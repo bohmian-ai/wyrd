@@ -17,6 +17,7 @@ sha2 = { workspace = true }
 secrecy = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
+metrics = { workspace = true }
 sqlx = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
@@ -38,13 +39,19 @@ name = "pg_audit_outbox"
 name = "pg_drift_alerts"
 
 [[test]]
+name = "pg_forge_operations"
+
+[[test]]
+name = "pg_forge_tasks"
+
+[[test]]
+name = "pg_forge_file_list"
+
+[[test]]
 name = "pg_migration"
 
 [[test]]
-name = "pg_olap_query_jobs"
-
-[[test]]
-name = "pg_olap_recovery"
+name = "pg_oracle_membership"
 
 [[test]]
 name = "pg_schema_usage"

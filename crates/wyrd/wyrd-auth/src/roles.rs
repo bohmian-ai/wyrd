@@ -115,7 +115,7 @@ mod pg_tests {
                 SET permissions = $1
               WHERE name = 'writer'",
         )
-        .bind(serde_json::json!([{ "resource": "cards", "action": "read" }]))
+        .bind(serde_json::json!([{ "resource": "cards", "action": "read", "scope": "all" }]))
         .execute(&mut **conn.transaction())
         .await
         .expect("builtin permissions update succeeds");

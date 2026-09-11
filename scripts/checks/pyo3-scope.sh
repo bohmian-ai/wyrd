@@ -37,7 +37,6 @@ if rg -n 'pyo3|pymodule|pyclass|pymethods|Python|Bound<|Py<|PyErr' crates/skald 
   --glob '!crates/skald/skald-agent/Cargo.toml' \
   --glob '!crates/skald/skald-agent/src/agent.rs' \
   --glob '!crates/skald/skald-agent/src/lib.rs' \
-  --glob '!crates/skald/skald-agent/src/py_error.rs' \
   --glob '!crates/skald/skald-agent/src/python.rs' \
   --glob '!crates/skald/skald-agent/src/run.rs' \
   --glob '!crates/skald/skald-agent/src/session.rs' \

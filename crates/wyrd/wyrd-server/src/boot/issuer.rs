@@ -95,9 +95,12 @@ pub async fn resolve_implicit_tenant(
 /// boot closed.
 ///
 /// # Errors
-/// Returns [`ServerBootError::IssuerDiscoveryUnavailable`] for an unreachable,
-/// never-seeded issuer; [`ServerBootError::IssuerSeal`] when a secret-bearing
-/// issuer has no sealing key; and [`ServerBootError::Sql`] on a write failure.
+/// Returns [`ServerBootError::IssuerDiscoveryUnavailable`] when another Rustls
+/// provider already owns the process or for an unreachable, never-seeded
+/// issuer; [`ServerBootError::IssuerSeal`] when a secret-bearing issuer has no
+/// sealing key; and [`ServerBootError::Sql`] on a write failure. Cancellation
+/// may leave earlier issuer entries committed while later entries remain
+/// unprocessed.
 pub async fn seed_trusted_issuers(
     pool: &PgPool,
     tenant_id: DataTenantId,
@@ -107,6 +110,12 @@ pub async fn seed_trusted_issuers(
     if entries.is_empty() {
         return Ok(());
     }
+    wyrd_tls::install_crypto_provider().map_err(|error| {
+        ServerBootError::IssuerDiscoveryUnavailable {
+            issuer: "configured issuer".to_owned(),
+            message: error.to_string(),
+        }
+    })?;
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none())

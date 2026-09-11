@@ -23,6 +23,7 @@ _extract_pattern() {
 }
 
 IDENTITY_PATTERN="$(_extract_pattern identity)"
+BIFROST_PATTERN="$(grep -m1 "set_output_all bifrost_only " "$DETECT" | sed "s/.*set_output_all bifrost_only '//;s/'$//")"
 
 check() {
   local label="$1"
@@ -68,6 +69,37 @@ check "wyrd-ui svelte (under wyrd-server)" "crates/wyrd/wyrd-server/wyrd-ui/src/
 check "vala crate (no identity impact)"    "crates/vala/vala-eval/src/lib.rs"                               false
 check "README"                             "README.md"                                                      false
 check "storage crate (no identity impact)" "crates/wyrd/wyrd-storage/src/lib.rs"                           false
+
+check_bifrost_only() {
+  local label="$1"
+  local want="$2"
+  shift 2
+
+  got=true
+  for file in "$@"; do
+    if ! echo "$file" | grep -qE "$BIFROST_PATTERN"; then
+      got=false
+    fi
+  done
+
+  if [ "$got" = "$want" ]; then
+    echo "OK  $label"
+    PASS=$((PASS+1))
+  else
+    echo "FAIL $label: expected bifrost_only=$want, got $got"
+    FAIL=$((FAIL+1))
+  fi
+}
+
+check_bifrost_only "Forge implementation" true \
+  "crates/vala/vala-bifrost-redux/src/forge/worker.rs"
+check_bifrost_only "Bifrost cross-crate change" true \
+  "crates/vala/vala-bifrost-redux/src/forge/worker.rs" \
+  "crates/wyrd/wyrd-server/src/oracle/peer_service.rs"
+check_bifrost_only "mixed domain change" false \
+  "crates/vala/vala-bifrost-redux/src/forge/worker.rs" \
+  "crates/skald/skald-agent/src/lib.rs"
+check_bifrost_only "global test configuration" false "mise.toml"
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

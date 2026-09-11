@@ -6,35 +6,87 @@ license = { workspace = true }
 rust-version = { workspace = true }
 repository = { workspace = true }
 authors = { workspace = true }
+autotests = false
 
 [features]
 default = []
-python = ["dep:pyo3", "dep:wyrd-interfaces", "dep:wyrd-utils"]
+python = ["dep:pyo3", "dep:wyrd-utils"]
+
+# Capability-scoped Bifrost test binaries. Each target is named for the
+# capability it proves and lives in `tests/bifrost/<capability>/`, where
+# `main.rs` is the binary root and every sibling file is one of its modules —
+# an ordinary directory module tree, so no `#[path]` attributes are needed.
+#
+# `autotests = false` is what keeps a module from also becoming a target of its
+# own; without it, Cargo would promote every `tests/*.rs` file and each module
+# would compile and run twice. Keeping the sources one directory down makes
+# that structural rather than a rule to remember.
+#
+# Lanes select a whole target and never an individual test name, so adding a
+# test to an existing binary needs no `mise.toml` edit. See `tests/README.md`.
+[[test]]
+name = "forge"
+path = "tests/bifrost/forge/main.rs"
+
+[[test]]
+name = "scribe"
+path = "tests/bifrost/scribe/main.rs"
+
+[[test]]
+name = "oracle"
+path = "tests/bifrost/oracle/main.rs"
+
+[[test]]
+name = "otlp"
+path = "tests/bifrost/otlp/main.rs"
+
+[[test]]
+name = "server"
+path = "tests/bifrost/server/main.rs"
 
 [dependencies]
+async-trait = { workspace = true }
+async-stream = { workspace = true }
 axum = { workspace = true }
+arrow = { workspace = true }
+base64 = { workspace = true }
+bytes = { workspace = true }
 chrono = { workspace = true }
 ed25519-dalek = { workspace = true, features = ["pkcs8"] }
+rcgen = { workspace = true }
+futures-util = { workspace = true }
+hdrhistogram = { workspace = true }
+hex = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+iceberg = { workspace = true }
 http = { workspace = true }
+http-body = { workspace = true }
+http-body-util = "0.1"
 opendal = { workspace = true }
+parquet = { workspace = true }
 pyo3 = { workspace = true, optional = true }
+rand = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
+serde_jcs = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+sha2 = { workspace = true }
 sqlx = { workspace = true, features = ["postgres"] }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util", "time"] }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "test-util", "time"] }
 tokio-stream = "0.1"
 tokio-util = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 wyrd-tonic = { workspace = true, features = ["server", "client"] }
 uuid = { workspace = true, features = ["v4", "v7"] }
-vala-bifrost = { workspace = true }
-vala-bifrost-redux = { workspace = true }
+vala-bifrost-redux = { workspace = true, features = ["bench-support", "test-support"] }
+vala-sdk = { workspace = true }
 vala-sql = { workspace = true }
 wyrd-auth = { workspace = true }
 wyrd-auth-check = { workspace = true, features = ["test-helpers"] }
@@ -42,12 +94,42 @@ wyrd-auth-issue = { workspace = true }
 wyrd-auth-oidc = { workspace = true }
 wyrd-auth-verify = { workspace = true }
 wyrd-crypt = { path = "../../shared/wyrd-crypt", version = "0.0.1" }
+wyrd-client = { workspace = true }
+wyrd-queue = { workspace = true }
 wyrd-dev-fixtures = { workspace = true, features = ["pg"] }
-wyrd-interfaces = { workspace = true, optional = true, features = ["python"] }
 wyrd-runtime = { workspace = true }
 wyrd-semver = { workspace = true }
-wyrd-server = { workspace = true }
+wyrd-server = { workspace = true, features = ["test-support"] }
 wyrd-spec = { workspace = true, features = ["test-utils"] }
 wyrd-sql = { workspace = true }
 wyrd-storage = { workspace = true }
+wyrd-telemetry = { workspace = true }
 wyrd-utils = { workspace = true, features = ["python"], optional = true }
+wyrd-tls = { workspace = true }
+
+[dev-dependencies]
+metrics = { workspace = true }
+# Stock upstream OpenTelemetry, used only by the OTLP journey target: those
+# tests must configure the exporters an ordinary application configures rather
+# than hand-build protocol requests. The `logs` and `metrics` features are the
+# two signals beyond the workspace default that those journeys export.
+opentelemetry = { workspace = true, features = ["logs", "metrics"] }
+opentelemetry_sdk = { workspace = true, features = ["logs", "metrics"] }
+opentelemetry-otlp = { workspace = true, features = ["logs", "metrics"] }
+# Journey plumbing only: the Oracle MCP journey drives a real MCP client against
+# a process-cluster pod's `/mcp` endpoint, so it needs the protocol client the
+# way an agent would use it. No `wyrd-testing` library code speaks MCP.
+rmcp = { workspace = true, features = [
+    "client",
+    "transport-streamable-http-client-reqwest",
+] }
+
+# One test-support binary, not a test target. Registering it is what makes
+# Cargo hand `CARGO_BIN_EXE_bifrost_peer_test_node` to the Oracle integration
+# test, which is how `BifrostProcessCluster` launches each simulated pod as a
+# real child process instead of shelling out to Cargo.
+[[bin]]
+name = "bifrost_peer_test_node"
+path = "src/bin/bifrost_peer_test_node.rs"
+test = false
+bench = false

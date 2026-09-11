@@ -59,12 +59,12 @@ Oracle pins one consistent cut across the selected Iceberg snapshot, published
 hot objects, and Scribe live-tail authority. It never opens another node's
 local staged files and does not query WAL in normal operation.
 
-The interactive path remains the default for low-latency scans and plans that
-do not require a network exchange. The analytical path executes the supported
-baseline — filtered/projected scans, fixed-width grouped aggregation,
-multi-input equi-join, and a spilling operator — through streamed partitioned
-exchanges. It has no materialized shuffle service, independent scheduler, or
-public plan-explanation surface.
+Oracle runs the pinned `datafusion-distributed` planner once. A normal
+DataFusion physical root selects the interactive admission and terminal path;
+a `DistributedExec` root selects the analytical path and its streamed stage
+graph. Wyrd adds no operator allowlist, candidate heuristic, second physical
+build, or pre-selection fallback. It has no materialized shuffle service,
+independent scheduler, or public plan-explanation surface.
 
 Both paths:
 
@@ -91,13 +91,11 @@ one total Oracle capacity check and one shared elastic resource root.
 
 ## Admission and failure semantics
 
-Route from the existing optimized-plan classification over pinned query facts;
-add no separate routing-facts subsystem. Missing or invalid estimates select
-the conservative interactive path. A candidate whose distributed physical plan
-falls outside the supported baseline or contains no actual network exchange
-executes interactively. Planning fallback happens only before analytical
-selection and never bypasses authorization, admission, deadline, audit, or
-result budgets.
+Derive the path only from the physical root returned by the pinned planner:
+normal root is interactive and `DistributedExec` root is analytical. Planning,
+codec, or worker incompatibility is a structured failure, not a reason to build
+or run a second plan. Path selection never bypasses authorization, admission,
+deadline, audit, or result budgets.
 
 Fail closed on tenant mismatch, schema fingerprint conflict, unknown columns,
 unregistered tables, replay identity conflict, unsupported expressions,

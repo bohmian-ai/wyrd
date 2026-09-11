@@ -10,8 +10,8 @@ use arc_swap::ArcSwap;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tonic::service::interceptor::InterceptedService;
-use tonic::transport::server::{Router as TonicRouter, TcpIncoming};
-use tonic::transport::Server;
+use tonic::transport::server::Router as TonicRouter;
+use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tonic_health::pb::health_server::{Health, HealthServer};
 use tonic_health::server::HealthReporter;
 use tracing::warn;
@@ -33,11 +33,84 @@ impl tonic::service::Interceptor for NoopInterceptor {
     }
 }
 
+/// Server TLS material for a listener that requires a verified client certificate.
+///
+/// This is the transport half of a private Wyrd listener: it supplies the
+/// listener's own leaf identity and the single certificate authority every
+/// connecting client certificate must chain to. It carries no application
+/// policy — deciding which authenticated peers may call which operation stays
+/// with the owning server crate.
+pub struct MutualTlsServerConfig {
+    /// Leaf identity presented by this listener during the TLS handshake.
+    identity: Identity,
+    /// Trust root every accepted client certificate must chain to.
+    client_ca_root: Certificate,
+}
+
+impl std::fmt::Debug for MutualTlsServerConfig {
+    /// Formats only the presence of TLS material; key bytes never reach logs.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MutualTlsServerConfig")
+            .finish_non_exhaustive()
+    }
+}
+
+impl MutualTlsServerConfig {
+    /// Builds mutual-TLS material from PEM certificate, key, and CA bytes.
+    ///
+    /// The private key is moved directly into tonic's opaque [`Identity`] and is
+    /// never retained in a formattable field.
+    #[must_use]
+    pub fn from_pem(
+        certificate_chain_pem: &[u8],
+        private_key_pem: &[u8],
+        client_ca_root_pem: &[u8],
+    ) -> Self {
+        Self {
+            identity: Identity::from_pem(certificate_chain_pem, private_key_pem),
+            client_ca_root: Certificate::from_pem(client_ca_root_pem),
+        }
+    }
+
+    /// Converts the material into tonic's server TLS configuration.
+    ///
+    /// Client authentication is mandatory: tonic requires a client certificate
+    /// chaining to `client_ca_root` because `client_auth_optional` is left at
+    /// its `false` default.
+    fn into_tls_config(self) -> ServerTlsConfig {
+        ServerTlsConfig::new()
+            .identity(self.identity)
+            .client_ca_root(self.client_ca_root)
+    }
+}
+
+/// Builds a tonic server that only accepts mutually authenticated connections.
+///
+/// The caller mounts services on the returned builder. Nothing is mounted here
+/// — in particular no health or reflection service — so a private listener
+/// exposes exactly the services its owner chooses.
+///
+/// # Errors
+///
+/// Returns [`GrpcError::CryptoProvider`] when another Rustls provider already
+/// owns the process, or [`GrpcError::Transport`] when tonic rejects the
+/// certificate, key, or CA material.
+pub fn mutual_tls_server(tls: MutualTlsServerConfig) -> Result<Server, GrpcError> {
+    wyrd_tls::install_crypto_provider()?;
+    Server::builder()
+        .tls_config(tls.into_tls_config())
+        .map_err(GrpcError::Transport)
+}
+
 const HEALTH_CONSUMER_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Errors raised by the gRPC server scaffold.
 #[derive(Debug, thiserror::Error)]
 pub enum GrpcError {
+    /// Process-wide Rustls provider ownership conflicts with Wyrd.
+    #[error(transparent)]
+    CryptoProvider(#[from] wyrd_tls::InstallError),
     /// Bind or serve failure from the tonic transport layer.
     #[error("gRPC transport failed")]
     Transport(#[from] tonic::transport::Error),
@@ -47,16 +120,28 @@ pub enum GrpcError {
     /// Building the incoming stream from a pre-bound listener failed.
     #[error("gRPC incoming listener setup failed: {0}")]
     IncomingSetup(String),
+    /// A private peer router was requested without the resolved peer Service
+    /// identity or the role-owned security audit it authenticates against.
+    /// Serving the peer plane without either would mean admitting traffic the
+    /// process cannot authorize or refuse on the record, so it is a boot error.
+    #[error("Bifrost peer plane identity or security audit is unavailable")]
+    MissingPeerIdentity,
     /// Ingest mount was requested but no token verifier is configured. Ingest is
     /// never mounted unauthenticated, so a missing verifier is a hard boot error.
     #[error("gRPC ingest requires a token verifier but none is configured")]
     MissingTokenVerifier,
+    /// Ingest was mounted without the server-owned Scribe runtime.
+    #[error("gRPC ingest requires a server-owned Scribe runtime")]
+    MissingScribe,
 }
 
 /// Inputs to [`build_grpc_router`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GrpcRouterConfig {
+    /// Whether reflection is exposed on the listener.
     pub reflection_enabled: bool,
+    /// Optional PEM identity applied before any service is mounted.
+    pub tls_identity: Option<Identity>,
 }
 
 /// Build and return the configured tonic router.
@@ -74,6 +159,12 @@ pub struct GrpcRouterConfig {
 /// No `.layer(...)` is composed here — doing so changes the server's stacked
 /// type and breaks the `TonicRouter` return type. The auth interceptor seat
 /// is wired via `InterceptedService::new` on each mounted service.
+///
+/// # Errors
+///
+/// Returns [`GrpcError::CryptoProvider`] when another Rustls provider already
+/// owns the process, [`GrpcError::Transport`] when tonic rejects the TLS
+/// identity, or [`GrpcError::Reflection`] when reflection cannot be built.
 pub fn build_grpc_router<H, I>(
     health_service: HealthServer<H>,
     interceptor: I,
@@ -83,7 +174,13 @@ where
     H: Health,
     I: tonic::service::Interceptor + Clone + Send + Sync + 'static,
 {
+    wyrd_tls::install_crypto_provider()?;
     let mut server = Server::builder();
+    if let Some(identity) = cfg.tls_identity {
+        server = server
+            .tls_config(ServerTlsConfig::new().identity(identity))
+            .map_err(GrpcError::Transport)?;
+    }
     let health = InterceptedService::new(health_service, interceptor.clone());
 
     let router = if cfg.reflection_enabled {
@@ -139,8 +236,7 @@ pub async fn serve_grpc_with_listener(
     listener: TcpListener,
     shutdown: CancellationToken,
 ) -> Result<(), GrpcError> {
-    let incoming = TcpIncoming::from_listener(listener, true, None)
-        .map_err(|e| GrpcError::IncomingSetup(e.to_string()))?;
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
     router
         .serve_with_incoming_shutdown(incoming, async move { shutdown.cancelled().await })
         .await
@@ -174,7 +270,7 @@ pub async fn publish_initial_health<S: HealthSnapshot>(
 #[tracing::instrument(skip(snapshot, reporter, shutdown))]
 pub async fn drive_health_status<S: HealthSnapshot>(
     snapshot: Arc<ArcSwap<S>>,
-    mut reporter: HealthReporter,
+    reporter: HealthReporter,
     shutdown: CancellationToken,
 ) {
     let mut last_ok: Option<bool> = Some(snapshot.load().all_ok());
@@ -234,6 +330,7 @@ mod tests {
             NoopInterceptor,
             GrpcRouterConfig {
                 reflection_enabled: false,
+                tls_identity: None,
             },
         );
         assert!(result.is_ok());
@@ -248,6 +345,7 @@ mod tests {
             NoopInterceptor,
             GrpcRouterConfig {
                 reflection_enabled: true,
+                tls_identity: None,
             },
         );
         assert!(result.is_ok());

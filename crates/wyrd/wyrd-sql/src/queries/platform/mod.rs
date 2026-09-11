@@ -6,7 +6,6 @@
 //! platform-admin pool.
 
 pub mod api_keys;
-pub mod audit_log;
 pub mod roles;
 pub mod tenant_resolver;
 pub mod tenants;

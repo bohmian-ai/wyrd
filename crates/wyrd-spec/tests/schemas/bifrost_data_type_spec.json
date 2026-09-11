@@ -261,14 +261,14 @@
       "additionalProperties": false
     },
     {
-      "description": "Variable-length list of a single element type.",
+      "description": "Variable-length list whose boxed element declaration carries the child's name, nullability, metadata, and stable field id.\n\nThe element is a full [`FieldSpec`] rather than a bare type so a nested child keeps the same identity the physical schema stores; a client that rebuilds an Arrow schema from a description reproduces the stored list child exactly instead of inventing a nullable `item`.",
       "type": "object",
       "required": [
         "List"
       ],
       "properties": {
         "List": {
-          "$ref": "#/definitions/DataTypeSpec"
+          "$ref": "#/definitions/FieldSpec"
         }
       },
       "additionalProperties": false
@@ -552,14 +552,14 @@
           "additionalProperties": false
         },
         {
-          "description": "Variable-length list of a single element type.",
+          "description": "Variable-length list whose boxed element declaration carries the child's name, nullability, metadata, and stable field id.\n\nThe element is a full [`FieldSpec`] rather than a bare type so a nested child keeps the same identity the physical schema stores; a client that rebuilds an Arrow schema from a description reproduces the stored list child exactly instead of inventing a nullable `item`.",
           "type": "object",
           "required": [
             "List"
           ],
           "properties": {
             "List": {
-              "$ref": "#/definitions/DataTypeSpec"
+              "$ref": "#/definitions/FieldSpec"
             }
           },
           "additionalProperties": false
@@ -599,7 +599,7 @@
           ]
         },
         "metadata": {
-          "description": "String metadata. Bifrost describe uses the `wyrd:column_class` key to flag `correlation` columns distinctly from user columns.",
+          "description": "String metadata carried verbatim through every schema conversion.\n\nTwo keys are meaningful to Bifrost: [`PARQUET_FIELD_ID_KEY`] holds the stored stable field id as decimal text, and [`INPUT_CLASS_KEY`] marks a declaration that is a write-time input rather than a stored column.",
           "type": "object",
           "additionalProperties": {
             "type": "string"

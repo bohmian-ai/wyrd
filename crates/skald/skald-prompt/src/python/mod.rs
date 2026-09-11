@@ -21,7 +21,7 @@
 #![allow(clippy::match_wildcard_for_single_variants)]
 // justification: `|v| v.len()` is clearer than `Vec::len` in closure context here.
 #![allow(clippy::redundant_closure_for_method_calls)]
-// justification: CardPyResult return types are intentionally uniform across the bridge, even when infallible.
+// justification: WyrdPyResult return types are intentionally uniform across the bridge, even when infallible.
 #![allow(clippy::unnecessary_wraps)]
 #![allow(missing_docs)]
 

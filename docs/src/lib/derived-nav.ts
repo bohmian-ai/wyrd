@@ -1,37 +1,101 @@
 // Frontmatter-driven nav derivation. Reads validated entries from content.ts,
-// filters to wyrd-pillar non-draft pages, buckets by group, sorts by the
-// declarative GROUP_ORDER config + per-entry `order` field, and exposes the
-// sidebar tree plus a flat spine for prev/next pagination.
+// filters to published pages, maps content groups into reader-intent sections,
+// and exposes the sidebar tree plus a flat spine for prev/next pagination.
 //
-// Dropping a file with valid wyrd-pillar frontmatter is sufficient to place it
-// in the sidebar and prev/next chain — no edit to any central list.
+// `section` is an escape hatch for pages that cross the normal group mapping.
+// The common case only needs a product/topic `group`, so adding a page does not
+// require editing a central navigation list.
 
 import type { DocMetadata } from './content.js';
 import { allSlugs, getEntry } from './content.js';
 
-export type NavItem = { label: string; path: string };
-export type NavGroup = { label: string; kind?: string; items: NavItem[] };
+export type NavItem = { label: string; path: string; soon?: boolean };
+export type NavSection = { label: string; items: NavItem[] };
+export type NavGroup = {
+  label: string;
+  kind?: string;
+  sections: NavSection[];
+  items: NavItem[];
+};
 
-// Declarative group-order config — the single ordering knob for group sequence.
-// Groups not listed appear after all configured groups, sorted alphabetically.
-// Entries within each group are sorted by `order` ASC, then by slug for a
-// deterministic tiebreak so builds are reproducible.
-// Diátaxis IA. Groups not listed here appear after all configured groups,
-// sorted alphabetically. How-to recipes are flattened into one 'How-to' group
-// (ordered by per-entry `order`) rather than split into capability sub-groups.
-// The generated card/api pages emit `group: Reference` directly, so they fold
-// into the single Reference section by their per-entry `order`.
+// Top-level navigation is organized by reader intent. Product/topic groups are
+// nested inside those sections, so a page can be found by either what the
+// reader wants to do or the Wyrd component they are working with.
 export const GROUP_ORDER: readonly string[] = [
+  'Start here',
+  'Learn Wyrd',
+  'Build with Wyrd',
+  'Products and components',
+  'Reference',
+  'Operate Wyrd',
+  'For agents'
+];
+
+const GROUP_SECTION: Record<string, string> = {
+  Overview: 'Start here',
+  'Get Started': 'Start here',
+  Tutorials: 'Learn Wyrd',
+  Concepts: 'Learn Wyrd',
+  Architecture: 'Learn Wyrd',
+  'How-to': 'Build with Wyrd',
+  Bifrost: 'Products and components',
+  Cards: 'Products and components',
+  Skald: 'Products and components',
+  Fathom: 'Products and components',
+  Reference: 'Reference',
+  'Self-hosting': 'Operate Wyrd',
+  'For Agents': 'For agents'
+};
+
+const GROUP_ORDER_WITHIN_SECTION: readonly string[] = [
   'Overview',
   'Get Started',
   'Tutorials',
-  'How-to',
   'Concepts',
+  'Architecture',
+  'How-to',
+  'Cards',
   'Bifrost',
-  'Self-hosting',
+  'Skald',
+  'Fathom',
   'Reference',
-  'For Agents',
+  'Self-hosting',
+  'For Agents'
 ];
+
+function sectionFor(meta: DocMetadata): string {
+  if (meta.section) return meta.section;
+  if (meta.group && GROUP_SECTION[meta.group]) return GROUP_SECTION[meta.group];
+  if (meta.pillar === 'fathom') return 'Products and components';
+  return 'Learn Wyrd';
+}
+
+function groupOrderIndex(label: string): number {
+  return GROUP_ORDER_WITHIN_SECTION.findIndex(
+    (group) => group.toLowerCase() === label.toLowerCase()
+  );
+}
+
+function sectionOrderIndex(label: string): number {
+  return GROUP_ORDER.findIndex((group) => group.toLowerCase() === label.toLowerCase());
+}
+
+function sortLabels(labels: string[], indexOf: (label: string) => number): void {
+  labels.sort((a, b) => {
+    const ia = indexOf(a);
+    const ib = indexOf(b);
+    if (ia !== -1 && ib !== -1) return ia - ib;
+    if (ia !== -1) return -1;
+    if (ib !== -1) return 1;
+    return a.localeCompare(b);
+  });
+}
+
+function navItem(slug: string, meta: DocMetadata): NavItem {
+  const item: NavItem = { label: meta.title, path: slugToPath(slug) };
+  if (meta.pillar === 'fathom') item.soon = true;
+  return item;
+}
 
 // Convert a content slug to a base-free nav path. Empty slug → root '/';
 // all others get a leading and trailing slash for canonical form.
@@ -54,76 +118,55 @@ function normalize(path: string): string {
   return path === '/' ? '/' : path.replace(/\/$/, '');
 }
 
-// Sentinel string used as a Map key for entries that carry no group.
-const UNGROUPED = '\x00ungrouped';
-
 function buildNav(): { nav: NavGroup[]; flat: NavItem[] } {
   type Entry = { slug: string; meta: DocMetadata };
 
-  // allSlugs() excludes drafts in prod; we re-filter draft here so drafts are
-  // always absent from the nav regardless of build environment.
   const entries: Entry[] = allSlugs()
     .map((slug) => ({ slug, meta: getEntry(slug)!.metadata }))
-    .filter(({ meta }) => meta.pillar === 'wyrd' && !meta.draft);
+    .filter(({ meta }) => !meta.draft);
 
-  // Bucket by group label.
-  const buckets = new Map<string, Entry[]>();
+  const sectionBuckets = new Map<string, Map<string, Entry[]>>();
   for (const entry of entries) {
-    const key = entry.meta.group ?? UNGROUPED;
-    if (!buckets.has(key)) buckets.set(key, []);
-    buckets.get(key)!.push(entry);
+    const section = sectionFor(entry.meta);
+    const group = entry.meta.group ?? entry.meta.title;
+    const groups = sectionBuckets.get(section) ?? new Map<string, Entry[]>();
+    const items = groups.get(group) ?? [];
+    items.push(entry);
+    groups.set(group, items);
+    sectionBuckets.set(section, groups);
   }
 
-  // Sort entries within each bucket: order ASC, slug for deterministic tiebreak.
-  for (const items of buckets.values()) {
-    items.sort((a, b) => {
-      const oa = a.meta.order ?? Infinity;
-      const ob = b.meta.order ?? Infinity;
-      if (oa !== ob) return oa - ob;
-      return a.slug.localeCompare(b.slug);
-    });
+  for (const groups of sectionBuckets.values()) {
+    for (const items of groups.values()) {
+      items.sort((a, b) => {
+        const oa = a.meta.order ?? Infinity;
+        const ob = b.meta.order ?? Infinity;
+        if (oa !== ob) return oa - ob;
+        return a.slug.localeCompare(b.slug);
+      });
+    }
   }
 
-  // Sort named group keys by GROUP_ORDER; unlisted groups sort alphabetically after.
-  const namedKeys = [...buckets.keys()].filter((k) => k !== UNGROUPED);
-  // Case-insensitive lookup: generators emit lowercase group keys (`api`,
-  // `cards`) while hand-authored pages use title-case (`Concepts`). Matching
-  // on lowercase keeps a miscased group in its intended GROUP_ORDER slot
-  // instead of silently dropping to the alphabetical tail.
-  const orderIndex = (key: string) =>
-    GROUP_ORDER.findIndex((g) => g.toLowerCase() === key.toLowerCase());
-  namedKeys.sort((a, b) => {
-    const ia = orderIndex(a);
-    const ib = orderIndex(b);
-    if (ia !== -1 && ib !== -1) return ia - ib;
-    if (ia !== -1) return -1;
-    if (ib !== -1) return 1;
-    return a.localeCompare(b);
-  });
+  const sectionLabels = [...sectionBuckets.keys()];
+  sortLabels(sectionLabels, sectionOrderIndex);
 
   const groups: NavGroup[] = [];
-
-  for (const key of namedKeys) {
+  for (const sectionLabel of sectionLabels) {
+    const buckets = sectionBuckets.get(sectionLabel)!;
+    const groupLabels = [...buckets.keys()];
+    sortLabels(groupLabels, groupOrderIndex);
+    const sections = groupLabels.map((label) => ({
+      label,
+      items: buckets.get(label)!.map(({ slug, meta }) => navItem(slug, meta))
+    }));
     groups.push({
-      label: key,
-      items: buckets.get(key)!.map(({ slug, meta }) => ({
-        label: meta.title,
-        path: slugToPath(slug)
-      }))
+      label: sectionLabel,
+      sections,
+      items: sections.flatMap((section) => section.items)
     });
   }
 
-  // Ungrouped entries become standalone groups (single item, label = title)
-  // so Sidebar.svelte's isStandalone check renders them as bare links.
-  const ungrouped = buckets.get(UNGROUPED) ?? [];
-  for (const { slug, meta } of ungrouped) {
-    groups.push({
-      label: meta.title,
-      items: [{ label: meta.title, path: slugToPath(slug) }]
-    });
-  }
-
-  return { nav: groups, flat: groups.flatMap((g) => g.items) };
+  return { nav: groups, flat: groups.flatMap((group) => group.items) };
 }
 
 // Lazily computed and memoized. buildNav() reads content.ts's module-level

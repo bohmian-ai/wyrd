@@ -1,0 +1,321 @@
+-- Durable Oracle reader authority: table serialization, epoch leases, and the
+-- per-table protection frontier each fenced Oracle epoch publishes.
+--
+-- Forge maintenance runs in a different process from every reader, so an
+-- admitted query has to leave a durable trace or destructive maintenance would
+-- be deciding from age and liveness alone. Four owners carry that trace:
+--
+--   * bifrost_table_maintenance_authority is the single SQL serialization
+--     boundary for one tenant-qualified table. Reader-protection expansion,
+--     narrowing, release, and snapshot-expiration preparation all take this one
+--     row FOR UPDATE, so the admission-versus-destruction race has exactly one
+--     durable winner per table without a global physical lock.
+--   * oracle_reader_epochs holds one bounded renewable lease per fenced Oracle
+--     epoch. Postgres statement_timestamp() is the only lease clock, so lease
+--     expiry is a database fact rather than a comparison of two local wall
+--     clocks.
+--   * oracle_table_protections and oracle_table_protection_members hold one
+--     epoch's conservative frontier for one table: a set of retained-head ->
+--     protected-snapshot chains with the exact Iceberg ancestry path proving
+--     each chain, so maintenance never infers ancestry from snapshot-ID order.
+--
+-- A protection header is Forge protection regardless of heartbeat freshness or
+-- epoch state. Only the invalidation-and-release sequence removes one.
+
+-- ---------------------------------------------------------------------------
+-- Per-table serialization boundary
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE vala.bifrost_table_maintenance_authority (
+    data_tenant_id   uuid  NOT NULL REFERENCES platform.tenants(data_tenant_id),
+    catalog_name     text  NOT NULL CHECK (catalog_name = 'wyrd-redux'),
+    namespace_name   text  NOT NULL CHECK (btrim(namespace_name) <> ''),
+    table_name       text  NOT NULL CHECK (btrim(table_name) <> ''),
+    table_uid        bytea NOT NULL CHECK (octet_length(table_uid) = 16),
+    PRIMARY KEY (data_tenant_id, catalog_name, namespace_name, table_name),
+    UNIQUE (data_tenant_id, table_uid),
+    FOREIGN KEY (data_tenant_id, table_uid)
+        REFERENCES vala.bifrost_tables(data_tenant_id, table_uid)
+);
+
+-- Exactly one authority row per already-registered Bifrost table. The fqn is
+-- `<namespace>.<table>` with the namespace itself dotted, so the table name is
+-- the final segment and the namespace is everything before it. Table
+-- registration inserts its own row from now on, which is why no caller ever
+-- needs an advisory-lock fallback for a missing row.
+INSERT INTO vala.bifrost_table_maintenance_authority
+    (data_tenant_id, catalog_name, namespace_name, table_name, table_uid)
+SELECT data_tenant_id,
+       'wyrd-redux',
+       left(fqn, length(fqn) - strpos(reverse(fqn), '.')),
+       right(fqn, strpos(reverse(fqn), '.') - 1),
+       table_uid
+  FROM vala.bifrost_tables
+ WHERE strpos(reverse(fqn), '.') > 1;
+
+ALTER TABLE vala.bifrost_table_maintenance_authority ENABLE ROW LEVEL SECURITY;
+ALTER TABLE vala.bifrost_table_maintenance_authority FORCE  ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON vala.bifrost_table_maintenance_authority
+    USING      (data_tenant_id = wyrd.current_tenant())
+    WITH CHECK (data_tenant_id = wyrd.current_tenant());
+
+REVOKE ALL ON vala.bifrost_table_maintenance_authority FROM PUBLIC;
+GRANT SELECT, INSERT, UPDATE, DELETE
+    ON vala.bifrost_table_maintenance_authority TO wyrd_app;
+
+-- ---------------------------------------------------------------------------
+-- Oracle epoch leases
+-- ---------------------------------------------------------------------------
+
+-- The epoch owner is the system tenant, not the tenant whose data is being
+-- read: one epoch serves every tenant this Oracle process admits, and its lease
+-- is a process fact. Tenant-qualified protection lives in the two tables below.
+CREATE TABLE vala.oracle_reader_epochs (
+    epoch_owner_tenant_id uuid NOT NULL
+        REFERENCES platform.tenants(data_tenant_id)
+        CHECK (epoch_owner_tenant_id = '00000000-0000-0000-0000-000000000000'::uuid),
+    node_id           uuid   NOT NULL,
+    fencing_token     bigint NOT NULL CHECK (fencing_token > 0),
+    state             text   NOT NULL
+        CHECK (state IN ('acquired', 'active', 'draining', 'invalidated')),
+    state_revision    bigint NOT NULL CHECK (state_revision >= 1),
+    acquired_at       timestamptz NOT NULL,
+    activated_at      timestamptz,
+    renewed_at        timestamptz NOT NULL,
+    lease_expires_at  timestamptz NOT NULL,
+    invalidated_at    timestamptz,
+    CHECK (lease_expires_at > acquired_at),
+    -- An epoch is 'acquired' until activation succeeds, so it has no
+    -- activation instant; an activation failure invalidates without ever
+    -- gaining one, which is why only 'active' and 'draining' require it.
+    CHECK (state <> 'acquired' OR activated_at IS NULL),
+    CHECK (state NOT IN ('active', 'draining') OR activated_at IS NOT NULL),
+    CHECK ((state = 'invalidated') = (invalidated_at IS NOT NULL)),
+    PRIMARY KEY (epoch_owner_tenant_id, node_id, fencing_token),
+    -- A protection header names its epoch by (node, fence) alone, because the
+    -- header belongs to a data tenant while the epoch belongs to the system
+    -- owner. This unique key is what the header's foreign key references, and
+    -- it is what makes the referential lock below reachable.
+    UNIQUE (node_id, fencing_token)
+);
+
+CREATE INDEX oracle_reader_epochs_expiry
+    ON vala.oracle_reader_epochs (lease_expires_at);
+
+ALTER TABLE vala.oracle_reader_epochs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE vala.oracle_reader_epochs FORCE  ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON vala.oracle_reader_epochs
+    USING      (epoch_owner_tenant_id = wyrd.current_tenant())
+    WITH CHECK (epoch_owner_tenant_id = wyrd.current_tenant());
+
+REVOKE ALL ON vala.oracle_reader_epochs FROM PUBLIC;
+GRANT SELECT, INSERT, UPDATE, DELETE ON vala.oracle_reader_epochs TO wyrd_app;
+
+-- ---------------------------------------------------------------------------
+-- Per-epoch, per-table protection frontier
+-- ---------------------------------------------------------------------------
+
+-- table_uid, not the reconstructed namespace string, is durable table identity.
+-- The checked catalog/namespace/table payload exists so drift between the
+-- registry and a protection header is visible rather than silent.
+CREATE TABLE vala.oracle_table_protections (
+    data_tenant_id            uuid   NOT NULL REFERENCES platform.tenants(data_tenant_id),
+    table_uid                 bytea  NOT NULL CHECK (octet_length(table_uid) = 16),
+    node_id                   uuid   NOT NULL,
+    fencing_token             bigint NOT NULL CHECK (fencing_token > 0),
+    catalog_name              text   NOT NULL CHECK (catalog_name = 'wyrd-redux'),
+    namespace_name            text   NOT NULL CHECK (btrim(namespace_name) <> ''),
+    table_name                text   NOT NULL CHECK (btrim(table_name) <> ''),
+    revision                  bigint NOT NULL CHECK (revision >= 1),
+    frontier_encoding_version integer NOT NULL CHECK (frontier_encoding_version = 1),
+    frontier_digest           bytea  NOT NULL CHECK (octet_length(frontier_digest) = 32),
+    updated_at                timestamptz NOT NULL,
+    PRIMARY KEY (data_tenant_id, table_uid, node_id, fencing_token),
+    FOREIGN KEY (data_tenant_id, table_uid)
+        REFERENCES vala.bifrost_table_maintenance_authority(data_tenant_id, table_uid),
+    -- Publication and retirement are one durable order. Postgres' own
+    -- referential-integrity locks decide the race: an inserting transaction
+    -- takes a key-share lock on the epoch row, and a retiring transaction takes
+    -- the conflicting lock, so exactly one of them commits. If retirement wins,
+    -- the late insert fails; if the insert wins, retirement fails and leaves
+    -- the invalidated epoch for the next recovery pass to finish. Neither
+    -- outcome can leave a protection header without its owning epoch.
+    FOREIGN KEY (node_id, fencing_token)
+        REFERENCES vala.oracle_reader_epochs(node_id, fencing_token)
+        ON DELETE RESTRICT
+);
+
+CREATE INDEX oracle_table_protections_epoch
+    ON vala.oracle_table_protections (node_id, fencing_token);
+
+ALTER TABLE vala.oracle_table_protections ENABLE ROW LEVEL SECURITY;
+ALTER TABLE vala.oracle_table_protections FORCE  ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON vala.oracle_table_protections
+    USING      (data_tenant_id = wyrd.current_tenant())
+    WITH CHECK (data_tenant_id = wyrd.current_tenant());
+
+REVOKE ALL ON vala.oracle_table_protections FROM PUBLIC;
+GRANT SELECT, INSERT, UPDATE, DELETE ON vala.oracle_table_protections TO wyrd_app;
+
+-- One member is one comparable Iceberg chain: the newest active local cut is
+-- the retained head, the oldest is the protected snapshot, and ancestry_path is
+-- the inclusive newest-to-oldest parent walk that proves they are on the same
+-- chain. Incomparable active cuts get separate members; a singleton chain has
+-- the same head and protected id and a one-element path.
+CREATE TABLE vala.oracle_table_protection_members (
+    data_tenant_id                 uuid   NOT NULL REFERENCES platform.tenants(data_tenant_id),
+    table_uid                      bytea  NOT NULL CHECK (octet_length(table_uid) = 16),
+    node_id                        uuid   NOT NULL,
+    fencing_token                  bigint NOT NULL CHECK (fencing_token > 0),
+    protected_snapshot_id          bigint NOT NULL,
+    protected_snapshot_timestamp_ms bigint NOT NULL CHECK (protected_snapshot_timestamp_ms >= 0),
+    retained_head_snapshot_id      bigint NOT NULL,
+    retained_head_timestamp_ms     bigint NOT NULL CHECK (retained_head_timestamp_ms >= 0),
+    ancestry_path                  bigint[] NOT NULL CHECK (array_length(ancestry_path, 1) >= 1),
+    ancestry_digest_version        integer NOT NULL CHECK (ancestry_digest_version = 1),
+    ancestry_digest                bytea  NOT NULL CHECK (octet_length(ancestry_digest) = 32),
+    CHECK (retained_head_timestamp_ms >= protected_snapshot_timestamp_ms),
+    CHECK (ancestry_path[1] = retained_head_snapshot_id),
+    CHECK (ancestry_path[array_length(ancestry_path, 1)] = protected_snapshot_id),
+    PRIMARY KEY (data_tenant_id, table_uid, node_id, fencing_token, protected_snapshot_id),
+    FOREIGN KEY (data_tenant_id, table_uid, node_id, fencing_token)
+        REFERENCES vala.oracle_table_protections
+                   (data_tenant_id, table_uid, node_id, fencing_token)
+        ON DELETE CASCADE
+);
+
+ALTER TABLE vala.oracle_table_protection_members ENABLE ROW LEVEL SECURITY;
+ALTER TABLE vala.oracle_table_protection_members FORCE  ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON vala.oracle_table_protection_members
+    USING      (data_tenant_id = wyrd.current_tenant())
+    WITH CHECK (data_tenant_id = wyrd.current_tenant());
+
+REVOKE ALL ON vala.oracle_table_protection_members FROM PUBLIC;
+GRANT SELECT, INSERT, UPDATE, DELETE
+    ON vala.oracle_table_protection_members TO wyrd_app;
+
+-- Read-only cross-tenant enumeration for crash/takeover recovery. Recovery may
+-- learn which (tenant, table, node, fence) keys a dead epoch still protects; it
+-- may not mutate tenant state or append tenant audit through this grant.
+GRANT SELECT ON vala.oracle_table_protections TO wyrd_platform_admin;
+GRANT SELECT ON vala.oracle_reader_epochs TO wyrd_platform_admin;
+GRANT SELECT ON vala.oracle_table_protection_members TO wyrd_platform_admin;
+-- The fenced Forge expiration lifecycle runs on the operator pool and takes the
+-- maintenance-authority row as its serialization lock against reader widening.
+-- PostgreSQL requires UPDATE privilege to take a `FOR UPDATE` row lock, so the
+-- grant is wider than the behavior: Forge only ever reads and locks this row,
+-- and registration remains the sole writer.
+GRANT SELECT, UPDATE ON vala.bifrost_table_maintenance_authority TO wyrd_platform_admin;
+
+-- ---------------------------------------------------------------------------
+-- Retirement proof
+-- ---------------------------------------------------------------------------
+
+-- Retiring an epoch requires proof that no protection header remains for it,
+-- but that proof spans every tenant while the retiring transaction is bound to
+-- the system owner under forced RLS — so a plain count inside that transaction
+-- would always see zero and retire an epoch that is still protecting tables.
+-- This execute-only function is exactly that proof: read-only, cross-tenant,
+-- returning one number and no row payload, and taking no tenant input.
+CREATE FUNCTION vala.oracle_epoch_protection_count(
+    p_node_id uuid,
+    p_fencing_token bigint
+) RETURNS bigint
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+    SELECT pg_catalog.count(*)
+      FROM vala.oracle_table_protections
+     WHERE node_id = p_node_id AND fencing_token = p_fencing_token
+$$;
+
+ALTER FUNCTION vala.oracle_epoch_protection_count(uuid, bigint) OWNER TO wyrd_migrator;
+REVOKE ALL ON FUNCTION vala.oracle_epoch_protection_count(uuid, bigint) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION vala.oracle_epoch_protection_count(uuid, bigint) TO wyrd_app;
+GRANT EXECUTE ON FUNCTION vala.oracle_epoch_protection_count(uuid, bigint) TO wyrd_platform_admin;
+
+-- ---------------------------------------------------------------------------
+-- Forge snapshot-expiration claims
+-- ---------------------------------------------------------------------------
+
+-- The mirror image of a reader protection header. A protection row says "a
+-- reader still needs this snapshot"; a claim row says "an expiration operation
+-- has already selected this snapshot and has not resolved". Both are read while
+-- the same bifrost_table_maintenance_authority row is held FOR UPDATE, which is
+-- what gives the widen-versus-destroy race exactly one durable winner per
+-- tenant-qualified table.
+--
+-- Only unresolved claims live here: settlement and reset delete the operation's
+-- rows in the same transaction that closes it, and the cascade from
+-- forge_operation_state means an operation can never outlive its claims in the
+-- other direction either.
+--
+-- Claim rows are immutable. They preserve the identity the selection was
+-- prepared under — task, attempt, preparing worker, and that worker's table
+-- lease key and fencing token — as historical evidence. Correcting a
+-- preparation means deleting these rows and preparing a new operation, never
+-- updating one, which is why wyrd_platform_admin holds INSERT and DELETE but
+-- no UPDATE. A successor that takes the task over settles under its own current
+-- ownership and its own newly acquired fence; it does not rewrite these rows.
+CREATE TABLE vala.forge_snapshot_expiration_claims (
+    data_tenant_id      uuid   NOT NULL REFERENCES platform.tenants(data_tenant_id),
+    resource            text   NOT NULL,
+    family              text   NOT NULL CHECK (family = 'snapshot_expire'),
+    operation_id        uuid   NOT NULL,
+    snapshot_id         bigint NOT NULL,
+    task_id             uuid   NOT NULL REFERENCES vala.forge_tasks(task_id),
+    attempt_id          uuid   NOT NULL,
+    worker_id           uuid   NOT NULL,
+    lease_key           text   NOT NULL CHECK (btrim(lease_key) <> ''),
+    lease_fencing_token bigint NOT NULL CHECK (lease_fencing_token > 0),
+    table_uid           bytea  NOT NULL CHECK (octet_length(table_uid) = 16),
+    catalog_name        text   NOT NULL CHECK (catalog_name = 'wyrd-redux'),
+    namespace_name      text   NOT NULL CHECK (btrim(namespace_name) <> ''),
+    table_name          text   NOT NULL CHECK (btrim(table_name) <> ''),
+    table_uuid          uuid   NOT NULL,
+    PRIMARY KEY (data_tenant_id, resource, family, operation_id, snapshot_id),
+    FOREIGN KEY (data_tenant_id, resource, family, operation_id)
+        REFERENCES vala.forge_operation_state
+                   (data_tenant_id, resource, family, operation_id)
+        ON DELETE CASCADE,
+    FOREIGN KEY (data_tenant_id, table_uid)
+        REFERENCES vala.bifrost_table_maintenance_authority(data_tenant_id, table_uid)
+);
+
+-- Admission asks one question: is this exact snapshot on this exact table
+-- already claimed? Reconciliation asks the other: which operation do this
+-- task's claims belong to? Neither may become a scan.
+CREATE INDEX forge_snapshot_expiration_claims_admission
+    ON vala.forge_snapshot_expiration_claims (data_tenant_id, table_uid, snapshot_id);
+CREATE INDEX forge_snapshot_expiration_claims_task
+    ON vala.forge_snapshot_expiration_claims (data_tenant_id, task_id);
+
+ALTER TABLE vala.forge_snapshot_expiration_claims ENABLE ROW LEVEL SECURITY;
+ALTER TABLE vala.forge_snapshot_expiration_claims FORCE  ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON vala.forge_snapshot_expiration_claims
+    USING      (data_tenant_id = wyrd.current_tenant())
+    WITH CHECK (data_tenant_id = wyrd.current_tenant());
+
+REVOKE ALL ON vala.forge_snapshot_expiration_claims FROM PUBLIC;
+-- Oracle admission reads the claim index from a tenant connection; only the
+-- fenced Forge lifecycle owner, which runs on the operator pool, may write one.
+GRANT SELECT ON vala.forge_snapshot_expiration_claims TO wyrd_app;
+GRANT SELECT, INSERT, DELETE
+    ON vala.forge_snapshot_expiration_claims TO wyrd_platform_admin;
+
+-- ---------------------------------------------------------------------------
+-- Expired-cleanup handoff identity
+-- ---------------------------------------------------------------------------
+
+-- One cleanup task per succeeded snapshot-expiration source, as a database
+-- invariant rather than a scheduler convention. The source task id is the
+-- globally unique replay identity of the handoff, so a second enqueue for the
+-- same source cannot create a second physical deletion owner even if two
+-- schedulers race or a demand is replanned. Retention also reads this index:
+-- a succeeded expiration whose candidates no cleanup plan references yet is
+-- held back from terminal pruning by a NOT EXISTS against exactly this key.
+CREATE UNIQUE INDEX forge_tasks_expired_cleanup_source ON vala.forge_tasks
+ ((plan #>> '{parameters,source_task_id}'))
+ WHERE strategy = 'expired_cleanup';

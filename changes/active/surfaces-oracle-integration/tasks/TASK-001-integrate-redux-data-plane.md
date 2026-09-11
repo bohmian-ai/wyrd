@@ -33,6 +33,7 @@ audit publication; legacy `vala-bifrost` is gone in full.
   cluster-wide Oracle quotas, or alternate durable formats.
 - Live UI integration, SDK package convergence, repository-wide CI closeout,
   and the single data-root follow-up are owned by later tasks.
+- There is no such thing as a pre-existing failure anymore. All failures must be explicitly handled within the current execution context.
 
 ## Relevant Surface
 

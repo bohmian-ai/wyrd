@@ -14,24 +14,41 @@ path = "src/lib.rs"
 
 [features]
 default = []
-python = ["dep:pyo3"]
+python = ["dep:pyo3", "dep:wyrd-utils", "wyrd-utils/python"]
 
 [dependencies]
+bytes = { workspace = true }
+chrono = { workspace = true }
 wyrd-queue = { workspace = true }
 wyrd-client = { workspace = true }
+wyrd-tonic = { workspace = true, features = ["client"] }
 wyrd-spec = { workspace = true }
 wyrd-runtime = { workspace = true }
 arrow-schema = { workspace = true }
+arrow = { workspace = true }
 async-trait = { workspace = true }
 secrecy = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time"] }
+tokio-stream = "0.1"
+uuid = { workspace = true, features = ["v7"] }
+futures-util = { workspace = true }
+reqwest = { workspace = true }
+wyrd-tls = { workspace = true }
 
 pyo3 = { workspace = true, optional = true }
+wyrd-utils = { workspace = true, optional = true }
 
 [dev-dependencies]
+reqwest = { workspace = true }
+sqlx = { workspace = true, features = ["postgres"] }
+vala-bifrost-redux = { workspace = true }
 wyrd-queue = { workspace = true }
 wyrd-runtime = { workspace = true }
 wyrd-testing = { workspace = true }

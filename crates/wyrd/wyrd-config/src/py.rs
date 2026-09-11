@@ -12,6 +12,7 @@ use wyrd_spec::error::WyrdError;
 use crate::config::WyrdConfig;
 use crate::error::WyrdConfigError;
 use crate::merge::apply_defaults as core_apply_defaults;
+use wyrd_utils::py::{WyrdPyError, WyrdPyResult};
 
 const METADATA_SENTINEL: &str = "<metadata-dict>";
 
@@ -29,8 +30,8 @@ impl WyrdConfigPy {
     #[pyo3(signature = (path=None))]
     // justification: pyo3 boundary; the extractor produces an owned value (PathBuf/PyRef/newtype), taking it by reference would require a caller-side clone
     #[allow(clippy::needless_pass_by_value)]
-    fn load(_cls: &Bound<'_, PyType>, path: Option<PathBuf>) -> PyResult<Self> {
-        let cfg = WyrdConfig::load(path.as_deref()).map_err(to_py_err)?;
+    fn load(_cls: &Bound<'_, PyType>, path: Option<PathBuf>) -> WyrdPyResult<Self> {
+        let cfg = WyrdConfig::load(path.as_deref()).map_err(WyrdPyError::from)?;
         Ok(Self { inner: cfg })
     }
 
@@ -40,23 +41,18 @@ impl WyrdConfigPy {
         py: Python<'py>,
         metadata: &Bound<'py, PyDict>,
         kind: &Bound<'py, PyAny>,
-    ) -> PyResult<()> {
+    ) -> WyrdPyResult<()> {
         let card_kind = extract_card_kind(kind)?;
 
         if metadata.get_item("name").ok().flatten().is_none() {
-            return Err(to_py_err(WyrdConfigError::Schema {
-                message: "metadata dict is missing required key `name`".to_string(),
-                path: PathBuf::from(METADATA_SENTINEL),
-            }));
+            return Err(schema_error(
+                "metadata dict is missing required key `name`".to_string(),
+            ));
         }
 
         let json_value = wyrd_utils::py::pydict_to_json_value(metadata)?;
-        let mut meta: Metadata = serde_json::from_value(json_value).map_err(|e| {
-            to_py_err(WyrdConfigError::Schema {
-                message: format!("metadata dict invalid: {e}"),
-                path: PathBuf::from(METADATA_SENTINEL),
-            })
-        })?;
+        let mut meta: Metadata = serde_json::from_value(json_value)
+            .map_err(|e| schema_error(format!("metadata dict invalid: {e}")))?;
 
         core_apply_defaults(&mut meta, &card_kind, &self.inner);
 
@@ -81,61 +77,40 @@ impl WyrdConfigPy {
     }
 }
 
-fn extract_card_kind(value: &Bound<'_, PyAny>) -> PyResult<CardKind> {
+fn extract_card_kind(value: &Bound<'_, PyAny>) -> WyrdPyResult<CardKind> {
     if let Ok(s) = value.extract::<String>() {
-        return CardKind::from_wire_name(&s).ok_or_else(|| {
-            to_py_err(WyrdConfigError::Schema {
-                message: format!("unknown CardKind: {s}"),
-                path: PathBuf::from(METADATA_SENTINEL),
-            })
-        });
+        return CardKind::from_wire_name(&s)
+            .ok_or_else(|| schema_error(format!("unknown CardKind: {s}")));
     }
     let name: String = value.getattr("name").and_then(|n| n.extract())?;
-    CardKind::from_wire_name(&name).ok_or_else(|| {
-        to_py_err(WyrdConfigError::Schema {
-            message: format!("unknown CardKind: {name}"),
-            path: PathBuf::from(METADATA_SENTINEL),
-        })
-    })
+    CardKind::from_wire_name(&name).ok_or_else(|| schema_error(format!("unknown CardKind: {name}")))
 }
 
 fn write_merge_outputs<'py>(
     py: Python<'py>,
     target: &Bound<'py, PyDict>,
     meta: &Metadata,
-) -> PyResult<()> {
+) -> WyrdPyResult<()> {
     let mut payload = serde_json::Map::new();
     if let Some(s) = &meta.space {
         payload.insert(
             "space".into(),
-            serde_json::to_value(s).map_err(|e| {
-                to_py_err(WyrdConfigError::Schema {
-                    message: format!("metadata reserialize failed: {e}"),
-                    path: PathBuf::from(METADATA_SENTINEL),
-                })
-            })?,
+            serde_json::to_value(s)
+                .map_err(|e| schema_error(format!("metadata reserialize failed: {e}")))?,
         );
     }
     if !meta.labels.is_empty() {
         payload.insert(
             "labels".into(),
-            serde_json::to_value(&meta.labels).map_err(|e| {
-                to_py_err(WyrdConfigError::Schema {
-                    message: format!("metadata reserialize failed: {e}"),
-                    path: PathBuf::from(METADATA_SENTINEL),
-                })
-            })?,
+            serde_json::to_value(&meta.labels)
+                .map_err(|e| schema_error(format!("metadata reserialize failed: {e}")))?,
         );
     }
     if !meta.annotations.is_empty() {
         payload.insert(
             "annotations".into(),
-            serde_json::to_value(&meta.annotations).map_err(|e| {
-                to_py_err(WyrdConfigError::Schema {
-                    message: format!("metadata reserialize failed: {e}"),
-                    path: PathBuf::from(METADATA_SENTINEL),
-                })
-            })?,
+            serde_json::to_value(&meta.annotations)
+                .map_err(|e| schema_error(format!("metadata reserialize failed: {e}")))?,
         );
     }
     for (k, v) in &payload {
@@ -145,10 +120,23 @@ fn write_merge_outputs<'py>(
     Ok(())
 }
 
-/// Convert a `WyrdConfigError` to a typed `wyrd.errors.Cfg*` Python exception.
-fn to_py_err(err: WyrdConfigError) -> PyErr {
-    let wyrd_err: WyrdError = err.into();
-    wyrd_utils::py::wyrd_error_to_py_err(wyrd_err)
+impl From<WyrdConfigError> for WyrdPyError {
+    /// Project a configuration failure onto the shared Wyrd boundary adapter.
+    fn from(error: WyrdConfigError) -> Self {
+        Self::from(WyrdError::from(error))
+    }
+}
+
+/// Build a configuration schema failure for the synthetic metadata-dict path.
+///
+/// Every boundary failure in this module originates from the caller's metadata
+/// dictionary rather than a file on disk, so they share the same sentinel path.
+fn schema_error(message: String) -> WyrdPyError {
+    WyrdConfigError::Schema {
+        message,
+        path: PathBuf::from(METADATA_SENTINEL),
+    }
+    .into()
 }
 
 /// Register the `wyrd.config` submodule on the py-wyrd aggregator.

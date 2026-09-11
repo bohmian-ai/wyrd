@@ -12,8 +12,9 @@ use crate::data::interfaces::kinds::{
     PandasInterface, ParquetInterface, PolarsInterface, SqlInterface, TextInterface,
     TorchInterface,
 };
-use crate::error::{CardPyResult, WyrdPyError};
 use wyrd_spec::card::data::{CustomDataMeta, DataInterface as RustDataInterface, DataSchema};
+#[cfg(feature = "python")]
+use wyrd_utils::py::WyrdPyResult;
 
 /// Python-compatible dispatch wrapper for local data interface holders.
 #[cfg(feature = "python")]
@@ -47,7 +48,7 @@ pub enum DataInterfaceHandle {
 #[cfg(feature = "python")]
 impl DataInterfaceHandle {
     /// Build a handle from an explicit Python `DataInterface` object.
-    pub fn from_interface(interface: &Bound<'_, PyAny>) -> CardPyResult<Self> {
+    pub fn from_interface(interface: &Bound<'_, PyAny>) -> WyrdPyResult<Self> {
         macro_rules! extract_interface {
             ($type:ty, $variant:ident) => {
                 if interface.is_instance_of::<$type>() {
@@ -73,13 +74,11 @@ impl DataInterfaceHandle {
             return Ok(Self::Subclass(interface.clone().unbind()));
         }
 
-        Err(WyrdPyError::validation(
-            "DataCard requires a supported data interface",
-        ))
+        Err(crate::error::validation("DataCard requires a supported data interface").into())
     }
 
     /// Detect and build a default interface holder from raw Python data.
-    pub fn from_raw(py: Python<'_>, data: &Bound<'_, PyAny>) -> CardPyResult<Self> {
+    pub fn from_raw(py: Python<'_>, data: &Bound<'_, PyAny>) -> WyrdPyResult<Self> {
         match dtype::detect_data_source(py, data)? {
             DataSourceKind::Pandas => Ok(Self::Pandas(PandasInterface {
                 data: Some(Arc::new(data.clone().unbind())),
@@ -140,7 +139,7 @@ impl DataInterfaceHandle {
     }
 
     /// Convert this holder into Rust-only interface metadata.
-    pub fn to_spec_interface(&self, py: Python<'_>) -> CardPyResult<RustDataInterface> {
+    pub fn to_spec_interface(&self, py: Python<'_>) -> WyrdPyResult<RustDataInterface> {
         match self {
             Self::Pandas(value) => value.to_spec_interface(py),
             Self::Polars(value) => value.to_spec_interface(py),
@@ -162,7 +161,7 @@ impl DataInterfaceHandle {
     }
 
     /// Convert this handle back into a Python interface object.
-    pub fn into_py_any(self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+    pub fn into_py_any(self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         macro_rules! into_py {
             ($value:expr, $kind:literal) => {
                 Ok(Py::new(py, ($value, DataInterface::marker($kind)))?.into_any())
@@ -225,7 +224,7 @@ impl DataInterfaceHandle {
         &self,
         py: Python<'_>,
         data: &Bound<'_, PyAny>,
-    ) -> CardPyResult<DataSchema> {
+    ) -> WyrdPyResult<DataSchema> {
         if matches!(self, Self::Subclass(_)) {
             return Ok(DataSchema::empty());
         }

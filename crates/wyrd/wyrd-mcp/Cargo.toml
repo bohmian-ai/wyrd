@@ -6,32 +6,47 @@ license = { workspace = true }
 rust-version = { workspace = true }
 repository = { workspace = true }
 authors = { workspace = true }
-
-[[bin]]
-name = "wyrd-mcp"
-path = "src/main.rs"
+autotests = false
 
 [lib]
 path = "src/lib.rs"
 
+# Single owner for MCP journeys. `autotests = false` is required alongside it:
+# with auto-discovery on, `connectivity.rs` would become a target of its own in
+# addition to being a module of `mcp`, compiling that source into two binaries.
+# A new MCP journey is registered by adding a `mod` line in
+# `tests/bifrost/mcp/main.rs`, not a `mise.toml` line.
+[[test]]
+name = "mcp"
+path = "tests/bifrost/mcp/main.rs"
+
 [dependencies]
 wyrd-client = { workspace = true }
-wyrd-registry = { workspace = true }
-wyrd-spec = { workspace = true }
-wyrd-runtime = { workspace = true }
-skald-tool = { workspace = true }
-async-trait = { workspace = true }
-schemars = { workspace = true }
-serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
-strum = { workspace = true }
+# Streamable HTTP MCP client only: `wyrd-mcp` connects to Wyrd's `/mcp`
+# endpoint, it never serves the protocol.
+rmcp = { workspace = true, features = [
+    "client",
+    "transport-streamable-http-client-reqwest",
+] }
+http = { workspace = true }
+sse-stream = { workspace = true }
+futures-util = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
 wyrd-testing = { workspace = true }
-wyrd-client = { workspace = true }
+# Journey plumbing only: the discovery journey registers a second tenant's
+# table through the production catalog so the list projection's tenancy claim
+# is about two real tables, not one.
+vala-bifrost-redux = { workspace = true, features = ["test-support"] }
+arrow = { workspace = true }
+wyrd-server = { workspace = true, features = ["test-support"] }
+wyrd-spec = { workspace = true }
+wyrd-runtime = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 secrecy = { workspace = true }
-url = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+sqlx = { workspace = true }

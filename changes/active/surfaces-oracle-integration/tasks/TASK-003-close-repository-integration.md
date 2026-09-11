@@ -37,6 +37,7 @@ and GitHub Actions so the complete revision-5 candidate is demonstrably green.
 - Exclude compiled `.node` files from the tree. Do not rewrite history; that is
   a separately authorized prerequisite for entering `main`.
 - Keep live Oracle UI integration outside this change.
+- There is no such thing as a pre-existing failure anymore. All failures must be explicitly handled within the current execution context.
 
 ## Relevant Surface
 

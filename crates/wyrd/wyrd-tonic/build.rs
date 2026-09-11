@@ -31,9 +31,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let build_server = std::env::var_os("CARGO_FEATURE_SERVER").is_some();
     let build_client = std::env::var_os("CARGO_FEATURE_CLIENT").is_some();
 
-    tonic_build::configure()
+    tonic_prost_build::configure()
         .build_server(build_server)
         .build_client(build_client)
+        .bytes(".wyrd.v1.InsertBatchRequest.arrow_ipc")
+        .bytes(".wyrd.v1.InsertBatchRequest.wyrd_batch_id")
+        .bytes(".wyrd.v1.InsertBatchResponse.wyrd_batch_id")
         .file_descriptor_set_path(&descriptor)
         .compile_protos(&[proto], &[proto_dir])?;
 

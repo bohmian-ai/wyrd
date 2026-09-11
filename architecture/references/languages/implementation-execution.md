@@ -45,9 +45,11 @@ Before editing, establish:
 
 - objective, requirements, non-goals, and acceptance criteria;
 - allowed and prohibited material scope;
-- owners, interfaces, invariants, and normative control flow;
-- dependencies and exact required features;
-- tests, focused verification, and completion evidence;
+- expensive-to-reverse ownership, interface, and invariant decisions already
+  fixed by the task or architecture;
+- likely owners and consumers, without treating paths as a private
+  implementation allowlist;
+- focused verification and completion evidence; and
 - material stop conditions.
 
 An approved task is the normal input for a spec-driven change. Bounded direct
@@ -57,6 +59,10 @@ that exception to bypass an approved spec or unresolved material design.
 
 Keep the checklist live until every actionable requirement and required proof
 is complete.
+
+Do not require the task to predict helpers, private methods, local module
+structure, exact control flow, already-approved dependency APIs, test fixture
+structure, or other reversible choices. The implementation agent owns them.
 
 ## Three execution classes
 
@@ -278,9 +284,12 @@ Durable execution notes must follow [Execution record](#execution-record).
 
 ## Completion standard
 
-`COMPLETE` requires every acceptance criterion and required proof to pass, no
-prohibited change, sequential verification, a clean diff audit, and recorded
-bounded corrections.
+`IMPLEMENTED` requires every acceptance criterion and required proof to pass, every
+non-goal to remain excluded, no unrelated or prohibited change, sequential
+verification, a clean diff audit, and recorded bounded corrections.
+
+Implementation is not task completion. The task completes only after an
+independent `$wyrd-task-review` returns `PASS`.
 
 `BLOCKED` requires evidence that no in-scope solution remains without a
 material decision or genuinely unavailable authority. Difficulty, elapsed
@@ -292,13 +301,19 @@ Use this report:
 ```markdown
 ## Task Result
 
-Status: COMPLETE | BLOCKED
+Status: IMPLEMENTED | BLOCKED
 
 ### Summary
 <Implemented outcome>
 
 ### Acceptance Criteria
-- AC1: PASS | FAIL | UNVERIFIED — <source and test evidence>
+
+| Criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| AC1 | <source> | <test or check> | PASS | FAIL | UNVERIFIED |
+
+### Non-goals
+- <non-goal>: EXCLUDED | VIOLATED — <diff evidence>
 
 ### Files Changed
 - `path` — <requirement or acceptance criterion>

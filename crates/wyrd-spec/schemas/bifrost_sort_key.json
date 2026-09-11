@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SortKeyWire",
+  "description": "One declared physical sort key.",
+  "type": "object",
+  "required": [
+    "column",
+    "direction",
+    "null_order"
+  ],
+  "properties": {
+    "column": {
+      "description": "Sorted column; must exist in the complete physical schema.",
+      "type": "string"
+    },
+    "direction": {
+      "description": "Sort direction.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/SortDirectionWire"
+        }
+      ]
+    },
+    "null_order": {
+      "description": "Null placement.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/NullOrderWire"
+        }
+      ]
+    }
+  },
+  "definitions": {
+    "NullOrderWire": {
+      "description": "Null placement of one declared physical sort key.",
+      "oneOf": [
+        {
+          "description": "Nulls sort before non-null values.",
+          "type": "string",
+          "enum": [
+            "first"
+          ]
+        },
+        {
+          "description": "Nulls sort after non-null values.",
+          "type": "string",
+          "enum": [
+            "last"
+          ]
+        }
+      ]
+    },
+    "SortDirectionWire": {
+      "description": "Sort direction of one declared physical sort key.",
+      "oneOf": [
+        {
+          "description": "Ascending.",
+          "type": "string",
+          "enum": [
+            "asc"
+          ]
+        },
+        {
+          "description": "Descending.",
+          "type": "string",
+          "enum": [
+            "desc"
+          ]
+        }
+      ]
+    }
+  }
+}

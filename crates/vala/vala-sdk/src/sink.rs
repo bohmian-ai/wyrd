@@ -1,59 +1,50 @@
-//! The swap seam: [`BifrostIngestSink`], a `wyrd-queue` [`BatchSink`] that maps
-//! a sealed Record batch onto the ingest RPC.
+//! The owned Bifrost ingest handoff from `wyrd-queue` to ordinary Rust gRPC.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use wyrd_queue::{BatchSink, SealedBatch};
-use wyrd_spec::error::WyrdError;
+use wyrd_queue::{BatchSink, ClientByteGuard, DurableBatchAck, SealedBatch, SinkError};
 
-/// The ingest RPC seam mirroring `wyrd.v1.BifrostIngestService::InsertBatch`.
-///
-/// One call ships one sealed batch: the destination `table`, the 16-byte
-/// idempotency `batch_id` (proto `wyrd_batch_id`), and the Arrow IPC `frames`
-/// (proto `arrow_ipc`, carrying the per-row `card_ref`/`run_id` correlation
-/// columns). Returns `rows_accepted`. The concrete gRPC client-streaming
-/// transport is wired in a later transport commit; this seam keeps
-/// [`BifrostIngestSink`] fully unit-testable server-free.
+/// The ordinary Rust transport seam for one owned batch guard type.
 #[async_trait]
-pub trait IngestTransport: Send + Sync + 'static {
-    /// Ship one sealed batch to the ingest service; return `rows_accepted`.
-    ///
-    /// Must be **idempotent on `batch_id`** — a retry re-sends the same id so
-    /// the server's `olap_commits` dedup holds.
+pub trait IngestTransport<G>: Send + Sync + 'static {
+    /// Borrows one owned batch while the queue retains its recovery shell.
     ///
     /// # Errors
-    /// Returns a [`WyrdError`] mapped from the transport/server failure.
-    async fn insert_batch(
-        &self,
-        table: &str,
-        batch_id: [u8; 16],
-        frames: Vec<u8>,
-    ) -> Result<u64, WyrdError>;
+    ///
+    /// Returns [`SinkError::Retryable`] when timeout or transport loss leaves
+    /// durable commit ambiguous, or when stable no-write
+    /// `WYRD_VALA_429_INGEST_BUSY` requires retry. In both cases the queue
+    /// retains the exact UUID, bytes, allocation guard, and retry permit.
+    /// Terminal failure lets the queue consume that owner.
+    async fn insert_batch(&self, batch: &SealedBatch<G>) -> Result<DurableBatchAck, SinkError>;
 }
 
-/// The Record-kind [`BatchSink`]: hands each sealed batch to the ingest RPC.
-///
-/// The sink adds no state of its own beyond the transport — `batch_id` is
-/// forwarded verbatim into the RPC, so idempotency is preserved across the
-/// producer's re-send-on-failure path.
+/// The Record queue sink that forwards each non-cloneable batch to gRPC.
 pub struct BifrostIngestSink {
-    transport: Arc<dyn IngestTransport>,
+    transport: Arc<dyn IngestTransport<ClientByteGuard>>,
 }
 
 impl BifrostIngestSink {
-    /// Build the sink over an [`IngestTransport`].
+    /// Builds a sink over the ordinary Rust owned-batch transport.
     #[must_use]
-    pub fn new(transport: Arc<dyn IngestTransport>) -> Self {
+    pub fn new(transport: Arc<dyn IngestTransport<ClientByteGuard>>) -> Self {
         Self { transport }
     }
 }
 
 #[async_trait]
-impl BatchSink for BifrostIngestSink {
-    async fn send(&self, batch: SealedBatch) -> Result<u64, WyrdError> {
-        self.transport
-            .insert_batch(&batch.table, batch.batch_id, batch.frames)
-            .await
+impl BatchSink<ClientByteGuard> for BifrostIngestSink {
+    /// Forwards a borrowed sealed owner to the ordinary-Rust transport.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the transport's retryable or terminal settlement without
+    /// consuming the queue-owned batch shell.
+    async fn send(
+        &self,
+        batch: &SealedBatch<ClientByteGuard>,
+    ) -> Result<DurableBatchAck, SinkError> {
+        self.transport.insert_batch(batch).await
     }
 }

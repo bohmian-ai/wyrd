@@ -23,7 +23,6 @@ pub mod error;
 pub mod journal;
 pub mod loop_runtime;
 #[cfg(feature = "python")]
-pub mod py_error;
 #[cfg(feature = "python")]
 pub mod python;
 pub mod registry;

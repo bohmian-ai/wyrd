@@ -39,9 +39,12 @@ class WyrdError(Exception):
     """Python-facing Wyrd error with stable metadata.
 
     Wyrd raises this exception for validation and boundary failures that have a
-    durable Wyrd error code. The attributes are intended for both humans and
-    agents: `code` is stable, `message` explains the failure, `details` carries
-    structured context, and `remediation` tells the caller what to change next.
+    durable Wyrd error code. Every attribute is projected from one RFC 9457
+    problem document, so every direct attribute agrees with that projection:
+    `code` is stable, `message` and `detail` carry the same human-readable
+    failure text, `details` carries structured context, `status`, `title`, and
+    `type` mirror the problem document, and `remediation` tells the caller what
+    to change next.
     """
 
     code: str
@@ -49,6 +52,9 @@ class WyrdError(Exception):
     detail: str
     details: dict[str, Any] | None
     remediation: str
+    status: int
+    title: str
+    type: str
 
     def __init__(
         self,
@@ -146,6 +152,27 @@ class SessionError(WyrdError):
         """
         ...
 
+def build_wyrd_error(
+    code: str,
+    message: str,
+    details: dict[str, Any] | None = None,
+) -> WyrdError:
+    """Build a fully populated Wyrd error from a stable catalog code.
+
+    Pure Python helpers use this instead of constructing an exception and
+    assigning a subset of its attributes, so every raised error carries the
+    catalog's status, title, type, and remediation.
+
+    Args:
+        code (str): Stable Wyrd error code.
+        message (str): Human-readable failure message.
+        details (dict[str, Any] | None): Optional structured context.
+
+    Returns:
+        WyrdError: Exception instance carrying complete Wyrd metadata.
+    """
+    ...
+
 def _init() -> None:
     """Initialize the native Wyrd extension."""
     ...
@@ -157,4 +184,5 @@ __all__ = [
     "ToolError",
     "WyrdError",
     "_init",
+    "build_wyrd_error",
 ]

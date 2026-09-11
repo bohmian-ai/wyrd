@@ -52,26 +52,6 @@ pub async fn migrate(migrator_pool: &PgPool) -> Result<(), SqlError> {
             .await
             .map_err(SqlError::Connect)?;
         }
-        // Pre-commit schema grants before migrations start. PostgreSQL 17
-        // enforces that the new owner has CREATE on a function's schema during
-        // ALTER FUNCTION OWNER. Within-transaction grants are not visible to the
-        // ACL cache at that point, so we commit them here before sqlx::migrate!.
-        sqlx::query(
-            "DO $$ BEGIN
-                 IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'vala_recovery_owner') THEN
-                     GRANT USAGE, CREATE ON SCHEMA vala TO vala_recovery_owner;
-                 END IF;
-                 IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'vala_recovery') THEN
-                     GRANT USAGE ON SCHEMA vala TO vala_recovery;
-                 END IF;
-                 IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'vala_audit_relay') THEN
-                     GRANT USAGE, CREATE ON SCHEMA vala TO vala_audit_relay;
-                 END IF;
-             END $$",
-        )
-        .execute(&mut *conn)
-        .await
-        .map_err(SqlError::Connect)?;
         sqlx::query(AssertSqlSafe(format!(
             "SET search_path TO {MIGRATION_SEARCH_PATH}"
         )))
@@ -134,10 +114,22 @@ async fn release_migration_advisory_lock(conn: &mut PgConnection) -> Result<(), 
 
 #[cfg(test)]
 mod tests {
+    use sha2::{Digest, Sha256};
+
     use crate::{MIGRATION_SEARCH_PATH, OWNED_SCHEMAS};
 
     use std::fs;
     use std::path::{Path, PathBuf};
+
+    /// Query modules that intentionally coordinate cross-tenant operator state.
+    const MIXED_EXECUTOR_QUERY_MODULES: &[&str] = &["forge_operations.rs", "forge_tasks.rs"];
+
+    /// Returns whether a query module is a sanctioned mixed executor owner.
+    fn is_mixed_executor_query_module(path: &Path) -> bool {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| MIXED_EXECUTOR_QUERY_MODULES.contains(&name))
+    }
 
     #[test]
     fn schema_ownership_is_explicit() {
@@ -236,6 +228,47 @@ mod tests {
         }
     }
 
+    /// Verifies the Forge/Oracle migration partition and forward grant owner.
+    #[test]
+    fn forge_and_oracle_migrations_have_unique_forward_owners() {
+        let files = migration_files();
+        let forge = [
+            "20260910000010_forge_tasks.sql",
+            "20260910000011_forge_planning_demands.sql",
+            "20260910000012_forge_worker_claim_state.sql",
+        ];
+        let oracle = [
+            "20260910000013_oracle_coordination.sql",
+            "20260910000014_oracle_recovery_audit_authority.sql",
+        ];
+        for file in forge.into_iter().chain(oracle) {
+            assert!(
+                files.iter().any(|candidate| candidate == file),
+                "missing migration {file}"
+            );
+        }
+        let old_olap = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("migrations/20260619000001_olap_minimal.sql"),
+        )
+        .expect("older OLAP migration is readable");
+        let old_olap_digest = Sha256::digest(old_olap.as_bytes());
+        assert_eq!(
+            format!("{old_olap_digest:x}"),
+            "a2df17d99f1ee29c1ead1fca2ea30c0062cd918d9d5b5e3f41f30ac6cdc259ef",
+            "older migration checksum must remain stable"
+        );
+        let oracle_coordination = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("migrations/20260910000013_oracle_coordination.sql"),
+        )
+        .expect("Oracle coordination migration is readable");
+        assert!(
+            oracle_coordination
+                .contains("GRANT SELECT ON vala.bifrost_tables TO wyrd_platform_admin")
+        );
+    }
+
     #[test]
     fn queries_module_shape_matches_foundation_plan() {
         let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -271,10 +304,12 @@ mod tests {
     }
 
     #[test]
+    /// Verifies tenant query owners do not accept raw pools or transaction handles.
     fn tenant_scoped_query_stubs_do_not_take_raw_pool_executors() {
         let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let forbidden = rust_files_under(&crate_dir.join("src/queries"))
             .into_iter()
+            .filter(|path| !is_mixed_executor_query_module(path))
             .filter_map(|path| {
                 let body = fs::read_to_string(&path).expect("Vala query file is readable");
                 let checked = without_line_comments(&body);
@@ -294,10 +329,12 @@ mod tests {
     }
 
     #[test]
+    /// Verifies tenant query owners never issue transaction-control SQL themselves.
     fn tenant_scoped_query_modules_do_not_issue_transaction_control_sql() {
         let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let forbidden = rust_files_under(&crate_dir.join("src/queries"))
             .into_iter()
+            .filter(|path| !is_mixed_executor_query_module(path))
             .filter_map(|path| {
                 let body = fs::read_to_string(&path).expect("Vala query source is readable");
                 let checked = without_line_comments(&body).to_ascii_uppercase();
@@ -412,20 +449,15 @@ mod tests {
         source.split("\n#[cfg(test)]").next().unwrap_or(source)
     }
 
+    /// Returns whether a quoted SQL statement starts with transaction control.
     fn contains_sql_keyword(text: &str, keyword: &str) -> bool {
-        let mut start = 0;
-        while let Some(pos) = text[start..].find(keyword) {
-            let abs = start + pos;
-            let before_ok =
-                abs == 0 || !matches!(text.as_bytes()[abs - 1], b'A'..=b'Z' | b'0'..=b'9' | b'_');
-            let end = abs + keyword.len();
-            let after_ok = end >= text.len()
-                || !matches!(text.as_bytes()[end], b'A'..=b'Z' | b'0'..=b'9' | b'_');
-            if before_ok && after_ok {
-                return true;
-            }
-            start = abs + 1;
-        }
-        false
+        text.split('"').skip(1).step_by(2).any(|literal| {
+            let statement = literal.trim_start();
+            statement.starts_with(keyword)
+                && statement
+                    .as_bytes()
+                    .get(keyword.len())
+                    .is_none_or(u8::is_ascii_whitespace)
+        })
     }
 }

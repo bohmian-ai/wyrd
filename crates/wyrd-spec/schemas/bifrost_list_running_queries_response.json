@@ -1,0 +1,152 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ListRunningQueriesResponse",
+  "description": "Response containing every active Oracle query visible to one tenant.",
+  "type": "object",
+  "required": [
+    "queries"
+  ],
+  "properties": {
+    "queries": {
+      "description": "Active request summaries in deterministic request-ID order.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/RunningQuerySummary"
+      }
+    }
+  },
+  "definitions": {
+    "QueryClass": {
+      "description": "Server-derived admission class.",
+      "oneOf": [
+        {
+          "description": "Latency-sensitive bounded work.",
+          "type": "string",
+          "enum": [
+            "interactive"
+          ]
+        },
+        {
+          "description": "Larger analytical work.",
+          "type": "string",
+          "enum": [
+            "analytical"
+          ]
+        }
+      ]
+    },
+    "RequestId": {
+      "description": "Request correlation ID; required to be a UUID v7.",
+      "type": "string"
+    },
+    "RunningQueryLifecycleState": {
+      "description": "The current non-terminal lifecycle state of an admitted Oracle query.\n\nThe state is projected by live controls only; completed queries are removed from the in-memory registry and are not durable query jobs.",
+      "oneOf": [
+        {
+          "description": "Admission completed and execution has not emitted progress yet.",
+          "type": "string",
+          "enum": [
+            "admitted"
+          ]
+        },
+        {
+          "description": "The selected participant cut is executing.",
+          "type": "string",
+          "enum": [
+            "running"
+          ]
+        },
+        {
+          "description": "A caller requested cancellation and owners are draining the cut.",
+          "type": "string",
+          "enum": [
+            "cancelling"
+          ]
+        }
+      ]
+    },
+    "RunningQueryProgress": {
+      "description": "Aggregate progress for one request-ID-keyed Oracle query.",
+      "type": "object",
+      "required": [
+        "completed_participants",
+        "total_participants"
+      ],
+      "properties": {
+        "completed_participants": {
+          "description": "Number of selected participants that have reported completion.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "total_participants": {
+          "description": "Exact number of participants frozen into the immutable cut.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "RunningQuerySummary": {
+      "description": "Public summary for one active Oracle query.\n\nThis contract deliberately excludes SQL text, parameters, Arrow batches, and result rows. A summary is tenant-scoped by the serving boundary.",
+      "type": "object",
+      "required": [
+        "cancellation_requested",
+        "deadline",
+        "progress",
+        "query_class",
+        "request_id",
+        "started_at",
+        "state"
+      ],
+      "properties": {
+        "cancellation_requested": {
+          "description": "Whether cancellation has been requested for this request identity.",
+          "type": "boolean"
+        },
+        "deadline": {
+          "description": "Absolute query deadline.",
+          "type": "string",
+          "format": "date-time"
+        },
+        "progress": {
+          "description": "Aggregate progress over the immutable participant cut.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/RunningQueryProgress"
+            }
+          ]
+        },
+        "query_class": {
+          "description": "Server-derived admission class.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/QueryClass"
+            }
+          ]
+        },
+        "request_id": {
+          "description": "Stable request identity used by live controls.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/RequestId"
+            }
+          ]
+        },
+        "started_at": {
+          "description": "Wall-clock admission time.",
+          "type": "string",
+          "format": "date-time"
+        },
+        "state": {
+          "description": "Current non-terminal lifecycle state.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/RunningQueryLifecycleState"
+            }
+          ]
+        }
+      }
+    }
+  }
+}

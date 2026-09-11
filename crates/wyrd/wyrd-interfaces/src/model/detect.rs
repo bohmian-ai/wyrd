@@ -50,9 +50,9 @@ impl ModelInterfaceKind {
 pub fn detect_interface_variant(
     py: pyo3::Python<'_>,
     model: &pyo3::Bound<'_, pyo3::types::PyAny>,
-) -> crate::error::CardPyResult<ModelInterfaceKind> {
+) -> wyrd_utils::py::WyrdPyResult<ModelInterfaceKind> {
     use crate::data::dtype::is_framework_class;
-    use crate::error::WyrdPyError;
+
     use pyo3::types::PyAnyMethods;
 
     if is_framework_class(py, model, "transformers", "PreTrainedModel")? {
@@ -93,7 +93,7 @@ pub fn detect_interface_variant(
         .getattr("__qualname__")
         .and_then(|value| value.extract::<String>())
         .unwrap_or_else(|_| "unknown".to_string());
-    Err(WyrdPyError::unknown_model_type(module, type_name))
+    Err(crate::error::unknown_model_type(module, type_name).into())
 }
 
 #[cfg(test)]

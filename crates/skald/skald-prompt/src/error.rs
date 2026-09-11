@@ -84,7 +84,7 @@ impl PromptBuilderError {
 }
 
 #[cfg(feature = "python")]
-impl From<PromptBuilderError> for wyrd_interfaces::error::WyrdPyError {
+impl From<PromptBuilderError> for wyrd_utils::py::WyrdPyError {
     fn from(error: PromptBuilderError) -> Self {
         use serde_json::json;
         let message = error.to_string();

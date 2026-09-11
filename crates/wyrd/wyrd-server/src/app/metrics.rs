@@ -5,20 +5,85 @@
 //! it, and `/metrics` renders the current snapshot on a dedicated listener.
 
 use std::future::ready;
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::OnceLock;
 
 use axum::{Router, routing::get};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
+use wyrd_telemetry::{TelemetryConfig, TelemetryGuard};
 
 /// Histogram buckets (seconds) for request-duration metrics.
 const REQUEST_DURATION_BUCKETS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
 
+/// Forge and Bifrost-query duration buckets shared by deployed processes and
+/// the read-only benchmark capture.
+const BIFROST_DURATION_BUCKETS: &[f64] = &[
+    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
+    600.0, 1800.0,
+];
+
 /// Wyrd metric names. Keep these stable — dashboards depend on them.
 pub const HTTP_REQUESTS_TOTAL: &str = "wyrd_http_requests_total";
 pub const HTTP_REQUEST_DURATION_SECONDS: &str = "wyrd_http_request_duration_seconds";
+
+/// Production-facing query duration metric.
+pub const BIFROST_QUERY_DURATION_SECONDS: &str = "bifrost_query_duration_seconds";
+/// Production-facing Forge task duration metric.
+pub const BIFROST_FORGE_TASK_DURATION_SECONDS: &str = "bifrost_forge_task_duration_seconds";
+/// Gate request latency observed at the public write/query boundary.
+pub const BIFROST_GATE_REQUEST_DURATION_SECONDS: &str = "bifrost_gate_request_duration_seconds";
+/// Gate query-stream lifetime from dispatch through terminal consumption.
+pub const BIFROST_GATE_QUERY_STREAM_DURATION_SECONDS: &str =
+    "bifrost_gate_query_stream_duration_seconds";
+/// Scribe durable acknowledgement latency.
+pub const BIFROST_SCRIBE_ACK_SECONDS: &str = "bifrost_scribe_ack_seconds";
+/// Scribe ingress queue wait latency.
+pub const BIFROST_SCRIBE_QUEUE_WAIT_SECONDS: &str = "bifrost_scribe_queue_wait_seconds";
+/// Scribe execution-lane job latency.
+pub const BIFROST_SCRIBE_LANE_JOB_SECONDS: &str = "bifrost_scribe_lane_job_seconds";
+/// Scribe persistence publication latency.
+pub const BIFROST_SCRIBE_PERSISTENCE_PUBLICATION_SECONDS: &str =
+    "bifrost_scribe_persistence_publication_seconds";
+/// Scribe seal-stage latency.
+pub const BIFROST_SCRIBE_SEAL_STAGE_SECONDS: &str = "bifrost_scribe_seal_stage_seconds";
+/// Scribe physical WAL append latency.
+pub const BIFROST_SCRIBE_WAL_APPEND_SECONDS: &str = "bifrost_scribe_wal_append_seconds";
+/// Scribe physical WAL fsync latency.
+pub const BIFROST_SCRIBE_WAL_FSYNC_SECONDS: &str = "bifrost_scribe_wal_fsync_seconds";
+/// Wyrd PostgreSQL tenant-pool acquisition latency.
+pub const WYRD_POSTGRES_POOL_ACQUIRE_SECONDS: &str = "wyrd_postgres_pool_acquire_seconds";
+/// Vala PostgreSQL tenant-pool acquisition latency.
+pub const VALA_POSTGRES_POOL_ACQUIRE_SECONDS: &str = "vala_postgres_pool_acquire_seconds";
+/// Shared storage operation latency.
+pub const WYRD_STORAGE_OPERATION_DURATION_SECONDS: &str = "wyrd_storage_operation_duration_seconds";
+
+/// Every production Bifrost duration family whose p99 is consumed by qualification.
+const BIFROST_P99_DURATION_FAMILIES: &[&str] = &[
+    BIFROST_QUERY_DURATION_SECONDS,
+    BIFROST_GATE_REQUEST_DURATION_SECONDS,
+    BIFROST_GATE_QUERY_STREAM_DURATION_SECONDS,
+    BIFROST_SCRIBE_ACK_SECONDS,
+    BIFROST_SCRIBE_QUEUE_WAIT_SECONDS,
+    BIFROST_SCRIBE_LANE_JOB_SECONDS,
+    BIFROST_SCRIBE_PERSISTENCE_PUBLICATION_SECONDS,
+    BIFROST_SCRIBE_SEAL_STAGE_SECONDS,
+    BIFROST_SCRIBE_WAL_APPEND_SECONDS,
+    BIFROST_SCRIBE_WAL_FSYNC_SECONDS,
+    BIFROST_FORGE_TASK_DURATION_SECONDS,
+    "oracle_admission_queue_duration_seconds",
+    "oracle_query_duration_seconds",
+    "oracle_query_time_to_first_batch_seconds",
+    "oracle_fragment_duration_seconds",
+    "oracle_audit_append_duration_seconds",
+    WYRD_POSTGRES_POOL_ACQUIRE_SECONDS,
+    VALA_POSTGRES_POOL_ACQUIRE_SECONDS,
+    WYRD_STORAGE_OPERATION_DURATION_SECONDS,
+];
 
 /// Errors installing the Prometheus recorder.
 #[derive(Debug, thiserror::Error)]
@@ -31,6 +96,78 @@ pub enum MetricsError {
     Install(#[source] metrics_exporter_prometheus::BuildError),
 }
 
+/// Error returned while composing Wyrd's process-wide telemetry runtime.
+#[derive(Debug, thiserror::Error)]
+pub enum TelemetryRuntimeError {
+    /// The production tracing provider could not be installed.
+    #[error("failed to install Wyrd tracing provider")]
+    Tracing(#[source] wyrd_spec::error::WyrdError),
+    /// The production Prometheus recorder could not be installed.
+    #[error("failed to install Wyrd Prometheus recorder")]
+    Metrics(#[source] MetricsError),
+}
+
+/// Server-owned composition of canonical tracing and Prometheus backends.
+///
+/// The runtime is installed once before server or standalone Forge role
+/// composition. `AppState` retains only [`TelemetryGuard`]; the enclosing
+/// lifecycle retains this owner and its read-only render handle.
+pub struct WyrdTelemetryRuntime {
+    /// Guard that owns the process tracing provider lifetime.
+    guard: Arc<TelemetryGuard>,
+    /// Handle for the one process-global production Prometheus recorder.
+    prometheus: PrometheusHandle,
+}
+
+impl WyrdTelemetryRuntime {
+    /// Install the production tracing subscriber and Prometheus recorder.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TelemetryRuntimeError`] when either process-global backend
+    /// cannot be installed. Callers must retain the returned runtime until
+    /// every role has stopped.
+    pub fn install(config: TelemetryConfig) -> Result<Self, TelemetryRuntimeError> {
+        let guard = Arc::new(wyrd_telemetry::init(config).map_err(TelemetryRuntimeError::Tracing)?);
+        let prometheus = install_recorder().map_err(TelemetryRuntimeError::Metrics)?;
+        Ok(Self { guard, prometheus })
+    }
+
+    /// Return the tracing-provider lifetime guard passed into application state.
+    #[must_use]
+    pub fn guard(&self) -> Arc<TelemetryGuard> {
+        Arc::clone(&self.guard)
+    }
+
+    /// Return the production Prometheus render handle retained by lifecycle owners.
+    #[must_use]
+    pub fn prometheus(&self) -> PrometheusHandle {
+        self.prometheus.clone()
+    }
+}
+
+/// Install the same production runtime with a test-only read-only span capture.
+///
+/// # Errors
+///
+/// Returns [`TelemetryRuntimeError`] when either process-global backend cannot
+/// be installed.
+#[cfg(feature = "test-support")]
+pub fn install_capture_runtime(
+    config: TelemetryConfig,
+) -> Result<(WyrdTelemetryRuntime, wyrd_telemetry::TestTraceCapture), TelemetryRuntimeError> {
+    let (guard, traces) =
+        wyrd_telemetry::init_capture(config).map_err(TelemetryRuntimeError::Tracing)?;
+    let prometheus = install_recorder().map_err(TelemetryRuntimeError::Metrics)?;
+    Ok((
+        WyrdTelemetryRuntime {
+            guard: Arc::new(guard),
+            prometheus,
+        },
+        traces,
+    ))
+}
+
 /// Install the process-global Prometheus recorder and return its render handle.
 ///
 /// Call exactly once per process. Returns an error if a recorder is already
@@ -39,14 +176,37 @@ pub enum MetricsError {
 /// # Errors
 /// Returns [`MetricsError`] when bucket setup or global installation fails.
 pub fn install_recorder() -> Result<PrometheusHandle, MetricsError> {
-    PrometheusBuilder::new()
+    let mut builder = PrometheusBuilder::new()
         .set_buckets_for_metric(
             Matcher::Full(HTTP_REQUEST_DURATION_SECONDS.to_owned()),
             REQUEST_DURATION_BUCKETS,
         )
-        .map_err(MetricsError::Buckets)?
-        .install_recorder()
-        .map_err(MetricsError::Install)
+        .map_err(MetricsError::Buckets)?;
+    for family in BIFROST_P99_DURATION_FAMILIES {
+        builder = builder
+            .set_buckets_for_metric(
+                Matcher::Full((*family).to_owned()),
+                BIFROST_DURATION_BUCKETS,
+            )
+            .map_err(MetricsError::Buckets)?;
+    }
+    let handle = builder.install_recorder().map_err(MetricsError::Install)?;
+    vala_bifrost_redux::gate::initialize_gate_metrics();
+    Ok(handle)
+}
+
+/// Shared test-only Prometheus handle that installs the process recorder once.
+///
+/// Production composition receives its handle from [`WyrdTelemetryRuntime`].
+/// Tests that exercise a real listener use this helper so they retain the same
+/// one-recorder invariant without attempting a second global installation.
+#[cfg(test)]
+pub(crate) fn test_prometheus_handle() -> PrometheusHandle {
+    /// Holds the one test-process recorder used by listener and middleware tests.
+    static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
+    HANDLE
+        .get_or_init(|| install_recorder().expect("test recorder installs exactly once"))
+        .clone()
 }
 
 /// Build the metrics router: `GET /metrics` renders the Prometheus snapshot.
@@ -101,8 +261,6 @@ mod tests {
     // recorder exactly once via `OnceLock`.
 
     use super::*;
-    use std::sync::OnceLock;
-
     use axum::Router;
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
@@ -113,11 +271,10 @@ mod tests {
 
     use crate::http::middleware::metrics::track_metrics;
 
-    static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
-
     fn get_handle() -> &'static PrometheusHandle {
-        HANDLE
-            .get_or_init(|| install_recorder().expect("recorder installs exactly once per process"))
+        /// Holds the recorder shared by the metrics module's rendering tests.
+        static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
+        HANDLE.get_or_init(test_prometheus_handle)
     }
 
     #[test]
@@ -128,6 +285,30 @@ mod tests {
             output.is_empty() || output.contains('#'),
             "render must produce valid Prometheus text (empty or starting with # HELP/# TYPE): got {output:?}"
         );
+    }
+
+    /// Every qualification p99 family renders the configured histogram shape.
+    #[test]
+    fn bifrost_p99_families_render_bucket_count_and_sum() {
+        let handle = get_handle();
+        for family in BIFROST_P99_DURATION_FAMILIES {
+            metrics::histogram!(*family).record(0.01);
+        }
+        let output = handle.render();
+        for family in BIFROST_P99_DURATION_FAMILIES {
+            assert!(
+                output.contains(&format!("{family}_bucket")),
+                "missing buckets for {family}"
+            );
+            assert!(
+                output.contains(&format!("{family}_count")),
+                "missing count for {family}"
+            );
+            assert!(
+                output.contains(&format!("{family}_sum")),
+                "missing sum for {family}"
+            );
+        }
     }
 
     #[tokio::test]

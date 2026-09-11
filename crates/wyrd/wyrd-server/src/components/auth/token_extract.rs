@@ -96,7 +96,5 @@ pub(crate) async fn verify_authenticated_principal(
         .verify(&token, &expected_tenant)
         .await
         .map_err(WyrdErrorResponse::from)?;
-    Ok(super::AuthenticatedPrincipal {
-        principal: verified.principal.clone(),
-    })
+    Ok(super::AuthenticatedPrincipal::from_verified(verified))
 }

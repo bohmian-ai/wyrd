@@ -16,12 +16,15 @@ pub mod redaction;
 pub mod request_context;
 pub mod request_id;
 
-pub use permission::{Action, Permission, PermissionSet, Resource};
+pub use permission::{
+    Action, BifrostPermissionScope, BifrostSchemaScope, BifrostTableScope, Permission,
+    PermissionScope, PermissionScopeError, PermissionSet, Resource,
+};
 pub use permission_check::{PermissionCheck, PermissionDenyReason, PermissionVerdict, RbacCheck};
 pub use principal::{
     InvalidRoleName, Principal, PrincipalId, PrincipalKind, PrincipalRef, RoleRef,
 };
-pub use request_context::{DelegationStep, RequestContext, TraceParent};
+pub use request_context::{DelegationStep, RequestContext, TraceParent, audit_delegation_chain};
 pub use wyrd_spec::reference::CardRefScope;
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();

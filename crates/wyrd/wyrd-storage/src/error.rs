@@ -58,6 +58,9 @@ pub enum StorageError {
         /// Conflicting URL requested by the caller.
         requested: String,
     },
+    /// Process-wide Rustls provider ownership conflicts with Wyrd.
+    #[error(transparent)]
+    CryptoProvider(#[from] wyrd_tls::InstallError),
     /// Tenant path validation failed.
     #[error("tenant path mismatch: {0}")]
     TenantPathMismatch(String),
@@ -293,6 +296,9 @@ impl From<StorageError> for WyrdStorageError {
                 detail: format!(
                     "public base URL conflict: existing `{existing}`, requested `{requested}`"
                 ),
+            },
+            StorageError::CryptoProvider(error) => Self::Backend {
+                detail: error.to_string(),
             },
             StorageError::TenantPathMismatch(detail) => Self::TenantPathMismatch { detail },
             StorageError::ArtifactTooLarge { actual, limit } => {

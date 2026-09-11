@@ -10,16 +10,23 @@ authors = { workspace = true }
 [features]
 cloud = ["wyrd-storage/cloud"]
 storage-emulator = ["cloud", "wyrd-storage/emulator"]
+test-support = ["dep:iceberg", "vala-bifrost-redux/test-support", "wyrd-telemetry/test-support"]
 
 [[bin]]
 name = "wyrd-server"
 path = "src/main.rs"
 
 [dependencies]
+async-stream = { workspace = true }
+futures-util = { workspace = true }
 arc-swap = { workspace = true }
 arrow = { workspace = true }
 async-trait = { workspace = true }
+crc32c = { workspace = true }
+opendal = { workspace = true }
 datafusion = { workspace = true }
+iceberg = { workspace = true, optional = true }
+hex = { workspace = true }
 clap = { workspace = true }
 wyrd-tonic = { workspace = true, features = ["server"] }
 shellexpand = { workspace = true }
@@ -28,6 +35,13 @@ tokio = { workspace = true, features = ["signal", "net"] }
 tokio-util = { workspace = true }
 url = { workspace = true }
 axum = { workspace = true }
+# Streamable HTTP MCP server only: `wyrd-server` serves the protocol, it never
+# connects as an MCP client.
+rmcp = { workspace = true, features = [
+    "server",
+    "macros",
+    "transport-streamable-http-server",
+] }
 vala-eval = { workspace = true }
 wyrd-telemetry = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
@@ -39,6 +53,7 @@ metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 moka = { version = "0.12", features = ["future"] }
 rand = { workspace = true }
+rustix = { workspace = true }
 secrecy = { workspace = true, features = ["serde"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -51,8 +66,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true }
 vala-sql = { path = "../../vala/vala-sql", version = "0.0.1" }
-vala-bifrost = { workspace = true }
-vala-ingest = { workspace = true }
+vala-bifrost-redux = { workspace = true }
 wyrd-runtime = { workspace = true }
 wyrd-auth-issue = { workspace = true }
 wyrd-auth-oidc = { workspace = true }
@@ -64,14 +78,19 @@ wyrd-sql = { path = "../wyrd-sql", version = "0.0.1", features = ["embedded-post
 tower = { workspace = true, features = ["util", "timeout", "limit", "load-shed"] }
 tower-http = { workspace = true, features = ["trace", "catch-panic"] }
 tower_governor = { workspace = true }
+http-body = { workspace = true }
 http-body-util = "0.1"
 wyrd-spec = { workspace = true, features = ["server"] }
 wyrd-semver = { workspace = true }
+wyrd-client = { path = "../../shared/wyrd-client", version = "0.0.1" }
 wyrd-storage = { workspace = true }
+wyrd-tls = { workspace = true }
+ed25519-dalek = { workspace = true }
 utoipa = { workspace = true, features = ["yaml"] }
 
 [dev-dependencies]
 insta = { workspace = true }
+rcgen = { workspace = true }
 reqwest = { workspace = true }
 wyrd-storage = { workspace = true }
 temp-env = { workspace = true }
@@ -84,7 +103,6 @@ wyrd-auth-check = { workspace = true, features = ["test-helpers"] }
 wyrd-testing = { path = "../wyrd-testing", version = "0.0.1" }
 wyrd-tonic = { workspace = true, features = ["client"] }
 wyrd-cli = { path = "../wyrd-cli", version = "0.0.1" }
-wyrd-client = { path = "../../shared/wyrd-client", version = "0.0.1" }
 wyrd-sql = { path = "../wyrd-sql", version = "0.0.1" }
 vala-sql = { path = "../../vala/vala-sql", version = "0.0.1" }
 wyrd-loader = { path = "../../shared/wyrd-loader", version = "0.0.1" }
@@ -96,6 +114,10 @@ name = "pg_grpc_smoke"
 
 [[test]]
 name = "pg_grpc_ingest_smoke"
+# Inspects recovered WAL state through `replay_wal_directory`, which exists only
+# under `vala-bifrost-redux/test-support`; this crate's `test-support` feature
+# forwards it.
+required-features = ["test-support"]
 
 [[test]]
 name = "pg_authz_check_route"

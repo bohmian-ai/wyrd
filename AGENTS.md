@@ -170,7 +170,7 @@ Python, and TypeScript client surfaces where appropriate.
 - Use `thiserror` for crate-local library error enums. Use `anyhow` only in
   binaries.
 - Use the derive-backed `wyrd_spec::error::WyrdError` catalog for public errors
-  that cross HTTP, Python, MCP, CLI, or generated-documentation boundaries.
+  that cross HTTP, Python, Rust, TypeScript, MCP, CLI, or generated-documentation boundaries.
 - Register public error metadata with
   `#[wyrd_error(code = "...", status = N, title = "...", remediation = "...")]`.
   Never hand-write parallel `code()`, `status()`, `remediation()`, or
@@ -400,11 +400,10 @@ behavior has no cross-boundary state (record the reason).
 
 ### Verification Scope
 
-Run verification for the code you changed. Pull requests run only lanes selected
-by the affected code and dependency closure. The full non-credentialed
-correctness suite runs nightly on `main`; live-cloud and performance suites run
-on separate schedules. `mise run gate` is intentionally broad and slow, and it
-is not the default local or pull-request bar.
+Run verification for the code you changed. Capability-scoped `verify:<scope>`
+tasks are the default local and pull-request gates when one exists. `mise run
+gate` is the broad repository aggregate reserved for nightly, release, mixed,
+global, and unclassified changes.
 
 ```bash
 # Always run the relevant format and lint checks.
@@ -436,7 +435,9 @@ not use a positional filter that can pass after selecting no test.
 
 - Rust crate change: prefer the nearest crate-specific `mise run ...` task
   (`test:wyrd`, `test:skald`, `test:vala`, `test:shared`, `test:sql`,
-  `test:bifrost`, `test:storage:matrix`, etc.). Whole-crate tests should use `mise` when a task exists because some
+  `test:bifrost`, `test:storage:matrix`, etc.). `test:bifrost` covers every
+  Bifrost tier and first-class language surface; its `:journey:<capability>`
+  leaves remain the iteration lanes. Whole-crate tests should use `mise` when a task exists because some
   crates need external dependencies, migrations, generated artifacts, or
   environment variables that the mise task sets up. Specifically named Rust
   tests use the exact `mise exec -- cargo nextest run` form above; include the
@@ -454,9 +455,10 @@ not use a positional filter that can pass after selecting no test.
   when the change affects shared example behavior.
 
 Run `mise run gate` locally only when the change is intentionally broad, crosses
-several ownership boundaries, changes shared CI/build/test infrastructure,
-prepares a release, or when the user explicitly asks for it. Otherwise let CI
-run it.
+several ownership boundaries without a complete capability gate, changes shared
+CI/build/test infrastructure, prepares a release, or when the user explicitly
+asks for it. Unknown CI paths fail over to this broad gate rather than silently
+skipping proof.
 
 Real cloud storage integration tests (`test:storage:*:cloud`) run against live
 infrastructure separately.
@@ -473,7 +475,7 @@ While working on a specific area:
 mise exec -- cargo nextest run --locked -p <crate> --lib \
   -E 'test(=module::tests::test_name)'
 mise run test:sql      # runs all SQL-backed integration tests across wyrd-sql, wyrd-dev-fixtures, and vala-sql
-mise run test:unit     # all Rust tests including SQL and storage emulators
+mise run test:rust     # broad Rust aggregate including SQL and storage emulators
 
 # Python only
 mise run py:test:unit  # all Python tests
@@ -563,28 +565,34 @@ generated Claude discovery mirror. Run `mise run skills:sync` after editing a
 shared workflow skill and `mise run check:skills-sync` to detect drift. Codex
 `agents/openai.yaml` metadata remains only in the canonical source.
 
-- `$wyrd-spec` turns human intent into a decision-complete behavioral
-  specification. Only explicit human approval makes a revision authoritative.
-- `$wyrd-plan` decomposes an approved specification into cohesive TDD tasks or
-  creates bounded remediation tasks from validated `$wyrd-task-review`
-  findings. It never rewrites an approved spec to fit implementation.
-- `$wyrd-task-readiness` reviews one or more proposed tasks before
-  implementation. It is distinct from post-implementation task review.
+- `$wyrd-spec` fixes intent, externally observable behavior, constraints, and
+  expensive-to-reverse decisions. Only explicit human approval makes a revision
+  authoritative; reversible implementation choices remain open.
+- `$wyrd-plan` decomposes an approved specification into the minimum cohesive
+  set of outcome-complete tasks. It stops once implementation can begin without
+  an unresolved product, public API, architecture, security, compatibility,
+  cross-service, concurrency-semantics, or persistent-data decision. It does
+  not plan review remediation.
 - Wyrd Rust, Python, TypeScript, server, CLI, MCP, storage, Vala, and contract
   implementors must receive the `$wyrd-implement` skill in their task packet.
-  It executes one ready task through scenario-by-scenario Red-Green-Refactor
-  cycles, then runs the broader focused verification required here.
+  It owns reversible local decisions, implements the smallest sufficient
+  change, and records acceptance and verification evidence.
 - Wyrd UI implementors additionally receive the `wyrd-ui` skill when their
   write set enters the UI tree.
-- `$wyrd-task-review` performs read-only review of one immutable cumulative
-  task candidate. `REMEDIATE` findings return to `$wyrd-plan`;
-  behavior-changing conflicts return to `$wyrd-spec` and require renewed human
-  approval.
+- `$wyrd-task-review` uses a fresh independent reviewer to compare one immutable
+  cumulative candidate with the original task, approved spec, actual diff,
+  repository rules, and verification. It starts unconvinced, tries to falsify
+  completion, and applies the Ponytail delete/reuse/native/installed/minimum-code
+  ladder to every changed complexity. It classifies only `MISSING`, `INCORRECT`,
+  `DRIFT`, `VIOLATION`, and `REGRESSION` findings and writes an explicit
+  acceptance matrix. For `FIX_REQUIRED`, it writes one self-contained
+  remediation task under `changes/active/<slug>/review/<review-name>/` for a
+  fresh `$wyrd-implement` agent; it does not invoke another planning cycle.
 - `$wyrd-change-review` performs the final immutable integrated review and maps
   every required specification obligation to credible evidence, including
-  cross-task seams and user journeys. Its review phase remains read-only. An
-  `APPROVE` verdict automatically invokes `$wyrd-complete` in the same workflow
-  turn.
+  cross-task seams and user journeys. It uses the same acceptance classifications
+  and direct remediation-task flow. A `PASS` verdict automatically invokes
+  `$wyrd-complete` in the same workflow turn.
 - `$wyrd-complete` requires that approved review, writes one compact durable
   record under `changes/completed/<year>/<slug>.md`, and removes the full
   `changes/active/<slug>` packet. It does not merge, push, deploy, modify
@@ -622,7 +630,19 @@ shared workflow skill and `mise run check:skills-sync` to detect drift. Codex
   Wyrd crates; Wyrd never depends on that private repository. "Enterprise cloud"
   describes a deployment topology and tenant-isolation requirement, not an
   in-tree commercial edition.
-- KEEP IT SIMPLE STUPID: when reviewing and implementing, avoid over-engineering and adding unnecessary complexity, YAGNI, and follow a modular design that solves the problem at hand without adding extra layers, abstractions, or future-proofing that isn't justified by current needs. There should be one obvious way to do something, and it should be the way we do it.
+- For every design, plan, implementation, and review, first understand the
+  complete path, then stop at the first correct option: remove or decline
+  speculative work; simplify existing code; reuse the repository's current
+  owner or pattern; use the standard library; use a native platform feature;
+  use an already-installed dependency; otherwise add the minimum cohesive code.
+- Before adding a file, type, trait, helper, dependency, configuration option,
+  compatibility path, or test fixture, inspect the existing owners and callers
+  and prove that the repository does not already provide the needed behavior.
+  Fix a root cause once at the shared owner instead of patching each symptom.
+  Do not scaffold for hypothetical reuse or future requirements.
+- Simplicity never overrides explicit product behavior, architecture,
+  validation, security, tenancy, durability, accessibility, testing, or
+  verification requirements. The smallest incomplete solution is still wrong.
 - Follow industry and Rust community best practices. Provide recommendations when appropriate.
 
 ## 16. General Code Rules

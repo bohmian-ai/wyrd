@@ -1,15 +1,14 @@
-//! Bifrost namespace enum — copied from vala-bifrost and extended with `Datasets`.
+//! Redux Bifrost namespace enum, including caller-owned datasets.
 
 use iceberg::NamespaceIdent;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BifrostNamespace {
-    System,
+    Audit,
     Bifrost,
     Traces,
     Metrics,
     Logs,
-    GenAi,
     Eval,
     Drift,
     Dev,
@@ -19,13 +18,12 @@ pub enum BifrostNamespace {
 impl BifrostNamespace {
     /// All known namespaces. Adding a variant here causes a compile error at every
     /// `match` that is missing a branch — the exhaustiveness guard.
-    pub const ALL: [Self; 10] = [
-        Self::System,
+    pub const ALL: [Self; 9] = [
+        Self::Audit,
         Self::Bifrost,
         Self::Traces,
         Self::Metrics,
         Self::Logs,
-        Self::GenAi,
         Self::Eval,
         Self::Drift,
         Self::Dev,
@@ -34,12 +32,11 @@ impl BifrostNamespace {
 
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::System => "vala.system",
+            Self::Audit => "vala.system",
             Self::Bifrost => "vala.bifrost",
             Self::Traces => "vala.traces",
             Self::Metrics => "vala.metrics",
             Self::Logs => "vala.logs",
-            Self::GenAi => "vala.genai",
             Self::Eval => "vala.eval",
             Self::Drift => "vala.drift",
             Self::Dev => "vala.dev",
@@ -57,12 +54,11 @@ impl BifrostNamespace {
     /// Returns `None` for unknown segments.
     pub fn from_domain_namespace(segment: &str) -> Option<Self> {
         match segment {
-            "system" => Some(Self::System),
+            "system" => Some(Self::Audit),
             "bifrost" => Some(Self::Bifrost),
             "traces" => Some(Self::Traces),
             "metrics" => Some(Self::Metrics),
             "logs" => Some(Self::Logs),
-            "genai" => Some(Self::GenAi),
             "eval" => Some(Self::Eval),
             "drift" => Some(Self::Drift),
             "dev" => Some(Self::Dev),
@@ -102,6 +98,21 @@ impl BifrostNamespace {
 impl std::fmt::Display for BifrostNamespace {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+/// Joins a table binding's namespace and table into the canonical Wyrd FQN.
+///
+/// A wire `TenantTableBinding` carries its namespace either with the `vala.`
+/// root (`vala.bifrost`) or with that root already stripped
+/// (`TailFenceDrainer::wire_binding`), so every consumer that has to name the
+/// catalog's closed namespace set normalizes through this one function rather
+/// than guessing which producer built the binding it holds.
+pub(crate) fn canonical_table_name(namespace: &str, table: &str) -> String {
+    if namespace.starts_with("vala.") {
+        format!("{namespace}.{table}")
+    } else {
+        format!("vala.{namespace}.{table}")
     }
 }
 

@@ -20,6 +20,92 @@ create_exception!(wyrd._wyrd, AgentError, WyrdError, "Agent Wyrd error.");
 create_exception!(wyrd._wyrd, ToolError, WyrdError, "Tool Wyrd error.");
 create_exception!(wyrd._wyrd, SessionError, WyrdError, "Session Wyrd error.");
 
+/// Result alias for every Wyrd-owned public Python operation.
+///
+/// A Wyrd-owned failure crosses the Python boundary only as a catalog-backed
+/// [`SpecWyrdError`]; `?` on a [`WyrdPyError`] therefore always projects
+/// through [`wyrd_error_to_py_err`], which is the sole final projector.
+pub type WyrdPyResult<T> = Result<T, WyrdPyError>;
+
+/// Shared cross-crate Python boundary error for Wyrd-owned failures.
+///
+/// Owner crates convert their internal error into a derive-backed
+/// [`SpecWyrdError`] first, then let `?` widen it here. The newtype carries no
+/// metadata of its own, so there is exactly one public projection of code,
+/// status, title, detail, details, and remediation.
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+pub struct WyrdPyError(#[from] SpecWyrdError);
+
+impl WyrdPyError {
+    /// Stable catalog code this boundary failure raises into Python.
+    ///
+    /// Callers use it to assert boundary behavior without constructing a
+    /// Python interpreter, since the inner catalog error stays private.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        self.0.code()
+    }
+}
+
+impl From<PyErr> for WyrdPyError {
+    /// Re-enter the catalog from a Python-raised exception.
+    ///
+    /// A Wyrd exception that crossed into Python keeps its stable code; any
+    /// other Python exception is recorded as agent validation with its type
+    /// name, so no Wyrd-owned boundary raises an unstructured failure.
+    fn from(error: PyErr) -> Self {
+        Python::attach(|py| Self::from(py_err_to_wyrd_error(py, error)))
+    }
+}
+
+impl<'a, 'py> From<pyo3::CastError<'a, 'py>> for WyrdPyError {
+    /// Record a Python object cast failure as an internal boundary failure.
+    fn from(error: pyo3::CastError<'a, 'py>) -> Self {
+        boundary_internal("Python object downcast failed", &error.to_string())
+    }
+}
+
+impl<'a, 'py> From<pyo3::pyclass::PyClassGuardError<'a, 'py>> for WyrdPyError {
+    /// Record a borrow-guard failure on a pyclass as an internal failure.
+    fn from(error: pyo3::pyclass::PyClassGuardError<'a, 'py>) -> Self {
+        boundary_internal("Python class borrow failed", &error.to_string())
+    }
+}
+
+impl From<serde_json::Error> for WyrdPyError {
+    /// Record a JSON conversion failure at the boundary as internal.
+    ///
+    /// A boundary that must reject caller-supplied JSON with a 4xx code should
+    /// map the failure onto its own catalog variant instead of relying on this
+    /// conversion.
+    fn from(error: serde_json::Error) -> Self {
+        boundary_internal("JSON conversion failed", &error.to_string())
+    }
+}
+
+impl From<std::io::Error> for WyrdPyError {
+    /// Record a local filesystem failure at the boundary as internal.
+    fn from(error: std::io::Error) -> Self {
+        boundary_internal("local IO failed", &error.to_string())
+    }
+}
+
+/// Build the shared internal boundary failure carrying its originating source.
+fn boundary_internal(message: &str, source: &str) -> WyrdPyError {
+    WyrdPyError::from(SpecWyrdError::Internal {
+        message: message.to_owned(),
+        details: serde_json::json!({ "source": source }),
+    })
+}
+
+impl From<WyrdPyError> for PyErr {
+    /// Project the wrapped catalog error through the shared converter.
+    fn from(error: WyrdPyError) -> Self {
+        wyrd_error_to_py_err(error.0)
+    }
+}
+
 /// Convert a JSON value to a Python object.
 ///
 /// # Errors
@@ -36,7 +122,10 @@ pub fn json_to_pyobject(py: Python<'_>, value: &Value) -> PyResult<Py<PyAny>> {
             } else if let Some(value) = value.as_f64() {
                 value.into_py_any(py)
             } else {
-                Err(PyRuntimeError::new_err("invalid JSON number"))
+                Err(wyrd_error_to_py_err(SpecWyrdError::Internal {
+                    message: "invalid JSON number".to_owned(),
+                    details: Value::Null,
+                }))
             }
         }
         Value::String(value) => value.into_py_any(py),
@@ -163,7 +252,33 @@ pub fn register_wyrd_error_exception(module: &Bound<'_, PyModule>) -> PyResult<(
     module.add("WyrdError", py.get_type::<WyrdError>())?;
     module.add("AgentError", py.get_type::<AgentError>())?;
     module.add("ToolError", py.get_type::<ToolError>())?;
-    module.add("SessionError", py.get_type::<SessionError>())
+    module.add("SessionError", py.get_type::<SessionError>())?;
+    module.add_function(pyo3::wrap_pyfunction!(build_wyrd_error, module)?)
+}
+
+/// Build a fully populated Wyrd exception instance from a catalog code.
+///
+/// Pure Python surfaces cannot reach the derive-backed catalog, so they call
+/// this instead of instantiating an exception and assigning a subset of its
+/// attributes. An unknown code still yields a structured exception, because the
+/// catalog reconstruction falls back to agent validation.
+///
+/// # Errors
+/// Returns a Python error when `details` is not JSON-convertible or exception
+/// construction fails.
+#[pyfunction]
+#[pyo3(name = "build_wyrd_error", signature = (code, message, details = None))]
+fn build_wyrd_error(
+    py: Python<'_>,
+    code: &str,
+    message: String,
+    details: Option<&Bound<'_, PyAny>>,
+) -> PyResult<Py<PyAny>> {
+    let details = match details {
+        Some(details) if !details.is_none() => pyobject_to_json(details)?,
+        _ => Value::Null,
+    };
+    wyrd_error_to_py_object(py, wyrd_error_from_python_code(code, message, details))
 }
 
 /// Convert a public Wyrd error into a structured Python Wyrd error.
@@ -189,6 +304,11 @@ pub fn wyrd_error_to_py_object(py: Python<'_>, error: SpecWyrdError) -> PyResult
 /// Convert a Python exception into a structured Wyrd error.
 pub fn py_err_to_wyrd_error(py: Python<'_>, error: PyErr) -> SpecWyrdError {
     let value = error.value(py);
+    let details = value
+        .getattr("details")
+        .ok()
+        .and_then(|details| pyobject_to_json(&details).ok())
+        .unwrap_or(Value::Null);
     if let Ok(code) = value
         .getattr("code")
         .and_then(|code| code.extract::<String>())
@@ -197,7 +317,7 @@ pub fn py_err_to_wyrd_error(py: Python<'_>, error: PyErr) -> SpecWyrdError {
             .getattr("message")
             .and_then(|message| message.extract::<String>())
             .unwrap_or_else(|_| error.to_string());
-        return wyrd_error_from_python_code(code, message);
+        return wyrd_error_from_python_code(&code, message, details);
     }
     if let Ok(args_obj) = value.getattr("args")
         && let Ok(args) = args_obj.cast::<PyTuple>()
@@ -207,7 +327,7 @@ pub fn py_err_to_wyrd_error(py: Python<'_>, error: PyErr) -> SpecWyrdError {
             args.get_item(1).and_then(|item| item.extract::<String>()),
         )
     {
-        return wyrd_error_from_python_code(code, message);
+        return wyrd_error_from_python_code(&code, message, details);
     }
     let type_name = error
         .get_type(py)
@@ -224,17 +344,20 @@ pub fn py_err_to_wyrd_error(py: Python<'_>, error: PyErr) -> SpecWyrdError {
     }
 }
 
-fn wyrd_error_from_python_code(code: String, message: String) -> SpecWyrdError {
-    match code.as_str() {
-        "WYRD_AGENT_499_CALLBACK_ABORTED" => SpecWyrdError::AgentCallbackAborted {
+/// Rebuild the catalog variant a Python exception's stable code names.
+///
+/// The derive-backed catalog reconstructs every `{ message, details }` variant
+/// from its code, so a Wyrd exception that crossed into Python and came back
+/// keeps its original identity. A code the catalog cannot reconstruct — an
+/// unknown code, or a variant with extra fields — degrades to agent validation
+/// with the original code preserved in `details`.
+fn wyrd_error_from_python_code(code: &str, message: String, details: Value) -> SpecWyrdError {
+    SpecWyrdError::from_code(code, message.clone(), details).unwrap_or_else(|| {
+        SpecWyrdError::AgentValidation {
             message,
             details: serde_json::json!({ "python_error_code": code }),
-        },
-        _ => SpecWyrdError::AgentValidation {
-            message,
-            details: serde_json::json!({ "python_error_code": code }),
-        },
-    }
+        }
+    })
 }
 
 fn py_iterable_to_json<'py>(iter: impl Iterator<Item = Bound<'py, PyAny>>) -> PyResult<Value> {
@@ -269,13 +392,13 @@ fn build_wyrd_py_exception(py: Python<'_>, error: SpecWyrdError) -> PyResult<Bou
 
     let exception = exception_type_for_code(py, &code).call1((message.clone(),))?;
     exception.setattr("code", code)?;
-    exception.setattr("message", message)?;
+    exception.setattr("message", message.clone())?;
+    exception.setattr("detail", message)?;
     exception.setattr("details", json_to_pyobject(py, &details)?.bind(py))?;
     exception.setattr("remediation", remediation)?;
     exception.setattr("status", status)?;
     exception.setattr("title", title)?;
     exception.setattr("type", problem_type)?;
-    exception.setattr("problem", json_to_pyobject(py, &problem)?.bind(py))?;
     Ok(exception)
 }
 

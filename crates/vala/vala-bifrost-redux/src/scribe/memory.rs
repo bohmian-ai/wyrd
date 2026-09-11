@@ -1,0 +1,1156 @@
+//! Pure Scribe memory sizing, lifecycle categories, and refusal projections.
+//!
+//! Process capacity and live ownership belong exclusively to root-issued
+//! [`crate::resources::ScribeResources`] and
+//! [`crate::resources::ScribeMemoryLease`] values.
+
+use num_traits::ToPrimitive;
+use std::sync::Arc;
+use std::sync::Mutex;
+
+use crate::contracts::ScribeError;
+
+#[cfg(test)]
+thread_local! {
+    static CGROUP_CURRENT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// One-shot terminal identity return failure used by replay settlement tests.
+    static FAIL_REPLAY_IDENTITY_RETURN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Arms a one-shot replay identity return failure on the calling test thread.
+#[cfg(test)]
+pub(crate) fn arm_replay_identity_return_failure_for_test() {
+    FAIL_REPLAY_IDENTITY_RETURN.with(|failure| failure.set(true));
+}
+
+/// Minimum managed memory accepted by the checked Scribe/Oracle ledger.
+///
+/// The root resource plan removes the unmanaged process reserve before
+/// constructing this ledger. A combined process therefore needs exactly two
+/// 256 MiB role floors beneath this 512 MiB managed minimum.
+pub const MIN_MEMORY_BYTES: usize = 256 * 1024 * 1024;
+/// Exact encoded-footer child held from before writer creation through inspection.
+pub(crate) const PARQUET_FOOTER_CHILD_BYTES: usize = 8 * 1024 * 1024;
+/// Bounded transfer buffer held while `OpenDAL` owns one payload copy.
+pub(crate) const PARQUET_TRANSFER_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+/// Number of bounded lifecycle memory categories.
+pub const MEMORY_CATEGORY_COUNT: usize = 8;
+
+/// Returns the distinct allocated bytes one decoded batch keeps alive.
+///
+/// Arrow's own `get_array_memory_size` sums every buffer's whole allocation
+/// once per array that references it. That is exact for a batch whose columns
+/// each own their buffers, and badly wrong for a zero-copy native decode: every
+/// column of an Arrow IPC frame is a view into the one received allocation, so
+/// an eleven-column frame reports eleven times the memory it actually retains.
+/// Scribe plans an envelope for a request and then measures what the
+/// materialized rows retain, so an inflated measure refuses requests that fit.
+///
+/// This walks the same buffers and charges each distinct allocation once, keyed
+/// by the allocation the buffer points into rather than by the view. Arrays
+/// that own their buffers are unaffected, so a projected or OTLP batch measures
+/// exactly what Arrow reports for it.
+pub(crate) fn retained_arrow_bytes(batch: &arrow::record_batch::RecordBatch) -> usize {
+    let mut charged = std::collections::HashSet::new();
+    batch.columns().iter().fold(0_usize, |total, column| {
+        total.saturating_add(retained_array_bytes(&column.to_data(), &mut charged))
+    })
+}
+
+/// Charges one array's own allocations, then its children's, once each.
+///
+/// `charged` carries the allocations already counted for this batch. The key is
+/// the allocation start and its capacity, so two views into one buffer collapse
+/// to one charge while two equally sized distinct buffers stay separate.
+fn retained_array_bytes(
+    data: &arrow::array::ArrayData,
+    charged: &mut std::collections::HashSet<(usize, usize)>,
+) -> usize {
+    let mut total = size_of::<arrow::array::ArrayData>();
+    let mut charge = |buffer: &arrow::buffer::Buffer, total: &mut usize| {
+        let allocation = (buffer.data_ptr().as_ptr() as usize, buffer.capacity());
+        if charged.insert(allocation) {
+            *total = total.saturating_add(buffer.capacity());
+        }
+    };
+    for buffer in data.buffers() {
+        charge(buffer, &mut total);
+    }
+    if let Some(nulls) = data.nulls() {
+        charge(nulls.inner().inner(), &mut total);
+    }
+    data.child_data().iter().fold(total, |total, child| {
+        total.saturating_add(retained_array_bytes(child, charged))
+    })
+}
+
+/// Returns the checked incremental workspace for one whole-batch candidate.
+///
+/// The immutable Arrow input remains charged to its existing owner. The
+/// producer root lease covers one merge/sort copy, one codec-output copy, the
+/// retained footer child, and both caller/OpenDAL transfer buffers.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::Internal`] when the exact incremental projection
+/// cannot be represented by the current platform.
+pub(crate) fn parquet_candidate_incremental_bytes(
+    candidate_bytes: usize,
+) -> Result<usize, ScribeError> {
+    candidate_bytes
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(PARQUET_FOOTER_CHILD_BYTES))
+        .and_then(|bytes| bytes.checked_add(PARQUET_TRANSFER_BUFFER_BYTES))
+        .and_then(|bytes| bytes.checked_add(PARQUET_TRANSFER_BUFFER_BYTES))
+        .ok_or_else(|| ScribeError::Internal {
+            detail: "Parquet candidate incremental workspace overflowed".to_owned(),
+        })
+}
+
+/// Move-only encoded-footer child split from the complete producer owner.
+///
+/// Carrying this token into the CPU lane proves the exact eight-mebibyte
+/// allowance remains charged from before encoder construction until every
+/// sealed footer has been inspected. Dropping it restores those bytes to the
+/// remaining producer reservation without changing aggregate accounting.
+#[derive(Debug)]
+pub struct EncodedFooterReservation {
+    /// Exact checked memory reservation backing the footer child.
+    reservation: Option<crate::resources::ScribeMemoryLease>,
+}
+
+impl EncodedFooterReservation {
+    /// Splits the exact footer child from an already-admitted producer owner.
+    ///
+    /// # Errors
+    /// Returns an internal error when the producer owner cannot supply the
+    /// exact eight-mebibyte child.
+    pub(crate) fn split_from(
+        owner: &mut crate::resources::ScribeMemoryLease,
+    ) -> Result<Self, ScribeError> {
+        Ok(Self {
+            reservation: Some(owner.split(PARQUET_FOOTER_CHILD_BYTES).map_err(|error| {
+                ScribeError::Internal {
+                    detail: error.to_string(),
+                }
+            })?),
+        })
+    }
+
+    /// Transfers the footer child from the complete producer ownership tuple.
+    ///
+    /// The checked delta supplies the child when it owns at least eight MiB.
+    /// Larger immutable generations already carry that memory, so the token
+    /// records a category transition without double charging the governor.
+    ///
+    /// # Errors
+    /// Returns an internal error only when neither reservation nor immutable
+    /// ownership can cover the exact footer child.
+    pub(crate) fn transfer_from(
+        owner: &mut crate::resources::ScribeMemoryLease,
+        immutable_bytes: usize,
+    ) -> Result<Self, ScribeError> {
+        if owner.bytes() >= PARQUET_FOOTER_CHILD_BYTES {
+            return Self::split_from(owner);
+        }
+        if immutable_bytes >= PARQUET_FOOTER_CHILD_BYTES {
+            return Ok(Self { reservation: None });
+        }
+        Err(ScribeError::Internal {
+            detail: "complete producer owner cannot supply its encoded-footer child".to_owned(),
+        })
+    }
+
+    /// Returns the exact bytes retained by this child.
+    #[must_use]
+    pub(crate) fn bytes(&self) -> usize {
+        self.reservation.as_ref().map_or(
+            PARQUET_FOOTER_CHILD_BYTES,
+            crate::resources::ScribeMemoryLease::bytes,
+        )
+    }
+
+    /// Constructs an isolated exact footer child for pure encoder tests.
+    ///
+    /// # Panics
+    /// Panics only if the fixed test governor cannot admit its exact footer
+    /// child, which would mean the production memory invariant regressed.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        let roles = crate::resources::BifrostRuntimeResources::composed_for_test(
+            768 * 1024 * 1024,
+            512 * 1024 * 1024,
+            [crate::resources::BifrostRole::Scribe],
+        );
+        let reservation = roles
+            .scribe()
+            .expect("footer test Scribe capability")
+            .try_reserve_maintenance(MemoryCategory::Persistence, PARQUET_FOOTER_CHILD_BYTES)
+            .expect("footer test child must fit the production floor");
+        Self {
+            reservation: Some(reservation),
+        }
+    }
+}
+
+/// Memory categories charged by the Scribe lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum MemoryCategory {
+    /// Raw bytes retained from the transport.
+    Raw = 0,
+    /// Decoded Arrow memory.
+    Decode = 1,
+    /// Prepared and serialized slices.
+    Prepared = 2,
+    /// Bytes waiting in bounded queues.
+    Queued = 3,
+    /// Writable active buckets.
+    Active = 4,
+    /// Frozen immutable buckets.
+    Immutable = 5,
+    /// Bounded Parquet/object-store persistence workspace.
+    Persistence = 6,
+    /// Metadata and bookkeeping.
+    Metadata = 7,
+}
+
+/// Point-in-time category totals for all memory roles in the governor.
+///
+/// The three-way reconciliation identity holds at every consistent snapshot:
+/// `bifrost_total_bytes == scribe_total_bytes + oracle_total_bytes +
+/// parent_only_bytes`, where `parent_only_bytes` is derived as the difference
+/// and is not stored directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemorySnapshot {
+    /// Total pod memory budget.
+    pub pod_limit_bytes: usize,
+    /// Exact managed-memory ceiling supplied by the root resource owner.
+    pub bifrost_limit_bytes: usize,
+    /// Parent Bifrost bytes currently charged.
+    pub bifrost_total_bytes: usize,
+    /// Scribe child bytes currently charged.
+    pub scribe_total_bytes: usize,
+    /// Scribe soft reservation limit.
+    pub scribe_limit_bytes: usize,
+    /// Oracle child bytes currently charged.
+    pub oracle_total_bytes: usize,
+    /// Legacy Oracle process-reservation limit used outside query envelopes.
+    pub oracle_limit_bytes: usize,
+    /// Total charged bytes by category in enum order.
+    pub categories: [usize; MEMORY_CATEGORY_COUNT],
+    /// Current cgroup resident usage when the kernel exposes it.
+    pub cgroup_current_bytes: Option<usize>,
+    /// Cgroup memory limit used for the external-pressure tripwire.
+    pub cgroup_limit_bytes: Option<usize>,
+    /// Current ingress bytes charged (the value ingress admission counts).
+    ///
+    /// This equals `scribe_total_bytes`: ingress admission charges the whole
+    /// Scribe child total against the ingress ceiling, so the pressure-seal
+    /// watermark decision keys on this value rather than
+    /// [`MemorySnapshot::effective_pressure_percent`] (D83).
+    pub ingress_occupancy_bytes: usize,
+    /// Ingress reservation ceiling (`limit_bytes() - persistence_headroom`).
+    ///
+    /// This is the denominator the watermark decision divides by; it is smaller
+    /// than `scribe_limit_bytes`, so a run pinned at the ingress ceiling can sit
+    /// below the effective-pressure threshold yet be at 100% ingress occupancy.
+    pub ingress_limit_bytes: usize,
+    /// High-water byte threshold = `ingress_limit_bytes * high_water / 100`.
+    ///
+    /// Populated by [`MemorySnapshot::with_ingress_watermarks`] from the
+    /// runtime `ScribePressureConfig`; a bare governor snapshot leaves it `0`.
+    pub ingress_high_water_bytes: usize,
+    /// Low-water byte target = `ingress_limit_bytes * low_water / 100`.
+    ///
+    /// The release target pressure sealing drains toward. Populated by
+    /// [`MemorySnapshot::with_ingress_watermarks`]; `0` on a bare snapshot.
+    pub ingress_low_water_bytes: usize,
+}
+
+impl MemorySnapshot {
+    /// Return the sum of all category totals.
+    #[must_use]
+    pub fn total_bytes(self) -> usize {
+        self.scribe_total_bytes
+    }
+
+    /// Effective pressure as a percentage of the most constrained active
+    /// governor. The cgroup signal is absent on bare-metal hosts.
+    #[must_use]
+    pub fn effective_pressure_percent(self) -> usize {
+        let managed = self
+            .total_bytes()
+            .saturating_mul(100)
+            .checked_div(self.scribe_limit_bytes.max(1))
+            .unwrap_or(100);
+        let parent = self
+            .bifrost_total_bytes
+            .saturating_mul(100)
+            .checked_div(self.bifrost_limit_bytes.max(1))
+            .unwrap_or(100);
+        let cgroup = match (self.cgroup_current_bytes, self.cgroup_limit_bytes) {
+            (Some(current), Some(limit)) if limit > 0 => current
+                .saturating_mul(100)
+                .checked_div(limit)
+                .unwrap_or(100),
+            _ => 0,
+        };
+        managed.max(parent).max(cgroup)
+    }
+
+    /// Ingress occupancy as a percent of the ingress ceiling.
+    ///
+    /// This is `ingress_occupancy_bytes * 100 / ingress_limit_bytes` with a
+    /// saturating multiply and an `ingress_limit_bytes.max(1)` denominator so a
+    /// degenerate zero ceiling reports 100% rather than dividing by zero. This
+    /// is the only ratio the pressure-seal watermark decision consults;
+    /// [`MemorySnapshot::effective_pressure_percent`] (whose denominator is the
+    /// larger `scribe_limit_bytes`) is deliberately not used for admission (D83).
+    #[must_use]
+    pub fn ingress_occupancy_percent(self) -> usize {
+        self.ingress_occupancy_bytes
+            .saturating_mul(100)
+            .checked_div(self.ingress_limit_bytes.max(1))
+            .unwrap_or(100)
+    }
+
+    /// Return a copy of this snapshot with the ingress watermark bytes filled
+    /// from the runtime high/low-water percents.
+    ///
+    /// The governor snapshot populates `ingress_occupancy_bytes` and
+    /// `ingress_limit_bytes` but cannot know the runtime
+    /// [`crate::scribe::ScribePressureConfig`] percents, so the Scribe runtime
+    /// applies them here before making a watermark decision (and before T40
+    /// exports the four ingress gauges). `high_water_percent` and
+    /// `low_water_percent` are percents of `ingress_limit_bytes`; the caller is
+    /// responsible for the `low_water < high_water` invariant, which
+    /// [`crate::scribe::ScribePressureConfig`] enforces at construction.
+    #[must_use]
+    pub fn with_ingress_watermarks(
+        mut self,
+        high_water_percent: usize,
+        low_water_percent: usize,
+    ) -> Self {
+        self.ingress_high_water_bytes =
+            self.ingress_limit_bytes.saturating_mul(high_water_percent) / 100;
+        self.ingress_low_water_bytes =
+            self.ingress_limit_bytes.saturating_mul(low_water_percent) / 100;
+        self
+    }
+
+    /// Exports the closed Scribe ingress-watermark lifecycle gauges.
+    ///
+    /// Emitted from the production steady-state age scanner on every tick so a
+    /// dashboard can read the D83 ingress watermarks without a debugger.
+    /// `bifrost_scribe_ingress_watermark_bytes` carries the four D83 ingress
+    /// marks under a closed `mark` label `{occupancy, limit, high_water,
+    /// low_water}` — the exact numerator, denominator, and hysteresis band the
+    /// pressure-seal decision keys on. No label carries tenant, table, or
+    /// request identity. The snapshot should already be watermarked via
+    /// [`Self::with_ingress_watermarks`]; an unwatermarked snapshot reports the
+    /// two watermark marks as `0`.
+    pub fn emit_ingress_watermark_gauges(self) {
+        let as_f64 = |bytes: usize| bytes.to_f64().unwrap_or(f64::MAX);
+        metrics::gauge!("bifrost_scribe_ingress_watermark_bytes", "mark" => "occupancy")
+            .set(as_f64(self.ingress_occupancy_bytes));
+        metrics::gauge!("bifrost_scribe_ingress_watermark_bytes", "mark" => "limit")
+            .set(as_f64(self.ingress_limit_bytes));
+        metrics::gauge!("bifrost_scribe_ingress_watermark_bytes", "mark" => "high_water")
+            .set(as_f64(self.ingress_high_water_bytes));
+        metrics::gauge!("bifrost_scribe_ingress_watermark_bytes", "mark" => "low_water")
+            .set(as_f64(self.ingress_low_water_bytes));
+    }
+
+    /// Decide the pressure-seal release target from the ingress watermarks.
+    ///
+    /// This is the single, pure hysteresis decision shared by the admission
+    /// path and the periodic age scanner (both call it through
+    /// [`crate::scribe::ScribeImpl`]), so the seal contract is defined once:
+    ///
+    /// * Below `high_water_percent` of the ingress ceiling, or already at/below
+    ///   the low-water byte target, it returns `None` — the no-op half of the
+    ///   band that keeps the decision from thrashing on every tick.
+    /// * At or above the high-water mark it returns `Some(bytes_to_release)`,
+    ///   where the release target is the low-water byte mark filled by
+    ///   [`Self::with_ingress_watermarks`]:
+    ///   `ingress_occupancy_bytes - ingress_low_water_bytes` (saturating).
+    ///
+    /// The comparison uses [`Self::ingress_occupancy_percent`], whose
+    /// denominator is `ingress_limit_bytes`, not the larger `scribe_limit_bytes`
+    /// of [`Self::effective_pressure_percent`] (D83).
+    #[must_use]
+    pub fn pressure_release_bytes(self, high_water_percent: usize) -> Option<usize> {
+        if self.ingress_occupancy_percent() < high_water_percent {
+            return None;
+        }
+        let to_release = self
+            .ingress_occupancy_bytes
+            .saturating_sub(self.ingress_low_water_bytes);
+        (to_release > 0).then_some(to_release)
+    }
+}
+
+/// Closed identity of the memory ceiling that rejected a reservation (D84).
+///
+/// Every distinct reservation ceiling maps to exactly one variant so that a
+/// user-visible ingress rejection can be labelled by the true limit that
+/// tripped, instead of collapsing five physically distinct ceilings under one
+/// constant `reason="memory"` label. The [`Self::as_metric_label`] values are
+/// the only accepted values of the ceiling-labelled rejection metric; the label
+/// set is closed and carries no tenant or table identity.
+///
+/// The ingress admission path constructs [`Self::CgroupBreaker`],
+/// [`Self::IngressSublimit`], and [`Self::BifrostParent`] (see
+/// the root-issued Scribe ingress capability); [`Self::ScribeChild`] is the
+/// child-limit form used by the non-ingress reservation paths, and
+/// [`Self::CgroupParent`] identifies the parent cgroup tripwire. All five are a
+/// normative D84 interface, not implementor latitude.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScribeRejectionCeiling {
+    /// The Scribe-child cgroup breaker tripped at or above 90% container usage.
+    CgroupBreaker,
+    /// A raw Scribe-child reservation exceeded the full child limit.
+    ScribeChild,
+    /// An ingress reservation exceeded the ingress sublimit (`limit - headroom`).
+    IngressSublimit,
+    /// A reservation exceeded the parent Bifrost ceiling.
+    BifrostParent,
+    /// The parent cgroup tripwire tripped at 100% container usage.
+    CgroupParent,
+}
+impl ScribeRejectionCeiling {
+    /// Return the stable `snake_case` label used by ceiling-rejection telemetry.
+    ///
+    /// The returned string is the value attached as the `reason` label on
+    /// `bifrost_scribe_rejections_total` for a ceiling-labelled rejection; the
+    /// five values form the closed label set and must stay stable across
+    /// changes.
+    #[must_use]
+    pub fn as_metric_label(self) -> &'static str {
+        match self {
+            Self::CgroupBreaker => "cgroup_breaker",
+            Self::ScribeChild => "scribe_child",
+            Self::IngressSublimit => "ingress_sublimit",
+            Self::BifrostParent => "bifrost_parent",
+            Self::CgroupParent => "cgroup_parent",
+        }
+    }
+}
+
+/// Shared active/immutable ownership ledger for shard-owned Arrow buffers.
+#[derive(Debug, Clone)]
+pub struct ScribeOwnership {
+    /// Root-backed lease owning writable-generation Arrow bytes.
+    active: Arc<Mutex<crate::resources::ScribeMemoryLease>>,
+    /// Root-backed lease owning frozen and replay-generation Arrow bytes.
+    immutable: Arc<Mutex<crate::resources::ScribeMemoryLease>>,
+    /// Scalar observations emitted only after the corresponding lease transition.
+    lifecycle: Arc<Mutex<ScribeGenerationLifecycleSnapshot>>,
+}
+
+/// Move-only replay identity lease temporarily adopted by immutable ownership.
+///
+/// The guard preserves the exact root reservation while replay publication is
+/// pending. Returning it reclassifies the same lease to Decode; dropping it on
+/// an error path also restores that category before releasing capacity.
+#[derive(Debug)]
+pub(crate) struct ReplayIdentityOwnership {
+    /// Exact root-backed lease loaned by the replay scanner.
+    lease: Option<crate::resources::ScribeMemoryLease>,
+    /// Stable byte count used in the complete Parquet producer tuple.
+    bytes: usize,
+}
+
+impl ReplayIdentityOwnership {
+    /// Returns the exact identity bytes retained by this guard.
+    #[must_use]
+    pub(crate) const fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Returns the same root-backed lease to Decode ownership.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when root category attribution cannot be
+    /// restored. The guard retains the lease on failure.
+    pub(crate) fn return_to_decode(
+        mut self,
+    ) -> Result<crate::resources::ScribeMemoryLease, ScribeError> {
+        #[cfg(test)]
+        if FAIL_REPLAY_IDENTITY_RETURN.with(|failure| failure.replace(false)) {
+            return Err(ScribeError::Internal {
+                detail: "forced replay identity return failure".to_owned(),
+            });
+        }
+        let mut lease = self.lease.take().ok_or_else(|| ScribeError::Internal {
+            detail: "replay identity guard lost its lease".to_owned(),
+        })?;
+        if let Err(error) = lease.transfer_category(MemoryCategory::Decode) {
+            self.lease = Some(lease);
+            return Err(error);
+        }
+        Ok(lease)
+    }
+}
+
+impl Drop for ReplayIdentityOwnership {
+    fn drop(&mut self) {
+        if let Some(lease) = self.lease.as_mut() {
+            let _ = lease.transfer_category(MemoryCategory::Decode);
+        }
+    }
+}
+
+/// Fixed-size lifecycle observations emitted by the enforcing generation owner.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScribeGenerationLifecycleSnapshot {
+    /// Active or replay generations planned from exact Arrow ownership.
+    pub plans: u64,
+    /// Exact bytes represented by completed generation plans.
+    pub planned_bytes: usize,
+    /// Active or replay reservations adopted by the generation ledger.
+    pub reservations: u64,
+    /// Exact bytes adopted by those reservations.
+    pub reserved_bytes: usize,
+    /// Materialized active or replay generations admitted to the memtable.
+    pub materializations: u64,
+    /// Exact Arrow bytes materialized by those generations.
+    pub materialized_bytes: usize,
+    /// Active generations transferred into immutable persistence ownership.
+    pub transfers: u64,
+    /// Exact Arrow bytes transferred into immutable ownership.
+    pub transferred_bytes: usize,
+    /// Replay generations reconstructed directly into immutable ownership.
+    pub replay_materializations: u64,
+    /// Exact Arrow bytes reconstructed during replay.
+    pub replay_materialized_bytes: usize,
+    /// Generation reservations terminally released.
+    pub releases: u64,
+    /// Exact active or immutable bytes terminally released.
+    pub released_bytes: usize,
+    /// Exact active Arrow bytes currently retained.
+    pub active_bytes: usize,
+    /// Exact immutable Arrow bytes currently retained through persistence or retirement.
+    pub immutable_bytes: usize,
+}
+
+impl ScribeOwnership {
+    /// Create zero-sized active and immutable reservations on one governor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::IngestBusy`] when the shared Scribe root refuses
+    /// either zero-sized category lease, or [`ScribeError::Internal`] when root
+    /// accounting is poisoned and cannot issue a trustworthy owner.
+    pub fn new(governor: &crate::resources::ScribeResources) -> Result<Self, ScribeError> {
+        Ok(Self {
+            active: Arc::new(Mutex::new(
+                governor.try_reserve_maintenance(MemoryCategory::Active, 0)?,
+            )),
+            immutable: Arc::new(Mutex::new(
+                governor.try_reserve_maintenance(MemoryCategory::Immutable, 0)?,
+            )),
+            lifecycle: Arc::new(Mutex::new(ScribeGenerationLifecycleSnapshot::default())),
+        })
+    }
+
+    /// Adopts a replay scanner's committed-identity lease without admission.
+    ///
+    /// The same root-backed lease moves from Decode to Immutable, so the
+    /// operation is net-zero at the role ceiling. `producer_owner_bytes`
+    /// carries the complete replay-wide identity projection used to size the
+    /// producer delta; the returned guard restores only its move-only lease to
+    /// Decode attribution on rollback or terminal settlement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when root category attribution cannot move to
+    /// Immutable. The supplied lease is released as Decode on failure.
+    pub(crate) fn adopt_replay_identity(
+        &self,
+        mut lease: crate::resources::ScribeMemoryLease,
+        producer_owner_bytes: usize,
+    ) -> Result<ReplayIdentityOwnership, ScribeError> {
+        drop(self.immutable.lock().map_err(|_| ScribeError::Internal {
+            detail: "immutable memory ledger lock poisoned".to_owned(),
+        })?);
+        lease.transfer_category(MemoryCategory::Immutable)?;
+        Ok(ReplayIdentityOwnership {
+            lease: Some(lease),
+            bytes: producer_owner_bytes,
+        })
+    }
+
+    /// Adopts a replay chunk's decoded lease as immutable Arrow ownership.
+    ///
+    /// The existing lease is resized to the reconstructed Arrow footprint,
+    /// reclassified, and merged into the immutable ledger. No capacity is
+    /// released and reacquired between decode and persistence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when resize, category transfer, attribution
+    /// clearing, or immutable-ledger merging fails.
+    pub(crate) fn adopt_replay_immutable(
+        &self,
+        mut lease: crate::resources::ScribeMemoryLease,
+        bytes: usize,
+    ) -> Result<(), ScribeError> {
+        lease.resize_ingress(bytes)?;
+        lease.transfer_category(MemoryCategory::Immutable)?;
+        lease
+            .clear_identity_attribution()
+            .map_err(|error| ScribeError::Internal {
+                detail: error.to_string(),
+            })?;
+        let mut immutable = self.immutable.lock().map_err(|_| ScribeError::Internal {
+            detail: "immutable memory ledger lock poisoned".to_owned(),
+        })?;
+        immutable
+            .merge(lease)
+            .map_err(|error| ScribeError::Internal {
+                detail: error.to_string(),
+            })?;
+        self.observe(|lifecycle| {
+            lifecycle.plans = lifecycle.plans.saturating_add(1);
+            lifecycle.planned_bytes = lifecycle.planned_bytes.saturating_add(bytes);
+            lifecycle.reservations = lifecycle.reservations.saturating_add(1);
+            lifecycle.reserved_bytes = lifecycle.reserved_bytes.saturating_add(bytes);
+            lifecycle.materializations = lifecycle.materializations.saturating_add(1);
+            lifecycle.materialized_bytes = lifecycle.materialized_bytes.saturating_add(bytes);
+            lifecycle.replay_materializations = lifecycle.replay_materializations.saturating_add(1);
+            lifecycle.replay_materialized_bytes =
+                lifecycle.replay_materialized_bytes.saturating_add(bytes);
+            lifecycle.immutable_bytes = lifecycle.immutable_bytes.saturating_add(bytes);
+        });
+        Ok(())
+    }
+
+    /// Applies one scalar observation transition without creating a second governor.
+    fn observe(&self, update: impl FnOnce(&mut ScribeGenerationLifecycleSnapshot)) {
+        let mut lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        update(&mut lifecycle);
+    }
+
+    /// Returns the generation lifecycle facts emitted by this enforcing owner.
+    #[must_use]
+    pub(crate) fn lifecycle_snapshot(&self) -> ScribeGenerationLifecycleSnapshot {
+        *self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Grow the active Arrow ownership reservation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when checked byte arithmetic or the enforcing
+    /// root reservation fails.
+    pub fn reserve_active(&self, bytes: usize) -> Result<(), ScribeError> {
+        let mut active = self.active.lock().map_err(|_| ScribeError::Internal {
+            detail: "active memory ledger lock poisoned".to_owned(),
+        })?;
+        let target = active
+            .bytes()
+            .checked_add(bytes)
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "active memory ledger byte count overflow".to_owned(),
+            })?;
+        active.resize_ingress(target)?;
+        self.observe(|lifecycle| {
+            lifecycle.plans = lifecycle.plans.saturating_add(1);
+            lifecycle.planned_bytes = lifecycle.planned_bytes.saturating_add(bytes);
+            lifecycle.reservations = lifecycle.reservations.saturating_add(1);
+            lifecycle.reserved_bytes = lifecycle.reserved_bytes.saturating_add(bytes);
+            lifecycle.materializations = lifecycle.materializations.saturating_add(1);
+            lifecycle.materialized_bytes = lifecycle.materialized_bytes.saturating_add(bytes);
+            lifecycle.active_bytes = lifecycle.active_bytes.saturating_add(bytes);
+        });
+        Ok(())
+    }
+
+    /// Adopt an already-accounted active reservation after memtable insertion.
+    ///
+    /// The caller transfers ownership of the reservation; this method only
+    /// joins its accounting with the ledger and never reserves the bytes a
+    /// second time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when category transfer, identity clearing, or
+    /// exact root-owner merging fails.
+    pub(crate) fn absorb_active(
+        &self,
+        mut reservation: crate::resources::ScribeMemoryLease,
+    ) -> Result<(), ScribeError> {
+        let bytes = reservation.bytes();
+        reservation.transfer_category(MemoryCategory::Active)?;
+        reservation
+            .clear_identity_attribution()
+            .map_err(|error| ScribeError::Internal {
+                detail: error.to_string(),
+            })?;
+        let mut active = self.active.lock().map_err(|_| ScribeError::Internal {
+            detail: "active memory ledger lock poisoned".to_owned(),
+        })?;
+        active
+            .merge(reservation)
+            .map_err(|error| ScribeError::Internal {
+                detail: error.to_string(),
+            })?;
+        self.observe(|lifecycle| {
+            lifecycle.plans = lifecycle.plans.saturating_add(1);
+            lifecycle.planned_bytes = lifecycle.planned_bytes.saturating_add(bytes);
+            lifecycle.reservations = lifecycle.reservations.saturating_add(1);
+            lifecycle.reserved_bytes = lifecycle.reserved_bytes.saturating_add(bytes);
+            lifecycle.materializations = lifecycle.materializations.saturating_add(1);
+            lifecycle.materialized_bytes = lifecycle.materialized_bytes.saturating_add(bytes);
+            lifecycle.active_bytes = lifecycle.active_bytes.saturating_add(bytes);
+        });
+        Ok(())
+    }
+
+    /// Release active Arrow ownership after an insertion failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when the active ledger cannot cover `bytes` or
+    /// the exact root release fails.
+    pub fn release_active(&self, bytes: usize) -> Result<(), ScribeError> {
+        let mut active = self.active.lock().map_err(|_| ScribeError::Internal {
+            detail: "active memory ledger lock poisoned".to_owned(),
+        })?;
+        let target = active
+            .bytes()
+            .checked_sub(bytes)
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "active memory ledger byte count underflow".to_owned(),
+            })?;
+        active.resize_ingress(target)?;
+        self.observe(|lifecycle| {
+            lifecycle.releases = lifecycle.releases.saturating_add(1);
+            lifecycle.released_bytes = lifecycle.released_bytes.saturating_add(bytes);
+            lifecycle.active_bytes = lifecycle.active_bytes.saturating_sub(bytes);
+        });
+        Ok(())
+    }
+
+    /// Check active ledger ownership before a coordinated cleanup releases it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] and poisons the governor if the
+    /// ledger cannot cover `bytes` or its lock is poisoned.
+    pub(crate) fn preflight_release_active(&self, bytes: usize) -> Result<(), ScribeError> {
+        let active = self.active.lock().map_err(|_| ScribeError::Internal {
+            detail: "active memory ledger lock poisoned during release preflight".to_owned(),
+        })?;
+        if active.bytes() < bytes {
+            active.poison();
+            return Err(ScribeError::Internal {
+                detail: "active memory ledger underflow during release preflight".to_owned(),
+            });
+        }
+        active.preflight_release(bytes)
+    }
+
+    /// Move Arrow ownership from writable buckets to immutable generations.
+    ///
+    /// The transfer is a net-zero category move: the bytes stay charged against
+    /// the shared Scribe and Bifrost pools throughout, so nothing is released to
+    /// the pool and nothing is re-reserved. This closes the shrink-then-grow
+    /// race a concurrent reservation could otherwise win at the ceiling — the
+    /// pre-D97 form shrank Active (releasing the bytes to the pool) and then
+    /// grew Immutable (re-reserving them), and an ingress `try_reserve` racing
+    /// into the transiently freed headroom made the grow fail exactly when the
+    /// pod sat at ceiling and pressure seals ran. Because the category move
+    /// never touches the pool totals it can no longer fail on a ceiling, only on
+    /// a poisoned ledger lock, and it therefore needs no rollback.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the active or immutable ledger
+    /// lock is poisoned. Poisoning indicates a prior panic inside a ledger
+    /// critical section — a broken invariant, not a recoverable accounting
+    /// failure — and no partial category move can have occurred because the
+    /// method mutates nothing before both locks are held.
+    pub fn move_active_to_immutable(&self, bytes: usize) -> Result<(), ScribeError> {
+        let mut active = self.active.lock().map_err(|_| ScribeError::Internal {
+            detail: "active memory ledger lock poisoned".to_owned(),
+        })?;
+        let mut immutable = self.immutable.lock().map_err(|_| ScribeError::Internal {
+            detail: "immutable memory ledger lock poisoned".to_owned(),
+        })?;
+        active.transfer_bytes_to(&mut immutable, bytes)?;
+        self.observe(|lifecycle| {
+            lifecycle.transfers = lifecycle.transfers.saturating_add(1);
+            lifecycle.transferred_bytes = lifecycle.transferred_bytes.saturating_add(bytes);
+            lifecycle.active_bytes = lifecycle.active_bytes.saturating_sub(bytes);
+            lifecycle.immutable_bytes = lifecycle.immutable_bytes.saturating_add(bytes);
+        });
+        Ok(())
+    }
+
+    /// Check active and immutable ledger ownership before a lifecycle transfer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] and poisons the governor when the
+    /// source cannot cover `bytes`, the target would overflow, or either lock
+    /// is poisoned.
+    pub(crate) fn preflight_move_active_to_immutable(
+        &self,
+        bytes: usize,
+    ) -> Result<(), ScribeError> {
+        let active = self.active.lock().map_err(|_| ScribeError::Internal {
+            detail: "active memory ledger lock poisoned during move preflight".to_owned(),
+        })?;
+        let immutable = self.immutable.lock().map_err(|_| ScribeError::Internal {
+            detail: "immutable memory ledger lock poisoned during move preflight".to_owned(),
+        })?;
+        if active.bytes() < bytes || immutable.bytes().checked_add(bytes).is_none() {
+            active.poison();
+            return Err(ScribeError::Internal {
+                detail: "active-to-immutable ledger move failed preflight".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Release immutable Arrow ownership after grace expiry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when the immutable ledger cannot cover `bytes`
+    /// or the exact root release fails.
+    pub fn release_immutable(&self, bytes: usize) -> Result<(), ScribeError> {
+        let mut immutable = self.immutable.lock().map_err(|_| ScribeError::Internal {
+            detail: "immutable memory ledger lock poisoned".to_owned(),
+        })?;
+        let target = immutable
+            .bytes()
+            .checked_sub(bytes)
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "immutable memory ledger byte count underflow".to_owned(),
+            })?;
+        immutable.resize_ingress(target)?;
+        self.observe(|lifecycle| {
+            lifecycle.releases = lifecycle.releases.saturating_add(1);
+            lifecycle.released_bytes = lifecycle.released_bytes.saturating_add(bytes);
+            lifecycle.immutable_bytes = lifecycle.immutable_bytes.saturating_sub(bytes);
+        });
+        Ok(())
+    }
+
+    /// Check immutable ledger ownership before explicit retirement mutates it.
+    pub(crate) fn preflight_release_immutable(&self, bytes: usize) -> Result<(), ScribeError> {
+        let immutable = self.immutable.lock().map_err(|_| ScribeError::Internal {
+            detail: "immutable memory ledger lock poisoned during preflight".to_owned(),
+        })?;
+        if immutable.bytes() < bytes {
+            immutable.poison();
+            return Err(ScribeError::Internal {
+                detail: "immutable memory ledger underflow during preflight".to_owned(),
+            });
+        }
+        immutable.preflight_release(bytes)
+    }
+
+    /// Poison the shared governor after an impossible post-preflight mutation.
+    ///
+    /// Explicit retirement performs all recoverable checks before releasing
+    /// ownership. If the subsequent token commit nevertheless fails, the
+    /// accounting state may have partially advanced and all future admission
+    /// must fail closed.
+    pub(crate) fn poison(&self) {
+        if let Ok(immutable) = self.immutable.lock() {
+            immutable.poison();
+        }
+    }
+
+    /// Reserve immutable ownership during boot replay.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when checked byte arithmetic or the enforcing
+    /// replay reservation fails.
+    pub fn reserve_immutable(&self, bytes: usize) -> Result<(), ScribeError> {
+        let mut immutable = self.immutable.lock().map_err(|_| ScribeError::Internal {
+            detail: "immutable memory ledger lock poisoned".to_owned(),
+        })?;
+        let target = immutable
+            .bytes()
+            .checked_add(bytes)
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "immutable memory ledger byte count overflow".to_owned(),
+            })?;
+        immutable.resize_ingress(target)?;
+        self.observe(|lifecycle| {
+            lifecycle.plans = lifecycle.plans.saturating_add(1);
+            lifecycle.planned_bytes = lifecycle.planned_bytes.saturating_add(bytes);
+            lifecycle.reservations = lifecycle.reservations.saturating_add(1);
+            lifecycle.reserved_bytes = lifecycle.reserved_bytes.saturating_add(bytes);
+            lifecycle.materializations = lifecycle.materializations.saturating_add(1);
+            lifecycle.materialized_bytes = lifecycle.materialized_bytes.saturating_add(bytes);
+            lifecycle.replay_materializations = lifecycle.replay_materializations.saturating_add(1);
+            lifecycle.replay_materialized_bytes =
+                lifecycle.replay_materialized_bytes.saturating_add(bytes);
+            lifecycle.immutable_bytes = lifecycle.immutable_bytes.saturating_add(bytes);
+        });
+        Ok(())
+    }
+
+    /// Read the active-category byte total for accounting assertions in tests.
+    ///
+    /// Exposes the ledger's active reservation size so seal-path tests can pin
+    /// the two-legal-states invariant (Active-accounted before a successful
+    /// move, transferred out after). Test-only; no production caller reads a
+    /// category total directly.
+    ///
+    /// # Panics
+    /// Panics if the active ledger lock is poisoned; a poisoned ledger is a
+    /// broken invariant that a test should surface loudly.
+    #[cfg(test)]
+    pub(crate) fn active_bytes(&self) -> usize {
+        self.active
+            .lock()
+            .expect("active memory ledger lock poisoned")
+            .bytes()
+    }
+
+    /// Read the immutable-category byte total for accounting assertions in
+    /// tests.
+    ///
+    /// Counterpart to [`Self::active_bytes`]; together they let a seal-path
+    /// test assert the net-zero category move (state A has zero immutable
+    /// bytes; state B has the frozen bytes). Test-only.
+    ///
+    /// # Panics
+    /// Panics if the immutable ledger lock is poisoned.
+    #[cfg(test)]
+    pub(crate) fn immutable_bytes(&self) -> usize {
+        self.immutable
+            .lock()
+            .expect("immutable memory ledger lock poisoned")
+            .bytes()
+    }
+
+    /// Reports the shared governor poison state for owner-level fault tests.
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.active
+            .lock()
+            .expect("active memory ledger lock invariant for inspection")
+            .is_poisoned()
+    }
+}
+
+pub(crate) fn read_cgroup_limit() -> Option<usize> {
+    [
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    ]
+    .into_iter()
+    .find_map(read_memory_limit)
+}
+
+pub(crate) fn read_cgroup_current() -> Option<usize> {
+    #[cfg(test)]
+    CGROUP_CURRENT_READS.with(|count| count.set(count.get() + 1));
+    [
+        "/sys/fs/cgroup/memory.current",
+        "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+    ]
+    .into_iter()
+    .find_map(|path| {
+        std::fs::read_to_string(path)
+            .ok()?
+            .trim()
+            .parse::<usize>()
+            .ok()
+    })
+}
+
+fn read_memory_limit(path: &str) -> Option<usize> {
+    let value = std::fs::read_to_string(path).ok()?;
+    let value = value.trim();
+    if value == "max" {
+        return None;
+    }
+    value.parse::<usize>().ok().filter(|value| *value > 0)
+}
+
+#[cfg(test)]
+/// Focused ownership and lifecycle reconciliation proofs.
+mod tests {
+    use super::{MemoryCategory, ScribeOwnership, retained_arrow_bytes};
+
+    /// Builds one two-column batch of `rows` rows for the retention proofs.
+    fn payload_batch(rows: usize) -> arrow::record_batch::RecordBatch {
+        let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int64, false),
+            arrow::datatypes::Field::new("payload", arrow::datatypes::DataType::Binary, false),
+        ]));
+        let mut payloads =
+            arrow::array::BinaryBuilder::with_capacity(rows, rows.saturating_mul(1024));
+        for _ in 0..rows {
+            payloads.append_value([9_u8; 1024]);
+        }
+        arrow::record_batch::RecordBatch::try_new(
+            schema,
+            vec![
+                std::sync::Arc::new(arrow::array::Int64Array::from(
+                    (0..i64::try_from(rows).expect("invariant: fixture row count fits i64"))
+                        .collect::<Vec<_>>(),
+                )),
+                std::sync::Arc::new(payloads.finish()),
+            ],
+        )
+        .expect("payload batch")
+    }
+
+    /// A zero-copy decoded frame is charged its allocation once, not per column.
+    ///
+    /// Every column of an Arrow IPC frame views the one received allocation, so
+    /// Arrow's own per-array measure multiplies that allocation by the column
+    /// count. Scribe admits a request against a planned envelope and then
+    /// charges what the materialized rows retain, so the inflated measure would
+    /// refuse requests that fit.
+    #[test]
+    fn a_zero_copy_frame_is_charged_its_allocation_once() {
+        let rows = 4_000;
+        let batch = payload_batch(rows);
+        let mut ipc = Vec::new();
+        {
+            let mut writer =
+                arrow::ipc::writer::StreamWriter::try_new(&mut ipc, batch.schema().as_ref())
+                    .expect("IPC writer");
+            writer.write(&batch).expect("IPC batch");
+            writer.finish().expect("IPC terminal");
+        }
+        let decoded = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(ipc), None)
+            .expect("IPC reader")
+            .next()
+            .expect("one decoded batch")
+            .expect("the decoded batch is valid");
+
+        let retained = retained_arrow_bytes(&decoded);
+        let per_array = arrow::array::RecordBatch::get_array_memory_size(&decoded);
+        assert!(
+            retained < per_array,
+            "a shared allocation must be charged once: retained {retained}, per-array {per_array}"
+        );
+        assert!(
+            retained >= rows * 1024,
+            "the charge must still cover the payload it retains: {retained}"
+        );
+        assert!(
+            retained < rows * 1024 * 2,
+            "the charge must not double the allocation it retains: {retained}"
+        );
+    }
+
+    /// A batch whose columns own their buffers is charged every allocation.
+    ///
+    /// Nothing is shared here, so the charge must track Arrow's own measure.
+    /// The two differ only by the per-array struct each counts — Arrow adds the
+    /// concrete array type, this adds its `ArrayData` — which is tens of bytes
+    /// against a quarter-megabyte batch.
+    #[test]
+    fn an_owned_batch_is_charged_what_arrow_reports() {
+        let batch = payload_batch(256);
+        let retained = retained_arrow_bytes(&batch);
+        let per_array = arrow::array::RecordBatch::get_array_memory_size(&batch);
+        assert!(
+            retained.abs_diff(per_array) < 1_024,
+            "distinct allocations must each be charged in full: retained {retained}, per-array {per_array}"
+        );
+    }
+
+    /// Generation observations follow the enforcing active/immutable owner exactly.
+    #[test]
+    fn generation_lifecycle_reconciles_transfer_replay_and_retirement() {
+        let resources =
+            crate::scribe::embedded_scribe_resources(&crate::scribe::AdmissionConfig::default());
+        let ownership = ScribeOwnership::new(&resources).expect("generation owner");
+
+        ownership.reserve_active(128).expect("active reservation");
+        ownership
+            .move_active_to_immutable(128)
+            .expect("persistence transfer");
+        ownership
+            .release_immutable(128)
+            .expect("retirement release");
+        ownership
+            .reserve_immutable(64)
+            .expect("replay materialization");
+        ownership.release_immutable(64).expect("replay retirement");
+
+        let lifecycle = ownership.lifecycle_snapshot();
+        assert_eq!(lifecycle.plans, 2);
+        assert_eq!(lifecycle.planned_bytes, 192);
+        assert_eq!(lifecycle.reservations, 2);
+        assert_eq!(lifecycle.reserved_bytes, 192);
+        assert_eq!(lifecycle.materializations, 2);
+        assert_eq!(lifecycle.materialized_bytes, 192);
+        assert_eq!(lifecycle.transfers, 1);
+        assert_eq!(lifecycle.transferred_bytes, 128);
+        assert_eq!(lifecycle.replay_materializations, 1);
+        assert_eq!(lifecycle.replay_materialized_bytes, 64);
+        assert_eq!(lifecycle.releases, 2);
+        assert_eq!(lifecycle.released_bytes, 192);
+        assert_eq!(lifecycle.active_bytes, 0);
+        assert_eq!(lifecycle.immutable_bytes, 0);
+        assert_eq!(resources.memory_snapshot().total_bytes(), 0);
+    }
+
+    /// Replay identity adoption and rollback preserve exact root ownership.
+    ///
+    /// # Panics
+    ///
+    /// Panics if admission, category adoption, Decode restoration, or terminal
+    /// release changes the root total or leaves category attribution behind.
+    #[test]
+    fn replay_identity_adoption_and_rollback_are_net_zero() {
+        let resources =
+            crate::scribe::embedded_scribe_resources(&crate::scribe::AdmissionConfig::default());
+        let ownership = ScribeOwnership::new(&resources).expect("generation owner");
+        let baseline = resources.snapshot().expect("baseline snapshot");
+        let lease = resources
+            .try_reserve_maintenance(MemoryCategory::Decode, 96)
+            .expect("replay identity lease");
+        let admitted = resources.snapshot().expect("admitted snapshot");
+        let identity = ownership
+            .adopt_replay_identity(lease, 96)
+            .expect("identity adoption");
+        assert_eq!(identity.bytes(), 96);
+        assert_eq!(
+            resources
+                .snapshot()
+                .expect("adopted snapshot")
+                .scribe_memory_used_bytes,
+            admitted.scribe_memory_used_bytes
+        );
+        let lease = identity.return_to_decode().expect("identity rollback");
+        assert_eq!(
+            resources
+                .snapshot()
+                .expect("rolled-back snapshot")
+                .scribe_memory_used_bytes,
+            admitted.scribe_memory_used_bytes
+        );
+        drop(lease);
+        assert_eq!(
+            resources
+                .snapshot()
+                .expect("released snapshot")
+                .scribe_memory_used_bytes,
+            baseline.scribe_memory_used_bytes
+        );
+    }
+}

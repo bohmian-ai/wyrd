@@ -1,4 +1,5 @@
-use crate::error::{CardPyResult, WyrdPyError};
+#[cfg(feature = "python")]
+use wyrd_utils::py::WyrdPyResult;
 
 #[cfg(feature = "python")]
 use {
@@ -48,12 +49,12 @@ impl ModelInterface {
     fn from_metadata(
         cls: &Bound<'_, PyType>,
         metadata: &Bound<'_, PyAny>,
-    ) -> CardPyResult<Py<PyAny>> {
+    ) -> WyrdPyResult<Py<PyAny>> {
         let _ = metadata;
         Ok(cls
             .call0()
             .map_err(|error| {
-                WyrdPyError::model_validation(format!(
+                crate::error::model_validation(format!(
                     "custom ModelInterface class could not be reconstructed from metadata with the default from_metadata implementation; override from_metadata(cls, metadata): {error}"
                 ))
             })?
@@ -62,20 +63,22 @@ impl ModelInterface {
 
     /// Save custom model bytes into a local `ModelCard` artifact directory.
     #[pyo3(signature = (path, save_kwargs=None))]
-    fn save(&self, path: PathBuf, save_kwargs: Option<&Bound<'_, PyDict>>) -> CardPyResult<()> {
+    fn save(&self, path: PathBuf, save_kwargs: Option<&Bound<'_, PyDict>>) -> WyrdPyResult<()> {
         let _ = (&self.kind, path, save_kwargs);
-        Err(WyrdPyError::model_validation(
+        Err(crate::error::model_validation(
             "ModelInterface.save must be implemented by a concrete interface",
-        ))
+        )
+        .into())
     }
 
     /// Load custom model bytes from a local `ModelCard` artifact directory.
     #[pyo3(signature = (path, load_kwargs=None))]
-    fn load(&mut self, path: PathBuf, load_kwargs: Option<&Bound<'_, PyDict>>) -> CardPyResult<()> {
+    fn load(&mut self, path: PathBuf, load_kwargs: Option<&Bound<'_, PyDict>>) -> WyrdPyResult<()> {
         let _ = (&self.kind, path, load_kwargs);
-        Err(WyrdPyError::model_validation(
+        Err(crate::error::model_validation(
             "ModelInterface.load must be implemented by a concrete interface",
-        ))
+        )
+        .into())
     }
 }
 

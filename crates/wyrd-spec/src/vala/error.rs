@@ -19,6 +19,195 @@ use crate::error::derive::WyrdError;
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(tag = "variant", content = "data", rename_all = "snake_case")]
 pub enum BifrostError {
+    /// This server has no ready local Oracle role.
+    #[error("Oracle role unavailable")]
+    #[wyrd_error(
+        code = "WYRD_VALA_503_ORACLE_ROLE_UNAVAILABLE",
+        status = 503,
+        title = "Oracle role unavailable",
+        remediation = "Retry through an Oracle-ready query endpoint."
+    )]
+    OracleRoleUnavailable,
+
+    /// No running query is visible for the authenticated tenant and request.
+    #[error("running query not found")]
+    #[wyrd_error(
+        code = "WYRD_VALA_404_RUNNING_QUERY_NOT_FOUND",
+        status = 404,
+        title = "Running query not found",
+        remediation = "Verify the request identity or list currently running queries for the authenticated tenant."
+    )]
+    RunningQueryNotFound,
+
+    /// Current Oracle owners reported contradictory lifecycle authority.
+    #[error("running query ownership conflict")]
+    #[wyrd_error(
+        code = "WYRD_VALA_409_RUNNING_QUERY_CONFLICT",
+        status = 409,
+        title = "Running query ownership conflict",
+        remediation = "Do not retry cancellation automatically; investigate the contradictory Oracle owners."
+    )]
+    RunningQueryConflict,
+
+    /// At least one current-ready Oracle could not answer lifecycle control.
+    #[error("running query control unavailable")]
+    #[wyrd_error(
+        code = "WYRD_VALA_503_RUNNING_QUERY_CONTROL_UNAVAILABLE",
+        status = 503,
+        title = "Running query control unavailable",
+        remediation = "Restore every current-ready Oracle lifecycle endpoint before retrying the logical operation."
+    )]
+    RunningQueryControlUnavailable,
+
+    /// This server has no WAL-ready local Scribe role.
+    #[error("Scribe role unavailable")]
+    #[wyrd_error(
+        code = "WYRD_VALA_503_SCRIBE_ROLE_UNAVAILABLE",
+        status = 503,
+        title = "Scribe role unavailable",
+        remediation = "Retry ingest through a WAL-ready Scribe endpoint."
+    )]
+    ScribeRoleUnavailable,
+
+    /// Query admission capacity was unavailable.
+    #[error("query admission rejected")]
+    #[wyrd_error(
+        code = "WYRD_VALA_429_QUERY_ADMISSION_REJECTED",
+        status = 429,
+        title = "Query admission rejected",
+        remediation = "Retry after the supplied bounded delay or reduce demand."
+    )]
+    QueryAdmissionRejected,
+
+    /// One indivisible query memory request exceeds its governing ceiling.
+    #[error("query memory request too large")]
+    #[wyrd_error(
+        code = "WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE",
+        status = 422,
+        title = "Query memory request too large",
+        remediation = "Reduce the requested range or query memory footprint; retrying unchanged will not succeed."
+    )]
+    QueryMemoryRequestTooLarge,
+
+    /// The requested sealed or live visibility cut could not be acquired.
+    #[error("query visibility unavailable")]
+    #[wyrd_error(
+        code = "WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE",
+        status = 503,
+        title = "Query visibility unavailable",
+        remediation = "Retry when the sealed/live source is available or select an allowed weaker freshness."
+    )]
+    QueryVisibilityUnavailable,
+
+    /// A row violated the authenticated tenant boundary.
+    #[error("query tenant invariant violated")]
+    #[wyrd_error(
+        code = "WYRD_VALA_500_QUERY_TENANT_INVARIANT",
+        status = 500,
+        title = "Query tenant invariant violated",
+        remediation = "Stop and investigate tenant isolation; never retry as caller input."
+    )]
+    QueryTenantInvariant,
+
+    /// Cross-tier rows with one identity contained inconsistent values.
+    #[error("query reconciliation invariant violated")]
+    #[wyrd_error(
+        code = "WYRD_VALA_500_QUERY_RECONCILIATION_INVARIANT",
+        status = 500,
+        title = "Query reconciliation invariant violated",
+        remediation = "Stop and investigate cross-tier row corruption."
+    )]
+    QueryReconciliationInvariant,
+
+    /// A peer credential, fence, or replay check failed.
+    #[error("query peer security validation failed")]
+    #[wyrd_error(
+        code = "WYRD_VALA_403_QUERY_PEER_SECURITY",
+        status = 403,
+        title = "Query peer security validation failed",
+        remediation = "Reject the peer attempt and investigate credential/fence/replay state."
+    )]
+    QueryPeerSecurity,
+
+    /// A query stream violated the closed frame protocol.
+    #[error("query stream protocol violation")]
+    #[wyrd_error(
+        code = "WYRD_VALA_502_QUERY_STREAM_PROTOCOL",
+        status = 502,
+        title = "Query stream protocol violation",
+        remediation = "Discard partial output and retry through a healthy server."
+    )]
+    QueryStreamProtocol,
+
+    /// A query stream ended without a terminal frame.
+    #[error("query stream incomplete")]
+    #[wyrd_error(
+        code = "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE",
+        status = 502,
+        title = "Query stream incomplete",
+        remediation = "Discard partial output; retry because no terminal was observed."
+    )]
+    QueryStreamIncomplete,
+
+    /// The transactional query read-decision audit could not be committed.
+    #[error("query audit unavailable")]
+    #[wyrd_error(
+        code = "WYRD_VALA_503_QUERY_AUDIT_UNAVAILABLE",
+        status = 503,
+        title = "Query audit unavailable",
+        remediation = "Restore the audit/SQL dependency before retrying."
+    )]
+    QueryAuditUnavailable,
+
+    /// Query execution failed after the public stream began.
+    #[error("query execution failed")]
+    #[wyrd_error(
+        code = "WYRD_VALA_500_QUERY_EXECUTION_FAILED",
+        status = 500,
+        title = "Query execution failed",
+        remediation = "Inspect the scrubbed terminal error and server diagnostics before retrying."
+    )]
+    QueryExecutionFailed,
+
+    /// The ingest authentication credentials were missing or rejected.
+    #[error("ingest authentication failed: {message}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_401_INGEST_AUTH",
+        status = 401,
+        title = "Ingest authentication failed",
+        remediation = "Provide a valid Wyrd access token with permission to write the target ingest surface."
+    )]
+    IngestAuthentication {
+        /// Human-readable authentication failure detail.
+        message: String,
+    },
+
+    /// The ingest request violated the native protocol contract.
+    #[error("ingest request validation failed: {message}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_400_INGEST_PROTO",
+        status = 400,
+        title = "Invalid ingest request",
+        remediation = "Fix the ingest request fields and retry with a valid Wyrd ingest payload."
+    )]
+    IngestProtocol {
+        /// Human-readable protocol validation detail.
+        message: String,
+    },
+
+    /// A Bifrost schema, or a row value measured against it, failed to map.
+    #[error("schema parse failed: {detail}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_400_SCHEMA_PARSE",
+        status = 400,
+        title = "Bifrost schema parse failed",
+        remediation = "Correct the column type or the row value so it satisfies the table's declared DataTypeSpec."
+    )]
+    SchemaParse {
+        /// Human-readable schema or value validation detail.
+        detail: String,
+    },
+
     /// A user-supplied schema field uses a reserved system column name.
     #[error("reserved system column: {column}")]
     #[wyrd_error(
@@ -32,29 +221,29 @@ pub enum BifrostError {
         column: String,
     },
 
-    /// A `SystemShared` table schema is missing the required `data_tenant_id` column.
-    #[error("SystemShared table missing data_tenant_id column: {table}")]
+    /// A caller attempted to write a server-managed built-in table.
+    #[error("write to reserved built-in table denied: {table}")]
     #[wyrd_error(
-        code = "WYRD_VALA_400_BIFROST_MISSING_TENANT_COLUMN",
-        status = 400,
-        title = "SystemShared table missing data_tenant_id column",
-        remediation = "Add a data_tenant_id Utf8 column to the schema for SystemShared tables."
+        code = "WYRD_VALA_403_BIFROST_RESERVED_BUILTIN_WRITE",
+        status = 403,
+        title = "Reserved built-in write denied",
+        remediation = "Write through the supported observation or audit API instead of directly targeting a reserved built-in table."
     )]
-    MissingTenantColumn {
-        /// Fully-qualified table name that is missing the tenant column.
+    ReservedBuiltinWriteDenied {
+        /// Fully-qualified table name that was refused.
         table: String,
     },
 
-    /// A TenantOwned table schema includes the `data_tenant_id` column, which is not allowed.
-    #[error("TenantOwned table must not include data_tenant_id: {table}")]
+    /// A physical table schema is missing the required tenant isolation column.
+    #[error("table missing data_tenant_id managed column: {table}")]
     #[wyrd_error(
-        code = "WYRD_VALA_400_BIFROST_UNEXPECTED_TENANT_COLUMN",
+        code = "WYRD_VALA_400_BIFROST_TENANT_ISOLATION_COLUMN_MISSING",
         status = 400,
-        title = "TenantOwned table must not include data_tenant_id",
-        remediation = "Remove data_tenant_id from the schema — TenantOwned tables are isolated by catalog namespace."
+        title = "Tenant isolation column missing",
+        remediation = "Add the server-managed data_tenant_id Utf8 column to the physical table schema."
     )]
-    UnexpectedTenantColumn {
-        /// Fully-qualified table name that incorrectly includes the tenant column.
+    TenantIsolationColumnMissing {
+        /// Fully-qualified table name that is missing the tenant column.
         table: String,
     },
 
@@ -81,6 +270,29 @@ pub enum BifrostError {
         /// Canonical string form of the card reference that was refused.
         card_ref: String,
     },
+
+    /// A card reference could not be resolved to a tenant-local card UID.
+    #[error("card_ref cannot be resolved: {card_ref}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_403_CARD_UNRESOLVED",
+        status = 403,
+        title = "Card reference unresolved",
+        remediation = "Use a card_ref that resolves to a registered card in the current tenant."
+    )]
+    CardUnresolved {
+        /// Canonical card reference that could not be resolved.
+        card_ref: String,
+    },
+
+    /// The authenticated principal could not be stamped onto the ingest row.
+    #[error("principal_id cannot be stamped for authenticated write")]
+    #[wyrd_error(
+        code = "WYRD_VALA_401_PRINCIPAL_UNRESOLVED",
+        status = 401,
+        title = "Ingest principal unresolved",
+        remediation = "Authenticate with a token containing a valid principal identity and retry."
+    )]
+    PrincipalUnresolved,
 
     /// The requested Bifrost table does not exist in the catalog.
     #[error("bifrost table not found: {table}")]
@@ -221,7 +433,7 @@ pub enum BifrostError {
         code = "WYRD_VALA_504_QUERY_TIMEOUT",
         status = 504,
         title = "Query execution timed out",
-        remediation = "Narrow the query (add filters, reduce scanned partitions) or use the async query API."
+        remediation = "Narrow the query by adding filters or reducing scanned partitions."
     )]
     QueryTimeout,
 
@@ -231,9 +443,59 @@ pub enum BifrostError {
         code = "WYRD_VALA_413_QUERY_RESULT_TOO_LARGE",
         status = 413,
         title = "Query result too large",
-        remediation = "Add a LIMIT or narrower filters, or use the async query API for large result sets."
+        remediation = "Add a LIMIT or narrower filters for large result sets."
     )]
     QueryResultTooLarge,
+
+    /// A client attempted a Bifrost write with no table bound as its target.
+    ///
+    /// Client-raised rather than server-raised: the SDK refuses the row before
+    /// it can be routed anywhere. The metadata still lives in this catalog
+    /// because it crosses the Rust, Python, and TypeScript boundaries, and a
+    /// second hand-written copy per SDK is how the four fields drift apart.
+    #[error("no active Bifrost table")]
+    #[wyrd_error(
+        code = "WYRD_VALA_412_NO_ACTIVE_TABLE",
+        status = 412,
+        title = "No active Bifrost table",
+        remediation = "Bind a table with use_table or use_table_by_name before inserting rows."
+    )]
+    NoActiveTable,
+
+    /// The decompressed canonical ingest payload exceeded the Scribe limit.
+    ///
+    /// Both bounds are public data: `bytes` is what the server measured and
+    /// `limit` is the ceiling it actually enforced for this request. The limit
+    /// is configured rather than universal, so callers must read it from the
+    /// problem document instead of assuming a fixed transport ceiling.
+    #[error("ingest payload too large: {bytes} bytes exceeds the {limit} byte limit")]
+    #[wyrd_error(
+        code = "WYRD_VALA_413_PAYLOAD_TOO_LARGE",
+        status = 413,
+        title = "Ingest payload too large",
+        remediation = "Reduce the request below the enforced limit reported in this problem and retry."
+    )]
+    PayloadTooLarge {
+        /// Server-measured canonical transport bytes.
+        bytes: usize,
+        /// Canonical transport byte ceiling enforced for this request.
+        limit: usize,
+    },
+
+    /// The ingest request exceeded the aggregate row bound.
+    #[error("ingest request has too many rows ({rows} > {limit})")]
+    #[wyrd_error(
+        code = "WYRD_VALA_413_INGEST_OVERSIZED",
+        status = 413,
+        title = "Ingest request oversized",
+        remediation = "Reduce the number of rows in the request and retry."
+    )]
+    IngestOversized {
+        /// Number of rows observed in the request.
+        rows: u64,
+        /// Maximum rows allowed by the ingest contract.
+        limit: u64,
+    },
 
     /// An unexpected internal Bifrost failure occurred.
     #[error("internal bifrost failure: {detail}")]
@@ -381,16 +643,6 @@ pub enum BifrostError {
     )]
     QueryForbidden,
 
-    /// The principal lacks the payload resource permission.
-    #[error("payload access forbidden")]
-    #[wyrd_error(
-        code = "WYRD_VALA_403_PAYLOAD_FORBIDDEN",
-        status = 403,
-        title = "Payload access forbidden",
-        remediation = "The principal lacks the payload resource permission; sensitive columns were omitted."
-    )]
-    PayloadForbidden,
-
     /// The ingest writer's local buffer is full; the caller must retry.
     ///
     /// This is **local buffer backpressure only** — the per-physical-table
@@ -398,8 +650,9 @@ pub enum BifrostError {
     /// partial success: no row from this request was written. Callers should
     /// back off and retry the full request.
     ///
-    /// The OTLP ingest path maps overload to a retryable `UNAVAILABLE`/`503`
-    /// response, never to `partial_success`.
+    /// The OTLP ingest path maps overload to HTTP `429` and gRPC
+    /// `RESOURCE_EXHAUSTED`, never to `partial_success`; no rows from the
+    /// request are written.
     #[error("ingest writer busy: {table}")]
     #[wyrd_error(
         code = "WYRD_VALA_429_INGEST_BUSY",
@@ -444,4 +697,234 @@ pub enum BifrostError {
         /// Human-readable decode error detail.
         detail: String,
     },
+
+    /// A caller-supplied `wyrd_event_time` value falls outside the server
+    /// acceptance window evaluated against per-batch receipt time.
+    ///
+    /// The entire batch is rejected pre-admission; no rows are written. Either
+    /// supply a `wyrd_event_time` within the configured window (default: 30 days
+    /// past to 24 hours future of server receipt time) or omit the column to let
+    /// the server stamp receipt time. The window cannot be overridden per-tenant.
+    #[error("event time out of acceptance window: {value} not in [{past_bound}, {future_bound}]")]
+    #[wyrd_error(
+        code = "WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE",
+        status = 400,
+        title = "Event time outside acceptance window",
+        remediation = "Supply a wyrd_event_time within the server acceptance window \
+(default 30 days past to 24 hours future of server receipt time), or omit the \
+column to let the server stamp receipt time."
+    )]
+    EventTimeOutOfRange {
+        /// The offending `wyrd_event_time` value (epoch-microseconds rendered as a string).
+        value: String,
+        /// The inclusive past bound used for this batch (epoch-microseconds rendered as a string).
+        past_bound: String,
+        /// The inclusive future bound used for this batch (epoch-microseconds rendered as a string).
+        future_bound: String,
+    },
+
+    /// A register request declared a physical layout Bifrost cannot canonicalize.
+    ///
+    /// The fault is reported before any SQL transaction, Iceberg call, or audit
+    /// append, so no durable state changed. The triple
+    /// (`field`, `violation`, `column`) names the exact declaration at fault.
+    #[error("invalid physical layout for table {table}: {field:?}/{violation:?}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_400_BIFROST_INVALID_PHYSICAL_LAYOUT",
+        status = 400,
+        title = "Invalid Bifrost physical layout",
+        remediation = "Declare hour or day granularity, at most four unique schema columns as sort keys, and supported sort/null values."
+    )]
+    InvalidPhysicalLayout {
+        /// Canonical `<namespace>.<name>` of the table being registered.
+        table: String,
+        /// Declaration slot that failed validation.
+        field: PhysicalLayoutField,
+        /// Why the declaration in `field` is not acceptable.
+        violation: PhysicalLayoutViolation,
+        /// Offending bounded schema/layout identifier when the fault names one.
+        column: Option<String>,
+    },
+
+    /// A register retry supplied a valid layout that differs from the layout the
+    /// table is already registered with.
+    ///
+    /// Fingerprint equality is checked first, so this variant means the schema
+    /// matched and only the canonical physical layout diverged. Nothing was
+    /// mutated.
+    #[error("physical layout mismatch for table: {table}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_409_BIFROST_LAYOUT_MISMATCH",
+        status = 409,
+        title = "Bifrost physical layout mismatch",
+        remediation = "Retry with the table's registered physical layout or register a different table."
+    )]
+    PhysicalLayoutMismatch {
+        /// Canonical `<namespace>.<name>` of the conflicting table.
+        table: String,
+    },
+}
+
+/// Declaration slot named by [`BifrostError::InvalidPhysicalLayout`].
+///
+/// Each variant maps one-to-one onto a field of the public
+/// `PhysicalLayoutWire` request shape so a client can point at the exact
+/// declaration it must correct.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum PhysicalLayoutField {
+    /// The `partition` object itself, including its required presence.
+    Partition,
+    /// The partition's `granularity` token.
+    Granularity,
+    /// An entry of `sort_keys`, identified by its `column`.
+    SortKey,
+    /// A sort key's `direction` token.
+    SortDirection,
+    /// A sort key's `null_order` token.
+    NullOrder,
+    /// An entry of `bloom_columns`.
+    BloomColumn,
+}
+
+/// Why the declaration named by [`PhysicalLayoutField`] was rejected.
+///
+/// The set is closed so SDKs can branch on it without parsing prose; no backend
+/// or parser message crosses the public boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum PhysicalLayoutViolation {
+    /// A required declaration was absent.
+    Missing,
+    /// The same identifier was declared more than once in one list.
+    Duplicate,
+    /// More sort keys were declared than the layout contract admits.
+    TooManyKeys,
+    /// The declaration referenced a name absent from the physical schema.
+    UnknownColumn,
+    /// The column exists but cannot serve this declaration slot.
+    UnsupportedColumn,
+    /// The token is outside the closed set this slot accepts.
+    UnsupportedValue,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every declaration slot in the public layout contract, in declaration order.
+    const ALL_FIELDS: [PhysicalLayoutField; 6] = [
+        PhysicalLayoutField::Partition,
+        PhysicalLayoutField::Granularity,
+        PhysicalLayoutField::SortKey,
+        PhysicalLayoutField::SortDirection,
+        PhysicalLayoutField::NullOrder,
+        PhysicalLayoutField::BloomColumn,
+    ];
+
+    /// Every rejection class in the public layout contract, in declaration order.
+    const ALL_VIOLATIONS: [PhysicalLayoutViolation; 6] = [
+        PhysicalLayoutViolation::Missing,
+        PhysicalLayoutViolation::Duplicate,
+        PhysicalLayoutViolation::TooManyKeys,
+        PhysicalLayoutViolation::UnknownColumn,
+        PhysicalLayoutViolation::UnsupportedColumn,
+        PhysicalLayoutViolation::UnsupportedValue,
+    ];
+
+    /// Pins the generated code/status of both layout errors and proves every
+    /// `(field, violation)` pair survives a public serde round trip carrying only
+    /// bounded identifiers.
+    #[test]
+    fn physical_layout_error_contract() {
+        let mismatch = BifrostError::PhysicalLayoutMismatch {
+            table: "obs.events".to_owned(),
+        };
+        assert_eq!(mismatch.code(), "WYRD_VALA_409_BIFROST_LAYOUT_MISMATCH");
+        assert_eq!(mismatch.status(), 409);
+
+        for field in ALL_FIELDS {
+            for violation in ALL_VIOLATIONS {
+                for column in [None, Some("wyrd_event_time".to_owned())] {
+                    let error = BifrostError::InvalidPhysicalLayout {
+                        table: "obs.events".to_owned(),
+                        field,
+                        violation,
+                        column: column.clone(),
+                    };
+                    assert_eq!(
+                        error.code(),
+                        "WYRD_VALA_400_BIFROST_INVALID_PHYSICAL_LAYOUT"
+                    );
+                    assert_eq!(error.status(), 400);
+
+                    let json = serde_json::to_string(&error).expect("layout error serializes");
+                    let restored: BifrostError =
+                        serde_json::from_str(&json).expect("layout error deserializes");
+                    assert_eq!(restored, error);
+                    assert!(
+                        !json.contains("panic") && json.len() < 512,
+                        "public layout error must stay bounded: {json}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Proves the ingest payload ceiling is carried as structured data rather than
+    /// being frozen into prose: the enforced `limit` travels beside the measured
+    /// `bytes` through the public catalog projection, so a caller reading only the
+    /// problem document can compute how far over the configured ceiling it went.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the code, status, structured details, or remediation drift from
+    /// the durable public contract.
+    #[test]
+    fn payload_too_large_reports_the_enforced_limit() {
+        let error = BifrostError::PayloadTooLarge {
+            bytes: 41_943_040,
+            limit: 8_388_608,
+        };
+        assert_eq!(error.code(), "WYRD_VALA_413_PAYLOAD_TOO_LARGE");
+        assert_eq!(error.status(), 413);
+
+        let details = serde_json::to_value(&error).expect("payload error serializes");
+        assert_eq!(
+            details["data"]["bytes"], 41_943_040,
+            "measured transport bytes must survive the public projection: {details}"
+        );
+        assert_eq!(
+            details["data"]["limit"], 8_388_608,
+            "the enforced ceiling must survive the public projection: {details}"
+        );
+
+        let remediation = error.remediation();
+        assert!(
+            !remediation.contains("32 MiB"),
+            "remediation must not assert a fixed ceiling that contradicts the \
+             supplied limit: {remediation}"
+        );
+        assert!(
+            remediation.contains("limit"),
+            "remediation must point the caller at the supplied limit: {remediation}"
+        );
+    }
+
+    /// Confirms the closed token vocabulary is snake_case on the wire so SDKs can
+    /// branch on the exact strings the generated schemas publish.
+    #[test]
+    fn physical_layout_tokens_are_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&PhysicalLayoutViolation::TooManyKeys)
+                .expect("violation serializes"),
+            "\"too_many_keys\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PhysicalLayoutField::SortDirection).expect("field serializes"),
+            "\"sort_direction\""
+        );
+    }
 }

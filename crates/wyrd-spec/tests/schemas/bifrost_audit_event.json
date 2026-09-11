@@ -127,9 +127,714 @@
         }
       ]
     },
+    "AuditDelegationStep": {
+      "description": "One verified delegation hop projected into a durable audit record.\n\nThe projection is deliberately identity-only: a delegation chain reaches audit from a token the verifier already accepted, so the record needs the delegator's identity and the card authority it was acting under, never the credential that carried them. Steps are stored in the same initiator-first order the verifier produced, because the order is the delegation, not an incidental encoding.",
+      "type": "object",
+      "required": [
+        "principal_id",
+        "principal_kind"
+      ],
+      "properties": {
+        "card_ref": {
+          "description": "Card bound to the delegator; absent for a `User` principal.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "card_ref_scope": {
+          "description": "Transitive card authorization the delegator acted under; empty for a `User` principal.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/CardRef"
+          }
+        },
+        "principal_id": {
+          "description": "Stable identity of the delegating principal.",
+          "type": "string",
+          "format": "uuid"
+        },
+        "principal_kind": {
+          "description": "Card-free kind discriminator of the delegating principal.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/PrincipalKindTag"
+            }
+          ]
+        }
+      }
+    },
     "AuditDetail": {
       "description": "Structured detail for one auditable operation.",
       "oneOf": [
+        {
+          "description": "Bounded deployment-wide aggregates captured by Oracle admission recovery.",
+          "type": "object",
+          "required": [
+            "active_lease_count",
+            "analytical_slots",
+            "expired_lease_count",
+            "interactive_slots",
+            "kind",
+            "total_slots"
+          ],
+          "properties": {
+            "active_lease_count": {
+              "description": "Number of unexpired admission leases retained by recovery.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "analytical_slots": {
+              "description": "Analytical slot units retained across active leases.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "expired_lease_count": {
+              "description": "Number of expired admission leases removed by recovery.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "interactive_slots": {
+              "description": "Interactive slot units retained across active leases.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "oracle_admission_recovery"
+              ]
+            },
+            "total_slots": {
+              "description": "Total slot units retained across every active lease.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            }
+          }
+        },
+        {
+          "description": "Immutable, scrubbed Bifrost visibility-cut read decision.",
+          "type": "object",
+          "required": [
+            "binding_digests",
+            "deadline_ms",
+            "execution",
+            "kind",
+            "manifest_digest",
+            "permission_digest",
+            "projection_digest",
+            "query_class",
+            "query_digest",
+            "retry_ordinal",
+            "selected_node_count",
+            "slot_units",
+            "snapshot_digest",
+            "visibility",
+            "worker_count"
+          ],
+          "properties": {
+            "binding_digests": {
+              "description": "Sorted tenant-table binding digests.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "deadline_ms": {
+              "description": "Settled deadline in milliseconds.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "delegation_chain": {
+              "description": "Verified initiator-first delegation chain, empty when the caller presented no `act` claim. Omitted from the canonical encoding when empty so records written before delegation attribution keep their original bytes and hash.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/AuditDelegationStep"
+              }
+            },
+            "execution": {
+              "description": "Local or distributed execution decision.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/QueryExecutionMode"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "bifrost_query_read_decision"
+              ]
+            },
+            "manifest_digest": {
+              "description": "Hot manifest summary digest.",
+              "type": "string"
+            },
+            "permission_digest": {
+              "description": "Permission decision digest.",
+              "type": "string"
+            },
+            "projection_digest": {
+              "description": "Authorized projection digest.",
+              "type": "string"
+            },
+            "query_class": {
+              "description": "Server-derived admission class.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/QueryClass"
+                }
+              ]
+            },
+            "query_digest": {
+              "description": "Digest of the normalized query.",
+              "type": "string"
+            },
+            "retry_ordinal": {
+              "description": "Whole-cut retry ordinal, zero or one.",
+              "type": "integer",
+              "format": "uint8",
+              "minimum": 0.0
+            },
+            "selected_node_count": {
+              "description": "Selected execution nodes including leader.",
+              "type": "integer",
+              "format": "uint8",
+              "minimum": 0.0
+            },
+            "slot_units": {
+              "description": "Total admission slot demand.",
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "snapshot_digest": {
+              "description": "Pinned snapshot summary digest.",
+              "type": "string"
+            },
+            "visibility": {
+              "description": "Visibility mode committed by the cut.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/VisibilityMode"
+                }
+              ]
+            },
+            "worker_count": {
+              "description": "Selected workers excluding leader.",
+              "type": "integer",
+              "format": "uint8",
+              "minimum": 0.0
+            }
+          }
+        },
+        {
+          "description": "Scrubbed tenant or peer security violation.",
+          "type": "object",
+          "required": [
+            "kind",
+            "phase",
+            "violation"
+          ],
+          "properties": {
+            "delegation_chain": {
+              "description": "Verified initiator-first delegation chain, empty and omitted when the refused caller presented no `act` claim.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/AuditDelegationStep"
+              }
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "bifrost_security_violation"
+              ]
+            },
+            "phase": {
+              "description": "Boundary where validation failed.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/BifrostSecurityPhase"
+                }
+              ]
+            },
+            "query_digest": {
+              "description": "Trusted query digest when one exists.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "violation": {
+              "description": "Closed violation class.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/BifrostSecurityViolationKind"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "description": "A live Iceberg file replacement and its recoverable external boundary.\n\nThe ordered paths are the exact current-snapshot inputs and the exact rewrite outputs. `base_snapshot_id` is the plan fence, never an input file's addition snapshot.",
+          "type": "object",
+          "required": [
+            "base_snapshot_id",
+            "group",
+            "input_paths",
+            "kind",
+            "operation_id",
+            "output_paths",
+            "partition_spec_id",
+            "phase",
+            "target_file_size_bytes",
+            "time_partition"
+          ],
+          "properties": {
+            "base_snapshot_id": {
+              "description": "Snapshot observed by the table plan before discovery.",
+              "type": "integer",
+              "format": "int64"
+            },
+            "committed_snapshot_id": {
+              "description": "Snapshot returned after a proven replacement commit.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            },
+            "group": {
+              "description": "Canonical tenant/table resource identity.",
+              "type": "string"
+            },
+            "input_paths": {
+              "description": "Exact ordered catalog paths deleted by the Iceberg action.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "forge_iceberg_rewrite"
+              ]
+            },
+            "operation_id": {
+              "description": "Stable identity shared by output names, Iceberg, and audit rows.",
+              "type": "string",
+              "format": "uuid"
+            },
+            "output_paths": {
+              "description": "Exact ordered rewritten object paths added by the Iceberg action.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "partition_spec_id": {
+              "description": "Destination partition specification identity.",
+              "type": "integer",
+              "format": "int32"
+            },
+            "phase": {
+              "description": "Durable lifecycle transition represented by this row.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ForgeIcebergRewritePhase"
+                }
+              ]
+            },
+            "target_file_size_bytes": {
+              "description": "Target output size captured from the table metadata.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "time_partition": {
+              "description": "Shared exact time partition for every input in the rewrite group.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TimePartitionWire"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "description": "A Forge Scribe-promotion operation and its Iceberg catalog boundary.\n\nPromotion appends already-published hot objects unchanged, so the row records exactly which `file_list` rows and object paths moved, the snapshot the append started from, the snapshot it produced when known, and the digest binding that ordered file set to this operation.",
+          "type": "object",
+          "required": [
+            "base_snapshot_id",
+            "group",
+            "input_file_ids",
+            "input_paths",
+            "kind",
+            "operation_id",
+            "phase",
+            "promoted_file_set_digest"
+          ],
+          "properties": {
+            "base_snapshot_id": {
+              "description": "Snapshot observed before the promotion append.",
+              "type": "integer",
+              "format": "int64"
+            },
+            "committed_snapshot_id": {
+              "description": "Snapshot returned by a proven promotion commit, when known.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            },
+            "group": {
+              "description": "Canonical tenant/table resource identity.",
+              "type": "string"
+            },
+            "input_file_ids": {
+              "description": "Exact ordered `file_list` rows promoted by the operation.",
+              "type": "array",
+              "items": {
+                "type": "string",
+                "format": "uuid"
+              }
+            },
+            "input_paths": {
+              "description": "Exact ordered logical object paths promoted by the operation.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "forge_scribe_promotion"
+              ]
+            },
+            "operation_id": {
+              "description": "Deterministic identifier shared by prepared and terminal rows.",
+              "type": "string",
+              "format": "uuid"
+            },
+            "phase": {
+              "description": "Durable phase represented by this audit row.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ForgeScribePromotionPhase"
+                }
+              ]
+            },
+            "promoted_file_set_digest": {
+              "description": "Digest binding the ordered promoted file set to this operation.",
+              "type": "string"
+            }
+          }
+        },
+        {
+          "description": "A Forge snapshot-expiry operation and its Iceberg metadata boundary.",
+          "type": "object",
+          "required": [
+            "base_metadata_location",
+            "cutoff_ms",
+            "group",
+            "kind",
+            "operation_id",
+            "phase",
+            "retained_ref_heads",
+            "selected_snapshot_ids"
+          ],
+          "properties": {
+            "base_metadata_location": {
+              "description": "Metadata location observed before the expiry commit.",
+              "type": "string"
+            },
+            "current_snapshot_id": {
+              "description": "Current snapshot observed before the expiry commit.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            },
+            "cutoff_ms": {
+              "description": "Strict timestamp cutoff used for selection.",
+              "type": "integer",
+              "format": "int64"
+            },
+            "group": {
+              "description": "Canonical tenant/table resource identity.",
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "forge_snapshot_expire"
+              ]
+            },
+            "operation_id": {
+              "description": "Deterministic identifier shared by prepared and terminal rows.",
+              "type": "string",
+              "format": "uuid"
+            },
+            "phase": {
+              "description": "Durable phase represented by this audit row.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ForgeSnapshotExpirePhase"
+                }
+              ]
+            },
+            "retained_ref_heads": {
+              "description": "Snapshot IDs at the heads of retained Iceberg refs.",
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "int64"
+              }
+            },
+            "selected_snapshot_ids": {
+              "description": "Exact snapshot IDs selected for expiry, sorted ascending.",
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "int64"
+              }
+            }
+          }
+        },
+        {
+          "description": "A Forge metadata-only manifest rewrite and its Iceberg boundary.\n\nThe operation regroups manifest entries and nothing else: the data files the table logically contains are identical before and after it. Both path collections are exact and ordered, so a reader can prove which manifests were replaced by which without consulting the catalog.",
+          "type": "object",
+          "required": [
+            "base_metadata_location",
+            "group",
+            "input_manifest_paths",
+            "kind",
+            "operation_id",
+            "output_manifest_paths",
+            "phase"
+          ],
+          "properties": {
+            "base_metadata_location": {
+              "description": "Metadata location observed before the rewrite commit.",
+              "type": "string"
+            },
+            "committed_metadata_location": {
+              "description": "Metadata location returned by a proven commit, when known.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "group": {
+              "description": "Canonical tenant/table resource identity.",
+              "type": "string"
+            },
+            "input_manifest_paths": {
+              "description": "Exact ordered manifests replaced by the rewrite.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "forge_manifest_rewrite"
+              ]
+            },
+            "operation_id": {
+              "description": "Deterministic identifier shared by prepared and terminal rows.",
+              "type": "string",
+              "format": "uuid"
+            },
+            "output_manifest_paths": {
+              "description": "Exact ordered manifests written by the rewrite.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "phase": {
+              "description": "Durable phase represented by this audit row.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ForgeManifestRewritePhase"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "description": "One fenced Oracle reader epoch's durable lifecycle transition.\n\nThe epoch is a process fact rather than a tenant fact, so this event is appended under the system owner. Renewal is deliberately absent: it changes only the lease window and revision, and auditing every five seconds would bury the transitions that actually change what Forge may destroy.",
+          "type": "object",
+          "required": [
+            "fencing_token",
+            "kind",
+            "node_id",
+            "phase",
+            "state_revision"
+          ],
+          "properties": {
+            "fencing_token": {
+              "description": "Exact `cluster_nodes` Oracle fence the epoch was acquired under.",
+              "type": "integer",
+              "format": "int64"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "oracle_reader_epoch"
+              ]
+            },
+            "node_id": {
+              "description": "Physical node holding the epoch.",
+              "type": "string",
+              "format": "uuid"
+            },
+            "phase": {
+              "description": "Durable transition this row records.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/OracleReaderEpochPhase"
+                }
+              ]
+            },
+            "state_revision": {
+              "description": "Revision the committing statement left behind.",
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        },
+        {
+          "description": "One epoch's durable reader protection change for one table.\n\nAppended in the same tenant transaction as the protection rows it describes, so a protection change and its evidence commit or roll back together. An admission already covered by the confirmed frontier emits nothing, because it changes no durable state.",
+          "type": "object",
+          "required": [
+            "fencing_token",
+            "group",
+            "kind",
+            "node_id",
+            "phase",
+            "protected_snapshot_ids",
+            "revision"
+          ],
+          "properties": {
+            "fencing_token": {
+              "description": "Exact Oracle fence of that epoch.",
+              "type": "integer",
+              "format": "int64"
+            },
+            "group": {
+              "description": "Canonical tenant/table resource identity.",
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "oracle_table_protection"
+              ]
+            },
+            "node_id": {
+              "description": "Physical node whose epoch published the protection.",
+              "type": "string",
+              "format": "uuid"
+            },
+            "phase": {
+              "description": "Durable transition this row records.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/OracleTableProtectionPhase"
+                }
+              ]
+            },
+            "protected_snapshot_ids": {
+              "description": "Oldest protected snapshot of every retained chain, sorted ascending.",
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "int64"
+              }
+            },
+            "revision": {
+              "description": "Table-local revision this transition committed.",
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        },
+        {
+          "description": "A Forge orphan-GC operation and its bounded object batch.",
+          "type": "object",
+          "required": [
+            "candidate_paths",
+            "deleted_paths",
+            "group",
+            "kind",
+            "operation_id",
+            "phase",
+            "skipped_paths"
+          ],
+          "properties": {
+            "candidate_paths": {
+              "description": "Exact sorted object candidates observed before deletion.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "deleted_paths": {
+              "description": "Objects deleted by the terminal attempt.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "group": {
+              "description": "Canonical tenant/table resource identity.",
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "forge_orphan_gc"
+              ]
+            },
+            "operation_id": {
+              "description": "Deterministic identifier shared by prepared and terminal rows.",
+              "type": "string",
+              "format": "uuid"
+            },
+            "phase": {
+              "description": "Durable phase represented by this audit row.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ForgeOrphanGcPhase"
+                }
+              ]
+            },
+            "skipped_paths": {
+              "description": "Objects skipped after the final live-set/age check.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
         {
           "description": "Authentication failure metadata; credentials are never representable here.",
           "type": "object",
@@ -520,6 +1225,29 @@
           }
         },
         {
+          "description": "Delegation attribution for an audited operation that carries no operation-specific detail of its own.\n\nThis variant exists so an RBAC denial or other detail-free event can still name who was acting for whom. It never replaces an operation-specific detail: an event that already has one carries its delegation inside that detail instead.",
+          "type": "object",
+          "required": [
+            "delegation_chain",
+            "kind"
+          ],
+          "properties": {
+            "delegation_chain": {
+              "description": "Verified initiator-first delegation chain.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/AuditDelegationStep"
+              }
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "delegation_attribution"
+              ]
+            }
+          }
+        },
+        {
           "description": "Ingest batch metadata.",
           "type": "object",
           "required": [
@@ -652,6 +1380,156 @@
           "type": "string",
           "enum": [
             "internal"
+          ]
+        }
+      ]
+    },
+    "BifrostSecurityPhase": {
+      "description": "Closed phase where a Bifrost security invariant failed.",
+      "oneOf": [
+        {
+          "description": "Query planning and binding.",
+          "type": "string",
+          "enum": [
+            "planning"
+          ]
+        },
+        {
+          "description": "Source access or tenant tripwire.",
+          "type": "string",
+          "enum": [
+            "source"
+          ]
+        },
+        {
+          "description": "Private peer authentication and execution.",
+          "type": "string",
+          "enum": [
+            "peer"
+          ]
+        }
+      ]
+    },
+    "BifrostSecurityViolationKind": {
+      "description": "Closed Bifrost security violation classes.",
+      "oneOf": [
+        {
+          "description": "Authenticated tenant binding mismatch.",
+          "type": "string",
+          "enum": [
+            "tenant_binding"
+          ]
+        },
+        {
+          "description": "Tenant-scoped object path mismatch.",
+          "type": "string",
+          "enum": [
+            "tenant_path"
+          ]
+        },
+        {
+          "description": "Runtime row tenant mismatch.",
+          "type": "string",
+          "enum": [
+            "tenant_row"
+          ]
+        },
+        {
+          "description": "Invalid peer signature.",
+          "type": "string",
+          "enum": [
+            "peer_signature"
+          ]
+        },
+        {
+          "description": "Unknown peer key identifier.",
+          "type": "string",
+          "enum": [
+            "peer_unknown_key"
+          ]
+        },
+        {
+          "description": "Replayed peer nonce.",
+          "type": "string",
+          "enum": [
+            "peer_replay"
+          ]
+        },
+        {
+          "description": "Wrong peer audience.",
+          "type": "string",
+          "enum": [
+            "peer_audience"
+          ]
+        },
+        {
+          "description": "Stale peer fence.",
+          "type": "string",
+          "enum": [
+            "peer_fence"
+          ]
+        },
+        {
+          "description": "Verified peer tenant mismatch.",
+          "type": "string",
+          "enum": [
+            "peer_tenant"
+          ]
+        },
+        {
+          "description": "Peer manifest digest mismatch.",
+          "type": "string",
+          "enum": [
+            "peer_manifest"
+          ]
+        },
+        {
+          "description": "Peer fragment digest mismatch.",
+          "type": "string",
+          "enum": [
+            "peer_fragment"
+          ]
+        },
+        {
+          "description": "Peer assignment-authority digest mismatch: the recomputed digest over the follower's actual dispatched assignments does not match the digest signed into the ticket claims, so the closed predicate and projection closure cannot be trusted.",
+          "type": "string",
+          "enum": [
+            "peer_assignment_authority"
+          ]
+        },
+        {
+          "description": "Private stage-operation binding mismatch: a signed Analytical stage ticket did not match the receiving follower's own expectation for the operation, either query identity, the pinned snapshot, the stage, the task, the attempt, the reservation, or the authorized permissions, so the operation was refused before any plan decode, task-cache lookup, provider construction, or object I/O.",
+          "type": "string",
+          "enum": [
+            "peer_stage_binding"
+          ]
+        },
+        {
+          "description": "Invalid Scribe-tail ticket audience.",
+          "type": "string",
+          "enum": [
+            "tail_audience"
+          ]
+        },
+        {
+          "description": "Scribe-tail tenant or table binding mismatch.",
+          "type": "string",
+          "enum": [
+            "tail_binding"
+          ]
+        },
+        {
+          "description": "Scribe-tail fence or writer epoch mismatch.",
+          "type": "string",
+          "enum": [
+            "tail_fence"
+          ]
+        },
+        {
+          "description": "Replayed Scribe-tail ticket or capability.",
+          "type": "string",
+          "enum": [
+            "tail_replay"
           ]
         }
       ]
@@ -835,6 +1713,223 @@
       "minLength": 7,
       "pattern": "^[0-9a-f]{7,40}$"
     },
+    "ForgeIcebergRewritePhase": {
+      "description": "Durable phase recorded for a live Iceberg replacement operation.",
+      "oneOf": [
+        {
+          "description": "Rewritten outputs were persisted before the external catalog commit.",
+          "type": "string",
+          "enum": [
+            "prepared"
+          ]
+        },
+        {
+          "description": "The exact Iceberg replacement commit completed.",
+          "type": "string",
+          "enum": [
+            "committed"
+          ]
+        },
+        {
+          "description": "Reconciliation proved a previously uncertain commit completed.",
+          "type": "string",
+          "enum": [
+            "recovered"
+          ]
+        },
+        {
+          "description": "Reconciliation proved the prepared operation was not committed.",
+          "type": "string",
+          "enum": [
+            "reset"
+          ]
+        }
+      ]
+    },
+    "ForgeManifestRewritePhase": {
+      "description": "Durable phase recorded for a Forge metadata-only manifest rewrite.\n\nThe rewrite writes new manifests and then swaps them in with one catalog commit, so it has the same recoverable external boundary as data rewrite: a prepared operation whose commit outcome is unknown is settled by reconciliation into exactly one of `Recovered` or `Reset`.",
+      "oneOf": [
+        {
+          "description": "The exact input and output manifests were fixed before the commit.",
+          "type": "string",
+          "enum": [
+            "prepared"
+          ]
+        },
+        {
+          "description": "The catalog commit completed and returned a metadata location.",
+          "type": "string",
+          "enum": [
+            "committed"
+          ]
+        },
+        {
+          "description": "Reconciliation proved a previously uncertain commit completed.",
+          "type": "string",
+          "enum": [
+            "recovered"
+          ]
+        },
+        {
+          "description": "Reconciliation proved the prepared commit was not applied.",
+          "type": "string",
+          "enum": [
+            "reset"
+          ]
+        }
+      ]
+    },
+    "ForgeOrphanGcPhase": {
+      "description": "Durable phase recorded for a Forge orphan-GC operation.",
+      "oneOf": [
+        {
+          "description": "A bounded candidate batch was prepared for deletion.",
+          "type": "string",
+          "enum": [
+            "prepared"
+          ]
+        },
+        {
+          "description": "Every eligible candidate in the batch was handled.",
+          "type": "string",
+          "enum": [
+            "committed"
+          ]
+        },
+        {
+          "description": "Reconciliation completed a previously prepared batch.",
+          "type": "string",
+          "enum": [
+            "recovered"
+          ]
+        }
+      ]
+    },
+    "ForgeScribePromotionPhase": {
+      "description": "Durable phase recorded for a Forge Scribe-promotion operation.",
+      "oneOf": [
+        {
+          "description": "The exact promoted file set was fixed before the catalog append.",
+          "type": "string",
+          "enum": [
+            "prepared"
+          ]
+        },
+        {
+          "description": "The catalog append completed and returned a promotion snapshot.",
+          "type": "string",
+          "enum": [
+            "committed"
+          ]
+        },
+        {
+          "description": "Reconciliation proved a previously uncertain append had completed.",
+          "type": "string",
+          "enum": [
+            "recovered"
+          ]
+        },
+        {
+          "description": "Reconciliation proved the prepared append was not committed.",
+          "type": "string",
+          "enum": [
+            "reset"
+          ]
+        }
+      ]
+    },
+    "ForgeSnapshotExpirePhase": {
+      "description": "Durable phase recorded for a Forge snapshot-expiry operation.",
+      "oneOf": [
+        {
+          "description": "Snapshot IDs were selected and the external commit is about to start.",
+          "type": "string",
+          "enum": [
+            "prepared"
+          ]
+        },
+        {
+          "description": "The external Iceberg commit completed.",
+          "type": "string",
+          "enum": [
+            "committed"
+          ]
+        },
+        {
+          "description": "Reconciliation proved the external commit completed.",
+          "type": "string",
+          "enum": [
+            "recovered"
+          ]
+        }
+      ]
+    },
+    "OracleReaderEpochPhase": {
+      "description": "Durable transition recorded for one Oracle reader epoch.\n\n`Retired` is the deletion of the epoch row after its last protection was released, which is what keeps a safely retired epoch from remaining a permanent maintenance root.",
+      "oneOf": [
+        {
+          "description": "The lease was inserted under the node's exact current Oracle fence.",
+          "type": "string",
+          "enum": [
+            "acquired"
+          ]
+        },
+        {
+          "description": "Every dependency was established and the epoch may admit reads.",
+          "type": "string",
+          "enum": [
+            "activated"
+          ]
+        },
+        {
+          "description": "Admission closed and descendants are being joined.",
+          "type": "string",
+          "enum": [
+            "draining"
+          ]
+        },
+        {
+          "description": "The epoch can never renew or admit again.",
+          "type": "string",
+          "enum": [
+            "invalidated"
+          ]
+        },
+        {
+          "description": "The invalidated epoch released every table and its row was deleted.",
+          "type": "string",
+          "enum": [
+            "retired"
+          ]
+        }
+      ]
+    },
+    "OracleTableProtectionPhase": {
+      "description": "Durable transition recorded for one epoch's per-table reader protection.",
+      "oneOf": [
+        {
+          "description": "First protection for the table, or a conservative widening of it.",
+          "type": "string",
+          "enum": [
+            "expanded"
+          ]
+        },
+        {
+          "description": "A narrowing that still protects every remaining active cut.",
+          "type": "string",
+          "enum": [
+            "narrowed"
+          ]
+        },
+        {
+          "description": "The last active cut ended and the protection header was removed.",
+          "type": "string",
+          "enum": [
+            "released"
+          ]
+        }
+      ]
+    },
     "Origin": {
       "description": "Code-origin provenance for a card: the repository commit it was declared from, plus the in-repo path for monorepo disambiguation.",
       "type": "object",
@@ -890,6 +1985,44 @@
           "type": "string",
           "enum": [
             "agent"
+          ]
+        }
+      ]
+    },
+    "QueryClass": {
+      "description": "Server-derived admission class.",
+      "oneOf": [
+        {
+          "description": "Latency-sensitive bounded work.",
+          "type": "string",
+          "enum": [
+            "interactive"
+          ]
+        },
+        {
+          "description": "Larger analytical work.",
+          "type": "string",
+          "enum": [
+            "analytical"
+          ]
+        }
+      ]
+    },
+    "QueryExecutionMode": {
+      "description": "Closed execution topology recorded by a Bifrost read decision.",
+      "oneOf": [
+        {
+          "description": "The leader executes every scan locally.",
+          "type": "string",
+          "enum": [
+            "local"
+          ]
+        },
+        {
+          "description": "The leader delegates immutable sealed scan leaves.",
+          "type": "string",
+          "enum": [
+            "distributed"
           ]
         }
       ]
@@ -989,9 +2122,70 @@
         }
       ]
     },
+    "TimeGranularityWire": {
+      "description": "Time-partition granularity on the wire.\n\nBifrost v1 partitions every table on `wyrd_event_time` and admits exactly these two Iceberg-native transforms; nothing else is representable.",
+      "oneOf": [
+        {
+          "description": "One partition per UTC hour.",
+          "type": "string",
+          "enum": [
+            "hour"
+          ]
+        },
+        {
+          "description": "One partition per UTC day.",
+          "type": "string",
+          "enum": [
+            "day"
+          ]
+        }
+      ]
+    },
+    "TimePartitionWire": {
+      "description": "Validated time-partition value carried by private tail and follower contracts.\n\nThe pair `(granularity, start_utc)` is the one durable partition identity in Bifrost: WAL slices, seal keys, object paths, file-list rows, Forge audit detail, and tail fences all carry exactly this value. `start_utc` is always the exact UTC boundary of the partition, so two values are equal if and only if they name the same physical partition.",
+      "type": "object",
+      "required": [
+        "granularity",
+        "start_utc"
+      ],
+      "properties": {
+        "granularity": {
+          "description": "Partition granularity.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/TimeGranularityWire"
+            }
+          ]
+        },
+        "start_utc": {
+          "description": "Exact UTC start boundary of the partition.",
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
     "VersionBlock": {
       "description": "Semver-compatible version string.",
       "type": "string"
+    },
+    "VisibilityMode": {
+      "description": "Visibility tiers included in one immutable Oracle query cut.",
+      "oneOf": [
+        {
+          "description": "Read pinned Iceberg and hot sealed files.",
+          "type": "string",
+          "enum": [
+            "published_only"
+          ]
+        },
+        {
+          "description": "Also read the exact fenced live-tail interval.",
+          "type": "string",
+          "enum": [
+            "fused"
+          ]
+        }
+      ]
     }
   }
 }

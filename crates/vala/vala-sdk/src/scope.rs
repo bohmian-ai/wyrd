@@ -48,9 +48,26 @@ impl ClientScope {
     pub fn from_config(config: &ClientConfig) -> Result<Self, WyrdError> {
         let credential = config.resolve_credential().map_err(client_error_to_wyrd)?;
         Ok(Self {
-            server_url: config.http.base_url.clone(),
+            server_url: config.http.base_url.trim_end_matches('/').to_owned(),
             credential_fingerprint: fingerprint_credential(&credential),
         })
+    }
+
+    /// Derive the scope from an already-assembled [`WyrdClient`].
+    ///
+    /// Reads the base URL and credential the client's [`AuthMiddleware`] is
+    /// actually bound to, rather than re-running the credential chain, so a
+    /// handle built from a client can never key its producer pool on a
+    /// different credential than the one its requests carry.
+    ///
+    /// [`AuthMiddleware`]: wyrd_client::auth::AuthMiddleware
+    #[must_use]
+    pub fn from_client(client: &wyrd_client::WyrdClient) -> Self {
+        let auth = client.auth();
+        Self {
+            server_url: auth.base_url().trim_end_matches('/').to_owned(),
+            credential_fingerprint: fingerprint_credential(auth.credential()),
+        }
     }
 
     /// The server base URL this scope is bound to.

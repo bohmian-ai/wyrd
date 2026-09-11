@@ -1,6 +1,11 @@
 //! Generated OpenAPI document for the public HTTP surface.
 
 use utoipa::OpenApi;
+use wyrd_spec::vala::api::{
+    BifrostQueryRequest, CancelRunningQueryResponse, FreshnessPolicy, ListRunningQueriesResponse,
+    QueryClass, RunningQueryLifecycleState, RunningQueryProgress, RunningQuerySummary,
+    VisibilityMode,
+};
 
 /// Authoritative Wyrd HTTP contract.
 #[derive(OpenApi)]
@@ -17,8 +22,24 @@ use utoipa::OpenApi;
         crate::components::cards::routes::list_artifacts_http,
         crate::components::storage::routes::download_init,
         crate::components::cards::routes::delete_card_http,
-        crate::components::cards::routes::delete_card_by_ref_http
-    )
+        crate::components::cards::routes::delete_card_by_ref_http,
+        crate::query::routes::sync_query,
+        crate::query::routes::list_running_queries,
+        crate::query::routes::get_running_query,
+        crate::query::routes::cancel_running_query
+    ),
+    components(schemas(
+        BifrostQueryRequest,
+        CancelRunningQueryResponse,
+        FreshnessPolicy,
+        ListRunningQueriesResponse,
+        QueryClass,
+        RunningQueryLifecycleState,
+        RunningQueryProgress,
+        RunningQuerySummary,
+        VisibilityMode
+    )),
+    tags((name = "Bifrost", description = "Bounded Bifrost query transport"))
 )]
 pub struct WyrdApiDoc;
 

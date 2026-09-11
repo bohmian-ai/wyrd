@@ -58,7 +58,7 @@ mod pg_tests {
         // so this also exercises credential resolution, not just direct wiring.
         let mut config = ClientConfig::default();
         config.http.base_url = base_url.clone();
-        config.api_key = Some(api_key);
+        config.credential = Some(api_key);
         let client = WyrdClient::with_config(config).expect("client assembles");
 
         // (1) Token-layer e2e: the real /auth/token accepts the resolved API key and

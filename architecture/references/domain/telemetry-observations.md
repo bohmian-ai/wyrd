@@ -6,7 +6,8 @@ identity, correlation, sampling, or payload sensitivity.
 ## Protocol identity and physical storage
 
 OpenTelemetry signals describe runtime activity. Wyrd turns durable measured
-facts into typed Observations attached to declared Cards and client Runs.
+facts into typed Observations that always retain their authenticated publisher
+and may additionally attach to declared Cards and client Runs.
 Signal transport may batch, sample, retry, or re-encode data without changing
 Wyrd identity.
 
@@ -14,18 +15,28 @@ The public correlation spine is:
 
 ```text
 authenticated tenant
-  + authorized card_ref
-  + opaque run_id
+  + authenticated principal_id
   + Wyrd-Request-Id
+  + optional authorized card_ref/card_uid
+  + optional opaque run_id
 ```
 
-`card_ref` and `run_id` are observation-grain values. A buffered request may
-contain rows for several Cards and Runs, so authorize every distinct asserted
-Card against the principal's card scope. The server derives tenant and request
+`card_ref` and `run_id` are optional observation-grain values. A buffered
+request may contain uncorrelated rows and rows for several Cards and Runs, so
+authorize every distinct asserted Card against the principal's signed Card
+scope. Token mint and refresh resolve the bounded scope to authoritative Card
+UIDs; ingest uses that verified in-memory mapping without a Card-registry
+Postgres or cache lookup. The server derives tenant, publisher, and request
 identity from verified authority and stamps physical storage columns such as
 `data_tenant_id`, `card_uid`, `principal_id`, `wyrd_batch_id`,
-`wyrd_row_ordinal`, and `wyrd_ingested_at`. Those physical columns support
-isolation and efficient joins; they do not replace the public Card/Run contract.
+`wyrd_row_ordinal`, and `wyrd_ingested_at`. Missing Card correlation leaves
+`card_uid` null; it never erases the server-stamped publisher identity.
+
+OTLP table projection recognizes the exact record-level attributes
+`wyrd.card_ref` and `wyrd.run_id`. The final duplicate key determines the
+correlation value, while all entries remain in the lossless attribute payload.
+Values reuse the existing `CardRef` and `RunId` text grammars; a client-supplied
+Card UID is never trusted over the signed scope mapping.
 
 `Wyrd-Request-Id` joins Wyrd hops and audit ancestry. W3C trace/span IDs join
 telemetry causality. Preserve both; never overload one as the other.
@@ -68,7 +79,8 @@ encoded blobs; such payloads require separate access and retention controls.
 
 ## Ingest and query invariants
 
-Ingest validates schema, event-time acceptance, card scope, batch replay
+Ingest validates schema, event-time acceptance, every present Card reference
+against signed scope, batch replay
 identity, and bounded envelope size before Scribe admission. Query surfaces
 require a tenant-qualified table, bounded time range, explicit projection, and
 the permission associated with every sensitive column. Filter and project
@@ -81,11 +93,13 @@ to one logical row set or a typed identity conflict.
 
 ## Failure states
 
-Missing identity, denied Card scope, malformed context, schema conflict,
+Missing authenticated publisher identity, denied or unresolved asserted Card
+scope, malformed context, schema conflict,
 out-of-range event time, sampling/export loss, redaction failure, and incomplete
 ingest are explicit degraded or failed states. They never become a synthetic
-"no signal" observation. Reject trusting client tenant fields, deriving a Card
-from principal identity alone, metric labels with unbounded values, and payload
+"no signal" observation. An omitted optional `card_ref` is valid generic
+telemetry, not missing publisher identity. Reject trusting client tenant fields,
+deriving a Card from principal identity alone, metric labels with unbounded values, and payload
 collection before authorization/projection.
 
 ## Stable Wyrd anchors

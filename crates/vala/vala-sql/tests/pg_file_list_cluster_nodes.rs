@@ -5,7 +5,7 @@ mod pg_tests {
     //! - Migration applies cleanly (columns, types, nullability)
     //! - Indexes exist (watermark, duplicate-range guard, discovery)
     //! - RLS blocks cross-tenant SELECT on file_list
-    //! - OperatorPool grants permit required operations
+    //! - TenantConn grants permit required operations
     //! - Duplicate stream range INSERT fails on unique constraint
     //!
     //! Skipped when WYRD_DATABASE_URL is unset (credential-free default suite).
@@ -68,15 +68,19 @@ mod pg_tests {
             ("row_count", "bigint", "NO"),
             ("min_event_time", "timestamp with time zone", "NO"),
             ("max_event_time", "timestamp with time zone", "NO"),
-            ("partition_day", "date", "NO"),
-            ("tenant_bucket", "integer", "NO"),
+            ("partition_granularity", "text", "NO"),
+            ("partition_start", "timestamp with time zone", "NO"),
             ("compacted", "boolean", "NO"),
             ("committed_snapshot_id", "bigint", "YES"),
             ("node_id", "uuid", "NO"),
             ("writer_epoch", "bigint", "NO"),
             ("wal_lsn_min", "bigint", "NO"),
             ("wal_lsn_max", "bigint", "NO"),
+            ("promotion_record", "jsonb", "NO"),
             ("created_at", "timestamp with time zone", "NO"),
+            ("forge_publication_operation_id", "uuid", "YES"),
+            ("file_ordinal", "smallint", "NO"),
+            ("file_checksum", "text", "YES"),
         ];
 
         assert_eq!(
@@ -139,8 +143,8 @@ mod pg_tests {
             "watermark index includes table_name"
         );
         assert!(
-            def.0.contains("tenant_bucket"),
-            "watermark index includes tenant_bucket"
+            def.0.contains("data_tenant_id"),
+            "watermark index is tenant-first"
         );
         assert!(
             def.0.contains("node_id"),
@@ -172,12 +176,13 @@ mod pg_tests {
             INSERT INTO vala.file_list (
                 id, data_tenant_id, namespace, table_name, file_path,
                 file_size, row_count, min_event_time, max_event_time,
-                partition_day, tenant_bucket, node_id, writer_epoch,
-                wal_lsn_min, wal_lsn_max
+                partition_granularity, partition_start, node_id, writer_epoch,
+                wal_lsn_min, wal_lsn_max, promotion_record
             ) VALUES (
                 $1, $2, 'vala.traces', 'spans', '/fake/path1.parquet',
-                1024, 100, now(), now(), current_date, 0,
-                $3, $4, $5, $6
+                1024, 100, now(), now(),
+                'day', date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC',
+                $3, $4, $5, $6, '{"fixture": "pg-file-list-cluster-nodes"}'::jsonb
             )
             "#,
         )
@@ -197,12 +202,13 @@ mod pg_tests {
             INSERT INTO vala.file_list (
                 id, data_tenant_id, namespace, table_name, file_path,
                 file_size, row_count, min_event_time, max_event_time,
-                partition_day, tenant_bucket, node_id, writer_epoch,
-                wal_lsn_min, wal_lsn_max
+                partition_granularity, partition_start, node_id, writer_epoch,
+                wal_lsn_min, wal_lsn_max, promotion_record
             ) VALUES (
                 $1, $2, 'vala.traces', 'spans', '/fake/path2.parquet',
-                2048, 200, now(), now(), current_date, 0,
-                $3, $4, $5, $6
+                2048, 200, now(), now(),
+                'day', date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC',
+                $3, $4, $5, $6, '{"fixture": "pg-file-list-cluster-nodes"}'::jsonb
             )
             "#,
         )
@@ -232,7 +238,7 @@ mod pg_tests {
             assert!(
                 db_err
                     .constraint()
-                    .is_some_and(|c| c.contains("file_list_stream_range_uniq")),
+                    .is_some_and(|c| c.contains("file_list_stream_range_ordinal_uniq")),
                 "constraint name matches unique index"
             );
         }
@@ -264,6 +270,10 @@ mod pg_tests {
             ("started_at", "timestamp with time zone", "NO"),
             ("heartbeat_at", "timestamp with time zone", "NO"),
             ("meta", "jsonb", "NO"),
+            ("data_tenant_id", "uuid", "NO"),
+            ("capability_version", "smallint", "NO"),
+            ("capabilities", "jsonb", "NO"),
+            ("ready", "boolean", "NO"),
         ];
 
         assert_eq!(
@@ -312,12 +322,13 @@ mod pg_tests {
             INSERT INTO vala.file_list (
                 id, data_tenant_id, namespace, table_name, file_path,
                 file_size, row_count, min_event_time, max_event_time,
-                partition_day, tenant_bucket, node_id, writer_epoch,
-                wal_lsn_min, wal_lsn_max
+                partition_granularity, partition_start, node_id, writer_epoch,
+                wal_lsn_min, wal_lsn_max, promotion_record
             ) VALUES (
                 $1, $2, 'vala.traces', 'spans', '/fake/pathA.parquet',
-                1024, 100, now(), now(), current_date, 0,
-                $3, 1, 100, 200
+                1024, 100, now(), now(),
+                'day', date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC',
+                $3, 1, 100, 200, '{"fixture": "pg-file-list-cluster-nodes"}'::jsonb
             )
             "#,
         )
@@ -357,12 +368,13 @@ mod pg_tests {
             INSERT INTO vala.file_list (
                 id, data_tenant_id, namespace, table_name, file_path,
                 file_size, row_count, min_event_time, max_event_time,
-                partition_day, tenant_bucket, node_id, writer_epoch,
-                wal_lsn_min, wal_lsn_max
+                partition_granularity, partition_start, node_id, writer_epoch,
+                wal_lsn_min, wal_lsn_max, promotion_record
             ) VALUES (
                 $1, $2, 'vala.traces', 'spans', '/fake/operator.parquet',
-                1024, 100, now(), now(), current_date, 0,
-                $3, 1, 100, 200
+                1024, 100, now(), now(),
+                'day', date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC',
+                $3, 1, 100, 200, '{"fixture": "pg-file-list-cluster-nodes"}'::jsonb
             )
             "#,
         )
@@ -383,48 +395,58 @@ mod pg_tests {
         assert_eq!(row.0, file_id, "OperatorPool can SELECT file_list");
     }
 
+    /// Proves the system tenant can UPSERT its isolated membership fence.
+    ///
+    /// # Panics
+    /// Panics when the database fixture, tenant transaction, UPSERT, or commit fails.
     #[tokio::test]
-    async fn vala_operator_pool_can_upsert_cluster_nodes() {
+    async fn vala_tenant_conn_can_upsert_cluster_nodes() {
         let (fixture, _tenant) = setup().await;
-        let pool = fixture.superuser_pool().await.expect("superuser pool");
+        let mut conn = fixture
+            .vala_postgres()
+            .tenant_conn(DataTenantId::SYSTEM_OWNER)
+            .await
+            .expect("system tenant connection");
 
         let node_id = Uuid::now_v7();
 
-        // INSERT via OperatorPool.
         sqlx::query(
             r#"
             INSERT INTO vala.cluster_nodes (
-                node_id, role, advertise_addr, fencing_token,
+                data_tenant_id, node_id, role, advertise_addr, fencing_token,
                 started_at, heartbeat_at
-            ) VALUES ($1, 'scribe', 'localhost:50051', 1, now(), now())
-            ON CONFLICT (node_id) DO UPDATE
+            ) VALUES ($1, $2, 'scribe', 'localhost:50051', 1, now(), now())
+            ON CONFLICT (data_tenant_id, node_id, role) DO UPDATE
             SET fencing_token = vala.cluster_nodes.fencing_token + 1,
                 heartbeat_at = now()
             RETURNING fencing_token
             "#,
         )
+        .bind(uuid::Uuid::from(DataTenantId::SYSTEM_OWNER))
         .bind(node_id)
-        .fetch_one(&pool)
+        .fetch_one(&mut **conn.transaction())
         .await
-        .expect("OperatorPool INSERT/UPSERT");
+        .expect("TenantConn INSERT/UPSERT");
 
         // Second UPSERT should increment fencing_token.
         let token: (i64,) = sqlx::query_as(
             r#"
             INSERT INTO vala.cluster_nodes (
-                node_id, role, advertise_addr, fencing_token,
+                data_tenant_id, node_id, role, advertise_addr, fencing_token,
                 started_at, heartbeat_at
-            ) VALUES ($1, 'scribe', 'localhost:50051', 1, now(), now())
-            ON CONFLICT (node_id) DO UPDATE
+            ) VALUES ($1, $2, 'scribe', 'localhost:50051', 1, now(), now())
+            ON CONFLICT (data_tenant_id, node_id, role) DO UPDATE
             SET fencing_token = vala.cluster_nodes.fencing_token + 1,
                 heartbeat_at = now()
             RETURNING fencing_token
             "#,
         )
+        .bind(uuid::Uuid::from(DataTenantId::SYSTEM_OWNER))
         .bind(node_id)
-        .fetch_one(&pool)
+        .fetch_one(&mut **conn.transaction())
         .await
         .expect("second UPSERT");
+        conn.commit().await.expect("commit membership UPSERTs");
 
         assert_eq!(
             token.0, 2,

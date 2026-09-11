@@ -27,9 +27,17 @@ Authorization denial is a `PermissionVerdict::Deny`, not a Rust error. The
 handler boundary maps `PermissionDenyReason::Rbac` into the public Wyrd error
 catalog.
 
-The trait takes only `&Principal` and `&Permission`. There is no `TargetRef`
-because this foundation is RBAC only: it checks the principal's
-role-derived `effective_permissions`.
+The trait takes only `&Principal` and `&Permission`, and that signature is
+stable. There is no `TargetRef` parameter because the required object is
+already carried *inside* `Permission`, as its `PermissionScope`. A caller that
+needs to authorize one Bifrost table builds the required permission at that
+table's scope and passes it here; the checker still decides by containment over
+the principal's role-derived `effective_permissions`.
+
+This is object-scoped RBAC, not ABAC. The object is a static, typed identity
+named by a role grant, so the decision stays a pure in-memory function with no
+query-path database or network lookup. Attribute-dependent decisions remain in
+the Policy plane.
 
 ## RbacCheck
 
@@ -40,10 +48,21 @@ stateless and returns `Allow` when:
 principal.effective_permissions.contains(permission)
 ```
 
-The check uses the same `PermissionSet` subsumption rules documented in
-`permission-model.md`, including wildcard coverage. Builtin administrative
+The check uses the same three-axis `PermissionSet` subsumption rules documented
+in `permission-model.md`, including wildcard resource/action coverage and
+`PermissionScope` containment. A grant covers a requirement only when its
+resource, action, *and* scope all cover. Builtin administrative
 behavior is represented by normal permissions, not by role-name bypasses inside
 the checker.
+
+## Coarse Route Admission
+
+A public route that cannot yet name the objects a request will touch — a
+Bifrost SQL query, whose tables are known only after Oracle pins them — admits
+on `PermissionSet::covers_operation`, which ignores scope. That is admission,
+not authorization: the authoritative decision is taken through this checker
+against each resolved object before any data is read. No surface may substitute
+coarse admission for the object decision.
 
 ## Policy Plane
 

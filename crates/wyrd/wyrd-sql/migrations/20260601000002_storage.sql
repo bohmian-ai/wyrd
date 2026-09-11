@@ -93,45 +93,6 @@ CREATE POLICY admin_cross_tenant ON wyrd.storage_artifact_metadata
     USING (true)
     WITH CHECK (true);
 
-CREATE TABLE wyrd.storage_access_ledger (
-    id             BIGSERIAL   PRIMARY KEY,
-    data_tenant_id UUID        NOT NULL REFERENCES platform.tenants(data_tenant_id),
-    subject_id     TEXT        NOT NULL,
-    operation      TEXT        NOT NULL CHECK (operation IN (
-                                 'upload_init',
-                                 'upload_complete',
-                                 'upload_abort',
-                                 'download_init',
-                                 'sweeper_abort'
-                             )),
-    upload_id      UUID,
-    storage_path   TEXT        NOT NULL,
-    backend        TEXT        NOT NULL CHECK (backend IN ('local', 's3', 'gcs', 'azure')),
-    status_code    INTEGER     NOT NULL,
-    error_code     TEXT,
-    request_id     TEXT        NOT NULL,
-    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE INDEX storage_access_ledger_tenant_created
-    ON wyrd.storage_access_ledger (data_tenant_id, created_at DESC);
-
-CREATE INDEX storage_access_ledger_upload
-    ON wyrd.storage_access_ledger (upload_id)
-    WHERE upload_id IS NOT NULL;
-
-ALTER TABLE wyrd.storage_access_ledger ENABLE ROW LEVEL SECURITY;
-ALTER TABLE wyrd.storage_access_ledger FORCE ROW LEVEL SECURITY;
-
-CREATE POLICY tenant_isolation ON wyrd.storage_access_ledger
-    USING (data_tenant_id = wyrd.current_tenant())
-    WITH CHECK (data_tenant_id = wyrd.current_tenant());
-
-CREATE POLICY admin_cross_tenant ON wyrd.storage_access_ledger
-    TO wyrd_platform_admin
-    USING (true)
-    WITH CHECK (true);
-
 REVOKE ALL ON TABLE wyrd.storage_multipart_uploads FROM wyrd_app;
 REVOKE ALL ON TABLE wyrd.storage_multipart_uploads FROM wyrd_platform_admin;
 GRANT SELECT, INSERT, UPDATE ON wyrd.storage_multipart_uploads TO wyrd_app;
@@ -141,13 +102,3 @@ REVOKE ALL ON TABLE wyrd.storage_artifact_metadata FROM wyrd_app;
 REVOKE ALL ON TABLE wyrd.storage_artifact_metadata FROM wyrd_platform_admin;
 GRANT SELECT, INSERT, UPDATE, DELETE ON wyrd.storage_artifact_metadata TO wyrd_app;
 GRANT SELECT ON wyrd.storage_artifact_metadata TO wyrd_platform_admin;
-
-REVOKE ALL ON TABLE wyrd.storage_access_ledger FROM wyrd_app;
-REVOKE ALL ON TABLE wyrd.storage_access_ledger FROM wyrd_platform_admin;
-GRANT SELECT, INSERT ON wyrd.storage_access_ledger TO wyrd_app;
-GRANT SELECT, INSERT ON wyrd.storage_access_ledger TO wyrd_platform_admin;
-
-REVOKE ALL ON SEQUENCE wyrd.storage_access_ledger_id_seq FROM wyrd_app;
-REVOKE ALL ON SEQUENCE wyrd.storage_access_ledger_id_seq FROM wyrd_platform_admin;
-GRANT USAGE, SELECT ON SEQUENCE wyrd.storage_access_ledger_id_seq TO wyrd_app;
-GRANT USAGE, SELECT ON SEQUENCE wyrd.storage_access_ledger_id_seq TO wyrd_platform_admin;

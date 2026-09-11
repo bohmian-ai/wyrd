@@ -1,528 +1,453 @@
-//! RBAC-gated query service functions: the sync (raw Arrow IPC) path and the
-//! async (validate-before-enqueue) path.
-//!
-//! Both paths authorize `bifrost_query_read` and run the syntactic floor
-//! (`floor::validate_query_sql`) *before* any provider is built, any query is
-//! planned, or any durable `olap_query_jobs` row is written — so an invalid SQL
-//! async submission is a `400` that leaves no queued row. Providers are built
-//! per request and scoped to the caller's tenant via `state.bifrost.provider`;
-//! there is never a shared `SessionContext`. Engine and storage errors cross the
-//! public boundary through the one `WyrdError` delegate rendered by the single
-//! `WyrdErrorResponse`.
+//! Auth-bound adapters from Gate transports and typed plans into retained Oracle.
 
-use std::sync::Arc;
-
-use arrow::datatypes::Schema;
-use arrow::ipc::writer::StreamWriter;
-use arrow::record_batch::RecordBatch;
-use datafusion::common::TableReference;
-use datafusion::error::DataFusionError;
-use datafusion::prelude::SessionContext;
-use serde_json::{Value as JsonValue, json};
-use vala_bifrost::error::BifrostError as EngineBifrostError;
-use vala_bifrost::session::wyrd_session_context;
-use vala_bifrost::{BifrostNamespace, SchemaFingerprint};
-use vala_sql::TenantConn;
-use vala_sql::queries::olap_query_jobs::{NewQueryJob, enqueue_query_job, query_job_status};
-use wyrd_runtime::{Permission, PermissionVerdict};
+use vala_bifrost_redux::oracle::{AuthorizedQueryContext, OracleQueryStream, QueryIpcDecodeError};
+use wyrd_runtime::{Action, Permission, PermissionDenyReason, PermissionVerdict, Resource};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::vala::BifrostError as ValaError;
+use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
-    AsyncJobState, AsyncQueryRequest, AsyncQueryResponse, AsyncQueryStatus, AuditDecision,
-    AuditResult, ExecutorAvailability, JobUid, QueryParam, SyncQueryRequest,
+    AuditDecision, AuditResult, AuthMethod, BifrostQueryRequest, CancelRunningQueryResponse,
+    RunningQuerySummary,
 };
 
 use crate::AppState;
 use crate::audit;
-use crate::bifrost::convert;
 use crate::components::auth::Caller;
 use crate::http::error::permission_deny_reason_to_wyrd;
-use crate::query::floor;
 
-/// Materialized sync-query result: the Arrow IPC stream plus the header metadata
-/// the axum adapter stamps onto the response.
-#[derive(Debug)]
-pub struct SyncQueryResult {
-    /// Serialized `application/vnd.apache.arrow.stream` body.
-    pub body: Vec<u8>,
-    /// Lower-case hex of the result schema fingerprint (`X-Wyrd-Schema-Fingerprint`).
-    pub schema_fingerprint: String,
-    /// Total result row count across all batches (`X-Wyrd-Row-Count`).
-    pub row_count: usize,
+/// Authorization and audit owner for one authenticated query-plane operation.
+///
+/// Query authorization has two distinct stages and both belong here. Route
+/// admission is deliberately coarse — a schema- or table-scoped grant cannot
+/// satisfy an object-wide requirement, so an exact-global prerequisite would
+/// reject every scoped principal before Oracle resolved which tables the SQL
+/// touches. The authoritative object decision is taken inside Oracle against
+/// the resolved scan set, and this owner records its denial. Lifecycle
+/// operations, which name their target by request ID rather than by object,
+/// take the exact decision here directly.
+///
+/// Every refusal on either stage fails closed on its audit append: a denial
+/// that cannot be recorded is returned as audit-unavailable rather than as a
+/// plain rejection, so no refusal is silently unlogged.
+pub(crate) struct QueryAuthority<'a> {
+    /// Shared server state containing authorization and the durable audit outbox.
+    state: &'a AppState,
+    /// Authenticated caller whose tenant and request spine own the audit row.
+    caller: &'a Caller,
+    /// Stable operation name for the public action being decided.
+    operation: &'static str,
+    /// Redacted resource, optionally qualified by target request ID.
+    resource: String,
+    /// Existing permission required by every public query-plane action.
+    permission: Permission,
 }
 
-/// Authorize the caller against a required permission, auditing a denial.
-///
-/// `pub(crate)` so typed-route modules can reuse this without duplicating the
-/// audit-deny logic.
-///
-/// On success no row is written here — the handler audits the executed op. On
-/// denial a `decision = deny` row is appended in its own transaction (M-06
-/// doctrine: every allow AND every deny is audited) before the `403` propagates.
-pub(crate) async fn authorize_audited(
-    state: &AppState,
-    caller: &Caller,
-    required: Permission,
-    operation: &str,
-    resource: &str,
-) -> Result<(), WyrdError> {
-    match state
-        .authz
-        .permission_check
-        .check(&caller.principal, &required)
-    {
-        PermissionVerdict::Allow => Ok(()),
-        PermissionVerdict::Deny { reason } => {
-            let event = audit::audit_event(
-                caller,
-                operation,
-                resource,
-                &required.to_string(),
-                AuditDecision::Deny,
-                AuditResult::Failure,
-                "rbac permission denied",
-            );
-            audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, &event).await?;
-            Err(permission_deny_reason_to_wyrd(reason))
+impl<'a> QueryAuthority<'a> {
+    /// Binds one operation and redacted resource to the query-read permission.
+    pub(crate) fn new(
+        state: &'a AppState,
+        caller: &'a Caller,
+        operation: &'static str,
+        resource: impl Into<String>,
+    ) -> Self {
+        Self {
+            state,
+            caller,
+            operation,
+            resource: resource.into(),
+            permission: Permission::bifrost_query_read(),
         }
     }
-}
 
-/// Map an engine Bifrost error to the public `WyrdError` via the single delegate.
-fn map_engine_error(error: EngineBifrostError) -> WyrdError {
-    error.into_public().into()
-}
-
-/// Map a query-job storage failure to the public catalog-unreachable code, never
-/// leaking the underlying SQL/connection detail across the boundary.
-fn storage_error(error: impl std::fmt::Display) -> WyrdError {
-    tracing::error!(error = %error, "query-job storage operation failed");
-    ValaError::CatalogUnreachable {
-        detail: "query-job storage operation failed".to_owned(),
+    /// Binds one lifecycle operation to its authenticated caller and redacted target.
+    fn lifecycle(
+        state: &'a AppState,
+        caller: &'a Caller,
+        operation: &'static str,
+        request_id: Option<&RequestId>,
+    ) -> Self {
+        let resource = request_id.map_or_else(
+            || "vala.query.lifecycle".to_owned(),
+            |request_id| format!("vala.query.lifecycle/{request_id}"),
+        );
+        Self::new(state, caller, operation, resource)
     }
-    .into()
-}
 
-/// Map a DataFusion planning/execution error to the public boundary.
-///
-/// A planning-stage rejection (parse/plan/schema) of a floor-valid statement is a
-/// `400 QUERY_INVALID_SQL` — the floor passed the syntax but planning found an
-/// unknown table/column or unsupported construct. Anything else is a `500`.
-fn map_datafusion_error(error: DataFusionError) -> WyrdError {
-    if matches!(
-        error,
-        DataFusionError::SQL(..) | DataFusionError::Plan(_) | DataFusionError::SchemaError(..)
-    ) {
-        return floor::invalid_sql(format!("query planning rejected the statement: {error}"));
+    /// Admits a request that holds the Bifrost read capability under some scope.
+    ///
+    /// This is admission, never authorization: it proves only that the caller
+    /// operates the Bifrost read surface at all. A principal admitted here is
+    /// still refused every table its grants do not name.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stable authorization denial, or audit-unavailable when that
+    /// denial cannot be durably recorded.
+    async fn admit_capability(&self) -> Result<(), WyrdError> {
+        if self
+            .caller
+            .principal
+            .effective_permissions
+            .covers_operation(&Resource::BifrostQuery, &Action::Read)
+        {
+            return Ok(());
+        }
+        Err(self
+            .deny(PermissionDenyReason::Rbac {
+                required: Box::new(self.permission.clone()),
+                principal: self.caller.principal.id,
+            })
+            .await)
     }
-    WyrdError::Internal {
-        message: "query execution failed".to_owned(),
-        details: json!({ "detail": error.to_string() }),
-    }
-}
 
-/// Map an Arrow IPC encoding failure to a `500`.
-fn ipc_error(error: arrow::error::ArrowError) -> WyrdError {
-    WyrdError::Internal {
-        message: "failed to encode query result as Arrow IPC".to_owned(),
-        details: json!({ "detail": error.to_string() }),
+    /// Authorizes one exact permission and durably audits a denial.
+    ///
+    /// Successful authorization deliberately writes no read-decision row here:
+    /// retained Oracle commits the immutable visibility decision after planning
+    /// and before any query data is read.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stable authorization denial or audit-unavailable error.
+    pub(crate) async fn authorize(&self) -> Result<(), WyrdError> {
+        match self
+            .state
+            .authz
+            .permission_check
+            .check(&self.caller.principal, &self.permission)
+        {
+            PermissionVerdict::Allow => Ok(()),
+            PermissionVerdict::Deny { reason } => Err(self.deny(reason).await),
+        }
     }
-}
 
-/// Build a tenant-scoped `SessionContext` and register only the Bifrost tables the
-/// query references. The context carries the tenant analyzer rule and each
-/// provider enforces the physical tenant boundary; there is never a shared or
-/// cross-tenant context. Names that do not resolve to a Bifrost table are skipped.
-async fn build_tenant_session(
-    state: &AppState,
-    caller: &Caller,
-    sql: &str,
-) -> Result<SessionContext, WyrdError> {
-    let ctx = wyrd_session_context(caller.data_tenant_id);
-    for fqn in floor::referenced_tables(sql) {
-        let Some((ns, name)) = BifrostNamespace::split_fqn(&fqn) else {
-            continue;
-        };
-        match state
-            .bifrost
-            .provider(ns, &name, caller.data_tenant_id)
+    /// Durably records one authorization denial and returns what the caller sees.
+    ///
+    /// A failed append substitutes audit-unavailable for the rejection, which is
+    /// the fail-closed outcome: the caller is still refused, and the refusal is
+    /// never reported as if it had been recorded.
+    async fn deny(&self, reason: PermissionDenyReason) -> WyrdError {
+        match self
+            .append(AuditResult::Failure, "rbac permission denied")
             .await
         {
-            Ok(provider) => {
-                ctx.register_table(TableReference::bare(fqn), Arc::new(provider))
-                    .map_err(map_datafusion_error)?;
+            Ok(()) => permission_deny_reason_to_wyrd(reason),
+            Err(error) => error,
+        }
+    }
+
+    /// Durably records the authoritative object denial Oracle already decided.
+    ///
+    /// The row carries only the caller, the operation, and the operation-only
+    /// permission token. The refused table never enters the audit payload: the
+    /// object identity stays inside Oracle, exactly as the raw SQL does.
+    ///
+    /// Returns audit-unavailable when the append fails, and otherwise the
+    /// caller's original stable query-forbidden error unchanged.
+    async fn record_object_denial(&self, denial: WyrdError) -> WyrdError {
+        #[cfg(feature = "test-support")]
+        if self
+            .state
+            .query_control_audit_fault
+            .as_ref()
+            .is_some_and(crate::state::QueryControlAuditFaultController::object_denials_fail)
+        {
+            return wyrd_spec::vala::error::BifrostError::AuditUnavailable {
+                detail: "object denial audit unavailable".to_owned(),
             }
-            Err(EngineBifrostError::TableNotFound(_)) => continue,
-            Err(other) => return Err(map_engine_error(other)),
+            .into();
+        }
+        match self
+            .append(AuditResult::Failure, "rbac object permission denied")
+            .await
+        {
+            Ok(()) => denial,
+            Err(error) => error,
         }
     }
-    Ok(ctx)
-}
 
-/// Encode a batch stream as a single Arrow IPC stream body.
-fn encode_ipc(schema: &Schema, batches: &[RecordBatch]) -> Result<Vec<u8>, WyrdError> {
-    let mut buffer = Vec::new();
-    {
-        let mut writer = StreamWriter::try_new(&mut buffer, schema).map_err(ipc_error)?;
-        for batch in batches {
-            writer.write(batch).map_err(ipc_error)?;
+    /// Appends one denial row for this operation to the tenant audit outbox.
+    ///
+    /// # Errors
+    ///
+    /// Returns audit-unavailable when the tenant outbox append cannot commit.
+    async fn append(&self, result: AuditResult, summary: &str) -> Result<(), WyrdError> {
+        let event = audit::audit_event(
+            self.caller,
+            self.operation,
+            &self.resource,
+            &self.permission.to_string(),
+            AuditDecision::Deny,
+            result,
+            summary,
+        );
+        audit::record_audit_owned(
+            self.state.postgres.vala_pool().clone(),
+            self.caller.data_tenant_id,
+            event,
+        )
+        .await
+    }
+
+    /// Durably records the truthful result returned by the lifecycle owner.
+    ///
+    /// The row contains only lifecycle identity and outcome metadata. Query
+    /// text, parameters, and results never enter the audit record.
+    ///
+    /// # Errors
+    ///
+    /// Returns audit-unavailable when the tenant outbox append cannot commit;
+    /// callers must then fail closed instead of returning the control result.
+    async fn record<T>(&self, outcome: &Result<T, WyrdError>) -> Result<(), WyrdError> {
+        let (result, payload_summary) = if outcome.is_ok() {
+            (AuditResult::Success, "running query control succeeded")
+        } else {
+            (AuditResult::Failure, "running query control failed")
+        };
+        let event = audit::audit_event(
+            self.caller,
+            self.operation,
+            &self.resource,
+            &self.permission.to_string(),
+            AuditDecision::Allow,
+            result,
+            payload_summary,
+        );
+        audit::record_audit_owned(
+            self.state.postgres.vala_pool().clone(),
+            self.caller.data_tenant_id,
+            event,
+        )
+        .await
+    }
+
+    /// Durably gates one mutating cancellation before owner dispatch.
+    ///
+    /// This records authorization to attempt dispatch under a distinct operation;
+    /// it does not claim that cancellation succeeded. [`Self::record`] writes the
+    /// truthful owner outcome after dispatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns audit-unavailable before the cancellation owner is called.
+    async fn record_cancel_attempt(&self) -> Result<(), WyrdError> {
+        #[cfg(feature = "test-support")]
+        if self
+            .state
+            .query_control_audit_fault
+            .as_ref()
+            .is_some_and(crate::state::QueryControlAuditFaultController::cancel_attempts_fail)
+        {
+            return Err(wyrd_spec::vala::error::BifrostError::AuditUnavailable {
+                detail: "cancellation audit gate unavailable before dispatch".to_owned(),
+            }
+            .into());
         }
-        writer.finish().map_err(ipc_error)?;
-    }
-    Ok(buffer)
-}
-
-/// Run a synchronous SELECT and return its Arrow IPC stream.
-///
-/// Order (each gate before the next): authorize `bifrost_query_read` → syntactic
-/// floor → per-request tenant-scoped providers → DataFusion exec under a wall-clock
-/// budget → row/byte ceilings → IPC encode. A timeout is `504 QUERY_TIMEOUT`; an
-/// over-ceiling result is `413 QUERY_RESULT_TOO_LARGE`.
-pub async fn run_sync_query(
-    state: &AppState,
-    caller: Caller,
-    body: SyncQueryRequest,
-) -> Result<SyncQueryResult, WyrdError> {
-    authorize_audited(
-        state,
-        &caller,
-        Permission::bifrost_query_read(),
-        "vala.query.sync",
-        "vala.query",
-    )
-    .await?;
-    floor::validate_query_sql(&body.sql)?;
-
-    let ctx = build_tenant_session(state, &caller, &body.sql).await?;
-
-    let sql = body.sql.clone();
-    let (schema, batches) = tokio::time::timeout(floor::SYNC_QUERY_TIMEOUT, async {
-        let df = ctx.sql(&sql).await?;
-        let schema = df.schema().as_arrow().clone();
-        let batches = df.collect().await?;
-        Ok::<_, DataFusionError>((schema, batches))
-    })
-    .await
-    .map_err(|_| floor::query_timeout())?
-    .map_err(map_datafusion_error)?;
-
-    let row_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
-    if row_count > floor::MAX_SYNC_RESULT_ROWS {
-        return Err(floor::result_too_large());
-    }
-
-    let body_bytes = encode_ipc(&schema, &batches)?;
-    if body_bytes.len() > floor::MAX_SYNC_RESULT_BYTES {
-        return Err(floor::result_too_large());
-    }
-
-    let schema_fingerprint = convert::to_hex(&SchemaFingerprint::from_arrow_schema(&schema).0);
-
-    // Audit the authorized, successful read in its own transaction — committed
-    // BEFORE the Arrow body streams to the client, so a durable record of the
-    // query precedes any result leaving the server.
-    let event = audit::audit_event(
-        &caller,
-        "vala.query.sync",
-        "vala.query",
-        &Permission::bifrost_query_read().to_string(),
-        AuditDecision::Allow,
-        AuditResult::Success,
-        "sync select executed",
-    );
-    audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, &event).await?;
-
-    Ok(SyncQueryResult {
-        body: body_bytes,
-        schema_fingerprint,
-        row_count,
-    })
-}
-
-/// Redact bound parameters to type tags only. Raw literals never reach durable
-/// storage — the persisted `params_redacted` records the shape, not the values.
-fn redact_params(params: &[QueryParam]) -> JsonValue {
-    let tags: Vec<JsonValue> = params
-        .iter()
-        .map(|param| {
-            let tag = match param {
-                QueryParam::Null => "null",
-                QueryParam::Bool(_) => "bool",
-                QueryParam::Int(_) => "int",
-                QueryParam::Float(_) => "float",
-                QueryParam::Text(_) => "text",
-            };
-            json!({ "type": tag })
-        })
-        .collect();
-    JsonValue::Array(tags)
-}
-
-/// Derive a per-tenant idempotency key from the normalized SQL and redacted param
-/// shape, so a retried identical submission de-duplicates to the same job row.
-fn idempotency_key(sql_normalized: &str, params_redacted: &JsonValue) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(sql_normalized.as_bytes());
-    hasher.update([0u8]);
-    hasher.update(params_redacted.to_string().as_bytes());
-    convert::to_hex(&hasher.finalize())
-}
-
-/// Validate then enqueue an async query job.
-///
-/// The syntactic floor runs *before* `enqueue_query_job`: an invalid SQL
-/// submission returns `400 QUERY_INVALID_SQL` and writes no durable row. A valid
-/// submission lands exactly one `queued` row (idempotent on retry) and reports
-/// `executor_availability = PendingStage5` — the executor does not exist until
-/// Stage 5.
-pub async fn submit_async_query(
-    state: &AppState,
-    caller: Caller,
-    body: AsyncQueryRequest,
-) -> Result<AsyncQueryResponse, WyrdError> {
-    authorize_audited(
-        state,
-        &caller,
-        Permission::bifrost_query_read(),
-        "vala.query.async.submit",
-        "vala.query.async",
-    )
-    .await?;
-    floor::validate_query_sql(&body.sql)?;
-
-    let sql_normalized = body.sql.trim().to_owned();
-    let params_redacted = redact_params(&body.params);
-    let key = idempotency_key(&sql_normalized, &params_redacted);
-
-    let mut conn = TenantConn::acquire(state.postgres.vala_pool(), caller.data_tenant_id)
+        let event = audit::audit_event(
+            self.caller,
+            "vala.query.running.cancel.attempt",
+            &self.resource,
+            &self.permission.to_string(),
+            AuditDecision::Allow,
+            AuditResult::Success,
+            "running query cancellation dispatch authorized",
+        );
+        audit::record_audit_owned(
+            self.state.postgres.vala_pool().clone(),
+            self.caller.data_tenant_id,
+            event,
+        )
         .await
-        .map_err(storage_error)?;
-    let job_uid = enqueue_query_job(
-        &mut conn,
-        NewQueryJob {
-            idempotency_key: &key,
-            sql_normalized: &sql_normalized,
-            params_redacted: &params_redacted,
-        },
-    )
-    .await
-    .map_err(storage_error)?;
-    // Append the audit row in the SAME tx as the `olap_query_jobs` write, so the
-    // enqueued job and its audit record commit atomically (fail-closed).
-    let event = audit::audit_event(
-        &caller,
-        "vala.query.async.submit",
-        "vala.query.async",
-        &Permission::bifrost_query_read().to_string(),
-        AuditDecision::Allow,
-        AuditResult::Success,
-        "async query enqueued",
-    );
-    audit::append_on(&mut conn, &event).await?;
-    conn.commit().await.map_err(storage_error)?;
-
-    Ok(AsyncQueryResponse {
-        job_uid,
-        state: AsyncJobState::Queued,
-        executor_availability: ExecutorAvailability::PendingStage5,
-    })
+    }
 }
 
-/// Read one async query job's status under the caller's tenant bind. A job owned
-/// by another tenant is invisible under RLS and surfaces as `404`.
-pub async fn get_async_query_status(
-    state: &AppState,
-    caller: Caller,
-    job_uid: JobUid,
-) -> Result<AsyncQueryStatus, WyrdError> {
-    authorize_audited(
-        state,
-        &caller,
+/// Converts the authenticated server caller into Oracle's exact context.
+///
+/// The verified delegation chain travels with the effective principal so both
+/// local and forwarded execution build the same attributed read decision.
+///
+/// # Errors
+///
+/// Returns the tenant invariant error if the principal and extractor tenant
+/// disagree.
+fn oracle_context(caller: &Caller) -> Result<AuthorizedQueryContext, WyrdError> {
+    AuthorizedQueryContext::try_new(
+        caller.principal.clone(),
+        caller.data_tenant_id,
+        caller.request_id.clone(),
+        None,
+        AuthMethod::Jwt,
         Permission::bifrost_query_read(),
-        "vala.query.async.status",
-        "vala.query.async",
     )
-    .await?;
-
-    let mut conn = TenantConn::acquire(state.postgres.vala_pool(), caller.data_tenant_id)
-        .await
-        .map_err(storage_error)?;
-    let status = query_job_status(&mut conn, job_uid)
-        .await
-        .map_err(storage_error)?;
-    // Audit the authorized status read in the SAME tx as the job read. Recorded
-    // whether or not the job resolves (a `404` under RLS is still an audited op).
-    let event = audit::audit_event(
-        &caller,
-        "vala.query.async.status",
-        &format!("vala.query.async/{}", job_uid.0),
-        &Permission::bifrost_query_read().to_string(),
-        AuditDecision::Allow,
-        AuditResult::Success,
-        "async status read",
-    );
-    audit::append_on(&mut conn, &event).await?;
-    conn.commit().await.map_err(storage_error)?;
-
-    status.ok_or_else(|| WyrdError::NotFound {
-        message: "async query job not found".to_owned(),
-        details: json!({ "job_uid": job_uid.0 }),
-    })
+    .map(|context| context.with_delegation_chain(caller.delegation_chain.clone()))
+    .map_err(Into::into)
 }
 
-/// Execute a pre-built `LogicalPlan` through the typed seam (M-07).
+/// Authorizes and dispatches a public SQL request through the stable local Gate.
 ///
-/// Gates (in order):
-///   1. `bifrost_query_read` — audited deny on failure.
-///   2. Execution under a wall-clock budget (`SYNC_QUERY_TIMEOUT`).
-///   3. Row ceiling (`limit + 1`): if more than `limit` rows are present the
-///      returned `has_more` flag is `true` and the batch set is truncated to
-///      `limit` rows.
+/// Authorization always completes before the Gate inspects local Oracle
+/// availability. The returned stream owns admission, cancellation, and cleanup
+/// guards, so dropping it on transport cancellation stops query work.
 ///
-/// Returns the collected batches (already within `limit`) plus the `has_more`
-/// signal used by the caller to issue a signed page token.
-pub async fn run_plan_query(
+/// # Errors
+///
+/// Returns authorization/audit errors, Oracle role unavailable, or a stable
+/// pre-stream Oracle query error.
+pub async fn stream_query(
+    state: AppState,
+    caller: Caller,
+    request: BifrostQueryRequest,
+) -> Result<OracleQueryStream, WyrdError> {
+    let authority = QueryAuthority::new(&state, &caller, "vala.query.sync", "vala.query");
+    authority.admit_capability().await?;
+    let context = oracle_context(&caller)?;
+    match state.bifrost.query_sql(context, request).await {
+        Ok(stream) => Ok(stream),
+        // Oracle took the authoritative object decision against its resolved
+        // scan set. The tenant and principal are verified here, so the refusal
+        // is recorded on the same audited boundary as a coarse route denial.
+        Err(denial @ wyrd_spec::vala::error::BifrostError::QueryForbidden) => {
+            Err(authority.record_object_denial(denial.into()).await)
+        }
+        Err(other) => Err(other.into()),
+    }
+}
+
+/// Lists active queries visible to the authenticated tenant.
+///
+/// Cancelling this future abandons the pending distributed lookup; no query
+/// lifecycle is changed.
+///
+/// # Errors
+///
+/// Returns stable authorization, audit, role-availability, or owner-control errors.
+pub async fn list_running_queries(
     state: &AppState,
     caller: &Caller,
-    plan: datafusion::logical_expr::LogicalPlan,
-    audit_op: &str,
-    limit: u32,
-) -> Result<(Vec<RecordBatch>, bool), WyrdError> {
-    authorize_audited(
+) -> Result<Vec<RunningQuerySummary>, WyrdError> {
+    let audit = QueryAuthority::lifecycle(state, caller, "vala.query.running.list", None);
+    audit.authorize().await?;
+    let outcome = match state.bifrost.query_controls() {
+        Some(controls) => controls.list(caller.data_tenant_id).await,
+        None => Err(wyrd_spec::vala::error::BifrostError::OracleRoleUnavailable.into()),
+    };
+    audit.record(&outcome).await?;
+    outcome
+}
+
+/// Returns one active query visible to the authenticated tenant.
+///
+/// Cancelling this future abandons the pending distributed lookup; no query
+/// lifecycle is changed.
+///
+/// # Errors
+///
+/// Returns stable authorization, audit, role-availability, not-found, or conflict errors.
+pub async fn get_running_query(
+    state: &AppState,
+    caller: &Caller,
+    request_id: RequestId,
+) -> Result<RunningQuerySummary, WyrdError> {
+    let audit =
+        QueryAuthority::lifecycle(state, caller, "vala.query.running.get", Some(&request_id));
+    audit.authorize().await?;
+    let outcome = match state.bifrost.query_controls() {
+        Some(controls) => controls.get(caller.data_tenant_id, request_id).await,
+        None => Err(wyrd_spec::vala::error::BifrostError::OracleRoleUnavailable.into()),
+    };
+    audit.record(&outcome).await?;
+    outcome
+}
+
+/// Requests idempotent cancellation of one active query for the authenticated tenant.
+///
+/// Once any exact owner accepts cancellation, cancelling this future does not
+/// reverse the owner-side transition.
+///
+/// # Errors
+///
+/// Returns stable authorization, audit, role-availability, not-found, or conflict errors.
+pub async fn cancel_running_query(
+    state: &AppState,
+    caller: &Caller,
+    request_id: RequestId,
+) -> Result<CancelRunningQueryResponse, WyrdError> {
+    let audit = QueryAuthority::lifecycle(
         state,
         caller,
-        Permission::bifrost_query_read(),
-        audit_op,
-        "vala.query",
-    )
-    .await?;
-
-    // A fresh tenant-scoped context runs the TenantPredicateRule analyzer on the
-    // incoming plan; providers are embedded in the plan's TableScan sources.
-    let ctx = vala_bifrost::session::wyrd_session_context(caller.data_tenant_id);
-    let limit_plus_one = (limit as usize).saturating_add(1);
-
-    let (schema, batches) = tokio::time::timeout(floor::SYNC_QUERY_TIMEOUT, async {
-        let df = ctx.execute_logical_plan(plan).await?;
-        let df = df.limit(0, Some(limit_plus_one))?;
-        let schema = df.schema().as_arrow().clone();
-        let batches = df.collect().await?;
-        Ok::<_, datafusion::error::DataFusionError>((schema, batches))
-    })
-    .await
-    .map_err(|_| floor::query_timeout())?
-    .map_err(map_datafusion_error)?;
-
-    // Count total rows across all batches.
-    let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-    let has_more = total_rows > limit as usize;
-
-    // Truncate to exactly `limit` rows if has_more.
-    let batches = if has_more {
-        truncate_batches(batches, limit as usize, &schema)
-    } else {
-        batches
-    };
-
-    // Audit the authorized, successful typed query.
-    let event = audit::audit_event(
-        caller,
-        audit_op,
-        "vala.query",
-        &Permission::bifrost_query_read().to_string(),
-        wyrd_spec::vala::api::AuditDecision::Allow,
-        wyrd_spec::vala::api::AuditResult::Success,
-        "typed plan query executed",
+        "vala.query.running.cancel",
+        Some(&request_id),
     );
-    audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, &event).await?;
-
-    Ok((batches, has_more))
-}
-
-/// Truncate a batch list to at most `limit` rows, re-slicing the last batch
-/// if needed rather than collecting row-by-row.
-fn truncate_batches(
-    batches: Vec<RecordBatch>,
-    limit: usize,
-    _schema: &arrow::datatypes::Schema,
-) -> Vec<RecordBatch> {
-    let mut result = Vec::with_capacity(batches.len());
-    let mut remaining = limit;
-    for batch in batches {
-        if remaining == 0 {
-            break;
+    audit.authorize().await?;
+    audit.record_cancel_attempt().await?;
+    let outcome = match state.bifrost.query_controls() {
+        Some(controls) => controls
+            .cancel(caller.data_tenant_id, request_id)
+            .await
+            .map(|cancelled| CancelRunningQueryResponse {
+                request_id: cancelled.request_id,
+                cancellation_started: cancelled.cancellation_started,
+            }),
+        None => Err(wyrd_spec::vala::error::BifrostError::OracleRoleUnavailable.into()),
+    };
+    if audit.record(&outcome).await.is_err() {
+        return Err(wyrd_spec::vala::error::BifrostError::AuditUnavailable {
+            detail: "cancellation produced an outcome but its audit append failed".to_owned(),
         }
-        if batch.num_rows() <= remaining {
-            remaining -= batch.num_rows();
-            result.push(batch);
-        } else {
-            result.push(batch.slice(0, remaining));
-            break;
-        }
+        .into());
     }
-    result
+    outcome
 }
 
+/// operators.
+pub(crate) fn arrow_decode_error(error: &QueryIpcDecodeError) -> WyrdError {
+    WyrdError::Internal {
+        message: "failed to decode Oracle Arrow batch".to_owned(),
+        details: serde_json::json!({ "detail": error.to_string() }),
+    }
+}
+/// Preserves the stable terminal error catalog across typed query adapters.
+pub(crate) fn terminal_error_to_bifrost(
+    code: wyrd_spec::vala::api::QueryTerminalErrorCode,
+) -> wyrd_spec::vala::error::BifrostError {
+    use wyrd_spec::vala::api::QueryTerminalErrorCode;
+    use wyrd_spec::vala::error::BifrostError;
+
+    match code {
+        QueryTerminalErrorCode::QueryTimeout => BifrostError::QueryTimeout,
+        QueryTerminalErrorCode::QueryVisibilityUnavailable => {
+            BifrostError::QueryVisibilityUnavailable
+        }
+        QueryTerminalErrorCode::QueryTenantInvariant => BifrostError::QueryTenantInvariant,
+        QueryTerminalErrorCode::QueryReconciliationInvariant => {
+            BifrostError::QueryReconciliationInvariant
+        }
+        QueryTerminalErrorCode::QueryPeerSecurity => BifrostError::QueryPeerSecurity,
+        QueryTerminalErrorCode::QueryAuditUnavailable => BifrostError::QueryAuditUnavailable,
+        QueryTerminalErrorCode::CatalogUnreachable => BifrostError::CatalogUnreachable {
+            detail: "Oracle typed query catalog unavailable".to_owned(),
+        },
+        QueryTerminalErrorCode::StorageUnreachable => BifrostError::StorageUnreachable {
+            detail: "Oracle typed query storage unavailable".to_owned(),
+        },
+        QueryTerminalErrorCode::QueryExecutionFailed => BifrostError::QueryExecutionFailed,
+    }
+}
 #[cfg(test)]
-mod pg_tests {
-    use super::*;
-    use std::time::Duration;
-
-    use wyrd_runtime::{PermissionSet, Principal, PrincipalId, PrincipalKind};
-    use wyrd_spec::ids::DataTenantId;
+mod tests {
+    use std::path::Path;
+    use wyrd_runtime::permission::PermissionSet;
+    use wyrd_runtime::{Principal, PrincipalKind};
+    use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::request_id::RequestId;
-    use wyrd_spec::vala::api::AsyncJobState;
-    use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
+    use wyrd_spec::vala::api::{FreshnessPolicy, VisibilityMode};
 
-    /// True when an audit-outbox row for `request_id` with the given `decision`
-    /// exists. Reads via the cross-tenant relay claim (SECURITY DEFINER) so the
-    /// assertion is independent of the reader's tenant bind; `request_id` is a
-    /// fresh UUIDv7 per caller, so the match is unique across the test binary.
-    async fn has_audit(
-        pool: &sqlx::PgPool,
-        tenant: DataTenantId,
-        request_id: &str,
-        decision: &str,
-    ) -> bool {
-        let mut conn = TenantConn::acquire(pool, tenant)
-            .await
-            .expect("tenant conn");
-        let rows = vala_sql::queries::audit_outbox::claim_unshipped_audit(&mut conn, 10_000)
-            .await
-            .expect("claim audit rows");
-        conn.commit().await.expect("commit");
-        rows.iter()
-            .any(|r| r.request_id == request_id && r.decision == decision)
-    }
+    use super::*;
 
-    /// Build an `AppState` whose `pool` is the shared fixture's `wyrd_app` pool so
-    /// async-path tests persist rows under RLS.
-    async fn db_state() -> AppState {
-        let root = tempfile::tempdir().expect("temp dir");
-        let storage = StorageHandle::from_settings(StorageSettings {
-            backend: BackendConfig::Local {
-                root: root.path().to_path_buf(),
-            },
-            require_encryption: false,
-            presign_ttl: Duration::from_secs(600),
-            part_size_bytes: 16 * 1024 * 1024,
-            multipart_threshold_bytes: 100 * 1024 * 1024,
-            public_base_url: Some("https://wyrd.test".to_owned()),
-        })
-        .await
-        .expect("local storage handle");
-        let pool = crate::test_support::test_pool().await;
-        let wyrd = wyrd_sql::WyrdPostgres::from_pools(pool.clone(), None);
-        let vala = vala_sql::ValaPostgres::from_pools(pool, None);
-        let postgres = Arc::new(crate::postgres::ServerPostgres::from_parts(wyrd, vala));
-        AppState::new(
-            postgres,
-            Arc::clone(&storage),
-            crate::test_support::test_catalog().await,
-        )
-    }
-
+    /// Builds one caller with the requested effective permissions.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the shared fixture tenant cannot be resolved.
     async fn caller_with(permissions: impl IntoIterator<Item = Permission>) -> Caller {
         let tenant = crate::test_support::test_tenant().await;
         Caller {
@@ -531,189 +456,101 @@ mod pg_tests {
                 PrincipalId::new(uuid::Uuid::now_v7()),
                 PrincipalKind::User,
                 tenant,
-                vec![],
+                Vec::new(),
                 PermissionSet::from_iter(permissions),
             ),
-            request_id: RequestId::parse(&uuid::Uuid::now_v7().to_string())
-                .expect("request id parses"),
+            request_id: RequestId::now_v7(),
+            // Nondelegated fixture caller: no verified `act` chain exists.
+            delegation_chain: Vec::new(),
         }
     }
 
-    fn async_req(sql: &str) -> AsyncQueryRequest {
-        AsyncQueryRequest {
-            sql: sql.to_owned(),
-            params: vec![],
+    /// Builds application state with real authz audit SQL and no local Oracle role.
+    ///
+    /// # Panics
+    ///
+    /// Panics when shared Postgres, storage, or catalog fixtures cannot start.
+    async fn state_without_oracle() -> AppState {
+        crate::test_support::test_app_state(
+            crate::test_support::test_server_postgres().await,
+            crate::test_support::test_storage().await,
+            crate::test_support::test_catalog().await,
+        )
+    }
+
+    /// Proves authorization and its denial audit run before local role lookup.
+    ///
+    /// The allowed caller reaches typed role-unavailable without a Gate, while
+    /// the denied caller receives RBAC denial only after the real outbox append
+    /// succeeds. Neither path can start Oracle planning or source IO.
+    #[test]
+    fn bifrost_query_authz_precedes_oracle_role_lookup() {
+        wyrd_runtime::runtime().block_on(async {
+            let state = state_without_oracle().await;
+            let request = BifrostQueryRequest {
+                sql: "SELECT 1".to_owned(),
+                visibility: VisibilityMode::PublishedOnly,
+                freshness: FreshnessPolicy::Strict,
+                deadline_ms: Some(1_000),
+            };
+            let allowed = stream_query(
+                state.clone(),
+                caller_with([Permission::bifrost_query_read()]).await,
+                request.clone(),
+            )
+            .await
+            .expect_err("absent Oracle must fail before stream");
+            assert_eq!(allowed.status(), 503);
+
+            let denied = stream_query(state, caller_with([]).await, request)
+                .await
+                .expect_err("under-privileged caller must be denied");
+            assert_eq!(
+                denied.status(),
+                403,
+                "authz denial must win over local role availability"
+            );
+        });
+    }
+
+    /// Proves production server query adapters cannot regress to legacy engines or collection.
+    #[test]
+    fn production_query_paths_have_no_legacy_escape_hatches() {
+        let own_source = include_str!("service.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("query service has a production section");
+        for (path, complete_source) in [
+            ("query/service.rs", own_source),
+            ("query/routes.rs", include_str!("routes.rs")),
+        ] {
+            let source = complete_source
+                .split("#[cfg(test)]")
+                .next()
+                .expect("query adapter has a production section");
+            for forbidden in ["application/vnd.apache.arrow.stream", ".collect().await"] {
+                assert!(
+                    !source.contains(forbidden),
+                    "{path} retains forbidden query escape hatch {forbidden}"
+                );
+            }
         }
     }
 
-    // These tests drive the shared embedded-Postgres pool; they run on the
-    // process-wide persistent runtime (never a per-test `#[tokio::test]` runtime)
-    // so the shared pool is not poisoned by a runtime that dies at test end.
-    // See `crate::test_support`.
-
+    /// Proves the removed async-job SQL owner and initial migration stay absent.
     #[test]
-    fn query_sync_requires_read_permission() {
-        wyrd_runtime::runtime().block_on(async {
-            let state = db_state().await;
-            let caller = caller_with([]).await;
-            let err = run_sync_query(
-                &state,
-                caller,
-                SyncQueryRequest {
-                    sql: "SELECT 1".to_owned(),
-                    params: vec![],
-                },
-            )
-            .await
-            .expect_err("no read permission is denied");
-            assert_eq!(err.status(), 403);
-        });
-    }
-
-    #[test]
-    fn query_sync_executes_select_and_reports_headers() {
-        wyrd_runtime::runtime().block_on(async {
-            let state = db_state().await;
-            let caller = caller_with([Permission::bifrost_query_read()]).await;
-            let result = run_sync_query(
-                &state,
-                caller,
-                SyncQueryRequest {
-                    sql: "SELECT 1 AS n".to_owned(),
-                    params: vec![],
-                },
-            )
-            .await
-            .expect("tableless SELECT executes");
-            assert_eq!(result.row_count, 1);
-            assert!(!result.body.is_empty(), "IPC body is non-empty");
+    fn async_query_job_persistence_is_absent() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        for relative in [
+            "crates/vala/vala-sql/migrations/20260801000001_olap_query_jobs.sql",
+            "crates/vala/vala-sql/src/queries/olap_query_jobs.rs",
+            "crates/vala/vala-sql/src/row_types/olap_query_jobs.rs",
+            "crates/vala/vala-sql/tests/pg_olap_query_jobs.rs",
+        ] {
             assert!(
-                !result.schema_fingerprint.is_empty(),
-                "schema fingerprint is set"
+                !repository.join(relative).exists(),
+                "removed async query-job owner returned: {relative}"
             );
-        });
-    }
-
-    #[test]
-    fn query_async_requires_read_permission() {
-        wyrd_runtime::runtime().block_on(async {
-            let state = db_state().await;
-            let caller = caller_with([]).await;
-            let err = submit_async_query(&state, caller, async_req("SELECT 1"))
-                .await
-                .expect_err("no read permission is denied");
-            assert_eq!(err.status(), 403);
-        });
-    }
-
-    #[test]
-    fn query_async_rejects_invalid_sql_before_enqueue() {
-        wyrd_runtime::runtime().block_on(async {
-            let state = db_state().await;
-            let caller = caller_with([Permission::bifrost_query_read()]).await;
-            let err =
-                submit_async_query(&state, caller, async_req("DROP TABLE \"vala.bifrost.t\""))
-                    .await
-                    .expect_err("non-SELECT is rejected before enqueue");
-            assert_eq!(err.status(), 400);
-            assert_eq!(err.code(), "WYRD_VALA_400_QUERY_INVALID_SQL");
-        });
-    }
-
-    #[test]
-    fn query_async_enqueues_queued_job_idempotently_and_status_roundtrips() {
-        wyrd_runtime::runtime().block_on(async {
-            let state = db_state().await;
-            let caller = caller_with([Permission::bifrost_query_read()]).await;
-            // Unique SQL per run so the idempotency key does not collide with a
-            // prior test-process row in the shared fixture.
-            let sql = format!("SELECT {} AS n", uuid::Uuid::now_v7().as_u128());
-
-            let first = submit_async_query(&state, caller.clone(), async_req(&sql))
-                .await
-                .expect("valid submission enqueues");
-            assert_eq!(first.state, AsyncJobState::Queued);
-            assert_eq!(
-                first.executor_availability,
-                ExecutorAvailability::PendingStage5
-            );
-
-            let second = submit_async_query(&state, caller.clone(), async_req(&sql))
-                .await
-                .expect("retry is idempotent");
-            assert_eq!(
-                first.job_uid, second.job_uid,
-                "idempotent retry returns the same job"
-            );
-
-            let status = get_async_query_status(&state, caller, first.job_uid)
-                .await
-                .expect("status resolves for the enqueued job");
-            assert_eq!(status.job_uid, first.job_uid);
-            assert_eq!(status.state, AsyncJobState::Queued);
-            assert_eq!(
-                status.executor_availability,
-                ExecutorAvailability::PendingStage5
-            );
-        });
-    }
-
-    #[test]
-    fn query_async_status_unknown_job_is_not_found() {
-        wyrd_runtime::runtime().block_on(async {
-            let state = db_state().await;
-            let caller = caller_with([Permission::bifrost_query_read()]).await;
-            let err = get_async_query_status(&state, caller, JobUid(uuid::Uuid::now_v7()))
-                .await
-                .expect_err("unknown job is not found");
-            assert_eq!(err.status(), 404);
-        });
-    }
-
-    #[test]
-    fn query_async_submit_appends_allow_audit_row() {
-        wyrd_runtime::runtime().block_on(async {
-            let state = db_state().await;
-            let caller = caller_with([Permission::bifrost_query_read()]).await;
-            let tenant = caller.data_tenant_id;
-            let request_id = caller.request_id.as_str().to_owned();
-            let sql = format!("SELECT {} AS n", uuid::Uuid::now_v7().as_u128());
-
-            submit_async_query(&state, caller, async_req(&sql))
-                .await
-                .expect("valid submission enqueues");
-
-            assert!(
-                has_audit(state.postgres.vala_pool(), tenant, &request_id, "allow").await,
-                "a successful async submit appends one allow audit row"
-            );
-        });
-    }
-
-    #[test]
-    fn query_sync_denied_appends_deny_audit_row() {
-        wyrd_runtime::runtime().block_on(async {
-            let state = db_state().await;
-            let caller = caller_with([]).await;
-            let tenant = caller.data_tenant_id;
-            let request_id = caller.request_id.as_str().to_owned();
-
-            let err = run_sync_query(
-                &state,
-                caller,
-                SyncQueryRequest {
-                    sql: "SELECT 1".to_owned(),
-                    params: vec![],
-                },
-            )
-            .await
-            .expect_err("no read permission is denied");
-            assert_eq!(err.status(), 403);
-
-            assert!(
-                has_audit(state.postgres.vala_pool(), tenant, &request_id, "deny").await,
-                "an RBAC denial appends one deny audit row in its own tx"
-            );
-        });
+        }
     }
 }

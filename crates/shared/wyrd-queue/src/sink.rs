@@ -1,96 +1,222 @@
-//! The swap seam: [`BatchSink`], [`SealedBatch`], and the test [`MockSink`].
+//! Owned sealed batches and the bounded queue-to-transport handoff.
 //!
-//! `BatchSink` is the single most important type in the crate — the swap point
-//! the client→server flow marks as "the only kind-specific code". The producer
-//! hands a [`SealedBatch`] to a `dyn BatchSink` and is done; a new observation
-//! kind is a new impl in its own surface crate, with zero change here.
+//! A [`SealedBatch`] moves through staging, transport, and retry without cloning
+//! its IPC payload or budget guard. A retryable sink failure leaves that exact
+//! owner with the queue; an acknowledgement or terminal error consumes it.
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use wyrd_spec::error::WyrdError;
 
-/// One sealed, ready-to-ship batch handed from the producer to a sink.
-///
-/// Produced by the flush task; consumed by exactly one [`BatchSink::send`] call.
-/// Carries **no `run_id` field**: correlation is per-row inside `frames`, never
-/// batch-grain (a sealed batch freely mixes cards and runs — C-01).
-#[derive(Debug, Clone)]
-pub struct SealedBatch {
-    /// Destination table identifier (`"namespace.table"`). Opaque to the queue —
-    /// the sink forwards it to its typed service.
-    pub table: String,
-    /// Durable idempotency key. Minted **once at seal** (UUIDv7 bytes) and
-    /// **stable across transport retries** — a retry re-sends the same id so the
-    /// server `olap_commits` dedup holds. The producer never regenerates it.
+/// The server acknowledgement that settles one durable batch identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DurableBatchAck {
+    /// The identity the server durably accepted.
     pub batch_id: [u8; 16],
-    /// Arrow IPC stream bytes for one logical `RecordBatch` — user columns plus
-    /// the two per-row correlation columns `card_ref` and `run_id`. The server
-    /// stamps the per-request system columns; correlation rides inside `frames`,
-    /// never as `SealedBatch` metadata.
-    pub frames: Vec<u8>,
-    /// Row count in this batch — for ack reconciliation and metrics.
+    /// The accepted row count used by queue metrics.
     pub rows: u64,
 }
 
-/// The swap seam: one implementation per observation-kind transport.
+/// IPC bytes coupled to the exclusive client-budget guard that pays for them.
 ///
-/// `wyrd-queue` ships [`MockSink`] (tests); `vala-sdk` ships `BifrostIngestSink`
-/// (Record); future kinds add their own sinks in their own crates — none of
-/// which touch this file.
-///
-/// `Arc<dyn BatchSink>` is the chosen shape: runtime extensibility is the
-/// explicit intent, and `send` is called once **per flush** (per N rows), not
-/// per row — so dynamic dispatch is off the hot path (the hot path is `enqueue`,
-/// which never touches the sink).
-#[async_trait::async_trait]
-pub trait BatchSink: Send + Sync + 'static {
-    /// Ship one sealed batch to its typed service; return `rows_accepted`.
-    ///
-    /// Contract:
-    /// - **Idempotent on `batch.batch_id`** — the server dedups, so a re-send of
-    ///   the same id must be safe (the producer relies on this for retry).
-    /// - Returns a [`WyrdError`] on failure. The producer inspects the error to
-    ///   decide re-buffer vs. drop-with-log.
-    async fn send(&self, batch: SealedBatch) -> Result<u64, WyrdError>;
+/// The guard is generic so `wyrd-queue` remains transport-free while the
+/// ordinary Rust client uses [`crate::ClientByteGuard`].
+#[derive(Debug)]
+pub struct OwnedIpcBytes<G> {
+    bytes: SharedIpcBytes,
+    guard: G,
 }
 
-/// In-memory loopback sink for producer tests.
+/// Clone-cheap immutable IPC storage shared only with a cancellable transport borrow.
 ///
-/// Records every batch it receives and can be configured to fail a configurable
-/// number of sends (to exercise re-buffer without a network).
+/// A [`SealedBatch`] remains non-cloneable and keeps the exclusive client-byte
+/// guard. Cloning this shell only extends the immutable frame allocation long
+/// enough for an in-flight `Bytes` request after the queue has retained the
+/// authoritative batch owner.
+#[derive(Debug, Clone)]
+pub struct SharedIpcBytes {
+    /// Immutable frame allocation retained by the sealed-batch owner.
+    bytes: Arc<Vec<u8>>,
+}
+
+impl SharedIpcBytes {
+    /// Wraps an owned IPC allocation before it enters a sealed batch.
+    #[must_use]
+    fn new(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes: Arc::new(bytes),
+        }
+    }
+}
+
+impl AsRef<[u8]> for SharedIpcBytes {
+    /// Borrows the immutable IPC allocation for `Bytes::from_owner`.
+    fn as_ref(&self) -> &[u8] {
+        self.bytes.as_slice()
+    }
+}
+
+impl<G> OwnedIpcBytes<G> {
+    /// Couples already-owned IPC bytes with their one exclusive reservation.
+    #[must_use]
+    pub fn new(bytes: Vec<u8>, guard: G) -> Self {
+        Self {
+            bytes: SharedIpcBytes::new(bytes),
+            guard,
+        }
+    }
+
+    /// Borrows the owned IPC bytes for a copy-free transport request build.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        self.bytes.as_ref()
+    }
+
+    /// Clones the dependency-free shared byte owner for a cancellable transport borrow.
+    ///
+    /// The clone increments only the `Arc` control block. It never copies the
+    /// IPC allocation or its exclusive client budget guard, which remains held
+    /// by this [`OwnedIpcBytes`] until terminal batch settlement.
+    #[must_use]
+    pub fn shared_bytes(&self) -> SharedIpcBytes {
+        self.bytes.clone()
+    }
+
+    /// Returns the owned reservation after terminal settlement.
+    #[must_use]
+    pub fn into_guard(self) -> G {
+        self.guard
+    }
+}
+
+/// One non-cloneable IPC batch that is ready for transport.
+#[derive(Debug)]
+pub struct SealedBatch<G> {
+    /// Destination table identifier, opaque to the queue.
+    pub table: String,
+    /// UUIDv7 idempotency identity minted before the first transport attempt.
+    pub batch_id: [u8; 16],
+    /// One owned Arrow IPC frame and its client-byte reservation.
+    pub frame: OwnedIpcBytes<G>,
+    /// The number of logical rows represented by this frame.
+    pub rows: u64,
+}
+
+impl<G> SealedBatch<G> {
+    /// Borrows the owned IPC frame without exposing a mutable payload path.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        self.frame.bytes()
+    }
+}
+
+/// Retryable or terminal failure from a sink that consumed a sealed batch.
+#[derive(Debug)]
+pub enum SinkError {
+    /// The server either may not have acknowledged the operation or returned
+    /// stable no-write `WYRD_VALA_429_INGEST_BUSY`; the queue retains the
+    /// unchanged UUID, bytes, allocation guard, and retry permit until the
+    /// exact owner reaches ACK or terminal settlement.
+    Retryable(WyrdError),
+    /// The batch reached a terminal outcome and its owner has been consumed.
+    Terminal(WyrdError),
+}
+
+impl SinkError {
+    /// Borrows the stable error without exposing a retry batch by accident.
+    #[must_use]
+    pub fn error(&self) -> &WyrdError {
+        match self {
+            Self::Retryable(error) | Self::Terminal(error) => error,
+        }
+    }
+}
+
+/// The queue's transport seam for one owned batch type.
+#[async_trait::async_trait]
+pub trait BatchSink<G>: Send + Sync + 'static {
+    /// Borrows one owned batch and reports its transport settlement.
+    ///
+    /// The queue keeps the non-cloneable batch shell and guard while this
+    /// future is pending. It can therefore cancel a deadline-expired future
+    /// without losing the stable identity or owned bytes needed for retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SinkError::Retryable`] when commit acknowledgement is
+    /// ambiguous or stable no-write `WYRD_VALA_429_INGEST_BUSY` requires the
+    /// exact borrowed UUID, bytes, allocation guard, and retry permit to remain
+    /// retained. Returns [`SinkError::Terminal`] only when the queue may consume
+    /// the owner after a permanent rejection.
+    async fn send(&self, batch: &SealedBatch<G>) -> Result<DurableBatchAck, SinkError>;
+}
+
+/// Snapshot-only test receipt that never recreates a queue ownership token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchReceipt {
+    /// Destination table recorded by the test sink.
+    pub table: String,
+    /// Stable batch identity recorded by the test sink.
+    pub batch_id: [u8; 16],
+    /// A shared immutable view of the sent bytes for assertions.
+    pub bytes: Vec<u8>,
+    /// Logical row count.
+    pub rows: u64,
+}
+
+/// In-memory loopback sink for queue tests.
 #[derive(Debug, Default)]
 pub struct MockSink {
-    received: Mutex<Vec<SealedBatch>>,
+    received: Mutex<Vec<BatchReceipt>>,
+    attempted: Mutex<Vec<[u8; 16]>>,
     fail_next: AtomicUsize,
 }
 
 impl MockSink {
-    /// Construct an empty mock sink.
+    /// Constructs an empty test sink.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Arrange for the next `n` sends to fail with a transport [`WyrdError`].
-    ///
-    /// Each failing send decrements the counter; once it reaches zero, sends
-    /// succeed and record normally. A failing send records nothing — the
-    /// producer re-buffers those rows.
+    /// Arranges for the next `n` sends to return retryable ambiguity.
     pub fn fail_next(&self, n: usize) {
         self.fail_next.store(n, Ordering::SeqCst);
     }
 
-    /// Return a snapshot of every batch this sink has accepted (assertion surface).
+    /// Returns assertion receipts rather than cloneable owned batches.
     #[must_use]
-    pub fn received(&self) -> Vec<SealedBatch> {
-        self.received.lock().expect("mock sink poisoned").clone()
+    pub fn received(&self) -> Vec<BatchReceipt> {
+        self.received
+            .lock()
+            .expect("mock sink is not poisoned")
+            .clone()
+    }
+
+    /// Returns every attempted identity, including retained ambiguous attempts.
+    #[must_use]
+    pub fn attempted(&self) -> Vec<[u8; 16]> {
+        self.attempted
+            .lock()
+            .expect("mock sink is not poisoned")
+            .clone()
     }
 }
 
 #[async_trait::async_trait]
-impl BatchSink for MockSink {
-    async fn send(&self, batch: SealedBatch) -> Result<u64, WyrdError> {
+impl<G: Send + Sync + 'static> BatchSink<G> for MockSink {
+    /// Records a borrowed batch and returns a deterministic mock settlement.
+    ///
+    /// # Errors
+    ///
+    /// Returns a retryable service-unavailable error while `fail_next` still
+    /// has budget; the queue retains the batch because this sink borrows it.
+    async fn send(&self, batch: &SealedBatch<G>) -> Result<DurableBatchAck, SinkError> {
+        self.attempted
+            .lock()
+            .expect("mock sink is not poisoned")
+            .push(batch.batch_id);
         loop {
             let remaining = self.fail_next.load(Ordering::SeqCst);
             if remaining == 0 {
@@ -101,17 +227,26 @@ impl BatchSink for MockSink {
                 .compare_exchange(remaining, remaining - 1, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
             {
-                return Err(WyrdError::Internal {
-                    message: "mock sink forced failure".to_owned(),
+                return Err(SinkError::Retryable(WyrdError::ServiceUnavailable {
+                    message: "mock sink forced ambiguous failure".to_owned(),
                     details: serde_json::json!({ "mock": true }),
-                });
+                }));
             }
         }
-        let rows = batch.rows;
+        let receipt = BatchReceipt {
+            table: batch.table.clone(),
+            batch_id: batch.batch_id,
+            bytes: batch.bytes().to_vec(),
+            rows: batch.rows,
+        };
+        let ack = DurableBatchAck {
+            batch_id: receipt.batch_id,
+            rows: receipt.rows,
+        };
         self.received
             .lock()
-            .expect("mock sink poisoned")
-            .push(batch);
-        Ok(rows)
+            .expect("mock sink is not poisoned")
+            .push(receipt);
+        Ok(ack)
     }
 }

@@ -17,6 +17,7 @@ skald-spec = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+wyrd-spec = { workspace = true }
 pyo3 = { workspace = true, optional = true }
 
 [features]

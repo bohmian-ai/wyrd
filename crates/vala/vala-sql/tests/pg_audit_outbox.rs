@@ -1,8 +1,8 @@
 mod pg_tests {
-    //! SQL integration tests for the S3.C5 transactional audit outbox.
+    //! SQL integration tests for the transactional audit outbox.
     //!
-    //! Covers the per-tenant gapless hash chain, the append-only trigger, per-tenant
-    //! isolation of chains and shipping, and the cross-tenant relay claim/ship cycle.
+    //! Covers the per-tenant gapless hash chain, append-only enforcement, tenant
+    //! isolation, and tenant-scoped reads.
     //! Run via `mise run test:sql`.
 
     mod audit_outbox {
@@ -128,73 +128,7 @@ mod pg_tests {
         }
 
         #[tokio::test]
-        async fn shipped_row_is_immutable() {
-            let (fixture, superuser, tenant) = setup().await;
-            append(fixture.app_pool(), tenant, "op.a").await;
-
-            let batch = [0xABu8; 16];
-            let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
-                .await
-                .unwrap();
-            let shipped =
-                vala_sql::queries::audit_outbox::mark_audit_shipped(&mut conn, 1, 1, &batch)
-                    .await
-                    .unwrap();
-            conn.commit().await.unwrap();
-            assert_eq!(shipped, 1);
-
-            let reship = sqlx::query(
-                "UPDATE vala.audit_outbox SET shipped = true
-              WHERE data_tenant_id = $1 AND seq = 1",
-            )
-            .bind(tenant.as_uuid())
-            .execute(&superuser)
-            .await;
-            assert!(reship.is_err(), "an already-shipped row must be immutable");
-        }
-
-        #[tokio::test]
-        async fn per_tenant_chains_and_shipping_are_isolated() {
-            let (fixture, superuser, tenant_a) = setup().await;
-            let tenant_b = DataTenantId::new_v7();
-            fixture
-                .seed_additional_tenant_with_uuid(
-                    tenant_b,
-                    &format!("test-{}", tenant_b.as_uuid().simple()),
-                )
-                .await
-                .unwrap();
-
-            // Each tenant's seq is independent and starts at 1.
-            assert_eq!(append(fixture.app_pool(), tenant_a, "a.1").await, 1);
-            assert_eq!(append(fixture.app_pool(), tenant_a, "a.2").await, 2);
-            assert_eq!(append(fixture.app_pool(), tenant_b, "b.1").await, 1);
-
-            // Marking tenant A shipped must not touch tenant B's rows.
-            let batch_a = [0x0Au8; 16];
-            let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant_a)
-                .await
-                .unwrap();
-            let shipped_a =
-                vala_sql::queries::audit_outbox::mark_audit_shipped(&mut conn, 1, 2, &batch_a)
-                    .await
-                    .unwrap();
-            conn.commit().await.unwrap();
-            assert_eq!(shipped_a, 2, "both tenant-A rows ship");
-
-            let b_unshipped: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM vala.audit_outbox
-              WHERE data_tenant_id = $1 AND NOT shipped",
-            )
-            .bind(tenant_b.as_uuid())
-            .fetch_one(&superuser)
-            .await
-            .unwrap();
-            assert_eq!(b_unshipped, 1, "tenant B is untouched by tenant A shipping");
-        }
-
-        #[tokio::test]
-        async fn relay_claims_across_tenants_then_marks_shipped() {
+        async fn resource_reader_is_tenant_scoped_and_paginates() {
             let (fixture, _superuser, tenant_a) = setup().await;
             let tenant_b = DataTenantId::new_v7();
             fixture
@@ -209,48 +143,125 @@ mod pg_tests {
             append(fixture.app_pool(), tenant_a, "a.2").await;
             append(fixture.app_pool(), tenant_b, "b.1").await;
 
-            // Cross-tenant claim (SECURITY DEFINER) sees every unshipped row.
             let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant_a)
                 .await
                 .unwrap();
-            let claimed = vala_sql::queries::audit_outbox::claim_unshipped_audit(&mut conn, 100)
-                .await
-                .unwrap();
-            conn.commit().await.unwrap();
-            assert_eq!(claimed.len(), 3, "claim spans both tenants");
+            let first = vala_sql::queries::audit_outbox::list_audit_events_for_resource(
+                &mut conn, "ns.tbl", 0, 1,
+            )
+            .await
+            .unwrap();
+            assert_eq!(first.len(), 1);
+            assert_eq!(first[0].seq, 1);
 
-            // Ship per tenant under that tenant's bind.
-            let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant_a)
+            let second = vala_sql::queries::audit_outbox::list_audit_events_for_resource(
+                &mut conn,
+                "ns.tbl",
+                first[0].seq,
+                10,
+            )
+            .await
+            .unwrap();
+            conn.commit().await.unwrap();
+            assert_eq!(second.len(), 1);
+            assert_eq!(second[0].seq, 2);
+            assert_eq!(second[0].resource, "ns.tbl");
+        }
+
+        /// Two-epoch replay suppresses an exact retry and fails a contradiction without mutation.
+        #[tokio::test]
+        async fn replay_two_epoch_batch_fence_suppresses_exact_and_rejects_contradiction() {
+            let (fixture, superuser, tenant) = setup().await;
+            let batch_id = Uuid::now_v7();
+            let audit = event("bifrost.append");
+            let request_id = Uuid::parse_str(audit.request_id.as_str()).expect("request UUID");
+            let canonical = vala_sql::queries::scribe_batch_commits::ScribeBatchCommit {
+                tenant,
+                logical_table_fqn: "bifrost.replay_two_epoch".to_owned(),
+                batch_id,
+                slice_set_digest: [7; 32],
+                slice_count: 1,
+                wal_node_id: Uuid::now_v7(),
+                wal_writer_epoch: 1,
+                wal_shard_id: 3,
+                wal_segment_sequence: 4,
+                wal_lsn_min: 10,
+                wal_lsn_max: 11,
+                request_id,
+            };
+            let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
                 .await
-                .unwrap();
+                .expect("tenant connection");
             assert_eq!(
-                vala_sql::queries::audit_outbox::mark_audit_shipped(&mut conn, 1, 2, &[0x0Au8; 16])
+                vala_sql::queries::scribe_batch_commits::record(&mut conn, &canonical, &audit)
                     .await
-                    .unwrap(),
-                2
+                    .expect("canonical fence"),
+                vala_sql::queries::scribe_batch_commits::ScribeBatchCommitResolution::Committed,
+                "a first observation of a batch identity commits it"
             );
-            conn.commit().await.unwrap();
+            conn.commit().await.expect("commit canonical fence");
 
-            let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant_b)
+            let retry = vala_sql::queries::scribe_batch_commits::ScribeBatchCommit {
+                wal_writer_epoch: 2,
+                wal_segment_sequence: 0,
+                wal_lsn_min: 0,
+                wal_lsn_max: 1,
+                ..canonical.clone()
+            };
+            let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
                 .await
-                .unwrap();
+                .expect("retry connection");
             assert_eq!(
-                vala_sql::queries::audit_outbox::mark_audit_shipped(&mut conn, 1, 1, &[0x0Bu8; 16])
+                vala_sql::queries::scribe_batch_commits::resolve_replay(&mut conn, &retry)
                     .await
-                    .unwrap(),
-                1
+                    .expect("exact retry resolution"),
+                vala_sql::queries::scribe_batch_commits::ScribeBatchReplayResolution::Suppress
             );
-            conn.commit().await.unwrap();
+            // A client re-sending the same rows under a fresh request lands on
+            // new WAL coordinates and a new correlation id. That is the same
+            // batch, so it must be acknowledged as already committed rather
+            // than refused as a contradiction, and it must not audit twice.
+            let resend_audit = event("bifrost.append");
+            let resend = vala_sql::queries::scribe_batch_commits::ScribeBatchCommit {
+                request_id: Uuid::parse_str(resend_audit.request_id.as_str())
+                    .expect("re-sent request UUID"),
+                ..retry.clone()
+            };
+            assert_eq!(
+                vala_sql::queries::scribe_batch_commits::record(&mut conn, &resend, &resend_audit)
+                    .await
+                    .expect("re-sent identical batch resolves"),
+                vala_sql::queries::scribe_batch_commits::ScribeBatchCommitResolution::AlreadyCommitted,
+                "the same rows from a later attempt are already committed, not contradictory"
+            );
 
-            // Nothing left to claim.
-            let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant_a)
-                .await
-                .unwrap();
-            let remaining = vala_sql::queries::audit_outbox::claim_unshipped_audit(&mut conn, 100)
-                .await
-                .unwrap();
-            conn.commit().await.unwrap();
-            assert!(remaining.is_empty(), "all rows shipped");
+            let contradiction = vala_sql::queries::scribe_batch_commits::ScribeBatchCommit {
+                slice_set_digest: [8; 32],
+                ..retry
+            };
+            assert!(
+                vala_sql::queries::scribe_batch_commits::resolve_replay(&mut conn, &contradiction)
+                    .await
+                    .is_err(),
+                "contradictory replay identity must fail closed"
+            );
+            conn.commit().await.expect("commit read-only replay checks");
+
+            let audit_rows: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM vala.audit_outbox WHERE data_tenant_id = $1",
+            )
+            .bind(tenant.as_uuid())
+            .fetch_one(&superuser)
+            .await
+            .expect("audit count");
+            let publication_rows: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM vala.file_list WHERE data_tenant_id = $1")
+                    .bind(tenant.as_uuid())
+                    .fetch_one(&superuser)
+                    .await
+                    .expect("publication count");
+            assert_eq!(audit_rows, 1, "replay resolution must not duplicate audit");
+            assert_eq!(publication_rows, 0, "replay resolution must not publish");
         }
     }
 }

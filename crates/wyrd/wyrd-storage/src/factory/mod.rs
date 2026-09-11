@@ -36,9 +36,13 @@ fn cloud_disabled(backend: &BackendConfig) -> StorageError {
 /// synchronous inside the same future.
 ///
 /// # Errors
-/// Returns a storage error when SDK construction or boot probing fails.
+/// Returns [`StorageError::CryptoProvider`] when another Rustls provider
+/// already owns the process. Other storage errors report backend SDK
+/// construction or boot-probe failures. Cancellation can interrupt a remote
+/// probe without constructing a signer; it makes no durable storage changes.
 #[cfg(feature = "cloud")]
 pub async fn build_signer(backend: &BackendConfig) -> Result<BackendSigner, StorageError> {
+    wyrd_tls::install_crypto_provider()?;
     match backend {
         BackendConfig::Local { root } => {
             Ok(BackendSigner::Local(local::build_signer(root.clone())?))
@@ -62,19 +66,24 @@ pub async fn build_signer(backend: &BackendConfig) -> Result<BackendSigner, Stor
 /// deterministic cloud-capability error.
 ///
 /// # Errors
-/// Returns a storage error when local signer construction fails or a cloud
-/// backend is selected without the `cloud` feature.
+/// Returns [`StorageError::CryptoProvider`] when another Rustls provider
+/// already owns the process, a storage error when local signer construction
+/// fails, or a cloud-capability error when a cloud backend is selected without
+/// the `cloud` feature.
 #[cfg(not(feature = "cloud"))]
 pub fn build_signer(
     backend: &BackendConfig,
 ) -> std::future::Ready<Result<BackendSigner, StorageError>> {
-    let result = match backend {
-        BackendConfig::Local { root } => {
-            local::build_signer(root.clone()).map(BackendSigner::Local)
-        }
-        BackendConfig::S3(_) | BackendConfig::Gcs(_) | BackendConfig::Azure(_) => {
-            Err(cloud_disabled(backend))
-        }
+    let result = match wyrd_tls::install_crypto_provider() {
+        Ok(()) => match backend {
+            BackendConfig::Local { root } => {
+                local::build_signer(root.clone()).map(BackendSigner::Local)
+            }
+            BackendConfig::S3(_) | BackendConfig::Gcs(_) | BackendConfig::Azure(_) => {
+                Err(cloud_disabled(backend))
+            }
+        },
+        Err(error) => Err(StorageError::from(error)),
     };
     std::future::ready(result)
 }
@@ -95,8 +104,11 @@ fn finish_op<B: opendal::Builder>(
 /// Build the opendal `Operator` for the selected backend.
 ///
 /// # Errors
-/// Returns a storage error when operator construction fails.
+/// Returns [`StorageError::CryptoProvider`] when another Rustls provider
+/// already owns the process, or a storage error when operator construction
+/// fails.
 pub fn build_operator(backend: &BackendConfig) -> Result<Operator, StorageError> {
+    wyrd_tls::install_crypto_provider()?;
     match backend {
         BackendConfig::Local { root } => {
             finish_op(local::fs_service(root), StorageBackendKind::Local)

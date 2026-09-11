@@ -1,0 +1,17 @@
+{
+  "name": "@wyrd/sdk-darwin-x64",
+  "version": "0.0.1",
+  "description": "Native napi addon for @wyrd/sdk-darwin-x64.",
+  "license": "MIT",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "main": "./wyrd.darwin-x64.node",
+  "files": [
+    "wyrd.darwin-x64.node",
+    "package.json"
+  ]
+}

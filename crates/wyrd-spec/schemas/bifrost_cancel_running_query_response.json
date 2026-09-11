@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CancelRunningQueryResponse",
+  "description": "Idempotent cancellation result for one active Oracle query.",
+  "type": "object",
+  "required": [
+    "cancellation_started",
+    "request_id"
+  ],
+  "properties": {
+    "cancellation_started": {
+      "description": "Whether this call changed the registry from active to cancelling.",
+      "type": "boolean"
+    },
+    "request_id": {
+      "description": "Request identity selected by the caller.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/RequestId"
+        }
+      ]
+    }
+  },
+  "definitions": {
+    "RequestId": {
+      "description": "Request correlation ID; required to be a UUID v7.",
+      "type": "string"
+    }
+  }
+}

@@ -28,12 +28,13 @@ their pinned cut and never discover unqualified objects by listing storage.
 
 ## Bounded ownership and backpressure
 
-Every queue and resource class is bounded by its natural unit: items, bytes,
-age, slots, open files, fan-out, or deadline. Scribe accounts global, tenant,
-and table admission; active and immutable memory; durable stage; merge scratch;
-claim ownership; and upload lanes separately. Capacity is work-conserving, but
-contention enforces tenant-then-table fairness and prevents over-share owners
-from reacquiring while an admitted competitor waits.
+Every Wyrd admission queue and governed resource class is bounded by its
+natural unit: items, estimated bytes, age, slots, open files, fan-out, or
+deadline. Scribe accounts global, tenant, and table admission; active and
+immutable memory; durable stage; merge scratch; claim ownership; and upload
+lanes separately. Capacity is work-conserving, but contention enforces
+tenant-then-table fairness and prevents over-share owners from reacquiring
+while an admitted competitor waits.
 
 Scribe preserves acknowledged authority under downstream pressure. It rejects
 new work with a typed retryable response before WAL, stage, scratch, or object
@@ -41,26 +42,39 @@ storage exhausts. Shutdown closes admission, rotates active work, stages
 immutable members, closes residue claims, and drains admitted publication up
 to one absolute deadline; unsettled work retains exact replay evidence.
 
-Oracle admits interactive and analytical slots separately under one atomic
-total bound. Each query owns its runtime, one aggregate memory pool shared by
-operators and exchanges, spill allocation, bounded Wyrd-owned admission queues
-and graph controls, cancellation tree, and deadline. Dependency-owned exchange
+Oracle derives Interactive or Analytical from the one physical root returned by
+the pinned planner, then admits their slots separately under one atomic total
+bound derived from this pod's own CPU and memory. Each query owns its runtime, a
+private ceiling view over the one process-wide memory root shared by every
+operator, exchange, leader, and selected worker, spill allocation, bounded
+Wyrd-owned admission queues and graph controls, cancellation tree, and deadline.
+Tenant slot caps schedule that local capacity fairly; they are not cluster-wide
+quotas, and no Oracle control claims a cluster-wide capacity guarantee. Dependency-owned exchange
 queues retain their pinned byte backpressure without a Wyrd item-count
 guarantee. Admission refusal never mutates the root grant. Cancellation releases
 every descendant reservation and temporary file.
 
-Forge leases resources per tenant/table/task/attempt. Physical writers may run
-concurrently within an attempt, but one fence owns final catalog publication.
-Resource pressure defers or refuses a task; it never silently reduces file
-size, row-group geometry, selection scope, or correctness.
+Forge plans before memory admission, estimates each real compaction plan, and
+queues it in a strict pod-local FIFO. Only running plan estimates count against
+the pod's aggregate memory and parallelism budgets. Waiting plans consume only
+the bounded pending-queue parallelism budget; they do not reserve running
+memory or parallelism and cannot bypass the head. The estimate is not a hard
+DataFusion ceiling, so pod OOM remains possible and is recovered through
+durable task, lease, and fence state. Physical writers and sibling plan
+publications may run concurrently under one task attempt's lease and fence;
+each plan owns an independent catalog compare-and-swap operation. Pressure
+defers or refuses work without changing file size, row-group geometry,
+selection scope, or correctness.
 
 ## Cross-system commit and recovery
 
 Postgres and object storage do not share a transaction. Every external effect
 uses deterministic identity plus explicit prepared, terminal, and uncertain
-evidence. Catalog publication uses compare-and-swap/`commit_once`; timeout or
-transport loss reconciles by operation identity before a new attempt begins.
-Never report success merely because output objects exist.
+evidence. Each Forge plan publishes through its own
+compare-and-swap/`commit_once`; definite conflicts use the bounded per-plan
+retry schedule, and any successful sibling makes the task successful while
+unfinished work remains replannable debt. Timeout or transport loss reconciles
+by operation identity and is never inferred from output objects alone.
 
 Startup restores in dependency order: WAL, staged manifests and checksums,
 live-tail registry, deterministic claims, pending uploads/publications,
@@ -97,15 +111,25 @@ Measure at minimum:
 
 - admission refusal by resource category; active owners; queue depth and age;
 - WAL append/fsync/fence latency, bytes, replay, and retirement lag;
-- active, immutable, staged, scratch, claim, upload, and spill ownership;
+- active, immutable, staged, Scribe scratch, claim, upload, and Oracle spill
+  ownership;
 - staged dwell, merge fan-in/passes, row groups, hot-object PUT amplification,
   `file_list` publication, reconciliation, and live-tail source counts;
-- Oracle route, slot wait, planning, pruning, exchange bytes, worker fan-out,
+- Oracle local slot and scratch occupancy, aggregate governed memory use,
+  memory refusal, and measured infallible headroom;
+- Oracle route, slot wait, planning, pruning, exchange bytes, selected worker
+  count, worker fan-out,
   terminal peer failure, cancellation, TTFF, terminal latency, and incomplete
   streams;
-- Forge promotion debt, rewrite debt, task/lease age, writer estimates and close
-  reasons, commit conflicts, uncertain operations, no-progress refusals,
-  snapshot age, cleanup cursor, and orphan backlog;
+- Forge promotion debt, rewrite debt, local FIFO age, estimated and observed
+  plan memory, running parallelism, worker loss, attempts, failure class,
+  accepted-delete rate, writer estimates and close reasons, commit conflicts,
+  uncertain operations, no-progress refusals, snapshot age, role readiness,
+  and the durable cleanup cursor. Orphan cleanup is measured this way — by its
+  own queue age, attempts, failures, and physically deleted objects — and not
+  by an orphan-backlog gauge: that number is only knowable by a full storage
+  scan that is stale on completion, is not comparable between partial scans,
+  and is not safely aggregatable across replicas;
 - catalog refresh age and object-store latency/error/throughput.
 
 Metrics use stable bounded labels. Tenant, table, batch, task, attempt, path,

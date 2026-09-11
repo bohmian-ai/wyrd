@@ -6,8 +6,8 @@
 
 use crate::env_parse::{parse_bool_optional, parse_clamped_i64, parse_u64_optional};
 use crate::error::StorageError;
-use crate::{StorageHandle, tenant_path};
-use sqlx::PgPool;
+use crate::service::{StorageCaller, StoragePrincipalKind, StorageSubject};
+use crate::{StorageHandle, audit, tenant_path};
 use sqlx::pool::PoolConnection;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -15,7 +15,10 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
+use wyrd_spec::request_id::RequestId;
 use wyrd_spec::storage::{StorageBackendKind, WireProtocol};
+use wyrd_sql::{OperatorPool, WyrdPostgres};
 
 /// Session-level Postgres advisory lock key for sweeper leadership.
 pub const SWEEPER_LEADER_LOCK_KEY: i64 = 0x5759_7264_5374_6f72_i64;
@@ -81,26 +84,42 @@ impl Default for SweeperConfig {
     }
 }
 
-/// Background storage sweeper.
+/// Coordinates cross-tenant storage discovery with tenant-scoped reclamation.
+///
+/// Operator SQL discovers expired work and owns leader election. Each selected
+/// row is then mutated and audited through a tenant transaction opened by the
+/// Wyrd Postgres handle, preserving the app-role RLS and audit boundary.
 pub struct Sweeper {
+    /// Storage backend used to abort abandoned provider-side uploads.
     handle: Arc<StorageHandle>,
-    admin_pool: PgPool,
+    /// Cross-tenant capability used for leader election and expired-row discovery.
+    operator_pool: OperatorPool,
+    /// App-role handle used to open tenant transactions for mutation and audit.
+    postgres: WyrdPostgres,
+    /// Bounded scheduling and batch configuration for each cleanup pass.
     cfg: SweeperConfig,
+    /// Cooperative cancellation signal for the background loop.
     shutdown: CancellationToken,
 }
 
 impl Sweeper {
-    /// Build a sweeper from already-constructed process state.
+    /// Build a sweeper from typed storage, operator, and tenant SQL capabilities.
+    ///
+    /// The operator and Wyrd Postgres handles must address the same database.
+    /// Server boot and `PgFixture` preserve that invariant by deriving both
+    /// from one resolved DSN set.
     #[must_use]
     pub fn new(
         handle: Arc<StorageHandle>,
-        admin_pool: PgPool,
+        operator_pool: OperatorPool,
+        postgres: WyrdPostgres,
         cfg: SweeperConfig,
         shutdown: CancellationToken,
     ) -> Self {
         Self {
             handle,
-            admin_pool,
+            operator_pool,
+            postgres,
             cfg,
             shutdown,
         }
@@ -163,7 +182,8 @@ impl Sweeper {
         &self,
     ) -> Result<Option<PoolConnection<sqlx::Postgres>>, StorageError> {
         let mut conn = self
-            .admin_pool
+            .operator_pool
+            .pool()
             .acquire()
             .await
             .map_err(|source| StorageError::AdminPool { source })?;
@@ -182,9 +202,16 @@ impl Sweeper {
         }
     }
 
+    /// Discover and reclaim one bounded batch of expired uploads.
+    ///
+    /// Individual reclamation failures are logged and do not prevent later rows
+    /// in the same batch from being attempted.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] when cross-tenant batch discovery fails.
     async fn sweep_expired_uploads_batch(&self) -> Result<(), StorageError> {
         let rows = wyrd_sql::queries::storage::admin::multipart_uploads::expired_uploads_batch(
-            &self.admin_pool,
+            self.operator_pool.pool(),
             self.cfg.batch_size,
         )
         .await?;
@@ -215,9 +242,12 @@ impl Sweeper {
         Ok(())
     }
 
+    /// Reap one bounded batch of expired idempotency rows.
+    ///
+    /// Cleanup is best effort: SQL failures are logged so a later tick can retry.
     async fn reap_expired_idempotency_keys(&self) {
         match wyrd_sql::queries::storage::admin::idempotency::reap_idempotency_keys(
-            &self.admin_pool,
+            self.operator_pool.pool(),
             self.cfg.idempotency_batch_size,
         )
         .await
@@ -233,6 +263,15 @@ impl Sweeper {
         }
     }
 
+    /// Abort one expired upload and atomically record its tenant audit outcome.
+    ///
+    /// Backend abort happens before the tenant transaction. If the database
+    /// mutation or audit fails, a later tick may retry the idempotent backend
+    /// abort and the still-live control row.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] when tenant validation, backend abort, tenant
+    /// transaction acquisition, status mutation, audit append, or commit fails.
     async fn abort_one(
         &self,
         row: &wyrd_sql::queries::storage::admin::multipart_uploads::ExpiredUpload,
@@ -300,9 +339,15 @@ impl Sweeper {
             }
         };
 
+        let conn = self
+            .postgres
+            .tenant_conn(data_tenant_id)
+            .await
+            .map_err(StorageError::Sql)?;
+        let mut conn = conn;
         let rows_updated =
             wyrd_sql::queries::storage::admin::multipart_uploads::mark_aborted_admin(
-                &self.admin_pool,
+                &mut conn,
                 row.id,
                 "sweeper-ttl-expired",
             )
@@ -316,41 +361,43 @@ impl Sweeper {
             return Ok(());
         }
 
-        self.audit_abort(data_tenant_id, row, backend, status_code, error_code)
-            .await
+        commit_reclamation(conn, data_tenant_id, row, backend, status_code, error_code).await
     }
+}
 
-    async fn audit_abort(
-        &self,
-        data_tenant_id: DataTenantId,
-        row: &wyrd_sql::queries::storage::admin::multipart_uploads::ExpiredUpload,
-        backend: StorageBackendKind,
-        status_code: i32,
-        error_code: Option<&str>,
-    ) -> Result<(), StorageError> {
-        let mut conn = wyrd_sql::TenantConn::acquire(&self.admin_pool, data_tenant_id)
-            .await
-            .map_err(StorageError::Sql)?;
-        let request_id = format!("storage-sweeper-{}", row.id);
-
-        wyrd_sql::queries::platform::audit_log::write_storage_event(
-            &mut conn,
-            wyrd_sql::queries::platform::audit_log::StorageAuditEvent {
-                subject_id: "storage-sweeper",
-                operation: "sweeper_abort",
-                storage_path: row.storage_path.as_str(),
-                status_code,
-                error_code,
-                request_id: request_id.as_str(),
-                backend,
-                upload_id: Some(row.id),
-            },
-        )
-        .await?;
-        conn.commit().await?;
-
-        Ok(())
-    }
+async fn commit_reclamation(
+    mut conn: wyrd_sql::TenantConn<'_>,
+    data_tenant_id: DataTenantId,
+    row: &wyrd_sql::queries::storage::admin::multipart_uploads::ExpiredUpload,
+    backend: StorageBackendKind,
+    status_code: i32,
+    error_code: Option<&str>,
+) -> Result<(), StorageError> {
+    let caller = StorageCaller {
+        data_tenant_id,
+        subject: StorageSubject {
+            principal_id: PLATFORM_AUDIT_PRINCIPAL.as_uuid(),
+            kind: StoragePrincipalKind::Service,
+        },
+        request_id: RequestId::now_v7(),
+    };
+    audit::write(
+        &mut conn,
+        &caller,
+        audit::UploadAuditOperation::Reclaimed,
+        Some(row.id),
+        &row.storage_path,
+        backend,
+        status_code,
+        error_code,
+    )
+    .await
+    .map_err(|error| StorageError::Backend {
+        backend,
+        op: "audit_reclaimed",
+        message: error.to_string(),
+    })?;
+    conn.commit().await.map_err(StorageError::Sql)
 }
 
 fn classify_error(error: &StorageError) -> &'static str {

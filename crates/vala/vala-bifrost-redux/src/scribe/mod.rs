@@ -1,74 +1,1272 @@
 //! Scribe implementation — WAL append, fsync, replay, and memtable (/).
 
+pub mod admission;
+pub mod assembly;
 pub mod audit_envelope;
+pub mod claim_assembly;
+pub mod claim_merge;
+pub mod claim_publication;
+pub mod contention;
+pub mod execution_lanes;
 pub mod file_list_writer;
 pub mod filename;
+mod fixed_ipc;
+pub mod geometry;
+pub mod hot_source;
+pub mod hot_stage;
+mod ingress;
 pub mod manifest;
+mod material_plan;
+pub mod member_stager;
+pub mod memory;
 pub mod memtable;
 pub mod parquet_writer;
+pub mod persistence;
+pub mod preprocess;
+pub mod promotion;
 pub mod registry;
 pub mod replay;
-pub mod seal;
+pub mod routing;
 pub mod seal_key;
+pub mod shards;
+pub(crate) mod staged_tail;
+pub(crate) mod staging;
+pub mod staging_runtime;
 pub mod stream_identity;
 pub mod tail_rpc;
+pub mod telemetry;
 pub mod wal;
+mod write_recipe;
 
-use arrow::array::Array;
-use arrow::compute::take;
-use arrow::ipc::writer::StreamWriter;
-use arrow::record_batch::RecordBatch;
+#[cfg(test)]
+#[path = "tests/pg_scribe_crash_injection.rs"]
+mod pg_scribe_crash_injection;
+#[cfg(test)]
+#[path = "tests/pg_scribe_restart.rs"]
+mod pg_scribe_restart;
+#[cfg(test)]
+#[path = "tests/scribe_persistence_path.rs"]
+mod scribe_persistence_path;
+#[cfg(test)]
+#[path = "tests/time_partition.rs"]
+mod tests;
+#[cfg(test)]
+#[path = "tests/wal_closeout.rs"]
+mod wal_closeout;
+use crate::catalog::BifrostCatalog;
+use crate::contracts::{FrameAdmission, Scribe, ScribeError, ScribeIngressFrame};
+use crate::maintenance::StagingFilePublisher;
+use crate::scribe::admission::{AdmissionConfig, AdmissionController};
+pub use crate::scribe::execution_lanes::{
+    ScribeIngressCpuPool, ScribePersistenceCpuPool, ScribeWalIoPool,
+};
+pub use crate::scribe::memory::ScribeRejectionCeiling;
+pub use crate::scribe::memtable::SealTriggerReason;
+pub use crate::scribe::persistence::ScribePersistenceConfig;
+use crate::scribe::seal_key::SealKey;
+use crate::scribe::tail_rpc::FetchLiveTailService;
+pub use crate::scribe::tail_rpc::{
+    LocalTailReadTransport, ScribeTailReader, TailFenceConfig, TailReadTransport,
+    TonicTailReadTransport,
+};
+
+/// Derives the largest replayable Scribe envelope admitted by configured limits.
+///
+/// Server boot compares this intrinsic requirement with the detected root
+/// capability before accepting traffic or starting WAL replay.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::DecodedPayloadTooLarge`] when configured bound
+/// arithmetic cannot be represented on this platform.
+pub fn configured_maximum_envelope_bytes(
+    limits: crate::gate::limits::IngestLimits,
+) -> Result<usize, ScribeError> {
+    material_plan::configured_maximum_envelope_bytes(limits)
+}
+use crate::scribe::telemetry::{
+    ScribeBucketMemorySnapshot, ScribeIngressLifecycle, ScribeInspectionSnapshot,
+    ScribeRuntimeSnapshot,
+};
 use async_trait::async_trait;
-use std::collections::HashMap;
+#[cfg(any(test, feature = "test-support"))]
+use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+use num_traits::ToPrimitive;
 use std::sync::Arc;
-use vala_sql::TenantConn;
-use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+use tokio::runtime::Handle;
 
-use crate::contracts::{Scribe, ScribeAppend, ScribeError};
-use crate::scribe::memtable::Memtable;
-use crate::scribe::seal_key::{EventDay, SealKey};
+/// Awaits one already-signalled Scribe cleanup phase within the caller deadline.
+///
+/// The phase is never polled after deadline expiry. Cancellation drops only
+/// the graceful wait; concrete owners retain their task handles for the
+/// unconditional abort finalizer in [`ScribeImpl::shutdown`].
+async fn await_shutdown_phase<T>(
+    deadline: std::time::Instant,
+    phase: impl std::future::Future<Output = T>,
+) -> bool {
+    timed_shutdown_phase(deadline, phase).await.is_some()
+}
+
+/// Runs one bounded shutdown phase and returns what it produced, if anything.
+///
+/// `None` means the phase did not finish before the caller's deadline, either
+/// because the deadline had already passed or because the phase timed out. A
+/// phase whose own outcome decides whether shutdown stays graceful uses this
+/// directly; phases that only need to complete use
+/// [`await_shutdown_phase`].
+async fn timed_shutdown_phase<T>(
+    deadline: std::time::Instant,
+    phase: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    if tokio::time::Instant::now() >= tokio::time::Instant::from_std(deadline) {
+        return None;
+    }
+    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), phase)
+        .await
+        .ok()
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Proves a stalled Scribe phase returns exactly at the caller-owned deadline.
+    #[tokio::test]
+    async fn stalled_shutdown_phase_obeys_caller_deadline() {
+        let deadline = std::time::Instant::now() + Duration::from_millis(10);
+        let completed = await_shutdown_phase(deadline, std::future::pending::<()>()).await;
+
+        assert!(!completed);
+        assert!(std::time::Instant::now() >= deadline);
+    }
+
+    /// Proves an expired budget skips a later Scribe phase without polling it.
+    #[tokio::test]
+    async fn expired_shutdown_phase_is_not_polled() {
+        let polled = Arc::new(AtomicBool::new(false));
+        let probe = Arc::clone(&polled);
+        let completed = await_shutdown_phase(std::time::Instant::now(), async move {
+            probe.store(true, Ordering::Release);
+        })
+        .await;
+
+        assert!(!completed);
+        assert!(!polled.load(Ordering::Acquire));
+    }
+}
+
+/// Build a test-tier `DataFusion` pool with an explicit bounded ceiling.
+#[cfg(any(test, feature = "test-support"))]
+#[must_use]
+pub fn constrained_datafusion_memory_pool(limit_bytes: usize) -> Arc<dyn MemoryPool> {
+    Arc::new(GreedyMemoryPool::new(limit_bytes.max(1)))
+}
 
 /// Memtable key for per-bucket row-count inspection.
 ///
 /// Type alias for [`SealKey`] — memtable buckets are keyed by
-/// (`tenant`, `table`, `event_day`).
+/// (`tenant`, `table`, `time_partition`).
 pub type MemtableKey = SealKey;
-use crate::scribe::wal::ScribeAppendMeta;
 
-/// Scribe implementation with WAL append, fsync, replay, memtable, and seal ().
+/// The three concrete execution lanes owned by the Bifrost server boot path.
 ///
-/// `append` splits the batch by event day, writes paired (audit, data) WAL records,
-/// fsyncs, and forwards to the memtable. Seal predicate triggers freeze at first-of:
-/// 50k rows | 1s | 128 MiB | 5s inactivity. Seal state machine executes:
-/// Freeze → Parquet → PUT → PG tx (`file_list` + audit) → manifest → retire WAL.
-#[derive(Debug)]
-pub struct ScribeImpl {
-    /// In-memory memtable keyed by seal-key.
-    memtable: Arc<Memtable>,
-    /// Opendal operator for object store (shared across seal drivers).
+/// Scribe accepts this value but never constructs or sizes a lane itself. The
+/// concrete types keep the lane boundary narrow and preserve the distinct
+/// worker pools required by the write lifecycle.
+#[derive(Debug, Clone)]
+pub struct ScribeExecutionPools {
+    ingress_cpu: ScribeIngressCpuPool,
+    persistence_cpu: ScribePersistenceCpuPool,
+    wal_io: ScribeWalIoPool,
+}
+
+impl ScribeExecutionPools {
+    /// Assemble the server-owned execution lanes for one Scribe instance.
+    #[must_use]
+    pub fn new(
+        ingress_cpu: ScribeIngressCpuPool,
+        persistence_cpu: ScribePersistenceCpuPool,
+        wal_io: ScribeWalIoPool,
+    ) -> Self {
+        Self {
+            ingress_cpu,
+            persistence_cpu,
+            wal_io,
+        }
+    }
+}
+
+/// Explicit boot-time execution-lane provisioning for Scribe.
+#[derive(Debug, Clone, Copy)]
+pub struct ScribeLaneConfig {
+    /// Rayon workers reserved for pre-ACK decode, validation, and projection.
+    pub ingress_cpu_threads: usize,
+    /// Rayon workers reserved for persistence splitting and serialization.
+    pub persistence_cpu_threads: usize,
+    /// Rayon workers reserved for WAL filesystem operations.
+    pub wal_io_threads: usize,
+}
+
+impl Default for ScribeLaneConfig {
+    fn default() -> Self {
+        Self::resolved()
+    }
+}
+
+impl ScribeLaneConfig {
+    /// Resolve the boot defaults from the host's available parallelism.
+    #[must_use]
+    pub fn resolved() -> Self {
+        let available = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+        let cpu_budget = available.saturating_sub(2).max(2);
+        let ingress_cpu_threads = (cpu_budget / 3).max(1);
+        Self {
+            ingress_cpu_threads,
+            persistence_cpu_threads: cpu_budget.saturating_sub(ingress_cpu_threads).max(1),
+            wal_io_threads: 4,
+        }
+    }
+}
+
+/// Scribe implementation with bounded admission, fixed shards, WAL, memtable, and seal.
+///
+/// `append` decodes and prepares a complete request on the bounded CPU lanes,
+/// then admits one owned prepared packet to a fixed shard queue. The shard
+/// owner performs WAL writes, memtable insertion, and `sync_data` in order.
+/// Rotation is a consumer-owned state swap; immutable generations are handed
+/// to the bounded persistence runtime.
+/// Owners the persistence runtime borrows from the Scribe build.
+///
+/// Exists so the persistence context can be assembled in one named place
+/// instead of inline in the middle of the build; it holds no state of its own.
+struct PersistenceDependencies {
+    /// Object-store operator shared by persistence workers.
     operator: Arc<opendal::Operator>,
+    /// WAL writer used for manifest location and recovery identity.
+    wal: Arc<wal::WalWriter>,
+    /// Bounded CPU lane used to encode and merge.
+    persistence_cpu: crate::scribe::execution_lanes::ScribePersistenceCpuPool,
+    /// Bounded WAL lane used to advance manifests.
+    wal_io: crate::scribe::execution_lanes::ScribeWalIoPool,
+    /// Typed pod stream identity authorizing publication.
+    stream: stream_identity::StreamIdentity,
+    /// Scribe child budget used for per-job workspace reservations.
+    memory: crate::resources::ScribeResources,
+    /// Optional local wake-up publisher used after confirmed commits.
+    staging_file_publisher: Option<crate::maintenance::StagingFilePublisher>,
+    /// Validated geometry fixing the hot-object target and member dwell.
+    geometry: geometry::ScribeGeometry,
+    /// Pod-wide registry the staging runtime moves generation authority in.
+    hot_sources: Arc<hot_source::ScribeHotSourceRegistry>,
+    /// Pod-wide observation owner the staged and claim lifecycle publishes to.
+    telemetry: Arc<telemetry::ScribeTelemetry>,
+}
+
+pub struct ScribeImpl {
+    /// Catalog owner used to validate and resolve logical transport frames.
+    catalog: Option<Arc<crate::catalog::BifrostCatalog>>,
     /// WAL writer for durable append fsync.
     wal: Arc<wal::WalWriter>,
     /// Pod identity (`node_id`, `writer_epoch`).
     node_id: String,
+    /// Typed actor stream retained for source-filtered startup recovery.
+    stream: stream_identity::StreamIdentity,
     writer_epoch: i64,
+    /// Pod-global request and shard admission counters.
+    admission: AdmissionController,
+    /// Scribe-only child capability over the pod-global Bifrost governor.
+    memory: crate::resources::ScribeResources,
+    /// Immutable boot-selected ingest ceilings shared with Gate.
+    ingest_limits: crate::gate::limits::IngestLimits,
+    /// Pod-wide record of where every live generation's rows are readable.
+    ///
+    /// One registry is shared by the shard memtables that register generations,
+    /// the staging runtime that moves them to durable runs and then to
+    /// published objects, and the live-tail service that resolves which staged
+    /// members still serve rows.
+    hot_sources: Arc<hot_source::ScribeHotSourceRegistry>,
+    /// Runtime pressure and lifecycle thresholds (D83 watermarks and max age).
+    ///
+    /// Shared by the admission path and the periodic age scanner so the
+    /// flush-first hysteresis is defined once.
+    pressure_config: ScribePressureConfig,
+    /// Validated geometry this Scribe booted with.
+    ///
+    /// The shard owners and the persistence runtime each received their own copy
+    /// of this value at start and enforce it from there, so nothing in the
+    /// serving path reads it back. It is retained only so a scaled production
+    /// test can assert through [`Self::geometry_for_test`] that the geometry it
+    /// configured is the one the pod actually booted with, and is therefore
+    /// compiled out of a production build.
+    #[cfg(any(test, feature = "test-support"))]
+    geometry: geometry::ScribeGeometry,
+    /// Shared active/immutable Arrow ownership ledger.
+    memory_ownership: memory::ScribeOwnership,
+    /// Bounded persistence CPU lane retained for replay and seal preparation.
+    persistence_cpu: ScribePersistenceCpuPool,
+    /// Bounded WAL IO lane retained for recovery and writer execution.
+    wal_io: ScribeWalIoPool,
+    /// Bounded Rayon lane for pre-ACK native decode and projection work.
+    ingress_cpu: ScribeIngressCpuPool,
+    /// Fixed sixteen-lane shard owners for the live ingest path.
+    shards: Arc<shards::ScribeShardRuntime>,
+    /// Fixed-size lifecycle ledger shared by move-only ingress root owners.
+    ingress_lifecycle: Arc<ScribeIngressLifecycle>,
+    /// Lifecycle gate closed before shard draining begins.
+    closed: AtomicBool,
+    /// Coordinates the recoverable running/draining/finalizing/stopped lifecycle.
+    shutdown_state: std::sync::atomic::AtomicU8,
+    /// Wakes callers waiting for the shutdown owner to finish.
+    shutdown_notify: tokio::sync::Notify,
+    /// Wakes test-tier observers after the owner enters draining.
+    #[cfg(any(test, feature = "test-support"))]
+    shutdown_draining_notify: tokio::sync::Notify,
+    /// False while startup WAL recovery is active or has failed.
+    recovery_ready: AtomicBool,
+    /// Cooperative V1 recovery cancellation observed between WAL records and phases.
+    recovery_cancelled: Arc<AtomicBool>,
+    /// Optional server-provisioned immutable persistence runtime.
+    persistence: Option<Arc<persistence::PersistenceRuntime>>,
+    #[cfg(any(test, feature = "test-support"))]
+    ingest_stall: Arc<std::sync::Mutex<Option<Arc<IngestStall>>>>,
+    /// Optional decoded-request ceiling used only by bounded regression tests;
+    /// zero selects the production active-bucket target.
+    #[cfg(any(test, feature = "test-support"))]
+    decoded_request_limit_for_test: AtomicUsize,
+}
+
+/// Scribe is accepting work and no shutdown owner exists.
+const SHUTDOWN_RUNNING: u8 = 0;
+/// One graceful owner is draining accepted work and remains recoverable on drop.
+const SHUTDOWN_DRAINING: u8 = 1;
+/// One synchronous finalizer owns closure of every retained worker.
+const SHUTDOWN_FINALIZING: u8 = 2;
+/// Every retained Scribe owner has been closed or aborted.
+const SHUTDOWN_STOPPED: u8 = 3;
+
+/// Cancellation finalizer for the caller-owned graceful shutdown future.
+struct ShutdownCancellationFinalizer<'a> {
+    /// Scribe whose draining state must never be stranded by cancellation.
+    scribe: &'a ScribeImpl,
+    /// False only after graceful shutdown or a competing finalizer completes.
+    armed: bool,
+}
+
+impl ShutdownCancellationFinalizer<'_> {
+    /// Disarm the guard after the Scribe reaches its stopped state.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ShutdownCancellationFinalizer<'_> {
+    /// Recover an interrupted graceful drain through the synchronous abort path.
+    fn drop(&mut self) {
+        if self.armed {
+            self.scribe.abort_shutdown();
+        }
+    }
+}
+
+/// Deterministic test-tier barrier held at the public Scribe ingest seam.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Default)]
+pub struct IngestStall {
+    /// Records that one public write reached the barrier.
+    ///
+    /// The flag is the durable edge; [`IngestStall::entered_notify`] only wakes
+    /// a waiter that was already parked. Both are required because the write
+    /// runs on its own task and may reach the barrier before the asserting task
+    /// first polls [`IngestStall::wait_entered`].
+    entered: AtomicBool,
+    /// Wakes a parked waiter after a public write reaches the barrier.
+    entered_notify: tokio::sync::Notify,
+    /// Signals a waiting write to continue when the test releases it.
+    release: tokio::sync::Notify,
+    /// Records that the stalled write future released its Scribe owner.
+    completed: AtomicBool,
+    /// Wakes lifecycle assertions after normal release or cancellation.
+    completed_notify: tokio::sync::Notify,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl IngestStall {
+    /// Wait until one public write is blocked at this barrier.
+    ///
+    /// The waiter is registered before the flag is observed.
+    /// [`tokio::sync::Notify::notify_waiters`] wakes only already-registered
+    /// waiters, and a `Notified` future does not register until it is first
+    /// polled, so observing the flag first would lose the edge published by a
+    /// write that reaches the barrier in between and park this caller forever.
+    pub async fn wait_entered(&self) {
+        Self::wait_for_edge(&self.entered, &self.entered_notify).await;
+    }
+
+    /// Release a blocked public write without changing its outcome.
+    pub fn release(&self) {
+        self.release.notify_waiters();
+    }
+
+    /// Wait until the stalled write future releases its Scribe owner.
+    ///
+    /// Cancelling the returned future abandons the observation only; the
+    /// published edge stays latched, so a later caller still observes it.
+    pub async fn wait_completed(&self) {
+        Self::wait_for_edge(&self.completed, &self.completed_notify).await;
+    }
+
+    /// Publish the exact entry edge owned by the stalled write future.
+    fn enter(&self) {
+        self.entered.store(true, Ordering::Release);
+        self.entered_notify.notify_waiters();
+    }
+
+    /// Publish the exact completion edge owned by the stalled write future.
+    fn complete(&self) {
+        self.completed.store(true, Ordering::Release);
+        self.completed_notify.notify_waiters();
+    }
+
+    /// Await one latched barrier edge without losing a concurrent publication.
+    ///
+    /// Registers the waiter, then re-checks the flag, so an edge published
+    /// between the previous check and this registration is still observed.
+    async fn wait_for_edge(flag: &AtomicBool, notify: &tokio::sync::Notify) {
+        loop {
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if flag.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// Drop guard that publishes release of one stalled public write owner.
+#[cfg(any(test, feature = "test-support"))]
+struct IngestStallCompletion<'a>(&'a IngestStall);
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for IngestStallCompletion<'_> {
+    /// Publish completion whether the write resumes or its transport is cancelled.
+    fn drop(&mut self) {
+        self.0.complete();
+    }
+}
+
+/// Runtime-tunable Scribe pressure and lifecycle thresholds (D83).
+///
+/// This carrier owns the three knobs that govern the flush-first response to
+/// ingress memory pressure: the ingress-occupancy high-water mark that triggers
+/// a coordinated pressure seal, the low-water mark that seal drains toward, and
+/// the active-generation max age that bounds trickle-workload visibility. It is
+/// owned by the Scribe runtime and constructed beside the other Scribe build
+/// config; the D83 defaults are production-ready with no config file required.
+///
+/// The `low_water < high_water` hysteresis invariant is enforced at
+/// construction ([`ScribePressureConfig::new`] / [`ScribePressureConfig::default`]),
+/// so an invalid config can never invert the watermark decision.
+///
+/// The field names and their D83 defaults are a normative interface: T40
+/// (18-H2) reads them to set the watermark gauges and the seal-trigger labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScribePressureConfig {
+    /// Ingress occupancy fraction (percent of `ingress_limit_bytes`) at or
+    /// above which a coordinated pressure seal is triggered. Default 75.
+    pub ingress_high_water_percent: usize,
+    /// Ingress occupancy fraction (percent of `ingress_limit_bytes`) that
+    /// pressure sealing drains toward. Default 50. Must be < high-water.
+    pub ingress_low_water_percent: usize,
+    /// Maximum age of an active generation before age-based sealing.
+    /// Default 600 s.
+    pub seal_max_age: Duration,
+}
+
+impl ScribePressureConfig {
+    /// Construct a pressure config, clamping the low-water mark strictly below
+    /// the high-water mark to preserve the hysteresis invariant.
+    ///
+    /// A caller-supplied `ingress_low_water_percent` at or above
+    /// `ingress_high_water_percent` is clamped to `high_water - 1` (and a
+    /// zero high-water is treated as low-water `0`), so the returned config can
+    /// never invert the seal decision. `seal_max_age` is stored verbatim.
+    #[must_use]
+    pub fn new(
+        ingress_high_water_percent: usize,
+        ingress_low_water_percent: usize,
+        seal_max_age: Duration,
+    ) -> Self {
+        let ingress_low_water_percent = if ingress_low_water_percent >= ingress_high_water_percent {
+            ingress_high_water_percent.saturating_sub(1)
+        } else {
+            ingress_low_water_percent
+        };
+        Self {
+            ingress_high_water_percent,
+            ingress_low_water_percent,
+            seal_max_age,
+        }
+    }
+}
+
+impl Default for ScribePressureConfig {
+    /// The rotation defaults: 75% high-water, 50% low-water, 600 s max age.
+    fn default() -> Self {
+        Self::new(75, 50, Duration::from_mins(10))
+    }
+}
+
+/// Complete server-provisioned dependencies used to construct one Scribe graph.
+///
+/// The execution lanes and coordination runtime are supplied by the embedding
+/// server so Scribe does not create an unbounded runtime or hide resource
+/// sizing inside a durable data-plane component.
+pub struct ScribeBuildConfig {
+    /// Catalog owner used by Scribe before physical binding or projection.
+    pub catalog: Option<Arc<crate::catalog::BifrostCatalog>>,
+    /// Object-store operator used by the persistence runtime.
+    pub operator: Arc<opendal::Operator>,
+    /// WAL writer used by every fixed shard and persistence worker.
+    pub wal: Arc<wal::WalWriter>,
+    /// Validated node/epoch identity shared by all child owners.
+    pub stream: stream_identity::StreamIdentity,
+    /// Admission bounds for in-flight frames and active memory.
+    pub admission: AdmissionConfig,
+    /// Runtime used for Scribe coordination tasks.
+    pub coordination_runtime: Handle,
+    /// Server-provisioned CPU and WAL execution pools.
+    pub execution_pools: ScribeExecutionPools,
+    /// Optional server-provisioned immutable persistence dependencies.
+    pub persistence: Option<ScribePersistenceConfig>,
+    /// Scribe child budget provisioned by server boot.
+    pub resources: crate::resources::ScribeResources,
+    /// Immutable boot-selected ingest ceilings shared with Gate.
+    pub ingest_limits: crate::gate::limits::IngestLimits,
+    /// Validated independent geometry every rotation limit derives from.
+    ///
+    /// Scribe takes the whole checked value object rather than three loose
+    /// numbers so a caller cannot pass a WAL target that disagrees with the
+    /// generation limit the same boot installed.
+    pub geometry: geometry::ScribeGeometry,
+    /// Optional bounded local wake-up publisher for committed staging files.
+    pub staging_file_publisher: Option<StagingFilePublisher>,
+}
+
+/// Test-support input for exercising the private native transport seam.
+///
+/// This DTO exists only under `test-support`; production callers cannot bypass
+/// Gate to construct a `ScribeIngressFrame`.
+#[cfg(feature = "test-support")]
+pub struct NativeIngressTestFrame {
+    /// Server-verified principal used by the fixture.
+    pub principal: wyrd_runtime::principal::Principal,
+    /// Requested logical table preserved through the private seam.
+    pub table: crate::catalog::TableRef,
+    /// Expected logical source-schema fingerprint for the native IPC stream.
+    pub expected_schema_fingerprint: crate::schema::fingerprint::SchemaFingerprint,
+    /// Stable request correlation identifier.
+    pub request_id: wyrd_spec::request_id::RequestId,
+    /// Stable idempotency identifier for this test batch.
+    pub batch_id: uuid::Uuid,
+    /// Server-shaped audit event committed with the fixture batch.
+    pub audit_event: wyrd_spec::vala::api::AuditEvent,
+    /// Exact native IPC bytes supplied to the private decoder.
+    pub payload: bytes::Bytes,
+}
+
+/// Runtime, admission, and memory inputs for an embedded Scribe.
+pub struct ScribeEmbeddedConfig {
+    /// Optional catalog owner required when the embedded Scribe serves public ingress.
+    pub catalog: Option<Arc<BifrostCatalog>>,
+    /// Execution lane sizes for the embedded Scribe.
+    pub lane_config: ScribeLaneConfig,
+    /// Admission bounds for the embedded Scribe.
+    pub admission: AdmissionConfig,
+    /// Runtime used for Scribe coordination tasks.
+    pub coordination_runtime: Handle,
+    /// Optional tenant-scoped immutable persistence runtime.
+    pub persistence: Option<ScribePersistenceConfig>,
+    /// Optional server-provisioned Scribe child budget.
+    pub resources: crate::resources::ScribeResources,
+    /// Optional bounded publisher for post-commit Forge wake-ups.
+    pub staging_file_publisher: Option<StagingFilePublisher>,
+    /// Test-tier override for the complete production geometry.
+    ///
+    /// Production boot constructs [`ScribeBuildConfig`] directly from
+    /// `ScribeRuntimeConfig`; this override exists only so real server journeys
+    /// can scale the already-configurable production controls — rotation
+    /// limits and the assembled-object target — without adding a second
+    /// geometry policy. The value is a validated [`geometry::ScribeGeometry`],
+    /// so a test cannot install a shape production could not boot with.
+    #[cfg(any(test, feature = "test-support"))]
+    pub geometry_for_test: Option<geometry::ScribeGeometry>,
+}
+
+impl ScribeEmbeddedConfig {
+    /// Derives the geometry an embedded Scribe runs under.
+    ///
+    /// The WAL segment target is read back from the already-constructed writer
+    /// rather than re-declared, so an embedded Scribe can never rotate its
+    /// shards against a segment size the writer does not actually use.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the embedded default rotation targets are not a coherent
+    /// geometry, which is a construction invariant rather than an input.
+    fn geometry(&self, wal: &wal::WalWriter) -> geometry::ScribeGeometry {
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(geometry) = self.geometry_for_test {
+            return geometry;
+        }
+        geometry::ScribeGeometry::for_uniform_shard_rotation(
+            wal.segment_bytes(),
+            memtable::MEMTABLE_ROTATION_BYTES,
+            ScribePressureConfig::default().seal_max_age,
+        )
+        .expect("the embedded default rotation targets form a coherent geometry")
+    }
+}
+
+/// Composes the embedded Scribe capability through the production root path.
+///
+/// # Panics
+///
+/// Panics when the embedded admission configuration cannot cover the protected
+/// unmanaged reserve and Scribe floor, which is a construction invariant.
+fn embedded_scribe_resources(config: &AdmissionConfig) -> crate::resources::ScribeResources {
+    let memory_limit_bytes = config.memory_limit_bytes.max(
+        crate::resources::MIN_UNMANAGED_RESERVE_BYTES + crate::resources::ROLE_MEMORY_FLOOR_BYTES,
+    );
+    let runtime = crate::resources::BifrostRuntimeResources::from_snapshot(
+        crate::resources::SystemResourceSnapshot {
+            memory_limit_bytes,
+            effective_cpu: 1,
+            scratch_capacity_bytes: 2 * crate::resources::MIN_SCRATCH_FREE_BYTES,
+            scratch_available_bytes: 2 * crate::resources::MIN_SCRATCH_FREE_BYTES,
+            memory_source: crate::resources::ResourceSource::Injected,
+            cpu_source: crate::resources::ResourceSource::Injected,
+        },
+        crate::resources::BifrostResourcePolicy {
+            roles: [crate::resources::BifrostRole::Scribe]
+                .into_iter()
+                .collect(),
+            memory_limit_bytes: None,
+            unmanaged_reserve_bytes: None,
+            scratch_limit_bytes: Some(crate::resources::MIN_SCRATCH_FREE_BYTES),
+            forge_compaction_memory_limit_bytes: None,
+            effective_cpu: None,
+            oracle_query_slot_limit: None,
+            scratch_root: std::path::PathBuf::new(),
+            volume_roots: None,
+        },
+    )
+    .expect("embedded Scribe resource policy must satisfy its configured floor");
+    runtime
+        .compose_roles()
+        .expect("embedded Scribe root must remain healthy")
+        .scribe()
+        .expect("embedded Scribe role must be enabled")
+}
+
+/// Acquires one real root-backed decode owner for crate-local routing tests.
+///
+/// # Panics
+///
+/// Panics when the embedded test resource floor cannot admit `bytes`, which
+/// indicates the fixture requested more capacity than its production-shaped
+/// Scribe root can own.
+#[cfg(test)]
+pub(crate) fn otlp_decode_owner_for_test(bytes: usize) -> crate::contracts::OtlpDecodeOwner {
+    let resources = embedded_scribe_resources(&AdmissionConfig::default());
+    let memory = resources
+        .try_reserve_ingress(memory::MemoryCategory::Decode, bytes)
+        .expect("test OTLP decode owner must fit the embedded Scribe root");
+    crate::contracts::OtlpDecodeOwner { memory }
+}
+
+/// Builds one production-shaped Scribe root for direct tail fixtures.
+///
+/// Integration tests pass this capability into the same fence owner used by
+/// production readers, so pre-materialization admission and terminal release
+/// cannot be bypassed by the direct-memtable adapter.
+#[cfg(feature = "test-support")]
+#[must_use]
+pub fn tail_resources_for_test() -> crate::resources::ScribeResources {
+    embedded_scribe_resources(&AdmissionConfig::default())
 }
 
 impl ScribeImpl {
+    /// Admits one native IPC fixture through the crate-private logical seam.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] for the same validation, decode, admission, and
+    /// persistence failures as production ingress.
+    #[cfg(feature = "test-support")]
+    pub async fn ingest_native_for_test(
+        &self,
+        frame: NativeIngressTestFrame,
+    ) -> Result<FrameAdmission, ScribeError> {
+        let measured_wire_bytes = frame.payload.len();
+        Scribe::ingest_frame(
+            self,
+            ScribeIngressFrame {
+                authenticated_tenant: frame.principal.tenant_id,
+                principal: frame.principal,
+                table: frame.table,
+                expected_schema_fingerprint: Some(frame.expected_schema_fingerprint),
+                request_id: frame.request_id,
+                batch_id: frame.batch_id,
+                audit_event: frame.audit_event,
+                measured_wire_bytes,
+                payload: crate::contracts::IngressPayload::ArrowIpc(frame.payload),
+            },
+        )
+        .await
+    }
+
+    /// Builds the immutable-retirement owner transferred with caller COMMIT attempts.
+    /// Return the registered writer epoch used by this production Scribe.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub const fn writer_epoch_for_test(&self) -> i64 {
+        self.writer_epoch
+    }
+
+    /// Return the validated geometry this Scribe actually booted with.
+    ///
+    /// A scaled production test configures the geometry through the server and
+    /// then asserts against what is running, rather than assuming the override
+    /// reached the shard owners.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub const fn geometry_for_test(&self) -> geometry::ScribeGeometry {
+        self.geometry
+    }
     /// Construct a new `ScribeImpl` with empty memtable and provided dependencies.
-    pub fn new_with_deps(
+    pub fn new_for_embedded_with_deps(
         operator: Arc<opendal::Operator>,
         wal: Arc<wal::WalWriter>,
-        node_id: String,
+        node_id: &str,
         writer_epoch: i64,
     ) -> Self {
-        Self {
-            memtable: Arc::new(Memtable::new()),
+        Self::new_for_embedded_with_runtime(operator, wal, node_id, writer_epoch, Handle::current())
+    }
+
+    /// Construct an embedded Scribe that can resolve public logical ingress.
+    ///
+    /// The supplied catalog remains owned by Scribe so Gate only transports
+    /// authenticated logical identity and bounded payload bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the node identifier is not a UUID or the embedded resource
+    /// policy cannot satisfy Scribe's fixed ownership floors.
+    pub fn new_for_embedded_with_deps_and_catalog(
+        operator: Arc<opendal::Operator>,
+        wal: Arc<wal::WalWriter>,
+        node_id: &str,
+        writer_epoch: i64,
+        catalog: Arc<BifrostCatalog>,
+    ) -> Self {
+        let admission = AdmissionConfig::default();
+        let resources = embedded_scribe_resources(&admission);
+        Self::new_for_embedded_with_runtime_config_and_admission_and_memory(
             operator,
             wal,
             node_id,
             writer_epoch,
+            ScribeEmbeddedConfig {
+                catalog: Some(catalog),
+                lane_config: ScribeLaneConfig::default(),
+                admission,
+                coordination_runtime: Handle::current(),
+                persistence: None,
+                resources,
+                staging_file_publisher: None,
+                #[cfg(any(test, feature = "test-support"))]
+                geometry_for_test: None,
+            },
+        )
+    }
+
+    /// Construct the embedded Scribe with a deterministic WAL sync delay.
+    ///
+    /// This seam is used only by real benchmark and failure-injection
+    /// harnesses. Production boot supplies its own explicit pools through
+    /// [`ScribeBuildConfig`] and always uses a zero WAL delay.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a configured execution lane cannot be created or
+    /// `node_id` is not a UUID accepted by the WAL stream identity.
+    pub fn try_new_for_embedded_with_wal_sync_delay(
+        operator: Arc<opendal::Operator>,
+        wal: Arc<wal::WalWriter>,
+        node_id: &str,
+        writer_epoch: i64,
+        sync_delay: std::time::Duration,
+    ) -> Result<Self, String> {
+        Self::try_new_for_embedded_with_wal_sync_delay_and_admission(
+            operator,
+            wal,
+            node_id,
+            writer_epoch,
+            sync_delay,
+            AdmissionConfig::default(),
+        )
+    }
+
+    /// Construct the embedded Scribe with deterministic sync delay and
+    /// explicit test-tier admission limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a configured execution lane cannot be created or
+    /// `node_id` is not a UUID accepted by the WAL stream identity.
+    pub fn try_new_for_embedded_with_wal_sync_delay_and_admission(
+        operator: Arc<opendal::Operator>,
+        wal: Arc<wal::WalWriter>,
+        node_id: &str,
+        writer_epoch: i64,
+        sync_delay: std::time::Duration,
+        admission: AdmissionConfig,
+    ) -> Result<Self, String> {
+        let resources = embedded_scribe_resources(&admission);
+        Self::try_new_for_embedded_with_wal_sync_delay_and_admission_and_memory(
+            operator,
+            wal,
+            node_id,
+            writer_epoch,
+            sync_delay,
+            ScribeEmbeddedConfig {
+                catalog: None,
+                lane_config: ScribeLaneConfig::resolved(),
+                admission,
+                coordination_runtime: Handle::current(),
+                persistence: None,
+                resources,
+                staging_file_publisher: None,
+                #[cfg(any(test, feature = "test-support"))]
+                geometry_for_test: None,
+            },
+        )
+    }
+
+    /// Construct the embedded Scribe with deterministic sync delay, explicit
+    /// admission limits, and an optional server-provisioned memory governor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a configured execution lane cannot be created or
+    /// `node_id` is not a UUID accepted by the WAL stream identity.
+    pub fn try_new_for_embedded_with_wal_sync_delay_and_admission_and_memory(
+        operator: Arc<opendal::Operator>,
+        wal: Arc<wal::WalWriter>,
+        node_id: &str,
+        writer_epoch: i64,
+        sync_delay: std::time::Duration,
+        config: ScribeEmbeddedConfig,
+    ) -> Result<Self, String> {
+        let geometry = config.geometry(&wal);
+        let execution_pools = ScribeExecutionPools::new(
+            ScribeIngressCpuPool::try_new_with_capacity(
+                config.lane_config.ingress_cpu_threads,
+                256,
+            )
+            .map_err(|error| format!("ingress CPU pool failed: {error}"))?,
+            ScribePersistenceCpuPool::try_new_with_capacity(
+                config.lane_config.persistence_cpu_threads,
+                64,
+            )
+            .map_err(|error| format!("persistence CPU pool failed: {error}"))?,
+            ScribeWalIoPool::try_new_with_capacity_and_delay(
+                config.lane_config.wal_io_threads,
+                256,
+                sync_delay,
+            )
+            .map_err(|error| format!("WAL IO pool failed: {error}"))?,
+        );
+        let stream = stream_identity::StreamIdentity::new(
+            stream_identity::NodeId::new(
+                uuid::Uuid::parse_str(node_id).map_err(|error| error.to_string())?,
+            ),
+            stream_identity::WriterEpoch::new(writer_epoch),
+        );
+        Self::new_with_execution_pools(ScribeBuildConfig {
+            catalog: config.catalog,
+            operator,
+            wal,
+            stream,
+            admission: config.admission,
+            coordination_runtime: config.coordination_runtime,
+            execution_pools,
+            persistence: config.persistence,
+            resources: config.resources,
+            ingest_limits: crate::gate::limits::IngestLimits::default(),
+            geometry,
+            staging_file_publisher: None,
+        })
+        .map_err(|error| error.to_string())
+    }
+
+    /// Construct a Scribe using an explicitly owned Tokio coordination runtime.
+    ///
+    /// Server deployments use [`Self::new_with_execution_pools`]. Tests and
+    /// embedded callers may use this constructor on the current runtime.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `node_id` is not a UUID accepted by the WAL stream identity
+    /// or the fixed Scribe ownership graph cannot be initialized.
+    pub fn new_for_embedded_with_runtime(
+        operator: Arc<opendal::Operator>,
+        wal: Arc<wal::WalWriter>,
+        node_id: &str,
+        writer_epoch: i64,
+        coordination_runtime: Handle,
+    ) -> Self {
+        Self::new_for_embedded_with_runtime_config(
+            operator,
+            wal,
+            node_id,
+            writer_epoch,
+            ScribeLaneConfig::default(),
+            coordination_runtime,
+        )
+    }
+
+    /// Construct Scribe with explicitly provisioned execution lanes.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `node_id` is not a UUID accepted by the WAL stream identity
+    /// or the fixed Scribe ownership graph cannot be initialized.
+    pub fn new_for_embedded_with_runtime_config(
+        operator: Arc<opendal::Operator>,
+        wal: Arc<wal::WalWriter>,
+        node_id: &str,
+        writer_epoch: i64,
+        lane_config: ScribeLaneConfig,
+        coordination_runtime: Handle,
+    ) -> Self {
+        Self::new_for_embedded_with_runtime_config_and_admission(
+            operator,
+            wal,
+            node_id,
+            writer_epoch,
+            lane_config,
+            AdmissionConfig::default(),
+            coordination_runtime,
+        )
+    }
+
+    /// Construct Scribe with explicit execution lanes and admission bounds.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `node_id` is not a UUID accepted by the WAL stream identity
+    /// or the fixed Scribe ownership graph cannot be initialized.
+    pub fn new_for_embedded_with_runtime_config_and_admission(
+        operator: Arc<opendal::Operator>,
+        wal: Arc<wal::WalWriter>,
+        node_id: &str,
+        writer_epoch: i64,
+        lane_config: ScribeLaneConfig,
+        admission: AdmissionConfig,
+        coordination_runtime: Handle,
+    ) -> Self {
+        let resources = embedded_scribe_resources(&admission);
+        Self::new_for_embedded_with_runtime_config_and_admission_and_memory(
+            operator,
+            wal,
+            node_id,
+            writer_epoch,
+            ScribeEmbeddedConfig {
+                catalog: None,
+                lane_config,
+                admission,
+                coordination_runtime,
+                persistence: None,
+                resources,
+                staging_file_publisher: None,
+                #[cfg(any(test, feature = "test-support"))]
+                geometry_for_test: None,
+            },
+        )
+    }
+
+    /// Construct Scribe with explicit execution lanes, admission bounds, and
+    /// an optional server-provisioned memory governor.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `node_id` is not a UUID accepted by the WAL stream identity,
+    /// when the fixed Scribe ownership graph cannot be initialized, or when the
+    /// supplied admission budget cannot hold its own configured guaranteed
+    /// contention width. Server deployments take the fallible
+    /// [`Self::new_with_execution_pools`] instead so that last case becomes a
+    /// typed boot refusal rather than a panic.
+    pub fn new_for_embedded_with_runtime_config_and_admission_and_memory(
+        operator: Arc<opendal::Operator>,
+        wal: Arc<wal::WalWriter>,
+        node_id: &str,
+        writer_epoch: i64,
+        config: ScribeEmbeddedConfig,
+    ) -> Self {
+        let geometry = config.geometry(&wal);
+        let stream = stream_identity::StreamIdentity::new(
+            stream_identity::NodeId::new(
+                uuid::Uuid::parse_str(node_id).expect("embedded Scribe node_id must be a UUID"),
+            ),
+            stream_identity::WriterEpoch::new(writer_epoch),
+        );
+        Self::build(ScribeBuildConfig {
+            catalog: config.catalog,
+            operator,
+            wal,
+            stream,
+            admission: config.admission,
+            coordination_runtime: config.coordination_runtime,
+            execution_pools: ScribeExecutionPools::new(
+                ScribeIngressCpuPool::new_with_capacity(
+                    config.lane_config.ingress_cpu_threads,
+                    256,
+                ),
+                ScribePersistenceCpuPool::new_with_capacity(
+                    config.lane_config.persistence_cpu_threads,
+                    64,
+                ),
+                ScribeWalIoPool::new_with_capacity(config.lane_config.wal_io_threads, 256),
+            ),
+            persistence: config.persistence,
+            resources: config.resources,
+            ingest_limits: crate::gate::limits::IngestLimits::default(),
+            geometry,
+            staging_file_publisher: config.staging_file_publisher,
+        })
+        .expect("the embedded Scribe budget completes at least one table lifecycle")
+    }
+
+    /// Construct Scribe from execution lanes provisioned by server boot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`geometry::ScribeGeometryError`] when the node's Scribe memory
+    /// budget and staging volume cannot hold the configured guaranteed
+    /// contention width, so boot fails with the shortfall named instead of
+    /// reporting ready.
+    pub fn new_with_execution_pools(
+        config: ScribeBuildConfig,
+    ) -> Result<Self, geometry::ScribeGeometryError> {
+        Self::build(config)
+    }
+
+    /// Replaces the immutable ingest-limit snapshot for one test-support Scribe.
+    ///
+    /// Public journey fixtures use this builder before wrapping Scribe in an
+    /// `Arc`, ensuring the server adapter, Gate, and Scribe observe one exact
+    /// lowerable limits snapshot without changing production defaults. The
+    /// in-crate unit tests use the same builder, so it is compiled for `test`
+    /// as well as for the `test-support` feature; gating it on the feature
+    /// alone breaks the crate's own default-feature test build.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn with_ingest_limits_for_test(
+        mut self,
+        ingest_limits: crate::gate::limits::IngestLimits,
+    ) -> Self {
+        self.ingest_limits = ingest_limits;
+        self
+    }
+
+    /// Starts the persistence runtime from the dependencies every worker shares.
+    ///
+    /// Split out of [`Self::build`] because persistence is the one child whose
+    /// context is assembled rather than forwarded: it takes a slice of almost
+    /// every other owner, and inlining that assembly buries the shard and
+    /// lifecycle wiring that follows it.
+    fn start_persistence(
+        config: persistence::ScribePersistenceConfig,
+        dependencies: PersistenceDependencies,
+        runtime: &Handle,
+    ) -> Arc<persistence::PersistenceRuntime> {
+        #[cfg(any(test, feature = "test-support"))]
+        let faults = config.faults.clone();
+        let PersistenceDependencies {
+            operator,
+            wal,
+            persistence_cpu,
+            wal_io,
+            stream,
+            memory,
+            staging_file_publisher,
+            geometry,
+            hot_sources,
+            telemetry,
+        } = dependencies;
+        persistence::PersistenceRuntime::start(
+            config,
+            persistence::PersistenceRuntimeContext {
+                operator,
+                wal,
+                persistence_cpu,
+                wal_io,
+                actor_stream: stream,
+                memory,
+                staging_file_publisher,
+                geometry,
+                hot_sources,
+                telemetry,
+                #[cfg(any(test, feature = "test-support"))]
+                faults,
+            },
+            runtime,
+        )
+    }
+
+    /// Builds the complete Scribe ownership graph from server-provisioned dependencies.
+    ///
+    /// This is the single internal construction path used by production and
+    /// embedded factories. It creates persistence before the fixed shard
+    /// owners so every child receives the same lanes, WAL identity, memory
+    /// ledger, and coordination runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`geometry::ScribeGeometryError`] when the pod cannot hold every
+    /// guaranteed contention reserve vector. Scribe refuses to exist on a node
+    /// it cannot serve its configured width on, so this check happens here,
+    /// before any owner is built.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the configured fallback memory governor cannot represent
+    /// the fixed one-gibibyte invariant or a shard WAL handle cannot be built.
+    fn build(config: ScribeBuildConfig) -> Result<Self, geometry::ScribeGeometryError> {
+        let memory = config.resources.clone();
+        let memory_ownership =
+            memory::ScribeOwnership::new(&memory).expect("zero-sized root ownership must be valid");
+        let wal_breaker = Some(config.wal.disk_full_breaker());
+        let admission = AdmissionController::with_config_memory_and_wal(
+            config.admission,
+            memory.clone(),
+            wal_breaker,
+        )?;
+        let ScribeBuildConfig {
+            catalog,
+            operator,
+            wal,
+            stream,
+            coordination_runtime,
+            execution_pools,
+            persistence: persistence_config,
+            admission: _,
+            resources: _,
+            ingest_limits,
+            geometry,
+            staging_file_publisher,
+        } = config;
+        let seal_max_age = geometry.generation_max_age();
+        let ScribeExecutionPools {
+            ingress_cpu,
+            persistence_cpu,
+            wal_io,
+        } = execution_pools;
+        let control_postgres = persistence_config
+            .as_ref()
+            .map(|config| Arc::clone(&config.postgres));
+        let hot_sources = Arc::new(hot_source::ScribeHotSourceRegistry::new());
+        let persistence = persistence_config.map(|config| {
+            Self::start_persistence(
+                config,
+                PersistenceDependencies {
+                    operator: Arc::clone(&operator),
+                    wal: Arc::clone(&wal),
+                    persistence_cpu: persistence_cpu.clone(),
+                    wal_io: wal_io.clone(),
+                    stream,
+                    memory: memory.clone(),
+                    staging_file_publisher: staging_file_publisher.clone(),
+                    geometry,
+                    hot_sources: Arc::clone(&hot_sources),
+                    telemetry: admission.contention().telemetry_handle(),
+                },
+                &coordination_runtime,
+            )
+        });
+        let shards = shards::ScribeShardRuntime::start(
+            shards::ScribeShardStartConfig {
+                admission: admission.clone(),
+                geometry,
+                seal_max_age,
+                wal: Arc::clone(&wal),
+                persistence_cpu: persistence_cpu.clone(),
+                wal_io: wal_io.clone(),
+                persistence: persistence.clone(),
+                control_postgres,
+                stream,
+                memory_ownership: memory_ownership.clone(),
+                hot_sources: Arc::clone(&hot_sources),
+            },
+            &coordination_runtime,
+        );
+        Self::install_boot_metrics(wal.bytes_on_disk());
+        Ok(Self {
+            catalog,
+            wal,
+            node_id: stream.node_id.to_string(),
+            stream,
+            writer_epoch: stream.writer_epoch.as_i64(),
+            admission,
+            memory,
+            ingest_limits,
+            pressure_config: ScribePressureConfig::new(75, 50, seal_max_age),
+            #[cfg(any(test, feature = "test-support"))]
+            geometry,
+            memory_ownership,
+            hot_sources,
+            persistence_cpu,
+            wal_io,
+            ingress_cpu,
+            shards,
+            ingress_lifecycle: Arc::new(ScribeIngressLifecycle::default()),
+            closed: AtomicBool::new(false),
+            shutdown_state: std::sync::atomic::AtomicU8::new(SHUTDOWN_RUNNING),
+            shutdown_notify: tokio::sync::Notify::new(),
+            #[cfg(any(test, feature = "test-support"))]
+            shutdown_draining_notify: tokio::sync::Notify::new(),
+            recovery_ready: AtomicBool::new(true),
+            recovery_cancelled: Arc::new(AtomicBool::new(false)),
+            persistence,
+            #[cfg(any(test, feature = "test-support"))]
+            ingest_stall: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(any(test, feature = "test-support"))]
+            decoded_request_limit_for_test: AtomicUsize::new(0),
+        })
+    }
+
+    /// Publish the zero-initialized Scribe boot telemetry.
+    ///
+    /// Called once from [`Self::build`] so the ingress-active gauge, every named
+    /// rejection counter, and the WAL disk-bytes gauge exist at value zero (or
+    /// the current WAL residency) before the first request, giving scrapers a
+    /// stable series set from process start. `wal_disk_bytes` is the current
+    /// on-disk WAL byte count read from the freshly recovered writer.
+    fn install_boot_metrics(wal_disk_bytes: u64) {
+        metrics::gauge!("bifrost_scribe_ingress_active").set(0.0);
+        for reason in ["in_flight", "memory", "wal", "queue", "closed", "invalid"] {
+            metrics::counter!("bifrost_scribe_rejections_total", "reason" => reason).increment(0);
         }
+        metrics::gauge!("bifrost_scribe_wal_disk_bytes")
+            .set(wal_disk_bytes.to_f64().unwrap_or(f64::MAX));
     }
 
     /// Construct a stub `ScribeImpl` for tests (memory backend, stub node identity, temp WAL).
@@ -78,6 +1276,23 @@ impl ScribeImpl {
     #[must_use]
     #[cfg(test)]
     pub fn new() -> Self {
+        Self::new_with_test_lanes(ScribePersistenceCpuPool::new(1), ScribeWalIoPool::new(1))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_test_lanes(
+        persistence_cpu: ScribePersistenceCpuPool,
+        wal_io: ScribeWalIoPool,
+    ) -> Self {
+        Self::new_with_test_config(persistence_cpu, wal_io, AdmissionConfig::default())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_test_config(
+        persistence_cpu: ScribePersistenceCpuPool,
+        wal_io: ScribeWalIoPool,
+        admission_config: AdmissionConfig,
+    ) -> Self {
         let operator = Arc::new(
             opendal::Operator::new(opendal::services::Memory::default())
                 .expect("memory backend init")
@@ -90,138 +1305,526 @@ impl ScribeImpl {
             .as_bytes()
             .to_owned();
         let wal = Arc::new(
-            wal::WalWriter::new(
-                temp_dir.path(),
-                node_id_bytes,
-                1,
-                wyrd_spec::ids::DataTenantId::new_v7(),
-                None,
-            )
-            .expect("test WAL init"),
+            wal::WalWriter::new(temp_dir.path(), node_id_bytes, 1, wal::WalConfig::default())
+                .expect("test WAL init"),
         );
 
         // Leak temp_dir to keep WAL files for the test lifetime
         std::mem::forget(temp_dir);
 
-        Self {
-            memtable: Arc::new(Memtable::new()),
+        let resources = embedded_scribe_resources(&admission_config);
+        let geometry = geometry::ScribeGeometry::for_uniform_shard_rotation(
+            wal.segment_bytes(),
+            memtable::MEMTABLE_ROTATION_BYTES,
+            ScribePressureConfig::default().seal_max_age,
+        )
+        .expect("the static test rotation targets form a coherent geometry");
+        Self::build(ScribeBuildConfig {
+            catalog: None,
             operator,
             wal,
-            node_id: "00000000-0000-0000-0000-000000000000".to_string(),
-            writer_epoch: 1,
-        }
-    }
-
-    /// Execute seal pre-commit stages (Freeze → Parquet → PUT → PG tx) for a
-    /// specific seal-key on the caller's tenant-scoped transaction.
-    ///
-    /// Returns a `SealCommit` handle that the caller must pass to `seal_one_post_commit`
-    /// after committing the transaction. The caller owns commit/rollback.
-    ///
-    /// Repo rule (`check:from-pools-allowlist`): this signature MUST take
-    /// `&mut vala_sql::TenantConn<'_>` and MUST NOT accept `sqlx::PgPool`.
-    ///
-    /// # Errors
-    /// Returns [`ScribeError`] if any seal stage fails.
-    pub async fn seal_one(
-        &self,
-        seal_key: &SealKey,
-        conn: &mut TenantConn<'_>,
-    ) -> Result<seal::SealCommit, ScribeError> {
-        use crate::scribe::seal::SealDriver;
-
-        // Cross-tenant guard: seal_key.tenant must match conn.data_tenant_id()
-        let conn_tenant = conn.data_tenant_id();
-        if seal_key.tenant != conn_tenant {
-            return Err(ScribeError::Internal {
-                detail: format!(
-                    "tenant mismatch: seal_key.tenant={} vs conn.data_tenant_id={}",
-                    seal_key.tenant, conn_tenant
+            stream: stream_identity::StreamIdentity::new(
+                stream_identity::NodeId::new(
+                    uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000000")
+                        .expect("static test Scribe node_id is a UUID"),
                 ),
-            });
-        }
-
-        let driver = SealDriver::new(self.operator.clone());
-        driver
-            .pre_commit(
-                &self.memtable,
-                seal_key,
-                conn,
-                &self.node_id,
-                self.writer_epoch,
-            )
-            .await
+                stream_identity::WriterEpoch::new(1),
+            ),
+            admission: admission_config,
+            coordination_runtime: Handle::current(),
+            execution_pools: ScribeExecutionPools::new(
+                ScribeIngressCpuPool::new(1),
+                persistence_cpu,
+                wal_io,
+            ),
+            persistence: None,
+            resources,
+            ingest_limits: crate::gate::limits::IngestLimits::default(),
+            geometry,
+            staging_file_publisher: None,
+        })
+        .expect("the fixed test Scribe geometry fits its embedded governor")
     }
 
-    /// Complete seal post-commit stages (manifest + WAL retirement) after the
-    /// caller commits the seal transaction.
+    /// Stop accepting new shard work and drain execution lanes until `deadline`.
+    ///
+    /// Cancellation may leave durable accepted work for normal recovery. Every
+    /// phase is first closed, then awaited only while the caller's process-wide
+    /// shutdown budget remains. A cancellation guard synchronously aborts retained
+    /// owners if the caller drops this future while it owns the draining state.
+    pub async fn shutdown(&self, deadline: std::time::Instant) -> bool {
+        if self
+            .shutdown_state
+            .compare_exchange(
+                SHUTDOWN_RUNNING,
+                SHUTDOWN_DRAINING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            while self.shutdown_state.load(Ordering::Acquire) != SHUTDOWN_STOPPED {
+                let notified = self.shutdown_notify.notified();
+                if self.shutdown_state.load(Ordering::Acquire) == SHUTDOWN_STOPPED {
+                    break;
+                }
+                notified.await;
+            }
+            return true;
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        self.shutdown_draining_notify.notify_waiters();
+        let mut cancellation_finalizer = ShutdownCancellationFinalizer {
+            scribe: self,
+            armed: true,
+        };
+        let started = std::time::Instant::now();
+        self.begin_shutdown();
+        let mut graceful = if tokio::time::Instant::now() < tokio::time::Instant::from_std(deadline)
+        {
+            matches!(
+                tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    self.shards.flush_all(),
+                )
+                .await,
+                Ok(Ok(()))
+            )
+        } else {
+            false
+        };
+        if graceful {
+            graceful = await_shutdown_phase(deadline, self.shards.drain()).await;
+        }
+        // Stop new persistence submissions only after the final shard flush.
+        // Keep the CPU and WAL lanes open while already-queued generations
+        // finish encoding and publish their file-list rows.
+        if graceful && let Some(persistence) = &self.persistence {
+            persistence.close();
+        }
+        if graceful && let Some(persistence) = &self.persistence {
+            graceful = await_shutdown_phase(deadline, persistence.drain()).await;
+        }
+        // Every accepted generation is now durable on the staging volume, but a
+        // key that never reached its object target would sit there waiting for
+        // a dwell this process will not outlive. Publish that residue while the
+        // CPU, WAL, and object lanes are still open.
+        if graceful {
+            graceful = Box::pin(self.publish_staged_residue(deadline)).await;
+        }
+        self.close_lanes();
+        if graceful {
+            graceful = await_shutdown_phase(deadline, self.shards.shutdown(deadline)).await;
+        }
+        if graceful {
+            graceful = await_shutdown_phase(deadline, self.persistence_cpu.drain()).await;
+        }
+        if graceful {
+            graceful = await_shutdown_phase(deadline, self.wal_io.drain()).await;
+        }
+        if graceful {
+            graceful = await_shutdown_phase(deadline, self.ingress_cpu.drain()).await;
+        }
+        if self
+            .shutdown_state
+            .compare_exchange(
+                SHUTDOWN_DRAINING,
+                SHUTDOWN_FINALIZING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.finalize_shutdown_owners();
+        } else {
+            while self.shutdown_state.load(Ordering::Acquire) != SHUTDOWN_STOPPED {
+                let notified = self.shutdown_notify.notified();
+                if self.shutdown_state.load(Ordering::Acquire) == SHUTDOWN_STOPPED {
+                    break;
+                }
+                notified.await;
+            }
+        }
+        if !graceful {
+            tracing::warn!("Scribe graceful cleanup was incomplete at shutdown deadline");
+        }
+        metrics::histogram!("bifrost_scribe_shutdown_seconds")
+            .record(started.elapsed().as_secs_f64());
+        cancellation_finalizer.disarm();
+        graceful
+    }
+
+    /// Closes external admission and aborts every retained Tokio worker without waiting.
+    ///
+    /// This is the deadline-expiry path. It deliberately skips graceful flush,
+    /// closes execution lanes, and leaves any unfinished durable work to WAL
+    /// recovery. No external await or detached cleanup is started.
+    pub fn abort_shutdown(&self) {
+        loop {
+            let state = self.shutdown_state.load(Ordering::Acquire);
+            if matches!(state, SHUTDOWN_FINALIZING | SHUTDOWN_STOPPED) {
+                return;
+            }
+            if self
+                .shutdown_state
+                .compare_exchange(
+                    state,
+                    SHUTDOWN_FINALIZING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                break;
+            }
+        }
+        self.begin_shutdown();
+        self.close_lanes();
+        self.finalize_shutdown_owners();
+    }
+
+    /// Abort retained async owners and publish the terminal stopped state.
+    fn finalize_shutdown_owners(&self) {
+        let aborted_shards = self.shards.abort_retained();
+        self.shards.clear_retained_join_handles();
+        let aborted_persistence = self
+            .persistence
+            .as_ref()
+            .map_or(0, |persistence| persistence.abort_retained());
+        if let Some(persistence) = &self.persistence {
+            persistence.clear_retained_join_handles();
+        }
+        if let Err(error) = self.wal.close_all_streams() {
+            tracing::error!(error = %error, "Scribe shutdown could not close every WAL stream owner");
+        }
+        tracing::debug!(
+            aborted_shards,
+            aborted_persistence,
+            "Scribe shard and persistence owners finalized"
+        );
+        self.shutdown_state
+            .store(SHUTDOWN_STOPPED, Ordering::Release);
+        self.shutdown_notify.notify_waiters();
+    }
+
+    /// Publishes the staged members graceful drain would otherwise strand.
+    ///
+    /// Runs after the persistence queue is empty, so every accepted generation
+    /// is already durable and the only members left are the ones target and
+    /// dwell were still holding. Returns whether the sweep completed within the
+    /// deadline; a pod without staging publishes nothing and succeeds. A member
+    /// that fails to publish stays durable and staged, so reporting the failure
+    /// downgrades shutdown to non-graceful rather than losing rows.
+    async fn publish_staged_residue(&self, deadline: std::time::Instant) -> bool {
+        let Some(persistence) = &self.persistence else {
+            return true;
+        };
+        match timed_shutdown_phase(
+            deadline,
+            Box::pin(persistence.publish_residue(crate::scribe::assembly::ClaimCause::Drain)),
+        )
+        .await
+        {
+            Some(Ok(published)) => {
+                tracing::info!(published, "Scribe drain published its staged residue");
+                true
+            }
+            Some(Err(error)) => {
+                tracing::warn!(%error, "Scribe drain left staged members unpublished");
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Closes external Scribe admission without cancelling internal flush lanes.
+    ///
+    /// Already accepted writable generations may still use the internal lanes
+    /// during [`Self::shutdown`]'s bounded flush. Dropping shutdown after this
+    /// transition is fail-closed; [`Self::abort_shutdown`] performs final abort.
+    fn begin_shutdown(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.recovery_cancelled.store(true, Ordering::Release);
+        self.shards.close();
+    }
+
+    /// Closes internal execution lanes after graceful flush has completed or timed out.
+    ///
+    /// Persistence remains available until this transition so accepted writable
+    /// generations can be frozen and submitted during the bounded flush. Once
+    /// closed, later drains can only finish work that was already admitted.
+    fn close_lanes(&self) {
+        if let Some(persistence) = &self.persistence {
+            persistence.close();
+        }
+        self.persistence_cpu.close();
+        self.wal_io.close();
+        self.ingress_cpu.close();
+    }
+
+    /// Installs one retained never-completing shard task for shutdown-bound tests.
+    ///
+    /// The returned abort handle lets the production-owner test prove the real
+    /// Scribe finalizer cancelled the task rather than merely dropping its wait.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn install_shutdown_stall_for_test(&self) -> tokio::task::AbortHandle {
+        self.shards.install_shutdown_stall_for_test().await
+    }
+
+    /// Wait until graceful shutdown owns the draining state.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn wait_shutdown_draining_for_test(&self) {
+        while self.shutdown_state.load(Ordering::Acquire) != SHUTDOWN_DRAINING {
+            let notified = self.shutdown_draining_notify.notified();
+            if self.shutdown_state.load(Ordering::Acquire) == SHUTDOWN_DRAINING {
+                break;
+            }
+            notified.await;
+        }
+    }
+
+    /// Return whether Scribe has completed recovery and still accepts writes.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        !self.closed.load(Ordering::Acquire) && self.recovery_ready.load(Ordering::Acquire)
+    }
+
+    /// Drain shard work after the pod lifecycle scanner's tick.
+    pub async fn retire_idle(&self, now: std::time::Instant) {
+        let _ = now;
+        self.shards.drain().await;
+    }
+
+    /// Flush writable generations through the bounded persistence runtime.
+    ///
+    /// This is a test-tier control seam for exercising owner FIFO and retry
+    /// behavior without bypassing the shard command boundary.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn flush_writable_for_test(&self) -> Result<(), ScribeError> {
+        self.shards.flush_all().await
+    }
+
+    /// Return the bounded persistence queue depth for test-tier drain checks.
+    #[must_use]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn persistence_queue_depth_for_test(&self) -> usize {
+        self.persistence
+            .as_ref()
+            .map_or(0, |persistence| persistence.queue_depth())
+    }
+
+    /// Publish only the staged residue belonging to one physical partition.
+    ///
+    /// Drives the production residue claim and fenced publication owner for the
+    /// already-existing ready keys of that partition and nothing else, so a
+    /// caller can place the real production state in which one partition is
+    /// served by a hot object while a neighbouring partition is still served by
+    /// its live authority.
     ///
     /// # Errors
-    /// Returns [`ScribeError`] if any post-commit stage fails.
-    pub async fn seal_one_post_commit(&self, handle: seal::SealCommit) -> Result<(), ScribeError> {
-        use crate::scribe::seal::SealDriver;
-        let driver = SealDriver::new(self.operator.clone());
-        driver.post_commit(handle).await
-    }
-}
-
-/// Split a `RecordBatch` by `wyrd_event_time` day, returning (`EventDay`, `RecordBatch`) pairs.
-fn split_batch_by_event_day(
-    batch: &RecordBatch,
-) -> Result<Vec<(EventDay, RecordBatch)>, ScribeError> {
-    let ts_col = batch
-        .column_by_name("wyrd_event_time")
-        .ok_or_else(|| ScribeError::Internal {
-            detail: "missing wyrd_event_time column".into(),
-        })?;
-
-    let ts_array = ts_col
-        .as_any()
-        .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
-        .ok_or_else(|| ScribeError::Internal {
-            detail: "wyrd_event_time must be TimestampMicrosecond".into(),
-        })?;
-
-    // Group row indices by UTC day
-    let mut day_indices: HashMap<chrono::NaiveDate, Vec<u32>> = HashMap::new();
-    for i in 0..ts_array.len() {
-        if ts_array.is_null(i) {
-            continue;
+    ///
+    /// Returns [`ScribeError`] when the selected key's residue claim or its
+    /// fenced publication is refused. The remaining keys stay staged and their
+    /// WAL stays authoritative.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn publish_partition_for_test(
+        &self,
+        partition: crate::catalog::layout::TimePartition,
+    ) -> Result<usize, ScribeError> {
+        match self.persistence.as_ref() {
+            Some(persistence) => persistence.publish_partition_for_test(partition).await,
+            None => Ok(0),
         }
-        let micros = ts_array.value(i);
-        let dt = chrono::DateTime::from_timestamp_micros(micros).ok_or_else(|| {
-            ScribeError::Internal {
-                detail: format!("invalid timestamp micros: {micros}"),
-            }
-        })?;
-        let day = dt.date_naive();
-        day_indices
-            .entry(day)
-            .or_default()
-            .push(u32::try_from(i).expect("row index within u32 range"));
     }
 
-    // Build one RecordBatch per day using arrow::compute::take
-    let mut result = Vec::with_capacity(day_indices.len());
-    for (day, indices) in day_indices {
-        let indices_array = arrow::array::UInt32Array::from(indices);
-        let columns: Result<Vec<_>, _> = batch
-            .columns()
-            .iter()
-            .map(|col| {
-                take(col.as_ref(), &indices_array, None).map_err(|e| ScribeError::Internal {
-                    detail: format!("arrow take failed: {e}"),
-                })
+    /// Return where every generation this pod still tracks is readable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the hot-source registry lock is
+    /// poisoned, which means a holder already panicked.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn live_authorities_for_test(&self) -> Result<Vec<hot_source::LiveAuthority>, ScribeError> {
+        self.hot_sources
+            .live_authorities_for_test()
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("read the pod's live hot authorities: {error}"),
             })
-            .collect();
-        let day_batch =
-            RecordBatch::try_new(batch.schema(), columns?).map_err(|e| ScribeError::Internal {
-                detail: format!("RecordBatch::try_new failed: {e}"),
-            })?;
-        result.push((EventDay::new(day), day_batch));
     }
 
-    Ok(result)
+    /// Return every claim this Scribe's staging runtime has published.
+    ///
+    /// One entry per committed claim, naming the objects it published and the
+    /// distinct shard lanes its members were frozen on. This is the only place
+    /// that binding is observable: publication records rows, not lanes.
+    #[must_use]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn published_claims_for_test(
+        &self,
+    ) -> Vec<crate::scribe::staging_runtime::PublishedClaimObservation> {
+        self.persistence
+            .as_ref()
+            .map(|persistence| persistence.published_claims_for_test())
+            .unwrap_or_default()
+    }
+
+    /// Return the exact admitted request count still owned by Scribe.
+    ///
+    /// This test-support inspection reads the production admission owner; it
+    /// does not infer in-flight work from shard queue depth.
+    #[must_use]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn inflight_items_for_test(&self) -> usize {
+        self.admission.snapshot().items
+    }
+
+    /// Read a governor snapshot enriched with the runtime ingress watermarks.
+    ///
+    /// The governor fills `ingress_occupancy_bytes` and `ingress_limit_bytes`;
+    /// this method layers the D83 high/low-water bytes from
+    /// [`ScribeImpl::pressure_config`] so every watermark decision — admission
+    /// and the periodic age scanner alike — reads one consistent snapshot.
+    #[must_use]
+    fn pressure_snapshot(&self) -> memory::MemorySnapshot {
+        self.memory.memory_snapshot().with_ingress_watermarks(
+            self.pressure_config.ingress_high_water_percent,
+            self.pressure_config.ingress_low_water_percent,
+        )
+    }
+
+    /// Request a coordinated pressure seal that drains ingress toward low-water.
+    ///
+    /// This is the single definition of the flush-first hysteresis, shared by
+    /// the admission path (`Scribe::prepare_and_dispatch`) and the periodic age
+    /// scanner (`Scribe::check_age`). It is a no-op below the high-water mark;
+    /// at or above it, it selects the largest writable buckets aggregated across
+    /// all shards (shard-count-invariant, via
+    /// [`memtable::Memtable::select_pressure_victims`]) sufficient to release
+    /// occupancy down to the low-water target, and fans a fire-and-forget flush
+    /// signal to their owners. It never blocks or busy-waits: freezing and
+    /// persistence proceed asynchronously, and callers retry the reservation
+    /// once (admission) or wait for the next tick (scanner).
+    fn request_pressure_seal_toward_low_water(&self) {
+        let snapshot = self.pressure_snapshot();
+        let Some(to_release) =
+            snapshot.pressure_release_bytes(self.pressure_config.ingress_high_water_percent)
+        else {
+            return;
+        };
+        let candidates = self
+            .shards
+            .memtable_snapshots()
+            .unwrap_or_default()
+            .into_iter()
+            .flat_map(|snapshot| snapshot.pressure_candidates)
+            .collect::<Vec<_>>();
+        let victims = memtable::Memtable::select_pressure_victims(candidates, to_release);
+        tracing::debug!(
+            trigger = SealTriggerReason::Pressure.as_label(),
+            to_release,
+            victims = victims.len(),
+            "requesting coordinated ingress-pressure seal"
+        );
+        self.shards.request_pressure_flush(&victims);
+    }
+
+    /// Publish one coalescing lifecycle age tick to every shard owner.
+    ///
+    /// The ingress-pressure branch shares its hysteresis with admission through
+    /// `Scribe::request_pressure_seal_toward_low_water`: crossing the ingress
+    /// high-water mark seals down toward low-water; below low-water it no-ops.
+    /// The independent WAL-disk soft-pressure branch is unchanged.
+    ///
+    /// As the production steady-state tick, it first exports the governor and
+    /// memtable gauges (D84) so per-child occupancy, the D83 ingress watermarks,
+    /// and the memtable seal-decision inputs are observable every tick. It also
+    /// emits one debug-level governor snapshot line per tick — child totals,
+    /// the derived parent-only remainder, and every per-category total — so a
+    /// saturated ceiling can be attributed to its holder from logs alone
+    /// (ceiling refusals collapse to one `IngestBusy` message and cannot name
+    /// the holder themselves). All exports are emission-only and precede the
+    /// flush requests; they never change the seal, age, or pressure decisions
+    /// the rest of the method makes.
+    pub fn check_age(&self, now: std::time::Instant) {
+        let snapshot = self.pressure_snapshot();
+        self.memory.emit_root_resource_gauges();
+        snapshot.emit_ingress_watermark_gauges();
+        tracing::debug!(
+            scribe_total = snapshot.scribe_total_bytes,
+            oracle_total = snapshot.oracle_total_bytes,
+            bifrost_total = snapshot.bifrost_total_bytes,
+            parent_only = snapshot.bifrost_total_bytes.saturating_sub(
+                snapshot
+                    .scribe_total_bytes
+                    .saturating_add(snapshot.oracle_total_bytes)
+            ),
+            raw = snapshot.categories[memory::MemoryCategory::Raw as usize],
+            decode = snapshot.categories[memory::MemoryCategory::Decode as usize],
+            prepared = snapshot.categories[memory::MemoryCategory::Prepared as usize],
+            queued = snapshot.categories[memory::MemoryCategory::Queued as usize],
+            active = snapshot.categories[memory::MemoryCategory::Active as usize],
+            immutable = snapshot.categories[memory::MemoryCategory::Immutable as usize],
+            persistence = snapshot.categories[memory::MemoryCategory::Persistence as usize],
+            metadata = snapshot.categories[memory::MemoryCategory::Metadata as usize],
+            "governor tick snapshot"
+        );
+        if let Ok(stats) = self.aggregate_memtable_stats() {
+            emit_memtable_gauges(&stats);
+        }
+        self.shards.request_expired_flush(now);
+        self.request_pressure_seal_toward_low_water();
+        if self.wal.disk_pressure().soft {
+            let candidates = self
+                .shards
+                .memtable_snapshots()
+                .unwrap_or_default()
+                .into_iter()
+                .flat_map(|snapshot| snapshot.pressure_candidates)
+                .collect::<Vec<_>>();
+            let victim = memtable::Memtable::select_oldest_wal_victim(&candidates);
+            self.shards.request_wal_pressure_flush(victim);
+        }
+    }
+
+    /// Return the current admission, lane, and shard health metrics.
+    #[must_use]
+    pub fn runtime_snapshot(&self) -> ScribeRuntimeSnapshot {
+        let persistence = self.persistence_cpu.snapshot();
+        let wal_io = self.wal_io.snapshot();
+        let ingress = self.ingress_cpu.snapshot();
+        let lanes = crate::scribe::telemetry::ExecutorSnapshot {
+            depth: persistence.depth.saturating_add(wal_io.depth),
+            capacity: persistence.capacity.saturating_add(wal_io.capacity),
+            saturation_events: persistence
+                .saturation_events
+                .saturating_add(wal_io.saturation_events),
+            completed: persistence.completed.saturating_add(wal_io.completed),
+            failed: persistence.failed.saturating_add(wal_io.failed),
+            panicked: persistence.panicked.saturating_add(wal_io.panicked),
+        };
+        ScribeRuntimeSnapshot {
+            admission: self.admission.snapshot(),
+            executor: crate::scribe::telemetry::ExecutorSnapshot {
+                depth: lanes.depth.saturating_add(ingress.depth),
+                capacity: lanes.capacity.saturating_add(ingress.capacity),
+                saturation_events: lanes
+                    .saturation_events
+                    .saturating_add(ingress.saturation_events),
+                completed: lanes.completed.saturating_add(ingress.completed),
+                failed: lanes.failed.saturating_add(ingress.failed),
+                panicked: lanes.panicked.saturating_add(ingress.panicked),
+            },
+            ingress,
+            persistence,
+            wal_io,
+            shards: crate::scribe::telemetry::ShardHealthSnapshot {
+                shard_tasks: crate::scribe::routing::SCRIBE_SHARD_COUNT,
+                shard_channels: crate::scribe::routing::SCRIBE_SHARD_COUNT,
+                pending_items: self.shards.pending_items(),
+                terminal_errors: 0,
+            },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -233,127 +1836,822 @@ impl Default for ScribeImpl {
 
 #[async_trait]
 impl Scribe for ScribeImpl {
-    async fn append(&self, req: ScribeAppend) -> Result<(), ScribeError> {
-        // batch_id comes from the request (client-supplied v7 UUID); 2PC
-        // recovery in catalog::recovery keys off this exact value.
-        let batch_id = *req.batch_id.as_bytes();
-        let table_fqn = req.table.fqn();
+    /// Acquires the adapter-decode child from Scribe's ingress resources.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::IngestBusy`] when another owner occupies the
+    /// ingress envelope, or [`ScribeError::Internal`] for accounting, poison,
+    /// or other resource-owner failures.
+    fn reserve_otlp_decode(
+        &self,
+        bytes: usize,
+    ) -> Result<crate::contracts::OtlpDecodeOwner, ScribeError> {
+        let memory = self
+            .memory
+            .try_reserve_ingress(memory::MemoryCategory::Decode, bytes)?;
+        Ok(crate::contracts::OtlpDecodeOwner { memory })
+    }
 
-        // Split cross-day input into per-day slices; a cross-day batch
-        // produces two seals into two file_list rows (see seal_key module).
-        let event_days = split_batch_by_event_day(&req.rows)?;
+    /// Reports whether recovery has opened the private durable ingress seam.
+    fn is_ready(&self) -> bool {
+        Self::is_ready(self)
+    }
 
-        for (event_day, day_batch) in event_days {
-            let seal_key = SealKey::new(req.principal.tenant_id, req.table.clone(), event_day);
-
-            let audit_event = AuditEvent {
-                request_id: req.request_id.clone(),
-                trace_id: None,
-                operation: "bifrost.append".to_string(),
-                resource: table_fqn.clone(),
-                card_ref: req.principal.card_ref().cloned(),
-                principal_id: req.principal.id,
-                principal_kind: req.principal.kind.tag(),
-                auth_method: AuthMethod::Jwt,
-                permission: "bifrost:append".to_string(),
-                decision: AuditDecision::Allow,
-                result: AuditResult::Success,
-                payload_summary: format!("{} rows", day_batch.num_rows()),
-                detail: None,
-            };
-
-            let audit_payload =
-                serde_json::to_vec(&audit_event).map_err(|e| ScribeError::Internal {
-                    detail: format!("failed to serialize AuditEvent: {e}"),
-                })?;
-
-            let mut data_payload = Vec::new();
-            {
-                let mut writer = StreamWriter::try_new(&mut data_payload, &day_batch.schema())
-                    .map_err(|e| ScribeError::Internal {
-                        detail: format!("Arrow IPC writer init: {e}"),
-                    })?;
-                writer
-                    .write(&day_batch)
-                    .map_err(|e| ScribeError::Internal {
-                        detail: format!("Arrow IPC write: {e}"),
-                    })?;
-                writer.finish().map_err(|e| ScribeError::Internal {
-                    detail: format!("Arrow IPC finish: {e}"),
-                })?;
-            }
-
-            let wal_lsn = self
-                .wal
-                .append_and_fsync(batch_id, audit_payload, data_payload)?;
-
-            let meta = ScribeAppendMeta {
-                batch_id,
-                rows_accepted: day_batch.num_rows(),
-                wal_lsn_min: wal_lsn,
-                wal_lsn_max: wal_lsn,
-                seal_key: seal_key.as_path_components(),
-            };
-
-            self.memtable
-                .insert(&seal_key, audit_event, meta, day_batch)?;
-
-            if self.memtable.should_seal(&seal_key)? {
-                tracing::info!(seal_key = %seal_key, "seal predicate triggered");
-            }
+    /// Prepares one logical Gate frame and waits for durable completion.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when resolution, projection, admission,
+    /// persistence, or durable acknowledgment fails.
+    async fn ingest_frame(&self, frame: ScribeIngressFrame) -> Result<FrameAdmission, ScribeError> {
+        let active = metrics::gauge!("bifrost_scribe_ingress_active");
+        active.increment(1.0);
+        let _active = ScribeIngressTelemetryGuard(active);
+        if !self.is_ready() {
+            record_scribe_rejection("closed");
+            return Err(ScribeError::IngressClosed);
         }
+        let admission = self
+            .prepare_and_dispatch(frame)
+            .await
+            .inspect_err(|error| {
+                let reason = match error {
+                    ScribeError::UnsupportedWalVersion { .. } => Some("wal"),
+                    ScribeError::PayloadTooLarge { .. }
+                    | ScribeError::DecodedPayloadTooLarge { .. }
+                    | ScribeError::TooManyRows { .. }
+                    | ScribeError::InvalidFrame
+                    | ScribeError::EventTimeOutOfRange { .. }
+                    | ScribeError::FingerprintMismatch { .. }
+                    | ScribeError::TableNotFound { .. }
+                    | ScribeError::CardScopeDenied
+                    | ScribeError::CardUnresolved
+                    | ScribeError::StreamMismatch { .. } => Some("invalid"),
+                    ScribeError::IngressClosed
+                    | ScribeError::WalDiskFull
+                    | ScribeError::IngestBusy { .. }
+                    | ScribeError::ObjectStorePutFailed(_)
+                    | ScribeError::Internal { .. } => None,
+                };
+                if let Some(reason) = reason {
+                    record_scribe_rejection(reason);
+                }
+            })?;
+        Ok(admission)
+    }
+}
 
-        Ok(())
+/// Record one Scribe admission rejection using only closed owner labels.
+fn record_scribe_rejection(reason: &'static str) {
+    metrics::counter!("bifrost_scribe_rejections_total", "reason" => reason).increment(1);
+}
+
+/// Record one memory-ceiling rejection labelled by the ceiling that tripped (D84).
+///
+/// This shares the `bifrost_scribe_rejections_total` counter family with
+/// [`record_scribe_rejection`] but attaches the closed
+/// [`ScribeRejectionCeiling::as_metric_label`] value as the `reason`, so a
+/// dashboard can tell a Scribe-child overflow apart from an ingress-sublimit,
+/// parent-ceiling, or cgroup-breaker rejection instead of reading one collapsed
+/// `reason="memory"`. The label set is closed to the five ceiling values and
+/// carries no tenant, table, or request identity.
+fn record_scribe_ceiling_rejection(ceiling: ScribeRejectionCeiling) {
+    record_scribe_rejection(ceiling.as_metric_label());
+}
+
+/// Emit the three aggregate memtable gauges from a pod-level stats snapshot.
+///
+/// Emission-only: this sets the live gauges and never mutates admission state,
+/// so it is safe to call from the periodic age scanner ([`ScribeImpl::check_age`])
+/// as well as [`ScribeImpl::memtable_stats`]. The three gauges —
+/// `bifrost_scribe_active_memtable_bytes`, `bifrost_scribe_immutable_memtable_bytes`,
+/// and `bifrost_scribe_immutable_generation_count` — make the seal decision
+/// inputs (writable pressure, immutable backlog, generation depth) observable
+/// from production telemetry. The values are pod-global aggregates and carry no
+/// identity labels.
+fn emit_memtable_gauges(stats: &memtable::MemtableStats) {
+    metrics::gauge!("bifrost_scribe_active_memtable_bytes")
+        .set(stats.writable_bytes.to_f64().unwrap_or(f64::MAX));
+    metrics::gauge!("bifrost_scribe_immutable_memtable_bytes")
+        .set(stats.immutable_bytes.to_f64().unwrap_or(f64::MAX));
+    metrics::gauge!("bifrost_scribe_immutable_generation_count")
+        .set(stats.immutable_generations.to_f64().unwrap_or(f64::MAX));
+}
+
+/// Drop guard that drains the Scribe active-ingress gauge on every exit.
+struct ScribeIngressTelemetryGuard(metrics::Gauge);
+
+impl Drop for ScribeIngressTelemetryGuard {
+    /// Release one active ingress ownership unit.
+    fn drop(&mut self) {
+        self.0.decrement(1.0);
+    }
+}
+
+#[cfg(test)]
+mod pressure_config_tests {
+    use super::ScribePressureConfig;
+    use std::time::Duration;
+
+    /// The D83 defaults are the locked 75/50/600 s triple that T40 reads.
+    #[test]
+    fn default_is_the_locked_d83_triple() {
+        let config = ScribePressureConfig::default();
+        assert_eq!(config.ingress_high_water_percent, 75);
+        assert_eq!(config.ingress_low_water_percent, 50);
+        assert_eq!(config.seal_max_age, Duration::from_mins(10));
+    }
+
+    /// A low-water at or above high-water is clamped strictly below it, so the
+    /// hysteresis invariant `low < high` can never be inverted by config.
+    #[test]
+    fn new_clamps_low_water_strictly_below_high_water() {
+        let inverted = ScribePressureConfig::new(60, 90, Duration::from_secs(5));
+        assert_eq!(inverted.ingress_high_water_percent, 60);
+        assert_eq!(inverted.ingress_low_water_percent, 59);
+        assert!(inverted.ingress_low_water_percent < inverted.ingress_high_water_percent);
+
+        let equal = ScribePressureConfig::new(75, 75, Duration::from_secs(5));
+        assert_eq!(equal.ingress_low_water_percent, 74);
+    }
+}
+
+#[cfg(test)]
+mod constructor_rotation_tests {
+    use super::*;
+
+    /// Embedded construction preserves production-selected WAL, memtable, and
+    /// age thresholds when no test-only override is supplied.
+    #[tokio::test]
+    async fn embedded_constructor_preserves_selected_wal_rotation_target() {
+        let segment_bytes = 37 * 1024 * 1024;
+        let wal_root = tempfile::tempdir().expect("WAL root");
+        let wal = Arc::new(
+            wal::WalWriter::new(
+                wal_root.path(),
+                *uuid::Uuid::now_v7().as_bytes(),
+                1,
+                wal::WalConfig::new(segment_bytes).expect("nondefault WAL config"),
+            )
+            .expect("nondefault WAL writer"),
+        );
+        let operator = Arc::new(
+            opendal::Operator::new(opendal::services::Memory::default())
+                .expect("memory backend")
+                .finish(),
+        );
+        let scribe = ScribeImpl::try_new_for_embedded_with_wal_sync_delay_and_admission(
+            operator,
+            Arc::clone(&wal),
+            &uuid::Uuid::now_v7().to_string(),
+            1,
+            Duration::ZERO,
+            AdmissionConfig::default(),
+        )
+        .expect("embedded Scribe");
+        assert_eq!(wal.segment_bytes(), segment_bytes);
+        assert_eq!(
+            scribe.shards.rotation_thresholds_for_test(),
+            (segment_bytes, memtable::MEMTABLE_ROTATION_BYTES)
+        );
+        assert_eq!(
+            scribe.pressure_config.seal_max_age,
+            ScribePressureConfig::default().seal_max_age
+        );
+        scribe
+            .shutdown(std::time::Instant::now() + Duration::from_secs(1))
+            .await;
+    }
+
+    /// Embedded construction applies every explicitly selected test-tier
+    /// threshold to the same shard-owner graph used by production boot.
+    #[tokio::test]
+    async fn embedded_constructor_applies_geometry_for_test_override() {
+        let segment_bytes = 41 * 1024 * 1024;
+        let memtable_bytes = 23 * 1024 * 1024;
+        let max_age = Duration::from_secs(7);
+        let scaled_target_bytes = 3 * 1024 * 1024;
+        let wal_root = tempfile::tempdir().expect("WAL root");
+        let wal = Arc::new(
+            wal::WalWriter::new(
+                wal_root.path(),
+                *uuid::Uuid::now_v7().as_bytes(),
+                1,
+                wal::WalConfig::new(segment_bytes).expect("nondefault WAL config"),
+            )
+            .expect("nondefault WAL writer"),
+        );
+        let operator = Arc::new(
+            opendal::Operator::new(opendal::services::Memory::default())
+                .expect("memory backend")
+                .finish(),
+        );
+        let admission = AdmissionConfig::default();
+        let configured_request_bytes = 201 * 1024 * 1024;
+        let defaults = crate::gate::limits::IngestLimits::default();
+        let ingest_limits = crate::gate::limits::IngestLimits {
+            max_frame_bytes: configured_request_bytes,
+            max_decoding_message_size: configured_request_bytes + 64 * 1024,
+            otlp: crate::gate::limits::OtlpWireLimits {
+                request_bytes: configured_request_bytes,
+                ..defaults.otlp
+            },
+            ..defaults
+        };
+        let scribe = ScribeImpl::new_for_embedded_with_runtime_config_and_admission_and_memory(
+            operator,
+            wal,
+            &uuid::Uuid::now_v7().to_string(),
+            1,
+            ScribeEmbeddedConfig {
+                catalog: None,
+                lane_config: ScribeLaneConfig::default(),
+                admission,
+                coordination_runtime: Handle::current(),
+                persistence: None,
+                resources: embedded_scribe_resources(&admission),
+                staging_file_publisher: None,
+                geometry_for_test: Some(
+                    geometry::ScribeGeometry::for_uniform_shard_rotation(
+                        segment_bytes,
+                        memtable_bytes,
+                        max_age,
+                    )
+                    .expect("nondefault geometry")
+                    .with_staging_target_file_size_bytes(scaled_target_bytes)
+                    .expect("scaled assembled-object target"),
+                ),
+            },
+        )
+        .with_ingest_limits_for_test(ingest_limits);
+
+        assert_eq!(
+            scribe.shards.rotation_thresholds_for_test(),
+            (segment_bytes, memtable_bytes)
+        );
+        assert_eq!(scribe.pressure_config.seal_max_age, max_age);
+        assert_eq!(
+            scribe.geometry_for_test().staging_target_file_size_bytes(),
+            scaled_target_bytes,
+            "the scaled assembled-object target reaches the running Scribe"
+        );
+        assert_eq!(scribe.ingest_limits, ingest_limits);
+        scribe
+            .shutdown(std::time::Instant::now() + Duration::from_secs(1))
+            .await;
+    }
+}
+
+#[cfg(test)]
+mod telemetry_tests {
+    /// Decode scratch remains charged during construction and settles separately.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the production-equivalent root cannot reserve, split, or
+    /// release the exact decode capacities.
+    #[tokio::test]
+    async fn otlp_decode_scratch_split_settles_exactly_once() {
+        let scribe = super::ScribeImpl::default();
+        let baseline = scribe
+            .memory
+            .snapshot()
+            .expect("baseline resource snapshot")
+            .scribe_memory_used_bytes;
+        let mut owner =
+            <super::ScribeImpl as crate::contracts::Scribe>::reserve_otlp_decode(&scribe, 1024)
+                .expect("decode owner reservation");
+        assert_eq!(
+            scribe
+                .memory
+                .snapshot()
+                .expect("reserved resource snapshot")
+                .scribe_memory_used_bytes,
+            baseline + 1024
+        );
+
+        let scratch = owner.split_scratch(256).expect("scratch split");
+        assert_eq!(
+            scribe
+                .memory
+                .snapshot()
+                .expect("split resource snapshot")
+                .scribe_memory_used_bytes,
+            baseline + 1024
+        );
+        drop(scratch);
+        assert_eq!(
+            scribe
+                .memory
+                .snapshot()
+                .expect("scratch release snapshot")
+                .scribe_memory_used_bytes,
+            baseline + 768
+        );
+        let decoded = crate::contracts::DecodedOtlp::new((), 1, owner);
+        assert_eq!(decoded.decode_bytes, 768);
+        drop(decoded);
+        assert_eq!(
+            scribe
+                .memory
+                .snapshot()
+                .expect("terminal resource snapshot")
+                .scribe_memory_used_bytes,
+            baseline
+        );
+    }
+
+    /// The steady-state age path emits only root-owned capacity metric families.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the embedded production-equivalent Scribe cannot emit its
+    /// root snapshot or when a legacy competing capacity family is observed.
+    #[tokio::test]
+    async fn root_resource_metrics_replace_legacy_capacity_families() {
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            super::ScribeImpl::default().check_age(std::time::Instant::now());
+        });
+        let snapshot = recorder.snapshot();
+        assert!(
+            snapshot
+                .gauges
+                .keys()
+                .any(|key| key.starts_with("bifrost_resource_memory_bytes{"))
+        );
+        assert!(
+            snapshot
+                .gauges
+                .keys()
+                .any(|key| key.starts_with("bifrost_resource_scratch_bytes{"))
+        );
+        assert!(snapshot.gauges.keys().all(|key| {
+            !key.starts_with("bifrost_memory_reserved_bytes")
+                && !key.starts_with("bifrost_memory_limit_bytes")
+        }));
+    }
+
+    /// Dropping the ingress owner drains its exact active gauge without identity labels.
+    #[test]
+    fn ingress_telemetry_guard_cancellation_drains_active_zero() {
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            let active = metrics::gauge!("bifrost_scribe_ingress_active");
+            active.increment(1.0);
+            drop(super::ScribeIngressTelemetryGuard(active));
+        });
+        let snapshot = recorder.snapshot();
+        assert!(
+            snapshot
+                .gauges
+                .get("bifrost_scribe_ingress_active")
+                .is_some_and(|value| value.abs() <= f64::EPSILON)
+        );
+        assert!(!snapshot.gauges.keys().any(|key| {
+            ["tenant", "table", "path", "request", "node", "error", "sql"]
+                .iter()
+                .any(|forbidden| key.contains(forbidden))
+        }));
+    }
+
+    /// Every ceiling rejection reason is a closed `snake_case` label with no identity.
+    ///
+    /// Emitting all five D84 ceilings through
+    /// [`super::record_scribe_ceiling_rejection`] proves the write-path rejection
+    /// counter labels the ceiling that tripped and never widens the label set
+    /// with tenant, table, path, request, node, error, or sql identity.
+    #[test]
+    fn write_path_metrics_carry_no_tenant_or_table_label() {
+        use super::ScribeRejectionCeiling;
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            for ceiling in [
+                ScribeRejectionCeiling::CgroupBreaker,
+                ScribeRejectionCeiling::ScribeChild,
+                ScribeRejectionCeiling::IngressSublimit,
+                ScribeRejectionCeiling::BifrostParent,
+                ScribeRejectionCeiling::CgroupParent,
+            ] {
+                super::record_scribe_ceiling_rejection(ceiling);
+            }
+        });
+        let snapshot = recorder.snapshot();
+        for reason in [
+            "cgroup_breaker",
+            "scribe_child",
+            "ingress_sublimit",
+            "bifrost_parent",
+            "cgroup_parent",
+        ] {
+            let key = format!("bifrost_scribe_rejections_total{{reason=\"{reason}\"}}");
+            assert_eq!(
+                snapshot.counters.get(&key).copied(),
+                Some(1),
+                "missing ceiling rejection {key}"
+            );
+        }
+        assert!(!snapshot.counters.keys().any(|key| {
+            ["tenant", "table", "path", "request", "node", "error", "sql"]
+                .iter()
+                .any(|forbidden| key.contains(forbidden))
+        }));
     }
 }
 
 impl ScribeImpl {
+    /// Reports the pod's closed contention registry totals.
+    ///
+    /// The registry is the production observation owner for admission,
+    /// activation, borrowing, and demand transitions, so a fairness case reads
+    /// its totals rather than installing a parallel counter. Read-only: nothing
+    /// here moves capacity or changes a scheduling decision.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn contention_totals_for_test(&self) -> crate::scribe::telemetry::ScribeTelemetrySnapshot {
+        self.admission.contention().telemetry_totals()
+    }
+
+    /// Reports the pod's closed staged-member and claim registry totals.
+    ///
+    /// The same retained observation owner that records admission also records
+    /// the durability half of the pod, so a reconciliation case reads staged
+    /// minus retired members and claims taken minus claims closed from here
+    /// rather than inferring a durable transition from a published object.
+    /// Read-only: nothing here stages, claims, publishes, or retires.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn staging_totals_for_test(&self) -> crate::scribe::telemetry::ScribeStagingSnapshot {
+        self.admission.contention().staging_totals()
+    }
+
+    /// Reports how many complete lifecycle vectors this pod's capacity completes.
+    ///
+    /// Derived once at startup from measured capacity, so a case that has to
+    /// place real contention reads the pod's own ceiling instead of recomputing
+    /// it from configuration.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn ownership_ceiling_for_test(&self) -> usize {
+        self.admission.contention().ownership_ceiling()
+    }
+
+    /// Install a one-shot test barrier at the public write seam.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn stall_next_ingest_for_test(&self) -> Arc<IngestStall> {
+        let stall = Arc::new(IngestStall::default());
+        if let Ok(mut current) = self.ingest_stall.lock() {
+            *current = Some(Arc::clone(&stall));
+        }
+        stall
+    }
     /// Sum of pending (un-fsynced or un-truncated) WAL bytes on this pod.
     #[must_use]
     pub fn wal_pending_bytes(&self) -> u64 {
-        0 // TODO : Real WAL pending bytes
+        self.wal.bytes_on_disk()
+    }
+
+    /// Return the number of bytes currently retained by this pod's WAL.
+    #[must_use]
+    pub fn wal_bytes_on_disk(&self) -> u64 {
+        self.wal.bytes_on_disk()
+    }
+
+    /// Aggregate per-shard memtable state into one pod-level snapshot.
+    ///
+    /// Pure read: it sums every shard's writable and immutable counters without
+    /// touching admission or emitting telemetry, so both the admission-syncing
+    /// [`Self::memtable_stats`] and the emission-only age scanner
+    /// (`Scribe::check_age`) can share one aggregation without one path forcing
+    /// the other's side effects.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when a shard memtable snapshot cannot be read.
+    fn aggregate_memtable_stats(&self) -> Result<memtable::MemtableStats, ScribeError> {
+        let mut stats = memtable::MemtableStats::default();
+        for owner in self.shards.memtable_snapshots()? {
+            stats.writable_rows += owner.stats.writable_rows;
+            stats.writable_bytes += owner.stats.writable_bytes;
+            stats.immutable_rows += owner.stats.immutable_rows;
+            stats.immutable_bytes += owner.stats.immutable_bytes;
+            stats.immutable_generations += owner.stats.immutable_generations;
+            stats.pending_generations += owner.stats.pending_generations;
+            stats.writable_buckets += owner.stats.writable_buckets;
+            stats.immutable_buckets += owner.stats.immutable_buckets;
+        }
+        Ok(stats)
+    }
+
+    /// Return aggregate writable and immutable memtable state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when a shard memtable snapshot cannot be read.
+    pub fn memtable_stats(&self) -> Result<memtable::MemtableStats, ScribeError> {
+        let stats = self.aggregate_memtable_stats()?;
+        self.admission
+            .sync_memtable_bytes(stats.writable_bytes, stats.immutable_bytes);
+        emit_memtable_gauges(&stats);
+        Ok(stats)
+    }
+
+    /// Return the current pod-global admission counters.
+    #[must_use]
+    pub fn admission_snapshot(&self) -> admission::AdmissionSnapshot {
+        self.admission.snapshot()
+    }
+
+    /// Return pod-global Bifrost memory accounting.
+    #[must_use]
+    pub fn memory_snapshot(&self) -> memory::MemorySnapshot {
+        self.memory.memory_snapshot()
+    }
+
+    /// Return the bounded setup and ownership snapshot used by test harnesses.
+    ///
+    /// Governor totals are authoritative. Bucket and transient-shard
+    /// attribution is retried for coherence, but under uninterrupted writes the
+    /// method returns the latest independently sampled attribution rather than
+    /// failing an otherwise valid operational inspection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when memtable statistics or per-shard owner
+    /// snapshots cannot be collected.
+    pub fn inspection_snapshot(&self) -> Result<ScribeInspectionSnapshot, ScribeError> {
+        let stats = self.memtable_stats()?;
+        let mut coherent = None;
+        let mut latest = None;
+        for _ in 0..64 {
+            let before = self.memory.memory_snapshot();
+            let owner_snapshots = self.shards.memtable_snapshots()?;
+            let transient_by_shard = self.memory.shard_snapshot();
+            let memory = self.memory.memory_snapshot().with_ingress_watermarks(
+                self.pressure_config.ingress_high_water_percent,
+                self.pressure_config.ingress_low_water_percent,
+            );
+            let bucket_total = owner_snapshots
+                .iter()
+                .flat_map(|snapshot| &snapshot.bucket_memory)
+                .map(|bucket| bucket.writable_bytes.saturating_add(bucket.immutable_bytes))
+                .sum::<usize>();
+            let transient_total = transient_by_shard.into_iter().sum::<usize>();
+            latest = Some((memory, owner_snapshots.clone(), transient_by_shard));
+            if before.total_bytes() == memory.total_bytes()
+                && bucket_total.saturating_add(transient_total) == memory.total_bytes()
+            {
+                coherent = Some((memory, owner_snapshots, transient_by_shard));
+                break;
+            }
+            std::hint::spin_loop();
+        }
+        let (memory, owner_snapshots, transient_by_shard) =
+            coherent.or(latest).ok_or_else(|| ScribeError::Internal {
+                detail: "inspection could not read bucket and shard ownership".to_owned(),
+            })?;
+        let mut memory_by_shard = [0_usize; crate::scribe::routing::SCRIBE_SHARD_COUNT];
+        let mut memory_by_bucket = Vec::new();
+        for (shard, snapshot) in owner_snapshots.into_iter().enumerate() {
+            for bucket in snapshot.bucket_memory {
+                let bytes = bucket.writable_bytes.saturating_add(bucket.immutable_bytes);
+                memory_by_shard[shard] = memory_by_shard[shard].saturating_add(bytes);
+                memory_by_bucket.push(ScribeBucketMemorySnapshot {
+                    seal_key: bucket.seal_key,
+                    writable_bytes: bucket.writable_bytes,
+                    immutable_bytes: bucket.immutable_bytes,
+                });
+            }
+        }
+        for (shard, bytes) in transient_by_shard.into_iter().enumerate() {
+            memory_by_shard[shard] = memory_by_shard[shard].saturating_add(bytes);
+        }
+        Ok(ScribeInspectionSnapshot {
+            shard_task_count: crate::scribe::routing::SCRIBE_SHARD_COUNT,
+            shard_channel_count: crate::scribe::routing::SCRIBE_SHARD_COUNT,
+            open_wal_stream_count: self.wal.open_stream_count(),
+            queued_items: self.shards.pending_items(),
+            writable_bucket_count: stats.writable_buckets,
+            immutable_bucket_count: stats.immutable_buckets,
+            memory_by_category: memory.categories,
+            memory_by_shard,
+            memory_by_bucket,
+            total_accounted_memory: memory.total_bytes(),
+            parent_used_memory: memory.bifrost_total_bytes,
+            parent_memory_limit: memory.bifrost_limit_bytes,
+            scribe_used_memory: memory.scribe_total_bytes,
+            scribe_memory_limit: memory.scribe_limit_bytes,
+            ingress_used_memory: memory.ingress_occupancy_bytes,
+            ingress_memory_limit: memory.ingress_limit_bytes,
+            ingress_high_water_memory: memory.ingress_high_water_bytes,
+            ingress_low_water_memory: memory.ingress_low_water_bytes,
+            wal_disk_bytes: self.wal.bytes_on_disk(),
+            ingress_lifecycle: self.ingress_lifecycle.snapshot(),
+            generation_lifecycle: self.memory_ownership.lifecycle_snapshot(),
+        })
+    }
+
+    /// Trip the WAL availability breaker for deterministic test-tier probes.
+    ///
+    /// The refusal is held until [`Self::clear_wal_disk_full_injection_for_test`]
+    /// releases it, so a concurrent retirement observing a writable host disk
+    /// cannot end the probe's refusal window early.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn trip_wal_disk_full_for_test(&self) {
+        self.admission.trip_wal_disk_full_injected();
+    }
+
+    /// Release the held test refusal, leaving the latch to real retirement.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn clear_wal_disk_full_injection_for_test(&self) {
+        self.admission.clear_wal_disk_full_injection();
+    }
+
+    /// Returns the bounded CPU pool used by Scribe's ingest materialization.
+    #[must_use]
+    pub fn ingress_cpu_pool(&self) -> ScribeIngressCpuPool {
+        self.ingress_cpu.clone()
     }
 
     /// Row count in the writable bucket for `key` on this pod; 0 if no bucket.
     #[must_use]
     pub fn memtable_row_count(&self, key: &MemtableKey) -> usize {
-        self.memtable.row_count(key).unwrap_or(0)
+        self.shards
+            .memtable_snapshots()
+            .ok()
+            .into_iter()
+            .flatten()
+            .flat_map(|snapshot| snapshot.bucket_memory)
+            .find(|bucket| bucket.seal_key == *key)
+            .map_or(0, |bucket| bucket.row_count)
     }
 
-    /// Every Parquet path this pod has sealed since boot.
-    #[must_use]
-    pub fn sealed_parquet_paths(&self) -> Vec<String> {
-        // TODO : Query vala.file_list for sealed paths for this node
-        vec![]
-    }
-
-    /// Force-seal every non-empty memtable bucket on this pod and wait for the
-    /// seal tx to commit.
+    /// Flushes every active bucket through the staged and claim lifecycle.
+    ///
+    /// This is the one flush: it drives the same path a full pod does, so what
+    /// it produces is what production produces. Every active bucket freezes
+    /// into its shard's persistence queue, the accepted generations become
+    /// durable staged members, and the ready members that target and dwell
+    /// would still hold publish as residue claims.
+    ///
+    /// The flush finishes the lifecycle it started: once the claims are
+    /// published it retires the committed generations, so ownership of their
+    /// Arrow copies is released before it returns rather than on the next age
+    /// tick.
+    ///
+    /// Returns the number of claims published, which is zero for a pod with
+    /// nothing staged rather than an error.
     ///
     /// # Errors
-    /// Returns `ScribeError` if any seal stage fails.
-    pub async fn force_seal(&self, conn: &mut TenantConn<'_>) -> Result<(), ScribeError> {
-        // A `TenantConn` is bound to exactly one tenant. Seal only the
-        // memtable buckets whose seal-key belongs to that tenant; the harness
-        // iterates tenants and opens a fresh `TenantConn` per tenant.
-        //
-        // Pre-commit stages only — caller owns commit and post_commit.
-        // This simplified implementation runs post_commit immediately after,
-        // but real production usage would separate them.
-        let tenant = conn.data_tenant_id();
-        let keys = self.memtable.active_seal_keys_for_tenant(tenant)?;
+    ///
+    /// Returns [`ScribeError`] when a shard cannot flush, when a residue claim
+    /// cannot be taken, merged, or published, or when a shard cannot run the
+    /// retirement pass. Members that did not publish stay durable and staged
+    /// and the WAL stays authoritative for their rows, so the caller may retry.
+    pub async fn flush_staged(&self) -> Result<usize, ScribeError> {
+        self.shards.flush_all().await?;
+        self.shards.drain().await;
+        let Some(persistence) = &self.persistence else {
+            return Ok(0);
+        };
+        persistence.drain().await;
+        let published = persistence
+            .publish_residue(crate::scribe::assembly::ClaimCause::Drain)
+            .await?;
+        self.shards.drain().await;
+        // Publication makes the rows readable from parquet; it does not release
+        // the Arrow copy the shard still owns. That release is otherwise driven
+        // by the coalescing age tick, so a flush that stopped here would return
+        // with its own generations still owning immutable memory until an
+        // unrelated timer fired. Retire them on the flush that published them.
+        self.shards.retire_committed().await?;
+        Ok(published)
+    }
 
-        let mut handles = Vec::with_capacity(keys.len());
-        for key in keys {
-            let handle = self.seal_one(&key, conn).await?;
-            handles.push(handle);
+    /// Replays eligible WAL sequentially through the bounded filesystem lane.
+    ///
+    /// Readiness remains false until every restored shard result, manifest
+    /// advance, and WAL retirement settles. Shutdown requests cancellation
+    /// between records; an already-started shard settlement completes first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] for bounded discovery or admission refusal,
+    /// corrupt or contradictory WAL, cancellation, shard restoration failure,
+    /// manifest advancement failure, or WAL retirement failure.
+    pub async fn replay_wal_async(&self) -> Result<usize, ScribeError> {
+        let started = std::time::Instant::now();
+        self.recovery_ready.store(false, Ordering::Release);
+        if self.recovery_cancelled.load(Ordering::Acquire) {
+            return Err(ScribeError::Internal {
+                detail: "WAL replay cancelled".to_owned(),
+            });
         }
-
-        // Post-commit stages (simplified: run immediately without waiting for commit)
-        for handle in handles {
-            self.seal_one_post_commit(handle).await?;
+        if let Some(persistence) = &self.persistence {
+            let restored = persistence.restore_staging().await?;
+            tracing::info!(
+                restored,
+                stream = %self.stream,
+                "Scribe staged members restored before WAL replay"
+            );
+            let recovered = persistence.recover_staged_publications().await?;
+            tracing::info!(
+                recovered,
+                stream = %self.stream,
+                "Scribe staged publications reconciled before WAL replay"
+            );
+            let resumed = persistence.resume_staging_claims().await?;
+            tracing::info!(
+                resumed,
+                stream = %self.stream,
+                "Scribe durable claims resumed before WAL replay"
+            );
         }
+        let result = self
+            .wal_io
+            .submit(
+                crate::scribe::execution_lanes::ScribeWalIoOp::ReplayDirectoryStream {
+                    path: self.wal.base_dir().to_path_buf(),
+                    wal: Arc::clone(&self.wal),
+                    recovery_stream: self.stream,
+                    shard_senders: self.shards.replay_senders(),
+                    memory: self.memory.clone(),
+                    cancelled: Arc::clone(&self.recovery_cancelled),
+                },
+            )
+            .await;
+        let result = match result {
+            Ok(crate::scribe::execution_lanes::ScribeWalIoResult::ReplayStreamCompleted {
+                restored,
+                retirement_high_water,
+            }) => {
+                self.memtable_stats()?;
+                tracing::info!(
+                    restored,
+                    retirement_high_water,
+                    stream = %self.stream,
+                    "Scribe WAL recovery completed"
+                );
+                Ok(restored)
+            }
+            Ok(_) => Err(ScribeError::Internal {
+                detail: "WAL IO lane returned the wrong replay result".to_owned(),
+            }),
+            Err(error) => {
+                let memory = self.memory.memory_snapshot();
+                tracing::error!(
+                    stage = "replay_stream",
+                    purpose = "scribe_replay",
+                    error = %error,
+                    scribe_current_bytes = memory.scribe_total_bytes,
+                    scribe_limit_bytes = memory.scribe_limit_bytes,
+                    bifrost_current_bytes = memory.bifrost_total_bytes,
+                    bifrost_limit_bytes = memory.bifrost_limit_bytes,
+                    "Scribe WAL recovery failed"
+                );
+                Err(error)
+            }
+        };
+        if result.is_ok() {
+            self.recovery_ready.store(true, Ordering::Release);
+            metrics::histogram!("bifrost_scribe_replay_seconds")
+                .record(started.elapsed().as_secs_f64());
+        }
+        result
+    }
 
-        Ok(())
+    /// Construct the pod-local typed tail reader.
+    pub fn tail_service(&self) -> Result<FetchLiveTailService, ScribeError> {
+        let node_id =
+            uuid::Uuid::parse_str(&self.node_id).map_err(|error| ScribeError::Internal {
+                detail: format!("invalid Scribe node_id: {error}"),
+            })?;
+        let stream = stream_identity::StreamIdentity::new(
+            stream_identity::NodeId::new(node_id),
+            stream_identity::WriterEpoch::new(self.writer_epoch),
+        );
+        Ok(FetchLiveTailService::with_runtime(
+            stream,
+            Arc::clone(&self.shards),
+            self.memory.clone(),
+            Arc::clone(&self.hot_sources),
+        ))
+    }
+
+    /// Construct the bounded, fence-owning Scribe tail reader for new Oracle paths.
+    ///
+    /// The returned reader retains only shallow Arrow snapshots from this Scribe's
+    /// shard runtime and owns the bounded fence protocol used by Oracle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when this Scribe's node identity cannot produce a
+    /// typed stream identity for the reader.
+    pub fn tail_reader(&self) -> Result<ScribeTailReader, ScribeError> {
+        Ok(ScribeTailReader::new(
+            Arc::new(self.tail_service()?),
+            TailFenceConfig::default(),
+        ))
     }
 }

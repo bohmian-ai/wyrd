@@ -118,9 +118,9 @@ transaction-pooled path.
   retained `vala.system.audit_log` history. Deployment readiness includes
   durable idempotent publication and bounded outbox retirement;
   `vala.audit_outbox` is not retained history.
-- Forge scratch is bounded and disposable only after its durable task,
-  attempt, object, catalog, and reconciliation state prove that deletion is
-  safe.
+- Forge requires no local scratch volume: managed compaction does not enable
+  DataFusion disk spilling. Its pod memory limit remains the final physical
+  boundary behind estimated-memory admission.
 - Volume purpose, tenant/table path grammar, encryption, capacity, inode
   budget, cleanup owner, and alert thresholds are explicit. A volume cannot be
   shared across incompatible purposes merely to increase apparent free space.

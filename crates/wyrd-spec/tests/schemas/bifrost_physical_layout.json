@@ -1,0 +1,125 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PhysicalLayoutWire",
+  "description": "The authoritative physical layout of one Bifrost table.\n\nThe same shape is used three ways: as the optional declaration on [`RegisterTableRequest`], as the canonical server-resolved layout returned by [`BifrostTableDescription`], and as the exact JSON persisted in the control row. In the latter two it is always fully populated: the sort order carries at least one key and the Bloom list begins with the schema-present managed floor.\n\nThe partition itself is system-owned. Every table is partitioned on `wyrd_event_time`, so the declaration carries only the granularity and no wire field names a partition column.\n\nOn the request path an omitted `sort_keys` and an explicit empty `sort_keys` resolve identically, because the server injects nothing ahead of a declared key and defaults an empty order to `wyrd_event_time` descending.",
+  "type": "object",
+  "required": [
+    "partition_granularity"
+  ],
+  "properties": {
+    "bloom_columns": {
+      "description": "Ordered Bloom-filtered columns.",
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "partition_granularity": {
+      "description": "Required partition granularity on the managed `wyrd_event_time` column.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/TimeGranularityWire"
+        }
+      ]
+    },
+    "sort_keys": {
+      "description": "Ordered sort keys; at most four may be declared.",
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/SortKeyWire"
+      }
+    }
+  },
+  "definitions": {
+    "NullOrderWire": {
+      "description": "Null placement of one declared physical sort key.",
+      "oneOf": [
+        {
+          "description": "Nulls sort before non-null values.",
+          "type": "string",
+          "enum": [
+            "first"
+          ]
+        },
+        {
+          "description": "Nulls sort after non-null values.",
+          "type": "string",
+          "enum": [
+            "last"
+          ]
+        }
+      ]
+    },
+    "SortDirectionWire": {
+      "description": "Sort direction of one declared physical sort key.",
+      "oneOf": [
+        {
+          "description": "Ascending.",
+          "type": "string",
+          "enum": [
+            "asc"
+          ]
+        },
+        {
+          "description": "Descending.",
+          "type": "string",
+          "enum": [
+            "desc"
+          ]
+        }
+      ]
+    },
+    "SortKeyWire": {
+      "description": "One declared physical sort key.",
+      "type": "object",
+      "required": [
+        "column",
+        "direction",
+        "null_order"
+      ],
+      "properties": {
+        "column": {
+          "description": "Sorted column; must exist in the complete physical schema.",
+          "type": "string"
+        },
+        "direction": {
+          "description": "Sort direction.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/SortDirectionWire"
+            }
+          ]
+        },
+        "null_order": {
+          "description": "Null placement.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/NullOrderWire"
+            }
+          ]
+        }
+      }
+    },
+    "TimeGranularityWire": {
+      "description": "Time-partition granularity on the wire.\n\nBifrost v1 partitions every table on `wyrd_event_time` and admits exactly these two Iceberg-native transforms; nothing else is representable.",
+      "oneOf": [
+        {
+          "description": "One partition per UTC hour.",
+          "type": "string",
+          "enum": [
+            "hour"
+          ]
+        },
+        {
+          "description": "One partition per UTC day.",
+          "type": "string",
+          "enum": [
+            "day"
+          ]
+        }
+      ]
+    }
+  }
+}

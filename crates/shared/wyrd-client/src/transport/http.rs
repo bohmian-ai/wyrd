@@ -7,6 +7,7 @@
 //!
 //! - [`HttpTransport::request_json`] — JSON in, JSON out.
 //! - [`HttpTransport::request_arrow`] — JSON in, raw Arrow IPC bytes + metadata headers out.
+//! - [`HttpTransport::request_json_stream`] — JSON in, terminal-framed streaming bytes out.
 //! - [`HttpTransport::submit_idempotent`] — JSON in, JSON out, one stable `Idempotency-Key`.
 //!
 //! Each helper mints a fresh origin `wyrd-request-id` per request: in v1 the
@@ -29,6 +30,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::request_id::RequestId;
 
 use crate::auth::{AuthError, AuthMiddleware};
 use crate::error::{WyrdClientError, from_problem_json};
@@ -48,6 +50,7 @@ const HEADER_REQUEST_ID: &str = "wyrd-request-id";
 const HEADER_IDEMPOTENCY_KEY: &str = "Idempotency-Key";
 const HEADER_SCHEMA_FINGERPRINT: &str = "X-Wyrd-Schema-Fingerprint";
 const HEADER_ROW_COUNT: &str = "X-Wyrd-Row-Count";
+const QUERY_STREAM_CONTENT_TYPE: &str = "application/vnd.wyrd.bifrost-query-stream";
 /// Wyrd access-token header. The server authenticates data-plane requests from
 /// this header only; the application's own `Authorization` header is reserved
 /// for the embedding app and is never read or written by Wyrd.
@@ -55,13 +58,16 @@ const HEADER_WYRD_ACCESS_TOKEN: &str = "x-wyrd-access-token";
 
 /// Async `reqwest` HTTP transport for Wyrd read and admin paths.
 ///
-/// Holds one [`reqwest::Client`] built from [`HttpConfig`] (timeout, optional
-/// gzip) and a shared [`AuthMiddleware`] (D3: same `Arc` as gRPC). Each
-/// request helper resolves the bearer via [`AuthMiddleware::bearer`], attaches
-/// `wyrd-request-id`, and applies the retry policy before returning.
+/// Holds bounded and streaming [`reqwest::Client`] handles built from one
+/// [`HttpConfig`] plus a shared [`AuthMiddleware`] (D3: same `Arc` as gRPC).
+/// Ordinary requests retain the configured total deadline. Terminal streams
+/// bound connection establishment but let the server query deadline and caller
+/// cancellation govern response-body lifetime.
 #[derive(Clone)]
 pub struct HttpTransport {
     client: reqwest::Client,
+    /// Connection-bounded client whose response body has no generic deadline.
+    stream_client: reqwest::Client,
     auth: Arc<AuthMiddleware>,
     base_url: String,
 }
@@ -83,26 +89,19 @@ impl HttpTransport {
     }
     /// Build a transport from config and a shared auth middleware.
     ///
-    /// Sets the per-request timeout from `config.timeout_ms` and enables gzip
-    /// decompression when `config.compression` is `true`.
+    /// Builds ordinary and terminal-stream clients from one TLS/compression
+    /// configuration. `config.timeout_ms` is the ordinary total deadline and
+    /// the streaming connection deadline.
     ///
     /// # Errors
     /// Returns [`WyrdClientError::TransportDown`] when the underlying
     /// `reqwest::Client` cannot be constructed.
     pub fn new(config: &HttpConfig, auth: Arc<AuthMiddleware>) -> Result<Self, WyrdClientError> {
-        let mut builder =
-            reqwest::Client::builder().timeout(Duration::from_millis(config.timeout_ms));
-        if config.compression {
-            builder = builder.gzip(true);
-        }
-        let client = builder
-            .build()
-            .map_err(|err| WyrdClientError::TransportDown {
-                transport: "http".to_owned(),
-                message: format!("failed to build HTTP client: {err}"),
-            })?;
+        let client = build_http_client(config, HttpClientDeadline::Total)?;
+        let stream_client = build_http_client(config, HttpClientDeadline::ConnectOnly)?;
         Ok(Self {
             client,
+            stream_client,
             auth,
             base_url: config.base_url.trim_end_matches('/').to_owned(),
         })
@@ -285,6 +284,135 @@ impl HttpTransport {
             })?;
         if response.status().is_success() {
             Ok(response)
+        } else {
+            let body = response
+                .json::<serde_json::Value>()
+                .await
+                .unwrap_or_else(|_| serde_json::json!({}));
+            Err(from_problem_json(&body))
+        }
+    }
+
+    /// Send an authenticated JSON request and return its response body as a
+    /// stream. This is used by terminal-safe query clients so response bytes
+    /// are decoded incrementally without buffering the result. Connection
+    /// establishment is bounded by `HttpConfig::timeout_ms`; body lifetime is
+    /// intentionally not subject to the ordinary total-request deadline.
+    /// Cancelling this future abandons connection setup; dropping the returned
+    /// response stops unbuffered body consumption.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable Wyrd error for request serialization, authentication,
+    /// transport, HTTP problem responses, or an unexpected success media type.
+    pub async fn request_json_stream<S>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: &S,
+    ) -> Result<reqwest::Response, WyrdError>
+    where
+        S: Serialize,
+    {
+        let request_id = self.auth.request_id(None);
+        self.request_json_stream_inner(method, path, body, &request_id, false)
+            .await
+    }
+
+    /// Sends a streaming JSON request with one caller-owned request identity.
+    ///
+    /// The response remains unbuffered. Success is returned only when the
+    /// server echoes the exact UUIDv7 request ID in its response headers.
+    /// Cancelling this future abandons connection setup; dropping the returned
+    /// response stops unbuffered body consumption.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable transport or protocol error, including a missing or
+    /// mismatched response request ID.
+    pub async fn request_json_stream_with_id<S>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: &S,
+        request_id: &RequestId,
+    ) -> Result<reqwest::Response, WyrdError>
+    where
+        S: Serialize,
+    {
+        self.request_json_stream_inner(method, path, body, request_id.as_str(), true)
+            .await
+    }
+
+    /// Sends one streaming request and optionally enforces the caller-owned ID echo.
+    ///
+    /// Cancelling this future abandons connection setup; a successful response
+    /// remains unbuffered and is owned by the caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns stable URL, authentication, serialization, transport, HTTP,
+    /// media-type, or request-identity errors.
+    async fn request_json_stream_inner<S>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: &S,
+        request_id: &str,
+        verify_request_id: bool,
+    ) -> Result<reqwest::Response, WyrdError>
+    where
+        S: Serialize,
+    {
+        let url = self.authenticated_url(path)?;
+        let bearer = self.auth.bearer().await.map_err(auth_to_wyrd)?;
+        let payload = serde_json::to_vec(body).map_err(|error| WyrdError::Internal {
+            message: format!("request serialization failed: {error}"),
+            details: serde_json::json!({}),
+        })?;
+        let response = self
+            .stream_client
+            .request(method, url)
+            .header(
+                HEADER_WYRD_ACCESS_TOKEN,
+                format!("Bearer {}", bearer.expose()),
+            )
+            .header(HEADER_REQUEST_ID, request_id)
+            .header("content-type", "application/json")
+            .header("accept", QUERY_STREAM_CONTENT_TYPE)
+            .body(payload)
+            .send()
+            .await
+            .map_err(|error| WyrdError::Internal {
+                message: format!("transport error: {error}"),
+                details: serde_json::json!({"transport": "http"}),
+            })?;
+        if response.status().is_success() {
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split(';').next())
+                .map(str::trim);
+            if content_type == Some(QUERY_STREAM_CONTENT_TYPE) {
+                let echoed = header_str(&response, HEADER_REQUEST_ID);
+                if !verify_request_id || echoed == Some(request_id) {
+                    Ok(response)
+                } else {
+                    Err(WyrdError::UpstreamFailure {
+                        message: "query response request identity did not match".to_owned(),
+                        details: serde_json::json!({"reason": "request_id_mismatch"}),
+                    })
+                }
+            } else {
+                Err(WyrdError::UpstreamFailure {
+                    message: "query response used an unsupported content type".to_owned(),
+                    details: serde_json::json!({
+                        "expected": QUERY_STREAM_CONTENT_TYPE,
+                        "actual": content_type
+                    }),
+                })
+            }
         } else {
             let body = response
                 .json::<serde_json::Value>()
@@ -541,6 +669,51 @@ impl HttpTransport {
     }
 }
 
+/// Builds the shared Reqwest client after installing Wyrd's process TLS provider.
+///
+/// # Errors
+///
+/// Returns [`WyrdClientError::TransportDown`] when another Rustls provider
+/// already owns the process or Reqwest rejects the client configuration.
+///
+/// Deadline mode for one concrete HTTP client pool.
+enum HttpClientDeadline {
+    /// Bound connect and complete response-body consumption.
+    Total,
+    /// Bound connection establishment while leaving body lifetime to its owner.
+    ConnectOnly,
+}
+
+/// Builds one Reqwest client with the selected deadline semantics.
+///
+/// # Errors
+///
+/// Returns [`WyrdClientError::TransportDown`] when another Rustls provider
+/// already owns the process or Reqwest rejects the client configuration.
+fn build_http_client(
+    config: &HttpConfig,
+    deadline: HttpClientDeadline,
+) -> Result<reqwest::Client, WyrdClientError> {
+    wyrd_tls::install_crypto_provider().map_err(|error| WyrdClientError::TransportDown {
+        transport: "http".to_owned(),
+        message: error.to_string(),
+    })?;
+    let timeout = Duration::from_millis(config.timeout_ms);
+    let mut builder = match deadline {
+        HttpClientDeadline::Total => reqwest::Client::builder().timeout(timeout),
+        HttpClientDeadline::ConnectOnly => reqwest::Client::builder().connect_timeout(timeout),
+    };
+    if config.compression {
+        builder = builder.gzip(true);
+    }
+    builder
+        .build()
+        .map_err(|err| WyrdClientError::TransportDown {
+            transport: "http".to_owned(),
+            message: format!("failed to build HTTP client: {err}"),
+        })
+}
+
 /// Serialize an optional body to JSON bytes.
 fn serialize_body<S: Serialize>(body: Option<&S>) -> Result<Option<Vec<u8>>, WyrdError> {
     body.map(serde_json::to_vec)
@@ -607,4 +780,22 @@ fn split_origin(url: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((scheme, authority))
+}
+
+#[cfg(test)]
+mod tls_tests {
+    /// Reqwest builds an HTTPS request before any tonic/server initialization.
+    #[test]
+    fn https_client_initializes_provider_standalone() {
+        let client = super::build_http_client(
+            &crate::transport::config::HttpConfig::default(),
+            super::HttpClientDeadline::Total,
+        )
+        .expect("standalone HTTPS client builds");
+        client
+            .get("https://localhost/health")
+            .build()
+            .expect("HTTPS request builds");
+        wyrd_tls::install_crypto_provider().expect("HTTP boundary retained AWS-LC ownership");
+    }
 }

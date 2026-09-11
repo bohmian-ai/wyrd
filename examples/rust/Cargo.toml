@@ -82,7 +82,7 @@ anyhow = "1"
 reqwest = { workspace = true }
 async-trait = { workspace = true }
 opentelemetry = { workspace = true }
-opentelemetry-stdout = { version = "0.27", features = ["trace"] }
+opentelemetry-stdout = { version = "0.31", features = ["trace"] }
 opentelemetry_sdk = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

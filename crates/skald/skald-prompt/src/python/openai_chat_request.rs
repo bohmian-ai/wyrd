@@ -23,7 +23,7 @@ use skald_spec::wire::openai_chat::{
     OpenAiResponseModality, OpenAiStop, OpenAiStreamOptions, OpenAiTool, OpenAiToolChoiceMode,
     OpenAiVoice,
 };
-use wyrd_interfaces::error::CardPyResult;
+use wyrd_utils::py::WyrdPyResult;
 
 use super::openai_chat_messages::PyOpenAiChatMessage;
 use super::shared::ChatMessageSource;
@@ -178,7 +178,7 @@ impl PyOpenAiChatSettings {
         self.s().seed
     }
     #[getter]
-    fn logit_bias(&self, py: Python<'_>) -> CardPyResult<Option<Py<PyAny>>> {
+    fn logit_bias(&self, py: Python<'_>) -> WyrdPyResult<Option<Py<PyAny>>> {
         self.s()
             .logit_bias
             .as_ref()
@@ -238,7 +238,7 @@ impl PyOpenAiChatSettings {
         self.s().store
     }
     #[getter]
-    fn metadata(&self, py: Python<'_>) -> CardPyResult<Option<Py<PyAny>>> {
+    fn metadata(&self, py: Python<'_>) -> WyrdPyResult<Option<Py<PyAny>>> {
         self.s()
             .metadata
             .as_ref()
@@ -257,7 +257,7 @@ impl PyOpenAiChatSettings {
         self.s().top_logprobs
     }
     #[getter]
-    fn extra(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+    fn extra(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         wyrd_utils::py::json_to_pyobject(py, &serde_json::Value::Object(self.s().extra.clone()))
             .map_err(Into::into)
     }
@@ -307,13 +307,13 @@ impl PyOpenAiStop {
             OpenAiStop::Many(_) => "many",
         }
     }
-    fn as_one(&self) -> CardPyResult<String> {
+    fn as_one(&self) -> WyrdPyResult<String> {
         match self.s() {
             OpenAiStop::One(s) => Ok(s.clone()),
             _ => Err(wrong_variant("one", self.kind()).into()),
         }
     }
-    fn as_many(&self) -> CardPyResult<Vec<String>> {
+    fn as_many(&self) -> WyrdPyResult<Vec<String>> {
         match self.s() {
             OpenAiStop::Many(v) => Ok(v.clone()),
             _ => Err(wrong_variant("many", self.kind()).into()),
@@ -389,13 +389,13 @@ impl PyOpenAiVoice {
             OpenAiVoice::Custom(_) => "custom",
         }
     }
-    fn as_built_in(&self) -> CardPyResult<&'static str> {
+    fn as_built_in(&self) -> WyrdPyResult<&'static str> {
         match self.v() {
             OpenAiVoice::BuiltIn(b) => Ok(openai_built_in_voice_str(b)),
             _ => Err(wrong_variant("built_in", self.kind()).into()),
         }
     }
-    fn as_custom(&self) -> CardPyResult<String> {
+    fn as_custom(&self) -> WyrdPyResult<String> {
         match self.v() {
             OpenAiVoice::Custom(c) => Ok(c.id.clone()),
             _ => Err(wrong_variant("custom", self.kind()).into()),
@@ -498,13 +498,13 @@ impl PyOpenAiPredictionPayload {
             OpenAiPredictionPayload::Parts(_) => "parts",
         }
     }
-    fn as_text(&self) -> CardPyResult<String> {
+    fn as_text(&self) -> WyrdPyResult<String> {
         match self.p() {
             OpenAiPredictionPayload::Text(s) => Ok(s.clone()),
             _ => Err(wrong_variant("text", self.kind()).into()),
         }
     }
-    fn as_parts(&self) -> CardPyResult<Vec<PyOpenAiPredictionContentPart>> {
+    fn as_parts(&self) -> WyrdPyResult<Vec<PyOpenAiPredictionContentPart>> {
         match self.p() {
             OpenAiPredictionPayload::Parts(ps) => Ok((0..ps.len())
                 .map(|i| PyOpenAiPredictionContentPart {
@@ -541,7 +541,7 @@ impl PyOpenAiPredictionContentPart {
             OpenAiPredictionContentPart::Text { .. } => "text",
         }
     }
-    fn as_text(&self) -> CardPyResult<String> {
+    fn as_text(&self) -> WyrdPyResult<String> {
         match self.p() {
             OpenAiPredictionContentPart::Text { text } => Ok(text.clone()),
         }
@@ -608,7 +608,7 @@ impl PyOpenAiResponseFormat {
             OpenAiResponseFormat::JsonSchema { .. } => "json_schema",
         }
     }
-    fn as_json_schema(&self) -> CardPyResult<PyOpenAiJsonSchema> {
+    fn as_json_schema(&self) -> WyrdPyResult<PyOpenAiJsonSchema> {
         match self.f() {
             OpenAiResponseFormat::JsonSchema { .. } => Ok(PyOpenAiJsonSchema {
                 inner: Arc::clone(&self.inner),
@@ -655,7 +655,7 @@ impl PyOpenAiJsonSchema {
         self.s().description.as_deref()
     }
     #[getter]
-    fn schema(&self, py: Python<'_>) -> CardPyResult<Option<Py<PyAny>>> {
+    fn schema(&self, py: Python<'_>) -> WyrdPyResult<Option<Py<PyAny>>> {
         self.s()
             .schema
             .as_ref()
@@ -701,7 +701,7 @@ impl PyOpenAiTool {
             OpenAiTool::Custom { .. } => "custom",
         }
     }
-    fn as_function(&self) -> CardPyResult<PyOpenAiFunction> {
+    fn as_function(&self) -> WyrdPyResult<PyOpenAiFunction> {
         match self.t() {
             OpenAiTool::Function { .. } => Ok(PyOpenAiFunction {
                 inner: Arc::clone(&self.inner),
@@ -710,7 +710,7 @@ impl PyOpenAiTool {
             _ => Err(wrong_variant("function", self.kind()).into()),
         }
     }
-    fn as_custom_tool(&self) -> CardPyResult<PyOpenAiCustomTool> {
+    fn as_custom_tool(&self) -> WyrdPyResult<PyOpenAiCustomTool> {
         match self.t() {
             OpenAiTool::Custom { .. } => Ok(PyOpenAiCustomTool {
                 inner: Arc::clone(&self.inner),
@@ -759,7 +759,7 @@ impl PyOpenAiFunction {
         self.f().description.as_deref()
     }
     #[getter]
-    fn parameters(&self, py: Python<'_>) -> CardPyResult<Option<Py<PyAny>>> {
+    fn parameters(&self, py: Python<'_>) -> WyrdPyResult<Option<Py<PyAny>>> {
         self.f()
             .parameters
             .as_ref()
@@ -857,7 +857,7 @@ impl PyOpenAiCustomToolFormat {
             OpenAiCustomToolFormat::Grammar { .. } => "grammar",
         }
     }
-    fn as_grammar(&self) -> CardPyResult<PyOpenAiGrammar> {
+    fn as_grammar(&self) -> WyrdPyResult<PyOpenAiGrammar> {
         match self.f() {
             OpenAiCustomToolFormat::Grammar { .. } => Ok(PyOpenAiGrammar {
                 inner: Arc::clone(&self.inner),
@@ -946,7 +946,7 @@ impl PyOpenAiChatToolChoice {
             OpenAiChatToolChoice::Custom(_) => "custom",
         }
     }
-    fn as_mode(&self) -> CardPyResult<&'static str> {
+    fn as_mode(&self) -> WyrdPyResult<&'static str> {
         match self.c() {
             OpenAiChatToolChoice::Mode(m) => Ok(match m {
                 OpenAiToolChoiceMode::None => "none",
@@ -956,7 +956,7 @@ impl PyOpenAiChatToolChoice {
             _ => Err(wrong_variant("mode", self.kind()).into()),
         }
     }
-    fn as_allowed(&self) -> CardPyResult<PyOpenAiAllowedToolsChoice> {
+    fn as_allowed(&self) -> WyrdPyResult<PyOpenAiAllowedToolsChoice> {
         match self.c() {
             OpenAiChatToolChoice::Allowed(_) => Ok(PyOpenAiAllowedToolsChoice {
                 inner: Arc::clone(&self.inner),
@@ -964,7 +964,7 @@ impl PyOpenAiChatToolChoice {
             _ => Err(wrong_variant("allowed", self.kind()).into()),
         }
     }
-    fn as_function_choice(&self) -> CardPyResult<PyOpenAiNamedFunctionToolChoice> {
+    fn as_function_choice(&self) -> WyrdPyResult<PyOpenAiNamedFunctionToolChoice> {
         match self.c() {
             OpenAiChatToolChoice::Function(_) => Ok(PyOpenAiNamedFunctionToolChoice {
                 inner: Arc::clone(&self.inner),
@@ -972,7 +972,7 @@ impl PyOpenAiChatToolChoice {
             _ => Err(wrong_variant("function", self.kind()).into()),
         }
     }
-    fn as_custom_choice(&self) -> CardPyResult<PyOpenAiNamedCustomToolChoice> {
+    fn as_custom_choice(&self) -> WyrdPyResult<PyOpenAiNamedCustomToolChoice> {
         match self.c() {
             OpenAiChatToolChoice::Custom(_) => Ok(PyOpenAiNamedCustomToolChoice {
                 inner: Arc::clone(&self.inner),
@@ -1060,7 +1060,7 @@ impl PyOpenAiAllowedTools {
         }
     }
     #[getter]
-    fn tools(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+    fn tools(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         let arr = serde_json::Value::Array(
             self.a()
                 .tools

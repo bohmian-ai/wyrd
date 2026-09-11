@@ -260,22 +260,35 @@ impl AgentRun {
     /// Raises:
     ///     WyrdError: When conversation conversion fails.
     #[getter]
-    pub fn conversation(&self, py: pyo3::Python<'_>) -> pyo3::PyResult<pyo3::Py<pyo3::PyAny>> {
-        let value = serde_json::to_value(&self.conversation)
-            .map_err(|error| pyo3::exceptions::PyRuntimeError::new_err(error.to_string()))?;
-        wyrd_utils::py::json_to_pyobject(py, &value)
+    pub fn conversation(
+        &self,
+        py: pyo3::Python<'_>,
+    ) -> wyrd_utils::py::WyrdPyResult<pyo3::Py<pyo3::PyAny>> {
+        let value = serde_json::to_value(&self.conversation).map_err(run_boundary_error)?;
+        wyrd_utils::py::json_to_pyobject(py, &value).map_err(wyrd_utils::py::WyrdPyError::from)
     }
 
     /// Return the structured terminal error.
     ///
     /// Returns:
     ///     WyrdError | None: Terminal error for abort-shaped runs.
+    ///
+    /// Raises:
+    ///     WyrdError: When the terminal error cannot be built as a Python
+    ///         exception object. The failure is surfaced rather than silently
+    ///         collapsed to `None`, which would report an aborted run as one
+    ///         that ended without an error.
     #[getter]
-    pub fn error(&self, py: pyo3::Python<'_>) -> Option<pyo3::Py<pyo3::PyAny>> {
-        self.error
-            .clone()
-            .map(|error| wyrd_utils::py::wyrd_error_to_py_object(py, error))
-            .and_then(Result::ok)
+    pub fn error(
+        &self,
+        py: pyo3::Python<'_>,
+    ) -> wyrd_utils::py::WyrdPyResult<Option<pyo3::Py<pyo3::PyAny>>> {
+        let Some(error) = self.error.clone() else {
+            return Ok(None);
+        };
+        wyrd_utils::py::wyrd_error_to_py_object(py, error)
+            .map(Some)
+            .map_err(wyrd_utils::py::WyrdPyError::from)
     }
 
     /// Return parsed structured output, when the prompt declared an output schema.
@@ -286,12 +299,14 @@ impl AgentRun {
     pub fn structured_output(
         &self,
         py: pyo3::Python<'_>,
-    ) -> pyo3::PyResult<Option<pyo3::Py<pyo3::PyAny>>> {
+    ) -> wyrd_utils::py::WyrdPyResult<Option<pyo3::Py<pyo3::PyAny>>> {
         let Some(map) = self.structured_output.as_ref() else {
             return Ok(None);
         };
         let value = serde_json::Value::Object(map.clone());
-        wyrd_utils::py::json_to_pyobject(py, &value).map(Some)
+        wyrd_utils::py::json_to_pyobject(py, &value)
+            .map(Some)
+            .map_err(wyrd_utils::py::WyrdPyError::from)
     }
 
     /// Return the typed model instance when the prompt declared an output class.
@@ -311,7 +326,7 @@ impl AgentRun {
     pub fn provider_response(
         &self,
         py: pyo3::Python<'_>,
-    ) -> pyo3::PyResult<Option<pyo3::Py<pyo3::PyAny>>> {
+    ) -> wyrd_utils::py::WyrdPyResult<Option<pyo3::Py<pyo3::PyAny>>> {
         let Some(arc) = self.final_response.as_ref() else {
             return Ok(None);
         };
@@ -333,4 +348,17 @@ impl AgentRun {
             self.finish_reason, self.output, self.iterations
         )
     }
+}
+
+/// Project a run-projection serialization failure onto the Wyrd catalog.
+///
+/// `AgentRun` owns fully-serializable state, so a failure here means the
+/// interpreter or serializer refused work rather than that the run was
+/// malformed; the catalog `WYRD_SPEC_500_INTERNAL` variant records it.
+#[cfg(feature = "python")]
+fn run_boundary_error(error: serde_json::Error) -> wyrd_utils::py::WyrdPyError {
+    wyrd_utils::py::WyrdPyError::from(wyrd_spec::error::WyrdError::Internal {
+        message: error.to_string(),
+        details: serde_json::json!({ "boundary": "skald_agent_python" }),
+    })
 }

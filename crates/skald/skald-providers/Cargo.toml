@@ -26,6 +26,7 @@ jsonwebtoken = { workspace = true }
 url = { workspace = true }
 urlencoding = { workspace = true }
 httpdate = { workspace = true }
+wyrd-tls = { workspace = true }
 
 [dev-dependencies]
 wiremock = { workspace = true }

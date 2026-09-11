@@ -1,17 +1,19 @@
--- Stage 1 OLAP control tables.
+-- Stage 1 OLAP control table.
 -- vala.bifrost_tables: registry (one row per registered Bifrost table).
--- vala.olap_commits:   2PC anchor (one row per commit attempt).
--- vala.refresh_epochs: cache invalidation watermark.
--- All tenant-scoped with RLS.
+-- Tenant-scoped with RLS.
 
 CREATE TABLE vala.bifrost_tables (
     data_tenant_id      UUID    NOT NULL REFERENCES platform.tenants(data_tenant_id),
     table_uid           BYTEA   NOT NULL CHECK (octet_length(table_uid) = 16),
     fqn                 TEXT    NOT NULL,
     fingerprint         BYTEA   NOT NULL CHECK (octet_length(fingerprint) = 32),
-    scope               TEXT    NOT NULL CHECK (scope IN ('tenant_owned', 'system_shared')),
     status              TEXT    NOT NULL CHECK (status IN ('active', 'deprecated', 'quarantined')) DEFAULT 'active',
-    partition_columns   TEXT[]  NOT NULL DEFAULT ARRAY[]::TEXT[],
+    -- Canonical PhysicalLayoutWire object: the exact JSON the describe route
+    -- returns. Three keys, in this order: partition_granularity ('hour' or
+    -- 'day', the system-owned partition on wyrd_event_time), and the fully
+    -- populated sort_keys and bloom_columns arrays. No key names a partition
+    -- column, and no SQL predicate reads inside this document.
+    physical_layout     JSONB   NOT NULL,
     registered_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     origin              TEXT,
@@ -29,74 +31,6 @@ CREATE POLICY tenant_isolation ON vala.bifrost_tables
 CREATE INDEX bifrost_tables_fingerprint_idx
     ON vala.bifrost_tables (data_tenant_id, fingerprint);
 
-
--- 2PC anchor keyed on batch_id. snapshot_id is library-generated and only
--- known AFTER the Iceberg commit (recovery scans snapshot_properties for
--- wyrd_batch_id), so it is nullable and never read for correctness.
--- Stage 1 FSM: precommit / committed / failed only. 'aborted' is Stage-2-only.
-CREATE TABLE vala.olap_commits (
-    data_tenant_id      UUID    NOT NULL REFERENCES platform.tenants(data_tenant_id),
-    table_uid           BYTEA   NOT NULL CHECK (octet_length(table_uid) = 16),
-    batch_id            BYTEA   NOT NULL CHECK (octet_length(batch_id) = 16),
-    snapshot_id         BIGINT,
-    state               TEXT    NOT NULL CHECK (state IN ('precommit', 'committed', 'failed')),
-    precommit_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-    committed_at        TIMESTAMPTZ,
-    finalized_at        TIMESTAMPTZ,
-    error_code          TEXT,
-    error_detail        TEXT,
-    origin              TEXT,
-    actor               TEXT,
-    PRIMARY KEY (data_tenant_id, table_uid, batch_id),
-    FOREIGN KEY (data_tenant_id, table_uid)
-        REFERENCES vala.bifrost_tables(data_tenant_id, table_uid)
-);
-
-ALTER TABLE vala.olap_commits ENABLE ROW LEVEL SECURITY;
-ALTER TABLE vala.olap_commits FORCE  ROW LEVEL SECURITY;
-CREATE POLICY tenant_isolation ON vala.olap_commits
-    USING      (data_tenant_id = wyrd.current_tenant())
-    WITH CHECK (data_tenant_id = wyrd.current_tenant());
-
-CREATE INDEX olap_commits_state_idx
-    ON vala.olap_commits (data_tenant_id, table_uid, state)
-    WHERE state IN ('precommit', 'failed');
-
-
-CREATE TABLE vala.refresh_epochs (
-    data_tenant_id      UUID    NOT NULL REFERENCES platform.tenants(data_tenant_id),
-    table_uid           BYTEA   NOT NULL CHECK (octet_length(table_uid) = 16),
-    epoch               BIGINT  NOT NULL DEFAULT 0,
-    bumped_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (data_tenant_id, table_uid),
-    FOREIGN KEY (data_tenant_id, table_uid)
-        REFERENCES vala.bifrost_tables(data_tenant_id, table_uid)
-);
-
-ALTER TABLE vala.refresh_epochs ENABLE ROW LEVEL SECURITY;
-ALTER TABLE vala.refresh_epochs FORCE  ROW LEVEL SECURITY;
-CREATE POLICY tenant_isolation ON vala.refresh_epochs
-    USING      (data_tenant_id = wyrd.current_tenant())
-    WITH CHECK (data_tenant_id = wyrd.current_tenant());
-
 GRANT SELECT, INSERT, UPDATE, DELETE
-    ON vala.bifrost_tables, vala.olap_commits, vala.refresh_epochs
+    ON vala.bifrost_tables
     TO wyrd_app;
-
--- Reserved system-owner tenant. SystemShared tables register their
--- bifrost_tables / olap_commits rows under this sentinel so there is exactly
--- one commit coordinator per physical table. The nil UUID is never a valid
--- UUIDv7, so it cannot collide with a real tenant.
---
--- status 'active' is required: the platform.tenants CHECK constraint only
--- permits active/suspended/deleted; 'system' would abort the migration. The
--- auth boundary is the real guard — no auth path may resolve a principal to
--- the nil UUID (wyrd_spec::DataTenantId::SYSTEM_OWNER).
-INSERT INTO platform.tenants (data_tenant_id, slug, display_name, status)
-VALUES (
-    '00000000-0000-0000-0000-000000000000',
-    'wyrd-system-owner',
-    'Wyrd System Owner',
-    'active'
-)
-ON CONFLICT (data_tenant_id) DO NOTHING;

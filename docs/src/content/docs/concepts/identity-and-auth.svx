@@ -41,7 +41,7 @@ This page is the map. The three pages it links to hold the detail:
     ['act chain', 'RFC 8693 delegation record embedded in a token: the ordered list of principals that delegated down to the callee.'],
     ['Trusted issuer', 'An external OIDC issuer whose JWTs Wyrd will verify, scoped to one tenant.'],
     ['Workload binding', 'Server-owned mapping (issuer, subject, audience) → CardRef that names which Service/Agent a workload assertion represents.'],
-    ['RBAC', 'Role-based access control. A principal\'s roles resolve to an effective permission set of resource:action entries.'],
+    ['RBAC', 'Role-based access control. A principal\'s roles resolve to an effective permission set of { resource, action, scope } entries.'],
     ['PolicyHook', 'Pluggable policy-evaluation seam that gates the /v1/authz/check endpoint before RBAC.']
   ]}
 />
@@ -111,7 +111,8 @@ The per-grant flows, with diagrams, are on the
 
 Authentication answers *who is calling*. Authorization answers *may they do
 this*. After a token verifies, its role claims resolve to an effective
-permission set, and RBAC checks the requested `resource:action` against it.
+permission set, and RBAC checks the requested permission — operation *and*
+object scope — against it.
 
 Agent-to-agent calls add a second layer. A caller with `delegation:issue` can
 exchange its token for a **delegated** Service/Agent token that carries an `act`

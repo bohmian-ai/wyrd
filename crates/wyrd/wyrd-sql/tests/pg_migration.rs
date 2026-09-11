@@ -25,9 +25,130 @@ mod pg_tests {
     // already defines local helpers of the same name with different signatures.
     use wyrd_sql::queries::auth::insert_trusted_issuer as insert_trusted_issuer_query;
     use wyrd_sql::queries::auth::insert_workload_binding as insert_workload_binding_query;
-    use wyrd_sql::queries::platform::audit_log::{StorageAuditEvent, write_storage_event};
     use wyrd_sql::queries::storage;
     use wyrd_sql::{SqlError, SqlStore, TenantConn};
+
+    const SYSTEM_TENANT_MIGRATION_VERSION: i64 = 20260601000014;
+
+    /// The system-owner seed is exact, repeatable, and rejects ambiguous ownership.
+    #[tokio::test]
+    async fn system_owner_seed_migration_is_strict_and_idempotent() {
+        let Some(_) = database_url() else {
+            return;
+        };
+        let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
+            .await
+            .expect("fixture starts with fresh migration");
+        let pool = fixture.superuser_pool().await.expect("migrator pool");
+        let system_id = DataTenantId::SYSTEM_OWNER.as_uuid();
+
+        let exact: (
+            String,
+            String,
+            String,
+            Option<chrono::DateTime<chrono::Utc>>,
+        ) = sqlx::query_as(
+            "SELECT slug, display_name, status, deleted_at
+                   FROM platform.tenants
+                  WHERE data_tenant_id = $1",
+        )
+        .bind(system_id)
+        .fetch_one(&pool)
+        .await
+        .expect("fresh migration seeds system tenant");
+        assert_eq!(
+            exact,
+            (
+                "wyrd-system".to_owned(),
+                "Wyrd System".to_owned(),
+                "active".to_owned(),
+                None,
+            )
+        );
+
+        wyrd_sql::migrate(&pool)
+            .await
+            .expect("repeat migration is idempotent");
+        sqlx::query("DELETE FROM wyrd._sqlx_migrations WHERE version = $1")
+            .bind(SYSTEM_TENANT_MIGRATION_VERSION)
+            .execute(&pool)
+            .await
+            .expect("remove migration ledger for compatible-state proof");
+        wyrd_sql::migrate(&pool)
+            .await
+            .expect("exact compatible preexistence is accepted");
+
+        sqlx::query(
+            "UPDATE platform.tenants
+                SET display_name = 'Impostor System'
+              WHERE data_tenant_id = $1",
+        )
+        .bind(system_id)
+        .execute(&pool)
+        .await
+        .expect("stage incompatible sentinel");
+        sqlx::query("DELETE FROM wyrd._sqlx_migrations WHERE version = $1")
+            .bind(SYSTEM_TENANT_MIGRATION_VERSION)
+            .execute(&pool)
+            .await
+            .expect("remove migration ledger for conflict proof");
+        assert!(
+            wyrd_sql::migrate(&pool).await.is_err(),
+            "incompatible nil-UUID attributes must fail"
+        );
+        let display_name: (String,) =
+            sqlx::query_as("SELECT display_name FROM platform.tenants WHERE data_tenant_id = $1")
+                .bind(system_id)
+                .fetch_one(&pool)
+                .await
+                .expect("conflicting sentinel remains");
+        assert_eq!(display_name.0, "Impostor System");
+
+        sqlx::query(
+            "UPDATE platform.tenants
+                SET display_name = 'Wyrd System'
+              WHERE data_tenant_id = $1",
+        )
+        .bind(system_id)
+        .execute(&pool)
+        .await
+        .expect("restore exact sentinel");
+        wyrd_sql::migrate(&pool)
+            .await
+            .expect("restored exact sentinel migrates");
+
+        sqlx::query("DELETE FROM platform.tenants WHERE data_tenant_id = $1")
+            .bind(system_id)
+            .execute(&pool)
+            .await
+            .expect("remove sentinel for slug conflict");
+        let conflicting_tenant = DataTenantId::new_v7();
+        sqlx::query(
+            "INSERT INTO platform.tenants
+                (data_tenant_id, slug, display_name, status)
+             VALUES ($1, 'wyrd-system', 'Conflicting Tenant', 'active')",
+        )
+        .bind(conflicting_tenant.as_uuid())
+        .execute(&pool)
+        .await
+        .expect("stage canonical slug conflict");
+        sqlx::query("DELETE FROM wyrd._sqlx_migrations WHERE version = $1")
+            .bind(SYSTEM_TENANT_MIGRATION_VERSION)
+            .execute(&pool)
+            .await
+            .expect("remove migration ledger for slug conflict proof");
+        assert!(
+            wyrd_sql::migrate(&pool).await.is_err(),
+            "canonical slug ownership by another tenant must fail"
+        );
+        let owner: (Uuid,) = sqlx::query_as(
+            "SELECT data_tenant_id FROM platform.tenants WHERE slug = 'wyrd-system'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("conflicting slug owner remains");
+        assert_eq!(owner.0, conflicting_tenant.as_uuid());
+    }
 
     #[tokio::test]
     async fn migrations_apply_and_are_idempotent() {
@@ -520,22 +641,6 @@ mod pg_tests {
             assert_eq!(metadata.backend, StorageBackendKind::S3);
             assert_eq!(metadata.sha256, sha);
 
-            write_storage_event(
-                &mut conn,
-                StorageAuditEvent {
-                    subject_id: "test-subject",
-                    operation: "upload_complete",
-                    storage_path: &storage_path,
-                    status_code: 200,
-                    error_code: None,
-                    request_id: "test-request",
-                    backend: StorageBackendKind::S3,
-                    upload_id: Some(upload_id),
-                },
-            )
-            .await
-            .expect("storage audit event writes");
-
             storage::idempotency::store(
                 &mut conn,
                 "idem-key",
@@ -683,13 +788,13 @@ mod pg_tests {
             "expired upload must be selected for sweeping"
         );
 
-        storage::admin::multipart_uploads::mark_aborted_admin(
-            store.pool(),
-            upload_id,
-            "test-sweeper",
-        )
-        .await
-        .expect("admin abort update succeeds");
+        let mut conn = TenantConn::acquire(store.pool(), tenant)
+            .await
+            .expect("tenant connection opens");
+        storage::admin::multipart_uploads::mark_aborted_admin(&mut conn, upload_id, "test-sweeper")
+            .await
+            .expect("admin abort update succeeds");
+        conn.commit().await.expect("admin abort commits");
 
         cleanup_storage_test_rows(store.pool(), &[tenant])
             .await
@@ -1684,10 +1789,6 @@ mod pg_tests {
             .map(|tenant| tenant.as_uuid())
             .collect::<Vec<_>>();
 
-        sqlx::query("DELETE FROM wyrd.storage_access_ledger WHERE data_tenant_id = ANY($1)")
-            .bind(&tenant_ids)
-            .execute(pool)
-            .await?;
         sqlx::query("DELETE FROM wyrd.storage_idempotency_keys WHERE data_tenant_id = ANY($1)")
             .bind(&tenant_ids)
             .execute(pool)

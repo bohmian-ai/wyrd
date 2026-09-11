@@ -6,6 +6,32 @@ use wyrd_error_derive::WyrdError;
 /// Errors raised by the `wyrd` binary.
 #[derive(Debug, Error, WyrdError)]
 pub enum WyrdCliError {
+    /// Required Oracle client configuration was not supplied.
+    #[error("query configuration is missing {field}")]
+    #[wyrd_error(
+        code = "WYRD_CLI_400_QUERY_CONFIG",
+        status = 400,
+        title = "Query configuration missing",
+        remediation = "Pass --server and --token or set WYRD_SERVER_URL and WYRD_ACCESS_TOKEN."
+    )]
+    QueryConfig {
+        /// Missing command field.
+        field: &'static str,
+    },
+
+    /// Oracle query setup, streaming, terminal validation, or output failed.
+    #[error("query failed: {detail}")]
+    #[wyrd_error(
+        code = "WYRD_CLI_500_QUERY",
+        status = 500,
+        title = "Oracle query failed",
+        remediation = "Inspect the stable query error and terminal diagnostics, then retry."
+    )]
+    Query {
+        /// Scrubbed query failure detail.
+        detail: String,
+    },
+
     /// Client-delegated simulated-user mode was requested without a script.
     #[error("--simulated-user client requires --simulated-user-script <PATH>")]
     #[wyrd_error(
@@ -417,5 +443,132 @@ impl WyrdCliError {
             502 | 503 => 69,
             _ => 1,
         }
+    }
+}
+
+/// Error crossing the binary boundary from either local CLI work or Oracle query SDK work.
+#[derive(Debug)]
+pub enum CliBoundaryError {
+    /// A derive-catalogued failure owned by the local CLI.
+    Local(WyrdCliError),
+    /// An Oracle query failure already projected onto the shared catalog.
+    ///
+    /// The SDK owns that projection, so the binary boundary reads its stable
+    /// metadata straight off the catalog error instead of keeping a second
+    /// per-variant table here.
+    Query(wyrd_spec::error::WyrdError),
+}
+
+impl From<WyrdCliError> for CliBoundaryError {
+    /// Preserves an existing local CLI error at the binary boundary.
+    fn from(error: WyrdCliError) -> Self {
+        Self::Local(error)
+    }
+}
+
+impl From<vala_sdk::ValaSdkError> for CliBoundaryError {
+    /// Projects an originating query SDK error onto the shared catalog.
+    fn from(error: vala_sdk::ValaSdkError) -> Self {
+        Self::Query(wyrd_spec::error::WyrdError::from(error))
+    }
+}
+
+impl CliBoundaryError {
+    /// Returns the originating stable error code.
+    #[must_use]
+    pub fn code(&self) -> &str {
+        match self {
+            Self::Local(error) => error.code(),
+            Self::Query(error) => error.code(),
+        }
+    }
+
+    /// Returns the originating HTTP-equivalent status.
+    #[must_use]
+    pub fn status(&self) -> u16 {
+        match self {
+            Self::Local(error) => error.status(),
+            Self::Query(error) => error.status(),
+        }
+    }
+
+    /// Returns the originating stable title.
+    #[must_use]
+    pub fn title(&self) -> &str {
+        match self {
+            Self::Local(error) => error.title(),
+            Self::Query(error) => error.title(),
+        }
+    }
+
+    /// Returns the scrubbed human-readable detail.
+    #[must_use]
+    pub fn detail(&self) -> String {
+        match self {
+            Self::Local(error) => error.to_string(),
+            Self::Query(error) => error
+                .as_problem_json()
+                .get("detail")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("query failed")
+                .to_owned(),
+        }
+    }
+
+    /// Returns the originating remediation.
+    #[must_use]
+    pub fn remediation(&self) -> &str {
+        match self {
+            Self::Local(error) => error.remediation(),
+            Self::Query(error) => error.remediation(),
+        }
+    }
+
+    /// Returns JSON-safe structured diagnostics when supplied by the source.
+    #[must_use]
+    pub fn details(&self) -> Option<serde_json::Value> {
+        match self {
+            Self::Local(_) => None,
+            Self::Query(error) => error.as_problem_json().get("details").cloned(),
+        }
+    }
+
+    /// Returns the process exit code associated with the boundary status.
+    #[must_use]
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            Self::Local(error) => error.exit_code(),
+            Self::Query(error) => match error.status() {
+                400 => 64,
+                422 => 65,
+                _ => 1,
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use wyrd_spec::error::WyrdError;
+
+    use super::*;
+
+    /// Query boundary errors retain source metadata and bypass the CLI query catalog.
+    #[test]
+    fn query_boundary_preserves_originating_problem_metadata() {
+        let error = CliBoundaryError::from(vala_sdk::ValaSdkError::Transport(
+            WyrdError::PermissionDeniedRbac {
+                message: "query denied".to_owned(),
+                details: serde_json::json!({"required_scope": "bifrost_query:read"}),
+            },
+        ));
+        assert_eq!(error.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
+        assert_eq!(error.status(), 403);
+        assert_eq!(error.title(), "Permission denied (RBAC)");
+        assert_eq!(error.detail(), "query denied");
+        assert_eq!(
+            error.details(),
+            Some(serde_json::json!({"required_scope": "bifrost_query:read"}))
+        );
     }
 }

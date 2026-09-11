@@ -9,14 +9,13 @@
 #
 # WHAT IT CHECKS: from_pools (both method and associated-function call forms)
 # does not appear outside the 2 definition files, 9 production wiring sites,
-# and 8 test sites listed in the glob exclusions below.
+# and 2 test sites listed in the glob exclusions below.
 set -e
 # from_pools may only be called from the sites below.
 # 2 definition files: wyrd-sql/src/postgres.rs, vala-sql/src/postgres.rs
 # 9 production wiring files: wyrd-server/src/{state,boot/mod,http/middleware/authenticate,components/{auth/{principal_extractor,caller_extractor,policy_hook,routes},health},postgres}.rs
-# 3 in-src #[cfg(test)] sites: wyrd-server/src/{bifrost/service,query/service,app/server}.rs
-# 5 integration test files: wyrd-server/tests/{pg_authz_check_route,pg_grpc_smoke,pg_router_smoke,pg_grpc_ingest_smoke,pg_merge_http_protected}.rs
-# 3 vala test/harness files: wyrd-testing/src/bifrost/scribe_harness.rs, vala-bifrost-redux/tests/pg_scribe_seal.rs, vala-bifrost/src/writer/commit/pg_tests.rs
+# 4 in-src #[cfg(test)] sites: wyrd-server/src/{bifrost/service,query/service,app/server,oracle/lifecycle_service}.rs
+# 1 Vala test file: vala-bifrost-redux/tests/pg_scribe_seal.rs
 # Harness audited FD-009: constructs ValaPostgres for test fixture only.
 ! rg -n --no-heading -e '\.from_pools\(|::from_pools\(' \
     --glob '!crates/wyrd/wyrd-sql/src/postgres.rs' \
@@ -33,12 +32,6 @@ set -e
     --glob '!crates/wyrd/wyrd-server/src/bifrost/service.rs' \
     --glob '!crates/wyrd/wyrd-server/src/query/service.rs' \
     --glob '!crates/wyrd/wyrd-server/src/app/server.rs' \
-    --glob '!crates/wyrd/wyrd-server/tests/pg_authz_check_route.rs' \
-    --glob '!crates/wyrd/wyrd-server/tests/pg_grpc_smoke.rs' \
-    --glob '!crates/wyrd/wyrd-server/tests/pg_router_smoke.rs' \
-    --glob '!crates/wyrd/wyrd-server/tests/pg_grpc_ingest_smoke.rs' \
-    --glob '!crates/wyrd/wyrd-server/tests/pg_merge_http_protected.rs' \
+    --glob '!crates/wyrd/wyrd-server/src/oracle/lifecycle_service.rs' \
     --glob '!crates/vala/vala-bifrost-redux/tests/pg_scribe_seal.rs' \
-    --glob '!crates/wyrd/wyrd-testing/src/bifrost/scribe_harness.rs' \
-    --glob '!crates/vala/vala-bifrost/src/writer/commit/pg_tests.rs' \
     crates/ python/

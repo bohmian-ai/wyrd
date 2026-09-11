@@ -1,0 +1,69 @@
+# Nextest is this repository's Rust test harness in every environment: local
+# `mise run test:*` lanes and GitHub Actions alike. CI needs no extra setup —
+# workflows invoke `mise run <task>`, and `jdx/mise-action` installs the
+# `cargo:cargo-nextest` pin from `[tools]` in mise.toml.
+#
+# The deciding reason for nextest over `cargo test` is process-per-test
+# isolation, not speed. The harness installs the production telemetry stack once
+# per process — a global metrics recorder and tracing subscriber
+# (crates/wyrd/wyrd-testing/src/bifrost/cluster.rs:578-611) — and tier-1 tests
+# assert on `checkpoint()` deltas of those process-global counters. Two tests
+# sharing one process fold each other's Forge counters into their own delta, so
+# `cargo test --test-threads=6` fails
+# convergence::pg_bifrost_forge_small_files_converges_without_query_dependency
+# at convergence.rs:240 while nextest passes it. Serialization was the old way
+# to avoid that; per-test processes make it correct instead of merely avoided.
+
+# The Forge integration binary boots a Postgres-backed fixture per test, each
+# retaining its own connection pools, so its concurrency is bounded by Postgres
+# connections rather than CPU — the same constraint the journey profile states.
+# The crate lane already runs it under that profile; the family lanes
+# (scripts/run-family-tests.sh) run it under the default profile, where CPU
+# parallelism oversubscribes the fixtures and their deterministic bounds are
+# missed. This group applies the same ceiling wherever that binary runs.
+[test-groups.postgres-fixtures]
+max-threads = 6
+
+[profile.default]
+# nextest reports LEAK when a test's process has not fully quiesced within this
+# window after the test function returns. The test still passes. Fixtures here
+# tear down an in-process server and drop an ephemeral database, which
+# occasionally exceeds the 100ms default under load without anything actually
+# leaking.
+leak-timeout = "2s"
+# Match the old lanes' `--no-fail-fast`: one broken test must not hide the rest
+# of a binary.
+fail-fast = false
+
+[[profile.default.overrides]]
+filter = 'package(vala-bifrost-redux) and binary(integration)'
+test-group = 'postgres-fixtures'
+
+# The router smoke binary's Forge readiness matrix boots one WyrdTestServer per
+# case for the same reason: each case mutates durable scheduler, demand, or
+# quarantine state that a shared server could not isolate. It carries the same
+# per-fixture connection cost, so it takes the same ceiling.
+[[profile.default.overrides]]
+filter = 'package(wyrd-server) and binary(pg_router_smoke)'
+test-group = 'postgres-fixtures'
+
+[profile.journey]
+# Tier-1 journey binaries boot a WyrdTestServer per test, each retaining its own
+# connection pools. Concurrency is bounded by Postgres connections rather than
+# CPU: with WYRD_DB_MAX_CONNECTIONS=8 (scripts/postgres/with-test-postgres.sh)
+# against max_connections=400 (docker-compose.yml), six concurrent journeys sit
+# well inside the ceiling. Raise both together, never this alone.
+test-threads = 6
+leak-timeout = "5s"
+fail-fast = false
+
+# The sustained journey asserts that a pod lending one vector to four
+# concurrent tenants refuses at least once. That refusal only happens when the
+# four tenants are genuinely in flight together, which is why the test runs its
+# own multi-threaded runtime. Five sibling journeys competing for the same cores
+# serialize those tenants instead, and the run then observes no refusal at all
+# and fails. Reserving every slot keeps the contention it measures a property of
+# the pod rather than of the host.
+[[profile.journey.overrides]]
+filter = 'test(=sustained::scribe_sustained_ingest_oracle_hot_read_journey)'
+threads-required = 'num-test-threads'

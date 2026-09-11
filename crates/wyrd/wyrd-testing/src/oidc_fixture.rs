@@ -51,8 +51,12 @@ impl OidcIssuerFixture {
     /// fetched from `{issuer_url}/.well-known/openid-configuration`.
     ///
     /// # Panics
-    /// Panics when discovery fails.
+    /// Panics when another Rustls provider already owns the process, the HTTP
+    /// client cannot be built, or discovery fails. This deliberately
+    /// infallible test-fixture API converts setup failures into test failures.
     pub async fn connect(issuer_base: &str) -> Self {
+        wyrd_tls::install_crypto_provider()
+            .expect("Wyrd's AWS-LC provider must own fixture TLS before client construction");
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()

@@ -14,7 +14,7 @@ All tables are pre-declared `DomainTable` instances registered at boot. The phys
 
 ### Shared signal tables
 
-**Namespace:** `vala.traces`, `vala.metrics`, `vala.logs`, `vala.genai`, `vala.eval`, `vala.drift`, `vala.dev`
+**Namespace:** `vala.traces`, `vala.metrics`, `vala.logs`, `vala.eval`, `vala.drift`, `vala.dev`
 
 **Partitioning:** `Day(event_time) + Bucket(tenant, 64)`
 
@@ -46,63 +46,58 @@ User-defined datasets for high-volume custom observability writes. Each tenant g
 
 ## vala.traces.spans
 
-Source type: `SpanRecord` (`wyrd-spec::vala::traces`).
+The sole canonical durable table for the OTLP trace signal. Its ledger lives in
+`vala-bifrost-redux::tables::traces::spans::SPAN_FIELDS`; each field carries an
+immutable table-local id published as `PARQUET:field_id`. Span events, span
+links, resource, scope, and the promoted GenAI attributes are columns of this
+table — there are no child tables.
 
 | Column | Physical type | Notes |
 |---|---|---|
 | `trace_id` | `FixedSizeBinary(16)` | 128-bit trace ID |
 | `span_id` | `FixedSizeBinary(8)` | 64-bit span ID |
 | `parent_span_id` | `FixedSizeBinary(8)` nullable | Absent for root span |
-| `flags` | `UInt32` | OpenTelemetry span flags |
+| `trace_state` | `Utf8` | W3C tracestate |
+| `flags` | `Int64` | OpenTelemetry span flags; Iceberg has no unsigned integer type |
 | `name` | `Utf8` | Span operation name |
-| `kind` | `Utf8` | `SERVER`, `CLIENT`, `INTERNAL`, etc. |
-| `start_time` | `Timestamp(µs, UTC)` | Span start |
-| `end_time` | `Timestamp(µs, UTC)` | Span end |
-| `duration_ms` | `UInt64` | `(end_time - start_time) / 1000` |
-| `status` | `Utf8` | `OK`, `ERROR`, `UNSET` |
-| `attributes` | `Utf8View` nullable | JSON-serialized span attributes, **payload-gated** |
-| `service_name` | `Utf8` | Emitting service |
+| `kind` | `Int32` | OTLP `SpanKind` enum value |
+| `start_time_unix_nano` | `Int64` | Span start |
+| `end_time_unix_nano` | `Int64` | Span end |
+| `duration_nano` | `Int64` | `end_time_unix_nano - start_time_unix_nano` |
+| `status_present` | `Bool` | Distinguishes an absent status from a present empty one |
+| `status_code` | `Int32` nullable | |
+| `status_message` | `Utf8` nullable | **payload-gated** |
+| `attributes` | `Binary` | Canonical KeyValue encoding, **payload-gated** |
+| `dropped_attributes_count` | `Int64` | |
+| `events` | `List<Struct>` | Nested span events, **payload-gated** |
+| `dropped_events_count` | `Int64` | |
+| `links` | `List<Struct>` | Nested span links, **payload-gated** |
+| `dropped_links_count` | `Int64` | |
+| `resource_present` | `Bool` | |
+| `resource_attributes` | `Binary` | **payload-gated** |
+| `resource_dropped_attributes_count` | `Int64` | |
+| `resource_schema_url` | `Utf8` | |
+| `resource_entity_refs` | `List<Binary>` | Pinned `EntityRef` encoding, **payload-gated** |
+| `scope_present` | `Bool` | |
+| `scope_name` | `Utf8` | |
+| `scope_version` | `Utf8` | |
+| `scope_attributes` | `Binary` | **payload-gated** |
+| `scope_dropped_attributes_count` | `Int64` | |
+| `scope_schema_url` | `Utf8` | |
+| `service_name` | `Utf8` nullable | Promoted from resource attributes |
+| `gen_ai_operation_name` | `Utf8` nullable | Promoted GenAI attribute |
+| `gen_ai_provider_name` | `Utf8` nullable | Promoted GenAI attribute |
+| `gen_ai_request_model` | `Utf8` nullable | Promoted GenAI attribute |
+| `gen_ai_conversation_id` | `Utf8` nullable | Promoted GenAI attribute |
+| `gen_ai_usage_input_tokens` | `Int64` nullable | Promoted GenAI attribute |
+| `gen_ai_usage_output_tokens` | `Int64` nullable | Promoted GenAI attribute |
 | + system columns | | |
 
-## vala.traces.events
-
-| Column | Physical type |
-|---|---|
-| `trace_id` | `FixedSizeBinary(16)` |
-| `span_id` | `FixedSizeBinary(8)` |
-| `timestamp` | `Timestamp(µs, UTC)` |
-| `name` | `Utf8` |
-| `attributes` | `Utf8View` nullable, **payload-gated** |
-| + system columns | |
-
-## vala.traces.links
-
-| Column | Physical type |
-|---|---|
-| `trace_id` | `FixedSizeBinary(16)` |
-| `span_id` | `FixedSizeBinary(8)` |
-| `linked_trace_id` | `FixedSizeBinary(16)` |
-| `linked_span_id` | `FixedSizeBinary(8)` |
-| `attributes` | `Utf8View` nullable, **payload-gated** |
-| + system columns | |
-
-## vala.genai.messages
-
-Source type: `GenAiSpanRecord`.
-
-| Column | Physical type | Notes |
-|---|---|---|
-| `trace_id` | `FixedSizeBinary(16)` | |
-| `span_id` | `FixedSizeBinary(8)` | |
-| `start_time` | `Timestamp(µs, UTC)` | |
-| `provider_name` | `Utf8` | e.g. `openai`, `anthropic` |
-| `request_model` | `Utf8` | Model name as requested |
-| `conversation_id` | `Utf8` nullable | |
-| `usage_input_tokens` | `UInt32` nullable | |
-| `usage_output_tokens` | `UInt32` nullable | |
-| `input_messages` | `Utf8View` nullable | **payload-gated** |
-| `output_messages` | `Utf8View` nullable | **payload-gated** |
-| + system columns | |
+Nested `events` elements carry `time_unix_nano`, `name`, `attributes`, and
+`dropped_attributes_count`. Nested `links` elements carry `trace_id`,
+`span_id`, `trace_state`, `flags`, `attributes`, and
+`dropped_attributes_count`. Both subtrees are entirely caller content and are
+omitted by a metadata-only projection.
 
 ## vala.metrics.points
 
@@ -114,7 +109,7 @@ Source type: `MetricRecord`.
 | `time` | `Timestamp(µs, UTC)` |
 | `metric_type` | `Utf8` |
 | `value` | `Float64` nullable |
-| `attributes` | `Utf8View` nullable |
+| `attributes` | `Utf8` nullable |
 | + system columns | |
 
 ## vala.logs.records
@@ -125,10 +120,10 @@ Source type: `LogRecord`.
 |---|---|
 | `time` | `Timestamp(µs, UTC)` nullable |
 | `observed_time` | `Timestamp(µs, UTC)` |
-| `severity_number` | `UInt32` nullable |
+| `severity_number` | `Int64` nullable |
 | `severity_text` | `Utf8` nullable |
 | `event_name` | `Utf8` nullable, **payload-gated** |
-| `body` | `Utf8View` nullable, **payload-gated** |
+| `body` | `Utf8` nullable, **payload-gated** |
 | `trace_id` | `FixedSizeBinary(16)` nullable |
 | `span_id` | `FixedSizeBinary(8)` nullable |
 | + system columns | |
@@ -172,8 +167,8 @@ Source type: `AgentTraceRecord`.
 | `run_id` | `Utf8` |
 | `started_at` | `Timestamp(µs, UTC)` |
 | `ended_at` | `Timestamp(µs, UTC)` |
-| `messages` | `Utf8View`, **payload-gated** |
-| `tool_io` | `Utf8View` nullable, **payload-gated** |
+| `messages` | `Utf8`, **payload-gated** |
+| `tool_io` | `Utf8` nullable, **payload-gated** |
 | + system columns | |
 
 ## Type mapping
@@ -183,6 +178,6 @@ Source type: `AgentTraceRecord`.
 | `FixedSizeBinary(16)` | `String` (lowercase hex) | trace_id, batch_id |
 | `FixedSizeBinary(8)` | `String` (lowercase hex) | span_id |
 | `Timestamp(µs, UTC)` | `DateTime<Utc>` (RFC3339) | All timestamps |
-| `Utf8View` | `String` or `serde_json::Value` | Attributes are JSON-parsed |
-| `UInt32` nullable | `Option<i64>` | Token counts |
+| `Utf8` | `String` or `serde_json::Value` | Attributes are JSON-parsed |
+| `Int64` nullable | `Option<i64>` | Token counts, counts, and other unsigned OTLP values |
 | `Float64` nullable | `Option<f64>` | Scores, values |

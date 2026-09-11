@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "BifrostQueryRequest",
+  "description": "Public synchronous Oracle query request.",
+  "type": "object",
+  "required": [
+    "freshness",
+    "sql",
+    "visibility"
+  ],
+  "properties": {
+    "deadline_ms": {
+      "description": "Optional caller deadline in milliseconds.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "freshness": {
+      "description": "Required freshness behavior.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/FreshnessPolicy"
+        }
+      ]
+    },
+    "sql": {
+      "description": "SELECT-only SQL text.",
+      "type": "string"
+    },
+    "visibility": {
+      "description": "Visibility tiers requested by the caller.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/VisibilityMode"
+        }
+      ]
+    }
+  },
+  "definitions": {
+    "FreshnessPolicy": {
+      "description": "Behavior when a requested live source cannot complete.",
+      "oneOf": [
+        {
+          "description": "Fail when every requested source cannot complete.",
+          "type": "string",
+          "enum": [
+            "strict"
+          ]
+        },
+        {
+          "description": "Retain a bounded degraded result when live data is unavailable.",
+          "type": "string",
+          "enum": [
+            "allow_degraded"
+          ]
+        }
+      ]
+    },
+    "VisibilityMode": {
+      "description": "Visibility tiers included in one immutable Oracle query cut.",
+      "oneOf": [
+        {
+          "description": "Read pinned Iceberg and hot sealed files.",
+          "type": "string",
+          "enum": [
+            "published_only"
+          ]
+        },
+        {
+          "description": "Also read the exact fenced live-tail interval.",
+          "type": "string",
+          "enum": [
+            "fused"
+          ]
+        }
+      ]
+    }
+  }
+}

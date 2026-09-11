@@ -77,16 +77,31 @@ struct JwtClaims {
 
 impl GoogleOAuth {
     /// Creates an OAuth loader from inline account JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::Auth`] when another Rustls provider already
+    /// owns the process or the metadata HTTP client cannot be built.
     pub fn from_account_json(json: impl Into<String>) -> ProviderResult<Self> {
         Self::new(GoogleOAuthSource::InlineJson(json.into()))
     }
 
     /// Creates an OAuth loader from an ADC credentials file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::Auth`] when another Rustls provider already
+    /// owns the process or the metadata HTTP client cannot be built.
     pub fn from_credentials_file(path: impl Into<PathBuf>) -> ProviderResult<Self> {
         Self::new(GoogleOAuthSource::CredentialsFile(path.into()))
     }
 
     /// Creates an OAuth loader using a metadata-server base URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::Auth`] when another Rustls provider already
+    /// owns the process or the metadata HTTP client cannot be built.
     pub fn from_metadata_server(base_url: impl Into<String>) -> ProviderResult<Self> {
         Self::new(GoogleOAuthSource::Metadata {
             base_url: base_url.into(),
@@ -94,6 +109,13 @@ impl GoogleOAuth {
     }
 
     /// Resolves the supported ADC chain without making network calls yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns a decode or authentication error when configured credentials or
+    /// metadata URLs are invalid. Returns [`ProviderError::Auth`] when another
+    /// Rustls provider already owns the process or the metadata HTTP client
+    /// cannot be built.
     pub fn from_env() -> ProviderResult<Self> {
         if let Ok(encoded) = std::env::var("GOOGLE_ACCOUNT_JSON_BASE64") {
             let decoded = base64::engine::general_purpose::STANDARD
@@ -127,7 +149,17 @@ impl GoogleOAuth {
         Self::from_metadata_server(base_url)
     }
 
+    /// Build a Google credential source with a provider-owned HTTP client.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::Auth`] when another Rustls provider already
+    /// owns the process or Reqwest cannot construct the metadata client.
     fn new(source: GoogleOAuthSource) -> ProviderResult<Self> {
+        wyrd_tls::install_crypto_provider().map_err(|error| ProviderError::Auth {
+            provider: "google".to_owned(),
+            detail: error.to_string(),
+        })?;
         let http = reqwest::Client::builder()
             .build()
             .map_err(|error| ProviderError::decode("google", error))?;

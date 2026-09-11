@@ -48,9 +48,17 @@ non-null columns:
 - `wyrd_request_id`: server-minted or validated request correlation;
 - `data_tenant_id`: authenticated tenant-isolation identity.
 
-Nullable `run_id`, `card_uid`, and `principal_id` provide correlation and do
-not participate in row identity. Within a tenant-qualified physical table, row
-identity is:
+Nullable `run_id` and `card_uid` provide optional Card/Run correlation.
+Required, non-null `principal_id` identifies the authenticated publisher. None
+participates in row identity.
+
+For OTLP records, table-owned projection reads correlation only from the final
+record-level `wyrd.card_ref` and `wyrd.run_id` attributes, retaining all source
+attributes losslessly. The values use the existing `CardRef` and `RunId` text
+grammars. Any client Card UID is ignored; Scribe stamps only the UID from the
+verified principal scope.
+
+Within a tenant-qualified physical table, row identity is:
 
 ```text
 (wyrd_batch_id, wyrd_row_ordinal)
@@ -64,9 +72,10 @@ Globally it is:
 
 The ordinal is contiguous across request order and never resets at an Arrow
 batch, WAL segment, shard, staged run, Parquet row group, object, snapshot, or
-Forge rewrite. Gate validates the batch identity, assigns ordinals before
-Scribe admission, and prevents payload columns from supplying server-owned
-fields. A retry preserves the batch ID. Within the idempotency-retention window,
+Forge rewrite. Gate validates the batch identity and routes the authenticated
+write. Scribe assigns request-wide ordinals while table-owned validation
+prevents payload columns from supplying server-owned fields. A retry preserves
+the batch ID. Within the idempotency-retention window,
 reusing an accepted ID requires the same schema fingerprint, row count, row
 order, and payload digest; any mismatch is a stable batch-identity conflict.
 
@@ -264,30 +273,23 @@ streams one terminal-safe result. DataFusion providers receive only the pinned
 files and leased live-tail sources. Tenant authority is installed before plan
 decode or source IO.
 
-Oracle has two execution paths:
+Oracle plans every query once through the pinned `datafusion-distributed`
+planner and derives its admission and terminal path from the returned physical
+root:
 
-- **Interactive** is the default single-stage path for scans, filters, limits,
-  global operations already supported locally, low-cardinality aggregation,
-  and any query for which an analytical route cannot be established safely.
-- **Analytical** is the streamed distributed path for the supported v1
-  baseline: filtered and projected scans, fixed-width grouped `COUNT`, `SUM`,
-  `MIN`, and `MAX` aggregation, multi-input equi-join, streamed network
-  exchange, and one real spilling DataFusion operator. Query shapes outside
-  that baseline remain Interactive when Interactive supports them and
-  otherwise return a stable structured failure. Bifrost promises no exhaustive
-  operator matrix for windows, correlated subqueries, deduplicating sets,
-  UDAFs, every join type, or every aggregation state.
+- **Interactive** is selected for a normal DataFusion physical root and keeps
+  protected capacity for low-overhead, high-throughput reads.
+- **Analytical** is selected for a
+  `datafusion_distributed::DistributedExec` root and executes its streamed
+  stage graph across authenticated Oracle peers.
 
-Routing reuses Oracle's existing optimized-plan classification over the
-immutable pinned query facts to nominate an Analytical candidate; Bifrost adds
-no second optimizer and no separate routing-facts subsystem. Missing,
-incompatible, overflowed, or mutable estimates select Interactive. SQL text,
-row sampling, live execution statistics, client hints, and unpinned catalog
-state never select the path. A candidate becomes Analytical only when
-distributed physical planning succeeds, the plan stays inside the supported v1
-baseline, and the plan contains a real network exchange. Any of those checks
-failing before selection executes the Interactive plan and records a bounded
-fallback reason.
+Oracle maintains no operator allowlist, candidate heuristic, second physical
+build, or pre-selection fallback. The pinned planner decides whether useful
+network boundaries survive; its registered codecs and workers decide what the
+integrated system can execute. Planning, codec, and worker incompatibilities
+return a stable structured failure. Representative end-to-end queries prove
+scan/filter/projection, grouped aggregation, join, sort/limit, exchange, and
+spill behavior without claiming exhaustive operator coverage.
 
 ### Distributed analytical execution
 
@@ -352,10 +354,17 @@ One atomic aggregate check prevents their combined occupancy from exceeding
 Oracle capacity. A configured Interactive slot floor cannot be borrowed by
 Analytical work; Interactive work may use idle unreserved capacity. Both paths
 share one elastic memory and scratch root plus one leader/peer capacity counter.
-`QueryClass` is telemetry classification, not an admission key.
+`QueryClass` is derived from the one returned physical root and is never a
+caller-controlled hint.
 
-When Analytical execution is enabled, configuration requires
-`1 <= interactive_floor_slots < total_oracle_slots`; otherwise startup fails.
+Local capacity is pod-local and is derived from this node's own CPU and memory,
+never from a cluster-wide quota. Total slot units default to the smaller of two
+units per effective CPU and the Oracle memory budget divided by the 32 MiB
+working set a unit represents; an explicit operator limit replaces that
+derivation outright. The resulting total splits once at boot into
+`interactive_floor_units + analytical_max_units`. `analytical_max_units` of zero
+is valid on a pod too small to run one two-unit Analytical query: its Analytical
+admission is refused immediately rather than queued forever.
 
 Within each path, queries are FIFO per tenant and tenants are selected by
 weighted round robin. The arbiter first fills the protected Interactive floor,
@@ -363,10 +372,13 @@ then assigns unreserved capacity to the oldest eligible path head while
 preserving tenant rotation. A continuously ready path cannot be skipped
 indefinitely, and Analytical work never consumes the Interactive floor.
 
-Slots admit and grants size. A slot unit charges 32 MiB of working memory.
-Interactive work normally charges one unit and Analytical work two, with the
-selected physical plan owning the checked final cost. A query-local memory
-ceiling is derived once at admission:
+Slots admit; the actual grant sizes only the execution memory ceiling. A slot
+unit represents the 32 MiB working set used to derive local capacity; it is not
+itself charged as resident query memory. Concurrency is governed by slot units,
+actual cooperative reservation by the shared memory root, and spill by the
+separately leased scratch share. Interactive work charges one unit and
+Analytical work two, with the selected physical plan owning the checked final
+cost. A query-local memory ceiling is derived once at admission:
 
 ```text
 grant = oracle_budget * query_slots / sum(running_slots)
@@ -375,21 +387,47 @@ grant = clamp(grant, 32 MiB, 256 MiB)
 
 The denominator includes the candidate query's slots plus every running
 query's admitted slots. The grant is a non-reserved per-query ceiling held for
-the query lifetime and never recomputed under running operators. Each query's
-DataFusion pool enforces that ceiling while actual allocations draw from the
-shared root, whose hard limit remains authoritative.
+the query lifetime and never recomputed under running operators. Every leader
+and follower query receives a private view over one process-wide Oracle memory
+root, never an independently sized pool: the view refuses growth past that
+query's own ceiling, and the root's single tracked spill-fair pool, bounded by
+the Oracle floor plus the elastic borrow, arbitrates what all live queries hold
+together. Aggregate governed reservations therefore cannot sum above what the
+pod owns.
 
-Operators and exchange consumers share the issued query ceiling without
+Only fallible cooperative reservation is hard-limited. Growth DataFusion does
+not let fail is still real memory, so it is charged to an explicit process
+headroom counter that makes later fallible growth refuse sooner. The resource
+plan retains that headroom alongside the unmanaged reserve for dependency
+allocations outside cooperative reservation; the pool is the Oracle safety
+boundary, not a guarantee against operating-system or cgroup OOM.
+
+The guaranteed minimum successful grant fixes one `OracleSessionShape` before
+physical planning: the 32 MiB memory floor, the minimum two execution
+partitions narrowed by available cut work, and the resulting target partitions,
+batch size, spill reservation, and join preference. Oracle retains that exact
+`SessionConfig` with the single physical root. The actual grant chosen after
+root-derived admission supplies only the query-owned `RuntimeEnv` and
+`MemoryPool` ceiling; it does not reshape or rebuild the physical plan, and
+capacity above the retained shape may remain unused.
+
+Operators and exchange consumers share that issued query ceiling without
 separate sublimits. Admission refuses before dispatch when checked graph counts
 or scratch demand exceed their finite configured limits. Allocation or
 transport refusal after admission is a typed query-resource failure and
-cancels the full query; it never borrows from another query's ceiling. The
-fixed grant sizes one `OracleSessionShape`: target partitions, batch size, and
-join preference. Scratch space is separately reserved because spill consumes
-real disk.
+cancels the full query; it never borrows from another query's ceiling. Scratch
+space is separately reserved because spill consumes real disk.
 
 Tenant fairness is owned separately by per-tenant FIFO and weighted
-round-robin admission. Grants are tenant-blind. Memory governance protects
+round-robin admission, scheduled pod-locally: tenant slot caps are local
+scheduling caps rather than cluster quotas. Grants are tenant-blind.
+
+An Analytical leader selects at most `max_workers_per_query` remote workers from
+the pinned eligible cut, rotating the starting position by the attempt identity
+so selection is deterministic, stable across re-projection of the same roster,
+and spread across attempts. Only selected workers reserve resources, receive
+requests, or affect the result; an unselected replica is absent from the cut
+entirely. Memory governance protects
 stability; pruning, vectorization, layout, and IO efficiency determine latency.
 
 ### Read audit and terminal contract
@@ -429,16 +467,19 @@ or separate `platform.audit_log` may become a second historical authority.
 ### Scheduling, admission, and fences
 
 Forge schedules durable Postgres tasks with tenant-fair admission. At most one
-publication attempt is active per tenant-qualified table, while bounded
-per-tenant and per-worker lanes permit independent tables to progress
-concurrently. Each attempt binds tenant, table, task, plan hash, base snapshot,
-target branch, attempt UUIDv7, operation ID, output generation, lease, and
-fence. Loss of authority cancels and drains physical work before settlement.
+durable task attempt owns the lease and fence for a tenant-qualified table.
+Within that attempt, admitted ordinary compaction plans are independent child
+operations: fitting siblings may rewrite and publish concurrently, while
+bounded per-tenant and per-worker admission also permits independent tables to
+progress concurrently. Each plan binds the owning tenant, table, task, plan
+hash, base snapshot, target branch, attempt UUIDv7, operation ID, output
+generation, lease, and fence. Loss of authority cancels and drains physical
+work before settlement.
 
-Forge owns runtime leases, memory, spill, read streams, writer fanout, upload
-buffers, close futures, SQL state, audit, reconciliation, and garbage
-collection. Resource admission may defer a task but never changes table file
-geometry or creates a second grouping algorithm.
+Forge owns runtime leases, pod-local plan admission, read streams, writer
+fanout, upload buffers, close futures, SQL state, audit, reconciliation, and
+garbage collection. Resource admission may defer a plan but never changes
+table file geometry or creates a second grouping algorithm.
 
 ### Scribe hot promotion
 
@@ -477,11 +518,28 @@ guarantee.
 
 The managed compaction core is the sole owner of candidate selection, grouping,
 bin packing, delete application, sorting, partition fanout, bounded concurrent
-writing, rolling, and output `DataFile` production. It consumes one
-Wyrd-admitted execution context with the attempt runtime, memory pool, spill
-root, cancellation tree, output identity, and closed physical observer. It
-never owns tenant authority, leases, SQL, audit, reconciliation, object GC, or
-catalog commit.
+writing, rolling, and output `DataFile` production. After it produces real
+`CompactionPlan` values, Forge estimates each plan's peak heap use from the
+plan, table schema and format version, batch size, prefetch and sort settings,
+delete files, and recommended parallelism.
+
+Each Forge worker owns one strict FIFO queue of those plans. The queue starts
+only its head when both the pod's aggregate estimated-memory budget and running
+parallelism have room. Waiting plans do not consume the running-memory budget,
+and a later smaller plan cannot bypass a blocked head; pending parallelism
+bounds the queue itself. The memory budget is configured per worker or defaults
+to 80 percent of that worker's declared memory. A plan larger than either total
+budget is refused, while a plan that fits the totals waits for running plans to
+release capacity. The budget is an admission estimate, not a `DataFusion`
+allocation ceiling. `DataFusion` runs Forge plans with its default unbounded
+memory pool and without disk spilling; Forge provisions no local scratch
+storage. An underestimated plan can exhaust the pod, after which the durable
+task, lease, and fence recovery path reclaims the lost work. One plan executes
+within one worker; Forge does not split a compaction plan across pods.
+
+The managed core consumes the attempt cancellation tree, output identity, and
+closed physical observer. It never owns tenant authority, leases, SQL, audit,
+reconciliation, object GC, or catalog commit.
 
 The non-committing boundary returns exactly:
 
@@ -513,28 +571,39 @@ the Iceberg commit so an applied delete does not reapply to replacement rows.
 Missing target evidence, mixed sequence semantics, or an unproven surviving
 scope fails commit validation.
 
-Attempt output paths are flat and table-bound:
+Attempt output paths are table-bound and retain the managed core's recipe
+segment:
 
 ```text
-{table}/data/forge/{attempt_uuidv7}-{ordinal:05}.parquet
+{table}/data/forge/{recipe}/{attempt_uuidv7}-{writer_ordinal:05}-{writer_uuidv7}.parquet
 ```
 
-One attempt-global `u64` ordinal is reserved before each open across all
-concurrent writers. Cancellation drains every writer and retains exact
+The recipe segment is the managed core's canonical writer-recipe identity and
+keeps completed Forge outputs recognizable as current on the next selection
+pass. Each physical writer owns its filename counter and UUIDv7 suffix;
+`writer_ordinal` is minimum-width five-digit canonical decimal and may restart
+for another writer because `writer_uuidv7` provides cross-writer uniqueness.
+Forge separately assigns each opened output one attempt-global
+`OutputIdentity.logical_ordinal` for observer, drain, reconciliation, and
+cleanup evidence. The logical ordinal is not encoded into or reconstructed
+from the object path. Cancellation drains every writer and retains exact
 produced-or-possible output evidence. Forge renews and verifies the lease and
 fence immediately before the initial `commit_once`. The commit adapter removes
 the exact rewritten data files, adds the exact outputs, preserves delete
 correctness, and writes operation and lineage properties in the same snapshot.
 
 Committed, definitely uncommitted, fence-refused, cancelled, and uncertain are
-distinct outcomes. On a definite catalog compare-and-swap conflict, Forge
-refreshes the branch head and revalidates base ancestry, selected inputs,
-delete scope, schema/spec/sort policy, lease, and fence. When all assumptions
-remain true, the same attempt, operation ID, output generation, and objects may
-issue at most one additional `commit_once` within the original deadline. A
-second conflict, expired deadline, or changed assumption settles the attempt as
-definitely uncommitted and returns durable demand for a new plan and attempt.
-No conflict retry creates new output objects.
+distinct per-plan outcomes. Concurrent siblings may optimistically race on the
+same branch head and cause an expected compare-and-swap conflict. On a definite
+conflict, Forge refreshes the branch head and revalidates the retained planning
+snapshot, current schema identity, selected-input existence, lease, and fence.
+When those assumptions remain true, the same plan operation, output generation,
+and objects may make at most three further `commit_once` calls after fixed
+1s/2s/4s delays within the original deadline. Exhausted retries, an expired
+deadline, or a changed assumption settles only that plan as definitely
+uncommitted. Successful sibling snapshots remain visible; the task succeeds
+when any admitted plan publishes, and later discovery replans remaining debt
+from the current head. No conflict retry creates new output objects.
 
 An uncertain attempt protects its outputs and reconciles under the same
 identity; it never retries the catalog call, starts a fresh attempt, or reports
@@ -557,17 +626,21 @@ expiration preserves active refs, unresolved attempts, reconciliation evidence,
 and the lineage snapshot referenced by the branch head. Orphan GC deletes only
 objects proven unreferenced and outside every active or uncertain attempt.
 Committed Scribe hot objects in `file_list` that lack exact promotion evidence,
-and objects retained by any pinned Oracle cut or live-tail lease, are hard GC
-roots even when no Iceberg snapshot references them. No cleanup infers safety
-from age or path shape alone.
+and objects retained by a pinned Oracle cut, are hard GC roots even when no
+Iceberg snapshot references them.
+A v1 live-tail lease retains Scribe-local Arrow batches and staged resources for its lifetime but names no Forge-collectable object, so it contributes no independent Forge GC root.
+No cleanup infers safety from age or path shape alone.
 
 ## Resource and failure invariants
 
-- Every Wyrd-owned queue, mailbox, stream, fanout, task set, buffer, memory
-  pool, scratch root, spill path, staged namespace, and object upload lane is
-  bounded. A pinned dependency-internal queue may instead provide finite byte
-  backpressure when Wyrd cannot configure its item count; architecture must
-  name that exception rather than claim ownership it does not have.
+- Every Wyrd-owned queue, mailbox, stream, fanout, task set, buffer, staged
+  namespace, and object upload lane is bounded. Scribe scratch and Oracle
+  memory pools, scratch roots, and spill paths remain hard-bounded. Forge uses
+  bounded FIFO admission from estimated plan memory instead of a hard
+  `DataFusion` pool or spill path. A pinned dependency-internal queue may
+  instead provide finite byte backpressure when Wyrd cannot configure its item
+  count; architecture must name that exception rather than claim ownership it
+  does not have.
 - Global resource owners account tenant and table attribution without creating
   an independent root pool per tenant.
 - Cancellation is structured: stop admission, cancel descendants, join work,
@@ -585,11 +658,22 @@ from age or path shape alone.
 
 ## Telemetry
 
-Scribe, Oracle, and Forge each own a closed lifecycle telemetry registry used by
-production behavior, verification, and operator documentation. Required
-observations cover admission, queue age, active ownership, WAL fsync, staging,
-merge, object IO, catalog calls, spill, retries, lease and fence decisions,
-reconciliation, cleanup, cancellation, and terminal settlement.
+Scribe, Oracle, and Forge each own one closed telemetry registry used by
+production behavior, verification, and operator documentation. Four surfaces
+carry Bifrost's observability, and each fact belongs to exactly one of them.
+
+The public Prometheus catalog answers what an operator must be able to graph
+and alert on without reading code: demand, queue depth and age, active
+ownership, durable results, latency, failure class, physical data flow, and
+outstanding maintenance debt. It is deliberately small and closed; a subsystem
+does not add a family because a value exists.
+
+Protocol mechanics — lease and fence decisions, catalog calls, reconciliation,
+cursor movement, scheduler passes, and resource envelopes — belong to
+structured traces, where the identities that make them useful are legal.
+Durable audit and task rows remain the authority for what actually happened,
+and no metric is evidence of a durable fact. Unresolved authority or
+in-progress recovery is a readiness signal, not a metric.
 
 Every active gauge decrements on success, refusal, retry, uncertainty,
 cancellation, and failure. Metric labels use only closed, bounded dimensions
@@ -626,24 +710,41 @@ The surface includes:
   is the closed `AppendDurability::Acknowledged` value; the synchronous append
   response never reports staged, published, promoted, or rewritten state;
 - terminal-safe query streaming at `POST /v1/query`;
-- typed Vala observation queries with mandatory bounded time windows and cursor
-  pagination;
+- canonical SQL observation reads through the ordinary Bifrost query contract;
 - gRPC ingestion through `wyrd.v1.BifrostIngestService`;
 - gRPC query projection through `wyrd.v1.BifrostQueryService`;
 - the `wyrd.bifrost` Python projection and matching TypeScript SDK;
 - agent-facing read and write operations governed by explicit permissions.
 
-Typed observation queries cover `vala.traces`, `vala.metrics`, `vala.logs`,
-`vala.genai`, `vala.eval`, `vala.drift`, `vala.dev`, and `vala.system`. The
-corresponding physical tables remain tenant-qualified Bifrost tables; the
-namespace does not create another storage or authorization model.
+Observation namespaces such as `vala.traces`, `vala.metrics`, `vala.logs`,
+`vala.eval`, `vala.drift`, `vala.dev`, and `vala.system` remain
+tenant-qualified Bifrost tables. Canonical SQL is their only read contract;
+the namespace does not create another storage or authorization model.
 
 Permissions are scoped through `BifrostTable`, `BifrostRecord`, and
 `BifrostQuery`. Generic writes cannot target reserved or system-managed tables.
-Sensitive trace, log, GenAI, and agent-trace payload columns require their
-respective `BifrostTracePayload`, `BifrostLogPayload`,
-`BifrostGenAiPayload`, or `BifrostAgentTracePayload` read permission through
-typed and generic SQL paths alike.
+Sensitive-column metadata remains descriptive; table query permission governs
+every column, including GenAI fields stored on trace spans.
+
+Bifrost query permissions carry an object axis. A `bifrost_query:read` grant is
+scoped either to every object (`all`) or to a named Bifrost object: a
+`{ catalog, schema }` schema scope, or a
+`{ catalog, schema, table_uid }` table scope keyed by the existing Bifrost
+`TableUid`. A query names no tables until it is planned, so `POST /v1/query`
+admits on the coarse operation capability only, and the authoritative object
+decision runs inside the Oracle once `pin_cut` has resolved the complete
+`PinnedSealedTable` set — before provider registration, physical planning,
+admission charging, read-audit acceptance, peer dispatch, or any source read.
+Every resolved table, including tables reached only through a join or an
+expansion, must be covered; one uncovered table denies the whole query with
+`WYRD_VALA_403_QUERY_FORBIDDEN` and streams no rows.
+
+The permission digest bound into every stage assignment is derived from the
+approved scoped permission together with the exact authorized table identities,
+so a worker cannot execute against a wider object set than the leader approved.
+This is object-scoped RBAC — a static role grant over named objects — and adds
+no grant table, policy lookup, query-path database lookup, cache, or second
+checker.
 
 There is no `WarehouseCard`, `wyrd.warehouse` compatibility surface,
 asynchronous query-job API, result polling/redirect protocol, or client-selected

@@ -4,19 +4,24 @@ use std::path::{Path, PathBuf};
 
 use vala_eval::{ComparisonResults, EvalResults, compare};
 
-use crate::error::WyrdCliError;
+use crate::error::{CliBoundaryError, WyrdCliError};
 
-/// Print a structured CLI error.
-pub fn print_cli_error(error: &WyrdCliError) {
+/// Prints one machine-readable problem followed by one human-readable stderr line.
+///
+/// The function performs exactly two stderr writes and never writes stdout,
+/// mutates durable state, or changes the originating error metadata.
+pub fn print_cli_error(error: &CliBoundaryError) {
     let json = serde_json::json!({
         "kind": "wyrd_cli_error",
         "code": error.code(),
         "status": error.status(),
-        "message": error.to_string(),
+        "title": error.title(),
+        "message": error.detail(),
         "remediation": error.remediation(),
+        "details": error.details(),
     });
     eprintln!("{json}");
-    eprintln!("error: {error}");
+    eprintln!("error: {}", error.detail());
 }
 
 /// Print local eval summary.

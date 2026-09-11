@@ -366,22 +366,40 @@ mod pg_tests {
     use sha2::{Digest, Sha256};
     use uuid::Uuid;
     use wyrd_auth_issue::IssuingKey;
-    use wyrd_auth_verify::Kid;
+    use wyrd_auth_verify::{
+        AccessTokenClaims, Kid, PermissionResolver, ResolveError, public_key_from_pem, verify_eddsa,
+    };
     use wyrd_dev_fixtures::pg::PgFixture;
-    use wyrd_runtime::PrincipalId;
+    use wyrd_runtime::{PermissionSet, PrincipalId, PrincipalKind, RoleRef};
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::PrincipalKindTag;
-    use wyrd_spec::envelope::CardKind;
+    use wyrd_spec::envelope::{CardKind, Spec};
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::reference::CardRef;
     use wyrd_sql::TenantConn;
     use wyrd_sql::queries::auth::{insert_refresh_token, insert_service_account, refresh_by_hash};
+    use wyrd_sql::queries::cards::get_card_by_ref;
 
-    use wyrd_dev_fixtures::cards::seed_backing_card;
+    use wyrd_dev_fixtures::cards::{seed_backing_card, seed_card_with_spec};
 
     use super::{RefreshError, RefreshTokens};
     use crate::exchange_api_key::TokenExchangeSettings;
+
+    /// Resolver stub for token projection: this test asserts signed Card scope,
+    /// not role permissions, so it grants nothing.
+    #[derive(Debug)]
+    struct AllowNothingResolver;
+
+    impl PermissionResolver for AllowNothingResolver {
+        async fn resolve(
+            &self,
+            _tenant_id: &DataTenantId,
+            _roles: &[RoleRef],
+        ) -> Result<PermissionSet, ResolveError> {
+            Ok(PermissionSet::new())
+        }
+    }
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
 
@@ -783,6 +801,116 @@ mod pg_tests {
         let extracted = super::tenant_from_refresh_jwt(&jwt).expect("tenant extracted");
 
         assert_eq!(extracted, tenant_id);
+    }
+
+    /// Ingest resolves Card correlation from signed claims alone, so a real
+    /// rotation must sign, verify, and project every scope member's registry
+    /// UID through to the runtime `Principal`.
+    #[tokio::test]
+    async fn refresh_signs_resolved_scope_uids() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let key = test_issuing_key();
+        let root = service_card_ref();
+        let secondary = CardRef {
+            name: CardName::new("scope-secondary").expect("static name is valid"),
+            ..service_card_ref()
+        };
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let user_id = insert_test_user(&mut conn, tenant).await;
+        seed_backing_card(&mut conn, &secondary, user_id).await;
+        let root_spec = Spec::from_kind_and_value(
+            &CardKind::Service,
+            serde_json::json!({
+                "components": [{
+                    "alias": "secondary",
+                    "ref": {
+                        "kind": "Service",
+                        "space": secondary.space.as_str(),
+                        "name": secondary.name.as_str(),
+                        "version": secondary.version.as_str(),
+                    },
+                }],
+            }),
+        )
+        .expect("root service spec decodes");
+        seed_card_with_spec(&mut conn, &root, &root_spec, user_id).await;
+        let sa_id = insert_test_service_account(&mut conn, user_id, &root).await;
+
+        let expected_root_uid = get_card_by_ref(
+            &mut conn,
+            root.kind.clone(),
+            &root.space,
+            &root.name,
+            &root.version,
+        )
+        .await
+        .expect("root card row loads")
+        .card_uid;
+        let expected_secondary_uid = get_card_by_ref(
+            &mut conn,
+            secondary.kind.clone(),
+            &secondary.space,
+            &secondary.name,
+            &secondary.version,
+        )
+        .await
+        .expect("secondary card row loads")
+        .card_uid;
+
+        let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::Service, sa_id, tenant);
+        let hash = hash_of(&refresh_jwt);
+        seed_active_refresh(&mut conn, "service", sa_id, &hash).await;
+
+        let exchanged = refresh_service()
+            .execute(&mut conn, refresh_jwt, "req-scope-uids")
+            .await
+            .expect("rotation succeeds");
+
+        let verifying_pem = key.verifying_key_pem().expect("verifying key encodes");
+        let decoding_key =
+            public_key_from_pem(verifying_pem.as_bytes()).expect("verifying key decodes");
+        let claims: AccessTokenClaims = verify_eddsa(
+            exchanged.access_token.expose_secret(),
+            &decoding_key,
+            Some("wyrd"),
+        )
+        .expect("signed access token verifies");
+
+        let verified = claims
+            .into_verified(&AllowNothingResolver)
+            .await
+            .expect("verified token projects");
+        let PrincipalKind::Service { card_ref_scope, .. } = verified.principal.kind.clone() else {
+            panic!("service rotation yields a service principal");
+        };
+
+        assert_eq!(
+            card_ref_scope.len(),
+            2,
+            "root and secondary are both signed"
+        );
+        let signed_root = card_ref_scope
+            .as_slice()
+            .iter()
+            .find(|member| member.same_identity(&root))
+            .expect("root member is signed");
+        assert_eq!(
+            signed_root.uid.as_ref(),
+            Some(&expected_root_uid),
+            "verified root member keeps its registry uid"
+        );
+        let signed_secondary = card_ref_scope
+            .as_slice()
+            .iter()
+            .find(|member| member.same_identity(&secondary))
+            .expect("secondary member is signed");
+        assert_eq!(
+            signed_secondary.uid.as_ref(),
+            Some(&expected_secondary_uid),
+            "verified secondary member keeps its registry uid"
+        );
     }
 
     #[tokio::test]

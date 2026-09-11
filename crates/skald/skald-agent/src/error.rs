@@ -8,6 +8,7 @@ use skald_runtime::SkaldRuntimeError;
 use skald_spec::ProviderName;
 use skald_tool::SkaldToolError;
 use thiserror::Error;
+use wyrd_spec::error::WyrdError;
 
 /// Result alias used throughout the crate.
 pub type AgentResult<T> = Result<T, AgentError>;
@@ -172,101 +173,105 @@ impl AgentError {
             Self::InvalidArgument { .. } => "SKALD_AGENT_422_INVALID_ARGUMENT",
         }
     }
+}
 
-    /// Suggested HTTP status for this failure.
-    pub const fn status(&self) -> u16 {
-        match self {
-            Self::ToolNotFound { .. } | Self::ToolNotInAgent { .. } => 404,
-            Self::InvalidToolArgs { .. } | Self::Prompt { .. } | Self::LoopMessageType { .. } => {
-                422
-            }
-            Self::ProviderMismatch { .. } => 409,
-            Self::DelegationDepthExceeded { .. } => 412,
-            Self::MaxIterations { .. }
-            | Self::CallbackPanic { .. }
-            | Self::SessionRecentFailed { .. }
-            | Self::SessionAppendFailed { .. }
-            | Self::JournalAppendFailed { .. } => 500,
-            Self::Timeout { .. } => 504,
-            Self::StructuredOutputDecode { .. } | Self::InvalidArgument { .. } => 422,
-            Self::Provider(_) => 502,
-            Self::Tool(_) => 400,
-        }
+impl From<AgentError> for WyrdError {
+    /// Project an owned agent failure onto the derive-backed Wyrd catalog.
+    fn from(error: AgentError) -> Self {
+        Self::from(&error)
     }
+}
 
-    /// Stable problem-title text.
-    pub const fn title(&self) -> &'static str {
-        match self {
-            Self::ToolNotFound { .. } => "Tool not registered for agent",
-            Self::ToolNotInAgent { .. } => "Tool not attached to agent",
-            Self::InvalidToolArgs { .. } => "Tool arguments invalid",
-            Self::MaxIterations { .. } => "Agent exceeded max iterations",
-            Self::Provider(_) => "Provider call failed",
-            Self::Tool(_) => "Tool declaration malformed",
-            Self::Prompt { .. } => "Agent prompt rendering failed",
-            Self::LoopMessageType { .. } => "Loop message type mismatch",
-            Self::ProviderMismatch { .. } => "Provider mismatch",
-            Self::DelegationDepthExceeded { .. } => "Agent delegation depth exceeded",
-            Self::CallbackPanic { .. } => "User-supplied callback panicked",
-            Self::SessionRecentFailed { .. } => "Session memory recent fetch failed",
-            Self::SessionAppendFailed { .. } => "Session memory append failed",
-            Self::JournalAppendFailed { .. } => "Journal append failed",
-            Self::Timeout { .. } => "Agent run exceeded configured timeout",
-            Self::StructuredOutputDecode { .. } => "Structured response decode failed",
-            Self::InvalidArgument { .. } => "Invalid argument",
-        }
-    }
-
-    /// Operator-facing remediation hint.
-    pub const fn remediation(&self) -> &'static str {
-        match self {
-            Self::ToolNotFound { .. } => {
-                "Register the tool before running the agent or remove the tool call from the provider response."
-            }
-            Self::ToolNotInAgent { .. } => {
-                "Attach the runtime-local tool to this agent or adjust the model response."
-            }
-            Self::InvalidToolArgs { .. } => {
-                "Adjust the provider-emitted tool arguments to match the tool input schema."
-            }
-            Self::MaxIterations { .. } => {
-                "Increase RunConfig::max_iterations or adjust the agent prompt and tools so the loop can terminate."
-            }
-            Self::Provider(_) => "Inspect the provider backend and retry once it is healthy.",
-            Self::Tool(_) => "Inspect the tool declaration name, description, and JSON schema.",
-            Self::Prompt { .. } => {
-                "Inspect the prompt template and variables passed to Agent::run_prompt."
-            }
-            Self::LoopMessageType { .. } => {
-                "Keep loop history in the same provider-native message family as the agent prompt."
-            }
-            Self::ProviderMismatch { .. } => {
-                "Run the agent with a prompt targeting the same provider as the agent's resolved prompt."
-            }
-            Self::DelegationDepthExceeded { .. } => {
-                "Reduce nested agent-as-tool calls (cap = 3) or restructure the workflow."
-            }
-            Self::CallbackPanic { .. } => {
-                "Inspect the panic payload and fix the callback implementation. Callbacks must not panic."
-            }
-            Self::SessionRecentFailed { .. } => {
-                "Inspect the session backend; ensure connectivity and that session_id exists."
-            }
-            Self::SessionAppendFailed { .. } => {
-                "Inspect the session backend; ensure write permissions."
-            }
-            Self::JournalAppendFailed { .. } => {
-                "Inspect the journal backend; for NoopJournal this should never fire."
-            }
-            Self::Timeout { .. } => {
-                "Increase RunConfig.timeout or reduce iteration count / tool latency."
-            }
-            Self::StructuredOutputDecode { .. } => {
-                "Inspect the model output; structured-output prompts must return a JSON object."
-            }
-            Self::InvalidArgument { .. } => {
-                "Correct the argument value; see the error detail for the expected type or constraint."
-            }
+impl From<&AgentError> for WyrdError {
+    /// Project an agent failure onto the derive-backed Wyrd catalog.
+    ///
+    /// This is the single source of public metadata for every agent failure
+    /// that crosses a public Wyrd boundary: the catalog owns
+    /// `code`, `status`, `title`, and `remediation`, while this projection
+    /// supplies the human-readable message and the structured `details`
+    /// payload carrying the variant's own fields.
+    fn from(error: &AgentError) -> Self {
+        let message = error.to_string();
+        match error {
+            AgentError::ToolNotFound { name } => Self::AgentToolNotFound {
+                message,
+                details: serde_json::json!({ "tool": name }),
+            },
+            AgentError::ToolNotInAgent { name } => Self::AgentToolNotInAgent {
+                message,
+                details: serde_json::json!({ "tool": name }),
+            },
+            AgentError::InvalidToolArgs { tool, detail } => Self::AgentToolArgs {
+                message,
+                details: serde_json::json!({ "tool": tool, "reason": detail }),
+            },
+            AgentError::MaxIterations { agent, cap } => Self::AgentMaxIterations {
+                message,
+                details: serde_json::json!({ "agent": agent, "max_iterations": cap }),
+            },
+            AgentError::Provider(source) => Self::AgentProviderCall {
+                message,
+                details: serde_json::json!({ "provider_code": source.code() }),
+            },
+            AgentError::Tool(source) => Self::ToolInvalidSchema {
+                message,
+                details: serde_json::json!({ "tool_code": source.code() }),
+            },
+            AgentError::Prompt { agent, detail } => Self::AgentPromptRender {
+                message,
+                details: serde_json::json!({ "agent": agent, "reason": detail }),
+            },
+            AgentError::LoopMessageType { provider, detail } => Self::AgentLoopMessageType {
+                message,
+                details: serde_json::json!({
+                    "provider": format!("{provider:?}"),
+                    "reason": detail,
+                }),
+            },
+            AgentError::ProviderMismatch {
+                agent,
+                agent_provider,
+                prompt_provider,
+            } => Self::AgentProviderMismatch {
+                message,
+                details: serde_json::json!({
+                    "agent": agent,
+                    "agent_provider": format!("{agent_provider:?}"),
+                    "prompt_provider": format!("{prompt_provider:?}"),
+                }),
+            },
+            AgentError::DelegationDepthExceeded { chain } => Self::AgentDelegationDepth {
+                message,
+                details: serde_json::json!({ "chain": chain }),
+            },
+            AgentError::CallbackPanic { hook, payload } => Self::AgentCallbackPanic {
+                message,
+                details: serde_json::json!({ "hook": hook, "payload": payload }),
+            },
+            AgentError::SessionRecentFailed { session_id, .. } => Self::SessionRecentFailed {
+                message,
+                details: serde_json::json!({ "session_id": session_id }),
+            },
+            AgentError::SessionAppendFailed { session_id, .. } => Self::SessionAppendFailed {
+                message,
+                details: serde_json::json!({ "session_id": session_id }),
+            },
+            AgentError::JournalAppendFailed { .. } => Self::AgentJournalAppend {
+                message,
+                details: serde_json::json!({}),
+            },
+            AgentError::Timeout { duration } => Self::AgentTimeout {
+                message,
+                details: serde_json::json!({ "timeout_ms": duration.as_millis() }),
+            },
+            AgentError::StructuredOutputDecode { agent, detail } => Self::AgentStructuredDecode {
+                message,
+                details: serde_json::json!({ "agent": agent, "reason": detail }),
+            },
+            AgentError::InvalidArgument { name, detail } => Self::AgentInvalidArgument {
+                message,
+                details: serde_json::json!({ "argument": name, "reason": detail }),
+            },
         }
     }
 }

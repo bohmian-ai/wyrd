@@ -112,8 +112,9 @@ impl AuthMiddleware {
     /// restarts.
     ///
     /// # Errors
-    /// Returns [`WyrdClientError::TransportDown`] when the underlying `reqwest`
-    /// client cannot be constructed.
+    /// Returns [`WyrdClientError::TransportDown`] when another Rustls provider
+    /// already owns the process or the underlying Reqwest client cannot be
+    /// constructed.
     pub fn new(
         config: &ClientConfig,
         credential: ResolvedCredential,
@@ -129,11 +130,21 @@ impl AuthMiddleware {
     /// Construct from a resolved cache path. `new` resolves the production
     /// `~/.config/wyrd/token_cache.json`; tests inject a unique path so they
     /// never touch the process environment (and stay parallel-safe).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WyrdClientError::TransportDown`] when another Rustls provider
+    /// already owns the process or the authentication HTTP client cannot be
+    /// built.
     fn build(
         config: &ClientConfig,
         credential: ResolvedCredential,
         cache_path: Option<PathBuf>,
     ) -> Result<Arc<Self>, WyrdClientError> {
+        wyrd_tls::install_crypto_provider().map_err(|error| WyrdClientError::TransportDown {
+            transport: "http".to_owned(),
+            message: error.to_string(),
+        })?;
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_millis(config.http.timeout_ms))
             .build()
@@ -164,6 +175,30 @@ impl AuthMiddleware {
         cache_path: Option<PathBuf>,
     ) -> Result<Arc<Self>, WyrdClientError> {
         Self::build(config, credential, cache_path)
+    }
+
+    /// The credential this middleware authenticates with.
+    ///
+    /// Exposed so a client-tier owner can fingerprint the secret material it
+    /// is already bound to — `vala-sdk`'s [`ClientScope`] keys its producer
+    /// pool on `(base URL, credential fingerprint)` — without re-resolving the
+    /// credential chain and risking a different answer than the live transport
+    /// uses.
+    ///
+    /// [`ClientScope`]: https://docs.rs/vala-sdk
+    #[must_use]
+    pub fn credential(&self) -> &ResolvedCredential {
+        &self.credential
+    }
+
+    /// The HTTP base URL this middleware exchanges tokens against.
+    ///
+    /// The same normalized URL [`HttpTransport`](crate::transport::HttpTransport)
+    /// joins relative paths onto, so a scope derived from it matches the plane
+    /// requests actually reach.
+    #[must_use]
+    pub fn base_url(&self) -> &str {
+        &self.http_base_url
     }
 
     /// Return the current access token, exchanging or refreshing as needed.

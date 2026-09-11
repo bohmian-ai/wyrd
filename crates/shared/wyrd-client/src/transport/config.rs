@@ -149,7 +149,9 @@ pub struct HttpConfig {
     #[serde(default = "default_base_url")]
     pub base_url: String,
 
-    /// Request timeout in milliseconds.
+    /// Ordinary total-request and streaming connection timeout in milliseconds.
+    /// Terminal stream body lifetime is governed by its server deadline and
+    /// caller cancellation rather than this generic transport duration.
     ///
     /// Default: [`HTTP_DEFAULT_TIMEOUT_MS`] (`30_000`, 30 s).
     #[serde(default = "default_timeout_ms")]

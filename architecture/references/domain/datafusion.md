@@ -5,10 +5,16 @@ distributed execution, managed compaction, memory, spill, or diagnostics.
 
 ## DataFusion is execution, not authority
 
-DataFusion receives an already authenticated, tenant-qualified, admitted
-operation. Wyrd owns authorization, query-class routing, resource grants,
-deadlines, failure policy, audit, and terminal semantics. A `SessionContext`,
-SQL parser, optimizer, or `TableProvider` is never an authorization boundary.
+DataFusion planning receives an authenticated, tenant-qualified immutable cut
+before path-specific admission. It uses the exact `OracleSessionShape` derived
+from Oracle's guaranteed minimum successful grant and performs no row IO or
+query-memory retention. After the returned root selects its class, execution
+receives the admitted query-owned runtime and memory pool through `TaskContext`
+while retaining the planning `SessionConfig` unchanged; extra granted capacity
+may remain unused. Wyrd owns authorization, query-class routing, resource
+grants, deadlines, failure policy, audit, and terminal semantics. A
+`SessionContext`, SQL parser, optimizer, or `TableProvider` is never an
+authorization boundary.
 
 A provider owns schema, exact snapshot-bound file facts, statistics, scan
 construction, and truthful pushdown claims. Advertise `Exact` filtering only
@@ -19,14 +25,14 @@ map fields by name or stable field identity.
 
 ## Oracle execution paths
 
-The interactive engine is the default. Keep work interactive when it needs no
-network exchange or when cardinality/working-state estimates are missing or
-invalid. Use the streamed distributed path for the supported baseline of
-filtered/projected scans, fixed-width grouped `COUNT`/`SUM`/`MIN`/`MAX`,
-multi-input equi-join, streamed exchange, and a spilling operator. The
-analytical candidate must contain a real network exchange, and its physical
-plan must validate inside that baseline before selection. Do not promise
-broader operator coverage than the delivery proves.
+Run every query through the pinned `datafusion-distributed` planner once. A
+normal DataFusion physical root selects Interactive; a
+`datafusion_distributed::DistributedExec` root selects Analytical. Retain and
+execute that exact returned root after path-specific admission. Do not add a
+candidate classifier, operator allowlist, second physical build, or fallback
+planner. Representative end-to-end stage-graph queries prove the integrated
+planner, codec, worker, and result path without promising exhaustive operator
+coverage.
 
 Distributed stages use one partitioned streamed exchange and no materialized
 shuffle service. Bind tenant, pinned-snapshot digest, fragment digest, and fence
@@ -34,9 +40,12 @@ before decoding the physical plan or performing IO. Install the admitted
 query-owned `RuntimeEnv` and dynamic `MemoryPool` on leader and workers; never
 fall back to a worker's process-global runtime for Wyrd query work.
 
-Operators and streamed exchanges use the same finite query-owned memory pool;
-do not create a predicted exchange child or separate operator/exchange
-sublimits. Before dispatch, enforce the configured selected-worker limit,
+Operators and streamed exchanges use the same query-owned memory pool view; do
+not create a predicted exchange child or separate operator/exchange sublimits.
+That view is a private ceiling over the one process-wide Oracle memory root, not
+an independently sized pool: every leader, follower, operator, and exchange
+consumer registers with the same root, so aggregate cooperative reservation
+cannot exceed the pod's bound. Before dispatch, enforce the configured selected-worker limit,
 admitted tasks/partitions, Wyrd-owned admission queue and slots, and scratch
 demand with checked count/range arithmetic. Dependency-owned exchange queues
 retain their pinned byte backpressure without a Wyrd item-count guarantee. Do
@@ -58,9 +67,20 @@ than copying examples from a newer upstream release.
 
 Forge uses DataFusion through the managed compaction core for manifest-backed
 selection, delete application, optional sort execution, partition fan-out, and
-rolling Parquet production. Wyrd injects the admitted runtime, memory/spill
-resources, cancellation token, attempt output identity, immutable table policy,
-and non-semantic observer. It does not reimplement planning or physical rewrite.
+rolling Parquet production. The core first produces real `CompactionPlan`
+values. Forge estimates each plan's peak heap use, then admits plans through a
+strict pod-local FIFO constrained by aggregate estimated memory and
+parallelism. Waiting plans do not count against running memory and cannot
+bypass a blocked head. A plan that fits the worker totals waits for running
+capacity; a plan larger than the worker's total estimated-memory or parallelism
+budget is refused.
+
+The estimate is scheduler accounting, not a hard allocation limit. Forge uses
+DataFusion's default unbounded memory pool, configures no disk spilling, and
+provisions no local scratch storage. Estimator undershoot may OOM the worker;
+durable task, lease, and fence recovery handles that process loss. Wyrd still
+supplies cancellation, attempt output identity, immutable table policy, and a
+non-semantic observer. It does not reimplement planning or physical rewrite.
 
 The managed core may expose narrow seams for runtime injection, structured
 cancellation/drain, output identity, selection evidence, and observations. It
@@ -69,17 +89,20 @@ uncertain-outcome reconciliation.
 
 ## Memory, spill, and concurrency
 
-- Make each query or Forge attempt own its memory-pool lifetime. A process pool
-  is an aggregate capacity root, not an operation-local grant.
-- Account scan buffers, repartition buffers, hash state, exchange buffers,
-  output builders, object-store writer buffers, Parquet row groups, footer
-  state, and close/upload concurrency before admission.
-- Keep spill allocation tenant- and operation-bound. Configure capacity,
-  compression, file rotation, cleanup, and failure behavior. Disk exhaustion
-  is a typed operation failure, not a reason to borrow another tenant's space.
+- Each Oracle query owns its memory-pool view and spill lifetime. The process
+  pool is the aggregate capacity root every Oracle consumer shares, not an
+  operation-local grant, and a query view allocates no capacity of its own.
+- Only fallible reservation is hard-limited. Infallible growth is measured as
+  explicit process headroom that makes later fallible growth refuse sooner; the
+  root bounds cooperative reservation, not total process memory.
+- Oracle accounts scan, repartition, hash, and exchange buffers before
+  admission and keeps spill tenant- and operation-bound.
+- Forge accounts the real plan's scan and prefetch buffers, decoded Arrow
+  batches, sort workspace, writer buffers, delete joins, and fixed headroom in
+  its scheduler estimate. The pod-local FIFO tracks only running estimates.
 - Bound target partitions, file-read concurrency, exchange fan-out, and open
   writers from measured resources. More partitions can increase retained
-  buffers and memory even when each operator is individually bounded.
+  buffers and memory.
 - Stream `RecordBatch` output. A user-sized `collect()` is forbidden.
 
 Accurate statistics drive pruning, join choice, and repartitioning. Prefer
@@ -90,8 +113,8 @@ count, or value distribution.
 ## Metrics and dependency boundary
 
 Collect DataFusion plan and operator metrics for rows, batches, elapsed work,
-spills, and partition behavior. Wyrd separately owns admission waits, queue
-age, snapshot acquisition, exchange reservation, terminal peer failure,
+Oracle spills, and partition behavior. Wyrd separately owns admission waits,
+queue age, snapshot acquisition, exchange reservation, terminal peer failure,
 WAL/catalog age, object-store errors, and successful-terminal accounting. Never
 infer resource or durability success from a metric descriptor alone.
 
@@ -131,3 +154,6 @@ DataFusion's owned abstractions already satisfy the required boundary.
 - [DataFusion operator metrics](https://datafusion.apache.org/user-guide/metrics.html)
 - [DataFusion 55 `TableProvider`](https://docs.rs/datafusion/55.0.0/datafusion/catalog/trait.TableProvider.html)
 - [datafusion-distributed](https://github.com/datafusion-contrib/datafusion-distributed)
+redacted
+redacted
+redacted

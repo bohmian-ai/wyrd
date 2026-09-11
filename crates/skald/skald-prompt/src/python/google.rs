@@ -16,7 +16,7 @@ use skald_spec::wire::google_generate::{
     GoogleThinkingConfig, GoogleTool, GoogleToolConfig, GoogleUsageMetadata,
 };
 use skald_spec::{ProviderRequest, ProviderResponse};
-use wyrd_interfaces::error::CardPyResult;
+use wyrd_utils::py::WyrdPyResult;
 
 use crate::prompt::wrong_variant;
 
@@ -184,13 +184,13 @@ impl PyGooglePart {
             GooglePart::CodeExecutionResult { .. } => "code_execution_result",
         }
     }
-    fn as_text(&self) -> CardPyResult<String> {
+    fn as_text(&self) -> WyrdPyResult<String> {
         match self.p() {
             GooglePart::Text { text } => Ok(text.clone()),
             _ => Err(wrong_variant("text", self.kind()).into()),
         }
     }
-    fn as_inline_data(&self) -> CardPyResult<PyGoogleInlineData> {
+    fn as_inline_data(&self) -> WyrdPyResult<PyGoogleInlineData> {
         match self.p() {
             GooglePart::InlineData { .. } => Ok(PyGoogleInlineData {
                 inner: Arc::clone(&self.inner),
@@ -200,7 +200,7 @@ impl PyGooglePart {
             _ => Err(wrong_variant("inline_data", self.kind()).into()),
         }
     }
-    fn as_file_data(&self) -> CardPyResult<PyGoogleFileData> {
+    fn as_file_data(&self) -> WyrdPyResult<PyGoogleFileData> {
         match self.p() {
             GooglePart::FileData { .. } => Ok(PyGoogleFileData {
                 inner: Arc::clone(&self.inner),
@@ -210,7 +210,7 @@ impl PyGooglePart {
             _ => Err(wrong_variant("file_data", self.kind()).into()),
         }
     }
-    fn as_function_call(&self) -> CardPyResult<PyGoogleFunctionCall> {
+    fn as_function_call(&self) -> WyrdPyResult<PyGoogleFunctionCall> {
         match self.p() {
             GooglePart::FunctionCall { .. } => Ok(PyGoogleFunctionCall {
                 inner: Arc::clone(&self.inner),
@@ -220,7 +220,7 @@ impl PyGooglePart {
             _ => Err(wrong_variant("function_call", self.kind()).into()),
         }
     }
-    fn as_function_response(&self) -> CardPyResult<PyGoogleFunctionResponse> {
+    fn as_function_response(&self) -> WyrdPyResult<PyGoogleFunctionResponse> {
         match self.p() {
             GooglePart::FunctionResponse { .. } => Ok(PyGoogleFunctionResponse {
                 inner: Arc::clone(&self.inner),
@@ -332,7 +332,7 @@ impl PyGoogleFunctionCall {
         &self.f().name
     }
     #[getter]
-    fn args(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+    fn args(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         wyrd_utils::py::json_to_pyobject(py, &self.f().args).map_err(Into::into)
     }
     fn __repr__(&self) -> String {
@@ -367,7 +367,7 @@ impl PyGoogleFunctionResponse {
         &self.f().name
     }
     #[getter]
-    fn response(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+    fn response(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         wyrd_utils::py::json_to_pyobject(py, &self.f().response).map_err(Into::into)
     }
     fn __repr__(&self) -> String {
@@ -597,7 +597,7 @@ impl PyGoogleFunctionDeclaration {
         self.f().description.as_deref()
     }
     #[getter]
-    fn parameters(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+    fn parameters(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         wyrd_utils::py::json_to_pyobject(py, &self.f().parameters).map_err(Into::into)
     }
     fn __repr__(&self) -> String {

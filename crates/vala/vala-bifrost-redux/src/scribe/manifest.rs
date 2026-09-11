@@ -58,7 +58,10 @@ impl Manifest {
 
     /// Update the sealed LSN for the given seal-key.
     pub fn update_sealed_lsn(&mut self, seal_key: &SealKey, lsn: WalLsn) {
-        self.sealed_lsn.insert(seal_key.to_string(), lsn.as_u64());
+        self.sealed_lsn
+            .entry(seal_key.to_string())
+            .and_modify(|current| *current = (*current).max(lsn.as_u64()))
+            .or_insert(lsn.as_u64());
     }
 
     /// Get the sealed LSN for the given seal-key, or `None` if not present.
@@ -167,12 +170,11 @@ pub fn read_manifest(path: impl AsRef<Path>) -> Result<Option<Manifest>, ScribeE
 mod tests {
     use super::*;
     use crate::catalog::TableRef;
+
     use crate::namespaces::BifrostNamespace;
-    use crate::scribe::seal_key::EventDay;
     use crate::scribe::stream_identity::{NodeId, WriterEpoch};
-    use chrono::NaiveDate;
+
     use tempfile::TempDir;
-    use wyrd_spec::ids::DataTenantId;
 
     #[test]
     fn manifest_roundtrip() {
@@ -182,9 +184,9 @@ mod tests {
 
         let mut manifest = Manifest::new(identity);
 
-        let tenant = DataTenantId::SYSTEM_OWNER;
+        let tenant = crate::test_support::tenant();
         let table = TableRef::new(BifrostNamespace::Bifrost, "events");
-        let day = EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).unwrap());
+        let day = crate::test_support::day_partition(2026, 7, 14);
         let seal_key = SealKey::new(tenant, table, day);
 
         manifest.update_sealed_lsn(&seal_key, WalLsn::new(100));
@@ -200,6 +202,22 @@ mod tests {
     }
 
     #[test]
+    fn manifest_watermark_never_regresses() {
+        let identity = StreamIdentity::new(NodeId::generate(), WriterEpoch::new(42));
+        let mut manifest = Manifest::new(identity);
+        let seal_key = SealKey::new(
+            crate::test_support::tenant(),
+            TableRef::new(BifrostNamespace::Bifrost, "events"),
+            crate::test_support::day_partition(2026, 7, 14),
+        );
+
+        manifest.update_sealed_lsn(&seal_key, WalLsn::new(100));
+        manifest.update_sealed_lsn(&seal_key, WalLsn::new(50));
+
+        assert_eq!(manifest.get_sealed_lsn(&seal_key), Some(WalLsn::new(100)));
+    }
+
+    #[test]
     fn wal_manifest_replace_is_atomic_across_crash() {
         let temp_dir = TempDir::new().expect("temp dir");
         let manifest_path = temp_dir.path().join("manifest");
@@ -208,9 +226,9 @@ mod tests {
         let identity = StreamIdentity::new(node_id, WriterEpoch::new(1));
 
         let mut manifest1 = Manifest::new(identity);
-        let tenant = DataTenantId::SYSTEM_OWNER;
+        let tenant = crate::test_support::tenant();
         let table = TableRef::new(BifrostNamespace::Bifrost, "events");
-        let day = EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).unwrap());
+        let day = crate::test_support::day_partition(2026, 7, 14);
         let seal_key = SealKey::new(tenant, table, day);
 
         manifest1.update_sealed_lsn(&seal_key, WalLsn::new(50));

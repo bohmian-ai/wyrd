@@ -6,7 +6,6 @@
 //! in process — exactly what an operator runs — instead of re-implementing the
 //! admin wire calls.
 
-pub mod audit;
 pub mod auth;
 mod card;
 mod cli;
@@ -14,6 +13,7 @@ pub mod error;
 mod eval;
 pub mod load;
 mod principal;
+pub mod query;
 #[cfg(feature = "python")]
 /// Optional PyO3 adapter for the shared numeric CLI entrypoint.
 pub mod python;

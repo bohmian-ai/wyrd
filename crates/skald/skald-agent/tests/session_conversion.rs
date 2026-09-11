@@ -7,10 +7,11 @@ use skald_agent::{
     SessionMemory, SessionTurn,
 };
 use skald_spec::{
-    MessageNum, OpenAiChatMessage, ProviderRequest, ProviderResponse,
+    MessageNum, OpenAiChatMessage, ProviderName, ProviderRequest, ProviderResponse,
     wire::openai_chat::OpenAiMessageContent,
 };
 use skald_tool::ToolError;
+use wyrd_spec::error::WyrdError;
 
 fn openai_assistant_message(content: &str) -> MessageNum {
     MessageNum::OpenAi(Box::new(OpenAiChatMessage {
@@ -301,11 +302,13 @@ fn error_codes_map_to_wyrd_error() {
         chain: vec!["a".to_owned()],
     };
     assert_eq!(delegation.code(), "SKALD_AGENT_412_DELEGATION_DEPTH");
-    assert_eq!(delegation.status(), 412);
-    assert_eq!(delegation.title(), "Agent delegation depth exceeded");
+    let projected = WyrdError::from(&delegation);
+    assert_eq!(projected.code(), "WYRD_AGENT_412_DELEGATION_DEPTH");
+    assert_eq!(projected.status(), 412);
+    assert_eq!(projected.title(), "Agent delegation depth exceeded");
     assert_eq!(
-        delegation.remediation(),
-        "Reduce nested agent-as-tool calls (cap = 3) or restructure the workflow."
+        projected.remediation(),
+        "Reduce nested agent-as-tool calls or restructure the workflow so the delegation chain stays within the cap."
     );
 
     let callback = AgentError::CallbackPanic {
@@ -348,5 +351,131 @@ fn session_turn_tool_role_none_call_id_produces_empty_string() {
             );
         }
         other => panic!("expected ToolResult, got {other:?}"),
+    }
+}
+
+/// Every agent failure must project onto a distinct, non-degraded catalog
+/// variant: every public Wyrd boundary reads its metadata from that
+/// projection alone.
+#[test]
+fn agent_errors_project_onto_the_catalog() {
+    let cases: Vec<(AgentError, &str)> = vec![
+        (
+            AgentError::ToolNotFound {
+                name: "echo".to_owned(),
+            },
+            "WYRD_AGENT_404_TOOL",
+        ),
+        (
+            AgentError::ToolNotInAgent {
+                name: "echo".to_owned(),
+            },
+            "WYRD_AGENT_404_TOOL_NOT_IN_AGENT",
+        ),
+        (
+            AgentError::InvalidToolArgs {
+                tool: "echo".to_owned(),
+                detail: "bad".to_owned(),
+            },
+            "WYRD_AGENT_422_TOOL_ARGS",
+        ),
+        (
+            AgentError::max_iterations("a", 3),
+            "WYRD_AGENT_500_MAX_ITERATIONS",
+        ),
+        (
+            AgentError::Provider(skald_runtime::SkaldRuntimeError::provider_not_registered(
+                ProviderName::OpenAi,
+            )),
+            "WYRD_AGENT_502_PROVIDER",
+        ),
+        (
+            AgentError::Tool(skald_tool::SkaldToolError::invalid_schema(None, "bad")),
+            "WYRD_TOOL_400_INVALID_SCHEMA",
+        ),
+        (
+            AgentError::Prompt {
+                agent: "a".to_owned(),
+                detail: "bad".to_owned(),
+            },
+            "WYRD_AGENT_422_PROMPT",
+        ),
+        (
+            AgentError::LoopMessageType {
+                provider: ProviderName::OpenAi,
+                detail: "bad".to_owned(),
+            },
+            "WYRD_AGENT_422_LOOP_MESSAGE_TYPE",
+        ),
+        (
+            AgentError::ProviderMismatch {
+                agent: "a".to_owned(),
+                agent_provider: ProviderName::OpenAi,
+                prompt_provider: ProviderName::Anthropic,
+            },
+            "WYRD_AGENT_409_PROVIDER_MISMATCH",
+        ),
+        (
+            AgentError::DelegationDepthExceeded { chain: Vec::new() },
+            "WYRD_AGENT_412_DELEGATION_DEPTH",
+        ),
+        (
+            AgentError::CallbackPanic {
+                hook: "before_model".to_owned(),
+                payload: "boom".to_owned(),
+            },
+            "WYRD_AGENT_500_CALLBACK_PANIC",
+        ),
+        (
+            AgentError::SessionRecentFailed {
+                session_id: "x".to_owned(),
+                source: SessionError::RecentFailed("e".to_owned()),
+            },
+            "WYRD_SESSION_500_RECENT",
+        ),
+        (
+            AgentError::SessionAppendFailed {
+                session_id: "x".to_owned(),
+                source: SessionError::AppendFailed("e".to_owned()),
+            },
+            "WYRD_SESSION_500_APPEND",
+        ),
+        (
+            AgentError::JournalAppendFailed {
+                source: JournalError::AppendFailed("e".to_owned()),
+            },
+            "WYRD_AGENT_500_JOURNAL",
+        ),
+        (
+            AgentError::Timeout {
+                duration: std::time::Duration::from_millis(250),
+            },
+            "WYRD_AGENT_504_TIMEOUT",
+        ),
+        (
+            AgentError::StructuredOutputDecode {
+                agent: "a".to_owned(),
+                detail: "bad".to_owned(),
+            },
+            "WYRD_AGENT_422_STRUCTURED_DECODE",
+        ),
+        (
+            AgentError::InvalidArgument {
+                name: "output_type".to_owned(),
+                detail: "bad".to_owned(),
+            },
+            "WYRD_AGENT_422_INVALID_ARGUMENT",
+        ),
+    ];
+
+    for (error, expected) in cases {
+        let message = error.to_string();
+        let projected = WyrdError::from(&error);
+        assert_eq!(projected.code(), expected, "for {error:?}");
+        assert_eq!(
+            projected.as_problem_json()["detail"],
+            serde_json::Value::String(message),
+            "projection must preserve the agent message for {error:?}"
+        );
     }
 }

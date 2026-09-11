@@ -1,15 +1,15 @@
 //! Data-plane audit threading for the C2 handlers (S3.C5).
 //!
-//! Every audited HTTP data-plane op (register/install, sync query, async
-//! submit/status, RBAC deny) appends one hash-chained `AuditEvent` row into the
+//! Every audited HTTP data-plane operation (register/install, query, RBAC deny)
+//! appends one hash-chained `AuditEvent` row into the
 //! transactional `vala.audit_outbox`. The attribution is derived from the
 //! resolved [`Caller`]: `principal_id`/`principal_kind`/`card_ref` come straight
 //! off the `Principal`, `request_id` off the caller, and `auth_method` is `Jwt`
 //! because this surface is reached only through the HTTP JWT-bearer flow
 //! (internal record writes audit as `Internal` down the ingest path).
 //!
-//! A same-tx append (async submit/status, register) is threaded directly on the
-//! operation's `TenantConn`; a standalone append (sync query, RBAC deny) uses
+//! A same-tx append (register) is threaded directly on the operation's
+//! `TenantConn`; a standalone append (query, RBAC deny) uses
 //! [`record_audit`], which owns its own short transaction. Either way a failed
 //! append is fail-closed: the enclosing op is refused with
 //! `WYRD_VALA_500_AUDIT_UNAVAILABLE`.
@@ -22,7 +22,7 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::BifrostError as ValaError;
-use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
+use wyrd_spec::vala::api::{AuditDecision, AuditDetail, AuditEvent, AuditResult, AuthMethod};
 
 use crate::components::auth::Caller;
 
@@ -54,8 +54,28 @@ pub fn audit_event(
         decision,
         result,
         payload_summary: payload_summary.to_owned(),
-        detail: None,
+        detail: delegation_detail(caller),
     }
+}
+
+/// Project the caller's verified delegation chain into a durable detail.
+///
+/// Operations reached through this builder carry no operation-specific detail
+/// of their own, so an attribution-only detail is the one place their audit row
+/// can record who was acting for whom. A nondelegated caller keeps `None`, which
+/// is exactly the encoding every such row had before delegation attribution
+/// existed, so historical rows and new nondelegated rows hash identically.
+///
+/// Callers that already build an operation-specific detail must fold the chain
+/// into that detail instead of calling this; overwriting a read decision with
+/// an attribution-only detail would lose the decision.
+fn delegation_detail(caller: &Caller) -> Option<AuditDetail> {
+    if caller.delegation_chain.is_empty() {
+        return None;
+    }
+    Some(AuditDetail::DelegationAttribution {
+        delegation_chain: wyrd_runtime::audit_delegation_chain(&caller.delegation_chain),
+    })
 }
 
 /// Build an [`AuditEvent`] for a pre-authentication attempt, attributed to
@@ -132,4 +152,33 @@ pub async fn record_audit(
         .map_err(audit_unavailable)?;
     conn.commit().await.map_err(audit_unavailable)?;
     Ok(())
+}
+
+/// Appends one owned audit event in its own tenant-scoped transaction.
+///
+/// This adapter keeps event and pool ownership inside transport futures that
+/// must remain `Send`; durability and fail-closed behavior match
+/// [`record_audit`].
+///
+/// # Errors
+///
+/// Returns [`WyrdError::AuditUnavailable`] when acquiring, appending, or
+/// committing fails.
+pub async fn record_audit_owned(
+    pool: PgPool,
+    tenant: DataTenantId,
+    event: AuditEvent,
+) -> Result<(), WyrdError> {
+    tokio::spawn(async move {
+        let mut conn = TenantConn::acquire(&pool, tenant)
+            .await
+            .map_err(audit_unavailable)?;
+        append_audit(&mut conn, &event)
+            .await
+            .map_err(audit_unavailable)?;
+        conn.commit().await.map_err(audit_unavailable)?;
+        Ok(())
+    })
+    .await
+    .map_err(audit_unavailable)?
 }

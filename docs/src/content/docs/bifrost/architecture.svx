@@ -8,13 +8,17 @@ order: 3
 
 # Bifrost Architecture
 
-Bifrost uses a four-component design: Gate (stateless routing), Scribe (durable WAL + seal), Oracle (stateless query), and Forge (stateless compaction). One binary can run all four roles by default. Optional role specialization via `WYRD_ROLES` env flag for separated deployments.
+Bifrost uses a four-component design: Gate (stateless routing), Scribe (durable WAL + seal), Oracle (stateless query), and Forge (stateless compaction). Wyrd deploys that design through one binary and three closed process-role values.
 
 ## System diagram
 
 One binary runs Gate, Scribe, Oracle, and Forge on the same pod. Add pods to scale horizontally. Postgres holds `vala.maintenance_leases` so Forge can lease `(namespace, table)` pairs and run one tick per table at a time.
 
 <WyrdBifrostSystem />
+
+The [Forge system overview](/bifrost/forge) follows the maintenance path in
+detail: how staged files move through compaction, how snapshot expiry and
+orphan GC protect live data, and how leases fence concurrent workers.
 
 ## Component responsibilities
 
@@ -52,10 +56,10 @@ One binary runs Gate, Scribe, Oracle, and Forge on the same pod. Add pods to sca
 6. **Seal state machine:**
    - Freeze memtable into an immutable Arrow snapshot.
    - Encode Parquet (sorted by `data_tenant_id`, `wyrd_event_time`; bloom filters, page index).
-   - PUT to object store: `s3://{ns}/{table}/day={YYYY-MM-DD}/tenant_bucket={N}/{pod_id}-{ulid}.parquet`.
+   - PUT to object store: `s3://tenants/{tenant_uuid}/{logical_namespace}/{table}/day={YYYY-MM-DD}/{pod_id}-{ulid}.parquet`.
    - Atomic Postgres transaction: INSERT `vala.file_list` row + append audit rows.
    - On commit, truncate WAL and retire manifest.
-7. **(Async) Forge** leases partition via `vala.maintenance_leases`, bin-packs small Parquet files into large ones, commits Iceberg snapshot via Mitari REPLACE, updates `vala.file_list` SET `compacted = true`.
+7. **(Async) Forge** leases a tenant/table via `vala.maintenance_leases`, bin-packs small Parquet files into Iceberg data files, updates `vala.file_list`, and runs snapshot expiry plus orphan GC. See the [Forge system overview](/bifrost/forge) for the maintenance state machine.
 
 **Critical:** Scribe never writes Iceberg snapshots on the ingest hot path. Forge is the only Iceberg snapshot writer.
 
@@ -82,7 +86,7 @@ One binary runs Gate, Scribe, Oracle, and Forge on the same pod. Add pods to sca
 1. **Client** issues query via typed `ValaQueryService` method (e.g., `QueryTraces`, `QueryMetrics`) or generic SQL (`POST /v1/observations/query`).
 2. **Gate** authenticates, resolves tenant + permissions, routes to any Oracle.
 3. **Oracle** builds DataFusion session with fused scan:
-   - **IcebergTableScan** (compacted data, partition-pruned by `Day(event_time)` + `Bucket(tenant, 64)`)
+   - **IcebergTableScan** (compacted data, tenant-qualified and partition-pruned by `Day(event_time)`)
    - **FileListScan** (`SELECT vala.file_list WHERE NOT compacted`, un-compacted Parquet files)
    - **ScribeLiveTailScan** (gRPC to live Scribe pods for recent WAL data; Phase 2, partially implemented)
 4. Union, then `FilterExec(data_tenant_id = $tenant)` applied (non-removable via `TenantPredicateRule`).
@@ -118,8 +122,8 @@ Postgres table tracking all sealed Parquet files:
 | `row_count` | `BIGINT NOT NULL` | Rows in file |
 | `min_event_time` | `TIMESTAMPTZ NOT NULL` | Earliest `wyrd_event_time` |
 | `max_event_time` | `TIMESTAMPTZ NOT NULL` | Latest `wyrd_event_time` |
-| `partition_day` | `DATE NOT NULL` | Exactly one Day per file |
-| `tenant_bucket` | `INT NOT NULL` | `Bucket(tenant, 64)` |
+| `partition_granularity` | `TEXT NOT NULL` | `hour` or `day` |
+| `partition_start` | `TIMESTAMPTZ NOT NULL` | Exactly one time partition per file |
 | `compacted` | `BOOLEAN NOT NULL DEFAULT false` | `false` until Forge folds into snapshot |
 | `committed_snapshot_id` | `BIGINT` nullable | Iceberg snapshot ID (NULL until Forge commits) |
 | `node_id` | `TEXT NOT NULL` | Scribe pod ID |
@@ -128,7 +132,7 @@ Postgres table tracking all sealed Parquet files:
 | `wal_lsn_max` | `BIGINT NOT NULL` | WAL LSN range end |
 | `created_at` | `TIMESTAMPTZ NOT NULL DEFAULT NOW()` | |
 
-**LSN streams:** LSN is append-position in one Scribe pod's local WAL. LSNs are meaningful ONLY within one `(node_id, writer_epoch)` stream. Cross-pod LSNs are unrelated integers. Oracle uses per-stream watermark `MAX(wal_lsn_max)` per `(ns, table, tenant_bucket, node_id, writer_epoch)` to dedupe live-tail data.
+**LSN streams:** LSN is append-position in one Scribe pod's local WAL. LSNs are meaningful ONLY within one `(node_id, writer_epoch)` stream. Cross-pod LSNs are unrelated integers. Oracle uses per-stream watermark `MAX(wal_lsn_max)` per `(data_tenant_id, namespace, table_name, node_id, writer_epoch)` to dedupe live-tail data.
 
 ## Concurrency model
 
@@ -201,13 +205,45 @@ Idempotent: if the pod crashed after PUT but before COMMIT, replay re-encodes Pa
 
 ## Deployment modes
 
-**Default:** One binary runs all four roles: Gate + Scribe + Oracle + Forge.
+`WYRD_ROLES` accepts exactly `all`, `server`, or `forge-worker`; comma-separated
+component subsets are rejected at boot.
 
-**Optional specialization via `WYRD_ROLES` env flag:**
-- `WYRD_ROLES=gate,scribe,forge,oracle` (default if unset)
-- Operator may restrict pod to subset: e.g., `WYRD_ROLES=scribe` for fast-disk StatefulSets, `WYRD_ROLES=oracle` for memory-heavy nodes.
+| Role | Listeners | Scheduler | Forge executor | Concurrency |
+| --- | --- | --- | --- | --- |
+| `all` | HTTP, gRPC, optional loopback metrics | Yes | One shared worker pool | `WYRD_FORGE_WORKER_CONCURRENCY` bounds the pool. |
+| `server` | HTTP, gRPC, optional loopback metrics | Yes | No | No Forge executor. |
+| `forge-worker` | Optional loopback metrics only | No | One shared worker pool | `WYRD_FORGE_WORKER_CONCURRENCY` bounds the pool. |
 
-Not a requirement; architecture works with flag unset. Autoscaling is per-pod, not per-role: HPA on CPU/memory, add pods, done.
+The Prometheus metrics listener is orthogonal to API serving and defaults to
+loopback. In `forge-worker` mode it is the only listener; the process never
+opens Wyrd HTTP or gRPC sockets. Every role uses the configured
+`WYRD_SHUTDOWN_DRAIN_MS` budget for cooperative shutdown before remaining work
+is cancelled.
+
+### Embedded topology
+
+```bash
+export WYRD_ROLES=all
+export WYRD_FORGE_WORKER_CONCURRENCY=1
+wyrd-server
+```
+
+`all` is the default and runs Gate, Scribe, Oracle, the Forge scheduler, and
+one bounded worker pool in the API-serving process.
+
+### Dedicated worker topology
+
+```bash
+# API-serving scheduler process
+WYRD_ROLES=server wyrd-server
+
+# One or more executor-only processes
+WYRD_ROLES=forge-worker WYRD_FORGE_WORKER_CONCURRENCY=2 wyrd-server
+```
+
+The `server` process schedules Forge work; every `forge-worker` process runs
+one shared executor graph and may expose only its metrics endpoint. Autoscaling
+remains a process-level operational decision.
 
 ## Data categories
 
@@ -215,17 +251,15 @@ All categories flow through unified Bifrost schema:
 
 | Category | Table | Partitioning | Isolation |
 |----------|-------|--------------|-----------|
-| **Agent traces** | `vala.dev.agent_traces` | `Day(event_time) + Bucket(tenant, 64)` | `data_tenant_id` column + bucket + `FilterExec` |
-| **Traces (spans)** | `vala.traces.spans` | `Day(event_time) + Bucket(tenant, 64)` | `data_tenant_id` column + bucket + `FilterExec` |
-| **Traces (events, links)** | `vala.traces.events`, `vala.traces.links` | `Day(event_time) + Bucket(tenant, 64)` | `data_tenant_id` column + bucket + `FilterExec` |
-| **Metrics** | `vala.metrics.points` | `Day(event_time) + Bucket(tenant, 64)` | `data_tenant_id` column + bucket + `FilterExec` |
-| **Logs** | `vala.logs.records` | `Day(event_time) + Bucket(tenant, 64)` | `data_tenant_id` column + bucket + `FilterExec` |
-| **GenAI signals** | `vala.genai.*` | `Day(event_time) + Bucket(tenant, 64)` | `data_tenant_id` column + bucket + `FilterExec` |
-| **Evaluations** | `vala.eval.*` | `Day(event_time) + Bucket(tenant, 64)` | `data_tenant_id` column + bucket + `FilterExec` |
-| **Drift** | `vala.drift.*` | `Day(event_time) + Bucket(tenant, 64)` | `data_tenant_id` column + bucket + `FilterExec` |
-| **User datasets** | `vala.datasets.<tenant_uuid>.<name>` | `Day(event_time) + Bucket(tenant, 64)` (collapses to 1 slot) | Physical namespace + `data_tenant_id` + `FilterExec` |
+| **Agent traces** | `vala.dev.agent_traces` | `Day(event_time)` | Tenant-qualified namespace + `data_tenant_id` |
+| **Traces (spans, incl. nested events/links and promoted GenAI attributes)** | `vala.traces.spans` | `Day(event_time)` | Tenant-qualified namespace + `data_tenant_id` |
+| **Metrics** | `vala.metrics.points` | `Day(event_time)` | Tenant-qualified namespace + `data_tenant_id` |
+| **Logs** | `vala.logs.records` | `Day(event_time)` | Tenant-qualified namespace + `data_tenant_id` |
+| **Evaluations** | `vala.eval.*` | `Day(event_time)` | Tenant-qualified namespace + `data_tenant_id` |
+| **Drift** | `vala.drift.*` | `Day(event_time)` | Tenant-qualified namespace + `data_tenant_id` |
+| **User datasets** | `vala.datasets.<name>` | `Day(event_time)` | Tenant-qualified namespace + `data_tenant_id` |
 
-**Shared signal tables** use multi-tenant partitioning via `Bucket(tenant, 64)`. **Tenant-scoped dynamic datasets** collapse to 1 bucket (physical isolation + logical RLS).
+Every logical table has an independent tenant-qualified physical table. The logical namespace and FQN remain stable while the physical path is rooted at `tenants/<tenant_uuid>/`.
 
 ## DomainTable and boot registration
 
@@ -233,10 +267,10 @@ Every queryable table in Bifrost is a `DomainTable`: a pre-declared, validated d
 
 A `DomainTable` carries:
 
-- **FQN.** `vala.traces.spans`, `vala.genai.messages`, etc.
+- **FQN.** `vala.traces.spans`, `vala.logs.records`, etc.
 - **Schema.** Arrow field list with types, nullability, and metadata.
-- **Scope.** `SystemShared`: all tenants write to the same physical Iceberg table; the `data_tenant_id` column enforces tenant isolation in the scan path.
-- **Partition spec.** Typically `Day(event_time) + Bucket(tenant, 64)`.
+- **Physical identity.** `(data_tenant_id, logical TableRef)`; built-ins and datasets use the same tenant-qualified storage model.
+- **Partition spec.** `Day(event_time)`.
 - **Sensitive payload columns.** The columns projected away by the payload permission gate.
 - **Correlation policy.** Which of `run_id`, `card_uid`, `principal_id` are stamped.
 
@@ -275,22 +309,17 @@ The `TenantPredicateRule` is a DataFusion `AnalyzerRule` registered on every `Se
 
 The predicate cannot be elided by a DataFusion optimizer pass because the rule is re-run after every optimization cycle.
 
-## Audit relay
+## Audit data
 
-Every Bifrost write operation appends audit rows atomically with the `vala.file_list` INSERT. Audit records are hash-chained and Ed25519-signed at seal boundaries. A separate audit relay worker tails the audit outbox and ships finalized records to long-term storage on a configurable schedule.
+Audited operations append immutable, hash-chained rows to
+`vala.audit_outbox` in their Postgres transaction. Redux owns the canonical
+`vala.system.audit_log` table definition and deterministic row projection.
 
 The audit log captures: operation name, principal ID, tenant, timestamp, decision (allow/deny), result, and detail field. Denials are written in a separate fail-closed transaction before the error is returned to the caller.
 
 ## Payload governance
 
-Sensitive columns (span attributes, log body, GenAI messages, agent-trace payloads) are projected away at the DataFusion plan stage unless the caller holds the matching payload read permission:
-
-- `bifrost_trace_payload:read`
-- `bifrost_log_payload:read`
-- `bifrost_genai_payload:read`
-- `bifrost_agent_trace_payload:read`
-
-Projection happens in Oracle before execution. Callers without permission see `NULL` for payload columns.
+Tables may mark columns as sensitive metadata. Oracle does not enforce separate column permissions; `bifrost_query:read` for the table governs every column, including GenAI fields stored on trace spans.
 
 Write-path redaction (when enabled) zeros sensitive columns before seal. Columns in the `REDACTED_COLUMNS` set are zeroed (strings become empty, numerics become 0, binaries become zero bytes) before the Arrow batch is sealed to Parquet. Redaction is transparent to the SDK and logged in the audit row.
 

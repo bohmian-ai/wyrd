@@ -19,6 +19,11 @@ pub enum WyrdQueueError {
     #[error("queue full: ingestion channel saturated")]
     QueueFull,
 
+    /// The handle-wide byte, producer, control, or retry envelope refused work
+    /// before adding a registry entry or material buffer.
+    #[error("queue backpressure: handle-wide bounded envelope is saturated")]
+    Backpressure,
+
     /// A drain (`flush`/`shutdown`) could not complete an in-flight `send` before
     /// the `flush_timeout_ms` deadline. Client-tier `WYRD_CLIENT_504_FLUSH_TIMEOUT`.
     #[error("flush timed out before the drain deadline")]
@@ -52,6 +57,7 @@ impl WyrdQueueError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::QueueFull => "WYRD_CLIENT_429_QUEUE_FULL",
+            Self::Backpressure => "WYRD_CLIENT_429_QUEUE_FULL",
             Self::FlushTimeout => "WYRD_CLIENT_504_FLUSH_TIMEOUT",
             Self::PayloadTooLarge => "WYRD_CLIENT_413_PAYLOAD_TOO_LARGE",
             Self::SchemaParse(_) => "WYRD_VALA_400_SCHEMA_PARSE",

@@ -34,9 +34,10 @@ At minimum, deployments measure:
 - Oracle interactive and analytical queue age, execution latency, result
   outcome, cancellation, terminal peer failure, memory, exchange, spill,
   audit-WAL lag, and partial-result prevention;
-- Forge demand age, claim age, lease expiry, attempt outcome, rewrite debt,
-  commit conflict, uncertain publication, reconciliation, snapshot expiry,
-  and orphan cleanup;
+- Forge demand age, claim age, lease expiry, plan-estimate accuracy, local FIFO
+  age, running estimated memory and parallelism, worker loss, attempt outcome,
+  rewrite debt, commit conflict, uncertain publication, reconciliation,
+  snapshot expiry, and orphan cleanup;
 - Postgres saturation, replication health, migration state, transaction
   failures, and RLS/role verification;
 - object-store latency, throttling, integrity failure, and capacity;
@@ -62,9 +63,10 @@ Overload is bounded and explicit:
 - Oracle preserves a non-borrowable interactive floor, separates interactive
   and analytical queues, and admits every query against query-owned memory,
   exchange, scratch, deadline, and cancellation resources.
-- Forge uses durable demand, per-tenant fairness, bounded worker lanes, and
-  fenced leases. Compaction debt cannot consume Scribe or Oracle's protected
-  resource floor.
+- Forge uses durable demand, per-tenant fairness, fenced leases, and one
+  strict FIFO per worker bounded by pending/running parallelism and running
+  estimated memory. Compaction debt cannot consume Scribe or Oracle's
+  protected resource floor.
 - Postgres and external dependencies use bounded pools, timeouts, and
   backpressure. An exhausted dependency does not trigger unbounded retries or
   queue growth.
@@ -86,9 +88,9 @@ Backups cover all authoritative and recovery-critical state:
 - deployment and redacted configuration fingerprints; and
 - node-to-volume identity needed to recover Scribe WAL and staged runs.
 
-Oracle spill and Forge scratch are not backup sources. Scribe staged runs and
-WAL remain required until their authoritative replacement and retirement fence
-are proven.
+Oracle spill is not a backup source. Forge has no local scratch state. Scribe
+staged runs and WAL remain required until their authoritative replacement and
+retirement fence are proven.
 
 Backups are encrypted, immutable for their retention interval, integrity-
 checked, access-audited, and stored outside the primary failure domain. A
@@ -159,10 +161,10 @@ fabricate task completion to make health checks pass.
   exhaustion, protocol mismatch, deadline, or cancellation terminates the
   complete result. Terminal framing prevents a partial stream from being
   interpreted as success.
-- Multi-stage planning failure before analytical selection may select the
-  authorized interactive path; it cannot bypass admission, audit, tenant
-  binding, deadline, or payload policy. After selection there is no interactive
-  rerun.
+- Physical planning failure is terminal; Oracle does not build or run a second
+  interactive plan. Planning and path selection cannot bypass admission,
+  audit, tenant binding, deadline, or payload policy. After Analytical
+  selection there is no interactive rerun.
 - Cleanup timeout or failure is never reported as a successful release. The
   remaining graph stays observable to the owning supervisor, the node does not
   claim a clean terminal state, and readiness or shutdown evidence surfaces the
@@ -189,20 +191,25 @@ publication.
 - Only the live lease and fence may create effects or acknowledge demand.
   Stale workers cannot publish, settle, or delete.
 - The managed compaction core produces bounded outputs and never commits the
-  Iceberg catalog. Forge validates the exact handoff and owns one fenced
-  `commit_once` operation per attempt.
-- A definite non-commit returns the logical task to durable scheduling under a
-  new claim, attempt, output generation, and fence. An ambiguous commit enters
-  durable uncertainty and is reconciled from snapshot properties and object
-  evidence before any retry or terminal audit.
+  Iceberg catalog. Forge validates each exact handoff; every admitted plan owns
+  one fenced `commit_once` operation, and sibling plans may publish
+  concurrently under the task attempt's lease and fence.
+- A definite non-commit leaves that plan's work as replannable debt. The task
+  returns to durable failure scheduling only when no sibling published; any
+  known committed or recovered sibling settles the task successfully. An
+  ambiguous operation with no known success retains the Running attempt for
+  exact reconciliation. When a sibling already succeeded, the task settles and
+  the still-Prepared operation remains for table-wide reconciliation.
 - Promotion, rewrite, snapshot expiration, expired-object deletion, and
   never-published orphan deletion are separate durable operations with
   independent protection sets and cursors.
 - Cancellation after output creation preserves enough durable identity to
-  reconcile or safely collect the outputs. Scratch and leases are released
-  only after the attempt disposition is durable.
-- Restart reclaims expired work, fences stale completion, resumes cursors, and
-  emits exactly one authoritative terminal outcome per attempt.
+  reconcile or safely collect the outputs. Normal completion or cancellation
+  releases the plan's local estimated-memory and parallelism reservation.
+- Process loss drops the local queue and running reservations. Lease expiry
+  returns unfinished durable work to scheduling, fences stale completion,
+  resumes cursors, and preserves one authoritative terminal outcome per
+  attempt.
 
 ## Dependency and regional failure
 

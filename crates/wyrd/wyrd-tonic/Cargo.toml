@@ -7,16 +7,21 @@ edition = "2021"
 # only the client-safe surface here so client-tier consumers (wyrd-client) never
 # inherit the server stack; the `server` feature below opts back into `tonic/server`.
 [dependencies]
-tonic = { workspace = true, features = ["channel", "tls", "tls-native-roots"] }
+tonic = { workspace = true, features = ["channel", "tls-aws-lc", "tls-native-roots"] }
+tonic-prost = { workspace = true }
 tonic-types = { workspace = true }
 prost = { workspace = true }
 wyrd-spec = { workspace = true }
+wyrd-tls = { workspace = true }
 serde_json = { workspace = true }
 arc-swap = { workspace = true }
 tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
 tokio-util = { workspace = true, features = ["rt"] }
+tokio-stream = { version = "0.1", features = ["net"] }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
 
 [dependencies.tonic-health]
 workspace = true
@@ -33,11 +38,15 @@ workspace = true
 optional = true
 
 [build-dependencies]
-tonic-build = { workspace = true }
+tonic-prost-build = { workspace = true }
 
 [features]
 default = []
-server = ["dep:tonic-reflection", "dep:tonic-health", "tonic/server", "dep:opentelemetry-proto"]
+# `tls-connect-info` publishes the accepted peer certificate chain into request
+# extensions. The private Bifrost peer listener authenticates a workload
+# credential against the certificate that carried it, so the server surface
+# needs the connection's verified identity, not only its bytes.
+server = ["dep:tonic-reflection", "dep:tonic-health", "tonic/server", "tonic/router", "tonic/tls-connect-info", "dep:opentelemetry-proto"]
 # Marker feature: opts the generated `wyrd::v1` client stub into codegen (see
 # build.rs). No extra tonic surface needed — the client rides the default
 # `channel` transport already enabled above.

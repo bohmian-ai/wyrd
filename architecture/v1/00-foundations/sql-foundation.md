@@ -46,7 +46,8 @@ strings or add a second hand-written tenant predicate.
 
 ## Transaction discipline
 
-The caller owns the `TenantConn` transaction and its final commit or rollback.
+Every tenant-scoped logical operation opens exactly one transaction. The caller
+owns that `TenantConn` transaction and its final commit or rollback.
 Tenant-scoped query and service functions accept `&mut TenantConn<'_>` and
 never accept a raw `PgPool`, `PgConnection`, or SQLx transaction. Callees do
 not commit, roll back, open a nested transaction, or issue raw transaction
@@ -60,8 +61,8 @@ does not expose a raw pool, connection, transaction, or generic query method.
 `SECURITY DEFINER` functions are narrow, reviewed bridges and never become a
 general RLS bypass.
 
-Cross-crate work does not extend a transaction by importing another crate's
-private query modules. A cross-owner durable effect uses its declared committed
+Cross-crate transactional coordination is not supported. Cross-crate work does
+not extend a transaction by importing another crate's private query modules. A cross-owner durable effect uses its declared committed
 handoff and idempotent consumer semantics.
 
 ## Roles, pools, and boot

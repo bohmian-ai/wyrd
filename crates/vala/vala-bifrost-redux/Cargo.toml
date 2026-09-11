@@ -6,48 +6,91 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
+autotests = false
+
+# `integration` is the crate's only test target. Every source under `tests/` is a
+# `#[path]` module of it, so a source is compiled and run exactly once.
+# `autotests = false` above is what makes that hold: without it Cargo would also
+# promote each `tests/*.rs` file to a target of its own and every module would
+# execute twice. Do not add a second `[[test]]` for a file this binary already
+# includes.
+[[test]]
+name = "integration"
+path = "tests/integration/main.rs"
+required-features = ["test-support"]
+
+[features]
+default = []
+bench-support = []
+test-support = []
 
 [dependencies]
+metrics.workspace = true
+num-traits = { workspace = true }
 wyrd-spec = { workspace = true }
 wyrd-runtime = { workspace = true }
 wyrd-sql = { workspace = true }
+wyrd-storage = { workspace = true }
 vala-sql = { workspace = true }
 
 async-trait = { workspace = true }
+async-stream = { workspace = true }
+arc-swap = { workspace = true }
+futures-util = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 sha2 = { workspace = true }
+hex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 arrow = { workspace = true }
-parquet = { workspace = true }
+parquet = { workspace = true, features = ["async"] }
 iceberg = { workspace = true }
+iceberg-datafusion = { workspace = true }
+iceberg-catalog-sql = { workspace = true }
+iceberg-compaction-core = { workspace = true }
+typetag = { workspace = true }
+lru = { workspace = true }
+datafusion-distributed = { workspace = true }
+http = { workspace = true }
+http-body = { workspace = true }
+tower = { workspace = true }
+url = { workspace = true }
 datafusion = { workspace = true }
+datafusion-proto = { workspace = true }
 opendal = { workspace = true }
 crc32c = { workspace = true }
+rustix = { workspace = true }
+blake3 = { workspace = true }
 uuid = { workspace = true }
+base64 = { workspace = true }
+secrecy = { workspace = true }
+wyrd-auth-oidc = { workspace = true }
+wyrd-auth-verify = { workspace = true }
+wyrd-tonic = { workspace = true, features = ["server", "client"] }
+prost = { workspace = true }
 chrono = { workspace = true }
 sqlx = { workspace = true }
+sqlx_catalog = { package = "sqlx", version = "=0.8.1", default-features = false, features = ["postgres", "runtime-tokio", "any"] }
 ulid = { workspace = true }
 bytes = "1"
+rayon = { workspace = true }
 rand = "0.8"
 tokio = { workspace = true }
+tokio-util = { workspace = true }
+tempfile = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
+# `time` and `test-util` are test-only: the publication retry schedule is proved
+# with paused time rather than a clock abstraction the production path would
+# then have to carry.
+tokio = { workspace = true, features = ["time", "test-util"] }
 wyrd-dev-fixtures = { workspace = true, features = ["pg"] }
-
-[[bench]]
-name = "bench_ingest_seal_throughput"
-harness = false
-
-[[bench]]
-name = "bench_ingest_ack_latency"
-harness = false
-
-[[bench]]
-name = "bench_ingest_multi_tenant_fairness"
-harness = false
+wyrd-bench = { workspace = true }
+wyrd-telemetry = { workspace = true, features = ["test-support"] }
+iceberg-catalog-sql = { workspace = true }
+datafusion-distributed = { workspace = true }
+url = { workspace = true }
 
 [lints]
 workspace = true

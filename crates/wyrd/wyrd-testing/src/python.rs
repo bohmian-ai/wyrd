@@ -2,11 +2,16 @@
 
 use std::sync::{Mutex, OnceLock};
 
+use arrow::datatypes::{DataType, Field, Schema};
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
 use secrecy::ExposeSecret;
-use wyrd_interfaces::error::{CardPyResult, WyrdPyError};
-use wyrd_utils::py::wyrd_error_to_py_err;
+use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
+use vala_bifrost_redux::namespaces::BifrostNamespace;
+use vala_bifrost_redux::scribe::tail_rpc::{LocalTailReadTransport, TailReadTransport};
+use wyrd_client::config::ClientConfig;
+use wyrd_client::transport::{GrpcConfig, HttpConfig};
+use wyrd_utils::py::{WyrdPyError, WyrdPyResult};
 
 static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -29,18 +34,45 @@ impl EnvSnapshot {
         }
     }
 
-    fn restore(self) {
-        match self.server_url {
-            Some(v) => unsafe { std::env::set_var("WYRD_SERVER_URL", &v) },
-            None => unsafe { std::env::remove_var("WYRD_SERVER_URL") },
+    fn restore(self, py: Python<'_>) -> WyrdPyResult<()> {
+        for (key, value) in [
+            ("WYRD_SERVER_URL", self.server_url),
+            ("WYRD_GRPC_URL", self.grpc_url),
+            ("WYRD_API_KEY", self.api_key),
+        ] {
+            publish_env(py, key, value.as_deref())?;
         }
-        match self.grpc_url {
-            Some(v) => unsafe { std::env::set_var("WYRD_GRPC_URL", &v) },
-            None => unsafe { std::env::remove_var("WYRD_GRPC_URL") },
+        Ok(())
+    }
+}
+
+/// Publishes one harness endpoint variable to both environment views.
+///
+/// The process environment is what the Rust client tier resolves from, but
+/// Python builds `os.environ` once at interpreter start and never re-reads
+/// `environ`, so a `setenv` alone is invisible to the Python side of a test.
+/// Both are written here so a Python caller and a Rust client agree on what
+/// the harness published.
+///
+/// # Errors
+///
+/// Returns a Python error when `os.environ` cannot be reached; deleting an
+/// absent key is not an error.
+fn publish_env(py: Python<'_>, key: &str, value: Option<&str>) -> WyrdPyResult<()> {
+    match value {
+        Some(value) => {
+            // SAFETY: every harness mutation holds `env_mutex`, and the
+            // published values are owned `String`s with no interior nul.
+            unsafe { std::env::set_var(key, value) };
+            Ok(py.import("os")?.getattr("environ")?.set_item(key, value)?)
         }
-        match self.api_key {
-            Some(v) => unsafe { std::env::set_var("WYRD_API_KEY", &v) },
-            None => unsafe { std::env::remove_var("WYRD_API_KEY") },
+        None => {
+            unsafe { std::env::remove_var(key) };
+            let environ = py.import("os")?.getattr("environ")?;
+            if environ.call_method1("__contains__", (key,))?.is_truthy()? {
+                environ.del_item(key)?;
+            }
+            Ok(())
         }
     }
 }
@@ -74,7 +106,13 @@ impl WyrdTestServer {
         }
     }
 
-    fn __enter__(mut slf: PyRefMut<'_, Self>) -> PyResult<PyRefMut<'_, Self>> {
+    /// Start a bound server, bootstrap its writer service key, and optionally
+    /// publish the endpoints through the documented `WYRD_*` environment vars.
+    ///
+    /// # Errors
+    /// Returns a Python error when server startup, service bootstrap, or
+    /// environment setup cannot complete.
+    fn __enter__(mut slf: PyRefMut<'_, Self>) -> WyrdPyResult<PyRefMut<'_, Self>> {
         let mutate_env = slf.mutate_env;
 
         let result: Result<
@@ -92,21 +130,34 @@ impl WyrdTestServer {
                 .map_err(wyrd_spec::error::WyrdError::from)?;
             let base_url = srv.base_url().unwrap_or("").to_owned();
             let grpc_url = srv.grpc_url().unwrap_or_default();
-            let api_key = srv.api_key().expose_secret().to_owned();
+            let bootstrap = srv
+                .bootstrap_service("python-integration-writer", &["admin"])
+                .await
+                .map_err(wyrd_spec::error::WyrdError::from)?;
+            let api_key = match bootstrap {
+                crate::server::Bootstrap::Machine { api_key, .. } => {
+                    api_key.expose_secret().to_owned()
+                }
+                crate::server::Bootstrap::User { .. } => {
+                    return Err(wyrd_spec::error::WyrdError::HarnessStart {
+                        message: "Python test server writer bootstrap returned a user".to_owned(),
+                        details: serde_json::json!({}),
+                    });
+                }
+            };
             let tenant_id = srv.data_tenant_id().to_string();
             Ok((srv, base_url, grpc_url, api_key, tenant_id))
         });
 
-        let (srv, base_url, grpc_url, api_key, tenant_id) = result.map_err(wyrd_error_to_py_err)?;
+        let (srv, base_url, grpc_url, api_key, tenant_id) = result.map_err(WyrdPyError::from)?;
 
         if mutate_env {
             let _guard = env_mutex().lock().unwrap_or_else(|p| p.into_inner());
             let snapshot = EnvSnapshot::capture();
-            unsafe {
-                std::env::set_var("WYRD_SERVER_URL", &base_url);
-                std::env::set_var("WYRD_GRPC_URL", &grpc_url);
-                std::env::set_var("WYRD_API_KEY", &api_key);
-            }
+            let py = slf.py();
+            publish_env(py, "WYRD_SERVER_URL", Some(&base_url))?;
+            publish_env(py, "WYRD_GRPC_URL", Some(&grpc_url))?;
+            publish_env(py, "WYRD_API_KEY", Some(&api_key))?;
             slf.env_snapshot = Some(snapshot);
         }
 
@@ -119,13 +170,14 @@ impl WyrdTestServer {
 
     fn __exit__(
         &mut self,
+        py: Python<'_>,
         _exc_type: Option<Bound<'_, PyAny>>,
         _exc_value: Option<Bound<'_, PyAny>>,
         _traceback: Option<Bound<'_, PyAny>>,
-    ) -> PyResult<bool> {
+    ) -> WyrdPyResult<bool> {
         if let Some(snapshot) = self.env_snapshot.take() {
             let _guard = env_mutex().lock().unwrap_or_else(|p| p.into_inner());
-            snapshot.restore();
+            snapshot.restore(py)?;
         }
         if !self.cleanup {
             tracing::warn!(
@@ -142,30 +194,41 @@ impl WyrdTestServer {
     }
 
     #[getter]
-    fn base_url(&self) -> PyResult<String> {
-        self.base_url.clone().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "WyrdTestServer not started (use as context manager)",
-            )
-        })
+    fn base_url(&self) -> WyrdPyResult<String> {
+        self.base_url.clone().ok_or_else(not_started)
     }
 
     #[getter]
-    fn api_key(&self) -> PyResult<String> {
-        self.api_key.clone().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "WyrdTestServer not started (use as context manager)",
-            )
-        })
+    fn api_key(&self) -> WyrdPyResult<String> {
+        self.api_key.clone().ok_or_else(not_started)
     }
 
     #[getter]
-    fn tenant_id(&self) -> PyResult<String> {
-        self.tenant_id.clone().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "WyrdTestServer not started (use as context manager)",
-            )
-        })
+    fn tenant_id(&self) -> WyrdPyResult<String> {
+        self.tenant_id.clone().ok_or_else(not_started)
+    }
+
+    /// Exchanges the harness's retained API key for a bearer access token.
+    ///
+    /// Wraps [`crate::server::WyrdTestServer::exchange_api_key`] so a Python
+    /// test can hand an unmodified OTLP exporter the `x-wyrd-access-token`
+    /// header it needs. The key itself never leaves the harness.
+    ///
+    /// # Errors
+    ///
+    /// Raises a Python runtime error when the context manager is inactive, and
+    /// a Wyrd Python error when the exchange route refuses the key.
+    fn access_token(&self) -> WyrdPyResult<String> {
+        let srv = self.server.as_ref().ok_or_else(not_started)?;
+        let api_key = self.api_key.as_ref().ok_or_else(not_started)?;
+        let key = secrecy::SecretString::from(api_key.clone());
+        let result: Result<String, wyrd_spec::error::WyrdError> =
+            wyrd_runtime::runtime().block_on(async {
+                srv.exchange_api_key(&key)
+                    .await
+                    .map_err(wyrd_spec::error::WyrdError::from)
+            });
+        result.map_err(WyrdPyError::from)
     }
 
     /// Bootstrap a service principal, returning its scoped API key string.
@@ -175,12 +238,8 @@ impl WyrdTestServer {
     /// grants (useful for negative RBAC journeys). Must be called inside the context
     /// manager.
     #[pyo3(signature = (roles, name = "svc"))]
-    fn bootstrap_service(&self, roles: Vec<String>, name: &str) -> PyResult<String> {
-        let srv = self.server.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "WyrdTestServer not started (use as context manager)",
-            )
-        })?;
+    fn bootstrap_service(&self, roles: Vec<String>, name: &str) -> WyrdPyResult<String> {
+        let srv = self.server.as_ref().ok_or_else(not_started)?;
         let roles: Vec<&str> = roles.iter().map(String::as_str).collect();
         let result: Result<crate::server::Bootstrap, wyrd_spec::error::WyrdError> =
             wyrd_runtime::runtime().block_on(async {
@@ -188,62 +247,485 @@ impl WyrdTestServer {
                     .await
                     .map_err(wyrd_spec::error::WyrdError::from)
             });
-        let bootstrap = result.map_err(wyrd_error_to_py_err)?;
+        let bootstrap = result.map_err(WyrdPyError::from)?;
         match bootstrap {
             crate::server::Bootstrap::Machine { api_key, .. } => {
                 Ok(api_key.expose_secret().to_owned())
             }
-            crate::server::Bootstrap::User { .. } => {
-                Err(pyo3::exceptions::PyRuntimeError::new_err(
-                    "expected Machine bootstrap from bootstrap_service",
-                ))
-            }
+            crate::server::Bootstrap::User { .. } => Err(WyrdPyError::from(harness_error(
+                "expected Machine bootstrap from bootstrap_service",
+            ))),
         }
     }
 
-    /// Provision a second tenant for cross-tenant journey tests.
+    /// Materialize one canonical built-in table for the fixture tenant.
+    ///
+    /// A canonical signal table is created on first use. An OTLP export
+    /// provisions it on ingest, but a journey that writes it through the public
+    /// Arrow batch door must ask for it first.
+    ///
+    /// # Errors
+    ///
+    /// Raises a Wyrd Python error when the context manager is inactive, no
+    /// built-in owns `namespace.name`, or the catalog cannot materialize it.
+    fn ensure_builtin_table(&self, namespace: &str, name: &str) -> WyrdPyResult<()> {
+        let srv = self.server.as_ref().ok_or_else(not_started)?;
+        wyrd_runtime::runtime()
+            .block_on(srv.ensure_builtin_table_for_test(srv.data_tenant_id(), namespace, name))
+            .map_err(WyrdPyError::from)
+    }
+
+    /// Mint an API key for a principal holding exactly `permissions`.
+    ///
+    /// `permissions` are `resource:action` strings. This is the door a journey
+    /// uses to prove an access gate from the caller's side: it seeds one role
+    /// carrying only those grants and bootstraps a service onto it.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValueError` for an unparsable permission, and a Wyrd Python
+    /// error when the context manager is inactive or role seeding or
+    /// bootstrapping fails.
+    fn scoped_api_key(&self, role: &str, permissions: Vec<String>) -> WyrdPyResult<String> {
+        let srv = self.server.as_ref().ok_or_else(not_started)?;
+        let parsed = permissions
+            .iter()
+            .map(|value| {
+                value.parse::<wyrd_runtime::Permission>().map_err(|_| {
+                    WyrdPyError::from(harness_error(format!(
+                        "`{value}` is not a resource:action permission"
+                    )))
+                })
+            })
+            .collect::<WyrdPyResult<Vec<_>>>()?;
+        let result: Result<crate::server::Bootstrap, wyrd_spec::error::WyrdError> =
+            wyrd_runtime::runtime().block_on(async {
+                srv.seed_role(role, &parsed)
+                    .await
+                    .map_err(wyrd_spec::error::WyrdError::from)?;
+                srv.bootstrap_service(role, &[role])
+                    .await
+                    .map_err(wyrd_spec::error::WyrdError::from)
+            });
+        match result.map_err(WyrdPyError::from)? {
+            crate::server::Bootstrap::Machine { api_key, .. } => {
+                Ok(api_key.expose_secret().to_owned())
+            }
+            crate::server::Bootstrap::User { .. } => Err(WyrdPyError::from(harness_error(
+                "expected a machine bootstrap",
+            ))),
+        }
+    }
+
+    /// Creates a real sealed Oracle fixture and returns its table and access token.
+    ///
+    /// The setup uses the public gRPC ingest transport, flushes Scribe, and
+    /// exchanges the harness admin API key through the real auth route. The
+    /// returned values are intended for public language-client integration tests.
+    ///
+    /// # Errors
+    ///
+    /// Raises a Wyrd Python error when the context manager is inactive or table
+    /// registration, ingest, flush, token exchange, or Arrow encoding fails.
+    #[pyo3(signature = (fused = false))]
+    fn prepare_oracle_query_fixture(&self, fused: bool) -> WyrdPyResult<(String, String)> {
+        let srv = self.server.as_ref().ok_or_else(not_started)?;
+        wyrd_runtime::runtime()
+            .block_on(prepare_oracle_query_fixture(srv, fused))
+            .map_err(WyrdPyError::from)
+    }
+
+    /// Provision a second tenant so a journey can prove cross-tenant isolation.
+    ///
+    /// The tenant is seeded through the same operator path the Rust harness
+    /// uses, so a Python journey observes the production tenancy boundary
+    /// rather than a fixture-only one.
+    ///
+    /// # Errors
+    ///
+    /// Raises a Wyrd Python error when the context manager is inactive or the
+    /// tenant cannot be seeded.
     #[pyo3(signature = (slug))]
-    fn seed_tenant(&self, slug: &str) -> CardPyResult<String> {
-        let srv = self
-            .server
-            .as_ref()
-            .ok_or_else(|| WyrdPyError::internal("WyrdTestServer not started"))?;
+    fn seed_tenant(&self, slug: &str) -> WyrdPyResult<String> {
+        let srv = self.server.as_ref().ok_or_else(not_started)?;
         let tenant_id = wyrd_runtime::runtime()
             .block_on(srv.seed_tenant(slug))
-            .map_err(|error| WyrdPyError::from(wyrd_spec::error::WyrdError::from(error)))?;
+            .map_err(WyrdPyError::from)?;
         Ok(tenant_id.to_string())
     }
 
     /// Bootstrap a service principal under an explicit tenant.
+    ///
+    /// Pairs with [`seed_tenant`](Self::seed_tenant): the returned API key is
+    /// the caller identity a cross-tenant journey uses to prove that the other
+    /// tenant's Cards are unreachable.
+    ///
+    /// # Errors
+    ///
+    /// Raises a Wyrd Python error when the context manager is inactive, the
+    /// tenant id does not parse, bootstrapping fails, or the bootstrap is not a
+    /// machine principal.
     #[pyo3(signature = (tenant_id, roles, name = "svc"))]
     fn bootstrap_service_in_tenant(
         &self,
         tenant_id: &str,
         roles: Vec<String>,
         name: &str,
-    ) -> CardPyResult<String> {
-        let srv = self
-            .server
-            .as_ref()
-            .ok_or_else(|| WyrdPyError::internal("WyrdTestServer not started"))?;
-        let tenant_id = tenant_id
-            .parse::<wyrd_spec::DataTenantId>()
-            .map_err(|error| WyrdPyError::validation(format!("invalid tenant id: {error}")))?;
+    ) -> WyrdPyResult<String> {
+        let srv = self.server.as_ref().ok_or_else(not_started)?;
+        let tenant_id = tenant_id.parse::<wyrd_spec::DataTenantId>().map_err(|error| {
+            WyrdPyError::from(harness_error(format!("invalid tenant id: {error}")))
+        })?;
         let roles: Vec<&str> = roles.iter().map(String::as_str).collect();
         let bootstrap = wyrd_runtime::runtime()
             .block_on(srv.bootstrap_service_in_tenant(tenant_id, name, &roles))
-            .map_err(|error| WyrdPyError::from(wyrd_spec::error::WyrdError::from(error)))?;
+            .map_err(WyrdPyError::from)?;
         match bootstrap {
             crate::server::Bootstrap::Machine { api_key, .. } => {
                 Ok(api_key.expose_secret().to_owned())
             }
-            crate::server::Bootstrap::User { .. } => Err(WyrdPyError::internal(
-                "expected Machine bootstrap from bootstrap_service_in_tenant",
-            )),
+            crate::server::Bootstrap::User { .. } => Err(WyrdPyError::from(harness_error(
+                "expected a machine bootstrap from bootstrap_service_in_tenant",
+            ))),
         }
+    }
+
+    /// Flush the server-owned Scribe after a public client drain.
+    ///
+    /// # Errors
+    /// Raises a Wyrd Python error when the context manager is inactive or the
+    /// production Scribe seal path cannot commit its buffered rows.
+    fn flush_bifrost(&self) -> WyrdPyResult<()> {
+        let server = self.server.as_ref().ok_or_else(not_started)?;
+        wyrd_runtime::runtime()
+            .block_on(server.flush_bifrost())
+            .map_err(WyrdPyError::from)
+    }
+
+    /// Truncate the next query after its schema frame in the real server.
+    ///
+    /// # Errors
+    ///
+    /// Raises `RuntimeError` when the context manager is inactive.
+    fn fail_next_query_after_schema(&self) -> WyrdPyResult<()> {
+        self.server
+            .as_ref()
+            .ok_or_else(not_started)?
+            .fail_next_query_after_schema();
+        Ok(())
+    }
+
+    /// Truncate the next query after its first batch frame in the real server.
+    ///
+    /// # Errors
+    ///
+    /// Raises `RuntimeError` when the context manager is inactive.
+    fn fail_next_query_after_batch(&self) -> WyrdPyResult<()> {
+        self.server
+            .as_ref()
+            .ok_or_else(not_started)?
+            .fail_next_query_after_batch();
+        Ok(())
+    }
+
+    /// Stall the next query after its schema for deterministic cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Raises `RuntimeError` when the context manager is inactive.
+    fn stall_next_query_after_schema(&self) -> WyrdPyResult<()> {
+        self.server
+            .as_ref()
+            .ok_or_else(not_started)?
+            .stall_next_query_after_schema();
+        Ok(())
+    }
+
+    /// Wait until the real response body reaches its notification-backed stall.
+    ///
+    /// # Errors
+    ///
+    /// Raises a Wyrd Python error when no stall is scheduled or the configured
+    /// server drain deadline expires.
+    fn wait_query_schema_stall(&self, py: Python<'_>) -> WyrdPyResult<String> {
+        let server = self.server.as_ref().ok_or_else(not_started)?;
+        py.detach(|| wyrd_runtime::runtime().block_on(server.wait_query_schema_stall()))
+            .map_err(WyrdPyError::from)
+    }
+
+    /// Return exact admission, memory, peer-slot, and tail-fence counts.
+    ///
+    /// # Errors
+    ///
+    /// Raises a Wyrd Python error when production-shaped resource owners cannot
+    /// provide an exact snapshot.
+    fn bifrost_query_resource_snapshot(
+        &self,
+        query_id: &str,
+    ) -> WyrdPyResult<std::collections::BTreeMap<String, u64>> {
+        let server = self.server.as_ref().ok_or_else(not_started)?;
+        let snapshot = server
+            .bifrost_query_resource_snapshot(query_id)
+            .map_err(WyrdPyError::from)?;
+        Ok(query_resource_snapshot_to_map(snapshot))
+    }
+
+    /// Wait until all exact query resources equal the supplied baseline.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValueError` for a malformed baseline and a Wyrd Python error
+    /// when notification-backed release exceeds `shutdown.drain_ms`.
+    fn wait_bifrost_query_resources_released(
+        &self,
+        py: Python<'_>,
+        query_id: &str,
+        baseline: std::collections::BTreeMap<String, u64>,
+    ) -> WyrdPyResult<std::collections::BTreeMap<String, u64>> {
+        let server = self.server.as_ref().ok_or_else(not_started)?;
+        let baseline = query_resource_snapshot_from_map(&baseline)?;
+        let snapshot = py
+            .detach(|| {
+                wyrd_runtime::runtime()
+                    .block_on(server.wait_bifrost_query_resources_released(query_id, baseline))
+            })
+            .map_err(WyrdPyError::from)?;
+        Ok(query_resource_snapshot_to_map(snapshot))
+    }
+
+    /// Mint an authenticated token lacking `bifrost_query:read`.
+    ///
+    /// # Errors
+    ///
+    /// Raises a Wyrd error when the context manager is inactive or token
+    /// issuance fails.
+    fn query_denied_token(&self) -> WyrdPyResult<String> {
+        let server = self.server.as_ref().ok_or_else(not_started)?;
+        wyrd_runtime::runtime()
+            .block_on(server.query_denied_token())
+            .map_err(WyrdPyError::from)
+    }
+
+    /// Return the fixture tenant's durable Oracle read-decision count.
+    ///
+    /// # Errors
+    ///
+    /// Raises a Wyrd error when the context manager is inactive or the audit
+    /// query fails.
+    fn bifrost_read_decision_count(&self) -> WyrdPyResult<i64> {
+        let server = self.server.as_ref().ok_or_else(not_started)?;
+        wyrd_runtime::runtime()
+            .block_on(server.bifrost_read_decision_count())
+            .map_err(WyrdPyError::from)
+    }
+
+    /// Wait until every accepted Oracle audit record has relayed to Postgres.
+    ///
+    /// Returns the residual pending count, which is `0` on a converged relay.
+    /// A journey asserting on the read-decision outbox calls this first: the
+    /// relay is a background task, so the outbox lags local acceptance.
+    ///
+    /// # Errors
+    ///
+    /// Raises a Wyrd error when the context manager is inactive or this server
+    /// does not host an Oracle role.
+    #[pyo3(signature = (budget_ms=5000))]
+    fn wait_oracle_audit_relayed(&self, py: Python<'_>, budget_ms: u64) -> WyrdPyResult<u64> {
+        let server = self.server.as_ref().ok_or_else(not_started)?;
+        py.detach(|| {
+            wyrd_runtime::runtime().block_on(
+                server.wait_oracle_audit_relayed(std::time::Duration::from_millis(budget_ms)),
+            )
+        })
+        .map_err(WyrdPyError::from)
+    }
+}
+
+/// Projects one exact Rust resource snapshot into a Python dictionary.
+fn query_resource_snapshot_to_map(
+    snapshot: crate::server::BifrostQueryResourceSnapshot,
+) -> std::collections::BTreeMap<String, u64> {
+    std::collections::BTreeMap::from([
+        ("admission_slots".to_owned(), snapshot.admission_slots),
+        ("memory_bytes".to_owned(), snapshot.memory_bytes),
+        ("peer_slots".to_owned(), snapshot.peer_slots),
+        ("tail_fences".to_owned(), snapshot.tail_fences),
+    ])
+}
+
+/// Parses one Python baseline dictionary into exact Rust resource counts.
+///
+/// # Errors
+///
+/// Raises `WYRD_TESTING_500_HARNESS_START` when a required counter is absent or
+/// does not fit the platform's native count width.
+fn query_resource_snapshot_from_map(
+    baseline: &std::collections::BTreeMap<String, u64>,
+) -> WyrdPyResult<crate::server::BifrostQueryResourceSnapshot> {
+    let value = |name: &str| {
+        baseline.get(name).copied().ok_or_else(|| {
+            WyrdPyError::from(harness_error(format!(
+                "query resource baseline is missing {name}"
+            )))
+        })
+    };
+    Ok(crate::server::BifrostQueryResourceSnapshot {
+        admission_slots: value("admission_slots")?,
+        memory_bytes: value("memory_bytes")?,
+        peer_slots: value("peer_slots")?,
+        tail_fences: value("tail_fences")?,
+    })
+}
+
+/// Builds the Python query journey's real ingest-to-sealed prerequisite.
+///
+/// # Errors
+///
+/// Returns a Wyrd error when table registration, Arrow encoding, client
+/// construction, gRPC ingest, Scribe flush, or token exchange fails.
+async fn prepare_oracle_query_fixture(
+    srv: &crate::server::WyrdTestServer,
+    fused: bool,
+) -> Result<(String, String), wyrd_spec::error::WyrdError> {
+    let bootstrap = srv
+        .bootstrap_service(
+            &format!("python-oracle-query-{}", uuid::Uuid::now_v7().simple()),
+            &["admin"],
+        )
+        .await
+        .map_err(wyrd_spec::error::WyrdError::from)?;
+    let api_key = bootstrap
+        .api_key()
+        .ok_or_else(|| harness_error("Oracle fixture bootstrap did not return an API key"))?;
+    let table_name = format!("python_oracle_{}", uuid::Uuid::now_v7().simple());
+    let table_fqn = format!("vala.bifrost.{table_name}");
+    let schema = std::sync::Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Utf8, false),
+    ]));
+    srv.state()
+        .bifrost_catalog()
+        .expect("test server exposes its Bifrost catalog")
+        .create_table(CreateTableRequest {
+            table: TableRef::new(BifrostNamespace::Bifrost, &table_name),
+            user_fields: schema
+                .fields()
+                .iter()
+                .map(|field| field.as_ref().clone())
+                .collect(),
+            tenant: srv.data_tenant_id(),
+            physical_layout: None,
+            audit: None,
+        })
+        .await
+        .map_err(harness_error)?;
+    let writer = crate::bifrost::write::BifrostWriter::connect(
+        ClientConfig {
+            grpc: GrpcConfig {
+                endpoint: srv.grpc_url().unwrap_or_default(),
+                connect_retries: 0,
+                ..GrpcConfig::default()
+            },
+            http: HttpConfig {
+                base_url: srv.base_url().unwrap_or_default().to_owned(),
+                ..HttpConfig::default()
+            },
+            credential: Some(api_key.clone()),
+            ..ClientConfig::default()
+        },
+        bootstrap
+            .card_ref()
+            .ok_or_else(|| harness_error("Oracle fixture bootstrap is not a machine principal"))?
+            .clone(),
+    )
+    .await?;
+    writer
+        .write(
+            &table_fqn,
+            &schema,
+            [
+                br#"{"id": 1, "value": "first"}"#.to_vec(),
+                br#"{"id": 2, "value": "second"}"#.to_vec(),
+            ],
+        )
+        .await?;
+    let ingest = srv
+        .state()
+        .bifrost_ingest()
+        .ok_or_else(|| harness_error("Scribe runtime is unavailable"))?;
+    let stream = ingest
+        .scribe()
+        .tail_service()
+        .map_err(harness_error)?
+        .stream();
+    let writer_epoch = u64::try_from(stream.writer_epoch.as_i64()).map_err(harness_error)?;
+    let time_partition = vala_bifrost_redux::catalog::TimeGranularity::Hour
+        .bucket(chrono::Utc::now())
+        .map_err(harness_error)?
+        .to_wire();
+    let tail_transport: std::sync::Arc<dyn TailReadTransport> =
+        std::sync::Arc::new(LocalTailReadTransport::new(ingest.tail_reader()));
+    let oracle = srv
+        .state()
+        .bifrost_query()
+        .ok_or_else(|| harness_error("Oracle runtime is unavailable"))?
+        .oracle();
+    if fused {
+        oracle.prefer_local_tail_routes_for_test();
+    }
+    oracle.tail_transports().insert_live_stream_for_tenant(
+        srv.data_tenant_id(),
+        &table_fqn,
+        wyrd_spec::vala::api::NodeId::new(stream.node_id.as_uuid()),
+        writer_epoch,
+        time_partition,
+        tail_transport,
+    );
+    if !fused {
+        srv.flush_bifrost()
+            .await
+            .map_err(wyrd_spec::error::WyrdError::from)?;
+    }
+    writer
+        .write(
+            &table_fqn,
+            &schema,
+            [br#"{"id": 3, "value": "live"}"#.to_vec()],
+        )
+        .await?;
+    let token = srv
+        .exchange_api_key(api_key)
+        .await
+        .map_err(wyrd_spec::error::WyrdError::from)?;
+    Ok((table_fqn, token))
+}
+
+/// Converts one fixture setup failure into the stable test-harness catalog.
+impl From<crate::server::WyrdTestServerError> for WyrdPyError {
+    /// Project a harness failure onto the shared Wyrd boundary adapter.
+    fn from(error: crate::server::WyrdTestServerError) -> Self {
+        Self::from(wyrd_spec::error::WyrdError::from(error))
+    }
+}
+
+fn harness_error(error: impl std::fmt::Display) -> wyrd_spec::error::WyrdError {
+    wyrd_spec::error::WyrdError::HarnessStart {
+        message: error.to_string(),
+        details: serde_json::json!({}),
     }
 }
 
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<WyrdTestServer>()
+}
+
+/// Build the harness failure raised when the server has not been started.
+///
+/// Every accessor on [`WyrdTestServerPy`] requires the context manager to be
+/// entered first, so they share one catalog-backed failure instead of raising a
+/// bare Python exception.
+fn not_started() -> WyrdPyError {
+    WyrdPyError::from(harness_error(
+        "WyrdTestServer not started (use as context manager)",
+    ))
 }

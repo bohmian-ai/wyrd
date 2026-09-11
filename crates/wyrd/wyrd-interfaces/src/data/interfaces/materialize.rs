@@ -25,11 +25,12 @@ use crate::data::io::{
     sql_logic_from_data, text_manifest_from_data, text_manifest_schema, write_jsonl_normalized,
 };
 use crate::data::layout::LocalArtifactLayout;
-use crate::error::{CardPyResult, WyrdPyError};
 use wyrd_spec::card::data::{
     ArrowFormat, DataInterface as RustDataInterface, DataSchema, DataStats, NumpyFormat,
     TorchSaveFormat,
 };
+#[cfg(feature = "python")]
+use wyrd_utils::py::WyrdPyResult;
 
 #[cfg(feature = "python")]
 impl PandasInterface {
@@ -55,9 +56,9 @@ impl PandasInterface {
         py: Python<'_>,
         path: &Path,
         _save_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<DataStats> {
+    ) -> WyrdPyResult<DataStats> {
         let source = self.data.as_ref().ok_or_else(|| {
-            WyrdPyError::missing_data_source("PandasInterface.save requires a pandas.DataFrame")
+            crate::error::missing_data_source("PandasInterface.save requires a pandas.DataFrame")
         })?;
         let data = source.bind(py);
         dtype::ensure_pandas_dataframe(py, data)?;
@@ -88,7 +89,7 @@ impl PandasInterface {
         py: Python<'_>,
         path: &Path,
         _load_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<()> {
+    ) -> WyrdPyResult<()> {
         let absolute_path = RustDataInterface::Pandas(self.to_rust(py)?).artifact_path(path)?;
         require_local_file(&absolute_path)?;
         let kwargs = pyarrow_engine_kwargs(py)?;
@@ -122,9 +123,9 @@ impl PolarsInterface {
         py: Python<'_>,
         path: &Path,
         _save_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<DataStats> {
+    ) -> WyrdPyResult<DataStats> {
         let source = self.data.as_ref().ok_or_else(|| {
-            WyrdPyError::missing_data_source("PolarsInterface.save requires a polars.DataFrame")
+            crate::error::missing_data_source("PolarsInterface.save requires a polars.DataFrame")
         })?;
         let data = source.bind(py);
         dtype::ensure_polars_dataframe(py, data)?;
@@ -156,7 +157,7 @@ impl PolarsInterface {
         py: Python<'_>,
         path: &Path,
         _load_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<()> {
+    ) -> WyrdPyResult<()> {
         let absolute_path = RustDataInterface::Polars(self.to_rust(py)?).artifact_path(path)?;
         require_local_file(&absolute_path)?;
         let polars = py.import("polars")?;
@@ -193,9 +194,9 @@ impl ArrowInterface {
         py: Python<'_>,
         path: &Path,
         _save_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<DataStats> {
+    ) -> WyrdPyResult<DataStats> {
         let source = self.data.as_ref().ok_or_else(|| {
-            WyrdPyError::missing_data_source("ArrowInterface.save requires a pyarrow.Table")
+            crate::error::missing_data_source("ArrowInterface.save requires a pyarrow.Table")
         })?;
         let data = source.bind(py);
         dtype::ensure_pyarrow_table(py, data)?;
@@ -240,7 +241,7 @@ impl ArrowInterface {
         py: Python<'_>,
         path: &Path,
         _load_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<()> {
+    ) -> WyrdPyResult<()> {
         let meta = self.to_rust(py)?;
         let format = meta.format;
         let absolute_path = RustDataInterface::Arrow(meta).artifact_path(path)?;
@@ -283,9 +284,9 @@ impl ParquetInterface {
         py: Python<'_>,
         path: &Path,
         _save_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<DataStats> {
+    ) -> WyrdPyResult<DataStats> {
         let source = self.data.as_ref().ok_or_else(|| {
-            WyrdPyError::missing_data_source(
+            crate::error::missing_data_source(
                 "ParquetInterface.save requires a parquet path or table-like source",
             )
         })?;
@@ -324,7 +325,7 @@ impl ParquetInterface {
         py: Python<'_>,
         path: &Path,
         _load_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<()> {
+    ) -> WyrdPyResult<()> {
         let absolute_path = RustDataInterface::Parquet(self.to_rust(py)?).artifact_path(path)?;
         require_local_file(&absolute_path)?;
         self.data = Some(Arc::new(
@@ -360,9 +361,9 @@ impl NumpyInterface {
         py: Python<'_>,
         path: &Path,
         _save_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<DataStats> {
+    ) -> WyrdPyResult<DataStats> {
         let source = self.data.as_ref().ok_or_else(|| {
-            WyrdPyError::missing_data_source("NumpyInterface.save requires a numpy.ndarray")
+            crate::error::missing_data_source("NumpyInterface.save requires a numpy.ndarray")
         })?;
         let data = source.bind(py);
         dtype::ensure_numpy_array(py, data)?;
@@ -402,7 +403,7 @@ impl NumpyInterface {
         py: Python<'_>,
         path: &Path,
         _load_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<()> {
+    ) -> WyrdPyResult<()> {
         let meta = self.to_rust(py)?;
         let format = meta.format;
         let absolute_path = RustDataInterface::Numpy(meta).artifact_path(path)?;
@@ -446,9 +447,9 @@ impl TorchInterface {
         py: Python<'_>,
         path: &Path,
         _save_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<DataStats> {
+    ) -> WyrdPyResult<DataStats> {
         let source = self.data.as_ref().ok_or_else(|| {
-            WyrdPyError::missing_data_source(
+            crate::error::missing_data_source(
                 "TorchInterface.save requires a torch.Tensor or tensor mapping",
             )
         })?;
@@ -491,7 +492,7 @@ impl TorchInterface {
         py: Python<'_>,
         path: &Path,
         _load_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<()> {
+    ) -> WyrdPyResult<()> {
         let meta = self.to_rust(py)?;
         let save_format = meta.save_format;
         let absolute_path = RustDataInterface::Torch(meta).artifact_path(path)?;
@@ -536,7 +537,7 @@ impl SqlInterface {
         py: Python<'_>,
         path: &Path,
         _save_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<DataStats> {
+    ) -> WyrdPyResult<DataStats> {
         let query_bundle = sql_logic_from_data(py, self.data.as_deref())?;
         let absolute_path = RustDataInterface::Sql(self.to_rust(py)?).artifact_path(path)?;
         write_json_sorted(&absolute_path, &query_bundle)?;
@@ -561,7 +562,7 @@ impl SqlInterface {
         py: Python<'_>,
         path: &Path,
         _load_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<()> {
+    ) -> WyrdPyResult<()> {
         let absolute_path = RustDataInterface::Sql(self.to_rust(py)?).artifact_path(path)?;
         require_local_file(&absolute_path)?;
         self.data = Some(Arc::new(
@@ -595,9 +596,9 @@ impl JsonlInterface {
         py: Python<'_>,
         path: &Path,
         _save_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<DataStats> {
+    ) -> WyrdPyResult<DataStats> {
         let source = self.data.as_ref().ok_or_else(|| {
-            WyrdPyError::missing_data_source(
+            crate::error::missing_data_source(
                 "JsonlInterface.save requires a path, iterable of dicts, or file-like object",
             )
         })?;
@@ -628,7 +629,7 @@ impl JsonlInterface {
         py: Python<'_>,
         path: &Path,
         load_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<()> {
+    ) -> WyrdPyResult<()> {
         let meta = self.to_rust(py)?;
         let compression = meta.compression;
         let absolute_path = RustDataInterface::Jsonl(meta).artifact_path(path)?;
@@ -671,9 +672,9 @@ impl ImageInterface {
         py: Python<'_>,
         path: &Path,
         save_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<DataStats> {
+    ) -> WyrdPyResult<DataStats> {
         let source = self.data.as_ref().ok_or_else(|| {
-            WyrdPyError::missing_data_source(
+            crate::error::missing_data_source(
                 "ImageInterface.save requires a directory, paths, or manifest",
             )
         })?;
@@ -707,7 +708,7 @@ impl ImageInterface {
         py: Python<'_>,
         path: &Path,
         _load_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<()> {
+    ) -> WyrdPyResult<()> {
         let absolute_path = RustDataInterface::Image(self.to_rust(py)?).artifact_path(path)?;
         require_local_file(&absolute_path)?;
         self.data = Some(Arc::new(manifest_json_to_py(py, &absolute_path)?.unbind()));
@@ -740,9 +741,9 @@ impl TextInterface {
         py: Python<'_>,
         path: &Path,
         save_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<DataStats> {
+    ) -> WyrdPyResult<DataStats> {
         let source = self.data.as_ref().ok_or_else(|| {
-            WyrdPyError::missing_data_source(
+            crate::error::missing_data_source(
                 "TextInterface.save requires a directory, paths, or manifest",
             )
         })?;
@@ -776,7 +777,7 @@ impl TextInterface {
         py: Python<'_>,
         path: &Path,
         _load_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<()> {
+    ) -> WyrdPyResult<()> {
         let absolute_path = RustDataInterface::Text(self.to_rust(py)?).artifact_path(path)?;
         require_local_file(&absolute_path)?;
         self.data = Some(Arc::new(manifest_json_to_py(py, &absolute_path)?.unbind()));
@@ -809,7 +810,7 @@ impl HuggingfaceInterface {
         py: Python<'_>,
         path: &Path,
         _save_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<DataStats> {
+    ) -> WyrdPyResult<DataStats> {
         let meta = self.to_rust(py)?;
         let (artifact_path, schema) = if let Some(source) = self.data.as_ref() {
             let data = source.bind(py);
@@ -824,7 +825,7 @@ impl HuggingfaceInterface {
             (dataset_path, schema)
         } else {
             let revision = meta.revision.as_ref().ok_or_else(|| {
-                WyrdPyError::validation("Huggingface pointer-only save requires a pinned revision")
+                crate::error::validation("Huggingface pointer-only save requires a pinned revision")
             })?;
             let absolute_path = RustDataInterface::Huggingface(meta.clone()).artifact_path(path)?;
             write_json_sorted(
@@ -860,16 +861,17 @@ impl HuggingfaceInterface {
         py: Python<'_>,
         path: &Path,
         load_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<()> {
+    ) -> WyrdPyResult<()> {
         let datasets = py.import("datasets")?;
         let pointer_path = path.join("data/dataset_pointer.json");
         let dataset_dir = path.join("data/dataset");
         self.data = Some(Arc::new(if pointer_path.exists() {
             let allow_remote = bool_kwarg(load_kwargs, "allow_remote")?;
             if !allow_remote {
-                return Err(WyrdPyError::validation(
+                return Err(crate::error::validation(
                     "Remote HuggingFace load requires load_kwargs.allow_remote=true",
-                ));
+                )
+                .into());
             }
             let pointer = read_huggingface_pointer(&pointer_path)?;
             let kwargs = pointer_to_kwargs(py, pointer)?;

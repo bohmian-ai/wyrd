@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "NullOrderWire",
+  "description": "Null placement of one declared physical sort key.",
+  "oneOf": [
+    {
+      "description": "Nulls sort before non-null values.",
+      "type": "string",
+      "enum": [
+        "first"
+      ]
+    },
+    {
+      "description": "Nulls sort after non-null values.",
+      "type": "string",
+      "enum": [
+        "last"
+      ]
+    }
+  ]
+}

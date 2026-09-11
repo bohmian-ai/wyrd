@@ -1,6 +1,7 @@
 //! Cross-tenant sweeper queries for storage uploads.
 // raw-query grep allowlist: storage tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
+use crate::TenantConn;
 use crate::error::SqlError;
 use serde::Serialize;
 use sqlx::PgPool;
@@ -64,7 +65,7 @@ pub async fn expired_uploads_batch(
     Ok(rows)
 }
 
-/// Mark an upload aborted from the admin pool.
+/// Mark an upload aborted from a tenant-scoped admin operation.
 ///
 /// Returns the number of rows updated. Zero indicates the upload was already
 /// in a terminal state (e.g., completed concurrently), which the caller should
@@ -73,7 +74,7 @@ pub async fn expired_uploads_batch(
 /// # Errors
 /// Returns [`SqlError`] when Postgres rejects the update.
 pub async fn mark_aborted_admin(
-    admin_pool: &PgPool,
+    conn: &mut TenantConn<'_>,
     id: Uuid,
     reason: &str,
 ) -> Result<u64, SqlError> {
@@ -89,7 +90,7 @@ pub async fn mark_aborted_admin(
     )
     .bind(id)
     .bind(reason)
-    .execute(admin_pool)
+    .execute(&mut **conn.transaction())
     .await
     .map_err(SqlError::from)?;
 

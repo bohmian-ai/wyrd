@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CancelRunningQueryRequest",
+  "description": "Request to cancel one active Oracle query by its public request identity.",
+  "type": "object",
+  "required": [
+    "request_id"
+  ],
+  "properties": {
+    "request_id": {
+      "description": "Request identity selected by the caller.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/RequestId"
+        }
+      ]
+    }
+  },
+  "definitions": {
+    "RequestId": {
+      "description": "Request correlation ID; required to be a UUID v7.",
+      "type": "string"
+    }
+  }
+}

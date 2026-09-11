@@ -53,7 +53,7 @@ pub fn eval_router() -> Router<AppState> {
 #[tracing::instrument(
     skip(state, principal, req),
     fields(
-        wyrd.tenant = %principal.principal.tenant_id,
+        wyrd.tenant = %principal.principal().tenant_id,
         wyrd.eval_ref = %req.eval_ref.name.as_str(),
     ),
 )]
@@ -62,7 +62,7 @@ async fn open(
     principal: AuthenticatedPrincipal,
     Json(req): Json<EvalRunOpenRequest>,
 ) -> Result<Json<EvalRunOpenResponse>, WyrdErrorResponse> {
-    let principal = principal.principal;
+    let principal = Principal::from(principal);
     let tenant = principal.tenant_id;
     let owner = principal.id;
 
@@ -144,7 +144,7 @@ async fn next(
     Path(run_id): Path<RunId>,
     headers: HeaderMap,
 ) -> Result<Json<TurnDirective>, WyrdErrorResponse> {
-    let principal = principal.principal;
+    let principal = Principal::from(principal);
     let tenant = principal.tenant_id;
     let entry = lookup(&state, tenant, &run_id, &principal, &headers)?;
 
@@ -206,7 +206,7 @@ async fn agent_turn(
     headers: HeaderMap,
     Json(sub): Json<AgentTurnSubmission>,
 ) -> Result<StatusCode, WyrdErrorResponse> {
-    let principal = principal.principal;
+    let principal = Principal::from(principal);
     let entry = lookup(&state, principal.tenant_id, &run_id, &principal, &headers)?;
     entry
         .state
@@ -225,7 +225,7 @@ async fn user_turn(
     headers: HeaderMap,
     Json(sub): Json<UserTurnSubmission>,
 ) -> Result<StatusCode, WyrdErrorResponse> {
-    let principal = principal.principal;
+    let principal = Principal::from(principal);
     let entry = lookup(&state, principal.tenant_id, &run_id, &principal, &headers)?;
     entry
         .state

@@ -7,7 +7,7 @@ use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
 use wyrd_spec::reference::CardRef;
-use wyrd_utils::py::wyrd_error_to_py_err;
+use wyrd_utils::py::{WyrdPyError, WyrdPyResult};
 
 /// Wyrd card kind exposed to Python.
 #[pyclass(module = "wyrd.cards", name = "CardKind", eq, eq_int, from_py_object)]
@@ -161,19 +161,19 @@ impl CardRefPy {
         version: &str,
         space: &str,
         uid: Option<&str>,
-    ) -> PyResult<Self> {
-        let parsed_kind = parse_kind_input(kind).map_err(wyrd_error_to_py_err)?;
+    ) -> WyrdPyResult<Self> {
+        let parsed_kind = parse_kind_input(kind)?;
         let parsed_name = CardName::new(name)
-            .map_err(|error| wyrd_error_to_py_err(invalid_identity("name", name, error)))?;
+            .map_err(|error| WyrdPyError::from(invalid_identity("name", name, error)))?;
         let parsed_version = VersionBlock::parse(version)
-            .map_err(|error| wyrd_error_to_py_err(invalid_identity("version", version, error)))?;
+            .map_err(|error| WyrdPyError::from(invalid_identity("version", version, error)))?;
         let parsed_space = SpaceName::new(space)
-            .map_err(|error| wyrd_error_to_py_err(invalid_identity("space", space, error)))?;
+            .map_err(|error| WyrdPyError::from(invalid_identity("space", space, error)))?;
         let parsed_uid = match uid {
             None | Some("") => None,
             Some(value) => Some(
                 CardUid::new(value)
-                    .map_err(|error| wyrd_error_to_py_err(invalid_identity("uid", value, error)))?,
+                    .map_err(|error| WyrdPyError::from(invalid_identity("uid", value, error)))?,
             ),
         };
         Ok(Self(CardRef {

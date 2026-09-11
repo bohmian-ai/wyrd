@@ -8,13 +8,20 @@
 #
 # WHAT IT CHECKS: every error code emitted in source has a corresponding entry
 # in the observable error map; every mapped code has test coverage.
-set -eu
+set -euo pipefail
 
 emitted=$(mktemp)
 mapped=$(mktemp)
 sql_emitted=$(mktemp)
 sql_tested=$(mktemp)
-trap 'rm -f "$emitted" "$mapped" "$sql_emitted" "$sql_tested"' EXIT
+vala_emitted=$(mktemp)
+vala_catalog=$(mktemp)
+trap 'rm -f "$emitted" "$mapped" "$sql_emitted" "$sql_tested" "$vala_emitted" "$vala_catalog"' EXIT
+
+command -v rg >/dev/null || {
+  echo 'error coverage requires rg' >&2
+  exit 1
+}
 
 {
   rg --no-filename -oN 'SKALD_AGENT_[0-9]{3}_[A-Z_]+' crates/skald/skald-agent/src || true
@@ -41,5 +48,20 @@ sed -n '/#\[cfg(test)\]/,$p' crates/wyrd/wyrd-sql/src/error.rs \
 
 if comm -23 "$sql_emitted" "$sql_tested" | rg .; then
   echo 'SQL error coverage is missing stable WYRD_SQL_* codes'
+  exit 1
+fi
+
+rg --no-filename -oN 'WYRD_VALA_[0-9]{3}_[A-Z_]+' \
+  crates/vala/vala-bifrost-redux/src/gate \
+  crates/wyrd/wyrd-server/src/http/otlp.rs \
+  crates/wyrd/wyrd-tonic/src/error.rs \
+  | sort -u > "$vala_emitted"
+rg --no-filename -oN 'code = "WYRD_VALA_[0-9]{3}_[A-Z_]+"' \
+  crates/wyrd-spec/src/vala/error.rs \
+  | sed 's/.*code = "//; s/"$//' \
+  | sort -u > "$vala_catalog"
+
+if comm -23 "$vala_emitted" "$vala_catalog" | rg .; then
+  echo 'Vala error coverage is missing stable WYRD_VALA_* catalog entries'
   exit 1
 fi

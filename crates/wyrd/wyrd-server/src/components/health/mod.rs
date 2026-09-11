@@ -47,6 +47,16 @@ pub enum ProbeReason {
     BackendError,
     /// Pre-boot warmup: the background task has not ticked yet.
     Warmup,
+    /// Scribe WAL recovery or downstream publication has not completed.
+    ScribeRecovery,
+    /// Oracle role registration, coordination, or worker startup has not completed.
+    OracleStartup,
+    /// This target must serve the private Bifrost peer listener and does not.
+    PeerPlaneDown,
+    /// The selected Forge coordinator has not completed a scheduling pass.
+    ForgeCoordinatorUnavailable,
+    /// The selected Forge worker has not finished durable recovery.
+    ForgeWorkerUnavailable,
 }
 
 /// Snapshot published by the background readiness_loop task.
@@ -56,6 +66,16 @@ pub struct ReadinessSnapshot {
     pub postgres: ProbeOutcome,
     /// Object storage liveness result.
     pub storage: ProbeOutcome,
+    /// Scribe recovery and write-path readiness result.
+    pub scribe: ProbeOutcome,
+    /// Oracle registration and query-path readiness result.
+    pub oracle: ProbeOutcome,
+    /// Private Bifrost peer listener readiness result.
+    pub peer: ProbeOutcome,
+    /// Forge coordinator readiness, present only when that role is selected.
+    pub forge_coordinator: Option<ProbeOutcome>,
+    /// Forge worker readiness, present only when that role is selected.
+    pub forge_worker: Option<ProbeOutcome>,
 }
 
 /// Per-dependency probe result.
@@ -82,13 +102,39 @@ impl ReadinessSnapshot {
         Self {
             postgres: warmup.clone(),
             storage: warmup,
+            scribe: ProbeOutcome {
+                ok: false,
+                reason: ProbeReason::Warmup,
+                elapsed_ms: 0,
+            },
+            oracle: ProbeOutcome {
+                ok: false,
+                reason: ProbeReason::Warmup,
+                elapsed_ms: 0,
+            },
+            peer: ProbeOutcome {
+                ok: false,
+                reason: ProbeReason::Warmup,
+                elapsed_ms: 0,
+            },
+            // Absent until a tick observes which Forge roles this target
+            // selected, so a non-Forge target's report never grows a check it
+            // can never satisfy.
+            forge_coordinator: None,
+            forge_worker: None,
         }
     }
 
     /// True when all probes passed in the most recent tick.
     #[must_use]
     pub fn all_ok(&self) -> bool {
-        self.postgres.ok && self.storage.ok
+        self.postgres.ok
+            && self.storage.ok
+            && self.scribe.ok
+            && self.oracle.ok
+            && self.peer.ok
+            && self.forge_coordinator.as_ref().is_none_or(|probe| probe.ok)
+            && self.forge_worker.as_ref().is_none_or(|probe| probe.ok)
     }
 }
 
@@ -118,7 +164,145 @@ async fn compute_snapshot(state: &AppState, probe_timeout: Duration) -> Readines
     ReadinessSnapshot {
         postgres: pg,
         storage,
+        scribe: probe_scribe(state),
+        oracle: probe_oracle(state),
+        peer: probe_peer(state),
+        forge_coordinator: probe_forge_coordinator(state),
+        forge_worker: probe_forge_worker(state),
     }
+}
+
+/// Reads the Forge coordinator bit the supervised planning loop publishes.
+///
+/// Returns `None` when this target did not select the role, so an unselected
+/// role contributes no check rather than a vacuously passing one.
+fn probe_forge_coordinator(state: &AppState) -> Option<ProbeOutcome> {
+    let forge = state.bifrost.forge()?;
+    forge.coordinator()?;
+    let ready = forge.coordinator_readiness().is_ready();
+    metrics::gauge!("bifrost_role_ready", "role" => "forge_coordinator").set(if ready {
+        1.0
+    } else {
+        0.0
+    });
+    Some(role_outcome(
+        ready,
+        ProbeReason::ForgeCoordinatorUnavailable,
+    ))
+}
+
+/// Reads the Forge worker bit its recovery-gated loop publishes.
+///
+/// Returns `None` when this target did not select the role.
+fn probe_forge_worker(state: &AppState) -> Option<ProbeOutcome> {
+    let forge = state.bifrost.forge()?;
+    forge.worker()?;
+    let ready = forge.worker_readiness().is_ready();
+    metrics::gauge!("bifrost_role_ready", "role" => "forge_worker").set(if ready {
+        1.0
+    } else {
+        0.0
+    });
+    Some(role_outcome(ready, ProbeReason::ForgeWorkerUnavailable))
+}
+
+/// Builds one probe outcome from a published role bit and its unready reason.
+fn role_outcome(ready: bool, unavailable: ProbeReason) -> ProbeOutcome {
+    ProbeOutcome {
+        ok: ready,
+        reason: if ready { ProbeReason::Ok } else { unavailable },
+        elapsed_ms: 0,
+    }
+}
+
+/// Reads the retained peer-listener bit without opening a connection.
+///
+/// A node that serves the public listener while its private listener is absent
+/// is reachable by clients and unreachable by its peers, which is worse than
+/// being plainly unready: tail discovery and Analytical stage delivery both
+/// fail against it while a load balancer keeps sending it work.
+fn probe_peer(state: &AppState) -> ProbeOutcome {
+    let required = state.peer_plane.is_required();
+    let outcome = if state.peer_plane.is_satisfied() {
+        ProbeOutcome {
+            ok: true,
+            reason: ProbeReason::Ok,
+            elapsed_ms: 0,
+        }
+    } else {
+        ProbeOutcome {
+            ok: false,
+            reason: ProbeReason::PeerPlaneDown,
+            elapsed_ms: 0,
+        }
+    };
+    metrics::gauge!("bifrost_role_ready", "role" => "peer").set(if required && outcome.ok {
+        1.0
+    } else {
+        0.0
+    });
+    outcome
+}
+
+/// Reads retained Oracle readiness without executing a query or touching storage.
+fn probe_oracle(state: &AppState) -> ProbeOutcome {
+    let selected = state.bifrost.oracle().is_some();
+    let outcome = match state.bifrost_query() {
+        Some(runtime) if runtime.is_ready() => ProbeOutcome {
+            ok: true,
+            reason: ProbeReason::Ok,
+            elapsed_ms: 0,
+        },
+        Some(_) if selected => ProbeOutcome {
+            ok: false,
+            reason: ProbeReason::OracleStartup,
+            elapsed_ms: 0,
+        },
+        None if selected => ProbeOutcome {
+            ok: false,
+            reason: ProbeReason::OracleStartup,
+            elapsed_ms: 0,
+        },
+        None | Some(_) => ProbeOutcome {
+            ok: true,
+            reason: ProbeReason::Ok,
+            elapsed_ms: 0,
+        },
+    };
+    metrics::gauge!("bifrost_role_ready", "role" => "oracle").set(if selected && outcome.ok {
+        1.0
+    } else {
+        0.0
+    });
+    outcome
+}
+
+/// Read the Scribe recovery bit without touching its queues or storage.
+fn probe_scribe(state: &AppState) -> ProbeOutcome {
+    let selected = state.bifrost.scribe().is_some();
+    let outcome = match state.bifrost_ingest() {
+        Some(runtime) if runtime.is_ready() => ProbeOutcome {
+            ok: true,
+            reason: ProbeReason::Ok,
+            elapsed_ms: 0,
+        },
+        Some(_) => ProbeOutcome {
+            ok: false,
+            reason: ProbeReason::ScribeRecovery,
+            elapsed_ms: 0,
+        },
+        None => ProbeOutcome {
+            ok: true,
+            reason: ProbeReason::Ok,
+            elapsed_ms: 0,
+        },
+    };
+    metrics::gauge!("bifrost_role_ready", "role" => "scribe").set(if selected && outcome.ok {
+        1.0
+    } else {
+        0.0
+    });
+    outcome
 }
 
 async fn probe_postgres(state: &AppState, probe_timeout: Duration) -> ProbeOutcome {
@@ -247,6 +431,12 @@ struct PublicReadinessReport {
 struct PublicChecks {
     postgres: PublicProbeOutcome,
     storage: PublicProbeOutcome,
+    scribe: PublicProbeOutcome,
+    oracle: PublicProbeOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    forge_coordinator: Option<PublicProbeOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    forge_worker: Option<PublicProbeOutcome>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -265,6 +455,23 @@ impl PublicReadinessReport {
                 storage: PublicProbeOutcome {
                     reason: snapshot.storage.reason,
                 },
+                scribe: PublicProbeOutcome {
+                    reason: snapshot.scribe.reason,
+                },
+                oracle: PublicProbeOutcome {
+                    reason: snapshot.oracle.reason,
+                },
+                forge_coordinator: snapshot.forge_coordinator.as_ref().map(|probe| {
+                    PublicProbeOutcome {
+                        reason: probe.reason,
+                    }
+                }),
+                forge_worker: snapshot
+                    .forge_worker
+                    .as_ref()
+                    .map(|probe| PublicProbeOutcome {
+                        reason: probe.reason,
+                    }),
             },
         }
     }
@@ -288,7 +495,7 @@ pub async fn readyz(State(state): State<AppState>) -> Response {
 
 impl wyrd_tonic::health::HealthSnapshot for ReadinessSnapshot {
     fn all_ok(&self) -> bool {
-        self.postgres.ok && self.storage.ok
+        ReadinessSnapshot::all_ok(self)
     }
 }
 
@@ -308,6 +515,23 @@ mod tests {
                 reason: ProbeReason::Ok,
                 elapsed_ms: 1,
             },
+            scribe: ProbeOutcome {
+                ok: true,
+                reason: ProbeReason::Ok,
+                elapsed_ms: 1,
+            },
+            oracle: ProbeOutcome {
+                ok: true,
+                reason: ProbeReason::Ok,
+                elapsed_ms: 1,
+            },
+            peer: ProbeOutcome {
+                ok: true,
+                reason: ProbeReason::Ok,
+                elapsed_ms: 1,
+            },
+            forge_coordinator: None,
+            forge_worker: None,
         }
     }
 
@@ -323,6 +547,23 @@ mod tests {
                 reason: ProbeReason::Ok,
                 elapsed_ms: 1,
             },
+            scribe: ProbeOutcome {
+                ok: true,
+                reason: ProbeReason::Ok,
+                elapsed_ms: 1,
+            },
+            oracle: ProbeOutcome {
+                ok: true,
+                reason: ProbeReason::Ok,
+                elapsed_ms: 1,
+            },
+            peer: ProbeOutcome {
+                ok: true,
+                reason: ProbeReason::Ok,
+                elapsed_ms: 1,
+            },
+            forge_coordinator: None,
+            forge_worker: None,
         }
     }
 
@@ -332,6 +573,8 @@ mod tests {
         assert!(!snap.all_ok());
         assert_eq!(snap.postgres.reason, ProbeReason::Warmup);
         assert_eq!(snap.storage.reason, ProbeReason::Warmup);
+        assert_eq!(snap.scribe.reason, ProbeReason::Warmup);
+        assert_eq!(snap.oracle.reason, ProbeReason::Warmup);
     }
 
     #[test]
@@ -344,6 +587,29 @@ mod tests {
     fn partial_failure_is_not_ready() {
         let snap = failing_snapshot();
         assert!(!snap.all_ok());
+    }
+
+    #[test]
+    fn failed_scribe_recovery_is_not_ready() {
+        let mut snapshot = all_ok_snapshot();
+        snapshot.scribe = ProbeOutcome {
+            ok: false,
+            reason: ProbeReason::ScribeRecovery,
+            elapsed_ms: 0,
+        };
+        assert!(!snapshot.all_ok());
+    }
+
+    /// Oracle startup failure independently blocks public readiness.
+    #[test]
+    fn failed_oracle_startup_is_not_ready() {
+        let mut snapshot = all_ok_snapshot();
+        snapshot.oracle = ProbeOutcome {
+            ok: false,
+            reason: ProbeReason::OracleStartup,
+            elapsed_ms: 0,
+        };
+        assert!(!snapshot.all_ok());
     }
 }
 
@@ -360,12 +626,12 @@ mod pg_tests {
 
         let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
         let wyrd = wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), None);
-        let vala = vala_sql::ValaPostgres::from_pools(app_pool, None);
+        let vala = vala_sql::ValaPostgres::from_pool(app_pool);
         let postgres = Arc::new(crate::postgres::ServerPostgres::from_parts(wyrd, vala));
         let root = tempfile::tempdir().expect("temp dir");
         let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
         let storage = Arc::new(StorageHandle::new(BackendSigner::Local(signer)));
-        let state = crate::state::AppState::new(
+        let state = crate::test_support::test_app_state(
             postgres,
             storage,
             crate::test_support::test_catalog().await,

@@ -1,5 +1,13 @@
+use secrecy::SecretString;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use wyrd_client::auth::AuthMiddleware;
+use wyrd_client::config::ClientConfig;
 use wyrd_client::error::WyrdClientError;
+use wyrd_client::transport::HttpTransport;
 use wyrd_client::transport::config::{HTTP_DEFAULT_BASE_URL, HTTP_DEFAULT_TIMEOUT_MS, HttpConfig};
+use wyrd_client::transport::credential::ResolvedCredential;
+use wyrd_spec::request_id::RequestId;
 use wyrd_spec::security::{SecretRef, TlsConfig};
 
 #[test]
@@ -151,6 +159,77 @@ fn assert_config_error(err: WyrdClientError, expected_field: &str, expected_reas
     assert_eq!(reason, expected_reason);
 }
 
+/// Explicit query identity crosses the streaming request and is verified on response.
+#[tokio::test]
+async fn running_query_request_id_and_controls_round_trip() {
+    let request_id = RequestId::now_v7();
+    let expected = request_id.to_string();
+    let mismatch = RequestId::now_v7().to_string();
+    for (echo, accepted) in [
+        (Some(expected.clone()), true),
+        (None, false),
+        (Some(mismatch), false),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server_expected = expected.clone();
+        let server_echo = echo.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut bytes = vec![0_u8; 4096];
+            let read = socket.read(&mut bytes).await.expect("read");
+            let request = String::from_utf8_lossy(&bytes[..read]);
+            assert!(request.contains(&format!("wyrd-request-id: {server_expected}")));
+            let echo_header = server_echo
+                .map(|value| format!("wyrd-request-id: {value}\r\n"))
+                .unwrap_or_default();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/vnd.wyrd.bifrost-query-stream\r\n{echo_header}content-length: 0\r\nconnection: close\r\n\r\n"
+            );
+            socket.write_all(response.as_bytes()).await.expect("write");
+        });
+        let config = ClientConfig {
+            http: HttpConfig {
+                base_url: format!("http://{address}"),
+                ..HttpConfig::default()
+            },
+            ..ClientConfig::default()
+        };
+        let auth = AuthMiddleware::new(
+            &config,
+            ResolvedCredential::BearerToken(SecretString::from("token".to_owned())),
+        )
+        .expect("auth");
+        let transport = HttpTransport::new(&config.http, auth).expect("transport");
+        let result = transport
+            .request_json_stream_with_id(
+                reqwest::Method::POST,
+                "/v1/query",
+                &serde_json::json!({"sql": "SELECT 1"}),
+                &request_id,
+            )
+            .await;
+        if accepted {
+            let response = result.expect("exact echoed request ID accepted");
+            assert_eq!(
+                response
+                    .headers()
+                    .get("wyrd-request-id")
+                    .and_then(|value| value.to_str().ok()),
+                Some(expected.as_str())
+            );
+        } else {
+            let error = result.expect_err("missing or mismatched request ID rejected");
+            assert_eq!(error.status(), 502);
+            assert_eq!(
+                error.as_problem_json()["details"]["reason"],
+                "request_id_mismatch"
+            );
+        }
+        server.await.expect("server joins");
+    }
+}
+
 // ── HttpTransport behavioral tests ────────────────────────────────────────────
 
 mod transport_behavior {
@@ -177,31 +256,48 @@ mod transport_behavior {
         _handle: tokio::task::JoinHandle<()>,
     }
 
+    /// Scripted local HTTP response with optional delayed body delivery.
     struct MockResponse {
+        /// Numeric HTTP response status.
         status: u16,
+        /// Complete response body written after any configured delay.
         body: String,
+        /// Additional response headers appended to the fixture defaults.
         extra_headers: Vec<(String, String)>,
+        /// Optional delay between response headers and body bytes.
+        body_delay: Option<std::time::Duration>,
     }
 
     impl MockResponse {
+        /// Builds a successful JSON fixture response.
         fn ok(body: &str) -> Self {
             Self {
                 status: 200,
                 body: body.to_owned(),
                 extra_headers: vec![],
+                body_delay: None,
             }
         }
 
+        /// Builds a fixture response with an explicit status.
         fn status(status: u16, body: &str) -> Self {
             Self {
                 status,
                 body: body.to_owned(),
                 extra_headers: vec![],
+                body_delay: None,
             }
         }
 
+        /// Appends one response header.
         fn with_header(mut self, name: &str, value: &str) -> Self {
             self.extra_headers.push((name.to_owned(), value.to_owned()));
+            self
+        }
+
+        /// Delays body bytes after response headers have been written.
+        fn with_body_delay(mut self, delay: std::time::Duration) -> Self {
+            self.body_delay = Some(delay);
             self
         }
     }
@@ -236,23 +332,34 @@ mod transport_behavior {
                         status,
                         body,
                         extra_headers,
+                        body_delay,
                     } = responses_inner
                         .lock()
                         .await
                         .pop_front()
                         .unwrap_or_else(|| MockResponse::ok("{}"));
 
+                    let has_content_type = extra_headers
+                        .iter()
+                        .any(|(name, _)| name.eq_ignore_ascii_case("content-type"));
+                    let content_type = if has_content_type {
+                        String::new()
+                    } else {
+                        "content-type: application/json\r\n".to_owned()
+                    };
                     let mut response = format!(
-                        "HTTP/1.1 {status} Status\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n",
+                        "HTTP/1.1 {status} Status\r\n{content_type}content-length: {}\r\nconnection: close\r\n",
                         body.len()
                     );
                     for (name, value) in &extra_headers {
                         response.push_str(&format!("{name}: {value}\r\n"));
                     }
                     response.push_str("\r\n");
-                    response.push_str(&body);
-
                     let _ = stream.write_all(response.as_bytes()).await;
+                    if let Some(delay) = body_delay {
+                        tokio::time::sleep(delay).await;
+                    }
+                    let _ = stream.write_all(body.as_bytes()).await;
                 });
             }
         });
@@ -642,5 +749,102 @@ mod transport_behavior {
             extract_header(&captured[0], "Authorization").is_none(),
             "the SDK must not write the caller's reserved Authorization header"
         );
+    }
+
+    /// Proves streaming JSON POSTs retain auth and negotiate the closed media type.
+    #[tokio::test]
+    async fn request_json_stream_authenticates_and_preserves_body_stream() {
+        let server =
+            spawn_mock(vec![MockResponse::ok("frame-bytes").with_header(
+                "content-type",
+                "application/vnd.wyrd.bifrost-query-stream",
+            )])
+            .await;
+        let transport = make_transport(server.base_url);
+        let response = transport
+            .request_json_stream(
+                reqwest::Method::POST,
+                "/v1/query",
+                &serde_json::json!({"sql": "SELECT 1"}),
+            )
+            .await
+            .expect("stream response accepted");
+        assert_eq!(
+            response.bytes().await.expect("response bytes"),
+            "frame-bytes"
+        );
+        let captured = server.captured.lock().await;
+        assert_eq!(
+            extract_header(&captured[0], "accept").as_deref(),
+            Some("application/vnd.wyrd.bifrost-query-stream")
+        );
+        assert!(
+            extract_header(&captured[0], "x-wyrd-access-token").is_some(),
+            "streaming request carries the Wyrd bearer"
+        );
+    }
+
+    /// Proves terminal streams outlive the ordinary total-response deadline.
+    #[tokio::test]
+    async fn request_json_stream_outlives_ordinary_total_timeout() {
+        let delay = std::time::Duration::from_millis(80);
+        let server = spawn_mock(vec![
+            MockResponse::ok("ordinary").with_body_delay(delay),
+            MockResponse::ok("frame-bytes")
+                .with_header("content-type", "application/vnd.wyrd.bifrost-query-stream")
+                .with_body_delay(delay),
+        ])
+        .await;
+        let credential = ResolvedCredential::BearerToken("test-bearer".to_owned().into());
+        let config = ClientConfig::default();
+        let auth = AuthMiddleware::new(&config, credential).expect("auth builds");
+        let transport = HttpTransport::new(
+            &HttpConfig {
+                base_url: server.base_url,
+                timeout_ms: 20,
+                ..HttpConfig::default()
+            },
+            auth,
+        )
+        .expect("transport builds");
+
+        let ordinary = transport
+            .request_raw(reqwest::Method::GET, "/v1/ordinary")
+            .await
+            .expect("ordinary response headers arrive");
+        let ordinary_error = ordinary
+            .bytes()
+            .await
+            .expect_err("ordinary response body keeps its total deadline");
+        assert!(ordinary_error.is_timeout());
+
+        let streaming = transport
+            .request_json_stream(
+                reqwest::Method::POST,
+                "/v1/query",
+                &serde_json::json!({"sql": "SELECT 1"}),
+            )
+            .await
+            .expect("stream response headers arrive");
+        assert_eq!(
+            streaming.bytes().await.expect("delayed stream body"),
+            "frame-bytes"
+        );
+    }
+
+    /// Proves a successful response with the wrong media type is rejected.
+    #[tokio::test]
+    async fn request_json_stream_rejects_unapproved_media_type() {
+        let server = spawn_mock(vec![MockResponse::ok("not-a-query-stream")]).await;
+        let transport = make_transport(server.base_url);
+        let error = transport
+            .request_json_stream(
+                reqwest::Method::POST,
+                "/v1/query",
+                &serde_json::json!({"sql": "SELECT 1"}),
+            )
+            .await
+            .expect_err("JSON success must not masquerade as a query stream");
+        assert_eq!(error.code(), "WYRD_SPEC_502_UPSTREAM_FAILURE");
     }
 }

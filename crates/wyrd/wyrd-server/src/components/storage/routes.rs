@@ -409,6 +409,8 @@ mod tests {
             ),
             request_id: RequestId::parse(&uuid::Uuid::now_v7().to_string())
                 .expect("request id parses"),
+            // Nondelegated fixture caller: no verified `act` chain exists.
+            delegation_chain: Vec::new(),
         }
     }
 

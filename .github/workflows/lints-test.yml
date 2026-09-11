@@ -22,6 +22,7 @@ jobs:
       docs: ${{ steps.filter.outputs.docs }}
       ui: ${{ steps.filter.outputs.ui }}
       workflow: ${{ steps.filter.outputs.workflow }}
+      bifrost_only: ${{ steps.filter.outputs.bifrost_only }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -56,13 +57,11 @@ jobs:
           fi
           cat "$GITHUB_OUTPUT"
 
-  # Authoritative Rust gate: format, lint, all boundary checks, tests, codegen,
-  # and Python on ubuntu/3.12. This is mise run pre-pr — the same gate as local.
-  # Cross-platform compatibility (macOS/Windows) is handled by the rust-compat job.
+  # Mixed, global, and unclassified Rust changes take the conservative full gate.
   ci:
     name: ci
     needs: changes
-    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflow == 'true'
+    if: (needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflow == 'true') && needs.changes.outputs.bifrost_only != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -103,15 +102,59 @@ jobs:
       - name: Add wasm target
         run: rustup target add wasm32-unknown-unknown
 
-      - name: Run pre-pr gate
-        run: mise run pre-pr
+      - name: Run CI gate
+        run: mise run gate
+
+  bifrost:
+    name: bifrost
+    needs: changes
+    if: needs.changes.outputs.bifrost_only == 'true' && needs.changes.outputs.workflow != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Set up mise
+        uses: jdx/mise-action@v3
+        with:
+          install: true
+          cache: true
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: "3.12"
+
+      - name: Install Rust components
+        run: rustup component add --toolchain "$RUSTUP_TOOLCHAIN" rustfmt clippy
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install system tools
+        run: sudo apt-get update && sudo apt-get install -y ripgrep libcurl4-openssl-dev pkg-config
+
+      - name: Run Bifrost gate
+        run: mise run verify:bifrost
 
   # Cross-platform Rust compatibility: tests on macOS and Windows.
   # Format/lint/boundary checks run only in the ci job above (Linux only).
   rust-compat:
     name: rust compat (${{ matrix.os }})
     needs: [changes, matrix-plan]
-    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflow == 'true'
+    if: (needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflow == 'true') && needs.changes.outputs.bifrost_only != 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -126,12 +169,12 @@ jobs:
       - uses: ./.github/actions/setup-rust-ci
 
       - name: Run Rust test gate
-        run: mise run test:unit
+        run: mise run test:rust
 
   python:
     name: python (${{ matrix.os }} / py${{ matrix.python-version }})
     needs: [changes, matrix-plan]
-    if: needs.changes.outputs.python == 'true' || needs.changes.outputs.workflow == 'true'
+    if: (needs.changes.outputs.python == 'true' || needs.changes.outputs.workflow == 'true') && needs.changes.outputs.bifrost_only != 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     strategy:
@@ -262,7 +305,7 @@ jobs:
 
   ci-complete:
     name: ci complete
-    needs: [changes, matrix-plan, ci, rust-compat, python, docs, ui]
+    needs: [changes, matrix-plan, ci, bifrost, rust-compat, python, docs, ui]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -273,6 +316,7 @@ jobs:
           set -euo pipefail
           for result in \
             "${{ needs.ci.result }}" \
+            "${{ needs.bifrost.result }}" \
             "${{ needs.rust-compat.result }}" \
             "${{ needs.python.result }}" \
             "${{ needs.docs.result }}" \

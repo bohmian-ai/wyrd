@@ -1,0 +1,33 @@
+---
+title: Skald
+description: The Wyrd runtime for provider clients, prompts, tools, agents, and workflows.
+pillar: wyrd
+section: Products and components
+group: Skald
+order: 1
+---
+
+# Skald
+
+Skald is the runtime layer in Wyrd. It owns provider clients, prompt execution,
+tool resolution, agent loops, and workflow orchestration. Wyrd Cards describe
+the components; Skald turns the runnable declarations into execution.
+
+## What Skald owns
+
+- Provider-specific request and response handling.
+- Prompt construction and execution.
+- Runtime tool registration and resolution.
+- Bounded Agent loops and session state.
+- Workflow composition and task execution.
+
+Skald does not replace the Wyrd registry. A registered Prompt, Agent, or
+Workflow Card remains the declarative source of truth; the runtime resolves that
+contract when it executes.
+
+## Where to go next
+
+- [Architecture](/concepts/architecture/) — how Skald fits beside Wyrd and Vala.
+- [Build an agent](/how-to/build-an-agent/) — create a bounded agent loop.
+- [Build a workflow](/how-to/build-a-workflow/) — compose agent invocations.
+- [Cards overview](/cards/) — understand the declarations Skald consumes.

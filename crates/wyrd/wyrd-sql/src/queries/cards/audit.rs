@@ -3,6 +3,8 @@
 //! Card registration is a control-plane operation, so its outbox append lives
 //! in the same tenant transaction as the card write. The append is deliberately
 //! fail-closed: a failed chain update aborts the caller's transaction.
+// raw-query grep allowlist: card audit writes post-date the SQLx offline cache;
+// run `mise run sqlx:prepare` to promote them to macros.
 #![deny(missing_docs)]
 // raw-query grep allowlist: audit writes use a typed TenantConn transaction;
 // sqlx macros cannot cover the append-only hash-chain payload shape.

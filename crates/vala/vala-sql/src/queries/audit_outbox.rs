@@ -1,17 +1,16 @@
-//! Tenant-scoped writes + cross-tenant relay claim for the audit outbox:
+//! Tenant-scoped writes and reads for the audit outbox:
 //! `vala.audit_chain_head` and `vala.audit_outbox`.
 //!
 //! `append_audit` runs in the audited operation's own [`TenantConn`]
 //! transaction: it advances the per-tenant chain head under a `FOR UPDATE`
 //! lock, computes the SHA256 entry hash in Rust (this module owns the canonical
 //! encoding), inserts the append-only row, and bumps the head — all so the audit
-//! row commits atomically with the operation it records. `mark_audit_shipped`
-//! flips a contiguous `seq` range to shipped under the tenant bind. The relay
-//! discovers work across every tenant via the SECURITY DEFINER
-//! `claim_unshipped_audit` routine.
+//! row commits atomically with the operation it records.
 // raw-query grep allowlist: audit outbox tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use sha2::{Digest, Sha256};
+use sqlx::{PgConnection, Postgres, Transaction};
+use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{
     AuditDecision, AuditEvent, AuditResult, AuthMethod, audit_detail_canonical_json,
 };
@@ -30,6 +29,63 @@ use crate::row_types::audit_outbox::AuditOutboxRow;
 /// # Errors
 /// Returns [`SqlError`] when any statement fails or an RLS policy rejects a row.
 pub async fn append_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Result<i64, SqlError> {
+    append_audit_connection(conn.transaction(), event).await
+}
+
+/// Tenant-bound audit capability for a trusted operator transaction.
+///
+/// Exposes only canonical audit append bound to one already verified tenant.
+/// It owns the verified `tenant` and re-binds the current tenant via
+/// [`BIND_CURRENT_TENANT_SQL`](wyrd_sql::tenant_conn::BIND_CURRENT_TENANT_SQL)
+/// before every append, re-establishing on the shared operator transaction the
+/// RLS boundary a [`TenantConn`] would otherwise provide. It cannot be used as
+/// a general SQL executor or masquerade as a tenant connection.
+pub struct OperatorAudit<'transaction, 'connection> {
+    /// Verified tenant on whose behalf Forge is appending audit evidence.
+    tenant: DataTenantId,
+    /// Operator transaction shared with the fenced Forge planning workflow.
+    transaction: &'transaction mut Transaction<'connection, Postgres>,
+}
+
+impl<'transaction, 'connection> OperatorAudit<'transaction, 'connection> {
+    /// Binds canonical audit append to one already verified tenant.
+    pub fn new(
+        tenant: DataTenantId,
+        transaction: &'transaction mut Transaction<'connection, Postgres>,
+    ) -> Self {
+        Self {
+            tenant,
+            transaction,
+        }
+    }
+
+    /// Appends one canonical hash-chained event for the bound tenant.
+    ///
+    /// # Errors
+    /// Returns [`SqlError`] when tenant binding, chain locking, hashing
+    /// persistence, or row insertion fails.
+    ///
+    /// # Cancellation
+    /// Cancellation leaves the enclosing operator transaction uncommitted, so
+    /// its owner can roll back the Forge mutation and audit append together.
+    pub async fn append(&mut self, event: &AuditEvent) -> Result<i64, SqlError> {
+        sqlx::query(wyrd_sql::tenant_conn::BIND_CURRENT_TENANT_SQL)
+            .bind(self.tenant.to_string())
+            .execute(&mut **self.transaction)
+            .await
+            .map_err(SqlError::from)?;
+        append_audit_connection(self.transaction, event).await
+    }
+}
+
+/// Implements canonical audit encoding for an already tenant-bound connection.
+///
+/// # Errors
+/// Returns [`SqlError`] when chain locking, hashing persistence, or RLS fails.
+async fn append_audit_connection(
+    conn: &mut PgConnection,
+    event: &AuditEvent,
+) -> Result<i64, SqlError> {
     sqlx::query(
         r#"
         INSERT INTO vala.audit_chain_head (data_tenant_id)
@@ -37,7 +93,7 @@ pub async fn append_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Resu
         ON CONFLICT (data_tenant_id) DO NOTHING
         "#,
     )
-    .execute(&mut **conn.transaction())
+    .execute(&mut *conn)
     .await
     .map_err(SqlError::from)?;
 
@@ -49,7 +105,7 @@ pub async fn append_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Resu
         FOR UPDATE
         "#,
     )
-    .fetch_one(&mut **conn.transaction())
+    .fetch_one(&mut *conn)
     .await
     .map_err(SqlError::from)?;
 
@@ -90,7 +146,7 @@ pub async fn append_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Resu
     .bind(result_str(event.result))
     .bind(event.payload_summary.as_str())
     .bind(detail.as_deref())
-    .execute(&mut **conn.transaction())
+    .execute(&mut *conn)
     .await
     .map_err(SqlError::from)?;
 
@@ -103,7 +159,7 @@ pub async fn append_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Resu
     )
     .bind(seq)
     .bind(entry_hash.as_slice())
-    .execute(&mut **conn.transaction())
+    .execute(&mut *conn)
     .await
     .map_err(SqlError::from)?;
 
@@ -121,85 +177,39 @@ pub async fn record_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Resu
     append_audit(conn, event).await
 }
 
-/// Mark a contiguous `seq` range shipped for the current tenant.
+/// Read a bounded page of audit rows for one tenant-bound resource.
 ///
-/// Stamps `ship_batch_id` / `shipped_at` on every still-unshipped row in
-/// `[seq_lo, seq_hi]`; already-shipped rows are skipped, so re-marking a range
-/// after a partial relay failure is idempotent. Returns the number of rows
-/// transitioned.
+/// The caller supplies the last observed sequence number. RLS remains the
+/// tenant boundary; the explicit current-tenant predicate keeps the query
+/// aligned with the covering `(data_tenant_id, resource, seq)` index.
 ///
 /// # Errors
-/// Returns [`SqlError`] when the update fails.
-pub async fn mark_audit_shipped(
+/// Returns [`SqlError`] when the page query fails.
+pub async fn list_audit_events_for_resource(
     conn: &mut TenantConn<'_>,
-    seq_lo: i64,
-    seq_hi: i64,
-    ship_batch_id: &[u8; 16],
-) -> Result<u64, SqlError> {
-    let result = sqlx::query(
+    resource: &str,
+    after_seq: i64,
+    limit: i64,
+) -> Result<Vec<AuditOutboxRow>, SqlError> {
+    sqlx::query_as::<_, AuditOutboxRow>(
         r#"
-        UPDATE vala.audit_outbox
-           SET shipped = true, shipped_at = now(), ship_batch_id = $3
+        SELECT data_tenant_id, seq, entry_hash, prev_hash, request_id, trace_id,
+               operation, resource, card_ref, principal_id, principal_kind,
+               auth_method, permission, decision, result, payload_summary, detail, created_at
+          FROM vala.audit_outbox
          WHERE data_tenant_id = wyrd.current_tenant()
-           AND seq BETWEEN $1 AND $2
-           AND NOT shipped
+           AND resource = $1
+           AND seq > $2
+         ORDER BY seq
+         LIMIT $3
         "#,
     )
-    .bind(seq_lo)
-    .bind(seq_hi)
-    .bind(ship_batch_id.as_slice())
-    .execute(&mut **conn.transaction())
+    .bind(resource)
+    .bind(after_seq)
+    .bind(limit)
+    .fetch_all(&mut **conn.transaction())
     .await
-    .map_err(SqlError::from)?;
-    Ok(result.rows_affected())
-}
-
-/// Claim up to `limit` unshipped audit rows across all tenants for relay.
-///
-/// Calls the SECURITY DEFINER `vala.claim_unshipped_audit` routine (owned by
-/// `vala_audit_relay`, BYPASSRLS) so the relay sees pending work regardless of
-/// the connection's tenant bind. Rows are ordered by `(data_tenant_id, seq)`;
-/// the relay groups by tenant, ships one batch per tenant, then marks each range
-/// shipped under that tenant's bind.
-///
-/// # Errors
-/// Returns [`SqlError`] when the query fails.
-pub async fn claim_unshipped_audit(
-    conn: &mut TenantConn<'_>,
-    limit: i32,
-) -> Result<Vec<AuditOutboxRow>, SqlError> {
-    sqlx::query_as::<_, AuditOutboxRow>("SELECT * FROM vala.claim_unshipped_audit($1)")
-        .bind(limit)
-        .fetch_all(&mut **conn.transaction())
-        .await
-        .map_err(SqlError::from)
-}
-
-/// Stamp `ship_batch_id` on the claimed `[seq_lo, seq_hi]` range for one tenant.
-///
-/// Called inside the claim transaction so the batch boundary is durable before the
-/// relay even begins shipping. `WHERE ship_batch_id IS NULL` makes repeated calls
-/// idempotent — rows already stamped from a prior (crashed) attempt are untouched,
-/// preserving their existing batch_id for the recovery path.
-///
-/// # Errors
-/// Returns [`SqlError`] when the update fails.
-pub async fn stamp_audit_ship_batch_id(
-    conn: &mut TenantConn<'_>,
-    tenant_id: uuid::Uuid,
-    seq_lo: i64,
-    seq_hi: i64,
-    batch_id: &[u8; 16],
-) -> Result<u64, SqlError> {
-    let result = sqlx::query("SELECT vala.stamp_audit_ship_batch_id($1, $2, $3, $4)")
-        .bind(tenant_id)
-        .bind(seq_lo)
-        .bind(seq_hi)
-        .bind(batch_id.as_slice())
-        .execute(&mut **conn.transaction())
-        .await
-        .map_err(SqlError::from)?;
-    Ok(result.rows_affected())
+    .map_err(SqlError::from)
 }
 
 /// Compute `entry_hash = SHA256(canonical(prev_hash, seq, event))`.
@@ -269,339 +279,77 @@ fn result_str(result: AuditResult) -> &'static str {
     }
 }
 
-/// Column values needed to recompute the SHA256 entry hash.
-///
-/// Used by the audit-seal verifier to recompute hashes from the Iceberg
-/// `audit_log` table and cross-check them against seal checkpoints. The
-/// canonical encoding is identical to the private `entry_hash` function.
-pub struct AuditEntryHashInput<'a> {
-    /// Entry hash of `seq - 1` (all-zeros for seq=1).
-    pub prev_hash: &'a [u8],
-    /// Monotonically increasing row sequence number.
-    pub seq: i64,
-    /// Unique request correlation id.
-    pub request_id: &'a str,
-    /// Optional trace id for distributed tracing.
-    pub trace_id: Option<&'a str>,
-    /// The operation name (e.g. `cards.create`).
-    pub operation: &'a str,
-    /// The resource path acted upon.
-    pub resource: &'a str,
-    /// Optional `CardRef` string for card-scoped operations.
-    pub card_ref: Option<&'a str>,
-    /// Raw 16-byte principal UUID.
-    pub principal_id_bytes: &'a [u8; 16],
-    /// The principal kind string (e.g. `user`, `service`).
-    pub principal_kind: &'a str,
-    /// The authentication method used.
-    pub auth_method: &'a str,
-    /// The permission that was checked.
-    pub permission: &'a str,
-    /// The policy decision string (`allow` / `deny`).
-    pub decision: &'a str,
-    /// The operation result string (`success` / `failure`).
-    pub result: &'a str,
-    /// Short human-readable summary of the payload.
-    pub payload_summary: &'a str,
-}
-
-/// Recompute the SHA256 entry hash from the raw stored column bytes.
-///
-/// The canonical encoding is identical to the private `entry_hash` function
-/// so this is the public re-check entry point used by the seal verifier.
-#[must_use]
-pub fn entry_hash_from_cols(input: AuditEntryHashInput<'_>) -> [u8; 32] {
-    let mut buf = Vec::new();
-    buf.extend_from_slice(input.prev_hash);
-    buf.extend_from_slice(&input.seq.to_be_bytes());
-    push_str(&mut buf, input.request_id);
-    push_opt(&mut buf, input.trace_id);
-    push_str(&mut buf, input.operation);
-    push_str(&mut buf, input.resource);
-    push_opt(&mut buf, input.card_ref);
-    buf.extend_from_slice(input.principal_id_bytes);
-    push_str(&mut buf, input.principal_kind);
-    push_str(&mut buf, input.auth_method);
-    push_str(&mut buf, input.permission);
-    push_str(&mut buf, input.decision);
-    push_str(&mut buf, input.result);
-    push_str(&mut buf, input.payload_summary);
-    Sha256::digest(&buf).into()
-}
-
-/// Recompute the SHA256 entry hash from stored columns and optional canonical
-/// JSON detail. The detail presence marker is part of the canonical preimage,
-/// so absent detail and present detail remain distinct.
-#[must_use]
-pub fn entry_hash_from_cols_with_detail(
-    input: AuditEntryHashInput<'_>,
-    detail: Option<&str>,
-) -> [u8; 32] {
-    let mut buf = Vec::new();
-    buf.extend_from_slice(input.prev_hash);
-    buf.extend_from_slice(&input.seq.to_be_bytes());
-    push_str(&mut buf, input.request_id);
-    push_opt(&mut buf, input.trace_id);
-    push_str(&mut buf, input.operation);
-    push_str(&mut buf, input.resource);
-    push_opt(&mut buf, input.card_ref);
-    buf.extend_from_slice(input.principal_id_bytes);
-    push_str(&mut buf, input.principal_kind);
-    push_str(&mut buf, input.auth_method);
-    push_str(&mut buf, input.permission);
-    push_str(&mut buf, input.decision);
-    push_str(&mut buf, input.result);
-    push_str(&mut buf, input.payload_summary);
-    push_opt(&mut buf, detail);
-    Sha256::digest(&buf).into()
-}
-
-/// A gap detected between consecutive `seq` values for a tenant.
-#[derive(Debug, Clone)]
-pub struct SeqGap {
-    /// First missing `seq` in the gap.
-    pub gap_from: i64,
-    /// Last missing `seq` in the gap.
-    pub gap_to: i64,
-}
-
-/// A hash-chain break: the row at `seq` has a `prev_hash` that does not match
-/// the `entry_hash` of `seq - 1`.
-#[derive(Debug, Clone)]
-pub struct ChainBreak {
-    /// The `seq` whose `prev_hash` does not match its predecessor's `entry_hash`.
-    pub seq: i64,
-}
-
-/// A (seq, entry_hash) pair from a shipped outbox row, used for cross-store parity.
-#[derive(Debug, Clone)]
-pub struct ShippedOutboxRef {
-    /// The sequence number.
-    pub seq: i64,
-    /// The SHA256 entry hash of this row.
-    pub entry_hash: Vec<u8>,
-}
-
-/// Find gaps in the per-tenant `seq` sequence (check 1 of 3 — SQL-only).
-///
-/// Returns at most 100 gaps; a non-empty result indicates rows were lost or
-/// never inserted, which is an audit integrity incident.
-///
-/// # Errors
-/// Returns [`SqlError`] when the query fails.
-pub async fn check_seq_gaps(conn: &mut TenantConn<'_>) -> Result<Vec<SeqGap>, SqlError> {
-    sqlx::query_as::<_, (i64, i64)>(
-        r#"
-        WITH ordered AS (
-            SELECT seq, lag(seq) OVER (ORDER BY seq) AS prev
-              FROM vala.audit_outbox
-             WHERE data_tenant_id = wyrd.current_tenant()
-        )
-        SELECT prev + 1 AS gap_from, seq - 1 AS gap_to
-          FROM ordered
-         WHERE seq - prev > 1
-         LIMIT 100
-        "#,
-    )
-    .fetch_all(&mut **conn.transaction())
-    .await
-    .map_err(SqlError::from)
-    .map(|rows| {
-        rows.into_iter()
-            .map(|(gap_from, gap_to)| SeqGap { gap_from, gap_to })
-            .collect()
-    })
-}
-
-/// Detect hash-chain breaks: rows whose `prev_hash` does not match the
-/// `entry_hash` of the preceding row (check 2 of 3 — SQL-only).
-///
-/// Returns at most 100 breaks; a non-empty result indicates tampering or
-/// data corruption.
-///
-/// # Errors
-/// Returns [`SqlError`] when the query fails.
-pub async fn check_hash_chain(conn: &mut TenantConn<'_>) -> Result<Vec<ChainBreak>, SqlError> {
-    sqlx::query_as::<_, (i64,)>(
-        r#"
-        WITH chained AS (
-            SELECT seq, prev_hash,
-                   lag(entry_hash) OVER (ORDER BY seq) AS expected_prev
-              FROM vala.audit_outbox
-             WHERE data_tenant_id = wyrd.current_tenant()
-        )
-        SELECT seq
-          FROM chained
-         WHERE expected_prev IS NOT NULL
-           AND prev_hash != expected_prev
-         LIMIT 100
-        "#,
-    )
-    .fetch_all(&mut **conn.transaction())
-    .await
-    .map_err(SqlError::from)
-    .map(|rows| rows.into_iter().map(|(seq,)| ChainBreak { seq }).collect())
-}
-
-/// Return (seq, entry_hash) for all shipped outbox rows in seq order. Used by
-/// the Bifrost reconcile layer (check 3 of 3) to cross-reference against the
-/// Iceberg `audit_log` table.
-///
-/// # Errors
-/// Returns [`SqlError`] when the query fails.
-pub async fn shipped_outbox_refs(
-    conn: &mut TenantConn<'_>,
-) -> Result<Vec<ShippedOutboxRef>, SqlError> {
-    sqlx::query_as::<_, (i64, Vec<u8>)>(
-        r#"
-        SELECT seq, entry_hash
-          FROM vala.audit_outbox
-         WHERE data_tenant_id = wyrd.current_tenant()
-           AND shipped = true
-         ORDER BY seq
-        "#,
-    )
-    .fetch_all(&mut **conn.transaction())
-    .await
-    .map_err(SqlError::from)
-    .map(|rows| {
-        rows.into_iter()
-            .map(|(seq, entry_hash)| ShippedOutboxRef { seq, entry_hash })
-            .collect()
-    })
-}
-
-/// Return (seq, entry_hash) for shipped outbox rows with `seq > after_seq`, in
-/// seq order. The seal worker uses this to seal only the unsealed tail past the
-/// last checkpoint, so repeated ticks produce contiguous, non-overlapping
-/// checkpoints instead of re-sealing the whole `[1, N]` range each pass.
-///
-/// # Errors
-/// Returns [`SqlError`] when the query fails.
-pub async fn shipped_outbox_refs_after(
-    conn: &mut TenantConn<'_>,
-    after_seq: i64,
-) -> Result<Vec<ShippedOutboxRef>, SqlError> {
-    sqlx::query_as::<_, (i64, Vec<u8>)>(
-        r#"
-        SELECT seq, entry_hash
-          FROM vala.audit_outbox
-         WHERE data_tenant_id = wyrd.current_tenant()
-           AND shipped = true
-           AND seq > $1
-         ORDER BY seq
-        "#,
-    )
-    .bind(after_seq)
-    .fetch_all(&mut **conn.transaction())
-    .await
-    .map_err(SqlError::from)
-    .map(|rows| {
-        rows.into_iter()
-            .map(|(seq, entry_hash)| ShippedOutboxRef { seq, entry_hash })
-            .collect()
-    })
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use sqlx::types::Uuid;
-    use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
-    use wyrd_spec::request_id::RequestId;
+mod pg_tests {
+    //! Database parity proof for the execute-only recovery audit encoder.
 
-    fn sample_event() -> AuditEvent {
-        AuditEvent::new(
-            RequestId::parse("01890f28-7c4a-7000-98e7-4f4a3c2d1b02")
-                .expect("static request id is valid"),
-            Some("trace-abc".to_string()),
-            "bifrost.write".to_string(),
-            "ns.tbl".to_string(),
+    use wyrd_dev_fixtures::pg::PgFixture;
+    use wyrd_spec::{
+        auth::{PrincipalId, PrincipalKindTag},
+        request_id::RequestId,
+        vala::api::{AuditDecision, AuditDetail, AuditEvent, AuditResult, AuthMethod},
+    };
+
+    use super::entry_hash;
+
+    /// The SQL definer function produces the exact canonical Rust detail and hash bytes.
+    #[tokio::test]
+    async fn oracle_recovery_sql_hash_matches_canonical_rust_encoder() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let request_id = RequestId::now_v7();
+        let seq: i64 = sqlx::query_scalar(
+            "SELECT vala.append_oracle_admission_recovery_audit($1,$2,$3,$4,$5,$6)",
+        )
+        .bind(request_id.as_str())
+        .bind(2_i64)
+        .bind(3_i64)
+        .bind(5_i64)
+        .bind(8_i64)
+        .bind(13_i64)
+        .fetch_one(fixture.operator_pool().pool())
+        .await
+        .expect("recovery append executes");
+        let (stored_detail, stored_prev_hash, stored_entry_hash): (String, Vec<u8>, Vec<u8>) =
+            sqlx::query_as(
+                "SELECT detail,prev_hash,entry_hash FROM vala.audit_outbox \
+                 WHERE data_tenant_id=$1 AND seq=$2",
+            )
+            .bind(uuid::Uuid::nil())
+            .bind(seq)
+            .fetch_one(&fixture.superuser_pool().await.expect("superuser pool"))
+            .await
+            .expect("recovery audit reads");
+        let detail = AuditDetail::OracleAdmissionRecovery {
+            expired_lease_count: 2,
+            active_lease_count: 3,
+            interactive_slots: 5,
+            analytical_slots: 8,
+            total_slots: 13,
+        };
+        let canonical_detail = wyrd_spec::vala::api::audit_detail_canonical_json(&detail);
+        let event = AuditEvent::new(
+            request_id,
             None,
-            PrincipalId::new(
-                "01890f28-7c4a-7000-98e7-4f4a3c2d1b03"
-                    .parse::<Uuid>()
-                    .expect("static uuid is valid"),
-            ),
-            PrincipalKindTag::User,
+            "bifrost.oracle.admission_recovery".to_owned(),
+            "bifrost.oracle.admission".to_owned(),
+            None,
+            PrincipalId::new(uuid::Uuid::nil()),
+            PrincipalKindTag::Service,
             AuthMethod::Internal,
-            "bifrost.write".to_string(),
+            "bifrost:oracle".to_owned(),
             AuditDecision::Allow,
             AuditResult::Success,
-            "redacted".to_string(),
+            "recovered Oracle admission aggregates".to_owned(),
         )
-    }
-
-    /// Build the verifier-side input mirroring how the seal verifier reconstructs
-    /// column values from the Iceberg `audit_log` row.
-    fn cols_input<'a>(
-        event: &'a AuditEvent,
-        prev: &'a [u8],
-        seq: i64,
-        pid: &'a [u8; 16],
-    ) -> AuditEntryHashInput<'a> {
-        AuditEntryHashInput {
-            prev_hash: prev,
+        .with_detail(detail);
+        let expected_hash = entry_hash(
+            &stored_prev_hash,
             seq,
-            request_id: event.request_id.as_str(),
-            trace_id: event.trace_id.as_deref(),
-            operation: &event.operation,
-            resource: &event.resource,
-            card_ref: None,
-            principal_id_bytes: pid,
-            principal_kind: event.principal_kind.as_str(),
-            auth_method: auth_method_str(event.auth_method),
-            permission: &event.permission,
-            decision: decision_str(event.decision),
-            result: result_str(event.result),
-            payload_summary: &event.payload_summary,
-        }
-    }
-
-    /// The public `entry_hash_from_cols` (used by the seal verifier) reproduces
-    /// the private writer `entry_hash` byte-for-byte. This is the parity the seal
-    /// chain relies on: the verifier recomputing from Iceberg content columns
-    /// must land on exactly the hash the writer stored.
-    #[test]
-    fn entry_hash_from_cols_reproduces_writer_hash() {
-        let event = sample_event();
-        let prev = [0u8; 32];
-        let seq = 1;
-        let pid = *event.principal_id.as_uuid().as_bytes();
-
-        let detail = event.detail.as_ref().map(audit_detail_canonical_json);
-        let written = entry_hash(&prev, seq, &event, None, detail.as_deref());
-        let recomputed = entry_hash_from_cols_with_detail(
-            cols_input(&event, &prev, seq, &pid),
-            detail.as_deref(),
+            &event,
+            None,
+            Some(&canonical_detail),
         );
-
-        assert_eq!(
-            written, recomputed,
-            "verifier recompute must match the writer's stored entry hash"
-        );
-    }
-
-    /// Changing any content column changes the recomputed hash — the property
-    /// that makes the seal detect content tampering in the archived warehouse.
-    #[test]
-    fn entry_hash_from_cols_is_content_bound() {
-        let event = sample_event();
-        let prev = [0u8; 32];
-        let seq = 1;
-        let pid = *event.principal_id.as_uuid().as_bytes();
-
-        let base = entry_hash_from_cols(cols_input(&event, &prev, seq, &pid));
-
-        // Flip the authorization decision `allow` → `deny`: a single content
-        // column change must break the recomputed hash.
-        let mut tampered = cols_input(&event, &prev, seq, &pid);
-        tampered.decision = "deny";
-        let tampered_hash = entry_hash_from_cols(tampered);
-
-        assert_ne!(
-            base, tampered_hash,
-            "flipping the decision column must change the recomputed entry hash"
-        );
+        assert_eq!(stored_detail, canonical_detail);
+        assert_eq!(stored_entry_hash, expected_hash);
     }
 }

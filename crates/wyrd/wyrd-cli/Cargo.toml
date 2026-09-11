@@ -26,6 +26,7 @@ name = "cli"
 path = "tests/cli.rs"
 
 [dependencies]
+arrow = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
@@ -44,8 +45,8 @@ tracing-subscriber = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 vala-eval = { workspace = true }
+vala-sdk = { workspace = true }
 wyrd-client = { workspace = true }
-wyrd-config = { workspace = true }
 wyrd-error-derive = { workspace = true }
 
 wyrd-loader = { workspace = true }
@@ -53,6 +54,7 @@ wyrd-registry = { workspace = true }
 wyrd-runtime = { workspace = true }
 wyrd-semver = { workspace = true }
 wyrd-spec = { workspace = true }
+wyrd-tls = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = "2"

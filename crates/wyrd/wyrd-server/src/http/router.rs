@@ -27,7 +27,6 @@ use crate::http::openapi::WyrdApiDoc;
 use crate::http::otlp::router as otlp_router;
 use crate::query::routes::router as query_router;
 use crate::state::AppState;
-use crate::vala_query::routes::router as vala_query_router;
 
 /// Build the HTTP router with shared server state.
 pub fn build_router(state: AppState) -> Router {
@@ -53,7 +52,6 @@ pub fn build_router(state: AppState) -> Router {
         .merge(admin_router())
         .merge(bifrost_router())
         .merge(query_router())
-        .merge(vala_query_router())
         .merge(otlp_router())
         .fallback(v1_not_found)
         .layer(middleware::from_fn_with_state(
@@ -61,8 +59,24 @@ pub fn build_router(state: AppState) -> Router {
             require_authenticated,
         ));
 
+    // One MCP endpoint on the one public listener. It sits inside the same
+    // protected edge as `/v1` — request-id, panic capture, load-shed,
+    // concurrency, timeout, body limit — and carries the same default-deny
+    // authentication, so `rmcp` never sees an unverified caller. The route is
+    // not nested under `/v1`: the MCP protocol version, not the Wyrd API
+    // version, governs this surface's compatibility.
+    let mcp_route = Router::new()
+        .route_service("/mcp", crate::mcp::mcp_service(&state))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_authenticated,
+        ));
+
     let protected = apply_protected_edge(
-        Router::new().merge(auth_routes).nest("/v1", v1_group),
+        Router::new()
+            .merge(auth_routes)
+            .merge(mcp_route)
+            .nest("/v1", v1_group),
         &state,
     );
 
@@ -125,6 +139,14 @@ where
         .layer(TimeoutLayer::new(state.limits.timeout))
         .layer(crate::http::middleware::body_limit::wyrd_body_limit(
             state.limits.body_bytes,
+            state
+                .bifrost
+                .serves_api()
+                .then(|| state.bifrost.gate().otlp_decoding_message_size()),
+            state
+                .bifrost
+                .serves_api()
+                .then(|| state.bifrost.transport_admission()),
         ));
     router
         .layer(inner_stack)

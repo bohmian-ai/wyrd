@@ -2,10 +2,10 @@
 
 #[cfg(feature = "python")]
 use {
-    crate::error::{CardPyResult, WyrdPyError},
     pyo3::prelude::*,
     pyo3::types::{PyAny, PyDict},
     std::path::{Path, PathBuf},
+    wyrd_utils::py::WyrdPyResult,
 };
 
 /// Dispatch model save through the Python interface object.
@@ -17,7 +17,7 @@ pub fn save_model(
     interface: &Bound<'_, PyAny>,
     path: &Path,
     save_kwargs: Option<&Bound<'_, PyDict>>,
-) -> CardPyResult<()> {
+) -> WyrdPyResult<()> {
     interface.call_method("save", (path.to_path_buf(), save_kwargs), None)?;
     Ok(())
 }
@@ -32,9 +32,9 @@ pub fn load_model(
     interface: &Bound<'_, PyAny>,
     path: Option<PathBuf>,
     load_kwargs: Option<&Bound<'_, PyDict>>,
-) -> CardPyResult<()> {
-    let path =
-        path.ok_or_else(|| WyrdPyError::model_validation("local model artifact path is required"))?;
+) -> WyrdPyResult<()> {
+    let path = path
+        .ok_or_else(|| crate::error::model_validation("local model artifact path is required"))?;
     interface.call_method("load", (path, load_kwargs), None)?;
     Ok(())
 }

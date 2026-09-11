@@ -5,7 +5,7 @@
 //! client startup (from env vars, explicit config, or workload metadata) and
 //! resolved before each outbound request.
 
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use wyrd_utils::config_dir::wyrd_config_dir;
 
 use crate::error::WyrdClientError;
@@ -71,6 +71,33 @@ pub enum CredentialSource {
         /// Raw API key, redacted in `Debug`.
         key: SecretString,
     },
+}
+
+/// The self-identifying prefix every Wyrd API key carries.
+///
+/// A key is minted as `wyrd_sk_<tenant>_<visible>_<secret>`, so the prefix is
+/// the one thing about a credential string a client may read without asking
+/// the server. Anything without it is an already-issued access token.
+pub const API_KEY_PREFIX: &str = "wyrd_sk_";
+
+impl CredentialSource {
+    /// Classify one explicitly supplied credential string.
+    ///
+    /// SDK surfaces take a single `credential` value rather than asking the
+    /// caller which grant it belongs to. This is the one place that
+    /// distinction is made: a value carrying [`API_KEY_PREFIX`] is exchanged
+    /// through the `wyrd_api_key` grant, anything else is presented verbatim
+    /// as a bearer access token. Routing it in one place is what keeps the
+    /// Rust, Python, and TypeScript clients from disagreeing about what a
+    /// credential is.
+    #[must_use]
+    pub fn explicit(credential: SecretString) -> Self {
+        if credential.expose_secret().starts_with(API_KEY_PREFIX) {
+            Self::ApiKey { key: credential }
+        } else {
+            Self::ExplicitToken { token: credential }
+        }
+    }
 }
 
 impl std::fmt::Debug for CredentialSource {
@@ -260,6 +287,36 @@ mod tests {
     use secrecy::ExposeSecret;
 
     use super::{CredentialChain, CredentialSource, ResolvedCredential};
+
+    /// One `credential` string routes to the grant its own prefix names.
+    ///
+    /// This is the property every SDK's single-`credential` constructor rests
+    /// on: an API key is exchanged, an access token is presented verbatim, and
+    /// neither caller has to say which they hold.
+    #[test]
+    fn explicit_credential_routes_by_its_own_prefix() {
+        let mut chain = CredentialChain::default();
+        chain.push(CredentialSource::explicit(
+            "wyrd_sk_tenant_visible_secret".to_owned().into(),
+        ));
+        match chain.resolve().expect("an API key resolves") {
+            ResolvedCredential::ApiKey(key) => {
+                assert_eq!(key.expose_secret(), "wyrd_sk_tenant_visible_secret");
+            }
+            other => panic!("a wyrd_sk_ credential is an API key, got {other:?}"),
+        }
+
+        let mut chain = CredentialChain::default();
+        chain.push(CredentialSource::explicit(
+            "eyJhbGciOi.token".to_owned().into(),
+        ));
+        match chain.resolve().expect("an access token resolves") {
+            ResolvedCredential::BearerToken(token) => {
+                assert_eq!(token.expose_secret(), "eyJhbGciOi.token");
+            }
+            other => panic!("an unprefixed credential is a bearer token, got {other:?}"),
+        }
+    }
 
     #[test]
     fn empty_chain_returns_no_credentials() {

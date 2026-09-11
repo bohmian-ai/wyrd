@@ -2,11 +2,11 @@
 
 use clap::{Parser, Subcommand};
 
-use crate::audit::AuditCommand;
 use crate::auth::AuthCommand;
 use crate::card::{ApplyArgs, DeleteArgs, GetArgs, LatestArgs, ListArgs, LoadArgs, PlanArgs};
 use crate::eval::run::EvalCommand;
 use crate::principal::PrincipalCommand;
+use crate::query::QueryCommand;
 
 /// Wyrd command-line interface.
 #[derive(Debug, Parser)]
@@ -27,21 +27,23 @@ impl Cli {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::error::WyrdCliError`] when parsing-compatible command
-    /// inputs fail local validation or a client/server operation fails.
-    pub async fn dispatch(self) -> Result<std::process::ExitCode, crate::error::WyrdCliError> {
+    /// Returns [`crate::error::CliBoundaryError`] when parsing-compatible
+    /// command inputs fail local validation or a client/server operation fails.
+    /// Query commands keep their typed Bifrost error; every other command keeps
+    /// the derive-catalogued local CLI error.
+    pub async fn dispatch(self) -> Result<std::process::ExitCode, crate::error::CliBoundaryError> {
         match self.command {
-            Command::Plan(args) => crate::card::dispatch_plan(args).await,
-            Command::Apply(args) => crate::card::dispatch_apply(args).await,
-            Command::Get(args) => crate::card::dispatch_get(args).await,
-            Command::Latest(args) => crate::card::dispatch_latest(args).await,
-            Command::List(args) => crate::card::dispatch_list(args).await,
-            Command::Load(args) => crate::card::dispatch_load(args).await,
-            Command::Delete(args) => crate::card::dispatch_delete(args).await,
-            Command::Audit(command) => crate::audit::dispatch(command).await,
-            Command::Auth(command) => crate::auth::dispatch(command).await,
-            Command::Eval(command) => crate::eval::run::dispatch(command).await,
-            Command::Principal(command) => crate::principal::dispatch(command).await,
+            Command::Plan(args) => crate::card::dispatch_plan(args).await.map_err(Into::into),
+            Command::Apply(args) => crate::card::dispatch_apply(args).await.map_err(Into::into),
+            Command::Get(args) => crate::card::dispatch_get(args).await.map_err(Into::into),
+            Command::Latest(args) => crate::card::dispatch_latest(args).await.map_err(Into::into),
+            Command::List(args) => crate::card::dispatch_list(args).await.map_err(Into::into),
+            Command::Load(args) => crate::card::dispatch_load(args).await.map_err(Into::into),
+            Command::Delete(args) => crate::card::dispatch_delete(args).await.map_err(Into::into),
+            Command::Auth(command) => crate::auth::dispatch(command).await.map_err(Into::into),
+            Command::Eval(command) => crate::eval::run::dispatch(command).await.map_err(Into::into),
+            Command::Principal(command) => crate::principal::dispatch(command).await.map_err(Into::into),
+            Command::Query(command) => crate::query::dispatch(command).await,
         }
     }
 }
@@ -65,9 +67,6 @@ pub enum Command {
     Load(LoadArgs),
     /// Soft-delete one exact card.
     Delete(DeleteArgs),
-    /// Audit log commands (verify seal checkpoints).
-    #[command(subcommand)]
-    Audit(AuditCommand),
     /// Authenticate with a Wyrd server (login, refresh, issue-key).
     #[command(subcommand)]
     Auth(AuthCommand),
@@ -77,4 +76,6 @@ pub enum Command {
     /// Manage Wyrd principals (revoke).
     #[command(subcommand)]
     Principal(PrincipalCommand),
+    /// Run a terminal-safe streaming Oracle query.
+    Query(QueryCommand),
 }

@@ -1,0 +1,20 @@
+{
+  "name": "@wyrd/sdk-linux-arm64-gnu",
+  "version": "0.0.1",
+  "description": "Native napi addon for @wyrd/sdk-linux-arm64-gnu.",
+  "license": "MIT",
+  "os": [
+    "linux"
+  ],
+  "libc": [
+    "glibc"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "main": "./wyrd.linux-arm64-gnu.node",
+  "files": [
+    "wyrd.linux-arm64-gnu.node",
+    "package.json"
+  ]
+}

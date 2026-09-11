@@ -1,6 +1,6 @@
 ---
 title: Reading Data
-description: ValaQueryService typed methods, signed page tokens, payload-read permissions, the governed generic SQL surface, and Arrow conversion.
+description: Query Bifrost synchronously through the governed Oracle stream.
 pillar: wyrd
 group: Bifrost
 order: 6
@@ -8,148 +8,179 @@ order: 6
 
 # Reading Data
 
-Bifrost exposes its domain tables through the `ValaQueryService`: nine typed methods, one per observation domain. A governed generic SQL surface (`POST /v1/observations/query`) is also available for ad-hoc analysis.
+Bifrost reads use one synchronous endpoint: `POST /v1/query`. The request is
+authorized by Gate and executed by Oracle. The response is a bounded stream of
+typed frames, so a client can render rows as they arrive while retaining the
+terminal state that describes the complete result.
 
-## Query freshness and fused scan
+## The query stream
 
 <WyrdSequenceDiagram dense
-  title="Query to fused result"
-  participants={['Client', 'Gate', 'Oracle', 'Postgres', 'Object store', 'Scribe']}
+  title="Synchronous Bifrost query"
+  participants={['Client', 'Gate', 'Oracle', 'Storage']}
   messages={[
-    { from: 'Client', to: 'Gate', label: 'query (typed or SQL)' },
-    { from: 'Gate', to: 'Oracle', label: 'route: tenant + perms resolved' },
-    { from: 'Oracle', to: 'Postgres', label: 'SELECT vala.file_list WHERE NOT compacted' },
-    { from: 'Postgres', to: 'Oracle', label: 'un-compacted refs', dashed: true },
-    { from: 'Oracle', to: 'Object store', label: 'scan Iceberg + sealed Parquet' },
-    { from: 'Object store', to: 'Oracle', label: 'Arrow batches', dashed: true },
-    { from: 'Oracle', to: 'Scribe', label: 'live-tail RPC (Phase 2)' },
-    { from: 'Scribe', to: 'Oracle', label: 'in-memory rows', dashed: true },
-    { from: 'Oracle', to: 'Oracle', label: 'union · FilterExec(tenant) · execute' },
-    { from: 'Oracle', to: 'Client', label: 'Arrow IPC stream', dashed: true }
+    { from: 'Client', to: 'Gate', label: 'POST /v1/query' },
+    { from: 'Gate', to: 'Oracle', label: 'authorize tenant + permission' },
+    { from: 'Oracle', to: 'Storage', label: 'read the immutable visibility cut' },
+    { from: 'Storage', to: 'Oracle', label: 'Arrow batches', dashed: true },
+    { from: 'Oracle', to: 'Client', label: 'Schema → Batch* → Terminal', dashed: true }
   ]}
 />
 
-Reads go through Gate to Oracle. Oracle builds a DataFusion plan whose scan fuses three sources:
+Every successful response is `application/vnd.wyrd.bifrost-query-stream`, a
+length-delimited sequence of `QueryStreamFrame` protobuf messages:
 
-- **Iceberg snapshots.** Compacted historical data written by Forge.
-- **`vala.file_list` un-compacted files.** Sealed Parquet from Scribe that Forge has not yet folded into a snapshot.
-- **Live Scribe WAL (Phase 2).** Recent rows still in Scribe memtables, streamed via live-tail RPC.
+1. `Schema` appears exactly once and identifies the Arrow schema.
+2. Zero or more `Batch` frames carry Arrow IPC record batches.
+3. One `Terminal` frame closes the stream. It contains `outcome`, `freshness`,
+   `row_count`, bounded `warnings`, `source_completion`, and an optional stable
+   `error`.
 
-Fresh data becomes visible within seal latency (~1-5s typical) even before Forge compacts it. Oracle is stateless: any Oracle pod can serve any query, so you can scale it independently of the write path.
+EOF before `Terminal` is an incomplete query, never a successful partial
+result. A terminal with `outcome: failed` is also a failure even when batches
+precede it. Clients should retain the terminal and release the stream on every
+error path.
 
-**Implementation status:**
+## Defaults and explicit opt-ins
 
-- Iceberg scan: planned.
-- `vala.file_list` scan: planned.
-- Live-tail RPC: partially implemented (heartbeat + tail RPC skeleton in `vala-bifrost-redux`, no distributed fan-out yet).
-
-Until fused scan lands, only the typed query methods that route through the current Vala query service are available end-to-end.
-
-## ValaQueryService methods
-
-| Method | Route | Returns |
-|---|---|---|
-| `GetTrace` | `GET /v1/traces/{trace_id}` | `TraceWaterfall` (spans, events, links) |
-| `QueryTraces` | `POST /v1/traces/query` | `Vec<TraceSummaryRow>` |
-| `QueryRecentTraces` | `POST /v1/traces/recent/query` | `Vec<TraceSummaryRow>` sorted by recency |
-| `QueryGenAi` | `POST /v1/genai/query` | `Vec<GenAiRow>` |
-| `QueryEval` | `POST /v1/eval/query` | `Vec<EvalRow>` |
-| `QueryDrift` | `POST /v1/drift/query` | `Vec<DriftRow>` |
-| `QueryMetrics` | `POST /v1/metrics/query` | `Vec<MetricRow>` |
-| `QueryLogs` | `POST /v1/logs/query` | `Vec<LogRow>` |
-| `QueryAgentTraces` | `POST /v1/agent-traces/query` | `Vec<AgentTraceRow>` |
-
-All methods accept a `QueryWindow` envelope:
+Omitting policy fields uses the safest shared defaults:
 
 ```json
 {
-  "since": "2026-07-01T00:00:00Z",
-  "until": "2026-07-08T00:00:00Z",
-  "limit": 100,
-  "page_token": null
+  "visibility": "published_only",
+  "freshness": "strict"
 }
 ```
 
-`since` defaults to `now - 7 days` when absent. `limit` is capped at `MAX_QUERY_PAGE_SIZE = 1000`.
+`published_only` reads the durable published and sealed sources. `strict`
+returns a stable failure when a required source cannot complete. Choose
+`visibility: "fused"` to include the fenced live-tail interval. Pair it with
+`freshness: "allow_degraded"` only when a bounded result without an unavailable
+live source is acceptable. These are explicit opt-ins; clients must serialize
+both enum values rather than relying on language-specific defaults.
 
-## Required permission
-
-All typed methods require `bifrost_query:read`. Callers without this permission receive `403 WYRD_VALA_403_QUERY_FORBIDDEN`.
-
-## Payload permissions
-
-Sensitive columns are projected away unless the caller holds the matching payload permission:
-
-| Permission | Unlocks columns |
-|---|---|
-| `bifrost_trace_payload:read` | `attributes` on spans, events, links |
-| `bifrost_log_payload:read` | `body`, `attributes` on logs |
-| `bifrost_genai_payload:read` | `input_messages`, `output_messages` on GenAI rows |
-| `bifrost_agent_trace_payload:read` | `messages`, `tool_io` on agent-trace rows |
-
-Without the payload permission the method still returns the metadata columns; it does not return an error. Only if the caller explicitly requests a gated column through the generic SQL surface does the server return `403 WYRD_VALA_403_PAYLOAD_FORBIDDEN`.
-
-## Column name mapping for `QueryEval`
-
-The `QueryEval` typed method accepts an `eval_id` filter parameter, which maps to the physical column `eval_ref` in the `vala.eval.assertions` table. If you write raw SQL against the generic SQL surface, use `eval_ref`. The name `eval_id` does not exist as a physical column and will return `column not found`.
-
-## Signed page tokens and pagination
-
-When a response carries `next_page_token`, pass it in the next request's `page_token` field to get the next page. Tokens are:
-
-- **Tenant-bound.** A token issued under tenant A is rejected under tenant B.
-- **Permission-bound.** A token encodes a hash of the caller's effective permissions; a token issued before a permission was revoked is rejected after revocation.
-- **Query-bound.** Changing any filter field invalidates the token.
-- **TTL-bounded.** Tokens expire after 300 seconds (default). An expired token returns `400 WYRD_VALA_400_PAGE_TOKEN_INVALID`. If the underlying Iceberg snapshot was pruned by the time the token is used, the server returns `410 WYRD_VALA_410_PAGE_SNAPSHOT_EXPIRED`, which is a signal to restart from page 1.
-
-## TraceSummaryRow derivation
-
-`QueryTraces` and `QueryRecentTraces` return `TraceSummaryRow`, a derived row that does not exist in the physical table. It is computed from the raw `vala.traces.spans` scan by grouping on `trace_id` and computing:
-
-- `root_name`: name of the span with `parent_span_id IS NULL`
-- `service`: `service_name` of the root span
-- `started_at`: min `start_time` across all spans
-- `duration_ms`: `(max(end_time) - min(start_time)) / 1000`
-- `span_count`: count of spans
-- `error`: any span has `status = "ERROR"`
-
-This GROUP-BY runs in Rust after collecting the scanned batches. In Stage 5 it will be pushed into the DataFusion plan.
-
-## Generic SQL surface
-
-`POST /v1/observations/query` accepts any SELECT statement:
+## HTTP
 
 ```bash
-curl -X POST /v1/observations/query \
-  -H "x-wyrd-access-token: Bearer $TOKEN" \
-  -d '{ "sql": "SELECT metric_name, AVG(value) AS avg FROM \"vala.metrics.points\" WHERE wyrd_event_time >= now() - interval '\''7 days'\'' GROUP BY metric_name" }'
+curl --fail-with-body -X POST "$WYRD_SERVER_URL/v1/query" \
+  -H "x-wyrd-access-token: Bearer $WYRD_ACCESS_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{
+    "sql": "SELECT metric_name, time, value, service_name FROM vala.metrics.points WHERE wyrd_event_time >= now() - interval '\''7 days'\''",
+    "visibility": "published_only",
+    "freshness": "strict"
+  }'
 ```
 
-The response body is a raw Arrow IPC stream (`application/vnd.apache.arrow.stream`).
+The request is one bounded `SELECT`. Non-`SELECT` statements, oversized
+queries, missing time bounds where the table requires them, and references to
+tables or payload columns outside the caller's permissions return structured
+Wyrd errors before rows are released.
 
-**Governance on the generic path:**
+## Client examples
 
-- Requires `bifrost_query:read`.
-- Any reference to a domain table also requires its domain-level permission.
-- References to payload columns without the matching payload permission return `403 WYRD_VALA_403_PAYLOAD_FORBIDDEN`.
-- A domain-table scan without a `wyrd_event_time` time-window predicate is rejected with `400 WYRD_VALA_400_QUERY_INVALID_SQL`.
-- Non-SELECT statements are rejected.
-- Results are bounded at `MAX_SYNC_RESULT_ROWS` rows and `MAX_SYNC_RESULT_BYTES` bytes.
+The first-class clients expose the same frame and terminal contract. They use
+published-only/strict defaults when the options are omitted.
 
-## Arrow → Python conversion
+### Python
 
 ```python
-import pyarrow as pa
-import pyarrow.ipc as ipc
-import io
+from wyrd.bifrost import BifrostQueryClient
 
-response = requests.post(
-    "/v1/observations/query",
-    headers={"x-wyrd-access-token": f"Bearer {token}"},
-    json={"sql": "SELECT * FROM \"vala.metrics.points\" LIMIT 100"},
-    stream=True,
+client = BifrostQueryClient("https://wyrd.example", token)
+stream = await client.query(
+    'SELECT metric_name, time, value, service_name FROM "vala.metrics.points" WHERE wyrd_event_time >= now() - interval \'7 days\'',
+    visibility="published_only",
+    freshness="strict",
 )
-reader = ipc.open_stream(io.BytesIO(response.content))
-table = reader.read_all()
-df = table.to_pandas()
+rows = []
+async for batch in stream:
+    rows.extend(batch.to_pylist())
+terminal = stream.terminal
+if terminal is None:
+    raise RuntimeError("query completed without terminal metadata")
+required = ("outcome", "freshness", "row_count", "warnings", "source_completion", "error")
+missing = [field for field in required if field not in terminal]
+if missing:
+    raise RuntimeError(f"query terminal is missing fields: {missing}")
+if terminal["outcome"] != "success" or terminal["freshness"] != "complete":
+    raise RuntimeError(terminal["error"])
 ```
+
+### TypeScript
+
+```ts
+import { BifrostQueryClient } from "@wyrd/sdk";
+
+const client = new BifrostQueryClient(serverUrl, accessToken);
+const stream = await client.query({
+  sql: 'SELECT metric_name, time, value, service_name FROM "vala.metrics.points" WHERE wyrd_event_time >= now() - interval \'7 days\'',
+  visibility: "published_only",
+  freshness: "strict",
+});
+const rows = [];
+for await (const batch of stream) rows.push(...batch.toArray());
+const terminal = stream.terminal;
+if (terminal === null || terminal === undefined) {
+  throw new Error("query completed without terminal metadata");
+}
+for (const field of ["outcome", "freshness", "row_count", "warnings", "source_completion", "error"]) {
+  if (!(field in terminal)) throw new Error(`query terminal is missing ${field}`);
+}
+if (terminal.outcome !== "success" || terminal.freshness !== "complete" || terminal.error !== null) {
+  throw new Error(`query failed: ${JSON.stringify(terminal.error)}`);
+}
+```
+
+### CLI
+
+```bash
+wyrd query \
+  --server "$WYRD_SERVER_URL" \
+  --token "$WYRD_ACCESS_TOKEN" \
+  --sql 'SELECT metric_name, time, value, service_name FROM "vala.metrics.points" WHERE wyrd_event_time >= now() - interval '\''7 days'\''' \
+  --format jsonl
+```
+
+Rows are written to stdout. The validated terminal is written as JSON to
+stderr. `--visibility fused` and `--freshness allow-degraded` are explicit
+alternatives when their semantics are wanted.
+
+### MCP
+
+Connect an MCP Streamable HTTP client to `$WYRD_SERVER_URL/mcp`. Wyrd serves
+protocol revision `2026-07-28` using `server/discover` and self-contained
+per-request protocol metadata, without sessions. Use a client that supports
+this discovery lifecycle; the older `initialize` lifecycle is not supported.
+Let the MCP client manage protocol framing and metadata.
+
+Every request must carry `x-wyrd-access-token: Bearer <access-token>`, including
+discovery and tool calls. Obtain the access token by exchanging a Wyrd API key
+at `POST /auth/token`, and refresh it before expiry. The first-party Rust
+`WyrdMcpHttpClient` decorator reuses `AuthMiddleware` to supply a current bearer
+and a `wyrd-request-id` on every request. It preserves a supplied request ID
+and leaves the application's `Authorization` header untouched.
+
+After discovery, use `tools/list` to find `bifrost.list_tables`,
+`bifrost.describe_table`, and `bifrost.query`, then invoke them with `tools/call`.
+The `bifrost.query` read tool accepts the same SQL and policy fields and returns
+one bounded structured result: `{columns, rows, terminal}`. `columns` is an
+ordered array of descriptors with `name`, `data_type`, and `nullable`; each row
+is a positional array in that same order, preserving duplicate column names.
+The terminal contains `outcome`, `freshness`, `execution_path`, `row_count`,
+`warnings`, and `source_completion`.
+
+A query failure or result-ceiling refusal returns a structured Wyrd error with
+no partial successful result. Inspect the tool result's `isError` before using
+its structured content. The tool descriptor does not advertise an output schema.
+
+## Permissions and stable failures
+
+Every query requires `bifrost_query:read`. Table and payload permissions still
+apply to referenced columns. A caller without the query permission receives
+`403 WYRD_PERMISSION_403_DENIED_RBAC`; no Oracle read-decision or row effect is
+created. Other stable failures include invalid SQL, query timeout, unavailable
+sources, tenant invariants, and oversized results. Each failure carries a
+stable `code`, HTTP-equivalent `status`, title, detail, and remediation. Retry
+only after applying the remediation and only when the error is retryable for
+your workflow.

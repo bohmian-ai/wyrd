@@ -25,6 +25,7 @@ FAMILY_WYRD=(
 FAMILY_SKALD=(
   skald-agent
   skald-cache
+  skald-observer
   skald-prompt
   skald-providers
   skald-observer
@@ -35,7 +36,6 @@ FAMILY_SKALD=(
 )
 
 FAMILY_VALA=(
-  vala-bifrost
   vala-bifrost-redux
   vala-core
   vala-drift
@@ -58,8 +58,11 @@ FAMILY_SHARED=(
   wyrd-runtime
   wyrd-loader
   wyrd-semver
+  wyrd-storage-client
   wyrd-telemetry
   wyrd-test-contract-macros
+  wyrd-tls
+  wyrd-bench
   wyrd-utils
   wyrd-version
 )

@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit as ArrowTimeUnit};
 use serde_json::{Map, Value};
-use wyrd_spec::vala::api::{DataTypeSpec, FieldSpec, TimeUnit};
+use wyrd_spec::vala::api::{BifrostTableDescription, DataTypeSpec, FieldSpec, TimeUnit};
 
 use crate::error::WyrdQueueError;
 
@@ -43,24 +43,60 @@ pub fn arrow_schema_to_fieldspec(schema: &Schema) -> Vec<FieldSpec> {
 /// direction that mirrors `arrow_schema_to_fieldspec`.
 ///
 /// Every `DataTypeSpec` variant in the register-accepted set maps to exactly the
-/// `arrow::DataType` the server twin `data_type_to_arrow` would produce. List
-/// item fields are named `"item"` and are nullable; Struct fields recurse.
+/// `arrow::DataType` the server twin `data_type_to_arrow` would produce. A list
+/// element and a struct child are full declarations, so their names,
+/// nullability are reproduced rather than synthesized. Field metadata is
+/// dropped at every depth: see [`spec_to_field`].
 ///
 /// # Errors
 /// Returns `Ok` for all supported `DataTypeSpec` variants. The function
 /// signature returns `Result` for symmetry with `json_schema_to_arrow`.
 pub fn fieldspec_to_arrow(fields: &[FieldSpec]) -> Result<Schema, WyrdQueueError> {
-    let arrow_fields: Vec<Field> = fields
+    Ok(Schema::new(
+        fields.iter().map(spec_to_field).collect::<Vec<_>>(),
+    ))
+}
+
+/// Build the Arrow schema a writer sends for one described table.
+///
+/// The layout is the table's own `user_fields`, then its declared correlation
+/// inputs in description order, then — only when `include_event_time` — the
+/// managed candidates the writer chooses to supply itself. Everything else on
+/// the physical table is server-stamped and must not appear on the wire.
+///
+/// Use this for a direct Arrow writer; [`crate::BatchBuilder::from_description`]
+/// is the JSON-row path and appends correlation itself.
+///
+/// # Errors
+///
+/// Returns [`WyrdQueueError::SchemaParse`] when the description declares a
+/// column name twice across its three field classes, which would make the
+/// batch ambiguous.
+pub fn writable_schema(
+    description: &BifrostTableDescription,
+    include_event_time: bool,
+) -> Result<Schema, WyrdQueueError> {
+    let declared = description
+        .user_fields
         .iter()
-        .map(|f| {
-            Field::new(
-                f.name.as_str(),
-                data_type_to_arrow(&f.data_type),
-                f.nullable,
-            )
-        })
-        .collect();
-    Ok(Schema::new(arrow_fields))
+        .chain(&description.correlation_fields)
+        .chain(if include_event_time {
+            description.managed_candidates.as_slice()
+        } else {
+            &[]
+        });
+    let mut fields = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for spec in declared {
+        if !seen.insert(spec.name.as_str()) {
+            return Err(WyrdQueueError::SchemaParse(format!(
+                "described column `{}` is declared more than once",
+                spec.name
+            )));
+        }
+        fields.push(spec_to_field(spec));
+    }
+    Ok(Schema::new(fields))
 }
 
 /// Walk a JSON-Schema object into an Arrow `Schema` in one step.
@@ -150,7 +186,12 @@ fn map_type(
             let items = prop.get("items").ok_or_else(|| {
                 WyrdQueueError::SchemaParse("array schema missing `items`".to_owned())
             })?;
-            Ok(DataTypeSpec::List(Box::new(map_type(items, defs)?)))
+            Ok(DataTypeSpec::List(Box::new(FieldSpec {
+                name: "item".to_owned(),
+                data_type: map_type(items, defs)?,
+                nullable: true,
+                metadata: BTreeMap::new(),
+            })))
         }
         Some("object") => {
             if prop.get("properties").is_some() {
@@ -194,13 +235,41 @@ fn free_form_dict() -> WyrdQueueError {
     )
 }
 
+/// Project one Arrow field onto its wire declaration, metadata included.
+///
+/// Metadata is carried verbatim so a stable `PARQUET:field_id` survives at
+/// every nesting depth rather than only on top-level columns.
 fn field_to_spec(field: &Field) -> FieldSpec {
     FieldSpec {
         name: field.name().clone(),
         data_type: dtspec_from_arrow(field.data_type()),
         nullable: field.is_nullable(),
-        metadata: BTreeMap::new(),
+        metadata: field
+            .metadata()
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
     }
+}
+
+/// Project one wire declaration onto its Arrow field, metadata dropped.
+///
+/// Name, nullability, and the exact type — everything that shapes an Arrow
+/// buffer — are reproduced at every depth. Field metadata is not: a
+/// `PARQUET:field_id` is the server's own physical identity, which it assigns
+/// at registration, re-derives on every stamp, and ignores on an incoming
+/// batch. Emitting it here would put a value on the wire that looks
+/// load-bearing and is not, which is exactly what a client cannot be right or
+/// wrong about. `describe_table` still reports it; a writer does not repeat it.
+///
+/// This is therefore the lossy forward half of [`field_to_spec`], not its
+/// inverse.
+fn spec_to_field(spec: &FieldSpec) -> Field {
+    Field::new(
+        spec.name.as_str(),
+        data_type_to_arrow(&spec.data_type),
+        spec.nullable,
+    )
 }
 
 fn dtspec_from_arrow(dt: &DataType) -> DataTypeSpec {
@@ -237,7 +306,7 @@ fn dtspec_from_arrow(dt: &DataType) -> DataTypeSpec {
             precision: *precision,
             scale: *scale,
         },
-        DataType::List(field) => DataTypeSpec::List(Box::new(dtspec_from_arrow(field.data_type()))),
+        DataType::List(element) => DataTypeSpec::List(Box::new(field_to_spec(element))),
         DataType::Struct(fields) => {
             DataTypeSpec::Struct(fields.iter().map(|f| field_to_spec(f)).collect())
         }
@@ -291,24 +360,10 @@ fn data_type_to_arrow(spec: &DataTypeSpec) -> DataType {
         DataTypeSpec::Time32 { unit } => DataType::Time32(time_unit_to_arrow(*unit)),
         DataTypeSpec::Time64 { unit } => DataType::Time64(time_unit_to_arrow(*unit)),
         DataTypeSpec::Decimal128 { precision, scale } => DataType::Decimal128(*precision, *scale),
-        DataTypeSpec::List(inner) => DataType::List(Arc::new(Field::new(
-            "item",
-            data_type_to_arrow(inner),
-            true,
-        ))),
-        DataTypeSpec::Struct(fields) => {
-            let arrow_fields: Vec<Field> = fields
-                .iter()
-                .map(|f| {
-                    Field::new(
-                        f.name.as_str(),
-                        data_type_to_arrow(&f.data_type),
-                        f.nullable,
-                    )
-                })
-                .collect();
-            DataType::Struct(Fields::from(arrow_fields))
-        }
+        DataTypeSpec::List(element) => DataType::List(Arc::new(spec_to_field(element))),
+        DataTypeSpec::Struct(fields) => DataType::Struct(Fields::from(
+            fields.iter().map(spec_to_field).collect::<Vec<_>>(),
+        )),
     }
 }
 
@@ -423,7 +478,7 @@ mod schema_tests {
 
         assert_eq!(
             field(&specs, "tags").data_type,
-            DataTypeSpec::List(Box::new(DataTypeSpec::Utf8))
+            DataTypeSpec::List(Box::new(make_field("item", DataTypeSpec::Utf8, true)))
         );
     }
 
@@ -597,12 +652,12 @@ mod schema_tests {
         let specs = vec![
             make_field(
                 "tags",
-                DataTypeSpec::List(Box::new(DataTypeSpec::Utf8)),
+                DataTypeSpec::List(Box::new(make_field("item", DataTypeSpec::Utf8, true))),
                 true,
             ),
             make_field(
                 "counts",
-                DataTypeSpec::List(Box::new(DataTypeSpec::Int64)),
+                DataTypeSpec::List(Box::new(make_field("element", DataTypeSpec::Int64, false))),
                 false,
             ),
         ];
@@ -661,5 +716,93 @@ mod schema_tests {
         let schema = json!({"type": "object"});
         let err = json_schema_to_arrow(&schema).unwrap_err();
         assert_eq!(err.code(), "WYRD_VALA_400_SCHEMA_PARSE");
+    }
+
+    /// A recursive declaration keeps every child's shape and drops its ids.
+    ///
+    /// The list element is the declaration the description carried — its own
+    /// name and nullability — not a synthesized nullable `item`, and a struct
+    /// child keeps the same, so a client rebuilds the exact buffer layout the
+    /// server stores. It does not rebuild the server's `PARQUET:field_id`: that
+    /// is physical identity the server assigns and ignores on an incoming
+    /// batch, so no depth of this projection puts it on the wire.
+    ///
+    /// # Panics
+    ///
+    /// Panics when Arrow loses a nested name or nullability, or when any field
+    /// at any depth carries metadata onto the wire.
+    #[test]
+    fn fieldspec_to_arrow_keeps_recursive_shape_without_field_ids() {
+        use std::collections::BTreeMap;
+        use wyrd_spec::vala::api::PARQUET_FIELD_ID_KEY;
+
+        let with_id = |mut spec: FieldSpec, id: i32| {
+            spec.metadata = BTreeMap::from([(PARQUET_FIELD_ID_KEY.to_owned(), id.to_string())]);
+            spec
+        };
+        let specs = vec![with_id(
+            make_field(
+                "events",
+                DataTypeSpec::List(Box::new(with_id(
+                    make_field(
+                        "event",
+                        DataTypeSpec::Struct(vec![with_id(
+                            make_field("name", DataTypeSpec::Utf8, false),
+                            19,
+                        )]),
+                        false,
+                    ),
+                    17,
+                ))),
+                false,
+            ),
+            16,
+        )];
+
+        let arrow = fieldspec_to_arrow(&specs).expect("the declaration maps to Arrow");
+        let column = arrow.field(0);
+        assert!(column.metadata().is_empty(), "a column sends no field id");
+        let DataType::List(element) = column.data_type() else {
+            panic!("a list declaration must project an Arrow list");
+        };
+        assert_eq!(element.name(), "event");
+        assert!(!element.is_nullable());
+        assert!(
+            element.metadata().is_empty(),
+            "a list element sends no field id"
+        );
+        let DataType::Struct(children) = element.data_type() else {
+            panic!("the list element must project its declared struct");
+        };
+        assert_eq!(children[0].name(), "name");
+        assert!(
+            children[0].metadata().is_empty(),
+            "a struct child sends no field id"
+        );
+
+        let round_tripped = arrow_schema_to_fieldspec(&arrow);
+        assert_eq!(
+            round_tripped,
+            specs.iter().map(strip_ids).collect::<Vec<_>>(),
+            "reading the projection back yields the same shape with no ids"
+        );
+    }
+
+    /// Clears one declaration's metadata at every depth for comparison.
+    fn strip_ids(spec: &FieldSpec) -> FieldSpec {
+        use std::collections::BTreeMap;
+
+        FieldSpec {
+            name: spec.name.clone(),
+            data_type: match &spec.data_type {
+                DataTypeSpec::List(element) => DataTypeSpec::List(Box::new(strip_ids(element))),
+                DataTypeSpec::Struct(children) => {
+                    DataTypeSpec::Struct(children.iter().map(strip_ids).collect())
+                }
+                other => other.clone(),
+            },
+            nullable: spec.nullable,
+            metadata: BTreeMap::new(),
+        }
     }
 }

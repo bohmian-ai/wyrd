@@ -135,12 +135,23 @@ pub async fn prepare_login(
 }
 
 /// Resolve the trusted issuer's OIDC `authorization_endpoint` via discovery.
+///
+/// # Errors
+///
+/// Returns [`WyrdError::DiscoveryUnavailable`] when another Rustls provider
+/// already owns the process or the issuer URL, metadata request, or response is
+/// invalid. Cancellation can interrupt discovery without persisting state.
+///
 pub async fn discover_authorization_endpoint(trusted: &TrustedIssuer) -> Result<Url, WyrdError> {
     let issuer_url =
         Url::parse(trusted.issuer.as_str()).map_err(|_| WyrdError::DiscoveryUnavailable {
             message: "trusted issuer URL could not be parsed".to_owned(),
             details: serde_json::json!({}),
         })?;
+    wyrd_tls::install_crypto_provider().map_err(|_| WyrdError::DiscoveryUnavailable {
+        message: "OIDC TLS provider initialization failed".to_owned(),
+        details: serde_json::json!({}),
+    })?;
     let provider = OidcProvider::discover(issuer_url, reqwest::Client::new())
         .await
         .map_err(|error| {

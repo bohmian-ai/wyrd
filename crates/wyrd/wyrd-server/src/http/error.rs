@@ -74,6 +74,16 @@ pub fn wyrd_error_response_from_parts(
     request_id: Option<&wyrd_spec::request_id::RequestId>,
 ) -> Response {
     let status = StatusCode::from_u16(error.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let retry_after = matches!(
+        &error,
+        WyrdError::AuthVerifyUnavailable { .. }
+            | WyrdError::Vala {
+                error: wyrd_spec::vala::error::BifrostError::QueryAdmissionRejected,
+            }
+            | WyrdError::Vala {
+                error: wyrd_spec::vala::error::BifrostError::IngestBusy { .. },
+            }
+    );
     let mut body = error.as_problem_json();
     if let (serde_json::Value::Object(map), Some(id)) = (&mut body, request_id) {
         map.insert(
@@ -81,7 +91,6 @@ pub fn wyrd_error_response_from_parts(
             serde_json::Value::String(format!("urn:wyrd:request:{}", id.as_str())),
         );
     }
-    let retry_after = matches!(error, WyrdError::AuthVerifyUnavailable { .. });
     match serde_json::to_vec(&body) {
         Ok(bytes) => {
             let mut response = response_with_body(status, bytes);
@@ -372,7 +381,7 @@ mod error_mapper_tests {
     }
 
     #[tokio::test]
-    async fn retry_after_only_on_verify_unavailable() {
+    async fn ingest_busy_http_retry_metadata() {
         let retryable = WyrdErrorResponse::from(WyrdError::AuthVerifyUnavailable {
             message: "resolver unavailable".to_owned(),
             details: serde_json::json!({}),
@@ -380,6 +389,30 @@ mod error_mapper_tests {
         .into_response();
         assert_eq!(
             retryable
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        let ingest_busy = WyrdErrorResponse::from(WyrdError::from(
+            wyrd_spec::vala::error::BifrostError::IngestBusy {
+                table: "vala.traces.spans".to_owned(),
+            },
+        ))
+        .into_response();
+        assert_eq!(
+            ingest_busy
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        let capacity = WyrdErrorResponse::from(WyrdError::from(
+            wyrd_spec::vala::error::BifrostError::QueryAdmissionRejected,
+        ))
+        .into_response();
+        assert_eq!(
+            capacity
                 .headers()
                 .get(axum::http::header::RETRY_AFTER)
                 .and_then(|value| value.to_str().ok()),
@@ -395,6 +428,10 @@ mod error_mapper_tests {
                 message: "audit unavailable".to_owned(),
                 details: serde_json::json!({}),
             },
+            wyrd_spec::vala::error::BifrostError::QueryMemoryRequestTooLarge.into(),
+            wyrd_spec::vala::error::BifrostError::QueryExecutionFailed.into(),
+            wyrd_spec::vala::error::BifrostError::PayloadTooLarge { bytes: 1, limit: 1 }.into(),
+            wyrd_spec::vala::error::BifrostError::WalDiskFull.into(),
         ] {
             let response = WyrdErrorResponse::from(error).into_response();
             assert!(
@@ -404,6 +441,54 @@ mod error_mapper_tests {
                     .is_none()
             );
         }
+    }
+
+    /// Proves the enforced payload ceiling survives the HTTP problem+json
+    /// rendering. An agent reading only the response body must be able to see
+    /// both what it sent and what the server would have accepted; a remediation
+    /// asserting a fixed ceiling would contradict the configured limit.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the code, status, measured bytes, enforced limit, detail, or
+    /// remediation is lost or contradicted at the HTTP boundary.
+    #[tokio::test]
+    async fn payload_limit_survives_the_http_boundary() {
+        let response = WyrdErrorResponse::from(WyrdError::from(
+            wyrd_spec::vala::error::BifrostError::PayloadTooLarge {
+                bytes: 41_943_040,
+                limit: 8_388_608,
+            },
+        ))
+        .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("problem body reads");
+        let problem: serde_json::Value =
+            serde_json::from_slice(&body).expect("problem body is JSON");
+
+        assert_eq!(problem["code"], "WYRD_VALA_413_PAYLOAD_TOO_LARGE");
+        assert_eq!(problem["status"], 413);
+        assert_eq!(
+            problem["details"]["data"]["bytes"], 41_943_040,
+            "measured bytes must survive HTTP: {problem}"
+        );
+        assert_eq!(
+            problem["details"]["data"]["limit"], 8_388_608,
+            "the enforced limit must survive HTTP: {problem}"
+        );
+        let detail = problem["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("41943040") && detail.contains("8388608"),
+            "detail must name both bounds: {problem}"
+        );
+        let remediation = problem["remediation"].as_str().unwrap_or_default();
+        assert!(
+            !remediation.contains("32 MiB") && remediation.contains("limit"),
+            "remediation must point at the supplied limit: {problem}"
+        );
     }
 
     #[test]
@@ -457,7 +542,7 @@ mod error_mapper_tests {
     fn permission_deny_reason_maps_to_rbac_problem_details() {
         let principal = PrincipalId::new(uuid::Uuid::now_v7());
         let error = permission_deny_reason_to_wyrd(PermissionDenyReason::Rbac {
-            required: Permission::card_write(),
+            required: Box::new(Permission::card_write()),
             principal,
         });
         let problem = error.as_problem_json();

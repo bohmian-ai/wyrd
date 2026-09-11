@@ -11,6 +11,9 @@ build/
 .vite/
 dist/
 
+# Native addon build artifacts (compiled outputs, never commit)
+*.node
+
 # Python / uv / maturin
 __pycache__/
 *.pyc
@@ -48,6 +51,7 @@ crates/vala/vala-bifrost/benches/reports/*.json
 # Agent tools
 .codegraph
 
-
 **/evidence/
 **/.vitest/
+.omp
+*.node

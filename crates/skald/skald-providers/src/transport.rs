@@ -41,7 +41,18 @@ pub struct HttpTransport {
 
 impl HttpTransport {
     /// Builds a reqwest client with the supplied provider-safe defaults.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::Upstream`] when another Rustls provider already
+    /// owns the process or Reqwest cannot build the client. Invalid user-agent
+    /// values are returned as provider decode errors.
     pub fn new(config: TransportConfig) -> ProviderResult<Self> {
+        wyrd_tls::install_crypto_provider().map_err(|error| ProviderError::Upstream {
+            provider: "transport".to_owned(),
+            status: 0,
+            body: error.to_string(),
+        })?;
         let mut headers = HeaderMap::new();
         let user_agent = HeaderValue::from_str(&config.user_agent)
             .map_err(|error| ProviderError::decode("transport", error))?;

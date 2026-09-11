@@ -408,89 +408,6 @@ impl IssuingKey {
     }
 }
 
-/// Domain separator for audit-seal Ed25519 signatures.
-///
-/// Distinct from the JWT issuing key: the audit-seal key is provisioned
-/// separately and signs only audit-log checkpoint ranges.
-pub const AUDIT_SEAL_DOMAIN: &[u8] = b"wyrd.audit.seal.v1\0";
-
-/// Dedicated Ed25519 signing and verification key for audit log sealing.
-///
-/// Not the JWT issuing key — a separate key provisioned for the `vala_audit_seal`
-/// role. Loaded from the `WYRD_AUDIT_SEAL_KEY` environment variable (PKCS#8 PEM).
-/// Sign with [`AuditSealKey::sign`]; verify with [`AuditSealKey::verify`].
-pub struct AuditSealKey {
-    signing: SigningKey,
-}
-
-/// Audit seal error.
-#[derive(Debug, thiserror::Error)]
-pub enum AuditSealError {
-    /// PEM decode or key parse failed.
-    #[error("audit seal key invalid: {0}")]
-    InvalidKey(String),
-    /// Signature verification failed.
-    #[error("audit seal signature invalid")]
-    InvalidSignature,
-}
-
-impl AuditSealKey {
-    /// Load an Ed25519 audit-seal key from PKCS#8 PEM bytes.
-    ///
-    /// # Errors
-    /// Returns [`AuditSealError::InvalidKey`] when the PEM is not a valid
-    /// PKCS#8 Ed25519 private key.
-    pub fn from_pkcs8_pem(pem: &str) -> Result<Self, AuditSealError> {
-        SigningKey::from_pkcs8_pem(pem)
-            .map(|signing| Self { signing })
-            .map_err(|e| AuditSealError::InvalidKey(e.to_string()))
-    }
-
-    /// Generate an ephemeral key for tests.
-    ///
-    /// # Errors
-    /// Returns [`AuditSealError::InvalidKey`] if encoding fails (not expected
-    /// for a freshly generated key).
-    pub fn generate() -> Result<Self, AuditSealError> {
-        let pem = SigningKey::generate(&mut OsRng)
-            .to_pkcs8_pem(LineEnding::LF)
-            .map_err(|e| AuditSealError::InvalidKey(e.to_string()))?;
-        Self::from_pkcs8_pem(&pem)
-    }
-
-    /// Sign a message with the domain separator prepended.
-    ///
-    /// `msg` is the range hash (SHA256 over ordered audit log column bytes).
-    #[must_use]
-    pub fn sign(&self, msg: &[u8]) -> Vec<u8> {
-        use ed25519_dalek::Signer as _;
-        let mut payload = Vec::with_capacity(AUDIT_SEAL_DOMAIN.len() + msg.len());
-        payload.extend_from_slice(AUDIT_SEAL_DOMAIN);
-        payload.extend_from_slice(msg);
-        self.signing.sign(&payload).to_bytes().to_vec()
-    }
-
-    /// Verify a signature produced by [`AuditSealKey::sign`].
-    ///
-    /// # Errors
-    /// Returns [`AuditSealError::InvalidSignature`] when the signature does
-    /// not verify, is the wrong length, or was produced by a different key.
-    pub fn verify(&self, msg: &[u8], sig_bytes: &[u8]) -> Result<(), AuditSealError> {
-        use ed25519_dalek::Verifier as _;
-        let sig_arr: [u8; 64] = sig_bytes
-            .try_into()
-            .map_err(|_| AuditSealError::InvalidSignature)?;
-        let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
-        let mut payload = Vec::with_capacity(AUDIT_SEAL_DOMAIN.len() + msg.len());
-        payload.extend_from_slice(AUDIT_SEAL_DOMAIN);
-        payload.extend_from_slice(msg);
-        self.signing
-            .verifying_key()
-            .verify(&payload, &sig)
-            .map_err(|_| AuditSealError::InvalidSignature)
-    }
-}
-
 /// Hash a raw API key for at-rest storage.
 ///
 /// # Errors
@@ -580,8 +497,8 @@ mod tests {
     use wyrd_spec::reference::{CardRef, CardRefScope};
 
     use super::{
-        ARGON2_M_COST_KIB, AUDIT_SEAL_DOMAIN, AuditSealKey, DelegationCaller, IssueError,
-        IssuingKey, Kid, MAX_DELEGATION_DEPTH, hash_api_key, verify_api_key,
+        ARGON2_M_COST_KIB, DelegationCaller, IssueError, IssuingKey, Kid, MAX_DELEGATION_DEPTH,
+        hash_api_key, verify_api_key,
     };
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
@@ -886,51 +803,6 @@ mod tests {
         let raw = SecretString::from("wyrd_test_key");
 
         assert!(!verify_api_key(&raw, "not-a-phc-hash"));
-    }
-
-    /// Nested module so the gate filter
-    /// `wyrd_auth_issue::audit_seal_sign_verifies_and_is_domain_separated`
-    /// is a substring of the full test path
-    /// `tests::wyrd_auth_issue::audit_seal_sign_verifies_and_is_domain_separated`.
-    mod wyrd_auth_issue {
-        use super::{AUDIT_SEAL_DOMAIN, AuditSealKey};
-
-        #[test]
-        fn audit_seal_sign_verifies_and_is_domain_separated() {
-            let key = AuditSealKey::generate().expect("ephemeral key generates");
-            let msg = b"sha256-range-hash-bytes-32-padded!";
-
-            let sig = key.sign(msg);
-            key.verify(msg, &sig).expect("valid signature verifies");
-
-            // Wrong message fails.
-            let tampered = b"sha256-range-hash-bytes-32-padded?";
-            assert!(
-                key.verify(tampered, &sig).is_err(),
-                "tampered message must not verify"
-            );
-
-            // Wrong key fails.
-            let other_key = AuditSealKey::generate().expect("second key generates");
-            assert!(
-                other_key.verify(msg, &sig).is_err(),
-                "signature must not verify under a different key"
-            );
-
-            // Domain separation: signing `domain || msg` double-applies the domain
-            // (stored payload is `domain || domain || msg`); the resulting signature
-            // must not verify for the original `msg` payload.
-            let domain_prepended_msg: Vec<u8> = AUDIT_SEAL_DOMAIN
-                .iter()
-                .chain(msg.iter())
-                .copied()
-                .collect();
-            let double_domain_sig = key.sign(&domain_prepended_msg);
-            assert!(
-                key.verify(msg, &double_domain_sig).is_err(),
-                "double-domain payload must not verify as single-domain message"
-            );
-        }
     }
 
     #[test]

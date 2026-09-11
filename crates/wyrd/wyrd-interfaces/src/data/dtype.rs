@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 use std::path::Path;
+use wyrd_spec::error::WyrdError;
 
 #[cfg(feature = "python")]
 use {
@@ -17,7 +18,8 @@ use {
     wyrd_utils::py::pyobject_to_json,
 };
 
-use crate::error::{CardPyResult, WyrdPyError};
+#[cfg(feature = "python")]
+use wyrd_utils::py::WyrdPyResult;
 
 /// Detected Python data source family used to build a `DataInterface`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,7 +75,7 @@ pub fn is_parquet_path(path: &Path) -> bool {
 /// # Errors
 /// Returns `WYRD_DATA_400_UNKNOWN_DATA_TYPE` when the token is not in the
 /// locked dtype table.
-pub fn normalize_dtype(source: &str, value: &str) -> CardPyResult<String> {
+pub fn normalize_dtype(source: &str, value: &str) -> Result<String, WyrdError> {
     let source = source.trim().to_ascii_lowercase();
     let value = normalize_token(value);
     match source.as_str() {
@@ -96,7 +98,7 @@ pub fn infer_schema_for_interface(
     py: Python<'_>,
     data: &Bound<'_, PyAny>,
     kind: &str,
-) -> CardPyResult<DataSchema> {
+) -> WyrdPyResult<DataSchema> {
     match kind {
         "Pandas" => infer_pandas_schema(data),
         "Polars" => infer_polars_schema(data),
@@ -106,9 +108,10 @@ pub fn infer_schema_for_interface(
         "Torch" => infer_torch_schema(data),
         "Jsonl" => infer_jsonl_schema(py, data),
         "Sql" | "Image" | "Text" | "Huggingface" => Ok(DataSchema::empty()),
-        _ => Err(WyrdPyError::unknown_data_type(format!(
+        _ => Err(crate::error::unknown_data_type(format!(
             "unknown DataCard interface kind: {kind}"
-        ))),
+        ))
+        .into()),
     }
 }
 
@@ -126,13 +129,13 @@ pub fn dtype_string_from_py(
     _py: Python<'_>,
     source: &str,
     obj: &Bound<'_, PyAny>,
-) -> CardPyResult<String> {
+) -> WyrdPyResult<String> {
     let dtype = if source.eq_ignore_ascii_case("numpy") {
         numpy_dtype_string(obj)?
     } else {
         obj.str()?.extract::<String>()?
     };
-    normalize_dtype(source, &dtype)
+    normalize_dtype(source, &dtype).map_err(Into::into)
 }
 
 /// Infer ordered Wyrd field specs from a supported Python data object.
@@ -145,7 +148,7 @@ pub fn dtype_string_from_py(
 /// Returns a Wyrd Python-boundary error when the object is unsupported or its
 /// dtype/shape cannot be inspected.
 #[cfg(feature = "python")]
-pub fn fields_from_py(py: Python<'_>, data: &Bound<'_, PyAny>) -> CardPyResult<Vec<FieldSpec>> {
+pub fn fields_from_py(py: Python<'_>, data: &Bound<'_, PyAny>) -> WyrdPyResult<Vec<FieldSpec>> {
     if is_pandas_dataframe(py, data)? {
         return Ok(infer_pandas_schema(data)?.columns);
     }
@@ -161,24 +164,24 @@ pub fn fields_from_py(py: Python<'_>, data: &Bound<'_, PyAny>) -> CardPyResult<V
     if is_torch_tensor(py, data)? {
         return Ok(infer_torch_schema(data)?.columns);
     }
-    Err(WyrdPyError::unknown_data_type(
+    Err(crate::error::unknown_data_type(
         "expected pandas.DataFrame, polars.DataFrame, pyarrow.Table, numpy.ndarray, or torch.Tensor",
-    ))
+    ).into())
 }
 
 /// Infer the canonical dtype for a `NumPy` object when present.
 #[cfg(feature = "python")]
-pub fn numpy_dtype(py: Python<'_>, data: Option<&Py<PyAny>>) -> Option<CardPyResult<String>> {
+pub fn numpy_dtype(py: Python<'_>, data: Option<&Py<PyAny>>) -> Option<WyrdPyResult<String>> {
     data.map(|value| {
         let bound = value.bind(py);
         let dtype = numpy_dtype_string(bound)?;
-        normalize_dtype("numpy", &dtype)
+        normalize_dtype("numpy", &dtype).map_err(Into::into)
     })
 }
 
 /// Infer the shape for a `NumPy` object when present.
 #[cfg(feature = "python")]
-pub fn numpy_shape(py: Python<'_>, data: Option<&Py<PyAny>>) -> Option<CardPyResult<Vec<i64>>> {
+pub fn numpy_shape(py: Python<'_>, data: Option<&Py<PyAny>>) -> Option<WyrdPyResult<Vec<i64>>> {
     data.map(|value| shape_values(value.bind(py)))
 }
 
@@ -187,7 +190,7 @@ pub fn numpy_shape(py: Python<'_>, data: Option<&Py<PyAny>>) -> Option<CardPyRes
 /// Detection order is locked: pandas, polars, pyarrow, numpy, torch,
 /// `HuggingFace` datasets, SQL dict, then path-like dispatch.
 #[cfg(feature = "python")]
-pub fn detect_data_source(py: Python<'_>, data: &Bound<'_, PyAny>) -> CardPyResult<DataSourceKind> {
+pub fn detect_data_source(py: Python<'_>, data: &Bound<'_, PyAny>) -> WyrdPyResult<DataSourceKind> {
     if is_pandas_dataframe(py, data)? {
         return Ok(DataSourceKind::Pandas);
     }
@@ -225,14 +228,15 @@ pub fn detect_data_source(py: Python<'_>, data: &Bound<'_, PyAny>) -> CardPyResu
             };
         }
     }
-    Err(WyrdPyError::unknown_data_type(
+    Err(crate::error::unknown_data_type(
         "DataCard requires a supported data object, SQL dictionary, or data path",
-    ))
+    )
+    .into())
 }
 
 /// Return true when a Python object can be coerced through `os.fspath`.
 #[cfg(feature = "python")]
-pub fn is_path_like(py: Python<'_>, data: &Bound<'_, PyAny>) -> CardPyResult<bool> {
+pub fn is_path_like(py: Python<'_>, data: &Bound<'_, PyAny>) -> WyrdPyResult<bool> {
     if data.is_instance_of::<PyString>() {
         return Ok(true);
     }
@@ -245,7 +249,7 @@ pub fn is_path_like(py: Python<'_>, data: &Bound<'_, PyAny>) -> CardPyResult<boo
 
 /// Coerce a Python string or path-like object into a local path.
 #[cfg(feature = "python")]
-pub fn extract_pathbuf(data: &Bound<'_, PyAny>) -> CardPyResult<PathBuf> {
+pub fn extract_pathbuf(data: &Bound<'_, PyAny>) -> WyrdPyResult<PathBuf> {
     if data.is_instance_of::<PyString>() {
         return Ok(PathBuf::from(data.extract::<String>()?));
     }
@@ -256,54 +260,56 @@ pub fn extract_pathbuf(data: &Bound<'_, PyAny>) -> CardPyResult<PathBuf> {
 
 /// Infer a JSONL compression label from a Python path-like object.
 #[cfg(feature = "python")]
-pub fn jsonl_compression_from_path(data: &Bound<'_, PyAny>) -> CardPyResult<String> {
+pub fn jsonl_compression_from_path(data: &Bound<'_, PyAny>) -> WyrdPyResult<String> {
     let path = extract_pathbuf(data)?;
     jsonl_compression_for_path(&path)
         .map(str::to_string)
         .ok_or_else(|| {
-            WyrdPyError::validation_with_details(
+            crate::error::validation_with_details(
                 "JSONL data paths must end with .jsonl, .jsonl.gz, or .jsonl.zst",
                 serde_json::json!({ "path": path.to_string_lossy() }),
             )
         })
+        .map_err(Into::into)
 }
 
 /// Require a `pandas.DataFrame`.
 #[cfg(feature = "python")]
-pub fn ensure_pandas_dataframe(py: Python<'_>, data: &Bound<'_, PyAny>) -> CardPyResult<()> {
+pub fn ensure_pandas_dataframe(py: Python<'_>, data: &Bound<'_, PyAny>) -> WyrdPyResult<()> {
     ensure_kind(py, data, DataSourceKind::Pandas, "pandas.DataFrame")
 }
 
 /// Require a `polars.DataFrame`.
 #[cfg(feature = "python")]
-pub fn ensure_polars_dataframe(py: Python<'_>, data: &Bound<'_, PyAny>) -> CardPyResult<()> {
+pub fn ensure_polars_dataframe(py: Python<'_>, data: &Bound<'_, PyAny>) -> WyrdPyResult<()> {
     ensure_kind(py, data, DataSourceKind::Polars, "polars.DataFrame")
 }
 
 /// Require a `pyarrow.Table`.
 #[cfg(feature = "python")]
-pub fn ensure_pyarrow_table(py: Python<'_>, data: &Bound<'_, PyAny>) -> CardPyResult<()> {
+pub fn ensure_pyarrow_table(py: Python<'_>, data: &Bound<'_, PyAny>) -> WyrdPyResult<()> {
     ensure_kind(py, data, DataSourceKind::Arrow, "pyarrow.Table")
 }
 
 /// Require a `numpy.ndarray`.
 #[cfg(feature = "python")]
-pub fn ensure_numpy_array(py: Python<'_>, data: &Bound<'_, PyAny>) -> CardPyResult<()> {
+pub fn ensure_numpy_array(py: Python<'_>, data: &Bound<'_, PyAny>) -> WyrdPyResult<()> {
     ensure_kind(py, data, DataSourceKind::Numpy, "numpy.ndarray")
 }
 
 /// Require a `torch.Tensor` or mapping of tensor values.
 #[cfg(feature = "python")]
-pub fn ensure_torch_tensor_or_mapping(py: Python<'_>, data: &Bound<'_, PyAny>) -> CardPyResult<()> {
+pub fn ensure_torch_tensor_or_mapping(py: Python<'_>, data: &Bound<'_, PyAny>) -> WyrdPyResult<()> {
     if is_torch_tensor(py, data)? {
         return Ok(());
     }
     if data.is_instance_of::<PyDict>() || (data.hasattr("keys")? && data.hasattr("items")?) {
         return Ok(());
     }
-    Err(WyrdPyError::unknown_data_type(
-        "expected a torch.Tensor or mapping of tensor values",
-    ))
+    Err(
+        crate::error::unknown_data_type("expected a torch.Tensor or mapping of tensor values")
+            .into(),
+    )
 }
 
 #[cfg(feature = "python")]
@@ -312,13 +318,11 @@ fn ensure_kind(
     data: &Bound<'_, PyAny>,
     kind: DataSourceKind,
     expected: &str,
-) -> CardPyResult<()> {
+) -> WyrdPyResult<()> {
     if detect_data_source(py, data)? == kind {
         Ok(())
     } else {
-        Err(WyrdPyError::unknown_data_type(format!(
-            "expected {expected}"
-        )))
+        Err(crate::error::unknown_data_type(format!("expected {expected}")).into())
     }
 }
 
@@ -336,7 +340,7 @@ pub fn is_framework_class(
     data: &Bound<'_, PyAny>,
     module_name: &str,
     class_name: &str,
-) -> CardPyResult<bool> {
+) -> WyrdPyResult<bool> {
     let module = match py.import(module_name) {
         Ok(module) => module,
         Err(error) if error.is_instance_of::<PyModuleNotFoundError>(py) => return Ok(false),
@@ -347,32 +351,32 @@ pub fn is_framework_class(
 }
 
 #[cfg(feature = "python")]
-fn is_pandas_dataframe(py: Python<'_>, data: &Bound<'_, PyAny>) -> CardPyResult<bool> {
+fn is_pandas_dataframe(py: Python<'_>, data: &Bound<'_, PyAny>) -> WyrdPyResult<bool> {
     is_framework_class(py, data, "pandas", "DataFrame")
 }
 
 #[cfg(feature = "python")]
-fn is_polars_dataframe(py: Python<'_>, data: &Bound<'_, PyAny>) -> CardPyResult<bool> {
+fn is_polars_dataframe(py: Python<'_>, data: &Bound<'_, PyAny>) -> WyrdPyResult<bool> {
     is_framework_class(py, data, "polars", "DataFrame")
 }
 
 #[cfg(feature = "python")]
-fn is_pyarrow_table(py: Python<'_>, data: &Bound<'_, PyAny>) -> CardPyResult<bool> {
+fn is_pyarrow_table(py: Python<'_>, data: &Bound<'_, PyAny>) -> WyrdPyResult<bool> {
     is_framework_class(py, data, "pyarrow", "Table")
 }
 
 #[cfg(feature = "python")]
-fn is_numpy_array(py: Python<'_>, data: &Bound<'_, PyAny>) -> CardPyResult<bool> {
+fn is_numpy_array(py: Python<'_>, data: &Bound<'_, PyAny>) -> WyrdPyResult<bool> {
     is_framework_class(py, data, "numpy", "ndarray")
 }
 
 #[cfg(feature = "python")]
-fn is_torch_tensor(py: Python<'_>, data: &Bound<'_, PyAny>) -> CardPyResult<bool> {
+fn is_torch_tensor(py: Python<'_>, data: &Bound<'_, PyAny>) -> WyrdPyResult<bool> {
     is_framework_class(py, data, "torch", "Tensor")
 }
 
 #[cfg(feature = "python")]
-fn is_huggingface_dataset(py: Python<'_>, data: &Bound<'_, PyAny>) -> CardPyResult<bool> {
+fn is_huggingface_dataset(py: Python<'_>, data: &Bound<'_, PyAny>) -> WyrdPyResult<bool> {
     is_framework_class(py, data, "datasets", "Dataset")
 }
 
@@ -410,7 +414,7 @@ fn path_stem_has_extension(path: &Path, expected: &str) -> bool {
         .is_some_and(|stem| path_has_extension(stem, expected))
 }
 
-fn normalize_pandas_dtype(value: &str) -> CardPyResult<String> {
+fn normalize_pandas_dtype(value: &str) -> Result<String, WyrdError> {
     let value = value.to_ascii_lowercase();
     match value.as_str() {
         "int8" | "int16" | "int32" | "int64" | "uint8" | "uint16" | "uint32" | "uint64"
@@ -424,7 +428,7 @@ fn normalize_pandas_dtype(value: &str) -> CardPyResult<String> {
     }
 }
 
-fn normalize_polars_dtype(value: &str) -> CardPyResult<String> {
+fn normalize_polars_dtype(value: &str) -> Result<String, WyrdError> {
     let lower = value.to_ascii_lowercase();
     match value {
         "Int8" | "Int16" | "Int32" | "Int64" | "UInt8" | "UInt16" | "UInt32" | "UInt64"
@@ -454,7 +458,7 @@ fn normalize_polars_dtype(value: &str) -> CardPyResult<String> {
     Err(unknown_dtype("polars", value))
 }
 
-fn normalize_pyarrow_dtype(value: &str) -> CardPyResult<String> {
+fn normalize_pyarrow_dtype(value: &str) -> Result<String, WyrdError> {
     let lower = value.to_ascii_lowercase();
     match lower.as_str() {
         "int8" | "int8type" => Ok("int8".to_string()),
@@ -490,7 +494,7 @@ fn normalize_pyarrow_dtype(value: &str) -> CardPyResult<String> {
     }
 }
 
-fn normalize_numpy_dtype(value: &str) -> CardPyResult<String> {
+fn normalize_numpy_dtype(value: &str) -> Result<String, WyrdError> {
     match value {
         "int8" | "int16" | "int32" | "int64" | "uint8" | "uint16" | "uint32" | "uint64"
         | "float16" | "float32" | "float64" => Ok(value.to_string()),
@@ -511,7 +515,7 @@ fn normalize_numpy_dtype(value: &str) -> CardPyResult<String> {
     }
 }
 
-fn normalize_torch_dtype(value: &str) -> CardPyResult<String> {
+fn normalize_torch_dtype(value: &str) -> Result<String, WyrdError> {
     let value = value.strip_prefix("torch.").unwrap_or(value);
     match value {
         "int8" | "int16" | "int32" | "int64" | "uint8" | "float16" | "bfloat16" | "float32"
@@ -524,8 +528,8 @@ fn normalize_token(value: &str) -> Cow<'_, str> {
     Cow::Owned(value.trim().replace(' ', ""))
 }
 
-fn unknown_dtype(source: &str, value: &str) -> WyrdPyError {
-    WyrdPyError::unknown_data_type(format!("unsupported {source} dtype: {value}"))
+fn unknown_dtype(source: &str, value: &str) -> WyrdError {
+    crate::error::unknown_data_type(format!("unsupported {source} dtype: {value}"))
 }
 
 fn parse_call_one_arg(value: &str, name: &str) -> Option<String> {
@@ -554,13 +558,13 @@ fn parse_polars_datetime(value: &str) -> Option<(String, Option<String>)> {
     Some((unit, timezone))
 }
 
-fn normalize_arrow_timestamp(value: &str) -> CardPyResult<String> {
+fn normalize_arrow_timestamp(value: &str) -> Result<String, WyrdError> {
     let inner =
         parse_square_inner(value, "timestamp").ok_or_else(|| unknown_dtype("pyarrow", value))?;
     Ok(format!("timestamp[{}]", normalize_timestamp_inner(inner)))
 }
 
-fn normalize_arrow_timestamp_call(value: &str) -> CardPyResult<String> {
+fn normalize_arrow_timestamp_call(value: &str) -> Result<String, WyrdError> {
     let inner = parse_wrapped(value, "Timestamp", '(', ')')
         .or_else(|| parse_wrapped(value, "TimestampType", '(', ')'))
         .or_else(|| parse_wrapped(value, "timestamptype", '(', ')'))
@@ -586,7 +590,7 @@ fn normalize_timestamp_inner(inner: &str) -> String {
     }
 }
 
-fn normalize_arrow_dictionary(value: &str) -> CardPyResult<String> {
+fn normalize_arrow_dictionary(value: &str) -> Result<String, WyrdError> {
     let inner =
         parse_bracket_inner(value, "dictionary").ok_or_else(|| unknown_dtype("pyarrow", value))?;
     let parts = split_top_level(inner, ',');
@@ -608,7 +612,7 @@ fn normalize_arrow_dictionary(value: &str) -> CardPyResult<String> {
     ))
 }
 
-fn normalize_arrow_dictionary_call(value: &str) -> CardPyResult<String> {
+fn normalize_arrow_dictionary_call(value: &str) -> Result<String, WyrdError> {
     let inner = parse_wrapped(value, "DictionaryType", '(', ')')
         .or_else(|| parse_wrapped(value, "dictionarytype", '(', ')'))
         .ok_or_else(|| unknown_dtype("pyarrow", value))?;
@@ -623,7 +627,7 @@ fn normalize_arrow_dictionary_call(value: &str) -> CardPyResult<String> {
     ))
 }
 
-fn normalize_arrow_list(value: &str) -> CardPyResult<String> {
+fn normalize_arrow_list(value: &str) -> Result<String, WyrdError> {
     let inner = parse_bracket_inner(value, "list")
         .or_else(|| parse_bracket_inner(value, "large_list"))
         .ok_or_else(|| unknown_dtype("pyarrow", value))?;
@@ -631,7 +635,7 @@ fn normalize_arrow_list(value: &str) -> CardPyResult<String> {
     Ok(format!("list<{}>", normalize_pyarrow_dtype(dtype)?))
 }
 
-fn normalize_arrow_list_call(value: &str) -> CardPyResult<String> {
+fn normalize_arrow_list_call(value: &str) -> Result<String, WyrdError> {
     let inner = parse_wrapped(value, "ListType", '(', ')')
         .or_else(|| parse_wrapped(value, "LargeListType", '(', ')'))
         .or_else(|| parse_wrapped(value, "listtype", '(', ')'))
@@ -640,20 +644,20 @@ fn normalize_arrow_list_call(value: &str) -> CardPyResult<String> {
     Ok(format!("list<{}>", normalize_pyarrow_dtype(inner)?))
 }
 
-fn normalize_arrow_struct(value: &str) -> CardPyResult<String> {
+fn normalize_arrow_struct(value: &str) -> Result<String, WyrdError> {
     let inner =
         parse_bracket_inner(value, "struct").ok_or_else(|| unknown_dtype("pyarrow", value))?;
     normalize_struct_fields(inner, "pyarrow")
 }
 
-fn normalize_arrow_struct_call(value: &str) -> CardPyResult<String> {
+fn normalize_arrow_struct_call(value: &str) -> Result<String, WyrdError> {
     let inner = parse_wrapped(value, "StructType", '(', ')')
         .or_else(|| parse_wrapped(value, "structtype", '(', ')'))
         .ok_or_else(|| unknown_dtype("pyarrow", value))?;
     normalize_struct_fields(inner, "pyarrow")
 }
 
-fn normalize_struct_fields(fields: &str, source: &str) -> CardPyResult<String> {
+fn normalize_struct_fields(fields: &str, source: &str) -> Result<String, WyrdError> {
     let fields = fields
         .trim()
         .strip_prefix('{')
@@ -672,7 +676,7 @@ fn normalize_struct_fields(fields: &str, source: &str) -> CardPyResult<String> {
                 normalize_dtype(source, dtype)?
             ))
         })
-        .collect::<CardPyResult<Vec<String>>>()?;
+        .collect::<Result<Vec<String>, WyrdError>>()?;
     Ok(format!("struct<{}>", values.join(", ")))
 }
 
@@ -721,28 +725,28 @@ fn trim_quotes(value: &str) -> &str {
 }
 
 #[cfg(feature = "python")]
-fn infer_pandas_schema(data: &Bound<'_, PyAny>) -> CardPyResult<DataSchema> {
+fn infer_pandas_schema(data: &Bound<'_, PyAny>) -> WyrdPyResult<DataSchema> {
     let dtypes = data
         .getattr("dtypes")
-        .map_err(|_| WyrdPyError::validation("PandasInterface data must be a pandas.DataFrame"))?;
+        .map_err(|_| crate::error::validation("PandasInterface data must be a pandas.DataFrame"))?;
     let items = dtypes.call_method0("items")?;
     schema_from_items(&items, "pandas")
 }
 
 #[cfg(feature = "python")]
-fn infer_polars_schema(data: &Bound<'_, PyAny>) -> CardPyResult<DataSchema> {
+fn infer_polars_schema(data: &Bound<'_, PyAny>) -> WyrdPyResult<DataSchema> {
     let items = data.getattr("schema")?.call_method0("items")?;
     schema_from_items(&items, "polars")
 }
 
 #[cfg(feature = "python")]
-fn infer_arrow_schema(data: &Bound<'_, PyAny>) -> CardPyResult<DataSchema> {
+fn infer_arrow_schema(data: &Bound<'_, PyAny>) -> WyrdPyResult<DataSchema> {
     let schema = data.getattr("schema")?;
     infer_pyarrow_schema_object(&schema)
 }
 
 #[cfg(feature = "python")]
-fn infer_parquet_path_schema(py: Python<'_>, data: &Bound<'_, PyAny>) -> CardPyResult<DataSchema> {
+fn infer_parquet_path_schema(py: Python<'_>, data: &Bound<'_, PyAny>) -> WyrdPyResult<DataSchema> {
     let path = extract_pathbuf(data)?;
     let schema = py
         .import("pyarrow.parquet")?
@@ -751,7 +755,7 @@ fn infer_parquet_path_schema(py: Python<'_>, data: &Bound<'_, PyAny>) -> CardPyR
 }
 
 #[cfg(feature = "python")]
-fn infer_pyarrow_schema_object(schema: &Bound<'_, PyAny>) -> CardPyResult<DataSchema> {
+fn infer_pyarrow_schema_object(schema: &Bound<'_, PyAny>) -> WyrdPyResult<DataSchema> {
     let names = schema.getattr("names")?.extract::<Vec<String>>()?;
     let types = schema.getattr("types")?;
     let mut fields = Vec::new();
@@ -767,7 +771,7 @@ fn infer_pyarrow_schema_object(schema: &Bound<'_, PyAny>) -> CardPyResult<DataSc
 }
 
 #[cfg(feature = "python")]
-fn infer_jsonl_schema(_py: Python<'_>, data: &Bound<'_, PyAny>) -> CardPyResult<DataSchema> {
+fn infer_jsonl_schema(_py: Python<'_>, data: &Bound<'_, PyAny>) -> WyrdPyResult<DataSchema> {
     let sample = if is_path_like(data.py(), data)? {
         let path = extract_pathbuf(data)?;
         let first_line = read_first_jsonl_line(&path)?;
@@ -797,7 +801,7 @@ fn infer_jsonl_schema(_py: Python<'_>, data: &Bound<'_, PyAny>) -> CardPyResult<
 }
 
 #[cfg(feature = "python")]
-fn read_first_jsonl_line(path: &Path) -> CardPyResult<String> {
+fn read_first_jsonl_line(path: &Path) -> WyrdPyResult<String> {
     use std::io::{BufRead, BufReader};
     // BLOCKING: synchronous filesystem I/O; do not call from an async executor
     // without tokio::task::spawn_blocking.
@@ -807,15 +811,16 @@ fn read_first_jsonl_line(path: &Path) -> CardPyResult<String> {
             BufReader::new(file),
         ))),
         Some("zstd") => Box::new(BufReader::new(
-            zstd::Decoder::new(file).map_err(|e| WyrdPyError::Io(e.to_string()))?,
+            zstd::Decoder::new(file).map_err(|e| crate::error::io_error(&e))?,
         )),
         Some("none") | None => Box::new(BufReader::new(file)),
         Some(value) => {
-            return Err(WyrdPyError::invalid_interface_option(
+            return Err(crate::error::invalid_interface_option(
                 "compression",
                 value,
                 ["none", "gzip", "zstd"],
-            ));
+            )
+            .into());
         }
     };
     let mut line = String::new();
@@ -823,7 +828,7 @@ fn read_first_jsonl_line(path: &Path) -> CardPyResult<String> {
         line.clear();
         let n = reader
             .read_line(&mut line)
-            .map_err(|e| WyrdPyError::Io(e.to_string()))?;
+            .map_err(|e| crate::error::io_error(&e))?;
         if n == 0 {
             return Ok(String::new());
         }
@@ -847,7 +852,7 @@ fn json_value_dtype(value: &Value) -> String {
 }
 
 #[cfg(feature = "python")]
-fn infer_numpy_schema(data: &Bound<'_, PyAny>) -> CardPyResult<DataSchema> {
+fn infer_numpy_schema(data: &Bound<'_, PyAny>) -> WyrdPyResult<DataSchema> {
     let dtype = numpy_dtype_string(data)?;
     Ok(DataSchema::new(vec![field_spec(
         "value",
@@ -857,7 +862,7 @@ fn infer_numpy_schema(data: &Bound<'_, PyAny>) -> CardPyResult<DataSchema> {
 }
 
 #[cfg(feature = "python")]
-fn infer_torch_schema(data: &Bound<'_, PyAny>) -> CardPyResult<DataSchema> {
+fn infer_torch_schema(data: &Bound<'_, PyAny>) -> WyrdPyResult<DataSchema> {
     let dtype = data.getattr("dtype")?.str()?.extract::<String>()?;
     Ok(DataSchema::new(vec![field_spec(
         "value",
@@ -867,7 +872,7 @@ fn infer_torch_schema(data: &Bound<'_, PyAny>) -> CardPyResult<DataSchema> {
 }
 
 #[cfg(feature = "python")]
-fn schema_from_items(items: &Bound<'_, PyAny>, source: &str) -> CardPyResult<DataSchema> {
+fn schema_from_items(items: &Bound<'_, PyAny>, source: &str) -> WyrdPyResult<DataSchema> {
     let mut fields = Vec::new();
     for item in items.try_iter()? {
         let item = item?;
@@ -884,7 +889,7 @@ fn schema_from_items(items: &Bound<'_, PyAny>, source: &str) -> CardPyResult<Dat
 }
 
 #[cfg(feature = "python")]
-fn shape_dims(data: &Bound<'_, PyAny>) -> CardPyResult<Vec<Dim>> {
+fn shape_dims(data: &Bound<'_, PyAny>) -> WyrdPyResult<Vec<Dim>> {
     Ok(shape_values(data)?
         .into_iter()
         .map(Dim::Fixed)
@@ -892,7 +897,7 @@ fn shape_dims(data: &Bound<'_, PyAny>) -> CardPyResult<Vec<Dim>> {
 }
 
 #[cfg(feature = "python")]
-fn shape_values(data: &Bound<'_, PyAny>) -> CardPyResult<Vec<i64>> {
+fn shape_values(data: &Bound<'_, PyAny>) -> WyrdPyResult<Vec<i64>> {
     let shape = data.getattr("shape")?;
     let mut values = Vec::new();
     for dim in shape.try_iter()? {
@@ -902,7 +907,7 @@ fn shape_values(data: &Bound<'_, PyAny>) -> CardPyResult<Vec<i64>> {
 }
 
 #[cfg(feature = "python")]
-fn numpy_dtype_string(data: &Bound<'_, PyAny>) -> CardPyResult<String> {
+fn numpy_dtype_string(data: &Bound<'_, PyAny>) -> WyrdPyResult<String> {
     let dtype = data.getattr("dtype")?;
     if let Ok(dtype_string) = dtype.extract::<String>() {
         return Ok(dtype_string);
@@ -918,9 +923,9 @@ fn numpy_dtype_string(data: &Bound<'_, PyAny>) -> CardPyResult<String> {
 }
 
 #[cfg(feature = "python")]
-fn field_spec(name: &str, dtype: String, shape: Vec<Dim>) -> CardPyResult<FieldSpec> {
+fn field_spec(name: &str, dtype: String, shape: Vec<Dim>) -> WyrdPyResult<FieldSpec> {
     let name = ColumnName::new(name).map_err(|source| {
-        WyrdPyError::validation_with_details(
+        crate::error::validation_with_details(
             "DataCard schema column name is invalid",
             serde_json::json!({
                 "column": name,
@@ -940,7 +945,6 @@ fn field_spec(name: &str, dtype: String, shape: Vec<Dim>) -> CardPyResult<FieldS
 #[cfg(test)]
 mod tests {
     use super::{is_parquet_path, jsonl_compression_for_path, normalize_dtype};
-    use crate::error::WyrdPyError;
     use std::path::Path;
     use wyrd_spec::card::field::is_canonical_dtype;
 
@@ -1093,9 +1097,6 @@ mod tests {
     #[test]
     fn normalize_unknown_dtype_returns_wyrd_error_code() {
         let error = normalize_dtype("numpy", "complex64").unwrap_err();
-        let WyrdPyError::Spec(error) = error else {
-            panic!("unknown dtype should map to a public WyrdError");
-        };
         assert_eq!(error.code(), "WYRD_DATA_400_UNKNOWN_DATA_TYPE");
     }
 

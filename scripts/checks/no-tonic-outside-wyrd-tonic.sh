@@ -17,14 +17,14 @@ set -e
 
 # 1. Manifest declarations must only appear in wyrd-tonic and workspace root
 ! rg -n --no-heading \
-    -e '^[[:space:]]*(tonic|tonic-health|tonic-reflection|prost)[[:space:]]*=' \
+    -e '^[[:space:]]*(tonic|tonic-health|tonic-reflection|tonic-types|tonic-build|tonic-prost|tonic-prost-build|prost)[[:space:]]*=' \
     --glob '!crates/wyrd/wyrd-tonic/Cargo.toml' \
     --glob '!Cargo.toml' \
     crates/ python/
 
 # 1a. Renamed-dep evasion (package = "tonic")
 ! rg -n --no-heading \
-    -e 'package[[:space:]]*=[[:space:]]*"(tonic|tonic-health|tonic-reflection|prost)"' \
+    -e 'package[[:space:]]*=[[:space:]]*"(tonic|tonic-health|tonic-reflection|tonic-types|tonic-build|tonic-prost|tonic-prost-build|prost)"' \
     --glob '!crates/wyrd/wyrd-tonic/Cargo.toml' \
     --glob '!Cargo.toml' \
     crates/ python/
@@ -45,6 +45,9 @@ set -e
 rg -q -e '^[[:space:]]*tonic[[:space:]]*=' Cargo.toml
 rg -q -e '^[[:space:]]*tonic-health[[:space:]]*=' Cargo.toml
 rg -q -e '^[[:space:]]*tonic-reflection[[:space:]]*=' Cargo.toml
+rg -q -e '^[[:space:]]*tonic-types[[:space:]]*=' Cargo.toml
+rg -q -e '^[[:space:]]*tonic-prost[[:space:]]*=' Cargo.toml
+rg -q -e '^[[:space:]]*tonic-prost-build[[:space:]]*=' Cargo.toml
 rg -q -e '^[[:space:]]*prost[[:space:]]*=' Cargo.toml
 
 # 4. wyrd-server consumes wyrd-tonic with features = ["server"]

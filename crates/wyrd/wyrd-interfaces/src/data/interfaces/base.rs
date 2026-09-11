@@ -1,4 +1,5 @@
-use crate::error::{CardPyResult, WyrdPyError};
+#[cfg(feature = "python")]
+use wyrd_utils::py::WyrdPyResult;
 
 #[cfg(feature = "python")]
 use {
@@ -100,12 +101,12 @@ impl DataInterface {
     fn from_metadata(
         cls: &Bound<'_, PyType>,
         metadata: &Bound<'_, PyAny>,
-    ) -> CardPyResult<Py<PyAny>> {
+    ) -> WyrdPyResult<Py<PyAny>> {
         let _ = metadata;
         Ok(cls
             .call0()
             .map_err(|error| {
-                WyrdPyError::validation(format!(
+                crate::error::validation(format!(
                     "custom DataInterface class could not be reconstructed from metadata with the default from_metadata implementation; override from_metadata(cls, metadata): {error}"
                 ))
             })?
@@ -141,11 +142,12 @@ impl DataInterface {
         &self,
         path: PathBuf,
         save_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<PyDataStats> {
+    ) -> WyrdPyResult<PyDataStats> {
         let _ = (&self.kind, path, save_kwargs);
-        Err(WyrdPyError::validation(
+        Err(crate::error::validation(
             "DataInterface.save must be implemented by a concrete interface",
-        ))
+        )
+        .into())
     }
 
     /// Load custom data from a local `DataCard` artifact directory.
@@ -165,11 +167,12 @@ impl DataInterface {
     /// Always returns `WYRD_DATA_400_VALIDATION` from the base class because
     /// subclasses are required to implement their own load behavior.
     #[pyo3(signature = (path, load_kwargs=None))]
-    fn load(&mut self, path: PathBuf, load_kwargs: Option<&Bound<'_, PyDict>>) -> CardPyResult<()> {
+    fn load(&mut self, path: PathBuf, load_kwargs: Option<&Bound<'_, PyDict>>) -> WyrdPyResult<()> {
         let _ = (&self.kind, path, load_kwargs);
-        Err(WyrdPyError::validation(
+        Err(crate::error::validation(
             "DataInterface.load must be implemented by a concrete interface",
-        ))
+        )
+        .into())
     }
 }
 

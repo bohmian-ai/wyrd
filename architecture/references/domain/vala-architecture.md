@@ -64,9 +64,11 @@ semantics.
   physical tables with caller-supplied tenant predicates are forbidden.
 - Server-owned system columns and `(wyrd_batch_id, wyrd_row_ordinal)` survive
   WAL, staging, Parquet, Iceberg promotion, Forge rewrite, and query unchanged.
-- A Card is the declared subject. A Run is one client execution. An Observation
-  retains the authenticated tenant, authorized `card_ref`, opaque `run_id`, and
-  propagated `Wyrd-Request-Id` at the contract grain defined by its table.
+- A Card is an optional declared subject. A Run is one client execution. Every
+  Observation retains authenticated tenant and publisher `principal_id`; when
+  supplied it also retains authorized `card_ref`, resolved `card_uid`, opaque
+  `run_id`, and propagated `Wyrd-Request-Id` at the contract grain defined by
+  its table.
 - `wyrd-spec` remains IO-free and owns wire types. Durable behavior belongs to
   server and Vala owner crates; language bindings remain projections.
 - Every queue, reservation, retry, and cleanup path is bounded. Tenant

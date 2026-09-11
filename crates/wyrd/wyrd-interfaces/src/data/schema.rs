@@ -5,13 +5,14 @@ use wyrd_spec::card::field::FieldSpec;
 
 #[cfg(feature = "python")]
 use {
-    crate::error::{CardPyResult, WyrdPyError},
     pyo3::prelude::*,
     pyo3::types::{PyAny, PyModule},
     serde_json::Value,
     std::collections::BTreeMap,
     wyrd_spec::card::field::Dim,
+    wyrd_spec::error::WyrdError,
     wyrd_spec::ids::ColumnName,
+    wyrd_utils::py::WyrdPyResult,
     wyrd_utils::py::{json_to_pyobject, pyobject_to_json},
 };
 
@@ -68,9 +69,9 @@ impl PyFieldSpec {
         shape: Option<&Bound<'_, PyAny>>,
         nullable: bool,
         extra: Option<BTreeMap<String, String>>,
-    ) -> CardPyResult<Self> {
+    ) -> WyrdPyResult<Self> {
         let name = ColumnName::new(name).map_err(|error| {
-            WyrdPyError::validation_with_details(
+            crate::error::validation_with_details(
                 format!("invalid schema field name: {name}"),
                 serde_json::json!({
                     "field": "name",
@@ -99,7 +100,7 @@ impl PyFieldSpec {
     }
 
     #[getter]
-    fn shape(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+    fn shape(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         Ok(json_to_pyobject(
             py,
             &serde_json::to_value(&self.inner.shape)?,
@@ -107,7 +108,7 @@ impl PyFieldSpec {
     }
 
     #[getter]
-    fn dims(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+    fn dims(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         Ok(json_to_pyobject(
             py,
             &serde_json::to_value(&self.inner.shape)?,
@@ -124,7 +125,7 @@ impl PyFieldSpec {
         self.inner.extra.clone()
     }
 
-    fn to_dict(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+    fn to_dict(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         Ok(json_to_pyobject(py, &serde_json::to_value(&self.inner)?)?)
     }
 }
@@ -176,7 +177,7 @@ impl From<PyDataSchema> for DataSchema {
 impl PyDataSchema {
     #[new]
     #[pyo3(signature = (columns=None))]
-    fn __new__(columns: Option<&Bound<'_, PyAny>>) -> CardPyResult<Self> {
+    fn __new__(columns: Option<&Bound<'_, PyAny>>) -> WyrdPyResult<Self> {
         Ok(Self::from_inner(DataSchema::new(parse_columns(columns)?)))
     }
 
@@ -199,12 +200,12 @@ impl PyDataSchema {
         self.inner.is_empty()
     }
 
-    fn contains_column(&self, name: &str) -> CardPyResult<bool> {
+    fn contains_column(&self, name: &str) -> WyrdPyResult<bool> {
         let name = column_name(name)?;
         Ok(self.inner.contains_column(&name))
     }
 
-    fn column(&self, name: &str) -> CardPyResult<Option<PyFieldSpec>> {
+    fn column(&self, name: &str) -> WyrdPyResult<Option<PyFieldSpec>> {
         let name = column_name(name)?;
         Ok(self.inner.column(&name).cloned().map(PyFieldSpec::from))
     }
@@ -216,7 +217,7 @@ impl PyDataSchema {
             .collect()
     }
 
-    fn to_dict(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+    fn to_dict(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         Ok(json_to_pyobject(py, &serde_json::to_value(&self.inner)?)?)
     }
 }
@@ -230,21 +231,23 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 #[cfg(feature = "python")]
-fn column_name(value: &str) -> CardPyResult<ColumnName> {
-    ColumnName::new(value).map_err(|error| {
-        WyrdPyError::validation_with_details(
-            format!("invalid schema column name: {value}"),
-            serde_json::json!({
-                "field": "name",
-                "value": value,
-                "source": error.to_string(),
-            }),
-        )
-    })
+fn column_name(value: &str) -> WyrdPyResult<ColumnName> {
+    ColumnName::new(value)
+        .map_err(|error| {
+            crate::error::validation_with_details(
+                format!("invalid schema column name: {value}"),
+                serde_json::json!({
+                    "field": "name",
+                    "value": value,
+                    "source": error.to_string(),
+                }),
+            )
+        })
+        .map_err(Into::into)
 }
 
 #[cfg(feature = "python")]
-fn parse_columns(value: Option<&Bound<'_, PyAny>>) -> CardPyResult<Vec<FieldSpec>> {
+fn parse_columns(value: Option<&Bound<'_, PyAny>>) -> WyrdPyResult<Vec<FieldSpec>> {
     let Some(value) = value.filter(|value| !value.is_none()) else {
         return Ok(Vec::new());
     };
@@ -262,7 +265,7 @@ fn parse_columns(value: Option<&Bound<'_, PyAny>>) -> CardPyResult<Vec<FieldSpec
 }
 
 #[cfg(feature = "python")]
-fn parse_dims(value: Option<&Bound<'_, PyAny>>) -> CardPyResult<Vec<Dim>> {
+fn parse_dims(value: Option<&Bound<'_, PyAny>>) -> WyrdPyResult<Vec<Dim>> {
     let Some(value) = value.filter(|value| !value.is_none()) else {
         return Ok(Vec::new());
     };
@@ -270,16 +273,17 @@ fn parse_dims(value: Option<&Bound<'_, PyAny>>) -> CardPyResult<Vec<Dim>> {
 }
 
 #[cfg(feature = "python")]
-fn dims_from_json(value: Value) -> CardPyResult<Vec<Dim>> {
+fn dims_from_json(value: Value) -> WyrdPyResult<Vec<Dim>> {
     match value {
         Value::Array(values) if values.iter().all(Value::is_i64) => values
             .into_iter()
             .map(|value| {
                 value.as_i64().map(Dim::Fixed).ok_or_else(|| {
-                    WyrdPyError::validation("schema dimension values must be signed integers")
+                    crate::error::validation("schema dimension values must be signed integers")
                 })
             })
-            .collect(),
+            .collect::<Result<Vec<Dim>, WyrdError>>()
+            .map_err(Into::into),
         value => Ok(serde_json::from_value(value)?),
     }
 }

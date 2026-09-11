@@ -31,6 +31,7 @@ integration closeout.
   appear exhaustive.
 - This task depends on the integrated server, Scribe, Oracle, and deployment
   owners from TASK-001 and completes before TASK-003 closeout.
+- There is no such thing as a pre-existing failure anymore. All failures must be explicitly handled within the current execution context.
 
 ## Relevant Surface
 

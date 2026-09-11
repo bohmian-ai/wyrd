@@ -1,10 +1,16 @@
 services:
   postgres:
     image: postgres:16
+    command:
+      - postgres
+      - "-c"
+      - "max_connections=400"
+      - "-c"
+      - "shared_buffers=512MB"
     environment:
       POSTGRES_DB: wyrd
-      POSTGRES_USER: wyrd_migrator
-      POSTGRES_PASSWORD: wyrd_migrator_pw
+      POSTGRES_USER: wyrd_test_admin
+      POSTGRES_PASSWORD: wyrd_test_admin_pw
     # Ephemeral test database: keep PGDATA in RAM, not the postgres:16 image's
     # built-in anonymous volume. The anonymous volume survived `compose down`
     # and carried a stale _sqlx_migrations ledger across runs, which broke the
@@ -16,9 +22,9 @@ services:
       - type: tmpfs
         target: /var/lib/postgresql/data
     ports:
-      - "55432:5432"
+      - "127.0.0.1::5432"
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "wyrd_migrator", "-d", "wyrd"]
+      test: ["CMD", "pg_isready", "-U", "wyrd_test_admin", "-d", "wyrd"]
       interval: 2s
       timeout: 3s
       retries: 20

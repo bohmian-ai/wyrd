@@ -4,6 +4,7 @@ mod admin;
 mod card_scope;
 mod issue_key;
 mod oidc;
+mod permission_scope;
 mod principal_id;
 mod principal_kind;
 mod revoke;
@@ -17,6 +18,10 @@ pub use admin::{
 pub use card_scope::CardScope;
 pub use issue_key::{IssueKeyRequest, IssueKeyResponse};
 pub use oidc::{AbsoluteUrl, CallbackQuery, IssuerUrl, LoginInitResponse, UrlParseError};
+pub use permission_scope::{
+    BifrostPermissionScope, BifrostSchemaScope, BifrostTableScope, PermissionScope,
+    PermissionScopeError,
+};
 pub use principal_id::{PLATFORM_AUDIT_PRINCIPAL, PrincipalId};
 pub use principal_kind::PrincipalKindTag;
 pub use revoke::{RevokePrincipalRequest, RevokePrincipalResponse};

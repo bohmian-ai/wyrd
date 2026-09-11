@@ -26,6 +26,7 @@ tracing = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 wyrd-spec = { workspace = true }
 wyrd-tonic = { workspace = true }
+wyrd-tls = { workspace = true }
 wyrd-utils = { workspace = true }
 
 [dev-dependencies]

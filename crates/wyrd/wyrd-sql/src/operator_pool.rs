@@ -5,24 +5,15 @@
 //! enumerate or act across every tenant partition. It is the sole mechanism that
 //! query modules are allowed to hold for cross-tenant SQL; no query fn may take
 //! a bare `&PgPool`.
-//!
-//! Transactions that a cross-tenant operator fn needs are opened here via
-//! `tenant_conn`, which binds a chosen tenant on a transaction drawn from this
-//! BYPASSRLS pool. The same `TenantConn` type is reused so query modules that
-//! issue tenant-scoped SQL remain callable from the operator path without
-//! modification.
 
 use sqlx::PgPool;
-use wyrd_spec::DataTenantId;
-
-use crate::{SqlError, TenantConn};
 
 /// Audited cross-tenant BYPASSRLS Postgres pool handle.
 ///
 /// Wraps the `wyrd_platform_admin` pool. Every cross-tenant / operator /
 /// control-table query fn takes `&OperatorPool` and calls `op.pool()` inline in
-/// the `query!` invocation. Operator transactions (for fns that need to bind a
-/// specific tenant) are opened via `tenant_conn`.
+/// the `query!` invocation. Tenant-scoped transactions remain the responsibility
+/// of [`crate::WyrdPostgres`] or the owning tier's equivalent Postgres handle.
 ///
 /// `None` when no cross-tenant role is configured (single-app or dev setup).
 /// Production boot that requires cross-tenant maintenance fails fast when the
@@ -31,6 +22,20 @@ use crate::{SqlError, TenantConn};
 pub struct OperatorPool(PgPool);
 
 impl OperatorPool {
+    /// Opens one operator-owned transaction for a bounded cross-tenant operation.
+    ///
+    /// The transaction remains borrowed from this handle and is owned by the
+    /// caller until commit or rollback. Query modules use this boundary rather
+    /// than reaching through to the underlying pool and constructing a raw
+    /// transaction themselves.
+    ///
+    /// # Errors
+    /// Returns the database error when PostgreSQL cannot acquire a connection
+    /// or begin the transaction.
+    pub async fn begin(&self) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, sqlx::Error> {
+        self.0.begin().await
+    }
+
     /// Borrow the underlying BYPASSRLS pool.
     ///
     /// Pass the returned reference directly to `query!` / `query_as!` as the
@@ -38,20 +43,6 @@ impl OperatorPool {
     #[must_use]
     pub fn pool(&self) -> &PgPool {
         &self.0
-    }
-
-    /// Open a transaction on the BYPASSRLS pool and bind it to `tenant_id`.
-    ///
-    /// Use this when a cross-tenant worker needs to self-transact for a specific
-    /// tenant — for example a worker that iterates tenants and writes per-tenant
-    /// state. The returned `TenantConn` is identical in shape to one opened via
-    /// `WyrdPostgres::tenant_conn`, so all tenant-scoped query modules remain
-    /// callable without modification.
-    ///
-    /// # Errors
-    /// Returns [`SqlError`] when acquiring or binding the transaction fails.
-    pub async fn tenant_conn(&self, tenant_id: DataTenantId) -> Result<TenantConn<'_>, SqlError> {
-        TenantConn::acquire(&self.0, tenant_id).await
     }
 }
 

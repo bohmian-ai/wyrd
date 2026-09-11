@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RunningQueryProgress",
+  "description": "Aggregate progress for one request-ID-keyed Oracle query.",
+  "type": "object",
+  "required": [
+    "completed_participants",
+    "total_participants"
+  ],
+  "properties": {
+    "completed_participants": {
+      "description": "Number of selected participants that have reported completion.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "total_participants": {
+      "description": "Exact number of participants frozen into the immutable cut.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    }
+  }
+}

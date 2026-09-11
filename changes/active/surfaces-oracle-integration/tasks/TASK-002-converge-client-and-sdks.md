@@ -35,6 +35,7 @@ errors, HTTP/gRPC, MCP, CLI, and generated client contracts agree.
   `BifrostGrpcTransport` as sibling client owners.
 - Do not restore typed observation reads, legacy audit verification,
   `wyrd dev bootstrap`, obsolete error aliases, or live UI behavior.
+- There is no such thing as a pre-existing failure anymore. All failures must be explicitly handled within the current execution context.
 
 ## Relevant Surface
 

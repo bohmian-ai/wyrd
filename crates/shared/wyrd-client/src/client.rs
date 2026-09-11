@@ -18,6 +18,7 @@ use std::sync::Arc;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::request_id::RequestId;
 
 use crate::auth::AuthMiddleware;
 use crate::config::ClientConfig;
@@ -224,6 +225,48 @@ impl WyrdClient {
     ) -> Result<reqwest::Response, WyrdError> {
         self.http
             .request_external_stream(method, url, body, headers)
+            .await
+    }
+
+    /// Send an authenticated JSON request and preserve the response as a
+    /// streaming body for incremental protocol decoding.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable Wyrd error for serialization, authentication,
+    /// transport, HTTP problem, or response media-type failures.
+    pub async fn request_json_stream<S>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: &S,
+    ) -> Result<reqwest::Response, WyrdError>
+    where
+        S: Serialize,
+    {
+        self.http.request_json_stream(method, path, body).await
+    }
+
+    /// Sends a streaming JSON request with a caller-owned request ID and verifies its echo.
+    ///
+    /// Cancelling this future before return abandons connection setup. After
+    /// return, dropping the response stops unbuffered body consumption.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable request, authentication, transport, response, or ID-mismatch error.
+    pub async fn request_json_stream_with_id<S>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: &S,
+        request_id: &RequestId,
+    ) -> Result<reqwest::Response, WyrdError>
+    where
+        S: Serialize,
+    {
+        self.http
+            .request_json_stream_with_id(method, path, body, request_id)
             .await
     }
 

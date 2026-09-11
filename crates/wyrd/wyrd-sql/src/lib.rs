@@ -146,8 +146,12 @@ impl SqlStore {
     /// This does not run migrations.
     ///
     /// # Errors
-    /// Returns [`SqlError::Connect`] when the database connection fails.
+    /// Returns [`SqlError::Connect`] when another Rustls provider already owns
+    /// the process or the database connection fails. Cancellation may leave
+    /// connections opened by SQLx for the pool to close during drop.
     pub async fn connect(database_url: &str, max_connections: u32) -> Result<Self, SqlError> {
+        wyrd_tls::install_crypto_provider()
+            .map_err(|error| SqlError::Connect(sqlx::Error::Configuration(Box::new(error))))?;
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
             .connect(database_url)
@@ -161,8 +165,10 @@ impl SqlStore {
     /// This does not run migrations.
     ///
     /// # Errors
-    /// Returns [`SqlError::Connect`] when the DSN cannot be parsed or the
-    /// database connection fails.
+    /// Returns [`SqlError::Connect`] when another Rustls provider already owns
+    /// the process, the DSN cannot be parsed, or the database connection fails.
+    /// Cancellation may leave connections opened by SQLx for the pool to close
+    /// during drop.
     pub async fn connect_with(database_url: &str, config: PoolConfig) -> Result<Self, SqlError> {
         let pool = pool::connect_pool(database_url, config)
             .await
@@ -406,6 +412,41 @@ mod tests {
         );
     }
 
+    /// Joins a prose source into one whitespace-normalized line.
+    ///
+    /// The documentation assertions below look for whole sentences, but every
+    /// source they read is hard-wrapped Markdown or rustdoc. Matching the raw
+    /// text makes the assertion depend on where the wrap happens to fall, so a
+    /// pure reflow that changes no words breaks the test. Each line therefore
+    /// sheds its rustdoc marker — a wrap inside a `//!` block would otherwise
+    /// leave the marker sitting mid-sentence — and every run of whitespace
+    /// collapses to a single space, so the comparison sees the sentence rather
+    /// than its line breaks.
+    fn unwrapped(source: &str) -> String {
+        source
+            .lines()
+            .map(|line| {
+                line.trim_start()
+                    .trim_start_matches("//!")
+                    .trim_start_matches("///")
+            })
+            .flat_map(str::split_whitespace)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Verifies the transaction invariants stay stated where callers read them.
+    ///
+    /// The rule these guard is architectural, not compilable: one `TenantConn`
+    /// per tenant-scoped logical operation, and no cross-crate transaction
+    /// built by importing another crate's query modules. The sibling tests
+    /// enforce the code side; this one keeps the architecture doc, the
+    /// `TenantConn` rustdoc, and the query-module doc from quietly dropping the
+    /// statement a reader relies on.
+    ///
+    /// # Panics
+    /// Panics when any of the three sources is unreadable, or when one of them
+    /// no longer states its invariant.
     #[test]
     fn transaction_discipline_is_documented() {
         let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -413,19 +454,42 @@ mod tests {
             .ancestors()
             .nth(3)
             .expect("crate lives three levels below repo root");
-        let sql_foundation =
-            fs::read_to_string(repo_dir.join("architecture/v1/00-foundations/sql-foundation.md"))
-                .expect("SQL foundation architecture doc is readable");
-        let tenant_conn = fs::read_to_string(crate_dir.join("src/tenant_conn.rs"))
-            .expect("TenantConn is readable");
-        let queries_doc = fs::read_to_string(crate_dir.join("src/queries/mod.rs"))
-            .expect("query module doc is readable");
+        let sql_foundation = unwrapped(
+            &fs::read_to_string(repo_dir.join("architecture/v1/00-foundations/sql-foundation.md"))
+                .expect("SQL foundation architecture doc is readable"),
+        );
+        let tenant_conn = unwrapped(
+            &fs::read_to_string(crate_dir.join("src/tenant_conn.rs"))
+                .expect("TenantConn is readable"),
+        );
+        let queries_doc = unwrapped(
+            &fs::read_to_string(crate_dir.join("src/queries/mod.rs"))
+                .expect("query module doc is readable"),
+        );
 
-        assert!(sql_foundation.contains("Every tenant-scoped logical operation opens exactly one"));
-        assert!(sql_foundation.contains("Cross-crate transactional coordination is not supported"));
-        assert!(tenant_conn.contains("transaction boundary for one tenant-scoped logical"));
-        assert!(tenant_conn.contains("operation. Handlers and workers"));
-        assert!(queries_doc.contains("future outbox path"));
+        for (source, label, sentence) in [
+            (
+                &sql_foundation,
+                "sql-foundation.md",
+                "tenant-scoped logical operation acquires one `TenantConn`",
+            ),
+            (
+                &sql_foundation,
+                "sql-foundation.md",
+                "Cross-crate work does not extend a transaction by importing another crate's",
+            ),
+            (
+                &tenant_conn,
+                "tenant_conn.rs",
+                "transaction boundary for one tenant-scoped logical operation. Handlers and workers",
+            ),
+            (&queries_doc, "queries/mod.rs", "future outbox path"),
+        ] {
+            assert!(
+                source.contains(sentence),
+                "{label} must still state: {sentence}"
+            );
+        }
     }
 
     #[test]
@@ -443,7 +507,6 @@ mod tests {
         for table in [
             "wyrd.storage_multipart_uploads",
             "wyrd.storage_artifact_metadata",
-            "wyrd.storage_access_ledger",
             "wyrd.storage_idempotency_keys",
         ] {
             assert!(
@@ -451,6 +514,11 @@ mod tests {
                 "storage migration must create or configure {table}"
             );
         }
+        let removed_access_table = ["storage_access", "_ledger"].concat();
+        assert!(
+            !migrations.contains(&removed_access_table),
+            "storage migration set must not contain the removed access ledger"
+        );
 
         let forbidden_parts_table = ["storage_multipart_upload", "_parts"].concat();
         assert!(
@@ -500,11 +568,6 @@ mod tests {
                 "GRANT SELECT ON wyrd.storage_artifact_metadata TO wyrd_platform_admin;",
             ),
             (
-                "wyrd.storage_access_ledger",
-                "GRANT SELECT, INSERT ON wyrd.storage_access_ledger TO wyrd_app;",
-                "GRANT SELECT, INSERT ON wyrd.storage_access_ledger TO wyrd_platform_admin;",
-            ),
-            (
                 "wyrd.storage_idempotency_keys",
                 "GRANT SELECT, INSERT, UPDATE ON wyrd.storage_idempotency_keys TO wyrd_app;",
                 "GRANT SELECT, DELETE ON wyrd.storage_idempotency_keys TO wyrd_platform_admin;",
@@ -540,27 +603,6 @@ mod tests {
                 "storage migrations must not leave broad grant shape: {forbidden}"
             );
         }
-
-        assert!(
-            migrations.contains(
-                "REVOKE ALL ON SEQUENCE wyrd.storage_access_ledger_id_seq FROM wyrd_app;"
-            ),
-            "ledger sequence must revoke inherited app privileges before narrow grant"
-        );
-        assert!(
-            migrations.contains(
-                "REVOKE ALL ON SEQUENCE wyrd.storage_access_ledger_id_seq FROM wyrd_platform_admin;"
-            ),
-            "ledger sequence must revoke inherited platform-admin privileges before narrow grant"
-        );
-        assert!(
-            migrations.contains(
-                "GRANT USAGE, SELECT ON SEQUENCE wyrd.storage_access_ledger_id_seq TO wyrd_app;"
-            ) && migrations.contains(
-                "GRANT USAGE, SELECT ON SEQUENCE wyrd.storage_access_ledger_id_seq TO wyrd_platform_admin;"
-            ),
-            "ledger inserts require narrow sequence usage grants"
-        );
     }
 
     #[test]

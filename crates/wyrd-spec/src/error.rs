@@ -2394,6 +2394,328 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// Agent tool lookup found no registered tool with the requested name.
+    #[error("[WYRD_AGENT_404_TOOL] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AGENT_404_TOOL",
+        status = 404,
+        title = "Tool not registered for agent",
+        remediation = "Register the tool before running the agent or remove the tool call from the provider response."
+    )]
+    AgentToolNotFound {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// The model requested a registered tool that is not attached to this agent.
+    #[error("[WYRD_AGENT_404_TOOL_NOT_IN_AGENT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AGENT_404_TOOL_NOT_IN_AGENT",
+        status = 404,
+        title = "Tool not attached to agent",
+        remediation = "Attach the runtime-local tool to this agent or adjust the model response."
+    )]
+    AgentToolNotInAgent {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// The agent's bound provider differs from the provider the rendered prompt targets.
+    #[error("[WYRD_AGENT_409_PROVIDER_MISMATCH] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AGENT_409_PROVIDER_MISMATCH",
+        status = 409,
+        title = "Provider mismatch",
+        remediation = "Run the agent with a prompt targeting the same provider as the agent's resolved prompt."
+    )]
+    AgentProviderMismatch {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Agent-as-tool delegation exceeded the configured nesting depth.
+    #[error("[WYRD_AGENT_412_DELEGATION_DEPTH] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AGENT_412_DELEGATION_DEPTH",
+        status = 412,
+        title = "Agent delegation depth exceeded",
+        remediation = "Reduce nested agent-as-tool calls or restructure the workflow so the delegation chain stays within the cap."
+    )]
+    AgentDelegationDepth {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// An agent constructor or method argument failed validation.
+    #[error("[WYRD_AGENT_422_INVALID_ARGUMENT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AGENT_422_INVALID_ARGUMENT",
+        status = 422,
+        title = "Invalid argument",
+        remediation = "Correct the argument value; see details for the expected type or constraint."
+    )]
+    AgentInvalidArgument {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Prompt rendering or provider projection failed before the agent loop started.
+    #[error("[WYRD_AGENT_422_PROMPT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AGENT_422_PROMPT",
+        status = 422,
+        title = "Agent prompt rendering failed",
+        remediation = "Inspect the prompt template and the variables passed to the agent run."
+    )]
+    AgentPromptRender {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A structured-output agent run returned a response that is not a JSON object.
+    #[error("[WYRD_AGENT_422_STRUCTURED_DECODE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AGENT_422_STRUCTURED_DECODE",
+        status = 422,
+        title = "Structured response decode failed",
+        remediation = "Inspect the model output; structured-output prompts must return a JSON object."
+    )]
+    AgentStructuredDecode {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Tool argument validation rejected a provider-emitted call payload.
+    #[error("[WYRD_AGENT_422_TOOL_ARGS] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AGENT_422_TOOL_ARGS",
+        status = 422,
+        title = "Tool arguments invalid",
+        remediation = "Adjust the provider-emitted tool arguments to match the tool input schema."
+    )]
+    AgentToolArgs {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A user-supplied agent callback panicked during the run.
+    #[error("[WYRD_AGENT_500_CALLBACK_PANIC] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AGENT_500_CALLBACK_PANIC",
+        status = 500,
+        title = "User-supplied callback panicked",
+        remediation = "Inspect the panic payload and fix the callback implementation; callbacks must not panic."
+    )]
+    AgentCallbackPanic {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// The agent journal backend refused an event append.
+    #[error("[WYRD_AGENT_500_JOURNAL] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AGENT_500_JOURNAL",
+        status = 500,
+        title = "Journal append failed",
+        remediation = "Inspect the journal backend; for the no-op journal this should never fire."
+    )]
+    AgentJournalAppend {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// The bounded agent loop reached its iteration cap without terminating.
+    #[error("[WYRD_AGENT_500_MAX_ITERATIONS] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AGENT_500_MAX_ITERATIONS",
+        status = 500,
+        title = "Agent exceeded max iterations",
+        remediation = "Raise the run's max_iterations or adjust the agent prompt and tools so the loop can terminate."
+    )]
+    AgentMaxIterations {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A model-provider call made on behalf of the agent failed.
+    #[error("[WYRD_AGENT_502_PROVIDER] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AGENT_502_PROVIDER",
+        status = 502,
+        title = "Provider call failed",
+        remediation = "Inspect the provider backend and retry once it is healthy."
+    )]
+    AgentProviderCall {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// The agent run exceeded its configured wall-clock timeout.
+    #[error("[WYRD_AGENT_504_TIMEOUT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AGENT_504_TIMEOUT",
+        status = 504,
+        title = "Agent run exceeded configured timeout",
+        remediation = "Increase the run timeout or reduce iteration count and tool latency."
+    )]
+    AgentTimeout {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Session memory could not append a conversation turn.
+    #[error("[WYRD_SESSION_500_APPEND] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SESSION_500_APPEND",
+        status = 500,
+        title = "Session memory append failed",
+        remediation = "Inspect the session backend and ensure the caller has write permission for the session."
+    )]
+    SessionAppendFailed {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Session memory could not fetch the recent conversation turns.
+    #[error("[WYRD_SESSION_500_RECENT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SESSION_500_RECENT",
+        status = 500,
+        title = "Session memory recent fetch failed",
+        remediation = "Inspect the session backend; ensure it is reachable and the session id exists."
+    )]
+    SessionRecentFailed {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A tool declaration failed name, description, or JSON-schema validation.
+    #[error("[WYRD_TOOL_400_INVALID_SCHEMA] {message}")]
+    #[wyrd_error(
+        code = "WYRD_TOOL_400_INVALID_SCHEMA",
+        status = 400,
+        title = "Tool declaration malformed",
+        remediation = "Inspect the tool declaration name, description, and JSON input schema."
+    )]
+    ToolInvalidSchema {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Tool resolution found no registered tool with the requested name.
+    #[error("[WYRD_TOOL_404_NOT_REGISTERED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_TOOL_404_NOT_REGISTERED",
+        status = 404,
+        title = "Tool name not registered",
+        remediation = "Register the tool before resolving it, or check the name against the registry's available tools."
+    )]
+    ToolNotRegistered {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Tool registration collided with a name the registry already holds.
+    #[error("[WYRD_TOOL_409_NAME_TAKEN] {message}")]
+    #[wyrd_error(
+        code = "WYRD_TOOL_409_NAME_TAKEN",
+        status = 409,
+        title = "Tool name already registered",
+        remediation = "Pick a unique tool name or clear the registry before registering the replacement."
+    )]
+    ToolNameTaken {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Provider-emitted JSON did not deserialize into the tool's declared input type.
+    #[error("[WYRD_TOOL_422_INPUT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_TOOL_422_INPUT",
+        status = 422,
+        title = "Tool invocation input did not match the declared input schema",
+        remediation = "Adjust the tool call arguments to match the schema the tool declares."
+    )]
+    ToolInvalidInput {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// The tool implementation itself failed while executing an invocation.
+    #[error("[WYRD_TOOL_500_CALL] {message}")]
+    #[wyrd_error(
+        code = "WYRD_TOOL_500_CALL",
+        status = 500,
+        title = "Tool invocation failed during execution",
+        remediation = "Check the tool's underlying cause and fix the tool implementation or its inputs."
+    )]
+    ToolInvocationFailed {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Tool output failed JSON serialization after a successful invocation.
+    #[error("[WYRD_TOOL_500_OUTPUT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_TOOL_500_OUTPUT",
+        status = 500,
+        title = "Tool output could not be serialized to JSON",
+        remediation = "Ensure the tool output type serializes to a JSON-compatible value."
+    )]
+    ToolOutputSerialization {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Runtime dispatch found no provider client registered for the request target.
+    #[error("[WYRD_RUNTIME_404_PROVIDER] {message}")]
+    #[wyrd_error(
+        code = "WYRD_RUNTIME_404_PROVIDER",
+        status = 404,
+        title = "Provider not registered in the runtime",
+        remediation = "Register a provider client for the requested provider before dispatching the request."
+    )]
+    RuntimeProviderNotRegistered {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Provider output failed validation against the prompt's response schema.
+    #[error("[WYRD_RUNTIME_422_RESPONSE_DECODE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_RUNTIME_422_RESPONSE_DECODE",
+        status = 422,
+        title = "Provider response did not match the prompt schema",
+        remediation = "Inspect the provider output against the prompt's declared response schema."
+    )]
+    RuntimeResponseDecode {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// WorkflowCard validation failed.
     #[error("[WYRD_WORKFLOW_422_VALIDATION] {message}")]
     #[wyrd_error(
@@ -2473,6 +2795,146 @@ pub enum WyrdError {
         remediation = "Break the dependency cycle by removing or reordering depends_on edges."
     )]
     WorkflowCycle {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A workflow task referenced an agent id the workflow does not define.
+    #[error("[WYRD_WORKFLOW_404_AGENT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_WORKFLOW_404_AGENT",
+        status = 404,
+        title = "Workflow agent not found",
+        remediation = "Add the referenced agent to the workflow or correct the task's agent id."
+    )]
+    WorkflowAgentNotFound {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A workflow lookup referenced an unknown task id.
+    #[error("[WYRD_WORKFLOW_404_TASK] {message}")]
+    #[wyrd_error(
+        code = "WYRD_WORKFLOW_404_TASK",
+        status = 404,
+        title = "Workflow task not found",
+        remediation = "Correct the task id; it must match a task defined in the workflow."
+    )]
+    WorkflowTaskNotFound {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A step prompt referenced a variable absent from both workflow input and upstream output.
+    #[error("[WYRD_WORKFLOW_422_MISSING_PARAMETER] {message}")]
+    #[wyrd_error(
+        code = "WYRD_WORKFLOW_422_MISSING_PARAMETER",
+        status = 422,
+        title = "Workflow step parameter unresolved",
+        remediation = "Supply the variable in the workflow input or produce it from an upstream step."
+    )]
+    WorkflowMissingParameter {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A workflow task produced output that failed its declared response-schema validation.
+    #[error("[WYRD_WORKFLOW_422_OUTPUT_SCHEMA] {message}")]
+    #[wyrd_error(
+        code = "WYRD_WORKFLOW_422_OUTPUT_SCHEMA",
+        status = 422,
+        title = "Workflow task output failed schema validation",
+        remediation = "Align the task's model output with the response schema its prompt declares."
+    )]
+    WorkflowOutputSchema {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A workflow task's agent run completed without a consumable final provider response.
+    #[error("[WYRD_WORKFLOW_500_AGENT_RESPONSE_MISSING] {message}")]
+    #[wyrd_error(
+        code = "WYRD_WORKFLOW_500_AGENT_RESPONSE_MISSING",
+        status = 500,
+        title = "Workflow agent run produced no final response",
+        remediation = "Inspect the task's agent run; the workflow needs a final provider response to continue."
+    )]
+    WorkflowAgentResponseMissing {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// The workflow user surface raised a boundary failure with no more specific code.
+    #[error("[WYRD_WORKFLOW_500_INTERNAL] {message}")]
+    #[wyrd_error(
+        code = "WYRD_WORKFLOW_500_INTERNAL",
+        status = 500,
+        title = "Workflow surface failed internally",
+        remediation = "Inspect the workflow run logs; the failure detail names the internal boundary that failed."
+    )]
+    WorkflowInternal {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// The workflow scheduler could not acquire a task lock.
+    #[error("[WYRD_WORKFLOW_500_LOCK] {message}")]
+    #[wyrd_error(
+        code = "WYRD_WORKFLOW_500_LOCK",
+        status = 500,
+        title = "Workflow task lock acquisition failed",
+        remediation = "Retry the workflow run; a poisoned or contended task lock prevented scheduling."
+    )]
+    WorkflowLock {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A workflow task exhausted its configured retry budget.
+    #[error("[WYRD_WORKFLOW_500_MAX_RETRIES] {message}")]
+    #[wyrd_error(
+        code = "WYRD_WORKFLOW_500_MAX_RETRIES",
+        status = 500,
+        title = "Workflow task exceeded max retries",
+        remediation = "Raise the task's retry budget or fix the underlying task failure it kept hitting."
+    )]
+    WorkflowMaxRetries {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// No workflow task is ready to run yet the workflow is not complete.
+    #[error("[WYRD_WORKFLOW_500_STALLED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_WORKFLOW_500_STALLED",
+        status = 500,
+        title = "Workflow stalled with pending tasks",
+        remediation = "Inspect the pending task ids in details; their dependencies can never become ready."
+    )]
+    WorkflowStalled {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// No message conversion exists between the upstream and downstream task providers.
+    #[error("[WYRD_WORKFLOW_501_UNSUPPORTED_HANDOFF] {message}")]
+    #[wyrd_error(
+        code = "WYRD_WORKFLOW_501_UNSUPPORTED_HANDOFF",
+        status = 501,
+        title = "Unsupported workflow provider handoff",
+        remediation = "Keep adjacent workflow tasks on providers with a supported message conversion."
+    )]
+    WorkflowUnsupportedHandoff {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
@@ -2717,6 +3179,104 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// Structural validation rejected a client configuration field.
+    #[error("[WYRD_CLIENT_400_CONFIG_INVALID] {message}")]
+    #[wyrd_error(
+        code = "WYRD_CLIENT_400_CONFIG_INVALID",
+        status = 400,
+        title = "Client configuration is invalid",
+        remediation = "Correct the client configuration field named in details and rebuild the client."
+    )]
+    ClientConfigInvalid {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// The client credential chain produced no usable credential.
+    #[error("[WYRD_CLIENT_401_NO_CREDENTIALS] {message}")]
+    #[wyrd_error(
+        code = "WYRD_CLIENT_401_NO_CREDENTIALS",
+        status = 401,
+        title = "No client credentials available",
+        remediation = "Set WYRD_ACCESS_TOKEN, WYRD_WORKLOAD_TOKEN with WYRD_TENANT, or WYRD_API_KEY, pass an explicit client credential, or add a default api_key to the Wyrd credentials file."
+    )]
+    ClientNoCredentials {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A sealed batch, or a single row, cannot fit under the client's max_message_bytes.
+    #[error("[WYRD_CLIENT_413_PAYLOAD_TOO_LARGE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_CLIENT_413_PAYLOAD_TOO_LARGE",
+        status = 413,
+        title = "Sealed batch exceeds the client message ceiling",
+        remediation = "Reduce the row or batch size, or raise max_message_bytes within the server's accepted ceiling."
+    )]
+    ClientPayloadTooLarge {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A query result row failed to deserialize into the caller's row type.
+    #[error("[WYRD_CLIENT_422_ROW_DESERIALIZATION] {message}")]
+    #[wyrd_error(
+        code = "WYRD_CLIENT_422_ROW_DESERIALIZATION",
+        status = 422,
+        title = "Query row deserialization failed",
+        remediation = "Align the caller's row type with the columns and types the query selects."
+    )]
+    ClientRowDeserialization {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// The bounded client ingestion queue could not accept the row after bounded backoff.
+    #[error("[WYRD_CLIENT_429_QUEUE_FULL] {message}")]
+    #[wyrd_error(
+        code = "WYRD_CLIENT_429_QUEUE_FULL",
+        status = 429,
+        title = "Client ingestion queue is saturated",
+        remediation = "Slow the producer, raise the queue capacity, or flush more often; every refusal bumps the drop counter."
+    )]
+    ClientQueueFull {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// The client transport could not reach the server; DNS, TCP, TLS, or connect failed.
+    #[error("[WYRD_CLIENT_503_TRANSPORT_DOWN] {message}")]
+    #[wyrd_error(
+        code = "WYRD_CLIENT_503_TRANSPORT_DOWN",
+        status = 503,
+        title = "Client transport is unavailable",
+        remediation = "Verify the endpoint, DNS, TLS material, and network reachability, then retry once the transport recovers."
+    )]
+    ClientTransportDown {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A flush or shutdown drain could not finish its in-flight send before the deadline.
+    #[error("[WYRD_CLIENT_504_FLUSH_TIMEOUT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_CLIENT_504_FLUSH_TIMEOUT",
+        status = 504,
+        title = "Client flush exceeded its drain deadline",
+        remediation = "Increase flush_timeout_ms or reduce the in-flight batch size so the drain can complete."
+    )]
+    ClientFlushTimeout {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
 }
 
 impl WyrdError {
@@ -2912,7 +3472,47 @@ impl WyrdError {
             | Self::EvalInvalidLease { message, details }
             | Self::EvalSubmissionMismatch { message, details }
             | Self::EvalRunFailed { message, details }
-            | Self::EvalTooManyRuns { message, details } => {
+            | Self::EvalTooManyRuns { message, details }
+            | Self::AgentToolNotFound { message, details }
+            | Self::AgentToolNotInAgent { message, details }
+            | Self::AgentProviderMismatch { message, details }
+            | Self::AgentDelegationDepth { message, details }
+            | Self::AgentInvalidArgument { message, details }
+            | Self::AgentPromptRender { message, details }
+            | Self::AgentStructuredDecode { message, details }
+            | Self::AgentToolArgs { message, details }
+            | Self::AgentCallbackPanic { message, details }
+            | Self::AgentJournalAppend { message, details }
+            | Self::AgentMaxIterations { message, details }
+            | Self::AgentProviderCall { message, details }
+            | Self::AgentTimeout { message, details }
+            | Self::SessionAppendFailed { message, details }
+            | Self::SessionRecentFailed { message, details }
+            | Self::ToolInvalidSchema { message, details }
+            | Self::ToolNotRegistered { message, details }
+            | Self::ToolNameTaken { message, details }
+            | Self::ToolInvalidInput { message, details }
+            | Self::ToolInvocationFailed { message, details }
+            | Self::ToolOutputSerialization { message, details }
+            | Self::RuntimeProviderNotRegistered { message, details }
+            | Self::RuntimeResponseDecode { message, details }
+            | Self::WorkflowAgentNotFound { message, details }
+            | Self::WorkflowTaskNotFound { message, details }
+            | Self::WorkflowMissingParameter { message, details }
+            | Self::WorkflowOutputSchema { message, details }
+            | Self::WorkflowAgentResponseMissing { message, details }
+            | Self::WorkflowInternal { message, details }
+            | Self::WorkflowLock { message, details }
+            | Self::WorkflowMaxRetries { message, details }
+            | Self::WorkflowStalled { message, details }
+            | Self::WorkflowUnsupportedHandoff { message, details }
+            | Self::ClientConfigInvalid { message, details }
+            | Self::ClientNoCredentials { message, details }
+            | Self::ClientPayloadTooLarge { message, details }
+            | Self::ClientRowDeserialization { message, details }
+            | Self::ClientQueueFull { message, details }
+            | Self::ClientTransportDown { message, details }
+            | Self::ClientFlushTimeout { message, details } => {
                 (Cow::Borrowed(message.as_str()), details.clone())
             }
             Self::Storage { error } => (
@@ -3237,6 +3837,122 @@ impl From<skald_spec::SkaldError> for WyrdError {
 #[cfg(test)]
 mod tests {
     use super::WyrdError;
+
+    /// Every stable code a public Python owner emits today, in the order the
+    /// owning crate lists it. Each entry pairs the catalog code with the HTTP
+    /// status its owner already reports, so a silent status change is a test
+    /// failure rather than a wire-visible regression.
+    const PYTHON_BOUNDARY_CODES: &[(&str, u16)] = &[
+        ("WYRD_AGENT_404_TOOL", 404),
+        ("WYRD_AGENT_404_TOOL_NOT_IN_AGENT", 404),
+        ("WYRD_AGENT_409_PROVIDER_MISMATCH", 409),
+        ("WYRD_AGENT_412_DELEGATION_DEPTH", 412),
+        ("WYRD_AGENT_422_INVALID_ARGUMENT", 422),
+        ("WYRD_AGENT_422_LOOP_MESSAGE_TYPE", 422),
+        ("WYRD_AGENT_422_PROMPT", 422),
+        ("WYRD_AGENT_422_STRUCTURED_DECODE", 422),
+        ("WYRD_AGENT_422_TOOL_ARGS", 422),
+        ("WYRD_AGENT_500_CALLBACK_PANIC", 500),
+        ("WYRD_AGENT_500_JOURNAL", 500),
+        ("WYRD_AGENT_500_MAX_ITERATIONS", 500),
+        ("WYRD_AGENT_502_PROVIDER", 502),
+        ("WYRD_AGENT_504_TIMEOUT", 504),
+        ("WYRD_SESSION_500_APPEND", 500),
+        ("WYRD_SESSION_500_RECENT", 500),
+        ("WYRD_TOOL_400_INVALID_SCHEMA", 400),
+        ("WYRD_TOOL_404_NOT_REGISTERED", 404),
+        ("WYRD_TOOL_409_NAME_TAKEN", 409),
+        ("WYRD_TOOL_422_INPUT", 422),
+        ("WYRD_TOOL_500_CALL", 500),
+        ("WYRD_TOOL_500_OUTPUT", 500),
+        ("WYRD_RUNTIME_404_PROVIDER", 404),
+        ("WYRD_RUNTIME_422_RESPONSE_DECODE", 422),
+        ("WYRD_WORKFLOW_404_AGENT", 404),
+        ("WYRD_WORKFLOW_404_TASK", 404),
+        ("WYRD_WORKFLOW_422_CYCLE", 422),
+        ("WYRD_WORKFLOW_422_DUPLICATE_STEP_ID", 422),
+        ("WYRD_WORKFLOW_422_MISSING_DEPENDENCY", 422),
+        ("WYRD_WORKFLOW_422_MISSING_PARAMETER", 422),
+        ("WYRD_WORKFLOW_422_OUTPUT_SCHEMA", 422),
+        ("WYRD_WORKFLOW_500_AGENT_RESPONSE_MISSING", 500),
+        ("WYRD_WORKFLOW_500_INTERNAL", 500),
+        ("WYRD_WORKFLOW_500_LOCK", 500),
+        ("WYRD_WORKFLOW_500_MAX_RETRIES", 500),
+        ("WYRD_WORKFLOW_500_STALLED", 500),
+        ("WYRD_WORKFLOW_501_UNSUPPORTED_HANDOFF", 501),
+        ("WYRD_CLIENT_400_CONFIG_INVALID", 400),
+        ("WYRD_CLIENT_401_NO_CREDENTIALS", 401),
+        ("WYRD_CLIENT_413_PAYLOAD_TOO_LARGE", 413),
+        ("WYRD_CLIENT_422_ROW_DESERIALIZATION", 422),
+        ("WYRD_CLIENT_429_QUEUE_FULL", 429),
+        ("WYRD_CLIENT_503_TRANSPORT_DOWN", 503),
+        ("WYRD_CLIENT_504_FLUSH_TIMEOUT", 504),
+    ];
+
+    /// Proves every code a public Python owner emits is owned by the catalog.
+    ///
+    /// `from_code` is the reconstruction the client, queue, and Python
+    /// boundaries all route through. A code with no catalog variant returns
+    /// `None` there and its caller degrades the failure to an opaque internal
+    /// error, which is exactly the loss of actionable metadata this change
+    /// exists to prevent.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a listed code has no catalog variant, reconstructs onto a
+    /// different code, reports a status that disagrees with its own code
+    /// segment, or carries placeholder title or remediation text.
+    #[test]
+    fn python_boundary_codes_resolve_through_the_catalog() {
+        for (code, status) in PYTHON_BOUNDARY_CODES {
+            let error = WyrdError::from_code(
+                code,
+                "boundary failure".to_owned(),
+                serde_json::json!({ "field": "value" }),
+            )
+            .unwrap_or_else(|| panic!("{code} has no derive-backed catalog variant"));
+
+            assert_eq!(error.code(), *code, "reconstruction changed the code");
+            assert_eq!(error.status(), *status, "{code} status regressed");
+            assert!(!error.title().is_empty(), "{code} has no title");
+            assert!(
+                error.remediation().len() > 20,
+                "{code} remediation is not actionable: {}",
+                error.remediation()
+            );
+
+            let problem = error.as_problem_json();
+            assert_eq!(problem["code"], *code);
+            assert_eq!(problem["status"], *status);
+            assert_eq!(problem["detail"], "boundary failure");
+            assert_eq!(problem["details"]["field"], "value");
+        }
+    }
+
+    /// The Bifrost serialization code the queue emits is catalog-owned too.
+    ///
+    /// `BifrostError` variants are not `{ message, details }` shaped, so they
+    /// never reconstruct through `from_code`; the guard here is that the code
+    /// exists with its real 400 status instead of being absent entirely.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the schema-parse code or status drifts.
+    #[test]
+    fn bifrost_schema_parse_is_catalog_owned() {
+        let error = WyrdError::Vala {
+            error: crate::vala::error::BifrostError::SchemaParse {
+                detail: "column 'age' is not an i64".to_owned(),
+            },
+        };
+
+        assert_eq!(error.code(), "WYRD_VALA_400_SCHEMA_PARSE");
+        assert_eq!(error.status(), 400);
+        assert_eq!(
+            error.as_problem_json()["details"]["data"]["detail"],
+            "column 'age' is not an i64"
+        );
+    }
 
     #[test]
     fn auth_codes_match_status() {
@@ -4162,6 +4878,11 @@ mod error_vala_tests {
                 BifrostError::QueryResultTooLarge,
                 "WYRD_VALA_413_QUERY_RESULT_TOO_LARGE",
                 413,
+            ),
+            (
+                BifrostError::QueryMemoryRequestTooLarge,
+                "WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE",
+                422,
             ),
             (
                 BifrostError::QueryTimeout,

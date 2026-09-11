@@ -1,0 +1,27 @@
+[package]
+name = "wyrd-node-testing"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+rust-version = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+arrow = { workspace = true }
+napi = { workspace = true }
+napi-derive = { workspace = true }
+secrecy = { workspace = true }
+vala-bifrost-redux = { workspace = true }
+wyrd-runtime = { workspace = true }
+wyrd-testing = { workspace = true }
+
+[build-dependencies]
+napi-build = { workspace = true }
+
+[lints]
+workspace = true

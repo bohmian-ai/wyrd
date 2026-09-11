@@ -81,9 +81,11 @@ Enforced by `check:client-tier`:
   it never widens a tenant query into an administrative query.
 - Tenant identity qualifies registry, audit, Bifrost table, object-store,
   cache, WAL, spill, generated-artifact, and telemetry boundaries.
-- Observation `card_ref` values are asserted per row and authorized against
-  the verified principal's card scope. `run_id` remains opaque and does not
-  encode card or tenant identity.
+- Observation `card_ref` values are optional per row. Present values are
+  authorized against the verified principal's signed Card scope and resolve
+  from its trusted UID mapping; absent values leave `card_uid` null while
+  server-stamped `principal_id` identifies the publisher. `run_id` remains
+  opaque and does not encode Card or tenant identity.
 
 ## Surface Alignment
 
@@ -154,8 +156,8 @@ replicas remain one logical surface behind one gateway.
 ## Observation Identity
 
 - One JWT can carry multiple component cards (nested service).
-- Each observation row carries `card_ref` (per row, server-authorized,
-  not trusted from the client) plus opaque client-generated `run_id`.
+- Each observation row carries server-stamped `principal_id`; optional per-row
+  `card_ref` is server-authorized when present, and `run_id` remains opaque.
 - Run IDs are opaque client-side execution records, not server-persisted.
 - See `architecture/wyrd-design.md` §Observation identity.
 

@@ -7,7 +7,7 @@ import types
 import typing
 from typing import Any
 
-from ._wyrd import WyrdError
+from ._wyrd import WyrdError, build_wyrd_error
 
 _PRIMITIVES: dict[Any, dict] = {
     str: {"type": "string"},
@@ -19,11 +19,8 @@ _PRIMITIVES: dict[Any, dict] = {
 
 
 def _wyrd_error(code: str, detail: str) -> WyrdError:
-    error = WyrdError(detail)
-    error.code = code
-    error.message = detail
-    error.details = {}
-    return error
+    """Build a fully populated catalog-backed Wyrd exception."""
+    return build_wyrd_error(code, detail)
 
 
 def annotation_to_schema(annotation: Any) -> dict:

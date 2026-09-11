@@ -24,20 +24,14 @@
       "description": "Target namespace.",
       "type": "string"
     },
-    "partition_columns": {
-      "description": "Declared partition columns.",
-      "default": [],
-      "type": "array",
-      "items": {
-        "$ref": "#/definitions/PartitionColumnSpec"
-      }
-    },
-    "scope": {
-      "description": "Table scope; defaults to `TenantOwned`.",
-      "default": "TenantOwned",
-      "allOf": [
+    "physical_layout": {
+      "description": "Optional physical layout declaration.\n\nOmitting the field entirely resolves to `hour(wyrd_event_time)`, `wyrd_event_time` descending nulls-last, and the managed Bloom floor. Supplying the object requires `partition_granularity`; within it, an explicit empty `sort_keys` resolves exactly as an omitted one does, and an explicit empty `bloom_columns` means \"managed floor only\".",
+      "anyOf": [
         {
-          "$ref": "#/definitions/TableScopeWire"
+          "$ref": "#/definitions/PhysicalLayoutWire"
+        },
+        {
+          "type": "null"
         }
       ]
     }
@@ -304,14 +298,14 @@
           "additionalProperties": false
         },
         {
-          "description": "Variable-length list of a single element type.",
+          "description": "Variable-length list whose boxed element declaration carries the child's name, nullability, metadata, and stable field id.\n\nThe element is a full [`FieldSpec`] rather than a bare type so a nested child keeps the same identity the physical schema stores; a client that rebuilds an Arrow schema from a description reproduces the stored list child exactly instead of inventing a nullable `item`.",
           "type": "object",
           "required": [
             "List"
           ],
           "properties": {
             "List": {
-              "$ref": "#/definitions/DataTypeSpec"
+              "$ref": "#/definitions/FieldSpec"
             }
           },
           "additionalProperties": false
@@ -351,7 +345,7 @@
           ]
         },
         "metadata": {
-          "description": "String metadata. Bifrost describe uses the `wyrd:column_class` key to flag `correlation` columns distinctly from user columns.",
+          "description": "String metadata carried verbatim through every schema conversion.\n\nTwo keys are meaningful to Bifrost: [`PARQUET_FIELD_ID_KEY`] holds the stored stable field id as decimal text, and [`INPUT_CLASS_KEY`] marks a declaration that is a write-time input rather than a stored column.",
           "type": "object",
           "additionalProperties": {
             "type": "string"
@@ -368,129 +362,123 @@
         }
       }
     },
-    "PartitionColumnSpec": {
-      "description": "One partition-column declaration on the register request.",
+    "NullOrderWire": {
+      "description": "Null placement of one declared physical sort key.",
+      "oneOf": [
+        {
+          "description": "Nulls sort before non-null values.",
+          "type": "string",
+          "enum": [
+            "first"
+          ]
+        },
+        {
+          "description": "Nulls sort after non-null values.",
+          "type": "string",
+          "enum": [
+            "last"
+          ]
+        }
+      ]
+    },
+    "PhysicalLayoutWire": {
+      "description": "The authoritative physical layout of one Bifrost table.\n\nThe same shape is used three ways: as the optional declaration on [`RegisterTableRequest`], as the canonical server-resolved layout returned by [`BifrostTableDescription`], and as the exact JSON persisted in the control row. In the latter two it is always fully populated: the sort order carries at least one key and the Bloom list begins with the schema-present managed floor.\n\nThe partition itself is system-owned. Every table is partitioned on `wyrd_event_time`, so the declaration carries only the granularity and no wire field names a partition column.\n\nOn the request path an omitted `sort_keys` and an explicit empty `sort_keys` resolve identically, because the server injects nothing ahead of a declared key and defaults an empty order to `wyrd_event_time` descending.",
+      "type": "object",
+      "required": [
+        "partition_granularity"
+      ],
+      "properties": {
+        "bloom_columns": {
+          "description": "Ordered Bloom-filtered columns.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "partition_granularity": {
+          "description": "Required partition granularity on the managed `wyrd_event_time` column.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/TimeGranularityWire"
+            }
+          ]
+        },
+        "sort_keys": {
+          "description": "Ordered sort keys; at most four may be declared.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/SortKeyWire"
+          }
+        }
+      }
+    },
+    "SortDirectionWire": {
+      "description": "Sort direction of one declared physical sort key.",
+      "oneOf": [
+        {
+          "description": "Ascending.",
+          "type": "string",
+          "enum": [
+            "asc"
+          ]
+        },
+        {
+          "description": "Descending.",
+          "type": "string",
+          "enum": [
+            "desc"
+          ]
+        }
+      ]
+    },
+    "SortKeyWire": {
+      "description": "One declared physical sort key.",
       "type": "object",
       "required": [
         "column",
-        "transform"
+        "direction",
+        "null_order"
       ],
       "properties": {
         "column": {
-          "description": "Column to partition on.",
+          "description": "Sorted column; must exist in the complete physical schema.",
           "type": "string"
         },
-        "transform": {
-          "description": "Transform applied to the column value.",
+        "direction": {
+          "description": "Sort direction.",
           "allOf": [
             {
-              "$ref": "#/definitions/PartitionTransformWire"
+              "$ref": "#/definitions/SortDirectionWire"
+            }
+          ]
+        },
+        "null_order": {
+          "description": "Null placement.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/NullOrderWire"
             }
           ]
         }
       }
     },
-    "PartitionTransformWire": {
-      "description": "Partition transform on the wire. Arrow/Iceberg-free mirror of the engine `PartitionTransform`.",
+    "TimeGranularityWire": {
+      "description": "Time-partition granularity on the wire.\n\nBifrost v1 partitions every table on `wyrd_event_time` and admits exactly these two Iceberg-native transforms; nothing else is representable.",
       "oneOf": [
         {
-          "description": "Identity (value as-is).",
+          "description": "One partition per UTC hour.",
           "type": "string",
           "enum": [
-            "Identity"
+            "hour"
           ]
         },
         {
-          "description": "Truncate a timestamp to the year.",
+          "description": "One partition per UTC day.",
           "type": "string",
           "enum": [
-            "Year"
-          ]
-        },
-        {
-          "description": "Truncate a timestamp to the month.",
-          "type": "string",
-          "enum": [
-            "Month"
-          ]
-        },
-        {
-          "description": "Truncate a timestamp to the day.",
-          "type": "string",
-          "enum": [
-            "Day"
-          ]
-        },
-        {
-          "description": "Truncate a timestamp to the hour.",
-          "type": "string",
-          "enum": [
-            "Hour"
-          ]
-        },
-        {
-          "description": "Hash into `n` buckets.",
-          "type": "object",
-          "required": [
-            "Bucket"
-          ],
-          "properties": {
-            "Bucket": {
-              "type": "object",
-              "required": [
-                "n"
-              ],
-              "properties": {
-                "n": {
-                  "description": "Bucket count.",
-                  "type": "integer",
-                  "format": "int32"
-                }
-              }
-            }
-          },
-          "additionalProperties": false
-        },
-        {
-          "description": "Truncate to width `w`.",
-          "type": "object",
-          "required": [
-            "Truncate"
-          ],
-          "properties": {
-            "Truncate": {
-              "type": "object",
-              "required": [
-                "w"
-              ],
-              "properties": {
-                "w": {
-                  "description": "Truncation width.",
-                  "type": "integer",
-                  "format": "int32"
-                }
-              }
-            }
-          },
-          "additionalProperties": false
-        }
-      ]
-    },
-    "TableScopeWire": {
-      "description": "Wire form of a Bifrost table scope. Distinct from the engine `TableScope` so `wyrd-spec` carries no engine dependency; the engine maps between the two.",
-      "oneOf": [
-        {
-          "description": "Tenant-isolated by catalog namespace; carries no `data_tenant_id` column.",
-          "type": "string",
-          "enum": [
-            "TenantOwned"
-          ]
-        },
-        {
-          "description": "Cross-tenant physical table; rows carry a server-stamped `data_tenant_id`.",
-          "type": "string",
-          "enum": [
-            "SystemShared"
+            "day"
           ]
         }
       ]

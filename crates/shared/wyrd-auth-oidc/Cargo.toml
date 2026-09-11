@@ -18,6 +18,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
 wyrd-spec = { path = "../../wyrd-spec", version = "0.0.1" }
+wyrd-tls = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

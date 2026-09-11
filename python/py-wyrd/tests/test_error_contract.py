@@ -11,7 +11,6 @@ REQUIRED_ATTRIBUTES = (
     "status",
     "title",
     "type",
-    "problem",
 )
 
 
@@ -33,18 +32,18 @@ def test_wyrd_error_exposes_every_required_attribute() -> None:
     assert error.remediation
 
 
-def test_direct_attributes_agree_with_the_problem_payload() -> None:
+def test_aggregate_problem_attribute_is_absent() -> None:
     error = raise_catalog_error()
-    problem = error.problem
 
-    assert problem["code"] == error.code
-    assert problem["status"] == error.status
-    assert problem["title"] == error.title
-    assert problem["remediation"] == error.remediation
-    assert problem["type"] == error.type
-    assert problem["details"] == error.details
-    assert problem["detail"] == error.detail == error.message
+    assert not hasattr(error, "problem")
+
+
+def test_direct_attributes_agree_with_the_problem_projection() -> None:
+    error = raise_catalog_error()
+
+    assert error.detail == error.message
     assert error.type.endswith(error.code)
+    assert isinstance(error.details, dict)
 
 
 def test_error_is_catchable_as_the_shared_base_class() -> None:

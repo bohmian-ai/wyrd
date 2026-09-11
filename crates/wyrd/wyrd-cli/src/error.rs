@@ -404,8 +404,12 @@ impl WyrdCliError {
 pub enum CliBoundaryError {
     /// A derive-catalogued failure owned by the local CLI.
     Local(WyrdCliError),
-    /// A typed Oracle query failure projected without recataloguing it.
-    Query(vala_sdk::ValaSdkError),
+    /// An Oracle query failure already projected onto the shared catalog.
+    ///
+    /// The SDK owns that projection, so the binary boundary reads its stable
+    /// metadata straight off the catalog error instead of keeping a second
+    /// per-variant table here.
+    Query(wyrd_spec::error::WyrdError),
 }
 
 impl From<WyrdCliError> for CliBoundaryError {
@@ -416,9 +420,9 @@ impl From<WyrdCliError> for CliBoundaryError {
 }
 
 impl From<vala_sdk::ValaSdkError> for CliBoundaryError {
-    /// Preserves an originating query SDK error at the binary boundary.
+    /// Projects an originating query SDK error onto the shared catalog.
     fn from(error: vala_sdk::ValaSdkError) -> Self {
-        Self::Query(error)
+        Self::Query(wyrd_spec::error::WyrdError::from(error))
     }
 }
 
@@ -455,7 +459,12 @@ impl CliBoundaryError {
     pub fn detail(&self) -> String {
         match self {
             Self::Local(error) => error.to_string(),
-            Self::Query(error) => error.detail(),
+            Self::Query(error) => error
+                .as_problem_json()
+                .get("detail")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("query failed")
+                .to_owned(),
         }
     }
 
@@ -473,7 +482,7 @@ impl CliBoundaryError {
     pub fn details(&self) -> Option<serde_json::Value> {
         match self {
             Self::Local(_) => None,
-            Self::Query(error) => error.safe_details(),
+            Self::Query(error) => error.as_problem_json().get("details").cloned(),
         }
     }
 
@@ -500,7 +509,7 @@ mod tests {
     /// Query boundary errors retain source metadata and bypass the CLI query catalog.
     #[test]
     fn query_boundary_preserves_originating_problem_metadata() {
-        let error = CliBoundaryError::Query(vala_sdk::ValaSdkError::Transport(
+        let error = CliBoundaryError::from(vala_sdk::ValaSdkError::Transport(
             WyrdError::PermissionDeniedRbac {
                 message: "query denied".to_owned(),
                 details: serde_json::json!({"required_scope": "bifrost_query:read"}),

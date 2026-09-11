@@ -1971,7 +1971,7 @@ async fn run_tenant(context: TenantRunContext) -> Result<TenantLoadResult, Clust
                         // here, a high retry rate looks like an audit-count
                         // mismatch rather than the refusal it actually is.
                         tracing::warn!(
-                            code = error.code(),
+                            code = wyrd_spec::error::WyrdError::from(&error).code(),
                             tenant = %tenant,
                             "load matrix retried a refused read"
                         );
@@ -2031,7 +2031,7 @@ fn is_retryable_read_error(error: &ValaSdkError) -> bool {
         "WYRD_VALA_503_QUERY_AUDIT_UNAVAILABLE",
         "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND",
     ]
-    .contains(&error.code())
+    .contains(&wyrd_spec::error::WyrdError::from(error).code())
 }
 
 /// Encode one deterministic Arrow batch for public Gate ingest.

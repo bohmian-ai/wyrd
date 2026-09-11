@@ -18,13 +18,14 @@ def test_bifrost_without_a_resolvable_credential_raises(monkeypatch: pytest.Monk
     say so through the typed exception rather than a generic error.
     """
 
-    from wyrd.bifrost import Bifrost, NoCredentialsError
+    from wyrd import WyrdError
+    from wyrd.bifrost import Bifrost
 
     for name in ("WYRD_ACCESS_TOKEN", "WYRD_WORKLOAD_TOKEN", "WYRD_TENANT", "WYRD_API_KEY"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("HOME", "/nonexistent-wyrd-home")
 
-    with pytest.raises(NoCredentialsError) as captured:
+    with pytest.raises(WyrdError) as captured:
         Bifrost()
     assert captured.value.code == "WYRD_CLIENT_401_NO_CREDENTIALS"
 

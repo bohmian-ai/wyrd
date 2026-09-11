@@ -272,12 +272,12 @@ pub(super) async fn read_sql(client: &wyrd_client::WyrdClient, sql: &str) -> Vec
             deadline_ms: Some(120_000),
         })
         .await
-        .unwrap_or_else(|error| panic!("public query `{sql}` starts: {}", error.detail()));
+        .unwrap_or_else(|error| panic!("public query `{sql}` starts: {error}"));
     let mut values = Vec::new();
     while let Some(batch) = stream
         .next_batch()
         .await
-        .unwrap_or_else(|error| panic!("public query `{sql}` streams: {}", error.detail()))
+        .unwrap_or_else(|error| panic!("public query `{sql}` streams: {error}"))
     {
         let column = batch
             .column_by_name("value")

@@ -176,7 +176,20 @@ async fn await_admitted(
 /// Only that class is retried by this journey: a dropped stream can leave the
 /// client's connection pool holding an entry the next request cannot use.
 fn is_transport(error: &vala_sdk::ValaSdkError) -> bool {
-    error.code() == "WYRD_SPEC_500_INTERNAL" && error.to_string().contains("transport error")
+    sdk_code(error) == "WYRD_SPEC_500_INTERNAL" && error.to_string().contains("transport error")
+}
+
+/// The stable catalog code one SDK error projects onto.
+///
+/// The SDK owns exactly one public projection, so every assertion here reads
+/// the code through it rather than a second per-variant table.
+fn sdk_code(error: &vala_sdk::ValaSdkError) -> &'static str {
+    wyrd_spec::error::WyrdError::from(error).code()
+}
+
+/// The HTTP-equivalent status one SDK error projects onto.
+fn sdk_status(error: &vala_sdk::ValaSdkError) -> u16 {
+    wyrd_spec::error::WyrdError::from(error).status()
 }
 
 /// Reports whether every Oracle node currently retains no Analytical ownership.
@@ -608,8 +621,8 @@ async fn expect_single_build_failure(
     if is_transport(sdk) {
         return Err(format!("{case}: failed as a client transport error: {sdk}").into());
     }
-    if sdk.code() != "WYRD_VALA_500_QUERY_EXECUTION_FAILED" {
-        return Err(format!("{case}: settled code {}: {sdk}", sdk.code()).into());
+    if sdk_code(sdk) != "WYRD_VALA_500_QUERY_EXECUTION_FAILED" {
+        return Err(format!("{case}: settled code {}: {sdk}", sdk_code(sdk)).into());
     }
     let after = cluster.nodes_mut()[COORDINATOR].physical_build_evidence()?;
     if after.total != before.total + 1 {
@@ -1307,17 +1320,17 @@ async fn prove_under_privileged_refusal() -> Result<(), JourneyError> {
         .await
         .err()
         .ok_or("an under-privileged caller ran a query")?;
-    if error.status() != 403 {
+    if sdk_status(&error) != 403 {
         return Err(format!(
             "the denied caller was refused as {} instead",
-            error.status()
+            sdk_status(&error)
         )
         .into());
     }
     if !QueryClient::new(&denied)
         .running()
         .await
-        .is_err_and(|error| error.status() == 403)
+        .is_err_and(|error| sdk_status(&error) == 403)
     {
         return Err("the denied caller could still list running queries".into());
     }
@@ -1420,8 +1433,8 @@ async fn prove_selected_failure_is_terminal() -> Result<(), JourneyError> {
         }
         Err(failure) => failure,
     };
-    if is_transport(&failure) || !failure.code().starts_with("WYRD_") {
-        return Err(format!("the lost peer surfaced {failure} as {}", failure.code()).into());
+    if is_transport(&failure) || !sdk_code(&failure).starts_with("WYRD_") {
+        return Err(format!("the lost peer surfaced {failure} as {}", sdk_code(&failure)).into());
     }
 
     // One build for the whole attempt: the lost peer produced no successor

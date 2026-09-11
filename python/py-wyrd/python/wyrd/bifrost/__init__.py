@@ -10,11 +10,6 @@ from typing import Any, Protocol, TypedDict, TypeVar, cast, overload
 import pyarrow
 
 from .. import _wyrd as _native
-from .._wyrd.bifrost import (
-    BifrostQueryError,
-    IncompleteQueryStreamError,
-    NoCredentialsError,
-)
 
 _Row = TypeVar("_Row", bound="RowModel")
 
@@ -419,7 +414,8 @@ class _BifrostBase:
                 omitted.
 
         Raises:
-            NoCredentialsError: the credential chain yielded nothing.
+            WyrdError: ``WYRD_CLIENT_401_NO_CREDENTIALS`` when the credential
+                chain yielded nothing.
 
         """
 
@@ -455,7 +451,9 @@ class _BifrostBase:
         refuses here rather than dropping silently.
 
         Raises:
-            BifrostQueryError: no table is bound, or the producer queue is full.
+            WyrdError: ``WYRD_VALA_412_NO_ACTIVE_TABLE`` when no table is
+                bound, or ``WYRD_CLIENT_429_QUEUE_FULL`` when the producer
+                queue is full.
 
         """
 
@@ -507,8 +505,8 @@ class Bifrost(_BifrostBase):
         exactly, metadata included.
 
         Raises:
-            BifrostQueryError: the batch exceeded the byte envelope, or the
-                server refused it.
+            WyrdError: the batch exceeded the byte envelope, or the server
+                refused it; the stable ``code`` says which.
 
         """
 
@@ -605,8 +603,8 @@ class AsyncBifrost(_BifrostBase):
         blocking native write both run in a worker thread.
 
         Raises:
-            BifrostQueryError: the batch exceeded the byte envelope, or the
-                server refused it.
+            WyrdError: the batch exceeded the byte envelope, or the server
+                refused it; the stable ``code`` says which.
 
         """
 
@@ -813,15 +811,12 @@ __all__ = [
     "AsyncBifrost",
     "Bifrost",
     "BifrostBatchIterator",
-    "BifrostQueryError",
     "BifrostQueryStream",
     "CancelRunningQueryResult",
     "Correlation",
     "DataTypeSpec",
     "DataTypeSpecVariants",
     "FieldSpec",
-    "IncompleteQueryStreamError",
-    "NoCredentialsError",
     "PhysicalLayout",
     "QueryResult",
     "ResolvedTable",

@@ -5,11 +5,12 @@ use secrecy::SecretString;
 use serde_json::Value;
 use std::process::Command;
 use std::sync::Arc;
-use vala_sdk::{QueryClient, ValaSdkError};
+use vala_sdk::QueryClient;
 use wyrd_client::WyrdClient;
 use wyrd_client::auth::AuthMiddleware;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{HttpConfig, HttpTransport, ResolvedCredential};
+use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{BifrostQueryRequest, FreshnessPolicy, VisibilityMode};
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::seed_query_fixture;
@@ -23,7 +24,7 @@ async fn typed_query_error(
     endpoint: &str,
     token: &str,
     sql: &str,
-) -> Result<ValaSdkError, Box<dyn std::error::Error>> {
+) -> Result<WyrdError, Box<dyn std::error::Error>> {
     let config = ClientConfig {
         http: HttpConfig {
             base_url: endpoint.to_owned(),
@@ -44,22 +45,23 @@ async fn typed_query_error(
         deadline_ms: None,
     };
     match QueryClient::new(&client).query(&request).await {
-        Err(error) => Ok(error),
+        Err(error) => Ok(WyrdError::from(error)),
         Ok(_) => Err("query unexpectedly succeeded".into()),
     }
 }
 
 /// Asserts global CLI stderr exactly projects one typed SDK error.
-fn assert_cli_problem(problem: &Value, expected: &ValaSdkError) {
+fn assert_cli_problem(problem: &Value, expected: &WyrdError) {
+    let canonical = expected.as_problem_json();
     assert_eq!(problem["kind"], "wyrd_cli_error");
     assert_eq!(problem["code"], expected.code());
     assert_eq!(problem["status"], expected.status());
     assert_eq!(problem["title"], expected.title());
-    assert_eq!(problem["message"], expected.detail());
+    assert_eq!(problem["message"], canonical["detail"]);
     assert_eq!(problem["remediation"], expected.remediation());
     assert_eq!(
         problem["details"],
-        expected.safe_details().unwrap_or(Value::Null)
+        canonical.get("details").cloned().unwrap_or(Value::Null)
     );
 }
 

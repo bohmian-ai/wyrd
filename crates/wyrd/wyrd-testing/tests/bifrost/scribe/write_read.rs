@@ -624,8 +624,12 @@ async fn scribe_undialable_private_peer_returns_typed_visibility_failure() {
             Ok(None) => panic!("undialable strict read emitted a successful terminal"),
         },
     };
-    assert_eq!(error.code(), "WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE");
-    assert_eq!(error.status(), 503);
+    let projected = wyrd_spec::error::WyrdError::from(&error);
+    assert_eq!(
+        projected.code(),
+        "WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE"
+    );
+    assert_eq!(projected.status(), 503);
     match &error {
         ValaSdkError::FailedTerminal { terminal } => {
             assert_eq!(
@@ -699,7 +703,7 @@ async fn append_active_row(writer: &wyrd_testing::bifrost::write::BifrostWriter,
 
 /// Returns the public stable code without consuming the typed SDK error.
 fn error_code(error: &ValaSdkError) -> &'static str {
-    error.code()
+    wyrd_spec::error::WyrdError::from(error).code()
 }
 
 /// Optional and scoped Card correlation, end to end through the public routes.
@@ -1017,12 +1021,12 @@ async fn read_correlation(
             deadline_ms: Some(120_000),
         })
         .await
-        .unwrap_or_else(|error| panic!("public query `{sql}` starts: {}", error.detail()));
+        .unwrap_or_else(|error| panic!("public query `{sql}` starts: {error}"));
     let mut rows = Vec::new();
     while let Some(batch) = stream
         .next_batch()
         .await
-        .unwrap_or_else(|error| panic!("public query `{sql}` streams: {}", error.detail()))
+        .unwrap_or_else(|error| panic!("public query `{sql}` streams: {error}"))
     {
         let values = batch
             .column_by_name("value")

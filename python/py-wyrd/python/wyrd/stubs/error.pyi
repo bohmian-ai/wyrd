@@ -9,7 +9,7 @@ class WyrdError(Exception):
 
     Wyrd raises this exception for validation and boundary failures that have a
     durable Wyrd error code. Every attribute is projected from one RFC 9457
-    problem document, so `problem` and the direct attributes always agree:
+    problem document, so every direct attribute agrees with that projection:
     `code` is stable, `message` and `detail` carry the same human-readable
     failure text, `details` carries structured context, `status`, `title`, and
     `type` mirror the problem document, and `remediation` tells the caller what
@@ -24,7 +24,6 @@ class WyrdError(Exception):
     status: int
     title: str
     type: str
-    problem: dict[str, Any]
 
     def __init__(
         self,

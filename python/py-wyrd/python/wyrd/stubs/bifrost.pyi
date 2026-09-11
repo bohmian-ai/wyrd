@@ -3,23 +3,6 @@ from typing import Any, Protocol, TypedDict, TypeVar, overload
 
 import pyarrow
 
-class BifrostQueryError(RuntimeError):
-    """Base exception for terminal-safe Bifrost query failures."""
-
-    code: str
-    status: int
-    title: str
-    message: str
-    detail: str
-    remediation: str
-    details: Any | None
-
-class IncompleteQueryStreamError(BifrostQueryError):
-    """Raised when transport EOF arrives before a validated terminal."""
-
-class NoCredentialsError(BifrostQueryError):
-    """Raised when the credential chain yields nothing for an omitted credential."""
-
 class DataTypeSpecVariants(TypedDict, total=False):
     """The parameterized `DataTypeSpec` forms, tagged by their variant name.
 
@@ -317,15 +300,12 @@ __all__ = [
     "AsyncBifrost",
     "Bifrost",
     "BifrostBatchIterator",
-    "BifrostQueryError",
     "BifrostQueryStream",
     "CancelRunningQueryResult",
     "Correlation",
     "DataTypeSpec",
     "DataTypeSpecVariants",
     "FieldSpec",
-    "IncompleteQueryStreamError",
-    "NoCredentialsError",
     "PhysicalLayout",
     "QueryResult",
     "ResolvedTable",

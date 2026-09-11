@@ -248,12 +248,12 @@ pub(crate) async fn read_managed_rows(
     let mut stream = vala_sdk::query::QueryClient::new(client)
         .query(&strict_fused(sql.clone()))
         .await
-        .unwrap_or_else(|error| panic!("public query `{sql}` starts: {}", error.detail()));
+        .unwrap_or_else(|error| panic!("public query `{sql}` starts: {error}"));
     let mut rows = Vec::new();
     while let Some(batch) = stream
         .next_batch()
         .await
-        .unwrap_or_else(|error| panic!("public query `{sql}` streams: {}", error.detail()))
+        .unwrap_or_else(|error| panic!("public query `{sql}` streams: {error}"))
     {
         rows.extend(decode_managed_rows(&batch));
     }
@@ -367,23 +367,19 @@ pub(crate) async fn assert_tenant_scoped_not_found(
         "{context}: the refusal is a projection of a server decision, not a local \
          stream failure: {error:?}"
     );
+    let projected = wyrd_spec::error::WyrdError::from(&error);
+    let problem = projected.as_problem_json();
     assert_eq!(
-        error.code(),
+        projected.code(),
         "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND",
         "{context}: the tenant boundary answers with its stable not-found code"
     );
     assert_eq!(
-        error.status(),
+        projected.status(),
         404,
         "{context}: the stable not-found code keeps its status"
     );
-    let leaked = format!(
-        "{} {}",
-        error.detail(),
-        error
-            .safe_details()
-            .map_or_else(String::new, |details| details.to_string())
-    );
+    let leaked = problem.to_string();
     assert!(
         !leaked.contains(&neighbour.as_uuid().to_string()),
         "{context}: the refusal named the neighbouring tenant: {leaked}"

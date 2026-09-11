@@ -57,10 +57,9 @@ pub enum ValaSdkError {
     NoActiveTable,
     /// The client-tier producer queue refused, timed out, or failed a write.
     ///
-    /// Carried verbatim rather than projected onto [`WyrdError`] because the
-    /// queue's own codes — notably `WYRD_CLIENT_429_QUEUE_FULL` — have no
-    /// catalog variant, and collapsing them would report saturation as an
-    /// internal error to every language SDK.
+    /// Carried verbatim so the public projection can name the queue's own
+    /// catalog variant — notably `WYRD_CLIENT_429_QUEUE_FULL` — instead of
+    /// reporting saturation as an internal error to every language SDK.
     #[error("bifrost write failed: {0}")]
     Queue(#[from] WyrdQueueError),
     /// One completed result row did not deserialize into the caller's type.
@@ -74,133 +73,13 @@ pub enum ValaSdkError {
     /// A client-tier configuration, credential, or transport failure.
     ///
     /// Carried verbatim for the same reason [`ValaSdkError::Queue`] is: the
-    /// `WYRD_CLIENT_*` codes are client-boundary projections with no catalog
-    /// variant, and collapsing them would report an unresolvable credential
-    /// chain as an internal error in every language SDK.
+    /// public projection names the matching `WYRD_CLIENT_*` catalog variant so
+    /// an unresolvable credential chain stays a 401 in every language SDK.
     #[error("{0}")]
     Client(#[from] WyrdClientError),
 }
 
 impl ValaSdkError {
-    /// Returns the scrubbed human-readable detail for boundary projections.
-    #[must_use]
-    pub fn detail(&self) -> String {
-        match self {
-            Self::Transport(error) => error
-                .as_problem_json()
-                .get("detail")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("query transport failed")
-                .to_owned(),
-            Self::Protocol(detail) | Self::Arrow(detail) | Self::RowDeserialization(detail) => {
-                detail.clone()
-            }
-            Self::IncompleteQueryStream => {
-                "query stream ended before its required terminal frame".to_owned()
-            }
-            Self::FailedTerminal { terminal } => terminal
-                .error
-                .as_ref()
-                .and_then(|error| error.detail.as_ref())
-                .map_or_else(
-                    || "query terminal reported failure".to_owned(),
-                    |detail| detail.as_str().to_owned(),
-                ),
-            Self::ResultTooLarge => "query result exceeds configured bounds".to_owned(),
-            Self::NoActiveTable => "no active Bifrost table is bound for writes".to_owned(),
-            Self::Queue(error) => error.to_string(),
-            Self::Client(error) => error.to_string(),
-        }
-    }
-
-    /// Returns structured diagnostics already scrubbed for public projection.
-    #[must_use]
-    pub fn safe_details(&self) -> Option<serde_json::Value> {
-        match self {
-            Self::Transport(error) => error.as_problem_json().get("details").cloned(),
-            Self::FailedTerminal { terminal } => serde_json::to_value(terminal).ok(),
-            Self::Protocol(_)
-            | Self::Arrow(_)
-            | Self::RowDeserialization(_)
-            | Self::IncompleteQueryStream
-            | Self::ResultTooLarge
-            | Self::NoActiveTable
-            | Self::Queue(_)
-            | Self::Client(_) => None,
-        }
-    }
-
-    /// Returns the stable public code used by language projections.
-    #[must_use]
-    pub fn code(&self) -> &'static str {
-        match self {
-            Self::Transport(error) => error.code(),
-            Self::Protocol(_) | Self::Arrow(_) => "WYRD_VALA_502_QUERY_STREAM_PROTOCOL",
-            Self::RowDeserialization(_) => "WYRD_CLIENT_422_ROW_DESERIALIZATION",
-            Self::IncompleteQueryStream => "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE",
-            Self::FailedTerminal { terminal } => terminal_bifrost_error(terminal).code(),
-            Self::ResultTooLarge => "WYRD_VALA_413_QUERY_RESULT_TOO_LARGE",
-            Self::NoActiveTable => BifrostError::NoActiveTable.code(),
-            Self::Queue(error) => error.code(),
-            Self::Client(error) => error.code(),
-        }
-    }
-
-    /// Returns the HTTP-equivalent status projected into language SDK errors.
-    #[must_use]
-    pub fn status(&self) -> u16 {
-        match self {
-            Self::Transport(error) => error.status(),
-            Self::Protocol(_) | Self::Arrow(_) | Self::IncompleteQueryStream => 502,
-            Self::RowDeserialization(_) => 422,
-            Self::FailedTerminal { terminal } => terminal_bifrost_error(terminal).status(),
-            Self::ResultTooLarge => 413,
-            Self::NoActiveTable => BifrostError::NoActiveTable.status(),
-            Self::Queue(error) => queue_status(error),
-            Self::Client(error) => client_status(error),
-        }
-    }
-
-    /// Returns a stable human-readable SDK error title.
-    #[must_use]
-    pub fn title(&self) -> &'static str {
-        match self {
-            Self::Transport(error) => error.title(),
-            Self::Protocol(_) | Self::Arrow(_) => "Query stream protocol failed",
-            Self::RowDeserialization(_) => "Query row deserialization failed",
-            Self::IncompleteQueryStream => "Query stream incomplete",
-            Self::FailedTerminal { terminal } => terminal_bifrost_error(terminal).title(),
-            Self::ResultTooLarge => "Query result too large",
-            Self::NoActiveTable => BifrostError::NoActiveTable.title(),
-            Self::Queue(error) => queue_title(error),
-            Self::Client(error) => client_title(error),
-        }
-    }
-
-    /// Returns operator-facing remediation projected into language SDK errors.
-    #[must_use]
-    pub fn remediation(&self) -> &'static str {
-        match self {
-            Self::Transport(error) => error.remediation(),
-            Self::Protocol(_) | Self::Arrow(_) => {
-                "Retry the query; if the error persists, verify client and server contract versions."
-            }
-            Self::RowDeserialization(_) => {
-                "Align the caller's row type with the columns and types the query selects."
-            }
-            Self::IncompleteQueryStream => {
-                "Retry the query because the response ended before its required terminal frame."
-            }
-            Self::FailedTerminal { terminal } => terminal_bifrost_error(terminal).remediation(),
-            Self::ResultTooLarge => {
-                "Reduce the query result or raise the caller's explicit collection limit within its hard ceiling."
-            }
-            Self::NoActiveTable => BifrostError::NoActiveTable.remediation(),
-            Self::Queue(error) => queue_remediation(error),
-            Self::Client(error) => client_remediation(error),
-        }
-    }
-
     /// Returns terminal metadata when a validated failed terminal caused this error.
     #[must_use]
     pub fn terminal(&self) -> Option<&QueryTerminalFrame> {
@@ -220,115 +99,92 @@ impl ValaSdkError {
 }
 
 impl From<ValaSdkError> for WyrdError {
-    /// Project one SDK error onto the shared stable catalog.
-    ///
-    /// The SDK's own codes are already the ones every language surface
-    /// reports, so this reconstructs the catalog variant from the code rather
-    /// than inventing a second mapping. A code with no catalog variant — the
-    /// client-tier queue codes, notably — becomes an internal error that still
-    /// names its original code in the details, so nothing is silently renamed.
+    /// Project one owned SDK error onto the shared derive-backed catalog.
     fn from(error: ValaSdkError) -> Self {
-        if let ValaSdkError::Transport(inner) = error {
-            return inner;
-        }
-        let code = error.code();
-        let detail = error.detail();
-        Self::from_code(
-            code,
-            detail.clone(),
-            error
-                .safe_details()
-                .unwrap_or_else(|| serde_json::json!({})),
-        )
-        .unwrap_or(Self::Internal {
-            message: detail,
-            details: serde_json::json!({ "original_code": code }),
-        })
+        Self::from(&error)
     }
 }
 
-/// The HTTP-equivalent status of one client-tier transport failure.
+impl From<&ValaSdkError> for WyrdError {
+    /// Project one borrowed SDK error onto the shared derive-backed catalog.
+    ///
+    /// This is the crate's only public error projection: every stable code,
+    /// status, title, and remediation the SDK reports comes from the catalog
+    /// variant named here, so no language boundary keeps a second copy. A
+    /// transport failure is already a catalog error and is returned untouched.
+    ///
+    /// Framing and Arrow decode strings stay on the Rust-side `Display` rather
+    /// than the public projection: the catalog owns the scrubbed public text,
+    /// and a raw decoder string is a local diagnostic, not a stable contract.
+    fn from(error: &ValaSdkError) -> Self {
+        match error {
+            ValaSdkError::Transport(inner) => inner.clone(),
+            ValaSdkError::Protocol(_) | ValaSdkError::Arrow(_) => Self::Vala {
+                error: BifrostError::QueryStreamProtocol,
+            },
+            ValaSdkError::IncompleteQueryStream => Self::Vala {
+                error: BifrostError::QueryStreamIncomplete,
+            },
+            ValaSdkError::FailedTerminal { terminal } => Self::Vala {
+                error: terminal_bifrost_error(terminal),
+            },
+            ValaSdkError::ResultTooLarge => Self::Vala {
+                error: BifrostError::QueryResultTooLarge,
+            },
+            ValaSdkError::NoActiveTable => Self::Vala {
+                error: BifrostError::NoActiveTable,
+            },
+            ValaSdkError::RowDeserialization(detail) => Self::ClientRowDeserialization {
+                message: detail.clone(),
+                details: serde_json::json!({}),
+            },
+            ValaSdkError::Queue(inner) => queue_catalog_error(inner),
+            ValaSdkError::Client(inner) => client_catalog_error(inner),
+        }
+    }
+}
+
+/// Projects one client-tier transport failure onto its catalog variant.
 ///
-/// The `WYRD_CLIENT_*` codes are client-boundary projections with no catalog
-/// variant, so this is the single place their numeric half is stated.
-fn client_status(error: &WyrdClientError) -> u16 {
+/// The `WYRD_CLIENT_*` codes are client-boundary contracts, so each refusal
+/// names its own catalog variant instead of collapsing onto an internal error.
+fn client_catalog_error(error: &WyrdClientError) -> WyrdError {
+    let message = error.to_string();
+    let details = serde_json::json!({});
     match error {
-        WyrdClientError::Config { .. } => 400,
-        WyrdClientError::NoCredentials => 401,
-        WyrdClientError::TransportDown { .. } => 503,
-    }
-}
-
-/// The stable title of one client-tier transport failure.
-fn client_title(error: &WyrdClientError) -> &'static str {
-    match error {
-        WyrdClientError::Config { .. } => "Client configuration invalid",
-        WyrdClientError::NoCredentials => "No credentials available",
-        WyrdClientError::TransportDown { .. } => "Transport unavailable",
-    }
-}
-
-/// Operator-facing remediation for one client-tier transport failure.
-fn client_remediation(error: &WyrdClientError) -> &'static str {
-    match error {
-        WyrdClientError::Config { .. } => {
-            "Correct the supplied server URL, gRPC endpoint, or credential before constructing the client."
-        }
-        WyrdClientError::NoCredentials => {
-            "Set WYRD_ACCESS_TOKEN, WYRD_WORKLOAD_TOKEN with WYRD_TENANT, or WYRD_API_KEY, pass an explicit credential, or add [default].api_key to ~/.config/wyrd/credentials.toml."
-        }
+        WyrdClientError::Config { .. } => WyrdError::ClientConfigInvalid { message, details },
+        WyrdClientError::NoCredentials => WyrdError::ClientNoCredentials { message, details },
         WyrdClientError::TransportDown { .. } => {
-            "Confirm the Wyrd server is reachable at the resolved endpoint and retry."
+            WyrdError::ClientTransportDown { message, details }
         }
     }
 }
 
-/// The HTTP-equivalent status of one client-tier queue refusal.
+/// Projects one client-tier queue refusal onto its catalog variant.
 ///
-/// The queue owns its own stable codes; this is the single place their numeric
-/// half is stated, so every language SDK reports the same status for the same
-/// refusal.
-fn queue_status(error: &WyrdQueueError) -> u16 {
-    match error {
-        WyrdQueueError::QueueFull | WyrdQueueError::Backpressure => 429,
-        WyrdQueueError::FlushTimeout => 504,
-        WyrdQueueError::PayloadTooLarge => 413,
-        WyrdQueueError::SchemaParse(_) | WyrdQueueError::ReservedColumn(_) => 400,
-        WyrdQueueError::Sink(inner) => inner.status(),
-    }
-}
-
-/// The stable title of one client-tier queue refusal.
-fn queue_title(error: &WyrdQueueError) -> &'static str {
-    match error {
-        WyrdQueueError::QueueFull | WyrdQueueError::Backpressure => "Write queue saturated",
-        WyrdQueueError::FlushTimeout => "Write flush timed out",
-        WyrdQueueError::PayloadTooLarge => "Write payload too large",
-        WyrdQueueError::SchemaParse(_) => "Schema parse failed",
-        WyrdQueueError::ReservedColumn(_) => "Reserved column name",
-        WyrdQueueError::Sink(inner) => inner.title(),
-    }
-}
-
-/// Operator-facing remediation for one client-tier queue refusal.
-fn queue_remediation(error: &WyrdQueueError) -> &'static str {
+/// Saturation, drain, and payload refusals keep their own `WYRD_CLIENT_*`
+/// codes so a caller can retry a full queue without parsing error text; a sink
+/// failure is already a catalog error and passes through unchanged.
+fn queue_catalog_error(error: &WyrdQueueError) -> WyrdError {
+    let message = error.to_string();
+    let details = serde_json::json!({});
     match error {
         WyrdQueueError::QueueFull | WyrdQueueError::Backpressure => {
-            "Slow the write rate or flush more often; the producer channel, staging ring, and byte budget are all occupied."
+            WyrdError::ClientQueueFull { message, details }
         }
-        WyrdQueueError::FlushTimeout => {
-            "Retry the flush; the in-flight batch did not acknowledge before the drain deadline."
-        }
-        WyrdQueueError::PayloadTooLarge => {
-            "Reduce the row size; a single sealed row exceeds the configured max_message_bytes."
-        }
-        WyrdQueueError::SchemaParse(_) => {
-            "Correct the declared column types so every field maps onto a supported Bifrost type."
-        }
-        WyrdQueueError::ReservedColumn(_) => {
-            "Rename the column; wyrd_*, card_ref, and run_id are server-owned names."
-        }
-        WyrdQueueError::Sink(inner) => inner.remediation(),
+        WyrdQueueError::FlushTimeout => WyrdError::ClientFlushTimeout { message, details },
+        WyrdQueueError::PayloadTooLarge => WyrdError::ClientPayloadTooLarge { message, details },
+        WyrdQueueError::SchemaParse(detail) => WyrdError::Vala {
+            error: BifrostError::SchemaParse {
+                detail: detail.clone(),
+            },
+        },
+        WyrdQueueError::ReservedColumn(column) => WyrdError::Vala {
+            error: BifrostError::ReservedColumn {
+                column: column.clone(),
+            },
+        },
+        WyrdQueueError::Sink(inner) => inner.clone(),
     }
 }
 
@@ -1100,7 +956,9 @@ impl QueryResultStream {
                 return;
             }
             if let Ok(outcome) = tokio::time::timeout(remaining, client.status(&request_id)).await
-                && outcome.is_err_and(|error| error.code() == RUNNING_QUERY_RETIRED_CODE)
+                && outcome.is_err_and(|error| {
+                    WyrdError::from(&error).code() == RUNNING_QUERY_RETIRED_CODE
+                })
             {
                 return;
             }
@@ -2129,17 +1987,19 @@ mod tests {
         server.await.expect("test server exits");
     }
 
-    /// Stable metadata accessors preserve typed transport and terminal diagnostics.
+    /// The catalog projection preserves typed transport and terminal diagnostics.
     #[test]
-    fn vala_sdk_error_projects_typed_detail_and_safe_details() {
+    fn vala_sdk_error_projects_onto_the_catalog() {
         let transport = ValaSdkError::Transport(WyrdError::PermissionDeniedRbac {
             message: "query denied".to_owned(),
             details: serde_json::json!({"required_scope": "bifrost_query:read"}),
         });
-        assert_eq!(transport.detail(), "query denied");
+        let projected = WyrdError::from(&transport);
+        assert_eq!(projected.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
+        assert_eq!(projected.as_problem_json()["detail"], "query denied");
         assert_eq!(
-            transport.safe_details(),
-            Some(serde_json::json!({"required_scope": "bifrost_query:read"}))
+            projected.as_problem_json()["details"],
+            serde_json::json!({"required_scope": "bifrost_query:read"})
         );
 
         let mut terminal = failed_terminal(0);
@@ -2152,30 +2012,58 @@ mod tests {
         let failed = ValaSdkError::FailedTerminal {
             terminal: terminal.clone(),
         };
-        assert_eq!(failed.detail(), "source failed");
         assert_eq!(
-            failed.safe_details(),
-            Some(serde_json::to_value(terminal).expect("terminal serializes"))
+            WyrdError::from(&failed).code(),
+            BifrostError::QueryExecutionFailed.code()
         );
 
-        let protocol = ValaSdkError::Protocol("safe protocol detail".to_owned());
-        assert_eq!(protocol.detail(), "safe protocol detail");
-        assert_eq!(protocol.safe_details(), None);
-
-        let arrow = ValaSdkError::Arrow("safe Arrow detail".to_owned());
-        assert_eq!(arrow.detail(), "safe Arrow detail");
-        assert_eq!(arrow.safe_details(), None);
-
-        let incomplete = ValaSdkError::IncompleteQueryStream;
-        assert_eq!(
-            incomplete.detail(),
-            "query stream ended before its required terminal frame"
-        );
-        assert_eq!(incomplete.safe_details(), None);
-
-        let too_large = ValaSdkError::ResultTooLarge;
-        assert_eq!(too_large.detail(), "query result exceeds configured bounds");
-        assert_eq!(too_large.safe_details(), None);
+        for (error, code) in [
+            (
+                ValaSdkError::Protocol("safe protocol detail".to_owned()),
+                "WYRD_VALA_502_QUERY_STREAM_PROTOCOL",
+            ),
+            (
+                ValaSdkError::Arrow("safe Arrow detail".to_owned()),
+                "WYRD_VALA_502_QUERY_STREAM_PROTOCOL",
+            ),
+            (
+                ValaSdkError::IncompleteQueryStream,
+                "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE",
+            ),
+            (
+                ValaSdkError::ResultTooLarge,
+                "WYRD_VALA_413_QUERY_RESULT_TOO_LARGE",
+            ),
+            (ValaSdkError::NoActiveTable, "WYRD_VALA_412_NO_ACTIVE_TABLE"),
+            (
+                ValaSdkError::RowDeserialization("row does not fit".to_owned()),
+                "WYRD_CLIENT_422_ROW_DESERIALIZATION",
+            ),
+            (
+                ValaSdkError::Queue(WyrdQueueError::QueueFull),
+                "WYRD_CLIENT_429_QUEUE_FULL",
+            ),
+            (
+                ValaSdkError::Queue(WyrdQueueError::FlushTimeout),
+                "WYRD_CLIENT_504_FLUSH_TIMEOUT",
+            ),
+            (
+                ValaSdkError::Queue(WyrdQueueError::PayloadTooLarge),
+                "WYRD_CLIENT_413_PAYLOAD_TOO_LARGE",
+            ),
+            (
+                ValaSdkError::Client(WyrdClientError::NoCredentials),
+                "WYRD_CLIENT_401_NO_CREDENTIALS",
+            ),
+        ] {
+            let projected = WyrdError::from(&error);
+            assert_eq!(projected.code(), code, "code for {error}");
+            assert_ne!(
+                projected.code(),
+                "WYRD_SPEC_500_INTERNAL",
+                "{error} degraded to the internal code"
+            );
+        }
     }
 
     /// Every closed failed-terminal code projects through its catalog entry.
@@ -2233,7 +2121,7 @@ mod tests {
             error.code = code;
             error.detail =
                 Some(QueryErrorDetail::new("source failed").expect("detail is scrubbed"));
-            let projected = ValaSdkError::FailedTerminal { terminal };
+            let projected = WyrdError::from(&ValaSdkError::FailedTerminal { terminal });
             assert_eq!(projected.code(), expected.code(), "code for {code:?}");
             assert_eq!(projected.status(), expected.status(), "status for {code:?}");
             assert_eq!(projected.title(), expected.title(), "title for {code:?}");

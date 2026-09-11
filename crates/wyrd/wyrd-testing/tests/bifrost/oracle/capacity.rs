@@ -1417,7 +1417,12 @@ async fn drain_query(query: &QueryClient, sql: &str) -> Result<u64, String> {
             deadline_ms: Some(REFUSAL_QUERY_DEADLINE_MS),
         })
         .await
-        .map_err(|error| format!("{}: {error}", error.code()))?;
+        .map_err(|error| {
+            format!(
+                "{}: {error}",
+                wyrd_spec::error::WyrdError::from(&error).code()
+            )
+        })?;
     let mut rows = 0_u64;
     loop {
         match stream.next_batch().await {
@@ -1425,7 +1430,12 @@ async fn drain_query(query: &QueryClient, sql: &str) -> Result<u64, String> {
                 rows = rows.saturating_add(u64::try_from(batch.num_rows()).unwrap_or(u64::MAX))
             }
             Ok(None) => break,
-            Err(error) => return Err(format!("{}: {error}", error.code())),
+            Err(error) => {
+                return Err(format!(
+                    "{}: {error}",
+                    wyrd_spec::error::WyrdError::from(&error).code()
+                ));
+            }
         }
     }
     match stream.terminal().map(|terminal| terminal.outcome) {

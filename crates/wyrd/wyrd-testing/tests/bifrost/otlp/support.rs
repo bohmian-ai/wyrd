@@ -1014,12 +1014,12 @@ impl OtlpJourney {
                 deadline_ms: Some(120_000),
             })
             .await
-            .unwrap_or_else(|error| panic!("public query `{sql}` starts: {}", error.detail()));
+            .unwrap_or_else(|error| panic!("public query `{sql}` starts: {error}"));
         let mut batches = Vec::new();
         while let Some(batch) = stream
             .next_batch()
             .await
-            .unwrap_or_else(|error| panic!("public query `{sql}` streams: {}", error.detail()))
+            .unwrap_or_else(|error| panic!("public query `{sql}` streams: {error}"))
         {
             batches.push(batch);
         }
@@ -1061,7 +1061,7 @@ impl OtlpJourney {
         while let Some(batch) = stream
             .next_batch()
             .await
-            .unwrap_or_else(|error| panic!("public query `{sql}` streams: {}", error.detail()))
+            .unwrap_or_else(|error| panic!("public query `{sql}` streams: {error}"))
         {
             batches.push(batch);
         }

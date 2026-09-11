@@ -87,16 +87,18 @@ impl NativeLifecycleResult {
 
     /// Builds one failed lifecycle projection with stable Wyrd metadata.
     fn failure(error: &ValaSdkError) -> Self {
+        let projected = wyrd_spec::error::WyrdError::from(error);
+        let problem = projected.as_problem_json();
         Self {
             value_json: None,
-            error_code: Some(error.code().to_owned()),
-            error_status: Some(u32::from(error.status())),
-            error_title: Some(error.title().to_owned()),
-            error_detail: Some(error.detail()),
-            error_remediation: Some(error.remediation().to_owned()),
-            error_details_json: error
-                .safe_details()
-                .and_then(|value| serde_json::to_string(&value).ok()),
+            error_code: Some(projected.code().to_owned()),
+            error_status: Some(u32::from(projected.status())),
+            error_title: Some(problem_field(&problem, "title", projected.title())),
+            error_detail: Some(problem_field(&problem, "detail", &projected.to_string())),
+            error_remediation: Some(projected.remediation().to_owned()),
+            error_details_json: problem
+                .get("details")
+                .and_then(|value| serde_json::to_string(value).ok()),
         }
     }
 }
@@ -136,16 +138,18 @@ impl NativeQueryStart {
 
     /// Builds the failed side with stable metadata retained as independent fields.
     fn failure(error: &ValaSdkError) -> Self {
+        let projected = wyrd_spec::error::WyrdError::from(error);
+        let problem = projected.as_problem_json();
         Self {
             stream: None,
-            error_code: Some(error.code().to_owned()),
-            error_status: Some(u32::from(error.status())),
-            error_title: Some(error.title().to_owned()),
-            error_detail: Some(error.detail()),
-            error_remediation: Some(error.remediation().to_owned()),
-            error_details_json: error
-                .safe_details()
-                .and_then(|value| serde_json::to_string(&value).ok()),
+            error_code: Some(projected.code().to_owned()),
+            error_status: Some(u32::from(projected.status())),
+            error_title: Some(problem_field(&problem, "title", projected.title())),
+            error_detail: Some(problem_field(&problem, "detail", &projected.to_string())),
+            error_remediation: Some(projected.remediation().to_owned()),
+            error_details_json: problem
+                .get("details")
+                .and_then(|value| serde_json::to_string(value).ok()),
         }
     }
 }
@@ -804,17 +808,19 @@ impl NativeBifrostQueryStream {
                         napi::Error::from_reason("terminal lock poisoned".to_owned())
                     })? = Some(terminal);
                 }
+                let projected = wyrd_spec::error::WyrdError::from(&error);
+                let problem = projected.as_problem_json();
                 Ok(NativeQueryStep {
                     ipc: None,
                     terminal_json: None,
-                    error_code: Some(error.code().to_owned()),
-                    error_status: Some(u32::from(error.status())),
-                    error_title: Some(error.title().to_owned()),
-                    error_detail: Some(error.detail()),
-                    error_remediation: Some(error.remediation().to_owned()),
-                    error_details_json: error
-                        .safe_details()
-                        .and_then(|value| serde_json::to_string(&value).ok()),
+                    error_code: Some(projected.code().to_owned()),
+                    error_status: Some(u32::from(projected.status())),
+                    error_title: Some(problem_field(&problem, "title", projected.title())),
+                    error_detail: Some(problem_field(&problem, "detail", &projected.to_string())),
+                    error_remediation: Some(projected.remediation().to_owned()),
+                    error_details_json: problem
+                        .get("details")
+                        .and_then(|value| serde_json::to_string(value).ok()),
                 })
             }
         }
@@ -947,9 +953,25 @@ fn encode_schema(schema: &arrow::datatypes::SchemaRef) -> napi::Result<Vec<u8>> 
     Ok(bytes)
 }
 
+/// Reads one string member of an RFC 9457 problem payload.
+///
+/// The catalog owns the public text, so the projection reads it from the
+/// problem document and falls back to the derive-backed field only if the
+/// payload omits the member.
+fn problem_field(problem: &serde_json::Value, key: &str, fallback: &str) -> String {
+    problem
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(fallback)
+        .to_owned()
+}
+
 /// Projects an SDK error with its stable code intact.
 fn sdk_error(error: &ValaSdkError) -> napi::Error {
-    napi::Error::from_reason(format!("[{}] {error}", error.code()))
+    napi::Error::from_reason(format!(
+        "[{}] {error}",
+        wyrd_spec::error::WyrdError::from(error).code()
+    ))
 }
 
 /// Converts an arbitrary boundary error into a napi failure.

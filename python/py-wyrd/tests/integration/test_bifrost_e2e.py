@@ -10,11 +10,10 @@ from typing import TYPE_CHECKING
 
 import pytest
 from pydantic import BaseModel, ValidationError
+from wyrd import WyrdError
 from wyrd.bifrost import (
     AsyncBifrost,
     Bifrost,
-    BifrostQueryError,
-    NoCredentialsError,
     TableConfig,
 )
 from wyrd.observe import record
@@ -136,7 +135,7 @@ def test_no_resolvable_credential_raises(wyrd_server: WyrdTestServer) -> None:
         os.environ.pop(name, None)
     os.environ["HOME"] = "/nonexistent-wyrd-home"
     try:
-        with pytest.raises(NoCredentialsError) as captured:
+        with pytest.raises(WyrdError) as captured:
             Bifrost()
         assert captured.value.code == "WYRD_CLIENT_401_NO_CREDENTIALS"
     finally:
@@ -164,7 +163,7 @@ def test_insert_without_an_active_table_refuses(wyrd_server: WyrdTestServer) -> 
     """A write with nothing bound fails rather than landing somewhere."""
 
     bifrost = Bifrost(server_url=wyrd_server.base_url, credential=wyrd_server.api_key)
-    with pytest.raises(BifrostQueryError) as captured:
+    with pytest.raises(WyrdError) as captured:
         bifrost.insert(_row(0), {"card_ref": CARD_REF})
     assert captured.value.code == "WYRD_VALA_412_NO_ACTIVE_TABLE"
     assert captured.value.status == 412
@@ -351,7 +350,7 @@ def test_negative_empty_permissions_denied_rbac_on_write(wyrd_server: WyrdTestSe
     denied_key = wyrd_server.bootstrap_service([], name="bifrost-write-denied")
     bifrost = _fixture_client(wyrd_server, table_fqn, denied_key)
     bifrost.insert({"id": 999, "value": "denied"}, {"card_ref": CARD_REF})
-    with pytest.raises(BifrostQueryError, match="WYRD_PERMISSION_403_DENIED_RBAC"):
+    with pytest.raises(WyrdError, match="WYRD_PERMISSION_403_DENIED_RBAC"):
         bifrost.flush()
     # A denial is terminal, not ambiguous: the refused batch is not retained for
     # retry, so the caller is told once, at the boundary that carried the write,
@@ -379,7 +378,7 @@ def test_registering_a_different_schema_on_one_name_conflicts(
         server_url=wyrd_server.base_url,
         credential=wyrd_server.api_key,
     )
-    with pytest.raises(BifrostQueryError) as captured:
+    with pytest.raises(WyrdError) as captured:
         conflicting.register()
     assert captured.value.code == "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH"
     assert captured.value.status == 409
@@ -393,7 +392,7 @@ def test_negative_non_select_query_is_refused(wyrd_server: WyrdTestServer) -> No
     table_fqn, token = wyrd_server.prepare_oracle_query_fixture()
     bifrost = Bifrost(server_url=wyrd_server.base_url, credential=token)
 
-    with pytest.raises(BifrostQueryError) as captured:
+    with pytest.raises(WyrdError) as captured:
         bifrost.sql(f"DELETE FROM {table_fqn}")
     assert captured.value.code == "WYRD_VALA_400_QUERY_INVALID_SQL"
     assert captured.value.status == 400
@@ -409,7 +408,7 @@ def test_negative_oversized_query_is_refused(wyrd_server: WyrdTestServer) -> Non
     # The floor is 64 KiB of SQL; pad a valid SELECT past it with a comment so
     # the refusal is about size rather than syntax.
     oversized = f"SELECT id FROM {table_fqn} -- {'x' * (64 * 1024)}"
-    with pytest.raises(BifrostQueryError) as captured:
+    with pytest.raises(WyrdError) as captured:
         bifrost.sql(oversized)
     assert captured.value.code == "WYRD_VALA_400_QUERY_INVALID_SQL"
     assert captured.value.status == 400
@@ -420,7 +419,7 @@ def test_negative_invalid_sql_query(wyrd_server: WyrdTestServer) -> None:
     _table_fqn, token = wyrd_server.prepare_oracle_query_fixture()
     bifrost = Bifrost(server_url=wyrd_server.base_url, credential=token)
 
-    with pytest.raises(BifrostQueryError) as captured:
+    with pytest.raises(WyrdError) as captured:
         bifrost.sql("SELECT FROM")
     assert captured.value.code == "WYRD_VALA_400_QUERY_INVALID_SQL"
     assert captured.value.status == 400

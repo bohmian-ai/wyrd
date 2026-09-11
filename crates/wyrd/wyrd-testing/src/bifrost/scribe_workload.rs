@@ -1329,14 +1329,11 @@ impl crate::WyrdTestServer {
             })
             .await
             .map_err(|error| {
-                crate::WyrdTestServerError::Start(format!("query {table_fqn}: {}", error.detail()))
+                crate::WyrdTestServerError::Start(format!("query {table_fqn}: {error}"))
             })?;
         let mut values = Vec::new();
         while let Some(batch) = stream.next_batch().await.map_err(|error| {
-            crate::WyrdTestServerError::Start(format!(
-                "read a batch of {table_fqn}: {}",
-                error.detail()
-            ))
+            crate::WyrdTestServerError::Start(format!("read a batch of {table_fqn}: {error}"))
         })? {
             let column = batch
                 .column_by_name("value")

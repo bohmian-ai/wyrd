@@ -4,7 +4,8 @@ import asyncio
 
 import pyarrow
 import pytest
-from wyrd.bifrost import AsyncBifrost, BifrostQueryError, IncompleteQueryStreamError
+from wyrd import WyrdError
+from wyrd.bifrost import AsyncBifrost
 from wyrd.testing import WyrdTestServer
 
 
@@ -74,7 +75,7 @@ def test_bifrost_query_missing_terminal_fails_closed(
         stream = await AsyncBifrost(server_url=wyrd_server.base_url, credential=token).stream(
             f"SELECT id, value FROM {table_fqn} ORDER BY id",
         )
-        with pytest.raises(IncompleteQueryStreamError) as captured:
+        with pytest.raises(WyrdError) as captured:
             while True:
                 await stream.__anext__()
         assert captured.value.code == "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE"
@@ -99,7 +100,7 @@ def test_bifrost_query_gate_denial_has_no_oracle_side_effect(
     before = wyrd_server.bifrost_read_decision_count()
 
     async def query() -> None:
-        with pytest.raises(BifrostQueryError) as captured:
+        with pytest.raises(WyrdError) as captured:
             await AsyncBifrost(server_url=wyrd_server.base_url, credential=denied_token).stream(
                 f"SELECT * FROM {table_fqn}",
             )

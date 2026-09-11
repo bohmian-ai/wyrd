@@ -416,12 +416,12 @@ async fn read_rows(client: &WyrdClient, table: &str) -> Vec<RowIdentity> {
             deadline_ms: Some(120_000),
         })
         .await
-        .unwrap_or_else(|error| panic!("public query `{sql}` starts: {}", error.detail()));
+        .unwrap_or_else(|error| panic!("public query `{sql}` starts: {error}"));
     let mut rows = Vec::new();
     while let Some(batch) = stream
         .next_batch()
         .await
-        .unwrap_or_else(|error| panic!("public query `{sql}` streams: {}", error.detail()))
+        .unwrap_or_else(|error| panic!("public query `{sql}` streams: {error}"))
     {
         let batch_ids = batch
             .column_by_name(wyrd_spec::vala::managed_columns::WYRD_BATCH_ID)

@@ -116,8 +116,9 @@ pub fn wyrd_error_to_py_err(err: WyrdError) -> pyo3::PyErr {
 }
 ```
 
-The Python exception exposes `code`, `message`, `details`, `remediation`,
-`status`, `title`, `type`, and the full `problem` payload as attributes. Domain
+The Python exception exposes `code`, `message`, `detail`, `details`,
+`remediation`, `status`, `title`, and `type` as attributes. It does not expose
+the aggregate RFC 9457 payload as a separate `problem` attribute. Domain
 subclasses may improve `except` ergonomics, but callers distinguish durable
 failure contracts by `code`, not by parsing text.
 

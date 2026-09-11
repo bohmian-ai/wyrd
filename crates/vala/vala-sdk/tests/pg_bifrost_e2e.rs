@@ -43,6 +43,24 @@ mod pg_tests {
     use wyrd_testing::bifrost::write::{BifrostWriter, RawIngest};
     use wyrd_testing::server::WyrdTestServer;
 
+    /// The stable catalog code one SDK error projects onto.
+    ///
+    /// The SDK keeps exactly one public projection, so these journeys assert
+    /// the code through it rather than a second per-variant table.
+    fn sdk_code(error: &vala_sdk::ValaSdkError) -> &'static str {
+        wyrd_spec::error::WyrdError::from(error).code()
+    }
+
+    /// The scrubbed public detail one SDK error projects onto.
+    fn sdk_detail(error: &vala_sdk::ValaSdkError) -> String {
+        wyrd_spec::error::WyrdError::from(error)
+            .as_problem_json()
+            .get("detail")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    }
+
     fn schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
@@ -296,11 +314,11 @@ mod pg_tests {
             .await
             .expect_err("unknown query remains opaque");
         assert_eq!(
-            foreign_status.code(),
+            sdk_code(&foreign_status),
             "WYRD_VALA_404_RUNNING_QUERY_NOT_FOUND"
         );
-        assert_eq!(foreign_status.code(), absent_status.code());
-        assert_eq!(foreign_status.detail(), absent_status.detail());
+        assert_eq!(sdk_code(&foreign_status), sdk_code(&absent_status));
+        assert_eq!(sdk_detail(&foreign_status), sdk_detail(&absent_status));
         let foreign_cancel = other_query
             .cancel(&request_id)
             .await
@@ -310,21 +328,21 @@ mod pg_tests {
             .await
             .expect_err("unknown cancellation remains opaque");
         assert_eq!(
-            foreign_cancel.code(),
+            sdk_code(&foreign_cancel),
             "WYRD_VALA_404_RUNNING_QUERY_NOT_FOUND"
         );
-        assert_eq!(foreign_cancel.code(), absent_cancel.code());
-        assert_eq!(foreign_cancel.detail(), absent_cancel.detail());
+        assert_eq!(sdk_code(&foreign_cancel), sdk_code(&absent_cancel));
+        assert_eq!(sdk_detail(&foreign_cancel), sdk_detail(&absent_cancel));
         let denied = denied_query
             .running()
             .await
             .expect_err("under-privileged lifecycle list is denied");
-        assert_eq!(denied.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
+        assert_eq!(sdk_code(&denied), "WYRD_PERMISSION_403_DENIED_RBAC");
         let denied_status = denied_query
             .status(&request_id)
             .await
             .expect_err("under-privileged lifecycle status is denied");
-        assert_eq!(denied_status.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
+        assert_eq!(sdk_code(&denied_status), "WYRD_PERMISSION_403_DENIED_RBAC");
         let controls = srv
             .state()
             .bifrost
@@ -340,7 +358,7 @@ mod pg_tests {
             .cancel(&request_id)
             .await
             .expect_err("pre-dispatch audit failure refuses cancellation");
-        assert_eq!(audit_failure.code(), "WYRD_VALA_500_AUDIT_UNAVAILABLE");
+        assert_eq!(sdk_code(&audit_failure), "WYRD_VALA_500_AUDIT_UNAVAILABLE");
         srv.restore_query_cancel_attempt_audit();
         let after_failed_audit = controls
             .get(srv.data_tenant_id(), request_id.clone())
@@ -1560,7 +1578,7 @@ mod pg_tests {
                 Ok(()) => {}
                 Err(error) => {
                     assert_eq!(
-                        error.code(),
+                        sdk_code(&error),
                         "WYRD_CLIENT_429_QUEUE_FULL",
                         "unexpected error: {error}"
                     );
@@ -1639,7 +1657,7 @@ mod pg_tests {
                 Ok(()) => accepted += 1,
                 Err(error) => {
                     assert_eq!(
-                        error.code(),
+                        sdk_code(&error),
                         "WYRD_CLIENT_429_QUEUE_FULL",
                         "unexpected queue error: {error}"
                     );
@@ -2191,8 +2209,8 @@ mod pg_tests {
             .sql_as::<MistypedRow>(&format!("SELECT model FROM {facts}"))
             .await
             .expect_err("a row that does not fit the declared type fails the read");
-        assert_eq!(mismatch.code(), "WYRD_CLIENT_422_ROW_DESERIALIZATION");
-        assert_eq!(mismatch.status(), 422);
+        assert_eq!(sdk_code(&mismatch), "WYRD_CLIENT_422_ROW_DESERIALIZATION");
+        assert_eq!(wyrd_spec::error::WyrdError::from(&mismatch).status(), 422);
 
         srv.shutdown().await.expect("server shutdown");
     }

@@ -104,14 +104,14 @@ pub async fn execute(
     let mut stream = QueryClient::new(&client)
         .query(&request)
         .await
-        .map_err(CliBoundaryError::Query)?;
+        .map_err(CliBoundaryError::from)?;
     match command.format {
         QueryOutputFormat::Jsonl => write_jsonl(&mut stream, stdout).await?,
         QueryOutputFormat::Arrow => write_arrow(&mut stream, stdout).await?,
     }
     let terminal = stream
         .terminal()
-        .ok_or_else(|| CliBoundaryError::Query(vala_sdk::ValaSdkError::IncompleteQueryStream))?;
+        .ok_or_else(|| CliBoundaryError::from(vala_sdk::ValaSdkError::IncompleteQueryStream))?;
     serde_json::to_writer(&mut *stderr, terminal)
         .map_err(output_error)
         .map_err(CliBoundaryError::Local)?;
@@ -204,7 +204,7 @@ async fn write_jsonl(
     stdout: &mut dyn Write,
 ) -> Result<(), CliBoundaryError> {
     let mut writer = LineDelimitedWriter::new(stdout);
-    while let Some(batch) = stream.next_batch().await.map_err(CliBoundaryError::Query)? {
+    while let Some(batch) = stream.next_batch().await.map_err(CliBoundaryError::from)? {
         writer
             .write(&batch)
             .map_err(output_error)
@@ -225,7 +225,7 @@ async fn write_arrow(
     stream: &mut QueryResultStream,
     stdout: &mut dyn Write,
 ) -> Result<(), CliBoundaryError> {
-    let first = stream.next_batch().await.map_err(CliBoundaryError::Query)?;
+    let first = stream.next_batch().await.map_err(CliBoundaryError::from)?;
     let schema = stream.schema().cloned().ok_or_else(|| {
         CliBoundaryError::Local(WyrdCliError::Query {
             detail: "query stream did not provide an Arrow schema".to_owned(),
@@ -240,7 +240,7 @@ async fn write_arrow(
             .map_err(output_error)
             .map_err(CliBoundaryError::Local)?;
     }
-    while let Some(batch) = stream.next_batch().await.map_err(CliBoundaryError::Query)? {
+    while let Some(batch) = stream.next_batch().await.map_err(CliBoundaryError::from)? {
         writer
             .write(&batch)
             .map_err(output_error)

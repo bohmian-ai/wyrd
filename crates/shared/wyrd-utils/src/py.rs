@@ -300,7 +300,6 @@ fn build_wyrd_py_exception(py: Python<'_>, error: SpecWyrdError) -> PyResult<Bou
     exception.setattr("status", status)?;
     exception.setattr("title", title)?;
     exception.setattr("type", problem_type)?;
-    exception.setattr("problem", json_to_pyobject(py, &problem)?.bind(py))?;
     Ok(exception)
 }
 

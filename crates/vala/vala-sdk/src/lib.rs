@@ -368,12 +368,13 @@ mod sdk {
         for i in 0..40 {
             let payload = format!(r#"{{"id": {}}}"#, i + 1).into_bytes();
             if let Err(err) = bifrost.insert(payload, correlated()) {
+                let projected = wyrd_spec::error::WyrdError::from(&err);
                 assert_eq!(
-                    err.code(),
+                    projected.code(),
                     "WYRD_CLIENT_429_QUEUE_FULL",
                     "insert must surface queue-full to the caller"
                 );
-                assert_eq!(err.status(), 429);
+                assert_eq!(projected.status(), 429);
                 rejected += 1;
             }
         }
@@ -442,17 +443,18 @@ mod sdk {
         let error = bifrost
             .insert(row(), Correlation::default())
             .expect_err("an unbound write must refuse");
-        assert_eq!(error.code(), "WYRD_VALA_412_NO_ACTIVE_TABLE");
-        assert_eq!(error.status(), 412);
+        let projected = wyrd_spec::error::WyrdError::from(&error);
+        assert_eq!(projected.code(), "WYRD_VALA_412_NO_ACTIVE_TABLE");
+        assert_eq!(projected.status(), 412);
         // One catalog owner: the SDK reports the derive-backed metadata rather
         // than a second hand-written copy that could drift from it.
         let catalog = wyrd_spec::vala::error::BifrostError::NoActiveTable;
         assert_eq!(
             (
-                error.code(),
-                error.status(),
-                error.title(),
-                error.remediation()
+                projected.code(),
+                projected.status(),
+                projected.title(),
+                projected.remediation()
             ),
             (
                 catalog.code(),
@@ -631,7 +633,10 @@ mod sdk {
     fn table_config_requires_a_namespaced_name() {
         let error = TableConfig::from_arrow("predictions", test_schema())
             .expect_err("an unqualified name must refuse");
-        assert_eq!(error.code(), "WYRD_VALA_400_SCHEMA_PARSE");
+        assert_eq!(
+            wyrd_spec::error::WyrdError::from(&error).code(),
+            "WYRD_VALA_400_SCHEMA_PARSE"
+        );
     }
 
     /// A server-owned column may not be declared as a user column.
@@ -644,7 +649,10 @@ mod sdk {
         )]));
         let error = TableConfig::from_arrow("ns.tbl", schema)
             .expect_err("a correlation column is not a user column");
-        assert_eq!(error.code(), "WYRD_VALA_400_BIFROST_RESERVED_COLUMN");
+        assert_eq!(
+            wyrd_spec::error::WyrdError::from(&error).code(),
+            "WYRD_VALA_400_BIFROST_RESERVED_COLUMN"
+        );
     }
 }
 

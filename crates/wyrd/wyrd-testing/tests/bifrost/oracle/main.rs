@@ -29,15 +29,8 @@
 mod analytical_activation;
 mod analytical_inactive;
 mod capacity;
-mod convergence;
 mod distributed;
-mod grpc_surface;
-mod layout;
 mod mcp;
-mod observability;
-mod peer;
 mod peer_network;
 mod published;
-mod recovery;
-mod spill;
 mod support;

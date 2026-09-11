@@ -36,8 +36,6 @@ use wyrd_runtime::{
 use wyrd_spec::DataTenantId;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::BifrostError;
-#[cfg(feature = "test-support")]
-use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult};
 use wyrd_spec::vala::api::{
     AuditDetail, AuthMethod, BifrostQueryRequest, BifrostSecurityPhase,
     BifrostSecurityViolationKind, NodeId, PersistedFileDescriptor, QueryAuditDigest,
@@ -45,6 +43,8 @@ use wyrd_spec::vala::api::{
     QuerySchemaFrame, QuerySource, QueryStreamFrame, QueryTerminalErrorCode, QueryTerminalFrame,
     QueryTerminalOutcome, SourceCompletion, SourceCompletionOutcome, VisibilityMode,
 };
+#[cfg(feature = "test-support")]
+use wyrd_spec::vala::api::{AuditEvent, AuditOutcome};
 
 use crate::catalog::{BifrostCatalog, BifrostCatalogError, PinnedSealedTable, TableRef};
 use crate::cluster::{ClusterRegistry, ClusterSnapshot, RegisteredRole};
@@ -1167,9 +1167,9 @@ impl TestPostgresOracleAudit {
 
     /// Appends and commits one exact audit event under tenant RLS.
     ///
-    /// The caller selects the locked result while the authenticated,
-    /// authorized query decision remains `Allow`: reads record `Success` and
-    /// source security violations record `Failure`.
+    /// The caller selects the outcome the authorization boundary reached:
+    /// an admitted read records `Allowed` and a refused source security
+    /// violation records `Denied`.
     ///
     /// # Errors
     ///
@@ -1179,7 +1179,7 @@ impl TestPostgresOracleAudit {
         &self,
         context: &AuthorizedQueryContext,
         operation: &str,
-        result: AuditResult,
+        outcome: AuditOutcome,
         detail: AuditDetail,
     ) -> Result<(), BifrostError> {
         let event = AuditEvent::new(
@@ -1190,11 +1190,8 @@ impl TestPostgresOracleAudit {
             context.principal.card_ref().cloned(),
             context.principal.id,
             context.principal.kind.tag(),
-            context.auth_method,
             context.permission.to_string(),
-            AuditDecision::Allow,
-            result,
-            "scrubbed Bifrost query decision".to_owned(),
+            outcome,
         )
         .with_detail(detail);
         let mut conn = self
@@ -1227,7 +1224,7 @@ impl OracleAudit for TestPostgresOracleAudit {
         self.commit(
             context,
             "bifrost.query.read_decision",
-            AuditResult::Success,
+            AuditOutcome::Allowed,
             decision.into_detail(),
         )
         .await
@@ -1246,7 +1243,7 @@ impl OracleAudit for TestPostgresOracleAudit {
         self.commit(
             &context.query,
             "bifrost.query.security_violation",
-            AuditResult::Failure,
+            AuditOutcome::Denied,
             AuditDetail::BifrostSecurityViolation {
                 violation: violation.violation,
                 phase: violation.phase,

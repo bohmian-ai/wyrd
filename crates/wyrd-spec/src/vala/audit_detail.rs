@@ -673,43 +673,6 @@ pub enum AuditDetail {
         /// Exact ordered manifests written by the rewrite.
         output_manifest_paths: Vec<StoragePath>,
     },
-    /// One fenced Oracle reader epoch's durable lifecycle transition.
-    ///
-    /// The epoch is a process fact rather than a tenant fact, so this event is
-    /// appended under the system owner. Renewal is deliberately absent: it
-    /// changes only the lease window and revision, and auditing every five
-    /// seconds would bury the transitions that actually change what Forge may
-    /// destroy.
-    OracleReaderEpoch {
-        /// Physical node holding the epoch.
-        node_id: uuid::Uuid,
-        /// Exact `cluster_nodes` Oracle fence the epoch was acquired under.
-        fencing_token: i64,
-        /// Durable transition this row records.
-        phase: OracleReaderEpochPhase,
-        /// Revision the committing statement left behind.
-        state_revision: i64,
-    },
-    /// One epoch's durable reader protection change for one table.
-    ///
-    /// Appended in the same tenant transaction as the protection rows it
-    /// describes, so a protection change and its evidence commit or roll back
-    /// together. An admission already covered by the confirmed frontier emits
-    /// nothing, because it changes no durable state.
-    OracleTableProtection {
-        /// Physical node whose epoch published the protection.
-        node_id: uuid::Uuid,
-        /// Exact Oracle fence of that epoch.
-        fencing_token: i64,
-        /// Durable transition this row records.
-        phase: OracleTableProtectionPhase,
-        /// Canonical tenant/table resource identity.
-        group: String,
-        /// Table-local revision this transition committed.
-        revision: i64,
-        /// Oldest protected snapshot of every retained chain, sorted ascending.
-        protected_snapshot_ids: Vec<i64>,
-    },
     /// A Forge orphan-GC operation and its bounded object batch.
     ForgeOrphanGc {
         /// Deterministic identifier shared by prepared and terminal rows.

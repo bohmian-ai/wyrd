@@ -5,7 +5,7 @@ use vala_sql::queries::audit_staging::append_audit;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::storage::StorageBackendKind;
-use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
+use wyrd_spec::vala::api::{AuditEvent, AuditOutcome};
 use wyrd_spec::vala::audit_detail::{
     AuditDetail, AuditErrorCode, StorageAuditOperation, StorageBackend, StoragePath,
 };
@@ -86,19 +86,12 @@ pub(crate) async fn write(
         None,
         PrincipalId::new(caller.subject.principal_id),
         principal_kind(caller.subject.kind),
-        if caller.subject.principal_id == wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL.as_uuid() {
-            AuthMethod::Internal
-        } else {
-            AuthMethod::Jwt
-        },
         if matches!(operation, UploadAuditOperation::Download) {
             "storage:read".to_owned()
         } else {
             "storage:write".to_owned()
         },
-        AuditDecision::Allow,
-        audit_result(status_code, error_code),
-        format!("storage transition {}", operation.as_wire_str()),
+        audit_outcome(error_code),
     )
     .with_detail(detail);
     append_audit(conn, &event)
@@ -115,11 +108,15 @@ fn principal_kind(kind: StoragePrincipalKind) -> PrincipalKindTag {
     }
 }
 
-fn audit_result(status_code: i32, error_code: Option<&str>) -> AuditResult {
-    if error_code.is_some() || status_code / 100 != 2 {
-        AuditResult::Failure
-    } else {
-        AuditResult::Success
+/// Classify one storage transition as an authorization outcome.
+///
+/// Storage refuses a caller by returning a permission-denied error code; every
+/// other failure happened after the boundary admitted the caller and is engine
+/// detail carried on `AuditDetail::Storage`, not a denial.
+fn audit_outcome(error_code: Option<&str>) -> AuditOutcome {
+    match error_code.map(parse_error_code) {
+        Some(AuditErrorCode::PermissionDenied) => AuditOutcome::Denied,
+        _ => AuditOutcome::Allowed,
     }
 }
 
@@ -185,9 +182,12 @@ mod tests {
     }
 
     #[test]
-    fn non_success_status_is_a_failure_even_without_an_error_code() {
-        assert_eq!(audit_result(500, None), AuditResult::Failure);
-        assert_eq!(audit_result(200, Some("backend")), AuditResult::Failure);
-        assert_eq!(audit_result(200, None), AuditResult::Success);
+    fn only_a_permission_denial_records_a_denied_outcome() {
+        assert_eq!(audit_outcome(None), AuditOutcome::Allowed);
+        assert_eq!(audit_outcome(Some("backend")), AuditOutcome::Allowed);
+        assert_eq!(
+            audit_outcome(Some("WYRD_PERMISSION_DENIED")),
+            AuditOutcome::Denied
+        );
     }
 }

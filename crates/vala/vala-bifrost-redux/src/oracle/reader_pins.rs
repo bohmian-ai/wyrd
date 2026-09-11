@@ -37,13 +37,8 @@ use vala_sql::row_types::oracle_reader_authority::{
     ProtectionRecord, TableAuthorityIdentity,
 };
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
-use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::BifrostError;
-use wyrd_spec::vala::api::{
-    AuditDecision, AuditDetail, AuditEvent, AuditResult, AuthMethod, OracleReaderEpochPhase,
-    OracleTableProtectionPhase,
-};
+use wyrd_spec::vala::api::OracleTableProtectionPhase;
 
 use crate::catalog::{BIFROST_CATALOG_NAME, PinnedSealedTable};
 
@@ -72,9 +67,6 @@ pub(crate) const EPOCH_JOIN_BUDGET: std::time::Duration = std::time::Duration::f
 /// lease before that remainder is projected onto the local monotonic clock.
 pub(crate) const EPOCH_DATABASE_TIME_ALLOWANCE: std::time::Duration =
     std::time::Duration::from_secs(2);
-
-/// Principal recorded for background epoch and protection transitions.
-const SYSTEM_PRINCIPAL: PrincipalId = PrincipalId::new(uuid::Uuid::nil());
 
 /// Constructs an internal Bifrost failure without leaking row payloads.
 fn internal(detail: impl Into<String>) -> BifrostError {
@@ -754,14 +746,6 @@ impl OracleReaderAuthority {
                 .acquire(config.node_id, fencing_token, EPOCH_LEASE)
                 .await
                 .map_err(|error| internal(error.to_string()))?;
-            append_epoch_audit(
-                &mut conn,
-                config.node_id,
-                fencing_token,
-                OracleReaderEpochPhase::Acquired,
-                sample.state_revision,
-            )
-            .await?;
             conn.commit()
                 .await
                 .map_err(|error| internal(error.to_string()))?;
@@ -868,14 +852,6 @@ impl OracleReaderAuthority {
             )
             .await
             .map_err(|error| internal(error.to_string()))?;
-        append_epoch_audit(
-            &mut conn,
-            self.node_id,
-            self.fencing_token,
-            OracleReaderEpochPhase::Activated,
-            sample.state_revision,
-        )
-        .await?;
         conn.commit()
             .await
             .map_err(|error| internal(error.to_string()))?;
@@ -1057,13 +1033,12 @@ impl OracleReaderAuthority {
         Ok(row.activated_at.is_some())
     }
 
-    /// Commits one audited epoch state edge and returns its new revision.
+    /// Commits one epoch state edge and returns its new revision.
     ///
     /// # Errors
     ///
     /// Returns [`BifrostError::Internal`] when the fence was replaced, the
-    /// predicate matched no row, or the transaction or audit failed. State and
-    /// audit roll back together, so a failure emits neither.
+    /// predicate matched no row, or the transaction failed.
     async fn commit_epoch_transition(
         &self,
         expected_revision: i64,
@@ -1075,16 +1050,14 @@ impl OracleReaderAuthority {
             .transition(self.node_id, self.fencing_token, expected_revision, target)
             .await
             .map_err(|error| internal(error.to_string()))?;
-        let phase = match target {
-            OracleEpochState::Draining => OracleReaderEpochPhase::Draining,
-            OracleEpochState::Invalidated => OracleReaderEpochPhase::Invalidated,
-            OracleEpochState::Acquired | OracleEpochState::Active => {
-                return Err(internal(
-                    "Oracle reader epoch acquisition and activation have their own statements",
-                ));
-            }
-        };
-        append_epoch_audit(&mut conn, self.node_id, self.fencing_token, phase, revision).await?;
+        if matches!(
+            target,
+            OracleEpochState::Acquired | OracleEpochState::Active
+        ) {
+            return Err(internal(
+                "Oracle reader epoch acquisition and activation have their own statements",
+            ));
+        }
         conn.commit()
             .await
             .map_err(|error| internal(error.to_string()))?;
@@ -1103,114 +1076,6 @@ async fn system_conn(
 ) -> Result<vala_sql::TenantConn<'_>, BifrostError> {
     vala.tenant_conn(DataTenantId::SYSTEM_OWNER)
         .await
-        .map_err(|error| internal(error.to_string()))
-}
-
-/// Appends the one canonical audit row for an epoch lifecycle transition.
-///
-/// Renewal deliberately has no call site here: it changes only the lease window
-/// and revision, and auditing it every five seconds would bury the transitions
-/// that actually change what Forge may destroy.
-///
-/// # Errors
-///
-/// Returns [`BifrostError::Internal`] when the append fails; the caller's
-/// transaction then rolls back the state edge with it.
-async fn append_epoch_audit(
-    conn: &mut vala_sql::TenantConn<'_>,
-    node_id: uuid::Uuid,
-    fencing_token: i64,
-    phase: OracleReaderEpochPhase,
-    state_revision: i64,
-) -> Result<(), BifrostError> {
-    let operation = match phase {
-        OracleReaderEpochPhase::Acquired => "oracle.reader_epoch.acquired",
-        OracleReaderEpochPhase::Activated => "oracle.reader_epoch.activated",
-        OracleReaderEpochPhase::Draining => "oracle.reader_epoch.draining",
-        OracleReaderEpochPhase::Invalidated => "oracle.reader_epoch.invalidated",
-        OracleReaderEpochPhase::Retired => "oracle.reader_epoch.retired",
-    };
-    let event = AuditEvent {
-        request_id: RequestId::now_v7(),
-        trace_id: None,
-        operation: operation.to_owned(),
-        resource: format!("oracle/reader_epoch/{node_id}/{fencing_token}"),
-        card_ref: None,
-        principal_id: SYSTEM_PRINCIPAL,
-        principal_kind: PrincipalKindTag::Service,
-        auth_method: AuthMethod::Internal,
-        permission: "bifrost:oracle".to_owned(),
-        decision: AuditDecision::Allow,
-        result: AuditResult::Success,
-        payload_summary: operation.to_owned(),
-        detail: Some(AuditDetail::OracleReaderEpoch {
-            node_id,
-            fencing_token,
-            phase,
-            state_revision,
-        }),
-    };
-    vala_sql::queries::audit_staging::append_audit(conn, &event)
-        .await
-        .map(|_| ())
-        .map_err(|error| internal(error.to_string()))
-}
-
-/// Appends the one canonical audit row for a table protection transition.
-///
-/// # Errors
-///
-/// Returns [`BifrostError::Internal`] when the append fails; the caller's
-/// transaction then rolls back the protection change with it.
-async fn append_protection_audit(
-    conn: &mut vala_sql::TenantConn<'_>,
-    identity: &TableAuthorityIdentity,
-    node_id: uuid::Uuid,
-    fencing_token: i64,
-    phase: OracleTableProtectionPhase,
-    revision: i64,
-    frontier: &ProtectionFrontier,
-) -> Result<(), BifrostError> {
-    let operation = match phase {
-        OracleTableProtectionPhase::Expanded => "oracle.table_protection.expanded",
-        OracleTableProtectionPhase::Narrowed => "oracle.table_protection.narrowed",
-        OracleTableProtectionPhase::Released => "oracle.table_protection.released",
-    };
-    let group = format!(
-        "{}/{}/{}/{}",
-        identity.tenant, identity.catalog_name, identity.namespace_name, identity.table_name
-    );
-    let mut protected_snapshot_ids: Vec<i64> = frontier
-        .members
-        .iter()
-        .map(|member| member.protected_snapshot_id)
-        .collect();
-    protected_snapshot_ids.sort_unstable();
-    let event = AuditEvent {
-        request_id: RequestId::now_v7(),
-        trace_id: None,
-        operation: operation.to_owned(),
-        resource: group.clone(),
-        card_ref: None,
-        principal_id: SYSTEM_PRINCIPAL,
-        principal_kind: PrincipalKindTag::Service,
-        auth_method: AuthMethod::Internal,
-        permission: "bifrost:oracle".to_owned(),
-        decision: AuditDecision::Allow,
-        result: AuditResult::Success,
-        payload_summary: operation.to_owned(),
-        detail: Some(AuditDetail::OracleTableProtection {
-            node_id,
-            fencing_token,
-            phase,
-            group,
-            revision,
-            protected_snapshot_ids,
-        }),
-    };
-    vala_sql::queries::audit_staging::append_audit(conn, &event)
-        .await
-        .map(|_| ())
         .map_err(|error| internal(error.to_string()))
 }
 
@@ -1518,16 +1383,6 @@ impl OracleReaderAuthority {
                 .map_err(|error| internal(error.to_string()))?;
             match outcome {
                 ProtectionCas::Committed(record) => {
-                    append_protection_audit(
-                        &mut conn,
-                        identity,
-                        self.node_id,
-                        self.fencing_token,
-                        phase,
-                        record.revision,
-                        required,
-                    )
-                    .await?;
                     conn.commit()
                         .await
                         .map_err(|error| internal(error.to_string()))?;
@@ -1781,14 +1636,6 @@ impl OracleReaderAuthority {
             .retire(self.node_id, self.fencing_token, invalidated)
             .await
             .map_err(|error| internal(error.to_string()))?;
-        append_epoch_audit(
-            &mut conn,
-            self.node_id,
-            self.fencing_token,
-            OracleReaderEpochPhase::Retired,
-            invalidated,
-        )
-        .await?;
         conn.commit()
             .await
             .map_err(|error| internal(error.to_string()))?;
@@ -2161,14 +2008,6 @@ impl OracleEpochRecovery {
                 .await
                 .map_err(|error| internal(error.to_string()))?;
             let revision = if let Some(revision) = invalidated {
-                append_epoch_audit(
-                    &mut conn,
-                    node_id,
-                    fencing_token,
-                    OracleReaderEpochPhase::Invalidated,
-                    revision,
-                )
-                .await?;
                 revision
             } else {
                 let row = OracleReaderEpochs::new(&mut conn)
@@ -2208,14 +2047,6 @@ impl OracleEpochRecovery {
             .retire(node_id, fencing_token, revision)
             .await
             .map_err(|error| internal(error.to_string()))?;
-        append_epoch_audit(
-            &mut conn,
-            node_id,
-            fencing_token,
-            OracleReaderEpochPhase::Retired,
-            revision,
-        )
-        .await?;
         conn.commit()
             .await
             .map_err(|error| internal(error.to_string()))?;
@@ -2268,16 +2099,6 @@ impl OracleEpochRecovery {
                 "Oracle epoch recovery lost the release compare-and-set",
             ));
         }
-        append_protection_audit(
-            &mut conn,
-            &identity,
-            node_id,
-            fencing_token,
-            OracleTableProtectionPhase::Released,
-            revision,
-            &ProtectionFrontier::default(),
-        )
-        .await?;
         conn.commit()
             .await
             .map_err(|error| internal(error.to_string()))?;

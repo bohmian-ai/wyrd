@@ -26,7 +26,7 @@ pub struct AuditProjection {
     pub seq_hi: i64,
     /// Stable idempotency key for the projected shipment.
     pub batch_id: [u8; 16],
-    /// Exactly the 17 content fields declared by [`AuditLogTable`].
+    /// Exactly the 13 content fields declared by [`AuditLogTable`].
     pub rows: RecordBatch,
 }
 
@@ -129,9 +129,7 @@ fn validate_range(
             &row.principal_kind,
             ["user", "service", "agent"],
         )?;
-        validate_enum(index, "auth_method", &row.auth_method, ["jwt", "internal"])?;
-        validate_enum(index, "decision", &row.decision, ["allow", "deny"])?;
-        validate_enum(index, "result", &row.result, ["success", "failure"])?;
+        validate_enum(index, "outcome", &row.outcome, ["allowed", "denied"])?;
 
         let _ = (entry_hash, prev_hash);
     }
@@ -183,33 +181,17 @@ fn project_record_batch(rows: &[AuditStagingRow]) -> Result<RecordBatch, AuditPr
         .iter()
         .map(|row| row.principal_kind.clone())
         .collect::<Vec<_>>();
-    let auth_method_values = rows
+    let outcome_values = rows
         .iter()
-        .map(|row| row.auth_method.clone())
+        .map(|row| row.outcome.clone())
         .collect::<Vec<_>>();
     let permission_values = rows
         .iter()
         .map(|row| row.permission.clone())
         .collect::<Vec<_>>();
-    let decision_values = rows
-        .iter()
-        .map(|row| row.decision.clone())
-        .collect::<Vec<_>>();
-    let result_values = rows
-        .iter()
-        .map(|row| row.result.clone())
-        .collect::<Vec<_>>();
-    let payload_summary_values = rows
-        .iter()
-        .map(|row| row.payload_summary.clone())
-        .collect::<Vec<_>>();
     let detail_values = rows
         .iter()
         .map(|row| row.detail.clone())
-        .collect::<Vec<_>>();
-    let created_at_values = rows
-        .iter()
-        .map(|row| row.created_at.timestamp_micros())
         .collect::<Vec<_>>();
     let schema = Arc::new(Schema::new(AuditLogTable::arrow_fields()));
     let columns: Vec<ArrayRef> = vec![
@@ -223,13 +205,9 @@ fn project_record_batch(rows: &[AuditStagingRow]) -> Result<RecordBatch, AuditPr
         Arc::new(StringArray::from(card_ref_values)),
         Arc::new(StringArray::from(principal_id_values)),
         Arc::new(StringArray::from(principal_kind_values)),
-        Arc::new(StringArray::from(auth_method_values)),
         Arc::new(StringArray::from(permission_values)),
-        Arc::new(StringArray::from(decision_values)),
-        Arc::new(StringArray::from(result_values)),
-        Arc::new(StringArray::from(payload_summary_values)),
+        Arc::new(StringArray::from(outcome_values)),
         Arc::new(StringArray::from(detail_values)),
-        Arc::new(Int64Array::from(created_at_values)),
     ];
     let rows = RecordBatch::try_new(schema, columns)
         .map_err(|error| AuditProjectionError::Schema(error.to_string()))?;
@@ -283,7 +261,7 @@ fn derive_batch_id(tenant: DataTenantId, seq_lo: i64, seq_hi: i64) -> [u8; 16] {
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::{Array, Int64Array, StringArray};
+    use arrow::array::{Array, StringArray};
     use chrono::{TimeZone, Utc};
 
     use super::*;
@@ -307,11 +285,8 @@ mod tests {
             card_ref: None,
             principal_id: Uuid::now_v7(),
             principal_kind: "user".to_owned(),
-            auth_method: "jwt".to_owned(),
             permission: "audit:write".to_owned(),
-            decision: "allow".to_owned(),
-            result: "success".to_owned(),
-            payload_summary: "one row".to_owned(),
+            outcome: "allowed".to_owned(),
             detail: None,
             created_at: Utc
                 .timestamp_micros(1_700_000_000_000_000 + seq)
@@ -329,7 +304,7 @@ mod tests {
         assert_eq!(projection.tenant, authenticated);
         assert_eq!((projection.seq_lo, projection.seq_hi), (7, 8));
         assert_eq!(projection.batch_id, derive_batch_id(authenticated, 7, 8));
-        assert_eq!(projection.rows.num_columns(), 17);
+        assert_eq!(projection.rows.num_columns(), 13);
         assert_eq!(
             projection.rows.schema(),
             Arc::new(Schema::new(AuditLogTable::arrow_fields()))
@@ -344,17 +319,7 @@ mod tests {
         assert_eq!(hashes.value(0), "ab".repeat(32));
         assert!(projection.rows.column(4).is_null(0));
         assert!(projection.rows.column(7).is_null(0));
-        assert!(projection.rows.column(15).is_null(0));
-        assert_eq!(
-            projection
-                .rows
-                .column(16)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("created at")
-                .value(0),
-            1_700_000_000_000_007
-        );
+        assert!(projection.rows.column(12).is_null(0));
     }
 
     #[test]
@@ -413,11 +378,11 @@ mod tests {
         ));
 
         let mut bad_enum = row(authenticated, 1);
-        bad_enum.decision = "maybe".to_owned();
+        bad_enum.outcome = "maybe".to_owned();
         assert!(matches!(
             project_audit_rows(authenticated, &[bad_enum]),
             Err(AuditProjectionError::InvalidEnum {
-                field: "decision",
+                field: "outcome",
                 ..
             })
         ));

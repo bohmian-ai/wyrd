@@ -29,9 +29,8 @@ use vala_sql::row_types::oracle_reader_authority::{
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{
-    AuditDecision, AuditDetail, AuditEvent, AuditResult, AuthMethod, ClusterCapabilities,
-    ClusterNodeKey, ClusterRole, NodeId, OracleCapabilitiesV1, OracleReaderEpochPhase,
-    OracleTableProtectionPhase, QueryClass,
+    AuthMethod, ClusterCapabilities, ClusterNodeKey, ClusterRole, NodeId, OracleCapabilitiesV1,
+    QueryClass,
 };
 
 /// How long a durable expectation may take to appear before the test fails.
@@ -199,31 +198,6 @@ impl AuthorityFixture {
             .expect("protection read")
     }
 
-    /// Lists the protection audit operations recorded for one table.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the audit rows cannot be read.
-    async fn audit_operations(&self, identity: &TableAuthorityIdentity) -> Vec<String> {
-        let pool = self
-            .database
-            .superuser_pool()
-            .await
-            .expect("superuser pool");
-        sqlx::query_scalar(
-            "SELECT operation FROM vala.audit_staging \
-              WHERE data_tenant_id = $1 AND resource = $2 ORDER BY seq",
-        )
-        .bind(identity.tenant.as_uuid())
-        .bind(format!(
-            "{}/{}/{}/{}",
-            identity.tenant, identity.catalog_name, identity.namespace_name, identity.table_name
-        ))
-        .fetch_all(&pool)
-        .await
-        .expect("audit rows read")
-    }
-
     /// Reads this epoch's durable row exactly as Postgres holds it.
     ///
     /// # Panics
@@ -241,41 +215,6 @@ impl AuthorityFixture {
             .read(self.node_id, i64::try_from(self.fence).expect("fence fits"))
             .await
             .expect("epoch read")
-    }
-
-    /// Lists the epoch lifecycle audit operations this node recorded.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the audit rows cannot be read.
-    async fn epoch_audit_operations(&self) -> Vec<String> {
-        self.epoch_audit_operations_at(i64::try_from(self.fence).expect("fence fits"))
-            .await
-    }
-
-    /// Lists the epoch lifecycle audit operations recorded at one exact fence.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the audit rows cannot be read.
-    async fn epoch_audit_operations_at(&self, fencing_token: i64) -> Vec<String> {
-        let pool = self
-            .database
-            .superuser_pool()
-            .await
-            .expect("superuser pool");
-        sqlx::query_scalar(
-            "SELECT operation FROM vala.audit_staging \
-              WHERE data_tenant_id = $1 AND resource = $2 ORDER BY seq",
-        )
-        .bind(uuid::Uuid::from(DataTenantId::SYSTEM_OWNER))
-        .bind(format!(
-            "oracle/reader_epoch/{}/{fencing_token}",
-            self.node_id
-        ))
-        .fetch_all(&pool)
-        .await
-        .expect("audit rows read")
     }
 
     /// Polls until one table's durable header satisfies `predicate`.
@@ -399,26 +338,6 @@ impl AuthorityFixture {
         (headers, members)
     }
 
-    /// Polls until this epoch's lifecycle audit contains `operation`.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the operation is not durable within [`SETTLE_BUDGET`].
-    async fn settle_epoch_audit(&self, operation: &str) {
-        let deadline = tokio::time::Instant::now() + SETTLE_BUDGET;
-        loop {
-            let recorded = self.epoch_audit_operations().await;
-            if recorded.iter().any(|entry| entry == operation) {
-                return;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "{operation} never reached the epoch audit; last was {recorded:?}"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }
-
     /// Waits until one backend is queued behind this epoch's exact row.
     ///
     /// A writer that must wait for a row first takes a `tuple` lock naming the
@@ -515,99 +434,10 @@ async fn open_protection_publication<'pool>(
         .commit(identity, node_id, fence, None, frontier)
         .await
         .expect("protection publication runs");
-    let ProtectionCas::Committed(record) = outcome else {
+    let ProtectionCas::Committed(_) = outcome else {
         panic!("a first publication is not a conflict");
     };
-    append_expanded_audit(&mut conn, identity, node_id, fence, record.revision).await;
     conn
-}
-
-/// Appends the canonical expanded-protection audit row for one publication.
-///
-/// # Panics
-///
-/// Panics when the append fails.
-async fn append_expanded_audit(
-    conn: &mut vala_sql::TenantConn<'_>,
-    identity: &TableAuthorityIdentity,
-    node_id: Uuid,
-    fence: i64,
-    revision: i64,
-) {
-    let group = format!(
-        "{}/{}/{}/{}",
-        identity.tenant, identity.catalog_name, identity.namespace_name, identity.table_name
-    );
-    let event = AuditEvent {
-        request_id: wyrd_spec::request_id::RequestId::now_v7(),
-        trace_id: None,
-        operation: "oracle.table_protection.expanded".to_owned(),
-        resource: group.clone(),
-        card_ref: None,
-        principal_id: wyrd_spec::auth::PrincipalId::new(Uuid::nil()),
-        principal_kind: wyrd_spec::auth::PrincipalKindTag::Service,
-        auth_method: AuthMethod::Internal,
-        permission: "bifrost:oracle".to_owned(),
-        decision: AuditDecision::Allow,
-        result: AuditResult::Success,
-        payload_summary: "oracle.table_protection.expanded".to_owned(),
-        detail: Some(AuditDetail::OracleTableProtection {
-            node_id,
-            fencing_token: fence,
-            phase: OracleTableProtectionPhase::Expanded,
-            group,
-            revision,
-            protected_snapshot_ids: vec![10],
-        }),
-    };
-    vala_sql::queries::audit_staging::append_audit(conn, &event)
-        .await
-        .expect("protection audit appends");
-}
-
-/// Appends one canonical epoch invalidation audit row for a seeded predecessor.
-///
-/// A predecessor that reached invalidation before this process started has that
-/// transition in the audit already, so a test that seeds the row must seed its
-/// audit too: the point of resuming such an epoch is that it is *not* audited a
-/// second time.
-///
-/// # Panics
-///
-/// Panics when the append or its transaction fails.
-async fn append_invalidation_audit(
-    pool: &sqlx::PgPool,
-    node_id: Uuid,
-    fencing_token: i64,
-    state_revision: i64,
-) {
-    let mut conn = vala_sql::TenantConn::acquire(pool, DataTenantId::SYSTEM_OWNER)
-        .await
-        .expect("system connection");
-    let event = AuditEvent {
-        request_id: wyrd_spec::request_id::RequestId::now_v7(),
-        trace_id: None,
-        operation: "oracle.reader_epoch.invalidated".to_owned(),
-        resource: format!("oracle/reader_epoch/{node_id}/{fencing_token}"),
-        card_ref: None,
-        principal_id: wyrd_spec::auth::PrincipalId::new(Uuid::nil()),
-        principal_kind: wyrd_spec::auth::PrincipalKindTag::Service,
-        auth_method: AuthMethod::Internal,
-        permission: "bifrost:oracle".to_owned(),
-        decision: AuditDecision::Allow,
-        result: AuditResult::Success,
-        payload_summary: "oracle.reader_epoch.invalidated".to_owned(),
-        detail: Some(AuditDetail::OracleReaderEpoch {
-            node_id,
-            fencing_token,
-            phase: OracleReaderEpochPhase::Invalidated,
-            state_revision,
-        }),
-    };
-    vala_sql::queries::audit_staging::append_audit(&mut conn, &event)
-        .await
-        .expect("epoch audit appends");
-    conn.commit().await.expect("epoch audit commits");
 }
 
 /// Builds one local cut with an exact ancestry, newest first.
@@ -644,11 +474,6 @@ async fn aggregate_and_narrow(
     assert_eq!(opened.revision, 1);
     assert_eq!(opened.frontier.members.len(), 1);
     assert!(opened.frontier.covers(30));
-    assert_eq!(
-        fixture.audit_operations(events).await,
-        vec!["oracle.table_protection.expanded".to_owned()]
-    );
-
     // A second reader of the same snapshot is already covered: no revision, no
     // mutation, no evidence. That is the whole point of aggregating.
     let (covered, _covered_permit) = authority
@@ -657,8 +482,6 @@ async fn aggregate_and_narrow(
         .expect("covered admission protects");
     let unchanged = fixture.header(events).await.expect("the header survives");
     assert_eq!(unchanged, opened, "a covered admission writes nothing");
-    assert_eq!(fixture.audit_operations(events).await.len(), 1);
-
     // An older cut on the same chain widens the existing member downward.
     let (older, _older_permit) = authority
         .acquire_guard_for_cuts(vec![(events.clone(), cut(20, 200, &[20, 10]))])
@@ -679,15 +502,6 @@ async fn aggregate_and_narrow(
     assert_eq!(both.revision, 3);
     assert_eq!(both.frontier.members.len(), 2);
     assert!(both.frontier.covers(25) && both.frontier.covers(30));
-    assert_eq!(
-        fixture.audit_operations(events).await,
-        vec![
-            "oracle.table_protection.expanded".to_owned(),
-            "oracle.table_protection.expanded".to_owned(),
-            "oracle.table_protection.expanded".to_owned(),
-        ]
-    );
-
     // Protection is table-local and tenant-local throughout.
     assert!(fixture.header(orders).await.is_none());
     assert!(fixture.header(foreign).await.is_none());
@@ -752,7 +566,6 @@ async fn refuse_uncommittable_release(
     .expect("digest corruption applies");
     drop(covered);
     drop(first);
-    let audits_before = fixture.audit_operations(events).await.len();
     tokio::time::sleep(Duration::from_millis(200)).await;
     let (revision, members): (i64, i64) = sqlx::query_as(
         "SELECT (SELECT revision FROM vala.oracle_table_protections WHERE data_tenant_id = $1), \
@@ -768,7 +581,6 @@ async fn refuse_uncommittable_release(
         (intact.revision, 1),
         "a failed release keeps the prior protection exactly"
     );
-    assert_eq!(fixture.audit_operations(events).await.len(), audits_before);
     sqlx::query(
         "UPDATE vala.oracle_table_protections SET frontier_digest = $2 WHERE data_tenant_id = $1",
     )
@@ -898,14 +710,6 @@ async fn process_global_authority_aggregates_and_releases_conservatively() {
         .expect("epoch retires");
     assert!(fixture.header(&events).await.is_none());
     assert!(fixture.header(&orders).await.is_none());
-    assert_eq!(
-        fixture
-            .audit_operations(&events)
-            .await
-            .last()
-            .map(String::as_str),
-        Some("oracle.table_protection.released")
-    );
 }
 
 /// Proves a live epoch's durable revisions, deadlines, and silent renewal.
@@ -952,13 +756,6 @@ async fn assert_live_epoch_accounting(
             .expect("the epoch row survives renewal")
             .state_revision,
         3
-    );
-    assert_eq!(
-        fixture.epoch_audit_operations().await,
-        vec![
-            "oracle.reader_epoch.acquired".to_owned(),
-            "oracle.reader_epoch.activated".to_owned(),
-        ]
     );
 }
 
@@ -1024,15 +821,6 @@ async fn epoch_lifecycle_self_fences_and_retires_in_order() {
         draining.state,
         vala_sql::row_types::oracle_reader_authority::OracleEpochState::Draining
     );
-    assert_eq!(
-        fixture
-            .epoch_audit_operations()
-            .await
-            .last()
-            .map(String::as_str),
-        Some("oracle.reader_epoch.draining")
-    );
-
     // Retirement after a self-fence owes no second loss edge; it joins the now
     // released descendant, releases each table, invalidates, then deletes.
     drop(guard);
@@ -1044,23 +832,6 @@ async fn epoch_lifecycle_self_fences_and_retires_in_order() {
     assert!(
         fixture.epoch_row().await.is_none(),
         "a retired epoch leaves no row"
-    );
-    assert_eq!(
-        fixture.audit_operations(&events).await,
-        vec![
-            "oracle.table_protection.expanded".to_owned(),
-            "oracle.table_protection.released".to_owned(),
-        ]
-    );
-    assert_eq!(
-        fixture.epoch_audit_operations().await,
-        vec![
-            "oracle.reader_epoch.acquired".to_owned(),
-            "oracle.reader_epoch.activated".to_owned(),
-            "oracle.reader_epoch.draining".to_owned(),
-            "oracle.reader_epoch.invalidated".to_owned(),
-            "oracle.reader_epoch.retired".to_owned(),
-        ]
     );
 }
 
@@ -1204,15 +975,6 @@ async fn stalled_loss_verification_terminates_at_the_caller_deadline() {
         vala_sql::row_types::oracle_reader_authority::OracleEpochState::Draining,
         "the supervisor's loss edge stands and nothing follows it"
     );
-    assert_eq!(
-        fixture.epoch_audit_operations().await,
-        vec![
-            "oracle.reader_epoch.acquired".to_owned(),
-            "oracle.reader_epoch.activated".to_owned(),
-            "oracle.reader_epoch.draining".to_owned(),
-        ],
-        "no invalidation or retirement edge follows an exhausted verification"
-    );
     drop(guard);
 }
 
@@ -1305,14 +1067,6 @@ async fn blocked_loss_settlement_terminates_at_the_caller_deadline() {
         vala_sql::row_types::oracle_reader_authority::OracleEpochState::Active,
         "a loss edge that never committed leaves the epoch exactly as it was"
     );
-    assert_eq!(
-        fixture.epoch_audit_operations().await,
-        vec![
-            "oracle.reader_epoch.acquired".to_owned(),
-            "oracle.reader_epoch.activated".to_owned(),
-        ],
-        "no invalidation or retirement edge follows an exhausted settlement"
-    );
     drop(guard);
 }
 
@@ -1373,15 +1127,6 @@ async fn unjoined_descendants_terminate_at_the_caller_deadline() {
             .expect("the epoch row survives")
             .state,
         vala_sql::row_types::oracle_reader_authority::OracleEpochState::Draining
-    );
-    assert_eq!(
-        fixture.epoch_audit_operations().await,
-        vec![
-            "oracle.reader_epoch.acquired".to_owned(),
-            "oracle.reader_epoch.activated".to_owned(),
-            "oracle.reader_epoch.draining".to_owned(),
-        ],
-        "an exhausted join reaches neither invalidation nor retirement"
     );
     drop(guard);
 }
@@ -1766,9 +1511,6 @@ async fn late_publication_leaves_a_resumable_epoch() {
         );
         async move { recovery.reclaim_expired(64).await }
     });
-    fixture
-        .settle_epoch_audit("oracle.reader_epoch.invalidated")
-        .await;
     fixture.settle_blocked_epoch_delete().await;
     publication
         .commit()
@@ -1797,12 +1539,6 @@ async fn late_publication_leaves_a_resumable_epoch() {
         (1, 1),
         "the published header and its member survive"
     );
-    assert_eq!(
-        fixture.epoch_audit_operations().await,
-        vec!["oracle.reader_epoch.invalidated".to_owned()],
-        "the lost retirement is not audited"
-    );
-
     // The next pass resumes the already-invalidated epoch and finishes it.
     recovery
         .reclaim_expired(64)
@@ -1816,22 +1552,6 @@ async fn late_publication_leaves_a_resumable_epoch() {
     assert!(
         fixture.epoch_row().await.is_none(),
         "resumed recovery retires the epoch"
-    );
-    assert_eq!(
-        fixture.audit_operations(&events).await,
-        vec![
-            "oracle.table_protection.expanded".to_owned(),
-            "oracle.table_protection.released".to_owned(),
-        ],
-        "the table records exactly one publication and one release"
-    );
-    assert_eq!(
-        fixture.epoch_audit_operations().await,
-        vec![
-            "oracle.reader_epoch.invalidated".to_owned(),
-            "oracle.reader_epoch.retired".to_owned(),
-        ],
-        "resuming an invalidated epoch appends no second invalidation"
     );
 }
 
@@ -1885,10 +1605,6 @@ async fn retirement_refuses_every_later_publication() {
         (0, 0),
         "the rejected publication leaves no header or member behind"
     );
-    assert!(
-        retired.audit_operations(&retired_events).await.is_empty(),
-        "a rejected publication records no table audit"
-    );
 }
 
 /// Seeds one invalidated predecessor epoch whose protection cannot be released.
@@ -1939,7 +1655,6 @@ async fn seed_unreleasable_predecessor(
         .commit()
         .await
         .expect("the predecessor's protection is durable");
-    append_invalidation_audit(fixture.database.app_pool(), fixture.node_id, stale_fence, 2).await;
     sqlx::query(
         "UPDATE vala.oracle_table_protections SET frontier_digest = $3 \
           WHERE node_id = $1 AND fencing_token = $2",
@@ -1988,7 +1703,7 @@ async fn startup_recovery_failure_prevents_epoch_activation_and_readiness() {
         .superuser_pool()
         .await
         .expect("superuser pool");
-    let (stale_fence, events) = seed_unreleasable_predecessor(&fixture).await;
+    let (stale_fence, _events) = seed_unreleasable_predecessor(&fixture).await;
 
     let recovery = OracleEpochRecovery::new(
         fixture.database.operator_pool().clone(),
@@ -2026,16 +1741,6 @@ async fn startup_recovery_failure_prevents_epoch_activation_and_readiness() {
         "an unreleasable header and its member survive the failed pass"
     );
     assert_eq!(
-        fixture.epoch_audit_operations_at(stale_fence).await,
-        vec!["oracle.reader_epoch.invalidated".to_owned()],
-        "resuming appends no second invalidation and no retirement"
-    );
-    assert_eq!(
-        fixture.audit_operations(&events).await,
-        vec!["oracle.table_protection.expanded".to_owned()],
-        "a failed release records no release audit"
-    );
-    assert_eq!(
         fixture
             .epoch_row()
             .await
@@ -2044,12 +1749,6 @@ async fn startup_recovery_failure_prevents_epoch_activation_and_readiness() {
         vala_sql::row_types::oracle_reader_authority::OracleEpochState::Acquired,
         "startup stopped before activation"
     );
-    assert_eq!(
-        fixture.epoch_audit_operations().await,
-        vec!["oracle.reader_epoch.acquired".to_owned()],
-        "an epoch that never activated publishes no readiness"
-    );
-
     authority
         .retire(retirement_deadline())
         .await
@@ -2091,12 +1790,6 @@ async fn narrowing_retries_once_and_covered_duplicates_need_no_sql() {
         .header(&events)
         .await
         .expect("the shared protection is durable");
-    assert_eq!(
-        fixture.audit_operations(&events).await,
-        vec!["oracle.table_protection.expanded".to_owned()],
-        "an already covered second query commits nothing"
-    );
-
     // Releasing a covered duplicate leaves the frontier identical, so it must
     // not reach Postgres at all.
     drop(first);
@@ -2115,12 +1808,6 @@ async fn narrowing_retries_once_and_covered_duplicates_need_no_sql() {
         expanded.revision,
         "releasing a covered duplicate commits no revision"
     );
-    assert_eq!(
-        fixture.audit_operations(&events).await,
-        vec!["oracle.table_protection.expanded".to_owned()],
-        "releasing a covered duplicate writes no audit row"
-    );
-
     // The last release does change the durable set. Its first commit fails, so
     // the pin must survive and the same command must be applied again.
     authority.inject_protection_faults_for_test(1);
@@ -2133,15 +1820,6 @@ async fn narrowing_retries_once_and_covered_duplicates_need_no_sql() {
         0,
         "the injected fault was consumed by the first attempt"
     );
-    assert_eq!(
-        fixture.audit_operations(&events).await,
-        vec![
-            "oracle.table_protection.expanded".to_owned(),
-            "oracle.table_protection.released".to_owned(),
-        ],
-        "the retry commits exactly one release"
-    );
-
     authority
         .retire(retirement_deadline())
         .await

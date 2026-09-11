@@ -297,15 +297,6 @@ mod pg_tests {
     /// columns. `attributes` is the one that carries the structured `GenAI`
     /// input and output messages, so gating it is what keeps a conversation
     /// payload from reaching a caller holding query access alone.
-    const PAYLOAD_COLUMNS: [&str; 6] = [
-        "attributes",
-        "events",
-        "links",
-        "resource_attributes",
-        "resource_entity_refs",
-        "scope_attributes",
-    ];
-
     /// One maximal span exported over OTLP/gRPC reads back with every field.
     ///
     /// This is the fidelity contract in one path. The exporter sends every
@@ -350,44 +341,21 @@ mod pg_tests {
             .await;
         assert_maximal_span_row(&row, start, GRPC_SPAN);
 
-        let metadata_only = journey
-            .client_with_permissions("otlp_span_metadata", &[Permission::bifrost_query_read()])
+        let reader = journey
+            .client_with_permissions("otlp_span_reader", &[Permission::bifrost_query_read()])
             .await;
-        let permitted = journey
+        let rows = journey
             .query_as(
-                &metadata_only,
-                &format!(
-                    "SELECT name, gen_ai_request_model, gen_ai_usage_input_tokens \
-                     FROM {SPANS_TABLE} WHERE start_time_unix_nano = {start}"
-                ),
+                &reader,
+                &format!("SELECT * FROM {SPANS_TABLE} WHERE start_time_unix_nano = {start}"),
             )
             .await;
         assert_eq!(
-            permitted
-                .iter()
+            rows.iter()
                 .map(arrow::array::RecordBatch::num_rows)
                 .sum::<usize>(),
             1,
-            "a caller without payload permission still reads promoted GenAI metadata"
-        );
-        for column_name in PAYLOAD_COLUMNS {
-            let refusal = journey
-                .query_error(
-                    &metadata_only,
-                    &format!("SELECT {column_name} FROM {SPANS_TABLE}"),
-                )
-                .await;
-            assert_eq!(
-                refusal, "WYRD_VALA_403_PAYLOAD_FORBIDDEN",
-                "projecting `{column_name}` without payload permission is refused"
-            );
-        }
-        let star = journey
-            .query_error(&metadata_only, &format!("SELECT * FROM {SPANS_TABLE}"))
-            .await;
-        assert_eq!(
-            star, "WYRD_VALA_403_PAYLOAD_FORBIDDEN",
-            "`SELECT *` cannot smuggle the structured GenAI messages past the gate"
+            "table query permission covers the complete trace span"
         );
 
         journey.shutdown().await;

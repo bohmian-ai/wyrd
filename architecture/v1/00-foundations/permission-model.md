@@ -40,9 +40,8 @@ an empty, over-long, or dotted value is rejected.
 Scope is domain-tagged so a future Wyrd domain that needs object scope adds its
 own typed variant rather than overloading someone else's identity spelling.
 
-Bifrost object scope is valid only on the Bifrost query and sensitive-payload
-read resources. Attaching it to any other resource — including `AnyOf` and
-`Wildcard` — is rejected at decode.
+Bifrost object scope is valid only on Bifrost query reads. Attaching it to any
+other resource — including `AnyOf` and `Wildcard` — is rejected at decode.
 
 ## Vocabulary
 

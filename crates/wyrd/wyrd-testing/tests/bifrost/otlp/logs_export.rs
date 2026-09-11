@@ -80,41 +80,17 @@ mod pg_tests {
     use super::super::trace_export_http::HttpEncoding;
     use super::{export_logs_over_grpc, export_logs_over_http};
 
-    /// Every canonical log column that carries caller content.
-    ///
-    /// These are exactly `vala.logs.records`'s declared sensitive payload
-    /// columns; a caller without `bifrost_log_payload:read` must not be able
-    /// to read any of them, individually or through `SELECT *`.
-    const PAYLOAD_COLUMNS: [&str; 5] = [
-        "body",
-        "attributes",
-        "resource_attributes",
-        "resource_entity_refs",
-        "scope_attributes",
-    ];
-
-    /// The metadata columns the same unauthorized caller must still read.
-    const PERMITTED_COLUMNS: &str = "time_unix_nano, severity_number, severity_text, event_name";
-
-    /// A log record round-trips its body and context, and its payload is gated.
+    /// A log record round-trips its body and context.
     ///
     /// One maximal log record — a present body, an `OTel` event name, a real
     /// trace/span correlation, every attribute shape, and a full resource and
     /// scope envelope — is exported over all three transports and read back
-    /// through canonical SQL. Storing the record is only half the contract:
-    /// its body and attributes are declared sensitive payload, so the same
-    /// published rows are then read by a second authenticated principal that
-    /// holds `bifrost_query:read` and deliberately does not hold
-    /// `bifrost_log_payload:read`. That caller must still read the permitted
-    /// metadata and must be refused every protected column, including through
-    /// `SELECT *` — refused before projection rather than served a redacted
-    /// or empty value that a client could mistake for "nothing was recorded".
+    /// through canonical SQL.
     ///
     /// # Panics
     ///
     /// Panics when an export is refused, when a stored column differs from
-    /// what was sent, when the unauthorized caller receives protected content,
-    /// or when that caller is refused the metadata it is entitled to.
+    /// what was sent, or when a table-authorized caller cannot read the row.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires the Postgres-backed Bifrost journey lane"]
     async fn otlp_log_routes_round_trip_body_context_and_redaction() {
@@ -216,44 +192,21 @@ mod pg_tests {
             );
         }
 
-        let metadata_only = journey
-            .client_with_permissions("otlp_log_metadata", &[Permission::bifrost_query_read()])
+        let reader = journey
+            .client_with_permissions("otlp_log_reader", &[Permission::bifrost_query_read()])
             .await;
-        let permitted = journey
+        let rows = journey
             .query_as(
-                &metadata_only,
-                &format!(
-                    "SELECT {PERMITTED_COLUMNS} FROM {LOGS_TABLE} WHERE time_unix_nano = {anchor}"
-                ),
+                &reader,
+                &format!("SELECT * FROM {LOGS_TABLE} WHERE time_unix_nano = {anchor}"),
             )
             .await;
         assert_eq!(
-            permitted
-                .iter()
+            rows.iter()
                 .map(arrow::array::RecordBatch::num_rows)
                 .sum::<usize>(),
             1,
-            "a caller without payload permission still reads permitted metadata"
-        );
-
-        for column_name in PAYLOAD_COLUMNS {
-            let refusal = journey
-                .query_error(
-                    &metadata_only,
-                    &format!("SELECT {column_name} FROM {LOGS_TABLE}"),
-                )
-                .await;
-            assert_eq!(
-                refusal, "WYRD_VALA_403_PAYLOAD_FORBIDDEN",
-                "projecting `{column_name}` without payload permission is refused: {refusal:?}"
-            );
-        }
-        let star = journey
-            .query_error(&metadata_only, &format!("SELECT * FROM {LOGS_TABLE}"))
-            .await;
-        assert_eq!(
-            star, "WYRD_VALA_403_PAYLOAD_FORBIDDEN",
-            "`SELECT *` cannot smuggle protected columns past the payload gate"
+            "table query permission covers the complete log row"
         );
 
         journey.shutdown().await;

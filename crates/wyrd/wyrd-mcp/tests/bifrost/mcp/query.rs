@@ -668,16 +668,13 @@ mod pg_tests {
     }
 
     /// An agent answers a complete GenAI incident question over the three
-    /// canonical signal ledgers, and the payload gate holds against it.
+    /// canonical signal ledgers.
     ///
     /// This is the agent-surface half of the canonical journey: nothing is
     /// seeded through a private seam, the dataset arrives through the public
     /// Arrow batch door, and every answer is read back through `bifrost.query`
     /// SQL — the trace hierarchy, the promoted GenAI token aggregate, the log
-    /// correlated to the span that failed, and one metric aggregate. A caller
-    /// holding only `bifrost_query:read` is then refused the structured GenAI
-    /// messages, and the same call succeeds once its principal also holds
-    /// `bifrost_trace_payload:read`.
+    /// correlated to the span that failed, and one metric aggregate.
     ///
     /// # Errors
     ///
@@ -788,42 +785,19 @@ mod pg_tests {
         );
         assert_eq!(metrics["terminal"]["outcome"], serde_json::json!("success"));
 
-        // The payload gate, proved from the agent's side with two principals.
+        // GenAI messages are ordinary trace-span columns governed by table RBAC.
         let payload_sql = format!(
             "SELECT attributes FROM vala.traces.spans \
              WHERE scope_name = '{scope}' AND parent_span_id IS NULL"
         );
-        let metadata_only = agent_with_permissions(
+        let reader = agent_with_permissions(
             &server,
-            "mcp_canonical_metadata",
+            "mcp_canonical_reader",
             &[wyrd_runtime::Permission::bifrost_query_read()],
         )
         .await?;
-        let refusal = problem(
-            metadata_only
-                .call_tool(query(serde_json::json!({"sql": payload_sql.clone()})))
-                .await?,
-        )?;
-        assert_eq!(
-            refusal["code"],
-            serde_json::json!("WYRD_VALA_403_PAYLOAD_FORBIDDEN"),
-            "an agent without payload permission cannot read the GenAI messages"
-        );
-        metadata_only.cancel().await?;
-
-        let authorized = agent_with_permissions(
-            &server,
-            "mcp_canonical_payload",
-            &[
-                wyrd_runtime::Permission::bifrost_query_read(),
-                "bifrost_trace_payload:read"
-                    .parse()
-                    .map_err(|_| "the payload permission parses")?,
-            ],
-        )
-        .await?;
         let messages = structured(
-            authorized
+            reader
                 .call_tool(query(serde_json::json!({"sql": payload_sql})))
                 .await?,
         )?;
@@ -842,7 +816,7 @@ mod pg_tests {
                 && payload.contains(&hex_of(fixture::OUTPUT_MESSAGES)),
             "an authorized agent reads the structured GenAI messages: {payload}"
         );
-        authorized.cancel().await?;
+        reader.cancel().await?;
 
         client.cancel().await?;
         server.shutdown().await?;

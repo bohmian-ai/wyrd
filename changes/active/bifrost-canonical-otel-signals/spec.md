@@ -1,6 +1,6 @@
 ---
 id: SPEC-bifrost-canonical-otel-signals
-revision: 11
+revision: 12
 status: approved
 ---
 
@@ -496,11 +496,11 @@ the caller supplied. Storage optimization shall not change their OTel meaning.
 Promoted `service.*` or `gen_ai.*` values shall equal their canonical
 attribute source. Conflicting duplicated values are prohibited.
 
-#### INV-006 — Sensitive payload remains protected
+#### INV-006 — Sensitive payload remains classified
 
 Span attributes and events, log bodies and attributes, and large GenAI content
-remain sensitive payload. Authorization shall be enforced before projection or
-return, and sensitive content or identifiers shall not become metric labels.
+remain marked as sensitive metadata, and sensitive content or identifiers shall
+not become metric labels. Table query permission governs the complete row.
 
 #### INV-007 — Tenant isolation is unchanged
 
@@ -543,9 +543,7 @@ Postgres or a new cache to the ingest hot path.
 - Canonical SQL returns actual nested events and links with their parent spans.
 - GenAI search uses promoted-column predicates through canonical SQL, reads
   canonical spans, and does not require duplicated payload storage.
-- A caller without sensitive-payload permission can query permitted metadata
-  but cannot receive protected bodies, attributes, messages, instructions, or
-  tool content.
+- A caller with query permission for a table can read its complete rows.
 - Invalid IDs, timestamps, value encodings, nested structures, metric shapes,
   schema fingerprints, field types, tenant identities, and configured size
   limits fail with stable structured errors before acknowledgement.
@@ -757,6 +755,9 @@ choice.
 
 ## Revision history
 
+- Revision 12 (2026-09-10): retain sensitive-column metadata but remove the
+  unused column-level permission model; table query permission governs complete
+  rows, including GenAI fields on trace spans.
 - Revision 11 (2026-09-10): reconcile the remaining trace and GenAI readback
   prose with revision 10's canonical-SQL-only contract, align the Bifrost
   authority, and treat the integrated Forge/Oracle change as the implementation

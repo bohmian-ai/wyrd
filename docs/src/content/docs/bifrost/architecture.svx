@@ -319,14 +319,7 @@ The audit log captures: operation name, principal ID, tenant, timestamp, decisio
 
 ## Payload governance
 
-Sensitive columns (span attributes, log body, GenAI messages, agent-trace payloads) are projected away at the DataFusion plan stage unless the caller holds the matching payload read permission:
-
-- `bifrost_trace_payload:read`
-- `bifrost_log_payload:read`
-- `bifrost_genai_payload:read`
-- `bifrost_agent_trace_payload:read`
-
-Projection happens in Oracle before execution. Callers without permission see `NULL` for payload columns.
+Tables may mark columns as sensitive metadata. Oracle does not enforce separate column permissions; `bifrost_query:read` for the table governs every column, including GenAI fields stored on trace spans.
 
 Write-path redaction (when enabled) zeros sensitive columns before seal. Columns in the `REDACTED_COLUMNS` set are zeroed (strings become empty, numerics become 0, binaries become zero bytes) before the Arrow batch is sealed to Parquet. Redaction is transparent to the SDK and logged in the audit row.
 

@@ -630,16 +630,6 @@ pub enum BifrostError {
     )]
     QueryForbidden,
 
-    /// The principal lacks the payload resource permission.
-    #[error("payload access forbidden")]
-    #[wyrd_error(
-        code = "WYRD_VALA_403_PAYLOAD_FORBIDDEN",
-        status = 403,
-        title = "Payload access forbidden",
-        remediation = "The principal lacks the payload resource permission; sensitive columns were omitted."
-    )]
-    PayloadForbidden,
-
     /// The ingest writer's local buffer is full; the caller must retry.
     ///
     /// This is **local buffer backpressure only** — the per-physical-table

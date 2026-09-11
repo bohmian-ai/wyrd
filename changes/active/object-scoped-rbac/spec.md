@@ -1,6 +1,6 @@
 ---
 id: SPEC-object-scoped-rbac
-revision: 3
+revision: 4
 status: approved
 approved_at: 2026-09-10
 ---
@@ -44,8 +44,7 @@ The persisted JSON remains the direct typed projection:
 not target an object explicitly use `All`; scope-less input is rejected. No
 compatibility decoder or migration shim is required because this contract has
 not shipped. Invalid resource/scope combinations and malformed identities are
-rejected. Bifrost object scope is initially valid only for Bifrost query and
-sensitive-payload read permissions.
+rejected. Bifrost object scope is valid only for Bifrost query reads.
 
 Role permissions remain the sole static grant model, persist through the
 existing role permission JSON, and resolve into the principal's existing
@@ -73,9 +72,8 @@ Interactive, analytical, HTTP, gRPC, SDK, and MCP paths converge on the same
 decision. Distributed authority binds the coordinator-approved scoped decision
 so workers cannot widen the table set.
 
-Existing sensitive-payload read permissions use the same scope containment. A
-query grant does not grant protected payload columns, and existing payload
-denial/error behavior remains intact.
+Table query permission governs every column. Sensitive-column declarations
+remain descriptive metadata and do not create a second authorization check.
 
 ### REQ-003 — Focused role journeys prove distinct access
 
@@ -90,8 +88,7 @@ with this matrix:
 The journey asserts the stable authorization rejection and that denials return
 no rows. These roles are test fixtures, not new builtin production roles.
 Focused unit and Oracle tests separately prove scope validation, schema
-containment, exact UID matching, sensitive-payload scope, and distributed
-authority binding.
+containment, exact UID matching, and distributed authority binding.
 
 ## Invariants
 
@@ -109,9 +106,9 @@ authority binding.
 ## Scope and non-goals
 
 In scope: the typed and persisted permission contract; role decoding,
-resolution, validation, and subsumption; Bifrost query and existing payload
-enforcement; conflicting architecture/docs and generated contracts; focused
-unit, resolver/Oracle, and one real-server role journey.
+resolution, validation, and subsumption; Bifrost query enforcement; conflicting
+architecture/docs and generated contracts; focused unit, resolver/Oracle, and
+one real-server role journey.
 
 Not in scope:
 
@@ -119,7 +116,7 @@ Not in scope:
 - another grant store, checker, cache, or SQL-compatible `GRANT` language;
 - raw globs, explicit deny, ownership, or grant-option semantics;
 - scoped Bifrost ingest, table management, or private peer permissions;
-- new payload categories or sensitive-column classification redesign;
+- column-level authorization or sensitive-column classification redesign;
 - non-Bifrost object scopes or new builtin analyst/data-scientist roles; and
 - compatibility aliases or alternate authorization paths.
 
@@ -151,7 +148,7 @@ Not in scope:
 - **AC-004:** The `data_scientist` journey accepts the traces query and denies
   the logs and mixed-table queries before returning rows.
 - **AC-005:** Focused tests prove schema containment, exact table UID coverage,
-  separately scoped sensitive payload access, and no distributed widening.
+  no distributed widening, and stable remote query denials.
 - **AC-006:** Architecture, generated contracts, formatting, lint, and affected
   boundary checks pass without the repository gate or complete
   Bifrost/platform test suites.
@@ -177,6 +174,9 @@ RBAC rule. Static operation/object grants remain RBAC.
 
 ## Revision history
 
+- **Revision 4 — 2026-09-10 — approved.** Removes unused column-level payload
+  permissions and enforcement. Sensitive-column metadata remains descriptive;
+  scoped table query permission governs the complete row.
 - **Revision 3 — 2026-09-10 — approved.** Represents Bifrost identities as
   explicit catalog, schema, and table components and removes compatibility
   behavior because no permission contract has shipped.

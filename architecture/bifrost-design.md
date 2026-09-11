@@ -699,14 +699,12 @@ the namespace does not create another storage or authorization model.
 
 Permissions are scoped through `BifrostTable`, `BifrostRecord`, and
 `BifrostQuery`. Generic writes cannot target reserved or system-managed tables.
-Sensitive trace, log, GenAI, and agent-trace payload columns require their
-respective `BifrostTracePayload`, `BifrostLogPayload`,
-`BifrostGenAiPayload`, or `BifrostAgentTracePayload` read permission through
-the canonical SQL path.
+Sensitive-column metadata remains descriptive; table query permission governs
+every column, including GenAI fields stored on trace spans.
 
-Bifrost read permissions carry an object axis. A `bifrost_query:read` or
-sensitive-payload grant is scoped either to every object (`all`) or to a named
-Bifrost object: a `{ catalog, schema }` schema scope, or a
+Bifrost query permissions carry an object axis. A `bifrost_query:read` grant is
+scoped either to every object (`all`) or to a named Bifrost object: a
+`{ catalog, schema }` schema scope, or a
 `{ catalog, schema, table_uid }` table scope keyed by the existing Bifrost
 `TableUid`. A query names no tables until it is planned, so `POST /v1/query`
 admits on the coarse operation capability only, and the authoritative object
@@ -715,9 +713,7 @@ decision runs inside the Oracle once `pin_cut` has resolved the complete
 admission charging, read-audit acceptance, peer dispatch, or any source read.
 Every resolved table, including tables reached only through a join or an
 expansion, must be covered; one uncovered table denies the whole query with
-`WYRD_VALA_403_QUERY_FORBIDDEN` and streams no rows. Sensitive-payload
-permissions are checked with the same resolved-table scope, and the payload
-categories and payload-forbidden error are unchanged.
+`WYRD_VALA_403_QUERY_FORBIDDEN` and streams no rows.
 
 The permission digest bound into every stage assignment is derived from the
 approved scoped permission together with the exact authorized table identities,

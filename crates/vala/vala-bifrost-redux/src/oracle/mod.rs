@@ -15,8 +15,6 @@ use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider};
 use datafusion::common::TableReference;
-use datafusion::dataframe::DataFrame;
-use datafusion::datasource::MemTable;
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionContext;
@@ -2194,64 +2192,6 @@ impl Oracle {
         self.planner.validate_query(request)
     }
 
-    /// Resolves one tenant-qualified table into a schema-only typed-plan
-    /// `DataFrame`.
-    ///
-    /// The returned logical plan carries no executable provider. Oracle installs
-    /// the authenticated immutable-cut provider during [`Self::query_plan`],
-    /// after audit and visibility decisions are committed.
-    ///
-    /// # Errors
-    ///
-    /// Returns a stable catalog or execution failure when the table namespace,
-    /// provider, empty builtin fallback, or `DataFrame` cannot be constructed.
-    pub async fn typed_dataframe(
-        &self,
-        tenant: DataTenantId,
-        fqn: &str,
-    ) -> Result<DataFrame, BifrostError> {
-        let (namespace, name) = fqn
-            .rsplit_once('.')
-            .ok_or(BifrostError::QueryExecutionFailed)?;
-        let namespace = namespace.strip_prefix("vala.").unwrap_or(namespace);
-        let namespace = crate::namespaces::BifrostNamespace::from_domain_namespace(namespace)
-            .ok_or(BifrostError::QueryExecutionFailed)?;
-        let table = TableRef::new(namespace, name);
-        let session = SessionContext::new();
-        // Typed plans are schema-only authoring artifacts. The executable
-        // Oracle provider is installed later by `query_plan` after it freezes
-        // a tenant-bound visibility cut and commits its read decision.
-        // Metadata only: a schema-only artifact never touches a snapshot, so it
-        // resolves the reader identity without protecting or materializing one.
-        let schema: Arc<Schema> = match self.catalog.prepare_reader_identity(&table, tenant).await {
-            Ok(prepared) => Arc::new(
-                iceberg::arrow::schema_to_arrow_schema(prepared.metadata.current_schema())
-                    .map_err(|_| BifrostError::QueryExecutionFailed)?,
-            ),
-            Err(BifrostCatalogError::TableNotFound(_)) => {
-                let definition = crate::tables::builtin_table(namespace.as_str(), name)
-                    .ok_or(BifrostError::QueryExecutionFailed)?;
-                (definition.schema)()
-            }
-            Err(error) => return Err(error.into_public()),
-        };
-        let public_fields = schema
-            .fields()
-            .iter()
-            .filter(|field| field.name() != "data_tenant_id")
-            .cloned()
-            .collect::<Vec<_>>();
-        let provider = MemTable::try_new(Arc::new(Schema::new(public_fields)), vec![Vec::new()])
-            .map_err(|error| map_datafusion_error(&error))?;
-        session
-            .register_table(TableReference::bare(fqn), Arc::new(provider))
-            .map_err(|error| map_datafusion_error(&error))?;
-        session
-            .table(TableReference::bare(fqn))
-            .await
-            .map_err(|error| map_datafusion_error(&error))
-    }
-
     /// Returns this node's inactive Analytical follower ingress, when composed.
     ///
     /// The server mounts the upstream worker service behind
@@ -4045,7 +3985,7 @@ impl Oracle {
         if self.take_analytical_plan_failure() {
             return Err(BifrostError::QueryExecutionFailed);
         }
-        let root = Self::plan_physical(&planning, sql, context, cuts)
+        let root = Self::plan_physical(&planning, sql)
             .await
             .map_err(|OracleExecutionError::Public(error)| error)?;
         Ok(RetainedPhysicalPlan {
@@ -4064,21 +4004,14 @@ impl Oracle {
     async fn plan_physical(
         session: &SessionContext,
         sql: &str,
-        context: &AuthorizedQueryContext,
-        cuts: &[PinnedSealedTable],
     ) -> Result<Arc<dyn ExecutionPlan>, OracleExecutionError> {
         let frame = session
             .sql(sql)
             .await
             .map_err(|error| map_query_planning_error(&error))?;
-        // Optimized rather than the planner's raw output: projection pushdown
-        // is what turns `SELECT *` and `SELECT body AS b` alike into the exact
-        // set of columns this query will read. The raw scan carries no
-        // projection at all, so gating on it would refuse a metadata-only read.
         let plan = frame
             .into_optimized_plan()
             .map_err(|error| map_query_planning_error(&error))?;
-        authorize_payload_projection(context, cuts, &plan)?;
         session
             .state()
             .create_physical_plan(&plan)
@@ -4746,124 +4679,6 @@ fn plan_read_decision(
     })
 }
 
-/// Refuses a plan that would read a sensitive payload column the caller lacks.
-///
-/// Enforced on the optimized logical plan, before any physical plan exists and
-/// therefore before any row can be read, so the caller is told the projection
-/// is forbidden rather than handed an open stream that later fails or, worse,
-/// a silently narrowed result they could mistake for "nothing was recorded".
-///
-/// Only the scanned tables named by `cuts` are consulted: those are the exact
-/// bindings this query pinned, so an alias, a subquery, or a join cannot
-/// smuggle a protected column past the check by renaming it downstream.
-///
-/// # Errors
-///
-/// Returns [`BifrostError::PayloadForbidden`] when the plan scans a canonical
-/// sensitive column and the principal's effective permissions do not cover
-/// that table's payload read permission.
-fn authorize_payload_projection(
-    context: &AuthorizedQueryContext,
-    cuts: &[PinnedSealedTable],
-    plan: &datafusion::logical_expr::LogicalPlan,
-) -> Result<(), BifrostError> {
-    let mut protected: Vec<(String, &'static [&'static str], Permission)> = Vec::new();
-    for cut in cuts {
-        let table_ref = &cut.binding.table_ref;
-        let Some(permission) = payload_permission(
-            table_ref,
-            resolved_table_scope(&cut.binding, &cut.table_uid)?,
-        ) else {
-            continue;
-        };
-        let Some(definition) = table_ref
-            .namespace
-            .as_str()
-            .strip_prefix("vala.")
-            .and_then(|namespace| crate::tables::builtin_table(namespace, &table_ref.name))
-        else {
-            continue;
-        };
-        if definition.sensitive_payload_columns.is_empty() {
-            continue;
-        }
-        protected.push((
-            table_ref.fqn(),
-            definition.sensitive_payload_columns,
-            permission,
-        ));
-    }
-    if protected.is_empty() {
-        return Ok(());
-    }
-    refuse_protected_scan(context, &protected, plan)
-}
-
-/// Walks one optimized plan and refuses the first unauthorized protected scan.
-///
-/// # Errors
-///
-/// Returns [`BifrostError::PayloadForbidden`] for the first table scan that
-/// projects a protected column without the matching payload permission.
-fn refuse_protected_scan(
-    context: &AuthorizedQueryContext,
-    protected: &[(String, &'static [&'static str], Permission)],
-    plan: &datafusion::logical_expr::LogicalPlan,
-) -> Result<(), BifrostError> {
-    if let datafusion::logical_expr::LogicalPlan::TableScan(scan) = plan {
-        let scanned = scan.table_name.to_string();
-        for (table, columns, permission) in protected {
-            // The same provider is registered both as `vala.<schema>.<name>`
-            // and as one flat quoted alias, so a scan is matched on either the
-            // qualified path or the alias rather than on one spelling.
-            let matches = scanned == *table
-                || scanned.ends_with(&format!(
-                    ".{}",
-                    table.rsplit('.').next().unwrap_or(table.as_str())
-                ));
-            if !matches {
-                continue;
-            }
-            let reads_protected = scan
-                .projected_schema
-                .fields()
-                .iter()
-                .any(|field| columns.contains(&field.name().as_str()));
-            if reads_protected && !context.principal.effective_permissions.contains(permission) {
-                return Err(BifrostError::PayloadForbidden);
-            }
-        }
-    }
-    for input in plan.inputs() {
-        refuse_protected_scan(context, protected, input)?;
-    }
-    Ok(())
-}
-
-/// Maps one canonical table to the payload permission its sensitive columns need.
-///
-/// The four permissions the Bifrost doctrine defines are trace, log, `GenAI` and
-/// agent-trace payload. `vala.metrics.points` declares sensitive columns but
-/// the doctrine names no metric payload permission, so it is deliberately not
-/// gated here: inventing a fifth permission would be a contract change rather
-/// than an implementation decision.
-fn payload_permission(
-    table: &crate::catalog::TableRef,
-    scope: PermissionScope,
-) -> Option<Permission> {
-    let resource = match (table.namespace.as_str(), table.name.as_str()) {
-        ("vala.traces", "spans") => wyrd_runtime::Resource::BifrostTracePayload,
-        ("vala.logs", "records") => wyrd_runtime::Resource::BifrostLogPayload,
-        ("vala.dev", "agent_traces") => wyrd_runtime::Resource::BifrostAgentTracePayload,
-        _ => return None,
-    };
-    Some(Permission {
-        resource,
-        action: wyrd_runtime::Action::Read,
-        scope,
-    })
-}
-
 /// Projects one catalog-resolved table binding into its RBAC object scope.
 ///
 /// The scope is built from the *catalog identity*, never from SQL text: the
@@ -5514,60 +5329,6 @@ mod tests {
             schema: schema.to_owned(),
             table_uid: uid,
         }))
-    }
-
-    /// Proves the sensitive-payload requirement carries the same resolved-table
-    /// object scope, and that the query grant for that table is a separate authority.
-    #[test]
-    fn payload_permission_requires_the_resolved_table_scope() {
-        let uid = uuid::Uuid::from_u128(5);
-        let scope = table_scope("logs", uid);
-        let permission = payload_permission(
-            &crate::catalog::TableRef::new(crate::namespaces::BifrostNamespace::Logs, "records"),
-            scope.clone(),
-        )
-        .expect("log records declare a payload permission");
-
-        assert_eq!(
-            permission.resource,
-            wyrd_runtime::Resource::BifrostLogPayload
-        );
-        assert_eq!(permission.action, wyrd_runtime::Action::Read);
-        assert_eq!(permission.scope, scope);
-
-        // The query grant for the same table is a separate authority: holding
-        // it does not hand the caller the sensitive payload columns.
-        let query_grant = Permission {
-            resource: wyrd_runtime::Resource::BifrostQuery,
-            action: wyrd_runtime::Action::Read,
-            scope: scope.clone(),
-        };
-        assert!(!query_grant.covers(&permission));
-
-        // A payload grant on another table does not travel to this one.
-        let other = Permission {
-            resource: wyrd_runtime::Resource::BifrostLogPayload,
-            action: wyrd_runtime::Action::Read,
-            scope: table_scope("logs", uuid::Uuid::from_u128(6)),
-        };
-        assert!(!other.covers(&permission));
-    }
-
-    /// Proves scope does not invent a payload gate: a table the doctrine names
-    /// no payload resource for still requires no payload permission.
-    #[test]
-    fn payload_permission_is_absent_for_ungated_tables() {
-        assert!(
-            payload_permission(
-                &crate::catalog::TableRef::new(
-                    crate::namespaces::BifrostNamespace::Metrics,
-                    "points"
-                ),
-                table_scope("metrics", uuid::Uuid::from_u128(7)),
-            )
-            .is_none(),
-            "the doctrine names no metric payload permission"
-        );
     }
 
     /// Proves the peer-verified digest binds both axes of the coordinator's

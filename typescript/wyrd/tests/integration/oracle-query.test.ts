@@ -556,23 +556,10 @@ describe("Canonical signal journey", () => {
       ]);
       expect(HISTOGRAM_SUM).toBe(12.5);
 
-      const metadataOnly = await Bifrost.connect({
-        ...transport,
-        credential: server.scopedApiKey("ts_canonical_metadata", [
-          "bifrost_query:read",
-        ]),
-      });
-      await expect(
-        metadataOnly.sql(
-          `SELECT attributes FROM vala.traces.spans WHERE scope_name = '${scope}'`,
-        ),
-      ).rejects.toMatchObject({ code: "WYRD_VALA_403_PAYLOAD_FORBIDDEN" });
-
       const payloadReader = await Bifrost.connect({
         ...transport,
-        credential: server.scopedApiKey("ts_canonical_payload", [
+        credential: server.scopedApiKey("ts_canonical_reader", [
           "bifrost_query:read",
-          "bifrost_trace_payload:read",
         ]),
       });
       const nested = (

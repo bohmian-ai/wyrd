@@ -4,6 +4,7 @@
 
 use thiserror::Error;
 use wyrd_spec::error::WyrdError;
+use wyrd_tonic::error::WYRD_ERROR_HEADER;
 
 /// Concrete client-local error.
 ///
@@ -101,20 +102,24 @@ pub fn from_problem_json(body: &serde_json::Value) -> WyrdError {
     code_to_wyrd_error(code, message, details)
 }
 
-/// Map a gRPC [`wyrd_tonic::tonic::Status`] carrying a `google.rpc.ErrorInfo`
-/// into a [`WyrdError`].
+/// Maps a gRPC [`wyrd_tonic::tonic::Status`] into a [`WyrdError`].
 ///
-/// Extracts `ErrorInfo` from the status details via
-/// `tonic_types::StatusExt::get_details_error_info`, reads the stable Wyrd
-/// code from `ErrorInfo.reason`, and feeds the **same** code→variant
-/// reconstruction as [`from_problem_json`]. Both transports therefore produce
-/// byte-identical output for the same stable code by construction.
+/// Prefers Wyrd's canonical problem document and accepts `google.rpc.ErrorInfo`
+/// from older or external gRPC services.
 ///
 /// Falls back to [`WyrdError::Internal`] when the status carries no
 /// `ErrorInfo`.
 pub fn from_grpc_status(status: &wyrd_tonic::tonic::Status) -> WyrdError {
     use wyrd_tonic::tonic_types::StatusExt as _;
 
+    if let Some(problem) = status
+        .metadata()
+        .get_bin(WYRD_ERROR_HEADER)
+        .and_then(|value| value.to_bytes().ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+    {
+        return from_problem_json(&problem);
+    }
     if let Some(info) = status.get_details_error_info() {
         let details = if info.metadata.is_empty() {
             serde_json::json!({})
@@ -227,7 +232,6 @@ fn bifrost_error_from_code(
         }
         "WYRD_VALA_403_QUERY_PEER_SECURITY" => BifrostError::QueryPeerSecurity,
         "WYRD_VALA_403_QUERY_FORBIDDEN" => BifrostError::QueryForbidden,
-        "WYRD_VALA_403_PAYLOAD_FORBIDDEN" => BifrostError::PayloadForbidden,
         "WYRD_VALA_502_QUERY_STREAM_PROTOCOL" => BifrostError::QueryStreamProtocol,
         "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE" => BifrostError::QueryStreamIncomplete,
         "WYRD_VALA_503_QUERY_AUDIT_UNAVAILABLE" => BifrostError::QueryAuditUnavailable,

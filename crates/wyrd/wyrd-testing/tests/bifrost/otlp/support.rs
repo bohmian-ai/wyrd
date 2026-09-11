@@ -971,33 +971,6 @@ impl OtlpJourney {
         .expect("the fixture builds its restricted SDK client")
     }
 
-    /// Runs one public query expected to be refused and returns its error code.
-    ///
-    /// The refusal must arrive before the stream opens, as a transport-level
-    /// stable error: a caller that is handed an open stream and then a failed
-    /// terminal has already been told the query was accepted, and the closed
-    /// terminal code vocabulary cannot name a payload refusal.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the query is accepted, or fails in any shape other than a
-    /// pre-stream stable refusal.
-    pub(super) async fn query_error(&self, client: &wyrd_client::WyrdClient, sql: &str) -> String {
-        let outcome = vala_sdk::query::QueryClient::new(client)
-            .query(&wyrd_spec::vala::api::BifrostQueryRequest {
-                sql: sql.to_owned(),
-                visibility: wyrd_spec::vala::api::VisibilityMode::Fused,
-                freshness: wyrd_spec::vala::api::FreshnessPolicy::Strict,
-                deadline_ms: Some(120_000),
-            })
-            .await;
-        match outcome {
-            Ok(_) => panic!("`{sql}` must be refused before its stream opens"),
-            Err(vala_sdk::query::ValaSdkError::Transport(error)) => error.code().to_owned(),
-            Err(other) => panic!("`{sql}` is refused pre-stream, got {other}"),
-        }
-    }
-
     /// Crosses the publication boundary so published readers see the rows.
     ///
     /// # Panics

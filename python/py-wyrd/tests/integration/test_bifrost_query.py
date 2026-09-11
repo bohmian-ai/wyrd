@@ -480,21 +480,10 @@ def test_canonical_signal_arrow_write_and_sql_read_round_trip(
         {"metric_type": "sum", "ints": COUNTER_VALUE, "doubles": 0.0, "observations": 0},
     ]
 
-    metadata_only = Bifrost(
-        server_url=wyrd_server.base_url,
-        credential=wyrd_server.scoped_api_key(
-            f"py_canonical_metadata_{uuid.uuid4().hex[:8]}", ["bifrost_query:read"]
-        ),
-    )
-    with pytest.raises(BifrostQueryError) as refused:
-        metadata_only.sql(f"SELECT attributes FROM vala.traces.spans WHERE scope_name = '{scope}'")
-    assert refused.value.code == "WYRD_VALA_403_PAYLOAD_FORBIDDEN"
-
     payload_reader = Bifrost(
         server_url=wyrd_server.base_url,
         credential=wyrd_server.scoped_api_key(
-            f"py_canonical_payload_{uuid.uuid4().hex[:8]}",
-            ["bifrost_query:read", "bifrost_trace_payload:read"],
+            f"py_canonical_reader_{uuid.uuid4().hex[:8]}", ["bifrost_query:read"]
         ),
     )
     nested = (

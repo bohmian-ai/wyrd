@@ -12,12 +12,13 @@ use vala_bifrost_redux::oracle::{
     AuthorizedQueryContext, Oracle, OracleConfig, OraclePlanner, OracleQueryStream, QueryIpcDecoder,
 };
 use wyrd_runtime::Permission;
+use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{BifrostQueryRequest, NodeId, QueryClass, SignedPeerTicket};
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_tonic::query_conversion::QueryStreamConverter;
-use wyrd_tonic::tonic::Request;
 use wyrd_tonic::tonic::metadata::MetadataValue;
 use wyrd_tonic::tonic::transport::Channel;
+use wyrd_tonic::tonic::{Request, Status};
 use wyrd_tonic::wyrd::v1::ForwardQueryRequest;
 use wyrd_tonic::wyrd::v1::oracle_peer_service_client::OraclePeerServiceClient;
 
@@ -306,15 +307,11 @@ impl ReadyOracleForwarder {
         request
             .metadata_mut()
             .insert("x-wyrd-access-token", metadata);
-        let response =
-            connected
-                .client
-                .forward_query(request)
-                .await
-                .map_err(|status| match status.code() {
-                    wyrd_tonic::tonic::Code::DeadlineExceeded => BifrostError::QueryTimeout,
-                    _ => BifrostError::QueryExecutionFailed,
-                })?;
+        let response = connected
+            .client
+            .forward_query(request)
+            .await
+            .map_err(forwarded_query_error)?;
         let schema_fingerprint = response
             .metadata()
             .get("x-wyrd-schema-fingerprint")
@@ -416,6 +413,17 @@ impl ReadyOracleForwarder {
             return Err(BifrostError::QueryPeerSecurity);
         }
         Ok(())
+    }
+}
+
+/// Restores a remote Oracle's typed query error from its gRPC response.
+fn forwarded_query_error(status: Status) -> BifrostError {
+    if status.code() == wyrd_tonic::tonic::Code::DeadlineExceeded {
+        return BifrostError::QueryTimeout;
+    }
+    match wyrd_client::error::from_grpc_status(&status) {
+        WyrdError::Vala { error } => error,
+        _ => BifrostError::QueryExecutionFailed,
     }
 }
 
@@ -647,6 +655,16 @@ mod tests {
         AuthMethod, ClusterCapabilities, ClusterNodeKey, ClusterRole, ClusterRoleLease,
         FreshnessPolicy, OracleCapabilitiesV1, VisibilityMode,
     };
+
+    /// A remote RBAC denial remains a denial after crossing gRPC.
+    #[test]
+    fn forwarded_query_error_preserves_query_forbidden() {
+        let status = crate::grpc::query::query_status(BifrostError::QueryForbidden.into());
+        assert!(matches!(
+            forwarded_query_error(status),
+            BifrostError::QueryForbidden
+        ));
+    }
 
     /// Encodes one split query IPC stream exactly as the leader emits it.
     ///

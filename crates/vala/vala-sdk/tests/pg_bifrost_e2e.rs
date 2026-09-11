@@ -2528,23 +2528,9 @@ mod pg_tests {
             vec![Some(0), Some(fixture::HISTOGRAM_COUNT), Some(0)]
         );
 
-        // The payload gate stands over the structured GenAI messages.
-        let metadata_only =
-            reader_with_permissions(&srv, "sdk_canonical_metadata", &["bifrost_query:read"]).await;
-        let refusal = metadata_only
-            .sql(&format!(
-                "SELECT attributes FROM vala.traces.spans WHERE scope_name = '{scope}'"
-            ))
-            .await
-            .expect_err("a caller without trace payload permission is refused");
-        assert_eq!(refusal.code(), "WYRD_VALA_403_PAYLOAD_FORBIDDEN");
-
-        let payload_reader = reader_with_permissions(
-            &srv,
-            "sdk_canonical_payload",
-            &["bifrost_query:read", "bifrost_trace_payload:read"],
-        )
-        .await;
+        // Table query permission covers the trace span's complete row.
+        let payload_reader =
+            reader_with_permissions(&srv, "sdk_canonical_reader", &["bifrost_query:read"]).await;
         let nested = payload_reader
             .sql(&format!(
                 "SELECT CAST(array_length(events) AS BIGINT) AS events, \

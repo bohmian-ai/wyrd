@@ -100,14 +100,6 @@ pub enum Resource {
     BifrostRecord,
     /// Bifrost table reads (SQL/scan).
     BifrostQuery,
-    /// Trace-span payload/attribute columns (sensitive; gates waterfall payloads).
-    BifrostTracePayload,
-    /// Log-record body/attribute columns (sensitive).
-    BifrostLogPayload,
-    /// GenAI prompt/completion columns (sensitive).
-    BifrostGenAiPayload,
-    /// Agent-trace captured payload columns (sensitive).
-    BifrostAgentTracePayload,
     /// Private Bifrost peer plane: reservation, execution, tail, and lifecycle.
     ///
     /// Role-neutral on purpose. Every peer-bearing target answers the same
@@ -161,20 +153,12 @@ impl Resource {
 
     /// True when this resource owns Bifrost objects a grant may be scoped to.
     ///
-    /// Only the Bifrost query surface and the four sensitive-payload resources
-    /// name a table. `AnyOf` and `Wildcard` are deliberately excluded: a
-    /// multi-resource or wildcard grant reaches objects only through
-    /// [`PermissionScope::All`].
+    /// Only the Bifrost query surface names a table. `AnyOf` and `Wildcard` are
+    /// deliberately excluded: a multi-resource or wildcard grant reaches
+    /// objects only through [`PermissionScope::All`].
     #[must_use]
     pub const fn accepts_bifrost_scope(&self) -> bool {
-        matches!(
-            self,
-            Self::BifrostQuery
-                | Self::BifrostTracePayload
-                | Self::BifrostLogPayload
-                | Self::BifrostGenAiPayload
-                | Self::BifrostAgentTracePayload
-        )
+        matches!(self, Self::BifrostQuery)
     }
 
     fn as_str(&self) -> Option<&'static str> {
@@ -194,10 +178,6 @@ impl Resource {
             Self::BifrostTable => "bifrost_table",
             Self::BifrostRecord => "bifrost_record",
             Self::BifrostQuery => "bifrost_query",
-            Self::BifrostTracePayload => "bifrost_trace_payload",
-            Self::BifrostLogPayload => "bifrost_log_payload",
-            Self::BifrostGenAiPayload => "bifrost_genai_payload",
-            Self::BifrostAgentTracePayload => "bifrost_agent_trace_payload",
             Self::BifrostPeer => "bifrost_peer",
             Self::Wildcard => "wildcard",
             Self::AnyOf(_) => return None,
@@ -243,8 +223,7 @@ impl Permission {
 
     /// Rejects a permission whose object scope cannot apply to its operation.
     ///
-    /// Bifrost object scope is meaningful only for the Bifrost query and
-    /// sensitive-payload read resources, and only for the exact `read` action.
+    /// Bifrost object scope is meaningful only for Bifrost query reads.
     /// A wildcard or multi-resource grant on either axis keeps object-wide
     /// reach only with [`PermissionScope::All`], which is what stops a
     /// wildcard from inheriting one table's narrow authority.
@@ -545,10 +524,6 @@ fn parse_resource(value: &str) -> Result<Resource, PermissionParseError> {
         "bifrost_record" => Resource::BifrostRecord,
         "bifrost_peer" => Resource::BifrostPeer,
         "bifrost_query" => Resource::BifrostQuery,
-        "bifrost_trace_payload" => Resource::BifrostTracePayload,
-        "bifrost_log_payload" => Resource::BifrostLogPayload,
-        "bifrost_genai_payload" => Resource::BifrostGenAiPayload,
-        "bifrost_agent_trace_payload" => Resource::BifrostAgentTracePayload,
         "wildcard" => Resource::Wildcard,
         _ => return Err(PermissionParseError),
     })
@@ -702,32 +677,6 @@ mod tests {
             let json = serde_json::to_value(&permission).expect("serializes");
             assert_eq!(
                 serde_json::from_value::<Permission>(json).expect("deserializes"),
-                permission
-            );
-        }
-    }
-
-    #[test]
-    fn payload_resource_wire_strings() {
-        for (resource, wire) in [
-            (Resource::BifrostTracePayload, "bifrost_trace_payload"),
-            (Resource::BifrostLogPayload, "bifrost_log_payload"),
-            (Resource::BifrostGenAiPayload, "bifrost_genai_payload"),
-            (
-                Resource::BifrostAgentTracePayload,
-                "bifrost_agent_trace_payload",
-            ),
-        ] {
-            let permission = Permission {
-                resource: resource.clone(),
-                action: Action::Read,
-                scope: PermissionScope::All,
-            };
-            assert_eq!(permission.to_string(), format!("{wire}:read"));
-            assert_eq!(
-                format!("{wire}:read")
-                    .parse::<Permission>()
-                    .expect("parses"),
                 permission
             );
         }
@@ -987,20 +936,12 @@ mod tests {
             assert!(error.to_string().contains("action"), "{error}");
         }
 
-        for resource in [
-            "bifrost_query",
-            "bifrost_trace_payload",
-            "bifrost_log_payload",
-            "bifrost_gen_ai_payload",
-            "bifrost_agent_trace_payload",
-        ] {
-            serde_json::from_value::<Permission>(json!({
-                "resource": resource,
-                "action": "read",
-                "scope": {"bifrost": {"schema": {"catalog": "vala", "schema": "logs"}}}
-            }))
-            .expect("exact read stays valid for every scoped Bifrost resource");
-        }
+        serde_json::from_value::<Permission>(json!({
+            "resource": "bifrost_query",
+            "action": "read",
+            "scope": {"bifrost": {"schema": {"catalog": "vala", "schema": "logs"}}}
+        }))
+        .expect("exact query read stays valid for Bifrost scope");
     }
 
     /// Proves a structurally valid but empty object identity is not an object:

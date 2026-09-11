@@ -663,11 +663,6 @@ hide = true
 description = "Assert every workspace crate (except py-wyrd and wyrd-rust-examples) is assigned to exactly one family test lane in mise.toml"
 run = "bash scripts/checks/test-coverage.sh"
 
-[tasks."check:design-sync"]
-hide = true
-description = "Assert ValaQueryService and all four payload-read permissions are accepted in wyrd-design.md before the vala_query seam exists in code"
-run = "bash scripts/checks/design-sync.sh"
-
 [tasks."check:unwrap-audit"]
 hide = true
 description = "Audit unwrap/expect calls outside tests and examples"
@@ -1188,7 +1183,6 @@ depends = [
   "test:bifrost",
   "codegen:check",
   "cardkind:check",
-  "check:design-sync",
   "check:client-tier",
   "check:registry-no-server-routes",
   "check:pyo3-scope",

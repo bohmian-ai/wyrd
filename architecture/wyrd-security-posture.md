@@ -229,23 +229,27 @@ is not an SSRF control.
 
 ## Audit integrity and privacy
 
-Audit cardinality follows auditable domain operations and independently
-durable transitions, not HTTP requests. Every auditable Postgres transition
-appends its audit row in the same transaction. Forge may append tenant-owned
-events only through its tenant-bound, fence-checked `OperatorAudit`
-capability.
+Audit cardinality follows authorization decisions, not HTTP requests and not
+engine mechanics. Every decision that evaluates a principal's permission
+appends its audit row in the same transaction that made it. Scribe batch
+commits and Forge maintenance transitions evaluate no permission: they are
+recorded as lineage in `vala.scribe_batch_commits` and `vala.forge_operations`
+and emit no audit event.
 
 Oracle query admission is the single durability exception: the serving process
 fsyncs a versioned, CRC-framed local acceptance record before returning rows,
 then a bounded at-least-once relay appends the canonical tenant
-`vala.audit_outbox` entry. Relay identity makes replay safe and observable.
+`vala.audit_staging` entry. Relay identity makes replay safe and observable.
 
-The outbox is transient transactional delivery state. Retained audit history
-lives in the tenant-qualified Bifrost `vala.system.audit_log` table. A bounded
-publisher moves events idempotently from the outbox to that table. An outbox
-row may retire only after its corresponding retained event is durably
-published. A legacy direct-Iceberg relay and `platform.audit_log` are not
-alternate historical authorities.
+`vala.audit_staging` is transient transactional write-ahead state, not an
+outbox: it has no external consumer. Retained audit history lives in the
+tenant-qualified Bifrost `vala.system.audit_log` table. A bounded publisher
+moves events idempotently into that table, reading ranges by a per-tenant
+watermark. A staged row is garbage-collected once the watermark has advanced
+past it; a replayed range is absorbed by Scribe's durable batch-id dedup fence.
+Because publication evaluates no new permission, it appends no audit event and
+retained history cannot feed itself. A legacy direct-Iceberg relay and
+`platform.audit_log` are not alternate historical authorities.
 
 Audit schemas minimize personal data. They store typed identities and decisions,
 not credentials, raw prompts, request bodies, Source payloads, or unnecessary

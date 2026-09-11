@@ -5,7 +5,7 @@ use vala_bifrost_redux::oracle::peer::{PeerSecurityAudit, PeerSecurityAuditError
 use wyrd_spec::DataTenantId;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
-    AuditDecision, AuditDetail, AuditResult, BifrostSecurityPhase, BifrostSecurityViolationKind,
+    AuditDetail, AuditOutcome, BifrostSecurityPhase, BifrostSecurityViolationKind,
 };
 
 use crate::audit;
@@ -69,9 +69,7 @@ impl PostgresPeerSecurityAudit {
             "bifrost.query.security_violation",
             "bifrost.oracle.peer",
             "bifrost:query:peer_execute",
-            AuditDecision::Deny,
-            AuditResult::Failure,
-            "scrubbed Oracle peer security rejection",
+            AuditOutcome::Denied,
         )
         .with_detail(AuditDetail::BifrostSecurityViolation {
             violation,

@@ -58,13 +58,13 @@ use wyrd_spec::storage::{
     UploadInitRequest, UploadInitResponse, UploadPlan, VerificationGuarantee, WireProtocol,
 };
 use wyrd_spec::vala::api::{
-    AuditDecision, AuditEvent, AuditResult, AuthMethod, BifrostErrorDescriptor,
-    BifrostPermissionDescriptor, BifrostQueryRequest, BifrostTableDescription, BifrostTableEntry,
-    CancelRunningQueryRequest, CancelRunningQueryResponse, DataTypeSpec,
-    FieldSpec as BifrostFieldSpec, GetRunningQueryRequest, ListRunningQueriesResponse,
-    NullOrderWire, PhysicalLayoutWire, QueryParam, RegisterOutcome, RegisterTableRequest,
-    RegisterTableResponse, RunningQueryLifecycleState, RunningQueryProgress, RunningQuerySummary,
-    SortDirectionWire, SortKeyWire, SyncQueryRequest, TableStatus, TimeGranularityWire, TimeUnit,
+    AuditEvent, AuditOutcome, AuthMethod, BifrostErrorDescriptor, BifrostPermissionDescriptor,
+    BifrostQueryRequest, BifrostTableDescription, BifrostTableEntry, CancelRunningQueryRequest,
+    CancelRunningQueryResponse, DataTypeSpec, FieldSpec as BifrostFieldSpec,
+    GetRunningQueryRequest, ListRunningQueriesResponse, NullOrderWire, PhysicalLayoutWire,
+    QueryParam, RegisterOutcome, RegisterTableRequest, RegisterTableResponse,
+    RunningQueryLifecycleState, RunningQueryProgress, RunningQuerySummary, SortDirectionWire,
+    SortKeyWire, SyncQueryRequest, TableStatus, TimeGranularityWire, TimeUnit,
 };
 use wyrd_spec::vala::eval::{
     AgentTurnSubmission, ComparisonOperator, ConversationTurn, DagError, EvalCondition,

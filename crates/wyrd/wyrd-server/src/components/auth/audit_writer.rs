@@ -5,7 +5,7 @@ use vala_sql::queries::audit_staging::append_audit;
 use wyrd_auth_check::AuthzCheckContext;
 use wyrd_spec::card::policy::PolicyDecision;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
+use wyrd_spec::vala::api::{AuditEvent, AuditOutcome};
 use wyrd_sql::TenantConn;
 
 /// Audit writer used by the authz-check route.
@@ -37,10 +37,9 @@ impl AuthzAuditWriter for RealAuthzAuditWriter {
         ctx: &AuthzCheckContext,
         decision: &PolicyDecision,
     ) -> Result<(), WyrdError> {
-        let (audit_decision, audit_result) = match decision {
-            PolicyDecision::Allow => (AuditDecision::Allow, AuditResult::Success),
-            PolicyDecision::Deny { .. } => (AuditDecision::Deny, AuditResult::Failure),
-            &_ => (AuditDecision::Deny, AuditResult::Failure),
+        let outcome = match decision {
+            PolicyDecision::Allow => AuditOutcome::Allowed,
+            _ => AuditOutcome::Denied,
         };
         let event = AuditEvent {
             request_id: ctx.request_id.clone(),
@@ -50,11 +49,8 @@ impl AuthzAuditWriter for RealAuthzAuditWriter {
             card_ref: ctx.caller.card_ref().cloned(),
             principal_id: ctx.caller.id,
             principal_kind: ctx.caller.kind.tag(),
-            auth_method: AuthMethod::Jwt,
             permission: ctx.request.action.clone(),
-            decision: audit_decision,
-            result: audit_result,
-            payload_summary: format!("authz check; action={}", ctx.request.action),
+            outcome,
             detail: None,
         };
         append_audit(conn, &event)

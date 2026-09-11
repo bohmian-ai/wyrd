@@ -24,24 +24,22 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::BifrostError as ValaError;
-use wyrd_spec::vala::api::{AuditDecision, AuditDetail, AuditEvent, AuditResult, AuthMethod};
+use wyrd_spec::vala::api::{AuditDetail, AuditEvent, AuditOutcome};
 
 use crate::components::auth::Caller;
 
 /// Build a data-plane [`AuditEvent`] attributed to the HTTP caller.
 ///
 /// `card_ref` is the writer-identity card (`None` for a `User` principal), never
-/// a per-row data column (Decision E). `auth_method` is `Jwt`: this handler
-/// surface authenticates via the HTTP bearer flow.
+/// a per-row data column (Decision E). The row states what the boundary decided
+/// about `permission`, never whether the admitted operation later succeeded.
 #[must_use]
 pub fn audit_event(
     caller: &Caller,
     operation: &str,
     resource: &str,
     permission: &str,
-    decision: AuditDecision,
-    result: AuditResult,
-    payload_summary: &str,
+    outcome: AuditOutcome,
 ) -> AuditEvent {
     AuditEvent {
         request_id: caller.request_id.clone(),
@@ -51,11 +49,8 @@ pub fn audit_event(
         card_ref: caller.principal.card_ref().cloned(),
         principal_id: caller.principal.id,
         principal_kind: caller.principal.kind.tag(),
-        auth_method: AuthMethod::Jwt,
         permission: permission.to_owned(),
-        decision,
-        result,
-        payload_summary: payload_summary.to_owned(),
+        outcome,
         detail: delegation_detail(caller),
     }
 }
@@ -84,18 +79,14 @@ fn delegation_detail(caller: &Caller) -> Option<AuditDetail> {
 /// [`PLATFORM_AUDIT_PRINCIPAL`] (a reserved well-known service actor). Used
 /// when no `Caller` is available — e.g. `GET /auth/login` before OIDC resolve.
 ///
-/// `auth_method` is `Internal` (the platform actor is internal; the *claimed*
-/// OIDC method is a fact about the attempt, not the actor). `payload_summary`
-/// should include the attempted issuer, tenant slug, and outcome.
+/// The outcome states whether the attempt was admitted or refused.
 #[must_use]
 pub fn audit_event_unauthenticated(
     request_id: RequestId,
     operation: &str,
     resource: &str,
     permission: &str,
-    decision: AuditDecision,
-    result: AuditResult,
-    payload_summary: &str,
+    outcome: AuditOutcome,
 ) -> AuditEvent {
     AuditEvent {
         request_id,
@@ -105,11 +96,8 @@ pub fn audit_event_unauthenticated(
         card_ref: None,
         principal_id: PLATFORM_AUDIT_PRINCIPAL,
         principal_kind: PrincipalKindTag::Service,
-        auth_method: AuthMethod::Internal,
         permission: permission.to_owned(),
-        decision,
-        result,
-        payload_summary: payload_summary.to_owned(),
+        outcome,
         detail: None,
     }
 }
@@ -117,9 +105,9 @@ pub fn audit_event_unauthenticated(
 /// Map an audit-append failure to the fail-closed public code, never leaking the
 /// underlying SQL/connection detail across the boundary.
 pub fn audit_unavailable(error: impl std::fmt::Display) -> WyrdError {
-    tracing::error!(error = %error, "audit outbox append failed; refusing operation");
+    tracing::error!(error = %error, "audit append failed; refusing operation");
     ValaError::AuditUnavailable {
-        detail: "audit outbox append failed".to_owned(),
+        detail: "audit append failed".to_owned(),
     }
     .into()
 }

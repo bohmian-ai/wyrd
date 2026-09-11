@@ -7,7 +7,7 @@ use vala_bifrost_redux::scribe::tail_rpc::{TailReadError, TailSecurityAudit};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
-    AuditDecision, AuditDetail, AuditResult, BifrostSecurityPhase, BifrostSecurityViolationKind,
+    AuditDetail, AuditOutcome, BifrostSecurityPhase, BifrostSecurityViolationKind,
 };
 
 /// Standard-outbox writer for tail-specific security violations.
@@ -62,9 +62,7 @@ impl PostgresTailSecurityAudit {
             "bifrost.scribe.tail_security",
             "bifrost.scribe.tail",
             "bifrost:query:tail",
-            AuditDecision::Deny,
-            AuditResult::Failure,
-            "scrubbed Scribe-tail security rejection",
+            AuditOutcome::Denied,
         )
         .with_detail(AuditDetail::BifrostSecurityViolation {
             violation,

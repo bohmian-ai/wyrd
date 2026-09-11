@@ -896,8 +896,8 @@ fn fixture_audit_event(tenant: DataTenantId, table: &str) -> wyrd_spec::vala::ap
         wyrd_spec::auth::PrincipalKindTag::User,
         wyrd_spec::vala::api::AuthMethod::Internal,
         "bifrost_write:write".to_owned(),
-        wyrd_spec::vala::api::AuditDecision::Allow,
-        wyrd_spec::vala::api::AuditResult::Success,
+        wyrd_spec::vala::api::AuditOutcome::Allowed,
+        wyrd_spec::vala::api::AuditOutcome::Allowed,
         "oracle contention fixture ingest".to_owned(),
     )
 }

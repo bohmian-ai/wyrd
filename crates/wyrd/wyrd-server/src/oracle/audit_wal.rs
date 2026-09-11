@@ -700,7 +700,7 @@ mod tests {
     use std::thread;
     use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
     use wyrd_spec::request_id::RequestId;
-    use wyrd_spec::vala::api::{AuditDecision, AuditResult, AuthMethod};
+    use wyrd_spec::vala::api::{AuditOutcome, AuthMethod};
 
     /// Creates a minimal valid audit payload for WAL tests.
     fn event() -> AuditEvent {
@@ -719,8 +719,8 @@ mod tests {
             PrincipalKindTag::User,
             AuthMethod::Internal,
             "bifrost.query.read".to_owned(),
-            AuditDecision::Allow,
-            AuditResult::Success,
+            AuditOutcome::Allowed,
+            AuditOutcome::Allowed,
             "test".to_owned(),
         )
     }

@@ -13,7 +13,7 @@ use vala_bifrost_redux::oracle::{
     VerifiedSecurityContext,
 };
 use vala_sql::ValaPostgres;
-use wyrd_spec::vala::api::{AuditDecision, AuditDetail, AuditEvent, AuditResult};
+use wyrd_spec::vala::api::{AuditDetail, AuditEvent, AuditOutcome};
 use wyrd_spec::vala::error::BifrostError;
 
 #[cfg(feature = "test-support")]
@@ -280,7 +280,7 @@ impl OracleAuditPublisher {
         let event = build_event(
             context,
             "bifrost.query.read_decision",
-            AuditResult::Success,
+            AuditOutcome::Allowed,
             decision.into_detail(),
         );
         self.append(context.data_tenant_id, event).await
@@ -567,7 +567,7 @@ impl OracleAudit for OracleAuditPublisher {
         let event = build_event(
             &context.query,
             "bifrost.query.security_violation",
-            AuditResult::Failure,
+            AuditOutcome::Denied,
             AuditDetail::BifrostSecurityViolation {
                 violation: violation.violation,
                 phase: violation.phase,
@@ -594,7 +594,7 @@ fn effective_shutdown_deadline(
 fn build_event(
     context: &AuthorizedQueryContext,
     operation: &str,
-    result: AuditResult,
+    outcome: AuditOutcome,
     detail: AuditDetail,
 ) -> AuditEvent {
     AuditEvent::new(
@@ -605,11 +605,8 @@ fn build_event(
         context.principal.card_ref().cloned(),
         context.principal.id,
         context.principal.kind.tag(),
-        context.auth_method,
         context.permission.to_string(),
-        AuditDecision::Allow,
-        result,
-        "scrubbed Bifrost query decision".to_owned(),
+        outcome,
     )
     .with_detail(detail)
 }
@@ -634,7 +631,8 @@ mod pg_tests {
     use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::{
-        AuditDetail, AuthMethod, QueryAuditDigest, QueryClass, QueryExecutionMode, VisibilityMode,
+        AuditDetail, AuditOutcome, AuthMethod, QueryAuditDigest, QueryClass, QueryExecutionMode,
+        VisibilityMode,
     };
 
     use super::*;

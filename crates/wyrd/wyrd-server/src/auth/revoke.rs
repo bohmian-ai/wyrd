@@ -5,7 +5,7 @@ use wyrd_runtime::PrincipalId;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalKindTag;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::vala::api::{AuditDecision, AuditResult};
+use wyrd_spec::vala::api::AuditOutcome;
 
 use crate::audit;
 use crate::auth::revocation_listener::notify_principal_revoked;
@@ -39,9 +39,7 @@ pub async fn revoke_principal(
             "auth.principal.revoke",
             &format!("principal:{target_id}"),
             "service_accounts:write",
-            AuditDecision::Allow,
-            AuditResult::Success,
-            "principal revoked",
+            AuditOutcome::Allowed,
         ),
     )
     .await

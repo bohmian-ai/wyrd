@@ -32,7 +32,7 @@ use wyrd_spec::registry::{
 };
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::storage::{UploadId, UploadInitRequest, UploadPlan};
-use wyrd_spec::vala::api::{AuditDecision, AuditResult};
+use wyrd_spec::vala::api::AuditOutcome;
 use wyrd_sql::CardStatus;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::cards::{
@@ -60,7 +60,7 @@ use wyrd_storage::StorageError;
 use wyrd_storage::service::{upload_abort, upload_init};
 use wyrd_storage::tenant_path;
 
-use crate::audit::{append_on, audit_event, audit_event_unauthenticated, record_audit};
+use crate::audit::{append_on, audit_event, audit_event_unauthenticated};
 use crate::components::auth::Caller;
 use crate::components::cards::mapping::{existing_row_to_response, outcome_row_to_response};
 use crate::components::cards::resolve::{
@@ -717,7 +717,7 @@ async fn initialize_card_uploads(
     let rows = match load_manifest_rows(state, caller, card_uid).await {
         Ok(rows) => rows,
         Err(error) => {
-            audit_upload_init_failure(state, caller, card_uid, "manifest lookup failed").await;
+            tracing::error!(%card_uid, "artifact upload initialization failed: manifest lookup failed");
             tracing::error!(%error, %card_uid, "manifest lookup failed after registration");
             return Err(error);
         }
@@ -731,7 +731,7 @@ async fn initialize_card_uploads(
         {
             Ok(entry) => entry,
             Err(error) => {
-                audit_upload_init_failure(state, caller, card_uid, &row.relative_path).await;
+                tracing::error!(%card_uid, path = %row.relative_path, "artifact upload initialization failed");
                 tracing::error!(%error, %card_uid, path = %row.relative_path, "upload init failed");
                 return Err(error);
             }
@@ -827,9 +827,7 @@ async fn initialize_manifest_row(
         "card.artifact.upload_init.success",
         &format!("manifest:{}", row.manifest_id),
         "card:write",
-        AuditDecision::Allow,
-        AuditResult::Success,
-        "artifact upload initialization succeeded",
+        AuditOutcome::Allowed,
     );
     let persisted = async {
         append_on(&mut conn, &event).await?;
@@ -871,29 +869,6 @@ fn card_upload_entry(
         upload_id,
         plan,
     })
-}
-
-/// Record one post-commit initialization failure before registration cleanup.
-async fn audit_upload_init_failure(
-    state: &AppState,
-    caller: &Caller,
-    card_uid: &CardUid,
-    detail: &str,
-) {
-    let event = audit_event(
-        caller,
-        "card.artifact.upload_init.failed",
-        &format!("card:{card_uid}"),
-        "card:write",
-        AuditDecision::Allow,
-        AuditResult::Failure,
-        detail,
-    );
-    if let Err(error) =
-        record_audit(state.postgres.vala_pool(), caller.data_tenant_id, &event).await
-    {
-        tracing::error!(%error, %card_uid, "upload-init failure audit could not be recorded");
-    }
 }
 
 /// Resolve external references before opening the composite write transaction.
@@ -1158,9 +1133,7 @@ async fn append_registration_audit(
         "card.registration.create",
         &format!("card:{card_uid}"),
         "card:write",
-        AuditDecision::Allow,
-        AuditResult::Success,
-        "card registration persisted",
+        AuditOutcome::Allowed,
     );
     append_on(conn, &event).await
 }
@@ -1517,12 +1490,7 @@ pub(crate) async fn record_reconciliation_failure(
             "card.reconciliation.dead_letter",
             &format!("card:{}", claim.card_uid),
             "card:write",
-            AuditDecision::Allow,
-            AuditResult::Failure,
-            &format!(
-                "card reconciliation dead-lettered after {} attempts; kind={}",
-                claim.reconcile_attempts, claim.reconcile_kind
-            ),
+            AuditOutcome::Allowed,
         );
         append_on(&mut conn, &event).await?;
     }
@@ -1992,9 +1960,7 @@ async fn commit_card_activation(
             "card.registration.complete",
             &format!("card:{card_uid}"),
             "card:write",
-            AuditDecision::Allow,
-            AuditResult::Success,
-            "card registration completed and activated",
+            AuditOutcome::Allowed,
         );
         append_on(&mut conn, &event).await?;
     }
@@ -2166,13 +2132,7 @@ async fn commit_card_failure(
             "card.registration.cleanup",
             &format!("card:{card_uid}"),
             "card:write",
-            AuditDecision::Allow,
-            if cleanup_succeeded {
-                AuditResult::Success
-            } else {
-                AuditResult::Failure
-            },
-            "card registration cleanup completed",
+            AuditOutcome::Allowed,
         );
         append_on(&mut conn, &event).await?;
     }
@@ -2321,9 +2281,7 @@ async fn write_card_blob(
             "card.registration.blob_write.failed",
             &format!("card:{}", card.card_uid),
             "card:write",
-            AuditDecision::Allow,
-            AuditResult::Failure,
-            "card blob persistence failed",
+            AuditOutcome::Allowed,
         );
         record_blob_failure(&mut conn, &card.card_uid).await?;
         append_on(&mut conn, &event).await?;

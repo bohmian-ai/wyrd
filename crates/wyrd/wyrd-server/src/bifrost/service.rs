@@ -10,8 +10,8 @@ use vala_bifrost_redux::catalog::{BifrostCatalogError, TableRef};
 use wyrd_runtime::Permission;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{
-    AuditDecision, AuditResult, BifrostTableDescription, BifrostTableEntry, PhysicalLayoutWire,
-    RegisterOutcome, RegisterTableRequest, RegisterTableResponse,
+    AuditOutcome, BifrostTableDescription, BifrostTableEntry, PhysicalLayoutWire, RegisterOutcome,
+    RegisterTableRequest, RegisterTableResponse,
 };
 
 use wyrd_runtime::PermissionVerdict;
@@ -47,9 +47,7 @@ async fn authorize_audited(
                 operation,
                 resource,
                 &required.to_string(),
-                AuditDecision::Deny,
-                AuditResult::Failure,
-                "rbac permission denied",
+                AuditOutcome::Denied,
             );
             audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, &event).await?;
             Err(permission_deny_reason_to_wyrd(reason))
@@ -158,9 +156,7 @@ pub async fn register_table(
                 operation,
                 &fqn,
                 &required.to_string(),
-                AuditDecision::Allow,
-                AuditResult::Success,
-                "bifrost table registered",
+                AuditOutcome::Allowed,
             );
             let table_uid = catalog
                 .register_dataset(
@@ -271,7 +267,7 @@ mod pg_tests {
 
     use wyrd_runtime::{PermissionSet, Principal, PrincipalId, PrincipalKind};
     use wyrd_spec::request_id::RequestId;
-    use wyrd_spec::vala::api::{DataTypeSpec, FieldSpec};
+    use wyrd_spec::vala::api::{AuditOutcome, DataTypeSpec, FieldSpec};
     use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
 
     async fn test_state() -> AppState {

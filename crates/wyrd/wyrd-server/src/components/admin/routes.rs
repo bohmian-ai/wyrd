@@ -259,9 +259,7 @@ async fn create_trusted_issuer(
             "admin.trusted_issuer.create",
             &format!("trusted_issuer:{}", trusted.issuer),
             "service_accounts:write",
-            wyrd_spec::vala::api::AuditDecision::Allow,
-            wyrd_spec::vala::api::AuditResult::Success,
-            "trusted issuer registered",
+            wyrd_spec::vala::api::AuditOutcome::Allowed,
         ),
     )
     .await
@@ -336,9 +334,7 @@ async fn delete_trusted_issuer_route(
             "admin.trusted_issuer.delete",
             &format!("trusted_issuer:{issuer}"),
             "service_accounts:write",
-            wyrd_spec::vala::api::AuditDecision::Allow,
-            wyrd_spec::vala::api::AuditResult::Success,
-            "trusted issuer deleted",
+            wyrd_spec::vala::api::AuditOutcome::Allowed,
         ),
     )
     .await
@@ -389,9 +385,7 @@ async fn create_workload_binding(
             "admin.workload_binding.create",
             &format!("workload_binding:{}:{}", binding.issuer, binding.subject),
             "service_accounts:write",
-            wyrd_spec::vala::api::AuditDecision::Allow,
-            wyrd_spec::vala::api::AuditResult::Success,
-            "workload binding registered",
+            wyrd_spec::vala::api::AuditOutcome::Allowed,
         ),
     )
     .await
@@ -462,9 +456,7 @@ async fn delete_workload_binding_route(
             "admin.workload_binding.delete",
             &format!("workload_binding:{issuer}:{}", query.subject),
             "service_accounts:write",
-            wyrd_spec::vala::api::AuditDecision::Allow,
-            wyrd_spec::vala::api::AuditResult::Success,
-            "workload binding deleted",
+            wyrd_spec::vala::api::AuditOutcome::Allowed,
         ),
     )
     .await

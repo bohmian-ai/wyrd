@@ -19,7 +19,7 @@ use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::tables::audit::projection::project_audit_rows;
 use vala_sql::TenantConn;
-use vala_sql::queries::audit_staging::{list_publication_batch, retire_published};
+use vala_sql::queries::audit_staging::{drain_through_watermark, list_publication_batch};
 use vala_sql::row_types::audit_staging::AuditStagingRow;
 use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
 use wyrd_spec::DataTenantId;
@@ -28,9 +28,6 @@ use wyrd_spec::request_id::RequestId;
 use wyrd_sql::OperatorPool;
 
 use crate::state::{AppState, ServerGate};
-
-/// Fully-qualified physical name of the retained audit table.
-const AUDIT_LOG_FQN: &str = "vala.system.audit_log";
 
 /// Events moved by one tenant cycle.
 ///
@@ -47,13 +44,13 @@ const PUBLICATION_INTERVAL: Duration = Duration::from_secs(5);
 pub enum PublishOutcome {
     /// The tenant has no event owed to retained history.
     Idle,
-    /// The inclusive range was published and retired.
+    /// The inclusive range was published and drained.
     Published {
         /// First published sequence number.
         seq_lo: i64,
         /// Last published sequence number.
         seq_hi: i64,
-        /// Rows actually removed by retirement.
+        /// Rows actually removed by the watermark advance.
         retired: u64,
     },
 }
@@ -148,16 +145,16 @@ impl AuditPublisher {
     /// runs in its own transaction once the append is durable.
     ///
     /// # Errors
-    /// Returns the stable failure raised by the outbox read, the content
-    /// projection, the durable append, or the retirement. A failure after a
-    /// durable append leaves the range published but not retired; the next
-    /// cycle republishes it into Scribe's dedup fence and retires it then.
+    /// Returns the stable failure raised by the staging read, the content
+    /// projection, the durable append, or the watermark advance. A failure
+    /// after a durable append leaves the range published but staged; the next
+    /// cycle republishes it into Scribe's dedup fence and drains it then.
     pub async fn publish_tenant(
         &self,
         tenant: DataTenantId,
     ) -> Result<PublishOutcome, AuditPublicationError> {
         let rows = self.claim(tenant).await?;
-        if rows.is_empty() || is_publication_tail(&rows) {
+        if rows.is_empty() {
             return Ok(PublishOutcome::Idle);
         }
         let projection = project_audit_rows(tenant, &rows)
@@ -171,7 +168,7 @@ impl AuditPublisher {
             )
             .await
             .map_err(|error| AuditPublicationError::Publish(error.to_string()))?;
-        let retired = self.retire(tenant, seq_lo, seq_hi).await?;
+        let retired = self.retire(tenant, seq_hi).await?;
         Ok(PublishOutcome::Published {
             seq_lo,
             seq_hi,
@@ -196,17 +193,17 @@ impl AuditPublisher {
         Ok(rows)
     }
 
-    /// Retire the published inclusive range in its own tenant transaction.
+    /// Advance the tenant watermark past the published range and drain through
+    /// it, both in one transaction.
     async fn retire(
         &self,
         tenant: DataTenantId,
-        seq_lo: i64,
         seq_hi: i64,
     ) -> Result<u64, AuditPublicationError> {
         let mut conn = TenantConn::acquire(&self.pool, tenant)
             .await
             .map_err(|error| AuditPublicationError::Retire(error.to_string()))?;
-        let retired = retire_published(&mut conn, seq_lo, seq_hi)
+        let retired = drain_through_watermark(&mut conn, seq_hi)
             .await
             .map_err(|error| AuditPublicationError::Retire(error.to_string()))?;
         conn.commit()
@@ -219,8 +216,8 @@ impl AuditPublisher {
 /// Stable failures raised by one publication cycle.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum AuditPublicationError {
-    /// The outbox read failed.
-    #[error("audit outbox read failed: {0}")]
+    /// The staging read failed.
+    #[error("audit staging read failed: {0}")]
     Outbox(String),
     /// The claimed rows could not be projected into canonical content.
     #[error("audit projection failed: {0}")]
@@ -228,20 +225,9 @@ pub enum AuditPublicationError {
     /// The durable append was refused.
     #[error("audit publication failed: {0}")]
     Publish(String),
-    /// Retirement of a published range failed.
-    #[error("audit retirement failed: {0}")]
+    /// Draining a published range through the watermark failed.
+    #[error("audit drain failed: {0}")]
     Retire(String),
-}
-
-/// True when the batch contains only this publisher's own trailing markers.
-///
-/// Publishing into `vala.system.audit_log` is itself an audited transition, so
-/// a shipment leaves one marker row behind. Publishing that marker alone would
-/// mint the next one forever, so the tail waits until a real event arrives to
-/// travel with it. No event is dropped — retained history simply lags by its
-/// own marker until the tenant records something else.
-fn is_publication_tail(rows: &[AuditStagingRow]) -> bool {
-    rows.iter().all(|row| row.resource == AUDIT_LOG_FQN)
 }
 
 /// Build the internal principal that owns one tenant's publication.
@@ -253,53 +239,4 @@ fn publisher_principal(tenant: DataTenantId) -> Principal {
         Vec::new(),
         PermissionSet::new(),
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Build one outbox row for the given resource.
-    fn row(seq: i64, resource: &str) -> AuditStagingRow {
-        AuditStagingRow {
-            data_tenant_id: uuid::Uuid::now_v7(),
-            seq,
-            entry_hash: vec![0; 32],
-            prev_hash: vec![0; 32],
-            request_id: "req".to_owned(),
-            trace_id: None,
-            operation: "bifrost.scribe.visibility.publish".to_owned(),
-            resource: resource.to_owned(),
-            card_ref: None,
-            principal_id: uuid::Uuid::nil(),
-            principal_kind: "user".to_owned(),
-            auth_method: "internal".to_owned(),
-            permission: "bifrost:record:write".to_owned(),
-            decision: "allow".to_owned(),
-            result: "success".to_owned(),
-            payload_summary: "published".to_owned(),
-            detail: None,
-            created_at: chrono::Utc::now(),
-        }
-    }
-
-    /// A batch of nothing but publication markers does not ship.
-    #[test]
-    fn publication_markers_alone_are_a_tail() {
-        let rows = vec![row(1, AUDIT_LOG_FQN), row(2, AUDIT_LOG_FQN)];
-        assert!(is_publication_tail(&rows));
-    }
-
-    /// One real event makes the whole batch shippable, markers included.
-    #[test]
-    fn one_real_event_makes_the_batch_shippable() {
-        let rows = vec![row(1, AUDIT_LOG_FQN), row(2, "wyrd.cards")];
-        assert!(!is_publication_tail(&rows));
-    }
-
-    /// An empty batch is not treated as a tail; the caller handles it first.
-    #[test]
-    fn empty_batch_is_vacuously_a_tail() {
-        assert!(is_publication_tail(&[]));
-    }
 }

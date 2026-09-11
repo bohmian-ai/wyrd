@@ -8,8 +8,7 @@ use wyrd_spec::auth::{PLATFORM_AUDIT_PRINCIPAL, PrincipalId, PrincipalKindTag};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
-    AuditDecision, AuditEvent, AuditResult, AuthMethod, BifrostQueryRequest, FreshnessPolicy,
-    VisibilityMode,
+    AuditEvent, AuditOutcome, AuthMethod, BifrostQueryRequest, FreshnessPolicy, VisibilityMode,
 };
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_testing::WyrdTestServer;
@@ -215,8 +214,8 @@ async fn audited_transitions_retire_only_into_retained_history() -> Result<(), S
             PrincipalKindTag::User,
             AuthMethod::Internal,
             "bifrost:record:write".to_owned(),
-            AuditDecision::Allow,
-            AuditResult::Success,
+            AuditOutcome::Allowed,
+            AuditOutcome::Allowed,
             "journey owed event".to_owned(),
         ),
     )

@@ -33,8 +33,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
-    AuditDecision, AuditEvent, AuditResult, AuthMethod, BifrostQueryRequest, FreshnessPolicy,
-    VisibilityMode,
+    AuditEvent, AuditOutcome, AuthMethod, BifrostQueryRequest, FreshnessPolicy, VisibilityMode,
 };
 use wyrd_testing::Bootstrap;
 use wyrd_testing::bifrost::WyrdTestCluster;
@@ -274,8 +273,8 @@ pub(crate) async fn seed_foreign_hot_row(
         PrincipalKindTag::User,
         AuthMethod::Internal,
         "bifrost_query:read".to_owned(),
-        AuditDecision::Allow,
-        AuditResult::Success,
+        AuditOutcome::Allowed,
+        AuditOutcome::Allowed,
         "foreign tripwire fixture".to_owned(),
     );
     let mut conn = cluster.pg_fixture().tenant_conn_for(owner).await?;

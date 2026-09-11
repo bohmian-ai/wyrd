@@ -36,11 +36,11 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PLATFORM_AUDIT_PRINCIPAL, PrincipalKindTag};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
-    AcquireTailFenceRequest as DomainAcquireTailFenceRequest,
+    AcquireTailFenceRequest as DomainAcquireTailFenceRequest, AuditOutcome,
     SchemaFingerprint as WireSchemaFingerprint, TailCursor,
     TailPageRequest as DomainTailPageRequest, TenantTableBinding,
 };
-use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
+use wyrd_spec::vala::api::{AuditEvent, AuditOutcome, AuthMethod};
 use wyrd_testing::WyrdTestServer;
 use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValue, any_value};
 use wyrd_tonic::otlp::logs::v1::ResourceLogs;
@@ -244,8 +244,8 @@ async fn seed_tail_rows(state: &AppState, tenant: DataTenantId) {
         principal_kind: principal.kind.tag(),
         auth_method: AuthMethod::Jwt,
         permission: "bifrost:append".to_owned(),
-        decision: AuditDecision::Allow,
-        result: AuditResult::Success,
+        decision: AuditOutcome::Allowed,
+        result: AuditOutcome::Allowed,
         payload_summary: format!("{} rows", rows.num_rows()),
         detail: None,
     };

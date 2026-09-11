@@ -9,7 +9,7 @@ use wyrd_spec::auth::IssuerUrl;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::TenantSlug;
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{AuditDecision, AuditResult};
+use wyrd_spec::vala::api::AuditOutcome;
 
 use crate::audit;
 use crate::http::error::WyrdErrorResponse;
@@ -55,23 +55,11 @@ pub async fn login(
         None
     };
 
-    // Determine audit outcome and resource.
-    let (decision, result, payload_summary) = match (&tenant_result, &login_result) {
-        (Err(_), _) => (
-            AuditDecision::Deny,
-            AuditResult::Failure,
-            format!("tenant unresolved; issuer={}", query.issuer),
-        ),
-        (_, Some(Err(_))) => (
-            AuditDecision::Deny,
-            AuditResult::Failure,
-            format!("login initiation failed; issuer={}", query.issuer),
-        ),
-        _ => (
-            AuditDecision::Allow,
-            AuditResult::Success,
-            format!("login initiated; issuer={}", query.issuer),
-        ),
+    // A login attempt is admitted only when its tenant resolves and initiation
+    // succeeds; either refusal is the boundary denying the attempt.
+    let decision = match (&tenant_result, &login_result) {
+        (Err(_), _) | (_, Some(Err(_))) => AuditOutcome::Denied,
+        _ => AuditOutcome::Allowed,
     };
 
     let audit_event = audit::audit_event_unauthenticated(
@@ -80,8 +68,6 @@ pub async fn login(
         &format!("issuer:{}", query.issuer),
         "auth:login",
         decision,
-        result,
-        &payload_summary,
     );
 
     // Route audit to tenant log (resolved) or platform stream (unresolved).

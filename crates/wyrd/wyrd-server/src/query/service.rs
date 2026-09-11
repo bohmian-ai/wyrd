@@ -5,8 +5,7 @@ use wyrd_runtime::{Action, Permission, PermissionDenyReason, PermissionVerdict, 
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
-    AuditDecision, AuditResult, AuthMethod, BifrostQueryRequest, CancelRunningQueryResponse,
-    RunningQuerySummary,
+    AuditOutcome, AuthMethod, BifrostQueryRequest, CancelRunningQueryResponse, RunningQuerySummary,
 };
 
 use crate::AppState;
@@ -126,10 +125,7 @@ impl<'a> QueryAuthority<'a> {
     /// the fail-closed outcome: the caller is still refused, and the refusal is
     /// never reported as if it had been recorded.
     async fn deny(&self, reason: PermissionDenyReason) -> WyrdError {
-        match self
-            .append(AuditResult::Failure, "rbac permission denied")
-            .await
-        {
+        match self.append(AuditOutcome::Denied).await {
             Ok(()) => permission_deny_reason_to_wyrd(reason),
             Err(error) => error,
         }
@@ -156,29 +152,24 @@ impl<'a> QueryAuthority<'a> {
             }
             .into();
         }
-        match self
-            .append(AuditResult::Failure, "rbac object permission denied")
-            .await
-        {
+        match self.append(AuditOutcome::Denied).await {
             Ok(()) => denial,
             Err(error) => error,
         }
     }
 
-    /// Appends one denial row for this operation to the tenant audit outbox.
+    /// Appends one decision row for this operation to the tenant audit staging.
     ///
     /// # Errors
     ///
-    /// Returns audit-unavailable when the tenant outbox append cannot commit.
-    async fn append(&self, result: AuditResult, summary: &str) -> Result<(), WyrdError> {
+    /// Returns audit-unavailable when the tenant append cannot commit.
+    async fn append(&self, outcome: AuditOutcome) -> Result<(), WyrdError> {
         let event = audit::audit_event(
             self.caller,
             self.operation,
             &self.resource,
             &self.permission.to_string(),
-            AuditDecision::Deny,
-            result,
-            summary,
+            outcome,
         );
         audit::record_audit_owned(
             self.state.postgres.vala_pool().clone(),
@@ -188,48 +179,17 @@ impl<'a> QueryAuthority<'a> {
         .await
     }
 
-    /// Durably records the truthful result returned by the lifecycle owner.
+    /// Durably records the allowed decision before the owner is dispatched.
     ///
-    /// The row contains only lifecycle identity and outcome metadata. Query
-    /// text, parameters, and results never enter the audit record.
-    ///
-    /// # Errors
-    ///
-    /// Returns audit-unavailable when the tenant outbox append cannot commit;
-    /// callers must then fail closed instead of returning the control result.
-    async fn record<T>(&self, outcome: &Result<T, WyrdError>) -> Result<(), WyrdError> {
-        let (result, payload_summary) = if outcome.is_ok() {
-            (AuditResult::Success, "running query control succeeded")
-        } else {
-            (AuditResult::Failure, "running query control failed")
-        };
-        let event = audit::audit_event(
-            self.caller,
-            self.operation,
-            &self.resource,
-            &self.permission.to_string(),
-            AuditDecision::Allow,
-            result,
-            payload_summary,
-        );
-        audit::record_audit_owned(
-            self.state.postgres.vala_pool().clone(),
-            self.caller.data_tenant_id,
-            event,
-        )
-        .await
-    }
-
-    /// Durably gates one mutating cancellation before owner dispatch.
-    ///
-    /// This records authorization to attempt dispatch under a distinct operation;
-    /// it does not claim that cancellation succeeded. [`Self::record`] writes the
-    /// truthful owner outcome after dispatch.
+    /// A lifecycle operation has no later Oracle read decision to carry its
+    /// `allowed` row, so the boundary writes it here, before dispatch. The row
+    /// states only that the caller was permitted; whether the owner then
+    /// succeeded is lifecycle state, not an authorization decision.
     ///
     /// # Errors
     ///
-    /// Returns audit-unavailable before the cancellation owner is called.
-    async fn record_cancel_attempt(&self) -> Result<(), WyrdError> {
+    /// Returns audit-unavailable before the lifecycle owner is called.
+    async fn record_admission(&self) -> Result<(), WyrdError> {
         #[cfg(feature = "test-support")]
         if self
             .state
@@ -238,18 +198,16 @@ impl<'a> QueryAuthority<'a> {
             .is_some_and(crate::state::QueryControlAuditFaultController::cancel_attempts_fail)
         {
             return Err(wyrd_spec::vala::error::BifrostError::AuditUnavailable {
-                detail: "cancellation audit gate unavailable before dispatch".to_owned(),
+                detail: "lifecycle audit gate unavailable before dispatch".to_owned(),
             }
             .into());
         }
         let event = audit::audit_event(
             self.caller,
-            "vala.query.running.cancel.attempt",
+            self.operation,
             &self.resource,
             &self.permission.to_string(),
-            AuditDecision::Allow,
-            AuditResult::Success,
-            "running query cancellation dispatch authorized",
+            AuditOutcome::Allowed,
         );
         audit::record_audit_owned(
             self.state.postgres.vala_pool().clone(),
@@ -326,12 +284,11 @@ pub async fn list_running_queries(
 ) -> Result<Vec<RunningQuerySummary>, WyrdError> {
     let audit = QueryAuthority::lifecycle(state, caller, "vala.query.running.list", None);
     audit.authorize().await?;
-    let outcome = match state.bifrost.query_controls() {
+    audit.record_admission().await?;
+    match state.bifrost.query_controls() {
         Some(controls) => controls.list(caller.data_tenant_id).await,
         None => Err(wyrd_spec::vala::error::BifrostError::OracleRoleUnavailable.into()),
-    };
-    audit.record(&outcome).await?;
-    outcome
+    }
 }
 
 /// Returns one active query visible to the authenticated tenant.
@@ -350,12 +307,11 @@ pub async fn get_running_query(
     let audit =
         QueryAuthority::lifecycle(state, caller, "vala.query.running.get", Some(&request_id));
     audit.authorize().await?;
-    let outcome = match state.bifrost.query_controls() {
+    audit.record_admission().await?;
+    match state.bifrost.query_controls() {
         Some(controls) => controls.get(caller.data_tenant_id, request_id).await,
         None => Err(wyrd_spec::vala::error::BifrostError::OracleRoleUnavailable.into()),
-    };
-    audit.record(&outcome).await?;
-    outcome
+    }
 }
 
 /// Requests idempotent cancellation of one active query for the authenticated tenant.
@@ -378,8 +334,8 @@ pub async fn cancel_running_query(
         Some(&request_id),
     );
     audit.authorize().await?;
-    audit.record_cancel_attempt().await?;
-    let outcome = match state.bifrost.query_controls() {
+    audit.record_admission().await?;
+    match state.bifrost.query_controls() {
         Some(controls) => controls
             .cancel(caller.data_tenant_id, request_id)
             .await
@@ -388,14 +344,7 @@ pub async fn cancel_running_query(
                 cancellation_started: cancelled.cancellation_started,
             }),
         None => Err(wyrd_spec::vala::error::BifrostError::OracleRoleUnavailable.into()),
-    };
-    if audit.record(&outcome).await.is_err() {
-        return Err(wyrd_spec::vala::error::BifrostError::AuditUnavailable {
-            detail: "cancellation produced an outcome but its audit append failed".to_owned(),
-        }
-        .into());
     }
-    outcome
 }
 
 /// operators.
@@ -439,7 +388,7 @@ mod tests {
     use wyrd_runtime::{Principal, PrincipalKind};
     use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::request_id::RequestId;
-    use wyrd_spec::vala::api::{FreshnessPolicy, VisibilityMode};
+    use wyrd_spec::vala::api::{AuditOutcome, FreshnessPolicy, VisibilityMode};
 
     use super::*;
 

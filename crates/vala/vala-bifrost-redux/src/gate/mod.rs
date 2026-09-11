@@ -8,7 +8,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use arrow::record_batch::RecordBatch;
+use sha2::{Digest as _, Sha256};
 use tracing::Instrument;
+use uuid::Uuid;
 use wyrd_auth_oidc::IssuerConfigResolver;
 use wyrd_auth_verify::PermissionResolver;
 use wyrd_runtime::PermissionCheck;
@@ -33,6 +36,9 @@ pub use crate::gate::limits::{IngestLimits, OtlpWireLimits};
 use crate::namespaces::BifrostNamespace;
 use crate::oracle::{AuthorizedQueryContext, OracleQueryStream, QueryStreamLifecycle};
 pub use crate::otlp_contract::{IngestOutcome, LogsOutcome, MetricsOutcome};
+use crate::scribe::preprocess::{correlation_data_identity, logical_data_identity};
+use wyrd_spec::auth::PrincipalId;
+use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::error::BifrostError;
 
@@ -82,10 +88,15 @@ fn record_write_rejection(error: &IngestError) {
 /// OTLP is at-least-once and carries no request idempotency key, so a retried
 /// export must be recognized by what it accepted rather than by transport
 /// metadata. The identity is the SHA-256 of a domain separator, the
-/// authenticated tenant, the logical table FQN, and the canonical batch's
-/// logical Arrow digest from [`crate::scribe::preprocess::logical_data_identity`],
-/// which deliberately excludes the per-request managed columns (request id,
-/// ingest time) that change across a legitimate retry. Scoping by tenant and
+/// authenticated tenant, the authenticated principal, the logical table FQN,
+/// the canonical batch's logical Arrow digest from
+/// [`logical_data_identity`], and the accepted correlation attribution that
+/// digest deliberately excludes ([`correlation_data_identity`]). The logical
+/// digest omits the per-request managed columns (request id, ingest time) that
+/// change across a legitimate retry, so a genuine replay still converges;
+/// binding the principal and the correlation columns keeps two authorized
+/// callers in one tenant from collapsing an identical user payload onto one
+/// fence and losing the second caller's attribution. Scoping by tenant and
 /// table keeps identity from correlating across either boundary.
 ///
 /// The first sixteen digest bytes are stamped with the RFC 4122 variant and
@@ -97,26 +108,32 @@ fn record_write_rejection(error: &IngestError) {
 /// # Errors
 ///
 /// Returns the mapped Scribe failure when the canonical batch has no
-/// representable logical identity.
+/// representable logical or correlation identity.
+///
+/// # Panics
+///
+/// Never panics: the sixteen-byte slice of a SHA-256 digest is infallible and
+/// its `expect` names that invariant.
 fn otlp_batch_id(
-    tenant: wyrd_spec::ids::DataTenantId,
+    tenant: DataTenantId,
+    principal: PrincipalId,
     table: &TableRef,
-    batch: &arrow::record_batch::RecordBatch,
-) -> Result<uuid::Uuid, IngestError> {
-    use sha2::{Digest as _, Sha256};
-
-    let (logical_digest, _) = crate::scribe::preprocess::logical_data_identity(batch)
-        .map_err(IngestError::from_scribe)?;
+    batch: &RecordBatch,
+) -> Result<Uuid, IngestError> {
+    let (logical_digest, _) = logical_data_identity(batch).map_err(IngestError::from_scribe)?;
+    let correlation_digest = correlation_data_identity(batch).map_err(IngestError::from_scribe)?;
     let mut digest = Sha256::new();
     digest.update(b"wyrd.otlp.batch-id.v1");
     digest.update(tenant.as_uuid().as_bytes());
+    digest.update(principal.as_uuid().as_bytes());
     digest.update(table.fqn().as_bytes());
     digest.update(logical_digest);
+    digest.update(correlation_digest);
     let digest: [u8; 32] = digest.finalize().into();
     let mut bytes: [u8; 16] = digest[..16].try_into().expect("sixteen digest bytes");
     bytes[6] = (bytes[6] & 0x0f) | 0x70;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    Ok(uuid::Uuid::from_bytes(bytes))
+    Ok(Uuid::from_bytes(bytes))
 }
 
 /// Owns exactly one terminal Gate request metric across return or cancellation.
@@ -619,6 +636,25 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
         Ok(outcome)
     }
 
+    /// Routes one projected canonical OTLP batch to Scribe under retry
+    /// suppression.
+    ///
+    /// The accepted rows are what identifies the request: [`otlp_batch_id`]
+    /// derives a deterministic `wyrd_batch_id` from the authenticated tenant
+    /// and principal, the table, and the batch's logical and correlation
+    /// content, so an at-least-once exporter replaying the same export reaches
+    /// Scribe's durable fence and commits exactly once, while a different
+    /// authenticated publisher or different accepted correlation attribution
+    /// gets its own fence and its own correctly attributed rows. An empty
+    /// batch — every record of the request was rejected by projection — is a
+    /// no-op that never reaches Scribe.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngestError::IngressClosed`] when ingress is closing,
+    /// [`IngestError::PayloadTooLarge`] when the measured frame exceeds the
+    /// configured limit, and the mapped Scribe failure for a refused
+    /// validation, admission, or durable append.
     #[tracing::instrument(
         skip_all,
         fields(tenant = %auth.tenant, table = %table, request_id = %auth.request_id,
@@ -629,7 +665,7 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
         auth: &AuthContext,
         table: TableRef,
         measured_wire_bytes: usize,
-        batch: arrow::record_batch::RecordBatch,
+        batch: RecordBatch,
         owner: Option<OtlpDecodeOwner>,
     ) -> Result<(), IngestError> {
         self.ensure_open()?;
@@ -657,7 +693,7 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
         if batch.num_rows() == 0 {
             return Ok(());
         }
-        let batch_id = otlp_batch_id(auth.tenant, &table, &batch)?;
+        let batch_id = otlp_batch_id(auth.tenant, auth.principal.id, &table, &batch)?;
         let payload = IngressPayload::Canonical(match owner {
             Some(owner) => CanonicalIngress::new(vec![batch], owner),
             None => CanonicalIngress::unreserved(vec![batch]),
@@ -1960,31 +1996,53 @@ mod tests {
 }
 
 #[cfg(test)]
+/// Covers the derived OTLP retry identity and the boundaries it must not cross.
 mod otlp_batch_id_tests {
     use std::sync::Arc;
 
-    use arrow::array::Int32Array;
+    use arrow::array::{Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::ids::DataTenantId;
+    use wyrd_spec::vala::RUN_ID;
 
     use super::{TableRef, otlp_batch_id};
     use crate::namespaces::BifrostNamespace;
 
-    /// Builds one canonical-shaped batch carrying `values` in order.
-    fn batch(values: &[i32]) -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
-        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values.to_vec()))])
-            .expect("the fixture batch matches its schema")
+    /// Builds one canonical-shaped batch carrying `values` under `run`.
+    ///
+    /// The batch pairs an ordinary user column with the `run_id` correlation
+    /// column the OTLP projection emits, because those two travel different
+    /// paths into the identity: user content through the logical Arrow digest,
+    /// correlation through the attribution digest that the logical one omits.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture arrays do not match the schema it declares,
+    /// which is a defect in this fixture rather than in the code under test.
+    fn batch(values: &[i32], run: Option<&str>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("v", DataType::Int32, false),
+            Field::new(RUN_ID, DataType::Utf8, true),
+        ]));
+        let runs = StringArray::from(vec![run; values.len()]);
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(values.to_vec())), Arc::new(runs)],
+        )
+        .expect("the fixture batch matches its schema")
     }
 
-    /// The derived OTLP identity is stable per tenant, table, and payload.
+    /// The derived OTLP identity is stable per tenant, table, payload, and
+    /// authenticated attribution.
     ///
     /// Retry suppression depends on a repeated export converging on one
-    /// `wyrd_batch_id`, and on any other tenant, table, row order, or payload
-    /// diverging so identity never correlates across those boundaries. The
-    /// value must also remain a `UUIDv7`, which is the contract the native
-    /// ingest path validates.
+    /// `wyrd_batch_id`, and on any other tenant, table, row order, payload,
+    /// authenticated principal, or accepted correlation attribution diverging
+    /// so identity never correlates across those boundaries and two authorized
+    /// publishers never collapse onto one fence. The value must also remain a
+    /// `UUIDv7`, which is the contract the native ingest path validates.
     ///
     /// # Panics
     ///
@@ -1994,16 +2052,19 @@ mod otlp_batch_id_tests {
     fn derived_identity_is_stable_per_tenant_table_and_payload() {
         let tenant = DataTenantId::new_v7();
         let other_tenant = DataTenantId::new_v7();
+        let principal = PrincipalId::new(uuid::Uuid::now_v7());
+        let other_principal = PrincipalId::new(uuid::Uuid::now_v7());
         let spans = TableRef::new(BifrostNamespace::Traces, "spans");
         let records = TableRef::new(BifrostNamespace::Logs, "records");
-        let id = |tenant, table: &TableRef, values: &[i32]| {
-            otlp_batch_id(tenant, table, &batch(values)).expect("the fixture batch has an identity")
+        let id = |tenant, principal, table: &TableRef, values: &[i32], run| {
+            otlp_batch_id(tenant, principal, table, &batch(values, run))
+                .expect("the fixture batch has an identity")
         };
 
-        let baseline = id(tenant, &spans, &[1, 2, 3]);
+        let baseline = id(tenant, principal, &spans, &[1, 2, 3], Some("run-a"));
         assert_eq!(
             baseline,
-            id(tenant, &spans, &[1, 2, 3]),
+            id(tenant, principal, &spans, &[1, 2, 3], Some("run-a")),
             "a replayed logical batch keeps one identity"
         );
         assert_eq!(
@@ -2012,14 +2073,18 @@ mod otlp_batch_id_tests {
             "the derived identity satisfies the UUIDv7 batch contract"
         );
         for divergent in [
-            id(other_tenant, &spans, &[1, 2, 3]),
-            id(tenant, &records, &[1, 2, 3]),
-            id(tenant, &spans, &[3, 2, 1]),
-            id(tenant, &spans, &[1, 2, 4]),
+            id(other_tenant, principal, &spans, &[1, 2, 3], Some("run-a")),
+            id(tenant, other_principal, &spans, &[1, 2, 3], Some("run-a")),
+            id(tenant, principal, &records, &[1, 2, 3], Some("run-a")),
+            id(tenant, principal, &spans, &[3, 2, 1], Some("run-a")),
+            id(tenant, principal, &spans, &[1, 2, 4], Some("run-a")),
+            id(tenant, principal, &spans, &[1, 2, 3], Some("run-b")),
+            id(tenant, principal, &spans, &[1, 2, 3], None),
         ] {
             assert_ne!(
                 baseline, divergent,
-                "a different tenant, table, row order, or payload is a different batch"
+                "a different tenant, principal, table, row order, payload, or accepted \
+                 correlation attribution is a different batch"
             );
         }
     }

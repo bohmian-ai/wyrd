@@ -138,6 +138,23 @@ fn negative_resource_metrics(anchor: i64, invalid: &[usize]) -> Vec<ResourceMetr
     }]
 }
 
+/// A valid run correlation the attribution journey stamps its second export with.
+const ATTRIBUTION_RUN: &str = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b11";
+
+/// Builds the wholly valid negative spans carrying `wyrd.run_id` correlation.
+///
+/// The spans are otherwise identical to `negative_resource_spans(anchor, &[])`,
+/// so the only thing that can distinguish their stored rows from that export's
+/// is the accepted run correlation the Gate must bind into batch identity.
+fn correlated_resource_spans(anchor: i64) -> Vec<ResourceSpans> {
+    let mut resource_spans = negative_resource_spans(anchor, &[]);
+    for span in &mut resource_spans[0].scope_spans[0].spans {
+        span.attributes
+            .push(support::string_attribute("wyrd.run_id", ATTRIBUTION_RUN));
+    }
+    resource_spans
+}
+
 /// Reads the ordered `(discriminator, wyrd_row_ordinal)` pairs of one query.
 ///
 /// The caller orders the query by `wyrd_row_ordinal`, so the returned order is
@@ -161,6 +178,9 @@ fn ordered_rows(batches: &[RecordBatch], discriminator: &str) -> Vec<(String, i3
 
 /// Tests that need Postgres, a bound server, and the publication boundary.
 mod pg_tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use arrow::array::StringArray;
     use arrow::record_batch::RecordBatch;
     use reqwest::StatusCode;
     use wyrd_runtime::Permission;
@@ -173,11 +193,13 @@ mod pg_tests {
 
     use super::super::support::{self, LOGS_TABLE, METRICS_TABLE, OtlpJourney, SPANS_TABLE};
     use super::super::trace_export::export_traces_over_grpc;
+    use super::super::trace_export::export_traces_over_grpc_as;
     use super::super::trace_export_http::{HttpEncoding, post_otlp, post_otlp_raw};
     use super::{
-        LOG_MARKERS, LOG_REJECTION, METRIC_REJECTION, NEGATIVE_LOG_SCOPE, NEGATIVE_METRIC_SCOPE,
-        NEGATIVE_TRACE_SCOPE, SPAN_MARKERS, SPAN_REJECTION, negative_resource_logs,
-        negative_resource_metrics, negative_resource_spans, ordered_rows,
+        ATTRIBUTION_RUN, LOG_MARKERS, LOG_REJECTION, METRIC_REJECTION, NEGATIVE_LOG_SCOPE,
+        NEGATIVE_METRIC_SCOPE, NEGATIVE_TRACE_SCOPE, SPAN_MARKERS, SPAN_REJECTION,
+        correlated_resource_spans, negative_resource_logs, negative_resource_metrics,
+        negative_resource_spans, ordered_rows,
     };
 
     /// A mixed request commits its complete siblings and reports exactly one.
@@ -308,6 +330,105 @@ mod pg_tests {
             &[support::GAUGE_INT_METRIC, support::SUM_INT_METRIC],
             "",
         );
+
+        journey.shutdown().await;
+    }
+
+    /// One publisher's replay is exactly once; two publishers are two row sets.
+    ///
+    /// Retry suppression derives `wyrd_batch_id` from the accepted rows rather
+    /// than from transport metadata, so it must be scoped to the authenticated
+    /// publisher and the accepted correlation attribution it carries. This
+    /// case exports the same wholly valid spans three ways: twice as the
+    /// journey's own principal (the at-least-once replay), once as a second
+    /// authorized principal in the same tenant, and once as the first
+    /// principal again under a different accepted `wyrd.run_id`. The replay
+    /// must converge on one fence and store one row set, while each of the
+    /// other two must reach its own fence and store its own rows with its own
+    /// `principal_id` and `run_id` — otherwise an acknowledgement would have
+    /// claimed a row that was never stored under its own attribution.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an export is refused, when the replay duplicates or drops a
+    /// row, or when a distinct principal or run correlation does not produce
+    /// its own complete, correctly attributed row set.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn identical_exports_from_two_principals_each_keep_their_own_attribution() {
+        let journey = OtlpJourney::start().await;
+        let anchor = support::anchor_nanos();
+
+        for attempt in 0..2 {
+            let partial = export_traces_over_grpc(&journey, negative_resource_spans(anchor, &[]))
+                .await
+                .and_then(|partial| (partial.rejected_spans != 0).then_some(partial));
+            assert!(
+                partial.is_none(),
+                "attempt {attempt}: a wholly valid export rejects no span"
+            );
+        }
+
+        let second = journey
+            .token_with_permissions(
+                "otlp_attribution_writer",
+                &[Permission::bifrost_record_write()],
+            )
+            .await;
+        export_traces_over_grpc_as(&journey, &second, negative_resource_spans(anchor, &[])).await;
+        export_traces_over_grpc(&journey, correlated_resource_spans(anchor)).await;
+
+        journey.publish().await;
+
+        let rows = journey
+            .query(&format!(
+                "SELECT trace_state, principal_id, run_id FROM {SPANS_TABLE} \
+                 WHERE scope_name = '{NEGATIVE_TRACE_SCOPE}'"
+            ))
+            .await;
+        let mut attributed: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+        for batch in &rows {
+            let markers = support::column::<StringArray>(batch, "trace_state");
+            let principals = support::column::<StringArray>(batch, "principal_id");
+            let runs = support::column::<StringArray>(batch, "run_id");
+            for index in 0..batch.num_rows() {
+                let run = if runs.is_null(index) {
+                    String::new()
+                } else {
+                    runs.value(index).to_owned()
+                };
+                attributed
+                    .entry((principals.value(index).to_owned(), run))
+                    .or_default()
+                    .push(markers.value(index).to_owned());
+            }
+        }
+
+        assert_eq!(
+            attributed.len(),
+            3,
+            "the replay collapses onto one fence while the second principal and the \
+             differently correlated export each keep their own: {attributed:?}"
+        );
+        let principals: BTreeSet<&String> = attributed.keys().map(|(id, _)| id).collect();
+        assert_eq!(
+            principals.len(),
+            2,
+            "two authorized publishers keep two distinct principal attributions"
+        );
+        let runs: BTreeSet<&String> = attributed.keys().map(|(_, run)| run).collect();
+        assert!(
+            runs.contains(&String::new()) && runs.contains(&ATTRIBUTION_RUN.to_owned()),
+            "the uncorrelated and the run-correlated exports are stored apart: {runs:?}"
+        );
+        for (attribution, mut markers) in attributed {
+            markers.sort();
+            assert_eq!(
+                markers,
+                SPAN_MARKERS.map(str::to_owned).to_vec(),
+                "{attribution:?} stores every accepted sibling exactly once"
+            );
+        }
 
         journey.shutdown().await;
     }

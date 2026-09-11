@@ -33,6 +33,26 @@ pub(super) async fn export_traces_over_grpc(
     journey: &OtlpJourney,
     resource_spans: Vec<wyrd_tonic::otlp::trace::v1::ResourceSpans>,
 ) -> Option<wyrd_tonic::otlp::trace_service::ExportTracePartialSuccess> {
+    export_traces_over_grpc_as(journey, journey.token(), resource_spans).await
+}
+
+/// Sends one OTLP trace export authenticated as the principal behind `token`.
+///
+/// Retry suppression is scoped to one authenticated publisher, so proving it
+/// needs a second authorized caller in the same tenant sending the same
+/// payload. Only the credential differs from [`export_traces_over_grpc`];
+/// every other transport detail is shared so the two exports are identical on
+/// the wire apart from their bearer.
+///
+/// # Panics
+///
+/// Panics when the transport cannot be dialed or the export is refused; a
+/// refusal is a defect in this journey rather than an outcome it asserts.
+pub(super) async fn export_traces_over_grpc_as(
+    journey: &OtlpJourney,
+    token: &str,
+    resource_spans: Vec<wyrd_tonic::otlp::trace::v1::ResourceSpans>,
+) -> Option<wyrd_tonic::otlp::trace_service::ExportTracePartialSuccess> {
     let channel = Channel::from_shared(journey.grpc_url())
         .expect("the bound gRPC URL is a valid endpoint")
         .connect()
@@ -41,7 +61,7 @@ pub(super) async fn export_traces_over_grpc(
     let mut request = Request::new(ExportTraceServiceRequest { resource_spans });
     request.metadata_mut().insert(
         "x-wyrd-access-token",
-        format!("Bearer {}", journey.token())
+        format!("Bearer {token}")
             .parse()
             .expect("the minted bearer is valid ASCII metadata"),
     );

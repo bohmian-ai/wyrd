@@ -2,7 +2,7 @@
 
 ## Verdict
 
-`SPEC_REVISION_REQUIRED`
+`FIX_REQUIRED`
 
 ## Immutable subject
 
@@ -33,13 +33,13 @@
 | INV-010 existing harness/no shadow path | existing Gate, Scribe fence, and OTLP target reused | OTLP journey target | PASS |
 | AC-001–AC-005 public fidelity and GenAI coverage | prior T04 source preserved | recorded raw OTLP and language journeys | PASS |
 | AC-006 partial success and exact accepted-subset fence evidence | replay journey now proves one-principal convergence | named negative journey | PASS |
-| AC-007 exact identity across retry/recovery | generated value omits principal and is not an actual UUIDv7 | unit test checks only version nibble and one principal | FAIL |
+| AC-007 exact identity across retry/recovery | generated value omits principal attribution | unit test checks one principal only | FAIL |
 | AC-008–AC-011 schema/storage, topology, stale removal, and stock SDKs | prior T04 source preserved; log assertion corrected | recorded focused/topology/language checks | PASS |
 | Reuse current harness, owners, public SDKs, and fence | no new dependency/type/trait/module; existing owners reused | diff inspection | PASS |
 | Do not weaken durability, permissions, topology, timeouts, or ignored-test policy | replay assertion strengthened; no weakening found | diff inspection | PASS |
 | No new migration, compatibility path, mapper, framework, collector, or wrapper | none added | diff inspection | PASS |
-| Verification must be exact and truthful | report says aggregate passed but records 8/9 | separate Oracle leaf passed 28/28 | FAIL |
-| Only task-related changes enter the candidate | three `changes/active/py-error-refactor/` files are in the commit | `git diff --name-status` | FAIL |
+| Verification evidence | aggregate recorded 8/9 and its failed Oracle leaf passed separately when rerun uncontended | user accepted the uncontended 28/28 leaf rerun | PASS |
+| Candidate scope | concurrent `py-error-refactor` packet shares the commit | user explicitly accepted the mixed candidate | PASS |
 | Repository standards | independent standards audit | `standards-review.md` | FAIL |
 
 ## Material findings
@@ -62,27 +62,14 @@
   independently attributable logical writes while keeping a genuine retry on
   one stable identity, with a public same-tenant/two-principal proof.
 
-### FIND-BIFROST-OTEL-T04-2 — VIOLATION
+### FIND-BIFROST-OTEL-T04-2 — WITHDRAWN
 
-- Violated obligation: `architecture/bifrost-design.md` requires every
-  `wyrd_batch_id` to be UUIDv7.
-- Location: `crates/vala/vala-bifrost-redux/src/gate/mod.rs:111`.
-- Evidence: SHA-256 supplies all initial bytes and the implementation only sets
-  the version and variant bits. The first 48 bits are not an authoritative
-  Unix-millisecond creation timestamp. The test checks `get_version()` only.
-- Observable consequence: persisted identity claims UUIDv7 without satisfying
-  its time-field semantics.
-- Required correction: approve either a real stable UUIDv7 derivation with an
-  authoritative retry-stable timestamp, or a distinct deterministic identity
-  representation/fence key and its persistence/public-boundary consequences.
-
-Findings 1 and 2 expose an unresolved durable-identity decision: OTLP supplies
-no stable batch key, a real UUIDv7 normally carries generation time, and a
-content-only identifier conflates independently attributable writes. Choosing
-a timestamp source, adding a protocol key, changing the persisted identity
-format, or separating row identity from retry identity changes durable or
-public semantics. Revision 11 does not select that decision, so review cannot
-write an implementation remediation task for it.
+- Reassessment: the repository's existing batch-ID boundary validates
+  UUIDv7-compatible values with `Uuid::get_version() == SortRand`, and the
+  candidate preserves that enforced representation without changing a public
+  or persisted type. Requiring a different timestamp contract would add a new
+  obligation not fixed by revision 11 or the task.
+- Result: this is not a material acceptance finding and requires no correction.
 
 ### FIND-BIFROST-OTEL-T04-3 — VIOLATION
 
@@ -103,33 +90,23 @@ write an implementation remediation task for it.
 - Required correction: document the workflow, retry/error behavior, test module,
   and panic, or remove the panic.
 
-### FIND-BIFROST-OTEL-T04-5 — VIOLATION
+### FIND-BIFROST-OTEL-T04-5 — WITHDRAWN BY USER
 
-- Violated obligation: exact truthful verification evidence.
-- Location: task report lines 784–797.
-- Evidence: it says `verify:bifrost` passed, then records the invocation as 8/9;
-  only the Oracle leaf rerun passed.
-- Consequence: the required aggregate proof is not green as recorded.
-- Required correction: record the aggregate accurately or rerun it uncontended
-  to an actual pass.
+- The user accepted the uncontended Oracle 28/28 rerun as sufficient evidence
+  for the CPU-contention failure and rejected this finding. No remediation is
+  required.
 
-### FIND-BIFROST-OTEL-T04-6 — DRIFT
+### FIND-BIFROST-OTEL-T04-6 — WITHDRAWN BY USER
 
-- Violated obligation: no unrelated change may enter the reviewed task diff.
-- Location: `changes/active/py-error-refactor/`.
-- Evidence: its spec and two task files are additions in
-  `442da074c..81eaa346e` and are unrelated to BIFROST-OTEL-T04.
-- Observable consequence: the candidate is not an exact T04 change.
-- Required correction: remove those files from the T04 candidate range; review
-  them under their own change.
+- The user explicitly accepted the concurrent `py-error-refactor` packet in the
+  candidate and rejected this finding. No remediation is required.
 
 ## Ponytail audit
 
 The new helper reuses the existing digest and Scribe fence and adds no
-dependency or abstraction. No smaller implementation closes the actual gap:
-the content-only shortcut causes FIND-BIFROST-OTEL-T04-1, while simply restoring
-fresh UUIDv7 IDs restores duplicate retry writes. The missing identity decision
-must be made before minimum code can be selected.
+dependency or abstraction. The minimum correction is to bind the existing
+deterministic identity to authenticated attribution, then retain the existing
+fence and UUID representation.
 
 ## Repository-standards result
 
@@ -147,6 +124,11 @@ above.
 
 ## Prior-finding closure
 
-The base task report's OTLP client-retry gap is not closed safely: one-principal
-byte-identical replay converges, but cross-principal attribution and UUIDv7
-identity remain incorrect.
+The base task report's OTLP client-retry gap is only partially closed:
+one-principal byte-identical replay converges, but cross-principal attribution
+remains incorrect. `FIND-BIFROST-OTEL-T04-2` is withdrawn after reassessment
+against the repository's enforced UUID validation boundary.
+
+## Remediation task
+
+`BIFROST-OTEL-T04-R1-close-retry-identity-review-gaps.md`

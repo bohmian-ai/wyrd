@@ -410,6 +410,78 @@ pub(crate) struct PreparedSlice {
     pub memtable_bytes: usize,
 }
 
+/// Folds one Arrow array's logical bytes into `digest` and its length.
+///
+/// The walk is deliberately buffer-level rather than value-level: it covers
+/// length, offset, the validity bitmap, every data buffer, and every child
+/// recursively, so two batches agree only when their Arrow representation
+/// agrees byte-for-byte. `bytes` accumulates the contributed buffer length the
+/// WAL-v6 metadata records alongside the digest.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::Internal`] when the accumulated buffer length
+/// overflows its `usize` accumulator.
+fn digest_array_data(
+    data: &ArrayData,
+    digest: &mut Sha256,
+    bytes: &mut usize,
+) -> Result<(), ScribeError> {
+    digest.update(data.len().to_le_bytes());
+    digest.update(data.offset().to_le_bytes());
+    if let Some(nulls) = data.nulls() {
+        let buffer = nulls.buffer().as_slice();
+        digest.update(buffer);
+        *bytes = bytes
+            .checked_add(buffer.len())
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "logical Arrow identity length overflow".to_owned(),
+            })?;
+    }
+    for buffer in data.buffers() {
+        let buffer = buffer.as_slice();
+        digest.update(buffer);
+        *bytes = bytes
+            .checked_add(buffer.len())
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "logical Arrow identity length overflow".to_owned(),
+            })?;
+    }
+    for child in data.child_data() {
+        digest_array_data(child, digest, bytes)?;
+    }
+    Ok(())
+}
+
+/// Computes the identity of the accepted correlation attribution on `rows`.
+///
+/// [`logical_data_identity`] deliberately drops the universal correlation
+/// columns so a server restamp cannot break retry convergence, which also
+/// means two callers can present the same user payload under different
+/// accepted attribution and reach the same logical digest. A caller that
+/// derives a durable identity from that digest must bind this second digest
+/// as well; the two together describe both what the rows are and whose
+/// correlation they carry. Columns are folded in schema order, and a batch
+/// carrying no correlation column digests the domain separator alone.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::Internal`] when a correlation column's buffer length
+/// overflows its accumulator.
+pub(crate) fn correlation_data_identity(rows: &RecordBatch) -> Result<[u8; 32], ScribeError> {
+    let mut digest = Sha256::new();
+    digest.update(b"wyrd.correlation-identity.v1");
+    let mut bytes = 0_usize;
+    for (field, column) in rows.schema().fields().iter().zip(rows.columns()) {
+        if !wyrd_spec::vala::managed_columns::is_reserved_correlation_column(field.name()) {
+            continue;
+        }
+        digest.update(field.name().as_bytes());
+        digest_array_data(&column.to_data(), &mut digest, &mut bytes)?;
+    }
+    Ok(digest.finalize().into())
+}
+
 /// Computes the stable logical Arrow identity used only for retained retries.
 ///
 /// Server-generated request and time columns change across a legitimate client
@@ -421,33 +493,6 @@ pub(crate) struct PreparedSlice {
 /// Returns an internal error when the stable buffer length exceeds its WAL-v6
 /// metadata representation.
 pub(crate) fn logical_data_identity(rows: &RecordBatch) -> Result<([u8; 32], u32), ScribeError> {
-    fn update(data: &ArrayData, digest: &mut Sha256, bytes: &mut usize) -> Result<(), ScribeError> {
-        digest.update(data.len().to_le_bytes());
-        digest.update(data.offset().to_le_bytes());
-        if let Some(nulls) = data.nulls() {
-            let buffer = nulls.buffer().as_slice();
-            digest.update(buffer);
-            *bytes = bytes
-                .checked_add(buffer.len())
-                .ok_or_else(|| ScribeError::Internal {
-                    detail: "logical Arrow identity length overflow".to_owned(),
-                })?;
-        }
-        for buffer in data.buffers() {
-            let buffer = buffer.as_slice();
-            digest.update(buffer);
-            *bytes = bytes
-                .checked_add(buffer.len())
-                .ok_or_else(|| ScribeError::Internal {
-                    detail: "logical Arrow identity length overflow".to_owned(),
-                })?;
-        }
-        for child in data.child_data() {
-            update(child, digest, bytes)?;
-        }
-        Ok(())
-    }
-
     let mut digest = Sha256::new();
     let mut bytes = 0_usize;
     for (field, column) in rows.schema().fields().iter().zip(rows.columns()) {
@@ -467,11 +512,11 @@ pub(crate) fn logical_data_identity(rows: &RecordBatch) -> Result<([u8; 32], u32
         }
         digest.update(field.name().as_bytes());
         let before = bytes;
-        update(&column.to_data(), &mut digest, &mut bytes)?;
+        digest_array_data(&column.to_data(), &mut digest, &mut bytes)?;
         if tracing::enabled!(tracing::Level::DEBUG) {
             let mut column_digest = Sha256::new();
             let mut column_bytes = 0_usize;
-            update(&column.to_data(), &mut column_digest, &mut column_bytes)?;
+            digest_array_data(&column.to_data(), &mut column_digest, &mut column_bytes)?;
             tracing::debug!(
                 column = field.name().as_str(),
                 digest = %hex_digest(&column_digest.finalize().into()),

@@ -305,6 +305,79 @@ fn decode_managed_rows(batch: &arrow::record_batch::RecordBatch) -> Vec<ManagedR
         .collect()
 }
 
+/// Reads the rewrite audit rows one table's retained history already holds.
+///
+/// `vala.audit_outbox` is delivery state: the server's own publisher moves a
+/// settled range into `vala.system.audit_log` and retires it, so an audit row
+/// written minutes ago is legitimately no longer in the outbox. A journey that
+/// inspects Forge's audit cardinality must therefore look in both places, and
+/// this is the retained half. A table that has never been published yet is an
+/// empty half, not a failure.
+///
+/// # Panics
+///
+/// Panics when the retained read fails for any reason other than the table not
+/// existing yet, or when a retained row does not carry the audit columns.
+pub(crate) async fn retained_rewrite_audit(
+    client: &wyrd_client::WyrdClient,
+    resource: &str,
+) -> Vec<(i64, String, Option<String>)> {
+    let sql = format!(
+        "SELECT seq, operation, detail FROM vala.system.audit_log \
+         WHERE resource = '{resource}' AND operation LIKE 'forge.iceberg_rewrite.%'"
+    );
+    let mut stream = match vala_sdk::query::QueryClient::new(client)
+        .query(&strict_fused(sql))
+        .await
+    {
+        Ok(stream) => stream,
+        Err(error) => {
+            assert!(
+                wyrd_spec::error::WyrdError::from(&error).code()
+                    == "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND",
+                "retained audit history is readable: {error:?}"
+            );
+            return Vec::new();
+        }
+    };
+    let mut rows = Vec::new();
+    while let Some(batch) = stream
+        .next_batch()
+        .await
+        .expect("retained audit history streams to its terminal")
+    {
+        let seqs = batch
+            .column_by_name("seq")
+            .expect("retained audit history carries its sequence")
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("the audit sequence stays Int64");
+        let operations = batch
+            .column_by_name("operation")
+            .expect("retained audit history carries its operation")
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("the audit operation stays Utf8");
+        let details = batch
+            .column_by_name("detail")
+            .expect("retained audit history carries its detail")
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("the audit detail stays Utf8");
+        // This is a public read like any other: it streams through Oracle, so
+        // its rows belong in the same counter the journey holds telemetry to.
+        PUBLIC_ROWS_RETURNED.fetch_add(batch.num_rows() as u64, Ordering::AcqRel);
+        for row in 0..batch.num_rows() {
+            rows.push((
+                seqs.value(row),
+                operations.value(row).to_owned(),
+                (!arrow::array::Array::is_null(details, row)).then(|| details.value(row).to_owned()),
+            ));
+        }
+    }
+    rows
+}
+
 /// Builds the one customer read shape this journey is allowed to use.
 fn strict_fused(sql: String) -> wyrd_spec::vala::api::BifrostQueryRequest {
     wyrd_spec::vala::api::BifrostQueryRequest {
@@ -379,7 +452,14 @@ pub(crate) async fn assert_tenant_scoped_not_found(
         404,
         "{context}: the stable not-found code keeps its status"
     );
-    let leaked = problem.to_string();
+    // `type` is the stable catalog URI for the code itself, identical for every
+    // caller and carrying no request data, so it is not part of what the refusal
+    // could leak; every other member is server-authored text about this request.
+    let mut disclosed = problem.clone();
+    if let Some(object) = disclosed.as_object_mut() {
+        object.remove("type");
+    }
+    let leaked = disclosed.to_string();
     assert!(
         !leaked.contains(&neighbour.as_uuid().to_string()),
         "{context}: the refusal named the neighbouring tenant: {leaked}"

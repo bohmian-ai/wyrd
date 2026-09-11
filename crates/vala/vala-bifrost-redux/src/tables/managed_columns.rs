@@ -34,9 +34,6 @@ pub fn ensure_managed_columns(
             user_fields.push(Field::new(PRINCIPAL_ID, DataType::Utf8, false));
             user_fields.push(Field::new(WYRD_REQUEST_ID, DataType::Utf8, false));
         }
-        CorrelationPolicy::None => {
-            // audit_log: no universal correlation columns appended.
-        }
     }
 
     // Bifrost system columns (always present on domain tables).
@@ -157,18 +154,6 @@ mod tests {
         assert!(names.contains(&CARD_UID));
         assert!(names.contains(&PRINCIPAL_ID));
         assert!(names.contains(&WYRD_REQUEST_ID));
-    }
-
-    #[test]
-    /// Tables without correlation policy receive only physical system columns.
-    fn none_policy_only_managed_columns() {
-        let fields = ensure_managed_columns(vec![], CorrelationPolicy::None);
-        let names = field_names(&fields);
-        assert!(!names.contains(&RUN_ID));
-        assert!(!names.contains(&CARD_UID));
-        assert!(!names.contains(&PRINCIPAL_ID));
-        assert!(names.contains(&WYRD_EVENT_TIME));
-        assert!(names.contains(&DATA_TENANT_ID));
     }
 
     #[test]

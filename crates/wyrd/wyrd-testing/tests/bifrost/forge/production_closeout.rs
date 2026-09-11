@@ -879,6 +879,68 @@ impl CloseoutJourney {
             .count()
     }
 
+    /// Proves one audited sequence carries the expected operation name.
+    ///
+    /// A settlement is audited exactly once, but it lives in one of two places
+    /// depending on whether the server's publisher has run: the transactional
+    /// outbox until it ships, retained history afterwards. Retained history is
+    /// read through the same authorized query path a caller uses, and a
+    /// sequence present in neither place is a lost audit event, not a timing
+    /// difference.
+    ///
+    /// # Panics
+    /// Panics when the sequence carries another operation, or when it is absent
+    /// from both the outbox and retained history.
+    async fn assert_audited(
+        &self,
+        tenant: DataTenantId,
+        owed: &std::collections::BTreeMap<i64, String>,
+        seq: i64,
+        expected: &str,
+    ) {
+        if let Some(operation) = owed.get(&seq) {
+            assert_eq!(operation, expected, "owed audit event {seq}");
+            return;
+        }
+        let permission = wyrd_runtime::Permission::bifrost_query_read();
+        let principal = wyrd_runtime::Principal::new(
+            wyrd_spec::auth::PrincipalId::new(Uuid::now_v7()),
+            wyrd_runtime::PrincipalKind::User,
+            tenant,
+            Vec::new(),
+            wyrd_runtime::permission::PermissionSet::from_iter([permission.clone()]),
+        );
+        let context = vala_bifrost_redux::oracle::AuthorizedQueryContext::try_new(
+            principal,
+            tenant,
+            wyrd_spec::request_id::RequestId::now_v7(),
+            None,
+            wyrd_spec::vala::api::AuthMethod::Internal,
+            permission,
+        )
+        .expect("the scheduled principal owns the tenant it reads");
+        let outcome = wyrd_server::query::scheduled::ScheduledQueryCaller::new(
+            self.oracle().state().clone(),
+            context,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .run(wyrd_spec::vala::api::BifrostQueryRequest {
+            sql: format!(
+                "SELECT seq FROM vala.system.audit_log \
+                 WHERE seq = {seq} AND operation = '{expected}'"
+            ),
+            visibility: wyrd_spec::vala::api::VisibilityMode::Fused,
+            freshness: wyrd_spec::vala::api::FreshnessPolicy::Strict,
+            deadline_ms: Some(60_000),
+        })
+        .await
+        .expect("retained audit history is readable");
+        assert_eq!(
+            outcome.rows, 1,
+            "audit sequence {seq} left the outbox without reaching retained history as {expected}"
+        );
+    }
+
     /// Corroborates every completed rewrite with transactional audit and metrics.
     ///
     /// An attempt publishes each of its admitted plans independently, so a
@@ -900,14 +962,24 @@ impl CloseoutJourney {
             .tenant_conn_for(tenant)
             .await
             .expect("tenant-scoped audit inspection");
-        let rows: Vec<(Uuid, i64, i64, String, String, serde_json::Value)> = sqlx::query_as(
-            "SELECT o.operation_id, o.prepared_audit_seq, o.terminal_audit_seq, \
-             p.operation, t.operation, o.prepared_detail \
-             FROM vala.forge_operation_state o \
-             JOIN vala.audit_outbox p ON p.data_tenant_id=o.data_tenant_id AND p.seq=o.prepared_audit_seq \
-             JOIN vala.audit_outbox t ON t.data_tenant_id=o.data_tenant_id AND t.seq=o.terminal_audit_seq \
-             WHERE o.family='iceberg_rewrite'",
-        ).fetch_all(&mut **conn.transaction()).await.expect("rewrite audit evidence");
+        let rows: Vec<(Uuid, i64, i64, serde_json::Value)> = sqlx::query_as(
+            "SELECT operation_id, prepared_audit_seq, terminal_audit_seq, prepared_detail \
+             FROM vala.forge_operation_state \
+             WHERE family='iceberg_rewrite'",
+        )
+        .fetch_all(&mut **conn.transaction())
+        .await
+        .expect("rewrite audit evidence");
+        // The outbox is delivery state: the server's own publisher moves a
+        // settled range into retained history and retires it, so a settlement
+        // audited minutes ago is legitimately gone from here. Both sides are
+        // read, and a sequence found in neither is a lost audit event.
+        let owed: Vec<(i64, String)> =
+            sqlx::query_as("SELECT seq, operation FROM vala.audit_outbox")
+                .fetch_all(&mut **conn.transaction())
+                .await
+                .expect("owed audit evidence");
+        let owed: std::collections::BTreeMap<i64, String> = owed.into_iter().collect();
         conn.commit()
             .await
             .expect("read-only audit inspection completes");
@@ -926,10 +998,12 @@ impl CloseoutJourney {
             "no two published plans settled under one operation identity"
         );
         let operations = rows.len();
-        for (operation, prepared, terminal, prepared_name, terminal_name, detail) in rows {
+        for (operation, prepared, terminal, detail) in rows {
             assert!(prepared < terminal);
-            assert_eq!(prepared_name, "forge.iceberg_rewrite.prepared");
-            assert_eq!(terminal_name, "forge.iceberg_rewrite.committed");
+            self.assert_audited(tenant, &owed, prepared, "forge.iceberg_rewrite.prepared")
+                .await;
+            self.assert_audited(tenant, &owed, terminal, "forge.iceberg_rewrite.committed")
+                .await;
             eprintln!(
                 "rewrite {operation}, audit {prepared}->{terminal}, fenced preparation {detail}"
             );

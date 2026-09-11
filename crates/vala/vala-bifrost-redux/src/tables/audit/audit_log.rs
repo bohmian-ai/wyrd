@@ -8,19 +8,21 @@ use wyrd_spec::vala::api::PhysicalLayoutWire;
 use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 /// `vala.system.audit_log` — 17 audit content columns plus the managed
-/// physical columns, `CorrelationPolicy::None` (C-01).
+/// physical envelope.
 ///
 /// Two content columns carry an `audit_` prefix. `card_ref` and `principal_id`
 /// are reserved Redux correlation names: the ingest path rejects a payload that
 /// supplies one and excludes it from a batch's logical identity, so an audit
 /// event's own card reference and principal must be named out of that set to
-/// travel as content.
+/// travel as content. The universal correlation columns therefore stay free to
+/// carry what they carry everywhere else — the principal and request that
+/// published the row, not the principal the row is about.
 pub struct AuditLogTable;
 
 impl DomainTable for AuditLogTable {
     const NAMESPACE: &'static str = "system";
     const NAME: &'static str = "audit_log";
-    const CORRELATION_POLICY: CorrelationPolicy = CorrelationPolicy::None;
+    const CORRELATION_POLICY: CorrelationPolicy = CorrelationPolicy::Observation;
     const PAYLOAD_CLASS: PayloadClass = PayloadClass::Standard;
 
     fn arrow_fields() -> Vec<Field> {

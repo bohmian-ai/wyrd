@@ -11,8 +11,8 @@ use wyrd_testing::bifrost::{WyrdTestCluster, shared_process_telemetry_for_test};
 
 use crate::public_support::{
     JourneyTable, ManagedRow, append_values, assert_tenant_scoped_not_found, canonical_order,
-    public_rows_returned, read_managed_rows, register_table, rows_digest, tenant_client,
-    unique_table,
+    public_rows_returned, read_managed_rows, register_table, retained_rewrite_audit, rows_digest,
+    tenant_client, unique_table,
 };
 
 /// Longest a journey waits for one production Forge attempt to return.
@@ -789,6 +789,7 @@ impl RewriteAuditFacts {
 /// read-only; the journey never appends an audit row.
 async fn rewrite_audit_facts(
     cluster: &WyrdTestCluster,
+    client: &wyrd_client::WyrdClient,
     tenant: DataTenantId,
     resource: &str,
     operation: Uuid,
@@ -818,6 +819,12 @@ async fn rewrite_audit_facts(
     )
     .await
     .expect("Forge audit-outbox inspection");
+    let mut appended = appended;
+    // A settled range the server's publisher already shipped is gone from the
+    // outbox and lives in retained history instead. Both halves are read, so
+    // the cardinality asserted here is the operation's own, not a snapshot of
+    // how much of it happened to still be owed.
+    appended.extend(retained_rewrite_audit(client, resource).await);
     let mut rows: BTreeMap<String, Vec<i64>> = BTreeMap::new();
     for (seq, name, detail) in appended {
         let detail = detail
@@ -832,6 +839,10 @@ async fn rewrite_audit_facts(
         if named == operation {
             rows.entry(name).or_default().push(seq);
         }
+    }
+    for sequences in rows.values_mut() {
+        sequences.sort_unstable();
+        sequences.dedup();
     }
     RewriteAuditFacts {
         phase,
@@ -1091,9 +1102,14 @@ fn assert_recovery_telemetry(
         "bifrost_scribe_rows_total",
         &[("status", "accepted")],
     );
+    // The counter is process-wide and carries no table label, and this process
+    // also publishes its own retained audit history through the same Scribe, so
+    // the journey's rows are a floor rather than the whole count. Row-for-row
+    // fidelity of this journey's own data is proved by the public reads above,
+    // which compare identities and a digest, not a volume.
     assert!(
-        (accepted - facts.acknowledged_rows as f64).abs() < f64::EPSILON,
-        "the production Scribe accepted exactly the rows public ingest acknowledged: \
+        accepted >= facts.acknowledged_rows as f64,
+        "the production Scribe accepted at least the rows public ingest acknowledged: \
          {accepted} vs {}",
         facts.acknowledged_rows
     );
@@ -1782,7 +1798,7 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
         Some(&audit_resource),
         "the landed snapshot is audited under this table's own resource: {landed:?}"
     );
-    let audit = rewrite_audit_facts(&cluster, owner, &audit_resource, uncertain).await;
+    let audit = rewrite_audit_facts(&cluster, &owner_client, owner, &audit_resource, uncertain).await;
     assert_eq!(
         audit.phase, "recovered",
         "the successor settles its predecessor's own operation as recovered"

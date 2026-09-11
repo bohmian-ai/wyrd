@@ -23,14 +23,24 @@ Executed during TASK-001 closeout, against the same integration branch.
 
 ## Blocking precondition
 
-This task changes decisions fixed in `architecture/bifrost-design.md:454-463`
-and MUST NOT begin until that revision is human-approved. The revision covers:
+This task changes decisions fixed in `AGENTS.md` and
+`architecture/bifrost-design.md`, and MUST NOT begin until those revisions are
+human-approved:
 
-- Audit fires at authorization boundaries only; engine-internal transitions
-  (Scribe writes, Forge maintenance) are lineage, not audit.
-- `vala.audit_outbox` becomes `vala.audit_staging` with watermark semantics;
-  retirement becomes garbage collection.
-- `vala.system.audit_log` deviates from the house hourly partitioning to daily.
+- **Where audit fires** — `AGENTS.md:113-117`. "Every Postgres mutation and
+  other durable transition remains transactionally audited at its commit
+  boundary" becomes audit of authorization decisions only; engine-internal
+  transitions are lineage. This is the load-bearing revision: Changes 1-3
+  depend on it.
+- **Staging, not outbox** — `AGENTS.md:121-123` and
+  `architecture/bifrost-design.md:454-463`. `vala.audit_outbox` becomes
+  `vala.audit_staging`; ranges are read by watermark rather than claimed, and
+  rows are garbage-collected rather than retired.
+- **Daily partitioning** — stated in neither document today, so this is an
+  addition recording a deliberate deviation, not a conflict to resolve.
+
+Unchanged: `vala.system.audit_log` remains the authoritative retained audit
+history, and no second historical authority is permitted.
 
 It also supersedes the audit portions of TASK-001's status amendment: the
 interim `CorrelationPolicy::Observation` change and the `audit_principal_id`

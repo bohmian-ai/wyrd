@@ -110,17 +110,23 @@ Locked cross-cutting decisions that any contributor must honor:
   explicit scopes.
 - Audit is foundational across CLI, UI, MCP, Python SDK, `wyrd-server`, and
   Vala surfaces.
+- Audit records authorization decisions, not engine mechanics. Every decision
+  that evaluates a principal's permission is transactionally audited in the
+  transaction that made it. Engine-internal transitions — Scribe batch commits,
+  Forge maintenance — evaluate no permission and are recorded as lineage in
+  their own operational tables, never as audit.
 - Oracle query reads are the narrow exception to synchronous Postgres audit:
   the server must fsync a versioned, CRC-framed local WAL acceptance before
   permitting rows, then relay at least once into the canonical tenant
-  hash-chained outbox. Every Postgres mutation and other durable transition
-  remains transactionally audited at its commit boundary.
+  hash-chained staging table.
 - Bifrost clients use `wyrd_client::Bifrost` over the crate's shared HTTP and
   gRPC transport. Rust, Python, and TypeScript project that same facade. Gate, Scribe,
   Oracle, and Forge remain server owners and never become client types.
-- `vala.audit_outbox` is transient delivery state. Retained audit history lives
-  in `vala.system.audit_log`; outbox rows may retire only after their audit-log
-  publication is durable.
+- `vala.audit_staging` is transient write-ahead state, not an outbox: it has no
+  external consumer. Retained audit history lives in `vala.system.audit_log`.
+  Ranges are read by a per-tenant watermark rather than claimed, and staged rows
+  are garbage-collected once the watermark has advanced past them; a replayed
+  range is absorbed by Scribe's durable batch-id dedup fence.
 
 ## 3. Ownership Boundaries
 

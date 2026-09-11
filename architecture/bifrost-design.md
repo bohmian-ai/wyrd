@@ -451,16 +451,34 @@ through the success terminal of the one public query operation. The public
 query deadline range is `1..=u32::MAX` milliseconds across Rust, HTTP, gRPC,
 Python, TypeScript, and MCP.
 
-The tenant hash-chain `vala.audit_outbox` is transient transactional delivery
-state, not retained audit history. Contiguous tenant-scoped ranges are claimed
-and projected idempotently through the current Scribe and Forge publication
-path into the tenant-qualified `vala.system.audit_log` Bifrost table. That table
-is the authoritative retained audit history.
+The tenant hash-chain `vala.audit_staging` is transient transactional
+write-ahead state, not retained audit history, and not an outbox: it has no
+external consumer. Contiguous tenant-scoped ranges are read by a per-tenant
+watermark and projected idempotently through the current Scribe and Forge
+publication path into the tenant-qualified `vala.system.audit_log` Bifrost
+table. That table is the authoritative retained audit history.
 
-An outbox row may retire only after its corresponding audit event is durably
-published to `vala.system.audit_log`. Publication is idempotent, and recovery
-retries without duplicating the retained event. No legacy direct-Iceberg relay
-or separate `platform.audit_log` may become a second historical authority.
+A staged row is garbage-collected once the watermark has advanced past it. The
+watermark is the only progress state; a crash between publication and watermark
+advance replays a range that Scribe's durable batch-id dedup fence absorbs, so
+recovery retries without duplicating the retained event. No legacy
+direct-Iceberg relay or separate `platform.audit_log` may become a second
+historical authority.
+
+Audit events are appended only where an authorization decision was made. Scribe
+batch commits and Forge maintenance transitions evaluate no permission and are
+recorded as lineage in `vala.scribe_batch_commits` and `vala.forge_operations`;
+they emit no audit event. The publication path therefore evaluates no new
+permission and appends nothing, so retained audit history cannot feed itself.
+
+`vala.system.audit_log` partitions daily, deviating from the hourly granularity
+every other built-in table uses. Forge cannot bin-pack across partition
+boundaries, so hourly partitions would permanently cap every audit object at one
+hour of a tenant's audit traffic regardless of compaction settings. Audit also
+differs from the telemetry tables on every axis partition granularity responds
+to: one row per authorized request rather than continuous high-rate ingest,
+date-range rather than recent-window queries, and retention measured in years
+rather than days.
 
 ## Maintenance: Forge
 

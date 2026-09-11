@@ -28,9 +28,7 @@ PLATFORM_QUERY_ALLOWLIST = {
 # Files under queries/platform/ whose public async fns may take TenantConn
 # instead of PgPool/Transaction. These are cross-domain helpers that delegate
 # tenant-scoped writes to tenant-shaped APIs.
-PLATFORM_EXECUTOR_ALLOWLIST = {
-    "crates/wyrd/wyrd-sql/src/queries/platform/audit_log.rs",
-}
+PLATFORM_EXECUTOR_ALLOWLIST: set[str] = set()
 
 # Vala query modules that are intentionally tenant-free (M6/M12). These query
 # the global `iceberg_catalog` JDBC catalog — a single cross-tenant namespace,

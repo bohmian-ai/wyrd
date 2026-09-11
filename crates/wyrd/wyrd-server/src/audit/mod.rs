@@ -14,6 +14,8 @@
 //! append is fail-closed: the enclosing op is refused with
 //! `WYRD_VALA_500_AUDIT_UNAVAILABLE`.
 
+pub mod publication;
+
 use sqlx::PgPool;
 use vala_sql::TenantConn;
 use vala_sql::queries::audit_outbox::append_audit;

@@ -37,8 +37,12 @@ use crate::namespaces::BifrostNamespace;
 use crate::oracle::{AuthorizedQueryContext, OracleQueryStream, QueryStreamLifecycle};
 pub use crate::otlp_contract::{IngestOutcome, LogsOutcome, MetricsOutcome};
 use crate::scribe::preprocess::{correlation_data_identity, logical_data_identity};
+use crate::tables::audit::projection::AuditProjection;
+use crate::tables::{AuditLogTable, DomainTable};
+use wyrd_runtime::Principal;
 use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::ids::DataTenantId;
+use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::error::BifrostError;
 
@@ -134,6 +138,18 @@ fn otlp_batch_id(
     bytes[6] = (bytes[6] & 0x0f) | 0x70;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     Ok(Uuid::from_bytes(bytes))
+}
+
+/// Stamps a derived audit shipment key as a sortable-random UUID.
+///
+/// [`AuditProjection::batch_id`] is already a deterministic digest of the
+/// tenant and sequence range; Scribe's fence requires the sortable-random
+/// version bits, so only those bits are set.
+fn audit_batch_id(derived: [u8; 16]) -> Uuid {
+    let mut bytes = derived;
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
 }
 
 /// Owns exactly one terminal Gate request metric across return or cancellation.
@@ -710,6 +726,81 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
                 audit_event,
                 measured_wire_bytes,
                 payload,
+            })
+            .await
+            .map_err(|error| {
+                record_gate_event("scribe_failure");
+                IngestError::from_scribe(error)
+            })?;
+        Ok(())
+    }
+
+    /// Publishes one projected tenant audit range into `vala.system.audit_log`.
+    ///
+    /// The publisher is server-owned and already holds the authenticated
+    /// tenant's rows, so this seam adds no authorization of its own; it exists
+    /// so retained audit history reaches Iceberg through the same Scribe
+    /// durability fence as every other canonical write. The shipment's
+    /// idempotency key is derived from the tenant and the inclusive sequence
+    /// range, so a republished range after an uncertain outcome reaches
+    /// Scribe's durable dedup rather than duplicating retained history.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngestError::IngressClosed`] when this Gate is closed or has
+    /// no Scribe, and the mapped Scribe failure for a refused validation,
+    /// admission, or durable append.
+    #[tracing::instrument(
+        skip_all,
+        fields(tenant = %projection.tenant, seq_lo = projection.seq_lo, seq_hi = projection.seq_hi)
+    )]
+    pub async fn publish_audit_projection(
+        &self,
+        principal: &Principal,
+        request_id: RequestId,
+        projection: AuditProjection,
+    ) -> Result<(), IngestError> {
+        self.ensure_open()?;
+        let table = TableRef::new(BifrostNamespace::Audit, AuditLogTable::NAME);
+        let measured_wire_bytes = projection.rows.get_array_memory_size();
+        if measured_wire_bytes > self.limits.max_frame_bytes {
+            return Err(IngestError::PayloadTooLarge {
+                bytes: u64::try_from(measured_wire_bytes).unwrap_or(u64::MAX),
+                limit: u64::try_from(self.limits.max_frame_bytes).unwrap_or(u64::MAX),
+            });
+        }
+        let audit_event = wyrd_spec::vala::api::AuditEvent {
+            request_id: request_id.clone(),
+            trace_id: None,
+            operation: "bifrost.audit.publish".to_owned(),
+            resource: table.fqn(),
+            card_ref: principal.card_ref().cloned(),
+            principal_id: principal.id,
+            principal_kind: principal.kind.tag(),
+            auth_method: wyrd_spec::vala::api::AuthMethod::Internal,
+            permission: "bifrost:record:write".to_owned(),
+            decision: wyrd_spec::vala::api::AuditDecision::Allow,
+            result: wyrd_spec::vala::api::AuditResult::Success,
+            payload_summary: format!(
+                "audit sequences {}..={}",
+                projection.seq_lo, projection.seq_hi
+            ),
+            detail: None,
+        };
+        let scribe = self.scribe.as_ref().ok_or(IngestError::IngressClosed)?;
+        scribe
+            .ingest_frame(ScribeIngressFrame {
+                principal: principal.clone(),
+                authenticated_tenant: projection.tenant,
+                table,
+                expected_schema_fingerprint: None,
+                request_id,
+                batch_id: audit_batch_id(projection.batch_id),
+                audit_event,
+                measured_wire_bytes,
+                payload: IngressPayload::Canonical(CanonicalIngress::unreserved(vec![
+                    projection.rows,
+                ])),
             })
             .await
             .map_err(|error| {

@@ -126,25 +126,5 @@ CREATE INDEX platform_api_keys_by_prefix ON platform.api_keys (prefix);
 CREATE INDEX platform_api_keys_active
     ON platform.api_keys (user_id) WHERE revoked_at IS NULL;
 
-CREATE TABLE platform.audit_log (
-    id              BIGSERIAL PRIMARY KEY,
-    actor_user_id   TEXT REFERENCES platform.users(id),
-    operation       TEXT NOT NULL,
-    target          TEXT,
-    before          JSONB,
-    after           JSONB,
-    request_id      TEXT,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE INDEX platform_audit_log_by_actor
-    ON platform.audit_log (actor_user_id, created_at DESC);
-CREATE INDEX platform_audit_log_by_target
-    ON platform.audit_log (target, created_at DESC);
-
--- Preserve tamper-evidence: platform_admin may INSERT but must not alter or
--- delete existing audit records.
-REVOKE UPDATE, DELETE ON platform.audit_log FROM wyrd_platform_admin;
-
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA platform, wyrd TO wyrd_platform_admin;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA wyrd TO wyrd_app;

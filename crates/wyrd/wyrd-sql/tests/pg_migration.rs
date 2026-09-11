@@ -173,7 +173,9 @@ mod pg_tests {
         assert_regclass_exists(pool, "public._sqlx_migrations", false).await;
         assert_regclass_exists(pool, "platform.tenants", true).await;
         assert_regclass_exists(pool, "platform.users", true).await;
-        assert_regclass_exists(pool, "platform.audit_log", true).await;
+        // The greenfield baseline has one audit authority: the tenant
+        // `vala.audit_outbox` chain published into `vala.system.audit_log`.
+        assert_regclass_exists(pool, "platform.audit_log", false).await;
         assert_regclass_exists(pool, "wyrd.auth_users", true).await;
         assert_regclass_exists(pool, "wyrd.auth_user_identities", true).await;
         assert_regclass_exists(pool, "wyrd.auth_login_state", true).await;

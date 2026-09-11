@@ -53,17 +53,20 @@ CREATE POLICY tenant_isolation ON vala.audit_outbox
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
 
 GRANT SELECT, INSERT, UPDATE ON vala.audit_chain_head TO wyrd_app;
-GRANT SELECT, INSERT ON vala.audit_outbox TO wyrd_app;
+-- DELETE is the publisher's retirement of rows already durable in
+-- vala.system.audit_log. Rows are never mutated in place.
+GRANT SELECT, INSERT, DELETE ON vala.audit_outbox TO wyrd_app;
 
--- 3. Append-only enforcement.
-CREATE FUNCTION vala.audit_outbox_append_only() RETURNS trigger
+-- 3. Immutability enforcement: a written row is never rewritten. Retirement
+--    removes a published row; it never edits one.
+CREATE FUNCTION vala.audit_outbox_immutable() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
-    RAISE EXCEPTION 'vala.audit_outbox is append-only: % is forbidden', TG_OP
+    RAISE EXCEPTION 'vala.audit_outbox rows are immutable: % is forbidden', TG_OP
         USING ERRCODE = 'P0001';
 END;
 $$;
 
-CREATE TRIGGER audit_outbox_append_only
-    BEFORE UPDATE OR DELETE ON vala.audit_outbox
-    FOR EACH ROW EXECUTE FUNCTION vala.audit_outbox_append_only();
+CREATE TRIGGER audit_outbox_immutable
+    BEFORE UPDATE ON vala.audit_outbox
+    FOR EACH ROW EXECUTE FUNCTION vala.audit_outbox_immutable();

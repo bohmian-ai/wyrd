@@ -212,6 +212,66 @@ pub async fn list_audit_events_for_resource(
     .map_err(SqlError::from)
 }
 
+/// Read the oldest bounded run of unpublished audit rows for the current tenant.
+///
+/// Retirement removes a published prefix, so the lowest surviving `seq` is
+/// always the next event owed to `vala.system.audit_log`. The page is ordered
+/// and bounded, which is exactly the contiguous shape
+/// `project_audit_rows` validates before a shipment is built.
+///
+/// # Errors
+/// Returns [`SqlError`] when the page query fails or RLS rejects the read.
+pub async fn list_publication_batch(
+    conn: &mut TenantConn<'_>,
+    limit: i64,
+) -> Result<Vec<AuditOutboxRow>, SqlError> {
+    sqlx::query_as::<_, AuditOutboxRow>(
+        r#"
+        SELECT data_tenant_id, seq, entry_hash, prev_hash, request_id, trace_id,
+               operation, resource, card_ref, principal_id, principal_kind,
+               auth_method, permission, decision, result, payload_summary, detail, created_at
+          FROM vala.audit_outbox
+         WHERE data_tenant_id = wyrd.current_tenant()
+         ORDER BY seq
+         LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)
+}
+
+/// Retire the inclusive `seq` range whose audit events are durably published.
+///
+/// The caller MUST have observed a durable `vala.system.audit_log` publication
+/// for the whole range first. Retirement is idempotent: a repeated call after
+/// an uncertain outcome removes whatever survives and reports the rows it
+/// actually retired, so a lost acknowledgement costs one replayed shipment
+/// rather than a lost or duplicated audit event.
+///
+/// # Errors
+/// Returns [`SqlError`] when the delete fails or RLS rejects the range.
+pub async fn retire_published(
+    conn: &mut TenantConn<'_>,
+    seq_lo: i64,
+    seq_hi: i64,
+) -> Result<u64, SqlError> {
+    let result = sqlx::query(
+        r#"
+        DELETE FROM vala.audit_outbox
+         WHERE data_tenant_id = wyrd.current_tenant()
+           AND seq BETWEEN $1 AND $2
+        "#,
+    )
+    .bind(seq_lo)
+    .bind(seq_hi)
+    .execute(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)?;
+    Ok(result.rows_affected())
+}
+
 /// Compute `entry_hash = SHA256(canonical(prev_hash, seq, event))`.
 ///
 /// The canonical encoding is a length-prefixed concatenation owned here, so the

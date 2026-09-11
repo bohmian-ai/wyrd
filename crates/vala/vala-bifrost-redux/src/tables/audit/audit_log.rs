@@ -9,6 +9,12 @@ use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 /// `vala.system.audit_log` — 17 audit content columns plus the managed
 /// physical columns, `CorrelationPolicy::None` (C-01).
+///
+/// Two content columns carry an `audit_` prefix. `card_ref` and `principal_id`
+/// are reserved Redux correlation names: the ingest path rejects a payload that
+/// supplies one and excludes it from a batch's logical identity, so an audit
+/// event's own card reference and principal must be named out of that set to
+/// travel as content.
 pub struct AuditLogTable;
 
 impl DomainTable for AuditLogTable {
@@ -27,7 +33,7 @@ impl DomainTable for AuditLogTable {
             utf8("operation", false),
             utf8("resource", false),
             utf8("audit_card_ref", true),
-            utf8("principal_id", false),
+            utf8("audit_principal_id", false),
             utf8("principal_kind", false),
             utf8("auth_method", false),
             utf8("permission", false),

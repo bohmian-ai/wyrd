@@ -18,7 +18,7 @@ use wyrd_tonic::wyrd::v1 as proto;
 use wyrd_tonic::wyrd::v1::bifrost_query_service_client::BifrostQueryServiceClient;
 
 /// Boxed error carried by every helper in this journey.
-type ServerJourneyError = Box<dyn std::error::Error + Send + Sync>;
+pub(super) type ServerJourneyError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Rows the fixture publishes, and therefore the exact result of every read.
 const FIXTURE_VALUES: [i64; 4] = [1, 2, 3, 4];
@@ -38,7 +38,9 @@ fn request(sql: &str) -> BifrostQueryRequest {
 /// # Errors
 ///
 /// Returns the tenant invariant error when the principal and tenant disagree.
-fn scheduled_context(tenant: DataTenantId) -> Result<AuthorizedQueryContext, ServerJourneyError> {
+pub(super) fn scheduled_context(
+    tenant: DataTenantId,
+) -> Result<AuthorizedQueryContext, ServerJourneyError> {
     let permission = Permission::bifrost_query_read();
     let principal = Principal::new(
         PrincipalId::new(uuid::Uuid::now_v7()),

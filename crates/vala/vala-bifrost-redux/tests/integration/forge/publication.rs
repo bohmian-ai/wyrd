@@ -1007,7 +1007,6 @@ async fn assert_held_authority_change_refuses(
 
     let mutations_before = catalog.attempts();
     let loads_before = catalog.loads();
-    let audit_before = promoted.fixture.forge_audit_operations().await;
     let files_before = promoted.fixture.file_rows().await;
     let objects_before = promoted.fixture.object_digests().await;
     let span_mark = telemetry.mark();
@@ -1037,16 +1036,11 @@ async fn assert_held_authority_change_refuses(
         "the mutated owner produced its own refusal ({mutation:?}): {error}"
     );
 
-    // 2. No durable operation row and no durable Forge audit transition.
+    // 2. No durable operation row.
     assert_eq!(
         promoted.fixture.rewrite_phases().await,
         Vec::<String>::new(),
         "the refusal arrived before any Prepared operation row ({mutation:?})"
-    );
-    assert_eq!(
-        promoted.fixture.forge_audit_operations().await,
-        audit_before,
-        "a refused publication appends no Forge audit transition ({mutation:?})"
     );
 
     // 3. No rewrite settlement was applied to the durable file ledger.

@@ -305,7 +305,6 @@ fn decode_managed_rows(batch: &arrow::record_batch::RecordBatch) -> Vec<ManagedR
         .collect()
 }
 
-
 /// Builds the one customer read shape this journey is allowed to use.
 fn strict_fused(sql: String) -> wyrd_spec::vala::api::BifrostQueryRequest {
     wyrd_spec::vala::api::BifrostQueryRequest {

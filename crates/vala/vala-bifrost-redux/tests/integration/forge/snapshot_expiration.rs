@@ -30,8 +30,6 @@ struct ExpiryState {
     claims: i64,
     /// Current operation phase, if the projection row exists.
     operation_phase: Option<String>,
-    /// Every snapshot-expiry and task audit operation, in sequence order.
-    audits: Vec<String>,
     /// Current planning-demand generation for the table.
     demand_generation: Option<i64>,
 }
@@ -64,21 +62,6 @@ async fn expiry_state(fixture: &PromotionIntegrationFixture, task_id: Uuid) -> E
     .fetch_optional(pool)
     .await
     .expect("operation phase");
-    let mut conn = fixture
-        .vala
-        .tenant_conn(fixture.tenant)
-        .await
-        .expect("fixture tenant connection");
-    let audits: Vec<String> = sqlx::query_scalar(
-        "SELECT operation FROM vala.audit_staging \
-         WHERE operation LIKE 'forge.snapshot_expire.%' OR resource = $1 \
-         ORDER BY seq",
-    )
-    .bind(format!("forge-task:{task_id}"))
-    .fetch_all(&mut **conn.transaction())
-    .await
-    .expect("audit operations");
-    conn.commit().await.expect("fixture audit read commit");
     let demand_generation: Option<i64> = sqlx::query_scalar(
         "SELECT generation FROM vala.forge_planning_demands \
          WHERE data_tenant_id = $1 AND namespace_name = $2 AND table_name = $3",
@@ -93,7 +76,6 @@ async fn expiry_state(fixture: &PromotionIntegrationFixture, task_id: Uuid) -> E
         task_state,
         claims,
         operation_phase,
-        audits,
         demand_generation,
     }
 }
@@ -136,8 +118,8 @@ async fn seed_running_task(
 ///
 /// # Panics
 ///
-/// Panics when the reset does not cancel the task, drop every claim, emit both
-/// audits, and leave the object store untouched.
+/// Panics when the reset does not cancel the task, drop every claim, settle the
+/// operation as reset, and leave the object store untouched.
 async fn reject_releases_every_claim(
     fixture: &PromotionIntegrationFixture,
     seam: &PromotionCatalogSeam,
@@ -175,17 +157,6 @@ async fn reject_releases_every_claim(
     assert_eq!(released.task_state, "cancelled");
     assert_eq!(released.claims, 0);
     assert_eq!(released.operation_phase.as_deref(), Some("reset"));
-    assert!(
-        released
-            .audits
-            .contains(&"forge.snapshot_expire.prepared".to_owned())
-            && released
-                .audits
-                .contains(&"forge.snapshot_expire.reset".to_owned())
-            && released.audits.contains(&"forge.task.cancelled".to_owned()),
-        "reset emits the prepared, reset, and task-cancelled audits: {:?}",
-        released.audits
-    );
     assert_eq!(store.deletes(), 0, "expiration never deletes an object");
 }
 
@@ -318,14 +289,6 @@ async fn prepared_claim_releases_sql_before_iceberg_and_hands_exact_names_to_cle
     assert_eq!(settled.task_state, "succeeded");
     assert_eq!(settled.claims, 0);
     assert_eq!(settled.operation_phase.as_deref(), Some("committed"));
-    assert!(
-        settled
-            .audits
-            .contains(&"forge.snapshot_expire.committed".to_owned())
-            && settled.audits.contains(&"forge.task.succeeded".to_owned()),
-        "settlement emits both terminal audits: {:?}",
-        settled.audits
-    );
     assert!(
         settled.demand_generation > before_demand,
         "settlement creates cleanup demand: {before_demand:?} -> {:?}",
@@ -460,9 +423,9 @@ async fn head_manifest_path(fixture: &PromotionIntegrationFixture) -> String {
 /// Asserts an unproven expiration retained the preparing worker's authority.
 ///
 /// An uncertain outcome must leave the task `prepared`, every claim row in
-/// place, the operation `prepared`, no release audit of either kind, and the
-/// original attempt's immutable evidence unchanged — which together are what
-/// let a successor reconcile instead of re-expiring.
+/// place, the operation `prepared`, and the original attempt's immutable
+/// evidence unchanged — which together are what let a successor reconcile
+/// instead of re-expiring.
 ///
 /// Returns the retained state so the caller can compare a later settlement
 /// against it.
@@ -481,14 +444,6 @@ async fn assert_uncertain_preparation_retained(
     assert_eq!(retained.task_state, "prepared");
     assert!(retained.claims > 0, "every claim survives uncertainty");
     assert_eq!(retained.operation_phase.as_deref(), Some("prepared"));
-    assert!(
-        !retained
-            .audits
-            .contains(&"forge.snapshot_expire.reset".to_owned())
-            && !retained.audits.contains(&"forge.task.cancelled".to_owned()),
-        "an uncertain outcome releases nothing: {:?}",
-        retained.audits
-    );
     let preparing_evidence: (Uuid, Uuid, Uuid) = sqlx::query_as(
         "SELECT task_id, attempt_id, worker_id FROM vala.forge_snapshot_expiration_claims \
          WHERE task_id = $1 LIMIT 1",
@@ -607,14 +562,6 @@ async fn retryable_catalog_failure_retains_prepared_authority() {
     assert_eq!(settled.claims, 0);
     assert_eq!(settled.operation_phase.as_deref(), Some("recovered"));
     assert!(
-        settled
-            .audits
-            .contains(&"forge.snapshot_expire.recovered".to_owned())
-            && settled.audits.contains(&"forge.task.succeeded".to_owned()),
-        "recovery emits both terminal audits: {:?}",
-        settled.audits
-    );
-    assert!(
         settled.demand_generation > retained.demand_generation,
         "recovered settlement creates cleanup demand"
     );
@@ -673,11 +620,6 @@ pub(super) async fn seed_ready_expiry_task(
     task_id
 }
 
-/// Counts how many times one audit operation appears in a settled sequence.
-fn audit_count(audits: &[String], operation: &str) -> usize {
-    audits.iter().filter(|entry| *entry == operation).count()
-}
-
 /// Proves a worker accepts atomic expiration settlement without transitioning.
 ///
 /// # Panics
@@ -726,7 +668,7 @@ async fn worker_settled_expiration_returns_success_without_a_second_transition()
     assert_eq!(
         expiry_state(&fixture, task).await,
         before,
-        "a refused payload leaves the claimed task, its claims, and its audits untouched"
+        "a refused payload leaves the claimed task and its claims untouched"
     );
 
     worker
@@ -738,18 +680,6 @@ async fn worker_settled_expiration_returns_success_without_a_second_transition()
     assert_eq!(settled.task_state, "succeeded");
     assert_eq!(settled.claims, 0);
     assert_eq!(settled.operation_phase.as_deref(), Some("committed"));
-    assert_eq!(
-        audit_count(&settled.audits, "forge.task.succeeded"),
-        1,
-        "the task has exactly one terminal audit: {:?}",
-        settled.audits
-    );
-    assert_eq!(
-        audit_count(&settled.audits, "forge.snapshot_expire.committed"),
-        1,
-        "the operation has exactly one terminal audit: {:?}",
-        settled.audits
-    );
     assert_eq!(
         settled.demand_generation,
         Some(before.demand_generation.unwrap_or(0) + 1),
@@ -856,25 +786,6 @@ async fn settled_expiration_outranks(event: ConcurrentSettlementEvent) {
         settled.operation_phase.as_deref(),
         Some("committed"),
         "{event:?}"
-    );
-    assert_eq!(
-        audit_count(&settled.audits, "forge.task.succeeded"),
-        1,
-        "{event:?} leaves exactly one terminal task audit: {:?}",
-        settled.audits
-    );
-    assert_eq!(
-        audit_count(&settled.audits, "forge.snapshot_expire.committed"),
-        1,
-        "{event:?} leaves exactly one terminal operation audit: {:?}",
-        settled.audits
-    );
-    assert_eq!(
-        audit_count(&settled.audits, "forge.task.cancelled")
-            + audit_count(&settled.audits, "forge.task.failed"),
-        0,
-        "{event:?} wrote no replacement terminal transition: {:?}",
-        settled.audits
     );
     assert_eq!(
         settled.demand_generation,

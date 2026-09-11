@@ -219,7 +219,7 @@ mod pg_tests {
 
         let mut conn = server.tenant_conn_for(tenant).await?;
         let denial: Vec<(uuid::Uuid, String, Option<String>)> = sqlx::query_as(
-            "SELECT principal_id, decision, detail FROM vala.audit_staging \
+            "SELECT principal_id, outcome, detail FROM vala.audit_staging \
              WHERE operation = 'vala.query.sync' AND request_id = $1",
         )
         .bind(denied_request_id.as_str())
@@ -228,7 +228,7 @@ mod pg_tests {
         conn.commit().await?;
         assert_eq!(denial.len(), 1, "the denial is audited exactly once");
         assert_eq!(denial[0].0, underprivileged.id().as_uuid());
-        assert_eq!(denial[0].1, "deny");
+        assert_eq!(denial[0].1, "denied");
         let denial_detail: serde_json::Value = serde_json::from_str(
             denial[0]
                 .2

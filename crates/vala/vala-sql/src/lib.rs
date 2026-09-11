@@ -237,10 +237,7 @@ mod tests {
             "20260910000011_forge_planning_demands.sql",
             "20260910000012_forge_worker_claim_state.sql",
         ];
-        let oracle = [
-            "20260910000013_oracle_coordination.sql",
-            "20260910000014_oracle_recovery_audit_authority.sql",
-        ];
+        let oracle = ["20260910000013_oracle_coordination.sql"];
         for file in forge.into_iter().chain(oracle) {
             assert!(
                 files.iter().any(|candidate| candidate == file),

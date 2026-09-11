@@ -590,7 +590,11 @@ mod pg_tests {
                 3,
                 "one resource carries one durable row per attempt identity"
             );
-            assert_eq!(count_audit(pool, tenant).await, 6);
+            assert_eq!(
+                count_audit(pool, tenant).await,
+                0,
+                "Forge transitions append no audit"
+            );
         }
 
         // -----------------------------------------------------------------------
@@ -672,7 +676,11 @@ mod pg_tests {
                 }
             );
             assert_eq!(count_state(pool, tenant).await, 1);
-            assert_eq!(count_audit(pool, tenant).await, 2);
+            assert_eq!(
+                count_audit(pool, tenant).await,
+                0,
+                "Forge transitions append no audit"
+            );
         }
 
         // -----------------------------------------------------------------------
@@ -746,7 +754,11 @@ mod pg_tests {
                 }
             );
             assert_eq!(count_state(pool, tenant).await, 1);
-            assert_eq!(count_audit(pool, tenant).await, 2);
+            assert_eq!(
+                count_audit(pool, tenant).await,
+                0,
+                "Forge transitions append no audit"
+            );
         }
 
         // -----------------------------------------------------------------------
@@ -817,7 +829,11 @@ mod pg_tests {
                 ));
             }
             assert_eq!(count_state(pool, tenant).await, 2);
-            assert_eq!(count_audit(pool, tenant).await, 2);
+            assert_eq!(
+                count_audit(pool, tenant).await,
+                0,
+                "Forge transitions append no audit"
+            );
         }
 
         // -----------------------------------------------------------------------
@@ -855,21 +871,20 @@ mod pg_tests {
         }
 
         /// Verifies that the Scribe-promotion family transitions under the same
-        /// fence and transactional audit contract as every other Forge family.
+        /// fence and lineage contract as every other Forge family.
         ///
-        /// A Prepared row persists with its prepared audit sequence, the
-        /// Committed transition persists the promotion snapshot and its own
-        /// terminal sequence, and each transition contributes exactly one audit
-        /// row. The negative arms prove the fence is real rather than
-        /// incidental: a promotion detail presented under the wrong family, a
-        /// terminal event whose digest no longer matches the prepared file set,
-        /// and an event carrying no audit detail at all each fail without
-        /// leaving durable state behind.
+        /// A Prepared row persists, the Committed transition persists the
+        /// promotion snapshot, and neither evaluates a principal permission, so
+        /// neither appends audit. The negative arms prove the fence is real
+        /// rather than incidental: a promotion detail presented under the wrong
+        /// family, a terminal event whose digest no longer matches the prepared
+        /// file set, and an event carrying no typed detail at all each fail
+        /// without leaving durable state behind.
         ///
         /// # Panics
         ///
         /// Panics when setup, typed detail construction, transitions, or exact
-        /// persisted phase, sequence, digest, and cardinality assertions fail.
+        /// persisted phase, digest, and cardinality assertions fail.
         #[tokio::test]
         async fn scribe_promotion_operation_transitions_are_fenced_and_audited() {
             let TestFixtures { fixture, .. } = setup().await;
@@ -973,21 +988,24 @@ mod pg_tests {
             );
 
             assert_eq!(count_state(pool, tenant).await, 1);
-            assert_eq!(count_audit(pool, tenant).await, 2);
+            assert_eq!(
+                count_audit(pool, tenant).await,
+                0,
+                "Forge transitions append no audit"
+            );
         }
 
         // -----------------------------------------------------------------------
         // Self-contained operation state
         // -----------------------------------------------------------------------
 
-        /// Seeds one `vala.forge_operation_state` row directly, with no
-        /// `vala.audit_staging` row at either referenced sequence.
+        /// Seeds one `vala.forge_operation_state` row directly, with no staged
+        /// audit row of any kind.
         ///
-        /// Production always appends the audit event in the same transaction as
-        /// the transition, but audit delivery rows are subject to their own
-        /// retention lifecycle. This helper reproduces the state a Forge worker
-        /// legitimately restarts into once a delivered prepared audit row has
-        /// aged out of the outbox, which no public writer can otherwise create.
+        /// Forge transitions evaluate no principal permission and therefore
+        /// append no audit. This helper reproduces the state a Forge worker
+        /// legitimately restarts into, which no public writer can otherwise
+        /// create.
         ///
         /// # Panics
         ///
@@ -1031,11 +1049,10 @@ mod pg_tests {
         ///
         /// Orphan collection is the one destructive family whose recovery
         /// authority is reached only through this projection: an orphan batch
-        /// leaves no catalog trace, so a reader that needed the prepared audit
-        /// row to still exist would lose the batch whenever delivery was
-        /// relayed or pruned away. This proves the family lists, settles, and
-        /// snapshots on its own durable state, and that its terminal
-        /// settlement still appends exactly one audit event atomically.
+        /// leaves no catalog trace, so a reader that needed a staged audit row
+        /// to still exist would lose the batch whenever delivery was relayed or
+        /// pruned away. This proves the family lists, settles, and snapshots on
+        /// its own durable state, and that no transition appends audit.
         ///
         /// # Panics
         ///
@@ -1103,8 +1120,8 @@ mod pg_tests {
             };
             assert_eq!(
                 count_audit(pool, tenant).await,
-                audits_before + 1,
-                "orphan-GC settlement appends exactly one audit event"
+                0,
+                "Forge transitions append no audit"
             );
             assert_eq!(
                 state_snapshot(pool, tenant, ForgeOperationFamily::OrphanGc, operation_id).await,
@@ -1361,18 +1378,15 @@ mod pg_tests {
         /// Proves Forge operation recovery reads only its own state projection.
         ///
         /// `vala.forge_operation_state` is the sole Forge recovery authority:
-        /// it stores the complete typed prepared and current details plus the
-        /// audit sequences those transitions produced. `vala.audit_staging` is a
-        /// delivery table with its own retention, so requiring one of its rows
-        /// to still be present before a worker may read back its own prepared
-        /// operation would make recovery depend on audit delivery rather than
-        /// on Forge's own durable state.
+        /// it stores the complete typed prepared and current details. Forge
+        /// transitions evaluate no principal permission, so they append no
+        /// audit, and recovery must never depend on `vala.audit_staging`, which
+        /// is transient write-ahead state with its own retention.
         ///
-        /// The seeded rows carry complete valid state and sequence references
-        /// with no outbox row at either sequence. Reads, Prepared replay, and
-        /// terminal settlement must all succeed on that state alone, terminal
-        /// settlement must still append exactly one audit event atomically, and
-        /// contradictory stored state must still fail closed.
+        /// The seeded rows carry complete valid state with no staged audit row.
+        /// Reads, Prepared replay, and terminal settlement must all succeed on
+        /// that state alone, none of them may append audit, and contradictory
+        /// stored state must still fail closed.
         ///
         /// # Panics
         ///
@@ -1429,7 +1443,7 @@ mod pg_tests {
             assert_eq!(
                 count_audit(pool, tenant).await,
                 0,
-                "no audit delivery row backs either seeded operation"
+                "Forge transitions append no audit"
             );
 
             let open = list_open(pool, tenant, ForgeOperationFamily::SnapshotExpire)
@@ -1477,10 +1491,10 @@ mod pg_tests {
             assert_eq!(
                 count_audit(pool, tenant).await,
                 0,
-                "an idempotent Prepared replay appends no audit"
+                "Forge transitions append no audit"
             );
 
-            // Terminal settlement still appends exactly one audit event.
+            // Terminal settlement writes lineage only.
             let committed_event = event(
                 "forge.snapshot_expire.committed",
                 resource(),
@@ -1505,8 +1519,8 @@ mod pg_tests {
             };
             assert_eq!(
                 count_audit(pool, tenant).await,
-                1,
-                "terminal settlement appends exactly one audit event"
+                0,
+                "Forge transitions append no audit"
             );
             assert_eq!(
                 state_snapshot(
@@ -1537,8 +1551,8 @@ mod pg_tests {
             );
             assert_eq!(
                 count_audit(pool, tenant).await,
-                1,
-                "an idempotent terminal replay appends no audit"
+                0,
+                "Forge transitions append no audit"
             );
 
             assert_orphan_gc_recovery_is_outbox_independent(pool, tenant, 1).await;
@@ -1865,8 +1879,8 @@ mod pg_tests {
             );
             assert_eq!(
                 count_audit(&superuser, tenant).await,
-                2,
-                "preparation audits the operation and the task exactly once each"
+                0,
+                "Forge transitions append no audit"
             );
 
             // Replaying the identical preparation writes nothing.
@@ -1880,8 +1894,8 @@ mod pg_tests {
             );
             assert_eq!(
                 count_audit(&superuser, tenant).await,
-                2,
-                "replay appends no audit"
+                0,
+                "Forge transitions append no audit"
             );
 
             // A second table-local operation cannot claim the same snapshot.
@@ -1954,8 +1968,8 @@ mod pg_tests {
             );
             assert_eq!(
                 count_audit(&superuser, tenant).await,
-                4,
-                "reset audits the operation and the task exactly once each"
+                0,
+                "Forge transitions append no audit"
             );
 
             // --- settlement resolves a fresh preparation -------------------

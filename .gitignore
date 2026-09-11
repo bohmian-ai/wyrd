@@ -55,3 +55,4 @@ crates/vala/vala-bifrost-redux/benches/reports/*.json
 **/.vitest/
 .omp
 *.node
+openapi.yaml.tmp

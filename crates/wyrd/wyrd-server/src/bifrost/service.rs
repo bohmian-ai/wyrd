@@ -366,8 +366,7 @@ mod pg_tests {
             Permission::bifrost_table_read().to_string(),
             "denial attributes the required read permission"
         );
-        assert_eq!(row.decision, "deny");
-        assert_eq!(row.result, "failure");
+        assert_eq!(row.outcome, "denied");
         assert_eq!(row.principal_id, caller.principal.id.as_uuid());
         assert_eq!(row.request_id, caller.request_id.as_str());
     }
@@ -523,7 +522,7 @@ mod pg_tests {
                 "only the registration is audited for this table"
             );
             assert_eq!(table_rows[0].operation, "vala.bifrost.register");
-            assert_eq!(table_rows[0].decision, "allow");
+            assert_eq!(table_rows[0].outcome, "allowed");
         });
     }
 

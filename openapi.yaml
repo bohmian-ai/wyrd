@@ -516,6 +516,115 @@ paths:
                 $ref: '#/components/schemas/ListVersionsResponse'
         '503':
           description: Registry unavailable
+  /v1/query:
+    post:
+      tags:
+      - Bifrost
+      summary: Streams one authenticated SQL query as canonical protobuf frames.
+      operationId: sync_query
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BifrostQueryRequest'
+        required: true
+      responses:
+        '200':
+          description: Length-delimited protobuf QueryStreamFrame stream
+          headers:
+            x-wyrd-schema-fingerprint:
+              schema:
+                type: string
+              description: Hex SHA-256 fingerprint of the response schema
+          content:
+            application/vnd.wyrd.bifrost-query-stream:
+              schema:
+                type: array
+                items:
+                  type: integer
+                  format: int32
+                  minimum: 0
+        '503':
+          description: Oracle role is unavailable
+  /v1/query/running:
+    get:
+      tags:
+      - Bifrost
+      summary: Lists active queries for the authenticated tenant.
+      description: |-
+        Cancelling the handler future abandons the pending owner lookup without
+        creating durable lifecycle state.
+
+        # Errors
+
+        Returns structured authorization, audit, role-availability, or owner-control errors.
+      operationId: list_running_queries
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListRunningQueriesResponse'
+  /v1/query/{request_id}:
+    get:
+      tags:
+      - Bifrost
+      summary: Returns one active query for the authenticated tenant.
+      description: |-
+        Cancelling the handler future abandons the pending owner lookup without
+        changing the active query.
+
+        # Errors
+
+        Returns structured request-ID validation, authorization, audit,
+        role-availability, not-found, or owner-conflict errors.
+      operationId: get_running_query
+      parameters:
+      - name: request_id
+        in: path
+        description: Canonical query request ID
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunningQuerySummary'
+        '404':
+          description: No visible active query
+    delete:
+      tags:
+      - Bifrost
+      summary: Requests idempotent cancellation for one active query in the authenticated tenant.
+      description: |-
+        Once an owner accepts cancellation, dropping this handler future does not
+        undo that server-side lifecycle transition.
+
+        # Errors
+
+        Returns structured request-ID validation, authorization, audit,
+        role-availability, not-found, or owner-conflict errors.
+      operationId: cancel_running_query
+      parameters:
+      - name: request_id
+        in: path
+        description: Canonical query request ID
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CancelRunningQueryResponse'
+        '404':
+          description: No visible active query
 components:
   schemas:
     AgentSpec:
@@ -672,6 +781,43 @@ components:
       propertyNames:
         type: string
         description: Validated key for free-form Card annotations.
+    BifrostQueryRequest:
+      type: object
+      description: Public synchronous Oracle query request.
+      required:
+      - sql
+      - visibility
+      - freshness
+      properties:
+        deadline_ms:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Optional caller deadline in milliseconds.
+          minimum: 0
+        freshness:
+          $ref: '#/components/schemas/FreshnessPolicy'
+          description: Required freshness behavior.
+        sql:
+          type: string
+          description: SELECT-only SQL text.
+        visibility:
+          $ref: '#/components/schemas/VisibilityMode'
+          description: Visibility tiers requested by the caller.
+    CancelRunningQueryResponse:
+      type: object
+      description: Idempotent cancellation result for one active Oracle query.
+      required:
+      - request_id
+      - cancellation_started
+      properties:
+        cancellation_started:
+          type: boolean
+          description: Whether this call changed the registry from active to cancelling.
+        request_id:
+          $ref: '#/components/schemas/RequestId'
+          description: Request identity selected by the caller.
     Card:
       type: object
       description: Universal registered Card envelope.
@@ -804,6 +950,20 @@ components:
           $ref: '#/components/schemas/CardLifecycleStatus'
           description: Server-managed lifecycle state.
       additionalProperties: false
+    CardRelationship:
+      type: object
+      description: One server-derived relationship edge.
+      required:
+      - ref
+      properties:
+        alias:
+          type:
+          - string
+          - 'null'
+          description: Optional user-facing alias assigned by a parent composition.
+        ref:
+          $ref: '#/components/schemas/CardRef'
+          description: Exact related Card reference.
     CardSubmission:
       type: object
       description: |-
@@ -979,11 +1139,6 @@ components:
         interface:
           $ref: '#/components/schemas/DataInterface'
           description: Declared interface family and interface-specific metadata.
-        publishes_to:
-          type: array
-          items:
-            $ref: '#/components/schemas/Ref'
-          description: Eval and Drift cards that receive observations from this data card.
         schema:
           $ref: '#/components/schemas/DataSchema'
           description: Ordered schema fields for tabular interfaces.
@@ -1179,6 +1334,12 @@ components:
           items:
             $ref: '#/components/schemas/Ref'
           description: Primary target Cards.
+    FreshnessPolicy:
+      type: string
+      description: Behavior when a requested live source cannot complete.
+      enum:
+      - strict
+      - allow_degraded
     GetCardResponse:
       type: object
       description: Full card response.
@@ -1230,6 +1391,17 @@ components:
           - 'null'
           description: Opaque continuation cursor.
       additionalProperties: false
+    ListRunningQueriesResponse:
+      type: object
+      description: Response containing every active Oracle query visible to one tenant.
+      required:
+      - queries
+      properties:
+        queries:
+          type: array
+          items:
+            $ref: '#/components/schemas/RunningQuerySummary'
+          description: Active request summaries in deterministic request-ID order.
     ListVersionsResponse:
       type: object
       description: Versions available for one card identity.
@@ -1379,11 +1551,6 @@ components:
         interface:
           $ref: '#/components/schemas/ModelInterface'
           description: Framework interface tag and per-interface config metadata.
-        publishes_to:
-          type: array
-          items:
-            $ref: '#/components/schemas/Ref'
-          description: Eval and Drift cards that receive observations from this model card.
         sample_input:
           oneOf:
           - type: 'null'
@@ -1480,6 +1647,12 @@ components:
           that is compiled into the native provider request.
         - **Native** (`request` present): the stored native `Prompt` shape, as
           produced by `save()`.
+    QueryClass:
+      type: string
+      description: Server-derived admission class.
+      enum:
+      - interactive
+      - analytical
     RegistrationOutcomeKind:
       type: string
       description: Result of a registration write.
@@ -1496,14 +1669,94 @@ components:
           items:
             type: string
           description: Inbound references as normalized display strings.
+        inbound_refs:
+          type: array
+          items:
+            $ref: '#/components/schemas/CardRelationship'
+          description: Exact inbound references.
         outbound:
           type: array
           items:
             type: string
           description: Outbound references as normalized display strings.
+        outbound_refs:
+          type: array
+          items:
+            $ref: '#/components/schemas/CardRelationship'
+          description: Exact outbound references with optional user-facing aliases.
     RelativeArtifactPath:
       type: string
       description: A validated relative path inside a card's artifact manifest.
+    RequestId:
+      type: string
+      description: Request correlation ID; required to be a UUID v7.
+    RunningQueryLifecycleState:
+      type: string
+      description: |-
+        The current non-terminal lifecycle state of an admitted Oracle query.
+
+        The state is projected by live controls only; completed queries are removed
+        from the in-memory registry and are not durable query jobs.
+      enum:
+      - admitted
+      - running
+      - cancelling
+    RunningQueryProgress:
+      type: object
+      description: Aggregate progress for one request-ID-keyed Oracle query.
+      required:
+      - completed_participants
+      - total_participants
+      properties:
+        completed_participants:
+          type: integer
+          format: int32
+          description: Number of selected participants that have reported completion.
+          minimum: 0
+        total_participants:
+          type: integer
+          format: int32
+          description: Exact number of participants frozen into the immutable cut.
+          minimum: 0
+    RunningQuerySummary:
+      type: object
+      description: |-
+        Public summary for one active Oracle query.
+
+        This contract deliberately excludes SQL text, parameters, Arrow batches,
+        and result rows. A summary is tenant-scoped by the serving boundary.
+      required:
+      - request_id
+      - query_class
+      - started_at
+      - deadline
+      - state
+      - progress
+      - cancellation_requested
+      properties:
+        cancellation_requested:
+          type: boolean
+          description: Whether cancellation has been requested for this request identity.
+        deadline:
+          type: string
+          format: date-time
+          description: Absolute query deadline.
+        progress:
+          $ref: '#/components/schemas/RunningQueryProgress'
+          description: Aggregate progress over the immutable participant cut.
+        query_class:
+          $ref: '#/components/schemas/QueryClass'
+          description: Server-derived admission class.
+        request_id:
+          $ref: '#/components/schemas/RequestId'
+          description: Stable request identity used by live controls.
+        started_at:
+          type: string
+          format: date-time
+          description: Wall-clock admission time.
+        state:
+          $ref: '#/components/schemas/RunningQueryLifecycleState'
+          description: Current non-terminal lifecycle state.
     ServiceSpec:
       type: object
       description: Composition of cards used by an application or deployment.
@@ -1616,11 +1869,6 @@ components:
           interface:
             $ref: '#/components/schemas/DataInterface'
             description: Declared interface family and interface-specific metadata.
-          publishes_to:
-            type: array
-            items:
-              $ref: '#/components/schemas/Ref'
-            description: Eval and Drift cards that receive observations from this data card.
           schema:
             $ref: '#/components/schemas/DataSchema'
             description: Ordered schema fields for tabular interfaces.
@@ -1666,11 +1914,6 @@ components:
           interface:
             $ref: '#/components/schemas/ModelInterface'
             description: Framework interface tag and per-interface config metadata.
-          publishes_to:
-            type: array
-            items:
-              $ref: '#/components/schemas/Ref'
-            description: Eval and Drift cards that receive observations from this model card.
           sample_input:
             oneOf:
             - type: 'null'
@@ -2455,6 +2698,12 @@ components:
     VersionSpec:
       type: string
       description: Authored version on the card-registration path. Either a full semver triple pin (e.g. "1.4.2", "1.4.2-rc.1+meta") or a bare partial scope (e.g. "1", "1.0"). Range comparators (^, ~, *, >=, ...) are rejected on this path.
+    VisibilityMode:
+      type: string
+      description: Visibility tiers included in one immutable Oracle query cut.
+      enum:
+      - published_only
+      - fused
     WorkflowSpec:
       type: object
       description: Declarative workflow definition.
@@ -2534,3 +2783,6 @@ components:
           type: string
           description: Problem type URI.
       additionalProperties: false
+tags:
+- name: Bifrost
+  description: Bounded Bifrost query transport

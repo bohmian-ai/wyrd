@@ -630,18 +630,6 @@ mod pg_tests {
                 ("wyrd".to_owned(), "wyrd_migrator".to_owned()),
             ]
         );
-        let recovery_authority: (bool, bool, bool, bool, bool) = sqlx::query_as(
-            "SELECT has_function_privilege('wyrd_platform_admin', \
-               'vala.append_oracle_admission_recovery_audit(text,bigint,bigint,bigint,bigint,bigint)', 'EXECUTE'), \
-             has_table_privilege('wyrd_platform_admin','vala.audit_chain_head','SELECT,INSERT,UPDATE'), \
-             NOT has_table_privilege('wyrd_platform_admin','vala.audit_chain_head','DELETE'), \
-             has_table_privilege('wyrd_platform_admin','vala.audit_staging','INSERT'), \
-             NOT has_table_privilege('wyrd_platform_admin','vala.audit_staging','SELECT,UPDATE,DELETE')",
-        )
-        .fetch_one(&fixture_admin)
-        .await
-        .expect("Oracle recovery audit authority reads");
-        assert_eq!(recovery_authority, (true, true, true, true, true));
         fixture_admin.close().await;
 
         let migrator_dsn = fixture

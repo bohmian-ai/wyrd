@@ -1,10 +1,9 @@
 //! Tier-2 coverage for the periodic never-published orphan cleanup route.
 //!
 //! Orphan collection is the one Forge protocol that deletes objects no catalog
-//! snapshot, no operation row, and no audit transition names. Its safety
-//! therefore comes entirely from the canonical writer grammar deciding what is
-//! addressable at all and from the complete protection proof deciding what is
-//! deletable. These scenarios drive the real scheduler, worker, catalog, and
+//! snapshot and no operation row names. Its safety therefore comes entirely
+//! from the canonical writer grammar deciding what is addressable at all and
+//! from the complete protection proof deciding what is deletable. These scenarios drive the real scheduler, worker, catalog, and
 //! warehouse so that both halves are exercised by production code rather than
 //! asserted about it.
 
@@ -47,9 +46,9 @@ async fn seed_object(fixture: &PromotionIntegrationFixture, path: String) -> Str
 /// Asserts nothing durable names the objects the refused rewrite produced.
 ///
 /// This is what makes the scenario a genuine rowless case: with no operation
-/// row, no Forge audit transition, and no Reset generation, the collector has
-/// no durable evidence to consult and must reach the object through the
-/// writer's own grammar and the age floor alone.
+/// row and no Reset generation, the collector has no durable evidence to
+/// consult and must reach the object through the writer's own grammar and the
+/// age floor alone.
 ///
 /// # Panics
 ///
@@ -57,17 +56,11 @@ async fn seed_object(fixture: &PromotionIntegrationFixture, path: String) -> Str
 async fn assert_no_durable_owner_names(
     fixture: &PromotionIntegrationFixture,
     forge: &Arc<vala_bifrost_redux::forge::Forge>,
-    audit_before: &[String],
 ) {
     assert_eq!(
         fixture.rewrite_phases().await,
         Vec::<String>::new(),
         "the refusal arrived before any Prepared operation row"
-    );
-    assert_eq!(
-        fixture.forge_audit_operations().await,
-        audit_before,
-        "a refused publication appends no Forge audit transition"
     );
     assert_eq!(
         forge
@@ -139,10 +132,10 @@ async fn assert_eligibility(
 /// operation row commits leaves physical output that no durable state names.
 /// That is precisely the object this protocol exists for, and precisely the
 /// object nothing else can prove is safe to delete — there is no Reset row, no
-/// operation row, and no audit transition to consult. So the proof runs the real
-/// failure, confirms the durable absence it produces, and then requires the
-/// collector to reach that object through the writer's own path grammar plus the
-/// age floor and nothing else.
+/// operation row to consult. So the proof runs the real failure, confirms the
+/// durable absence it produces, and then requires the collector to reach that
+/// object through the writer's own path grammar plus the age floor and nothing
+/// else.
 ///
 /// The lookalikes are the other half of the same claim. Listing discovers
 /// everything under the table prefix, so an object that merely resembles a
@@ -174,7 +167,6 @@ async fn rowless_output_uses_canonical_identity_and_full_protection() {
     // One real managed rewrite produces its outputs and is then refused by its
     // own cancellation token, which is the last authority checked before the
     // Prepared operation row would commit.
-    let audit_before = promoted.fixture.forge_audit_operations().await;
     supervisor.restart_worker();
     let worker_stop = supervisor.worker_stop();
     let error = supervisor
@@ -213,7 +205,7 @@ async fn rowless_output_uses_canonical_identity_and_full_protection() {
         );
     }
 
-    assert_no_durable_owner_names(&promoted.fixture, &forge, &audit_before).await;
+    assert_no_durable_owner_names(&promoted.fixture, &forge).await;
     let lookalikes = seed_lookalikes(&promoted.fixture).await;
 
     // Before the age floor elapses, even a genuinely rowless output is retained.

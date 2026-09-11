@@ -2873,15 +2873,6 @@ async fn crash_recovery_reconciles_the_exact_operation(
         "a killed owner settles nothing for an attempt it cannot account for: {:?}",
         supervisor.returned_errors()
     );
-    assert_eq!(
-        promoted
-            .fixture
-            .forge_terminal_audit_count_for(&unresolved_ids)
-            .await,
-        0,
-        "a released attempt appends no terminal rewrite audit row for its own \
-         operation"
-    );
     assert!(
         small_files_in_state(&promoted.fixture, &["claimed", "running"]).await > 0,
         "the task stays Running for whoever recovers it: {:?}",

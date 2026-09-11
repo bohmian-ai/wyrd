@@ -422,14 +422,14 @@ mod pg_tests {
             .commit()
             .await
             .expect("commit superseded cancellation");
-        let terminal: (String, Option<Uuid>, Option<Uuid>, i64, i64) = sqlx::query_as(
-            "SELECT t.state,t.attempt_id,t.claimed_by,(SELECT count(*) FROM vala.forge_planning_demands),(SELECT count(*) FROM vala.audit_staging WHERE operation='forge.task.cancelled') FROM vala.forge_tasks t WHERE t.task_id=$1",
+        let terminal: (String, Option<Uuid>, Option<Uuid>, i64) = sqlx::query_as(
+            "SELECT t.state,t.attempt_id,t.claimed_by,(SELECT count(*) FROM vala.forge_planning_demands) FROM vala.forge_tasks t WHERE t.task_id=$1",
         )
         .bind(task_id)
         .fetch_one(&admin)
         .await
         .expect("committed cancellation state");
-        assert_eq!(terminal, ("cancelled".to_owned(), None, None, 1, 1));
+        assert_eq!(terminal, ("cancelled".to_owned(), None, None, 1));
         assert_eq!(tasks.reclaim_expired(10).await.expect("reclaim"), 0);
     }
 
@@ -852,7 +852,10 @@ mod pg_tests {
             .fetch_one(&mut **after.transaction())
             .await
             .expect("audit count");
-        assert_eq!(audit_count, 1, "terminal state and audit both rolled back");
+        assert_eq!(
+            audit_count, 0,
+            "a rolled-back terminal transition leaves no lineage and no audit"
+        );
         assert!(
             tasks
                 .terminal(
@@ -1176,7 +1179,10 @@ mod pg_tests {
             .fetch_one(&admin)
             .await
             .expect("audit after");
-        assert_eq!(audit_after, audit_before + 1);
+        assert_eq!(
+            audit_after, audit_before,
+            "successor demand evaluates no permission, so it appends no audit"
+        );
 
         let noop_table = ForgeTaskTableIdentity::new(
             "wyrd-redux",
@@ -1738,35 +1744,12 @@ mod pg_tests {
                 .any(|value| value.0 == "wyrd_app" && value.1 == "DELETE")
         );
         let audit_grants: Vec<(String, String, String)> = sqlx::query_as("SELECT table_name,grantee,privilege_type FROM information_schema.role_table_grants WHERE table_schema='vala' AND table_name IN ('audit_chain_head','audit_staging')").fetch_all(&admin).await.expect("audit grants");
-        let mut operator_audit_grants = audit_grants
-            .iter()
-            .filter(|value| value.1 == "wyrd_platform_admin")
-            .map(|value| (value.0.clone(), value.2.clone()))
-            .collect::<Vec<_>>();
-        operator_audit_grants.sort();
-        assert_eq!(
-            operator_audit_grants,
-            vec![
-                ("audit_chain_head".to_owned(), "INSERT".to_owned()),
-                ("audit_chain_head".to_owned(), "SELECT".to_owned()),
-                ("audit_chain_head".to_owned(), "UPDATE".to_owned()),
-                ("audit_staging".to_owned(), "INSERT".to_owned()),
-            ],
-            "operator audit authority is append-only and exact"
-        );
         assert!(
-            audit_grants
+            !audit_grants
                 .iter()
-                .any(|value| value.0 == "audit_chain_head"
-                    && value.1 == "wyrd_platform_admin"
-                    && value.2 == "UPDATE")
+                .any(|value| value.1 == "wyrd_platform_admin"),
+            "Forge evaluates no permission, so the operator holds no audit authority: {audit_grants:?}"
         );
-        assert!(audit_grants.iter().any(|value| value.0 == "audit_staging"
-            && value.1 == "wyrd_platform_admin"
-            && value.2 == "INSERT"));
-        assert!(!audit_grants.iter().any(|value| value.0 == "audit_staging"
-            && value.1 == "wyrd_platform_admin"
-            && matches!(value.2.as_str(), "SELECT" | "UPDATE" | "DELETE")));
         assert!(
             sqlx::query_scalar::<_, i64>("SELECT count(*) FROM vala.audit_staging")
                 .fetch_one(op.pool())
@@ -1775,7 +1758,7 @@ mod pg_tests {
             "operator cannot directly read tenant audit rows"
         );
         assert!(
-            sqlx::query("UPDATE vala.audit_staging SET result=result")
+            sqlx::query("UPDATE vala.audit_staging SET outcome=outcome")
                 .execute(op.pool())
                 .await
                 .is_err(),
@@ -1787,6 +1770,13 @@ mod pg_tests {
                 .await
                 .is_err(),
             "operator cannot directly delete tenant audit rows"
+        );
+        assert!(
+            sqlx::query("INSERT INTO vala.audit_staging (data_tenant_id,seq,prev_hash,entry_hash,request_id,operation,resource,principal_id,principal_kind,permission,outcome) VALUES (wyrd.current_tenant(),1,decode(repeat('00',32),'hex'),decode(repeat('00',32),'hex'),'x','x','x',gen_random_uuid(),'service','x','allowed')")
+                .execute(op.pool())
+                .await
+                .is_err(),
+            "operator cannot append tenant audit rows"
         );
         sqlx::query("INSERT INTO vala.forge_planning_demands(data_tenant_id,catalog_name,namespace_name,table_name,last_source) SELECT $1,'wyrd-redux','vala.bifrost','scale-'||g,'periodic' FROM generate_series(1,1000) g").bind(tenant.as_uuid()).execute(&admin).await.expect("scale demands");
         sqlx::query("SET enable_seqscan=off")
@@ -2527,18 +2517,6 @@ mod pg_tests {
         task_id
     }
 
-    /// Counts audit-outbox rows carrying one exact operation.
-    ///
-    /// # Panics
-    /// Panics when the count query fails.
-    async fn count_operation(superuser: &PgPool, operation: &str) -> i64 {
-        sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging WHERE operation=$1")
-            .bind(operation)
-            .fetch_one(superuser)
-            .await
-            .expect("operation count")
-    }
-
     /// Reads one Forge task's persisted evidence, if any.
     ///
     /// # Panics
@@ -2919,10 +2897,6 @@ mod pg_tests {
         assert_eq!(prepared.prepared_candidate_index, Some(0));
         assert_eq!(prepared.deleted_candidate_count, 0);
         assert_eq!(prepared.cleanup_candidates, candidates);
-        assert_eq!(
-            count_operation(&admin, "forge.expired_cleanup.candidate_prepared").await,
-            1
-        );
 
         // The exact already-prepared tuple replays read-only.
         assert_eq!(
@@ -2939,11 +2913,6 @@ mod pg_tests {
                 .await
                 .expect("replay preparation"),
             ForgeTaskTransitionOutcome::AlreadyApplied
-        );
-        assert_eq!(
-            count_operation(&admin, "forge.expired_cleanup.candidate_prepared").await,
-            1,
-            "an identical replay emits no second audit"
         );
 
         // A stale owner can neither prepare nor settle.
@@ -2999,15 +2968,9 @@ mod pg_tests {
             )
             .await
             .expect("prepare candidate one");
-        for (outcome, operation) in [
-            (
-                ExpiredCleanupOutcome::Refused,
-                "forge.expired_cleanup.candidate_refused",
-            ),
-            (
-                ExpiredCleanupOutcome::Uncertain,
-                "forge.expired_cleanup.candidate_uncertain",
-            ),
+        for outcome in [
+            ExpiredCleanupOutcome::Refused,
+            ExpiredCleanupOutcome::Uncertain,
         ] {
             tasks
                 .settle_expired_cleanup_candidate(
@@ -3026,7 +2989,6 @@ mod pg_tests {
             assert_eq!(held.deleted_candidate_count, 1);
             assert_eq!(held.prepared_candidate_index, Some(1));
             assert_eq!(held.cleanup_candidates, candidates);
-            assert_eq!(count_operation(&admin, operation).await, 1);
         }
 
         // Proven absence advances to the terminal frontier.
@@ -3469,45 +3431,6 @@ mod pg_tests {
             .await
             .expect("resumed checkpoint");
 
-        // Completion is atomic with its audit. Occupying the next audit
-        // sequence forces the append to fail after the state update, and the
-        // whole transaction rolls back: the task stays Running with its cursor.
-        let head_seq: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(seq),0) FROM vala.audit_staging WHERE data_tenant_id=$1",
-        )
-        .bind(tenant.as_uuid())
-        .fetch_one(&admin)
-        .await
-        .expect("chain head");
-        sqlx::query("INSERT INTO vala.audit_staging (data_tenant_id,seq,prev_hash,entry_hash,request_id,operation,resource,principal_id,principal_kind,auth_method,permission,decision,result,payload_summary) VALUES ($1,$2,decode(repeat('00',32),'hex'),decode(repeat('00',32),'hex'),'poison','test.poison','forge-task:poison',$3,'service','internal','bifrost:forge','allow','success','poison')")
-            .bind(tenant.as_uuid())
-            .bind(head_seq + 1)
-            .bind(Uuid::nil())
-            .execute(&admin)
-            .await
-            .expect("occupy the next audit sequence");
-        assert!(
-            tasks
-                .complete_orphan_cleanup(tenant, &resumed_authority, &table)
-                .await
-                .is_err(),
-            "a failed audit append must take the terminal transition with it"
-        );
-        assert_eq!(state_and_attempts(&admin, id).await.0, "running");
-        assert_eq!(
-            raw_evidence(&admin, id).await.expect("cursor evidence"),
-            serde_json::json!({"version": 1, "start_after": last_key}),
-            "the rolled-back completion left the cursor authoritative"
-        );
-        // The outbox is append-only, so the occupied sequence is released by
-        // advancing the chain head past it rather than by deleting the row.
-        sqlx::query("INSERT INTO vala.audit_chain_head (data_tenant_id,last_seq,head_hash) VALUES ($1,$2,decode(repeat('00',32),'hex')) ON CONFLICT (data_tenant_id) DO UPDATE SET last_seq=EXCLUDED.last_seq")
-            .bind(tenant.as_uuid())
-            .bind(head_seq + 1)
-            .execute(&admin)
-            .await
-            .expect("advance past the occupied sequence");
-
         assert_eq!(
             tasks
                 .complete_orphan_cleanup(tenant, &resumed_authority, &table)
@@ -3519,11 +3442,6 @@ mod pg_tests {
         assert!(
             raw_evidence(&admin, id).await.is_none(),
             "exhaustion clears the traversal cursor"
-        );
-        assert_eq!(
-            count_operation(&admin, "forge.task.succeeded").await,
-            1,
-            "exactly one task-success audit is appended"
         );
         assert!(
             tasks

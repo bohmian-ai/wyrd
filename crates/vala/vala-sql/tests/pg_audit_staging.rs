@@ -328,7 +328,10 @@ mod pg_tests {
                     .fetch_one(&superuser)
                     .await
                     .expect("publication count");
-            assert_eq!(audit_rows, 1, "replay resolution must not duplicate audit");
+            assert_eq!(
+                audit_rows, 0,
+                "a batch commit evaluates no permission, so it appends no audit"
+            );
             assert_eq!(publication_rows, 0, "replay resolution must not publish");
         }
     }

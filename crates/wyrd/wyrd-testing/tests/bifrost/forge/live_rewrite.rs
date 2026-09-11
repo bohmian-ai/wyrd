@@ -11,8 +11,8 @@ use wyrd_testing::bifrost::{WyrdTestCluster, shared_process_telemetry_for_test};
 
 use crate::public_support::{
     JourneyTable, ManagedRow, append_values, assert_tenant_scoped_not_found, canonical_order,
-    public_rows_returned, read_managed_rows, register_table, rows_digest,
-    tenant_client, unique_table,
+    public_rows_returned, read_managed_rows, register_table, rows_digest, tenant_client,
+    unique_table,
 };
 
 /// Longest a journey waits for one production Forge attempt to return.

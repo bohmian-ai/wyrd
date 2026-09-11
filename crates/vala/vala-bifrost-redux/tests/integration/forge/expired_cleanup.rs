@@ -810,7 +810,6 @@ async fn expire_claim(pool: &sqlx::PgPool, task_id: Uuid) {
         .expect("the claim lease lapses");
 }
 
-
 /// Reads one task's current attempt generation.
 ///
 /// # Panics
@@ -1149,7 +1148,6 @@ async fn assert_cleanup_finished_exactly(
             "every candidate is finally removed"
         );
     }
-
 
     // No destructive maintenance other than the handoff pair ran: scribe
     // promotion is ingest publication, not a maintenance effect.

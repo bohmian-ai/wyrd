@@ -52,9 +52,7 @@ pub(crate) async fn record_card_registration_audit(
     let resource = format!("card:{}", input.card_uid);
     let operation_name = "card.registration";
     let permission = "cards:write";
-    let decision = "allow";
-    let result = "success";
-    let payload_summary = "card registration";
+    let outcome = "allowed";
 
     sqlx::query(
         r#"INSERT INTO vala.audit_chain_head (data_tenant_id)
@@ -85,11 +83,8 @@ pub(crate) async fn record_card_registration_audit(
         card_ref.as_deref(),
         input.actor.id.as_uuid().as_bytes(),
         principal_kind,
-        "internal",
         permission,
-        decision,
-        result,
-        payload_summary,
+        outcome,
         Some(&detail),
     );
 
@@ -97,9 +92,9 @@ pub(crate) async fn record_card_registration_audit(
         r#"INSERT INTO vala.audit_staging
            (data_tenant_id, seq, prev_hash, entry_hash, request_id, trace_id,
             operation, resource, card_ref, principal_id, principal_kind,
-            auth_method, permission, decision, result, payload_summary, detail)
+            permission, outcome, detail)
            VALUES (wyrd.current_tenant(), $1, $2, $3, $4, NULL, $5, $6, $7,
-                   $8, $9, $10, $11, $12, $13, $14, $15)"#,
+                   $8, $9, $10, $11, $12)"#,
     )
     .bind(seq)
     .bind(prev_hash.as_slice())
@@ -110,11 +105,8 @@ pub(crate) async fn record_card_registration_audit(
     .bind(card_ref.as_deref())
     .bind(input.actor.id.as_uuid())
     .bind(principal_kind)
-    .bind("internal")
     .bind(permission)
-    .bind(decision)
-    .bind(result)
-    .bind(payload_summary)
+    .bind(outcome)
     .bind(&detail)
     .execute(&mut **conn.transaction())
     .await
@@ -158,11 +150,8 @@ fn entry_hash(
     card_ref: Option<&str>,
     principal_id: &[u8],
     principal_kind: &str,
-    auth_method: &str,
     permission: &str,
-    decision: &str,
-    result: &str,
-    payload_summary: &str,
+    outcome: &str,
     detail: Option<&str>,
 ) -> [u8; 32] {
     let mut bytes = Vec::new();
@@ -175,11 +164,8 @@ fn entry_hash(
     push_opt(&mut bytes, card_ref);
     bytes.extend_from_slice(principal_id);
     push_str(&mut bytes, principal_kind);
-    push_str(&mut bytes, auth_method);
     push_str(&mut bytes, permission);
-    push_str(&mut bytes, decision);
-    push_str(&mut bytes, result);
-    push_str(&mut bytes, payload_summary);
+    push_str(&mut bytes, outcome);
     push_opt(&mut bytes, detail);
     Sha256::digest(bytes).into()
 }

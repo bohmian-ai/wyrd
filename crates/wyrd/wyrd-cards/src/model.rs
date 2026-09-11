@@ -441,7 +441,7 @@ impl ModelCard {
         let Some(interface) = self.interface.as_ref() else {
             return Ok(None);
         };
-        ModelInterfaceHandle::from_interface(interface.bind(py))?.model_py(py)
+        Ok(ModelInterfaceHandle::from_interface(interface.bind(py))?.model_py(py)?)
     }
 
     /// Return the live preprocessing object held by this card.
@@ -456,7 +456,7 @@ impl ModelCard {
         let Some(interface) = self.interface.as_ref() else {
             return Ok(None);
         };
-        ModelInterfaceHandle::from_interface(interface.bind(py))?.preprocessor_py(py)
+        Ok(ModelInterfaceHandle::from_interface(interface.bind(py))?.preprocessor_py(py)?)
     }
 
     /// Return the live Hugging Face processor held by this card.
@@ -471,7 +471,7 @@ impl ModelCard {
         let Some(interface) = self.interface.as_ref() else {
             return Ok(None);
         };
-        ModelInterfaceHandle::from_interface(interface.bind(py))?.processor_py(py)
+        Ok(ModelInterfaceHandle::from_interface(interface.bind(py))?.processor_py(py)?)
     }
 
     /// Replace the held live model interface.
@@ -826,13 +826,13 @@ impl ModelCardInput {
         metadata: &ModelCardMetadata,
     ) -> CardPyResult<ModelInterfaceHandle> {
         match self {
-            Self::Raw(model) => ModelInterfaceHandle::from_raw(py, model.bind(py)),
+            Self::Raw(model) => Ok(ModelInterfaceHandle::from_raw(py, model.bind(py))?),
             Self::Interface(interface) => Ok(interface),
             Self::InterfaceClass(interface_class) => {
                 let interface = interface_class
                     .bind(py)
                     .call_method1("from_metadata", (metadata.clone(),))?;
-                ModelInterfaceHandle::from_interface(&interface)
+                Ok(ModelInterfaceHandle::from_interface(&interface)?)
             }
         }
     }
@@ -874,7 +874,7 @@ fn interface_from_model_spec(
             ));
         }
     };
-    handle.into_py_any(py)
+    Ok(handle.into_py_any(py)?)
 }
 
 #[cfg(feature = "python")]
@@ -987,7 +987,7 @@ fn parse_metadata_interface(
         return Ok(ModelCardMetadata::default().interface);
     }
     if let Ok(handle) = ModelInterfaceHandle::from_interface(value) {
-        return handle.to_spec_interface(py);
+        return Ok(handle.to_spec_interface(py)?);
     }
     Ok(serde_json::from_value(pyobject_to_json(value)?)?)
 }

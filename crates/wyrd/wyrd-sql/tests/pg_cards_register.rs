@@ -67,7 +67,7 @@ async fn consolidated_registration_migration_has_locked_shape() {
                                'reconcile_last_error_message', 'reconcile_dead_lettered_at') \
          ORDER BY column_name",
     )
-    .fetch_all(fixture.platform_admin_pool())
+    .fetch_all(fixture.operator_pool().pool())
     .await
     .expect("card columns read");
 
@@ -96,7 +96,7 @@ async fn consolidated_registration_migration_has_locked_shape() {
            AND table_name IN ('card_registration_operations', 'card_artifact_manifest', 'card_relationships') \
          ORDER BY table_name",
     )
-    .fetch_all(fixture.platform_admin_pool())
+    .fetch_all(fixture.operator_pool().pool())
     .await
     .expect("registration tables read");
     assert_eq!(
@@ -237,7 +237,7 @@ async fn reconciliation_claims_are_bounded_and_lease_safe() {
     .expect("card inserts");
     conn.commit().await.expect("setup commits");
 
-    let operator = OperatorPool::from(fixture.platform_admin_pool().clone());
+    let operator = fixture.operator_pool().clone();
     let first_now = Utc::now() + Duration::seconds(1);
     let (left, right) = tokio::join!(
         claim_card_reconciliation(&operator, first_now, first_now + Duration::seconds(30), 32),

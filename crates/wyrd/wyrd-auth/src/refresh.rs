@@ -376,6 +376,7 @@ mod pg_tests {
     use wyrd_spec::auth::PrincipalKindTag;
     use wyrd_spec::envelope::{CardKind, Spec};
     use wyrd_spec::ids::{CardName, SpaceName};
+
     use wyrd_spec::reference::CardRef;
     use wyrd_sql::TenantConn;
     use wyrd_sql::queries::auth::{insert_refresh_token, insert_service_account, refresh_by_hash};
@@ -385,6 +386,11 @@ mod pg_tests {
 
     use super::{RefreshError, RefreshTokens};
     use crate::exchange_api_key::TokenExchangeSettings;
+
+    /// Return the resolved space of a test card reference.
+    fn space_of(card_ref: &CardRef) -> &SpaceName {
+        card_ref.space.as_ref().expect("test card ref has a space")
+    }
 
     /// Resolver stub for token projection: this test asserts signed Card scope,
     /// not role permissions, so it grants nothing.
@@ -827,7 +833,7 @@ mod pg_tests {
                     "alias": "secondary",
                     "ref": {
                         "kind": "Service",
-                        "space": secondary.space.as_str(),
+                        "space": space_of(&secondary).as_str(),
                         "name": secondary.name.as_str(),
                         "version": secondary.version.as_str(),
                     },
@@ -841,7 +847,7 @@ mod pg_tests {
         let expected_root_uid = get_card_by_ref(
             &mut conn,
             root.kind.clone(),
-            &root.space,
+            space_of(&root),
             &root.name,
             &root.version,
         )
@@ -851,7 +857,7 @@ mod pg_tests {
         let expected_secondary_uid = get_card_by_ref(
             &mut conn,
             secondary.kind.clone(),
-            &secondary.space,
+            space_of(&secondary),
             &secondary.name,
             &secondary.version,
         )

@@ -818,7 +818,7 @@ fn infer_schema_from_handle(
     py: Python<'_>,
 ) -> CardPyResult<DataSchema> {
     if let Some(source) = handle.source_ref() {
-        handle.infer_schema(py, source.bind(py))
+        Ok(handle.infer_schema(py, source.bind(py))?)
     } else {
         Ok(DataSchema::empty())
     }
@@ -830,7 +830,7 @@ fn sql_logic_from_handle(
     py: Python<'_>,
 ) -> CardPyResult<Option<SqlLogic>> {
     match handle {
-        DataInterfaceHandle::Sql(_) => sql_logic_from_data(py, handle.source_ref()).map(Some),
+        DataInterfaceHandle::Sql(_) => Ok(Some(sql_logic_from_data(py, handle.source_ref())?)),
         _ => Ok(None),
     }
 }
@@ -877,7 +877,7 @@ fn interface_from_spec(py: Python<'_>, interface: &RustDataInterface) -> CardPyR
             ));
         }
     };
-    handle.into_py_any(py)
+    Ok(handle.into_py_any(py)?)
 }
 
 #[cfg(feature = "python")]

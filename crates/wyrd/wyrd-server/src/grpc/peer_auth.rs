@@ -356,7 +356,7 @@ mod tests {
             kind: CardKind::Service,
             name: CardName::new(name).expect("static card name is valid"),
             version: wyrd_semver::VersionBlock::parse("1.0.0").expect("static version is valid"),
-            space: SpaceName::new("system").expect("static space name is valid"),
+            space: Some(SpaceName::new("system").expect("static space name is valid")),
             uid: None,
         }
     }

@@ -499,7 +499,7 @@ impl PromptCard {
         if let Some(prompt) = self.prompt.as_ref() {
             return Ok(prompt.clone_ref(py));
         }
-        skald_prompt::prompt_py(self.metadata.prompt.clone(), py)
+        Ok(skald_prompt::prompt_py(self.metadata.prompt.clone(), py)?)
     }
 
     /// Replace the held live prompt and `PromptCard` metadata.
@@ -516,7 +516,7 @@ impl PromptCard {
     /// Return typed provider generation settings, or `None` for raw prompts.
     #[getter]
     pub fn model_settings(&self, py: Python<'_>) -> CardPyResult<Option<Py<PyAny>>> {
-        skald_prompt::model_settings_py(&self.metadata.prompt, py)
+        Ok(skald_prompt::model_settings_py(&self.metadata.prompt, py)?)
     }
 
     /// Return the `PromptCard` space.

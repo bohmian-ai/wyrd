@@ -882,7 +882,13 @@ async fn declare_component_card(
             .as_uuid(),
     )
     .bind(CardKind::Service.wire_name())
-    .bind(component.space.as_str())
+    .bind(
+        component
+            .space
+            .as_ref()
+            .expect("fixture card ref carries a space")
+            .as_str(),
+    )
     .bind(component.name.as_str())
     .bind(component.version.as_str())
     .bind(serde_json::to_value(&component_spec).expect("component spec encodes"))
@@ -911,7 +917,13 @@ async fn declare_component_card(
     )
     .bind(root.uid.as_ref().expect("root uid is set").as_uuid())
     .bind(CardKind::Service.wire_name())
-    .bind(root.space.as_str())
+    .bind(
+        root
+            .space
+            .as_ref()
+            .expect("fixture card ref carries a space")
+            .as_str(),
+    )
     .bind(root.name.as_str())
     .bind(root.version.as_str())
     .bind(serde_json::to_value(&root_spec).expect("root spec encodes"))
@@ -949,7 +961,13 @@ async fn registry_card_uid(
          AND version = $4",
     )
     .bind(card.kind.wire_name())
-    .bind(card.space.as_str())
+    .bind(
+        card
+            .space
+            .as_ref()
+            .expect("fixture card ref carries a space")
+            .as_str(),
+    )
     .bind(card.name.as_str())
     .bind(card.version.as_str())
     .fetch_one(&pool)

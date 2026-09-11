@@ -467,7 +467,7 @@ pub(crate) mod pg_tests {
             kind: CardKind::Service,
             name: CardName::new("oracle-peer").expect("name"),
             version: VersionBlock::parse("1.0.0").expect("version"),
-            space: SpaceName::new("system").expect("space"),
+            space: Some(SpaceName::new("system").expect("space")),
             uid: None,
         };
         let service_kind = PrincipalKind::Service {

@@ -3,7 +3,7 @@
 //! [`ClientConfig`] is the single entry point for configuring `wyrd-client`.
 //! Build from the global profile with [`ClientConfig::from_global`] or from
 //! environment variables with [`ClientConfig::from_env`], optionally set
-//! [`ClientConfig::api_key`] for an explicit key that outranks ambient env and
+//! [`ClientConfig::credential`] for an explicit credential that outranks env and
 //! file credentials, then call [`ClientConfig::resolve_credential`] to obtain
 //! the effective [`ResolvedCredential`].
 
@@ -47,7 +47,7 @@ pub struct ClientConfig {
     /// When set, this value is prepended to the credential chain as tier 0 and
     /// always wins over `WYRD_API_KEY`, `WYRD_ACCESS_TOKEN`, and the
     /// `credentials.toml` floor.
-    pub api_key: Option<SecretString>,
+    pub credential: Option<SecretString>,
     /// Optional tenant slug used with workload identity credentials.
     pub tenant: Option<String>,
     /// Token cache mode.
@@ -61,7 +61,10 @@ impl std::fmt::Debug for ClientConfig {
         f.debug_struct("ClientConfig")
             .field("grpc", &self.grpc)
             .field("http", &self.http)
-            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "credential",
+                &self.credential.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("tenant", &self.tenant)
             .field("token_cache", &self.token_cache)
             .field("token_cache_path", &self.token_cache_path)
@@ -144,7 +147,7 @@ impl ClientConfig {
                 base_url: http_base_url,
                 ..HttpConfig::default()
             },
-            api_key: None,
+            credential: None,
             tenant,
             token_cache,
             token_cache_path,
@@ -178,6 +181,14 @@ impl ClientConfig {
 #[cfg(test)]
 mod tests {
     use secrecy::ExposeSecret;
+
+    /// Credential fixture used by the precedence tests.
+    ///
+    /// The precedence tests assert that an explicit credential wins, so the
+    /// fixture must be something the server-side parser would accept; a
+    /// prose placeholder would classify as a bearer token instead.
+    const API_KEY_FIXTURE: &str =
+        "wyrd_sk_4d5e1c3a9b7f4e2d8a6c0b1e2f3a4b5c_1a2b3c4d_9f8e7d6c5b4a39281706f5e4d3c2b1a0";
 
     use crate::global_config::{ClientSection, GlobalConfig};
 

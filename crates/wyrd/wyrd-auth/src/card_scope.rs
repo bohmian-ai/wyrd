@@ -336,6 +336,11 @@ mod pg_tests {
 
     use super::*;
 
+    /// Return the resolved space of a test card reference.
+    fn space_of(card_ref: &CardRef) -> &SpaceName {
+        card_ref.space.as_ref().expect("test card ref has a space")
+    }
+
     fn make_card_ref(kind: CardKind, space: &str, name: &str) -> CardRef {
         CardRef {
             kind,
@@ -541,7 +546,7 @@ mod pg_tests {
                     "alias": "secondary",
                     "ref": {
                         "kind": "Service",
-                        "space": secondary.space.as_str(),
+                        "space": space_of(&secondary).as_str(),
                         "name": secondary.name.as_str(),
                         "version": secondary.version.as_str(),
                     },
@@ -554,7 +559,7 @@ mod pg_tests {
         let expected_root_uid = get_card_by_ref(
             &mut conn,
             root.kind.clone(),
-            &root.space,
+            space_of(&root),
             &root.name,
             &root.version,
         )
@@ -564,7 +569,7 @@ mod pg_tests {
         let expected_secondary_uid = get_card_by_ref(
             &mut conn,
             secondary.kind.clone(),
-            &secondary.space,
+            space_of(&secondary),
             &secondary.name,
             &secondary.version,
         )

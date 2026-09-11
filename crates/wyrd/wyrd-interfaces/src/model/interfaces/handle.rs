@@ -212,7 +212,7 @@ impl ModelInterfaceHandle {
     ///
     /// # Errors
     /// Returns a Python error when a custom attribute getter fails.
-    pub fn model_py(&self, py: Python<'_>) -> CardPyResult<Option<Py<PyAny>>> {
+    pub fn model_py(&self, py: Python<'_>) -> WyrdPyResult<Option<Py<PyAny>>> {
         match self {
             Self::Subclass(value) => optional_subclass_attribute(value.bind(py), "model"),
             _ => Ok(self.model_ref().map(|model| model.clone_ref(py))),
@@ -226,7 +226,7 @@ impl ModelInterfaceHandle {
     ///
     /// # Errors
     /// Returns a Python error when a custom attribute getter fails.
-    pub fn preprocessor_py(&self, py: Python<'_>) -> CardPyResult<Option<Py<PyAny>>> {
+    pub fn preprocessor_py(&self, py: Python<'_>) -> WyrdPyResult<Option<Py<PyAny>>> {
         let preprocessor = match self {
             Self::Sklearn(value) => value.preprocessor.as_deref(),
             Self::Xgboost(value) => value.preprocessor.as_deref(),
@@ -249,7 +249,7 @@ impl ModelInterfaceHandle {
     ///
     /// # Errors
     /// Returns a Python error when a custom attribute getter fails.
-    pub fn processor_py(&self, py: Python<'_>) -> CardPyResult<Option<Py<PyAny>>> {
+    pub fn processor_py(&self, py: Python<'_>) -> WyrdPyResult<Option<Py<PyAny>>> {
         match self {
             Self::Huggingface(value) => Ok(value
                 .processor
@@ -264,7 +264,7 @@ impl ModelInterfaceHandle {
 fn optional_subclass_attribute(
     interface: &Bound<'_, PyAny>,
     name: &str,
-) -> CardPyResult<Option<Py<PyAny>>> {
+) -> WyrdPyResult<Option<Py<PyAny>>> {
     if !interface.hasattr(name)? {
         return Ok(None);
     }

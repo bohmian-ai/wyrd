@@ -28,7 +28,7 @@ pub(crate) fn load(
         client_config.http.base_url = server_url.to_owned();
     }
     if api_key.is_some() {
-        client_config.api_key = api_key;
+        client_config.credential = api_key;
     }
     Ok(WyrdClient::with_config(client_config)?)
 }

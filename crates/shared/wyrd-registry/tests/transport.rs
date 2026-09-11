@@ -253,7 +253,7 @@ async fn server_problem_code_and_status_survive_registry_boundary() {
 #[test]
 fn client_debug_redacts_constructor_secret() {
     let config = ClientConfig {
-        api_key: Some(SecretString::from("wyrd_sk_private")),
+        credential: Some(SecretString::from("wyrd_sk_private")),
         http: HttpConfig {
             base_url: "http://localhost:50050".to_owned(),
             ..HttpConfig::default()

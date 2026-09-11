@@ -4690,7 +4690,7 @@ fn card_ref(kind: CardKind, name: &str) -> Result<CardRef, WyrdTestServerError> 
         kind,
         name: CardName::new(name).map_err(|error| WyrdTestServerError::Auth(error.to_string()))?,
         version: VersionBlock::parse("1.0.0").expect("static semantic version block is valid"),
-        space: SpaceName::new("test").expect("static space name is valid"),
+        space: Some(SpaceName::new("test").expect("static space name is valid")),
         uid: Some(
             CardUid::new(Uuid::now_v7().to_string()).expect("generated UUIDv7 is a valid CardUid"),
         ),
@@ -4808,7 +4808,13 @@ async fn insert_fixture_card(
     )
     .bind(uid.as_uuid())
     .bind(card_ref.kind.wire_name())
-    .bind(card_ref.space.as_str())
+    .bind(
+        card_ref
+            .space
+            .as_ref()
+            .expect("fixture card ref carries a space")
+            .as_str(),
+    )
     .bind(card_ref.name.as_str())
     .bind(card_ref.version.as_str())
     .bind(spec_json)

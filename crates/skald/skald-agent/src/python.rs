@@ -14,6 +14,7 @@ use skald_spec::{ProviderRequest, ProviderResponse};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::metadata::{AnnotationKey, AnnotationValue, LabelKey, LabelValue};
 use wyrd_spec::reference::InlineableRef;
+use wyrd_utils::py::{WyrdPyError, WyrdPyResult};
 
 use crate::error::AgentError;
 use crate::{
@@ -741,7 +742,7 @@ fn prompt_from_py(value: &Bound<'_, PyAny>) -> WyrdPyResult<Prompt> {
 
 fn prompt_ref_from_py(
     value: &Bound<'_, PyAny>,
-) -> AgentPyResult<InlineableRef<skald_spec::Prompt>> {
+) -> WyrdPyResult<InlineableRef<skald_spec::Prompt>> {
     if let Ok(json) = value.call_method0("model_dump_json") {
         let data = json
             .extract::<String>()

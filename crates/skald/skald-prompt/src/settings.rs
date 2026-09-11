@@ -420,6 +420,6 @@ pub fn model_settings_py(
 
 /// Return a typed Python `Prompt` for native prompt metadata.
 #[cfg(feature = "python")]
-pub fn prompt_py(prompt: skald_spec::Prompt, py: Python<'_>) -> CardPyResult<Py<Prompt>> {
+pub fn prompt_py(prompt: skald_spec::Prompt, py: Python<'_>) -> WyrdPyResult<Py<Prompt>> {
     Ok(Py::new(py, Prompt::from_native(prompt))?)
 }

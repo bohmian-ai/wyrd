@@ -1563,6 +1563,7 @@ pub(crate) fn reconciliation_caller(tenant_id: DataTenantId) -> Caller {
             PermissionSet::new(),
         ),
         request_id: RequestId::now_v7(),
+        delegation_chain: Vec::new(),
     }
 }
 

@@ -2376,7 +2376,7 @@ pub fn check_card_recovery_pool(state: &AppState) -> Result<(), ServerBootError>
 
 fn check_card_recovery_pool_inner(
     has_operator_pool: bool,
-    profile: &DeploymentProfile,
+    profile: &crate::config::DeploymentProfile,
 ) -> Result<(), ServerBootError> {
     if !has_operator_pool {
         if profile.is_production() {

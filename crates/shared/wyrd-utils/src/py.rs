@@ -46,6 +46,15 @@ impl WyrdPyError {
     pub fn code(&self) -> &'static str {
         self.0.code()
     }
+
+    /// Unwrap the catalog error this boundary failure carries.
+    ///
+    /// Owner crates that still project through their own boundary enum use it
+    /// to re-enter the catalog without constructing a Python interpreter.
+    #[must_use]
+    pub fn into_wyrd_error(self) -> SpecWyrdError {
+        self.0
+    }
 }
 
 impl From<PyErr> for WyrdPyError {

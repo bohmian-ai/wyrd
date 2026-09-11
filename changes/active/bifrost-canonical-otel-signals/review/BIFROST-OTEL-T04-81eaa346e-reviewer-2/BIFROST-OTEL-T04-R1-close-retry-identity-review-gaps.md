@@ -140,3 +140,36 @@ git diff --check
 
 Before returning `IMPLEMENTED`, record the exact focused test name used for the
 two-principal proof if it is added as a separate named test.
+
+## Implementation evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| `FIND-BIFROST-OTEL-T04-1` | `crates/vala/vala-bifrost-redux/src/gate/mod.rs::otlp_batch_id` now folds the authenticated `PrincipalId` and `scribe::preprocess::correlation_data_identity` into the existing tenant/table/logical digest; `crates/vala/vala-bifrost-redux/src/scribe/preprocess.rs::correlation_data_identity` digests exactly the reserved correlation columns the logical digest drops, reusing the hoisted `digest_array_data` walker | `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=gate::otlp_batch_id_tests::derived_identity_is_stable_per_tenant_table_and_payload)'`; journey `negative::pg_tests::identical_exports_from_two_principals_each_keep_their_own_attribution` (two-principal proof) and `negative::pg_tests::mixed_otlp_requests_commit_only_complete_siblings_and_exact_partial_success` | PASS |
+| `FIND-BIFROST-OTEL-T04-3` | `sha2`, `arrow::record_batch::RecordBatch`, `uuid::Uuid`, `DataTenantId`, `PrincipalId`, and both preprocess helpers are imported at `gate/mod.rs` module scope; `otlp_batch_id` and `dispatch_canonical` use bare type names | `mise run fmt`, `mise run lints` | PASS |
+| `FIND-BIFROST-OTEL-T04-4` | Rustdoc added/updated on `otlp_batch_id` (`# Errors`, `# Panics`), `dispatch_canonical` (retry/fence behavior, `# Errors`), `digest_array_data`, `correlation_data_identity`, the `otlp_batch_id_tests` module, its `batch` fixture (`# Panics`), and `export_traces_over_grpc_as` | `mise run lints` (workspace `--all-features` clippy) | PASS |
+
+Commands run: `mise run fmt`, `mise run lints`, the focused `vala-bifrost-redux` unit test above,
+`scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test otlp -P journey -E '...' --run-ignored=all"`,
+`mise run verify:bifrost`, `git diff --check`.
+
+Two-principal proof test name:
+`negative::pg_tests::identical_exports_from_two_principals_each_keep_their_own_attribution`
+(`crates/wyrd/wyrd-testing/tests/bifrost/otlp/negative.rs`).
+
+Non-goals held: no new public idempotency key, header, route, request field, SDK surface,
+persisted fence key, column, migration, dependency, projector, or test target; Scribe fencing and
+`logical_data_identity` semantics are unchanged (the walker was hoisted, not altered); the UUIDv7
+representation, spec revision 11, and all preserved OTLP behaviors are untouched.
+
+### Material limit
+
+`mise run verify:bifrost` reported 15 of 16 lanes green (976/977 in the
+`vala-bifrost-redux` tier-2 lane). The single failure,
+`forge::compaction_admission::acceptance_unknown_recovers_from_durable_state`,
+is a load-dependent Forge rewrite-publication cancellation
+("Forge rewrite publication refused before commit: Cancelled"); it passes in
+isolation under the same Postgres lane
+(`cargo nextest run --locked -p vala-bifrost-redux --features test-support,bench-support --test integration -P journey --run-ignored=all -E 'test(=forge::compaction_admission::acceptance_unknown_recovers_from_durable_state)'`
+→ 1 passed). No file under `forge/` is in this remediation's write set, and
+repairing unrelated timing behavior is an explicit non-goal.

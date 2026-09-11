@@ -704,6 +704,28 @@ respective `BifrostTracePayload`, `BifrostLogPayload`,
 `BifrostGenAiPayload`, or `BifrostAgentTracePayload` read permission through
 the canonical SQL path.
 
+Bifrost read permissions carry an object axis. A `bifrost_query:read` or
+sensitive-payload grant is scoped either to every object (`all`) or to a named
+Bifrost object: a `{ catalog, schema }` schema scope, or a
+`{ catalog, schema, table_uid }` table scope keyed by the existing Bifrost
+`TableUid`. A query names no tables until it is planned, so `POST /v1/query`
+admits on the coarse operation capability only, and the authoritative object
+decision runs inside the Oracle once `pin_cut` has resolved the complete
+`PinnedSealedTable` set — before provider registration, physical planning,
+admission charging, read-audit acceptance, peer dispatch, or any source read.
+Every resolved table, including tables reached only through a join or an
+expansion, must be covered; one uncovered table denies the whole query with
+`WYRD_VALA_403_QUERY_FORBIDDEN` and streams no rows. Sensitive-payload
+permissions are checked with the same resolved-table scope, and the payload
+categories and payload-forbidden error are unchanged.
+
+The permission digest bound into every stage assignment is derived from the
+approved scoped permission together with the exact authorized table identities,
+so a worker cannot execute against a wider object set than the leader approved.
+This is object-scoped RBAC — a static role grant over named objects — and adds
+no grant table, policy lookup, query-path database lookup, cache, or second
+checker.
+
 There is no `WarehouseCard`, `wyrd.warehouse` compatibility surface,
 asynchronous query-job API, result polling/redirect protocol, or client-selected
 physical tenant scope.

@@ -240,3 +240,85 @@ git diff --check
 ```
 
 Do not run the repository gate or a complete Bifrost/platform test suite.
+
+## Implementation Report
+
+### Acceptance matrix
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Direct permission JSON supports `all`, schema scope, table scope | `crates/wyrd-spec/src/auth/permission_scope.rs`, `crates/shared/wyrd-runtime/src/permission.rs` | `wyrd-spec auth::permission_scope::tests::scope_json_matches_the_approved_projection`; `wyrd-runtime permission::tests::scoped_permission_json_matches_the_approved_projection` | PASS |
+| Missing scope, malformed identity, and Bifrost scope on an unrelated resource rejected; no compatibility decoder | `Permission` decodes only through `#[serde(try_from = "PermissionWire")]` with `deny_unknown_fields`; `Permission::validate` + `Resource::accepts_bifrost_scope` (`crates/shared/wyrd-runtime/src/permission.rs`) | `wyrd-runtime permission::tests::scope_is_required_and_has_no_compatibility_decoder`, `::bifrost_scope_is_rejected_on_an_unrelated_resource`, `::malformed_scope_identity_is_rejected_at_decode`; `wyrd-spec auth::permission_scope::tests::malformed_identities_are_rejected`, `::malformed_table_identity_is_rejected_at_decode` | PASS |
+| Three-axis coverage (`All`, schema, exact UID; wildcard resource/action is object-wide only with `All`) | `Permission::covers` + `PermissionScope::covers`/`BifrostPermissionScope::covers` | `wyrd-runtime permission::tests::coverage_is_three_axis`, `::permission_set_keeps_scopes_that_do_not_subsume_each_other`; `wyrd-spec auth::permission_scope::tests::all_covers_every_object_and_is_covered_by_nothing_narrower`, `::schema_scope_covers_every_table_in_that_exact_schema`, `::table_scope_covers_only_the_exact_uid` | PASS |
+| Tenant role JSON resolves through `SqlPermissionResolver` into the existing `PermissionSet`; epoch/cache revocation unchanged | No resolver change was needed — the single `Permission` decode path enforces scope (`crates/wyrd/wyrd-auth/src/permission_resolver.rs`) | `wyrd-auth permission_resolver::pg_tests::decodes_scoped_bifrost_grants_and_rejects_unscoped_rows`, `::resolved_set_matches_constant`; `wyrd-auth-verify tests::invalidate_principal_removes_matching_entries_and_forces_re_resolve`, `::revocation_epoch_rejects_cache_hit_when_iat_predates_epoch` | PASS |
+| Every resolved table checked from its catalog-resolved identity; denial precedes source IO, accepted read audit, and peer dispatch | `authorize_resolved_tables` called from `OraclePlanner::pin_cut` immediately after `protect_and_materialize` (`crates/vala/vala-bifrost-redux/src/oracle/planner.rs:395`), defined at `crates/vala/vala-bifrost-redux/src/oracle/mod.rs:4909` | `wyrd-testing::server query::tenant_scoped_roles_reach_only_their_granted_bifrost_tables` (join case denied, zero rows) | PASS |
+| Checks use logical catalog/schema and the existing `TableUid`, not aliases, raw SQL, flattened namespaces, or physical catalogs | `resolved_table_scope` splits the pinned `TenantTableBinding` namespace and reuses `cut.table_uid` (`oracle/mod.rs:4878`) | Same journey; `vala-bifrost-redux oracle::tests::payload_permission_requires_the_resolved_table_scope` | PASS |
+| Sensitive payload permissions require the same resolved-table scope; categories and payload-forbidden error unchanged | `payload_permission(table, scope)` (`oracle/mod.rs:4773`) | `vala-bifrost-redux oracle::tests::payload_permission_requires_the_resolved_table_scope`, `::payload_permission_is_absent_for_ungated_tables` | PASS |
+| Scoped decision participates in audit, forwarding, stage tickets, worker verification; tampering rejected before worker IO | `scoped_permission_digest` at all three digest sites (`oracle/mod.rs:2687,4677,4737`); typed permission comparison in `crates/wyrd/wyrd-server/src/oracle/forwarding.rs` | `vala-bifrost-redux oracle::tests::scoped_permission_digest_binds_the_authorized_table_set`; `wyrd-server oracle::peer_authority::tests::oracle_peer_authority_rejects_tamper_replay_and_restart_fence` (widened-permission substitution added) | PASS |
+| No decision reduces to the old `resource:action` string; descriptors expose typed scope with no second string language | `AuthorizedQueryContext.permission: Permission`; `Display`/`FromStr` remain operation-only for audit text; `BifrostPermissionDescriptor.scope: PermissionScope` (`crates/wyrd-spec/src/vala/api.rs`) | `mise run codegen:check`; regenerated `crates/wyrd-spec/schemas/bifrost_permission_descriptor.json` | PASS |
+| Real-server journey proves the `analyst` / `data_scientist` matrix, denials with zero rows | `crates/wyrd/wyrd-testing/tests/bifrost/server/query.rs` | `wyrd-testing::server query::tenant_scoped_roles_reach_only_their_granted_bifrost_tables` | PASS |
+| `analyst` / `data_scientist` are test-only; all query adapters converge on one authorization path | Roles are seeded only via `WyrdTestServer::seed_role` in that journey; no builtin-role change (`crates/wyrd/wyrd-auth/src/roles.rs` untouched except a scope literal) | Whole `server` journey binary (5/5) incl. the gRPC/scheduled-query journey | PASS |
+| `permission-model.md` defines operation/object RBAC, typed scope, JSON, validation, coverage | `architecture/v1/00-foundations/permission-model.md` | `mise run docs:check` | PASS |
+| `permission-check.md` states the object rides inside `Permission`, explains the absent `TargetRef`, no longer equates object-free with RBAC | `architecture/v1/00-foundations/permission-check.md` | `mise run docs:check` | PASS |
+| `wyrd-design.md`, `wyrd-security-posture.md`, `bifrost-design.md`, public authorization docs, generated contracts agree; no authority still rejects scope | Those four files plus `docs/src/content/docs/concepts/authorization.svx` and `identity-and-auth.svx` | `mise run docs:check`; `mise run codegen:check` | PASS |
+
+### Commands run
+
+```bash
+# Superseded by the exact expressions recorded in
+# changes/active/object-scoped-rbac/review/task-001-codex/TASK-001-R1-close-rbac-contract-gaps.md
+# (these two regex module selectors could pass after selecting the wrong set).
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib \
+  -E 'test(=oracle::tests::payload_permission_requires_the_resolved_table_scope) | test(=oracle::tests::payload_permission_is_absent_for_ungated_tables) | test(=oracle::tests::scoped_permission_digest_binds_the_authorized_table_set)'
+mise exec -- cargo nextest run --locked -p wyrd-server --lib --features test-support \
+  -E 'test(=oracle::peer_authority::tests::oracle_peer_authority_rejects_tamper_replay_and_restart_fence)'
+mise exec -- cargo nextest run --locked -p wyrd-auth-verify --lib \
+  -E 'test(=tests::invalidate_principal_removes_matching_entries_and_forces_re_resolve) | test(=tests::revocation_epoch_rejects_cache_hit_when_iat_predates_epoch)'
+scripts/postgres/with-test-postgres.sh -- bash -lc \
+  'mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-auth --lib -E '\''test(=permission_resolver::pg_tests::resolved_set_matches_constant) | test(=permission_resolver::pg_tests::decodes_scoped_bifrost_grants_and_rejects_unscoped_rows)'\'''
+scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:bifrost:journey:server:inner'
+scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:bifrost:journey:oracle:inner'
+mise run fmt && mise run lints && mise run codegen:check
+mise run check:client-tier && mise run check:pyo3-scope && mise run docs:check
+git diff --check
+```
+
+### Corrections to the task's verification block
+
+- `test(=oracle::peer_authority::tests::prove_forward_query_claims_bind_every_field)`
+  selects zero tests: that name is a helper function, not a test. The real
+  signed-peer tamper anchor is
+  `oracle::peer_authority::tests::oracle_peer_authority_rejects_tamper_replay_and_restart_fence`,
+  which is what was run and extended.
+- The scoped role-decode case lives inside `permission_resolver::pg_tests`
+  (its module home in the file), so its expression is
+  `test(=permission_resolver::pg_tests::decodes_scoped_bifrost_grants_and_rejects_unscoped_rows)`.
+
+### Pre-existing failures, unchanged by this task
+
+- `mise run check:unwrap-audit` fails on `crates/wyrd/wyrd-testing/src/bifrost/process_cluster.rs`.
+  Identical 10 findings at the task's base commit `1c4b518db` (verified in a
+  throwaway worktree); no file this task touched is flagged.
+- `mise run check:design-sync` fails because `architecture/wyrd-design.md` never
+  named `ValaQueryService` or the four `Bifrost*Payload` resources. Identical 6
+  failures at `1c4b518db`. Out of this task's write set.
+
+### Material limits
+
+- `clippy::result_large_err` fired once the scope axis grew `Permission` past
+  128 bytes. `PermissionDenyReason::Rbac.required` is now `Box<Permission>`,
+  which is the lint's own remedy and keeps the check's `Result` small. No
+  public wire shape changed.
+- `authorize_resolved_tables` has no isolated unit test: constructing a
+  `PinnedSealedTable` requires a live `iceberg::table::Table`. Its two pure
+  halves (`resolved_table_scope` identity projection, three-axis coverage) are
+  unit tested, and the function itself is proven end to end by the journey's
+  six-case role matrix, including the join case.
+- The journey's accepted queries stream zero rows: the built-in tables are
+  provisioned but not ingested into. Acceptance therefore proves that
+  authorization, admission, audit, and execution completed; it does not assert
+  row content. Denials assert a pre-stream `WYRD_VALA_403_QUERY_FORBIDDEN` and
+  zero rows.
+- Non-goals stayed excluded: no grant table, policy lookup, query-path database
+  lookup, permission cache, second checker, string/glob scope language, second
+  table identity, catalog/schema registry, or new dependency was added.

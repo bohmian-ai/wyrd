@@ -93,7 +93,7 @@ to this version from their owning sources.
 18. **Auth and Policy are two distinct planes.** Emit is **not** a third
     plane: a deployed service's observation/ingest writes are ordinary
     Auth-plane routes, authorized by the same JWT and a
-    `Permission { resource, action }` like every other call. The legacy
+    `Permission { resource, action, scope }` like every other call. The legacy
     per-card **governance token is removed** — the JWT proves the principal and
     bounds its emittable **card scope**. For card-bound principals, the scope is
     the principal's own `card_ref` plus the **observation-target** cards reachable
@@ -112,11 +112,17 @@ to this version from their owning sources.
     Generic telemetry may omit it and retains the authenticated publisher through
     `principal_id`. A separate emit credential was redundant — see "Observation
     identity — Card → Run → Observation".
-    - **Auth** gates Wyrd API calls: `Permission { resource, action }` on the
-      handler, stateless pubkey verify of the access token. Answers "is this
-      principal allowed to hit this Wyrd route?" This covers data-plane ingest
-      (e.g. `bifrost_record:write`) exactly like any other route. The legacy
-      `Scope` vocabulary is rejected — do not introduce it in new code.
+    - **Auth** gates Wyrd API calls: `Permission { resource, action, scope }` on
+      the handler, stateless pubkey verify of the access token. Answers "is this
+      principal allowed to hit this Wyrd route, and to reach this object?" This
+      covers data-plane ingest (e.g. `bifrost_record:write`) exactly like any
+      other route. Wyrd RBAC is the standard operation/object model: `resource`
+      and `action` name the operation and the typed `PermissionScope` names the
+      objects, so a static role grant over one Bifrost schema or table is still
+      RBAC and never enters the Policy plane. The rejected legacy vocabulary was
+      a free-form OAuth-style `Scope` *string*; a typed closed object scope
+      inside `Permission` is the sanctioned model — see
+      `v1/00-foundations/permission-model.md`.
     - **Policy** gates card states (`classify` at register-time, `gate` at
       deploy-time) and cross-service invokes (`invoke` at runtime). Runtime
       invoke evaluation is centralized at `POST /v1/authz/check`, called

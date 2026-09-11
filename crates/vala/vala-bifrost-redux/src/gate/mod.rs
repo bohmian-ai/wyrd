@@ -1626,7 +1626,7 @@ mod tests {
             request_id: auth.request_id,
             trace_id: None,
             auth_method: wyrd_spec::vala::api::AuthMethod::Jwt,
-            permission: "bifrost:record:read".to_owned(),
+            permission: wyrd_runtime::Permission::bifrost_query_read(),
             delegation_chain: auth.delegation_chain,
         }
     }

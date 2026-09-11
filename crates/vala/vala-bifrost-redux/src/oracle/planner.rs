@@ -97,24 +97,26 @@ impl OraclePlanner {
     /// Protects and materializes every table scan in a typed plan.
     ///
     /// Tables are prepared sequentially under one absolute deadline, the whole
+    /// prepared set is authorized against the caller's object grants, the whole
     /// set is protected by one durable guard, and only then is any snapshot
     /// materialized. Cancellation drops the active catalog future; a partially
     /// materialized result is discarded together with its guard, which narrows
     /// the protection it took.
     ///
     /// # Errors
-    /// Returns invalid SQL for non-canonical scans, reader-authority refusal,
-    /// or timeout/catalog failures while materializing the immutable cuts.
+    /// Returns invalid SQL for non-canonical scans, the query-forbidden refusal
+    /// when the caller does not hold every resolved table, reader-authority
+    /// refusal, or timeout/catalog failures while materializing the cuts.
     pub(super) async fn prepare_typed_cuts(
         &self,
         plan: &datafusion::logical_expr::LogicalPlan,
-        tenant: wyrd_spec::DataTenantId,
+        context: &AuthorizedQueryContext,
         deadline: Instant,
         catalog: &BifrostCatalog,
         authority: &Arc<OracleReaderAuthority>,
     ) -> Result<ProtectedPlannedSqlCut, BifrostError> {
         let tables = collect_plan_table_refs(plan)?;
-        Self::protect_and_materialize(&tables, tenant, deadline, catalog, Some(authority)).await
+        Self::protect_and_materialize(&tables, context, deadline, catalog, Some(authority)).await
     }
 
     /// Prepares identities, takes one complete reader guard, revalidates, then
@@ -122,10 +124,11 @@ impl OraclePlanner {
     ///
     /// This is the only place a leader turns table references into readable
     /// cuts. The ordering is the protection contract: every identity is
-    /// resolved from metadata alone, one guard covers the whole set, every
-    /// prepared table is revalidated against the authoritative catalog before
-    /// any of them is materialized, and no snapshot-dependent source IO happens
-    /// before that guard exists.
+    /// resolved from metadata alone, the complete resolved object set is
+    /// authorized before a guard is even taken, one guard covers the whole set,
+    /// every prepared table is revalidated against the authoritative catalog
+    /// before any of them is materialized, and no snapshot-dependent source IO
+    /// happens before that guard exists.
     ///
     /// Promotion between preparation and materialization invalidates the whole
     /// attempt, not one table: the guard covers a set of snapshots, and a set
@@ -136,13 +139,14 @@ impl OraclePlanner {
     ///
     /// # Errors
     /// Returns [`BifrostError::QueryTimeout`] when the deadline passes during
-    /// preparation or materialization, the reader authority's refusal when the
-    /// cut cannot be protected, a metadata-mismatch failure when the catalog
-    /// was promoted twice under this query, and the catalog's public failure
-    /// otherwise.
+    /// preparation or materialization, [`BifrostError::QueryForbidden`] when
+    /// the caller's grants do not cover every resolved table, the reader
+    /// authority's refusal when the cut cannot be protected, a metadata-mismatch
+    /// failure when the catalog was promoted twice under this query, and the
+    /// catalog's public failure otherwise.
     async fn protect_and_materialize(
         tables: &[TableRef],
-        tenant: wyrd_spec::DataTenantId,
+        context: &AuthorizedQueryContext,
         deadline: Instant,
         catalog: &BifrostCatalog,
         authority: Option<&Arc<OracleReaderAuthority>>,
@@ -152,14 +156,14 @@ impl OraclePlanner {
             // has nothing that could protect a snapshot it is about to read.
             return Err(BifrostError::OracleRoleUnavailable);
         };
-        match Self::attempt_protected_cut(tables, tenant, deadline, catalog, authority).await {
+        match Self::attempt_protected_cut(tables, context, deadline, catalog, authority).await {
             Err(AttemptFailure::CatalogPromoted(error)) => {
                 tracing::warn!(
                     error = %error,
                     tables = tables.len(),
                     "Oracle restarted complete reader admission after catalog promotion"
                 );
-                Self::attempt_protected_cut(tables, tenant, deadline, catalog, authority)
+                Self::attempt_protected_cut(tables, context, deadline, catalog, authority)
                     .await
                     .map_err(AttemptFailure::into_public)
             }
@@ -169,14 +173,18 @@ impl OraclePlanner {
 
     /// Runs one complete prepare, protect, revalidate, and materialize attempt.
     ///
+    /// The object decision is taken on the prepared identities, before the
+    /// reader guard: a restart cannot change who holds a table, and an
+    /// out-of-scope caller must not reach protection or materialization at all.
+    ///
     /// # Errors
     /// Returns [`AttemptFailure::CatalogPromoted`] when revalidation proved the
     /// authoritative catalog moved under this attempt, which the caller may
     /// restart once, and [`AttemptFailure::Fatal`] for every failure a restart
-    /// cannot change.
+    /// cannot change, including the query-forbidden object refusal.
     async fn attempt_protected_cut(
         tables: &[TableRef],
-        tenant: wyrd_spec::DataTenantId,
+        context: &AuthorizedQueryContext,
         deadline: Instant,
         catalog: &BifrostCatalog,
         authority: &Arc<OracleReaderAuthority>,
@@ -187,12 +195,22 @@ impl OraclePlanner {
                 .checked_duration_since(Instant::now())
                 .ok_or(AttemptFailure::Fatal(BifrostError::QueryTimeout))?;
             prepared.push(
-                tokio::time::timeout(remaining, catalog.prepare_reader_identity(table, tenant))
-                    .await
-                    .map_err(|_| AttemptFailure::Fatal(BifrostError::QueryTimeout))?
-                    .map_err(|error| AttemptFailure::Fatal(error.into_public()))?,
+                tokio::time::timeout(
+                    remaining,
+                    catalog.prepare_reader_identity(table, context.data_tenant_id),
+                )
+                .await
+                .map_err(|_| AttemptFailure::Fatal(BifrostError::QueryTimeout))?
+                .map_err(|error| AttemptFailure::Fatal(error.into_public()))?,
             );
         }
+        // The complete prepared set is the first trustworthy object list a
+        // decision can be taken on: every requested table now has a tenant-bound
+        // canonical binding and its stable registered UID. Authorizing here — and
+        // not one step later — means an out-of-scope caller never takes a reader
+        // guard, never drives revalidation, and never causes manifest or hot-cut
+        // source IO it could observe.
+        super::authorize_resolved_tables(context, &prepared).map_err(AttemptFailure::Fatal)?;
         let (guard, permit) = authority
             .acquire_guard(&prepared)
             .await
@@ -246,12 +264,12 @@ impl OraclePlanner {
     #[cfg(any(test, feature = "test-support"))]
     pub async fn protect_and_materialize_for_test(
         tables: &[TableRef],
-        tenant: wyrd_spec::DataTenantId,
+        context: &AuthorizedQueryContext,
         deadline: Instant,
         catalog: &BifrostCatalog,
         authority: &Arc<OracleReaderAuthority>,
     ) -> Result<usize, BifrostError> {
-        Self::protect_and_materialize(tables, tenant, deadline, catalog, Some(authority))
+        Self::protect_and_materialize(tables, context, deadline, catalog, Some(authority))
             .await
             .map(|protected| protected.cuts.len())
     }
@@ -361,7 +379,7 @@ impl OraclePlanner {
     /// from the physical root built on top of this cut.
     ///
     /// # Errors
-    /// Returns timeout, catalog, or byte-accounting failures.
+    /// Returns timeout, authorization, catalog, or byte-accounting failures.
     pub(super) async fn pin_cut(
         &self,
         context: &AuthorizedQueryContext,
@@ -380,14 +398,7 @@ impl OraclePlanner {
             guard,
             permit,
             cuts,
-        } = Self::protect_and_materialize(
-            tables,
-            context.data_tenant_id,
-            deadline,
-            catalog,
-            authority,
-        )
-        .await?;
+        } = Self::protect_and_materialize(tables, context, deadline, catalog, authority).await?;
         let hot_files = cuts.iter().map(|cut| cut.hot_files.len()).sum::<usize>();
         let iceberg_files = cuts
             .iter()

@@ -53,7 +53,7 @@ fn scheduled_context(tenant: DataTenantId) -> Result<AuthorizedQueryContext, Ser
         RequestId::now_v7(),
         None,
         AuthMethod::Internal,
-        permission.to_string(),
+        permission,
     )?)
 }
 
@@ -947,4 +947,261 @@ async fn await_clean_analytical(
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     Err(format!("a node still retained Analytical ownership: {last}").into())
+}
+
+/// Tenant-local roles reach exactly the Bifrost tables their scope names.
+///
+/// Both halves of the approved role matrix run against one real bound server
+/// through the public SDK, so the decision under test is the production one:
+/// the route admits the coarse Bifrost read capability, Oracle resolves the
+/// complete scan set from the catalog, and the object decision is taken against
+/// the resolved tables before any row is read.
+///
+/// The journey also proves the denial is durable: one refusal writes exactly one
+/// tenant-bound denial event and no accepted-read event, and a refusal whose own
+/// audit append fails is reported as audit-unavailable rather than as a plain
+/// rejection.
+///
+/// # Panics
+///
+/// Panics when a scoped role reaches a table it was not granted, is refused one
+/// it was granted, a refusal returns rows, or a refusal is not durably audited.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn tenant_scoped_roles_reach_only_their_granted_bifrost_tables() {
+    prove_object_scoped_role_matrix()
+        .await
+        .expect("object-scoped Bifrost role matrix journey");
+}
+
+/// Stable code a principal receives for a table its grants do not cover.
+const QUERY_FORBIDDEN: &str = "WYRD_VALA_403_QUERY_FORBIDDEN";
+/// Stable code substituted when a refusal's own audit append cannot commit.
+const AUDIT_UNAVAILABLE: &str = "WYRD_VALA_500_AUDIT_UNAVAILABLE";
+/// Audited operation name the public query route decides under.
+const QUERY_OPERATION: &str = "vala.query.sync";
+/// Audited operation name Oracle commits one accepted read decision under.
+const READ_DECISION_OPERATION: &str = "bifrost.query.read_decision";
+
+/// Non-sensitive projection of `vala.logs.records`.
+const LOGS_SQL: &str = "SELECT severity_text FROM vala.logs.records";
+/// Non-sensitive projection of `vala.traces.spans`.
+const TRACES_SQL: &str = "SELECT name FROM vala.traces.spans";
+/// One plan whose resolved scan set spans both schemas.
+const MIXED_SQL: &str = "SELECT r.severity_text, s.name \
+     FROM vala.logs.records r JOIN vala.traces.spans s ON r.trace_id = s.trace_id";
+
+/// Drives the complete `analyst` / `data_scientist` access matrix.
+///
+/// # Errors
+///
+/// Returns the first claim that broke.
+async fn prove_object_scoped_role_matrix() -> Result<(), ServerJourneyError> {
+    let server = WyrdTestServer::start_bound().await?;
+    let tenant = server.data_tenant_id();
+    let catalog = server
+        .state()
+        .bifrost_catalog()
+        .ok_or("server composed no Bifrost catalog")?;
+
+    // Both canonical built-ins exist before any grant is written: a grant names
+    // the UID the catalog assigned, so the registration is what the scope is
+    // derived from rather than a name the test invented.
+    let logs_uid = catalog
+        .ensure_builtin(
+            tenant,
+            vala_bifrost_redux::tables::builtin_table("logs", "records")
+                .ok_or("no canonical vala.logs.records definition")?,
+        )
+        .await?;
+    let spans_uid = catalog
+        .ensure_builtin(
+            tenant,
+            vala_bifrost_redux::tables::builtin_table("traces", "spans")
+                .ok_or("no canonical vala.traces.spans definition")?,
+        )
+        .await?;
+
+    let base = server.base_url().ok_or("missing HTTP URL")?.to_owned();
+    await_server_ready(&base).await?;
+
+    // `analyst` holds the whole `vala.logs` schema; `data_scientist` holds the
+    // single resolved `vala.traces.spans` UID and nothing else.
+    let analyst = scoped_client(
+        &server,
+        "analyst",
+        wyrd_runtime::PermissionScope::Bifrost(wyrd_runtime::BifrostPermissionScope::Schema(
+            wyrd_runtime::BifrostSchemaScope {
+                catalog: "vala".to_owned(),
+                schema: "logs".to_owned(),
+            },
+        )),
+    )
+    .await?;
+    let data_scientist = scoped_client(
+        &server,
+        "data_scientist",
+        wyrd_runtime::PermissionScope::Bifrost(wyrd_runtime::BifrostPermissionScope::Table(
+            wyrd_runtime::BifrostTableScope {
+                catalog: "vala".to_owned(),
+                schema: "traces".to_owned(),
+                table_uid: uuid::Uuid::from_bytes(*spans_uid.as_bytes()),
+            },
+        )),
+    )
+    .await?;
+
+    assert_ne!(
+        uuid::Uuid::from_bytes(*logs_uid.as_bytes()),
+        uuid::Uuid::from_bytes(*spans_uid.as_bytes()),
+        "the two built-ins must carry distinct registered identities"
+    );
+
+    accepts(&analyst, LOGS_SQL).await?;
+    refuses(&analyst, TRACES_SQL).await?;
+    refuses(&analyst, MIXED_SQL).await?;
+
+    accepts(&data_scientist, TRACES_SQL).await?;
+    refuses(&data_scientist, LOGS_SQL).await?;
+    refuses(&data_scientist, MIXED_SQL).await?;
+
+    // One public scoped-object denial is a durable, tenant-bound audit event.
+    // The principal passed coarse route admission, so without this the tenant's
+    // chain would hold no record that it repeatedly probed tables it does not
+    // hold. A denial must also never look like an accepted read.
+    let denials_before = audit_rows(&server, tenant, QUERY_OPERATION).await?;
+    let reads_before = audit_rows(&server, tenant, READ_DECISION_OPERATION).await?;
+    refuses(&analyst, TRACES_SQL).await?;
+    let denials_after = audit_rows(&server, tenant, QUERY_OPERATION).await?;
+    let reads_after = audit_rows(&server, tenant, READ_DECISION_OPERATION).await?;
+    if denials_after != denials_before + 1 {
+        return Err(format!(
+            "one scoped-object denial must write exactly one durable denial event, \
+             got {denials_before} -> {denials_after}"
+        )
+        .into());
+    }
+    if reads_after != reads_before {
+        return Err(format!(
+            "a denied object decision must write no accepted-read event, \
+             got {reads_before} -> {reads_after}"
+        )
+        .into());
+    }
+
+    // The denial fails closed on its own append: an unrecordable refusal is
+    // reported as audit-unavailable, never as a plain rejection.
+    server.fail_query_object_denial_audit();
+    refuses_with(&analyst, TRACES_SQL, AUDIT_UNAVAILABLE).await?;
+    server.restore_query_object_denial_audit();
+    refuses(&analyst, TRACES_SQL).await?;
+
+    server.shutdown().await?;
+    Ok(())
+}
+
+/// Seeds one tenant-local role at `scope` and returns a client bound to it.
+///
+/// The role exists only here. Neither name is a builtin: the matrix is a
+/// statement about scoped grants, not about Wyrd shipping an analyst role.
+///
+/// # Errors
+///
+/// Returns a role-seed, bootstrap, or client-construction failure.
+async fn scoped_client(
+    server: &WyrdTestServer,
+    role: &str,
+    scope: wyrd_runtime::PermissionScope,
+) -> Result<wyrd_client::WyrdClient, ServerJourneyError> {
+    server
+        .seed_role(
+            role,
+            &[Permission {
+                resource: wyrd_runtime::Resource::BifrostQuery,
+                action: wyrd_runtime::Action::Read,
+                scope,
+            }],
+        )
+        .await?;
+    let bootstrap = server
+        .bootstrap_service_in_tenant(server.data_tenant_id(), role, &[role])
+        .await?;
+    let api_key = bootstrap
+        .api_key()
+        .ok_or("the bootstrapped service carries no API key")?
+        .clone();
+    Ok(wyrd_client::WyrdClient::with_config(
+        wyrd_client::config::ClientConfig {
+            grpc: wyrd_client::transport::GrpcConfig {
+                endpoint: server.grpc_url().ok_or("missing gRPC URL")?,
+                connect_retries: 0,
+                ..wyrd_client::transport::GrpcConfig::default()
+            },
+            http: wyrd_client::transport::HttpConfig {
+                base_url: server.base_url().ok_or("missing HTTP URL")?.to_owned(),
+                ..wyrd_client::transport::HttpConfig::default()
+            },
+            credential: Some(api_key),
+            ..wyrd_client::config::ClientConfig::default()
+        },
+    )?)
+}
+
+/// Asserts one query is authorized and streams to completion.
+///
+/// # Errors
+///
+/// Returns the refusal when the granted table is denied, or the streaming
+/// failure when an authorized query cannot be drained.
+async fn accepts(client: &wyrd_client::WyrdClient, sql: &str) -> Result<(), ServerJourneyError> {
+    let mut stream = vala_sdk::query::QueryClient::new(client)
+        .query(&request(sql))
+        .await
+        .map_err(|error| format!("`{sql}` must be authorized: {error}"))?;
+    while stream.next_batch().await?.is_some() {}
+    Ok(())
+}
+
+/// Asserts one query is refused before its stream opens and returns no rows.
+///
+/// A refusal that arrives after an open stream has already told the caller the
+/// query was accepted, so the claim is specifically that the SDK never hands
+/// back a stream at all.
+///
+/// # Errors
+///
+/// Returns a failure when the query is accepted, or when it fails with anything
+/// other than the stable query-forbidden refusal.
+async fn refuses(client: &wyrd_client::WyrdClient, sql: &str) -> Result<(), ServerJourneyError> {
+    refuses_with(client, sql, QUERY_FORBIDDEN).await
+}
+
+/// Asserts one query is refused before its stream opens with the exact `code`.
+///
+/// # Errors
+///
+/// Returns a failure when the query is accepted, or when it fails with anything
+/// other than `code`.
+async fn refuses_with(
+    client: &wyrd_client::WyrdClient,
+    sql: &str,
+    code: &str,
+) -> Result<(), ServerJourneyError> {
+    match vala_sdk::query::QueryClient::new(client)
+        .query(&request(sql))
+        .await
+    {
+        Ok(mut stream) => {
+            let mut rows = 0_usize;
+            while let Some(batch) = stream.next_batch().await? {
+                rows += batch.num_rows();
+            }
+            Err(
+                format!("`{sql}` must be refused before its stream opens, streamed {rows} rows")
+                    .into(),
+            )
+        }
+        Err(vala_sdk::query::ValaSdkError::Transport(error)) if error.code() == code => Ok(()),
+        Err(other) => Err(format!("`{sql}` must be refused with {code}, got {other}").into()),
+    }
 }

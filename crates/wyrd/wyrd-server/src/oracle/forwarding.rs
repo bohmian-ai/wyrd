@@ -386,11 +386,11 @@ impl ReadyOracleForwarder {
     /// Validates the signed public-caller policy projection.
     fn validate_context(context: &AuthorizedQueryContext) -> Result<(), BifrostError> {
         if context.principal.tenant_id != context.data_tenant_id
-            || context.permission != Permission::bifrost_query_read().to_string()
-            || !context
-                .principal
-                .effective_permissions
-                .contains(&Permission::bifrost_query_read())
+            || context.permission != Permission::bifrost_query_read()
+            || !context.principal.effective_permissions.covers_operation(
+                &wyrd_runtime::Resource::BifrostQuery,
+                &wyrd_runtime::Action::Read,
+            )
         {
             return Err(BifrostError::QueryPeerSecurity);
         }
@@ -772,7 +772,7 @@ mod tests {
             RequestId::now_v7(),
             None,
             AuthMethod::Internal,
-            permission.to_string(),
+            permission,
         )
         .expect("tenant-bound query context");
         let request = BifrostQueryRequest {

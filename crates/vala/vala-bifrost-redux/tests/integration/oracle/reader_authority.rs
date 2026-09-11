@@ -2148,6 +2148,119 @@ async fn narrowing_retries_once_and_covered_duplicates_need_no_sql() {
         .expect("the epoch retires");
 }
 
+/// Builds one authorized query context holding exactly the supplied grants.
+///
+/// The principal is bound to `tenant`, because the object decision under test
+/// is never allowed to select or widen tenancy.
+fn query_context(
+    tenant: DataTenantId,
+    permissions: impl IntoIterator<Item = wyrd_runtime::Permission>,
+) -> vala_bifrost_redux::oracle::AuthorizedQueryContext {
+    let principal = wyrd_runtime::Principal {
+        id: wyrd_spec::auth::PrincipalId::new(Uuid::now_v7()),
+        kind: wyrd_runtime::PrincipalKind::User,
+        tenant_id: tenant,
+        roles: Vec::new(),
+        effective_permissions: wyrd_runtime::permission::PermissionSet::from_iter(permissions),
+    };
+    vala_bifrost_redux::oracle::AuthorizedQueryContext::try_new(
+        principal,
+        tenant,
+        wyrd_spec::request_id::RequestId::now_v7(),
+        None,
+        AuthMethod::Internal,
+        wyrd_runtime::Permission::bifrost_query_read(),
+    )
+    .expect("the principal and the extractor agree on the tenant")
+}
+
+/// Builds one authorized query context that covers every object.
+///
+/// Used by scenarios whose subject is protection or promotion rather than
+/// authorization, so the object axis cannot silently change what they prove.
+fn granted_context(tenant: DataTenantId) -> vala_bifrost_redux::oracle::AuthorizedQueryContext {
+    query_context(tenant, [wyrd_runtime::Permission::wildcard()])
+}
+
+/// Proves an uncovered table is refused before any reader guard or source IO.
+///
+/// The object decision has to happen on the prepared catalog identities, not on
+/// the materialized cut: materialization opens the gated Iceberg table, its
+/// manifests, and the hot-cut state, all of which an out-of-scope caller could
+/// otherwise drive and observe before being told it is forbidden. The sealed-pin
+/// counter is that observation — it must stay at zero for a denied set and rise
+/// for a granted one, through the exact same production sequence.
+///
+/// # Panics
+///
+/// Panics when a denied query materializes a cut, when the denial is not the
+/// stable query-forbidden refusal, or when a granted principal is refused.
+#[tokio::test]
+async fn object_denial_precedes_reader_guard_and_materialization() {
+    let fixture = forge_support::PromotionIntegrationFixture::start("reader_object_denial").await;
+    let (authority, _node, _fence) =
+        oracle_epoch(&fixture, "http://oracle-object-denial:5002", 1).await;
+    let tables = vec![fixture.binding.table_ref.clone()];
+
+    // A grant for some *other* table in the same catalog: the principal holds
+    // the coarse Bifrost read capability, so only the object axis can refuse it.
+    let elsewhere = wyrd_runtime::Permission {
+        resource: wyrd_runtime::Resource::BifrostQuery,
+        action: wyrd_runtime::Action::Read,
+        scope: wyrd_runtime::PermissionScope::Bifrost(wyrd_runtime::BifrostPermissionScope::Table(
+            wyrd_runtime::BifrostTableScope {
+                catalog: "vala".to_owned(),
+                schema: "logs".to_owned(),
+                table_uid: Uuid::now_v7(),
+            },
+        )),
+    };
+    vala_bifrost_redux::catalog::reset_sealed_pin_count_for_test();
+    let denied =
+        vala_bifrost_redux::oracle::planner::OraclePlanner::protect_and_materialize_for_test(
+            &tables,
+            &query_context(fixture.tenant, [elsewhere]),
+            std::time::Instant::now() + Duration::from_secs(30),
+            &fixture.catalog,
+            &authority,
+        )
+        .await
+        .expect_err("a table this principal does not hold is refused");
+    assert!(
+        matches!(denied, wyrd_spec::vala::error::BifrostError::QueryForbidden),
+        "the object refusal is the stable query-forbidden error: {denied:?}"
+    );
+    assert_eq!(
+        vala_bifrost_redux::catalog::sealed_pin_count_for_test(),
+        0,
+        "a denied query must not materialize a cut, open manifests, or read a source byte"
+    );
+
+    // The same sequence with the object granted still reaches normal planning.
+    vala_bifrost_redux::catalog::reset_sealed_pin_count_for_test();
+    let materialized =
+        vala_bifrost_redux::oracle::planner::OraclePlanner::protect_and_materialize_for_test(
+            &tables,
+            &granted_context(fixture.tenant),
+            std::time::Instant::now() + Duration::from_secs(30),
+            &fixture.catalog,
+            &authority,
+        )
+        .await
+        .expect("a granted principal materializes the complete set");
+    assert_eq!(materialized, tables.len());
+    assert_eq!(
+        vala_bifrost_redux::catalog::sealed_pin_count_for_test(),
+        tables.len(),
+        "the granted path is the same production sequence, not a bypass"
+    );
+
+    authority
+        .retire(retirement_deadline())
+        .await
+        .expect("the epoch retires");
+}
+
 /// Proves catalog promotion under a prepared reader identity is detected and
 /// restarts the complete admission rather than materializing a stale cut.
 ///
@@ -2215,7 +2328,7 @@ async fn catalog_promotion_between_prepare_and_materialize_restarts_all_tables()
     let materialized =
         vala_bifrost_redux::oracle::planner::OraclePlanner::protect_and_materialize_for_test(
             &tables,
-            fixture.tenant,
+            &granted_context(fixture.tenant),
             std::time::Instant::now() + Duration::from_secs(30),
             &fixture.catalog,
             &authority,
@@ -2246,7 +2359,7 @@ async fn catalog_promotion_between_prepare_and_materialize_restarts_all_tables()
     let error =
         vala_bifrost_redux::oracle::planner::OraclePlanner::protect_and_materialize_for_test(
             &tables,
-            fixture.tenant,
+            &granted_context(fixture.tenant),
             std::time::Instant::now() + Duration::from_secs(30),
             &fixture.catalog,
             &authority,

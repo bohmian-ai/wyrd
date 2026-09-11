@@ -35,7 +35,10 @@ pub enum PermissionDenyReason {
     /// permission.
     Rbac {
         /// Required permission.
-        required: Permission,
+        ///
+        /// Boxed because the permission now carries a typed object scope, and
+        /// this reason travels inside a `Result` error on every check.
+        required: Box<Permission>,
         /// Principal that failed the check.
         principal: PrincipalId,
     },
@@ -65,7 +68,7 @@ impl PermissionCheck for RbacCheck {
         } else {
             PermissionVerdict::Deny {
                 reason: PermissionDenyReason::Rbac {
-                    required: permission.clone(),
+                    required: Box::new(permission.clone()),
                     principal: principal.id,
                 },
             }
@@ -108,7 +111,7 @@ mod tests {
             verdict,
             PermissionVerdict::Deny {
                 reason: PermissionDenyReason::Rbac {
-                    required: Permission::card_write(),
+                    required: Box::new(Permission::card_write()),
                     principal: principal.id,
                 },
             }
@@ -143,7 +146,7 @@ mod tests {
         assert_eq!(PermissionVerdict::Allow.into_result(), Ok(()));
 
         let reason = PermissionDenyReason::Rbac {
-            required: Permission::card_write(),
+            required: Box::new(Permission::card_write()),
             principal: PrincipalId::new(uuid::Uuid::now_v7()),
         };
         let verdict = PermissionVerdict::Deny {
@@ -156,7 +159,7 @@ mod tests {
     #[test]
     fn deny_reason_carries_required_and_principal() {
         let reason = PermissionDenyReason::Rbac {
-            required: Permission::card_write(),
+            required: Box::new(Permission::card_write()),
             principal: PrincipalId::new(uuid::Uuid::now_v7()),
         };
 

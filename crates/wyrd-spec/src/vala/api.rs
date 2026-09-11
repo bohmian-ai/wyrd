@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::DataTenantId;
-use crate::auth::{PrincipalId, PrincipalKindTag};
+use crate::auth::{PermissionScope, PrincipalId, PrincipalKindTag};
 use crate::reference::CardRef;
 use crate::request_id::RequestId;
 pub use crate::vala::audit_detail::{
@@ -288,12 +288,17 @@ pub struct BifrostErrorDescriptor {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct BifrostPermissionDescriptor {
-    /// Permission string in `resource:action` format (e.g. `bifrost_table:read`).
+    /// Operation token in `resource:action` format (e.g. `bifrost_table:read`).
+    ///
+    /// Names the operation only. The object half of the grant is
+    /// [`Self::scope`]; there is no string spelling for an object.
     pub permission: String,
     /// Resource component (e.g. `bifrost_table`).
     pub resource: String,
     /// Action component (e.g. `read`).
     pub action: String,
+    /// Objects the permission reaches, as the typed RBAC scope.
+    pub scope: PermissionScope,
 }
 
 /// Time-partition granularity on the wire.

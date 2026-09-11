@@ -3809,7 +3809,7 @@ mod tests {
                 RequestId::now_v7(),
                 None,
                 AuthMethod::Internal,
-                "bifrost_query:read",
+                wyrd_runtime::Permission::bifrost_query_read(),
             )
             .expect("query context");
             let tripwire = TenantTripwireExec::new(
@@ -3878,7 +3878,7 @@ mod tests {
             RequestId::now_v7(),
             None,
             AuthMethod::Internal,
-            "bifrost_query:read",
+            wyrd_runtime::Permission::bifrost_query_read(),
         )
         .expect("query context");
         let source_union =
@@ -6380,7 +6380,7 @@ mod tests {
             RequestId::now_v7(),
             None,
             AuthMethod::Internal,
-            "bifrost_query:read",
+            wyrd_runtime::Permission::bifrost_query_read(),
         )
         .expect("query context");
         OracleTableProvider::try_new(OracleTableInputs {
@@ -6657,7 +6657,7 @@ mod tests {
             RequestId::now_v7(),
             None,
             AuthMethod::Internal,
-            "bifrost_query:read",
+            wyrd_runtime::Permission::bifrost_query_read(),
         )
         .expect("query context");
         let live_schema = Arc::new(Schema::new(vec![

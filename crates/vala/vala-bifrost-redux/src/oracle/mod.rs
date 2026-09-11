@@ -31,7 +31,10 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use vala_sql::ValaPostgres;
-use wyrd_runtime::{DelegationStep, Permission, Principal};
+use wyrd_runtime::{
+    BifrostPermissionScope, BifrostTableScope, DelegationStep, Permission, PermissionScope,
+    Principal,
+};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::BifrostError;
@@ -159,8 +162,15 @@ pub struct AuthorizedQueryContext {
     pub trace_id: Option<String>,
     /// Verified authentication method retained by the mandatory audit event.
     pub auth_method: AuthMethod,
-    /// Effective permission checked before the query entered Oracle.
-    pub permission: String,
+    /// Typed operation permission admitted before the query entered Oracle.
+    ///
+    /// Coarse route admission only. The authoritative object decision is taken
+    /// inside Oracle against the *resolved* table set, because parsed SQL names
+    /// are not an authorization boundary. This field therefore travels as the
+    /// typed [`Permission`] rather than as an object-free `resource:action`
+    /// string, and the scoped decision reaches distributed peers through the
+    /// permission digest built from the resolved tables.
+    pub permission: Permission,
     /// Verified initiator-first delegation chain, empty when the caller
     /// presented no `act` claim.
     ///
@@ -289,7 +299,7 @@ impl AuthorizedQueryContext {
         request_id: RequestId,
         trace_id: Option<String>,
         auth_method: AuthMethod,
-        permission: impl Into<String>,
+        permission: Permission,
     ) -> Result<Self, BifrostError> {
         if principal.tenant_id != data_tenant_id {
             return Err(BifrostError::QueryTenantInvariant);
@@ -300,7 +310,7 @@ impl AuthorizedQueryContext {
             request_id,
             trace_id,
             auth_method,
-            permission: permission.into(),
+            permission,
             delegation_chain: Vec::new(),
         })
     }
@@ -1183,7 +1193,7 @@ impl TestPostgresOracleAudit {
             context.principal.id,
             context.principal.kind.tag(),
             context.auth_method,
-            context.permission.clone(),
+            context.permission.to_string(),
             AuditDecision::Allow,
             result,
             "scrubbed Bifrost query decision".to_owned(),
@@ -2672,7 +2682,12 @@ impl Oracle {
             )?
             .as_str()
             .to_owned(),
-            permission_digest: audit_digest(&context.permission)?.as_str().to_owned(),
+            permission_digest: scoped_permission_digest(
+                &context.permission,
+                &resolved_table_scopes(&planned.cuts)?,
+            )?
+            .as_str()
+            .to_owned(),
         })
     }
 
@@ -3515,7 +3530,7 @@ impl Oracle {
             .planner
             .prepare_typed_cuts(
                 &plan,
-                context.data_tenant_id,
+                context,
                 options.deadline,
                 &self.catalog,
                 &self.reader_authority,
@@ -4657,7 +4672,10 @@ fn read_decision(
             cuts.iter().map(|cut| cut.hot_manifest_digest.as_str()),
         )?,
         projection_digest: audit_digest(sql)?,
-        permission_digest: audit_digest(&context.permission)?,
+        permission_digest: scoped_permission_digest(
+            &context.permission,
+            &resolved_table_scopes(cuts)?,
+        )?,
         execution: QueryExecutionMode::Local,
         selected_node_count: 1,
         worker_count: 0,
@@ -4714,7 +4732,10 @@ fn plan_read_decision(
         snapshot_digest,
         manifest_digest,
         projection_digest: audit_digest(&plan_text)?,
-        permission_digest: audit_digest(&context.permission)?,
+        permission_digest: scoped_permission_digest(
+            &context.permission,
+            &resolved_table_scopes(cuts)?,
+        )?,
         execution: QueryExecutionMode::Local,
         selected_node_count: 1,
         worker_count: 0,
@@ -4749,7 +4770,10 @@ fn authorize_payload_projection(
     let mut protected: Vec<(String, &'static [&'static str], Permission)> = Vec::new();
     for cut in cuts {
         let table_ref = &cut.binding.table_ref;
-        let Some(permission) = payload_permission(table_ref) else {
+        let Some(permission) = payload_permission(
+            table_ref,
+            resolved_table_scope(&cut.binding, &cut.table_uid)?,
+        ) else {
             continue;
         };
         let Some(definition) = table_ref
@@ -4823,7 +4847,10 @@ fn refuse_protected_scan(
 /// the doctrine names no metric payload permission, so it is deliberately not
 /// gated here: inventing a fifth permission would be a contract change rather
 /// than an implementation decision.
-fn payload_permission(table: &crate::catalog::TableRef) -> Option<Permission> {
+fn payload_permission(
+    table: &crate::catalog::TableRef,
+    scope: PermissionScope,
+) -> Option<Permission> {
     let resource = match (table.namespace.as_str(), table.name.as_str()) {
         ("vala.traces", "spans") => wyrd_runtime::Resource::BifrostTracePayload,
         ("vala.logs", "records") => wyrd_runtime::Resource::BifrostLogPayload,
@@ -4833,7 +4860,122 @@ fn payload_permission(table: &crate::catalog::TableRef) -> Option<Permission> {
     Some(Permission {
         resource,
         action: wyrd_runtime::Action::Read,
+        scope,
     })
+}
+
+/// Projects one catalog-resolved table binding into its RBAC object scope.
+///
+/// The scope is built from the *catalog identity*, never from SQL text: the
+/// flattened internal namespace `vala.<schema>` is split back into the logical
+/// catalog and schema a grant names, and the object identity is the registered
+/// [`TableUid`](crate::catalog::TableUid) the catalog resolved. An alias, a view
+/// expansion, or a second spelling of the same table therefore cannot present a
+/// different object to the checker.
+///
+/// A prepared identity and the sealed cut it later materializes into carry the
+/// same binding and UID, so both authorization stages name the same object.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::QueryForbidden`] when a resolved namespace does not
+/// split into a logical catalog and schema, which would leave the table with no
+/// nameable object identity and must fail closed.
+pub(super) fn resolved_table_scope(
+    binding: &crate::catalog::TenantTableBinding,
+    table_uid: &crate::catalog::TableUid,
+) -> Result<PermissionScope, BifrostError> {
+    let (catalog, schema) = binding
+        .table_ref
+        .namespace
+        .as_str()
+        .split_once('.')
+        .ok_or(BifrostError::QueryForbidden)?;
+    Ok(PermissionScope::Bifrost(BifrostPermissionScope::Table(
+        BifrostTableScope {
+            catalog: catalog.to_owned(),
+            schema: schema.to_owned(),
+            table_uid: uuid::Uuid::from_bytes(*table_uid.as_bytes()),
+        },
+    )))
+}
+
+/// Refuses the whole query unless every resolved table is individually granted.
+///
+/// This runs on the complete *prepared* scan set — direct tables, join inputs,
+/// and view expansions alike — which is the earliest point at which every
+/// requested table has a tenant-bound canonical binding and a stable UID. It
+/// therefore precedes reader-guard acquisition, catalog revalidation, cut
+/// materialization, provider registration, physical planning, admission,
+/// read-audit acceptance, peer dispatch, and any source IO. One uncovered
+/// table denies the query outright: there is no partial plan, no silently
+/// narrowed result, and no materialization work an out-of-scope caller can
+/// observe.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::QueryForbidden`] for the first resolved table the
+/// principal's effective permissions do not cover, and for any table whose
+/// catalog-resolved identity cannot be named.
+pub(super) fn authorize_resolved_tables(
+    context: &AuthorizedQueryContext,
+    prepared: &[crate::catalog::PreparedReaderIdentity],
+) -> Result<(), BifrostError> {
+    for identity in prepared {
+        let required = Permission {
+            resource: wyrd_runtime::Resource::BifrostQuery,
+            action: wyrd_runtime::Action::Read,
+            scope: resolved_table_scope(&identity.binding, &identity.table_uid)?,
+        };
+        if !context.principal.effective_permissions.contains(&required) {
+            tracing::warn!(
+                request_id = %context.request_id,
+                table = %identity.binding.table_ref,
+                "Oracle refused a query over a table this principal is not granted"
+            );
+            return Err(BifrostError::QueryForbidden);
+        }
+    }
+    Ok(())
+}
+
+/// Digests the coordinator's scoped decision and the exact tables it approved.
+///
+/// The digest binds the object axis, not just the operation: a peer that
+/// received this attempt can only reproduce the value from the same permission
+/// *and* the same ordered authorized table identities, so a worker cannot widen
+/// the approved table set without failing the existing digest comparison.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::QueryAuditUnavailable`] when the decision cannot be
+/// canonicalized or the digest falls outside the bounded audit contract.
+pub(super) fn scoped_permission_digest(
+    permission: &Permission,
+    scopes: &[PermissionScope],
+) -> Result<QueryAuditDigest, BifrostError> {
+    let mut rendered = scopes
+        .iter()
+        .map(|scope| serde_json::to_string(scope).map_err(|_| BifrostError::QueryAuditUnavailable))
+        .collect::<Result<Vec<_>, _>>()?;
+    rendered.sort_unstable();
+    let permission =
+        serde_json::to_string(permission).map_err(|_| BifrostError::QueryAuditUnavailable)?;
+    audit_digest(&format!("{permission}\n{}", rendered.join("\n")))
+}
+
+/// Projects every pinned table in one cut into its RBAC object identity.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::QueryForbidden`] when a pinned namespace carries no
+/// nameable catalog and schema.
+pub(super) fn resolved_table_scopes(
+    cuts: &[PinnedSealedTable],
+) -> Result<Vec<PermissionScope>, BifrostError> {
+    cuts.iter()
+        .map(|cut| resolved_table_scope(&cut.binding, &cut.table_uid))
+        .collect()
 }
 
 /// Collects scrubbed table-binding digests from a validated typed plan.
@@ -5364,6 +5506,120 @@ where
 mod tests {
     use super::participant_cut::tests::lease;
     use super::*;
+
+    /// Builds one Bifrost table scope for the supplied schema and UID.
+    fn table_scope(schema: &str, uid: uuid::Uuid) -> PermissionScope {
+        PermissionScope::Bifrost(BifrostPermissionScope::Table(BifrostTableScope {
+            catalog: "vala".to_owned(),
+            schema: schema.to_owned(),
+            table_uid: uid,
+        }))
+    }
+
+    /// Proves the sensitive-payload requirement carries the same resolved-table
+    /// object scope, and that the query grant for that table is a separate authority.
+    #[test]
+    fn payload_permission_requires_the_resolved_table_scope() {
+        let uid = uuid::Uuid::from_u128(5);
+        let scope = table_scope("logs", uid);
+        let permission = payload_permission(
+            &crate::catalog::TableRef::new(crate::namespaces::BifrostNamespace::Logs, "records"),
+            scope.clone(),
+        )
+        .expect("log records declare a payload permission");
+
+        assert_eq!(
+            permission.resource,
+            wyrd_runtime::Resource::BifrostLogPayload
+        );
+        assert_eq!(permission.action, wyrd_runtime::Action::Read);
+        assert_eq!(permission.scope, scope);
+
+        // The query grant for the same table is a separate authority: holding
+        // it does not hand the caller the sensitive payload columns.
+        let query_grant = Permission {
+            resource: wyrd_runtime::Resource::BifrostQuery,
+            action: wyrd_runtime::Action::Read,
+            scope: scope.clone(),
+        };
+        assert!(!query_grant.covers(&permission));
+
+        // A payload grant on another table does not travel to this one.
+        let other = Permission {
+            resource: wyrd_runtime::Resource::BifrostLogPayload,
+            action: wyrd_runtime::Action::Read,
+            scope: table_scope("logs", uuid::Uuid::from_u128(6)),
+        };
+        assert!(!other.covers(&permission));
+    }
+
+    /// Proves scope does not invent a payload gate: a table the doctrine names
+    /// no payload resource for still requires no payload permission.
+    #[test]
+    fn payload_permission_is_absent_for_ungated_tables() {
+        assert!(
+            payload_permission(
+                &crate::catalog::TableRef::new(
+                    crate::namespaces::BifrostNamespace::Metrics,
+                    "points"
+                ),
+                table_scope("metrics", uuid::Uuid::from_u128(7)),
+            )
+            .is_none(),
+            "the doctrine names no metric payload permission"
+        );
+    }
+
+    /// Proves the peer-verified digest binds both axes of the coordinator's
+    /// decision: the operation and the exact, order-independent approved table set.
+    #[test]
+    fn scoped_permission_digest_binds_the_authorized_table_set() {
+        let permission = Permission::bifrost_query_read();
+        let logs = table_scope("logs", uuid::Uuid::from_u128(1));
+        let traces = table_scope("traces", uuid::Uuid::from_u128(2));
+
+        let one = scoped_permission_digest(&permission, std::slice::from_ref(&logs))
+            .expect("one-table digest");
+        let widened = scoped_permission_digest(&permission, &[logs.clone(), traces])
+            .expect("two-table digest");
+
+        assert_ne!(
+            one, widened,
+            "adding a table to the approved set must change the digest a peer verifies"
+        );
+
+        // Order is not authority: the same set digests identically either way.
+        let forward = scoped_permission_digest(
+            &permission,
+            &[
+                table_scope("logs", uuid::Uuid::from_u128(1)),
+                table_scope("traces", uuid::Uuid::from_u128(2)),
+            ],
+        )
+        .expect("ordered digest");
+        let reversed = scoped_permission_digest(
+            &permission,
+            &[
+                table_scope("traces", uuid::Uuid::from_u128(2)),
+                table_scope("logs", uuid::Uuid::from_u128(1)),
+            ],
+        )
+        .expect("reordered digest");
+        assert_eq!(forward, reversed);
+
+        // The operation axis is bound too, not only the objects.
+        let narrower = scoped_permission_digest(
+            &Permission {
+                resource: wyrd_runtime::Resource::BifrostQuery,
+                action: wyrd_runtime::Action::Read,
+                scope: logs.clone(),
+            },
+            std::slice::from_ref(&logs),
+        )
+        .expect("scoped-permission digest");
+        assert_ne!(one, narrower);
+    }
+
     use arrow::array::{StringArray, UInt64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use chrono::Utc;

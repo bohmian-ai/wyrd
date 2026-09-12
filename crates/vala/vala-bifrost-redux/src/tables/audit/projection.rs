@@ -26,7 +26,11 @@ pub struct AuditProjection {
     /// Last sequence number in the contiguous range.
     pub seq_hi: i64,
     /// Stable idempotency key for the projected shipment.
-    pub batch_id: [u8; 16],
+    ///
+    /// Derived from the tenant and the frozen inclusive sequence range alone,
+    /// so every replica and every crash replay of the same frozen range
+    /// presents Scribe the same identity and lands on its durable batch fence.
+    pub batch_id: Uuid,
     /// The 13 content fields declared by [`AuditLogTable`], plus the
     /// `wyrd_event_time` the decision was stamped with in Postgres.
     pub rows: RecordBatch,
@@ -265,16 +269,29 @@ fn validate_enum<const N: usize>(
     }
 }
 
-fn derive_batch_id(tenant: DataTenantId, seq_lo: i64, seq_hi: i64) -> [u8; 16] {
+/// Derive the deterministic shipment key for one tenant audit range.
+///
+/// The digest covers only the tenant and the inclusive sequence bounds, which
+/// is exactly the state a restarted or competing publisher can reconstruct from
+/// the frozen in-flight bound. Scribe's fence requires the sortable-random
+/// version and variant bits, so only those are stamped over the digest prefix.
+///
+/// # Panics
+/// Never panics: a SHA-256 digest always yields the sixteen-byte prefix the
+/// `expect` names.
+fn derive_batch_id(tenant: DataTenantId, seq_lo: i64, seq_hi: i64) -> Uuid {
     let mut hasher = Sha256::new();
     hasher.update(AUDIT_PROJECTION_DOMAIN);
     hasher.update(tenant.as_uuid().as_bytes());
     hasher.update(seq_lo.to_be_bytes());
     hasher.update(seq_hi.to_be_bytes());
     let digest = hasher.finalize();
-    digest[..16]
+    let mut bytes: [u8; 16] = digest[..16]
         .try_into()
-        .expect("SHA-256 prefix has 16 bytes")
+        .expect("SHA-256 prefix has 16 bytes");
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
 }
 
 #[cfg(test)]

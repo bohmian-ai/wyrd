@@ -191,28 +191,151 @@ pub async fn list_publication_batch(
     .map_err(SqlError::from)
 }
 
-/// Advance the tenant watermark to `seq_hi` and delete every staged row through
-/// it, returning the rows actually drained.
+/// One frozen contiguous audit range owed to retained history.
 ///
-/// The caller MUST have observed a durable `vala.system.audit_log` publication
-/// for the whole range first. Both statements run in the caller's tenant
-/// transaction, so the watermark never advances without the deletion and the
-/// deletion never outruns the watermark. The watermark only ever moves forward,
-/// which makes the call idempotent: a replay after an uncertain outcome removes
-/// whatever survives and reports it, so a lost acknowledgement costs one
-/// replayed shipment rather than a lost or duplicated audit event.
+/// Both bounds are inclusive. The range is derived under tenant serialization
+/// and persisted as `vala.audit_chain_head.publishing_seq_hi`, so every
+/// concurrent or restarted publisher that observes the same in-flight bound
+/// projects the same rows and therefore the same batch identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuditPublicationRange {
+    /// First sequence number owed, always `published_seq + 1`.
+    pub seq_lo: i64,
+    /// Frozen inclusive upper bound of the batch currently owed.
+    pub seq_hi: i64,
+}
+
+/// Freeze, or reuse, the one contiguous range this tenant owes retained history.
+///
+/// The chain head is locked `FOR UPDATE` so two publishers cannot establish
+/// two different bounds. An existing `publishing_seq_hi` is reused verbatim —
+/// that is what makes a competing or restarted publisher derive the identical
+/// batch identity — and is otherwise established from the bounded staging
+/// prefix above the watermark. Returns `None` when the tenant has never
+/// appended an audit row or owes nothing, in which case the caller has no work
+/// and the tail stays empty.
+///
+/// The caller commits the short transaction before performing any Scribe IO:
+/// the bound is durable progress state, not a lease, so no owner token,
+/// deadline, or audit-chain lock travels with it.
 ///
 /// # Errors
-/// Returns [`SqlError`] when the watermark update or the delete fails, or RLS
+/// Returns [`SqlError`] when the locked read or the bound update fails, or RLS
+/// rejects the tenant's own chain head.
+pub async fn freeze_publication_range(
+    conn: &mut TenantConn<'_>,
+    limit: i64,
+) -> Result<Option<AuditPublicationRange>, SqlError> {
+    let frozen: Option<(i64, Option<i64>, bool)> = sqlx::query_as(
+        r#"
+        WITH head AS (
+            SELECT published_seq, publishing_seq_hi
+              FROM vala.audit_chain_head
+             WHERE data_tenant_id = wyrd.current_tenant()
+            FOR UPDATE
+        )
+        SELECT head.published_seq + 1,
+               COALESCE(
+                   head.publishing_seq_hi,
+                   (SELECT max(prefix.seq)
+                      FROM (
+                          SELECT seq
+                            FROM vala.audit_staging
+                           WHERE data_tenant_id = wyrd.current_tenant()
+                             AND seq > head.published_seq
+                           ORDER BY seq
+                           LIMIT $1
+                      ) prefix)
+               ),
+               head.publishing_seq_hi IS NOT NULL
+          FROM head
+        "#,
+    )
+    .bind(limit)
+    .fetch_optional(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)?;
+
+    let Some((seq_lo, Some(seq_hi), already_frozen)) = frozen else {
+        return Ok(None);
+    };
+    if !already_frozen {
+        sqlx::query(
+            r#"
+            UPDATE vala.audit_chain_head
+               SET publishing_seq_hi = $1, updated_at = now()
+             WHERE data_tenant_id = wyrd.current_tenant()
+            "#,
+        )
+        .bind(seq_hi)
+        .execute(&mut **conn.transaction())
+        .await
+        .map_err(SqlError::from)?;
+    }
+    Ok(Some(AuditPublicationRange { seq_lo, seq_hi }))
+}
+
+/// Read exactly the staged rows of one frozen inclusive audit range.
+///
+/// Reading the frozen range rather than a fresh bounded prefix is what keeps a
+/// growing staging tail out of an in-flight batch: rows above `seq_hi` are
+/// invisible here and wait for the next batch.
+///
+/// # Errors
+/// Returns [`SqlError`] when the range query fails or RLS rejects the read.
+pub async fn list_publication_range(
+    conn: &mut TenantConn<'_>,
+    range: AuditPublicationRange,
+) -> Result<Vec<AuditStagingRow>, SqlError> {
+    sqlx::query_as::<_, AuditStagingRow>(
+        r#"
+        SELECT data_tenant_id, seq, entry_hash, prev_hash, request_id, trace_id,
+               operation, resource, card_ref, principal_id, principal_kind,
+               permission, outcome, detail, created_at
+          FROM vala.audit_staging
+         WHERE data_tenant_id = wyrd.current_tenant()
+           AND seq BETWEEN $1 AND $2
+         ORDER BY seq
+        "#,
+    )
+    .bind(range.seq_lo)
+    .bind(range.seq_hi)
+    .fetch_all(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)
+}
+
+/// Settle one durably published range: advance the watermark, release the
+/// matching in-flight bound, and delete every staged row through the watermark.
+///
+/// The caller MUST have observed a durable `vala.system.audit_log` publication
+/// for the whole range first. All three effects run in the caller's tenant
+/// transaction, so the watermark never advances without the deletion and the
+/// bound is never released without the watermark.
+///
+/// Both the advance and the release are guarded so a stale completion is inert:
+/// `GREATEST` refuses to move the watermark backwards, and the bound is cleared
+/// only when it still equals `seq_hi`. A publisher whose acknowledgement was
+/// lost therefore replays the identical range into Scribe's batch fence and
+/// settles it again, removing whatever survives and reporting it, rather than
+/// losing or duplicating a retained event or clearing a newer batch's bound.
+///
+/// # Errors
+/// Returns [`SqlError`] when the chain-head update or the delete fails, or RLS
 /// rejects the range.
-pub async fn drain_through_watermark(
+pub async fn settle_publication(
     conn: &mut TenantConn<'_>,
     seq_hi: i64,
 ) -> Result<u64, SqlError> {
     sqlx::query(
         r#"
         UPDATE vala.audit_chain_head
-           SET published_seq = GREATEST(published_seq, $1), updated_at = now()
+           SET published_seq = GREATEST(published_seq, $1),
+               publishing_seq_hi = CASE
+                   WHEN publishing_seq_hi = $1 THEN NULL
+                   ELSE publishing_seq_hi
+               END,
+               updated_at = now()
          WHERE data_tenant_id = wyrd.current_tenant()
         "#,
     )

@@ -10,16 +10,24 @@
 -- 1. Per-tenant chain head. last_seq is the gapless high-water mark; head_hash
 --    is the entry_hash of row `last_seq` (32 zero bytes before the first row);
 --    published_seq is the watermark every staged row at or below has been
---    durably published into vala.system.audit_log and may be deleted through.
+--    durably published into vala.system.audit_log and may be deleted through;
+--    publishing_seq_hi is the single frozen upper bound of the one batch
+--    currently owed to retained history, so every concurrent or restarted
+--    publisher derives the same batch identity for `published_seq + 1
+--    .. publishing_seq_hi` until that batch settles. Rows appended above the
+--    frozen bound wait for the next batch.
 CREATE TABLE vala.audit_chain_head (
-    data_tenant_id  uuid   NOT NULL PRIMARY KEY REFERENCES platform.tenants(data_tenant_id),
-    last_seq        bigint NOT NULL DEFAULT 0,
-    published_seq   bigint NOT NULL DEFAULT 0,
-    head_hash       bytea  NOT NULL
+    data_tenant_id    uuid   NOT NULL PRIMARY KEY REFERENCES platform.tenants(data_tenant_id),
+    last_seq          bigint NOT NULL DEFAULT 0,
+    published_seq     bigint NOT NULL DEFAULT 0,
+    publishing_seq_hi bigint,
+    head_hash         bytea  NOT NULL
                         DEFAULT '\x0000000000000000000000000000000000000000000000000000000000000000'
                         CHECK (octet_length(head_hash) = 32),
-    updated_at      timestamptz NOT NULL DEFAULT now(),
-    CHECK (published_seq >= 0 AND published_seq <= last_seq)
+    updated_at        timestamptz NOT NULL DEFAULT now(),
+    CHECK (published_seq >= 0 AND published_seq <= last_seq),
+    CHECK (publishing_seq_hi IS NULL
+           OR (publishing_seq_hi > published_seq AND publishing_seq_hi <= last_seq))
 );
 
 ALTER TABLE vala.audit_chain_head ENABLE ROW LEVEL SECURITY;

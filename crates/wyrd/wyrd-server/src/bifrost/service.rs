@@ -10,49 +10,18 @@ use vala_bifrost_redux::catalog::{BifrostCatalogError, TableRef};
 use wyrd_runtime::Permission;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{
-    AuditOutcome, BifrostTableDescription, BifrostTableEntry, PhysicalLayoutWire, RegisterOutcome,
+    BifrostTableDescription, BifrostTableEntry, PhysicalLayoutWire, RegisterOutcome,
     RegisterTableRequest, RegisterTableResponse,
 };
-
-use wyrd_runtime::PermissionVerdict;
 
 use crate::AppState;
 use crate::audit;
 use crate::bifrost::convert;
 use crate::components::auth::Caller;
-use crate::http::error::permission_deny_reason_to_wyrd;
 
 /// Map a Redux catalog error to the public `WyrdError` via the single delegate.
 fn map_engine_error(error: BifrostCatalogError) -> WyrdError {
     error.into_public().into()
-}
-
-/// Authorize, appending a `decision = deny` audit row (own tx) on refusal.
-async fn authorize_audited(
-    state: &AppState,
-    caller: &Caller,
-    required: &Permission,
-    operation: &str,
-    resource: &str,
-) -> Result<(), WyrdError> {
-    match state
-        .authz
-        .permission_check
-        .check(&caller.principal, required)
-    {
-        PermissionVerdict::Allow => Ok(()),
-        PermissionVerdict::Deny { reason } => {
-            let event = audit::audit_event(
-                caller,
-                operation,
-                resource,
-                &required.to_string(),
-                AuditOutcome::Denied,
-            );
-            audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, &event).await?;
-            Err(permission_deny_reason_to_wyrd(reason))
-        }
-    }
 }
 
 /// Rejects a re-registration whose declared layout differs from the one the
@@ -98,6 +67,20 @@ fn assert_registered_layout_matches(
 ///
 /// Dataset registration requires `bifrost_table:write`. A matching-fingerprint re-register returns
 /// `AlreadyExists`; a conflicting schema is `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH`.
+///
+/// Exactly one canonical audit row records the verdict. A created table commits
+/// its `Allowed` row inside `register_dataset`'s own transaction; every branch
+/// that writes nothing — invalid namespace, absent catalog, already-exists,
+/// fingerprint or layout mismatch, engine failure — records the same row
+/// standalone before returning, so no received registration goes unaudited.
+///
+/// # Errors
+///
+/// Returns a permission error when the caller lacks `bifrost_table:write`,
+/// [`WyrdError::AuditUnavailable`] when the decision audit append fails,
+/// a validation error for a non-dataset namespace,
+/// [`wyrd_spec::vala::BifrostError::ScribeRoleUnavailable`] when this server
+/// carries no catalog, and the mapped catalog error otherwise.
 pub async fn register_table(
     state: &AppState,
     caller: Caller,
@@ -106,10 +89,36 @@ pub async fn register_table(
     let required = Permission::bifrost_table_write();
     let operation = "vala.bifrost.register";
     let fqn_for_audit = format!("{}.{}", body.namespace, body.name);
-    authorize_audited(state, &caller, &required, operation, &fqn_for_audit).await?;
+    // The allowed row is handed back rather than written here: the create branch
+    // commits it in the same transaction as the catalog row it authorizes. Every
+    // other branch performs no durable write, so it records the verdict itself
+    // before returning.
+    let allowed = audit::authorize_recording_denial(
+        state,
+        &caller,
+        &required,
+        operation,
+        &fqn_for_audit,
+    )
+    .await?;
+    let record_allowed = || async {
+        audit::record_audit(
+            state.postgres.vala_pool(),
+            caller.data_tenant_id,
+            &allowed,
+        )
+        .await
+    };
 
-    let ns = convert::namespace_from_wire(&body.namespace)?;
+    let ns = match convert::namespace_from_wire(&body.namespace) {
+        Ok(ns) => ns,
+        Err(error) => {
+            record_allowed().await?;
+            return Err(error);
+        }
+    };
     if ns != vala_bifrost_redux::namespaces::BifrostNamespace::Datasets {
+        record_allowed().await?;
         return Err(WyrdError::Validation {
             message: "only vala.datasets registrations are caller-owned".to_owned(),
             details: serde_json::json!({ "table": fqn_for_audit }),
@@ -120,14 +129,17 @@ pub async fn register_table(
 
     let fqn = format!("{}.{}", ns.as_str(), body.name);
     let table = TableRef::new(ns, body.name.clone());
-    let catalog = state
-        .bifrost
-        .catalog()
-        .ok_or(wyrd_spec::vala::BifrostError::ScribeRoleUnavailable)?
-        .as_ref();
+    let catalog = match state.bifrost.catalog() {
+        Some(catalog) => catalog.as_ref(),
+        None => {
+            record_allowed().await?;
+            return Err(wyrd_spec::vala::BifrostError::ScribeRoleUnavailable.into());
+        }
+    };
 
     match catalog.describe_table(&table, caller.data_tenant_id).await {
         Ok(existing) => {
+            record_allowed().await?;
             if existing.entry.fingerprint == fingerprint {
                 let stored_schema = catalog
                     .assignment_schema(&table, caller.data_tenant_id)
@@ -149,22 +161,15 @@ pub async fn register_table(
             }
         }
         Err(BifrostCatalogError::TableNotFound(_)) => {
-            // Audit the successful registration in the SAME tx as the catalog row
-            // (append happens inside `create_table` before its commit).
-            let event = audit::audit_event(
-                &caller,
-                operation,
-                &fqn,
-                &required.to_string(),
-                AuditOutcome::Allowed,
-            );
+            // The allowed row commits in the SAME tx as the catalog row
+            // (the append happens inside `create_table` before its commit).
             let table_uid = catalog
                 .register_dataset(
                     caller.data_tenant_id,
                     table,
                     user_fields,
                     body.physical_layout.clone(),
-                    Some(event),
+                    Some(allowed.clone()),
                 )
                 .await
                 .map_err(map_engine_error)?;
@@ -174,22 +179,25 @@ pub async fn register_table(
                 fingerprint,
             })
         }
-        Err(other) => Err(map_engine_error(other)),
+        Err(other) => {
+            record_allowed().await?;
+            Err(map_engine_error(other))
+        }
     }
 }
 
 /// List the tables visible to the caller's tenant (schema-free entries).
 ///
-/// Listing requires `bifrost_table:read`. A denial appends a canonical
-/// `decision = deny` row to tenant audit staging before the public 403 is
-/// returned, and is fail-closed: an audit-append failure refuses the read with
-/// `WYRD_VALA_500_AUDIT_UNAVAILABLE`. A successful list is an ordinary
-/// tenant-bound read and records no durable transition.
+/// Listing requires `bifrost_table:read`. Either verdict appends exactly one
+/// canonical row to tenant audit staging before the entries are returned or the
+/// public 403 is raised, and both are fail-closed: an audit-append failure
+/// refuses the read with `WYRD_VALA_500_AUDIT_UNAVAILABLE` rather than serving
+/// an unaudited list.
 ///
 /// # Errors
 ///
 /// Returns a permission error when the caller lacks `bifrost_table:read`,
-/// [`WyrdError::AuditUnavailable`] when the denial audit append fails,
+/// [`WyrdError::AuditUnavailable`] when the decision audit append fails,
 /// [`wyrd_spec::vala::BifrostError::ScribeRoleUnavailable`] when this server
 /// carries no catalog, or the mapped catalog error when the listing query
 /// fails.
@@ -197,7 +205,7 @@ pub async fn list_tables(
     state: &AppState,
     caller: Caller,
 ) -> Result<Vec<BifrostTableEntry>, WyrdError> {
-    authorize_audited(
+    audit::authorize(
         state,
         &caller,
         &Permission::bifrost_table_read(),
@@ -216,19 +224,19 @@ pub async fn list_tables(
 
 /// Describe a single table (entry plus its stored field list).
 ///
-/// Describing requires `bifrost_table:read`. A denial appends a canonical
-/// `decision = deny` row naming the requested fully qualified table before the
-/// public 403 is returned, and is fail-closed: an audit-append failure refuses
-/// the read. The audited resource is built from the request as received —
-/// authorization is decided before namespace validation so an unauthorized
-/// caller cannot distinguish a valid namespace from an invalid one — while the
-/// audit tenant always remains `caller.data_tenant_id`, never request payload.
-/// A successful describe records no durable transition.
+/// Describing requires `bifrost_table:read`. Either verdict appends exactly one
+/// canonical row naming the requested fully qualified table before the
+/// description is returned or the public 403 is raised, and both are
+/// fail-closed: an audit-append failure refuses the read. The audited resource
+/// is built from the request as received — authorization is decided before
+/// namespace validation so an unauthorized caller cannot distinguish a valid
+/// namespace from an invalid one — while the audit tenant always remains
+/// `caller.data_tenant_id`, never request payload.
 ///
 /// # Errors
 ///
 /// Returns a permission error when the caller lacks `bifrost_table:read`,
-/// [`WyrdError::AuditUnavailable`] when the denial audit append fails,
+/// [`WyrdError::AuditUnavailable`] when the decision audit append fails,
 /// a validation error for an unknown namespace,
 /// [`wyrd_spec::vala::BifrostError::ScribeRoleUnavailable`] when this server
 /// carries no catalog, and the mapped catalog error (including table-not-found)
@@ -240,7 +248,7 @@ pub async fn describe_table(
     name: String,
 ) -> Result<BifrostTableDescription, WyrdError> {
     let requested_fqn = format!("{namespace}.{name}");
-    authorize_audited(
+    audit::authorize(
         state,
         &caller,
         &Permission::bifrost_table_read(),
@@ -508,21 +516,29 @@ mod pg_tests {
                 "describe surfaces the user field"
             );
 
-            assert!(
-                audit_rows_for(&state, &caller, "bifrost.tables")
-                    .await
-                    .is_empty(),
-                "a permitted list records no durable audit transition"
+            let list_rows = audit_rows_for(&state, &caller, "bifrost.tables").await;
+            assert_eq!(
+                list_rows.len(),
+                1,
+                "a permitted list audits its own read verdict exactly once"
             );
+            assert_eq!(list_rows[0].operation, "vala.bifrost.list");
+            assert_eq!(list_rows[0].outcome, "allowed");
             let table_rows =
                 audit_rows_for(&state, &caller, &format!("vala.datasets.{name}")).await;
+            let operations: Vec<&str> = table_rows
+                .iter()
+                .map(|row| row.operation.as_str())
+                .collect();
             assert_eq!(
-                table_rows.len(),
-                1,
-                "only the registration is audited for this table"
+                operations,
+                vec!["vala.bifrost.register", "vala.bifrost.describe"],
+                "register and describe each audit their own verdict once"
             );
-            assert_eq!(table_rows[0].operation, "vala.bifrost.register");
-            assert_eq!(table_rows[0].outcome, "allowed");
+            assert!(
+                table_rows.iter().all(|row| row.outcome == "allowed"),
+                "both permitted verdicts are recorded as allowed"
+            );
         });
     }
 

@@ -305,6 +305,78 @@ async fn local_client_server_round_trip() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn storage_routes_refuse_and_audit_an_unprivileged_caller() {
+    if !enabled("WYRD_STORAGE_E2E") {
+        return;
+    }
+    let storage_root = tempfile::tempdir().expect("storage root creates");
+    let srv = server_from_settings(local_settings(storage_root.path())).await;
+    let service = srv
+        .bootstrap_service("storage-unprivileged", &[])
+        .await
+        .expect("bootstrap service without roles");
+    let token = srv
+        .exchange_api_key(service.api_key().expect("service API key"))
+        .await
+        .expect("exchange API key");
+    let client = client_for(&srv, &token);
+    let card_uid = CardUid::new(FIXED_CARD_UID).expect("card UID");
+
+    let error = client
+        .submit_with_idempotency_key::<_, UploadInitResponse>(
+            reqwest::Method::POST,
+            "/v1/cards/upload/init",
+            &UploadInitRequest {
+                card_uid: card_uid.clone(),
+                relative_path: "local/denied.bin".to_owned(),
+                expected_sha256: sha256_b64(b"denied"),
+                expected_size_bytes: 6,
+                content_type: None,
+            },
+            "storage-unprivileged-001",
+        )
+        .await
+        .expect_err("a principal without card:write cannot initialize an upload");
+    assert_eq!(error.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
+
+    let error = client
+        .submit::<_, DownloadInitResponse>(
+            reqwest::Method::POST,
+            "/v1/cards/download/init",
+            &DownloadInitRequest {
+                card_uid: card_uid.clone(),
+                relative_path: "local/denied.bin".to_owned(),
+            },
+        )
+        .await
+        .expect_err("a principal without card:read cannot plan a download");
+    assert_eq!(error.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
+
+    let mut conn = srv
+        .tenant_conn_for(srv.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let denials: Vec<(String, String)> = sqlx::query_as(
+        "SELECT operation, decision FROM vala.audit_staging \
+         WHERE operation IN ('storage.upload.init', 'storage.download.init') \
+         ORDER BY operation",
+    )
+    .fetch_all(&mut **conn.transaction())
+    .await
+    .expect("storage decision rows read");
+    conn.commit().await.expect("assertion transaction commits");
+    assert_eq!(
+        denials,
+        vec![
+            ("storage.download.init".to_owned(), "deny".to_owned()),
+            ("storage.upload.init".to_owned(), "deny".to_owned()),
+        ],
+        "each refused storage route audits its own denial exactly once"
+    );
+    srv.shutdown().await.expect("test server shuts down");
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn local_upload_capability_rejects_raw_paths_and_bad_bytes() {
     if !enabled("WYRD_STORAGE_E2E") {
         return;

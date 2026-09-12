@@ -15,7 +15,7 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 use tokio_util::io::ReaderStream;
-use wyrd_runtime::{Permission, PermissionCheck};
+use wyrd_runtime::Permission;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::IdempotencyKey;
 use wyrd_spec::storage::{
@@ -25,6 +25,7 @@ use wyrd_spec::storage::{
 use wyrd_storage::BackendConfig;
 use wyrd_storage::service::{self, StorageCaller};
 
+use crate::audit;
 use crate::components::auth::Caller;
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
@@ -54,7 +55,13 @@ async fn init(
     headers: HeaderMap,
     Json(body): Json<UploadInitRequest>,
 ) -> Result<Json<wyrd_spec::storage::UploadInitResponse>, WyrdErrorResponse> {
-    authorize_card_write(state.authz.permission_check.as_ref(), &caller)?;
+    authorize_card_write(
+        &state,
+        &caller,
+        "storage.upload.init",
+        &format!("card:{}", body.card_uid),
+    )
+    .await?;
     let idempotency_key = extract_idempotency_key(&headers)?;
     let storage_caller = storage_caller(&caller);
     service::upload_init(
@@ -82,8 +89,14 @@ async fn part_url(
     Path(id): Path<String>,
     Query(query): Query<PartUrlQuery>,
 ) -> Result<Json<PartUrlResponse>, WyrdErrorResponse> {
-    authorize_card_write(state.authz.permission_check.as_ref(), &caller)?;
     let upload_id = parse_upload_id(&id)?;
+    authorize_card_write(
+        &state,
+        &caller,
+        "storage.upload.part_url",
+        &format!("upload:{upload_id}"),
+    )
+    .await?;
     let storage_caller = storage_caller(&caller);
     service::upload_part_url(
         &state.storage,
@@ -109,9 +122,15 @@ async fn complete(
     headers: HeaderMap,
     Json(body): Json<UploadCompleteRequest>,
 ) -> Result<Json<wyrd_spec::storage::UploadCompleteResponse>, WyrdErrorResponse> {
-    authorize_card_write(state.authz.permission_check.as_ref(), &caller)?;
     let idempotency_key = extract_idempotency_key(&headers)?;
     let upload_id = parse_upload_id(&id)?;
+    authorize_card_write(
+        &state,
+        &caller,
+        "storage.upload.complete",
+        &format!("upload:{upload_id}"),
+    )
+    .await?;
     let storage_caller = storage_caller(&caller);
     service::upload_complete(
         &state.storage,
@@ -137,9 +156,15 @@ async fn abort(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<AbortResponse>, WyrdErrorResponse> {
-    authorize_card_write(state.authz.permission_check.as_ref(), &caller)?;
     let idempotency_key = extract_idempotency_key(&headers)?;
     let upload_id = parse_upload_id(&id)?;
+    authorize_card_write(
+        &state,
+        &caller,
+        "storage.upload.abort",
+        &format!("upload:{upload_id}"),
+    )
+    .await?;
     let storage_caller = storage_caller(&caller);
     service::upload_abort(
         &state.storage,
@@ -160,8 +185,14 @@ async fn local_blob(
     Path(id): Path<String>,
     body: Bytes,
 ) -> Result<Json<LocalBlobUploadResponse>, WyrdErrorResponse> {
-    authorize_card_write(state.authz.permission_check.as_ref(), &caller)?;
     let upload_id = parse_upload_id(&id)?;
+    authorize_card_write(
+        &state,
+        &caller,
+        "storage.upload.local_blob",
+        &format!("upload:{upload_id}"),
+    )
+    .await?;
     let storage_caller = storage_caller(&caller);
     service::upload_local_blob(
         &state.storage,
@@ -192,7 +223,13 @@ async fn download_init(
     caller: Caller,
     Json(body): Json<DownloadInitRequest>,
 ) -> Result<Json<wyrd_spec::storage::DownloadInitResponse>, WyrdErrorResponse> {
-    authorize_card_read(state.authz.permission_check.as_ref(), &caller)?;
+    authorize_card_read(
+        &state,
+        &caller,
+        "storage.download.init",
+        &format!("card:{}", body.card_uid),
+    )
+    .await?;
     let storage_caller = storage_caller(&caller);
     service::download_init(&state.storage, state.postgres.wyrd(), &storage_caller, body)
         .await
@@ -206,7 +243,13 @@ async fn download_local_blob(
     caller: Caller,
     Path(path): Path<String>,
 ) -> Result<Response, WyrdErrorResponse> {
-    authorize_card_read(state.authz.permission_check.as_ref(), &caller)?;
+    authorize_card_read(
+        &state,
+        &caller,
+        "storage.download.local_blob",
+        &format!("object:{path}"),
+    )
+    .await?;
     let (file, len) = service::download_local_blob(&state.storage, caller.data_tenant_id, path)
         .await
         .map_err(WyrdErrorResponse::from)?;
@@ -260,31 +303,40 @@ fn extract_idempotency_key(
         .map_err(WyrdErrorResponse::from)
 }
 
-/// Require the card-write permission for storage mutations.
-fn authorize_card_write(
-    check: &dyn PermissionCheck,
+/// Evaluate and audit the card-write permission for one storage mutation.
+///
+/// Storage routes own no transaction of their own — the service opens its own —
+/// so the verdict is recorded in its own tenant transaction before the mutation
+/// is dispatched, and an append failure refuses the request.
+async fn authorize_card_write(
+    state: &AppState,
     caller: &Caller,
+    operation: &str,
+    resource: &str,
 ) -> Result<(), WyrdErrorResponse> {
-    authorize(check, caller, Permission::card_write())
+    audit::authorize(
+        state,
+        caller,
+        &Permission::card_write(),
+        operation,
+        resource,
+    )
+    .await
+    .map_err(WyrdErrorResponse::from)
 }
 
-/// Require the card-read permission for storage reads.
-fn authorize_card_read(
-    check: &dyn PermissionCheck,
+/// Evaluate and audit the card-read permission for one storage read.
+///
+/// A permitted download is the moment a principal is allowed at the artifact
+/// bytes, so its decision row is written before any plan or stream is produced.
+async fn authorize_card_read(
+    state: &AppState,
     caller: &Caller,
+    operation: &str,
+    resource: &str,
 ) -> Result<(), WyrdErrorResponse> {
-    authorize(check, caller, Permission::card_read())
-}
-
-/// Evaluate one route capability against the already authenticated principal.
-fn authorize(
-    check: &dyn PermissionCheck,
-    caller: &Caller,
-    required: Permission,
-) -> Result<(), WyrdErrorResponse> {
-    check
-        .check(&caller.principal, &required)
-        .into_result()
+    audit::authorize(state, caller, &Permission::card_read(), operation, resource)
+        .await
         .map_err(WyrdErrorResponse::from)
 }
 
@@ -302,9 +354,6 @@ pub(crate) fn storage_caller(caller: &Caller) -> StorageCaller {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wyrd_runtime::{PermissionSet, Principal, PrincipalId, PrincipalKind};
-    use wyrd_spec::DataTenantId;
-    use wyrd_spec::request_id::RequestId;
 
     #[test]
     fn idempotency_key_rejects_non_utf8_header() {
@@ -330,40 +379,5 @@ mod tests {
         let err = extract_idempotency_key(&headers).expect_err("invalid key must fail");
 
         assert_eq!(err.0.status(), 400);
-    }
-
-    #[test]
-    fn local_blob_helpers_require_route_permissions() {
-        let caller = caller_with_permissions(PrincipalKind::User, []);
-
-        let check = wyrd_runtime::RbacCheck;
-        let read =
-            authorize_card_read(&check, &caller).expect_err("missing read permission must fail");
-        let write =
-            authorize_card_write(&check, &caller).expect_err("missing write permission must fail");
-
-        assert_eq!(read.0.status(), 403);
-        assert_eq!(write.0.status(), 403);
-    }
-
-    fn caller_with_permissions(
-        kind: PrincipalKind,
-        permissions: impl IntoIterator<Item = Permission>,
-    ) -> Caller {
-        let tenant = DataTenantId::new_v7();
-        Caller {
-            data_tenant_id: tenant,
-            principal: Principal::new(
-                PrincipalId::new(uuid::Uuid::now_v7()),
-                kind,
-                tenant,
-                vec![],
-                PermissionSet::from_iter(permissions),
-            ),
-            request_id: RequestId::parse(&uuid::Uuid::now_v7().to_string())
-                .expect("request id parses"),
-            // Nondelegated fixture caller: no verified `act` chain exists.
-            delegation_chain: Vec::new(),
-        }
     }
 }

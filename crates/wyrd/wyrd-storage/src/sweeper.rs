@@ -1,13 +1,14 @@
 //! Background cleanup for expired multipart upload control-plane rows.
 //!
 //! The sweeper is a server-tier worker. It uses the platform-admin pool to
-//! discover cross-tenant expired rows, then audits each row-level mutation under
-//! that row's tenant through a tenant-scoped connection.
+//! discover cross-tenant expired rows, then mutates each row under that row's
+//! tenant through a tenant-scoped connection. Reclamation evaluates no principal
+//! permission, so its durable record is the aborted upload row plus structured
+//! diagnostics, never a canonical audit event.
 
 use crate::env_parse::{parse_bool_optional, parse_clamped_i64, parse_u64_optional};
 use crate::error::StorageError;
-use crate::service::{StorageCaller, StoragePrincipalKind, StorageSubject};
-use crate::{StorageHandle, audit, tenant_path};
+use crate::{StorageHandle, tenant_path};
 use sqlx::pool::PoolConnection;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -15,8 +16,6 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
-use wyrd_spec::request_id::RequestId;
 use wyrd_spec::storage::{StorageBackendKind, WireProtocol};
 use wyrd_sql::{OperatorPool, WyrdPostgres};
 
@@ -98,14 +97,14 @@ impl Default for SweeperConfig {
 /// Coordinates cross-tenant storage discovery with tenant-scoped reclamation.
 ///
 /// Operator SQL discovers expired work and owns leader election. Each selected
-/// row is then mutated and audited through a tenant transaction opened by the
-/// Wyrd Postgres handle, preserving the app-role RLS and audit boundary.
+/// row is then mutated through a tenant transaction opened by the Wyrd Postgres
+/// handle, preserving the app-role RLS boundary.
 pub struct Sweeper {
     /// Storage backend used to abort abandoned provider-side uploads.
     handle: Arc<StorageHandle>,
     /// Cross-tenant capability used for leader election and expired-row discovery.
     operator_pool: OperatorPool,
-    /// App-role handle used to open tenant transactions for mutation and audit.
+    /// App-role handle used to open tenant transactions for row mutation.
     postgres: WyrdPostgres,
     /// Bounded scheduling and batch configuration for each cleanup pass.
     cfg: SweeperConfig,
@@ -276,15 +275,15 @@ impl Sweeper {
         }
     }
 
-    /// Abort one expired upload and atomically record its tenant audit outcome.
+    /// Abort one expired upload and commit its reclamation under that tenant.
     ///
     /// Backend abort happens before the tenant transaction. If the database
-    /// mutation or audit fails, a later tick may retry the idempotent backend
-    /// abort and the still-live control row.
+    /// mutation fails, a later tick may retry the idempotent backend abort and
+    /// the still-live control row.
     ///
     /// # Errors
     /// Returns [`StorageError`] when tenant validation, backend abort, tenant
-    /// transaction acquisition, status mutation, audit append, or commit fails.
+    /// transaction acquisition, status mutation, or commit fails.
     async fn abort_one(
         &self,
         row: &wyrd_sql::queries::storage::admin::multipart_uploads::ExpiredUpload,
@@ -368,47 +367,38 @@ impl Sweeper {
         if rows_updated == 0 {
             tracing::debug!(
                 upload_id = %row.id,
-                "sweeper race: upload completed before abort, skipping audit"
+                "sweeper race: upload completed before abort, skipping reclamation"
             );
             return Ok(());
         }
 
-        commit_reclamation(conn, data_tenant_id, row, backend, status_code, error_code).await
+        commit_reclamation(conn, row, backend, status_code, error_code).await
     }
 }
 
+/// Commit one reclaimed upload and record the reclamation as lineage.
+///
+/// Reclamation is a sweeper transition: it evaluates no principal permission,
+/// so the durable record it owes is the aborted upload row it just wrote plus
+/// structured diagnostics naming why the upload was reclaimed.
+///
+/// # Errors
+/// Returns [`StorageError::Sql`] when the reclamation transaction cannot commit.
 async fn commit_reclamation(
-    mut conn: wyrd_sql::TenantConn<'_>,
-    data_tenant_id: DataTenantId,
+    conn: wyrd_sql::TenantConn<'_>,
     row: &wyrd_sql::queries::storage::admin::multipart_uploads::ExpiredUpload,
     backend: StorageBackendKind,
     status_code: i32,
     error_code: Option<&str>,
 ) -> Result<(), StorageError> {
-    let caller = StorageCaller {
-        data_tenant_id,
-        subject: StorageSubject {
-            principal_id: PLATFORM_AUDIT_PRINCIPAL.as_uuid(),
-            kind: StoragePrincipalKind::Service,
-        },
-        request_id: RequestId::now_v7(),
-    };
-    audit::write(
-        &mut conn,
-        &caller,
-        audit::UploadAuditOperation::Reclaimed,
-        Some(row.id),
-        &row.storage_path,
-        backend,
+    tracing::info!(
+        upload_id = %row.id,
+        storage_path = %row.storage_path,
+        %backend,
         status_code,
-        error_code,
-    )
-    .await
-    .map_err(|error| StorageError::Backend {
-        backend,
-        op: "audit_reclaimed",
-        message: error.to_string(),
-    })?;
+        error_code = error_code.unwrap_or("unclassified"),
+        "sweeper reclaimed an expired upload"
+    );
     conn.commit().await.map_err(StorageError::Sql)
 }
 

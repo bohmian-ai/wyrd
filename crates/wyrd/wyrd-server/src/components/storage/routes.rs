@@ -15,7 +15,7 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 use tokio_util::io::ReaderStream;
-use wyrd_runtime::{Permission, PermissionCheck, PrincipalKind};
+use wyrd_runtime::{Permission, PermissionCheck};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::IdempotencyKey;
 use wyrd_spec::storage::{
@@ -23,7 +23,7 @@ use wyrd_spec::storage::{
     PartUrlResponse, UploadCompleteRequest, UploadId, UploadInitRequest,
 };
 use wyrd_storage::BackendConfig;
-use wyrd_storage::service::{self, StorageCaller, StoragePrincipalKind, StorageSubject};
+use wyrd_storage::service::{self, StorageCaller};
 
 use crate::components::auth::Caller;
 use crate::http::error::WyrdErrorResponse;
@@ -288,35 +288,22 @@ fn authorize(
         .map_err(WyrdErrorResponse::from)
 }
 
-/// Convert the authenticated caller into the storage service's typed subject.
+/// Convert the authenticated caller into the storage service's tenant context.
 ///
-/// The principal UUID is passed directly. Storage does not infer identity from
-/// a string prefix, and the caller's tenant and request ID are preserved for
-/// row-level isolation and audit attribution.
+/// Storage orchestration only needs the tenant its rows are isolated by; the
+/// route has already evaluated and audited the principal's permission, so no
+/// principal identity crosses into the storage crate.
 pub(crate) fn storage_caller(caller: &Caller) -> StorageCaller {
     StorageCaller {
         data_tenant_id: caller.data_tenant_id,
-        subject: StorageSubject {
-            principal_id: caller.principal.id.as_uuid(),
-            kind: match &caller.principal.kind {
-                PrincipalKind::User => StoragePrincipalKind::User,
-                PrincipalKind::Service { .. } => StoragePrincipalKind::Service,
-                PrincipalKind::Agent { .. } => StoragePrincipalKind::Agent,
-            },
-        },
-        request_id: caller.request_id.clone(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wyrd_runtime::{PermissionSet, Principal, PrincipalId};
-    use wyrd_semver::VersionBlock;
+    use wyrd_runtime::{PermissionSet, Principal, PrincipalId, PrincipalKind};
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::envelope::CardKind;
-    use wyrd_spec::ids::{CardName, SpaceName};
-    use wyrd_spec::reference::{CardRef, CardRefScope};
     use wyrd_spec::request_id::RequestId;
 
     #[test]
@@ -359,40 +346,6 @@ mod tests {
         assert_eq!(write.0.status(), 403);
     }
 
-    #[test]
-    fn storage_caller_maps_runtime_identity_without_string_prefixing() {
-        let user = caller_with_permissions(PrincipalKind::User, [Permission::card_read()]);
-        let service_ref = card_ref(CardKind::Service, "artifact-writer");
-        let service = caller_with_permissions(
-            PrincipalKind::Service {
-                card_ref: service_ref.clone(),
-                card_ref_scope: CardRefScope::own(&service_ref),
-            },
-            [Permission::card_write()],
-        );
-        let agent_ref = card_ref(CardKind::Agent, "artifact-agent");
-        let agent = caller_with_permissions(
-            PrincipalKind::Agent {
-                card_ref: agent_ref.clone(),
-                card_ref_scope: CardRefScope::own(&agent_ref),
-            },
-            [Permission::card_write()],
-        );
-
-        let user_storage = storage_caller(&user);
-        let service_storage = storage_caller(&service);
-        let agent_storage = storage_caller(&agent);
-
-        assert_eq!(user_storage.subject.kind, StoragePrincipalKind::User);
-        assert_eq!(service_storage.subject.kind, StoragePrincipalKind::Service);
-        assert_eq!(agent_storage.subject.kind, StoragePrincipalKind::Agent);
-        assert_eq!(
-            user_storage.subject.principal_id,
-            user.principal.id.as_uuid()
-        );
-        assert_eq!(user_storage.request_id, user.request_id);
-    }
-
     fn caller_with_permissions(
         kind: PrincipalKind,
         permissions: impl IntoIterator<Item = Permission>,
@@ -411,16 +364,6 @@ mod tests {
                 .expect("request id parses"),
             // Nondelegated fixture caller: no verified `act` chain exists.
             delegation_chain: Vec::new(),
-        }
-    }
-
-    fn card_ref(kind: CardKind, name: &str) -> CardRef {
-        CardRef {
-            kind,
-            name: CardName::new(name).expect("name"),
-            version: VersionBlock::parse("1.0.0").expect("version"),
-            space: Some(SpaceName::new("prod").expect("space")),
-            uid: None,
         }
     }
 }

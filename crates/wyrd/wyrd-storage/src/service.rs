@@ -12,7 +12,6 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::error::storage::WyrdStorageError;
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::ids::IdempotencyKey;
-use wyrd_spec::request_id::RequestId;
 use wyrd_spec::storage::{
     AbortResponse, AzureBlockBlobComplete, DownloadInitRequest, DownloadInitResponse, DownloadPlan,
     PartUrlResponse, S3MultipartComplete, StorageBackendKind, StoredObjectRef,
@@ -24,7 +23,6 @@ use wyrd_sql::queries::storage::multipart_uploads::{self, MultipartUploadRow, Up
 use wyrd_sql::{TenantConn, WyrdPostgres};
 
 use crate::StorageHandle;
-use crate::audit::{self, UploadAuditOperation};
 use crate::error::StorageError;
 use crate::plan::{MAX_OBJECT_SIZE_BYTES, PlannedUpload, plan_upload};
 use crate::signer::{CompletePayload, HeadInfo, MultipartInit, UploadPlanReplayInput};
@@ -33,35 +31,15 @@ use crate::tenant_path::{self, TenantPathError, ValidatedPath};
 const INIT_TTL_SECS: u64 = 24 * 60 * 60;
 const INIT_TTL_SECS_I64: i64 = 24 * 60 * 60;
 
-/// Storage-local principal-kind discriminant for audit identity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StoragePrincipalKind {
-    /// Human user principal.
-    User,
-    /// Service principal bound to a card.
-    Service,
-    /// Agent principal bound to a card.
-    Agent,
-}
-
-/// Typed audit subject for storage service operations.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StorageSubject {
-    /// Principal UUID identity.
-    pub principal_id: uuid::Uuid,
-    /// Principal kind discriminant.
-    pub kind: StoragePrincipalKind,
-}
-
 /// Request context needed by storage orchestration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageCaller {
     /// Tenant whose RLS-bound storage operation is executing.
+    ///
+    /// This is the only caller attribute storage orchestration consumes: every
+    /// row it writes is isolated by this tenant. Principal identity belongs to
+    /// the route that already evaluated and audited the permission decision.
     pub data_tenant_id: DataTenantId,
-    /// Typed subject for audit rows.
-    pub subject: StorageSubject,
-    /// Request id propagated to the storage access ledger.
-    pub request_id: RequestId,
 }
 
 struct StorageServiceState<'a> {
@@ -96,7 +74,6 @@ struct PriorAbort {
 }
 
 struct FailureContext<'a> {
-    operation: UploadAuditOperation,
     reason: &'a str,
     status_code: i32,
     error_code: Option<&'a str>,
@@ -171,7 +148,6 @@ pub async fn upload_init(
         counts,
     )
     .await?;
-    write_session_created(&mut conn, caller, upload_uuid, &validated.full, backend).await?;
     conn.commit().await.map_err(|error| map_sql_error(&error))?;
 
     if let Some(prior) = prior_abort {
@@ -217,33 +193,6 @@ pub async fn upload_init(
     })
 }
 
-/// Append the `session_created` transition for a freshly inserted upload row.
-///
-/// The audit append shares the row-insert transaction so an accepted upload
-/// session is never visible without its audit record.
-///
-/// # Errors
-/// Returns the audit write error when the staging append fails.
-async fn write_session_created(
-    conn: &mut TenantConn<'_>,
-    caller: &StorageCaller,
-    upload_uuid: Uuid,
-    storage_path: &str,
-    backend: StorageBackendKind,
-) -> Result<(), WyrdError> {
-    audit::write(
-        conn,
-        caller,
-        UploadAuditOperation::SessionCreated,
-        Some(upload_uuid),
-        storage_path,
-        backend,
-        201,
-        None,
-    )
-    .await
-}
-
 async fn persist_upload_init(
     postgres: &WyrdPostgres,
     caller: &StorageCaller,
@@ -253,11 +202,9 @@ async fn persist_upload_init(
         .tenant_conn(caller.data_tenant_id)
         .await
         .map_err(|error| map_sql_error(&error))?;
-    persist_s3_upload_id_and_audit(
+    persist_s3_upload_id(
         &mut conn,
-        caller,
         input.upload_uuid,
-        input.validated,
         input.backend,
         input.backend_upload_id,
     )
@@ -410,7 +357,7 @@ pub async fn upload_complete(
     verify_object_head(&state, caller, upload_uuid, &validated, &row, &head).await?;
 
     let mut conn = state.storage_tenant_conn(caller.data_tenant_id).await?;
-    persist_completed_upload(&mut conn, caller, upload_uuid, &validated, &row, &head).await?;
+    persist_completed_upload(&mut conn, upload_uuid, &validated, &row, &head).await?;
     conn.commit().await.map_err(|error| map_sql_error(&error))?;
 
     Ok(UploadCompleteResponse {
@@ -474,17 +421,6 @@ pub async fn upload_abort(
             Err(wyrd_sql::SqlError::Conflict { .. }) => false,
             Err(error) => return Err(map_sql_error(&error)),
         };
-    audit::write(
-        &mut conn,
-        caller,
-        UploadAuditOperation::Abort,
-        Some(upload_uuid),
-        &validated.full,
-        row.backend,
-        200,
-        None,
-    )
-    .await?;
     conn.commit().await.map_err(|error| map_sql_error(&error))?;
 
     Ok(AbortResponse { aborted })
@@ -575,20 +511,6 @@ pub async fn download_init(
     } else {
         request_ttl_secs
     };
-
-    let mut conn = state.storage_tenant_conn(caller.data_tenant_id).await?;
-    audit::write(
-        &mut conn,
-        caller,
-        UploadAuditOperation::Download,
-        None,
-        &validated.full,
-        metadata.backend,
-        200,
-        None,
-    )
-    .await?;
-    conn.commit().await.map_err(|error| map_sql_error(&error))?;
 
     Ok(DownloadInitResponse {
         plan: DownloadPlan { get_url, ttl_secs },
@@ -1006,7 +928,6 @@ async fn drive_backend_init_or_mark_failed(
                 validated,
                 state.storage.backend(),
                 FailureContext {
-                    operation: UploadAuditOperation::BackendFailed,
                     reason: "backend init failed",
                     status_code,
                     error_code: Some(&error_code),
@@ -1035,29 +956,25 @@ fn local_single_put_plan(
     })
 }
 
-async fn persist_s3_upload_id_and_audit(
+/// Move one freshly initialized upload into `pending`, keeping the backend id.
+///
+/// Only S3 hands back a multipart id worth persisting; every other backend
+/// reaches completion from the stored path alone. The transition is upload
+/// lifecycle state, not an authorization decision, so the row it writes is the
+/// only record it owes.
+///
+/// # Errors
+/// Returns the mapped SQL failure when the transition cannot be written.
+async fn persist_s3_upload_id(
     conn: &mut TenantConn<'_>,
-    caller: &StorageCaller,
     upload_uuid: Uuid,
-    validated: &ValidatedPath,
     backend: StorageBackendKind,
     backend_upload_id: &str,
 ) -> Result<(), WyrdError> {
     let persisted_backend_id = (backend == StorageBackendKind::S3).then_some(backend_upload_id);
     multipart_uploads::mark_pending(conn, upload_uuid, persisted_backend_id)
         .await
-        .map_err(|error| map_sql_error(&error))?;
-    audit::write(
-        conn,
-        caller,
-        UploadAuditOperation::BackendInitialized,
-        Some(upload_uuid),
-        &validated.full,
-        backend,
-        200,
-        None,
-    )
-    .await
+        .map_err(|error| map_sql_error(&error))
 }
 
 async fn cache_init_seed(
@@ -1192,7 +1109,6 @@ async fn complete_backend_upload(
             validated,
             row.backend,
             FailureContext {
-                operation: UploadAuditOperation::BackendFailed,
                 reason: "backend_complete_failed",
                 status_code,
                 error_code: Some(&error_code),
@@ -1229,7 +1145,6 @@ async fn verified_object_head(
                 validated,
                 row.backend,
                 FailureContext {
-                    operation: UploadAuditOperation::BackendFailed,
                     reason: "head_for_verification_failed",
                     status_code,
                     error_code: Some(&error_code),
@@ -1243,7 +1158,6 @@ async fn verified_object_head(
 
 async fn persist_completed_upload(
     conn: &mut TenantConn<'_>,
-    caller: &StorageCaller,
     upload_uuid: Uuid,
     validated: &ValidatedPath,
     row: &MultipartUploadRow,
@@ -1277,17 +1191,7 @@ async fn persist_completed_upload(
         // registered Card completion gets the durable verification marker.
         wyrd_sql::queries::cards::mark_manifest_verified(conn, &card_uid, upload_uuid).await?;
     }
-    audit::write(
-        conn,
-        caller,
-        UploadAuditOperation::Complete,
-        Some(upload_uuid),
-        &validated.full,
-        row.backend,
-        200,
-        None,
-    )
-    .await
+    Ok(())
 }
 
 async fn verify_object_head(
@@ -1318,7 +1222,6 @@ async fn verify_object_head(
             validated,
             row.backend,
             FailureContext {
-                operation: UploadAuditOperation::BackendFailed,
                 reason: "size_mismatch",
                 status_code,
                 error_code: Some(&error_code),
@@ -1338,7 +1241,6 @@ async fn verify_object_head(
             validated,
             row.backend,
             FailureContext {
-                operation: UploadAuditOperation::BackendFailed,
                 reason: "encryption_missing",
                 status_code,
                 error_code: Some(&error_code),
@@ -1366,17 +1268,15 @@ async fn mark_failed(
     multipart_uploads::mark_failed(&mut conn, upload_uuid, ctx.reason)
         .await
         .map_err(|error| map_sql_error(&error))?;
-    audit::write(
-        &mut conn,
-        caller,
-        ctx.operation,
-        Some(upload_uuid),
-        &validated.full,
-        backend,
-        ctx.status_code,
-        ctx.error_code,
-    )
-    .await?;
+    tracing::warn!(
+        upload_id = %upload_uuid,
+        storage_path = %validated.full,
+        %backend,
+        status_code = ctx.status_code,
+        error_code = ctx.error_code.unwrap_or("unclassified"),
+        reason = ctx.reason,
+        "upload failed"
+    );
     conn.commit().await.map_err(|error| map_sql_error(&error))
 }
 

@@ -84,13 +84,12 @@ mod pg_tests {
         assert_upload_status(operator_pool.pool(), expired_pending, "aborted").await;
         assert_upload_status(operator_pool.pool(), orphan_initiating, "aborted").await;
         assert_upload_status(operator_pool.pool(), live_pending, "pending").await;
-        assert_audit_count(fixture.app_pool(), tenant, 3).await;
         assert_idempotency_count(operator_pool.pool(), "expired-key", 0).await;
         assert_idempotency_count(operator_pool.pool(), "live-key", 1).await;
     }
 
     #[tokio::test]
-    async fn sweeper_skips_audit_when_upload_already_completed() {
+    async fn sweeper_skips_reclamation_when_upload_already_completed() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let operator_pool = fixture.operator_pool().clone();
         let tenant = fixture.data_tenant_id();
@@ -128,7 +127,7 @@ mod pg_tests {
 
         sweeper.tick().await.expect("tick runs");
 
-        assert_audit_count(fixture.app_pool(), tenant, 0).await;
+        assert_upload_status(operator_pool.pool(), upload_id, "completed").await;
     }
 
     async fn local_storage_handle() -> std::sync::Arc<StorageHandle> {
@@ -262,29 +261,6 @@ mod pg_tests {
         .expect("fetch upload status");
 
         assert_eq!(status, expected);
-    }
-
-    async fn assert_audit_count(
-        app_pool: &sqlx::PgPool,
-        tenant: wyrd_spec::DataTenantId,
-        expected: i64,
-    ) {
-        let mut conn = wyrd_sql::TenantConn::acquire(app_pool, tenant)
-            .await
-            .expect("tenant conn");
-        let count = sqlx::query_scalar::<_, i64>(
-            r"
-        SELECT count(*)
-        FROM vala.audit_staging
-        WHERE data_tenant_id = wyrd.current_tenant()
-          AND operation = 'storage.reclaimed'
-        ",
-        )
-        .fetch_one(&mut **conn.transaction())
-        .await
-        .expect("fetch audit count");
-
-        assert_eq!(count, expected);
     }
 
     async fn assert_idempotency_count(admin_pool: &sqlx::PgPool, key: &str, expected: i64) {

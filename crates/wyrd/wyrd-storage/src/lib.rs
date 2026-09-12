@@ -30,7 +30,6 @@ pub mod signer;
 pub mod sweeper;
 pub mod tenant_path;
 
-mod audit;
 mod telemetry;
 
 #[cfg(feature = "cloud")]
@@ -41,7 +40,7 @@ pub use error::{AzureError, ConfigParseError, GcsError, LocalError, S3Error, Sto
 pub use handle::{StorageHandle, StorageHealthError};
 pub use local::LocalSigner;
 pub use plan::{PlanError, PlannedUpload, plan_upload};
-pub use service::{StorageCaller, StoragePrincipalKind, StorageSubject};
+pub use service::StorageCaller;
 pub use settings::{BackendConfig, StorageSettings};
 pub use signer::{BackendSigner, CompletePayload, HeadInfo, MultipartInit, UploadPlanReplayInput};
 pub use tenant_path::{TenantPathError, ValidatedPath};

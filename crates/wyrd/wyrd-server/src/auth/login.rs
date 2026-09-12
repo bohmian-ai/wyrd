@@ -9,9 +9,7 @@ use wyrd_spec::auth::IssuerUrl;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::TenantSlug;
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::AuditOutcome;
 
-use crate::audit;
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
@@ -24,11 +22,11 @@ pub struct LoginQuery {
 
 /// Handler for `GET /auth/login`.
 ///
-/// Emits one unauthenticated audit row (attributed to `PLATFORM_AUDIT_PRINCIPAL`)
-/// for every attempt — success or deny — before returning. Fail-closed: if the
-/// audit append fails, the login is refused rather than proceeding silently.
-/// Resolved-tenant attempts write to that tenant's audit log; unresolved-tenant
-/// attempts (unknown/inactive tenant) write to the platform stream (system tenant).
+/// Login initiation evaluates no principal permission — it answers "who is
+/// calling?", not "may they do this?" — so it appends no canonical audit event.
+/// A refused attempt is recorded as structured diagnostics instead, and the
+/// durable record of the session it goes on to establish belongs to the
+/// authentication tables, not to the authorization chain.
 #[tracing::instrument(level = "debug", skip(state, headers, maybe_request_id), fields(issuer = %query.issuer))]
 pub async fn login(
     State(state): State<AppState>,
@@ -39,50 +37,22 @@ pub async fn login(
     let request_id = maybe_request_id
         .map(|Extension(id)| id)
         .unwrap_or_else(RequestId::now_v7);
-    // Attempt tenant resolution. Capture the result so we can emit audit
-    // regardless of outcome before returning.
-    let tenant_result = resolve_login_tenant(&state, &headers).await;
-    let tenant_id = match &tenant_result {
-        Ok(id) => Some(*id),
-        Err(_) => None,
-    };
-
-    // Attempt the actual login only if tenant resolved.
-    let login_result = if let Some(tid) = tenant_id {
-        let r = try_initiate_login(&state, &headers, &query, tid).await;
-        Some(r)
-    } else {
-        None
-    };
-
-    // A login attempt is admitted only when its tenant resolves and initiation
-    // succeeds; either refusal is the boundary denying the attempt.
-    let decision = match (&tenant_result, &login_result) {
-        (Err(_), _) | (_, Some(Err(_))) => AuditOutcome::Denied,
-        _ => AuditOutcome::Allowed,
-    };
-
-    let audit_event = audit::audit_event_unauthenticated(
-        request_id,
-        "auth.login.initiate",
-        &format!("issuer:{}", query.issuer),
-        "auth:login",
-        decision,
-    );
-
-    // Route audit to tenant log (resolved) or platform stream (unresolved).
-    let audit_tenant = tenant_id.unwrap_or(DataTenantId::SYSTEM_OWNER);
-    audit::record_audit(state.postgres.app_pool(), audit_tenant, &audit_event)
+    let tenant_id = resolve_login_tenant(&state, &headers).await.inspect_err(|_| {
+        tracing::info!(
+            request_id = %request_id,
+            issuer = %query.issuer,
+            "login attempt refused: tenant did not resolve"
+        );
+    })?;
+    try_initiate_login(&state, &headers, &query, tenant_id)
         .await
-        .map_err(WyrdErrorResponse::from)?;
-
-    // Now surface the original login result.
-    tenant_result?;
-    match login_result {
-        Some(Ok(response)) => Ok(response),
-        Some(Err(e)) => Err(e),
-        None => unreachable!("tenant_result was Ok above"),
-    }
+        .inspect_err(|_| {
+            tracing::info!(
+                request_id = %request_id,
+                issuer = %query.issuer,
+                "login initiation refused"
+            );
+        })
 }
 
 async fn try_initiate_login(

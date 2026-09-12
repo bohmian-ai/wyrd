@@ -154,9 +154,10 @@ impl AuditPublisher {
         &self,
         tenant: DataTenantId,
     ) -> Result<PublishOutcome, AuditPublicationError> {
-        let Some(range) = self.publish_frozen_range(tenant).await? else {
+        let Some(range) = self.freeze(tenant).await? else {
             return Ok(PublishOutcome::Idle);
         };
+        self.publish_range(tenant, range).await?;
         let retired = self.settle(tenant, range.seq_hi).await?;
         Ok(PublishOutcome::Published {
             seq_lo: range.seq_lo,
@@ -165,31 +166,28 @@ impl AuditPublisher {
         })
     }
 
-    /// Freeze the tenant's owed range and durably append exactly it, without settling.
+    /// Durably append exactly one frozen range, without freezing or settling.
     ///
-    /// This is the half of a cycle that must survive being repeated: the frozen
-    /// bound is persisted before the append and reused verbatim afterwards, so a
-    /// competing replica or a restart after an uncertain append re-derives the
-    /// same tenant, bounds, and batch identity and lands on Scribe's durable
-    /// batch fence instead of duplicating retained history. Rows appended above
-    /// the frozen bound are not read and wait for the next batch.
-    ///
-    /// Returns `None` when the tenant owes nothing.
+    /// This is the half of a cycle that must survive being repeated. Because
+    /// `range` comes from the persisted in-flight bound, a competing replica or
+    /// a restart after an uncertain append re-derives the same tenant and
+    /// bounds, projects the same rows, and therefore presents the same batch
+    /// identity — landing on Scribe's durable batch fence instead of
+    /// duplicating retained history. Rows appended above `seq_hi` are not read
+    /// and wait for the next batch.
     ///
     /// # Errors
-    /// Returns [`AuditPublicationError::Outbox`] when freezing or reading the
-    /// range fails, or when a frozen bound has no staged rows — which cannot
-    /// happen while staging is only deleted through the watermark;
+    /// Returns [`AuditPublicationError::Outbox`] when reading the range fails,
+    /// or when the range has no staged row — which cannot happen while staging
+    /// is only deleted through the watermark;
     /// [`AuditPublicationError::Projection`] for non-contiguous or invalid
     /// content; and [`AuditPublicationError::Publish`] when Scribe refuses the
     /// append.
-    pub async fn publish_frozen_range(
+    pub async fn publish_range(
         &self,
         tenant: DataTenantId,
-    ) -> Result<Option<AuditPublicationRange>, AuditPublicationError> {
-        let Some(range) = self.freeze(tenant).await? else {
-            return Ok(None);
-        };
+        range: AuditPublicationRange,
+    ) -> Result<(), AuditPublicationError> {
         let rows = self.read_range(tenant, range).await?;
         if rows.is_empty() {
             return Err(AuditPublicationError::Outbox(format!(
@@ -214,7 +212,7 @@ impl AuditPublisher {
             })
             .await
             .map_err(|error| AuditPublicationError::Publish(format!("{error:?}")))?;
-        Ok(Some(range))
+        Ok(())
     }
 
     /// Freeze, or reuse, the one range this tenant owes retained history.

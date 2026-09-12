@@ -3,7 +3,7 @@ id: TASK-005
 kind: implementation
 status: ready
 spec: SPEC-surfaces-oracle-integration
-spec_revision: 6
+spec_revision: 7
 requirements: [REQ-026, REQ-026A, REQ-026B, REQ-027, REQ-027A, REQ-027B, REQ-028, REQ-029, REQ-030, REQ-030A, INV-008, INV-008A, INV-008B, INV-008C, AC-005, AC-017]
 depends_on: []
 parent_task: TASK-001
@@ -17,9 +17,9 @@ The completed flow audits both allowed and denied permission checks before the
 operation proceeds or refuses, publishes a minimal verifiable retained ledger,
 and makes self-referential audit publication structurally impossible.
 
-Implement this task when the paused, in-progress TASK-001 resumes, against the
-same integration branch and before TASK-001 closeout. Do not schedule or execute
-TASK-005 independently.
+Implement this task against TASK-001's completed integration result while its
+closeout is paused. TASK-005 must finish before TASK-006 and TASK-001 closeout;
+do not restart or reimplement TASK-001.
 
 ## Constraints
 
@@ -32,8 +32,9 @@ TASK-005 independently.
 - Oracle query admission remains the sole WAL-first exception. No other engine
   transition becomes an audit event.
 - Reuse the existing Scribe and Forge publication path. Do not add a write mode,
-  direct Iceberg writer, audit-specific sizing mechanism, scheduler, historical
-  table, or compatibility migration for unshipped audit state.
+  direct Iceberg writer, audit-specific sizing mechanism, scheduler, or
+  historical table. Audit state is unshipped: edit its existing schema
+  definition in place without a migration, compatibility path, or backfill.
 - Do not add test cases or test files. Update existing fixtures or assertions
   only where the changed contracts require it, then use existing verification.
 

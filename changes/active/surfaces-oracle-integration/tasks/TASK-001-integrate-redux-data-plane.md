@@ -3,8 +3,8 @@ id: TASK-001
 kind: implementation
 status: implemented
 spec: SPEC-surfaces-oracle-integration
-spec_revision: 6
-requirements: [REQ-001, REQ-002, REQ-003, REQ-010, REQ-011, REQ-012, REQ-013, REQ-014, REQ-015, REQ-026, REQ-026A, REQ-026B, REQ-027, REQ-027A, REQ-027B, REQ-028, REQ-029, REQ-030, REQ-030A, REQ-048, REQ-049, REQ-050, REQ-051, REQ-052, REQ-053, REQ-053A, REQ-054, REQ-062, REQ-063, INV-002, INV-003, INV-007, INV-008, INV-008A, INV-008B, INV-008C, INV-009, INV-017, INV-018, INV-019, INV-020, INV-021, INV-023, AC-005, AC-006, AC-011, AC-012, AC-013, AC-014, AC-015, AC-016, AC-017, AC-020]
+spec_revision: 7
+requirements: [REQ-001, REQ-002, REQ-003, REQ-010, REQ-011, REQ-012, REQ-013, REQ-014, REQ-015, REQ-026, REQ-026A, REQ-026B, REQ-027, REQ-027A, REQ-027B, REQ-027C, REQ-028, REQ-029, REQ-030, REQ-030A, REQ-048, REQ-049, REQ-050, REQ-051, REQ-052, REQ-053, REQ-053A, REQ-054, REQ-062, REQ-063, INV-002, INV-003, INV-007, INV-008, INV-008A, INV-008B, INV-008C, INV-008D, INV-009, INV-017, INV-018, INV-019, INV-020, INV-021, INV-023, AC-005, AC-006, AC-011, AC-012, AC-013, AC-014, AC-015, AC-016, AC-017, AC-020]
 depends_on: []
 parent_task:
 remediates: []
@@ -18,9 +18,9 @@ outcome has one Redux engine owning Gate, Scribe, Oracle, incorporated Forge,
 canonical telemetry, query execution, maintenance, recovery, and retained
 audit publication; legacy `vala-bifrost` is gone in full.
 
-This task is paused during closeout, not awaiting a fresh implementation start.
-When resumed, continue from the existing integrated work, implement child
-TASK-005 followed by TASK-006, and only then finish TASK-001 closeout.
+TASK-001 implementation is complete; only its closeout is paused. Do not
+restart or reimplement this task. Implement child TASK-005 followed by TASK-006
+against the existing integrated result, and only then resume TASK-001 closeout.
 
 ## Constraints
 
@@ -73,9 +73,9 @@ Paths are ownership guidance, not a private implementation allowlist.
    fail-closed readiness behavior.
 6. Converge OTLP and canonical Arrow writes on the three canonical signal
    tables with trusted attribution and SQL-only reads.
-7. Resume the paused closeout by implementing TASK-005's authorization-only
-   audit flow, then TASK-006's frozen-range coordination and direct-Scribe
-   publication, before completing the remaining integration evidence.
+7. Keep closeout paused while TASK-005 implements the authorization-only audit
+   flow and TASK-006 implements frozen-range coordination and direct-Scribe
+   publication; then complete the remaining integration evidence.
 
 ## Acceptance Criteria
 
@@ -105,7 +105,7 @@ Paths are ownership guidance, not a private implementation allowlist.
   after durable publication.
 - Scoped-role, cross-tenant, audit-unavailable, replay, backpressure,
   cancellation, peer-failure, restart, and cleanup journeys fail or recover
-  exactly as revision 6 requires.
+  exactly as revision 7 requires.
 
 ## Verification
 
@@ -233,7 +233,7 @@ withdrawn, and the remaining audit work in this task is defined by TASK-005
 rather than by items 1 and 2 of Remaining. TASK-006 then closes the changing-
 tail replay and Gate-bypass gaps discovered in that publication flow.
 
-Revision 6 and the required architecture direction are approved. Resume from
+Revision 7 and the required architecture direction are approved. Resume from
 the existing in-progress work; do not restart TASK-001 or repeat completed
 integration steps. Implement and verify TASK-005, then TASK-006, then continue
 items 3–6 under Remaining and finish TASK-001 closeout.

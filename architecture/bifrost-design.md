@@ -454,16 +454,31 @@ Python, TypeScript, and MCP.
 The tenant hash-chain `vala.audit_staging` is transient transactional
 write-ahead state, not retained audit history, and not an outbox: it has no
 external consumer. Contiguous tenant-scoped ranges are read by a per-tenant
-watermark and projected idempotently through the current Scribe and Forge
-publication path into the tenant-qualified `vala.system.audit_log` Bifrost
-table. That table is the authoritative retained audit history.
+watermark and projected idempotently through the owning local Scribe and the
+Forge publication path into the tenant-qualified `vala.system.audit_log` Bifrost
+table. That table is the authoritative retained audit history. The publisher
+runs only in a process that owns a local Scribe and calls it directly; Gate
+holds no retained-audit path.
 
-A staged row is garbage-collected once the watermark has advanced past it. The
-watermark is the only progress state; a crash between publication and watermark
-advance replays a range that Scribe's durable batch-id dedup fence absorbs, so
-recovery retries without duplicating the retained event. No legacy
-direct-Iceberg relay or separate `platform.audit_log` may become a second
-historical authority.
+Publication progress is exactly two values per tenant: the monotonic published
+watermark, and at most one nullable in-flight upper bound. A publisher freezes
+that bound from the bounded staging prefix under tenant serialization and
+releases the transaction before any Scribe IO, so the audit-chain append lock is
+never held across publication. Every competing replica and every restarted
+publisher reuses the frozen bound verbatim, so all of them project the same
+rows and derive the same batch identity; rows appended above the bound wait for
+the next batch. The watermark alone would not be enough: a staging tail that
+grows mid-flight would give two publishers two overlapping ranges and therefore
+two distinct identities for the same content, which no dedup fence can absorb.
+
+A staged row is garbage-collected once the watermark has advanced past it. One
+tenant transaction advances the watermark, clears the matching in-flight bound,
+and deletes through the watermark together; a stale completion neither moves the
+watermark backwards nor clears a newer bound. A crash between publication and
+that settlement replays the identical frozen range, which Scribe's durable
+batch-id dedup fence absorbs, so recovery retries without duplicating the
+retained event. No legacy direct-Iceberg relay or separate `platform.audit_log`
+may become a second historical authority.
 
 Audit events are appended only where an authorization decision was made. Scribe
 batch commits and Forge maintenance transitions evaluate no permission and are

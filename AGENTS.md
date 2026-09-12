@@ -124,9 +124,12 @@ Locked cross-cutting decisions that any contributor must honor:
   Oracle, and Forge remain server owners and never become client types.
 - `vala.audit_staging` is transient write-ahead state, not an outbox: it has no
   external consumer. Retained audit history lives in `vala.system.audit_log`.
-  Ranges are read by a per-tenant watermark rather than claimed, and staged rows
-  are garbage-collected once the watermark has advanced past them; a replayed
-  range is absorbed by Scribe's durable batch-id dedup fence.
+  Publication progress is a per-tenant monotonic watermark plus at most one
+  frozen in-flight upper bound; no lease, claim, or owner token exists. Every
+  competing or restarted publisher reuses that bound, so the replayed range and
+  its derived batch identity are identical and Scribe's durable batch-id dedup
+  fence absorbs it. Staged rows are garbage-collected once the watermark has
+  advanced past them, in the same transaction that clears the matching bound.
 
 ## 3. Ownership Boundaries
 

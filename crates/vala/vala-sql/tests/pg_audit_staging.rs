@@ -115,13 +115,13 @@ mod pg_tests {
             assert!(tampered.is_err(), "content UPDATE must be rejected");
         }
 
-        /// The publisher reads the oldest bounded run and retires exactly it.
+        /// The publisher reads the oldest bounded run and settles exactly it.
         ///
-        /// Retirement is the only removal path, and repeating it after an
+        /// Settlement is the only removal path, and repeating it after an
         /// uncertain outcome removes nothing more — the property audit
         /// recovery depends on.
         #[tokio::test]
-        async fn publication_batch_is_bounded_and_retirement_is_idempotent() {
+        async fn publication_batch_is_bounded_and_settlement_is_idempotent() {
             let (fixture, _superuser, tenant) = setup().await;
             append(fixture.app_pool(), tenant, "op.a").await;
             append(fixture.app_pool(), tenant, "op.b").await;
@@ -130,23 +130,32 @@ mod pg_tests {
             let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
                 .await
                 .unwrap();
-            let batch = vala_sql::queries::audit_staging::list_publication_batch(&mut conn, 2)
+            let range = vala_sql::queries::audit_staging::freeze_publication_range(&mut conn, 2)
+                .await
+                .unwrap()
+                .expect("three staged rows owe a range");
+            assert_eq!(
+                (range.seq_lo, range.seq_hi),
+                (1, 2),
+                "the frozen range is the oldest contiguous run, bounded by the limit"
+            );
+            let batch = vala_sql::queries::audit_staging::list_publication_range(&mut conn, range)
                 .await
                 .unwrap();
             assert_eq!(
                 batch.iter().map(|row| row.seq).collect::<Vec<_>>(),
                 vec![1, 2],
-                "the batch is the oldest contiguous run, bounded by the limit"
+                "reading the frozen range returns exactly it"
             );
 
-            let drained = vala_sql::queries::audit_staging::drain_through_watermark(&mut conn, 2)
+            let drained = vala_sql::queries::audit_staging::settle_publication(&mut conn, 2)
                 .await
                 .unwrap();
             assert_eq!(drained, 2);
-            let replayed = vala_sql::queries::audit_staging::drain_through_watermark(&mut conn, 2)
+            let replayed = vala_sql::queries::audit_staging::settle_publication(&mut conn, 2)
                 .await
                 .unwrap();
-            assert_eq!(replayed, 0, "a replayed drain removes nothing more");
+            assert_eq!(replayed, 0, "a replayed settlement removes nothing more");
 
             let remaining = vala_sql::queries::audit_staging::list_publication_batch(&mut conn, 10)
                 .await
@@ -155,13 +164,151 @@ mod pg_tests {
             assert_eq!(
                 remaining.iter().map(|row| row.seq).collect::<Vec<_>>(),
                 vec![3],
-                "unpublished events survive the drain of the published prefix"
+                "unpublished events survive the settlement of the published prefix"
             );
         }
 
-        /// Draining never reaches another tenant's rows.
+        /// A growing tail and a competing publisher cannot move a frozen range.
+        ///
+        /// This is the whole point of persisting one in-flight upper bound: two
+        /// publishers — or one publisher restarted mid-flight — must project the
+        /// same rows, otherwise they derive two different batch identities for
+        /// overlapping content and Scribe's batch fence cannot absorb the
+        /// second. The scenario freezes `1..=3`, appends row `4` above the
+        /// bound, re-freezes from a second connection, and requires the identical
+        /// range; only after settlement may a publisher see `4`.
+        ///
+        /// It also pins the stale-completion guard: a settlement carrying the
+        /// already-settled bound must neither advance the watermark nor clear
+        /// the newer bound that replaced it.
         #[tokio::test]
-        async fn drain_is_tenant_scoped() {
+        async fn frozen_range_survives_tail_growth_competition_and_stale_settlement() {
+            let (fixture, superuser, tenant) = setup().await;
+            for operation in ["op.a", "op.b", "op.c"] {
+                append(fixture.app_pool(), tenant, operation).await;
+            }
+
+            let mut first = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
+                .await
+                .unwrap();
+            let frozen =
+                vala_sql::queries::audit_staging::freeze_publication_range(&mut first, 512)
+                    .await
+                    .unwrap()
+                    .expect("three staged rows owe a range");
+            first.commit().await.unwrap();
+            assert_eq!((frozen.seq_lo, frozen.seq_hi), (1, 3));
+
+            // The tail grows while the batch is in flight.
+            append(fixture.app_pool(), tenant, "op.d").await;
+
+            let mut competing = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
+                .await
+                .unwrap();
+            let observed =
+                vala_sql::queries::audit_staging::freeze_publication_range(&mut competing, 512)
+                    .await
+                    .unwrap()
+                    .expect("the in-flight bound is still owed");
+            assert_eq!(
+                observed, frozen,
+                "a competing publisher must reuse the frozen range, not widen it to 1..=4"
+            );
+            let rows =
+                vala_sql::queries::audit_staging::list_publication_range(&mut competing, observed)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
+                vec![1, 2, 3],
+                "row 4 arrived above the frozen bound and stays staged"
+            );
+            let retired = vala_sql::queries::audit_staging::settle_publication(
+                &mut competing,
+                observed.seq_hi,
+            )
+            .await
+            .unwrap();
+            competing.commit().await.unwrap();
+            assert_eq!(retired, 3);
+
+            let mut next = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
+                .await
+                .unwrap();
+            let second = vala_sql::queries::audit_staging::freeze_publication_range(&mut next, 512)
+                .await
+                .unwrap()
+                .expect("row 4 is owed once the first batch settled");
+            assert_eq!(
+                (second.seq_lo, second.seq_hi),
+                (4, 4),
+                "only a settled batch releases the tail into the next range"
+            );
+            // The slow first publisher finally reports the range already settled.
+            let stale =
+                vala_sql::queries::audit_staging::settle_publication(&mut next, frozen.seq_hi)
+                    .await
+                    .unwrap();
+            next.commit().await.unwrap();
+            assert_eq!(stale, 0, "a stale settlement removes nothing");
+
+            let (published, in_flight): (i64, Option<i64>) = sqlx::query_as(
+                "SELECT published_seq, publishing_seq_hi FROM vala.audit_chain_head
+                  WHERE data_tenant_id = $1",
+            )
+            .bind(tenant.as_uuid())
+            .fetch_one(&superuser)
+            .await
+            .unwrap();
+            assert_eq!(
+                published, 3,
+                "a stale settlement must not advance past the newer in-flight bound"
+            );
+            assert_eq!(
+                in_flight,
+                Some(4),
+                "a stale settlement must not clear the newer in-flight bound"
+            );
+        }
+
+        /// An idle tenant owes nothing and its staging table drains to zero.
+        #[tokio::test]
+        async fn settled_tenant_drains_to_zero_and_owes_nothing() {
+            let (fixture, superuser, tenant) = setup().await;
+            append(fixture.app_pool(), tenant, "op.a").await;
+
+            let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
+                .await
+                .unwrap();
+            let range = vala_sql::queries::audit_staging::freeze_publication_range(&mut conn, 512)
+                .await
+                .unwrap()
+                .expect("one staged row is owed");
+            assert_eq!(
+                vala_sql::queries::audit_staging::settle_publication(&mut conn, range.seq_hi)
+                    .await
+                    .unwrap(),
+                1
+            );
+            let idle = vala_sql::queries::audit_staging::freeze_publication_range(&mut conn, 512)
+                .await
+                .unwrap();
+            conn.commit().await.unwrap();
+            assert_eq!(idle, None, "a fully settled tenant owes no range");
+
+            let staged: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM vala.audit_staging WHERE data_tenant_id = $1",
+            )
+            .bind(tenant.as_uuid())
+            .fetch_one(&superuser)
+            .await
+            .unwrap();
+            assert_eq!(staged, 0, "no grace tail survives an idle tenant");
+        }
+
+        /// Settlement never reaches another tenant's rows.
+        #[tokio::test]
+        async fn settlement_is_tenant_scoped() {
             let (fixture, _superuser, tenant_a) = setup().await;
             let tenant_b = DataTenantId::new_v7();
             fixture
@@ -177,7 +324,7 @@ mod pg_tests {
             let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant_a)
                 .await
                 .unwrap();
-            let drained = vala_sql::queries::audit_staging::drain_through_watermark(&mut conn, 1)
+            let drained = vala_sql::queries::audit_staging::settle_publication(&mut conn, 1)
                 .await
                 .unwrap();
             conn.commit().await.unwrap();
@@ -194,7 +341,7 @@ mod pg_tests {
             assert_eq!(
                 surviving.len(),
                 1,
-                "one tenant's drain leaves another tenant's chain intact"
+                "one tenant's settlement leaves another tenant's chain intact"
             );
         }
 

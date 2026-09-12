@@ -172,6 +172,73 @@ async fn multi_pod_concurrent_batches_are_owned_and_visible() {
     assert_clean_shutdown(cluster).await;
 }
 
+/// One sealed batch delivered to every pod at once is visible exactly once.
+///
+/// The canonical Gate-to-Scribe path is what retained audit publication relies
+/// on for safety across replicas: a batch identity derived from content alone
+/// means several pods can present the *same* sealed batch, and only Scribe's
+/// durable commit fence decides how many times its rows exist. A sibling
+/// journey already proves three pods accept *distinct* batches concurrently,
+/// which says nothing about collision — a fence that admitted every attempt
+/// would pass it and triple the rows here.
+///
+/// So this submits one immutable batch — one batch id over one byte-identical
+/// Arrow payload — to all three pod endpoints simultaneously from one barrier,
+/// and requires the public strict fused read to return each
+/// `(batch id, row ordinal)` exactly once. Every attempt must still be
+/// acknowledged: a suppressed duplicate is an idempotent success, not a refusal
+/// the caller has to interpret.
+///
+/// # Panics
+///
+/// Panics when the cluster cannot start, when any pod refuses the sealed batch,
+/// when the read-back is not exactly one copy of it, or when terminal shutdown
+/// ownership is not empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires Postgres and object storage"]
+async fn one_sealed_batch_submitted_to_every_pod_is_visible_once() {
+    let cluster =
+        WyrdTestCluster::start_with_wal_sync_delay(PODS, BifrostTopology::ThreePod, WAL_SYNC_DELAY)
+            .await
+            .expect("the three-pod production cluster starts");
+    let tenant = cluster.data_tenant_id();
+    let name = unique_table("horizontal_sealed");
+    let table = register_table(&cluster, tenant, &name).await;
+    let clients = endpoint_clients(&cluster, tenant).await;
+
+    let batch_id = uuid::Uuid::now_v7();
+    let values: Vec<i64> = (0..ROWS_PER_BATCH as i64).collect();
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(PODS));
+    let mut appends = tokio::task::JoinSet::new();
+    for pod in 0..PODS {
+        let client = Arc::clone(&clients[pod]);
+        let table = table.clone();
+        let values = values.clone();
+        let barrier = Arc::clone(&barrier);
+        appends.spawn(async move {
+            barrier.wait().await;
+            append_values(&client, &table, batch_id, &values).await;
+        });
+    }
+    while let Some(joined) = appends.join_next().await {
+        joined.expect("every pod's attempt at the sealed batch is acknowledged");
+    }
+
+    flush_every_pod(&cluster).await;
+
+    let mut expected = expected_rows(&[(0, batch_id, values)]);
+    expected.sort_unstable();
+    let observed = read_rows(&clients[0], &table).await;
+    assert_eq!(
+        observed, expected,
+        "three pods presented one sealed batch identity, so the durable commit \
+         fence must leave exactly one copy of its rows visible"
+    );
+
+    assert_clean_shutdown(cluster).await;
+}
+
 /// Twenty tenant/table identities ingest on every pod without growing topology.
 ///
 /// The journey registers five tables for each of four tenants, then submits one

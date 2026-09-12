@@ -323,10 +323,7 @@ pub async fn list_publication_range(
 /// # Errors
 /// Returns [`SqlError`] when the chain-head update or the delete fails, or RLS
 /// rejects the range.
-pub async fn settle_publication(
-    conn: &mut TenantConn<'_>,
-    seq_hi: i64,
-) -> Result<u64, SqlError> {
+pub async fn settle_publication(conn: &mut TenantConn<'_>, seq_hi: i64) -> Result<u64, SqlError> {
     sqlx::query(
         r#"
         UPDATE vala.audit_chain_head

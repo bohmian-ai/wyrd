@@ -1,6 +1,6 @@
 ---
 id: SPEC-surfaces-oracle-integration
-revision: 6
+revision: 7
 status: approved
 ---
 
@@ -443,8 +443,10 @@ architecture rather than as parallel implementations.
   pre-dispatch authorization audit and MUST NOT create or rewrite an operation-
   result audit outcome.
 - **REQ-027:** A bounded publisher MUST move tenant audit events idempotently
-  from `vala.audit_staging` into `vala.system.audit_log` through the existing
-  Scribe and Forge path without generating another audit event.
+  from `vala.audit_staging` directly through a local Scribe into
+  `vala.system.audit_log` and the existing Forge path without passing through
+  Gate or generating another audit event. The publisher MUST run only in a
+  process that owns a local Scribe.
 - **REQ-027A:** The per-tenant `entry_hash` MUST be reproducible from the
   retained event content, sequence, and preceding retained `entry_hash`.
   Staging-only or deleted fields MUST NOT be part of its canonical preimage.
@@ -456,8 +458,14 @@ architecture rather than as parallel implementations.
   hash. The original server-stamped decision time MUST become
   `wyrd_event_time`; audit backlog publication is exempt from the ordinary past
   event-time admission window; and `vala.system.audit_log` partitions daily.
-  No migration or compatibility path is required for audit tables or files
-  that have never shipped.
+  Audit state has not shipped: edit its existing schema definition in place.
+  Do not add a migration, compatibility path, or backfill.
+- **REQ-027C:** Before publication leaves Postgres, the publisher MUST durably
+  freeze one contiguous upper sequence bound for the tenant. Concurrent and
+  restarted publishers MUST reuse that bound and therefore the same batch
+  identity until it settles; rows appended above it wait for the next batch.
+  Publication progress consists only of the monotonic watermark and at most one
+  in-flight upper bound per tenant.
 - **REQ-028:** After a range is durably published, one tenant-scoped Postgres
   transaction MUST advance its monotonic watermark and garbage-collect every
   staged row through that watermark. No grace tail remains; an idle tenant's
@@ -582,6 +590,9 @@ architecture rather than as parallel implementations.
   for Forge recovery, reconciliation, or idempotent state transitions.
 - **INV-008C:** Retained audit publication cannot append an audit event, and a
   successfully drained idle tenant retains no staging tail.
+- **INV-008D:** A growing staging tail cannot change the identity of an
+  in-flight audit batch or allow overlapping non-identical ranges to reach
+  retained history.
 - **INV-009:** No failed or partial analytical result is represented as a
   successful query.
 - **INV-010:** No compatibility shim preserves a rejected contract or stale
@@ -711,6 +722,8 @@ The audit-history flow is:
 ```text
 authorization decision or accepted Oracle read
   -> vala.audit_staging
+  -> freeze one tenant range
+  -> local Scribe (never Gate)
   -> vala.system.audit_log
   -> atomic watermark advance and staging garbage collection after durable publication
 ```
@@ -743,8 +756,12 @@ authorization decision or accepted Oracle read
   idempotent staging publication, reproducible retained hashes, and atomic
   watermark advancement plus garbage collection across partial failures.
   Existing real-server retained-history evidence proves publication into
-  `vala.system.audit_log`, including replay without duplication and an idle
-  staging table that drains to zero.
+  `vala.system.audit_log`, including a growing tail with competing publishers,
+  crash replay without duplication, and an idle staging table that drains to
+  zero. Existing multi-pod Scribe journey infrastructure also proves that one
+  immutable canonical batch submitted concurrently through distinct server
+  endpoints is visible exactly once. No new test harness or test file is
+  introduced.
 - **AC-006:** Tenant and authorization evidence demonstrates isolation across
   registry, SQL, Bifrost physical tables, object paths, query plans, and every
   public client surface.
@@ -840,13 +857,14 @@ credentialed cloud tests run and pass in GitHub Actions; the single Bifrost
 data-root outcome is a required completion-blocking follow-up task; and live UI
 integration remains outside this change because that work is ongoing.
 
-The user approved revision 6 on 2026-09-11. It makes audit an authorization-
-decision record, replaces outbox retirement with staging watermark garbage
-collection, fixes the retained audit schema and event-time behavior, and
-requires no compatibility migration because no audit table or file has shipped.
-TASK-005 executes when the in-progress TASK-001 resumes and MUST complete before
-TASK-001 closeout. Task decomposition and merge execution remain subject to
-REQ-039 and REQ-047.
+The user approved revision 7 on 2026-09-11. It retains the authorization-only
+audit boundary, freezes one in-flight publication range per tenant, routes the
+publisher directly to its local Scribe, and requires one canonical multi-pod
+deduplication control using existing test infrastructure. Audit state remains
+unshipped, so its existing schema definition changes in place with no migration
+or backfill. TASK-001 implementation is complete; its closeout remains blocked
+until TASK-005 and TASK-006 complete. Task decomposition and merge execution
+remain subject to REQ-039 and REQ-047.
 
 ## Revision history
 
@@ -891,6 +909,14 @@ REQ-039 and REQ-047.
   unshipped audit state. TASK-005 is implemented when the paused, in-progress
   TASK-001 resumes and blocks its closeout. Existing verification is reused
   without adding tests.
+- Revision 7 (`approved`, 2026-09-11): Freezes one in-flight audit publication
+  range per tenant so a growing tail, crash, or competing Scribe replica cannot
+  produce overlapping batch identities; routes retained publication directly
+  to the local Scribe rather than Gate; and adds one canonical multi-pod
+  deduplication control using existing harnesses. Audit state remains unshipped,
+  so the existing schema definition changes in place with no migration,
+  compatibility path, or backfill. TASK-001 remains implemented with closeout
+  blocked on TASK-005 and TASK-006.
 
 ## Material authority
 

@@ -37,10 +37,8 @@ use crate::namespaces::BifrostNamespace;
 use crate::oracle::{AuthorizedQueryContext, OracleQueryStream, QueryStreamLifecycle};
 pub use crate::otlp_contract::{IngestOutcome, LogsOutcome, MetricsOutcome};
 use crate::scribe::preprocess::{correlation_data_identity, logical_data_identity};
-use wyrd_runtime::Principal;
 use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::ids::DataTenantId;
-use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::error::BifrostError;
 

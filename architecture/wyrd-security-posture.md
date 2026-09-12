@@ -243,10 +243,15 @@ then a bounded at-least-once relay appends the canonical tenant
 
 `vala.audit_staging` is transient transactional write-ahead state, not an
 outbox: it has no external consumer. Retained audit history lives in the
-tenant-qualified Bifrost `vala.system.audit_log` table. A bounded publisher
-moves events idempotently into that table, reading ranges by a per-tenant
-watermark. A staged row is garbage-collected once the watermark has advanced
-past it; a replayed range is absorbed by Scribe's durable batch-id dedup fence.
+tenant-qualified Bifrost `vala.system.audit_log` table. A bounded publisher in a
+process owning a local Scribe moves events idempotently into that table through
+that Scribe, never through Gate. Progress is the monotonic per-tenant watermark
+plus at most one frozen in-flight upper bound, which every competing or
+restarted publisher reuses so the replayed range and its batch identity are
+identical; rows appended above the bound wait for the next batch. One tenant
+transaction advances the watermark, clears the matching bound, and
+garbage-collects through the watermark; a replayed range is absorbed by Scribe's
+durable batch-id dedup fence.
 Because publication evaluates no new permission, it appends no audit event and
 retained history cannot feed itself. A legacy direct-Iceberg relay and
 `platform.audit_log` are not alternate historical authorities.

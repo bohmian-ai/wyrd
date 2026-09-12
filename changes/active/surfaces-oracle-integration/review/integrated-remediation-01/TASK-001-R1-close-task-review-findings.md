@@ -1,7 +1,7 @@
 ---
 id: TASK-001-R1
 kind: remediation
-status: ready
+status: implemented
 spec: SPEC-surfaces-oracle-integration
 spec_revision: 7
 requirements: [REQ-026, REQ-027C, REQ-028, REQ-029, INV-008, INV-008C, INV-008D, AC-005]
@@ -206,3 +206,65 @@ git diff --check
 - Preserve one local Scribe publication path on Scribe-bearing roles.
 - Do not add a compatibility surface, second audit history, direct Iceberg audit writer, scheduler, lease, claim table, configuration knob, dependency, test harness, or test file.
 - Do not broaden into SDK convergence, the single data-root task, UI work, or unrelated cleanup.
+
+## Implementation evidence
+
+Candidate range: `8377fff9f..HEAD` on `change/surfaces-oracle-integration`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| 1. Each receiving verdict audited once, both outcomes, fail closed | `wyrd-server/src/audit/mod.rs` `authorize`, `authorize_recording_denial`, `authorize_service_accounts_write`; Card, storage, Eval, admin, revoke, `issue_key` routes; Bifrost list/describe/register (create keeps the `register_dataset` append) | `pg_card_registration_route`: `registration_replays_through_public_authenticated_route`, `registration_refuses_when_its_decision_audit_fails`, `delete_audit_failure_keeps_card_active`; `storage_e2e::storage_routes_refuse_and_audit_an_unprivileged_caller`; `pg_eval_v1_protocol::open_requires_eval_run_permission`; admin `pg_tests` (13); `bifrost::service::pg_tests`; CLI `apply_refuses_when_completion_decision_audit_fails`; MCP `connectivity::pg_tests::mcp_rejects_credentials_and_joins_request_and_process_cancellation`, `query::pg_tests::delegated_agent_query_is_attributed_in_its_durable_audit_record` | PASS |
+| 2. No canonical audit from non-permission transitions | `auth/login.rs`; `components/cards/service.rs` (reconcile, activation, cleanup, blob failure now tracing/operational state); `wyrd-storage/src/audit.rs` deleted with service and sweeper callers | `mise run test:sql` (includes `wyrd-storage` `pg_sweeper`); `card_reconciler_dead_letters_after_three_failures` reads `reconcile_attempts` (blocked, see risks) | PASS (one blocked scenario) |
+| 3. SQL ownership restored | `AuditPublisher` holds `ValaPostgres`; `list_active_tenant_ids(&OperatorPool)`; `append_audit_connection` deleted; tenant predicates removed | `mise run test:sql`; `mise run check:from-pools-allowlist`; `mise run check:tenant-isolation` | PASS |
+| 4. Static Gate audit composition | `Gate<P, I, A>`; `ServerGate` selects `PostgresGateAudit` | `vala-bifrost-redux` `gate::tests::gate_enforces_bifrost_record_write`, `gate::tests::batch_identity_acceptance_is_unchanged`, `gate::tests::gate_constructs_with_injected_seams_without_server_boot`; `mise run test:bifrost:integration:redux` (973 passed) | PASS |
+| 5. Only the complete publication cycle callable; replay journey | `publish_range`/`settle` private; journey fences staged rows at settlement with a savepoint-scoped delete (the application role holds no UPDATE on staging) | `wyrd-testing::server audit_publication::frozen_audit_range_replays_once_while_its_tail_waits`, `audit_publication::audited_transitions_retire_only_into_retained_history`; Scribe control `horizontal_ingest::multi_pod_concurrent_batches_are_owned_and_visible` | PASS |
+| 6. Bounded cross-tenant publication | `PUBLICATION_TENANT_CONCURRENCY = 8` with `buffer_unordered` | `audit::publication::tests::bounded_sweep_never_exceeds_its_fixed_concurrency`; `audit_publication::a_stalled_tenant_does_not_block_another_tenants_history` | PASS |
+| 7. Enumerated rustdoc, signature, docs, tenant-check defects | publication module docs, `# Errors` on `freeze`/`read_range`, cancellation docs, bare types, `append_managed_columns` doc; architecture, reference, operations and `.svx` pages; `check_tenant_isolation.py` exemption deleted | `mise run lints`; `mise run docs:check`; `mise run check:tenant-isolation` | PASS |
+| 8. Lifecycle and evidence | TASK-001, TASK-005, TASK-006 `status: review`; this matrix | Commands below | PASS |
+| 9. No new audit durability mechanism | No Oracle WAL identity, receipt table, relay watermark, config, dependency, harness, or test file added | Diff audit of `8377fff9f..HEAD` | PASS |
+
+### Commands
+
+```bash
+mise run fmt
+mise run lints
+mise run codegen:check
+mise run test:sql
+mise run test:bifrost:integration:redux
+mise run test:bifrost:integration:server
+mise run test:bifrost:journey:server
+mise run test:bifrost:journey:scribe
+mise run test:bifrost:journey:oracle
+mise run test:bifrost:journey:forge
+mise run test:bifrost:journey:otlp
+mise run test:bifrost:journey:mcp
+mise run check:tenant-isolation
+mise run check:from-pools-allowlist
+mise run check:object-store-pin
+mise run check:unwrap-audit
+mise run check:client-tier
+mise run check:pyo3-scope
+mise run docs:check
+git diff --check
+
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib \
+  -E 'test(=gate::tests::gate_enforces_bifrost_record_write) | test(=gate::tests::batch_identity_acceptance_is_unchanged) | test(=gate::tests::gate_constructs_with_injected_seams_without_server_boot)'
+mise exec -- cargo nextest run --locked -p wyrd-server --lib \
+  -E 'test(=audit::publication::tests::bounded_sweep_never_exceeds_its_fixed_concurrency)'
+scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-server --lib -E "test(/^components::admin::routes::pg_tests::/)"'
+scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test server -P journey --run-ignored=all -E "test(=audit_publication::frozen_audit_range_replays_once_while_its_tail_waits) | test(=audit_publication::a_stalled_tenant_does_not_block_another_tenants_history) | test(=audit_publication::audited_transitions_retire_only_into_retained_history)"'
+scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test scribe -P journey --run-ignored=all -E "test(=horizontal_ingest::multi_pod_concurrent_batches_are_owned_and_visible)"'
+scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-mcp --test mcp -P journey --run-ignored=all -E "test(=query::pg_tests::delegated_agent_query_is_attributed_in_its_durable_audit_record) | test(=connectivity::pg_tests::mcp_rejects_credentials_and_joins_request_and_process_cancellation)"'
+scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-server --test pg_eval_v1_protocol -E "test(=open_requires_eval_run_permission)"'
+WYRD_STORAGE_E2E=1 scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-server --features storage-emulator --test storage_e2e -E "test(=storage_routes_refuse_and_audit_an_unprivileged_caller)"'
+WYRD_REG_E2E=1 scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-server --test pg_card_registration_route -E "test(=registration_replays_through_public_authenticated_route) | test(=delete_audit_failure_keeps_card_active) | test(=registration_refuses_when_its_decision_audit_fails)"'
+WYRD_CLI_E2E=1 scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-cli --test cli -E "test(=card_lifecycle::pg_tests::apply_refuses_when_completion_decision_audit_fails)"'
+```
+
+### Pre-existing blockers and risks
+
+- `mise run test:cards:integration` and `mise run test:cli:journey` cannot start: `setup:postgres` depends on `setup:db-roles`, deleted in `c9bf7322c`. Their suites ran through `scripts/postgres/with-test-postgres.sh` instead.
+- Six `pg_card_registration_route` tests that call `start_bound()` with a `Local` storage backend fail identically at the pre-change base `8377fff9f^`: the harness composes a Forge worker, which exits with "Forge worker staging backend does not support native list_with_start_after" (gate added in `66bec4bf1`), so `/healthz` never serves. This blocks `card_reconciler_dead_letters_after_three_failures`, whose assertion this remediation changed.
+- `wyrd-cli --test cli` `card_lifecycle::pg_tests::card_lifecycle_cli_journey` (artifact digest mismatch returns `WYRD_REGISTRY_400_INVALID_CARD_SPEC`, not `…507_ARTIFACT_VERIFY_FAILED`) and `multi_card_service_get_hydrates_complete_and_metadata_bundles` (Model fixture lacks `signature.inputs`) fail identically at `8377fff9f^`; unrelated to audit. The former `apply_surfaces_backend_completion_failure` also failed at base; its renamed replacement passes.
+- Denial audit is per request, so an idempotent replay records a second decision.
+- `wyrd_spec` `AuditDetail::Storage` variants are no longer produced; the wire type is unchanged.

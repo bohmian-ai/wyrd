@@ -334,7 +334,11 @@ pub struct BifrostTestControls {
 /// [`WyrdTokenVerifier`] already fixes both resolver parameters, so the alias
 /// keeps [`Bifrost`] and [`AppState`] non-generic while the Gate itself stays
 /// generic for other embedders.
-pub type ServerGate = vala_bifrost_redux::gate::Gate<SqlPermissionResolver, PgIssuerResolver>;
+pub type ServerGate = vala_bifrost_redux::gate::Gate<
+    SqlPermissionResolver,
+    PgIssuerResolver,
+    crate::bifrost::gate_audit::PostgresGateAudit,
+>;
 
 /// Ordered local lifecycle states for one independently fenced role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

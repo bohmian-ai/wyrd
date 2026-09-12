@@ -1196,10 +1196,16 @@ fn correlation_envelope_applies(context: &DecodeContext<'_>) -> bool {
     })
 }
 
-/// Appends the always-server-owned managed columns to a partially-stamped batch.
+/// Appends the server-owned managed columns to a partially-stamped batch.
 ///
-/// The receipt timestamp, batch id, row ordinal, tenant, card uid, principal,
-/// and request id are unconditionally server-owned and always appended here.
+/// The event time, receipt timestamp, batch id, row ordinal, and tenant are
+/// appended unconditionally, values and all. The correlation envelope —
+/// `card_uid`, `wyrd_principal_id`, and `wyrd_request_id` — is conditional: its
+/// fields are declared here only when
+/// [`correlation_envelope_applies`] holds for this table, and their arrays were
+/// already pushed onto `columns` by the caller that decoded them, which is what
+/// makes the batch "partially stamped" on entry. A table whose correlation
+/// policy is `None` carries no such column at all.
 /// `wyrd_ingested_at` is always the server receipt time. `wyrd_event_time` is
 /// always materialized in the canonical slot (between `wyrd_request_id` and
 /// `wyrd_ingested_at`), so the stamped field order equals

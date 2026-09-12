@@ -157,7 +157,13 @@ async fn await_drained(
 /// also locked by `freeze_publication_range`: fencing there would stop a cycle
 /// before it published anything, which is the wrong half of the window.
 ///
-/// The returned connection owns the lock; committing it releases the fence.
+/// The lock is a row-deleting statement under a savepoint rather than
+/// `FOR UPDATE`: the application role may delete drained staging rows but
+/// holds no UPDATE privilege, and a row-locking read would demand one. The
+/// deletion is never kept — [`release_fence`] rolls back to the savepoint,
+/// which releases the row locks, before committing an empty transaction.
+///
+/// The returned connection owns the lock until [`release_fence`].
 ///
 /// # Errors
 /// Returns the tenant-connection or lock failure Postgres raised.
@@ -167,12 +173,31 @@ async fn fence_staged_rows(
     range: vala_sql::queries::audit_staging::AuditPublicationRange,
 ) -> Result<vala_sql::TenantConn<'_>, ServerJourneyError> {
     let mut fence = server.tenant_conn_for(tenant).await?;
-    sqlx::query("SELECT seq FROM vala.audit_staging WHERE seq BETWEEN $1 AND $2 FOR UPDATE")
+    sqlx::query("SAVEPOINT audit_fence")
+        .execute(&mut **fence.transaction())
+        .await?;
+    sqlx::query("DELETE FROM vala.audit_staging WHERE seq BETWEEN $1 AND $2")
         .bind(range.seq_lo)
         .bind(range.seq_hi)
-        .fetch_all(&mut **fence.transaction())
+        .execute(&mut **fence.transaction())
         .await?;
     Ok(fence)
+}
+
+/// Release a [`fence_staged_rows`] fence without removing any staged row.
+///
+/// Rolling back to the savepoint undoes the held deletion and releases its
+/// row locks, so a blocked settlement proceeds against unchanged staging; the
+/// then-empty transaction commits.
+///
+/// # Errors
+/// Returns the rollback or commit failure Postgres raised.
+async fn release_fence(mut fence: vala_sql::TenantConn<'_>) -> Result<(), ServerJourneyError> {
+    sqlx::query("ROLLBACK TO SAVEPOINT audit_fence")
+        .execute(&mut **fence.transaction())
+        .await?;
+    fence.commit().await?;
+    Ok(())
 }
 
 /// A frozen audit range replays exactly once while its tail waits behind it.
@@ -238,7 +263,7 @@ async fn frozen_audit_range_replays_once_while_its_tail_waits() -> Result<(), Se
         blocked.await.is_err(),
         "the fenced cycle must be aborted before it settles"
     );
-    fence.commit().await?;
+    release_fence(fence).await?;
 
     // The bound survived the abort, so this cycle replays the identical range.
     publisher.publish_tenant(tenant).await?;

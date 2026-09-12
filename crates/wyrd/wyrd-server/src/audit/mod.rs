@@ -172,3 +172,70 @@ pub async fn record_audit_owned(
     .await
     .map_err(audit_unavailable)?
 }
+
+/// Evaluate one receiving permission and audit the verdict exactly once.
+///
+/// This is the shared owner of the "audit the decision, then act" boundary. The
+/// verdict is appended in its own tenant transaction before the caller proceeds
+/// or is refused, so an allowed operation cannot run unaudited and a refusal
+/// cannot be silent. An append failure fails closed: the operation is refused
+/// with [`WyrdError::AuditUnavailable`] even when the verdict was `Allow`.
+///
+/// Use [`authorize_recording_denial`] instead when the allowed path already owns
+/// a transaction that the allowed row must commit with.
+///
+/// # Errors
+/// Returns the mapped denial error when the principal lacks `required`, and
+/// [`WyrdError::AuditUnavailable`] when the decision row cannot be persisted.
+pub async fn authorize(
+    state: &crate::state::AppState,
+    caller: &Caller,
+    required: &wyrd_runtime::Permission,
+    operation: &str,
+    resource: &str,
+) -> Result<(), WyrdError> {
+    let denial = authorize_recording_denial(state, caller, required, operation, resource).await?;
+    record_audit(state.postgres.vala_pool(), caller.data_tenant_id, &denial).await
+}
+
+/// Evaluate one receiving permission, audit a denial, and hand back the allowed row.
+///
+/// Denials are recorded standalone because there is no operation transaction to
+/// join. The returned `Allowed` event is *not* yet durable: the caller MUST
+/// [`append_on`] it inside the transaction that performs the operation, so the
+/// decision and its effect commit together.
+///
+/// # Errors
+/// Returns the mapped denial error when the principal lacks `required`, and
+/// [`WyrdError::AuditUnavailable`] when the denial row cannot be persisted.
+pub async fn authorize_recording_denial(
+    state: &crate::state::AppState,
+    caller: &Caller,
+    required: &wyrd_runtime::Permission,
+    operation: &str,
+    resource: &str,
+) -> Result<AuditEvent, WyrdError> {
+    if let Err(reason) = state
+        .authz
+        .permission_check
+        .check(&caller.principal, required)
+        .into_result()
+    {
+        let denied = audit_event(
+            caller,
+            operation,
+            resource,
+            &required.to_string(),
+            AuditOutcome::Denied,
+        );
+        record_audit(state.postgres.vala_pool(), caller.data_tenant_id, &denied).await?;
+        return Err(crate::http::error::permission_deny_reason_to_wyrd(reason));
+    }
+    Ok(audit_event(
+        caller,
+        operation,
+        resource,
+        &required.to_string(),
+        AuditOutcome::Allowed,
+    ))
+}

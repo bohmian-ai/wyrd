@@ -21,6 +21,7 @@ use wyrd_spec::registry::{
 };
 use wyrd_spec::storage::IDEMPOTENCY_KEY_HEADER;
 
+use crate::audit;
 use crate::components::auth::Caller;
 use crate::components::cards::service;
 use crate::http::error::WyrdErrorResponse;
@@ -72,9 +73,9 @@ async fn get_card_http(
     caller: Caller,
     Path((kind, card_uid)): Path<(String, String)>,
 ) -> Result<Json<GetCardResponse>, WyrdErrorResponse> {
-    authorize_card_read(&state, &caller)?;
     let kind = parse_card_kind(&kind)?;
     let card_uid = parse_card_uid(&card_uid)?;
+    authorize_card_read(&state, &caller, "card.read.uid", &format!("card:{card_uid}")).await?;
     let response = service::get_card_by_uid(&state, &caller, &card_uid)
         .await
         .map_err(WyrdErrorResponse::from)?;
@@ -108,8 +109,8 @@ async fn get_card_by_ref_http(
     caller: Caller,
     Query(query): Query<CardRefQuery>,
 ) -> Result<Json<GetCardResponse>, WyrdErrorResponse> {
-    authorize_card_read(&state, &caller)?;
     let card_ref = query.into_card_ref()?;
+    authorize_card_read(&state, &caller, "card.read.ref", &card_resource(&card_ref)).await?;
     service::get_card_by_ref(&state, &caller, &card_ref)
         .await
         .map(Json)
@@ -137,10 +138,16 @@ async fn get_latest_card_http(
     caller: Caller,
     Path((kind, space, name)): Path<(String, String, String)>,
 ) -> Result<Json<GetCardResponse>, WyrdErrorResponse> {
-    authorize_card_read(&state, &caller)?;
     let kind = parse_card_kind(&kind)?;
     let space = parse_space(&space)?;
     let name = parse_name(&name)?;
+    authorize_card_read(
+        &state,
+        &caller,
+        "card.read.latest",
+        &format!("card:{}/{space}/{name}", kind.wire_name()),
+    )
+    .await?;
     service::get_latest_card(&state, &caller, kind, space, name)
         .await
         .map(Json)
@@ -168,13 +175,22 @@ async fn list_versions_http(
     Path((kind, space, name)): Path<(String, String, String)>,
     Query(query): Query<VersionListQuery>,
 ) -> Result<Json<ListVersionsResponse>, WyrdErrorResponse> {
-    authorize_card_read(&state, &caller)?;
+    let kind = parse_card_kind(&kind)?;
+    let space = parse_space(&space)?;
+    let name = parse_name(&name)?;
+    authorize_card_read(
+        &state,
+        &caller,
+        "card.read.versions",
+        &format!("card:{}/{space}/{name}", kind.wire_name()),
+    )
+    .await?;
     service::list_card_versions(
         &state,
         &caller,
-        parse_card_kind(&kind)?,
-        parse_space(&space)?,
-        parse_name(&name)?,
+        kind,
+        space,
+        name,
         query.include_prerelease,
     )
     .await
@@ -210,7 +226,7 @@ async fn list_cards_http(
     caller: Caller,
     Query(query): Query<ListCardsRequest>,
 ) -> Result<Json<ListCardsResponse>, WyrdErrorResponse> {
-    authorize_card_read(&state, &caller)?;
+    authorize_card_read(&state, &caller, "card.read.list", "cards").await?;
     service::list_cards(&state, &caller, query)
         .await
         .map(Json)
@@ -233,8 +249,14 @@ async fn list_artifacts_http(
     caller: Caller,
     Path(card_uid): Path<String>,
 ) -> Result<Json<wyrd_spec::registry::ArtifactInventoryResponse>, WyrdErrorResponse> {
-    authorize_card_read(&state, &caller)?;
     let card_uid = parse_card_uid(&card_uid)?;
+    authorize_card_read(
+        &state,
+        &caller,
+        "card.read.artifacts",
+        &format!("card:{card_uid}"),
+    )
+    .await?;
     service::list_card_artifacts(&state, &caller, &card_uid)
         .await
         .map(Json)
@@ -277,12 +299,7 @@ pub(crate) async fn register_card_http(
     // access token and the `Caller` extractor has materialized its principal.
     // This check is intentionally route-local: authentication answers "who is
     // calling?" while this capability check answers "may they register cards?".
-    state
-        .authz
-        .permission_check
-        .check(&caller.principal, &Permission::card_write())
-        .into_result()
-        .map_err(WyrdErrorResponse::from)?;
+    authorize_card_write(&state, &caller, "card.registration.create", "cards").await?;
     let idempotency_key = extract_required_idempotency_key(&headers)?;
     service::register_card(&state, &caller, idempotency_key.as_str(), body)
         .await
@@ -321,9 +338,15 @@ async fn complete_card_http(
     headers: HeaderMap,
     Path(card_uid): Path<String>,
 ) -> Result<Json<CreateCardResponse>, WyrdErrorResponse> {
-    authorize_card_write(&state, &caller)?;
     let idempotency_key = extract_required_idempotency_key(&headers)?;
     let card_uid = parse_card_uid(&card_uid)?;
+    authorize_card_write(
+        &state,
+        &caller,
+        "card.registration.complete",
+        &format!("card:{card_uid}"),
+    )
+    .await?;
     let outcome = service::complete_card(&state, &caller, &card_uid, idempotency_key.as_str())
         .await
         .map_err(WyrdErrorResponse::from)?;
@@ -352,13 +375,19 @@ async fn delete_card_http(
     caller: Caller,
     Path((kind, card_uid)): Path<(String, String)>,
 ) -> Result<Json<DeleteCardResponse>, WyrdErrorResponse> {
-    authorize_card_write(&state, &caller)?;
     let kind = CardKind::from_wire_name(&kind).ok_or_else(|| {
         WyrdErrorResponse::from(WyrdError::registry_invalid_card_spec(
             "kind is not a valid Card kind",
         ))
     })?;
     let card_uid = parse_card_uid(&card_uid)?;
+    authorize_card_write(
+        &state,
+        &caller,
+        "card.registration.delete",
+        &format!("card:{card_uid}"),
+    )
+    .await?;
     service::delete_card_with_kind(&state, &caller, &card_uid, kind)
         .await
         .map(Json)
@@ -389,8 +418,14 @@ async fn delete_card_by_ref_http(
     caller: Caller,
     Query(query): Query<DeleteCardRefQuery>,
 ) -> Result<Json<DeleteCardResponse>, WyrdErrorResponse> {
-    authorize_card_write(&state, &caller)?;
     let card_ref = query.into_card_ref()?;
+    authorize_card_write(
+        &state,
+        &caller,
+        "card.registration.delete",
+        &card_resource(&card_ref),
+    )
+    .await?;
     service::delete_card_by_ref(&state, &caller, &card_ref)
         .await
         .map(Json)
@@ -475,21 +510,60 @@ fn single_card_response(outcome: CardRegistrationOutcome) -> CreateCardResponse 
     }
 }
 
-fn authorize_card_write(state: &AppState, caller: &Caller) -> Result<(), WyrdErrorResponse> {
-    state
-        .authz
-        .permission_check
-        .check(&caller.principal, &Permission::card_write())
-        .into_result()
-        .map_err(WyrdErrorResponse::from)
+/// Render one exact Card reference as a stable audit resource string.
+///
+/// Identity-line routes have no UID to name yet, so the decision row records the
+/// kind/space/name/version the caller asked for. Keeping one renderer means every
+/// such row is comparable across read and delete routes.
+fn card_resource(card_ref: &CardRef) -> String {
+    format!(
+        "card:{}/{}/{}@{}",
+        card_ref.kind.wire_name(),
+        card_ref
+            .space
+            .as_ref()
+            .map_or("-", SpaceName::as_str),
+        card_ref.name,
+        card_ref.version,
+    )
 }
 
-fn authorize_card_read(state: &AppState, caller: &Caller) -> Result<(), WyrdErrorResponse> {
-    state
-        .authz
-        .permission_check
-        .check(&caller.principal, &Permission::card_read())
-        .into_result()
+/// Evaluate and audit `card:write` for one receiving registry route.
+///
+/// The route-local check answers "may this principal change cards?" after
+/// authentication answered "who is calling?". Delegating to [`audit::authorize`]
+/// is what makes the verdict durable exactly once, before the route proceeds or
+/// refuses, and fail-closed when the decision cannot be recorded.
+async fn authorize_card_write(
+    state: &AppState,
+    caller: &Caller,
+    operation: &str,
+    resource: &str,
+) -> Result<(), WyrdErrorResponse> {
+    audit::authorize(
+        state,
+        caller,
+        &Permission::card_write(),
+        operation,
+        resource,
+    )
+    .await
+    .map_err(WyrdErrorResponse::from)
+}
+
+/// Evaluate and audit `card:read` for one receiving registry route.
+///
+/// Reads are audited on the same terms as writes: the decision row is the only
+/// durable evidence that a principal was permitted to see a Card, so an allowed
+/// read that cannot be recorded is refused rather than served.
+async fn authorize_card_read(
+    state: &AppState,
+    caller: &Caller,
+    operation: &str,
+    resource: &str,
+) -> Result<(), WyrdErrorResponse> {
+    audit::authorize(state, caller, &Permission::card_read(), operation, resource)
+        .await
         .map_err(WyrdErrorResponse::from)
 }
 

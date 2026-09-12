@@ -525,8 +525,8 @@ async fn registration_replays_through_public_authenticated_route() {
     .await
     .expect("audit count reads");
     assert_eq!(
-        audit_count, 1,
-        "replay must not append a second create audit"
+        audit_count, 2,
+        "each received registration request audits its own card:write decision"
     );
     conn.commit().await.expect("assertion transaction commits");
 
@@ -1028,7 +1028,10 @@ async fn composite_registration_returns_leaf_first_outcomes_and_root() {
     .fetch_one(&mut **conn.transaction())
     .await
     .expect("audit count reads");
-    assert_eq!(audit_count, 3);
+    assert_eq!(
+        audit_count, 1,
+        "one received request evaluates card:write once and audits it once"
+    );
     let relationships: Vec<(Uuid, String, Uuid)> = sqlx::query_as(
         "SELECT card_uid, target_name, target_uid FROM wyrd.card_relationships \
          WHERE card_uid IN ($1, $2) ORDER BY target_name",
@@ -1351,16 +1354,12 @@ async fn card_reconciler_dead_letters_after_three_failures() {
         .tenant_conn_for(server.data_tenant_id())
         .await
         .expect("tenant connection opens");
-    let metadata: (String, String, Option<String>, Option<String>, i64) = sqlx::query_as(
+    let metadata: (String, String, Option<String>, Option<String>, i32) = sqlx::query_as(
         "SELECT reconcile_status, reconcile_kind, reconcile_last_error_code, \
-                reconcile_last_error_message, \
-                (SELECT count(*) FROM vala.audit_staging \
-                  WHERE operation = 'card.reconciliation.dead_letter' \
-                    AND resource = $2) \
+                reconcile_last_error_message, reconcile_attempts \
            FROM wyrd.cards WHERE card_uid = $1",
     )
     .bind(card_uid.as_uuid())
-    .bind(format!("card:{card_uid}"))
     .fetch_one(&mut **conn.transaction())
     .await
     .expect("dead-letter metadata reads");
@@ -1374,7 +1373,10 @@ async fn card_reconciler_dead_letters_after_three_failures() {
         metadata.3.is_some(),
         "dead letter stores the inspectable error message"
     );
-    assert_eq!(metadata.4, 1, "dead letter audit is appended once");
+    assert_eq!(
+        metadata.4, 3,
+        "dead letter records its attempt count as reconciliation lineage"
+    );
     conn.commit().await.expect("dead-letter read commits");
 
     sleep(Duration::from_millis(1_200)).await;
@@ -1384,7 +1386,7 @@ async fn card_reconciler_dead_letters_after_three_failures() {
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// Activation and its audit row roll back together when the audit append fails.
+/// Completion refuses and leaves the card Pending when its decision audit fails.
 #[tokio::test(flavor = "current_thread")]
 async fn completion_audit_failure_keeps_card_pending() {
     if !enabled() {
@@ -1496,7 +1498,7 @@ async fn completion_audit_failure_keeps_card_pending() {
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// Delete audit failure rolls back the tombstone and does not append an audit row.
+/// Delete refuses and keeps the card Active when its decision audit fails.
 #[tokio::test(flavor = "current_thread")]
 async fn delete_audit_failure_keeps_card_active() {
     if !enabled() {
@@ -1528,7 +1530,7 @@ async fn delete_audit_failure_keeps_card_active() {
         r#"CREATE OR REPLACE FUNCTION vala.test_fail_card_delete_audit()
            RETURNS trigger LANGUAGE plpgsql AS $$
            BEGIN
-             IF NEW.operation = 'card.registration' THEN
+             IF NEW.operation = 'card.registration.delete' THEN
                RAISE EXCEPTION 'injected delete audit failure';
              END IF;
              RETURN NEW;
@@ -1558,8 +1560,8 @@ async fn delete_audit_failure_keeps_card_active() {
         .expect("delete responds");
     let status = response.status();
     let body = response_json(response).await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(body["code"], "WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE");
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body["code"], "WYRD_VALA_500_AUDIT_UNAVAILABLE");
 
     let mut conn = server
         .tenant_conn_for(server.data_tenant_id())
@@ -1573,7 +1575,7 @@ async fn delete_audit_failure_keeps_card_active() {
             .expect("card state reads");
     let delete_audits: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM vala.audit_staging \
-         WHERE operation = 'card.registration' AND resource = $1",
+         WHERE operation = 'card.registration.delete' AND resource = $1",
     )
     .bind(format!("card:{card_uid}"))
     .fetch_one(&mut **conn.transaction())
@@ -1724,22 +1726,14 @@ async fn blob_storage_failure_is_audited_without_leaking_sql() {
     assert_eq!(failure_state.0, "failed");
     assert!(failure_state.1.is_none());
     assert!(failure_state.2.is_some());
-    let blob_failure_audits: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM vala.audit_staging \
-         WHERE operation = 'card.registration.blob_write.failed'",
-    )
-    .fetch_one(&mut **conn.transaction())
-    .await
-    .expect("blob failure audit count reads");
-    assert_eq!(blob_failure_audits, 1);
     conn.commit().await.expect("assertion transaction commits");
 
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// Roll back the entire composite when a later per-node audit append fails.
+/// Refuse the whole composite when the registration decision audit fails.
 #[tokio::test(flavor = "current_thread")]
-async fn audit_append_failure_rolls_back_composite_transaction() {
+async fn registration_refuses_when_its_decision_audit_fails() {
     if !enabled() {
         return;
     }
@@ -1759,14 +1753,10 @@ async fn audit_append_failure_rolls_back_composite_transaction() {
         .await
         .expect("superuser pool opens");
     sqlx::query(
-        r#"CREATE OR REPLACE FUNCTION vala.test_fail_second_registration_audit()
+        r#"CREATE OR REPLACE FUNCTION vala.test_fail_registration_decision_audit()
            RETURNS trigger LANGUAGE plpgsql AS $$
            BEGIN
-             IF NEW.operation = 'card.registration.create'
-                AND (SELECT count(*) FROM vala.audit_staging
-                     WHERE data_tenant_id = NEW.data_tenant_id
-                       AND request_id = NEW.request_id
-                       AND operation = 'card.registration.create') >= 1 THEN
+             IF NEW.operation = 'card.registration.create' THEN
                RAISE EXCEPTION 'injected registration audit failure';
              END IF;
              RETURN NEW;
@@ -1777,9 +1767,9 @@ async fn audit_append_failure_rolls_back_composite_transaction() {
     .await
     .expect("failure function installs");
     sqlx::query(
-        r#"CREATE TRIGGER test_fail_second_registration_audit
+        r#"CREATE TRIGGER test_fail_registration_decision_audit
            BEFORE INSERT ON vala.audit_staging
-           FOR EACH ROW EXECUTE FUNCTION vala.test_fail_second_registration_audit()"#,
+           FOR EACH ROW EXECUTE FUNCTION vala.test_fail_registration_decision_audit()"#,
     )
     .execute(&superuser)
     .await

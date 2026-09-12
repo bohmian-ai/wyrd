@@ -32,7 +32,6 @@ use wyrd_spec::registry::{
 };
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::storage::{UploadId, UploadInitRequest, UploadPlan};
-use wyrd_spec::vala::api::AuditOutcome;
 use wyrd_sql::CardStatus;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::cards::{
@@ -60,7 +59,6 @@ use wyrd_storage::StorageError;
 use wyrd_storage::service::{upload_abort, upload_init};
 use wyrd_storage::tenant_path;
 
-use crate::audit::{append_on, audit_event, audit_event_unauthenticated};
 use crate::components::auth::Caller;
 use crate::components::cards::mapping::{existing_row_to_response, outcome_row_to_response};
 use crate::components::cards::resolve::{
@@ -822,15 +820,7 @@ async fn initialize_manifest_row(
         }
     };
     let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
-    let event = audit_event(
-        caller,
-        "card.artifact.upload_init.success",
-        &format!("manifest:{}", row.manifest_id),
-        "card:write",
-        AuditOutcome::Allowed,
-    );
     let persisted = async {
-        append_on(&mut conn, &event).await?;
         mark_manifest_upload_initialized(&mut conn, card_uid, &row.relative_path, upload_uuid)
             .await?;
         conn.commit().await.map_err(registry_db_error)
@@ -1021,7 +1011,6 @@ async fn persist_node(
     .await?
     {
         persist_outbound_relationships(conn, &existing.row.card_uid, &outbound_refs).await?;
-        append_registration_audit(conn, caller, &existing.row.card_uid).await?;
         return Ok(existing_row_to_response(&existing.row, existing.outcome));
     }
     let card_uid = CardUid::from_uuid(Uuid::now_v7()).map_err(WyrdError::from_card_uid_error)?;
@@ -1043,7 +1032,6 @@ async fn persist_node(
     if matches!(card.kind, CardKind::Service | CardKind::Agent) {
         upsert_service_account_from_card(conn, &row.card_uid, &card, &caller.principal).await?;
     }
-    append_registration_audit(conn, caller, &row.card_uid).await?;
     Ok(outcome_row_to_response(
         &row,
         RegistrationOutcomeKind::Registered,
@@ -1120,22 +1108,6 @@ async fn resolve_existing(
             }),
         },
     }
-}
-
-/// Append the required per-node audit event on the caller's transaction.
-async fn append_registration_audit(
-    conn: &mut TenantConn<'_>,
-    caller: &Caller,
-    card_uid: &CardUid,
-) -> Result<(), WyrdError> {
-    let event = audit_event(
-        caller,
-        "card.registration.create",
-        &format!("card:{card_uid}"),
-        "card:write",
-        AuditOutcome::Allowed,
-    );
-    append_on(conn, &event).await
 }
 
 /// Enforce request-wide invariants before database access.
@@ -1466,7 +1438,11 @@ pub(crate) async fn reconcile_cleanup_claim(
     conn.commit().await.map_err(registry_db_error)
 }
 
-/// Record a failed reconciler attempt and append a same-transaction dead-letter audit.
+/// Record a failed reconciler attempt and report a dead-letter transition.
+///
+/// Reconciliation is a background registry transition: it evaluates no principal
+/// permission, so the dead-letter outcome it owes is the durable reconciliation
+/// row it just wrote plus structured diagnostics, never a canonical audit event.
 pub(crate) async fn record_reconciliation_failure(
     state: &AppState,
     caller: &Caller,
@@ -1485,14 +1461,12 @@ pub(crate) async fn record_reconciliation_failure(
     )
     .await?;
     if dead_lettered {
-        let event = audit_event_unauthenticated(
-            RequestId::now_v7(),
-            "card.reconciliation.dead_letter",
-            &format!("card:{}", claim.card_uid),
-            "card:write",
-            AuditOutcome::Allowed,
+        tracing::warn!(
+            card_uid = %claim.card_uid,
+            reconcile_kind = ?claim.reconcile_kind,
+            error_code = error.code(),
+            "card reconciliation dead-lettered"
         );
-        append_on(&mut conn, &event).await?;
     }
     conn.commit().await.map_err(registry_db_error)?;
     Ok(dead_lettered)
@@ -1955,14 +1929,7 @@ async fn commit_card_activation(
         mark_card_reconciliation_succeeded(&mut conn, card_uid, lease_owner).await?;
     }
     if activated {
-        let event = audit_event(
-            caller,
-            "card.registration.complete",
-            &format!("card:{card_uid}"),
-            "card:write",
-            AuditOutcome::Allowed,
-        );
-        append_on(&mut conn, &event).await?;
+        tracing::info!(%card_uid, "card activated");
     }
     conn.commit().await.map_err(registry_db_error)?;
     Ok(activated)
@@ -2114,7 +2081,11 @@ async fn cleanup_manifest_artifact(
     Ok(())
 }
 
-/// Persist Pending→Failed and its audit event in one tenant transaction.
+/// Persist the Pending→Failed lifecycle transition in one tenant transaction.
+///
+/// Cleanup evaluates no principal permission — the caller's `card:write`
+/// decision was already audited when registration was received — so the durable
+/// record it owes is the failed card row plus structured diagnostics.
 async fn commit_card_failure(
     state: &AppState,
     caller: &Caller,
@@ -2127,14 +2098,7 @@ async fn commit_card_failure(
         if cleanup_succeeded {
             mark_card_reconciliation_succeeded(&mut conn, card_uid, None).await?;
         }
-        let event = audit_event(
-            caller,
-            "card.registration.cleanup",
-            &format!("card:{card_uid}"),
-            "card:write",
-            AuditOutcome::Allowed,
-        );
-        append_on(&mut conn, &event).await?;
+        tracing::warn!(%card_uid, cleanup_succeeded, "card registration failed and was cleaned up");
     }
     conn.commit().await.map_err(registry_db_error)?;
     Ok(failed)
@@ -2276,15 +2240,13 @@ async fn write_card_blob(
             .tenant_conn(caller.data_tenant_id)
             .await
             .map_err(registry_db_error)?;
-        let event = audit_event(
-            caller,
-            "card.registration.blob_write.failed",
-            &format!("card:{}", card.card_uid),
-            "card:write",
-            AuditOutcome::Allowed,
+        tracing::warn!(
+            card_uid = %card.card_uid,
+            blob_path = %blob_path,
+            %error,
+            "immutable card blob write failed"
         );
         record_blob_failure(&mut conn, &card.card_uid).await?;
-        append_on(&mut conn, &event).await?;
         conn.commit().await.map_err(registry_db_error)?;
         return Err(map_storage_error(error));
     }

@@ -74,9 +74,10 @@ semantics.
 - Every queue, reservation, retry, and cleanup path is bounded. Tenant
   mismatch, contradictory durable evidence, or ambiguous publication fails
   closed without discarding the last valid authority.
-- Audit cardinality follows independently durable domain transitions. Oracle
-  read admission uses the one local-WAL audit exception; other durable
-  transitions append audit evidence at their actual commit boundary.
+- Audit cardinality follows evaluated permission decisions: one event per
+  received verdict, appended before the result or refusal. Oracle read admission
+  uses the one local-WAL audit exception. Engine-internal transitions record
+  lineage in their own operational tables instead of audit.
 
 ## Rejected shapes
 

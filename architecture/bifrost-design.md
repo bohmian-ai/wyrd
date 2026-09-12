@@ -682,9 +682,16 @@ No cleanup infers safety from age or path shape alone.
   Uncertainty retains identity and evidence until reconciliation.
 - Catalog compare-and-swap and lease fences own publication authority. An
   object-store PUT alone never makes data visible or safe to delete.
-- All Postgres mutations and durable transitions append audit in their commit
-  transaction, except Oracle's WAL-before-read acceptance.
-- Operator-level Forge audit uses the tenant-bound fenced capability defined by
+- Audit records authorization decisions. Every boundary that evaluates a
+  principal's permission appends exactly one allowed or denied event before the
+  operation proceeds or refuses, in the operation's own commit transaction where
+  one exists, and fails closed when that append fails. Oracle's WAL-before-read
+  acceptance is the one exception to synchronous Postgres audit.
+- Engine-internal transitions — Scribe batch commits, Forge maintenance, audit
+  publication, reconciliation, storage lifecycle — evaluate no permission. They
+  record lineage in their own operational tables and structured diagnostics,
+  never canonical audit.
+- Operator-level Forge lineage uses the tenant-bound fenced capability defined by
   repository SQL rules; it is not a generic cross-tenant executor.
 - No retry or successor attempt in any Bifrost protocol widens tenant, table,
   snapshot, participant, deadline, permission, or resource authority.

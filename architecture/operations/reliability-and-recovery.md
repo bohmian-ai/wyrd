@@ -181,10 +181,12 @@ The current Scribe and Forge publication path publishes those ranges
 idempotently; a legacy direct-Iceberg relay is not a recovery mechanism.
 
 Staging rows retire only after their corresponding events are durably published
-to `vala.system.audit_log`. Recovery distinguishes unpublished rows from rows
-whose publication completed before the publisher checkpointed retirement. An
+to `vala.system.audit_log`. Recovery reads the per-tenant watermark together with
+the persisted frozen upper bound: a bound that survived a crash names the exact
+range whose publication is uncertain, so every competing or restarted publisher
+replays that identical range and derives the identical batch identity. An
 ambiguous boundary preserves the staging row and retries the idempotent
-publication.
+publication. Publication is itself an engine transition and appends no audit.
 
 ## Forge failure boundaries
 

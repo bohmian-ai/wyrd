@@ -20,6 +20,9 @@ The repository OpenAPI document is `openapi.yaml`. Its current title is `Wyrd AP
 - `/v1/cards/{card_uid}/complete`
 - `/v1/cards/{kind}/{space}/{name}/latest`
 - `/v1/cards/{kind}/{space}/{name}/versions`
+- `/v1/query`
+- `/v1/query/running`
+- `/v1/query/{request_id}`
 
 ## Refresh
 

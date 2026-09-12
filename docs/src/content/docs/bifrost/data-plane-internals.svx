@@ -19,7 +19,7 @@ Every Scribe pod owns a local write-ahead log. Writes ack only after `fsync(2)` 
 Format:
 
 - Magic bytes (`WRAW`) and format version in the segment header.
-- Framed records with CRC32C on each frame. Two record kinds: audit (kind=1) and data (kind=0). Every data record is immediately preceded by its audit record.
+- Framed records with CRC32C on each frame. The WAL carries ingest data records only: a batch commit evaluates no principal permission, so the caller's `bifrost_record:write` decision is audited at Gate and never restaged here.
 - Records carry a monotonically increasing LSN scoped to `(node_id, writer_epoch)`. LSNs are meaningful only within one Scribe pod's stream; cross-pod LSN comparison is undefined.
 - Segments roll over atomically at a size threshold; the header of the new segment is fsynced before the writer switches to it.
 
@@ -38,10 +38,10 @@ The seal itself is a pre-commit sequence followed by a single Postgres transacti
 1. **Freeze memtable.** Swap the mutable buffer for a fresh one; the frozen snapshot is immutable from here.
 2. **Encode Parquet.** Sort by `(data_tenant_id, wyrd_event_time)`. Build bloom filters on tenant + trace_id, write the page index.
 3. **PUT to object store.** Path: `s3://tenants/{tenant_uuid}/{logical_namespace}/{table}/day={YYYY-MM-DD}/{pod_id}-{ulid}.parquet`. The tenant-qualified prefix and `{pod_id}-{ulid}` suffix guarantee uniqueness across tenants and pods.
-4. **Atomic Postgres tx.** `INSERT INTO vala.file_list (...)` plus append the sealed audit rows for the batch. Commit or rollback as one unit.
+4. **Atomic Postgres tx.** `INSERT INTO vala.file_list (...)`. Commit or rollback as one unit; this lineage row is the seal's durable record.
 5. **Retire WAL bytes.** Update the seal manifest with the new `sealed_lsn`, truncate the covered WAL segments.
 
-Failure at any point before step 4 leaves the row invisible: no `file_list` entry, no audit rows. Any Parquet file already PUT becomes an orphan and is reaped later by Forge GC. Failure between steps 4 and 5 is safe too: the file is visible, replay skips it via `sealed_lsn`, and the WAL bytes are retired on the next successful seal for that key.
+Failure at any point before step 4 leaves the row invisible: no `file_list` entry. Any Parquet file already PUT becomes an orphan and is reaped later by Forge GC. Failure between steps 4 and 5 is safe too: the file is visible, replay skips it via `sealed_lsn`, and the WAL bytes are retired on the next successful seal for that key.
 
 Steps 4 and 5 are the durability boundary. Any Scribe crash before step 4 rolls back cleanly; any crash after it is guaranteed to converge on restart.
 
@@ -85,8 +85,14 @@ storage and audit context; the Forge page is the operational reference.
 
 ## Audit data
 
-Every audited operation appends an immutable row to the tenant-scoped,
-hash-chained `vala.audit_staging` in the operation's Postgres transaction.
+Audit records authorization decisions, one immutable row per evaluated verdict,
+appended to the tenant-scoped, hash-chained `vala.audit_staging` before the
+operation returns its result or its refusal. An allowed decision commits in the
+transaction that performs the operation wherever one exists; a denial commits in
+its own transaction. Both fail closed. Engine-internal transitions — Scribe seals,
+Forge maintenance, audit publication — evaluate no permission and record lineage
+in their own operational tables instead.
+
 Redux defines the canonical `vala.system.audit_log` schema and a deterministic
 projection from ordered staging rows; Scribe owns physical stamping when that
 projection is ingested.
@@ -98,7 +104,7 @@ Postgres role.
 
 | Pool | Connecting role | RLS | Purpose |
 |---|---|---|---|
-| App pool | `wyrd_app` | Enforced via `wyrd.current_tenant()` | Tenant-scoped reads and writes from the server; Scribe audit inserts |
+| App pool | `wyrd_app` | Enforced via `wyrd.current_tenant()` | Tenant-scoped reads and writes from the server; decision audit appends and Scribe lineage inserts |
 | Operator pool | `wyrd_platform_admin` | BYPASSRLS | Cross-tenant control-plane tables (`vala.maintenance_leases`, Forge lease coordination) |
 
 A few things worth being explicit about for audit purposes.

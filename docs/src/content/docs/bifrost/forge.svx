@@ -49,9 +49,9 @@ Forge makes sense only in the context of the Bifrost write and read paths.
 2. **Scribe** appends the batch to its local WAL and acknowledges it after
    `fsync`. It accumulates rows in a memtable keyed by tenant, table, and event
    day.
-3. **Scribe seals** a memtable into Parquet, writes the object, then commits a
-   `vala.file_list` row and the batch audit rows in one Postgres transaction.
-   The file is now durable staged data.
+3. **Scribe seals** a memtable into Parquet, writes the object, then commits the
+   `vala.file_list` row in one Postgres transaction. That lineage row is the
+   seal's durable record; the file is now durable staged data.
 4. **Oracle** reads the staged file through `vala.file_list` while
    `compacted = false`. It also reads the table's Iceberg snapshots. A recent
    write can therefore be queryable before Forge has processed it.
@@ -163,8 +163,8 @@ cross-system boundary explicit in `vala.file_list` and
 
 The prepared state is why reconciliation runs before new compaction. A crash
 after the input transition but before the Iceberg commit can temporarily hide
-the input from the staging scan. The next worker checks the audit detail and
-Iceberg manifests: if the output is live, it stamps the snapshot; if the output
+the input from the staging scan. The next worker checks the durable operation
+record and Iceberg manifests: if the output is live, it stamps the snapshot; if the output
 is absent after the uncertainty window, it resets the input. Forge does not
 guess from a single failed network request.
 
@@ -175,13 +175,13 @@ without deleting a snapshot that the table still needs.
 
 Forge selects by snapshot timestamp, not numeric snapshot ID. It protects the
 current snapshot, every metadata reference head, and the configured number of
-ancestors behind each head. The selection is written to a prepared audit event,
-then Forge reloads the table and recomputes eligibility before committing the
+ancestors behind each head. The selection is written as a prepared operation
+record, then Forge reloads the table and recomputes eligibility before committing the
 expiry transaction. That second check matters when another process advances a
 reference while Forge is working.
 
 Expiry uses the same recovery shape as compaction. Prepared, committed, and
-recovered audit phases describe what happened at the Iceberg boundary.
+recovered operation phases describe what happened at the Iceberg boundary.
 
 ## Orphan garbage collection
 
@@ -203,12 +203,14 @@ lease fence. If the object became referenced, Forge records it as skipped.
 That final reference check is the important part. The initial live set is a
 planning snapshot; it is not treated as permission to delete forever.
 
-## Audit and fencing model
+## Lineage and fencing model
 
-Every Forge transition has a stable operation ID and an audit detail containing
-the tenant/table resource, input IDs, object paths, and lifecycle phase. The
-audit row is written in the same tenant transaction as the corresponding
-`file_list` transition.
+Forge maintenance evaluates no principal permission, so it records no canonical
+audit. Every Forge transition instead has a stable operation ID and a durable
+operation record containing the tenant/table resource, input IDs, object paths,
+and lifecycle phase. That lineage row is written in the same tenant transaction
+as the corresponding `file_list` transition, so the record and its effect are
+durable together.
 
 Lease coordination uses the cross-tenant operator pool because leases cover
 maintenance ownership rather than user data. The state transition uses a
@@ -234,7 +236,7 @@ compaction debt remains.
 
 Everything else stays where it is already authoritative. Lease, fence, catalog,
 reconciliation, cursor, scheduler, and resource mechanics are structured traces
-and durable audit and task rows; unresolved authority or recovery is
+and durable operation and task rows; unresolved authority or recovery is
 `bifrost_role_ready`. None of it is duplicated as a metric, and no Forge series
 carries a tenant, table, task, attempt, snapshot, path, or request label.
 
@@ -381,11 +383,11 @@ The implementation follows the lifecycle described above:
 | `forge/worker.rs` | Claim, fenced dispatch, settlement, and recovery reconciliation. |
 | `forge/planner.rs` | Candidate selection and durable task identity. |
 | `forge/metrics.rs` | The sole Forge metric owner and its closed label schema. |
-| `forge/compact.rs` | Candidate selection, staged-file validation, Iceberg compaction, audit transitions, and reconciliation. |
+| `forge/compact.rs` | Candidate selection, staged-file validation, Iceberg compaction, lineage transitions, and reconciliation. |
 | `forge/expire.rs` | Snapshot selection, expiry commit, and expiry recovery. |
 | `forge/orphan_gc.rs` | Live-set construction, candidate selection, final reference checks, deletion, and GC recovery. |
 | `forge/lease.rs` | Lease acquisition, renewal, release, and transaction fencing. |
-| `vala-sql` maintenance queries and migrations | Lease storage, audit paging, and database-side fence assertions. |
+| `vala-sql` maintenance queries and migrations | Lease storage, operation-record paging, and database-side fence assertions. |
 
 For the broader Bifrost storage model, see [Bifrost architecture](/bifrost/architecture)
 and [Data plane internals](/bifrost/data-plane-internals). For the client-facing

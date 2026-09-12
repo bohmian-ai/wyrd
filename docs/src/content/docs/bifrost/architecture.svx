@@ -43,7 +43,7 @@ orphan GC protect live data, and how leases fence concurrent workers.
     { from: 'Scribe', to: 'Scribe', label: 'accumulate in memtable' },
     { from: 'Scribe', to: 'Scribe', label: 'seal: 50k · 1s · 128 MiB · 5s inactivity' },
     { from: 'Scribe', to: 'Object store', label: 'PUT sealed Parquet' },
-    { from: 'Scribe', to: 'Postgres', label: 'INSERT vala.file_list + audit (atomic)' },
+    { from: 'Scribe', to: 'Postgres', label: 'INSERT vala.file_list (atomic)' },
     { from: 'Scribe', to: 'Scribe', label: 'truncate WAL past sealed_lsn' }
   ]}
 />
@@ -57,7 +57,7 @@ orphan GC protect live data, and how leases fence concurrent workers.
    - Freeze memtable into an immutable Arrow snapshot.
    - Encode Parquet (sorted by `data_tenant_id`, `wyrd_event_time`; bloom filters, page index).
    - PUT to object store: `s3://tenants/{tenant_uuid}/{logical_namespace}/{table}/day={YYYY-MM-DD}/{pod_id}-{ulid}.parquet`.
-   - Atomic Postgres transaction: INSERT `vala.file_list` row + append audit rows.
+   - Atomic Postgres transaction: INSERT the `vala.file_list` row. A batch commit evaluates no principal permission, so its durable record is that lineage row, never an audit event.
    - On commit, truncate WAL and retire manifest.
 7. **(Async) Forge** leases a tenant/table via `vala.maintenance_leases`, bin-packs small Parquet files into Iceberg data files, updates `vala.file_list`, and runs snapshot expiry plus orphan GC. See the [Forge system overview](/bifrost/forge) for the maintenance state machine.
 
@@ -172,13 +172,13 @@ Multiple Forge pods race for `(namespace, table)` leases via `vala.maintenance_l
 
 Scribe appends WAL record, calls `fsync(segment_fd)`, returns `Ok(lsn)` only after fsync. Ack is durable.
 
-Every `ScribeAppend` produces audit record (kind=1) immediately followed by data record (kind=0); both fsync'd before ack.
+Every `ScribeAppend` produces one data record, fsync'd before ack. The WAL carries ingest lineage only; the caller's `bifrost_record:write` decision was already audited at Gate.
 
 ### WAL replay on restart
 
 Scribe's manifest records `sealed_lsn[K]` per seal-key. On boot:
 1. Read WAL segments past `sealed_lsn`
-2. Rebuild memtables and staged `AuditEvent`s
+2. Rebuild memtables from the replayed slices
 3. Dedupe by `batch_id` at replay layer
 4. Dedupe by `(node_id, writer_epoch, wal_lsn_min, wal_lsn_max)` on `file_list` INSERT (unique index)
 5. Truncate torn tails (CRC validation, LSN monotonicity check)
@@ -190,7 +190,7 @@ Idempotent: if the pod crashed after PUT but before COMMIT, replay re-encodes Pa
 | Failure | Behavior |
 |---------|----------|
 | Scribe crashes after WAL append but before seal | WAL replay rebuilds memtable, seal retries |
-| Scribe crashes after Parquet PUT but before Postgres COMMIT | Rollback atomically, no `file_list` row, no audit rows, Parquet becomes orphan (Forge GC reaps) |
+| Scribe crashes after Parquet PUT but before Postgres COMMIT | Rollback atomically, no `file_list` row, Parquet becomes orphan (Forge GC reaps) |
 | Scribe crashes after Postgres COMMIT | WAL bytes retired, file visible to Oracle |
 | Forge crashes mid-tick | Lease expires, successor pod re-derives state from durable surface and re-runs (idempotent) |
 | Object storage temporarily unavailable | Seal retries with backoff; new appends return `429_INGEST_BUSY` until PUT succeeds |
@@ -311,17 +311,26 @@ The predicate cannot be elided by a DataFusion optimizer pass because the rule i
 
 ## Audit data
 
-Audited operations append immutable, hash-chained rows to
-`vala.audit_staging` in their Postgres transaction. Redux owns the canonical
-`vala.system.audit_log` table definition and deterministic row projection.
+Audit records authorization decisions. Every boundary that evaluates a
+principal's permission appends exactly one immutable, hash-chained row to
+`vala.audit_staging` before it returns a result or a refusal. Redux owns the
+canonical `vala.system.audit_log` table definition and deterministic row
+projection.
 
-The audit log captures: operation name, principal ID, tenant, timestamp, decision (allow/deny), result, and detail field. Denials are written in a separate fail-closed transaction before the error is returned to the caller.
+The audit row captures: operation name, principal ID, tenant, timestamp,
+decision (allow/deny), result, and detail field. An allowed decision commits in
+the transaction that performs the authorized operation wherever one exists, so
+the decision is durable exactly when its effect is; a denial commits in its own
+transaction before the error is returned. Both are fail-closed: an append
+failure refuses the operation. Engine-internal transitions — Scribe batch
+commits, Forge maintenance, audit publication — evaluate no permission and
+record lineage in their own operational tables instead.
 
 ## Payload governance
 
 Tables may mark columns as sensitive metadata. Oracle does not enforce separate column permissions; `bifrost_query:read` for the table governs every column, including GenAI fields stored on trace spans.
 
-Write-path redaction (when enabled) zeros sensitive columns before seal. Columns in the `REDACTED_COLUMNS` set are zeroed (strings become empty, numerics become 0, binaries become zero bytes) before the Arrow batch is sealed to Parquet. Redaction is transparent to the SDK and logged in the audit row.
+Write-path redaction (when enabled) zeros sensitive columns before seal. Columns in the `REDACTED_COLUMNS` set are zeroed (strings become empty, numerics become 0, binaries become zero bytes) before the Arrow batch is sealed to Parquet. Redaction is transparent to the SDK and recorded in Scribe's seal lineage.
 
 ## Database privilege model
 
@@ -331,4 +340,4 @@ Bifrost uses three Postgres connection pools with distinct privilege levels:
 - **OperatorPool** (BYPASSRLS, `wyrd_platform_admin` role). Cross-tenant reads/writes for Forge compaction, Oracle fused scans, and maintenance tasks.
 - **RecoveryConn** (`wyrd_recovery` role). Disaster recovery and migration tasks only.
 
-Scribe uses TenantConn for audit writes (RLS-bound). Forge and Oracle use OperatorPool for cross-tenant operations with explicit admin roles.
+Scribe uses TenantConn for its tenant lineage writes (RLS-bound). Forge and Oracle use OperatorPool for cross-tenant operations with explicit admin roles.

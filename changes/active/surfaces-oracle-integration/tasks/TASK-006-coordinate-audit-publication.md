@@ -144,3 +144,70 @@ demonstrate simultaneous delivery of an identical sealed batch to distinct
 Scribe replicas and exact-once public visibility. The implementer must inspect
 the current harness and record the exact focused command after choosing the
 existing test location; missing proof blocks completion.
+
+## Acceptance Evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| A frozen `1..100` survives row `101`; no competing or restarted publisher widens it | `vala-sql/migrations/20260802000000_vala_audit_staging.sql` (`publishing_seq_hi` + CHECK), `vala-sql/src/queries/audit_staging.rs::freeze_publication_range` | `pg_audit_staging::frozen_range_survives_tail_growth_competition_and_stale_settlement` | PASS |
+| Crash after Scribe acceptance, before watermark advance, replays the identical tenant and bounds into the batch fence | `wyrd-server/src/audit/publication.rs::publish_range`, `vala-bifrost-redux/src/tables/audit/projection.rs::derive_batch_id` | `server::audit_publication::frozen_audit_range_replays_once_while_its_tail_waits` (two `publish_range` calls on one frozen range, retained count still 3) | PASS |
+| A stale completion neither clears nor advances past a newer in-flight bound; rows above the bound stay staged | `vala-sql/src/queries/audit_staging.rs::settle_publication` (`GREATEST` + `CASE WHEN publishing_seq_hi = $1`) | `pg_audit_staging::frozen_range_survives_tail_growth_competition_and_stale_settlement` (asserts `published_seq = 3`, `publishing_seq_hi = Some(4)` after the stale settle) | PASS |
+| Watermark advance, bound clearance, and deletion commit atomically; an idle tenant drains to zero | `settle_publication` (one tenant transaction), `publication.rs::settle` | `pg_audit_staging::settled_tenant_drains_to_zero_and_owes_nothing`, `pg_audit_staging::publication_batch_is_bounded_and_settlement_is_idempotent`, journey `await_drained` | PASS |
+| Concurrent tenants publish independently; slow publication holds no audit-chain append lock | `publication.rs::freeze` / `read_range` / `settle` each own a short transaction; no lock spans `ingest_frame` | `pg_audit_staging::settlement_is_tenant_scoped`; the server journey appends a new decision after the fence commits and the background worker carries it | PASS |
+| AuditPublisher starts only where a local Scribe exists and calls it directly; no retained path calls Gate or audits itself | `publication.rs::from_state` (`state.bifrost_ingest()?.scribe()`), `publish_range` calls `ScribeImpl::ingest_frame` | `server::audit_publication::audited_transitions_retire_only_into_retained_history` (background worker publishes and drains); `grep` shows no `publish_audit_projection` caller remains | PASS |
+| Gate's audit-public retained-publication bypass is deleted without a replacement trait, adapter, service, or public API | `vala-bifrost-redux/src/gate/mod.rs` — `publish_audit_projection` and `audit_batch_id` removed; version/variant stamping folded into `derive_batch_id` | `mise run lints` (exit 0, `--all-features --all-targets`) | PASS |
+| Architecture and replay documentation describes the frozen in-flight range | `architecture/bifrost-design.md`, `architecture/wyrd-security-posture.md`, `AGENTS.md` §2 | Text review: the "watermark is the only progress state" claim is replaced by watermark + one frozen bound | PASS |
+| Exactly one new canonical-ingest concurrency scenario, in an existing harness and test binary | `wyrd-testing/tests/bifrost/scribe/horizontal_ingest.rs::one_sealed_batch_submitted_to_every_pod_is_visible_once` (reuses `WyrdTestCluster`, `endpoint_clients`, `append_values`, `read_rows`) | `scribe::horizontal_ingest::one_sealed_batch_submitted_to_every_pod_is_visible_once` | PASS |
+
+Non-goals held: no lease, owner token, claim table, scheduler, service, global
+lock, migration, compatibility path, backfill, new test file, or new harness was
+added. `list_publication_batch` survives only as the staging-inspection read the
+journeys and SQL tier already used.
+
+### Commands
+
+```
+mise run fmt                           # clean
+mise run lints                         # exit 0
+mise run check:unwrap-audit            # unwrap/expect audit passed
+mise run test:sql                      # 112/112 + 2/2
+mise run test:bifrost:journey:server   # 7/7
+mise run test:bifrost:journey:scribe   # 18/21 (3 pre-existing failures, below)
+git diff --check                       # clean
+
+# Focused, through the repository Postgres wrapper:
+scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner \
+  && mise exec -- cargo nextest run --locked -p vala-sql --test pg_audit_staging \
+     -E 'test(=pg_tests::audit_staging::frozen_range_survives_tail_growth_competition_and_stale_settlement) \
+       + test(=pg_tests::audit_staging::publication_batch_is_bounded_and_settlement_is_idempotent) \
+       + test(=pg_tests::audit_staging::settled_tenant_drains_to_zero_and_owes_nothing) \
+       + test(=pg_tests::audit_staging::settlement_is_tenant_scoped)' \
+  && mise exec -- cargo nextest run --locked -p wyrd-testing --test server -P journey --run-ignored=all \
+     -E 'test(=audit_publication::frozen_audit_range_replays_once_while_its_tail_waits) \
+       + test(=audit_publication::audited_transitions_retire_only_into_retained_history)' \
+  && mise exec -- cargo nextest run --locked -p wyrd-testing --test scribe -P journey --run-ignored=all \
+     -E 'test(=horizontal_ingest::one_sealed_batch_submitted_to_every_pod_is_visible_once)'"
+# 4/4, 2/2, 1/1 PASS
+```
+
+### Material limits
+
+- Three `test:bifrost:journey:scribe` cases fail, and all three fail identically
+  at the pre-task baseline `32a0aafec` when run in a clean worktree, so none is
+  caused by this task:
+  - `source_boundary_recovery::scribe_failure_retry_replay_remain_atomic`
+    (`left: 0, right: 1`, "one committed publication is exactly one durable
+    audit transition"). Its helper counts `vala.audit_staging` rows for
+    `operation = 'bifrost.scribe.visibility.publish'`, but that name now exists
+    only as a tracing span: Scribe publication is lineage, not audit. The
+    assertion is stale TASK-005 coverage and needs re-pointing at
+    `vala.scribe_batch_commits`; that belongs to the audit-boundary task, not to
+    publication coordination.
+  - `qualification::scribe_512_mib_physical_object_qualifies` (`left: 1,
+    right: 0`, "publication must leave no writable bucket owning published
+    rows") and `sustained::scribe_sustained_ingest_oracle_hot_read_journey`
+    (`left: 4, right: 0`, "a published pod owns no writable bucket"). Both are
+    Scribe bucket-ownership assertions untouched by this task.
+- `mise run codegen:check` was not run: no wire type, schema, OpenAPI surface, or
+  stub changed. `AuditProjection::batch_id` moved from `[u8; 16]` to `Uuid`, and
+  that type is engine-internal with no generated projection.

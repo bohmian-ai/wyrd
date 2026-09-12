@@ -1894,8 +1894,19 @@ mod pg_tests {
         stop_cli_server(server, shutdown, serve_handle).await;
     }
 
+    /// Prove `wyrd apply` fails closed when the completion decision cannot be audited.
+    ///
+    /// Completing a registration is a receiving authorization boundary, so its
+    /// permission verdict is appended before the backend completion runs. A
+    /// trigger refuses that one append; the CLI must surface the stable
+    /// audit-unavailable error and its generic exit code rather than a
+    /// completed registration.
+    ///
+    /// # Panics
+    /// Panics when the embedded server or fixture setup fails, or the CLI does
+    /// not report the fail-closed refusal.
     #[tokio::test]
-    async fn apply_surfaces_backend_completion_failure() {
+    async fn apply_refuses_when_completion_decision_audit_fails() {
         if std::env::var("WYRD_CLI_E2E").as_deref() != Ok("1") {
             return;
         }
@@ -1950,15 +1961,15 @@ mod pg_tests {
 
         assert_eq!(
             output.status.code(),
-            Some(69),
+            Some(1),
             "stdout={} stderr={}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(first_stderr_json(&output)["status"], 502);
+        assert_eq!(first_stderr_json(&output)["status"], 500);
         assert_eq!(
             first_stderr_json(&output)["code"],
-            "WYRD_SPEC_502_UPSTREAM_FAILURE"
+            "WYRD_VALA_500_AUDIT_UNAVAILABLE"
         );
         stop_cli_server(server, shutdown, serve_handle).await;
     }

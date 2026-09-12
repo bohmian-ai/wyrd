@@ -304,13 +304,24 @@ async fn local_client_server_round_trip() {
     run_client_server_journey(srv, "local/weights.bin", false).await;
 }
 
+/// A principal holding no Card permission is refused at both storage entry
+/// routes, and each refusal is audited as its own denied decision.
+///
+/// Upload and download planning are receiving authorization boundaries, so the
+/// verdict is recorded before anything about the Card or its objects is
+/// disclosed. The journey drives both routes through the real client against a
+/// bound server, requires the stable RBAC code on each, and reads staging to
+/// prove exactly one `denied` row per route.
 #[tokio::test(flavor = "current_thread")]
 async fn storage_routes_refuse_and_audit_an_unprivileged_caller() {
     if !enabled("WYRD_STORAGE_E2E") {
         return;
     }
-    let storage_root = tempfile::tempdir().expect("storage root creates");
-    let srv = server_from_settings(local_settings(storage_root.path())).await;
+    // Both routes refuse before any storage IO, so the default bound server
+    // suffices and no backend is configured.
+    let srv = WyrdTestServer::start_bound()
+        .await
+        .expect("start bound server");
     let service = srv
         .bootstrap_service("storage-unprivileged", &[])
         .await
@@ -358,7 +369,7 @@ async fn storage_routes_refuse_and_audit_an_unprivileged_caller() {
         .await
         .expect("tenant connection opens");
     let denials: Vec<(String, String)> = sqlx::query_as(
-        "SELECT operation, decision FROM vala.audit_staging \
+        "SELECT operation, outcome FROM vala.audit_staging \
          WHERE operation IN ('storage.upload.init', 'storage.download.init') \
          ORDER BY operation",
     )
@@ -369,8 +380,8 @@ async fn storage_routes_refuse_and_audit_an_unprivileged_caller() {
     assert_eq!(
         denials,
         vec![
-            ("storage.download.init".to_owned(), "deny".to_owned()),
-            ("storage.upload.init".to_owned(), "deny".to_owned()),
+            ("storage.download.init".to_owned(), "denied".to_owned()),
+            ("storage.upload.init".to_owned(), "denied".to_owned()),
         ],
         "each refused storage route audits its own denial exactly once"
     );

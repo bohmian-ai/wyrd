@@ -101,7 +101,7 @@ async fn scribe_failure_retry_replay_remain_atomic() {
     let mut expected: Vec<i64> = first.iter().chain(second.iter()).copied().collect();
     expected.sort_unstable();
 
-    let audits_before = publication_audits(&server, tenant, &table).await;
+    let files_before = published_generations(&server, tenant, &name).await;
     faults.fail_next_post_commit_response();
     let ambiguous = server
         .flush_bifrost()
@@ -130,9 +130,9 @@ async fn scribe_failure_retry_replay_remain_atomic() {
         "the committed-but-unacknowledged publication must be durably visible exactly once"
     );
     assert_eq!(
-        publication_audits(&server, tenant, &table).await,
-        audits_before + 1,
-        "one committed publication is exactly one durable audit transition"
+        committed.len(),
+        files_before + 1,
+        "one committed publication is exactly one durable published generation"
     );
     assert_eq!(
         sorted_values(&client, &table).await,
@@ -159,11 +159,6 @@ async fn scribe_failure_retry_replay_remain_atomic() {
             .collect::<Vec<_>>(),
         "reconciliation must retain the committed object identities rather than \
          publishing the same members again"
-    );
-    assert_eq!(
-        publication_audits(&server, tenant, &table).await,
-        audits_before + 1,
-        "a reconciling retry inserts no artifact row and therefore emits no second audit"
     );
     assert_eq!(
         published_rows(&server, tenant, &name).await,
@@ -213,19 +208,23 @@ async fn scribe_failure_retry_replay_remain_atomic() {
     server.shutdown().await.expect("the server drains cleanly");
 }
 
-/// Counts the durable publication transitions recorded for one logical table.
+/// Counts the generations one logical table has durably published.
 ///
-/// Wraps the server-side audit probe so the case reads as a statement about the
-/// table under test rather than about the outbox query.
-async fn publication_audits(
+/// A file-list commit is lineage, not audit: Scribe publication evaluates no
+/// principal permission, so the only truthful record that a generation became
+/// visible is the published file row it committed. Counting those rows is how a
+/// case distinguishes "the retry reconciled the identical publication" from
+/// "the retry published a second time under a new identity".
+async fn published_generations(
     server: &WyrdTestServer,
     tenant: wyrd_spec::DataTenantId,
-    table_fqn: &str,
-) -> i64 {
+    name: &str,
+) -> usize {
     server
-        .scribe_publication_audit_count_for_test(tenant, table_fqn)
+        .published_hot_files_for_test(tenant, BifrostNamespace::Datasets.as_str(), name)
         .await
-        .expect("Scribe publication audit rows are inspectable")
+        .expect("published hot files are inspectable")
+        .len()
 }
 
 /// Asserts a settled Scribe retains no staged, claim, or scratch ownership.

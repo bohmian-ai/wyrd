@@ -8,6 +8,7 @@
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::scribe::geometry::ScribeGeometry;
+use vala_bifrost_redux::scribe::telemetry::{ScribeBucketMemorySnapshot, ScribeInspectionSnapshot};
 use wyrd_spec::DataTenantId;
 use wyrd_testing::WyrdTestServer;
 
@@ -542,4 +543,23 @@ pub(super) fn hour_start(at: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<
         .and_then(|value| value.with_second(0))
         .and_then(|value| value.with_nanosecond(0))
         .expect("an hour boundary is a valid instant")
+}
+
+/// The inspected buckets this journey is answerable for.
+///
+/// The server runs its own retained-audit publisher on a fixed interval, and it
+/// appends `vala.system.audit_log` through the same local Scribe as any other
+/// writer. Those buckets are live engine state owned by that publisher's
+/// schedule, not ownership left behind by the publication a journey drove, so a
+/// case proving it returned every byte it borrowed must read past them. Every
+/// other bucket still belongs to the journey and is returned intact so a
+/// failure names the surviving seal keys.
+pub(super) fn journey_buckets(
+    snapshot: &ScribeInspectionSnapshot,
+) -> Vec<&ScribeBucketMemorySnapshot> {
+    snapshot
+        .memory_by_bucket
+        .iter()
+        .filter(|bucket| bucket.seal_key.table.namespace != BifrostNamespace::Audit)
+        .collect()
 }

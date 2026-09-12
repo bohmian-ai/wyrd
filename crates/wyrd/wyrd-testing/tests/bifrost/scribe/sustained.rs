@@ -222,9 +222,11 @@ async fn scribe_sustained_ingest_oracle_hot_read_journey() {
     let staged = server
         .scribe_inspection_snapshot()
         .expect("Scribe ownership is inspectable");
-    assert_eq!(
-        staged.writable_bucket_count, 0,
-        "the freeze must leave no writable bucket owning acknowledged rows"
+    let frozen = super::support::journey_buckets(&staged);
+    assert!(
+        frozen.iter().all(|bucket| bucket.writable_bytes == 0),
+        "the freeze must leave no writable bucket owning acknowledged rows; \
+         surviving: {frozen:?}"
     );
     assert!(
         server
@@ -430,9 +432,10 @@ fn assert_terminal_reconciliation(server: &WyrdTestServer) {
     let snapshot = server
         .scribe_inspection_snapshot()
         .expect("Scribe ownership is inspectable");
-    assert_eq!(
-        snapshot.writable_bucket_count, 0,
-        "a published pod owns no writable bucket"
+    let owned = super::support::journey_buckets(&snapshot);
+    assert!(
+        owned.iter().all(|bucket| bucket.writable_bytes == 0),
+        "a published pod owns no writable bucket; surviving: {owned:?}"
     );
     assert_eq!(
         snapshot.queued_items, 0,

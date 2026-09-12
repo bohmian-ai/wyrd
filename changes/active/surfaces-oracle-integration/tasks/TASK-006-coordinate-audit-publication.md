@@ -192,22 +192,25 @@ scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner \
 
 ### Material limits
 
-- Three `test:bifrost:journey:scribe` cases fail, and all three fail identically
-  at the pre-task baseline `32a0aafec` when run in a clean worktree, so none is
-  caused by this task:
+- Three `test:bifrost:journey:scribe` cases encoded assumptions this task
+  falsified and were corrected rather than reported as pre-existing:
   - `source_boundary_recovery::scribe_failure_retry_replay_remain_atomic`
-    (`left: 0, right: 1`, "one committed publication is exactly one durable
-    audit transition"). Its helper counts `vala.audit_staging` rows for
-    `operation = 'bifrost.scribe.visibility.publish'`, but that name now exists
-    only as a tracing span: Scribe publication is lineage, not audit. The
-    assertion is stale TASK-005 coverage and needs re-pointing at
-    `vala.scribe_batch_commits`; that belongs to the audit-boundary task, not to
-    publication coordination.
-  - `qualification::scribe_512_mib_physical_object_qualifies` (`left: 1,
-    right: 0`, "publication must leave no writable bucket owning published
-    rows") and `sustained::scribe_sustained_ingest_oracle_hot_read_journey`
-    (`left: 4, right: 0`, "a published pod owns no writable bucket"). Both are
-    Scribe bucket-ownership assertions untouched by this task.
+    counted `vala.audit_staging` rows for
+    `operation = 'bifrost.scribe.visibility.publish'`, a name that exists only as
+    a tracing span — Scribe publication is lineage, not audit, so the count was
+    structurally zero. It now counts the published generations the commit
+    produced, which is the lineage authority for the property it claimed. The
+    redundant second assertion and the dead
+    `WyrdTestServer::scribe_publication_audit_count_for_test` probe were deleted.
+  - `qualification::scribe_512_mib_physical_object_qualifies` and both
+    bucket-ownership assertions in
+    `sustained::scribe_sustained_ingest_oracle_hot_read_journey` asserted that
+    Scribe owns no writable bucket at all. This task gave the server its own
+    retained-audit writer on a fixed interval, so `vala.system.audit_log` buckets
+    appear on the publisher's schedule and no global count can be stable. The
+    three sites now read through `support::journey_buckets`, which excludes the
+    `Audit` namespace and returns every other bucket so a failure names the
+    surviving seal keys.
 - `mise run codegen:check` was not run: no wire type, schema, OpenAPI surface, or
   stub changed. `AuditProjection::batch_id` moved from `[u8; 16]` to `Uuid`, and
   that type is engine-internal with no generated projection.

@@ -1733,36 +1733,6 @@ impl WyrdTestServer {
             .ok_or_else(|| WyrdTestServerError::Start("server owns no Scribe".to_owned()))
     }
 
-    /// Count the durable Scribe publication transitions one table has recorded.
-    ///
-    /// A file-list commit emits exactly one `bifrost.scribe.visibility.publish`
-    /// row per published generation, and a reconciling retry that inserts no
-    /// new artifact rows emits none. Counting them is therefore how a caller
-    /// distinguishes "the retry reconciled the identical publication" from
-    /// "the retry published a second time under a new identity".
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the fixture's superuser pool cannot be acquired or
-    /// the tenant-scoped audit query fails.
-    pub async fn scribe_publication_audit_count_for_test(
-        &self,
-        tenant: DataTenantId,
-        resource: &str,
-    ) -> Result<i64, WyrdTestServerError> {
-        let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
-        sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM vala.audit_staging \
-             WHERE data_tenant_id = $1 AND resource = $2 \
-               AND operation = 'bifrost.scribe.visibility.publish'",
-        )
-        .bind(tenant.as_uuid())
-        .bind(resource)
-        .fetch_one(&pool)
-        .await
-        .map_err(sql)
-    }
-
     /// Trip the server-owned WAL breaker for a deterministic failure probe.
     pub fn trip_bifrost_wal_disk_full_for_test(&self) -> Result<(), WyrdTestServerError> {
         self.inner

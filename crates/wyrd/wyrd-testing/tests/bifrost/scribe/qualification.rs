@@ -185,13 +185,10 @@ async fn scribe_512_mib_physical_object_qualifies() {
     let settled = server
         .scribe_inspection_snapshot()
         .expect("Scribe ownership is inspectable");
-    assert_eq!(
-        settled.writable_bucket_count, 0,
-        "publication must leave no writable bucket owning published rows"
-    );
-    assert_eq!(
-        settled.immutable_bucket_count, 0,
-        "publication must leave no immutable bucket owning published rows"
+    let owned = super::support::journey_buckets(&settled);
+    assert!(
+        owned.is_empty(),
+        "publication must leave no bucket owning published rows; surviving: {owned:?}"
     );
 
     // PUT evidence: the rows come back from the objects that were uploaded.

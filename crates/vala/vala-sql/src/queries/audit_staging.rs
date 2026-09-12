@@ -9,7 +9,6 @@
 // raw-query grep allowlist: audit staging tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use sha2::{Digest, Sha256};
-use sqlx::PgConnection;
 use wyrd_spec::vala::api::{AuditEvent, AuditOutcome, audit_detail_canonical_json};
 use wyrd_sql::TenantConn;
 
@@ -27,17 +26,7 @@ use crate::row_types::audit_staging::AuditStagingRow;
 /// # Errors
 /// Returns [`SqlError`] when any statement fails or an RLS policy rejects a row.
 pub async fn append_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Result<i64, SqlError> {
-    append_audit_connection(conn.transaction(), event).await
-}
-
-/// Implements canonical audit encoding for an already tenant-bound connection.
-///
-/// # Errors
-/// Returns [`SqlError`] when chain locking, hashing persistence, or RLS fails.
-async fn append_audit_connection(
-    conn: &mut PgConnection,
-    event: &AuditEvent,
-) -> Result<i64, SqlError> {
+    let conn = &mut **conn.transaction();
     sqlx::query(
         r#"
         INSERT INTO vala.audit_chain_head (data_tenant_id)
@@ -53,7 +42,6 @@ async fn append_audit_connection(
         r#"
         SELECT last_seq, head_hash
           FROM vala.audit_chain_head
-         WHERE data_tenant_id = wyrd.current_tenant()
         FOR UPDATE
         "#,
     )
@@ -103,7 +91,6 @@ async fn append_audit_connection(
         r#"
         UPDATE vala.audit_chain_head
            SET last_seq = $1, head_hash = $2, updated_at = now()
-         WHERE data_tenant_id = wyrd.current_tenant()
         "#,
     )
     .bind(seq)
@@ -128,9 +115,10 @@ pub async fn record_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Resu
 
 /// Read a bounded page of audit rows for one tenant-bound resource.
 ///
-/// The caller supplies the last observed sequence number. RLS remains the
-/// tenant boundary; the explicit current-tenant predicate keeps the query
-/// aligned with the covering `(data_tenant_id, resource, seq)` index.
+/// The caller supplies the last observed sequence number. RLS is the only
+/// tenant boundary: the policy on `vala.audit_staging` supplies the
+/// `data_tenant_id` equality the covering `(data_tenant_id, resource, seq)`
+/// index is planned against, so no statement repeats it.
 ///
 /// # Errors
 /// Returns [`SqlError`] when the page query fails.
@@ -146,8 +134,7 @@ pub async fn list_audit_events_for_resource(
                operation, resource, card_ref, principal_id, principal_kind,
                permission, outcome, detail, created_at
           FROM vala.audit_staging
-         WHERE data_tenant_id = wyrd.current_tenant()
-           AND resource = $1
+         WHERE resource = $1
            AND seq > $2
          ORDER BY seq
          LIMIT $3
@@ -180,7 +167,6 @@ pub async fn list_publication_batch(
                operation, resource, card_ref, principal_id, principal_kind,
                permission, outcome, detail, created_at
           FROM vala.audit_staging
-         WHERE data_tenant_id = wyrd.current_tenant()
          ORDER BY seq
          LIMIT $1
         "#,
@@ -231,7 +217,6 @@ pub async fn freeze_publication_range(
         WITH head AS (
             SELECT published_seq, publishing_seq_hi
               FROM vala.audit_chain_head
-             WHERE data_tenant_id = wyrd.current_tenant()
             FOR UPDATE
         )
         SELECT head.published_seq + 1,
@@ -241,8 +226,7 @@ pub async fn freeze_publication_range(
                       FROM (
                           SELECT seq
                             FROM vala.audit_staging
-                           WHERE data_tenant_id = wyrd.current_tenant()
-                             AND seq > head.published_seq
+                           WHERE seq > head.published_seq
                            ORDER BY seq
                            LIMIT $1
                       ) prefix)
@@ -264,7 +248,6 @@ pub async fn freeze_publication_range(
             r#"
             UPDATE vala.audit_chain_head
                SET publishing_seq_hi = $1, updated_at = now()
-             WHERE data_tenant_id = wyrd.current_tenant()
             "#,
         )
         .bind(seq_hi)
@@ -293,8 +276,7 @@ pub async fn list_publication_range(
                operation, resource, card_ref, principal_id, principal_kind,
                permission, outcome, detail, created_at
           FROM vala.audit_staging
-         WHERE data_tenant_id = wyrd.current_tenant()
-           AND seq BETWEEN $1 AND $2
+         WHERE seq BETWEEN $1 AND $2
          ORDER BY seq
         "#,
     )
@@ -333,7 +315,6 @@ pub async fn settle_publication(conn: &mut TenantConn<'_>, seq_hi: i64) -> Resul
                    ELSE publishing_seq_hi
                END,
                updated_at = now()
-         WHERE data_tenant_id = wyrd.current_tenant()
         "#,
     )
     .bind(seq_hi)
@@ -343,11 +324,9 @@ pub async fn settle_publication(conn: &mut TenantConn<'_>, seq_hi: i64) -> Resul
     let result = sqlx::query(
         r#"
         DELETE FROM vala.audit_staging
-         WHERE data_tenant_id = wyrd.current_tenant()
-           AND seq <= (
+         WHERE seq <= (
                SELECT published_seq
                  FROM vala.audit_chain_head
-                WHERE data_tenant_id = wyrd.current_tenant()
            )
         "#,
     )

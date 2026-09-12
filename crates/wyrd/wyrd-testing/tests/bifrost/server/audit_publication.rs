@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use vala_sql::queries::audit_staging::{
     append_audit, freeze_publication_range, list_publication_batch,
 };
@@ -146,6 +148,33 @@ async fn await_drained(
     }
 }
 
+/// Hold every staged row of one frozen range so settlement cannot drain it.
+///
+/// Settlement advances the watermark and deletes through it in one transaction,
+/// so a row lock on the staged rows stops a cycle after its durable Scribe
+/// append and before any of its Postgres effects commit. The lock is taken on
+/// the staged rows rather than on the chain-head row because the chain head is
+/// also locked by `freeze_publication_range`: fencing there would stop a cycle
+/// before it published anything, which is the wrong half of the window.
+///
+/// The returned connection owns the lock; committing it releases the fence.
+///
+/// # Errors
+/// Returns the tenant-connection or lock failure Postgres raised.
+async fn fence_staged_rows(
+    server: &WyrdTestServer,
+    tenant: DataTenantId,
+    range: vala_sql::queries::audit_staging::AuditPublicationRange,
+) -> Result<vala_sql::TenantConn<'_>, ServerJourneyError> {
+    let mut fence = server.tenant_conn_for(tenant).await?;
+    sqlx::query("SELECT seq FROM vala.audit_staging WHERE seq BETWEEN $1 AND $2 FOR UPDATE")
+        .bind(range.seq_lo)
+        .bind(range.seq_hi)
+        .fetch_all(&mut **fence.transaction())
+        .await?;
+    Ok(fence)
+}
+
 /// A frozen audit range replays exactly once while its tail waits behind it.
 ///
 /// Three hazards share this boundary and none of them is visible to a test that
@@ -157,15 +186,18 @@ async fn await_drained(
 /// that stops appending must end with an empty staging table rather than a
 /// grace tail.
 ///
-/// The journey drives all three against the real server. It appends three real
-/// decisions, freezes their range, and holds that freeze transaction open: the
-/// lock it takes on the tenant's chain head is what fences the server's own
-/// publication worker out of the window, so the replay below is deterministic
-/// rather than a race the test hopes to win. Inside the window it publishes the
-/// identical frozen range twice — the crash-before-settlement replay — then
-/// releases the freeze, settles, appends a second operation above the old bound,
-/// and requires the server's own worker to carry that tail. Both operations must
-/// be retained exactly once and the tenant must drain to zero.
+/// The journey drives all three against the real server through the only
+/// callable cycle, `publish_tenant`, so no partial stage is reachable from a
+/// test that production cannot reach. It appends three real decisions, freezes
+/// their range and commits that bound, then fences the staged rows so the next
+/// cycle blocks at settlement rather than before publication. A spawned cycle
+/// therefore reaches retained history — the assertion that its Scribe append is
+/// durable — and is aborted while still holding nothing committed in Postgres,
+/// which is exactly the crash-before-settlement state. Releasing the fence and
+/// running the cycle again replays the identical frozen range into Scribe's
+/// batch fence. Both operations must be retained exactly once, the tail
+/// appended above the old bound must wait for its own range, and the tenant
+/// must drain to zero.
 ///
 /// # Errors
 /// Returns the server, Postgres, projection, publication, or query failure.
@@ -182,29 +214,89 @@ async fn frozen_audit_range_replays_once_while_its_tail_waits() -> Result<(), Se
         append_decision(&server, tenant, &frozen_op).await?;
     }
 
-    let publisher = AuditPublisher::from_state(server.state())
-        .ok_or("a Scribe-bearing server composes the audit publisher")?;
+    let publisher = Arc::new(
+        AuditPublisher::from_state(server.state())
+            .ok_or("a Scribe-bearing server composes the audit publisher")?,
+    );
 
-    // The freeze transaction stays open across both appends. `publish_range`
-    // touches staging only, so it proceeds while every other freeze or
-    // settlement — including the server worker's — waits on the chain-head row.
-    let mut fence = server.tenant_conn_for(tenant).await?;
-    let range = freeze_publication_range(&mut fence, 512)
+    let mut freezer = server.tenant_conn_for(tenant).await?;
+    let range = freeze_publication_range(&mut freezer, 512)
         .await?
         .ok_or("three appended decisions owe a range")?;
-    publisher.publish_range(tenant, range).await?;
-    publisher.publish_range(tenant, range).await?;
+    freezer.commit().await?;
+
+    let fence = fence_staged_rows(&server, tenant, range).await?;
+    let blocked = tokio::spawn({
+        let publisher = Arc::clone(&publisher);
+        async move { publisher.publish_tenant(tenant).await }
+    });
+    // The append is durable before settlement is attempted, so retained history
+    // sees the range while the fence still holds every Postgres effect back.
+    await_retained(&server, tenant, &frozen_op, 3).await?;
+    blocked.abort();
+    assert!(
+        blocked.await.is_err(),
+        "the fenced cycle must be aborted before it settles"
+    );
     fence.commit().await?;
 
-    publisher.settle(tenant, range.seq_hi).await?;
+    // The bound survived the abort, so this cycle replays the identical range.
+    publisher.publish_tenant(tenant).await?;
     await_retained(&server, tenant, &frozen_op, 3).await?;
 
-    // The tail was appended above the frozen bound, so it is a separate batch
-    // the server's own worker must pick up without anyone asking it to.
     append_decision(&server, tenant, &tail_op).await?;
     await_retained(&server, tenant, &tail_op, 1).await?;
     await_retained(&server, tenant, &frozen_op, 3).await?;
     await_drained(&server, tenant).await?;
+
+    server.shutdown().await?;
+    Ok(())
+}
+
+/// One stalled tenant does not hold retained history back for another tenant.
+///
+/// A sweep that published tenants one after another would make every tenant
+/// wait on the slowest: a tenant whose chain head is held by an unrelated
+/// transaction would stall the whole directory behind it. The journey seeds a
+/// second tenant, appends a decision in each, then holds the boot tenant's
+/// chain-head row so its cycle cannot even freeze. The second tenant must still
+/// reach retained history and drain inside the bounded wait, which only a
+/// concurrent sweep can do. Releasing the fence must then let the stalled
+/// tenant finish as well, proving the fence delayed rather than lost its work.
+///
+/// The fixed bound the sweep runs tenants under is pinned by
+/// `wyrd-server`'s own `bounded_sweep_never_exceeds_its_fixed_concurrency`; a
+/// two-tenant directory cannot observe a ceiling of eight.
+///
+/// # Errors
+/// Returns the server, Postgres, publication, or query failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn a_stalled_tenant_does_not_block_another_tenants_history() -> Result<(), ServerJourneyError>
+{
+    let server = WyrdTestServer::start_bound().await?;
+    let suffix = uuid::Uuid::now_v7().simple().to_string();
+    let stalled = server.data_tenant_id();
+    let healthy = server.seed_tenant(&format!("audit-sweep-{suffix}")).await?;
+    let stalled_op = format!("wyrd.journey.audit_stalled.{suffix}");
+    let healthy_op = format!("wyrd.journey.audit_healthy.{suffix}");
+
+    append_decision(&server, stalled, &stalled_op).await?;
+    append_decision(&server, healthy, &healthy_op).await?;
+
+    // The boot tenant sorts before a freshly minted UUIDv7 tenant, so a serial
+    // sweep would reach the healthy tenant only after this fence is released.
+    let mut fence = server.tenant_conn_for(stalled).await?;
+    sqlx::query("SELECT last_seq FROM vala.audit_chain_head FOR UPDATE")
+        .fetch_all(&mut **fence.transaction())
+        .await?;
+
+    await_retained(&server, healthy, &healthy_op, 1).await?;
+    await_drained(&server, healthy).await?;
+
+    fence.commit().await?;
+    await_retained(&server, stalled, &stalled_op, 1).await?;
+    await_drained(&server, stalled).await?;
 
     server.shutdown().await?;
     Ok(())

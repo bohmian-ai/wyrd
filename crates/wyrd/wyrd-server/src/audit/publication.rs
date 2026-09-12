@@ -1,7 +1,17 @@
+//! Server-owned publication of staged audit events into retained history.
+//!
+//! Staging is transient write-ahead state: [`AuditPublisher`] is the one owner
+//! that moves a tenant's frozen audit range into `vala.system.audit_log`
+//! through the local Scribe and then drains what it published. The cycle is
+//! engine-internal — it evaluates no permission and therefore appends no audit
+//! event of its own — and only the complete freeze → publish → settle cycle is
+//! callable, so staging can never be drained without a durable Scribe
+//! acceptance for the same range.
+
 use std::sync::Arc;
 use std::time::Duration;
 
-use sqlx::PgPool;
+use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::contracts::{
@@ -12,10 +22,11 @@ use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::tables::AuditLogTable;
 use vala_bifrost_redux::tables::DomainTable;
 use vala_bifrost_redux::tables::audit::projection::project_audit_rows;
-use vala_sql::TenantConn;
+use vala_sql::ValaPostgres;
 use vala_sql::queries::audit_staging::{
     AuditPublicationRange, freeze_publication_range, list_publication_range, settle_publication,
 };
+use vala_sql::row_types::audit_staging::AuditStagingRow;
 use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
@@ -33,6 +44,15 @@ const PUBLICATION_BATCH_RECORDS: i64 = 512;
 
 /// Delay between sweeps of the tenant directory.
 const PUBLICATION_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Tenant cycles a single sweep runs at once.
+///
+/// A sweep publishes tenants concurrently so one tenant waiting on its chain
+/// head, Scribe, or Postgres cannot stall every tenant behind it. The bound is
+/// fixed rather than configurable: it exists to keep one sweep's demand on the
+/// Vala pool and the local Scribe predictable, and a deeper tenant directory
+/// drains over consecutive sweeps instead of opening unbounded work.
+const PUBLICATION_TENANT_CONCURRENCY: usize = 8;
 
 /// What one tenant's publication cycle did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,8 +77,9 @@ pub enum PublishOutcome {
 /// Publication is engine-internal: it evaluates no permission, never calls
 /// Gate, and therefore appends no further audit event.
 pub struct AuditPublisher {
-    /// RLS-enforced application pool used for tenant-scoped work.
-    pool: PgPool,
+    /// Vala warehouse owner every tenant-scoped staging transaction is opened
+    /// through.
+    postgres: ValaPostgres,
     /// Cross-tenant pool the admin-owned tenant directory is read through.
     ///
     /// `platform.tenants` is not tenant data and grants no read to the
@@ -89,7 +110,7 @@ impl AuditPublisher {
             None
         })?;
         Some(Self {
-            pool: state.postgres.wyrd().app_pool().clone(),
+            postgres: state.postgres.vala().clone(),
             directory,
             scribe,
             batch_records: PUBLICATION_BATCH_RECORDS,
@@ -103,6 +124,14 @@ impl AuditPublisher {
     /// durable in Postgres and its frozen bound stays set, so a transient
     /// Scribe or Postgres failure delays retained history rather than losing it
     /// or changing the in-flight batch identity.
+    ///
+    /// Cancellation is observed only between sweeps, so `shutdown` does not
+    /// interrupt a cycle that has already begun. A sweep dropped mid-flight —
+    /// by process exit rather than by this token — leaves partial progress that
+    /// is safe by construction: every effect is either committed or absent, a
+    /// frozen bound survives to be reused verbatim, and a range appended but
+    /// not settled is republished into Scribe's batch fence on the next sweep.
+    /// Nothing is retried inside one sweep; the next tick is the retry.
     pub async fn run(self, shutdown: CancellationToken) {
         let mut ticks = tokio::time::interval(self.interval);
         loop {
@@ -114,26 +143,41 @@ impl AuditPublisher {
     }
 
     /// Publish one bounded batch for every live tenant.
+    ///
+    /// Cycles run unordered, at most [`PUBLICATION_TENANT_CONCURRENCY`] at a
+    /// time, so a tenant blocked on its chain head delays only itself: every
+    /// other tenant in the same sweep keeps making progress and the sweep's
+    /// total demand still stays inside one fixed bound. A failing cycle is
+    /// logged and left to the next sweep.
     async fn sweep(&self) {
-        let tenants = match wyrd_sql::queries::platform::tenants::list_active_tenant_ids(
-            self.directory.pool(),
-        )
-        .await
-        {
-            Ok(tenants) => tenants,
-            Err(error) => {
-                tracing::warn!(error = %error, "audit publisher could not list tenants");
-                return;
-            }
-        };
-        for tenant in tenants {
-            if let Err(error) = self.publish_tenant(tenant).await {
-                tracing::warn!(
-                    %tenant,
-                    error = %error,
-                    "audit publication cycle failed; retained history will retry"
-                );
-            }
+        let tenants =
+            match wyrd_sql::queries::platform::tenants::list_active_tenant_ids(&self.directory)
+                .await
+            {
+                Ok(tenants) => tenants,
+                Err(error) => {
+                    tracing::warn!(error = %error, "audit publisher could not list tenants");
+                    return;
+                }
+            };
+        futures_util::stream::iter(tenants)
+            .for_each_concurrent(PUBLICATION_TENANT_CONCURRENCY, |tenant| {
+                self.publish_logged(tenant)
+            })
+            .await;
+    }
+
+    /// Run one tenant cycle, reporting a failure instead of propagating it.
+    ///
+    /// A sweep services every tenant it listed, so one tenant's transient
+    /// Scribe or Postgres failure must not cancel the rest of the sweep.
+    async fn publish_logged(&self, tenant: DataTenantId) {
+        if let Err(error) = self.publish_tenant(tenant).await {
+            tracing::warn!(
+                %tenant,
+                error = %error,
+                "audit publication cycle failed; retained history will retry"
+            );
         }
     }
 
@@ -176,24 +220,32 @@ impl AuditPublisher {
     /// duplicating retained history. Rows appended above `seq_hi` are not read
     /// and wait for the next batch.
     ///
+    /// A range whose rows are already gone is treated as published rather than
+    /// as a failure. Staging is only ever deleted through the watermark, so an
+    /// empty frozen range means a competing replica published and settled this
+    /// exact range between this cycle's freeze and its read. Settling it again
+    /// is inert under the `GREATEST` and matching-bound guards, while refusing
+    /// would leave the tenant erroring on a range nobody still owes.
+    ///
     /// # Errors
     /// Returns [`AuditPublicationError::Staging`] when reading the range fails,
-    /// or when the range has no staged row — which cannot happen while staging
-    /// is only deleted through the watermark;
     /// [`AuditPublicationError::Projection`] for non-contiguous or invalid
-    /// content; and [`AuditPublicationError::Publish`] when Scribe refuses the
+    /// content, and [`AuditPublicationError::Publish`] when Scribe refuses the
     /// append.
-    pub async fn publish_range(
+    async fn publish_range(
         &self,
         tenant: DataTenantId,
         range: AuditPublicationRange,
     ) -> Result<(), AuditPublicationError> {
         let rows = self.read_range(tenant, range).await?;
         if rows.is_empty() {
-            return Err(AuditPublicationError::Staging(format!(
-                "frozen audit range {}..={} has no staged row",
-                range.seq_lo, range.seq_hi
-            )));
+            tracing::debug!(
+                %tenant,
+                seq_lo = range.seq_lo,
+                seq_hi = range.seq_hi,
+                "frozen audit range was already published and drained by another replica"
+            );
+            return Ok(());
         }
         let projection = project_audit_rows(tenant, &rows)
             .map_err(|error| AuditPublicationError::Projection(error.to_string()))?;
@@ -216,11 +268,22 @@ impl AuditPublisher {
     }
 
     /// Freeze, or reuse, the one range this tenant owes retained history.
+    ///
+    /// The short transaction commits before any Scribe IO, so the durable bound
+    /// is progress state rather than a lease. `None` means the tenant owes
+    /// nothing and the cycle is idle.
+    ///
+    /// # Errors
+    /// Returns [`AuditPublicationError::Staging`] when the tenant transaction
+    /// cannot be acquired, the locked chain-head read or bound update fails, or
+    /// the commit fails. Nothing is frozen unless the commit succeeds.
     async fn freeze(
         &self,
         tenant: DataTenantId,
     ) -> Result<Option<AuditPublicationRange>, AuditPublicationError> {
-        let mut conn = TenantConn::acquire(&self.pool, tenant)
+        let mut conn = self
+            .postgres
+            .tenant_conn(tenant)
             .await
             .map_err(|error| AuditPublicationError::Staging(error.to_string()))?;
         let range = freeze_publication_range(&mut conn, self.batch_records)
@@ -233,13 +296,22 @@ impl AuditPublisher {
     }
 
     /// Read exactly the staged rows of one frozen range.
+    ///
+    /// Rows appended above `range.seq_hi` are invisible here, which is what
+    /// keeps a growing staging tail out of an in-flight batch.
+    ///
+    /// # Errors
+    /// Returns [`AuditPublicationError::Staging`] when the tenant transaction
+    /// cannot be acquired, the range read fails or RLS rejects it, or the
+    /// read-only commit fails.
     async fn read_range(
         &self,
         tenant: DataTenantId,
         range: AuditPublicationRange,
-    ) -> Result<Vec<vala_sql::row_types::audit_staging::AuditStagingRow>, AuditPublicationError>
-    {
-        let mut conn = TenantConn::acquire(&self.pool, tenant)
+    ) -> Result<Vec<AuditStagingRow>, AuditPublicationError> {
+        let mut conn = self
+            .postgres
+            .tenant_conn(tenant)
             .await
             .map_err(|error| AuditPublicationError::Staging(error.to_string()))?;
         let rows = list_publication_range(&mut conn, range)
@@ -259,12 +331,14 @@ impl AuditPublisher {
     /// Returns [`AuditPublicationError::Retire`] when the settlement
     /// transaction cannot be acquired, applied, or committed. Nothing is
     /// removed unless all three effects commit together.
-    pub async fn settle(
+    async fn settle(
         &self,
         tenant: DataTenantId,
         seq_hi: i64,
     ) -> Result<u64, AuditPublicationError> {
-        let mut conn = TenantConn::acquire(&self.pool, tenant)
+        let mut conn = self
+            .postgres
+            .tenant_conn(tenant)
             .await
             .map_err(|error| AuditPublicationError::Retire(error.to_string()))?;
         let retired = settle_publication(&mut conn, seq_hi)
@@ -306,4 +380,71 @@ fn publisher_principal(tenant: DataTenantId) -> Principal {
         Vec::new(),
         PermissionSet::new(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use futures_util::StreamExt;
+
+    use super::PUBLICATION_TENANT_CONCURRENCY;
+
+    /// Peak and current in-flight counts observed by one bounded sweep.
+    ///
+    /// The sweep's only concurrency control is the bound it hands
+    /// `for_each_concurrent`, so the property worth pinning is that the bound is
+    /// the ceiling on simultaneously open tenant cycles.
+    #[derive(Default)]
+    struct InFlight {
+        /// Cycles currently open.
+        current: AtomicUsize,
+        /// Highest simultaneous count observed.
+        peak: AtomicUsize,
+    }
+
+    impl InFlight {
+        /// Record one cycle entering, keeping the running peak.
+        fn enter(&self) {
+            let open = self.current.fetch_add(1, Ordering::AcqRel) + 1;
+            self.peak.fetch_max(open, Ordering::AcqRel);
+        }
+
+        /// Record one cycle leaving.
+        fn leave(&self) {
+            self.current.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    /// A sweep never opens more tenant cycles than its fixed bound.
+    ///
+    /// The sweep is driven over far more tenants than the bound, and every
+    /// cycle yields before completing so the runtime is free to open another.
+    /// A sweep that dropped the bound — or awaited tenants serially — fails on
+    /// the observed peak rather than on timing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bounded_sweep_never_exceeds_its_fixed_concurrency() {
+        let tenants = 4 * PUBLICATION_TENANT_CONCURRENCY;
+        let in_flight = Arc::new(InFlight::default());
+        futures_util::stream::iter(0..tenants)
+            .for_each_concurrent(PUBLICATION_TENANT_CONCURRENCY, |_| {
+                let in_flight = Arc::clone(&in_flight);
+                async move {
+                    in_flight.enter();
+                    tokio::task::yield_now().await;
+                    in_flight.leave();
+                }
+            })
+            .await;
+        let peak = in_flight.peak.load(Ordering::Acquire);
+        assert!(
+            peak > 1,
+            "the sweep must publish tenants concurrently, observed peak {peak}"
+        );
+        assert!(
+            peak <= PUBLICATION_TENANT_CONCURRENCY,
+            "the sweep opened {peak} cycles, above the fixed bound {PUBLICATION_TENANT_CONCURRENCY}"
+        );
+    }
 }

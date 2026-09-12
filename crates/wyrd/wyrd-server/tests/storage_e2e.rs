@@ -340,13 +340,14 @@ async fn storage_routes_refuse_and_audit_an_unprivileged_caller() {
     assert_eq!(error.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
 
     let error = client
-        .submit::<_, DownloadInitResponse>(
+        .request_json::<_, DownloadInitResponse>(
             reqwest::Method::POST,
             "/v1/cards/download/init",
-            &DownloadInitRequest {
+            Some(&DownloadInitRequest {
                 card_uid: card_uid.clone(),
                 relative_path: "local/denied.bin".to_owned(),
-            },
+                ttl_secs: None,
+            }),
         )
         .await
         .expect_err("a principal without card:read cannot plan a download");

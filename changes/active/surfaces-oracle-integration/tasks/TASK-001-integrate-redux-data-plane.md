@@ -297,14 +297,19 @@ this task owed after it are resolved below.
 
 ### Commands
 
+Re-run in full against the post-TASK-006 tree, since this task's closeout order
+holds items 3-6 until TASK-006's publication coordination lands and that work
+changed `vala-sql`, `vala-bifrost-redux`, and `wyrd-server`.
+
 ```
 mise run fmt                               # clean
 mise run lints                             # exit 0
 mise run codegen:check                     # All checks passed!
-mise run test:sql                          # 218/218
-mise run test:bifrost:integration:redux    # 973/973 (x3 consecutive)
-mise run test:bifrost:integration:server   # 67/67 (x3 consecutive)
+mise run test:sql                          # 220/220
+mise run test:bifrost:integration:redux    # 973/973
+mise run test:bifrost:integration:server   # 67/67
 mise run test:bifrost:journey:server       # 7/7
+mise run test:bifrost:journey:scribe       # 21/21
 mise run test:bifrost:journey:oracle       # 28/28
 mise run test:bifrost:journey:forge        # 13/13
 mise run test:bifrost:journey:otlp         # 10/10
@@ -316,6 +321,15 @@ mise run check:pyo3-scope                  # clean
 mise run skills:sync / check:skills-sync   # clean
 git diff --check                           # clean
 ```
+
+`test:sql` moved from 218 to 220: TASK-006 added the two frozen-range cases in
+`vala-sql/tests/pg_audit_staging.rs`. `test:bifrost:journey:scribe` is new to
+this block; TASK-006 owns that lane and it was not part of the earlier closeout.
+
+`codegen:check` failed on this re-run and exposed real committed drift:
+`4a3c5ee22` renamed the `AUDIT_UNAVAILABLE` doc comment from "audit outbox" to
+"audit staging" without regenerating `bifrost_audit_event.json`. Regenerated and
+committed in `358cf636e`; the check is clean.
 
 No Bifrost aggregate was run in this task, per its Verification section, and
 `mise run verify:bifrost` is withheld by explicit instruction until this

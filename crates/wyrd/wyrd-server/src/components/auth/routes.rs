@@ -25,7 +25,7 @@ use crate::auth::issue_api_key::{IssueApiKey, WyrdApiKey};
 use crate::auth::jwt_bearer::JwtBearer;
 use crate::auth::login::login as login_handler;
 use crate::auth::refresh::{RefreshTokens, tenant_from_refresh_jwt};
-use crate::components::auth::AuthenticatedPrincipal;
+use crate::components::auth::{AuthenticatedPrincipal, Caller};
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
@@ -263,12 +263,6 @@ async fn issue_key(
     request_id: Option<Extension<RequestId>>,
     Json(request): Json<IssueKeyRequest>,
 ) -> Result<Json<wyrd_spec::auth::IssueKeyResponse>, WyrdErrorResponse> {
-    wyrd_auth::service_accounts::require_service_accounts_write(
-        caller.principal(),
-        "issue API keys",
-    )
-    .map_err(WyrdErrorResponse::from)?;
-
     let request_id_str: String;
     let req_id = match request_id.as_ref() {
         Some(Extension(id)) => id.as_str(),
@@ -277,6 +271,19 @@ async fn issue_key(
             &request_id_str
         }
     };
+    let audited_caller = Caller::from_authenticated(
+        &caller,
+        RequestId::parse(req_id).unwrap_or_else(|_| RequestId::now_v7()),
+    );
+    let decision = crate::audit::authorize_service_accounts_write(
+        &state,
+        &audited_caller,
+        "issue API keys",
+        "auth.api_key.issue",
+        &format!("card:{}", request.card_ref.name),
+    )
+    .await
+    .map_err(WyrdErrorResponse::from)?;
 
     let tenant = caller.principal().tenant_id;
     let mut conn = state
@@ -284,6 +291,9 @@ async fn issue_key(
         .tenant_conn(tenant)
         .await
         .map_err(sql_error)?;
+    crate::audit::append_on(&mut conn, &decision)
+        .await
+        .map_err(WyrdErrorResponse::from)?;
     let service = IssueApiKey::default();
     let issued = service
         .execute(&mut conn, request, caller.principal())

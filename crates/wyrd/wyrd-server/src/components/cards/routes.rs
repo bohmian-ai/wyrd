@@ -75,7 +75,13 @@ async fn get_card_http(
 ) -> Result<Json<GetCardResponse>, WyrdErrorResponse> {
     let kind = parse_card_kind(&kind)?;
     let card_uid = parse_card_uid(&card_uid)?;
-    authorize_card_read(&state, &caller, "card.read.uid", &format!("card:{card_uid}")).await?;
+    authorize_card_read(
+        &state,
+        &caller,
+        "card.read.uid",
+        &format!("card:{card_uid}"),
+    )
+    .await?;
     let response = service::get_card_by_uid(&state, &caller, &card_uid)
         .await
         .map_err(WyrdErrorResponse::from)?;
@@ -185,17 +191,10 @@ async fn list_versions_http(
         &format!("card:{}/{space}/{name}", kind.wire_name()),
     )
     .await?;
-    service::list_card_versions(
-        &state,
-        &caller,
-        kind,
-        space,
-        name,
-        query.include_prerelease,
-    )
-    .await
-    .map(Json)
-    .map_err(WyrdErrorResponse::from)
+    service::list_card_versions(&state, &caller, kind, space, name, query.include_prerelease)
+        .await
+        .map(Json)
+        .map_err(WyrdErrorResponse::from)
 }
 
 /// List tenant-visible Card summaries with keyset pagination.
@@ -519,10 +518,7 @@ fn card_resource(card_ref: &CardRef) -> String {
     format!(
         "card:{}/{}/{}@{}",
         card_ref.kind.wire_name(),
-        card_ref
-            .space
-            .as_ref()
-            .map_or("-", SpaceName::as_str),
+        card_ref.space.as_ref().map_or("-", SpaceName::as_str),
         card_ref.name,
         card_ref.version,
     )

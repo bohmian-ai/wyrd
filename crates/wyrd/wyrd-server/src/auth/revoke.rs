@@ -5,7 +5,6 @@ use wyrd_runtime::PrincipalId;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalKindTag;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::vala::api::AuditOutcome;
 
 use crate::audit;
 use crate::auth::revocation_listener::notify_principal_revoked;
@@ -15,6 +14,18 @@ use crate::state::AppState;
 use wyrd_auth::revoke::revoke_principal_in_conn;
 use wyrd_sql::TenantConn;
 
+/// Revoke one principal's outstanding tokens under the caller's tenant.
+///
+/// Revocation is an administrative authorization boundary: the
+/// `service_accounts:write` verdict is audited for both outcomes, and the
+/// allowed row commits in the same transaction as the `tokens_not_before` bump
+/// so the decision and its effect are durable together.
+///
+/// # Errors
+/// Returns [`WyrdError::PermissionDeniedRbac`] when the caller lacks
+/// `service_accounts:write`, [`WyrdError::AuditUnavailable`] when the decision
+/// cannot be recorded, and an internal error when the revocation transaction
+/// cannot be acquired or committed.
 pub async fn revoke_principal(
     State(state): State<AppState>,
     caller: Caller,
@@ -22,28 +33,23 @@ pub async fn revoke_principal(
 ) -> Result<(), WyrdErrorResponse> {
     let tenant = caller.principal.tenant_id;
 
-    wyrd_auth::service_accounts::require_service_accounts_write(
-        &caller.principal,
+    let decision = audit::authorize_service_accounts_write(
+        &state,
+        &caller,
         "revoke principals",
-    )
-    .map_err(WyrdErrorResponse::from)?;
-
-    let mut conn = acquire_conn(&state, tenant).await?;
-    let kind = revoke_principal_in_conn(&mut conn, target_id, tenant)
-        .await
-        .map_err(WyrdErrorResponse::from)?;
-    audit::append_on(
-        &mut conn,
-        &audit::audit_event(
-            &caller,
-            "auth.principal.revoke",
-            &format!("principal:{target_id}"),
-            "service_accounts:write",
-            AuditOutcome::Allowed,
-        ),
+        "auth.principal.revoke",
+        &format!("principal:{target_id}"),
     )
     .await
     .map_err(WyrdErrorResponse::from)?;
+
+    let mut conn = acquire_conn(&state, tenant).await?;
+    audit::append_on(&mut conn, &decision)
+        .await
+        .map_err(WyrdErrorResponse::from)?;
+    let kind = revoke_principal_in_conn(&mut conn, target_id, tenant)
+        .await
+        .map_err(WyrdErrorResponse::from)?;
     conn.commit().await.map_err(internal_error)?;
 
     fan_out_notify(&state, tenant, kind, target_id).await;

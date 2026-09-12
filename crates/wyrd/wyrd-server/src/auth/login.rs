@@ -37,13 +37,15 @@ pub async fn login(
     let request_id = maybe_request_id
         .map(|Extension(id)| id)
         .unwrap_or_else(RequestId::now_v7);
-    let tenant_id = resolve_login_tenant(&state, &headers).await.inspect_err(|_| {
-        tracing::info!(
-            request_id = %request_id,
-            issuer = %query.issuer,
-            "login attempt refused: tenant did not resolve"
-        );
-    })?;
+    let tenant_id = resolve_login_tenant(&state, &headers)
+        .await
+        .inspect_err(|_| {
+            tracing::info!(
+                request_id = %request_id,
+                issuer = %query.issuer,
+                "login attempt refused: tenant did not resolve"
+            );
+        })?;
     try_initiate_login(&state, &headers, &query, tenant_id)
         .await
         .inspect_err(|_| {

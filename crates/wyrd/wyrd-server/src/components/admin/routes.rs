@@ -217,10 +217,17 @@ async fn create_trusted_issuer(
     caller: Caller,
     Json(request): Json<CreateTrustedIssuerRequest>,
 ) -> Result<Json<TrustedIssuerView>, WyrdErrorResponse> {
-    wyrd_auth::service_accounts::require_service_accounts_write(
-        &caller.principal,
+    let decision = audit::authorize_service_accounts_write(
+        &state,
+        &caller,
         "manage trusted issuers",
+        "admin.trusted_issuer.create",
+        &format!(
+            "trusted_issuer:{}",
+            normalize_issuer(request.issuer.as_str())
+        ),
     )
+    .await
     .map_err(WyrdErrorResponse::from)?;
 
     // The only network call on any admin path, and only at create: discovery
@@ -249,21 +256,12 @@ async fn create_trusted_issuer(
         .map_err(seal_error)?;
 
     let mut conn = acquire_conn(&state, &caller).await?;
+    audit::append_on(&mut conn, &decision)
+        .await
+        .map_err(WyrdErrorResponse::from)?;
     insert_trusted_issuer(&mut conn, &write)
         .await
         .map_err(map_write_error)?;
-    audit::append_on(
-        &mut conn,
-        &audit::audit_event(
-            &caller,
-            "admin.trusted_issuer.create",
-            &format!("trusted_issuer:{}", trusted.issuer),
-            "service_accounts:write",
-            wyrd_spec::vala::api::AuditOutcome::Allowed,
-        ),
-    )
-    .await
-    .map_err(WyrdErrorResponse::from)?;
     conn.commit().await.map_err(sql_unavailable)?;
 
     Ok(Json(trusted_issuer_view_from_write(&write)))
@@ -276,13 +274,20 @@ async fn list_trusted_issuers(
     State(state): State<AppState>,
     caller: Caller,
 ) -> Result<Json<Vec<TrustedIssuerView>>, WyrdErrorResponse> {
-    wyrd_auth::service_accounts::require_service_accounts_write(
-        &caller.principal,
+    let decision = audit::authorize_service_accounts_write(
+        &state,
+        &caller,
         "read trusted issuers",
+        "admin.trusted_issuer.list",
+        "trusted_issuers",
     )
+    .await
     .map_err(WyrdErrorResponse::from)?;
 
     let mut conn = acquire_conn(&state, &caller).await?;
+    audit::append_on(&mut conn, &decision)
+        .await
+        .map_err(WyrdErrorResponse::from)?;
     let rows = trusted_issuers_for_tenant(&mut conn)
         .await
         .map_err(sql_unavailable)?;
@@ -303,14 +308,21 @@ async fn delete_trusted_issuer_route(
     caller: Caller,
     Query(query): Query<DeleteIssuerQuery>,
 ) -> Result<StatusCode, WyrdErrorResponse> {
-    wyrd_auth::service_accounts::require_service_accounts_write(
-        &caller.principal,
+    let issuer = normalize_issuer(&query.issuer);
+    let decision = audit::authorize_service_accounts_write(
+        &state,
+        &caller,
         "delete trusted issuers",
+        "admin.trusted_issuer.delete",
+        &format!("trusted_issuer:{issuer}"),
     )
+    .await
     .map_err(WyrdErrorResponse::from)?;
 
-    let issuer = normalize_issuer(&query.issuer);
     let mut conn = acquire_conn(&state, &caller).await?;
+    audit::append_on(&mut conn, &decision)
+        .await
+        .map_err(WyrdErrorResponse::from)?;
 
     // --cascade removes the referencing bindings first so the issuer delete is
     // not blocked by the FK ON DELETE RESTRICT. Without it, a live binding makes
@@ -325,20 +337,12 @@ async fn delete_trusted_issuer_route(
         .await
         .map_err(map_write_error)?;
     if removed == 0 {
+        // The decision row is already staged on this transaction, so commit it
+        // before reporting the miss: the verdict happened even though the
+        // addressed issuer did not exist.
+        conn.commit().await.map_err(sql_unavailable)?;
         return Err(issuer_not_found(&issuer));
     }
-    audit::append_on(
-        &mut conn,
-        &audit::audit_event(
-            &caller,
-            "admin.trusted_issuer.delete",
-            &format!("trusted_issuer:{issuer}"),
-            "service_accounts:write",
-            wyrd_spec::vala::api::AuditOutcome::Allowed,
-        ),
-    )
-    .await
-    .map_err(WyrdErrorResponse::from)?;
     conn.commit().await.map_err(sql_unavailable)?;
 
     Ok(StatusCode::NO_CONTENT)
@@ -359,10 +363,18 @@ async fn create_workload_binding(
     caller: Caller,
     Json(request): Json<CreateWorkloadBindingRequest>,
 ) -> Result<Json<WorkloadBindingView>, WyrdErrorResponse> {
-    wyrd_auth::service_accounts::require_service_accounts_write(
-        &caller.principal,
+    let decision = audit::authorize_service_accounts_write(
+        &state,
+        &caller,
         "manage workload bindings",
+        "admin.workload_binding.create",
+        &format!(
+            "workload_binding:{}:{}",
+            normalize_issuer(request.issuer.as_str()),
+            request.subject
+        ),
     )
+    .await
     .map_err(WyrdErrorResponse::from)?;
 
     let binding = WorkloadBinding {
@@ -375,21 +387,12 @@ async fn create_workload_binding(
     let write = binding_write_from_binding(&binding).map_err(internal_error)?;
 
     let mut conn = acquire_conn(&state, &caller).await?;
+    audit::append_on(&mut conn, &decision)
+        .await
+        .map_err(WyrdErrorResponse::from)?;
     insert_workload_binding(&mut conn, &write)
         .await
         .map_err(|error| map_binding_write_error(error, &binding.issuer))?;
-    audit::append_on(
-        &mut conn,
-        &audit::audit_event(
-            &caller,
-            "admin.workload_binding.create",
-            &format!("workload_binding:{}:{}", binding.issuer, binding.subject),
-            "service_accounts:write",
-            wyrd_spec::vala::api::AuditOutcome::Allowed,
-        ),
-    )
-    .await
-    .map_err(WyrdErrorResponse::from)?;
     conn.commit().await.map_err(sql_unavailable)?;
 
     Ok(Json(workload_binding_view_from_write(&write)))
@@ -404,16 +407,23 @@ async fn list_workload_bindings(
     caller: Caller,
     Query(filter): Query<BindingFilter>,
 ) -> Result<Json<Vec<WorkloadBindingView>>, WyrdErrorResponse> {
-    wyrd_auth::service_accounts::require_service_accounts_write(
-        &caller.principal,
+    let decision = audit::authorize_service_accounts_write(
+        &state,
+        &caller,
         "read workload bindings",
+        "admin.workload_binding.list",
+        "workload_bindings",
     )
+    .await
     .map_err(WyrdErrorResponse::from)?;
 
     // Normalize the issuer filter to the stored form so a trailing slash does
     // not silently miss; the subject is matched verbatim.
     let issuer = filter.issuer.as_deref().map(normalize_issuer);
     let mut conn = acquire_conn(&state, &caller).await?;
+    audit::append_on(&mut conn, &decision)
+        .await
+        .map_err(WyrdErrorResponse::from)?;
     let rows =
         workload_bindings_for_tenant(&mut conn, issuer.as_deref(), filter.subject.as_deref())
             .await
@@ -435,32 +445,31 @@ async fn delete_workload_binding_route(
     caller: Caller,
     Query(query): Query<BindingQuery>,
 ) -> Result<StatusCode, WyrdErrorResponse> {
-    wyrd_auth::service_accounts::require_service_accounts_write(
-        &caller.principal,
+    let issuer = normalize_issuer(&query.issuer);
+    let decision = audit::authorize_service_accounts_write(
+        &state,
+        &caller,
         "delete workload bindings",
+        "admin.workload_binding.delete",
+        &format!("workload_binding:{issuer}:{}", query.subject),
     )
+    .await
     .map_err(WyrdErrorResponse::from)?;
 
-    let issuer = normalize_issuer(&query.issuer);
     let mut conn = acquire_conn(&state, &caller).await?;
+    audit::append_on(&mut conn, &decision)
+        .await
+        .map_err(WyrdErrorResponse::from)?;
     let removed = delete_workload_binding(&mut conn, &issuer, &query.subject)
         .await
         .map_err(map_write_error)?;
     if removed == 0 {
+        // The decision row is already staged on this transaction, so commit it
+        // before reporting the miss: the verdict happened even though the
+        // addressed binding did not exist.
+        conn.commit().await.map_err(sql_unavailable)?;
         return Err(binding_not_found(&issuer, &query.subject));
     }
-    audit::append_on(
-        &mut conn,
-        &audit::audit_event(
-            &caller,
-            "admin.workload_binding.delete",
-            &format!("workload_binding:{issuer}:{}", query.subject),
-            "service_accounts:write",
-            wyrd_spec::vala::api::AuditOutcome::Allowed,
-        ),
-    )
-    .await
-    .map_err(WyrdErrorResponse::from)?;
     conn.commit().await.map_err(sql_unavailable)?;
 
     Ok(StatusCode::NO_CONTENT)

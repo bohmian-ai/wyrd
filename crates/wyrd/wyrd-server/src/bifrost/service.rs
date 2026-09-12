@@ -93,21 +93,11 @@ pub async fn register_table(
     // commits it in the same transaction as the catalog row it authorizes. Every
     // other branch performs no durable write, so it records the verdict itself
     // before returning.
-    let allowed = audit::authorize_recording_denial(
-        state,
-        &caller,
-        &required,
-        operation,
-        &fqn_for_audit,
-    )
-    .await?;
+    let allowed =
+        audit::authorize_recording_denial(state, &caller, &required, operation, &fqn_for_audit)
+            .await?;
     let record_allowed = || async {
-        audit::record_audit(
-            state.postgres.vala_pool(),
-            caller.data_tenant_id,
-            &allowed,
-        )
-        .await
+        audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, &allowed).await
     };
 
     let ns = match convert::namespace_from_wire(&body.namespace) {

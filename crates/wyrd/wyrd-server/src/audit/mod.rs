@@ -239,3 +239,50 @@ pub async fn authorize_recording_denial(
         AuditOutcome::Allowed,
     ))
 }
+
+/// Evaluate and audit the `service_accounts:write` gate for one admin operation.
+///
+/// Credential administration shares one permission across issuance, trusted
+/// issuers, workload bindings, and principal revocation, and every one of those
+/// handlers owns a tenant transaction. A denial is recorded standalone because
+/// no such transaction exists yet; the returned `Allowed` event MUST be appended
+/// with [`append_on`] on that transaction **before** the administrative write, so
+/// a later not-found early return cannot commit the effect without the decision.
+///
+/// `action` is the existing human-readable intent accepted by
+/// [`wyrd_auth::service_accounts::require_service_accounts_write`], kept so the
+/// public refusal message stays exactly what it was.
+///
+/// # Errors
+/// Returns [`WyrdError::PermissionDeniedRbac`] when the principal lacks
+/// `service_accounts:write`, and [`WyrdError::AuditUnavailable`] when the denial
+/// row cannot be persisted.
+pub async fn authorize_service_accounts_write(
+    state: &crate::state::AppState,
+    caller: &Caller,
+    action: &str,
+    operation: &str,
+    resource: &str,
+) -> Result<AuditEvent, WyrdError> {
+    let permission = wyrd_runtime::Permission::service_accounts_write().to_string();
+    if let Err(error) =
+        wyrd_auth::service_accounts::require_service_accounts_write(&caller.principal, action)
+    {
+        let denied = audit_event(
+            caller,
+            operation,
+            resource,
+            &permission,
+            AuditOutcome::Denied,
+        );
+        record_audit(state.postgres.vala_pool(), caller.data_tenant_id, &denied).await?;
+        return Err(error);
+    }
+    Ok(audit_event(
+        caller,
+        operation,
+        resource,
+        &permission,
+        AuditOutcome::Allowed,
+    ))
+}

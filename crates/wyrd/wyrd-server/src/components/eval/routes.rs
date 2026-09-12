@@ -14,7 +14,8 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::components::auth::AuthenticatedPrincipal;
+use crate::audit;
+use crate::components::auth::{AuthenticatedPrincipal, Caller};
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 use axum::extract::{Path, State};
@@ -22,7 +23,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::routing::post;
 use axum::{Json, Router};
 use vala_eval::orchestrator::{NextDirective, RunState};
-use wyrd_runtime::{Permission, PermissionVerdict, Principal};
+use wyrd_runtime::{Permission, Principal};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::eval::protocol::{
@@ -51,26 +52,25 @@ pub fn eval_router() -> Router<AppState> {
 }
 
 #[tracing::instrument(
-    skip(state, principal, req),
+    skip(state, caller, req),
     fields(
-        wyrd.tenant = %principal.principal().tenant_id,
+        wyrd.tenant = %caller.data_tenant_id,
         wyrd.eval_ref = %req.eval_ref.name.as_str(),
     ),
 )]
 async fn open(
     State(state): State<AppState>,
-    principal: AuthenticatedPrincipal,
+    caller: Caller,
     Json(req): Json<EvalRunOpenRequest>,
 ) -> Result<Json<EvalRunOpenResponse>, WyrdErrorResponse> {
-    let principal = Principal::from(principal);
-    let tenant = principal.tenant_id;
-    let owner = principal.id;
+    let tenant = caller.data_tenant_id;
+    let owner = caller.principal.id;
 
     // Concrete RBAC (spec §2b): gate `evals:run` before any card read. The gate is
     // card-independent, so checking it first denies an unpermissioned principal
     // with 403 regardless of whether the `eval_ref` exists — closing the
     // same-tenant existence oracle — and spares a tenant conn and two DB reads.
-    require_eval_run(&state, &principal)?;
+    require_eval_run(&state, &caller, &req.eval_ref).await?;
 
     // RLS hops 1 (eval_ref → Eval card) and 2 (Eval.dataset → Data card) run
     // under a single tenant bind. A foreign/missing ref returns 404, fail-closed.
@@ -290,27 +290,26 @@ fn check_lease(headers: &HeaderMap, entry: &RunEntry) -> Result<(), WyrdErrorRes
     }
 }
 
-/// `Permission::eval_run` gate against the tenant-resolved principal.
+/// Evaluate and audit `Permission::eval_run` before an eval run is opened.
 ///
-/// Uses the shared synchronous RBAC checker (`AppState::permission_check`), a pure
-/// function over the principal's `effective_permissions`. A `Deny` maps to a 403
-/// `WyrdError`, mirroring the `check_authz` handler's `missing_permission` arm.
-fn require_eval_run(state: &AppState, principal: &Principal) -> Result<(), WyrdErrorResponse> {
-    let required = Permission::eval_run();
-    match state.authz.permission_check.check(principal, &required) {
-        PermissionVerdict::Allow => Ok(()),
-        PermissionVerdict::Deny { .. } => {
-            tracing::warn!(
-                wyrd.required = %required,
-                wyrd.principal = %principal.id,
-                "eval run creation denied: principal lacks evals:run",
-            );
-            Err(WyrdErrorResponse::from(WyrdError::PermissionDeniedRbac {
-                message: "evals:run permission required to open an eval run".to_owned(),
-                details: serde_json::json!({ "required": required.to_string() }),
-            }))
-        }
-    }
+/// Opening a run is the receiving authorization boundary for the eval surface,
+/// so the verdict — allowed or denied — is recorded as one canonical audit event
+/// naming the requested eval before the run is created or refused. The append is
+/// fail-closed: a run is never opened on an unrecorded decision.
+async fn require_eval_run(
+    state: &AppState,
+    caller: &Caller,
+    eval_ref: &wyrd_spec::reference::CardRef,
+) -> Result<(), WyrdErrorResponse> {
+    audit::authorize(
+        state,
+        caller,
+        &Permission::eval_run(),
+        "eval.run.open",
+        &format!("eval:{}", eval_ref.name.as_str()),
+    )
+    .await
+    .map_err(WyrdErrorResponse::from)
 }
 
 /// Mint a fresh per-run lease token.

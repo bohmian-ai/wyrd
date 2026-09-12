@@ -1,7 +1,7 @@
 ---
 id: TASK-001
 kind: implementation
-status: in_progress
+status: implemented
 spec: SPEC-surfaces-oracle-integration
 spec_revision: 6
 requirements: [REQ-001, REQ-002, REQ-003, REQ-010, REQ-011, REQ-012, REQ-013, REQ-014, REQ-015, REQ-026, REQ-026A, REQ-026B, REQ-027, REQ-027A, REQ-027B, REQ-028, REQ-029, REQ-030, REQ-030A, REQ-048, REQ-049, REQ-050, REQ-051, REQ-052, REQ-053, REQ-053A, REQ-054, REQ-062, REQ-063, INV-002, INV-003, INV-007, INV-008, INV-008A, INV-008B, INV-008C, INV-009, INV-017, INV-018, INV-019, INV-020, INV-021, INV-023, AC-005, AC-006, AC-011, AC-012, AC-013, AC-014, AC-015, AC-016, AC-017, AC-020]
@@ -20,7 +20,7 @@ audit publication; legacy `vala-bifrost` is gone in full.
 
 This task is paused during closeout, not awaiting a fresh implementation start.
 When resumed, continue from the existing integrated work, implement child
-TASK-005, and only then finish TASK-001 closeout.
+TASK-005 followed by TASK-006, and only then finish TASK-001 closeout.
 
 ## Constraints
 
@@ -34,7 +34,8 @@ TASK-005, and only then finish TASK-001 closeout.
 - Complete audit publication directly against Redux. Do not port legacy
   sealing, derivation, typed-read, or direct-Iceberg relay machinery.
 - TASK-005 owns the revised authorization-boundary audit flow. It MUST be
-  implemented on this task's existing integration branch before TASK-001 may
+  implemented on this task's existing integration branch, then TASK-006 MUST
+  make its retained publication race-safe and Scribe-owned before TASK-001 may
   enter review or closeout.
 - Do not add compatibility crates, routes, aliases, a second scheduler,
   cluster-wide Oracle quotas, or alternate durable formats.
@@ -73,8 +74,8 @@ Paths are ownership guidance, not a private implementation allowlist.
 6. Converge OTLP and canonical Arrow writes on the three canonical signal
    tables with trusted attribution and SQL-only reads.
 7. Resume the paused closeout by implementing TASK-005's authorization-only
-   audit flow, staging watermark publication, and garbage collection before
-   completing the remaining integration evidence.
+   audit flow, then TASK-006's frozen-range coordination and direct-Scribe
+   publication, before completing the remaining integration evidence.
 
 ## Acceptance Criteria
 
@@ -220,16 +221,126 @@ Scribe also accepts published audit history.
   `register_card_tools` was deleted along with the old `wyrd-mcp` surface.
 - `CardPyResult` → `WyrdPyResult` (REQ-024) stays deferred to TASK-002.
 
-### Closeout order — TASK-005 first
+### Closeout order — TASK-005, then TASK-006
 
 No further TASK-001 closeout work proceeds until TASK-005
-(`TASK-005-audit-at-the-authorization-boundary.md`) is implemented. It
+(`TASK-005-audit-at-the-authorization-boundary.md`) is implemented and TASK-006
+(`TASK-006-coordinate-audit-publication.md`) completes its publication
+coordination and direct-Scribe ownership. TASK-005
 supersedes the audit portions of the status amendment above: the interim
 `CorrelationPolicy::Observation` change and the `audit_principal_id` rename are
 withdrawn, and the remaining audit work in this task is defined by TASK-005
-rather than by items 1 and 2 of Remaining.
+rather than by items 1 and 2 of Remaining. TASK-006 then closes the changing-
+tail replay and Gate-bypass gaps discovered in that publication flow.
 
 Revision 6 and the required architecture direction are approved. Resume from
 the existing in-progress work; do not restart TASK-001 or repeat completed
-integration steps. Implement and verify TASK-005 first, then continue items
-3–6 under Remaining and finish TASK-001 closeout.
+integration steps. Implement and verify TASK-005, then TASK-006, then continue
+items 3–6 under Remaining and finish TASK-001 closeout.
+
+## Closeout Evidence
+
+TASK-005 is implemented and carries its own acceptance matrix in
+`TASK-005-audit-at-the-authorization-boundary.md`. The four Remaining items
+this task owed after it are resolved below.
+
+### Remaining items 1–6 disposition
+
+| Item | Disposition |
+|---|---|
+| 1. Correlation-policy direction | Superseded by TASK-005, which restored `CorrelationPolicy::None` for `vala.system.audit_log`. Ingest now resolves every built-in definition (`scribe/ingress.rs::builtin_definition`) and stamps the correlation envelope only where the declared policy asks for it. |
+| 2. `audit_log` physical layout | `bloom = ["audit_principal_id", "resource", "operation"]`, sort unchanged. The `audit_principal_id` rename was withdrawn by TASK-005's closeout order; the content column is `principal_id` under `CorrelationPolicy::None`. |
+| 3. Forge lane stability | Root-caused, not mitigated. The proposed retained-history fallback edit was unnecessary. Two distinct defects: (a) `audit_log` decoded with `definition: None`, so its `CorrelationPolicy::None` and `PAST_EVENT_TIME_EXEMPT` declarations were both inert and Scribe sealed 22 columns against a registered 18 — fixed in `ebfd269ef`; (b) `coordinator_object_store_failure_clears_readiness` never settled the coordinator's boot planning pass — fixed in `d5c0f1643`. |
+| 4. `codegen:check` and regeneration | `mise run codegen:check` clean; `openapi.yaml` regenerated and `openapi.yaml.tmp` removed from tracking and ignored. |
+| 5. Sync and boundary checks | All clean — see Commands below. |
+| 6. Evidence, inventory, closure | This section. |
+
+### Acceptance-criteria evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Exactly one Bifrost engine, Redux; no legacy package, symbol, feature, route, schema owner, test, benchmark, doc alias, or compatibility facade | `crates/vala/` holds only `vala-bifrost-redux`; one workspace member in `Cargo.toml`; `vala-bifrost` deleted in full | No-legacy inventory below; `mise run check:client-tier` clean | PASS |
+| Acknowledged Scribe writes survive replay and progress through staging and publication without weakening fences, idempotency, bounded ownership, or tenant-qualified physical identity | Scribe WAL v6, durable batch-id dedup fence, admission, staging, publication, shutdown and retirement retained from the pinned input | `mise run test:bifrost:integration:redux` 973/973; `mise run test:bifrost:journey:server` 7/7 (`replayed_audit_publication_retains_each_event_once`) | PASS |
+| Queries use one physical build, local fair admission, complete object authorization, durable reader protection before source IO, one deadline, one selected attempt; failure never becomes partial success | Oracle one-build planning, pod-local admission, reader epochs/protection, one-attempt execution retained | `mise run test:bifrost:journey:oracle` 28/28; `mise run test:bifrost:integration:server` 67/67 — `oracle_authority_is_installed_before_source_io` now gates on `vala.oracle_table_protections`, proving protection commits before resolver entry | PASS |
+| Reader protection and Forge expiration serialize per tenant-qualified table; lease loss, uncertain authority, and unresolved maintenance remove readiness and fail closed | Oracle reader authority and Forge expiry gates | `oracle_epoch_cutoff_removes_readiness_and_retirement_joins_loss_owner` (three loss-owner races); `blocked_renewal_cannot_suppress_cutoff_or_bounded_settlement`; `worker_recovery_failure_never_publishes_ready`, `worker_registration_failure_never_publishes_ready`, `prepared_evidence_validation_failure_never_publishes_ready` | PASS |
+| Forge retains independently committed sibling progress, bounded conflict retry, ambiguous-outcome reconciliation, worker-local FIFO estimated-memory admission, and separate cleanup protocols | `forge/managed/`, `forge/publication.rs`, `forge/scribe_promotion.rs`, `forge/orphan_gc.rs` — the incorporated Forge, newer than the pinned input | `mise run test:bifrost:journey:forge` 13/13; redux `forge::*` integration targets within 973/973 | PASS |
+| Stock OTLP and canonical Arrow writes produce equivalent rows in only the three canonical signal tables, with trusted attribution and exact partial-success rules | OTLP ingress and canonical Arrow path converge on `vala.traces.spans`, `vala.logs.records`, `vala.metrics.points` | `mise run test:bifrost:journey:otlp` 10/10; redux `gate::tests::mixed_otlp_projection_assigns_only_accepted_contiguous_ordinals` and `all_invalid_otlp_returns_existing_outcome_without_scribe` | PASS |
+| Allowed and denied decisions reach the canonical tenant staging chain before the operation proceeds or refuses; Oracle reads keep the WAL-first exception; publication is bounded and idempotent; watermark advance and GC follow durable publication | TASK-005 — Gate decision append, `drain_through_watermark`, Oracle audit WAL relay | TASK-005 acceptance matrix, all 8 criteria PASS; `mise run test:sql` 218/218 | PASS |
+| Scoped-role, cross-tenant, audit-unavailable, replay, backpressure, cancellation, peer-failure, restart, and cleanup journeys fail or recover exactly as revision 6 requires | Journey suites across server, oracle, forge, otlp | 7/7, 28/28, 13/13, 10/10 respectively; `mise run check:tenant-isolation` clean | PASS |
+
+### No-legacy inventory
+
+| Probe | Result |
+|---|---|
+| `crates/vala/` members | `vala-bifrost-redux`, `vala-core`, `vala-drift`, `vala-eval`, `vala-ingest`, `vala-sdk`, `vala-sql` — no `vala-bifrost` |
+| Workspace manifest | one Bifrost member, `vala-bifrost-redux` |
+| `vala_bifrost` symbols outside Redux (`*.rs`, `*.toml`) | 0 |
+| `vala-bifrost` strings, tracked, excluding Redux/`changes/`/`.dev/` | 3, all in `scripts/checks/client-tier.sh`, where the token matches Redux by prefix and guards a live dependency-direction boundary. Retained per AGENTS.md §12: the boundary it enforces is still violable. |
+| Compatibility routes or aliases | none; the `legacy`/`compatibility` matches in Redux are rustdoc stating that no such path exists |
+| Generated contracts | `mise run codegen:check` clean |
+
+### Requirement-to-evidence closure
+
+| Requirements | Evidence |
+|---|---|
+| REQ-001, REQ-002, REQ-003, INV-002, INV-003 | Merge defects resolved against the current tree rather than tolerated — sweeper `init_grace`, `check:tenant-isolation` Oracle exemption, `check:unwrap-audit` harness rename, orphan-cleanup count helper (Status Amendment above). Git's textual result was never accepted as proof. |
+| REQ-010, REQ-011, REQ-012, REQ-013, INV-023 | One engine, one serving surface, tenant-qualified physical identity; no-legacy inventory and `check:client-tier`. |
+| REQ-014, REQ-049, REQ-050, INV-017, INV-018, INV-020, AC-011, AC-012, AC-013 | Scribe WAL v6 and Oracle admission/epoch/protection behavior; `journey:oracle` 28/28, `integration:server` 67/67. |
+| REQ-015, INV-009, INV-019 | One execution attempt, no partial success; `journey:oracle`, redux 973/973. |
+| REQ-048, REQ-051, REQ-052, REQ-030A, INV-021, AC-014 | One-build planning; incorporated Forge scheduling, publication, reconciliation, worker-local FIFO admission; `vala.forge_operation_state` self-contained. `journey:forge` 13/13, `test:sql` 218/218. |
+| REQ-053, REQ-053A, AC-015 | Three canonical signal tables with trusted attribution; `journey:otlp` 10/10. |
+| REQ-054, AC-016, AC-017 | Typed scoped `Permission`; scoped-role journeys and TASK-005's retained dynamic permission. |
+| REQ-026, REQ-026A, REQ-026B, REQ-027, REQ-027A, REQ-027B, REQ-028, REQ-029, REQ-030, INV-008, INV-008A, INV-008B, INV-008C, AC-005 | TASK-005 acceptance matrix in full. |
+| REQ-062, REQ-063, AC-020 | Redux replaces `vala-bifrost` in full and owns Gate, Scribe, Oracle, Forge, telemetry, query, maintenance, recovery, and retained audit publication; no-legacy inventory. |
+| INV-007, AC-006 | No operation derives tenant identity from an untrusted source; `mise run check:tenant-isolation` clean. |
+| REQ-024 | Out of scope here — `CardPyResult` → `WyrdPyResult` remains deferred to TASK-002 (Notes for the change owner). |
+
+### Commands
+
+```
+mise run fmt                               # clean
+mise run lints                             # exit 0
+mise run codegen:check                     # All checks passed!
+mise run test:sql                          # 218/218
+mise run test:bifrost:integration:redux    # 973/973 (x3 consecutive)
+mise run test:bifrost:integration:server   # 67/67 (x3 consecutive)
+mise run test:bifrost:journey:server       # 7/7
+mise run test:bifrost:journey:oracle       # 28/28
+mise run test:bifrost:journey:forge        # 13/13
+mise run test:bifrost:journey:otlp         # 10/10
+mise run check:tenant-isolation            # clean
+mise run check:object-store-pin            # clean
+mise run check:unwrap-audit                # clean
+mise run check:client-tier                 # clean
+mise run check:pyo3-scope                  # clean
+mise run skills:sync / check:skills-sync   # clean
+git diff --check                           # clean
+```
+
+No Bifrost aggregate was run in this task, per its Verification section, and
+`mise run verify:bifrost` is withheld by explicit instruction until this
+change's merge work completes.
+
+### Defects found and fixed during closeout
+
+| Commit | Defect |
+|---|---|
+| `ebfd269ef` | `scribe/ingress.rs` resolved a built-in definition only when it declared a canonical validator, so `audit_log`'s `CorrelationPolicy::None` and `PAST_EVENT_TIME_EXEMPT` were both inert. Scribe sealed 22 columns against a registered 18 and Forge's promotion invariant refused the object. |
+| `634fbf8f2` | `crates/wyrd/wyrd-sql/src/queries/cards/audit.rs` still wrote the pre-revision audit columns and hash preimage. |
+| `566f7782c` | `WyrdTestServerBuilder` accepted `oracle_audit_wal_root` but never composed it into `BifrostRuntimeConfig`, so every test server fell back to a process-id-named directory under the system temp dir that nothing removes. Once the OS recycled a pid, a later server recovered a dead process's WAL and refused to start with `QueryAuditUnavailable`. 14933 directories had accumulated locally. |
+| `d5c0f1643` | The Oracle audit WAL development fallback is now one stable path rather than one per process id, so it neither accumulates nor adopts a foreign WAL. |
+| `d5c0f1643` | `coordinator_object_store_failure_clears_readiness` never settled the coordinator's boot planning pass. `c3db2fc9b` made a coordinator plan on start and applied `await_boot_scheduler_pass` to two sibling router-smoke cases but missed this one, so its worker barrier could close on an attempt that had nothing to promote. |
+| `6bb6f1b12` | Oracle epoch and reader-protection races were gated with a table lock on `vala.audit_staging`, which stopped blocking anything once those transitions no longer wrote audit. Re-gated on the durable rows they do write. |
+
+### Material limits
+
+- One `test:bifrost:integration:redux` run reported `972 passed (1 leaky), 1
+  failed`. Its log was overwritten before the failing test was named, and four
+  subsequent runs were 973/973. It is recorded here as an unnamed
+  non-reproducing flake rather than presented as a clean lane.
+- `ForgeSchedulerTrigger::owner_for_test` denotes a pinned lease owner for
+  restart fixtures, and `c3db2fc9b` additionally reads it as "this fixture
+  drives every scheduler pass". Those are different properties, which is why a
+  test that drives every pass without pinning an owner still receives a boot
+  pass it must remember to settle. The branch is test-support-only and
+  production is unconditional, so this is flagged rather than changed.

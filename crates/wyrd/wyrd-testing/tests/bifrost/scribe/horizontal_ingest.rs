@@ -211,8 +211,8 @@ async fn one_sealed_batch_submitted_to_every_pod_is_visible_once() {
 
     let barrier = Arc::new(tokio::sync::Barrier::new(PODS));
     let mut appends = tokio::task::JoinSet::new();
-    for pod in 0..PODS {
-        let client = Arc::clone(&clients[pod]);
+    for client in &clients {
+        let client = Arc::clone(client);
         let table = table.clone();
         let values = values.clone();
         let barrier = Arc::clone(&barrier);

@@ -22,8 +22,6 @@ use super::audit_wal::{
     AuditWal, AuditWalAppendCommand, AuditWalRecord, AuditWalWriter, OracleAuditWalConfig,
 };
 
-static TEMP_ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
 impl From<&crate::config::OracleRuntimeConfig> for OracleAuditWalConfig {
     /// Projects server configuration into the WAL owner's validated bounds.
     fn from(config: &crate::config::OracleRuntimeConfig) -> Self {
@@ -193,13 +191,16 @@ impl OracleAuditPublisher {
         vala: ValaPostgres,
         config: OracleAuditWalConfig,
     ) -> Result<std::sync::Arc<Self>, BifrostError> {
-        let root = config.audit_wal_root.clone().unwrap_or_else(|| {
-            let sequence = TEMP_ROOT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            std::env::temp_dir().join(format!(
-                "wyrd-oracle-audit-{}-{sequence}",
-                std::process::id()
-            ))
-        });
+        // Production requires `audit_wal_root`, so this fallback serves only a
+        // development server started without one. It is deliberately a single
+        // stable path: a per-process name would orphan one directory per run
+        // and, once the operating system recycled that process id, hand a
+        // later server a dead process's WAL to recover. The root is locked, so
+        // a second concurrent server fails closed here rather than sharing it.
+        let root = config
+            .audit_wal_root
+            .clone()
+            .unwrap_or_else(|| std::env::temp_dir().join("wyrd-oracle-audit"));
         let wal = AuditWal::recover(&root, &config)?;
         let wal = std::sync::Arc::new(Mutex::new(wal));
         let writer_capacity = config.audit_wal_max_records.clamp(1, 1024);

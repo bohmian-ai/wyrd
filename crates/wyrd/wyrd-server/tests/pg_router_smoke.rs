@@ -2537,6 +2537,13 @@ async fn coordinator_object_store_failure_clears_readiness() {
         .forge()
         .expect("the default target selects Forge")
         .coordinator_readiness();
+    // The coordinator's first tick is immediate, so the boot pass must be
+    // observed before this test arranges anything. Otherwise the pass this
+    // test drives below can be that boot pass still in flight — one that
+    // planned the table before it held any rows — and the worker barrier
+    // armed for the promoting attempt closes on that empty attempt instead.
+    // The worker then never attempts again and no snapshot ever appears.
+    await_boot_scheduler_pass(&server, "boot pass before object-store fault").await;
     let pool = server
         .pg_fixture()
         .superuser_pool()

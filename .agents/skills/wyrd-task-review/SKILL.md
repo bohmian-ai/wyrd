@@ -1,6 +1,6 @@
 ---
 name: wyrd-task-review
-description: Independently audit one immutable cumulative Wyrd task implementation for exact acceptance, repository-standard compliance, and Ponytail minimalism, then write a verdict and any remediation task.
+description: Independently audit one immutable cumulative Wyrd task implementation for exact acceptance and repository standards, then independently validate every finding and remediation through Ponytail before writing a verdict.
 ---
 
 # Wyrd Task Review
@@ -126,17 +126,61 @@ deleted or which existing or native mechanism already covers the outcome.
 Prescribe the outcome and boundary, not private implementation mechanics when
 several equally minimal corrections remain.
 
+## Validate findings and remediation independently
+
+Skip this section and do not create `findings-validation.md` when the proposed
+finding ledger is empty.
+
+Before choosing a verdict, give every proposed finding and correction boundary
+to a fresh validator independent of implementation, the primary acceptance
+review, and the repository-standards specialist. Provide the immutable subject,
+applicable authorities, complete diff, and proposed finding ledger, but no
+intended verdict.
+
+The validator inspects the actual source and applies the Ponytail ladder. For
+each finding it must:
+
+1. trace every caller and read the full body of each function the correction
+   would change or move;
+2. prove the reported path is reachable and required by the approved task,
+   rejecting dormant, test-only, speculative, or zero-caller surfaces unless
+   the task explicitly requires them;
+3. distinguish the requested behavior from bundled adjacent behavior and reject
+   a correction that moves, duplicates, or weakens unrelated lifecycle,
+   admission, durability, security, or resource ownership;
+4. ask whether the finding or remediation can be deleted, whether existing
+   behavior already satisfies the task, and whether the proposed proof is the
+   smallest credible check without a new dependency or test harness; and
+5. return `CONFIRMED`, `REVISED`, or `REJECTED` with source evidence and the
+   smallest safe correction boundary.
+
+The primary reviewer may include only independently confirmed or revised
+findings. A rejected finding is omitted, not softened into optional advice. If
+validation shows that the correction needs a new product, public API,
+architecture, security, compatibility, cross-service, concurrency, resource-
+ownership, or persistent-data decision, do not prescribe it as remediation;
+return `SPEC_REVISION_REQUIRED` when the approved task truly requires that
+decision, otherwise reject the finding as out of scope.
+
+Missing source, incomplete caller tracing, an unavailable independent
+validator, or disagreement that cannot be resolved from approved authority
+blocks the review. Preserve the validator's report as
+`findings-validation.md` in the review directory.
+
 ## Verdict and remediation task
 
 Create a new `changes/active/<slug>/review/<review-name>/` directory without
-overwriting a prior attempt. Write the specialist's `standards-review.md`, then
+overwriting a prior attempt. Write the specialist's `standards-review.md` and
+the validator's `findings-validation.md` when there were proposed findings, then
 write `verdict.md` containing the immutable subject, acceptance matrix,
-repository-standards result, verification limits, material findings,
-prior-finding closure, and one verdict:
+repository-standards result, independent finding-validation result when
+applicable, verification limits, material findings, prior-finding closure, and
+one verdict:
 
 - `PASS` — every obligation and the independent repository-standards audit
-  passes, non-goals remain excluded, verification is credible, and no unrelated
-  change entered the diff;
+  passes, no independently confirmed or revised material finding remains,
+  non-goals remain excluded, verification is credible, and no unrelated change
+  entered the diff;
 - `FIX_REQUIRED` — one or more bounded implementation findings remain;
 - `SPEC_REVISION_REQUIRED` — correction requires changing approved behavior or
   an expensive-to-reverse decision; or

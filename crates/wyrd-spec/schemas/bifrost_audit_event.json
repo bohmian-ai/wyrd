@@ -1170,7 +1170,7 @@
           ]
         },
         {
-          "description": "The audit outbox was unavailable.",
+          "description": "Audit staging was unavailable.",
           "type": "string",
           "enum": [
             "AUDIT_UNAVAILABLE"

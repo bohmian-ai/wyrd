@@ -436,7 +436,7 @@ pub enum StorageAuditOperation {
 pub enum AuditErrorCode {
     /// The caller lacked the required permission.
     PermissionDenied,
-    /// The audit outbox was unavailable.
+    /// Audit staging was unavailable.
     AuditUnavailable,
     /// The supplied token was invalid.
     InvalidToken,

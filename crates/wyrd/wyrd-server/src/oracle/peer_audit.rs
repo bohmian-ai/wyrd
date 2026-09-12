@@ -1,4 +1,4 @@
-//! Durable standard-outbox audit collaborator for rejected Oracle peer tickets.
+//! Durable audit-staging collaborator for rejected Oracle peer tickets.
 
 use async_trait::async_trait;
 use vala_bifrost_redux::oracle::peer::{PeerSecurityAudit, PeerSecurityAuditError};
@@ -11,7 +11,7 @@ use wyrd_spec::vala::api::{
 use crate::audit;
 use crate::postgres::ServerPostgres;
 
-/// Server-owned peer-security writer using the canonical tenant audit outbox.
+/// Server-owned peer-security writer using canonical tenant audit staging.
 #[derive(Clone)]
 pub struct PostgresPeerSecurityAudit {
     /// Runtime-ready Postgres owner used to acquire tenant-scoped transactions.

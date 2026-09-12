@@ -115,7 +115,7 @@ non-tail WAL is a no-go and invokes full restore or incident escalation.
 1. Remove Oracle readiness before the acceptance WAL reaches its configured
    backlog or durability limit; do not return rows without a successful fsync.
 2. Verify CRC frames, sequence/relay identity, tenant binding, and the last
-   canonical audit-outbox acknowledgement.
+   canonical audit-staging acknowledgement.
 3. Relay valid frames at least once and prove duplicates converge under the
    canonical audit writer. Preserve a corrupt frame and its surrounding bytes
    as evidence; never skip it to regain readiness.
@@ -142,11 +142,11 @@ success after terminal failure is a no-go.
 
 ## Audit publication or retirement failure
 
-1. Stop outbox retirement and preserve the affected tenant-scoped rows.
+1. Stop staging retirement and preserve the affected tenant-scoped rows.
 2. Determine whether each event is absent from or already durably present in
    `vala.system.audit_log`.
 3. Retry publication with the same idempotency identity.
-4. Delete only outbox rows whose corresponding audit-log publication is
+4. Delete only staging rows whose corresponding audit-log publication is
    durable.
 
 Audit retirement is a no-go while publication remains ambiguous.

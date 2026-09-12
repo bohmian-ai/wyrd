@@ -41,7 +41,7 @@ At minimum, deployments measure:
 - Postgres saturation, replication health, migration state, transaction
   failures, and RLS/role verification;
 - object-store latency, throttling, integrity failure, and capacity;
-- audit-outbox publication lag and failure outcome; and
+- audit-staging publication lag and failure outcome; and
 - backup age, backup verification, restore duration, and recovery-point age.
 
 Tenant, table, query, object path, task, attempt, and principal identities do
@@ -180,10 +180,10 @@ past them; a replayed range is absorbed by Scribe's durable batch-id fence.
 The current Scribe and Forge publication path publishes those ranges
 idempotently; a legacy direct-Iceberg relay is not a recovery mechanism.
 
-Outbox rows retire only after their corresponding events are durably published
+Staging rows retire only after their corresponding events are durably published
 to `vala.system.audit_log`. Recovery distinguishes unpublished rows from rows
 whose publication completed before the publisher checkpointed retirement. An
-ambiguous boundary preserves the outbox row and retries the idempotent
+ambiguous boundary preserves the staging row and retries the idempotent
 publication.
 
 ## Forge failure boundaries
@@ -265,7 +265,7 @@ The production qualification suite exercises, with real dependencies:
 
 - Postgres point-in-time restore and migration compatibility;
 - object-store version recovery and missing/corrupt-object detection;
-- audit-outbox and retained audit-log reconciliation;
+- audit-staging and retained audit-log reconciliation;
 - Scribe crash at each durability boundary, replay, duplicate suppression,
   staged-run recovery, and uncertain publication;
 - Oracle leader and peer loss, cancellation, timeout, spill exhaustion,

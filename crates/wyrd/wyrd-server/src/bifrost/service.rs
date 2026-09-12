@@ -181,7 +181,7 @@ pub async fn register_table(
 /// List the tables visible to the caller's tenant (schema-free entries).
 ///
 /// Listing requires `bifrost_table:read`. A denial appends a canonical
-/// `decision = deny` row to the tenant audit outbox before the public 403 is
+/// `decision = deny` row to tenant audit staging before the public 403 is
 /// returned, and is fail-closed: an audit-append failure refuses the read with
 /// `WYRD_VALA_500_AUDIT_UNAVAILABLE`. A successful list is an ordinary
 /// tenant-bound read and records no durable transition.
@@ -326,7 +326,7 @@ mod pg_tests {
         }
     }
 
-    /// Read the caller's own audit-outbox rows for one resource.
+    /// Read the caller's own audit-staging rows for one resource.
     ///
     /// The rows are fetched through the canonical tenant-scoped reader, then
     /// narrowed to the caller's request ID so an assertion sees exactly the

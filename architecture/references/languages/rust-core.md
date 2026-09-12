@@ -601,7 +601,7 @@ atomically.
 Audit follows durable domain transitions. Append each auditable Postgres event
 inside the transaction that commits that transition. Oracle read admission is
 the narrow exception: fsync its versioned local audit WAL before rows and relay
-the canonical tenant outbox event at least once. Forge operator audit remains
+the canonical tenant staging event at least once. Forge operator audit remains
 behind its fenced, tenant-bound capability.
 
 ## External URL Safety

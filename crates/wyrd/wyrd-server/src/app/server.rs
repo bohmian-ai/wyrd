@@ -619,7 +619,7 @@ impl BoundServer {
         }
         // Retained audit history: one bounded sweep per interval moves each
         // tenant's oldest contiguous run of audit events out of the
-        // transactional outbox and retires it only once Scribe has it durably.
+        // transactional staging and retires it only once Scribe has it durably.
         if let Some(publisher) = crate::audit::publication::AuditPublisher::from_state(&self.state)
         {
             set.spawn(worker_task(

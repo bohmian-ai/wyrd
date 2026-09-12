@@ -28,7 +28,7 @@ transactions described here.
 | Gate | Authentication, tenant resolution, table resolution, and request dispatch | Supplies Scribe and Oracle with an authenticated tenant/table context. It does not choose or commit Forge work. |
 | Scribe | Per-pod WAL, memtables, Parquet sealing, and `vala.file_list` registration | Produces Forge's input files. Scribe does not write Iceberg snapshots. |
 | Oracle | DataFusion query planning and the read surface | Reads compacted Iceberg data and un-compacted staged files. Queries do not wait for Forge to compact a file. |
-| Forge | Compaction, snapshot expiry, orphan GC, audit recovery, and lease fencing | Maintains the transition from staged Parquet to Iceberg-backed data. |
+| Forge | Compaction, snapshot expiry, orphan GC, recovery, and lease fencing | Maintains the transition from staged Parquet to Iceberg-backed data. |
 
 The durable surfaces have different roles:
 
@@ -37,7 +37,7 @@ The durable surfaces have different roles:
 | Object store | Staged Parquet, Iceberg data files, metadata, manifests, and statistics | Reads inputs, writes compacted data, and deletes unreferenced objects. |
 | `vala.file_list` | Postgres index of sealed files and their compaction state | Selects candidates and records prepared/committed input state. |
 | `vala.maintenance_leases` | Cross-tenant lease ownership and fencing tokens | Ensures one Forge owner processes a tenant/table at a time. |
-| Audit outbox | Durable record of Forge state transitions | Reconstructs the outcome when Postgres and Iceberg cannot commit atomically. |
+| `vala.forge_operation_state` | Durable record of Forge state transitions | Reconstructs the outcome when Postgres and Iceberg cannot commit atomically. |
 | Iceberg catalog | Table metadata and snapshot history | Loads table state and commits compacted data or snapshot expiry. |
 
 ## Data path: Gate to Oracle
@@ -151,7 +151,8 @@ subject to this rewrite retry schedule.
 ### Durable compaction states
 
 Postgres and Iceberg cannot participate in one transaction. Forge makes that
-cross-system boundary explicit in `vala.file_list` and the audit outbox:
+cross-system boundary explicit in `vala.file_list` and
+`vala.forge_operation_state`:
 
 | State | `compacted` | `committed_snapshot_id` | Meaning |
 | --- | --- | --- | --- |

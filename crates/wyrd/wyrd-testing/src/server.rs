@@ -1562,8 +1562,8 @@ impl WyrdTestServer {
     /// Wait until every locally accepted Oracle audit record has relayed.
     ///
     /// Oracle read acceptance is fsynced to a local WAL before rows are
-    /// permitted and relayed into the canonical outbox by a background task, so
-    /// a journey that asserts on the outbox must first observe the relay
+    /// permitted and relayed into canonical staging by a background task, so
+    /// a journey that asserts on staging must first observe the relay
     /// converge. This polls the exact pending counter rather than sleeping a
     /// fixed interval: the returned count is the real residual, and a nonzero
     /// return within `budget` is a genuine failure to drain, not a masked race.

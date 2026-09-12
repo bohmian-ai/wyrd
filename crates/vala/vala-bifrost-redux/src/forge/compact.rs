@@ -3,9 +3,9 @@
 //! This module owns the compaction state machine. It selects bounded,
 //! tenant-scoped groups from `vala.file_list`, validates and sorts their Arrow
 //! rows, writes one Iceberg data file, and records each durable transition in
-//! the audit outbox. Prepared audit records make a crash between the SQL and
-//! Iceberg commits observable; the next Forge tick reconciles that state before
-//! selecting more files.
+//! `vala.forge_operation_state`. Prepared operation state makes a crash between
+//! the SQL and Iceberg commits observable; the next Forge tick reconciles that
+//! state before selecting more files.
 
 use std::time::Duration;
 

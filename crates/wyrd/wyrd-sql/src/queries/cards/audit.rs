@@ -1,6 +1,6 @@
 //! Transactional audit writer for the card registry plane.
 //!
-//! Card registration is a control-plane operation, so its outbox append lives
+//! Card registration is a control-plane operation, so its staging append lives
 //! in the same tenant transaction as the card write. The append is deliberately
 //! fail-closed: a failed chain update aborts the caller's transaction.
 // raw-query grep allowlist: card audit writes post-date the SQLx offline cache;
@@ -32,7 +32,7 @@ pub(super) struct CardRegistrationAuditInput<'a> {
     pub(super) request_id: Option<&'a RequestId>,
 }
 
-/// Append one typed card-registration event to the tenant audit outbox.
+/// Append one typed card-registration event to tenant audit staging.
 pub(crate) async fn record_card_registration_audit(
     conn: &mut TenantConn<'_>,
     input: CardRegistrationAuditInput<'_>,
@@ -110,7 +110,7 @@ pub(crate) async fn record_card_registration_audit(
     .bind(&detail)
     .execute(&mut **conn.transaction())
     .await
-    .map_err(|error| audit_error(error, "insert outbox row"))?;
+    .map_err(|error| audit_error(error, "insert staging row"))?;
 
     sqlx::query(
         r#"UPDATE vala.audit_chain_head

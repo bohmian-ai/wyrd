@@ -116,7 +116,7 @@ transaction-pooled path.
   termination; the audit WAL is not.
 - Audit projection uses the current Scribe and Forge publication path to write
   retained `vala.system.audit_log` history. Deployment readiness includes
-  durable idempotent publication and bounded outbox retirement;
+  durable idempotent publication and bounded staging retirement;
   `vala.audit_staging` is not retained history.
 - Forge requires no local scratch volume: managed compaction does not enable
   DataFusion disk spilling. Its pod memory limit remains the final physical

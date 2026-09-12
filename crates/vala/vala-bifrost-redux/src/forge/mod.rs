@@ -2,7 +2,7 @@
 //!
 //! A scheduler leases one tenant/table at a time, then runs reconciliation,
 //! compaction, snapshot expiry, and orphan garbage collection under the same
-//! fencing boundary. The stages use the audit outbox and durable file metadata
+//! fencing boundary. The stages use durable operation state and file metadata
 //! to recover work after a process or catalog failure.
 
 use std::sync::Arc;

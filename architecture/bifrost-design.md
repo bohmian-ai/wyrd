@@ -435,7 +435,7 @@ stability; pruning, vectorization, layout, and IO efficiency determine latency.
 Oracle read admission is the narrow exception to transactional Postgres audit.
 Before rows may be returned, the server fsyncs a versioned CRC-framed local WAL
 acceptance containing its timestamp. One bounded relay appends it at least once
-to the canonical tenant hash-chain outbox. A replayed relay may create one
+to the canonical tenant hash-chain staging table. A replayed relay may create one
 valid duplicate but cannot lose an accepted read decision. One logical query
 produces one read-audit event; distributed stages produce none.
 
@@ -452,8 +452,8 @@ query deadline range is `1..=u32::MAX` milliseconds across Rust, HTTP, gRPC,
 Python, TypeScript, and MCP.
 
 The tenant hash-chain `vala.audit_staging` is transient transactional
-write-ahead state, not retained audit history, and not an outbox: it has no
-external consumer. Contiguous tenant-scoped ranges are read by a per-tenant
+write-ahead state, not retained audit history, and has no external consumer.
+Contiguous tenant-scoped ranges are read by a per-tenant
 watermark and projected idempotently through the owning local Scribe and the
 Forge publication path into the tenant-qualified `vala.system.audit_log` Bifrost
 table. That table is the authoritative retained audit history. The publisher

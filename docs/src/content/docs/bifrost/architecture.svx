@@ -312,7 +312,7 @@ The predicate cannot be elided by a DataFusion optimizer pass because the rule i
 ## Audit data
 
 Audited operations append immutable, hash-chained rows to
-`vala.audit_outbox` in their Postgres transaction. Redux owns the canonical
+`vala.audit_staging` in their Postgres transaction. Redux owns the canonical
 `vala.system.audit_log` table definition and deterministic row projection.
 
 The audit log captures: operation name, principal ID, tenant, timestamp, decision (allow/deny), result, and detail field. Denials are written in a separate fail-closed transaction before the error is returned to the caller.

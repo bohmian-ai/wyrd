@@ -122,8 +122,8 @@ Locked cross-cutting decisions that any contributor must honor:
 - Bifrost clients use `wyrd_client::Bifrost` over the crate's shared HTTP and
   gRPC transport. Rust, Python, and TypeScript project that same facade. Gate, Scribe,
   Oracle, and Forge remain server owners and never become client types.
-- `vala.audit_staging` is transient write-ahead state, not an outbox: it has no
-  external consumer. Retained audit history lives in `vala.system.audit_log`.
+- `vala.audit_staging` is transient write-ahead state with no external
+  consumer. Retained audit history lives in `vala.system.audit_log`.
   Publication progress is a per-tenant monotonic watermark plus at most one
   frozen in-flight upper bound; no lease, claim, or owner token exists. Every
   competing or restarted publisher reuses that bound, so the replayed range and

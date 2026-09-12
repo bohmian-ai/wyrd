@@ -177,7 +177,7 @@ impl AuditPublisher {
     /// and wait for the next batch.
     ///
     /// # Errors
-    /// Returns [`AuditPublicationError::Outbox`] when reading the range fails,
+    /// Returns [`AuditPublicationError::Staging`] when reading the range fails,
     /// or when the range has no staged row — which cannot happen while staging
     /// is only deleted through the watermark;
     /// [`AuditPublicationError::Projection`] for non-contiguous or invalid
@@ -190,7 +190,7 @@ impl AuditPublisher {
     ) -> Result<(), AuditPublicationError> {
         let rows = self.read_range(tenant, range).await?;
         if rows.is_empty() {
-            return Err(AuditPublicationError::Outbox(format!(
+            return Err(AuditPublicationError::Staging(format!(
                 "frozen audit range {}..={} has no staged row",
                 range.seq_lo, range.seq_hi
             )));
@@ -222,13 +222,13 @@ impl AuditPublisher {
     ) -> Result<Option<AuditPublicationRange>, AuditPublicationError> {
         let mut conn = TenantConn::acquire(&self.pool, tenant)
             .await
-            .map_err(|error| AuditPublicationError::Outbox(error.to_string()))?;
+            .map_err(|error| AuditPublicationError::Staging(error.to_string()))?;
         let range = freeze_publication_range(&mut conn, self.batch_records)
             .await
-            .map_err(|error| AuditPublicationError::Outbox(error.to_string()))?;
+            .map_err(|error| AuditPublicationError::Staging(error.to_string()))?;
         conn.commit()
             .await
-            .map_err(|error| AuditPublicationError::Outbox(error.to_string()))?;
+            .map_err(|error| AuditPublicationError::Staging(error.to_string()))?;
         Ok(range)
     }
 
@@ -241,13 +241,13 @@ impl AuditPublisher {
     {
         let mut conn = TenantConn::acquire(&self.pool, tenant)
             .await
-            .map_err(|error| AuditPublicationError::Outbox(error.to_string()))?;
+            .map_err(|error| AuditPublicationError::Staging(error.to_string()))?;
         let rows = list_publication_range(&mut conn, range)
             .await
-            .map_err(|error| AuditPublicationError::Outbox(error.to_string()))?;
+            .map_err(|error| AuditPublicationError::Staging(error.to_string()))?;
         conn.commit()
             .await
-            .map_err(|error| AuditPublicationError::Outbox(error.to_string()))?;
+            .map_err(|error| AuditPublicationError::Staging(error.to_string()))?;
         Ok(rows)
     }
 
@@ -282,7 +282,7 @@ impl AuditPublisher {
 pub enum AuditPublicationError {
     /// Freezing or reading the owed staging range failed.
     #[error("audit staging read failed: {0}")]
-    Outbox(String),
+    Staging(String),
     /// The claimed rows could not be projected into canonical content.
     #[error("audit projection failed: {0}")]
     Projection(String),

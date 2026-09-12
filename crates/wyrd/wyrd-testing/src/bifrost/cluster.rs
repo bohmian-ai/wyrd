@@ -2284,12 +2284,12 @@ impl WyrdTestCluster {
         self.reclaimed_panic_attempts.insert(task_id, attempt_id);
     }
 
-    /// Return the canonical audit-outbox row count for panic-clock assertions.
+    /// Return the canonical audit-staging row count for panic-clock assertions.
     ///
     /// # Errors
     ///
     /// Returns a fixture or SQL error when the privileged assertion connection
-    /// cannot read the canonical outbox.
+    /// cannot read canonical staging.
     pub async fn audit_staging_count_for_test(&self) -> Result<i64, ClusterError> {
         let pool = self
             .fixture

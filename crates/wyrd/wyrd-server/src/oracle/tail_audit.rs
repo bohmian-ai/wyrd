@@ -10,7 +10,7 @@ use wyrd_spec::vala::api::{
     AuditDetail, AuditOutcome, BifrostSecurityPhase, BifrostSecurityViolationKind,
 };
 
-/// Standard-outbox writer for tail-specific security violations.
+/// Audit-staging writer for tail-specific security violations.
 #[derive(Clone)]
 pub struct PostgresTailSecurityAudit {
     postgres: ServerPostgres,

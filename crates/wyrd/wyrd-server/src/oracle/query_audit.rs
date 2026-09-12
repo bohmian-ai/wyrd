@@ -1,4 +1,4 @@
-//! Transactional outbox audit owner for retained Oracle queries.
+//! Transactional audit-staging owner for retained Oracle queries.
 
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -724,7 +724,7 @@ mod pg_tests {
     }
 
     #[test]
-    /// Proves a locally fsynced tenant event reaches the canonical outbox.
+    /// Proves a locally fsynced tenant event reaches canonical staging.
     fn oracle_audit_relay_appends_tenant_scoped_event() {
         run(async {
             let vala = crate::test_support::test_vala_postgres().await;
@@ -923,9 +923,9 @@ mod pg_tests {
     /// observed with no concurrent decrement, then released so the counter drains
     /// to zero. Correctness is measured as a committed-row delta around this
     /// test's own appends, so it is independent of rows other tests leave in the
-    /// shared single-tenant outbox. The name sorts after
+    /// shared single-tenant staging. The name sorts after
     /// `oracle_audit_relay_appends_tenant_scoped_event` so that exact-count test
-    /// still observes a clean outbox.
+    /// still observes clean staging.
     fn oracle_audit_relay_pending_counter_drains_to_zero_pg() {
         run(async {
             let vala = crate::test_support::test_vala_postgres().await;
@@ -977,7 +977,7 @@ mod pg_tests {
             assert_eq!(
                 count_after - count_before,
                 2,
-                "each of the two pending decrements committed exactly one outbox row"
+                "each of the two pending decrements committed exactly one staging row"
             );
             publisher
                 .shutdown(Instant::now() + Duration::from_secs(1))
@@ -1007,7 +1007,7 @@ mod pg_tests {
             // The relay stays paused for the whole test so it never checkpoints or
             // commits a row: the two records remain pending, and the test tears the
             // publisher down with `abort_for_test` rather than draining, keeping the
-            // shared single-tenant outbox unpolluted.
+            // shared single-tenant staging unpolluted.
             let _pause = publisher.pause_relay_before_postgres();
             publisher
                 .publish_read_decision(&context(tenant), decision())

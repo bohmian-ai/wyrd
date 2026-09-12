@@ -223,7 +223,7 @@ pub async fn upload_init(
 /// session is never visible without its audit record.
 ///
 /// # Errors
-/// Returns the audit write error when the outbox append fails.
+/// Returns the audit write error when the staging append fails.
 async fn write_session_created(
     conn: &mut TenantConn<'_>,
     caller: &StorageCaller,

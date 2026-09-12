@@ -2675,7 +2675,7 @@ mod tests {
     }
 }
 
-// ── Audit event (S3.C5 — transactional audit outbox) ─────────────────────────
+// ── Audit event (S3.C5 — transactional audit staging) ────────────────────────
 
 /// How the acting principal authenticated for an audited data-plane op.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

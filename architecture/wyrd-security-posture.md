@@ -241,8 +241,8 @@ fsyncs a versioned, CRC-framed local acceptance record before returning rows,
 then a bounded at-least-once relay appends the canonical tenant
 `vala.audit_staging` entry. Relay identity makes replay safe and observable.
 
-`vala.audit_staging` is transient transactional write-ahead state, not an
-outbox: it has no external consumer. Retained audit history lives in the
+`vala.audit_staging` is transient transactional write-ahead state with no
+external consumer. Retained audit history lives in the
 tenant-qualified Bifrost `vala.system.audit_log` table. A bounded publisher in a
 process owning a local Scribe moves events idempotently into that table through
 that Scribe, never through Gate. Progress is the monotonic per-tenant watermark

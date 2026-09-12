@@ -28,7 +28,7 @@ use crate::http::error::permission_deny_reason_to_wyrd;
 /// that cannot be recorded is returned as audit-unavailable rather than as a
 /// plain rejection, so no refusal is silently unlogged.
 pub(crate) struct QueryAuthority<'a> {
-    /// Shared server state containing authorization and the durable audit outbox.
+    /// Shared server state containing authorization and durable audit staging.
     state: &'a AppState,
     /// Authenticated caller whose tenant and request spine own the audit row.
     caller: &'a Caller,
@@ -430,7 +430,7 @@ mod tests {
     /// Proves authorization and its denial audit run before local role lookup.
     ///
     /// The allowed caller reaches typed role-unavailable without a Gate, while
-    /// the denied caller receives RBAC denial only after the real outbox append
+    /// the denied caller receives RBAC denial only after the real staging append
     /// succeeds. Neither path can start Oracle planning or source IO.
     #[test]
     fn bifrost_query_authz_precedes_oracle_role_lookup() {

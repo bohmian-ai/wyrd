@@ -524,8 +524,8 @@ impl WyrdTestServer {
     /// Wait until every accepted Oracle audit record has relayed to Postgres.
     ///
     /// Returns the residual pending count, which is `0` on a converged relay.
-    /// A journey asserting on the read-decision outbox calls this first: the
-    /// relay is a background task, so the outbox lags local acceptance.
+    /// A journey asserting on read-decision staging calls this first: the relay
+    /// is a background task, so staging lags local acceptance.
     ///
     /// # Errors
     ///

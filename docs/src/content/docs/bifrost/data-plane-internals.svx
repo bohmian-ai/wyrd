@@ -86,9 +86,9 @@ storage and audit context; the Forge page is the operational reference.
 ## Audit data
 
 Every audited operation appends an immutable row to the tenant-scoped,
-hash-chained `vala.audit_outbox` in the operation's Postgres transaction.
+hash-chained `vala.audit_staging` in the operation's Postgres transaction.
 Redux defines the canonical `vala.system.audit_log` schema and a deterministic
-projection from ordered outbox rows; Scribe owns physical stamping when that
+projection from ordered staging rows; Scribe owns physical stamping when that
 projection is ingested.
 
 ## Database privilege model

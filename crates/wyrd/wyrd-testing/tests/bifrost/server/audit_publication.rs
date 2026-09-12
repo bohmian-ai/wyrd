@@ -210,14 +210,14 @@ async fn frozen_audit_range_replays_once_while_its_tail_waits() -> Result<(), Se
     Ok(())
 }
 
-/// An audited transition reaches retained history and only then leaves the outbox.
+/// An audited transition reaches retained history and only then leaves staging.
 ///
 /// `vala.audit_staging` is transient delivery state and `vala.system.audit_log`
 /// is the retained authority, so a row may retire only once its content is
 /// durable in the Bifrost table. This appends one distinctive event through the
 /// production writer, runs the production publisher, and asserts both halves of
 /// that contract: the event readable exactly once through the public query
-/// surface, and the row gone from the outbox. A publisher that retired a range
+/// surface, and the row gone from staging. A publisher that retired a range
 /// it had not shipped loses the first assertion; one that never retires loses
 /// the second.
 ///

@@ -1,4 +1,4 @@
-//! Tenant-scoped writes and reads for the audit outbox:
+//! Tenant-scoped writes and reads for audit staging:
 //! `vala.audit_chain_head` and `vala.audit_staging`.
 //!
 //! `append_audit` runs in the audited operation's own [`TenantConn`]
@@ -6,7 +6,7 @@
 //! lock, computes the SHA256 entry hash in Rust (this module owns the canonical
 //! encoding), inserts the append-only row, and bumps the head — all so the audit
 //! row commits atomically with the operation it records.
-// raw-query grep allowlist: audit outbox tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
+// raw-query grep allowlist: audit staging tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use sha2::{Digest, Sha256};
 use sqlx::PgConnection;

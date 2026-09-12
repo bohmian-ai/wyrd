@@ -23,7 +23,7 @@ Readiness therefore requires:
 - reachable authoritative Postgres and object storage;
 - loaded authentication, signing, and peer keys;
 - active audit path, including the Oracle local acceptance WAL and relay;
-- healthy outbox publication into retained `vala.system.audit_log`, including
+- healthy staging publication into retained `vala.system.audit_log`, including
   bounded retry and retirement state;
 - initialized resource governors and writable role-owned durable volumes;
 - registered peer identity where a distributed role is enabled; and

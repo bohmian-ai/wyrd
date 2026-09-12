@@ -73,7 +73,7 @@ pub(crate) struct AuditWalRecord {
     pub lsn: u64,
     /// Unix epoch timestamp captured before the frame was written.
     pub accepted_at_micros: i64,
-    /// Tenant owning the eventual outbox row.
+    /// Tenant owning the eventual staging row.
     pub tenant: DataTenantId,
     /// Existing canonical audit event payload.
     pub event: AuditEvent,

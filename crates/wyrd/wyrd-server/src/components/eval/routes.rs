@@ -296,6 +296,14 @@ fn check_lease(headers: &HeaderMap, entry: &RunEntry) -> Result<(), WyrdErrorRes
 /// so the verdict — allowed or denied — is recorded as one canonical audit event
 /// naming the requested eval before the run is created or refused. The append is
 /// fail-closed: a run is never opened on an unrecorded decision.
+///
+/// A denial keeps the eval surface's own refusal body, naming the required
+/// permission as its wire string, so auditing the verdict changes no response.
+///
+/// # Errors
+/// Returns `WYRD_PERMISSION_403_DENIED_RBAC` when the principal lacks
+/// `evals:run`, and the audit-unavailable error when either outcome cannot be
+/// recorded.
 async fn require_eval_run(
     state: &AppState,
     caller: &Caller,
@@ -309,6 +317,13 @@ async fn require_eval_run(
         &format!("eval:{}", eval_ref.name.as_str()),
     )
     .await
+    .map_err(|error| match error {
+        WyrdError::PermissionDeniedRbac { .. } => WyrdError::PermissionDeniedRbac {
+            message: "evals:run permission required to open an eval run".to_owned(),
+            details: serde_json::json!({ "required": Permission::eval_run().to_string() }),
+        },
+        other => other,
+    })
     .map_err(WyrdErrorResponse::from)
 }
 

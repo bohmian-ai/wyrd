@@ -354,8 +354,8 @@ mod pg_tests {
             "the RBAC denial reaches the client verbatim: {refusal}"
         );
         let mut conn = server.tenant_conn_for(tenant).await?;
-        let denial_rows: Vec<(String, uuid::Uuid, String, String, String)> = sqlx::query_as(
-            "SELECT permission, principal_id, request_id, decision, result \
+        let denial_rows: Vec<(String, uuid::Uuid, String, String)> = sqlx::query_as(
+            "SELECT permission, principal_id, request_id, outcome \
              FROM vala.audit_staging \
              WHERE operation = $1 \
                AND request_id = $2",
@@ -371,8 +371,7 @@ mod pg_tests {
                 Permission::bifrost_query_read().to_string(),
                 denied.id().as_uuid(),
                 denied_request_id.to_string(),
-                "deny".to_owned(),
-                "failure".to_owned(),
+                "denied".to_owned(),
             )],
             "the denial is durably audited exactly once, under the caller's own \
              request id, before anything is disclosed"

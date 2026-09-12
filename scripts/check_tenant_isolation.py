@@ -70,20 +70,6 @@ VALA_MIXED_EXECUTOR_ALLOWLIST = {
     "crates/vala/vala-sql/src/queries/forge_operations.rs",
 }
 
-# Cohesive owners that expose a narrow tenant-bound capability through a struct
-# that owns a verified `tenant: DataTenantId` and re-establishes the tenant RLS
-# boundary by executing `BIND_CURRENT_TENANT_SQL` before it writes, instead of
-# taking a `TenantConn`. This is the fenced-operator audit path: a Forge worker
-# appends audit evidence on the operator transaction it already holds, so the
-# capability binds the current tenant on that shared connection rather than
-# threading a separate TenantConn. Entries must still satisfy both shape rules:
-# every public async fn either takes a `TenantConn<'_>` or is a method of the
-# tenant-owning capability struct, and the module must execute
-# `BIND_CURRENT_TENANT_SQL`.
-VALA_TENANT_BOUND_CAPABILITY_ALLOWLIST = {
-    "crates/vala/vala-sql/src/queries/audit_outbox.rs",
-}
-
 # Cohesive owners whose capability structs *hold* the caller's `TenantConn`
 # borrow for the lifetime of a multi-statement workflow, instead of taking one
 # per call. The isolation property is unchanged and in fact tighter: every
@@ -342,33 +328,6 @@ def check_vala_query_modules(failures: list[str]) -> None:
             )
             continue
 
-        if relative in VALA_TENANT_BOUND_CAPABILITY_ALLOWLIST:
-            if "BIND_CURRENT_TENANT_SQL" not in code:
-                failures.append(
-                    f"{relative}: tenant-bound capability module must execute BIND_CURRENT_TENANT_SQL to re-establish the RLS boundary"
-                )
-            owns_tenant_field = re.search(
-                r"struct\s+\w+[^{]*\{[^}]*tenant:\s*DataTenantId", code, re.DOTALL
-            ) is not None
-            for fn_name, params in public_async_fns(code):
-                if (
-                    "TenantConn<'_" not in params
-                    and "TenantConn < '_" not in params
-                    and not (owns_tenant_field and "self" in params)
-                ):
-                    failures.append(
-                        f"{relative}: tenant-bound public async fn {fn_name} must take TenantConn or be a method of a struct owning tenant: DataTenantId"
-                    )
-            check_tenant_query_file(
-                relative,
-                body,
-                code,
-                failures,
-                allow_operator_transaction=True,
-                exempt_tenant_conn_param=True,
-            )
-            continue
-
         check_tenant_query_file(relative, body, code, failures)
 
 
@@ -378,28 +337,20 @@ def check_tenant_query_file(
     code: str,
     failures: list[str],
     *,
-    allow_operator_transaction: bool = False,
     exempt_tenant_conn_param: bool = False,
 ) -> None:
     """Run every tenant-query SQL rule against one module.
 
-    `allow_operator_transaction` and `exempt_tenant_conn_param` suppress only the
-    two rules a tenant-bound capability legitimately replaces with its own shape
-    guarantees (see `VALA_TENANT_BOUND_CAPABILITY_ALLOWLIST`): a capability that
-    holds the caller's operator transaction is permitted a `Transaction<'_>`
-    parameter, and its public async fns are methods of a tenant-owning struct
-    rather than `TenantConn` takers; such a module proves its RLS boundary with
-    an explicit tenant predicate on every statement instead. Every other rule —
-    the raw-`PgPool` prohibition, the self-opened-transaction prohibition, the
-    tenant-predicate requirement, and the raw-query justification — still runs
-    unchanged.
+    `exempt_tenant_conn_param` suppresses only the one rule a `TenantConn`-owning
+    capability legitimately replaces with its own shape guarantee (see
+    `VALA_TENANT_CONN_OWNER_ALLOWLIST`): its public async fns are methods of a
+    struct holding the caller's `TenantConn` rather than `TenantConn` takers, so
+    the module proves its RLS boundary with an explicit tenant predicate on every
+    statement instead. Every other rule — the raw-`PgPool`/`Transaction`
+    prohibition, the self-opened-transaction prohibition, the tenant-predicate
+    requirement, and the raw-query justification — still runs unchanged.
     """
-    pool_pattern = (
-        r"&\s*PgPool\b|\bPgPool\s*,"
-        if allow_operator_transaction
-        else r"&\s*PgPool\b|\bPgPool\s*,|Transaction\s*<\s*'_"
-    )
-    if re.search(pool_pattern, code):
+    if re.search(r"&\s*PgPool\b|\bPgPool\s*,|Transaction\s*<\s*'_", code):
         failures.append(
             f"{relative}: tenant query module must not take raw PgPool/Transaction"
         )

@@ -4077,6 +4077,18 @@ impl WyrdTestServerBuilder {
         let mut bifrost_config = BifrostRuntimeConfig::default();
         bifrost_config.scribe.ingest_request_bytes = self.scribe_ingest_limits.max_frame_bytes;
         bifrost_config.storage = self.bifrost_storage_io;
+        // The Oracle audit WAL is pod-local durable state with the same
+        // lifecycle as the Scribe WAL, so it lives beside it unless a cluster
+        // hands this node a root of its own. Leaving it unset would fall back
+        // to the server's process-id-named directory under the system temp
+        // dir, which no test removes and which a later process inherits once
+        // the operating system recycles that pid — recovery then adopts a
+        // foreign WAL and refuses to start.
+        bifrost_config.oracle.audit_wal_root =
+            Some(self.oracle_audit_wal_root.as_ref().map_or_else(
+                || durable_wal_root.join("oracle-audit"),
+                |root| root.path().to_owned(),
+            ));
         let forge_runtime = ForgeRuntimeConfig {
             maintenance_interval_secs: Some(self.forge_interval.as_secs()),
             ..ForgeRuntimeConfig::default()

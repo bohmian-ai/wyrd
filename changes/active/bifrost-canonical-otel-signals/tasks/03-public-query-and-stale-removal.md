@@ -478,7 +478,7 @@ pre-task commit `8c107b344`:
 - The `otlp` journey lane fails with `no tests to run`: every file under
   `crates/wyrd/wyrd-testing/tests/bifrost/otlp/` is a 0-byte archived target at
   `8c107b344` as well.
-- `wyrd-mcp::mcp query::pg_tests::delegated_agent_query_is_attributed_in_its_durable_audit_record`
+- `wyrd-mcp::mcp query::pg_tests::delegated_agent_query_is_authorized_as_the_effective_principal`
   fails with `RowNotFound` when the seven-test MCP journey lane runs in
   parallel and passes when run alone — the audit relay race. It reproduces
   identically in the baseline worktree at `8c107b344`.

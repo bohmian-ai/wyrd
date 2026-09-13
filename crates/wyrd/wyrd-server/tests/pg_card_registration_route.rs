@@ -1587,6 +1587,53 @@ async fn delete_audit_failure_keeps_card_active() {
     server.shutdown().await.expect("test server shuts down");
 }
 
+/// A delete that finds no Card still records its one received verdict.
+///
+/// The not-found transaction commits nothing, so its in-transaction append
+/// rolls back and the service records the allowed row standalone exactly once.
+#[tokio::test(flavor = "current_thread")]
+async fn delete_by_ref_not_found_records_one_decision() {
+    if !enabled() {
+        return;
+    }
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("registry-delete-missing", &["writer"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("writer bootstrap returned a non-user principal");
+    };
+
+    let request = Request::builder()
+        .method(Method::DELETE)
+        .uri("/v1/cards/by-ref?kind=Prompt&space=default&name=never-registered&version=1.0.0")
+        .body(Body::empty())
+        .expect("delete request builds");
+    let response = server
+        .oneshot_authenticated(&jwt, request)
+        .await
+        .expect("delete responds");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let decisions: Vec<String> = sqlx::query_scalar(
+        "SELECT outcome FROM vala.audit_staging \
+         WHERE operation = 'card.registration.delete' AND resource LIKE '%never-registered%'",
+    )
+    .fetch_all(&mut **conn.transaction())
+    .await
+    .expect("delete decisions read");
+    assert_eq!(decisions, vec!["allowed".to_owned()]);
+    conn.commit().await.expect("assertion transaction commits");
+    server.shutdown().await.expect("test server shuts down");
+}
+
 /// Backend cleanup failure leaves a committed tombstone and retryable blob state.
 #[tokio::test(flavor = "current_thread")]
 async fn delete_storage_failure_preserves_cleanup_state() {

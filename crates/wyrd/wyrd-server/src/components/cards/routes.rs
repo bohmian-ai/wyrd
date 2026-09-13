@@ -20,6 +20,7 @@ use wyrd_spec::registry::{
     GetCardResponse, ListCardsRequest, ListCardsResponse, ListVersionsResponse,
 };
 use wyrd_spec::storage::IDEMPOTENCY_KEY_HEADER;
+use wyrd_spec::vala::api::AuditEvent;
 
 use crate::audit;
 use crate::components::auth::Caller;
@@ -298,9 +299,16 @@ pub(crate) async fn register_card_http(
     // access token and the `Caller` extractor has materialized its principal.
     // This check is intentionally route-local: authentication answers "who is
     // calling?" while this capability check answers "may they register cards?".
-    authorize_card_write(&state, &caller, "card.registration.create", "cards").await?;
-    let idempotency_key = extract_required_idempotency_key(&headers)?;
-    service::register_card(&state, &caller, idempotency_key.as_str(), body)
+    let allowed = allow_card_write(&state, &caller, "card.registration.create", "cards").await?;
+    let idempotency_key = match extract_required_idempotency_key(&headers) {
+        Ok(key) => key,
+        Err(error) => {
+            audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, &allowed)
+                .await?;
+            return Err(error);
+        }
+    };
+    service::register_card(&state, &caller, idempotency_key.as_str(), body, &allowed)
         .await
         .map(|response| (StatusCode::CREATED, Json(response)))
         .map_err(WyrdErrorResponse::from)
@@ -380,14 +388,14 @@ async fn delete_card_http(
         ))
     })?;
     let card_uid = parse_card_uid(&card_uid)?;
-    authorize_card_write(
+    let allowed = allow_card_write(
         &state,
         &caller,
         "card.registration.delete",
         &format!("card:{card_uid}"),
     )
     .await?;
-    service::delete_card_with_kind(&state, &caller, &card_uid, kind)
+    service::delete_card_with_kind(&state, &caller, &card_uid, kind, &allowed)
         .await
         .map(Json)
         .map_err(WyrdErrorResponse::from)
@@ -418,14 +426,14 @@ async fn delete_card_by_ref_http(
     Query(query): Query<DeleteCardRefQuery>,
 ) -> Result<Json<DeleteCardResponse>, WyrdErrorResponse> {
     let card_ref = query.into_card_ref()?;
-    authorize_card_write(
+    let allowed = allow_card_write(
         &state,
         &caller,
         "card.registration.delete",
         &card_resource(&card_ref),
     )
     .await?;
-    service::delete_card_by_ref(&state, &caller, &card_ref)
+    service::delete_card_by_ref(&state, &caller, &card_ref, &allowed)
         .await
         .map(Json)
         .map_err(WyrdErrorResponse::from)
@@ -537,6 +545,32 @@ async fn authorize_card_write(
     resource: &str,
 ) -> Result<(), WyrdErrorResponse> {
     audit::authorize(
+        state,
+        caller,
+        &Permission::card_write(),
+        operation,
+        resource,
+    )
+    .await
+    .map_err(WyrdErrorResponse::from)
+}
+
+/// Evaluate `card:write`, audit a denial, and hand back the allowed verdict.
+///
+/// Registration and deletion own a SQL transaction the verdict must commit
+/// with, so the allowed row is returned for the service to append there
+/// rather than recorded here.
+///
+/// # Errors
+/// Returns the public permission error for a denial, and
+/// [`WyrdError::AuditUnavailable`] when the denial cannot be recorded.
+async fn allow_card_write(
+    state: &AppState,
+    caller: &Caller,
+    operation: &str,
+    resource: &str,
+) -> Result<AuditEvent, WyrdErrorResponse> {
+    audit::authorize_recording_denial(
         state,
         caller,
         &Permission::card_write(),

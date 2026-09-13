@@ -32,6 +32,7 @@ use wyrd_spec::registry::{
 };
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::storage::{UploadId, UploadInitRequest, UploadPlan};
+use wyrd_spec::vala::api::AuditEvent;
 use wyrd_sql::CardStatus;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::cards::{
@@ -59,6 +60,7 @@ use wyrd_storage::StorageError;
 use wyrd_storage::service::{upload_abort, upload_init};
 use wyrd_storage::tenant_path;
 
+use crate::audit;
 use crate::components::auth::Caller;
 use crate::components::cards::mapping::{existing_row_to_response, outcome_row_to_response};
 use crate::components::cards::resolve::{
@@ -479,24 +481,49 @@ struct ExistingNode {
 ///
 /// This operation resolves references, applies idempotency replay, writes the
 /// registration transaction, and initializes any artifact uploads.
-#[tracing::instrument(skip(state, caller), fields(operation = "card.registration"))]
+///
+/// `allowed` is the route's `card:write` verdict. A fresh write appends it on
+/// the registration transaction before any mutation, so both commit or roll
+/// back together. Every outcome that commits no registration — replay,
+/// validation or dependency failure, a lost idempotency race, or a rolled-back
+/// write — records it standalone once instead. Upload initialization runs
+/// after that point and never records it again.
+///
+/// # Errors
+/// Returns [`WyrdError::AuditUnavailable`] when the verdict cannot be recorded,
+/// and otherwise the validation, idempotency, dependency, registry, or upload
+/// failure the registration raised.
+#[tracing::instrument(skip(state, caller, allowed), fields(operation = "card.registration"))]
 pub async fn register_card(
     state: &AppState,
     caller: &Caller,
     idempotency_key: &str,
     request: CreateCardRequest,
+    allowed: &AuditEvent,
 ) -> Result<CreateCardResponse, WyrdError> {
-    let request_hash = hash_request(&request)?;
-    if let Some((operation_id, seed)) =
-        replay(state, caller, idempotency_key, &request_hash).await?
-    {
-        return initialize_uploads(state, caller, operation_id, seed, idempotency_key).await;
+    let written = async {
+        let request_hash = hash_request(&request)?;
+        if let Some(replayed) = replay(state, caller, idempotency_key, &request_hash).await? {
+            return Ok((replayed, false));
+        }
+        validate_request(&request)?;
+        let (order, root) = plan_registration_graph(&request.submissions)?;
+        let external_refs = resolve_external(state, caller, &request.submissions).await?;
+        let plan = plan_registration(request, request_hash, external_refs, order, root);
+        write_registration(state, caller, idempotency_key, plan, allowed).await
     }
-    validate_request(&request)?;
-    let (order, root) = plan_registration_graph(&request.submissions)?;
-    let external_refs = resolve_external(state, caller, &request.submissions).await?;
-    let plan = plan_registration(request, request_hash, external_refs, order, root);
-    let (operation_id, seed) = write_registration(state, caller, idempotency_key, plan).await?;
+    .await;
+    let (operation_id, seed) = match written {
+        Ok((written, true)) => written,
+        Ok((written, false)) => {
+            audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, allowed).await?;
+            written
+        }
+        Err(error) => {
+            audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, allowed).await?;
+            return Err(error);
+        }
+    };
     initialize_uploads(state, caller, operation_id, seed, idempotency_key).await
 }
 
@@ -907,8 +934,18 @@ fn plan_registration(
 }
 
 /// Reserve idempotency and atomically persist every topo-ordered node and audit.
+///
+/// The `allowed` verdict is appended before any mutation and commits with the
+/// registration. The returned flag is `true` only when that transaction
+/// committed; a lost idempotency race rolls it back and returns the winner's
+/// replay with `false`, leaving the caller to record the verdict standalone.
+///
+/// # Errors
+/// Returns [`WyrdError::AuditUnavailable`] when the append fails, and the
+/// dependency, idempotency, validation, or registry failure otherwise; nothing
+/// commits on any error.
 #[tracing::instrument(
-    skip(state, caller, plan),
+    skip(state, caller, plan, allowed),
     fields(operation = "card.registration.write")
 )]
 async fn write_registration(
@@ -916,9 +953,11 @@ async fn write_registration(
     caller: &Caller,
     idempotency_key: &str,
     mut plan: RegistrationPlan,
-) -> Result<(RegistrationOperationId, RegistrationReplaySeed), WyrdError> {
+    allowed: &AuditEvent,
+) -> Result<((RegistrationOperationId, RegistrationReplaySeed), bool), WyrdError> {
     let operation_id = RegistrationOperationId::new(Uuid::now_v7());
     let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
+    audit::append_on(&mut conn, allowed).await?;
     // Recheck before reserving idempotency so a dependency rejection rolls back
     // the entire attempt, including its bookkeeping row. The row locks remain
     // held while cards and relationships are written below.
@@ -940,7 +979,8 @@ async fn write_registration(
     .await?;
     if !inserted {
         drop(conn);
-        return wait_for_replay(state, caller, idempotency_key, &plan.request_hash).await;
+        let replayed = wait_for_replay(state, caller, idempotency_key, &plan.request_hash).await?;
+        return Ok((replayed, false));
     }
 
     let mut sibling_uids = HashMap::new();
@@ -979,7 +1019,7 @@ async fn write_registration(
     let seed = replay_seed(&response, &plan.submissions)?;
     commit_registration_operation(&mut conn, operation_id, &seed).await?;
     conn.commit().await.map_err(registry_db_error)?;
-    Ok((operation_id, seed))
+    Ok(((operation_id, seed), true))
 }
 
 /// Resolve one node's version, deduplicate when possible, and persist when fresh.
@@ -1663,45 +1703,94 @@ fn reconciliation_error_message(kind: &str) -> &'static str {
 
 /// Soft-delete one exact Card UID while asserting its kind namespace.
 ///
-/// The SQL transition and audit append commit before any backend delete. If a
-/// backend cleanup fails, the deleted card and its cleanup rows remain intact
-/// so a later retry can repeat the idempotent operation.
+/// The route's `allowed` verdict is appended before the SQL transition, and
+/// both commit before any backend delete. A not-found, conflict, or failed
+/// transaction commits neither, so the verdict is recorded standalone once. If
+/// a backend cleanup fails, the deleted card and its cleanup rows remain
+/// intact so a later retry can repeat the idempotent operation.
+///
+/// # Errors
+/// Returns [`WyrdError::AuditUnavailable`] when the verdict cannot be recorded,
+/// the not-found, conflict, or registry failure of the transition, and
+/// [`WyrdError::RegistryArtifactVerifyFailed`] when backend cleanup is incomplete.
 pub async fn delete_card_with_kind(
     state: &AppState,
     caller: &Caller,
     card_uid: &CardUid,
     kind: CardKind,
+    allowed: &AuditEvent,
 ) -> Result<DeleteCardResponse, WyrdError> {
-    let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
-    let delete_state = soft_delete_card_with_kind(
-        &mut conn,
-        card_uid,
-        kind,
-        &caller.principal,
-        Some(&caller.request_id),
-    )
-    .await?;
-    conn.commit().await.map_err(registry_db_error)?;
+    let deleted = async {
+        let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
+        audit::append_on(&mut conn, allowed).await?;
+        let delete_state = soft_delete_card_with_kind(
+            &mut conn,
+            card_uid,
+            kind,
+            &caller.principal,
+            Some(&caller.request_id),
+        )
+        .await?;
+        conn.commit().await.map_err(registry_db_error)?;
+        Ok(delete_state)
+    }
+    .await;
+    let delete_state = record_unless_committed(state, caller, allowed, deleted).await?;
     finish_card_delete(state, caller, delete_state).await
 }
 
 /// Soft-delete one Card selected by its exact public CardRef.
-#[tracing::instrument(skip(state, caller), fields(operation = "card.registration.delete"))]
+///
+/// Audits the route's `allowed` verdict exactly as [`delete_card_with_kind`].
+///
+/// # Errors
+/// Returns the same failures as [`delete_card_with_kind`].
+#[tracing::instrument(
+    skip(state, caller, allowed),
+    fields(operation = "card.registration.delete")
+)]
 pub async fn delete_card_by_ref(
     state: &AppState,
     caller: &Caller,
     card_ref: &CardRef,
+    allowed: &AuditEvent,
 ) -> Result<DeleteCardResponse, WyrdError> {
-    let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
-    let delete_state = soft_delete_card_by_ref(
-        &mut conn,
-        card_ref,
-        &caller.principal,
-        Some(&caller.request_id),
-    )
-    .await?;
-    conn.commit().await.map_err(registry_db_error)?;
+    let deleted = async {
+        let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
+        audit::append_on(&mut conn, allowed).await?;
+        let delete_state = soft_delete_card_by_ref(
+            &mut conn,
+            card_ref,
+            &caller.principal,
+            Some(&caller.request_id),
+        )
+        .await?;
+        conn.commit().await.map_err(registry_db_error)?;
+        Ok(delete_state)
+    }
+    .await;
+    let delete_state = record_unless_committed(state, caller, allowed, deleted).await?;
     finish_card_delete(state, caller, delete_state).await
+}
+
+/// Records the verdict standalone when its operation transaction did not commit.
+///
+/// Every error from a delete transaction means nothing committed, including the
+/// in-transaction append, so the verdict is recorded once here.
+///
+/// # Errors
+/// Returns [`WyrdError::AuditUnavailable`] when the standalone record fails,
+/// otherwise the transaction's own error.
+async fn record_unless_committed<T>(
+    state: &AppState,
+    caller: &Caller,
+    allowed: &AuditEvent,
+    result: Result<T, WyrdError>,
+) -> Result<T, WyrdError> {
+    if result.is_err() {
+        audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, allowed).await?;
+    }
+    result
 }
 
 async fn finish_card_delete(

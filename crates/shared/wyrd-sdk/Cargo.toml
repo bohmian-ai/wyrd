@@ -16,7 +16,7 @@ python = [
     "dep:tempfile",
     "dep:wyrd-interfaces",
     "dep:wyrd-loader",
-    "dep:wyrd-registry",
+    "dep:wyrd-client",
     "dep:wyrd-runtime",
     "dep:wyrd-utils",
     "wyrd-cards/python",
@@ -38,7 +38,7 @@ wyrd-loader = { workspace = true, optional = true }
 wyrd-semver = { workspace = true }
 wyrd-interfaces = { workspace = true, optional = true }
 wyrd-cards = { workspace = true }
-wyrd-registry = { workspace = true, optional = true }
+wyrd-client = { workspace = true, optional = true }
 wyrd-runtime = { workspace = true, optional = true }
 wyrd-spec = { workspace = true }
 wyrd-utils = { workspace = true, optional = true }

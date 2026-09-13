@@ -20,36 +20,48 @@ test-support = []
 [dependencies]
 arrow = { workspace = true }
 arrow-schema = { workspace = true }
+async-stream = { workspace = true }
 async-trait = { workspace = true }
+base64 = { workspace = true }
+blake3 = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 futures-util = { workspace = true }
 hex = { workspace = true }
+indicatif = { workspace = true }
 reqwest = { workspace = true }
 schemars = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
+serde_jcs = { workspace = true }
 serde_json = { workspace = true }
+serde_urlencoded = { workspace = true }
+serde_yaml = { workspace = true }
 sha2 = { workspace = true }
+tempfile = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["sync", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "sync", "time"] }
 tokio-stream = "0.1"
+tokio-util = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
+urlencoding = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
+wyrd-loader = { workspace = true }
 wyrd-queue = { workspace = true }
 wyrd-runtime = { workspace = true }
+wyrd-semver = { workspace = true }
 wyrd-spec = { workspace = true }
-wyrd-tonic = { workspace = true, features = ["client"] }
 wyrd-tls = { workspace = true }
+wyrd-tonic = { workspace = true, features = ["client"] }
 wyrd-utils = { workspace = true }
 
 [dev-dependencies]
 secrecy = { workspace = true }
 sqlx = { workspace = true, features = ["postgres"] }
 vala-bifrost-redux = { workspace = true }
-tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }
+wiremock = { workspace = true }
 wyrd-testing = { workspace = true }
 
 [[test]]

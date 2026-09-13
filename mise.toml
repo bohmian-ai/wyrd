@@ -533,7 +533,7 @@ run = "bash scripts/checks/client-tier.sh"
 [tasks."check:registry-client-tier"]
 hide = true
 description = "Verify the registry client artifact-materialization cone remains client-tier only"
-run = "cargo tree --locked -p wyrd-registry -e normal | rg 'wyrd-server|wyrd-sql|sqlx|deltalake|datafusion' && exit 1 || exit 0"
+run = "cargo tree --locked -p wyrd-client -e normal | rg 'wyrd-server|wyrd-sql|sqlx|deltalake|datafusion' && exit 1 || exit 0"
 
 [tasks."check:cli-client-tier"]
 hide = true
@@ -553,7 +553,7 @@ hide = true
 description = "Verify default wyrd-sdk excludes Python-only dependencies"
 run = """
 set -eu
-if cargo tree --locked -p wyrd-sdk -e normal | rg 'pyo3|wyrd-registry|wyrd-loader|wyrd-runtime|tempfile'; then
+if cargo tree --locked -p wyrd-sdk -e normal | rg 'pyo3|wyrd-client|wyrd-loader|wyrd-runtime|tempfile'; then
   echo "FAIL: default wyrd-sdk dependency cone contains a Python-only dependency"
   exit 1
 fi
@@ -564,7 +564,7 @@ hide = true
 description = "Verify PyO3 enters only wyrd-sdk's explicit Python feature cone"
 run = """
 set -eu
-for package in wyrd-spec wyrd-registry; do
+for package in wyrd-spec wyrd-client; do
   if cargo tree --locked -p "$package" -e normal | rg 'pyo3'; then
     echo "FAIL: $package normal dependency cone contains PyO3"
     exit 1

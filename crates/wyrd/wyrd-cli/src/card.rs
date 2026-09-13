@@ -9,11 +9,11 @@ use clap::{Args, ValueEnum};
 use serde::Serialize;
 use wyrd_client::WyrdClient;
 use wyrd_client::auth::AuthMiddleware;
+use wyrd_client::cards::{CardGraphHydrator, CardSelector, Cards, HydrationMode, HydrationSummary};
 use wyrd_client::config::ClientConfig;
 use wyrd_client::error::WyrdClientError;
 use wyrd_client::transport::HttpTransport;
 use wyrd_loader::{Diagnostic, LoadError, RegistrationInput, build_registration_input, load};
-use wyrd_registry::{CardGraphHydrator, CardSelector, Cards, HydrationMode, HydrationSummary};
 use wyrd_semver::VersionBlock;
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::error::WyrdError;
@@ -275,7 +275,7 @@ pub async fn dispatch_plan(args: PlanArgs) -> Result<ExitCode, WyrdCliError> {
 ///
 /// Local loading and validation complete before the command constructs the
 /// configured client. Registration then performs the remote artifact and Card
-/// lifecycle operations owned by `wyrd-registry`.
+/// lifecycle operations owned by `wyrd_client::cards`.
 ///
 /// # Errors
 /// Returns a CLI load error for invalid local input, a client error when
@@ -709,7 +709,7 @@ fn print_load_failure(error: &LoadError, format: OutputFormat) {
     }
 }
 
-fn print_apply_text(receipt: &wyrd_registry::RegistrationReceipt) {
+fn print_apply_text(receipt: &wyrd_client::cards::RegistrationReceipt) {
     println!("registered: {}", receipt.root);
     for outcome in &receipt.outcomes {
         println!(

@@ -15,6 +15,7 @@ use tempfile::NamedTempFile;
 use wyrd_client::WyrdClient;
 use wyrd_client::auth::AuthMiddleware;
 use wyrd_client::config::ClientConfig;
+use wyrd_client::storage::WyrdStorageClient;
 use wyrd_client::transport::HttpTransport;
 use wyrd_client::transport::config::HttpConfig;
 use wyrd_client::transport::credential::ResolvedCredential;
@@ -26,7 +27,6 @@ use wyrd_spec::storage::{
 use wyrd_storage::cloud::CloudSigner;
 use wyrd_storage::settings::{AzureConfig, GcsConfig, S3Config};
 use wyrd_storage::{BackendConfig, BackendSigner, StorageHandle, StorageSettings};
-use wyrd_storage_client::WyrdStorageClient;
 use wyrd_testing::WyrdTestServer;
 
 const FIXED_CARD_UID: &str = "018f0000-0000-7000-8000-000000000001";

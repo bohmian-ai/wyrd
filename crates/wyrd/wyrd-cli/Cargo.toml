@@ -49,7 +49,6 @@ wyrd-client = { workspace = true }
 wyrd-error-derive = { workspace = true }
 
 wyrd-loader = { workspace = true }
-wyrd-registry = { workspace = true }
 wyrd-runtime = { workspace = true }
 wyrd-semver = { workspace = true }
 wyrd-spec = { workspace = true }

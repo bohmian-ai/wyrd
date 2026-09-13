@@ -116,7 +116,7 @@ impl HydratedArtifact {
 /// `HydratedStateIndex` owns the exact-reference, alias, and artifact maps
 /// after `WyrdState` has completed filesystem loading and cross-card
 /// validation. It indexes the Card relationships loaded from disk; it does
-/// not perform the remote graph traversal owned by `wyrd-registry`.
+/// not perform the remote graph traversal owned by `wyrd_client::cards`.
 #[derive(Debug)]
 struct HydratedStateIndex {
     /// Canonical exact-reference key for the Service root.

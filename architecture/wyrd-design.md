@@ -1291,7 +1291,7 @@ Exact field schema for each context lives in OpenAPI.
 
 How authored specs become durable cards. This section pins the wire
 shape of composite registration, the card blob state machine, and the
-idempotency contract. Implementation lives in `wyrd-registry`; active change
+idempotency contract. Implementation lives in `wyrd_client::cards`; active change
 specifications and task packets follow the repository specification-first
 workflow and do not override this contract.
 

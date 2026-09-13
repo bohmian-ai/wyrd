@@ -12,11 +12,9 @@ FAMILY_WYRD=(
   wyrd-config
   wyrd-interfaces
   wyrd-mcp
-  wyrd-registry
   wyrd-server
   wyrd-sql
   wyrd-storage
-  wyrd-storage-client
   wyrd-testing
   wyrd-tonic
   wyrd-spec
@@ -57,7 +55,6 @@ FAMILY_SHARED=(
   wyrd-runtime
   wyrd-loader
   wyrd-semver
-  wyrd-storage-client
   wyrd-telemetry
   wyrd-test-contract-macros
   wyrd-tls

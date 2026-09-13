@@ -78,7 +78,7 @@ Wyrd Rust code uses the required struct-centered hybrid style from
 | Service or handle | Clients, stores, configuration, runtime state, IO workflows | Concrete struct with explicit fields, constructor, and inherent methods |
 | Pure helper | Stateless deterministic calculation or narrow conversion | Small module function |
 
-`crates/shared/wyrd-registry/src/handle.rs::Cards` is the canonical service
+`crates/shared/wyrd-client/src/cards/handle.rs::Cards` is the canonical service
 pattern. `Cards` owns the client and focused registry engine; callers discover
 registration, resolution, listing, loading, and deletion through typed methods
 instead of receiving those dependencies separately. Narrow private modules own

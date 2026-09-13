@@ -211,7 +211,7 @@ Struct-centered design does not turn Wyrd Cards into active-record objects.
 Card envelopes and specs own declarative construction, validation, and pure
 transformation. Registry, storage, policy, and lifecycle IO stays on the
 service or handle that owns those dependencies. The canonical reference is
-`crates/shared/wyrd-registry/src/handle.rs::Cards`: a public,
+`crates/shared/wyrd-client/src/cards/handle.rs::Cards`: a public,
 dependency-owning handle with discoverable registration, resolution, listing,
 loading, and deletion methods, composed from a focused engine and narrow
 private helpers.

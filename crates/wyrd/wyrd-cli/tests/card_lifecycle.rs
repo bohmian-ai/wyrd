@@ -271,10 +271,10 @@ impl RuntimeServiceFixture {
     ///
     /// # Errors
     /// Returns the first registry or fixture-loading error encountered while
-    /// registering a dependency through [`wyrd_registry::Cards`].
+    /// registering a dependency through [`wyrd_client::cards::Cards`].
     async fn register_dependencies(
         &self,
-        cards: &wyrd_registry::Cards,
+        cards: &wyrd_client::cards::Cards,
     ) -> Result<(), wyrd_spec::error::WyrdError> {
         for relative in ["training.yaml", "model-primary.yaml", "model-shadow.yaml"] {
             cards.register_from_path(&self.path(relative)).await?;
@@ -556,9 +556,9 @@ mod pg_tests {
     use std::sync::Arc;
     use wyrd_client::WyrdClient;
     use wyrd_client::auth::AuthMiddleware;
+    use wyrd_client::cards::Cards;
     use wyrd_client::config::ClientConfig;
     use wyrd_client::transport::{HttpTransport, ResolvedCredential};
-    use wyrd_registry::Cards;
     use wyrd_testing::Bootstrap;
 
     async fn start_cli_server() -> (

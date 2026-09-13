@@ -5,7 +5,7 @@ use std::thread;
 use std::time::Duration;
 
 use wyrd_cli::registration::RegistrationProgressRenderer;
-use wyrd_registry::{RegistrationPhase, RegistrationProgressEvent, RegistrationProgressSink};
+use wyrd_client::cards::{RegistrationPhase, RegistrationProgressEvent, RegistrationProgressSink};
 use wyrd_spec::registry::RelativeArtifactPath;
 
 fn main() {

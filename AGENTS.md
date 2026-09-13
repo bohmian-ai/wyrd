@@ -247,7 +247,7 @@ behavior with the wrong structural shape is incomplete.
 - Wyrd Card envelopes and specs remain declarative. They MUST NOT acquire
   registry clients, storage clients, server behavior, or hidden IO merely to
   satisfy this style. Put those workflows on the owning service or handle.
-- `crates/shared/wyrd-registry/src/handle.rs::Cards` is the canonical
+- `crates/shared/wyrd-client/src/cards/handle.rs::Cards` is the canonical
   Wyrd pattern: a public, dependency-owning handle with discoverable methods,
   composed from a focused engine and narrow private helpers.
 

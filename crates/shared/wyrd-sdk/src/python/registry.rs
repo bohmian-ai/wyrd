@@ -1,8 +1,8 @@
 //! Python Card registration orchestration owned by an authenticated registry handle.
 
 use pyo3::prelude::*;
+use wyrd_client::cards::Cards;
 use wyrd_interfaces::error::CardPyResult;
-use wyrd_registry::Cards;
 use wyrd_spec::envelope::CardKind;
 
 use super::{PyRegistrationReceipt, register_python_card};

@@ -20,8 +20,8 @@ use crate::wire::vertex_generate::VertexGenerateContentRequest;
 
 /// Declarative prompt draft that compiles into a native `Prompt`.
 ///
-/// Both the YAML authoring path and the Python SDK `Prompt(provider=…)` constructor
-/// compile through here, ensuring one canonical assembly per provider.
+/// Both the YAML authoring path and the SDK prompt constructors compile through
+/// here, ensuring one canonical assembly per provider.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PromptDraft {
     /// Provider name (e.g. `"openai"`, `"anthropic"`, `"google"`, `"vertex"`).

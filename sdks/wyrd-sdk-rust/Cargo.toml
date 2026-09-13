@@ -15,5 +15,13 @@ path = "src/lib.rs"
 [dependencies]
 wyrd-client = { workspace = true }
 
+[dev-dependencies]
+base64 = { workspace = true }
+secrecy = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+wyrd-testing = { workspace = true }
+
 [lints]
 workspace = true

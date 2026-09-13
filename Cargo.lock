@@ -11534,7 +11534,13 @@ dependencies = [
 name = "wyrd-sdk-rust"
 version = "0.0.1"
 dependencies = [
+ "base64 0.22.1",
+ "secrecy",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
  "wyrd-client",
+ "wyrd-testing",
 ]
 
 [[package]]

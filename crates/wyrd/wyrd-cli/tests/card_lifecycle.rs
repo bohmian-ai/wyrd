@@ -102,7 +102,7 @@ fn write_multi_card_service(temp: &TempDir) -> std::path::PathBuf {
     std::fs::write(
         temp.path().join("model.yaml"),
         format!(
-            "apiVersion: wyrd/v1\nkind: Model\nmetadata:\n  name: shared-model\n  version: 1.0.0\n  space: default\nspec:\n  interface:\n    kind: Sklearn\n    meta:\n      framework_version: \"1.4.0\"\n      model_subtype: GradientBoostingClassifier\n  task_type: BinaryClassification\n  signature:\n    inputs: []\n    outputs: []\nartifacts:\n  - relative_path: model.bin\n    sha256: {model_digest}\n    size_bytes: {}\n    content_type: application/octet-stream\n",
+            "apiVersion: wyrd/v1\nkind: Model\nmetadata:\n  name: shared-model\n  version: 1.0.0\n  space: default\nspec:\n  interface:\n    kind: Sklearn\n    meta:\n      framework_version: \"1.4.0\"\n      model_subtype: GradientBoostingClassifier\n  task_type: BinaryClassification\n  signature:\n    inputs:\n      - name: feature\n        dtype: float64\n    outputs:\n      - name: prediction\n        dtype: float64\nartifacts:\n  - relative_path: model.bin\n    sha256: {model_digest}\n    size_bytes: {}\n    content_type: application/octet-stream\n",
             model_artifact.len()
         ),
     )
@@ -767,7 +767,7 @@ mod pg_tests {
 
         let temp = tempfile::tempdir().expect("tempdir creates");
         let path = write_prompt(&temp);
-        let (server, base_url, _storage_root, shutdown, serve_handle) = start_cli_server().await;
+        let (server, base_url, storage_root, shutdown, serve_handle) = start_cli_server().await;
         let Bootstrap::User { jwt, .. } = server
             .bootstrap_user("cli-lifecycle-writer", &["writer"])
             .await
@@ -1084,12 +1084,14 @@ mod pg_tests {
         .expect("artifact storage path reads");
         let correct_digest = base64::engine::general_purpose::STANDARD
             .encode(sha2::Sha256::digest(b"cli-card-artifact"));
-        sqlx::query("UPDATE wyrd.storage_artifact_metadata SET sha256 = $1 WHERE card_uid = $2")
-            .bind("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
-            .bind(&uid)
-            .execute(&superuser)
-            .await
-            .expect("artifact digest corrupts");
+        // Corrupt the stored bytes, not the inventory row: the server refuses a
+        // row that disagrees with the committed Card's artifact hash before any
+        // download, so only tampered bytes reach client-side verification.
+        let artifact_path = storage_root
+            .path()
+            .join(original_storage_path.trim_start_matches("wyrd://"));
+        std::fs::write(&artifact_path, b"cli-card-XXXXXXXX")
+            .expect("artifact bytes corrupt with the same length");
         let digest_mismatch = run_cli_async_with_token!(
             &jwt,
             "get",
@@ -1110,19 +1112,14 @@ mod pg_tests {
         assert!(!digest_mismatch.status.success());
         assert_eq!(
             first_stderr_json(&digest_mismatch)["code"],
-            "WYRD_REGISTRY_507_ARTIFACT_VERIFY_FAILED"
+            "WYRD_REGISTRY_507_ARTIFACT_VERIFY_FAILED",
+            "{}",
+            String::from_utf8_lossy(&digest_mismatch.stderr)
         );
         assert!(!temp.path().join("digest-mismatch").exists());
 
-        sqlx::query(
-            "UPDATE wyrd.storage_artifact_metadata SET sha256 = $1, size_bytes = $2 WHERE card_uid = $3",
-        )
-        .bind(&correct_digest)
-        .bind(999_i64)
-        .bind(&uid)
-        .execute(&superuser)
-        .await
-        .expect("artifact size corrupts");
+        std::fs::write(&artifact_path, b"cli-card-artifact-with-extra-bytes")
+            .expect("artifact bytes corrupt with a different length");
         let size_mismatch = run_cli_async_with_token!(
             &jwt,
             "get",
@@ -1146,6 +1143,7 @@ mod pg_tests {
             "WYRD_REGISTRY_507_ARTIFACT_VERIFY_FAILED"
         );
         assert!(!temp.path().join("size-mismatch").exists());
+        std::fs::write(&artifact_path, b"cli-card-artifact").expect("artifact bytes restore");
 
         sqlx::query(
             "UPDATE wyrd.storage_artifact_metadata SET size_bytes = $1, storage_path = $2 WHERE card_uid = $3",

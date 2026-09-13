@@ -182,7 +182,7 @@ hide = true
 description = "Run Python Bifrost unit tests."
 dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup"]
-run = "uv run pytest -q tests/test_bifrost.py tests/bifrost"
+run = "uv run python -m pytest -q tests/test_bifrost.py tests/bifrost"
 
 [tasks."test:bifrost:unit:typescript:inner"]
 hide = true
@@ -346,7 +346,7 @@ hide = true
 description = "Run Python Bifrost journeys against an already-provisioned Postgres lifecycle."
 dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup:testing"]
-run = "uv run pytest -q -m integration tests/integration/bifrost/test_bifrost_e2e.py tests/integration/test_bifrost_query.py"
+run = "uv run python -m pytest -q -m integration tests/integration/bifrost/test_bifrost_e2e.py tests/integration/test_bifrost_query.py"
 
 [tasks."test:bifrost:journey:typescript"]
 description = "Tier-1 journeys: TypeScript Bifrost client, query and write surfaces"
@@ -841,26 +841,26 @@ run = "uv run python scripts/run_unit_tests.py"
 description = "Run focused Python packaging tests for the shared Wyrd CLI"
 dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup"]
-run = "uv run pytest -q tests/unit/cli/test_cli_surface.py"
+run = "uv run python -m pytest -q tests/unit/cli/test_cli_surface.py"
 
 [tasks."py:test:wyrdstate:unit"]
 description = "Run the focused offline WyrdState hydration tests"
 dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup"]
-run = "uv run pytest -q tests/unit/state"
+run = "uv run python -m pytest -q tests/unit/state"
 
 [tasks."py:test:registry:unit"]
 description = "Run focused Python Card registry boundary tests"
 dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup"]
-run = "uv run pytest -q tests/unit/cards/test_registry_surface.py"
+run = "uv run python -m pytest -q tests/unit/cards/test_registry_surface.py"
 
 [tasks."py:test:tensorflow"]
 hide = true
 description = "Run TensorFlow-marked Python unit tests"
 dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup"]
-run = "uv run pytest -q -m tensorflow"
+run = "uv run python -m pytest -q -m tensorflow"
 
 [tasks."py:format"]
 description = "Format Wyrd Python package and tests with Ruff"
@@ -900,7 +900,7 @@ hide = true
 description = "Run the wyrd.testing harness pytest suite"
 dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup:testing"]
-run = "uv run pytest -q tests/harness/test_test_server.py"
+run = "uv run python -m pytest -q tests/harness/test_test_server.py"
 
 [tasks."py:test:integration"]
 hide = true
@@ -912,7 +912,7 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:i
 hide = true
 description = "Run wyrd.testing integration journeys against a live Postgres-backed server"
 dir = "sdks/wyrd-sdk-python"
-run = "uv run pytest -q -m integration"
+run = "uv run python -m pytest -q -m integration"
 
 [tasks."py:test:cards:integration"]
 hide = true
@@ -924,7 +924,7 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:a
 hide = true
 description = "Run the focused real-server Python Card registry journey with its lifecycle already provisioned"
 dir = "sdks/wyrd-sdk-python"
-run = "uv run pytest -q -m integration tests/integration/cards/test_cards_crud.py"
+run = "uv run python -m pytest -q -m integration tests/integration/cards/test_cards_crud.py"
 
 [tasks."py:test:wyrdstate:integration"]
 hide = true
@@ -936,7 +936,7 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:a
 hide = true
 description = "Run the real-server Python-to-offline typed WyrdState journey with its lifecycle already provisioned"
 dir = "sdks/wyrd-sdk-python"
-run = "uv run pytest -q -m integration tests/integration/state/test_state_journey.py"
+run = "uv run python -m pytest -q -m integration tests/integration/state/test_state_journey.py"
 
 [tasks."check:py-wheel-no-testing"]
 hide = true

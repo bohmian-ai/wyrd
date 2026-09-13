@@ -1712,9 +1712,11 @@ async fn delete_storage_failure_preserves_cleanup_state() {
             .expect("card state reads");
     assert_eq!(card_status, "deleted");
     conn.commit().await.expect("assertion transaction commits");
+    // Shut down first: a live server's background storage work can recreate
+    // the root between removing the broken file and restoring the directory.
+    server.shutdown().await.expect("test server shuts down");
     std::fs::remove_file(storage_root.path()).expect("broken storage root removes");
     std::fs::rename(&moved_storage_root, storage_root.path()).expect("storage root restores");
-    server.shutdown().await.expect("test server shuts down");
 }
 
 /// A blob storage failure refuses registration and leaves durable failure state.

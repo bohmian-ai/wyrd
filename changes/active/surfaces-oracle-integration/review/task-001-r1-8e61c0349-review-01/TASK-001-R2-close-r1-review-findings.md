@@ -1,7 +1,7 @@
 ---
 id: TASK-001-R2
 kind: remediation
-status: in_progress
+status: review
 spec: SPEC-surfaces-oracle-integration
 spec_revision: 7
 requirements: [REQ-026, REQ-026B, REQ-027, REQ-027C, REQ-028, REQ-029, INV-008, INV-008C, INV-008D, INV-025, AC-005]
@@ -231,3 +231,55 @@ git diff --check
 
 Do not add `verify:bifrost`; TASK-001 expressly defers that aggregate to the
 integration task that owns merge closeout.
+
+## Implementation evidence
+
+Candidate range: `8e61c0349..HEAD` on `change/surfaces-oracle-integration`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| R1-1 system-owner rejection retains once; non-audit nil still fails | `AuditLogTable::admits_system_owner`; nil gate in `TenantTableBinding::facts`, `validate_logical_transport_frame`, `project_audit_rows` (e586d94d1, 3d49676c4) | Focused 1 (3 passed); focused 2 `audit_publication::system_owner_security_rejections_retain_once` | PASS |
+| R1-2 every permitted registration records one verdict | `append_registration_audit` on create and row-exists paths; `register_table` records standalone on non-audit failure (4d3d84808) | Focused 3 `bifrost_tables_register_pre_commit_failure_records_one_verdict`, `bifrost_tables_concurrent_same_fqn_register_records_each_verdict` | PASS |
+| R1-3 issuer verdict recorded before discovery; no issuer on failure | Standalone record before OIDC discovery in admin routes (b627cce40) | Focused 3 `create_records_allowed_decision_before_failed_discovery` | PASS |
+| R1-4 Card register/deletes couple the Allowed row with the SQL effect | `append_on` inside `write_registration`, `delete_card_with_kind`, `delete_card_by_ref`; `record_unless_committed` for no-write outcomes (f44068089) | Focused 4 `registration_refuses_when_its_decision_audit_fails`, `delete_audit_failure_keeps_card_active`, `delete_by_ref_not_found_records_one_decision`, `registration_replays_through_public_authenticated_route`, `completion_audit_failure_keeps_card_pending` | PASS |
+| R1-5 unordered progress; disconnected scaffolding absent | `InFlight` unit test deleted (8af4ef85d) | Focused 2 `a_stalled_tenant_does_not_block_another_tenants_history` (see deviation and risk) | PASS with deviation |
+| R1-6 dead-letter scenario runnable with exact command | Local storage settings declare `list_with_start_after` in `wyrd-testing` `start_in_process`; smoke refusal uses `with_storage_handle` (9e9972543) | Focused 4 `card_reconciler_dead_letters_after_three_failures`, `blob_storage_failure_leaves_durable_failure_state`, `delete_storage_failure_preserves_cleanup_state`; focused 5 `forge_worker_refuses_staging_without_native_cursor_listing` | PASS |
+| R1-7 bare types, rustdoc sections, stale prose | `ServerGate` and eval `CardRef` imported; `# Errors`/`# Panics` on touched items; `abort_card`, dead-letter, blob-failure docs and `wyrd-design.md` reconcile prose; blob test renamed (461f7614c, bcdcaaa28) | `mise run lints`; `mise run docs:check` | PASS |
+| R1-8 lifecycle states | TASK-001-R1 `status: review`; this task `status: review` | File frontmatter | PASS |
+| R1-9 configured `PermissionCheck` governs verdict | `authorize_service_accounts_write` evaluates through `state.authz.permission_check` (b627cce40) | Focused 3 `configured_checker_denial_governs_workload_binding_create` | PASS |
+
+### Focused commands
+
+```bash
+# 1
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=catalog::tenant_table::tests::tenant_table_binding_admits_system_owner_only_for_audit_log) | test(=scribe::ingress::tests::nil_tenant_frames_admit_only_internal_audit_publication) | test(=tables::audit::projection::tests::projects_system_owner_rows)'
+# 2
+scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test server -P journey --run-ignored=all -E 'test(=audit_publication::system_owner_security_rejections_retain_once) | test(=audit_publication::a_stalled_tenant_does_not_block_another_tenants_history)'"
+# 3
+scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-server --lib --features test-support -E 'test(=bifrost::service::pg_tests::bifrost_tables_register_pre_commit_failure_records_one_verdict) | test(=bifrost::service::pg_tests::bifrost_tables_concurrent_same_fqn_register_records_each_verdict) | test(=components::admin::routes::pg_tests::create_records_allowed_decision_before_failed_discovery) | test(=components::admin::routes::pg_tests::configured_checker_denial_governs_workload_binding_create)'"
+# 4
+WYRD_REG_E2E=1 scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-server --test pg_card_registration_route --test-threads=1 -E 'test(=registration_refuses_when_its_decision_audit_fails) | test(=delete_audit_failure_keeps_card_active) | test(=delete_by_ref_not_found_records_one_decision) | test(=registration_replays_through_public_authenticated_route) | test(=completion_audit_failure_keeps_card_pending) | test(=card_reconciler_dead_letters_after_three_failures) | test(=blob_storage_failure_leaves_durable_failure_state) | test(=delete_storage_failure_preserves_cleanup_state)'"
+# 5
+scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-server --features test-support --test pg_router_smoke -E 'test(=forge_worker_refuses_staging_without_native_cursor_listing)'"
+```
+
+Selected counts matched every expression (3, 2, 4, 8, 1), confirming exact names.
+
+### Lane results
+
+PASS: `fmt`, `lints`, `codegen:check`, `test:sql`, `test:bifrost:integration:redux` (975), `test:bifrost:integration:server` (67), `test:bifrost:journey:scribe` (21), `test:bifrost:journey:oracle` (28), `test:bifrost:journey:forge` (13), `test:bifrost:journey:otlp` (10), `check:tenant-isolation`, `check:from-pools-allowlist`, `check:object-store-pin`, `check:unwrap-audit`, `check:client-tier`, `check:pyo3-scope`, `docs:check`, `git diff --check`.
+
+INTERMITTENT: `test:bifrost:journey:server` and `test:bifrost:journey:mcp`; see risks.
+
+### Deviation
+
+R1-5 does not prove the fixed ceiling of 8 end to end. Holding more than eight fenced tenant cycles exceeds the test pool (`WYRD_DB_MAX_CONNECTIONS=8`); the ceiling is the literal `PUBLICATION_TENANT_CONCURRENCY` passed to `for_each_concurrent`. The stalled-tenant journey proves unordered progress. Human-approved during implementation.
+
+### Material risks
+
+- `test:bifrost:journey:server` fails intermittently in the full parallel lane: `frozen_audit_range_replays_once_while_its_tail_waits` (`QueryVisibilityUnavailable` from a `Fused`/`Strict` poll around 81s) or `a_stalled_tenant_does_not_block_another_tenants_history` (staging not drained in 90s). Both pass alone and 5/5 as a concurrent pair. Not introduced by R2: with R1-1 disabled (`admits_system_owner` forced `false`) and the new system-owner test excluded, the lane still failed 2 of 3 runs on the same tests, and no other R2 change touches audit publication, Oracle, Scribe, or the journey lanes. Owner: TASK-006 audit publication.
+- `test:bifrost:journey:mcp` failed 2 of 4 runs: `delegated_agent_query_is_attributed_in_its_durable_audit_record` reads its decision from transient `vala.audit_staging`, which the 5s publisher may already have drained (`RowNotFound`). Passes alone; R2 does not touch this test or its path.
+
+### Non-goals
+
+Excluded: SDK convergence, single data root, UI, TASK-002 Postgres launcher repair and Card/CLI/WyrdState lanes, crate-wide cleanup, new migration, configuration, dependency, scheduler, lease, harness, test seam, or test file.

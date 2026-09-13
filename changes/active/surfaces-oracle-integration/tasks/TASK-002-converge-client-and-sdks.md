@@ -159,3 +159,20 @@ Run and record exact focused commands for the Rust SDK, Python, TypeScript,
 MCP, CLI, Card, and `WyrdState` scenarios changed during implementation, plus
 the dependency/feature evidence for each SDK. Do not run a Bifrost aggregate
 in this task.
+
+## Implementation Evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Three SDKs consume `wyrd-client`; Rust/TS PyO3-free; client tier holds | `sdks/wyrd-sdk-{rust,python,ts}` manifests depend directly on `wyrd-client`; Python normal deps exclude `wyrd-testing` | `cargo tree -p wyrd-sdk-rust --all-features -i pyo3` and `-p wyrd-sdk-ts` match nothing; `check:client-tier`, `check:pyo3-scope`, `check:py-wheel-no-testing` | PASS |
+| One Bifrost facade (lifecycle, writes, flush, describe, SQL, streams, status/cancel) | `wyrd_client::Bifrost`; CLI query uses `Bifrost::query_only` (`crates/wyrd/wyrd-cli/src/query/mod.rs:104`) | `ts:test:integration` (16/16), `py:test:integration` (54), `test:cli:journey` (20) | PASS |
+| Stream invariants and settle-on-break | `wyrd-client` query stream | `py:test:integration`, `ts:test:integration`, `ts:test:unit` (8) | PASS |
+| Python sync/async journeys through public `wyrd` | Python SDK; Cards credential rename (b1c540a69) | `py:test:unit` (463), `py:typecheck`, `py:test:integration` | PASS |
+| TS journeys through `@wyrd/sdk` including Cards/WyrdState | `native/src/cards.rs`, `index.ts`, `cards-state.test.ts` (b1c540a69) | `ts:build`, `ts:typecheck`, `ts:test:integration`, `ts:napi:check` | PASS |
+| Card registration/loading and WyrdState via language, HTTP, CLI, MCP | Test fixes e5095808d: tamper stored bytes for the 507 path, stop the server before tampering with storage, and a typed shared-model signature | `test:cards:unit`, `test:cards:integration` (23+6), `test:cli:journey` (20), `test:wyrdstate:journey`, `py:test:cards:integration` (13), `py:test:wyrdstate:integration` (7); focused: `WYRD_CLI_E2E=1 WYRD_REG_E2E=1 scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && cargo test --locked -p wyrd-cli --test cli -- card_lifecycle::pg_tests::card_lifecycle_cli_journey --exact'` | PASS |
+| `/mcp` exposes exactly three Bifrost tools | `crates/wyrd/wyrd-mcp/tests/bifrost/mcp/discovery.rs` | `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-mcp --test mcp --run-ignored all -E "test(=discovery::pg_tests::agent_discovers_only_authorized_tables_and_layout)"'` | PASS |
+| Generated contract includes Bifrost table routes; no stale read authority | `bifrost/routes.rs` utoipa paths, `openapi.rs`, `DataTypeSpec` `no_recursion` (8af2d0b6c); docs rewritten (dde25b98d) | `codegen:check`, `check:proto-drift`, `docs:check`, focused OpenAPI tests | PASS |
+| Python failures are catalog `WyrdError` | Python SDK error boundary | `py:test:unit`, `py:typecheck` | PASS |
+| Five Postgres lanes run from a clean checkout via the isolated lifecycle | `mise.toml` runs pytest as `uv run python -m pytest` | All five lanes rerun green after e5095808d; `test:postgres:inventory` | PASS |
+
+Also: `fmt`, `lints`, `check:single-into-response-impl` and `git diff --check` pass. Non-goals were kept out: no Bifrost aggregate was run, and nothing was merged or pushed.

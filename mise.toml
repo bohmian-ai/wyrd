@@ -71,62 +71,6 @@ hide = true
 description = "Run the default-feature py-wyrd library clippy check"
 run = "cargo clippy --locked -p py-wyrd --lib -- -D warnings"
 
-[tasks."build:postgres"]
-hide = true
-description = "Start a clean Postgres container via docker compose and wait for it to be healthy"
-# --force-recreate --renew-anon-volumes guarantees a genuinely fresh container
-# and storage even if a healthy container is already running (otherwise `up` is a
-# no-op and reuses the old PGDATA). Combined with the postgres tmpfs mount, the
-# test DB is empty on every invocation — no stale _sqlx_migrations ledger.
-run = """
-set -eu
-
-lock_dir=".mise-postgres.lock"
-locked=0
-for _ in $(seq 1 180); do
-  if mkdir "$lock_dir" 2>/dev/null; then
-    trap 'rmdir "$lock_dir"' EXIT INT TERM
-    locked=1
-    break
-  fi
-  sleep 1
-done
-if [ "$locked" -ne 1 ]; then
-  echo "could not acquire Postgres setup lock" >&2
-  exit 1
-fi
-
-for id in $(docker ps -aq --filter publish=55432); do
-  echo "removing Docker container publishing 55432: $id"
-  error_file="$(mktemp)"
-  if ! docker rm -f -v "$id" 2>"$error_file"; then
-    if ! grep -q "removal of container .* is already in progress" "$error_file"; then
-      cat "$error_file" >&2
-      rm -f "$error_file"
-      exit 1
-    fi
-  fi
-  rm -f "$error_file"
-done
-
-docker compose down --volumes --remove-orphans
-docker compose up -d --build --force-recreate --renew-anon-volumes postgres --wait
-"""
-
-[tasks."pg:teardown"]
-description = "Tear down the Postgres docker container and remove volumes"
-run = "docker compose down --volumes --remove-orphans"
-
-[tasks."setup:postgres"]
-description = "Start a clean Postgres container and provision all test roles (single entry point for SQL-dependent tasks)"
-depends = ["setup:db-roles"]
-
-[tasks."impl:setup"]
-hide = true
-description = "One-time environment bring-up before the first wyrd-implement wave: shared docker Postgres that every worktree reaches at 127.0.0.1:55432. Run once, not per worktree."
-depends = ["setup:postgres"]
-run = "echo 'impl env ready: shared Postgres up; mise supplies DATABASE_URL / WYRD_* per verify task'"
-
 [tasks."impl:warm"]
 hide = true
 description = "Seed the shared cargo target dir by compiling the workspace before dispatching a wave. All executors share one CARGO_TARGET_DIR, so warming once builds the heavy deps (DataFusion/Arrow/Iceberg) a single time; each executor then reuses them instead of cold-building in parallel and racing on cargo's build lock."
@@ -153,8 +97,13 @@ cargo test --locked -p wyrd-server --lib http::openapi
 
 [tasks."test:cards:integration"]
 description = "Run the durable card registration Postgres suite"
-depends = ["setup:postgres"]
-env = { WYRD_REG_E2E = "1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw" }
+env = { WYRD_REG_E2E = "1" }
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:cards:integration:inner'"
+
+[tasks."test:cards:integration:inner"]
+hide = true
+description = "Run the durable card registration Postgres suite with its lifecycle already provisioned"
+env = { WYRD_REG_E2E = "1" }
 run = """
 cargo test --locked -p wyrd-sql --test pg_cards_register -- --nocapture --test-threads=1
 cargo test --locked -p wyrd-server --test pg_card_registration_route -- --nocapture --test-threads=1
@@ -162,14 +111,22 @@ cargo test --locked -p wyrd-server --test pg_card_registration_route -- --nocapt
 
 [tasks."test:cli:journey"]
 description = "Run the real-server CLI Card lifecycle journey"
-depends = ["setup:postgres", "db:migrate"]
-env = { WYRD_CLI_E2E = "1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw" }
+env = { WYRD_CLI_E2E = "1" }
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:cli:journey:inner'"
+
+[tasks."test:cli:journey:inner"]
+hide = true
+description = "Run the real-server CLI Card lifecycle journey with its lifecycle already provisioned"
+env = { WYRD_CLI_E2E = "1" }
 run = "cargo test --locked -p wyrd-cli --test cli -- --nocapture --test-threads=1"
 
 [tasks."test:wyrdstate:journey"]
 description = "Run the real-server CLI-to-offline typed WyrdState journey"
-depends = ["setup:postgres", "db:migrate"]
-env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw" }
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:wyrdstate:journey:inner'"
+
+[tasks."test:wyrdstate:journey:inner"]
+hide = true
+description = "Run the real-server CLI-to-offline typed WyrdState journey with its lifecycle already provisioned"
 run = "cargo test --locked -p wyrd-cli --test cli -- --ignored cli_bundle_loads_typed_wyrdstate_after_server_shutdown --nocapture --test-threads=1"
 
 [tasks."test:skald"]
@@ -965,17 +922,25 @@ run = "uv run pytest -q -m integration"
 [tasks."py:test:cards:integration"]
 hide = true
 description = "Run the focused real-server Python Card registry journey"
+depends = ["py:setup:testing"]
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run py:test:cards:integration:inner'"
+
+[tasks."py:test:cards:integration:inner"]
+hide = true
+description = "Run the focused real-server Python Card registry journey with its lifecycle already provisioned"
 dir = "python/py-wyrd"
-depends = ["setup:postgres", "py:setup:testing"]
-env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw" }
 run = "uv run pytest -q -m integration tests/integration/cards/test_cards_crud.py"
 
 [tasks."py:test:wyrdstate:integration"]
 hide = true
 description = "Run the real-server Python-to-offline typed WyrdState journey"
+depends = ["py:setup:testing"]
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run py:test:wyrdstate:integration:inner'"
+
+[tasks."py:test:wyrdstate:integration:inner"]
+hide = true
+description = "Run the real-server Python-to-offline typed WyrdState journey with its lifecycle already provisioned"
 dir = "python/py-wyrd"
-depends = ["setup:postgres", "py:setup:testing"]
-env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw" }
 run = "uv run pytest -q -m integration tests/integration/state/test_state_journey.py"
 
 [tasks."check:py-wheel-no-testing"]

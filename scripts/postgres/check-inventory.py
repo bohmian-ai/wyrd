@@ -28,6 +28,8 @@ pre = {
     "test:bifrost:integration:server",
     "test:bifrost:journey",
     "test:bifrost:journey:python", "test:bifrost:journey:typescript",
+    "test:cards:integration", "test:cli:journey", "test:wyrdstate:journey",
+    "py:test:cards:integration", "py:test:wyrdstate:integration",
     "py:test:integration", "ts:test:integration", "test:identity:journey",
     "test:storage:e2e", "test:storage:s3:cloud", "test:storage:gcs:cloud", "test:storage:azure:cloud",
 }

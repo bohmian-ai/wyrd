@@ -1459,7 +1459,7 @@ mod pg_tests {
         let state = test_state(&fixture).await;
         // No discovery document is mounted, so discovery fails after the verdict.
         let server = MockServer::start().await;
-        let issuer = IssuerUrl::new(&server.uri()).expect("loopback http issuer is valid");
+        let issuer = IssuerUrl::new(server.uri()).expect("loopback http issuer is valid");
 
         let error = create_trusted_issuer(
             State(state),

@@ -48,13 +48,8 @@ pub struct CardDeleteState {
     skip(conn),
     fields(tenant_id = %conn.data_tenant_id(), card_uid = %uid),
 )]
-pub async fn soft_delete_card(
-    conn: &mut TenantConn<'_>,
-    uid: &CardUid,
-) -> Result<(), WyrdError> {
-    soft_delete_card_with_state(conn, uid)
-        .await
-        .map(|_| ())
+pub async fn soft_delete_card(conn: &mut TenantConn<'_>, uid: &CardUid) -> Result<(), WyrdError> {
+    soft_delete_card_with_state(conn, uid).await.map(|_| ())
 }
 
 /// Soft-delete a card and return the state needed for post-commit cleanup.

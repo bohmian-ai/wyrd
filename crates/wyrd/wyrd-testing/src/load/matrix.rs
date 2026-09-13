@@ -1166,7 +1166,7 @@ struct PhaseOwnerCheckpoint {
 
 /// Bounded wall-clock budget for in-flight read-audit commits to finish before a
 /// phase boundary reads the durable audit-row counts it is about to assert on.
-const AUDIT_RELAY_CONVERGENCE_BUDGET: Duration = Duration::from_secs(30);
+const AUDIT_STAGED_BUDGET: Duration = Duration::from_secs(30);
 
 /// Capture durable Forge and Oracle owner counts for one phase boundary.
 ///
@@ -1178,7 +1178,7 @@ const AUDIT_RELAY_CONVERGENCE_BUDGET: Duration = Duration::from_secs(30);
 /// # Errors
 /// Returns [`ClusterLoadError::Cluster`] when the shared database inspection
 /// fails, or [`ClusterLoadError::Assertion`] when audit commits do not finish
-/// within [`AUDIT_RELAY_CONVERGENCE_BUDGET`].
+/// within [`AUDIT_STAGED_BUDGET`].
 async fn phase_owner_checkpoint(
     cluster: &WyrdTestCluster,
 ) -> Result<PhaseOwnerCheckpoint, ClusterLoadError> {
@@ -1197,11 +1197,11 @@ async fn phase_owner_checkpoint(
 /// # Errors
 /// Returns [`ClusterLoadError::Cluster`] on inspection failure or
 /// [`ClusterLoadError::Assertion`] when commits are still pending at
-/// [`AUDIT_RELAY_CONVERGENCE_BUDGET`].
+/// [`AUDIT_STAGED_BUDGET`].
 async fn await_read_audit_convergence(
     cluster: &WyrdTestCluster,
 ) -> Result<crate::bifrost::cluster::OracleInspection, ClusterLoadError> {
-    let deadline = Instant::now() + AUDIT_RELAY_CONVERGENCE_BUDGET;
+    let deadline = Instant::now() + AUDIT_STAGED_BUDGET;
     loop {
         let inspection = cluster
             .oracle_inspection()
@@ -1213,7 +1213,7 @@ async fn await_read_audit_convergence(
         if Instant::now() >= deadline {
             return Err(ClusterLoadError::Assertion(format!(
                 "read-audit commits did not finish: {} pending after {:?}",
-                inspection.audit_pending, AUDIT_RELAY_CONVERGENCE_BUDGET,
+                inspection.audit_pending, AUDIT_STAGED_BUDGET,
             )));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;

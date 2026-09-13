@@ -59,8 +59,7 @@ use crate::components::auth::audit_writer::RealAuthzAuditWriter;
 use crate::components::auth::{ServerAuth, ServerAuthz};
 use crate::config::{BifrostRuntimeRole, WorkloadBindingEntry};
 use crate::oracle::{
-    OracleQueryAudit, OraclePeerAuthority, PostgresPeerSecurityAudit,
-    ServerBifrostPeerCredentials,
+    OraclePeerAuthority, OracleQueryAudit, PostgresPeerSecurityAudit, ServerBifrostPeerCredentials,
 };
 use crate::postgres::ServerPostgres;
 use crate::state::{

@@ -1990,7 +1990,8 @@ impl WyrdTestCluster {
                     .saturating_add(snapshot.reserved_spill_bytes);
                 runtime.peer_pending = runtime.peer_pending.saturating_add(snapshot.peer_pending);
                 runtime.peer_running = runtime.peer_running.saturating_add(snapshot.peer_running);
-                runtime.audit_pending = runtime.audit_pending.saturating_add(snapshot.audit_pending);
+                runtime.audit_pending =
+                    runtime.audit_pending.saturating_add(snapshot.audit_pending);
                 runtime.spill_directories = runtime
                     .spill_directories
                     .saturating_add(snapshot.spill_directories);

@@ -7,6 +7,8 @@ import {
 } from "apache-arrow";
 import { createRequire } from "node:module";
 
+import type { WyrdErrorCode } from "./error-codes.js";
+
 import type {
   NativeBifrostQueryStream,
   NativeLifecycleResult,
@@ -156,8 +158,10 @@ export interface QueryTerminal {
   arrow_ipc_eos: number[];
 }
 
+export type { WyrdErrorCode } from "./error-codes.js";
+
 export class WyrdError extends Error {
-  readonly code: string;
+  readonly code: WyrdErrorCode;
   readonly status: number;
   readonly title: string;
   readonly detail: string;
@@ -166,7 +170,7 @@ export class WyrdError extends Error {
   readonly details: unknown;
 
   constructor(
-    code: string,
+    code: WyrdErrorCode,
     status: number,
     title: string,
     detail: string,
@@ -234,7 +238,8 @@ function projectedError(metadata: NativeErrorMetadata): WyrdError | undefined {
     );
   }
   return new WyrdError(
-    metadata.errorCode,
+    // The native projection only emits codes from the same derive-backed catalog.
+    metadata.errorCode as WyrdErrorCode,
     status,
     title,
     detail,

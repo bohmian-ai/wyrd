@@ -1201,6 +1201,7 @@ snapshot_codegen() {
     find crates/wyrd-spec/schemas crates/wyrd-spec/tests/schemas -type f -name '*.json'
     find crates/shared/wyrd-client/schemas crates/shared/wyrd-client/tests/schemas -type f -name '*.json'
     find crates/vala/vala-core/schemas crates/vala/vala-core/tests/schemas -type f -name '*.json'
+    printf '%s\n' sdks/wyrd-sdk-ts/wyrd/src/error-codes.ts
     find sdks/wyrd-sdk-python/python/wyrd -type f -name '*.pyi' \
       ! -path 'sdks/wyrd-sdk-python/python/wyrd/stubs/*'
   } | sort | while IFS= read -r file; do

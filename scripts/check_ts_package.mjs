@@ -89,6 +89,8 @@ async function walkFiles(root) {
 }
 
 const rootAllowed = new Set([
+  "dist/error-codes.d.ts",
+  "dist/error-codes.js",
   "dist/index.d.ts",
   "dist/index.js",
   "index.cjs",

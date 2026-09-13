@@ -89,6 +89,20 @@ fn from_code_returns_none_for_unknown_or_unqualified_code() {
     );
 }
 
+/// `codes()` lists static codes in declaration order and expands delegates
+/// into their inner catalog.
+#[test]
+fn codes_enumerate_static_and_delegated_catalog() {
+    assert_eq!(
+        ExampleError::codes(),
+        [
+            "WYRD_TEST_400_VALIDATION",
+            "WYRD_TEST_500_INTERNAL",
+            "WYRD_TEST_503_UPSTREAM",
+        ]
+    );
+}
+
 #[test]
 fn derives_all_error_metadata_accessors() {
     let validation = ExampleError::Validation {

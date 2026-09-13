@@ -21,6 +21,9 @@ pub fn derive_wyrd_error(input: TokenStream) -> TokenStream {
     let mut status_arms = Vec::new();
     let mut title_arms = Vec::new();
     let mut remediation_arms = Vec::new();
+    // Catalog enumeration: static variants push their code, delegates expand
+    // their inner catalog, so generated projections see every reachable code.
+    let mut code_list = Vec::new();
     // Reverse code->variant reconstruction, emitted only for variants whose
     // named fields are exactly `{ message, details }`. This is the inverse of
     // `code()`: it lets a transport boundary rebuild the typed variant (and so
@@ -66,6 +69,7 @@ pub fn derive_wyrd_error(input: TokenStream) -> TokenStream {
                 status_arms.push(quote! { #pattern => #status });
                 title_arms.push(quote! { #pattern => #title });
                 remediation_arms.push(quote! { #pattern => #remediation });
+                code_list.push(quote! { codes.push(#code); });
 
                 if let Some((message_ty, details_ty)) = message_details_fields(&variant.fields) {
                     // Pin the param types to the first qualifying variant and
@@ -88,36 +92,40 @@ pub fn derive_wyrd_error(input: TokenStream) -> TokenStream {
                 }
             }
             ErrorMetadata::Delegate => {
-                let (pattern, binding) = match &variant.fields {
-                    Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
-                        (quote! { #name::#ident(inner) }, quote! { inner })
-                    }
-                    Fields::Named(fields) if fields.named.len() == 1 => {
-                        let Some(field) =
-                            fields.named.first().and_then(|field| field.ident.as_ref())
-                        else {
+                let (pattern, binding, inner_ty) =
+                    match &variant.fields {
+                        Fields::Unnamed(fields) if fields.unnamed.len() == 1 => (
+                            quote! { #name::#ident(inner) },
+                            quote! { inner },
+                            &fields.unnamed[0].ty,
+                        ),
+                        Fields::Named(fields) if fields.named.len() == 1 => {
+                            let Some((field, ty)) = fields.named.first().and_then(|field| {
+                                field.ident.as_ref().map(|ident| (ident, &field.ty))
+                            }) else {
+                                return syn::Error::new_spanned(
+                                    variant,
+                                    "#[wyrd_error(delegate)] named field must have an identifier",
+                                )
+                                .to_compile_error()
+                                .into();
+                            };
+                            (quote! { #name::#ident { #field } }, quote! { #field }, ty)
+                        }
+                        _ => {
                             return syn::Error::new_spanned(
-                                variant,
-                                "#[wyrd_error(delegate)] named field must have an identifier",
-                            )
-                            .to_compile_error()
-                            .into();
-                        };
-                        (quote! { #name::#ident { #field } }, quote! { #field })
-                    }
-                    _ => {
-                        return syn::Error::new_spanned(
                             variant,
                             "#[wyrd_error(delegate)] requires exactly one named or unnamed field",
                         )
                         .to_compile_error()
                         .into();
-                    }
-                };
+                        }
+                    };
                 code_arms.push(quote! { #pattern => #binding.code() });
                 status_arms.push(quote! { #pattern => #binding.status() });
                 title_arms.push(quote! { #pattern => #binding.title() });
                 remediation_arms.push(quote! { #pattern => #binding.remediation() });
+                code_list.push(quote! { codes.extend(<#inner_ty>::codes()); });
             }
         }
     }
@@ -174,6 +182,18 @@ pub fn derive_wyrd_error(input: TokenStream) -> TokenStream {
                 match self {
                     #(#remediation_arms,)*
                 }
+            }
+
+            /// Every stable code [`Self::code`] can return, in declaration order.
+            ///
+            /// Static variants contribute their own code and delegate variants
+            /// expand their inner catalog, so generated language projections
+            /// (such as the TypeScript `WyrdErrorCode` union) enumerate the full
+            /// reachable catalog from this one source.
+            pub fn codes() -> ::std::vec::Vec<&'static str> {
+                let mut codes = ::std::vec::Vec::new();
+                #(#code_list)*
+                codes
             }
 
             #from_code_method

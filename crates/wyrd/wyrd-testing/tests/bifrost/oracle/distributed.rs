@@ -6,8 +6,8 @@
 
 use arrow::array::{Array, Int64Array};
 use vala_bifrost_redux::oracle::iceberg_projection_probe;
-use vala_sdk::{QueryClient, ValaSdkError};
 use wyrd_client::WyrdClient;
+use wyrd_client::bifrost::BifrostClientError;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{
     BifrostQueryRequest, FreshnessPolicy, QueryTerminalErrorCode, QueryTerminalOutcome,
@@ -350,7 +350,9 @@ async fn query_terminal_either_surface(
     client: &WyrdClient,
     sql: String,
 ) -> Result<(u64, QueryTerminalOutcome, Option<QueryTerminalErrorCode>), JourneyError> {
-    let opened = QueryClient::new(client)
+    let opened = wyrd_client::Bifrost::query_only(client)
+        .query_client()
+        .clone()
         .query(&BifrostQueryRequest {
             sql,
             visibility: VisibilityMode::PublishedOnly,
@@ -360,7 +362,7 @@ async fn query_terminal_either_surface(
         .await;
     let mut stream = match opened {
         Ok(stream) => stream,
-        Err(ValaSdkError::Transport(WyrdError::Vala { error })) => {
+        Err(BifrostClientError::Transport(WyrdError::Vala { error })) => {
             let code = bifrost_terminal_code(&error)
                 .ok_or_else(|| format!("refusal is not a terminal query outcome: {error:?}"))?;
             return Ok((0, QueryTerminalOutcome::Failed, Some(code)));
@@ -831,7 +833,9 @@ fn expected_marked_ids() -> Vec<i64> {
 /// terminal frame, does not succeed, or emits a batch whose leading column is
 /// not a non-null `Int64`.
 async fn query_ids(client: &WyrdClient, sql: String) -> Result<Vec<i64>, JourneyError> {
-    let mut stream = QueryClient::new(client)
+    let mut stream = wyrd_client::Bifrost::query_only(client)
+        .query_client()
+        .clone()
         .query(&BifrostQueryRequest {
             sql,
             visibility: VisibilityMode::PublishedOnly,

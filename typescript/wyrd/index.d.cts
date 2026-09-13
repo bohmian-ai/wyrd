@@ -4,7 +4,7 @@
  * The one Bifrost client: query any authorized table, write to the active one.
  *
  * Mirrors the Python binding: both are thin conversions over the one
- * [`vala_sdk::Bifrost`], so batching, backpressure, registration, and the
+ * [`wyrd_client::bifrost::Bifrost`], so batching, backpressure, registration, and the
  * query contract have exactly one owner.
  */
 export declare class NativeBifrost {

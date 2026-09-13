@@ -1130,7 +1130,9 @@ async fn scoped_client(
 /// Returns the refusal when the granted table is denied, or the streaming
 /// failure when an authorized query cannot be drained.
 async fn accepts(client: &wyrd_client::WyrdClient, sql: &str) -> Result<(), ServerJourneyError> {
-    let mut stream = vala_sdk::query::QueryClient::new(client)
+    let mut stream = wyrd_client::Bifrost::query_only(client)
+        .query_client()
+        .clone()
         .query(&request(sql))
         .await
         .map_err(|error| format!("`{sql}` must be authorized: {error}"))?;
@@ -1163,7 +1165,9 @@ async fn refuses_with(
     sql: &str,
     code: &str,
 ) -> Result<(), ServerJourneyError> {
-    match vala_sdk::query::QueryClient::new(client)
+    match wyrd_client::Bifrost::query_only(client)
+        .query_client()
+        .clone()
         .query(&request(sql))
         .await
     {
@@ -1177,7 +1181,9 @@ async fn refuses_with(
                     .into(),
             )
         }
-        Err(vala_sdk::query::ValaSdkError::Transport(error)) if error.code() == code => Ok(()),
+        Err(wyrd_client::bifrost::BifrostClientError::Transport(error)) if error.code() == code => {
+            Ok(())
+        }
         Err(other) => Err(format!("`{sql}` must be refused with {code}, got {other}").into()),
     }
 }

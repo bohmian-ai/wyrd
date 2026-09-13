@@ -8,11 +8,11 @@ use std::sync::Arc;
 use arrow::json::LineDelimitedWriter;
 use clap::{ArgGroup, Args, ValueEnum};
 use secrecy::SecretString;
-use vala_sdk::{QueryClient, QueryResultStream};
-use wyrd_client::WyrdClient;
 use wyrd_client::auth::AuthMiddleware;
+use wyrd_client::bifrost::{BifrostClientError, QueryResultStream};
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{HttpConfig, HttpTransport, ResolvedCredential};
+use wyrd_client::{Bifrost, WyrdClient};
 use wyrd_spec::vala::api::{BifrostQueryRequest, FreshnessPolicy, VisibilityMode};
 
 use crate::error::{CliBoundaryError, WyrdCliError};
@@ -101,7 +101,8 @@ pub async fn execute(
 ) -> Result<(), CliBoundaryError> {
     let request = request(&command).map_err(CliBoundaryError::Local)?;
     let client = client(&command).map_err(CliBoundaryError::Local)?;
-    let mut stream = QueryClient::new(&client)
+    let mut stream = Bifrost::query_only(&client)
+        .query_client()
         .query(&request)
         .await
         .map_err(CliBoundaryError::from)?;
@@ -111,7 +112,7 @@ pub async fn execute(
     }
     let terminal = stream
         .terminal()
-        .ok_or_else(|| CliBoundaryError::from(vala_sdk::ValaSdkError::IncompleteQueryStream))?;
+        .ok_or_else(|| CliBoundaryError::from(BifrostClientError::IncompleteQueryStream))?;
     serde_json::to_writer(&mut *stderr, terminal)
         .map_err(output_error)
         .map_err(CliBoundaryError::Local)?;

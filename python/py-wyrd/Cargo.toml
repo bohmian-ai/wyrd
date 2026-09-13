@@ -29,8 +29,15 @@ skald-prompt = { workspace = true, features = ["python"] }
 skald-runtime = { workspace = true, features = ["python"] }
 wyrd-cards = { workspace = true, features = ["python"] }
 wyrd-config = { workspace = true, features = ["python"] }
-vala-sdk = { workspace = true, features = ["python"] }
 wyrd-utils = { workspace = true, features = ["python"] }
+wyrd-spec = { workspace = true }
+wyrd-runtime = { workspace = true }
+wyrd-client = { workspace = true }
+serde_json = { workspace = true }
+futures-util = { workspace = true }
+arrow = { workspace = true }
+arrow-schema = { workspace = true }
+wyrd-queue = { workspace = true }
 wyrd-sdk = { workspace = true, features = ["python"] }
 wyrd-testing = { workspace = true, features = ["python"], optional = true }
 

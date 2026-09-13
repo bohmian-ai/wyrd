@@ -1,8 +1,8 @@
-//! Vala client SDK — the client-tier Bifrost ingest surface.
+//! The Bifrost capability of the shared Wyrd client.
 //!
-//! `vala-sdk` is the one Bifrost client: it registers tables, ships buffered
-//! JSON rows to the Wyrd ingest service as Record batches, and reads them back
-//! with terminal-safe SQL. It owns:
+//! [`Bifrost`] is the one public Bifrost client: it registers and describes
+//! tables, ships buffered JSON rows and canonical Arrow batches to the Wyrd
+//! ingest service, and reads them back with terminal-safe SQL. It owns:
 //!
 //! - [`Bifrost`] — the client. A [`TableConfig`] binds the write target; reads
 //!   are unbound because `POST /v1/query` accepts SQL over any authorized
@@ -17,6 +17,9 @@
 //!   preserving `batch_id` so the server's commit dedup holds across retries.
 //! - [`observe`] — fire-and-forget telemetry that never breaks its caller.
 //!
+//! Query lifecycle mechanics ([`QueryClient`]) and the ingest transport are
+//! reached through the facade, never constructed as sibling clients.
+//!
 //! [`ClientScope`] is a credential fingerprint the **token-opaque** client tier
 //! computes without ever decoding a JWT: `(server_url, SHA-256 of the resolved
 //! credential's secret material)`. Backpressure is asymmetric — [`Bifrost::insert`]
@@ -25,31 +28,25 @@
 //!
 //! [`BatchSink`]: wyrd_queue::BatchSink
 
-#![deny(missing_docs)]
-#![deny(rustdoc::broken_intra_doc_links)]
-
-mod bifrost;
 pub mod blocking;
-pub mod grpc;
+mod facade;
+mod grpc;
 mod handle;
-mod native_owner;
 pub mod observe;
-#[cfg(feature = "python")]
-pub mod python;
-pub mod query;
-pub mod scope;
-pub mod sink;
+mod query;
+mod scope;
+mod sink;
 mod table;
 
-pub use bifrost::{Bifrost, QueryResult, client_from_options, register_outcome_name};
-pub use grpc::{
-    BifrostGrpcTransport, BifrostTransportConfig, MAX_FRAME_BYTES, MAX_FRAME_RETRIES,
-    PROTO_FRAME_OVERHEAD_BYTES,
-};
+pub use facade::{Bifrost, QueryResult, client_from_options, register_outcome_name};
+/// Raw ingest transport, exposed only to test harnesses that must submit exact
+/// sealed batches (replay and deduplication journeys) without the facade.
+#[cfg(feature = "test-support")]
+pub use grpc::{BifrostGrpcTransport, BifrostTransportConfig};
 pub use handle::BifrostMetrics;
 pub use query::{
-    CollectedQueryLimits, CollectedQueryResult, QueryClient, QueryResultStream, RawQueryStream,
-    ValaSdkError,
+    BifrostClientError, CollectedQueryLimits, CollectedQueryResult, QueryClient, QueryResultStream,
+    RawQueryStream,
 };
 pub use scope::{ClientScope, SinkKind};
 pub use sink::{BifrostIngestSink, IngestTransport};
@@ -60,7 +57,7 @@ pub use table::{Correlation, ResolvedTable, TableConfig};
 // `wyrd-queue` directly.
 pub use wyrd_queue::{fieldspec_to_arrow, json_schema_to_arrow};
 
-/// Server-free unit lane for `vala-sdk`: scope identity, producer pooling, and
+/// Server-free unit lane for the Bifrost client: scope identity, producer pooling, and
 /// the asymmetric backpressure contract — all driven through mock/stall sinks.
 #[cfg(test)]
 mod sdk {
@@ -69,10 +66,10 @@ mod sdk {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
+    use crate::config::ClientConfig;
+    use crate::transport::HttpConfig;
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use async_trait::async_trait;
-    use wyrd_client::config::ClientConfig;
-    use wyrd_client::transport::HttpConfig;
     use wyrd_queue::{
         BatchSink, ClientByteBudget, ClientByteGuard, DurableBatchAck, MockSink, OwnedIpcBytes,
         QueueConfig, SealedBatch, SinkError,
@@ -80,8 +77,8 @@ mod sdk {
     use wyrd_spec::error::WyrdError;
     use wyrd_spec::reference::CardRef;
 
-    use crate::handle::WriterPool;
-    use crate::{
+    use crate::bifrost::handle::WriterPool;
+    use crate::bifrost::{
         Bifrost, BifrostIngestSink, ClientScope, Correlation, IngestTransport, TableConfig, observe,
     };
 
@@ -108,7 +105,7 @@ mod sdk {
     /// A client over `sink`, built without any IO so a mock sink can stand in
     /// for the gRPC transport the production constructor would dial.
     fn client_over(sink: Arc<dyn BatchSink<ClientByteGuard>>, config: QueueConfig) -> Bifrost {
-        let client = wyrd_client::WyrdClient::with_config(config_with_key("http://x", "secret"))
+        let client = crate::WyrdClient::with_config(config_with_key("http://x", "secret"))
             .expect("client assembles without IO");
         Bifrost::with_sink(&client, None, sink, config)
     }

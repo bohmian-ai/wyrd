@@ -7,7 +7,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use url::Url;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
-use vala_sdk::query::ValaSdkError;
+use wyrd_client::bifrost::BifrostClientError;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
 use wyrd_spec::vala::api::{BifrostQueryRequest, QueryTerminalErrorCode, VisibilityMode};
@@ -154,7 +154,7 @@ async fn assert_canonical_genai_span_is_tenant_isolated(server: &wyrd_testing::W
         .await
         .expect("the canonical span ledger is provisioned for the writing tenant");
     let writer = tenant_writer(server, tenant).await;
-    let described = vala_sdk::TableConfig::describe(writer.client(), SPANS)
+    let described = wyrd_client::bifrost::TableConfig::describe(writer.client(), SPANS)
         .await
         .expect("the canonical span ledger describes itself");
     let scope = unique_table("scribe_canonical");
@@ -245,7 +245,9 @@ async fn query_rows(
     writer: &wyrd_testing::bifrost::write::BifrostWriter,
     sql: &str,
 ) -> Vec<RecordBatch> {
-    let mut stream = vala_sdk::query::QueryClient::new(writer.client())
+    let mut stream = wyrd_client::Bifrost::query_only(writer.client())
+        .query_client()
+        .clone()
         .query(&BifrostQueryRequest {
             sql: sql.to_owned(),
             visibility: VisibilityMode::Fused,
@@ -501,7 +503,9 @@ async fn assert_empty_table_reads_cleanly(server: &wyrd_testing::WyrdTestServer)
     )
     .await;
     let reader = tenant_writer(server, tenant).await;
-    let mut empty = vala_sdk::query::QueryClient::new(reader.client())
+    let mut empty = wyrd_client::Bifrost::query_only(reader.client())
+        .query_client()
+        .clone()
         .query(&BifrostQueryRequest {
             sql: format!("SELECT value FROM {table}"),
             visibility: VisibilityMode::Fused,
@@ -608,7 +612,9 @@ async fn scribe_undialable_private_peer_returns_typed_visibility_failure() {
         .await
         .expect("Oracle observes the undialable membership");
 
-    let started = vala_sdk::query::QueryClient::new(writer.client())
+    let started = wyrd_client::Bifrost::query_only(writer.client())
+        .query_client()
+        .clone()
         .query(&BifrostQueryRequest {
             sql: format!("SELECT value FROM {table}"),
             visibility: VisibilityMode::Fused,
@@ -631,7 +637,7 @@ async fn scribe_undialable_private_peer_returns_typed_visibility_failure() {
     );
     assert_eq!(projected.status(), 503);
     match &error {
-        ValaSdkError::FailedTerminal { terminal } => {
+        BifrostClientError::FailedTerminal { terminal } => {
             assert_eq!(
                 terminal.outcome,
                 wyrd_spec::vala::api::QueryTerminalOutcome::Failed
@@ -641,7 +647,7 @@ async fn scribe_undialable_private_peer_returns_typed_visibility_failure() {
                 QueryTerminalErrorCode::QueryVisibilityUnavailable
             );
         }
-        ValaSdkError::Transport(wyrd_spec::error::WyrdError::Vala {
+        BifrostClientError::Transport(wyrd_spec::error::WyrdError::Vala {
             error: wyrd_spec::vala::error::BifrostError::QueryVisibilityUnavailable,
         }) => {}
         other => panic!("expected typed visibility refusal, got {other:?}"),
@@ -702,7 +708,7 @@ async fn append_active_row(writer: &wyrd_testing::bifrost::write::BifrostWriter,
 }
 
 /// Returns the public stable code without consuming the typed SDK error.
-fn error_code(error: &ValaSdkError) -> &'static str {
+fn error_code(error: &BifrostClientError) -> &'static str {
     wyrd_spec::error::WyrdError::from(error).code()
 }
 
@@ -1029,7 +1035,9 @@ async fn read_correlation(
     table: &str,
 ) -> Vec<(i64, Option<String>, String)> {
     let sql = format!("SELECT value, card_uid, principal_id FROM {table} ORDER BY value");
-    let mut stream = vala_sdk::query::QueryClient::new(client)
+    let mut stream = wyrd_client::Bifrost::query_only(client)
+        .query_client()
+        .clone()
         .query(&BifrostQueryRequest {
             sql: sql.clone(),
             visibility: VisibilityMode::Fused,

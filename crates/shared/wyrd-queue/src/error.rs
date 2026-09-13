@@ -5,7 +5,7 @@
 //! the serialization-domain failures. It maps to
 //! [`wyrd_spec::error::WyrdError`] at the surface boundary; the `Sink` variant
 //! carries an already-mapped server error (the sink does the transport→`WyrdError`
-//! translation in `vala-sdk`/`wyrd-client`).
+//! translation in `wyrd_client::bifrost`).
 
 use wyrd_spec::error::WyrdError;
 

@@ -1,11 +1,11 @@
 //! Producer-pool identity: [`SinkKind`], [`ClientScope`], and the credential
 //! fingerprint the token-opaque client tier can compute.
 
+use crate::config::ClientConfig;
+use crate::error::WyrdClientError;
+use crate::transport::ResolvedCredential;
 use secrecy::ExposeSecret;
 use sha2::{Digest, Sha256};
-use wyrd_client::config::ClientConfig;
-use wyrd_client::error::WyrdClientError;
-use wyrd_client::transport::ResolvedCredential;
 use wyrd_spec::error::WyrdError;
 
 /// The observation-kind discriminant that keys the producer pool.
@@ -60,9 +60,9 @@ impl ClientScope {
     /// handle built from a client can never key its producer pool on a
     /// different credential than the one its requests carry.
     ///
-    /// [`AuthMiddleware`]: wyrd_client::auth::AuthMiddleware
+    /// [`AuthMiddleware`]: crate::auth::AuthMiddleware
     #[must_use]
-    pub fn from_client(client: &wyrd_client::WyrdClient) -> Self {
+    pub fn from_client(client: &crate::WyrdClient) -> Self {
         let auth = client.auth();
         Self {
             server_url: auth.base_url().trim_end_matches('/').to_owned(),

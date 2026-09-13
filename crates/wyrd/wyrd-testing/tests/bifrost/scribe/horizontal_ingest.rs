@@ -475,7 +475,9 @@ fn expected_rows(batches: &[SubmittedBatch]) -> Vec<RowIdentity> {
 /// column is absent or of an unexpected Arrow type.
 async fn read_rows(client: &WyrdClient, table: &str) -> Vec<RowIdentity> {
     let sql = format!("SELECT wyrd_batch_id, wyrd_row_ordinal, value FROM {table}");
-    let mut stream = vala_sdk::query::QueryClient::new(client)
+    let mut stream = wyrd_client::Bifrost::query_only(client)
+        .query_client()
+        .clone()
         .query(&wyrd_spec::vala::api::BifrostQueryRequest {
             sql: sql.clone(),
             visibility: wyrd_spec::vala::api::VisibilityMode::Fused,

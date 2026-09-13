@@ -1,13 +1,13 @@
 //! Fire-and-forget telemetry over the one Bifrost client.
 //!
-//! The only difference from [`crate::Bifrost::insert`] is what happens when the
+//! The only difference from [`crate::bifrost::Bifrost::insert`] is what happens when the
 //! producer refuses: telemetry swallows the refusal and counts it, because
 //! losing a signal row is better than breaking the instrumented caller.
 
 use arrow_schema::SchemaRef;
 
-use crate::bifrost::Bifrost;
-use crate::table::Correlation;
+use crate::bifrost::facade::Bifrost;
+use crate::bifrost::table::Correlation;
 
 /// Record one telemetry observation, fire-and-forget.
 ///

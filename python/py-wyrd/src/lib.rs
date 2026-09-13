@@ -1,5 +1,7 @@
 //! `PyO3` bootstrap module for the Python Wyrd package.
 
+mod bifrost;
+
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 
@@ -79,12 +81,12 @@ fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     skald_observer::python::python_register(m)?;
 
     let bifrost = PyModule::new(py, "bifrost")?;
-    vala_sdk::python::register_bifrost(&bifrost)?;
+    bifrost::register_bifrost(&bifrost)?;
     m.add_submodule(&bifrost)?;
     register_submodule(py, "wyrd._wyrd.bifrost", &bifrost)?;
 
     let observe = PyModule::new(py, "observe")?;
-    vala_sdk::python::register_observe(&observe)?;
+    bifrost::register_observe(&observe)?;
     m.add_submodule(&observe)?;
     register_submodule(py, "wyrd._wyrd.observe", &observe)?;
 

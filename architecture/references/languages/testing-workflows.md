@@ -105,7 +105,7 @@ mise run test:bifrost         # all Bifrost tests and language surfaces
 mise run test:bifrost:journey # Rust bifrost user-journey tests/multi-pod distributed tests
                               # (capability binaries + registration rule:
                               #  crates/wyrd/wyrd-testing/tests/README.md)
-mise run test:e2e             # server-level e2e (wyrd-auth, wyrd-server, wyrd-testing, wyrd-client, vala-sdk)
+mise run test:e2e             # server-level e2e (wyrd-auth, wyrd-server, wyrd-testing, wyrd-client)
 mise run test:storage:matrix  # storage emulator matrix (S3/GCS/Azure)
 
 # Narrow named lib test:

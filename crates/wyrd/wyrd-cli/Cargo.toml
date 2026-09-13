@@ -45,7 +45,6 @@ tracing-subscriber = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 vala-eval = { workspace = true }
-vala-sdk = { workspace = true }
 wyrd-client = { workspace = true }
 wyrd-error-derive = { workspace = true }
 

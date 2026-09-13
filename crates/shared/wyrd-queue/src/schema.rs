@@ -4,7 +4,7 @@
 //! `06-serialization-spec.md` table: JSON-Schema `Value` → `Vec<FieldSpec>` and
 //! `arrow::Schema` → `Vec<FieldSpec>`, both returning the Arrow-free C2 wire type
 //! [`wyrd_spec::vala::api::FieldSpec`]. The PyO3 acquisition (Pydantic
-//! `model_json_schema()` / `pyarrow.Schema`) lives in `vala-sdk` and calls these.
+//! `model_json_schema()` / `pyarrow.Schema`) lives in `wyrd_client::bifrost` and calls these.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

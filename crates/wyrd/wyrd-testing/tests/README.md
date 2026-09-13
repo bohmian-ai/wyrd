@@ -89,7 +89,7 @@ Keep a module under roughly 40 KB. Splitting costs one file and one `mod` line.
 |---|---|
 | `mise run test:bifrost` | every Bifrost unit, integration, and Rust/Python/TypeScript journey lane |
 | `mise run test:bifrost:journey` | every capability below, in sequence, under one database lifecycle |
-| `mise run test:bifrost:journey:sdk` | `vala-sdk` `pg_bifrost_e2e`, whole |
+| `mise run test:bifrost:journey:sdk` | `wyrd-client` `pg_bifrost_e2e`, whole |
 | `mise run test:bifrost:journey:forge` | `forge`, whole |
 | `mise run test:bifrost:journey:scribe` | `scribe`, whole |
 | `mise run test:bifrost:journey:oracle` | `oracle`, whole |

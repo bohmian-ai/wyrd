@@ -20,7 +20,6 @@ napi-derive = { workspace = true }
 secrecy = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync"] }
-vala-sdk = { workspace = true }
 wyrd-client = { workspace = true }
 wyrd-spec = { workspace = true }
 

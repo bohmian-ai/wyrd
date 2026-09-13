@@ -177,7 +177,7 @@ package:
 - `prompt` (from `skald-prompt`)
 - `providers` (from `skald-runtime`)
 - `bifrost` (one projection of `wyrd_client::Bifrost`)
-- `observe` (from `vala-sdk::observe` + `skald-observer`)
+- `observe` (from `wyrd_client::bifrost::observe` + `skald-observer`)
 - `testing` (from `wyrd-testing`, feature-gated, dev-only wheel)
 
 Users import the package projections such as `wyrd.cards`, `wyrd.data`,

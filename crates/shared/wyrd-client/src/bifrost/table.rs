@@ -4,15 +4,15 @@
 //! [`TableConfig`] is the single client-side description of one Bifrost table:
 //! its `<namespace>.<name>` identity, the user columns the caller declares, and
 //! the physical layout it asks the server to create. Every language SDK builds
-//! one of these and hands it to [`crate::Bifrost`]; none of them re-derive the
+//! one of these and hands it to [`crate::bifrost::Bifrost`]; none of them re-derive the
 //! schema mapping, which belongs to `wyrd-queue`, or the table identity, which
 //! belongs to the server.
 
 use std::sync::Arc;
 
+use crate::WyrdClient;
 use arrow_schema::SchemaRef;
 use serde::{Deserialize, Serialize};
-use wyrd_client::WyrdClient;
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::api::{
     BifrostTableDescription, FieldSpec, PhysicalLayoutWire, RegisterTableRequest,
@@ -20,7 +20,7 @@ use wyrd_spec::vala::api::{
 };
 use wyrd_spec::vala::ids::RunId;
 
-use crate::query::ValaSdkError;
+use crate::bifrost::query::BifrostClientError;
 
 /// The server-authoritative identity of a registered table.
 ///
@@ -38,7 +38,7 @@ pub struct ResolvedTable {
 
 /// One Bifrost table a writer is bound to.
 ///
-/// A config is inert until [`crate::Bifrost::register`] or
+/// A config is inert until [`crate::bifrost::Bifrost::register`] or
 /// [`TableConfig::describe`] resolves it against the server; until then
 /// [`TableConfig::resolved`] is `None`.
 ///
@@ -70,11 +70,11 @@ impl TableConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`ValaSdkError::Queue`] with code `WYRD_VALA_400_SCHEMA_PARSE`
+    /// Returns [`BifrostClientError::Queue`] with code `WYRD_VALA_400_SCHEMA_PARSE`
     /// when `fqn` is not `<namespace>.<name>`, and
     /// `WYRD_VALA_400_BIFROST_RESERVED_COLUMN` when a column uses a reserved
     /// `wyrd_*`, `card_ref`, or `run_id` name.
-    pub fn from_arrow(fqn: &str, schema: SchemaRef) -> Result<Self, ValaSdkError> {
+    pub fn from_arrow(fqn: &str, schema: SchemaRef) -> Result<Self, BifrostClientError> {
         let (namespace, name) = split_fqn(fqn)?;
         reject_reserved_columns(&schema)?;
         Ok(Self {
@@ -99,7 +99,10 @@ impl TableConfig {
     /// As [`TableConfig::from_arrow`], plus a schema-parse failure for a
     /// free-form object, an untyped array, an unsupported type, or an
     /// unresolvable `$ref`.
-    pub fn from_json_schema(fqn: &str, schema: &serde_json::Value) -> Result<Self, ValaSdkError> {
+    pub fn from_json_schema(
+        fqn: &str,
+        schema: &serde_json::Value,
+    ) -> Result<Self, BifrostClientError> {
         let arrow = wyrd_queue::json_schema_to_arrow(schema)?;
         Self::from_arrow(fqn, Arc::new(arrow))
     }
@@ -118,7 +121,7 @@ impl TableConfig {
     /// # Errors
     ///
     /// As [`TableConfig::from_json_schema`].
-    pub fn from_model<T: schemars::JsonSchema>(fqn: &str) -> Result<Self, ValaSdkError> {
+    pub fn from_model<T: schemars::JsonSchema>(fqn: &str) -> Result<Self, BifrostClientError> {
         let schema = serde_json::to_value(schemars::schema_for!(T)).map_err(|error| {
             wyrd_queue::WyrdQueueError::SchemaParse(format!(
                 "model schema is not representable as JSON: {error}"
@@ -143,9 +146,9 @@ impl TableConfig {
     /// # Cancellation
     ///
     /// Abandoning the future leaves no server state behind; describe is a read.
-    pub async fn describe(client: &WyrdClient, fqn: &str) -> Result<Self, ValaSdkError> {
+    pub async fn describe(client: &WyrdClient, fqn: &str) -> Result<Self, BifrostClientError> {
         let (namespace, name) = split_fqn(fqn)?;
-        let description = crate::QueryClient::new(client)
+        let description = crate::bifrost::QueryClient::new(client)
             .describe_table(&namespace, &name)
             .await?;
         Self::from_description(&description)
@@ -157,8 +160,8 @@ impl TableConfig {
     ///
     /// As [`TableConfig::describe`], plus the stable no-credentials error when
     /// the credential chain yields nothing.
-    pub async fn describe_from_env(fqn: &str) -> Result<Self, ValaSdkError> {
-        let client = crate::bifrost::client_from_env()?;
+    pub async fn describe_from_env(fqn: &str) -> Result<Self, BifrostClientError> {
+        let client = crate::bifrost::facade::client_from_env()?;
         Self::describe(&client, fqn).await
     }
 
@@ -174,7 +177,7 @@ impl TableConfig {
     /// mapped back onto Arrow.
     pub(crate) fn from_description(
         description: &BifrostTableDescription,
-    ) -> Result<Self, ValaSdkError> {
+    ) -> Result<Self, BifrostClientError> {
         let user_schema = wyrd_queue::fieldspec_to_arrow(&description.user_fields)?;
         Ok(Self {
             namespace: description.entry.namespace.clone(),
@@ -284,7 +287,7 @@ impl From<TableConfig> for TableConfigWire {
 }
 
 impl TryFrom<TableConfigWire> for TableConfig {
-    type Error = ValaSdkError;
+    type Error = BifrostClientError;
 
     /// Rebuild one config from its wire form.
     ///
@@ -324,7 +327,7 @@ pub struct Correlation {
 /// # Errors
 ///
 /// Returns a schema-parse error when either half is empty or the dot is absent.
-pub(crate) fn split_fqn(fqn: &str) -> Result<(String, String), ValaSdkError> {
+pub(crate) fn split_fqn(fqn: &str) -> Result<(String, String), BifrostClientError> {
     let (namespace, name) = fqn.rsplit_once('.').ok_or_else(|| {
         wyrd_queue::WyrdQueueError::SchemaParse(format!(
             "table `{fqn}` is not `<namespace>.<name>`"
@@ -348,7 +351,7 @@ pub(crate) fn split_fqn(fqn: &str) -> Result<(String, String), ValaSdkError> {
 /// # Errors
 ///
 /// Returns a reserved-column error naming the first offending column.
-fn reject_reserved_columns(schema: &SchemaRef) -> Result<(), ValaSdkError> {
+fn reject_reserved_columns(schema: &SchemaRef) -> Result<(), BifrostClientError> {
     for field in schema.fields() {
         let name = field.name().as_str();
         if wyrd_queue::is_reserved_column(name) {

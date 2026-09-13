@@ -4,12 +4,12 @@ use std::collections::VecDeque;
 use std::io::Cursor;
 use std::pin::Pin;
 
+use crate::WyrdClient;
+use crate::error::WyrdClientError;
 use arrow::datatypes::SchemaRef;
 use arrow::ipc::reader::StreamReader;
 use arrow::record_batch::RecordBatch;
 use futures_util::{Stream, StreamExt};
-use wyrd_client::WyrdClient;
-use wyrd_client::error::WyrdClientError;
 use wyrd_queue::WyrdQueueError;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
@@ -30,7 +30,7 @@ type ResponseBytes = Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Err
 
 /// Errors returned while querying Oracle through the public client contract.
 #[derive(Debug, thiserror::Error)]
-pub enum ValaSdkError {
+pub enum BifrostClientError {
     /// The authenticated HTTP transport rejected or could not send a request.
     #[error("query transport failed: {0}")]
     Transport(#[from] wyrd_spec::error::WyrdError),
@@ -72,14 +72,14 @@ pub enum ValaSdkError {
     RowDeserialization(String),
     /// A client-tier configuration, credential, or transport failure.
     ///
-    /// Carried verbatim for the same reason [`ValaSdkError::Queue`] is: the
+    /// Carried verbatim for the same reason [`BifrostClientError::Queue`] is: the
     /// public projection names the matching `WYRD_CLIENT_*` catalog variant so
     /// an unresolvable credential chain stays a 401 in every language SDK.
     #[error("{0}")]
     Client(#[from] WyrdClientError),
 }
 
-impl ValaSdkError {
+impl BifrostClientError {
     /// Returns terminal metadata when a validated failed terminal caused this error.
     #[must_use]
     pub fn terminal(&self) -> Option<&QueryTerminalFrame> {
@@ -98,14 +98,14 @@ impl ValaSdkError {
     }
 }
 
-impl From<ValaSdkError> for WyrdError {
+impl From<BifrostClientError> for WyrdError {
     /// Project one owned SDK error onto the shared derive-backed catalog.
-    fn from(error: ValaSdkError) -> Self {
+    fn from(error: BifrostClientError) -> Self {
         Self::from(&error)
     }
 }
 
-impl From<&ValaSdkError> for WyrdError {
+impl From<&BifrostClientError> for WyrdError {
     /// Project one borrowed SDK error onto the shared derive-backed catalog.
     ///
     /// This is the crate's only public error projection: every stable code,
@@ -116,30 +116,30 @@ impl From<&ValaSdkError> for WyrdError {
     /// Framing and Arrow decode strings stay on the Rust-side `Display` rather
     /// than the public projection: the catalog owns the scrubbed public text,
     /// and a raw decoder string is a local diagnostic, not a stable contract.
-    fn from(error: &ValaSdkError) -> Self {
+    fn from(error: &BifrostClientError) -> Self {
         match error {
-            ValaSdkError::Transport(inner) => inner.clone(),
-            ValaSdkError::Protocol(_) | ValaSdkError::Arrow(_) => Self::Vala {
+            BifrostClientError::Transport(inner) => inner.clone(),
+            BifrostClientError::Protocol(_) | BifrostClientError::Arrow(_) => Self::Vala {
                 error: BifrostError::QueryStreamProtocol,
             },
-            ValaSdkError::IncompleteQueryStream => Self::Vala {
+            BifrostClientError::IncompleteQueryStream => Self::Vala {
                 error: BifrostError::QueryStreamIncomplete,
             },
-            ValaSdkError::FailedTerminal { terminal } => Self::Vala {
+            BifrostClientError::FailedTerminal { terminal } => Self::Vala {
                 error: terminal_bifrost_error(terminal),
             },
-            ValaSdkError::ResultTooLarge => Self::Vala {
+            BifrostClientError::ResultTooLarge => Self::Vala {
                 error: BifrostError::QueryResultTooLarge,
             },
-            ValaSdkError::NoActiveTable => Self::Vala {
+            BifrostClientError::NoActiveTable => Self::Vala {
                 error: BifrostError::NoActiveTable,
             },
-            ValaSdkError::RowDeserialization(detail) => Self::ClientRowDeserialization {
+            BifrostClientError::RowDeserialization(detail) => Self::ClientRowDeserialization {
                 message: detail.clone(),
                 details: serde_json::json!({}),
             },
-            ValaSdkError::Queue(inner) => queue_catalog_error(inner),
-            ValaSdkError::Client(inner) => client_catalog_error(inner),
+            BifrostClientError::Queue(inner) => queue_catalog_error(inner),
+            BifrostClientError::Client(inner) => client_catalog_error(inner),
         }
     }
 }
@@ -231,7 +231,7 @@ pub struct QueryClient {
 impl QueryClient {
     /// Creates a query handle sharing the supplied Wyrd client's transport state.
     #[must_use]
-    pub fn new(client: &WyrdClient) -> Self {
+    pub(crate) fn new(client: &WyrdClient) -> Self {
         Self {
             client: client.clone(),
         }
@@ -239,7 +239,7 @@ impl QueryClient {
 
     /// The authenticated client this handle shares its transport with.
     ///
-    /// Exposed so [`crate::Bifrost`] issues its catalog calls — register and
+    /// Exposed so [`crate::bifrost::Bifrost`] issues its catalog calls — register and
     /// describe — over the same auth and connection pools its queries use,
     /// instead of assembling a second transport for the same credential.
     #[must_use]
@@ -264,10 +264,10 @@ impl QueryClient {
     pub async fn query(
         &self,
         request: &BifrostQueryRequest,
-    ) -> Result<QueryResultStream, ValaSdkError> {
+    ) -> Result<QueryResultStream, BifrostClientError> {
         request
             .validate()
-            .map_err(|error| ValaSdkError::Protocol(error.to_string()))?;
+            .map_err(|error| BifrostClientError::Protocol(error.to_string()))?;
         let request_id = RequestId::now_v7();
         let response = self
             .client
@@ -280,7 +280,7 @@ impl QueryClient {
             .and_then(|value| value.parse::<i64>().ok())
             .filter(|deadline| *deadline >= 0)
             .ok_or_else(|| {
-                ValaSdkError::Protocol(
+                BifrostClientError::Protocol(
                     "query response omits a valid x-wyrd-query-deadline-ms".to_owned(),
                 )
             })?;
@@ -300,7 +300,7 @@ impl QueryClient {
     /// # Errors
     ///
     /// Returns stable authentication, authorization, audit, availability, or protocol errors.
-    pub async fn running(&self) -> Result<Vec<RunningQuerySummary>, ValaSdkError> {
+    pub async fn running(&self) -> Result<Vec<RunningQuerySummary>, BifrostClientError> {
         let response: ListRunningQueriesResponse = self
             .client
             .request_json::<(), _>(reqwest::Method::GET, "/v1/query/running", None)
@@ -319,7 +319,7 @@ impl QueryClient {
     pub async fn status(
         &self,
         request_id: &RequestId,
-    ) -> Result<RunningQuerySummary, ValaSdkError> {
+    ) -> Result<RunningQuerySummary, BifrostClientError> {
         self.client
             .request_json::<(), _>(
                 reqwest::Method::GET,
@@ -341,7 +341,7 @@ impl QueryClient {
     pub async fn cancel(
         &self,
         request_id: &RequestId,
-    ) -> Result<CancelRunningQueryResponse, ValaSdkError> {
+    ) -> Result<CancelRunningQueryResponse, BifrostClientError> {
         self.client
             .request_json::<(), _>(
                 reqwest::Method::DELETE,
@@ -374,7 +374,7 @@ impl QueryClient {
         &self,
         namespace: &str,
         name: &str,
-    ) -> Result<BifrostTableDescription, ValaSdkError> {
+    ) -> Result<BifrostTableDescription, BifrostClientError> {
         self.client
             .request_json::<(), _>(
                 reqwest::Method::GET,
@@ -400,7 +400,7 @@ impl QueryClient {
         &self,
         request: &BifrostQueryRequest,
         limits: CollectedQueryLimits,
-    ) -> Result<CollectedQueryResult, ValaSdkError> {
+    ) -> Result<CollectedQueryResult, BifrostClientError> {
         self.query(request).await?.collect_bounded(limits).await
     }
 }
@@ -447,13 +447,13 @@ impl RawQueryStream {
     ///
     /// Returns a typed protocol or Arrow error for malformed, truncated,
     /// out-of-order, duplicate, post-terminal, or invalid-terminal streams.
-    /// EOF before terminal returns [`ValaSdkError::IncompleteQueryStream`].
+    /// EOF before terminal returns [`BifrostClientError::IncompleteQueryStream`].
     ///
     /// # Cancellation
     ///
     /// Cancelling this operation preserves decoder state. Dropping the stream
     /// drops the HTTP response body and stops further reads.
-    pub async fn next_frame(&mut self) -> Result<Option<QueryStreamFrame>, ValaSdkError> {
+    pub async fn next_frame(&mut self) -> Result<Option<QueryStreamFrame>, BifrostClientError> {
         Ok(self
             .next_decoded_frame()
             .await?
@@ -471,10 +471,10 @@ impl RawQueryStream {
     ///
     /// Returns a typed protocol or Arrow error for malformed, truncated,
     /// out-of-order, duplicate, post-terminal, or invalid-terminal streams.
-    /// EOF before terminal returns [`ValaSdkError::IncompleteQueryStream`].
+    /// EOF before terminal returns [`BifrostClientError::IncompleteQueryStream`].
     async fn next_decoded_frame(
         &mut self,
-    ) -> Result<Option<(QueryStreamFrame, Option<RecordBatch>)>, ValaSdkError> {
+    ) -> Result<Option<(QueryStreamFrame, Option<RecordBatch>)>, BifrostClientError> {
         loop {
             if let Some((frame, batch)) = self.pending.pop_front() {
                 if let QueryStreamFrame::Terminal(terminal) = &frame {
@@ -488,14 +488,14 @@ impl RawQueryStream {
                         self.received_bytes
                             .checked_add(bytes.len())
                             .ok_or_else(|| {
-                                ValaSdkError::Protocol(
+                                BifrostClientError::Protocol(
                                     "encoded response byte count overflow".to_owned(),
                                 )
                             })?;
                     let frames = self
                         .decoder
                         .push::<wyrd_tonic::wyrd::v1::QueryStreamFrame>(&bytes)
-                        .map_err(|error| ValaSdkError::Protocol(error.to_string()))?;
+                        .map_err(|error| BifrostClientError::Protocol(error.to_string()))?;
                     for frame in frames {
                         // The Arrow fragment is consumed before conversion so
                         // the converter's row accounting and the decoder's
@@ -518,14 +518,16 @@ impl RawQueryStream {
                             .as_ref()
                             .map(|batch| {
                                 u64::try_from(batch.num_rows()).map_err(|_| {
-                                    ValaSdkError::Protocol("row count does not fit u64".to_owned())
+                                    BifrostClientError::Protocol(
+                                        "row count does not fit u64".to_owned(),
+                                    )
                                 })
                             })
                             .transpose()?;
                         let frame = self
                             .converter
                             .convert(frame, batch_rows)
-                            .map_err(|error| ValaSdkError::Protocol(error.to_string()))?;
+                            .map_err(|error| BifrostClientError::Protocol(error.to_string()))?;
                         // The terminal's own validation already refused a
                         // success that omits its end-of-stream; closing the
                         // Arrow stream here proves the bytes it carries are the
@@ -544,9 +546,9 @@ impl RawQueryStream {
                 None => {
                     self.decoder
                         .finish()
-                        .map_err(|error| ValaSdkError::Protocol(error.to_string()))?;
+                        .map_err(|error| BifrostClientError::Protocol(error.to_string()))?;
                     if self.terminal.is_none() {
-                        return Err(ValaSdkError::IncompleteQueryStream);
+                        return Err(BifrostClientError::IncompleteQueryStream);
                     }
                     return Ok(None);
                 }
@@ -600,7 +602,7 @@ impl RawQueryStream {
 /// The stable projection retains machine-readable phase and Reqwest
 /// classifications. The structured diagnostic keeps the original error as the
 /// tracing source for operators while the public detail remains scrubbed.
-fn query_body_transport_error(error: reqwest::Error) -> ValaSdkError {
+fn query_body_transport_error(error: reqwest::Error) -> BifrostClientError {
     let details = serde_json::json!({
         "transport": "http",
         "phase": "response_body",
@@ -619,7 +621,7 @@ fn query_body_transport_error(error: reqwest::Error) -> ValaSdkError {
         decode = error.is_decode(),
         "Oracle query response body failed"
     );
-    ValaSdkError::Transport(WyrdError::UpstreamFailure {
+    BifrostClientError::Transport(WyrdError::UpstreamFailure {
         message: "Oracle query response body failed".to_owned(),
         details,
     })
@@ -709,14 +711,14 @@ impl QueryResultStream {
     ///
     /// Cancelling preserves the stream for a later call. Dropping the stream
     /// cancels response-body consumption.
-    pub async fn next_batch(&mut self) -> Result<Option<RecordBatch>, ValaSdkError> {
+    pub async fn next_batch(&mut self) -> Result<Option<RecordBatch>, BifrostClientError> {
         if self.terminal.is_none()
             && self.settlement != StreamSettlement::Broken
             && let Some(terminal) = self.raw.terminal().cloned()
             && terminal.outcome != QueryTerminalOutcome::Failed
         {
             if let Err(error) = terminal.validate_emitted_rows(self.emitted_rows) {
-                return Err(self.mark_broken(ValaSdkError::Protocol(error.to_string())));
+                return Err(self.mark_broken(BifrostClientError::Protocol(error.to_string())));
             }
             return self.finish_at_clean_eof(terminal).await;
         }
@@ -736,28 +738,31 @@ impl QueryResultStream {
                 }
                 QueryStreamFrame::Batch(_) => {
                     let Some(decoded) = decoded else {
-                        return Err(self.mark_broken(ValaSdkError::Arrow(
+                        return Err(self.mark_broken(BifrostClientError::Arrow(
                             "batch frame contains no record batch".to_owned(),
                         )));
                     };
                     let rows = match u64::try_from(decoded.num_rows()) {
                         Ok(rows) => rows,
                         Err(_) => {
-                            return Err(self.mark_broken(ValaSdkError::Protocol(
+                            return Err(self.mark_broken(BifrostClientError::Protocol(
                                 "row count does not fit u64".to_owned(),
                             )));
                         }
                     };
                     let Some(emitted) = self.emitted_rows.checked_add(rows) else {
-                        return Err(self
-                            .mark_broken(ValaSdkError::Protocol("row count overflow".to_owned())));
+                        return Err(self.mark_broken(BifrostClientError::Protocol(
+                            "row count overflow".to_owned(),
+                        )));
                     };
                     self.emitted_rows = emitted;
                     return Ok(Some(decoded));
                 }
                 QueryStreamFrame::Terminal(terminal) => {
                     if let Err(error) = terminal.validate_emitted_rows(self.emitted_rows) {
-                        return Err(self.mark_broken(ValaSdkError::Protocol(error.to_string())));
+                        return Err(
+                            self.mark_broken(BifrostClientError::Protocol(error.to_string()))
+                        );
                     }
                     if terminal.outcome == QueryTerminalOutcome::Failed {
                         self.terminal = Some(terminal.clone());
@@ -765,7 +770,7 @@ impl QueryResultStream {
                         // can never become a successful result, so it settles
                         // here rather than waiting for the body to close.
                         self.settlement = StreamSettlement::Settled;
-                        return Err(ValaSdkError::FailedTerminal { terminal });
+                        return Err(BifrostClientError::FailedTerminal { terminal });
                     }
                     return self.finish_at_clean_eof(terminal).await;
                 }
@@ -779,13 +784,13 @@ impl QueryResultStream {
     /// response stream in an unknown position, so settlement must prove cleanup
     /// through the query's own status route instead of draining it. The error
     /// is returned unchanged: this marker never replaces what the caller sees.
-    fn mark_broken(&mut self, error: ValaSdkError) -> ValaSdkError {
+    fn mark_broken(&mut self, error: BifrostClientError) -> BifrostClientError {
         if matches!(
             error,
-            ValaSdkError::Protocol(_)
-                | ValaSdkError::Arrow(_)
-                | ValaSdkError::Transport(_)
-                | ValaSdkError::IncompleteQueryStream
+            BifrostClientError::Protocol(_)
+                | BifrostClientError::Arrow(_)
+                | BifrostClientError::Transport(_)
+                | BifrostClientError::IncompleteQueryStream
         ) {
             self.settlement = StreamSettlement::Broken;
         }
@@ -802,14 +807,14 @@ impl QueryResultStream {
     /// deadline; only clean EOF promotes it to this stream's public result.
     ///
     /// # Errors
-    /// Returns [`ValaSdkError::Protocol`] when any frame follows the terminal,
+    /// Returns [`BifrostClientError::Protocol`] when any frame follows the terminal,
     /// the raw stream's own error unchanged when the body fails, and
-    /// [`ValaSdkError::IncompleteQueryStream`] when the deadline passes before
+    /// [`BifrostClientError::IncompleteQueryStream`] when the deadline passes before
     /// the body closes. Every one of those marks the body broken first.
     async fn finish_at_clean_eof(
         &mut self,
         terminal: QueryTerminalFrame,
-    ) -> Result<Option<RecordBatch>, ValaSdkError> {
+    ) -> Result<Option<RecordBatch>, BifrostClientError> {
         let remaining = self.remaining();
         let observed = tokio::time::timeout(remaining, self.raw.next_decoded_frame()).await;
         self.encoded_bytes = self.raw.received_bytes();
@@ -821,11 +826,11 @@ impl QueryResultStream {
                 self.settlement = StreamSettlement::Settled;
                 Ok(None)
             }
-            Ok(Ok(Some(_))) => Err(self.mark_broken(ValaSdkError::Protocol(
+            Ok(Ok(Some(_))) => Err(self.mark_broken(BifrostClientError::Protocol(
                 "a frame followed the query terminal".to_owned(),
             ))),
             Ok(Err(error)) => Err(self.mark_broken(error)),
-            Err(_) => Err(self.mark_broken(ValaSdkError::IncompleteQueryStream)),
+            Err(_) => Err(self.mark_broken(BifrostClientError::IncompleteQueryStream)),
         }
     }
 
@@ -837,7 +842,7 @@ impl QueryResultStream {
     ///
     /// # Errors
     ///
-    /// Returns a stream error or [`ValaSdkError::ResultTooLarge`] before
+    /// Returns a stream error or [`BifrostClientError::ResultTooLarge`] before
     /// retaining a batch that would exceed either ceiling.
     ///
     /// # Cancellation
@@ -846,7 +851,7 @@ impl QueryResultStream {
     pub async fn collect_bounded(
         mut self,
         limits: CollectedQueryLimits,
-    ) -> Result<CollectedQueryResult, ValaSdkError> {
+    ) -> Result<CollectedQueryResult, BifrostClientError> {
         let mut batches = Vec::new();
         let mut rows = 0usize;
         loop {
@@ -855,20 +860,24 @@ impl QueryResultStream {
                 Err(error) => return Err(self.settle_with(error).await),
             };
             if self.encoded_bytes > limits.max_encoded_bytes {
-                return Err(self.settle_with(ValaSdkError::ResultTooLarge).await);
+                return Err(self.settle_with(BifrostClientError::ResultTooLarge).await);
             }
             let Some(batch) = batch else {
                 break;
             };
             let next_rows = match rows.checked_add(batch.num_rows()) {
                 Some(next_rows) if next_rows <= limits.max_rows => next_rows,
-                _ => return Err(self.settle_with(ValaSdkError::ResultTooLarge).await),
+                _ => return Err(self.settle_with(BifrostClientError::ResultTooLarge).await),
             };
             rows = next_rows;
             batches.push(batch);
         }
-        let terminal = self.terminal.ok_or(ValaSdkError::IncompleteQueryStream)?;
-        let schema = self.schema.ok_or(ValaSdkError::IncompleteQueryStream)?;
+        let terminal = self
+            .terminal
+            .ok_or(BifrostClientError::IncompleteQueryStream)?;
+        let schema = self
+            .schema
+            .ok_or(BifrostClientError::IncompleteQueryStream)?;
         Ok(CollectedQueryResult {
             schema,
             batches,
@@ -884,7 +893,7 @@ impl QueryResultStream {
     /// client's obligation to the server, not a second failure to report. A
     /// decode or transport error also means the body can no longer be trusted,
     /// so it downgrades settlement to the status-polling proof before running.
-    async fn settle_with(&mut self, error: ValaSdkError) -> ValaSdkError {
+    async fn settle_with(&mut self, error: BifrostClientError) -> BifrostClientError {
         let error = self.mark_broken(error);
         self.settle().await;
         error
@@ -1134,30 +1143,30 @@ impl QueryIpcDecoder {
     ///
     /// # Errors
     ///
-    /// Returns [`ValaSdkError::Protocol`] for a duplicate or post-terminal
-    /// schema, and [`ValaSdkError::Arrow`] when the fragment is not exactly one
+    /// Returns [`BifrostClientError::Protocol`] for a duplicate or post-terminal
+    /// schema, and [`BifrostClientError::Arrow`] when the fragment is not exactly one
     /// schema message.
-    fn accept_schema(&mut self, bytes: &[u8]) -> Result<SchemaRef, ValaSdkError> {
+    fn accept_schema(&mut self, bytes: &[u8]) -> Result<SchemaRef, BifrostClientError> {
         if self.schema.is_some() || self.eos_accepted {
-            return Err(ValaSdkError::Protocol(
+            return Err(BifrostClientError::Protocol(
                 "query stream carries more than one schema frame".to_owned(),
             ));
         }
         let mut prefix = StreamReader::try_new(Cursor::new(bytes), None)
-            .map_err(|error| ValaSdkError::Arrow(error.to_string()))?;
+            .map_err(|error| BifrostClientError::Arrow(error.to_string()))?;
         let schema = prefix.schema();
         if prefix
             .next()
             .transpose()
-            .map_err(|error| ValaSdkError::Arrow(error.to_string()))?
+            .map_err(|error| BifrostClientError::Arrow(error.to_string()))?
             .is_some()
         {
-            return Err(ValaSdkError::Arrow(
+            return Err(BifrostClientError::Arrow(
                 "schema frame unexpectedly contains a record batch".to_owned(),
             ));
         }
         if self.feed(bytes)?.is_some() {
-            return Err(ValaSdkError::Arrow(
+            return Err(BifrostClientError::Arrow(
                 "schema frame unexpectedly contains a record batch".to_owned(),
             ));
         }
@@ -1169,25 +1178,24 @@ impl QueryIpcDecoder {
     ///
     /// # Errors
     ///
-    /// Returns [`ValaSdkError::Protocol`] before the schema or after
-    /// end-of-stream, and [`ValaSdkError::Arrow`] when the fragment does not
+    /// Returns [`BifrostClientError::Protocol`] before the schema or after
+    /// end-of-stream, and [`BifrostClientError::Arrow`] when the fragment does not
     /// decode to exactly one record batch matching the stream schema.
-    fn accept_batch(&mut self, bytes: &[u8]) -> Result<RecordBatch, ValaSdkError> {
-        let expected = self
-            .schema
-            .as_ref()
-            .ok_or_else(|| ValaSdkError::Protocol("batch arrived before schema".to_owned()))?;
+    fn accept_batch(&mut self, bytes: &[u8]) -> Result<RecordBatch, BifrostClientError> {
+        let expected = self.schema.as_ref().ok_or_else(|| {
+            BifrostClientError::Protocol("batch arrived before schema".to_owned())
+        })?;
         if self.eos_accepted {
-            return Err(ValaSdkError::Protocol(
+            return Err(BifrostClientError::Protocol(
                 "query stream frame arrived after its end-of-stream".to_owned(),
             ));
         }
         let expected = SchemaRef::clone(expected);
         let batch = self.feed(bytes)?.ok_or_else(|| {
-            ValaSdkError::Arrow("batch frame contains no record batch".to_owned())
+            BifrostClientError::Arrow("batch frame contains no record batch".to_owned())
         })?;
         if batch.schema().as_ref() != expected.as_ref() {
-            return Err(ValaSdkError::Arrow(
+            return Err(BifrostClientError::Arrow(
                 "batch schema does not match the initial schema".to_owned(),
             ));
         }
@@ -1198,28 +1206,28 @@ impl QueryIpcDecoder {
     ///
     /// # Errors
     ///
-    /// Returns [`ValaSdkError::Protocol`] before the schema or on a second
-    /// end-of-stream, and [`ValaSdkError::Arrow`] when the delta is absent,
+    /// Returns [`BifrostClientError::Protocol`] before the schema or on a second
+    /// end-of-stream, and [`BifrostClientError::Arrow`] when the delta is absent,
     /// carries a record batch, or leaves a partial message behind.
-    fn accept_eos(&mut self, bytes: &[u8]) -> Result<(), ValaSdkError> {
+    fn accept_eos(&mut self, bytes: &[u8]) -> Result<(), BifrostClientError> {
         if self.schema.is_none() || self.eos_accepted {
-            return Err(ValaSdkError::Protocol(
+            return Err(BifrostClientError::Protocol(
                 "query stream end-of-stream is out of order".to_owned(),
             ));
         }
         if bytes.is_empty() {
-            return Err(ValaSdkError::Arrow(
+            return Err(BifrostClientError::Arrow(
                 "successful query terminal carries no Arrow IPC end-of-stream".to_owned(),
             ));
         }
         if self.feed(bytes)?.is_some() {
-            return Err(ValaSdkError::Arrow(
+            return Err(BifrostClientError::Arrow(
                 "query end-of-stream unexpectedly contains a record batch".to_owned(),
             ));
         }
         self.decoder
             .finish()
-            .map_err(|error| ValaSdkError::Arrow(error.to_string()))?;
+            .map_err(|error| BifrostClientError::Arrow(error.to_string()))?;
         self.eos_accepted = true;
         Ok(())
     }
@@ -1243,9 +1251,9 @@ impl QueryIpcDecoder {
     ///
     /// # Errors
     ///
-    /// Returns [`ValaSdkError::Arrow`] when Arrow rejects the bytes or the
+    /// Returns [`BifrostClientError::Arrow`] when Arrow rejects the bytes or the
     /// fragment yields more than one record batch.
-    fn feed(&mut self, bytes: &[u8]) -> Result<Option<RecordBatch>, ValaSdkError> {
+    fn feed(&mut self, bytes: &[u8]) -> Result<Option<RecordBatch>, BifrostClientError> {
         self.peak_pending_frame_bytes = self.peak_pending_frame_bytes.max(bytes.len());
         self.total_fragment_bytes = self.total_fragment_bytes.saturating_add(bytes.len());
         let mut buffer = arrow::buffer::Buffer::from_vec(bytes.to_vec());
@@ -1254,11 +1262,11 @@ impl QueryIpcDecoder {
             match self
                 .decoder
                 .decode(&mut buffer)
-                .map_err(|error| ValaSdkError::Arrow(error.to_string()))?
+                .map_err(|error| BifrostClientError::Arrow(error.to_string()))?
             {
                 Some(batch) if decoded.is_none() => decoded = Some(batch),
                 Some(_) => {
-                    return Err(ValaSdkError::Arrow(
+                    return Err(BifrostClientError::Arrow(
                         "batch frame contains more than one record batch".to_owned(),
                     ));
                 }
@@ -1484,7 +1492,7 @@ mod tests {
             })
             .await
             .expect_err("the row ceiling refuses this result");
-        assert!(matches!(error, ValaSdkError::ResultTooLarge));
+        assert!(matches!(error, BifrostClientError::ResultTooLarge));
         assert_eq!(
             counts.cancels.load(Ordering::Acquire),
             1,
@@ -1509,7 +1517,10 @@ mod tests {
             .await
             .expect_err("an undecodable batch fails");
         assert!(
-            matches!(error, ValaSdkError::Protocol(_) | ValaSdkError::Arrow(_)),
+            matches!(
+                error,
+                BifrostClientError::Protocol(_) | BifrostClientError::Arrow(_)
+            ),
             "settlement never replaces the originating error: {error:?}"
         );
         assert_eq!(counts.cancels.load(Ordering::Acquire), 1);
@@ -1600,7 +1611,7 @@ mod tests {
             .await
             .expect_err("a truncated body is a transport failure");
         assert!(
-            matches!(error, ValaSdkError::Transport(_)),
+            matches!(error, BifrostClientError::Transport(_)),
             "the caller keeps its transport error: {error:?}"
         );
         assert_eq!(truncated.settlement, StreamSettlement::Broken);
@@ -1658,7 +1669,10 @@ mod tests {
                 .await
                 .expect_err("{label} after a terminal is refused");
             assert!(
-                matches!(error, ValaSdkError::Protocol(_) | ValaSdkError::Arrow(_)),
+                matches!(
+                    error,
+                    BifrostClientError::Protocol(_) | BifrostClientError::Arrow(_)
+                ),
                 "{label} after a terminal is a protocol failure: {error:?}"
             );
             assert_eq!(
@@ -1975,7 +1989,8 @@ mod tests {
             .next_frame()
             .await
             .expect_err("truncated body is a transport failure");
-        let ValaSdkError::Transport(WyrdError::UpstreamFailure { details, .. }) = error else {
+        let BifrostClientError::Transport(WyrdError::UpstreamFailure { details, .. }) = error
+        else {
             panic!("body failure must retain the transport projection");
         };
         assert_eq!(details["transport"], "http");
@@ -1989,8 +2004,8 @@ mod tests {
 
     /// The catalog projection preserves typed transport and terminal diagnostics.
     #[test]
-    fn vala_sdk_error_projects_onto_the_catalog() {
-        let transport = ValaSdkError::Transport(WyrdError::PermissionDeniedRbac {
+    fn bifrost_client_error_projects_onto_the_catalog() {
+        let transport = BifrostClientError::Transport(WyrdError::PermissionDeniedRbac {
             message: "query denied".to_owned(),
             details: serde_json::json!({"required_scope": "bifrost_query:read"}),
         });
@@ -2009,7 +2024,7 @@ mod tests {
             .expect("failed terminal has error")
             .detail =
             Some(QueryErrorDetail::new("source failed").expect("fixed detail is scrubbed"));
-        let failed = ValaSdkError::FailedTerminal {
+        let failed = BifrostClientError::FailedTerminal {
             terminal: terminal.clone(),
         };
         assert_eq!(
@@ -2019,40 +2034,43 @@ mod tests {
 
         for (error, code) in [
             (
-                ValaSdkError::Protocol("safe protocol detail".to_owned()),
+                BifrostClientError::Protocol("safe protocol detail".to_owned()),
                 "WYRD_VALA_502_QUERY_STREAM_PROTOCOL",
             ),
             (
-                ValaSdkError::Arrow("safe Arrow detail".to_owned()),
+                BifrostClientError::Arrow("safe Arrow detail".to_owned()),
                 "WYRD_VALA_502_QUERY_STREAM_PROTOCOL",
             ),
             (
-                ValaSdkError::IncompleteQueryStream,
+                BifrostClientError::IncompleteQueryStream,
                 "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE",
             ),
             (
-                ValaSdkError::ResultTooLarge,
+                BifrostClientError::ResultTooLarge,
                 "WYRD_VALA_413_QUERY_RESULT_TOO_LARGE",
             ),
-            (ValaSdkError::NoActiveTable, "WYRD_VALA_412_NO_ACTIVE_TABLE"),
             (
-                ValaSdkError::RowDeserialization("row does not fit".to_owned()),
+                BifrostClientError::NoActiveTable,
+                "WYRD_VALA_412_NO_ACTIVE_TABLE",
+            ),
+            (
+                BifrostClientError::RowDeserialization("row does not fit".to_owned()),
                 "WYRD_CLIENT_422_ROW_DESERIALIZATION",
             ),
             (
-                ValaSdkError::Queue(WyrdQueueError::QueueFull),
+                BifrostClientError::Queue(WyrdQueueError::QueueFull),
                 "WYRD_CLIENT_429_QUEUE_FULL",
             ),
             (
-                ValaSdkError::Queue(WyrdQueueError::FlushTimeout),
+                BifrostClientError::Queue(WyrdQueueError::FlushTimeout),
                 "WYRD_CLIENT_504_FLUSH_TIMEOUT",
             ),
             (
-                ValaSdkError::Queue(WyrdQueueError::PayloadTooLarge),
+                BifrostClientError::Queue(WyrdQueueError::PayloadTooLarge),
                 "WYRD_CLIENT_413_PAYLOAD_TOO_LARGE",
             ),
             (
-                ValaSdkError::Client(WyrdClientError::NoCredentials),
+                BifrostClientError::Client(WyrdClientError::NoCredentials),
                 "WYRD_CLIENT_401_NO_CREDENTIALS",
             ),
         ] {
@@ -2121,7 +2139,7 @@ mod tests {
             error.code = code;
             error.detail =
                 Some(QueryErrorDetail::new("source failed").expect("detail is scrubbed"));
-            let projected = WyrdError::from(&ValaSdkError::FailedTerminal { terminal });
+            let projected = WyrdError::from(&BifrostClientError::FailedTerminal { terminal });
             assert_eq!(projected.code(), expected.code(), "code for {code:?}");
             assert_eq!(projected.status(), expected.status(), "status for {code:?}");
             assert_eq!(projected.title(), expected.title(), "title for {code:?}");
@@ -2306,14 +2324,14 @@ mod tests {
 
     /// Builds a query client bound to one base URL with a static credential.
     fn client_for(base_url: &str) -> QueryClient {
-        let config = wyrd_client::config::ClientConfig {
+        let config = crate::config::ClientConfig {
             credential: Some(secrecy::SecretString::from("test-key")),
-            http: wyrd_client::transport::config::HttpConfig {
+            http: crate::transport::config::HttpConfig {
                 base_url: base_url.to_owned(),
                 timeout_ms: 2_000,
-                ..wyrd_client::transport::config::HttpConfig::default()
+                ..crate::transport::config::HttpConfig::default()
             },
-            ..wyrd_client::config::ClientConfig::default()
+            ..crate::config::ClientConfig::default()
         };
         QueryClient::new(&WyrdClient::with_config(config).expect("static config builds a client"))
     }
@@ -2363,7 +2381,7 @@ mod tests {
         let mut stream = RawQueryStream::new(body, VisibilityMode::PublishedOnly);
         assert!(matches!(
             stream.next_frame().await,
-            Err(ValaSdkError::IncompleteQueryStream)
+            Err(BifrostClientError::IncompleteQueryStream)
         ));
     }
 
@@ -2436,7 +2454,10 @@ mod tests {
                     tokio::time::timeout(std::time::Duration::from_secs(1), result.next_batch())
                         .await
                         .expect("resumption remains bounded by the original deadline");
-                assert!(matches!(resumed, Err(ValaSdkError::IncompleteQueryStream)));
+                assert!(matches!(
+                    resumed,
+                    Err(BifrostClientError::IncompleteQueryStream)
+                ));
                 assert_eq!(result.deadline_ms(), deadline);
                 assert_eq!(result.settlement, StreamSettlement::Broken);
                 assert!(result.terminal().is_none());
@@ -2450,7 +2471,7 @@ mod tests {
                     .expect("late frame fits");
                 assert!(matches!(
                     result.next_batch().await,
-                    Err(ValaSdkError::Protocol(_))
+                    Err(BifrostClientError::Protocol(_))
                 ));
                 assert_eq!(result.settlement, StreamSettlement::Broken);
                 assert!(result.terminal().is_none());
@@ -2614,7 +2635,7 @@ mod tests {
             .next_batch()
             .await
             .expect_err("failed terminal rejects");
-        assert!(matches!(error, ValaSdkError::FailedTerminal { .. }));
+        assert!(matches!(error, BifrostClientError::FailedTerminal { .. }));
         assert_eq!(
             result.terminal().expect("failed terminal retained").outcome,
             QueryTerminalOutcome::Failed
@@ -2662,7 +2683,7 @@ mod tests {
         let mut result = result_stream(chunks, VisibilityMode::PublishedOnly);
         assert!(matches!(
             result.next_batch().await,
-            Err(ValaSdkError::Arrow(_))
+            Err(BifrostClientError::Arrow(_))
         ));
     }
 
@@ -2759,7 +2780,7 @@ mod tests {
             result_stream(missing_eos, VisibilityMode::PublishedOnly)
                 .next_batch()
                 .await,
-            Err(ValaSdkError::Protocol(_)),
+            Err(BifrostClientError::Protocol(_)),
         ));
 
         let orphan_batch = vec![encoded(QueryStreamFrame::Batch(QueryBatchFrame {
@@ -2769,7 +2790,7 @@ mod tests {
             result_stream(orphan_batch, VisibilityMode::PublishedOnly)
                 .next_batch()
                 .await,
-            Err(ValaSdkError::Protocol(_))
+            Err(BifrostClientError::Protocol(_))
         ));
 
         let (prefix, closing) = empty_ipc(&schema);
@@ -2820,7 +2841,7 @@ mod tests {
                 max_encoded_bytes: usize::MAX,
             })
             .await;
-        assert!(matches!(rows, Err(ValaSdkError::ResultTooLarge)));
+        assert!(matches!(rows, Err(BifrostClientError::ResultTooLarge)));
 
         let bytes = result_stream(chunks, VisibilityMode::PublishedOnly)
             .collect_bounded(CollectedQueryLimits {
@@ -2828,7 +2849,7 @@ mod tests {
                 max_encoded_bytes: batch.len().saturating_sub(1),
             })
             .await;
-        assert!(matches!(bytes, Err(ValaSdkError::ResultTooLarge)));
+        assert!(matches!(bytes, Err(BifrostClientError::ResultTooLarge)));
     }
 
     /// Schema and framing bytes count toward the ceiling even with no result batches.
@@ -2866,7 +2887,7 @@ mod tests {
                 max_encoded_bytes: encoded_bytes.saturating_sub(1),
             })
             .await;
-        assert!(matches!(rejected, Err(ValaSdkError::ResultTooLarge)));
+        assert!(matches!(rejected, Err(BifrostClientError::ResultTooLarge)));
 
         let accepted = result_stream(chunks, VisibilityMode::PublishedOnly)
             .collect_bounded(CollectedQueryLimits {

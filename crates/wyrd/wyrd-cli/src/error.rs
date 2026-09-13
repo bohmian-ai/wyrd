@@ -466,9 +466,9 @@ impl From<WyrdCliError> for CliBoundaryError {
     }
 }
 
-impl From<vala_sdk::ValaSdkError> for CliBoundaryError {
+impl From<wyrd_client::bifrost::BifrostClientError> for CliBoundaryError {
     /// Projects an originating query SDK error onto the shared catalog.
-    fn from(error: vala_sdk::ValaSdkError) -> Self {
+    fn from(error: wyrd_client::bifrost::BifrostClientError) -> Self {
         Self::Query(wyrd_spec::error::WyrdError::from(error))
     }
 }
@@ -556,7 +556,7 @@ mod tests {
     /// Query boundary errors retain source metadata and bypass the CLI query catalog.
     #[test]
     fn query_boundary_preserves_originating_problem_metadata() {
-        let error = CliBoundaryError::from(vala_sdk::ValaSdkError::Transport(
+        let error = CliBoundaryError::from(wyrd_client::bifrost::BifrostClientError::Transport(
             WyrdError::PermissionDeniedRbac {
                 message: "query denied".to_owned(),
                 details: serde_json::json!({"required_scope": "bifrost_query:read"}),

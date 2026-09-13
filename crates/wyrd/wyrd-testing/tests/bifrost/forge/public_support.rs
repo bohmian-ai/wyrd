@@ -245,7 +245,9 @@ pub(crate) async fn read_managed_rows(
     table: &str,
 ) -> Vec<ManagedRow> {
     let sql = format!("SELECT wyrd_batch_id, wyrd_row_ordinal, value FROM {table}");
-    let mut stream = vala_sdk::query::QueryClient::new(client)
+    let mut stream = wyrd_client::Bifrost::query_only(client)
+        .query_client()
+        .clone()
         .query(&strict_fused(sql.clone()))
         .await
         .unwrap_or_else(|error| panic!("public query `{sql}` starts: {error}"));
@@ -323,9 +325,11 @@ fn strict_fused(sql: String) -> wyrd_spec::vala::api::BifrostQueryRequest {
 pub(crate) async fn try_read(
     client: &wyrd_client::WyrdClient,
     table: &str,
-) -> Result<Vec<ManagedRow>, vala_sdk::ValaSdkError> {
+) -> Result<Vec<ManagedRow>, wyrd_client::bifrost::BifrostClientError> {
     let sql = format!("SELECT wyrd_batch_id, wyrd_row_ordinal, value FROM {table}");
-    let mut stream = vala_sdk::query::QueryClient::new(client)
+    let mut stream = wyrd_client::Bifrost::query_only(client)
+        .query_client()
+        .clone()
         .query(&strict_fused(sql))
         .await?;
     let mut rows = Vec::new();
@@ -362,7 +366,8 @@ pub(crate) async fn assert_tenant_scoped_not_found(
     assert!(
         matches!(
             error,
-            vala_sdk::ValaSdkError::Transport(_) | vala_sdk::ValaSdkError::FailedTerminal { .. }
+            wyrd_client::bifrost::BifrostClientError::Transport(_)
+                | wyrd_client::bifrost::BifrostClientError::FailedTerminal { .. }
         ),
         "{context}: the refusal is a projection of a server decision, not a local \
          stream failure: {error:?}"

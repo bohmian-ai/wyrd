@@ -141,9 +141,8 @@ Locked cross-cutting decisions that any contributor must honor:
 - `crates/skald/*`: model/provider runtime, prompt/cache abstractions,
   orchestration, provider-specific wire handling.
 - `crates/vala/*`: observability, evaluation, drift, tracing, archival query,
-  OLAP, and background data-plane behavior. Rust-native Vala client mechanics
-  may live in `vala-sdk`, but `wyrd-client` owns their SDK-facing composition
-  and public re-exports.
+  OLAP, and background data-plane behavior. Bifrost client mechanics live in
+  `wyrd_client::bifrost`, never in a Vala crate.
 - `crates/wyrd/*`: server, CLI, MCP, application integration, UI host.
 - `crates/shared/wyrd-client`: shared client implementations and the sole
   SDK-facing Rust client surface, including composition of Cards, WyrdState,

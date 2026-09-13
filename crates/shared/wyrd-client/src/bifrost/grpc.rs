@@ -2,19 +2,19 @@
 
 use std::time::Duration;
 
+use crate::WyrdClient;
+use crate::auth::AuthError;
+use crate::error::{WyrdClientError, from_grpc_status};
+use crate::transport::GrpcConnection;
 use async_trait::async_trait;
 use bytes::Bytes;
 use uuid::{Uuid, Version};
-use wyrd_client::WyrdClient;
-use wyrd_client::auth::AuthError;
-use wyrd_client::error::{WyrdClientError, from_grpc_status};
-use wyrd_client::transport::GrpcConnection;
 use wyrd_spec::error::WyrdError;
 use wyrd_tonic::tonic::{Code, Request, Status, metadata::MetadataValue};
 use wyrd_tonic::wyrd::v1::InsertBatchRequest;
 use wyrd_tonic::wyrd::v1::bifrost_ingest_service_client::BifrostIngestServiceClient;
 
-use crate::sink::IngestTransport;
+use crate::bifrost::sink::IngestTransport;
 use wyrd_queue::{ClientByteGuard, DurableBatchAck, SealedBatch, SinkError};
 
 /// Maximum Arrow IPC payload for one Bifrost batch after decompression.
@@ -339,12 +339,12 @@ mod tests {
 
     use wyrd_queue::{ClientByteBudget, OwnedIpcBytes, QueueConfig};
 
+    use crate::auth::AuthMiddleware;
+    use crate::config::ClientConfig;
+    use crate::transport::HttpTransport;
+    use crate::transport::credential::ResolvedCredential;
     use secrecy::SecretString;
     use tokio::sync::Mutex;
-    use wyrd_client::auth::AuthMiddleware;
-    use wyrd_client::config::ClientConfig;
-    use wyrd_client::transport::HttpTransport;
-    use wyrd_client::transport::credential::ResolvedCredential;
     use wyrd_tonic::tonic::Response;
     use wyrd_tonic::tonic::transport::Server;
     use wyrd_tonic::wyrd::v1::InsertBatchResponse;
@@ -471,10 +471,10 @@ mod tests {
         tokio::task::yield_now().await;
 
         let config = ClientConfig {
-            grpc: wyrd_client::transport::GrpcConfig {
+            grpc: crate::transport::GrpcConfig {
                 endpoint: format!("http://{address}"),
                 connect_retries: 0,
-                ..wyrd_client::transport::GrpcConfig::default()
+                ..crate::transport::GrpcConfig::default()
             },
             ..ClientConfig::default()
         };

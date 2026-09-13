@@ -180,12 +180,12 @@ impl AuthMiddleware {
     /// The credential this middleware authenticates with.
     ///
     /// Exposed so a client-tier owner can fingerprint the secret material it
-    /// is already bound to — `vala-sdk`'s [`ClientScope`] keys its producer
+    /// is already bound to — the Bifrost [`ClientScope`] keys its producer
     /// pool on `(base URL, credential fingerprint)` — without re-resolving the
     /// credential chain and risking a different answer than the live transport
     /// uses.
     ///
-    /// [`ClientScope`]: https://docs.rs/vala-sdk
+    /// [`ClientScope`]: crate::bifrost::ClientScope
     #[must_use]
     pub fn credential(&self) -> &ResolvedCredential {
         &self.credential

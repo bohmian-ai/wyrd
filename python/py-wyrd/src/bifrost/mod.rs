@@ -1,10 +1,10 @@
-//! PyO3 boundary for the one Bifrost client.
+//! `PyO3` boundary for the one Bifrost client.
 //!
 //! Every method converts its Python inputs to native contract types at the edge
-//! — a JSON-Schema document or Arrow IPC schema to [`crate::TableConfig`], a
+//! — a JSON-Schema document or Arrow IPC schema to [`wyrd_client::bifrost::TableConfig`], a
 //! card-ref string to [`wyrd_spec::reference::CardRef`] — and then calls the
 //! Rust-native client. No queue, schema-mapping, registration, or query logic
-//! is re-implemented here; the pool key and [`crate::ClientScope`] stay opaque,
+//! is re-implemented here; the pool key and [`wyrd_client::bifrost::ClientScope`] stay opaque,
 //! and Python never names them.
 //!
 //! Every entry point is blocking and releases the GIL. The public package's
@@ -29,19 +29,18 @@ use wyrd_spec::vala::api::{
 use wyrd_spec::vala::ids::RunId;
 use wyrd_utils::py::{WyrdPyError, WyrdPyResult, json_to_pyobject};
 
-use crate::native_owner::NativeStreamOwner;
-use crate::table::Correlation;
-use crate::{QueryClient, ValaSdkError, client_from_options};
+use wyrd_client::bifrost::Correlation;
+use wyrd_client::bifrost::{
+    BifrostClientError, QueryClient, QueryResultStream, client_from_options,
+};
 
-/// Widens one SDK failure into the shared Wyrd Python boundary error.
+/// Widens one Bifrost client failure into the shared Wyrd Python boundary error.
 ///
-/// Declared here so every `#[pymethods]` body can use `?` directly on a
-/// [`ValaSdkError`]: the catalog projection stays the crate's single public
-/// mapping and this only widens it for `wyrd_utils`' sole final projector.
-impl From<ValaSdkError> for WyrdPyError {
-    fn from(error: ValaSdkError) -> Self {
-        Self::from(WyrdError::from(error))
-    }
+/// The catalog projection (`WyrdError::from`) stays the client crate's single
+/// public mapping; this only routes it into `wyrd_utils`' sole final projector.
+/// A free function because both types live in foreign crates.
+fn client_error(error: BifrostClientError) -> WyrdPyError {
+    WyrdPyError::from(WyrdError::from(error))
 }
 
 /// Builds one boundary validation failure for a rejected Python argument.
@@ -78,7 +77,7 @@ fn boundary_internal(detail: impl Into<String>) -> WyrdPyError {
     })
 }
 
-/// Python-facing [`crate::TableConfig`]: one Bifrost table's identity, declared
+/// Python-facing [`wyrd_client::bifrost::TableConfig`]: one Bifrost table's identity, declared
 /// user columns, and requested physical layout.
 ///
 /// The schema arrives either as a JSON Schema document — what
@@ -90,7 +89,7 @@ fn boundary_internal(detail: impl Into<String>) -> WyrdPyError {
 #[derive(Clone)]
 pub struct PyTableConfig {
     /// The native config every write and register call reads.
-    inner: crate::TableConfig,
+    inner: wyrd_client::bifrost::TableConfig,
 }
 
 #[pymethods]
@@ -115,7 +114,8 @@ impl PyTableConfig {
     ) -> WyrdPyResult<Self> {
         let schema: serde_json::Value = serde_json::from_str(schema_json)
             .map_err(|error| invalid_argument("schema_json", error))?;
-        let config = crate::TableConfig::from_json_schema(table, &schema)?;
+        let config = wyrd_client::bifrost::TableConfig::from_json_schema(table, &schema)
+            .map_err(client_error)?;
         Ok(Self {
             inner: apply_layout(config, layout_json)?,
         })
@@ -140,7 +140,8 @@ impl PyTableConfig {
         layout_json: Option<&str>,
     ) -> WyrdPyResult<Self> {
         let schema = decode_schema_ipc(schema_ipc)?;
-        let config = crate::TableConfig::from_arrow(table, schema)?;
+        let config =
+            wyrd_client::bifrost::TableConfig::from_arrow(table, schema).map_err(client_error)?;
         Ok(Self {
             inner: apply_layout(config, layout_json)?,
         })
@@ -165,10 +166,13 @@ impl PyTableConfig {
         credential: Option<&str>,
         grpc_url: Option<&str>,
     ) -> WyrdPyResult<Self> {
-        let client = client_from_options(server_url, credential, grpc_url)?;
-        let inner = py.detach(|| {
-            wyrd_runtime::runtime().block_on(crate::TableConfig::describe(&client, table))
-        })?;
+        let client = client_from_options(server_url, credential, grpc_url).map_err(client_error)?;
+        let inner = py
+            .detach(|| {
+                wyrd_runtime::runtime()
+                    .block_on(wyrd_client::bifrost::TableConfig::describe(&client, table))
+            })
+            .map_err(client_error)?;
         Ok(Self { inner })
     }
 
@@ -209,7 +213,7 @@ impl PyTableConfig {
 #[pyclass(module = "wyrd._wyrd.bifrost", name = "QueryResult")]
 pub struct PyQueryResult {
     /// The native result every projection reads.
-    inner: crate::QueryResult,
+    inner: wyrd_client::bifrost::QueryResult,
 }
 
 #[pymethods]
@@ -220,7 +224,7 @@ impl PyQueryResult {
     ///
     /// Raises `WyrdError` when IPC encoding fails.
     fn to_ipc(&self) -> WyrdPyResult<Vec<u8>> {
-        Ok(self.inner.to_ipc()?)
+        self.inner.to_ipc().map_err(client_error)
     }
 
     /// The validated terminal frame, serialized.
@@ -241,7 +245,7 @@ impl PyQueryResult {
     }
 }
 
-/// Python-facing [`crate::Bifrost`]: query any authorized table, write to the
+/// Python-facing [`wyrd_client::bifrost::Bifrost`]: query any authorized table, write to the
 /// active one.
 ///
 /// Construction dials the ingest channel, so it performs IO; every transport
@@ -250,7 +254,7 @@ impl PyQueryResult {
 #[pyclass(module = "wyrd._wyrd.bifrost", name = "Bifrost")]
 pub struct Bifrost {
     /// The one native client both public Python facades drive.
-    handle: crate::Bifrost,
+    handle: wyrd_client::bifrost::Bifrost,
 }
 
 #[pymethods]
@@ -271,15 +275,19 @@ impl Bifrost {
         credential: Option<&str>,
         grpc_url: Option<&str>,
     ) -> WyrdPyResult<Self> {
-        let client = client_from_options(server_url, credential, grpc_url)?;
+        let client = client_from_options(server_url, credential, grpc_url).map_err(client_error)?;
         let table = table.map(|table| table.inner);
-        let handle = py.detach(|| {
-            wyrd_runtime::runtime().block_on(crate::Bifrost::connect_with_config(
-                &client,
-                table,
-                wyrd_queue::QueueConfig::default(),
-            ))
-        })?;
+        let handle = py
+            .detach(|| {
+                wyrd_runtime::runtime().block_on(
+                    wyrd_client::bifrost::Bifrost::connect_with_config(
+                        &client,
+                        table,
+                        wyrd_queue::QueueConfig::default(),
+                    ),
+                )
+            })
+            .map_err(client_error)?;
         Ok(Self { handle })
     }
 
@@ -291,8 +299,10 @@ impl Bifrost {
     /// exists with different columns, or for transport and authorization
     /// failures.
     fn register(&self, py: Python<'_>) -> WyrdPyResult<&'static str> {
-        let outcome = py.detach(|| wyrd_runtime::runtime().block_on(self.handle.register()))?;
-        Ok(crate::register_outcome_name(outcome))
+        let outcome = py
+            .detach(|| wyrd_runtime::runtime().block_on(self.handle.register()))
+            .map_err(client_error)?;
+        Ok(wyrd_client::bifrost::register_outcome_name(outcome))
     }
 
     /// Binds `table` as the write target, returning the previous binding.
@@ -308,7 +318,8 @@ impl Bifrost {
     ///
     /// As [`PyTableConfig::describe`].
     fn use_table_by_name(&self, py: Python<'_>, table: &str) -> WyrdPyResult<()> {
-        py.detach(|| wyrd_runtime::runtime().block_on(self.handle.use_table_by_name(table)))?;
+        py.detach(|| wyrd_runtime::runtime().block_on(self.handle.use_table_by_name(table)))
+            .map_err(client_error)?;
         Ok(())
     }
 
@@ -337,7 +348,8 @@ impl Bifrost {
         run_id: Option<String>,
     ) -> WyrdPyResult<()> {
         self.handle
-            .insert(row.as_bytes().to_vec(), correlation(card_ref, run_id)?)?;
+            .insert(row.as_bytes().to_vec(), correlation(card_ref, run_id)?)
+            .map_err(client_error)?;
         Ok(())
     }
 
@@ -358,7 +370,8 @@ impl Bifrost {
     #[pyo3(signature = (table, batch_ipc))]
     fn write_batch(&self, py: Python<'_>, table: &str, batch_ipc: &[u8]) -> WyrdPyResult<()> {
         let batch = decode_batch_ipc(batch_ipc)?;
-        py.detach(|| wyrd_runtime::runtime().block_on(self.handle.write_batch(table, &batch)))?;
+        py.detach(|| wyrd_runtime::runtime().block_on(self.handle.write_batch(table, &batch)))
+            .map_err(client_error)?;
         Ok(())
     }
 
@@ -369,7 +382,8 @@ impl Bifrost {
     /// Raises `WyrdError` carrying the first producer or sink failure after
     /// every producer has been attempted.
     fn flush(&self, py: Python<'_>) -> WyrdPyResult<()> {
-        py.detach(|| wyrd_runtime::runtime().block_on(self.handle.flush()))?;
+        py.detach(|| wyrd_runtime::runtime().block_on(self.handle.flush()))
+            .map_err(client_error)?;
         Ok(())
     }
 
@@ -379,7 +393,8 @@ impl Bifrost {
     ///
     /// As [`Bifrost::flush`].
     fn shutdown(&self, py: Python<'_>) -> WyrdPyResult<()> {
-        py.detach(|| wyrd_runtime::runtime().block_on(self.handle.shutdown()))?;
+        py.detach(|| wyrd_runtime::runtime().block_on(self.handle.shutdown()))
+            .map_err(client_error)?;
         Ok(())
     }
 
@@ -392,7 +407,9 @@ impl Bifrost {
     /// code for invalid SQL, the query floor's refusal, or transport and
     /// authorization failures.
     fn sql(&self, py: Python<'_>, query: &str) -> WyrdPyResult<PyQueryResult> {
-        let inner = py.detach(|| wyrd_runtime::runtime().block_on(self.handle.sql(query)))?;
+        let inner = py
+            .detach(|| wyrd_runtime::runtime().block_on(self.handle.sql(query)))
+            .map_err(client_error)?;
         Ok(PyQueryResult { inner })
     }
 
@@ -417,14 +434,14 @@ impl Bifrost {
             freshness: parse_freshness(freshness)?,
             deadline_ms,
         };
-        let stream = py.detach(|| {
-            wyrd_runtime::runtime().block_on(self.handle.query_client().query(&request))
-        })?;
+        let stream = py
+            .detach(|| wyrd_runtime::runtime().block_on(self.handle.query_client().query(&request)))
+            .map_err(client_error)?;
         let request_id = stream.request_id().as_str().to_owned();
         Ok(PyBifrostQueryStream {
             request_id,
             consumer: Mutex::new(()),
-            stream: Mutex::new(Some(NativeStreamOwner::Production(Box::new(stream)))),
+            stream: Mutex::new(Some(Box::new(stream))),
             poll_abort: Mutex::new(PollAbortState::new()),
             terminal_json: Mutex::new(None),
         })
@@ -436,8 +453,9 @@ impl Bifrost {
     ///
     /// Raises `WyrdError` for transport or server failures.
     fn running(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
-        let queries =
-            py.detach(|| wyrd_runtime::runtime().block_on(self.query_client().running()))?;
+        let queries = py
+            .detach(|| wyrd_runtime::runtime().block_on(self.query_client().running()))
+            .map_err(client_error)?;
         to_python_json(py, serde_json::to_value(queries))
     }
 
@@ -447,9 +465,10 @@ impl Bifrost {
     ///
     /// Raises `WyrdError` for malformed IDs, transport, or server failures.
     fn status(&self, py: Python<'_>, request_id: &str) -> WyrdPyResult<Py<PyAny>> {
-        let request_id = parse_query_request_id(request_id)?;
+        let request_id = parse_query_request_id(request_id).map_err(client_error)?;
         let summary = py
-            .detach(|| wyrd_runtime::runtime().block_on(self.query_client().status(&request_id)))?;
+            .detach(|| wyrd_runtime::runtime().block_on(self.query_client().status(&request_id)))
+            .map_err(client_error)?;
         to_python_json(py, serde_json::to_value(summary))
     }
 
@@ -459,9 +478,10 @@ impl Bifrost {
     ///
     /// As [`Bifrost::status`].
     fn cancel(&self, py: Python<'_>, request_id: &str) -> WyrdPyResult<Py<PyAny>> {
-        let request_id = parse_query_request_id(request_id)?;
+        let request_id = parse_query_request_id(request_id).map_err(client_error)?;
         let response = py
-            .detach(|| wyrd_runtime::runtime().block_on(self.query_client().cancel(&request_id)))?;
+            .detach(|| wyrd_runtime::runtime().block_on(self.query_client().cancel(&request_id)))
+            .map_err(client_error)?;
         to_python_json(py, serde_json::to_value(response))
     }
 
@@ -476,9 +496,12 @@ impl Bifrost {
         namespace: &str,
         name: &str,
     ) -> WyrdPyResult<Py<PyAny>> {
-        let description = py.detach(|| {
-            wyrd_runtime::runtime().block_on(self.query_client().describe_table(namespace, name))
-        })?;
+        let description = py
+            .detach(|| {
+                wyrd_runtime::runtime()
+                    .block_on(self.query_client().describe_table(namespace, name))
+            })
+            .map_err(client_error)?;
         to_python_json(py, serde_json::to_value(description))
     }
 
@@ -514,9 +537,9 @@ impl Bifrost {
 /// Returns the stable Wyrd validation error when the text is not one
 /// `PhysicalLayoutWire`.
 fn apply_layout(
-    config: crate::TableConfig,
+    config: wyrd_client::bifrost::TableConfig,
     layout_json: Option<&str>,
-) -> WyrdPyResult<crate::TableConfig> {
+) -> WyrdPyResult<wyrd_client::bifrost::TableConfig> {
     match layout_json {
         None => Ok(config),
         Some(layout) => {
@@ -600,7 +623,7 @@ fn encode_schema_ipc(schema: &arrow_schema::SchemaRef) -> WyrdPyResult<Vec<u8>> 
 /// # Errors
 ///
 /// Returns the stable Wyrd internal error when the response cannot be
-/// serialized, and the intrinsic PyO3 error when Python object construction
+/// serialized, and the intrinsic `PyO3` error when Python object construction
 /// fails.
 fn to_python_json(
     py: Python<'_>,
@@ -615,9 +638,9 @@ fn to_python_json(
 /// # Errors
 ///
 /// Returns the stable Wyrd validation error when `value` is not a valid request ID.
-fn parse_query_request_id(value: &str) -> Result<RequestId, ValaSdkError> {
+fn parse_query_request_id(value: &str) -> Result<RequestId, BifrostClientError> {
     RequestId::parse(value).map_err(|error| {
-        ValaSdkError::Transport(WyrdError::Validation {
+        BifrostClientError::Transport(WyrdError::Validation {
             message: "request_id is invalid".to_owned(),
             details: serde_json::json!({"field": "request_id", "reason": error.to_string()}),
         })
@@ -632,7 +655,7 @@ pub struct PyBifrostQueryStream {
     /// Serializes consumers without blocking cancellation signalling.
     consumer: Mutex<()>,
     /// Rust stream removed on explicit close or after terminal completion.
-    stream: Mutex<Option<NativeStreamOwner>>,
+    stream: Mutex<Option<Box<QueryResultStream>>>,
     /// Short-held state for aborting the currently pending native poll.
     poll_abort: Mutex<PollAbortState>,
     /// Serialized terminal retained after the Rust stream is released.
@@ -692,12 +715,27 @@ enum NativePollOutcome {
     /// The SDK returned a structured query failure.
     QueryError {
         /// Structured SDK error projected after native ownership is released.
-        error: ValaSdkError,
+        error: BifrostClientError,
         /// Optional serialized terminal retained before projecting the error.
         terminal: Option<String>,
     },
     /// Local serialization or Arrow encoding failed.
     ProjectionError(String),
+}
+
+impl PyBifrostQueryStream {
+    /// Retains one serialized terminal so `terminal_json` can return it after the poll.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WyrdError` when the terminal lock is poisoned.
+    fn retain_terminal(&self, terminal: String) -> WyrdPyResult<()> {
+        *self
+            .terminal_json
+            .lock()
+            .map_err(|_| boundary_internal("terminal lock poisoned"))? = Some(terminal);
+        Ok(())
+    }
 }
 
 #[pymethods]
@@ -776,7 +814,7 @@ impl PyBifrostQueryStream {
                                     Ok(terminal) => NativePollOutcome::Complete(terminal),
                                     Err(error) if error == MISSING_TERMINAL => {
                                         NativePollOutcome::QueryError {
-                                            error: ValaSdkError::IncompleteQueryStream,
+                                            error: BifrostClientError::IncompleteQueryStream,
                                             terminal: None,
                                         }
                                     }
@@ -797,27 +835,20 @@ impl PyBifrostQueryStream {
             match outcome {
                 NativePollOutcome::Batch(batch) => Ok(Some(batch)),
                 NativePollOutcome::Complete(terminal) => {
-                    *self
-                        .terminal_json
-                        .lock()
-                        .map_err(|_| boundary_internal("terminal lock poisoned"))? = Some(terminal);
+                    self.retain_terminal(terminal)?;
                     Ok(None)
                 }
                 NativePollOutcome::Closed => {
                     Err(invalid_argument("stream", "query stream is closed"))
                 }
-                NativePollOutcome::Aborted => Err(WyrdPyError::from(ValaSdkError::Protocol(
+                NativePollOutcome::Aborted => Err(client_error(BifrostClientError::Protocol(
                     "query stream poll aborted".to_owned(),
                 ))),
                 NativePollOutcome::QueryError { error, terminal } => {
                     if let Some(terminal) = terminal {
-                        *self
-                            .terminal_json
-                            .lock()
-                            .map_err(|_| boundary_internal("terminal lock poisoned"))? =
-                            Some(terminal);
+                        self.retain_terminal(terminal)?;
                     }
-                    Err(WyrdPyError::from(error))
+                    Err(client_error(error))
                 }
                 NativePollOutcome::ProjectionError(error) => Err(boundary_internal(error)),
             }
@@ -865,8 +896,9 @@ impl PyBifrostQueryStream {
     ///
     /// Always raises `WyrdError` carrying
     /// `WYRD_VALA_502_QUERY_STREAM_INCOMPLETE`.
-    fn raise_incomplete_error(&self) -> WyrdPyResult<()> {
-        Err(WyrdPyError::from(ValaSdkError::IncompleteQueryStream))
+    #[staticmethod]
+    fn raise_incomplete_error() -> WyrdPyResult<()> {
+        Err(client_error(BifrostClientError::IncompleteQueryStream))
     }
 }
 
@@ -885,7 +917,7 @@ impl PyBifrostQueryStream {
 #[pyfunction]
 #[pyo3(signature = (bifrost, table, schema, row, card_ref=None, run_id=None))]
 fn record(
-    bifrost: PyRef<'_, Bifrost>,
+    bifrost: &Bound<'_, Bifrost>,
     table: &str,
     schema: &str,
     row: &str,
@@ -896,8 +928,8 @@ fn record(
         serde_json::from_str(schema).map_err(|error| invalid_argument("schema", error))?;
     let schema = wyrd_queue::json_schema_to_arrow(&schema_value)
         .map_err(|error| invalid_argument("schema", error))?;
-    crate::observe::record(
-        &bifrost.handle,
+    wyrd_client::bifrost::observe::record(
+        &bifrost.borrow().handle,
         table,
         &std::sync::Arc::new(schema),
         row.as_bytes().to_vec(),
@@ -909,7 +941,7 @@ fn record(
 /// Register the one Bifrost client and its result types on the supplied module.
 ///
 /// # Errors
-/// Returns PyO3 registration errors.
+/// Returns `PyO3` registration errors.
 pub fn register_bifrost(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Bifrost>()?;
     module.add_class::<PyTableConfig>()?;
@@ -921,7 +953,7 @@ pub fn register_bifrost(module: &Bound<'_, PyModule>) -> PyResult<()> {
 /// Register the `observe` fire-and-forget telemetry function on the module.
 ///
 /// # Errors
-/// Returns PyO3 registration errors.
+/// Returns `PyO3` registration errors.
 pub fn register_observe(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(record, module)?)?;
     Ok(())
@@ -961,7 +993,7 @@ fn parse_freshness(value: &str) -> WyrdPyResult<FreshnessPolicy> {
     }
 }
 
-/// Encodes one Rust record batch for the public Python PyArrow conversion.
+/// Encodes one Rust record batch for the public Python `PyArrow` conversion.
 ///
 /// # Errors
 ///

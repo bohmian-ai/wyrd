@@ -42,7 +42,6 @@ skald-prompt = { path = "crates/skald/skald-prompt", version = "0.0.1" }
 skald-agent = { path = "crates/skald/skald-agent", version = "0.0.1" }
 skald-workflow = { path = "crates/skald/skald-workflow", version = "0.0.1" }
 vala-bifrost-redux = { path = "crates/vala/vala-bifrost-redux", version = "0.0.1" }
-vala-sdk = { path = "crates/vala/vala-sdk", version = "0.0.1" }
 vala-sql = { path = "crates/vala/vala-sql", version = "0.0.1" }
 vala-core = { path = "crates/vala/vala-core", version = "0.0.1" }
 vala-ingest = { path = "crates/vala/vala-ingest", version = "0.0.1" }

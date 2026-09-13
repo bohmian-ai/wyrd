@@ -9,22 +9,22 @@
 
 use std::sync::{Arc, Mutex};
 
+use crate::WyrdClient;
+use crate::config::ClientConfig;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
-use wyrd_client::WyrdClient;
-use wyrd_client::config::ClientConfig;
 use wyrd_queue::QueueConfig;
 use wyrd_spec::vala::api::{
     BifrostQueryRequest, BifrostTableDescription, FreshnessPolicy, QueryTerminalFrame,
     RegisterOutcome, RegisterTableResponse, VisibilityMode,
 };
 
-use crate::grpc::BifrostGrpcTransport;
-use crate::handle::WriterPool;
-use crate::query::{QueryClient, QueryResultStream, ValaSdkError};
-use crate::scope::ClientScope;
-use crate::sink::BifrostIngestSink;
-use crate::table::{Correlation, TableConfig};
+use crate::bifrost::grpc::BifrostGrpcTransport;
+use crate::bifrost::handle::WriterPool;
+use crate::bifrost::query::{BifrostClientError, QueryClient, QueryResultStream};
+use crate::bifrost::scope::ClientScope;
+use crate::bifrost::sink::BifrostIngestSink;
+use crate::bifrost::table::{Correlation, TableConfig};
 
 /// The one Bifrost client: query any authorized table, write to the active one.
 ///
@@ -57,7 +57,7 @@ impl Bifrost {
     ///
     /// Returns the stable no-credentials error when the chain yields nothing,
     /// or a transport error when the ingest channel cannot be dialled.
-    pub async fn from_env() -> Result<Self, ValaSdkError> {
+    pub async fn from_env() -> Result<Self, BifrostClientError> {
         let client = client_from_env()?;
         Self::connect(&client).await
     }
@@ -71,7 +71,7 @@ impl Bifrost {
     /// # Errors
     ///
     /// Returns a transport error when the ingest channel cannot be dialled.
-    pub async fn connect(client: &WyrdClient) -> Result<Self, ValaSdkError> {
+    pub async fn connect(client: &WyrdClient) -> Result<Self, BifrostClientError> {
         Self::assemble(client, None, QueueConfig::default()).await
     }
 
@@ -83,7 +83,7 @@ impl Bifrost {
     pub async fn connect_with_table(
         client: &WyrdClient,
         table: TableConfig,
-    ) -> Result<Self, ValaSdkError> {
+    ) -> Result<Self, BifrostClientError> {
         Self::assemble(client, Some(table), QueueConfig::default()).await
     }
 
@@ -100,7 +100,7 @@ impl Bifrost {
         client: &WyrdClient,
         table: Option<TableConfig>,
         config: QueueConfig,
-    ) -> Result<Self, ValaSdkError> {
+    ) -> Result<Self, BifrostClientError> {
         Self::assemble(client, table, config).await
     }
 
@@ -128,6 +128,22 @@ impl Bifrost {
         }
     }
 
+    /// Build a read-only client that never dials the ingest channel.
+    ///
+    /// For callers that only query, describe, or manage query lifecycle — the
+    /// `wyrd query` command, for example — and must not require a reachable
+    /// gRPC endpoint. It performs no IO. Any write reaches a sink that refuses
+    /// it with a stable validation error instead of sending a batch.
+    #[must_use]
+    pub fn query_only(client: &WyrdClient) -> Self {
+        Self::with_sink(
+            client,
+            None,
+            Arc::new(QueryOnlySink),
+            QueueConfig::default(),
+        )
+    }
+
     /// Dial the ingest channel and assemble both planes over one client.
     ///
     /// # Errors
@@ -137,10 +153,10 @@ impl Bifrost {
         client: &WyrdClient,
         table: Option<TableConfig>,
         config: QueueConfig,
-    ) -> Result<Self, ValaSdkError> {
+    ) -> Result<Self, BifrostClientError> {
         let transport = BifrostGrpcTransport::connect(client)
             .await
-            .map_err(ValaSdkError::from)?;
+            .map_err(BifrostClientError::from)?;
         Ok(Self {
             query: QueryClient::new(client),
             writer: Arc::new(WriterPool::new(
@@ -164,7 +180,7 @@ impl Bifrost {
     ///
     /// # Errors
     ///
-    /// Returns [`ValaSdkError::NoActiveTable`] when no table is bound, the
+    /// Returns [`BifrostClientError::NoActiveTable`] when no table is bound, the
     /// stable fingerprint-mismatch error when a table of the same name exists
     /// with different columns, and the stable reserved-column or validation
     /// error the server reports for a rejected declaration.
@@ -178,12 +194,12 @@ impl Bifrost {
     /// # Panics
     ///
     /// Panics if the active-table lock is poisoned.
-    pub async fn register(&self) -> Result<RegisterOutcome, ValaSdkError> {
+    pub async fn register(&self) -> Result<RegisterOutcome, BifrostClientError> {
         let request = {
             let active = self.active.lock().expect("active table lock poisoned");
             active
                 .as_ref()
-                .ok_or(ValaSdkError::NoActiveTable)?
+                .ok_or(BifrostClientError::NoActiveTable)?
                 .register_request()
         };
         let response: RegisterTableResponse = self
@@ -228,7 +244,7 @@ impl Bifrost {
     /// # Errors
     ///
     /// As [`TableConfig::describe`].
-    pub async fn use_table_by_name(&self, fqn: &str) -> Result<(), ValaSdkError> {
+    pub async fn use_table_by_name(&self, fqn: &str) -> Result<(), BifrostClientError> {
         let table = TableConfig::describe(self.query.client(), fqn).await?;
         self.use_table(table);
         Ok(())
@@ -257,17 +273,17 @@ impl Bifrost {
     ///
     /// # Errors
     ///
-    /// Returns [`ValaSdkError::NoActiveTable`] when no table is bound, or
-    /// [`ValaSdkError::Queue`] with `WYRD_CLIENT_429_QUEUE_FULL` when the
+    /// Returns [`BifrostClientError::NoActiveTable`] when no table is bound, or
+    /// [`BifrostClientError::Queue`] with `WYRD_CLIENT_429_QUEUE_FULL` when the
     /// producer channel, its staging ring, and the byte budget are all occupied.
     ///
     /// # Panics
     ///
     /// Panics if the active-table lock is poisoned.
-    pub fn insert(&self, row: Vec<u8>, correlation: Correlation) -> Result<(), ValaSdkError> {
+    pub fn insert(&self, row: Vec<u8>, correlation: Correlation) -> Result<(), BifrostClientError> {
         let (table, schema) = {
             let active = self.active.lock().expect("active table lock poisoned");
-            let table = active.as_ref().ok_or(ValaSdkError::NoActiveTable)?;
+            let table = active.as_ref().ok_or(BifrostClientError::NoActiveTable)?;
             (table.fqn(), table.user_schema().clone())
         };
         self.writer
@@ -305,10 +321,14 @@ impl Bifrost {
     ///
     /// # Errors
     ///
-    /// Returns [`ValaSdkError::Queue`] when the batch cannot be encoded,
+    /// Returns [`BifrostClientError::Queue`] when the batch cannot be encoded,
     /// exceeds the accepted frame ceiling, or cannot fit this client's byte
     /// envelope, and the server's stable refusal when the batch is rejected.
-    pub async fn write_batch(&self, table: &str, batch: &RecordBatch) -> Result<(), ValaSdkError> {
+    pub async fn write_batch(
+        &self,
+        table: &str,
+        batch: &RecordBatch,
+    ) -> Result<(), BifrostClientError> {
         self.writer
             .write_batch(table, batch)
             .await
@@ -328,7 +348,7 @@ impl Bifrost {
     /// # Panics
     ///
     /// Panics when the blocking drain task cannot be joined.
-    pub async fn flush(&self) -> Result<(), ValaSdkError> {
+    pub async fn flush(&self) -> Result<(), BifrostClientError> {
         self.drain(Drain::Flush).await
     }
 
@@ -341,7 +361,7 @@ impl Bifrost {
     /// # Panics
     ///
     /// Panics when the blocking drain task cannot be joined.
-    pub async fn shutdown(&self) -> Result<(), ValaSdkError> {
+    pub async fn shutdown(&self) -> Result<(), BifrostClientError> {
         self.drain(Drain::Shutdown).await
     }
 
@@ -357,7 +377,7 @@ impl Bifrost {
     /// # Panics
     ///
     /// Panics when the blocking drain task cannot be joined.
-    async fn drain(&self, kind: Drain) -> Result<(), ValaSdkError> {
+    async fn drain(&self, kind: Drain) -> Result<(), BifrostClientError> {
         let writer = Arc::clone(&self.writer);
         tokio::task::spawn_blocking(move || match kind {
             Drain::Flush => writer.flush(),
@@ -386,20 +406,19 @@ impl Bifrost {
     ///
     /// Abandoning the future abandons the request; the server cancels the query
     /// when the response body is dropped.
-    pub async fn sql(&self, query: &str) -> Result<QueryResult, ValaSdkError> {
+    pub async fn sql(&self, query: &str) -> Result<QueryResult, BifrostClientError> {
         let mut stream = self.stream(query).await?;
         let mut batches = Vec::new();
         while let Some(batch) = stream.next_batch().await? {
             batches.push(batch);
         }
-        let schema = stream
-            .schema()
-            .cloned()
-            .ok_or_else(|| ValaSdkError::Protocol("query stream omitted its schema".to_owned()))?;
+        let schema = stream.schema().cloned().ok_or_else(|| {
+            BifrostClientError::Protocol("query stream omitted its schema".to_owned())
+        })?;
         let terminal = stream
             .terminal()
             .cloned()
-            .ok_or(ValaSdkError::IncompleteQueryStream)?;
+            .ok_or(BifrostClientError::IncompleteQueryStream)?;
         Ok(QueryResult {
             batches,
             schema,
@@ -417,7 +436,7 @@ impl Bifrost {
     ///
     /// # Errors
     ///
-    /// As [`Self::sql`], plus [`ValaSdkError::RowDeserialization`] when any row
+    /// As [`Self::sql`], plus [`BifrostClientError::RowDeserialization`] when any row
     /// does not fit `T`. That failure is total: no partially converted result
     /// is returned.
     ///
@@ -427,7 +446,7 @@ impl Bifrost {
     pub async fn sql_as<T: serde::de::DeserializeOwned>(
         &self,
         query: &str,
-    ) -> Result<Vec<T>, ValaSdkError> {
+    ) -> Result<Vec<T>, BifrostClientError> {
         self.sql(query).await?.deserialize()
     }
 
@@ -444,7 +463,7 @@ impl Bifrost {
     /// # Cancellation
     ///
     /// Abandoning the future abandons the request before any row is read.
-    pub async fn stream(&self, query: &str) -> Result<QueryResultStream, ValaSdkError> {
+    pub async fn stream(&self, query: &str) -> Result<QueryResultStream, BifrostClientError> {
         self.query
             .query(&BifrostQueryRequest {
                 sql: query.to_owned(),
@@ -479,8 +498,8 @@ impl Bifrost {
     /// # Cancellation
     ///
     /// Abandoning the future leaves no server state behind; describe is a read.
-    pub async fn describe(&self, fqn: &str) -> Result<BifrostTableDescription, ValaSdkError> {
-        let (namespace, name) = crate::table::split_fqn(fqn)?;
+    pub async fn describe(&self, fqn: &str) -> Result<BifrostTableDescription, BifrostClientError> {
+        let (namespace, name) = crate::bifrost::table::split_fqn(fqn)?;
         self.query.describe_table(&namespace, &name).await
     }
 
@@ -500,7 +519,7 @@ impl Bifrost {
         self.writer.producer_count()
     }
 
-    /// Rows dropped by the fire-and-forget [`crate::observe::record`] path.
+    /// Rows dropped by the fire-and-forget [`crate::bifrost::observe::record`] path.
     ///
     /// Always zero for [`Self::insert`], which refuses rather than drops.
     #[must_use]
@@ -510,13 +529,13 @@ impl Bifrost {
 
     /// Point-in-time bounded-ownership accounting for this client's producers.
     #[must_use]
-    pub fn metrics(&self) -> crate::BifrostMetrics {
+    pub fn metrics(&self) -> crate::bifrost::BifrostMetrics {
         self.writer.metrics()
     }
 
     /// The producer pool this client writes through.
     ///
-    /// Crate-private so [`crate::observe::record`] can reach the drop-counting
+    /// Crate-private so [`crate::bifrost::observe::record`] can reach the drop-counting
     /// path without the pool becoming a second public write door.
     pub(crate) fn writer(&self) -> &WriterPool {
         &self.writer
@@ -584,26 +603,26 @@ impl QueryResult {
     ///
     /// # Errors
     ///
-    /// Returns [`ValaSdkError::Arrow`] when the JSON projection fails and
-    /// [`ValaSdkError::RowDeserialization`] when any row does not fit `T`.
-    fn deserialize<T: serde::de::DeserializeOwned>(&self) -> Result<Vec<T>, ValaSdkError> {
+    /// Returns [`BifrostClientError::Arrow`] when the JSON projection fails and
+    /// [`BifrostClientError::RowDeserialization`] when any row does not fit `T`.
+    fn deserialize<T: serde::de::DeserializeOwned>(&self) -> Result<Vec<T>, BifrostClientError> {
         let mut bytes = Vec::new();
         {
             let mut writer = arrow::json::ArrayWriter::new(&mut bytes);
             for batch in &self.batches {
                 writer
                     .write(batch)
-                    .map_err(|error| ValaSdkError::Arrow(error.to_string()))?;
+                    .map_err(|error| BifrostClientError::Arrow(error.to_string()))?;
             }
             writer
                 .finish()
-                .map_err(|error| ValaSdkError::Arrow(error.to_string()))?;
+                .map_err(|error| BifrostClientError::Arrow(error.to_string()))?;
         }
         if bytes.is_empty() {
             return Ok(Vec::new());
         }
         serde_json::from_slice(&bytes)
-            .map_err(|error| ValaSdkError::RowDeserialization(error.to_string()))
+            .map_err(|error| BifrostClientError::RowDeserialization(error.to_string()))
     }
 
     /// Encode the whole result as one Arrow IPC stream.
@@ -614,20 +633,20 @@ impl QueryResult {
     ///
     /// # Errors
     ///
-    /// Returns [`ValaSdkError::Arrow`] when IPC encoding fails.
-    pub fn to_ipc(&self) -> Result<Vec<u8>, ValaSdkError> {
+    /// Returns [`BifrostClientError::Arrow`] when IPC encoding fails.
+    pub fn to_ipc(&self) -> Result<Vec<u8>, BifrostClientError> {
         let mut buffer = Vec::new();
         {
             let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut buffer, &self.schema)
-                .map_err(|error| ValaSdkError::Arrow(error.to_string()))?;
+                .map_err(|error| BifrostClientError::Arrow(error.to_string()))?;
             for batch in &self.batches {
                 writer
                     .write(batch)
-                    .map_err(|error| ValaSdkError::Arrow(error.to_string()))?;
+                    .map_err(|error| BifrostClientError::Arrow(error.to_string()))?;
             }
             writer
                 .finish()
-                .map_err(|error| ValaSdkError::Arrow(error.to_string()))?;
+                .map_err(|error| BifrostClientError::Arrow(error.to_string()))?;
         }
         Ok(buffer)
     }
@@ -650,7 +669,7 @@ pub fn register_outcome_name(outcome: RegisterOutcome) -> &'static str {
 /// Assemble the ambient [`WyrdClient`] every no-argument constructor uses.
 ///
 /// Delegates to [`client_from_options`] with nothing overridden, so
-/// [`Bifrost::from_env`] and [`crate::TableConfig::describe_from_env`] cannot
+/// [`Bifrost::from_env`] and [`crate::bifrost::TableConfig::describe_from_env`] cannot
 /// resolve their endpoints or credential differently from each other or from an
 /// explicitly-configured client.
 ///
@@ -658,7 +677,7 @@ pub fn register_outcome_name(outcome: RegisterOutcome) -> &'static str {
 ///
 /// Returns the stable no-credentials error when the chain yields nothing, or a
 /// transport error when the HTTP client cannot be built.
-pub(crate) fn client_from_env() -> Result<WyrdClient, ValaSdkError> {
+pub(crate) fn client_from_env() -> Result<WyrdClient, BifrostClientError> {
     client_from_options(None, None, None)
 }
 
@@ -683,7 +702,7 @@ pub fn client_from_options(
     server_url: Option<&str>,
     credential: Option<&str>,
     grpc_url: Option<&str>,
-) -> Result<WyrdClient, ValaSdkError> {
+) -> Result<WyrdClient, BifrostClientError> {
     let mut config = ClientConfig::from_env();
     if let Some(server_url) = server_url {
         config.http.base_url = server_url.trim_end_matches('/').to_owned();
@@ -694,5 +713,33 @@ pub fn client_from_options(
     if let Some(credential) = credential {
         config.credential = Some(secrecy::SecretString::from(credential.to_owned()));
     }
-    WyrdClient::with_config(config).map_err(ValaSdkError::from)
+    WyrdClient::with_config(config).map_err(BifrostClientError::from)
+}
+
+/// Ingest sink behind [`Bifrost::query_only`]: refuses every batch.
+///
+/// A read-only client has no ingest channel, so a write that reaches the sink
+/// settles terminally with a stable validation error rather than dialling a
+/// transport or reporting success.
+struct QueryOnlySink;
+
+#[async_trait::async_trait]
+impl wyrd_queue::BatchSink<wyrd_queue::ClientByteGuard> for QueryOnlySink {
+    /// Refuse `batch` without sending it.
+    ///
+    /// # Errors
+    ///
+    /// Always returns a terminal `WYRD_SPEC_400_VALIDATION` naming the table.
+    async fn send(
+        &self,
+        batch: &wyrd_queue::SealedBatch<wyrd_queue::ClientByteGuard>,
+    ) -> Result<wyrd_queue::DurableBatchAck, wyrd_queue::SinkError> {
+        Err(wyrd_queue::SinkError::Terminal(
+            wyrd_spec::error::WyrdError::Validation {
+                message: "this Bifrost client was built with Bifrost::query_only and cannot write"
+                    .to_owned(),
+                details: serde_json::json!({ "table": batch.table }),
+            },
+        ))
+    }
 }

@@ -2,7 +2,6 @@
 
 use std::collections::BTreeSet;
 
-use vala_sdk::QueryClient;
 use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
@@ -570,7 +569,9 @@ async fn coordinate_public_query(
         credential: Some(api_key.clone()),
         ..ClientConfig::default()
     })?;
-    let mut stream = QueryClient::new(&client)
+    let mut stream = wyrd_client::Bifrost::query_only(&client)
+        .query_client()
+        .clone()
         .query(&BifrostQueryRequest {
             sql: format!("SELECT id FROM vala.bifrost.{table} ORDER BY id"),
             visibility: VisibilityMode::PublishedOnly,

@@ -17,8 +17,10 @@ use thiserror::Error;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::scribe::admission::{AdmissionConfig, EventTimeWindow};
-use vala_sdk::{CollectedQueryLimits, CollectedQueryResult, QueryClient, ValaSdkError};
 use wyrd_client::WyrdClient;
+use wyrd_client::bifrost::{
+    BifrostClientError, CollectedQueryLimits, CollectedQueryResult, QueryClient,
+};
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
 use wyrd_spec::DataTenantId;
@@ -512,7 +514,9 @@ impl BifrostClusterLoad {
             .server(0)
             .ok_or_else(|| ClusterLoadError::Cluster("setup Server is absent".to_owned()))?;
         let setup_client = public_client(setup_server, tenants[0], "load-setup-telemetry").await?;
-        QueryClient::new(&setup_client)
+        wyrd_client::Bifrost::query_only(&setup_client)
+            .query_client()
+            .clone()
             .collect_bounded(
                 &BifrostQueryRequest {
                     sql: format!("SELECT id, tenant, batch FROM {table} LIMIT 0"),
@@ -682,7 +686,9 @@ async fn exercise_query_cancellation(
     }
 
     server.stall_next_query_after_schema();
-    let query = QueryClient::new(client);
+    let query = wyrd_client::Bifrost::query_only(client)
+        .query_client()
+        .clone();
     let sql = format!("SELECT id, tenant, batch FROM {table} LIMIT 0");
     let mut task = tokio::spawn(async move {
         query
@@ -869,7 +875,9 @@ async fn run_public_matrix(
                 let writer_transport = crate::bifrost::write::RawIngest::connect(&writer_client)
                     .await
                     .map_err(|error| ClusterLoadError::Client(error.to_string()))?;
-                let query = QueryClient::new(&reader_client);
+                let query = wyrd_client::Bifrost::query_only(&reader_client)
+                    .query_client()
+                    .clone();
                 let profile = *profile;
                 let table = table.to_owned();
                 let barriers = Arc::clone(&barriers);
@@ -970,7 +978,7 @@ async fn run_public_matrix(
             .ok_or_else(|| ClusterLoadError::Cluster("final reader Server is absent".to_owned()))?;
         let final_client =
             public_client(reader, tenant, &format!("load-final-{tenant_index}")).await?;
-        let query = QueryClient::new(&final_client);
+        let query = wyrd_client::Bifrost::query_only(&final_client).query_client().clone();
         let audit_count_before = reader
             .bifrost_read_decision_count_for_tenant(tenant)
             .await
@@ -2014,7 +2022,7 @@ async fn run_tenant(context: TenantRunContext) -> Result<TenantLoadResult, Clust
 /// through every prose needle and failed its tenant outright, which ended the
 /// whole run. Codes are the contract, so a new terminal that is not listed here
 /// is treated as fatal on purpose rather than by accident.
-fn is_retryable_read_error(error: &ValaSdkError) -> bool {
+fn is_retryable_read_error(error: &BifrostClientError) -> bool {
     [
         // Transient saturation: the server refused or could not finish in time.
         "WYRD_VALA_429_QUERY_ADMISSION_REJECTED",

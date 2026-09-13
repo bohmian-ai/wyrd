@@ -1,5 +1,5 @@
 //! The [`WriterPool`]: one [`Producer`] per destination table, keyed by
-//! `(ClientScope, SinkKind, table)` and owned by [`crate::Bifrost`].
+//! `(ClientScope, SinkKind, table)` and owned by [`crate::bifrost::Bifrost`].
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,7 +15,7 @@ use wyrd_queue::{
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::ids::RunId;
 
-use crate::scope::{ClientScope, SinkKind};
+use crate::bifrost::scope::{ClientScope, SinkKind};
 
 /// Pool key: the full `(ClientScope, SinkKind, table)` producer identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -25,18 +25,18 @@ struct ProducerKey {
     table: String,
 }
 
-/// The client-tier producer pool behind [`crate::Bifrost`].
+/// The client-tier producer pool behind [`crate::bifrost::Bifrost`].
 ///
 /// One [`Producer`] is lazily constructed per distinct [`ProducerKey`] and
 /// shared across calls; all producers drain into the one [`BatchSink`] the pool
 /// owns (the sink routes by `SealedBatch.table`). Pooling by table is what lets
-/// [`crate::Bifrost::use_table`] swap the active write target without losing
+/// [`crate::bifrost::Bifrost::use_table`] swap the active write target without losing
 /// the previous table's buffered rows: the swapped-away producer stays in the
 /// pool and still drains on the next flush.
 ///
 /// This type is crate-private. `Bifrost` is the public write door, and
 /// backpressure asymmetry lives above it — `Bifrost::insert` propagates
-/// queue-full while [`crate::observe::record`] swallows and counts it.
+/// queue-full while [`crate::bifrost::observe::record`] swallows and counts it.
 pub(crate) struct WriterPool {
     scope: ClientScope,
     sink: Arc<dyn BatchSink<ClientByteGuard>>,
@@ -49,7 +49,7 @@ pub(crate) struct WriterPool {
     drop_warned: AtomicBool,
 }
 
-/// Point-in-time settlement accounting for one [`crate::Bifrost`] client.
+/// Point-in-time settlement accounting for one [`crate::bifrost::Bifrost`] client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BifrostMetrics {
     /// Producers currently registered under the bounded handle pool.
@@ -72,7 +72,7 @@ impl WriterPool {
     /// Build a pool over a resolved [`ClientScope`], a shared sink, and the
     /// producer tuning [`QueueConfig`].
     ///
-    /// Production wraps a [`crate::BifrostIngestSink`]; tests inject a
+    /// Production wraps a [`crate::bifrost::BifrostIngestSink`]; tests inject a
     /// `wyrd-queue` mock or a stall sink through the same seam.
     #[must_use]
     pub(crate) fn new(
@@ -161,8 +161,8 @@ impl WriterPool {
     /// The queue-domain [`WyrdQueueError`] is propagated verbatim (rather than
     /// projected onto the shared catalog) so the client-tier code —
     /// `WYRD_CLIENT_429_QUEUE_FULL`, which has no dedicated catalog variant —
-    /// survives to the caller. [`crate::Bifrost`] wraps it in
-    /// [`crate::ValaSdkError::Queue`] at the public boundary.
+    /// survives to the caller. [`crate::bifrost::Bifrost`] wraps it in
+    /// [`crate::bifrost::BifrostClientError::Queue`] at the public boundary.
     ///
     /// # Errors
     /// Returns [`WyrdQueueError::QueueFull`] (code `WYRD_CLIENT_429_QUEUE_FULL`)

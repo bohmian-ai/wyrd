@@ -1,4 +1,3 @@
-use vala_sdk::QueryClient;
 use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
@@ -1185,7 +1184,9 @@ async fn public_query(
     client: &WyrdClient,
     sql: &str,
 ) -> Result<Vec<std::collections::BTreeMap<String, String>>, PeerJourneyError> {
-    let mut stream = QueryClient::new(client)
+    let mut stream = wyrd_client::Bifrost::query_only(client)
+        .query_client()
+        .clone()
         .query(&BifrostQueryRequest {
             sql: sql.to_owned(),
             visibility: VisibilityMode::PublishedOnly,

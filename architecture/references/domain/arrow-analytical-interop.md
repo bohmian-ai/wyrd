@@ -92,8 +92,7 @@ unbounded IPC messages, and tenant inference from object paths.
 
 - Managed analytical schema: `crates/wyrd-spec/src/vala/`.
 - Arrow, Parquet, and providers: `crates/vala/vala-bifrost-redux/src/`.
-- Rust-native analytical mechanics may remain in `crates/vala/vala-sdk/`, but
-  `wyrd-client` owns their SDK-facing composition and public re-export.
+- Rust-native analytical client mechanics: `crates/shared/wyrd-client/src/bifrost/`.
 - Python aggregation: `sdks/wyrd-sdk-python/`.
 
 ## Primary grounding

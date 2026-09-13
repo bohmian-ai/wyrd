@@ -12,7 +12,7 @@
 //! What this binary leaves to another: Scribe's own durability, admission and
 //! restart semantics belong to the `scribe` binary; query planning, dispatch
 //! and topology belong to `oracle`; the language SDK and agent projections of
-//! the same canonical rows belong to `vala-sdk`'s `pg_bifrost_e2e`, the Python
+//! the same canonical rows belong to `wyrd-client`'s `pg_bifrost_e2e`, the Python
 //! and TypeScript journey suites, and `wyrd-mcp`'s `mcp` binary.
 
 mod logs_export;

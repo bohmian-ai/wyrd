@@ -1128,7 +1128,7 @@ impl QueryIpcEncoder {
 /// stream that ended cleanly and for one that never began, so it cannot prove
 /// an explicit EOS arrived; only the terminal's carried delta can.
 ///
-/// The client tier has its own copy of this state machine in `vala-sdk`,
+/// The client tier has its own copy of this state machine in `wyrd_client::bifrost`,
 /// because client-tier crates may not depend on the Bifrost server engine. The
 /// wire contract, not shared code, is what keeps the two honest.
 #[derive(Debug, Default)]

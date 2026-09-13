@@ -19,8 +19,8 @@ use vala_bifrost_redux::oracle::QueryIpcDecoder;
 use vala_bifrost_redux::oracle::analytical::{
     AnalyticalCleanupPause, AnalyticalLiveInspection, analytical_cleanup_pause_for_test,
 };
-use vala_sdk::QueryClient;
 use wyrd_client::WyrdClient;
+use wyrd_client::bifrost::QueryClient;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
@@ -175,7 +175,7 @@ async fn await_admitted(
 ///
 /// Only that class is retried by this journey: a dropped stream can leave the
 /// client's connection pool holding an entry the next request cannot use.
-fn is_transport(error: &vala_sdk::ValaSdkError) -> bool {
+fn is_transport(error: &wyrd_client::bifrost::BifrostClientError) -> bool {
     sdk_code(error) == "WYRD_SPEC_500_INTERNAL" && error.to_string().contains("transport error")
 }
 
@@ -183,12 +183,12 @@ fn is_transport(error: &vala_sdk::ValaSdkError) -> bool {
 ///
 /// The SDK owns exactly one public projection, so every assertion here reads
 /// the code through it rather than a second per-variant table.
-fn sdk_code(error: &vala_sdk::ValaSdkError) -> &'static str {
+fn sdk_code(error: &wyrd_client::bifrost::BifrostClientError) -> &'static str {
     wyrd_spec::error::WyrdError::from(error).code()
 }
 
 /// The HTTP-equivalent status one SDK error projects onto.
-fn sdk_status(error: &vala_sdk::ValaSdkError) -> u16 {
+fn sdk_status(error: &wyrd_client::bifrost::BifrostClientError) -> u16 {
     wyrd_spec::error::WyrdError::from(error).status()
 }
 
@@ -233,7 +233,9 @@ async fn prove_cleanup_ownership() -> Result<(), JourneyError> {
             .engine(),
     );
     let public = client(query_server, "analytical-cleanup-reader").await?;
-    let query = QueryClient::new(&public);
+    let query = wyrd_client::Bifrost::query_only(&public)
+        .query_client()
+        .clone();
 
     let plain = format!("SELECT id FROM vala.bifrost.{table} WHERE filter_key = 'group_0'");
     let grouped = format!(
@@ -280,7 +282,7 @@ async fn dispatch(
     query: &QueryClient,
     sql: &str,
     case: &str,
-) -> Result<vala_sdk::QueryResultStream, JourneyError> {
+) -> Result<wyrd_client::bifrost::QueryResultStream, JourneyError> {
     match query.query(&request(sql)).await {
         Ok(stream) => Ok(stream),
         Err(error) if is_transport(&error) => Ok(query
@@ -313,7 +315,14 @@ async fn prove_paused_cleanup(
     let case = "http selected analytical";
     let pause = analytical_cleanup_pause_for_test();
     pause.arm();
-    let mut stream = dispatch(&QueryClient::new(public), sql, case).await?;
+    let mut stream = dispatch(
+        &wyrd_client::Bifrost::query_only(public)
+            .query_client()
+            .clone(),
+        sql,
+        case,
+    )
+    .await?;
     let request_id = stream.request_id().clone();
     stream
         .next_batch()
@@ -326,7 +335,9 @@ async fn prove_paused_cleanup(
     let observer = client(server, "analytical-cleanup-http-observer").await?;
     hold_and_release(
         cluster,
-        &QueryClient::new(&observer),
+        &wyrd_client::Bifrost::query_only(&observer)
+            .query_client()
+            .clone(),
         &request_id,
         &pause,
         case,
@@ -410,7 +421,9 @@ async fn prove_paused_cleanup_over_grpc(
     let observer = client(server, "analytical-cleanup-grpc-observer").await?;
     hold_and_release(
         cluster,
-        &QueryClient::new(&observer),
+        &wyrd_client::Bifrost::query_only(&observer)
+            .query_client()
+            .clone(),
         &request_id,
         &pause,
         case,
@@ -504,13 +517,17 @@ struct PublicSettlement {
     deadline_ms: i64,
 }
 
-/// Drives one complete public query through `vala-sdk` and settles it.
+/// Drives one complete public query through `wyrd_client::Bifrost` and settles it.
 ///
 /// # Errors
 ///
 /// Returns a transport, protocol, Arrow, or missing-terminal error.
 async fn run_public(client: &WyrdClient, sql: &str) -> Result<PublicSettlement, JourneyError> {
-    let mut stream = QueryClient::new(client).query(&request(sql)).await?;
+    let mut stream = wyrd_client::Bifrost::query_only(client)
+        .query_client()
+        .clone()
+        .query(&request(sql))
+        .await?;
     let deadline_ms = stream.deadline_ms();
     let mut rows = 0_usize;
     while let Some(batch) = stream.next_batch().await? {
@@ -541,7 +558,11 @@ async fn run_self_join(
     client: &WyrdClient,
     sql: &str,
 ) -> Result<(PublicSettlement, Vec<(i64, i64, i32)>), JourneyError> {
-    let mut stream = QueryClient::new(client).query(&request(sql)).await?;
+    let mut stream = wyrd_client::Bifrost::query_only(client)
+        .query_client()
+        .clone()
+        .query(&request(sql))
+        .await?;
     let deadline_ms = stream.deadline_ms();
     let mut rows = 0_usize;
     let mut decoded = Vec::new();
@@ -616,7 +637,7 @@ async fn expect_single_build_failure(
         Err(error) => error,
     };
     let sdk = failure
-        .downcast_ref::<vala_sdk::ValaSdkError>()
+        .downcast_ref::<wyrd_client::bifrost::BifrostClientError>()
         .ok_or_else(|| format!("{case}: failed outside the SDK as {failure}"))?;
     if is_transport(sdk) {
         return Err(format!("{case}: failed as a client transport error: {sdk}").into());
@@ -1224,17 +1245,19 @@ async fn prove_public_activation() -> Result<(), JourneyError> {
     }
 
     // Finite result pressure fails safely rather than truncating.
-    match QueryClient::new(&client)
+    match wyrd_client::Bifrost::query_only(&client)
+        .query_client()
+        .clone()
         .collect_bounded(
             &request(&analytical_sql),
-            vala_sdk::CollectedQueryLimits {
+            wyrd_client::bifrost::CollectedQueryLimits {
                 max_rows: 1,
                 max_encoded_bytes: usize::MAX,
             },
         )
         .await
     {
-        Err(vala_sdk::ValaSdkError::ResultTooLarge) => {}
+        Err(wyrd_client::bifrost::BifrostClientError::ResultTooLarge) => {}
         Err(error) => return Err(format!("bounded collection failed as {error}").into()),
         Ok(result) => {
             return Err(
@@ -1315,7 +1338,9 @@ async fn prove_under_privileged_refusal() -> Result<(), JourneyError> {
         .bootstrap_service_in_tenant(tenant, "under-privileged-denied", &[])
         .await?;
     let denied = client_from_bootstrap(query_server, bootstrap).await?;
-    let error = QueryClient::new(&denied)
+    let error = wyrd_client::Bifrost::query_only(&denied)
+        .query_client()
+        .clone()
         .query(&request(&grouped))
         .await
         .err()
@@ -1327,7 +1352,9 @@ async fn prove_under_privileged_refusal() -> Result<(), JourneyError> {
         )
         .into());
     }
-    if !QueryClient::new(&denied)
+    if !wyrd_client::Bifrost::query_only(&denied)
+        .query_client()
+        .clone()
         .running()
         .await
         .is_err_and(|error| sdk_status(&error) == 403)
@@ -1393,12 +1420,16 @@ async fn prove_selected_failure_is_terminal() -> Result<(), JourneyError> {
         // about the failure itself: the caller must receive one structured
         // Wyrd error, not an anonymous transport break or a truncated success.
         tokio::spawn(async move {
-            let mut stream = QueryClient::new(&client).query(&request(&sql)).await?;
+            let mut stream = wyrd_client::Bifrost::query_only(&client)
+                .query_client()
+                .clone()
+                .query(&request(&sql))
+                .await?;
             let mut rows = 0_usize;
             while let Some(batch) = stream.next_batch().await? {
                 rows += batch.num_rows();
             }
-            Ok::<usize, vala_sdk::ValaSdkError>(rows)
+            Ok::<usize, wyrd_client::bifrost::BifrostClientError>(rows)
         })
     };
     cluster.nodes_mut()[paused].await_execute_paused()?;

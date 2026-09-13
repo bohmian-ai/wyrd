@@ -87,8 +87,6 @@ cancelled, indeterminate, and failed checks remain distinct terminal states.
 - Eval contract: `architecture/wyrd-design.md` §Eval.
 - Eval types: `crates/wyrd-spec/src/vala/eval/`.
 - Engine: `crates/vala/vala-eval/`.
-- Rust-native evaluation mechanics may remain in `crates/vala/vala-sdk/`, but
-  `wyrd-client` owns their SDK-facing composition and public re-export.
 
 ## Primary grounding
 

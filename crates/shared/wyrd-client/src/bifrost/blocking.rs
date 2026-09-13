@@ -1,4 +1,4 @@
-//! The synchronous projection of [`crate::Bifrost`], for callers with no
+//! The synchronous projection of [`crate::bifrost::Bifrost`], for callers with no
 //! runtime of their own.
 //!
 //! Every method drives the async client on the shared Wyrd runtime. The async
@@ -7,16 +7,16 @@
 //! `reqwest::blocking`, which is already in the dependency tree and sets the
 //! reader's expectation for the pairing.
 
+use crate::WyrdClient;
 use arrow::record_batch::RecordBatch;
-use wyrd_client::WyrdClient;
 use wyrd_queue::QueueConfig;
 use wyrd_spec::vala::api::{BifrostTableDescription, RegisterOutcome};
 
-use crate::bifrost::QueryResult;
-use crate::query::{QueryClient, QueryResultStream, ValaSdkError};
-use crate::table::{Correlation, TableConfig};
+use crate::bifrost::facade::QueryResult;
+use crate::bifrost::query::{BifrostClientError, QueryClient, QueryResultStream};
+use crate::bifrost::table::{Correlation, TableConfig};
 
-/// The synchronous [`crate::Bifrost`].
+/// The synchronous [`crate::bifrost::Bifrost`].
 ///
 /// # Panics
 ///
@@ -25,7 +25,7 @@ use crate::table::{Correlation, TableConfig};
 /// is driving deadlocks, and a panic naming the mistake is better than a hang.
 pub struct Bifrost {
     /// The async client every method blocks on.
-    inner: crate::Bifrost,
+    inner: crate::bifrost::Bifrost,
 }
 
 impl Bifrost {
@@ -33,10 +33,10 @@ impl Bifrost {
     ///
     /// # Errors
     ///
-    /// As [`crate::Bifrost::from_env`].
-    pub fn from_env() -> Result<Self, ValaSdkError> {
+    /// As [`crate::bifrost::Bifrost::from_env`].
+    pub fn from_env() -> Result<Self, BifrostClientError> {
         Ok(Self {
-            inner: block_on(crate::Bifrost::from_env())?,
+            inner: block_on(crate::bifrost::Bifrost::from_env())?,
         })
     }
 
@@ -44,10 +44,10 @@ impl Bifrost {
     ///
     /// # Errors
     ///
-    /// As [`crate::Bifrost::connect`].
-    pub fn connect(client: &WyrdClient) -> Result<Self, ValaSdkError> {
+    /// As [`crate::bifrost::Bifrost::connect`].
+    pub fn connect(client: &WyrdClient) -> Result<Self, BifrostClientError> {
         Ok(Self {
-            inner: block_on(crate::Bifrost::connect(client))?,
+            inner: block_on(crate::bifrost::Bifrost::connect(client))?,
         })
     }
 
@@ -55,13 +55,13 @@ impl Bifrost {
     ///
     /// # Errors
     ///
-    /// As [`crate::Bifrost::connect`].
+    /// As [`crate::bifrost::Bifrost::connect`].
     pub fn connect_with_table(
         client: &WyrdClient,
         table: TableConfig,
-    ) -> Result<Self, ValaSdkError> {
+    ) -> Result<Self, BifrostClientError> {
         Ok(Self {
-            inner: block_on(crate::Bifrost::connect_with_table(client, table))?,
+            inner: block_on(crate::bifrost::Bifrost::connect_with_table(client, table))?,
         })
     }
 
@@ -69,14 +69,16 @@ impl Bifrost {
     ///
     /// # Errors
     ///
-    /// As [`crate::Bifrost::connect`].
+    /// As [`crate::bifrost::Bifrost::connect`].
     pub fn connect_with_config(
         client: &WyrdClient,
         table: Option<TableConfig>,
         config: QueueConfig,
-    ) -> Result<Self, ValaSdkError> {
+    ) -> Result<Self, BifrostClientError> {
         Ok(Self {
-            inner: block_on(crate::Bifrost::connect_with_config(client, table, config))?,
+            inner: block_on(crate::bifrost::Bifrost::connect_with_config(
+                client, table, config,
+            ))?,
         })
     }
 
@@ -84,8 +86,8 @@ impl Bifrost {
     ///
     /// # Errors
     ///
-    /// As [`crate::Bifrost::register`].
-    pub fn register(&self) -> Result<RegisterOutcome, ValaSdkError> {
+    /// As [`crate::bifrost::Bifrost::register`].
+    pub fn register(&self) -> Result<RegisterOutcome, BifrostClientError> {
         block_on(self.inner.register())
     }
 
@@ -98,8 +100,8 @@ impl Bifrost {
     ///
     /// # Errors
     ///
-    /// As [`crate::Bifrost::use_table_by_name`].
-    pub fn use_table_by_name(&self, fqn: &str) -> Result<(), ValaSdkError> {
+    /// As [`crate::bifrost::Bifrost::use_table_by_name`].
+    pub fn use_table_by_name(&self, fqn: &str) -> Result<(), BifrostClientError> {
         block_on(self.inner.use_table_by_name(fqn))
     }
 
@@ -116,8 +118,8 @@ impl Bifrost {
     ///
     /// # Errors
     ///
-    /// As [`crate::Bifrost::insert`].
-    pub fn insert(&self, row: Vec<u8>, correlation: Correlation) -> Result<(), ValaSdkError> {
+    /// As [`crate::bifrost::Bifrost::insert`].
+    pub fn insert(&self, row: Vec<u8>, correlation: Correlation) -> Result<(), BifrostClientError> {
         self.inner.insert(row, correlation)
     }
 
@@ -125,8 +127,8 @@ impl Bifrost {
     ///
     /// # Errors
     ///
-    /// As [`crate::Bifrost::flush`].
-    pub fn flush(&self) -> Result<(), ValaSdkError> {
+    /// As [`crate::bifrost::Bifrost::flush`].
+    pub fn flush(&self) -> Result<(), BifrostClientError> {
         block_on(self.inner.flush())
     }
 
@@ -134,8 +136,8 @@ impl Bifrost {
     ///
     /// # Errors
     ///
-    /// As [`crate::Bifrost::shutdown`].
-    pub fn shutdown(&self) -> Result<(), ValaSdkError> {
+    /// As [`crate::bifrost::Bifrost::shutdown`].
+    pub fn shutdown(&self) -> Result<(), BifrostClientError> {
         block_on(self.inner.shutdown())
     }
 
@@ -143,8 +145,8 @@ impl Bifrost {
     ///
     /// # Errors
     ///
-    /// As [`crate::Bifrost::sql`].
-    pub fn sql(&self, query: &str) -> Result<QueryResult, ValaSdkError> {
+    /// As [`crate::bifrost::Bifrost::sql`].
+    pub fn sql(&self, query: &str) -> Result<QueryResult, BifrostClientError> {
         block_on(self.inner.sql(query))
     }
 
@@ -152,11 +154,11 @@ impl Bifrost {
     ///
     /// # Errors
     ///
-    /// As [`crate::Bifrost::sql_as`].
+    /// As [`crate::bifrost::Bifrost::sql_as`].
     pub fn sql_as<T: serde::de::DeserializeOwned>(
         &self,
         query: &str,
-    ) -> Result<Vec<T>, ValaSdkError> {
+    ) -> Result<Vec<T>, BifrostClientError> {
         block_on(self.inner.sql_as(query))
     }
 
@@ -164,8 +166,8 @@ impl Bifrost {
     ///
     /// # Errors
     ///
-    /// As [`crate::Bifrost::stream`].
-    pub fn stream(&self, query: &str) -> Result<BlockingQueryStream, ValaSdkError> {
+    /// As [`crate::bifrost::Bifrost::stream`].
+    pub fn stream(&self, query: &str) -> Result<BlockingQueryStream, BifrostClientError> {
         Ok(BlockingQueryStream {
             inner: block_on(self.inner.stream(query))?,
         })
@@ -175,8 +177,8 @@ impl Bifrost {
     ///
     /// # Errors
     ///
-    /// As [`crate::Bifrost::describe`].
-    pub fn describe(&self, fqn: &str) -> Result<BifrostTableDescription, ValaSdkError> {
+    /// As [`crate::bifrost::Bifrost::describe`].
+    pub fn describe(&self, fqn: &str) -> Result<BifrostTableDescription, BifrostClientError> {
         block_on(self.inner.describe(fqn))
     }
 
@@ -193,7 +195,7 @@ impl Bifrost {
 
     /// The async client underneath, for a caller that acquires a runtime later.
     #[must_use]
-    pub fn into_async(self) -> crate::Bifrost {
+    pub fn into_async(self) -> crate::bifrost::Bifrost {
         self.inner
     }
 }
@@ -217,7 +219,7 @@ impl BlockingQueryStream {
 }
 
 impl Iterator for BlockingQueryStream {
-    type Item = Result<RecordBatch, ValaSdkError>;
+    type Item = Result<RecordBatch, BifrostClientError>;
 
     /// Read the next batch, ending on the validated terminal.
     ///

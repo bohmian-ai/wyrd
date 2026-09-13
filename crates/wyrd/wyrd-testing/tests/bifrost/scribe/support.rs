@@ -265,7 +265,9 @@ pub(super) async fn read_values(client: &wyrd_client::WyrdClient, table: &str) -
 
 /// Runs one strict fused public query and collects its `value` column.
 pub(super) async fn read_sql(client: &wyrd_client::WyrdClient, sql: &str) -> Vec<i64> {
-    let mut stream = vala_sdk::query::QueryClient::new(client)
+    let mut stream = wyrd_client::Bifrost::query_only(client)
+        .query_client()
+        .clone()
         .query(&wyrd_spec::vala::api::BifrostQueryRequest {
             sql: sql.to_owned(),
             visibility: wyrd_spec::vala::api::VisibilityMode::Fused,

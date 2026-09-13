@@ -5,8 +5,7 @@ use secrecy::SecretString;
 use serde_json::Value;
 use std::process::Command;
 use std::sync::Arc;
-use vala_sdk::QueryClient;
-use wyrd_client::WyrdClient;
+use wyrd_client::{Bifrost, WyrdClient};
 use wyrd_client::auth::AuthMiddleware;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{HttpConfig, HttpTransport, ResolvedCredential};
@@ -44,7 +43,11 @@ async fn typed_query_error(
         freshness: FreshnessPolicy::Strict,
         deadline_ms: None,
     };
-    match QueryClient::new(&client).query(&request).await {
+    match Bifrost::query_only(&client)
+        .query_client()
+        .query(&request)
+        .await
+    {
         Err(error) => Ok(WyrdError::from(error)),
         Ok(_) => Err("query unexpectedly succeeded".into()),
     }

@@ -1006,7 +1006,9 @@ impl OtlpJourney {
         client: &wyrd_client::WyrdClient,
         sql: &str,
     ) -> Vec<RecordBatch> {
-        let mut stream = vala_sdk::query::QueryClient::new(client)
+        let mut stream = wyrd_client::Bifrost::query_only(client)
+            .query_client()
+            .clone()
             .query(&wyrd_spec::vala::api::BifrostQueryRequest {
                 sql: sql.to_owned(),
                 visibility: wyrd_spec::vala::api::VisibilityMode::Fused,
@@ -1042,7 +1044,9 @@ impl OtlpJourney {
     ///
     /// Panics when an accepted query does not stream to completion.
     pub(super) async fn try_query(&self, sql: &str) -> Result<Vec<RecordBatch>, String> {
-        let mut stream = match vala_sdk::query::QueryClient::new(&self.client)
+        let mut stream = match wyrd_client::Bifrost::query_only(&self.client)
+            .query_client()
+            .clone()
             .query(&wyrd_spec::vala::api::BifrostQueryRequest {
                 sql: sql.to_owned(),
                 visibility: wyrd_spec::vala::api::VisibilityMode::Fused,
@@ -1052,7 +1056,7 @@ impl OtlpJourney {
             .await
         {
             Ok(stream) => stream,
-            Err(vala_sdk::query::ValaSdkError::Transport(error)) => {
+            Err(wyrd_client::bifrost::BifrostClientError::Transport(error)) => {
                 return Err(error.code().to_owned());
             }
             Err(other) => panic!("public query `{sql}` fails outside the stable contract: {other}"),

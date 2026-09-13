@@ -9,8 +9,8 @@
 # WHAT IT CHECKS:
 #   - wyrd-spec: no server-tier or async-runtime deps at --no-default-features
 #   - wyrd-auth-verify: no PyO3, no sqlx
-#   - wyrd-client: no DB, cloud SDK, object-store, or engine deps
-#   - vala-sdk: no server, database, storage, cloud, or query-engine deps
+#   - wyrd-client (including its Bifrost client): no DB, cloud SDK, object-store,
+#     engine, server, or test-harness deps
 #   - wyrd-mcp: no sqlx, datafusion, server-owned Vala engines, or axum
 #   - skald-prompt: no network runtime or engine deps; stays the Skald/Wyrd boundary
 #   - skald engine crates: no Wyrd/Vala deps outside the locked foundation set
@@ -39,24 +39,14 @@ done
 # HTTP client for the auth exchange and HTTP transport. `axum` still flags the
 # server HTTP stack.
 forbidden_wyrd_client=$(cargo tree -p wyrd-client --all-features -e normal | \
-  rg '(^|[ ─└├])(sqlx|tokio-postgres|postgres|deltalake|datafusion|axum|kube|aws-sdk|azure_|google-cloud|opendal|rdkafka|lapin|redis|deadpool-|vala-)' || true)
+  rg '(^|[ ─└├])(sqlx|tokio-postgres|postgres|deltalake|datafusion|axum|kube|aws-sdk|azure_|google-cloud|opendal|rdkafka|lapin|redis|deadpool-|vala-|wyrd-server|wyrd-testing)' || true)
 if [ -n "$forbidden_wyrd_client" ]; then
   echo "FAIL: wyrd-client pulls forbidden client-tier deps:"
   echo "$forbidden_wyrd_client"
   exit 1
 fi
 
-# The Vala SDK is a first-class client owner. Its optional Python projection
-# does not permit server, database, storage, cloud, or query-engine dependencies.
-forbidden_vala_sdk=$(cargo tree -p vala-sdk --all-features -e normal | \
-  rg '(^|[ ─└├])(sqlx|tokio-postgres|postgres|deltalake|datafusion|axum|kube|aws-sdk|azure_|google-cloud|opendal|rdkafka|lapin|redis|deadpool-|vala-bifrost|vala-sql|wyrd-server|wyrd-testing)' || true)
-if [ -n "$forbidden_vala_sdk" ]; then
-  echo "FAIL: vala-sdk pulls forbidden client-tier deps:"
-  echo "$forbidden_vala_sdk"
-  exit 1
-fi
-
-# S3.C7: wyrd-mcp may depend on vala-sdk's client projection but must stay
+# S3.C7: wyrd-mcp may depend on wyrd-client's Bifrost client but must stay
 # engine-free (no vala-bifrost, vala-sql, sqlx, datafusion, or axum).
 # Mirror of the wyrd-client guard above. Dev-deps are excluded (-e normal).
 forbidden_wyrd_mcp=$(cargo tree -p wyrd-mcp --all-features -e normal | \

@@ -10,7 +10,7 @@ works. **A lower tier never substitutes for a missing higher one.**
 
 | Tier | What it drives | Where it lives | Needs |
 |---|---|---|---|
-| 1 — user journey | the real SDK against a real server, client → server → client | `crates/wyrd/wyrd-testing/tests/`, `crates/wyrd/wyrd-mcp/tests/`, `vala-sdk`'s `pg_bifrost_e2e` | Postgres + booted server |
+| 1 — user journey | the real SDK against a real server, client → server → client | `crates/wyrd/wyrd-testing/tests/`, `crates/wyrd/wyrd-mcp/tests/`, `wyrd-client`'s `pg_bifrost_e2e` | Postgres + booted server |
 | 2 — integration | one subsystem against its real dependency, no server | `crates/vala/vala-bifrost-redux/tests/`, `crates/wyrd/wyrd-sql/tests/`, … | usually Postgres |
 | 3 — unit | one function or type, in isolation | `src/**/mod tests` | nothing |
 

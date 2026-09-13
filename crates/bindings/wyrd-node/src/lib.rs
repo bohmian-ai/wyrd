@@ -8,7 +8,7 @@ use arrow::record_batch::RecordBatch;
 use napi::bindgen_prelude::Buffer;
 use napi_derive::napi;
 use tokio::sync::Mutex as AsyncMutex;
-use vala_sdk::{QueryResultStream, ValaSdkError};
+use wyrd_client::bifrost::{BifrostClientError, QueryResultStream};
 use wyrd_queue::QueueConfig;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
@@ -86,7 +86,7 @@ impl NativeLifecycleResult {
     }
 
     /// Builds one failed lifecycle projection with stable Wyrd metadata.
-    fn failure(error: &ValaSdkError) -> Self {
+    fn failure(error: &BifrostClientError) -> Self {
         let projected = wyrd_spec::error::WyrdError::from(error);
         let problem = projected.as_problem_json();
         Self {
@@ -137,7 +137,7 @@ impl NativeQueryStart {
     }
 
     /// Builds the failed side with stable metadata retained as independent fields.
-    fn failure(error: &ValaSdkError) -> Self {
+    fn failure(error: &BifrostClientError) -> Self {
         let projected = wyrd_spec::error::WyrdError::from(error);
         let problem = projected.as_problem_json();
         Self {
@@ -225,7 +225,7 @@ impl NativeTableConfig {
     /// # Errors
     ///
     /// Returns a napi error when the config or its schema cannot be encoded.
-    fn project(config: &vala_sdk::TableConfig) -> napi::Result<Self> {
+    fn project(config: &wyrd_client::bifrost::TableConfig) -> napi::Result<Self> {
         let mut schema_ipc = Vec::new();
         {
             let mut writer =
@@ -250,7 +250,7 @@ impl NativeTableConfig {
     /// # Errors
     ///
     /// Returns a napi error when the text is not one serialized `TableConfig`.
-    fn parse(&self) -> napi::Result<vala_sdk::TableConfig> {
+    fn parse(&self) -> napi::Result<wyrd_client::bifrost::TableConfig> {
         serde_json::from_str(&self.config_json).map_err(napi_error)
     }
 }
@@ -298,7 +298,8 @@ pub fn table_config_from_json_schema(
 ) -> napi::Result<NativeTableConfig> {
     let schema: serde_json::Value = serde_json::from_str(&schema_json)
         .map_err(|error| napi::Error::from_reason(format!("invalid JSON schema: {error}")))?;
-    let config = vala_sdk::TableConfig::from_json_schema(&table, &schema).map_err(napi_error)?;
+    let config =
+        wyrd_client::bifrost::TableConfig::from_json_schema(&table, &schema).map_err(napi_error)?;
     NativeTableConfig::project(&apply_layout(config, layout_json.as_deref())?)
 }
 
@@ -321,13 +322,13 @@ pub async fn describe_table_config(
     credential: Option<String>,
     grpc_url: Option<String>,
 ) -> napi::Result<NativeTableConfig> {
-    let client = vala_sdk::client_from_options(
+    let client = wyrd_client::bifrost::client_from_options(
         server_url.as_deref(),
         credential.as_deref(),
         grpc_url.as_deref(),
     )
     .map_err(napi_error)?;
-    let config = vala_sdk::TableConfig::describe(&client, &table)
+    let config = wyrd_client::bifrost::TableConfig::describe(&client, &table)
         .await
         .map_err(napi_error)?;
     NativeTableConfig::project(&config)
@@ -339,9 +340,9 @@ pub async fn describe_table_config(
 ///
 /// Returns a napi error when the text is not one `PhysicalLayoutWire`.
 fn apply_layout(
-    config: vala_sdk::TableConfig,
+    config: wyrd_client::bifrost::TableConfig,
     layout_json: Option<&str>,
-) -> napi::Result<vala_sdk::TableConfig> {
+) -> napi::Result<wyrd_client::bifrost::TableConfig> {
     match layout_json {
         None => Ok(config),
         Some(layout) => {
@@ -357,7 +358,7 @@ fn apply_layout(
 /// The one Bifrost client: query any authorized table, write to the active one.
 ///
 /// Mirrors the Python binding: both are thin conversions over the one
-/// [`vala_sdk::Bifrost`], so batching, backpressure, registration, and the
+/// [`wyrd_client::bifrost::Bifrost`], so batching, backpressure, registration, and the
 /// query contract have exactly one owner.
 #[napi]
 pub struct NativeBifrost {
@@ -365,7 +366,7 @@ pub struct NativeBifrost {
     ///
     /// Shared through an [`Arc`] so a blocking drain can move it onto a
     /// blocking worker without stalling the Node event loop.
-    client: Arc<vala_sdk::Bifrost>,
+    client: Arc<wyrd_client::bifrost::Bifrost>,
 }
 
 /// Connects one Bifrost client, optionally already bound to a write target.
@@ -386,16 +387,17 @@ pub async fn connect_bifrost(
     credential: Option<String>,
     grpc_url: Option<String>,
 ) -> napi::Result<NativeBifrost> {
-    let client = vala_sdk::client_from_options(
+    let client = wyrd_client::bifrost::client_from_options(
         server_url.as_deref(),
         credential.as_deref(),
         grpc_url.as_deref(),
     )
     .map_err(napi_error)?;
     let table = table.map(|table| table.parse()).transpose()?;
-    let handle = vala_sdk::Bifrost::connect_with_config(&client, table, QueueConfig::default())
-        .await
-        .map_err(napi_error)?;
+    let handle =
+        wyrd_client::bifrost::Bifrost::connect_with_config(&client, table, QueueConfig::default())
+            .await
+            .map_err(napi_error)?;
     Ok(NativeBifrost {
         client: Arc::new(handle),
     })
@@ -414,7 +416,7 @@ impl NativeBifrost {
     pub async fn register(&self) -> napi::Result<NativeLifecycleResult> {
         match self.client.register().await {
             Ok(outcome) => NativeLifecycleResult::success(&serde_json::Value::String(
-                vala_sdk::register_outcome_name(outcome).to_owned(),
+                wyrd_client::bifrost::register_outcome_name(outcome).to_owned(),
             )),
             Err(error) => Ok(NativeLifecycleResult::failure(&error)),
         }
@@ -771,7 +773,7 @@ impl NativeBifrostQueryStream {
                     }
                 } else {
                     *stream_slot = None;
-                    return Err(sdk_error(&ValaSdkError::IncompleteQueryStream));
+                    return Err(sdk_error(&BifrostClientError::IncompleteQueryStream));
                 };
                 *stream_slot = None;
                 *self
@@ -867,8 +869,8 @@ impl NativeBifrostQueryStream {
 fn correlation(
     card_ref: Option<&str>,
     run_id: Option<String>,
-) -> napi::Result<vala_sdk::Correlation> {
-    Ok(vala_sdk::Correlation {
+) -> napi::Result<wyrd_client::bifrost::Correlation> {
+    Ok(wyrd_client::bifrost::Correlation {
         card_ref: card_ref
             .map(str::parse)
             .transpose()
@@ -882,11 +884,11 @@ fn correlation(
 /// # Errors
 ///
 /// Returns a structured SDK protocol error for an unknown value.
-fn parse_visibility(value: &str) -> Result<VisibilityMode, ValaSdkError> {
+fn parse_visibility(value: &str) -> Result<VisibilityMode, BifrostClientError> {
     match value {
         "published_only" => Ok(VisibilityMode::PublishedOnly),
         "fused" => Ok(VisibilityMode::Fused),
-        _ => Err(ValaSdkError::Protocol(
+        _ => Err(BifrostClientError::Protocol(
             "visibility must be published_only or fused".to_owned(),
         )),
     }
@@ -897,11 +899,11 @@ fn parse_visibility(value: &str) -> Result<VisibilityMode, ValaSdkError> {
 /// # Errors
 ///
 /// Returns a structured SDK protocol error for an unknown value.
-fn parse_freshness(value: &str) -> Result<FreshnessPolicy, ValaSdkError> {
+fn parse_freshness(value: &str) -> Result<FreshnessPolicy, BifrostClientError> {
     match value {
         "strict" => Ok(FreshnessPolicy::Strict),
         "allow_degraded" => Ok(FreshnessPolicy::AllowDegraded),
-        _ => Err(ValaSdkError::Protocol(
+        _ => Err(BifrostClientError::Protocol(
             "freshness must be strict or allow_degraded".to_owned(),
         )),
     }
@@ -912,9 +914,9 @@ fn parse_freshness(value: &str) -> Result<FreshnessPolicy, ValaSdkError> {
 /// # Errors
 ///
 /// Returns the stable public validation error when the value is not a `UUIDv7` request ID.
-fn parse_request_id(value: &str) -> Result<RequestId, ValaSdkError> {
+fn parse_request_id(value: &str) -> Result<RequestId, BifrostClientError> {
     RequestId::parse(value).map_err(|error| {
-        ValaSdkError::Transport(WyrdError::Validation {
+        BifrostClientError::Transport(WyrdError::Validation {
             message: error.to_string(),
             details: serde_json::json!({"field": "request_id"}),
         })
@@ -967,7 +969,7 @@ fn problem_field(problem: &serde_json::Value, key: &str, fallback: &str) -> Stri
 }
 
 /// Projects an SDK error with its stable code intact.
-fn sdk_error(error: &ValaSdkError) -> napi::Error {
+fn sdk_error(error: &BifrostClientError) -> napi::Error {
     napi::Error::from_reason(format!(
         "[{}] {error}",
         wyrd_spec::error::WyrdError::from(error).code()

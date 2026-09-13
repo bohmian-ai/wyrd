@@ -23,11 +23,11 @@ mod pg_tests {
     use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
     use vala_bifrost_redux::namespaces::BifrostNamespace;
     use vala_bifrost_redux::resources::ORACLE_MAX_BATCH_SIZE;
-    use vala_sdk::{
+    use wyrd_client::WyrdClient;
+    use wyrd_client::bifrost::{
         Bifrost, BifrostGrpcTransport, BifrostIngestSink, BifrostTransportConfig, Correlation,
         IngestTransport, QueryClient, TableConfig, observe,
     };
-    use wyrd_client::WyrdClient;
     use wyrd_client::config::ClientConfig;
     use wyrd_client::transport::{GrpcConfig, HttpConfig};
     use wyrd_queue::{
@@ -47,12 +47,12 @@ mod pg_tests {
     ///
     /// The SDK keeps exactly one public projection, so these journeys assert
     /// the code through it rather than a second per-variant table.
-    fn sdk_code(error: &vala_sdk::ValaSdkError) -> &'static str {
+    fn sdk_code(error: &wyrd_client::bifrost::BifrostClientError) -> &'static str {
         wyrd_spec::error::WyrdError::from(error).code()
     }
 
     /// The scrubbed public detail one SDK error projects onto.
-    fn sdk_detail(error: &vala_sdk::ValaSdkError) -> String {
+    fn sdk_detail(error: &wyrd_client::bifrost::BifrostClientError) -> String {
         wyrd_spec::error::WyrdError::from(error)
             .as_problem_json()
             .get("detail")
@@ -285,9 +285,15 @@ mod pg_tests {
     pub(super) async fn oracle_query_status_cancel_impl() {
         let (srv, client, other_client, denied_client, other_tenant, table_fqn) =
             lifecycle_fixture().await;
-        let query = QueryClient::new(&client);
-        let other_query = QueryClient::new(&other_client);
-        let denied_query = QueryClient::new(&denied_client);
+        let query = wyrd_client::Bifrost::query_only(&client)
+            .query_client()
+            .clone();
+        let other_query = wyrd_client::Bifrost::query_only(&other_client)
+            .query_client()
+            .clone();
+        let denied_query = wyrd_client::Bifrost::query_only(&denied_client)
+            .query_client()
+            .clone();
         let (request_id, task) = stalled_query(&srv, &query, &table_fqn).await;
 
         let running = query.running().await.expect("running list");
@@ -480,7 +486,9 @@ mod pg_tests {
 
         let (srv, client, other_client, denied_client, other_tenant, table_fqn) =
             lifecycle_fixture().await;
-        let query = QueryClient::new(&client);
+        let query = wyrd_client::Bifrost::query_only(&client)
+            .query_client()
+            .clone();
         let (request_id, task) = stalled_query(&srv, &query, &table_fqn).await;
         let channel =
             wyrd_tonic::tonic::transport::Endpoint::from_shared(srv.grpc_url().expect("gRPC URL"))
@@ -834,7 +842,9 @@ mod pg_tests {
             freshness: FreshnessPolicy::Strict,
             deadline_ms: None,
         };
-        let mut stream = QueryClient::new(client)
+        let mut stream = wyrd_client::Bifrost::query_only(client)
+            .query_client()
+            .clone()
             .query(&request)
             .await
             .expect("Oracle query starts");
@@ -934,7 +944,9 @@ mod pg_tests {
             freshness: FreshnessPolicy::Strict,
             deadline_ms: None,
         };
-        let mut stream = QueryClient::new(client)
+        let mut stream = wyrd_client::Bifrost::query_only(client)
+            .query_client()
+            .clone()
             .query(&request)
             .await
             .expect("Oracle query starts");
@@ -1055,7 +1067,9 @@ mod pg_tests {
         config.grpc.endpoint = srv.grpc_url().expect("gRPC URL");
         config.grpc.connect_retries = 0;
         let client = WyrdClient::with_config(config).expect("SDK client");
-        let query = QueryClient::new(&client);
+        let query = wyrd_client::Bifrost::query_only(&client)
+            .query_client()
+            .clone();
 
         // The canonical signal table: its description must reproduce the
         // registry's own physical schema rather than an approximation of it.
@@ -1421,7 +1435,8 @@ mod pg_tests {
         let first_error = bifrost.flush().await.expect_err(
             "short deadline after server receipt must leave the durable result ambiguous",
         );
-        let vala_sdk::ValaSdkError::Queue(WyrdQueueError::Sink(first_sink_error)) = &first_error
+        let wyrd_client::bifrost::BifrostClientError::Queue(WyrdQueueError::Sink(first_sink_error)) =
+            &first_error
         else {
             panic!("the queue must receive an ambiguous sink result: {first_error}");
         };
@@ -1864,8 +1879,9 @@ mod pg_tests {
         let client = runtime.block_on(admin_client(&srv, "sdk-blocking-journey"));
 
         let fqn = owned_fqn("blocking_journey");
-        let bifrost = vala_sdk::blocking::Bifrost::connect_with_table(&client, table(&fqn))
-            .expect("blocking client connects");
+        let bifrost =
+            wyrd_client::bifrost::blocking::Bifrost::connect_with_table(&client, table(&fqn))
+                .expect("blocking client connects");
 
         assert_eq!(
             bifrost.register().expect("register the table"),

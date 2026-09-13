@@ -18,9 +18,9 @@
 
 use arrow::datatypes::SchemaRef;
 use uuid::Uuid;
-use vala_sdk::grpc::BifrostGrpcTransport;
-use vala_sdk::{Bifrost, Correlation, IngestTransport, TableConfig};
 use wyrd_client::WyrdClient;
+use wyrd_client::bifrost::BifrostGrpcTransport;
+use wyrd_client::bifrost::{Bifrost, Correlation, IngestTransport, TableConfig};
 use wyrd_client::config::ClientConfig;
 use wyrd_queue::{ClientByteBudget, OwnedIpcBytes, QueueConfig, SealedBatch, SinkError};
 use wyrd_spec::error::WyrdError;

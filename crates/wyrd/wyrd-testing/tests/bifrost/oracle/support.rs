@@ -23,7 +23,6 @@ use vala_bifrost_redux::oracle::analytical::{
 };
 use vala_bifrost_redux::parquet::writer_properties::bifrost_writer_properties;
 use vala_bifrost_redux::schema::with_managed_columns;
-use vala_sdk::QueryClient;
 use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
@@ -304,7 +303,9 @@ pub(crate) async fn query_rows(
     table: &str,
     visibility: VisibilityMode,
 ) -> Result<u64, JourneyError> {
-    let mut stream = QueryClient::new(client)
+    let mut stream = wyrd_client::Bifrost::query_only(client)
+        .query_client()
+        .clone()
         .query(&BifrostQueryRequest {
             sql: format!(
                 "SELECT id, filter_key, unused_payload FROM vala.bifrost.{table} ORDER BY id"

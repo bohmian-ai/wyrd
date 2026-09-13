@@ -634,7 +634,7 @@ pub async fn seed_canonical_signals(
         ("vala.logs.records", logs),
         ("vala.metrics.points", points),
     ] {
-        let described = vala_sdk::TableConfig::describe(writer.client(), fqn)
+        let described = wyrd_client::bifrost::TableConfig::describe(writer.client(), fqn)
             .await
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         writer

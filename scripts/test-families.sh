@@ -41,7 +41,6 @@ FAMILY_VALA=(
   vala-drift
   vala-eval
   vala-ingest
-  vala-sdk
   vala-sql
 )
 

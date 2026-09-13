@@ -174,7 +174,7 @@ description = "Run Bifrost-facing unit tests in shared server, harness, SDK, and
 run = """
 cargo nextest run --locked -p wyrd-testing --lib -E 'test(/^bifrost::/) | test(/^interleaving::/) | test(/^load::/) | test(/^server::production_composition_tests::/)'
 cargo nextest run --locked -p wyrd-server --lib --features test-support -E 'test(/^bifrost::/) | test(/^oracle::/) | test(/^query::/) | test(/^grpc::(query|scribe_tail)::/) | test(/bifrost|oracle|scribe|forge/)'
-cargo nextest run --locked -p vala-sdk --lib -E 'test(/^query::/) | test(/^sdk::bifrost/)'
+cargo nextest run --locked -p wyrd-client --lib -E 'test(/^bifrost::query::/) | test(/^bifrost::sdk::/)'
 """
 
 [tasks."test:bifrost:unit:python:inner"]
@@ -273,12 +273,12 @@ run = "bash scripts/run-bifrost-journeys.sh"
 # aggregate and is the place to look before adding a journey.
 
 [tasks."test:bifrost:journey:sdk"]
-description = "Tier-1 journeys: the vala-sdk public Bifrost client path"
+description = "Tier-1 journeys: the wyrd_client::Bifrost public client path"
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:bifrost:journey:sdk:inner'"
 [tasks."test:bifrost:journey:sdk:inner"]
 hide = true
-description = "vala-sdk pg_bifrost_e2e binary, whole"
-run = "cargo nextest run --locked -p vala-sdk --test pg_bifrost_e2e -P journey --run-ignored=all"
+description = "wyrd-client pg_bifrost_e2e binary, whole"
+run = "cargo nextest run --locked -p wyrd-client --test pg_bifrost_e2e -P journey --run-ignored=all"
 
 [tasks."test:bifrost:journey:forge"]
 description = "Tier-1 journeys: compaction, maintenance, publication recovery, lease reclaim"
@@ -371,7 +371,7 @@ run = "BIFROST_RESOURCE_GOVERNANCE_SELF_TEST=1 bash scripts/checks/bifrost-resou
 description = "Run formatting, scoped Clippy, and static Bifrost boundary checks."
 run = """
 cargo fmt --all -- --check
-cargo clippy --locked -p vala-bifrost-redux -p vala-sdk -p vala-sql -p wyrd-mcp -p wyrd-server -p wyrd-testing --all-targets --features wyrd-server/test-support -- -D warnings
+cargo clippy --locked -p vala-bifrost-redux -p wyrd-client -p vala-sql -p wyrd-mcp -p wyrd-server -p wyrd-testing --all-targets --features wyrd-server/test-support -- -D warnings
 mise run check:bifrost-oracle-deploy
 mise run check:bifrost-resource-governance
 mise run check:object-store-pin

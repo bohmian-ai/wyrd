@@ -20,7 +20,6 @@ use vala_bifrost_redux::storage::{
     BifrostStorage, BifrostStorageError, CacheEffect, MetadataCacheSnapshot, StorageLifecycle,
     StorageOperation, StorageOperationBarrier, StorageRequestOutcome,
 };
-use vala_sdk::QueryClient;
 use wyrd_client::WyrdClient;
 use wyrd_spec::vala::api::{BifrostQueryRequest, FreshnessPolicy, VisibilityMode};
 use wyrd_testing::WyrdTestServer;
@@ -624,7 +623,9 @@ async fn query_ids_between(
 /// Returns a client or Arrow error, and an error when the stream carries no
 /// terminal frame or a leading column that is not a non-null `Int64`.
 async fn collect_ids(client: &WyrdClient, sql: String) -> Result<Vec<i64>, JourneyError> {
-    let mut stream = QueryClient::new(client)
+    let mut stream = wyrd_client::Bifrost::query_only(client)
+        .query_client()
+        .clone()
         .query(&BifrostQueryRequest {
             sql,
             visibility: VisibilityMode::PublishedOnly,

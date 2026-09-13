@@ -7,30 +7,51 @@ rust-version = { workspace = true }
 repository = { workspace = true }
 authors = { workspace = true }
 publish = false
-description = "External Wyrd client transport runtime."
+description = "Shared Wyrd client: transport, authentication, and composed client capabilities."
 
 [lib]
 path = "src/lib.rs"
 
+[features]
+# Exposes the raw Bifrost ingest transport to test harnesses. Never enabled by
+# an SDK package.
+test-support = []
+
 [dependencies]
+arrow = { workspace = true }
+arrow-schema = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
 chrono = { workspace = true }
+futures-util = { workspace = true }
+hex = { workspace = true }
 reqwest = { workspace = true }
 schemars = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "time"] }
+tokio-stream = "0.1"
 toml = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
+wyrd-queue = { workspace = true }
+wyrd-runtime = { workspace = true }
 wyrd-spec = { workspace = true }
-wyrd-tonic = { workspace = true }
+wyrd-tonic = { workspace = true, features = ["client"] }
 wyrd-tls = { workspace = true }
 wyrd-utils = { workspace = true }
 
 [dev-dependencies]
 secrecy = { workspace = true }
+sqlx = { workspace = true, features = ["postgres"] }
+vala-bifrost-redux = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }
 wyrd-testing = { workspace = true }
+
+[[test]]
+name = "pg_bifrost_e2e"
+required-features = ["test-support"]

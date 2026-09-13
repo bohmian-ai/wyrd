@@ -1,18 +1,22 @@
-//! External Wyrd client runtime surfaces.
+//! The shared Wyrd client: the sole SDK-facing Rust client surface.
 //!
-//! This crate owns the external client transport configuration and credential
-//! resolution. Durable shared security refs live in `wyrd-spec`.
+//! This crate owns client transport configuration, credential resolution,
+//! authentication, and the composed client capabilities — including
+//! [`Bifrost`] — that the Rust, Python, and TypeScript SDKs project. Durable
+//! shared security refs live in `wyrd-spec`.
 
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
 pub mod auth;
+pub mod bifrost;
 pub mod client;
 pub mod config;
 pub mod error;
 pub mod global_config;
 pub mod transport;
 
+pub use bifrost::Bifrost;
 pub use client::WyrdClient;
 pub use global_config::GlobalConfig;
 

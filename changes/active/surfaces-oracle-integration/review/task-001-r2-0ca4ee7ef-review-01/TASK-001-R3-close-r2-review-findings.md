@@ -1,7 +1,7 @@
 ---
 id: TASK-001-R3
 kind: remediation
-status: ready
+status: implemented
 spec: SPEC-surfaces-oracle-integration
 spec_revision: 7
 requirements: [REQ-026, INV-025, AC-005]
@@ -112,11 +112,9 @@ three-consecutive-runs proof: one audit write path (`vala.audit_staging`) and on
 | R1-7 bare `TenantConn`, Card handler docs | `a41adeafc`; OpenAPI regenerated | `mise run codegen:check` pass | PASS |
 | R2-1 service-account verdicts survive failure | Allowed row committed standalone before the transaction in trusted-issuer delete, binding create/delete, principal revoke, API-key issue (`4272ef988`) | wyrd-server lib admin/auth/revoke pg tests 22/22 | PASS |
 | Single audit writer | Removed wyrd-sql Card-delete audit row, tracing eval audit writer, `vala_sql` `record_audit` alias (`dfc930031`) | `pg_eval_v1_protocol` 9/9; `pg_cards_register` `exact_delete_enforces_inbound_references_and_is_idempotent`; `test:bifrost:integration:server` 67/67 | PASS |
+| Auth audit on the single outbox | Token exchange, API-key issue, refresh-family revocation, card-scope mint and auth failures append `AuditEvent`s to `vala.audit_staging`; wyrd-sql auth audit tables, inserts and migrations deleted (`de2a6a7fa`, `6d18cbfce`) | wyrd-auth and wyrd-server auth pg tests read staging; `mise run lints` pass | PASS |
+| Python journey green | Stale client expectations corrected (`WyrdError`, `{"variant": ...}` details); Scribe recovery decodes system-owner staged records, admitted only for the audit log (`scribe/hot_stage.rs`) | `test:bifrost:journey:python` 34/34; `scribe::hot_stage::tests::a_system_owner_record_decodes_and_is_limited_to_the_audit_log`; redux clippy pass | PASS |
 
 Also: `mise run lints` pass; `mise run fmt` clean; `git diff --check` clean.
 
-Limits: `test:bifrost:journey:python` previously pointed at a moved file and ran
-nothing; with the path fixed, 30 pass and 4 fail on client error text/details
-(`test_negative_bad_card_ref_raises`, `test_negative_reserved_column_is_refused_locally`,
-`test_bifrost_query_missing_terminal_fails_closed[schema|batch]`), unrelated to audit.
-Oracle read-audit commit failures are logged and counted, not replayed.
+Limits: Oracle read-audit commit failures are logged and counted, not replayed.

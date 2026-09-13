@@ -83,7 +83,7 @@ def test_bifrost_query_missing_terminal_fails_closed(
         assert captured.value.title == "Query stream incomplete"
         assert captured.value.message == captured.value.detail
         assert captured.value.remediation
-        assert captured.value.details is None
+        assert captured.value.details == {"variant": "query_stream_incomplete"}
         await stream.aclose()
         with pytest.raises(StopAsyncIteration):
             await stream.__anext__()

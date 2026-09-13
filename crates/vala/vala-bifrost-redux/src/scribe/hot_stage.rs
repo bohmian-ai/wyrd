@@ -47,6 +47,7 @@ use crate::scribe::assembly::{
     ReadyMember, RecoveredMember, ScribeAssemblyKey, StagedMemberId, StagingClaimId,
 };
 use crate::scribe::stream_identity::{NodeId, WriterEpoch};
+use crate::tables::AuditLogTable;
 
 /// Only staged-record version this server reads or writes.
 const STAGED_RECORD_VERSION: u16 = 1;
@@ -298,7 +299,9 @@ impl StagedRunFile {
 pub struct StagedHotSourceRecordV1 {
     /// Closed format version validated before any other field is trusted.
     version: u16,
-    /// Tenant owning every row of the member.
+    /// Tenant owning every row of the member; the system owner only for the
+    /// audit log, which [`Self::assembly_key`] enforces on recovery.
+    #[serde(deserialize_with = "deserialize_record_tenant")]
     tenant: DataTenantId,
     /// Canonical `<namespace>.<name>` the member belongs to.
     table_fqn: String,
@@ -420,6 +423,12 @@ impl StagedHotSourceRecordV1 {
                 self.table_fqn
             ))
         })?;
+        if self.tenant.as_uuid().is_nil() && !AuditLogTable::admits_system_owner(&table) {
+            return Err(invalid(format!(
+                "the system owner cannot stage `{}`",
+                self.table_fqn
+            )));
+        }
         let schema_fingerprint =
             SchemaFingerprint(unhex(&self.schema_fingerprint).ok_or_else(|| {
                 invalid("schema fingerprint is not a 32-byte hex digest".to_owned())
@@ -810,6 +819,27 @@ impl ScribeHotStage {
     }
 }
 
+/// Decodes a staged record's tenant, admitting the system owner.
+///
+/// System-attributed audit history stages under [`DataTenantId::SYSTEM_OWNER`],
+/// the nil sentinel that `DataTenantId`'s own decoder rejects, so without this a
+/// frozen audit-log member could be written but never recovered. Admission is
+/// narrowed to the audit log by [`StagedHotSourceRecordV1::assembly_key`].
+///
+/// # Errors
+///
+/// Returns the decoder's error for a value that is neither nil nor a `UUIDv7`.
+fn deserialize_record_tenant<'de, D>(deserializer: D) -> Result<DataTenantId, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Uuid::deserialize(deserializer)?;
+    if value.is_nil() {
+        return Ok(DataTenantId::SYSTEM_OWNER);
+    }
+    DataTenantId::new(value).map_err(serde::de::Error::custom)
+}
+
 /// Name of the one durable record file inside a member directory.
 pub(crate) const RECORD_FILE_NAME: &str = "member.staged.json";
 /// Name of the incomplete record a crash may leave behind.
@@ -977,6 +1007,7 @@ mod tests {
     use super::*;
     use crate::catalog::layout::{PhysicalLayout, TimeGranularity};
     use crate::namespaces::BifrostNamespace;
+    use crate::tables::DomainTable as _;
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 
     /// Builds one assembly key for the staged-namespace fixtures.
@@ -1092,6 +1123,42 @@ mod tests {
         assert_eq!(ready.id(), member);
         assert_eq!(ready.encoded_bytes(), 16);
         assert_eq!(ready.ready_at(), ready_at());
+    }
+
+    /// A system-owner record decodes again, but only the audit log may use it.
+    ///
+    /// Audit publication freezes members under the nil system owner; recovery
+    /// must read them back instead of failing boot, while every other table
+    /// keeps refusing the nil tenant.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the record cannot be encoded or decoded.
+    #[test]
+    fn a_system_owner_record_decodes_and_is_limited_to_the_audit_log() {
+        let key = fixture_key();
+        let mut record = StagedHotSourceRecordV1::ready(
+            &key,
+            StagedMemberId::new(4, 1),
+            StagedLsnRange { min: 1, max: 2 },
+            Vec::new(),
+            ready_at(),
+        );
+        record.tenant = DataTenantId::SYSTEM_OWNER;
+        let bytes = serde_json::to_vec(&record).expect("the record encodes");
+        let decoded: StagedHotSourceRecordV1 =
+            serde_json::from_slice(&bytes).expect("a system-owner record decodes");
+        assert_eq!(decoded, record);
+        assert!(
+            decoded.assembly_key(RECORD_FILE_NAME).is_err(),
+            "a non-audit table refuses the system owner"
+        );
+
+        record.table_fqn = TableRef::new(BifrostNamespace::Audit, AuditLogTable::NAME).fqn();
+        assert!(
+            record.assembly_key(RECORD_FILE_NAME).is_ok(),
+            "the audit log admits the system owner"
+        );
     }
 
     /// An incomplete record is removed and never counted as a query source.

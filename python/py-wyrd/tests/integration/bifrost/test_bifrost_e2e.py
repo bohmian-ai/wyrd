@@ -329,7 +329,7 @@ def test_observe_record_swallows_and_counts(wyrd_server: WyrdTestServer) -> None
 @pytest.mark.integration
 def test_negative_bad_card_ref_raises(wyrd_server: WyrdTestServer) -> None:
     bifrost = _client(wyrd_server, "genai.bad")
-    with pytest.raises(ValueError):
+    with pytest.raises(WyrdError, match="card ref is missing @version"):
         bifrost.insert(_row(0), {"card_ref": "not-a-ref"})
 
 
@@ -340,7 +340,7 @@ def test_negative_reserved_column_is_refused_locally() -> None:
     class Reserved(BaseModel):
         card_ref: str
 
-    with pytest.raises(ValueError, match="card_ref"):
+    with pytest.raises(WyrdError, match="card_ref"):
         TableConfig(Reserved, "genai.reserved")
 
 

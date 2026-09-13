@@ -302,7 +302,7 @@ async fn issue_key(
     service
         .audit(&mut conn, &issued, caller.principal(), req_id)
         .await
-        .map_err(|error| sql_error(wyrd_sql::SqlError::from(error)))?;
+        .map_err(WyrdErrorResponse::from)?;
     conn.commit().await.map_err(sql_error)?;
 
     Ok(Json(issued.response))
@@ -604,17 +604,25 @@ mod pg_tests {
 
         let mut verify_conn = fixture.tenant_conn().await.expect("verify conn opens");
         let row = sqlx::query(
-            "SELECT issuer_principal_id, target_sa_id, request_id, data_tenant_id
-             FROM wyrd.audit_credential_issuance
-             WHERE data_tenant_id = $1",
+            "SELECT principal_id, detail, request_id, data_tenant_id
+             FROM vala.audit_staging
+             WHERE data_tenant_id = $1
+               AND operation = 'auth.api_key.issue'
+               AND detail LIKE '%credential_issuance%'",
         )
         .bind(tenant.as_uuid())
         .fetch_one(&mut **verify_conn.transaction())
         .await
-        .expect("audit row was written");
+        .expect("credential issuance audit event was staged");
 
-        let audit_actor: Uuid = row.get("issuer_principal_id");
-        let audit_target: Uuid = row.get("target_sa_id");
+        let audit_actor: Uuid = row.get("principal_id");
+        let detail: serde_json::Value =
+            serde_json::from_str(row.get("detail")).expect("audit detail is json");
+        let audit_target: Uuid = detail["target_principal_id"]
+            .as_str()
+            .expect("target principal id is present")
+            .parse()
+            .expect("target principal id is a uuid");
         let audit_request_id: String = row.get("request_id");
         let audit_tenant: Uuid = row.get("data_tenant_id");
         assert_eq!(audit_actor, creator, "audit records the issuing actor");

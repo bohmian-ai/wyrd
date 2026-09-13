@@ -2,7 +2,6 @@
 // raw-query grep allowlist: auth tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use chrono::{DateTime, Utc};
-use serde_json::Value;
 use sqlx::types::{Json, Uuid};
 use wyrd_spec::reference::CardRef;
 
@@ -312,125 +311,6 @@ pub async fn insert_refresh_token(
         .bind(expires_at)
         .execute(&mut **conn.transaction())
         .await?;
-    Ok(())
-}
-
-/// Insert durable credential issuance audit.
-pub async fn insert_audit_credential_issuance(
-    conn: &mut TenantConn<'_>,
-    id: Uuid,
-    issuer_principal_id: Uuid,
-    target_sa_id: Uuid,
-    api_key_id: Uuid,
-    request_id: &str,
-    expires_at: DateTime<Utc>,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        r#"
-        INSERT INTO wyrd.audit_credential_issuance (
-            id, data_tenant_id, issuer_principal_id, target_sa_id,
-            api_key_id, request_id, expires_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-        "#,
-    )
-    .bind(id)
-    .bind(conn.data_tenant_id().as_uuid())
-    .bind(issuer_principal_id)
-    .bind(target_sa_id)
-    .bind(api_key_id)
-    .bind(request_id)
-    .bind(expires_at)
-    .execute(&mut **conn.transaction())
-    .await?;
-    Ok(())
-}
-
-/// Insert durable token-exchange audit.
-pub async fn insert_audit_token_exchange(
-    conn: &mut TenantConn<'_>,
-    id: Uuid,
-    subject_principal_id: Uuid,
-    actor_principal_id: Uuid,
-    act_chain: Value,
-    request_id: &str,
-    expires_at: DateTime<Utc>,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        r#"
-        INSERT INTO wyrd.audit_token_exchange (
-            id, data_tenant_id, subject_principal_id, actor_principal_id,
-            act_chain, request_id, expires_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-        "#,
-    )
-    .bind(id)
-    .bind(conn.data_tenant_id().as_uuid())
-    .bind(subject_principal_id)
-    .bind(actor_principal_id)
-    .bind(act_chain)
-    .bind(request_id)
-    .bind(expires_at)
-    .execute(&mut **conn.transaction())
-    .await?;
-    Ok(())
-}
-
-/// One `wyrd.audit_card_scope_mint` row payload for
-/// [`insert_audit_card_scope_mint`]. The tenant is derived from the
-/// `TenantConn`, not carried here.
-pub struct CardScopeMintAudit<'a> {
-    /// Row primary key.
-    pub id: Uuid,
-    /// Optional minting principal (None for pre-authentication failures).
-    pub principal_id: Option<Uuid>,
-    /// Mint kind: `api_key_exchange`, `refresh`, `delegation`, `jwt_bearer`, …
-    pub mint_kind: &'a str,
-    /// Root card whose scope was being minted.
-    pub root_card_ref: &'a CardRef,
-    /// Correlating request identifier.
-    pub request_id: &'a str,
-    /// Outcome tag: `success` or `failure`.
-    pub result: &'a str,
-    /// Number of cards in the resolved scope (present on success).
-    pub scope_member_count: Option<i32>,
-    /// Stable hash of the sorted scope member list (present on success).
-    pub scope_hash: Option<&'a str>,
-    /// JSON summary of scope members (empty array on failure).
-    pub scope_members: Value,
-    /// Stable Wyrd error code when `result = "failure"`.
-    pub failure_code: Option<&'a str>,
-    /// Human-readable error text when `result = "failure"`.
-    pub failure_reason: Option<&'a str>,
-}
-
-/// Insert durable card-ref scope mint audit.
-pub async fn insert_audit_card_scope_mint(
-    conn: &mut TenantConn<'_>,
-    audit: CardScopeMintAudit<'_>,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        r#"
-        INSERT INTO wyrd.audit_card_scope_mint (
-            id, data_tenant_id, principal_id, mint_kind, root_card_ref,
-            request_id, result, scope_member_count, scope_hash, scope_members,
-            failure_code, failure_reason
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-        "#,
-    )
-    .bind(audit.id)
-    .bind(conn.data_tenant_id().as_uuid())
-    .bind(audit.principal_id)
-    .bind(audit.mint_kind)
-    .bind(Json(audit.root_card_ref))
-    .bind(audit.request_id)
-    .bind(audit.result)
-    .bind(audit.scope_member_count)
-    .bind(audit.scope_hash)
-    .bind(audit.scope_members)
-    .bind(audit.failure_code)
-    .bind(audit.failure_reason)
-    .execute(&mut **conn.transaction())
-    .await?;
     Ok(())
 }
 

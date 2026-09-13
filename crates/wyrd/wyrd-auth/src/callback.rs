@@ -15,12 +15,16 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalKindTag;
 use wyrd_spec::auth::{IssuerUrl, TokenResponse, TokenType};
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
 use wyrd_sql::queries::auth::{
-    delete_user, insert_audit_token_exchange, insert_refresh_token, insert_user,
-    upsert_user_identity, user_id_by_identity,
+    delete_user, insert_refresh_token, insert_user, upsert_user_identity, user_id_by_identity,
 };
 use wyrd_sql::{SqlError, TenantConn, WyrdPostgres};
 
+use crate::audit::{
+    TOKEN_EXCHANGE_OPERATION, append_auth_audit, auth_event, auth_failure_code,
+    record_auth_audit_best_effort,
+};
 use crate::error::auth_error_to_wyrd;
 use crate::exchange_api_key::{ExchangedToken, role_refs, token_hash};
 use crate::login::{LoginStateEntry, PgLoginStateStore};
@@ -379,17 +383,22 @@ async fn issue_and_record_user_session(
     )
     .await
     .map_err(sql_error)?;
-    insert_audit_token_exchange(
-        conn,
-        Uuid::new_v4(),
-        principal_id,
-        principal_id,
-        serde_json::json!([]),
+    let user = PrincipalId::new(principal_id);
+    let event = auth_event(
         request_id,
-        expires_at,
-    )
-    .await
-    .map_err(sql_error)?;
+        TOKEN_EXCHANGE_OPERATION,
+        user,
+        PrincipalKindTag::User,
+        None,
+        AuditOutcome::Allowed,
+        AuditDetail::TokenExchange {
+            subject_principal_id: user,
+            actor_principal_id: user,
+            delegation_chain: Vec::new(),
+            expires_at,
+        },
+    );
+    append_auth_audit(conn, &event).await?;
 
     Ok(ExchangedToken {
         access_token: SecretString::from(access_token),
@@ -399,7 +408,12 @@ async fn issue_and_record_user_session(
     })
 }
 
-/// Best-effort audit write for a failed human authorization-code exchange.
+/// Best-effort audit of a refused human authorization-code exchange.
+///
+/// Stages one denied `auth.token.exchange` event carrying the closed failure
+/// code in its own transaction. `principal_id` is nil when the refusal happened
+/// before a user was resolved. Staging failures are logged, never returned, so
+/// the caller's original error still reaches the client.
 pub async fn audit_authorization_code_failure(
     postgres: &WyrdPostgres,
     tenant_id: DataTenantId,
@@ -407,60 +421,18 @@ pub async fn audit_authorization_code_failure(
     request_id: &str,
     error: &WyrdError,
 ) {
-    let mut conn = match postgres.tenant_conn(tenant_id).await {
-        Ok(conn) => conn,
-        Err(audit_error) => {
-            tracing::warn!(
-                error = %audit_error,
-                original_error = %error,
-                "OIDC authorization-code failure audit could not acquire tenant connection"
-            );
-            return;
-        }
-    };
-    if let Err(audit_error) = insert_audit_token_exchange(
-        &mut conn,
-        Uuid::new_v4(),
-        principal_id,
-        principal_id,
-        serde_json::json!([{ "error": audit_error_tag(error) }]),
+    let event = auth_event(
         request_id,
-        Utc::now() + ACCESS_TTL,
-    )
-    .await
-    {
-        tracing::warn!(
-            error = %audit_error,
-            original_error = %error,
-            "OIDC authorization-code failure audit insert failed"
-        );
-        return;
-    }
-    if let Err(audit_error) = conn.commit().await {
-        tracing::warn!(
-            error = %audit_error,
-            original_error = %error,
-            "OIDC authorization-code failure audit commit failed"
-        );
-    }
-}
-
-/// Return the stable audit tag used for authorization-code exchange failures.
-#[must_use]
-pub fn audit_error_tag(error: &WyrdError) -> &'static str {
-    match error {
-        WyrdError::InvalidState { .. } => "InvalidState",
-        WyrdError::InvalidToken { .. } => "InvalidToken",
-        WyrdError::DiscoveryUnavailable { .. } => "DiscoveryUnavailable",
-        WyrdError::AuthVerifyUnavailable { .. } => "AuthVerifyUnavailable",
-        WyrdError::InvalidNonce { .. } => "InvalidNonce",
-        WyrdError::Internal { .. } => "Internal",
-        WyrdError::TokenExpired { .. } => "TokenExpired",
-        WyrdError::BadTokenFormat { .. } => "BadTokenFormat",
-        WyrdError::CredentialRevoked { .. } => "CredentialRevoked",
-        WyrdError::RoleCorrupt { .. } => "RoleCorrupt",
-        _ => "WyrdError",
-    }
+        TOKEN_EXCHANGE_OPERATION,
+        PrincipalId::new(principal_id),
+        PrincipalKindTag::User,
+        None,
+        AuditOutcome::Denied,
+        AuditDetail::AuthFailure {
+            error_code: auth_failure_code(error),
+        },
+    );
+    record_auth_audit_best_effort(postgres.app_pool(), tenant_id, &event).await;
 }
 
 /// Verify the OIDC nonce bound to the login state.

@@ -11161,6 +11161,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "vala-sql",
  "wyrd-auth-issue",
  "wyrd-auth-oidc",
  "wyrd-auth-verify",

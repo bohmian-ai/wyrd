@@ -4,6 +4,7 @@
 //! HTTP extractors, handlers, middleware, and response mapping stay in
 //! `wyrd-server`.
 
+pub mod audit;
 pub mod callback;
 pub mod card_scope;
 pub(crate) mod error;

@@ -311,7 +311,7 @@ mod pg_tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].subject_principal_id, Uuid::nil());
         assert_eq!(rows[0].actor_principal_id, Uuid::nil());
-        assert_eq!(rows[0].error_tag, "InvalidToken");
+        assert_eq!(rows[0].error_tag, "INVALID_TOKEN");
     }
 
     #[tokio::test]
@@ -814,11 +814,12 @@ mod pg_tests {
             .tenant_conn_for(tenant)
             .await
             .expect("tenant conn opens");
-        let rows = sqlx::query_as::<_, (Uuid, Uuid, serde_json::Value)>(
-            "SELECT subject_principal_id, actor_principal_id, act_chain
-             FROM wyrd.audit_token_exchange
+        let rows = sqlx::query_as::<_, (Uuid, String)>(
+            "SELECT principal_id, detail
+             FROM vala.audit_staging
              WHERE data_tenant_id = $1
-             ORDER BY issued_at DESC",
+               AND operation = 'auth.token.exchange'
+             ORDER BY seq DESC",
         )
         .bind(tenant.as_uuid())
         .fetch_all(&mut **conn.transaction())
@@ -826,19 +827,27 @@ mod pg_tests {
         .expect("audit rows fetch");
         conn.commit().await.expect("audit query commits");
         rows.into_iter()
-            .map(
-                |(subject_principal_id, actor_principal_id, act_chain)| AuditRow {
-                    subject_principal_id,
-                    actor_principal_id,
-                    error_tag: act_chain
-                        .as_array()
-                        .and_then(|items| items.first())
-                        .and_then(|value| value.get("error"))
-                        .and_then(|value| value.as_str())
+            .map(|(principal_id, detail)| {
+                let detail: serde_json::Value =
+                    serde_json::from_str(&detail).expect("audit detail is json");
+                let id = |field: &str| {
+                    detail
+                        .get(field)
+                        .and_then(serde_json::Value::as_str)
+                        .map_or(principal_id, |value| {
+                            value.parse().expect("audit principal id is a uuid")
+                        })
+                };
+                AuditRow {
+                    subject_principal_id: id("subject_principal_id"),
+                    actor_principal_id: id("actor_principal_id"),
+                    error_tag: detail
+                        .get("error_code")
+                        .and_then(serde_json::Value::as_str)
                         .unwrap_or_default()
                         .to_owned(),
-                },
-            )
+                }
+            })
             .collect()
     }
 

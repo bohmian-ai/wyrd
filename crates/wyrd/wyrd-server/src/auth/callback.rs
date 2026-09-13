@@ -133,8 +133,8 @@ mod pg_tests {
     use crate::http::error::WyrdErrorResponse;
     use crate::state::AppState;
     use wyrd_auth::callback::{
-        AuthorizationCodeExchange, audit_authorization_code_failure, audit_error_tag,
-        ensure_user_identity, role_names_to_refs, verify_nonce,
+        AuthorizationCodeExchange, audit_authorization_code_failure, ensure_user_identity,
+        role_names_to_refs, verify_nonce,
     };
     use wyrd_auth::login::{LoginStateEntry, PgLoginStateStore};
 
@@ -267,8 +267,8 @@ mod pg_tests {
         let audit = audit_rows(&fixture).await;
         assert_eq!(audit.len(), 1);
         assert_eq!(audit[0].0, Uuid::nil());
-        assert_eq!(audit[0].1, Uuid::nil());
-        assert_eq!(audit[0].2, serde_json::json!([{ "error": "InvalidState" }]));
+        assert_eq!(audit[0].1, "denied");
+        assert_eq!(audit[0].2, auth_failure_detail("INVALID_TOKEN"));
     }
 
     #[tokio::test]
@@ -308,7 +308,8 @@ mod pg_tests {
         let audit = audit_rows(&fixture).await;
         assert_eq!(audit.len(), 1);
         assert_eq!(audit[0].0, Uuid::nil());
-        assert_eq!(audit[0].2, serde_json::json!([{ "error": "InvalidToken" }]));
+        assert_eq!(audit[0].1, "denied");
+        assert_eq!(audit[0].2, auth_failure_detail("INVALID_TOKEN"));
     }
 
     #[tokio::test]
@@ -361,8 +362,11 @@ mod pg_tests {
         let audit = audit_rows(&fixture).await;
         assert_eq!(audit.len(), 1);
         assert_eq!(audit[0].0, audit_principal_id);
-        assert_eq!(audit[0].1, audit_principal_id);
-        assert_eq!(audit[0].2, serde_json::json!([]));
+        assert_eq!(audit[0].1, "allowed");
+        let user = audit_principal_id.to_string();
+        assert_eq!(audit[0].2["subject_principal_id"], user.as_str());
+        assert_eq!(audit[0].2["actor_principal_id"], user.as_str());
+        assert_eq!(audit[0].2["delegation_chain"], serde_json::json!([]));
     }
 
     #[tokio::test]
@@ -405,8 +409,8 @@ mod pg_tests {
         let audit = audit_rows(&fixture).await;
         assert_eq!(audit.len(), 1);
         assert_eq!(audit[0].0, Uuid::nil());
-        assert_eq!(audit[0].1, Uuid::nil());
-        assert_eq!(audit[0].2, serde_json::json!([{ "error": "InvalidToken" }]));
+        assert_eq!(audit[0].1, "denied");
+        assert_eq!(audit[0].2, auth_failure_detail("INVALID_TOKEN"));
     }
 
     #[tokio::test]
@@ -452,14 +456,15 @@ mod pg_tests {
         assert!(email.is_none());
     }
 
+    /// A nonce mismatch is audited as a credential refusal.
     #[test]
-    fn audit_error_tags_use_variant_names_for_callback_failures() {
+    fn callback_nonce_failure_maps_to_invalid_token_code() {
         assert_eq!(
-            audit_error_tag(&wyrd_spec::error::WyrdError::InvalidNonce {
+            wyrd_auth::audit::auth_failure_code(&wyrd_spec::error::WyrdError::InvalidNonce {
                 message: "nonce".to_owned(),
                 details: serde_json::json!({}),
             }),
-            "InvalidNonce"
+            wyrd_spec::vala::audit_detail::AuditErrorCode::InvalidToken
         );
     }
 
@@ -744,16 +749,33 @@ mod pg_tests {
         headers
     }
 
-    async fn audit_rows(fixture: &PgFixture) -> Vec<(Uuid, Uuid, serde_json::Value)> {
+    /// Staged `auth.token.exchange` events as `(principal_id, outcome, detail)`,
+    /// oldest first.
+    ///
+    /// # Panics
+    /// Panics when the query fails or a detail is not JSON.
+    async fn audit_rows(fixture: &PgFixture) -> Vec<(Uuid, String, serde_json::Value)> {
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        sqlx::query_as(
-            "SELECT subject_principal_id, actor_principal_id, act_chain
-               FROM wyrd.audit_token_exchange
-              ORDER BY issued_at ASC",
+        let rows: Vec<(Uuid, String, String)> = sqlx::query_as(
+            "SELECT principal_id, outcome, detail
+               FROM vala.audit_staging
+              WHERE operation = 'auth.token.exchange'
+              ORDER BY seq ASC",
         )
         .fetch_all(&mut **conn.transaction())
         .await
-        .expect("audit query runs")
+        .expect("audit query runs");
+        rows.into_iter()
+            .map(|(principal_id, outcome, detail)| {
+                let detail = serde_json::from_str(&detail).expect("audit detail is json");
+                (principal_id, outcome, detail)
+            })
+            .collect()
+    }
+
+    /// Canonical detail of a refused exchange with `error_code`.
+    fn auth_failure_detail(error_code: &str) -> serde_json::Value {
+        serde_json::json!({ "kind": "auth_failure", "error_code": error_code })
     }
 
     async fn refresh_token_count(fixture: &PgFixture, principal_id: Uuid) -> i64 {

@@ -14,10 +14,16 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::TokenType;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::CardRef;
+use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
-    consume_active_refresh, insert_audit_token_exchange, insert_refresh_token_rotated,
-    list_service_account_roles, refresh_by_hash, revoke_refresh_family, service_account_by_id,
+    consume_active_refresh, insert_refresh_token_rotated, list_service_account_roles,
+    refresh_by_hash, revoke_refresh_family, service_account_by_id,
+};
+
+use crate::audit::{
+    REFRESH_FAMILY_REVOKE_OPERATION, TOKEN_EXCHANGE_OPERATION, append_auth_audit, auth_event,
+    principal_kind_tag,
 };
 
 use crate::card_scope::{
@@ -144,18 +150,24 @@ impl RefreshTokens {
                     }
                 };
 
-                // Audit the rotation using the existing audit_token_exchange table (F08).
-                // subject = actor = principal_id; no delegation chain on a refresh grant.
-                insert_audit_token_exchange(
-                    conn,
-                    Uuid::new_v4(),
-                    principal_id,
-                    principal_id,
-                    json!([]),
+                // Audit the rotation (F08): subject = actor; a refresh grant
+                // carries no delegation chain.
+                let rotated = PrincipalId::new(principal_id);
+                let event = auth_event(
                     request_id,
-                    exchanged.expires_at,
-                )
-                .await?;
+                    TOKEN_EXCHANGE_OPERATION,
+                    rotated,
+                    principal_kind_tag(&principal_kind),
+                    None,
+                    AuditOutcome::Allowed,
+                    AuditDetail::TokenExchange {
+                        subject_principal_id: rotated,
+                        actor_principal_id: rotated,
+                        delegation_chain: Vec::new(),
+                        expires_at: exchanged.expires_at,
+                    },
+                );
+                append_auth_audit(conn, &event).await?;
 
                 tracing::debug!(
                     principal_id = %principal_id,
@@ -181,17 +193,23 @@ impl RefreshTokens {
                     )
                     .await?;
 
-                    // Audit the family revocation (F08).
-                    insert_audit_token_exchange(
-                        conn,
-                        Uuid::new_v4(),
-                        stale.principal_id,
-                        stale.principal_id,
-                        json!([]),
+                    // Audit the family revocation (F08) as a refused grant.
+                    let owner = PrincipalId::new(stale.principal_id);
+                    let owner_kind = principal_kind_tag(&stale.principal_kind);
+                    let event = auth_event(
                         request_id,
-                        Utc::now(),
-                    )
-                    .await?;
+                        REFRESH_FAMILY_REVOKE_OPERATION,
+                        owner,
+                        owner_kind,
+                        None,
+                        AuditOutcome::Denied,
+                        AuditDetail::RefreshFamilyRevocation {
+                            principal_id: owner,
+                            principal_kind: owner_kind,
+                            revoked_token_count: revoked,
+                        },
+                    );
+                    append_auth_audit(conn, &event).await?;
 
                     tracing::warn!(
                         principal_id = %stale.principal_id,
@@ -747,9 +765,10 @@ mod pg_tests {
             .expect("rotation succeeds");
 
         let count: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM wyrd.audit_token_exchange
+            "SELECT COUNT(*) FROM vala.audit_staging
               WHERE data_tenant_id = $1
-                AND subject_principal_id = $2",
+                AND operation = 'auth.token.exchange'
+                AND principal_id = $2",
         )
         .bind(tenant.as_uuid())
         .bind(sa_id)
@@ -939,10 +958,11 @@ mod pg_tests {
             .await
             .expect("rotation succeeds");
 
-        let row: (String, String, i32) = sqlx::query_as(
-            "SELECT mint_kind, result, scope_member_count
-               FROM wyrd.audit_card_scope_mint
+        let (outcome, detail): (String, String) = sqlx::query_as(
+            "SELECT outcome, detail
+               FROM vala.audit_staging
               WHERE data_tenant_id = $1
+                AND operation = 'auth.card_scope.mint'
                 AND principal_id = $2
               LIMIT 1",
         )
@@ -950,10 +970,15 @@ mod pg_tests {
         .bind(sa_id)
         .fetch_one(&mut **conn.transaction())
         .await
-        .expect("audit_card_scope_mint row exists");
+        .expect("card scope mint audit event is staged");
+        let detail: serde_json::Value =
+            serde_json::from_str(&detail).expect("audit detail is json");
 
-        assert_eq!(row.0, "refresh", "mint_kind is refresh");
-        assert_eq!(row.1, "success", "result is success");
-        assert_eq!(row.2, 1, "single-card scope has member count 1");
+        assert_eq!(detail["mint_kind"], "refresh", "mint_kind is refresh");
+        assert_eq!(outcome, "allowed", "mint is allowed");
+        assert_eq!(
+            detail["scope_member_count"], 1,
+            "single-card scope has member count 1"
+        );
     }
 }

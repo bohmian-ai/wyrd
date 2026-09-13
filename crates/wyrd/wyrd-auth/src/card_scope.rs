@@ -8,10 +8,19 @@ use sqlx::PgPool;
 use uuid::Uuid;
 use wyrd_auth_issue::IssueError;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::{PLATFORM_AUDIT_PRINCIPAL, PrincipalId, PrincipalKindTag};
+use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::{CardRef, CardRefScope};
+use wyrd_spec::vala::ScopeHash;
+use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
+use wyrd_spec::vala::audit_detail::CardScopeMintKind;
 use wyrd_sql::TenantConn;
-use wyrd_sql::queries::auth::{CardScopeMintAudit, insert_audit_card_scope_mint};
+
+use crate::audit::{
+    CARD_SCOPE_MINT_OPERATION, append_auth_audit, auth_event, auth_failure_code,
+    record_auth_audit_best_effort,
+};
 use wyrd_sql::queries::cards::get_card_by_ref;
 
 const MAX_SCOPE_DEPTH: usize = 16;
@@ -20,13 +29,13 @@ pub const MAX_SCOPE_CARDS: usize = 32;
 const SCOPE_AUDIT_MEMBER_SUMMARY_LIMIT: usize = 16;
 
 /// Audit mint kind for API-key token exchange scope minting.
-pub const MINT_KIND_API_KEY_EXCHANGE: &str = "api_key_exchange";
+pub const MINT_KIND_API_KEY_EXCHANGE: CardScopeMintKind = CardScopeMintKind::ApiKeyExchange;
 /// Audit mint kind for refresh-token scope minting.
-pub const MINT_KIND_REFRESH: &str = "refresh";
+pub const MINT_KIND_REFRESH: CardScopeMintKind = CardScopeMintKind::Refresh;
 /// Audit mint kind for delegated-token scope minting.
-pub const MINT_KIND_DELEGATION: &str = "delegation";
+pub const MINT_KIND_DELEGATION: CardScopeMintKind = CardScopeMintKind::Delegation;
 /// Audit mint kind for JWT bearer workload scope minting.
-pub const MINT_KIND_JWT_BEARER: &str = "jwt_bearer";
+pub const MINT_KIND_JWT_BEARER: CardScopeMintKind = CardScopeMintKind::JwtBearer;
 
 /// Resolve the observation-target scope for a card-bound principal.
 ///
@@ -146,11 +155,18 @@ pub enum IssueErrorOrWyrd {
     Wyrd(WyrdError),
 }
 
-/// Write the successful card-ref scope mint audit row on the mint transaction.
+/// Stage the successful card-ref scope mint audit event on the mint transaction.
+///
+/// The event commits with the token grant, carrying the scope digest, the full
+/// member count, and at most [`SCOPE_AUDIT_MEMBER_SUMMARY_LIMIT`] members.
+///
+/// # Errors
+/// Returns [`WyrdError::AuditUnavailable`] when the scope digest is not a valid
+/// audit value or the append fails.
 ///
 /// # Panics
 ///
-/// Panics if `scope.len()` exceeds `i32::MAX`. Callers must enforce the
+/// Panics if `scope.len()` exceeds `u32::MAX`. Callers must enforce the
 /// `MAX_SCOPE_CARDS` limit upstream; violating it is a programmer error,
 /// not a runtime condition.
 pub async fn write_scope_mint_success_audit(
@@ -159,101 +175,77 @@ pub async fn write_scope_mint_success_audit(
     root: &CardRef,
     scope: &CardRefScope,
     request_id: &str,
-    mint_kind: &str,
-) -> Result<(), sqlx::Error> {
-    let members = scope_member_strings(scope);
-    let scope_hash = scope_hash(&members);
-    insert_audit_card_scope_mint(
-        conn,
-        CardScopeMintAudit {
-            id: Uuid::new_v4(),
-            principal_id: Some(principal_id),
+    mint_kind: CardScopeMintKind,
+) -> Result<(), WyrdError> {
+    let scope_hash = ScopeHash::new(scope_hash(&scope_member_strings(scope))).map_err(|error| {
+        WyrdError::AuditUnavailable {
+            message: format!("scope digest is not a valid audit value: {error}"),
+            details: json!({}),
+        }
+    })?;
+    let event = auth_event(
+        request_id,
+        CARD_SCOPE_MINT_OPERATION,
+        PrincipalId::new(principal_id),
+        card_principal_kind(root),
+        Some(root.clone()),
+        AuditOutcome::Allowed,
+        AuditDetail::CardScopeMint {
             mint_kind,
-            root_card_ref: root,
-            request_id,
-            result: "success",
+            root_card_ref: root.clone(),
+            scope_hash: Some(scope_hash),
             scope_member_count: Some(
-                i32::try_from(scope.len())
-                    .expect("MAX_SCOPE_CARDS invariant: scope count fits into i32"),
+                u32::try_from(scope.len())
+                    .expect("MAX_SCOPE_CARDS invariant: scope count fits into u32"),
             ),
-            scope_hash: Some(&scope_hash),
-            scope_members: scope_member_summary(&members),
+            scope_members: scope_member_summary(scope.as_slice()),
             failure_code: None,
-            failure_reason: None,
         },
-    )
-    .await
+    );
+    append_auth_audit(conn, &event).await
 }
 
-/// Best-effort write of a failed card-ref scope mint audit row on a fresh transaction.
+/// Best-effort staging of a refused card-ref scope mint in its own transaction.
+///
+/// Only errors that name a scope root are recorded; the refused grant has no
+/// authenticated principal yet, so the event is attributed to
+/// [`PLATFORM_AUDIT_PRINCIPAL`]. Staging failures are logged, never returned.
 pub async fn audit_scope_mint_failure_best_effort(
     pool: &PgPool,
     tenant_id: DataTenantId,
     request_id: &str,
-    mint_kind: &str,
+    mint_kind: CardScopeMintKind,
     error: &WyrdError,
 ) {
     let Some(root) = scope_failure_root(error) else {
         return;
     };
-    match TenantConn::acquire(pool, tenant_id).await {
-        Ok(mut conn) => {
-            if let Err(audit_error) =
-                write_scope_mint_failure_audit(&mut conn, &root, request_id, mint_kind, error).await
-            {
-                tracing::error!(
-                    error = %audit_error,
-                    root = %root,
-                    reason = %error.code(),
-                    "scope-mint failure audit write failed",
-                );
-                return;
-            }
-            if let Err(commit_error) = conn.commit().await {
-                tracing::error!(
-                    error = %commit_error,
-                    root = %root,
-                    reason = %error.code(),
-                    "scope-mint failure audit commit failed",
-                );
-            }
-        }
-        Err(acquire_error) => {
-            tracing::error!(
-                error = %acquire_error,
-                root = %root,
-                reason = %error.code(),
-                "scope-mint failure audit conn acquire failed",
-            );
-        }
-    }
+    let event = auth_event(
+        request_id,
+        CARD_SCOPE_MINT_OPERATION,
+        PLATFORM_AUDIT_PRINCIPAL,
+        PrincipalKindTag::Service,
+        Some(root.clone()),
+        AuditOutcome::Denied,
+        AuditDetail::CardScopeMint {
+            mint_kind,
+            root_card_ref: root.clone(),
+            scope_hash: None,
+            scope_member_count: None,
+            scope_members: Vec::new(),
+            failure_code: Some(auth_failure_code(error)),
+        },
+    );
+    record_auth_audit_best_effort(pool, tenant_id, &event).await;
 }
 
-/// Write a failed card-ref scope mint audit row.
-async fn write_scope_mint_failure_audit(
-    conn: &mut TenantConn<'_>,
-    root: &CardRef,
-    request_id: &str,
-    mint_kind: &str,
-    error: &WyrdError,
-) -> Result<(), sqlx::Error> {
-    insert_audit_card_scope_mint(
-        conn,
-        CardScopeMintAudit {
-            id: Uuid::new_v4(),
-            principal_id: None,
-            mint_kind,
-            root_card_ref: root,
-            request_id,
-            result: "failure",
-            scope_member_count: None,
-            scope_hash: None,
-            scope_members: json!([]),
-            failure_code: Some(error.code()),
-            failure_reason: Some(&error.to_string()),
-        },
-    )
-    .await
+/// Principal kind of the card-bound principal that owns `root`.
+fn card_principal_kind(root: &CardRef) -> PrincipalKindTag {
+    if root.kind == CardKind::Agent {
+        PrincipalKindTag::Agent
+    } else {
+        PrincipalKindTag::Service
+    }
 }
 
 /// Attach scope-mint context to resolver errors that should be audited.
@@ -313,14 +305,12 @@ fn scope_hash(members: &[String]) -> String {
 }
 
 /// Build a bounded audit summary of the card-ref scope members.
-fn scope_member_summary(members: &[String]) -> Value {
-    json!({
-        "members": members
-            .iter()
-            .take(SCOPE_AUDIT_MEMBER_SUMMARY_LIMIT)
-            .collect::<Vec<_>>(),
-        "truncated": members.len() > SCOPE_AUDIT_MEMBER_SUMMARY_LIMIT,
-    })
+fn scope_member_summary(members: &[CardRef]) -> Vec<CardRef> {
+    members
+        .iter()
+        .take(SCOPE_AUDIT_MEMBER_SUMMARY_LIMIT)
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]
@@ -482,29 +472,25 @@ mod pg_tests {
 
     // --- pure: scope_member_summary ---
 
+    /// A scope at the summary limit is recorded in full.
     #[test]
-    fn scope_member_summary_sets_truncated_false_under_limit() {
-        let members: Vec<String> = (0..SCOPE_AUDIT_MEMBER_SUMMARY_LIMIT)
-            .map(|i| format!("prod/Service/svc-{i}@1.0.0"))
+    fn scope_member_summary_keeps_members_under_limit() {
+        let members: Vec<CardRef> = (0..SCOPE_AUDIT_MEMBER_SUMMARY_LIMIT)
+            .map(|i| make_card_ref(CardKind::Service, "prod", &format!("svc-{i}")))
             .collect();
-        let summary = scope_member_summary(&members);
-        assert_eq!(summary["truncated"], false);
-        assert_eq!(
-            summary["members"].as_array().unwrap().len(),
-            SCOPE_AUDIT_MEMBER_SUMMARY_LIMIT
-        );
+        assert_eq!(scope_member_summary(&members), members);
     }
 
+    /// A scope past the summary limit keeps only the first members; the full
+    /// count travels separately as `scope_member_count`.
     #[test]
-    fn scope_member_summary_truncates_and_sets_flag() {
-        let members: Vec<String> = (0..SCOPE_AUDIT_MEMBER_SUMMARY_LIMIT + 5)
-            .map(|i| format!("prod/Service/svc-{i}@1.0.0"))
+    fn scope_member_summary_truncates_past_limit() {
+        let members: Vec<CardRef> = (0..SCOPE_AUDIT_MEMBER_SUMMARY_LIMIT + 5)
+            .map(|i| make_card_ref(CardKind::Service, "prod", &format!("svc-{i}")))
             .collect();
-        let summary = scope_member_summary(&members);
-        assert_eq!(summary["truncated"], true);
         assert_eq!(
-            summary["members"].as_array().unwrap().len(),
-            SCOPE_AUDIT_MEMBER_SUMMARY_LIMIT
+            scope_member_summary(&members),
+            members[..SCOPE_AUDIT_MEMBER_SUMMARY_LIMIT]
         );
     }
 

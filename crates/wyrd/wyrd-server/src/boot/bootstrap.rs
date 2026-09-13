@@ -54,6 +54,9 @@ pub enum BootstrapError {
     /// API-key issuance failed.
     #[error("api key issuance failed: {0}")]
     Issue(#[from] IssueKeyError),
+    /// The credential-issuance audit event could not be staged.
+    #[error("api key issuance audit failed: {0}")]
+    Audit(#[from] wyrd_spec::error::WyrdError),
 }
 
 /// Mint the first admin API key for `slug` and return the plaintext key once.

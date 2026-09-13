@@ -4,15 +4,16 @@ use chrono::{Duration, Utc};
 use secrecy::{ExposeSecret, SecretString};
 use uuid::Uuid;
 use wyrd_auth_issue::{self, IssueError};
-use wyrd_runtime::Principal;
+use wyrd_runtime::{Permission, Principal, PrincipalId};
 use wyrd_spec::auth::{IssueKeyRequest, IssueKeyResponse, SecretBearer};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::CardRef;
+use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
 use wyrd_sql::TenantConn;
-use wyrd_sql::queries::auth::{
-    insert_api_key, insert_audit_credential_issuance, service_account_by_card_ref,
-};
+use wyrd_sql::queries::auth::{insert_api_key, service_account_by_card_ref};
+
+use crate::audit::{API_KEY_ISSUE_OPERATION, append_auth_audit, auth_event};
 
 /// API-key issue settings.
 #[derive(Debug, Clone)]
@@ -135,27 +136,37 @@ impl IssueApiKey {
         })
     }
 
-    /// Insert the durable audit row for a successful issuance.
+    /// Stage the credential-issuance audit event on the issuing transaction.
+    ///
+    /// The event names the target card as its resource and `service_accounts`
+    /// write as its permission, and records the key id and expiry — never the
+    /// key. It commits with the key row, so a key is never returned unaudited.
     ///
     /// # Errors
-    /// Returns a SQL error when the audit row cannot be inserted.
+    /// Returns [`WyrdError::AuditUnavailable`] when the audit append fails.
     pub async fn audit(
         &self,
         conn: &mut TenantConn<'_>,
         issued: &IssuedApiKey,
         actor: &Principal,
         request_id: &str,
-    ) -> Result<(), sqlx::Error> {
-        insert_audit_credential_issuance(
-            conn,
-            Uuid::new_v4(),
-            actor.id.as_uuid(),
-            issued.service_account_id,
-            issued.api_key_id,
+    ) -> Result<(), WyrdError> {
+        let mut event = auth_event(
             request_id,
-            issued.response.expires_at,
-        )
-        .await
+            API_KEY_ISSUE_OPERATION,
+            actor.id,
+            actor.kind.tag(),
+            actor.card_ref().cloned(),
+            AuditOutcome::Allowed,
+            AuditDetail::CredentialIssuance {
+                target_principal_id: PrincipalId::new(issued.service_account_id),
+                api_key_id: issued.api_key_id,
+                expires_at: issued.response.expires_at,
+            },
+        );
+        event.resource = issued.response.card_ref.to_string();
+        event.permission = Permission::service_accounts_write().to_string();
+        append_auth_audit(conn, &event).await
     }
 }
 

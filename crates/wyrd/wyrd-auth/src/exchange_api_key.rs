@@ -15,12 +15,15 @@ use wyrd_spec::auth::{RequestedSubject, SecretBearer, TokenResponse, TokenType};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::{CardRef, CardRefScope};
+use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
+use wyrd_spec::vala::audit_detail::CardScopeMintKind;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
-    ApiKeyStatus, api_key_by_prefix, api_key_status_by_prefix, insert_audit_token_exchange,
-    insert_refresh_token, list_service_account_roles, service_account_by_id,
-    touch_api_key_last_used,
+    ApiKeyStatus, api_key_by_prefix, api_key_status_by_prefix, insert_refresh_token,
+    list_service_account_roles, service_account_by_id, touch_api_key_last_used,
 };
+
+use crate::audit::{TOKEN_EXCHANGE_OPERATION, append_auth_audit, auth_event};
 
 use crate::card_scope::{
     IssueErrorOrWyrd, MINT_KIND_API_KEY_EXCHANGE, MINT_KIND_DELEGATION, issue_scope_error,
@@ -317,16 +320,26 @@ impl DelegateToken {
         // (RFC 8693). The caller re-delegates when the access token expires, so
         // no refresh token is issued or persisted for the delegated principal.
         let expires_at = Utc::now() + self.settings.access_ttl;
-        insert_audit_token_exchange(
-            conn,
-            Uuid::new_v4(),
-            row.id,
-            verified.principal.id.as_uuid(),
-            json!(verified.delegation_chain),
+        let mut event = auth_event(
             request_id,
-            expires_at,
-        )
-        .await?;
+            TOKEN_EXCHANGE_OPERATION,
+            verified.principal.id,
+            verified.principal.kind.tag(),
+            verified.principal.card_ref().cloned(),
+            AuditOutcome::Allowed,
+            AuditDetail::TokenExchange {
+                subject_principal_id: PrincipalId::new(row.id),
+                actor_principal_id: verified.principal.id,
+                delegation_chain: verified
+                    .delegation_chain
+                    .iter()
+                    .filter_map(|step| step.principal.card_ref().cloned())
+                    .collect(),
+                expires_at,
+            },
+        );
+        event.permission = Permission::delegation_issue().to_string();
+        append_auth_audit(conn, &event).await?;
         write_scope_mint_success_audit(
             conn,
             row.id,
@@ -354,7 +367,7 @@ pub(crate) async fn issue_for_subject(
     subject: IssueSubject,
     refresh: RefreshPolicy,
     request_id: &str,
-    mint_kind: &str,
+    mint_kind: CardScopeMintKind,
 ) -> Result<ExchangedToken, IssueOrSqlError> {
     let IssueSubject {
         principal_id,

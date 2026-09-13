@@ -2,25 +2,29 @@
 
 use std::sync::Arc;
 
-use chrono::{Duration, Utc};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::json;
 use uuid::Uuid;
 use wyrd_auth_issue::IssuingKey;
 use wyrd_auth_oidc::WorkloadBindingResolver;
 use wyrd_auth_verify::{TokenVerifier, VerifiedExternalIdentity};
-use wyrd_runtime::RoleRef;
+use wyrd_runtime::{PrincipalId, RoleRef};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::IssuerTokenPolicy;
 use wyrd_spec::auth::IssuerUrl;
+use wyrd_spec::auth::PrincipalKindTag;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::CardRef;
+use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
 use wyrd_sql::queries::auth::{
-    ServiceAccountPrincipalRow, insert_audit_token_exchange, list_service_account_roles,
-    service_account_by_card_ref,
+    ServiceAccountPrincipalRow, list_service_account_roles, service_account_by_card_ref,
 };
 use wyrd_sql::{TenantConn, WyrdPostgres};
 
+use crate::audit::{
+    TOKEN_EXCHANGE_OPERATION, append_auth_audit, auth_event, auth_failure_code, principal_kind_tag,
+    record_auth_audit_best_effort,
+};
 use crate::card_scope::MINT_KIND_JWT_BEARER;
 use crate::error::auth_error_to_wyrd;
 use crate::exchange_api_key::{
@@ -88,15 +92,8 @@ impl JwtBearer {
         match result {
             Ok(token) => Ok(token),
             Err(error) => {
-                audit_workload_failure(
-                    postgres,
-                    tenant_id,
-                    audit_principal_id,
-                    request_id,
-                    self.settings.access_ttl,
-                    &error,
-                )
-                .await;
+                audit_workload_failure(postgres, tenant_id, audit_principal_id, request_id, &error)
+                    .await;
                 Err(error)
             }
         }
@@ -192,17 +189,22 @@ async fn issue_and_audit(
     )
     .await
     .map_err(|error| workload_exchange_error(ExchangeError::from(error)))?;
-    insert_audit_token_exchange(
-        conn,
-        Uuid::new_v4(),
-        row.id,
-        row.id,
-        json!([]),
+    let workload = PrincipalId::new(row.id);
+    let event = auth_event(
         request_id,
-        Utc::now() + settings.access_ttl,
-    )
-    .await
-    .map_err(sql_error)?;
+        TOKEN_EXCHANGE_OPERATION,
+        workload,
+        principal_kind_tag(&row.principal_kind),
+        Some(row.card_ref.0.clone()),
+        AuditOutcome::Allowed,
+        AuditDetail::TokenExchange {
+            subject_principal_id: workload,
+            actor_principal_id: workload,
+            delegation_chain: Vec::new(),
+            expires_at: exchanged.expires_at,
+        },
+    );
+    append_auth_audit(conn, &event).await?;
     Ok(exchanged)
 }
 
@@ -223,63 +225,30 @@ fn workload_exchange_error(error: ExchangeError) -> WyrdError {
     }
 }
 
+/// Best-effort audit of a refused workload `jwt-bearer` exchange.
+///
+/// Stages one denied `auth.token.exchange` event with the closed failure code
+/// in its own transaction; `principal_id` is nil when the service account was
+/// never resolved. Staging failures are logged, never returned.
 async fn audit_workload_failure(
     postgres: &WyrdPostgres,
     tenant_id: DataTenantId,
     principal_id: Uuid,
     request_id: &str,
-    access_ttl: Duration,
     error: &WyrdError,
 ) {
-    let mut conn = match postgres.tenant_conn(tenant_id).await {
-        Ok(conn) => conn,
-        Err(audit_error) => {
-            tracing::warn!(
-                error = %audit_error,
-                original_error = %error,
-                "OIDC workload failure audit could not acquire tenant connection"
-            );
-            return;
-        }
-    };
-    if let Err(audit_error) = insert_audit_token_exchange(
-        &mut conn,
-        Uuid::new_v4(),
-        principal_id,
-        principal_id,
-        json!([{ "error": audit_error_tag(error) }]),
+    let event = auth_event(
         request_id,
-        Utc::now() + access_ttl,
-    )
-    .await
-    {
-        tracing::warn!(
-            error = %audit_error,
-            original_error = %error,
-            "OIDC workload failure audit insert failed"
-        );
-        return;
-    }
-    if let Err(audit_error) = conn.commit().await {
-        tracing::warn!(
-            error = %audit_error,
-            original_error = %error,
-            "OIDC workload failure audit commit failed"
-        );
-    }
-}
-
-fn audit_error_tag(error: &WyrdError) -> &'static str {
-    match error {
-        WyrdError::InvalidToken { .. } => "InvalidToken",
-        WyrdError::TokenExpired { .. } => "TokenExpired",
-        WyrdError::AuthVerifyUnavailable { .. } => "AuthVerifyUnavailable",
-        WyrdError::PrincipalNotFound { .. } => "PrincipalNotFound",
-        WyrdError::PrincipalKindCardKindMismatch { .. } => "PrincipalKindCardKindMismatch",
-        WyrdError::Internal { .. } => "Internal",
-        WyrdError::BadTokenFormat { .. } => "BadTokenFormat",
-        _ => "WyrdError",
-    }
+        TOKEN_EXCHANGE_OPERATION,
+        PrincipalId::new(principal_id),
+        PrincipalKindTag::Service,
+        None,
+        AuditOutcome::Denied,
+        AuditDetail::AuthFailure {
+            error_code: auth_failure_code(error),
+        },
+    );
+    record_auth_audit_best_effort(postgres.app_pool(), tenant_id, &event).await;
 }
 
 fn principal_not_found(subject: &str, issuer: &IssuerUrl) -> WyrdError {

@@ -3,7 +3,7 @@
 //! Proves Oracle query execution and its edges — published and fused
 //! reconciliation, role-separated and distributed dispatch, multitenant
 //! isolation and fairness, spill accounting, peer security, Scribe tail
-//! fencing, cancellation and terminal recovery, audit relay, the public gRPC
+//! fencing, cancellation and terminal recovery, read-audit staging, the public gRPC
 //! frame-parity and resource-release journeys, the typed Vala route cut, and
 //! the Oracle production-telemetry contract.
 //!

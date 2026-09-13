@@ -1049,9 +1049,9 @@ async fn run_public_matrix(
             )));
         }
         report.final_terminal_count = u8::from(terminal_valid);
-        // Wait for the read-audit relay to drain the just-executed public read
-        // before asserting on its durable row count; the pending WAL residual is
-        // an exact counter, so this converges without masking a real shortfall.
+        // Wait for the tracked read-audit tasks to commit the just-executed public
+        // read into audit_staging before asserting on its durable row count; the
+        // pending count is exact, so this converges without masking a shortfall.
         await_read_audit_convergence(cluster).await?;
         let audit_count_after = reader
             .bifrost_read_decision_count_for_tenant(tenant)

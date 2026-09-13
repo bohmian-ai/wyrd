@@ -289,6 +289,17 @@ async fn list_artifacts_http(
 /// response. The service binds that key to the authenticated principal and
 /// canonical request content, so an exact replay is safe while reuse for a
 /// different request is rejected.
+///
+/// The `card:write` verdict is recorded exactly once: inside the service's
+/// registration transaction when that transaction commits the Card, and
+/// standalone otherwise — a missing or invalid `Idempotency-Key`, an exact
+/// replay, a lost idempotency race, or any failure before commit.
+///
+/// # Errors
+/// Returns `WYRD_PERMISSION_403_DENIED_RBAC` without `card:write`, the
+/// audit-unavailable error when the verdict cannot be recorded, a validation
+/// error for a missing or invalid `Idempotency-Key` or Card body, an
+/// idempotency or version conflict, and registry or storage unavailability.
 pub(crate) async fn register_card_http(
     State(state): State<AppState>,
     caller: Caller,
@@ -361,6 +372,16 @@ async fn complete_card_http(
 }
 
 /// Delete one Card by its exact UID.
+///
+/// The `card:write` verdict commits inside the soft-delete transaction; a delete
+/// that commits nothing (not found, inbound references, or a failure) records it
+/// standalone exactly once. Storage cleanup runs after that commit.
+///
+/// # Errors
+/// Returns a validation error for an invalid kind or UID,
+/// `WYRD_PERMISSION_403_DENIED_RBAC` without `card:write`, the audit-unavailable
+/// error when the verdict cannot be recorded, not found, an inbound-reference
+/// conflict, registry unavailability, and incomplete storage cleanup.
 #[utoipa::path(
     delete,
     path = "/v1/cards/by-uid/{kind}/{card_uid}",
@@ -402,6 +423,16 @@ async fn delete_card_http(
 }
 
 /// Delete one Card by its exact kind/space/name/version identity.
+///
+/// The `card:write` verdict commits inside the soft-delete transaction; a delete
+/// that commits nothing (not found, inbound references, or a failure) records it
+/// standalone exactly once. Storage cleanup runs after that commit.
+///
+/// # Errors
+/// Returns a validation error for an invalid kind, space, name, or version,
+/// `WYRD_PERMISSION_403_DENIED_RBAC` without `card:write`, the audit-unavailable
+/// error when the verdict cannot be recorded, not found, an inbound-reference
+/// conflict, registry unavailability, and incomplete storage cleanup.
 #[utoipa::path(
     delete,
     path = "/v1/cards/by-ref",

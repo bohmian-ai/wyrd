@@ -8,8 +8,8 @@ use iceberg::TableCreation;
 use iceberg::io::{FileIO, FileIOBuilder};
 use iceberg::spec::{FormatVersion, Transform};
 use sha2::{Digest as _, Sha256};
-use vala_sql::ValaPostgres;
 use vala_sql::queries::file_list::HotFileCatalog;
+use vala_sql::{TenantConn, ValaPostgres};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::WYRD_EVENT_TIME;
 use wyrd_spec::vala::api::{
@@ -1487,7 +1487,7 @@ fn resolve_registration_layout(
 /// # Errors
 /// Returns [`BifrostCatalogError::AuditUnavailable`] when the staging append fails.
 async fn append_registration_audit(
-    conn: &mut wyrd_sql::TenantConn<'_>,
+    conn: &mut TenantConn<'_>,
     audit: Option<&AuditEvent>,
     fqn: &str,
 ) -> Result<(), BifrostCatalogError> {

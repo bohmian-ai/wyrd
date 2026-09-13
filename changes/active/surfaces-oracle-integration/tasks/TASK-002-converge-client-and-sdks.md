@@ -91,6 +91,10 @@ TDD cycle is required. The direct proof is that the five existing commands
 start without an unknown setup task and `test:postgres:inventory` accepts their
 lifecycle ownership.
 
+Status: these lane rewrites landed early at `662bf33bc`, during TASK-001
+remediation, and remain unverified. TASK-002 still owns running the five lanes
+and `test:postgres:inventory` as the proof above.
+
 ## Acceptance Criteria
 
 - Rust, Python, and TypeScript expose one coherent SDK capability set from the

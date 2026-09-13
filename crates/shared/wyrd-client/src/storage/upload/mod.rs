@@ -116,7 +116,10 @@ pub(crate) type PartUrlFuture<'a> =
     Pin<Box<dyn Future<Output = Result<String, StorageClientError>> + Send + 'a>>;
 
 /// On-demand S3 part URL callback.
-pub(crate) type PartUrlMinter<'a> = Box<dyn FnMut(u32) -> PartUrlFuture<'a> + Send + 'a>;
+///
+/// `Sync` so registration futures that borrow their upload hooks stay `Send`
+/// for async foreign-runtime boundaries such as the Node binding.
+pub(crate) type PartUrlMinter<'a> = Box<dyn FnMut(u32) -> PartUrlFuture<'a> + Send + Sync + 'a>;
 
 /// Owned callback used by provider streams and chunk loops.
 pub(crate) type ProgressCallback = Arc<dyn Fn(u64, Option<u64>) + Send + Sync + 'static>;

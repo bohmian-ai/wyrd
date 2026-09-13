@@ -218,7 +218,7 @@ def test_data_card_pandas_interface_eager_loads_after_real_registry_round_trip(w
 def test_eager_data_load_uses_constructed_server_and_retains_workspace(wyrd_server) -> None:
     """A Cards handle stays bound to server A when ambient config changes to B."""
     api_key = wyrd_server.bootstrap_service(["writer"], name=_name("eager-client"))
-    cards = Cards(server_url=wyrd_server.base_url, api_key=api_key)
+    cards = Cards(server_url=wyrd_server.base_url, credential=api_key)
     interface = JsonDataInterface({"rows": 3})
     card = DataCard(
         interface,
@@ -404,7 +404,7 @@ def test_registration_releases_gil_and_failure_preserves_holder_identity(wyrd_se
     assert counter[0] > 0
 
     denied_key = wyrd_server.bootstrap_service([], name=_name("denied-register"))
-    denied = Cards(server_url=wyrd_server.base_url, api_key=denied_key)
+    denied = Cards(server_url=wyrd_server.base_url, credential=denied_key)
     unchanged = PromptCard(
         Prompt.openai_chat("gpt-4o", messages="identity"),
         space="python-e2e",
@@ -434,7 +434,7 @@ def test_card_registration_rejects_invalid_artifact_layout(wyrd_server) -> None:
 @pytest.mark.integration
 def test_card_registration_rejects_underprivileged_writer(wyrd_server) -> None:
     api_key = wyrd_server.bootstrap_service([], name=_name("read-only"))
-    cards = Cards(server_url=wyrd_server.base_url, api_key=api_key)
+    cards = Cards(server_url=wyrd_server.base_url, credential=api_key)
     card = PromptCard(
         Prompt.openai_chat("gpt-4o", messages="No write permission"),
         space="python-e2e",
@@ -463,7 +463,7 @@ def test_card_registry_enforces_cross_tenant_isolation(wyrd_server) -> None:
         ["writer"],
         name=_name("tenant-b-client"),
     )
-    cards_b = Cards(server_url=wyrd_server.base_url, api_key=tenant_b_key)
+    cards_b = Cards(server_url=wyrd_server.base_url, credential=tenant_b_key)
 
     with pytest.raises(WyrdError):
         cards_b.prompt.get(uid=card.uid)

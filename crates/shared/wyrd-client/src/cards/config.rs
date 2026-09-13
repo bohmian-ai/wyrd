@@ -14,7 +14,7 @@ use crate::cards::error::RegistryEngineError;
 /// assembles the authenticated network client.
 pub(crate) fn load(
     server_url: Option<&str>,
-    api_key: Option<SecretString>,
+    credential: Option<SecretString>,
 ) -> Result<WyrdClient, RegistryEngineError> {
     let mut client_config = ClientConfig::from_global()?;
     if let Some(server_url) = server_url {
@@ -27,8 +27,8 @@ pub(crate) fn load(
         }
         client_config.http.base_url = server_url.to_owned();
     }
-    if api_key.is_some() {
-        client_config.credential = api_key;
+    if credential.is_some() {
+        client_config.credential = credential;
     }
     Ok(WyrdClient::with_config(client_config)?)
 }

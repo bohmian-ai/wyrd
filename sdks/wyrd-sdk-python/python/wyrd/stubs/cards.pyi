@@ -235,7 +235,7 @@ class Cards:
     Args:
         server_url: Optional Wyrd server URL. When omitted, the shared Wyrd
             client configuration supplies it.
-        api_key: Optional API key override for this handle. When omitted, the
+        credential: Optional credential override for this handle. When omitted, the
             shared Wyrd client configuration supplies credentials.
 
     Raises:
@@ -243,7 +243,7 @@ class Cards:
             loaded.
     """
 
-    def __init__(self, server_url: str | None = ..., api_key: str | None = ...) -> None: ...
+    def __init__(self, server_url: str | None = ..., credential: str | None = ...) -> None: ...
     @property
     def data(self) -> DataCardRegistry:
         """Return the typed registry view for `DataCard` operations."""

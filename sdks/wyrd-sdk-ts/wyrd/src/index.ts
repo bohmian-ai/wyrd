@@ -18,9 +18,16 @@ import type {
 
 const require = createRequire(import.meta.url);
 const nativeBinding = require("../index.cjs") as typeof import("../index.cjs");
-const { connectBifrost, describeTableConfig, tableConfigFromJsonSchema } =
-  nativeBinding;
+const {
+  connectBifrost,
+  connectCards,
+  describeTableConfig,
+  openWyrdState,
+  tableConfigFromJsonSchema,
+} = nativeBinding;
 type NativeBifrost = import("../index.cjs").NativeBifrost;
+type NativeCards = import("../index.cjs").NativeCards;
+type NativeWyrdState = import("../index.cjs").NativeWyrdState;
 type NativeTableConfig = import("../index.cjs").NativeTableConfig;
 
 export type VisibilityMode = "published_only" | "fused";
@@ -850,5 +857,211 @@ export class Bifrost {
     return lifecycleValue<TableDescription>(
       await this.#native.describeTable(namespace, name),
     );
+  }
+}
+
+/** Exact Card identity as returned by the registry. */
+export interface CardRef {
+  readonly kind: string;
+  readonly name: string;
+  readonly version: string;
+  readonly space?: string | null;
+  readonly uid?: string | null;
+}
+
+/** One Card envelope: `apiVersion`, `kind`, `metadata`, `spec`, and server-derived fields. */
+export interface Card {
+  readonly apiVersion: "wyrd/v1";
+  readonly kind: string;
+  readonly metadata: {
+    readonly name: string;
+    readonly version: string;
+    readonly space?: string;
+    readonly uid?: string;
+    readonly [key: string]: unknown;
+  };
+  readonly spec: Readonly<Record<string, unknown>>;
+  readonly [key: string]: unknown;
+}
+
+/** Server outcome for one Card in a composite registration. */
+export interface CardRegistrationOutcome {
+  readonly card_ref: CardRef;
+  readonly spec_hash: string;
+  readonly artifact_hash: string | null;
+  readonly status: string;
+  readonly outcome: string;
+  readonly card_blob_uri: string | null;
+}
+
+/** Registration receipt: the graph root plus dependency-first outcomes. */
+export interface RegistrationReceipt {
+  readonly root: CardRef;
+  readonly outcomes: readonly CardRegistrationOutcome[];
+}
+
+/** Metadata-only Card list filters. */
+export interface ListCardsRequest {
+  readonly kind?: string;
+  readonly space?: string;
+  readonly name?: string;
+  readonly version_range?: string;
+  readonly status?: string;
+  readonly filter?: string;
+  readonly include_prerelease?: boolean;
+  readonly limit?: number;
+  readonly cursor?: string;
+}
+
+/** One metadata-only Card summary. */
+export interface CardSummary {
+  readonly card_uid: string;
+  readonly kind: string;
+  readonly space: string;
+  readonly name: string;
+  readonly version: string;
+  readonly spec_hash: string;
+  readonly artifact_hash: string | null;
+  readonly status: string;
+  readonly [key: string]: unknown;
+}
+
+/** One page of Card summaries. */
+export interface ListCardsResponse {
+  readonly items: readonly CardSummary[];
+  readonly next_cursor: string | null;
+}
+
+/** Machine-readable result of a published hydration. */
+export interface HydrationSummary {
+  readonly root: CardRef;
+  readonly destination: string;
+  readonly mode: "complete" | "metadata";
+  readonly card_count: number;
+  readonly artifact_count: number;
+  readonly downloaded_artifact_count: number;
+}
+
+/** One verified artifact payload in a local `WyrdState` bundle. */
+export interface HydratedArtifact {
+  readonly relative_path: string;
+  readonly local_path: string;
+  readonly sha256: string;
+  readonly size_bytes: number;
+  readonly content_type: string | null;
+}
+
+/** Card references cross the native boundary as text or serialized JSON. */
+function cardRefText(ref: CardRef | string): string {
+  return typeof ref === "string" ? ref : JSON.stringify(ref);
+}
+
+/**
+ * Tenant-scoped Card registry client over the shared Rust `Cards` handle.
+ *
+ * Registration, reads, hydration, and deletion run in Rust; failures throw
+ * a structured {@link WyrdError}.
+ */
+export class Cards {
+  readonly #native: NativeCards;
+
+  private constructor(native: NativeCards) {
+    this.#native = native;
+  }
+
+  /**
+   * Build a registry client without performing IO.
+   *
+   * Omitted options resolve through the same chain as {@link Bifrost.connect}.
+   */
+  static connect(
+    options: { readonly serverUrl?: string; readonly credential?: string } = {},
+  ): Cards {
+    return new Cards(connectCards(options.serverUrl, options.credential));
+  }
+
+  /** Load a Card tree from disk and register it as one composite. */
+  async registerFromPath(path: string): Promise<RegistrationReceipt> {
+    return lifecycleValue<RegistrationReceipt>(
+      await this.#native.registerFromPath(path),
+    );
+  }
+
+  /** Fetch one Card envelope by exact reference. */
+  async get(ref: CardRef | string): Promise<Card> {
+    return lifecycleValue<Card>(await this.#native.get(cardRefText(ref)));
+  }
+
+  /** List metadata-only Card summaries. */
+  async list(request: ListCardsRequest = {}): Promise<ListCardsResponse> {
+    return lifecycleValue<ListCardsResponse>(
+      await this.#native.list(JSON.stringify(request)),
+    );
+  }
+
+  /** Hydrate one Card graph into a published local bundle for {@link WyrdState}. */
+  async hydrate(
+    ref: CardRef | string,
+    destination: string,
+    options: { readonly metadataOnly?: boolean } = {},
+  ): Promise<HydrationSummary> {
+    return lifecycleValue<HydrationSummary>(
+      await this.#native.hydrate(
+        cardRefText(ref),
+        destination,
+        options.metadataOnly ?? false,
+      ),
+    );
+  }
+
+  /** Soft-delete one Card by exact reference. */
+  async delete(ref: CardRef | string): Promise<void> {
+    lifecycleValue<null>(await this.#native.delete(cardRefText(ref)));
+  }
+}
+
+/**
+ * Offline view of a hydrated Card bundle over the shared Rust `WyrdState`.
+ *
+ * Reads never contact Wyrd; an unknown alias or invalid bundle throws a
+ * structured {@link WyrdError}.
+ */
+export class WyrdState {
+  readonly #native: NativeWyrdState;
+
+  private constructor(native: NativeWyrdState) {
+    this.#native = native;
+  }
+
+  /** Load and validate one hydrated bundle, throwing for an invalid bundle. */
+  static fromPath(path: string): WyrdState {
+    const state = new WyrdState(openWyrdState(path));
+    void state.rootRef;
+    return state;
+  }
+
+  /** The exact root Card reference. */
+  get rootRef(): CardRef {
+    return lifecycleValue<CardRef>(this.#native.rootRef());
+  }
+
+  /** Every persisted alias in stable sorted order. */
+  get aliases(): readonly string[] {
+    return lifecycleValue<string[]>(this.#native.aliases());
+  }
+
+  /** The stored Card envelope for an alias. */
+  card(alias: string): Card {
+    return lifecycleValue<Card>(this.#native.card(alias));
+  }
+
+  /** The exact Card reference for an alias. */
+  cardRef(alias: string): CardRef {
+    return lifecycleValue<CardRef>(this.#native.cardRef(alias));
+  }
+
+  /** The verified local artifacts for an alias. */
+  artifacts(alias: string): readonly HydratedArtifact[] {
+    return lifecycleValue<HydratedArtifact[]>(this.#native.artifacts(alias));
   }
 }

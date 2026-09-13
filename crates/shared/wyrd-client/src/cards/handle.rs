@@ -150,10 +150,13 @@ impl Cards {
     /// No network or token exchange occurs during construction.
     ///
     /// # Errors
-    /// Returns a Wyrd error when the local configuration or API-key override
+    /// Returns a Wyrd error when the local configuration or credential override
     /// cannot be loaded.
-    pub fn new(server_url: Option<&str>, api_key: Option<SecretString>) -> Result<Self, WyrdError> {
-        let client = config::load(server_url, api_key).map_err(WyrdError::from)?;
+    pub fn new(
+        server_url: Option<&str>,
+        credential: Option<SecretString>,
+    ) -> Result<Self, WyrdError> {
+        let client = config::load(server_url, credential).map_err(WyrdError::from)?;
         Ok(Self {
             engine: RegistryEngine::new(client),
         })

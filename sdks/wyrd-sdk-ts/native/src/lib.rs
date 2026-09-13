@@ -1,6 +1,9 @@
-//! Thin napi projection of the one Rust-owned Bifrost client.
+//! Thin napi projection of the Rust-owned `wyrd_client` capabilities:
+//! Bifrost, Cards, and offline `WyrdState`.
 
 #![deny(missing_docs)]
+
+pub mod cards;
 
 use std::sync::{Arc, Mutex};
 
@@ -85,9 +88,25 @@ impl NativeLifecycleResult {
         })
     }
 
+    /// Projects one Rust-owned result as its JSON value or catalog-backed failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the successful value cannot be serialized.
+    fn outcome<T: serde::Serialize>(result: Result<T, WyrdError>) -> napi::Result<Self> {
+        match result {
+            Ok(value) => Self::success(&serde_json::to_value(value).map_err(napi_error)?),
+            Err(error) => Ok(Self::from_wyrd(&error)),
+        }
+    }
+
     /// Builds one failed lifecycle projection with stable Wyrd metadata.
     fn failure(error: &BifrostClientError) -> Self {
-        let projected = wyrd_spec::error::WyrdError::from(error);
+        Self::from_wyrd(&WyrdError::from(error))
+    }
+
+    /// Builds one failed projection directly from a catalog error.
+    fn from_wyrd(projected: &WyrdError) -> Self {
         let problem = projected.as_problem_json();
         Self {
             value_json: None,

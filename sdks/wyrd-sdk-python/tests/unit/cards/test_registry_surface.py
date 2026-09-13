@@ -10,7 +10,7 @@ from wyrd.prompt import Prompt, PromptCard, PromptReference
 
 def _offline_cards() -> Cards:
     """Construct a credential-complete client whose endpoint must never be used."""
-    return Cards(server_url="http://127.0.0.1:1", api_key="unit-test-key")
+    return Cards(server_url="http://127.0.0.1:1", credential="unit-test-key")
 
 
 def test_agent_cards_are_not_registerable() -> None:

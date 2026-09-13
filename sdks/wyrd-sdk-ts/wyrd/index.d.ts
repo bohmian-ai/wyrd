@@ -192,6 +192,58 @@ export declare class NativeBifrostQueryStream {
   get terminalJson(): string | null
 }
 
+/** Tenant-scoped Card registry handle over the shared `wyrd_client` Cards. */
+export declare class NativeCards {
+  /**
+   * Loads one Card tree from disk and registers it as a composite.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the receipt cannot be serialized; load,
+   * validation, and registry failures are returned in the result.
+   */
+  registerFromPath(path: string): Promise<NativeLifecycleResult>
+  /**
+   * Fetches one Card envelope by exact reference.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the envelope cannot be serialized; an
+   * invalid reference or registry failure is returned in the result.
+   */
+  get(cardRef: string): Promise<NativeLifecycleResult>
+  /**
+   * Lists metadata-only Card summaries for one serialized list request.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the page cannot be serialized; a
+   * malformed request or registry failure is returned in the result.
+   */
+  list(requestJson: string): Promise<NativeLifecycleResult>
+  /**
+   * Hydrates one Card graph into a published local bundle.
+   *
+   * `metadata_only` skips artifact payload downloads. A failed hydration
+   * never publishes a partial bundle.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the summary cannot be serialized; graph,
+   * destination, and transfer failures are returned in the result.
+   */
+  hydrate(cardRef: string, destination: string, metadataOnly: boolean): Promise<NativeLifecycleResult>
+  /**
+   * Soft-deletes one Card by exact reference.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the result cannot be projected; an
+   * invalid reference or registry failure is returned in the result.
+   */
+  delete(cardRef: string): Promise<NativeLifecycleResult>
+}
+
 /** Structured result of starting a native terminal-safe query. */
 export declare class NativeQueryStart {
   /** Moves the Rust-owned stream out after a successful startup. */
@@ -211,6 +263,55 @@ export declare class NativeQueryStart {
 }
 
 /**
+ * Offline hydrated-bundle view over the shared `wyrd_client` `WyrdState`.
+ *
+ * The open result is retained so an invalid bundle surfaces its catalog error
+ * on the first read instead of as an untyped constructor failure.
+ */
+export declare class NativeWyrdState {
+  /**
+   * Returns the exact root Card reference.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the reference cannot be serialized.
+   */
+  rootRef(): NativeLifecycleResult
+  /**
+   * Returns every persisted alias in stable sorted order.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the aliases cannot be serialized.
+   */
+  aliases(): NativeLifecycleResult
+  /**
+   * Resolves an alias to its stored Card envelope.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the envelope cannot be serialized.
+   */
+  card(alias: string): NativeLifecycleResult
+  /**
+   * Resolves an alias to its exact Card reference.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the reference cannot be serialized.
+   */
+  cardRef(alias: string): NativeLifecycleResult
+  /**
+   * Returns the verified local artifacts for an alias.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the artifact list cannot be serialized.
+   */
+  artifacts(alias: string): NativeLifecycleResult
+}
+
+/**
  * Connects one Bifrost client, optionally already bound to a write target.
  *
  * A free function rather than a constructor because connecting is asynchronous
@@ -224,6 +325,19 @@ export declare class NativeQueryStart {
  * cannot be dialled.
  */
 export declare function connectBifrost(table?: NativeTableConfig | undefined | null, serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null): Promise<NativeBifrost>
+
+/**
+ * Builds one Card registry handle without performing IO.
+ *
+ * Omitted arguments resolve through the same shared client configuration
+ * chain as `connectBifrost`, so both capabilities authenticate identically.
+ *
+ * # Errors
+ *
+ * Returns a napi error when no credential resolves or the HTTP client cannot
+ * be built.
+ */
+export declare function connectCards(serverUrl?: string | undefined | null, credential?: string | undefined | null): NativeCards
 
 /**
  * Fetches an already-registered table's config by name.
@@ -308,6 +422,9 @@ export interface NativeTableConfig {
   /** Serialized `{table_uid, fingerprint}` once the server has minted it. */
   resolvedJson?: string
 }
+
+/** Loads and validates one hydrated bundle without contacting Wyrd. */
+export declare function openWyrdState(path: string): NativeWyrdState
 
 /**
  * Builds one table config from a JSON Schema document.

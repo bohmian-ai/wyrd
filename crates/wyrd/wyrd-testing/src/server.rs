@@ -3589,7 +3589,13 @@ impl WyrdTestServerBuilder {
                         presign_ttl: Duration::from_secs(600),
                         part_size_bytes: 16 * 1024 * 1024,
                         multipart_threshold_bytes: 100 * 1024 * 1024,
-                        public_base_url: Some("https://wyrd.test".to_owned()),
+                        // A bound server serves its own storage URLs, so they
+                        // must share its HTTP origin: the client refuses to
+                        // send credentials to any other origin.
+                        public_base_url: Some(self.bind_addrs.map_or_else(
+                            || "https://wyrd.test".to_owned(),
+                            |(http, _)| format!("http://{http}"),
+                        )),
                     };
                     (Some(Arc::new(root)), settings)
                 }

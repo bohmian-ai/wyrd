@@ -1470,23 +1470,23 @@ pub struct PyCards {
 impl PyCards {
     /// Construct a tenant-scoped Card client.
     ///
-    /// When `server_url` or `api_key` is omitted, the shared Wyrd client
+    /// When `server_url` or `credential` is omitted, the shared Wyrd client
     /// configuration supplies the value. The handle is cheap to clone and the
     /// kind-specific properties retain this same connection context.
     ///
     /// # Arguments
     /// * `server_url` - Optional Wyrd server URL override.
-    /// * `api_key` - Optional API key override.
+    /// * `credential` - Optional explicit credential override.
     ///
     /// # Errors
-    /// Returns a Wyrd error when local configuration or the API-key override
+    /// Returns a Wyrd error when local configuration or the credential override
     /// cannot be loaded.
     #[new]
-    #[pyo3(signature = (server_url=None, api_key=None))]
-    // justification: pyo3 boundary; Python callers provide owned optional strings and api_key is consumed into SecretString
+    #[pyo3(signature = (server_url=None, credential=None))]
+    // justification: pyo3 boundary; Python callers provide owned optional strings and credential is consumed into SecretString
     #[allow(clippy::needless_pass_by_value)]
-    fn __new__(server_url: Option<String>, api_key: Option<String>) -> CardPyResult<Self> {
-        Cards::new(server_url.as_deref(), api_key.map(SecretString::from))
+    fn __new__(server_url: Option<String>, credential: Option<String>) -> CardPyResult<Self> {
+        Cards::new(server_url.as_deref(), credential.map(SecretString::from))
             .map(|inner| Self { inner })
             .map_err(WyrdPyError::from)
     }

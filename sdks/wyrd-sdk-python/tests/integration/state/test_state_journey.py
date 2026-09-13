@@ -202,7 +202,7 @@ def download_fixture(
     service_path = copy_typed_state_service(tmp_path)
     bundle = tmp_path / "wyrd-state"
     with WyrdTestServer(mutate_env=False) as server:
-        cards = Cards(server_url=server.base_url, api_key=writer_api_key(server))
+        cards = Cards(server_url=server.base_url, credential=writer_api_key(server))
         service_ref = register_service(cards, service_path)
         result = run_cli(
             server,
@@ -273,7 +273,7 @@ def test_underprivileged_get_publishes_no_runnable_bundle(tmp_path: Path) -> Non
     bundle = tmp_path / "denied"
     with WyrdTestServer(mutate_env=False) as server:
         service_path = copy_typed_state_service(tmp_path)
-        cards = Cards(server_url=server.base_url, api_key=writer_api_key(server))
+        cards = Cards(server_url=server.base_url, credential=writer_api_key(server))
         service_ref = register_service(cards, service_path)
         denied = server.bootstrap_service([], name="underprivileged-get")
         result = run_cli(

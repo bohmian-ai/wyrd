@@ -3305,7 +3305,10 @@ impl WyrdTestServerBuilder {
     /// By default the server uses a local filesystem backend backed by a
     /// `tempdir`. Call this to start the server against a real cloud backend
     /// (e.g. S3/RustFS) for multipart or end-to-end storage tests. Credentials
-    /// must be present in the calling process's environment.
+    /// must be present in the calling process's environment. A Local backend
+    /// declares its native `start_after` listing like the default, so a bound
+    /// server's Forge worker starts; supply a plain handle through
+    /// [`Self::with_storage_handle`] to exercise the incapable backend.
     #[must_use]
     pub fn with_storage_settings(mut self, settings: StorageSettings) -> Self {
         self.storage_settings = Some(settings);
@@ -3628,44 +3631,47 @@ impl WyrdTestServerBuilder {
 
         let (storage_root, storage) = if let Some(handle) = self.storage_handle.take() {
             (None, handle)
-        } else if let Some(settings) = self.storage_settings.take() {
-            let handle = wyrd_storage::StorageHandle::from_settings(settings)
-                .await
-                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-            (None, handle)
         } else {
-            let root = tempfile::tempdir()
-                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-            let settings = StorageSettings {
-                backend: BackendConfig::Local {
-                    root: root.path().to_path_buf(),
-                },
-                require_encryption: false,
-                presign_ttl: Duration::from_secs(600),
-                part_size_bytes: 16 * 1024 * 1024,
-                multipart_threshold_bytes: 100 * 1024 * 1024,
-                public_base_url: Some("https://wyrd.test".to_owned()),
+            let (root, settings) = match self.storage_settings.take() {
+                Some(settings) => (None, settings),
+                None => {
+                    let root = tempfile::tempdir()
+                        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+                    let settings = StorageSettings {
+                        backend: BackendConfig::Local {
+                            root: root.path().to_path_buf(),
+                        },
+                        require_encryption: false,
+                        presign_ttl: Duration::from_secs(600),
+                        part_size_bytes: 16 * 1024 * 1024,
+                        multipart_threshold_bytes: 100 * 1024 * 1024,
+                        public_base_url: Some("https://wyrd.test".to_owned()),
+                    };
+                    (Some(Arc::new(root)), settings)
+                }
             };
-            // The filesystem service resumes a listing from `start_after`
-            // correctly but does not advertise the capability, and Forge
-            // workers refuse to start on a staging backend that cannot resume
-            // a bounded orphan scan. The default fixture stands in for a
-            // production object store, so it declares the support it actually
-            // has; a caller wanting the incapable backend supplies plain
-            // storage settings instead.
-            let operator = wyrd_storage::factory::build_operator(&settings.backend)
-                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?
-                .layer(opendal::layers::CapabilityOverrideLayer::new(
-                    |mut capability| {
-                        capability.list_with_start_after = true;
-                        capability
-                    },
-                ));
-            let handle =
-                wyrd_storage::StorageHandle::from_settings_with_operator(settings, operator)
-                    .await
-                    .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-            (Some(Arc::new(root)), handle)
+            let handle = if matches!(settings.backend, BackendConfig::Local { .. }) {
+                // The filesystem service resumes a listing from `start_after`
+                // correctly but does not advertise the capability, and Forge
+                // workers refuse to start on a staging backend that cannot
+                // resume a bounded orphan scan. A Local fixture stands in for a
+                // production object store, so it declares the support it
+                // actually has; a caller wanting the incapable backend supplies
+                // its own plain storage handle instead.
+                let operator = wyrd_storage::factory::build_operator(&settings.backend)
+                    .map_err(|error| WyrdTestServerError::Start(error.to_string()))?
+                    .layer(opendal::layers::CapabilityOverrideLayer::new(
+                        |mut capability| {
+                            capability.list_with_start_after = true;
+                            capability
+                        },
+                    ));
+                wyrd_storage::StorageHandle::from_settings_with_operator(settings, operator).await
+            } else {
+                wyrd_storage::StorageHandle::from_settings(settings).await
+            }
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+            (root, handle)
         };
         if self.bifrost_roles.contains(&BifrostRuntimeRole::Oracle)
             && self.oracle_peer_credentials.is_none()

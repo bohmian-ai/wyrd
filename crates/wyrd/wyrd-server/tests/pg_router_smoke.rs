@@ -1368,17 +1368,20 @@ async fn forge_begin_shutdown_closes_readiness_before_cancellation() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn forge_worker_refuses_staging_without_native_cursor_listing() {
     let root = tempfile::tempdir().expect("staging root");
+    let storage = wyrd_storage::StorageHandle::from_settings(wyrd_storage::StorageSettings {
+        backend: wyrd_storage::BackendConfig::Local {
+            root: root.path().to_path_buf(),
+        },
+        require_encryption: false,
+        presign_ttl: std::time::Duration::from_secs(600),
+        part_size_bytes: 16 * 1024 * 1024,
+        multipart_threshold_bytes: 100 * 1024 * 1024,
+        public_base_url: Some("https://wyrd.test".to_owned()),
+    })
+    .await
+    .expect("plain filesystem storage builds");
     let server = WyrdTestServer::builder()
-        .with_storage_settings(wyrd_storage::StorageSettings {
-            backend: wyrd_storage::BackendConfig::Local {
-                root: root.path().to_path_buf(),
-            },
-            require_encryption: false,
-            presign_ttl: std::time::Duration::from_secs(600),
-            part_size_bytes: 16 * 1024 * 1024,
-            multipart_threshold_bytes: 100 * 1024 * 1024,
-            public_base_url: Some("https://wyrd.test".to_owned()),
-        })
+        .with_storage_handle(storage)
         .start_in_process()
         .await
         .expect("test server starts");

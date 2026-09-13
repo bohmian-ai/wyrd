@@ -35,7 +35,7 @@ workspace_members=$(cargo metadata --no-deps --format-version 1 2>/dev/null \
 import json, sys
 data = json.load(sys.stdin)
 print('\n'.join(sorted(p['name'] for p in data['packages'])))
-" | grep -Ev '^(wyrd-sdk-python|wyrd-node|wyrd-node-testing|wyrd-rust-examples)$')
+" | grep -Ev '^(wyrd-sdk-python|wyrd-sdk-ts|wyrd-sdk-ts-testing|wyrd-rust-examples)$')
 
 missing=$(comm -23 <(echo "$workspace_members") <(echo "$combined"))
 if [ -n "$missing" ]; then

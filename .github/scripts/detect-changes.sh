@@ -37,7 +37,7 @@ set_output_all() {
   fi
 }
 
-set_output rust '^(Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|deny\.toml|mise\.toml|crates/|sdks/wyrd-sdk-rust/|sdks/wyrd-sdk-python/Cargo\.toml|sdks/wyrd-sdk-python/src/)'
+set_output rust '^(Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|deny\.toml|mise\.toml|crates/|sdks/wyrd-sdk-rust/|sdks/wyrd-sdk-ts/native/|sdks/wyrd-sdk-ts/native-testing/|sdks/wyrd-sdk-python/Cargo\.toml|sdks/wyrd-sdk-python/src/)'
 set_output python '^(mise\.toml|Cargo\.toml|Cargo\.lock|crates/shared/wyrd-utils/|crates/wyrd/wyrd-cards/|crates/wyrd/wyrd-interfaces/|sdks/wyrd-sdk-python/|examples/python/)'
 set_output docs '^(mise\.toml|docs/|openapi\.yaml|crates/wyrd-spec/schemas/|examples/)'
 # ui also covers the cross-package generated token targets so the check:tokens
@@ -51,7 +51,7 @@ set_output identity '^(mise\.toml|Cargo\.lock|docker-compose\.yml|tests/fixtures
 set_output workflow '^(\.github/workflows/|\.github/scripts/)'
 # A Bifrost-only change can use the complete capability gate. Mixed, global,
 # and unknown changes deliberately fall back to the repository gate.
-set_output_all bifrost_only '^(architecture/bifrost-design\.md|architecture/references/domain/(olap-serving|iceberg|datafusion|arrow-analytical-interop|analytical-operations-reliability)\.md|crates/vala/vala-bifrost-redux/|crates/shared/wyrd-client/(src/bifrost/|tests/pg_bifrost_e2e\.rs)|crates/vala/vala-sql/(src/(queries|row_types)/(forge|oracle|file_list|maintenance|scribe)|tests/(oracle_admission|pg_(file_list|forge|maintenance|olap|oracle|stream)))|crates/wyrd/wyrd-testing/(src/bifrost/|tests/bifrost/)|crates/wyrd/wyrd-server/src/(bifrost/|oracle/|query/|grpc/(query|scribe_tail)\.rs)|crates/wyrd/wyrd-server/tests/(pg_eval_v1_protocol|pg_grpc_ingest_smoke|pg_grpc_smoke|pg_merge_http_protected|pg_router_smoke)\.rs|crates/wyrd/wyrd-mcp/(src/bifrost/|tests/bifrost/)|crates/wyrd-spec/src/vala/(api|assignment_authority|error|ids|managed_columns)\.rs|sdks/wyrd-sdk-python/(python/wyrd/bifrost/|tests/bifrost/|tests/test_bifrost\.py|tests/integration/test_bifrost_(e2e|query)\.py)|typescript/wyrd/(tests/unit/bifrost-query\.test\.ts|tests/integration/oracle-query\.test\.ts))'
+set_output_all bifrost_only '^(architecture/bifrost-design\.md|architecture/references/domain/(olap-serving|iceberg|datafusion|arrow-analytical-interop|analytical-operations-reliability)\.md|crates/vala/vala-bifrost-redux/|crates/shared/wyrd-client/(src/bifrost/|tests/pg_bifrost_e2e\.rs)|crates/vala/vala-sql/(src/(queries|row_types)/(forge|oracle|file_list|maintenance|scribe)|tests/(oracle_admission|pg_(file_list|forge|maintenance|olap|oracle|stream)))|crates/wyrd/wyrd-testing/(src/bifrost/|tests/bifrost/)|crates/wyrd/wyrd-server/src/(bifrost/|oracle/|query/|grpc/(query|scribe_tail)\.rs)|crates/wyrd/wyrd-server/tests/(pg_eval_v1_protocol|pg_grpc_ingest_smoke|pg_grpc_smoke|pg_merge_http_protected|pg_router_smoke)\.rs|crates/wyrd/wyrd-mcp/(src/bifrost/|tests/bifrost/)|crates/wyrd-spec/src/vala/(api|assignment_authority|error|ids|managed_columns)\.rs|sdks/wyrd-sdk-python/(python/wyrd/bifrost/|tests/bifrost/|tests/test_bifrost\.py|tests/integration/test_bifrost_(e2e|query)\.py)|sdks/wyrd-sdk-ts/wyrd/(tests/unit/bifrost-query\.test\.ts|tests/integration/oracle-query\.test\.ts))'
 
 if [[ -s "$changed_files" ]]; then
   echo "any=true" >> "$output_file"

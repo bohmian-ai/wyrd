@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 
 const exec = promisify(execFile);
 const repository = resolve(fileURLToPath(new URL("..", import.meta.url)));
-const sdkDir = join(repository, "typescript", "wyrd");
+const sdkDir = join(repository, "sdks", "wyrd-sdk-ts", "wyrd");
 const target = `${process.platform}-${process.arch}`;
 const targetPackage = {
   "darwin-arm64": "darwin-arm64",
@@ -23,7 +23,7 @@ if (targetPackage === undefined) {
 
 const binary = `wyrd.${targetPackage}.node`;
 const sourceBinary = join(sdkDir, binary);
-const platformDir = join(repository, "typescript", `wyrd-${targetPackage}`);
+const platformDir = join(repository, "sdks", "wyrd-sdk-ts", `wyrd-${targetPackage}`);
 const platformManifest = JSON.parse(
   await readFile(join(platformDir, "package.json"), "utf8"),
 );
@@ -136,9 +136,9 @@ try {
   const { stdout: importOutput } = await exec(
     process.execPath,
     ["--input-type=module", "-e", `
-      import { WyrdClient } from "@wyrd/sdk";
-      const client = new WyrdClient("http://127.0.0.1:1", "pack-check-token");
-      if (!(client instanceof WyrdClient)) throw new Error("WyrdClient construction failed");
+      import { Bifrost, TableConfig } from "@wyrd/sdk";
+      if (typeof Bifrost.connect !== "function") throw new Error("Bifrost facade missing");
+      if (typeof TableConfig !== "function") throw new Error("TableConfig missing");
       const resolved = import.meta.resolve("@wyrd/sdk");
       if (resolved.includes(".ts")) throw new Error("published export resolves to TypeScript: " + resolved);
       console.log(resolved);

@@ -187,7 +187,7 @@ run = "uv run pytest -q tests/test_bifrost.py tests/bifrost"
 [tasks."test:bifrost:unit:typescript:inner"]
 hide = true
 description = "Run TypeScript Bifrost unit tests."
-dir = "typescript/wyrd"
+dir = "sdks/wyrd-sdk-ts/wyrd"
 depends = ["ts:build"]
 run = "pnpm exec vitest run tests/unit/bifrost-query.test.ts"
 
@@ -355,7 +355,7 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:a
 [tasks."test:bifrost:journey:typescript:inner"]
 hide = true
 description = "Run the TypeScript Bifrost journey against an already-provisioned Postgres lifecycle."
-dir = "typescript/wyrd"
+dir = "sdks/wyrd-sdk-ts/wyrd"
 depends = ["ts:build", "ts:build:testing"]
 run = "pnpm exec vitest run tests/integration/oracle-query.test.ts tests/integration/bifrost-write.test.ts tests/integration/otel-export.test.ts"
 
@@ -553,7 +553,7 @@ hide = true
 description = "Verify the Rust SDK projects wyrd-client without Python-only dependencies"
 run = """
 set -eu
-if cargo tree --locked -p wyrd-sdk-rust -e normal | rg 'pyo3|wyrd-sdk-python|wyrd-node'; then
+if cargo tree --locked -p wyrd-sdk-rust -e normal | rg 'pyo3|wyrd-sdk-python|wyrd-sdk-ts'; then
   echo "FAIL: wyrd-sdk-rust dependency cone contains a Python or TypeScript binding dependency"
   exit 1
 fi
@@ -1221,10 +1221,10 @@ diff -u "$BEFORE" "$AFTER" \
 # Task shells defined ahead of implementation, mirroring `test:bifrost:journey`. They
 # are INERT until their owning slice lands the code: `codegen:openapi` needs the
 # `wyrd-server` `gen_openapi` example (slice 06c); every `ts:*` task needs the napi
-# bindings + package roots (slice 13a). Two separate pnpm packages under `typescript/`
-# glued by `typescript/pnpm-workspace.yaml`: public `@wyrd/sdk` (`typescript/wyrd`,
-# built from `crates/bindings/wyrd-node`) and private `@wyrd/testing`
-# (`typescript/testing`, built from `crates/bindings/wyrd-node-testing`, test-tier).
+# bindings + package roots (slice 13a). Two separate pnpm packages under `sdks/wyrd-sdk-ts/`
+# glued by `sdks/wyrd-sdk-ts/pnpm-workspace.yaml`: public `@wyrd/sdk` (`sdks/wyrd-sdk-ts/wyrd`,
+# built from `sdks/wyrd-sdk-ts/native`) and private `@wyrd/testing`
+# (`sdks/wyrd-sdk-ts/testing`, built from `sdks/wyrd-sdk-ts/native-testing`, test-tier).
 # One napi addon per package so the harness never overwrites the SDK's generated
 # loader/`.d.ts`. 06c wires `codegen:openapi` into `codegen:regen`; 13a adds
 # `ts:napi:check`/`ts:typecheck`/`ts:test:unit` to `gate`; `ts:test:integration`
@@ -1237,27 +1237,27 @@ run = "cargo run --locked -p wyrd-server --example gen_openapi > openapi.yaml.tm
 
 [tasks."ts:install"]
 hide = true
-description = "Install the typescript/ pnpm workspace (@wyrd/sdk + @wyrd/testing) from the frozen lockfile (slice 13a)"
-dir = "typescript"
+description = "Install the sdks/wyrd-sdk-ts/ pnpm workspace (@wyrd/sdk + @wyrd/testing) from the frozen lockfile (slice 13a)"
+dir = "sdks/wyrd-sdk-ts"
 run = "pnpm install --frozen-lockfile"
 
 [tasks."ts:build"]
-description = "Build the public @wyrd/sdk napi addon (crates/bindings/wyrd-node) + emit index.d.ts into typescript/wyrd (slice 13a)"
+description = "Build the public @wyrd/sdk napi addon (sdks/wyrd-sdk-ts/native) + emit index.d.ts into sdks/wyrd-sdk-ts/wyrd (slice 13a)"
 depends = ["ts:install"]
-dir = "typescript/wyrd"
-run = "pnpm exec napi build --platform --manifest-path ../../crates/bindings/wyrd-node/Cargo.toml --output-dir . --package-json-path package.json && test ! -f index.js || mv index.js index.generated.cjs && cp index.d.ts index.d.cts && pnpm exec tsc -p tsconfig.build.json && node -e 'require(\"node:fs\").rmSync(\"index.generated.cjs\", { force: true })'"
+dir = "sdks/wyrd-sdk-ts/wyrd"
+run = "pnpm exec napi build --platform --manifest-path ../native/Cargo.toml --output-dir . --package-json-path package.json && test ! -f index.js || mv index.js index.generated.cjs && cp index.d.ts index.d.cts && pnpm exec tsc -p tsconfig.build.json && node -e 'require(\"node:fs\").rmSync(\"index.generated.cjs\", { force: true })'"
 
 [tasks."ts:build:testing"]
-description = "Build the private @wyrd/testing napi harness addon (crates/bindings/wyrd-node-testing) into typescript/testing; feeds the integration lane only (slice 13a)"
+description = "Build the private @wyrd/testing napi harness addon (sdks/wyrd-sdk-ts/native-testing) into sdks/wyrd-sdk-ts/testing; feeds the integration lane only (slice 13a)"
 depends = ["ts:install"]
-dir = "typescript/testing"
-run = "pnpm exec napi build --platform --manifest-path ../../crates/bindings/wyrd-node-testing/Cargo.toml --output-dir . --package-json-path package.json"
+dir = "sdks/wyrd-sdk-ts/testing"
+run = "pnpm exec napi build --platform --manifest-path ../native-testing/Cargo.toml --output-dir . --package-json-path package.json"
 
 [tasks."ts:napi:check"]
 description = "Fail if the public @wyrd/sdk napi-generated index.d.ts is not committed/current (slice 13a; Node analogue of .pyi drift). Scoped to the SDK declaration, not the harness."
 depends = ["ts:build"]
-dir = "typescript/wyrd"
-run = "git diff --exit-code -- index.d.ts || { echo 'napi .d.ts drift - run mise run ts:build and commit typescript/wyrd/index.d.ts'; exit 1; }"
+dir = "sdks/wyrd-sdk-ts/wyrd"
+run = "git diff --exit-code -- index.d.ts || { echo 'napi .d.ts drift - run mise run ts:build and commit sdks/wyrd-sdk-ts/wyrd/index.d.ts'; exit 1; }"
 
 [tasks."ts:pack:check"]
 description = "Pack the compiled @wyrd/sdk and current-host napi addon, then import the installed package from a clean ESM project"
@@ -1267,13 +1267,13 @@ run = "node scripts/check_ts_package.mjs"
 [tasks."ts:typecheck"]
 description = "Typecheck @wyrd/sdk incl. integration sources that resolve the local @wyrd/testing workspace dep (slice 13a)"
 depends = ["ts:build", "ts:build:testing"]
-dir = "typescript/wyrd"
+dir = "sdks/wyrd-sdk-ts/wyrd"
 run = "pnpm exec tsc --noEmit"
 
 [tasks."ts:test:unit"]
 description = "@wyrd/sdk unit tests: auth-parity + an error-set native {value,error} envelope makes unwrapNative throw instanceof WyrdError (hand-authored TS class) exposing code/status/title/detail as properties, not parsed from message (slice 13a)"
 depends = ["ts:build"]
-dir = "typescript/wyrd"
+dir = "sdks/wyrd-sdk-ts/wyrd"
 run = "pnpm exec vitest run tests/unit"
 
 [tasks."ts:test:integration"]
@@ -1294,7 +1294,7 @@ Vitest, which boots WyrdTestServer IN-PROCESS against the repository-managed Pos
 seeds a tenant, mints a key, and drives @wyrd/sdk against it, tearing down via shutdown()
 in finally — symmetric with the Python journey.
 """
-dir = "typescript/wyrd"
+dir = "sdks/wyrd-sdk-ts/wyrd"
 run = "pnpm exec vitest run tests/integration"
 
 [tasks."check:single-into-response-impl"]

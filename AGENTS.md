@@ -150,10 +150,6 @@ Locked cross-cutting decisions that any contributor must honor:
 - `crates/wyrd/wyrd-interfaces`: existing Python-only framework adapters. It
   may remain as an optional-feature migration boundary during this integration;
   only `wyrd-sdk-python` enables it. Its long-term home is the Python SDK.
-- `crates/bindings/*`: migration-state or internal native-binding mechanics
-  only. They are not public package roots. First-class SDK package and native
-  binding roots live under `sdks/*`; bindings do not reimplement HTTP,
-  validation, registry, storage, or lifecycle logic.
 - `sdks/wyrd-sdk-rust`: thin first-class Rust package over `wyrd-client`.
 - `sdks/wyrd-sdk-python`: Python package, PyO3 aggregation, generated stubs,
   and Python-facing tests over `wyrd-client`.

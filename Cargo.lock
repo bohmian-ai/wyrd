@@ -11442,37 +11442,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "wyrd-node"
-version = "0.0.1"
-dependencies = [
- "arrow",
- "chrono",
- "napi",
- "napi-build",
- "napi-derive",
- "secrecy",
- "serde_json",
- "tokio",
- "wyrd-client",
- "wyrd-queue",
- "wyrd-spec",
-]
-
-[[package]]
-name = "wyrd-node-testing"
-version = "0.0.1"
-dependencies = [
- "arrow",
- "napi",
- "napi-build",
- "napi-derive",
- "secrecy",
- "vala-bifrost-redux",
- "wyrd-runtime",
- "wyrd-testing",
-]
-
-[[package]]
 name = "wyrd-queue"
 version = "0.0.1"
 dependencies = [
@@ -11566,6 +11535,37 @@ name = "wyrd-sdk-rust"
 version = "0.0.1"
 dependencies = [
  "wyrd-client",
+]
+
+[[package]]
+name = "wyrd-sdk-ts"
+version = "0.0.1"
+dependencies = [
+ "arrow",
+ "chrono",
+ "napi",
+ "napi-build",
+ "napi-derive",
+ "secrecy",
+ "serde_json",
+ "tokio",
+ "wyrd-client",
+ "wyrd-queue",
+ "wyrd-spec",
+]
+
+[[package]]
+name = "wyrd-sdk-ts-testing"
+version = "0.0.1"
+dependencies = [
+ "arrow",
+ "napi",
+ "napi-build",
+ "napi-derive",
+ "secrecy",
+ "vala-bifrost-redux",
+ "wyrd-runtime",
+ "wyrd-testing",
 ]
 
 [[package]]

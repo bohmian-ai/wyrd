@@ -5,11 +5,12 @@ members = [
     "crates/vala/*",
     "crates/skald/*",
     "crates/shared/*",
-    "crates/bindings/*",
     "crates/wyrd-spec",
     "examples/rust",
     "sdks/wyrd-sdk-python",
     "sdks/wyrd-sdk-rust",
+    "sdks/wyrd-sdk-ts/native",
+    "sdks/wyrd-sdk-ts/native-testing",
 ]
 exclude = []
 default-members = [

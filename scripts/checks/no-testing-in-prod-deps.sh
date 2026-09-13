@@ -39,7 +39,7 @@ for package in metadata["packages"]:
         ):
             continue
         if (
-            package["name"] == "wyrd-node-testing"
+            package["name"] == "wyrd-sdk-ts-testing"
             and dependency["name"] == "wyrd-testing"
         ):
             continue

@@ -69,6 +69,28 @@ Paths are ownership guidance, not a private implementation allowlist.
 7. Reconcile source contracts and generators so every public Bifrost table,
    query, lifecycle, permission, streaming, and error surface is represented.
 
+## Postgres Test Lifecycle Correction
+
+The five Postgres-backed Card, CLI, and WyrdState verification lanes still
+depend on the deleted `setup:postgres`/`setup:db-roles` lifecycle. Keep the
+existing tests and route these lanes through the repository's existing
+`scripts/postgres/with-test-postgres.sh` outer/`:inner` pattern instead:
+
+- `test:cards:integration`
+- `test:cli:journey`
+- `test:wyrdstate:journey`
+- `py:test:cards:integration`
+- `py:test:wyrdstate:integration`
+
+Do not restore the deleted shared-container setup tasks or add another harness.
+Each outer lane owns one isolated Postgres lifecycle and migration; its inner
+lane preserves the existing Cargo or pytest command.
+
+This is a configuration regression correction, so no manufactured application
+TDD cycle is required. The direct proof is that the five existing commands
+start without an unknown setup task and `test:postgres:inventory` accepts their
+lifecycle ownership.
+
 ## Acceptance Criteria
 
 - Rust, Python, and TypeScript expose one coherent SDK capability set from the
@@ -98,6 +120,9 @@ Paths are ownership guidance, not a private implementation allowlist.
   direct `code`, `message`, `detail`, `details`, `remediation`, `status`,
   `title`, and `type`; prohibited exception classes, fake aliases, generic
   fallbacks, and aggregate `problem` attributes are absent.
+- All five Task-002 Card, CLI, and WyrdState Postgres lanes start from a clean
+  checkout through the canonical isolated lifecycle, without a dependency on
+  deleted setup tasks or a fixed Postgres endpoint.
 
 ## Verification
 
@@ -123,6 +148,7 @@ Paths are ownership guidance, not a private implementation allowlist.
 - `mise run check:py-wheel-no-testing`
 - `mise run check:single-into-response-impl`
 - `mise run check:proto-drift`
+- `mise run test:postgres:inventory`
 - `git diff --check`
 
 Run and record exact focused commands for the Rust SDK, Python, TypeScript,

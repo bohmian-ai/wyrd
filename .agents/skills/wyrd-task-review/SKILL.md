@@ -1,6 +1,6 @@
 ---
 name: wyrd-task-review
-description: Independently audit one immutable cumulative Wyrd task implementation for exact acceptance and repository standards, then independently validate every finding and remediation through Ponytail before writing a verdict.
+description: Orchestrate a required two-wave, multi-agent audit of one immutable cumulative Wyrd task implementation, then write its verdict and any remediation task from independently validated findings.
 ---
 
 # Wyrd Task Review
@@ -23,81 +23,59 @@ results. If the candidate changes during review, return `BLOCKED`.
 Read `AGENTS.md`, [agent rules](../../../architecture/agent-rules.md),
 [spec-driven development](../../../architecture/references/languages/spec-driven-development.md),
 and only the architecture and testing references applicable to the task. Follow
-CodeGraph instructions. Inspect the diff and enough surrounding owners,
-callers, consumers, negative paths, tests, manifests, and generated surfaces to
-judge the task.
+CodeGraph instructions. Map the changed surfaces only far enough to select the
+required `domain-rev` agents; the reviewers own inspection and judgment.
 
-The reviewer must be fresh relative to implementation. If the current context
-implemented the change, delegate this audit to one fresh reviewer; otherwise
-review directly. The reviewer receives the original specification and task,
-actual diff, relevant repository rules, and verification results—not the
-implementation agent's completion summary or an intended verdict.
+Before spawning Wave 1, create a new
+`changes/active/<slug>/review/<review-name>/` directory without overwriting a
+prior attempt. Assign every reviewer its exact report path in that directory.
 
-Always delegate repository-standard compliance to a separate fresh specialist.
-This specialist is independent of both implementation and the primary acceptance
-reviewer. Add another specialist when a changed high-risk security, tenancy,
-concurrency, durability, or persistent-data boundary needs expert review.
+## Required agent topology
 
-## Audit repository standards independently
+The calling agent is the review orchestrator, not one of the reviewers. It MUST
+use the harness's agent-delegation capability to spawn separate fresh subagents;
+simulating multiple reviewer roles in one context does not satisfy this skill.
+No agent may fill more than one role.
 
-Give the repository-standards specialist the immutable subject, complete diff,
-repository root, and available verification results. Do not provide the primary
-reviewer's conclusions or an intended verdict.
+Run the review in two waves:
 
-The specialist reads `AGENTS.md`, [agent rules](../../../architecture/agent-rules.md),
-and the complete applicable authority selected through the
-[reference router](../../../architecture/references/README.md). It maps every
-changed surface to its governing rules and inspects enough surrounding source,
-tests, manifests, generated artifacts, and consumers to determine compliance.
-It audits all touched languages and layers; one surface cannot stand in for
-Rust, Python, TypeScript, server, contract, test, documentation, or tooling
-rules that independently apply.
+1. **Wave 1, in parallel:** always spawn a task implementation reviewer
+   (`task-rev`) and repository-standards reviewer (`repo-rev`). Also spawn one
+   domain reviewer (`domain-rev`) for each materially changed sensitive domain,
+   including security/RBAC, tenancy, concurrency, durability, persistent data,
+   or another boundary whose correctness needs domain expertise.
+2. **Wave 2:** after every Wave 1 report is complete, always spawn one
+   structured Ponytail reviewer (`ponytail-rev`). It independently validates
+   the union of all findings and produces the final finding ledger and
+   decision-complete recommendations.
 
-The specialist returns:
+Wave 1 reviewers receive the immutable subject and inputs needed for their own
+scope, but not another reviewer's conclusions or an intended verdict. The
+`ponytail-rev` receives the complete diff, applicable authorities, and every
+Wave 1 report. The orchestrator only establishes the subject, routes inputs,
+checks report completeness, and writes final artifacts from the validated
+ledger. If any required agent cannot be spawned, any required report is
+missing, or the candidate changes during either wave, return `BLOCKED`.
 
-1. an authority-coverage table mapping each changed surface to every applicable
-   repository authority;
-2. a pass or fail result for each applicable rule, with exact rule and source
-   evidence; and
-3. material repository-rule findings with the violated rule, location,
-   consequence, and testable correction.
+## Wave 1: task implementation review (`task-rev`)
 
-The specialist does not review task acceptance, propose optional improvements,
-or repeat the Ponytail audit. Missing authority, incomplete coverage, or an
-unavailable independent specialist blocks the review. Preserve its report as
-`standards-review.md` in the review directory and include every material
-standards finding in the primary verdict and remediation task.
+The `task-rev` must be fresh relative to implementation. Give it the original
+specification and task, actual diff, relevant repository rules, and available
+verification results—not the implementation agent's completion summary or an
+intended verdict.
 
-## Apply adversarial Ponytail review
-
-Start unconvinced. The candidate earns `PASS` through repository, diff, and
-verification evidence; intent, summaries, plausible code, and green checks alone
-do not establish completion. Try to falsify every acceptance criterion,
+Start unconvinced. The candidate earns acceptance through repository, diff, and
+verification evidence; intent, summaries, plausible code, and green checks
+alone do not establish completion. Try to falsify every acceptance criterion,
 constraint, non-goal, and claimed regression boundary through a realistic
 reachable path.
 
 Apply the Ponytail ladder to every changed abstraction, dependency,
 configuration surface, compatibility path, generic layer, and speculative
-extension:
-
-1. Can it be deleted while preserving the complete task?
-2. Does existing repository behavior already solve it?
-3. Does the standard library or native platform solve it?
-4. Does an already-installed dependency solve it?
-5. Only then, is the new code the minimum necessary behavior?
-
-Require source evidence for the complexity. When a smaller existing solution
-satisfies every requirement and constraint, classify the unnecessary addition
-as `DRIFT` and require deletion or simplification. Prefer one root-cause fix in
-the shared owner over repeated symptom guards. Do not mistake fewer lines for a
-valid simplification when it weakens validation, error handling, security,
-accessibility, durability, or another explicit requirement.
-
-Best-practice review means enforcing applicable repository rules and the
-simplest maintainable solution required by the task. It does not authorize
-subjective cleanup, a preferred style, or broader redesign.
-
-## Audit acceptance
+extension: delete it if the task does not need it; otherwise reuse repository,
+standard-library, native-platform, or installed-dependency behavior before
+accepting new code. Require the smallest safe root-cause correction without
+weakening validation, error handling, security, accessibility, or durability.
 
 Build an explicit matrix:
 
@@ -110,35 +88,88 @@ Inspect specifically for:
 - **MISSING** — required behavior was not implemented;
 - **INCORRECT** — behavior exists but does not satisfy the requirement;
 - **DRIFT** — implementation extends beyond the requested scope;
-- **VIOLATION** — an explicit constraint, non-goal, or repository rule was
-  violated; and
+- **VIOLATION** — an explicit constraint or non-goal was violated; and
 - **REGRESSION** — existing behavior was unintentionally changed.
 
 Do not report optional improvements, speculative hardening, preferences,
 unrelated pre-existing debt, or refactors not required by the task. Tests prove
-behavior; they do not prove that the requested behavior was the behavior built.
-Rely on repository source and the diff, not agent summaries.
+behavior; they do not prove that the requested behavior was built. Rely on
+repository source and the diff, not agent summaries.
 
-Give every material finding a stable `FIND-<task>-<n>` ID plus its
-classification, violated obligation, exact location, evidence, observable
-consequence, and required testable correction. For `DRIFT`, identify what can be
-deleted or which existing or native mechanism already covers the outcome.
-Prescribe the outcome and boundary, not private implementation mechanics when
-several equally minimal corrections remain.
+Return `task-review.md` with the acceptance matrix, proposed findings, and one
+overall `PASS`, `FAIL`, or `BLOCKED` result. Each finding needs a source-local
+ID, classification, violated obligation, exact location, evidence, observable
+consequence, and required testable correction. For `DRIFT`, identify what can
+be deleted or which existing or native mechanism already covers the outcome.
 
-## Validate findings and remediation independently
+## Wave 1: repository standards review (`repo-rev`)
 
-Skip this section and do not create `findings-validation.md` when the proposed
-finding ledger is empty.
+Give the repository-standards specialist the immutable subject, complete diff,
+repository root, and available verification results. Do not provide `task-rev`
+conclusions or an intended verdict.
 
-Before choosing a verdict, give every proposed finding and correction boundary
-to a fresh validator independent of implementation, the primary acceptance
-review, and the repository-standards specialist. Provide the immutable subject,
-applicable authorities, complete diff, and proposed finding ledger, but no
-intended verdict.
+The specialist reads `AGENTS.md`, [agent rules](../../../architecture/agent-rules.md),
+and the complete applicable authority selected through the
+[reference router](../../../architecture/references/README.md). It maps every
+changed surface to its governing rules and inspects enough surrounding source,
+tests, manifests, generated artifacts, and consumers to determine compliance.
+It audits all touched languages and layers; one surface cannot stand in for
+Rust, Python, TypeScript, server, contract, test, documentation, or tooling
+rules that independently apply.
 
-The validator inspects the actual source and applies the Ponytail ladder. For
-each finding it must:
+The `repo-rev` returns:
+
+1. an authority-coverage table mapping each changed surface to every applicable
+   repository authority;
+2. a pass or fail result for each applicable rule, with exact rule and source
+   evidence; and
+3. material repository-rule findings with source-local IDs, the violated rule,
+   location, consequence, and testable correction; and
+4. one overall `PASS`, `FAIL`, or `BLOCKED` result.
+
+The specialist does not review task acceptance, propose optional improvements,
+or perform the Ponytail audit. Missing authority or incomplete coverage blocks
+the review. Preserve its report as `standards-review.md`.
+
+## Wave 1: sensitive domain review (`domain-rev`)
+
+Spawn a separate `domain-rev` for each sensitive domain materially changed by
+the candidate. Scope each agent to one coherent domain and give it the approved
+specification, original task, complete diff, governing authority, surrounding
+code, available verification results, and exact report path needed to trace that
+boundary end to end. Examples include an RBAC/security reviewer for permission
+and trust-boundary changes or a data-layer reviewer for transaction, RLS,
+durability, concurrency, and persistent-state changes.
+
+Each `domain-rev` returns `domain-review-<domain>.md` with its reviewed boundary,
+authority and source coverage, verification limits, material proposed findings,
+and one overall `PASS`, `FAIL`, or `BLOCKED` result. Every finding needs a
+source-local ID, violated obligation, exact location, evidence, observable
+consequence, and testable correction. It does not broaden the approved task or
+report speculative hardening.
+
+## Wave 2: structured Ponytail validation (`ponytail-rev`)
+
+Always spawn a fresh `ponytail-rev` after all Wave 1 reports are complete, even
+when their proposed finding union is empty. Give it the immutable subject,
+applicable authorities, complete diff, `task-review.md`, `standards-review.md`,
+and every `domain-review-<domain>.md`, but no intended verdict.
+
+The `ponytail-rev` independently inspects the actual source, validates every
+Wave 1 finding and correction, removes duplicates, and resolves contradictions
+from approved authority. Apply this ladder to every finding and proposed
+remediation:
+
+1. Can it be deleted while preserving the complete task?
+2. Does existing repository behavior already solve it?
+3. Does the standard library or native platform solve it?
+4. Does an already-installed dependency solve it?
+5. Only then, what is the minimum necessary correction?
+
+Prefer one root-cause fix in the shared owner over repeated symptom guards. Do
+not mistake fewer lines for a valid simplification when it weakens validation,
+error handling, security, accessibility, durability, or another explicit
+requirement. For each proposed finding the `ponytail-rev` must:
 
 1. trace every caller and read the full body of each function the correction
    would change or move;
@@ -154,33 +185,40 @@ each finding it must:
 5. return `CONFIRMED`, `REVISED`, or `REJECTED` with source evidence and the
    smallest safe correction boundary.
 
-The primary reviewer may include only independently confirmed or revised
-findings. A rejected finding is omitted, not softened into optional advice. If
-validation shows that the correction needs a new product, public API,
+The final deduplicated ledger records each retained finding's stable
+`FIND-<task>-<n>` ID, Wave 1 source IDs, `CONFIRMED` or `REVISED` status,
+classification, violated obligation, exact location, evidence, observable
+consequence, decision-complete correction, and focused closure proof. Preserve
+prior `FIND-*` IDs during remediation and assign the next unused number only to
+new findings. Each correction selects the smallest safe approach, names the
+existing owner or mechanism to reuse, and preserves adjacent behavior. When
+Wave 1 proposed no findings, return an explicitly validated empty ledger.
+
+The orchestrator may include only independently confirmed or revised findings.
+A rejected finding is omitted, not softened into optional advice. If validation
+shows that the correction needs a new product, public API,
 architecture, security, compatibility, cross-service, concurrency, resource-
 ownership, or persistent-data decision, do not prescribe it as remediation;
 return `SPEC_REVISION_REQUIRED` when the approved task truly requires that
 decision, otherwise reject the finding as out of scope.
 
 Missing source, incomplete caller tracing, an unavailable independent
-validator, or disagreement that cannot be resolved from approved authority
-blocks the review. Preserve the validator's report as
+`ponytail-rev`, or disagreement that cannot be resolved from approved authority
+blocks the review. Preserve its final ledger and recommendations as
 `findings-validation.md` in the review directory.
 
 ## Verdict and remediation task
 
-Create a new `changes/active/<slug>/review/<review-name>/` directory without
-overwriting a prior attempt. Write the specialist's `standards-review.md` and
-the validator's `findings-validation.md` when there were proposed findings, then
-write `verdict.md` containing the immutable subject, acceptance matrix,
-repository-standards result, independent finding-validation result when
-applicable, verification limits, material findings, prior-finding closure, and
-one verdict:
+In the established review directory, preserve `task-review.md`,
+`standards-review.md`, every `domain-review-<domain>.md`, and
+`findings-validation.md`, then write `verdict.md` containing the immutable
+subject, acceptance matrix, Wave 1 results, validated finding ledger,
+verification limits, prior-finding closure, and one verdict:
 
-- `PASS` — every obligation and the independent repository-standards audit
-  passes, no independently confirmed or revised material finding remains,
-  non-goals remain excluded, verification is credible, and no unrelated change
-  entered the diff;
+- `PASS` — `task-rev`, `repo-rev`, and every selected `domain-rev` pass,
+  `ponytail-rev` completes with an empty validated ledger, every obligation
+  passes, non-goals remain excluded, verification is credible, and no unrelated
+  change entered the diff;
 - `FIX_REQUIRED` — one or more bounded implementation findings remain;
 - `SPEC_REVISION_REQUIRED` — correction requires changing approved behavior or
   an expensive-to-reverse decision; or

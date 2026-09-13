@@ -1,4 +1,4 @@
 interface:
   display_name: "Wyrd Task Review"
-  short_description: "Adversarially audit task fit and minimalism"
-  default_prompt: "Use $wyrd-task-review to adversarially audit this candidate for exact acceptance and Ponytail minimalism, then write a verdict plus any remediation task."
+  short_description: "Run a two-wave specialist task audit"
+  default_prompt: "Use $wyrd-task-review to run the required task, repository, domain, and Ponytail review agents, then write the verdict and any remediation task."

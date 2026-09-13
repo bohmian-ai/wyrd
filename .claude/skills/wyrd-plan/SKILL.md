@@ -40,41 +40,87 @@ Collectively map every required `REQ-*`, `INV-*`, and `AC-*` obligation. Preserv
 the user journeys and language surfaces required by `AGENTS.md`, but do not
 pre-design test fixtures or private production structure.
 
+Classify each task's proof before writing it:
+
+- A task that adds or changes executable behavior, scenarios, or logic requires
+  TDD. Write each behavioral scenario in execution order using the exact
+  `Behavior` / `RED` / `GREEN` / `REFACTOR` structure below.
+- A task limited to documentation, generated artifacts, configuration, static
+  obligations, or verification of already-correct behavior does not require a
+  manufactured RED. State why TDD is not applicable and name the static,
+  verification-only, regression, or no-op proof instead.
+- A mixed task applies TDD only to its new or changed executable behavior.
+
 ## Write tasks
 
-Write tasks under `changes/active/<slug>/tasks/`. Use proportionate Markdown:
+Write tasks under `changes/active/<slug>/tasks/`. Use this structure, omitting
+only sections that are demonstrably inapplicable:
 
 ```markdown
-## Objective
+## Outcome and Value
 
 The observable outcome and mapped spec obligations.
 
-## Constraints
+## Owners, Scope, Consumers, and Prohibited Changes
 
-Required boundaries, invariants, and explicit non-goals.
-
-## Relevant Surface
-
-Likely owners, consumers, contracts, and systems involved. Paths are guidance,
-not a private implementation allowlist.
+Required boundaries, likely owners and consumers, invariants, and explicit
+non-goals. Paths are guidance, not a private implementation allowlist.
 
 ## Approach
 
 Three to seven high-level implementation steps.
 
+## Ordered Implementation Scenarios
+
+### Scenario 1 — <observable behavior>
+
+**Behavior.** <Success, failure, or edge behavior and mapped obligations.>
+
+**RED.** <The smallest focused test and the expected failure that proves the
+behavior is missing. If the test is named, include its exact focused command.>
+
+**GREEN.** <The minimum cohesive behavior needed to pass this scenario and the
+earlier scenarios that must be rerun.>
+
+**REFACTOR.** <The repository-native simplification permitted while all scenario
+tests remain green.>
+
 ## Acceptance Criteria
 
 Concrete success, failure, edge, and regression behavior.
 
-## Verification
+## Expected Write Set and Consumer Closure
+
+Likely production, consumer, contract, generated, and test surfaces. Paths are
+guidance, not an implementation allowlist.
+
+## Verification and Evidence
 
 The focused and broader repository-native checks that can prove completion.
+
+## Material Stop Conditions
+
+The discoveries that require planning or specification authority rather than an
+implementation decision.
+
+## Authority Links
+
+The approved spec and applicable repository authorities.
 ```
 
+Repeat the complete scenario block for each behavioral scenario. If the task
+has no new or changed executable behavior, replace `Ordered Implementation
+Scenarios` with `Proof Strategy` and explain the applicable static,
+verification-only, regression, or no-op proof. For a mixed task, retain the
+scenario blocks and add the non-TDD proof for the remaining obligations under
+`Verification and Evidence`.
+
 Add compact metadata for task ID, approved spec revision, mapped obligations,
-and real dependencies. Include exact commands only for an existing specifically
-named test or a repository-owned verification lane; the implementer may choose
-the smallest suitable new test and fixture structure.
+and real dependencies. Every specifically named test, existing or planned,
+includes its exact focused repository-native command. Confirm its package,
+target, and selector from the current test owner; do not invent a command from
+an assumed path. The implementer still owns the smallest suitable fixture
+structure.
 
 Do not specify helper functions, private methods, variable names, exact loops,
 local control flow, private module structure, test fixture structure, or exact
@@ -83,8 +129,11 @@ choice that tests can validate belongs to `$wyrd-implement`.
 
 Before handoff, confirm that every acceptance criterion has an owner and a
 credible proof, every non-goal remains excluded, dependencies are real, and no
-expensive-to-reverse decision is unresolved. Planning does not implement,
-approve, merge, or issue a separate readiness verdict.
+expensive-to-reverse decision is unresolved. A task that adds or changes
+executable behavior, scenarios, or logic is invalid when any scenario lacks an
+explicit `Behavior`, `RED`, `GREEN`, or `REFACTOR` block; do not return
+`TASKS_PROPOSED` until all four are present for every scenario. Planning does
+not implement, approve, merge, or issue a separate readiness verdict.
 
 Return `TASKS_PROPOSED`, `PLAN_BLOCKED`, or `SPEC_REVISION_REQUIRED`, followed
 only by task paths and any material blocker.

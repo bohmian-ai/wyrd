@@ -12,10 +12,10 @@
 //! plaintext secret reach a column, log, or response (GET redacts it). Reads and
 //! deletes never touch discovery.
 //!
-//! Every handler audits its `service_accounts:write` verdict exactly once. The
-//! Allowed row shares the handler's tenant transaction, except at issuer create,
-//! where it commits standalone before discovery so no network IO runs unaudited
-//! and no transaction spans it.
+//! Every handler audits its `service_accounts:write` verdict exactly once. Every
+//! mutation commits the Allowed row standalone before its work, so the decision
+//! survives a conflict, not-found, or failed write, and issuer create runs no
+//! network IO unaudited. The list handlers append it in their read transaction.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;

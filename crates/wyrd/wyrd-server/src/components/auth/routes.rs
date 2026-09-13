@@ -473,22 +473,6 @@ mod pg_tests {
         }))
     }
 
-    async fn lazy_state() -> AppState {
-        use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-
-        let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
-        let wyrd = wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), None);
-        let vala = vala_sql::ValaPostgres::from_pool(app_pool);
-        let postgres = Arc::new(crate::postgres::ServerPostgres::from_parts(wyrd, vala));
-        let root = tempfile::tempdir().expect("temp dir");
-        let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
-        crate::test_support::test_app_state(
-            postgres,
-            Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
-            crate::test_support::test_catalog().await,
-        )
-    }
-
     async fn fixture_state(fixture: &PgFixture) -> AppState {
         let postgres = Arc::new(crate::postgres::ServerPostgres::from_parts(
             fixture.wyrd_postgres().clone(),
@@ -553,9 +537,13 @@ mod pg_tests {
     }
 
     #[tokio::test]
+    /// A caller without `service_accounts:write` is refused with the RBAC
+    /// denial. The denial row commits to the real fixture database, so the
+    /// refusal is not masked by an unreachable audit store.
     async fn issue_key_without_permission_is_rbac_denied() {
-        let tenant = DataTenantId::new_v7();
-        let state = lazy_state().await;
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let state = fixture_state(&fixture).await;
         let caller = caller_with(Uuid::new_v4(), tenant, PermissionSet::new());
         let request = IssueKeyRequest {
             card_ref: service_card_ref(),

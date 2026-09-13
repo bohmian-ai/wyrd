@@ -354,7 +354,7 @@ async fn unauthenticated_request_to_each_route_returns_401() {
 // --------------------------------------------------------------------------
 
 #[tokio::test]
-async fn full_lifecycle_and_audit_under_one_jwt() {
+async fn full_lifecycle_under_one_jwt() {
     let server = WyrdTestServer::builder()
         .start_in_process()
         .await

@@ -90,7 +90,7 @@ For programmatic overrides, build a `ClientConfig` and pass it to
 
 ```rust
 use secrecy::SecretString;
-use wyrd_client::{config::ClientConfig, WyrdClient};
+use wyrd_sdk::{config::ClientConfig, WyrdClient};
 
 let mut config = ClientConfig::from_global()?;
 config.http.base_url = "http://localhost:50050".to_owned();

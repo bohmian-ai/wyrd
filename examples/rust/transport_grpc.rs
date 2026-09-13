@@ -3,7 +3,7 @@
 //! Run with:
 //!     cargo run -p wyrd-rust-examples --bin transport_grpc
 
-use wyrd_client::transport::{GrpcConfig, TransportConfig};
+use wyrd_sdk::transport::{GrpcConfig, TransportConfig};
 use wyrd_spec::security::{SecretRef, TlsConfig};
 
 fn main() -> anyhow::Result<()> {

@@ -95,7 +95,7 @@ Gate validates the batch against the stored `SchemaFingerprint` before Scribe ac
 ## Direct Arrow writes (Rust)
 
 ```rust
-use wyrd_client::{Bifrost, WyrdClient};
+use wyrd_sdk::{Bifrost, WyrdClient};
 
 let client = WyrdClient::from_env()?;
 let bifrost = Bifrost::connect(&client).await?;

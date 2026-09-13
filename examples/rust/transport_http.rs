@@ -3,7 +3,7 @@
 //! Run with:
 //!     cargo run -p wyrd-rust-examples --bin transport_http
 
-use wyrd_client::transport::{HttpConfig, TransportConfig};
+use wyrd_sdk::transport::{HttpConfig, TransportConfig};
 use wyrd_spec::security::{SecretRef, TlsConfig};
 
 fn main() -> anyhow::Result<()> {

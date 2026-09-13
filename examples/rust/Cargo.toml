@@ -95,6 +95,6 @@ skald-tool = { workspace = true }
 skald-workflow = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 wyrd = { path = "../../crates/wyrd/wyrd", features = ["otel"] }
-wyrd-client = { workspace = true }
+wyrd-sdk-rust = { path = "../../sdks/wyrd-sdk-rust" }
 skald-observer = { workspace = true, features = ["otel"] }
 wyrd-spec = { workspace = true }

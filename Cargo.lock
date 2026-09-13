@@ -11494,7 +11494,7 @@ dependencies = [
  "skald-workflow",
  "tokio",
  "wyrd",
- "wyrd-client",
+ "wyrd-sdk-rust",
  "wyrd-spec",
 ]
 

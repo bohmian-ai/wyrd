@@ -3,7 +3,7 @@
 //! Run with:
 //!     cargo run -p wyrd-rust-examples --bin transport_mock
 
-use wyrd_client::transport::{MockConfig, TransportConfig};
+use wyrd_sdk::transport::{MockConfig, TransportConfig};
 
 fn main() -> anyhow::Result<()> {
     let mock = MockConfig {

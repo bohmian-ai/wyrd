@@ -33,12 +33,17 @@ wyrd-utils = { workspace = true, features = ["python"] }
 wyrd-spec = { workspace = true }
 wyrd-runtime = { workspace = true }
 wyrd-client = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 futures-util = { workspace = true }
 arrow = { workspace = true }
 arrow-schema = { workspace = true }
 wyrd-queue = { workspace = true }
-wyrd-sdk = { workspace = true, features = ["python"] }
+secrecy = { workspace = true }
+tempfile = { workspace = true }
+wyrd-interfaces = { workspace = true }
+wyrd-loader = { workspace = true }
+wyrd-semver = { workspace = true }
 wyrd-testing = { workspace = true, features = ["python"], optional = true }
 
 [lints]

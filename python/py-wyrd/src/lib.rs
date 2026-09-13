@@ -1,6 +1,7 @@
 //! `PyO3` bootstrap module for the Python Wyrd package.
 
 mod bifrost;
+mod state;
 
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
@@ -28,7 +29,7 @@ fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     register_submodule(py, "wyrd._wyrd.agent", &agent)?;
 
     wyrd_cards::register(py, m)?;
-    wyrd_sdk::python::register_cards(&m.getattr("cards")?.cast_into()?)?;
+    state::register_cards(&m.getattr("cards")?.cast_into()?)?;
     register_submodule(py, "wyrd._wyrd.cards", &m.getattr("cards")?.cast_into()?)?;
 
     let state = PyModule::new(py, "state")?;
@@ -36,7 +37,7 @@ fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         "__doc__",
         "Offline, fully hydrated Wyrd Card graph. Load a complete local Service bundle without a registry or network; typed holders are shared across aliases, and artifact descriptors expose confined local paths without reading payload bytes.",
     )?;
-    wyrd_sdk::python::register_state(&state)?;
+    state::register_state(&state)?;
     m.add_submodule(&state)?;
     register_submodule(py, "wyrd._wyrd.state", &state)?;
 

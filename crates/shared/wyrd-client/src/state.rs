@@ -22,7 +22,6 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::{
     CardRef, registration_only_sibling_refs, scope_child_card_refs, unresolved_card_ref_paths,
 };
-#[cfg(feature = "python")]
 use wyrd_spec::registry::{
     ArtifactManifestEntry, RelativeArtifactPath, canonical_artifact_manifest_hash,
 };
@@ -305,7 +304,6 @@ impl HydratedStateIndex {
     /// Returns an invalid-state-bundle error when the exact Card key is absent
     /// or an artifact path is not a valid wire path, and propagates
     /// canonicalization failures from `wyrd-spec`.
-    #[cfg(feature = "python")]
     fn artifact_manifest_hash_by_key(&self, key: &str) -> Result<Option<String>, WyrdError> {
         let manifest = self
             .artifacts_by_key(key)?
@@ -689,8 +687,7 @@ impl WyrdState {
     }
 
     /// Iterate over every loaded Card keyed by its canonical exact `CardRef`.
-    #[cfg(feature = "python")]
-    pub(crate) fn cards(&self) -> impl Iterator<Item = (&str, &Card)> {
+    pub fn cards(&self) -> impl Iterator<Item = (&str, &Card)> {
         self.index
             .cards_by_ref
             .iter()
@@ -698,8 +695,7 @@ impl WyrdState {
     }
 
     /// Iterate over loaded Cards of one kind keyed by exact `CardRef`.
-    #[cfg(feature = "python")]
-    pub(crate) fn cards_of_kind(&self, kind: CardKind) -> impl Iterator<Item = (&str, &Card)> {
+    pub fn cards_of_kind(&self, kind: CardKind) -> impl Iterator<Item = (&str, &Card)> {
         self.index
             .cards_by_ref
             .iter()
@@ -708,14 +704,12 @@ impl WyrdState {
     }
 
     /// Resolve a canonical exact `CardRef` key to its stored reference.
-    #[cfg(feature = "python")]
-    pub(crate) fn card_ref_by_key(&self, key: &str) -> Result<&CardRef, WyrdError> {
+    pub fn card_ref_by_key(&self, key: &str) -> Result<&CardRef, WyrdError> {
         self.index.card_ref_by_key(key)
     }
 
     /// Resolve a canonical exact `CardRef` key to its aliases.
-    #[cfg(feature = "python")]
-    pub(crate) fn aliases_by_key(&self, key: &str) -> Result<&[String], WyrdError> {
+    pub fn aliases_by_key(&self, key: &str) -> Result<&[String], WyrdError> {
         self.index.aliases_by_key(key)
     }
 
@@ -725,7 +719,7 @@ impl WyrdState {
     ///
     /// Returns an invalid-state-bundle error when the key is absent from the
     /// validated artifact index.
-    pub(crate) fn artifacts_by_key(&self, key: &str) -> Result<&[HydratedArtifact], WyrdError> {
+    pub fn artifacts_by_key(&self, key: &str) -> Result<&[HydratedArtifact], WyrdError> {
         self.index.artifacts_by_key(key)
     }
 
@@ -735,7 +729,7 @@ impl WyrdState {
     ///
     /// Returns an invalid-state-bundle error when the key is absent from the
     /// validated graph indexes.
-    pub(crate) fn artifact_dir_by_key(&self, key: &str) -> Result<Option<&Path>, WyrdError> {
+    pub fn artifact_dir_by_key(&self, key: &str) -> Result<Option<&Path>, WyrdError> {
         self.index.artifact_dir_by_key(key)
     }
 
@@ -749,11 +743,7 @@ impl WyrdState {
     ///
     /// Returns an invalid-state-bundle or canonicalization error when the
     /// validated index cannot reproduce the Card artifact manifest.
-    #[cfg(feature = "python")]
-    pub(crate) fn artifact_manifest_hash_by_key(
-        &self,
-        key: &str,
-    ) -> Result<Option<String>, WyrdError> {
+    pub fn artifact_manifest_hash_by_key(&self, key: &str) -> Result<Option<String>, WyrdError> {
         self.index.artifact_manifest_hash_by_key(key)
     }
 }

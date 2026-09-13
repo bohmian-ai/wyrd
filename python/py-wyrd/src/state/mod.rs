@@ -24,15 +24,15 @@ use wyrd_spec::registry::{
     RegistrationOutcomeKind, RegistrationReceipt,
 };
 
-use crate::WyrdState;
+use wyrd_client::state::WyrdState;
 
+/// Python state hydration boundary and all-or-nothing holder owner.
+mod hydrator;
 /// Python Card registration boundary and prepared-registration owner.
 mod registry;
-/// Python state hydration boundary and all-or-nothing holder owner.
-mod state;
 
+use hydrator::{PythonLoadConfig, PythonStateHydrator};
 use registry::PythonCardRegistry;
-use state::{PythonLoadConfig, PythonStateHydrator};
 
 /// Immutable Python projection of one complete Card envelope.
 #[pyclass(module = "wyrd.state", name = "CardEnvelope", frozen)]

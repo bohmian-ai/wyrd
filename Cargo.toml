@@ -9,6 +9,7 @@ members = [
     "crates/wyrd-spec",
     "examples/rust",
     "python/py-wyrd",
+    "sdks/wyrd-sdk-rust",
 ]
 exclude = []
 default-members = [
@@ -29,7 +30,6 @@ authors = ["Thorrester <sjforrester32@gmail.com>"]
 wyrd-spec = { path = "crates/wyrd-spec", version = "0.0.1" }
 wyrd-client = { path = "crates/shared/wyrd-client", version = "0.0.1" }
 wyrd-cli = { path = "crates/wyrd/wyrd-cli", version = "0.0.1" }
-wyrd-sdk = { path = "crates/shared/wyrd-sdk", version = "0.0.1" }
 wyrd-loader = { path = "crates/shared/wyrd-loader", version = "0.0.1" }
 skald-spec = { path = "crates/skald/skald-spec", version = "0.1.0" }
 skald-cache = { path = "crates/skald/skald-cache", version = "0.0.1" }

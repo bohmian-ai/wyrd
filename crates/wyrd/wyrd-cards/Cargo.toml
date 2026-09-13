@@ -11,7 +11,6 @@ authors = { workspace = true }
 default = []
 python = [
     "dep:pyo3",
-    "dep:wyrd-client",
     "dep:wyrd-runtime",
     "dep:tempfile",
     "chrono/clock",
@@ -27,7 +26,6 @@ wyrd-spec = { workspace = true }
 wyrd-config = { workspace = true }
 wyrd-semver = { workspace = true }
 wyrd-interfaces = { workspace = true }
-wyrd-client = { workspace = true, optional = true }
 wyrd-runtime = { workspace = true, optional = true }
 wyrd-utils = { workspace = true }
 wyrd-test-contract-macros = { workspace = true }

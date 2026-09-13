@@ -37,6 +37,7 @@ serde_jcs = { workspace = true }
 serde_json = { workspace = true }
 serde_urlencoded = { workspace = true }
 serde_yaml = { workspace = true }
+skald-spec = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
@@ -47,6 +48,7 @@ toml = { workspace = true }
 tracing = { workspace = true }
 urlencoding = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
+wyrd-cards = { workspace = true }
 wyrd-loader = { workspace = true }
 wyrd-queue = { workspace = true }
 wyrd-runtime = { workspace = true }

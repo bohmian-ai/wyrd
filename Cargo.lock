@@ -7215,6 +7215,8 @@ dependencies = [
  "arrow-schema",
  "futures-util",
  "pyo3",
+ "secrecy",
+ "serde",
  "serde_json",
  "skald-agent",
  "skald-observer",
@@ -7222,13 +7224,16 @@ dependencies = [
  "skald-runtime",
  "skald-tool",
  "skald-workflow",
+ "tempfile",
  "wyrd-cards",
  "wyrd-cli",
  "wyrd-client",
  "wyrd-config",
+ "wyrd-interfaces",
+ "wyrd-loader",
  "wyrd-queue",
  "wyrd-runtime",
- "wyrd-sdk",
+ "wyrd-semver",
  "wyrd-spec",
  "wyrd-testing",
  "wyrd-utils",
@@ -11255,7 +11260,6 @@ dependencies = [
  "skald-spec",
  "tempfile",
  "tokio",
- "wyrd-client",
  "wyrd-config",
  "wyrd-interfaces",
  "wyrd-runtime",
@@ -11302,7 +11306,6 @@ dependencies = [
  "wyrd-error-derive",
  "wyrd-loader",
  "wyrd-runtime",
- "wyrd-sdk",
  "wyrd-semver",
  "wyrd-server",
  "wyrd-spec",
@@ -11335,6 +11338,7 @@ dependencies = [
  "serde_urlencoded",
  "serde_yaml",
  "sha2 0.10.9",
+ "skald-spec",
  "sqlx 0.9.0",
  "tempfile",
  "thiserror 2.0.18",
@@ -11347,6 +11351,7 @@ dependencies = [
  "uuid",
  "vala-bifrost-redux",
  "wiremock",
+ "wyrd-cards",
  "wyrd-loader",
  "wyrd-queue",
  "wyrd-runtime",
@@ -11557,27 +11562,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "wyrd-sdk"
+name = "wyrd-sdk-rust"
 version = "0.0.1"
 dependencies = [
- "base64 0.22.1",
- "pyo3",
- "secrecy",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2 0.10.9",
- "skald-spec",
- "tempfile",
- "thiserror 2.0.18",
- "wyrd-cards",
  "wyrd-client",
- "wyrd-interfaces",
- "wyrd-loader",
- "wyrd-runtime",
- "wyrd-semver",
- "wyrd-spec",
- "wyrd-utils",
 ]
 
 [[package]]

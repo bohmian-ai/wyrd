@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
-use wyrd_sdk::WyrdState;
+use wyrd_client::state::WyrdState;
 use wyrd_spec::reference::{CardRef, unresolved_card_ref_paths};
 use wyrd_storage::settings::{BackendConfig, StorageSettings};
 use wyrd_testing::WyrdTestServer;

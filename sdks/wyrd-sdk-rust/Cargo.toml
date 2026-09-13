@@ -1,0 +1,19 @@
+[package]
+name = "wyrd-sdk-rust"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+rust-version = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+description = "First-class Rust Wyrd SDK: a thin projection of wyrd-client."
+
+[lib]
+name = "wyrd_sdk"
+path = "src/lib.rs"
+
+[dependencies]
+wyrd-client = { workspace = true }
+
+[lints]
+workspace = true

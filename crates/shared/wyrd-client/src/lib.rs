@@ -2,7 +2,8 @@
 //!
 //! This crate owns client transport configuration, credential resolution,
 //! authentication, and the composed client capabilities — [`cards::Cards`],
-//! [`storage::WyrdStorageClient`], and [`Bifrost`] — that the Rust, Python, and TypeScript SDKs project. Durable
+//! [`storage::WyrdStorageClient`], [`state::WyrdState`], and [`Bifrost`] —
+//! that the Rust, Python, and TypeScript SDKs project. Durable
 //! shared security refs live in `wyrd-spec`.
 
 #![deny(missing_docs)]
@@ -15,6 +16,7 @@ pub mod client;
 pub mod config;
 pub mod error;
 pub mod global_config;
+pub mod state;
 pub mod storage;
 pub mod transport;
 

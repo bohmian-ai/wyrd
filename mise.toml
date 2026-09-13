@@ -156,8 +156,8 @@ run = "bash scripts/run-family-tests.sh shared"
 
 [tasks."test:wyrd-sdk"]
 hide = true
-description = "Run the default-feature Rust SDK unit tests serially"
-run = "cargo test --locked -p wyrd-sdk -- --nocapture --test-threads=1"
+description = "Run the Rust SDK projection unit tests"
+run = "cargo nextest run --locked -p wyrd-sdk-rust --lib"
 
 [tasks."test:bifrost"]
 description = "Run every Bifrost unit, integration, and Rust/Python/TypeScript journey test under one Postgres lifecycle."
@@ -550,31 +550,26 @@ done
 
 [tasks."check:sdk-client-tier"]
 hide = true
-description = "Verify default wyrd-sdk excludes Python-only dependencies"
+description = "Verify the Rust SDK projects wyrd-client without Python-only dependencies"
 run = """
 set -eu
-if cargo tree --locked -p wyrd-sdk -e normal | rg 'pyo3|wyrd-client|wyrd-loader|wyrd-runtime|tempfile'; then
-  echo "FAIL: default wyrd-sdk dependency cone contains a Python-only dependency"
+if cargo tree --locked -p wyrd-sdk-rust -e normal | rg 'pyo3|wyrd-sdk-python|wyrd-node'; then
+  echo "FAIL: wyrd-sdk-rust dependency cone contains a Python or TypeScript binding dependency"
   exit 1
 fi
 """
 
 [tasks."check:sdk-pyo3-scope"]
 hide = true
-description = "Verify PyO3 enters only wyrd-sdk's explicit Python feature cone"
+description = "Verify the shared client and Rust SDK dependency cones stay PyO3-free"
 run = """
 set -eu
-for package in wyrd-spec wyrd-client; do
+for package in wyrd-spec wyrd-client wyrd-sdk-rust; do
   if cargo tree --locked -p "$package" -e normal | rg 'pyo3'; then
     echo "FAIL: $package normal dependency cone contains PyO3"
     exit 1
   fi
 done
-if cargo tree --locked -p wyrd-sdk -e normal | rg 'pyo3'; then
-  echo "FAIL: default wyrd-sdk dependency cone contains PyO3"
-  exit 1
-fi
-cargo tree --locked -p wyrd-sdk --features python -e normal | rg 'pyo3' >/dev/null
 """
 
 [tasks."check:registry-no-server-routes"]

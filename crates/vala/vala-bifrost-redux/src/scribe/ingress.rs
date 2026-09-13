@@ -701,7 +701,6 @@ mod tests {
         ScribeImpl, take_transport_decode_owner, validate_decoded_request_size,
         validate_logical_transport_frame,
     };
-    use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
     use crate::catalog::TableRef;
     use crate::contracts::{
         CanonicalIngress, IngressPayload, Scribe, ScribeError, ScribeIngressFrame,
@@ -716,6 +715,7 @@ mod tests {
     use std::time::{Duration, Instant};
     use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
     use wyrd_spec::DataTenantId;
+    use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
     use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::request_id::RequestId;
 

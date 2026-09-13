@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
-use vala_sql::queries::audit_staging::{
-    append_audit, freeze_publication_range, list_publication_batch,
-};
 use vala_bifrost_redux::oracle::peer::PeerSecurityAudit;
+use vala_sql::TenantConn;
+use vala_sql::queries::audit_staging::{
+    AuditPublicationRange, append_audit, freeze_publication_range, list_publication_batch,
+};
 use wyrd_server::audit::publication::AuditPublisher;
 use wyrd_server::oracle::PostgresPeerSecurityAudit;
 use wyrd_spec::DataTenantId;
@@ -173,8 +174,8 @@ async fn await_drained(
 async fn fence_staged_rows(
     server: &WyrdTestServer,
     tenant: DataTenantId,
-    range: vala_sql::queries::audit_staging::AuditPublicationRange,
-) -> Result<vala_sql::TenantConn<'_>, ServerJourneyError> {
+    range: AuditPublicationRange,
+) -> Result<TenantConn<'_>, ServerJourneyError> {
     let mut fence = server.tenant_conn_for(tenant).await?;
     sqlx::query("SAVEPOINT audit_fence")
         .execute(&mut **fence.transaction())
@@ -195,7 +196,7 @@ async fn fence_staged_rows(
 ///
 /// # Errors
 /// Returns the rollback or commit failure Postgres raised.
-async fn release_fence(mut fence: vala_sql::TenantConn<'_>) -> Result<(), ServerJourneyError> {
+async fn release_fence(mut fence: TenantConn<'_>) -> Result<(), ServerJourneyError> {
     sqlx::query("ROLLBACK TO SAVEPOINT audit_fence")
         .execute(&mut **fence.transaction())
         .await?;
@@ -292,9 +293,9 @@ async fn frozen_audit_range_replays_once_while_its_tail_waits() -> Result<(), Se
 /// concurrent sweep can do. Releasing the fence must then let the stalled
 /// tenant finish as well, proving the fence delayed rather than lost its work.
 ///
-/// The fixed bound the sweep runs tenants under is pinned by
-/// `wyrd-server`'s own `bounded_sweep_never_exceeds_its_fixed_concurrency`; a
-/// two-tenant directory cannot observe a ceiling of eight.
+/// Only unordered progress is proven here. The sweep's ceiling is the literal
+/// `PUBLICATION_TENANT_CONCURRENCY` handed to `for_each_concurrent`; proving it
+/// end to end would need more fenced tenants than the test pool can hold.
 ///
 /// # Errors
 /// Returns the server, Postgres, publication, or query failure.

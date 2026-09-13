@@ -1723,14 +1723,7 @@ pub async fn delete_card_with_kind(
     let deleted = async {
         let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
         audit::append_on(&mut conn, allowed).await?;
-        let delete_state = soft_delete_card_with_kind(
-            &mut conn,
-            card_uid,
-            kind,
-            &caller.principal,
-            Some(&caller.request_id),
-        )
-        .await?;
+        let delete_state = soft_delete_card_with_kind(&mut conn, card_uid, kind).await?;
         conn.commit().await.map_err(registry_db_error)?;
         Ok(delete_state)
     }
@@ -1758,13 +1751,7 @@ pub async fn delete_card_by_ref(
     let deleted = async {
         let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
         audit::append_on(&mut conn, allowed).await?;
-        let delete_state = soft_delete_card_by_ref(
-            &mut conn,
-            card_ref,
-            &caller.principal,
-            Some(&caller.request_id),
-        )
-        .await?;
+        let delete_state = soft_delete_card_by_ref(&mut conn, card_ref).await?;
         conn.commit().await.map_err(registry_db_error)?;
         Ok(delete_state)
     }

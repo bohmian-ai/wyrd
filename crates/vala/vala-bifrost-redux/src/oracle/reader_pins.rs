@@ -826,7 +826,7 @@ impl OracleReaderAuthority {
     /// Commits `acquired -> active` and opens admission.
     ///
     /// The caller must already have established every dependency the epoch
-    /// needs: catalog, object store, read-audit relay, peer trust, recovery,
+    /// needs: catalog, object store, read-audit writer, peer trust, recovery,
     /// renewal supervision, cancellation, and the narrowing worker. Readiness
     /// is set only after this commit, so an Oracle can never report ready under
     /// an epoch Postgres has not yet activated.

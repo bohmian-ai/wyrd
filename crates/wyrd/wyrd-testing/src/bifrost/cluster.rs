@@ -476,12 +476,8 @@ pub struct OracleInspection {
     pub peer_pending: u64,
     /// Peer running reservations across Oracle pods.
     pub peer_running: u64,
-    /// Accepted audit records retained in pod-local WALs.
-    pub audit_wal_records: u64,
-    /// Bytes retained in pod-local WALs.
-    pub audit_wal_bytes: u64,
-    /// Oldest accepted audit record retained in any pod WAL.
-    pub audit_oldest_age: Option<Duration>,
+    /// Oracle audit outbox commits still in flight across pods.
+    pub audit_pending: u64,
     /// Forge tasks still holding a durable claim.
     pub forge_active_claims: u64,
     /// Distinct Forge attempts still in a non-terminal claimed execution state.
@@ -717,8 +713,6 @@ struct NodeResources {
     wal_root: Option<Arc<tempfile::TempDir>>,
     /// Retained Oracle/Forge spill root, absent on Scribe-only nodes.
     spill_root: Option<Arc<tempfile::TempDir>>,
-    /// Retained Oracle audit WAL root, absent on query-only nodes.
-    audit_wal_root: Option<Arc<tempfile::TempDir>>,
     /// Fixed public HTTP bind retained across a restart.
     http_addr: std::net::SocketAddr,
     /// Fixed private/public gRPC bind retained across a restart.
@@ -784,8 +778,6 @@ pub struct RetainedNodeRoots {
     pub wal_root: Option<PathBuf>,
     /// Oracle/Forge spill root retained for replacement startup.
     pub spill_root: Option<PathBuf>,
-    /// Oracle audit WAL root retained for relay recovery.
-    pub audit_wal_root: Option<PathBuf>,
     /// HTTP address proven closed by abrupt termination.
     pub previous_http_addr: std::net::SocketAddr,
     /// gRPC address proven closed by abrupt termination.
@@ -974,10 +966,6 @@ impl WyrdTestCluster {
                 .spill_root
                 .as_ref()
                 .map(|root| root.path().to_path_buf()),
-            audit_wal_root: resources
-                .audit_wal_root
-                .as_ref()
-                .map(|root| root.path().to_path_buf()),
             previous_http_addr: resources.http_addr,
             previous_grpc_addr: resources.grpc_addr,
             previous_writer_epoch,
@@ -1025,10 +1013,6 @@ impl WyrdTestCluster {
                 .map(|root| root.path().to_path_buf()),
             spill_root: resources
                 .spill_root
-                .as_ref()
-                .map(|root| root.path().to_path_buf()),
-            audit_wal_root: resources
-                .audit_wal_root
                 .as_ref()
                 .map(|root| root.path().to_path_buf()),
             previous_http_addr,
@@ -1729,13 +1713,6 @@ impl WyrdTestCluster {
             } else {
                 None
             };
-            let audit_wal_root = if node.roles.contains(&BifrostRuntimeRole::Oracle) {
-                Some(Arc::new(tempfile::tempdir().map_err(|error| {
-                    ClusterError::Resource(error.to_string())
-                })?))
-            } else {
-                None
-            };
             let process_role = process_target_for_roles(&node.roles).ok_or_else(|| {
                 ClusterError::Resource(format!(
                     "node {} has no exact public process target",
@@ -1748,7 +1725,6 @@ impl WyrdTestCluster {
                     spec: node,
                     wal_root,
                     spill_root,
-                    audit_wal_root,
                     http_addr: reserve_loopback_addr()?,
                     grpc_addr: reserve_loopback_addr()?,
                     process_role,
@@ -1808,7 +1784,6 @@ impl WyrdTestCluster {
             .with_bifrost_roots(
                 resources.wal_root.as_ref().map(Arc::clone),
                 resources.spill_root.as_ref().map(Arc::clone),
-                resources.audit_wal_root.as_ref().map(Arc::clone),
             )
             .with_bind_addrs(resources.http_addr, resources.grpc_addr)
             .with_oracle_peer_credentials(Arc::clone(&self.oracle_peer_credentials))
@@ -2015,12 +1990,7 @@ impl WyrdTestCluster {
                     .saturating_add(snapshot.reserved_spill_bytes);
                 runtime.peer_pending = runtime.peer_pending.saturating_add(snapshot.peer_pending);
                 runtime.peer_running = runtime.peer_running.saturating_add(snapshot.peer_running);
-                runtime.audit_wal_records = runtime
-                    .audit_wal_records
-                    .saturating_add(snapshot.audit_wal_records);
-                runtime.audit_wal_bytes = runtime
-                    .audit_wal_bytes
-                    .saturating_add(snapshot.audit_wal_bytes);
+                runtime.audit_pending = runtime.audit_pending.saturating_add(snapshot.audit_pending);
                 runtime.spill_directories = runtime
                     .spill_directories
                     .saturating_add(snapshot.spill_directories);
@@ -2028,12 +1998,6 @@ impl WyrdTestCluster {
                 runtime.spill_file_bytes = runtime
                     .spill_file_bytes
                     .saturating_add(snapshot.spill_file_bytes);
-                runtime.audit_oldest_age =
-                    match (runtime.audit_oldest_age, snapshot.audit_oldest_age) {
-                        (None, age) => age,
-                        (age, None) => age,
-                        (Some(left), Some(right)) => Some(left.max(right)),
-                    };
             }
         }
         Ok(OracleInspection {
@@ -2052,9 +2016,7 @@ impl WyrdTestCluster {
             spill_file_bytes: runtime.spill_file_bytes,
             peer_pending: runtime.peer_pending,
             peer_running: runtime.peer_running,
-            audit_wal_records: runtime.audit_wal_records,
-            audit_wal_bytes: runtime.audit_wal_bytes,
-            audit_oldest_age: runtime.audit_oldest_age,
+            audit_pending: runtime.audit_pending,
             forge_active_claims: u64::try_from(forge_active_claims)
                 .map_err(|error| ClusterError::Resource(error.to_string()))?,
             forge_active_attempts: u64::try_from(forge_active_attempts)

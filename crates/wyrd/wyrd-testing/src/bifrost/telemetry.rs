@@ -202,19 +202,6 @@ const ORACLE_FRAGMENT_LABELS: &[TelemetryLabelValues] = &[TelemetryLabelValues {
     values: &["success", "failed"],
 }];
 
-/// Closed relay labels emitted by the server audit publisher.
-#[cfg(test)]
-const ORACLE_AUDIT_RELAY_LABELS: &[TelemetryLabelValues] = &[
-    TelemetryLabelValues {
-        key: "outcome",
-        values: &["committed", "retried_transient", "failed"],
-    },
-    TelemetryLabelValues {
-        key: "reason",
-        values: &["postgres", "timeout", "serialization"],
-    },
-];
-
 /// Closed exact binding ledger shared by qualification and capacity projection.
 const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
     TelemetryBinding {
@@ -4301,10 +4288,6 @@ mod tests {
             production.fragment_outcomes
         );
 
-        let audit = wyrd_server::oracle::audit_telemetry_label_domains();
-        assert_eq!(ORACLE_AUDIT_RELAY_LABELS[0].values, audit.outcomes);
-        assert_eq!(ORACLE_AUDIT_RELAY_LABELS[1].values, audit.failure_reasons);
-
         let redux_keys = [
             ORACLE_ADMISSION_LABELS
                 .iter()
@@ -4327,11 +4310,6 @@ mod tests {
         assert_eq!(redux_keys[1], vec!["outcome"]);
         assert_eq!(redux_keys[2], vec!["reason"]);
         assert_eq!(redux_keys[3], vec!["outcome"]);
-        let audit_keys = ORACLE_AUDIT_RELAY_LABELS
-            .iter()
-            .map(|domain| domain.key)
-            .collect::<Vec<_>>();
-        assert_eq!(audit_keys, vec!["outcome", "reason"]);
     }
 
     /// Return whether every selector pair belongs to its allowed emitter domain.

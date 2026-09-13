@@ -57,10 +57,9 @@ use wyrd_storage::{StorageHandle, settings::from_env as load_storage_settings};
 use crate::auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
 use crate::components::auth::audit_writer::RealAuthzAuditWriter;
 use crate::components::auth::{ServerAuth, ServerAuthz};
-use crate::components::eval::EvalAuditWriter;
 use crate::config::{BifrostRuntimeRole, WorkloadBindingEntry};
 use crate::oracle::{
-    OracleAuditPublisher, OraclePeerAuthority, PostgresPeerSecurityAudit,
+    OracleQueryAudit, OraclePeerAuthority, PostgresPeerSecurityAudit,
     ServerBifrostPeerCredentials,
 };
 use crate::postgres::ServerPostgres;
@@ -205,8 +204,6 @@ impl ForgeObjectStore for OpenDalForgeObjectStore {
 pub struct StateOverrides {
     /// Replace authorization handles (policy hook + RBAC + audit writer).
     pub authz: Option<ServerAuthz>,
-    /// Replace the eval audit writer.
-    pub eval_audit: Option<Arc<dyn EvalAuditWriter>>,
     /// Test-only failure injected after Scribe activation to exercise rollback.
     #[cfg(feature = "test-support")]
     pub fail_after_scribe_activation: bool,
@@ -994,14 +991,7 @@ pub async fn compose_bifrost(
     let query_audit = if roles.contains(&BifrostRuntimeRole::Oracle)
         || roles.contains(&BifrostRuntimeRole::Scribe)
     {
-        Some(
-            OracleAuditPublisher::new(postgres.vala().clone(), (&bifrost_config.oracle).into())
-                .map_err(|error| {
-                    ServerBootError::OraclePeer(format!(
-                        "Oracle audit WAL recovery failed: {error:?}"
-                    ))
-                })?,
-        )
+        Some(OracleQueryAudit::new(postgres.vala().clone()))
     } else {
         None
     };
@@ -1489,9 +1479,6 @@ fn apply_overrides(state: AppState, overrides: StateOverrides) -> AppState {
     if let Some(authz) = overrides.authz {
         state = state.with_authz(authz);
     }
-    if let Some(eval_audit) = overrides.eval_audit {
-        state = state.with_eval_audit(eval_audit);
-    }
     state
 }
 
@@ -1596,7 +1583,7 @@ struct OracleRoleBuilder<'a> {
     /// Immutable peer TLS trust policy, present only when CA material is configured.
     peer_tls: Option<BifrostPeerTls>,
     /// Shared query audit used by the leader and role-local tenant tripwires.
-    audit: Option<Arc<OracleAuditPublisher>>,
+    audit: Option<Arc<OracleQueryAudit>>,
     /// One process-wide shutdown token injected into every Oracle owner.
     shutdown: CancellationToken,
 }
@@ -2002,8 +1989,8 @@ struct BuiltOracleRole {
     peer: Arc<crate::oracle::OraclePeerRuntime>,
     /// Cluster owner used for activation and snapshot publication.
     cluster: Arc<ClusterRegistry>,
-    /// Local audit publisher recovered before role activation.
-    audit: Arc<OracleAuditPublisher>,
+    /// Outbox writer for Oracle read decisions and tenant tripwires.
+    audit: Arc<OracleQueryAudit>,
     /// Root-derived Oracle resource capability.
     resources: vala_bifrost_redux::resources::OracleResources,
     /// One process-wide shutdown token retained through lifecycle publication.
@@ -2921,7 +2908,6 @@ pub(crate) mod pg_tests {
         };
         let overrides = StateOverrides {
             authz: Some(non_stub_authz),
-            eval_audit: None,
             ..StateOverrides::default()
         };
         let patched = apply_overrides(state, overrides);
@@ -2929,36 +2915,6 @@ pub(crate) mod pg_tests {
         assert!(
             !patched.authz.policy_hook.is_stub_default(),
             "override replaced stub policy hook"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn state_overrides_eval_audit_applied() {
-        use crate::components::eval::{EvalAuditEvent, EvalAuditWriter};
-
-        struct MarkerWriter;
-        impl EvalAuditWriter for MarkerWriter {
-            fn record(&self, _event: &EvalAuditEvent) {}
-        }
-
-        let state = make_test_state().await;
-        // Confirm default is the tracing-backed stub (Arc::ptr_eq won't work
-        // across two Arc<dyn Trait> directly, so we replace and check the new
-        // instance is reachable via the state field).
-        let marker: Arc<dyn EvalAuditWriter> = Arc::new(MarkerWriter);
-        let marker_ptr = Arc::as_ptr(&marker) as *const ();
-
-        let overrides = StateOverrides {
-            authz: None,
-            eval_audit: Some(marker),
-            ..StateOverrides::default()
-        };
-        let patched = apply_overrides(state, overrides);
-
-        assert_eq!(
-            Arc::as_ptr(&patched.eval_audit) as *const (),
-            marker_ptr,
-            "override replaced the default eval audit writer"
         );
     }
 

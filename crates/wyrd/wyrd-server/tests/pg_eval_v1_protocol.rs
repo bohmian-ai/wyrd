@@ -10,12 +10,10 @@
 //! - (f) foreign `run_id` → 404, not 403 (existence-oracle guard)
 //! - (g) per-tenant concurrency cap counting (unit-tested in `eval::state`)
 //! - (h) 5xx responses carry a generic message + empty details
-//! - (i) run open/complete emits an audit event
 //! - RBAC gate: in-tenant principal lacking `evals:run` → denied at open;
 //!   principal holding `evals:run` opens successfully (tightened past card_write)
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
@@ -30,7 +28,6 @@ use wyrd_semver::VersionBlock;
 use wyrd_server::AppState;
 use wyrd_server::auth::seed::seed_builtin_roles_for_tenant;
 use wyrd_server::components::eval::resolver::{resolve_card_for_tenant, scenario_object_path};
-use wyrd_server::components::eval::{EvalAuditEvent, EvalAuditKind, EvalAuditWriter};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalKindTag;
 use wyrd_spec::card::data::{
@@ -353,25 +350,12 @@ async fn unauthenticated_request_to_each_route_returns_401() {
 }
 
 // --------------------------------------------------------------------------
-// (a) Full lifecycle + (i) audit
+// (a) Full lifecycle
 // --------------------------------------------------------------------------
-
-#[derive(Default)]
-struct RecordingAudit {
-    events: Mutex<Vec<EvalAuditEvent>>,
-}
-
-impl EvalAuditWriter for RecordingAudit {
-    fn record(&self, event: &EvalAuditEvent) {
-        self.events.lock().expect("audit lock").push(event.clone());
-    }
-}
 
 #[tokio::test]
 async fn full_lifecycle_and_audit_under_one_jwt() {
-    let audit = Arc::new(RecordingAudit::default());
     let server = WyrdTestServer::builder()
-        .with_eval_audit_for_test(audit.clone())
         .start_in_process()
         .await
         .expect("test server starts");
@@ -461,15 +445,6 @@ async fn full_lifecycle_and_audit_under_one_jwt() {
         directive["kind"], "run_complete",
         "expected RunComplete: {directive}"
     );
-
-    // (i) audit: open + complete recorded with the eval_ref and run_id.
-    let events = audit.events.lock().expect("audit lock").clone();
-    assert_eq!(events.len(), 2, "open + complete audited");
-    assert_eq!(events[0].kind, EvalAuditKind::RunOpen);
-    assert_eq!(events[1].kind, EvalAuditKind::RunComplete);
-    assert_eq!(events[0].tenant, tenant);
-    assert_eq!(events[0].run_id.as_str(), run_id);
-    assert_eq!(events[0].eval_ref.name.as_str(), "rubric");
 
     server.shutdown().await.expect("server shuts down");
 }

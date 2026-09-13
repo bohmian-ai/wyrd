@@ -35,7 +35,7 @@ use crate::auth::permission_resolver::SqlPermissionResolver;
 use crate::auth::pg_resolvers::PgIssuerResolver;
 use crate::bifrost::gate_audit::PostgresGateAudit;
 use crate::components::auth::{ServerAuth, ServerAuthz};
-use crate::components::eval::{EvalAuditWriter, EvalRuns, TracingEvalAuditWriter, new_run_map};
+use crate::components::eval::{EvalRuns, new_run_map};
 use crate::components::health::ReadinessSnapshot;
 use crate::config::{BifrostRuntimeConfig, BifrostTarget, DeploymentProfile, ForgeRuntimeConfig};
 use crate::postgres::ServerPostgres;
@@ -130,8 +130,8 @@ pub struct OracleBuildInputs {
     pub registered_role: RegisteredRole,
     /// Shared current-ready cluster registry.
     pub cluster: Arc<ClusterRegistry>,
-    /// Audit publisher for query lifecycle transitions.
-    pub audit: Arc<crate::oracle::OracleAuditPublisher>,
+    /// Audit outbox writer for Oracle read decisions and tenant tripwires.
+    pub audit: Arc<crate::oracle::OracleQueryAudit>,
     /// Transport carrying lifecycle control to peer participants.
     pub lifecycle_transport: Arc<crate::oracle::OracleLifecycleTransport>,
     /// Root-derived resource capability for the Oracle role.
@@ -161,8 +161,8 @@ pub struct ScribeBuildInputs {
     pub fragment_verifier: Arc<dyn PeerTicketVerifier>,
     /// Audit sink for refused inbound fragment requests.
     pub fragment_security_audit: Arc<dyn PeerSecurityAudit>,
-    /// Audit publisher recording follower query execution.
-    pub fragment_query_audit: Arc<crate::oracle::OracleAuditPublisher>,
+    /// Audit outbox writer for follower tenant tripwires.
+    pub fragment_query_audit: Arc<crate::oracle::OracleQueryAudit>,
     /// Whether this role owns `fragment_query_audit`'s shutdown, which it does
     /// only when no local Oracle role shares the publisher.
     pub owns_fragment_query_audit: bool,
@@ -434,7 +434,7 @@ pub struct Scribe {
     /// Durable security audit for rejected Scribe fragment authority.
     fragment_security_audit: Arc<dyn PeerSecurityAudit>,
     /// Process-owned query audit required by decoded tenant tripwires.
-    fragment_query_audit: Arc<crate::oracle::OracleAuditPublisher>,
+    fragment_query_audit: Arc<crate::oracle::OracleQueryAudit>,
     /// Retains audit shutdown ownership only when this process has no Oracle owner.
     owns_fragment_query_audit: bool,
     /// Cancels the recurring heartbeat and snapshot tasks before role removal.
@@ -488,8 +488,8 @@ pub struct Oracle {
     continuity_monitor_abort: AbortHandle,
     /// Readiness value preserved by heartbeats during transport drain.
     advertise_ready: Arc<AtomicBool>,
-    /// Local WAL publisher retained for the complete Oracle lifecycle.
-    audit: Arc<crate::oracle::OracleAuditPublisher>,
+    /// Audit outbox writer retained for the complete Oracle lifecycle.
+    audit: Arc<crate::oracle::OracleQueryAudit>,
     /// Canonical authenticated transport for owner-local lifecycle fanout.
     lifecycle_transport: Arc<crate::oracle::OracleLifecycleTransport>,
 }
@@ -638,35 +638,13 @@ impl Oracle {
         &self.query_controls
     }
 
-    /// Captures production-owned Oracle resource reservations and WAL backlog.
+    /// Captures Oracle resource reservations and in-flight audit outbox commits.
     #[cfg(feature = "test-support")]
     #[must_use]
     pub fn oracle_runtime_inspection(
         &self,
-    ) -> (
-        vala_bifrost_redux::oracle::OracleRuntimeInspection,
-        (u64, u64, Option<Duration>),
-    ) {
-        (self.engine.runtime_inspection(), self.audit.wal_snapshot())
-    }
-
-    /// Pauses relay SQL at the production fault-injection seam.
-    #[cfg(feature = "test-support")]
-    pub fn pause_audit_relay_for_test(&self) -> crate::oracle::AuditRelayPauseGuard {
-        self.audit.pause_relay_before_postgres()
-    }
-
-    /// Injects the documented commit-before-checkpoint replay window.
-    #[cfg(feature = "test-support")]
-    pub fn fail_audit_after_commit_for_test(&self) {
-        self.audit
-            .fail_after_next_postgres_commit_before_checkpoint();
-    }
-
-    /// Aborts production audit tasks so an abrupt test restart releases WAL locks.
-    #[cfg(feature = "test-support")]
-    pub async fn abort_audit_tasks_for_test(&self) {
-        self.audit.abort_for_test().await;
+    ) -> (vala_bifrost_redux::oracle::OracleRuntimeInspection, usize) {
+        (self.engine.runtime_inspection(), self.audit.pending())
     }
 
     /// Reports startup reconciliation and lifecycle readiness, excluding saturation.
@@ -736,8 +714,7 @@ impl Oracle {
             || report.peer_running != 0
             || report.reserved_memory_bytes != 0
             || report.reserved_spill_bytes != 0
-            || audit.backlog_records != 0
-            || audit.backlog_bytes != 0
+            || audit != 0
         {
             return Err(wyrd_spec::vala::error::BifrostError::Internal {
                 detail: "Oracle shutdown retained admission, resource, peer, or audit state"
@@ -1079,13 +1056,11 @@ impl Scribe {
                 detail: "Scribe shutdown did not flush every retained owner".to_owned(),
             });
         }
-        if self.owns_fragment_query_audit {
-            let audit = self.fragment_query_audit.shutdown(deadline).await;
-            if audit.backlog_records != 0 || audit.backlog_bytes != 0 {
-                return Err(wyrd_spec::vala::error::BifrostError::Internal {
-                    detail: "Scribe shutdown retained tenant-tripwire audit state".to_owned(),
-                });
-            }
+        if self.owns_fragment_query_audit && self.fragment_query_audit.shutdown(deadline).await != 0
+        {
+            return Err(wyrd_spec::vala::error::BifrostError::Internal {
+                detail: "Scribe shutdown retained tenant-tripwire audit state".to_owned(),
+            });
         }
         await_role_task(&self.heartbeat, deadline, "scribe heartbeat").await?;
         await_role_task(&self.snapshot_poller, deadline, "scribe snapshot poller").await?;
@@ -2097,8 +2072,6 @@ pub struct AppState {
     pub peer_plane: Arc<crate::app::peer_plane::PeerPlaneStatus>,
     /// Tenant-keyed in-memory eval run/lease/session map. Ephemeral, single-replica.
     pub eval_runs: EvalRuns,
-    /// Audit sink for eval run open/complete events.
-    pub eval_audit: Arc<dyn EvalAuditWriter>,
     /// Optional deterministic stream truncation controller for test servers.
     #[cfg(feature = "test-support")]
     pub query_stream_fault: Option<QueryStreamFaultController>,
@@ -2136,19 +2109,11 @@ impl AppState {
             readiness: Arc::new(ArcSwap::from_pointee(ReadinessSnapshot::initial())),
             peer_plane: Arc::new(crate::app::peer_plane::PeerPlaneStatus::default()),
             eval_runs: new_run_map(),
-            eval_audit: Arc::new(TracingEvalAuditWriter),
             #[cfg(feature = "test-support")]
             query_stream_fault: None,
             #[cfg(feature = "test-support")]
             query_control_audit_fault: None,
         }
-    }
-
-    /// Replace the eval audit writer, primarily for tests.
-    #[must_use]
-    pub fn with_eval_audit(mut self, eval_audit: Arc<dyn EvalAuditWriter>) -> Self {
-        self.eval_audit = eval_audit;
-        self
     }
 
     /// Register the test-support MCP context probe on this state.

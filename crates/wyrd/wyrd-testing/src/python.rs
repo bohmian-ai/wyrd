@@ -521,22 +521,22 @@ impl WyrdTestServer {
             .map_err(WyrdPyError::from)
     }
 
-    /// Wait until every accepted Oracle audit record has relayed to Postgres.
+    /// Wait until no Oracle audit outbox commit is still in flight.
     ///
-    /// Returns the residual pending count, which is `0` on a converged relay.
-    /// A journey asserting on read-decision staging calls this first: the relay
-    /// is a background task, so staging lags local acceptance.
+    /// Returns the residual pending count, which is `0` once every read
+    /// decision is staged. A journey asserting on read-decision staging calls
+    /// this first because Oracle stages decisions from a background task.
     ///
     /// # Errors
     ///
     /// Raises a Wyrd error when the context manager is inactive or this server
     /// does not host an Oracle role.
     #[pyo3(signature = (budget_ms=5000))]
-    fn wait_oracle_audit_relayed(&self, py: Python<'_>, budget_ms: u64) -> WyrdPyResult<u64> {
+    fn wait_oracle_audit_staged(&self, py: Python<'_>, budget_ms: u64) -> WyrdPyResult<u64> {
         let server = self.server.as_ref().ok_or_else(not_started)?;
         py.detach(|| {
             wyrd_runtime::runtime().block_on(
-                server.wait_oracle_audit_relayed(std::time::Duration::from_millis(budget_ms)),
+                server.wait_oracle_audit_staged(std::time::Duration::from_millis(budget_ms)),
             )
         })
         .map_err(WyrdPyError::from)

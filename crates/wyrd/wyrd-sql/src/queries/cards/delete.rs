@@ -6,16 +6,12 @@
 //! resolve to a fixed tenant.
 #![deny(missing_docs)]
 
-use wyrd_runtime::principal::Principal;
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::audit_detail::CardRegistrationOperation;
 
 use super::registry_db_error;
-use crate::queries::cards::audit::{CardRegistrationAuditInput, record_card_registration_audit};
 use crate::queries::cards::lifecycle::{CardManifestCompletionRow, manifest_completion_rows};
 use crate::row_types::cards::{CardRow, CardStatus, ParsedCardRow};
 use crate::tenant_conn::TenantConn;
@@ -40,24 +36,23 @@ pub struct CardDeleteState {
     pub deleted: bool,
 }
 
-/// Soft-delete a card: set `status = 'deleted'` and write an audit row.
+/// Soft-delete a card: set `status = 'deleted'`.
 ///
-/// Idempotent on already-deleted cards (no audit row, no error).
+/// Idempotent on already-deleted cards. The caller records the authorization
+/// audit through the server's outbox write in the same transaction.
 ///
 /// # Errors
 /// Returns `WYRD_REGISTRY_404_CARD_NOT_FOUND` when the uid is not present.
 /// Returns `WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE` on transient DB errors.
 #[tracing::instrument(
     skip(conn),
-    fields(tenant_id = %conn.data_tenant_id(), card_uid = %uid, actor = %actor.id),
+    fields(tenant_id = %conn.data_tenant_id(), card_uid = %uid),
 )]
 pub async fn soft_delete_card(
     conn: &mut TenantConn<'_>,
     uid: &CardUid,
-    actor: &Principal,
-    request_id: Option<&RequestId>,
 ) -> Result<(), WyrdError> {
-    soft_delete_card_with_state(conn, uid, actor, request_id)
+    soft_delete_card_with_state(conn, uid)
         .await
         .map(|_| ())
 }
@@ -71,10 +66,8 @@ pub async fn soft_delete_card(
 pub async fn soft_delete_card_with_state(
     conn: &mut TenantConn<'_>,
     uid: &CardUid,
-    actor: &Principal,
-    request_id: Option<&RequestId>,
 ) -> Result<CardDeleteState, WyrdError> {
-    soft_delete_card_with_expected_kind(conn, uid, None, actor, request_id).await
+    soft_delete_card_with_expected_kind(conn, uid, None).await
 }
 
 /// Soft-delete a card while asserting the exact kind supplied by the caller.
@@ -82,18 +75,14 @@ pub async fn soft_delete_card_with_kind(
     conn: &mut TenantConn<'_>,
     uid: &CardUid,
     expected_kind: CardKind,
-    actor: &Principal,
-    request_id: Option<&RequestId>,
 ) -> Result<CardDeleteState, WyrdError> {
-    soft_delete_card_with_expected_kind(conn, uid, Some(expected_kind), actor, request_id).await
+    soft_delete_card_with_expected_kind(conn, uid, Some(expected_kind)).await
 }
 
 async fn soft_delete_card_with_expected_kind(
     conn: &mut TenantConn<'_>,
     uid: &CardUid,
     expected_kind: Option<CardKind>,
-    actor: &Principal,
-    request_id: Option<&RequestId>,
 ) -> Result<CardDeleteState, WyrdError> {
     let card = load_card_for_delete(conn, uid).await?;
     let manifests = manifest_completion_rows(conn, uid).await?;
@@ -173,21 +162,6 @@ async fn soft_delete_card_with_expected_kind(
         .map_err(registry_db_error)?;
     }
 
-    record_card_registration_audit(
-        conn,
-        CardRegistrationAuditInput {
-            card_uid: uid,
-            card_kind: card.kind.clone(),
-            operation: CardRegistrationOperation::Delete,
-            outcome: None,
-            actor,
-            before_spec_hash: Some(card.spec_hash.as_str()),
-            after_spec_hash: None,
-            request_id,
-        },
-    )
-    .await?;
-
     Ok(CardDeleteState {
         card,
         manifests,
@@ -199,8 +173,6 @@ async fn soft_delete_card_with_expected_kind(
 pub async fn soft_delete_card_by_ref(
     conn: &mut TenantConn<'_>,
     card_ref: &CardRef,
-    actor: &Principal,
-    request_id: Option<&RequestId>,
 ) -> Result<CardDeleteState, WyrdError> {
     let space = card_ref.space.as_ref().ok_or_else(|| {
         WyrdError::registry_invalid_card_spec("CardRef.space is required for card deletion")
@@ -219,7 +191,7 @@ pub async fn soft_delete_card_by_ref(
     .map_err(registry_db_error)?
     .ok_or_else(|| WyrdError::registry_card_not_found("card reference was not found"))?;
     let uid = CardUid::from_uuid(uid).map_err(WyrdError::from_card_uid_error)?;
-    soft_delete_card_with_state(conn, &uid, actor, request_id).await
+    soft_delete_card_with_state(conn, &uid).await
 }
 
 async fn load_card_for_delete(

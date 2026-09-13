@@ -102,17 +102,6 @@ pub async fn append_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Resu
     Ok(seq)
 }
 
-/// Append one audit row on a caller-provided tenant-scoped transaction.
-///
-/// The caller owns the [`TenantConn`] lifetime and transaction commit, so this
-/// primitive can participate in the audited operation's transaction.
-///
-/// # Errors
-/// Returns [`SqlError`] when appending the audit row fails.
-pub async fn record_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Result<i64, SqlError> {
-    append_audit(conn, event).await
-}
-
 /// Read a bounded page of audit rows for one tenant-bound resource.
 ///
 /// The caller supplies the last observed sequence number. RLS is the only

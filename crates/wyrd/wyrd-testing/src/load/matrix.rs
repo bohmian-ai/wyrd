@@ -1164,23 +1164,21 @@ struct PhaseOwnerCheckpoint {
     read_audit_rows: u64,
 }
 
-/// Bounded wall-clock budget for the read-audit relay to drain before a phase
-/// boundary reads the durable audit-row counts it is about to assert on.
+/// Bounded wall-clock budget for in-flight read-audit commits to finish before a
+/// phase boundary reads the durable audit-row counts it is about to assert on.
 const AUDIT_RELAY_CONVERGENCE_BUDGET: Duration = Duration::from_secs(30);
 
 /// Capture durable Forge and Oracle owner counts for one phase boundary.
 ///
-/// Before reading the counts, this waits on a production durability signal: it
-/// polls every pod's pending read-audit WAL residual (`audit_wal_records`, an
-/// exact counter) until it reaches zero, so the subsequent `vala.audit_staging`
-/// row counts reflect a fully relayed cluster. This is a convergence wait, not a
-/// masking retry — the asserted counts are unchanged and the wait errors loudly
-/// with the residual and oldest-record age if the relay fails to drain.
+/// Before reading the counts, this polls every pod's in-flight Oracle audit
+/// outbox commits (`audit_pending`) until none remain, so the subsequent
+/// `vala.audit_staging` row counts include every read decision. The asserted
+/// counts are unchanged and the wait errors loudly if commits do not finish.
 ///
 /// # Errors
 /// Returns [`ClusterLoadError::Cluster`] when the shared database inspection
-/// fails, or [`ClusterLoadError::Assertion`] when the read-audit relay does not
-/// converge within [`AUDIT_RELAY_CONVERGENCE_BUDGET`].
+/// fails, or [`ClusterLoadError::Assertion`] when audit commits do not finish
+/// within [`AUDIT_RELAY_CONVERGENCE_BUDGET`].
 async fn phase_owner_checkpoint(
     cluster: &WyrdTestCluster,
 ) -> Result<PhaseOwnerCheckpoint, ClusterLoadError> {
@@ -1191,15 +1189,15 @@ async fn phase_owner_checkpoint(
     })
 }
 
-/// Polls cluster Oracle inspection until every pod's read-audit WAL is drained.
+/// Polls cluster Oracle inspection until no pod has an in-flight audit commit.
 ///
 /// Returns the converged inspection so the caller reuses its durable counts
 /// without a second query.
 ///
 /// # Errors
 /// Returns [`ClusterLoadError::Cluster`] on inspection failure or
-/// [`ClusterLoadError::Assertion`] when the pending residual is still non-zero
-/// at [`AUDIT_RELAY_CONVERGENCE_BUDGET`].
+/// [`ClusterLoadError::Assertion`] when commits are still pending at
+/// [`AUDIT_RELAY_CONVERGENCE_BUDGET`].
 async fn await_read_audit_convergence(
     cluster: &WyrdTestCluster,
 ) -> Result<crate::bifrost::cluster::OracleInspection, ClusterLoadError> {
@@ -1209,15 +1207,13 @@ async fn await_read_audit_convergence(
             .oracle_inspection()
             .await
             .map_err(|error| ClusterLoadError::Cluster(error.to_string()))?;
-        if inspection.audit_wal_records == 0 {
+        if inspection.audit_pending == 0 {
             return Ok(inspection);
         }
         if Instant::now() >= deadline {
             return Err(ClusterLoadError::Assertion(format!(
-                "read-audit relay did not converge: {} WAL records pending (oldest {:?}) after {:?}",
-                inspection.audit_wal_records,
-                inspection.audit_oldest_age,
-                AUDIT_RELAY_CONVERGENCE_BUDGET,
+                "read-audit commits did not finish: {} pending after {:?}",
+                inspection.audit_pending, AUDIT_RELAY_CONVERGENCE_BUDGET,
             )));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;

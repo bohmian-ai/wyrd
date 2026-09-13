@@ -1033,22 +1033,22 @@ impl TailTransportDirectory {
 /// Narrow audit collaborator owned by the serving composition root.
 #[async_trait]
 pub trait OracleAudit: Send + Sync {
-    /// Commits the immutable read-decision detail before row access.
+    /// Records the immutable read-decision detail before row access.
     ///
     /// # Errors
     ///
-    /// Returns audit unavailable when the mandatory immutable event cannot commit.
+    /// Returns audit unavailable when the writer refuses the event.
     async fn append_read_decision(
         &self,
         context: &AuthorizedQueryContext,
         decision: BifrostQueryReadDecision,
     ) -> Result<(), BifrostError>;
 
-    /// Commits a tenant-tripwire security event.
+    /// Records a tenant-tripwire security event.
     ///
     /// # Errors
     ///
-    /// Returns audit unavailable when the mandatory security event cannot commit.
+    /// Returns audit unavailable when the writer refuses the event.
     async fn append_security_violation(
         &self,
         context: VerifiedSecurityContext,

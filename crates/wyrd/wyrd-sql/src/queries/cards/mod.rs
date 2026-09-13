@@ -9,7 +9,6 @@ pub(super) fn registry_db_error(error: impl std::fmt::Display) -> WyrdError {
     WyrdError::registry_unavailable("card registry unavailable")
 }
 
-mod audit;
 mod auth_projection;
 mod delete;
 mod field_resolver;

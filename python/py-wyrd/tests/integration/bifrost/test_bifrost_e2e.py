@@ -440,9 +440,9 @@ def test_positive_audit_trail(wyrd_server: WyrdTestServer) -> None:
     result = bifrost.sql(f"SELECT id FROM {table_fqn} ORDER BY id")
     assert result.terminal["outcome"] == "success"
 
-    # The read acceptance is fsynced locally and relayed to the canonical
-    # outbox by a background task, so converge the relay before counting.
-    assert wyrd_server.wait_oracle_audit_relayed() == 0
+    # The read decision is staged in the audit outbox by a background task,
+    # so wait for it before counting.
+    assert wyrd_server.wait_oracle_audit_staged() == 0
     assert wyrd_server.bifrost_read_decision_count() > before
 
 

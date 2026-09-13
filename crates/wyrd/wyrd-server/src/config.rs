@@ -495,33 +495,6 @@ pub struct OracleRuntimeConfig {
     /// Production ignores this switch and always requires an approved profile.
     #[serde(default)]
     pub allow_unapproved_profile: bool,
-    /// Root directory for the locally durable Oracle audit WAL.
-    #[serde(default)]
-    pub audit_wal_root: Option<PathBuf>,
-    /// Maximum accepted records retained before relay.
-    #[serde(default = "default_audit_wal_max_records")]
-    pub audit_wal_max_records: usize,
-    /// Maximum accepted WAL bytes retained before relay.
-    #[serde(default = "default_audit_wal_max_bytes")]
-    pub audit_wal_max_bytes: u64,
-    /// Maximum oldest-record age before fail-closed admission.
-    #[serde(default = "default_audit_wal_max_age_seconds")]
-    pub audit_wal_max_age_seconds: u64,
-    /// Maximum records delivered in one relay pass.
-    #[serde(default = "default_audit_relay_batch_records")]
-    pub audit_relay_batch_records: usize,
-    /// Postgres attempt timeout in milliseconds.
-    #[serde(default = "default_audit_relay_attempt_timeout_ms")]
-    pub audit_relay_attempt_timeout_ms: u64,
-    /// Initial bounded retry backoff in milliseconds.
-    #[serde(default = "default_audit_relay_backoff_initial_ms")]
-    pub audit_relay_backoff_initial_ms: u64,
-    /// Maximum bounded retry backoff in milliseconds.
-    #[serde(default = "default_audit_relay_backoff_max_ms")]
-    pub audit_relay_backoff_max_ms: u64,
-    /// Shutdown drain deadline in milliseconds.
-    #[serde(default = "default_audit_relay_shutdown_timeout_ms")]
-    pub audit_relay_shutdown_timeout_ms: u64,
 }
 
 fn default_oracle_planning_permits() -> usize {
@@ -540,38 +513,6 @@ fn default_oracle_max_workers_per_query() -> usize {
 fn default_oracle_max_frame_bytes() -> usize {
     8 * 1024 * 1024
 }
-/// Default maximum accepted WAL records.
-fn default_audit_wal_max_records() -> usize {
-    100_000
-}
-/// Default maximum accepted WAL bytes.
-fn default_audit_wal_max_bytes() -> u64 {
-    1 << 30
-}
-/// Default maximum oldest accepted record age.
-fn default_audit_wal_max_age_seconds() -> u64 {
-    300
-}
-/// Default relay batch size.
-fn default_audit_relay_batch_records() -> usize {
-    128
-}
-/// Default relay attempt timeout.
-fn default_audit_relay_attempt_timeout_ms() -> u64 {
-    5_000
-}
-/// Default initial relay backoff.
-fn default_audit_relay_backoff_initial_ms() -> u64 {
-    50
-}
-/// Default maximum relay backoff.
-fn default_audit_relay_backoff_max_ms() -> u64 {
-    5_000
-}
-/// Default relay shutdown timeout.
-fn default_audit_relay_shutdown_timeout_ms() -> u64 {
-    10_000
-}
 
 impl Default for OracleRuntimeConfig {
     fn default() -> Self {
@@ -583,15 +524,6 @@ impl Default for OracleRuntimeConfig {
             max_frame_bytes: default_oracle_max_frame_bytes(),
             calibration_profile: PathBuf::new(),
             allow_unapproved_profile: false,
-            audit_wal_root: None,
-            audit_wal_max_records: default_audit_wal_max_records(),
-            audit_wal_max_bytes: default_audit_wal_max_bytes(),
-            audit_wal_max_age_seconds: default_audit_wal_max_age_seconds(),
-            audit_relay_batch_records: default_audit_relay_batch_records(),
-            audit_relay_attempt_timeout_ms: default_audit_relay_attempt_timeout_ms(),
-            audit_relay_backoff_initial_ms: default_audit_relay_backoff_initial_ms(),
-            audit_relay_backoff_max_ms: default_audit_relay_backoff_max_ms(),
-            audit_relay_shutdown_timeout_ms: default_audit_relay_shutdown_timeout_ms(),
         }
     }
 }
@@ -2609,26 +2541,9 @@ impl WyrdServerConfig {
                 || self.bifrost.oracle.admission_waiters == 0
                 || self.bifrost.oracle.max_queue_wait_ms == 0
                 || self.bifrost.oracle.max_frame_bytes == 0
-                || self.bifrost.oracle.audit_wal_max_records == 0
-                || self.bifrost.oracle.audit_wal_max_bytes == 0
-                || self.bifrost.oracle.audit_wal_max_age_seconds == 0
-                || self.bifrost.oracle.audit_relay_batch_records == 0
-                || self.bifrost.oracle.audit_relay_attempt_timeout_ms == 0
-                || self.bifrost.oracle.audit_relay_backoff_initial_ms == 0
-                || self.bifrost.oracle.audit_relay_backoff_max_ms == 0
-                || self.bifrost.oracle.audit_relay_shutdown_timeout_ms == 0
-                || self.bifrost.oracle.audit_relay_backoff_initial_ms
-                    > self.bifrost.oracle.audit_relay_backoff_max_ms
             {
                 return Err(ConfigError::Invalid {
                     message: "bifrost.oracle bounds must be positive and finite".to_owned(),
-                });
-            }
-            if self.deployment_profile.is_production()
-                && self.bifrost.oracle.audit_wal_root.is_none()
-            {
-                return Err(ConfigError::Invalid {
-                    message: "bifrost.oracle.audit_wal_root is required in production".to_owned(),
                 });
             }
             self.bifrost
@@ -3510,7 +3425,6 @@ minimum_slots = 2
             Some(directory.path().join("peer-ticket-signing.pem"));
         config.bifrost.peer.ticket.verifying_keyring_path =
             Some(directory.path().join("peer-ticket-keyring.json"));
-        config.bifrost.oracle.audit_wal_root = Some(directory.path().join("oracle-audit"));
         assert!(config.validate().is_err());
 
         std::fs::write(&path, complete_oracle_calibration("approved"))
@@ -3564,7 +3478,6 @@ minimum_slots = 2
             "a plaintext advertisement is unroutable for a mutually authenticated peer plane"
         );
         config.bifrost.peer.advertise_addr = Some("https://oracle-0.peers.svc:50052".to_owned());
-        config.bifrost.oracle.audit_wal_root = Some(directory.path().join("oracle-audit"));
         config
             .validate()
             .expect("complete production peer configuration validates");

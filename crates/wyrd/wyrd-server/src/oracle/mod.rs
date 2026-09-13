@@ -6,7 +6,6 @@ use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::cluster::{ClusterError, ClusterRegistry, RegisteredRole};
 use vala_bifrost_redux::oracle::dispatcher::OraclePeerWorker;
 
-mod audit_wal;
 mod forwarding;
 mod lifecycle_controls;
 /// Private owner-local lifecycle transport over the canonical query runtime.
@@ -33,11 +32,7 @@ pub use peer_authority::OraclePeerAuthority;
 pub use peer_credentials::ServerBifrostPeerCredentials;
 pub use peer_keyring::{PeerKeyringError, PeerTicketKeyring};
 pub use peer_service::OraclePeerGrpc;
-#[cfg(feature = "test-support")]
-pub use query_audit::{
-    AuditRelayPauseGuard, AuditTelemetryLabelDomains, audit_telemetry_label_domains,
-};
-pub use query_audit::{AuditShutdownReport, OracleAuditPublisher};
+pub use query_audit::OracleQueryAudit;
 pub use tail_audit::PostgresTailSecurityAudit;
 pub use tail_authority::ScribeTailAuthority;
 pub use tail_discovery::RegistryTailStreamDiscovery;

@@ -700,7 +700,7 @@ async fn exact_delete_enforces_inbound_references_and_is_idempotent() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    let error = soft_delete_card_with_state(&mut conn, &target_uid, &principal, None)
+    let error = soft_delete_card_with_state(&mut conn, &target_uid)
         .await
         .expect_err("visible inbound reference blocks delete");
     assert_eq!(error.status(), 409);
@@ -710,7 +710,7 @@ async fn exact_delete_enforces_inbound_references_and_is_idempotent() {
         .tenant_conn_for(other_tenant)
         .await
         .expect("other tenant connection opens");
-    let error = soft_delete_card_with_state(&mut conn, &target_uid, &principal, None)
+    let error = soft_delete_card_with_state(&mut conn, &target_uid)
         .await
         .expect_err("cross-tenant UID must not resolve");
     assert_eq!(error.code(), "WYRD_REGISTRY_404_CARD_NOT_FOUND");
@@ -731,7 +731,7 @@ async fn exact_delete_enforces_inbound_references_and_is_idempotent() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    let deleted = soft_delete_card_by_ref(&mut conn, &target_ref, &principal, None)
+    let deleted = soft_delete_card_by_ref(&mut conn, &target_ref)
         .await
         .expect("exact reference deletes target");
     assert!(deleted.deleted);
@@ -741,7 +741,7 @@ async fn exact_delete_enforces_inbound_references_and_is_idempotent() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    let replay = soft_delete_card_with_state(&mut conn, &target_uid, &principal, None)
+    let replay = soft_delete_card_with_state(&mut conn, &target_uid)
         .await
         .expect("repeated delete is idempotent");
     assert!(!replay.deleted);
@@ -756,15 +756,6 @@ async fn exact_delete_enforces_inbound_references_and_is_idempotent() {
         .fetch_one(&mut **conn.transaction())
         .await
         .expect("deleted card reads");
-    let audits: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM vala.audit_staging \
-         WHERE operation = 'card.registration' AND resource = $1",
-    )
-    .bind(format!("card:{target_uid}"))
-    .fetch_one(&mut **conn.transaction())
-    .await
-    .expect("delete audit reads");
     assert_eq!(status, "deleted");
-    assert_eq!(audits, 1, "replay must not append a second delete audit");
     conn.commit().await.expect("assertion transaction commits");
 }

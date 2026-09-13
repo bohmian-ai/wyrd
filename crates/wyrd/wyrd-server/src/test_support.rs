@@ -216,11 +216,6 @@ pub(crate) fn test_peer_config() -> crate::config::BifrostPeerConfig {
         .clone()
 }
 
-/// Return the shared Vala Postgres handle used by the Redux catalog.
-pub(crate) async fn test_vala_postgres() -> ValaPostgres {
-    shared().vala_postgres().clone()
-}
-
 /// Return a server Postgres owner over the shared fixture's exact runtime handles.
 pub(crate) async fn test_server_postgres() -> Arc<crate::postgres::ServerPostgres> {
     Arc::new(crate::postgres::ServerPostgres::from_parts(

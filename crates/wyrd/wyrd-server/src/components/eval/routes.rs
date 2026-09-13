@@ -32,7 +32,6 @@ use wyrd_spec::vala::eval::protocol::{
 };
 use wyrd_spec::vala::ids::{LeaseToken, RunId};
 
-use super::audit::{EvalAuditEvent, EvalAuditKind};
 use super::error::{
     eval_engine_error, eval_internal_error, eval_invalid_lease, eval_missing_lease,
     eval_run_not_found, eval_submission_error, eval_too_many_runs, map_card_resolution_error,
@@ -124,14 +123,6 @@ async fn open(
         );
     }
 
-    state.eval_audit.record(&EvalAuditEvent {
-        kind: EvalAuditKind::RunOpen,
-        principal: owner,
-        tenant,
-        eval_ref: req.eval_ref,
-        run_id: run_id.clone(),
-    });
-
     Ok(Json(EvalRunOpenResponse {
         run_id,
         lease_token: lease,
@@ -174,25 +165,13 @@ async fn next(
             Ok(Json(directive))
         }
         TurnDirective::RunComplete => {
-            let eval_ref = {
-                let mut run = entry.state.lock().await;
-                let eval_ref = run.eval_ref.clone();
-                run.ack_run_complete();
-                eval_ref
-            };
+            entry.state.lock().await.ack_run_complete();
             {
                 let mut runs = state.eval_runs.lock().map_err(|_| {
                     WyrdErrorResponse::from(eval_internal_error("eval run map lock poisoned"))
                 })?;
                 runs.remove(&(tenant, run_id.clone()));
             }
-            state.eval_audit.record(&EvalAuditEvent {
-                kind: EvalAuditKind::RunComplete,
-                principal: principal.id,
-                tenant,
-                eval_ref,
-                run_id: run_id.clone(),
-            });
             Ok(Json(directive))
         }
         TurnDirective::AgentTurn { .. } => Ok(Json(directive)),

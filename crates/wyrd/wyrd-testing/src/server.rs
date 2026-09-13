@@ -243,8 +243,6 @@ struct WyrdTestServerInner {
     _scribe_wal_root: Option<Arc<tempfile::TempDir>>,
     /// Lifetime guard for the Forge and Oracle DataFusion spill root.
     _bifrost_spill_root: Option<Arc<tempfile::TempDir>>,
-    /// Lifetime guard for the cluster-retained Oracle audit WAL root.
-    _oracle_audit_wal_root: Option<Arc<tempfile::TempDir>>,
     state: AppState,
     router: axum::Router,
     verifier: Arc<TokenVerifier<SqlPermissionResolver, PgIssuerResolver>>,
@@ -329,12 +327,8 @@ pub struct OracleRuntimeInspection {
     pub peer_pending: u64,
     /// Peer reservations executing worker streams.
     pub peer_running: u64,
-    /// Accepted audit records retained in the local WAL.
-    pub audit_wal_records: u64,
-    /// Bytes retained in the local WAL.
-    pub audit_wal_bytes: u64,
-    /// Age of the oldest retained WAL record.
-    pub audit_oldest_age: Option<Duration>,
+    /// Oracle audit outbox commits still in flight.
+    pub audit_pending: u64,
     /// Active Oracle-owned process/query scratch directories.
     pub spill_directories: u64,
     /// Regular files beneath the Oracle-owned scratch prefix.
@@ -460,8 +454,6 @@ enum Mode {
 pub struct WyrdTestServerBuilder {
     policy_hook: Option<Arc<dyn PolicyHook>>,
     audit_writer: Option<Arc<dyn AuthzAuditWriter>>,
-    /// Optional eval-run audit sink installed on the composed `AppState`.
-    eval_audit: Option<Arc<dyn wyrd_server::components::eval::EvalAuditWriter>>,
     allow_preview_auth: bool,
     storage_settings: Option<StorageSettings>,
     storage_handle: Option<Arc<wyrd_storage::StorageHandle>>,
@@ -507,8 +499,6 @@ pub struct WyrdTestServerBuilder {
     oracle_query_slot_limit: Option<usize>,
     /// Forge compaction budget replacing the harness default on this node.
     forge_compaction_memory_limit_bytes: Option<usize>,
-    /// Cluster-retained Oracle audit WAL root reused across restarts.
-    oracle_audit_wal_root: Option<Arc<tempfile::TempDir>>,
     /// Process-installed production telemetry guard shared by every node.
     telemetry: Option<Arc<TelemetryGuard>>,
     /// Optional fixed HTTP/gRPC addresses used for truthful peer advertisement.
@@ -607,7 +597,6 @@ impl Default for WyrdTestServerBuilder {
             system_resources: None,
             oracle_query_slot_limit: None,
             forge_compaction_memory_limit_bytes: None,
-            oracle_audit_wal_root: None,
             telemetry: None,
             bind_addrs: None,
             oracle_peer_credentials: None,
@@ -621,7 +610,6 @@ impl Default for WyrdTestServerBuilder {
             forge_catalog: None,
             forge_config: None,
             readiness_failure: false,
-            eval_audit: None,
             omit_token_verifier: false,
             limits: None,
             stalled_drain_for_test: None,
@@ -815,9 +803,6 @@ impl WyrdTestServer {
         if let Some(handle) = self.serve_handle.take() {
             handle.abort();
             let _ = handle.await;
-        }
-        if let Some(query) = self.inner.state.bifrost_query() {
-            query.abort_audit_tasks_for_test().await;
         }
         Ok(())
     }
@@ -1290,7 +1275,7 @@ impl WyrdTestServer {
             self.inner.state.bifrost_query().ok_or_else(|| {
                 WyrdTestServerError::Start("Oracle runtime is not hosted".to_owned())
             })?;
-        let (admission, (records, bytes, oldest)) = runtime.oracle_runtime_inspection();
+        let (admission, audit_pending) = runtime.oracle_runtime_inspection();
         let (spill_directories, spill_files, spill_file_bytes) = self.inspect_oracle_spill()?;
         Ok(OracleRuntimeInspection {
             active_queries: admission.active_queries,
@@ -1299,9 +1284,7 @@ impl WyrdTestServer {
             reserved_spill_bytes: admission.reserved_spill_bytes,
             peer_pending: admission.peer_pending,
             peer_running: admission.peer_running,
-            audit_wal_records: records,
-            audit_wal_bytes: bytes,
-            audit_oldest_age: oldest,
+            audit_pending: audit_pending as u64,
             spill_directories,
             spill_files,
             spill_file_bytes,
@@ -1343,27 +1326,6 @@ impl WyrdTestServer {
             }
         }
         Ok((directories, files, bytes))
-    }
-
-    /// Pauses the production audit relay before its next Postgres attempt.
-    pub fn pause_audit_relay_for_test(
-        &self,
-    ) -> Result<wyrd_server::oracle::AuditRelayPauseGuard, WyrdTestServerError> {
-        let runtime =
-            self.inner.state.bifrost_query().ok_or_else(|| {
-                WyrdTestServerError::Start("Oracle runtime is not hosted".to_owned())
-            })?;
-        Ok(runtime.pause_audit_relay_for_test())
-    }
-
-    /// Injects a commit-before-checkpoint relay crash window.
-    pub fn fail_audit_after_commit_for_test(&self) -> Result<(), WyrdTestServerError> {
-        let runtime =
-            self.inner.state.bifrost_query().ok_or_else(|| {
-                WyrdTestServerError::Start("Oracle runtime is not hosted".to_owned())
-            })?;
-        runtime.fail_audit_after_commit_for_test();
-        Ok(())
     }
 
     /// Captures exact durable and in-memory query resource ownership.
@@ -1559,25 +1521,23 @@ impl WyrdTestServer {
             .collect()
     }
 
-    /// Wait until every locally accepted Oracle audit record has relayed.
+    /// Wait until no Oracle audit outbox commit is still in flight.
     ///
-    /// Oracle read acceptance is fsynced to a local WAL before rows are
-    /// permitted and relayed into canonical staging by a background task, so
-    /// a journey that asserts on staging must first observe the relay
-    /// converge. This polls the exact pending counter rather than sleeping a
-    /// fixed interval: the returned count is the real residual, and a nonzero
-    /// return within `budget` is a genuine failure to drain, not a masked race.
+    /// Oracle stages each read decision in `vala.audit_staging` from a
+    /// background task, so a journey that asserts on staging first waits for
+    /// those commits. The returned count is the real residual; a nonzero
+    /// return within `budget` means commits did not finish.
     ///
     /// # Errors
     ///
     /// Returns a start error when this server does not host an Oracle role.
-    pub async fn wait_oracle_audit_relayed(
+    pub async fn wait_oracle_audit_staged(
         &self,
         budget: std::time::Duration,
     ) -> Result<u64, WyrdTestServerError> {
         let deadline = std::time::Instant::now() + budget;
         loop {
-            let pending = self.oracle_runtime_inspection()?.audit_wal_records;
+            let pending = self.oracle_runtime_inspection()?.audit_pending;
             if pending == 0 || std::time::Instant::now() >= deadline {
                 return Ok(pending);
             }
@@ -3157,20 +3117,6 @@ impl WyrdTestServerBuilder {
         self
     }
 
-    /// Install an eval-run audit sink on the composed `AppState`.
-    ///
-    /// The default sink discards events, so a test that must prove a run
-    /// open/complete pair was audited supplies a recording writer here rather
-    /// than reaching into composed state after the fact.
-    #[must_use]
-    pub fn with_eval_audit_for_test(
-        mut self,
-        writer: Arc<dyn wyrd_server::components::eval::EvalAuditWriter>,
-    ) -> Self {
-        self.eval_audit = Some(writer);
-        self
-    }
-
     /// Compose the server without a token verifier.
     ///
     /// Models a server whose auth backend is not yet configured — the state a
@@ -3487,11 +3433,9 @@ impl WyrdTestServerBuilder {
         mut self,
         scribe_wal_root: Option<Arc<tempfile::TempDir>>,
         oracle_spill_root: Option<Arc<tempfile::TempDir>>,
-        oracle_audit_wal_root: Option<Arc<tempfile::TempDir>>,
     ) -> Self {
         self.scribe_wal_root = scribe_wal_root;
         self.oracle_spill_root = oracle_spill_root;
-        self.oracle_audit_wal_root = oracle_audit_wal_root;
         self
     }
 
@@ -4053,18 +3997,6 @@ impl WyrdTestServerBuilder {
         let mut bifrost_config = BifrostRuntimeConfig::default();
         bifrost_config.scribe.ingest_request_bytes = self.scribe_ingest_limits.max_frame_bytes;
         bifrost_config.storage = self.bifrost_storage_io;
-        // The Oracle audit WAL is pod-local durable state with the same
-        // lifecycle as the Scribe WAL, so it lives beside it unless a cluster
-        // hands this node a root of its own. Leaving it unset would fall back
-        // to the server's process-id-named directory under the system temp
-        // dir, which no test removes and which a later process inherits once
-        // the operating system recycles that pid — recovery then adopts a
-        // foreign WAL and refuses to start.
-        bifrost_config.oracle.audit_wal_root =
-            Some(self.oracle_audit_wal_root.as_ref().map_or_else(
-                || durable_wal_root.join("oracle-audit"),
-                |root| root.path().to_owned(),
-            ));
         let forge_runtime = ForgeRuntimeConfig {
             maintenance_interval_secs: Some(self.forge_interval.as_secs()),
             ..ForgeRuntimeConfig::default()
@@ -4134,9 +4066,6 @@ impl WyrdTestServerBuilder {
                 workload_binding_resolver: Some(binding_resolver),
                 sealing_key: Some(sealing_key),
             });
-        if let Some(writer) = self.eval_audit {
-            state = state.with_eval_audit(writer);
-        }
         if let Some(limits) = self.limits {
             state = state.with_limits(limits);
         }
@@ -4158,7 +4087,6 @@ impl WyrdTestServerBuilder {
                 _storage_root: storage_root,
                 _scribe_wal_root: Some(wal_root),
                 _bifrost_spill_root: Some(spill_root),
-                _oracle_audit_wal_root: self.oracle_audit_wal_root,
                 state,
                 router,
                 verifier,

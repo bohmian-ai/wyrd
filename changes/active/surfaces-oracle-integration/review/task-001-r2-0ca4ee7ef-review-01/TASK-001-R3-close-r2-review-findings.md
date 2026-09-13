@@ -72,7 +72,7 @@ Route directly to `$wyrd-implement`. Recommendations are the validated `ponytail
 
 ## Constraints and preserved behavior
 
-- Preserve everything closed in R2 (R1-1..R1-4, R1-8, R1-9), Redux as sole engine, RLS, gapless chain, frozen-range publication, Scribe fences, Oracle WAL-first, Forge lineage, denial semantics, stable error codes, SSRF pinning, secret redaction.
+- Preserve everything closed in R2 (R1-1..R1-4, R1-8, R1-9), Redux as sole engine, RLS, gapless chain, frozen-range publication, Scribe fences, Forge lineage, denial semantics, stable error codes, SSRF pinning, secret redaction.
 - No new compatibility surface, migration, scheduler, configuration, dependency, public test seam, harness, or test file.
 - Non-goals: reverting `662bf33bc`; verifying TASK-002 lanes; fixing pre-R2 qualified type uses; SDK convergence; `verify:bifrost`; standards observations O-1..O-4.
 
@@ -100,4 +100,23 @@ Then the cumulative set from TASK-001-R2 "Focused proof" (fmt, lints, codegen:ch
 
 ## Implementation evidence
 
-To be completed by the implementer.
+Human direction (Steven Forrester, 2026-09-13) replaced §2 and §5 corrections and the
+three-consecutive-runs proof: one audit write path (`vala.audit_staging`) and one
+`AuditPublisher`; the Oracle audit WAL and relay are deleted; each lane runs once.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| R1-5 decision recorded | §1 (`4de23e201`) | n/a | PASS |
+| R1-6 (a) MCP journey deterministic | Audit assertions removed from the MCP delegated query journey; chain attribution stays in the server query journey (`a5089326f`). Oracle WAL deleted; Oracle commits to staging from a tracked task (`dfc930031`) | `test:bifrost:journey:mcp` 8/8; `test:bifrost:journey:server` 9/9; `test:bifrost:journey:oracle` 28/28 | PASS |
+| R1-6 (b) TASK-002 transfer note | `a41adeafc` | n/a | PASS |
+| R1-7 bare `TenantConn`, Card handler docs | `a41adeafc`; OpenAPI regenerated | `mise run codegen:check` pass | PASS |
+| R2-1 service-account verdicts survive failure | Allowed row committed standalone before the transaction in trusted-issuer delete, binding create/delete, principal revoke, API-key issue (`4272ef988`) | wyrd-server lib admin/auth/revoke pg tests 22/22 | PASS |
+| Single audit writer | Removed wyrd-sql Card-delete audit row, tracing eval audit writer, `vala_sql` `record_audit` alias (`dfc930031`) | `pg_eval_v1_protocol` 9/9; `pg_cards_register` `exact_delete_enforces_inbound_references_and_is_idempotent`; `test:bifrost:integration:server` 67/67 | PASS |
+
+Also: `mise run lints` pass; `mise run fmt` clean; `git diff --check` clean.
+
+Limits: `test:bifrost:journey:python` previously pointed at a moved file and ran
+nothing; with the path fixed, 30 pass and 4 fail on client error text/details
+(`test_negative_bad_card_ref_raises`, `test_negative_reserved_column_is_refused_locally`,
+`test_bifrost_query_missing_terminal_fails_closed[schema|batch]`), unrelated to audit.
+Oracle read-audit commit failures are logged and counted, not replayed.

@@ -56,14 +56,14 @@ Generated from the docs content tree and `crates/wyrd-spec/schemas/`. `architect
 
 ## Bifrost
 
-- [Bifrost](https://mitari-ai.github.io/wyrd/bifrost/): The Wyrd analytical warehouse. Apache Iceberg tables, DataFusion queries, and a typed read surface for all Vala observations.
+- [Bifrost](https://mitari-ai.github.io/wyrd/bifrost/): The Wyrd analytical warehouse. Apache Iceberg tables, DataFusion queries, and one canonical SQL read surface for all Vala observations.
 - [Architecture](https://mitari-ai.github.io/wyrd/bifrost/architecture/): Component responsibilities, data flow, storage model, concurrency, durability, and scaling for Gate, Scribe, Oracle, and Forge.
 - [Data plane internals](https://mitari-ai.github.io/wyrd/bifrost/data-plane-internals/): Scribe WAL format, seal state machine, vala.file_list schema, Forge maintenance, and audit data.
 - [Forge system overview](https://mitari-ai.github.io/wyrd/bifrost/forge/): How Forge maintains Bifrost data and connects Gate, Scribe, Oracle, Iceberg, Postgres, and object storage.
-- [Quickstart](https://mitari-ai.github.io/wyrd/bifrost/quickstart/): Emit an observation via vala-sdk and query it back through a typed ValaQueryService method.
+- [Quickstart](https://mitari-ai.github.io/wyrd/bifrost/quickstart/): Write rows through the Bifrost client and query them back with SQL.
 - [Reading Data](https://mitari-ai.github.io/wyrd/bifrost/reading-data/): Query Bifrost synchronously through the governed Oracle stream.
 - [Schema](https://mitari-ai.github.io/wyrd/bifrost/schema/): Pre-declared Bifrost domain tables, physical schemas, system columns, and type mapping.
-- [Writing Data](https://mitari-ai.github.io/wyrd/bifrost/writing-data/): vala-sdk producer, batching, backpressure, payload governance, and tenant stamping.
+- [Writing Data](https://mitari-ai.github.io/wyrd/bifrost/writing-data/): Bifrost client writes, batching, backpressure, payload governance, and tenant stamping.
 
 ## Cards
 

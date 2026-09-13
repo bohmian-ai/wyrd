@@ -1,6 +1,6 @@
 ---
 title: Quickstart
-description: Emit an observation via vala-sdk and query it back through a typed ValaQueryService method.
+description: Write rows through the Bifrost client and query them back with SQL.
 pillar: wyrd
 group: Bifrost
 order: 2
@@ -8,46 +8,41 @@ order: 2
 
 # Bifrost Quickstart
 
-This walkthrough emits a trace observation using `vala-sdk` and reads it back through the `QueryRecentTraces` typed method.
+This walkthrough registers a table, writes rows through `wyrd.bifrost.Bifrost`, and reads them back with SQL.
 
 ## Prerequisites
 
 - A running Wyrd server (see [self-hosting](/self-hosting))
 - Python `wyrd` package installed (`pip install wyrd`)
-- A valid Wyrd access token in the environment
+- `WYRD_SERVER_URL`, `WYRD_GRPC_URL`, and a Wyrd credential in the environment
 
-## 1. Emit a trace observation (Python)
+## 1. Write rows (Python)
 
 ```python
-from wyrd import WyrdClient
-from vala_sdk import ValaHandle, ObservationContext
+from pydantic import BaseModel
+from wyrd.bifrost import Bifrost, TableConfig
 
-client = WyrdClient(base_url="https://your-wyrd-server", token="…")
-vala = ValaHandle(client)
+class Prediction(BaseModel):
+    model: str
+    score: float
 
-ctx = ObservationContext(run_id="run-abc-123")
-with vala.observe.trace(ctx, name="inference", service="my-service") as span:
-    span.set_attribute("model", "gpt-4o")
-    result = run_inference()
-    span.set_attribute("tokens", result.usage.total_tokens)
+bifrost = Bifrost(TableConfig(Prediction, "genai.predictions"))
+bifrost.register()
+bifrost.insert({"model": "gpt-4o", "score": 0.93}, {"run_id": "run-abc-123"})
+bifrost.flush()
 ```
 
-The trace is buffered locally and flushed as an Arrow IPC batch through Gate to a Scribe. Scribe appends to its WAL, fsyncs, and acks (~1-5ms). The row becomes queryable after the next seal to Parquet (~1-5s typical).
+`insert` buffers rows locally; `flush` ships them as an Arrow IPC batch through Gate to a Scribe. Scribe appends to its WAL, fsyncs, and acks (~1-5ms). The row becomes queryable after the next seal to Parquet (~1-5s typical).
 
 ## 2. Query it back (SQL)
 
-Canonical SQL over the signal tables is the only read path. `POST /v1/bifrost/query` streams Arrow batches; the SDKs wrap it as `sql` (collect) and `stream` (iterate).
+Canonical SQL is the only read path. `POST /v1/query` streams Arrow batches; the SDKs wrap it as `sql` (collect) and `stream` (iterate).
 
 ```python
-result = await bifrost.sql(
-    "SELECT trace_id, name, duration_nano "
-    "FROM vala.traces.spans "
-    "WHERE service_name = 'my-service' "
-    "ORDER BY start_time_unix_nano DESC LIMIT 50"
-)
+rows = bifrost.sql("SELECT model, score FROM genai.predictions LIMIT 50").to_arrow()
 ```
 
-A whole trace is the same query narrowed to one id — each span row carries its own nested `events` and `links`:
+Traces use the same path. A whole trace is one query narrowed to one id — each span row carries its own nested `events` and `links`:
 
 ```sql
 SELECT * FROM vala.traces.spans WHERE trace_id = 'b7f3c1e2a4d5…'
@@ -61,14 +56,14 @@ FROM vala.traces.spans
 WHERE gen_ai_operation_name IN ('chat', 'generate_content', 'text_completion')
 ```
 
-Use `bifrost.describe("vala.traces.spans")` for the exact column list.
+Use `bifrost.describe_table("traces", "spans")` for the exact column list.
 
 ## What happens inside
 
-1. `vala-sdk` flushes the buffered spans as an Arrow IPC batch.
-2. **Gate** authenticates, resolves `DataTenantId` + `TableRef` for `vala.traces.spans`, validates the schema fingerprint, stamps `data_tenant_id` and `wyrd_event_time` and `wyrd_batch_id`, and dispatches to any Scribe.
-3. **Scribe** appends the batch to its WAL, fsyncs, acks. The rows accumulate in a memtable keyed by `(data_tenant_id, vala.traces.spans, event_day)` until a seal trigger fires (50k rows, 1s, 128 MiB, or 5s inactivity).
+1. `Bifrost.flush` ships the buffered rows as an Arrow IPC batch.
+2. **Gate** authenticates, resolves `DataTenantId` + `TableRef` for the target table, validates the schema fingerprint, stamps `data_tenant_id` and `wyrd_event_time` and `wyrd_batch_id`, and dispatches to any Scribe.
+3. **Scribe** appends the batch to its WAL, fsyncs, acks. The rows accumulate in a memtable keyed by `(data_tenant_id, table, event_day)` until a seal trigger fires (50k rows, 1s, 128 MiB, or 5s inactivity).
 4. **Scribe** seals: freeze memtable, encode Parquet, PUT to object store, atomic Postgres tx to insert into `vala.file_list` and append audit rows. The row is now visible to Oracle.
-5. The SQL query routes through Gate to Oracle. Oracle plans it with DataFusion against `vala.traces.spans`, and the `TenantPredicateRule` analyzer injects `data_tenant_id = $tenant` before execution.
+5. The SQL query routes through Gate to Oracle. Oracle plans it with DataFusion, and the `TenantPredicateRule` analyzer injects `data_tenant_id = $tenant` before execution.
 6. **Forge** runs asynchronously after ingest. It bin-packs small Parquet files from `vala.file_list`, commits an Iceberg snapshot, expires old snapshots, and removes unreferenced objects. Nothing in the read path changes.
 7. Results stream back as Arrow batches closed by a validated terminal frame. `sql` collects them; `stream` yields each batch as it arrives.

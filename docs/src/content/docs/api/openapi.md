@@ -12,6 +12,8 @@ The repository OpenAPI document is `openapi.yaml`. Its current title is `Wyrd AP
 
 ## Routes
 
+- `/v1/bifrost/tables`
+- `/v1/bifrost/tables/{namespace}/{name}`
 - `/v1/cards`
 - `/v1/cards/by-ref`
 - `/v1/cards/by-uid/{kind}/{card_uid}`

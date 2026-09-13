@@ -1,6 +1,6 @@
 ---
 title: Bifrost
-description: The Wyrd analytical warehouse. Apache Iceberg tables, DataFusion queries, and a typed read surface for all Vala observations.
+description: The Wyrd analytical warehouse. Apache Iceberg tables, DataFusion queries, and one canonical SQL read surface for all Vala observations.
 pillar: wyrd
 group: Bifrost
 order: 1
@@ -8,7 +8,7 @@ order: 1
 
 # Bifrost
 
-Bifrost is the Wyrd OLAP warehouse. It persists every Vala observation through a four-component architecture (Gate, Scribe, Oracle, Forge) and exposes them through a typed `ValaQueryService` read surface.
+Bifrost is the Wyrd OLAP warehouse. It persists every Vala observation through a four-component architecture (Gate, Scribe, Oracle, Forge) and exposes them through canonical SQL over `POST /v1/query`.
 
 ## Choose a path
 
@@ -31,14 +31,14 @@ Bifrost stores and queries all observability data for Wyrd:
 - **Real-time drift**: Data drift observations and series
 - **Dynamically defined user datasets**: High-volume writes for custom observability tables
 
-Observations written through `vala-sdk` are durably acknowledged via write-ahead log (WAL), sealed to Parquet files, and made queryable within seconds. Reads are served by DataFusion with query-time fusion across compacted Iceberg snapshots and fresh un-compacted data.
+Rows written through the `Bifrost` client are durably acknowledged via write-ahead log (WAL), sealed to Parquet files, and made queryable within seconds. Reads are served by DataFusion with query-time fusion across compacted Iceberg snapshots and fresh un-compacted data.
 
 Key properties:
 
 - **Typed tables.** Pre-declared `DomainTable` schemas define every column, type, and nullability at registration time. The schema fingerprint is stored and enforced. A write with a mismatched schema is rejected before durable commit.
 - **Tenant isolation.** Every row carries a server-stamped `data_tenant_id`. DataFusion's `TenantPredicateRule` analyzer injects a `data_tenant_id = $tenant` predicate into every scan. This predicate is non-removable; it is re-injected at the analysis stage of every plan execution.
 - **Payload governance.** Sensitive columns (span attributes, log body, GenAI messages, agent-trace payloads) are projected away at the plan stage unless the caller holds the matching payload read permission.
-- **Time-bounded scans.** Every typed query carries a `QueryWindow` with a default 7-day lookback when no bounds are supplied. Generic SQL queries over domain tables are also required to carry a time predicate.
+- **Time-bounded scans.** SQL queries over domain tables are required to carry a time predicate.
 
 ## Architecture
 
@@ -97,7 +97,7 @@ Scribe never writes Iceberg snapshots on the hot path. Forge is the only Iceberg
   title="Bifrost read path"
   participants={['Client', 'Gate', 'Oracle', 'Postgres', 'Object store', 'Scribe']}
   messages={[
-    { from: 'Client', to: 'Gate', label: 'query (typed method or SQL)' },
+    { from: 'Client', to: 'Gate', label: 'query (SQL)' },
     { from: 'Gate', to: 'Oracle', label: 'route: tenant + perms resolved' },
     { from: 'Oracle', to: 'Postgres', label: 'SELECT vala.file_list WHERE NOT compacted' },
     { from: 'Postgres', to: 'Oracle', label: 'un-compacted Parquet refs', dashed: true },
@@ -113,15 +113,15 @@ Scribe never writes Iceberg snapshots on the hot path. Forge is the only Iceberg
 
 Fresh data is visible within seal latency (~1-5s typical) even before Forge compacts it.
 
-## Where it fits vs. the generic observe surface
+## One read surface
 
-The `POST /v1/observations/query` endpoint accepts raw SQL against the same tables but runs through the same governance checks as typed routes (referenced-table permission, payload-column gate, tenant/time admission). The typed `ValaQueryService` methods are the preferred surface for agent and SDK clients. They produce structured row types with stable field names, enforce payload permissions column-by-column, and return signed page tokens for keyset pagination.
+`POST /v1/query` is the only observation-read contract. Every SQL query runs through the same governance checks (referenced-table permission, payload-column gate, tenant/time admission). SDKs expose it as `sql` and `stream`; agents reach it through the `bifrost.query` MCP tool.
 
 ## What's next
 
 - [Quickstart](./quickstart): emit and query an observation end-to-end
 - [Architecture](./architecture): `DomainTable`, system columns, audit data, schema fingerprinting
 - [Schema](./schema): the pre-declared tables and their physical schemas
-- [Writing data](./writing-data): `vala-sdk` producer, batching, governance
-- [Reading data](./reading-data): typed methods, pagination, permissions, generic SQL
+- [Writing data](./writing-data): `Bifrost` producer, batching, governance
+- [Reading data](./reading-data): SQL, streaming, lifecycle, permissions
 - [Data plane internals](./data-plane-internals): WAL and seal state machine, `vala.file_list`, Forge tick, audit data, database privilege model

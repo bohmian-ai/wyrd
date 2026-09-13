@@ -69,7 +69,7 @@ orphan GC protect live data, and how leases fence concurrent workers.
   title="Bifrost read flow"
   participants={['Client', 'Gate', 'Oracle', 'Postgres', 'Object store', 'Scribe']}
   messages={[
-    { from: 'Client', to: 'Gate', label: 'query (typed method or SQL)' },
+    { from: 'Client', to: 'Gate', label: 'query (SQL)' },
     { from: 'Gate', to: 'Oracle', label: 'route: tenant + perms resolved' },
     { from: 'Oracle', to: 'Postgres', label: 'SELECT vala.file_list WHERE NOT compacted' },
     { from: 'Postgres', to: 'Oracle', label: 'un-compacted Parquet refs', dashed: true },
@@ -83,7 +83,7 @@ orphan GC protect live data, and how leases fence concurrent workers.
   ]}
 />
 
-1. **Client** issues query via typed `ValaQueryService` method (e.g., `QueryTraces`, `QueryMetrics`) or generic SQL (`POST /v1/observations/query`).
+1. **Client** issues canonical SQL (`POST /v1/query`).
 2. **Gate** authenticates, resolves tenant + permissions, routes to any Oracle.
 3. **Oracle** builds DataFusion session with fused scan:
    - **IcebergTableScan** (compacted data, tenant-qualified and partition-pruned by `Day(event_time)`)

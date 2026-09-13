@@ -3,13 +3,16 @@ use std::sync::Arc;
 use vala_sql::queries::audit_staging::{
     append_audit, freeze_publication_range, list_publication_batch,
 };
+use vala_bifrost_redux::oracle::peer::PeerSecurityAudit;
 use wyrd_server::audit::publication::AuditPublisher;
+use wyrd_server::oracle::PostgresPeerSecurityAudit;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
-    AuditEvent, AuditOutcome, BifrostQueryRequest, FreshnessPolicy, VisibilityMode,
+    AuditEvent, AuditOutcome, BifrostQueryRequest, BifrostSecurityViolationKind, FreshnessPolicy,
+    VisibilityMode,
 };
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_testing::WyrdTestServer;
@@ -322,6 +325,65 @@ async fn a_stalled_tenant_does_not_block_another_tenants_history() -> Result<(),
     fence.commit().await?;
     await_retained(&server, stalled, &stalled_op, 1).await?;
     await_drained(&server, stalled).await?;
+
+    server.shutdown().await?;
+    Ok(())
+}
+
+/// Counts Scribe batch fences committed for retained audit under one tenant.
+///
+/// Oracle refuses nil-tenant reads, so system-owner retention is observed at
+/// the fence Scribe commits with every durable audit-log batch instead.
+///
+/// # Errors
+/// Returns the tenant-connection or query failure Postgres raised.
+async fn retained_audit_batches(
+    server: &WyrdTestServer,
+    tenant: DataTenantId,
+) -> Result<i64, ServerJourneyError> {
+    let mut conn = server.tenant_conn_for(tenant).await?;
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.scribe_batch_commits WHERE logical_table_fqn = $1",
+    )
+    .bind(AUDIT_LOG)
+    .fetch_one(&mut **conn.transaction())
+    .await?;
+    conn.commit().await?;
+    Ok(count)
+}
+
+/// A system-owner security rejection reaches retained history exactly once.
+///
+/// Unverified peer and tail rejections cannot name a tenant, so they stage
+/// under `DataTenantId::SYSTEM_OWNER`. The server's own publisher must still
+/// move them into `vala.system.audit_log` and drain system staging; before the
+/// audit-only nil exception they stayed staged forever. The journey drains any
+/// boot-time system rows, appends one rejection through the production peer
+/// audit writer, and requires exactly one new retained batch and empty staging.
+///
+/// # Errors
+/// Returns the server, Postgres, peer-audit, or publication failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn system_owner_security_rejections_retain_once() -> Result<(), ServerJourneyError> {
+    let server = WyrdTestServer::start_bound().await?;
+    let system = DataTenantId::SYSTEM_OWNER;
+    await_drained(&server, system).await?;
+    let before = retained_audit_batches(&server, system).await?;
+
+    PostgresPeerSecurityAudit::try_new(&server.state().postgres)
+        .await
+        .map_err(|_| "the booted server carries the exact system sentinel")?
+        .append_unverified_ticket_rejection(BifrostSecurityViolationKind::PeerUnknownKey)
+        .await
+        .map_err(|_| "the system-owner rejection commits to staging")?;
+
+    await_drained(&server, system).await?;
+    assert_eq!(
+        retained_audit_batches(&server, system).await?,
+        before + 1,
+        "the system-owner rejection must retain in exactly one batch"
+    );
 
     server.shutdown().await?;
     Ok(())

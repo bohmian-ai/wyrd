@@ -286,14 +286,14 @@ async fn issue_key(
     .map_err(WyrdErrorResponse::from)?;
 
     let tenant = caller.principal().tenant_id;
+    crate::audit::record_audit(state.postgres.vala_pool(), tenant, &decision)
+        .await
+        .map_err(WyrdErrorResponse::from)?;
     let mut conn = state
         .postgres
         .tenant_conn(tenant)
         .await
         .map_err(sql_error)?;
-    crate::audit::append_on(&mut conn, &decision)
-        .await
-        .map_err(WyrdErrorResponse::from)?;
     let service = IssueApiKey::default();
     let issued = service
         .execute(&mut conn, request, caller.principal())

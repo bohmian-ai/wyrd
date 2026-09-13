@@ -332,10 +332,10 @@ async fn delete_trusted_issuer_route(
     .await
     .map_err(WyrdErrorResponse::from)?;
 
-    let mut conn = acquire_conn(&state, &caller).await?;
-    audit::append_on(&mut conn, &decision)
+    audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, &decision)
         .await
         .map_err(WyrdErrorResponse::from)?;
+    let mut conn = acquire_conn(&state, &caller).await?;
 
     // --cascade removes the referencing bindings first so the issuer delete is
     // not blocked by the FK ON DELETE RESTRICT. Without it, a live binding makes
@@ -350,10 +350,6 @@ async fn delete_trusted_issuer_route(
         .await
         .map_err(map_write_error)?;
     if removed == 0 {
-        // The decision row is already staged on this transaction, so commit it
-        // before reporting the miss: the verdict happened even though the
-        // addressed issuer did not exist.
-        conn.commit().await.map_err(sql_unavailable)?;
         return Err(issuer_not_found(&issuer));
     }
     conn.commit().await.map_err(sql_unavailable)?;
@@ -399,10 +395,10 @@ async fn create_workload_binding(
     };
     let write = binding_write_from_binding(&binding).map_err(internal_error)?;
 
-    let mut conn = acquire_conn(&state, &caller).await?;
-    audit::append_on(&mut conn, &decision)
+    audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, &decision)
         .await
         .map_err(WyrdErrorResponse::from)?;
+    let mut conn = acquire_conn(&state, &caller).await?;
     insert_workload_binding(&mut conn, &write)
         .await
         .map_err(|error| map_binding_write_error(error, &binding.issuer))?;
@@ -469,18 +465,14 @@ async fn delete_workload_binding_route(
     .await
     .map_err(WyrdErrorResponse::from)?;
 
-    let mut conn = acquire_conn(&state, &caller).await?;
-    audit::append_on(&mut conn, &decision)
+    audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, &decision)
         .await
         .map_err(WyrdErrorResponse::from)?;
+    let mut conn = acquire_conn(&state, &caller).await?;
     let removed = delete_workload_binding(&mut conn, &issuer, &query.subject)
         .await
         .map_err(map_write_error)?;
     if removed == 0 {
-        // The decision row is already staged on this transaction, so commit it
-        // before reporting the miss: the verdict happened even though the
-        // addressed binding did not exist.
-        conn.commit().await.map_err(sql_unavailable)?;
         return Err(binding_not_found(&issuer, &query.subject));
     }
     conn.commit().await.map_err(sql_unavailable)?;

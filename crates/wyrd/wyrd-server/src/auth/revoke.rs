@@ -17,9 +17,9 @@ use wyrd_sql::TenantConn;
 /// Revoke one principal's outstanding tokens under the caller's tenant.
 ///
 /// Revocation is an administrative authorization boundary: the
-/// `service_accounts:write` verdict is audited for both outcomes, and the
-/// allowed row commits in the same transaction as the `tokens_not_before` bump
-/// so the decision and its effect are durable together.
+/// `service_accounts:write` verdict is audited for both outcomes. The allowed
+/// row commits on its own before the `tokens_not_before` bump, so the decision
+/// stays durable even when the revocation fails.
 ///
 /// # Errors
 /// Returns [`WyrdError::PermissionDeniedRbac`] when the caller lacks
@@ -43,10 +43,10 @@ pub async fn revoke_principal(
     .await
     .map_err(WyrdErrorResponse::from)?;
 
-    let mut conn = acquire_conn(&state, tenant).await?;
-    audit::append_on(&mut conn, &decision)
+    audit::record_audit(state.postgres.vala_pool(), tenant, &decision)
         .await
         .map_err(WyrdErrorResponse::from)?;
+    let mut conn = acquire_conn(&state, tenant).await?;
     let kind = revoke_principal_in_conn(&mut conn, target_id, tenant)
         .await
         .map_err(WyrdErrorResponse::from)?;

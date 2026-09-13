@@ -35,7 +35,8 @@ Route directly to `$wyrd-implement`. Recommendations are the validated `ponytail
 - **Current behavior:** the bound constant (`crates/wyrd/wyrd-server/src/audit/publication.rs:55`, used at `:164`) has no executable proof. R2 deleted the disconnected unit test; the only journey (`a_stalled_tenant_does_not_block_another_tenants_history`) uses two tenants. The journey doc (`crates/wyrd/wyrd-testing/tests/bifrost/server/audit_publication.rs:296-298`) says the ceiling is unproven, and the R2 evidence (`TASK-001-R2...md:276`) calls this "human-approved", but no approval is recorded anywhere.
 - **Why the stated blocker is wrong:** the publisher uses the Vala pool (default 16, `WYRD_DB_MAX_CONNECTIONS_VALA`); the tenant directory uses `OperatorPool`; `WYRD_DB_MAX_CONNECTIONS` (defaulted to 8 by `with-test-postgres.sh`, overridable) only caps the app pool the test's locks would come from; each `WyrdTestServer` has its own ephemeral database.
 - **Consequence:** changing the constant or making the sweep unbounded passes every test.
-- **Correction:** add one sibling journey case in the existing `audit_publication.rs`. Create 9 tenants with pending decisions. Hold row locks on the audit chain heads of the 8 tenants that sort first in `list_active_tenant_ids`, obtained through `tenant_conn_for` (raise the lane's `WYRD_DB_MAX_CONNECTIONS` for the run if needed, or take them on the Vala pool). Assert the 9th tenant is not retained while the 8 locks are held, then release and assert all 9 retain once and staging drains. Remove the "unproven" doc sentence and the deviation claim from the task record. No new seam, knob, config, or test file.
+- **Reviewer's proposed correction:** a 9-tenant sibling journey holding 8 chain-head locks, asserting the 9th tenant is not retained until release.
+- **Human decision (Steven Forrester, 2026-09-13): not required.** The ceiling proof is rejected as overkill. The value 8 is a resource bound, not a correctness property: gapless chains, frozen-range replay, and batch-id dedup hold at any concurrency, and the existing two-tenant journey proves a stalled tenant does not block another. The constant stays unproven by test, and the journey doc says so honestly. No code change for this item. A future change to the bound needs no new test unless it alters publication semantics.
 
 ### 2. Make required journey lanes deterministic (`FIND-TASK-001-R1-6` a)
 
@@ -79,7 +80,7 @@ Route directly to `$wyrd-implement`. Recommendations are the validated `ponytail
 
 | Criterion | Finding |
 |---|---|
-| A journey fails when more than the fixed number of tenants publish concurrently and passes at the constant; no approval/unproven claim remains | R1-5 |
+| Human decision to leave the concurrency bound unproven is recorded in this task (§1) | R1-5 |
 | MCP delegated-query audit test asserts retained `audit.audit_log`, not staging; `journey:mcp` and `journey:server` green three consecutive runs | R1-6 (a) |
 | TASK-002 records `662bf33bc` as landed and unverified; no TASK-001 record claims it | R1-6 (b) |
 | `append_registration_audit` uses bare `TenantConn` via `vala_sql`; the three Card handlers have audit rustdoc and `# Errors` | R1-7 |
@@ -89,7 +90,7 @@ Route directly to `$wyrd-implement`. Recommendations are the validated `ponytail
 
 Confirm exact names with `mise exec -- cargo nextest list`. Run Postgres tests one at a time.
 
-1. `WYRD_REG_E2E=1 scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test server -P journey --run-ignored=all -E 'test(=audit_publication::<new ceiling case>) | test(=audit_publication::a_stalled_tenant_does_not_block_another_tenants_history)'"`; record a local, uncommitted run with the constant set to 9 showing the new case fails.
+1. `WYRD_REG_E2E=1 scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test server -P journey --run-ignored=all -E 'test(=audit_publication::a_stalled_tenant_does_not_block_another_tenants_history)'"` (no ceiling case; see §1 decision).
 2. `mise run test:bifrost:journey:mcp` and `mise run test:bifrost:journey:server`, three consecutive runs each, with counts.
 3. `git grep 662bf33bc -- changes/active/surfaces-oracle-integration/tasks/TASK-002-converge-client-and-sdks.md`; `python3 scripts/postgres/check-inventory.py`.
 4. `mise exec -- cargo clippy --locked -p vala-bifrost-redux --all-targets --all-features -- -D warnings`.

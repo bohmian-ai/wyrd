@@ -1,7 +1,7 @@
 ---
 id: TASK-001
 kind: implementation
-status: review
+status: approved
 spec: SPEC-surfaces-oracle-integration
 spec_revision: 7
 requirements: [REQ-001, REQ-002, REQ-003, REQ-010, REQ-011, REQ-012, REQ-013, REQ-014, REQ-015, REQ-026, REQ-026A, REQ-026B, REQ-027, REQ-027A, REQ-027B, REQ-027C, REQ-028, REQ-029, REQ-030, REQ-030A, REQ-048, REQ-049, REQ-050, REQ-051, REQ-052, REQ-053, REQ-053A, REQ-054, REQ-062, REQ-063, INV-002, INV-003, INV-007, INV-008, INV-008A, INV-008B, INV-008C, INV-008D, INV-009, INV-017, INV-018, INV-019, INV-020, INV-021, INV-023, AC-005, AC-006, AC-011, AC-012, AC-013, AC-014, AC-015, AC-016, AC-017, AC-020]
@@ -358,3 +358,5 @@ change's merge work completes.
   test that drives every pass without pinning an owner still receives a boot
   pass it must remember to settle. The branch is test-support-only and
   production is unconditional, so this is flagged rather than changed.
+
+Approved by human decision (Steven Forrester, 2026-09-13) at `0f196e56e`.

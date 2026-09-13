@@ -9,6 +9,84 @@ info:
     name: Apache-2.0
   version: 0.0.1
 paths:
+  /v1/bifrost/tables:
+    get:
+      tags:
+      - Bifrost
+      summary: Lists the schema-free table entries the authenticated tenant may name.
+      description: |-
+        # Errors
+
+        Returns structured authorization or catalog-availability errors from the
+        catalog service.
+      operationId: list
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/BifrostTableEntry'
+    post:
+      tags:
+      - Bifrost
+      summary: |-
+        Registers one Bifrost table for the authenticated tenant, or matches an
+        existing table with the same schema fingerprint.
+      description: |-
+        # Errors
+
+        Returns structured validation, authorization, fingerprint-conflict, or
+        catalog-availability errors from the catalog service.
+      operationId: register
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterTableRequest'
+        required: true
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegisterTableResponse'
+  /v1/bifrost/tables/{namespace}/{name}:
+    get:
+      tags:
+      - Bifrost
+      summary: Describes one visible table with its stored user and managed columns.
+      description: |-
+        # Errors
+
+        Returns structured validation, authorization, not-found, or
+        catalog-availability errors from the catalog service.
+      operationId: describe
+      parameters:
+      - name: namespace
+        in: path
+        description: Table namespace
+        required: true
+        schema:
+          type: string
+      - name: name
+        in: path
+        description: Table name
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: ''
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BifrostTableDescription'
+        '404':
+          description: No visible table
   /v1/cards:
     get:
       tags:
@@ -836,6 +914,105 @@ components:
         visibility:
           $ref: '#/components/schemas/VisibilityMode'
           description: Visibility tiers requested by the caller.
+    BifrostTableDescription:
+      type: object
+      description: Per-table describe response — the lightweight entry plus the stored schema.
+      required:
+      - entry
+      - user_fields
+      - correlation_fields
+      - managed_candidates
+      - physical_layout
+      properties:
+        canonical_physical_fingerprint:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Lower-case 64-character hex of the complete canonical physical
+            fingerprint, present only for a canonical `OTel` signal built-in.
+
+            [`BifrostTableEntry::fingerprint`] keeps its user-schema meaning for
+            every table; this is the separate whole-physical-schema identity, and it
+            is omitted for a dynamically registered table.
+        correlation_fields:
+          type: array
+          items:
+            $ref: '#/components/schemas/FieldSpec'
+          description: |-
+            The correlation inputs a writer supplies alongside its user fields.
+
+            Exactly nullable `card_ref: Utf8` — a Gate input tagged
+            [`INPUT_CLASS_KEY`]`=`[`INPUT_CLASS_GATE_CORRELATION`] that resolves to
+            the stored `card_uid` and therefore carries no field id — followed by
+            nullable `run_id: Utf8` with the field id its physical column holds.
+
+            Card correlation is optional, so a writer may omit `card_ref` entirely;
+            the server then stores the row with its authenticated `principal_id` and
+            a null `card_uid`.
+        entry:
+          $ref: '#/components/schemas/BifrostTableEntry'
+          description: The same lightweight entry returned by the list route.
+        managed_candidates:
+          type: array
+          items:
+            $ref: '#/components/schemas/FieldSpec'
+          description: |-
+            Managed columns a writer may supply itself rather than let the server
+            stamp: non-null `wyrd_event_time: Timestamp(Microsecond, UTC)`.
+        physical_layout:
+          $ref: '#/components/schemas/PhysicalLayoutWire'
+          description: The server-resolved canonical physical layout, fully populated.
+        user_fields:
+          type: array
+          items:
+            $ref: '#/components/schemas/FieldSpec'
+          description: |-
+            The table's own declared columns, in stored order.
+
+            Server-owned correlation and managed columns are not here; they are
+            reported separately so a writer can tell what it declares from what the
+            server appends.
+    BifrostTableEntry:
+      type: object
+      description: |-
+        Lightweight table listing entry — one row of the list-tables response.
+
+        Schema-free by design (review M-04): the stored schema is carried only by the
+        per-table describe contract, [`BifrostTableDescription`], so the list stays
+        small.
+      required:
+      - namespace
+      - name
+      - table_uid
+      - status
+      - fingerprint
+      - registered_at
+      - updated_at
+      properties:
+        fingerprint:
+          type: string
+          description: Lower-case hex of the 32-byte user-schema fingerprint.
+        name:
+          type: string
+          description: Name component of the fully-qualified name (`<ns>.<name>` → name).
+        namespace:
+          type: string
+          description: Namespace component of the fully-qualified name (`<ns>.<name>` → ns).
+        registered_at:
+          type: string
+          format: date-time
+          description: Wall-clock registration time.
+        status:
+          $ref: '#/components/schemas/TableStatus'
+          description: Lifecycle status.
+        table_uid:
+          type: string
+          description: Lower-case hex of the 16-byte table uid.
+        updated_at:
+          type: string
+          format: date-time
+          description: Wall-clock last-update time.
     CancelRunningQueryResponse:
       type: object
       description: Idempotent cancellation result for one active Oracle query.
@@ -1195,6 +1372,195 @@ components:
             $ref: '#/components/schemas/ColumnName'
           description: Target columns for supervised workflows.
       additionalProperties: false
+    DataTypeSpec:
+      oneOf:
+      - type: string
+        description: Boolean.
+        enum:
+        - Bool
+      - type: string
+        description: Signed 8-bit integer.
+        enum:
+        - Int8
+      - type: string
+        description: Signed 16-bit integer.
+        enum:
+        - Int16
+      - type: string
+        description: Signed 32-bit integer.
+        enum:
+        - Int32
+      - type: string
+        description: Signed 64-bit integer.
+        enum:
+        - Int64
+      - type: string
+        description: Unsigned 8-bit integer.
+        enum:
+        - UInt8
+      - type: string
+        description: Unsigned 16-bit integer.
+        enum:
+        - UInt16
+      - type: string
+        description: Unsigned 32-bit integer.
+        enum:
+        - UInt32
+      - type: string
+        description: Unsigned 64-bit integer.
+        enum:
+        - UInt64
+      - type: string
+        description: 32-bit float.
+        enum:
+        - Float32
+      - type: string
+        description: 64-bit float.
+        enum:
+        - Float64
+      - type: string
+        description: UTF-8 string.
+        enum:
+        - Utf8
+      - type: string
+        description: Large UTF-8 string.
+        enum:
+        - LargeUtf8
+      - type: string
+        description: Variable-length binary.
+        enum:
+        - Binary
+      - type: string
+        description: Large variable-length binary.
+        enum:
+        - LargeBinary
+      - type: object
+        description: Fixed-width binary.
+        required:
+        - FixedSizeBinary
+        properties:
+          FixedSizeBinary:
+            type: object
+            description: Fixed-width binary.
+            required:
+            - len
+            properties:
+              len:
+                type: integer
+                format: int32
+                description: Byte width.
+      - type: string
+        description: 32-bit date (days since epoch).
+        enum:
+        - Date32
+      - type: string
+        description: 64-bit date (milliseconds since epoch).
+        enum:
+        - Date64
+      - type: object
+        description: Timestamp with explicit precision and optional timezone.
+        required:
+        - Timestamp
+        properties:
+          Timestamp:
+            type: object
+            description: Timestamp with explicit precision and optional timezone.
+            required:
+            - unit
+            properties:
+              tz:
+                type:
+                - string
+                - 'null'
+                description: IANA timezone string, or `None` for timezone-naive.
+              unit:
+                $ref: '#/components/schemas/TimeUnit'
+                description: Precision.
+      - type: object
+        description: Time-of-day at second/millisecond precision.
+        required:
+        - Time32
+        properties:
+          Time32:
+            type: object
+            description: Time-of-day at second/millisecond precision.
+            required:
+            - unit
+            properties:
+              unit:
+                $ref: '#/components/schemas/TimeUnit'
+                description: Precision.
+      - type: object
+        description: Time-of-day at microsecond/nanosecond precision.
+        required:
+        - Time64
+        properties:
+          Time64:
+            type: object
+            description: Time-of-day at microsecond/nanosecond precision.
+            required:
+            - unit
+            properties:
+              unit:
+                $ref: '#/components/schemas/TimeUnit'
+                description: Precision.
+      - type: object
+        description: 128-bit fixed-point decimal.
+        required:
+        - Decimal128
+        properties:
+          Decimal128:
+            type: object
+            description: 128-bit fixed-point decimal.
+            required:
+            - precision
+            - scale
+            properties:
+              precision:
+                type: integer
+                format: int32
+                description: Total number of digits.
+                minimum: 0
+              scale:
+                type: integer
+                format: int32
+                description: Number of fractional digits.
+      - type: object
+        description: |-
+          Variable-length list whose boxed element declaration carries the child's
+          name, nullability, metadata, and stable field id.
+
+          The element is a full [`FieldSpec`] rather than a bare type so a nested
+          child keeps the same identity the physical schema stores; a client that
+          rebuilds an Arrow schema from a description reproduces the stored list
+          child exactly instead of inventing a nullable `item`.
+        required:
+        - List
+        properties:
+          List:
+            $ref: '#/components/schemas/FieldSpec'
+            description: |-
+              Variable-length list whose boxed element declaration carries the child's
+              name, nullability, metadata, and stable field id.
+
+              The element is a full [`FieldSpec`] rather than a bare type so a nested
+              child keeps the same identity the physical schema stores; a client that
+              rebuilds an Arrow schema from a description reproduces the stored list
+              child exactly instead of inventing a nullable `item`.
+      - type: object
+        description: Nested struct of named fields.
+        required:
+        - Struct
+        properties:
+          Struct:
+            type: array
+            items:
+              $ref: '#/components/schemas/FieldSpec'
+            description: Nested struct of named fields.
+      description: |-
+        Arrow-free logical column type. The exhaustive set Bifrost accepts on the
+        register path; the `DataTypeSpec ↔ arrow::DataType` conversion lives in the
+        server/engine, never in `wyrd-spec`.
     DeleteCardResponse:
       type: object
       description: Soft-delete response.
@@ -1365,6 +1731,36 @@ components:
           items:
             $ref: '#/components/schemas/Ref'
           description: Primary target Cards.
+    FieldSpec:
+      type: object
+      description: |-
+        Arrow-free field declaration. Follows the `card::field::FieldSpec` precedent
+        but carries a typed [`DataTypeSpec`] instead of a loose dtype string.
+      required:
+      - name
+      - data_type
+      properties:
+        data_type:
+          $ref: '#/components/schemas/DataTypeSpec'
+          description: Logical column type.
+        metadata:
+          type: object
+          description: |-
+            String metadata carried verbatim through every schema conversion.
+
+            Two keys are meaningful to Bifrost: [`PARQUET_FIELD_ID_KEY`] holds the
+            stored stable field id as decimal text, and [`INPUT_CLASS_KEY`] marks a
+            declaration that is a write-time input rather than a stored column.
+          additionalProperties:
+            type: string
+          propertyNames:
+            type: string
+        name:
+          type: string
+          description: Column name.
+        nullable:
+          type: boolean
+          description: Whether the column is nullable. Defaults to `true`.
     FreshnessPolicy:
       type: string
       description: Behavior when a requested live source cannot complete.
@@ -1594,6 +1990,12 @@ components:
           $ref: '#/components/schemas/TaskType'
           description: Closed Wyrd ML task taxonomy.
       additionalProperties: false
+    NullOrderWire:
+      type: string
+      description: Null placement of one declared physical sort key.
+      enum:
+      - first
+      - last
     OperatorSpec:
       type: object
       description: A server-owned side-effect template.
@@ -1639,6 +2041,41 @@ components:
         repo:
           type: string
           description: Normalized repository identifier, e.g. `github.com/org/repo`.
+    PhysicalLayoutWire:
+      type: object
+      description: |-
+        The authoritative physical layout of one Bifrost table.
+
+        The same shape is used three ways: as the optional declaration on
+        [`RegisterTableRequest`], as the canonical server-resolved layout returned by
+        [`BifrostTableDescription`], and as the exact JSON persisted in the control
+        row. In the latter two it is always fully populated: the sort order carries
+        at least one key and the Bloom list begins with the schema-present managed
+        floor.
+
+        The partition itself is system-owned. Every table is partitioned on
+        `wyrd_event_time`, so the declaration carries only the granularity and no
+        wire field names a partition column.
+
+        On the request path an omitted `sort_keys` and an explicit empty `sort_keys`
+        resolve identically, because the server injects nothing ahead of a declared
+        key and defaults an empty order to `wyrd_event_time` descending.
+      required:
+      - partition_granularity
+      properties:
+        bloom_columns:
+          type: array
+          items:
+            type: string
+          description: Ordered Bloom-filtered columns.
+        partition_granularity:
+          $ref: '#/components/schemas/TimeGranularityWire'
+          description: Required partition granularity on the managed `wyrd_event_time` column.
+        sort_keys:
+          type: array
+          items:
+            $ref: '#/components/schemas/SortKeyWire'
+          description: Ordered sort keys; at most four may be declared.
     PolicySpec:
       type: object
       description: Declarative policy rule set.
@@ -1684,6 +2121,60 @@ components:
       enum:
       - interactive
       - analytical
+    RegisterOutcome:
+      type: string
+      description: Whether a register call created a new table or matched an existing one.
+      enum:
+      - Created
+      - AlreadyExists
+    RegisterTableRequest:
+      type: object
+      description: Register (create) a Bifrost table.
+      required:
+      - namespace
+      - name
+      - fields
+      properties:
+        fields:
+          type: array
+          items:
+            $ref: '#/components/schemas/FieldSpec'
+          description: User fields only; `wyrd_*`/`card_ref`/`run_id` reserved names are rejected.
+        name:
+          type: string
+          description: Table name.
+        namespace:
+          type: string
+          description: Target namespace.
+        physical_layout:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/PhysicalLayoutWire'
+            description: |-
+              Optional physical layout declaration.
+
+              Omitting the field entirely resolves to `hour(wyrd_event_time)`,
+              `wyrd_event_time` descending nulls-last, and the managed Bloom floor.
+              Supplying the object requires `partition_granularity`; within it, an
+              explicit empty `sort_keys` resolves exactly as an omitted one does, and
+              an explicit empty `bloom_columns` means "managed floor only".
+    RegisterTableResponse:
+      type: object
+      description: Response to a register call.
+      required:
+      - outcome
+      - table_uid
+      - fingerprint
+      properties:
+        fingerprint:
+          type: string
+          description: Server-authoritative lower-case hex of the 32-byte schema fingerprint.
+        outcome:
+          $ref: '#/components/schemas/RegisterOutcome'
+          description: Whether the table was created or already existed.
+        table_uid:
+          type: string
+          description: Lower-case hex of the 16-byte table uid.
     RegistrationOutcomeKind:
       type: string
       description: Result of a registration write.
@@ -1859,6 +2350,29 @@ components:
           - 'null'
           description: Service type.
       additionalProperties: false
+    SortDirectionWire:
+      type: string
+      description: Sort direction of one declared physical sort key.
+      enum:
+      - asc
+      - desc
+    SortKeyWire:
+      type: object
+      description: One declared physical sort key.
+      required:
+      - column
+      - direction
+      - null_order
+      properties:
+        column:
+          type: string
+          description: Sorted column; must exist in the complete physical schema.
+        direction:
+          $ref: '#/components/schemas/SortDirectionWire'
+          description: Sort direction.
+        null_order:
+          $ref: '#/components/schemas/NullOrderWire'
+          description: Null placement.
     SourceSpec:
       type: object
       description: Read-side reference to an external data system. Wyrd reads, never writes.
@@ -2469,6 +2983,31 @@ components:
           format: int64
           description: Stored byte length.
       additionalProperties: false
+    TableStatus:
+      type: string
+      description: Lifecycle status of a registered Bifrost table.
+      enum:
+      - Active
+      - Deprecated
+      - Quarantined
+    TimeGranularityWire:
+      type: string
+      description: |-
+        Time-partition granularity on the wire.
+
+        Bifrost v1 partitions every table on `wyrd_event_time` and admits exactly
+        these two Iceberg-native transforms; nothing else is representable.
+      enum:
+      - hour
+      - day
+    TimeUnit:
+      type: string
+      description: Timestamp / time precision. Arrow-free mirror of `arrow::datatypes::TimeUnit`.
+      enum:
+      - Second
+      - Millisecond
+      - Microsecond
+      - Nanosecond
     TriggerSpec:
       type: object
       description: Declarative schedule and optional observation source for an Operator.

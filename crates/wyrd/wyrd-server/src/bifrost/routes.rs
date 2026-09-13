@@ -19,7 +19,21 @@ pub fn router() -> Router<AppState> {
         .route("/bifrost/tables/{namespace}/{name}", get(describe))
 }
 
-async fn register(
+#[utoipa::path(
+    post,
+    path = "/v1/bifrost/tables",
+    request_body = RegisterTableRequest,
+    responses((status = 200, body = RegisterTableResponse)),
+    tag = "Bifrost"
+)]
+/// Registers one Bifrost table for the authenticated tenant, or matches an
+/// existing table with the same schema fingerprint.
+///
+/// # Errors
+///
+/// Returns structured validation, authorization, fingerprint-conflict, or
+/// catalog-availability errors from the catalog service.
+pub(crate) async fn register(
     State(state): State<AppState>,
     caller: Caller,
     Json(body): Json<RegisterTableRequest>,
@@ -30,7 +44,19 @@ async fn register(
         .map_err(WyrdErrorResponse::from)
 }
 
-async fn list(
+#[utoipa::path(
+    get,
+    path = "/v1/bifrost/tables",
+    responses((status = 200, body = Vec<BifrostTableEntry>)),
+    tag = "Bifrost"
+)]
+/// Lists the schema-free table entries the authenticated tenant may name.
+///
+/// # Errors
+///
+/// Returns structured authorization or catalog-availability errors from the
+/// catalog service.
+pub(crate) async fn list(
     State(state): State<AppState>,
     caller: Caller,
 ) -> Result<Json<Vec<BifrostTableEntry>>, WyrdErrorResponse> {
@@ -40,7 +66,23 @@ async fn list(
         .map_err(WyrdErrorResponse::from)
 }
 
-async fn describe(
+#[utoipa::path(
+    get,
+    path = "/v1/bifrost/tables/{namespace}/{name}",
+    params(
+        ("namespace" = String, Path, description = "Table namespace"),
+        ("name" = String, Path, description = "Table name")
+    ),
+    responses((status = 200, body = BifrostTableDescription), (status = 404, description = "No visible table")),
+    tag = "Bifrost"
+)]
+/// Describes one visible table with its stored user and managed columns.
+///
+/// # Errors
+///
+/// Returns structured validation, authorization, not-found, or
+/// catalog-availability errors from the catalog service.
+pub(crate) async fn describe(
     State(state): State<AppState>,
     caller: Caller,
     Path((namespace, name)): Path<(String, String)>,

@@ -226,8 +226,12 @@ pub enum DataTypeSpec {
     /// child keeps the same identity the physical schema stores; a client that
     /// rebuilds an Arrow schema from a description reproduces the stored list
     /// child exactly instead of inventing a nullable `item`.
+    // `no_recursion` stops OpenAPI schema collection from re-entering
+    // `FieldSpec`; both variants still reference it by name.
+    #[cfg_attr(feature = "server", schema(no_recursion))]
     List(Box<FieldSpec>),
     /// Nested struct of named fields.
+    #[cfg_attr(feature = "server", schema(no_recursion))]
     Struct(Vec<FieldSpec>),
 }
 

@@ -23,6 +23,9 @@ use wyrd_spec::vala::api::{
         crate::components::storage::routes::download_init,
         crate::components::cards::routes::delete_card_http,
         crate::components::cards::routes::delete_card_by_ref_http,
+        crate::bifrost::routes::register,
+        crate::bifrost::routes::list,
+        crate::bifrost::routes::describe,
         crate::query::routes::sync_query,
         crate::query::routes::list_running_queries,
         crate::query::routes::get_running_query,
@@ -61,6 +64,8 @@ mod tests {
             "/v1/cards/{kind}/{space}/{name}/versions",
             "/v1/cards/{card_uid}/artifacts",
             "/v1/cards/download/init",
+            "/v1/bifrost/tables",
+            "/v1/bifrost/tables/{namespace}/{name}",
         ] {
             assert!(document.paths.paths.contains_key(path), "missing {path}");
         }

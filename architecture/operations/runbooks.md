@@ -50,7 +50,7 @@ accepts the identified exposure window. Otherwise remain fenced.
 ### Contain and select a cut
 
 1. Fence all writes and background publication. Preserve database WAL, object
-   versions, Scribe volumes, and audit WALs.
+   versions, and Scribe volumes.
 2. Select one database recovery point and object-store version cut that can be
    reconciled without inventing catalog state. Record the intended RPO/RTO
    evaluation before mutation.
@@ -108,17 +108,15 @@ capacity is healthy, and append/replay/live-tail journeys pass. Missing
 acknowledged authority, contradictory lineage, tenant mismatch, or corrupt
 non-tail WAL is a no-go and invokes full restore or incident escalation.
 
-## Oracle audit-WAL or peer failure
+## Oracle audit commit or peer failure
 
-### Audit-WAL path
+### Audit commit path
 
-1. Remove Oracle readiness before the acceptance WAL reaches its configured
-   backlog or durability limit; do not return rows without a successful fsync.
-2. Verify CRC frames, sequence/relay identity, tenant binding, and the last
-   canonical audit-staging acknowledgement.
-3. Relay valid frames at least once and prove duplicates converge under the
-   canonical audit writer. Preserve a corrupt frame and its surrounding bytes
-   as evidence; never skip it to regain readiness.
+1. A rising `oracle_audit_commit_failures_total` means read decisions are not
+   reaching `vala.audit_staging`. Restore Postgres or tenant connection
+   capacity; the logged error names the tenant.
+2. Read decisions that failed to commit are not replayed. Record the window
+   from the failure logs as an audit gap.
 
 ### Peer path
 

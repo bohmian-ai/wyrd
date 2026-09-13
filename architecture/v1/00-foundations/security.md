@@ -67,7 +67,7 @@ backoff; permission denial is `WYRD_PERMISSION_403_DENIED_RBAC`.
 ## Security contract
 
 Production composition supplies a real permission resolver, policy decision
-point, canonical audit writer, and Oracle audit relay. Permit-all, no-op,
+point, and canonical audit writer. Permit-all, no-op,
 in-memory, and test substitutes cannot satisfy production readiness.
 
 Mesh `ext_authz` uses the same `X-Wyrd-Access-Token` contract; no additional

@@ -30,13 +30,12 @@ Required execution skill: `$wyrd-implement`.
 - `build_bifrost_external_dependencies` already treats the Scribe WAL path as
   a common base and derives Scribe stage/output scratch, Oracle spill, and
   Forge spill beneath it.
-- `OracleRuntimeConfig::audit_wal_root` independently crosses into
-  `OracleAuditWalConfig`; production validation requires it, while development
-  silently falls back to a process-specific system temporary directory.
+- Oracle keeps no local audit state; its read decisions commit to the audit
+  staging outbox (human decision, Steven Forrester, 2026-09-13).
 - Scribe stable identity is stored beside the current WAL root and must remain
   attached to the same durable volume.
 - `WyrdTestServerBuilder::with_bifrost_roots` and process-cluster fixtures
-  currently model WAL, spill, and Oracle audit roots independently.
+  currently model WAL and spill roots independently.
 - Checked-in Kubernetes manifests and their semantic checker use obsolete
   `WYRD_ROLES`; the role-separated Oracle example mounts `emptyDir` at
   `WYRD_SCRIBE_WAL_DIR`, and the mixed example provides no durable mount.
@@ -48,7 +47,7 @@ Required execution skill: `$wyrd-implement`.
 - A new private, state-bearing `BifrostLocalRoots` in `wyrd-server` boot owns
   child derivation, directory creation, and the invariant that every path is
   beneath one root. It is not a generic filesystem abstraction.
-- Existing Scribe, Oracle audit, Oracle spill, and Forge owners keep their
+- Existing Scribe, Oracle spill, and Forge owners keep their
   formats, accounting, cleanup, and recovery behavior; they consume derived
   paths only.
 - `wyrd-testing` owns local/process-cluster root injection and the semantic
@@ -66,25 +65,20 @@ settings as aliases or add additional root knobs.
 Add `data_dir: PathBuf` to `BifrostRuntimeConfig`, with a serde default of
 `.wyrd/bifrost`. `WyrdServerConfig::apply_env_overrides` applies the sole
 `WYRD_BIFROST_DATA_DIR` override through the existing non-empty environment
-validation. Remove `OracleRuntimeConfig::audit_wal_root`, its default, its
-production-presence validation, and its projection into the Oracle WAL
-configuration. Remove every direct read of `WYRD_SCRIBE_WAL_DIR`.
+validation. Remove every direct read of `WYRD_SCRIBE_WAL_DIR`.
 
 Add one private `BifrostLocalRoots` owner constructed from
 `config.bifrost.data_dir`. Preserve the current Scribe durable on-disk layout by
 using the data root itself as the WAL/node-identity base; derive the existing
 `scribe-stage`, `scribe-output-scratch`, `oracle-spill`, and `forge-spill`
-children unchanged, and add `oracle-audit` as the Oracle audit WAL child. Its
+children unchanged. Its
 single preparation operation creates the root and children required by the
 selected target before resource detection/role activation and returns the
 existing role-appropriate typed boot error on failure. No consumer may derive
 or replace these paths independently.
 
-Change `OracleAuditWalConfig::audit_wal_root` from optional to required
-`PathBuf`; `OracleAuditPublisher::new` always opens that path and deletes the
-system-temporary fallback and sequence counter. Construct its config at boot
-from the derived `oracle-audit` path plus the existing Oracle bounds. Test-only
-builders may inject one root, but not distinct production-shaped roots.
+Test-only builders may inject one root, but not distinct production-shaped
+roots.
 
 Replace `WyrdTestServerBuilder::with_bifrost_roots` with one internal
 `with_bifrost_root` seam and update `ClusterStorageRoot`, process-cluster node
@@ -118,10 +112,8 @@ select another path. Covers REQ-001, REQ-004, REQ-005, AC-001.
 
 **RED.** Add
 `config::tests::bifrost_data_dir_has_one_default_and_environment_override`.
-Assert the default, the environment override, empty override rejection, TOML
-rejection of `bifrost.oracle.audit_wal_root`, and that no Oracle field remains
-to diverge. It initially fails because no common field/env exists and the old
-field still parses.
+Assert the default, the environment override, empty override rejection. It initially fails
+because no common field/env exists.
 
 ```bash
 mise exec -- cargo nextest run --locked -p wyrd-server --lib \
@@ -200,8 +192,7 @@ stable claim per durable replica. Covers REQ-004, REQ-006, AC-004.
 **RED.** Update both existing deployment-contract tests. The acceptance test
 requires current targets, `WYRD_BIFROST_DATA_DIR`, a matching mount, and
 per-pod persistent claims. The mutation test proves rejection of `emptyDir`, a
-mismatched root/mount, a shared claim, `WYRD_SCRIBE_WAL_DIR`, and
-`bifrost.oracle.audit_wal_root`. They initially fail against the checked-in
+mismatched root/mount, a shared claim, and `WYRD_SCRIBE_WAL_DIR`. They initially fail against the checked-in
 manifests and current parser.
 
 ```bash
@@ -225,8 +216,6 @@ sensitive and does not grow into a Kubernetes framework.
   `wyrd-spec`, OpenAPI, Card schemas, or SDKs.
 - The data root itself remains the current Scribe WAL/node-identity base to
   avoid a durable-layout migration. Every other managed path is a child.
-- Oracle audit WAL receives a required derived path. Development and tests do
-  not use `std::env::temp_dir()` as an implicit second root.
 - Sharing a filesystem root never shares WAL identity, resource accounting,
   admission, cleanup, or recovery state between owners or pods.
 - Each replicated durable Kubernetes target owns its own claim; no two live
@@ -238,9 +227,6 @@ sensitive and does not grow into a Kubernetes framework.
   removed Oracle root, validation tests.
 - `crates/wyrd/wyrd-server/src/boot/mod.rs` — root owner, one preparation path,
   and role wiring.
-- `crates/wyrd/wyrd-server/src/oracle/audit_wal.rs` and
-  `crates/wyrd/wyrd-server/src/oracle/query_audit.rs` — required derived audit
-  root and no temporary fallback.
 - `crates/wyrd/wyrd-testing/src/server.rs`,
   `crates/wyrd/wyrd-testing/src/bifrost/cluster.rs`, and process-cluster child
   wiring — one injected/retained root across restart.

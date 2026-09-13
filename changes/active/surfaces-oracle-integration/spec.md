@@ -202,8 +202,9 @@ architecture rather than as parallel implementations.
   topologies without weakening tenant isolation.
 - **REQ-014:** Scribe MUST preserve Oracle's pod-local WAL v6 and its
   acknowledgement, replay, staging, publication, and retirement boundaries.
-  Oracle MUST preserve its separate local read-audit WAL and fsync acceptance
-  before returning query rows.
+  Oracle MUST commit read decisions to the audit staging outbox from a
+  non-blocking task; it keeps no separate audit WAL or relay (human decision,
+  Steven Forrester, 2026-09-13).
 - **REQ-015:** A selected analytical query MUST have one server execution
   attempt. Post-selection peer, transport, resource, cancellation, deadline,
   or execution failure MUST terminate the stream without a server successor
@@ -291,8 +292,7 @@ architecture rather than as parallel implementations.
 - **REQ-055:** The server MUST derive every Bifrost-managed local path from
   `WYRD_BIFROST_DATA_DIR`, defaulting locally to `.wyrd/bifrost`. It MUST create
   required Scribe and Oracle paths before role activation and fail readiness if
-  the root is unusable. `WYRD_SCRIBE_WAL_DIR` and the independent Oracle
-  audit-WAL-root setting MUST be removed without aliases. Durable replicas MUST
+  the root is unusable. `WYRD_SCRIBE_WAL_DIR` MUST be removed without aliases. Durable replicas MUST
   not share one writable WAL identity. Forge has no spill or scratch child
   path.
 
@@ -706,7 +706,7 @@ authenticate + coarse capability
   -> resolve immutable table cut
   -> authorize every resolved object
   -> commit Oracle reader protection
-  -> accept the read-audit WAL record
+  -> stage the read-decision audit event (non-blocking)
   -> admit pod-local resources
   -> execute one selected attempt
   -> terminal + joined cleanup

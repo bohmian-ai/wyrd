@@ -153,7 +153,7 @@ audited with request, principal, target, policy revision, and outcome identity.
 ### Production composition
 
 Server construction injects the configured policy decision point, permission
-resolver, canonical audit writer, and Oracle audit-WAL relay as required
+resolver, and canonical audit writer as required
 capabilities. A production profile cannot substitute a
 permit-all policy evaluator, no-op audit sink, in-memory credential store,
 test key, or best-effort background audit emitter. Missing or unhealthy
@@ -282,7 +282,7 @@ chain.
 
 Security events include credential issuance and revocation, token replay,
 unknown signing keys, policy unavailability, repeated authorization denial,
-peer-ticket rejection, tenant-tripwire failure, audit relay lag, audit-chain or
+peer-ticket rejection, tenant-tripwire failure, Oracle audit commit failure, audit-chain or
 publication failure, SSRF rejection, secret-resolution failure, and privileged
 operator use.
 

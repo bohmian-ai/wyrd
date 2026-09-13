@@ -601,9 +601,8 @@ atomically.
 Audit follows evaluated permission decisions. Append exactly one allowed or
 denied event for every verdict a receiving boundary reaches, inside the
 transaction that commits the authorized operation when one exists, and fail
-closed when the append fails. Oracle read admission is the narrow exception:
-fsync its versioned local audit WAL before rows and relay the canonical tenant
-staging event at least once. A transition that evaluates no permission — a
+closed when the append fails. Oracle read decisions commit the same staging
+event from a tracked, non-blocking task. A transition that evaluates no permission — a
 Scribe batch commit, Forge maintenance, audit publication, a reconciliation or
 storage lifecycle step — records lineage in its own operational table and
 structured tracing, never canonical audit. Forge operator lineage remains behind

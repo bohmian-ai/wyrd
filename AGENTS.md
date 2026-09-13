@@ -115,10 +115,11 @@ Locked cross-cutting decisions that any contributor must honor:
   transaction that made it. Engine-internal transitions — Scribe batch commits,
   Forge maintenance — evaluate no permission and are recorded as lineage in
   their own operational tables, never as audit.
-- Oracle query reads are the narrow exception to synchronous Postgres audit:
-  the server must fsync a versioned, CRC-framed local WAL acceptance before
-  permitting rows, then relay at least once into the canonical tenant
-  hash-chained staging table.
+- There is one audit write path and one publisher. Every audit event is
+  committed to `vala.audit_staging` through the canonical append, and only the
+  `AuditPublisher` moves staged rows into `vala.system.audit_log` via Scribe.
+  Oracle read decisions and tenant tripwires use that same path from a tracked,
+  non-blocking task; no other audit table, WAL, relay, or log sink exists.
 - Bifrost clients use `wyrd_client::Bifrost` over the crate's shared HTTP and
   gRPC transport. Rust, Python, and TypeScript project that same facade. Gate, Scribe,
   Oracle, and Forge remain server owners and never become client types.

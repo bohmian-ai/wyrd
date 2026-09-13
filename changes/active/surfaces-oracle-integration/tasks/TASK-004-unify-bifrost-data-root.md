@@ -21,8 +21,7 @@ integration closeout.
 
 - Derive all managed Scribe and Oracle local paths from one root, defaulting
   locally to `.wyrd/bifrost`.
-- Remove `WYRD_SCRIBE_WAL_DIR` and the independent Oracle audit-WAL-root
-  setting without aliases or compatibility fallback.
+- Remove `WYRD_SCRIBE_WAL_DIR` without aliases or compatibility fallback.
 - Create required managed paths before role activation and fail before
   readiness when the resolved root is unusable.
 - Durable replicas must not share one writable WAL identity. Tenant, node,
@@ -36,7 +35,7 @@ integration closeout.
 ## Relevant Surface
 
 - Bifrost server configuration and boot/readiness owners
-- Redux Scribe WAL and Oracle read-audit WAL path ownership
+- Redux Scribe WAL and Oracle spill path ownership
 - Deployment configuration, examples, and operations documentation
 - Bifrost server, Scribe, Oracle, restart, and multi-replica journeys
 
@@ -66,8 +65,7 @@ Paths are ownership guidance, not a private implementation allowlist.
 - The removed Scribe and Oracle settings are rejected or ignored as absent
   legacy configuration according to the current configuration parser; no
   alias, fallback, or second root survives.
-- Restart from the same root recovers acknowledged Scribe and accepted Oracle
-  audit-WAL state without loss, duplication beyond approved replay semantics,
+- Restart from the same root recovers acknowledged Scribe state without loss, duplication beyond approved replay semantics,
   or authority widening.
 - Multiple durable replicas use distinct writable WAL identities even when
   configured beneath the same deployment-level storage location; no process

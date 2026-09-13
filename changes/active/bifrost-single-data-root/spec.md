@@ -18,12 +18,11 @@ without configuration.
 
 - Establish one durable Bifrost filesystem root for every server target.
 - Derive and create Scribe WAL, stable node identity, staged runs, Scribe
-  output scratch, Oracle audit WAL, Oracle spill, and Forge spill paths beneath
+  output scratch, Oracle spill, and Forge spill paths beneath
   that root.
 - Make `WYRD_BIFROST_DATA_DIR` the sole environment override for that root.
 - Default the root to `.wyrd/bifrost` when the override is absent.
-- Remove the independent `WYRD_SCRIBE_WAL_DIR` and
-  `bifrost.oracle.audit_wal_root` configuration surfaces.
+- Remove the independent `WYRD_SCRIBE_WAL_DIR` configuration surface.
 - Align local/test startup, checked-in Kubernetes manifests, deployment
   contract checks, and architecture/operations documentation.
 
@@ -72,7 +71,7 @@ managed paths.
 
 ### REQ-003 — Role durability remains unchanged
 
-Scribe WAL, Scribe stable node identity, staged runs, and Oracle audit WAL shall
+Scribe WAL, Scribe stable node identity, and staged runs shall
 remain locally durable and recoverable under their existing protocols. Oracle
 and Forge scratch shall remain disposable under their existing lifecycle
 owners. Co-location beneath one root shall not merge their admission,
@@ -80,7 +79,7 @@ accounting, cleanup, or fail-closed boundaries.
 
 ### REQ-004 — Independent root settings are removed
 
-`WYRD_SCRIBE_WAL_DIR` and `bifrost.oracle.audit_wal_root` shall no longer be
+`WYRD_SCRIBE_WAL_DIR` shall no longer be
 accepted configuration. No replacement per-subsystem path or compatibility
 alias shall be introduced.
 
@@ -129,9 +128,9 @@ filesystem.
   roles create and use managed paths only below `/var/lib/wyrd/bifrost`.
 - Any deployment platform needs one root variable and one matching writable
   filesystem per durable Bifrost process; it needs no platform-specific Bifrost
-  configuration or Oracle audit-WAL TOML entry.
+  configuration.
 - A deployment may use ephemeral storage at that same root only when its
-  operator accepts losing unrelayed or unpublished local state after process
+  operator accepts losing unpublished local state after process
   replacement.
 - An empty root value or an uncreatable/unusable root fails startup without
   activating the affected role.

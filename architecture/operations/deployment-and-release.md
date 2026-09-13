@@ -111,9 +111,8 @@ transaction-pooled path.
 - Every Scribe replica has stable node identity and a persistent local volume
   for WAL and durable staged runs. Rescheduling without that volume is a node
   loss and invokes recovery; it is not a clean restart.
-- Oracle has a persistent local volume for its read-audit acceptance WAL and a
-  bounded, encrypted scratch volume for spill. Spill is disposable after query
-  termination; the audit WAL is not.
+- Oracle has a bounded, encrypted scratch volume for spill. Spill is disposable
+  after query termination; Oracle keeps no durable local audit state.
 - Audit projection uses the current Scribe and Forge publication path to write
   retained `vala.system.audit_log` history. Deployment readiness includes
   durable idempotent publication and bounded staging retirement;
@@ -207,7 +206,7 @@ contract. Missing or one-sided compatibility fails closed.
   cannot decode; an old worker cannot claim work whose writer requires newer
   semantics.
 - Rollout proceeds by role and limits unavailable capacity so Scribe admission,
-  Oracle interactive capacity, Forge lease progress, and audit relay remain
+  Oracle interactive capacity, Forge lease progress, and audit publication remain
   within their service objectives.
 - Readiness is removed before connection drain. Shutdown stops new admission,
   cancels or hands off bounded work according to its owner, waits for durable

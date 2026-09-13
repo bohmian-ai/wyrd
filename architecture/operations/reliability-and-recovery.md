@@ -33,7 +33,7 @@ At minimum, deployments measure:
   age, persistence lag, object publication, replay, and rejection;
 - Oracle interactive and analytical queue age, execution latency, result
   outcome, cancellation, terminal peer failure, memory, exchange, spill,
-  audit-WAL lag, and partial-result prevention;
+  audit commit failures, and partial-result prevention;
 - Forge demand age, claim age, lease expiry, plan-estimate accuracy, local FIFO
   age, running estimated memory and parallelism, worker loss, attempt outcome,
   rewrite debt, commit conflict, uncertain publication, reconciliation,

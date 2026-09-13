@@ -432,12 +432,13 @@ stability; pruning, vectorization, layout, and IO efficiency determine latency.
 
 ### Read audit and terminal contract
 
-Oracle read admission is the narrow exception to transactional Postgres audit.
-Before rows may be returned, the server fsyncs a versioned CRC-framed local WAL
-acceptance containing its timestamp. One bounded relay appends it at least once
-to the canonical tenant hash-chain staging table. A replayed relay may create one
-valid duplicate but cannot lose an accepted read decision. One logical query
-produces one read-audit event; distributed stages produce none.
+Oracle read decisions use the one audit outbox. After admission, a tracked,
+non-blocking task commits the read-decision event to the canonical tenant
+hash-chain staging table, and the `AuditPublisher` retains it like every other
+event. Rows are not held for that commit; a failed commit is logged and counted
+through `oracle_audit_commit_failures_total`, and shutdown waits for pending
+commits. One logical query produces one read-audit event; distributed stages
+produce none.
 
 Query streams are length-delimited, terminal-safe frames. Slot/queue refusal
 before framing is `QueryAdmissionRejected`; governed memory, scratch, or
@@ -685,8 +686,9 @@ No cleanup infers safety from age or path shape alone.
 - Audit records authorization decisions. Every boundary that evaluates a
   principal's permission appends exactly one allowed or denied event before the
   operation proceeds or refuses, in the operation's own commit transaction where
-  one exists, and fails closed when that append fails. Oracle's WAL-before-read
-  acceptance is the one exception to synchronous Postgres audit.
+  one exists, and fails closed when that append fails. Oracle read decisions
+  commit to the same staging outbox from a non-blocking task and do not hold
+  rows for that commit.
 - Engine-internal transitions — Scribe batch commits, Forge maintenance, audit
   publication, reconciliation, storage lifecycle — evaluate no permission. They
   record lineage in their own operational tables and structured diagnostics,

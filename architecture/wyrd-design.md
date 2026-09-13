@@ -1353,8 +1353,9 @@ written AND, for heavy cards, every declared artifact upload is
 verified.
 
 Reconcile sweep: pending rows past 24h since `blob_failed_at` are
-retried up to 3 times with exponential backoff, then dead-lettered
-with audit event `card.registration.dead_letter`.
+retried up to 3 times with exponential backoff, then dead-lettered.
+The dead letter is reconciliation lineage on the Card row, not a canonical
+audit event: reconciliation evaluates no principal permission.
 
 ### Heavy artifacts
 

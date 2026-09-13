@@ -421,6 +421,10 @@ mod pg_tests {
     /// An undeclarable Bloom column fails layout resolution before the catalog
     /// opens its transaction, so the event handed to the catalog is never
     /// appended there; the service must record it standalone exactly once.
+    ///
+    /// # Panics
+    /// Panics when the fixture cannot start, the registration unexpectedly
+    /// succeeds, or the staged verdict rows are not exactly one `allowed`.
     #[test]
     fn bifrost_tables_register_pre_commit_failure_records_one_verdict() {
         wyrd_runtime::runtime().block_on(async {
@@ -450,6 +454,10 @@ mod pg_tests {
     /// then lets one create while the other observes the winner's row. The
     /// loser's verdict must commit on that observing transaction rather than
     /// vanish, so each request owns exactly one allowed row.
+    ///
+    /// # Panics
+    /// Panics when the fixture cannot start, either registration fails, the
+    /// two requests resolve different table uids, or either lacks one `allowed` row.
     #[test]
     fn bifrost_tables_concurrent_same_fqn_register_records_each_verdict() {
         wyrd_runtime::runtime().block_on(async {

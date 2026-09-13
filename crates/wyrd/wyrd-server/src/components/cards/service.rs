@@ -1838,7 +1838,8 @@ async fn finish_card_delete(
 ///
 /// This is an internal lifecycle cleanup seam. It is intentionally not exposed
 /// as a method on the public `Cards` handle. Cleanup is best-effort, while the
-/// Pending→Failed transition and its audit event remain transactional.
+/// Pending→Failed transition commits atomically as registry lineage; it
+/// evaluates no permission and appends no canonical audit event.
 #[tracing::instrument(
     skip(state, caller, idempotency_key),
     fields(

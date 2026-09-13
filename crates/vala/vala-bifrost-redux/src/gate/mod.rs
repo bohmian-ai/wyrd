@@ -1333,6 +1333,9 @@ mod tests {
         }
 
         /// Copies the recorded decisions out for assertion.
+        ///
+        /// # Panics
+        /// Panics when a recording thread poisoned the decision lock.
         fn decisions(&self) -> Vec<(String, AuditOutcome)> {
             self.decisions
                 .lock()

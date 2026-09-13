@@ -88,6 +88,13 @@ mod pg_tests {
         assert_idempotency_count(operator_pool.pool(), "live-key", 1).await;
     }
 
+    /// A pending upload completed before the sweep is never reclaimed.
+    ///
+    /// The sweeper claims expired pending rows by status, so a row that turned
+    /// `completed` before the tick must keep that status.
+    ///
+    /// # Panics
+    /// Panics when the fixture cannot start or the completed upload is reclaimed.
     #[tokio::test]
     async fn sweeper_skips_reclamation_when_upload_already_completed() {
         let fixture = PgFixture::start().await.expect("fixture starts");

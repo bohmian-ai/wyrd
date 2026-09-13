@@ -26,6 +26,7 @@ use vala_eval::orchestrator::{NextDirective, RunState};
 use wyrd_runtime::{Permission, Principal};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::eval::protocol::{
     AgentTurnSubmission, EvalRunOpenRequest, EvalRunOpenResponse, TurnDirective, UserTurnSubmission,
 };
@@ -307,7 +308,7 @@ fn check_lease(headers: &HeaderMap, entry: &RunEntry) -> Result<(), WyrdErrorRes
 async fn require_eval_run(
     state: &AppState,
     caller: &Caller,
-    eval_ref: &wyrd_spec::reference::CardRef,
+    eval_ref: &CardRef,
 ) -> Result<(), WyrdErrorResponse> {
     audit::authorize(
         state,

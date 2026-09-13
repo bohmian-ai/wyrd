@@ -14,6 +14,7 @@ use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_bifrost_redux::cluster::{ClusterRegistry, RegisteredRole};
 use vala_bifrost_redux::forge::Forge as ForgeCoordinator;
 use vala_bifrost_redux::forge::ForgeWorker;
+use vala_bifrost_redux::gate::Gate;
 use vala_bifrost_redux::gate::limits::IngestLimits;
 use vala_bifrost_redux::oracle::Oracle as OracleEngine;
 use vala_bifrost_redux::oracle::dispatcher::{BifrostPeerTls, OraclePeerCredentials};
@@ -32,6 +33,7 @@ use wyrd_tonic::tonic_health::server::HealthReporter;
 
 use crate::auth::permission_resolver::SqlPermissionResolver;
 use crate::auth::pg_resolvers::PgIssuerResolver;
+use crate::bifrost::gate_audit::PostgresGateAudit;
 use crate::components::auth::{ServerAuth, ServerAuthz};
 use crate::components::eval::{EvalAuditWriter, EvalRuns, TracingEvalAuditWriter, new_run_map};
 use crate::components::health::ReadinessSnapshot;
@@ -334,11 +336,7 @@ pub struct BifrostTestControls {
 /// [`WyrdTokenVerifier`] already fixes both resolver parameters, so the alias
 /// keeps [`Bifrost`] and [`AppState`] non-generic while the Gate itself stays
 /// generic for other embedders.
-pub type ServerGate = vala_bifrost_redux::gate::Gate<
-    SqlPermissionResolver,
-    PgIssuerResolver,
-    crate::bifrost::gate_audit::PostgresGateAudit,
->;
+pub type ServerGate = Gate<SqlPermissionResolver, PgIssuerResolver, PostgresGateAudit>;
 
 /// Ordered local lifecycle states for one independently fenced role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

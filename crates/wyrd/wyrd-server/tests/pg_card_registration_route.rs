@@ -1304,7 +1304,11 @@ async fn card_reconciler_recovers_after_storage_retry() {
 }
 
 /// The production reconciler dead-letters exactly the third failed attempt and
-/// writes the dead-letter audit event in the same durable state transition.
+/// records it as reconciliation lineage in the same durable state transition.
+///
+/// # Panics
+/// Panics when the server cannot start, registration or reconciliation reads
+/// fail, or the dead-letter state, error metadata, or attempt count differ.
 #[tokio::test(flavor = "current_thread")]
 async fn card_reconciler_dead_letters_after_three_failures() {
     if !enabled() {
@@ -1591,6 +1595,10 @@ async fn delete_audit_failure_keeps_card_active() {
 ///
 /// The not-found transaction commits nothing, so its in-transaction append
 /// rolls back and the service records the allowed row standalone exactly once.
+///
+/// # Panics
+/// Panics when the server cannot start, the delete is not a 404, or the
+/// staged verdict rows are not exactly one `allowed`.
 #[tokio::test(flavor = "current_thread")]
 async fn delete_by_ref_not_found_records_one_decision() {
     if !enabled() {
@@ -1709,9 +1717,13 @@ async fn delete_storage_failure_preserves_cleanup_state() {
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// A blob storage failure leaves durable failure state and an audit record.
+/// A blob storage failure refuses registration and leaves durable failure state.
+///
+/// # Panics
+/// Panics when the server cannot start, the registration succeeds, or the Card
+/// is not left `failed` with no blob URI and a recorded failure time.
 #[tokio::test(flavor = "current_thread")]
-async fn blob_storage_failure_is_audited_without_leaking_sql() {
+async fn blob_storage_failure_leaves_durable_failure_state() {
     if !enabled() {
         return;
     }
@@ -1779,6 +1791,10 @@ async fn blob_storage_failure_is_audited_without_leaking_sql() {
 }
 
 /// Refuse the whole composite when the registration decision audit fails.
+///
+/// # Panics
+/// Panics when the server cannot start, the registration is not refused, or a
+/// Card row survives the failed decision audit.
 #[tokio::test(flavor = "current_thread")]
 async fn registration_refuses_when_its_decision_audit_fails() {
     if !enabled() {

@@ -312,6 +312,10 @@ async fn local_client_server_round_trip() {
 /// disclosed. The journey drives both routes through the real client against a
 /// bound server, requires the stable RBAC code on each, and reads staging to
 /// prove exactly one `denied` row per route.
+///
+/// # Panics
+/// Panics when the server or client cannot start, either route is not refused
+/// with the RBAC code, or staging lacks exactly one `denied` row per route.
 #[tokio::test(flavor = "current_thread")]
 async fn storage_routes_refuse_and_audit_an_unprivileged_caller() {
     if !enabled("WYRD_STORAGE_E2E") {

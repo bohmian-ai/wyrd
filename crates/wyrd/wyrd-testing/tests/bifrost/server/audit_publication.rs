@@ -364,6 +364,9 @@ async fn retained_audit_batches(
 ///
 /// # Errors
 /// Returns the server, Postgres, peer-audit, or publication failure.
+///
+/// # Panics
+/// Panics when the rejection is not retained in exactly one new batch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the serialized Postgres-backed journey lane"]
 async fn system_owner_security_rejections_retain_once() -> Result<(), ServerJourneyError> {

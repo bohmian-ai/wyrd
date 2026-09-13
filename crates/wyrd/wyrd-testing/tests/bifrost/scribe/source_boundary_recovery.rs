@@ -216,6 +216,9 @@ async fn scribe_failure_retry_replay_remain_atomic() {
 /// visible is the published file row it committed. Counting those rows is how a
 /// case distinguishes "the retry reconciled the identical publication" from
 /// "the retry published a second time under a new identity".
+///
+/// # Panics
+/// Panics when the published hot-file rows cannot be read.
 async fn published_generations(server: &WyrdTestServer, tenant: DataTenantId, name: &str) -> usize {
     server
         .published_hot_files_for_test(tenant, BifrostNamespace::Datasets.as_str(), name)

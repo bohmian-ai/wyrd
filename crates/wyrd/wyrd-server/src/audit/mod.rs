@@ -16,9 +16,12 @@
 
 pub mod publication;
 
+use std::fmt::Display;
+
 use sqlx::PgPool;
 use vala_sql::TenantConn;
 use vala_sql::queries::audit_staging::append_audit;
+use wyrd_runtime::Permission;
 use wyrd_spec::auth::{PLATFORM_AUDIT_PRINCIPAL, PrincipalKindTag};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::DataTenantId;
@@ -27,6 +30,8 @@ use wyrd_spec::vala::BifrostError as ValaError;
 use wyrd_spec::vala::api::{AuditDetail, AuditEvent, AuditOutcome};
 
 use crate::components::auth::Caller;
+use crate::http::error::permission_deny_reason_to_wyrd;
+use crate::state::AppState;
 
 /// Build a data-plane [`AuditEvent`] attributed to the HTTP caller.
 ///
@@ -104,7 +109,7 @@ pub fn audit_event_unauthenticated(
 
 /// Map an audit-append failure to the fail-closed public code, never leaking the
 /// underlying SQL/connection detail across the boundary.
-pub fn audit_unavailable(error: impl std::fmt::Display) -> WyrdError {
+pub fn audit_unavailable(error: impl Display) -> WyrdError {
     tracing::error!(error = %error, "audit append failed; refusing operation");
     ValaError::AuditUnavailable {
         detail: "audit append failed".to_owned(),
@@ -188,9 +193,9 @@ pub async fn record_audit_owned(
 /// Returns the mapped denial error when the principal lacks `required`, and
 /// [`WyrdError::AuditUnavailable`] when the decision row cannot be persisted.
 pub async fn authorize(
-    state: &crate::state::AppState,
+    state: &AppState,
     caller: &Caller,
-    required: &wyrd_runtime::Permission,
+    required: &Permission,
     operation: &str,
     resource: &str,
 ) -> Result<(), WyrdError> {
@@ -209,9 +214,9 @@ pub async fn authorize(
 /// Returns the mapped denial error when the principal lacks `required`, and
 /// [`WyrdError::AuditUnavailable`] when the denial row cannot be persisted.
 pub async fn authorize_recording_denial(
-    state: &crate::state::AppState,
+    state: &AppState,
     caller: &Caller,
-    required: &wyrd_runtime::Permission,
+    required: &Permission,
     operation: &str,
     resource: &str,
 ) -> Result<AuditEvent, WyrdError> {
@@ -229,7 +234,7 @@ pub async fn authorize_recording_denial(
             AuditOutcome::Denied,
         );
         record_audit(state.postgres.vala_pool(), caller.data_tenant_id, &denied).await?;
-        return Err(crate::http::error::permission_deny_reason_to_wyrd(reason));
+        return Err(permission_deny_reason_to_wyrd(reason));
     }
     Ok(audit_event(
         caller,
@@ -249,40 +254,31 @@ pub async fn authorize_recording_denial(
 /// with [`append_on`] on that transaction **before** the administrative write, so
 /// a later not-found early return cannot commit the effect without the decision.
 ///
-/// `action` is the existing human-readable intent accepted by
-/// [`wyrd_auth::service_accounts::require_service_accounts_write`], kept so the
-/// public refusal message stays exactly what it was.
+/// The verdict comes from the configured `PermissionCheck` through
+/// [`authorize_recording_denial`], so the audited decision, the response, and
+/// the effect all follow the same runtime owner. `action` is the existing
+/// human-readable intent kept so the public refusal message stays exactly what
+/// it was.
 ///
 /// # Errors
-/// Returns [`WyrdError::PermissionDeniedRbac`] when the principal lacks
+/// Returns [`WyrdError::PermissionDeniedRbac`] when the configured checker denies
 /// `service_accounts:write`, and [`WyrdError::AuditUnavailable`] when the denial
 /// row cannot be persisted.
 pub async fn authorize_service_accounts_write(
-    state: &crate::state::AppState,
+    state: &AppState,
     caller: &Caller,
     action: &str,
     operation: &str,
     resource: &str,
 ) -> Result<AuditEvent, WyrdError> {
-    let permission = wyrd_runtime::Permission::service_accounts_write().to_string();
-    if let Err(error) =
-        wyrd_auth::service_accounts::require_service_accounts_write(&caller.principal, action)
-    {
-        let denied = audit_event(
-            caller,
-            operation,
-            resource,
-            &permission,
-            AuditOutcome::Denied,
-        );
-        record_audit(state.postgres.vala_pool(), caller.data_tenant_id, &denied).await?;
-        return Err(error);
-    }
-    Ok(audit_event(
-        caller,
-        operation,
-        resource,
-        &permission,
-        AuditOutcome::Allowed,
-    ))
+    let required = Permission::service_accounts_write();
+    authorize_recording_denial(state, caller, &required, operation, resource)
+        .await
+        .map_err(|error| match error {
+            WyrdError::PermissionDeniedRbac { .. } => WyrdError::PermissionDeniedRbac {
+                message: format!("{required} permission required to {action}"),
+                details: serde_json::json!({ "required": required.to_string() }),
+            },
+            other => other,
+        })
 }

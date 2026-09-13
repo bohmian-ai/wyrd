@@ -1,7 +1,7 @@
 ---
 id: TASK-001-R2
 kind: remediation
-status: ready
+status: in_progress
 spec: SPEC-surfaces-oracle-integration
 spec_revision: 7
 requirements: [REQ-026, REQ-026B, REQ-027, REQ-027C, REQ-028, REQ-029, INV-008, INV-008C, INV-008D, INV-025, AC-005]

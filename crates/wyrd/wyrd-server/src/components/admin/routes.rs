@@ -12,9 +12,10 @@
 //! plaintext secret reach a column, log, or response (GET redacts it). Reads and
 //! deletes never touch discovery.
 //!
-//! No audit row is written here, and that is deliberate: admin-mutation audit is
-//! deferred to the audit→Vala/Iceberg consolidation rather than a per-feature
-//! Postgres table (the `revoke_principal` precedent writes no audit row either).
+//! Every handler audits its `service_accounts:write` verdict exactly once. The
+//! Allowed row shares the handler's tenant transaction, except at issuer create,
+//! where it commits standalone before discovery so no network IO runs unaudited
+//! and no transaction spans it.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
@@ -212,11 +213,23 @@ struct BindingFilter {
 /// insert (fails closed if a secret is supplied without a key), and writes
 /// through the RLS `TenantConn`. Returns the redacted [`TrustedIssuerView`]
 /// (never the secret).
+///
+/// Local request validation runs before the verdict. The Allowed row then
+/// commits standalone before discovery, so a later discovery, sealing, or insert
+/// failure leaves the decision recorded exactly once and no issuer row.
+///
+/// # Errors
+///
+/// Returns a `400` for a missing secret or blocked issuer, the RBAC denial,
+/// `AuditUnavailable` when the decision cannot be recorded, a `503` when
+/// discovery, the sealing key, or the store is unavailable, and a `409` for a
+/// duplicate issuer.
 async fn create_trusted_issuer(
     State(state): State<AppState>,
     caller: Caller,
     Json(request): Json<CreateTrustedIssuerRequest>,
 ) -> Result<Json<TrustedIssuerView>, WyrdErrorResponse> {
+    let client_auth = request_client_auth(&request)?;
     let decision = audit::authorize_service_accounts_write(
         &state,
         &caller,
@@ -229,6 +242,9 @@ async fn create_trusted_issuer(
     )
     .await
     .map_err(WyrdErrorResponse::from)?;
+    audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, &decision)
+        .await
+        .map_err(WyrdErrorResponse::from)?;
 
     // The only network call on any admin path, and only at create: discovery
     // resolves jwks_uri. A runtime read must never re-discover.
@@ -240,7 +256,7 @@ async fn create_trusted_issuer(
         jwks_uri,
         expected_audience: request.expected_audience.clone(),
         client_id: request.client_id.clone(),
-        client_auth: request_client_auth(&request)?,
+        client_auth,
         claim_mapping: claim_mapping_into_domain(request.claim_mapping.clone()),
         group_role_map: request.group_role_map.clone(),
         default_roles: request.default_roles.clone(),
@@ -256,9 +272,6 @@ async fn create_trusted_issuer(
         .map_err(seal_error)?;
 
     let mut conn = acquire_conn(&state, &caller).await?;
-    audit::append_on(&mut conn, &decision)
-        .await
-        .map_err(WyrdErrorResponse::from)?;
     insert_trusted_issuer(&mut conn, &write)
         .await
         .map_err(map_write_error)?;
@@ -822,7 +835,10 @@ mod pg_tests {
     };
     use wyrd_crypt::SecretKey;
     use wyrd_dev_fixtures::pg::PgFixture;
-    use wyrd_runtime::{Permission, PermissionSet, Principal, PrincipalId, PrincipalKind, RoleRef};
+    use wyrd_runtime::{
+        Permission, PermissionCheck, PermissionDenyReason, PermissionSet, PermissionVerdict,
+        Principal, PrincipalId, PrincipalKind, RoleRef,
+    };
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::IssuerTokenPolicy;
@@ -837,7 +853,7 @@ mod pg_tests {
 
     use super::*;
     use crate::auth::pg_resolvers::{PgIssuerResolver, issuer_write_from_trusted};
-    use crate::components::auth::Caller;
+    use crate::components::auth::{Caller, ServerAuthz};
     use wyrd_spec::request_id::RequestId;
 
     const SECRET: &str = "super-secret";
@@ -1392,5 +1408,123 @@ mod pg_tests {
             .expect("list succeeds")
             .0;
         assert_eq!(listed.len(), 2);
+    }
+
+    /// Checker that denies every permission, standing in for a configured
+    /// `PermissionCheck` that disagrees with the principal's effective set.
+    #[derive(Debug)]
+    struct DenyAllCheck;
+
+    impl PermissionCheck for DenyAllCheck {
+        /// Deny `permission` for `principal` regardless of its grants.
+        fn check(&self, principal: &Principal, permission: &Permission) -> PermissionVerdict {
+            PermissionVerdict::Deny {
+                reason: PermissionDenyReason::Rbac {
+                    required: Box::new(permission.clone()),
+                    principal: principal.id,
+                },
+            }
+        }
+    }
+
+    /// Return the staged `(outcome, count)` decision rows for `operation`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the tenant connection or the staging read fails.
+    async fn decision_rows(fixture: &PgFixture, operation: &str) -> Vec<(String, i64)> {
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let rows = sqlx::query_as(
+            "SELECT outcome, count(*) FROM vala.audit_staging \
+             WHERE operation = $1 GROUP BY outcome",
+        )
+        .bind(operation)
+        .fetch_all(&mut **conn.transaction())
+        .await
+        .expect("decision rows read");
+        conn.commit().await.expect("assertion transaction commits");
+        rows
+    }
+
+    /// A discovery failure after an Allowed verdict leaves exactly one Allowed row
+    /// (committed before the network call) and no issuer.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot start or any assertion fails.
+    #[tokio::test]
+    async fn create_records_allowed_decision_before_failed_discovery() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let state = test_state(&fixture).await;
+        // No discovery document is mounted, so discovery fails after the verdict.
+        let server = MockServer::start().await;
+        let issuer = IssuerUrl::new(&server.uri()).expect("loopback http issuer is valid");
+
+        let error = create_trusted_issuer(
+            State(state),
+            writer(tenant),
+            Json(create_issuer_request(issuer.clone(), Some(SECRET))),
+        )
+        .await
+        .expect_err("discovery failure refuses the create");
+        assert!(matches!(error.0, WyrdError::DiscoveryUnavailable { .. }));
+
+        assert_eq!(
+            decision_rows(&fixture, "admin.trusted_issuer.create").await,
+            vec![("allowed".to_owned(), 1)]
+        );
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let row = trusted_issuer_by_url(&mut conn, issuer.as_str())
+            .await
+            .expect("query succeeds");
+        conn.commit().await.expect("commit");
+        assert!(row.is_none(), "a failed discovery creates no issuer");
+    }
+
+    /// The configured checker's denial governs the response, the effect, and the
+    /// single audit row even when the principal holds `service_accounts:write`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot start or any assertion fails.
+    #[tokio::test]
+    async fn configured_checker_denial_governs_workload_binding_create() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let state = test_state(&fixture).await.with_authz(ServerAuthz {
+            permission_check: Arc::new(DenyAllCheck),
+            ..ServerAuthz::default()
+        });
+        seed_issuer(&fixture, tenant).await;
+
+        let error = create_workload_binding(
+            State(state.clone()),
+            writer(tenant),
+            Json(CreateWorkloadBindingRequest {
+                issuer: IssuerUrl::new(SEEDED_ISSUER).expect("issuer is valid"),
+                subject: "system:serviceaccount:default/sa".to_owned(),
+                audience: None,
+                card_ref: sample_card_ref(),
+            }),
+        )
+        .await
+        .expect_err("the configured checker denies the write");
+        assert!(matches!(
+            &error.0,
+            WyrdError::PermissionDeniedRbac { message, .. }
+                if message == "service_accounts:write permission required to manage workload bindings"
+        ));
+
+        assert_eq!(
+            decision_rows(&fixture, "admin.workload_binding.create").await,
+            vec![("denied".to_owned(), 1)]
+        );
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let bindings = workload_bindings_for_tenant(&mut conn, None, None)
+            .await
+            .expect("binding list reads");
+        conn.commit().await.expect("commit");
+        assert!(bindings.is_empty(), "a denied write creates no binding");
     }
 }

@@ -5,6 +5,7 @@ use thiserror::Error;
 use wyrd_spec::DataTenantId;
 
 use crate::catalog::table_ref::{TableRef, is_safe_name};
+use crate::tables::AuditLogTable;
 
 /// The logical table plus the authenticated organization that owns its data.
 pub type TenantTableKey = (DataTenantId, TableRef);
@@ -105,15 +106,20 @@ pub struct TenantTableBinding {
 impl TenantTableBinding {
     /// Computes the exact checked physical-name allocation facts without allocating.
     ///
+    /// The nil tenant is accepted only for the retained audit log, which the
+    /// system owner publishes its security decisions into.
+    ///
     /// # Errors
     ///
-    /// Returns an identity validation error or [`TenantTableBindingError::BindingSizeOverflow`]
-    /// when any exact byte total cannot be represented.
+    /// Returns [`TenantTableBindingError::InvalidTenant`] for a nil tenant on any
+    /// other table, another identity validation error, or
+    /// [`TenantTableBindingError::BindingSizeOverflow`] when any exact byte
+    /// total cannot be represented.
     pub(crate) fn facts<'a>(
         tenant: &'a DataTenantId,
         table_ref: &'a TableRef,
     ) -> Result<PhysicalBindingFacts<'a>, TenantTableBindingError> {
-        if tenant.as_uuid().is_nil() {
+        if tenant.as_uuid().is_nil() && !AuditLogTable::admits_system_owner(table_ref) {
             return Err(TenantTableBindingError::InvalidTenant);
         }
         if !is_safe_name(&table_ref.name) {
@@ -193,7 +199,8 @@ impl TenantTableBinding {
     /// only to the physical Iceberg namespace and object-store prefix.
     ///
     /// # Errors
-    /// Returns [`TenantTableBindingError::InvalidTenant`] for a nil tenant,
+    /// Returns [`TenantTableBindingError::InvalidTenant`] for a nil tenant on any
+    /// table but the retained audit log,
     /// [`TenantTableBindingError::InvalidTableName`] when the logical table
     /// name is not a safe local identifier,
     /// [`TenantTableBindingError::InvalidPhysicalNamespace`] when the fixed
@@ -372,6 +379,29 @@ mod tests {
     fn tenant_table_binding_rejects_nil_tenant() {
         assert_eq!(
             TenantTableBinding::resolve((crate::test_support::nil_tenant(), table())),
+            Err(TenantTableBindingError::InvalidTenant)
+        );
+    }
+
+    /// The system owner binds only the retained audit log, under its own prefix.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the audit-log binding is refused or its prefix differs.
+    #[test]
+    fn tenant_table_binding_admits_system_owner_only_for_audit_log() {
+        let audit_log = TableRef::new(BifrostNamespace::Audit, "audit_log");
+        let binding = TenantTableBinding::resolve((crate::test_support::nil_tenant(), audit_log))
+            .expect("the system owner binds the retained audit log");
+        assert_eq!(
+            binding.object_prefix,
+            format!("tenants/{}/system/audit_log", uuid::Uuid::nil())
+        );
+        assert_eq!(
+            TenantTableBinding::resolve((
+                crate::test_support::nil_tenant(),
+                TableRef::new(BifrostNamespace::Audit, "other"),
+            )),
             Err(TenantTableBindingError::InvalidTenant)
         );
     }

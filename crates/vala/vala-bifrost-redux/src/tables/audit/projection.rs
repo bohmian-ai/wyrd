@@ -41,8 +41,6 @@ pub struct AuditProjection {
 pub enum AuditProjectionError {
     #[error("audit projection requires at least one row")]
     Empty,
-    #[error("audit projection requires a non-nil authenticated tenant")]
-    NilAuthenticatedTenant,
     #[error(
         "audit row {index} belongs to tenant {row_tenant}, not authenticated tenant {authenticated_tenant}"
     )]
@@ -101,9 +99,6 @@ fn validate_range(
 ) -> Result<ValidatedAuditRange, AuditProjectionError> {
     if rows.is_empty() {
         return Err(AuditProjectionError::Empty);
-    }
-    if authenticated_tenant.as_uuid().is_nil() {
-        return Err(AuditProjectionError::NilAuthenticatedTenant);
     }
 
     let seq_lo = rows[0].seq;
@@ -366,12 +361,18 @@ mod tests {
         ));
     }
 
+    /// The system owner's staged security decisions project like any tenant's,
+    /// so they can reach retained history.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the system-owner range is refused.
     #[test]
-    fn rejects_nil_authenticated_tenant() {
-        assert!(matches!(
-            project_audit_rows(crate::test_support::nil_tenant(), &[row(tenant(1), 1)]),
-            Err(AuditProjectionError::NilAuthenticatedTenant)
-        ));
+    fn projects_system_owner_rows() {
+        let system = crate::test_support::nil_tenant();
+        let projection = project_audit_rows(system, &[row(system, 1)])
+            .expect("system-owner decisions project into retained history");
+        assert_eq!(projection.tenant, system);
     }
 
     #[test]

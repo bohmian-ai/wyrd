@@ -7,8 +7,11 @@ use crate::scribe::material_plan::{MaterialPlan, MaximumEnvelopeDecision, Scribe
 use crate::scribe::memory::MemoryCategory;
 use crate::scribe::preprocess::{AdmittedAppend, AdmittedRows, NativeAdmittedRows};
 use crate::scribe::routing::shard_for;
+use crate::tables::AuditLogTable;
 
 use std::time::Instant;
+
+use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
 
 /// Validates that one decoded request fits the persistence bucket that must own it.
 ///
@@ -40,16 +43,22 @@ fn validate_decoded_request_size(
 
 /// Validates authenticated identity and the raw transport ceiling.
 ///
+/// A nil tenant is admitted only for the server's internal audit publication:
+/// the platform audit principal writing the retained audit log.
+///
 /// # Errors
 ///
-/// Returns [`ScribeError::InvalidFrame`] for tenant mismatch or a nil tenant,
-/// and [`ScribeError::PayloadTooLarge`] above the fixed request ceiling.
+/// Returns [`ScribeError::InvalidFrame`] for tenant mismatch or any other nil
+/// tenant frame, and [`ScribeError::PayloadTooLarge`] above the fixed request
+/// ceiling.
 fn validate_logical_transport_frame(
     frame: &ScribeIngressFrame,
     request_limit_bytes: usize,
 ) -> Result<(), ScribeError> {
+    let system_audit_publication = frame.principal.id == PLATFORM_AUDIT_PRINCIPAL
+        && AuditLogTable::admits_system_owner(&frame.table);
     if frame.authenticated_tenant != frame.principal.tenant_id
-        || frame.authenticated_tenant.as_uuid().is_nil()
+        || (frame.authenticated_tenant.as_uuid().is_nil() && !system_audit_publication)
     {
         return Err(ScribeError::InvalidFrame);
     }
@@ -688,7 +697,11 @@ fn record_accepted_frame(rows_accepted: u64, elapsed: std::time::Duration) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ScribeImpl, take_transport_decode_owner, validate_decoded_request_size};
+    use super::{
+        ScribeImpl, take_transport_decode_owner, validate_decoded_request_size,
+        validate_logical_transport_frame,
+    };
+    use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
     use crate::catalog::TableRef;
     use crate::contracts::{
         CanonicalIngress, IngressPayload, Scribe, ScribeError, ScribeIngressFrame,
@@ -819,6 +832,52 @@ mod tests {
             measured_wire_bytes: 0,
             payload: IngressPayload::Canonical(CanonicalIngress::unreserved(vec![rows])),
         }
+    }
+
+    /// A nil tenant passes transport validation only as the platform audit
+    /// principal writing the retained audit log; caller tables and any other
+    /// principal stay refused.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an admission decision differs from the audit-only exception.
+    #[test]
+    fn nil_tenant_frames_admit_only_internal_audit_publication() {
+        let system = DataTenantId::SYSTEM_OWNER;
+        let publisher = Principal::new(
+            PLATFORM_AUDIT_PRINCIPAL,
+            PrincipalKind::User,
+            system,
+            Vec::new(),
+            PermissionSet::new(),
+        );
+        let audit_log = TableRef::new(BifrostNamespace::Audit, "audit_log");
+
+        let mut frame = decoded_size_frame(system, &publisher, "x".to_owned());
+        assert!(matches!(
+            validate_logical_transport_frame(&frame, usize::MAX),
+            Err(ScribeError::InvalidFrame)
+        ));
+        frame.table = audit_log.clone();
+        validate_logical_transport_frame(&frame, usize::MAX)
+            .expect("internal audit publication admits the system owner");
+
+        let mut caller = decoded_size_frame(
+            system,
+            &Principal::new(
+                PrincipalId::new(uuid::Uuid::now_v7()),
+                PrincipalKind::User,
+                system,
+                Vec::new(),
+                PermissionSet::new(),
+            ),
+            "x".to_owned(),
+        );
+        caller.table = audit_log;
+        assert!(matches!(
+            validate_logical_transport_frame(&caller, usize::MAX),
+            Err(ScribeError::InvalidFrame)
+        ));
     }
 
     /// An oversized decoded request is refused at the pre-WAL size gate while

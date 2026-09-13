@@ -1,5 +1,7 @@
 use arrow::datatypes::{DataType, Field};
 
+use crate::catalog::TableRef;
+use crate::namespaces::BifrostNamespace;
 use crate::tables::fields::utf8;
 use crate::tables::{CorrelationPolicy, DomainTable, PayloadClass, sort_asc, sort_desc};
 use wyrd_spec::vala::api::{PhysicalLayoutWire, TimeGranularityWire};
@@ -17,6 +19,20 @@ use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 /// The Postgres decision timestamp travels as `wyrd_event_time` rather than a
 /// content column, so a retained row partitions by when the boundary decided.
 pub struct AuditLogTable;
+
+impl AuditLogTable {
+    /// Whether `table` is the one table the nil system owner may physically own.
+    ///
+    /// System-attributed security decisions (unverified peer and tail
+    /// rejections) stage under `DataTenantId::SYSTEM_OWNER` and must reach
+    /// retained history like any tenant's. Every other table keeps rejecting
+    /// the nil tenant, and Gate refuses caller writes into the audit namespace,
+    /// so only the server's internal publication can use this exception.
+    #[must_use]
+    pub fn admits_system_owner(table: &TableRef) -> bool {
+        table.namespace == BifrostNamespace::Audit && table.name == Self::NAME
+    }
+}
 
 impl DomainTable for AuditLogTable {
     const NAMESPACE: &'static str = "system";

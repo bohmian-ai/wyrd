@@ -990,6 +990,9 @@ impl BifrostCatalog {
             }
             let physical = self.catalog.load_table(&table_ident).await?;
             self.validate_physical_table(&physical, &binding, &arrow_schema, &layout)?;
+            // A concurrent winner already created the row; this request's
+            // verdict still commits once, in the transaction that observed it.
+            append_registration_audit(&mut conn, request.audit.as_ref(), &fqn).await?;
             conn.commit().await?;
             return TableUid::from_row(&row.table_uid, &row.fqn);
         }
@@ -1012,16 +1015,7 @@ impl BifrostCatalog {
             &layout_json,
         )
         .await?;
-        if let Some(event) = request.audit.as_ref() {
-            vala_sql::queries::audit_staging::append_audit(&mut conn, event)
-                .await
-                .map_err(|error| {
-                    tracing::error!(error = %error, table = %fqn, "Redux catalog audit append failed");
-                    BifrostCatalogError::AuditUnavailable(
-                        "audit outbox append failed".to_owned(),
-                    )
-                })?;
-        }
+        append_registration_audit(&mut conn, request.audit.as_ref(), &fqn).await?;
         conn.commit().await?;
         Ok(table_uid)
     }
@@ -1481,6 +1475,32 @@ fn resolve_registration_layout(
     let layout = PhysicalLayout::resolve(fqn, &arrow_schema, declared)
         .map_err(BifrostCatalogError::Layout)?;
     Ok((arrow_schema, layout))
+}
+
+/// Appends a caller registration's authorization verdict on its catalog transaction.
+///
+/// Both registration exits that commit — a fresh create and a concurrent
+/// winner's matching row — call this immediately before commit, so the verdict
+/// and the observed catalog state commit or roll back together. Built-in
+/// registrations carry no event and append nothing.
+///
+/// # Errors
+/// Returns [`BifrostCatalogError::AuditUnavailable`] when the staging append fails.
+async fn append_registration_audit(
+    conn: &mut wyrd_sql::TenantConn<'_>,
+    audit: Option<&AuditEvent>,
+    fqn: &str,
+) -> Result<(), BifrostCatalogError> {
+    let Some(event) = audit else {
+        return Ok(());
+    };
+    vala_sql::queries::audit_staging::append_audit(conn, event)
+        .await
+        .map(|_| ())
+        .map_err(|error| {
+            tracing::error!(error = %error, table = %fqn, "Redux catalog audit append failed");
+            BifrostCatalogError::AuditUnavailable("audit outbox append failed".to_owned())
+        })
 }
 
 async fn acquire_table_advisory_lock(

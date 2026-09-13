@@ -68,11 +68,12 @@ fn assert_registered_layout_matches(
 /// Dataset registration requires `bifrost_table:write`. A matching-fingerprint re-register returns
 /// `AlreadyExists`; a conflicting schema is `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH`.
 ///
-/// Exactly one canonical audit row records the verdict. A created table commits
-/// its `Allowed` row inside `register_dataset`'s own transaction; every branch
-/// that writes nothing — invalid namespace, absent catalog, already-exists,
-/// fingerprint or layout mismatch, engine failure — records the same row
-/// standalone before returning, so no received registration goes unaudited.
+/// Exactly one canonical audit row records the verdict. A created table, or a
+/// concurrent winner's matching row, commits its `Allowed` row inside
+/// `register_dataset`'s own transaction; every branch that commits nothing —
+/// invalid namespace, absent catalog, already-exists, fingerprint or layout
+/// mismatch, a catalog failure before commit — records the same row standalone
+/// before returning, so no received registration goes unaudited.
 ///
 /// # Errors
 ///
@@ -151,9 +152,10 @@ pub async fn register_table(
             }
         }
         Err(BifrostCatalogError::TableNotFound(_)) => {
-            // The allowed row commits in the SAME tx as the catalog row
-            // (the append happens inside `create_table` before its commit).
-            let table_uid = catalog
+            // The catalog appends the allowed row only on the transaction it
+            // commits, so any error left the verdict unrecorded — except an
+            // audit failure, which must stay fail-closed rather than retry.
+            let table_uid = match catalog
                 .register_dataset(
                     caller.data_tenant_id,
                     table,
@@ -162,7 +164,16 @@ pub async fn register_table(
                     Some(allowed.clone()),
                 )
                 .await
-                .map_err(map_engine_error)?;
+            {
+                Ok(table_uid) => table_uid,
+                Err(error @ BifrostCatalogError::AuditUnavailable(_)) => {
+                    return Err(map_engine_error(error));
+                }
+                Err(error) => {
+                    record_allowed().await?;
+                    return Err(map_engine_error(error));
+                }
+            };
             Ok(RegisterTableResponse {
                 outcome: RegisterOutcome::Created,
                 table_uid: convert::to_hex(table_uid.as_bytes()),
@@ -265,7 +276,7 @@ mod pg_tests {
 
     use wyrd_runtime::{PermissionSet, Principal, PrincipalId, PrincipalKind};
     use wyrd_spec::request_id::RequestId;
-    use wyrd_spec::vala::api::{DataTypeSpec, FieldSpec};
+    use wyrd_spec::vala::api::{DataTypeSpec, FieldSpec, TimeGranularityWire};
     use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
 
     async fn test_state() -> AppState {
@@ -402,6 +413,68 @@ mod pg_tests {
             assert_eq!(second.outcome, RegisterOutcome::AlreadyExists);
             assert_eq!(first.table_uid, second.table_uid);
             assert_eq!(first.fingerprint, second.fingerprint);
+        });
+    }
+
+    /// A catalog failure before the create commits still records one verdict.
+    ///
+    /// An undeclarable Bloom column fails layout resolution before the catalog
+    /// opens its transaction, so the event handed to the catalog is never
+    /// appended there; the service must record it standalone exactly once.
+    #[test]
+    fn bifrost_tables_register_pre_commit_failure_records_one_verdict() {
+        wyrd_runtime::runtime().block_on(async {
+            let state = test_state().await;
+            let caller = caller_with([Permission::bifrost_table_write()]).await;
+            let name = unique_name();
+            let mut req = register_req(&name, vec![field("id", DataTypeSpec::Int64)]);
+            req.physical_layout = Some(PhysicalLayoutWire {
+                partition_granularity: TimeGranularityWire::Day,
+                sort_keys: Vec::new(),
+                bloom_columns: vec!["absent_column".to_owned()],
+            });
+
+            register_table(&state, caller.clone(), req)
+                .await
+                .expect_err("an undeclarable layout is refused");
+
+            let rows = audit_rows_for(&state, &caller, &format!("vala.datasets.{name}")).await;
+            assert_eq!(rows.len(), 1, "one received verdict, one row");
+            assert_eq!(rows[0].outcome, "allowed");
+        });
+    }
+
+    /// Concurrent same-FQN registrations each record exactly one verdict.
+    ///
+    /// Both requests may miss the table in `describe_table`; the advisory lock
+    /// then lets one create while the other observes the winner's row. The
+    /// loser's verdict must commit on that observing transaction rather than
+    /// vanish, so each request owns exactly one allowed row.
+    #[test]
+    fn bifrost_tables_concurrent_same_fqn_register_records_each_verdict() {
+        wyrd_runtime::runtime().block_on(async {
+            let state = test_state().await;
+            let first_caller = caller_with([Permission::bifrost_table_write()]).await;
+            let second_caller = caller_with([Permission::bifrost_table_write()]).await;
+            let name = unique_name();
+            let req = register_req(&name, vec![field("id", DataTypeSpec::Int64)]);
+
+            let (first, second) = tokio::join!(
+                register_table(&state, first_caller.clone(), req.clone()),
+                register_table(&state, second_caller.clone(), req),
+            );
+            let (first, second) = (
+                first.expect("first registers"),
+                second.expect("second registers"),
+            );
+            assert_eq!(first.table_uid, second.table_uid);
+
+            let resource = format!("vala.datasets.{name}");
+            for caller in [&first_caller, &second_caller] {
+                let rows = audit_rows_for(&state, caller, &resource).await;
+                assert_eq!(rows.len(), 1, "each request records one verdict");
+                assert_eq!(rows[0].outcome, "allowed");
+            }
         });
     }
 

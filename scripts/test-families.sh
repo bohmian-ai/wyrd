@@ -26,7 +26,6 @@ FAMILY_SKALD=(
   skald-observer
   skald-prompt
   skald-providers
-  skald-observer
   skald-runtime
   skald-spec
   skald-tool
@@ -54,6 +53,7 @@ FAMILY_SHARED=(
   wyrd-queue
   wyrd-runtime
   wyrd-loader
+  wyrd-sdk-rust
   wyrd-semver
   wyrd-telemetry
   wyrd-test-contract-macros

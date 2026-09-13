@@ -1,7 +1,7 @@
 """Configure the in-memory mock transport as JSON-compatible config.
 
 Run with:
-    python python/py-wyrd/examples/transport_mock.py
+    python sdks/wyrd-sdk-python/examples/transport_mock.py
 """
 
 from __future__ import annotations

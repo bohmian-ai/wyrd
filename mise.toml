@@ -34,7 +34,7 @@ jobs = 1
 
 [env]
 UI_DIR = "crates/wyrd/wyrd-server/wyrd-ui"
-PY_DIR = "python/py-wyrd"
+PY_DIR = "sdks/wyrd-sdk-python"
 WYRD_DEV_PG_CACHE = "${HOME}/.cache/wyrd/pg"
 # A panicking test should say where it panicked. Every lane below runs under
 # this, so a failure report never costs a second run to reproduce with
@@ -66,10 +66,10 @@ run = "cargo clippy --locked --workspace --all-targets -- -D warnings"
 description = "Whole-plan workspace Clippy with -D warnings (all features, all targets)"
 run = "cargo clippy --locked --workspace --all-features --all-targets -- -D warnings"
 
-[tasks."lint:py-wyrd"]
+[tasks."lint:wyrd-sdk-python"]
 hide = true
-description = "Run the default-feature py-wyrd library clippy check"
-run = "cargo clippy --locked -p py-wyrd --lib -- -D warnings"
+description = "Run the default-feature wyrd-sdk-python library clippy check"
+run = "cargo clippy --locked -p wyrd-sdk-python --lib -- -D warnings"
 
 [tasks."impl:warm"]
 hide = true
@@ -180,7 +180,7 @@ cargo nextest run --locked -p wyrd-client --lib -E 'test(/^bifrost::query::/) | 
 [tasks."test:bifrost:unit:python:inner"]
 hide = true
 description = "Run Python Bifrost unit tests."
-dir = "python/py-wyrd"
+dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup"]
 run = "uv run pytest -q tests/test_bifrost.py tests/bifrost"
 
@@ -344,7 +344,7 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:a
 [tasks."test:bifrost:journey:python:inner"]
 hide = true
 description = "Run Python Bifrost journeys against an already-provisioned Postgres lifecycle."
-dir = "python/py-wyrd"
+dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup:testing"]
 run = "uv run pytest -q -m integration tests/integration/bifrost/test_bifrost_e2e.py tests/integration/test_bifrost_query.py"
 
@@ -540,7 +540,7 @@ hide = true
 description = "Verify standalone and Python-packaged CLI cones remain free of server and database dependencies"
 run = """
 set -eu
-for package in wyrd-cli py-wyrd; do
+for package in wyrd-cli wyrd-sdk-python; do
   if cargo tree --locked -p "$package" -e normal | rg 'sqlx|wyrd-sql|vala-sql|wyrd-auth-issue|wyrd-server|wyrd-dev-fixtures|wyrd-testing'; then
     echo "FAIL: $package production dependency cone contains a server, SQL, issuance, or test-tier crate"
     exit 1
@@ -766,7 +766,7 @@ if rg -n 'CREATE TABLE wyrd\\.cards_[a-z]' crates/wyrd/wyrd-sql/migrations/; the
 
 [tasks."check:test-coverage"]
 hide = true
-description = "Assert every workspace crate (except py-wyrd and wyrd-rust-examples) is assigned to exactly one family test lane in mise.toml"
+description = "Assert every workspace crate (except wyrd-sdk-python and wyrd-rust-examples) is assigned to exactly one family test lane in mise.toml"
 run = "bash scripts/checks/test-coverage.sh"
 
 [tasks."check:unwrap-audit"]
@@ -827,68 +827,68 @@ run = "cargo sqlx prepare --workspace"
 
 [tasks."py:setup"]
 description = "Sync Python dev dependencies and build the Wyrd native extension"
-dir = "python/py-wyrd"
+dir = "sdks/wyrd-sdk-python"
 depends = ["codegen:stubs"]
 run = ["uv sync --all-extras --group dev", "uv run maturin develop"]
 
 [tasks."py:test:unit"]
 description = "Run Python unit tests except TensorFlow-marked tests"
-dir = "python/py-wyrd"
+dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup"]
 run = "uv run python scripts/run_unit_tests.py"
 
 [tasks."py:test:cli:unit"]
 description = "Run focused Python packaging tests for the shared Wyrd CLI"
-dir = "python/py-wyrd"
+dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup"]
 run = "uv run pytest -q tests/unit/cli/test_cli_surface.py"
 
 [tasks."py:test:wyrdstate:unit"]
 description = "Run the focused offline WyrdState hydration tests"
-dir = "python/py-wyrd"
+dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup"]
 run = "uv run pytest -q tests/unit/state"
 
 [tasks."py:test:registry:unit"]
 description = "Run focused Python Card registry boundary tests"
-dir = "python/py-wyrd"
+dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup"]
 run = "uv run pytest -q tests/unit/cards/test_registry_surface.py"
 
 [tasks."py:test:tensorflow"]
 hide = true
 description = "Run TensorFlow-marked Python unit tests"
-dir = "python/py-wyrd"
+dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup"]
 run = "uv run pytest -q -m tensorflow"
 
 [tasks."py:format"]
 description = "Format Wyrd Python package and tests with Ruff"
-dir = "python/py-wyrd"
+dir = "sdks/wyrd-sdk-python"
 run = ["uv run ruff format python/wyrd tests scripts", "uv run ruff check --fix python/wyrd tests scripts"]
 
 [tasks."py:format:check"]
 hide = true
 description = "Check Wyrd Python formatting"
-dir = "python/py-wyrd"
+dir = "sdks/wyrd-sdk-python"
 run = "uv run ruff format --check python/wyrd tests scripts"
 
 [tasks."py:lints"]
 hide = true
 description = "Run Wyrd Python Ruff lint checks"
-dir = "python/py-wyrd"
+dir = "sdks/wyrd-sdk-python"
 run = "uv run ruff check python/wyrd tests scripts"
 
 [tasks."py:typecheck"]
 hide = true
 description = "Run ty over the generated Python stub surface"
-dir = "python/py-wyrd"
-run = "uv run ty check python/wyrd/*.pyi python/wyrd/*/__init__.pyi tests/cards/data/test_public_surface.py tests/bifrost/test_public_typing.py"
+dir = "sdks/wyrd-sdk-python"
+run = "uv run ty check python/wyrd/*.pyi python/wyrd/*/__init__.pyi tests/unit/cards/data/test_public_surface.py tests/bifrost/test_public_typing.py"
 
 [tasks."py:setup:testing"]
 hide = true
-description = "Build py-wyrd with the wyrd.testing test harness enabled"
-dir = "python/py-wyrd"
+description = "Build wyrd-sdk-python with the wyrd.testing test harness enabled"
+dir = "sdks/wyrd-sdk-python"
 depends = ["codegen:stubs"]
 run = [
   "uv sync --all-extras --group dev",
@@ -898,7 +898,7 @@ run = [
 [tasks."py:test:testing"]
 hide = true
 description = "Run the wyrd.testing harness pytest suite"
-dir = "python/py-wyrd"
+dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup:testing"]
 run = "uv run pytest -q tests/harness/test_test_server.py"
 
@@ -911,7 +911,7 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:i
 [tasks."py:test:integration:inner"]
 hide = true
 description = "Run wyrd.testing integration journeys against a live Postgres-backed server"
-dir = "python/py-wyrd"
+dir = "sdks/wyrd-sdk-python"
 run = "uv run pytest -q -m integration"
 
 [tasks."py:test:cards:integration"]
@@ -923,7 +923,7 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:a
 [tasks."py:test:cards:integration:inner"]
 hide = true
 description = "Run the focused real-server Python Card registry journey with its lifecycle already provisioned"
-dir = "python/py-wyrd"
+dir = "sdks/wyrd-sdk-python"
 run = "uv run pytest -q -m integration tests/integration/cards/test_cards_crud.py"
 
 [tasks."py:test:wyrdstate:integration"]
@@ -935,18 +935,18 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:a
 [tasks."py:test:wyrdstate:integration:inner"]
 hide = true
 description = "Run the real-server Python-to-offline typed WyrdState journey with its lifecycle already provisioned"
-dir = "python/py-wyrd"
+dir = "sdks/wyrd-sdk-python"
 run = "uv run pytest -q -m integration tests/integration/state/test_state_journey.py"
 
 [tasks."check:py-wheel-no-testing"]
 hide = true
-description = "Assert the production py-wyrd wheel does not expose wyrd.testing"
-dir = "python/py-wyrd"
+description = "Assert the production wyrd-sdk-python wheel does not expose wyrd.testing"
+dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup"]
 run = """
 set -eu
 if uv run python -c 'import wyrd.testing' 2>/dev/null; then
-  echo 'FAIL: wyrd.testing leaked into the default py-wyrd wheel'
+  echo 'FAIL: wyrd.testing leaked into the default wyrd-sdk-python wheel'
   exit 1
 fi
 """
@@ -954,35 +954,35 @@ fi
 [tasks."examples:python:datacard"]
 hide = true
 description = "Run the local DataCard Python example"
-dir = "python/py-wyrd"
+dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup"]
 run = "uv run python ../../examples/python/datacard_local_workflow.py"
 
 [tasks."examples:python:workflow:openai"]
 hide = true
 description = "Run the sequential OpenAI workflow example"
-dir = "python/py-wyrd"
+dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup"]
 run = "uv run python ../../examples/python/workflow_openai.py"
 
 [tasks."examples:python:workflow:anthropic"]
 hide = true
 description = "Run the sequential Anthropic workflow example"
-dir = "python/py-wyrd"
+dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup"]
 run = "uv run python ../../examples/python/workflow_anthropic.py"
 
 [tasks."examples:python:workflow:gemini"]
 hide = true
 description = "Run the sequential Gemini workflow example"
-dir = "python/py-wyrd"
+dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup"]
 run = "uv run python ../../examples/python/workflow_gemini.py"
 
 [tasks."examples:python:workflow:gateway"]
 hide = true
 description = "Run the split-registry gateway workflow example"
-dir = "python/py-wyrd"
+dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup"]
 run = "uv run python ../../examples/python/workflow_gateway.py"
 
@@ -1186,7 +1186,7 @@ test -f openapi.yaml || { echo 'openapi.yaml missing'; exit 1; }
 [tasks."codegen:stubs"]
 hide = true
 description = "Regenerate Python type stubs"
-dir = "python/py-wyrd"
+dir = "sdks/wyrd-sdk-python"
 run = """
 uv run python scripts/assemble_stubs.py
 uv run ruff check --fix --select I python/wyrd
@@ -1201,8 +1201,8 @@ snapshot_codegen() {
     find crates/wyrd-spec/schemas crates/wyrd-spec/tests/schemas -type f -name '*.json'
     find crates/shared/wyrd-client/schemas crates/shared/wyrd-client/tests/schemas -type f -name '*.json'
     find crates/vala/vala-core/schemas crates/vala/vala-core/tests/schemas -type f -name '*.json'
-    find python/py-wyrd/python/wyrd -type f -name '*.pyi' \
-      ! -path 'python/py-wyrd/python/wyrd/stubs/*'
+    find sdks/wyrd-sdk-python/python/wyrd -type f -name '*.pyi' \
+      ! -path 'sdks/wyrd-sdk-python/python/wyrd/stubs/*'
   } | sort | while IFS= read -r file; do
     shasum -a 256 "$file"
   done

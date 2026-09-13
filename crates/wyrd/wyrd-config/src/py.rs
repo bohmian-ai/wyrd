@@ -139,7 +139,7 @@ fn schema_error(message: String) -> WyrdPyError {
     .into()
 }
 
-/// Register the `wyrd.config` submodule on the py-wyrd aggregator.
+/// Register the `wyrd.config` submodule on the Python SDK aggregator.
 pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let config = PyModule::new(py, "config")?;
     wyrd_interfaces::error::register_exceptions(&config)?;

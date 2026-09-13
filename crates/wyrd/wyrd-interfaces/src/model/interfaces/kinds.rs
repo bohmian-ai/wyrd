@@ -415,10 +415,27 @@ fn package_version(py: Python<'_>, package: &str) -> WyrdPyResult<String> {
     Ok(module_version(py, package)?.unwrap_or_else(|| "unknown".to_string()))
 }
 
+/// Resolve the concrete model class name recorded as `model_subtype`.
+///
+/// A live model reports its type's qualified name. A class supplied as a
+/// hydration template (for example `LightningInterface(model=TinyLightning)`)
+/// reports its own qualified name, so it matches the metadata persisted from an
+/// instance of that class instead of the metaclass name `type`.
+///
+/// # Errors
+///
+/// Returns a boundary error when the object or its type has no string
+/// `__qualname__`.
 #[cfg(feature = "python")]
 fn model_subtype(py: Python<'_>, model: Option<&Py<PyAny>>) -> WyrdPyResult<Option<String>> {
     model
-        .map(|model| crate::model::interfaces::helpers::qualname_of(py, model.bind(py)))
+        .map(|model| {
+            let model = model.bind(py);
+            match model.cast::<pyo3::types::PyType>() {
+                Ok(class) => Ok(class.qualname()?.to_string()),
+                Err(_) => crate::model::interfaces::helpers::qualname_of(py, model),
+            }
+        })
         .transpose()
 }
 

@@ -1,4 +1,4 @@
-# py-wyrd examples
+# wyrd-sdk-python examples
 
 Examples use the built-in `mock` provider so they run without credentials.
 

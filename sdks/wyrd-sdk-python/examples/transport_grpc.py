@@ -1,7 +1,7 @@
 """Configure the default gRPC transport as JSON-compatible config.
 
 Run with:
-    python python/py-wyrd/examples/transport_grpc.py
+    python sdks/wyrd-sdk-python/examples/transport_grpc.py
 """
 
 from __future__ import annotations

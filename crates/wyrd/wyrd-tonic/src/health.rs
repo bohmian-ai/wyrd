@@ -1,7 +1,7 @@
 //! Health-sentinel type and the snapshot trait the server-feature consumer reads.
 //!
 //! Both pieces are dependency-free of `wyrd-server` so the future rust-client
-//! and py-wyrd paths can pull them without transitively dragging in axum or sqlx.
+//! and Python SDK paths can pull them without transitively dragging in axum or sqlx.
 
 /// The tonic `NamedService` whose serving status drives `grpc.health.v1.Health/Check`.
 ///

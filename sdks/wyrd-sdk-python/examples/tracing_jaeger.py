@@ -7,7 +7,7 @@ Prerequisites:
     pip install opentelemetry-sdk opentelemetry-exporter-otlp-proto-grpc
 
 Usage:
-    python python/py-wyrd/examples/tracing_jaeger.py
+    python sdks/wyrd-sdk-python/examples/tracing_jaeger.py
 
 View traces at http://localhost:16686 - search for service "wyrd".
 """

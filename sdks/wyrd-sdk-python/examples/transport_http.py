@@ -1,7 +1,7 @@
 """Configure the HTTP fallback transport as JSON-compatible config.
 
 Run with:
-    python python/py-wyrd/examples/transport_http.py
+    python sdks/wyrd-sdk-python/examples/transport_http.py
 """
 
 from __future__ import annotations

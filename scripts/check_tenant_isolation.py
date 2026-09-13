@@ -116,7 +116,7 @@ SERVER_POOL_ALLOWLIST_PREFIXES = (
 CLIENT_TIER_CRATES = [
     "crates/wyrd-spec",
     "crates/vala/vala-client",
-    "python/py-wyrd",
+    "sdks/wyrd-sdk-python",
 ]
 
 RLS_LOOKAHEAD_CHARS = 8_000

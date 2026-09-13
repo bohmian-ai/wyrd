@@ -1,5 +1,5 @@
 [package]
-name = "py-wyrd"
+name = "wyrd-sdk-python"
 version = { workspace = true }
 edition = { workspace = true }
 license = { workspace = true }

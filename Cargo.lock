@@ -7208,38 +7208,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "py-wyrd"
-version = "0.0.1"
-dependencies = [
- "arrow",
- "arrow-schema",
- "futures-util",
- "pyo3",
- "secrecy",
- "serde",
- "serde_json",
- "skald-agent",
- "skald-observer",
- "skald-prompt",
- "skald-runtime",
- "skald-tool",
- "skald-workflow",
- "tempfile",
- "wyrd-cards",
- "wyrd-cli",
- "wyrd-client",
- "wyrd-config",
- "wyrd-interfaces",
- "wyrd-loader",
- "wyrd-queue",
- "wyrd-runtime",
- "wyrd-semver",
- "wyrd-spec",
- "wyrd-testing",
- "wyrd-utils",
-]
-
-[[package]]
 name = "pyo3"
 version = "0.28.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11559,6 +11527,38 @@ dependencies = [
  "wyrd",
  "wyrd-client",
  "wyrd-spec",
+]
+
+[[package]]
+name = "wyrd-sdk-python"
+version = "0.0.1"
+dependencies = [
+ "arrow",
+ "arrow-schema",
+ "futures-util",
+ "pyo3",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "skald-agent",
+ "skald-observer",
+ "skald-prompt",
+ "skald-runtime",
+ "skald-tool",
+ "skald-workflow",
+ "tempfile",
+ "wyrd-cards",
+ "wyrd-cli",
+ "wyrd-client",
+ "wyrd-config",
+ "wyrd-interfaces",
+ "wyrd-loader",
+ "wyrd-queue",
+ "wyrd-runtime",
+ "wyrd-semver",
+ "wyrd-spec",
+ "wyrd-testing",
+ "wyrd-utils",
 ]
 
 [[package]]

@@ -33,7 +33,7 @@ for package in metadata["packages"]:
         if dependency.get("kind") not in (None, "normal"):
             continue
         if (
-            package["name"] == "py-wyrd"
+            package["name"] == "wyrd-sdk-python"
             and dependency["name"] == "wyrd-testing"
             and dependency.get("optional")
         ):

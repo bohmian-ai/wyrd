@@ -47,12 +47,12 @@ jobs:
           args: --out dist
           maturin-version: 1.8.3
           rust-toolchain: stable
-          working-directory: python/py-wyrd
+          working-directory: sdks/wyrd-sdk-python
 
       - uses: actions/upload-artifact@v4
         with:
           name: pypi_sdist
-          path: python/py-wyrd/dist
+          path: sdks/wyrd-sdk-python/dist
           retention-days: 1
 
   build-linux:
@@ -88,7 +88,7 @@ jobs:
           args: --release --out dist
           rust-toolchain: stable
           docker-options: ${{ matrix.docker-options }}
-          working-directory: python/py-wyrd
+          working-directory: sdks/wyrd-sdk-python
           # manylinux containers don't have mise; install build deps manually.
           # wyrd only needs openssl headers + protoc (no cmake, no kafka deps).
           before-script-linux: |
@@ -109,12 +109,12 @@ jobs:
             rm "protoc-33.2-${PROTOC_ARCH}.zip"
             chmod +x /usr/local/bin/protoc && protoc --version
 
-      - run: twine check --strict python/py-wyrd/dist/*
+      - run: twine check --strict sdks/wyrd-sdk-python/dist/*
 
       - uses: actions/upload-artifact@v4
         with:
           name: pypi_linux_${{ matrix.target }}
-          path: python/py-wyrd/dist
+          path: sdks/wyrd-sdk-python/dist
           retention-days: 1
 
   build-macos:
@@ -152,14 +152,14 @@ jobs:
           target: ${{ matrix.target }}
           args: --release --out dist
           rust-toolchain: stable
-          working-directory: python/py-wyrd
+          working-directory: sdks/wyrd-sdk-python
 
-      - run: twine check --strict python/py-wyrd/dist/*
+      - run: twine check --strict sdks/wyrd-sdk-python/dist/*
 
       - uses: actions/upload-artifact@v4
         with:
           name: pypi_macos_${{ matrix.target }}
-          path: python/py-wyrd/dist
+          path: sdks/wyrd-sdk-python/dist
           retention-days: 1
 
   build-windows:
@@ -187,14 +187,14 @@ jobs:
           target: x86_64-pc-windows-msvc
           args: --release --out dist
           rust-toolchain: stable
-          working-directory: python/py-wyrd
+          working-directory: sdks/wyrd-sdk-python
 
-      - run: twine check --strict python/py-wyrd/dist/*
+      - run: twine check --strict sdks/wyrd-sdk-python/dist/*
 
       - uses: actions/upload-artifact@v4
         with:
           name: pypi_windows_x86_64
-          path: python/py-wyrd/dist
+          path: sdks/wyrd-sdk-python/dist
           retention-days: 1
 
   inspect-wheels:
@@ -248,7 +248,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Verify version matches release tag
-        working-directory: python/py-wyrd
+        working-directory: sdks/wyrd-sdk-python
         run: |
           VERSION=$(cargo pkgid | cut -d '#' -f2)
           echo "crate version: v$VERSION  tag: ${{ github.ref_name }}"

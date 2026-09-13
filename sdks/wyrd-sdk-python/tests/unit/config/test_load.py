@@ -3,9 +3,9 @@
 from pathlib import Path
 
 import pytest
+from wyrd import WyrdError
 from wyrd.cards import CardKind
 from wyrd.config import WyrdConfig
-from wyrd.errors import CfgInvalidToml, CfgSchemaMismatch
 
 
 def test_load_round_trip(tmp_path: Path) -> None:
@@ -18,8 +18,9 @@ def test_load_round_trip(tmp_path: Path) -> None:
 
 def test_load_explicit_missing_raises_typed(tmp_path: Path) -> None:
     missing = tmp_path / "no-such.toml"
-    with pytest.raises(CfgInvalidToml):
+    with pytest.raises(WyrdError) as exc:
         WyrdConfig.load(missing)
+    assert exc.value.code == "WYRD_CFG_400_INVALID_TOML"
 
 
 def test_apply_defaults_in_place(tmp_path: Path) -> None:
@@ -45,16 +46,18 @@ def test_apply_defaults_unknown_kind_raises_typed(tmp_path: Path) -> None:
     cfg_file = tmp_path / "wyrd.toml"
     cfg_file.write_text('[defaults]\nspace = "prod"\n')
     cfg = WyrdConfig.load(cfg_file)
-    with pytest.raises(CfgSchemaMismatch):
+    with pytest.raises(WyrdError) as exc:
         cfg.apply_defaults({"name": "churn"}, "NotAKind")
+    assert exc.value.code == "WYRD_CFG_400_SCHEMA_MISMATCH"
 
 
 def test_apply_defaults_missing_name_raises_typed(tmp_path: Path) -> None:
     cfg_file = tmp_path / "wyrd.toml"
     cfg_file.write_text('[defaults]\nspace = "prod"\n')
     cfg = WyrdConfig.load(cfg_file)
-    with pytest.raises(CfgSchemaMismatch) as exc:
+    with pytest.raises(WyrdError) as exc:
         cfg.apply_defaults({"space": "x"}, "Model")
+    assert exc.value.code == "WYRD_CFG_400_SCHEMA_MISMATCH"
     assert "name" in str(exc.value)
 
 
@@ -62,8 +65,9 @@ def test_apply_defaults_invalid_name_raises_typed(tmp_path: Path) -> None:
     cfg_file = tmp_path / "wyrd.toml"
     cfg_file.write_text('[defaults]\nspace = "prod"\n')
     cfg = WyrdConfig.load(cfg_file)
-    with pytest.raises(CfgSchemaMismatch):
+    with pytest.raises(WyrdError) as exc:
         cfg.apply_defaults({"name": "INVALID"}, "Model")
+    assert exc.value.code == "WYRD_CFG_400_SCHEMA_MISMATCH"
 
 
 def test_apply_defaults_accepts_typed_card_kind_enum(tmp_path: Path) -> None:

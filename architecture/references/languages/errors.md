@@ -143,14 +143,13 @@ Python exceptions must preserve:
 
 `WyrdError` is the one structured Python root. Every expected Wyrd failure,
 including Bifrost construction, ingestion, flush, shutdown, query, and stream
-failures, derives from it and uses the same central metadata mapper.
-Domain-specific classes such as `BifrostQueryError` and
-`IncompleteQueryStreamError` remain real subclasses for ergonomic catches;
-`except WyrdError` remains exhaustive for expected platform failures.
+failures, is raised as it and uses the same central metadata mapper; callers
+branch on `code`. `BifrostQueryError`, `IncompleteQueryStreamError`, and
+`NoCredentialsError` do not exist, and no exception carries an aggregate
+`problem` attribute.
 
-Do not publish aliases that merely rename `WyrdError`. In particular,
-`CfgInvalidToml`, `CfgSchemaMismatch`, and `CfgNameDefaultRejected` are not real
-subclasses and must not remain compatibility aliases. Preserve safe,
+Do not publish aliases that merely rename `WyrdError` (for example
+`Cfg*` names). Preserve safe,
 string-backed `__cause__` projection at the PyO3 edge without storing `PyErr`
 inside reusable Rust errors.
 

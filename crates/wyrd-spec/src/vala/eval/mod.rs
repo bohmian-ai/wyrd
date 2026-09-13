@@ -8,7 +8,7 @@
 //! load (see `validate_dag` / Lock #12).
 //!
 //! Runtime execution lives in `vala-eval` (PR4.4). Python wrappers live in
-//! `python/py-wyrd` (PR4.7). `wyrd-spec` ships only the contracts.
+//! `sdks/wyrd-sdk-python` (PR4.7). `wyrd-spec` ships only the contracts.
 //!
 //! Module map:
 //! - `ids` — `TaskId`, `SessionId`, `RecordId`, `WorkflowUid`, `EntityUid`,

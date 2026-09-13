@@ -1,5 +1,5 @@
 import pytest
-from wyrd import Agent, Prompt, Workflow
+from wyrd import Agent, Prompt, Workflow, WyrdError
 
 
 def _build_agent(name: str) -> Agent:
@@ -36,5 +36,7 @@ def test_workflow_parallel_no_dependencies() -> None:
 
 
 def test_workflow_sequential_rejects_non_agent_positional() -> None:
-    with pytest.raises(TypeError):
+    with pytest.raises(WyrdError) as exc:
         Workflow.sequential("research", "not-an-agent")
+    assert exc.value.code == "WYRD_WORKFLOW_422_VALIDATION"
+    assert exc.value.details["argument"] == "agents"

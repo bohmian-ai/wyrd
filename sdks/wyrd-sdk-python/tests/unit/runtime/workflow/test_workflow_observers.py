@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from wyrd import Agent, Observer, OtelObserver, Prompt, Workflow
+from wyrd import Agent, Observer, OtelObserver, Prompt, Workflow, WyrdError
 
 
 class RecordingObserver(Observer):
@@ -61,8 +61,10 @@ def test_workflow_accepts_observers_list() -> None:
 def test_workflow_rejects_non_observer_type() -> None:
     agent = _agent("planner", "hello")
 
-    with pytest.raises(TypeError, match="expected Observer subclass"):
+    with pytest.raises(WyrdError, match="expected Observer subclass") as exc:
         Workflow.sequential("bad", agent, observers=[object()])
+    assert exc.value.code == "WYRD_WORKFLOW_422_VALIDATION"
+    assert exc.value.details["argument"] == "observers"
 
 
 def test_workflow_observer_receives_workflow_events() -> None:

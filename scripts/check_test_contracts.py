@@ -9,8 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-RUST_ROOTS = [ROOT / "crates", ROOT / "python" / "py-wyrd" / "src"]
-PYTHON_TEST_ROOTS = [ROOT / "python" / "py-wyrd" / "tests"]
+RUST_ROOTS = [ROOT / "crates", ROOT / "sdks" / "wyrd-sdk-python" / "src"]
+PYTHON_TEST_ROOTS = [ROOT / "sdks" / "wyrd-sdk-python" / "tests"]
 
 CONTRACT_RE = re.compile(
     r"#\[\s*wyrd_test_contract_macros::critical\s*\(\s*['\"]([^'\"]+)['\"]\s*\)\s*\]"

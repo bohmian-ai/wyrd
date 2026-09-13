@@ -66,7 +66,7 @@ Both CI workflows (`lints-test`, `codegen-check`) must be green before merge.
 - Library errors use `thiserror`. Binary errors use `anyhow`.
 - Public Spec enums and structs are `#[non_exhaustive]`.
 - Every wire type derives `schemars::JsonSchema`.
-- PyO3 lives only in `python/py-wyrd*` and an explicit allowlist.
+- PyO3 lives only in `sdks/wyrd-sdk-python` and an explicit allowlist.
 - Client-tier crates may not depend on `sqlx`, `datafusion`, `deltalake`, or
   cloud SDKs.
 

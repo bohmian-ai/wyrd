@@ -20,8 +20,8 @@ class WyrdConfig:
         * ``path=None``: ancestor-walk from CWD, bounded by the
           nearest ``.git`` ancestor or ``$HOME``. Missing
           ``wyrd.toml`` returns an **empty config** (no error).
-        * ``path=Path(...)``: read that exact file. Missing -> typed
-          ``wyrd.errors.CfgInvalidToml``.
+        * ``path=Path(...)``: read that exact file. Missing -> ``wyrd.WyrdError``
+          with code ``WYRD_CFG_400_INVALID_TOML``.
         """
         ...
 

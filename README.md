@@ -19,7 +19,7 @@ mise run dev:full
 - `crates/vala/` - observability, evaluation, traces, and analytical storage.
 - `crates/skald/` - LLM providers, prompts, agents, and workflows.
 - `crates/shared/` - shared infrastructure.
-- `python/py-wyrd/` - Python wheel source.
+- `sdks/wyrd-sdk-python/` - Python wheel source.
 
 ## License
 

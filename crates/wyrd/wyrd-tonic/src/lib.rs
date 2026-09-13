@@ -1,7 +1,7 @@
 //! Wyrd-owned tonic facade.
 //!
 //! All tonic-family version pins live here. Consumers (`wyrd-server`, future
-//! `rust-client`, `py-wyrd` gRPC stubs) take `wyrd-tonic` as a workspace
+//! `rust-client`, Python SDK gRPC stubs) take `wyrd-tonic` as a workspace
 //! dependency rather than declaring their own tonic pins.
 //!
 //! The re-exports below are the point of this crate. A major bump in `tonic`

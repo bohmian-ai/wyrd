@@ -24,6 +24,7 @@ pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 pub const PROTO_FRAME_OVERHEAD_BYTES: usize = 4 * 1024;
 
 /// Maximum number of reconnect retries for one unacknowledged batch.
+#[cfg(any(test, feature = "test-support"))]
 pub const MAX_FRAME_RETRIES: u32 = 8;
 
 const RETRY_BACKOFF_MS: [u64; 3] = [100, 1_000, 5_000];
@@ -46,6 +47,7 @@ impl Default for BifrostTransportConfig {
 impl BifrostTransportConfig {
     /// Build configuration with a bounded retry budget.
     #[must_use]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_max_frame_retries(max_frame_retries: u32) -> Self {
         Self {
             max_frame_retries: max_frame_retries.min(MAX_FRAME_RETRIES),
@@ -88,12 +90,6 @@ impl BifrostGrpcTransport {
     #[must_use]
     pub fn new(connection: GrpcConnection, config: BifrostTransportConfig) -> Self {
         Self { connection, config }
-    }
-
-    /// Return the transport retry configuration.
-    #[must_use]
-    pub fn config(&self) -> BifrostTransportConfig {
-        self.config
     }
 
     async fn send_once(&self, request: InsertBatchRequest) -> Result<(), AttemptError> {

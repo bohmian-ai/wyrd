@@ -22,7 +22,7 @@ __pycache__/
 .ruff_cache/
 .coverage
 coverage.xml
-python/py-wyrd/python/wyrd/*.so
+sdks/wyrd-sdk-python/python/wyrd/*.so
 
 # IDE / OS
 .DS_Store

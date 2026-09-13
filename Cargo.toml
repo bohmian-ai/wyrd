@@ -8,7 +8,7 @@ members = [
     "crates/bindings/*",
     "crates/wyrd-spec",
     "examples/rust",
-    "python/py-wyrd",
+    "sdks/wyrd-sdk-python",
     "sdks/wyrd-sdk-rust",
 ]
 exclude = []

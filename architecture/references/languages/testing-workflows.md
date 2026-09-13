@@ -179,7 +179,7 @@ a specific change will trip:
 | `check:no-legacy-server-vocab` | Reject legacy vocabulary + orphan-rule violations |
 | `check:no-tonic-outside-wyrd-tonic` | Reject tonic-family deps outside `wyrd-tonic` + workspace pins |
 | `check:test-coverage` | Every crate assigned to exactly one family test lane |
-| `check:py-wheel-no-testing` | Production `py-wyrd` wheel does not expose `wyrd.testing` |
+| `check:py-wheel-no-testing` | Production `wyrd-sdk-python` wheel does not expose `wyrd.testing` |
 | `check:error-coverage` | Skald error codes mapped; SQL errors have coverage |
 | `check:design-sync` | `ValaQueryService` + payload-read permissions match `wyrd-design.md` |
 | `check:single-into-response-impl` | HTTP errors flow through one server `IntoResponse` mapper |

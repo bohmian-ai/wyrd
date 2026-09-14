@@ -294,6 +294,14 @@ impl ForgeTasks {
     /// demand generation aborts the transaction so task, audit, acknowledgement,
     /// and cursor state cannot commit against different generations.
     ///
+    /// The insert skips on any uniqueness conflict: the exact-plan idempotency
+    /// key, and the `forge_tasks_orphan_cleanup_active` invariant that admits
+    /// one nonterminal `orphan_cleanup` task per table. A skipped task is
+    /// successful coalescing: the demand is still acknowledged and the cursor
+    /// advanced, and the returned strategies name only the rows actually
+    /// inserted. No preflight read is made, so concurrent writers cannot race
+    /// past the invariant.
+    ///
     /// # Errors
     /// Returns validation, fencing, or SQL errors. Any error rolls back all inserts.
     ///
@@ -336,7 +344,7 @@ impl ForgeTasks {
             }
             task.estimates.validate()?;
             let plan = crate::row_types::forge_tasks::plan_to_value(&task.plan);
-            let committed = sqlx::query("INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,state,ready_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'ready',$12) ON CONFLICT (data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan_hash) DO NOTHING")
+            let committed = sqlx::query("INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,state,ready_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'ready',$12) ON CONFLICT DO NOTHING")
                 .bind(Uuid::now_v7()).bind(task.data_tenant_id.as_uuid()).bind(&task.table_ref.catalog).bind(&task.table_ref.namespace).bind(&task.table_ref.table).bind(task.strategy.as_str()).bind(task.base_snapshot_id).bind(plan).bind(task.plan_hash.as_slice()).bind(i64::from(task.estimates.files)).bind(i64::try_from(task.estimates.bytes).map_err(|_|SqlError::Conflict{detail:"estimated bytes overflow".to_owned()})?).bind(task.ready_at).execute(&mut *tx).await.map_err(SqlError::from)?;
             if committed.rows_affected() == 1 {
                 inserted.push(task.strategy);

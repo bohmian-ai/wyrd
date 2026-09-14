@@ -3091,6 +3091,200 @@ mod pg_tests {
             .expect("state read")
     }
 
+    /// Plans one periodic demand generation and enqueues `executable` against it.
+    ///
+    /// Returns the strategies actually inserted, exactly as the scheduler sees
+    /// them.
+    ///
+    /// # Panics
+    /// Panics when the demand cannot be requested, listed, or acknowledged.
+    async fn plan_periodic(
+        tasks: &ForgeTasks,
+        owner: Uuid,
+        fence: i64,
+        tenant: DataTenantId,
+        executable: &NewForgeTask,
+    ) -> Vec<ForgeTaskStrategy> {
+        tasks
+            .upsert_periodic(tenant, &executable.table_ref)
+            .await
+            .expect("periodic demand");
+        let demand = tasks
+            .planning_demands(owner, fence, 1)
+            .await
+            .expect("demand page")
+            .0
+            .remove(0);
+        tasks
+            .enqueue_and_acknowledge(
+                owner,
+                fence,
+                &demand,
+                ForgeEnqueueBatch {
+                    executable: std::slice::from_ref(executable),
+                },
+            )
+            .await
+            .expect("enqueue and acknowledge")
+    }
+
+    /// Reads every nonterminal orphan-cleanup task for `table` as `(task_id, plan_hash, plan)`.
+    ///
+    /// # Panics
+    /// Panics when the read fails.
+    async fn nonterminal_orphan_tasks(
+        superuser: &PgPool,
+        tenant: DataTenantId,
+        table: &str,
+    ) -> Vec<(Uuid, Vec<u8>, serde_json::Value)> {
+        sqlx::query_as("SELECT task_id,plan_hash,plan FROM vala.forge_tasks WHERE data_tenant_id=$1 AND table_name=$2 AND strategy='orphan_cleanup' AND state IN ('ready','retryable','claimed','running','prepared') ORDER BY task_id")
+            .bind(tenant.as_uuid()).bind(table).fetch_all(superuser).await.expect("orphan tasks")
+    }
+
+    /// At most one nonterminal orphan-cleanup task exists per table.
+    ///
+    /// Every periodic cycle derives a fresh age cutoff and therefore a fresh
+    /// plan hash, so the exact-plan idempotency key alone would let the backlog
+    /// grow without bound while the first task waits. The partial uniqueness
+    /// invariant coalesces the later demand onto the pending task inside the
+    /// same acknowledgement transaction, without a racy preflight read, and a
+    /// terminal task stops blocking its successor.
+    ///
+    /// # Panics
+    /// Panics when PostgreSQL setup or any invariant assertion fails.
+    #[tokio::test]
+    async fn orphan_cleanup_demand_coalesces_onto_one_nonterminal_task() {
+        let (fixture, admin) = setup().await;
+        let op = fixture.operator_pool();
+        let tasks = ForgeTasks::new(op.clone());
+        let tenant = fixture.data_tenant_id();
+        let table = "coalesce";
+        let prefix = format!("tenants/{tenant}/bifrost/{table}/data/forge/v1");
+        let owner = Uuid::now_v7();
+        let fence = tasks
+            .acquire_scheduler(owner, 30)
+            .await
+            .expect("scheduler")
+            .expect("fence");
+        let demand_count = || async {
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM vala.forge_planning_demands WHERE data_tenant_id=$1 AND table_name=$2")
+                .bind(tenant.as_uuid()).bind(table).fetch_one(&admin).await.expect("demand count")
+        };
+
+        // 1. The first plan inserts one ready task.
+        let first = NewForgeTask {
+            plan_hash: [1; 32],
+            ..orphan_task(tenant, table, &prefix, 1_700_000_000_000)
+        };
+        assert_eq!(
+            plan_periodic(&tasks, owner, fence, tenant, &first).await,
+            vec![ForgeTaskStrategy::OrphanCleanup]
+        );
+        let pending = nonterminal_orphan_tasks(&admin, tenant, table).await;
+        assert_eq!(pending.len(), 1);
+        let (first_id, first_hash, first_plan) = pending[0].clone();
+        assert_eq!(first_hash, vec![1; 32]);
+
+        // 2-5. A later demand with a fresh cutoff and hash is acknowledged
+        // without inserting, and the pending task is untouched.
+        let second = NewForgeTask {
+            plan_hash: [2; 32],
+            ..orphan_task(tenant, table, &prefix, 1_700_000_060_000)
+        };
+        assert!(
+            plan_periodic(&tasks, owner, fence, tenant, &second)
+                .await
+                .is_empty(),
+            "a fresh cutoff coalesces onto the pending orphan task"
+        );
+        assert_eq!(
+            nonterminal_orphan_tasks(&admin, tenant, table).await,
+            vec![(first_id, first_hash.clone(), first_plan.clone())],
+            "coalescing leaves the stored task id, cutoff, plan, and hash unchanged"
+        );
+        assert_eq!(
+            demand_count().await,
+            0,
+            "the coalesced demand is acknowledged"
+        );
+        let cursor: Option<Uuid> = sqlx::query_scalar(
+            "SELECT last_tenant_id FROM vala.forge_scheduler_state WHERE singleton",
+        )
+        .fetch_one(&admin)
+        .await
+        .expect("cursor");
+        assert_eq!(
+            cursor,
+            Some(tenant.as_uuid()),
+            "coalescing advances the cursor"
+        );
+
+        // 6. Concurrent insertion cannot create two nonterminal orphan tasks.
+        // Once the first task is terminal, an uncommitted competing row holds
+        // the invariant while the scheduler's insert blocks on it; when the
+        // competitor commits, the scheduler's insert is skipped, not errored.
+        sqlx::query("UPDATE vala.forge_tasks SET state='cancelled' WHERE task_id=$1")
+            .bind(first_id)
+            .execute(&admin)
+            .await
+            .expect("terminal first task");
+        let mut competitor = admin.begin().await.expect("competitor tx");
+        let competitor_id = Uuid::now_v7();
+        sqlx::query("INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,state,ready_at) SELECT $1,data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan,$2,estimated_files,estimated_bytes,'ready',ready_at FROM vala.forge_tasks WHERE task_id=$3")
+            .bind(competitor_id).bind([3_u8; 32].as_slice()).bind(first_id)
+            .execute(&mut *competitor).await.expect("competitor insert");
+        let racing = NewForgeTask {
+            plan_hash: [4; 32],
+            ..orphan_task(tenant, table, &prefix, 1_700_000_120_000)
+        };
+        let scheduler = tokio::spawn({
+            let tasks = tasks.clone();
+            async move { plan_periodic(&tasks, owner, fence, tenant, &racing).await }
+        });
+        let mut blocked = false;
+        for _ in 0..500 {
+            blocked = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE NOT granted)",
+            )
+            .fetch_one(&admin)
+            .await
+            .expect("wait state");
+            if blocked {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        assert!(blocked, "the scheduler insert waits on the competing row");
+        competitor.commit().await.expect("competitor commit");
+        assert!(
+            scheduler.await.expect("scheduler task").is_empty(),
+            "the racing insert coalesces once the competitor commits"
+        );
+        let survivors = nonterminal_orphan_tasks(&admin, tenant, table).await;
+        assert_eq!(survivors.len(), 1);
+        assert_eq!(survivors[0].0, competitor_id);
+        assert_eq!(demand_count().await, 0);
+
+        // 7. A terminal task no longer blocks a fresh-cutoff successor.
+        sqlx::query("UPDATE vala.forge_tasks SET state='succeeded' WHERE task_id=$1")
+            .bind(competitor_id)
+            .execute(&admin)
+            .await
+            .expect("terminal competitor");
+        let successor = NewForgeTask {
+            plan_hash: [5; 32],
+            ..orphan_task(tenant, table, &prefix, 1_700_000_180_000)
+        };
+        assert_eq!(
+            plan_periodic(&tasks, owner, fence, tenant, &successor).await,
+            vec![ForgeTaskStrategy::OrphanCleanup]
+        );
+        let successors = nonterminal_orphan_tasks(&admin, tenant, table).await;
+        assert_eq!(successors.len(), 1);
+        assert_eq!(successors[0].1, vec![5; 32]);
+        assert_ne!(successors[0].0, competitor_id);
+    }
+
     /// The orphan-cleanup plan, cursor, retry, and completion contracts are closed.
     ///
     /// One periodic orphan-cleanup task is fully described by its tenant, its

@@ -3431,11 +3431,11 @@ async fn coordinator_preseeded_demand_requires_roster_discovery() {
     );
     assert_eq!(
         table_task_count(&pool, tenant, "roster_required").await,
-        2,
-        "fresh discovery plans a new orphan cutoff in its new cycle"
+        1,
+        "the new cycle's fresh orphan cutoff coalesces onto the still-pending orphan task"
     );
     eprintln!(
-        "roster unavailable: task=1/demand=0/ready=false; restored: tasks=2/demand=0/ready=true"
+        "roster unavailable: task=1/demand=0/ready=false; restored: tasks=1/demand=0/ready=true"
     );
     stop.cancel();
     join_forge_loop(&server, handle)

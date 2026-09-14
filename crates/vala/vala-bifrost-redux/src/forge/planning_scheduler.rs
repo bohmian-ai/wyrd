@@ -653,7 +653,12 @@ impl<'forge> ForgeScheduler<'forge> {
         if result.acknowledged
             && let Some(observer) = &self.forge.core.completion_observer
         {
-            for task in &executable {
+            // A batch holds at most one task per strategy, so the inserted
+            // strategies identify exactly the rows that gained a task id.
+            for task in executable
+                .iter()
+                .filter(|task| inserted.contains(&task.strategy))
+            {
                 observer.record_lifecycle(ForgeLifecycleEvent::Planned {
                     task_id: self
                         .tasks

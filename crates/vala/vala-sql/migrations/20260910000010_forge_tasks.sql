@@ -43,6 +43,9 @@ CREATE UNIQUE INDEX forge_tasks_idempotency ON vala.forge_tasks
 CREATE UNIQUE INDEX forge_tasks_publication_active ON vala.forge_tasks
  (data_tenant_id, catalog_name, namespace_name, table_name)
  WHERE state IN ('claimed','running','prepared');
+CREATE UNIQUE INDEX forge_tasks_orphan_cleanup_active ON vala.forge_tasks
+ (data_tenant_id, catalog_name, namespace_name, table_name)
+ WHERE strategy = 'orphan_cleanup' AND state IN ('ready','retryable','claimed','running','prepared');
 CREATE INDEX forge_tasks_ready ON vala.forge_tasks
  (data_tenant_id, ready_at, task_id)
  WHERE state IN ('ready','retryable');

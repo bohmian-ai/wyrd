@@ -220,7 +220,7 @@ fn agent_projects_locked_agent_envelope_shape() {
     assert!(yaml.contains("apiVersion: wyrd/v1"));
     assert!(yaml.contains("kind: Agent"));
     assert!(yaml.contains("relationships:"));
-    assert!(yaml.contains("status: null"));
+    assert!(!yaml.contains("status:"));
     assert!(!yaml.contains("kind: inline"));
     assert!(!yaml.contains("kind: card"));
     assert!(!yaml.contains("value:"));
@@ -334,7 +334,7 @@ fn fixture_loads_with_single_version_field() {
     let fixture = include_str!("fixtures/agent_planner_v0.3.yaml");
     assert!(fixture.contains("apiVersion: wyrd/v1"));
     assert!(fixture.contains("relationships:"));
-    assert!(fixture.contains("status: null"));
+    assert!(!fixture.contains("status:"));
     assert!(fixture.contains("kind: Prompt"));
     assert!(!fixture.contains("kind: card"));
     assert!(!fixture.contains("value:"));

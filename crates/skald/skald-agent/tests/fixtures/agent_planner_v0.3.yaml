@@ -15,6 +15,4 @@ spec:
     tool_concurrency_cap: 2
     session_recent_limit: 4
     timeout_ms: 2500
-relationships:
-  outbound: []
-status: null
+relationships: {}

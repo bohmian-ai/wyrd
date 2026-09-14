@@ -15,7 +15,7 @@ A Workflow is a directed acyclic graph of Agent invocations. Use `Workflow.seque
 <LangTabs>
 <LangTab lang="python">
 
-<CodeFromFile file="python/py-wyrd/examples/from_builder.py" lang="python" />
+<CodeFromFile file="sdks/wyrd-sdk-python/examples/from_builder.py" lang="python" />
 
 </LangTab>
 <LangTab lang="rust">
@@ -71,7 +71,7 @@ Use `parallel` when steps do not depend on each other. Use `add_after` to fan ba
 <LangTabs>
 <LangTab lang="python">
 
-<CodeFromFile file="python/py-wyrd/examples/parallel.py" lang="python" />
+<CodeFromFile file="sdks/wyrd-sdk-python/examples/parallel.py" lang="python" />
 
 </LangTab>
 <LangTab lang="rust">
@@ -89,7 +89,7 @@ structured output across every step of the run.
 <LangTabs>
 <LangTab lang="python">
 
-<CodeFromFile file="python/py-wyrd/examples/with_observer.py" lang="python" />
+<CodeFromFile file="sdks/wyrd-sdk-python/examples/with_observer.py" lang="python" />
 
 </LangTab>
 <LangTab lang="rust">

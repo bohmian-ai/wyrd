@@ -2,7 +2,7 @@
   import { highlight } from '$lib/shiki';
   import CodeBlock from '$lib/mdsvex/CodeBlock.svelte';
 
-  // Embeds a source file from the repo (crates / examples / python) into the
+  // Embeds a source file from the repo (crates / examples / python / sdks) into the
   // docs, highlighted with the same Shiki themes as Markdown fences. The `file`
   // prop is a repo-relative path; any number of leading `../` or `/` segments
   // are tolerated, so the legacy Astro call sites
@@ -17,7 +17,7 @@
 
   // Eager raw glob keyed by repo path. `/` is the Vite root (docs/); `/../`
   // climbs to the repo root so examples/ and python/ are reachable.
-  const files = import.meta.glob('/../{crates,examples,python}/**/*.{rs,py,yaml,toml}', {
+  const files = import.meta.glob('/../{crates,examples,python,sdks}/**/*.{rs,py,yaml,toml}', {
     eager: true,
     import: 'default',
     query: '?raw'
@@ -26,7 +26,7 @@
   // Reduce any path (glob key or author prop) to its repo-relative tail starting
   // at the first top-level dir, so the two sides match regardless of `../` depth.
   function repoTail(path: string): string {
-    const m = path.match(/(?:crates|examples|python)\/.*$/);
+    const m = path.match(/(?:sdks|crates|examples|python)\/.*$/);
     return m ? m[0] : path;
   }
 

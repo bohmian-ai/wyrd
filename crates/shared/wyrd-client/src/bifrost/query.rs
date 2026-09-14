@@ -139,23 +139,7 @@ impl From<&BifrostClientError> for WyrdError {
                 details: serde_json::json!({}),
             },
             BifrostClientError::Queue(inner) => queue_catalog_error(inner),
-            BifrostClientError::Client(inner) => client_catalog_error(inner),
-        }
-    }
-}
-
-/// Projects one client-tier transport failure onto its catalog variant.
-///
-/// The `WYRD_CLIENT_*` codes are client-boundary contracts, so each refusal
-/// names its own catalog variant instead of collapsing onto an internal error.
-fn client_catalog_error(error: &WyrdClientError) -> WyrdError {
-    let message = error.to_string();
-    let details = serde_json::json!({});
-    match error {
-        WyrdClientError::Config { .. } => WyrdError::ClientConfigInvalid { message, details },
-        WyrdClientError::NoCredentials => WyrdError::ClientNoCredentials { message, details },
-        WyrdClientError::TransportDown { .. } => {
-            WyrdError::ClientTransportDown { message, details }
+            BifrostClientError::Client(inner) => inner.into(),
         }
     }
 }

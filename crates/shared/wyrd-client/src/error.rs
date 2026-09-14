@@ -86,6 +86,31 @@ impl WyrdClientError {
     }
 }
 
+impl From<&WyrdClientError> for WyrdError {
+    /// Project one client-local failure onto its `WYRD_CLIENT_*` catalog variant.
+    ///
+    /// This is the single client-error projection shared by every facade, so a
+    /// missing credential, invalid configuration, or unavailable transport keeps
+    /// the same code and status whether it surfaced through `Cards` or
+    /// `Bifrost`. The variant `Display` text becomes the catalog message.
+    fn from(error: &WyrdClientError) -> Self {
+        let message = error.to_string();
+        let details = serde_json::json!({});
+        match error {
+            WyrdClientError::Config { .. } => Self::ClientConfigInvalid { message, details },
+            WyrdClientError::NoCredentials => Self::ClientNoCredentials { message, details },
+            WyrdClientError::TransportDown { .. } => Self::ClientTransportDown { message, details },
+        }
+    }
+}
+
+impl From<WyrdClientError> for WyrdError {
+    /// Project an owned client-local failure through the borrowed projection.
+    fn from(error: WyrdClientError) -> Self {
+        Self::from(&error)
+    }
+}
+
 /// Map an HTTP `application/problem+json` response body into a [`WyrdError`].
 ///
 /// Reads the stable `code` field and reconstructs the matching

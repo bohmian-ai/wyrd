@@ -62,3 +62,17 @@ def test_model_get_rejects_legacy_load_args_before_network() -> None:
         match="get\\(\\) got an unexpected keyword argument 'load_args'",
     ):
         _offline_cards().model.get(load_args={})
+
+
+def test_cards_without_a_credential_raise_the_client_catalog_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cards reports an empty credential chain with Bifrost's client code."""
+    for name in ("WYRD_ACCESS_TOKEN", "WYRD_WORKLOAD_TOKEN", "WYRD_TENANT", "WYRD_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HOME", "/nonexistent-wyrd-home")
+
+    with pytest.raises(wyrd.WyrdError) as captured:
+        Cards(server_url="http://127.0.0.1:1")
+    assert captured.value.code == "WYRD_CLIENT_401_NO_CREDENTIALS"
+    assert captured.value.status == 401

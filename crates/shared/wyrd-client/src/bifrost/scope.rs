@@ -2,7 +2,6 @@
 //! fingerprint the token-opaque client tier can compute.
 
 use crate::config::ClientConfig;
-use crate::error::WyrdClientError;
 use crate::transport::ResolvedCredential;
 use secrecy::ExposeSecret;
 use sha2::{Digest, Sha256};
@@ -43,10 +42,10 @@ impl ClientScope {
     /// is never parsed.
     ///
     /// # Errors
-    /// Returns [`WyrdError`] mapped from [`WyrdClientError`] when the credential
+    /// Returns [`WyrdError`] mapped from [`WyrdClientError`](crate::error::WyrdClientError) when the credential
     /// chain yields nothing (`WYRD_CLIENT_401_NO_CREDENTIALS`).
     pub fn from_config(config: &ClientConfig) -> Result<Self, WyrdError> {
-        let credential = config.resolve_credential().map_err(client_error_to_wyrd)?;
+        let credential = config.resolve_credential().map_err(WyrdError::from)?;
         Ok(Self {
             server_url: config.http.base_url.trim_end_matches('/').to_owned(),
             credential_fingerprint: fingerprint_credential(&credential),
@@ -96,17 +95,4 @@ fn fingerprint_credential(credential: &ResolvedCredential) -> String {
     let mut hasher = Sha256::new();
     hasher.update(secret.as_bytes());
     hex::encode(hasher.finalize())
-}
-
-/// Map a client-local [`WyrdClientError`] onto the shared [`WyrdError`] catalog,
-/// preserving its stable `WYRD_CLIENT_*` code.
-fn client_error_to_wyrd(error: WyrdClientError) -> WyrdError {
-    let code = error.code();
-    let message = error.to_string();
-    WyrdError::from_code(code, message.clone(), serde_json::json!({})).unwrap_or(
-        WyrdError::Internal {
-            message,
-            details: serde_json::json!({ "original_code": code }),
-        },
-    )
 }

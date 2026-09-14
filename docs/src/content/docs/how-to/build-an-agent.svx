@@ -15,7 +15,7 @@ An Agent runs a bounded loop over a Prompt with tools, callbacks, and session me
 <LangTabs>
 <LangTab lang="python">
 
-<CodeFromFile file="python/py-wyrd/examples/agent_smoke.py" lang="python" />
+<CodeFromFile file="sdks/wyrd-sdk-python/examples/agent_smoke.py" lang="python" />
 
 </LangTab>
 <LangTab lang="rust">
@@ -49,7 +49,7 @@ Callbacks mutate inline behavior. They can replace a request, transform a respon
 <LangTabs>
 <LangTab lang="python">
 
-<CodeFromFile file="python/py-wyrd/examples/structured_pipeline.py" lang="python" range="3-20" title="structured_pipeline.py" />
+<CodeFromFile file="sdks/wyrd-sdk-python/examples/structured_pipeline.py" lang="python" range="3-20" title="structured_pipeline.py" />
 
 </LangTab>
 <LangTab lang="rust">

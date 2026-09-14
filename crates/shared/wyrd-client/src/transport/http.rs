@@ -735,14 +735,12 @@ fn body_read_err(err: reqwest::Error) -> WyrdError {
 /// Convert an [`AuthError`] to a [`WyrdError`].
 ///
 /// Server-reported auth failures pass through; client-local auth failures
-/// (transport down during token exchange) become [`WyrdError::Internal`].
+/// (transport down during token exchange) keep their `WYRD_CLIENT_*` identity
+/// through the shared client-error projection.
 fn auth_to_wyrd(err: AuthError) -> WyrdError {
     match err {
         AuthError::Server(wyrd) => wyrd,
-        AuthError::Client(client_err) => WyrdError::Internal {
-            message: format!("auth error: {client_err}"),
-            details: serde_json::json!({}),
-        },
+        AuthError::Client(client_err) => client_err.into(),
     }
 }
 

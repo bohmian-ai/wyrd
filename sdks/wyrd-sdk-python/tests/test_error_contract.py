@@ -49,3 +49,11 @@ def test_direct_attributes_agree_with_the_problem_projection() -> None:
 def test_error_is_catchable_as_the_shared_base_class() -> None:
     with pytest.raises(WyrdError):
         ResponseFormat.json_schema("bad", [])
+
+
+def test_errors_module_projects_the_root_error_class() -> None:
+    import wyrd
+    import wyrd.errors
+
+    assert wyrd.errors.WyrdError is wyrd.WyrdError
+    assert wyrd.errors.__all__ == ["WyrdError"]

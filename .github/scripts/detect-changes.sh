@@ -56,7 +56,7 @@ set_output_all() {
 rust_pattern='^(Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|deny\.toml|mise\.toml|crates/|sdks/wyrd-sdk-rust/|sdks/wyrd-sdk-ts/native/|sdks/wyrd-sdk-ts/native-testing/|sdks/wyrd-sdk-python/Cargo\.toml|sdks/wyrd-sdk-python/src/)'
 python_pattern='^(mise\.toml|Cargo\.toml|Cargo\.lock|crates/shared/wyrd-utils/|crates/wyrd/wyrd-cards/|crates/wyrd/wyrd-interfaces/|sdks/wyrd-sdk-python/|examples/python/)'
 docs_pattern='^(mise\.toml|docs/|openapi\.yaml|crates/wyrd-spec/schemas/|examples/)'
-ui_pattern='^(mise\.toml|crates/wyrd/wyrd-server/wyrd-ui/|docs/src/styles/wyrd-tokens\.css|\.claude/skills/wyrd-ui/references/wyrd-theme\.css|\.codex/skills/wyrd-ui/references/wyrd-theme\.css)'
+ui_pattern='^(mise\.toml|crates/wyrd/wyrd-server/wyrd-ui/|docs/src/styles/wyrd-tokens\.css|\.claude/skills/wyrd-ui/references/wyrd-theme\.css|\.agents/skills/wyrd-ui/references/wyrd-theme\.css)'
 generated_pattern='^(mise\.toml|Cargo\.toml|Cargo\.lock|crates/wyrd-spec/|crates/wyrd/wyrd-cards/|crates/wyrd/wyrd-interfaces/|sdks/wyrd-sdk-python/)'
 storage_pattern='^(mise\.toml|Cargo\.lock|crates/wyrd/wyrd-storage/|crates/wyrd/wyrd-server/|crates/wyrd/wyrd-sql/|crates/shared/wyrd-client/src/storage/|crates/wyrd-spec/src/storage/|\.github/workflows/storage-integration|\.github/scripts/detect-changes\.sh)'
 identity_pattern='^(mise\.toml|Cargo\.lock|docker-compose\.yml|tests/fixtures/identity/|crates/shared/wyrd-auth|crates/shared/wyrd-client/|crates/wyrd/wyrd-auth/|crates/wyrd/wyrd-server/|crates/wyrd/wyrd-testing/|crates/wyrd-spec/src/security|\.github/workflows/identity-e2e\.yml|\.github/scripts/detect-changes\.sh)'

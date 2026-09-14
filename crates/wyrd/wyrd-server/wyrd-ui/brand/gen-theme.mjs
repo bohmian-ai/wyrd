@@ -1,12 +1,13 @@
 #!/usr/bin/env node
-// Generates brand/theme.css, .claude/skills/wyrd-ui/references/wyrd-theme.css, and
-// .agents/skills/wyrd-ui/references/wyrd-theme.css from brand/palette.json (the
-// canonical token source).
+// Generates brand/theme.css, .agents/skills/wyrd-ui/references/wyrd-theme.css,
+// and docs/src/styles/wyrd-tokens.css from brand/palette.json (the canonical
+// token source).
 // Usage:
-//   node brand/gen-theme.mjs           regenerate theme.css
-//   node brand/gen-theme.mjs --check   exit non-zero if theme.css is stale
+//   node brand/gen-theme.mjs           regenerate every target
+//   node brand/gen-theme.mjs --check   exit non-zero if any target is stale
 //
-// This emits one target and does not write into skills or documentation.
+// The .claude/skills copy is a byte mirror of .agents/skills owned by
+// `mise run skills:sync`; run it after regenerating.
 import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -14,7 +15,6 @@ import { dirname, join } from 'node:path';
 const here = dirname(fileURLToPath(import.meta.url));
 const palettePath = join(here, 'palette.json');
 const themePath = join(here, 'theme.css');
-const claudePath = join(here, '../../../../../.claude/skills/wyrd-ui/references/wyrd-theme.css');
 const agentsPath = join(here, '../../../../../.agents/skills/wyrd-ui/references/wyrd-theme.css');
 const docsPath = join(here, '../../../../../docs/src/styles/wyrd-tokens.css');
 
@@ -372,13 +372,6 @@ const banner = [
 
 const themeOut = [banner, '', themeBlock(), '', ...modes.map(modeBlock), ''].join('\n');
 
-const claudeOut = [
-  banner,
-  '',
-  ...modes.map(modeBlock),
-  ''
-].join('\n');
-
 const codexOut = [
   banner,
   '',
@@ -398,7 +391,6 @@ const docsOut = [
 
 const targets = [
   { path: themePath, content: themeOut },
-  { path: claudePath, content: claudeOut },
   { path: agentsPath, content: codexOut },
   { path: docsPath, content: docsOut },
 ];

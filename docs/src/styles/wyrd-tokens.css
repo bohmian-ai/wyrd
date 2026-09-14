@@ -1,46 +1,47 @@
 /* GENERATED FILE — do not edit by hand.
- * Source of truth: brand/palette.json. Regenerate with `pnpm tokens`.
- * Token names are identical to ./wyrd-ui-source-of-truth-v2.html. */
+ * Source of truth: brand/palette.json.
+ * Regenerate with `node brand/gen-theme.mjs`.
+ * The rendered visual reference is ./renders/styleguide.html, which links
+ * THIS file — no render may restate a hex. */
 
 :root {
   /* fonts */
   --font-sans: "Archivo", system-ui, sans-serif;
-  --font-display: "Archivo Black", sans-serif;
+  --font-display: "Space Grotesk", "Archivo", system-ui, sans-serif;
   --font-mono: "JetBrains Mono", monospace;
-  --font-arcade: "Press Start 2P", monospace;
-  --font-pixel: "VT323", monospace;
+  --font-serif: "Fraunces", Georgia, serif;
 }
 
 :root,
 :root[data-theme="light"] {
   /* surface */
-  --bg: #f4f4f5;
+  --bg: #f2f0ea;
   --surface: #ffffff;
-  --surface-2: #ececef;
+  --surface-2: #eceadf;
 
   /* ink */
-  --border: #0b0b0e;
-  --shadow: #0b0b0e;
+  --border: #101014;
+  --shadow: #101014;
 
   /* text */
-  --text: #14141a;
-  --muted: #6b6b76;
+  --text: #101014;
+  --muted: #62626d;
 
-  /* rune */
-  --rune: #8b5cf6;
-  --rune-strong: #7c3aed;
-  --rune-soft: #f1ecfd;
-  --rune-btn: #8b5cf6;
-  --rune-btn-ink: #ffffff;
+  /* brand */
+  --brand: #2745e8;
+  --brand-strong: #2745e8;
+  --brand-soft: #e9edfd;
+  --brand-btn: #2745e8;
+  --brand-btn-ink: #ffffff;
 
   /* acid */
   --lime: #c5f23c;
-  --lime-ink: #0b0b0e;
-  --lime-text: #7c3aed;
+  --lime-ink: #101014;
+  --lime-text: #4a7a06;
 
   /* line */
-  --client: #c5f23c;
-  --client-bar: #c5f23c;
+  --client: #4a7a06;
+  --client-bar: #4a7a06;
   --server: #f2a23c;
   --server-bar: #ec8b14;
   --control: #7cc4e8;
@@ -50,46 +51,42 @@
   --ok: #2f9e44;
   --warn: #ec8b14;
   --danger: #d2402a;
+  --ok-text: #247b35;
+  --warn-text: #9c5c0d;
+  --danger-text: #c03a26;
 
   /* hero */
-  --hero-bg: #8b5cf6;
+  --hero-bg: #2745e8;
   --hero-ink: #ffffff;
-  --ink-on-fill: #0b0b0e;
-
-  /* scene */
-  --sky-top: #edeaf4;
-  --sky-bot: #e0d8f2;
-  --grid: #7c3aed;
-  --star: #7c3aed;
-  --spr-d: #9b78e0;
+  --ink-on-fill: #101014;
 
   /* geometry */
   --r: 5px;
 }
 :root[data-theme="dark"] {
   /* surface */
-  --bg: #0e0e0e;
-  --surface: #17171b;
-  --surface-2: #1f1f24;
+  --bg: #0b0c12;
+  --surface: #12141c;
+  --surface-2: #1a1d28;
 
   /* ink */
-  --border: #313139;
-  --shadow: #2a2a31;
+  --border: #424866;
+  --shadow: #050609;
 
   /* text */
-  --text: #d6d6dc;
-  --muted: #8a8a95;
+  --text: #e6e4da;
+  --muted: #84879a;
 
-  /* rune */
-  --rune: #241b40;
-  --rune-strong: #a78bfa;
-  --rune-soft: #241b40;
-  --rune-btn: #a78bfa;
-  --rune-btn-ink: #0b0b0e;
+  /* brand */
+  --brand: #1a2040;
+  --brand-strong: #7a8cff;
+  --brand-soft: #1a2040;
+  --brand-btn: #7a8cff;
+  --brand-btn-ink: #0b0c12;
 
   /* acid */
   --lime: #c5f23c;
-  --lime-ink: #0b0b0e;
+  --lime-ink: #101014;
   --lime-text: #c5f23c;
 
   /* line */
@@ -104,18 +101,14 @@
   --ok: #7ee081;
   --warn: #f2a23c;
   --danger: #e8615a;
+  --ok-text: #7ee081;
+  --warn-text: #f2a23c;
+  --danger-text: #e8615a;
 
   /* hero */
-  --hero-bg: #241b40;
-  --hero-ink: #e9e2ff;
-  --ink-on-fill: #0b0b0e;
-
-  /* scene */
-  --sky-top: #0d0d15;
-  --sky-bot: #191033;
-  --grid: #a78bfa;
-  --star: #d6d6dc;
-  --spr-d: #6f54b8;
+  --hero-bg: #1a2040;
+  --hero-ink: #e9edfd;
+  --ink-on-fill: #101014;
 
   /* geometry */
   --r: 5px;

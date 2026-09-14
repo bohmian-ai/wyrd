@@ -70,8 +70,8 @@ pub async fn run(mode: Option<ServeMode>) -> Result<(), BootExit> {
     let BootedServer {
         state,
         coordination_runtime,
-        compaction_runtime,
         data_root: _data_root,
+        compaction_runtime,
     } = build_state(&config, telemetry.clone(), StateOverrides::default())
         .await
         .map_err(|e| BootExit::Other(Box::new(e)))?;

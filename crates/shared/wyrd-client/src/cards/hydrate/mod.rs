@@ -40,6 +40,9 @@ pub struct HydrationSummary {
 /// context used by other client capabilities. It does not add graph behavior to [`crate::cards::Cards`].
 #[derive(Clone)]
 pub struct CardGraphHydrator {
+    /// Authenticated, tenant-scoped registry context shared with other client
+    /// capabilities; every resolve and artifact download issued while
+    /// hydrating a graph goes through it.
     context: RegistryContext,
 }
 

@@ -38,6 +38,11 @@ pub(crate) async fn dispatch(
     }
 }
 
+/// Server-declared integrity expectations for one downloaded artifact.
+///
+/// Built from the download plan by [`dispatch_verified`] and passed to the
+/// backend-specific download paths, which fail the transfer when the written
+/// bytes do not match the declared size and digest.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DownloadVerification<'a> {
     /// Base64-encoded SHA-256 digest declared by the server.

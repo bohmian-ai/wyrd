@@ -8,6 +8,26 @@ use super::{UploadHooks, UploadOutcome, checked_size, report};
 use crate::storage::error::{StorageClientError, map_backend_response};
 use crate::storage::upload::reader::SourceReader;
 
+/// Upload a sized source to Azure as fixed-size staged blocks through the
+/// plan's SAS URL, reporting progress after each block.
+///
+/// Block ids are zero-padded sequence numbers. The source must be exactly the
+/// declared size and yield exactly `block_count_planned` blocks. Azure does
+/// not commit staged blocks itself, so success returns a completion request
+/// carrying the block count for the server to issue Put Block List.
+///
+/// # Errors
+///
+/// Returns `PlanMismatch` for a non-Azure plan, `PlanInvalid` when the source
+/// size is unknown or the block geometry does not fit `usize`, `SizeMismatch`
+/// when the source size disagrees with the planned block count or the bytes
+/// actually read, `Transport` for request failures, source read errors, and
+/// mapped backend errors for non-success responses.
+///
+/// # Cancellation
+///
+/// Dropping the future leaves already-staged blocks uncommitted in Azure;
+/// nothing is visible until the server completes the upload.
 pub(crate) async fn upload(
     client: &WyrdClient,
     plan: &UploadPlan,

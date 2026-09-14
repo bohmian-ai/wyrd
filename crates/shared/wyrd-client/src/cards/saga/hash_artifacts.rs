@@ -54,6 +54,23 @@ pub(crate) async fn validate_and_stamp(
     Ok(())
 }
 
+/// Stream one local artifact file and return its byte length and base64
+/// SHA-256 digest, the two values compared against the manifest entry by
+/// [`validate_and_stamp`].
+///
+/// The file is read in 64 KiB buffers so large artifacts are never loaded
+/// into memory. The operation is read-only; cancellation simply drops the
+/// open file handle.
+///
+/// # Errors
+///
+/// Returns an IO error when the file cannot be opened or read, and
+/// `RegistrySpecTooLarge` when the cumulative size overflows `u64`.
+///
+/// # Panics
+///
+/// Panics only if a buffer length (at most 64 KiB) does not fit in `u64`,
+/// which cannot happen on supported targets.
 async fn hash_source(source: &Path) -> Result<(u64, String), RegistryEngineError> {
     let file = tokio::fs::File::open(source).await?;
     let mut reader = BufReader::new(file);

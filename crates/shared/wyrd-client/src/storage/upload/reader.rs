@@ -11,7 +11,11 @@ use crate::storage::error::StorageClientError;
 /// buffering partial reads across calls. Used by multipart upload to ensure
 /// each part matches the plan's `part_size_bytes`.
 pub(crate) struct SourceReader {
+    /// Upstream artifact byte stream; its errors are surfaced unchanged from
+    /// the read that encounters them.
     stream: BoxStream<'static, Result<Bytes, StorageClientError>>,
+    /// Unconsumed remainder of the last stream item, drained before the
+    /// stream is polled again so chunk boundaries never drop bytes.
     pending: Bytes,
 }
 

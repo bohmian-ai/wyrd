@@ -1,7 +1,7 @@
 //! `PyO3` boundary for the one Bifrost client.
 //!
 //! Every method converts its Python inputs to native contract types at the edge
-//! — a JSON-Schema document or Arrow IPC schema to [`wyrd_client::bifrost::TableConfig`], a
+//! — a JSON-Schema document or Arrow IPC schema to [`TableConfig`], a
 //! card-ref string to [`wyrd_spec::reference::CardRef`] — and then calls the
 //! Rust-native client. No queue, schema-mapping, registration, or query logic
 //! is re-implemented here; the pool key and [`wyrd_client::bifrost::ClientScope`] stay opaque,
@@ -17,9 +17,14 @@ use std::sync::Mutex;
 
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
+use arrow::record_batch::RecordBatch;
+use arrow_schema::SchemaRef;
 use futures_util::future::{AbortHandle, Abortable};
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
+use wyrd_client::bifrost::Bifrost as NativeBifrost;
+use wyrd_client::bifrost::QueryResult;
+use wyrd_client::bifrost::TableConfig;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
@@ -75,7 +80,7 @@ fn boundary_internal(detail: impl Into<String>) -> WyrdPyError {
     })
 }
 
-/// Python-facing [`wyrd_client::bifrost::TableConfig`]: one Bifrost table's identity, declared
+/// Python-facing [`TableConfig`]: one Bifrost table's identity, declared
 /// user columns, and requested physical layout.
 ///
 /// The schema arrives either as a JSON Schema document — what
@@ -87,7 +92,7 @@ fn boundary_internal(detail: impl Into<String>) -> WyrdPyError {
 #[derive(Clone)]
 pub struct PyTableConfig {
     /// The native config every write and register call reads.
-    inner: wyrd_client::bifrost::TableConfig,
+    inner: TableConfig,
 }
 
 #[pymethods]
@@ -112,8 +117,7 @@ impl PyTableConfig {
     ) -> WyrdPyResult<Self> {
         let schema: serde_json::Value = serde_json::from_str(schema_json)
             .map_err(|error| invalid_argument("schema_json", error))?;
-        let config = wyrd_client::bifrost::TableConfig::from_json_schema(table, &schema)
-            .map_err(client_error)?;
+        let config = TableConfig::from_json_schema(table, &schema).map_err(client_error)?;
         Ok(Self {
             inner: apply_layout(config, layout_json)?,
         })
@@ -138,8 +142,7 @@ impl PyTableConfig {
         layout_json: Option<&str>,
     ) -> WyrdPyResult<Self> {
         let schema = decode_schema_ipc(schema_ipc)?;
-        let config =
-            wyrd_client::bifrost::TableConfig::from_arrow(table, schema).map_err(client_error)?;
+        let config = TableConfig::from_arrow(table, schema).map_err(client_error)?;
         Ok(Self {
             inner: apply_layout(config, layout_json)?,
         })
@@ -166,10 +169,7 @@ impl PyTableConfig {
     ) -> WyrdPyResult<Self> {
         let client = client_from_options(server_url, credential, grpc_url).map_err(client_error)?;
         let inner = py
-            .detach(|| {
-                wyrd_runtime::runtime()
-                    .block_on(wyrd_client::bifrost::TableConfig::describe(&client, table))
-            })
+            .detach(|| wyrd_runtime::runtime().block_on(TableConfig::describe(&client, table)))
             .map_err(client_error)?;
         Ok(Self { inner })
     }
@@ -211,7 +211,7 @@ impl PyTableConfig {
 #[pyclass(module = "wyrd._wyrd.bifrost", name = "QueryResult")]
 pub struct PyQueryResult {
     /// The native result every projection reads.
-    inner: wyrd_client::bifrost::QueryResult,
+    inner: QueryResult,
 }
 
 #[pymethods]
@@ -243,7 +243,7 @@ impl PyQueryResult {
     }
 }
 
-/// Python-facing [`wyrd_client::bifrost::Bifrost`]: query any authorized table, write to the
+/// Python-facing [`NativeBifrost`]: query any authorized table, write to the
 /// active one.
 ///
 /// Construction dials the ingest channel, so it performs IO; every transport
@@ -252,7 +252,7 @@ impl PyQueryResult {
 #[pyclass(module = "wyrd._wyrd.bifrost", name = "Bifrost")]
 pub struct Bifrost {
     /// The one native client both public Python facades drive.
-    handle: wyrd_client::bifrost::Bifrost,
+    handle: NativeBifrost,
 }
 
 #[pymethods]
@@ -277,13 +277,11 @@ impl Bifrost {
         let table = table.map(|table| table.inner);
         let handle = py
             .detach(|| {
-                wyrd_runtime::runtime().block_on(
-                    wyrd_client::bifrost::Bifrost::connect_with_config(
-                        &client,
-                        table,
-                        wyrd_queue::QueueConfig::default(),
-                    ),
-                )
+                wyrd_runtime::runtime().block_on(NativeBifrost::connect_with_config(
+                    &client,
+                    table,
+                    wyrd_queue::QueueConfig::default(),
+                ))
             })
             .map_err(client_error)?;
         Ok(Self { handle })
@@ -524,10 +522,7 @@ impl Bifrost {
 ///
 /// Returns the stable Wyrd validation error when the text is not one
 /// `PhysicalLayoutWire`.
-fn apply_layout(
-    config: wyrd_client::bifrost::TableConfig,
-    layout_json: Option<&str>,
-) -> WyrdPyResult<wyrd_client::bifrost::TableConfig> {
+fn apply_layout(config: TableConfig, layout_json: Option<&str>) -> WyrdPyResult<TableConfig> {
     match layout_json {
         None => Ok(config),
         Some(layout) => {
@@ -561,7 +556,7 @@ fn correlation(card_ref: Option<&str>, run_id: Option<String>) -> WyrdPyResult<C
 ///
 /// Returns the stable Wyrd validation error when the bytes are not one Arrow
 /// IPC schema.
-fn decode_schema_ipc(bytes: &[u8]) -> WyrdPyResult<arrow_schema::SchemaRef> {
+fn decode_schema_ipc(bytes: &[u8]) -> WyrdPyResult<SchemaRef> {
     let reader = StreamReader::try_new(Cursor::new(bytes), None)
         .map_err(|error| invalid_argument("schema_ipc", error))?;
     Ok(reader.schema())
@@ -573,7 +568,7 @@ fn decode_schema_ipc(bytes: &[u8]) -> WyrdPyResult<arrow_schema::SchemaRef> {
 ///
 /// Returns the stable Wyrd validation error when the bytes are not one Arrow
 /// IPC stream carrying exactly one batch, which is what one logical write is.
-fn decode_batch_ipc(bytes: &[u8]) -> WyrdPyResult<arrow::record_batch::RecordBatch> {
+fn decode_batch_ipc(bytes: &[u8]) -> WyrdPyResult<RecordBatch> {
     let mut reader = StreamReader::try_new(Cursor::new(bytes), None)
         .map_err(|error| invalid_argument("batch_ipc", error))?;
     let batch = reader
@@ -594,7 +589,7 @@ fn decode_batch_ipc(bytes: &[u8]) -> WyrdPyResult<arrow::record_batch::RecordBat
 /// # Errors
 ///
 /// Returns the stable Wyrd internal error when the schema cannot be encoded.
-fn encode_schema_ipc(schema: &arrow_schema::SchemaRef) -> WyrdPyResult<Vec<u8>> {
+fn encode_schema_ipc(schema: &SchemaRef) -> WyrdPyResult<Vec<u8>> {
     let mut buffer = Vec::new();
     {
         let mut writer = StreamWriter::try_new(&mut buffer, schema)
@@ -987,7 +982,7 @@ fn parse_freshness(value: &str) -> WyrdPyResult<FreshnessPolicy> {
 ///
 /// Returns the encoder's own message when Arrow IPC encoding fails; the caller
 /// projects it onto the catalog.
-fn encode_batch(batch: &arrow::record_batch::RecordBatch) -> Result<Vec<u8>, String> {
+fn encode_batch(batch: &RecordBatch) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     let mut writer = StreamWriter::try_new(&mut bytes, batch.schema().as_ref())
         .map_err(|error| error.to_string())?;

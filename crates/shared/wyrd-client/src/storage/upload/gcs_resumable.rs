@@ -7,6 +7,26 @@ use super::{UploadHooks, UploadOutcome, checked_size, report};
 use crate::storage::error::{StorageClientError, map_backend_response};
 use crate::storage::upload::reader::SourceReader;
 
+/// Upload a source to a GCS resumable session in plan-sized chunks, sending a
+/// `Content-Range` per chunk and reporting progress after each accepted one.
+///
+/// A `308 Resume Incomplete` response is treated as chunk acceptance. When
+/// the source size is known the final range carries it and the transfer is
+/// held to that exact length. GCS finalizes the object itself, so success
+/// returns [`UploadOutcome::Uploaded`].
+///
+/// # Errors
+///
+/// Returns `PlanMismatch` for a non-GCS plan, `PlanInvalid` when the chunk
+/// size does not fit `usize`, `SizeMismatch` when a known-size source yields
+/// more or fewer bytes than declared, `Transport` for request failures,
+/// source read errors, and mapped backend errors for other statuses.
+///
+/// # Cancellation
+///
+/// Dropping the future abandons the resumable session with a partial,
+/// unfinalized object; the session URI can no longer be completed by this
+/// call.
 pub(crate) async fn upload(
     client: &WyrdClient,
     plan: &UploadPlan,

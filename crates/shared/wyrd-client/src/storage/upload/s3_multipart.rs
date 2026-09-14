@@ -20,6 +20,8 @@ use super::{UploadHooks, UploadOutcome, checked_size, report};
 use crate::storage::error::{StorageClientError, map_backend_response};
 use crate::storage::upload::reader::SourceReader;
 
+/// Total PUT attempts per part (first try plus retries) before a transport
+/// failure, 5xx, or 403 is returned to the caller.
 const MAX_PART_ATTEMPTS: u32 = 3;
 
 /// Executes S3 multipart upload with retry and progress tracking.
@@ -148,6 +150,15 @@ async fn send_part_with_retry(
     }
 }
 
+/// Obtain a fresh presigned PUT URL for `part_number` from the upload hooks.
+///
+/// Called before every part attempt so a retry after a 403 always uses a
+/// newly minted URL.
+///
+/// # Errors
+///
+/// Returns `MissingHook("part_url_minter")` when the engine supplied no
+/// minter, or the minter's own error (typically a server request failure).
 async fn mint_part_url(
     hooks: &mut UploadHooks<'_>,
     part_number: u32,
@@ -159,6 +170,11 @@ async fn mint_part_url(
     minter(part_number).await
 }
 
+/// Sleep before the next part attempt: 50 ms after the first failure, 250 ms
+/// after the second, and 500 ms for any later attempt.
+///
+/// Delays are deliberately short so retry tests do not stall; cancellation
+/// simply cancels the timer.
 async fn sleep_backoff(attempt: u32) {
     // Attempt 0 → 50 ms, 1 → 250 ms. Values kept small so tests do not stall.
     const DELAY_MS: &[u64] = &[50, 250];

@@ -9,6 +9,9 @@ use super::{PyRegistrationReceipt, register_python_card};
 
 /// Owns the authenticated context for one Python registration operation.
 pub(super) struct PythonCardRegistry<'a> {
+    /// Shared authenticated Cards handle whose transport, storage, and tenant
+    /// context every registration delegates to; borrowed so the Python view
+    /// that owns it stays the single owner.
     registry: &'a Cards,
 }
 

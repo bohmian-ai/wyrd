@@ -7,16 +7,21 @@ pub mod cards;
 
 use std::sync::{Arc, Mutex};
 
+use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use napi::bindgen_prelude::Buffer;
 use napi_derive::napi;
 use tokio::sync::Mutex as AsyncMutex;
+use wyrd_client::bifrost::Bifrost;
+use wyrd_client::bifrost::Correlation;
+use wyrd_client::bifrost::TableConfig;
 use wyrd_client::bifrost::{BifrostClientError, QueryResultStream};
 use wyrd_queue::QueueConfig;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{BifrostQueryRequest, FreshnessPolicy, VisibilityMode};
 use wyrd_spec::vala::error::BifrostError;
+use wyrd_spec::vala::ids::RunId;
 
 /// JavaScript query request projected onto the pure Wyrd contract.
 #[napi(object)]
@@ -305,7 +310,7 @@ impl NativeTableConfig {
     /// # Errors
     ///
     /// Returns a napi error when the config or its schema cannot be encoded.
-    fn project(config: &wyrd_client::bifrost::TableConfig) -> napi::Result<Self> {
+    fn project(config: &TableConfig) -> napi::Result<Self> {
         let mut schema_ipc = Vec::new();
         {
             let mut writer =
@@ -330,7 +335,7 @@ impl NativeTableConfig {
     /// # Errors
     ///
     /// Returns a napi error when the text is not one serialized `TableConfig`.
-    fn parse(&self) -> napi::Result<wyrd_client::bifrost::TableConfig> {
+    fn parse(&self) -> napi::Result<TableConfig> {
         serde_json::from_str(&self.config_json).map_err(napi_error)
     }
 }
@@ -341,7 +346,7 @@ impl NativeTableConfig {
 ///
 /// Returns a napi error when the bytes are not one Arrow IPC stream carrying
 /// exactly one batch, which is what one logical write is.
-fn decode_batch_ipc(bytes: &[u8]) -> napi::Result<arrow::record_batch::RecordBatch> {
+fn decode_batch_ipc(bytes: &[u8]) -> napi::Result<RecordBatch> {
     let mut reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)
         .map_err(napi_error)?;
     let batch = reader
@@ -378,8 +383,7 @@ pub fn table_config_from_json_schema(
 ) -> napi::Result<NativeTableConfig> {
     let schema: serde_json::Value = serde_json::from_str(&schema_json)
         .map_err(|error| napi::Error::from_reason(format!("invalid JSON schema: {error}")))?;
-    let config =
-        wyrd_client::bifrost::TableConfig::from_json_schema(&table, &schema).map_err(napi_error)?;
+    let config = TableConfig::from_json_schema(&table, &schema).map_err(napi_error)?;
     NativeTableConfig::project(&apply_layout(config, layout_json.as_deref())?)
 }
 
@@ -407,7 +411,7 @@ pub async fn describe_table_config(
         credential.as_deref(),
         grpc_url.as_deref(),
     ) {
-        Ok(client) => wyrd_client::bifrost::TableConfig::describe(&client, &table).await,
+        Ok(client) => TableConfig::describe(&client, &table).await,
         Err(error) => Err(error),
     };
     match described {
@@ -427,10 +431,7 @@ pub async fn describe_table_config(
 /// # Errors
 ///
 /// Returns a napi error when the text is not one `PhysicalLayoutWire`.
-fn apply_layout(
-    config: wyrd_client::bifrost::TableConfig,
-    layout_json: Option<&str>,
-) -> napi::Result<wyrd_client::bifrost::TableConfig> {
+fn apply_layout(config: TableConfig, layout_json: Option<&str>) -> napi::Result<TableConfig> {
     match layout_json {
         None => Ok(config),
         Some(layout) => {
@@ -446,7 +447,7 @@ fn apply_layout(
 /// The one Bifrost client: query any authorized table, write to the active one.
 ///
 /// Mirrors the Python binding: both are thin conversions over the one
-/// [`wyrd_client::bifrost::Bifrost`], so batching, backpressure, registration, and the
+/// [`Bifrost`], so batching, backpressure, registration, and the
 /// query contract have exactly one owner.
 #[napi]
 pub struct NativeBifrost {
@@ -454,7 +455,7 @@ pub struct NativeBifrost {
     ///
     /// Shared through an [`Arc`] so a blocking drain can move it onto a
     /// blocking worker without stalling the Node event loop.
-    client: Arc<wyrd_client::bifrost::Bifrost>,
+    client: Arc<Bifrost>,
 }
 
 /// Connects one Bifrost client, optionally already bound to a write target.
@@ -481,14 +482,7 @@ pub async fn connect_bifrost(
         credential.as_deref(),
         grpc_url.as_deref(),
     ) {
-        Ok(client) => {
-            wyrd_client::bifrost::Bifrost::connect_with_config(
-                &client,
-                table,
-                QueueConfig::default(),
-            )
-            .await
-        }
+        Ok(client) => Bifrost::connect_with_config(&client, table, QueueConfig::default()).await,
         Err(error) => Err(error),
     };
     Ok(match connected {
@@ -966,16 +960,13 @@ impl NativeBifrostQueryStream {
 /// # Errors
 ///
 /// Returns a napi error when `card_ref` is not one parsable Card reference.
-fn correlation(
-    card_ref: Option<&str>,
-    run_id: Option<String>,
-) -> napi::Result<wyrd_client::bifrost::Correlation> {
-    Ok(wyrd_client::bifrost::Correlation {
+fn correlation(card_ref: Option<&str>, run_id: Option<String>) -> napi::Result<Correlation> {
+    Ok(Correlation {
         card_ref: card_ref
             .map(str::parse)
             .transpose()
             .map_err(|error| napi::Error::from_reason(format!("invalid cardRef: {error}")))?,
-        run_id: run_id.map(wyrd_spec::vala::ids::RunId::from_string),
+        run_id: run_id.map(RunId::from_string),
     })
 }
 
@@ -1067,7 +1058,7 @@ fn encode_batch(batch: &RecordBatch) -> napi::Result<Vec<u8>> {
 /// # Errors
 ///
 /// Returns a napi error when IPC writing fails.
-fn encode_schema(schema: &arrow::datatypes::SchemaRef) -> napi::Result<Vec<u8>> {
+fn encode_schema(schema: &SchemaRef) -> napi::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut bytes, schema.as_ref())
         .map_err(napi_error)?;

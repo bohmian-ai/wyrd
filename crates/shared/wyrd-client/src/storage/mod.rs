@@ -43,6 +43,8 @@ pub type DownloadProgressSink = Arc<dyn Fn(u64, Option<u64>) + Send + Sync + 'st
 /// dispatch logic.
 #[derive(Clone)]
 pub struct WyrdStorageClient {
+    /// Shared client supplying auth, retry policy, base URL, and the
+    /// connection pool for every plan, upload, part-URL, and download call.
     client: WyrdClient,
 }
 

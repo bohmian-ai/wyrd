@@ -1099,10 +1099,12 @@ impl PythonStateHydrator<'_> {
 #[pyclass(module = "wyrd.cards", name = "VersionBump", eq, from_py_object)]
 #[derive(Clone, PartialEq)]
 pub struct PyVersionBump {
+    /// Native version intent forwarded unchanged to the shared registration workflow.
     native: VersionBump,
 }
 
 impl PyVersionBump {
+    /// Returns an owned copy of the native bump for one registration call.
     fn as_native(&self) -> VersionBump {
         self.native.clone()
     }
@@ -1169,27 +1171,45 @@ impl PyVersionBump {
 /// Typed Python options passed to `DataCard` interface `save` calls.
 #[pyclass(module = "wyrd.cards", name = "DataSaveArgs")]
 pub struct PyDataSaveArgs {
+    /// Normalized option dictionary handed verbatim to the interface call;
+    /// stored as `Py` so it outlives any single GIL borrow.
     values: Py<PyDict>,
 }
 
 /// Typed Python options passed to `ModelCard` interface `save` calls.
 #[pyclass(module = "wyrd.cards", name = "ModelSaveArgs")]
 pub struct PyModelSaveArgs {
+    /// Normalized option dictionary handed verbatim to the interface call;
+    /// stored as `Py` so it outlives any single GIL borrow.
     values: Py<PyDict>,
 }
 
 /// Typed Python options passed to `DataCard` interface `load` calls.
 #[pyclass(module = "wyrd.cards", name = "DataLoadArgs")]
 pub struct PyDataLoadArgs {
+    /// Normalized option dictionary handed verbatim to the interface call;
+    /// stored as `Py` so it outlives any single GIL borrow.
     values: Py<PyDict>,
 }
 
 /// Typed Python options passed to `ModelCard` interface `load` calls.
 #[pyclass(module = "wyrd.cards", name = "ModelLoadArgs")]
 pub struct PyModelLoadArgs {
+    /// Normalized option dictionary handed verbatim to the interface call;
+    /// stored as `Py` so it outlives any single GIL borrow.
     values: Py<PyDict>,
 }
 
+/// Copies caller options into a fresh dictionary shared by every option type.
+///
+/// Any mapping-like `values` is converted through `dict(...)`; the optional
+/// `boolean` pair is written last so an explicit keyword wins over the same key
+/// in `values`. The caller's object is never mutated.
+///
+/// # Errors
+///
+/// Returns the Python error raised when `values` cannot be converted to a
+/// dictionary or an item cannot be inserted.
 fn option_values(
     py: Python<'_>,
     values: Option<&Bound<'_, PyAny>>,
@@ -1213,6 +1233,8 @@ fn option_values(
     Ok(result.unbind())
 }
 
+/// Generates the shared `__new__` and `to_dict` Python methods for option
+/// types whose constructor takes only `values`.
 macro_rules! option_methods {
     ($type:ty) => {
         #[pymethods]
@@ -1264,6 +1286,7 @@ impl PyDataSaveArgs {
 /// A metadata-only Card list item.
 #[pyclass(module = "wyrd.cards", name = "CardSummary")]
 pub struct PyCardSummary {
+    /// Registry summary projected read-only through the Python getters.
     inner: CardSummary,
 }
 
@@ -1339,8 +1362,11 @@ impl PyCardSummary {
 /// Cursor-paginated metadata-only Card list.
 #[pyclass(module = "wyrd.cards", name = "CardList")]
 pub struct PyCardList {
+    /// Summaries in server order for this page.
     items: Vec<PyCardSummary>,
+    /// Exact references derived once from `items`, in the same order.
     refs: Vec<CardRefPy>,
+    /// Opaque server cursor for the next page, absent on the last page.
     next_cursor: Option<String>,
 }
 
@@ -1373,6 +1399,7 @@ impl PyCardList {
 /// One dependency-first registration outcome.
 #[pyclass(module = "wyrd.cards", name = "RegistrationOutcome")]
 pub struct PyRegistrationOutcome {
+    /// Native per-Card outcome projected read-only through the Python getters.
     inner: CardRegistrationOutcome,
 }
 
@@ -1418,6 +1445,7 @@ impl PyRegistrationOutcome {
 /// Public registration result returned after upload and completion succeed.
 #[pyclass(module = "wyrd.cards", name = "RegistrationReceipt")]
 pub struct PyRegistrationReceipt {
+    /// Completed native receipt; its root and outcomes are projected on access.
     inner: RegistrationReceipt,
 }
 
@@ -1463,6 +1491,8 @@ impl PyRegistrationReceipt {
 /// the holder before it is returned.
 #[pyclass(module = "wyrd.cards", name = "Cards")]
 pub struct PyCards {
+    /// Shared authenticated registry handle; typed views clone it cheaply so
+    /// they reuse the same transport and tenant context.
     inner: Cards,
 }
 
@@ -1597,6 +1627,7 @@ impl PyCards {
 /// this type directly.
 #[pyclass(module = "wyrd.cards", name = "DataCardRegistry")]
 pub struct PyDataCardRegistry {
+    /// Parent `Cards` handle clone carrying the connection and tenant context.
     inner: Cards,
 }
 
@@ -1607,6 +1638,7 @@ pub struct PyDataCardRegistry {
 /// this type directly.
 #[pyclass(module = "wyrd.cards", name = "ModelCardRegistry")]
 pub struct PyModelCardRegistry {
+    /// Parent `Cards` handle clone carrying the connection and tenant context.
     inner: Cards,
 }
 
@@ -1616,6 +1648,7 @@ pub struct PyModelCardRegistry {
 /// load options. Callers normally do not construct this type directly.
 #[pyclass(module = "wyrd.cards", name = "PromptCardRegistry")]
 pub struct PyPromptCardRegistry {
+    /// Parent `Cards` handle clone carrying the connection and tenant context.
     inner: Cards,
 }
 
@@ -1870,6 +1903,15 @@ fn list_registry(
         .map_err(WyrdPyError::from)
 }
 
+/// Resolves the latest registered version of one named Card of `kind`.
+///
+/// Space and name are validated before IO; the registry call runs detached
+/// from the GIL on the shared runtime.
+///
+/// # Errors
+///
+/// Returns a validation error for an invalid space or name, and the registry's
+/// not-found, authorization, or transport error otherwise.
 fn resolve_latest_registry(
     py: Python<'_>,
     registry: &Cards,
@@ -1884,6 +1926,14 @@ fn resolve_latest_registry(
         .map_err(WyrdPyError::from)
 }
 
+/// Soft-deletes one Card of `kind` selected by UID or by space and name.
+///
+/// The selector is validated before IO; deletion runs detached from the GIL.
+///
+/// # Errors
+///
+/// Returns a validation error for an incomplete or invalid selector, and the
+/// registry's not-found, authorization, or transport error otherwise.
 fn delete_registry(
     py: Python<'_>,
     registry: &Cards,
@@ -1898,6 +1948,11 @@ fn delete_registry(
         .map_err(WyrdPyError::from)
 }
 
+/// Registers a holder through a typed registry view, enforcing its kind.
+///
+/// # Errors
+///
+/// As [`registry::PythonCardRegistry::register_typed`].
 fn register_view_card(
     py: Python<'_>,
     registry: &Cards,
@@ -2463,12 +2518,20 @@ impl PreparedPythonCard {
     }
 }
 
+/// Card envelope serialized by a Python holder, before its spec is typed.
+///
+/// Only the shared envelope fields are validated here; the spec stays raw JSON
+/// until the kind-specific native workflow parses it.
 #[derive(serde::Deserialize)]
 struct PythonCardEnvelope {
+    /// Declared envelope API version, rejected by serde when unsupported.
     #[serde(rename = "apiVersion")]
     api_version: ApiVersion,
+    /// Declared Card kind, checked against the holder's own kind.
     kind: CardKind,
+    /// Caller-authored identity and labels.
     metadata: Metadata,
+    /// Kind-specific spec, parsed later by the native workflow.
     spec: serde_json::Value,
 }
 
@@ -2668,6 +2731,11 @@ fn local_save_version(version: Option<&VersionSpec>) -> String {
     }
 }
 
+/// Extracts `DataSaveArgs` into the dictionary the data interface receives.
+///
+/// # Errors
+///
+/// Returns a validation error when a value is supplied that is not `DataSaveArgs`.
 fn extract_data_save_args(
     py: Python<'_>,
     value: Option<&Bound<'_, PyAny>>,
@@ -2682,6 +2750,11 @@ fn extract_data_save_args(
         .transpose()
 }
 
+/// Extracts `ModelSaveArgs` into the dictionary the model interface receives.
+///
+/// # Errors
+///
+/// Returns a validation error when a value is supplied that is not `ModelSaveArgs`.
 fn extract_model_save_args(
     py: Python<'_>,
     value: Option<&Bound<'_, PyAny>>,
@@ -2698,15 +2771,26 @@ fn extract_model_save_args(
         .transpose()
 }
 
+/// Fetches and validates one Card envelope, detached from the GIL.
+///
+/// # Errors
+///
+/// Returns the registry's not-found, validation, authorization, or transport error.
 fn download_card(py: Python<'_>, registry: &Cards, selector: CardSelector) -> CardPyResult<Card> {
     py.detach(|| wyrd_runtime::runtime().block_on(registry.get(selector)))
         .map_err(WyrdPyError::from)
 }
 
-fn stamp_python_holder(
-    card: &Bound<'_, PyAny>,
-    card_ref: &wyrd_spec::reference::CardRef,
-) -> CardPyResult<()> {
+/// Writes the server-resolved identity back onto the caller-owned holder.
+///
+/// Called only after registration completes, so a failed registration never
+/// mutates the holder. `space` is written only when the server returned one.
+///
+/// # Errors
+///
+/// Returns a validation error when the reference has no UID, and the Python
+/// error raised by any attribute assignment.
+fn stamp_python_holder(card: &Bound<'_, PyAny>, card_ref: &CardRef) -> CardPyResult<()> {
     let uid = card_ref.uid.as_ref().ok_or_else(|| {
         WyrdPyError::validation("registration response did not contain a Card UID")
     })?;
@@ -2719,6 +2803,11 @@ fn stamp_python_holder(
     Ok(())
 }
 
+/// Classifies a Python holder as a registrable Data, Model, or Prompt Card.
+///
+/// # Errors
+///
+/// Returns a validation error for any other object.
 fn holder_kind(card: &Bound<'_, PyAny>) -> CardPyResult<CardKind> {
     if card.is_instance_of::<DataCard>() {
         Ok(CardKind::Data)
@@ -2733,6 +2822,11 @@ fn holder_kind(card: &Bound<'_, PyAny>) -> CardPyResult<CardKind> {
     }
 }
 
+/// Extracts a native version bump from a Python `VersionBump`.
+///
+/// # Errors
+///
+/// Returns a validation error when the value is not a `VersionBump`.
 fn parse_version_bump(value: &Bound<'_, PyAny>) -> CardPyResult<VersionBump> {
     value
         .extract::<PyRef<'_, PyVersionBump>>()
@@ -2740,6 +2834,16 @@ fn parse_version_bump(value: &Bound<'_, PyAny>) -> CardPyResult<VersionBump> {
         .map_err(|_| WyrdPyError::validation("version_bump must be a VersionBump"))
 }
 
+/// Builds a registry selector from a UID or from space and name.
+///
+/// A UID takes precedence; any supplied space and name then become identity
+/// assertions the server checks. Without a UID both space and name are
+/// required. An optional version narrows either selector.
+///
+/// # Errors
+///
+/// Returns a validation error for a missing space or name, or any invalid
+/// UID, space, name, or version.
 fn selector_for_kind(
     kind: CardKind,
     uid: Option<&str>,
@@ -2776,25 +2880,46 @@ fn selector_for_kind(
         })
 }
 
+/// Validates a Card space name.
+///
+/// # Errors
+///
+/// Returns a validation error carrying the space-name rule that failed.
 fn parse_space(value: &str) -> CardPyResult<SpaceName> {
     SpaceName::new(value).map_err(|error| WyrdPyError::validation(error.to_string()))
 }
 
+/// Validates a Card name.
+///
+/// # Errors
+///
+/// Returns a validation error carrying the name rule that failed.
 fn parse_name(value: &str) -> CardPyResult<CardName> {
     CardName::new(value).map_err(|error| WyrdPyError::validation(error.to_string()))
 }
 
+/// Parses a version or version block used to narrow a selector.
+///
+/// # Errors
+///
+/// Returns a validation error for an unparseable version.
 fn parse_version(value: &str) -> CardPyResult<VersionBlock> {
     VersionBlock::parse(value).map_err(|error| WyrdPyError::validation(error.to_string()))
 }
 
+/// Parses a case-insensitive lifecycle status filter.
+///
+/// # Errors
+///
+/// Returns a validation error naming the unknown status.
 fn parse_lifecycle_status(value: &str) -> CardPyResult<CardLifecycleStatus> {
     serde_json::from_value(serde_json::Value::String(value.to_ascii_lowercase()))
         .map_err(|_| WyrdPyError::validation(format!("unknown Card lifecycle status: {value}")))
 }
 
-fn card_ref_from_summary(summary: &CardSummary) -> wyrd_spec::reference::CardRef {
-    wyrd_spec::reference::CardRef {
+/// Builds the exact Card reference, including space and UID, for a list summary.
+fn card_ref_from_summary(summary: &CardSummary) -> CardRef {
+    CardRef {
         kind: summary.kind.clone(),
         name: summary.name.clone(),
         version: summary.version.clone(),
@@ -2803,6 +2928,7 @@ fn card_ref_from_summary(summary: &CardSummary) -> wyrd_spec::reference::CardRef
     }
 }
 
+/// Projects a native Card kind onto the Python `Kind` enum, exhaustively.
 fn kind_from_card_kind(kind: &CardKind) -> Kind {
     match kind {
         CardKind::Data => Kind::Data,
@@ -2825,6 +2951,7 @@ fn kind_from_card_kind(kind: &CardKind) -> Kind {
     }
 }
 
+/// Returns the stable lowercase Python spelling of a lifecycle status.
 fn lifecycle_status_name(status: CardLifecycleStatus) -> &'static str {
     match status {
         CardLifecycleStatus::Pending => "pending",
@@ -2836,6 +2963,7 @@ fn lifecycle_status_name(status: CardLifecycleStatus) -> &'static str {
     }
 }
 
+/// Returns the stable snake-case Python spelling of a registration outcome.
 fn registration_outcome_name(outcome: RegistrationOutcomeKind) -> &'static str {
     match outcome {
         RegistrationOutcomeKind::Registered => "registered",
@@ -2844,6 +2972,8 @@ fn registration_outcome_name(outcome: RegistrationOutcomeKind) -> &'static str {
     }
 }
 
+/// Projects a loader failure onto the invalid-envelope catalog error, keeping
+/// its diagnostics as structured details.
 fn loader_manifest_error(error: &wyrd_loader::LoadError) -> WyrdPyError {
     WyrdPyError::from(WyrdError::LoaderInvalidEnvelope {
         message: error.to_string(),

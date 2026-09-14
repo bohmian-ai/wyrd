@@ -11,10 +11,12 @@ use base64::Engine;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use skald_spec::Prompt;
 use wyrd_cards::data::DataCard;
 use wyrd_cards::model::ModelCard;
 use wyrd_cards::prompt::PromptCard;
 use wyrd_spec::api_version::ApiVersion;
+use wyrd_spec::card::agent::AgentCard;
 use wyrd_spec::card::drift::DriftSpec;
 use wyrd_spec::card::workflow::WorkflowCard;
 use wyrd_spec::envelope::{Card, CardKind, Relationships, Spec};
@@ -28,6 +30,7 @@ use wyrd_spec::registry::{
 use wyrd_spec::registry::{
     HydratedArtifactManifest, HydratedBundleManifest, HydratedCardManifest, HydrationMode,
 };
+use wyrd_spec::vala::eval::EvalSpec;
 
 /// One verified artifact payload in a local `WyrdState` bundle.
 #[derive(Debug, Clone)]
@@ -52,7 +55,7 @@ pub struct HydratedArtifact {
 #[derive(Default)]
 struct TypedCards {
     /// Agent Card holders keyed by exact `CardRef`.
-    agents: BTreeMap<String, wyrd_spec::card::agent::AgentCard>,
+    agents: BTreeMap<String, AgentCard>,
     /// Prompt Card holders keyed by exact `CardRef`.
     prompts: BTreeMap<String, PromptCard>,
     /// Model Card holders keyed by exact `CardRef`.
@@ -504,7 +507,7 @@ impl WyrdState {
     /// `WYRD_SDK_400_CARD_KIND_MISMATCH` when the alias names another kind,
     /// or `WYRD_SDK_400_INVALID_STATE_BUNDLE` when a validated typed index is
     /// internally inconsistent.
-    pub fn agent(&self, alias: &str) -> Result<&wyrd_spec::card::agent::AgentCard, WyrdError> {
+    pub fn agent(&self, alias: &str) -> Result<&AgentCard, WyrdError> {
         let key = self.typed_key(alias, &CardKind::Agent)?;
         self.index
             .typed
@@ -583,7 +586,7 @@ impl WyrdState {
     /// Returns `WYRD_SDK_404_UNKNOWN_ALIAS` for an unknown alias,
     /// `WYRD_SDK_400_CARD_KIND_MISMATCH` when the alias names another kind,
     /// or `WYRD_SDK_400_INVALID_STATE_BUNDLE` for an inconsistent envelope.
-    pub fn eval(&self, alias: &str) -> Result<&wyrd_spec::vala::eval::EvalSpec, WyrdError> {
+    pub fn eval(&self, alias: &str) -> Result<&EvalSpec, WyrdError> {
         self.spec_of_kind(alias, &CardKind::Eval, |spec| match spec {
             Spec::Eval(spec) => Some(spec),
             _ => None,
@@ -611,7 +614,7 @@ impl WyrdState {
     /// `WYRD_SDK_400_CARD_KIND_MISMATCH` when the alias is not an Agent,
     /// or `WYRD_SDK_400_INVALID_STATE_BUNDLE` when a prompt target is absent,
     /// not a Prompt Card, or remains an authored path.
-    pub fn agent_prompt(&self, alias: &str) -> Result<&skald_spec::Prompt, WyrdError> {
+    pub fn agent_prompt(&self, alias: &str) -> Result<&Prompt, WyrdError> {
         let agent = self.agent(alias)?;
         match &agent.spec.prompt {
             wyrd_spec::reference::InlineableRef::Inline(prompt) => Ok(prompt.as_ref()),
@@ -1121,7 +1124,7 @@ fn hydrate_typed_cards(cards: &BTreeMap<String, Card>) -> Result<TypedCards, Wyr
     for (key, envelope) in cards {
         match envelope.kind {
             CardKind::Agent => {
-                let holder = wyrd_spec::card::agent::AgentCard::from_envelope(envelope.clone())
+                let holder = AgentCard::from_envelope(envelope.clone())
                     .map_err(|error| typed_hydration_error(envelope, &error))?;
                 typed.agents.insert(key.clone(), holder);
             }
@@ -1178,7 +1181,7 @@ fn typed_hydration_error(card: &Card, source: &WyrdError) -> WyrdError {
 #[must_use]
 fn invalid_agent_prompt_target(
     alias: &str,
-    card_ref: &wyrd_spec::reference::CardRef,
+    card_ref: &CardRef,
     graph: &HydratedStateIndex,
 ) -> WyrdError {
     let key = card_ref.to_string();
@@ -1624,6 +1627,12 @@ fn unhydrated_error(path: &Path, message: &str) -> WyrdError {
     }
 }
 
+/// One Card from a hydrated bundle manifest after its envelope, identity,
+/// aliases, and artifacts have been validated against disk.
+///
+/// Produced per manifest entry while loading a local bundle and then indexed
+/// by `key` to build the in-memory Card graph; construction guarantees the
+/// Card carries a UID and that every artifact lies inside `artifact_dir`.
 #[derive(Debug)]
 struct LoadedManifestCard {
     /// Canonical exact-reference key used by every graph index.
@@ -1640,6 +1649,12 @@ struct LoadedManifestCard {
     artifact_dir: Option<PathBuf>,
 }
 
+/// On-disk alias projection read from `aliases/<alias>.yaml` in a hydrated
+/// bundle.
+///
+/// Bundle loading rejects the bundle unless every field matches the manifest
+/// entry that declares the alias; unknown fields are refused so a tampered or
+/// newer-format projection fails closed.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AliasRecord {

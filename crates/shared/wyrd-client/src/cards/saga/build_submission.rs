@@ -34,6 +34,18 @@ pub(crate) async fn prepare(
     })
 }
 
+/// Require a one-to-one match between artifacts declared by the submissions
+/// and the caller-supplied local sources.
+///
+/// Runs after every submission has been hashed and stamped, before any
+/// registration network call, so a registration never starts with an
+/// artifact that cannot be uploaded or a local file nobody declared.
+///
+/// # Errors
+///
+/// Returns `RegistryUploadInterrupted` when a declared artifact path has no
+/// local source, and `RegistryInvalidArtifactPath` when a local source is not
+/// declared by any submission.
 fn validate_source_set(
     submissions: &[CardSubmission],
     sources: &BTreeMap<RelativeArtifactPath, PathBuf>,

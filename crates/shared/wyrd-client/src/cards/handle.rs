@@ -140,6 +140,9 @@ pub struct LoadedCard {
 /// Cheap-to-clone, tenant-scoped Card registry handle.
 #[derive(Clone)]
 pub struct Cards {
+    /// Shared registry engine that owns the authenticated transport, tenant
+    /// scope, and registration/load sagas; cloning `Cards` only bumps this
+    /// `Arc`, so every clone drives the same engine state.
     pub(crate) engine: Arc<RegistryEngine>,
 }
 

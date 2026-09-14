@@ -8,6 +8,24 @@ use super::{UploadHooks, UploadOutcome, report};
 use crate::storage::error::{StorageClientError, from_authenticated};
 use crate::storage::upload::reader::SourceReader;
 
+/// Stream a source as one authenticated PUT to the Wyrd server's local
+/// filesystem storage endpoint.
+///
+/// The request goes through the client's authenticated transport rather than
+/// an external presigned URL. Progress is reported as each streamed chunk is
+/// handed to the request body. The server stores the object directly, so
+/// success returns [`UploadOutcome::Uploaded`].
+///
+/// # Errors
+///
+/// Returns `PlanMismatch` for a non-LocalFs plan and the mapped authenticated
+/// transport error when the PUT fails, including source stream errors
+/// surfaced through the request body.
+///
+/// # Cancellation
+///
+/// Dropping the future aborts the streamed body; the server may discard or
+/// retain a partial write depending on how much it received.
 pub(crate) async fn upload(
     client: &WyrdClient,
     plan: &UploadPlan,

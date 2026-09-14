@@ -69,7 +69,11 @@ impl ArtifactSource for Bytes {
 /// A filesystem-backed artifact source.
 #[derive(Debug, Clone)]
 pub struct FileSource {
+    /// File to stream; opened lazily when the upload stream is first polled.
     path: PathBuf,
+    /// Size captured by [`FileSource::open`], exposed as the size hint that
+    /// protocols use to enforce exact-length transfers; `None` from
+    /// [`FileSource::new`].
     size: Option<u64>,
 }
 
@@ -154,6 +158,27 @@ impl UploadOutcome {
     }
 }
 
+/// Validate an upload plan and run the matching backend protocol for one
+/// artifact source.
+///
+/// This is the single entry point [`crate::storage::WyrdStorageClient`] uses
+/// for byte transfer: it rejects degenerate plan geometry, wraps the source in
+/// a [`SourceReader`] with its size hint, and delegates to the LocalFs,
+/// single-PUT, S3 multipart, GCS resumable, or Azure block blob module. The
+/// returned outcome tells the caller whether a server completion call is
+/// still required.
+///
+/// # Errors
+///
+/// Returns `PlanInvalid` for zero part, chunk, or block sizes/counts, and
+/// otherwise any error from the selected protocol (plan mismatch, size
+/// mismatch, transport, backend, or source read errors).
+///
+/// # Cancellation
+///
+/// Dropping the future stops the transfer mid-protocol; bytes already sent
+/// may remain as partial or uncommitted backend state until the upload is
+/// retried or expires.
 pub(crate) async fn dispatch<S: ArtifactSource>(
     client: &WyrdClient,
     plan: &UploadPlan,
@@ -180,6 +205,13 @@ pub(crate) async fn dispatch<S: ArtifactSource>(
     }
 }
 
+/// Reject plans whose chunking geometry would make a protocol loop never
+/// progress or divide by zero.
+///
+/// # Errors
+///
+/// Returns `PlanInvalid` when an S3 part count or size, GCS chunk size, or
+/// Azure block count or size is zero.
 fn validate_plan(plan: &UploadPlan) -> Result<(), StorageClientError> {
     match plan {
         UploadPlan::S3Multipart {
@@ -205,6 +237,16 @@ fn validate_plan(plan: &UploadPlan) -> Result<(), StorageClientError> {
     }
 }
 
+/// Convert a server-declared chunk size into a buffer length the reader can
+/// allocate.
+///
+/// `name` identifies the plan field in the error so callers can see which
+/// geometry value was unusable.
+///
+/// # Errors
+///
+/// Returns `PlanInvalid(name)` when `value` does not fit `usize` or exceeds
+/// `isize::MAX`, the largest allocation size Rust permits.
 pub(crate) fn checked_size(value: u64, name: &'static str) -> Result<usize, StorageClientError> {
     let size = usize::try_from(value).map_err(|_| StorageClientError::PlanInvalid(name))?;
     if size > isize::MAX as usize {
@@ -213,6 +255,8 @@ pub(crate) fn checked_size(value: u64, name: &'static str) -> Result<usize, Stor
     Ok(size)
 }
 
+/// Invoke the optional progress callback with cumulative bytes uploaded and
+/// the known total, doing nothing when no callback was supplied.
 pub(crate) fn report(progress: Option<&ProgressCallback>, uploaded: u64, total: Option<u64>) {
     if let Some(progress) = progress {
         progress(uploaded, total);
@@ -237,6 +281,8 @@ pub(crate) fn s3_part_url_minter<'a>(
     }))
 }
 
+/// Return the static variant name of an upload plan, used in
+/// `PlanMismatch` errors when a protocol module receives the wrong plan.
 pub(crate) fn plan_variant(plan: &UploadPlan) -> &'static str {
     match plan {
         UploadPlan::LocalFs { .. } => "LocalFs",

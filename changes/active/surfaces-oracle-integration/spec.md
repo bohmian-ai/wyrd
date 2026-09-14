@@ -1,6 +1,6 @@
 ---
 id: SPEC-surfaces-oracle-integration
-revision: 7
+revision: 8
 status: approved
 ---
 
@@ -426,15 +426,18 @@ architecture rather than as parallel implementations.
   allowed and denied decisions are audited, and audit unavailability fails the
   operation closed. Engine-internal Scribe, Forge, Oracle reader-protection,
   and retained-publication transitions evaluate no permission and MUST remain
-  lineage rather than audit. Oracle query reads are the sole WAL-first
-  exception and MUST relay accepted events into the same tenant staging chain
-  at least once.
+  lineage rather than audit. Oracle query read decisions and tenant-tripwire
+  violations are the sole exception: per REQ-014 they are committed into the
+  same tenant staging chain from a tracked, non-blocking task after the
+  decision, with no audit WAL or relay. An allowed read therefore proceeds
+  without waiting for its audit commit, and a tripwire refusal is returned
+  regardless of it; a commit that fails MUST be logged and counted rather than
+  silently dropped.
 - **REQ-026A:** One logical Oracle query MUST produce one read-audit event and
-  distributed stages MUST produce none. The relay MUST checkpoint only after
-  its Postgres commit. Commit-before-checkpoint replay MAY produce one valid
-  duplicate but MUST NOT lose the accepted event. Verified delegation MUST be
-  stored initiator-first, survive WAL framing and replay, and remain hash
-  covered; an empty delegation chain MUST remain omitted from canonical bytes.
+  distributed stages MUST produce none. Oracle audit commits MUST NOT starve
+  the pooled connections that reader-epoch renewal and query execution need.
+  Verified delegation MUST be stored initiator-first and remain hash covered;
+  an empty delegation chain MUST remain omitted from canonical bytes.
 - **REQ-026B:** Object-scoped denial MUST be durably audited before refusal is
   returned; audit failure MUST preserve the denial and surface audit
   unavailability. Peer-ticket rejection before verified tenant decoding MUST
@@ -752,7 +755,7 @@ authorization decision or accepted Oracle read
   typed collection, streaming, lifecycle operations, description, and the
   absence of sibling public engine clients.
 - **AC-005:** SQL and audit evidence demonstrates fail-closed audit of allowed
-  and denied authorization decisions, Oracle WAL-first read acceptance,
+  and denied authorization decisions, non-blocking Oracle read-decision audit,
   idempotent staging publication, reproducible retained hashes, and atomic
   watermark advancement plus garbage collection across partial failures.
   Existing real-server retained-history evidence proves publication into
@@ -812,10 +815,10 @@ authorization decision or accepted Oracle read
   mixed-table denial with no rows, authorization before source IO, and no
   distributed widening.
 - **AC-017:** Audit evidence proves delegation and typed scoped permission
-  identity survive Oracle WAL framing and replay, relay checkpointing follows
-  Postgres commit, one logical query creates one event, object denial fails
-  closed when audit is unavailable, and peer rejection uses the correct tenant
-  or system chain.
+  identity are recorded in the Oracle read-decision event, one logical query
+  creates one event, Oracle reads stay served while their audit commits wait,
+  object denial fails closed when audit is unavailable, and peer rejection uses
+  the correct tenant or system chain.
 - **AC-018:** Configuration, boot, restart, and deployment evidence proves the
   default and overridden single Bifrost data root, automatic managed paths,
   removal of old settings, failure before readiness, durable restart behavior,
@@ -865,6 +868,12 @@ unshipped, so its existing schema definition changes in place with no migration
 or backfill. TASK-001 implementation is complete; its closeout remains blocked
 until TASK-005 and TASK-006 complete. Task decomposition and merge execution
 remain subject to REQ-039 and REQ-047.
+
+The user approved revision 8 on 2026-09-14. It aligns REQ-026, REQ-026A,
+AC-005, and AC-017 with the REQ-014 decision of 2026-09-13: Oracle read
+decisions and tenant tripwires commit to the audit outbox from a non-blocking
+task with no audit WAL or relay, so an allowed read is not failed closed on
+audit unavailability.
 
 ## Revision history
 
@@ -917,6 +926,14 @@ remain subject to REQ-039 and REQ-047.
   so the existing schema definition changes in place with no migration,
   compatibility path, or backfill. TASK-001 remains implemented with closeout
   blocked on TASK-005 and TASK-006.
+- Revision 8 (`approved`, 2026-09-14): Removes the Oracle WAL-first read audit,
+  relay, and checkpoint requirements that REQ-014 retired. Oracle read
+  decisions and tenant tripwires commit to `vala.audit_staging` from a tracked
+  non-blocking task; allowed reads are exempt from fail-closed audit, and
+  failed commits are logged and counted. One event per logical query,
+  initiator-first hash-covered delegation, fail-closed object denial, and
+  correct peer-rejection chains are unchanged. Audit commits must not starve
+  the Vala pool.
 
 ## Material authority
 

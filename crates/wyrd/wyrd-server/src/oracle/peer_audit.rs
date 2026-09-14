@@ -148,17 +148,9 @@ mod tests {
             .expect("tenant audit commits");
 
         let pool = fixture.superuser_pool().await.expect("assertion pool");
-        let rows: Vec<(
-            uuid::Uuid,
-            uuid::Uuid,
-            String,
-            String,
-            String,
-            String,
-            String,
-        )> = sqlx::query_as(
-            "SELECT data_tenant_id, principal_id, principal_kind, auth_method, \
-                        decision, result, detail \
+        let rows: Vec<(uuid::Uuid, uuid::Uuid, String, String, String, String)> = sqlx::query_as(
+            "SELECT data_tenant_id, principal_id, principal_kind, permission, \
+                        outcome, detail \
                    FROM vala.audit_staging \
                   WHERE operation = 'bifrost.query.security_violation' \
                   ORDER BY data_tenant_id",
@@ -171,20 +163,19 @@ mod tests {
         for row in &rows {
             assert_eq!(row.1, PLATFORM_AUDIT_PRINCIPAL.as_uuid());
             assert_eq!(row.2, "service");
-            assert_eq!(row.3, "internal");
-            assert_eq!(row.4, "deny");
-            assert_eq!(row.5, "failure");
+            assert_eq!(row.3, "bifrost:query:peer_execute");
+            assert_eq!(row.4, "denied");
         }
         let system = rows
             .iter()
             .find(|row| row.0 == DataTenantId::SYSTEM_OWNER.as_uuid())
             .expect("system audit row");
-        assert!(system.6.contains("\"violation\":\"peer_unknown_key\""));
+        assert!(system.5.contains("\"violation\":\"peer_unknown_key\""));
         let tenant = rows
             .iter()
             .find(|row| row.0 == fixture.data_tenant_id().as_uuid())
             .expect("verified tenant audit row");
-        assert!(tenant.6.contains("\"violation\":\"peer_audience\""));
+        assert!(tenant.5.contains("\"violation\":\"peer_audience\""));
     }
 
     /// Missing or incompatible system state prevents peer audit readiness.

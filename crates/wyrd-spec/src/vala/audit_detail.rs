@@ -1298,7 +1298,7 @@ mod tests {
                     "batch_id": value,
                     "table": "vala.events",
                     "record_count": 1,
-                    "decision": "allow"
+                    "outcome": "allowed"
                 }),
             };
             assert!(
@@ -1320,8 +1320,8 @@ mod tests {
                 r#"{"actor_principal_id":"00000000-0000-0000-0000-000000000001","delegation_chain":[{"kind":"Agent","name":"worker","space":"prod","version":"1.0.0"}],"expires_at":"2026-01-02T03:04:05Z","kind":"token_exchange","subject_principal_id":"00000000-0000-0000-0000-000000000002"}"#,
             ),
             (
-                r#"{"deny_reason":"PERMISSION_DENIED","delegation_chain":[],"decision":"deny","callee_principal_id":"00000000-0000-0000-0000-000000000002","kind":"authz_check","caller_principal_id":"00000000-0000-0000-0000-000000000001"}"#,
-                r#"{"callee_principal_id":"00000000-0000-0000-0000-000000000002","caller_principal_id":"00000000-0000-0000-0000-000000000001","decision":"deny","delegation_chain":[],"deny_reason":"PERMISSION_DENIED","kind":"authz_check"}"#,
+                r#"{"deny_reason":"PERMISSION_DENIED","delegation_chain":[],"outcome":"denied","callee_principal_id":"00000000-0000-0000-0000-000000000002","kind":"authz_check","caller_principal_id":"00000000-0000-0000-0000-000000000001"}"#,
+                r#"{"callee_principal_id":"00000000-0000-0000-0000-000000000002","caller_principal_id":"00000000-0000-0000-0000-000000000001","delegation_chain":[],"deny_reason":"PERMISSION_DENIED","kind":"authz_check","outcome":"denied"}"#,
             ),
             (
                 r#"{"after_spec_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","card_uid":"01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00","operation":"register","kind":"card_registration","card_kind":"Agent","outcome":"created","before_spec_hash":null}"#,
@@ -1336,8 +1336,8 @@ mod tests {
                 r#"{"backend":"s3","error_code":null,"kind":"storage","operation":"complete","status_code":200,"storage_path":"cards/a","upload_id":null}"#,
             ),
             (
-                r#"{"record_count":2,"table":"vala.events","decision":"allow","batch_id":"batch-1","origin":{"dirty":false,"path":"cards/agent.yaml","commit":"0123456","repo":"github.com/bohmian-ai/wyrd"},"kind":"ingest"}"#,
-                r#"{"batch_id":"batch-1","decision":"allow","kind":"ingest","origin":{"commit":"0123456","path":"cards/agent.yaml","repo":"github.com/bohmian-ai/wyrd"},"record_count":2,"table":"vala.events"}"#,
+                r#"{"record_count":2,"table":"vala.events","outcome":"allowed","batch_id":"batch-1","origin":{"dirty":false,"path":"cards/agent.yaml","commit":"0123456","repo":"github.com/bohmian-ai/wyrd"},"kind":"ingest"}"#,
+                r#"{"batch_id":"batch-1","kind":"ingest","origin":{"commit":"0123456","path":"cards/agent.yaml","repo":"github.com/bohmian-ai/wyrd"},"outcome":"allowed","record_count":2,"table":"vala.events"}"#,
             ),
         ];
 

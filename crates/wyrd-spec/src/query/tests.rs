@@ -393,7 +393,14 @@ fn field_strategy() -> impl Strategy<Value = FieldRef> {
         key_strategy().prop_map(FieldRef::Label),
         key_strategy().prop_map(FieldRef::Annotation),
         key_strategy().prop_map(FieldRef::Attribute),
-        "[a-z_][a-z0-9_]{0,12}".prop_map(FieldRef::Reserved),
+        "[a-z_][a-z0-9_]{0,12}"
+            .prop_filter("query keywords are not bare reserved fields", |name| {
+                !matches!(
+                    name.as_str(),
+                    "and" | "or" | "not" | "in" | "exists" | "true" | "false"
+                )
+            })
+            .prop_map(FieldRef::Reserved),
     ]
 }
 

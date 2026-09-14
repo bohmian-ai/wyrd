@@ -1663,7 +1663,17 @@ mod tests {
             "deadline cancelled only the borrowed sink future"
         );
         sink.release();
-        producer.flush().expect("retained timeout batch resolves");
+        let settle_by = Instant::now() + Duration::from_secs(5);
+        while budget.metrics().live_batches != 0 {
+            assert!(
+                Instant::now() < settle_by,
+                "scheduled retry settles the retained batch"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        producer
+            .flush()
+            .expect("flush succeeds after the scheduled retry settles");
         let attempts = sink
             .attempts
             .lock()

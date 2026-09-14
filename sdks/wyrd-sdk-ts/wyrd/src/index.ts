@@ -271,6 +271,26 @@ function lifecycleValue<T>(result: NativeLifecycleResult): T {
   return JSON.parse(result.valueJson) as T;
 }
 
+/** Unwrap one closed native construction result, throwing its catalog error. */
+function nativeHandle<T>(
+  value: T | null | undefined,
+  error: NativeErrorMetadata | null | undefined,
+): T {
+  const projected = error == null ? undefined : projectedError(error);
+  if (projected !== undefined) {
+    throw projected;
+  }
+  if (value === null || value === undefined) {
+    throw new WyrdError(
+      "WYRD_VALA_502_QUERY_STREAM_PROTOCOL",
+      502,
+      "Native construction protocol failed",
+      "native construction returned neither a value nor structured error",
+    );
+  }
+  return value;
+}
+
 function runningQuery(wire: RunningQueryWire): RunningQuery {
   return {
     requestId: wire.request_id,
@@ -508,14 +528,13 @@ export class TableConfig {
       readonly grpcUrl?: string;
     } = {},
   ): Promise<TableConfig> {
-    return new TableConfig(
-      await describeTableConfig(
-        table,
-        transport.serverUrl,
-        transport.credential,
-        transport.grpcUrl,
-      ),
+    const described = await describeTableConfig(
+      table,
+      transport.serverUrl,
+      transport.credential,
+      transport.grpcUrl,
     );
+    return new TableConfig(nativeHandle(described.config, described.error));
   }
 
   /** `namespace.name` — the name SQL and the ingest batch both use. */
@@ -656,14 +675,13 @@ export class Bifrost {
       readonly grpcUrl?: string;
     } = {},
   ): Promise<Bifrost> {
-    return new Bifrost(
-      await connectBifrost(
-        options.table?.native,
-        options.serverUrl,
-        options.credential,
-        options.grpcUrl,
-      ),
+    const connection = await connectBifrost(
+      options.table?.native,
+      options.serverUrl,
+      options.credential,
+      options.grpcUrl,
     );
+    return new Bifrost(nativeHandle(connection.bifrost, connection.error));
   }
 
   /** Create the active table; resolves to `created` or `already_exists`. */
@@ -977,7 +995,8 @@ export class Cards {
   static connect(
     options: { readonly serverUrl?: string; readonly credential?: string } = {},
   ): Cards {
-    return new Cards(connectCards(options.serverUrl, options.credential));
+    const connection = connectCards(options.serverUrl, options.credential);
+    return new Cards(nativeHandle(connection.cards, connection.error));
   }
 
   /** Load a Card tree from disk and register it as one composite. */

@@ -320,24 +320,20 @@ export declare class NativeWyrdState {
  *
  * # Errors
  *
- * Returns a napi error when no credential resolves, when the supplied table
- * config is not one serialized `TableConfig`, or when the gRPC ingest channel
- * cannot be dialled.
+ * Returns a napi error only when the supplied table config is not one
+ * serialized `TableConfig`; credential and ingest-dial failures are returned
+ * as catalog metadata.
  */
-export declare function connectBifrost(table?: NativeTableConfig | undefined | null, serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null): Promise<NativeBifrost>
+export declare function connectBifrost(table?: NativeTableConfig | undefined | null, serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null): Promise<NativeBifrostConnection>
 
 /**
  * Builds one Card registry handle without performing IO.
  *
  * Omitted arguments resolve through the same shared client configuration
  * chain as `connectBifrost`, so both capabilities authenticate identically.
- *
- * # Errors
- *
- * Returns a napi error when no credential resolves or the HTTP client cannot
- * be built.
+ * Credential and configuration failures are returned as catalog metadata.
  */
-export declare function connectCards(serverUrl?: string | undefined | null, credential?: string | undefined | null): NativeCards
+export declare function connectCards(serverUrl?: string | undefined | null, credential?: string | undefined | null): NativeCardsConnection
 
 /**
  * Fetches an already-registered table's config by name.
@@ -347,10 +343,26 @@ export declare function connectCards(serverUrl?: string | undefined | null, cred
  *
  * # Errors
  *
- * Returns a napi error when no credential resolves, or when the server refuses
- * or cannot describe the table.
+ * Returns a napi error only when the described config cannot be encoded;
+ * credential, transport, and server refusals are returned as catalog metadata.
  */
-export declare function describeTableConfig(table: string, serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null): Promise<NativeTableConfig>
+export declare function describeTableConfig(table: string, serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null): Promise<NativeTableConfigResult>
+
+/** Closed result of connecting one Bifrost client: a handle or a catalog error. */
+export interface NativeBifrostConnection {
+  /** Connected client when construction succeeded. */
+  bifrost?: NativeBifrost
+  /** Catalog failure when construction failed. */
+  error?: NativeWyrdError
+}
+
+/** Closed result of building one Card registry handle: a handle or a catalog error. */
+export interface NativeCardsConnection {
+  /** Registry handle when construction succeeded. */
+  cards?: NativeCards
+  /** Catalog failure when no credential resolves or the client cannot be built. */
+  error?: NativeWyrdError
+}
 
 /** Structured native result for one live-query lifecycle control. */
 export interface NativeLifecycleResult {
@@ -421,6 +433,35 @@ export interface NativeTableConfig {
   schemaIpc: Buffer
   /** Serialized `{table_uid, fingerprint}` once the server has minted it. */
   resolvedJson?: string
+}
+
+/** Closed result of describing one table: its config or a catalog error. */
+export interface NativeTableConfigResult {
+  /** Described table config when the server answered. */
+  config?: NativeTableConfig
+  /** Catalog failure when description failed. */
+  error?: NativeWyrdError
+}
+
+/**
+ * Catalog metadata for one failed native construction or description.
+ *
+ * Field names match the other native results so the TypeScript facade builds
+ * its public `WyrdError` through the same projection.
+ */
+export interface NativeWyrdError {
+  /** Stable catalog code. */
+  errorCode: string
+  /** HTTP-equivalent status. */
+  errorStatus: number
+  /** Stable catalog title. */
+  errorTitle: string
+  /** Scrubbed catalog detail. */
+  errorDetail: string
+  /** Operator-facing remediation. */
+  errorRemediation: string
+  /** Serialized JSON-safe structured details, when present. */
+  errorDetailsJson?: string
 }
 
 /** Loads and validates one hydrated bundle without contacting Wyrd. */

@@ -107,19 +107,75 @@ impl NativeLifecycleResult {
 
     /// Builds one failed projection directly from a catalog error.
     fn from_wyrd(projected: &WyrdError) -> Self {
-        let problem = projected.as_problem_json();
+        let error = NativeWyrdError::from_wyrd(projected);
         Self {
             value_json: None,
-            error_code: Some(projected.code().to_owned()),
-            error_status: Some(u32::from(projected.status())),
-            error_title: Some(problem_field(&problem, "title", projected.title())),
-            error_detail: Some(problem_field(&problem, "detail", &projected.to_string())),
-            error_remediation: Some(projected.remediation().to_owned()),
+            error_code: Some(error.error_code),
+            error_status: Some(error.error_status),
+            error_title: Some(error.error_title),
+            error_detail: Some(error.error_detail),
+            error_remediation: Some(error.error_remediation),
+            error_details_json: error.error_details_json,
+        }
+    }
+}
+
+/// Catalog metadata for one failed native construction or description.
+///
+/// Field names match the other native results so the TypeScript facade builds
+/// its public `WyrdError` through the same projection.
+#[napi(object)]
+pub struct NativeWyrdError {
+    /// Stable catalog code.
+    pub error_code: String,
+    /// HTTP-equivalent status.
+    pub error_status: u32,
+    /// Stable catalog title.
+    pub error_title: String,
+    /// Scrubbed catalog detail.
+    pub error_detail: String,
+    /// Operator-facing remediation.
+    pub error_remediation: String,
+    /// Serialized JSON-safe structured details, when present.
+    pub error_details_json: Option<String>,
+}
+
+impl NativeWyrdError {
+    /// Projects one catalog error onto its independent metadata fields.
+    ///
+    /// Public text comes from the problem document so it matches the HTTP and
+    /// Python projections of the same error.
+    fn from_wyrd(projected: &WyrdError) -> Self {
+        let problem = projected.as_problem_json();
+        Self {
+            error_code: projected.code().to_owned(),
+            error_status: u32::from(projected.status()),
+            error_title: problem_field(&problem, "title", projected.title()),
+            error_detail: problem_field(&problem, "detail", &projected.to_string()),
+            error_remediation: projected.remediation().to_owned(),
             error_details_json: problem
                 .get("details")
                 .and_then(|value| serde_json::to_string(value).ok()),
         }
     }
+}
+
+/// Closed result of connecting one Bifrost client: a handle or a catalog error.
+#[napi(object, object_from_js = false)]
+pub struct NativeBifrostConnection {
+    /// Connected client when construction succeeded.
+    pub bifrost: Option<NativeBifrost>,
+    /// Catalog failure when construction failed.
+    pub error: Option<NativeWyrdError>,
+}
+
+/// Closed result of describing one table: its config or a catalog error.
+#[napi(object, object_from_js = false)]
+pub struct NativeTableConfigResult {
+    /// Described table config when the server answered.
+    pub config: Option<NativeTableConfig>,
+    /// Catalog failure when description failed.
+    pub error: Option<NativeWyrdError>,
 }
 
 /// Structured result of starting a native terminal-safe query.
@@ -329,8 +385,8 @@ pub fn table_config_from_json_schema(
 ///
 /// # Errors
 ///
-/// Returns a napi error when no credential resolves, or when the server refuses
-/// or cannot describe the table.
+/// Returns a napi error only when the described config cannot be encoded;
+/// credential, transport, and server refusals are returned as catalog metadata.
 // justification: napi boundary; a JavaScript string is primitive and cannot be
 // passed by reference, so the generated binding requires an owned String
 #[allow(clippy::needless_pass_by_value)]
@@ -340,17 +396,25 @@ pub async fn describe_table_config(
     server_url: Option<String>,
     credential: Option<String>,
     grpc_url: Option<String>,
-) -> napi::Result<NativeTableConfig> {
-    let client = wyrd_client::bifrost::client_from_options(
+) -> napi::Result<NativeTableConfigResult> {
+    let described = match wyrd_client::bifrost::client_from_options(
         server_url.as_deref(),
         credential.as_deref(),
         grpc_url.as_deref(),
-    )
-    .map_err(napi_error)?;
-    let config = wyrd_client::bifrost::TableConfig::describe(&client, &table)
-        .await
-        .map_err(napi_error)?;
-    NativeTableConfig::project(&config)
+    ) {
+        Ok(client) => wyrd_client::bifrost::TableConfig::describe(&client, &table).await,
+        Err(error) => Err(error),
+    };
+    match described {
+        Ok(config) => Ok(NativeTableConfigResult {
+            config: Some(NativeTableConfig::project(&config)?),
+            error: None,
+        }),
+        Err(error) => Ok(NativeTableConfigResult {
+            config: None,
+            error: Some(NativeWyrdError::from_wyrd(&WyrdError::from(&error))),
+        }),
+    }
 }
 
 /// Applies one optional serialized physical layout to a config.
@@ -396,29 +460,43 @@ pub struct NativeBifrost {
 ///
 /// # Errors
 ///
-/// Returns a napi error when no credential resolves, when the supplied table
-/// config is not one serialized `TableConfig`, or when the gRPC ingest channel
-/// cannot be dialled.
+/// Returns a napi error only when the supplied table config is not one
+/// serialized `TableConfig`; credential and ingest-dial failures are returned
+/// as catalog metadata.
 #[napi]
 pub async fn connect_bifrost(
     table: Option<NativeTableConfig>,
     server_url: Option<String>,
     credential: Option<String>,
     grpc_url: Option<String>,
-) -> napi::Result<NativeBifrost> {
-    let client = wyrd_client::bifrost::client_from_options(
+) -> napi::Result<NativeBifrostConnection> {
+    let table = table.map(|table| table.parse()).transpose()?;
+    let connected = match wyrd_client::bifrost::client_from_options(
         server_url.as_deref(),
         credential.as_deref(),
         grpc_url.as_deref(),
-    )
-    .map_err(napi_error)?;
-    let table = table.map(|table| table.parse()).transpose()?;
-    let handle =
-        wyrd_client::bifrost::Bifrost::connect_with_config(&client, table, QueueConfig::default())
+    ) {
+        Ok(client) => {
+            wyrd_client::bifrost::Bifrost::connect_with_config(
+                &client,
+                table,
+                QueueConfig::default(),
+            )
             .await
-            .map_err(napi_error)?;
-    Ok(NativeBifrost {
-        client: Arc::new(handle),
+        }
+        Err(error) => Err(error),
+    };
+    Ok(match connected {
+        Ok(handle) => NativeBifrostConnection {
+            bifrost: Some(NativeBifrost {
+                client: Arc::new(handle),
+            }),
+            error: None,
+        },
+        Err(error) => NativeBifrostConnection {
+            bifrost: None,
+            error: Some(NativeWyrdError::from_wyrd(&WyrdError::from(&error))),
+        },
     })
 }
 

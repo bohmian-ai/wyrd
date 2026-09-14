@@ -12,7 +12,7 @@ use wyrd_client::state::WyrdState;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::{CardRef, CardRefParseError};
 
-use crate::{NativeLifecycleResult, napi_error};
+use crate::{NativeLifecycleResult, NativeWyrdError};
 
 /// Tenant-scoped Card registry handle over the shared `wyrd_client` Cards.
 #[napi]
@@ -21,20 +21,22 @@ pub struct NativeCards {
     cards: Cards,
 }
 
+/// Closed result of building one Card registry handle: a handle or a catalog error.
+#[napi(object, object_from_js = false)]
+pub struct NativeCardsConnection {
+    /// Registry handle when construction succeeded.
+    pub cards: Option<NativeCards>,
+    /// Catalog failure when no credential resolves or the client cannot be built.
+    pub error: Option<NativeWyrdError>,
+}
+
 /// Builds one Card registry handle without performing IO.
 ///
 /// Omitted arguments resolve through the same shared client configuration
 /// chain as `connectBifrost`, so both capabilities authenticate identically.
-///
-/// # Errors
-///
-/// Returns a napi error when no credential resolves or the HTTP client cannot
-/// be built.
+/// Credential and configuration failures are returned as catalog metadata.
 #[napi]
-pub fn connect_cards(
-    server_url: Option<String>,
-    credential: Option<String>,
-) -> napi::Result<NativeCards> {
+pub fn connect_cards(server_url: Option<String>, credential: Option<String>) -> NativeCardsConnection {
     let client = wyrd_client::bifrost::client_from_options(
         server_url.as_deref(),
         credential.as_deref(),
@@ -42,9 +44,18 @@ pub fn connect_cards(
     );
     drop(server_url);
     drop(credential);
-    Ok(NativeCards {
-        cards: Cards::with_client(client.map_err(napi_error)?),
-    })
+    match client {
+        Ok(client) => NativeCardsConnection {
+            cards: Some(NativeCards {
+                cards: Cards::with_client(client),
+            }),
+            error: None,
+        },
+        Err(error) => NativeCardsConnection {
+            cards: None,
+            error: Some(NativeWyrdError::from_wyrd(&WyrdError::from(&error))),
+        },
+    }
 }
 
 #[napi]

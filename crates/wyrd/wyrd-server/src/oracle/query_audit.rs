@@ -6,11 +6,19 @@
 //! history. The commit runs as a tracked background task so a query is never
 //! held behind it. A commit that fails is logged and counted; that decision has
 //! no audit row.
+//!
+//! Commits share the Vala pool with reader-epoch renewal and readiness. An
+//! append waits on the tenant's `audit_chain_head` row lock, so while that lock
+//! is held (for example by a publication settling behind a locked staging row)
+//! every read would otherwise park one pooled connection until renewal starved
+//! and the Oracle fenced itself. Commits therefore hold one of a fixed share of
+//! the pool's connections; the rest queue in memory without a connection.
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
+use tokio::sync::Semaphore;
 use tokio_util::task::TaskTracker;
 use vala_bifrost_redux::oracle::{
     AuthorizedQueryContext, BifrostQueryReadDecision, BifrostSecurityViolation, OracleAudit,
@@ -29,26 +37,44 @@ pub struct OracleQueryAudit {
     vala: ValaPostgres,
     /// Tracks in-flight commits so shutdown can wait for them.
     tasks: TaskTracker,
+    /// Caps commits holding a pooled connection at once, leaving the rest of
+    /// the pool to lease renewal, readiness, and query pins.
+    connections: Arc<Semaphore>,
 }
+
+/// Fraction of the Vala pool that concurrent audit commits may occupy.
+const POOL_SHARE_DIVISOR: u32 = 4;
 
 impl OracleQueryAudit {
     /// Creates the writer around the server's Vala Postgres owner.
+    ///
+    /// Concurrent commits are limited to a quarter of the pool's configured
+    /// maximum connections, and never fewer than one.
     #[must_use]
     pub(crate) fn new(vala: ValaPostgres) -> Arc<Self> {
+        let permits = (vala.pool().options().get_max_connections() / POOL_SHARE_DIVISOR).max(1);
         Arc::new(Self {
             vala,
             tasks: TaskTracker::new(),
+            connections: Arc::new(Semaphore::new(permits as usize)),
         })
     }
 
     /// Spawns one tracked commit of `event` into `tenant`'s audit outbox.
     ///
-    /// Returns immediately. A failed acquire, append, or commit increments
-    /// `oracle_audit_commit_failures_total` and logs the request identity.
+    /// Returns immediately. The task waits for a connection permit before it
+    /// acquires a connection and holds it through commit. A failed acquire,
+    /// append, or commit increments `oracle_audit_commit_failures_total` and
+    /// logs the request identity.
     fn stage(&self, tenant: DataTenantId, event: AuditEvent) {
         let vala = self.vala.clone();
+        let connections = Arc::clone(&self.connections);
         self.tasks.spawn(async move {
             let committed = async {
+                let _permit = connections
+                    .acquire_owned()
+                    .await
+                    .map_err(|e| e.to_string())?;
                 let mut conn = vala.tenant_conn(tenant).await.map_err(|e| e.to_string())?;
                 audit::append_on(&mut conn, &event)
                     .await

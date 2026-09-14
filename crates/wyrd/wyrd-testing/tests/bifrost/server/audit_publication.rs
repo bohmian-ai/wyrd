@@ -111,23 +111,24 @@ async fn append_decision(
     operation: &str,
 ) -> Result<i64, ServerJourneyError> {
     let mut conn = server.tenant_conn_for(tenant).await?;
-    let seq = append_audit(
-        &mut conn,
-        &AuditEvent::new(
-            RequestId::now_v7(),
-            None,
-            operation.to_owned(),
-            "vala.datasets.journey".to_owned(),
-            None,
-            PrincipalId::new(uuid::Uuid::now_v7()),
-            PrincipalKindTag::User,
-            "bifrost:record:write".to_owned(),
-            AuditOutcome::Allowed,
-        ),
-    )
-    .await?;
+    let seq = append_audit(&mut conn, &decision(operation)).await?;
     conn.commit().await?;
     Ok(seq)
+}
+
+/// Builds one distinctive allowed write decision under `operation`.
+fn decision(operation: &str) -> AuditEvent {
+    AuditEvent::new(
+        RequestId::now_v7(),
+        None,
+        operation.to_owned(),
+        "vala.datasets.journey".to_owned(),
+        None,
+        PrincipalId::new(uuid::Uuid::now_v7()),
+        PrincipalKindTag::User,
+        "bifrost:record:write".to_owned(),
+        AuditOutcome::Allowed,
+    )
 }
 
 /// Waits until this tenant's staging table owes nothing at all.
@@ -177,7 +178,8 @@ async fn await_drained(
 /// The returned connection owns the lock until [`release_fence`].
 ///
 /// # Errors
-/// Returns the tenant-connection or lock failure Postgres raised.
+/// Returns the tenant-connection or lock failure Postgres raised, or a failure
+/// when any row of the range was already settled and so could not be held.
 async fn fence_staged_rows(
     server: &WyrdTestServer,
     tenant: DataTenantId,
@@ -187,11 +189,19 @@ async fn fence_staged_rows(
     sqlx::query("SAVEPOINT audit_fence")
         .execute(&mut **fence.transaction())
         .await?;
-    sqlx::query("DELETE FROM vala.audit_staging WHERE seq BETWEEN $1 AND $2")
+    let held = sqlx::query("DELETE FROM vala.audit_staging WHERE seq BETWEEN $1 AND $2")
         .bind(range.seq_lo)
         .bind(range.seq_hi)
         .execute(&mut **fence.transaction())
-        .await?;
+        .await?
+        .rows_affected();
+    let owed = u64::try_from(range.seq_hi - range.seq_lo + 1)?;
+    if held != owed {
+        return Err(format!(
+            "only {held} of {owed} staged rows in {range:?} were still unsettled to fence"
+        )
+        .into());
+    }
     Ok(fence)
 }
 
@@ -224,12 +234,16 @@ async fn release_fence(mut fence: TenantConn<'_>) -> Result<(), ServerJourneyErr
 ///
 /// The journey drives all three against the real server through the only
 /// callable cycle, `publish_tenant`, so no partial stage is reachable from a
-/// test that production cannot reach. It appends three real decisions, freezes
-/// their range and commits that bound, then fences the staged rows so the next
-/// cycle blocks at settlement rather than before publication. A spawned cycle
-/// therefore reaches retained history — the assertion that its Scribe append is
-/// durable — and is aborted while still holding nothing committed in Postgres,
-/// which is exactly the crash-before-settlement state. Releasing the fence and
+/// test that production cannot reach. The server's own publisher sweeps every
+/// few seconds and is a legitimate competitor, so the setup is shaped to be
+/// indifferent to it: staging is drained first, the three real decisions are
+/// appended in one transaction so any sweep freezes all of them or none, and
+/// their staged rows are fenced before the range is frozen, so no cycle can
+/// settle them. The frozen range must then be exactly those three rows,
+/// whichever publisher froze it. A spawned cycle (or a competing sweep) reaches
+/// retained history — the assertion that the Scribe append is durable — and the
+/// spawned cycle is aborted while holding nothing committed in Postgres, which
+/// is exactly the crash-before-settlement state. Releasing the fence and
 /// running the cycle again replays the identical frozen range into Scribe's
 /// batch fence. Both operations must be retained exactly once, the tail
 /// appended above the old bound must wait for its own range, and the tenant
@@ -246,9 +260,14 @@ async fn frozen_audit_range_replays_once_while_its_tail_waits() -> Result<(), Se
     let frozen_op = format!("wyrd.journey.audit_frozen.{suffix}");
     let tail_op = format!("wyrd.journey.audit_tail.{suffix}");
 
-    for _ in 0..3 {
-        append_decision(&server, tenant, &frozen_op).await?;
-    }
+    await_drained(&server, tenant).await?;
+    let mut appender = server.tenant_conn_for(tenant).await?;
+    let seq_lo = append_audit(&mut appender, &decision(&frozen_op)).await?;
+    append_audit(&mut appender, &decision(&frozen_op)).await?;
+    let seq_hi = append_audit(&mut appender, &decision(&frozen_op)).await?;
+    appender.commit().await?;
+    let appended = AuditPublicationRange { seq_lo, seq_hi };
+    let fence = fence_staged_rows(&server, tenant, appended).await?;
 
     let publisher = Arc::new(
         AuditPublisher::from_state(server.state())
@@ -260,8 +279,11 @@ async fn frozen_audit_range_replays_once_while_its_tail_waits() -> Result<(), Se
         .await?
         .ok_or("three appended decisions owe a range")?;
     freezer.commit().await?;
+    assert_eq!(
+        range, appended,
+        "a drained tenant's frozen range must be exactly the three decisions appended together"
+    );
 
-    let fence = fence_staged_rows(&server, tenant, range).await?;
     let blocked = tokio::spawn({
         let publisher = Arc::clone(&publisher);
         async move { publisher.publish_tenant(tenant).await }
@@ -285,6 +307,66 @@ async fn frozen_audit_range_replays_once_while_its_tail_waits() -> Result<(), Se
     await_retained(&server, tenant, &frozen_op, 3).await?;
     await_drained(&server, tenant).await?;
 
+    server.shutdown().await?;
+    Ok(())
+}
+
+/// Reads stay served while their audit commits wait on a locked chain head.
+///
+/// Every Oracle read stages its read decision through a background commit, and
+/// that commit waits on the tenant's `audit_chain_head` row lock. A publication
+/// settling behind a locked staging row holds exactly that lock. If each
+/// waiting commit parked a pooled connection, a few dozen reads would exhaust
+/// the Vala pool that reader-epoch renewal and query pins also use, and the
+/// Oracle would fence itself once renewal missed its cutoff. The journey first
+/// publishes one decision, so retained history exists and a read is audited
+/// rather than refused as an unknown table. It then holds the chain head,
+/// issues twice as many reads as the pool has connections, confirms their audit
+/// commits are waiting, and requires the server's own Vala pool to hand out a
+/// connection while the lock is still held. Waiting for the lease cutoff itself would take tens of
+/// seconds; a pool with no connection to lend is the cause, observed directly.
+/// Releasing the lock must then let the queued decisions commit and drain.
+///
+/// # Errors
+/// Returns the server, Postgres, publication, or query failure, or a timeout
+/// when the pool has no connection left for renewal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn reads_are_served_while_audit_commits_wait_on_the_chain_head()
+-> Result<(), ServerJourneyError> {
+    let server = WyrdTestServer::start_bound().await?;
+    let tenant = server.data_tenant_id();
+    let operation = format!(
+        "wyrd.journey.audit_locked.{}",
+        uuid::Uuid::now_v7().simple()
+    );
+
+    append_decision(&server, tenant, &operation).await?;
+    await_retained(&server, tenant, &operation, 1).await?;
+
+    let mut fence = server.tenant_conn_for(tenant).await?;
+    sqlx::query("SELECT last_seq FROM vala.audit_chain_head FOR UPDATE")
+        .fetch_all(&mut **fence.transaction())
+        .await?;
+    let pool_connections = vala_sql::postgres::vala_pool_config().max_connections;
+    for _ in 0..pool_connections * 2 {
+        retained_rows(&server, tenant, &operation).await?;
+    }
+    let waiting = server.oracle_runtime_inspection()?.audit_pending;
+    assert!(
+        waiting >= u64::from(pool_connections),
+        "each fenced read must leave its audit commit waiting on the chain head: {waiting}"
+    );
+    let spare = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        server.state().postgres.vala().pool().acquire(),
+    )
+    .await
+    .map_err(|_| "audit commits waiting on the chain head left the Vala pool no connection")??;
+    drop(spare);
+    fence.commit().await?;
+
+    await_drained(&server, tenant).await?;
     server.shutdown().await?;
     Ok(())
 }

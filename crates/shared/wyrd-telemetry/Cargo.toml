@@ -23,3 +23,6 @@ opentelemetry-otlp = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 ulid = { workspace = true }
 wyrd-tls = { workspace = true }
+
+[dev-dependencies]
+workspace-hack.workspace = true

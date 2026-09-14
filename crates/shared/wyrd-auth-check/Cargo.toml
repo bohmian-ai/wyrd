@@ -21,6 +21,7 @@ wyrd-runtime = { workspace = true }
 wyrd-spec = { path = "../../wyrd-spec", version = "0.0.1" }
 
 [dev-dependencies]
+workspace-hack.workspace = true
 chrono = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true, features = ["std", "v7"] }

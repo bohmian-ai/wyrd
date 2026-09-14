@@ -59,6 +59,7 @@ wyrd-tonic = { workspace = true, features = ["client"] }
 wyrd-utils = { workspace = true }
 
 [dev-dependencies]
+workspace-hack.workspace = true
 secrecy = { workspace = true }
 sqlx = { workspace = true, features = ["postgres"] }
 vala-bifrost-redux = { workspace = true }

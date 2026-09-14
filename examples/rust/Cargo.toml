@@ -98,3 +98,6 @@ wyrd = { path = "../../crates/wyrd/wyrd", features = ["otel"] }
 wyrd-sdk-rust = { path = "../../sdks/wyrd-sdk-rust" }
 skald-observer = { workspace = true, features = ["otel"] }
 wyrd-spec = { workspace = true }
+
+[dev-dependencies]
+workspace-hack.workspace = true

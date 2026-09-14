@@ -21,3 +21,6 @@ walkdir = { workspace = true }
 sha2 = { workspace = true }
 wyrd-spec = { workspace = true }
 pyo3 = { workspace = true, optional = true }
+
+[dev-dependencies]
+workspace-hack.workspace = true

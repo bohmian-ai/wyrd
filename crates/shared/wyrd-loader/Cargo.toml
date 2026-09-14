@@ -24,6 +24,7 @@ wyrd-config = { workspace = true }
 wyrd-spec = { workspace = true }
 
 [dev-dependencies]
+workspace-hack.workspace = true
 tempfile = { workspace = true }
 wyrd-semver = { workspace = true }
 

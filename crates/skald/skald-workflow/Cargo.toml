@@ -48,6 +48,7 @@ url = { workspace = true }
 pyo3 = { workspace = true, optional = true }
 
 [dev-dependencies]
+workspace-hack.workspace = true
 skald-providers = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 serde_json = { workspace = true }

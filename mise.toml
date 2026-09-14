@@ -24,6 +24,7 @@ rust    = "1.97.1"
 cmake = "3.26.4"
 protoc = "33.2"
 "cargo:cargo-nextest" = "0.9.143"
+"cargo:cargo-hakari" = "0.9.38"
 
 [settings]
 env_shell_expand = false
@@ -1168,6 +1169,7 @@ description = "Whole-plan closeout gate: fmt check + all-feature Clippy"
 run = """
 set -eu
 mise run fmt:check
+mise run check:workspace-hack
 mise run lints
 """
 
@@ -1179,6 +1181,15 @@ run = "bash scripts/sync-agent-skills.sh --write"
 hide = true
 description = "Fail when Claude workflow-skill mirrors drift or retired skills reappear"
 run = "bash scripts/sync-agent-skills.sh --check"
+
+[tasks."check:workspace-hack"]
+hide = true
+description = "Fail when the hakari workspace-hack no longer matches the workspace's third-party feature union (regenerate with `cargo hakari generate`)"
+run = """
+set -eu
+cargo hakari generate --diff
+cargo hakari verify
+"""
 
 [tasks."codegen:regen"]
 description = "Regenerate OpenAPI / JSON schemas / MCP tool list / pyi stubs from source"

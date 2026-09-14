@@ -1,0 +1,25 @@
+# Configuration for `cargo hakari`: one third-party feature set for Rust test
+# and Clippy builds. Regenerate with `cargo hakari generate`; `mise run
+# check:workspace-hack` fails when the generated crate drifts.
+
+hakari-package = "workspace-hack"
+
+# Format version for hakari's output. Version 4 requires cargo-hakari 0.9.22 or above.
+dep-format-version = "4"
+
+resolver = "2"
+
+# Release targets from .github/workflows/release.yml.
+platforms = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+
+# Language binding cdylibs build their own PyO3/N-API feature sets and never
+# share artifacts with the Rust test graph; keeping them out stops binding-only
+# features (for example PyO3 extension-module) leaking into test binaries.
+[traversal-excludes]
+workspace-members = ["wyrd-sdk-python", "wyrd-sdk-ts", "wyrd-sdk-ts-testing"]

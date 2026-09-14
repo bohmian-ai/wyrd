@@ -35,6 +35,7 @@ reqwest = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
+workspace-hack.workspace = true
 wyrd-testing = { workspace = true }
 # Journey plumbing only: the discovery journey registers a second tenant's
 # table through the production catalog so the list projection's tenancy claim

@@ -21,5 +21,6 @@ wyrd-spec = { path = "../../wyrd-spec", version = "0.0.1" }
 wyrd-tls = { workspace = true }
 
 [dev-dependencies]
+workspace-hack.workspace = true
 tokio = { workspace = true }
 wiremock = { workspace = true }

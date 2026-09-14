@@ -41,6 +41,7 @@ wyrd-error-derive = { workspace = true }
 wyrd-semver = { workspace = true }
 
 [dev-dependencies]
+workspace-hack.workspace = true
 pretty_assertions = "1"
 proptest = { workspace = true }
 serde_urlencoded = "0.7"

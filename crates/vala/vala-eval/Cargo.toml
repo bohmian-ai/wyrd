@@ -36,6 +36,7 @@ wyrd-spec = { workspace = true }
 wyrd-utils = { workspace = true }
 
 [dev-dependencies]
+workspace-hack.workspace = true
 wyrd-semver = { workspace = true }
 serde_json = { workspace = true }
 skald-providers = { workspace = true }

@@ -26,6 +26,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+workspace-hack.workspace = true
 tokio = { workspace = true, features = ["full"] }
 arrow = { workspace = true }
 arrow-schema = { workspace = true }

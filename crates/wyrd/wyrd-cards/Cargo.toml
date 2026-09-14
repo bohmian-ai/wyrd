@@ -37,6 +37,7 @@ pyo3 = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]
+workspace-hack.workspace = true
 tokio = { workspace = true }
 
 [lints]

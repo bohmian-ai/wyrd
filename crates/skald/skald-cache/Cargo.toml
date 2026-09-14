@@ -21,3 +21,6 @@ mini-moka = { workspace = true }
 
 [features]
 default = []
+
+[dev-dependencies]
+workspace-hack.workspace = true

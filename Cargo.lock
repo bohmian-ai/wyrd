@@ -8760,6 +8760,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "workspace-hack",
  "wyrd-runtime",
  "wyrd-spec",
  "wyrd-utils",
@@ -8776,6 +8777,7 @@ dependencies = [
  "sha2 0.10.9",
  "skald-spec",
  "thiserror 2.0.18",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -8791,6 +8793,7 @@ dependencies = [
  "skald-prompt",
  "skald-spec",
  "tokio",
+ "workspace-hack",
  "wyrd-spec",
  "wyrd-utils",
 ]
@@ -8805,6 +8808,7 @@ dependencies = [
  "serde_json",
  "skald-spec",
  "thiserror 2.0.18",
+ "workspace-hack",
  "wyrd-interfaces",
  "wyrd-spec",
  "wyrd-utils",
@@ -8833,6 +8837,7 @@ dependencies = [
  "url",
  "urlencoding",
  "wiremock",
+ "workspace-hack",
  "wyrd-tls",
 ]
 
@@ -8849,6 +8854,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -8863,6 +8869,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "thiserror 2.0.18",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -8877,6 +8884,7 @@ dependencies = [
  "skald-spec",
  "thiserror 2.0.18",
  "tokio",
+ "workspace-hack",
  "wyrd-runtime",
  "wyrd-spec",
  "wyrd-utils",
@@ -8905,6 +8913,7 @@ dependencies = [
  "tokio",
  "url",
  "uuid",
+ "workspace-hack",
  "wyrd-runtime",
  "wyrd-spec",
  "wyrd-utils",
@@ -10444,6 +10453,7 @@ dependencies = [
  "url",
  "uuid",
  "vala-sql",
+ "workspace-hack",
  "wyrd-auth-oidc",
  "wyrd-auth-verify",
  "wyrd-bench",
@@ -10464,6 +10474,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "workspace-hack",
  "wyrd-spec",
 ]
 
@@ -10476,6 +10487,7 @@ dependencies = [
  "serde",
  "statrs",
  "thiserror 2.0.18",
+ "workspace-hack",
  "wyrd-semver",
  "wyrd-spec",
  "wyrd-version",
@@ -10505,6 +10517,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "workspace-hack",
  "wyrd-error-derive",
  "wyrd-semver",
  "wyrd-spec",
@@ -10518,6 +10531,7 @@ dependencies = [
  "arrow",
  "bytes",
  "vala-bifrost-redux",
+ "workspace-hack",
  "wyrd-tonic",
 ]
 
@@ -10534,6 +10548,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "workspace-hack",
  "wyrd-dev-fixtures",
  "wyrd-semver",
  "wyrd-spec",
@@ -11058,6 +11073,164 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
+name = "workspace-hack"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "arrow",
+ "arrow-array",
+ "arrow-cast",
+ "arrow-ipc",
+ "arrow-schema",
+ "async-compression",
+ "aws-config",
+ "aws-lc-rs",
+ "aws-runtime",
+ "aws-sigv4",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "axum",
+ "axum-core",
+ "base64 0.22.1",
+ "base64 0.23.1",
+ "bitflags 2.13.0",
+ "blake2",
+ "block-buffer 0.12.1",
+ "byteorder",
+ "bytes",
+ "cc",
+ "chrono",
+ "cipher 0.4.4",
+ "clap",
+ "clap_builder",
+ "compression-codecs",
+ "concurrent-queue",
+ "console",
+ "constant_time_eq",
+ "crossbeam-epoch",
+ "crossbeam-utils",
+ "crypto-common 0.1.7",
+ "deranged",
+ "digest 0.10.7",
+ "digest 0.11.3",
+ "either",
+ "errno",
+ "flate2",
+ "foldhash 0.2.0",
+ "form_urlencoded",
+ "futures",
+ "futures-channel",
+ "futures-core",
+ "futures-executor",
+ "futures-io",
+ "futures-sink",
+ "futures-task",
+ "futures-util",
+ "generic-array",
+ "getrandom 0.2.17",
+ "getrandom 0.3.4",
+ "getrandom 0.4.3",
+ "half",
+ "hashbrown 0.14.5",
+ "hashbrown 0.15.5",
+ "hashbrown 0.17.1",
+ "hex",
+ "hmac 0.12.1",
+ "hmac 0.13.0",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "indexmap 2.14.0",
+ "inout 0.1.4",
+ "lazy_static",
+ "libc",
+ "liblzma",
+ "liblzma-sys",
+ "linux-raw-sys",
+ "log",
+ "md-5 0.10.6",
+ "md-5 0.11.0",
+ "memchr",
+ "moka",
+ "nom 8.0.0",
+ "num-bigint 0.4.8",
+ "num-integer",
+ "num-iter",
+ "num-rational",
+ "num-traits",
+ "once_cell",
+ "opentelemetry",
+ "opentelemetry-proto",
+ "opentelemetry_sdk",
+ "parking_lot",
+ "password-hash",
+ "percent-encoding",
+ "petgraph 0.8.3",
+ "pkcs8",
+ "portable-atomic",
+ "ppv-lite86",
+ "proc-macro2",
+ "prost",
+ "quick-xml 0.41.0",
+ "rand 0.10.2",
+ "rand 0.8.7",
+ "rand 0.9.5",
+ "rand_chacha 0.3.1",
+ "rand_chacha 0.9.0",
+ "rand_core 0.6.4",
+ "regex",
+ "regex-automata",
+ "regex-syntax",
+ "reqwest 0.12.28",
+ "reqwest 0.13.4",
+ "ring",
+ "rmcp",
+ "rustix",
+ "rustls",
+ "rustls-webpki",
+ "secrecy",
+ "security-framework-sys",
+ "semver",
+ "serde",
+ "serde_core",
+ "serde_json",
+ "sha2 0.10.9",
+ "sha2 0.11.0",
+ "signature",
+ "simd-adler32",
+ "slab",
+ "smallvec",
+ "sqlx-core 0.9.0",
+ "subtle",
+ "syn 2.0.118",
+ "syn 3.0.5",
+ "sync_wrapper",
+ "temp-env",
+ "thiserror 2.0.18",
+ "time",
+ "time-macros",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tokio-util",
+ "tonic",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-core",
+ "twox-hash",
+ "typenum",
+ "url",
+ "uuid",
+ "windows-sys 0.61.2",
+ "zerocopy",
+ "zeroize",
+ "zstd",
+ "zstd-safe",
+ "zstd-sys",
+]
+
+[[package]]
 name = "writeable"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11082,6 +11255,7 @@ dependencies = [
  "skald-tool",
  "skald-workflow",
  "tokio",
+ "workspace-hack",
  "wyrd-spec",
 ]
 
@@ -11107,6 +11281,7 @@ dependencies = [
  "url",
  "uuid",
  "vala-sql",
+ "workspace-hack",
  "wyrd-auth-issue",
  "wyrd-auth-oidc",
  "wyrd-auth-verify",
@@ -11131,6 +11306,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "uuid",
+ "workspace-hack",
  "wyrd-auth-verify",
  "wyrd-runtime",
  "wyrd-semver",
@@ -11151,6 +11327,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "ulid",
+ "workspace-hack",
  "wyrd-auth-verify",
  "wyrd-runtime",
  "wyrd-semver",
@@ -11172,6 +11349,7 @@ dependencies = [
  "tracing",
  "url",
  "wiremock",
+ "workspace-hack",
  "wyrd-spec",
  "wyrd-tls",
 ]
@@ -11195,6 +11373,7 @@ dependencies = [
  "tracing",
  "url",
  "wiremock",
+ "workspace-hack",
  "wyrd-auth-oidc",
  "wyrd-runtime",
  "wyrd-semver",
@@ -11214,6 +11393,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "toml",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -11229,6 +11409,7 @@ dependencies = [
  "skald-spec",
  "tempfile",
  "tokio",
+ "workspace-hack",
  "wyrd-config",
  "wyrd-interfaces",
  "wyrd-runtime",
@@ -11270,6 +11451,7 @@ dependencies = [
  "uuid",
  "vala-eval",
  "wiremock",
+ "workspace-hack",
  "wyrd-client",
  "wyrd-dev-fixtures",
  "wyrd-error-derive",
@@ -11320,6 +11502,7 @@ dependencies = [
  "uuid",
  "vala-bifrost-redux",
  "wiremock",
+ "workspace-hack",
  "wyrd-cards",
  "wyrd-loader",
  "wyrd-queue",
@@ -11344,6 +11527,7 @@ dependencies = [
  "thiserror 2.0.18",
  "toml",
  "tracing",
+ "workspace-hack",
  "wyrd-interfaces",
  "wyrd-semver",
  "wyrd-spec",
@@ -11357,6 +11541,7 @@ dependencies = [
  "aes-gcm",
  "argon2",
  "thiserror 2.0.18",
+ "workspace-hack",
  "zeroize",
 ]
 
@@ -11372,6 +11557,7 @@ dependencies = [
  "url",
  "uuid",
  "vala-sql",
+ "workspace-hack",
  "wyrd-spec",
  "wyrd-sql",
 ]
@@ -11382,6 +11568,7 @@ version = "0.0.1"
 dependencies = [
  "quote",
  "syn 2.0.118",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -11396,6 +11583,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "walkdir",
+ "workspace-hack",
  "wyrd-spec",
  "wyrd-utils",
  "zstd",
@@ -11413,6 +11601,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
+ "workspace-hack",
  "wyrd-config",
  "wyrd-semver",
  "wyrd-spec",
@@ -11435,6 +11624,7 @@ dependencies = [
  "tokio",
  "uuid",
  "vala-bifrost-redux",
+ "workspace-hack",
  "wyrd-client",
  "wyrd-runtime",
  "wyrd-server",
@@ -11455,6 +11645,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "workspace-hack",
  "wyrd-runtime",
  "wyrd-spec",
 ]
@@ -11469,6 +11660,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "uuid",
+ "workspace-hack",
  "wyrd-semver",
  "wyrd-spec",
 ]
@@ -11494,6 +11686,7 @@ dependencies = [
  "skald-tool",
  "skald-workflow",
  "tokio",
+ "workspace-hack",
  "wyrd",
  "wyrd-sdk-rust",
  "wyrd-spec",
@@ -11540,6 +11733,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "workspace-hack",
  "wyrd-client",
  "wyrd-testing",
 ]
@@ -11586,6 +11780,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "utoipa",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -11647,6 +11842,7 @@ dependencies = [
  "vala-eval",
  "vala-sql",
  "wiremock",
+ "workspace-hack",
  "wyrd-auth",
  "wyrd-auth-check",
  "wyrd-auth-issue",
@@ -11695,6 +11891,7 @@ dependencies = [
  "url",
  "utoipa",
  "uuid",
+ "workspace-hack",
  "wyrd-error-derive",
  "wyrd-semver",
 ]
@@ -11723,6 +11920,7 @@ dependencies = [
  "url",
  "urlencoding",
  "uuid",
+ "workspace-hack",
  "wyrd-dev-fixtures",
  "wyrd-runtime",
  "wyrd-semver",
@@ -11761,6 +11959,7 @@ dependencies = [
  "url",
  "uuid",
  "vala-sql",
+ "workspace-hack",
  "wyrd-dev-fixtures",
  "wyrd-spec",
  "wyrd-sql",
@@ -11781,6 +11980,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "ulid",
+ "workspace-hack",
  "wyrd-spec",
  "wyrd-tls",
 ]
@@ -11792,6 +11992,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -11844,6 +12045,7 @@ dependencies = [
  "uuid",
  "vala-bifrost-redux",
  "vala-sql",
+ "workspace-hack",
  "wyrd-auth",
  "wyrd-auth-check",
  "wyrd-auth-issue",
@@ -11871,6 +12073,7 @@ version = "0.0.1"
 dependencies = [
  "rustls",
  "thiserror 2.0.18",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -11894,6 +12097,7 @@ dependencies = [
  "tonic-types",
  "tracing",
  "uuid",
+ "workspace-hack",
  "wyrd-spec",
  "wyrd-tls",
 ]
@@ -11910,6 +12114,7 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "walkdir",
+ "workspace-hack",
  "wyrd-spec",
  "zstd",
 ]
@@ -11923,6 +12128,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "workspace-hack",
 ]
 
 [[package]]

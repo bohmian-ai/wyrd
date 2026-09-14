@@ -14,3 +14,6 @@ vala-bifrost-redux = { workspace = true }
 # (check:no-tonic-outside-wyrd-tonic forbids direct deps here).
 wyrd-tonic = { workspace = true, features = ["server"] }
 arrow = { workspace = true, features = ["ipc"] }
+
+[dev-dependencies]
+workspace-hack.workspace = true

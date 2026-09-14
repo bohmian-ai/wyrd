@@ -15,5 +15,6 @@ uuid = { workspace = true, features = ["std", "v5", "v7"] }
 wyrd-spec = { path = "../../wyrd-spec", version = "0.0.1" }
 
 [dev-dependencies]
+workspace-hack.workspace = true
 serde_json = { workspace = true }
 wyrd-semver = { path = "../wyrd-semver", version = "0.0.1" }

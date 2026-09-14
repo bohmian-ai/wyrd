@@ -107,6 +107,7 @@ wyrd-utils = { workspace = true, features = ["python"], optional = true }
 wyrd-tls = { workspace = true }
 
 [dev-dependencies]
+workspace-hack.workspace = true
 metrics = { workspace = true }
 # Stock upstream OpenTelemetry, used only by the OTLP journey target: those
 # tests must configure the exporters an ordinary application configures rather

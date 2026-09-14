@@ -89,6 +89,7 @@ ed25519-dalek = { workspace = true }
 utoipa = { workspace = true, features = ["yaml"] }
 
 [dev-dependencies]
+workspace-hack.workspace = true
 insta = { workspace = true }
 rcgen = { workspace = true }
 reqwest = { workspace = true }

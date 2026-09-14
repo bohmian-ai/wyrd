@@ -56,6 +56,7 @@ azure_storage_blobs = { workspace = true, optional = true }
 wyrd-tls = { workspace = true }
 
 [dev-dependencies]
+workspace-hack.workspace = true
 temp-env = { workspace = true, features = ["async_closure"] }
 wyrd-dev-fixtures = { path = "../../shared/wyrd-dev-fixtures", version = "0.0.1", features = ["pg"] }
 wyrd-testing = { path = "../wyrd-testing", version = "0.0.1" }

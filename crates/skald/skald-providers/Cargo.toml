@@ -29,6 +29,7 @@ httpdate = { workspace = true }
 wyrd-tls = { workspace = true }
 
 [dev-dependencies]
+workspace-hack.workspace = true
 wiremock = { workspace = true }
 insta = { workspace = true }
 temp-env = { workspace = true }

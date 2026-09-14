@@ -21,6 +21,7 @@ wyrd-utils       = { workspace = true, optional = true, features = ["python"] }
 wyrd-interfaces  = { workspace = true, optional = true, features = ["python"] }
 
 [dev-dependencies]
+workspace-hack.workspace = true
 tempfile     = { workspace = true }
 serial_test  = { workspace = true }
 

@@ -51,3 +51,6 @@ server = ["dep:tonic-reflection", "dep:tonic-health", "tonic/server", "tonic/rou
 # build.rs). No extra tonic surface needed — the client rides the default
 # `channel` transport already enabled above.
 client = []
+
+[dev-dependencies]
+workspace-hack.workspace = true

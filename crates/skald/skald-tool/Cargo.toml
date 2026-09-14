@@ -34,4 +34,5 @@ workspace = true
 optional = true
 
 [dev-dependencies]
+workspace-hack.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

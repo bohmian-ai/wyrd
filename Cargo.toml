@@ -70,6 +70,8 @@ wyrd-testing = { path = "crates/wyrd/wyrd-testing", version = "0.0.1" }
 wyrd-tonic = { path = "crates/wyrd/wyrd-tonic", version = "0.0.1" }
 wyrd-tls = { path = "crates/shared/wyrd-tls", version = "0.0.1" }
 wyrd-semver = { path = "crates/shared/wyrd-semver", version = "0.0.1" }
+# Hakari feature-unification crate; members take it as a path-only dev-dependency.
+workspace-hack = { path = "crates/shared/workspace-hack" }
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread"] }
 tokio-util = { version = "0.7", features = ["io", "rt"] }
 async-trait = "0.1"

@@ -17,4 +17,5 @@ thiserror = { workspace = true }
 schemars = { workspace = true }
 
 [dev-dependencies]
+workspace-hack.workspace = true
 serde_json = { workspace = true }

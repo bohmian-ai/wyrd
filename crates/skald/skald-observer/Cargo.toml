@@ -35,5 +35,6 @@ opentelemetry_sdk = { workspace = true, optional = true, features = ["rt-tokio"]
 pyo3 = { workspace = true, optional = true }
 
 [dev-dependencies]
+workspace-hack.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }

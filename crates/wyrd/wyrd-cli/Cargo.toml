@@ -55,6 +55,7 @@ wyrd-spec = { workspace = true }
 wyrd-tls = { workspace = true }
 
 [dev-dependencies]
+workspace-hack.workspace = true
 assert_cmd = "2"
 axum = { workspace = true }
 base64 = { workspace = true }

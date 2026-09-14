@@ -19,6 +19,7 @@ base64 = { workspace = true }
 regex = { workspace = true }
 
 [dev-dependencies]
+workspace-hack.workspace = true
 insta = { workspace = true }
 serde_yaml = { workspace = true }
 

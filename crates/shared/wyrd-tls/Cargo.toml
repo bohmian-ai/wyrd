@@ -6,3 +6,6 @@ edition = "2021"
 [dependencies]
 rustls = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+workspace-hack.workspace = true

@@ -5,10 +5,10 @@ use secrecy::SecretString;
 use serde_json::Value;
 use std::process::Command;
 use std::sync::Arc;
-use wyrd_client::{Bifrost, WyrdClient};
 use wyrd_client::auth::AuthMiddleware;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{HttpConfig, HttpTransport, ResolvedCredential};
+use wyrd_client::{Bifrost, WyrdClient};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{BifrostQueryRequest, FreshnessPolicy, VisibilityMode};
 use wyrd_testing::WyrdTestServer;
@@ -43,10 +43,7 @@ async fn typed_query_error(
         freshness: FreshnessPolicy::Strict,
         deadline_ms: None,
     };
-    match Bifrost::query_only(&client)
-        .query(&request)
-        .await
-    {
+    match Bifrost::query_only(&client).query(&request).await {
         Err(error) => Ok(WyrdError::from(error)),
         Ok(_) => Err("query unexpectedly succeeded".into()),
     }

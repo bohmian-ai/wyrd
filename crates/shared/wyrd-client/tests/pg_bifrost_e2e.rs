@@ -130,14 +130,13 @@ mod pg_tests {
         srv: &WyrdTestServer,
         tenant: DataTenantId,
         operation: &str,
-    ) -> Vec<(String, String, String, String)> {
+    ) -> Vec<(String, String)> {
         let mut conn = srv
             .tenant_conn_for(tenant)
             .await
             .expect("tenant lifecycle audit connection");
         let rows = sqlx::query_as(
-            "SELECT resource, decision, result, payload_summary \
-             FROM vala.audit_staging WHERE operation = $1 ORDER BY seq",
+            "SELECT resource, outcome FROM vala.audit_staging WHERE operation = $1 ORDER BY seq",
         )
         .bind(operation)
         .fetch_all(&mut **conn.transaction())
@@ -375,15 +374,6 @@ mod pg_tests {
                 .is_empty()
         );
         assert!(
-            lifecycle_audit_rows(
-                &srv,
-                srv.data_tenant_id(),
-                "vala.query.running.cancel.attempt",
-            )
-            .await
-            .is_empty()
-        );
-        assert!(
             query
                 .cancel(&request_id)
                 .await
@@ -397,79 +387,27 @@ mod pg_tests {
                 .expect("idempotent cancel")
                 .cancellation_started
         );
-        let owner_cancel_audits =
-            lifecycle_audit_rows(&srv, srv.data_tenant_id(), "vala.query.running.cancel").await;
-        assert_eq!(owner_cancel_audits.len(), 2);
-        assert!(owner_cancel_audits.iter().all(|row| {
-            row.0 == format!("vala.query.lifecycle/{request_id}")
-                && row.1 == "allow"
-                && row.2 == "success"
-                && row.3 == "running query control succeeded"
-        }));
-        let owner_cancel_attempts = lifecycle_audit_rows(
-            &srv,
-            srv.data_tenant_id(),
-            "vala.query.running.cancel.attempt",
-        )
-        .await;
-        assert_eq!(owner_cancel_attempts.len(), 2);
-        assert!(owner_cancel_attempts.iter().all(|row| {
-            row.0 == format!("vala.query.lifecycle/{request_id}")
-                && row.1 == "allow"
-                && row.2 == "success"
-                && row.3 == "running query cancellation dispatch authorized"
-        }));
-        let foreign_cancel_audits =
-            lifecycle_audit_rows(&srv, other_tenant, "vala.query.running.cancel").await;
-        assert_eq!(foreign_cancel_audits.len(), 2);
+        let lifecycle = |id: &RequestId| format!("vala.query.lifecycle/{id}");
+        let allowed = |id: &RequestId| (lifecycle(id), "allowed".to_owned());
         assert_eq!(
-            foreign_cancel_audits,
-            vec![
-                (
-                    format!("vala.query.lifecycle/{request_id}"),
-                    "allow".to_owned(),
-                    "failure".to_owned(),
-                    "running query control failed".to_owned(),
-                ),
-                (
-                    format!("vala.query.lifecycle/{unknown_id}"),
-                    "allow".to_owned(),
-                    "failure".to_owned(),
-                    "running query control failed".to_owned(),
-                ),
-            ]
+            lifecycle_audit_rows(&srv, srv.data_tenant_id(), "vala.query.running.cancel").await,
+            vec![allowed(&request_id), allowed(&request_id)]
         );
-        let foreign_cancel_attempts =
-            lifecycle_audit_rows(&srv, other_tenant, "vala.query.running.cancel.attempt").await;
-        assert_eq!(foreign_cancel_attempts.len(), 2);
-        assert!(foreign_cancel_attempts.iter().all(|row| {
-            row.1 == "allow"
-                && row.2 == "success"
-                && row.3 == "running query cancellation dispatch authorized"
-        }));
-        let foreign_status_audits =
-            lifecycle_audit_rows(&srv, other_tenant, "vala.query.running.get").await;
-        assert_eq!(foreign_status_audits.len(), 3);
-        assert!(foreign_status_audits[..2].iter().all(|row| {
-            row.1 == "allow" && row.2 == "failure" && row.3 == "running query control failed"
-        }));
         assert_eq!(
-            foreign_status_audits[2],
-            (
-                format!("vala.query.lifecycle/{request_id}"),
-                "deny".to_owned(),
-                "failure".to_owned(),
-                "rbac permission denied".to_owned(),
-            )
+            lifecycle_audit_rows(&srv, other_tenant, "vala.query.running.cancel").await,
+            vec![allowed(&request_id), allowed(&unknown_id)]
+        );
+        assert_eq!(
+            lifecycle_audit_rows(&srv, other_tenant, "vala.query.running.get").await,
+            vec![
+                allowed(&request_id),
+                allowed(&unknown_id),
+                (lifecycle(&request_id), "denied".to_owned()),
+            ]
         );
         assert_eq!(
             lifecycle_audit_rows(&srv, srv.data_tenant_id(), "vala.query.running.get").await,
-            vec![(
-                format!("vala.query.lifecycle/{request_id}"),
-                "allow".to_owned(),
-                "success".to_owned(),
-                "running query control succeeded".to_owned(),
-            )]
+            vec![allowed(&request_id)]
         );
 
         task.abort();

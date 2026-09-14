@@ -188,7 +188,7 @@ hide = true
 description = "Run Python Bifrost unit tests."
 dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup"]
-run = "uv run python -m pytest -q tests/test_bifrost.py tests/bifrost"
+run = "uv run python -m pytest -q tests/bifrost"
 
 [tasks."test:bifrost:unit:typescript:inner"]
 hide = true

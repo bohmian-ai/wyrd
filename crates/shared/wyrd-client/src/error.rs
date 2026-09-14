@@ -92,14 +92,26 @@ impl From<&WyrdClientError> for WyrdError {
     /// This is the single client-error projection shared by every facade, so a
     /// missing credential, invalid configuration, or unavailable transport keeps
     /// the same code and status whether it surfaced through `Cards` or
-    /// `Bifrost`. The variant `Display` text becomes the catalog message.
+    /// `Bifrost`. The variant `Display` text becomes the catalog message, and
+    /// only the safe structured metadata each variant already carries becomes
+    /// `details`: `field` and `reason` for configuration, the `transport`
+    /// discriminator for transport unavailability, and nothing for missing
+    /// credentials. Raw transport failure text stays in the message only.
     fn from(error: &WyrdClientError) -> Self {
         let message = error.to_string();
-        let details = serde_json::json!({});
         match error {
-            WyrdClientError::Config { .. } => Self::ClientConfigInvalid { message, details },
-            WyrdClientError::NoCredentials => Self::ClientNoCredentials { message, details },
-            WyrdClientError::TransportDown { .. } => Self::ClientTransportDown { message, details },
+            WyrdClientError::Config { field, reason } => Self::ClientConfigInvalid {
+                message,
+                details: serde_json::json!({ "field": field, "reason": reason }),
+            },
+            WyrdClientError::NoCredentials => Self::ClientNoCredentials {
+                message,
+                details: serde_json::json!({}),
+            },
+            WyrdClientError::TransportDown { transport, .. } => Self::ClientTransportDown {
+                message,
+                details: serde_json::json!({ "transport": transport }),
+            },
         }
     }
 }

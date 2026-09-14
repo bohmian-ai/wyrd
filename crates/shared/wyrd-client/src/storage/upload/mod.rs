@@ -16,7 +16,7 @@ use crate::WyrdClient;
 use bytes::Bytes;
 use futures_util::stream::{BoxStream, StreamExt};
 use tokio_util::io::ReaderStream;
-use wyrd_spec::storage::{UploadId, UploadPlan};
+use wyrd_spec::storage::{UploadCompleteRequest, UploadId, UploadPlan};
 
 use crate::storage::error::StorageClientError;
 use reader::SourceReader;
@@ -144,13 +144,13 @@ pub(crate) enum UploadOutcome {
     /// The backend has accepted the complete object.
     Uploaded,
     /// The server must commit the backend multipart state.
-    NeedsServerComplete(wyrd_spec::storage::UploadCompleteRequest),
+    NeedsServerComplete(UploadCompleteRequest),
 }
 
 impl UploadOutcome {
     /// Return the server completion body, if the protocol needs one.
     #[must_use]
-    pub fn into_server_complete(self) -> Option<wyrd_spec::storage::UploadCompleteRequest> {
+    pub fn into_server_complete(self) -> Option<UploadCompleteRequest> {
         match self {
             Self::Uploaded => None,
             Self::NeedsServerComplete(request) => Some(request),

@@ -71,5 +71,18 @@ describe("native construction failures", () => {
       credential: "wyrd_sk_t_v_s",
     }).catch((error: unknown) => error);
     expectCatalogError(caught, "WYRD_CLIENT_503_TRANSPORT_DOWN", 503);
+    expect((caught as WyrdError).details).toEqual({ transport: "http" });
+  });
+
+  it("TableConfig.describe rejects an empty server URL with config-invalid details", async () => {
+    const caught: unknown = await TableConfig.describe("unit.missing", {
+      serverUrl: "",
+      credential: "wyrd_sk_t_v_s",
+    }).catch((error: unknown) => error);
+    expectCatalogError(caught, "WYRD_CLIENT_400_CONFIG_INVALID", 400);
+    expect((caught as WyrdError).details).toEqual({
+      field: "server_url",
+      reason: "must not be empty",
+    });
   });
 });

@@ -142,5 +142,14 @@ mod tests {
             (down.code(), down.status()),
             ("WYRD_CLIENT_503_TRANSPORT_DOWN", 503)
         );
+        assert_eq!(missing.problem().details, serde_json::json!({}));
+        assert_eq!(
+            invalid.problem().details,
+            serde_json::json!({ "field": "server_url", "reason": "must not be empty" })
+        );
+        assert_eq!(
+            down.problem().details,
+            serde_json::json!({ "transport": "http" })
+        );
     }
 }

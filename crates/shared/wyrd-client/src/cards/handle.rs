@@ -14,9 +14,10 @@ use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::registry::{ListCardsRequest, ListCardsResponse};
+use wyrd_spec::registry::{GetCardResponse, ListCardsRequest, ListCardsResponse};
 use wyrd_spec::storage::{DownloadInitRequest, DownloadInitResponse};
 
+use crate::cards::RegistrationReceipt;
 use crate::cards::config;
 use crate::cards::download;
 use crate::cards::download_progress::DownloadProgressDisplay;
@@ -215,7 +216,7 @@ impl Cards {
     pub async fn register_from_path(
         &self,
         path: &Path,
-    ) -> Result<crate::cards::RegistrationReceipt, WyrdError> {
+    ) -> Result<RegistrationReceipt, WyrdError> {
         let tree = wyrd_loader::load(path).map_err(|error| WyrdError::RegistryInvalidCardSpec {
             message: format!("card tree failed to load: {error}"),
             details: serde_json::json!({ "path": path, "error": error.to_string() }),
@@ -242,7 +243,7 @@ impl Cards {
     pub async fn register(
         &self,
         input: &RegistrationInput,
-    ) -> Result<crate::cards::RegistrationReceipt, WyrdError> {
+    ) -> Result<RegistrationReceipt, WyrdError> {
         crate::cards::saga::register(&self.engine, input, None)
             .await
             .map_err(Into::into)
@@ -263,7 +264,7 @@ impl Cards {
         &self,
         input: &RegistrationInput,
         progress: RegistrationProgressSink,
-    ) -> Result<crate::cards::RegistrationReceipt, WyrdError> {
+    ) -> Result<RegistrationReceipt, WyrdError> {
         crate::cards::saga::register(&self.engine, input, Some(progress))
             .await
             .map_err(Into::into)
@@ -288,7 +289,7 @@ impl Cards {
     pub async fn get_response(
         &self,
         selector: CardSelector,
-    ) -> Result<wyrd_spec::registry::GetCardResponse, WyrdError> {
+    ) -> Result<GetCardResponse, WyrdError> {
         reads::get_response(&self.engine.client, &selector)
             .await
             .map_err(Into::into)

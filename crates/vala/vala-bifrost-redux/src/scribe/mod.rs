@@ -2020,6 +2020,33 @@ mod constructor_rotation_tests {
             .await;
     }
 
+    /// Reading memtable statistics leaves admission reservations untouched.
+    ///
+    /// A slice reserves active bytes before its WAL write and enters the
+    /// memtable only after the durable fence, so an inspection taken in between
+    /// sees no writable bytes. If the read reconciled admission from that view
+    /// it would erase the reservation, and the slice's later release (the
+    /// duplicate-batch discard path) would underflow and poison the pod.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the reservation or statistics read fails, or when the read
+    /// changes the reserved active bytes.
+    #[tokio::test]
+    async fn memtable_stats_preserves_pre_insertion_active_reservations() {
+        let scribe = ScribeImpl::new();
+        scribe
+            .admission
+            .try_reserve_active("pre-insertion", 64)
+            .expect("active reservation");
+        scribe.memtable_stats().expect("memtable stats");
+        assert_eq!(scribe.admission_snapshot().active_bytes, 64);
+        scribe
+            .admission
+            .release_active(64)
+            .expect("the reservation is still owned and releases exactly");
+    }
+
     /// Embedded construction applies every explicitly selected test-tier
     /// threshold to the same shard-owner graph used by production boot.
     #[tokio::test]
@@ -2342,13 +2369,17 @@ impl ScribeImpl {
 
     /// Return aggregate writable and immutable memtable state.
     ///
+    /// This is a pure read. Admission's active counter also holds reservations
+    /// for WAL-durable slices that are not yet in a memtable, so overwriting it
+    /// from memtable totals here would erase those reservations and make their
+    /// later release underflow. Only WAL recovery, before admission opens,
+    /// reconciles the counters with memtable state.
+    ///
     /// # Errors
     ///
     /// Returns [`ScribeError`] when a shard memtable snapshot cannot be read.
     pub fn memtable_stats(&self) -> Result<memtable::MemtableStats, ScribeError> {
         let stats = self.aggregate_memtable_stats()?;
-        self.admission
-            .sync_memtable_bytes(stats.writable_bytes, stats.immutable_bytes);
         emit_memtable_gauges(&stats);
         Ok(stats)
     }
@@ -2582,7 +2613,9 @@ impl ScribeImpl {
                 restored,
                 retirement_high_water,
             }) => {
-                self.memtable_stats()?;
+                let stats = self.memtable_stats()?;
+                self.admission
+                    .sync_memtable_bytes(stats.writable_bytes, stats.immutable_bytes);
                 tracing::info!(
                     restored,
                     retirement_high_water,

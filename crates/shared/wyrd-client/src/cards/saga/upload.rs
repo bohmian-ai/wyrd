@@ -147,6 +147,7 @@ async fn upload_artifact_entry(
         .map_err(Into::into)
 }
 
+/// Artifact source and server plan reconciliation.
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
@@ -157,10 +158,12 @@ mod tests {
 
     use super::validate_artifact_sources;
 
+    /// Parse a relative artifact path fixture.
     fn path(value: &str) -> RelativeArtifactPath {
         RelativeArtifactPath::new(value).expect("test path is valid")
     }
 
+    /// A local source with no matching server upload entry is refused.
     #[test]
     fn rejects_declared_source_without_server_plan() {
         let entries = Vec::new();
@@ -174,6 +177,7 @@ mod tests {
         assert!(error.as_problem_json().to_string().contains("weights.bin"));
     }
 
+    /// A server upload entry with no matching local source is refused.
     #[test]
     fn rejects_server_plan_without_local_source() {
         let planned = BTreeSet::from([path("weights.bin")]);

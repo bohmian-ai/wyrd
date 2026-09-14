@@ -95,6 +95,7 @@ impl DownloadProgressDisplay {
     }
 }
 
+/// Progress display formatting.
 #[cfg(test)]
 mod tests {
     use indicatif::ProgressDrawTarget;

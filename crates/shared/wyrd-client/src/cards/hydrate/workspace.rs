@@ -219,6 +219,7 @@ fn take_publish_fault(fault: u8) -> bool {
     PUBLISH_FAULTS.fetch_and(!fault, Ordering::SeqCst) & fault != 0
 }
 
+/// Workspace layout for hydrated Cards.
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;

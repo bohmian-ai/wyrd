@@ -25,12 +25,14 @@ pub use wyrd_spec::registry::{
     CardSummary, ListCardsRequest, ListCardsResponse, RegistrationReceipt,
 };
 
+/// Public surface shape of the `cards` module.
 #[cfg(test)]
 mod tests {
     use super::{CardSelector, Cards, ListCardsRequest};
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, SpaceName};
 
+    /// The public handle, selector, and request types compose without staged-card or transport exports.
     #[test]
     fn public_surface_compiles_without_staged_card_or_transport_exports() {
         let _ = Cards::new;

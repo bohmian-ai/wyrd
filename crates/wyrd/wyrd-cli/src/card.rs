@@ -709,6 +709,7 @@ fn print_load_failure(error: &LoadError, format: OutputFormat) {
     }
 }
 
+/// Print a registration receipt as one root line followed by one line per outcome.
 fn print_apply_text(receipt: &wyrd_client::cards::RegistrationReceipt) {
     println!("registered: {}", receipt.root);
     for outcome in &receipt.outcomes {

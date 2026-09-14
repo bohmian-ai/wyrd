@@ -330,6 +330,7 @@ fn validate_artifact_path(path: &str, card_ref: &CardRef) -> Result<(), WyrdErro
     Ok(())
 }
 
+/// Bundle hydration.
 #[cfg(test)]
 mod tests {
     use wyrd_semver::VersionBlock;

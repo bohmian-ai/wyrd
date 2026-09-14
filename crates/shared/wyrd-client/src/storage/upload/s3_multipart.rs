@@ -176,6 +176,7 @@ async fn mint_part_url(
 /// Delays are deliberately short so retry tests do not stall; cancellation
 /// simply cancels the timer.
 async fn sleep_backoff(attempt: u32) {
+    /// Per-attempt backoff in milliseconds; attempts past the table use 500 ms.
     // Attempt 0 → 50 ms, 1 → 250 ms. Values kept small so tests do not stall.
     const DELAY_MS: &[u64] = &[50, 250];
     let ms = DELAY_MS.get(attempt as usize).copied().unwrap_or(500);

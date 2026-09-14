@@ -58,6 +58,7 @@ impl From<RegistryEngineError> for WyrdError {
     }
 }
 
+/// Registry error to catalog projection.
 #[cfg(test)]
 mod tests {
     use secrecy::SecretString;

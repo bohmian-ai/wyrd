@@ -375,6 +375,7 @@ mod tests {
         );
     }
 
+    /// The system owner may bind only the audit-log table.
     #[test]
     fn tenant_table_binding_rejects_system_owner_outside_audit_log() {
         assert_eq!(

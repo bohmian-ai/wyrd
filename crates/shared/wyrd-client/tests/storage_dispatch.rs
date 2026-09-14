@@ -18,6 +18,7 @@ use wyrd_client::transport::config::HttpConfig;
 use wyrd_client::transport::credential::ResolvedCredential;
 use wyrd_spec::storage::{HeaderPair, UploadId, UploadPlan};
 
+/// One HTTP request captured by [`TestServer`], including headers, for protocol assertions.
 #[derive(Clone, Debug)]
 struct Request {
     method: String,
@@ -26,6 +27,7 @@ struct Request {
     body: Vec<u8>,
 }
 
+/// One canned HTTP response with optional headers that [`TestServer`] returns in order.
 #[derive(Clone, Debug)]
 struct Response {
     status: u16,
@@ -33,21 +35,28 @@ struct Response {
     headers: Vec<(String, String)>,
 }
 
+/// Minimal single-connection HTTP server standing in for both the Wyrd API and a storage backend.
+///
+/// Each accepted connection consumes one response; the listener task is aborted on drop.
 struct TestServer {
     uri: String,
     requests: Arc<Mutex<Vec<Request>>>,
     task: tokio::task::JoinHandle<()>,
 }
 
+/// Base64 SHA-256 digest in the form the storage protocols send as integrity headers.
 fn sha256_b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes))
 }
 
 impl TestServer {
+    /// Start with a fixed response list that does not depend on the bound address.
     async fn start(responses: Vec<Response>) -> Self {
         Self::start_with(|_| responses).await
     }
 
+    /// Bind an ephemeral loopback listener, let `build` produce responses that may embed the
+    /// bound URI (presigned URLs), then spawn the replay task.
     async fn start_with(build: impl FnOnce(&str) -> Vec<Response>) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -76,21 +85,28 @@ impl TestServer {
         }
     }
 
+    /// Snapshot every request received so far, in arrival order.
     async fn requests(&self) -> Vec<Request> {
         self.requests.lock().await.clone()
     }
 
+    /// Base URI clients should use to reach this server.
     fn uri(&self) -> &str {
         &self.uri
     }
 }
 
 impl Drop for TestServer {
+    /// Abort the replay task so the test does not leak a listener.
     fn drop(&mut self) {
         self.task.abort();
     }
 }
 
+/// Read one HTTP/1.1 request head, headers, and body (content-length or chunked) from `stream`.
+///
+/// # Panics
+/// Panics when the request is malformed; this is a test helper.
 async fn read_request(stream: &mut tokio::net::TcpStream) -> Request {
     let mut bytes = Vec::new();
     let mut chunk = [0_u8; 4096];
@@ -137,6 +153,8 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> Request {
     }
 }
 
+/// Finish reading a request body into `bytes` once the header block ending at `header_end`
+/// has been parsed, honoring `content_length` or chunked framing.
 async fn read_body(
     stream: &mut tokio::net::TcpStream,
     bytes: &mut Vec<u8>,
@@ -191,6 +209,10 @@ async fn read_body(
     }
 }
 
+/// Write `response` as a minimal HTTP/1.1 response with its extra headers and close the connection.
+///
+/// # Errors
+/// Returns the socket write error.
 async fn write_response(
     stream: &mut tokio::net::TcpStream,
     response: Response,
@@ -215,6 +237,7 @@ async fn write_response(
     stream.write_all(&response.body).await
 }
 
+/// An empty-bodied [`Response`] with the given status.
 fn response(status: u16) -> Response {
     Response {
         status,
@@ -223,6 +246,7 @@ fn response(status: u16) -> Response {
     }
 }
 
+/// An empty-bodied [`Response`] carrying the given headers, e.g. an `ETag`.
 fn response_with_headers(status: u16, headers: Vec<(&str, &str)>) -> Response {
     Response {
         status,
@@ -234,6 +258,7 @@ fn response_with_headers(status: u16, headers: Vec<(&str, &str)>) -> Response {
     }
 }
 
+/// The Wyrd API `stored` confirmation body returned after an upload completes.
 fn stored_response() -> Response {
     Response {
         status: 200,
@@ -252,6 +277,7 @@ fn stored_response() -> Response {
     }
 }
 
+/// Build a bearer-authenticated [`WyrdClient`] pointed at `base_url` without network IO.
 fn client(base_url: impl Into<String>) -> WyrdClient {
     let base_url = base_url.into();
     let config = ClientConfig {
@@ -270,6 +296,7 @@ fn client(base_url: impl Into<String>) -> WyrdClient {
     WyrdClient::from_parts(auth, transport, config.grpc)
 }
 
+/// Single-PUT and local-filesystem plans upload through the facade with exact-length bodies.
 #[tokio::test]
 async fn high_level_upload_dispatches_single_put_and_localfs() {
     let server = TestServer::start(vec![
@@ -317,6 +344,7 @@ async fn high_level_upload_dispatches_single_put_and_localfs() {
     assert_eq!(requests[2].target, "/v1/cards/upload/local");
 }
 
+/// S3 multipart plans mint part URLs, upload parts, and complete through the server.
 #[tokio::test]
 async fn high_level_upload_dispatches_s3_and_completes_server_upload() {
     let server = TestServer::start_with(|uri| {
@@ -358,6 +386,7 @@ async fn high_level_upload_dispatches_s3_and_completes_server_upload() {
     assert!(requests[2].target.ends_with("/complete"));
 }
 
+/// GCS resumable and Azure block-blob plans dispatch to their protocol drivers.
 #[tokio::test]
 async fn high_level_upload_dispatches_gcs_and_azure_protocols() {
     let server = TestServer::start(vec![
@@ -470,6 +499,7 @@ async fn download_and_download_verified_stream_bytes_and_check_digest_and_size()
     assert!(positions.windows(2).all(|window| window[0].0 < window[1].0));
 }
 
+/// Malformed provider plans are refused before any byte is sent.
 #[tokio::test]
 async fn façade_rejects_invalid_provider_plans_before_transfer() {
     let server = TestServer::start(Vec::new()).await;

@@ -1449,7 +1449,9 @@ pub struct PyRegistrationReceipt {
     inner: RegistrationReceipt,
 }
 
+/// Wrap the native receipt; fields are projected lazily by the Python getters.
 impl From<RegistrationReceipt> for PyRegistrationReceipt {
+    /// Take ownership of the completed native receipt.
     fn from(inner: RegistrationReceipt) -> Self {
         Self { inner }
     }
@@ -2981,7 +2983,9 @@ fn loader_manifest_error(error: &wyrd_loader::LoadError) -> WyrdPyError {
     })
 }
 
+/// Project a native list response into Python-visible refs, summaries, and cursor.
 impl From<ListCardsResponse> for PyCardList {
+    /// Convert every item into its Python wrapper while preserving order and the cursor.
     fn from(response: ListCardsResponse) -> Self {
         let refs = response
             .items

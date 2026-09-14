@@ -112,7 +112,12 @@ pub(crate) fn from_authenticated(err: WyrdError) -> StorageClientError {
     StorageClientError::Wyrd(err)
 }
 
+/// Project a storage client failure onto the public storage catalog.
+///
+/// Structured [`WyrdError`]s pass through unchanged; local failures map to their
+/// `WYRD_STORAGE_*` entries without exposing transport or URL material.
 impl From<StorageClientError> for WyrdError {
+    /// Map each local variant to its catalog entry, passing structured errors through.
     fn from(error: StorageClientError) -> Self {
         match error {
             StorageClientError::Wyrd(err) => err,
@@ -164,11 +169,13 @@ impl From<StorageClientError> for WyrdError {
     }
 }
 
+/// Storage error to catalog projection.
 #[cfg(test)]
 mod tests {
     use super::{StorageClientError, map_backend_status};
     use wyrd_spec::error::{WyrdError, WyrdStorageError};
 
+    /// Size mismatches map to `WYRD_STORAGE_400_SIZE_MISMATCH`.
     #[test]
     fn size_mismatch_maps_to_storage_catalog() {
         let error: WyrdError = StorageClientError::SizeMismatch {
@@ -180,6 +187,7 @@ mod tests {
         assert_eq!(error.status(), 400);
     }
 
+    /// Transport failures render without library names or URLs.
     #[test]
     fn transport_error_does_not_expose_reqwest_or_url_material() {
         let error = StorageClientError::Transport {
@@ -190,6 +198,7 @@ mod tests {
         assert!(!rendered.contains("https://"));
     }
 
+    /// A backend 403 maps to the presign-expired catalog entry.
     #[test]
     fn presign_expiry_403_maps_to_presign_expired_catalog_entry() {
         let error: WyrdError = map_backend_status(403).into();
@@ -197,6 +206,7 @@ mod tests {
         assert_eq!(error.status(), 503);
     }
 
+    /// A backend 412 maps to the precondition-failed catalog entry.
     #[test]
     fn precondition_412_maps_to_precondition_failed_catalog_entry() {
         let error: WyrdError = map_backend_status(412).into();
@@ -204,6 +214,7 @@ mod tests {
         assert_eq!(error.status(), 412);
     }
 
+    /// A backend 416 maps to the range-not-satisfiable catalog entry.
     #[test]
     fn range_416_maps_to_range_not_satisfiable_catalog_entry() {
         let error: WyrdError = map_backend_status(416).into();
@@ -211,6 +222,7 @@ mod tests {
         assert_eq!(error.status(), 416);
     }
 
+    /// A backend 5xx maps to the backend-unavailable catalog entry.
     #[test]
     fn backend_5xx_maps_to_backend_unavailable_catalog_entry() {
         let error: WyrdError = map_backend_status(503).into();
@@ -218,12 +230,14 @@ mod tests {
         assert_eq!(error.status(), 503);
     }
 
+    /// Any other backend 4xx maps to the generic backend catalog entry.
     #[test]
     fn generic_4xx_maps_to_backend_catalog_entry() {
         let error: WyrdError = map_backend_status(400).into();
         assert_eq!(error.code(), "WYRD_STORAGE_500_BACKEND");
     }
 
+    /// A structured Wyrd error keeps its code and status through the conversion.
     #[test]
     fn structured_wyrd_error_flows_through_from_conversion_unchanged() {
         let source: WyrdError = WyrdStorageError::PreconditionFailed.into();

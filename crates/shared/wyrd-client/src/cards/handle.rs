@@ -213,10 +213,7 @@ impl Cards {
     ///
     /// Returns an error when the document cannot be loaded or converted into a registration
     /// request, or when the registry rejects the registration.
-    pub async fn register_from_path(
-        &self,
-        path: &Path,
-    ) -> Result<RegistrationReceipt, WyrdError> {
+    pub async fn register_from_path(&self, path: &Path) -> Result<RegistrationReceipt, WyrdError> {
         let tree = wyrd_loader::load(path).map_err(|error| WyrdError::RegistryInvalidCardSpec {
             message: format!("card tree failed to load: {error}"),
             details: serde_json::json!({ "path": path, "error": error.to_string() }),
@@ -286,10 +283,7 @@ impl Cards {
     /// # Errors
     /// Returns a Wyrd error when the selector is invalid, the Card is absent,
     /// or the server request fails.
-    pub async fn get_response(
-        &self,
-        selector: CardSelector,
-    ) -> Result<GetCardResponse, WyrdError> {
+    pub async fn get_response(&self, selector: CardSelector) -> Result<GetCardResponse, WyrdError> {
         reads::get_response(&self.engine.client, &selector)
             .await
             .map_err(Into::into)
@@ -531,6 +525,7 @@ impl<'a> ArtifactMaterializer<'a> {
     }
 }
 
+/// Selector construction and handle behavior.
 #[cfg(test)]
 mod tests {
     use base64::Engine;

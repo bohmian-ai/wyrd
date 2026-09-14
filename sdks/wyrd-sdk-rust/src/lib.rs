@@ -11,6 +11,7 @@
 
 pub use wyrd_client::*;
 
+/// SDK root re-export shape.
 #[cfg(test)]
 mod tests {
     /// The SDK root names every composed client capability from `wyrd-client`.

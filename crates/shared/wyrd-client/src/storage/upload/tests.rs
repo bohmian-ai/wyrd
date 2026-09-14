@@ -13,6 +13,10 @@ use crate::storage::WyrdStorageClient;
 use crate::storage::error::StorageClientError;
 use wyrd_spec::storage::{S3MultipartComplete, UploadCompleteRequest};
 
+/// Build an [`AuthMiddleware`] with a static bearer credential and default config.
+///
+/// # Errors
+/// Returns the client configuration error when the default config is invalid.
 fn test_auth_middleware() -> Result<Arc<AuthMiddleware>, crate::error::WyrdClientError> {
     AuthMiddleware::new(
         &ClientConfig::default(),
@@ -20,6 +24,7 @@ fn test_auth_middleware() -> Result<Arc<AuthMiddleware>, crate::error::WyrdClien
     )
 }
 
+/// Build an offline [`WyrdClient`] whose transport never reaches a server in these tests.
 fn client() -> WyrdClient {
     let config = ClientConfig::default();
     let auth = test_auth_middleware().expect("test_setup: auth builds");
@@ -27,6 +32,7 @@ fn client() -> WyrdClient {
     WyrdClient::from_parts(auth, http, config.grpc)
 }
 
+/// `UploadOutcome::into_server_complete` surfaces the completion body without protocol matching.
 #[test]
 fn server_completion_is_exposed_without_protocol_matching_at_the_call_site() {
     let outcome = UploadOutcome::NeedsServerComplete(UploadCompleteRequest::S3Multipart(
@@ -35,6 +41,7 @@ fn server_completion_is_exposed_without_protocol_matching_at_the_call_site() {
     assert!(outcome.into_server_complete().is_some());
 }
 
+/// Zero-sized chunk, block, and part dimensions are rejected by [`validate_plan`].
 #[test]
 fn malformed_dimensions_fail_before_dispatch() {
     let plan = wyrd_spec::storage::UploadPlan::GcsResumable {
@@ -68,6 +75,7 @@ fn malformed_dimensions_fail_before_dispatch() {
     ));
 }
 
+/// [`report`] forwards both known and unknown totals to the progress callback unchanged.
 #[test]
 fn progress_preserves_known_and_unknown_totals() {
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -88,6 +96,7 @@ fn progress_preserves_known_and_unknown_totals() {
     );
 }
 
+/// Over-range chunk sizes fail plan validation before the facade issues any request.
 #[tokio::test]
 async fn over_range_dimensions_fail_before_request_dispatch() {
     let plan = wyrd_spec::storage::UploadPlan::GcsResumable {

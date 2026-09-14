@@ -115,6 +115,7 @@ fn merge_completed_outcome(
     Ok(())
 }
 
+/// Completion response validation and outcome merging.
 #[cfg(test)]
 mod tests {
     use super::{merge_completed_outcome, validate_completion_response};
@@ -128,6 +129,7 @@ mod tests {
         CardLifecycleStatus, CardRegistrationOutcome, RegistrationOutcomeKind,
     };
 
+    /// Merging keeps the composite root and the server outcome order.
     #[test]
     fn merge_preserves_composite_root_and_outcome_order() {
         let first_uid = CardUid::new("018f0000-0000-7000-8000-000000000001").expect("test UID");
@@ -176,6 +178,7 @@ mod tests {
         assert_eq!(response.outcomes[1].status, CardLifecycleStatus::Active);
     }
 
+    /// A completion response missing an expected outcome is refused.
     #[test]
     fn rejects_missing_completion_outcome() {
         let uid = CardUid::new("018f0000-0000-7000-8000-000000000001").expect("test UID");
@@ -197,6 +200,7 @@ mod tests {
         assert_eq!(error.code(), "WYRD_REGISTRY_507_ARTIFACT_VERIFY_FAILED");
     }
 
+    /// Duplicate or unrelated outcomes in a completion response are refused.
     #[test]
     fn rejects_duplicate_or_unrelated_completion_outcomes() {
         let requested = CardUid::new("018f0000-0000-7000-8000-000000000001").expect("test UID");

@@ -46,21 +46,27 @@ pub struct UploadProgress {
 /// Thread-safe callback for caller-owned upload progress handling.
 pub type UploadProgressSink = Arc<dyn Fn(UploadProgress) + Send + Sync + 'static>;
 
+/// In-memory source: the whole buffer is one chunk with an exact size hint.
 impl ArtifactSource for Vec<u8> {
+    /// Exact length of the source.
     fn size_hint(&self) -> Option<u64> {
         Some(self.len() as u64)
     }
 
+    /// Yield the source as chunks; errors surface as [`StorageClientError`].
     fn into_stream(self) -> BoxStream<'static, Result<Bytes, StorageClientError>> {
         futures_util::stream::once(async move { Ok(Bytes::from(self)) }).boxed()
     }
 }
 
+/// Shared-buffer source: the bytes are yielded as one chunk without copying.
 impl ArtifactSource for Bytes {
+    /// Exact length of the source.
     fn size_hint(&self) -> Option<u64> {
         Some(self.len() as u64)
     }
 
+    /// Yield the source as chunks; errors surface as [`StorageClientError`].
     fn into_stream(self) -> BoxStream<'static, Result<Bytes, StorageClientError>> {
         futures_util::stream::once(async move { Ok(self) }).boxed()
     }
@@ -98,11 +104,14 @@ impl FileSource {
     }
 }
 
+/// Filesystem source: the file is opened lazily and streamed in reader-sized chunks.
 impl ArtifactSource for FileSource {
+    /// Exact length of the source.
     fn size_hint(&self) -> Option<u64> {
         self.size
     }
 
+    /// Yield the source as chunks; errors surface as [`StorageClientError`].
     fn into_stream(self) -> BoxStream<'static, Result<Bytes, StorageClientError>> {
         async_stream::try_stream! {
             let file = tokio::fs::File::open(self.path).await?;

@@ -103,6 +103,7 @@ impl CardGraphHydrator {
     }
 }
 
+/// Hydration entry points.
 #[cfg(test)]
 mod tests {
     use super::HydrationMode;

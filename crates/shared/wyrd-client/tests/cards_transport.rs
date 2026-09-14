@@ -15,6 +15,7 @@ use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardUid, SpaceName};
 use wyrd_spec::registry::ListCardsRequest;
 
+/// One HTTP request captured by [`TestServer`] for assertion after the client call.
 #[derive(Clone, Debug)]
 struct Request {
     method: String,
@@ -22,12 +23,16 @@ struct Request {
     body: Vec<u8>,
 }
 
+/// One canned HTTP response [`TestServer`] returns in arrival order.
 #[derive(Clone, Debug)]
 struct Response {
     status: u16,
     body: Vec<u8>,
 }
 
+/// Minimal single-connection HTTP server that replays canned responses and records every request.
+///
+/// Each accepted connection consumes one response; the listener task is aborted on drop.
 struct TestServer {
     uri: String,
     requests: Arc<Mutex<Vec<Request>>>,
@@ -35,6 +40,7 @@ struct TestServer {
 }
 
 impl TestServer {
+    /// Bind an ephemeral loopback listener and spawn the replay task for `responses`.
     async fn start(responses: Vec<Response>) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -62,21 +68,28 @@ impl TestServer {
         }
     }
 
+    /// Snapshot every request received so far, in arrival order.
     async fn requests(&self) -> Vec<Request> {
         self.requests.lock().await.clone()
     }
 
+    /// Base URI clients should use to reach this server.
     fn uri(&self) -> &str {
         &self.uri
     }
 }
 
 impl Drop for TestServer {
+    /// Abort the replay task so the test does not leak a listener.
     fn drop(&mut self) {
         self.task.abort();
     }
 }
 
+/// Read one HTTP/1.1 request head and its content-length body from `stream`.
+///
+/// # Panics
+/// Panics when the request is malformed; this is a test helper.
 async fn read_request(stream: &mut tokio::net::TcpStream) -> Request {
     let mut bytes = Vec::new();
     let mut chunk = [0_u8; 4096];
@@ -111,6 +124,10 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> Request {
     }
 }
 
+/// Write `response` as a minimal HTTP/1.1 JSON response and close the connection.
+///
+/// # Errors
+/// Returns the socket write error.
 async fn write_response(
     stream: &mut tokio::net::TcpStream,
     response: Response,
@@ -130,6 +147,7 @@ async fn write_response(
     stream.write_all(&response.body).await
 }
 
+/// Build a JSON [`Response`] with the given status.
 fn json_response(status: u16, body: serde_json::Value) -> Response {
     Response {
         status,
@@ -137,6 +155,7 @@ fn json_response(status: u16, body: serde_json::Value) -> Response {
     }
 }
 
+/// Build a bearer-authenticated [`WyrdClient`] pointed at `base_url` without network IO.
 fn client(base_url: impl Into<String>) -> WyrdClient {
     let base_url = base_url.into();
     let mut config = ClientConfig::default();
@@ -157,10 +176,12 @@ fn client(base_url: impl Into<String>) -> WyrdClient {
     WyrdClient::from_parts(auth, transport, config.grpc)
 }
 
+/// A fixed valid Card UID for request-shape assertions.
 fn uid() -> CardUid {
     CardUid::new("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00").expect("test uid is valid")
 }
 
+/// `Cards::list` encodes filters as query parameters and sends no GET body.
 #[tokio::test]
 async fn list_uses_typed_query_parameters_and_an_empty_get_body() {
     let server = TestServer::start(vec![json_response(
@@ -197,6 +218,7 @@ async fn list_uses_typed_query_parameters_and_an_empty_get_body() {
     assert!(requests[0].body.is_empty());
 }
 
+/// UID deletes hit the kind-qualified path and treat a 404 as already deleted.
 #[tokio::test]
 async fn uid_delete_uses_kind_qualified_path_and_preserves_idempotence() {
     let server = TestServer::start(vec![json_response(
@@ -222,6 +244,7 @@ async fn uid_delete_uses_kind_qualified_path_and_preserves_idempotence() {
     assert!(requests[0].body.is_empty());
 }
 
+/// A server problem+json refusal keeps its code and status through the registry boundary.
 #[tokio::test]
 async fn server_problem_code_and_status_survive_registry_boundary() {
     let server = TestServer::start(vec![json_response(
@@ -250,6 +273,7 @@ async fn server_problem_code_and_status_survive_registry_boundary() {
     );
 }
 
+/// `Debug` on the client never prints the constructor credential.
 #[test]
 fn client_debug_redacts_constructor_secret() {
     let config = ClientConfig {

@@ -97,6 +97,7 @@ async fn hash_source(source: &Path) -> Result<(u64, String), RegistryEngineError
     ))
 }
 
+/// Source validation and manifest-hash stamping.
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -111,6 +112,7 @@ mod tests {
     use super::validate_and_stamp;
     use crate::cards::error::RegistryEngineError;
 
+    /// A minimal Prompt submission carrying one artifact manifest entry.
     fn submission(entry: ArtifactManifestEntry) -> CardSubmission {
         CardSubmission {
             api_version: ApiVersion::v1(),
@@ -132,6 +134,7 @@ mod tests {
         }
     }
 
+    /// Matching sources pass and the manifest hash is stamped over sorted entries.
     #[tokio::test]
     async fn validates_sources_and_stamps_sorted_manifest_hash() {
         let directory = tempdir().expect("temporary directory creates");
@@ -157,6 +160,7 @@ mod tests {
         assert!(card.metadata.artifact_hash.is_some());
     }
 
+    /// A digest mismatch between the declared entry and the file is refused before upload.
     #[tokio::test]
     async fn rejects_source_digest_mismatch_before_upload() {
         let directory = tempdir().expect("temporary directory creates");
@@ -185,6 +189,7 @@ mod tests {
         ));
     }
 
+    /// A size mismatch in either direction is refused before upload.
     #[tokio::test]
     async fn rejects_short_and_long_sources_before_upload() {
         for (bytes, expected_size) in [(b"short".as_slice(), 6_u64), (b"longer".as_slice(), 5)] {

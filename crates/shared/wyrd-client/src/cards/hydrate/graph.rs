@@ -418,6 +418,7 @@ pub(super) fn graph_error(message: &str, card_ref: &CardRef) -> WyrdError {
     }
 }
 
+/// Hydration graph resolution.
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;

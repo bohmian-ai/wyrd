@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -14,9 +15,12 @@ use arrow::record_batch::RecordBatch;
 use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
 use thiserror::Error;
+use tokio::sync::{Barrier, Notify};
+use tokio::task::JoinHandle;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::scribe::admission::{AdmissionConfig, EventTimeWindow};
+use wyrd_client::Bifrost;
 use wyrd_client::WyrdClient;
 use wyrd_client::bifrost::{BifrostClientError, CollectedQueryLimits, CollectedQueryResult};
 use wyrd_client::config::ClientConfig;
@@ -25,11 +29,16 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{BifrostQueryRequest, FreshnessPolicy, VisibilityMode};
 
 use crate::Bootstrap;
+use crate::WyrdTestServer;
+use crate::bifrost::BifrostClusterSpec;
+use crate::bifrost::cluster::OracleInspection;
 use crate::bifrost::telemetry::{
     ClusterPhaseTelemetryEvidence, ClusterTelemetryEvidence, ClusterTelemetryExpectation,
     ClusterTelemetryProjection, ClusterTraceOperation, run_sampled_window,
 };
+use crate::bifrost::write::RawIngest;
 use crate::bifrost::{BifrostTelemetryCapture, BifrostTopology, WyrdTestCluster};
+use crate::server::BifrostQueryResourceSnapshot;
 
 /// Stable table name provisioned independently inside every tenant.
 const TABLE_NAME: &str = "bifrost_cluster_load";
@@ -592,7 +601,7 @@ impl BifrostClusterLoad {
 /// with cancellation-probe context when the query does not reach the stall.
 async fn await_query_schema_stall_or_completion<S, T, E>(
     stall: S,
-    query_task: &mut tokio::task::JoinHandle<Result<T, E>>,
+    query_task: &mut JoinHandle<Result<T, E>>,
 ) -> Result<String, ClusterLoadError>
 where
     S: Future<Output = Result<String, crate::WyrdTestServerError>>,
@@ -627,10 +636,10 @@ where
 /// Returns a client, cluster, or assertion error when either public operation
 /// cannot reach its deterministic stall or release every observed owner.
 async fn exercise_query_cancellation(
-    server: &crate::WyrdTestServer,
+    server: &WyrdTestServer,
     client: &WyrdClient,
     table: &str,
-) -> Result<crate::server::BifrostQueryResourceSnapshot, ClusterLoadError> {
+) -> Result<BifrostQueryResourceSnapshot, ClusterLoadError> {
     let lifecycle_observer = vala_bifrost_redux::oracle::query_lifecycle_observer_for_test();
     let lifecycle_target = lifecycle_observer.cancelled().saturating_add(1);
     let writer = crate::bifrost::write::RawIngest::connect(client)
@@ -702,7 +711,7 @@ async fn exercise_query_cancellation(
     });
     let query_id =
         await_query_schema_stall_or_completion(server.wait_query_schema_stall(), &mut task).await?;
-    let baseline = crate::server::BifrostQueryResourceSnapshot {
+    let baseline = BifrostQueryResourceSnapshot {
         admission_slots: 0,
         memory_bytes: 0,
         peer_slots: 0,
@@ -1200,7 +1209,7 @@ async fn phase_owner_checkpoint(
 /// [`AUDIT_STAGED_BUDGET`].
 async fn await_read_audit_convergence(
     cluster: &WyrdTestCluster,
-) -> Result<crate::bifrost::cluster::OracleInspection, ClusterLoadError> {
+) -> Result<OracleInspection, ClusterLoadError> {
     let deadline = Instant::now() + AUDIT_STAGED_BUDGET;
     loop {
         let inspection = cluster
@@ -1543,7 +1552,7 @@ fn assert_cancellation_outcomes(
 /// # Errors
 /// Returns a client error when bootstrap, endpoint discovery, or configuration fails.
 async fn public_client(
-    server: &crate::WyrdTestServer,
+    server: &WyrdTestServer,
     tenant: DataTenantId,
     name: &str,
 ) -> Result<WyrdClient, ClusterLoadError> {
@@ -1591,9 +1600,9 @@ struct TenantRunContext {
     /// Fully qualified public table name.
     table: String,
     /// Public ingest transport bound to the tenant's writer server.
-    writer: crate::bifrost::write::RawIngest,
+    writer: RawIngest,
     /// Public query client bound to the tenant's reader server.
-    query: Arc<wyrd_client::Bifrost>,
+    query: Arc<Bifrost>,
     /// Phase barriers shared by every tenant task in this run.
     barriers: Arc<TenantPhaseBarriers>,
     /// Shared progress evidence used to capture immutable telemetry windows.
@@ -1615,7 +1624,7 @@ struct TenantFailure {
     /// the fact that they were abandoned. The owner's phase waits release
     /// before the tenant tasks are joined, so without this the run reports
     /// "a tenant failed" and the actual error is never surfaced.
-    cause: Arc<std::sync::OnceLock<String>>,
+    cause: Arc<OnceLock<String>>,
 }
 
 impl TenantFailure {
@@ -1650,11 +1659,11 @@ impl TenantFailure {
 /// parked sibling immediately so the original error is the one that propagates.
 struct TenantPhaseBarriers {
     /// Released after every tenant finishes its warmup writes.
-    warmup: tokio::sync::Barrier,
+    warmup: Barrier,
     /// Released before measured writers and readers start.
-    measured: tokio::sync::Barrier,
+    measured: Barrier,
     /// Released after every tenant finishes its measured tasks.
-    completed: tokio::sync::Barrier,
+    completed: Barrier,
     /// Shared abort signal tripped by the first failing tenant.
     failed: TenantFailure,
 }
@@ -1707,7 +1716,7 @@ impl TenantPhaseBarriers {
     /// never release on its own.
     async fn wait_on(
         &self,
-        barrier: &tokio::sync::Barrier,
+        barrier: &Barrier,
         phase: &'static str,
     ) -> Result<(), ClusterLoadError> {
         tokio::select! {
@@ -1743,9 +1752,9 @@ struct PhaseProgress {
     /// Measured barrier arrivals.
     measured: AtomicUsize,
     /// Wakes the owner when any phase counter advances.
-    notify: tokio::sync::Notify,
+    notify: Notify,
     /// Releases tenant tasks only after the warmup checkpoint is captured.
-    warmup_release: tokio::sync::Notify,
+    warmup_release: Notify,
     /// Persistent release state preventing a lost notification race.
     warmup_released: AtomicBool,
     /// Shared abort signal tripped by the first tenant that fails.
@@ -2206,12 +2215,12 @@ impl fmt::Debug for BifrostClusterLoad {
 /// Maps the closed public topology enum to its exact test process descriptor.
 trait TopologySpec {
     /// Return the production-role descriptor used to boot this topology.
-    fn spec_for_test(self) -> crate::bifrost::BifrostClusterSpec;
+    fn spec_for_test(self) -> BifrostClusterSpec;
 }
 
 impl TopologySpec for BifrostTopology {
     /// Select the exact descriptor without inventing a production role.
-    fn spec_for_test(self) -> crate::bifrost::BifrostClusterSpec {
+    fn spec_for_test(self) -> BifrostClusterSpec {
         match self {
             BifrostTopology::OnePod => crate::bifrost::BifrostClusterSpec::one_mixed(),
             BifrostTopology::TwoPod => crate::bifrost::BifrostClusterSpec::two_mixed(),
@@ -2261,10 +2270,9 @@ mod tests {
         assert!(error.to_string().contains("original client failure"));
         assert!(!error.to_string().contains("schema stall deadline elapsed"));
 
-        let mut join_failure: tokio::task::JoinHandle<Result<(), &'static str>> =
-            tokio::spawn(async {
-                panic!("injected cancellation query panic");
-            });
+        let mut join_failure: JoinHandle<Result<(), &'static str>> = tokio::spawn(async {
+            panic!("injected cancellation query panic");
+        });
         let error = await_query_schema_stall_or_completion(
             std::future::pending::<Result<String, crate::WyrdTestServerError>>(),
             &mut join_failure,

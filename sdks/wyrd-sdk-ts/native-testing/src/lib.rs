@@ -5,6 +5,7 @@
 use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::{DataType, Field};
+use napi::Result;
 use napi_derive::napi;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
@@ -82,7 +83,7 @@ impl NativeWyrdTestServer {
     /// Returns a napi error when the harness is closed or registration,
     /// encoding, ingest, or flushing fails.
     #[napi]
-    pub fn seed_bifrost_rows(&self, table: String, rows: Vec<i64>) -> napi::Result<Vec<i64>> {
+    pub fn seed_bifrost_rows(&self, table: String, rows: Vec<i64>) -> Result<Vec<i64>> {
         let result = self.seed_bifrost_rows_borrowed(&table, &rows);
         drop(table);
         drop(rows);
@@ -94,8 +95,13 @@ impl NativeWyrdTestServer {
     /// This does not expose a production flush API; it only lets a journey
     /// await the existing server-owned publication lifecycle before Oracle
     /// reads the acknowledged batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the server lock is poisoned, the server is
+    /// shut down, or the publication barrier fails.
     #[napi]
-    pub fn wait_for_bifrost_publication(&self) -> napi::Result<()> {
+    pub fn wait_for_bifrost_publication(&self) -> Result<()> {
         let guard = self
             .server
             .lock()
@@ -115,7 +121,7 @@ impl NativeWyrdTestServer {
     ///
     /// Returns a napi error when the harness lock is poisoned, the server is
     /// already closed, or registration, encoding, ingest, or flushing fails.
-    fn seed_bifrost_rows_borrowed(&self, table: &str, rows: &[i64]) -> napi::Result<Vec<i64>> {
+    fn seed_bifrost_rows_borrowed(&self, table: &str, rows: &[i64]) -> Result<Vec<i64>> {
         let guard = self
             .server
             .lock()
@@ -138,7 +144,7 @@ impl NativeWyrdTestServer {
     ///
     /// Returns a napi error when the harness is closed or the flush fails.
     #[napi]
-    pub fn flush_bifrost(&self) -> napi::Result<()> {
+    pub fn flush_bifrost(&self) -> Result<()> {
         let guard = self
             .server
             .lock()
@@ -162,7 +168,7 @@ impl NativeWyrdTestServer {
     ///
     /// Returns a napi error when the harness is closed or provisioning fails.
     #[napi]
-    pub fn ensure_builtin_table(&self, namespace: String, name: String) -> napi::Result<()> {
+    pub fn ensure_builtin_table(&self, namespace: String, name: String) -> Result<()> {
         let result = self.ensure_builtin_table_borrowed(&namespace, &name);
         drop(namespace);
         drop(name);
@@ -176,7 +182,7 @@ impl NativeWyrdTestServer {
     ///
     /// Returns a napi error when the harness lock is poisoned, the server is
     /// already closed, or provisioning fails.
-    fn ensure_builtin_table_borrowed(&self, namespace: &str, name: &str) -> napi::Result<()> {
+    fn ensure_builtin_table_borrowed(&self, namespace: &str, name: &str) -> Result<()> {
         let guard = self
             .server
             .lock()
@@ -204,7 +210,7 @@ impl NativeWyrdTestServer {
     /// Returns a napi error for an unparsable permission, or when the harness
     /// is closed or role seeding or bootstrapping fails.
     #[napi]
-    pub fn scoped_api_key(&self, role: String, permissions: Vec<String>) -> napi::Result<String> {
+    pub fn scoped_api_key(&self, role: String, permissions: Vec<String>) -> Result<String> {
         let result = self.scoped_api_key_borrowed(&role, &permissions);
         drop(role);
         drop(permissions);
@@ -219,7 +225,7 @@ impl NativeWyrdTestServer {
     /// Returns a napi error for an unparsable permission, or when the harness
     /// lock is poisoned, the server is closed, or seeding or bootstrapping
     /// fails.
-    fn scoped_api_key_borrowed(&self, role: &str, permissions: &[String]) -> napi::Result<String> {
+    fn scoped_api_key_borrowed(&self, role: &str, permissions: &[String]) -> Result<String> {
         let guard = self
             .server
             .lock()
@@ -236,7 +242,7 @@ impl NativeWyrdTestServer {
                     ))
                 })
             })
-            .collect::<napi::Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()?;
         let bootstrap = wyrd_runtime::runtime()
             .block_on(async {
                 server.seed_role(role, &parsed).await?;
@@ -259,7 +265,7 @@ impl NativeWyrdTestServer {
     ///
     /// Returns a napi error when the harness is closed or token issuance fails.
     #[napi]
-    pub fn query_denied_token(&self) -> napi::Result<String> {
+    pub fn query_denied_token(&self) -> Result<String> {
         let guard = self
             .server
             .lock()
@@ -278,7 +284,7 @@ impl NativeWyrdTestServer {
     ///
     /// Returns a napi error when the harness is closed or the audit query fails.
     #[napi]
-    pub fn bifrost_read_decision_count(&self) -> napi::Result<i64> {
+    pub fn bifrost_read_decision_count(&self) -> Result<i64> {
         let guard = self
             .server
             .lock()
@@ -292,8 +298,13 @@ impl NativeWyrdTestServer {
     }
 
     /// Truncate the next query after its schema frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the server lock is poisoned or the server is
+    /// shut down.
     #[napi]
-    pub fn fail_next_query_after_schema(&self) -> napi::Result<()> {
+    pub fn fail_next_query_after_schema(&self) -> Result<()> {
         let guard = self
             .server
             .lock()
@@ -306,8 +317,13 @@ impl NativeWyrdTestServer {
     }
 
     /// Truncate the next query after its first batch frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the server lock is poisoned or the server is
+    /// shut down.
     #[napi]
-    pub fn fail_next_query_after_batch(&self) -> napi::Result<()> {
+    pub fn fail_next_query_after_batch(&self) -> Result<()> {
         let guard = self
             .server
             .lock()
@@ -325,7 +341,7 @@ impl NativeWyrdTestServer {
     ///
     /// Returns a napi error when the Rust harness cannot complete shutdown.
     #[napi]
-    pub fn shutdown(&self) -> napi::Result<()> {
+    pub fn shutdown(&self) -> Result<()> {
         let server = self
             .server
             .lock()
@@ -347,7 +363,7 @@ impl NativeWyrdTestServer {
 /// Returns a napi error when server startup, service bootstrap, API-key
 /// exchange, or URL discovery fails.
 #[napi]
-pub fn start_test_server() -> napi::Result<NativeWyrdTestServer> {
+pub fn start_test_server() -> Result<NativeWyrdTestServer> {
     wyrd_runtime::runtime().block_on(Box::pin(start_test_server_async()))
 }
 
@@ -356,7 +372,7 @@ pub fn start_test_server() -> napi::Result<NativeWyrdTestServer> {
 /// # Errors
 ///
 /// Returns a napi error when any server setup step fails.
-async fn start_test_server_async() -> napi::Result<NativeWyrdTestServer> {
+async fn start_test_server_async() -> Result<NativeWyrdTestServer> {
     let server = Box::pin(WyrdTestServer::start_bound())
         .await
         .map_err(|error| napi::Error::from_reason(error.to_string()))?;

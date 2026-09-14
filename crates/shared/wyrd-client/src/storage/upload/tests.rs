@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use crate::WyrdClient;
 use crate::auth::AuthMiddleware;
 use crate::config::ClientConfig;
+use crate::error::WyrdClientError;
 use crate::transport::HttpTransport;
 use crate::transport::config::HttpConfig;
 use crate::transport::credential::ResolvedCredential;
@@ -17,7 +18,7 @@ use wyrd_spec::storage::{S3MultipartComplete, UploadCompleteRequest};
 ///
 /// # Errors
 /// Returns the client configuration error when the default config is invalid.
-fn test_auth_middleware() -> Result<Arc<AuthMiddleware>, crate::error::WyrdClientError> {
+fn test_auth_middleware() -> Result<Arc<AuthMiddleware>, WyrdClientError> {
     AuthMiddleware::new(
         &ClientConfig::default(),
         ResolvedCredential::BearerToken("test-bearer".to_owned().into()),

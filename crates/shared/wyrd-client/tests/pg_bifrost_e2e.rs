@@ -14,16 +14,19 @@ mod pg_tests {
     use std::time::{Duration, Instant};
 
     use arrow::array::Array;
+    use arrow::datatypes::ArrowPrimitiveType;
     use arrow::ipc::writer::StreamWriter;
     use arrow::record_batch::RecordBatch;
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use async_trait::async_trait;
     use secrecy::ExposeSecret;
     use tokio::sync::Notify;
+    use tokio::task::JoinHandle;
     use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
     use vala_bifrost_redux::namespaces::BifrostNamespace;
     use vala_bifrost_redux::resources::ORACLE_MAX_BATCH_SIZE;
     use wyrd_client::WyrdClient;
+    use wyrd_client::bifrost::BifrostClientError;
     use wyrd_client::bifrost::{
         Bifrost, BifrostGrpcTransport, BifrostIngestSink, BifrostTransportConfig, Correlation,
         IngestTransport, TableConfig, observe,
@@ -42,17 +45,18 @@ mod pg_tests {
     };
     use wyrd_testing::bifrost::write::{BifrostWriter, RawIngest};
     use wyrd_testing::server::WyrdTestServer;
+    use wyrd_tonic::tonic::Request;
 
     /// The stable catalog code one SDK error projects onto.
     ///
     /// The SDK keeps exactly one public projection, so these journeys assert
     /// the code through it rather than a second per-variant table.
-    fn sdk_code(error: &wyrd_client::bifrost::BifrostClientError) -> &'static str {
+    fn sdk_code(error: &BifrostClientError) -> &'static str {
         wyrd_spec::error::WyrdError::from(error).code()
     }
 
     /// The scrubbed public detail one SDK error projects onto.
-    fn sdk_detail(error: &wyrd_client::bifrost::BifrostClientError) -> String {
+    fn sdk_detail(error: &BifrostClientError) -> String {
         wyrd_spec::error::WyrdError::from(error)
             .as_problem_json()
             .get("detail")
@@ -144,7 +148,7 @@ mod pg_tests {
     }
 
     /// Adds one Wyrd access token to a typed public gRPC request.
-    fn authenticated_request<T>(value: T, bearer: &str) -> wyrd_tonic::tonic::Request<T> {
+    fn authenticated_request<T>(value: T, bearer: &str) -> Request<T> {
         let mut request = wyrd_tonic::tonic::Request::new(value);
         request.metadata_mut().insert(
             "x-wyrd-access-token",
@@ -258,9 +262,9 @@ mod pg_tests {
     /// Runs one HTTP query into the deterministic schema stall and returns its owner task.
     async fn stalled_query(
         srv: &WyrdTestServer,
-        query: &wyrd_client::Bifrost,
+        query: &Bifrost,
         table_fqn: &str,
-    ) -> (RequestId, tokio::task::JoinHandle<()>) {
+    ) -> (RequestId, JoinHandle<()>) {
         srv.stall_next_query_after_schema();
         let stream = query
             .query(&BifrostQueryRequest {
@@ -2072,7 +2076,7 @@ mod pg_tests {
     /// # Panics
     ///
     /// Panics when the column is absent or is not the requested Arrow type.
-    fn primitive_col<T: arrow::datatypes::ArrowPrimitiveType>(
+    fn primitive_col<T: ArrowPrimitiveType>(
         batches: &[RecordBatch],
         name: &str,
     ) -> Vec<Option<T::Native>> {

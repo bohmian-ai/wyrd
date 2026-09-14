@@ -6,6 +6,7 @@
 
 use std::path::Path;
 
+use napi::Result as NapiResult;
 use napi_derive::napi;
 use wyrd_client::cards::{CardGraphHydrator, CardSelector, Cards, HydrationMode, ListCardsRequest};
 use wyrd_client::state::WyrdState;
@@ -70,7 +71,7 @@ impl NativeCards {
     /// Returns a napi error only when the receipt cannot be serialized; load,
     /// validation, and registry failures are returned in the result.
     #[napi]
-    pub async fn register_from_path(&self, path: String) -> napi::Result<NativeLifecycleResult> {
+    pub async fn register_from_path(&self, path: String) -> NapiResult<NativeLifecycleResult> {
         NativeLifecycleResult::outcome(
             Box::pin(self.cards.register_from_path(Path::new(&path))).await,
         )
@@ -83,7 +84,7 @@ impl NativeCards {
     /// Returns a napi error only when the envelope cannot be serialized; an
     /// invalid reference or registry failure is returned in the result.
     #[napi]
-    pub async fn get(&self, card_ref: String) -> napi::Result<NativeLifecycleResult> {
+    pub async fn get(&self, card_ref: String) -> NapiResult<NativeLifecycleResult> {
         let result = match parse_card_ref(&card_ref) {
             Ok(card_ref) => self.cards.get(CardSelector::exact(card_ref)).await,
             Err(error) => Err(error),
@@ -98,7 +99,7 @@ impl NativeCards {
     /// Returns a napi error only when the page cannot be serialized; a
     /// malformed request or registry failure is returned in the result.
     #[napi]
-    pub async fn list(&self, request_json: String) -> napi::Result<NativeLifecycleResult> {
+    pub async fn list(&self, request_json: String) -> NapiResult<NativeLifecycleResult> {
         let result = match serde_json::from_str::<ListCardsRequest>(&request_json) {
             Ok(request) => self.cards.list(request).await,
             Err(error) => Err(WyrdError::Validation {
@@ -124,7 +125,7 @@ impl NativeCards {
         card_ref: String,
         destination: String,
         metadata_only: bool,
-    ) -> napi::Result<NativeLifecycleResult> {
+    ) -> NapiResult<NativeLifecycleResult> {
         let mode = if metadata_only {
             HydrationMode::MetadataOnly
         } else {
@@ -152,7 +153,7 @@ impl NativeCards {
     /// Returns a napi error only when the result cannot be projected; an
     /// invalid reference or registry failure is returned in the result.
     #[napi]
-    pub async fn delete(&self, card_ref: String) -> napi::Result<NativeLifecycleResult> {
+    pub async fn delete(&self, card_ref: String) -> NapiResult<NativeLifecycleResult> {
         let result = match parse_card_ref(&card_ref) {
             Ok(card_ref) => self.cards.delete(CardSelector::exact(card_ref)).await,
             Err(error) => Err(error),
@@ -187,7 +188,7 @@ impl NativeWyrdState {
     ///
     /// Returns a napi error only when the reference cannot be serialized.
     #[napi]
-    pub fn root_ref(&self) -> napi::Result<NativeLifecycleResult> {
+    pub fn root_ref(&self) -> NapiResult<NativeLifecycleResult> {
         self.read(|state| NativeLifecycleResult::outcome(Ok(state.root_ref())))
     }
 
@@ -197,7 +198,7 @@ impl NativeWyrdState {
     ///
     /// Returns a napi error only when the aliases cannot be serialized.
     #[napi]
-    pub fn aliases(&self) -> napi::Result<NativeLifecycleResult> {
+    pub fn aliases(&self) -> NapiResult<NativeLifecycleResult> {
         self.read(|state| NativeLifecycleResult::outcome(Ok(state.aliases().collect::<Vec<_>>())))
     }
 
@@ -207,7 +208,7 @@ impl NativeWyrdState {
     ///
     /// Returns a napi error only when the envelope cannot be serialized.
     #[napi]
-    pub fn card(&self, alias: String) -> napi::Result<NativeLifecycleResult> {
+    pub fn card(&self, alias: String) -> NapiResult<NativeLifecycleResult> {
         let result = self.read(|state| NativeLifecycleResult::outcome(state.card(&alias)));
         drop(alias);
         result
@@ -219,7 +220,7 @@ impl NativeWyrdState {
     ///
     /// Returns a napi error only when the reference cannot be serialized.
     #[napi]
-    pub fn card_ref(&self, alias: String) -> napi::Result<NativeLifecycleResult> {
+    pub fn card_ref(&self, alias: String) -> NapiResult<NativeLifecycleResult> {
         let result = self.read(|state| NativeLifecycleResult::outcome(state.card_ref(&alias)));
         drop(alias);
         result
@@ -231,7 +232,7 @@ impl NativeWyrdState {
     ///
     /// Returns a napi error only when the artifact list cannot be serialized.
     #[napi]
-    pub fn artifacts(&self, alias: String) -> napi::Result<NativeLifecycleResult> {
+    pub fn artifacts(&self, alias: String) -> NapiResult<NativeLifecycleResult> {
         let result = self.read(|state| {
             NativeLifecycleResult::outcome(state.artifacts(&alias).map(|artifacts| {
                 artifacts
@@ -262,8 +263,8 @@ impl NativeWyrdState {
     /// Returns the projection's napi error.
     fn read(
         &self,
-        project: impl FnOnce(&WyrdState) -> napi::Result<NativeLifecycleResult>,
-    ) -> napi::Result<NativeLifecycleResult> {
+        project: impl FnOnce(&WyrdState) -> NapiResult<NativeLifecycleResult>,
+    ) -> NapiResult<NativeLifecycleResult> {
         match &self.state {
             Ok(state) => project(state),
             Err(error) => Ok(NativeLifecycleResult::from_wyrd(error)),

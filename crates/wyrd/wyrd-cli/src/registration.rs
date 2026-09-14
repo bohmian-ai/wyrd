@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use wyrd_client::cards::RegistrationReceipt;
 use wyrd_client::cards::{
     Cards, RegistrationPhase, RegistrationProgressEvent, RegistrationProgressSink,
 };
@@ -25,7 +26,7 @@ use crate::load::RegistrationInput;
 pub async fn register(
     cards: &Cards,
     input: &RegistrationInput,
-) -> Result<wyrd_client::cards::RegistrationReceipt, WyrdError> {
+) -> Result<RegistrationReceipt, WyrdError> {
     let renderer = RegistrationProgressRenderer::new();
     let result = cards.register_with_progress(input, renderer.sink()).await;
     renderer.finish_and_clear();

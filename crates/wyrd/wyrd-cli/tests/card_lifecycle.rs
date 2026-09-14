@@ -2,14 +2,18 @@
 
 use assert_cmd::prelude::*;
 use base64::Engine;
+use serde_json::Error as JsonError;
 use serde_json::{Value, json};
 use sha2::Digest;
 use std::collections::BTreeSet;
+use std::io::Error as IoError;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
+use wyrd_client::cards::Cards;
 use wyrd_client::state::WyrdState;
+use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::{CardRef, unresolved_card_ref_paths};
 use wyrd_storage::settings::{BackendConfig, StorageSettings};
 use wyrd_testing::WyrdTestServer;
@@ -216,7 +220,7 @@ impl RuntimeServiceFixture {
     /// # Errors
     /// Returns an IO error when the temporary workspace cannot be created, a
     /// committed fixture cannot be read, or a fixture copy cannot be written.
-    fn new() -> Result<Self, std::io::Error> {
+    fn new() -> Result<Self, IoError> {
         let workspace = tempfile::tempdir()?;
         let source_root = workspace.path().join("source");
         let committed_root =
@@ -272,10 +276,7 @@ impl RuntimeServiceFixture {
     /// # Errors
     /// Returns the first registry or fixture-loading error encountered while
     /// registering a dependency through [`wyrd_client::cards::Cards`].
-    async fn register_dependencies(
-        &self,
-        cards: &wyrd_client::cards::Cards,
-    ) -> Result<(), wyrd_spec::error::WyrdError> {
+    async fn register_dependencies(&self, cards: &Cards) -> Result<(), WyrdError> {
         for relative in ["training.yaml", "model-primary.yaml", "model-shadow.yaml"] {
             cards.register_from_path(&self.path(relative)).await?;
         }
@@ -554,9 +555,9 @@ mod pg_tests {
     use super::*;
     use secrecy::SecretString;
     use std::sync::Arc;
+    use tokio::task::JoinHandle;
     use wyrd_client::WyrdClient;
     use wyrd_client::auth::AuthMiddleware;
-    use wyrd_client::cards::Cards;
     use wyrd_client::config::ClientConfig;
     use wyrd_client::transport::{HttpTransport, ResolvedCredential};
     use wyrd_testing::Bootstrap;
@@ -566,7 +567,7 @@ mod pg_tests {
         String,
         TempDir,
         CancellationToken,
-        tokio::task::JoinHandle<()>,
+        JoinHandle<()>,
     ) {
         let socket = std::net::TcpListener::bind("127.0.0.1:0").expect("CLI test listener binds");
         socket
@@ -605,7 +606,7 @@ mod pg_tests {
     async fn stop_cli_server(
         server: WyrdTestServer,
         shutdown: CancellationToken,
-        serve_handle: tokio::task::JoinHandle<()>,
+        serve_handle: JoinHandle<()>,
     ) {
         shutdown.cancel();
         serve_handle.await.expect("CLI test server joins");
@@ -657,7 +658,7 @@ mod pg_tests {
     /// # Errors
     /// Returns a JSON decoding error when the receipt has no valid `root`
     /// CardRef object.
-    fn exact_root_ref(receipt: &Value) -> Result<CardRef, serde_json::Error> {
+    fn exact_root_ref(receipt: &Value) -> Result<CardRef, JsonError> {
         serde_json::from_value(receipt["root"].clone())
     }
 

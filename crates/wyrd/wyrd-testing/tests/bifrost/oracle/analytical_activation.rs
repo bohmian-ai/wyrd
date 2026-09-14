@@ -19,13 +19,19 @@ use vala_bifrost_redux::oracle::QueryIpcDecoder;
 use vala_bifrost_redux::oracle::analytical::{
     AnalyticalCleanupPause, AnalyticalLiveInspection, analytical_cleanup_pause_for_test,
 };
+use wyrd_client::Bifrost;
 use wyrd_client::WyrdClient;
+use wyrd_client::bifrost::{BifrostClientError, QueryResultStream};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
     BifrostQueryRequest, FreshnessPolicy, QueryExecutionPath, VisibilityMode,
 };
+use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::process_cluster::BifrostProcessCluster;
+use wyrd_testing::bifrost::process_cluster::{
+    OracleOwnershipSnapshot, ProcessNode, ProcessNodeTarget,
+};
 use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
 use wyrd_tonic::query_conversion::QueryStreamConverter;
 use wyrd_tonic::wyrd::v1 as proto;
@@ -152,7 +158,7 @@ async fn await_retired(
 /// Returns the control-protocol error, or a description of what the pod held
 /// when the bound expired.
 async fn await_admitted(
-    cluster: &mut wyrd_testing::bifrost::process_cluster::BifrostProcessCluster,
+    cluster: &mut BifrostProcessCluster,
     index: usize,
     units: u32,
 ) -> Result<(), JourneyError> {
@@ -174,7 +180,7 @@ async fn await_admitted(
 ///
 /// Only that class is retried by this journey: a dropped stream can leave the
 /// client's connection pool holding an entry the next request cannot use.
-fn is_transport(error: &wyrd_client::bifrost::BifrostClientError) -> bool {
+fn is_transport(error: &BifrostClientError) -> bool {
     sdk_code(error) == "WYRD_SPEC_500_INTERNAL" && error.to_string().contains("transport error")
 }
 
@@ -182,12 +188,12 @@ fn is_transport(error: &wyrd_client::bifrost::BifrostClientError) -> bool {
 ///
 /// The SDK owns exactly one public projection, so every assertion here reads
 /// the code through it rather than a second per-variant table.
-fn sdk_code(error: &wyrd_client::bifrost::BifrostClientError) -> &'static str {
+fn sdk_code(error: &BifrostClientError) -> &'static str {
     wyrd_spec::error::WyrdError::from(error).code()
 }
 
 /// The HTTP-equivalent status one SDK error projects onto.
-fn sdk_status(error: &wyrd_client::bifrost::BifrostClientError) -> u16 {
+fn sdk_status(error: &BifrostClientError) -> u16 {
     wyrd_spec::error::WyrdError::from(error).status()
 }
 
@@ -276,10 +282,10 @@ async fn prove_cleanup_ownership() -> Result<(), JourneyError> {
 ///
 /// Returns the dispatch failure, naming the case, when the retry also fails.
 async fn dispatch(
-    query: &wyrd_client::Bifrost,
+    query: &Bifrost,
     sql: &str,
     case: &str,
-) -> Result<wyrd_client::bifrost::QueryResultStream, JourneyError> {
+) -> Result<QueryResultStream, JourneyError> {
     match query.query(&request(sql)).await {
         Ok(stream) => Ok(stream),
         Err(error) if is_transport(&error) => Ok(query
@@ -305,7 +311,7 @@ async fn prove_paused_cleanup(
     cluster: &WyrdTestCluster,
     engine: &Arc<Oracle>,
     tenant: DataTenantId,
-    server: &wyrd_testing::WyrdTestServer,
+    server: &WyrdTestServer,
     public: &WyrdClient,
     sql: &str,
 ) -> Result<(), JourneyError> {
@@ -350,13 +356,10 @@ async fn prove_paused_cleanup_over_grpc(
     cluster: &WyrdTestCluster,
     engine: &Arc<Oracle>,
     tenant: DataTenantId,
-    server: &wyrd_testing::WyrdTestServer,
+    server: &WyrdTestServer,
     public: &WyrdClient,
     sql: &str,
 ) -> Result<(), JourneyError> {
-    use wyrd_tonic::wyrd::v1 as proto;
-    use wyrd_tonic::wyrd::v1::bifrost_query_service_client::BifrostQueryServiceClient;
-
     let case = "grpc selected analytical";
     let channel = wyrd_tonic::tonic::transport::Endpoint::from_shared(
         server.grpc_url().ok_or("missing gRPC URL")?,
@@ -427,7 +430,7 @@ async fn prove_paused_cleanup_over_grpc(
 /// Returns a timeout, transport, ownership, or assertion error naming the case.
 async fn hold_and_release(
     cluster: &WyrdTestCluster,
-    query: &wyrd_client::Bifrost,
+    query: &Bifrost,
     request_id: &RequestId,
     pause: &AnalyticalCleanupPause,
     case: &str,
@@ -471,7 +474,7 @@ const ANALYTICAL_GRAPH_UNITS: u32 = 2;
 ///
 /// Returns the client configuration error.
 fn public_client(
-    node: &wyrd_testing::bifrost::process_cluster::ProcessNode,
+    node: &ProcessNode,
     api_key: &secrecy::SecretString,
 ) -> Result<WyrdClient, JourneyError> {
     Ok(WyrdClient::with_config(
@@ -602,7 +605,7 @@ fn column<'batch, A: 'static>(
 /// transport failure or carries another code, when the build total moves by
 /// anything other than one, or when the phase records no cut.
 async fn expect_single_build_failure(
-    cluster: &mut wyrd_testing::bifrost::process_cluster::BifrostProcessCluster,
+    cluster: &mut BifrostProcessCluster,
     client: &WyrdClient,
     sql: &str,
     case: &str,
@@ -619,7 +622,7 @@ async fn expect_single_build_failure(
         Err(error) => error,
     };
     let sdk = failure
-        .downcast_ref::<wyrd_client::bifrost::BifrostClientError>()
+        .downcast_ref::<BifrostClientError>()
         .ok_or_else(|| format!("{case}: failed outside the SDK as {failure}"))?;
     if is_transport(sdk) {
         return Err(format!("{case}: failed as a client transport error: {sdk}").into());
@@ -989,10 +992,7 @@ async fn prove_preparation_deadline(
 ///
 /// Returns a description when the store cannot be walked or holds no pinned
 /// data object for `table`.
-fn pinned_parquet(
-    cluster: &wyrd_testing::bifrost::process_cluster::BifrostProcessCluster,
-    table: &str,
-) -> Result<String, JourneyError> {
+fn pinned_parquet(cluster: &BifrostProcessCluster, table: &str) -> Result<String, JourneyError> {
     let root = cluster.storage_root().to_path_buf();
     let mut seen: Vec<String> = Vec::new();
     let mut pending = vec![root.clone()];
@@ -1266,9 +1266,7 @@ async fn prove_public_activation() -> Result<(), JourneyError> {
 }
 
 /// Returns every Oracle pod index in one process topology.
-fn oracle_indices(
-    cluster: &wyrd_testing::bifrost::process_cluster::BifrostProcessCluster,
-) -> Vec<usize> {
+fn oracle_indices(cluster: &BifrostProcessCluster) -> Vec<usize> {
     cluster
         .nodes()
         .iter()
@@ -1403,7 +1401,7 @@ async fn prove_selected_failure_is_terminal() -> Result<(), JourneyError> {
             while let Some(batch) = stream.next_batch().await? {
                 rows += batch.num_rows();
             }
-            Ok::<usize, wyrd_client::bifrost::BifrostClientError>(rows)
+            Ok::<usize, BifrostClientError>(rows)
         })
     };
     cluster.nodes_mut()[paused].await_execute_paused()?;
@@ -1541,9 +1539,7 @@ struct AttemptTotals {
 /// # Errors
 ///
 /// Returns the control-protocol error unchanged.
-fn attempt_totals(
-    cluster: &mut wyrd_testing::bifrost::process_cluster::BifrostProcessCluster,
-) -> Result<AttemptTotals, JourneyError> {
+fn attempt_totals(cluster: &mut BifrostProcessCluster) -> Result<AttemptTotals, JourneyError> {
     let family = "bifrost_oracle_analytical_attempts_total";
     let total = cluster.nodes_mut()[COORDINATOR].metric_totals(&[family])?;
     let succeeded = cluster.nodes_mut()[COORDINATOR].metric_totals_labeled(
@@ -1567,7 +1563,7 @@ fn attempt_totals(
 /// Returns the control-protocol error, or a description of the lease the pod
 /// still held when the bound expired.
 async fn await_released_lease(
-    cluster: &mut wyrd_testing::bifrost::process_cluster::BifrostProcessCluster,
+    cluster: &mut BifrostProcessCluster,
     index: usize,
 ) -> Result<(u64, usize), JourneyError> {
     for _ in 0..BASELINE_POLLS {
@@ -1624,8 +1620,6 @@ async fn analytical_reserves_only_configured_workers() {
 ///
 /// Returns the first selection, isolation, floor, or cleanup claim that broke.
 async fn prove_bounded_worker_reservation() -> Result<(), JourneyError> {
-    use wyrd_testing::bifrost::process_cluster::ProcessNodeTarget;
-
     let mut cluster = BifrostProcessCluster::start(
         NODE_BINARY,
         &[
@@ -1809,10 +1803,7 @@ async fn await_selected_remotes(
 async fn prove_cancelled_query_returns_owners(
     cluster: &mut BifrostProcessCluster,
     sql: &str,
-    baseline: &[(
-        usize,
-        wyrd_testing::bifrost::process_cluster::OracleOwnershipSnapshot,
-    )],
+    baseline: &[(usize, OracleOwnershipSnapshot)],
 ) -> Result<(), JourneyError> {
     cluster.nodes_mut()[COORDINATOR].start_inactive_sql(sql)?;
     cluster.nodes_mut()[COORDINATOR].cancel_inactive_sql()?;

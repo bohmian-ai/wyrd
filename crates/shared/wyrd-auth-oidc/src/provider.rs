@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use reqwest::Client;
 use serde::Deserialize;
 use url::Url;
 
@@ -86,7 +87,7 @@ fn parse_raw_metadata(
 pub struct OidcProvider {
     /// Discovery document fields.
     pub metadata: ProviderMetadata,
-    http: reqwest::Client,
+    http: Client,
 }
 
 impl OidcProvider {
@@ -105,7 +106,7 @@ impl OidcProvider {
     /// the request URL, and [`OidcError::NoAsymmetricAlg`] when no supported
     /// asymmetric algorithm is advertised.
     #[tracing::instrument(level = "debug", skip(http), fields(issuer = %issuer_url), err)]
-    pub async fn discover(issuer_url: Url, http: reqwest::Client) -> Result<Self, OidcError> {
+    pub async fn discover(issuer_url: Url, http: Client) -> Result<Self, OidcError> {
         let issuer_str = issuer_url.as_str().trim_end_matches('/').to_owned();
         let discovery_url = format!("{issuer_str}/.well-known/openid-configuration");
 
@@ -157,13 +158,14 @@ impl OidcProvider {
     }
 
     /// Borrow the HTTP client for downstream use (e.g. JWKS fetches).
-    pub fn http(&self) -> &reqwest::Client {
+    pub fn http(&self) -> &Client {
         &self.http
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use serde_json::Value;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -173,12 +175,12 @@ mod tests {
     ///
     /// The workspace reqwest has no built-in provider; production installs
     /// Wyrd's before building clients, so each test process must too.
-    fn http_client() -> reqwest::Client {
+    fn http_client() -> Client {
         wyrd_tls::install_crypto_provider().expect("Wyrd owns the Rustls provider");
         reqwest::Client::new()
     }
 
-    fn asymmetric_discovery_body(issuer: &str) -> serde_json::Value {
+    fn asymmetric_discovery_body(issuer: &str) -> Value {
         serde_json::json!({
             "issuer": issuer,
             "authorization_endpoint": format!("{issuer}/authorize"),

@@ -1,5 +1,6 @@
 //! Card lifecycle verbs for the `wyrd` command-line client.
 
+use std::fmt::Display;
 use std::process::ExitCode;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -9,6 +10,7 @@ use clap::{Args, ValueEnum};
 use serde::Serialize;
 use wyrd_client::WyrdClient;
 use wyrd_client::auth::AuthMiddleware;
+use wyrd_client::cards::RegistrationReceipt;
 use wyrd_client::cards::{CardGraphHydrator, CardSelector, Cards, HydrationMode, HydrationSummary};
 use wyrd_client::config::ClientConfig;
 use wyrd_client::error::WyrdClientError;
@@ -609,7 +611,7 @@ fn parse_status(value: &str) -> Result<CardLifecycleStatus, WyrdCliError> {
 fn parse_id<T>(field: &str, value: &str, expected: &str) -> Result<T, WyrdCliError>
 where
     T: FromStr,
-    T::Err: std::fmt::Display,
+    T::Err: Display,
 {
     value
         .parse()
@@ -710,7 +712,7 @@ fn print_load_failure(error: &LoadError, format: OutputFormat) {
 }
 
 /// Print a registration receipt as one root line followed by one line per outcome.
-fn print_apply_text(receipt: &wyrd_client::cards::RegistrationReceipt) {
+fn print_apply_text(receipt: &RegistrationReceipt) {
     println!("registered: {}", receipt.root);
     for outcome in &receipt.outcomes {
         println!(

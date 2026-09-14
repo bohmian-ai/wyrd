@@ -12,6 +12,9 @@
 //! same calls through `asyncio.to_thread`, so the two facades share one
 //! implementation rather than two.
 
+use serde_json::Result as JsonResult;
+use serde_json::Value;
+use std::fmt::Display;
 use std::io::Cursor;
 use std::sync::Mutex;
 
@@ -52,7 +55,7 @@ fn client_error(error: BifrostClientError) -> WyrdPyError {
 /// `WYRD_SPEC_400_VALIDATION` naming the offending argument, so Python callers
 /// branch on the stable code and read `details["field"]` instead of parsing a
 /// `ValueError` message.
-fn invalid_argument(field: &str, reason: impl std::fmt::Display) -> WyrdPyError {
+fn invalid_argument(field: &str, reason: impl Display) -> WyrdPyError {
     WyrdPyError::from(WyrdError::Validation {
         message: format!("{field} is invalid: {reason}"),
         details: serde_json::json!({ "field": field, "reason": reason.to_string() }),
@@ -115,7 +118,7 @@ impl PyTableConfig {
         schema_json: &str,
         layout_json: Option<&str>,
     ) -> WyrdPyResult<Self> {
-        let schema: serde_json::Value = serde_json::from_str(schema_json)
+        let schema: Value = serde_json::from_str(schema_json)
             .map_err(|error| invalid_argument("schema_json", error))?;
         let config = TableConfig::from_json_schema(table, &schema).map_err(client_error)?;
         Ok(Self {
@@ -608,10 +611,7 @@ fn encode_schema_ipc(schema: &SchemaRef) -> WyrdPyResult<Vec<u8>> {
 /// Returns the stable Wyrd internal error when the response cannot be
 /// serialized, and the intrinsic `PyO3` error when Python object construction
 /// fails.
-fn to_python_json(
-    py: Python<'_>,
-    value: serde_json::Result<serde_json::Value>,
-) -> WyrdPyResult<Py<PyAny>> {
+fn to_python_json(py: Python<'_>, value: JsonResult<Value>) -> WyrdPyResult<Py<PyAny>> {
     let value = value.map_err(|error| boundary_internal(error.to_string()))?;
     json_to_pyobject(py, &value).map_err(|error| boundary_internal(error.to_string()))
 }
@@ -907,7 +907,7 @@ fn record(
     card_ref: Option<&str>,
     run_id: Option<String>,
 ) -> WyrdPyResult<()> {
-    let schema_value: serde_json::Value =
+    let schema_value: Value =
         serde_json::from_str(schema).map_err(|error| invalid_argument("schema", error))?;
     let schema = wyrd_queue::json_schema_to_arrow(&schema_value)
         .map_err(|error| invalid_argument("schema", error))?;

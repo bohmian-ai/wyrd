@@ -20,15 +20,20 @@ use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use futures_util::StreamExt as _;
 use sha2::{Digest as _, Sha256};
+use tokio::task::JoinHandle;
+use vala_bifrost_redux::oracle::Oracle;
 use vala_bifrost_redux::oracle::{QueryIpcDecoder, QueryResourceProbe, QueryResourceSnapshot};
 use vala_bifrost_redux::resources::{ResourceSource, SystemResourceSnapshot};
+use wyrd_client::Bifrost;
 use wyrd_client::WyrdClient;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::vala::api::NodeId;
 use wyrd_spec::vala::api::{
     BifrostQueryRequest, FreshnessPolicy, QueryStreamFrame, QueryTerminalOutcome, VisibilityMode,
 };
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::telemetry::BifrostMetricSample;
+use wyrd_testing::bifrost::telemetry::BifrostTelemetryDelta;
 use wyrd_testing::bifrost::{
     BifrostClusterSpec, BifrostNodeSpec, TestOracleResources, WyrdTestCluster,
 };
@@ -531,9 +536,7 @@ async fn prove_nodes_ready(cluster: &WyrdTestCluster, label: &str) -> Result<(),
 ///
 /// Returns an error when no Analytical handle exists, no evidence settles
 /// within the bound, or the settled evidence reports no spill.
-async fn prove_spill_evidence(
-    engine: &Arc<vala_bifrost_redux::oracle::Oracle>,
-) -> Result<(), JourneyError> {
+async fn prove_spill_evidence(engine: &Arc<Oracle>) -> Result<(), JourneyError> {
     let supervisor = engine
         .analytical_execution()
         .ok_or("Oracle composed no Analytical handle")?
@@ -564,7 +567,7 @@ async fn prove_spill_evidence(
 ///
 /// Returns an error naming the first series whose labels leak a tenant.
 fn prove_labels_are_bounded(
-    delta: &wyrd_testing::bifrost::telemetry::BifrostTelemetryDelta,
+    delta: &BifrostTelemetryDelta,
     tenants: &[DataTenantId],
 ) -> Result<(), JourneyError> {
     let forbidden: Vec<String> = tenants.iter().map(ToString::to_string).collect();
@@ -722,11 +725,7 @@ fn class_gauge(cluster: &WyrdTestCluster, class: &str) -> Result<f64, JourneyErr
 }
 
 /// Sums one production metric family restricted to an exact label set.
-fn labelled_sum(
-    delta: &wyrd_testing::bifrost::telemetry::BifrostTelemetryDelta,
-    family: &str,
-    labels: &[(&str, &str)],
-) -> f64 {
+fn labelled_sum(delta: &BifrostTelemetryDelta, family: &str, labels: &[(&str, &str)]) -> f64 {
     delta
         .metrics
         .iter()
@@ -1084,7 +1083,7 @@ fn heterogeneous_observation(
 /// report its resource snapshot.
 fn derived_capacities(
     cluster: &WyrdTestCluster,
-    node_ids: &[wyrd_spec::vala::api::NodeId],
+    node_ids: &[NodeId],
 ) -> Result<Vec<(usize, usize, usize, usize)>, JourneyError> {
     node_ids
         .iter()
@@ -1115,7 +1114,7 @@ fn derived_capacities(
 /// returns a row count the fixture did not write.
 async fn query_each_node(
     cluster: &WyrdTestCluster,
-    node_ids: &[wyrd_spec::vala::api::NodeId],
+    node_ids: &[NodeId],
     table: &str,
     label: &str,
 ) -> Result<(), JourneyError> {
@@ -1146,7 +1145,7 @@ async fn query_each_node(
 async fn seed_historical_admission_rows(
     cluster: &WyrdTestCluster,
     tenant: DataTenantId,
-    holder: wyrd_spec::vala::api::NodeId,
+    holder: NodeId,
 ) -> Result<(), JourneyError> {
     let pool = cluster.pg_fixture().operator_pool().pool();
     sqlx::query(
@@ -1387,7 +1386,7 @@ async fn prove_memory_refusal_preserves_health() -> Result<(), JourneyError> {
 /// # Errors
 ///
 /// Returns the rendered refusal when the statement does not complete.
-async fn drain_query(query: &wyrd_client::Bifrost, sql: &str) -> Result<u64, String> {
+async fn drain_query(query: &Bifrost, sql: &str) -> Result<u64, String> {
     let mut stream = query
         .query(&BifrostQueryRequest {
             sql: sql.to_owned(),
@@ -1591,7 +1590,7 @@ async fn hold_envelope(
     server: &WyrdTestServer,
     client: &WyrdClient,
     sql: &str,
-) -> Result<tokio::task::JoinHandle<()>, JourneyError> {
+) -> Result<JoinHandle<()>, JourneyError> {
     server.stall_next_query_after_schema();
     let stream = wyrd_client::Bifrost::query_only(client)
         .query(&BifrostQueryRequest {
@@ -1617,7 +1616,7 @@ async fn hold_envelope(
 /// Returns an error when the abandoned query never returns its slot units.
 async fn release_envelope(
     cluster: &WyrdTestCluster,
-    task: tokio::task::JoinHandle<()>,
+    task: JoinHandle<()>,
     class: &str,
     expected: f64,
 ) -> Result<(), JourneyError> {

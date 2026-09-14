@@ -7,11 +7,13 @@ use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyMapping, PyModule, PyTuple};
 use secrecy::SecretString;
+use serde_json::Value;
 use tempfile::{TempDir, tempdir};
 use wyrd_cards::card_ref::{CardRefPy, Kind};
 use wyrd_cards::{agent::PyAgentCard, data::DataCard, model::ModelCard, prompt::PromptCard};
 use wyrd_client::cards::{CardSelector, Cards};
 use wyrd_interfaces::error::{CardPyResult, WyrdPyError};
+use wyrd_loader::{LoadError, RegistrationInput};
 use wyrd_semver::{VersionBlock, VersionBump, VersionSpec};
 use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::envelope::{Card, CardKind, Metadata};
@@ -296,6 +298,10 @@ impl PyWyrdState {
     }
 
     /// Visit every retained Python holder for cyclic garbage collection.
+    ///
+    /// # Errors
+    ///
+    /// Returns the visitor's [`PyTraverseError`] as soon as a visit fails.
     // justification: pyo3 GC callbacks receive their visitor by value.
     #[allow(clippy::needless_pass_by_value)]
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
@@ -561,7 +567,7 @@ impl PyHydratedArtifact {
 /// # Errors
 ///
 /// Returns a stable Python conversion error when allocation or conversion fails.
-fn json_to_py(py: Python<'_>, value: &serde_json::Value) -> CardPyResult<Py<PyAny>> {
+fn json_to_py(py: Python<'_>, value: &Value) -> CardPyResult<Py<PyAny>> {
     wyrd_utils::py::json_to_pyobject(py, value).map_err(Into::into)
 }
 
@@ -1240,6 +1246,11 @@ macro_rules! option_methods {
         #[pymethods]
         impl $type {
             /// Create typed interface options from JSON-compatible values.
+            ///
+            /// # Errors
+            ///
+            /// Returns a stable SDK error when `values` cannot be converted by Python
+            /// `dict()` or copied into the options dictionary.
             #[new]
             #[pyo3(signature = (values=None))]
             fn __new__(py: Python<'_>, values: Option<&Bound<'_, PyAny>>) -> CardPyResult<Self> {
@@ -1265,6 +1276,11 @@ impl PyDataSaveArgs {
     /// Create data-interface save options.
     ///
     /// `copy_bytes` is copied into the options dictionary when provided.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable SDK error when `values` cannot be converted by Python
+    /// `dict()` or copied into the options dictionary.
     #[new]
     #[pyo3(signature = (values=None, copy_bytes=None))]
     fn __new__(
@@ -2484,7 +2500,7 @@ struct SavedCardEnvelope {
 /// Registration input whose manifest paths are confined to its retained workspace.
 struct PreparedPythonCard {
     /// Native input whose artifact sources were derived from `tempdir`.
-    input: wyrd_loader::RegistrationInput,
+    input: RegistrationInput,
     /// Workspace retained until hashing, upload, and completion finish.
     tempdir: TempDir,
 }
@@ -2505,7 +2521,7 @@ impl PreparedPythonCard {
         let manifest = wyrd_loader::build_artifact_manifest(root, "card.json")
             .map_err(|error| loader_manifest_error(&error))?;
         Ok(Self {
-            input: wyrd_loader::RegistrationInput {
+            input: RegistrationInput {
                 submissions: vec![wyrd_spec::registry::CardSubmission {
                     api_version: saved.envelope.api_version,
                     kind: saved.envelope.kind,
@@ -2534,7 +2550,7 @@ struct PythonCardEnvelope {
     /// Caller-authored identity and labels.
     metadata: Metadata,
     /// Kind-specific spec, parsed later by the native workflow.
-    spec: serde_json::Value,
+    spec: Value,
 }
 
 /// Save one Python Card holder into a native registration input and await the
@@ -2976,7 +2992,7 @@ fn registration_outcome_name(outcome: RegistrationOutcomeKind) -> &'static str {
 
 /// Projects a loader failure onto the invalid-envelope catalog error, keeping
 /// its diagnostics as structured details.
-fn loader_manifest_error(error: &wyrd_loader::LoadError) -> WyrdPyError {
+fn loader_manifest_error(error: &LoadError) -> WyrdPyError {
     WyrdPyError::from(WyrdError::LoaderInvalidEnvelope {
         message: error.to_string(),
         details: serde_json::json!({ "diagnostics": &error.diagnostics }),
@@ -3029,6 +3045,11 @@ pub fn register_state(module: &Bound<'_, PyModule>) -> CardPyResult<()> {
 }
 
 /// Register the client Card handle on `wyrd.cards`.
+///
+/// # Errors
+///
+/// Propagates the Python error from any failed `add_class` call, such as an
+/// allocation failure or an incompatible existing class entry.
 pub fn register_cards(module: &Bound<'_, PyModule>) -> CardPyResult<()> {
     module.add_class::<PyVersionBump>()?;
     module.add_class::<PyDataSaveArgs>()?;

@@ -5,10 +5,13 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use base64::Engine;
 use sha2::{Digest, Sha256};
+use std::io::Result;
 use tempfile::NamedTempFile;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::net::TcpStream;
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use wyrd_client::WyrdClient;
 use wyrd_client::auth::AuthMiddleware;
 use wyrd_client::config::ClientConfig;
@@ -41,7 +44,7 @@ struct Response {
 struct TestServer {
     uri: String,
     requests: Arc<Mutex<Vec<Request>>>,
-    task: tokio::task::JoinHandle<()>,
+    task: JoinHandle<()>,
 }
 
 /// Base64 SHA-256 digest in the form the storage protocols send as integrity headers.
@@ -107,7 +110,7 @@ impl Drop for TestServer {
 ///
 /// # Panics
 /// Panics when the request is malformed; this is a test helper.
-async fn read_request(stream: &mut tokio::net::TcpStream) -> Request {
+async fn read_request(stream: &mut TcpStream) -> Request {
     let mut bytes = Vec::new();
     let mut chunk = [0_u8; 4096];
     let header_end = loop {
@@ -156,7 +159,7 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> Request {
 /// Finish reading a request body into `bytes` once the header block ending at `header_end`
 /// has been parsed, honoring `content_length` or chunked framing.
 async fn read_body(
-    stream: &mut tokio::net::TcpStream,
+    stream: &mut TcpStream,
     bytes: &mut Vec<u8>,
     chunk: &mut [u8; 4096],
     header_end: usize,
@@ -213,10 +216,7 @@ async fn read_body(
 ///
 /// # Errors
 /// Returns the socket write error.
-async fn write_response(
-    stream: &mut tokio::net::TcpStream,
-    response: Response,
-) -> std::io::Result<()> {
+async fn write_response(stream: &mut TcpStream, response: Response) -> Result<()> {
     let reason = match response.status {
         200 => "OK",
         201 => "Created",

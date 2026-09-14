@@ -5,6 +5,7 @@ use std::path::Path;
 use crate::WyrdClient;
 use base64::Engine;
 use futures_util::StreamExt;
+use reqwest::Response;
 use sha2::{Digest, Sha256};
 use wyrd_spec::storage::DownloadPlan;
 
@@ -70,7 +71,7 @@ pub(crate) async fn download_verified(
 /// Cancellation can leave the destination partially written after reporting
 /// its committed bytes.
 pub(crate) async fn write_response(
-    response: reqwest::Response,
+    response: Response,
     dest: &Path,
     verification: Option<DownloadVerification<'_>>,
     progress: Option<&DownloadProgressSink>,

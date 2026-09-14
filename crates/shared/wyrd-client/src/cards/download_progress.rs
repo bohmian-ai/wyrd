@@ -1,7 +1,7 @@
 //! Private stdout progress coordination for registry artifact transfers.
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use wyrd_spec::registry::RelativeArtifactPath;
@@ -80,7 +80,7 @@ impl DownloadProgressDisplay {
     }
 
     /// Obtain active-bar state while recovering from a poisoned test or terminal lock.
-    fn bars_lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<RelativeArtifactPath, ProgressBar>> {
+    fn bars_lock(&self) -> MutexGuard<'_, BTreeMap<RelativeArtifactPath, ProgressBar>> {
         self.bars
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())

@@ -13,7 +13,9 @@ use crate::WyrdClient;
 use crate::config::ClientConfig;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
+use serde::de::DeserializeOwned;
 use wyrd_queue::QueueConfig;
+use wyrd_queue::{BatchSink, ClientByteGuard, DurableBatchAck, SealedBatch, SinkError};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
     BifrostQueryRequest, BifrostTableDescription, CancelRunningQueryResponse, FreshnessPolicy,
@@ -21,6 +23,7 @@ use wyrd_spec::vala::api::{
     VisibilityMode,
 };
 
+use crate::bifrost::BifrostMetrics;
 use crate::bifrost::grpc::BifrostGrpcTransport;
 use crate::bifrost::handle::WriterPool;
 use crate::bifrost::query::{
@@ -118,7 +121,7 @@ impl Bifrost {
     pub fn with_sink(
         client: &WyrdClient,
         table: Option<TableConfig>,
-        sink: Arc<dyn wyrd_queue::BatchSink<wyrd_queue::ClientByteGuard>>,
+        sink: Arc<dyn BatchSink<ClientByteGuard>>,
         config: QueueConfig,
     ) -> Self {
         Self {
@@ -447,7 +450,7 @@ impl Bifrost {
     /// # Cancellation
     ///
     /// As [`Self::sql`]; conversion happens only after the query completes.
-    pub async fn sql_as<T: serde::de::DeserializeOwned>(
+    pub async fn sql_as<T: DeserializeOwned>(
         &self,
         query: &str,
     ) -> Result<Vec<T>, BifrostClientError> {
@@ -617,7 +620,7 @@ impl Bifrost {
 
     /// Point-in-time bounded-ownership accounting for this client's producers.
     #[must_use]
-    pub fn metrics(&self) -> crate::bifrost::BifrostMetrics {
+    pub fn metrics(&self) -> BifrostMetrics {
         self.writer.metrics()
     }
 
@@ -693,7 +696,7 @@ impl QueryResult {
     ///
     /// Returns [`BifrostClientError::Arrow`] when the JSON projection fails and
     /// [`BifrostClientError::RowDeserialization`] when any row does not fit `T`.
-    fn deserialize<T: serde::de::DeserializeOwned>(&self) -> Result<Vec<T>, BifrostClientError> {
+    fn deserialize<T: DeserializeOwned>(&self) -> Result<Vec<T>, BifrostClientError> {
         let mut bytes = Vec::new();
         {
             let mut writer = arrow::json::ArrayWriter::new(&mut bytes);
@@ -812,7 +815,7 @@ pub fn client_from_options(
 struct QueryOnlySink;
 
 #[async_trait::async_trait]
-impl wyrd_queue::BatchSink<wyrd_queue::ClientByteGuard> for QueryOnlySink {
+impl BatchSink<ClientByteGuard> for QueryOnlySink {
     /// Refuse `batch` without sending it.
     ///
     /// # Errors
@@ -820,8 +823,8 @@ impl wyrd_queue::BatchSink<wyrd_queue::ClientByteGuard> for QueryOnlySink {
     /// Always returns a terminal `WYRD_SPEC_400_VALIDATION` naming the table.
     async fn send(
         &self,
-        batch: &wyrd_queue::SealedBatch<wyrd_queue::ClientByteGuard>,
-    ) -> Result<wyrd_queue::DurableBatchAck, wyrd_queue::SinkError> {
+        batch: &SealedBatch<ClientByteGuard>,
+    ) -> Result<DurableBatchAck, SinkError> {
         Err(wyrd_queue::SinkError::Terminal(
             wyrd_spec::error::WyrdError::Validation {
                 message: "this Bifrost client was built with Bifrost::query_only and cannot write"

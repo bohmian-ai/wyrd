@@ -3979,6 +3979,8 @@ mod tests {
 
     use tempfile::TempDir;
 
+    use crate::namespaces::BifrostNamespace;
+
     fn test_seal_key(tenant: DataTenantId) -> SealKey {
         SealKey::new(
             tenant,
@@ -4370,8 +4372,6 @@ mod tests {
     /// Panics when a fixture fails to encode or a decode outcome differs.
     #[test]
     fn slice_payload_decoder_limits_system_owner_to_the_audit_log() {
-        use crate::namespaces::BifrostNamespace;
-
         let system = DataTenantId::SYSTEM_OWNER.as_uuid();
         let audit_log = TableRef::new(BifrostNamespace::Audit, "audit_log").fqn();
         let payload = encode_slice_payload_parts(

@@ -707,11 +707,21 @@ impl WyrdState {
     }
 
     /// Resolve a canonical exact `CardRef` key to its stored reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-state-bundle error when the key is absent from the
+    /// validated Card index.
     pub fn card_ref_by_key(&self, key: &str) -> Result<&CardRef, WyrdError> {
         self.index.card_ref_by_key(key)
     }
 
     /// Resolve a canonical exact `CardRef` key to its aliases.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-state-bundle error when the key is absent from the
+    /// validated alias index.
     pub fn aliases_by_key(&self, key: &str) -> Result<&[String], WyrdError> {
         self.index.aliases_by_key(key)
     }
@@ -1700,6 +1710,8 @@ mod tests {
     };
 
     use super::WyrdState;
+    use wyrd_spec::error::WyrdError;
+    use wyrd_spec::vala::eval::EvalSpec;
 
     /// Deterministic payload metadata used to materialize a hydrated artifact
     /// in a temporary bundle fixture.
@@ -2349,8 +2361,8 @@ mod tests {
     ///
     /// # Panics
     /// This pure constructor does not panic.
-    fn eval_spec() -> wyrd_spec::vala::eval::EvalSpec {
-        wyrd_spec::vala::eval::EvalSpec {
+    fn eval_spec() -> EvalSpec {
+        EvalSpec {
             dataset: None,
             tasks: BTreeMap::new(),
             workflow: None,
@@ -2409,7 +2421,7 @@ mod tests {
     }
 
     /// Extract the structured details object from a public Wyrd error.
-    fn problem_details(error: &wyrd_spec::error::WyrdError) -> Value {
+    fn problem_details(error: &WyrdError) -> Value {
         error.as_problem_json()["details"].clone()
     }
 
@@ -2417,11 +2429,7 @@ mod tests {
     ///
     /// # Panics
     /// Panics if construction succeeds, the code differs, or the detail field is absent.
-    fn assert_error(
-        result: Result<WyrdState, wyrd_spec::error::WyrdError>,
-        code: &str,
-        field: &str,
-    ) {
+    fn assert_error(result: Result<WyrdState, WyrdError>, code: &str, field: &str) {
         let error = result.expect_err("bundle fixture must be rejected");
         assert_eq!(error.code(), code);
         assert!(
@@ -2432,10 +2440,7 @@ mod tests {
     }
 
     /// Assert the stable error shape used when durable state contains a sibling.
-    fn assert_sibling_error(
-        result: Result<WyrdState, wyrd_spec::error::WyrdError>,
-        expected_ref: &CardRef,
-    ) {
+    fn assert_sibling_error(result: Result<WyrdState, WyrdError>, expected_ref: &CardRef) {
         let error = result.expect_err("sibling reference must be rejected");
         assert_eq!(error.code(), "WYRD_SDK_400_INVALID_STATE_BUNDLE");
         let details = problem_details(&error);

@@ -9,6 +9,8 @@
 //! `From<StorageClientError> for WyrdError` conversion routes those through
 //! unchanged (V-002).
 
+use reqwest::Response;
+use std::io::Error as IoError;
 use thiserror::Error;
 use wyrd_spec::error::{WyrdError, WyrdStorageError};
 
@@ -37,7 +39,7 @@ pub enum StorageClientError {
     Source(String),
     /// Local destination or source IO failed.
     #[error("artifact filesystem operation failed: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[from] IoError),
     /// The backend request could not be sent.
     #[error("artifact transfer transport failed during {operation}")]
     Transport {
@@ -84,7 +86,7 @@ pub enum StorageClientError {
 /// projects the backend status onto the stable [`WyrdStorageError`] catalog.
 /// Called by every external upload/download branch on the non-success path so
 /// callers see the same stable codes regardless of protocol (V-002).
-pub(crate) async fn map_backend_response(response: reqwest::Response) -> StorageClientError {
+pub(crate) async fn map_backend_response(response: Response) -> StorageClientError {
     let status = response.status().as_u16();
     let _ = response.bytes().await;
     map_backend_status(status)

@@ -18,6 +18,7 @@ use futures_util::stream::{BoxStream, StreamExt};
 use tokio_util::io::ReaderStream;
 use wyrd_spec::storage::{UploadCompleteRequest, UploadId, UploadPlan};
 
+use crate::storage::WyrdStorageClient;
 use crate::storage::error::StorageClientError;
 use reader::SourceReader;
 
@@ -274,7 +275,7 @@ pub(crate) fn report(progress: Option<&ProgressCallback>, uploaded: u64, total: 
 
 /// Build the authenticated S3 part-URL callback for one server-owned upload.
 pub(crate) fn s3_part_url_minter<'a>(
-    storage: &'a crate::storage::WyrdStorageClient,
+    storage: &'a WyrdStorageClient,
     upload_id: &'a UploadId,
     plan: &UploadPlan,
 ) -> Option<PartUrlMinter<'a>> {

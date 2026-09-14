@@ -1,7 +1,10 @@
 //! Staging lifecycle and rollback-safe bundle publication.
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::{
     fs,
+    io::{Error as IoError, ErrorKind, Result as IoResult},
     path::{Path, PathBuf},
 };
 
@@ -37,7 +40,7 @@ impl HydrationWorkspace {
                 });
             }
             Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(error) => return Err(WyrdError::from(RegistryEngineError::from(error))),
         }
         let staging = parent.join(format!(
@@ -121,7 +124,7 @@ impl HydrationWorkspace {
     fn restore_after_failure(
         &self,
         backup: &Path,
-        promotion_error: std::io::Error,
+        promotion_error: IoError,
     ) -> Result<(), WyrdError> {
         let publication_error = WyrdError::from(RegistryEngineError::from(promotion_error));
         if let Err(error) = restore(backup, &self.destination) {
@@ -151,12 +154,10 @@ impl HydrationWorkspace {
 /// # Errors
 ///
 /// Returns the underlying filesystem error when promotion fails.
-fn promote(staging: &Path, destination: &Path) -> std::io::Result<()> {
+fn promote(staging: &Path, destination: &Path) -> IoResult<()> {
     #[cfg(test)]
     if take_publish_fault(FAIL_PROMOTION) {
-        return Err(std::io::Error::other(
-            "injected hydration promotion failure",
-        ));
+        return Err(IoError::other("injected hydration promotion failure"));
     }
     fs::rename(staging, destination)
 }
@@ -166,12 +167,10 @@ fn promote(staging: &Path, destination: &Path) -> std::io::Result<()> {
 /// # Errors
 ///
 /// Returns the underlying filesystem error when restoration fails.
-fn restore(backup: &Path, destination: &Path) -> std::io::Result<()> {
+fn restore(backup: &Path, destination: &Path) -> IoResult<()> {
     #[cfg(test)]
     if take_publish_fault(FAIL_RESTORE) {
-        return Err(std::io::Error::other(
-            "injected hydration restoration failure",
-        ));
+        return Err(IoError::other("injected hydration restoration failure"));
     }
     fs::rename(backup, destination)
 }
@@ -180,9 +179,7 @@ fn restore(backup: &Path, destination: &Path) -> std::io::Result<()> {
 fn cleanup_backup(backup: &Path, destination: &Path) {
     #[cfg(test)]
     let cleanup = if take_publish_fault(FAIL_CLEANUP) {
-        Err(std::io::Error::other(
-            "injected hydration backup cleanup failure",
-        ))
+        Err(IoError::other("injected hydration backup cleanup failure"))
     } else {
         fs::remove_dir_all(backup)
     };
@@ -209,20 +206,20 @@ const FAIL_RESTORE: u8 = 2;
 const FAIL_CLEANUP: u8 = 4;
 /// One-shot publication fault set shared by local unit tests.
 #[cfg(test)]
-static PUBLISH_FAULTS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static PUBLISH_FAULTS: AtomicU8 = AtomicU8::new(0);
 
 /// Consumes one configured publication fault and reports whether it was active.
 #[cfg(test)]
 fn take_publish_fault(fault: u8) -> bool {
-    use std::sync::atomic::Ordering;
-
     PUBLISH_FAULTS.fetch_and(!fault, Ordering::SeqCst) & fault != 0
 }
 
 /// Workspace layout for hydrated Cards.
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
     use std::sync::Mutex;
+    use std::sync::atomic::Ordering;
 
     use tempfile::TempDir;
 
@@ -233,20 +230,17 @@ mod tests {
 
     /// Configures one-shot publication faults for rollback tests.
     fn inject_publish_faults(faults: u8) {
-        PUBLISH_FAULTS.store(faults, std::sync::atomic::Ordering::SeqCst);
+        PUBLISH_FAULTS.store(faults, Ordering::SeqCst);
     }
 
     /// Writes a marker used to distinguish old and newly published bundles.
-    fn write_bundle_marker(directory: &std::path::Path, marker: &str) {
+    fn write_bundle_marker(directory: &Path, marker: &str) {
         std::fs::create_dir_all(directory).expect("bundle directory creates");
         std::fs::write(directory.join("marker"), marker).expect("bundle marker writes");
     }
 
     /// Constructs a workspace around test-controlled staging and destination paths.
-    fn test_workspace(
-        staging: std::path::PathBuf,
-        destination: std::path::PathBuf,
-    ) -> HydrationWorkspace {
+    fn test_workspace(staging: PathBuf, destination: PathBuf) -> HydrationWorkspace {
         HydrationWorkspace {
             staging,
             destination,

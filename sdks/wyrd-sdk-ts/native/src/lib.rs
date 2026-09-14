@@ -9,8 +9,13 @@ use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
+use napi::Error;
+use napi::Result as NapiResult;
 use napi::bindgen_prelude::Buffer;
 use napi_derive::napi;
+use serde::Serialize;
+use serde_json::Value;
+use std::fmt::Display;
 use tokio::sync::Mutex as AsyncMutex;
 use wyrd_client::bifrost::Bifrost;
 use wyrd_client::bifrost::Correlation;
@@ -19,6 +24,7 @@ use wyrd_client::bifrost::{BifrostClientError, QueryResultStream};
 use wyrd_queue::QueueConfig;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
+use wyrd_spec::vala::api::PhysicalLayoutWire;
 use wyrd_spec::vala::api::{BifrostQueryRequest, FreshnessPolicy, VisibilityMode};
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::vala::ids::RunId;
@@ -86,7 +92,7 @@ impl NativeLifecycleResult {
     /// # Errors
     ///
     /// Returns a napi error when the canonical lifecycle value cannot be serialized.
-    fn success(value: &serde_json::Value) -> napi::Result<Self> {
+    fn success(value: &Value) -> NapiResult<Self> {
         Ok(Self {
             value_json: Some(serde_json::to_string(&value).map_err(napi_error)?),
             error_code: None,
@@ -103,7 +109,7 @@ impl NativeLifecycleResult {
     /// # Errors
     ///
     /// Returns a napi error when the successful value cannot be serialized.
-    fn outcome<T: serde::Serialize>(result: Result<T, WyrdError>) -> napi::Result<Self> {
+    fn outcome<T: Serialize>(result: Result<T, WyrdError>) -> NapiResult<Self> {
         match result {
             Ok(value) => Self::success(&serde_json::to_value(value).map_err(napi_error)?),
             Err(error) => Ok(Self::from_wyrd(&error)),
@@ -310,7 +316,7 @@ impl NativeTableConfig {
     /// # Errors
     ///
     /// Returns a napi error when the config or its schema cannot be encoded.
-    fn project(config: &TableConfig) -> napi::Result<Self> {
+    fn project(config: &TableConfig) -> NapiResult<Self> {
         let mut schema_ipc = Vec::new();
         {
             let mut writer =
@@ -335,7 +341,7 @@ impl NativeTableConfig {
     /// # Errors
     ///
     /// Returns a napi error when the text is not one serialized `TableConfig`.
-    fn parse(&self) -> napi::Result<TableConfig> {
+    fn parse(&self) -> NapiResult<TableConfig> {
         serde_json::from_str(&self.config_json).map_err(napi_error)
     }
 }
@@ -346,7 +352,7 @@ impl NativeTableConfig {
 ///
 /// Returns a napi error when the bytes are not one Arrow IPC stream carrying
 /// exactly one batch, which is what one logical write is.
-fn decode_batch_ipc(bytes: &[u8]) -> napi::Result<RecordBatch> {
+fn decode_batch_ipc(bytes: &[u8]) -> NapiResult<RecordBatch> {
     let mut reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)
         .map_err(napi_error)?;
     let batch = reader
@@ -380,8 +386,8 @@ pub fn table_config_from_json_schema(
     table: String,
     schema_json: String,
     layout_json: Option<String>,
-) -> napi::Result<NativeTableConfig> {
-    let schema: serde_json::Value = serde_json::from_str(&schema_json)
+) -> NapiResult<NativeTableConfig> {
+    let schema: Value = serde_json::from_str(&schema_json)
         .map_err(|error| napi::Error::from_reason(format!("invalid JSON schema: {error}")))?;
     let config = TableConfig::from_json_schema(&table, &schema).map_err(napi_error)?;
     NativeTableConfig::project(&apply_layout(config, layout_json.as_deref())?)
@@ -405,7 +411,7 @@ pub async fn describe_table_config(
     server_url: Option<String>,
     credential: Option<String>,
     grpc_url: Option<String>,
-) -> napi::Result<NativeTableConfigResult> {
+) -> NapiResult<NativeTableConfigResult> {
     let described = match wyrd_client::bifrost::client_from_options(
         server_url.as_deref(),
         credential.as_deref(),
@@ -431,14 +437,13 @@ pub async fn describe_table_config(
 /// # Errors
 ///
 /// Returns a napi error when the text is not one `PhysicalLayoutWire`.
-fn apply_layout(config: TableConfig, layout_json: Option<&str>) -> napi::Result<TableConfig> {
+fn apply_layout(config: TableConfig, layout_json: Option<&str>) -> NapiResult<TableConfig> {
     match layout_json {
         None => Ok(config),
         Some(layout) => {
-            let layout: wyrd_spec::vala::api::PhysicalLayoutWire = serde_json::from_str(layout)
-                .map_err(|error| {
-                    napi::Error::from_reason(format!("invalid physical layout: {error}"))
-                })?;
+            let layout: PhysicalLayoutWire = serde_json::from_str(layout).map_err(|error| {
+                napi::Error::from_reason(format!("invalid physical layout: {error}"))
+            })?;
             Ok(config.with_layout(layout))
         }
     }
@@ -475,7 +480,7 @@ pub async fn connect_bifrost(
     server_url: Option<String>,
     credential: Option<String>,
     grpc_url: Option<String>,
-) -> napi::Result<NativeBifrostConnection> {
+) -> NapiResult<NativeBifrostConnection> {
     let table = table.map(|table| table.parse()).transpose()?;
     let connected = match wyrd_client::bifrost::client_from_options(
         server_url.as_deref(),
@@ -509,7 +514,7 @@ impl NativeBifrost {
     /// no-active-table, fingerprint-conflict, and transport failures are
     /// returned in [`NativeLifecycleResult`].
     #[napi]
-    pub async fn register(&self) -> napi::Result<NativeLifecycleResult> {
+    pub async fn register(&self) -> NapiResult<NativeLifecycleResult> {
         match self.client.register().await {
             Ok(outcome) => NativeLifecycleResult::success(&serde_json::Value::String(
                 wyrd_client::bifrost::register_outcome_name(outcome).to_owned(),
@@ -530,7 +535,7 @@ impl NativeBifrost {
     // justification: napi boundary; a generated object argument arrives owned
     #[allow(clippy::needless_pass_by_value)]
     #[napi]
-    pub fn use_table(&self, table: NativeTableConfig) -> napi::Result<Option<NativeTableConfig>> {
+    pub fn use_table(&self, table: NativeTableConfig) -> NapiResult<Option<NativeTableConfig>> {
         self.client
             .use_table(table.parse()?)
             .as_ref()
@@ -549,7 +554,7 @@ impl NativeBifrost {
     // be passed by reference, so the generated binding requires an owned String
     #[allow(clippy::needless_pass_by_value)]
     #[napi]
-    pub async fn use_table_by_name(&self, table: String) -> napi::Result<NativeLifecycleResult> {
+    pub async fn use_table_by_name(&self, table: String) -> NapiResult<NativeLifecycleResult> {
         match self.client.use_table_by_name(&table).await {
             Ok(()) => NativeLifecycleResult::success(&serde_json::Value::Null),
             Err(error) => Ok(NativeLifecycleResult::failure(&error)),
@@ -562,7 +567,7 @@ impl NativeBifrost {
     ///
     /// Returns a napi error when the binding cannot be projected.
     #[napi(getter)]
-    pub fn table(&self) -> napi::Result<Option<NativeTableConfig>> {
+    pub fn table(&self) -> NapiResult<Option<NativeTableConfig>> {
         self.client
             .table()
             .as_ref()
@@ -589,7 +594,7 @@ impl NativeBifrost {
         row: String,
         card_ref: Option<String>,
         run_id: Option<String>,
-    ) -> napi::Result<NativeLifecycleResult> {
+    ) -> NapiResult<NativeLifecycleResult> {
         let correlation = correlation(card_ref.as_deref(), run_id)?;
         match self.client.insert(row.into_bytes(), correlation) {
             Ok(()) => NativeLifecycleResult::success(&serde_json::Value::Null),
@@ -616,7 +621,7 @@ impl NativeBifrost {
         &self,
         table: String,
         batch_ipc: Buffer,
-    ) -> napi::Result<NativeLifecycleResult> {
+    ) -> NapiResult<NativeLifecycleResult> {
         let batch = decode_batch_ipc(&batch_ipc)?;
         match self.client.write_batch(&table, &batch).await {
             Ok(()) => NativeLifecycleResult::success(&serde_json::Value::Null),
@@ -631,7 +636,7 @@ impl NativeBifrost {
     /// Returns a napi error only when the native result cannot be projected;
     /// producer and sink failures are returned in [`NativeLifecycleResult`].
     #[napi]
-    pub async fn flush(&self) -> napi::Result<NativeLifecycleResult> {
+    pub async fn flush(&self) -> NapiResult<NativeLifecycleResult> {
         match self.client.flush().await {
             Ok(()) => NativeLifecycleResult::success(&serde_json::Value::Null),
             Err(error) => Ok(NativeLifecycleResult::failure(&error)),
@@ -644,7 +649,7 @@ impl NativeBifrost {
     ///
     /// As [`NativeBifrost::flush`].
     #[napi]
-    pub async fn shutdown(&self) -> napi::Result<NativeLifecycleResult> {
+    pub async fn shutdown(&self) -> NapiResult<NativeLifecycleResult> {
         match self.client.shutdown().await {
             Ok(()) => NativeLifecycleResult::success(&serde_json::Value::Null),
             Err(error) => Ok(NativeLifecycleResult::failure(&error)),
@@ -668,7 +673,7 @@ impl NativeBifrost {
     /// Returns a napi error only when napi cannot project the structured
     /// startup result itself.
     #[napi]
-    pub async fn query(&self, request: NativeQueryRequest) -> napi::Result<NativeQueryStart> {
+    pub async fn query(&self, request: NativeQueryRequest) -> NapiResult<NativeQueryStart> {
         let request = BifrostQueryRequest {
             sql: request.sql,
             visibility: match parse_visibility(&request.visibility) {
@@ -700,7 +705,7 @@ impl NativeBifrost {
     /// Returns a napi error only when the native result cannot be projected;
     /// Wyrd control failures are returned in [`NativeLifecycleResult`].
     #[napi]
-    pub async fn running(&self) -> napi::Result<NativeLifecycleResult> {
+    pub async fn running(&self) -> NapiResult<NativeLifecycleResult> {
         match self.client.running().await {
             Ok(queries) => {
                 NativeLifecycleResult::success(&serde_json::to_value(queries).map_err(napi_error)?)
@@ -719,7 +724,7 @@ impl NativeBifrost {
     /// Returns a napi error only when the native result cannot be projected;
     /// validation and Wyrd control failures are returned in [`NativeLifecycleResult`].
     #[napi]
-    pub async fn status(&self, request_id: String) -> napi::Result<NativeLifecycleResult> {
+    pub async fn status(&self, request_id: String) -> NapiResult<NativeLifecycleResult> {
         let request_id = match parse_request_id(&request_id) {
             Ok(request_id) => request_id,
             Err(error) => {
@@ -744,7 +749,7 @@ impl NativeBifrost {
     /// Returns a napi error only when the native result cannot be projected;
     /// validation and Wyrd control failures are returned in [`NativeLifecycleResult`].
     #[napi]
-    pub async fn cancel(&self, request_id: String) -> napi::Result<NativeLifecycleResult> {
+    pub async fn cancel(&self, request_id: String) -> NapiResult<NativeLifecycleResult> {
         let request_id = match parse_request_id(&request_id) {
             Ok(request_id) => request_id,
             Err(error) => {
@@ -776,7 +781,7 @@ impl NativeBifrost {
         &self,
         namespace: String,
         name: String,
-    ) -> napi::Result<NativeLifecycleResult> {
+    ) -> NapiResult<NativeLifecycleResult> {
         match self.client.describe(&format!("{namespace}.{name}")).await {
             Ok(description) => NativeLifecycleResult::success(
                 &serde_json::to_value(description).map_err(napi_error)?,
@@ -827,7 +832,7 @@ impl NativeBifrostQueryStream {
     /// Returns a napi error carrying the stable Wyrd code for failed,
     /// incomplete, malformed, or transport-terminated streams.
     #[napi]
-    pub async fn next(&self) -> napi::Result<NativeQueryStep> {
+    pub async fn next(&self) -> NapiResult<NativeQueryStep> {
         let mut stream_slot = self.stream.lock().await;
         let stream = stream_slot
             .as_mut()
@@ -938,7 +943,7 @@ impl NativeBifrostQueryStream {
     ///
     /// Returns a napi error when the retaining lock is poisoned.
     #[napi(getter)]
-    pub fn schema_ipc(&self) -> napi::Result<Option<Buffer>> {
+    pub fn schema_ipc(&self) -> NapiResult<Option<Buffer>> {
         self.schema_ipc
             .lock()
             .map(|schema| schema.clone().map(Buffer::from))
@@ -946,8 +951,12 @@ impl NativeBifrostQueryStream {
     }
 
     /// Returns serialized terminal metadata after validated completion.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the terminal lock is poisoned.
     #[napi(getter)]
-    pub fn terminal_json(&self) -> napi::Result<Option<String>> {
+    pub fn terminal_json(&self) -> NapiResult<Option<String>> {
         self.terminal_json
             .lock()
             .map(|terminal| terminal.clone())
@@ -960,7 +969,7 @@ impl NativeBifrostQueryStream {
 /// # Errors
 ///
 /// Returns a napi error when `card_ref` is not one parsable Card reference.
-fn correlation(card_ref: Option<&str>, run_id: Option<String>) -> napi::Result<Correlation> {
+fn correlation(card_ref: Option<&str>, run_id: Option<String>) -> NapiResult<Correlation> {
     Ok(Correlation {
         card_ref: card_ref
             .map(str::parse)
@@ -1039,7 +1048,7 @@ fn parse_request_id(value: &str) -> Result<RequestId, BifrostClientError> {
 /// # Errors
 ///
 /// Returns a napi error when Arrow IPC encoding fails.
-fn encode_batch(batch: &RecordBatch) -> napi::Result<Vec<u8>> {
+fn encode_batch(batch: &RecordBatch) -> NapiResult<Vec<u8>> {
     let mut bytes = Vec::new();
     let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut bytes, batch.schema().as_ref())
         .map_err(napi_error)?;
@@ -1058,7 +1067,7 @@ fn encode_batch(batch: &RecordBatch) -> napi::Result<Vec<u8>> {
 /// # Errors
 ///
 /// Returns a napi error when IPC writing fails.
-fn encode_schema(schema: &SchemaRef) -> napi::Result<Vec<u8>> {
+fn encode_schema(schema: &SchemaRef) -> NapiResult<Vec<u8>> {
     let mut bytes = Vec::new();
     let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut bytes, schema.as_ref())
         .map_err(napi_error)?;
@@ -1071,7 +1080,7 @@ fn encode_schema(schema: &SchemaRef) -> napi::Result<Vec<u8>> {
 /// The catalog owns the public text, so the projection reads it from the
 /// problem document and falls back to the derive-backed field only if the
 /// payload omits the member.
-fn problem_field(problem: &serde_json::Value, key: &str, fallback: &str) -> String {
+fn problem_field(problem: &Value, key: &str, fallback: &str) -> String {
     problem
         .get(key)
         .and_then(serde_json::Value::as_str)
@@ -1080,7 +1089,7 @@ fn problem_field(problem: &serde_json::Value, key: &str, fallback: &str) -> Stri
 }
 
 /// Projects an SDK error with its stable code intact.
-fn sdk_error(error: &BifrostClientError) -> napi::Error {
+fn sdk_error(error: &BifrostClientError) -> Error {
     napi::Error::from_reason(format!(
         "[{}] {error}",
         wyrd_spec::error::WyrdError::from(error).code()
@@ -1088,6 +1097,6 @@ fn sdk_error(error: &BifrostClientError) -> napi::Error {
 }
 
 /// Converts an arbitrary boundary error into a napi failure.
-fn napi_error(error: impl std::fmt::Display) -> napi::Error {
+fn napi_error(error: impl Display) -> Error {
     napi::Error::from_reason(error.to_string())
 }

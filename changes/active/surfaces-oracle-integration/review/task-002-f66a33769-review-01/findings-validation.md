@@ -180,4 +180,3 @@ Independent verification added during Wave 2:
 - `mise run py:format:check` — PASS (`121 files already formatted`)
 - `mise run py:lints` — PASS (`All checks passed`)
 - `git diff --check 861f8d86c..f66a33769` — PASS
-

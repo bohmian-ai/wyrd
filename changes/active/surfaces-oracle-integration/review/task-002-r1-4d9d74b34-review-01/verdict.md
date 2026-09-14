@@ -85,4 +85,3 @@ advice, and none requires a specification revision.
 The five validated findings are bounded corrections within approved behavior.
 They require no new product, public API, architecture, security, compatibility,
 cross-service, concurrency, resource-ownership, or persistent-data decision.
-

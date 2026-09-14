@@ -48,7 +48,9 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
 use datafusion_distributed::SessionStateBuilderExt as _;
 use datafusion_distributed::{DistributedExt as _, WorkerResolver};
-use datafusion_distributed::{Worker, WorkerQueryContext, WorkerSessionBuilder};
+use datafusion_distributed::{
+    LocalWorkerContext, Worker, WorkerQueryContext, WorkerSessionBuilder,
+};
 use http::HeaderMap;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -518,6 +520,16 @@ pub struct AnalyticalSessionBuilder {
     leaf: super::codec::AnalyticalLeafBinding,
     /// Outbound capability this node's own middle stages sign through.
     egress: Arc<AnalyticalStageEgress>,
+    /// Local-worker context installed in place of upstream's own.
+    ///
+    /// Upstream gives every follower session a context owning a clone of the
+    /// graph's worker, and that worker's task cache owns the session: a cycle
+    /// that keeps the query `RuntimeEnv`, its pool, and its spill directory
+    /// alive after settlement, because the cache only releases an invalidated
+    /// entry on a later cache operation a settled graph never makes. This one
+    /// wraps an empty worker at an address no peer advertises, so the cycle
+    /// cannot form and every stage operation takes the governed peer transport.
+    detached_local_worker: Arc<LocalWorkerContext>,
 }
 
 impl fmt::Debug for AnalyticalSessionBuilder {
@@ -531,16 +543,26 @@ impl fmt::Debug for AnalyticalSessionBuilder {
 
 impl AnalyticalSessionBuilder {
     /// Binds the builder to one node-local runtime registry.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: the detached local-worker address is a fixed literal
+    /// that always parses.
     #[must_use]
     pub fn new(
         registry: Arc<AnalyticalRuntimeRegistry>,
         leaf: super::codec::AnalyticalLeafBinding,
         egress: Arc<AnalyticalStageEgress>,
     ) -> Self {
+        let detached_url = Url::parse("detached://oracle.invalid")
+            .expect("the detached worker address is a valid URL");
         Self {
             registry,
             leaf,
             egress,
+            detached_local_worker: Arc::new(
+                Worker::default().to_local_worker_context(detached_url),
+            ),
         }
     }
 
@@ -620,6 +642,7 @@ impl WorkerSessionBuilder for AnalyticalSessionBuilder {
             config.set_distributed_worker_resolver(AnalyticalWorkerResolver { urls });
             config.set_distributed_channel_resolver(resolver);
         }
+        config.set_extension(Arc::clone(&self.detached_local_worker));
         builder = builder.with_config(config);
         Ok(builder
             .with_runtime_env(Arc::clone(graph.runtime()))

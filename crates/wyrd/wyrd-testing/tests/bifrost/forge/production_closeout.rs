@@ -899,8 +899,7 @@ impl CloseoutJourney {
     ///
     /// # Panics
     /// Panics on absent or unsettled operation evidence, on two plans sharing
-    /// one operation identity, on an unfinished ownership gauge, or on missing
-    /// physical data-flow counters.
+    /// one operation identity, or on missing physical data-flow counters.
     async fn assert_rewrite_evidence(&self, tenant: DataTenantId, expected: usize) -> usize {
         let mut conn = self
             .coordinator()
@@ -960,12 +959,6 @@ impl CloseoutJourney {
                         .is_some_and(|kind| kind == "small_files")),
                 "{family}"
             );
-        }
-        for sample in metrics
-            .iter()
-            .filter(|sample| sample.family == "bifrost_forge_active_tasks")
-        {
-            assert_eq!(sample.value, 0.0, "settled ownership: {sample:?}");
         }
         let authority = self
             .oracle()
@@ -1416,7 +1409,20 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
         journey.snapshot_count(&table.binding).await - published_before,
         "every snapshot the rewrite passes published carries its own operation"
     );
+    // Audited reads above keep publishing retained audit, so the coordinator
+    // can plan and start audit-log maintenance after the last drain. Ownership
+    // is therefore judged once every role has drained, when every attempt
+    // guard must have returned its increment.
+    let telemetry = journey.cluster.telemetry().clone();
     journey.cluster.shutdown().await.expect("all roles drain");
+    for sample in telemetry
+        .snapshot()
+        .expect("production metrics")
+        .iter()
+        .filter(|sample| sample.family == "bifrost_forge_active_tasks")
+    {
+        assert_eq!(sample.value, 0.0, "settled ownership: {sample:?}");
+    }
 }
 
 /// Owns two tenants and the real old cut held across destructive maintenance.

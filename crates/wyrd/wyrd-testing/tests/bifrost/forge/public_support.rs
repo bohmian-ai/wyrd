@@ -246,8 +246,6 @@ pub(crate) async fn read_managed_rows(
 ) -> Vec<ManagedRow> {
     let sql = format!("SELECT wyrd_batch_id, wyrd_row_ordinal, value FROM {table}");
     let mut stream = wyrd_client::Bifrost::query_only(client)
-        .query_client()
-        .clone()
         .query(&strict_fused(sql.clone()))
         .await
         .unwrap_or_else(|error| panic!("public query `{sql}` starts: {error}"));
@@ -328,8 +326,6 @@ pub(crate) async fn try_read(
 ) -> Result<Vec<ManagedRow>, wyrd_client::bifrost::BifrostClientError> {
     let sql = format!("SELECT wyrd_batch_id, wyrd_row_ordinal, value FROM {table}");
     let mut stream = wyrd_client::Bifrost::query_only(client)
-        .query_client()
-        .clone()
         .query(&strict_fused(sql))
         .await?;
     let mut rows = Vec::new();

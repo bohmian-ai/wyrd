@@ -23,7 +23,6 @@ use sha2::{Digest as _, Sha256};
 use vala_bifrost_redux::oracle::{QueryIpcDecoder, QueryResourceProbe, QueryResourceSnapshot};
 use vala_bifrost_redux::resources::{ResourceSource, SystemResourceSnapshot};
 use wyrd_client::WyrdClient;
-use wyrd_client::bifrost::QueryClient;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{
     BifrostQueryRequest, FreshnessPolicy, QueryStreamFrame, QueryTerminalOutcome, VisibilityMode,
@@ -353,8 +352,6 @@ async fn prove_interactive_window(
     let capture = coordinator.capture_next_query_resource_probe();
 
     let mut stream = wyrd_client::Bifrost::query_only(&client)
-        .query_client()
-        .clone()
         .query(&BifrostQueryRequest {
             // A flat bounded projection on purpose. Any global operator — a
             // sort, an aggregate, a join — is a "complex" plan, which the
@@ -1306,9 +1303,7 @@ async fn prove_memory_refusal_preserves_health() -> Result<(), JourneyError> {
     server.stall_next_query_after_schema();
     server.hold_next_query_memory(root_limit.saturating_sub(REFUSAL_HOLDER_HEADROOM_BYTES))?;
     let holder = client(server, "memory-refusal-holder").await?;
-    let holder_query = wyrd_client::Bifrost::query_only(&holder)
-        .query_client()
-        .clone();
+    let holder_query = wyrd_client::Bifrost::query_only(&holder);
     let stream = holder_query
         .query(&BifrostQueryRequest {
             sql: format!("SELECT id FROM vala.bifrost.{table}"),
@@ -1338,9 +1333,7 @@ async fn prove_memory_refusal_preserves_health() -> Result<(), JourneyError> {
 
     let refused = client(server, "memory-refusal-reader").await?;
     let refusal = drain_query(
-        &wyrd_client::Bifrost::query_only(&refused)
-            .query_client()
-            .clone(),
+        &wyrd_client::Bifrost::query_only(&refused),
         &format!(
             "SELECT REPEAT('x', {REFUSAL_SORT_KEY_BYTES}) || CAST(id AS VARCHAR) AS wide_key \
              FROM vala.bifrost.{table} ORDER BY wide_key"
@@ -1394,7 +1387,7 @@ async fn prove_memory_refusal_preserves_health() -> Result<(), JourneyError> {
 /// # Errors
 ///
 /// Returns the rendered refusal when the statement does not complete.
-async fn drain_query(query: &QueryClient, sql: &str) -> Result<u64, String> {
+async fn drain_query(query: &wyrd_client::Bifrost, sql: &str) -> Result<u64, String> {
     let mut stream = query
         .query(&BifrostQueryRequest {
             sql: sql.to_owned(),
@@ -1601,8 +1594,6 @@ async fn hold_envelope(
 ) -> Result<tokio::task::JoinHandle<()>, JourneyError> {
     server.stall_next_query_after_schema();
     let stream = wyrd_client::Bifrost::query_only(client)
-        .query_client()
-        .clone()
         .query(&BifrostQueryRequest {
             sql: sql.to_owned(),
             visibility: VisibilityMode::PublishedOnly,
@@ -1664,15 +1655,10 @@ async fn prove_saturated_pod_refuses_retryably(
             ("analytical", scheduling_analytical_sql(&tables[index])),
         ] {
             let started = std::time::Instant::now();
-            let refusal = drain_query(
-                &wyrd_client::Bifrost::query_only(client)
-                    .query_client()
-                    .clone(),
-                &sql,
-            )
-            .await
-            .err()
-            .ok_or_else(|| format!("the saturated pod admitted another {label} query"))?;
+            let refusal = drain_query(&wyrd_client::Bifrost::query_only(client), &sql)
+                .await
+                .err()
+                .ok_or_else(|| format!("the saturated pod admitted another {label} query"))?;
             if !refusal.contains(QUERY_ADMISSION_REJECTED_CODE) {
                 return Err(format!(
                     "the saturated pod refused a {label} query with {refusal}, not the retryable \
@@ -1709,12 +1695,8 @@ async fn prove_rotation_serves_both_tenants(
 ) -> Result<(), JourneyError> {
     let mut served = vec![0_usize; clients.len()];
     for _ in 0..SCHEDULING_ROTATION_ROUNDS {
-        let first_query = wyrd_client::Bifrost::query_only(&clients[0])
-            .query_client()
-            .clone();
-        let second_query = wyrd_client::Bifrost::query_only(&clients[1])
-            .query_client()
-            .clone();
+        let first_query = wyrd_client::Bifrost::query_only(&clients[0]);
+        let second_query = wyrd_client::Bifrost::query_only(&clients[1]);
         let first_sql = scheduling_interactive_sql(&tables[0]);
         let second_sql = scheduling_interactive_sql(&tables[1]);
         let (first, second) = tokio::join!(
@@ -1769,9 +1751,7 @@ async fn prove_analytical_cannot_cross_the_interactive_floor(
 ) -> Result<(), JourneyError> {
     let parked = hold_envelope(server, &clients[0], &scheduling_analytical_sql(&tables[0])).await?;
     let refusal = drain_query(
-        &wyrd_client::Bifrost::query_only(&clients[1])
-            .query_client()
-            .clone(),
+        &wyrd_client::Bifrost::query_only(&clients[1]),
         &scheduling_analytical_sql(&tables[1]),
     )
     .await
@@ -1785,9 +1765,7 @@ async fn prove_analytical_cannot_cross_the_interactive_floor(
     }
     for (index, client) in clients.iter().enumerate() {
         let rows = drain_query(
-            &wyrd_client::Bifrost::query_only(client)
-                .query_client()
-                .clone(),
+            &wyrd_client::Bifrost::query_only(client),
             &scheduling_interactive_sql(&tables[index]),
         )
         .await
@@ -1811,9 +1789,7 @@ async fn prove_both_classes_progress(
     tables: &[String],
 ) -> Result<(), JourneyError> {
     for (index, client) in clients.iter().enumerate() {
-        let query = wyrd_client::Bifrost::query_only(client)
-            .query_client()
-            .clone();
+        let query = wyrd_client::Bifrost::query_only(client);
         for (label, sql, expected) in [
             (
                 "interactive",
@@ -1936,9 +1912,7 @@ async fn prove_queue_is_fifo_and_tenant_rotated() -> Result<(), JourneyError> {
     // land inside the first waiter's bounded queue wait.
     for (index, client) in clients.iter().enumerate() {
         drain_query(
-            &wyrd_client::Bifrost::query_only(client)
-                .query_client()
-                .clone(),
+            &wyrd_client::Bifrost::query_only(client),
             &scheduling_interactive_sql(&tables[index]),
         )
         .await
@@ -1963,9 +1937,7 @@ async fn prove_queue_is_fifo_and_tenant_rotated() -> Result<(), JourneyError> {
     for (label, tenant) in [("first-older", 0), ("second", 1), ("first-newer", 0)] {
         // The ring visits tenants in first-enqueue order, so the first tenant's
         // older request must be enqueued before the second tenant appears.
-        let query = wyrd_client::Bifrost::query_only(&clients[tenant])
-            .query_client()
-            .clone();
+        let query = wyrd_client::Bifrost::query_only(&clients[tenant]);
         let sql = scheduling_interactive_sql(&tables[tenant]);
         let order = Arc::clone(&order);
         waiters.push(tokio::spawn(async move {

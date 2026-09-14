@@ -20,7 +20,6 @@ use vala_bifrost_redux::oracle::analytical::{
     AnalyticalCleanupPause, AnalyticalLiveInspection, analytical_cleanup_pause_for_test,
 };
 use wyrd_client::WyrdClient;
-use wyrd_client::bifrost::QueryClient;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
@@ -233,9 +232,7 @@ async fn prove_cleanup_ownership() -> Result<(), JourneyError> {
             .engine(),
     );
     let public = client(query_server, "analytical-cleanup-reader").await?;
-    let query = wyrd_client::Bifrost::query_only(&public)
-        .query_client()
-        .clone();
+    let query = wyrd_client::Bifrost::query_only(&public);
 
     let plain = format!("SELECT id FROM vala.bifrost.{table} WHERE filter_key = 'group_0'");
     let grouped = format!(
@@ -279,7 +276,7 @@ async fn prove_cleanup_ownership() -> Result<(), JourneyError> {
 ///
 /// Returns the dispatch failure, naming the case, when the retry also fails.
 async fn dispatch(
-    query: &QueryClient,
+    query: &wyrd_client::Bifrost,
     sql: &str,
     case: &str,
 ) -> Result<wyrd_client::bifrost::QueryResultStream, JourneyError> {
@@ -315,14 +312,7 @@ async fn prove_paused_cleanup(
     let case = "http selected analytical";
     let pause = analytical_cleanup_pause_for_test();
     pause.arm();
-    let mut stream = dispatch(
-        &wyrd_client::Bifrost::query_only(public)
-            .query_client()
-            .clone(),
-        sql,
-        case,
-    )
-    .await?;
+    let mut stream = dispatch(&wyrd_client::Bifrost::query_only(public), sql, case).await?;
     let request_id = stream.request_id().clone();
     stream
         .next_batch()
@@ -335,9 +325,7 @@ async fn prove_paused_cleanup(
     let observer = client(server, "analytical-cleanup-http-observer").await?;
     hold_and_release(
         cluster,
-        &wyrd_client::Bifrost::query_only(&observer)
-            .query_client()
-            .clone(),
+        &wyrd_client::Bifrost::query_only(&observer),
         &request_id,
         &pause,
         case,
@@ -421,9 +409,7 @@ async fn prove_paused_cleanup_over_grpc(
     let observer = client(server, "analytical-cleanup-grpc-observer").await?;
     hold_and_release(
         cluster,
-        &wyrd_client::Bifrost::query_only(&observer)
-            .query_client()
-            .clone(),
+        &wyrd_client::Bifrost::query_only(&observer),
         &request_id,
         &pause,
         case,
@@ -441,7 +427,7 @@ async fn prove_paused_cleanup_over_grpc(
 /// Returns a timeout, transport, ownership, or assertion error naming the case.
 async fn hold_and_release(
     cluster: &WyrdTestCluster,
-    query: &QueryClient,
+    query: &wyrd_client::Bifrost,
     request_id: &RequestId,
     pause: &AnalyticalCleanupPause,
     case: &str,
@@ -524,8 +510,6 @@ struct PublicSettlement {
 /// Returns a transport, protocol, Arrow, or missing-terminal error.
 async fn run_public(client: &WyrdClient, sql: &str) -> Result<PublicSettlement, JourneyError> {
     let mut stream = wyrd_client::Bifrost::query_only(client)
-        .query_client()
-        .clone()
         .query(&request(sql))
         .await?;
     let deadline_ms = stream.deadline_ms();
@@ -559,8 +543,6 @@ async fn run_self_join(
     sql: &str,
 ) -> Result<(PublicSettlement, Vec<(i64, i64, i32)>), JourneyError> {
     let mut stream = wyrd_client::Bifrost::query_only(client)
-        .query_client()
-        .clone()
         .query(&request(sql))
         .await?;
     let deadline_ms = stream.deadline_ms();
@@ -1246,8 +1228,6 @@ async fn prove_public_activation() -> Result<(), JourneyError> {
 
     // Finite result pressure fails safely rather than truncating.
     match wyrd_client::Bifrost::query_only(&client)
-        .query_client()
-        .clone()
         .collect_bounded(
             &request(&analytical_sql),
             wyrd_client::bifrost::CollectedQueryLimits {
@@ -1339,8 +1319,6 @@ async fn prove_under_privileged_refusal() -> Result<(), JourneyError> {
         .await?;
     let denied = client_from_bootstrap(query_server, bootstrap).await?;
     let error = wyrd_client::Bifrost::query_only(&denied)
-        .query_client()
-        .clone()
         .query(&request(&grouped))
         .await
         .err()
@@ -1353,8 +1331,6 @@ async fn prove_under_privileged_refusal() -> Result<(), JourneyError> {
         .into());
     }
     if !wyrd_client::Bifrost::query_only(&denied)
-        .query_client()
-        .clone()
         .running()
         .await
         .is_err_and(|error| sdk_status(&error) == 403)
@@ -1421,8 +1397,6 @@ async fn prove_selected_failure_is_terminal() -> Result<(), JourneyError> {
         // Wyrd error, not an anonymous transport break or a truncated success.
         tokio::spawn(async move {
             let mut stream = wyrd_client::Bifrost::query_only(&client)
-                .query_client()
-                .clone()
                 .query(&request(&sql))
                 .await?;
             let mut rows = 0_usize;

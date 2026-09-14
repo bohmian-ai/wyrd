@@ -351,8 +351,6 @@ async fn query_terminal_either_surface(
     sql: String,
 ) -> Result<(u64, QueryTerminalOutcome, Option<QueryTerminalErrorCode>), JourneyError> {
     let opened = wyrd_client::Bifrost::query_only(client)
-        .query_client()
-        .clone()
         .query(&BifrostQueryRequest {
             sql,
             visibility: VisibilityMode::PublishedOnly,
@@ -834,8 +832,6 @@ fn expected_marked_ids() -> Vec<i64> {
 /// not a non-null `Int64`.
 async fn query_ids(client: &WyrdClient, sql: String) -> Result<Vec<i64>, JourneyError> {
     let mut stream = wyrd_client::Bifrost::query_only(client)
-        .query_client()
-        .clone()
         .query(&BifrostQueryRequest {
             sql,
             visibility: VisibilityMode::PublishedOnly,

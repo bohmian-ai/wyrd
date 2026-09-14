@@ -570,8 +570,6 @@ async fn coordinate_public_query(
         ..ClientConfig::default()
     })?;
     let mut stream = wyrd_client::Bifrost::query_only(&client)
-        .query_client()
-        .clone()
         .query(&BifrostQueryRequest {
             sql: format!("SELECT id FROM vala.bifrost.{table} ORDER BY id"),
             visibility: VisibilityMode::PublishedOnly,

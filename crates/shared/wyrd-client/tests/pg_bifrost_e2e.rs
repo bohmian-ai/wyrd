@@ -26,7 +26,7 @@ mod pg_tests {
     use wyrd_client::WyrdClient;
     use wyrd_client::bifrost::{
         Bifrost, BifrostGrpcTransport, BifrostIngestSink, BifrostTransportConfig, Correlation,
-        IngestTransport, QueryClient, TableConfig, observe,
+        IngestTransport, TableConfig, observe,
     };
     use wyrd_client::config::ClientConfig;
     use wyrd_client::transport::{GrpcConfig, HttpConfig};
@@ -258,7 +258,7 @@ mod pg_tests {
     /// Runs one HTTP query into the deterministic schema stall and returns its owner task.
     async fn stalled_query(
         srv: &WyrdTestServer,
-        query: &QueryClient,
+        query: &wyrd_client::Bifrost,
         table_fqn: &str,
     ) -> (RequestId, tokio::task::JoinHandle<()>) {
         srv.stall_next_query_after_schema();
@@ -285,15 +285,9 @@ mod pg_tests {
     pub(super) async fn oracle_query_status_cancel_impl() {
         let (srv, client, other_client, denied_client, other_tenant, table_fqn) =
             lifecycle_fixture().await;
-        let query = wyrd_client::Bifrost::query_only(&client)
-            .query_client()
-            .clone();
-        let other_query = wyrd_client::Bifrost::query_only(&other_client)
-            .query_client()
-            .clone();
-        let denied_query = wyrd_client::Bifrost::query_only(&denied_client)
-            .query_client()
-            .clone();
+        let query = wyrd_client::Bifrost::query_only(&client);
+        let other_query = wyrd_client::Bifrost::query_only(&other_client);
+        let denied_query = wyrd_client::Bifrost::query_only(&denied_client);
         let (request_id, task) = stalled_query(&srv, &query, &table_fqn).await;
 
         let running = query.running().await.expect("running list");
@@ -486,9 +480,7 @@ mod pg_tests {
 
         let (srv, client, other_client, denied_client, other_tenant, table_fqn) =
             lifecycle_fixture().await;
-        let query = wyrd_client::Bifrost::query_only(&client)
-            .query_client()
-            .clone();
+        let query = wyrd_client::Bifrost::query_only(&client);
         let (request_id, task) = stalled_query(&srv, &query, &table_fqn).await;
         let channel =
             wyrd_tonic::tonic::transport::Endpoint::from_shared(srv.grpc_url().expect("gRPC URL"))
@@ -843,8 +835,6 @@ mod pg_tests {
             deadline_ms: None,
         };
         let mut stream = wyrd_client::Bifrost::query_only(client)
-            .query_client()
-            .clone()
             .query(&request)
             .await
             .expect("Oracle query starts");
@@ -945,8 +935,6 @@ mod pg_tests {
             deadline_ms: None,
         };
         let mut stream = wyrd_client::Bifrost::query_only(client)
-            .query_client()
-            .clone()
             .query(&request)
             .await
             .expect("Oracle query starts");
@@ -1067,14 +1055,12 @@ mod pg_tests {
         config.grpc.endpoint = srv.grpc_url().expect("gRPC URL");
         config.grpc.connect_retries = 0;
         let client = WyrdClient::with_config(config).expect("SDK client");
-        let query = wyrd_client::Bifrost::query_only(&client)
-            .query_client()
-            .clone();
+        let query = wyrd_client::Bifrost::query_only(&client);
 
         // The canonical signal table: its description must reproduce the
         // registry's own physical schema rather than an approximation of it.
         let canonical = query
-            .describe_table("vala.traces", "spans")
+            .describe("vala.traces.spans")
             .await
             .expect("describe the canonical span table");
         let definition = vala_bifrost_redux::tables::builtin_table("traces", "spans")
@@ -1163,7 +1149,7 @@ mod pg_tests {
         // The dynamic table: a batch built straight from its description is
         // accepted by the real ingest wire and lands durably.
         let dynamic = query
-            .describe_table("vala.bifrost", &table_name)
+            .describe(&format!("vala.bifrost.{table_name}"))
             .await
             .expect("describe the dynamic journey table");
         assert!(

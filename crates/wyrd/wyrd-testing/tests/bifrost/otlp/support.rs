@@ -1007,8 +1007,6 @@ impl OtlpJourney {
         sql: &str,
     ) -> Vec<RecordBatch> {
         let mut stream = wyrd_client::Bifrost::query_only(client)
-            .query_client()
-            .clone()
             .query(&wyrd_spec::vala::api::BifrostQueryRequest {
                 sql: sql.to_owned(),
                 visibility: wyrd_spec::vala::api::VisibilityMode::Fused,
@@ -1045,8 +1043,6 @@ impl OtlpJourney {
     /// Panics when an accepted query does not stream to completion.
     pub(super) async fn try_query(&self, sql: &str) -> Result<Vec<RecordBatch>, String> {
         let mut stream = match wyrd_client::Bifrost::query_only(&self.client)
-            .query_client()
-            .clone()
             .query(&wyrd_spec::vala::api::BifrostQueryRequest {
                 sql: sql.to_owned(),
                 visibility: wyrd_spec::vala::api::VisibilityMode::Fused,

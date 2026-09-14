@@ -14,14 +14,18 @@ use crate::config::ClientConfig;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use wyrd_queue::QueueConfig;
+use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
-    BifrostQueryRequest, BifrostTableDescription, FreshnessPolicy, QueryTerminalFrame,
-    RegisterOutcome, RegisterTableResponse, VisibilityMode,
+    BifrostQueryRequest, BifrostTableDescription, CancelRunningQueryResponse, FreshnessPolicy,
+    QueryTerminalFrame, RegisterOutcome, RegisterTableResponse, RunningQuerySummary,
+    VisibilityMode,
 };
 
 use crate::bifrost::grpc::BifrostGrpcTransport;
 use crate::bifrost::handle::WriterPool;
-use crate::bifrost::query::{BifrostClientError, QueryClient, QueryResultStream};
+use crate::bifrost::query::{
+    BifrostClientError, CollectedQueryLimits, CollectedQueryResult, QueryClient, QueryResultStream,
+};
 use crate::bifrost::scope::ClientScope;
 use crate::bifrost::sink::BifrostIngestSink;
 use crate::bifrost::table::{Correlation, TableConfig};
@@ -464,22 +468,106 @@ impl Bifrost {
     ///
     /// Abandoning the future abandons the request before any row is read.
     pub async fn stream(&self, query: &str) -> Result<QueryResultStream, BifrostClientError> {
-        self.query
-            .query(&BifrostQueryRequest {
-                sql: query.to_owned(),
-                visibility: VisibilityMode::PublishedOnly,
-                freshness: FreshnessPolicy::Strict,
-                deadline_ms: None,
-            })
-            .await
+        self.query(&BifrostQueryRequest {
+            sql: query.to_owned(),
+            visibility: VisibilityMode::PublishedOnly,
+            freshness: FreshnessPolicy::Strict,
+            deadline_ms: None,
+        })
+        .await
     }
 
-    /// Escape hatch to the query plane's lifecycle surface: running, status,
-    /// cancel, describe, and the raw request form [`Self::sql`] and
-    /// [`Self::stream`] wrap.
-    #[must_use]
-    pub fn query_client(&self) -> &QueryClient {
-        &self.query
+    /// Start one query from a complete request and return its batches as they arrive.
+    ///
+    /// The raw form [`Self::stream`] and [`Self::sql`] wrap: the caller chooses
+    /// visibility, freshness, and deadline. The request is validated before any
+    /// IO, and the returned stream owns the HTTP response body.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stable invalid-SQL error for an invalid request, and the
+    /// authentication, authorization, availability, or protocol error the
+    /// transport reported.
+    ///
+    /// # Cancellation
+    ///
+    /// Abandoning the future abandons the request; dropping the returned stream
+    /// cancels response-body consumption.
+    pub async fn query(
+        &self,
+        request: &BifrostQueryRequest,
+    ) -> Result<QueryResultStream, BifrostClientError> {
+        self.query.query(request).await
+    }
+
+    /// Run one query and collect it within explicit row and encoded-byte limits.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::query`], plus failed-terminal, incomplete-stream, Arrow, and
+    /// bounds errors. Exceeding a bound drops the live stream and never returns
+    /// truncated success.
+    ///
+    /// # Cancellation
+    ///
+    /// Abandoning the future drops the response stream and its HTTP body.
+    pub async fn collect_bounded(
+        &self,
+        request: &BifrostQueryRequest,
+        limits: CollectedQueryLimits,
+    ) -> Result<CollectedQueryResult, BifrostClientError> {
+        self.query.collect_bounded(request, limits).await
+    }
+
+    /// List the active queries visible to the authenticated tenant.
+    ///
+    /// # Errors
+    ///
+    /// Returns stable authentication, authorization, audit, availability, or
+    /// protocol errors.
+    ///
+    /// # Cancellation
+    ///
+    /// Abandoning the future abandons the request without client-owned state.
+    pub async fn running(&self) -> Result<Vec<RunningQuerySummary>, BifrostClientError> {
+        self.query.running().await
+    }
+
+    /// Get one active query visible to the authenticated tenant.
+    ///
+    /// # Errors
+    ///
+    /// Returns stable authentication, authorization, not-found, availability,
+    /// or protocol errors.
+    ///
+    /// # Cancellation
+    ///
+    /// Abandoning the future leaves the active query unchanged.
+    pub async fn status(
+        &self,
+        request_id: &RequestId,
+    ) -> Result<RunningQuerySummary, BifrostClientError> {
+        self.query.status(request_id).await
+    }
+
+    /// Request server-side cancellation of one active query.
+    ///
+    /// Does not close any local response stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns stable authentication, authorization, not-found, availability,
+    /// or protocol errors.
+    ///
+    /// # Cancellation
+    ///
+    /// Once the server accepts cancellation, abandoning the future does not
+    /// reverse the server-side transition.
+    pub async fn cancel(
+        &self,
+        request_id: &RequestId,
+    ) -> Result<CancelRunningQueryResponse, BifrostClientError> {
+        self.query.cancel(request_id).await
     }
 
     /// Read one registered table's server-owned description.

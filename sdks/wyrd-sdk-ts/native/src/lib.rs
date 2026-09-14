@@ -690,7 +690,7 @@ impl NativeBifrost {
                 Err(error) => return Ok(NativeQueryStart::failure(&error)),
             },
         };
-        Ok(match self.client.query_client().query(&request).await {
+        Ok(match self.client.query(&request).await {
             Ok(stream) => NativeQueryStart::success(stream),
             Err(error) => NativeQueryStart::failure(&error),
         })
@@ -707,7 +707,7 @@ impl NativeBifrost {
     /// Wyrd control failures are returned in [`NativeLifecycleResult`].
     #[napi]
     pub async fn running(&self) -> napi::Result<NativeLifecycleResult> {
-        match self.client.query_client().running().await {
+        match self.client.running().await {
             Ok(queries) => {
                 NativeLifecycleResult::success(&serde_json::to_value(queries).map_err(napi_error)?)
             }
@@ -732,7 +732,7 @@ impl NativeBifrost {
                 return Ok(NativeLifecycleResult::failure(&error));
             }
         };
-        match self.client.query_client().status(&request_id).await {
+        match self.client.status(&request_id).await {
             Ok(summary) => {
                 NativeLifecycleResult::success(&serde_json::to_value(summary).map_err(napi_error)?)
             }
@@ -757,7 +757,7 @@ impl NativeBifrost {
                 return Ok(NativeLifecycleResult::failure(&error));
             }
         };
-        match self.client.query_client().cancel(&request_id).await {
+        match self.client.cancel(&request_id).await {
             Ok(response) => {
                 NativeLifecycleResult::success(&serde_json::to_value(response).map_err(napi_error)?)
             }
@@ -783,12 +783,7 @@ impl NativeBifrost {
         namespace: String,
         name: String,
     ) -> napi::Result<NativeLifecycleResult> {
-        match self
-            .client
-            .query_client()
-            .describe_table(&namespace, &name)
-            .await
-        {
+        match self.client.describe(&format!("{namespace}.{name}")).await {
             Ok(description) => NativeLifecycleResult::success(
                 &serde_json::to_value(description).map_err(napi_error)?,
             ),

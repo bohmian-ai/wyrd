@@ -1185,8 +1185,6 @@ async fn public_query(
     sql: &str,
 ) -> Result<Vec<std::collections::BTreeMap<String, String>>, PeerJourneyError> {
     let mut stream = wyrd_client::Bifrost::query_only(client)
-        .query_client()
-        .clone()
         .query(&BifrostQueryRequest {
             sql: sql.to_owned(),
             visibility: VisibilityMode::PublishedOnly,

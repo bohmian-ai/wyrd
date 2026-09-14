@@ -10,10 +10,16 @@
 use crate::WyrdClient;
 use arrow::record_batch::RecordBatch;
 use wyrd_queue::QueueConfig;
-use wyrd_spec::vala::api::{BifrostTableDescription, RegisterOutcome};
+use wyrd_spec::request_id::RequestId;
+use wyrd_spec::vala::api::{
+    BifrostQueryRequest, BifrostTableDescription, CancelRunningQueryResponse, RegisterOutcome,
+    RunningQuerySummary,
+};
 
 use crate::bifrost::facade::QueryResult;
-use crate::bifrost::query::{BifrostClientError, QueryClient, QueryResultStream};
+use crate::bifrost::query::{
+    BifrostClientError, CollectedQueryLimits, CollectedQueryResult, QueryResultStream,
+};
 use crate::bifrost::table::{Correlation, TableConfig};
 
 /// The synchronous [`crate::bifrost::Bifrost`].
@@ -182,15 +188,64 @@ impl Bifrost {
         block_on(self.inner.describe(fqn))
     }
 
-    /// Escape hatch to the query plane's lifecycle surface: running, status,
-    /// cancel, and the raw request form `sql` and `stream` wrap.
+    /// Start one query from a complete request and iterate its batches.
     ///
-    /// The async client's own [`QueryClient`], not a second implementation: its
-    /// methods are futures a caller drives on whatever runtime it already has,
-    /// so the blocking facade adds no advanced-query behavior of its own.
-    #[must_use]
-    pub fn query_client(&self) -> &QueryClient {
-        self.inner.query_client()
+    /// # Errors
+    ///
+    /// As [`crate::bifrost::Bifrost::query`].
+    pub fn query(
+        &self,
+        request: &BifrostQueryRequest,
+    ) -> Result<BlockingQueryStream, BifrostClientError> {
+        Ok(BlockingQueryStream {
+            inner: block_on(self.inner.query(request))?,
+        })
+    }
+
+    /// Run one query and collect it within explicit limits.
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::bifrost::Bifrost::collect_bounded`].
+    pub fn collect_bounded(
+        &self,
+        request: &BifrostQueryRequest,
+        limits: CollectedQueryLimits,
+    ) -> Result<CollectedQueryResult, BifrostClientError> {
+        block_on(self.inner.collect_bounded(request, limits))
+    }
+
+    /// List the active queries visible to the authenticated tenant.
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::bifrost::Bifrost::running`].
+    pub fn running(&self) -> Result<Vec<RunningQuerySummary>, BifrostClientError> {
+        block_on(self.inner.running())
+    }
+
+    /// Get one active query visible to the authenticated tenant.
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::bifrost::Bifrost::status`].
+    pub fn status(
+        &self,
+        request_id: &RequestId,
+    ) -> Result<RunningQuerySummary, BifrostClientError> {
+        block_on(self.inner.status(request_id))
+    }
+
+    /// Request server-side cancellation of one active query.
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::bifrost::Bifrost::cancel`].
+    pub fn cancel(
+        &self,
+        request_id: &RequestId,
+    ) -> Result<CancelRunningQueryResponse, BifrostClientError> {
+        block_on(self.inner.cancel(request_id))
     }
 
     /// The async client underneath, for a caller that acquires a runtime later.

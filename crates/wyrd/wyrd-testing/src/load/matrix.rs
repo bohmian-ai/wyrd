@@ -18,9 +18,7 @@ use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::scribe::admission::{AdmissionConfig, EventTimeWindow};
 use wyrd_client::WyrdClient;
-use wyrd_client::bifrost::{
-    BifrostClientError, CollectedQueryLimits, CollectedQueryResult, QueryClient,
-};
+use wyrd_client::bifrost::{BifrostClientError, CollectedQueryLimits, CollectedQueryResult};
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
 use wyrd_spec::DataTenantId;
@@ -515,8 +513,6 @@ impl BifrostClusterLoad {
             .ok_or_else(|| ClusterLoadError::Cluster("setup Server is absent".to_owned()))?;
         let setup_client = public_client(setup_server, tenants[0], "load-setup-telemetry").await?;
         wyrd_client::Bifrost::query_only(&setup_client)
-            .query_client()
-            .clone()
             .collect_bounded(
                 &BifrostQueryRequest {
                     sql: format!("SELECT id, tenant, batch FROM {table} LIMIT 0"),
@@ -686,9 +682,7 @@ async fn exercise_query_cancellation(
     }
 
     server.stall_next_query_after_schema();
-    let query = wyrd_client::Bifrost::query_only(client)
-        .query_client()
-        .clone();
+    let query = wyrd_client::Bifrost::query_only(client);
     let sql = format!("SELECT id, tenant, batch FROM {table} LIMIT 0");
     let mut task = tokio::spawn(async move {
         query
@@ -875,9 +869,7 @@ async fn run_public_matrix(
                 let writer_transport = crate::bifrost::write::RawIngest::connect(&writer_client)
                     .await
                     .map_err(|error| ClusterLoadError::Client(error.to_string()))?;
-                let query = wyrd_client::Bifrost::query_only(&reader_client)
-                    .query_client()
-                    .clone();
+                let query = Arc::new(wyrd_client::Bifrost::query_only(&reader_client));
                 let profile = *profile;
                 let table = table.to_owned();
                 let barriers = Arc::clone(&barriers);
@@ -978,7 +970,7 @@ async fn run_public_matrix(
             .ok_or_else(|| ClusterLoadError::Cluster("final reader Server is absent".to_owned()))?;
         let final_client =
             public_client(reader, tenant, &format!("load-final-{tenant_index}")).await?;
-        let query = wyrd_client::Bifrost::query_only(&final_client).query_client().clone();
+        let query = wyrd_client::Bifrost::query_only(&final_client);
         let audit_count_before = reader
             .bifrost_read_decision_count_for_tenant(tenant)
             .await
@@ -1601,7 +1593,7 @@ struct TenantRunContext {
     /// Public ingest transport bound to the tenant's writer server.
     writer: crate::bifrost::write::RawIngest,
     /// Public query client bound to the tenant's reader server.
-    query: QueryClient,
+    query: Arc<wyrd_client::Bifrost>,
     /// Phase barriers shared by every tenant task in this run.
     barriers: Arc<TenantPhaseBarriers>,
     /// Shared progress evidence used to capture immutable telemetry windows.
@@ -1929,7 +1921,7 @@ async fn run_tenant(context: TenantRunContext) -> Result<TenantLoadResult, Clust
     }
     let min_reads = profile.minimum_reads_per_tenant;
     for reader_index in 0..profile.readers_per_tenant {
-        let query = query.clone();
+        let query = Arc::clone(&query);
         let table = table.clone();
         tasks.spawn(async move {
             let mut result = TenantLoadResult::default();

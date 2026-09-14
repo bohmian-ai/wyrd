@@ -44,7 +44,6 @@ async fn typed_query_error(
         deadline_ms: None,
     };
     match Bifrost::query_only(&client)
-        .query_client()
         .query(&request)
         .await
     {

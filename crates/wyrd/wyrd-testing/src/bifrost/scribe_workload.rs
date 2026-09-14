@@ -1319,9 +1319,7 @@ impl crate::WyrdTestServer {
         table_fqn: &str,
     ) -> Result<Vec<i64>, crate::WyrdTestServerError> {
         let client = self.workload_client(tenant).await?;
-        let query = wyrd_client::Bifrost::query_only(&client)
-            .query_client()
-            .clone();
+        let query = wyrd_client::Bifrost::query_only(&client);
         let mut stream = query
             .query(&wyrd_spec::vala::api::BifrostQueryRequest {
                 sql: format!("SELECT value FROM {table_fqn}"),

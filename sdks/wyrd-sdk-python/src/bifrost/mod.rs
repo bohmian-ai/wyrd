@@ -30,9 +30,7 @@ use wyrd_spec::vala::ids::RunId;
 use wyrd_utils::py::{WyrdPyError, WyrdPyResult, json_to_pyobject};
 
 use wyrd_client::bifrost::Correlation;
-use wyrd_client::bifrost::{
-    BifrostClientError, QueryClient, QueryResultStream, client_from_options,
-};
+use wyrd_client::bifrost::{BifrostClientError, QueryResultStream, client_from_options};
 
 /// Widens one Bifrost client failure into the shared Wyrd Python boundary error.
 ///
@@ -435,7 +433,7 @@ impl Bifrost {
             deadline_ms,
         };
         let stream = py
-            .detach(|| wyrd_runtime::runtime().block_on(self.handle.query_client().query(&request)))
+            .detach(|| wyrd_runtime::runtime().block_on(self.handle.query(&request)))
             .map_err(client_error)?;
         let request_id = stream.request_id().as_str().to_owned();
         Ok(PyBifrostQueryStream {
@@ -454,7 +452,7 @@ impl Bifrost {
     /// Raises `WyrdError` for transport or server failures.
     fn running(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         let queries = py
-            .detach(|| wyrd_runtime::runtime().block_on(self.query_client().running()))
+            .detach(|| wyrd_runtime::runtime().block_on(self.handle.running()))
             .map_err(client_error)?;
         to_python_json(py, serde_json::to_value(queries))
     }
@@ -467,7 +465,7 @@ impl Bifrost {
     fn status(&self, py: Python<'_>, request_id: &str) -> WyrdPyResult<Py<PyAny>> {
         let request_id = parse_query_request_id(request_id).map_err(client_error)?;
         let summary = py
-            .detach(|| wyrd_runtime::runtime().block_on(self.query_client().status(&request_id)))
+            .detach(|| wyrd_runtime::runtime().block_on(self.handle.status(&request_id)))
             .map_err(client_error)?;
         to_python_json(py, serde_json::to_value(summary))
     }
@@ -480,7 +478,7 @@ impl Bifrost {
     fn cancel(&self, py: Python<'_>, request_id: &str) -> WyrdPyResult<Py<PyAny>> {
         let request_id = parse_query_request_id(request_id).map_err(client_error)?;
         let response = py
-            .detach(|| wyrd_runtime::runtime().block_on(self.query_client().cancel(&request_id)))
+            .detach(|| wyrd_runtime::runtime().block_on(self.handle.cancel(&request_id)))
             .map_err(client_error)?;
         to_python_json(py, serde_json::to_value(response))
     }
@@ -499,7 +497,7 @@ impl Bifrost {
         let description = py
             .detach(|| {
                 wyrd_runtime::runtime()
-                    .block_on(self.query_client().describe_table(namespace, name))
+                    .block_on(self.handle.describe(&format!("{namespace}.{name}")))
             })
             .map_err(client_error)?;
         to_python_json(py, serde_json::to_value(description))
@@ -517,16 +515,6 @@ impl Bifrost {
     #[getter]
     fn producer_count(&self) -> usize {
         self.handle.producer_count()
-    }
-}
-
-impl Bifrost {
-    /// The native query plane every lifecycle and typed read delegates to.
-    ///
-    /// Not a `#[pymethods]` entry: Python reaches these reads through the
-    /// client's own methods rather than a second exported client object.
-    fn query_client(&self) -> &QueryClient {
-        self.handle.query_client()
     }
 }
 

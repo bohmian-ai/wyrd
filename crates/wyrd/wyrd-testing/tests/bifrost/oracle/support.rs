@@ -304,8 +304,6 @@ pub(crate) async fn query_rows(
     visibility: VisibilityMode,
 ) -> Result<u64, JourneyError> {
     let mut stream = wyrd_client::Bifrost::query_only(client)
-        .query_client()
-        .clone()
         .query(&BifrostQueryRequest {
             sql: format!(
                 "SELECT id, filter_key, unused_payload FROM vala.bifrost.{table} ORDER BY id"

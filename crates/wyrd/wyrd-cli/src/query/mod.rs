@@ -102,7 +102,6 @@ pub async fn execute(
     let request = request(&command).map_err(CliBoundaryError::Local)?;
     let client = client(&command).map_err(CliBoundaryError::Local)?;
     let mut stream = Bifrost::query_only(&client)
-        .query_client()
         .query(&request)
         .await
         .map_err(CliBoundaryError::from)?;

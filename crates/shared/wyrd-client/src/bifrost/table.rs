@@ -148,7 +148,7 @@ impl TableConfig {
     /// Abandoning the future leaves no server state behind; describe is a read.
     pub async fn describe(client: &WyrdClient, fqn: &str) -> Result<Self, BifrostClientError> {
         let (namespace, name) = split_fqn(fqn)?;
-        let description = crate::bifrost::QueryClient::new(client)
+        let description = crate::bifrost::query::QueryClient::new(client)
             .describe_table(&namespace, &name)
             .await?;
         Self::from_description(&description)

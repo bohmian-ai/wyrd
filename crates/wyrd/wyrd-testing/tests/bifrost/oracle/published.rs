@@ -624,8 +624,6 @@ async fn query_ids_between(
 /// terminal frame or a leading column that is not a non-null `Int64`.
 async fn collect_ids(client: &WyrdClient, sql: String) -> Result<Vec<i64>, JourneyError> {
     let mut stream = wyrd_client::Bifrost::query_only(client)
-        .query_client()
-        .clone()
         .query(&BifrostQueryRequest {
             sql,
             visibility: VisibilityMode::PublishedOnly,

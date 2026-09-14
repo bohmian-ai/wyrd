@@ -1131,8 +1131,6 @@ async fn scoped_client(
 /// failure when an authorized query cannot be drained.
 async fn accepts(client: &wyrd_client::WyrdClient, sql: &str) -> Result<(), ServerJourneyError> {
     let mut stream = wyrd_client::Bifrost::query_only(client)
-        .query_client()
-        .clone()
         .query(&request(sql))
         .await
         .map_err(|error| format!("`{sql}` must be authorized: {error}"))?;
@@ -1166,8 +1164,6 @@ async fn refuses_with(
     code: &str,
 ) -> Result<(), ServerJourneyError> {
     match wyrd_client::Bifrost::query_only(client)
-        .query_client()
-        .clone()
         .query(&request(sql))
         .await
     {

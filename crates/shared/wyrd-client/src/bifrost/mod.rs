@@ -17,8 +17,18 @@
 //!   preserving `batch_id` so the server's commit dedup holds across retries.
 //! - [`observe`] — fire-and-forget telemetry that never breaks its caller.
 //!
-//! Query lifecycle mechanics ([`QueryClient`]) and the ingest transport are
-//! reached through the facade, never constructed as sibling clients.
+//! Query streaming and lifecycle — [`Bifrost::query`], [`Bifrost::collect_bounded`],
+//! [`Bifrost::running`], [`Bifrost::status`], and [`Bifrost::cancel`] — and the
+//! ingest transport are reached only through the facade; the query mechanic
+//! behind them is not publicly nameable:
+//!
+//! ```compile_fail
+//! use wyrd_client::bifrost::QueryClient;
+//! ```
+//!
+//! ```compile_fail
+//! use wyrd_client::bifrost::RawQueryStream;
+//! ```
 //!
 //! [`ClientScope`] is a credential fingerprint the **token-opaque** client tier
 //! computes without ever decoding a JWT: `(server_url, SHA-256 of the resolved
@@ -45,8 +55,7 @@ pub use facade::{Bifrost, QueryResult, client_from_options, register_outcome_nam
 pub use grpc::{BifrostGrpcTransport, BifrostTransportConfig};
 pub use handle::BifrostMetrics;
 pub use query::{
-    BifrostClientError, CollectedQueryLimits, CollectedQueryResult, QueryClient, QueryResultStream,
-    RawQueryStream,
+    BifrostClientError, CollectedQueryLimits, CollectedQueryResult, QueryResultStream,
 };
 pub use scope::{ClientScope, SinkKind};
 pub use sink::{BifrostIngestSink, IngestTransport};
@@ -649,6 +658,35 @@ mod sdk {
         assert_eq!(
             wyrd_spec::error::WyrdError::from(&error).code(),
             "WYRD_VALA_400_BIFROST_RESERVED_COLUMN"
+        );
+    }
+
+    /// Names every query streaming and lifecycle operation through the async and
+    /// blocking facades, so removing or renaming one fails compilation.
+    ///
+    /// The paired `compile_fail` doctests in this module prove the internal
+    /// query mechanic and raw frame stream are not publicly nameable.
+    #[test]
+    fn bifrost_owns_the_complete_query_lifecycle() {
+        let _ = (
+            Bifrost::query,
+            Bifrost::stream,
+            Bifrost::sql,
+            Bifrost::collect_bounded,
+            Bifrost::running,
+            Bifrost::status,
+            Bifrost::cancel,
+            Bifrost::describe,
+        );
+        let _ = (
+            crate::bifrost::blocking::Bifrost::query,
+            crate::bifrost::blocking::Bifrost::stream,
+            crate::bifrost::blocking::Bifrost::sql,
+            crate::bifrost::blocking::Bifrost::collect_bounded,
+            crate::bifrost::blocking::Bifrost::running,
+            crate::bifrost::blocking::Bifrost::status,
+            crate::bifrost::blocking::Bifrost::cancel,
+            crate::bifrost::blocking::Bifrost::describe,
         );
     }
 }

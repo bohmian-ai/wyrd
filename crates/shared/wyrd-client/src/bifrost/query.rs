@@ -441,6 +441,7 @@ impl RawQueryStream {
     ///
     /// Cancelling this operation preserves decoder state. Dropping the stream
     /// drops the HTTP response body and stops further reads.
+    #[cfg(test)]
     pub async fn next_frame(&mut self) -> Result<Option<QueryStreamFrame>, BifrostClientError> {
         Ok(self
             .next_decoded_frame()

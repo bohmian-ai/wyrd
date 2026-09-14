@@ -246,8 +246,6 @@ async fn query_rows(
     sql: &str,
 ) -> Vec<RecordBatch> {
     let mut stream = wyrd_client::Bifrost::query_only(writer.client())
-        .query_client()
-        .clone()
         .query(&BifrostQueryRequest {
             sql: sql.to_owned(),
             visibility: VisibilityMode::Fused,
@@ -504,8 +502,6 @@ async fn assert_empty_table_reads_cleanly(server: &wyrd_testing::WyrdTestServer)
     .await;
     let reader = tenant_writer(server, tenant).await;
     let mut empty = wyrd_client::Bifrost::query_only(reader.client())
-        .query_client()
-        .clone()
         .query(&BifrostQueryRequest {
             sql: format!("SELECT value FROM {table}"),
             visibility: VisibilityMode::Fused,
@@ -613,8 +609,6 @@ async fn scribe_undialable_private_peer_returns_typed_visibility_failure() {
         .expect("Oracle observes the undialable membership");
 
     let started = wyrd_client::Bifrost::query_only(writer.client())
-        .query_client()
-        .clone()
         .query(&BifrostQueryRequest {
             sql: format!("SELECT value FROM {table}"),
             visibility: VisibilityMode::Fused,
@@ -1036,8 +1030,6 @@ async fn read_correlation(
 ) -> Vec<(i64, Option<String>, String)> {
     let sql = format!("SELECT value, card_uid, principal_id FROM {table} ORDER BY value");
     let mut stream = wyrd_client::Bifrost::query_only(client)
-        .query_client()
-        .clone()
         .query(&BifrostQueryRequest {
             sql: sql.clone(),
             visibility: VisibilityMode::Fused,

@@ -76,3 +76,13 @@ def test_cards_without_a_credential_raise_the_client_catalog_error(
         Cards(server_url="http://127.0.0.1:1")
     assert captured.value.code == "WYRD_CLIENT_401_NO_CREDENTIALS"
     assert captured.value.status == 401
+    assert captured.value.details == {}
+
+
+def test_cards_with_an_empty_server_url_raise_config_invalid_details() -> None:
+    """Cards keeps the offending field and reason in the client config error."""
+    with pytest.raises(wyrd.WyrdError) as captured:
+        Cards(server_url="", credential="wyrd_sk_t_v_s")
+    assert captured.value.code == "WYRD_CLIENT_400_CONFIG_INVALID"
+    assert captured.value.status == 400
+    assert captured.value.details == {"field": "server_url", "reason": "must not be empty"}

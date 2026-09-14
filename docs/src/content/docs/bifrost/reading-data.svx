@@ -85,10 +85,10 @@ published-only/strict defaults when the options are omitted.
 ### Python
 
 ```python
-from wyrd.bifrost import BifrostQueryClient
+from wyrd.bifrost import AsyncBifrost
 
-client = BifrostQueryClient("https://wyrd.example", token)
-stream = await client.query(
+client = AsyncBifrost(server_url="https://wyrd.example", credential=token)
+stream = await client.stream(
     'SELECT metric_name, time, value, service_name FROM "vala.metrics.points" WHERE wyrd_event_time >= now() - interval \'7 days\'',
     visibility="published_only",
     freshness="strict",
@@ -110,10 +110,10 @@ if terminal["outcome"] != "success" or terminal["freshness"] != "complete":
 ### TypeScript
 
 ```ts
-import { BifrostQueryClient } from "@wyrd/sdk";
+import { Bifrost } from "@wyrd/sdk";
 
-const client = new BifrostQueryClient(serverUrl, accessToken);
-const stream = await client.query({
+const client = await Bifrost.connect({ serverUrl, credential: accessToken });
+const stream = await client.stream({
   sql: 'SELECT metric_name, time, value, service_name FROM "vala.metrics.points" WHERE wyrd_event_time >= now() - interval \'7 days\'',
   visibility: "published_only",
   freshness: "strict",

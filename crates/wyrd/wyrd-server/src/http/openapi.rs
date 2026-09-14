@@ -107,9 +107,13 @@ mod tests {
             let responses = &document["paths"][path][method]["responses"];
             for status in ["401", "403", "default"].iter().chain(specific) {
                 assert_eq!(
-                    responses[*status]["content"]["application/json"]["schema"]["$ref"],
+                    responses[*status]["content"]["application/problem+json"]["schema"]["$ref"],
                     problem_ref,
-                    "{method} {path} must publish {status} as WyrdProblem"
+                    "{method} {path} must publish {status} as WyrdProblem problem+json"
+                );
+                assert!(
+                    responses[*status]["content"]["application/json"].is_null(),
+                    "{method} {path} must not publish {status} as plain JSON"
                 );
             }
         }

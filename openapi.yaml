@@ -32,25 +32,25 @@ paths:
         '401':
           description: Authentication required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '403':
           description: Bifrost table read permission required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '503':
           description: Catalog unavailable
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         default:
           description: Other catalog-backed refusal
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
     post:
@@ -81,37 +81,37 @@ paths:
         '400':
           description: Invalid table declaration
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '401':
           description: Authentication required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '403':
           description: Bifrost table registration permission required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '409':
           description: Schema fingerprint conflict
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '503':
           description: Catalog unavailable
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         default:
           description: Other catalog-backed refusal
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
   /v1/bifrost/tables/{namespace}/{name}:
@@ -148,37 +148,37 @@ paths:
         '400':
           description: Invalid table name
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '401':
           description: Authentication required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '403':
           description: Bifrost table read permission required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '404':
           description: No visible table
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '503':
           description: Catalog unavailable
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         default:
           description: Other catalog-backed refusal
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
   /v1/cards:
@@ -750,31 +750,31 @@ paths:
         '400':
           description: Invalid query request
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '401':
           description: Authentication required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '403':
           description: Query permission required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '503':
           description: Oracle role is unavailable
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         default:
           description: Other catalog-backed refusal
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
   /v1/query/running:
@@ -800,31 +800,31 @@ paths:
         '401':
           description: Authentication required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '403':
           description: Query lifecycle permission required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '409':
           description: Query owner conflict
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '503':
           description: Query control unavailable
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         default:
           description: Other catalog-backed refusal
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
   /v1/query/{request_id}:
@@ -858,43 +858,43 @@ paths:
         '400':
           description: Invalid request ID
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '401':
           description: Authentication required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '403':
           description: Query lifecycle permission required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '404':
           description: No visible active query
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '409':
           description: Query owner conflict
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '503':
           description: Query control unavailable
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         default:
           description: Other catalog-backed refusal
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
     delete:
@@ -927,43 +927,43 @@ paths:
         '400':
           description: Invalid request ID
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '401':
           description: Authentication required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '403':
           description: Query lifecycle permission required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '404':
           description: No visible active query
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '409':
           description: Query owner conflict
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '503':
           description: Query control unavailable
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         default:
           description: Other catalog-backed refusal
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
 components:

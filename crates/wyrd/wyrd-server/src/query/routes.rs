@@ -92,11 +92,11 @@ pub fn router() -> Router<AppState> {
     path = "/v1/query/running",
     responses(
         (status = 200, description = "Active queries", body = ListRunningQueriesResponse),
-        (status = 401, description = "Authentication required", body = WyrdProblem),
-        (status = 403, description = "Query lifecycle permission required", body = WyrdProblem),
-        (status = 409, description = "Query owner conflict", body = WyrdProblem),
-        (status = 503, description = "Query control unavailable", body = WyrdProblem),
-        (status = "default", description = "Other catalog-backed refusal", body = WyrdProblem)
+        (status = 401, description = "Authentication required", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 403, description = "Query lifecycle permission required", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 409, description = "Query owner conflict", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 503, description = "Query control unavailable", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = "default", description = "Other catalog-backed refusal", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Bifrost"
 )]
@@ -124,13 +124,13 @@ pub(crate) async fn list_running_queries(
     params(("request_id" = String, Path, description = "Canonical query request ID")),
     responses(
         (status = 200, description = "Active query", body = RunningQuerySummary),
-        (status = 400, description = "Invalid request ID", body = WyrdProblem),
-        (status = 401, description = "Authentication required", body = WyrdProblem),
-        (status = 403, description = "Query lifecycle permission required", body = WyrdProblem),
-        (status = 404, description = "No visible active query", body = WyrdProblem),
-        (status = 409, description = "Query owner conflict", body = WyrdProblem),
-        (status = 503, description = "Query control unavailable", body = WyrdProblem),
-        (status = "default", description = "Other catalog-backed refusal", body = WyrdProblem)
+        (status = 400, description = "Invalid request ID", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 401, description = "Authentication required", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 403, description = "Query lifecycle permission required", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 404, description = "No visible active query", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 409, description = "Query owner conflict", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 503, description = "Query control unavailable", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = "default", description = "Other catalog-backed refusal", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Bifrost"
 )]
@@ -166,13 +166,13 @@ pub(crate) async fn get_running_query(
     params(("request_id" = String, Path, description = "Canonical query request ID")),
     responses(
         (status = 200, description = "Cancellation accepted", body = CancelRunningQueryResponse),
-        (status = 400, description = "Invalid request ID", body = WyrdProblem),
-        (status = 401, description = "Authentication required", body = WyrdProblem),
-        (status = 403, description = "Query lifecycle permission required", body = WyrdProblem),
-        (status = 404, description = "No visible active query", body = WyrdProblem),
-        (status = 409, description = "Query owner conflict", body = WyrdProblem),
-        (status = 503, description = "Query control unavailable", body = WyrdProblem),
-        (status = "default", description = "Other catalog-backed refusal", body = WyrdProblem)
+        (status = 400, description = "Invalid request ID", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 401, description = "Authentication required", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 403, description = "Query lifecycle permission required", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 404, description = "No visible active query", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 409, description = "Query owner conflict", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 503, description = "Query control unavailable", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = "default", description = "Other catalog-backed refusal", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Bifrost"
 )]
@@ -219,11 +219,11 @@ pub(crate) async fn cancel_running_query(
                 )
             )
         ),
-        (status = 400, description = "Invalid query request", body = WyrdProblem),
-        (status = 401, description = "Authentication required", body = WyrdProblem),
-        (status = 403, description = "Query permission required", body = WyrdProblem),
-        (status = 503, description = "Oracle role is unavailable", body = WyrdProblem),
-        (status = "default", description = "Other catalog-backed refusal", body = WyrdProblem)
+        (status = 400, description = "Invalid query request", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 401, description = "Authentication required", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 403, description = "Query permission required", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 503, description = "Oracle role is unavailable", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = "default", description = "Other catalog-backed refusal", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Bifrost"
 )]

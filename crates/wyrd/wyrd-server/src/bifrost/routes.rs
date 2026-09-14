@@ -26,12 +26,12 @@ pub fn router() -> Router<AppState> {
     request_body = RegisterTableRequest,
     responses(
         (status = 200, description = "Table created or matched", body = RegisterTableResponse),
-        (status = 400, description = "Invalid table declaration", body = WyrdProblem),
-        (status = 401, description = "Authentication required", body = WyrdProblem),
-        (status = 403, description = "Bifrost table registration permission required", body = WyrdProblem),
-        (status = 409, description = "Schema fingerprint conflict", body = WyrdProblem),
-        (status = 503, description = "Catalog unavailable", body = WyrdProblem),
-        (status = "default", description = "Other catalog-backed refusal", body = WyrdProblem)
+        (status = 400, description = "Invalid table declaration", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 401, description = "Authentication required", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 403, description = "Bifrost table registration permission required", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 409, description = "Schema fingerprint conflict", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 503, description = "Catalog unavailable", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = "default", description = "Other catalog-backed refusal", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Bifrost"
 )]
@@ -58,10 +58,10 @@ pub(crate) async fn register(
     path = "/v1/bifrost/tables",
     responses(
         (status = 200, description = "Visible table entries", body = Vec<BifrostTableEntry>),
-        (status = 401, description = "Authentication required", body = WyrdProblem),
-        (status = 403, description = "Bifrost table read permission required", body = WyrdProblem),
-        (status = 503, description = "Catalog unavailable", body = WyrdProblem),
-        (status = "default", description = "Other catalog-backed refusal", body = WyrdProblem)
+        (status = 401, description = "Authentication required", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 403, description = "Bifrost table read permission required", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 503, description = "Catalog unavailable", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = "default", description = "Other catalog-backed refusal", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Bifrost"
 )]
@@ -90,12 +90,12 @@ pub(crate) async fn list(
     ),
     responses(
         (status = 200, description = "Table description", body = BifrostTableDescription),
-        (status = 400, description = "Invalid table name", body = WyrdProblem),
-        (status = 401, description = "Authentication required", body = WyrdProblem),
-        (status = 403, description = "Bifrost table read permission required", body = WyrdProblem),
-        (status = 404, description = "No visible table", body = WyrdProblem),
-        (status = 503, description = "Catalog unavailable", body = WyrdProblem),
-        (status = "default", description = "Other catalog-backed refusal", body = WyrdProblem)
+        (status = 400, description = "Invalid table name", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 401, description = "Authentication required", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 403, description = "Bifrost table read permission required", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 404, description = "No visible table", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 503, description = "Catalog unavailable", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = "default", description = "Other catalog-backed refusal", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Bifrost"
 )]

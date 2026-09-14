@@ -38,6 +38,7 @@ use crate::contracts::ScribeError;
 use crate::resources::{ScribeMemoryLease, ScribeResources};
 use crate::scribe::seal_key::SealKey;
 use crate::scribe::stream_identity::StreamIdentity;
+use crate::tables::AuditLogTable;
 
 /// Record one physical WAL append attempt while preserving its original result.
 fn record_wal_append(result: &Result<(), ScribeError>, bytes: usize, started: Instant) {
@@ -951,11 +952,22 @@ impl<'a> SlicePayloadReader<'a> {
 }
 
 /// Decode the tenant identity encoded in a v3 slice payload.
+///
+/// The nil UUID is the encoded [`DataTenantId::SYSTEM_OWNER`] sentinel that
+/// internal audit-log publication appends; `decode_slice_metadata` limits it to
+/// that table. Every other identity must be a `UUIDv7`.
+///
+/// # Errors
+/// Returns [`ScribeError::Internal`] when the field is not 16 bytes or names a
+/// non-sentinel identity that is not a UUIDv7.
 fn decode_slice_tenant(bytes: &[u8]) -> Result<DataTenantId, ScribeError> {
     let tenant_bytes: [u8; 16] = bytes.try_into().map_err(|_| ScribeError::Internal {
         detail: "WAL tenant id decode failed".to_owned(),
     })?;
     let tenant_uuid = uuid::Uuid::from_bytes(tenant_bytes);
+    if tenant_uuid.is_nil() {
+        return Ok(DataTenantId::SYSTEM_OWNER);
+    }
     DataTenantId::try_from(tenant_uuid).map_err(|error| ScribeError::Internal {
         detail: format!("WAL v3 tenant id is invalid: {error}"),
     })
@@ -1011,6 +1023,11 @@ fn decode_slice_metadata(
     let table_len = reader.read_u16("WAL table length decode failed")?;
     let table_fqn = reader.read_utf8(table_len, "table FQN")?;
     let table = decode_slice_table(&table_fqn)?;
+    if tenant == DataTenantId::SYSTEM_OWNER && !AuditLogTable::admits_system_owner(&table) {
+        return Err(ScribeError::Internal {
+            detail: format!("WAL system owner cannot write `{table_fqn}`"),
+        });
+    }
     let partition = decode_slice_partition(reader.take(SLICE_PARTITION_BYTES)?)?;
     let mut schema_fingerprint = [0_u8; 32];
     schema_fingerprint.copy_from_slice(reader.take(32)?);
@@ -4179,9 +4196,13 @@ mod tests {
         );
     }
 
+    /// The nil sentinel decodes as the system owner; any other non-v7 id fails.
     #[test]
-    fn slice_tenant_decoder_rejects_nil_and_non_v7() {
-        assert!(decode_slice_tenant(&[0; 16]).is_err());
+    fn slice_tenant_decoder_admits_system_owner_and_rejects_non_v7() {
+        assert!(matches!(
+            decode_slice_tenant(&[0; 16]),
+            Ok(tenant) if tenant == DataTenantId::SYSTEM_OWNER
+        ));
         assert!(decode_slice_tenant(Uuid::new_v4().as_bytes()).is_err());
     }
 
@@ -4343,6 +4364,40 @@ mod tests {
         payload[0] = b'X';
         let error = decode_slice_payload(&payload).expect_err("magic must fail closed");
         assert!(error.to_string().contains("magic mismatch"));
+    }
+
+    /// Recovery reads system-owner audit-log slices but refuses the sentinel elsewhere.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture fails to encode or a decode outcome differs.
+    #[test]
+    fn slice_payload_decoder_limits_system_owner_to_the_audit_log() {
+        use crate::namespaces::BifrostNamespace;
+
+        let system = DataTenantId::SYSTEM_OWNER.as_uuid();
+        let audit_log = TableRef::new(BifrostNamespace::Audit, "audit_log").fqn();
+        let payload = encode_slice_payload_parts(
+            system.as_bytes(),
+            &audit_log,
+            crate::test_support::day_partition(2026, 1, 1),
+            &[0_u8; 32],
+            b"data",
+        )
+        .expect("encode system audit slice");
+        let decoded = decode_slice_payload(&payload).expect("system audit slice decodes");
+        assert_eq!(decoded.seal_key.tenant, DataTenantId::SYSTEM_OWNER);
+
+        let payload = encode_slice_payload_parts(
+            system.as_bytes(),
+            "vala.bifrost.events",
+            crate::test_support::day_partition(2026, 1, 1),
+            &[0_u8; 32],
+            b"data",
+        )
+        .expect("encode system non-audit slice");
+        let error = decode_slice_payload(&payload).expect_err("non-audit system slice fails");
+        assert!(error.to_string().contains("system owner cannot write"));
     }
 
     #[test]

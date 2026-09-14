@@ -22,8 +22,8 @@ where
         message: "trusted issuer resolver is not configured".to_owned(),
         details: serde_json::json!({}),
     })?;
-    let issuers = resolver
-        .trusted_issuers(&tenant_id)
+    resolver
+        .trusted_issuer(&tenant_id, issuer)
         .await
         .map_err(|error| {
             tracing::warn!(
@@ -35,10 +35,7 @@ where
                 message: "trusted issuer resolution unavailable".to_owned(),
                 details: serde_json::json!({ "retry_after_seconds": 1 }),
             }
-        })?;
-    issuers
-        .into_iter()
-        .find(|candidate| candidate.issuer == *issuer)
+        })?
         .ok_or_else(|| WyrdError::InvalidToken {
             message: "issuer is not trusted for the resolved tenant".to_owned(),
             details: serde_json::json!({}),

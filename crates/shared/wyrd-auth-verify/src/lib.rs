@@ -561,17 +561,15 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> TokenVe
         // Parse the issuer string into the typed form for the trust lookup.
         let iss_url = IssuerUrl::new(iss_str).map_err(|_| AuthError::InvalidToken)?;
 
-        // Resolve this tenant's trusted issuers from the live config store, then
-        // filter by the unverified `iss`. A resolver outage fails closed as
+        // Look up this tenant's trusted issuer for the unverified `iss` in the
+        // live config store. A resolver outage fails closed as
         // VerifyUnavailable; no matching issuer fails closed as InvalidToken
         // (untrusted or cross-tenant).
         let trusted = ext
             .trusted
-            .trusted_issuers(tenant)
+            .trusted_issuer(tenant, &iss_url)
             .await
             .map_err(|_| AuthError::VerifyUnavailable)?
-            .into_iter()
-            .find(|ti| ti.issuer == iss_url)
             .ok_or(AuthError::InvalidToken)?;
 
         // Reject symmetric algorithms. Only asymmetric keys appear in JWKS.

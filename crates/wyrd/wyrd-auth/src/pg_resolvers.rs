@@ -35,7 +35,7 @@ use wyrd_spec::auth::IssuerUrl;
 use wyrd_spec::reference::CardRef;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
-    TrustedIssuerWrite, WorkloadBindingWrite, trusted_issuers_for_tenant,
+    TrustedIssuerWrite, WorkloadBindingWrite, trusted_issuer_by_url, trusted_issuers_for_tenant,
     workload_binding_by_subject,
 };
 use wyrd_sql::row_types::auth::TrustedIssuerRow;
@@ -110,6 +110,41 @@ impl IssuerConfigResolver for PgIssuerResolver {
                 })
             })
             .collect()
+    }
+
+    /// Fetch only the tenant's issuer row keyed by `issuer` instead of listing
+    /// and filtering every configured issuer.
+    #[tracing::instrument(skip(self), fields(tenant_id = %tenant, issuer = %issuer))]
+    async fn trusted_issuer(
+        &self,
+        tenant: &DataTenantId,
+        issuer: &IssuerUrl,
+    ) -> Result<Option<TrustedIssuer>, OidcError> {
+        let mut conn = TenantConn::acquire(&self.pool, *tenant).await.map_err(|error| {
+            tracing::warn!(error = %error, "issuer resolver failed to acquire tenant connection");
+            OidcError::JwksUnavailable {
+                issuer: tenant.as_uuid().to_string(),
+                message: error.to_string(),
+            }
+        })?;
+        let row = trusted_issuer_by_url(&mut conn, issuer.as_str())
+            .await
+            .map_err(|error| {
+                tracing::warn!(error = %error, "issuer resolver query failed");
+                OidcError::JwksUnavailable {
+                    issuer: tenant.as_uuid().to_string(),
+                    message: error.to_string(),
+                }
+            })?;
+        row.map(|row| {
+            trusted_issuer_from_row(*tenant, row, self.sealing_key.as_deref()).map_err(|error| {
+                OidcError::JwksUnavailable {
+                    issuer: issuer.as_str().to_owned(),
+                    message: error.to_string(),
+                }
+            })
+        })
+        .transpose()
     }
 }
 
@@ -626,6 +661,22 @@ mod pg_tests {
             ClientAuth::SecretPost(secret) => assert_eq!(secret.expose_secret(), "super-secret"),
             other => panic!("expected SecretPost, got {other:?}"),
         }
+
+        let keyed = resolver
+            .trusted_issuer(&tenant, &issuer.issuer)
+            .await
+            .expect("keyed resolve succeeds")
+            .expect("seeded issuer is found by URL");
+        assert_issuer_eq(&issuer, &keyed);
+        let unknown = IssuerUrl::new("https://unknown.example.com".to_owned()).expect("url");
+        assert!(
+            resolver
+                .trusted_issuer(&tenant, &unknown)
+                .await
+                .expect("keyed miss succeeds")
+                .is_none(),
+            "an unconfigured issuer URL resolves to None"
+        );
     }
 
     #[tokio::test]

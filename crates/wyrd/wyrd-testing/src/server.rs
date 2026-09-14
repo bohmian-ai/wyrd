@@ -289,6 +289,11 @@ struct WyrdTestServerInner {
 pub struct ServerShutdownInspection {
     /// Final Scribe ownership snapshot when this process hosted Scribe.
     pub scribe: Option<vala_bifrost_redux::scribe::telemetry::ScribeInspectionSnapshot>,
+    /// Admitted append requests Scribe still owned once the serve task joined.
+    ///
+    /// Read after the production drain, so a nonzero count is an accepted
+    /// append that survived shutdown rather than one still being acknowledged.
+    pub scribe_inflight: u64,
     /// Whether the bound listener supervisor joined successfully.
     pub listeners_stopped: bool,
     /// Supervisor join handles still retained after shutdown.
@@ -885,6 +890,9 @@ impl WyrdTestServer {
             .bifrost_scribe_for_test()
             .map(|_| self.scribe_inspection_snapshot())
             .transpose()?;
+        let scribe_inflight = self
+            .bifrost_scribe()
+            .map_or(0, |scribe| scribe.inflight_items_for_test() as u64);
         let storage = self
             .inner
             .state
@@ -893,6 +901,7 @@ impl WyrdTestServer {
             .map(|storage| storage.telemetry_snapshot());
         let inspection = ServerShutdownInspection {
             scribe,
+            scribe_inflight,
             listeners_stopped,
             supervised_tasks: self.supervised_task_count_for_test() as u64,
             storage,

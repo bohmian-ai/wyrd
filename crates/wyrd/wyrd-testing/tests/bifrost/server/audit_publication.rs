@@ -35,14 +35,17 @@ const PUBLICATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(9
 /// Retained history is registered by its first publication, so a tenant that
 /// has never published owns no such table yet. That is an honest zero rather
 /// than a failure: the caller is polling for a move the server has not made.
+/// A strict fused read may also refuse with the retryable
+/// `QueryVisibilityUnavailable` while publication moves the live cut; that
+/// yields `None` so the bounded poll retries instead of failing early.
 ///
 /// # Errors
-/// Returns the authorization, query, or terminal failure the caller raised.
+/// Returns the authorization, query, or any non-retryable terminal failure.
 async fn retained_rows(
     server: &WyrdTestServer,
     tenant: DataTenantId,
     operation: &str,
-) -> Result<u64, ServerJourneyError> {
+) -> Result<Option<u64>, ServerJourneyError> {
     let outcome = wyrd_server::query::scheduled::ScheduledQueryCaller::new(
         server.state().clone(),
         scheduled_context(tenant)?,
@@ -56,10 +59,13 @@ async fn retained_rows(
     })
     .await;
     match outcome {
-        Ok(outcome) => Ok(outcome.rows),
+        Ok(outcome) => Ok(Some(outcome.rows)),
         Err(WyrdError::Vala {
             error: BifrostError::TableNotFound { .. },
-        }) => Ok(0),
+        }) => Ok(Some(0)),
+        Err(WyrdError::Vala {
+            error: BifrostError::QueryVisibilityUnavailable,
+        }) => Ok(None),
         Err(error) => Err(error.into()),
     }
 }
@@ -81,12 +87,13 @@ async fn await_retained(
     let deadline = std::time::Instant::now() + PUBLICATION_BUDGET;
     loop {
         let observed = retained_rows(server, tenant, operation).await?;
-        if observed == expected {
+        if observed == Some(expected) {
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
             return Err(format!(
-                "`{operation}` was retained {observed} times within the bounded wait, expected {expected}"
+                "`{operation}` was retained {observed:?} times within the bounded wait \
+                 (None: visibility unavailable), expected {expected}"
             )
             .into());
         }

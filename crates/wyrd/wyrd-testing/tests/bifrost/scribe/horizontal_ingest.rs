@@ -111,14 +111,8 @@ async fn multi_pod_concurrent_batches_are_owned_and_visible() {
     let table = register_table(&cluster, tenant, &name).await;
     let clients = endpoint_clients(&cluster, tenant).await;
 
+    await_idle_pods(&cluster).await;
     let baseline = acknowledged_by_pod(&cluster);
-    assert_eq!(
-        in_flight_by_pod(&cluster),
-        vec![0; PODS],
-        "no pod may hold ingress work before the barrier releases; without this \
-         the simultaneous-activity observation below could be satisfied by a \
-         stale total rather than by live concurrent work"
-    );
 
     let submitted: Vec<SubmittedBatch> = (0..CONCURRENT_BATCHES)
         .map(|ordinal| {
@@ -618,6 +612,35 @@ async fn await_all_pods_active(cluster: &WyrdTestCluster) {
             tokio::time::Instant::now() < deadline,
             "the three pods never held work at the same time inside \
              {OBSERVATION_DEADLINE:?}; last observed per-pod in-flight work was \
+             {active:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
+/// Waits until no pod holds ingress work before the barrier releases.
+///
+/// Table registration records authorization decisions that the server's own
+/// retained-audit publisher appends through Scribe on its schedule, so a pod
+/// can honestly be busy right after setup. Requiring the gauges to return to
+/// zero first means the simultaneous-activity observation that follows can only
+/// be satisfied by live concurrent work, never by a stale total.
+///
+/// # Panics
+///
+/// Panics when some pod still holds ingress work at [`OBSERVATION_DEADLINE`],
+/// reporting the last per-pod state it saw.
+async fn await_idle_pods(cluster: &WyrdTestCluster) {
+    let deadline = tokio::time::Instant::now() + OBSERVATION_DEADLINE;
+    loop {
+        let active = in_flight_by_pod(cluster);
+        if active.iter().all(|owned| *owned == 0) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no pod may hold ingress work before the barrier releases, but inside \
+             {OBSERVATION_DEADLINE:?} the last observed per-pod in-flight work was \
              {active:?}"
         );
         tokio::time::sleep(Duration::from_millis(2)).await;

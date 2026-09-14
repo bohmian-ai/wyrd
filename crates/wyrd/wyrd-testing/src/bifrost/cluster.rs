@@ -2455,15 +2455,13 @@ impl WyrdTestCluster {
                 // therefore no pre-shutdown flush here: `server.shutdown_and_inspect`
                 // cancels, joins the serve task (which runs the production
                 // drain-then-seal to completion, ending worker liveness), and only
-                // then drains the Scribe. The inflight read below is a pure
-                // observation of the admission owner and plants nothing.
-                if let Some(scribe) = server.bifrost_scribe() {
-                    scribe_inflight =
-                        scribe_inflight.saturating_add(scribe.inflight_items_for_test() as u64);
-                }
+                // then drains the Scribe. Its in-flight count is read after that
+                // drain, so it reports only appends that survived shutdown.
                 match server.shutdown_and_inspect().await {
                     Ok(server_inspection) => {
                         stopped_servers = stopped_servers.saturating_add(1);
+                        scribe_inflight =
+                            scribe_inflight.saturating_add(server_inspection.scribe_inflight);
                         listeners_stopped &= server_inspection.listeners_stopped;
                         supervised_tasks =
                             supervised_tasks.saturating_add(server_inspection.supervised_tasks);

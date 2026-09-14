@@ -68,8 +68,11 @@ run = "cargo clippy --locked --workspace --all-features --all-targets -- -D warn
 
 [tasks."lint:wyrd-sdk-python"]
 hide = true
-description = "Run the default-feature wyrd-sdk-python library clippy check"
-run = "cargo clippy --locked -p wyrd-sdk-python --lib -- -D warnings"
+description = "Run the wyrd-sdk-python library clippy check without and with its python boundary feature"
+run = [
+  "cargo clippy --locked -p wyrd-sdk-python --lib -- -D warnings",
+  "cargo clippy --locked -p wyrd-sdk-python --lib --features python -- -D warnings",
+]
 
 [tasks."impl:warm"]
 hide = true

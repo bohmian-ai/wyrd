@@ -52,7 +52,7 @@ dev = [
 python-source = "python"
 module-name = "wyrd._wyrd"
 bindings = 'pyo3'
-features = ["pyo3/extension-module", "pyo3/abi3-py310"]
+features = ["python", "pyo3/extension-module", "pyo3/abi3-py310"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

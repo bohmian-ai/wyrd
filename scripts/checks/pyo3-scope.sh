@@ -94,3 +94,19 @@ if [ -n "$forbidden_utils_default" ]; then
   echo "$forbidden_utils_default"
   exit 1
 fi
+
+sdk_manifest=sdks/wyrd-sdk-python/Cargo.toml
+if ! rg -q '"dep:pyo3"' "$sdk_manifest" || \
+   ! rg -q '^pyo3 = \{ workspace = true, .*optional = true \}' "$sdk_manifest" || \
+   rg 'features = \["python"\]' "$sdk_manifest" | rg -qv '^wyrd-testing '; then
+  echo 'wyrd-sdk-python must gate PyO3 and owner-crate Python features behind its python feature'
+  exit 1
+fi
+
+forbidden_sdk_default=$(cargo tree --locked -p wyrd-sdk-python -e normal | \
+  rg '(^|[ ─└├])pyo3' || true)
+if [ -n "$forbidden_sdk_default" ]; then
+  echo "FAIL: wyrd-sdk-python pulls PyO3 without its python feature:"
+  echo "$forbidden_sdk_default"
+  exit 1
+fi

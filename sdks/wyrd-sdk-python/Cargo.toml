@@ -16,20 +16,35 @@ test = false
 doctest = false
 
 [features]
-testing = ["dep:wyrd-testing"]
+# The one foreign-runtime boundary: PyO3 and every retained owner-crate
+# Python feature activate only when the extension is built.
+python = [
+    "dep:pyo3",
+    "wyrd-cli/python",
+    "skald-agent/python",
+    "skald-observer/python",
+    "skald-workflow/python",
+    "skald-tool/python",
+    "skald-prompt/python",
+    "skald-runtime/python",
+    "wyrd-cards/python",
+    "wyrd-config/python",
+    "wyrd-utils/python",
+]
+testing = ["python", "dep:wyrd-testing"]
 
 [dependencies]
-pyo3 = { workspace = true, features = ["extension-module", "abi3-py310", "chrono"] }
-wyrd-cli = { workspace = true, features = ["python"] }
-skald-agent = { workspace = true, features = ["python"] }
-skald-observer = { workspace = true, features = ["python"] }
-skald-workflow = { workspace = true, features = ["python"] }
-skald-tool = { workspace = true, features = ["python"] }
-skald-prompt = { workspace = true, features = ["python"] }
-skald-runtime = { workspace = true, features = ["python"] }
-wyrd-cards = { workspace = true, features = ["python"] }
-wyrd-config = { workspace = true, features = ["python"] }
-wyrd-utils = { workspace = true, features = ["python"] }
+pyo3 = { workspace = true, features = ["extension-module", "abi3-py310", "chrono"], optional = true }
+wyrd-cli = { workspace = true }
+skald-agent = { workspace = true }
+skald-observer = { workspace = true }
+skald-workflow = { workspace = true }
+skald-tool = { workspace = true }
+skald-prompt = { workspace = true }
+skald-runtime = { workspace = true }
+wyrd-cards = { workspace = true }
+wyrd-config = { workspace = true }
+wyrd-utils = { workspace = true }
 wyrd-spec = { workspace = true }
 wyrd-runtime = { workspace = true }
 wyrd-client = { workspace = true }

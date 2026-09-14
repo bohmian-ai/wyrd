@@ -1,9 +1,17 @@
 //! `PyO3` bootstrap module for the Python Wyrd package.
+//!
+//! Every item is gated on the crate's `python` feature: selecting the crate
+//! without it compiles an empty library and never activates `PyO3` or an
+//! owner crate's Python boundary.
 
+#[cfg(feature = "python")]
 mod bifrost;
+#[cfg(feature = "python")]
 mod state;
 
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
+#[cfg(feature = "python")]
 use pyo3::types::PyModule;
 
 /// Native extension entry point mounted as `wyrd._wyrd`.
@@ -17,6 +25,7 @@ use pyo3::types::PyModule;
 /// Returns a Python error when a native submodule cannot be allocated,
 /// registered, or inserted into `sys.modules`, including failures reported by
 /// an owning crate's registration function.
+#[cfg(feature = "python")]
 #[pymodule]
 fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     wyrd_utils::py::register_wyrd_error_exception(m)?;
@@ -102,6 +111,17 @@ fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
+/// Publishes one already-populated native submodule under its dotted import name.
+///
+/// Inserting into `sys.modules` lets `import wyrd._wyrd.<name>` resolve the
+/// submodule the aggregator created instead of searching for a separate
+/// extension file. It replaces any existing entry with the same name.
+///
+/// # Errors
+///
+/// Returns a Python error when `sys` cannot be imported or `sys.modules`
+/// rejects the insertion.
+#[cfg(feature = "python")]
 fn register_submodule(py: Python<'_>, name: &str, module: &Bound<'_, PyModule>) -> PyResult<()> {
     let sys = py.import("sys")?;
     sys.getattr("modules")?.set_item(name, module)

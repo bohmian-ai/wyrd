@@ -12,10 +12,10 @@ use super::support::{
 
 /// Batches each of the two tables sends in the interleaving phase.
 ///
-/// Enough distinct batch identities that both tables reach most of the sixteen
-/// lanes, so "the same lanes serve both" is an observation rather than an
-/// accident of two routes landing together, and enough turns that a scheduler
-/// which favours one class has room to show it.
+/// At least one batch per lane, so each table is placed on every one of the
+/// sixteen lanes and "the same lanes serve both" holds by construction rather
+/// than by the hash, and enough turns that a scheduler which favours one class
+/// has room to show it.
 const BATCHES_PER_TABLE: usize = 24;
 /// Rows in one batch, identical for both tables.
 const ROWS_PER_BATCH: usize = 64;
@@ -165,18 +165,14 @@ async fn scribe_system_and_dynamic_tables_are_round_robin_equal() {
     for batch in 0..BATCHES_PER_TABLE {
         let first = ((batch + 1) * ROWS_PER_BATCH) as i64;
         let rows: Vec<i64> = (first..first + ROWS_PER_BATCH as i64).collect();
-        let dynamic_batch_id = uuid::Uuid::now_v7();
-        let system_batch_id = uuid::Uuid::now_v7();
-        dynamic_routes.push(vala_bifrost_redux::scribe::routing::shard_for(
-            tenant,
-            &dynamic_ref,
-            dynamic_batch_id,
-        ));
-        system_routes.push(vala_bifrost_redux::scribe::routing::shard_for(
-            tenant,
-            &system_ref,
-            system_batch_id,
-        ));
+        // Random ids let the hash decide how many lanes the two classes
+        // shared, which fell below half on unlucky draws. Placing batch `n` on
+        // lane `n % SCRIBE_SHARD_COUNT` for both classes makes every lane shared.
+        let lane = batch % SCRIBE_SHARD_COUNT;
+        let dynamic_batch_id = batch_id_on_lane(tenant, &dynamic_ref, lane);
+        let system_batch_id = batch_id_on_lane(tenant, &system_ref, lane);
+        dynamic_routes.push(lane);
+        system_routes.push(lane);
         expected_dynamic.extend_from_slice(&rows);
         expected_system.extend_from_slice(&rows);
         dynamic_batches.push((dynamic_batch_id, rows.clone()));
@@ -259,8 +255,8 @@ async fn scribe_system_and_dynamic_tables_are_round_robin_equal() {
     let shared: usize = (0..SCRIBE_SHARD_COUNT)
         .filter(|lane| system_lanes[*lane] && dynamic_lanes[*lane])
         .count();
-    assert!(
-        shared >= SCRIBE_SHARD_COUNT / 2,
+    assert_eq!(
+        shared, SCRIBE_SHARD_COUNT,
         "the two table classes must share the one fixed lane set, not split it: {shared} shared lanes of {SCRIBE_SHARD_COUNT}"
     );
     let unowned: Vec<usize> = (0..SCRIBE_SHARD_COUNT)
@@ -297,6 +293,24 @@ async fn scribe_system_and_dynamic_tables_are_round_robin_equal() {
     );
 
     server.shutdown().await.expect("the server drains cleanly");
+}
+
+/// Draws time-ordered batch ids until one routes to `lane`.
+///
+/// Routing is a uniform hash over tenant, table, and batch id, so a match takes
+/// sixteen draws on average. Ids stay `now_v7`, so a table's batches remain
+/// ascending in submission order exactly as random draws were.
+fn batch_id_on_lane(
+    tenant: wyrd_spec::ids::DataTenantId,
+    table: &vala_bifrost_redux::catalog::TableRef,
+    lane: usize,
+) -> uuid::Uuid {
+    loop {
+        let id = uuid::Uuid::now_v7();
+        if vala_bifrost_redux::scribe::routing::shard_for(tenant, table, id) == lane {
+            return id;
+        }
+    }
 }
 
 /// Which of the two scheduling peers took one acknowledged turn.

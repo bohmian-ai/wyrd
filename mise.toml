@@ -178,9 +178,7 @@ run = "bash scripts/run-bifrost-tests.sh"
 hide = true
 description = "Run Bifrost-facing unit tests in shared server, harness, SDK, and MCP owners."
 run = """
-cargo nextest run --locked -p wyrd-testing --lib -E 'test(/^bifrost::/) | test(/^interleaving::/) | test(/^load::/) | test(/^server::production_composition_tests::/)'
-cargo nextest run --locked -p wyrd-server --lib --features test-support -E 'test(/^bifrost::/) | test(/^oracle::/) | test(/^query::/) | test(/^grpc::(query|scribe_tail)::/) | test(/bifrost|oracle|scribe|forge/)'
-cargo nextest run --locked -p wyrd-client --lib -E 'test(/^bifrost::query::/) | test(/^bifrost::sdk::/)'
+cargo nextest run --locked -p wyrd-testing -p wyrd-server -p wyrd-client --lib --features wyrd-server/test-support -E '(package(wyrd-testing) & (test(/^bifrost::/) | test(/^interleaving::/) | test(/^load::/) | test(/^server::production_composition_tests::/))) | (package(wyrd-server) & (test(/^bifrost::/) | test(/^oracle::/) | test(/^query::/) | test(/^grpc::(query|scribe_tail)::/) | test(/bifrost|oracle|scribe|forge/))) | (package(wyrd-client) & (test(/^bifrost::query::/) | test(/^bifrost::sdk::/)))'
 """
 
 [tasks."test:bifrost:unit:python:inner"]

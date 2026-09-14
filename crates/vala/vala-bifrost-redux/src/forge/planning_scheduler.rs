@@ -25,6 +25,7 @@ use super::Forge;
 use super::compact::ForgeGroupKey;
 use super::error::ForgeError;
 use super::identity::task_table_binding;
+use super::managed::policy::ForgeTablePolicy;
 use super::metrics::{ForgePendingTasks, ForgeTelemetry};
 use super::path::catalog_path_to_object_key;
 use super::planner::{ForgePlanCandidate, ForgeTableSnapshot, plan_hash, plan_table};
@@ -856,6 +857,13 @@ impl<'forge> ForgeScheduler<'forge> {
     /// candidate exists to bind the durable task to one immutable base and to
     /// name the inputs recovery will look for.
     ///
+    /// The threshold comes from the same [`ForgeTablePolicy`] the worker
+    /// extracts, so a table whose declared geometry cannot hold the operator
+    /// threshold (for example an undeclared 512 MiB table under a 768 MiB
+    /// threshold) is refused here, with a warning, instead of being enqueued as
+    /// a task every worker attempt must refuse. Only the rewrite is withheld;
+    /// promotion and maintenance for the same table still plan.
+    ///
     /// # Errors
     ///
     /// Returns [`ForgeError::Catalog`] when the base snapshot's manifest list
@@ -867,7 +875,13 @@ impl<'forge> ForgeScheduler<'forge> {
         let Some(snapshot) = table.metadata().current_snapshot() else {
             return Ok(None);
         };
-        let threshold = self.forge.core.config.small_file_threshold_bytes;
+        let threshold = match ForgeTablePolicy::extract(table.metadata(), &self.forge.core.config) {
+            Ok(policy) => policy.small_file_threshold_bytes,
+            Err(error) => {
+                tracing::warn!(table = %table.identifier(), error = %error, "Forge rewrite policy is impossible for this table; no rewrite is planned");
+                return Ok(None);
+            }
+        };
         let manifests = table
             .manifest_list_reader(snapshot)
             .load()

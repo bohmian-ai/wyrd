@@ -246,3 +246,9 @@ missing_errors_doc = "allow"
 # the "repetition" is the crate namespace, not accidental noise. Blanket-allowed to
 # avoid 11+ per-crate `#![allow]` lines and per-site `// justification:` overhead.
 module_name_repetitions = "allow"
+
+# Third-party dependencies keep file:line tables for backtraces but drop full
+# debug info, shrinking target/ and link time for every dev and test binary.
+# Workspace crates keep full debug info.
+[profile.dev.package."*"]
+debug = "line-tables-only"

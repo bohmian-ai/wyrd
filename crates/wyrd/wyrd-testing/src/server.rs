@@ -2640,7 +2640,16 @@ impl WyrdTestServer {
         let principal_id = Uuid::now_v7();
         let creator_id = self.ensure_fixture_admin_for(tenant_id).await?;
         let mut conn = self.tenant_conn_for(tenant_id).await?;
-        seed_machine_card(&mut conn, card_ref, creator_id).await?;
+        // The registry row needs its own uid, while the principal keeps the
+        // binding's uid-less `card_ref` for the exact JSONB lookup.
+        let registered = CardRef {
+            uid: Some(
+                CardUid::new(Uuid::now_v7().to_string())
+                    .expect("generated UUIDv7 is a valid CardUid"),
+            ),
+            ..card_ref.clone()
+        };
+        seed_machine_card(&mut conn, &registered, creator_id).await?;
         insert_service_account(
             &mut conn,
             principal_id,

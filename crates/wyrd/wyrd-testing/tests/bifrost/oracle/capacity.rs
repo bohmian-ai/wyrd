@@ -83,10 +83,10 @@ const ANALYTICAL_INGEST_GROUPS: i64 = 1_000;
 /// It stays open across two complete Interactive windows, so its deadline has
 /// to cover them; it is still finite, because a stream that outlives the
 /// journey is a leak rather than a pass.
-const ANALYTICAL_DEADLINE_MS: u64 = 600_000;
+const ANALYTICAL_DEADLINE_MS: i64 = 600_000;
 
 /// Absolute deadline for each bounded public Interactive query.
-const INTERACTIVE_DEADLINE_MS: u64 = 60_000;
+const INTERACTIVE_DEADLINE_MS: i64 = 60_000;
 
 /// Bound on frame pulls used to bring the Analytical query to live ownership.
 ///
@@ -1218,10 +1218,10 @@ const REFUSAL_ROWS: i64 = 24;
 ///
 /// Long enough that the refusal, the release, and the cancel below all happen
 /// inside one query's own lifetime rather than racing its deadline.
-const REFUSAL_HOLDER_DEADLINE_MS: u64 = 60_000;
+const REFUSAL_HOLDER_DEADLINE_MS: i64 = 60_000;
 
 /// Deadline the refused query is submitted with, in milliseconds.
-const REFUSAL_QUERY_DEADLINE_MS: u64 = 30_000;
+const REFUSAL_QUERY_DEADLINE_MS: i64 = 30_000;
 
 /// Governed bytes the hold deliberately leaves the stalled holder.
 ///

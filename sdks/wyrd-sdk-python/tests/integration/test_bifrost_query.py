@@ -92,6 +92,25 @@ def test_bifrost_query_missing_terminal_fails_closed(
 
 
 @pytest.mark.integration
+def test_bifrost_query_out_of_range_deadline_is_the_shared_validation_error(
+    wyrd_server: WyrdTestServer,
+) -> None:
+    _table_fqn, token = wyrd_server.prepare_oracle_query_fixture()
+
+    async def query(deadline_ms: int) -> None:
+        with pytest.raises(WyrdError) as captured:
+            await AsyncBifrost(server_url=wyrd_server.base_url, credential=token).stream(
+                "SELECT 1",
+                deadline_ms=deadline_ms,
+            )
+        assert captured.value.code == "WYRD_VALA_400_QUERY_INVALID_SQL"
+        assert captured.value.status == 400
+
+    for deadline_ms in (0, 2**32):
+        asyncio.run(query(deadline_ms))
+
+
+@pytest.mark.integration
 def test_bifrost_query_gate_denial_has_no_oracle_side_effect(
     wyrd_server: WyrdTestServer,
 ) -> None:

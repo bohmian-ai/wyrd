@@ -138,10 +138,13 @@ impl ReadyOracleForwarder {
     ) -> Result<OracleQueryStream, BifrostError> {
         Self::validate_context(&context)?;
         self.planner.validate_query(&request)?;
-        let duration = request.deadline_ms.map_or(
-            OracleConfig::default().default_deadline,
-            Duration::from_millis,
-        );
+        let duration = request
+            .deadline_ms
+            .and_then(|deadline| u64::try_from(deadline).ok())
+            .map_or(
+                OracleConfig::default().default_deadline,
+                Duration::from_millis,
+            );
         let monotonic_deadline = Instant::now()
             .checked_add(duration)
             .ok_or(BifrostError::QueryTimeout)?;

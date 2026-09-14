@@ -10,13 +10,14 @@
   ],
   "properties": {
     "deadline_ms": {
-      "description": "Optional caller deadline in milliseconds.",
+      "description": "Optional caller deadline in milliseconds, valid in `1..=u32::MAX`.\n\nThe field is a wide signed integer so ordinary below- and above-range values deserialize and reach request validation, which owns the one closed range every client surface shares.",
       "type": [
         "integer",
         "null"
       ],
-      "format": "uint64",
-      "minimum": 0.0
+      "format": "int64",
+      "maximum": 4294967295.0,
+      "minimum": 1.0
     },
     "freshness": {
       "description": "Required freshness behavior.",

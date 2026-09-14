@@ -16,6 +16,7 @@ use wyrd_queue::QueueConfig;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{BifrostQueryRequest, FreshnessPolicy, VisibilityMode};
+use wyrd_spec::vala::error::BifrostError;
 
 /// JavaScript query request projected onto the pure Wyrd contract.
 #[napi(object)]
@@ -26,8 +27,12 @@ pub struct NativeQueryRequest {
     pub visibility: String,
     /// `strict` or `allow_degraded`.
     pub freshness: String,
-    /// Optional positive query deadline.
-    pub deadline_ms: Option<u32>,
+    /// Optional query deadline in milliseconds, valid in `1..=u32::MAX`.
+    ///
+    /// Accepted as a JavaScript number so every out-of-range, fractional, or
+    /// non-finite value reaches the structured startup failure instead of a
+    /// napi binding error.
+    pub deadline_ms: Option<f64>,
 }
 
 /// One raw native iterator step consumed by the TypeScript Arrow facade.
@@ -680,7 +685,10 @@ impl NativeBifrost {
                 Ok(freshness) => freshness,
                 Err(error) => return Ok(NativeQueryStart::failure(&error)),
             },
-            deadline_ms: request.deadline_ms.map(u64::from),
+            deadline_ms: match request.deadline_ms.map(parse_deadline_ms).transpose() {
+                Ok(deadline_ms) => deadline_ms,
+                Err(error) => return Ok(NativeQueryStart::failure(&error)),
+            },
         };
         Ok(match self.client.query_client().query(&request).await {
             Ok(stream) => NativeQueryStart::success(stream),
@@ -989,6 +997,26 @@ fn parse_visibility(value: &str) -> Result<VisibilityMode, BifrostClientError> {
             "visibility must be published_only or fused".to_owned(),
         )),
     }
+}
+
+/// Converts a JavaScript deadline number into the shared signed request field.
+///
+/// Only exact integers pass through the lossless decimal round trip; the
+/// `1..=u32::MAX` range is left to `BifrostQueryRequest::validate` so every
+/// surface shares one check and one catalog error.
+///
+/// # Errors
+///
+/// Returns the shared query-contract validation error for a non-finite,
+/// fractional, or beyond-`i64` number.
+fn parse_deadline_ms(value: f64) -> Result<i64, BifrostClientError> {
+    value.to_string().parse().map_err(|_| {
+        BifrostClientError::Transport(WyrdError::Vala {
+            error: BifrostError::QueryInvalidSql {
+                detail: "deadline_ms must be an integer between 1 and 4294967295".to_owned(),
+            },
+        })
+    })
 }
 
 /// Parses the native freshness spelling.

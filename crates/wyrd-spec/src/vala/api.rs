@@ -533,22 +533,32 @@ pub struct BifrostQueryRequest {
     pub visibility: VisibilityMode,
     /// Required freshness behavior.
     pub freshness: FreshnessPolicy,
-    /// Optional caller deadline in milliseconds.
-    pub deadline_ms: Option<u64>,
+    /// Optional caller deadline in milliseconds, valid in `1..=u32::MAX`.
+    ///
+    /// The field is a wide signed integer so ordinary below- and above-range
+    /// values deserialize and reach request validation, which owns the one
+    /// closed range every client surface shares.
+    #[schemars(range(min = 1, max = 4_294_967_295_u32))]
+    #[cfg_attr(feature = "server", schema(minimum = 1, maximum = 4_294_967_295_u32))]
+    pub deadline_ms: Option<i64>,
 }
 
 impl BifrostQueryRequest {
     /// Validates request fields whose limits are part of the pure protocol.
     ///
     /// # Errors
-    /// Returns [`QueryContractError`] when SQL is empty or the deadline is zero.
+    /// Returns [`QueryContractError`] when SQL is empty or the deadline is
+    /// outside `1..=u32::MAX` milliseconds.
     pub fn validate(&self) -> Result<(), QueryContractError> {
         if self.sql.trim().is_empty() {
             return Err(QueryContractError::Empty { field: "sql" });
         }
-        if self.deadline_ms == Some(0) {
+        if self
+            .deadline_ms
+            .is_some_and(|deadline| !(1..=i64::from(u32::MAX)).contains(&deadline))
+        {
             return Err(QueryContractError::InvalidTerminal {
-                reason: "deadline_ms must be positive",
+                reason: "deadline_ms must be between 1 and 4294967295",
             });
         }
         Ok(())
@@ -1228,6 +1238,48 @@ mod query_terminal_tests {
             deadline_ms: Some(0),
         };
         assert!(invalid.validate().is_err());
+    }
+
+    /// The deadline accepts exactly `1..=u32::MAX`, and the generated schema
+    /// publishes the same bounds.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a boundary value is misclassified or the schema bounds drift.
+    #[test]
+    fn query_request_deadline_range_is_closed_and_published() {
+        let request = |deadline_ms| BifrostQueryRequest {
+            sql: "SELECT 1".into(),
+            visibility: VisibilityMode::PublishedOnly,
+            freshness: FreshnessPolicy::Strict,
+            deadline_ms: Some(deadline_ms),
+        };
+        let max = i64::from(u32::MAX);
+        for valid in [1, max] {
+            request(valid)
+                .validate()
+                .expect("in-range deadline validates");
+        }
+        for invalid in [-1, 0, max + 1] {
+            assert!(
+                request(invalid).validate().is_err(),
+                "{invalid} must be rejected"
+            );
+        }
+        let decoded: BifrostQueryRequest = serde_json::from_value(serde_json::json!({
+            "sql": "SELECT 1",
+            "visibility": "published_only",
+            "freshness": "strict",
+            "deadline_ms": max + 1
+        }))
+        .expect("an above-range deadline deserializes for validation");
+        assert!(decoded.validate().is_err());
+
+        let schema = serde_json::to_value(schemars::schema_for!(BifrostQueryRequest).schema)
+            .expect("request schema serializes");
+        let deadline = &schema["properties"]["deadline_ms"];
+        assert_eq!(deadline["minimum"].as_f64(), Some(1.0));
+        assert_eq!(deadline["maximum"].as_f64(), Some(f64::from(u32::MAX)));
     }
 
     /// Every explicit safe or opt-in policy pair round-trips without inference.

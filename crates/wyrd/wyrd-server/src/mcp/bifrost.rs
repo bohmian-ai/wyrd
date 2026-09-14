@@ -331,7 +331,7 @@ impl QueryArguments {
             sql: self.sql.clone(),
             visibility: self.visibility,
             freshness: self.freshness,
-            deadline_ms: self.deadline_ms.map(u64::from),
+            deadline_ms: self.deadline_ms.map(i64::from),
         }
     }
 }
@@ -1208,7 +1208,7 @@ mod tests {
         let request = named.to_request();
         assert_eq!(request.visibility, VisibilityMode::Fused);
         assert_eq!(request.freshness, FreshnessPolicy::AllowDegraded);
-        assert_eq!(request.deadline_ms, Some(u64::from(u32::MAX)));
+        assert_eq!(request.deadline_ms, Some(i64::from(u32::MAX)));
 
         for (case, arguments) in [
             ("blank sql", serde_json::json!({"sql": "   "})),

@@ -390,7 +390,13 @@ export interface NativeQueryRequest {
   visibility: string
   /** `strict` or `allow_degraded`. */
   freshness: string
-  /** Optional positive query deadline. */
+  /**
+   * Optional query deadline in milliseconds, valid in `1..=u32::MAX`.
+   *
+   * Accepted as a JavaScript number so every out-of-range, fractional, or
+   * non-finite value reaches the structured startup failure instead of a
+   * napi binding error.
+   */
   deadlineMs?: number
 }
 

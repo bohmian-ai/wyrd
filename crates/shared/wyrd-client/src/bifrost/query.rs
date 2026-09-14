@@ -249,9 +249,13 @@ impl QueryClient {
         &self,
         request: &BifrostQueryRequest,
     ) -> Result<QueryResultStream, BifrostClientError> {
-        request
-            .validate()
-            .map_err(|error| BifrostClientError::Protocol(error.to_string()))?;
+        request.validate().map_err(|error| {
+            BifrostClientError::Transport(WyrdError::Vala {
+                error: BifrostError::QueryInvalidSql {
+                    detail: error.to_string(),
+                },
+            })
+        })?;
         let request_id = RequestId::now_v7();
         let response = self
             .client

@@ -426,7 +426,7 @@ impl Bifrost {
         sql: &str,
         visibility: &str,
         freshness: &str,
-        deadline_ms: Option<u64>,
+        deadline_ms: Option<i64>,
     ) -> WyrdPyResult<PyBifrostQueryStream> {
         let request = BifrostQueryRequest {
             sql: sql.to_owned(),

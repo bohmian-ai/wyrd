@@ -71,6 +71,50 @@ mod tests {
         }
     }
 
+    /// Every public Bifrost table, query, and lifecycle operation publishes its
+    /// pre-stream refusals as typed `WyrdProblem` bodies.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an operation omits a common or route-specific refusal, or
+    /// publishes one without the shared problem schema.
+    #[test]
+    fn bifrost_operations_publish_typed_problem_refusals() {
+        let document = serde_json::to_value(WyrdApiDoc::openapi()).expect("OpenAPI is JSON");
+        let problem_ref = "#/components/schemas/WyrdProblem";
+        let operations: [(&str, &str, &[&str]); 7] = [
+            ("/v1/bifrost/tables", "post", &["400", "409", "503"]),
+            ("/v1/bifrost/tables", "get", &["503"]),
+            (
+                "/v1/bifrost/tables/{namespace}/{name}",
+                "get",
+                &["400", "404", "503"],
+            ),
+            ("/v1/query", "post", &["400", "503"]),
+            ("/v1/query/running", "get", &["409", "503"]),
+            (
+                "/v1/query/{request_id}",
+                "get",
+                &["400", "404", "409", "503"],
+            ),
+            (
+                "/v1/query/{request_id}",
+                "delete",
+                &["400", "404", "409", "503"],
+            ),
+        ];
+        for (path, method, specific) in operations {
+            let responses = &document["paths"][path][method]["responses"];
+            for status in ["401", "403", "default"].iter().chain(specific) {
+                assert_eq!(
+                    responses[*status]["content"]["application/json"]["schema"]["$ref"],
+                    problem_ref,
+                    "{method} {path} must publish {status} as WyrdProblem"
+                );
+            }
+        }
+    }
+
     #[test]
     fn card_contract_publishes_typed_lifecycle_and_problem_shapes() {
         let document = serde_json::to_value(WyrdApiDoc::openapi()).expect("OpenAPI is JSON");

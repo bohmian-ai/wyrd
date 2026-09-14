@@ -230,7 +230,10 @@ impl TryFrom<proto::BifrostQueryRequest> for domain::BifrostQueryRequest {
             sql: value.sql,
             visibility: visibility(value.visibility)?,
             freshness: freshness(value.freshness)?,
-            deadline_ms: value.deadline_ms,
+            // Above-`i64` wire values stay out of range so validation rejects them.
+            deadline_ms: value
+                .deadline_ms
+                .map(|deadline| i64::try_from(deadline).unwrap_or(i64::MAX)),
         };
         request.validate()?;
         Ok(request)
@@ -254,7 +257,10 @@ impl From<domain::BifrostQueryRequest> for proto::BifrostQueryRequest {
                     proto::FreshnessPolicy::AllowDegraded as i32
                 }
             },
-            deadline_ms: value.deadline_ms,
+            // Negative contract values stay out of range as zero on the unsigned wire.
+            deadline_ms: value
+                .deadline_ms
+                .map(|deadline| u64::try_from(deadline).unwrap_or(0)),
         }
     }
 }

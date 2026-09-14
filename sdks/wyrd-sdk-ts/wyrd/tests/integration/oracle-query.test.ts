@@ -176,6 +176,27 @@ describe("Oracle query journey", () => {
       server.shutdown();
     }
   });
+
+  it("rejects out-of-range deadlines with the shared validation error", async () => {
+    const server = startTestServer();
+    try {
+      const client = await Bifrost.connect({
+        serverUrl: server.baseUrl,
+        credential: server.token,
+        grpcUrl: server.grpcUrl,
+      });
+      for (const deadlineMs of [0, 4_294_967_296, 1.5, Number.NaN]) {
+        await expect(
+          client.stream({ sql: "SELECT 1", deadlineMs }),
+        ).rejects.toMatchObject({
+          code: "WYRD_VALA_400_QUERY_INVALID_SQL",
+          status: 400,
+        } satisfies Partial<WyrdError>);
+      }
+    } finally {
+      server.shutdown();
+    }
+  });
 });
 
 /** Hex-decoded canonical trace and span identifiers the fixture writes. */

@@ -1266,7 +1266,7 @@ async fn drive_inactive_sql(
                     sql: sql.to_owned(),
                     visibility: wyrd_spec::vala::api::VisibilityMode::PublishedOnly,
                     freshness: wyrd_spec::vala::api::FreshnessPolicy::Strict,
-                    deadline_ms: Some(STATEMENT_DEADLINE_MS),
+                    deadline_ms: Some(STATEMENT_DEADLINE_MS.cast_signed()),
                 },
                 attempt,
             )

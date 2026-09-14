@@ -3,6 +3,7 @@
 use axum::extract::{Path, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use wyrd_spec::error::WyrdProblem;
 use wyrd_spec::vala::api::{
     BifrostTableDescription, BifrostTableEntry, RegisterTableRequest, RegisterTableResponse,
 };
@@ -23,7 +24,15 @@ pub fn router() -> Router<AppState> {
     post,
     path = "/v1/bifrost/tables",
     request_body = RegisterTableRequest,
-    responses((status = 200, body = RegisterTableResponse)),
+    responses(
+        (status = 200, description = "Table created or matched", body = RegisterTableResponse),
+        (status = 400, description = "Invalid table declaration", body = WyrdProblem),
+        (status = 401, description = "Authentication required", body = WyrdProblem),
+        (status = 403, description = "Bifrost table registration permission required", body = WyrdProblem),
+        (status = 409, description = "Schema fingerprint conflict", body = WyrdProblem),
+        (status = 503, description = "Catalog unavailable", body = WyrdProblem),
+        (status = "default", description = "Other catalog-backed refusal", body = WyrdProblem)
+    ),
     tag = "Bifrost"
 )]
 /// Registers one Bifrost table for the authenticated tenant, or matches an
@@ -47,7 +56,13 @@ pub(crate) async fn register(
 #[utoipa::path(
     get,
     path = "/v1/bifrost/tables",
-    responses((status = 200, body = Vec<BifrostTableEntry>)),
+    responses(
+        (status = 200, description = "Visible table entries", body = Vec<BifrostTableEntry>),
+        (status = 401, description = "Authentication required", body = WyrdProblem),
+        (status = 403, description = "Bifrost table read permission required", body = WyrdProblem),
+        (status = 503, description = "Catalog unavailable", body = WyrdProblem),
+        (status = "default", description = "Other catalog-backed refusal", body = WyrdProblem)
+    ),
     tag = "Bifrost"
 )]
 /// Lists the schema-free table entries the authenticated tenant may name.
@@ -73,7 +88,15 @@ pub(crate) async fn list(
         ("namespace" = String, Path, description = "Table namespace"),
         ("name" = String, Path, description = "Table name")
     ),
-    responses((status = 200, body = BifrostTableDescription), (status = 404, description = "No visible table")),
+    responses(
+        (status = 200, description = "Table description", body = BifrostTableDescription),
+        (status = 400, description = "Invalid table name", body = WyrdProblem),
+        (status = 401, description = "Authentication required", body = WyrdProblem),
+        (status = 403, description = "Bifrost table read permission required", body = WyrdProblem),
+        (status = 404, description = "No visible table", body = WyrdProblem),
+        (status = 503, description = "Catalog unavailable", body = WyrdProblem),
+        (status = "default", description = "Other catalog-backed refusal", body = WyrdProblem)
+    ),
     tag = "Bifrost"
 )]
 /// Describes one visible table with its stored user and managed columns.

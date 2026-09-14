@@ -12,7 +12,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::StreamExt;
 use vala_bifrost_redux::oracle::OracleQueryStream;
-use wyrd_spec::error::WyrdError;
+use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
     BifrostQueryRequest, CancelRunningQueryResponse, ListRunningQueriesResponse,
@@ -90,7 +90,14 @@ pub fn router() -> Router<AppState> {
 #[utoipa::path(
     get,
     path = "/v1/query/running",
-    responses((status = 200, body = ListRunningQueriesResponse)),
+    responses(
+        (status = 200, description = "Active queries", body = ListRunningQueriesResponse),
+        (status = 401, description = "Authentication required", body = WyrdProblem),
+        (status = 403, description = "Query lifecycle permission required", body = WyrdProblem),
+        (status = 409, description = "Query owner conflict", body = WyrdProblem),
+        (status = 503, description = "Query control unavailable", body = WyrdProblem),
+        (status = "default", description = "Other catalog-backed refusal", body = WyrdProblem)
+    ),
     tag = "Bifrost"
 )]
 /// Lists active queries for the authenticated tenant.
@@ -115,7 +122,16 @@ pub(crate) async fn list_running_queries(
     get,
     path = "/v1/query/{request_id}",
     params(("request_id" = String, Path, description = "Canonical query request ID")),
-    responses((status = 200, body = RunningQuerySummary), (status = 404, description = "No visible active query")),
+    responses(
+        (status = 200, description = "Active query", body = RunningQuerySummary),
+        (status = 400, description = "Invalid request ID", body = WyrdProblem),
+        (status = 401, description = "Authentication required", body = WyrdProblem),
+        (status = 403, description = "Query lifecycle permission required", body = WyrdProblem),
+        (status = 404, description = "No visible active query", body = WyrdProblem),
+        (status = 409, description = "Query owner conflict", body = WyrdProblem),
+        (status = 503, description = "Query control unavailable", body = WyrdProblem),
+        (status = "default", description = "Other catalog-backed refusal", body = WyrdProblem)
+    ),
     tag = "Bifrost"
 )]
 /// Returns one active query for the authenticated tenant.
@@ -148,7 +164,16 @@ pub(crate) async fn get_running_query(
     delete,
     path = "/v1/query/{request_id}",
     params(("request_id" = String, Path, description = "Canonical query request ID")),
-    responses((status = 200, body = CancelRunningQueryResponse), (status = 404, description = "No visible active query")),
+    responses(
+        (status = 200, description = "Cancellation accepted", body = CancelRunningQueryResponse),
+        (status = 400, description = "Invalid request ID", body = WyrdProblem),
+        (status = 401, description = "Authentication required", body = WyrdProblem),
+        (status = 403, description = "Query lifecycle permission required", body = WyrdProblem),
+        (status = 404, description = "No visible active query", body = WyrdProblem),
+        (status = 409, description = "Query owner conflict", body = WyrdProblem),
+        (status = 503, description = "Query control unavailable", body = WyrdProblem),
+        (status = "default", description = "Other catalog-backed refusal", body = WyrdProblem)
+    ),
     tag = "Bifrost"
 )]
 /// Requests idempotent cancellation for one active query in the authenticated tenant.
@@ -194,7 +219,11 @@ pub(crate) async fn cancel_running_query(
                 )
             )
         ),
-        (status = 503, description = "Oracle role is unavailable")
+        (status = 400, description = "Invalid query request", body = WyrdProblem),
+        (status = 401, description = "Authentication required", body = WyrdProblem),
+        (status = 403, description = "Query permission required", body = WyrdProblem),
+        (status = 503, description = "Oracle role is unavailable", body = WyrdProblem),
+        (status = "default", description = "Other catalog-backed refusal", body = WyrdProblem)
     ),
     tag = "Bifrost"
 )]

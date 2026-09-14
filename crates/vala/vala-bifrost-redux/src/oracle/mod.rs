@@ -4069,9 +4069,10 @@ pub fn physical_build_observation_for_test() -> (u64, String) {
     (total, latest)
 }
 
-/// Projects omitted and zero request budgets to the configured immutable default.
-fn projected_request_deadline(requested_ms: Option<u64>, default: Duration) -> Duration {
+/// Projects omitted, zero, and negative request budgets to the configured immutable default.
+fn projected_request_deadline(requested_ms: Option<i64>, default: Duration) -> Duration {
     requested_ms
+        .and_then(|deadline_ms| u64::try_from(deadline_ms).ok())
         .filter(|deadline_ms| *deadline_ms != 0)
         .map_or(default, Duration::from_millis)
 }

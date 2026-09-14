@@ -36,7 +36,10 @@ pub struct NativeCardsConnection {
 /// chain as `connectBifrost`, so both capabilities authenticate identically.
 /// Credential and configuration failures are returned as catalog metadata.
 #[napi]
-pub fn connect_cards(server_url: Option<String>, credential: Option<String>) -> NativeCardsConnection {
+pub fn connect_cards(
+    server_url: Option<String>,
+    credential: Option<String>,
+) -> NativeCardsConnection {
     let client = wyrd_client::bifrost::client_from_options(
         server_url.as_deref(),
         credential.as_deref(),

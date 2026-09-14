@@ -2132,9 +2132,11 @@ impl ForgeWorker {
     ///
     /// An unowned cleanup row carrying evidence is residue: an earlier attempt
     /// deleted objects and checkpointed a scan it never finished. Recovery runs
-    /// it through the ordinary execution and settlement path, so a durably
-    /// settled non-success is progress rather than a recovery failure and the
-    /// caller simply asks the predicate again.
+    /// it through the ordinary execution path and records the result through
+    /// [`Self::record_settled_claim`], exactly as the event loop does, so a
+    /// resumed cursor is logged, observed, and counted like any other attempt.
+    /// A durably settled non-success is progress rather than a recovery failure
+    /// and the caller simply asks the predicate again.
     ///
     /// Returns whether a cursor was claimed at all, which is what tells the
     /// drain loop apart from a pass that made no progress and must wait.
@@ -2182,10 +2184,10 @@ impl ForgeWorker {
         // Boxed for the same reason the event loop is: execution nests deeply, and
         // holding that whole state machine inline inside the startup drain
         // pushes the composed server future past rustc's layout-query budget.
+        let started = Instant::now();
         let result = Box::pin(self.execute_claim(claim, shutdown)).await;
-        if result? {
-            self.record_completion(task_id, strategy);
-        }
+        self.record_settled_claim(task_id, strategy, started, result)
+            .await?;
         Ok(true)
     }
 

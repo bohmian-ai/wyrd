@@ -175,9 +175,6 @@ impl WriterPool {
         card_ref: Option<CardRef>,
         run_id: Option<RunId>,
     ) -> Result<(), WyrdQueueError> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(WyrdQueueError::QueueFull);
-        }
         self.producer_for(table, schema)?
             .enqueue(json, card_ref, run_id)
     }
@@ -250,9 +247,11 @@ impl WriterPool {
 
     /// Drain every pooled producer and stop its background task.
     ///
-    /// The handle closes before it drains the current producer registry. Once
-    /// each producer enters its draining state, new rows are rejected and
-    /// buffered rows are sent before this method returns. Terminally drained
+    /// The handle closes and snapshots the producer registry under the one
+    /// producer-map lock that admission also holds, so no producer can be
+    /// created or returned after the snapshot. Once each producer enters its
+    /// draining state, new rows are rejected and buffered rows are sent before
+    /// this method returns. Terminally drained
     /// producers are removed and release their fixed-storage guards; a timed
     /// out ambiguous producer stays retained for a later shutdown retry.
     ///
@@ -265,14 +264,13 @@ impl WriterPool {
     /// Panics if the producer pool mutex is poisoned, which indicates an
     /// invariant-breaking panic in another handle operation.
     pub(crate) fn shutdown(&self) -> Result<(), WyrdQueueError> {
-        self.closed.store(true, Ordering::Release);
-        let mut producers = self
-            .producers
-            .lock()
-            .expect("producer pool poisoned")
-            .iter()
-            .map(|(key, producer)| (key.table.clone(), Arc::clone(producer)))
-            .collect::<Vec<_>>();
+        let mut producers = {
+            let pool = self.producers.lock().expect("producer pool poisoned");
+            self.closed.store(true, Ordering::Release);
+            pool.iter()
+                .map(|(key, producer)| (key.table.clone(), Arc::clone(producer)))
+                .collect::<Vec<_>>()
+        };
         producers.sort_by(|left, right| left.0.cmp(&right.0));
         let mut first_error = None;
         for (_, producer) in producers {
@@ -304,6 +302,20 @@ impl WriterPool {
     }
 
     /// Get-or-create the pooled producer for `(scope, Record, table)`.
+    ///
+    /// Closure is observed while holding the producer-map lock, the same lock
+    /// [`Self::shutdown`] closes and snapshots under, so an admitted producer is
+    /// always in the shutdown snapshot and a lookup after it is refused.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WyrdQueueError::QueueFull`] once the pool has closed,
+    /// [`WyrdQueueError::Backpressure`] when the producer ceiling is reached, and
+    /// the producer construction error otherwise.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the producer pool mutex is poisoned.
     fn producer_for(
         &self,
         table: &str,
@@ -311,6 +323,9 @@ impl WriterPool {
     ) -> Result<Arc<Producer>, WyrdQueueError> {
         let kind = SinkKind::Record;
         let mut pool = self.producers.lock().expect("producer pool poisoned");
+        if self.closed.load(Ordering::Acquire) {
+            return Err(WyrdQueueError::QueueFull);
+        }
         if let Some(producer) = pool.iter().find_map(|(key, producer)| {
             (key.scope == self.scope && key.kind == kind && key.table == table)
                 .then(|| Arc::clone(producer))
@@ -334,5 +349,84 @@ impl WriterPool {
         };
         pool.insert(key, Arc::clone(&producer));
         Ok(producer)
+    }
+}
+
+/// Admission and shutdown ordering over the shared producer-map lock.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ClientConfig;
+    use crate::transport::HttpConfig;
+    use arrow_schema::{DataType, Field, Schema};
+    use wyrd_queue::MockSink;
+
+    /// A producer lookup that crosses shutdown is either in the drained
+    /// snapshot or refused, never created behind it.
+    ///
+    /// The test holds the producer-map lock while shutdown starts, proving
+    /// closure is not observable until the lock is released; then a lookup
+    /// arriving after shutdown's snapshot — the interleaving where an insert
+    /// passed admission before shutdown — is refused without creating a
+    /// producer. The row admitted before shutdown is durably acknowledged and
+    /// no producer or dynamic ownership remains.
+    ///
+    /// # Panics
+    ///
+    /// Panics if shutdown misses the admitted row, a late lookup creates a
+    /// producer, or ownership outlives shutdown.
+    #[test]
+    fn shutdown_and_producer_admission_share_the_pool_lock() {
+        let sink = Arc::new(MockSink::new());
+        let config = ClientConfig {
+            http: HttpConfig {
+                base_url: "http://x".to_owned(),
+                ..HttpConfig::default()
+            },
+            credential: Some("secret".to_owned().into()),
+            ..ClientConfig::default()
+        };
+        let pool = WriterPool::new(
+            ClientScope::from_config(&config).expect("scope"),
+            Arc::clone(&sink) as Arc<dyn BatchSink<ClientByteGuard>>,
+            QueueConfig::default(),
+        );
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        pool.insert("admitted", &schema, br#"{"id": 1}"#.to_vec(), None, None)
+            .expect("row admitted before shutdown");
+
+        std::thread::scope(|scope| {
+            let guard = pool.producers.lock().expect("producer pool lock");
+            let shutdown = scope.spawn(|| pool.shutdown());
+            assert!(
+                !pool.closed.load(Ordering::Acquire),
+                "closure is only published under the producer-map lock"
+            );
+            drop(guard);
+            shutdown
+                .join()
+                .expect("shutdown thread")
+                .expect("shutdown drains the admitted row");
+        });
+
+        assert_eq!(
+            sink.received().len(),
+            1,
+            "admitted row durably acknowledged"
+        );
+        assert!(matches!(
+            pool.producer_for("late", &schema),
+            Err(WyrdQueueError::QueueFull)
+        ));
+        assert!(matches!(
+            pool.insert("late", &schema, br#"{"id": 2}"#.to_vec(), None, None),
+            Err(WyrdQueueError::QueueFull)
+        ));
+        let metrics = pool.metrics();
+        assert_eq!(metrics.producers, 0);
+        assert_eq!(metrics.owned_bytes, 0);
+        assert_eq!(metrics.live_batches, 0);
+        assert_eq!(metrics.total_reserved_bytes, 0);
     }
 }

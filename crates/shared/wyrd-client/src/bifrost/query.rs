@@ -21,6 +21,9 @@ use wyrd_spec::vala::api::{
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_tonic::frame_codec::FrameDecoder;
 use wyrd_tonic::query_conversion::QueryStreamConverter;
+// Aliased: the wire message shares its name with the domain frame it converts to.
+use wyrd_tonic::wyrd::v1::QueryStreamFrame as WireQueryStreamFrame;
+use wyrd_tonic::wyrd::v1::query_stream_frame::Frame as WireFrame;
 
 /// Maximum encoded protobuf frame accepted by the public query client.
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
@@ -399,9 +402,13 @@ pub struct RawQueryStream {
     body: ResponseBytes,
     /// Bounded protobuf length-delimited decoder.
     decoder: FrameDecoder,
-    /// Complete frames decoded from the most recent body chunk, each paired
-    /// with the record batch its Arrow fragment produced, if any.
-    pending: VecDeque<(QueryStreamFrame, Option<RecordBatch>)>,
+    /// Complete protobuf frames from the most recent body chunk, kept with
+    /// their Arrow fragments still encoded.
+    ///
+    /// Conversion and Arrow decoding run only when a frame is popped for
+    /// delivery, so however many frames one transport chunk coalesces, at most
+    /// one decoded `RecordBatch` exists in this stream's pending path.
+    pending: VecDeque<WireQueryStreamFrame>,
     /// Shared wire-to-domain ordering and terminal validator.
     converter: QueryStreamConverter,
     /// The one Arrow IPC decoder for this query's single split stream.
@@ -465,11 +472,8 @@ impl RawQueryStream {
         &mut self,
     ) -> Result<Option<(QueryStreamFrame, Option<RecordBatch>)>, BifrostClientError> {
         loop {
-            if let Some((frame, batch)) = self.pending.pop_front() {
-                if let QueryStreamFrame::Terminal(terminal) = &frame {
-                    self.terminal = Some(terminal.clone());
-                }
-                return Ok(Some((frame, batch)));
+            if let Some(frame) = self.pending.pop_front() {
+                return self.decode_frame(frame).map(Some);
             }
             match self.body.next().await {
                 Some(Ok(bytes)) => {
@@ -483,51 +487,9 @@ impl RawQueryStream {
                             })?;
                     let frames = self
                         .decoder
-                        .push::<wyrd_tonic::wyrd::v1::QueryStreamFrame>(&bytes)
+                        .push::<WireQueryStreamFrame>(&bytes)
                         .map_err(|error| BifrostClientError::Protocol(error.to_string()))?;
-                    for frame in frames {
-                        // The Arrow fragment is consumed before conversion so
-                        // the converter's row accounting and the decoder's
-                        // stream position advance from the same bytes exactly
-                        // once.
-                        let decoded = match frame.frame.as_ref() {
-                            Some(wyrd_tonic::wyrd::v1::query_stream_frame::Frame::Batch(batch)) => {
-                                Some(self.ipc.accept_batch(&batch.arrow_ipc_batch)?)
-                            }
-                            Some(wyrd_tonic::wyrd::v1::query_stream_frame::Frame::Schema(
-                                schema,
-                            )) => {
-                                self.ipc.accept_schema(&schema.arrow_ipc_schema)?;
-                                None
-                            }
-                            Some(wyrd_tonic::wyrd::v1::query_stream_frame::Frame::Terminal(_))
-                            | None => None,
-                        };
-                        let batch_rows = decoded
-                            .as_ref()
-                            .map(|batch| {
-                                u64::try_from(batch.num_rows()).map_err(|_| {
-                                    BifrostClientError::Protocol(
-                                        "row count does not fit u64".to_owned(),
-                                    )
-                                })
-                            })
-                            .transpose()?;
-                        let frame = self
-                            .converter
-                            .convert(frame, batch_rows)
-                            .map_err(|error| BifrostClientError::Protocol(error.to_string()))?;
-                        // The terminal's own validation already refused a
-                        // success that omits its end-of-stream; closing the
-                        // Arrow stream here proves the bytes it carries are the
-                        // real end of this decoder's stream.
-                        if let QueryStreamFrame::Terminal(terminal) = &frame
-                            && terminal.outcome != QueryTerminalOutcome::Failed
-                        {
-                            self.ipc.accept_eos(&terminal.arrow_ipc_eos)?;
-                        }
-                        self.pending.push_back((frame, decoded));
-                    }
+                    self.pending.extend(frames);
                 }
                 Some(Err(error)) => {
                     return Err(query_body_transport_error(error));
@@ -543,6 +505,54 @@ impl RawQueryStream {
                 }
             }
         }
+    }
+
+    /// Converts one wire frame at delivery time, decoding its Arrow fragment.
+    ///
+    /// The Arrow fragment is consumed before conversion so the converter's row
+    /// accounting and the stateful decoder's stream position advance from the
+    /// same bytes exactly once. A non-failed terminal closes the Arrow stream
+    /// with its end-of-stream bytes, and every terminal is retained as this
+    /// raw stream's provisional terminal.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed Arrow error for an undecodable fragment and a protocol
+    /// error for out-of-order, duplicate, post-terminal, or invalid frames.
+    fn decode_frame(
+        &mut self,
+        frame: WireQueryStreamFrame,
+    ) -> Result<(QueryStreamFrame, Option<RecordBatch>), BifrostClientError> {
+        let decoded = match frame.frame.as_ref() {
+            Some(WireFrame::Batch(batch)) => Some(self.ipc.accept_batch(&batch.arrow_ipc_batch)?),
+            Some(WireFrame::Schema(schema)) => {
+                self.ipc.accept_schema(&schema.arrow_ipc_schema)?;
+                None
+            }
+            Some(WireFrame::Terminal(_)) | None => None,
+        };
+        let batch_rows = decoded
+            .as_ref()
+            .map(|batch| {
+                u64::try_from(batch.num_rows()).map_err(|_| {
+                    BifrostClientError::Protocol("row count does not fit u64".to_owned())
+                })
+            })
+            .transpose()?;
+        let frame = self
+            .converter
+            .convert(frame, batch_rows)
+            .map_err(|error| BifrostClientError::Protocol(error.to_string()))?;
+        if let QueryStreamFrame::Terminal(terminal) = &frame {
+            // The terminal's own validation already refused a success that
+            // omits its end-of-stream; closing the Arrow stream here proves the
+            // bytes it carries are the real end of this decoder's stream.
+            if terminal.outcome != QueryTerminalOutcome::Failed {
+                self.ipc.accept_eos(&terminal.arrow_ipc_eos)?;
+            }
+            self.terminal = Some(terminal.clone());
+        }
+        Ok((frame, decoded))
     }
 
     /// Returns the validated terminal metadata, if it has been observed.
@@ -693,8 +703,8 @@ impl QueryResultStream {
     ///
     /// Returns protocol and Arrow errors, including a schema mismatch, multiple
     /// record batches inside one batch frame, missing terminal, failed terminal,
-    /// or mismatched terminal row count. A failed terminal is retained before
-    /// the error is returned.
+    /// or mismatched terminal row count. A failed terminal is retained, and its
+    /// error returned, only after the body reaches clean EOF.
     ///
     /// # Cancellation
     ///
@@ -704,7 +714,6 @@ impl QueryResultStream {
         if self.terminal.is_none()
             && self.settlement != StreamSettlement::Broken
             && let Some(terminal) = self.raw.terminal().cloned()
-            && terminal.outcome != QueryTerminalOutcome::Failed
         {
             if let Err(error) = terminal.validate_emitted_rows(self.emitted_rows) {
                 return Err(self.mark_broken(BifrostClientError::Protocol(error.to_string())));
@@ -753,14 +762,6 @@ impl QueryResultStream {
                             self.mark_broken(BifrostClientError::Protocol(error.to_string()))
                         );
                     }
-                    if terminal.outcome == QueryTerminalOutcome::Failed {
-                        self.terminal = Some(terminal.clone());
-                        // A failed terminal is the server's own settlement and
-                        // can never become a successful result, so it settles
-                        // here rather than waiting for the body to close.
-                        self.settlement = StreamSettlement::Settled;
-                        return Err(BifrostClientError::FailedTerminal { terminal });
-                    }
                     return self.finish_at_clean_eof(terminal).await;
                 }
             }
@@ -786,17 +787,20 @@ impl QueryResultStream {
         error
     }
 
-    /// Accepts a validated successful terminal only after the body reaches EOF.
+    /// Accepts a validated terminal only after the body reaches EOF.
     ///
     /// A terminal is a claim about a stream that has not ended yet. Retaining it
     /// before the body closes would let a duplicate terminal, a late schema, or
     /// a trailing batch arrive behind a result the caller already believes is
     /// complete. The raw stream retains the provisional terminal across cancelled
     /// reads. One further frame is polled within the remaining server-pinned
-    /// deadline; only clean EOF promotes it to this stream's public result.
+    /// deadline; only clean EOF promotes it to this stream's public result. A
+    /// failed terminal follows the same proof, so a duplicate terminal or any
+    /// other post-failure frame is a broken stream, not a validated failure.
     ///
     /// # Errors
-    /// Returns [`BifrostClientError::Protocol`] when any frame follows the terminal,
+    /// Returns [`BifrostClientError::FailedTerminal`] when a failed terminal is
+    /// followed by clean EOF, [`BifrostClientError::Protocol`] when any frame follows the terminal,
     /// the raw stream's own error unchanged when the body fails, and
     /// [`BifrostClientError::IncompleteQueryStream`] when the deadline passes before
     /// the body closes. Every one of those marks the body broken first.
@@ -809,10 +813,13 @@ impl QueryResultStream {
         self.encoded_bytes = self.raw.received_bytes();
         match observed {
             Ok(Ok(None)) => {
-                self.terminal = Some(terminal);
+                self.terminal = Some(terminal.clone());
                 // A terminal followed by clean EOF is the server's own
                 // settlement. Nothing is owed.
                 self.settlement = StreamSettlement::Settled;
+                if terminal.outcome == QueryTerminalOutcome::Failed {
+                    return Err(BifrostClientError::FailedTerminal { terminal });
+                }
                 Ok(None)
             }
             Ok(Ok(Some(_))) => Err(self.mark_broken(BifrostClientError::Protocol(
@@ -2629,6 +2636,138 @@ mod tests {
             result.terminal().expect("failed terminal retained").outcome,
             QueryTerminalOutcome::Failed
         );
+        assert_eq!(result.settlement, StreamSettlement::Settled);
+    }
+
+    /// A failed terminal is a validated failure only when clean EOF follows it.
+    ///
+    /// A duplicate terminal, a trailing batch, or a late schema after a failed
+    /// terminal breaks the exactly-one-terminal contract: the stream must not
+    /// retain the terminal, must report a protocol or Arrow failure instead of
+    /// the server's failure, and must owe exactly one settlement.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any trailing frame yields a retained failed terminal or
+    /// settlement is not owed exactly once.
+    #[tokio::test]
+    async fn failed_terminal_requires_clean_eof() {
+        for trailing in ["duplicate terminal", "batch", "schema"] {
+            let schema = test_schema();
+            let (mut ipc, prefix) = TestQueryIpc::open(&schema);
+            let batch = ipc.batch(&schema, &[1]);
+            let schema_frame = || {
+                QueryStreamFrame::Schema(QuerySchemaFrame {
+                    schema_fingerprint: "fingerprint".to_owned(),
+                    arrow_ipc_schema: prefix.clone(),
+                })
+            };
+            let follower = match trailing {
+                "duplicate terminal" => QueryStreamFrame::Terminal(failed_terminal(0)),
+                "batch" => QueryStreamFrame::Batch(QueryBatchFrame {
+                    arrow_ipc_batch: batch,
+                }),
+                _ => schema_frame(),
+            };
+            let chunks = vec![
+                encoded(schema_frame()),
+                encoded(QueryStreamFrame::Terminal(failed_terminal(0))),
+                encoded(follower),
+            ];
+            let mut result = result_stream(chunks, VisibilityMode::PublishedOnly);
+            let error = result
+                .next_batch()
+                .await
+                .expect_err("a trailing frame never yields success");
+            assert!(
+                matches!(
+                    error,
+                    BifrostClientError::Protocol(_) | BifrostClientError::Arrow(_)
+                ),
+                "{trailing}: {error:?}"
+            );
+            assert!(result.terminal().is_none(), "{trailing}");
+            assert_eq!(result.settlement, StreamSettlement::Broken, "{trailing}");
+            result.settle().await;
+            assert_eq!(result.settlement, StreamSettlement::Settled, "{trailing}");
+        }
+    }
+
+    /// One transport chunk carrying schema, many batches, and terminal is
+    /// decoded one frame per delivery.
+    ///
+    /// The pending queue holds only encoded wire frames, and the Arrow decoder
+    /// has consumed exactly the fragments already yielded, so no more than one
+    /// decoded batch is ever owned ahead of the caller. Order, row accounting,
+    /// and terminal validation are unchanged.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any batch is decoded before its delivery, rows reorder, or the
+    /// terminal is not retained.
+    #[tokio::test]
+    async fn coalesced_chunk_decodes_one_batch_per_delivery() {
+        let schema = test_schema();
+        let (mut ipc, prefix) = TestQueryIpc::open(&schema);
+        let values: Vec<i64> = (1..=16).collect();
+        let fragments: Vec<Vec<u8>> = values
+            .iter()
+            .map(|value| ipc.batch(&schema, &[*value]))
+            .collect();
+        let eos = ipc.close();
+        let mut body = encoded(QueryStreamFrame::Schema(QuerySchemaFrame {
+            schema_fingerprint: "fingerprint".to_owned(),
+            arrow_ipc_schema: prefix.clone(),
+        }));
+        for fragment in &fragments {
+            body.extend(encoded(QueryStreamFrame::Batch(QueryBatchFrame {
+                arrow_ipc_batch: fragment.clone(),
+            })));
+        }
+        body.extend(encoded(QueryStreamFrame::Terminal(success_terminal(
+            VisibilityMode::PublishedOnly,
+            16,
+            eos,
+        ))));
+
+        let mut result = result_stream(vec![body], VisibilityMode::PublishedOnly);
+        let mut rows = Vec::new();
+        let mut consumed = prefix.len();
+        for fragment in &fragments {
+            let batch = result
+                .next_batch()
+                .await
+                .expect("coalesced frame decodes")
+                .expect("batch present");
+            consumed += fragment.len();
+            let pending: &VecDeque<WireQueryStreamFrame> = &result.raw.pending;
+            assert!(
+                pending
+                    .iter()
+                    .all(|frame| !matches!(frame.frame, Some(WireFrame::Schema(_)))),
+                "only undelivered frames remain pending"
+            );
+            assert_eq!(
+                result.raw.arrow_ipc_bytes(),
+                consumed,
+                "only delivered fragments were decoded"
+            );
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("int64 column");
+            rows.extend(column.values().iter().copied());
+        }
+        assert!(
+            result
+                .next_batch()
+                .await
+                .expect("terminal validates")
+                .is_none()
+        );
+        assert_eq!(rows, values);
+        assert_eq!(result.terminal().expect("terminal retained").row_count, 16);
     }
 
     /// A standalone per-batch stream is refused; there is no compatibility mode.

@@ -1,0 +1,30 @@
+name: performance
+
+# Production-geometry qualification runs on its own schedule, separate from
+# pull-request lanes, nightly correctness, and live-cloud storage workflows.
+
+on:
+  schedule:
+    - cron: "0 8 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  MISE_LOCKED: "true"
+
+jobs:
+  forge-production-geometry:
+    name: forge production geometry
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          docker-images: "false"
+
+      - name: Run Forge production-geometry journey
+        run: mise run test:bifrost:journey:forge:production-geometry

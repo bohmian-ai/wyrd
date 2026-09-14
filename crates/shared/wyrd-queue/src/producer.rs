@@ -628,6 +628,7 @@ impl Producer {
                         flush_interval_ms: config.flush_interval_ms,
                         retry_attempt: 0,
                         retry_deadline: None,
+                        deferred_error: None,
                         lifetime: None,
                     },
                     fixed_storage,
@@ -640,8 +641,8 @@ impl Producer {
             _producer_permit: producer_permit,
         });
         wyrd_runtime::runtime().spawn(async move {
-            if let Some(reply) = task.run().await {
-                let _ = reply.send(Ok(()));
+            if let Some((reply, result)) = task.run().await {
+                let _ = reply.send(result);
             }
         });
         Ok(producer)
@@ -698,7 +699,9 @@ impl Producer {
     /// # Errors
     ///
     /// Returns typed backpressure when another control command is outstanding,
-    /// plus sealing and transport errors from the background owner.
+    /// plus sealing and transport errors from the background owner, including
+    /// a terminal refusal of a batch a background seal sent since the last
+    /// flush or shutdown reply.
     pub fn flush(&self) -> Result<Vec<[u8; 16]>, WyrdQueueError> {
         self.control(Ctrl::Flush)
     }
@@ -708,7 +711,8 @@ impl Producer {
     /// # Errors
     ///
     /// Returns typed backpressure when another control command is outstanding,
-    /// or the first durable transport error encountered while draining.
+    /// the first durable transport error encountered while draining, or an
+    /// earlier terminal refusal of a background-sent batch not yet reported.
     pub fn shutdown(&self) -> Result<(), WyrdQueueError> {
         if self.control_pending.swap(true, Ordering::AcqRel) {
             return Err(WyrdQueueError::Backpressure);
@@ -801,6 +805,13 @@ struct Task {
     retry_attempt: u32,
     /// Scheduled instant for the oldest retained ambiguity, if one is waiting.
     retry_deadline: Option<tokio::time::Instant>,
+    /// First unretained failure of a send no caller was waiting on.
+    ///
+    /// A row-count, interval, or retry seal can be refused terminally (for
+    /// example an RBAC denial) with no control command to carry the error, and
+    /// the refused batch is already consumed. The error waits here and is
+    /// reported, exactly once, by the next flush or shutdown reply.
+    deferred_error: Option<WyrdQueueError>,
     /// Fixed storage and producer admission held through task-owned state drop.
     lifetime: Option<TaskLifetime>,
 }
@@ -808,10 +819,17 @@ struct Task {
 impl Task {
     /// Runs the receiver loop until terminal drain or every sender is dropped.
     ///
-    /// A successful shutdown returns its reply sender only after this method
-    /// consumes `self`; the outer spawned future sends that reply after all
-    /// task-owned queue state and lifetime guards have dropped.
-    async fn run(mut self) -> Option<oneshot::Sender<Result<(), WyrdQueueError>>> {
+    /// A successful shutdown returns its reply sender, with the result to send,
+    /// only after this method consumes `self`; the outer spawned future sends
+    /// that reply after all task-owned queue state and lifetime guards have
+    /// dropped. The result is `Ok` unless a background send was refused since
+    /// the last control reply.
+    async fn run(
+        mut self,
+    ) -> Option<(
+        oneshot::Sender<Result<(), WyrdQueueError>>,
+        Result<(), WyrdQueueError>,
+    )> {
         let mut ticker = make_ticker(self.flush_interval_ms);
         loop {
             tokio::select! {
@@ -833,6 +851,7 @@ impl Task {
                                 }
                             }
                         };
+                        let result = self.report_deferred(result);
                         self.control_pending.store(false, Ordering::Release);
                         let _ = reply.send(result);
                     }
@@ -861,8 +880,9 @@ impl Task {
                         if result.is_ok() {
                             self.state.store(DRAINED, Ordering::Release);
                             self.control_pending.store(false, Ordering::Release);
-                            return Some(reply);
+                            return Some((reply, self.report_deferred(result)));
                         }
+                        let result = self.report_deferred(result);
                         self.control_pending.store(false, Ordering::Release);
                         let _ = reply.send(result);
                     }
@@ -878,10 +898,8 @@ impl Task {
                         self.channel_depth.fetch_sub(1, Ordering::AcqRel);
                         self.queue.ingest(row).await;
                         if self.queue.staging_len() >= self.flush_max_rows {
-                            match self.queue.seal_and_send().await {
-                                Ok(_) => self.reset_retry_schedule(),
-                                Err(_) => self.schedule_retry_if_retained(),
-                            }
+                            let result = self.queue.seal_and_send().await;
+                            self.settle_background(result);
                         }
                     }
                     None => {
@@ -893,18 +911,14 @@ impl Task {
                 },
                 () = tick(&mut ticker) => {
                     if self.retry_deadline.is_none() && self.queue.staging_len() > 0 {
-                        match self.queue.seal_and_send().await {
-                            Ok(_) => self.reset_retry_schedule(),
-                            Err(_) => self.schedule_retry_if_retained(),
-                        }
+                        let result = self.queue.seal_and_send().await;
+                        self.settle_background(result);
                     }
                 },
                 () = wait_for_retry(self.retry_deadline), if self.retry_deadline.is_some() => {
                     self.retry_deadline = None;
-                    match self.queue.seal_and_send().await {
-                        Ok(_) => self.reset_retry_schedule(),
-                        Err(_) => self.schedule_retry_if_retained(),
-                    }
+                    let result = self.queue.seal_and_send().await;
+                    self.settle_background(result);
                 },
             }
         }
@@ -915,6 +929,44 @@ impl Task {
         while let Ok(row) = self.rx.try_recv() {
             self.channel_depth.fetch_sub(1, Ordering::AcqRel);
             self.queue.ingest(row).await;
+        }
+    }
+
+    /// Settles a seal that no flush or shutdown caller is waiting on.
+    ///
+    /// Success clears retry timing. A failure that retained its batch is
+    /// scheduled for retry and surfaces through the retry deadline. A failure
+    /// that consumed its batch cannot be retried, so the first such error is
+    /// kept for [`Self::report_deferred`] instead of being dropped.
+    fn settle_background<T>(&mut self, result: Result<T, WyrdQueueError>) {
+        match result {
+            Ok(_) => self.reset_retry_schedule(),
+            Err(error) => {
+                self.schedule_retry_if_retained();
+                if self.retry_deadline.is_none() {
+                    self.deferred_error.get_or_insert(error);
+                }
+            }
+        }
+    }
+
+    /// Replaces a control reply with the earliest deferred background failure.
+    ///
+    /// The deferred error happened before this control command's own seal, so
+    /// it is reported first and cleared; a later control reply sees only its
+    /// own result.
+    ///
+    /// # Errors
+    ///
+    /// Returns the deferred background error when one is waiting, otherwise
+    /// `result` unchanged.
+    fn report_deferred<T>(
+        &mut self,
+        result: Result<T, WyrdQueueError>,
+    ) -> Result<T, WyrdQueueError> {
+        match self.deferred_error.take() {
+            Some(error) => Err(error),
+            None => result,
         }
     }
 
@@ -1087,6 +1139,7 @@ mod tests {
                 flush_interval_ms: config.flush_interval_ms,
                 retry_attempt: 0,
                 retry_deadline: None,
+                deferred_error: None,
                 lifetime: None,
             },
             tx,
@@ -1800,5 +1853,89 @@ mod tests {
         assert_eq!(budget.metrics().retry_entries, 0);
         assert_eq!(budget.metrics().live_batches, 0);
         task_handle.abort();
+    }
+
+    /// Sink that terminally refuses every batch and signals each attempt.
+    struct RefusingSink {
+        /// Tells the test thread a background seal has reached the sink.
+        attempted: Mutex<std::sync::mpsc::Sender<()>>,
+    }
+
+    #[async_trait]
+    impl BatchSink<ClientByteGuard> for RefusingSink {
+        /// Refuses the borrowed batch so the queue consumes it without retry.
+        ///
+        /// # Errors
+        ///
+        /// Always returns [`SinkError::Terminal`].
+        ///
+        /// # Panics
+        ///
+        /// Panics if the test-only signal mutex is poisoned.
+        async fn send(
+            &self,
+            _batch: &SealedBatch<ClientByteGuard>,
+        ) -> Result<DurableBatchAck, SinkError> {
+            let _ = self
+                .attempted
+                .lock()
+                .expect("refusing sink signal lock poisoned")
+                .send(());
+            Err(SinkError::Terminal(
+                wyrd_spec::error::WyrdError::ServiceUnavailable {
+                    message: "refusing sink".to_owned(),
+                    details: serde_json::json!({ "refusing": true }),
+                },
+            ))
+        }
+    }
+
+    /// A background send's terminal refusal reaches the next flush, once.
+    ///
+    /// A one-row threshold makes the task seal and send the row as soon as it
+    /// arrives, before any flush command exists. The refused batch is consumed,
+    /// so the explicit flush has nothing of its own to send; it must still
+    /// report the refusal, and neither a second flush nor shutdown may report
+    /// it again.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the refusal is dropped, reported twice, or the sink is never
+    /// reached.
+    #[test]
+    fn background_terminal_refusal_is_reported_by_the_next_flush_once() {
+        let (signal, attempted) = std::sync::mpsc::channel();
+        let sink = Arc::new(RefusingSink {
+            attempted: Mutex::new(signal),
+        });
+        let config = QueueConfig {
+            flush_interval_ms: 0,
+            flush_max_rows: 1,
+            ..QueueConfig::default()
+        };
+        let producer = Producer::with_budget(
+            "vala.bifrost.background_refusal",
+            schema(),
+            sink,
+            config,
+            ClientByteBudget::new(QueueConfig::MAX_CLIENT_BYTE_LIMIT),
+        )
+        .expect("producer starts");
+        producer
+            .enqueue(br#"{"id":1}"#.to_vec(), Some(card()), None)
+            .expect("row admitted");
+        attempted
+            .recv()
+            .expect("the row-count seal reaches the sink");
+
+        let first = producer.flush();
+        assert!(
+            matches!(first, Err(WyrdQueueError::Sink(_))),
+            "the refusal must reach the caller: {first:?}"
+        );
+        let second = producer.flush();
+        assert!(second.is_ok(), "a refusal is reported once: {second:?}");
+        let shutdown = producer.shutdown();
+        assert!(shutdown.is_ok(), "nothing remains to report: {shutdown:?}");
     }
 }

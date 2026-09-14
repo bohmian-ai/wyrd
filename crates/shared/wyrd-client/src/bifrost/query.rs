@@ -927,6 +927,9 @@ impl QueryResultStream {
             return;
         }
         Self::poll_until_retired(client, request_id, self.deadline_ms).await;
+        // A drain failure marked the body broken; the completed status cycle
+        // discharged that, so this stream owes nothing further.
+        self.settlement = StreamSettlement::Settled;
     }
 
     /// Drains a healthy body to its terminal within the query deadline.
@@ -1388,6 +1391,48 @@ mod tests {
         )
         .expect("the epoch millisecond fits an i64");
         now + millis
+    }
+
+    /// A healthy stream whose settlement drain fails settles exactly once.
+    ///
+    /// The drain meets an undecodable frame, which marks the body broken and
+    /// falls back to the status proof. A completed cycle must leave the stream
+    /// terminally settled, so a second call neither cancels nor polls again.
+    ///
+    /// # Panics
+    ///
+    /// Panics if settlement cancels or polls status more than once.
+    #[tokio::test]
+    async fn failed_healthy_drain_settles_once() {
+        let schema = test_schema();
+        let (mut ipc, prefix) = TestQueryIpc::open(&schema);
+        let batch = ipc.batch(&schema, &[1, 2, 3]);
+        let counts = Arc::new(LifecycleCounts::default());
+        let base_url = lifecycle_server(Arc::clone(&counts));
+        let mut stream = settling_stream(
+            vec![
+                encoded(QueryStreamFrame::Schema(QuerySchemaFrame {
+                    schema_fingerprint: String::new(),
+                    arrow_ipc_schema: prefix,
+                })),
+                encoded(QueryStreamFrame::Batch(QueryBatchFrame {
+                    arrow_ipc_batch: batch,
+                })),
+                encoded(QueryStreamFrame::Batch(QueryBatchFrame {
+                    arrow_ipc_batch: vec![0xff, 0xff, 0xff, 0xff],
+                })),
+            ],
+            &base_url,
+            deadline_in(30_000),
+        );
+        stream.next_batch().await.expect("first batch decodes");
+
+        stream.settle().await;
+        stream.settle().await;
+
+        assert_eq!(counts.cancels.load(Ordering::Acquire), 1);
+        assert_eq!(counts.statuses.load(Ordering::Acquire), 1);
+        assert_eq!(stream.settlement, StreamSettlement::Settled);
     }
 
     /// Every incomplete exit settles the server exactly once, under the deadline.

@@ -3,8 +3,8 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex, PoisonError};
 
 use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
@@ -45,6 +45,10 @@ pub(crate) struct WriterPool {
     producers: Mutex<HashMap<ProducerKey, Arc<Producer>>>,
     /// Rejects inserts once shutdown begins its terminal drain.
     closed: AtomicBool,
+    /// Direct Arrow sends admitted under the producer-map lock and not yet settled.
+    direct_sends: Mutex<usize>,
+    /// Wakes shutdown whenever an admitted direct send settles.
+    direct_settled: Condvar,
     dropped: AtomicU64,
     drop_warned: AtomicBool,
 }
@@ -87,6 +91,8 @@ impl WriterPool {
             budget: ClientByteBudget::new(config.client_byte_limit()),
             producers: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
+            direct_sends: Mutex::new(0),
+            direct_settled: Condvar::new(),
             dropped: AtomicU64::new(0),
             drop_warned: AtomicBool::new(false),
         }
@@ -191,19 +197,32 @@ impl WriterPool {
     /// Durability is complete when this resolves; unlike [`Self::insert`] there
     /// is nothing left for a later flush to do.
     ///
+    /// Admission is decided under the producer-map lock [`Self::shutdown`]
+    /// closes under, and an admitted send is counted until its future
+    /// completes or is dropped, so shutdown either refuses this send or waits
+    /// for it to release its batch and byte ownership.
+    ///
     /// # Errors
     ///
     /// Returns [`WyrdQueueError::QueueFull`] once the pool has closed, and
     /// otherwise the encode, byte-envelope, or stable server refusal reported
     /// by [`SealedBatchSender::send`].
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping the future releases its admission and any reserved ownership;
+    /// a batch already handed to the sink may still have been committed, and a
+    /// retry with a new call is a new batch identity.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the producer pool or direct-send mutex is poisoned.
     pub(crate) async fn write_batch(
         &self,
         table: &str,
         batch: &RecordBatch,
     ) -> Result<(), WyrdQueueError> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(WyrdQueueError::QueueFull);
-        }
+        let _admitted = DirectSendPermit::admit(self)?;
         SealedBatchSender::new(Arc::clone(&self.sink), self.budget.clone(), self.config)
             .send(table, batch)
             .await
@@ -251,7 +270,8 @@ impl WriterPool {
     /// producer-map lock that admission also holds, so no producer can be
     /// created or returned after the snapshot. Once each producer enters its
     /// draining state, new rows are rejected and buffered rows are sent before
-    /// this method returns. Terminally drained
+    /// this method returns. Direct Arrow sends admitted before closure are
+    /// awaited until each settles. Terminally drained
     /// producers are removed and release their fixed-storage guards; a timed
     /// out ambiguous producer stays retained for a later shutdown retry.
     ///
@@ -271,6 +291,14 @@ impl WriterPool {
                 .map(|(key, producer)| (key.table.clone(), Arc::clone(producer)))
                 .collect::<Vec<_>>()
         };
+        let mut direct_sends = self.direct_sends.lock().expect("direct sends poisoned");
+        while *direct_sends > 0 {
+            direct_sends = self
+                .direct_settled
+                .wait(direct_sends)
+                .expect("direct sends poisoned");
+        }
+        drop(direct_sends);
         producers.sort_by(|left, right| left.0.cmp(&right.0));
         let mut first_error = None;
         for (_, producer) in producers {
@@ -352,14 +380,174 @@ impl WriterPool {
     }
 }
 
+/// One admitted direct Arrow send that [`WriterPool::shutdown`] must await.
+///
+/// Created only while the pool is open under the producer-map lock; dropping it,
+/// on completion or cancellation, settles the admission and wakes shutdown.
+struct DirectSendPermit<'pool> {
+    /// The pool whose direct-send count this permit holds one unit of.
+    pool: &'pool WriterPool,
+}
+
+impl<'pool> DirectSendPermit<'pool> {
+    /// Admits one direct send unless shutdown has already closed the pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WyrdQueueError::QueueFull`] once the pool has closed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the producer pool or direct-send mutex is poisoned.
+    fn admit(pool: &'pool WriterPool) -> Result<Self, WyrdQueueError> {
+        let _producers = pool.producers.lock().expect("producer pool poisoned");
+        if pool.closed.load(Ordering::Acquire) {
+            return Err(WyrdQueueError::QueueFull);
+        }
+        *pool.direct_sends.lock().expect("direct sends poisoned") += 1;
+        Ok(Self { pool })
+    }
+}
+
+impl Drop for DirectSendPermit<'_> {
+    /// Settles this admission and wakes a shutdown waiting for direct sends.
+    fn drop(&mut self) {
+        let mut direct_sends = self
+            .pool
+            .direct_sends
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *direct_sends -= 1;
+        self.pool.direct_settled.notify_all();
+    }
+}
+
 /// Admission and shutdown ordering over the shared producer-map lock.
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::ClientConfig;
     use crate::transport::HttpConfig;
+    use arrow::array::Int64Array;
     use arrow_schema::{DataType, Field, Schema};
-    use wyrd_queue::MockSink;
+    use async_trait::async_trait;
+    use std::time::Duration;
+    use tokio::sync::Notify;
+    use wyrd_queue::{DurableBatchAck, MockSink, SealedBatch, SinkError};
+
+    /// Sink that parks each send until the test releases it, counting acks.
+    #[derive(Default)]
+    struct ReleaseSink {
+        /// Signalled once a send has reached the sink.
+        started: Notify,
+        /// Released by the test to let the parked send acknowledge.
+        release: Notify,
+        /// Sends acknowledged so far.
+        acked: AtomicU64,
+    }
+
+    #[async_trait]
+    impl BatchSink<ClientByteGuard> for ReleaseSink {
+        /// Parks until released, then acknowledges `batch` durably.
+        async fn send(
+            &self,
+            batch: &SealedBatch<ClientByteGuard>,
+        ) -> Result<DurableBatchAck, SinkError> {
+            self.started.notify_one();
+            self.release.notified().await;
+            self.acked.fetch_add(1, Ordering::SeqCst);
+            Ok(DurableBatchAck {
+                batch_id: batch.batch_id,
+                rows: batch.rows,
+            })
+        }
+    }
+
+    /// Builds a pool over `sink` with a valid scope and default tuning.
+    fn pool_over(sink: Arc<dyn BatchSink<ClientByteGuard>>) -> WriterPool {
+        let config = ClientConfig {
+            http: HttpConfig {
+                base_url: "http://x".to_owned(),
+                ..HttpConfig::default()
+            },
+            credential: Some("secret".to_owned().into()),
+            ..ClientConfig::default()
+        };
+        WriterPool::new(
+            ClientScope::from_config(&config).expect("scope"),
+            sink,
+            QueueConfig::default(),
+        )
+    }
+
+    /// Shutdown waits for a direct Arrow send admitted before closure.
+    ///
+    /// The send is parked inside the sink while shutdown closes the pool; the
+    /// sink is released only after closure is published and shutdown is shown
+    /// still pending on the parked send. Shutdown must observe
+    /// the acknowledgement and zero live ownership at the moment it returns, and
+    /// a later direct send is refused before admission.
+    ///
+    /// # Panics
+    ///
+    /// Panics if shutdown returns before the admitted send settles, ownership
+    /// outlives shutdown, or a post-closure send is admitted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_waits_for_admitted_direct_write() {
+        let sink = Arc::new(ReleaseSink::default());
+        let pool = Arc::new(pool_over(
+            Arc::clone(&sink) as Arc<dyn BatchSink<ClientByteGuard>>
+        ));
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64]))],
+        )
+        .expect("batch");
+
+        let writer = tokio::spawn({
+            let pool = Arc::clone(&pool);
+            let batch = batch.clone();
+            async move { pool.write_batch("direct", &batch).await }
+        });
+        sink.started.notified().await;
+
+        let mut shutdown = tokio::task::spawn_blocking({
+            let pool = Arc::clone(&pool);
+            let sink = Arc::clone(&sink);
+            move || {
+                let result = pool.shutdown();
+                (result, sink.acked.load(Ordering::SeqCst), pool.metrics())
+            }
+        });
+        while !pool.closed.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut shutdown)
+                .await
+                .is_err(),
+            "shutdown must not return while an admitted send is parked"
+        );
+        sink.release.notify_one();
+
+        let (result, acked_at_return, metrics) = shutdown.await.expect("shutdown task");
+        result.expect("shutdown succeeds");
+        assert_eq!(acked_at_return, 1, "shutdown awaited the admitted send");
+        assert_eq!(metrics.live_batches, 0);
+        assert_eq!(metrics.owned_bytes, 0);
+        assert_eq!(metrics.total_reserved_bytes, 0);
+        writer
+            .await
+            .expect("writer task")
+            .expect("admitted send acknowledged");
+        assert!(matches!(
+            pool.write_batch("late", &batch).await,
+            Err(WyrdQueueError::QueueFull)
+        ));
+        assert_eq!(sink.acked.load(Ordering::SeqCst), 1);
+    }
 
     /// A producer lookup that crosses shutdown is either in the drained
     /// snapshot or refused, never created behind it.

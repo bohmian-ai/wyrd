@@ -2598,8 +2598,9 @@ impl WyrdTestServer {
     /// (boot's `build_workload_bindings`), and the jwt-bearer exchange looks the
     /// principal up by exact JSONB `card_ref` equality. The role-bearing
     /// `bootstrap_service` helper mints a random `uid`, so it can never match a
-    /// binding. This seeds a principal under the binding's exact `card_ref` so a
-    /// config-driven workload journey resolves to a real account.
+    /// binding. This registers the bound Card and seeds a principal under the
+    /// binding's exact `card_ref`, so a config-driven workload journey resolves
+    /// to a real account and its token mint can walk the registered card scope.
     ///
     /// # Errors
     /// Returns an error when the card kind is not Service/Agent, or SQL fails.
@@ -2639,6 +2640,7 @@ impl WyrdTestServer {
         let principal_id = Uuid::now_v7();
         let creator_id = self.ensure_fixture_admin_for(tenant_id).await?;
         let mut conn = self.tenant_conn_for(tenant_id).await?;
+        seed_machine_card(&mut conn, card_ref, creator_id).await?;
         insert_service_account(
             &mut conn,
             principal_id,
@@ -3708,14 +3710,19 @@ impl WyrdTestServerBuilder {
             runtime_wyrd.app_pool().clone(),
         )));
 
+        // Match production's five-second epoch cache so repeated requests do not
+        // force a SQL lookup each. A caller that disables the token cache asks to
+        // observe revocation immediately, and in-process servers have no NOTIFY
+        // invalidator, so that caller reads the epoch fresh on every verify.
+        let revocation_pool = Arc::new(runtime_wyrd.app_pool().clone());
+        let revocation = if verify_settings.cache_ttl.is_zero() {
+            SqlRevocationCheck::new_with_ttl(revocation_pool, Duration::ZERO)
+        } else {
+            SqlRevocationCheck::new(revocation_pool)
+        };
         let verifier = Arc::new(
             TokenVerifier::new(decoding_keys, "wyrd", resolver, verify_settings)
-                // Match production's five-second epoch cache. Immediate
-                // revocation remains covered by the focused auth test seam;
-                // repeated test requests must not force a SQL lookup per request.
-                .with_revocation(Arc::new(SqlRevocationCheck::new(Arc::new(
-                    runtime_wyrd.app_pool().clone(),
-                ))))
+                .with_revocation(Arc::new(revocation))
                 .with_external(
                     Arc::new(JwksCache::new(
                         reqwest::Client::new(),

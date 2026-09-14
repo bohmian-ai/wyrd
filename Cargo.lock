@@ -11199,6 +11199,7 @@ dependencies = [
  "wyrd-runtime",
  "wyrd-semver",
  "wyrd-spec",
+ "wyrd-tls",
 ]
 
 [[package]]

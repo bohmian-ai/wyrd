@@ -169,6 +169,15 @@ mod tests {
 
     use super::*;
 
+    /// Builds a discovery HTTP client after installing Wyrd's Rustls provider.
+    ///
+    /// The workspace reqwest has no built-in provider; production installs
+    /// Wyrd's before building clients, so each test process must too.
+    fn http_client() -> reqwest::Client {
+        wyrd_tls::install_crypto_provider().expect("Wyrd owns the Rustls provider");
+        reqwest::Client::new()
+    }
+
     fn asymmetric_discovery_body(issuer: &str) -> serde_json::Value {
         serde_json::json!({
             "issuer": issuer,
@@ -192,7 +201,7 @@ mod tests {
             .await;
 
         let issuer_url: Url = issuer.parse().expect("server uri is valid url");
-        let provider = OidcProvider::discover(issuer_url, reqwest::Client::new())
+        let provider = OidcProvider::discover(issuer_url, http_client())
             .await
             .expect("discover should succeed");
 
@@ -224,7 +233,7 @@ mod tests {
             .await;
 
         let issuer_url: Url = issuer.parse().expect("server uri is valid url");
-        let err = OidcProvider::discover(issuer_url, reqwest::Client::new())
+        let err = OidcProvider::discover(issuer_url, http_client())
             .await
             .expect_err("issuer mismatch should fail");
 
@@ -251,7 +260,7 @@ mod tests {
             .await;
 
         let issuer_url: Url = issuer.parse().expect("server uri is valid url");
-        let err = OidcProvider::discover(issuer_url, reqwest::Client::new())
+        let err = OidcProvider::discover(issuer_url, http_client())
             .await
             .expect_err("symmetric-only algs should fail");
 
@@ -271,7 +280,7 @@ mod tests {
             .await;
 
         let issuer_url: Url = server.uri().parse().expect("server uri is valid url");
-        let err = OidcProvider::discover(issuer_url, reqwest::Client::new())
+        let err = OidcProvider::discover(issuer_url, http_client())
             .await
             .expect_err("503 should fail");
 
@@ -297,7 +306,7 @@ mod tests {
         // Request URL has a trailing slash.
         let with_slash = format!("{issuer}/");
         let issuer_url: Url = with_slash.parse().expect("url is valid");
-        let provider = OidcProvider::discover(issuer_url, reqwest::Client::new())
+        let provider = OidcProvider::discover(issuer_url, http_client())
             .await
             .expect("trailing slash should be normalized away");
 

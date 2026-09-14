@@ -315,6 +315,9 @@ mod tests {
     }
 
     fn cache() -> JwksCache {
+        // The workspace reqwest has no built-in Rustls provider; production
+        // installs Wyrd's before building clients, so each test process must too.
+        wyrd_tls::install_crypto_provider().expect("Wyrd owns the Rustls provider");
         JwksCache::new(
             reqwest::Client::new(),
             Duration::from_secs(300),

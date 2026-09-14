@@ -805,6 +805,14 @@ hide = true
 description = "Self-tests for the test-family coverage checker (dedup, missing, phantom detection)"
 run = "bash scripts/tests/test_test_coverage.sh"
 
+[tasks."check:ci-selection"]
+hide = true
+description = "Self-tests for pull-request lane selection and required-job aggregation"
+run = """
+bash .github/scripts/tests/test-detect-changes.sh
+bash .github/scripts/tests/test-verify-required-jobs.sh
+"""
+
 [tasks."check:error-coverage"]
 hide = true
 description = "Assert emitted Skald error codes are mapped and SQL errors have coverage"
@@ -1364,6 +1372,7 @@ depends = [
   "check:clippy-allow-audit:self",
   "check:tenant-isolation:self",
   "check:test-coverage:self",
+  "check:ci-selection",
   "check:storage:drift",
   "check:registry-tx-coupling",
   "check:registry-immutable-spec-hash",

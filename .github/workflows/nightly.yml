@@ -56,3 +56,40 @@ jobs:
 
       - name: Run full gate
         run: mise run gate
+
+  identity:
+    name: identity journey
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          docker-images: "false"
+
+      - name: Run identity journey
+        run: mise run test:identity:journey
+
+  postgres:
+    name: isolated Postgres checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          docker-images: "false"
+
+      - name: Run isolated Postgres contract checks
+        run: mise run test:postgres:contract
+
+      - name: Run isolated Postgres concurrency checks
+        run: mise run test:postgres:concurrency
+
+      - name: Run isolated Postgres role checks
+        run: mise run test:postgres:roles
+
+      - name: Run isolated Postgres inventory checks
+        run: mise run test:postgres:inventory

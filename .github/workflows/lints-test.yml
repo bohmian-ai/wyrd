@@ -23,6 +23,7 @@ jobs:
       ui: ${{ steps.filter.outputs.ui }}
       workflow: ${{ steps.filter.outputs.workflow }}
       bifrost_only: ${{ steps.filter.outputs.bifrost_only }}
+      full_gate: ${{ steps.filter.outputs.full_gate }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -57,11 +58,13 @@ jobs:
           fi
           cat "$GITHUB_OUTPUT"
 
-  # Mixed, global, and unclassified Rust changes take the conservative full gate.
+  # Mixed, global, and unclassified changes take the complete repository gate.
+  # Any other non-Bifrost Rust change runs format and lint here; its tests run
+  # in rust-compat.
   ci:
     name: ci
     needs: changes
-    if: (needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflow == 'true') && needs.changes.outputs.bifrost_only != 'true'
+    if: needs.changes.outputs.full_gate == 'true' || ((needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflow == 'true') && needs.changes.outputs.bifrost_only != 'true')
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -102,8 +105,8 @@ jobs:
       - name: Add wasm target
         run: rustup target add wasm32-unknown-unknown
 
-      - name: Run CI gate
-        run: mise run gate
+      - name: Run selected CI lane
+        run: mise run ${{ needs.changes.outputs.full_gate == 'true' && 'gate' || 'check' }}
 
   bifrost:
     name: bifrost
@@ -310,19 +313,17 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
+      - uses: actions/checkout@v4
+
       - name: Verify required jobs
         shell: bash
-        run: |
-          set -euo pipefail
-          for result in \
-            "${{ needs.ci.result }}" \
-            "${{ needs.bifrost.result }}" \
-            "${{ needs.rust-compat.result }}" \
-            "${{ needs.python.result }}" \
-            "${{ needs.docs.result }}" \
-            "${{ needs.ui.result }}"; do
-            case "$result" in
-              success|skipped) ;;
-              *) echo "CI job failed or was cancelled: $result"; exit 1 ;;
-            esac
-          done
+        run: >-
+          .github/scripts/verify-required-jobs.sh
+          "${{ needs.changes.result }}"
+          "${{ needs.matrix-plan.result }}"
+          "${{ needs.ci.result }}"
+          "${{ needs.bifrost.result }}"
+          "${{ needs.rust-compat.result }}"
+          "${{ needs.python.result }}"
+          "${{ needs.docs.result }}"
+          "${{ needs.ui.result }}"

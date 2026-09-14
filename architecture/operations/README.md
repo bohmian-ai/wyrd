@@ -61,6 +61,13 @@ The closed target mapping is:
 | `scribe` | yes | Scribe |
 | `forge-worker` | no | Forge worker |
 
+Every Bifrost-managed local path derives from `WYRD_BIFROST_DATA_DIR`
+(default `.wyrd/bifrost`). The root is the Scribe WAL base and holds the stable
+node identity; `scribe-stage`, `scribe-output-scratch`, and `oracle-spill` are
+its only children, and Forge has none. Boot creates them and takes an exclusive
+lock on the root before any role activates, so an unusable or already-owned
+root fails before readiness. Durable replicas need a distinct per-pod volume.
+
 A dependency that becomes unhealthy removes readiness for every entry that
 requires it. Existing accepted work follows its owner's bounded drain or
 recovery state machine; readiness loss does not destroy durable evidence.

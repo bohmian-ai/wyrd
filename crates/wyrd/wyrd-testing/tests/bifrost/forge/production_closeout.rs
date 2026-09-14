@@ -260,7 +260,7 @@ impl CloseoutJourney {
         if profile.production_resources {
             spec.nodes[1].forge_compaction_memory_limit_bytes = Some(16 * 1024 * 1024 * 1024);
             spec.nodes[1].oracle = Some(TestOracleResources {
-                spill_root: None,
+                data_root_parent: None,
                 system_resources: Some(SystemResourceSnapshot {
                     memory_limit_bytes: 32 * 1024 * 1024 * 1024,
                     effective_cpu: 4,

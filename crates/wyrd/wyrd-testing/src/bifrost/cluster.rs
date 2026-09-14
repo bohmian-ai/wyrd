@@ -103,8 +103,8 @@ pub const fn full_bifrost_topology() -> BifrostTopology {
 /// Resources allocated to a node's Oracle test runtime.
 #[derive(Debug, Clone, Default)]
 pub struct TestOracleResources {
-    /// Optional parent directory for the retained local spill root.
-    pub spill_root: Option<PathBuf>,
+    /// Optional parent directory for the node's retained Bifrost data root.
+    pub data_root_parent: Option<PathBuf>,
     /// Complete raw process observation retained across node restarts.
     pub system_resources: Option<SystemResourceSnapshot>,
 }
@@ -709,10 +709,8 @@ pub fn shared_process_telemetry_for_test()
 struct NodeResources {
     /// Original node descriptor.
     spec: BifrostNodeSpec,
-    /// Retained Scribe WAL root, absent on query-only nodes.
-    wal_root: Option<Arc<tempfile::TempDir>>,
-    /// Retained Oracle/Forge spill root, absent on Scribe-only nodes.
-    spill_root: Option<Arc<tempfile::TempDir>>,
+    /// Retained Bifrost data root reused across restarts.
+    data_root: Arc<tempfile::TempDir>,
     /// Fixed public HTTP bind retained across a restart.
     http_addr: std::net::SocketAddr,
     /// Fixed private/public gRPC bind retained across a restart.
@@ -774,10 +772,8 @@ pub enum ClusterError {
 /// Configured local roots retained after an abrupt test-node termination.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetainedNodeRoots {
-    /// Scribe WAL root retained for replay.
-    pub wal_root: Option<PathBuf>,
-    /// Oracle/Forge spill root retained for replacement startup.
-    pub spill_root: Option<PathBuf>,
+    /// Bifrost data root retained for replay and replacement startup.
+    pub data_root: PathBuf,
     /// HTTP address proven closed by abrupt termination.
     pub previous_http_addr: std::net::SocketAddr,
     /// gRPC address proven closed by abrupt termination.
@@ -958,14 +954,7 @@ impl WyrdTestCluster {
             .get(&node_id)
             .ok_or_else(|| ClusterError::Resource(format!("unknown node {}", node_id.as_uuid())))?;
         Ok(RetainedNodeRoots {
-            wal_root: resources
-                .wal_root
-                .as_ref()
-                .map(|root| root.path().to_path_buf()),
-            spill_root: resources
-                .spill_root
-                .as_ref()
-                .map(|root| root.path().to_path_buf()),
+            data_root: resources.data_root.path().to_path_buf(),
             previous_http_addr: resources.http_addr,
             previous_grpc_addr: resources.grpc_addr,
             previous_writer_epoch,
@@ -1007,14 +996,7 @@ impl WyrdTestCluster {
         let previous_http_addr = resources.http_addr;
         let previous_grpc_addr = resources.grpc_addr;
         let observed = RetainedNodeRoots {
-            wal_root: resources
-                .wal_root
-                .as_ref()
-                .map(|root| root.path().to_path_buf()),
-            spill_root: resources
-                .spill_root
-                .as_ref()
-                .map(|root| root.path().to_path_buf()),
+            data_root: resources.data_root.path().to_path_buf(),
             previous_http_addr,
             previous_grpc_addr,
             previous_writer_epoch: roots.previous_writer_epoch,
@@ -1698,21 +1680,7 @@ impl WyrdTestCluster {
             scribe_admission_node.and_then(|index| spec.nodes.get(index).map(|node| node.node_id));
         let mut nodes = BTreeMap::new();
         for node in spec.nodes {
-            let wal_root = if node.roles.contains(&BifrostRuntimeRole::Scribe) {
-                Some(Arc::new(tempfile::tempdir().map_err(|error| {
-                    ClusterError::Resource(error.to_string())
-                })?))
-            } else {
-                None
-            };
-            let spill_root = if node.roles.contains(&BifrostRuntimeRole::Oracle)
-                || node.roles.contains(&BifrostRuntimeRole::ForgeCoordinator)
-                || node.roles.contains(&BifrostRuntimeRole::ForgeWorker)
-            {
-                Some(Arc::new(create_spill_root(node.oracle.as_ref())?))
-            } else {
-                None
-            };
+            let data_root = Arc::new(create_data_root(node.oracle.as_ref())?);
             let process_role = process_target_for_roles(&node.roles).ok_or_else(|| {
                 ClusterError::Resource(format!(
                     "node {} has no exact public process target",
@@ -1723,8 +1691,7 @@ impl WyrdTestCluster {
                 node.node_id,
                 NodeResources {
                     spec: node,
-                    wal_root,
-                    spill_root,
+                    data_root,
                     http_addr: reserve_loopback_addr()?,
                     grpc_addr: reserve_loopback_addr()?,
                     process_role,
@@ -1781,10 +1748,7 @@ impl WyrdTestCluster {
         let mut builder = WyrdTestServerBuilder::default()
             .with_wal_sync_delay(self.wal_sync_delay)
             .with_bifrost_node(node_id, resources.spec.roles.clone())
-            .with_bifrost_roots(
-                resources.wal_root.as_ref().map(Arc::clone),
-                resources.spill_root.as_ref().map(Arc::clone),
-            )
+            .with_bifrost_data_dir(Some(Arc::clone(&resources.data_root)))
             .with_bind_addrs(resources.http_addr, resources.grpc_addr)
             .with_oracle_peer_credentials(Arc::clone(&self.oracle_peer_credentials))
             .with_bifrost_storage_io_for_test(self.storage_io)
@@ -2324,14 +2288,14 @@ impl WyrdTestCluster {
     ///
     /// # Errors
     ///
-    /// Returns a resource error for an unknown node, a node without an Oracle
-    /// spill root, or any fixture-directory or marker-write failure.
+    /// Returns a resource error for an unknown node or any fixture-directory or
+    /// marker-write failure.
     pub fn seed_oracle_spill_restart_fixture(&self, node_id: NodeId) -> Result<(), ClusterError> {
         let root = self
             .nodes
             .get(&node_id)
-            .and_then(|resources| resources.spill_root.as_ref())
-            .ok_or_else(|| ClusterError::Resource("Oracle spill root missing".to_owned()))?;
+            .map(|resources| &resources.data_root)
+            .ok_or_else(|| ClusterError::Resource(format!("unknown node {}", node_id.as_uuid())))?;
         let oracle = root.path().join("oracle-spill");
         for child in ["oracle-runtime-stale", "unrelated-sibling"] {
             let directory = oracle.join(child);
@@ -2350,7 +2314,7 @@ impl WyrdTestCluster {
     ///
     /// # Errors
     ///
-    /// Returns a resource error for an unknown node or missing Oracle spill root.
+    /// Returns a resource error for an unknown node.
     pub fn oracle_spill_restart_fixture_state(
         &self,
         node_id: NodeId,
@@ -2358,8 +2322,8 @@ impl WyrdTestCluster {
         let root = self
             .nodes
             .get(&node_id)
-            .and_then(|resources| resources.spill_root.as_ref())
-            .ok_or_else(|| ClusterError::Resource("Oracle spill root missing".to_owned()))?;
+            .map(|resources| &resources.data_root)
+            .ok_or_else(|| ClusterError::Resource(format!("unknown node {}", node_id.as_uuid())))?;
         let oracle = root.path().join("oracle-spill");
         Ok((
             oracle.join("oracle-runtime-stale").exists(),
@@ -2451,7 +2415,8 @@ impl WyrdTestCluster {
     pub fn wal_dirs(&self) -> impl Iterator<Item = &Path> {
         self.nodes
             .values()
-            .filter_map(|resources| resources.wal_root.as_ref().map(|root| root.path()))
+            .filter(|resources| resources.spec.roles.contains(&BifrostRuntimeRole::Scribe))
+            .map(|resources| resources.data_root.path())
     }
 
     /// Explicitly stop every running server and release shared resources.
@@ -2596,20 +2561,20 @@ fn classify_topology(spec: &BifrostClusterSpec) -> BifrostTopology {
     }
 }
 
-/// Create a retained spill directory under an optional caller-selected parent.
+/// Create a retained Bifrost data directory under an optional caller-selected parent.
 ///
 /// # Errors
 ///
 /// Returns [`ClusterError::Resource`] when the parent or temp directory cannot
 /// be created.
-fn create_spill_root(
+fn create_data_root(
     resources: Option<&TestOracleResources>,
 ) -> Result<tempfile::TempDir, ClusterError> {
-    if let Some(parent) = resources.and_then(|resources| resources.spill_root.as_deref()) {
+    if let Some(parent) = resources.and_then(|resources| resources.data_root_parent.as_deref()) {
         std::fs::create_dir_all(parent)
             .map_err(|error| ClusterError::Resource(error.to_string()))?;
         tempfile::Builder::new()
-            .prefix("oracle-spill-")
+            .prefix("bifrost-data-")
             .tempdir_in(parent)
             .map_err(|error| ClusterError::Resource(error.to_string()))
     } else {

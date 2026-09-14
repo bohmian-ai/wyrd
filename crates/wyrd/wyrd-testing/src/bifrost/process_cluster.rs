@@ -91,10 +91,8 @@ mod env {
     pub const STORAGE_ROOT: &str = "WYRD_PEER_TEST_STORAGE_ROOT";
     /// Bifrost target this child serves.
     pub const TARGET: &str = "WYRD_PEER_TEST_TARGET";
-    /// Child-private durable Scribe root.
-    pub const WAL_ROOT: &str = "WYRD_PEER_TEST_WAL_ROOT";
-    /// Child-private durable spill root.
-    pub const SPILL_ROOT: &str = "WYRD_PEER_TEST_SPILL_ROOT";
+    /// Child-private durable Bifrost data root.
+    pub const DATA_ROOT: &str = "WYRD_PEER_TEST_DATA_ROOT";
     /// Public HTTP socket this child binds.
     pub const HTTP_BIND: &str = "WYRD_PEER_TEST_HTTP_BIND";
     /// Public gRPC socket this child binds.
@@ -2274,13 +2272,12 @@ impl BifrostProcessCluster {
     fn launch(&self, plan: &LaunchPlan) -> Result<ProcessNode, ProcessClusterError> {
         let label = plan.label.clone();
         let root = self.shared.node_roots.path().join(&label);
-        let wal_root = root.join("wal");
-        let spill_root = root.join("spill");
-        for directory in [&root, &wal_root, &spill_root] {
+        let data_root = root.join("bifrost");
+        for directory in [&root, &data_root] {
             std::fs::create_dir_all(directory)
                 .map_err(|error| ProcessClusterError::Resource(error.to_string()))?;
         }
-        plan.volume.apply(&wal_root)?;
+        plan.volume.apply(&data_root)?;
         // The leaf lands under this child's own private root, and only its path
         // is passed on. No key material enters the child's argv or environment
         // value set beyond a filesystem path.
@@ -2318,8 +2315,7 @@ impl BifrostProcessCluster {
             .env(env::TENANT_SLUG, self.shared.fixture.tenant_slug())
             .env(env::STORAGE_ROOT, self.shared.storage_root.path())
             .env(env::TARGET, plan.target.as_str())
-            .env(env::WAL_ROOT, &wal_root)
-            .env(env::SPILL_ROOT, &spill_root)
+            .env(env::DATA_ROOT, &data_root)
             .env(env::HTTP_BIND, sockets.http.to_string())
             .env(env::GRPC_BIND, sockets.grpc.to_string())
             .env(env::PEER_BIND, sockets.peer.to_string())
@@ -2420,7 +2416,7 @@ impl BifrostProcessCluster {
                 advertise_addr: String::new(),
                 peer_certificate_fingerprint: String::new(),
                 ready: false,
-                wal_root: wal_root.display().to_string(),
+                wal_root: data_root.display().to_string(),
                 membership: Vec::new(),
             },
             sockets,

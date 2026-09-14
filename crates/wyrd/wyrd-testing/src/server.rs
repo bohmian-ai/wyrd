@@ -31,8 +31,8 @@ use vala_bifrost_redux::maintenance::{StagingFilePublisher, staging_file_channel
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::oracle::dispatcher::{DispatchError, OraclePeerCredentials};
 use vala_bifrost_redux::resources::{
-    BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources, BifrostVolumeRoots,
-    MIN_UNMANAGED_RESERVE_BYTES, ROLE_MEMORY_FLOOR_BYTES, ResourceSource, SystemResourceSnapshot,
+    BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources, MIN_UNMANAGED_RESERVE_BYTES,
+    ROLE_MEMORY_FLOOR_BYTES, ResourceSource, SystemResourceSnapshot,
 };
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
@@ -59,6 +59,7 @@ use wyrd_runtime::PermissionSet;
 use wyrd_runtime::{Permission, PrincipalId, RbacCheck, RoleRef};
 use wyrd_semver::VersionBlock;
 use wyrd_server::boot::build_workload_bindings;
+use wyrd_server::boot::data_root::BifrostDataRoot;
 use wyrd_server::boot::issuer::{seed_trusted_issuers, seed_workload_bindings};
 use wyrd_server::components::auth::audit_writer::{AuthzAuditWriter, NoopAuthzAuditWriter};
 use wyrd_server::config::{
@@ -240,9 +241,10 @@ struct WyrdTestServerInner {
     fixture: Arc<PgFixture>,
     /// Lifetime guard retained only for local storage-backed servers.
     _storage_root: Option<Arc<tempfile::TempDir>>,
-    _scribe_wal_root: Option<Arc<tempfile::TempDir>>,
-    /// Lifetime guard for the Forge and Oracle DataFusion spill root.
-    _bifrost_spill_root: Option<Arc<tempfile::TempDir>>,
+    /// Lifetime guard for a harness-created Bifrost data directory.
+    _bifrost_data_dir: Arc<tempfile::TempDir>,
+    /// Exclusive owner of this server's one Bifrost data root.
+    bifrost_data_root: BifrostDataRoot,
     state: AppState,
     router: axum::Router,
     verifier: Arc<TokenVerifier<SqlPermissionResolver, PgIssuerResolver>>,
@@ -478,17 +480,13 @@ pub struct WyrdTestServerBuilder {
     node_id: Option<NodeId>,
     /// Closed role set constructed for this server instance.
     bifrost_roles: BTreeSet<BifrostRuntimeRole>,
-    /// Cluster-retained Scribe WAL root reused across restarts.
-    scribe_wal_root: Option<Arc<tempfile::TempDir>>,
-    /// Caller-owned durable Scribe root that outlives this process.
+    /// Cluster-retained Bifrost data directory reused across restarts.
+    bifrost_data_dir: Option<Arc<tempfile::TempDir>>,
+    /// Caller-owned durable Bifrost data root that outlives this process.
     ///
     /// A multi-process harness needs a root a restarted child re-mounts, which
     /// a process-local [`tempfile::TempDir`] cannot be.
-    scribe_wal_path: Option<std::path::PathBuf>,
-    /// Cluster-retained Forge/Oracle spill root reused across restarts.
-    oracle_spill_root: Option<Arc<tempfile::TempDir>>,
-    /// Caller-owned durable spill root that outlives this process.
-    oracle_spill_path: Option<std::path::PathBuf>,
+    bifrost_data_path: Option<std::path::PathBuf>,
     /// Complete process observations injected into the production resource policy.
     system_resources: Option<SystemResourceSnapshot>,
     /// Configured Oracle query slot units, replacing the memory-derived count.
@@ -590,10 +588,8 @@ impl Default for WyrdTestServerBuilder {
             ]
             .into_iter()
             .collect(),
-            scribe_wal_root: None,
-            scribe_wal_path: None,
-            oracle_spill_root: None,
-            oracle_spill_path: None,
+            bifrost_data_dir: None,
+            bifrost_data_path: None,
             system_resources: None,
             oracle_query_slot_limit: None,
             forge_compaction_memory_limit_bytes: None,
@@ -1297,10 +1293,7 @@ impl WyrdTestServer {
     ///
     /// Returns a start error when scratch metadata cannot be inspected.
     fn inspect_oracle_spill(&self) -> Result<(u64, u64, u64), WyrdTestServerError> {
-        let Some(root) = self.inner._bifrost_spill_root.as_ref() else {
-            return Ok((0, 0, 0));
-        };
-        let oracle_root = root.path().join("oracle-spill");
+        let oracle_root = self.inner.bifrost_data_root.oracle_spill().to_path_buf();
         if !oracle_root.exists() {
             return Ok((0, 0, 0));
         }
@@ -2828,7 +2821,7 @@ impl WyrdTestServer {
     /// was handed. Returns `None` for a target that composes no Scribe role.
     #[must_use]
     pub fn scribe_wal_root_for_test(&self) -> Option<&std::path::Path> {
-        self.inner._scribe_wal_root.as_ref().map(|root| root.path())
+        Some(self.inner.bifrost_data_root.wal())
     }
 
     async fn raw_call(
@@ -3411,31 +3404,24 @@ impl WyrdTestServerBuilder {
         self
     }
 
-    /// Mount caller-owned durable WAL and spill roots that outlive the process.
+    /// Mount a caller-owned durable Bifrost data root that outlives the process.
     ///
     /// A simulated pod in a multi-process cluster is restarted by launching a
-    /// new child over the same directories, which is what makes a Scribe's
+    /// new child over the same directory, which is what makes a Scribe's
     /// volume-coupled identity observable across restart.
     #[must_use]
-    pub fn with_durable_bifrost_roots(
-        mut self,
-        scribe_wal: std::path::PathBuf,
-        oracle_spill: std::path::PathBuf,
-    ) -> Self {
-        self.scribe_wal_path = Some(scribe_wal);
-        self.oracle_spill_path = Some(oracle_spill);
+    pub fn with_durable_bifrost_data_root(mut self, data_root: std::path::PathBuf) -> Self {
+        self.bifrost_data_path = Some(data_root);
         self
     }
 
-    /// Reuse cluster-owned local WAL and spill directories for this node.
+    /// Reuse a cluster-owned local Bifrost data directory for this node.
     #[must_use]
-    pub(crate) fn with_bifrost_roots(
+    pub(crate) fn with_bifrost_data_dir(
         mut self,
-        scribe_wal_root: Option<Arc<tempfile::TempDir>>,
-        oracle_spill_root: Option<Arc<tempfile::TempDir>>,
+        data_dir: Option<Arc<tempfile::TempDir>>,
     ) -> Self {
-        self.scribe_wal_root = scribe_wal_root;
-        self.oracle_spill_root = oracle_spill_root;
+        self.bifrost_data_dir = data_dir;
         self
     }
 
@@ -3752,43 +3738,14 @@ impl WyrdTestServerBuilder {
                 BifrostRuntimeRole::Oracle => BifrostRole::Oracle,
             })
             .collect();
-        let spill_root = self.oracle_spill_root.clone().unwrap_or(Arc::new(
+        let data_dir = self.bifrost_data_dir.clone().unwrap_or(Arc::new(
             tempfile::tempdir().map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
         ));
-        let scratch_root = match &self.oracle_spill_path {
-            Some(path) => path.clone(),
-            None => spill_root.path().to_owned(),
-        };
-        let wal_root = self.scribe_wal_root.clone().unwrap_or(Arc::new(
-            tempfile::tempdir().map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
-        ));
-        let durable_wal_root = match &self.scribe_wal_path {
-            Some(path) => path.clone(),
-            None => wal_root.path().to_owned(),
-        };
-        let volume_roots = if self.bifrost_roles.is_empty() {
-            None
-        } else {
-            let wal_volume_root = durable_wal_root.clone();
-            let scribe_stage = wal_volume_root.join("scribe-stage");
-            let scribe_output = scratch_root.join("scribe-output");
-            let oracle_scratch = scratch_root.join("oracle");
-            for root in [
-                &wal_volume_root,
-                &scribe_stage,
-                &scribe_output,
-                &oracle_scratch,
-            ] {
-                std::fs::create_dir_all(root)
-                    .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-            }
-            Some(BifrostVolumeRoots {
-                wal: wal_volume_root,
-                scribe_stage,
-                scribe_output_scratch: scribe_output,
-                oracle_scratch,
-            })
-        };
+        let data_root =
+            BifrostDataRoot::prepare(self.bifrost_data_path.as_deref().unwrap_or(data_dir.path()))
+                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        let scratch_root = data_root.oracle_spill().to_path_buf();
+        let volume_roots = (!self.bifrost_roles.is_empty()).then(|| data_root.volume_roots());
         let snapshot = self.system_resources.unwrap_or(SystemResourceSnapshot {
             memory_limit_bytes: HARNESS_NODE_MEMORY_LIMIT_BYTES,
             effective_cpu: 4,
@@ -3880,7 +3837,7 @@ impl WyrdTestServerBuilder {
             Some(node_id) => node_id,
             None if self.bifrost_roles.contains(&BifrostRuntimeRole::Scribe) => {
                 let stored = wyrd_server::boot::node_identity::ScribeNodeIdentityStore::new(
-                    durable_wal_root.clone(),
+                    data_root.wal().to_path_buf(),
                 )
                 .load_or_create()
                 .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
@@ -4023,6 +3980,7 @@ impl WyrdTestServerBuilder {
             bifrost: bifrost_runtime,
             coordination_runtime,
             compaction_runtime,
+            data_root: bifrost_data_root,
         } = wyrd_server::boot::compose_bifrost(BifrostBuildInputs {
             target,
             deployment_profile: DeploymentProfile::Development,
@@ -4051,7 +4009,7 @@ impl WyrdTestServerBuilder {
                 self.peer_bind
                     .expect("peer bind is reserved before composition")
             ),
-            wal_dir: wal_root.path().to_owned(),
+            data_root,
             shutdown: shutdown.clone(),
             test_controls: Some(test_controls),
         })
@@ -4091,8 +4049,8 @@ impl WyrdTestServerBuilder {
             inner: WyrdTestServerInner {
                 fixture,
                 _storage_root: storage_root,
-                _scribe_wal_root: Some(wal_root),
-                _bifrost_spill_root: Some(spill_root),
+                _bifrost_data_dir: data_dir,
+                bifrost_data_root,
                 state,
                 router,
                 verifier,

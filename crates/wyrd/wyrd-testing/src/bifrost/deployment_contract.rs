@@ -28,7 +28,7 @@ struct Resource {
 struct DeploymentFacts {
     /// Labels placed on each pod.
     labels: BTreeMap<String, String>,
-    /// Enabled Wyrd roles from `WYRD_ROLES`.
+    /// Wyrd roles selected by the closed `WYRD_TARGET` value.
     roles: BTreeSet<String>,
     /// Container image, used to distinguish rollback from the candidate image.
     image: String,
@@ -40,6 +40,8 @@ struct DeploymentFacts {
     volume_mounts: BTreeMap<String, String>,
     /// Pod volumes backed by an `emptyDir` object.
     empty_dir_volumes: BTreeSet<String>,
+    /// Per-pod volume claim templates, present only on a `StatefulSet`.
+    claim_templates: BTreeSet<String>,
 }
 
 /// Complete semantic projection of one multi-document manifest.
@@ -71,7 +73,7 @@ fn parse_manifest(source: &str) -> Result<ManifestFacts, String> {
     for document in serde_yaml::Deserializer::from_str(source) {
         let resource = Resource::deserialize(document).map_err(|error| error.to_string())?;
         match resource.kind.as_str() {
-            "Deployment" => {
+            "Deployment" | "StatefulSet" => {
                 let selector = string_map(at(&resource.spec, &["selector", "matchLabels"])?)?;
                 let labels = string_map(at(&resource.spec, &["template", "metadata", "labels"])?)?;
                 if !selector
@@ -100,14 +102,36 @@ fn parse_manifest(source: &str) -> Result<ManifestFacts, String> {
                         ))
                     })
                     .collect::<Result<BTreeMap<_, _>, String>>()?;
-                let roles = environment
-                    .get("WYRD_ROLES")
+                let target = environment.get("WYRD_TARGET").ok_or_else(|| {
+                    format!("deployment {} omits WYRD_TARGET", resource.metadata.name)
+                })?;
+                let roles = target_roles(target)
                     .ok_or_else(|| {
-                        format!("deployment {} omits WYRD_ROLES", resource.metadata.name)
+                        format!(
+                            "deployment {} has unknown WYRD_TARGET {target}",
+                            resource.metadata.name
+                        )
                     })?
-                    .split(',')
-                    .map(str::to_owned)
+                    .iter()
+                    .map(|role| (*role).to_owned())
                     .collect();
+                let claim_templates = if resource.kind == "StatefulSet" {
+                    at(&resource.spec, &["volumeClaimTemplates"])
+                        .ok()
+                        .map(sequence)
+                        .transpose()?
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|entry| {
+                            at(entry, &["metadata", "name"])
+                                .ok()
+                                .and_then(|name| scalar(name).ok())
+                                .map(str::to_owned)
+                        })
+                        .collect()
+                } else {
+                    BTreeSet::new()
+                };
                 let volume_mounts = at(container, &["volumeMounts"])
                     .ok()
                     .map(sequence)
@@ -145,6 +169,7 @@ fn parse_manifest(source: &str) -> Result<ManifestFacts, String> {
                         environment,
                         volume_mounts,
                         empty_dir_volumes,
+                        claim_templates,
                     },
                 );
             }
@@ -198,6 +223,57 @@ fn parse_manifest(source: &str) -> Result<ManifestFacts, String> {
         }
     }
     Ok(facts)
+}
+
+/// Project one closed `WYRD_TARGET` value onto the manifest role vocabulary.
+fn target_roles(target: &str) -> Option<&'static [&'static str]> {
+    match target {
+        "all" | "server" => Some(&["scribe", "forge", "oracle"]),
+        "oracle" => Some(&["oracle"]),
+        "scribe" => Some(&["scribe"]),
+        "forge-worker" => Some(&["forge"]),
+        _ => None,
+    }
+}
+
+/// Validate that every pod mounts its one Bifrost data root with the right ownership.
+///
+/// Scribe-bearing pods must mount the root from a per-pod `StatefulSet` claim
+/// so replicas never share a WAL identity; other pods may use a pod-local
+/// `emptyDir`. The removed independent WAL variable is refused.
+///
+/// # Errors
+///
+/// Returns an error when a pod sets `WYRD_SCRIBE_WAL_DIR`, omits
+/// `WYRD_BIFROST_DATA_DIR`, mounts no volume at it, or backs a Scribe root with
+/// anything other than a per-pod claim.
+fn validate_data_root(facts: &ManifestFacts) -> Result<(), String> {
+    for (name, deployment) in &facts.deployments {
+        if deployment.environment.contains_key("WYRD_SCRIBE_WAL_DIR") {
+            return Err(format!("{name} sets removed WYRD_SCRIBE_WAL_DIR"));
+        }
+        let root = deployment
+            .environment
+            .get("WYRD_BIFROST_DATA_DIR")
+            .ok_or_else(|| format!("{name} omits WYRD_BIFROST_DATA_DIR"))?;
+        let volume = deployment
+            .volume_mounts
+            .iter()
+            .find_map(|(volume, path)| (path == root).then_some(volume))
+            .ok_or_else(|| format!("{name} mounts no volume at WYRD_BIFROST_DATA_DIR"))?;
+        let per_pod = deployment.claim_templates.contains(volume);
+        if deployment.roles.contains("scribe") && !per_pod {
+            return Err(format!(
+                "{name} Scribe data root must be a per-pod StatefulSet volume claim"
+            ));
+        }
+        if !per_pod && !deployment.empty_dir_volumes.contains(volume) {
+            return Err(format!(
+                "{name} data root must be a per-pod claim or a pod-local emptyDir"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Resolve a nested mapping path from semantic YAML.
@@ -300,6 +376,7 @@ fn validate_candidate(facts: &ManifestFacts, require_routes: bool) -> Result<(),
     {
         return Err("every deployment must use /readyz".to_owned());
     }
+    validate_data_root(facts)?;
     if require_routes {
         validate_service_role(facts, "wyrd-ingest", "scribe")?;
         validate_service_role(facts, "wyrd-query", "oracle")?;
@@ -330,30 +407,6 @@ fn validate_candidate(facts: &ManifestFacts, require_routes: bool) -> Result<(),
                 "role-separated manifest must contain Scribe and Oracle deployments".to_owned(),
             );
         }
-        for deployment in facts
-            .deployments
-            .values()
-            .filter(|deployment| deployment.roles.contains("oracle"))
-        {
-            let expected = "/var/lib/wyrd/bifrost";
-            if deployment
-                .environment
-                .get("WYRD_SCRIBE_WAL_DIR")
-                .map(String::as_str)
-                != Some(expected)
-                || deployment
-                    .volume_mounts
-                    .get("bifrost-data")
-                    .map(String::as_str)
-                    != Some(expected)
-                || !deployment.empty_dir_volumes.contains("bifrost-data")
-            {
-                return Err(
-                    "role-separated Oracle requires bifrost-data emptyDir mounted at WYRD_SCRIBE_WAL_DIR"
-                        .to_owned(),
-                );
-            }
-        }
     }
     Ok(())
 }
@@ -368,6 +421,7 @@ fn validate_rollback(facts: &ManifestFacts) -> Result<(), String> {
     if facts.deployments.len() != 1 {
         return Err("rollback must contain exactly one deployment".to_owned());
     }
+    validate_data_root(facts)?;
     let deployment = facts
         .deployments
         .values()
@@ -442,12 +496,28 @@ fn bifrost_deployment_contract_rejects_broken_fixtures() -> Result<(), String> {
     );
     assert!(validate_candidate(&parse_manifest(&missing_oracle_mount)?, false).is_err());
 
-    let mismatched_oracle_path = separated.replacen(
-        "{name: WYRD_SCRIBE_WAL_DIR, value: /var/lib/wyrd/bifrost}",
-        "{name: WYRD_SCRIBE_WAL_DIR, value: /var/lib/wyrd/wrong}",
+    let data_root = "{name: WYRD_BIFROST_DATA_DIR, value: /var/lib/wyrd/bifrost}";
+    let mismatched_root = separated.replacen(
+        data_root,
+        "{name: WYRD_BIFROST_DATA_DIR, value: /var/lib/wyrd/wrong}",
         1,
     );
-    assert!(validate_candidate(&parse_manifest(&mismatched_oracle_path)?, false).is_err());
+    assert!(validate_candidate(&parse_manifest(&mismatched_root)?, false).is_err());
+
+    let legacy_wal = separated.replacen(
+        data_root,
+        &format!(
+            "{data_root}\n            - {{name: WYRD_SCRIBE_WAL_DIR, value: /var/lib/wyrd/bifrost}}"
+        ),
+        1,
+    );
+    assert!(validate_candidate(&parse_manifest(&legacy_wal)?, false).is_err());
+
+    let shared_scribe_root = separated.replacen("kind: StatefulSet", "kind: Deployment", 1);
+    assert!(validate_candidate(&parse_manifest(&shared_scribe_root)?, false).is_err());
+
+    let unknown_target = mixed.replacen("value: all}", "value: everything}", 1);
+    assert!(parse_manifest(&unknown_target).is_err());
 
     let bad_rollback = rollback.replacen("wyrd/server:stable", "wyrd/server:latest", 1);
     assert!(validate_rollback(&parse_manifest(&bad_rollback)?).is_err());

@@ -1,8 +1,9 @@
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: wyrd-bifrost-mixed
 spec:
+  serviceName: wyrd-bifrost-private
   replicas: 3
   selector:
     matchLabels:
@@ -22,12 +23,17 @@ spec:
             - {name: http, containerPort: 8080}
             - {name: grpc, containerPort: 50051}
           env:
-            - name: WYRD_ROLES
-              value: scribe,forge,oracle
+            - {name: WYRD_TARGET, value: all}
+            - {name: WYRD_BIFROST_DATA_DIR, value: /var/lib/wyrd/bifrost}
+          volumeMounts:
+            - {name: bifrost-data, mountPath: /var/lib/wyrd/bifrost}
           readinessProbe:
             httpGet:
               path: /readyz
               port: http
+  volumeClaimTemplates:
+    - metadata: {name: bifrost-data}
+      spec: {accessModes: [ReadWriteOnce], resources: {requests: {storage: 50Gi}}}
 ---
 apiVersion: v1
 kind: Service

@@ -246,6 +246,8 @@ existing staged-reader leases finish before local deletion.
 
 ### Live tail, recovery, and shutdown
 
+Every local path a node owns derives from its one exclusively locked
+`WYRD_BIFROST_DATA_DIR` root, so no two live processes share a WAL identity.
 Oracle never opens another node's local path and does not use WAL as its normal
 query source. `FetchLiveTailService` serves a leased versioned cut of active,
 immutable, or staged rows through bounded internal RPC. Projection, signed

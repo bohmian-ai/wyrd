@@ -1,8 +1,9 @@
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: wyrd-bifrost-ingest
 spec:
+  serviceName: wyrd-bifrost-private
   replicas: 2
   selector:
     matchLabels: {app: wyrd-bifrost-ingest}
@@ -14,8 +15,15 @@ spec:
         - name: wyrd-server
           image: wyrd/server:latest
           ports: [{name: http, containerPort: 8080}, {name: grpc, containerPort: 50051}]
-          env: [{name: WYRD_ROLES, value: "scribe,forge"}]
+          env:
+            - {name: WYRD_TARGET, value: server}
+            - {name: WYRD_BIFROST_DATA_DIR, value: /var/lib/wyrd/bifrost}
+          volumeMounts:
+            - {name: bifrost-data, mountPath: /var/lib/wyrd/bifrost}
           readinessProbe: {httpGet: {path: /readyz, port: http}}
+  volumeClaimTemplates:
+    - metadata: {name: bifrost-data}
+      spec: {accessModes: [ReadWriteOnce], resources: {requests: {storage: 50Gi}}}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -37,8 +45,8 @@ spec:
           image: wyrd/server:latest
           ports: [{name: http, containerPort: 8080}, {name: grpc, containerPort: 50051}]
           env:
-            - {name: WYRD_ROLES, value: oracle}
-            - {name: WYRD_SCRIBE_WAL_DIR, value: /var/lib/wyrd/bifrost}
+            - {name: WYRD_TARGET, value: oracle}
+            - {name: WYRD_BIFROST_DATA_DIR, value: /var/lib/wyrd/bifrost}
           volumeMounts:
             - {name: bifrost-data, mountPath: /var/lib/wyrd/bifrost}
           readinessProbe: {httpGet: {path: /readyz, port: http}}

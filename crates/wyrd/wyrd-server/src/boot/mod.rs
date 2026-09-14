@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod bootstrap;
+pub mod data_root;
 pub mod issuer;
 pub mod node_identity;
 
@@ -55,6 +56,7 @@ use wyrd_sql::postgres_boot::{BootError, PostgresBoot};
 use wyrd_storage::{StorageHandle, settings::from_env as load_storage_settings};
 
 use crate::auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
+use crate::boot::data_root::{BifrostDataRoot, BifrostDataRootError};
 use crate::components::auth::audit_writer::RealAuthzAuditWriter;
 use crate::components::auth::{ServerAuth, ServerAuthz};
 use crate::config::{BifrostRuntimeRole, WorkloadBindingEntry};
@@ -230,8 +232,8 @@ struct BifrostExternalDependencies {
     node_id: ClusterNodeId,
     /// Private endpoint advertised by selected roles.
     advertise_addr: String,
-    /// Durable Scribe WAL root.
-    wal_dir: std::path::PathBuf,
+    /// Exclusively owned local root for every Bifrost-managed path.
+    data_root: BifrostDataRoot,
 }
 
 /// Owns resources created only when the Scribe role is selected.
@@ -257,6 +259,9 @@ pub enum ServerBootError {
     /// Storage boot failed.
     #[error(transparent)]
     Storage(#[from] wyrd_storage::StorageError),
+    /// The one local Bifrost data root could not be prepared or is owned elsewhere.
+    #[error(transparent)]
+    BifrostDataRoot(#[from] BifrostDataRootError),
     /// Runtime pool construction failed.
     #[error("database pool construction failed")]
     PoolConnect(#[source] sqlx::Error),
@@ -389,31 +394,6 @@ fn resolve_forge_config(
     (config, maintenance_interval)
 }
 
-/// Resolves and creates the one disposable Oracle scratch directory.
-///
-/// An injected base is used by test support. Production otherwise uses the
-/// Scribe WAL base environment setting or the portable local default, then
-/// appends exactly one `oracle-spill` component. WAL contents remain outside
-/// the scratch allocator even when both directories share a filesystem.
-///
-/// # Errors
-///
-/// Returns a typed boot error when the canonical scratch directory cannot be
-/// created; callers must stop before Bifrost role activation or detection.
-fn prepare_oracle_spill_root(
-    base: Option<std::path::PathBuf>,
-) -> Result<std::path::PathBuf, ServerBootError> {
-    let base = base.unwrap_or_else(|| {
-        std::env::var_os("WYRD_SCRIBE_WAL_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from(".wyrd/scribe-wal"))
-    });
-    let root = base.join("oracle-spill");
-    std::fs::create_dir_all(&root)
-        .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?;
-    Ok(root)
-}
-
 /// Rejects a Scribe configuration whose largest admitted unit cannot replay on this root.
 ///
 /// The comparison uses only the immutable configured shape and detected maximum
@@ -456,19 +436,17 @@ async fn build_bifrost_external_dependencies(
     config: &crate::config::BifrostRuntimeConfig,
     target: crate::config::BifrostTarget,
 ) -> Result<BifrostExternalDependencies, ServerBootError> {
+    let data_root = BifrostDataRoot::prepare(config.data_dir())?;
     let dsns = boot.dsns()?;
     let postgres = Arc::new(ServerPostgres::connect_from_boot(boot).await?);
     let storage_settings = load_storage_settings()?;
     let storage = StorageHandle::from_settings(storage_settings).await?;
-    let wal_dir = std::env::var_os("WYRD_SCRIBE_WAL_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from(".wyrd/scribe-wal"));
     // A Scribe-bearing target owns durable state keyed by its own node, so it
     // reclaims the identity stored beside that state; a target with no Scribe
     // role owns no volume and is free to be a new node each incarnation.
     let node_id =
         if crate::config::BifrostRoles::for_target(target).contains(&BifrostRuntimeRole::Scribe) {
-            node_identity::ScribeNodeIdentityStore::new(wal_dir.clone())
+            node_identity::ScribeNodeIdentityStore::new(data_root.wal().to_path_buf())
                 .load_or_create()
                 .map_err(|error| ServerBootError::Scribe(error.to_string()))?
         } else {
@@ -483,14 +461,6 @@ async fn build_bifrost_external_dependencies(
         postgres.vala().clone(),
         ClusterNodeId::new(node_id.as_uuid()),
     ));
-    let oracle_scratch = prepare_oracle_spill_root(Some(wal_dir.clone()))?;
-    let scribe_stage = wal_dir.join("scribe-stage");
-    let scribe_output_scratch = wal_dir.join("scribe-output-scratch");
-    for root in [&wal_dir, &scribe_stage, &scribe_output_scratch] {
-        std::fs::create_dir_all(root).map_err(|error| {
-            ServerBootError::Scribe(format!("Bifrost volume root creation failed: {error}"))
-        })?;
-    }
     let roles = crate::config::BifrostRoles::for_target(target);
     let resource_roles = roles
         .iter()
@@ -513,13 +483,8 @@ async fn build_bifrost_external_dependencies(
             forge_compaction_memory_limit_bytes: config
                 .resources
                 .forge_compaction_memory_limit_bytes,
-            scratch_root: oracle_scratch.clone(),
-            volume_roots: Some(vala_bifrost_redux::resources::BifrostVolumeRoots {
-                wal: wal_dir.clone(),
-                scribe_stage,
-                scribe_output_scratch,
-                oracle_scratch,
-            }),
+            scratch_root: data_root.oracle_spill().to_path_buf(),
+            volume_roots: Some(data_root.volume_roots()),
         },
         config.scribe.ingest_request_bytes,
     )
@@ -560,7 +525,7 @@ async fn build_bifrost_external_dependencies(
         cluster,
         node_id: ClusterNodeId::new(node_id.as_uuid()),
         advertise_addr,
-        wal_dir,
+        data_root,
     })
 }
 
@@ -590,7 +555,7 @@ pub async fn compose_bifrost(
         forge_config: forge_runtime,
         node_id,
         advertise_addr,
-        wal_dir,
+        data_root,
         shutdown,
         #[cfg(feature = "test-support")]
         test_controls,
@@ -610,13 +575,6 @@ pub async fn compose_bifrost(
                 detail: "platform-admin operator pool is unavailable".to_owned(),
             })?;
     let scribe_config = bifrost_config.scribe;
-    let scribe_stage = wal_dir.join("scribe-stage");
-    let scribe_output_scratch = wal_dir.join("scribe-output-scratch");
-    for root in [&wal_dir, &scribe_stage, &scribe_output_scratch] {
-        std::fs::create_dir_all(root).map_err(|error| {
-            ServerBootError::Scribe(format!("Bifrost volume root creation failed: {error}"))
-        })?;
-    }
     let resource_plan = bifrost_resources.plan();
     let pod_memory_limit = resource_plan.managed_memory_bytes;
     if roles.contains(&BifrostRuntimeRole::Scribe) {
@@ -661,9 +619,6 @@ pub async fn compose_bifrost(
                 ServerBootError::Scribe("Scribe role fence exceeds the WAL epoch range".to_owned())
             })?),
         );
-        std::fs::create_dir_all(&wal_dir).map_err(|error| {
-            ServerBootError::Scribe(format!("WAL directory creation failed: {error}"))
-        })?;
         let (wal_volume, scribe_output_volume) = bifrost_resources
             .scribe()
             .and_then(|resources| resources.volume_capabilities())
@@ -685,7 +640,7 @@ pub async fn compose_bifrost(
         let wal_segment_bytes = geometry.wal_segment_bytes();
         let wal = Arc::new(
             WalWriter::new_with_volume(
-                &wal_dir,
+                data_root.wal(),
                 *stream.node_id.as_bytes(),
                 stream.writer_epoch.as_i64(),
                 WalConfig::new(wal_segment_bytes)
@@ -1055,7 +1010,7 @@ pub async fn compose_bifrost(
         cluster: Arc::clone(&cluster_registry),
         node_id,
         advertise_addr: &advertise_addr,
-        spill_root: Some(wal_dir),
+        spill_root: data_root.oracle_spill().to_path_buf(),
         peer_credentials: Arc::clone(&peer_credentials),
         peer_tls: peer_tls.clone(),
         audit: query_audit.clone(),
@@ -1159,6 +1114,7 @@ pub async fn compose_bifrost(
         }),
         coordination_runtime,
         compaction_runtime,
+        data_root,
     })
 }
 
@@ -1248,6 +1204,11 @@ pub struct BootedServer {
     /// admitted plan runner is never abandoned between writing its outputs and
     /// Preparing its operation.
     pub compaction_runtime: ForgeCompactionRuntime,
+    /// Exclusive owner of the local Bifrost data root.
+    ///
+    /// Held for the life of the process so no second replica can open this
+    /// node's WAL identity while it runs.
+    pub data_root: BifrostDataRoot,
 }
 
 /// Emit pre-telemetry warnings for relaxed config that is still safe to run.
@@ -1316,6 +1277,7 @@ pub async fn build_state(
         bifrost,
         coordination_runtime,
         compaction_runtime,
+        data_root,
     } = compose_bifrost(crate::state::BifrostBuildInputs {
         target: config.role,
         deployment_profile: config.deployment_profile,
@@ -1333,7 +1295,7 @@ pub async fn build_state(
         forge_config: config.forge,
         node_id: external.node_id,
         advertise_addr: external.advertise_addr,
-        wal_dir: external.wal_dir,
+        data_root: external.data_root,
         shutdown: shutdown.clone(),
         #[cfg(feature = "test-support")]
         test_controls: None,
@@ -1375,6 +1337,7 @@ pub async fn build_state(
         state,
         coordination_runtime,
         compaction_runtime,
+        data_root,
     })
 }
 
@@ -1575,8 +1538,8 @@ struct OracleRoleBuilder<'a> {
     node_id: ClusterNodeId,
     /// Bound endpoint published in cluster membership.
     advertise_addr: &'a str,
-    /// Optional harness-owned Bifrost root replacing environment discovery.
-    spill_root: Option<std::path::PathBuf>,
+    /// Oracle spill directory derived from the one Bifrost data root.
+    spill_root: std::path::PathBuf,
     /// Shared outbound peer bearer owner.
     peer_credentials: Arc<dyn OraclePeerCredentials>,
     /// Immutable peer TLS trust policy, present only when CA material is configured.
@@ -1890,9 +1853,8 @@ impl<'a> OracleRoleBuilder<'a> {
             local_transport,
             remote_transport,
         ));
-        let oracle_spill_root = prepare_oracle_spill_root(spill_root)?;
         let spill_runtime =
-            match OracleSpillRuntime::new(&oracle_spill_root, resource_plan.scratch_limit_bytes) {
+            match OracleSpillRuntime::new(&spill_root, resource_plan.scratch_limit_bytes) {
                 Ok(runtime) => runtime,
                 Err(error) => {
                     release_failed_oracle_role(&cluster, &role, "spill runtime construction").await;
@@ -2671,28 +2633,6 @@ mod tests {
         assert!(error.to_string().contains("configured replay envelope"));
         validate_scribe_replay_envelope(config, required)
             .expect("exact replay envelope must remain bootable");
-    }
-
-    /// Server composition appends one disposable component before detection.
-    #[test]
-    fn config_composes_one_oracle_spill_root_before_detection() {
-        let base = tempfile::tempdir().expect("scratch base");
-        let root = prepare_oracle_spill_root(Some(base.path().to_path_buf()))
-            .expect("scratch root creation");
-        assert_eq!(root, base.path().join("oracle-spill"));
-        assert!(root.is_dir());
-        assert!(!root.join("oracle-spill").exists());
-    }
-
-    /// An uncreatable scratch child fails before resource-owner construction.
-    #[test]
-    fn config_rejects_uncreatable_oracle_spill_root_before_activation() {
-        let base = tempfile::tempdir().expect("scratch fixture");
-        let file = base.path().join("not-a-directory");
-        std::fs::write(&file, b"occupied").expect("blocking file");
-        let error = prepare_oracle_spill_root(Some(file))
-            .expect_err("file-backed base cannot create a scratch child");
-        assert!(matches!(error, ServerBootError::OraclePeer(_)));
     }
 
     /// An empty `forge` config resolves to the compiled `ForgeConfig` default

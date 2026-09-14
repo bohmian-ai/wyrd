@@ -561,10 +561,8 @@ struct ChildConfig {
     storage_root: PathBuf,
     /// Bifrost target this child serves.
     target: ProcessNodeTarget,
-    /// Child-private durable Scribe root.
-    wal_root: PathBuf,
-    /// Child-private durable spill root.
-    spill_root: PathBuf,
+    /// Child-private durable Bifrost data root.
+    data_root: PathBuf,
     /// Public HTTP socket.
     http_bind: SocketAddr,
     /// Public gRPC socket.
@@ -662,8 +660,7 @@ impl ChildConfig {
             tenant_slug: read(env::TENANT_SLUG)?,
             storage_root: PathBuf::from(read(env::STORAGE_ROOT)?),
             target: ProcessNodeTarget::parse(&read(env::TARGET)?)?,
-            wal_root: PathBuf::from(read(env::WAL_ROOT)?),
-            spill_root: PathBuf::from(read(env::SPILL_ROOT)?),
+            data_root: PathBuf::from(read(env::DATA_ROOT)?),
             http_bind: socket(env::HTTP_BIND)?,
             grpc_bind: socket(env::GRPC_BIND)?,
             peer_bind: socket(env::PEER_BIND)?,
@@ -793,7 +790,7 @@ impl ChildConfig {
             .with_peer_keyring_paths(self.peer_keyring.clone())
             .with_peer_bind(self.peer_bind)
             .with_bind_addrs_for_test(self.http_bind, self.grpc_bind)
-            .with_durable_bifrost_roots(self.wal_root.clone(), self.spill_root.clone())
+            .with_durable_bifrost_data_root(self.data_root.clone())
             .with_system_resources_for_test(pod_system_resources(self.target));
         let server = match self.oracle_query_slot_limit {
             Some(slots) => server.with_oracle_query_slot_limit_for_test(slots),
@@ -1561,7 +1558,7 @@ async fn describe(
         advertise_addr,
         peer_certificate_fingerprint: fingerprint,
         ready: config.is_ready(&snapshot, state),
-        wal_root: config.wal_root.display().to_string(),
+        wal_root: config.data_root.display().to_string(),
         membership,
     }
 }

@@ -5,7 +5,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
@@ -15,6 +15,8 @@ use vala_bifrost_redux::scribe::geometry::{ScribeGeometry, ScribeGeometryError};
 use wyrd_spec::TenantSlug;
 use wyrd_spec::auth::IssuerTokenPolicy;
 use wyrd_telemetry::TelemetryConfig;
+
+use crate::boot::data_root::DEFAULT_BIFROST_DATA_DIR;
 
 /// Errors raised during configuration loading or validation.
 #[derive(Debug, thiserror::Error)]
@@ -1107,6 +1109,19 @@ pub struct BifrostRuntimeConfig {
     /// Role-neutral private peer plane shared by Scribe and Oracle.
     #[serde(default)]
     pub peer: BifrostPeerConfig,
+    /// Local root for every Bifrost-managed path, set only by `WYRD_BIFROST_DATA_DIR`.
+    #[serde(skip)]
+    pub data_dir: Option<PathBuf>,
+}
+
+impl BifrostRuntimeConfig {
+    /// Resolved local Bifrost data root: the environment override, else `.wyrd/bifrost`.
+    #[must_use]
+    pub fn data_dir(&self) -> &Path {
+        self.data_dir
+            .as_deref()
+            .unwrap_or(Path::new(DEFAULT_BIFROST_DATA_DIR))
+    }
 }
 
 /// Signing and verification material for the independent peer-ticket keyring.
@@ -2223,6 +2238,15 @@ impl WyrdServerConfig {
                 message: "use the single closed WYRD_TARGET process target".to_owned(),
             });
         }
+        if env_opt("WYRD_SCRIBE_WAL_DIR")?.is_some() {
+            return Err(ConfigError::BadEnvVar {
+                key: "WYRD_SCRIBE_WAL_DIR".to_owned(),
+                message: "the Scribe WAL is derived from WYRD_BIFROST_DATA_DIR".to_owned(),
+            });
+        }
+        if let Some(value) = env_opt("WYRD_BIFROST_DATA_DIR")? {
+            self.bifrost.data_dir = Some(PathBuf::from(value));
+        }
         if let Some(value) = env_opt("WYRD_TARGET")? {
             self.role = match value.as_str() {
                 "all" => BifrostTarget::All,
@@ -3323,6 +3347,48 @@ maintenance_interval_secs = 45
         let _guard = ENV_LOCK.lock().expect("environment test lock");
         temp_env::with_vars([("WYRD_BIFROST_ROLES", Some("oracle"))], || {
             assert!(WyrdServerConfig::default().apply_env_overrides().is_err());
+        });
+    }
+
+    /// The Bifrost data root defaults locally and follows its one environment override.
+    #[test]
+    fn bifrost_data_dir_defaults_and_follows_environment() {
+        let _guard = ENV_LOCK.lock().expect("environment test lock");
+        temp_env::with_vars(
+            [
+                ("WYRD_BIFROST_DATA_DIR", None::<&str>),
+                ("WYRD_SCRIBE_WAL_DIR", None),
+            ],
+            || {
+                let mut config = WyrdServerConfig::default();
+                config.apply_env_overrides().expect("no data root override");
+                assert_eq!(config.bifrost.data_dir(), Path::new(".wyrd/bifrost"));
+            },
+        );
+        temp_env::with_vars(
+            [("WYRD_BIFROST_DATA_DIR", Some("/var/lib/wyrd/bifrost"))],
+            || {
+                let mut config = WyrdServerConfig::default();
+                config.apply_env_overrides().expect("data root override");
+                assert_eq!(
+                    config.bifrost.data_dir(),
+                    Path::new("/var/lib/wyrd/bifrost")
+                );
+            },
+        );
+    }
+
+    /// The removed independent Scribe WAL directory is rejected, never aliased.
+    #[test]
+    fn scribe_wal_dir_env_is_rejected() {
+        let _guard = ENV_LOCK.lock().expect("environment test lock");
+        temp_env::with_vars([("WYRD_SCRIBE_WAL_DIR", Some("/var/lib/wyrd/wal"))], || {
+            let error = WyrdServerConfig::default()
+                .apply_env_overrides()
+                .expect_err("legacy WAL directory must fail");
+            assert!(
+                matches!(error, ConfigError::BadEnvVar { ref key, .. } if key == "WYRD_SCRIBE_WAL_DIR")
+            );
         });
     }
 

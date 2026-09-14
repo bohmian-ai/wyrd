@@ -1,6 +1,5 @@
 //! Shared axum application state.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -34,6 +33,7 @@ use wyrd_tonic::tonic_health::server::HealthReporter;
 use crate::auth::permission_resolver::SqlPermissionResolver;
 use crate::auth::pg_resolvers::PgIssuerResolver;
 use crate::bifrost::gate_audit::PostgresGateAudit;
+use crate::boot::data_root::BifrostDataRoot;
 use crate::components::auth::{ServerAuth, ServerAuthz};
 use crate::components::eval::{EvalRuns, new_run_map};
 use crate::components::health::ReadinessSnapshot;
@@ -107,8 +107,8 @@ pub struct BifrostBuildInputs {
     pub node_id: wyrd_spec::vala::api::NodeId,
     /// Private endpoint advertised by selected fenced roles.
     pub advertise_addr: String,
-    /// Durable Scribe WAL root from which role scratch paths are derived.
-    pub wal_dir: PathBuf,
+    /// Exclusively owned local root from which every role path is derived.
+    pub data_root: BifrostDataRoot,
     /// Process shutdown signal injected into every selected owner.
     pub shutdown: CancellationToken,
     /// Focused production-control overrides consumed only by the shared test composer.
@@ -296,6 +296,8 @@ pub struct ComposedBifrost {
     pub coordination_runtime: ScribeCoordinationRuntime,
     /// Sole owner of the executor backing admitted Forge compaction runners.
     pub compaction_runtime: ForgeCompactionRuntime,
+    /// Exclusive local data-root owner the caller retains while the graph runs.
+    pub data_root: BifrostDataRoot,
 }
 
 /// Existing concrete production controls injected by server journeys.

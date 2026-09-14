@@ -43,14 +43,14 @@ fn validate_decoded_request_size(
 
 /// Validates authenticated identity and the raw transport ceiling.
 ///
-/// A nil tenant is admitted only for the server's internal audit publication:
-/// the platform audit principal writing the retained audit log.
+/// The system owner is admitted only for the server's internal audit
+/// publication: the platform audit principal writing the retained audit log.
 ///
 /// # Errors
 ///
-/// Returns [`ScribeError::InvalidFrame`] for tenant mismatch or any other nil
-/// tenant frame, and [`ScribeError::PayloadTooLarge`] above the fixed request
-/// ceiling.
+/// Returns [`ScribeError::InvalidFrame`] for tenant mismatch or any other
+/// system-owner frame, and [`ScribeError::PayloadTooLarge`] above the fixed
+/// request ceiling.
 fn validate_logical_transport_frame(
     frame: &ScribeIngressFrame,
     request_limit_bytes: usize,
@@ -58,7 +58,8 @@ fn validate_logical_transport_frame(
     let system_audit_publication = frame.principal.id == PLATFORM_AUDIT_PRINCIPAL
         && AuditLogTable::admits_system_owner(&frame.table);
     if frame.authenticated_tenant != frame.principal.tenant_id
-        || (frame.authenticated_tenant.as_uuid().is_nil() && !system_audit_publication)
+        || (frame.authenticated_tenant == wyrd_spec::DataTenantId::SYSTEM_OWNER
+            && !system_audit_publication)
     {
         return Err(ScribeError::InvalidFrame);
     }
@@ -834,7 +835,7 @@ mod tests {
         }
     }
 
-    /// A nil tenant passes transport validation only as the platform audit
+    /// The system owner passes transport validation only as the platform audit
     /// principal writing the retained audit log; caller tables and any other
     /// principal stay refused.
     ///
@@ -842,7 +843,7 @@ mod tests {
     ///
     /// Panics when an admission decision differs from the audit-only exception.
     #[test]
-    fn nil_tenant_frames_admit_only_internal_audit_publication() {
+    fn system_owner_frames_admit_only_internal_audit_publication() {
         let system = DataTenantId::SYSTEM_OWNER;
         let publisher = Principal::new(
             PLATFORM_AUDIT_PRINCIPAL,

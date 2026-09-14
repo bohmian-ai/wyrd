@@ -953,23 +953,19 @@ impl<'a> SlicePayloadReader<'a> {
 
 /// Decode the tenant identity encoded in a v3 slice payload.
 ///
-/// The nil UUID is the encoded [`DataTenantId::SYSTEM_OWNER`] sentinel that
-/// internal audit-log publication appends; `decode_slice_metadata` limits it to
-/// that table. Every other identity must be a `UUIDv7`.
+/// `decode_slice_metadata` limits [`DataTenantId::SYSTEM_OWNER`] to the audit log.
 ///
 /// # Errors
-/// Returns [`ScribeError::Internal`] when the field is not 16 bytes or names a
-/// non-sentinel identity that is not a UUIDv7.
+/// Returns [`ScribeError::Internal`] when the field is not 16 bytes or names an
+/// identity that is not a `UUIDv7`.
 fn decode_slice_tenant(bytes: &[u8]) -> Result<DataTenantId, ScribeError> {
     let tenant_bytes: [u8; 16] = bytes.try_into().map_err(|_| ScribeError::Internal {
         detail: "WAL tenant id decode failed".to_owned(),
     })?;
-    let tenant_uuid = uuid::Uuid::from_bytes(tenant_bytes);
-    if tenant_uuid.is_nil() {
-        return Ok(DataTenantId::SYSTEM_OWNER);
-    }
-    DataTenantId::try_from(tenant_uuid).map_err(|error| ScribeError::Internal {
-        detail: format!("WAL v3 tenant id is invalid: {error}"),
+    DataTenantId::try_from(uuid::Uuid::from_bytes(tenant_bytes)).map_err(|error| {
+        ScribeError::Internal {
+            detail: format!("WAL v3 tenant id is invalid: {error}"),
+        }
     })
 }
 
@@ -4196,13 +4192,14 @@ mod tests {
         );
     }
 
-    /// The nil sentinel decodes as the system owner; any other non-v7 id fails.
+    /// The system owner decodes like any v7 tenant; nil and non-v7 ids fail.
     #[test]
     fn slice_tenant_decoder_admits_system_owner_and_rejects_non_v7() {
         assert!(matches!(
-            decode_slice_tenant(&[0; 16]),
+            decode_slice_tenant(DataTenantId::SYSTEM_OWNER.as_uuid().as_bytes()),
             Ok(tenant) if tenant == DataTenantId::SYSTEM_OWNER
         ));
+        assert!(decode_slice_tenant(&[0; 16]).is_err());
         assert!(decode_slice_tenant(Uuid::new_v4().as_bytes()).is_err());
     }
 

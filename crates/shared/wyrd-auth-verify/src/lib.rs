@@ -842,73 +842,20 @@ fn seed_scope(card_ref: &CardRef, wire_scope: &CardRefScope) -> Result<CardRefSc
     Ok(wire_scope.clone())
 }
 
-/// Verify and decode access-token claims while preserving the private system-owner sentinel.
+/// Verify and decode EdDSA access-token claims.
 ///
-/// [`DataTenantId::new`] intentionally rejects non-v7 UUIDs, while the wire token format still
-/// carries the nil UUID for the internal system owner. This helper keeps that exception private
-/// to local-token verification instead of weakening the public tenant-id constructor.
+/// # Errors
+/// Returns [`AuthError`] when the signature or registered claims fail
+/// validation, or [`AuthError::InvalidToken`] when the claims do not decode.
 fn verify_access_token(
     token: &str,
     public_key: &DecodingKey,
     mut validation: Validation,
 ) -> Result<AccessTokenClaims, AuthError> {
     validation.algorithms = vec![Algorithm::EdDSA];
-    let mut raw = jsonwebtoken::decode::<serde_json::Value>(token, public_key, &validation)
+    jsonwebtoken::decode::<AccessTokenClaims>(token, public_key, &validation)
         .map(|data| data.claims)
-        .map_err(AuthError::from)?;
-    let marker = DataTenantId::new_v7();
-    replace_system_owner_tenant_ids(&mut raw, marker);
-    let mut claims =
-        serde_json::from_value::<AccessTokenClaims>(raw).map_err(|_| AuthError::InvalidToken)?;
-    restore_system_owner_tenant_ids(&mut claims, marker);
-    Ok(claims)
-}
-
-/// Replace nil tenant ids only in the access-token principal chain before strict
-/// [`DataTenantId`] deserialization. Other claim fields remain strict so a nil
-/// value cannot silently become a valid public tenant identifier.
-fn replace_system_owner_tenant_ids(value: &mut serde_json::Value, marker: DataTenantId) {
-    let Some(fields) = value.as_object_mut() else {
-        return;
-    };
-    replace_principal_tenant_id(fields.get_mut("principal"), marker);
-    let mut act = fields.get_mut("act");
-    while let Some(layer) = act {
-        let Some(layer_fields) = layer.as_object_mut() else {
-            break;
-        };
-        replace_principal_tenant_id(layer_fields.get_mut("principal"), marker);
-        act = layer_fields.get_mut("act");
-    }
-}
-
-/// Rewrites one token principal's private system-owner sentinel for decoding.
-fn replace_principal_tenant_id(value: Option<&mut serde_json::Value>, marker: DataTenantId) {
-    let Some(serde_json::Value::Object(fields)) = value else {
-        return;
-    };
-    if fields.get("tenant_id").and_then(serde_json::Value::as_str)
-        == Some("00000000-0000-0000-0000-000000000000")
-    {
-        fields.insert(
-            "tenant_id".to_owned(),
-            serde_json::Value::String(marker.to_string()),
-        );
-    }
-}
-
-/// Restore marker tenant ids to the internal system-owner sentinel after decoding.
-fn restore_system_owner_tenant_ids(claims: &mut AccessTokenClaims, marker: DataTenantId) {
-    if claims.principal.tenant_id == marker {
-        claims.principal.tenant_id = DataTenantId::SYSTEM_OWNER;
-    }
-    let mut layer = claims.act.as_deref_mut();
-    while let Some(current) = layer {
-        if current.principal.tenant_id == marker {
-            current.principal.tenant_id = DataTenantId::SYSTEM_OWNER;
-        }
-        layer = current.act.as_deref_mut();
-    }
+        .map_err(AuthError::from)
 }
 
 fn flatten_act_chain(mut act: Option<&ActClaim>) -> Result<Vec<DelegationStep>, AuthError> {

@@ -234,7 +234,7 @@ impl PgFixture {
     /// Seed an additional active tenant row with a caller-supplied isolation key.
     ///
     /// Use this when a test needs a tenant with a **specific** [`DataTenantId`]
-    /// (e.g., the nil UUID sentinel, or a UUID carried across a serialized
+    /// (e.g., a UUID carried across a serialized
     /// payload). For tests that only need a second distinct tenant, prefer
     /// [`seed_additional_tenant`][Self::seed_additional_tenant], which generates a
     /// fresh UUIDv7.
@@ -768,7 +768,7 @@ mod pg_tests {
 
     async fn assert_single_tenant(fixture: &PgFixture) {
         // vala_sql's olap_minimal migration seeds the reserved system-owner
-        // sentinel tenant (nil UUID), so the fixture's own seeded tenant is the
+        // system tenant, so the fixture's own seeded tenant is the
         // only non-system row.
         let count: (i64,) =
             sqlx::query_as("SELECT count(*) FROM platform.tenants WHERE data_tenant_id <> $1")

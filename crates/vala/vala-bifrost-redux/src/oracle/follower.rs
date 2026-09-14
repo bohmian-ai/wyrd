@@ -1651,7 +1651,7 @@ where
         for assignment in &request.assignments {
             if assignment.scan_id.is_empty()
                 || assignment.schema_fingerprint.is_empty()
-                || assignment.binding.tenant_id.as_uuid().is_nil()
+                || assignment.binding.tenant_id == DataTenantId::SYSTEM_OWNER
                 || assignment.binding.tenant_id != authenticated.tenant_id
                 || assignment.binding.namespace.trim().is_empty()
                 || assignment.binding.table.trim().is_empty()

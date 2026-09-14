@@ -211,11 +211,8 @@ impl WyrdApiKey {
             return Err(WyrdApiKeyParseError);
         }
         let tenant_uuid = Uuid::parse_str(tenant).map_err(|_| WyrdApiKeyParseError)?;
-        let tenant_id = if tenant_uuid.is_nil() {
-            wyrd_spec::DataTenantId::SYSTEM_OWNER
-        } else {
-            wyrd_spec::DataTenantId::try_from(tenant_uuid).map_err(|_| WyrdApiKeyParseError)?
-        };
+        let tenant_id =
+            wyrd_spec::DataTenantId::try_from(tenant_uuid).map_err(|_| WyrdApiKeyParseError)?;
         Ok(Self {
             tenant_id,
             prefix: format!("wyrd_sk_{tenant}_{visible}"),

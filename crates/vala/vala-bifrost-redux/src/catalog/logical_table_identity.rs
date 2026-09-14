@@ -28,7 +28,7 @@ impl<'a> LogicalTableIdentity<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`LogicalTableIdentityError::InvalidTenant`] for a nil tenant,
+    /// Returns [`LogicalTableIdentityError::InvalidTenant`] for the system owner,
     /// [`LogicalTableIdentityError::TenantMismatch`] when the binding tenant is
     /// foreign to the authenticated operation,
     /// [`LogicalTableIdentityError::InvalidTableName`] for an unsafe table
@@ -39,7 +39,9 @@ impl<'a> LogicalTableIdentity<'a> {
         binding_tenant: &'a DataTenantId,
         table: &'a TableRef,
     ) -> Result<Self, LogicalTableIdentityError<()>> {
-        if authenticated_tenant.as_uuid().is_nil() || binding_tenant.as_uuid().is_nil() {
+        if *authenticated_tenant == DataTenantId::SYSTEM_OWNER
+            || *binding_tenant == DataTenantId::SYSTEM_OWNER
+        {
             return Err(LogicalTableIdentityError::InvalidTenant);
         }
         if authenticated_tenant != binding_tenant {
@@ -260,8 +262,8 @@ impl<G> PhysicalTableProjection<G> {
 /// Validation, checked-planning, or role-reservation failure for table projection.
 #[derive(Debug, Eq, PartialEq, thiserror::Error)]
 pub(crate) enum LogicalTableIdentityError<E> {
-    /// A nil tenant cannot own logical or physical data.
-    #[error("data tenant id must not be nil")]
+    /// The system owner cannot own logical or physical query data.
+    #[error("data tenant id must not be the system owner")]
     InvalidTenant,
     /// The binding tenant differs from the authenticated operation tenant.
     #[error("authenticated tenant does not own the table binding")]
@@ -385,12 +387,12 @@ mod tests {
         ));
     }
 
-    /// Foreign and nil tenants fail before projection planning.
+    /// Foreign and system-owner tenants fail before projection planning.
     #[test]
-    fn logical_table_identity_rejects_foreign_and_nil_tenants() {
+    fn logical_table_identity_rejects_foreign_and_system_owner_tenants() {
         let tenant = DataTenantId::new_v7();
         let foreign = DataTenantId::new_v7();
-        let nil = crate::test_support::nil_tenant();
+        let nil = DataTenantId::SYSTEM_OWNER;
         let table = table();
         assert!(matches!(
             LogicalTableIdentity::try_new(&tenant, &foreign, &table),

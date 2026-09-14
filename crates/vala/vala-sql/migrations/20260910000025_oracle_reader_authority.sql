@@ -73,7 +73,7 @@ GRANT SELECT, INSERT, UPDATE, DELETE
 CREATE TABLE vala.oracle_reader_epochs (
     epoch_owner_tenant_id uuid NOT NULL
         REFERENCES platform.tenants(data_tenant_id)
-        CHECK (epoch_owner_tenant_id = '00000000-0000-0000-0000-000000000000'::uuid),
+        CHECK (epoch_owner_tenant_id = '00000000-0000-7000-8000-000000000000'::uuid),
     node_id           uuid   NOT NULL,
     fencing_token     bigint NOT NULL CHECK (fencing_token > 0),
     state             text   NOT NULL

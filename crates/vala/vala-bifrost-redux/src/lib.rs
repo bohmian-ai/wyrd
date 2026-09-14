@@ -93,10 +93,6 @@ pub(crate) mod test_support {
         *TENANT.get_or_init(DataTenantId::new_v7)
     }
 
-    pub(crate) fn nil_tenant() -> DataTenantId {
-        DataTenantId::SYSTEM_OWNER
-    }
-
     /// Captures exact span field updates and closure for lifecycle unit tests.
     #[derive(Default)]
     pub(crate) struct SpanCaptureSubscriber {

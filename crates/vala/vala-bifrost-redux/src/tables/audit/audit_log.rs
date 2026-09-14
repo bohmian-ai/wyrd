@@ -21,12 +21,12 @@ use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 pub struct AuditLogTable;
 
 impl AuditLogTable {
-    /// Whether `table` is the one table the nil system owner may physically own.
+    /// Whether `table` is the one table the system owner may physically own.
     ///
     /// System-attributed security decisions (unverified peer and tail
     /// rejections) stage under `DataTenantId::SYSTEM_OWNER` and must reach
     /// retained history like any tenant's. Every other table keeps rejecting
-    /// the nil tenant, and Gate refuses caller writes into the audit namespace,
+    /// the system owner, and Gate refuses caller writes into the audit namespace,
     /// so only the server's internal publication can use this exception.
     #[must_use]
     pub fn admits_system_owner(table: &TableRef) -> bool {

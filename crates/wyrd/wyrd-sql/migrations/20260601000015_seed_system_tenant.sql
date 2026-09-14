@@ -13,7 +13,7 @@ BEGIN
     SELECT *
       INTO sentinel
       FROM platform.tenants
-     WHERE data_tenant_id = '00000000-0000-0000-0000-000000000000'::uuid
+     WHERE data_tenant_id = '00000000-0000-7000-8000-000000000000'::uuid
      FOR UPDATE;
 
     SELECT data_tenant_id
@@ -22,7 +22,7 @@ BEGIN
      WHERE slug = 'wyrd-system'
      FOR UPDATE;
 
-    IF FOUND AND slug_owner <> '00000000-0000-0000-0000-000000000000'::uuid THEN
+    IF FOUND AND slug_owner <> '00000000-0000-7000-8000-000000000000'::uuid THEN
         RAISE EXCEPTION
             'canonical system tenant slug is owned by another tenant';
     END IF;
@@ -31,7 +31,7 @@ BEGIN
         INSERT INTO platform.tenants
             (data_tenant_id, slug, display_name, status, deleted_at)
         VALUES
-            ('00000000-0000-0000-0000-000000000000'::uuid,
+            ('00000000-0000-7000-8000-000000000000'::uuid,
              'wyrd-system',
              'Wyrd System',
              'active',

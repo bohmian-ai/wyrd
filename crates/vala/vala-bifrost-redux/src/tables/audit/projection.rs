@@ -369,7 +369,7 @@ mod tests {
     /// Panics when the system-owner range is refused.
     #[test]
     fn projects_system_owner_rows() {
-        let system = crate::test_support::nil_tenant();
+        let system = DataTenantId::SYSTEM_OWNER;
         let projection = project_audit_rows(system, &[row(system, 1)])
             .expect("system-owner decisions project into retained history");
         assert_eq!(projection.tenant, system);

@@ -333,7 +333,7 @@ async fn a_stalled_tenant_does_not_block_another_tenants_history() -> Result<(),
 
 /// Counts Scribe batch fences committed for retained audit under one tenant.
 ///
-/// Oracle refuses nil-tenant reads, so system-owner retention is observed at
+/// Oracle refuses system-owner reads, so system-owner retention is observed at
 /// the fence Scribe commits with every durable audit-log batch instead.
 ///
 /// # Errors

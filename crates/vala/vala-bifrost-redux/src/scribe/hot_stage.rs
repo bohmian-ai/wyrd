@@ -301,7 +301,6 @@ pub struct StagedHotSourceRecordV1 {
     version: u16,
     /// Tenant owning every row of the member; the system owner only for the
     /// audit log, which [`Self::assembly_key`] enforces on recovery.
-    #[serde(deserialize_with = "deserialize_record_tenant")]
     tenant: DataTenantId,
     /// Canonical `<namespace>.<name>` the member belongs to.
     table_fqn: String,
@@ -423,7 +422,8 @@ impl StagedHotSourceRecordV1 {
                 self.table_fqn
             ))
         })?;
-        if self.tenant.as_uuid().is_nil() && !AuditLogTable::admits_system_owner(&table) {
+        if self.tenant == DataTenantId::SYSTEM_OWNER && !AuditLogTable::admits_system_owner(&table)
+        {
             return Err(invalid(format!(
                 "the system owner cannot stage `{}`",
                 self.table_fqn
@@ -819,27 +819,6 @@ impl ScribeHotStage {
     }
 }
 
-/// Decodes a staged record's tenant, admitting the system owner.
-///
-/// System-attributed audit history stages under [`DataTenantId::SYSTEM_OWNER`],
-/// the nil sentinel that `DataTenantId`'s own decoder rejects, so without this a
-/// frozen audit-log member could be written but never recovered. Admission is
-/// narrowed to the audit log by [`StagedHotSourceRecordV1::assembly_key`].
-///
-/// # Errors
-///
-/// Returns the decoder's error for a value that is neither nil nor a `UUIDv7`.
-fn deserialize_record_tenant<'de, D>(deserializer: D) -> Result<DataTenantId, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = Uuid::deserialize(deserializer)?;
-    if value.is_nil() {
-        return Ok(DataTenantId::SYSTEM_OWNER);
-    }
-    DataTenantId::new(value).map_err(serde::de::Error::custom)
-}
-
 /// Name of the one durable record file inside a member directory.
 pub(crate) const RECORD_FILE_NAME: &str = "member.staged.json";
 /// Name of the incomplete record a crash may leave behind.
@@ -1127,9 +1106,9 @@ mod tests {
 
     /// A system-owner record decodes again, but only the audit log may use it.
     ///
-    /// Audit publication freezes members under the nil system owner; recovery
+    /// Audit publication freezes members under the system owner; recovery
     /// must read them back instead of failing boot, while every other table
-    /// keeps refusing the nil tenant.
+    /// keeps refusing the system owner.
     ///
     /// # Panics
     ///

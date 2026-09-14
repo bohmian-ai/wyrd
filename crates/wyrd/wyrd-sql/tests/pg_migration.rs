@@ -94,7 +94,7 @@ mod pg_tests {
             .expect("remove migration ledger for conflict proof");
         assert!(
             wyrd_sql::migrate(&pool).await.is_err(),
-            "incompatible nil-UUID attributes must fail"
+            "incompatible system tenant attributes must fail"
         );
         let display_name: (String,) =
             sqlx::query_as("SELECT display_name FROM platform.tenants WHERE data_tenant_id = $1")

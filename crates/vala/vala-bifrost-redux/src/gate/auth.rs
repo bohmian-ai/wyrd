@@ -82,12 +82,8 @@ fn tenant_from_unverified_access_token(token: &str) -> Result<DataTenantId, Inge
         .ok_or_else(|| IngestError::Unauthenticated("token does not name a tenant".to_owned()))?;
     let uuid = uuid::Uuid::parse_str(tenant)
         .map_err(|_| IngestError::Unauthenticated("token does not name a tenant".to_owned()))?;
-    if uuid.is_nil() {
-        Ok(DataTenantId::SYSTEM_OWNER)
-    } else {
-        DataTenantId::new(uuid)
-            .map_err(|_| IngestError::Unauthenticated("token does not name a tenant".to_owned()))
-    }
+    DataTenantId::new(uuid)
+        .map_err(|_| IngestError::Unauthenticated("token does not name a tenant".to_owned()))
 }
 
 /// Read `wyrd-request-id` from the inbound metadata, or mint a `UUIDv7` when it is

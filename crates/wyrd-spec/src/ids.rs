@@ -139,9 +139,14 @@ id_type!(
 pub struct DataTenantId(uuid::Uuid);
 
 impl DataTenantId {
-    /// Nil-UUID sentinel that bypasses the v7 validator and represents Wyrd's
-    /// system-owned tables (`SystemShared` OLAP namespace, catalog bootstrap, etc.).
-    pub const SYSTEM_OWNER: DataTenantId = DataTenantId(uuid::Uuid::nil());
+    /// Fixed `UUIDv7` of the platform system tenant (`wyrd-system`).
+    ///
+    /// It owns system-attributed data such as audit decisions that cannot be
+    /// attributed to a caller's tenant. It is an ordinary valid tenant id, so
+    /// every decoder accepts it without a special case.
+    pub const SYSTEM_OWNER: DataTenantId = DataTenantId(uuid::Uuid::from_u128(
+        0x0000_0000_0000_7000_8000_0000_0000_0000,
+    ));
 
     /// Generate a UUIDv7-backed tenant isolation key.
     #[must_use]

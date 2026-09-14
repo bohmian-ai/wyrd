@@ -20,10 +20,7 @@ use crate::{OperatorPool, SqlError};
 /// role is granted no read on `platform.tenants`: a sweep that listed tenants
 /// on the RLS-enforced pool would be refused by Postgres and service nobody.
 ///
-/// The directory always holds the nil-UUID system tenant, which owns Wyrd's
-/// system-shared tables and their audited transitions. It is not a UUIDv7, so
-/// it is mapped to [`DataTenantId::SYSTEM_OWNER`] rather than validated: a
-/// sweeper that failed the whole read on it would service no tenant at all.
+/// The directory always holds the [`DataTenantId::SYSTEM_OWNER`] system tenant.
 ///
 /// # Errors
 /// Returns [`SqlError::Query`] when Postgres rejects the directory read, and
@@ -44,13 +41,7 @@ pub async fn list_active_tenant_ids(
     .map_err(SqlError::from)?;
 
     rows.into_iter()
-        .map(|id| {
-            if id.is_nil() {
-                Ok(DataTenantId::SYSTEM_OWNER)
-            } else {
-                DataTenantId::new(id)
-            }
-        })
+        .map(DataTenantId::new)
         .collect::<Result<Vec<_>, _>>()
         .map_err(SqlError::InvalidDataTenantId)
 }

@@ -7,7 +7,7 @@ ALTER TABLE vala.cluster_nodes
         DEFAULT '{"kind":"scribe_v1","tail_protocol_version":1}'::jsonb,
     ADD COLUMN ready boolean NOT NULL DEFAULT false;
 UPDATE vala.cluster_nodes
-SET data_tenant_id = '00000000-0000-0000-0000-000000000000'
+SET data_tenant_id = '00000000-0000-7000-8000-000000000000'
 WHERE data_tenant_id IS NULL;
 ALTER TABLE vala.cluster_nodes ALTER COLUMN data_tenant_id SET NOT NULL;
 ALTER TABLE vala.cluster_nodes ADD PRIMARY KEY (data_tenant_id, node_id, role);

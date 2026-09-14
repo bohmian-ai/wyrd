@@ -106,20 +106,20 @@ pub struct TenantTableBinding {
 impl TenantTableBinding {
     /// Computes the exact checked physical-name allocation facts without allocating.
     ///
-    /// The nil tenant is accepted only for the retained audit log, which the
-    /// system owner publishes its security decisions into.
+    /// The system owner is accepted only for the retained audit log, which it
+    /// publishes its security decisions into.
     ///
     /// # Errors
     ///
-    /// Returns [`TenantTableBindingError::InvalidTenant`] for a nil tenant on any
-    /// other table, another identity validation error, or
+    /// Returns [`TenantTableBindingError::InvalidTenant`] for the system owner on
+    /// any other table, another identity validation error, or
     /// [`TenantTableBindingError::BindingSizeOverflow`] when any exact byte
     /// total cannot be represented.
     pub(crate) fn facts<'a>(
         tenant: &'a DataTenantId,
         table_ref: &'a TableRef,
     ) -> Result<PhysicalBindingFacts<'a>, TenantTableBindingError> {
-        if tenant.as_uuid().is_nil() && !AuditLogTable::admits_system_owner(table_ref) {
+        if *tenant == DataTenantId::SYSTEM_OWNER && !AuditLogTable::admits_system_owner(table_ref) {
             return Err(TenantTableBindingError::InvalidTenant);
         }
         if !is_safe_name(&table_ref.name) {
@@ -199,8 +199,8 @@ impl TenantTableBinding {
     /// only to the physical Iceberg namespace and object-store prefix.
     ///
     /// # Errors
-    /// Returns [`TenantTableBindingError::InvalidTenant`] for a nil tenant on any
-    /// table but the retained audit log,
+    /// Returns [`TenantTableBindingError::InvalidTenant`] for the system owner on
+    /// any table but the retained audit log,
     /// [`TenantTableBindingError::InvalidTableName`] when the logical table
     /// name is not a safe local identifier,
     /// [`TenantTableBindingError::InvalidPhysicalNamespace`] when the fixed
@@ -376,9 +376,9 @@ mod tests {
     }
 
     #[test]
-    fn tenant_table_binding_rejects_nil_tenant() {
+    fn tenant_table_binding_rejects_system_owner_outside_audit_log() {
         assert_eq!(
-            TenantTableBinding::resolve((crate::test_support::nil_tenant(), table())),
+            TenantTableBinding::resolve((DataTenantId::SYSTEM_OWNER, table())),
             Err(TenantTableBindingError::InvalidTenant)
         );
     }
@@ -391,15 +391,15 @@ mod tests {
     #[test]
     fn tenant_table_binding_admits_system_owner_only_for_audit_log() {
         let audit_log = TableRef::new(BifrostNamespace::Audit, "audit_log");
-        let binding = TenantTableBinding::resolve((crate::test_support::nil_tenant(), audit_log))
+        let binding = TenantTableBinding::resolve((DataTenantId::SYSTEM_OWNER, audit_log))
             .expect("the system owner binds the retained audit log");
         assert_eq!(
             binding.object_prefix,
-            format!("tenants/{}/system/audit_log", uuid::Uuid::nil())
+            format!("tenants/{}/system/audit_log", DataTenantId::SYSTEM_OWNER)
         );
         assert_eq!(
             TenantTableBinding::resolve((
-                crate::test_support::nil_tenant(),
+                DataTenantId::SYSTEM_OWNER,
                 TableRef::new(BifrostNamespace::Audit, "other"),
             )),
             Err(TenantTableBindingError::InvalidTenant)

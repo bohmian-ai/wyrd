@@ -13,6 +13,17 @@ use crate::storage::upload::reader::SourceReader;
 /// Streams the source body directly to the storage backend with the plan's
 /// required headers plus the idempotency key. No retry—transport failures
 /// propagate immediately.
+///
+/// # Errors
+///
+/// Returns `PlanMismatch` for a non-single-PUT plan, `Transport` when the
+/// request or its streamed source body fails, and the mapped backend error
+/// for a non-success status.
+///
+/// # Cancellation
+///
+/// Cancelling mid-body abandons the PUT; nothing is completed on the server
+/// by this function.
 pub(crate) async fn upload(
     client: &WyrdClient,
     plan: &UploadPlan,

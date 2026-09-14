@@ -32,6 +32,15 @@ impl SourceReader {
     /// boundaries.
     ///
     /// Returns `Ok(None)` when the stream is exhausted.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first source error yielded by the underlying stream; bytes
+    /// gathered for this call before that error are discarded.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancelling may drop bytes gathered for this call but not yet returned.
     pub(crate) async fn next_chunk(
         &mut self,
         max: usize,
@@ -56,6 +65,14 @@ impl SourceReader {
     }
 
     /// Checks whether more data is available without consuming it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the source error yielded by the underlying stream.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancelling before a chunk arrives leaves the reader unchanged.
     pub(crate) async fn has_more(&mut self) -> Result<bool, StorageClientError> {
         if self.pending.has_remaining() {
             return Ok(true);

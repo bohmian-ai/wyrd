@@ -76,6 +76,18 @@ impl PgIssuerResolver {
 }
 
 impl IssuerConfigResolver for PgIssuerResolver {
+    /// List every trusted issuer configured for `tenant`, decrypting sealed
+    /// client secrets with the process sealing key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OidcError::JwksUnavailable`] when the tenant connection
+    /// cannot be acquired, the issuer query fails, or any row cannot be
+    /// decoded or decrypted.
+    ///
+    /// # Cancellation
+    ///
+    /// The lookup is read-only; cancelling releases the tenant connection.
     #[tracing::instrument(skip(self), fields(tenant_id = %tenant))]
     async fn trusted_issuers(
         &self,
@@ -114,6 +126,16 @@ impl IssuerConfigResolver for PgIssuerResolver {
 
     /// Fetch only the tenant's issuer row keyed by `issuer` instead of listing
     /// and filtering every configured issuer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OidcError::JwksUnavailable`] when the tenant connection
+    /// cannot be acquired, the issuer query fails, or the matching row cannot
+    /// be decoded or decrypted. A missing issuer is `Ok(None)`.
+    ///
+    /// # Cancellation
+    ///
+    /// The lookup is read-only; cancelling releases the tenant connection.
     #[tracing::instrument(skip(self), fields(tenant_id = %tenant, issuer = %issuer))]
     async fn trusted_issuer(
         &self,

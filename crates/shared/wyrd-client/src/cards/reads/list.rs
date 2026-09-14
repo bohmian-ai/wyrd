@@ -6,6 +6,15 @@ use wyrd_spec::registry::{ListCardsRequest, ListCardsResponse};
 use crate::cards::error::RegistryEngineError;
 
 /// List Cards with encoded query parameters and no GET request body.
+///
+/// # Errors
+///
+/// Returns a query-serialization error when `request` cannot be URL-encoded,
+/// and the transport error or structured server refusal for the listing.
+///
+/// # Cancellation
+///
+/// The listing is read-only; cancelling abandons the request.
 pub(crate) async fn list(
     client: &WyrdClient,
     request: ListCardsRequest,

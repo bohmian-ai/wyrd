@@ -14,6 +14,23 @@ use wyrd_spec::registry::CreateCardResponse;
 use crate::cards::error::RegistryEngineError;
 
 /// Complete every uploaded Card and merge server-owned final state.
+///
+/// Cards are completed sequentially in upload-plan order under the saga's one
+/// idempotency key, and each server outcome is validated before it replaces
+/// the matching registration outcome.
+///
+/// # Errors
+///
+/// Returns `RegistryInvalidCardSpec` when an upload plan carries no Card UID,
+/// the transport or structured server error from a completion request, and
+/// `RegistryArtifactVerifyFailed` when a completion response does not
+/// identify exactly the requested Card. Earlier Cards may already be complete
+/// when a later one fails.
+///
+/// # Cancellation
+///
+/// Cancelling can leave some Cards completed and others pending. Every request
+/// carries the saga's idempotency key, so a retry is keyed to the same saga.
 pub(crate) async fn complete_uploaded_cards(
     client: &WyrdClient,
     response: &CreateCardResponse,
@@ -30,6 +47,10 @@ pub(crate) async fn complete_uploaded_cards(
 }
 
 /// Extract the unique Card UIDs represented by server upload plans.
+///
+/// # Errors
+///
+/// Returns `RegistryInvalidCardSpec` when a plan's Card reference has no UID.
 fn collect_uploaded_card_uids(
     response: &CreateCardResponse,
 ) -> Result<Vec<CardUid>, RegistryEngineError> {
@@ -52,6 +73,16 @@ fn collect_uploaded_card_uids(
 }
 
 /// Complete one Card using the registration saga's stable idempotency key.
+///
+/// # Errors
+///
+/// Returns the client transport error or the structured server refusal for
+/// the completion request.
+///
+/// # Cancellation
+///
+/// Cancelling after the request is sent leaves the server outcome unknown;
+/// the request carries the saga's idempotency key for a keyed retry.
 async fn complete_uploaded_card(
     client: &WyrdClient,
     uid: &CardUid,
@@ -66,6 +97,11 @@ async fn complete_uploaded_card(
 
 /// Reject a completion response that is missing the requested identity or
 /// contains a duplicate/unrelated outcome.
+///
+/// # Errors
+///
+/// Returns `RegistryArtifactVerifyFailed` unless the response holds exactly
+/// one outcome and it carries `uid`.
 fn validate_completion_response(
     original: &CreateCardResponse,
     uid: &CardUid,
@@ -93,6 +129,11 @@ fn validate_completion_response(
 }
 
 /// Replace only the matching outcome and preserve the server-derived root.
+///
+/// # Errors
+///
+/// Returns `RegistryArtifactVerifyFailed` when `completed` has no outcome or
+/// its outcome matches no Card in `response`; `response` is unchanged then.
 fn merge_completed_outcome(
     response: &mut CreateCardResponse,
     completed: CreateCardResponse,

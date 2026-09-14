@@ -31,6 +31,18 @@ const MAX_PART_ATTEMPTS: u32 = 3;
 /// `hooks.part_url_minter`. Returns a completion payload with one
 /// `(part_number, etag)` entry per part in ascending order—retries never
 /// duplicate parts (V-003).
+///
+/// # Errors
+///
+/// Returns `PlanMismatch` for a non-multipart plan, `PlanInvalid` when part
+/// sizing does not fit this platform, a source error from the reader,
+/// `SizeMismatch` when the source length differs from the plan, and the
+/// part-URL mint, transport, or backend status error left after retries.
+///
+/// # Cancellation
+///
+/// Cancelling can leave earlier parts uploaded to an incomplete multipart
+/// upload; nothing is completed on the server by this function.
 pub(crate) async fn upload(
     client: &WyrdClient,
     plan: &UploadPlan,
@@ -91,6 +103,16 @@ pub(crate) async fn upload(
 }
 
 /// PUT one part with bounded retry and presigned-URL remint on 403 expiry.
+///
+/// # Errors
+///
+/// Returns the part-URL mint error, or the transport or backend status error
+/// once the retry budget is exhausted or the status is not retryable.
+///
+/// # Cancellation
+///
+/// Cancelling mid-request leaves the part's upload state unknown; a later
+/// attempt re-sends the same part number.
 async fn send_part_with_retry(
     client: &WyrdClient,
     hooks: &mut UploadHooks<'_>,

@@ -12,6 +12,12 @@ use crate::cards::error::RegistryEngineError;
 /// Repository filesystem configuration is intentionally not loaded here.
 /// `wyrd-loader` owns authored-card and `wyrd.toml` discovery; this module only
 /// assembles the authenticated network client.
+///
+/// # Errors
+///
+/// Returns [`RegistryEngineError::Client`] when the global client
+/// configuration cannot be read or parsed, when an explicit `server_url` is
+/// empty, or when the authenticated transport cannot be constructed.
 pub(crate) fn load(
     server_url: Option<&str>,
     credential: Option<SecretString>,

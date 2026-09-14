@@ -22,6 +22,21 @@ use crate::cards::error::RegistryEngineError;
 use crate::cards::progress::{RegistrationProgressEvent, RegistrationProgressSink};
 
 /// Transfer every server-minted artifact entry with bounded concurrency.
+///
+/// Up to four artifacts transfer at once. Every transfer runs to its own
+/// outcome before the first failure is returned, so progress events report a
+/// finish for each started artifact.
+///
+/// # Errors
+///
+/// Returns `RegistryUploadInterrupted` when planned entries and local sources
+/// differ, an IO error when a source cannot be opened, and the storage-client
+/// error for a failed transfer or server upload completion.
+///
+/// # Cancellation
+///
+/// Cancelling can leave some artifacts fully or partially uploaded while their
+/// Cards remain pending; nothing is completed on the server by this step.
 pub(crate) async fn upload_artifacts(
     storage: &WyrdStorageClient,
     response: &CreateCardResponse,
@@ -84,6 +99,11 @@ fn collect_upload_entries(response: &CreateCardResponse) -> Vec<CardUploadEntry>
 }
 
 /// Require exact equality between planned relative paths and local sources.
+///
+/// # Errors
+///
+/// Returns `RegistryUploadInterrupted` naming the first path present on only
+/// one side.
 fn validate_artifact_sources(
     entries: &[CardUploadEntry],
     sources: &BTreeMap<RelativeArtifactPath, PathBuf>,
@@ -110,6 +130,16 @@ fn validate_artifact_sources(
 }
 
 /// Open one local source and hand it to the storage-client façade.
+///
+/// # Errors
+///
+/// Returns an IO error when the source cannot be opened and the storage-client
+/// error when the transfer or its server completion fails.
+///
+/// # Cancellation
+///
+/// Cancelling may leave a partially transferred upload; its Card stays pending
+/// until a later completion succeeds.
 async fn upload_artifact_entry(
     storage: &WyrdStorageClient,
     entry: &CardUploadEntry,

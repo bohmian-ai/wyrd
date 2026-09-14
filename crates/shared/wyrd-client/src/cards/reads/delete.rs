@@ -8,6 +8,17 @@ use crate::cards::handle::CardSelector;
 use crate::cards::reads::{get, selector_ref};
 
 /// Resolve a selector when necessary and issue the idempotent delete request.
+///
+/// # Errors
+///
+/// Returns a selector error when a named selector is not exact, the lookup or
+/// identity error when a UID selector's optional fields must be confirmed
+/// first, and the transport error or structured server refusal for the delete.
+///
+/// # Cancellation
+///
+/// Cancelling after the delete is sent leaves its outcome unknown; the delete
+/// is idempotent, so repeating it is safe.
 pub(crate) async fn delete(
     client: &WyrdClient,
     selector: CardSelector,

@@ -38,6 +38,18 @@ use crate::cards::progress::{
 /// owns every artifact transfer detail. `wyrd-server` owns durable manifest,
 /// activation, audit, and cleanup state. This module only sequences those
 /// operations and maps the final response into a receipt.
+///
+/// # Errors
+///
+/// Returns the local preparation errors of `build_submission::prepare`, the
+/// registration submission refusal, artifact transfer failures, completion
+/// errors, and `RegistryArtifactVerifyFailed` when a Card does not end Active.
+///
+/// # Cancellation
+///
+/// Cancelling after submission can leave Cards registered but pending, with
+/// artifacts partially uploaded or some Cards completed; that server-owned
+/// state remains available for reconciliation.
 pub(crate) async fn register(
     engine: &RegistryEngine,
     input: &RegistrationInput,
@@ -81,6 +93,10 @@ fn emit_phase(progress: &Option<RegistrationProgressSink>, phase: RegistrationPh
 }
 
 /// Reject a response that has not reached a server-owned terminal success.
+///
+/// # Errors
+///
+/// Returns `RegistryArtifactVerifyFailed` naming the first Card not Active.
 fn ensure_active(response: &CreateCardResponse) -> Result<(), RegistryEngineError> {
     if let Some(pending) = response
         .outcomes

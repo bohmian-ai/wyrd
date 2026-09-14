@@ -10,6 +10,14 @@ use crate::cards::error::RegistryEngineError;
 use crate::cards::handle::CardSelector;
 
 /// Fetch a Card through the selector's exact or latest route.
+///
+/// # Errors
+///
+/// Returns the errors of [`get_response`].
+///
+/// # Cancellation
+///
+/// The lookup is read-only; cancelling abandons the request.
 pub(crate) async fn get(
     client: &WyrdClient,
     selector: &CardSelector,
@@ -18,6 +26,16 @@ pub(crate) async fn get(
 }
 
 /// Fetch a complete Card response while retaining server timestamps.
+///
+/// # Errors
+///
+/// Returns the transport error or structured server refusal for the lookup,
+/// and `RegistryCardRefUidNotResolvableHere` when the returned Card does not
+/// match the selector's identity.
+///
+/// # Cancellation
+///
+/// The lookup is read-only; cancelling abandons the request.
 pub(crate) async fn get_response(
     client: &WyrdClient,
     selector: &CardSelector,
@@ -88,6 +106,12 @@ pub(crate) async fn get_response(
 }
 
 /// Convert an exact selector into the wire reference shape.
+///
+/// # Errors
+///
+/// Returns `RegistryVersionRequired` for a named selector without a version,
+/// and `RegistryInvalidCardSpec` for an exact reference missing its space or
+/// for a UID selector.
 pub(crate) fn selector_ref(selector: &CardSelector) -> Result<CardRef, RegistryEngineError> {
     match selector {
         CardSelector::Named {
@@ -126,6 +150,11 @@ pub(crate) fn selector_ref(selector: &CardSelector) -> Result<CardRef, RegistryE
 }
 
 /// Assert optional UID-selector identity fields against the server response.
+///
+/// # Errors
+///
+/// Returns `RegistryCardRefUidNotResolvableHere` when any identity field the
+/// selector carries differs from `card`.
 pub(crate) fn assert_selector_identity(
     selector: &CardSelector,
     card: &Card,
@@ -186,6 +215,11 @@ pub(crate) fn assert_selector_identity(
 }
 
 /// Convert a hydrated server Card into an exact resolved reference.
+///
+/// # Errors
+///
+/// Returns `RegistryInvalidVersionBlock` when the Card has no resolved
+/// version, and `RegistryInvalidCardSpec` when it has no resolved space.
 pub(crate) fn card_ref_from_card(card: &Card) -> Result<CardRef, RegistryEngineError> {
     let Some(version) = card.metadata.resolved_pin().cloned() else {
         return Err(WyrdError::RegistryInvalidVersionBlock {

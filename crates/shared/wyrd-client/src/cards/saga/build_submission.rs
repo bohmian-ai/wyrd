@@ -20,6 +20,22 @@ pub(crate) struct PreparedRegistration {
 
 /// Validate local sources, stamp client-owned manifest hashes, and project the
 /// request without serializing any filesystem path.
+///
+/// Stamping works on a cloned submission set, so the caller's input is never
+/// partially modified and no network call has been made when this returns.
+///
+/// # Errors
+///
+/// Returns the IO, size, or manifest-hash mismatch reported by
+/// [`hash_artifacts::validate_and_stamp`], a serialization error when a
+/// manifest cannot be canonicalized, and `RegistryUploadInterrupted` or
+/// `RegistryInvalidArtifactPath` when declared artifacts and local sources do
+/// not match one-to-one.
+///
+/// # Cancellation
+///
+/// Cancelling drops any open source file handle. Only local files have been
+/// read, so there is no remote progress to reconcile.
 pub(crate) async fn prepare(
     input: &RegistrationInput,
 ) -> Result<PreparedRegistration, RegistryEngineError> {

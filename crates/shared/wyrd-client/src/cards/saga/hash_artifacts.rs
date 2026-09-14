@@ -13,6 +13,22 @@ use crate::cards::error::RegistryEngineError;
 
 /// Validate source bytes before any registration network call and stamp the
 /// manifest hash that the server validates at the registration boundary.
+///
+/// Entries are sorted in place, and the manifest hash is stamped only after
+/// every present source matches its declared size and digest.
+///
+/// # Errors
+///
+/// Returns an IO error when a source cannot be opened or read,
+/// `RegistrySpecTooLarge` when a source size overflows `u64`,
+/// `RegistryManifestHashMismatch` when a source's size or SHA-256 differs from
+/// its entry, and a serialization error when the manifest cannot be
+/// canonicalized.
+///
+/// # Cancellation
+///
+/// Cancelling drops the open file handle and may leave the entries sorted
+/// without a stamped hash; no network call has been made.
 pub(crate) async fn validate_and_stamp(
     submission: &mut CardSubmission,
     sources: &BTreeMap<RelativeArtifactPath, PathBuf>,

@@ -50,13 +50,6 @@ VALA_OPERATOR_ALLOWLIST = {
     "crates/vala/vala-sql/src/queries/maintenance_leases.rs",
     # Cross-tenant active Bifrost roster used only by the Forge scheduler.
     "crates/vala/vala-sql/src/queries/forge_catalog_operator.rs",
-    # Oracle admission recovery is a bounded global counter reconciliation
-    # performed through the operator pool before readiness.
-    "crates/vala/vala-sql/src/queries/oracle_admission_operator.rs",
-    # Oracle admission blocks are a cross-tenant capacity ledger fenced by the
-    # Oracle role incarnation, allocated and renewed before any tenant request
-    # is admitted, so the owner runs on the operator pool.
-    "crates/vala/vala-sql/src/queries/oracle_admission.rs",
 }
 
 # Cohesive owners that intentionally expose both cross-tenant OperatorPool

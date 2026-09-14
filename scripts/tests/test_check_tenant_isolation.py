@@ -20,9 +20,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 from check_tenant_isolation import (  # noqa: E402
     VALA_NON_RLS_CONTROL_TABLES,
-    VALA_OPERATOR_ALLOWLIST,
     ROOT,
-    has_platform_executor,
     has_raw_query_marker,
     normalize_sql,
     strip_sql_line_comments,
@@ -128,7 +126,6 @@ def _repo_text(relative: str) -> str:
 ORACLE_ADMISSION_MIGRATION = (
     "crates/vala/vala-sql/migrations/20260910000022_oracle_admission_blocks.sql"
 )
-ORACLE_ADMISSION_MODULE = "crates/vala/vala-sql/src/queries/oracle_admission.rs"
 ORACLE_READER_AUTHORITY_MODULE = (
     "crates/vala/vala-sql/src/queries/oracle_reader_authority.rs"
 )
@@ -156,17 +153,6 @@ def test_both_oracle_admission_tables_carry_a_complete_rls_triple() -> None:
             assert clause in window.lower(), f"{qualified} is missing `{clause}`"
 
 
-def test_oracle_admission_module_is_an_operator_pool_owner() -> None:
-    assert ORACLE_ADMISSION_MODULE in VALA_OPERATOR_ALLOWLIST
-    code = _repo_text(ORACLE_ADMISSION_MODULE)
-    assert has_platform_executor(code), (
-        "an operator-allowlisted module must still prove its platform executor"
-    )
-    assert "TenantConn" not in code, (
-        "the cross-tenant admission ledger must not take a tenant connection"
-    )
-
-
 def test_table_protections_owns_a_tenant_conn_and_rejects_a_raw_connection() -> None:
     code = _repo_text(ORACLE_READER_AUTHORITY_MODULE)
     assert "OracleTableProtections" in structs_owning_tenant_conn(code)
@@ -184,7 +170,7 @@ def test_table_protections_owns_a_tenant_conn_and_rejects_a_raw_connection() -> 
 
 
 def test_the_two_sanctioned_raw_query_markers_are_accepted() -> None:
-    for relative in (ORACLE_ADMISSION_MODULE, SCRIBE_BATCH_COMMITS_MODULE):
+    for relative in (ORACLE_READER_AUTHORITY_MODULE, SCRIBE_BATCH_COMMITS_MODULE):
         code = _repo_text(relative)
         assert has_raw_query_marker(code), f"{relative} lost its raw-query marker"
         assert not has_raw_query_marker(

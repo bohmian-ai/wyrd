@@ -2568,7 +2568,10 @@ async fn coordinator_object_store_failure_clears_readiness() {
         .expect("the seeded rows publish as hot files");
     // Snapshot visibility precedes terminal settlement. Park the worker after
     // its full attempt so the coordinator's fault proof has a stable demand generation.
-    observer.hold_after_next_attempt_for_test();
+    // The hold targets this table: the server's audit publisher also drives
+    // Forge work for the system and tenant audit logs, and an audit-log attempt
+    // must not consume the barrier and park the worker before this table promotes.
+    observer.hold_after_next_table_attempt_for_test(server.data_tenant_id(), table);
     let catalog = server.bifrost_catalog();
     let ident = forge_table_ident(&server, table);
     let mut completed = server.completed_forge_scheduler_passes_for_test();

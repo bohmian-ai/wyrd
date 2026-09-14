@@ -806,6 +806,13 @@ pub struct ForgeWorkerCompletionObserver {
     /// Release for the one returned attempt held by the passive barrier.
     #[cfg(feature = "test-support")]
     attempt_pause_release: Arc<tokio::sync::Notify>,
+    /// Tenant table whose planned task alone trips the returned-attempt barrier.
+    ///
+    /// `None` lets any attempt trip it. A server also runs Forge work for
+    /// tables the test does not own, such as each tenant's audit log, so a
+    /// barrier aimed at one table must not be consumed by that work.
+    #[cfg(feature = "test-support")]
+    attempt_hold_table: Arc<Mutex<Option<(DataTenantId, String)>>>,
     /// One-shot passive barrier after the next managed rewrite handoff exists.
     #[cfg(feature = "test-support")]
     pause_after_next_handoff: Arc<AtomicBool>,
@@ -1241,6 +1248,27 @@ impl ForgeWorkerCompletionObserver {
     /// before its next claim after observing a failure boundary.
     #[cfg(feature = "test-support")]
     pub fn hold_after_next_attempt_for_test(&self) {
+        self.arm_attempt_hold(None);
+    }
+
+    /// Hold the next supervised attempt of a task planned for one tenant table.
+    ///
+    /// Identical to [`Self::hold_after_next_attempt_for_test`] except that
+    /// attempts of tasks planned for any other table return without tripping
+    /// the barrier. The task's table comes from the `Planned` lifecycle event
+    /// this observer already recorded, so the worker path is unchanged.
+    #[cfg(feature = "test-support")]
+    pub fn hold_after_next_table_attempt_for_test(&self, tenant: DataTenantId, table: &str) {
+        self.arm_attempt_hold(Some((tenant, table.to_owned())));
+    }
+
+    /// Arm the one-shot returned-attempt barrier with an optional table filter.
+    #[cfg(feature = "test-support")]
+    fn arm_attempt_hold(&self, table: Option<(DataTenantId, String)>) {
+        *self
+            .attempt_hold_table
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = table;
         self.attempt_paused.store(false, Ordering::Release);
         self.pause_after_next_attempt.store(true, Ordering::Release);
     }
@@ -1603,9 +1631,31 @@ impl ForgeWorkerCompletionObserver {
         self.ready.notify_waiters();
     }
 
-    /// Pause once after an armed supervised attempt has fully returned.
+    /// Pause once after an armed supervised attempt of `task_id` has fully returned.
+    ///
+    /// When the barrier carries a table filter, an attempt whose task was not
+    /// planned for that tenant table leaves the barrier armed and returns.
     #[cfg(feature = "test-support")]
-    async fn pause_after_attempt_for_test(&self) {
+    async fn pause_after_attempt_for_test(&self, task_id: Uuid) {
+        if !self.pause_after_next_attempt.load(Ordering::Acquire) {
+            return;
+        }
+        let filter = self
+            .attempt_hold_table
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some((tenant, table)) = filter
+            && !self.lifecycle_events().iter().any(|event| {
+                matches!(
+                    event,
+                    ForgeLifecycleEvent::Planned { task_id: planned, tenant: planned_tenant, table: planned_table, .. }
+                        if *planned == task_id && *planned_tenant == tenant && *planned_table == table
+                )
+            })
+        {
+            return;
+        }
         if !self.pause_after_next_attempt.swap(false, Ordering::AcqRel) {
             return;
         }
@@ -2728,7 +2778,7 @@ redacted
             "Forge task settled"
         );
         #[cfg(feature = "test-support")]
-        self.pause_after_attempt_for_test().await;
+        self.pause_after_attempt_for_test(task_id).await;
         match result {
             Ok(true) => self.record_completion(task_id, strategy),
             Ok(false) => {}
@@ -2770,7 +2820,7 @@ redacted
         let strategy = ForgeClaimStrategy::Known(prepared.task.strategy);
         let result = self.reconcile_prepared(prepared, shutdown).await;
         #[cfg(feature = "test-support")]
-        self.pause_after_attempt_for_test().await;
+        self.pause_after_attempt_for_test(task_id).await;
         match result {
             Ok(()) => self.record_completion(task_id, strategy),
             Err(error) => {
@@ -2827,11 +2877,11 @@ redacted
     }
 
     /// Publish the passive publication-evidence event for one admitted rewrite.
-    /// Apply the observer's one-shot passive returned-attempt barrier.
+    /// Apply the observer's one-shot passive returned-attempt barrier to `task_id`.
     #[cfg(feature = "test-support")]
-    async fn pause_after_attempt_for_test(&self) {
+    async fn pause_after_attempt_for_test(&self, task_id: Uuid) {
         if let Some(observer) = &self.completion_observer {
-            observer.pause_after_attempt_for_test().await;
+            observer.pause_after_attempt_for_test(task_id).await;
         }
     }
 

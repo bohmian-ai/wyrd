@@ -179,13 +179,10 @@ async fn scribe_backpressure_disk_pressure_and_fairness_recover() {
     let settled = server
         .scribe_inspection_snapshot()
         .expect("Scribe ownership is inspectable");
-    assert_eq!(
-        settled.writable_bucket_count, 0,
-        "publication must leave no writable bucket owning published rows"
-    );
-    assert_eq!(
-        settled.immutable_bucket_count, 0,
-        "publication must leave no immutable bucket owning published rows"
+    let owned = super::support::journey_buckets(&settled);
+    assert!(
+        owned.is_empty(),
+        "publication must leave no bucket owning published rows; surviving: {owned:?}"
     );
 
     server.shutdown().await.expect("the server drains cleanly");

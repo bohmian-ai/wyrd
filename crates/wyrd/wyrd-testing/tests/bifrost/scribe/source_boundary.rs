@@ -72,9 +72,11 @@ async fn scribe_local_stage_to_hot_source_transition_is_exact() {
     let staged = server
         .scribe_inspection_snapshot()
         .expect("Scribe ownership is inspectable");
-    assert_eq!(
-        staged.writable_bucket_count, 0,
-        "the freeze must leave no writable bucket owning acknowledged rows"
+    let frozen = super::support::journey_buckets(&staged);
+    assert!(
+        frozen.iter().all(|bucket| bucket.writable_bytes == 0),
+        "the freeze must leave no writable bucket owning acknowledged rows; \
+         surviving: {frozen:?}"
     );
     assert_eq!(
         published_object_count(&server, tenant, BifrostNamespace::Datasets, &name).await,

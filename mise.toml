@@ -1054,10 +1054,6 @@ run = [
   """,
 ]
 
-[tasks."cli:dev-bootstrap"]
-description = "Seed the local Wyrd tenant and service credentials"
-run = "cargo run --locked -p wyrd-cli -- dev bootstrap"
-
 [tasks."cli:bootstrap-key"]
 description = "Mint the first admin API key for a tenant"
 run = "cargo run --locked -p wyrd-server -- bootstrap-key --tenant ${WYRD_BOOTSTRAP_TENANT:-acme}"
@@ -1363,6 +1359,10 @@ depends = [
   "codegen:check",
   "cardkind:check",
   "check:client-tier",
+  "check:registry-client-tier",
+  "check:cli-client-tier",
+  "check:sdk-client-tier",
+  "check:sdk-pyo3-scope",
   "check:registry-no-server-routes",
   "check:pyo3-scope",
   "check:mocks-scope",

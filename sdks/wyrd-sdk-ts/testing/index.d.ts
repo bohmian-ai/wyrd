@@ -40,6 +40,11 @@ export declare class NativeWyrdTestServer {
    * This does not expose a production flush API; it only lets a journey
    * await the existing server-owned publication lifecycle before Oracle
    * reads the acknowledged batch.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the server lock is poisoned, the server is
+   * shut down, or the publication barrier fails.
    */
   waitForBifrostPublication(): void
   /**
@@ -96,9 +101,23 @@ export declare class NativeWyrdTestServer {
    * Returns a napi error when the harness is closed or the audit query fails.
    */
   bifrostReadDecisionCount(): number
-  /** Truncate the next query after its schema frame. */
+  /**
+   * Truncate the next query after its schema frame.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the server lock is poisoned or the server is
+   * shut down.
+   */
   failNextQueryAfterSchema(): void
-  /** Truncate the next query after its first batch frame. */
+  /**
+   * Truncate the next query after its first batch frame.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the server lock is poisoned or the server is
+   * shut down.
+   */
   failNextQueryAfterBatch(): void
   /**
    * Gracefully shuts down the in-process server once.

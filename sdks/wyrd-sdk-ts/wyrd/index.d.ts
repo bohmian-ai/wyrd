@@ -188,7 +188,13 @@ export declare class NativeBifrostQueryStream {
    * Returns a napi error when the retaining lock is poisoned.
    */
   get schemaIpc(): Buffer | null
-  /** Returns serialized terminal metadata after validated completion. */
+  /**
+   * Returns serialized terminal metadata after validated completion.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the terminal lock is poisoned.
+   */
   get terminalJson(): string | null
 }
 

@@ -1288,7 +1288,7 @@ mod pg_tests {
     #[tokio::test]
     async fn public_sdk_owned_batch_timeout_retry_deduplicates_and_settles() {
         let srv = WyrdTestServer::builder()
-            .with_wal_sync_delay(Duration::from_millis(75))
+            .with_wal_sync_delay(Duration::from_millis(750))
             .start_bound()
             .await
             .expect("delayed-WAL test server start");
@@ -1321,7 +1321,7 @@ mod pg_tests {
         let config = ClientConfig {
             grpc: GrpcConfig {
                 endpoint: srv.grpc_url().expect("gRPC URL"),
-                timeout_ms: 25,
+                timeout_ms: 250,
                 connect_retries: 0,
                 max_message_bytes: 32 * 1024 * 1024,
                 ..GrpcConfig::default()
@@ -1393,7 +1393,17 @@ mod pg_tests {
             "the failed flush released its control slot"
         );
 
-        tokio::time::sleep(Duration::from_millis(350)).await;
+        // The producer owns the retry schedule: early retries land inside the
+        // delayed WAL sync and back off, and a flush while one is scheduled
+        // reports FlushTimeout. Wait for the retained owner to settle instead
+        // of guessing how many backoff steps a fixed delay covers.
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while bifrost.metrics().retry_entries > 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the retained retry settles once the original append is durable");
         bifrost
             .flush()
             .await

@@ -5921,11 +5921,10 @@ impl ForgeCompactionPlanRunner {
     ///
     /// # Errors
     ///
-    /// Returns [`ForgeError::Catalog`] when the reload fails,
-    /// [`ForgeError::Shutdown`] when the refusal is cancellation, and
-    /// [`ForgeError::RewriteUnsettled`] wrapping the refusal when any other
-    /// authority is refused, alongside the audit, fence, and clock failures
-    /// that boundary raises.
+    /// Returns [`ForgeError::Catalog`] when the reload fails, and
+    /// [`ForgeError::RewriteUnsettled`] wrapping the refusal when authority is
+    /// refused, alongside the audit, fence, and clock failures that boundary
+    /// raises.
     async fn acquire_publication_authority(
         &self,
         context: &RewritePublication<'_>,
@@ -5951,7 +5950,11 @@ impl ForgeCompactionPlanRunner {
                     context,
                     None,
                     handoff,
-                    publication_refusal_error(refusal),
+                    ForgeError::Reconciliation {
+                        detail: format!(
+                            "Forge rewrite publication refused before commit: {refusal:?}"
+                        ),
+                    },
                     lease,
                 )
                 .await);
@@ -8172,21 +8175,6 @@ fn require_running(stop: &CancellationToken) -> Result<(), ForgeError> {
     }
 }
 
-/// Maps a pre-commit publication refusal onto the error the attempt returns.
-///
-/// Cancellation is a clean pre-effect shutdown, so it becomes the bare
-/// [`ForgeError::Shutdown`] the event loop releases, exactly as a cancelled
-/// retry wait does. Every other refusal is a reconciliation failure naming the
-/// authority that failed.
-fn publication_refusal_error(refusal: super::publication::RewriteRefusal) -> ForgeError {
-    match refusal {
-        super::publication::RewriteRefusal::Cancelled => ForgeError::Shutdown,
-        refusal => ForgeError::Reconciliation {
-            detail: format!("Forge rewrite publication refused before commit: {refusal:?}"),
-        },
-    }
-}
-
 /// Maps execution evidence onto the durable planning consequence for settlement.
 #[must_use]
 fn task_progress_effect(
@@ -8226,26 +8214,6 @@ mod tests {
     };
 
     use super::*;
-
-    /// A cancelled publication shuts down cleanly; other refusals stay failures.
-    ///
-    /// # Panics
-    ///
-    /// Panics when cancellation is not the bare shutdown the event loop releases,
-    /// or when another refusal is reported as a shutdown.
-    #[test]
-    fn publication_refusal_error_releases_only_cancellation() {
-        use super::super::publication::RewriteRefusal;
-
-        assert!(matches!(
-            publication_refusal_error(RewriteRefusal::Cancelled),
-            ForgeError::Shutdown
-        ));
-        assert!(matches!(
-            publication_refusal_error(RewriteRefusal::Deadline),
-            ForgeError::Reconciliation { detail } if detail.contains("Deadline")
-        ));
-    }
 
     /// The per-plan reducer applies exactly the documented priority.
     ///

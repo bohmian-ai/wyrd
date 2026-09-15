@@ -2781,9 +2781,8 @@ mod bifrost_wire_tests {
     use crate::vala::api::{
         BifrostTableDescription, BifrostTableEntry, DataTypeSpec, FieldSpec,
         INPUT_CLASS_GATE_CORRELATION, INPUT_CLASS_KEY, NullOrderWire, PARQUET_FIELD_ID_KEY,
-        PhysicalLayoutWire, RegisterOutcome, RegisterTableRequest,
-        RegisterTableResponse, SortDirectionWire, SortKeyWire, TableStatus,
-        TimeGranularityWire, TimeUnit,
+        PhysicalLayoutWire, RegisterOutcome, RegisterTableRequest, RegisterTableResponse,
+        SortDirectionWire, SortKeyWire, TableStatus, TimeGranularityWire, TimeUnit,
     };
     use schemars::schema_for;
 

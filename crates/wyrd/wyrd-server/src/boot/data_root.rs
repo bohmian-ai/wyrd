@@ -128,8 +128,10 @@ impl BifrostDataRoot {
             &roots.oracle_scratch,
         ] {
             let probe = dir.join(PROBE_FILE_NAME);
-            probe_write(&probe)
-                .map_err(|source| BifrostDataRootError::Unusable { path: probe, source })?;
+            probe_write(&probe).map_err(|source| BifrostDataRootError::Unusable {
+                path: probe,
+                source,
+            })?;
         }
         Ok(Self { roots, _lock: lock })
     }

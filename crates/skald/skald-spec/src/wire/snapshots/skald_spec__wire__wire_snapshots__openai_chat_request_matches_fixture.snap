@@ -1,6 +1,5 @@
 ---
 source: crates/skald/skald-spec/src/wire/mod.rs
-assertion_line: 5
 expression: "common::openai_chat_request()"
 ---
 {
@@ -25,12 +24,12 @@ expression: "common::openai_chat_request()"
     "json_schema": {
       "name": "answer",
       "schema": {
+        "type": "object",
         "properties": {
           "answer": {
             "type": "string"
           }
-        },
-        "type": "object"
+        }
       },
       "strict": true
     }
@@ -42,12 +41,12 @@ expression: "common::openai_chat_request()"
         "name": "lookup",
         "description": "Lookup a thing",
         "parameters": {
+          "type": "object",
           "properties": {
             "q": {
               "type": "string"
             }
-          },
-          "type": "object"
+          }
         },
         "strict": true
       }

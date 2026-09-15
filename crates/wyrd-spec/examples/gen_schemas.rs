@@ -402,10 +402,34 @@ impl ProblemExamples<'_> {
             value["detail"] = Value::from(error.title());
             catalog.insert(name.to_owned(), value);
         }
-        let output = to_string_pretty(&catalog)? + "\n";
+        let output = to_string_pretty(&sort_keys(Value::Object(catalog)))? + "\n";
         for directory in [self.out, self.golden] {
             fs::write(directory.join("ui_problem_examples.json"), &output)?;
         }
         Ok(())
+    }
+}
+
+/// Rebuilds `value` with every object's keys in sorted order.
+///
+/// `serde_json::Map` iterates in insertion order whenever any crate in the
+/// build graph enables `serde_json/preserve_order`, and in sorted order
+/// otherwise. Sorting before writing keeps the generated catalog byte-stable
+/// regardless of the build's feature union, so `codegen:check` compares
+/// content rather than feature resolution.
+fn sort_keys(value: Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut entries: Vec<(String, Value)> = map.into_iter().collect();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, nested)| (key, sort_keys(nested)))
+                    .collect(),
+            )
+        }
+        Value::Array(items) => Value::Array(items.into_iter().map(sort_keys).collect()),
+        scalar => scalar,
     }
 }

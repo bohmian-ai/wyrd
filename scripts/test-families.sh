@@ -61,4 +61,5 @@ FAMILY_SHARED=(
   wyrd-bench
   wyrd-utils
   wyrd-version
+  workspace-hack
 )

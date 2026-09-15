@@ -146,6 +146,20 @@ check_selection "planning-only change selects nothing" "any=true unclassified=fa
 check_selection "client storage selects storage" "storage=true" \
   "crates/shared/wyrd-client/src/storage/mod.rs"
 
+# A generic Rust pull request selects rust-compat on the pull-request OS plan,
+# so that job must run the Rust tests on Linux rather than exclude it.
+LINTS_TEST="$SCRIPT_DIR/../../workflows/lints-test.yml"
+rust_compat="$(awk '/^  rust-compat:$/{p=1;next} p&&/^  [a-z-]+:$/{p=0} p' "$LINTS_TEST")"
+if grep -q "echo 'os=\[\"ubuntu-24.04\"\]'" "$LINTS_TEST" \
+  && grep -q 'mise run test:rust' <<< "$rust_compat" \
+  && ! grep -q 'ubuntu-24.04' <<< "$rust_compat"; then
+  echo "OK  generic Rust pull request runs test:rust on Linux"
+  PASS=$((PASS+1))
+else
+  echo "FAIL generic Rust pull request must run test:rust in rust-compat on the Linux plan"
+  FAIL=$((FAIL+1))
+fi
+
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

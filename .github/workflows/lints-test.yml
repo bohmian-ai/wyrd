@@ -152,8 +152,8 @@ jobs:
       - name: Run Bifrost gate
         run: mise run verify:bifrost
 
-  # Cross-platform Rust compatibility: tests on macOS and Windows.
-  # Format/lint/boundary checks run only in the ci job above (Linux only).
+  # Rust tests on every planned OS: Linux for pull requests, plus macOS and
+  # Windows on main. Format/lint/boundary checks run only in the ci job above.
   rust-compat:
     name: rust compat (${{ matrix.os }})
     needs: [changes, matrix-plan]
@@ -164,8 +164,6 @@ jobs:
       fail-fast: false
       matrix:
         os: ${{ fromJSON(needs.matrix-plan.outputs.os) }}
-        exclude:
-          - os: ubuntu-24.04   # covered by the ci job
     steps:
       - uses: actions/checkout@v4
 

@@ -617,9 +617,14 @@ mod pg_tests {
             assert_eq!(pending.backend, StorageBackendKind::S3);
             assert_eq!(pending.wire_protocol, WireProtocol::S3MultipartV1);
 
+            // Card activation may verify the object and complete the row
+            // before the storage completion route persists its own result.
+            storage::multipart_uploads::mark_completed_if_pending(&mut conn, upload_id)
+                .await
+                .expect("card activation completes the upload first");
             storage::multipart_uploads::mark_completed(&mut conn, upload_id)
                 .await
-                .expect("upload marks completed");
+                .expect("storage completion accepts the already completed upload");
 
             storage::artifact_metadata::insert(
                 &mut conn,
@@ -800,6 +805,9 @@ mod pg_tests {
         storage::multipart_uploads::mark_aborted_if_open(&mut conn, upload_id, "test-sweeper")
             .await
             .expect("admin abort update succeeds");
+        storage::multipart_uploads::mark_completed(&mut conn, upload_id)
+            .await
+            .expect_err("an aborted upload cannot be completed");
         conn.commit().await.expect("admin abort commits");
 
         cleanup_storage_test_rows(store.pool(), &[tenant])

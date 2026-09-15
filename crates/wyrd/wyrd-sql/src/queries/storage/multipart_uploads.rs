@@ -433,18 +433,24 @@ pub async fn find_pending_for_dedupe(
     row.map(MultipartUploadRow::try_from).transpose()
 }
 
-/// Mark a pending upload as completed.
+/// Mark a pending upload as completed after the storage route verified it.
+///
+/// Card activation verifies the same object and may complete the row through
+/// [`mark_completed_if_pending`] first, so an already completed row is accepted
+/// and keeps its original `completed_at`. The row lock taken by the update
+/// serializes the two writers.
 ///
 /// # Errors
-/// Returns [`SqlError`] when the update fails or no pending row exists.
+/// Returns [`SqlError`] when the update fails or the row is missing, still
+/// initiating, aborted, or failed.
 pub async fn mark_completed(conn: &mut TenantConn<'_>, id: Uuid) -> Result<(), SqlError> {
     let result = sqlx::query(
         r#"
         UPDATE wyrd.storage_multipart_uploads
         SET status = 'completed',
-            completed_at = now()
+            completed_at = COALESCE(completed_at, now())
         WHERE id = $1
-          AND status = 'pending'
+          AND status IN ('pending', 'completed')
         "#,
     )
     .bind(id)

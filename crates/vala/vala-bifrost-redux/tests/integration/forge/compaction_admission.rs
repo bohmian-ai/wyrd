@@ -2576,12 +2576,13 @@ async fn unresolved_commit_resets_once_absence_is_provable(
     supervisor.stop_worker().await;
     // A release reports nothing, and the successor that recovered the operation
     // was still working when this worker was stopped, so the stop's own error is
-    // the only one an attempt is allowed to have returned here.
+    // the only one an attempt is allowed to have returned here. The stop can
+    // land at a checkpoint or at the publication authority check, which refuses
+    // as `Cancelled`; either is the stop, never a failure of the release.
     assert!(
-        supervisor
-            .returned_errors()
-            .iter()
-            .all(|error| error.contains("shut down")),
+        supervisor.returned_errors().iter().all(|error| {
+            error.contains("shut down") || error.contains("refused before commit: Cancelled")
+        }),
         "a released attempt reports no failure; its operation is settled from durable state: {:?}",
         supervisor.returned_errors()
     );

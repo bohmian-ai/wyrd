@@ -325,15 +325,24 @@ async fn frozen_audit_range_replays_once_while_its_tail_waits() -> Result<(), Se
 /// commits are waiting, and requires the server's own Vala pool to hand out a
 /// connection while the lock is still held. Waiting for the lease cutoff itself would take tens of
 /// seconds; a pool with no connection to lend is the cause, observed directly.
-/// Releasing the lock must then let the queued decisions commit and drain.
+/// Pending commits must stop at the pool's connection count, with every read
+/// past that bound still served and its dropped decision counted in
+/// `oracle_audit_commit_failures_total`. Releasing the lock must then let the
+/// admitted decisions commit and drain to zero pending.
 ///
 /// # Errors
 /// Returns the server, Postgres, publication, or query failure, or a timeout
-/// when the pool has no connection left for renewal.
+/// when the pool has no connection left for renewal or admitted commits never
+/// drain.
+///
+/// # Panics
+/// Panics when pending commits exceed or never reach the bound, or overflow is
+/// not counted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the serialized Postgres-backed journey lane"]
 async fn reads_are_served_while_audit_commits_wait_on_the_chain_head()
 -> Result<(), ServerJourneyError> {
+    let metrics = wyrd_server::app::metrics::install_recorder()?;
     let server = WyrdTestServer::start_bound().await?;
     let tenant = server.data_tenant_id();
     let operation = format!(
@@ -349,13 +358,20 @@ async fn reads_are_served_while_audit_commits_wait_on_the_chain_head()
         .fetch_all(&mut **fence.transaction())
         .await?;
     let pool_connections = vala_sql::postgres::vala_pool_config().max_connections;
+    let failures_before = commit_failures(&metrics);
     for _ in 0..pool_connections * 2 {
         retained_rows(&server, tenant, &operation).await?;
     }
     let waiting = server.oracle_runtime_inspection()?.audit_pending;
+    assert_eq!(
+        waiting,
+        u64::from(pool_connections),
+        "fenced reads must fill, and never exceed, the pool-derived pending bound"
+    );
+    let overflow = commit_failures(&metrics) - failures_before;
     assert!(
-        waiting >= u64::from(pool_connections),
-        "each fenced read must leave its audit commit waiting on the chain head: {waiting}"
+        overflow >= u64::from(pool_connections),
+        "every read past the pending bound must count its dropped decision: {overflow}"
     );
     let spare = tokio::time::timeout(
         std::time::Duration::from_secs(5),
@@ -366,9 +382,30 @@ async fn reads_are_served_while_audit_commits_wait_on_the_chain_head()
     drop(spare);
     fence.commit().await?;
 
+    let deadline = std::time::Instant::now() + PUBLICATION_BUDGET;
+    while server.oracle_runtime_inspection()?.audit_pending > 0 {
+        if std::time::Instant::now() >= deadline {
+            return Err(
+                "admitted audit commits did not drain after the chain head was released".into(),
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
     await_drained(&server, tenant).await?;
     server.shutdown().await?;
     Ok(())
+}
+
+/// Reads the process total of Oracle audit decisions that did not commit.
+///
+/// A family the recorder has not yet seen reads as zero.
+fn commit_failures(metrics: &metrics_exporter_prometheus::PrometheusHandle) -> u64 {
+    metrics
+        .render()
+        .lines()
+        .find_map(|line| line.strip_prefix("oracle_audit_commit_failures_total "))
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .map_or(0, |value| value as u64)
 }
 
 /// One stalled tenant does not hold retained history back for another tenant.

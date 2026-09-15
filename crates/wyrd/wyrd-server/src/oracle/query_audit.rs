@@ -13,6 +13,12 @@
 //! every read would otherwise park one pooled connection until renewal starved
 //! and the Oracle fenced itself. Commits therefore hold one of a fixed share of
 //! the pool's connections; the rest queue in memory without a connection.
+//!
+//! That in-memory queue is itself bounded. At most as many commits as the pool
+//! has connections may be pending at once; a decision arriving while that many
+//! are pending spawns nothing and is logged and counted like any other failed
+//! commit, so a stalled chain head can never grow an unbounded task backlog or
+//! block the read that produced it.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -40,6 +46,9 @@ pub struct OracleQueryAudit {
     /// Caps commits holding a pooled connection at once, leaving the rest of
     /// the pool to lease renewal, readiness, and query pins.
     connections: Arc<Semaphore>,
+    /// Caps commits owned at once, waiting or running, at the pool's maximum
+    /// connections; acquired without waiting before a commit is spawned.
+    pending: Arc<Semaphore>,
 }
 
 /// Fraction of the Vala pool that concurrent audit commits may occupy.
@@ -49,27 +58,38 @@ impl OracleQueryAudit {
     /// Creates the writer around the server's Vala Postgres owner.
     ///
     /// Concurrent commits are limited to a quarter of the pool's configured
-    /// maximum connections, and never fewer than one.
+    /// maximum connections, and never fewer than one. Pending commits, waiting
+    /// or running, are limited to the pool's maximum connections.
     #[must_use]
     pub(crate) fn new(vala: ValaPostgres) -> Arc<Self> {
-        let permits = (vala.pool().options().get_max_connections() / POOL_SHARE_DIVISOR).max(1);
+        let max_connections = vala.pool().options().get_max_connections().max(1);
+        let permits = (max_connections / POOL_SHARE_DIVISOR).max(1);
         Arc::new(Self {
             vala,
             tasks: TaskTracker::new(),
             connections: Arc::new(Semaphore::new(permits as usize)),
+            pending: Arc::new(Semaphore::new(max_connections as usize)),
         })
     }
 
     /// Spawns one tracked commit of `event` into `tenant`'s audit outbox.
     ///
-    /// Returns immediately. The task waits for a connection permit before it
-    /// acquires a connection and holds it through commit. A failed acquire,
-    /// append, or commit increments `oracle_audit_commit_failures_total` and
-    /// logs the request identity.
+    /// Returns immediately. A pending permit is taken without waiting before
+    /// anything is spawned; when every permit is held the decision is dropped,
+    /// counted in `oracle_audit_commit_failures_total`, and logged. An admitted
+    /// task holds its pending permit until it finishes, waits for a connection
+    /// permit before it acquires a connection, and holds that connection
+    /// through commit. A failed acquire, append, or commit is counted and
+    /// logged the same way.
     fn stage(&self, tenant: DataTenantId, event: AuditEvent) {
+        let Ok(pending) = Arc::clone(&self.pending).try_acquire_owned() else {
+            record_commit_failure(&event, "Oracle audit outbox commit backlog is full");
+            return;
+        };
         let vala = self.vala.clone();
         let connections = Arc::clone(&self.connections);
         self.tasks.spawn(async move {
+            let _pending = pending;
             let committed = async {
                 let _permit = connections
                     .acquire_owned()
@@ -83,13 +103,7 @@ impl OracleQueryAudit {
             }
             .await;
             if let Err(error) = committed {
-                metrics::counter!("oracle_audit_commit_failures_total").increment(1);
-                tracing::error!(
-                    %error,
-                    operation = %event.operation,
-                    request_id = %event.request_id,
-                    "Oracle audit decision did not commit to the audit outbox"
-                );
+                record_commit_failure(&event, &error);
             }
         });
     }
@@ -158,6 +172,19 @@ impl OracleAudit for OracleQueryAudit {
         self.stage(context.query.data_tenant_id, event);
         Ok(())
     }
+}
+
+/// Counts and logs one decision that did not reach the audit outbox.
+///
+/// Only the operation and request identity are logged, never the event detail.
+fn record_commit_failure(event: &AuditEvent, error: &str) {
+    metrics::counter!("oracle_audit_commit_failures_total").increment(1);
+    tracing::error!(
+        %error,
+        operation = %event.operation,
+        request_id = %event.request_id,
+        "Oracle audit decision did not commit to the audit outbox"
+    );
 }
 
 /// Builds the scrubbed event shared by read decisions and security violations.

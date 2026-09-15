@@ -270,8 +270,8 @@ Open items:
 - Resolved: spec revision 8 (user-approved 2026-09-14) aligns REQ-026,
   REQ-026A, AC-005, and AC-017 with REQ-014's non-blocking Oracle outbox audit.
 - AC-009 needs a final `$wyrd-change-review`.
-- FIND-TASK-002-18 (AI trailers on earlier commits) needs explicit
-  authorization to rewrite history; this task forbids a rewrite.
+- Resolved: the owner accepted FIND-TASK-002-18 (AI trailers on 22 earlier
+  commits) as-is on 2026-09-14; history is not rewritten.
 
 Non-goals held: no history rewrite, no tracked `.node` artifact, the live
 Oracle UI stays out of scope, and no unrelated working-tree file was committed.

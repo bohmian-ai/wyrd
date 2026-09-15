@@ -218,7 +218,7 @@ Candidate commits: `ae402d0b7`, `43c9a4382`, `55a41a061`, `e23848c5b`,
 | `git diff --check 861f8d86c..<candidate>` exits zero | `43c9a4382` | `git diff --check 861f8d86cc3f9d7e70fb59489e80f8be62afddbf..34b58cd0e` → exit 0, no output | PASS |
 | Direct write refused before admission or settled before shutdown returns | `bifrost/handle.rs` `DirectSendPermit` + shutdown wait (`ae402d0b7`) | `mise exec -- cargo nextest run --locked -p wyrd-client --lib -E 'test(=bifrost::handle::tests::shutdown_waits_for_admitted_direct_write)'` (fails with wait removed) | PASS |
 | Failed healthy drain settles exactly once | `bifrost/query.rs` `settle` marks `Settled` (`ae402d0b7`) | `mise exec -- cargo nextest run --locked -p wyrd-client --lib -E 'test(=bifrost::query::tests::failed_healthy_drain_settles_once)'` (fails without fix: 2 vs 1) | PASS |
-| No AI co-author trailer in the cumulative range | New R3 commits carry none; 22 earlier commits still do | `git log --format='%B' 861f8d86c..HEAD \| grep -c "Co-Authored-By: Claude"` → 22 | BLOCKED: history rewrite needs explicit owner authorization |
+| No AI co-author trailer in the cumulative range | New R3 commits carry none; 22 earlier commits still do | `git log --format='%B' 861f8d86c..HEAD \| grep -c "Co-Authored-By: Claude"` → 22 | ACCEPTED: owner accepted the 22 earlier trailers without a rewrite (2026-09-14) |
 
 Broader lanes: `mise run fmt`, `mise run lints`, `mise run py:format`,
 `mise run py:lints`, `mise run py:typecheck`, `mise run ts:build`,

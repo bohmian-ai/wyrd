@@ -173,6 +173,9 @@ fn probe_write(probe: &Path) -> Result<(), IoError> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
 
     /// Every managed path is created beneath the one root, and Forge gets none.
@@ -240,8 +243,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn prepare_rejects_an_unwritable_managed_child() {
-        use std::os::unix::fs::PermissionsExt;
-
         let base = tempfile::tempdir().expect("root fixture");
         let stage = base.path().join("scribe-stage");
         std::fs::create_dir(&stage).expect("stage fixture");

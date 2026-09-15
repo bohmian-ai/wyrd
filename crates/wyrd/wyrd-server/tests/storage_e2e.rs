@@ -19,6 +19,7 @@ use wyrd_client::storage::WyrdStorageClient;
 use wyrd_client::transport::HttpTransport;
 use wyrd_client::transport::config::HttpConfig;
 use wyrd_client::transport::credential::ResolvedCredential;
+use wyrd_server::config::BifrostTarget;
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::storage::{
     DownloadInitRequest, DownloadInitResponse, DownloadPlan, UploadInitRequest, UploadInitResponse,
@@ -87,8 +88,19 @@ async fn bootstrap_service_jwt(srv: &WyrdTestServer, name: &str) -> String {
         .expect("exchange API key")
 }
 
+/// Starts a bound artifact-storage server over `settings`.
+///
+/// Storage journeys exercise artifact upload and download only, so the server
+/// runs the API `Server` target without an embedded Forge worker: a worker
+/// refuses staging backends lacking native `start_after` listing (Azure), which
+/// is Forge behavior these journeys do not cover.
+///
+/// # Panics
+///
+/// Panics when the server fails to start or become ready.
 async fn server_from_settings(settings: StorageSettings) -> WyrdTestServer {
     WyrdTestServer::builder()
+        .with_bifrost_target_for_test(BifrostTarget::Server)
         .with_storage_settings(settings)
         .start_bound()
         .await
@@ -189,8 +201,17 @@ fn azure_cloud_settings() -> StorageSettings {
     }))
 }
 
+/// Starts a bound artifact-storage server over a pre-built emulator `handle`.
+///
+/// Uses the API `Server` target for the same reason as
+/// [`server_from_settings`]: storage journeys do not compose a Forge worker.
+///
+/// # Panics
+///
+/// Panics when the server fails to start or become ready.
 async fn server_from_handle(handle: Arc<StorageHandle>) -> WyrdTestServer {
     WyrdTestServer::builder()
+        .with_bifrost_target_for_test(BifrostTarget::Server)
         .with_storage_handle(handle)
         .start_bound()
         .await

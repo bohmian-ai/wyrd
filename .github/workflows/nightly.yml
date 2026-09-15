@@ -12,10 +12,23 @@ env:
   MISE_LOCKED: "true"
 
 jobs:
+  # gate plus the real-server journeys it does not reach. gate already covers
+  # the storage emulator matrix; live cloud and performance run elsewhere.
   gate:
-    name: full repository gate
+    name: nightly ${{ matrix.task }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        task:
+          - gate
+          - test:cards:integration
+          - test:cli:journey
+          - test:wyrdstate:journey
+          - py:test:testing
+          - py:test:integration
+          - ts:test:integration
     steps:
       - uses: actions/checkout@v4
 
@@ -54,8 +67,8 @@ jobs:
       - name: Add wasm target
         run: rustup target add wasm32-unknown-unknown
 
-      - name: Run full gate
-        run: mise run gate
+      - name: Run ${{ matrix.task }}
+        run: mise run ${{ matrix.task }}
 
   identity:
     name: identity journey
@@ -93,83 +106,3 @@ jobs:
 
       - name: Run isolated Postgres inventory checks
         run: mise run test:postgres:inventory
-
-  # Real-server journeys the gate does not reach. Live-cloud storage and
-  # performance stay in their own workflows.
-  rust-journeys:
-    name: real-server Rust journeys
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: ./.github/actions/setup-rust-ci
-        with:
-          docker-images: "false"
-
-      - name: Run Card registration integration
-        run: mise run test:cards:integration
-
-      - name: Run CLI journey
-        run: mise run test:cli:journey
-
-      - name: Run WyrdState journey
-        run: mise run test:wyrdstate:journey
-
-  python-journeys:
-    name: Python harness and integration journeys
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: ./.github/actions/setup-rust-ci
-        with:
-          docker-images: "false"
-
-      - name: Install uv and Python
-        uses: astral-sh/setup-uv@v6
-        with:
-          enable-cache: true
-          python-version: "3.12"
-
-      - name: Run Python harness tests
-        run: mise run py:test:testing
-
-      - name: Run Python integration journeys
-        run: mise run py:test:integration
-
-  typescript-journeys:
-    name: TypeScript integration journeys
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: ./.github/actions/setup-rust-ci
-        with:
-          docker-images: "false"
-
-      - name: Run TypeScript integration journeys
-        run: mise run ts:test:integration
-
-  storage-emulators:
-    name: storage emulator matrix
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: ./.github/actions/setup-rust-ci
-        with:
-          docker-images: "false"
-
-      - name: Start storage emulators
-        run: mise run storage:up
-
-      - name: Run storage emulator matrix
-        run: mise run test:storage:matrix
-
-      - name: Stop storage emulators
-        if: always()
-        run: mise run storage:down

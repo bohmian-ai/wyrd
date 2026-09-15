@@ -146,17 +146,22 @@ check_selection "planning-only change selects nothing" "any=true unclassified=fa
 check_selection "client storage selects storage" "storage=true" \
   "crates/shared/wyrd-client/src/storage/mod.rs"
 
-# A generic Rust pull request selects rust-compat on the pull-request OS plan,
-# so that job must run the Rust tests on Linux rather than exclude it.
+# The Linux ci job owns a selected change: a full-gate change runs only gate,
+# which already reaches the Rust tests, and any other change runs check and
+# then test:rust. rust-compat keeps Linux excluded so no Rust lane repeats.
 LINTS_TEST="$SCRIPT_DIR/../../workflows/lints-test.yml"
+ci_job="$(awk '/^  ci:$/{p=1;next} p&&/^  [a-z-]+:$/{p=0} p' "$LINTS_TEST")"
+full_branch="$(awk '/full_gate }}" == "true" ]]; then$/{p=1;next} /^ *else$/{p=0} p' <<< "$ci_job")"
+generic_branch="$(awk '/^ *else$/{p=1;next} /^ *fi$/{p=0} p' <<< "$ci_job")"
 rust_compat="$(awk '/^  rust-compat:$/{p=1;next} p&&/^  [a-z-]+:$/{p=0} p' "$LINTS_TEST")"
-if grep -q "echo 'os=\[\"ubuntu-24.04\"\]'" "$LINTS_TEST" \
-  && grep -q 'mise run test:rust' <<< "$rust_compat" \
-  && ! grep -q 'ubuntu-24.04' <<< "$rust_compat"; then
-  echo "OK  generic Rust pull request runs test:rust on Linux"
+if grep -q 'mise run gate' <<< "$full_branch" \
+  && ! grep -q 'test:rust' <<< "$full_branch" \
+  && grep -A1 'mise run check' <<< "$generic_branch" | grep -q 'mise run test:rust' \
+  && grep -q -- '- os: ubuntu-24.04' <<< "$rust_compat"; then
+  echo "OK  ci runs gate for full changes and check plus test:rust otherwise"
   PASS=$((PASS+1))
 else
-  echo "FAIL generic Rust pull request must run test:rust in rust-compat on the Linux plan"
+  echo "FAIL ci must run gate for full changes and check then test:rust otherwise, with Linux excluded from rust-compat"
   FAIL=$((FAIL+1))
 fi
 

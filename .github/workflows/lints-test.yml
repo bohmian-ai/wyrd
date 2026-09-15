@@ -59,8 +59,8 @@ jobs:
           cat "$GITHUB_OUTPUT"
 
   # Mixed, global, and unclassified changes take the complete repository gate.
-  # Any other non-Bifrost Rust change runs format and lint here; its tests run
-  # in rust-compat.
+  # Any other non-Bifrost Rust change runs format, lint, and Linux Rust tests
+  # here; rust-compat adds macOS and Windows on main.
   ci:
     name: ci
     needs: changes
@@ -106,7 +106,13 @@ jobs:
         run: rustup target add wasm32-unknown-unknown
 
       - name: Run selected CI lane
-        run: mise run ${{ needs.changes.outputs.full_gate == 'true' && 'gate' || 'check' }}
+        run: |
+          if [[ "${{ needs.changes.outputs.full_gate }}" == "true" ]]; then
+            mise run gate
+          else
+            mise run check
+            mise run test:rust
+          fi
 
   bifrost:
     name: bifrost
@@ -152,8 +158,8 @@ jobs:
       - name: Run Bifrost gate
         run: mise run verify:bifrost
 
-  # Rust tests on every planned OS: Linux for pull requests, plus macOS and
-  # Windows on main. Format/lint/boundary checks run only in the ci job above.
+  # Cross-platform Rust compatibility: tests on macOS and Windows.
+  # Format/lint/boundary checks run only in the ci job above (Linux only).
   rust-compat:
     name: rust compat (${{ matrix.os }})
     needs: [changes, matrix-plan]
@@ -164,6 +170,8 @@ jobs:
       fail-fast: false
       matrix:
         os: ${{ fromJSON(needs.matrix-plan.outputs.os) }}
+        exclude:
+          - os: ubuntu-24.04   # covered by the ci job
     steps:
       - uses: actions/checkout@v4
 

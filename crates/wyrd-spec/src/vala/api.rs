@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::DataTenantId;
-use crate::auth::{PermissionScope, PrincipalId, PrincipalKindTag};
+use crate::auth::{PrincipalId, PrincipalKindTag};
 use crate::reference::CardRef;
 use crate::request_id::RequestId;
 pub use crate::vala::audit_detail::{
@@ -268,43 +268,6 @@ pub const INPUT_CLASS_KEY: &str = "wyrd:input_class";
 /// [`INPUT_CLASS_KEY`] value for a correlation input Gate resolves on write.
 pub const INPUT_CLASS_GATE_CORRELATION: &str = "gate_correlation";
 
-/// Descriptor for one entry in the Bifrost error catalog.
-///
-/// Emitted by `gen_schemas` (Stage 3 C7) and returned by the
-/// `bifrost.list_errors` MCP tool.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct BifrostErrorDescriptor {
-    /// Stable machine-readable error code (e.g. `WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND`).
-    pub code: String,
-    /// HTTP status code associated with this error.
-    pub status: u16,
-    /// Short human-readable title.
-    pub title: String,
-    /// Actionable remediation guidance.
-    pub remediation: String,
-}
-
-/// Descriptor for one Bifrost RBAC permission.
-///
-/// Emitted by `gen_schemas` (Stage 3 C7) and returned by the
-/// `bifrost.list_permissions` MCP tool.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct BifrostPermissionDescriptor {
-    /// Operation token in `resource:action` format (e.g. `bifrost_table:read`).
-    ///
-    /// Names the operation only. The object half of the grant is
-    /// [`Self::scope`]; there is no string spelling for an object.
-    pub permission: String,
-    /// Resource component (e.g. `bifrost_table`).
-    pub resource: String,
-    /// Action component (e.g. `read`).
-    pub action: String,
-    /// Objects the permission reaches, as the typed RBAC scope.
-    pub scope: PermissionScope,
-}
-
 /// Time-partition granularity on the wire.
 ///
 /// Bifrost v1 partitions every table on `wyrd_event_time` and admits exactly
@@ -423,36 +386,6 @@ pub struct RegisterTableResponse {
     pub table_uid: String,
     /// Server-authoritative lower-case hex of the 32-byte schema fingerprint.
     pub fingerprint: String,
-}
-
-// ── Query wire types (split sync / async — review M7) ────────────────────────
-
-/// A bound SQL parameter value for a parameterized query. Arrow-free scalar set.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub enum QueryParam {
-    /// SQL `NULL`.
-    Null,
-    /// Boolean.
-    Bool(bool),
-    /// 64-bit signed integer.
-    Int(i64),
-    /// 64-bit float.
-    Float(f64),
-    /// UTF-8 text.
-    Text(String),
-}
-
-/// Synchronous SQL query request. The response is a raw Arrow IPC stream, not a
-/// JSON type, so no response struct lives here.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct SyncQueryRequest {
-    /// SELECT-only SQL text.
-    pub sql: String,
-    /// Bound parameters.
-    #[serde(default)]
-    pub params: Vec<QueryParam>,
 }
 
 /// Maximum number of warnings carried by a terminal frame.
@@ -2848,8 +2781,8 @@ mod bifrost_wire_tests {
     use crate::vala::api::{
         BifrostTableDescription, BifrostTableEntry, DataTypeSpec, FieldSpec,
         INPUT_CLASS_GATE_CORRELATION, INPUT_CLASS_KEY, NullOrderWire, PARQUET_FIELD_ID_KEY,
-        PhysicalLayoutWire, QueryParam, RegisterOutcome, RegisterTableRequest,
-        RegisterTableResponse, SortDirectionWire, SortKeyWire, SyncQueryRequest, TableStatus,
+        PhysicalLayoutWire, RegisterOutcome, RegisterTableRequest,
+        RegisterTableResponse, SortDirectionWire, SortKeyWire, TableStatus,
         TimeGranularityWire, TimeUnit,
     };
     use schemars::schema_for;
@@ -3077,20 +3010,6 @@ mod bifrost_wire_tests {
     }
 
     #[test]
-    fn bifrost_wire_query_types_round_trip() {
-        bifrost_wire_round_trip(&SyncQueryRequest {
-            sql: "SELECT 1".to_string(),
-            params: vec![
-                QueryParam::Null,
-                QueryParam::Bool(true),
-                QueryParam::Int(7),
-                QueryParam::Float(1.5),
-                QueryParam::Text("x".to_string()),
-            ],
-        });
-    }
-
-    #[test]
     fn bifrost_wire_register_response_and_layout_round_trip() {
         bifrost_wire_round_trip(&RegisterTableResponse {
             outcome: RegisterOutcome::Created,
@@ -3116,8 +3035,6 @@ mod bifrost_wire_tests {
         let _ = schema_for!(FieldSpec);
         let _ = schema_for!(RegisterTableRequest);
         let _ = schema_for!(RegisterTableResponse);
-        let _ = schema_for!(SyncQueryRequest);
-        let _ = schema_for!(QueryParam);
     }
 
     /// Private tail and peer DTOs remain schema-generatable pure contracts.

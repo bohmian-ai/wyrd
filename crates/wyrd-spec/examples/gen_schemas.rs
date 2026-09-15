@@ -58,13 +58,12 @@ use wyrd_spec::storage::{
     UploadInitRequest, UploadInitResponse, UploadPlan, VerificationGuarantee, WireProtocol,
 };
 use wyrd_spec::vala::api::{
-    AuditEvent, AuditOutcome, AuthMethod, BifrostErrorDescriptor, BifrostPermissionDescriptor,
-    BifrostQueryRequest, BifrostTableDescription, BifrostTableEntry, CancelRunningQueryRequest,
+    AuditEvent, AuditOutcome, AuthMethod, BifrostQueryRequest, BifrostTableDescription, BifrostTableEntry, CancelRunningQueryRequest,
     CancelRunningQueryResponse, DataTypeSpec, FieldSpec as BifrostFieldSpec,
     GetRunningQueryRequest, ListRunningQueriesResponse, NullOrderWire, PhysicalLayoutWire,
-    QueryParam, RegisterOutcome, RegisterTableRequest, RegisterTableResponse,
+    RegisterOutcome, RegisterTableRequest, RegisterTableResponse,
     RunningQueryLifecycleState, RunningQueryProgress, RunningQuerySummary, SortDirectionWire,
-    SortKeyWire, SyncQueryRequest, TableStatus, TimeGranularityWire, TimeUnit,
+    SortKeyWire, TableStatus, TimeGranularityWire, TimeUnit,
 };
 use wyrd_spec::vala::eval::{
     AgentTurnSubmission, ComparisonOperator, ConversationTurn, DagError, EvalCondition,
@@ -213,7 +212,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<RegisterTableRequest>(out, golden, "bifrost_register_table_request")?;
     write::<RegisterOutcome>(out, golden, "bifrost_register_outcome")?;
     write::<RegisterTableResponse>(out, golden, "bifrost_register_table_response")?;
-    write::<QueryParam>(out, golden, "bifrost_query_param")?;
     write::<BifrostQueryRequest>(out, golden, "bifrost_query_request")?;
     write::<RunningQueryLifecycleState>(out, golden, "bifrost_running_query_lifecycle_state")?;
     write::<RunningQueryProgress>(out, golden, "bifrost_running_query_progress")?;
@@ -222,15 +220,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<GetRunningQueryRequest>(out, golden, "bifrost_get_running_query_request")?;
     write::<CancelRunningQueryRequest>(out, golden, "bifrost_cancel_running_query_request")?;
     write::<CancelRunningQueryResponse>(out, golden, "bifrost_cancel_running_query_response")?;
-    write::<SyncQueryRequest>(out, golden, "bifrost_sync_query_request")?;
     write::<AuditEvent>(out, golden, "bifrost_audit_event")?;
     write::<AuthMethod>(out, golden, "bifrost_audit_auth_method")?;
     write::<AuditOutcome>(out, golden, "bifrost_audit_outcome")?;
-    // Stage 3 C7: Bifrost capability catalog — error descriptors + permission descriptors.
-    // One source (these types in vala::api), two consumers: gen_schemas (snapshot) +
-    // bifrost.list_errors / bifrost.list_permissions MCP tools. Schema drift detected here.
-    write::<BifrostErrorDescriptor>(out, golden, "bifrost_error_descriptor")?;
-    write::<BifrostPermissionDescriptor>(out, golden, "bifrost_permission_descriptor")?;
     let eval_fixtures = Path::new("crates/wyrd-spec/tests/fixtures/eval/schemas");
     fs::create_dir_all(eval_fixtures)?;
     write_fixture::<EvalSpec>(eval_fixtures, "eval_spec")?;

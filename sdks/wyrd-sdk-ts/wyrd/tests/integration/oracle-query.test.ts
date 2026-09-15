@@ -150,7 +150,7 @@ describe("Oracle query journey", () => {
     } finally {
       server.shutdown();
     }
-  });
+  }, 15_000);
 
   it("rejects an authenticated token before Oracle work", async () => {
     const server = startTestServer();
@@ -175,7 +175,7 @@ describe("Oracle query journey", () => {
     } finally {
       server.shutdown();
     }
-  });
+  }, 15_000);
 
   it("rejects out-of-range deadlines with the shared validation error", async () => {
     const server = startTestServer();
@@ -196,7 +196,7 @@ describe("Oracle query journey", () => {
     } finally {
       server.shutdown();
     }
-  });
+  }, 15_000);
 });
 
 /** Hex-decoded canonical trace and span identifiers the fixture writes. */

@@ -136,7 +136,24 @@ pre-insertion active reservations), `957ef9f1d` (harness reads Scribe in-flight
 work after drain), `de39d19fd` (Forge refuses an impossible table rewrite
 policy at planning), `de1f9844c` (geometry journey judges task ownership after
 drain), `5db5cf162` and `62f8a830e` (identity harness registers bound Cards
-under their own uid and honours immediate revocation).
+under their own uid and honours immediate revocation), `55a298885` (retired
+the tenant-isolation self-test for the deleted Oracle admission module),
+`686636d38` (recovered cleanup settles through the ordinary claim record),
+`cd07c2737` (orphan-cleanup demand coalesces onto one nonterminal task per
+table), `fb7e7c395` (Scribe round-robin journey places batches on every lane),
+`0facbe803` (queue reports a background send's terminal refusal at the next
+flush or shutdown), `30751d469` (Oracle audit commits capped to a share of the
+Vala pool; frozen-range replay journey tolerates the server's own publisher),
+`fe0e20bc5` (theme tokens regenerated; the Claude skill copy is left to
+`skills:sync`; UI change detection names the `.agents` theme path),
+`288944c6e` (Agent fixture matches the canonical Card envelope), `d880e7871`
+(third-party debug info reduced to line tables), `b504d6d5f` (Bifrost Rust unit
+tests in one nextest invocation, same 221-test selection), `7cd28db18`
+(hakari `workspace-hack` dev-dependency unifies third-party test features,
+enforced by `check:workspace-hack`), `19769e24c` (generated output and wire
+fixtures stable under the unified feature set), `2bbf390f4` (artifact storage
+journeys run the `Server` target), `2feb3756e` (server-starting TypeScript
+Oracle journeys declare the sibling timeout).
 
 | Acceptance criterion | Implementation evidence | Verification evidence | Result |
 |---|---|---|---|
@@ -161,12 +178,41 @@ Commands (clean detached worktrees; exit 0 unless noted):
   (1 passed, 479 s); `cargo clippy --locked -p wyrd-testing --all-features --tests -- -D warnings`.
 - At `62f8a830e`: `mise run test:identity:journey` (18/18);
   `cargo clippy --locked -p wyrd-testing --all-features --tests -- -D warnings`.
-- `mise run gate`: fails only in `check:tenant-isolation:self`, whose
-  `test_oracle_admission_module_is_an_operator_pool_owner` reads
+- `check:tenant-isolation:self` read
   `crates/vala/vala-sql/src/queries/oracle_admission.rs`, deleted by
-  `194b37c73`. Retiring that self-test and its two dead
-  `VALA_OPERATOR_ALLOWLIST` entries awaits explicit approval, because it
-  removes a check.
+  `194b37c73`. With explicit approval, `55a298885` retired that self-test and
+  its two dead `VALA_OPERATOR_ALLOWLIST` entries; the property it guarded has
+  no remaining owner.
+- At `cd07c2737`: `mise run gate` failed only in
+  `round_robin::scribe_system_and_dynamic_tables_are_round_robin_equal`
+  (7 shared lanes of 16 from random batch ids). At `fb7e7c395` the exact
+  nextest command for that test, under `with-test-postgres.sh`, passed.
+- At `fb7e7c395`: `mise run gate` failed only in
+  `test_negative_empty_permissions_denied_rbac_on_write` (Python journey) and
+  `audit_publication::frozen_audit_range_replays_once_while_its_tail_waits`.
+- At `0facbe803`: `wyrd-queue` lib tests (41/41), with
+  `producer::tests::background_terminal_refusal_is_reported_by_the_next_flush_once`
+  failing when the fix is removed; `cargo clippy -p wyrd-queue --all-features
+  --tests -D warnings`; `mise run test:bifrost:journey:python` (35 passed).
+- At `30751d469`: exact nextest for
+  `audit_publication::reads_are_served_while_audit_commits_wait_on_the_chain_head`
+  fails with `OracleRoleUnavailable` without the pool cap and passes with it;
+  `frozen_audit_range_replays_once_while_its_tail_waits` passed 4/4 alone;
+  `mise run test:bifrost:journey:server` (10/10); clippy for `wyrd-server` and
+  `wyrd-testing` tests.
+- At `30751d469`: `mise run gate` passed every Bifrost lane (9/9) and failed
+  in `check:tokens`.
+- At `fe0e20bc5`: `mise run check:tokens`, `mise run check:skills-sync`,
+  `mise run check:ci-selection` (7 passed), `mise run docs:check`.
+- From `288944c6e` every `gate` dependency ran as its own `mise run` lane.
+  At `19769e24c`: `check`, `check:skills-sync`, every `check:*` lane,
+  `codegen:check`, `check:test-coverage`, the `py:*` and `ts:*` lanes,
+  `examples:python:datacard`, `test:wyrd` (1907), `test:skald` (410),
+  `test:vala`, `test:shared`, `test:sql`, `test:tonic`, and eight of nine
+  `test:bifrost` lanes passed.
+- At `2bbf390f4`: `mise run test:storage:matrix` (storage e2e 9/9);
+  `cargo clippy --locked -p wyrd-server --all-features --test storage_e2e -- -D warnings`.
+- At `2feb3756e`: `mise run test:bifrost:journey:typescript` (16/16).
 
 Root causes fixed while running the lanes:
 
@@ -179,21 +225,53 @@ Root causes fixed while running the lanes:
   `ForgeTablePolicy` and withholds only that rewrite (`de39d19fd`).
 - Identity journeys drifted from the registry-walked token mint and the
   harness's 5-second revocation cache (`5db5cf162`, `62f8a830e`).
+- The Forge recovery drain settled a claim without `record_settled_claim`,
+  so the test attempt barrier never opened and
+  `forge::production_routes::coordinator_and_worker_delete_only_exact_never_published_generation`
+  hit its attempt bound once orphan demand was deduplicated (`686636d38`,
+  `cd07c2737`). Earlier contradictory results came from the verify worktree
+  and main checkout sharing one `CARGO_TARGET_DIR`: workspace-relative
+  dep-info let Cargo reuse a binary built from the other tree's source.
+- The Scribe round-robin journey proved lane sharing with random batch ids,
+  so the hash sometimes split the lanes; batches are now placed on every lane
+  (`fb7e7c395`).
+- A row-count, interval, or retry seal in `wyrd-queue` dropped a terminal
+  refusal, so a flush after a background send of a denied batch returned Ok
+  (`0facbe803`).
+- Oracle read-decision audit commits each parked a Vala pool connection while
+  waiting on a held `audit_chain_head` lock, starving reader-epoch renewal
+  until the Oracle fenced itself. The frozen-range journey reached that state
+  when the server's own publisher froze a range after one of its three appends
+  (`30751d469`).
+- `97eab6c44` changed `palette.json` without regenerating the agent skill and
+  docs token files, and `gen-theme.mjs` still wrote a Claude-specific variant
+  that contradicted the byte mirror `check:skills-sync` enforces (`fe0e20bc5`).
+- Oracle reader leases expired while macOS idle sleep suspended a gate run,
+  aborting journeys; lanes now run under `caffeinate -ims`.
+- `00fe9fae1` removed the Agent status override, so the fixture still carried a
+  status the Card envelope skips (`288944c6e`).
+- Hakari unifies `serde_json/preserve_order` into test builds (production
+  `wyrd-server` already enables it), so the UI problem-example catalog and one
+  OpenAI wire snapshot changed key order; the generator now sorts keys and the
+  snapshot was re-recorded with no value change (`19769e24c`). The new crate
+  also needed a test family.
+- Bound storage servers composed a Forge worker, which refuses staging without
+  native `start_after` listing; Azure lacks it, so Azure journeys never became
+  ready (`2bbf390f4`). An Azure-backed deployment with a Forge worker still
+  refuses to start, as `66bec4bf1` intends.
+- Three server-starting TypeScript Oracle journeys used vitest's 5 s default
+  and timed out under load (`2feb3756e`).
 
 Open items:
 
 - Credentialed live-cloud workflows (`storage-integration-cloud.yml`) and the
   new `performance.yml` and `nightly.yml` jobs need a push and GitHub secrets.
   No local run can supply that evidence.
-- REQ-026, REQ-026A, and AC-017 still require an Oracle WAL-first relay and
-  checkpoint, which the approved REQ-014 removed. This needs a spec revision
-  before a final review can map them.
+- Resolved: spec revision 8 (user-approved 2026-09-14) aligns REQ-026,
+  REQ-026A, AC-005, and AC-017 with REQ-014's non-blocking Oracle outbox audit.
 - AC-009 needs a final `$wyrd-change-review`.
 - FIND-TASK-002-18 (AI trailers on earlier commits) needs explicit
   authorization to rewrite history; this task forbids a rewrite.
-- The uncommitted working-tree Forge task edits make
-  `forge::production_routes::coordinator_and_worker_delete_only_exact_never_published_generation`
-  time out. They are not part of this change and were not committed.
 
 Non-goals held: no history rewrite, no tracked `.node` artifact, the live
 Oracle UI stays out of scope, and no unrelated working-tree file was committed.

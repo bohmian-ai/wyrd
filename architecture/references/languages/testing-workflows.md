@@ -51,8 +51,11 @@ Verification has three levels:
 Pull requests select only the lanes associated with affected code and its
 dependency closure. The complete non-credentialed correctness suite runs
 nightly on `main`, including Rust, SQL, Python, TypeScript, integration,
-user-journey, Bifrost cluster, identity, and storage-emulator lanes. Live-cloud
-and performance/qualification suites run on separate schedules.
+user-journey, Bifrost cluster, identity, and storage-emulator lanes. Credentialed
+S3, GCS, and Azure cloud tests run locally through the existing ignored
+`mise.local.toml` tasks as pre-merge proof. Their separate GitHub Actions
+workflow runs on pushes to `main` after merge, without a weekly schedule;
+performance/qualification retains its own schedule.
 
 Use the narrowest `mise` task that covers the touched surface:
 

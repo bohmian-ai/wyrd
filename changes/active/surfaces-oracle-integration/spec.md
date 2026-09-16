@@ -1,6 +1,6 @@
 ---
 id: SPEC-surfaces-oracle-integration
-revision: 8
+revision: 9
 status: approved
 ---
 
@@ -501,8 +501,10 @@ architecture rather than as parallel implementations.
   affected code and its dependency closure. A generic Rust change MUST NOT
   automatically run the complete repository aggregate.
 - **REQ-034:** The complete non-credentialed correctness suite MUST run
-  nightly against `main`. Live-cloud and performance or qualification suites
-  MUST run in their separate GitHub Actions workflows.
+  nightly against `main`. Live-cloud tests MUST run in their own GitHub Actions
+  workflow on pushes to `main` after merge, not on a weekly schedule.
+  Performance or qualification suites MUST retain their separate workflow and
+  schedule.
 - **REQ-035:** Required-check aggregation MUST remain stable when unaffected
   lanes are skipped and MUST fail when any selected required lane fails.
 - **REQ-035A:** The Bifrost capability gate MUST cover its Rust, Python, and
@@ -518,8 +520,11 @@ architecture rather than as parallel implementations.
   Bifrost. Gated or ignored journeys MUST be invoked through their owning
   `mise` lanes; their default exclusion is not passing evidence. The broad
   repository gate and every focused capability lane MUST pass locally.
-  Credentialed live-cloud tests MUST pass in their owning GitHub Actions
-  workflows. No pre-existing-failure waiver, selective omission, empty test
+  Credentialed live-cloud tests MUST pass locally through the existing
+  `mise.local.toml` S3, GCS, and Azure tasks on the final candidate; this is
+  sufficient pre-merge cloud proof. Their post-merge GitHub Actions results
+  are not required to accept the candidate. No pre-existing-failure waiver,
+  selective omission, empty test
   selection, restored deletion, weakened assertion, ignored failure, or
   replacement by a lower test tier is acceptable.
 
@@ -776,7 +781,8 @@ authorization decision or accepted Oracle read
   removed typed-read, benchmark/qualification, or runtime-emulation layers.
 - **AC-008:** Workflow evidence demonstrates affected-code pull-request lane
   selection, stable required-job aggregation, full nightly-main correctness,
-  and separate live-cloud and performance schedules. It exercises success,
+  live-cloud Actions on pushes to `main` after merge without a weekly cron,
+  and the separate performance schedule. It exercises success,
   skipped, failure, mixed, global, and unclassified classifier/aggregation
   outcomes and includes the local identity journey plus isolated-Postgres
   contract, concurrency, roles, and inventory checks.
@@ -843,8 +849,10 @@ authorization decision or accepted Oracle read
   without restoring Surfaces implementations.
 - **AC-022:** Completion evidence records a passing result for every
   local non-credentialed test and journey lane required by REQ-064, including
-  the broad gate and all gated journeys. GitHub Actions evidence records the
-  passing credentialed live-cloud workflows. The final review independently
+  the broad gate and all gated journeys. Local evidence records passing
+  credentialed S3, GCS, and Azure tests through the existing
+  `mise.local.toml` tasks on that candidate; post-merge GitHub Actions proof is
+  not required. The final review independently
   confirms that no required lane was skipped, filtered to zero tests, weakened,
   or excused as a baseline failure.
 
@@ -856,7 +864,8 @@ derived after approval.
 
 None. The user resolved the remaining scope and acceptance decisions on
 2026-09-11: all local non-credentialed tests and gated journeys must pass;
-credentialed cloud tests run and pass in GitHub Actions; the single Bifrost
+credentialed cloud tests run and pass in GitHub Actions (superseded by the
+revision-9 owner override below); the single Bifrost
 data-root outcome is a required completion-blocking follow-up task; and live UI
 integration remains outside this change because that work is ongoing.
 
@@ -874,6 +883,12 @@ AC-005, and AC-017 with the REQ-014 decision of 2026-09-13: Oracle read
 decisions and tenant tripwires commit to the audit outbox from a non-blocking
 task with no audit WAL or relay, so an allowed read is not failed closed on
 audit unavailability.
+
+The user explicitly approved revision 9 on 2026-09-16 by overriding the
+earlier cloud-proof and cadence requirements: passing the existing local
+`mise.local.toml` S3, GCS, and Azure tasks on the final candidate is sufficient
+pre-merge proof. Live-cloud GitHub Actions run after merges to `main`, not
+weekly, and are not a pre-merge acceptance gate.
 
 ## Revision history
 
@@ -934,6 +949,12 @@ audit unavailability.
   initiator-first hash-covered delegation, fail-closed object denial, and
   correct peer-rejection chains are unchanged. Audit commits must not starve
   the Vala pool.
+- Revision 9 (`approved`, 2026-09-16): Records the owner's explicit override of
+  cloud proof and cadence. The three existing local `mise.local.toml` live-cloud
+  tasks provide sufficient final-candidate proof; GitHub Actions cloud jobs
+  remain post-merge checks on `main` pushes with no weekly schedule. Updates
+  REQ-034, REQ-064, AC-008, and AC-022 without changing query or storage
+  public contracts.
 
 ## Material authority
 

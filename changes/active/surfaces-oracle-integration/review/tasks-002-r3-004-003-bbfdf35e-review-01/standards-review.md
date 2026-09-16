@@ -125,4 +125,3 @@ Verification limits:
 - Tracked candidate source remained unchanged. Concurrent reviewers created
   only untracked review artifacts under the assigned review directory and an
   unrelated untracked verifier directory; neither changes the candidate tree.
-

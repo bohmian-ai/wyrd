@@ -1,7 +1,7 @@
 ---
 id: TASK-005
 kind: implementation
-status: review
+status: approved
 spec: SPEC-surfaces-oracle-integration
 spec_revision: 7
 requirements: [REQ-026, REQ-026A, REQ-026B, REQ-027, REQ-027A, REQ-027B, REQ-028, REQ-029, REQ-030, REQ-030A, INV-008, INV-008A, INV-008B, INV-008C, AC-005, AC-017]

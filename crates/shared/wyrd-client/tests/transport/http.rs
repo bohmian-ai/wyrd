@@ -237,6 +237,7 @@ mod transport_behavior {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use futures_util::StreamExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::Mutex;
@@ -784,39 +785,52 @@ mod transport_behavior {
         );
     }
 
-    /// Proves terminal streams outlive the ordinary total-response deadline.
-    #[tokio::test]
-    async fn request_json_stream_outlives_ordinary_total_timeout() {
-        let delay = std::time::Duration::from_millis(80);
-        let server = spawn_mock(vec![
-            MockResponse::ok("ordinary").with_body_delay(delay),
-            MockResponse::ok("frame-bytes")
-                .with_header("content-type", "application/vnd.wyrd.bifrost-query-stream")
-                .with_body_delay(delay),
-        ])
-        .await;
+    /// Delay applied to every slow fixture leg; four times the short timeout.
+    const SLOW_DELAY: std::time::Duration = std::time::Duration::from_millis(80);
+
+    /// Builds a bearer transport whose `timeout_ms` is shorter than [`SLOW_DELAY`].
+    ///
+    /// # Panics
+    /// Panics when the auth middleware or transport cannot be built.
+    fn make_short_timeout_transport(base_url: String) -> HttpTransport {
         let credential = ResolvedCredential::BearerToken("test-bearer".to_owned().into());
-        let config = ClientConfig::default();
-        let auth = AuthMiddleware::new(&config, credential).expect("auth builds");
-        let transport = HttpTransport::new(
+        let auth = AuthMiddleware::new(&ClientConfig::default(), credential).expect("auth builds");
+        HttpTransport::new(
             &HttpConfig {
-                base_url: server.base_url,
+                base_url,
                 timeout_ms: 20,
                 ..HttpConfig::default()
             },
             auth,
         )
-        .expect("transport builds");
+        .expect("transport builds")
+    }
+
+    /// Proves retried JSON bodies keep the configured total deadline while a
+    /// terminal query stream outlives it on the same transport.
+    ///
+    /// # Panics
+    /// Panics when the delayed JSON body does not time out or the delayed query
+    /// stream body does not arrive.
+    #[tokio::test]
+    async fn request_json_stream_outlives_ordinary_total_timeout() {
+        let server = spawn_mock(vec![
+            MockResponse::ok("{}").with_body_delay(SLOW_DELAY),
+            MockResponse::ok("frame-bytes")
+                .with_header("content-type", "application/vnd.wyrd.bifrost-query-stream")
+                .with_body_delay(SLOW_DELAY),
+        ])
+        .await;
+        let transport = make_short_timeout_transport(server.base_url);
 
         let ordinary = transport
-            .request_raw(reqwest::Method::GET, "/v1/ordinary")
+            .request_json::<(), serde_json::Value>(reqwest::Method::GET, "/v1/ordinary", None)
             .await
-            .expect("ordinary response headers arrive");
-        let ordinary_error = ordinary
-            .bytes()
-            .await
-            .expect_err("ordinary response body keeps its total deadline");
-        assert!(ordinary_error.is_timeout());
+            .expect_err("a delayed JSON body keeps its total deadline");
+        assert!(
+            ordinary.to_string().contains("reading response body"),
+            "the JSON body read timed out: {ordinary}"
+        );
 
         let streaming = transport
             .request_json_stream(
@@ -830,6 +844,205 @@ mod transport_behavior {
             streaming.bytes().await.expect("delayed stream body"),
             "frame-bytes"
         );
+    }
+
+    /// Proves an authenticated streaming GET body outlives `timeout_ms`.
+    ///
+    /// # Panics
+    /// Panics when the delayed body fails or the same-origin request lacks the
+    /// Wyrd bearer.
+    #[tokio::test]
+    async fn request_raw_slow_download_outlives_timeout() {
+        let server = spawn_mock(vec![
+            MockResponse::ok("object-bytes").with_body_delay(SLOW_DELAY),
+        ])
+        .await;
+        let transport = make_short_timeout_transport(server.base_url);
+        let response = transport
+            .request_raw(reqwest::Method::GET, "/v1/storage/object")
+            .await
+            .expect("download headers arrive");
+        assert_eq!(
+            response.bytes().await.expect("slow download"),
+            "object-bytes"
+        );
+        let captured = server.captured.lock().await;
+        assert!(extract_header(&captured[0], "x-wyrd-access-token").is_some());
+    }
+
+    /// Proves a credential-free external streaming GET body outlives `timeout_ms`.
+    ///
+    /// # Panics
+    /// Panics when the delayed body fails or the presigned request carries
+    /// Wyrd credentials.
+    #[tokio::test]
+    async fn request_external_stream_slow_download_outlives_timeout() {
+        let server = spawn_mock(vec![
+            MockResponse::ok("object-bytes").with_body_delay(SLOW_DELAY),
+        ])
+        .await;
+        let transport = make_short_timeout_transport(HTTP_TEST_ORIGIN.to_owned());
+        let response = transport
+            .request_external_stream(
+                reqwest::Method::GET,
+                &format!("{}/bucket/object", server.base_url),
+                None,
+                &[],
+            )
+            .await
+            .expect("download headers arrive");
+        assert_eq!(
+            response.bytes().await.expect("slow download"),
+            "object-bytes"
+        );
+        let captured = server.captured.lock().await;
+        assert!(extract_header(&captured[0], "x-wyrd-access-token").is_none());
+        assert!(extract_header(&captured[0], "wyrd-request-id").is_none());
+    }
+
+    /// Proves an authenticated one-shot streaming PUT outlives `timeout_ms`.
+    ///
+    /// # Panics
+    /// Panics when the upload fails, the server receives different bytes, or
+    /// the same-origin request lacks the Wyrd bearer.
+    #[tokio::test]
+    async fn request_stream_slow_upload_outlives_timeout() {
+        let server = spawn_upload_mock().await;
+        let transport = make_short_timeout_transport(server.base_url.clone());
+        let response = transport
+            .request_stream(reqwest::Method::PUT, "/v1/storage/object", slow_body())
+            .await
+            .expect("slow upload accepted");
+        assert!(response.status().is_success());
+        let (head, body) = server.received().await;
+        assert_eq!(body, SLOW_UPLOAD.concat().into_bytes());
+        assert!(extract_header(&head, "x-wyrd-access-token").is_some());
+    }
+
+    /// Proves a credential-free external streaming PUT outlives `timeout_ms`.
+    ///
+    /// # Panics
+    /// Panics when the upload fails, the server receives different bytes, or
+    /// the presigned request carries Wyrd credentials.
+    #[tokio::test]
+    async fn request_external_stream_slow_upload_outlives_timeout() {
+        let server = spawn_upload_mock().await;
+        let transport = make_short_timeout_transport(HTTP_TEST_ORIGIN.to_owned());
+        let response = transport
+            .request_external_stream(
+                reqwest::Method::PUT,
+                &format!("{}/bucket/object", server.base_url),
+                Some(slow_body()),
+                &[("content-type", "application/octet-stream")],
+            )
+            .await
+            .expect("slow upload accepted");
+        assert!(response.status().is_success());
+        let (head, body) = server.received().await;
+        assert_eq!(body, SLOW_UPLOAD.concat().into_bytes());
+        assert!(extract_header(&head, "x-wyrd-access-token").is_none());
+        assert!(extract_header(&head, "wyrd-request-id").is_none());
+    }
+
+    /// Origin configured for external-transfer tests; never contacted.
+    const HTTP_TEST_ORIGIN: &str = "http://127.0.0.1:9";
+
+    /// Upload chunks delivered with [`SLOW_DELAY`] before each one.
+    const SLOW_UPLOAD: [&str; 3] = ["alpha-", "beta-", "gamma"];
+
+    /// Builds a streaming request body that yields [`SLOW_UPLOAD`] slowly, so
+    /// the whole transfer lasts several times the transport timeout.
+    fn slow_body() -> reqwest::Body {
+        let chunks = futures_util::stream::iter(SLOW_UPLOAD).then(|chunk| async move {
+            tokio::time::sleep(SLOW_DELAY).await;
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(chunk.as_bytes()))
+        });
+        reqwest::Body::wrap_stream(chunks)
+    }
+
+    /// Single-request upload fixture that consumes the full request body before
+    /// answering `200`.
+    struct UploadMock {
+        /// Base URL of the listening fixture.
+        base_url: String,
+        /// Request head and decoded body, available once fully consumed.
+        received: tokio::sync::oneshot::Receiver<(String, Vec<u8>)>,
+    }
+
+    impl UploadMock {
+        /// Waits for the fixture to finish consuming the request.
+        ///
+        /// # Panics
+        /// Panics when the fixture task ended without recording a request.
+        async fn received(self) -> (String, Vec<u8>) {
+            self.received
+                .await
+                .expect("upload fixture consumed the request")
+        }
+    }
+
+    /// Spawns an [`UploadMock`] that decodes a chunked or sized request body
+    /// completely and only then writes its response.
+    ///
+    /// # Panics
+    /// Panics when binding fails; the spawned task panics on malformed requests.
+    async fn spawn_upload_mock() -> UploadMock {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let base_url = format!("http://{}", listener.local_addr().expect("addr"));
+        let (sender, received) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept upload");
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            let head_end = loop {
+                if let Some(end) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break end + 4;
+                }
+                let read = stream.read(&mut buf).await.expect("read head");
+                assert!(read > 0, "request head ended early");
+                raw.extend_from_slice(&buf[..read]);
+            };
+            let head = String::from_utf8_lossy(&raw[..head_end]).to_string();
+            let mut rest = raw.split_off(head_end);
+            let body = if let Some(length) = extract_header(&head, "content-length") {
+                let length: usize = length.parse().expect("content-length");
+                while rest.len() < length {
+                    let read = stream.read(&mut buf).await.expect("read body");
+                    assert!(read > 0, "sized body ended early");
+                    rest.extend_from_slice(&buf[..read]);
+                }
+                rest
+            } else {
+                while !rest.ends_with(b"0\r\n\r\n") {
+                    let read = stream.read(&mut buf).await.expect("read chunk");
+                    assert!(read > 0, "chunked body ended early");
+                    rest.extend_from_slice(&buf[..read]);
+                }
+                let mut decoded = Vec::new();
+                let mut cursor = rest.as_slice();
+                loop {
+                    let line = cursor
+                        .windows(2)
+                        .position(|window| window == b"\r\n")
+                        .expect("chunk size line");
+                    let size = usize::from_str_radix(
+                        std::str::from_utf8(&cursor[..line]).expect("chunk size"),
+                        16,
+                    )
+                    .expect("hex chunk size");
+                    if size == 0 {
+                        break decoded;
+                    }
+                    decoded.extend_from_slice(&cursor[line + 2..line + 2 + size]);
+                    cursor = &cursor[line + 2 + size + 2..];
+                }
+            };
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await;
+            let _ = sender.send((head, body));
+        });
+        UploadMock { base_url, received }
     }
 
     /// Proves a successful response with the wrong media type is rejected.

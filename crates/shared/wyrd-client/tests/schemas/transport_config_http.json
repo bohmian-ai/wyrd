@@ -15,7 +15,7 @@
       "type": "boolean"
     },
     "timeout_ms": {
-      "description": "Ordinary total-request and streaming connection timeout in milliseconds. Terminal stream body lifetime is governed by its server deadline and caller cancellation rather than this generic transport duration.\n\nDefault: [`HTTP_DEFAULT_TIMEOUT_MS`] (`30_000`, 30 s).",
+      "description": "HTTP timeout in milliseconds with two uses: it bounds connection establishment for every call, and it bounds the total request/response duration only for retried JSON and control calls. Streaming transfers and terminal query streams have no total deadline from this value.\n\nDefault: [`HTTP_DEFAULT_TIMEOUT_MS`] (`30_000`, 30 s).",
       "default": 30000,
       "type": "integer",
       "format": "uint64",

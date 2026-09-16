@@ -13,10 +13,9 @@ A local run needs no external Postgres and no secrets. Leave the database variab
 ## Run it
 
 ```bash
-export WYRD_STORAGE_BACKEND=local
-export WYRD_STORAGE_LOCAL_ROOT="$PWD/.wyrd-dev/storage"
+mkdir -p .wyrd-dev/storage
+export WYRD_STORAGE_URL="file://$PWD/.wyrd-dev/storage"
 export WYRD_PUBLIC_BASE_URL=http://localhost:8080
-mkdir -p "$WYRD_STORAGE_LOCAL_ROOT"
 
 mise run dev:backend
 ```

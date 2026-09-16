@@ -113,7 +113,7 @@ You only need it when you federate identity. Trusted issuers and workload bindin
 These are documented in full on their own pages. In brief:
 
 - Database: set `WYRD_DATABASE_URL` plus the per-role passwords to run against external Postgres, or leave all of them unset to use embedded Postgres in development. See [Database](/self-hosting/database/).
-- Storage: set `WYRD_STORAGE_BACKEND` (`local`, `s3`, `gcs`, or `azure`) plus the backend-specific variables. See [Storage](/self-hosting/storage/).
+- Storage: set `WYRD_STORAGE_URL` (`file:///path`, `s3://bucket`, `gs://bucket`, or `az://account/container`). See [Storage](/self-hosting/storage/).
 
 ## Config file
 
@@ -157,9 +157,8 @@ export WYRD_DATABASE_MIGRATOR_PASSWORD="migrator-pw"
 export WYRD_DATABASE_CATALOG_APP_PASSWORD="catalog-pw"
 
 # Storage (S3). AWS credentials resolve via the default SDK chain.
-export WYRD_STORAGE_BACKEND=s3
-export WYRD_STORAGE_S3_BUCKET=wyrd-artifacts
-export WYRD_STORAGE_S3_REGION=us-east-1
+export WYRD_STORAGE_URL=s3://wyrd-artifacts
+export AWS_REGION=us-east-1
 
 # Signing key (required in production).
 export WYRD_SIGNING_KEY_FILE=/run/secrets/signing-key.pem

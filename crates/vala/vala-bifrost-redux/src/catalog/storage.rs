@@ -16,14 +16,13 @@ pub fn iceberg_catalog_properties(backend: &BackendConfig) -> HashMap<String, St
     match backend {
         BackendConfig::Local { .. } => {}
         BackendConfig::S3(config) => {
+            // A custom endpoint addresses an S3-compatible service path-style.
             if let Some(endpoint) = &config.endpoint_url {
                 properties.insert("s3.endpoint".to_owned(), endpoint.clone());
+                properties.insert("s3.path-style-access".to_owned(), "true".to_owned());
             }
             if let Some(region) = &config.region {
                 properties.insert("s3.region".to_owned(), region.clone());
-            }
-            if config.force_path_style {
-                properties.insert("s3.path-style-access".to_owned(), "true".to_owned());
             }
         }
         BackendConfig::Gcs(config) => {
@@ -74,7 +73,6 @@ mod tests {
                 bucket: "tables".to_owned(),
                 region: None,
                 endpoint_url: None,
-                force_path_style: false,
             })),
             "s3://tables"
         );

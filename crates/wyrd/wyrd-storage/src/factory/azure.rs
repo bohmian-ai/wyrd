@@ -4,15 +4,13 @@ use crate::azure::{AzureSasMode, AzureSigner};
 use crate::error::StorageError;
 use crate::settings::AzureConfig;
 use azure_identity::create_credential;
-#[cfg(any(test, feature = "emulator"))]
+#[cfg(feature = "emulator")]
 use azure_storage::CloudLocation;
 use azure_storage::StorageCredentials;
 use azure_storage_blobs::prelude::BlobServiceClient;
-#[cfg(any(test, feature = "emulator"))]
+#[cfg(feature = "emulator")]
 use azure_storage_blobs::prelude::ClientBuilder;
 use opendal::services;
-#[cfg(any(test, feature = "emulator"))]
-use wyrd_spec::storage::StorageBackendKind;
 
 pub(crate) fn azblob_service(cfg: &AzureConfig) -> services::Azblob {
     let endpoint = cfg
@@ -34,9 +32,24 @@ pub(crate) fn azblob_service(cfg: &AzureConfig) -> services::Azblob {
 
 /// Build the Azure signer from Azure's default credential chain.
 ///
+/// A configured endpoint selects the Azurite emulator signer in builds with
+/// the `emulator` feature. Without that feature an endpoint is refused rather
+/// than silently signing against the real provider.
+///
 /// # Errors
-/// Returns an error when credentials or container access fail.
+/// Returns an error when an endpoint is configured without the `emulator`
+/// feature, or when credentials or container access fail.
 pub async fn build_signer(config: &AzureConfig) -> Result<AzureSigner, StorageError> {
+    #[cfg(feature = "emulator")]
+    if let Some(endpoint) = &config.endpoint_url {
+        return Ok(emulator_signer(config, endpoint));
+    }
+    #[cfg(not(feature = "emulator"))]
+    if config.endpoint_url.is_some() {
+        return Err(super::endpoint_requires_emulator(
+            wyrd_spec::storage::StorageBackendKind::Azure,
+        ));
+    }
     let credential = create_credential().map_err(|source| {
         tracing::error!(error = ?source, "Azure credential chain failed");
         StorageError::CredentialChain("azure")
@@ -64,67 +77,24 @@ pub async fn build_signer(config: &AzureConfig) -> Result<AzureSigner, StorageEr
     ))
 }
 
-/// Build an Azure signer pointed at a local Azurite emulator.
+/// Build an Azure signer for an Azurite emulator.
 ///
-/// Uses the well-known Azurite shared-key credentials (`devstoreaccount1`)
-/// and shared-key SAS mode. Parses `azurite_endpoint` as `http://host:port`
-/// (default `http://127.0.0.1:10000`). Never call this in production.
-///
-/// # Errors
-/// Returns an error when the endpoint cannot be parsed or the container probe
-/// fails.
-#[cfg(any(test, feature = "emulator"))]
-pub fn build_emulator_signer(
-    container: &str,
-    azurite_endpoint: &str,
-) -> Result<AzureSigner, StorageError> {
-    let (address, port) =
-        parse_azurite_endpoint(azurite_endpoint).map_err(|()| StorageError::Backend {
-            backend: StorageBackendKind::Azure,
-            op: "build_emulator_signer",
-            message: format!("invalid azurite endpoint: {azurite_endpoint}"),
-        })?;
+/// `endpoint` is the complete service URL including the account, for example
+/// `http://127.0.0.1:10000/devstoreaccount1`. Uses the well-known emulator
+/// shared-key credentials and account-key SAS; performs no IO.
+#[cfg(feature = "emulator")]
+fn emulator_signer(config: &AzureConfig, endpoint: &str) -> AzureSigner {
     let service_client = ClientBuilder::with_location(
-        CloudLocation::Emulator { address, port },
+        CloudLocation::Custom {
+            account: config.account.clone(),
+            uri: endpoint.trim_end_matches('/').to_owned(),
+        },
         StorageCredentials::emulator(),
     )
     .blob_service_client();
-
-    Ok(AzureSigner::new(
+    AzureSigner::new(
         service_client,
-        container.to_owned(),
+        config.container.clone(),
         AzureSasMode::AccountKey,
-    ))
-}
-
-#[cfg(any(test, feature = "emulator"))]
-fn parse_azurite_endpoint(endpoint: &str) -> Result<(String, u16), ()> {
-    let url = endpoint.trim_end_matches('/');
-    let stripped = url.strip_prefix("http://").ok_or(())?;
-    let (host, port_str) = stripped.rsplit_once(':').ok_or(())?;
-    let port: u16 = port_str.parse().map_err(|_| ())?;
-    Ok((host.to_owned(), port))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_azurite_endpoint;
-
-    #[test]
-    fn parses_default_endpoint() {
-        let (host, port) =
-            parse_azurite_endpoint("http://127.0.0.1:10000").expect("valid azurite endpoint");
-        assert_eq!(host, "127.0.0.1");
-        assert_eq!(port, 10000);
-    }
-
-    #[test]
-    fn rejects_https() {
-        assert!(parse_azurite_endpoint("https://127.0.0.1:10000").is_err());
-    }
-
-    #[test]
-    fn rejects_missing_port() {
-        assert!(parse_azurite_endpoint("http://127.0.0.1").is_err());
-    }
+    )
 }

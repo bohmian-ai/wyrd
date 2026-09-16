@@ -71,8 +71,7 @@ jobs:
 
       - name: Run S3 cloud tests
         env:
-          WYRD_STORAGE_S3_BUCKET: ${{ secrets.AWS_CLOUD_BUCKET_NAME }}
-          WYRD_STORAGE_S3_REGION: ${{ secrets.AWS_CLOUD_REGION }}
+          WYRD_STORAGE_URL: s3://${{ secrets.AWS_CLOUD_BUCKET_NAME }}
         run: mise run test:storage:s3:cloud
 
   gcs-cloud:
@@ -99,7 +98,7 @@ jobs:
 
       - name: Run GCS cloud tests
         env:
-          WYRD_STORAGE_GCS_BUCKET: ${{ secrets.GCP_CLOUD_BUCKET_NAME }}
+          WYRD_STORAGE_URL: gs://${{ secrets.GCP_CLOUD_BUCKET_NAME }}
         run: mise run test:storage:gcs:cloud
 
   azure-cloud:
@@ -127,6 +126,5 @@ jobs:
 
       - name: Run Azure cloud tests
         env:
-          WYRD_STORAGE_AZURE_ACCOUNT: ${{ secrets.AZURE_CLOUD_ACCOUNT_NAME }}
-          WYRD_STORAGE_AZURE_CONTAINER: ${{ secrets.AZURE_CLOUD_CONTAINER_NAME }}
+          WYRD_STORAGE_URL: az://${{ secrets.AZURE_CLOUD_ACCOUNT_NAME }}/${{ secrets.AZURE_CLOUD_CONTAINER_NAME }}
         run: mise run test:storage:azure:cloud

@@ -43,9 +43,24 @@ pub(crate) fn gcs_service(cfg: &GcsConfig) -> services::Gcs {
 
 /// Build the GCS signer using the Wyrd credential cascade.
 ///
+/// A configured endpoint selects the anonymous emulator signer in builds with
+/// the `emulator` feature. Without that feature an endpoint is refused rather
+/// than silently signing against the real provider.
+///
 /// # Errors
-/// Returns an error when credentials or bucket access fail.
+/// Returns an error when an endpoint is configured without the `emulator`
+/// feature, or when credentials or bucket access fail.
 pub async fn build_signer(config: &GcsConfig) -> Result<GcsSigner, StorageError> {
+    #[cfg(feature = "emulator")]
+    if let Some(endpoint) = &config.endpoint_url {
+        return Ok(emulator_signer(&config.bucket, endpoint));
+    }
+    #[cfg(not(feature = "emulator"))]
+    if config.endpoint_url.is_some() {
+        return Err(super::endpoint_requires_emulator(
+            wyrd_spec::storage::StorageBackendKind::Gcs,
+        ));
+    }
     let client_config = build_client_config().await.map_err(|source| {
         tracing::error!(error = ?source, "GCS credential chain failed");
         StorageError::CredentialChain("gcs")
@@ -70,26 +85,17 @@ pub async fn build_signer(config: &GcsConfig) -> Result<GcsSigner, StorageError>
     Ok(GcsSigner::new(client, config.bucket.clone()))
 }
 
-/// Build a GCS signer pointed at a local emulator endpoint.
+/// Build a GCS signer for a `fake-gcs-server` emulator at `endpoint`.
 ///
-/// Uses anonymous credentials and a custom `storage_endpoint`. Set
-/// `WYRD_STORAGE_INTEGRATION_GCS=1` and `WYRD_GCS_EMULATOR_HOST` in tests
-/// to activate. Never call this in production.
-///
-/// # Errors
-/// Returns an error when the bucket probe against the emulator fails.
-#[cfg(any(test, feature = "emulator"))]
-pub fn build_emulator_signer(bucket: &str, emulator_host: &str) -> Result<GcsSigner, StorageError> {
+/// Uses anonymous credentials and the emulator's unsigned media URLs, so it
+/// performs no IO and no boot probe.
+#[cfg(feature = "emulator")]
+fn emulator_signer(bucket: &str, endpoint: &str) -> GcsSigner {
     let config = ClientConfig {
-        storage_endpoint: emulator_host.trim_end_matches('/').to_owned(),
+        storage_endpoint: endpoint.trim_end_matches('/').to_owned(),
         ..ClientConfig::default().anonymous()
     };
-    let client = Client::new(config);
-    Ok(GcsSigner::new_emulator(
-        client,
-        bucket.to_owned(),
-        emulator_host,
-    ))
+    GcsSigner::new_emulator(Client::new(config), bucket.to_owned(), endpoint)
 }
 
 async fn build_client_config() -> Result<ClientConfig, gcloud_auth::error::Error> {

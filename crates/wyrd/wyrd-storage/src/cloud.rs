@@ -47,7 +47,6 @@ impl CloudSigner {
                 bucket: s3.bucket().to_owned(),
                 region: None,
                 endpoint_url: None,
-                force_path_style: false,
             }),
             Self::Gcs(gcs) => BackendConfig::Gcs(GcsConfig {
                 bucket: gcs.bucket().to_owned(),

@@ -9,26 +9,24 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::storage::{StorageBackendKind, UploadPlan, WireProtocol};
 use wyrd_storage::cloud::CloudSigner;
 use wyrd_storage::error::{GcsError, StorageError};
-use wyrd_storage::factory::gcs::build_emulator_signer;
 use wyrd_storage::gcs::GcsSigner;
-use wyrd_storage::{BackendSigner, UploadPlanReplayInput, ValidatedPath};
+use wyrd_storage::settings::{self, BackendConfig};
+use wyrd_storage::{BackendSigner, UploadPlanReplayInput, ValidatedPath, factory};
 
-const EMULATOR_HOST: &str = "http://localhost:4443";
-const EMULATOR_BUCKET: &str = "wyrd-storage-test";
 const CHUNK_SIZE: u64 = 256 * 1024;
 const CHUNK_COUNT: u32 = 3;
 
-fn skip_unless_enabled() -> bool {
-    if std::env::var("WYRD_STORAGE_INTEGRATION_GCS").as_deref() != Ok("1") {
-        eprintln!("skipping GCS emulator integration test; set WYRD_STORAGE_INTEGRATION_GCS=1");
-        return true;
-    }
-    false
-}
-
-fn build_signer() -> GcsSigner {
-    let host = std::env::var("WYRD_GCS_EMULATOR_HOST").unwrap_or_else(|_| EMULATOR_HOST.to_owned());
-    build_emulator_signer(EMULATOR_BUCKET, &host).expect("emulator signer")
+/// Build the GCS signer for the location and endpoint in `WYRD_STORAGE_URL`.
+///
+/// # Panics
+/// Panics when the environment does not select GCS or signer construction fails.
+async fn build_signer() -> GcsSigner {
+    let BackendConfig::Gcs(config) = settings::from_env().expect("storage settings").backend else {
+        panic!("WYRD_STORAGE_URL must select gs://");
+    };
+    factory::gcs::build_signer(&config)
+        .await
+        .expect("GCS signer")
 }
 
 fn fresh_path(suffix: &str) -> ValidatedPath {
@@ -40,10 +38,7 @@ fn fresh_path(suffix: &str) -> ValidatedPath {
 
 #[tokio::test]
 async fn gcs_abort_returns_capability_mismatch() {
-    if skip_unless_enabled() {
-        return;
-    }
-    let backend = BackendSigner::Cloud(Box::new(CloudSigner::Gcs(build_signer())));
+    let backend = BackendSigner::Cloud(Box::new(CloudSigner::Gcs(build_signer().await)));
     let result = backend
         .abort_multipart(&fresh_path("abort/object.bin"), "ignored")
         .await;
@@ -58,10 +53,7 @@ async fn gcs_abort_returns_capability_mismatch() {
 
 #[tokio::test]
 async fn gcs_remint_plan_produces_valid_plan() {
-    if skip_unless_enabled() {
-        return;
-    }
-    let signer = build_signer();
+    let signer = build_signer().await;
     let path = fresh_path("remint/object.bin");
     let plan = signer
         .remint_plan(
@@ -84,10 +76,10 @@ async fn gcs_remint_plan_produces_valid_plan() {
 
 #[tokio::test]
 async fn gcs_head_on_missing_returns_not_found() {
-    if skip_unless_enabled() {
-        return;
-    }
-    let result = build_signer().head(&fresh_path("never-written.bin")).await;
+    let result = build_signer()
+        .await
+        .head(&fresh_path("never-written.bin"))
+        .await;
     match result {
         Err(StorageError::Gcs(boxed)) => assert!(matches!(*boxed, GcsError::NotFound { .. })),
         other => panic!("expected typed GCS not-found error, got: {other:?}"),
@@ -96,10 +88,7 @@ async fn gcs_head_on_missing_returns_not_found() {
 
 #[tokio::test]
 async fn gcs_capability_mismatch_is_typed_for_presign_part() {
-    if skip_unless_enabled() {
-        return;
-    }
-    let backend = BackendSigner::Cloud(Box::new(CloudSigner::Gcs(build_signer())));
+    let backend = BackendSigner::Cloud(Box::new(CloudSigner::Gcs(build_signer().await)));
     let path = fresh_path("capability/object.bin");
     let result = backend
         .presign_part(&path, "ignored", 1, Duration::from_secs(1))

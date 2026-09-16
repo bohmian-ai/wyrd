@@ -7,37 +7,18 @@
 //! [`ValidatedPath`] is built, and the handle reads/writes/lists/deletes the
 //! object itself (no client presign round-trip).
 //!
-//! Local always runs. S3/GCS/Azure each have two entrypoints that differ only
-//! in how the handle is built:
-//!
-//! * `*_emu` — gated on `WYRD_STORAGE_INTEGRATION_{S3,GCS,AZURE}=1`, targets the
-//!   local docker emulator (`RustFS` / fake-gcs / Azurite). Runs on any CI.
-//! * `*_cloud` — gated on `WYRD_STORAGE_CLOUD_{S3,GCS,AZURE}=1`, boots the real
-//!   handle via `from_settings` against the production backend. Runs only on
-//!   merge-to-main CI.
-//!
-//! The assertions are identical across every backend and lane.
+//! Local runs over a temporary root. The S3, GCS, and Azure entrypoints boot
+//! the handle from `settings::from_env()`, so their mise task decides whether
+//! `WYRD_STORAGE_URL` (plus `WYRD_STORAGE_ENDPOINT_URL`) targets a docker
+//! emulator or the real provider. Each asserts the configured backend kind, so
+//! a mis-wired task fails instead of exercising another backend.
 
 use std::sync::Arc;
-use std::time::Duration;
 use wyrd_spec::DataTenantId;
-use wyrd_storage::cloud::CloudSigner;
+use wyrd_spec::storage::StorageBackendKind;
 use wyrd_storage::error::StorageError;
-use wyrd_storage::factory::{azure, gcs, s3};
-use wyrd_storage::settings::{AzureConfig, BackendConfig, GcsConfig, S3Config, StorageSettings};
+use wyrd_storage::settings;
 use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle, ValidatedPath, tenant_path};
-
-fn enabled(var: &str) -> bool {
-    std::env::var(var).as_deref() == Ok("1")
-}
-
-fn env_or(var: &str, default: &str) -> String {
-    std::env::var(var).unwrap_or_else(|_| default.to_owned())
-}
-
-fn env_required(var: &str) -> String {
-    std::env::var(var).unwrap_or_else(|_| panic!("{var} must be set"))
-}
 
 /// Write/read/list/delete round-trip plus a missing-key `NotFound`, all through
 /// the public [`StorageHandle`] data-plane API.
@@ -110,97 +91,24 @@ async fn run_handle_crud(handle: &StorageHandle) {
         .expect("delete c");
 }
 
-// ---- Handle builders -------------------------------------------------------
-
-fn s3_emu_handle() -> StorageHandle {
-    let bucket = env_or("WYRD_STORAGE_S3_BUCKET", "wyrd-storage-test");
-    let endpoint = env_or("WYRD_S3_EMULATOR_ENDPOINT", "http://localhost:9000");
-    let signer = BackendSigner::Cloud(Box::new(CloudSigner::S3(
-        s3::build_emulator_signer(&bucket, &endpoint).expect("s3 emu signer"),
-    )));
-    let config = BackendConfig::S3(S3Config {
-        bucket,
-        region: Some(env_or("WYRD_STORAGE_S3_REGION", "us-east-1")),
-        endpoint_url: Some(endpoint),
-        force_path_style: true,
-    });
-    StorageHandle::for_testing(signer, config).expect("s3 emu handle")
-}
-
-fn gcs_emu_handle() -> StorageHandle {
-    let bucket = env_or("WYRD_STORAGE_GCS_BUCKET", "wyrd-storage-test");
-    let host = env_or("WYRD_GCS_EMULATOR_HOST", "http://localhost:4443");
-    let signer = BackendSigner::Cloud(Box::new(CloudSigner::Gcs(
-        gcs::build_emulator_signer(&bucket, &host).expect("gcs emu signer"),
-    )));
-    let config = BackendConfig::Gcs(GcsConfig {
-        bucket,
-        endpoint_url: Some(host),
-    });
-    StorageHandle::for_testing(signer, config).expect("gcs emu handle")
-}
-
-fn azure_emu_handle() -> StorageHandle {
-    let container = env_or("WYRD_STORAGE_AZURE_CONTAINER", "wyrd-storage-test");
-    let base = env_or("WYRD_AZURE_EMULATOR_ENDPOINT", "http://127.0.0.1:10000");
-    let signer = BackendSigner::Cloud(Box::new(CloudSigner::Azure(
-        azure::build_emulator_signer(&container, &base).expect("azure emu signer"),
-    )));
-    let config = BackendConfig::Azure(AzureConfig {
-        account: "devstoreaccount1".to_owned(),
-        container,
-        // Azurite path-style addressing requires the account name in the endpoint URL.
-        endpoint_url: Some(format!("{base}/devstoreaccount1")),
-    });
-    StorageHandle::for_testing(signer, config).expect("azure emu handle")
-}
-
-fn cloud_settings(backend: BackendConfig) -> StorageSettings {
-    StorageSettings {
-        backend,
-        require_encryption: false,
-        presign_ttl: Duration::from_mins(15),
-        part_size_bytes: 16 * 1024 * 1024,
-        multipart_threshold_bytes: 100 * 1024 * 1024,
-        public_base_url: None,
-    }
-}
-
-async fn s3_cloud_handle() -> Arc<StorageHandle> {
-    let backend = BackendConfig::S3(S3Config {
-        bucket: env_required("WYRD_STORAGE_S3_BUCKET"),
-        region: std::env::var("WYRD_STORAGE_S3_REGION").ok(),
-        endpoint_url: std::env::var("WYRD_STORAGE_S3_ENDPOINT_URL").ok(),
-        force_path_style: false,
-    });
-    StorageHandle::from_settings(cloud_settings(backend))
+/// Boot the handle described by the process storage environment.
+///
+/// # Panics
+/// Panics when the environment is incomplete, selects a backend other than
+/// `kind`, or the handle cannot be built.
+async fn configured_handle(kind: StorageBackendKind) -> Arc<StorageHandle> {
+    let settings = settings::from_env().expect("WYRD_STORAGE_URL configures storage");
+    assert_eq!(
+        settings.backend.kind(),
+        kind,
+        "WYRD_STORAGE_URL selects the wrong backend"
+    );
+    StorageHandle::from_settings(settings)
         .await
-        .expect("s3 cloud handle")
+        .expect("storage handle")
 }
 
-async fn gcs_cloud_handle() -> Arc<StorageHandle> {
-    let backend = BackendConfig::Gcs(GcsConfig {
-        bucket: env_required("WYRD_STORAGE_GCS_BUCKET"),
-        endpoint_url: None,
-    });
-    StorageHandle::from_settings(cloud_settings(backend))
-        .await
-        .expect("gcs cloud handle")
-}
-
-async fn azure_cloud_handle() -> Arc<StorageHandle> {
-    let backend = BackendConfig::Azure(AzureConfig {
-        account: env_required("WYRD_STORAGE_AZURE_ACCOUNT"),
-        container: env_required("WYRD_STORAGE_AZURE_CONTAINER"),
-        endpoint_url: None,
-    });
-    StorageHandle::from_settings(cloud_settings(backend))
-        .await
-        .expect("azure cloud handle")
-}
-
-// ---- Entrypoints -----------------------------------------------------------
-
+/// CRUD over a local handle rooted in a temporary directory.
 #[tokio::test]
 async fn local_handle_crud() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -210,56 +118,20 @@ async fn local_handle_crud() {
     run_handle_crud(&handle).await;
 }
 
+/// CRUD against the configured S3 or S3-compatible bucket.
 #[tokio::test]
-async fn s3_emu_handle_crud() {
-    if !enabled("WYRD_STORAGE_INTEGRATION_S3") {
-        eprintln!("skipping S3 handle emulator test; set WYRD_STORAGE_INTEGRATION_S3=1");
-        return;
-    }
-    run_handle_crud(&s3_emu_handle()).await;
+async fn s3_handle_crud() {
+    run_handle_crud(configured_handle(StorageBackendKind::S3).await.as_ref()).await;
 }
 
+/// CRUD against the configured GCS bucket or emulator.
 #[tokio::test]
-async fn s3_cloud_handle_crud() {
-    if !enabled("WYRD_STORAGE_CLOUD_S3") {
-        eprintln!("skipping S3 handle cloud test; set WYRD_STORAGE_CLOUD_S3=1");
-        return;
-    }
-    run_handle_crud(s3_cloud_handle().await.as_ref()).await;
+async fn gcs_handle_crud() {
+    run_handle_crud(configured_handle(StorageBackendKind::Gcs).await.as_ref()).await;
 }
 
+/// CRUD against the configured Azure container or emulator.
 #[tokio::test]
-async fn gcs_emu_handle_crud() {
-    if !enabled("WYRD_STORAGE_INTEGRATION_GCS") {
-        eprintln!("skipping GCS handle emulator test; set WYRD_STORAGE_INTEGRATION_GCS=1");
-        return;
-    }
-    run_handle_crud(&gcs_emu_handle()).await;
-}
-
-#[tokio::test]
-async fn gcs_cloud_handle_crud() {
-    if !enabled("WYRD_STORAGE_CLOUD_GCS") {
-        eprintln!("skipping GCS handle cloud test; set WYRD_STORAGE_CLOUD_GCS=1");
-        return;
-    }
-    run_handle_crud(gcs_cloud_handle().await.as_ref()).await;
-}
-
-#[tokio::test]
-async fn azure_emu_handle_crud() {
-    if !enabled("WYRD_STORAGE_INTEGRATION_AZURE") {
-        eprintln!("skipping Azure handle emulator test; set WYRD_STORAGE_INTEGRATION_AZURE=1");
-        return;
-    }
-    run_handle_crud(&azure_emu_handle()).await;
-}
-
-#[tokio::test]
-async fn azure_cloud_handle_crud() {
-    if !enabled("WYRD_STORAGE_CLOUD_AZURE") {
-        eprintln!("skipping Azure handle cloud test; set WYRD_STORAGE_CLOUD_AZURE=1");
-        return;
-    }
-    run_handle_crud(azure_cloud_handle().await.as_ref()).await;
+async fn azure_handle_crud() {
+    run_handle_crud(configured_handle(StorageBackendKind::Azure).await.as_ref()).await;
 }

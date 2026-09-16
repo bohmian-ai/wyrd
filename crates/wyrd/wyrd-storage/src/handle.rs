@@ -61,8 +61,8 @@ impl StorageHandle {
     ///
     /// Intended for tests and local-mode harnesses. The resulting
     /// [`BackendConfig`] is synthesized from the signer alone, so
-    /// optional fields (`region`, `endpoint_url`, `force_path_style`,
-    /// `public_base_url`) are defaulted, `require_encryption` is `false`,
+    /// optional fields (`region`, `endpoint_url`, `public_base_url`) are
+    /// defaulted, `require_encryption` is `false`,
     /// `presign_ttl` is the crate default, and `default_part_size_bytes`
     /// is the crate default. Production paths must use [`Self::from_settings`].
     ///
@@ -101,62 +101,6 @@ impl StorageHandle {
             multipart_threshold_bytes: crate::plan::MULTIPART_THRESHOLD_BYTES,
             public_base_url: None,
             public_base_url_override: Arc::new(OnceLock::new()),
-        }
-    }
-
-    /// Build a handle from a signer and an explicit backend config, skipping the
-    /// boot health probe.
-    ///
-    /// The operator is built from `backend_config` so any custom endpoint (for
-    /// example a local emulator) is honored. Intended for tests and emulator
-    /// harnesses that need a working data-plane operator without ambient cloud
-    /// credentials. Production paths must use [`Self::from_settings`].
-    ///
-    /// # Errors
-    /// Returns a storage error when operator construction fails.
-    #[cfg(any(test, feature = "emulator"))]
-    pub fn for_testing(
-        signer: BackendSigner,
-        backend_config: BackendConfig,
-    ) -> Result<Self, StorageError> {
-        let operator = crate::factory::build_operator(&backend_config)?;
-        Ok(Self::assemble(signer, operator, backend_config))
-    }
-
-    /// Build an emulator handle with explicit backend settings and multipart
-    /// tuning. This keeps emulator endpoints available to the server's OLAP
-    /// catalog while allowing small journey fixtures to exercise multipart
-    /// transfer paths.
-    #[cfg(any(test, feature = "emulator"))]
-    pub fn for_testing_with_multipart_threshold(
-        signer: BackendSigner,
-        backend_config: BackendConfig,
-        multipart_threshold_bytes: u64,
-    ) -> Result<Self, StorageError> {
-        let mut handle = Self::for_testing(signer, backend_config)?;
-        handle.multipart_threshold_bytes = multipart_threshold_bytes;
-        Ok(handle)
-    }
-
-    /// Build a storage handle from a signer with an explicit multipart
-    /// threshold.
-    ///
-    /// Test/local-harness constructor used to drive server-tier multipart
-    /// uploads against emulator signers (GCS, Azure) whose backend config
-    /// carries no emulator endpoint. Behaves like [`Self::new`] but overrides
-    /// the multipart threshold so a small payload triggers a real multipart
-    /// upload. The synthesized operator is never exercised because the
-    /// in-process test server skips the boot health probe.
-    ///
-    /// # Panics
-    ///
-    /// Panics if operator construction fails for the synthesized config.
-    #[cfg(any(test, feature = "emulator"))]
-    #[must_use]
-    pub fn from_signer(signer: BackendSigner, multipart_threshold_bytes: u64) -> Self {
-        Self {
-            multipart_threshold_bytes,
-            ..Self::new(signer)
         }
     }
 
@@ -445,34 +389,6 @@ mod tests {
         StorageHandle::new(signer)
     }
 
-    #[cfg(feature = "emulator")]
-    #[test]
-    fn from_signer_builds_cloud_handles_without_probing() {
-        let gcs = crate::factory::gcs::build_emulator_signer(
-            "wyrd-storage-test",
-            "http://localhost:4443",
-        )
-        .expect("gcs emulator signer");
-        let handle = StorageHandle::from_signer(
-            BackendSigner::Cloud(Box::new(crate::cloud::CloudSigner::Gcs(gcs))),
-            8 * 1024 * 1024,
-        );
-        assert_eq!(handle.backend(), StorageBackendKind::Gcs);
-        assert_eq!(handle.multipart_threshold_bytes(), 8 * 1024 * 1024);
-
-        let azure = crate::factory::azure::build_emulator_signer(
-            "wyrd-storage-test",
-            "http://127.0.0.1:10000",
-        )
-        .expect("azure emulator signer");
-        let handle = StorageHandle::from_signer(
-            BackendSigner::Cloud(Box::new(crate::cloud::CloudSigner::Azure(azure))),
-            8 * 1024 * 1024,
-        );
-        assert_eq!(handle.backend(), StorageBackendKind::Azure);
-        assert_eq!(handle.multipart_threshold_bytes(), 8 * 1024 * 1024);
-    }
-
     #[tokio::test]
     async fn health_probe_local_root_exists() {
         let dir = TempDir::new().expect("tempdir");
@@ -521,12 +437,14 @@ mod from_settings_tests {
     use crate::{BackendSigner, StorageHandle};
     use std::sync::Arc;
 
+    /// Storage variables cleared unless the test provides them.
     const ENV_KEYS: &[&str] = &[
-        "WYRD_STORAGE_BACKEND",
+        "WYRD_STORAGE_URL",
+        "WYRD_STORAGE_ENDPOINT_URL",
         "WYRD_STORAGE_REQUIRE_ENCRYPTION",
         "WYRD_STORAGE_PRESIGN_TTL_SECS",
         "WYRD_STORAGE_PART_SIZE_BYTES",
-        "WYRD_STORAGE_LOCAL_ROOT",
+        "WYRD_STORAGE_MULTIPART_THRESHOLD_BYTES",
         "WYRD_PUBLIC_BASE_URL",
     ];
 
@@ -544,13 +462,17 @@ mod from_settings_tests {
         assert_eq!(handle.public_base_url(), Some("https://wyrd.test"));
     }
 
+    /// Boot a local handle from a `file:` storage URL over a fresh temp root.
     async fn local_handle() -> (Arc<StorageHandle>, tempfile::TempDir) {
         let root = tempfile::tempdir().expect("temp dir");
         let vars = vec![
-            ("WYRD_STORAGE_BACKEND", Some("local".to_owned())),
             (
-                "WYRD_STORAGE_LOCAL_ROOT",
-                Some(root.path().display().to_string()),
+                "WYRD_STORAGE_URL",
+                Some(
+                    url::Url::from_file_path(root.path())
+                        .expect("temp dir is absolute")
+                        .to_string(),
+                ),
             ),
             ("WYRD_PUBLIC_BASE_URL", Some("https://wyrd.test".to_owned())),
         ];

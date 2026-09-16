@@ -45,6 +45,10 @@ pub enum ConfigParseError {
     /// Environment variable path failed validation.
     #[error("invalid path `{0}`")]
     InvalidPath(String),
+    /// Storage or endpoint URL violated the storage URL contract. Carries the
+    /// reason only, never the rejected value, which may embed credentials.
+    #[error("invalid url: {0}")]
+    InvalidUrl(String),
 }
 
 /// Top-level error returned by storage operations.

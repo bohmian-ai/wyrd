@@ -10,38 +10,21 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::storage::{StorageBackendKind, UploadPlan, WireProtocol};
 use wyrd_storage::error::{S3Error, StorageError};
 use wyrd_storage::s3::S3Signer;
-use wyrd_storage::{UploadPlanReplayInput, ValidatedPath};
+use wyrd_storage::settings::{self, BackendConfig};
+use wyrd_storage::{UploadPlanReplayInput, ValidatedPath, factory};
 
 const PART_SIZE: usize = 5 * 1024 * 1024;
 const PART_COUNT: u32 = 3;
 
-fn skip_unless_enabled() -> bool {
-    if std::env::var("WYRD_STORAGE_INTEGRATION_S3").as_deref() != Ok("1") {
-        eprintln!("skipping RustFS integration test; set WYRD_STORAGE_INTEGRATION_S3=1");
-        return true;
-    }
-    false
-}
-
+/// Build the S3 signer for the bucket and endpoint in `WYRD_STORAGE_URL`.
+///
+/// # Panics
+/// Panics when the environment does not select S3 or the bucket probe fails.
 async fn build_rustfs_signer() -> S3Signer {
-    use aws_config::BehaviorVersion;
-    use aws_sdk_s3::Client;
-    use aws_sdk_s3::config::{Builder, Credentials, Region};
-
-    let shared = aws_config::defaults(BehaviorVersion::latest()).load().await;
-    let config = Builder::from(&shared)
-        .region(Region::new("us-east-1"))
-        .endpoint_url("http://localhost:9000")
-        .force_path_style(true)
-        .credentials_provider(Credentials::new(
-            "wyrd-test-key",
-            "wyrd-test-secret",
-            None,
-            None,
-            "static",
-        ))
-        .build();
-    S3Signer::new(Client::from_conf(config), "wyrd-storage-test".to_owned())
+    let BackendConfig::S3(config) = settings::from_env().expect("storage settings").backend else {
+        panic!("WYRD_STORAGE_URL must select s3://");
+    };
+    factory::s3::build_signer(&config).await.expect("S3 signer")
 }
 
 fn fresh_path(suffix: &str) -> ValidatedPath {
@@ -53,9 +36,6 @@ fn fresh_path(suffix: &str) -> ValidatedPath {
 
 #[tokio::test]
 async fn rustfs_abort_lifecycle() {
-    if skip_unless_enabled() {
-        return;
-    }
     let signer = build_rustfs_signer().await;
     let path = fresh_path("abort/object.bin");
     let init = signer
@@ -71,9 +51,6 @@ async fn rustfs_abort_lifecycle() {
 
 #[tokio::test]
 async fn rustfs_remint_plan_produces_valid_plan() {
-    if skip_unless_enabled() {
-        return;
-    }
     let signer = build_rustfs_signer().await;
     let path = fresh_path("remint/object.bin");
     let init = signer
@@ -102,9 +79,6 @@ async fn rustfs_remint_plan_produces_valid_plan() {
 
 #[tokio::test]
 async fn rustfs_head_on_missing_returns_error() {
-    if skip_unless_enabled() {
-        return;
-    }
     let signer = build_rustfs_signer().await;
     let result = signer.head(&fresh_path("never-written.bin")).await;
     match result {
@@ -119,9 +93,6 @@ async fn rustfs_head_on_missing_returns_error() {
 
 #[tokio::test]
 async fn rustfs_capability_mismatch_is_typed_for_non_s3_protocols() {
-    if skip_unless_enabled() {
-        return;
-    }
     let signer = build_rustfs_signer().await;
     let path = fresh_path("capability/object.bin");
     for (wire_protocol, block_count_planned) in [

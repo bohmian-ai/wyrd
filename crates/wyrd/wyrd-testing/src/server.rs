@@ -3276,11 +3276,10 @@ impl WyrdTestServerBuilder {
 
     /// Inject a pre-built storage handle.
     ///
-    /// Use this for emulator backends (GCS, Azure) whose backend config carries
-    /// no emulator endpoint, so the handle must be built from an emulator signer
-    /// via [`wyrd_storage::StorageHandle::from_signer`]. The in-process server
-    /// skips the boot health probe, so the handle's operator is never exercised.
-    /// Takes precedence over [`Self::with_storage_settings`].
+    /// Use this when a test needs a handle assembled outside the settings path,
+    /// such as one sharing an operator with another harness. The in-process
+    /// server skips the boot health probe. Takes precedence over
+    /// [`Self::with_storage_settings`].
     #[must_use]
     pub fn with_storage_handle(mut self, handle: Arc<wyrd_storage::StorageHandle>) -> Self {
         self.storage_handle = Some(handle);

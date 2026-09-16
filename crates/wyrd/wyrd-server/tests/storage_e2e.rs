@@ -20,24 +20,19 @@ use wyrd_client::transport::HttpTransport;
 use wyrd_client::transport::config::HttpConfig;
 use wyrd_client::transport::credential::ResolvedCredential;
 use wyrd_server::config::BifrostTarget;
+use wyrd_spec::DataTenantId;
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::storage::{
-    DownloadInitRequest, DownloadInitResponse, DownloadPlan, UploadInitRequest, UploadInitResponse,
-    UploadPlan,
+    DownloadInitRequest, DownloadInitResponse, DownloadPlan, StorageBackendKind, UploadInitRequest,
+    UploadInitResponse, UploadPlan,
 };
-use wyrd_storage::cloud::CloudSigner;
-use wyrd_storage::settings::{AzureConfig, GcsConfig, S3Config};
-use wyrd_storage::{BackendConfig, BackendSigner, StorageHandle, StorageSettings};
+use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings, settings};
 use wyrd_testing::WyrdTestServer;
 
 const FIXED_CARD_UID: &str = "018f0000-0000-7000-8000-000000000001";
 const MULTIPART_PAYLOAD_BYTES: usize = 20 * 1024 * 1024;
 const LOW_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 const PLANNED_PART_BYTES: u64 = 16 * 1024 * 1024;
-
-fn enabled(var: &str) -> bool {
-    std::env::var(var).as_deref() == Ok("1")
-}
 
 fn sha256_b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes))
@@ -47,14 +42,6 @@ fn patterned_payload(len: usize) -> Vec<u8> {
     (0..len)
         .map(|index| u8::try_from(index % 251).expect("index modulo 251 fits u8"))
         .collect()
-}
-
-fn env_or(var: &str, default: &str) -> String {
-    std::env::var(var).unwrap_or_else(|_| default.to_owned())
-}
-
-fn env_required(var: &str) -> String {
-    std::env::var(var).unwrap_or_else(|_| panic!("{var} must be set for this cloud lane"))
 }
 
 fn client_for(srv: &WyrdTestServer, token: &str) -> WyrdClient {
@@ -107,17 +94,6 @@ async fn server_from_settings(settings: StorageSettings) -> WyrdTestServer {
         .expect("start bound storage server")
 }
 
-fn cloud_settings(backend: BackendConfig) -> StorageSettings {
-    StorageSettings {
-        backend,
-        require_encryption: false,
-        presign_ttl: Duration::from_secs(600),
-        part_size_bytes: PLANNED_PART_BYTES,
-        multipart_threshold_bytes: LOW_THRESHOLD_BYTES,
-        public_base_url: None,
-    }
-}
-
 fn local_settings(root: &Path) -> StorageSettings {
     StorageSettings {
         backend: BackendConfig::Local {
@@ -131,110 +107,71 @@ fn local_settings(root: &Path) -> StorageSettings {
     }
 }
 
-fn s3_emu_settings() -> StorageSettings {
-    cloud_settings(BackendConfig::S3(S3Config {
-        bucket: env_or("WYRD_STORAGE_S3_BUCKET", "wyrd-storage-test"),
-        region: Some(env_or("WYRD_STORAGE_S3_REGION", "us-east-1")),
-        endpoint_url: Some(env_or("WYRD_S3_EMULATOR_ENDPOINT", "http://localhost:9000")),
-        force_path_style: true,
-    }))
-}
-
-fn s3_cloud_settings() -> StorageSettings {
-    cloud_settings(BackendConfig::S3(S3Config {
-        bucket: env_required("WYRD_STORAGE_S3_BUCKET"),
-        region: std::env::var("WYRD_STORAGE_S3_REGION").ok(),
-        endpoint_url: std::env::var("WYRD_STORAGE_S3_ENDPOINT_URL").ok(),
-        force_path_style: false,
-    }))
-}
-
-fn gcs_emu_handle() -> Arc<StorageHandle> {
-    let bucket = env_or("WYRD_STORAGE_GCS_BUCKET", "wyrd-storage-test");
-    let endpoint = env_or("WYRD_GCS_EMULATOR_HOST", "http://localhost:4443");
-    let signer = wyrd_storage::factory::gcs::build_emulator_signer(&bucket, &endpoint)
-        .expect("GCS emulator signer");
-    Arc::new(
-        StorageHandle::for_testing_with_multipart_threshold(
-            BackendSigner::Cloud(Box::new(CloudSigner::Gcs(signer))),
-            BackendConfig::Gcs(GcsConfig {
-                bucket,
-                endpoint_url: Some(endpoint),
-            }),
-            LOW_THRESHOLD_BYTES,
-        )
-        .expect("GCS emulator storage handle"),
-    )
-}
-
-fn gcs_cloud_settings() -> StorageSettings {
-    cloud_settings(BackendConfig::Gcs(GcsConfig {
-        bucket: env_required("WYRD_STORAGE_GCS_BUCKET"),
-        endpoint_url: None,
-    }))
-}
-
-fn azure_emu_handle() -> Arc<StorageHandle> {
-    let container = env_or("WYRD_STORAGE_AZURE_CONTAINER", "wyrd-storage-test");
-    let endpoint = env_or("WYRD_AZURE_EMULATOR_ENDPOINT", "http://127.0.0.1:10000");
-    let signer = wyrd_storage::factory::azure::build_emulator_signer(&container, &endpoint)
-        .expect("Azure emulator signer");
-    Arc::new(
-        StorageHandle::for_testing_with_multipart_threshold(
-            BackendSigner::Cloud(Box::new(CloudSigner::Azure(signer))),
-            BackendConfig::Azure(AzureConfig {
-                account: "devstoreaccount1".to_owned(),
-                container,
-                endpoint_url: Some(endpoint),
-            }),
-            LOW_THRESHOLD_BYTES,
-        )
-        .expect("Azure emulator storage handle"),
-    )
-}
-
-fn azure_cloud_settings() -> StorageSettings {
-    cloud_settings(BackendConfig::Azure(AzureConfig {
-        account: env_required("WYRD_STORAGE_AZURE_ACCOUNT"),
-        container: env_required("WYRD_STORAGE_AZURE_CONTAINER"),
-        endpoint_url: None,
-    }))
-}
-
-/// Starts a bound artifact-storage server over a pre-built emulator `handle`.
+/// Load storage settings from the process environment for a cloud journey.
 ///
-/// Uses the API `Server` target for the same reason as
-/// [`server_from_settings`]: storage journeys do not compose a Forge worker.
+/// The mise task supplies `WYRD_STORAGE_URL`, an optional endpoint, and the
+/// multipart tuning, so one journey targets either an emulator or the real
+/// provider.
 ///
 /// # Panics
-///
-/// Panics when the server fails to start or become ready.
-async fn server_from_handle(handle: Arc<StorageHandle>) -> WyrdTestServer {
-    WyrdTestServer::builder()
-        .with_bifrost_target_for_test(BifrostTarget::Server)
-        .with_storage_handle(handle)
-        .start_bound()
-        .await
-        .expect("start bound storage server")
+/// Panics when the environment is incomplete or selects a backend other than
+/// `kind`.
+fn configured_settings(kind: StorageBackendKind) -> StorageSettings {
+    let settings = settings::from_env().expect("WYRD_STORAGE_URL configures storage");
+    assert_eq!(
+        settings.backend.kind(),
+        kind,
+        "WYRD_STORAGE_URL selects the wrong backend"
+    );
+    settings
 }
 
-fn gcs_emulator_download_plan(storage_path: &str) -> DownloadPlan {
-    let host = env_or("WYRD_GCS_EMULATOR_HOST", "http://localhost:4443");
-    let bucket = env_or("WYRD_STORAGE_GCS_BUCKET", "wyrd-storage-test");
-    DownloadPlan {
-        get_url: format!(
-            "{host}/storage/v1/b/{bucket}/o/{}?alt=media",
-            storage_path.replace('/', "%2F")
-        ),
-        ttl_secs: 0,
+/// Delete every object a journey against `settings` left in the backend.
+///
+/// The journey writes one artifact under its own tenant prefix, and the running
+/// server publishes audit-log Iceberg metadata under `tenants/<tenant>/` for
+/// both the journey tenant and the system owner. Cloud lanes share one durable
+/// bucket across runs, so each run removes exactly the prefixes it can produce
+/// instead of accumulating 20 MiB artifacts and metadata forever.
+///
+/// Objects are listed and deleted one at a time rather than through opendal's
+/// recursive delete, because `fake-gcs-server` refuses that backend's batch
+/// delete request with HTTP 400 while real GCS accepts it.
+///
+/// # Panics
+/// Panics when the cleanup handle cannot be built, a prefix cannot be listed,
+/// or an object cannot be deleted, so a lane that silently stops cleaning fails
+/// loudly.
+async fn purge_journey_objects(settings: &StorageSettings, tenant: DataTenantId) {
+    let handle = StorageHandle::from_settings(settings.clone())
+        .await
+        .expect("cleanup handle builds from the journey settings");
+    let operator = handle.operator();
+    for prefix in [
+        format!("{tenant}/"),
+        format!("tenants/{tenant}/"),
+        format!("tenants/{}/", DataTenantId::SYSTEM_OWNER),
+    ] {
+        let entries = operator
+            .list_with(&prefix)
+            .recursive(true)
+            .await
+            .expect("journey prefix lists");
+        for entry in entries {
+            if entry.metadata().is_dir() {
+                continue;
+            }
+            operator
+                .delete(entry.path())
+                .await
+                .expect("journey object is deleted");
+        }
     }
 }
 
-async fn run_client_server_journey(
-    srv: WyrdTestServer,
-    relative_path: &str,
-    gcs_emulator_media: bool,
-) {
+async fn run_client_server_journey(settings: StorageSettings, relative_path: &str) {
+    let srv = server_from_settings(settings.clone()).await;
+    let tenant = srv.data_tenant_id();
     let token = bootstrap_service_jwt(&srv, "storage-client-journey").await;
     let client = client_for(&srv, &token);
     let storage = WyrdStorageClient::new(&client);
@@ -284,9 +221,7 @@ async fn run_client_server_journey(
         )
         .await
         .expect("download init succeeds");
-    let plan = if gcs_emulator_media {
-        gcs_emulator_download_plan(&init.storage_path)
-    } else if relative_path.starts_with("local/") {
+    let plan = if relative_path.starts_with("local/") {
         let base_url = srv.base_url().expect("bound server exposes base URL");
         DownloadPlan {
             get_url: format!("{base_url}/v1/cards/download/local/{}", init.storage_path),
@@ -295,34 +230,34 @@ async fn run_client_server_journey(
     } else {
         download.plan
     };
+    // The download outcome is held rather than asserted so a transfer failure
+    // still reaches the cleanup below; a panic here would strand the uploaded
+    // artifact in a durable cloud bucket.
     let destination = NamedTempFile::new().expect("download destination");
-    storage
+    let outcome = storage
         .download_verified(
             &plan,
             destination.path(),
             &sha256_b64(&content),
             content.len() as u64,
         )
-        .await
-        .expect("storage client downloads and verifies artifact");
-    let downloaded = tokio::fs::read(destination.path())
-        .await
-        .expect("read downloaded artifact");
+        .await;
+    let downloaded = tokio::fs::read(destination.path()).await;
+    srv.shutdown().await.expect("shutdown server");
+    purge_journey_objects(&settings, tenant).await;
+
+    outcome.expect("storage client downloads and verifies artifact");
     assert_eq!(
-        downloaded, content,
+        downloaded.expect("read downloaded artifact"),
+        content,
         "client/server round trip preserves bytes"
     );
-    srv.shutdown().await.expect("shutdown server");
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn local_client_server_round_trip() {
-    if !enabled("WYRD_STORAGE_E2E") {
-        return;
-    }
     let storage_root = tempfile::tempdir().expect("storage root creates");
-    let srv = server_from_settings(local_settings(storage_root.path())).await;
-    run_client_server_journey(srv, "local/weights.bin", false).await;
+    run_client_server_journey(local_settings(storage_root.path()), "local/weights.bin").await;
 }
 
 /// A principal holding no Card permission is refused at both storage entry
@@ -339,9 +274,6 @@ async fn local_client_server_round_trip() {
 /// with the RBAC code, or staging lacks exactly one `denied` row per route.
 #[tokio::test(flavor = "current_thread")]
 async fn storage_routes_refuse_and_audit_an_unprivileged_caller() {
-    if !enabled("WYRD_STORAGE_E2E") {
-        return;
-    }
     // Both routes refuse before any storage IO, so the default bound server
     // suffices and no backend is configured.
     let srv = WyrdTestServer::start_bound()
@@ -415,9 +347,6 @@ async fn storage_routes_refuse_and_audit_an_unprivileged_caller() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn local_upload_capability_rejects_raw_paths_and_bad_bytes() {
-    if !enabled("WYRD_STORAGE_E2E") {
-        return;
-    }
     let storage_root = tempfile::tempdir().expect("storage root creates");
     let srv = server_from_settings(local_settings(storage_root.path())).await;
     let token = bootstrap_service_jwt(&srv, "storage-local-negative").await;
@@ -476,80 +405,32 @@ async fn local_upload_capability_rejects_raw_paths_and_bad_bytes() {
     srv.shutdown().await.expect("test server shuts down");
 }
 
+/// Multipart client/server round trip against the configured S3 or S3-compatible bucket.
 #[tokio::test(flavor = "current_thread")]
-async fn s3_multipart_e2e_emu() {
-    if !enabled("WYRD_STORAGE_INTEGRATION_S3") {
-        return;
-    }
+async fn s3_multipart_e2e() {
     run_client_server_journey(
-        server_from_settings(s3_emu_settings()).await,
+        configured_settings(StorageBackendKind::S3),
         "s3-multipart/weights.bin",
-        false,
     )
     .await;
 }
 
+/// Multipart client/server round trip against the configured GCS bucket or emulator.
 #[tokio::test(flavor = "current_thread")]
-async fn s3_multipart_e2e_cloud() {
-    if !enabled("WYRD_STORAGE_CLOUD_S3") {
-        return;
-    }
+async fn gcs_multipart_e2e() {
     run_client_server_journey(
-        server_from_settings(s3_cloud_settings()).await,
-        "s3-multipart/weights.bin",
-        false,
-    )
-    .await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn gcs_multipart_e2e_emu() {
-    if !enabled("WYRD_STORAGE_INTEGRATION_GCS") {
-        return;
-    }
-    run_client_server_journey(
-        server_from_handle(gcs_emu_handle()).await,
+        configured_settings(StorageBackendKind::Gcs),
         "gcs-multipart/weights.bin",
-        true,
     )
     .await;
 }
 
+/// Multipart client/server round trip against the configured Azure container or emulator.
 #[tokio::test(flavor = "current_thread")]
-async fn gcs_multipart_e2e_cloud() {
-    if !enabled("WYRD_STORAGE_CLOUD_GCS") {
-        return;
-    }
+async fn azure_multipart_e2e() {
     run_client_server_journey(
-        server_from_settings(gcs_cloud_settings()).await,
-        "gcs-multipart/weights.bin",
-        false,
-    )
-    .await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn azure_multipart_e2e_emu() {
-    if !enabled("WYRD_STORAGE_INTEGRATION_AZURE") {
-        return;
-    }
-    run_client_server_journey(
-        server_from_handle(azure_emu_handle()).await,
+        configured_settings(StorageBackendKind::Azure),
         "azure-multipart/weights.bin",
-        false,
-    )
-    .await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn azure_multipart_e2e_cloud() {
-    if !enabled("WYRD_STORAGE_CLOUD_AZURE") {
-        return;
-    }
-    run_client_server_journey(
-        server_from_settings(azure_cloud_settings()).await,
-        "azure-multipart/weights.bin",
-        false,
     )
     .await;
 }

@@ -31,10 +31,9 @@ Wyrd is multi-tenant. One server serves many tenants, isolated in the database, 
 The fastest way to see the server run is local development. Leave the database variables unset and it provisions its own Postgres. Skip the signing key and it mints an ephemeral one. You only have to point it at a storage directory.
 
 ```bash
-export WYRD_STORAGE_BACKEND=local
-export WYRD_STORAGE_LOCAL_ROOT="$PWD/.wyrd-dev/storage"
+mkdir -p .wyrd-dev/storage
+export WYRD_STORAGE_URL="file://$PWD/.wyrd-dev/storage"
 export WYRD_PUBLIC_BASE_URL=http://localhost:8080
-mkdir -p "$WYRD_STORAGE_LOCAL_ROOT"
 
 mise run dev:backend
 ```

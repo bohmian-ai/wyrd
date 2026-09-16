@@ -11,26 +11,24 @@ use wyrd_spec::storage::{StorageBackendKind, UploadPlan, WireProtocol};
 use wyrd_storage::azure::AzureSigner;
 use wyrd_storage::cloud::CloudSigner;
 use wyrd_storage::error::{AzureError, StorageError};
-use wyrd_storage::factory::azure::build_emulator_signer;
-use wyrd_storage::{BackendSigner, UploadPlanReplayInput, ValidatedPath};
+use wyrd_storage::settings::{self, BackendConfig};
+use wyrd_storage::{BackendSigner, UploadPlanReplayInput, ValidatedPath, factory};
 
-const AZURITE_ENDPOINT: &str = "http://127.0.0.1:10000";
-const AZURITE_CONTAINER: &str = "wyrd-storage-test";
 const BLOCK_SIZE: u64 = 256 * 1024;
 const BLOCK_COUNT: u32 = 3;
 
-fn skip_unless_enabled() -> bool {
-    if std::env::var("WYRD_STORAGE_INTEGRATION_AZURE").as_deref() != Ok("1") {
-        eprintln!("skipping Azurite integration test; set WYRD_STORAGE_INTEGRATION_AZURE=1");
-        return true;
-    }
-    false
-}
-
-fn build_signer() -> AzureSigner {
-    let endpoint = std::env::var("WYRD_AZURE_EMULATOR_ENDPOINT")
-        .unwrap_or_else(|_| AZURITE_ENDPOINT.to_owned());
-    build_emulator_signer(AZURITE_CONTAINER, &endpoint).expect("azurite signer")
+/// Build the Azure signer for the location and endpoint in `WYRD_STORAGE_URL`.
+///
+/// # Panics
+/// Panics when the environment does not select Azure or signer construction fails.
+async fn build_signer() -> AzureSigner {
+    let BackendConfig::Azure(config) = settings::from_env().expect("storage settings").backend
+    else {
+        panic!("WYRD_STORAGE_URL must select az://");
+    };
+    factory::azure::build_signer(&config)
+        .await
+        .expect("Azure signer")
 }
 
 fn fresh_path(suffix: &str) -> ValidatedPath {
@@ -42,10 +40,7 @@ fn fresh_path(suffix: &str) -> ValidatedPath {
 
 #[tokio::test]
 async fn azure_abort_lifecycle() {
-    if skip_unless_enabled() {
-        return;
-    }
-    let signer = build_signer();
+    let signer = build_signer().await;
     let path = fresh_path("abort/object.bin");
     signer
         .init_multipart(&path, 1, BLOCK_SIZE, Duration::from_mins(5))
@@ -64,11 +59,9 @@ async fn azure_abort_lifecycle() {
 
 #[tokio::test]
 async fn azure_abort_on_nonexistent_blob_returns_error() {
-    if skip_unless_enabled() {
-        return;
-    }
     assert!(
         build_signer()
+            .await
             .abort_multipart(&fresh_path("never-written.bin"))
             .await
             .is_err()
@@ -77,10 +70,7 @@ async fn azure_abort_on_nonexistent_blob_returns_error() {
 
 #[tokio::test]
 async fn azure_remint_plan_produces_valid_plan() {
-    if skip_unless_enabled() {
-        return;
-    }
-    let signer = build_signer();
+    let signer = build_signer().await;
     let plan = signer
         .remint_plan(
             &fresh_path("remint/object.bin"),
@@ -102,21 +92,15 @@ async fn azure_remint_plan_produces_valid_plan() {
 
 #[tokio::test]
 async fn azure_head_on_missing_returns_blob_not_found() {
-    if skip_unless_enabled() {
-        return;
-    }
     assert!(matches!(
-        build_signer().head(&fresh_path("never-written.bin")).await,
+        build_signer().await.head(&fresh_path("never-written.bin")).await,
         Err(StorageError::Azure(boxed)) if matches!(*boxed, AzureError::BlobNotFound { .. })
     ));
 }
 
 #[tokio::test]
 async fn azure_capability_mismatch_is_typed_for_presign_part() {
-    if skip_unless_enabled() {
-        return;
-    }
-    let backend = BackendSigner::Cloud(Box::new(CloudSigner::Azure(build_signer())));
+    let backend = BackendSigner::Cloud(Box::new(CloudSigner::Azure(build_signer().await)));
     let result = backend
         .presign_part(
             &fresh_path("capability/object.bin"),

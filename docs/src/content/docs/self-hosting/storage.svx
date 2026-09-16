@@ -8,69 +8,57 @@ order: 6
 
 # Storage
 
-The server keeps artifacts (uploaded model files, datasets, and other card payloads) in an object store, separate from Postgres. Pick one backend with `WYRD_STORAGE_BACKEND` and set that backend's variables. Four backends are supported: `local`, `s3`, `gcs`, and `azure`.
+The server keeps artifacts (uploaded model files, datasets, and other card payloads) in an object store, separate from Postgres. One variable, `WYRD_STORAGE_URL`, picks the backend and its location:
 
-Credentials for the cloud backends come from each provider's standard SDK credential chain, not from Wyrd-specific secrets. You configure the bucket and region through Wyrd, and let the cloud SDK resolve the identity the way it does everywhere else (environment, instance role, workload identity).
+```bash
+WYRD_STORAGE_URL=file:///var/lib/wyrd/artifacts   # local
+WYRD_STORAGE_URL=s3://bucket                      # S3
+WYRD_STORAGE_URL=gs://bucket                      # GCS
+WYRD_STORAGE_URL=az://account/container           # Azure
+```
 
-Clients move artifact bytes directly against the cloud store through short-lived presigned URLs. The server signs a URL and hands it back; it never proxies the bytes itself. Keeping large transfers off the server process is why the presign lifetime and multipart settings below exist. The local backend has no bucket to sign against, so it serves artifacts through the server, which is why `WYRD_PUBLIC_BASE_URL` is required for `local` and ignored by the cloud backends.
+Boot fails on an unsupported scheme, a missing bucket, account, or container, extra path segments, a relative local path, or a URL carrying credentials, a port, a query string, or a fragment.
 
-## Shared settings
+Credentials for the cloud backends come from each provider's standard SDK credential chain, not from Wyrd-specific secrets. Let the cloud SDK resolve the identity the way it does everywhere else (environment, instance role, workload identity).
 
-These apply to every backend.
+Clients move artifact bytes directly against the cloud store through short-lived presigned URLs. The server signs a URL and hands it back; it never proxies the bytes itself. Keeping large transfers off the server process is why the presign lifetime and multipart settings below exist. The local backend has no bucket to sign against, so it serves artifacts through the server, which is why `WYRD_PUBLIC_BASE_URL` is required for local storage and ignored by the cloud backends.
+
+## Settings
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `WYRD_STORAGE_BACKEND` | none (required) | `local`, `s3`, `gcs`, or `azure`. |
+| `WYRD_STORAGE_URL` | none (required) | Backend and location, as above. |
+| `WYRD_STORAGE_ENDPOINT_URL` | none | `http` or `https` endpoint for an S3-compatible store, without credentials, query, or fragment. See [Custom endpoints](#custom-endpoints). |
 | `WYRD_STORAGE_REQUIRE_ENCRYPTION` | `false` | Require an encryption marker when an upload completes. |
 | `WYRD_STORAGE_PRESIGN_TTL_SECS` | `600` | Presigned URL lifetime. Clamped to `60`–`3600`. |
 | `WYRD_STORAGE_PART_SIZE_BYTES` | `16777216` (16 MiB) | Multipart part size. Must be MiB-aligned. Clamped to 5 MiB–5 GiB. |
 | `WYRD_STORAGE_MULTIPART_THRESHOLD_BYTES` | `104857600` (100 MiB) | Object size at or above which cloud backends switch to multipart upload. |
+| `WYRD_PUBLIC_BASE_URL` | none | Public base URL of the server. Required for local storage. |
 
 `WYRD_STORAGE_REQUIRE_ENCRYPTION` refuses to finalize an upload that does not report an encryption marker, so a misconfigured bucket fails loudly instead of silently storing plaintext objects. Leave it off unless your environment requires encryption at rest; turn it on to enforce it.
 
 ## Local
 
-Files on the server's own disk. Fine for development and single-node setups, not for a horizontally scaled deployment where replicas do not share a filesystem.
-
-| Variable | Required | Notes |
-| --- | --- | --- |
-| `WYRD_STORAGE_LOCAL_ROOT` | yes | Absolute path to the storage root. Must exist. |
-| `WYRD_PUBLIC_BASE_URL` | yes | Public base URL of the server, used to build artifact links. |
+Files on the server's own disk. Fine for development and single-node setups, not for a horizontally scaled deployment where replicas do not share a filesystem. The path must be absolute and must exist.
 
 ```bash
-export WYRD_STORAGE_BACKEND=local
-export WYRD_STORAGE_LOCAL_ROOT=/var/lib/wyrd/artifacts
+export WYRD_STORAGE_URL=file:///var/lib/wyrd/artifacts
 export WYRD_PUBLIC_BASE_URL=https://wyrd.internal
 ```
 
 ## S3
 
-Amazon S3 or any S3-compatible store (MinIO, Ceph, R2). Credentials resolve through the AWS default credential chain: environment variables, IAM role, instance metadata, and so on. Wyrd does not take an access key directly.
-
-| Variable | Required | Notes |
-| --- | --- | --- |
-| `WYRD_STORAGE_S3_BUCKET` | yes | Bucket name, no `s3://` prefix. |
-| `WYRD_STORAGE_S3_REGION` | no | AWS region. Falls back to the SDK default chain if unset. |
-| `WYRD_STORAGE_S3_ENDPOINT_URL` | no | Custom endpoint for an S3-compatible store. Forces path-style addressing. |
-| `WYRD_STORAGE_S3_FORCE_PATH_STYLE` | no | Force path-style addressing without setting a custom endpoint. |
+Amazon S3 or any S3-compatible store (MinIO, Ceph, R2). Credentials resolve through the AWS default credential chain: environment variables, IAM role, instance metadata, and so on. The region comes from the standard `AWS_REGION` variable. Wyrd does not take an access key directly.
 
 ```bash
-export WYRD_STORAGE_BACKEND=s3
-export WYRD_STORAGE_S3_BUCKET=wyrd-artifacts
-export WYRD_STORAGE_S3_REGION=us-east-1
+export WYRD_STORAGE_URL=s3://wyrd-artifacts
+export AWS_REGION=us-east-1
 # Credentials via the AWS default chain (env, IAM role, instance metadata).
 ```
 
 ## GCS
 
 Google Cloud Storage. Credentials resolve in order: inline service account JSON, a service account key file, then Application Default Credentials (gcloud config, Workload Identity).
-
-| Variable | Required | Notes |
-| --- | --- | --- |
-| `WYRD_STORAGE_GCS_BUCKET` | yes | Bucket name, no `gs://` prefix. |
-| `WYRD_STORAGE_GCS_ENDPOINT_URL` | no | Custom endpoint or emulator. |
-
-Credential variables (first match wins):
 
 | Variable | Notes |
 | --- | --- |
@@ -79,27 +67,29 @@ Credential variables (first match wins):
 | (Application Default Credentials) | gcloud config or Workload Identity, used if neither of the above is set. |
 
 ```bash
-export WYRD_STORAGE_BACKEND=gcs
-export WYRD_STORAGE_GCS_BUCKET=wyrd-artifacts
+export WYRD_STORAGE_URL=gs://wyrd-artifacts
 export GOOGLE_APPLICATION_CREDENTIALS=/run/secrets/gcs-sa.json
 ```
 
 ## Azure
 
-Azure Blob Storage. Credentials resolve through the Azure default credential chain (`AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, `AZURE_TENANT_ID`, managed identity). For an emulator like Azurite, set the account key directly with `AZURE_STORAGE_ACCOUNT_KEY`.
-
-| Variable | Required | Notes |
-| --- | --- | --- |
-| `WYRD_STORAGE_AZURE_ACCOUNT` | yes | Storage account name. |
-| `WYRD_STORAGE_AZURE_CONTAINER` | yes | Blob container name. |
-| `WYRD_STORAGE_AZURE_ENDPOINT_URL` | no | Custom endpoint. Defaults to `https://{account}.blob.core.windows.net`. |
+Azure Blob Storage. Credentials resolve through the Azure default credential chain (`AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, `AZURE_TENANT_ID`, managed identity).
 
 ```bash
-export WYRD_STORAGE_BACKEND=azure
-export WYRD_STORAGE_AZURE_ACCOUNT=wyrdstorage
-export WYRD_STORAGE_AZURE_CONTAINER=artifacts
-# Credentials via the Azure default chain, or AZURE_STORAGE_ACCOUNT_KEY for an emulator.
+export WYRD_STORAGE_URL=az://wyrdstorage/artifacts
+# Credentials via the Azure default chain.
 ```
+
+## Custom endpoints
+
+Set `WYRD_STORAGE_ENDPOINT_URL` to point S3 storage at an S3-compatible service. A custom endpoint switches S3 to path-style addressing.
+
+```bash
+export WYRD_STORAGE_URL=s3://wyrd-artifacts
+export WYRD_STORAGE_ENDPOINT_URL=https://minio.internal:9000
+```
+
+GCS and Azure accept an endpoint only in builds with the `emulator` feature, for fake-gcs-server and Azurite. For Azurite the endpoint is the complete service URL including the account (`http://127.0.0.1:10000/devstoreaccount1`) and the account key comes from `AZURE_STORAGE_ACCOUNT_KEY`. A production build refuses to start when GCS or Azure has an endpoint rather than sign against the real provider.
 
 ## Related
 

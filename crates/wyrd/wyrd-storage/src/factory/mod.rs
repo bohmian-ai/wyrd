@@ -29,6 +29,20 @@ fn cloud_disabled(backend: &BackendConfig) -> StorageError {
     }
 }
 
+/// Refuse a GCS or Azure endpoint override in a build without `emulator`.
+///
+/// The production GCS and Azure signers address only the public provider, so
+/// honoring `WYRD_STORAGE_ENDPOINT_URL` for the data plane while signing
+/// against the real provider would split one backend across two services.
+#[cfg(all(feature = "cloud", not(feature = "emulator")))]
+fn endpoint_requires_emulator(backend: StorageBackendKind) -> StorageError {
+    StorageError::Backend {
+        backend,
+        op: "build_signer",
+        message: "WYRD_STORAGE_ENDPOINT_URL is supported for this backend only in builds with the `emulator` feature".to_owned(),
+    }
+}
+
 /// Build the active backend signer in a cloud-enabled build.
 ///
 /// Cloud backends may perform SDK setup and boot probing, so this variant

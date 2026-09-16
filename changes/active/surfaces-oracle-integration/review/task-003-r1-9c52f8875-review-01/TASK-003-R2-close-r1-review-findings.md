@@ -283,3 +283,40 @@ the touched Rust, storage, documentation, CI, generated-contract, Bifrost, and
 journey surfaces. Finish with
 `git diff --check 861f8d86cc3f9d7e70fb59489e80f8be62afddbf..<corrected-candidate>`.
 All evidence must identify the same final commit and tree.
+
+## Implementation evidence
+
+Verified candidate: commit `117f668f6046f15dcfb7b197fc53f8557f4c1757`,
+tree `e97a1e0aa2e0a25368167fcb4fca06792a71e270`. Every command below ran
+sequentially on that commit with `HEAD` unchanged at the end of the run.
+The commit recording this section changes only this file.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Local handle test and Azure signer-dispatch assertion execute under existing owners; no orphan `backend_contracts` target (`FIND-2`) | `fbae085fe`: `wyrd-storage/tests/handle_crud.rs`, `integration_azurite.rs` | `cargo nextest run --locked -p wyrd-storage --all-features --test handle_crud -E 'test(=local_handle_crud)'` 1 passed; `--test integration_azurite -E 'test(=azure_abort_on_nonexistent_blob_returns_error)'` 1 passed; `git ls-files \| grep backend_contracts` → 0; `mise run test:storage:matrix` 11 invocations, all nonzero, all passed | PASS |
+| Forge recovery journey keeps shutdown-only assertion; recovered attempt settles before stop; no production semantic change (`FIND-3`) | `d58ee1a8f`: passive `test-support` post-reconciliation barrier in `forge/worker.rs`; `compaction_admission.rs` restores `.all(\|e\| e.contains("shut down"))` | Exact `forge::compaction_admission::acceptance_unknown_recovers_from_durable_state` under `with-test-postgres.sh`, `-P journey --run-ignored=all`: 1 passed (16/16 repeated runs during implementation) | PASS |
+| Complete rustdoc on retained materially changed storage tests/helpers (`FIND-4`) | `abe2ecb9c`: `storage_e2e.rs`, `handle_crud.rs`, `integration_{azurite,gcs,rustfs}.rs` | `mise run lints`, `mise run docs:check` passed | PASS |
+| Live-cloud workflow runs on push to `main` only, three jobs and OIDC permissions kept | `5b340e3de`: `.github/workflows/storage-integration-cloud.yml` (`on: push: branches: [main]`, no `schedule`/`workflow_dispatch`) | `mise run check:ci-selection` passed; workflow inspection | PASS |
+| Storage workflows/docs use `WYRD_STORAGE_URL`/`WYRD_STORAGE_ENDPOINT_URL`, document local pre-merge cloud commands, retain no retired variables | `5b340e3de`: `docs/.../self-hosting/storage.svx` "Testing storage changes" | `grep -rhoE 'WYRD_STORAGE_[A-Z_]+' .github docs/src` → only `URL`, `ENDPOINT_URL`, `MULTIPART_THRESHOLD_BYTES`, `PART_SIZE_BYTES`, `PRESIGN_TTL_SECS`, `REQUIRE_ENCRYPTION` (no `BACKEND`, `*_BUCKET`, `*_CONTAINER`, `LOCAL_ROOT`, `INTEGRATION_*`, `CLOUD_*`); `mise run docs:check` passed | PASS |
+| One `HttpTransport` client bounds connect; only `send_with_retry` applies total timeout; slow transfers outlive it (`FIND-8`) | `238ef2a25`: `wyrd-client` HTTP transport | `cargo nextest run --locked -p wyrd-client --test transport` exact 5 `http::transport_behavior::*` tests: 5 passed; `mise run test:shared`: 649 passed | PASS |
+| Query ingress/auth/admission edge-bounded; Oracle preparation may exceed edge but not its deadline; non-query routes keep edge timeout; typed errors survive (`FIND-9`) | `07d3914db`, `8f54c2558`: `http/middleware/edge_timeout.rs`, `query/routes.rs`, `openapi.yaml`; journey `wyrd-testing/tests/bifrost/server/query.rs` | Exact `query::query_edge_timeout_yields_to_oracle_deadline` (`-P journey --run-ignored=all`): 1 passed; handoff no-op negative control failed during implementation; `mise run test:bifrost:journey:server`: 11 passed; `mise run codegen:check` passed | PASS |
+| Full prescribed matrix passes on one immutable commit/tree (`FIND-6`) | — | `fmt:check`, `lints`, `codegen:check`, `docs:check`, `check:ci-selection`, `check:bifrost-oracle-deploy`, `check:bifrost-resource-governance`, `check:unwrap-audit` passed; `wyrd-storage --lib settings::` 9 passed; `wyrd-spec --lib vala::api::bifrost_wire_tests::` 11 passed; `wyrd-mcp --test mcp discovery::pg_tests::agent_discovers_only_authorized_tables_and_layout` 1 passed; `wyrd-server --lib boot::data_root::tests::` 4 passed; `mise run gate` passed (1530 s; nonzero lanes incl. 1906, 1272, 978, 649, 410, 221, 113, 102 tests); `test:cards:integration` 6 + 23 passed; `test:cli:journey` 20 passed; `test:wyrdstate:journey` 1 passed; `py:test:testing` 5 passed; `py:test:integration` 55 passed; `ts:test:integration` 17 passed | PASS |
+| Local real-cloud tasks pass on the same SHA (`FIND-7`) | untracked `mise.local.toml` dev buckets | `mise run storage:s3:dev`, `storage:gcs:dev`, `storage:azure:dev`: each `*_handle_crud` 1 passed + `*_multipart_e2e` 1 passed | PASS |
+| Whitespace-clean range | `117f668f6` drops a pre-existing EOF blank line | `git diff --check 861f8d86cc3f9d7e70fb59489e80f8be62afddbf..117f668f6046f15dcfb7b197fc53f8557f4c1757` exit 0 | PASS |
+
+Deviation: `FIND-3` could not reuse an existing barrier — none fires after
+reconciliation settles and before stop — so one passive `test-support`-only
+barrier was added; production builds and Forge cancellation/publication
+semantics are unchanged.
+
+Non-goals held: no production Forge semantic change, no public query deadline
+or `request_arrow` change, no skipped/ignored tests or `#[allow]`, no push,
+merge, release, or deploy; `mise.local.toml` stays untracked; unrelated
+`changes/active/verified-change-contract/*` edits untouched.
+
+Environment note: an earlier run on `8f54c2558` hit a full disk; its
+`vala-sql::pg_forge_tasks` and `pg_card_registration_route` failures
+passed in isolation (`mise run test:sql` 113 passed) and on the verified
+candidate after build caches were cleared.
+
+Status: `IMPLEMENTED`.

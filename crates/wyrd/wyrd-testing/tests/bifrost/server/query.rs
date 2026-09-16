@@ -1183,3 +1183,219 @@ async fn refuses_with(
         Err(other) => Err(format!("`{sql}` must be refused with {code}, got {other}").into()),
     }
 }
+
+/// Generic protected-edge limit used by the staged query timeout journey.
+const EDGE_LIMIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Oracle preparation can outlive the generic edge limit but not its own deadline.
+///
+/// The server's edge timeout is shortened below explicit query deadlines. A
+/// request-scoped preparation pause holds one query past the edge limit and
+/// releases it before Oracle expiry, which must still stream a successful
+/// terminal; a second query held past its own deadline must fail with Oracle's
+/// typed timeout. A stalled query body and a stalled non-query body must still
+/// receive the generic edge timeout, proving only post-handoff query work is
+/// exempt.
+///
+/// # Errors
+/// Returns server setup, catalog, authentication, HTTP or frame decoding errors.
+///
+/// # Panics
+/// Panics if a timeout is attributed to the wrong owner or the released query
+/// does not settle successfully.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn query_edge_timeout_yields_to_oracle_deadline() -> Result<(), ServerJourneyError> {
+    let server = WyrdTestServer::builder()
+        .with_limits_for_test(wyrd_server::state::LimitsConfig {
+            timeout: EDGE_LIMIT,
+            ..wyrd_server::state::LimitsConfig::default()
+        })
+        .start_bound()
+        .await?;
+    let tenant = server.data_tenant_id();
+    let table = format!("edge_timeout_{}", uuid::Uuid::now_v7().simple());
+    server
+        .state()
+        .bifrost_catalog()
+        .ok_or("missing catalog")?
+        .create_table(CreateTableRequest {
+            table: TableRef::new(BifrostNamespace::Bifrost, &table),
+            user_fields: vec![Field::new("value", DataType::Int64, false)],
+            tenant,
+            physical_layout: None,
+            audit: None,
+        })
+        .await?;
+    let base = server.base_url().ok_or("missing HTTP URL")?.to_owned();
+    await_server_ready(&base).await?;
+    let api_key = server
+        .bootstrap_service_in_tenant(tenant, "edge-timeout-caller", &["admin"])
+        .await?
+        .api_key()
+        .ok_or("machine bootstrap returned no key")?
+        .clone();
+    let edge = EdgeTimeoutClient {
+        http: reqwest::Client::new(),
+        base,
+        token: server.exchange_api_key(&api_key).await?,
+    };
+    let oracle = server
+        .state()
+        .bifrost_query()
+        .map(|query| std::sync::Arc::clone(query.engine()))
+        .ok_or("missing Oracle")?;
+    let sql = format!("SELECT value FROM vala.bifrost.{table}");
+
+    // Released before Oracle expiry: the edge limit no longer applies.
+    let (pause, response) = edge.paused_query(&oracle, &sql, 10_000).await?;
+    tokio::time::sleep(EDGE_LIMIT * 2).await;
+    assert!(
+        !response.is_finished(),
+        "edge timer must not end preparation"
+    );
+    pause.release();
+    let response = response.await??;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let mut decoder = wyrd_tonic::frame_codec::FrameDecoder::new(16 * 1024 * 1024);
+    let mut terminal = None;
+    for frame in decoder.push::<proto::QueryStreamFrame>(&response.bytes().await?)? {
+        if let Some(proto::query_stream_frame::Frame::Terminal(frame)) = frame.frame {
+            terminal = Some(frame.outcome);
+        }
+    }
+    assert_eq!(
+        terminal,
+        Some(proto::QueryTerminalOutcome::Success as i32),
+        "released query settles successfully"
+    );
+
+    // Held past Oracle expiry: the typed query timeout survives.
+    let (pause, response) = edge.paused_query(&oracle, &sql, 3_000).await?;
+    let response = tokio::time::timeout(std::time::Duration::from_secs(10), response).await???;
+    pause.release();
+    assert_eq!(problem_code(response).await?, "WYRD_VALA_504_QUERY_TIMEOUT");
+    oracle.bind_preparation_pause_for_test(None)?;
+
+    // Stalled bodies before Oracle handoff keep the generic edge timeout.
+    let query_body = serde_json::to_vec(&request(&sql))?;
+    for (path, body) in [
+        ("/v1/query", query_body),
+        ("/v1/cards", b"{\"apiVersion\":\"wyrd/v1\"}".to_vec()),
+    ] {
+        let response = edge.stalled_post(path, body).await?;
+        assert_eq!(
+            problem_code(response).await?,
+            "WYRD_SERVER_504_REQUEST_TIMEOUT",
+            "{path} body collection stays edge-bounded"
+        );
+    }
+    server.shutdown().await?;
+    Ok(())
+}
+
+/// Authenticated raw HTTP caller for the staged edge-timeout journey.
+struct EdgeTimeoutClient {
+    /// Plain client without its own total timeout.
+    http: reqwest::Client,
+    /// Bound server origin.
+    base: String,
+    /// Exchanged bearer token for the admin service.
+    token: String,
+}
+
+impl EdgeTimeoutClient {
+    /// Arms a request-scoped preparation pause and starts that query.
+    ///
+    /// Returns once Oracle has reached the paused boundary, so the edge handoff
+    /// has already happened and the caller controls the remaining wait.
+    ///
+    /// # Errors
+    /// Returns pause binding errors, or a failure when the query settles or does
+    /// not reach the pause within the bounded window.
+    async fn paused_query(
+        &self,
+        oracle: &vala_bifrost_redux::oracle::Oracle,
+        sql: &str,
+        deadline_ms: i64,
+    ) -> Result<
+        (
+            std::sync::Arc<vala_bifrost_redux::oracle::OraclePreparationPause>,
+            tokio::task::JoinHandle<reqwest::Result<reqwest::Response>>,
+        ),
+        ServerJourneyError,
+    > {
+        let request_id = RequestId::now_v7();
+        let pause = std::sync::Arc::new(vala_bifrost_redux::oracle::OraclePreparationPause::new(
+            request_id.clone(),
+        ));
+        oracle.bind_preparation_pause_for_test(Some(std::sync::Arc::clone(&pause)))?;
+        let mut body = request(sql);
+        body.deadline_ms = Some(deadline_ms);
+        let response = tokio::spawn(
+            self.post("/v1/query")
+                .header("wyrd-request-id", request_id.to_string())
+                .json(&body)
+                .send(),
+        );
+        let reached = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while pause.observed_deadline_ms().is_none() {
+            if response.is_finished() || std::time::Instant::now() > reached {
+                pause.release();
+                return Err("query did not reach the preparation pause".into());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        Ok((pause, response))
+    }
+
+    /// Sends a body that stalls longer than the edge limit before completing.
+    ///
+    /// # Errors
+    /// Returns transport errors other than the server's timeout response.
+    async fn stalled_post(
+        &self,
+        path: &str,
+        body: Vec<u8>,
+    ) -> Result<reqwest::Response, ServerJourneyError> {
+        let (head, tail) = body.split_at(1);
+        let chunks = [
+            bytes::Bytes::copy_from_slice(head),
+            bytes::Bytes::copy_from_slice(tail),
+        ];
+        let stream = futures_util::stream::iter(chunks.into_iter().enumerate()).then(
+            |(index, chunk)| async move {
+                if index == 1 {
+                    tokio::time::sleep(EDGE_LIMIT * 3).await;
+                }
+                Ok::<_, std::io::Error>(chunk)
+            },
+        );
+        Ok(self
+            .post(path)
+            .header("content-type", "application/json")
+            .header("idempotency-key", uuid::Uuid::now_v7().to_string())
+            .body(reqwest::Body::wrap_stream(stream))
+            .send()
+            .await?)
+    }
+
+    /// Starts one authenticated POST to `path`.
+    fn post(&self, path: &str) -> reqwest::RequestBuilder {
+        self.http
+            .post(format!("{}{path}", self.base))
+            .header("x-wyrd-access-token", format!("Bearer {}", self.token))
+    }
+}
+
+/// Reads the stable problem code from an error response.
+///
+/// # Errors
+/// Returns body or JSON decoding errors, or a failure when `code` is absent.
+async fn problem_code(response: reqwest::Response) -> Result<String, ServerJourneyError> {
+    let problem: serde_json::Value = response.json().await?;
+    Ok(problem["code"]
+        .as_str()
+        .ok_or_else(|| format!("problem without code: {problem}"))?
+        .to_owned())
+}

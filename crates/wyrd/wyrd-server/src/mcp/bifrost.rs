@@ -431,6 +431,7 @@ impl WyrdMcpHandler {
                 self.state.clone(),
                 caller,
                 arguments.to_request(),
+                None,
             )
             .await?;
             let collector = ResultCollector {

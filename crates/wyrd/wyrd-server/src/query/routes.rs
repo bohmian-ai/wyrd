@@ -9,7 +9,7 @@ use axum::extract::{Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use futures_util::StreamExt;
 use vala_bifrost_redux::oracle::OracleQueryStream;
 use wyrd_spec::error::{WyrdError, WyrdProblem};
@@ -23,6 +23,7 @@ use wyrd_tonic::frame_codec::FrameEncoder;
 
 use crate::components::auth::Caller;
 use crate::http::error::WyrdErrorResponse;
+use crate::http::middleware::edge_timeout::QueryEdgeTimer;
 use crate::query::service;
 use crate::state::AppState;
 
@@ -228,12 +229,18 @@ pub(crate) async fn cancel_running_query(
     tag = "Bifrost"
 )]
 /// Streams one authenticated SQL query as canonical protobuf frames.
+///
+/// The protected edge supplies a [`QueryEdgeTimer`]; the query service ends that
+/// generic timer once Oracle dispatch owns the request's query deadline.
 pub(crate) async fn sync_query(
     State(state): State<AppState>,
+    edge_timer: Option<Extension<QueryEdgeTimer>>,
     caller: Caller,
     Json(body): Json<BifrostQueryRequest>,
 ) -> Response {
-    let result = match service::stream_query(state.clone(), caller, body).await {
+    let edge_timer = edge_timer.map(|Extension(timer)| timer);
+    let result = match service::stream_query(state.clone(), caller, body, edge_timer.as_ref()).await
+    {
         Ok(result) => result,
         Err(error) => return query_error_response(error),
     };
@@ -690,6 +697,7 @@ mod tests {
         wyrd_runtime::runtime().block_on(async {
             let response = sync_query(
                 State(state_without_oracle().await),
+                None,
                 query_caller().await,
                 Json(BifrostQueryRequest {
                     sql: "SELECT 1".to_owned(),

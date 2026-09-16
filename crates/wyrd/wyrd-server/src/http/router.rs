@@ -7,7 +7,6 @@ use axum::middleware;
 use tower::ServiceBuilder;
 use tower::limit::ConcurrencyLimitLayer;
 use tower::load_shed::LoadShedLayer;
-use tower::timeout::TimeoutLayer;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::trace::TraceLayer;
 use utoipa::OpenApi;
@@ -123,7 +122,8 @@ pub fn build_router(state: AppState) -> Router {
 ///   3. HandleErrorLayer — maps BoxError (Elapsed, Overloaded) → HTTP response
 ///   4. LoadShed — sheds requests when ConcurrencyLimit is not ready
 ///   5. ConcurrencyLimitLayer — caps in-flight requests
-///   6. TimeoutLayer — enforces per-request deadline
+///   6. EdgeTimeout — enforces the per-request deadline; `POST /v1/query`
+///      hands its remaining wait to the Oracle query deadline after admission
 ///   7. WyrdBodyLimit — enforces max body size
 ///   8. handler
 pub(crate) fn apply_protected_edge<S>(router: Router<S>, state: &AppState) -> Router<S>
@@ -136,7 +136,7 @@ where
         ))
         .layer(LoadShedLayer::new())
         .layer(ConcurrencyLimitLayer::new(state.limits.concurrency))
-        .layer(TimeoutLayer::new(state.limits.timeout))
+        .layer(crate::http::middleware::edge_timeout::EdgeTimeoutLayer::new(state.limits.timeout))
         .layer(crate::http::middleware::body_limit::wyrd_body_limit(
             state.limits.body_bytes,
             state

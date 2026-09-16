@@ -127,6 +127,7 @@ impl BifrostQueryService for BifrostQueryGrpc {
                 self.state.clone(),
                 caller,
                 request,
+                None,
             ))
             .await
             .map_err(query_status)?;

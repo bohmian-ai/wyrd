@@ -38,6 +38,8 @@ use crate::components::auth::{ServerAuth, ServerAuthz};
 use crate::components::eval::{EvalRuns, new_run_map};
 use crate::components::health::ReadinessSnapshot;
 use crate::config::{BifrostRuntimeConfig, BifrostTarget, DeploymentProfile, ForgeRuntimeConfig};
+#[cfg(feature = "test-support")]
+use crate::oracle::SilentForwardPeer;
 use crate::postgres::ServerPostgres;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
@@ -1732,7 +1734,7 @@ impl Bifrost {
     /// Borrows the test-only silent forwarding-peer switch of this replica.
     #[cfg(feature = "test-support")]
     #[must_use]
-    pub fn silent_forward_peer_for_test(&self) -> Option<&crate::oracle::SilentForwardPeer> {
+    pub fn silent_forward_peer_for_test(&self) -> Option<&SilentForwardPeer> {
         self.query_forwarder
             .as_ref()
             .map(|forwarder| forwarder.silent_peer_for_test())

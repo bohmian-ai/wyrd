@@ -2,10 +2,14 @@
 
 use std::future::Future;
 use std::sync::Arc;
+#[cfg(feature = "test-support")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use rand::RngCore as _;
+#[cfg(feature = "test-support")]
+use tokio::sync::watch::{Sender, error::RecvError};
 use vala_bifrost_redux::cluster::{ClusterRegistry, ClusterSnapshot};
 use vala_bifrost_redux::oracle::dispatcher::{BifrostPeerTls, OraclePeerCredentials};
 use vala_bifrost_redux::oracle::{
@@ -13,7 +17,9 @@ use vala_bifrost_redux::oracle::{
 };
 use wyrd_runtime::Permission;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::vala::api::{BifrostQueryRequest, NodeId, QueryClass, SignedPeerTicket};
+use wyrd_spec::vala::api::{
+    BifrostQueryRequest, NodeId, QueryClass, SignedPeerTicket, VisibilityMode,
+};
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_tonic::query_conversion::QueryStreamConverter;
 use wyrd_tonic::tonic::metadata::MetadataValue;
@@ -68,9 +74,9 @@ pub struct ReadyOracleForwarder {
 #[derive(Debug)]
 pub struct SilentForwardPeer {
     /// Whether newly arriving envelopes are parked.
-    armed: std::sync::atomic::AtomicBool,
+    armed: AtomicBool,
     /// Parked `(arrived, abandoned)` envelope counts, observable by waiters.
-    counts: tokio::sync::watch::Sender<(usize, usize)>,
+    counts: Sender<(usize, usize)>,
 }
 
 #[cfg(feature = "test-support")]
@@ -78,14 +84,14 @@ impl SilentForwardPeer {
     /// Creates a disarmed switch with zero counts.
     fn new() -> Self {
         Self {
-            armed: std::sync::atomic::AtomicBool::new(false),
-            counts: tokio::sync::watch::Sender::new((0, 0)),
+            armed: AtomicBool::new(false),
+            counts: Sender::new((0, 0)),
         }
     }
 
     /// Arms or disarms parking for envelopes that arrive afterwards.
     pub fn set_armed(&self, armed: bool) {
-        self.armed.store(armed, std::sync::atomic::Ordering::SeqCst);
+        self.armed.store(armed, Ordering::SeqCst);
     }
 
     /// Returns how many envelopes were parked and how many of those were dropped.
@@ -98,10 +104,7 @@ impl SilentForwardPeer {
     ///
     /// # Errors
     /// Returns an error only if the switch is dropped while waiting.
-    pub async fn wait_abandoned(
-        &self,
-        abandoned: usize,
-    ) -> Result<(), tokio::sync::watch::error::RecvError> {
+    pub async fn wait_abandoned(&self, abandoned: usize) -> Result<(), RecvError> {
         self.counts
             .subscribe()
             .wait_for(|counts| counts.1 >= abandoned)
@@ -115,14 +118,18 @@ impl SilentForwardPeer {
     /// request, which records the envelope as abandoned.
     pub(crate) async fn hold_if_armed(&self) {
         /// Counts the parked envelope as abandoned when its handler is dropped.
-        struct Abandon<'a>(&'a tokio::sync::watch::Sender<(usize, usize)>);
+        struct Abandon<'a>(
+            /// Shared counts channel whose abandoned total this guard bumps
+            /// on drop, which is how a cancelled parked handler is observed.
+            &'a Sender<(usize, usize)>,
+        );
         impl Drop for Abandon<'_> {
             /// Records cancellation of the parked handler.
             fn drop(&mut self) {
                 self.0.send_modify(|counts| counts.1 += 1);
             }
         }
-        if !self.armed.load(std::sync::atomic::Ordering::SeqCst) {
+        if !self.armed.load(Ordering::SeqCst) {
             return;
         }
         self.counts.send_modify(|counts| counts.0 += 1);
@@ -381,7 +388,7 @@ impl ReadyOracleForwarder {
         &self,
         mut connected: ConnectedOracle,
         ticket: SignedPeerTicket,
-        visibility: wyrd_spec::vala::api::VisibilityMode,
+        visibility: VisibilityMode,
     ) -> Result<OracleQueryStream, BifrostError> {
         let bearer = self
             .credentials
@@ -595,7 +602,7 @@ where
     CF: FnMut(NodeId, String) -> CFut,
     CFut: Future<Output = Result<C, BifrostError>>,
     EF: FnOnce(&ForwardQueryClaims) -> Result<E, BifrostError>,
-    DF: FnOnce((NodeId, u64), C, E, wyrd_spec::vala::api::VisibilityMode) -> DFut,
+    DF: FnOnce((NodeId, u64), C, E, VisibilityMode) -> DFut,
     DFut: Future<Output = Result<O, BifrostError>>,
 {
     let (leader, connected) = connect_before_delivery(candidates, deadline, connect).await?;
@@ -749,6 +756,7 @@ impl ForwardedQueryIpc {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
     use wyrd_runtime::permission::PermissionSet;
@@ -1040,12 +1048,16 @@ mod tests {
     }
 
     /// Records whether a pending delivery future was dropped rather than completed.
-    struct DropProbe(Arc<std::sync::atomic::AtomicBool>);
+    struct DropProbe(
+        /// Flag set when the probe drops; the test reads it to prove expiry
+        /// cancelled the in-flight delivery instead of leaving it pending.
+        Arc<AtomicBool>,
+    );
 
     impl Drop for DropProbe {
         /// Marks the owning delivery wait as cancelled.
         fn drop(&mut self) {
-            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.0.store(true, Ordering::SeqCst);
         }
     }
 
@@ -1055,6 +1067,12 @@ mod tests {
     /// test is deterministic: the silent delivery is cancelled with the typed
     /// timeout, exactly one envelope was delivered, and no other candidate is
     /// connected afterwards.
+    ///
+    /// # Panics
+    ///
+    /// Panics if expiry is not a typed query timeout, the delivery future is
+    /// not dropped, more than one envelope is delivered, or a successor
+    /// candidate is connected.
     #[tokio::test(start_paused = true)]
     async fn silent_selected_delivery_times_out_once_and_is_cancelled() {
         let observed_at = chrono::Utc::now();
@@ -1062,7 +1080,7 @@ mod tests {
         let snapshot = ClusterSnapshot::observed(leases, observed_at);
         let connects = Arc::new(Mutex::new(0_usize));
         let deliveries = Arc::new(Mutex::new(0_usize));
-        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
         let (context, request) = query_input();
         let error = route_remote_once(
             eligible_oracle_candidates(&snapshot)
@@ -1098,7 +1116,7 @@ mod tests {
         .await;
         assert!(matches!(error, Err(BifrostError::QueryTimeout)));
         assert!(
-            cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            cancelled.load(Ordering::SeqCst),
             "expiry drops the in-flight delivery wait"
         );
         assert_eq!(*deliveries.lock().expect("delivery lock"), 1);

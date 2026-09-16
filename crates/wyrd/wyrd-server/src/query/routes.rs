@@ -230,8 +230,8 @@ pub(crate) async fn cancel_running_query(
 )]
 /// Streams one authenticated SQL query as canonical protobuf frames.
 ///
-/// The protected edge supplies a [`QueryEdgeTimer`]; the query service ends that
-/// generic timer once Oracle dispatch owns the request's query deadline.
+/// Body collection, authentication, and admission are bounded by the server
+/// request timeout; once the query is dispatched, its own deadline governs.
 pub(crate) async fn sync_query(
     State(state): State<AppState>,
     edge_timer: Option<Extension<QueryEdgeTimer>>,

@@ -724,6 +724,9 @@ paths:
       tags:
       - Bifrost
       summary: Streams one authenticated SQL query as canonical protobuf frames.
+      description: |-
+        Body collection, authentication, and admission are bounded by the server
+        request timeout; once the query is dispatched, its own deadline governs.
       operationId: sync_query
       requestBody:
         content:

@@ -221,6 +221,50 @@ async fn release_fence(mut fence: TenantConn<'_>) -> Result<(), ServerJourneyErr
     Ok(())
 }
 
+/// Reads the Postgres backend process id serving one tenant transaction.
+///
+/// The id names that transaction in `pg_blocking_pids`, which is how the
+/// journey observes lock queue order without sleeping.
+///
+/// # Errors
+/// Returns the query failure Postgres raised.
+async fn backend_pid(conn: &mut TenantConn<'_>) -> Result<i32, ServerJourneyError> {
+    Ok(sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut **conn.transaction())
+        .await?)
+}
+
+/// Waits until backend `waiter` is queued behind the transaction `holder` owns.
+///
+/// Polls `pg_blocking_pids` from the holder's own transaction, so the check
+/// neither takes nor releases any lock.
+///
+/// # Errors
+/// Returns the query failure, or a timeout when the waiter never queues.
+async fn await_blocked_behind(
+    holder: &mut TenantConn<'_>,
+    waiter: i32,
+) -> Result<(), ServerJourneyError> {
+    let deadline = std::time::Instant::now() + PUBLICATION_BUDGET;
+    loop {
+        let queued: bool =
+            sqlx::query_scalar("SELECT pg_backend_pid() = ANY(pg_blocking_pids($1))")
+                .bind(waiter)
+                .fetch_one(&mut **holder.transaction())
+                .await?;
+        if queued {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "backend {waiter} never queued behind the freeze within {PUBLICATION_BUDGET:?}"
+            )
+            .into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 /// A frozen audit range replays exactly once while its tail waits behind it.
 ///
 /// Three hazards share this boundary and none of them is visible to a test that
@@ -240,14 +284,18 @@ async fn release_fence(mut fence: TenantConn<'_>) -> Result<(), ServerJourneyErr
 /// appended in one transaction so any sweep freezes all of them or none, and
 /// their staged rows are fenced before the range is frozen, so no cycle can
 /// settle them. The frozen range must then be exactly those three rows,
-/// whichever publisher froze it. A spawned cycle (or a competing sweep) reaches
-/// retained history — the assertion that the Scribe append is durable — and the
-/// spawned cycle is aborted while holding nothing committed in Postgres, which
-/// is exactly the crash-before-settlement state. Releasing the fence and
-/// running the cycle again replays the identical frozen range into Scribe's
-/// batch fence. Both operations must be retained exactly once, the tail
-/// appended above the old bound must wait for its own range, and the tenant
-/// must drain to zero.
+/// whichever publisher froze it. A tail decision commits in the same
+/// transaction as that freeze, so it is staged above a bound already live. A
+/// competing freeze queued on the chain head before that commit is granted the
+/// lock ahead of any settlement and must reuse the identical bound while the
+/// tail exists. A spawned cycle (or a competing sweep) then reaches retained
+/// history — the assertion that the Scribe append is durable — while the tail
+/// stays unretained, and the spawned cycle is aborted while holding nothing
+/// committed in Postgres, which is exactly the crash-before-settlement state.
+/// Releasing the fence and running the cycle again replays the identical frozen
+/// range into Scribe's batch fence. The frozen decisions must be retained
+/// exactly once, the tail must then be published by its own range, and the
+/// tenant must drain to zero.
 ///
 /// # Errors
 /// Returns the server, Postgres, projection, publication, or query failure.
@@ -274,23 +322,52 @@ async fn frozen_audit_range_replays_once_while_its_tail_waits() -> Result<(), Se
             .ok_or("a Scribe-bearing server composes the audit publisher")?,
     );
 
+    // The freeze and the tail commit together, so the tail is staged above a
+    // bound that is already live and no cycle can observe one without the other.
     let mut freezer = server.tenant_conn_for(tenant).await?;
     let range = freeze_publication_range(&mut freezer, 512)
         .await?
         .ok_or("three appended decisions owe a range")?;
-    freezer.commit().await?;
     assert_eq!(
         range, appended,
         "a drained tenant's frozen range must be exactly the three decisions appended together"
     );
+    let tail_seq = append_audit(&mut freezer, &decision(&tail_op)).await?;
+    assert!(
+        tail_seq > range.seq_hi,
+        "the tail {tail_seq} must stage above the frozen bound {range:?}"
+    );
 
-    let blocked = tokio::spawn({
-        let publisher = Arc::clone(&publisher);
-        async move { publisher.publish_tenant(tenant).await }
-    });
+    // The competitor queues on the chain head before the freeze commits, so it
+    // is granted the lock ahead of every settlement and must reuse the bound.
+    let mut competitor = server.tenant_conn_for(tenant).await?;
+    let competitor_pid = backend_pid(&mut competitor).await?;
+    let competing = async {
+        let range = freeze_publication_range(&mut competitor, 512).await?;
+        competitor.commit().await?;
+        Ok::<_, ServerJourneyError>(range)
+    };
+    let committing = async {
+        await_blocked_behind(&mut freezer, competitor_pid).await?;
+        let blocked = tokio::spawn({
+            let publisher = Arc::clone(&publisher);
+            async move { publisher.publish_tenant(tenant).await }
+        });
+        freezer.commit().await?;
+        Ok::<_, ServerJourneyError>(blocked)
+    };
+    let (competing, blocked) = tokio::try_join!(competing, committing)?;
+    assert_eq!(
+        competing,
+        Some(range),
+        "a competing cycle must reuse the frozen bound while the tail is staged above it"
+    );
+
     // The append is durable before settlement is attempted, so retained history
-    // sees the range while the fence still holds every Postgres effect back.
+    // sees the range while the fence still holds every Postgres effect back,
+    // and the staged tail stays out of every in-flight batch.
     await_retained(&server, tenant, &frozen_op, 3).await?;
+    await_retained(&server, tenant, &tail_op, 0).await?;
     blocked.abort();
     assert!(
         blocked.await.is_err(),
@@ -301,8 +378,6 @@ async fn frozen_audit_range_replays_once_while_its_tail_waits() -> Result<(), Se
     // The bound survived the abort, so this cycle replays the identical range.
     publisher.publish_tenant(tenant).await?;
     await_retained(&server, tenant, &frozen_op, 3).await?;
-
-    append_decision(&server, tenant, &tail_op).await?;
     await_retained(&server, tenant, &tail_op, 1).await?;
     await_retained(&server, tenant, &frozen_op, 3).await?;
     await_drained(&server, tenant).await?;

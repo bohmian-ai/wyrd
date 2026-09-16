@@ -485,11 +485,14 @@ impl OraclePeerService for OraclePeerGrpc {
             .gate()
             .ensure_query_open()
             .map_err(|error| crate::grpc::query::query_status(error.into()))?;
-        let stream = self
+        let forwarder = self
             .bifrost
             .query_forwarder()
             .ok_or(wyrd_spec::vala::error::BifrostError::OracleRoleUnavailable)
-            .map_err(|error| crate::grpc::query::query_status(error.into()))?
+            .map_err(|error| crate::grpc::query::query_status(error.into()))?;
+        #[cfg(feature = "test-support")]
+        forwarder.silent_peer_for_test().hold_if_armed().await;
+        let stream = forwarder
             .accept(ticket)
             .await
             .map_err(|error| crate::grpc::query::query_status(error.into()))?;

@@ -1294,6 +1294,129 @@ async fn query_edge_timeout_yields_to_oracle_deadline() -> Result<(), ServerJour
     Ok(())
 }
 
+/// A silent selected remote Oracle cannot hold an HTTP query past its deadline.
+///
+/// On a role-separated cluster the Scribe-only ingress owns no Oracle, so the
+/// public query is forwarded to a remote leader. Every Oracle is armed to park
+/// the forwarded envelope before acceptance, making the selected peer a
+/// connected replica that never answers. The HTTP request must still settle
+/// with the typed query timeout, exactly one envelope may arrive, and the
+/// ingress must cancel that parked call. Once disarmed, the same ingress serves
+/// a forwarded query successfully, proving the protected request was released.
+///
+/// # Errors
+/// Returns cluster setup, catalog, authentication, HTTP or frame decoding errors.
+///
+/// # Panics
+/// Panics if the silent peer receives other than one envelope or the follow-up
+/// query does not succeed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn silent_remote_oracle_delivery_yields_typed_query_timeout() -> Result<(), ServerJourneyError>
+{
+    let cluster = wyrd_testing::bifrost::WyrdTestCluster::start_spec(
+        wyrd_testing::bifrost::BifrostClusterSpec::role_separated(),
+    )
+    .await?;
+    let tenant = cluster.data_tenant_id();
+    let table = format!("silent_peer_{}", uuid::Uuid::now_v7().simple());
+    let ingress = cluster
+        .servers()
+        .find(|server| server.bifrost_scribe().is_some())
+        .ok_or("missing Scribe ingress")?;
+    assert!(
+        ingress.state().bifrost.oracle().is_none(),
+        "the ingress must forward"
+    );
+    ingress
+        .state()
+        .bifrost_catalog()
+        .ok_or("missing catalog")?
+        .create_table(CreateTableRequest {
+            table: TableRef::new(BifrostNamespace::Bifrost, &table),
+            user_fields: vec![Field::new("value", DataType::Int64, false)],
+            tenant,
+            physical_layout: None,
+            audit: None,
+        })
+        .await?;
+    cluster.refresh_oracle_snapshots().await?;
+    let base = ingress.base_url().ok_or("missing HTTP URL")?.to_owned();
+    await_server_ready(&base).await?;
+    let api_key = ingress
+        .bootstrap_service_in_tenant(tenant, "silent-peer-caller", &["admin"])
+        .await?
+        .api_key()
+        .ok_or("machine bootstrap returned no key")?
+        .clone();
+    let edge = EdgeTimeoutClient {
+        http: reqwest::Client::new(),
+        base,
+        token: ingress.exchange_api_key(&api_key).await?,
+    };
+    let peers = cluster
+        .servers()
+        .filter(|server| server.state().bifrost.oracle().is_some())
+        .map(|server| {
+            server
+                .state()
+                .bifrost
+                .silent_forward_peer_for_test()
+                .ok_or("an Oracle composed no forwarder")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for peer in &peers {
+        peer.set_armed(true);
+    }
+
+    let mut body = request(&format!("SELECT value FROM vala.bifrost.{table}"));
+    body.deadline_ms = Some(2_000);
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        edge.post("/v1/query").json(&body).send(),
+    )
+    .await
+    .map_err(|_| "a silent remote peer held the HTTP query past its deadline")??;
+    assert_eq!(problem_code(response).await?, "WYRD_VALA_504_QUERY_TIMEOUT");
+    let selected = peers
+        .iter()
+        .find(|peer| peer.counts().0 > 0)
+        .ok_or("no Oracle received the forwarded envelope")?;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        selected.wait_abandoned(1),
+    )
+    .await
+    .map_err(|_| "the ingress left the silent delivery parked")??;
+    assert_eq!(
+        peers.iter().map(|peer| peer.counts().0).sum::<usize>(),
+        1,
+        "one selected envelope and no successor delivery"
+    );
+
+    for peer in &peers {
+        peer.set_armed(false);
+    }
+    let body = request(&format!("SELECT value FROM vala.bifrost.{table}"));
+    let response = edge.post("/v1/query").json(&body).send().await?;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let mut decoder = wyrd_tonic::frame_codec::FrameDecoder::new(16 * 1024 * 1024);
+    let terminal = decoder
+        .push::<proto::QueryStreamFrame>(&response.bytes().await?)?
+        .into_iter()
+        .find_map(|frame| match frame.frame {
+            Some(proto::query_stream_frame::Frame::Terminal(terminal)) => Some(terminal.outcome),
+            _ => None,
+        });
+    assert_eq!(
+        terminal,
+        Some(proto::QueryTerminalOutcome::Success as i32),
+        "the released ingress still forwards successfully"
+    );
+    cluster.shutdown().await?;
+    Ok(())
+}
+
 /// Authenticated raw HTTP caller for the staged edge-timeout journey.
 struct EdgeTimeoutClient {
     /// Plain client without its own total timeout.

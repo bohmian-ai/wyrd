@@ -1729,6 +1729,15 @@ impl Bifrost {
             .await
     }
 
+    /// Borrows the test-only silent forwarding-peer switch of this replica.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn silent_forward_peer_for_test(&self) -> Option<&crate::oracle::SilentForwardPeer> {
+        self.query_forwarder
+            .as_ref()
+            .map(|forwarder| forwarder.silent_peer_for_test())
+    }
+
     /// Borrows the selected Oracle runtime.
     #[must_use]
     pub const fn oracle(&self) -> Option<&Arc<Oracle>> {

@@ -21,6 +21,8 @@ mod tail_audit;
 mod tail_authority;
 mod tail_discovery;
 
+#[cfg(feature = "test-support")]
+pub use forwarding::SilentForwardPeer;
 pub use forwarding::{ReadyOracleForwarder, ReadyOracleForwarderInputs};
 pub use lifecycle_controls::RunningQueryControls;
 pub use lifecycle_service::OracleLifecycleGrpc;

@@ -53,6 +53,82 @@ pub struct ReadyOracleForwarder {
     authority: Arc<OraclePeerAuthority>,
     /// Side-effect-free ingress classification owner.
     planner: OraclePlanner,
+    /// Test-only switch that makes this replica a silent forwarding peer.
+    #[cfg(feature = "test-support")]
+    silent_peer: SilentForwardPeer,
+}
+
+/// Test-only switch that stops inbound forwarded queries before any response.
+///
+/// When armed, the private peer handler parks each forwarded envelope forever
+/// before acceptance, so the replica behaves as a connected peer that never
+/// answers. The counters let a journey prove that exactly one envelope arrived
+/// and that the ingress cancelled the wait rather than leaving it parked.
+#[cfg(feature = "test-support")]
+#[derive(Debug)]
+pub struct SilentForwardPeer {
+    /// Whether newly arriving envelopes are parked.
+    armed: std::sync::atomic::AtomicBool,
+    /// Parked `(arrived, abandoned)` envelope counts, observable by waiters.
+    counts: tokio::sync::watch::Sender<(usize, usize)>,
+}
+
+#[cfg(feature = "test-support")]
+impl SilentForwardPeer {
+    /// Creates a disarmed switch with zero counts.
+    fn new() -> Self {
+        Self {
+            armed: std::sync::atomic::AtomicBool::new(false),
+            counts: tokio::sync::watch::Sender::new((0, 0)),
+        }
+    }
+
+    /// Arms or disarms parking for envelopes that arrive afterwards.
+    pub fn set_armed(&self, armed: bool) {
+        self.armed.store(armed, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Returns how many envelopes were parked and how many of those were dropped.
+    #[must_use]
+    pub fn counts(&self) -> (usize, usize) {
+        *self.counts.borrow()
+    }
+
+    /// Waits until at least `abandoned` parked envelopes have been dropped.
+    ///
+    /// # Errors
+    /// Returns an error only if the switch is dropped while waiting.
+    pub async fn wait_abandoned(
+        &self,
+        abandoned: usize,
+    ) -> Result<(), tokio::sync::watch::error::RecvError> {
+        self.counts
+            .subscribe()
+            .wait_for(|counts| counts.1 >= abandoned)
+            .await
+            .map(|_| ())
+    }
+
+    /// Parks forever when armed; returns immediately otherwise.
+    ///
+    /// The caller's future is cancelled when the peer transport drops the
+    /// request, which records the envelope as abandoned.
+    pub(crate) async fn hold_if_armed(&self) {
+        /// Counts the parked envelope as abandoned when its handler is dropped.
+        struct Abandon<'a>(&'a tokio::sync::watch::Sender<(usize, usize)>);
+        impl Drop for Abandon<'_> {
+            /// Records cancellation of the parked handler.
+            fn drop(&mut self) {
+                self.0.send_modify(|counts| counts.1 += 1);
+            }
+        }
+        if !self.armed.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        self.counts.send_modify(|counts| counts.0 += 1);
+        let _abandon = Abandon(&self.counts);
+        std::future::pending::<()>().await;
+    }
 }
 
 /// Presents the cluster-aware forwarder as the Gate's one SQL dispatch seam.
@@ -120,7 +196,16 @@ impl ReadyOracleForwarder {
             tls,
             authority,
             planner: OraclePlanner::new(config),
+            #[cfg(feature = "test-support")]
+            silent_peer: SilentForwardPeer::new(),
         }
+    }
+
+    /// Borrows this replica's test-only silent-peer switch.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub const fn silent_peer_for_test(&self) -> &SilentForwardPeer {
+        &self.silent_peer
     }
 
     /// Routes one already-authenticated public query to an exact ready Oracle.

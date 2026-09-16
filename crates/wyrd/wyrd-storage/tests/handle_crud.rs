@@ -22,6 +22,14 @@ use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle, ValidatedPath, ten
 
 /// Write/read/list/delete round-trip plus a missing-key `NotFound`, all through
 /// the public [`StorageHandle`] data-plane API.
+///
+/// Every object lives under a fresh tenant and Card prefix and is deleted before
+/// returning, so shared cloud buckets stay clean on success.
+///
+/// # Panics
+/// Panics when any put, get, list, or delete fails, the listing differs, or a
+/// deleted or missing key is not `ObjectNotFound`. A panic or cancellation
+/// mid-run can leave up to three small objects under that unique prefix.
 async fn run_handle_crud(handle: &StorageHandle) {
     let tenant = DataTenantId::new_v7();
     let card = uuid::Uuid::now_v7().to_string();
@@ -109,6 +117,11 @@ async fn configured_handle(kind: StorageBackendKind) -> Arc<StorageHandle> {
 }
 
 /// CRUD over a local handle rooted in a temporary directory.
+///
+/// Credential-free; runs under `test:storage:handle:emulators`.
+///
+/// # Panics
+/// Panics when the temporary root or signer cannot be built or CRUD fails.
 #[tokio::test]
 async fn local_handle_crud() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -119,18 +132,33 @@ async fn local_handle_crud() {
 }
 
 /// CRUD against the configured S3 or S3-compatible bucket.
+///
+/// Selected by the owning mise task; `WYRD_STORAGE_URL` must select S3.
+///
+/// # Panics
+/// Panics when the environment selects another backend or CRUD fails.
 #[tokio::test]
 async fn s3_handle_crud() {
     run_handle_crud(configured_handle(StorageBackendKind::S3).await.as_ref()).await;
 }
 
 /// CRUD against the configured GCS bucket or emulator.
+///
+/// Selected by the owning mise task; `WYRD_STORAGE_URL` must select GCS.
+///
+/// # Panics
+/// Panics when the environment selects another backend or CRUD fails.
 #[tokio::test]
 async fn gcs_handle_crud() {
     run_handle_crud(configured_handle(StorageBackendKind::Gcs).await.as_ref()).await;
 }
 
 /// CRUD against the configured Azure container or emulator.
+///
+/// Selected by the owning mise task; `WYRD_STORAGE_URL` must select Azure.
+///
+/// # Panics
+/// Panics when the environment selects another backend or CRUD fails.
 #[tokio::test]
 async fn azure_handle_crud() {
     run_handle_crud(configured_handle(StorageBackendKind::Azure).await.as_ref()).await;

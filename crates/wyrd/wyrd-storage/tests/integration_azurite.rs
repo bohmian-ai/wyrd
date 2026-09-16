@@ -1,3 +1,8 @@
+//! Azure signer contract tests against the Azurite emulator.
+//!
+//! Run by `test:storage:azurite` (part of `test:storage:matrix`), which selects
+//! the emulator through `WYRD_STORAGE_URL` and `WYRD_STORAGE_ENDPOINT_URL`.
+
 //! Azure Blob signer-layer integration tests against Azurite.
 //!
 //! The client-to-server transfer journey owns block upload and download
@@ -14,7 +19,9 @@ use wyrd_storage::error::{AzureError, StorageError};
 use wyrd_storage::settings::{self, BackendConfig};
 use wyrd_storage::{BackendSigner, UploadPlanReplayInput, ValidatedPath, factory};
 
+/// Block size used for multipart init and replay plans.
 const BLOCK_SIZE: u64 = 256 * 1024;
+/// Planned block count used for replay plans.
 const BLOCK_COUNT: u32 = 3;
 
 /// Build the Azure signer for the location and endpoint in `WYRD_STORAGE_URL`.
@@ -31,6 +38,10 @@ async fn build_signer() -> AzureSigner {
         .expect("Azure signer")
 }
 
+/// Tenant- and Card-unique validated path, so concurrent runs against a shared bucket never collide.
+///
+/// # Panics
+/// Never in practice: the freshly built path is valid for its own tenant.
 fn fresh_path(suffix: &str) -> ValidatedPath {
     let tenant = DataTenantId::new_v7();
     let card_uid = uuid::Uuid::now_v7();
@@ -38,6 +49,14 @@ fn fresh_path(suffix: &str) -> ValidatedPath {
     wyrd_storage::tenant_path::validate(&full, tenant).expect("tenant path")
 }
 
+/// Aborting an initialized Azure block upload leaves no committed blob.
+///
+/// Azure has no server-side upload to cancel, so abort may report the blob as
+/// already absent; either way `head` must then see `BlobNotFound`.
+///
+/// # Panics
+/// Panics when the environment does not select Azure, init fails, abort fails
+/// with any other error, or the blob exists afterwards.
 #[tokio::test]
 async fn azure_abort_lifecycle() {
     let signer = build_signer().await;
@@ -77,6 +96,11 @@ async fn azure_abort_on_nonexistent_blob_returns_error() {
     );
 }
 
+/// Replaying a stored Azure block-blob plan yields the same block geometry.
+///
+/// # Panics
+/// Panics when the environment does not select Azure, remint fails, or the plan
+/// differs from the replay input.
 #[tokio::test]
 async fn azure_remint_plan_produces_valid_plan() {
     let signer = build_signer().await;
@@ -99,6 +123,10 @@ async fn azure_remint_plan_produces_valid_plan() {
     );
 }
 
+/// `head` on a never-written blob returns typed `BlobNotFound`.
+///
+/// # Panics
+/// Panics when the environment does not select Azure or the error is untyped.
 #[tokio::test]
 async fn azure_head_on_missing_returns_blob_not_found() {
     assert!(matches!(
@@ -107,6 +135,10 @@ async fn azure_head_on_missing_returns_blob_not_found() {
     ));
 }
 
+/// `presign_part` through the backend dispatcher is a typed Azure capability mismatch.
+///
+/// # Panics
+/// Panics when the environment does not select Azure or dispatch returns anything else.
 #[tokio::test]
 async fn azure_capability_mismatch_is_typed_for_presign_part() {
     let backend = BackendSigner::Cloud(Box::new(CloudSigner::Azure(build_signer().await)));

@@ -29,21 +29,34 @@ use wyrd_spec::storage::{
 use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings, settings};
 use wyrd_testing::WyrdTestServer;
 
+/// Card identity every journey plans against; storage paths are scoped by tenant, so reuse is safe.
 const FIXED_CARD_UID: &str = "018f0000-0000-7000-8000-000000000001";
+/// Cloud payload size: above [`LOW_THRESHOLD_BYTES`], so cloud plans are multipart.
 const MULTIPART_PAYLOAD_BYTES: usize = 20 * 1024 * 1024;
+/// Multipart threshold lowered so a 20 MiB payload exercises multipart planning.
 const LOW_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
+/// Planned part size, yielding two parts for [`MULTIPART_PAYLOAD_BYTES`].
 const PLANNED_PART_BYTES: u64 = 16 * 1024 * 1024;
 
+/// Base64 SHA-256 digest in the form upload init and download verification expect.
 fn sha256_b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes))
 }
 
+/// Deterministic non-constant payload, so a misordered or truncated part changes the digest.
+///
+/// # Panics
+/// Never in practice: `index % 251` always fits `u8`.
 fn patterned_payload(len: usize) -> Vec<u8> {
     (0..len)
         .map(|index| u8::try_from(index % 251).expect("index modulo 251 fits u8"))
         .collect()
 }
 
+/// Builds a real `WyrdClient` bound to `srv` that authenticates with `token`.
+///
+/// # Panics
+/// Panics when the server is not bound or client auth/transport construction fails.
 fn client_for(srv: &WyrdTestServer, token: &str) -> WyrdClient {
     let base_url = srv
         .base_url()
@@ -65,6 +78,10 @@ fn client_for(srv: &WyrdTestServer, token: &str) -> WyrdClient {
     WyrdClient::from_parts(auth, transport, config.grpc)
 }
 
+/// Bootstraps a `writer`/`reader` service and exchanges its API key for a JWT.
+///
+/// # Panics
+/// Panics when bootstrap or key exchange fails.
 async fn bootstrap_service_jwt(srv: &WyrdTestServer, name: &str) -> String {
     let service = srv
         .bootstrap_service(name, &["writer", "reader"])
@@ -94,6 +111,7 @@ async fn server_from_settings(settings: StorageSettings) -> WyrdTestServer {
         .expect("start bound storage server")
 }
 
+/// Local-filesystem storage settings rooted at `root`, using the journey's multipart tuning.
 fn local_settings(root: &Path) -> StorageSettings {
     StorageSettings {
         backend: BackendConfig::Local {
@@ -169,6 +187,22 @@ async fn purge_journey_objects(settings: &StorageSettings, tenant: DataTenantId)
     }
 }
 
+/// Drives one complete upload → download round trip through the real client and server.
+///
+/// Starts a bound server over `settings`, initializes an upload for
+/// `relative_path` (512 KiB for `local/` paths, otherwise a multipart payload),
+/// uploads and completes it through `WyrdStorageClient`, plans a download, and
+/// streams it back with digest and size verification. The server is shut down
+/// and every object the run could produce is purged *before* the download
+/// outcome is asserted, so a failed transfer still cleans shared cloud buckets.
+///
+/// # Panics
+/// Panics when server start, bootstrap, upload init/transfer/complete, download
+/// init, shutdown, or cleanup fails, or when the verified bytes differ.
+///
+/// Cancellation or a panic before cleanup can leave the uploaded artifact and
+/// audit metadata under this run's tenant prefixes; the next run's purge only
+/// covers its own tenant, so such residue must be removed manually.
 async fn run_client_server_journey(settings: StorageSettings, relative_path: &str) {
     let srv = server_from_settings(settings.clone()).await;
     let tenant = srv.data_tenant_id();
@@ -254,6 +288,10 @@ async fn run_client_server_journey(settings: StorageSettings, relative_path: &st
     );
 }
 
+/// Local-backend client/server round trip; always runs in the workspace lane.
+///
+/// # Panics
+/// Panics when the temporary root cannot be created or the journey fails.
 #[tokio::test(flavor = "current_thread")]
 async fn local_client_server_round_trip() {
     let storage_root = tempfile::tempdir().expect("storage root creates");
@@ -345,6 +383,11 @@ async fn storage_routes_refuse_and_audit_an_unprivileged_caller() {
     srv.shutdown().await.expect("test server shuts down");
 }
 
+/// A local upload capability refuses raw storage paths and mismatched bytes, then accepts the declared bytes.
+///
+/// # Panics
+/// Panics when setup fails, the plan is not `LocalFs`, either negative request is
+/// accepted or refused with the wrong code, or the valid upload fails.
 #[tokio::test(flavor = "current_thread")]
 async fn local_upload_capability_rejects_raw_paths_and_bad_bytes() {
     let storage_root = tempfile::tempdir().expect("storage root creates");
@@ -406,6 +449,11 @@ async fn local_upload_capability_rejects_raw_paths_and_bad_bytes() {
 }
 
 /// Multipart client/server round trip against the configured S3 or S3-compatible bucket.
+///
+/// Selected by the owning mise task; `WYRD_STORAGE_URL` must select S3.
+///
+/// # Panics
+/// Panics when the environment selects another backend or the journey fails.
 #[tokio::test(flavor = "current_thread")]
 async fn s3_multipart_e2e() {
     run_client_server_journey(
@@ -416,6 +464,11 @@ async fn s3_multipart_e2e() {
 }
 
 /// Multipart client/server round trip against the configured GCS bucket or emulator.
+///
+/// Selected by the owning mise task; `WYRD_STORAGE_URL` must select GCS.
+///
+/// # Panics
+/// Panics when the environment selects another backend or the journey fails.
 #[tokio::test(flavor = "current_thread")]
 async fn gcs_multipart_e2e() {
     run_client_server_journey(
@@ -426,6 +479,11 @@ async fn gcs_multipart_e2e() {
 }
 
 /// Multipart client/server round trip against the configured Azure container or emulator.
+///
+/// Selected by the owning mise task; `WYRD_STORAGE_URL` must select Azure.
+///
+/// # Panics
+/// Panics when the environment selects another backend or the journey fails.
 #[tokio::test(flavor = "current_thread")]
 async fn azure_multipart_e2e() {
     run_client_server_journey(

@@ -57,6 +57,8 @@ impl EdgeTimeoutLayer {
 }
 
 impl<S> Layer<S> for EdgeTimeoutLayer {
+    /// Staged timeout service placed around the protected body-limit,
+    /// authentication, and route stack.
     type Service = EdgeTimeout<S>;
 
     /// Wraps `inner` with the staged edge timer.
@@ -86,11 +88,20 @@ where
     S::Error: Into<BoxError>,
     S::Future: Send + 'static,
 {
+    /// Response produced unchanged by the wrapped protected stack.
     type Response = S::Response;
+    /// Boxed error carrying either an inner-stack failure or edge [`Elapsed`],
+    /// which the outer error handler maps to the request-timeout problem.
     type Error = BoxError;
+    /// Future racing the inner call against the edge limit until completion
+    /// or query handoff.
     type Future = EdgeFuture<S::Response>;
 
     /// Delegates readiness to the wrapped stack.
+    ///
+    /// # Errors
+    ///
+    /// Returns the wrapped stack's readiness failure, boxed.
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx).map_err(Into::into)
     }
@@ -100,6 +111,11 @@ where
     ///
     /// Expiry drops the in-flight call, cancelling pre-Oracle work, and returns
     /// [`Elapsed`] for the existing request-timeout problem mapping.
+    ///
+    /// # Errors
+    ///
+    /// The returned future resolves to the wrapped stack's failure, boxed, or to
+    /// [`Elapsed`] when the edge limit passes before completion or query handoff.
     fn call(&mut self, mut request: Request<Body>) -> Self::Future {
         let handoff = (request.method() == Method::POST && request.uri().path() == QUERY_PATH)
             .then(|| {

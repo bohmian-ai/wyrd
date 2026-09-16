@@ -127,10 +127,12 @@ impl ReadyOracleForwarder {
     ///
     /// Candidate connections are attempted before the immutable cut is created. Once a local
     /// or connected remote leader is selected and signed, the request is delivered exactly once;
-    /// every delivery-time transport result is terminal and is never retried.
+    /// every delivery-time transport result is terminal and is never retried. The request's
+    /// captured deadline also bounds remote delivery until the selected peer first responds.
     ///
     /// # Errors
-    /// Returns a closed validation, catalog, role, transport, security, or execution failure.
+    /// Returns a closed validation, catalog, role, transport, security, timeout, or execution
+    /// failure.
     pub async fn forward(
         &self,
         context: AuthorizedQueryContext,
@@ -485,9 +487,19 @@ where
 }
 
 /// Owns remote selection, same-snapshot envelope construction, and one terminal delivery.
+///
+/// The one monotonic query `deadline` captured at ingress bounds both candidate
+/// connection and the selected delivery through receipt of the peer's first
+/// response. On expiry the in-flight delivery future is dropped, cancelling its
+/// credential acquisition or pending peer call, and no successor is attempted.
+///
+/// # Errors
+/// Returns [`BifrostError::OracleRoleUnavailable`] when no candidate connects,
+/// [`BifrostError::QueryTimeout`] when the deadline passes before connection or
+/// before delivery returns, or the envelope or delivery failure unchanged.
 async fn route_remote_once<C, E, O, I, CF, CFut, EF, DF, DFut>(
     candidates: I,
-    connect_deadline: Instant,
+    deadline: Instant,
     attempt: ForwardingAttempt,
     connect: CF,
     make_envelope: EF,
@@ -501,12 +513,16 @@ where
     DF: FnOnce((NodeId, u64), C, E, wyrd_spec::vala::api::VisibilityMode) -> DFut,
     DFut: Future<Output = Result<O, BifrostError>>,
 {
-    let (leader, connected) =
-        connect_before_delivery(candidates, connect_deadline, connect).await?;
+    let (leader, connected) = connect_before_delivery(candidates, deadline, connect).await?;
     let claims = attempt.into_claims(leader)?;
     let visibility = claims.request.visibility;
     let envelope = make_envelope(&claims)?;
-    deliver(leader, connected, envelope, visibility).await
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or(BifrostError::QueryTimeout)?;
+    tokio::time::timeout(remaining, deliver(leader, connected, envelope, visibility))
+        .await
+        .map_err(|_| BifrostError::QueryTimeout)?
 }
 
 /// The caller-supplied inputs one forwarding attempt signs into its envelope.
@@ -935,6 +951,76 @@ mod tests {
                 .expect("ambiguous delivery lock")[0]
                 .0,
             (first, 11)
+        );
+    }
+
+    /// Records whether a pending delivery future was dropped rather than completed.
+    struct DropProbe(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for DropProbe {
+        /// Marks the owning delivery wait as cancelled.
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// A connected peer that never answers cannot hold delivery past the query deadline.
+    ///
+    /// Paused time advances only once every task is idle on a timer, so the
+    /// test is deterministic: the silent delivery is cancelled with the typed
+    /// timeout, exactly one envelope was delivered, and no other candidate is
+    /// connected afterwards.
+    #[tokio::test(start_paused = true)]
+    async fn silent_selected_delivery_times_out_once_and_is_cancelled() {
+        let observed_at = chrono::Utc::now();
+        let leases = vec![oracle_lease(1, 11), oracle_lease(2, 22)];
+        let snapshot = ClusterSnapshot::observed(leases, observed_at);
+        let connects = Arc::new(Mutex::new(0_usize));
+        let deliveries = Arc::new(Mutex::new(0_usize));
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (context, request) = query_input();
+        let error = route_remote_once(
+            eligible_oracle_candidates(&snapshot)
+                .into_iter()
+                .map(|lease| (lease.key.node_id, lease.fencing_token, lease.address)),
+            Instant::now() + Duration::from_millis(50),
+            ForwardingAttempt {
+                context,
+                request,
+                now: observed_at,
+                wall_deadline: observed_at + chrono::Duration::milliseconds(50),
+            },
+            {
+                let connects = Arc::clone(&connects);
+                move |_node_id, _address| {
+                    *connects.lock().expect("connect lock") += 1;
+                    async { Ok(()) }
+                }
+            },
+            |claims| Ok(claims.clone()),
+            {
+                let deliveries = Arc::clone(&deliveries);
+                let cancelled = Arc::clone(&cancelled);
+                move |_leader, (), _envelope: ForwardQueryClaims, _visibility| {
+                    *deliveries.lock().expect("delivery lock") += 1;
+                    async move {
+                        let _probe = DropProbe(cancelled);
+                        std::future::pending::<Result<(), BifrostError>>().await
+                    }
+                }
+            },
+        )
+        .await;
+        assert!(matches!(error, Err(BifrostError::QueryTimeout)));
+        assert!(
+            cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            "expiry drops the in-flight delivery wait"
+        );
+        assert_eq!(*deliveries.lock().expect("delivery lock"), 1);
+        assert_eq!(
+            *connects.lock().expect("connect lock"),
+            1,
+            "a timed-out delivery starts no successor"
         );
     }
 }

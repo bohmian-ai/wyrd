@@ -58,10 +58,11 @@ export AWS_REGION=us-east-1
 
 ## GCS
 
-Google Cloud Storage. Credentials resolve in order: inline service account JSON, a service account key file, then Application Default Credentials (gcloud config, Workload Identity).
+Google Cloud Storage. Credentials resolve in order: base64 or inline service account JSON, a service account key file, then Application Default Credentials (gcloud config, Workload Identity).
 
 | Variable | Notes |
 | --- | --- |
+| `GOOGLE_ACCOUNT_JSON_BASE64` | Base64-encoded service account JSON. Checked first. |
 | `GOOGLE_APPLICATION_CREDENTIALS_JSON` | Inline service account JSON. |
 | `GOOGLE_APPLICATION_CREDENTIALS` | Path to a service account key file. |
 | (Application Default Credentials) | gcloud config or Workload Identity, used if neither of the above is set. |
@@ -90,6 +91,22 @@ export WYRD_STORAGE_ENDPOINT_URL=https://minio.internal:9000
 ```
 
 GCS and Azure accept an endpoint only in builds with the `emulator` feature, for fake-gcs-server and Azurite. For Azurite the endpoint is the complete service URL including the account (`http://127.0.0.1:10000/devstoreaccount1`) and the account key comes from `AZURE_STORAGE_ACCOUNT_KEY`. A production build refuses to start when GCS or Azure has an endpoint rather than sign against the real provider.
+
+## Testing storage changes
+
+Every test lane selects its backend the same way a deployment does: `WYRD_STORAGE_URL`, plus `WYRD_STORAGE_ENDPOINT_URL` for an emulator, with credentials from the provider's standard chain.
+
+- **Pull requests** run the emulator matrix (`mise run storage:up`, then `mise run test:storage:matrix`) when storage code changes. It covers RustFS, fake-gcs-server, Azurite, and the local backend, needs no cloud credentials, and never exposes secrets to a pull request.
+- **Merges to `main`** run the credentialed real-cloud workflow: one job each for S3, GCS, and Azure, authenticated through OIDC federation, running `mise run test:storage:s3:cloud`, `test:storage:gcs:cloud`, and `test:storage:azure:cloud`. It has no schedule and no manual trigger.
+- **Before merging** a change that touches a cloud backend, run the same cloud tasks locally against your own buckets. Keep the bucket URLs in an untracked `mise.local.toml` so nothing else inherits them:
+
+```toml
+[tasks."storage:s3:dev"]
+env = { WYRD_STORAGE_URL = "s3://my-dev-bucket" }
+run = "mise run test:storage:s3:cloud"
+```
+
+Authenticate with the provider CLI first (`aws`, `gcloud auth application-default login`, `az login`). Each cloud task starts its own test Postgres and cleans up the objects it writes.
 
 ## Related
 

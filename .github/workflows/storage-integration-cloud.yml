@@ -7,20 +7,17 @@ name: storage-integration-cloud
 # signed URLs, Azure user-delegation SAS, virtual-host vs path-style addressing
 # against real endpoints, and provider-specific error shapes.
 #
-# Triggers on main-branch pushes and a weekly Monday cron. Never runs on PRs
-# from forks (credential exposure risk).
+# Triggers only on pushes to main: no schedule and no manual dispatch, and never
+# on pull requests (credential exposure risk). Before merging a cloud-backend
+# change, run the same `test:storage:<provider>:cloud` tasks locally against dev
+# buckets configured in an untracked mise.local.toml.
 #
-# Activation: populate the repository secrets listed below, then un-comment the
-# `schedule` trigger. Until secrets are provisioned the workflow file can safely
-# land with only the `push` trigger — the jobs will fail at credential setup and
+# Until the secrets below are provisioned the jobs fail at credential setup and
 # surface a clear error rather than silently skipping.
 
 on:
   push:
     branches: [main]
-  # Activate by un-commenting after secrets are populated:
-  # schedule:
-  #   - cron: '0 6 * * 1'   # 06:00 UTC every Monday
 
 # Required repository secrets:
 #   AWS_CLOUD_ROLE_ARN          — IAM role ARN for OIDC assumption (e.g. arn:aws:iam::ACCOUNT:role/wyrd-ci-storage)

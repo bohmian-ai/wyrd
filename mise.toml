@@ -708,7 +708,7 @@ depends = ["test:storage:s3:cloud", "test:storage:gcs:cloud", "test:storage:azur
 [tasks."test:storage:matrix"]
 hide = true
 description = """Run all storage emulator integration tests (signer-tier + operator data-plane + server e2e); requires storage:up.
-Offline-only storage tests (integration_local, handle_crud::local_handle_crud) are NOT here -- they run in test:rust:workspace via `cargo nextest run -p wyrd-storage`.
+Offline integration_local runs in test:rust:workspace; handle_crud::local_handle_crud runs under test:storage:handle:emulators because its binary requires the emulator feature.
 """
 depends = ["test:storage:gcs-emu", "test:storage:rustfs", "test:storage:azurite", "test:storage:handle:emulators", "test:storage:e2e"]
 
@@ -735,8 +735,9 @@ run = "cargo nextest run -p wyrd-storage --all-features --test handle_crud -E 't
 
 [tasks."test:storage:handle:emulators"]
 hide = true
-description = "Run all StorageHandle CRUD tests against cloud emulators; requires storage:up"
+description = "Run all StorageHandle CRUD tests: the three cloud emulators plus the local temporary-root handle; requires storage:up"
 depends = ["test:storage:handle:s3-emu", "test:storage:handle:gcs-emu", "test:storage:handle:azure-emu"]
+run = "cargo nextest run -p wyrd-storage --all-features --test handle_crud -E 'test(=local_handle_crud)'"
 
 [tasks."check:storage:drift"]
 hide = true

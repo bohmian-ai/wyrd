@@ -57,14 +57,23 @@ async fn azure_abort_lifecycle() {
     ));
 }
 
+/// Aborting a never-written blob through [`BackendSigner`] must reach
+/// [`AzureSigner`] and fail, not dispatch to a capability mismatch or report
+/// silent success.
+///
+/// # Panics
+/// Panics when the environment does not select Azure, the abort succeeds, or
+/// dispatch returns `BackendCapabilityMismatch`.
 #[tokio::test]
 async fn azure_abort_on_nonexistent_blob_returns_error() {
+    let backend = BackendSigner::Cloud(Box::new(CloudSigner::Azure(build_signer().await)));
+    let error = backend
+        .abort_multipart(&fresh_path("never-written.bin"), "unused")
+        .await
+        .expect_err("Azure abort must return Err when no blob exists, not Ok(())");
     assert!(
-        build_signer()
-            .await
-            .abort_multipart(&fresh_path("never-written.bin"))
-            .await
-            .is_err()
+        !matches!(error, StorageError::BackendCapabilityMismatch { .. }),
+        "Azure abort must dispatch to AzureSigner, not return capability mismatch: {error}"
     );
 }
 

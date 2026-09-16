@@ -825,6 +825,18 @@ pub struct ForgeWorkerCompletionObserver {
     /// Release for the one completed handoff held by the passive barrier.
     #[cfg(feature = "test-support")]
     handoff_pause_release: Arc<tokio::sync::Notify>,
+    /// One-shot passive barrier after the next rewrite's live-operation settlement.
+    #[cfg(feature = "test-support")]
+    pause_after_next_rewrite_settlement: Arc<AtomicBool>,
+    /// Whether a rewrite is currently held after its live-operation settlement.
+    #[cfg(feature = "test-support")]
+    rewrite_settlement_paused: Arc<AtomicBool>,
+    /// Wakeup for tests waiting until the settled rewrite is held.
+    #[cfg(feature = "test-support")]
+    rewrite_settlement_pause_ready: Arc<tokio::sync::Notify>,
+    /// Release for the one rewrite held after its live-operation settlement.
+    #[cfg(feature = "test-support")]
+    rewrite_settlement_pause_release: Arc<tokio::sync::Notify>,
     /// One-shot injected failure of the next healthy-worker registration.
     #[cfg(feature = "test-support")]
     fail_next_registration: Arc<AtomicBool>,
@@ -1324,6 +1336,41 @@ impl ForgeWorkerCompletionObserver {
         self.handoff_pause_release.notify_one();
     }
 
+    /// Hold the next rewrite once its live-operation settlement barrier passed.
+    ///
+    /// The barrier is passive and sits after the attempt reconciled every live
+    /// operation on its table — recovering or resetting what a released
+    /// attempt left — and before managed planning reads the table. It never
+    /// changes a reconciliation verdict, skips IO, plans, or settles: a held
+    /// rewrite resumes into exactly the decisions it would have taken without
+    /// the barrier. Tests use it to observe a successor's recovery as durable
+    /// and then stop the worker before any new effect exists.
+    #[cfg(feature = "test-support")]
+    pub fn hold_after_next_rewrite_settlement_for_test(&self) {
+        self.rewrite_settlement_paused
+            .store(false, Ordering::Release);
+        self.pause_after_next_rewrite_settlement
+            .store(true, Ordering::Release);
+    }
+
+    /// Wait until the armed post-settlement rewrite barrier is holding one rewrite.
+    #[cfg(feature = "test-support")]
+    pub async fn wait_for_held_rewrite_settlement_for_test(&self) {
+        loop {
+            let notified = self.rewrite_settlement_pause_ready.notified();
+            if self.rewrite_settlement_paused.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Release the one rewrite held after its live-operation settlement.
+    #[cfg(feature = "test-support")]
+    pub fn release_held_rewrite_settlement_for_test(&self) {
+        self.rewrite_settlement_pause_release.notify_one();
+    }
+
     /// Hold the next dispatch that returned durable settlement.
     ///
     /// The barrier is passive and sits immediately after the dispatch returned
@@ -1663,6 +1710,23 @@ impl ForgeWorkerCompletionObserver {
         self.attempt_pause_ready.notify_waiters();
         self.attempt_pause_release.notified().await;
         self.attempt_paused.store(false, Ordering::Release);
+    }
+
+    /// Pause once after an armed rewrite passed its live-operation settlement.
+    #[cfg(feature = "test-support")]
+    async fn pause_after_rewrite_settlement_for_test(&self) {
+        if !self
+            .pause_after_next_rewrite_settlement
+            .swap(false, Ordering::AcqRel)
+        {
+            return;
+        }
+        self.rewrite_settlement_paused
+            .store(true, Ordering::Release);
+        self.rewrite_settlement_pause_ready.notify_waiters();
+        self.rewrite_settlement_pause_release.notified().await;
+        self.rewrite_settlement_paused
+            .store(false, Ordering::Release);
     }
 
     /// Pause once after an armed managed rewrite handoff exists.
@@ -2884,6 +2948,18 @@ redacted
     async fn pause_after_attempt_for_test(&self, task_id: Uuid) {
         if let Some(observer) = &self.completion_observer {
             observer.pause_after_attempt_for_test(task_id).await;
+        }
+    }
+
+    /// Apply the observer's one-shot passive post-reconciliation rewrite barrier.
+    ///
+    /// Called by a rewrite attempt after its live-operation settlement barrier
+    /// passed and before managed planning. Without an armed observer it is a
+    /// no-op, so no production decision depends on it.
+    #[cfg(feature = "test-support")]
+    async fn pause_after_rewrite_settlement_for_test(&self) {
+        if let Some(observer) = &self.completion_observer {
+            observer.pause_after_rewrite_settlement_for_test().await;
         }
     }
 
@@ -5106,6 +5182,8 @@ redacted
     ) -> Result<RewriteAdmission, ForgeError> {
         self.rewrite_settlement_barrier(claim, binding, lease, stop)
             .await?;
+        #[cfg(feature = "test-support")]
+        self.pause_after_rewrite_settlement_for_test().await;
         let rewrite = self
             .forge
             .managed_rewrite(binding, claim.task_id, attempt, stop)?;

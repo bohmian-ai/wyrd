@@ -2570,19 +2570,36 @@ async fn unresolved_commit_resets_once_absence_is_provable(
         .fixture
         .expire_claims_of(promoted.fixture.tenant)
         .await;
+    // The successor is held once its reconciliation settled the operation and
+    // before it plans anything new, so the stop below lands at a pre-effect
+    // checkpoint rather than racing a fresh publication.
+    supervisor
+        .observer()
+        .hold_after_next_rewrite_settlement_for_test();
     supervisor.reclaim_expired_claims().await;
     promoted.fixture.clear_task_backoff().await;
+    tokio::time::timeout(
+        ADMISSION_BOUND,
+        supervisor
+            .observer()
+            .wait_for_held_rewrite_settlement_for_test(),
+    )
+    .await
+    .expect("the successor settles the recovered operation");
     await_operation_phase(&promoted.fixture, &unresolved, &["reset"]).await;
+    supervisor.worker_stop().cancel();
+    supervisor
+        .observer()
+        .release_held_rewrite_settlement_for_test();
     supervisor.stop_worker().await;
     // A release reports nothing, and the successor that recovered the operation
     // was still working when this worker was stopped, so the stop's own error is
-    // the only one an attempt is allowed to have returned here. The stop can
-    // land at a checkpoint or at the publication authority check, which refuses
-    // as `Cancelled`; either is the stop, never a failure of the release.
+    // the only one an attempt is allowed to have returned here.
     assert!(
-        supervisor.returned_errors().iter().all(|error| {
-            error.contains("shut down") || error.contains("refused before commit: Cancelled")
-        }),
+        supervisor
+            .returned_errors()
+            .iter()
+            .all(|error| error.contains("shut down")),
         "a released attempt reports no failure; its operation is settled from durable state: {:?}",
         supervisor.returned_errors()
     );

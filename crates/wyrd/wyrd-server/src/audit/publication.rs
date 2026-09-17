@@ -99,6 +99,16 @@ pub struct AuditPublisher {
     /// server's own sweep publishes the same tenant. Production never sets it.
     #[cfg(feature = "test-support")]
     appended: Option<tokio::sync::watch::Sender<Option<AuditPublicationRange>>>,
+    /// Test-only pause between reading a frozen range and appending it.
+    ///
+    /// Set only through [`AuditPublisher::pause_before_append`]. The sender
+    /// reports arrival at the pause; the cycle resumes once the semaphore
+    /// grants it a permit. Production never sets it.
+    #[cfg(feature = "test-support")]
+    append_pause: Option<(
+        tokio::sync::watch::Sender<bool>,
+        Arc<tokio::sync::Semaphore>,
+    )>,
 }
 
 impl AuditPublisher {
@@ -124,7 +134,31 @@ impl AuditPublisher {
             interval: PUBLICATION_INTERVAL,
             #[cfg(feature = "test-support")]
             appended: None,
+            #[cfg(feature = "test-support")]
+            append_pause: None,
         })
+    }
+
+    /// Hold every cycle of this instance after it reads its frozen range and
+    /// before its Scribe append.
+    ///
+    /// The receiver turns `true` once a cycle has read its range and is
+    /// waiting; each permit added to the returned semaphore releases one
+    /// waiting cycle. A test uses it to order this instance's append after
+    /// another actor's crash while the range read already happened ahead of
+    /// any settlement. Only this instance pauses; the server's own sweep is
+    /// built separately and never waits. Calling it again replaces the pause.
+    #[cfg(feature = "test-support")]
+    pub fn pause_before_append(
+        &mut self,
+    ) -> (
+        tokio::sync::watch::Receiver<bool>,
+        Arc<tokio::sync::Semaphore>,
+    ) {
+        let (reached, receiver) = tokio::sync::watch::channel(false);
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        self.append_pause = Some((reached, Arc::clone(&release)));
+        (receiver, release)
     }
 
     /// Report every range this instance durably appends, before it settles.
@@ -263,6 +297,13 @@ impl AuditPublisher {
         range: AuditPublicationRange,
     ) -> Result<(), AuditPublicationError> {
         let rows = self.read_range(tenant, range).await?;
+        #[cfg(feature = "test-support")]
+        if let Some((reached, release)) = &self.append_pause {
+            reached.send_replace(true);
+            if let Ok(permit) = release.acquire().await {
+                permit.forget();
+            }
+        }
         if rows.is_empty() {
             tracing::debug!(
                 %tenant,

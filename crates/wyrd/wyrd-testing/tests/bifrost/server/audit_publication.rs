@@ -354,8 +354,11 @@ async fn frozen_bound(
 /// competes — and retained history sees it while the tail stays unretained.
 /// With every settlement held by the fence, `crashing` is aborted, which is
 /// exactly the crash-after-append, before-settlement state, and the bound is
-/// read back unchanged. Releasing the fence lets `survivor` finish: it must
-/// report publishing exactly the reused bound, with the tail excluded. The
+/// read back unchanged. `survivor` read the same range before any settlement
+/// and is paused before its append; only after the abort is it released, and
+/// it must report its own Scribe append of exactly that range, tail excluded,
+/// while the fence still blocks settlement and the bound stays live. Releasing
+/// the fence then lets it settle the reused bound. The
 /// frozen decisions must be retained exactly once, the tail must then be
 /// published by its own later range, and the tenant must drain to zero.
 ///
@@ -399,9 +402,12 @@ async fn frozen_audit_range_replays_once_while_its_tail_waits() -> Result<(), Se
     // each is granted the lock ahead of every settlement — no cycle can append,
     // and so none can settle, until the freeze commits — and must reuse the
     // bound. The SQL freeze pins that seam directly; `survivor` and `crashing`
-    // are two full production cycles, and only `crashing` reports its append.
-    let survivor_publisher = AuditPublisher::from_state(server.state())
+    // are two full production cycles. `survivor` pauses after reading the
+    // frozen range, so its own append can only follow the crash.
+    let mut survivor_publisher = AuditPublisher::from_state(server.state())
         .ok_or("a Scribe-bearing server composes the audit publisher")?;
+    let mut survivor_appended = survivor_publisher.observe_appends();
+    let (mut survivor_paused, survivor_release) = survivor_publisher.pause_before_append();
     let mut crashing_publisher = AuditPublisher::from_state(server.state())
         .ok_or("a Scribe-bearing server composes the audit publisher")?;
     let mut crashing_appended = crashing_publisher.observe_appends();
@@ -443,10 +449,21 @@ async fn frozen_audit_range_replays_once_while_its_tail_waits() -> Result<(), Se
     );
     await_retained(&server, tenant, &frozen_op, 3).await?;
     await_retained(&server, tenant, &tail_op, 0).await?;
+    tokio::time::timeout(
+        PUBLICATION_BUDGET,
+        survivor_paused.wait_for(|paused| *paused),
+    )
+    .await
+    .map_err(|_| "the surviving cycle never read its frozen range")??;
     await_blocked_backends(&mut fence, 1).await?;
     assert!(
         !crashing.is_finished() && !survivor.is_finished(),
         "no cycle may settle while the fence holds the frozen rows"
+    );
+    assert_eq!(
+        *survivor_appended.borrow(),
+        None,
+        "the surviving cycle must not append before the crashing cycle is cancelled"
     );
     crashing.abort();
     assert!(
@@ -458,10 +475,34 @@ async fn frozen_audit_range_replays_once_while_its_tail_waits() -> Result<(), Se
         Some(range.seq_hi),
         "the frozen bound must survive the aborted cycle"
     );
+
+    // Only now may the surviving cycle append: it replays exactly the frozen
+    // range into Scribe's batch fence while the fence still blocks settlement.
+    survivor_release.add_permits(1);
+    tokio::time::timeout(
+        PUBLICATION_BUDGET,
+        survivor_appended.wait_for(|appended| appended.is_some()),
+    )
+    .await
+    .map_err(|_| "the surviving cycle never replayed its durable append")??;
+    assert_eq!(
+        *survivor_appended.borrow(),
+        Some(range),
+        "the surviving cycle must replay exactly the frozen range, without the tail"
+    );
+    assert!(
+        !survivor.is_finished(),
+        "the replaying cycle must not settle while the fence holds the frozen rows"
+    );
+    assert_eq!(
+        frozen_bound(&server, tenant).await?,
+        Some(range.seq_hi),
+        "the frozen bound must stay live through the replay"
+    );
+    await_retained(&server, tenant, &frozen_op, 3).await?;
+    await_retained(&server, tenant, &tail_op, 0).await?;
     release_fence(fence).await?;
 
-    // The surviving cycle froze the identical bound before any settlement, so
-    // it replays exactly the frozen range into Scribe's batch fence.
     let survived = survivor.await??;
     assert!(
         matches!(
@@ -469,8 +510,7 @@ async fn frozen_audit_range_replays_once_while_its_tail_waits() -> Result<(), Se
             PublishOutcome::Published { seq_lo, seq_hi, .. }
                 if seq_lo == range.seq_lo && seq_hi == range.seq_hi
         ),
-        "the surviving cycle must publish the reused bound {range:?} with the tail excluded, \
-         got {survived:?}"
+        "the surviving cycle must settle the reused bound {range:?}, got {survived:?}"
     );
     await_retained(&server, tenant, &frozen_op, 3).await?;
     await_retained(&server, tenant, &tail_op, 1).await?;

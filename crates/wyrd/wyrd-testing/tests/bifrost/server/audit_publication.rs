@@ -1,11 +1,9 @@
-use std::sync::Arc;
-
 use vala_bifrost_redux::oracle::peer::PeerSecurityAudit;
 use vala_sql::TenantConn;
 use vala_sql::queries::audit_staging::{
     AuditPublicationRange, append_audit, freeze_publication_range, list_publication_batch,
 };
-use wyrd_server::audit::publication::AuditPublisher;
+use wyrd_server::audit::publication::{AuditPublisher, PublishOutcome};
 use wyrd_server::oracle::PostgresPeerSecurityAudit;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
@@ -265,6 +263,67 @@ async fn await_blocked_behind(
     }
 }
 
+/// Waits until at least `waiters` backends are blocked on a lock.
+///
+/// Postgres queues a second waiter for a row behind the first waiter's tuple
+/// lock rather than behind the row's holder, so a queue of unnamed production
+/// cycles is observed as a count of every backend `pg_blocking_pids` reports
+/// blocked. The journey serializes its lane, so each such backend is part of
+/// this interleaving. The check runs on `conn` and takes no lock of its own;
+/// it clears the activity snapshot first, because Postgres otherwise keeps the
+/// backend list of the first read for the rest of the transaction and never
+/// sees a cycle whose pooled connection opened later.
+///
+/// # Errors
+/// Returns the query failure, or a timeout naming the last observed count.
+async fn await_blocked_backends(
+    conn: &mut TenantConn<'_>,
+    waiters: i64,
+) -> Result<(), ServerJourneyError> {
+    let deadline = std::time::Instant::now() + PUBLICATION_BUDGET;
+    loop {
+        sqlx::query("SELECT pg_stat_clear_snapshot()")
+            .execute(&mut **conn.transaction())
+            .await?;
+        let queued: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+              WHERE cardinality(pg_blocking_pids(pid)) > 0",
+        )
+        .fetch_one(&mut **conn.transaction())
+        .await?;
+        if queued >= waiters {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "only {queued} of {waiters} backends blocked within {PUBLICATION_BUDGET:?}"
+            )
+            .into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// Reads the tenant's in-flight publication bound without taking its lock.
+///
+/// A plain read of `audit_chain_head` is not blocked by a settlement holding
+/// the row, so it observes the committed bound mid-interleaving.
+///
+/// # Errors
+/// Returns the tenant-connection or query failure Postgres raised.
+async fn frozen_bound(
+    server: &WyrdTestServer,
+    tenant: DataTenantId,
+) -> Result<Option<i64>, ServerJourneyError> {
+    let mut conn = server.tenant_conn_for(tenant).await?;
+    let bound: Option<i64> =
+        sqlx::query_scalar("SELECT publishing_seq_hi FROM vala.audit_chain_head")
+            .fetch_one(&mut **conn.transaction())
+            .await?;
+    conn.commit().await?;
+    Ok(bound)
+}
+
 /// A frozen audit range replays exactly once while its tail waits behind it.
 ///
 /// Three hazards share this boundary and none of them is visible to a test that
@@ -288,14 +347,17 @@ async fn await_blocked_behind(
 /// transaction as that freeze, so it is staged above a bound already live. A
 /// competing freeze queued on the chain head before that commit is granted the
 /// lock ahead of any settlement and must reuse the identical bound while the
-/// tail exists. A spawned cycle (or a competing sweep) then reaches retained
-/// history — the assertion that the Scribe append is durable — while the tail
-/// stays unretained, and the spawned cycle is aborted while holding nothing
-/// committed in Postgres, which is exactly the crash-before-settlement state.
-/// Releasing the fence and running the cycle again replays the identical frozen
-/// range into Scribe's batch fence. The frozen decisions must be retained
-/// exactly once, the tail must then be published by its own range, and the
-/// tenant must drain to zero.
+/// tail exists. Two full `publish_tenant` cycles are queued on the chain head
+/// behind that freeze as well, so both are granted the lock before any
+/// settlement can exist. `crashing` reports the range its own Scribe append returned for —
+/// the durable append, attributed to that cycle even while the server's sweep
+/// competes — and retained history sees it while the tail stays unretained.
+/// With every settlement held by the fence, `crashing` is aborted, which is
+/// exactly the crash-after-append, before-settlement state, and the bound is
+/// read back unchanged. Releasing the fence lets `survivor` finish: it must
+/// report publishing exactly the reused bound, with the tail excluded. The
+/// frozen decisions must be retained exactly once, the tail must then be
+/// published by its own later range, and the tenant must drain to zero.
 ///
 /// # Errors
 /// Returns the server, Postgres, projection, publication, or query failure.
@@ -315,12 +377,7 @@ async fn frozen_audit_range_replays_once_while_its_tail_waits() -> Result<(), Se
     let seq_hi = append_audit(&mut appender, &decision(&frozen_op)).await?;
     appender.commit().await?;
     let appended = AuditPublicationRange { seq_lo, seq_hi };
-    let fence = fence_staged_rows(&server, tenant, appended).await?;
-
-    let publisher = Arc::new(
-        AuditPublisher::from_state(server.state())
-            .ok_or("a Scribe-bearing server composes the audit publisher")?,
-    );
+    let mut fence = fence_staged_rows(&server, tenant, appended).await?;
 
     // The freeze and the tail commit together, so the tail is staged above a
     // bound that is already live and no cycle can observe one without the other.
@@ -338,8 +395,16 @@ async fn frozen_audit_range_replays_once_while_its_tail_waits() -> Result<(), Se
         "the tail {tail_seq} must stage above the frozen bound {range:?}"
     );
 
-    // The competitor queues on the chain head before the freeze commits, so it
-    // is granted the lock ahead of every settlement and must reuse the bound.
+    // Every competitor queues on the chain head before the freeze commits, so
+    // each is granted the lock ahead of every settlement — no cycle can append,
+    // and so none can settle, until the freeze commits — and must reuse the
+    // bound. The SQL freeze pins that seam directly; `survivor` and `crashing`
+    // are two full production cycles, and only `crashing` reports its append.
+    let survivor_publisher = AuditPublisher::from_state(server.state())
+        .ok_or("a Scribe-bearing server composes the audit publisher")?;
+    let mut crashing_publisher = AuditPublisher::from_state(server.state())
+        .ok_or("a Scribe-bearing server composes the audit publisher")?;
+    let mut crashing_appended = crashing_publisher.observe_appends();
     let mut competitor = server.tenant_conn_for(tenant).await?;
     let competitor_pid = backend_pid(&mut competitor).await?;
     let competing = async {
@@ -349,34 +414,64 @@ async fn frozen_audit_range_replays_once_while_its_tail_waits() -> Result<(), Se
     };
     let committing = async {
         await_blocked_behind(&mut freezer, competitor_pid).await?;
-        let blocked = tokio::spawn({
-            let publisher = Arc::clone(&publisher);
-            async move { publisher.publish_tenant(tenant).await }
-        });
+        let survivor = tokio::spawn(async move { survivor_publisher.publish_tenant(tenant).await });
+        let crashing = tokio::spawn(async move { crashing_publisher.publish_tenant(tenant).await });
+        await_blocked_backends(&mut freezer, 3).await?;
         freezer.commit().await?;
-        Ok::<_, ServerJourneyError>(blocked)
+        Ok::<_, ServerJourneyError>((survivor, crashing))
     };
-    let (competing, blocked) = tokio::try_join!(competing, committing)?;
+    let (competing, (survivor, crashing)) = tokio::try_join!(competing, committing)?;
     assert_eq!(
         competing,
         Some(range),
-        "a competing cycle must reuse the frozen bound while the tail is staged above it"
+        "a competing freeze must reuse the frozen bound while the tail is staged above it"
     );
 
-    // The append is durable before settlement is attempted, so retained history
-    // sees the range while the fence still holds every Postgres effect back,
-    // and the staged tail stays out of every in-flight batch.
+    // `crashing` reports only after its own Scribe append returned, so the
+    // range is durable in retained history while the fence still holds every
+    // settlement back and the staged tail stays out of every in-flight batch.
+    tokio::time::timeout(
+        PUBLICATION_BUDGET,
+        crashing_appended.wait_for(|appended| appended.is_some()),
+    )
+    .await
+    .map_err(|_| "the crashing cycle never reported its durable append")??;
+    assert_eq!(
+        *crashing_appended.borrow(),
+        Some(range),
+        "the crashing cycle must append exactly the frozen range, without the tail"
+    );
     await_retained(&server, tenant, &frozen_op, 3).await?;
     await_retained(&server, tenant, &tail_op, 0).await?;
-    blocked.abort();
+    await_blocked_backends(&mut fence, 1).await?;
     assert!(
-        blocked.await.is_err(),
-        "the fenced cycle must be aborted before it settles"
+        !crashing.is_finished() && !survivor.is_finished(),
+        "no cycle may settle while the fence holds the frozen rows"
+    );
+    crashing.abort();
+    assert!(
+        crashing.await.is_err_and(|error| error.is_cancelled()),
+        "the crashing cycle must be aborted after its append and before it settles"
+    );
+    assert_eq!(
+        frozen_bound(&server, tenant).await?,
+        Some(range.seq_hi),
+        "the frozen bound must survive the aborted cycle"
     );
     release_fence(fence).await?;
 
-    // The bound survived the abort, so this cycle replays the identical range.
-    publisher.publish_tenant(tenant).await?;
+    // The surviving cycle froze the identical bound before any settlement, so
+    // it replays exactly the frozen range into Scribe's batch fence.
+    let survived = survivor.await??;
+    assert!(
+        matches!(
+            survived,
+            PublishOutcome::Published { seq_lo, seq_hi, .. }
+                if seq_lo == range.seq_lo && seq_hi == range.seq_hi
+        ),
+        "the surviving cycle must publish the reused bound {range:?} with the tail excluded, \
+         got {survived:?}"
+    );
     await_retained(&server, tenant, &frozen_op, 3).await?;
     await_retained(&server, tenant, &tail_op, 1).await?;
     await_retained(&server, tenant, &frozen_op, 3).await?;

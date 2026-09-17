@@ -92,6 +92,13 @@ pub struct AuditPublisher {
     batch_records: i64,
     /// Delay between sweeps of the tenant directory.
     interval: Duration,
+    /// Test-only report of each range this instance durably appended.
+    ///
+    /// Set only through [`AuditPublisher::observe_appends`], so a journey can
+    /// name the cycle that reached Scribe before settlement even while the
+    /// server's own sweep publishes the same tenant. Production never sets it.
+    #[cfg(feature = "test-support")]
+    appended: Option<tokio::sync::watch::Sender<Option<AuditPublicationRange>>>,
 }
 
 impl AuditPublisher {
@@ -115,7 +122,25 @@ impl AuditPublisher {
             scribe,
             batch_records: PUBLICATION_BATCH_RECORDS,
             interval: PUBLICATION_INTERVAL,
+            #[cfg(feature = "test-support")]
+            appended: None,
         })
+    }
+
+    /// Report every range this instance durably appends, before it settles.
+    ///
+    /// The receiver observes the last range whose Scribe append returned, so a
+    /// test can abort that exact cycle in the window between its durable append
+    /// and its settlement. Only this instance reports; the server's own sweep
+    /// is built separately and stays silent. Calling it again replaces the
+    /// previous observer.
+    #[cfg(feature = "test-support")]
+    pub fn observe_appends(
+        &mut self,
+    ) -> tokio::sync::watch::Receiver<Option<AuditPublicationRange>> {
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        self.appended = Some(sender);
+        receiver
     }
 
     /// Run bounded publication sweeps until cancelled.
@@ -264,6 +289,10 @@ impl AuditPublisher {
             })
             .await
             .map_err(|error| AuditPublicationError::Publish(format!("{error:?}")))?;
+        #[cfg(feature = "test-support")]
+        if let Some(appended) = &self.appended {
+            appended.send_replace(Some(range));
+        }
         Ok(())
     }
 

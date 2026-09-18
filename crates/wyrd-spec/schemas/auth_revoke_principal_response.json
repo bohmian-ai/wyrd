@@ -38,8 +38,22 @@
   "additionalProperties": false,
   "definitions": {
     "PrincipalKindTag": {
-      "description": "Principal-kind discriminator without a bound card.\n\nSerializes as a bare snake_case string (`\"user\"`, `\"service\"`, `\"agent\"`); this is a stable wire contract for the revoke request body, token claims, and the revocation NOTIFY channel.",
+      "description": "Principal-kind discriminator without a bound card.\n\nSerializes as a bare snake_case string (`\"global_admin\"`, `\"tenant_admin\"`, `\"user\"`, `\"service\"`, `\"agent\"`); this is a stable wire contract for the revoke request body, token claims, the revocation NOTIFY channel, and the durable `principal_kind` columns.",
       "oneOf": [
+        {
+          "description": "Platform-scope administrative principal. Carries no tenant and operates the platform control plane: tenant lifecycle and tenant-administration recovery. It is never implicitly authorized over a tenant's resources.",
+          "type": "string",
+          "enum": [
+            "global_admin"
+          ]
+        },
+        {
+          "description": "Tenant-scope administrative principal created during tenant provisioning. It is the tenant's headless root of trust and is not bound to a Card.",
+          "type": "string",
+          "enum": [
+            "tenant_admin"
+          ]
+        },
         {
           "description": "Human user principal.",
           "type": "string",

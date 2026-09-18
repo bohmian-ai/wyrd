@@ -484,7 +484,7 @@ fn validate_principal_ref(principal: &TokenPrincipalRef) -> Result<(), IssueErro
         // A platform-scope principal is never issued a tenant-scope token. The
         // platform plane has its own credential path, so a token request
         // carrying this kind is malformed rather than merely unauthorized.
-        (PrincipalKindTag::GlobalAdmin, _) => Err(IssueError::InvalidCardRef),
+        (PrincipalKindTag::GlobalAdmin, _) => Err(IssueError::InvalidPrincipalKind),
         (PrincipalKindTag::TenantAdmin | PrincipalKindTag::User, None) => Ok(()),
         (PrincipalKindTag::TenantAdmin | PrincipalKindTag::User, Some(_)) => {
             Err(IssueError::InvalidCardRef)

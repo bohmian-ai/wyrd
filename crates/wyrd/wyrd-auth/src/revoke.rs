@@ -3,6 +3,8 @@
 use wyrd_runtime::PrincipalId;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalKindTag;
+
+use crate::exchange_api_key::principal_kind_wire;
 use wyrd_spec::error::WyrdError;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
@@ -34,11 +36,12 @@ pub async fn revoke_principal_in_conn(
         revoke_service_account_principal(conn, id_uuid)
             .await
             .map_err(internal_error)?;
-        let kind = if row.principal_kind == "agent" {
-            PrincipalKindTag::Agent
-        } else {
-            PrincipalKindTag::Service
-        };
+        let kind = principal_kind_wire(&row.principal_kind).ok_or_else(|| {
+            internal_error(format!(
+                "principal {target_id} has unrecognized kind {}",
+                row.principal_kind
+            ))
+        })?;
         return Ok(kind);
     }
 

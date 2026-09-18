@@ -256,7 +256,10 @@ impl RefreshTokens {
 
         let pid = PrincipalId::new(principal_id);
         let tenant_id = conn.data_tenant_id();
-        let card_ref = sa.card_ref.0;
+        let card_ref = sa
+            .card_ref
+            .map(|card_ref| card_ref.0)
+            .ok_or(RefreshError::Issue(IssueError::InvalidPrincipalKind))?;
         let card_ref_scope = resolve_card_ref_scope(conn, &card_ref).await?;
 
         let access_token = match principal_kind {

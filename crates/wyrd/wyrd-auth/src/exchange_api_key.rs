@@ -286,7 +286,11 @@ impl DelegateToken {
             .map_err(|_| DelegateError::PermissionDenied)?;
 
         let row = resolve_requested_subject(conn, requested_subject).await?;
-        let requested_card_ref = row.card_ref.0.clone();
+        let requested_card_ref = row
+            .card_ref
+            .clone()
+            .map(|card_ref| card_ref.0)
+            .ok_or(DelegateError::SubjectNotFound)?;
         let card_ref_scope = resolve_card_ref_scope(conn, &requested_card_ref).await?;
         let _ = runtime_principal_kind(&row.principal_kind, Some(requested_card_ref.clone()))
             .ok_or(DelegateError::SubjectNotFound)?;
@@ -514,6 +518,7 @@ pub(crate) fn role_refs(names: Vec<String>) -> Result<Vec<RoleRef>, wyrd_runtime
 /// Convert a stored principal kind string into the token wire enum.
 pub(crate) fn principal_kind_wire(value: &str) -> Option<PrincipalKindTag> {
     match value {
+        "tenant_admin" => Some(PrincipalKindTag::TenantAdmin),
         "service" => Some(PrincipalKindTag::Service),
         "agent" => Some(PrincipalKindTag::Agent),
         _ => None,
@@ -817,7 +822,7 @@ mod pg_tests {
     ) {
         sqlx::query(
             "INSERT INTO wyrd.auth_api_keys
-                 (id, data_tenant_id, sa_id, prefix, key_hash, created_by, expires_at, revoked_at)
+                 (id, data_tenant_id, principal_id, prefix, key_hash, created_by, expires_at, revoked_at)
              VALUES ($1, $2, $3, $4, 'placeholder-hash', $5, $6, CASE WHEN $7 THEN now() ELSE NULL END)",
         )
         .bind(Uuid::new_v4())
@@ -1040,7 +1045,7 @@ mod pg_tests {
         // service returns NotFound.
         sqlx::query(
             "INSERT INTO wyrd.auth_api_keys
-                 (id, data_tenant_id, sa_id, prefix, key_hash, created_by, expires_at, revoked_at)
+                 (id, data_tenant_id, principal_id, prefix, key_hash, created_by, expires_at, revoked_at)
              VALUES ($1, $2, $3, $4, 'placeholder-hash', $5, now() + interval '1 year', now())",
         )
         .bind(Uuid::new_v4())
@@ -1074,7 +1079,7 @@ mod pg_tests {
         // verify_api_key() returns false → HashMismatch.
         sqlx::query(
             "INSERT INTO wyrd.auth_api_keys
-                 (id, data_tenant_id, sa_id, prefix, key_hash, created_by, expires_at)
+                 (id, data_tenant_id, principal_id, prefix, key_hash, created_by, expires_at)
              VALUES ($1, $2, $3, $4, 'not-a-valid-phc-hash', $5, now() + interval '1 year')",
         )
         .bind(Uuid::new_v4())

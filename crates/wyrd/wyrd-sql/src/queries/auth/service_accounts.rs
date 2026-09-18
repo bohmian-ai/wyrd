@@ -22,15 +22,19 @@ const INSERT_REFRESH_TOKEN_SQL: &str = r#"
         ) VALUES ($1, $2, $3, $4, $5, $6)
         "#;
 
-/// Active Service/Agent principal row.
+/// Active tenant-scope machine principal row.
+///
+/// Covers every kind `wyrd.auth_service_accounts` holds: a tenant
+/// administrator, a Card-free automation identity, and a Card-bound Service or
+/// Agent workload.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ServiceAccountPrincipalRow {
     /// Principal id.
     pub id: Uuid,
-    /// Principal kind, `service` or `agent`.
+    /// Principal kind label: `tenant_admin`, `service`, or `agent`.
     pub principal_kind: String,
-    /// Structured card reference.
-    pub card_ref: Json<CardRef>,
+    /// Structured card reference, absent for a principal that binds no Card.
+    pub card_ref: Option<Json<CardRef>>,
     /// Status.
     pub status: String,
 }

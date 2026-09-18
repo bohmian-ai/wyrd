@@ -5,6 +5,7 @@
 //! payload is the same JSONB permission projection `wyrd.auth_roles.permissions`
 //! uses, so one permission vocabulary and one synchronous checker serve the
 //! platform and tenant planes alike.
+// raw-query grep allowlist: platform administrative tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use serde_json::Value;
 use sqlx::types::Uuid;

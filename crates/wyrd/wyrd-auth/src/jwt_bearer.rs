@@ -180,7 +180,7 @@ async fn issue_and_audit(
         IssueSubject {
             principal_id: row.id,
             principal_kind: row.principal_kind.clone(),
-            card_ref: Some(row.card_ref.0.clone()),
+            card_ref: row.card_ref.clone().map(|card_ref| card_ref.0),
             roles,
         },
         RefreshPolicy::Skip,

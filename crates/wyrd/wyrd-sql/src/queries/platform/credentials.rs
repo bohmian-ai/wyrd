@@ -7,6 +7,7 @@
 //! A principal may hold several live credentials at once, which is what makes
 //! rotation an overlap rather than a gap: issue the replacement, verify it,
 //! then revoke the superseded one.
+// raw-query grep allowlist: platform administrative tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use chrono::{DateTime, Utc};
 use sqlx::types::Uuid;

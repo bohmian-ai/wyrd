@@ -8,6 +8,7 @@
 //!
 //! A principal is durable and outlives its credentials. Nothing in this module
 //! reads, writes, or is affected by credential state.
+// raw-query grep allowlist: platform administrative tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use sqlx::types::Uuid;
 use wyrd_spec::auth::PrincipalKindTag;
@@ -40,8 +41,10 @@ impl PlatformPrincipalRow {
 
 /// Insert a platform-scope principal.
 ///
-/// The caller supplies `id` so the principal can be referenced inside the same
-/// transaction that grants its authority and issues its first credential.
+/// The caller supplies `id` so it can reference the principal when granting its
+/// authority and issuing its first credential. Each of those is a separate
+/// statement on the operator pool; the single-initialization invariant is
+/// carried by the durable uniqueness of `name`, not by this call.
 ///
 /// # Errors
 /// Returns [`SqlError::Query`] when the insert fails, including when `name` is
@@ -80,27 +83,6 @@ pub async fn platform_principal_by_id(
     )
     .bind(id)
     .fetch_optional(pool.pool())
-    .await
-    .map_err(SqlError::from)
-}
-
-/// Count the platform principals of one kind.
-///
-/// Initialization uses this to observe whether a deployment already has its
-/// administrative root. It is a read, not a guard: the single-initialization
-/// invariant is enforced durably, never by checking this first.
-///
-/// # Errors
-/// Returns [`SqlError::Query`] when the read fails.
-pub async fn count_platform_principals(
-    pool: &OperatorPool,
-    kind: PrincipalKindTag,
-) -> Result<i64, SqlError> {
-    sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM platform.principals WHERE principal_kind = $1",
-    )
-    .bind(kind.as_str())
-    .fetch_one(pool.pool())
     .await
     .map_err(SqlError::from)
 }

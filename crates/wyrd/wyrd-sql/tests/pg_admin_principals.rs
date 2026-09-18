@@ -23,7 +23,7 @@ mod pg_tests {
         platform_grant_for_principal, set_platform_grant,
     };
     use wyrd_sql::queries::platform::principals::{
-        count_platform_principals, insert_platform_principal, platform_principal_by_id,
+        insert_platform_principal, platform_principal_by_id,
     };
 
     /// Skip when no database is configured, matching the sibling Postgres suites.
@@ -128,11 +128,15 @@ mod pg_tests {
             result.is_err(),
             "tenant-scope kind is refused at platform scope"
         );
+        let stored: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM platform.principals WHERE principal_kind <> 'global_admin'",
+        )
+        .fetch_one(fixture.operator_pool().pool())
+        .await
+        .expect("count succeeds");
         assert_eq!(
-            count_platform_principals(fixture.operator_pool(), PrincipalKindTag::TenantAdmin)
-                .await
-                .expect("count succeeds"),
-            0
+            stored, 0,
+            "nothing tenant-scoped reached the platform store"
         );
     }
 

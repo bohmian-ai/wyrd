@@ -113,6 +113,25 @@ cargo test --locked -p wyrd-sql --test pg_cards_register -- --nocapture --test-t
 cargo test --locked -p wyrd-server --test pg_card_registration_route -- --nocapture --test-threads=1
 """
 
+[tasks."test:principals:unit"]
+description = "Run the principal and credential model unit slices"
+run = """
+cargo test --locked -p wyrd-spec --lib auth::principal_kind
+cargo test --locked -p wyrd-runtime --lib principal
+cargo test --locked -p wyrd-auth-verify --lib into_verified
+cargo test --locked -p wyrd-auth --lib platform_credentials::tests
+"""
+
+[tasks."test:principals:integration"]
+description = "Run the durable principal, credential, and grant Postgres suites"
+depends = ["setup:postgres"]
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw" }
+run = """
+cargo test --locked -p wyrd-sql --test pg_admin_principals -- --nocapture --test-threads=1
+cargo test --locked -p wyrd-auth --lib platform_credentials::pg_tests -- --nocapture --test-threads=1
+cargo test --locked -p wyrd-auth --lib exchange_api_key::pg_tests -- --nocapture --test-threads=1
+"""
+
 [tasks."test:cli:journey"]
 description = "Run the real-server CLI Card lifecycle journey"
 env = { WYRD_CLI_E2E = "1" }

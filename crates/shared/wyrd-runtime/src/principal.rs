@@ -28,16 +28,34 @@ pub struct Principal {
 }
 
 /// Kind of authenticated identity.
+///
+/// Every variant here is **tenant-scoped**: [`Principal`] carries a required
+/// tenant, so this enum is the tenant-plane projection of a principal.
+/// Platform-scope principals are a separate projection and are never
+/// representable as a [`Principal`], which is what keeps the two control planes
+/// from collapsing into one another by accident.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
 pub enum PrincipalKind {
+    /// Tenant administrative identity created during tenant provisioning.
+    ///
+    /// The tenant's headless root of trust. It binds no Card — an
+    /// administrative identity is not a registered AI-system component — and it
+    /// coexists with any human administrator the tenant later federates.
+    TenantAdmin,
     /// Human user identity.
     User,
-    /// Card-bound service identity.
+    /// Machine service identity, optionally bound to a Service card.
+    ///
+    /// A deployed workload carries its Service card and the emit scope derived
+    /// from it. Tenant automation created by a tenant administrator carries no
+    /// Card and therefore no emit scope, because Card binding is a property of
+    /// a machine principal rather than a precondition for holding a credential.
     Service {
-        /// Bound Service card.
-        card_ref: CardRef,
-        /// Transitive card authorization set; always contains `card_ref`.
+        /// Bound Service card, absent for a Card-free automation identity.
+        card_ref: Option<CardRef>,
+        /// Transitive card authorization set; contains `card_ref` when one is
+        /// bound and is empty otherwise.
         card_ref_scope: CardRefScope,
     },
     /// Card-bound agent identity.
@@ -54,6 +72,7 @@ impl PrincipalKind {
     #[must_use]
     pub fn tag(&self) -> PrincipalKindTag {
         match self {
+            Self::TenantAdmin => PrincipalKindTag::TenantAdmin,
             Self::User => PrincipalKindTag::User,
             Self::Service { .. } => PrincipalKindTag::Service,
             Self::Agent { .. } => PrincipalKindTag::Agent,
@@ -128,24 +147,30 @@ impl Principal {
         }
     }
 
-    /// Returns the card ref for service and agent principals.
+    /// Returns the bound card ref, when this principal has one.
+    ///
+    /// An agent always binds a Card. A service binds one only when it is a
+    /// deployed workload; Card-free tenant automation, tenant administrators,
+    /// and humans return `None`.
     #[must_use]
     pub fn card_ref(&self) -> Option<&CardRef> {
         match &self.kind {
-            PrincipalKind::Service { card_ref, .. } | PrincipalKind::Agent { card_ref, .. } => {
-                Some(card_ref)
-            }
-            PrincipalKind::User => None,
+            PrincipalKind::Service { card_ref, .. } => card_ref.as_ref(),
+            PrincipalKind::Agent { card_ref, .. } => Some(card_ref),
+            PrincipalKind::TenantAdmin | PrincipalKind::User => None,
         }
     }
 
-    /// Returns the card scope for service and agent principals.
+    /// Returns the card scope for card-carrying machine principals.
+    ///
+    /// A Card-free service still reports its (empty) scope, so callers can
+    /// distinguish "no emit authority" from "not a machine principal".
     #[must_use]
     pub fn card_ref_scope(&self) -> Option<&CardRefScope> {
         match &self.kind {
             PrincipalKind::Service { card_ref_scope, .. }
             | PrincipalKind::Agent { card_ref_scope, .. } => Some(card_ref_scope),
-            PrincipalKind::User => None,
+            PrincipalKind::TenantAdmin | PrincipalKind::User => None,
         }
     }
 
@@ -177,24 +202,28 @@ impl PrincipalRef {
         }
     }
 
-    /// Returns the card ref for service and agent principals.
+    /// Returns the bound card ref, when this principal has one.
+    ///
+    /// Mirrors [`Principal::card_ref`] for the delegation-chain projection.
     #[must_use]
     pub fn card_ref(&self) -> Option<&CardRef> {
         match &self.kind {
-            PrincipalKind::Service { card_ref, .. } | PrincipalKind::Agent { card_ref, .. } => {
-                Some(card_ref)
-            }
-            PrincipalKind::User => None,
+            PrincipalKind::Service { card_ref, .. } => card_ref.as_ref(),
+            PrincipalKind::Agent { card_ref, .. } => Some(card_ref),
+            PrincipalKind::TenantAdmin | PrincipalKind::User => None,
         }
     }
 
-    /// Returns the card scope for service and agent principals.
+    /// Returns the card scope for card-carrying machine principals.
+    ///
+    /// Mirrors [`Principal::card_ref_scope`] for the delegation-chain
+    /// projection.
     #[must_use]
     pub fn card_ref_scope(&self) -> Option<&CardRefScope> {
         match &self.kind {
             PrincipalKind::Service { card_ref_scope, .. }
             | PrincipalKind::Agent { card_ref_scope, .. } => Some(card_ref_scope),
-            PrincipalKind::User => None,
+            PrincipalKind::TenantAdmin | PrincipalKind::User => None,
         }
     }
 }

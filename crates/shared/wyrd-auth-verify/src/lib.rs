@@ -400,11 +400,7 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> TokenVe
             // F11: check revocation epoch BEFORE returning the positive cache hit.
             // A principal revoked after this token was cached must be rejected here.
             if let Some(ref rev) = self.revocation {
-                let kind = match &cached.principal.kind {
-                    PrincipalKind::User => PrincipalKindTag::User,
-                    PrincipalKind::Service { .. } => PrincipalKindTag::Service,
-                    PrincipalKind::Agent { .. } => PrincipalKindTag::Agent,
-                };
+                let kind = cached.principal.kind.tag();
                 match rev
                     .epoch(&cached.principal.tenant_id, cached.principal.id, kind)
                     .await
@@ -454,11 +450,7 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> TokenVe
 
         // Also check revocation for fresh (cache-miss) verifies.
         if let Some(ref rev) = self.revocation {
-            let kind = match &result.principal.kind {
-                PrincipalKind::User => PrincipalKindTag::User,
-                PrincipalKind::Service { .. } => PrincipalKindTag::Service,
-                PrincipalKind::Agent { .. } => PrincipalKindTag::Agent,
-            };
+            let kind = result.principal.kind.tag();
             match rev
                 .epoch(&result.principal.tenant_id, result.principal.id, kind)
                 .await
@@ -719,11 +711,7 @@ impl From<(&RuntimePrincipalRef, DataTenantId)> for TokenPrincipalRef {
     fn from((ref_, tenant_id): (&RuntimePrincipalRef, DataTenantId)) -> Self {
         Self {
             id: ref_.id,
-            kind: match &ref_.kind {
-                PrincipalKind::User => PrincipalKindTag::User,
-                PrincipalKind::Service { .. } => PrincipalKindTag::Service,
-                PrincipalKind::Agent { .. } => PrincipalKindTag::Agent,
-            },
+            kind: ref_.kind.tag(),
             tenant_id,
             card_ref: ref_.card_ref().cloned(),
             card_ref_scope: ref_.card_ref_scope().cloned().unwrap_or_default(),
@@ -734,13 +722,18 @@ impl From<(&RuntimePrincipalRef, DataTenantId)> for TokenPrincipalRef {
 impl From<&Principal> for TokenPrincipalRef {
     fn from(principal: &Principal) -> Self {
         let (kind, card_ref, card_ref_scope) = match &principal.kind {
+            PrincipalKind::TenantAdmin => (
+                PrincipalKindTag::TenantAdmin,
+                None,
+                CardRefScope::default(),
+            ),
             PrincipalKind::User => (PrincipalKindTag::User, None, CardRefScope::default()),
             PrincipalKind::Service {
                 card_ref,
                 card_ref_scope,
             } => (
                 PrincipalKindTag::Service,
-                Some(card_ref.clone()),
+                card_ref.clone(),
                 card_ref_scope.clone(),
             ),
             PrincipalKind::Agent {
@@ -812,12 +805,27 @@ fn wire_kind_into_principal_kind(
     card_ref_scope: &CardRefScope,
 ) -> Result<PrincipalKind, AuthError> {
     match (wire, card_ref) {
+        // A platform-scope kind can never become a tenant-scope principal. This
+        // is the type-level half of the control-plane boundary: even a validly
+        // signed token cannot smuggle a platform identity into a tenant.
+        (PrincipalKindTag::GlobalAdmin, _) => Err(AuthError::InvalidToken),
+        (PrincipalKindTag::TenantAdmin, Some(_)) => Err(AuthError::InvalidCardRef),
+        (PrincipalKindTag::TenantAdmin, None) => Ok(PrincipalKind::TenantAdmin),
         (PrincipalKindTag::User, Some(_)) => Err(AuthError::InvalidCardRef),
         (PrincipalKindTag::User, None) => Ok(PrincipalKind::User),
         (PrincipalKindTag::Service, Some(card_ref)) if card_ref.kind == CardKind::Service => {
             Ok(PrincipalKind::Service {
-                card_ref: card_ref.clone(),
+                card_ref: Some(card_ref.clone()),
                 card_ref_scope: seed_scope(card_ref, card_ref_scope)?,
+            })
+        }
+        // Card-free tenant automation: a machine principal that holds a
+        // credential without being a deployed, Card-bound workload. It carries
+        // no emit scope, so an empty scope is the only valid one.
+        (PrincipalKindTag::Service, None) if card_ref_scope.is_empty() => {
+            Ok(PrincipalKind::Service {
+                card_ref: None,
+                card_ref_scope: CardRefScope::default(),
             })
         }
         (PrincipalKindTag::Agent, Some(card_ref)) if card_ref.kind == CardKind::Agent => {

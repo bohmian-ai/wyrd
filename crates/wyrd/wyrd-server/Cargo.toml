@@ -128,9 +128,6 @@ name = "pg_router_smoke"
 name = "pg_merge_http_protected"
 
 [[test]]
-name = "pg_bootstrap_key"
-
-[[test]]
 name = "pg_eval_v1_protocol"
 
 [[test]]

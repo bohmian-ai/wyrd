@@ -1,10 +1,10 @@
 use clap::{Parser, Subcommand};
+use secrecy::ExposeSecret;
 
 use wyrd_server::WyrdServerConfig;
 use wyrd_server::app::{BootExit, run};
-use wyrd_server::boot::bootstrap::bootstrap_admin_key;
+use wyrd_server::boot::init::initialize_platform_root;
 use wyrd_server::config::ServeMode;
-use wyrd_spec::TenantSlug;
 use wyrd_sql::WyrdPostgres;
 use wyrd_sql::postgres_boot::PostgresBoot;
 
@@ -25,12 +25,11 @@ struct Cli {
 /// Operator subcommands. The absent arm runs the server.
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Mint the first admin API key for a fresh deployment.
-    BootstrapKey {
-        /// Tenant slug to bootstrap.
-        #[arg(long)]
-        tenant: String,
-    },
+    /// Establish this deployment's platform administrative root.
+    ///
+    /// Run once per deployment. Prints the root credential to this terminal
+    /// and nowhere else; it cannot be retrieved afterwards.
+    Init,
 }
 
 #[tokio::main]
@@ -40,7 +39,7 @@ async fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
         None => run(cli.mode).await,
-        Some(Command::BootstrapKey { tenant }) => bootstrap_key(&tenant).await,
+        Some(Command::Init) => init().await,
     };
 
     let exit_code = match result {
@@ -57,14 +56,14 @@ async fn main() {
     std::process::exit(exit_code);
 }
 
-/// Mint and print the first admin API key for `tenant`.
+/// Establish the deployment's administrative root and print its credential.
 ///
-/// Builds only the runtime `wyrd_app` pool — never telemetry, storage,
-/// listeners, or `AppState` — runs the issuance chain in one transaction, then
-/// prints the plaintext key once to stdout.
-async fn bootstrap_key(tenant: &str) -> Result<(), BootExit> {
+/// Builds only the Postgres handles — never telemetry, storage, listeners, or
+/// `AppState` — so initialization neither starts nor depends on a serving
+/// surface. The plaintext is printed once to this process's stdout, which is
+/// the operator's terminal rather than the server's log pipeline.
+async fn init() -> Result<(), BootExit> {
     let _config = WyrdServerConfig::load().map_err(|e| BootExit::Config(Box::new(e)))?;
-    let slug = TenantSlug::new(tenant).map_err(|e| BootExit::Config(Box::new(e)))?;
 
     let boot = PostgresBoot::from_env()
         .await
@@ -73,11 +72,19 @@ async fn bootstrap_key(tenant: &str) -> Result<(), BootExit> {
     let postgres = WyrdPostgres::connect_from_dsns(&dsns)
         .await
         .map_err(|e| BootExit::Other(Box::new(e)))?;
+    let Some(pool) = postgres.operator_pool() else {
+        return Err(BootExit::Config(Box::new(std::io::Error::other(
+            "platform control plane is not configured; set the platform-admin DSN",
+        ))));
+    };
 
-    let key = bootstrap_admin_key(postgres.app_pool(), &slug)
+    let credential = initialize_platform_root(&pool)
         .await
         .map_err(|e| BootExit::Other(Box::new(e)))?;
 
-    println!("{}", key.expose());
+    println!("Wyrd initialization complete.");
+    println!("Platform administrative credential:");
+    println!("{}", credential.expose_secret());
+    println!("Store this credential securely. It cannot be retrieved again.");
     Ok(())
 }

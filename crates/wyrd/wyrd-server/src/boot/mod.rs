@@ -1,8 +1,8 @@
 //! Server boot sequence for SQL-backed Wyrd runtime state.
 
 pub mod auth;
-pub mod bootstrap;
 pub mod data_root;
+pub mod init;
 pub mod issuer;
 pub mod node_identity;
 

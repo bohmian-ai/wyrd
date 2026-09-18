@@ -1072,9 +1072,13 @@ run = [
   """,
 ]
 
-[tasks."cli:bootstrap-key"]
-description = "Mint the first admin API key for a tenant"
-run = "cargo run --locked -p wyrd-server -- bootstrap-key --tenant ${WYRD_BOOTSTRAP_TENANT:-acme}"
+[tasks."cli:dev-bootstrap"]
+description = "Seed the local Wyrd tenant and service credentials"
+run = "cargo run --locked -p wyrd-cli -- dev bootstrap"
+
+[tasks."cli:init"]
+description = "Establish this deployment's platform administrative root and print its credential once"
+run = "cargo run --locked -p wyrd-server -- init"
 
 [tasks."dev:frontend"]
 description = "Run the local UI on localhost:3000 with a global mock-data toggle"

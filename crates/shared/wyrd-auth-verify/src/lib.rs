@@ -365,6 +365,41 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> TokenVe
         self
     }
 
+    /// Verify a platform-scope access token.
+    ///
+    /// Shares this verifier's key set and issuer policy with the tenant path so
+    /// one deployment has one signing trust anchor, but decodes the platform
+    /// claim shape, which carries no tenant, no roles, and no delegation chain.
+    /// A token whose scope marker is anything other than the platform marker is
+    /// rejected, so a tenant token can never be replayed here.
+    ///
+    /// Results are not cached: a platform session's continued validity depends
+    /// on credential state the caller re-reads, and caching the claims would
+    /// only invite treating that check as optional.
+    ///
+    /// # Errors
+    /// Returns [`AuthError::InvalidToken`] for an unknown key id, a failed
+    /// signature, a wrong issuer, or a non-platform scope marker, and
+    /// [`AuthError::TokenExpired`] for an expired token.
+    pub fn verify_platform(&self, token: &str) -> Result<PlatformAccessTokenClaims, AuthError> {
+        let header = decode_header(token).map_err(AuthError::from)?;
+        let kid = header
+            .kid
+            .ok_or(AuthError::InvalidToken)
+            .and_then(|kid| Kid::new(kid).map_err(|_| AuthError::InvalidToken))?;
+        let key = Arc::clone(
+            self.decoding_keys
+                .get(&kid)
+                .ok_or(AuthError::InvalidToken)?,
+        );
+        let claims: PlatformAccessTokenClaims =
+            verify_eddsa(token, &key, Some(self.issuer.as_str()))?;
+        if claims.scope != PLATFORM_TOKEN_SCOPE {
+            return Err(AuthError::InvalidToken);
+        }
+        Ok(claims)
+    }
+
     /// Verify a bearer token for the active tenant.
     #[tracing::instrument(
         level = "debug",

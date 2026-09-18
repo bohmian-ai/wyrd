@@ -13,12 +13,10 @@
 use std::sync::Arc;
 
 use chrono::{Duration, Utc};
-use jsonwebtoken::DecodingKey;
-use secrecy::ExposeSecret;
 use secrecy::SecretString;
 use uuid::Uuid;
 use wyrd_auth_issue::IssuingKey;
-use wyrd_auth_verify::{PLATFORM_TOKEN_SCOPE, PlatformAccessTokenClaims, verify_eddsa};
+use wyrd_auth_verify::{PLATFORM_TOKEN_SCOPE, PlatformAccessTokenClaims};
 use wyrd_spec::auth::PrincipalId;
 use wyrd_sql::queries::platform::credentials::platform_credential_by_id;
 use wyrd_sql::{OperatorPool, SqlError};
@@ -154,30 +152,24 @@ impl PlatformSessions {
         })
     }
 
-    /// Verify a presented platform session token.
+    /// Confirm that verified platform claims still name a live session.
     ///
-    /// Checks the signature, the platform scope marker, and that the credential
-    /// which minted the token is still usable and its principal still active.
-    /// The credential re-read is what makes revocation take effect immediately
-    /// without a separate authorization epoch.
+    /// Signature, issuer, and scope are settled by the token verifier; this is
+    /// the half that cannot be settled from the token alone. Re-reading the
+    /// credential that minted it is what makes revoking a credential end its
+    /// sessions immediately, without a separate authorization epoch.
     ///
     /// # Errors
-    /// Returns [`PlatformSessionError::Invalid`] for a malformed, mis-scoped,
-    /// expired, or unverifiable token and for a revoked credential or suspended
-    /// principal, and [`PlatformSessionError::Store`] when the credential state
-    /// cannot be read — an unavailable store is not an invalid session.
-    #[tracing::instrument(level = "debug", skip(self, public_key, token), err)]
-    pub async fn verify(
+    /// Returns [`PlatformSessionError::Invalid`] when the claims are malformed,
+    /// the credential is unknown, revoked or expired, the principal is not
+    /// active, or the token names a credential belonging to another principal.
+    /// Returns [`PlatformSessionError::Store`] when the credential state cannot
+    /// be read — an unavailable store is not an invalid session.
+    #[tracing::instrument(level = "debug", skip(self, claims), err)]
+    pub async fn confirm(
         &self,
-        public_key: &DecodingKey,
-        issuer: Option<&str>,
-        token: &SecretString,
+        claims: &PlatformAccessTokenClaims,
     ) -> Result<VerifiedPlatformSession, PlatformSessionError> {
-        let claims: PlatformAccessTokenClaims =
-            match verify_eddsa(token.expose_secret(), public_key, issuer) {
-                Ok(claims) => claims,
-                Err(_) => return Err(PlatformSessionError::Invalid),
-            };
         if claims.scope != PLATFORM_TOKEN_SCOPE {
             return Err(PlatformSessionError::Invalid);
         }

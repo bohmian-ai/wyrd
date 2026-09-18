@@ -1,8 +1,9 @@
 //! Platform-control-plane authentication.
 //!
-//! The platform plane authenticates a credential directly rather than a Wyrd
-//! access token: it exists before any tenant does, so there is no tenant to mint
-//! a token against. The credential arrives on `Authorization: Bearer`, distinct
+//! A platform request presents a platform **session token**, never credential
+//! material: the credential is exchanged once and the token carries every
+//! request after that, so no served surface reads a secret, a lookup prefix, or
+//! a credential record. The token arrives on `Authorization: Bearer`, distinct
 //! from the tenant plane's `X-Wyrd-Access-Token`, so the two planes cannot be
 //! confused by a misrouted header.
 //!
@@ -14,8 +15,9 @@
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderName};
-use secrecy::SecretString;
-use wyrd_auth::platform_credentials::{PlatformCredentialError, PlatformCredentials};
+use secrecy::{ExposeSecret, SecretString};
+use uuid::Uuid;
+use wyrd_auth::platform_sessions::{PlatformSessionError, PlatformSessions};
 use wyrd_runtime::{AuthContext, Permission, PermissionSet, PlatformPrincipal, PrincipalId};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
@@ -38,6 +40,9 @@ const AUTHORIZATION: HeaderName = HeaderName::from_static("authorization");
 pub struct PlatformCaller {
     /// The authenticated identity, always the platform variant.
     pub context: AuthContext,
+    /// Credential that minted the presented session, carried into audit so an
+    /// operation is traceable to the credential as well as the identity.
+    pub credential_id: Uuid,
     /// Request correlator for audit and response headers.
     pub request_id: RequestId,
 }
@@ -48,31 +53,13 @@ impl PlatformCaller {
     pub fn principal_id(&self) -> PrincipalId {
         self.context.principal_id()
     }
-
-    /// Authorize one platform-plane permission.
-    ///
-    /// Absence of a grant is denial: a platform principal that authenticates
-    /// but holds no matching permission is refused exactly like an unknown one.
-    ///
-    /// # Errors
-    /// Returns [`WyrdError::PermissionDeniedRbac`] when the principal's grant does
-    /// not cover `required`.
-    pub fn authorize(&self, required: &Permission) -> Result<(), WyrdErrorResponse> {
-        if self.context.effective_permissions().contains(required) {
-            return Ok(());
-        }
-        Err(WyrdErrorResponse::from(WyrdError::PermissionDeniedRbac {
-            message: "platform principal lacks the required permission".to_owned(),
-            details: serde_json::json!({ "plane": "platform" }),
-        }))
-    }
 }
 
-/// Read a platform credential from `Authorization: Bearer`.
+/// Read a platform session token from `Authorization: Bearer`.
 ///
 /// Every malformed or missing case yields the same unauthenticated error as an
 /// unknown credential, so header shape is not an oracle either.
-fn extract_platform_credential(headers: &HeaderMap) -> Option<SecretString> {
+fn extract_platform_token(headers: &HeaderMap) -> Option<SecretString> {
     let raw = headers.get(AUTHORIZATION)?.to_str().ok()?;
     let token = raw.strip_prefix("Bearer ")?;
     if token.is_empty() {
@@ -89,7 +76,7 @@ fn extract_platform_credential(headers: &HeaderMap) -> Option<SecretString> {
 /// unavailable database is not a failed authentication.
 fn unauthenticated() -> WyrdErrorResponse {
     WyrdErrorResponse::from(WyrdError::Unauthenticated {
-        message: "invalid platform credential".to_owned(),
+        message: "invalid platform session".to_owned(),
         details: serde_json::json!({ "plane": "platform" }),
     })
 }
@@ -140,21 +127,37 @@ impl FromRequestParts<AppState> for PlatformCaller {
                 details: serde_json::json!({ "plane": "platform" }),
             }));
         };
-        let Some(presented) = extract_platform_credential(&parts.headers) else {
+        let Some(token) = extract_platform_token(&parts.headers) else {
             return Err(unauthenticated());
         };
+        let Some(verifier) = state.auth.token_verifier.clone() else {
+            return Err(WyrdErrorResponse::from(WyrdError::Internal {
+                message: "token verification is not configured".to_owned(),
+                details: serde_json::json!({ "plane": "platform" }),
+            }));
+        };
+        let Some(issuing_key) = state.auth.issuing_key.clone() else {
+            return Err(WyrdErrorResponse::from(WyrdError::Internal {
+                message: "platform session issuance is not configured".to_owned(),
+                details: serde_json::json!({ "plane": "platform" }),
+            }));
+        };
 
-        let credentials = PlatformCredentials::new(pool.clone());
-        let principal_id = match credentials.authenticate(&presented).await {
-            Ok(principal_id) => principal_id,
-            Err(PlatformCredentialError::InvalidCredential) => return Err(unauthenticated()),
+        let Ok(claims) = verifier.verify_platform(token.expose_secret()) else {
+            return Err(unauthenticated());
+        };
+        let sessions = PlatformSessions::new(pool.clone(), issuing_key);
+        let session = match sessions.confirm(&claims).await {
+            Ok(session) => session,
+            Err(PlatformSessionError::Invalid) => return Err(unauthenticated()),
             Err(error) => {
                 return Err(WyrdErrorResponse::from(WyrdError::Internal {
-                    message: "platform credential verification failed".to_owned(),
+                    message: "platform session verification failed".to_owned(),
                     details: serde_json::json!({ "error": error.to_string() }),
                 }));
             }
         };
+        let principal_id = session.principal_id;
 
         let effective_permissions = resolve_grant(&pool, principal_id).await?;
         let request_id = parts
@@ -170,6 +173,7 @@ impl FromRequestParts<AppState> for PlatformCaller {
 
         Ok(Self {
             context: AuthContext::from(PlatformPrincipal::new(principal_id, effective_permissions)),
+            credential_id: session.credential_id,
             request_id,
         })
     }
@@ -179,121 +183,71 @@ impl FromRequestParts<AppState> for PlatformCaller {
 mod tests {
     use axum::http::HeaderMap;
     use secrecy::ExposeSecret;
-    use wyrd_runtime::{AuthContext, Permission, PermissionSet, PlatformPrincipal, PrincipalId};
+    use uuid::Uuid;
+    use wyrd_runtime::{AuthContext, PermissionSet, PlatformPrincipal, PrincipalId};
 
-    use super::{PlatformCaller, extract_platform_credential};
+    use super::{PlatformCaller, extract_platform_token};
 
-    /// Build a platform caller holding exactly `permissions`.
-    fn caller(permissions: PermissionSet) -> PlatformCaller {
+    /// Build a platform caller for shape assertions.
+    fn caller() -> PlatformCaller {
         PlatformCaller {
             context: AuthContext::from(PlatformPrincipal::new(
-                PrincipalId::new(uuid::Uuid::now_v7()),
-                permissions,
+                PrincipalId::new(Uuid::now_v7()),
+                PermissionSet::new(),
             )),
-            request_id: wyrd_spec::request_id::RequestId::parse(&uuid::Uuid::now_v7().to_string())
+            credential_id: Uuid::now_v7(),
+            request_id: wyrd_spec::request_id::RequestId::parse(&Uuid::now_v7().to_string())
                 .expect("generated UUIDv7 is a valid request id"),
         }
     }
 
-    /// A bearer credential is read from the platform header.
+    /// A bearer session token is read from the platform header.
     #[test]
-    fn bearer_credential_is_extracted() {
+    fn bearer_session_token_is_extracted() {
         let mut headers = HeaderMap::new();
         headers.insert(
             "authorization",
-            "Bearer wyrd_global_abc_def".parse().unwrap(),
+            "Bearer header.payload.sig".parse().unwrap(),
         );
 
-        let extracted = extract_platform_credential(&headers).expect("credential is present");
+        let extracted = extract_platform_token(&headers).expect("token is present");
 
-        assert_eq!(extracted.expose_secret(), "wyrd_global_abc_def");
+        assert_eq!(extracted.expose_secret(), "header.payload.sig");
     }
 
     /// Missing, empty, and non-bearer headers all yield nothing, so header shape
     /// cannot be used to probe the plane.
     #[test]
-    fn malformed_headers_yield_no_credential() {
-        for value in ["", "Bearer ", "Basic abc", "wyrd_global_abc_def"] {
+    fn malformed_headers_yield_no_token() {
+        for value in ["", "Bearer ", "Basic abc", "header.payload.sig"] {
             let mut headers = HeaderMap::new();
             if !value.is_empty() {
                 headers.insert("authorization", value.parse().unwrap());
             }
             assert!(
-                extract_platform_credential(&headers).is_none(),
-                "{value:?} must not resolve to a credential"
+                extract_platform_token(&headers).is_none(),
+                "{value:?} must not resolve to a session token"
             );
         }
     }
 
-    /// A tenant access token presented on the platform header never reaches the
-    /// platform store: it is not shaped like a platform credential, so it is
-    /// refused before any lookup and cannot probe for a principal.
-    #[test]
-    fn a_tenant_access_token_is_not_a_platform_credential() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "authorization",
-            "Bearer eyJhbGciOiJFZERTQSIsImtpZCI6ImsxIn0.eyJzdWIiOiJ4In0.sig"
-                .parse()
-                .unwrap(),
-        );
-
-        assert!(extract_platform_credential(&headers).is_some());
-        assert!(
-            wyrd_auth::platform_credentials::PlatformCredential::prefix_of(
-                &extract_platform_credential(&headers).expect("header parses")
-            )
-            .is_none(),
-            "a tenant token resolves to no platform lookup prefix"
-        );
-    }
-
-    /// A tenant API key is likewise not a platform credential, so the two
-    /// credential families cannot be swapped across planes.
-    #[test]
-    fn a_tenant_api_key_is_not_a_platform_credential() {
-        let key = secrecy::SecretString::from(
-            "wyrd_sk_0192abcd0000700080000000000000ab_deadbeef_cafebabecafebabecafebabecafebabe"
-                .to_owned(),
-        );
-
-        assert!(
-            wyrd_auth::platform_credentials::PlatformCredential::prefix_of(&key).is_none(),
-            "a tenant API key resolves to no platform lookup prefix"
-        );
-    }
-
-    /// A platform caller authorizes only what its grant covers, and holding a
-    /// platform permission never implies any tenant permission.
-    #[test]
-    fn authorization_follows_the_grant_and_never_reaches_a_tenant() {
-        let mut permissions = PermissionSet::new();
-        permissions.insert(Permission::tenant_create());
-        let caller = caller(permissions);
-
-        assert!(caller.authorize(&Permission::tenant_create()).is_ok());
-        assert!(caller.authorize(&Permission::tenant_suspend()).is_err());
-        assert!(
-            caller.authorize(&Permission::card_read()).is_err(),
-            "platform authority never confers tenant data access"
-        );
-    }
-
-    /// A platform caller has no tenant to offer any handler.
+    /// A platform caller has no tenant to offer any handler, so a platform
+    /// handler cannot open a tenant-scoped connection even by mistake.
     #[test]
     fn platform_caller_exposes_no_tenant() {
-        let caller = caller(PermissionSet::new());
+        let caller = caller();
 
         assert_eq!(caller.context.tenant_id(), None);
         assert!(caller.context.tenant().is_none());
     }
 
-    /// An empty grant authenticates but authorizes nothing: absence is denial.
+    /// The caller carries the credential that minted its session, so audit can
+    /// name the credential as well as the principal.
     #[test]
-    fn empty_grant_authorizes_nothing() {
-        let caller = caller(PermissionSet::new());
+    fn platform_caller_carries_its_minting_credential() {
+        let caller = caller();
 
-        assert!(caller.authorize(&Permission::tenant_create()).is_err());
-        assert!(caller.authorize(&Permission::tenant_read()).is_err());
+        assert_ne!(caller.credential_id, Uuid::nil());
+        assert_eq!(caller.principal_id(), caller.context.principal_id());
     }
 }

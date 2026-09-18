@@ -534,8 +534,8 @@ mod tests {
     use jsonwebtoken::{Algorithm, decode_header};
     use secrecy::{ExposeSecret, SecretString};
     use wyrd_auth_verify::{
-        AccessTokenClaims, ActClaim, RefreshTokenClaims, TokenPrincipalRef, decode_kid,
-        public_key_from_pem, verify_eddsa,
+        AccessTokenClaims, ActClaim, PLATFORM_TOKEN_SCOPE, PlatformAccessTokenClaims,
+        RefreshTokenClaims, TokenPrincipalRef, decode_kid, public_key_from_pem, verify_eddsa,
     };
     use wyrd_runtime::{PrincipalId, RoleRef};
     use wyrd_semver::VersionBlock;
@@ -919,6 +919,51 @@ mod tests {
             "wyrd",
         );
         assert!(matches!(result, Err(IssueError::Signing(_))));
+    }
+
+    /// A platform token verifies as platform claims and carries the scope
+    /// marker, the principal, and the credential that minted it.
+    #[test]
+    fn platform_token_carries_scope_principal_and_credential() {
+        let principal = PrincipalId::new(uuid::Uuid::now_v7());
+        let credential = uuid::Uuid::now_v7();
+
+        let token = issuing_key()
+            .issue_platform_access_token(principal, credential, Duration::minutes(15))
+            .expect("platform token issues");
+        let claims: PlatformAccessTokenClaims =
+            verify_eddsa(&token, &public_key(), Some("wyrd")).expect("platform token verifies");
+
+        assert_eq!(claims.scope, PLATFORM_TOKEN_SCOPE);
+        assert_eq!(claims.sub, principal.to_string());
+        assert_eq!(claims.cid, credential.to_string());
+    }
+
+    /// A tenant token cannot be read as platform claims, and a platform token
+    /// cannot be read as tenant claims. Neither plane can replay the other's
+    /// token, because the two claim shapes are structurally incompatible rather
+    /// than merely differently populated.
+    #[test]
+    fn the_two_planes_cannot_replay_each_others_tokens() {
+        let tenant_token = issue_user_test_token(Duration::minutes(15));
+        let platform_token = issuing_key()
+            .issue_platform_access_token(
+                PrincipalId::new(uuid::Uuid::now_v7()),
+                uuid::Uuid::now_v7(),
+                Duration::minutes(15),
+            )
+            .expect("platform token issues");
+
+        assert!(
+            verify_eddsa::<PlatformAccessTokenClaims>(&tenant_token, &public_key(), Some("wyrd"))
+                .is_err(),
+            "a tenant token must not verify as a platform session"
+        );
+        assert!(
+            verify_eddsa::<AccessTokenClaims>(&platform_token, &public_key(), Some("wyrd"))
+                .is_err(),
+            "a platform token must not verify as a tenant token"
+        );
     }
 
     fn issuing_key() -> IssuingKey {

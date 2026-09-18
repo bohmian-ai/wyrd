@@ -138,7 +138,7 @@ mod tests {
     fn service_kind(name: &str) -> PrincipalKind {
         let card_ref = card_ref(CardKind::Service, name);
         PrincipalKind::Service {
-            card_ref: card_ref.clone(),
+            card_ref: Some(card_ref.clone()),
             card_ref_scope: CardRefScope::own(&card_ref),
         }
     }

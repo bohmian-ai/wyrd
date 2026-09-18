@@ -1280,7 +1280,7 @@ mod tests {
         if let Ok(verified) = result {
             assert!(matches!(
                 verified.principal.kind,
-                PrincipalKind::Service { card_ref: ref actual, .. } if actual.as_ref() == Some(&card_ref)
+                PrincipalKind::Service { card_ref: Some(ref actual), .. } if actual == &card_ref
             ));
         }
     }

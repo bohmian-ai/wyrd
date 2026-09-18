@@ -2772,7 +2772,7 @@ mod tests {
         let principal = Principal::new(
             PrincipalId::new(Uuid::now_v7()),
             PrincipalKind::Service {
-                card_ref: card.clone(),
+                card_ref: Some(card.clone()),
                 card_ref_scope: CardRefScope::own(&card),
             },
             crate::test_support::tenant(),
@@ -2852,7 +2852,7 @@ mod tests {
         let principal = Principal::new(
             PrincipalId::new(Uuid::now_v7()),
             PrincipalKind::Service {
-                card_ref: card.clone(),
+                card_ref: Some(card.clone()),
                 card_ref_scope: CardRefScope::own(&card),
             },
             crate::test_support::tenant(),
@@ -3104,7 +3104,7 @@ mod tests {
         let principal = Principal::new(
             PrincipalId::new(Uuid::now_v7()),
             PrincipalKind::Service {
-                card_ref: card.clone(),
+                card_ref: Some(card.clone()),
                 card_ref_scope: CardRefScope::own(&card),
             },
             crate::test_support::tenant(),
@@ -3948,7 +3948,7 @@ mod tests {
         Principal::new(
             PrincipalId::new(Uuid::now_v7()),
             PrincipalKind::Service {
-                card_ref: root.clone(),
+                card_ref: Some(root.clone()),
                 card_ref_scope: scope,
             },
             crate::test_support::tenant(),

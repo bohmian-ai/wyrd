@@ -1471,7 +1471,7 @@ mod tests {
         let principal = Principal::new(
             PrincipalId::new(uuid::Uuid::now_v7()),
             PrincipalKind::Service {
-                card_ref: scope.as_slice()[0].clone(),
+                card_ref: Some(scope.as_slice()[0].clone()),
                 card_ref_scope: scope,
             },
             tenant,

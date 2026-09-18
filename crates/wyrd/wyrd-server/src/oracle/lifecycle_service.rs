@@ -471,7 +471,7 @@ pub(crate) mod pg_tests {
             uid: None,
         };
         let service_kind = PrincipalKind::Service {
-            card_ref: card_ref.clone(),
+            card_ref: Some(card_ref.clone()),
             card_ref_scope: CardRefScope::own(&card_ref),
         };
         let principal = |kind, tenant_id, permissions| Principal {

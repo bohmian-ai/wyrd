@@ -393,7 +393,7 @@ mod tests {
     /// Builds the Service principal kind bound to `card`.
     fn service_kind(card: &CardRef) -> PrincipalKind {
         PrincipalKind::Service {
-            card_ref: card.clone(),
+            card_ref: Some(card.clone()),
             card_ref_scope: CardRefScope::own(card),
         }
     }

@@ -198,7 +198,8 @@ mod pg_tests {
             .expect("issued token verifies");
         assert!(matches!(
             &verified.principal.kind,
-            PrincipalKind::Service { card_ref, .. } if *card_ref == binding.card_ref
+            PrincipalKind::Service { card_ref, .. }
+                if card_ref.as_ref() == Some(&binding.card_ref)
         ));
         assert_eq!(role_names(&verified.principal.roles), set_of(&[role_name]));
         assert_eq!(exchanged.token_type, TokenType::Bearer);
@@ -479,7 +480,8 @@ mod pg_tests {
             .expect("issued token verifies");
         assert!(matches!(
             &verified.principal.kind,
-            PrincipalKind::Service { card_ref, .. } if *card_ref == binding.card_ref
+            PrincipalKind::Service { card_ref, .. }
+                if card_ref.as_ref() == Some(&binding.card_ref)
         ));
     }
 
@@ -801,7 +803,7 @@ mod pg_tests {
             &prefix,
             &key_hash,
             created_by,
-            Utc::now() + ChronoDuration::days(30),
+            Some(Utc::now() + ChronoDuration::days(30)),
         )
         .await
         .expect("api key inserts");

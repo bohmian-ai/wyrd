@@ -2654,7 +2654,7 @@ impl WyrdTestServer {
             &mut conn,
             principal_id,
             principal_kind,
-            card_ref,
+            Some(card_ref),
             card_ref.name.as_str(),
             None,
             creator_id,
@@ -2729,7 +2729,7 @@ impl WyrdTestServer {
             &api_key.prefix,
             &key_hash,
             creator_id,
-            chrono::Utc::now() + chrono::Duration::days(365),
+            Some(chrono::Utc::now() + chrono::Duration::days(365)),
         )
         .await
         .map_err(sql)?;
@@ -4330,7 +4330,7 @@ pub(crate) async fn provision_tenant_service_principal(
         &mut conn,
         principal_id,
         "service",
-        &service_ref,
+        Some(&service_ref),
         name,
         None,
         creator_id,
@@ -4344,7 +4344,7 @@ pub(crate) async fn provision_tenant_service_principal(
         &api_key.prefix,
         &key_hash,
         creator_id,
-        chrono::Utc::now() + chrono::Duration::days(1),
+        Some(chrono::Utc::now() + chrono::Duration::days(1)),
     )
     .await
     .map_err(sql)?;
@@ -4488,7 +4488,7 @@ pub(crate) async fn provision_bifrost_peer_principal(
         &mut conn,
         principal_id,
         "service",
-        &service_ref,
+        Some(&service_ref),
         shape.service_name(),
         None,
         creator_id,
@@ -4502,7 +4502,7 @@ pub(crate) async fn provision_bifrost_peer_principal(
         &api_key.prefix,
         &key_hash,
         creator_id,
-        chrono::Utc::now() + chrono::Duration::days(1),
+        Some(chrono::Utc::now() + chrono::Duration::days(1)),
     )
     .await
     .map_err(sql)?;

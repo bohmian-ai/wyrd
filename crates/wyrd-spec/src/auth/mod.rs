@@ -10,6 +10,7 @@ mod principal_kind;
 mod revoke;
 mod secret_bearer;
 mod tenant_admin;
+mod tenant_principals;
 mod token;
 
 pub use admin::{
@@ -30,5 +31,9 @@ pub use secret_bearer::SecretBearer;
 pub use tenant_admin::{
     CreateTenantRequest, CreateTenantResponse, PlatformTokenRequest, PlatformTokenResponse,
     ProvisionedTenant, ProvisionedTenantAdmin, RecoverTenantAdminRequest,
+};
+pub use tenant_principals::{
+    CreateServicePrincipalRequest, CreateServicePrincipalResponse, CredentialListResponse,
+    CredentialMetadata, IssuedCredential,
 };
 pub use token::{RequestedSubject, SubjectTokenType, TokenRequest, TokenResponse, TokenType};

@@ -20,6 +20,7 @@ use crate::components::cards::cards_router;
 use crate::components::eval::eval_router;
 use crate::components::health::health_router;
 use crate::components::platform::{platform_auth_router, platform_router};
+use crate::components::principals::principals_router;
 use crate::components::storage::storage_router;
 use crate::http::error::WyrdErrorResponse;
 use crate::http::middleware::authenticate::require_authenticated;
@@ -49,6 +50,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(eval_router())
         .merge(authz_router())
         .merge(cards_router())
+        .merge(principals_router())
         .merge(admin_router())
         .merge(bifrost_router())
         .merge(query_router())

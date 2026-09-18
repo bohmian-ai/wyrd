@@ -1,0 +1,75 @@
+//! Wire contract for tenant-scoped principal and credential administration.
+
+use serde::{Deserialize, Serialize};
+
+use crate::auth::{PrincipalId, SecretBearer};
+
+/// Request to create a tenant-scoped machine principal.
+///
+/// The principal binds no Card: it is tenant automation — a CI runner, a
+/// deployment agent — rather than a deployed workload with an emit scope.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct CreateServicePrincipalRequest {
+    /// Operator-facing name, unique within the tenant.
+    pub name: String,
+    /// Roles to grant. Narrower than tenant administration, so automation never
+    /// needs the tenant administrative credential.
+    pub roles: Vec<String>,
+    /// Optional description.
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// A created machine principal and its first credential.
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct CreateServicePrincipalResponse {
+    /// Durable principal id, stable across credential rotation.
+    pub principal_id: PrincipalId,
+    /// Its first credential, returned exactly once.
+    #[schemars(with = "String")]
+    pub credential: SecretBearer,
+}
+
+/// A newly issued credential for an existing principal.
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct IssuedCredential {
+    /// Credential id, used to revoke it.
+    pub id: String,
+    /// The plaintext, returned exactly once.
+    #[schemars(with = "String")]
+    pub credential: SecretBearer,
+}
+
+/// Non-secret metadata for one credential.
+///
+/// Rotation works by overlap — issue, verify, then revoke — so a listing shows
+/// revoked and expired credentials too; an operator mid-rotation needs to see
+/// that the superseded one really is gone.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct CredentialMetadata {
+    /// Credential id.
+    pub id: String,
+    /// Non-secret lookup prefix.
+    pub prefix: String,
+    /// Creation time, RFC 3339.
+    pub created_at: String,
+    /// Expiry, when bounded.
+    pub expires_at: Option<String>,
+    /// Revocation time, when revoked.
+    pub revoked_at: Option<String>,
+    /// Last successful use.
+    pub last_used_at: Option<String>,
+}
+
+/// A principal's credential metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct CredentialListResponse {
+    /// Credentials, newest first. Never any secret material.
+    pub credentials: Vec<CredentialMetadata>,
+}

@@ -7,4 +7,5 @@ pub mod cards;
 pub mod eval;
 pub mod health;
 pub mod platform;
+pub mod principals;
 pub mod storage;

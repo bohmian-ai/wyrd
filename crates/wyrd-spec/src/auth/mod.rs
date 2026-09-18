@@ -9,6 +9,7 @@ mod principal_id;
 mod principal_kind;
 mod revoke;
 mod secret_bearer;
+mod tenant_admin;
 mod token;
 
 pub use admin::{
@@ -26,4 +27,7 @@ pub use principal_id::{PLATFORM_AUDIT_PRINCIPAL, PrincipalId};
 pub use principal_kind::PrincipalKindTag;
 pub use revoke::{RevokePrincipalRequest, RevokePrincipalResponse};
 pub use secret_bearer::SecretBearer;
+pub use tenant_admin::{
+    CreateTenantRequest, CreateTenantResponse, ProvisionedTenant, ProvisionedTenantAdmin,
+};
 pub use token::{RequestedSubject, SubjectTokenType, TokenRequest, TokenResponse, TokenType};

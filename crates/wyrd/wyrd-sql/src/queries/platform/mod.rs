@@ -14,5 +14,6 @@ pub mod audit_authz;
 pub mod credentials;
 pub mod principal_grants;
 pub mod principals;
+pub mod provisioning;
 pub mod tenant_resolver;
 pub mod tenants;

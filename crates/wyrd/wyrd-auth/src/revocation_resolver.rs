@@ -113,10 +113,23 @@ impl RevocationCheck for SqlRevocationCheck {
                             PrincipalKindTag::User => user_revocation_epoch(&mut conn, id_uuid)
                                 .await
                                 .map_err(|e| ResolveError::Unavailable(e.to_string()))?,
-                            PrincipalKindTag::Service | PrincipalKindTag::Agent => {
+                            PrincipalKindTag::TenantAdmin
+                            | PrincipalKindTag::Service
+                            | PrincipalKindTag::Agent => {
                                 service_account_revocation_epoch(&mut conn, id_uuid)
                                     .await
                                     .map_err(|e| ResolveError::Unavailable(e.to_string()))?
+                            }
+                            // A platform-scope principal has no tenant-scoped
+                            // revocation epoch. Reaching here means a token
+                            // claimed platform scope inside a tenant lookup, so
+                            // the resolution fails closed rather than returning
+                            // an epoch that would admit it.
+                            PrincipalKindTag::GlobalAdmin => {
+                                return Err(ResolveError::Unavailable(
+                                    "platform-scope principal has no tenant revocation epoch"
+                                        .to_owned(),
+                                ));
                             }
                         };
                     Ok(epoch)

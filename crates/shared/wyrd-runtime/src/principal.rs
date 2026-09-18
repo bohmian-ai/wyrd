@@ -275,7 +275,7 @@ mod tests {
         let principal = Principal {
             id: PrincipalId::new(uuid::Uuid::now_v7()),
             kind: PrincipalKind::Service {
-                card_ref: card_ref.clone(),
+                card_ref: Some(card_ref.clone()),
                 card_ref_scope: CardRefScope::own(&card_ref),
             },
             tenant_id: wyrd_spec::DataTenantId::new_v7(),
@@ -292,7 +292,7 @@ mod tests {
         let principal = Principal {
             id: PrincipalId::new(uuid::Uuid::now_v7()),
             kind: PrincipalKind::Service {
-                card_ref: card_ref.clone(),
+                card_ref: Some(card_ref.clone()),
                 card_ref_scope: CardRefScope::own(&card_ref),
             },
             tenant_id: wyrd_spec::DataTenantId::new_v7(),
@@ -319,7 +319,7 @@ mod tests {
         let principal = Principal {
             id: PrincipalId::new(uuid::Uuid::now_v7()),
             kind: PrincipalKind::Service {
-                card_ref: own.clone(),
+                card_ref: Some(own.clone()),
                 card_ref_scope: CardRefScope::from_root_and_members(&own, [composed.clone()]),
             },
             tenant_id: wyrd_spec::DataTenantId::new_v7(),

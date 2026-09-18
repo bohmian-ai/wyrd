@@ -118,7 +118,7 @@ impl IssueApiKey {
             &prefix,
             &key_hash,
             actor.id.as_uuid(),
-            expires_at,
+            Some(expires_at),
         )
         .await?;
 

@@ -998,7 +998,7 @@ mod tests {
         let principal = Principal::new(
             principal_id(),
             PrincipalKind::Service {
-                card_ref: card_ref.clone(),
+                card_ref: Some(card_ref.clone()),
                 card_ref_scope: CardRefScope::own(&card_ref),
             },
             tenant_id(),
@@ -1123,12 +1123,51 @@ mod tests {
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
     }
 
+    /// A Card-free service is a valid machine principal: Card binding is a
+    /// property of a deployed workload, not a precondition for holding a
+    /// credential. It resolves with no bound Card and therefore no emit scope.
     #[tokio::test]
-    async fn into_verified_rejects_non_user_without_card_ref() {
+    async fn into_verified_accepts_card_free_service_with_empty_scope() {
         let claims = AccessTokenClaims {
             principal: TokenPrincipalRef {
                 kind: PrincipalKindTag::Service,
                 card_ref: None,
+                card_ref_scope: CardRefScope::default(),
+                ..user_ref()
+            },
+            ..claims_with_times(now() + 3_600, now())
+        };
+
+        let verified = claims
+            .into_verified(&TestResolver::default())
+            .await
+            .expect("card-free service resolves");
+
+        assert!(matches!(
+            verified.principal.kind,
+            PrincipalKind::Service { card_ref: None, .. }
+        ));
+        assert_eq!(verified.principal.card_ref(), None);
+        assert!(
+            verified
+                .principal
+                .card_ref_scope()
+                .expect("service reports a scope")
+                .is_empty(),
+            "a Card-free service carries no emit authority"
+        );
+    }
+
+    /// A Card-free service claiming emit scope is refused: scope is derived
+    /// from a bound Card, so a populated scope without one is unattributable.
+    #[tokio::test]
+    async fn into_verified_rejects_card_free_service_claiming_scope() {
+        let borrowed = card_ref(CardKind::Service);
+        let claims = AccessTokenClaims {
+            principal: TokenPrincipalRef {
+                kind: PrincipalKindTag::Service,
+                card_ref: None,
+                card_ref_scope: CardRefScope::own(&borrowed),
                 ..user_ref()
             },
             ..claims_with_times(now() + 3_600, now())
@@ -1137,6 +1176,24 @@ mod tests {
         let result = claims.into_verified(&TestResolver::default()).await;
 
         assert!(matches!(result, Err(AuthError::InvalidCardRef)));
+    }
+
+    /// A platform-scope kind can never resolve to a tenant-scope principal,
+    /// even from an otherwise valid token.
+    #[tokio::test]
+    async fn into_verified_rejects_platform_scope_kind() {
+        let claims = AccessTokenClaims {
+            principal: TokenPrincipalRef {
+                kind: PrincipalKindTag::GlobalAdmin,
+                card_ref: None,
+                ..user_ref()
+            },
+            ..claims_with_times(now() + 3_600, now())
+        };
+
+        let result = claims.into_verified(&TestResolver::default()).await;
+
+        assert!(matches!(result, Err(AuthError::InvalidToken)));
     }
 
     #[tokio::test]
@@ -1225,7 +1282,7 @@ mod tests {
         if let Ok(verified) = result {
             assert!(matches!(
                 verified.principal.kind,
-                PrincipalKind::Service { card_ref: ref actual, .. } if actual == &card_ref
+                PrincipalKind::Service { card_ref: ref actual, .. } if actual.as_ref() == Some(&card_ref)
             ));
         }
     }

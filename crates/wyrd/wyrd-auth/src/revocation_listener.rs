@@ -36,12 +36,7 @@ pub async fn notify_principal_revoked(
     kind: PrincipalKindTag,
     id: PrincipalId,
 ) -> Result<(), sqlx::Error> {
-    let kind_str = match kind {
-        PrincipalKindTag::User => "user",
-        PrincipalKindTag::Service => "service",
-        PrincipalKindTag::Agent => "agent",
-    };
-    let payload = format!("{tenant}/{kind_str}/{id}");
+    let payload = format!("{tenant}/{kind}/{id}", kind = kind.as_str());
     sqlx::query("SELECT pg_notify($1, $2)")
         .bind(CHANNEL)
         .bind(&payload)

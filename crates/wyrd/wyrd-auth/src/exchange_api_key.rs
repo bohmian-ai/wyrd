@@ -140,10 +140,11 @@ pub(crate) enum RefreshPolicy {
 pub(crate) struct IssueSubject {
     /// Stable principal id.
     pub principal_id: Uuid,
-    /// Principal kind: `"service"` or `"agent"`.
+    /// Principal kind label, as stored on the durable principal row.
     pub principal_kind: String,
-    /// Principal card reference embedded in the access token.
-    pub card_ref: CardRef,
+    /// Bound Card reference embedded in the access token, absent for a
+    /// principal that binds no Card.
+    pub card_ref: Option<CardRef>,
     /// Effective roles embedded in the access token.
     pub roles: Vec<RoleRef>,
 }
@@ -249,7 +250,7 @@ impl ExchangeApiKey {
             IssueSubject {
                 principal_id: row.principal_id,
                 principal_kind: row.principal_kind,
-                card_ref: row.card_ref.0,
+                card_ref: row.card_ref.map(|card_ref| card_ref.0),
                 roles,
             },
             RefreshPolicy::Mint,
@@ -287,7 +288,7 @@ impl DelegateToken {
         let row = resolve_requested_subject(conn, requested_subject).await?;
         let requested_card_ref = row.card_ref.0.clone();
         let card_ref_scope = resolve_card_ref_scope(conn, &requested_card_ref).await?;
-        let _ = runtime_principal_kind(&row.principal_kind, requested_card_ref.clone())
+        let _ = runtime_principal_kind(&row.principal_kind, Some(requested_card_ref.clone()))
             .ok_or(DelegateError::SubjectNotFound)?;
         let roles = role_refs(list_service_account_roles(conn, row.id).await?)
             .map_err(|_| DelegateError::InvalidRole)?;
@@ -376,6 +377,13 @@ pub(crate) async fn issue_for_subject(
         roles,
     } = subject;
     let id = PrincipalId::new(principal_id);
+    // This path mints Card-bound access tokens, whose claims carry the bound
+    // Card and the emit scope derived from it. A Card-free principal has no
+    // such claims to carry, so it is refused here rather than minted with a
+    // fabricated binding.
+    let Some(card_ref) = card_ref else {
+        return Err(IssueOrSqlError::Issue(IssueError::InvalidPrincipalKind));
+    };
     let card_ref_scope = resolve_card_ref_scope(conn, &card_ref).await?;
     let access_token = match principal_kind.as_str() {
         "service" => issuing_key
@@ -512,16 +520,27 @@ pub(crate) fn principal_kind_wire(value: &str) -> Option<PrincipalKindTag> {
     }
 }
 
-fn runtime_principal_kind(value: &str, card_ref: CardRef) -> Option<PrincipalKind> {
-    match value {
-        "service" if card_ref.kind == CardKind::Service => {
+/// Rebuild the runtime principal kind from its durable label and Card binding.
+///
+/// Card binding is a property of a machine principal rather than a
+/// precondition, so a `service` row with no Card resolves to a Card-free
+/// service that carries no emit scope. A mismatched Card kind resolves to
+/// `None`, which the caller turns into a fail-closed refusal.
+fn runtime_principal_kind(value: &str, card_ref: Option<CardRef>) -> Option<PrincipalKind> {
+    match (value, card_ref) {
+        ("tenant_admin", None) => Some(PrincipalKind::TenantAdmin),
+        ("service", None) => Some(PrincipalKind::Service {
+            card_ref: None,
+            card_ref_scope: CardRefScope::default(),
+        }),
+        ("service", Some(card_ref)) if card_ref.kind == CardKind::Service => {
             let card_ref_scope = CardRefScope::own(&card_ref);
             Some(PrincipalKind::Service {
-                card_ref,
+                card_ref: Some(card_ref),
                 card_ref_scope,
             })
         }
-        "agent" if card_ref.kind == CardKind::Agent => {
+        ("agent", Some(card_ref)) if card_ref.kind == CardKind::Agent => {
             let card_ref_scope = CardRefScope::own(&card_ref);
             Some(PrincipalKind::Agent {
                 card_ref,
@@ -862,7 +881,7 @@ mod pg_tests {
             principal: RuntimePrincipalRef {
                 id: id_a,
                 kind: PrincipalKind::Service {
-                    card_ref: initiator_ref.clone(),
+                    card_ref: Some(initiator_ref.clone()),
                     card_ref_scope: CardRefScope::own(&initiator_ref),
                 },
             },
@@ -872,7 +891,7 @@ mod pg_tests {
             principal: RuntimePrincipalRef {
                 id: id_b,
                 kind: PrincipalKind::Service {
-                    card_ref: immediate_ref.clone(),
+                    card_ref: Some(immediate_ref.clone()),
                     card_ref_scope: CardRefScope::own(&immediate_ref),
                 },
             },

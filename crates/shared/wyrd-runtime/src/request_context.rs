@@ -163,7 +163,7 @@ mod tests {
         Principal {
             id: PrincipalId::new(uuid::Uuid::now_v7()),
             kind: PrincipalKind::Service {
-                card_ref: card_ref.clone(),
+                card_ref: Some(card_ref.clone()),
                 card_ref_scope: CardRefScope::own(&card_ref),
             },
             tenant_id: wyrd_spec::DataTenantId::new_v7(),

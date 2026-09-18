@@ -466,14 +466,30 @@ fn act_depth(act: Option<&ActClaim>) -> usize {
     1 + act_depth(act.act.as_deref())
 }
 
+/// Reject a principal projection whose kind and Card binding disagree.
+///
+/// Card binding is a property of a machine principal: an agent must carry an
+/// Agent card, a service may carry a Service card or none at all, and an
+/// administrative or human principal must carry none. A platform-scope kind is
+/// rejected outright because tenant-scope tokens are not issued for it.
+///
+/// # Errors
+/// Returns [`IssueError::InvalidCardRef`] when the kind and Card binding
+/// disagree, or when the kind is platform-scoped.
 fn validate_principal_ref(principal: &TokenPrincipalRef) -> Result<(), IssueError> {
     match (
         principal.kind,
         principal.card_ref.as_ref().map(|card_ref| &card_ref.kind),
     ) {
-        (PrincipalKindTag::User, None) => Ok(()),
-        (PrincipalKindTag::User, Some(_)) => Err(IssueError::InvalidCardRef),
-        (PrincipalKindTag::Service, Some(CardKind::Service)) => Ok(()),
+        // A platform-scope principal is never issued a tenant-scope token. The
+        // platform plane has its own credential path, so a token request
+        // carrying this kind is malformed rather than merely unauthorized.
+        (PrincipalKindTag::GlobalAdmin, _) => Err(IssueError::InvalidCardRef),
+        (PrincipalKindTag::TenantAdmin | PrincipalKindTag::User, None) => Ok(()),
+        (PrincipalKindTag::TenantAdmin | PrincipalKindTag::User, Some(_)) => {
+            Err(IssueError::InvalidCardRef)
+        }
+        (PrincipalKindTag::Service, Some(CardKind::Service) | None) => Ok(()),
         (PrincipalKindTag::Agent, Some(CardKind::Agent)) => Ok(()),
         (PrincipalKindTag::Service | PrincipalKindTag::Agent, _) => Err(IssueError::InvalidCardRef),
     }

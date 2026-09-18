@@ -46,8 +46,8 @@ pub struct ApiKeyLookupRow {
     pub principal_id: Uuid,
     /// Principal kind, `service` or `agent`.
     pub principal_kind: String,
-    /// Structured card reference.
-    pub card_ref: Json<CardRef>,
+    /// Structured card reference, absent for principals that bind no Card.
+    pub card_ref: Option<Json<CardRef>>,
     /// Principal status.
     pub status: String,
 }
@@ -55,7 +55,8 @@ pub struct ApiKeyLookupRow {
 /// API-key status derived from row presence and lifecycle timestamps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiKeyStatus {
-    /// Row exists, `revoked_at IS NULL`, and `expires_at > now()`.
+    /// Row exists, `revoked_at IS NULL`, and the credential is unexpired —
+    /// either `expires_at IS NULL` or `expires_at > now()`.
     Active,
     /// Row exists and `revoked_at IS NOT NULL`.
     Revoked,
@@ -172,26 +173,36 @@ pub async fn service_account_by_id(
     .await
 }
 
-/// Insert a hashed API key row.
+/// Insert a hashed credential row for a tenant-scope principal.
+///
+/// Stores only the Argon2 verifier and non-secret lookup metadata; the
+/// plaintext is returned once by the issuing caller and never persisted.
+/// `expires_at` is optional: an administrative credential issued during tenant
+/// provisioning or recovery has no natural lifetime, while a workload key keeps
+/// the bounded expiry its issuance path supplies.
+///
+/// # Errors
+/// Returns the database error when the insert fails, including when `prefix`
+/// collides within the tenant or `principal_id` names no principal.
 pub async fn insert_api_key(
     conn: &mut TenantConn<'_>,
     id: Uuid,
-    sa_id: Uuid,
+    principal_id: Uuid,
     prefix: &str,
     key_hash: &str,
     created_by: Uuid,
-    expires_at: DateTime<Utc>,
+    expires_at: Option<DateTime<Utc>>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
         INSERT INTO wyrd.auth_api_keys (
-            id, data_tenant_id, sa_id, prefix, key_hash, created_by, expires_at
+            id, data_tenant_id, principal_id, prefix, key_hash, created_by, expires_at
         ) VALUES ($1, $2, $3, $4, $5, $6, $7)
         "#,
     )
     .bind(id)
     .bind(conn.data_tenant_id().as_uuid())
-    .bind(sa_id)
+    .bind(principal_id)
     .bind(prefix)
     .bind(key_hash)
     .bind(created_by)
@@ -217,11 +228,11 @@ pub async fn api_key_by_prefix(
           FROM wyrd.auth_api_keys k
           JOIN wyrd.auth_service_accounts sa
             ON sa.data_tenant_id = k.data_tenant_id
-           AND sa.id = k.sa_id
+           AND sa.id = k.principal_id
          WHERE k.data_tenant_id = $1
            AND k.prefix = $2
            AND k.revoked_at IS NULL
-           AND k.expires_at > now()
+           AND (k.expires_at IS NULL OR k.expires_at > now())
          LIMIT 1
         "#,
     )
@@ -336,17 +347,18 @@ mod tests {
           FROM wyrd.auth_api_keys k
           JOIN wyrd.auth_service_accounts sa
             ON sa.data_tenant_id = k.data_tenant_id
-           AND sa.id = k.sa_id
+           AND sa.id = k.principal_id
          WHERE k.data_tenant_id = $1
            AND k.prefix = $2
            AND k.revoked_at IS NULL
-           AND k.expires_at > now()
+           AND (k.expires_at IS NULL OR k.expires_at > now())
          LIMIT 1
         "#;
 
         assert!(sql.contains("k.prefix = $2"));
         assert!(sql.contains("k.revoked_at IS NULL"));
-        assert!(sql.contains("k.expires_at > now()"));
+        assert!(sql.contains("(k.expires_at IS NULL OR k.expires_at > now())"));
+        assert!(sql.contains("sa.id = k.principal_id"));
         assert!(sql.contains("sa.data_tenant_id = k.data_tenant_id"));
     }
 

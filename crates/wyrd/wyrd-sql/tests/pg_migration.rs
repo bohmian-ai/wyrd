@@ -172,7 +172,15 @@ mod pg_tests {
         assert_regclass_exists(pool, "platform._sqlx_migrations", false).await;
         assert_regclass_exists(pool, "public._sqlx_migrations", false).await;
         assert_regclass_exists(pool, "platform.tenants", true).await;
-        assert_regclass_exists(pool, "platform.users", true).await;
+        // The pre-principal platform identity model is retired; administrative
+        // identity is principals, credentials, and grants.
+        assert_regclass_exists(pool, "platform.users", false).await;
+        assert_regclass_exists(pool, "platform.roles", false).await;
+        assert_regclass_exists(pool, "platform.user_roles", false).await;
+        assert_regclass_exists(pool, "platform.api_keys", false).await;
+        assert_regclass_exists(pool, "platform.principals", true).await;
+        assert_regclass_exists(pool, "platform.credentials", true).await;
+        assert_regclass_exists(pool, "platform.principal_grants", true).await;
         // The greenfield baseline has one audit authority: the tenant
         // `vala.audit_staging` chain published into `vala.system.audit_log`.
         assert_regclass_exists(pool, "platform.audit_log", false).await;

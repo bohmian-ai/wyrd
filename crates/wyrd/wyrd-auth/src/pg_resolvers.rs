@@ -25,8 +25,8 @@ use serde_json::Value;
 use sqlx::PgPool;
 use url::Url;
 use wyrd_auth_oidc::{
-    ClaimMapping, ClaimPath, ClientAuth, IssuerConfigResolver, OidcError, TrustedIssuer,
-    WorkloadBinding, WorkloadBindingResolver,
+    ClaimMapping, ClaimPath, ClientAuth, IssuerConfigResolver, IssuerVerification, OidcError,
+    TrustedIssuer, WorkloadBinding, WorkloadBindingResolver,
 };
 use wyrd_crypt::{CryptError, EncryptedPayload, SecretKey};
 use wyrd_spec::DataTenantId;
@@ -38,6 +38,7 @@ use wyrd_sql::queries::auth::{
     TrustedIssuerWrite, WorkloadBindingWrite, trusted_issuer_by_url, trusted_issuers_for_tenant,
     workload_binding_by_subject,
 };
+use wyrd_sql::queries::platform::identity::PlatformOidcConnectionRow;
 use wyrd_sql::row_types::auth::TrustedIssuerRow;
 
 /// AES-GCM nonce length; the leading prefix of every `client_secret_enc` value.
@@ -436,6 +437,102 @@ fn trusted_issuer_from_row(
         principal_kind,
         jwks_ttl: Duration::from_secs(row.jwks_ttl_secs.max(0).unsigned_abs()),
     })
+}
+
+// --------------------------------------------------------------------------
+// Row -> platform connection
+// --------------------------------------------------------------------------
+
+/// Reconstruct the platform-scope OIDC connection from its stored row.
+///
+/// Shares every decode step with the tenant issuer path — sealed client secret,
+/// claim mapping, URL validation — because the platform connection is the same
+/// kind of thing minus the tenancy. It produces [`IssuerVerification`] directly
+/// rather than a [`TrustedIssuer`], since a platform connection has no tenant
+/// to put in one and no groups or default roles to carry: a platform
+/// principal's authority comes from its grant, never from a provider claim.
+///
+/// # Errors
+/// Returns an error when the issuer or JWKS URL is malformed, the claim mapping
+/// cannot be decoded, or the client authentication cannot be reconstructed —
+/// including when the row carries a secret and no sealing key is configured,
+/// which fails closed rather than degrading to an unauthenticated client.
+pub fn platform_connection_from_row(
+    row: PlatformOidcConnectionRow,
+    sealing_key: Option<&SecretKey>,
+) -> Result<crate::platform_login::PlatformConnection, PlatformConnectionError> {
+    let issuer = IssuerUrl::new(row.issuer_url.clone())
+        .map_err(|error| PlatformConnectionError::IssuerUrl(error.to_string()))?;
+    let jwks_uri = Url::parse(&row.jwks_uri)
+        .map_err(|error| PlatformConnectionError::JwksUri(error.to_string()))?;
+    let client_auth = client_auth_from_row(
+        &row.client_auth,
+        row.client_secret_enc.as_deref(),
+        sealing_key,
+    )
+    .map_err(|error| PlatformConnectionError::ClientAuth(error.to_string()))?;
+    let claim_mapping = claim_mapping_from_value(row.claim_mapping)
+        .map_err(|error| PlatformConnectionError::ClaimMapping(error.to_string()))?;
+
+    Ok(crate::platform_login::PlatformConnection {
+        verification: IssuerVerification {
+            issuer,
+            jwks_uri,
+            expected_audience: row.expected_audience,
+            claim_mapping,
+            // A platform connection exists to let people sign in. A workload
+            // reaches the platform plane with a credential, never a federated
+            // token, so this is not configurable.
+            principal_kind: IssuerTokenPolicy::Human,
+        },
+        client_id: row.client_id,
+        client_auth,
+    })
+}
+
+/// Failure decoding a stored platform OIDC connection.
+#[derive(Debug, thiserror::Error)]
+pub enum PlatformConnectionError {
+    /// The stored issuer URL is not a valid issuer.
+    #[error("stored platform issuer url is invalid: {0}")]
+    IssuerUrl(String),
+    /// The stored JWKS URL is not a valid URL.
+    #[error("stored platform jwks uri is invalid: {0}")]
+    JwksUri(String),
+    /// The client authentication could not be reconstructed.
+    #[error("stored platform client authentication is unusable: {0}")]
+    ClientAuth(String),
+    /// The claim mapping payload could not be decoded.
+    #[error("stored platform claim mapping is invalid: {0}")]
+    ClaimMapping(String),
+}
+
+/// Seal a platform connection's client secret for storage.
+///
+/// # Errors
+/// Returns [`IssuerSealError::SealingKeyMissing`] when a secret is present and
+/// no sealing key is configured, and [`IssuerSealError::Encrypt`] when
+/// encryption fails. A secret-bearing connection is never stored in the clear.
+pub fn seal_platform_client_secret(
+    client_auth: &ClientAuth,
+    sealing_key: Option<&SecretKey>,
+) -> Result<Option<Vec<u8>>, IssuerSealError> {
+    match client_auth {
+        ClientAuth::SecretBasic(secret) | ClientAuth::SecretPost(secret) => {
+            let key = sealing_key.ok_or(IssuerSealError::SealingKeyMissing)?;
+            Ok(Some(
+                seal_secret(key, secret.expose_secret().as_bytes())
+                    .map_err(|_| IssuerSealError::Encrypt)?,
+            ))
+        }
+        ClientAuth::PrivateKeyJwt | ClientAuth::Public => Ok(None),
+    }
+}
+
+/// Name the stored discriminant for a client authentication method.
+#[must_use]
+pub fn client_auth_label(auth: &ClientAuth) -> &'static str {
+    client_auth_discriminant(auth)
 }
 
 // --------------------------------------------------------------------------

@@ -774,12 +774,18 @@ pub struct AccessTokenClaims {
 pub struct PlatformAccessTokenClaims {
     /// Platform principal id, JWT `sub`.
     pub sub: String,
-    /// Credential that minted this token.
+    /// Credential that minted this token, when one did.
     ///
     /// Checked on every verification so revoking a credential stops the tokens
     /// it issued, without a separate revocation epoch, and so audit can name
     /// which credential was used.
-    pub cid: String,
+    ///
+    /// Absent for a session established by federated login: a human presents an
+    /// identity, not a credential, so there is no credential to name or revoke.
+    /// Such a session is anchored on the principal instead, which is re-read on
+    /// every verification for the same reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cid: Option<String>,
     /// Control-plane marker. Always `platform`; any other value fails
     /// verification, so a tenant token cannot be replayed as a platform one.
     pub scope: String,

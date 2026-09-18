@@ -17,6 +17,7 @@ pub mod permission_resolver;
 pub mod pg_resolvers;
 pub mod platform_authz;
 pub mod platform_credentials;
+pub mod platform_login;
 pub mod platform_sessions;
 pub mod refresh;
 pub mod repo;

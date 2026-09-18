@@ -423,13 +423,13 @@ impl IssuingKey {
     pub fn issue_platform_access_token(
         &self,
         principal_id: PrincipalId,
-        credential_id: Uuid,
+        credential_id: Option<Uuid>,
         ttl: Duration,
     ) -> Result<String, IssueError> {
         let (iat, exp) = timestamps(ttl)?;
         let claims = PlatformAccessTokenClaims {
             sub: principal_id.to_string(),
-            cid: credential_id.to_string(),
+            cid: credential_id.map(|id| id.to_string()),
             scope: PLATFORM_TOKEN_SCOPE.to_owned(),
             exp,
             iat,

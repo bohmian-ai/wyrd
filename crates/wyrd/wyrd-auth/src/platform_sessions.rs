@@ -19,6 +19,7 @@ use wyrd_auth_issue::IssuingKey;
 use wyrd_auth_verify::{PLATFORM_TOKEN_SCOPE, PlatformAccessTokenClaims};
 use wyrd_spec::auth::PrincipalId;
 use wyrd_sql::queries::platform::credentials::platform_credential_by_id;
+use wyrd_sql::queries::platform::principals::platform_principal_by_id;
 use wyrd_sql::{OperatorPool, SqlError};
 
 use crate::platform_credentials::{PlatformCredentialError, PlatformCredentials};
@@ -48,7 +49,10 @@ pub struct VerifiedPlatformSession {
     pub principal_id: PrincipalId,
     /// Credential that minted the presented token, recorded in audit so an
     /// operation is traceable to the credential as well as the identity.
-    pub credential_id: Uuid,
+    ///
+    /// `None` for a session established by federated login, where the identity
+    /// is the whole story and no credential was presented.
+    pub credential_id: Option<Uuid>,
 }
 
 /// Platform session failure.
@@ -140,7 +144,7 @@ impl PlatformSessions {
             .issuing_key
             .issue_platform_access_token(
                 authenticated.principal_id,
-                authenticated.credential_id,
+                Some(authenticated.credential_id),
                 self.ttl,
             )
             .map_err(|error| PlatformSessionError::Key(error.to_string()))?;
@@ -150,6 +154,37 @@ impl PlatformSessions {
             principal_id: authenticated.principal_id,
             credential_id: authenticated.credential_id,
         })
+    }
+
+    /// Mint a platform session for an identity that federated login accepted.
+    ///
+    /// No credential is involved: the caller has already established *who* this
+    /// is by verifying a provider token and resolving it to a pre-registered
+    /// principal. The principal is re-read here so a suspended administrator
+    /// cannot obtain a session even with a valid provider token, which keeps
+    /// "authority is read from the store, not the token" true on this path too.
+    ///
+    /// # Errors
+    /// Returns [`PlatformSessionError::Invalid`] when the principal is unknown
+    /// or not active, [`PlatformSessionError::Key`] when signing fails, and
+    /// [`PlatformSessionError::Store`] when the principal cannot be read.
+    #[tracing::instrument(level = "debug", skip(self), err)]
+    pub async fn issue_federated(
+        &self,
+        principal_id: Uuid,
+    ) -> Result<SecretString, PlatformSessionError> {
+        let Some(principal) = platform_principal_by_id(&self.pool, principal_id).await? else {
+            return Err(PlatformSessionError::Invalid);
+        };
+        if !principal.is_active() {
+            return Err(PlatformSessionError::Invalid);
+        }
+
+        let token = self
+            .issuing_key
+            .issue_platform_access_token(PrincipalId::new(principal_id), None, self.ttl)
+            .map_err(|error| PlatformSessionError::Key(error.to_string()))?;
+        Ok(SecretString::from(token))
     }
 
     /// Confirm that verified platform claims still name a live session.
@@ -173,12 +208,38 @@ impl PlatformSessions {
         if claims.scope != PLATFORM_TOKEN_SCOPE {
             return Err(PlatformSessionError::Invalid);
         }
-        let (Ok(principal_id), Ok(credential_id)) =
-            (claims.sub.parse::<Uuid>(), claims.cid.parse::<Uuid>())
-        else {
+        let Ok(principal_id) = claims.sub.parse::<Uuid>() else {
             return Err(PlatformSessionError::Invalid);
         };
 
+        // Either anchor answers the same question — is the authority this token
+        // was minted under still live — and both re-read it from the store
+        // rather than trusting the token.
+        match claims.cid.as_deref() {
+            Some(cid) => self.confirm_credential_session(principal_id, cid).await,
+            None => self.confirm_federated_session(principal_id).await,
+        }
+    }
+
+    /// Confirm a session minted from a credential.
+    ///
+    /// Re-reading the credential is what makes revoking it end its sessions at
+    /// once. The row carries the principal's status, so a suspended principal
+    /// is rejected by the same read.
+    ///
+    /// # Errors
+    /// Returns [`PlatformSessionError::Invalid`] when the credential id is
+    /// malformed, unknown, revoked, expired, belongs to another principal, or
+    /// its principal is not active, and [`PlatformSessionError::Store`] when
+    /// the credential cannot be read.
+    async fn confirm_credential_session(
+        &self,
+        principal_id: Uuid,
+        cid: &str,
+    ) -> Result<VerifiedPlatformSession, PlatformSessionError> {
+        let Ok(credential_id) = cid.parse::<Uuid>() else {
+            return Err(PlatformSessionError::Invalid);
+        };
         let Some(row) = platform_credential_by_id(&self.pool, credential_id).await? else {
             return Err(PlatformSessionError::Invalid);
         };
@@ -188,7 +249,34 @@ impl PlatformSessions {
 
         Ok(VerifiedPlatformSession {
             principal_id: PrincipalId::new(principal_id),
-            credential_id,
+            credential_id: Some(credential_id),
+        })
+    }
+
+    /// Confirm a session established by federated login.
+    ///
+    /// There is no credential to re-read, so the principal itself is the
+    /// anchor: suspending it ends every session it holds on the next request,
+    /// which is the human equivalent of revoking a credential.
+    ///
+    /// # Errors
+    /// Returns [`PlatformSessionError::Invalid`] when the principal is unknown
+    /// or not active, and [`PlatformSessionError::Store`] when it cannot be
+    /// read.
+    async fn confirm_federated_session(
+        &self,
+        principal_id: Uuid,
+    ) -> Result<VerifiedPlatformSession, PlatformSessionError> {
+        let Some(principal) = platform_principal_by_id(&self.pool, principal_id).await? else {
+            return Err(PlatformSessionError::Invalid);
+        };
+        if !principal.is_active() {
+            return Err(PlatformSessionError::Invalid);
+        }
+
+        Ok(VerifiedPlatformSession {
+            principal_id: PrincipalId::new(principal_id),
+            credential_id: None,
         })
     }
 }

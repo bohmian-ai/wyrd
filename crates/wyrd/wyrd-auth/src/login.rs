@@ -100,13 +100,13 @@ pub async fn prepare_login(
     issuer: &IssuerUrl,
     redirect_uri: String,
 ) -> Result<LoginInitResponse, WyrdError> {
-    let authorization_endpoint = discover_authorization_endpoint(trusted).await?;
+    let authorization_endpoint = discover_authorization_endpoint(&trusted.issuer).await?;
     let state_key = auth_state_key();
     let code_verifier = pkce_verifier();
     let nonce = auth_nonce();
     let authz_url = build_authorization_url(
         &authorization_endpoint,
-        trusted,
+        &trusted.client_id,
         &redirect_uri,
         &state_key,
         code_verifier.expose_secret(),
@@ -142,12 +142,11 @@ pub async fn prepare_login(
 /// already owns the process or the issuer URL, metadata request, or response is
 /// invalid. Cancellation can interrupt discovery without persisting state.
 ///
-pub async fn discover_authorization_endpoint(trusted: &TrustedIssuer) -> Result<Url, WyrdError> {
-    let issuer_url =
-        Url::parse(trusted.issuer.as_str()).map_err(|_| WyrdError::DiscoveryUnavailable {
-            message: "trusted issuer URL could not be parsed".to_owned(),
-            details: serde_json::json!({}),
-        })?;
+pub async fn discover_authorization_endpoint(issuer: &IssuerUrl) -> Result<Url, WyrdError> {
+    let issuer_url = Url::parse(issuer.as_str()).map_err(|_| WyrdError::DiscoveryUnavailable {
+        message: "trusted issuer URL could not be parsed".to_owned(),
+        details: serde_json::json!({}),
+    })?;
     wyrd_tls::install_crypto_provider().map_err(|_| WyrdError::DiscoveryUnavailable {
         message: "OIDC TLS provider initialization failed".to_owned(),
         details: serde_json::json!({}),
@@ -164,15 +163,18 @@ pub async fn discover_authorization_endpoint(trusted: &TrustedIssuer) -> Result<
     Ok(provider.metadata.authorization_endpoint)
 }
 
-fn auth_state_key() -> String {
+/// Generate an unguessable login-state key.
+pub(crate) fn auth_state_key() -> String {
     random_b64url(32)
 }
 
-fn auth_nonce() -> String {
+/// Generate the nonce the returned ID token must echo.
+pub(crate) fn auth_nonce() -> String {
     random_b64url(32)
 }
 
-fn pkce_verifier() -> SecretString {
+/// Generate a PKCE code verifier.
+pub(crate) fn pkce_verifier() -> SecretString {
     SecretString::from(random_b64url(48))
 }
 
@@ -187,9 +189,14 @@ fn random_b64url(bytes: usize) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
 }
 
-fn build_authorization_url(
+/// Build the provider authorization URL for one login attempt.
+///
+/// Takes the client identifier rather than a whole trusted issuer because the
+/// platform control plane's connection is not a tenant's issuer, and the URL
+/// depends on nothing else about the issuer's trust configuration.
+pub(crate) fn build_authorization_url(
     authorization_endpoint: &Url,
-    trusted: &TrustedIssuer,
+    client_id: &str,
     redirect_uri: &str,
     state: &str,
     code_verifier: &str,
@@ -199,7 +206,7 @@ fn build_authorization_url(
     let challenge = pkce_challenge(code_verifier);
     let mut query = url.query_pairs_mut();
     query.append_pair("response_type", "code");
-    query.append_pair("client_id", &trusted.client_id);
+    query.append_pair("client_id", client_id);
     query.append_pair("redirect_uri", redirect_uri);
     query.append_pair("scope", "openid profile email");
     query.append_pair("code_challenge", &challenge);

@@ -94,9 +94,16 @@ impl AuthorizationCodeExchange {
                 &issuer,
             )
             .await?;
-            let provider = discover_provider(&trusted).await?;
-            let id_token =
-                exchange_code_for_id_token(&provider, &trusted, &login_state, code).await?;
+            let provider = discover_provider(&trusted.issuer).await?;
+            let id_token = exchange_code_for_id_token(
+                &provider,
+                &trusted.client_id,
+                &trusted.client_auth,
+                &login_state.redirect_uri,
+                &login_state.code_verifier,
+                code,
+            )
+            .await?;
             let token = self
                 .finish_authorization_code_exchange(FinishAuthorizationCodeInput {
                     postgres,
@@ -206,9 +213,9 @@ impl AuthorizationCodeExchange {
 /// Returns [`WyrdError::DiscoveryUnavailable`] when another Rustls provider
 /// already owns the process, the issuer URL is invalid, or discovery fails.
 /// Cancellation interrupts the request without persisting callback state.
-async fn discover_provider(trusted: &TrustedIssuer) -> Result<OidcProvider, WyrdError> {
+pub(crate) async fn discover_provider(issuer: &IssuerUrl) -> Result<OidcProvider, WyrdError> {
     let issuer_url =
-        url::Url::parse(trusted.issuer.as_str()).map_err(|_| WyrdError::DiscoveryUnavailable {
+        url::Url::parse(issuer.as_str()).map_err(|_| WyrdError::DiscoveryUnavailable {
             message: "trusted issuer URL could not be parsed".to_owned(),
             details: serde_json::json!({}),
         })?;
@@ -240,10 +247,12 @@ async fn discover_provider(trusted: &TrustedIssuer) -> Result<OidcProvider, Wyrd
 /// transport, response parsing, or token validation fails. Cancellation can
 /// leave the remote exchange outcome unknown, but this helper makes no local
 /// durable progress.
-async fn exchange_code_for_id_token(
+pub(crate) async fn exchange_code_for_id_token(
     provider: &OidcProvider,
-    trusted: &TrustedIssuer,
-    state: &LoginStateEntry,
+    client_id: &str,
+    client_auth: &ClientAuth,
+    redirect_uri: &str,
+    code_verifier: &SecretString,
     code: SecretString,
 ) -> Result<String, WyrdError> {
     let Some(token_endpoint) = provider.metadata.token_endpoint.clone() else {
@@ -262,18 +271,15 @@ async fn exchange_code_for_id_token(
     let mut form = vec![
         ("grant_type", "authorization_code".to_owned()),
         ("code", code.expose_secret().to_owned()),
-        ("client_id", trusted.client_id.clone()),
-        ("redirect_uri", state.redirect_uri.clone()),
-        (
-            "code_verifier",
-            state.code_verifier.expose_secret().to_owned(),
-        ),
+        ("client_id", client_id.to_owned()),
+        ("redirect_uri", redirect_uri.to_owned()),
+        ("code_verifier", code_verifier.expose_secret().to_owned()),
     ];
 
-    match &trusted.client_auth {
+    match client_auth {
         ClientAuth::SecretBasic(secret) => {
             request = request.basic_auth(
-                trusted.client_id.clone(),
+                client_id.to_owned(),
                 Some(secret.expose_secret().to_owned()),
             );
         }

@@ -92,6 +92,13 @@ pub enum Resource {
     ServiceAccounts,
     /// Human user administration.
     Users,
+    /// The tenant directory itself: creating, inspecting, suspending, and
+    /// recovering administration for a tenant.
+    ///
+    /// This is a platform-control-plane resource. It governs the lifecycle of a
+    /// tenant, never the resources inside one, so holding it grants no access
+    /// to any tenant's data.
+    Tenants,
     /// RFC 8693 token exchange and delegation.
     Delegation,
     /// Bifrost table definitions (DDL: create/list/describe).
@@ -132,6 +139,14 @@ pub enum Action {
     Run,
     /// Issue a token or delegated credential.
     Issue,
+    /// Suspend a resource without destroying it, and resume it.
+    Suspend,
+    /// Restore administrative access a tenant can no longer reach itself.
+    ///
+    /// Named separately from [`Self::Write`] so the one operation that lets the
+    /// platform plane act on a tenant's administration is distinguishable in a
+    /// grant and in audit, rather than hiding inside a general write.
+    Recover,
     /// One of several actions.
     AnyOf(Vec<Action>),
     /// All actions.
@@ -174,6 +189,7 @@ impl Resource {
             Self::Triggers => "triggers",
             Self::ServiceAccounts => "service_accounts",
             Self::Users => "users",
+            Self::Tenants => "tenants",
             Self::Delegation => "delegation",
             Self::BifrostTable => "bifrost_table",
             Self::BifrostRecord => "bifrost_record",
@@ -206,6 +222,8 @@ impl Action {
             Self::Lock => "lock",
             Self::Run => "run",
             Self::Issue => "issue",
+            Self::Suspend => "suspend",
+            Self::Recover => "recover",
             Self::Wildcard => "wildcard",
             Self::AnyOf(_) => return None,
         })
@@ -371,6 +389,50 @@ impl Permission {
         Self {
             resource: Resource::Policy,
             action: Action::Lock,
+            scope: PermissionScope::All,
+        }
+    }
+
+    /// Create a tenant on the platform control plane.
+    #[must_use]
+    pub const fn tenant_create() -> Self {
+        Self {
+            resource: Resource::Tenants,
+            action: Action::Write,
+            scope: PermissionScope::All,
+        }
+    }
+
+    /// List tenants and inspect one tenant's lifecycle state.
+    #[must_use]
+    pub const fn tenant_read() -> Self {
+        Self {
+            resource: Resource::Tenants,
+            action: Action::Read,
+            scope: PermissionScope::All,
+        }
+    }
+
+    /// Suspend and resume a tenant without destroying its state.
+    #[must_use]
+    pub const fn tenant_suspend() -> Self {
+        Self {
+            resource: Resource::Tenants,
+            action: Action::Suspend,
+            scope: PermissionScope::All,
+        }
+    }
+
+    /// Restore administrative access to a tenant that has lost its own.
+    ///
+    /// The single named capability by which the platform plane reaches a
+    /// tenant, kept distinct so it is visible in a grant and in audit rather
+    /// than hidden inside a general write.
+    #[must_use]
+    pub const fn tenant_recover_admin() -> Self {
+        Self {
+            resource: Resource::Tenants,
+            action: Action::Recover,
             scope: PermissionScope::All,
         }
     }

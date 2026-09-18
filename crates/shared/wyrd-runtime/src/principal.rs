@@ -348,3 +348,215 @@ mod tests {
         assert!(!principal.authorizes_card(&service_card_ref()));
     }
 }
+
+/// Platform-scope authenticated identity.
+///
+/// Deliberately carries **no tenant**. A platform principal operates the
+/// tenant directory — creating, inspecting, suspending, and recovering
+/// administration for tenants — and is never implicitly authorized over the
+/// resources inside one. Because the type has no tenant to offer, a handler
+/// holding one cannot open a tenant-scoped connection at all; the control-plane
+/// boundary is enforced by what is representable rather than by a check a
+/// caller could forget.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlatformPrincipal {
+    /// Stable principal id.
+    pub id: PrincipalId,
+    /// Permissions resolved from the principal's platform grant.
+    ///
+    /// Absence of a grant is denial: a platform principal with an empty set
+    /// authenticates but authorizes nothing.
+    pub effective_permissions: PermissionSet,
+}
+
+impl PlatformPrincipal {
+    /// Construct a platform-scope principal.
+    #[must_use]
+    pub const fn new(id: PrincipalId, effective_permissions: PermissionSet) -> Self {
+        Self {
+            id,
+            effective_permissions,
+        }
+    }
+}
+
+/// The authenticated identity behind a request, in exactly one control plane.
+///
+/// One authentication pipeline produces this, whichever entry path the caller
+/// used — a machine credential exchanged for a token, or a human federated
+/// login. Everything downstream authorizes against it and never branches on how
+/// authentication happened.
+///
+/// The two variants are closed and carry different payloads, so a platform
+/// identity is not representable where a tenant identity is required and the
+/// reverse. That mirrors the database tier's `OperatorPool` / `TenantConn`
+/// split at the identity tier.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "scope")]
+pub enum AuthContext {
+    /// Platform control plane: tenant lifecycle and administrative recovery.
+    Platform(PlatformPrincipal),
+    /// Tenant control plane: the resources of exactly one tenant.
+    Tenant(Box<Principal>),
+}
+
+impl AuthContext {
+    /// Borrow the platform principal, when this context is platform-scoped.
+    #[must_use]
+    pub fn platform(&self) -> Option<&PlatformPrincipal> {
+        match self {
+            Self::Platform(principal) => Some(principal),
+            Self::Tenant(_) => None,
+        }
+    }
+
+    /// Borrow the tenant principal, when this context is tenant-scoped.
+    #[must_use]
+    pub fn tenant(&self) -> Option<&Principal> {
+        match self {
+            Self::Tenant(principal) => Some(principal),
+            Self::Platform(_) => None,
+        }
+    }
+
+    /// The authenticated principal id, whichever plane this context names.
+    ///
+    /// Audit uses this so every privileged operation is attributable to a
+    /// principal rather than to a credential.
+    #[must_use]
+    pub fn principal_id(&self) -> PrincipalId {
+        match self {
+            Self::Platform(principal) => principal.id,
+            Self::Tenant(principal) => principal.id,
+        }
+    }
+
+    /// The permissions authorization is decided against.
+    ///
+    /// One vocabulary and one checker serve both planes; only the set differs.
+    #[must_use]
+    pub fn effective_permissions(&self) -> &PermissionSet {
+        match self {
+            Self::Platform(principal) => &principal.effective_permissions,
+            Self::Tenant(principal) => &principal.effective_permissions,
+        }
+    }
+
+    /// The tenant this context is scoped to, when it is tenant-scoped.
+    ///
+    /// Returns `None` for a platform context because a platform principal has
+    /// no tenant to return — not because one was withheld.
+    #[must_use]
+    pub fn tenant_id(&self) -> Option<DataTenantId> {
+        match self {
+            Self::Tenant(principal) => Some(principal.tenant_id),
+            Self::Platform(_) => None,
+        }
+    }
+}
+
+impl From<Principal> for AuthContext {
+    fn from(principal: Principal) -> Self {
+        Self::Tenant(Box::new(principal))
+    }
+}
+
+impl From<PlatformPrincipal> for AuthContext {
+    fn from(principal: PlatformPrincipal) -> Self {
+        Self::Platform(principal)
+    }
+}
+
+#[cfg(test)]
+mod auth_context_tests {
+    use wyrd_spec::DataTenantId;
+
+    use super::{AuthContext, PlatformPrincipal, Principal, PrincipalId, PrincipalKind};
+    use crate::permission::{Permission, PermissionSet};
+
+    /// A platform principal holding tenant-lifecycle authority.
+    fn platform() -> PlatformPrincipal {
+        PlatformPrincipal::new(PrincipalId::new(uuid::Uuid::now_v7()), {
+            let mut set = PermissionSet::new();
+            set.insert(Permission::tenant_create());
+            set
+        })
+    }
+
+    /// A tenant administrative principal in some tenant.
+    fn tenant() -> Principal {
+        Principal::new(
+            PrincipalId::new(uuid::Uuid::now_v7()),
+            PrincipalKind::TenantAdmin,
+            DataTenantId::new_v7(),
+            Vec::new(),
+            {
+                let mut set = PermissionSet::new();
+                set.insert(Permission::card_read());
+                set
+            },
+        )
+    }
+
+    /// A platform context has no tenant to offer, so no handler holding one can
+    /// reach tenant-scoped data even by mistake.
+    #[test]
+    fn platform_context_carries_no_tenant() {
+        let context = AuthContext::from(platform());
+
+        assert_eq!(context.tenant_id(), None);
+        assert!(context.tenant().is_none());
+        assert!(context.platform().is_some());
+    }
+
+    /// A tenant context names exactly one tenant and never satisfies a
+    /// platform-scoped accessor.
+    #[test]
+    fn tenant_context_carries_exactly_its_tenant() {
+        let principal = tenant();
+        let expected = principal.tenant_id;
+        let context = AuthContext::from(principal);
+
+        assert_eq!(context.tenant_id(), Some(expected));
+        assert!(context.platform().is_none());
+        assert!(context.tenant().is_some());
+    }
+
+    /// Authorization reads one permission set whichever plane produced the
+    /// context, so the checker needs no plane-specific branch.
+    #[test]
+    fn permissions_resolve_from_whichever_plane_authenticated() {
+        let platform_context = AuthContext::from(platform());
+        let tenant_context = AuthContext::from(tenant());
+
+        assert!(
+            platform_context
+                .effective_permissions()
+                .contains(&Permission::tenant_create())
+        );
+        assert!(
+            !tenant_context
+                .effective_permissions()
+                .contains(&Permission::tenant_create()),
+            "a tenant principal never holds platform authority"
+        );
+        assert!(
+            tenant_context
+                .effective_permissions()
+                .contains(&Permission::card_read())
+        );
+    }
+
+    /// Every privileged operation is attributable to a principal, on either
+    /// plane.
+    #[test]
+    fn principal_id_is_available_on_both_planes() {
+        let principal = platform();
+        let expected = principal.id;
+        assert_eq!(AuthContext::from(principal).principal_id(), expected);
+
+        let principal = tenant();
+        let expected = principal.id;
+        assert_eq!(AuthContext::from(principal).principal_id(), expected);
+    }
+}

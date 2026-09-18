@@ -22,7 +22,8 @@ pub use permission::{
 };
 pub use permission_check::{PermissionCheck, PermissionDenyReason, PermissionVerdict, RbacCheck};
 pub use principal::{
-    InvalidRoleName, Principal, PrincipalId, PrincipalKind, PrincipalRef, RoleRef,
+    AuthContext, InvalidRoleName, PlatformPrincipal, Principal, PrincipalId, PrincipalKind,
+    PrincipalRef, RoleRef,
 };
 pub use request_context::{DelegationStep, RequestContext, TraceParent, audit_delegation_chain};
 pub use wyrd_spec::reference::CardRefScope;

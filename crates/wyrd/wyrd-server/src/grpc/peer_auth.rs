@@ -88,7 +88,11 @@ impl PeerWorkloadIdentity {
     /// Returns a redacted message when the principal is not a control-tenant
     /// Service principal holding the peer permission.
     fn from_principal(principal: &Principal) -> Result<Self, String> {
-        let PrincipalKind::Service { card_ref, .. } = &principal.kind else {
+        let PrincipalKind::Service {
+            card_ref: Some(card_ref),
+            ..
+        } = &principal.kind
+        else {
             return Err("Bifrost peer credential is not a platform service".to_owned());
         };
         if principal.tenant_id != DataTenantId::SYSTEM_OWNER
@@ -109,7 +113,11 @@ impl PeerWorkloadIdentity {
     /// Returns `None` when the principal is the configured peer Service
     /// principal, and otherwise the violation kind the refusal is audited as.
     fn violation(&self, principal: &Principal) -> Option<BifrostSecurityViolationKind> {
-        let PrincipalKind::Service { card_ref, .. } = &principal.kind else {
+        let PrincipalKind::Service {
+            card_ref: Some(card_ref),
+            ..
+        } = &principal.kind
+        else {
             return Some(BifrostSecurityViolationKind::PeerAudience);
         };
         if principal.tenant_id != DataTenantId::SYSTEM_OWNER {
@@ -210,7 +218,11 @@ impl PeerWorkloadAuthState {
             self.audit_denial(violation).await;
             return Err(Status::permission_denied("Bifrost peer authority denied"));
         }
-        let PrincipalKind::Service { card_ref, .. } = &authenticated.principal.kind else {
+        let PrincipalKind::Service {
+            card_ref: Some(card_ref),
+            ..
+        } = &authenticated.principal.kind
+        else {
             // Unreachable: `violation` refuses every non-service principal.
             return Err(Status::permission_denied("Bifrost peer authority denied"));
         };

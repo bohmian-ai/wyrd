@@ -121,7 +121,7 @@ async fn ensure_service_account(
         conn,
         id,
         BOOTSTRAP_PRINCIPAL_KIND,
-        card_ref,
+        Some(card_ref),
         card_ref.name.as_str(),
         Some("Wyrd bootstrap admin"),
         SYSTEM_OPERATOR_ID,

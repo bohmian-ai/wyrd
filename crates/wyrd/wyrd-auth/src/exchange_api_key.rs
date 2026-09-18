@@ -373,22 +373,21 @@ impl DelegateToken {
 /// # Errors
 /// Returns an issuance error when the kind is not Card-free-eligible or
 /// signing fails, and a SQL error when the refresh token cannot be stored.
-#[allow(clippy::too_many_arguments)]
-// justification: this mirrors issue_for_subject's parameter list one-for-one;
-// consolidating them into a struct used by exactly two private callers would
-// add a type without removing a decision.
 async fn issue_cardless_subject(
     conn: &mut TenantConn<'_>,
     issuing_key: &IssuingKey,
     settings: &TokenExchangeSettings,
-    id: PrincipalId,
-    principal_kind: &str,
-    principal_id: Uuid,
-    roles: Vec<RoleRef>,
+    subject: IssueSubject,
     refresh: RefreshPolicy,
-    _request_id: &str,
 ) -> Result<ExchangedToken, IssueOrSqlError> {
-    let wire = principal_kind_wire(principal_kind).ok_or(IssueError::InvalidPrincipalKind)?;
+    let IssueSubject {
+        principal_id,
+        principal_kind,
+        card_ref: _,
+        roles,
+    } = subject;
+    let id = PrincipalId::new(principal_id);
+    let wire = principal_kind_wire(&principal_kind).ok_or(IssueError::InvalidPrincipalKind)?;
     let access_token = issuing_key.issue_cardless_access_token(
         TokenPrincipalRef {
             id,
@@ -412,7 +411,7 @@ async fn issue_cardless_subject(
             insert_refresh_token(
                 conn,
                 Uuid::new_v4(),
-                principal_kind,
+                &principal_kind,
                 principal_id,
                 &token_hash(&token),
                 Utc::now() + settings.refresh_ttl,
@@ -441,6 +440,13 @@ pub(crate) async fn issue_for_subject(
     request_id: &str,
     mint_kind: CardScopeMintKind,
 ) -> Result<ExchangedToken, IssueOrSqlError> {
+    // A Card-free principal — a tenant administrator or tenant automation —
+    // carries no bound Card and therefore no emit scope. It still holds roles
+    // and must be able to exchange its credential, or a provisioned tenant
+    // would hand back a credential that never works.
+    if subject.card_ref.is_none() {
+        return issue_cardless_subject(conn, issuing_key, settings, subject, refresh).await;
+    }
     let IssueSubject {
         principal_id,
         principal_kind,
@@ -448,24 +454,7 @@ pub(crate) async fn issue_for_subject(
         roles,
     } = subject;
     let id = PrincipalId::new(principal_id);
-    // A Card-free principal — a tenant administrator or tenant automation —
-    // carries no bound Card and therefore no emit scope. It still holds roles
-    // and must be able to exchange its credential, or a provisioned tenant
-    // would hand back a credential that never works.
-    let Some(card_ref) = card_ref else {
-        return issue_cardless_subject(
-            conn,
-            issuing_key,
-            settings,
-            id,
-            &principal_kind,
-            principal_id,
-            roles,
-            refresh,
-            request_id,
-        )
-        .await;
-    };
+    let card_ref = card_ref.expect("invariant: card-free subjects returned above");
     let card_ref_scope = resolve_card_ref_scope(conn, &card_ref).await?;
     let access_token = match principal_kind.as_str() {
         "service" => issuing_key

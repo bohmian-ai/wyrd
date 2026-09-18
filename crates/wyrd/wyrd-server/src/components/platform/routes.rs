@@ -8,17 +8,102 @@
 use axum::extract::State;
 use axum::routing::post;
 use axum::{Json, Router};
-use wyrd_spec::auth::{CreateTenantRequest, CreateTenantResponse};
+use secrecy::{ExposeSecret, SecretString};
+use wyrd_auth::platform_sessions::{
+    DEFAULT_PLATFORM_TOKEN_TTL_MINUTES, PlatformSessionError, PlatformSessions,
+};
+use wyrd_spec::auth::SecretBearer;
+use wyrd_spec::auth::{
+    CreateTenantRequest, CreateTenantResponse, PlatformTokenRequest, PlatformTokenResponse,
+    ProvisionedTenantAdmin, RecoverTenantAdminRequest,
+};
 use wyrd_spec::error::WyrdError;
 
 use crate::components::auth::PlatformCaller;
 use crate::components::platform::provisioning::{ProvisionError, TenantProvisioning};
+use crate::components::platform::recovery::TenantRecovery;
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
 /// Build the platform control-plane routes for the `/v1` group.
 pub fn platform_router() -> Router<AppState> {
-    Router::new().route("/tenants", post(create_tenant))
+    Router::new()
+        .route("/platform/token", post(platform_token))
+        .route("/tenants", post(create_tenant))
+        .route("/tenants/admin/credentials", post(recover_tenant_admin))
+}
+
+/// Exchange a platform credential for a short-lived session.
+///
+/// The one route that reads credential material. Every other platform route
+/// takes the session this mints, so no served surface after this point handles
+/// a secret.
+///
+/// # Errors
+/// Returns an unauthenticated error for every credential rejection, so no
+/// caller can distinguish which condition failed.
+#[tracing::instrument(level = "info", skip(state, request))]
+async fn platform_token(
+    State(state): State<AppState>,
+    Json(request): Json<PlatformTokenRequest>,
+) -> Result<Json<PlatformTokenResponse>, WyrdErrorResponse> {
+    let Some(operator) = state.postgres.operator_pool() else {
+        return Err(not_configured());
+    };
+    let Some(issuing_key) = state.auth.issuing_key.clone() else {
+        return Err(not_configured());
+    };
+
+    let sessions = PlatformSessions::new(operator, issuing_key);
+    let presented = SecretString::from(request.credential.expose().to_owned());
+    match sessions.exchange(&presented).await {
+        Ok(session) => Ok(Json(PlatformTokenResponse {
+            access_token: SecretBearer::new(session.token.expose_secret().to_owned()),
+            token_type: "Bearer".to_owned(),
+            expires_in: u64::try_from(DEFAULT_PLATFORM_TOKEN_TTL_MINUTES * 60).unwrap_or(900),
+        })),
+        Err(PlatformSessionError::Invalid) => {
+            Err(WyrdErrorResponse::from(WyrdError::Unauthenticated {
+                message: "invalid platform credential".to_owned(),
+                details: serde_json::json!({ "plane": "platform" }),
+            }))
+        }
+        Err(error) => Err(WyrdErrorResponse::from(WyrdError::Internal {
+            message: "platform session could not be issued".to_owned(),
+            details: serde_json::json!({ "error": error.to_string() }),
+        })),
+    }
+}
+
+/// Restore administrative access to a tenant that has lost it.
+///
+/// # Errors
+/// Returns a stable Wyrd error when the caller is unauthorized, the tenant has
+/// no administrative principal, or a write fails.
+#[tracing::instrument(level = "info", skip(state, caller, request))]
+async fn recover_tenant_admin(
+    State(state): State<AppState>,
+    caller: PlatformCaller,
+    Json(request): Json<RecoverTenantAdminRequest>,
+) -> Result<Json<ProvisionedTenantAdmin>, WyrdErrorResponse> {
+    let Some(operator) = state.postgres.operator_pool() else {
+        return Err(not_configured());
+    };
+    let recovery = TenantRecovery::new(operator, state.postgres.app_pool().clone());
+
+    recovery
+        .recover(&caller, request.tenant_id)
+        .await
+        .map(Json)
+        .map_err(provision_error)
+}
+
+/// The platform plane has no operator connection or signing key configured.
+fn not_configured() -> WyrdErrorResponse {
+    WyrdErrorResponse::from(WyrdError::Internal {
+        message: "platform control plane is not configured".to_owned(),
+        details: serde_json::json!({ "plane": "platform" }),
+    })
 }
 
 /// Provision a tenant and return its one-time administrative credential.
@@ -33,10 +118,7 @@ async fn create_tenant(
     Json(request): Json<CreateTenantRequest>,
 ) -> Result<Json<CreateTenantResponse>, WyrdErrorResponse> {
     let Some(operator) = state.postgres.operator_pool() else {
-        return Err(WyrdErrorResponse::from(WyrdError::Internal {
-            message: "platform control plane is not configured".to_owned(),
-            details: serde_json::json!({ "plane": "platform" }),
-        }));
+        return Err(not_configured());
     };
     let provisioning = TenantProvisioning::new(operator, state.postgres.app_pool().clone());
 

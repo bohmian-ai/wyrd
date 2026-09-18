@@ -5,6 +5,7 @@
 //! the transaction that acts on them.
 
 pub mod provisioning;
+pub mod recovery;
 pub mod routes;
 
 pub use routes::platform_router;

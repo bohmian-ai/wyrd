@@ -28,6 +28,7 @@ pub use principal_kind::PrincipalKindTag;
 pub use revoke::{RevokePrincipalRequest, RevokePrincipalResponse};
 pub use secret_bearer::SecretBearer;
 pub use tenant_admin::{
-    CreateTenantRequest, CreateTenantResponse, ProvisionedTenant, ProvisionedTenantAdmin,
+    CreateTenantRequest, CreateTenantResponse, PlatformTokenRequest, PlatformTokenResponse,
+    ProvisionedTenant, ProvisionedTenantAdmin, RecoverTenantAdminRequest,
 };
 pub use token::{RequestedSubject, SubjectTokenType, TokenRequest, TokenResponse, TokenType};

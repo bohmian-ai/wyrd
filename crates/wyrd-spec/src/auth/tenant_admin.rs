@@ -55,3 +55,35 @@ pub struct CreateTenantResponse {
     /// Its administrative principal and one-time credential.
     pub admin: ProvisionedTenantAdmin,
 }
+
+/// Request to exchange a platform credential for a session.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct PlatformTokenRequest {
+    /// The platform credential established at initialization or rotated since.
+    #[schemars(with = "String")]
+    pub credential: SecretBearer,
+}
+
+/// A minted platform session.
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct PlatformTokenResponse {
+    /// Bearer token presented on subsequent platform requests.
+    #[schemars(with = "String")]
+    pub access_token: SecretBearer,
+    /// Token type, always `Bearer`.
+    pub token_type: String,
+    /// Lifetime in seconds.
+    pub expires_in: u64,
+}
+
+/// Request to restore administrative access to a tenant.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct RecoverTenantAdminRequest {
+    /// Tenant whose administration is being restored.
+    pub tenant_id: DataTenantId,
+}

@@ -105,3 +105,27 @@ the migrated schema. Add a focused `mise` lane for this capability following the
 `test:cards:unit` / `test:cards:integration` pattern, and run it.
 
 `mise run codegen:check` when generated contracts move.
+
+## Implementation decisions
+
+**Scope vs authority.** `REQ-003` states human principals have exactly one
+tenant; `REQ-042` states human platform principals have none. Both are satisfied
+by reading the principal *type* as fixing **scope** and grants as fixing
+**authority**: `GlobalAdmin` is the platform-scope type and carries no tenant,
+while `TenantAdmin`, `Human`, `Service`, and `Agent` are tenant-scope types that
+carry exactly one. A human platform administrator is a platform-scope principal
+that authenticates through OIDC rather than a credential (`TASK-007`); "human"
+as a *type* stays tenant-scoped. No requirement is changed.
+
+**Two principal stores, one model.** Tenant-scope principals stay in `wyrd.*`
+under `TenantConn` RLS, which remains the load-bearing tenant boundary.
+Platform-scope principals, credentials, and grants live in `platform.*` reached
+only through `OperatorPool`. Absence of tenancy for platform principals is
+structural — the platform table has no tenant column — rather than a nullable
+column guarded by a check.
+
+**Runtime projection.** `wyrd_runtime::Principal` keeps its required
+`tenant_id` and remains the tenant-scope projection. The platform-scope
+projection is a separate type. This preserves the approved two-variant
+authenticated context (`TASK-002`) without making tenancy optional on every
+handler that reads it.

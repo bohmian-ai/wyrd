@@ -42,7 +42,7 @@ pub use service_accounts::{
     ApiKeyLookupRow, ApiKeyStatus, ServiceAccountPrincipalRow, api_key_by_prefix,
     api_key_status_by_prefix, delete_service_account, insert_api_key, insert_refresh_token,
     insert_service_account, service_account_by_card_ref, service_account_by_id,
-    touch_api_key_last_used,
+    tenant_admin_principal_id, touch_api_key_last_used,
 };
 pub use trusted_issuers::{
     TrustedIssuerWrite, delete_trusted_issuer, insert_trusted_issuer, trusted_issuer_by_url,

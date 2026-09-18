@@ -184,6 +184,34 @@ pub async fn service_account_by_id(
     .await
 }
 
+/// Find the tenant's administrative principal.
+///
+/// A tenant has exactly one, created during provisioning. Recovery needs it by
+/// identity rather than by Card or name, because the whole point is that the
+/// principal outlives the credentials that used to reach it. The oldest active
+/// one wins so a tenant that somehow acquired two resolves deterministically.
+///
+/// # Errors
+/// Returns the database error when the read fails.
+pub async fn tenant_admin_principal_id(
+    conn: &mut TenantConn<'_>,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    sqlx::query_scalar(
+        r#"
+        SELECT id
+          FROM wyrd.auth_service_accounts
+         WHERE data_tenant_id = $1
+           AND principal_kind = 'tenant_admin'
+           AND status = 'active'
+         ORDER BY created_at
+         LIMIT 1
+        "#,
+    )
+    .bind(conn.data_tenant_id().as_uuid())
+    .fetch_optional(&mut **conn.transaction())
+    .await
+}
+
 /// Insert a hashed credential row for a tenant-scope principal.
 ///
 /// Stores only the Argon2 verifier and non-secret lookup metadata; the

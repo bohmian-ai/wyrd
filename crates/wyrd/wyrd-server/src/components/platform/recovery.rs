@@ -18,7 +18,7 @@ use wyrd_auth::platform_authz::PlatformAuthorization;
 use wyrd_runtime::Permission;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, ProvisionedTenantAdmin, SecretBearer};
-use wyrd_sql::queries::auth::insert_api_key;
+use wyrd_sql::queries::auth::{insert_api_key, tenant_admin_principal_id};
 use wyrd_sql::{OperatorPool, TenantConn};
 
 use crate::components::auth::PlatformCaller;
@@ -91,7 +91,14 @@ impl TenantRecovery {
             .await
             .map_err(|e| ProvisionError::Store(e.to_string()))?;
 
-        let principal_id = existing_tenant_admin(&mut conn).await?;
+        let principal_id = tenant_admin_principal_id(&mut conn)
+            .await
+            .map_err(|e| ProvisionError::Store(e.to_string()))?
+            .ok_or_else(|| {
+                ProvisionError::Store(
+                    "tenant has no administrative principal to recover".to_owned(),
+                )
+            })?;
 
         let plaintext = wyrd_auth::issue_api_key::WyrdApiKey::generate(tenant_id);
         let raw = plaintext.secret.clone();
@@ -121,26 +128,4 @@ impl TenantRecovery {
             credential: SecretBearer::new(plaintext.secret.expose_secret().to_owned()),
         })
     }
-}
-
-/// Find the tenant's one administrative principal.
-///
-/// # Errors
-/// Returns [`ProvisionError::Store`] when the read fails or the tenant has no
-/// administrative principal — which means the tenant was never fully
-/// provisioned, and recovery is not the operation that fixes that.
-async fn existing_tenant_admin(conn: &mut TenantConn<'_>) -> Result<Uuid, ProvisionError> {
-    let id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM wyrd.auth_service_accounts
-          WHERE principal_kind = 'tenant_admin' AND status = 'active'
-          ORDER BY created_at
-          LIMIT 1",
-    )
-    .fetch_optional(&mut **conn.transaction())
-    .await
-    .map_err(|e| ProvisionError::Store(e.to_string()))?;
-
-    id.ok_or_else(|| {
-        ProvisionError::Store("tenant has no administrative principal to recover".to_owned())
-    })
 }

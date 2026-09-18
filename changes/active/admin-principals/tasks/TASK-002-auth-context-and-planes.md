@@ -105,3 +105,54 @@ repository-managed Postgres wrapper. Run the focused expressions for the tests
 you add or change.
 
 `mise run codegen:check` when the error catalog or permission contract moves.
+
+## Verification evidence
+
+Environment: `mise` is not installed. Direct `cargo` invocations were
+substituted, pinned to the repository's declared toolchain via
+`rustup run 1.97.1` — the container's default 1.98.1 fails to compile
+`wyrd-server` with a pre-existing `queries overflow the depth limit` error that
+reproduces at the base commit. `protoc` was installed to satisfy `wyrd-tonic`'s
+build script.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Any valid machine credential yields a context carrying principal identity, kind, and exactly one scope | `wyrd-runtime/src/principal.rs::AuthContext`, `wyrd-server/.../platform_extractor.rs` | `principal::auth_context_tests::*` (4), `platform_extractor::tests::*` (7) | PASS |
+| A tenant-scope token presented to the platform extractor is refused without enumeration | `platform_extractor.rs::extract_platform_credential`, `PlatformCredential::prefix_of` | `platform_extractor::tests::a_tenant_access_token_is_not_a_platform_credential`, `…::a_tenant_api_key_is_not_a_platform_credential`, `…::malformed_headers_yield_no_credential` | PASS |
+| A platform-scope context cannot open a tenant connection, by construction | `AuthContext::Platform(PlatformPrincipal)` carries no tenant field | `auth_context_tests::platform_context_carries_no_tenant`, `platform_extractor::tests::platform_caller_exposes_no_tenant` | PASS |
+| Tenant identity derives only from verified claims | unchanged `Caller` extractor; platform variant has no tenant to supply | `auth_context_tests::tenant_context_carries_exactly_its_tenant` | PASS |
+| A platform-scope kind cannot become a tenant principal | `wyrd-auth-verify::wire_kind_into_principal_kind`, `wyrd-auth-issue::validate_principal_ref` | `wyrd-auth-verify::into_verified_rejects_platform_scope_kind` | PASS |
+| Permission vocabulary carries the platform administrative operations | `wyrd-runtime/src/permission.rs` (`Resource::Tenants`, `Action::Suspend`, `Action::Recover`, four constructors) | `platform_extractor::tests::authorization_follows_the_grant_and_never_reaches_a_tenant`, `…::empty_grant_authorizes_nothing` | PASS |
+| Platform authority never confers tenant data access | `PlatformCaller::authorize` decides only against the platform grant | `platform_extractor::tests::authorization_follows_the_grant_and_never_reaches_a_tenant` | PASS |
+| A platform-scope principal has no tenant revocation epoch | `wyrd-auth/src/revocation_resolver.rs` | compile-enforced match arm; fail-closed return | PASS |
+| Each authorization decision appends its audit row in the deciding transaction | not implemented in this increment | — | **INCOMPLETE** |
+| Revoking a credential/principal/role advances the authorization epoch and stops earlier tokens | pre-existing epoch machinery reached but not extended to the platform plane | — | **INCOMPLETE** |
+| No authenticated handler retains credential-keyed authorization | platform plane is context-based; the tenant plane's remaining surfaces were not swept | — | **INCOMPLETE** |
+
+Commands run:
+
+```bash
+rustup run 1.97.1 cargo fmt --all
+python3 scripts/check_tenant_isolation.py                              # passed
+rustup run 1.97.1 cargo test --locked -p wyrd-runtime --lib            # 47 passed
+rustup run 1.97.1 cargo test --locked -p wyrd-auth-check --lib         # 18 passed
+rustup run 1.97.1 cargo test --locked -p wyrd-auth-verify --lib -- --skip verify_external  # 32 passed
+rustup run 1.97.1 cargo test --locked -p wyrd-server --lib platform_extractor              # 7 passed
+rustup run 1.97.1 cargo check --locked -p wyrd-server --all-targets    # clean
+git diff --check                                                       # clean
+```
+
+Material limits:
+
+- **This task is a partial increment.** The authenticated context, the plane
+  boundary, the platform authentication path, and the permission vocabulary are
+  implemented and proven. Transactional audit coupling (`REQ-016` audit half),
+  epoch coupling for the platform plane (`INV-011`/`INV-013`), and the sweep
+  removing credential-keyed authorization from every remaining tenant handler
+  (`REQ-015`) are **not** done and are recorded as INCOMPLETE above. They need a
+  further increment before this task can be accepted.
+- There are no platform-plane routes yet, so the plane boundary is proven at the
+  extractor and type level rather than end-to-end. `AC-003`'s real-server
+  journey depends on `TASK-004` supplying the first platform route.
+- Nine `wyrd-auth-verify` external-JWKS tests remain out of scope per `VER-005`
+  (missing rustls crypto provider in this container).

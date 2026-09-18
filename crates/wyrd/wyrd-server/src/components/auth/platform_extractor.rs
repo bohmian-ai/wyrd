@@ -224,6 +224,44 @@ mod tests {
         }
     }
 
+    /// A tenant access token presented on the platform header never reaches the
+    /// platform store: it is not shaped like a platform credential, so it is
+    /// refused before any lookup and cannot probe for a principal.
+    #[test]
+    fn a_tenant_access_token_is_not_a_platform_credential() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            "Bearer eyJhbGciOiJFZERTQSIsImtpZCI6ImsxIn0.eyJzdWIiOiJ4In0.sig"
+                .parse()
+                .unwrap(),
+        );
+
+        assert!(extract_platform_credential(&headers).is_some());
+        assert!(
+            wyrd_auth::platform_credentials::PlatformCredential::prefix_of(
+                &extract_platform_credential(&headers).expect("header parses")
+            )
+            .is_none(),
+            "a tenant token resolves to no platform lookup prefix"
+        );
+    }
+
+    /// A tenant API key is likewise not a platform credential, so the two
+    /// credential families cannot be swapped across planes.
+    #[test]
+    fn a_tenant_api_key_is_not_a_platform_credential() {
+        let key = secrecy::SecretString::from(
+            "wyrd_sk_0192abcd0000700080000000000000ab_deadbeef_cafebabecafebabecafebabecafebabe"
+                .to_owned(),
+        );
+
+        assert!(
+            wyrd_auth::platform_credentials::PlatformCredential::prefix_of(&key).is_none(),
+            "a tenant API key resolves to no platform lookup prefix"
+        );
+    }
+
     /// A platform caller authorizes only what its grant covers, and holding a
     /// platform permission never implies any tenant permission.
     #[test]

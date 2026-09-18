@@ -41,10 +41,32 @@ pub enum PlatformAuthzError {
 }
 
 /// Authorizes platform-plane operations and records every decision.
-#[derive(Debug, Clone, Default)]
-pub struct PlatformAuthorization;
+///
+/// Owns the operator boundary the decision and its audit row commit through,
+/// because the two must share one transaction and therefore one connection
+/// source.
+#[derive(Clone)]
+pub struct PlatformAuthorization {
+    /// Cross-tenant boundary the decision and its audit record commit through.
+    pool: OperatorPool,
+}
+
+impl std::fmt::Debug for PlatformAuthorization {
+    /// Prints the handle without its pool: a connection source has no
+    /// inspectable state and printing it would only add noise to a trace.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlatformAuthorization")
+            .finish_non_exhaustive()
+    }
+}
 
 impl PlatformAuthorization {
+    /// Bind platform authorization to one operator boundary.
+    #[must_use]
+    pub const fn new(pool: OperatorPool) -> Self {
+        Self { pool }
+    }
+
     /// Decide one platform-plane permission and record the decision.
     ///
     /// On success the returned transaction already carries the allowance row,
@@ -64,16 +86,15 @@ impl PlatformAuthorization {
     /// be appended; the transaction is rolled back and the caller must refuse.
     /// Returns [`PlatformAuthzError::Transaction`] when the transaction cannot
     /// be opened or the denial record cannot be committed.
-    #[tracing::instrument(level = "debug", skip(self, pool, context), err)]
-    pub async fn authorize<'a>(
+    #[tracing::instrument(level = "debug", skip(self, context), err)]
+    pub async fn authorize(
         &self,
-        pool: &'a OperatorPool,
         context: &AuthContext,
         required: &Permission,
         request_id: &str,
         credential_id: Option<Uuid>,
         target_tenant_id: Option<DataTenantId>,
-    ) -> Result<Transaction<'a, Postgres>, PlatformAuthzError> {
+    ) -> Result<Transaction<'_, Postgres>, PlatformAuthzError> {
         let resource = required.resource.as_str().unwrap_or("any_of");
         let action = required.action.as_str().unwrap_or("any_of");
 
@@ -88,7 +109,8 @@ impl PlatformAuthorization {
             AuthContext::Tenant(_) => Some(REASON_WRONG_PLANE),
         };
 
-        let mut tx = pool
+        let mut tx = self
+            .pool
             .begin()
             .await
             .map_err(PlatformAuthzError::Transaction)?;
@@ -176,9 +198,9 @@ mod pg_tests {
         let context = platform_context(&fixture, permissions).await;
         let principal = context.principal_id();
 
-        let tx = PlatformAuthorization
+        let authz = PlatformAuthorization::new(fixture.operator_pool().clone());
+        let tx = authz
             .authorize(
-                fixture.operator_pool(),
                 &context,
                 &Permission::tenant_create(),
                 "req-allow",
@@ -207,9 +229,9 @@ mod pg_tests {
         let context = platform_context(&fixture, permissions).await;
         let principal = context.principal_id();
 
-        let tx = PlatformAuthorization
+        let authz = PlatformAuthorization::new(fixture.operator_pool().clone());
+        let tx = authz
             .authorize(
-                fixture.operator_pool(),
                 &context,
                 &Permission::tenant_create(),
                 "req-rollback",
@@ -232,9 +254,9 @@ mod pg_tests {
         let principal = context.principal_id();
         let target = DataTenantId::new_v7();
 
-        let error = PlatformAuthorization
+        let authz = PlatformAuthorization::new(fixture.operator_pool().clone());
+        let error = authz
             .authorize(
-                fixture.operator_pool(),
                 &context,
                 &Permission::tenant_suspend(),
                 "req-deny",
@@ -284,9 +306,9 @@ mod pg_tests {
         let principal = tenant.id;
         let context = AuthContext::from(tenant);
 
-        let error = PlatformAuthorization
+        let authz = PlatformAuthorization::new(fixture.operator_pool().clone());
+        let error = authz
             .authorize(
-                fixture.operator_pool(),
                 &context,
                 &Permission::tenant_create(),
                 "req-wrong-plane",
@@ -328,9 +350,9 @@ mod pg_tests {
             .await
             .expect("privilege revoked");
 
-        let error = PlatformAuthorization
+        let authz = PlatformAuthorization::new(fixture.operator_pool().clone());
+        let error = authz
             .authorize(
-                fixture.operator_pool(),
                 &context,
                 &Permission::tenant_create(),
                 "req-no-audit",

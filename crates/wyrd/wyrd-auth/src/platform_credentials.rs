@@ -106,12 +106,31 @@ pub enum PlatformCredentialError {
 
 /// Issues and verifies platform-scope credentials.
 ///
-/// Holds no connection of its own: the caller supplies the operator pool so a
-/// credential can be issued as part of a wider administrative operation.
-#[derive(Debug, Clone, Default)]
-pub struct PlatformCredentials;
+/// Owns the operator boundary it writes through, so callers discover credential
+/// work as `credentials.issue(...)` and `credentials.authenticate(...)` rather
+/// than threading a pool through every call.
+#[derive(Clone)]
+pub struct PlatformCredentials {
+    /// Cross-tenant boundary the platform credential store lives behind.
+    pool: OperatorPool,
+}
+
+impl std::fmt::Debug for PlatformCredentials {
+    /// Prints the handle without its pool: a connection source has no
+    /// inspectable state and printing it would only add noise to a trace.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlatformCredentials")
+            .finish_non_exhaustive()
+    }
+}
 
 impl PlatformCredentials {
+    /// Bind credential issuance and verification to one operator boundary.
+    #[must_use]
+    pub const fn new(pool: OperatorPool) -> Self {
+        Self { pool }
+    }
+
     /// Mint a credential for an existing platform principal.
     ///
     /// Generates the secret, hashes it off the async runtime because Argon2 is
@@ -125,10 +144,9 @@ impl PlatformCredentials {
     /// [`PlatformCredentialError::Join`] when hashing fails, and
     /// [`PlatformCredentialError::Store`] when the insert is rejected —
     /// including when `principal_id` names no platform principal.
-    #[tracing::instrument(level = "debug", skip(self, pool), fields(principal_id = %principal_id), err)]
+    #[tracing::instrument(level = "debug", skip(self), fields(principal_id = %principal_id), err)]
     pub async fn issue(
         &self,
-        pool: &OperatorPool,
         principal_id: Uuid,
         expires_at: Option<DateTime<Utc>>,
     ) -> Result<IssuedPlatformCredential, PlatformCredentialError> {
@@ -138,7 +156,7 @@ impl PlatformCredentials {
 
         let id = Uuid::new_v4();
         insert_platform_credential(
-            pool,
+            &self.pool,
             id,
             principal_id,
             &credential.prefix,
@@ -163,16 +181,15 @@ impl PlatformCredentials {
     /// rejection, so no caller can distinguish which condition failed, and
     /// [`PlatformCredentialError::Store`] when the lookup itself fails — a
     /// store outage is not a wrong password and must not be reported as one.
-    #[tracing::instrument(level = "debug", skip(self, pool, presented), err)]
+    #[tracing::instrument(level = "debug", skip(self, presented), err)]
     pub async fn authenticate(
         &self,
-        pool: &OperatorPool,
         presented: &SecretString,
     ) -> Result<PrincipalId, PlatformCredentialError> {
         let Some(prefix) = PlatformCredential::prefix_of(presented) else {
             return Err(PlatformCredentialError::InvalidCredential);
         };
-        let Some(row) = platform_credential_by_prefix(pool, &prefix).await? else {
+        let Some(row) = platform_credential_by_prefix(&self.pool, &prefix).await? else {
             return Err(PlatformCredentialError::InvalidCredential);
         };
         if !row.is_usable(Utc::now()) {
@@ -181,7 +198,7 @@ impl PlatformCredentials {
         if !verify_api_key(presented, &row.secret_hash) {
             return Err(PlatformCredentialError::InvalidCredential);
         }
-        touch_platform_credential(pool, row.id).await?;
+        touch_platform_credential(&self.pool, row.id).await?;
         Ok(PrincipalId::new(row.principal_id))
     }
 }
@@ -289,14 +306,14 @@ mod pg_tests {
         let pool = fixture.operator_pool();
         let principal = seed_principal(&fixture, "issuing").await;
 
-        let issued = PlatformCredentials
-            .issue(pool, principal, None)
+        let issued = PlatformCredentials::new(pool.clone())
+            .issue(principal, None)
             .await
             .expect("credential issues");
         let plaintext = issued.credential.secret.expose_secret().to_owned();
 
-        let resolved = PlatformCredentials
-            .authenticate(pool, &issued.credential.secret)
+        let resolved = PlatformCredentials::new(pool.clone())
+            .authenticate(&issued.credential.secret)
             .await
             .expect("the issued credential authenticates");
         assert_eq!(resolved.as_uuid(), principal);
@@ -327,14 +344,14 @@ mod pg_tests {
         let pool = fixture.operator_pool();
 
         let live_owner = seed_principal(&fixture, "live").await;
-        let live = PlatformCredentials
-            .issue(pool, live_owner, None)
+        let live = PlatformCredentials::new(pool.clone())
+            .issue(live_owner, None)
             .await
             .expect("credential issues");
 
         let revoked_owner = seed_principal(&fixture, "revoked").await;
-        let revoked = PlatformCredentials
-            .issue(pool, revoked_owner, None)
+        let revoked = PlatformCredentials::new(pool.clone())
+            .issue(revoked_owner, None)
             .await
             .expect("credential issues");
         revoke_platform_credential(pool, revoked.id)
@@ -342,14 +359,14 @@ mod pg_tests {
             .expect("revocation succeeds");
 
         let expired_owner = seed_principal(&fixture, "expired").await;
-        let expired = PlatformCredentials
-            .issue(pool, expired_owner, Some(Utc::now() - Duration::hours(1)))
+        let expired = PlatformCredentials::new(pool.clone())
+            .issue(expired_owner, Some(Utc::now() - Duration::hours(1)))
             .await
             .expect("credential issues");
 
         let suspended_owner = seed_principal(&fixture, "suspended").await;
-        let suspended = PlatformCredentials
-            .issue(pool, suspended_owner, None)
+        let suspended = PlatformCredentials::new(pool.clone())
+            .issue(suspended_owner, None)
             .await
             .expect("credential issues");
         sqlx::query("UPDATE platform.principals SET status = 'suspended' WHERE id = $1")
@@ -381,8 +398,8 @@ mod pg_tests {
         ];
 
         for (label, presented) in rejections {
-            let error = PlatformCredentials
-                .authenticate(pool, &presented)
+            let error = PlatformCredentials::new(pool.clone())
+                .authenticate(&presented)
                 .await
                 .expect_err("rejection");
             assert!(
@@ -396,8 +413,8 @@ mod pg_tests {
             );
         }
 
-        PlatformCredentials
-            .authenticate(pool, &live.credential.secret)
+        PlatformCredentials::new(pool.clone())
+            .authenticate(&live.credential.secret)
             .await
             .expect("the live credential still authenticates");
     }
@@ -413,13 +430,13 @@ mod pg_tests {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let pool = fixture.operator_pool();
         let principal = seed_principal(&fixture, "revoked-mid-life").await;
-        let issued = PlatformCredentials
-            .issue(pool, principal, None)
+        let issued = PlatformCredentials::new(pool.clone())
+            .issue(principal, None)
             .await
             .expect("credential issues");
 
-        PlatformCredentials
-            .authenticate(pool, &issued.credential.secret)
+        PlatformCredentials::new(pool.clone())
+            .authenticate(&issued.credential.secret)
             .await
             .expect("the credential works before revocation");
 
@@ -427,8 +444,8 @@ mod pg_tests {
             .await
             .expect("revocation succeeds");
 
-        let error = PlatformCredentials
-            .authenticate(pool, &issued.credential.secret)
+        let error = PlatformCredentials::new(pool.clone())
+            .authenticate(&issued.credential.secret)
             .await
             .expect_err("the same credential stops working immediately");
         assert!(matches!(error, PlatformCredentialError::InvalidCredential));
@@ -440,13 +457,13 @@ mod pg_tests {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let pool = fixture.operator_pool();
         let principal = seed_principal(&fixture, "touched").await;
-        let issued = PlatformCredentials
-            .issue(pool, principal, None)
+        let issued = PlatformCredentials::new(pool.clone())
+            .issue(principal, None)
             .await
             .expect("credential issues");
 
-        PlatformCredentials
-            .authenticate(pool, &issued.credential.secret)
+        PlatformCredentials::new(pool.clone())
+            .authenticate(&issued.credential.secret)
             .await
             .expect("authenticates");
 

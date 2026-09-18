@@ -144,7 +144,8 @@ impl FromRequestParts<AppState> for PlatformCaller {
             return Err(unauthenticated());
         };
 
-        let principal_id = match PlatformCredentials.authenticate(&pool, &presented).await {
+        let credentials = PlatformCredentials::new(pool.clone());
+        let principal_id = match credentials.authenticate(&presented).await {
             Ok(principal_id) => principal_id,
             Err(PlatformCredentialError::InvalidCredential) => return Err(unauthenticated()),
             Err(error) => {

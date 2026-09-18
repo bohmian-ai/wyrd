@@ -1,6 +1,6 @@
 ---
 id: SPEC-admin-principals
-revision: 5
+revision: 6
 status: draft
 ---
 
@@ -619,6 +619,39 @@ documents. These amendments are part of the change.
   none of these contracts has shipped to users.
 - RBAC is not overbuilt: administrative permissions may remain internal in this
   delivery rather than being exposed as customizable roles.
+- Verification is deliberately narrow; see **Verification scope**. Concurrent
+  unrelated work is expected to break tests outside these surfaces, and that
+  breakage is not this change's responsibility.
+
+## Verification scope
+
+This change deliberately narrows the verification scope that `AGENTS.md` §11
+and §12 would otherwise require. The narrowing is an author decision recorded
+here, not drift, and this section is the authority for planning, implementation,
+and review.
+
+- **VER-001**: Verification proves only principal, credential, authenticated
+  context, authorization-plane, initialization, tenant-provisioning, and
+  administrative-surface behavior introduced or changed by this specification.
+  Every acceptance obligation is satisfied by focused tests, subsystem
+  integration tests, and the user journeys named in this specification.
+- **VER-002**: Every named Rust test runs through its exact focused expression,
+  `mise exec -- cargo nextest run --locked -p <crate> <target> -E 'test(=...)'`,
+  with the repository-managed setup wrapper where Postgres is required.
+- **VER-003**: Broad aggregates MUST NOT be run or required as evidence:
+  `mise run gate`, `test:rust`, whole-crate and family lanes, the storage
+  matrix, and any `--all-features` workspace lane. A reviewer MUST NOT treat
+  their absence as missing verification.
+- **VER-004**: Compilation and type checking are limited to the crates this
+  change touches and their direct dependents. Workspace-wide compilation is not
+  an acceptance obligation for this change.
+- **VER-005**: Test failures outside the surfaces in `VER-001` are out of scope.
+  They are not this change's obligation to diagnose, fix, skip, or report as
+  regressions, and they do not block its acceptance. This does not license
+  weakening, disabling, or deleting any test to produce a passing result.
+- **VER-006**: Contract regeneration (`mise run codegen:check`) remains in scope
+  because this change owns the HTTP, error-catalog, schema, and stub contracts
+  it alters.
 
 ## Delivery sequence
 
@@ -656,6 +689,12 @@ None. Every decision raised during drafting has been resolved by the author.
 
 ## Revision history
 
+- **Revision 6 — 2026-09-18 — draft**: Added the **Verification scope** section
+  narrowing proof to focused tests, subsystem integration tests, and the named
+  user journeys for principal, credential, authenticated-context,
+  authorization-plane, initialization, provisioning, and administrative
+  surfaces. Broad aggregates and workspace-wide compilation are excluded, and
+  failures outside these surfaces are out of scope.
 - **Revision 5 — 2026-09-18 — draft**: Platform authority becomes a grant rather
   than a principal-type property, holdable by the bootstrap global principal and
   by human platform principals living at platform scope. Adds the optional

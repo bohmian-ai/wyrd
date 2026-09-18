@@ -686,7 +686,7 @@ mod pg_tests {
             &mut conn,
             id,
             principal_kind,
-            &card_ref,
+            Some(&card_ref),
             name,
             None,
             creator_id,

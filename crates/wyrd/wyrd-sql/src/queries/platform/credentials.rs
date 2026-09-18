@@ -154,10 +154,7 @@ pub async fn list_platform_credentials(
 ///
 /// # Errors
 /// Returns [`SqlError::Query`] when the update fails.
-pub async fn revoke_platform_credential(
-    pool: &OperatorPool,
-    id: Uuid,
-) -> Result<bool, SqlError> {
+pub async fn revoke_platform_credential(pool: &OperatorPool, id: Uuid) -> Result<bool, SqlError> {
     let result = sqlx::query(
         "UPDATE platform.credentials
             SET revoked_at = now()
@@ -177,10 +174,7 @@ pub async fn revoke_platform_credential(
 ///
 /// # Errors
 /// Returns [`SqlError::Query`] when the update fails.
-pub async fn touch_platform_credential(
-    pool: &OperatorPool,
-    id: Uuid,
-) -> Result<(), SqlError> {
+pub async fn touch_platform_credential(pool: &OperatorPool, id: Uuid) -> Result<(), SqlError> {
     sqlx::query("UPDATE platform.credentials SET last_used_at = now() WHERE id = $1")
         .bind(id)
         .execute(pool.pool())

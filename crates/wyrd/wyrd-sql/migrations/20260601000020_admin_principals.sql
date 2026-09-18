@@ -97,10 +97,14 @@ GRANT SELECT, INSERT, UPDATE, DELETE
 -- retained. Postgres treats NULLs as distinct there, so Card-free principals do
 -- not collide with each other while `wyrd apply` re-application still resolves a
 -- Card-bound principal to the same row.
+-- `space` and `version` are projections of the bound Card, so they travel with
+-- it rather than being invented for a principal that has none.
 ALTER TABLE wyrd.auth_service_accounts
     ALTER COLUMN card_kind DROP NOT NULL,
     ALTER COLUMN card_uid  DROP NOT NULL,
-    ALTER COLUMN card_ref  DROP NOT NULL;
+    ALTER COLUMN card_ref  DROP NOT NULL,
+    ALTER COLUMN space     DROP NOT NULL,
+    ALTER COLUMN version   DROP NOT NULL;
 
 -- The original kind and card-agreement checks were auto-named by Postgres, so
 -- they are discovered by the columns they constrain rather than by a name this
@@ -131,8 +135,10 @@ ALTER TABLE wyrd.auth_service_accounts
 ALTER TABLE wyrd.auth_service_accounts
     ADD CONSTRAINT auth_service_accounts_card_binding_check
     CHECK (
-        (card_kind IS NULL AND card_uid IS NULL AND card_ref IS NULL)
-        OR (card_kind IS NOT NULL AND card_uid IS NOT NULL AND card_ref IS NOT NULL)
+        (card_kind IS NULL AND card_uid IS NULL AND card_ref IS NULL
+            AND space IS NULL AND version IS NULL)
+        OR (card_kind IS NOT NULL AND card_uid IS NOT NULL AND card_ref IS NOT NULL
+            AND space IS NOT NULL AND version IS NOT NULL)
     );
 
 ALTER TABLE wyrd.auth_service_accounts

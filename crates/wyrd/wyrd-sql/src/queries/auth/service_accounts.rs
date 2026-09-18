@@ -77,15 +77,28 @@ pub async fn insert_service_account(
     conn: &mut TenantConn<'_>,
     id: Uuid,
     principal_kind: &str,
-    card_ref: &CardRef,
+    card_ref: Option<&CardRef>,
     name: &str,
     description: Option<&str>,
     created_by: Uuid,
 ) -> Result<(), sqlx::Error> {
-    let card_kind = card_ref.kind.wire_name();
-    let card_uid = card_ref.uid.as_ref().map_or_else(Uuid::nil, |uid| {
-        Uuid::parse_str(uid.as_str()).expect("CardUid invariant: stored value is a valid UUID")
+    // Card binding is a property of a deployable machine principal, so every
+    // Card-derived column travels with the Card or is absent with it. A tenant
+    // administrator or Card-free automation principal stores none of them.
+    let card_kind = card_ref.map(|card_ref| card_ref.kind.wire_name());
+    let card_uid = card_ref.map(|card_ref| {
+        card_ref.uid.as_ref().map_or_else(Uuid::nil, |uid| {
+            Uuid::parse_str(uid.as_str()).expect("CardUid invariant: stored value is a valid UUID")
+        })
     });
+    let space = card_ref.map(|card_ref| {
+        card_ref
+            .space
+            .as_ref()
+            .expect("invariant: card-bound principal CardRef has resolved space")
+            .as_str()
+    });
+    let version = card_ref.map(|card_ref| card_ref.version.as_str());
 
     sqlx::query(
         r#"
@@ -100,16 +113,10 @@ pub async fn insert_service_account(
     .bind(principal_kind)
     .bind(card_kind)
     .bind(card_uid)
-    .bind(Json(card_ref))
-    .bind(
-        card_ref
-            .space
-            .as_ref()
-            .expect("invariant: service-account CardRef has resolved space")
-            .as_str(),
-    )
+    .bind(card_ref.map(Json))
+    .bind(space)
     .bind(name)
-    .bind(card_ref.version.as_str())
+    .bind(version)
     .bind(description)
     .bind(created_by)
     .execute(&mut **conn.transaction())

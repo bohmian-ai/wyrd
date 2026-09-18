@@ -722,11 +722,9 @@ impl From<(&RuntimePrincipalRef, DataTenantId)> for TokenPrincipalRef {
 impl From<&Principal> for TokenPrincipalRef {
     fn from(principal: &Principal) -> Self {
         let (kind, card_ref, card_ref_scope) = match &principal.kind {
-            PrincipalKind::TenantAdmin => (
-                PrincipalKindTag::TenantAdmin,
-                None,
-                CardRefScope::default(),
-            ),
+            PrincipalKind::TenantAdmin => {
+                (PrincipalKindTag::TenantAdmin, None, CardRefScope::default())
+            }
             PrincipalKind::User => (PrincipalKindTag::User, None, CardRefScope::default()),
             PrincipalKind::Service {
                 card_ref,

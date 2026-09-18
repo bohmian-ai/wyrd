@@ -499,7 +499,13 @@ mod pg_tests {
         seed_backing_card(conn, card_ref, created_by).await;
         let sa_id = Uuid::new_v4();
         insert_service_account(
-            conn, sa_id, "service", card_ref, "test-sa", None, created_by,
+            conn,
+            sa_id,
+            "service",
+            Some(card_ref),
+            "test-sa",
+            None,
+            created_by,
         )
         .await
         .expect("service account inserts");

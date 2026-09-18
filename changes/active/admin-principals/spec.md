@@ -1,6 +1,6 @@
 ---
 id: SPEC-admin-principals
-revision: 3
+revision: 4
 status: draft
 ---
 
@@ -205,11 +205,18 @@ to satisfy this specification.
 
 ### Authentication pipeline
 
-- **REQ-012**: Every machine credential MUST authenticate through one pipeline:
-  extract credential → resolve credential record → verify secret → resolve
-  principal → check principal and tenant status → construct the authenticated
-  context. No served surface MAY authorize from credential material, lookup
-  prefix, or credential record directly.
+- **REQ-012**: Authentication has two entry paths and one request path.
+  Machine credential exchange MUST resolve the credential record, verify the
+  secret, resolve the principal, and check principal and tenant status before
+  issuing a Wyrd token. Human OIDC login MUST verify the provider token and
+  resolve the federated identity to a principal before issuing a Wyrd token.
+  Both entry paths MUST mint tokens carrying the same principal
+  representation.
+- **REQ-012a**: The per-request path MUST construct the authenticated context
+  only from verified Wyrd token claims, subject to the existing authorization
+  epoch. No served surface MAY authorize from credential material, a lookup
+  prefix, a credential record, or a provider token directly, and no request
+  handler MAY branch on which entry path minted the token.
 - **REQ-013**: The authenticated context MUST carry server-verified principal
   identity, principal type, and control-plane scope — platform, or exactly one
   tenant. It MUST be a closed two-variant type so a platform identity is not
@@ -317,8 +324,12 @@ to satisfy this specification.
 
 - **REQ-034**: A verified federated human identity MUST resolve through its
   durable `(issuer, subject)` identity to a human principal in the bound tenant,
-  and MUST produce the same authenticated context as a machine credential.
-  Downstream authorization MUST contain no authentication-mechanism branch.
+  and MUST mint a token producing the same authenticated context as a machine
+  credential. Federated identity MUST be unique per tenant on
+  `(tenant, issuer, subject)`, preserving the existing
+  `wyrd.auth_user_identities` key, so one human may hold independent principals
+  in multiple tenants. OIDC login is a human entry path only; it never
+  authenticates a machine principal and never appears on the per-request path.
 - **REQ-035**: Human principals MUST receive tenant roles independently of
   authentication, and a human principal holding tenant administration MUST NOT
   displace or require removal of the tenant administrative principal. The tenant
@@ -365,6 +376,10 @@ to satisfy this specification.
 - **INV-004**: The platform and tenant control planes never silently collapse.
   Global administrators manage tenant lifecycle; tenant administrators manage
   tenant resources.
+- **INV-004a**: The platform control plane is credential-only. Human principals
+  are tenant-scoped, so no OIDC login can yield a platform-scoped authenticated
+  context. Widening this requires an approved revision, not an implementation
+  choice.
 - **INV-005**: A deployment has at most one initialization. Restart, replica
   count, crash recovery, and concurrent invocation never yield a second global
   administrative principal, a second initial credential, or a re-exposure.
@@ -579,6 +594,11 @@ None. Every decision raised during drafting has been resolved by the author.
 
 ## Revision history
 
+- **Revision 4 — 2026-09-18 — draft**: Separated the two authentication entry
+  paths (machine credential exchange, human OIDC login) from the per-request
+  path, which derives the authenticated context only from verified Wyrd token
+  claims. Pinned federated identity uniqueness to `(tenant, issuer, subject)`.
+  Recorded that the platform control plane is credential-only.
 - **Revision 3 — 2026-09-18 — draft**: Rewritten to the author's model.
   Principal types cover global administration, tenant administration, humans,
   and machines with tenancy absent for global principals; Card binding becomes a

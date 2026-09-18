@@ -12,6 +12,8 @@
 use chrono::{DateTime, Utc};
 use sqlx::types::Uuid;
 
+use sqlx::{Postgres, Transaction};
+
 use crate::{OperatorPool, SqlError};
 
 /// Credential lookup row joined to its owning principal.
@@ -79,21 +81,53 @@ pub async fn insert_platform_credential(
     secret_hash: &str,
     expires_at: Option<DateTime<Utc>>,
 ) -> Result<(), SqlError> {
-    sqlx::query(
-        "INSERT INTO platform.credentials
-             (id, principal_id, prefix, secret_hash, expires_at)
-         VALUES ($1, $2, $3, $4, $5)",
-    )
-    .bind(id)
-    .bind(principal_id)
-    .bind(prefix)
-    .bind(secret_hash)
-    .bind(expires_at)
-    .execute(pool.pool())
-    .await
-    .map_err(SqlError::from)?;
+    sqlx::query(INSERT_PLATFORM_CREDENTIAL_SQL)
+        .bind(id)
+        .bind(principal_id)
+        .bind(prefix)
+        .bind(secret_hash)
+        .bind(expires_at)
+        .execute(pool.pool())
+        .await
+        .map_err(SqlError::from)?;
     Ok(())
 }
+
+/// Insert a platform credential inside a caller-owned transaction.
+///
+/// Used where the credential is only meaningful together with what else the
+/// transaction writes — notably deployment initialization, where a principal
+/// without its first credential would be an unusable root that the unique name
+/// then makes impossible to replace.
+///
+/// # Errors
+/// Returns [`SqlError::Query`] when the insert fails, including on a repeated
+/// prefix or an unknown principal.
+pub async fn insert_platform_credential_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    id: Uuid,
+    principal_id: Uuid,
+    prefix: &str,
+    secret_hash: &str,
+    expires_at: Option<DateTime<Utc>>,
+) -> Result<(), SqlError> {
+    sqlx::query(INSERT_PLATFORM_CREDENTIAL_SQL)
+        .bind(id)
+        .bind(principal_id)
+        .bind(prefix)
+        .bind(secret_hash)
+        .bind(expires_at)
+        .execute(&mut **tx)
+        .await
+        .map_err(SqlError::from)?;
+    Ok(())
+}
+
+/// The one credential insert, shared by the pool and transaction entry points
+/// so they cannot drift apart.
+const INSERT_PLATFORM_CREDENTIAL_SQL: &str = "INSERT INTO platform.credentials
+     (id, principal_id, prefix, secret_hash, expires_at)
+ VALUES ($1, $2, $3, $4, $5)";
 
 /// Look up a platform credential by its non-secret prefix.
 ///

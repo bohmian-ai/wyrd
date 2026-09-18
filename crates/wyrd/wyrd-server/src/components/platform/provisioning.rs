@@ -131,7 +131,7 @@ impl TenantProvisioning {
                 &caller.context,
                 &Permission::tenant_create(),
                 caller.request_id.as_str(),
-                Some(caller.credential_id),
+                caller.credential_id,
                 Some(data_tenant_id),
             )
             .await?;

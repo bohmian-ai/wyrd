@@ -271,22 +271,21 @@ impl PlatformLogin {
         claims: &ExternalClaims,
     ) -> Result<uuid::Uuid, PlatformLoginError> {
         let issuer = connection.verification.issuer.as_str();
-        let principal_id =
-            match platform_identity_by_subject(&self.pool, issuer, &claims.subject).await? {
-                Some(identity) => identity.principal_id,
-                None => {
-                    // First login: match the pre-registered claim and pin the
-                    // subject. The store's `subject IS NULL` predicate makes this a
-                    // one-time transition, so a concurrent second login pins
-                    // nothing and is refused rather than racing.
-                    let Some(claim) = claims.email.as_deref() else {
-                        return Err(PlatformLoginError::NotAccepted);
-                    };
-                    pin_platform_identity(&self.pool, issuer, claim, &claims.subject)
-                        .await?
-                        .ok_or(PlatformLoginError::NotAccepted)?
-                }
+        let pinned = platform_identity_by_subject(&self.pool, issuer, &claims.subject).await?;
+        let principal_id = if let Some(identity) = pinned {
+            identity.principal_id
+        } else {
+            // First login: match the pre-registered claim and pin the subject.
+            // The store's `subject IS NULL` predicate makes this a one-time
+            // transition, so a concurrent second login pins nothing and is
+            // refused rather than racing.
+            let Some(claim) = claims.email.as_deref() else {
+                return Err(PlatformLoginError::NotAccepted);
             };
+            pin_platform_identity(&self.pool, issuer, claim, &claims.subject)
+                .await?
+                .ok_or(PlatformLoginError::NotAccepted)?
+        };
 
         let principal = platform_principal_by_id(&self.pool, principal_id)
             .await?

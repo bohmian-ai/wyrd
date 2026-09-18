@@ -12,11 +12,13 @@
 
 use secrecy::SecretString;
 use uuid::Uuid;
-use wyrd_auth::platform_credentials::{PlatformCredentialError, PlatformCredentials};
+use wyrd_auth::platform_credentials::{PlatformCredential, PlatformCredentialError};
+use wyrd_auth_issue::hash_api_key;
 use wyrd_runtime::{Permission, PermissionSet};
 use wyrd_spec::auth::PrincipalKindTag;
-use wyrd_sql::queries::platform::principal_grants::set_platform_grant;
-use wyrd_sql::queries::platform::principals::insert_platform_principal;
+use wyrd_sql::queries::platform::credentials::insert_platform_credential_tx;
+use wyrd_sql::queries::platform::principal_grants::set_platform_grant_tx;
+use wyrd_sql::queries::platform::principals::insert_platform_principal_tx;
 use wyrd_sql::{OperatorPool, SqlError};
 
 /// Operator-facing name of the deployment's administrative root.
@@ -63,20 +65,36 @@ fn platform_root_grant() -> PermissionSet {
 /// above, and issues its first credential, returning the plaintext for a single
 /// print. The plaintext is never persisted, logged, or traced.
 ///
+/// All three writes commit together. That is not tidiness: the principal's name
+/// is unique, so a partial initialization would leave a root with no credential
+/// that no later attempt could replace — the deployment would be permanently
+/// unadministrable, with no way back except the out-of-band SQL this operation
+/// exists to abolish. One transaction makes every failure leave the deployment
+/// uninitialized and retryable.
+///
 /// Single initialization is enforced durably by the unique principal name
 /// rather than by a read-then-write check, so two operators racing produce one
 /// root and one refusal rather than two roots.
 ///
 /// # Errors
 /// Returns [`InitError::AlreadyInitialized`] when a root already exists,
-/// [`InitError::Credential`] when issuance fails, and [`InitError::Store`] when
-/// the principal or grant write fails. A failed initialization leaves the
-/// deployment uninitialized and retryable.
+/// [`InitError::Credential`] when the credential cannot be generated or hashed,
+/// and [`InitError::Store`] when a write or the commit fails. A failed
+/// initialization commits nothing and can be retried unchanged.
 #[tracing::instrument(level = "info", skip(pool), err)]
 pub async fn initialize_platform_root(pool: &OperatorPool) -> Result<SecretString, InitError> {
     let principal_id = Uuid::now_v7();
-    match insert_platform_principal(
-        pool,
+    let credential = PlatformCredential::generate();
+    let raw = credential.secret.clone();
+    let secret_hash = tokio::task::spawn_blocking(move || hash_api_key(&raw))
+        .await
+        .map_err(|error| InitError::Credential(PlatformCredentialError::Join(error)))?
+        .map_err(|error| InitError::Credential(PlatformCredentialError::Hash(error)))?;
+
+    let mut tx = pool.begin().await.map_err(SqlError::from)?;
+
+    match insert_platform_principal_tx(
+        &mut tx,
         principal_id,
         PrincipalKindTag::GlobalAdmin,
         PLATFORM_ROOT_NAME,
@@ -85,19 +103,32 @@ pub async fn initialize_platform_root(pool: &OperatorPool) -> Result<SecretStrin
     {
         Ok(()) => {}
         Err(SqlError::UniqueViolation { .. }) => {
+            // Nothing was written, so the rollback is a formality; it matters
+            // that we do not leave the connection holding an open transaction.
+            let _ = tx.rollback().await;
             return Err(InitError::AlreadyInitialized);
         }
-        Err(error) => return Err(InitError::Store(error)),
+        Err(error) => {
+            let _ = tx.rollback().await;
+            return Err(InitError::Store(error));
+        }
     }
 
     let grant = serde_json::to_value(platform_root_grant().iter().collect::<Vec<_>>())
         .expect("permission set serializes to JSON");
-    set_platform_grant(pool, principal_id, &grant).await?;
+    set_platform_grant_tx(&mut tx, principal_id, &grant).await?;
+    insert_platform_credential_tx(
+        &mut tx,
+        Uuid::new_v4(),
+        principal_id,
+        &credential.prefix,
+        &secret_hash,
+        None,
+    )
+    .await?;
 
-    let issued = PlatformCredentials::new(pool.clone())
-        .issue(principal_id, None)
-        .await?;
-    Ok(issued.credential.secret)
+    tx.commit().await.map_err(SqlError::from)?;
+    Ok(credential.secret)
 }
 
 #[cfg(test)]

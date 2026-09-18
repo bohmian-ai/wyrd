@@ -77,7 +77,7 @@ impl TenantRecovery {
                 &caller.context,
                 &Permission::tenant_recover_admin(),
                 caller.request_id.as_str(),
-                Some(caller.credential_id),
+                caller.credential_id,
                 Some(tenant_id),
             )
             .await?;

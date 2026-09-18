@@ -116,7 +116,8 @@ pub enum PlatformCredentialError {
 /// Issues and verifies platform-scope credentials.
 ///
 /// Owns the operator boundary it writes through, so callers discover credential
-/// work as `credentials.issue(...)` and `credentials.authenticate(...)` rather
+/// work as `credentials.issue(...)` and
+/// `credentials.authenticate_for_session(...)` rather
 /// than threading a pool through every call.
 #[derive(Clone)]
 pub struct PlatformCredentials {
@@ -207,40 +208,6 @@ impl PlatformCredentials {
             principal_id: PrincipalId::new(row.principal_id),
             credential_id: row.id,
         })
-    }
-
-    /// Resolve a presented secret to the platform principal that owns it.
-    ///
-    /// Looks the credential up by its non-secret prefix, verifies the secret
-    /// against the stored Argon2 verifier, and checks that neither the
-    /// credential nor its principal has been revoked, expired, or suspended.
-    /// Successful use is recorded as operator-facing metadata and never
-    /// participates in the decision.
-    ///
-    /// # Errors
-    /// Returns [`PlatformCredentialError::InvalidCredential`] for every
-    /// rejection, so no caller can distinguish which condition failed, and
-    /// [`PlatformCredentialError::Store`] when the lookup itself fails — a
-    /// store outage is not a wrong password and must not be reported as one.
-    #[tracing::instrument(level = "debug", skip(self, presented), err)]
-    pub async fn authenticate(
-        &self,
-        presented: &SecretString,
-    ) -> Result<PrincipalId, PlatformCredentialError> {
-        let Some(prefix) = PlatformCredential::prefix_of(presented) else {
-            return Err(PlatformCredentialError::InvalidCredential);
-        };
-        let Some(row) = platform_credential_by_prefix(&self.pool, &prefix).await? else {
-            return Err(PlatformCredentialError::InvalidCredential);
-        };
-        if !row.is_usable(Utc::now()) {
-            return Err(PlatformCredentialError::InvalidCredential);
-        }
-        if !verify_api_key(presented, &row.secret_hash) {
-            return Err(PlatformCredentialError::InvalidCredential);
-        }
-        touch_platform_credential(&self.pool, row.id).await?;
-        Ok(PrincipalId::new(row.principal_id))
     }
 }
 
@@ -354,10 +321,10 @@ mod pg_tests {
         let plaintext = issued.credential.secret.expose_secret().to_owned();
 
         let resolved = PlatformCredentials::new(pool.clone())
-            .authenticate(&issued.credential.secret)
+            .authenticate_for_session(&issued.credential.secret)
             .await
             .expect("the issued credential authenticates");
-        assert_eq!(resolved.as_uuid(), principal);
+        assert_eq!(resolved.principal_id.as_uuid(), principal);
 
         let stored: String =
             sqlx::query_scalar("SELECT secret_hash FROM platform.credentials WHERE id = $1")
@@ -440,7 +407,7 @@ mod pg_tests {
 
         for (label, presented) in rejections {
             let error = PlatformCredentials::new(pool.clone())
-                .authenticate(&presented)
+                .authenticate_for_session(&presented)
                 .await
                 .expect_err("rejection");
             assert!(
@@ -455,7 +422,7 @@ mod pg_tests {
         }
 
         PlatformCredentials::new(pool.clone())
-            .authenticate(&live.credential.secret)
+            .authenticate_for_session(&live.credential.secret)
             .await
             .expect("the live credential still authenticates");
     }
@@ -477,7 +444,7 @@ mod pg_tests {
             .expect("credential issues");
 
         PlatformCredentials::new(pool.clone())
-            .authenticate(&issued.credential.secret)
+            .authenticate_for_session(&issued.credential.secret)
             .await
             .expect("the credential works before revocation");
 
@@ -486,7 +453,7 @@ mod pg_tests {
             .expect("revocation succeeds");
 
         let error = PlatformCredentials::new(pool.clone())
-            .authenticate(&issued.credential.secret)
+            .authenticate_for_session(&issued.credential.secret)
             .await
             .expect_err("the same credential stops working immediately");
         assert!(matches!(error, PlatformCredentialError::InvalidCredential));
@@ -504,7 +471,7 @@ mod pg_tests {
             .expect("credential issues");
 
         PlatformCredentials::new(pool.clone())
-            .authenticate(&issued.credential.secret)
+            .authenticate_for_session(&issued.credential.secret)
             .await
             .expect("authenticates");
 

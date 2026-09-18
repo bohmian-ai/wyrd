@@ -42,7 +42,11 @@ pub struct PlatformCaller {
     pub context: AuthContext,
     /// Credential that minted the presented session, carried into audit so an
     /// operation is traceable to the credential as well as the identity.
-    pub credential_id: Uuid,
+    ///
+    /// `None` when the session came from federated login, where the caller
+    /// presented an identity rather than a credential. Audit records the
+    /// principal either way; only the credential column is left empty.
+    pub credential_id: Option<Uuid>,
     /// Request correlator for audit and response headers.
     pub request_id: RequestId,
 }
@@ -195,7 +199,7 @@ mod tests {
                 PrincipalId::new(Uuid::now_v7()),
                 PermissionSet::new(),
             )),
-            credential_id: Uuid::now_v7(),
+            credential_id: Some(Uuid::now_v7()),
             request_id: wyrd_spec::request_id::RequestId::parse(&Uuid::now_v7().to_string())
                 .expect("generated UUIDv7 is a valid request id"),
         }
@@ -247,7 +251,7 @@ mod tests {
     fn platform_caller_carries_its_minting_credential() {
         let caller = caller();
 
-        assert_ne!(caller.credential_id, Uuid::nil());
+        assert!(caller.credential_id.is_some());
         assert_eq!(caller.principal_id(), caller.context.principal_id());
     }
 }

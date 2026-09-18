@@ -17,24 +17,32 @@ use chrono::Duration;
 use secrecy::ExposeSecret;
 use uuid::Uuid;
 use wyrd_auth::issue_api_key::WyrdApiKey;
-use wyrd_runtime::{Permission, RoleRef};
+use wyrd_auth::revocation_listener::notify_principal_revoked;
+use wyrd_runtime::RoleRef;
+use wyrd_spec::auth::PrincipalKindTag;
 use wyrd_spec::auth::{
     CreateServicePrincipalRequest, CreateServicePrincipalResponse, CredentialListResponse,
     CredentialMetadata, IssuedCredential, SecretBearer,
 };
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::vala::api::AuditOutcome;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
-    ApiKeyMetadataRow, grant_role_to_service_account, insert_api_key, insert_service_account,
-    list_api_key_metadata, revoke_api_key, role_by_name,
+    ApiKeyMetadataRow, credential_belongs_to, grant_role_to_service_account, insert_api_key,
+    insert_service_account, list_api_key_metadata, revoke_api_key,
+    revoke_service_account_principal, role_by_name,
 };
 
+use crate::audit;
 use crate::components::auth::Caller;
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
 /// Lifetime of a credential issued to tenant automation.
 const AUTOMATION_CREDENTIAL_DAYS: i64 = 90;
+
+/// Permission every operation on this surface requires.
+const REQUIRED_PERMISSION: &str = "service_accounts:write";
 
 /// Build the tenant principal-administration routes for the `/v1` group.
 pub fn principals_router() -> Router<AppState> {
@@ -52,26 +60,88 @@ pub fn principals_router() -> Router<AppState> {
 
 /// Refuse a caller that lacks tenant principal-management authority.
 ///
+/// Delegates to the repository's existing gate rather than re-checking the
+/// permission here, so this surface cannot drift from the one the principal
+/// revoke route already enforces.
+///
 /// # Errors
 /// Returns [`WyrdError::PermissionDeniedRbac`] when the permission is not held.
-fn require_principal_admin(caller: &Caller) -> Result<(), WyrdErrorResponse> {
-    if caller
-        .principal
-        .effective_permissions
-        .contains(&Permission::service_accounts_write())
-    {
-        return Ok(());
+fn require_principal_admin(caller: &Caller, action: &str) -> Result<(), WyrdErrorResponse> {
+    wyrd_auth::service_accounts::require_service_accounts_write(&caller.principal, action)
+        .map_err(WyrdErrorResponse::from)
+}
+
+/// Authorize one operation on this surface and record the decision.
+///
+/// Opens the tenant transaction first so the decision and the work it permits
+/// share it. A denial is committed on its own — a refused attempt is exactly
+/// the thing an operator needs in the log — and the connection is returned only
+/// when the caller may proceed.
+///
+/// # Errors
+/// Returns [`WyrdError::PermissionDeniedRbac`] when the caller lacks the
+/// permission, and [`WyrdError::AuditUnavailable`] when the decision cannot be
+/// recorded, which refuses the operation either way.
+async fn authorize<'a>(
+    state: &'a AppState,
+    caller: &Caller,
+    action: &str,
+    operation: &str,
+    resource: &str,
+) -> Result<TenantConn<'a>, WyrdErrorResponse> {
+    let mut conn = tenant_conn(state, caller).await?;
+    match require_principal_admin(caller, action) {
+        Ok(()) => {
+            record_decision(
+                &mut conn,
+                caller,
+                operation,
+                resource,
+                AuditOutcome::Allowed,
+            )
+            .await?;
+            Ok(conn)
+        }
+        Err(denied) => {
+            record_decision(&mut conn, caller, operation, resource, AuditOutcome::Denied).await?;
+            conn.commit().await.map_err(internal)?;
+            Err(denied)
+        }
     }
-    Err(WyrdErrorResponse::from(WyrdError::PermissionDeniedRbac {
-        message: "caller lacks tenant principal administration".to_owned(),
-        details: serde_json::json!({ "required": "service_accounts:write" }),
-    }))
+}
+
+/// Record an authorization decision on this surface.
+///
+/// Every operation here decides whether a principal may administer its tenant's
+/// identities, and agent-rules requires such a decision to be audited in the
+/// transaction that made it. Appending on the caller's own connection is what
+/// makes the record and the write it permits commit or fail together — an audit
+/// row for an operation that was rolled back would be worse than none.
+///
+/// # Errors
+/// Returns [`WyrdError::AuditUnavailable`] when the append fails, which fails
+/// the operation closed: a decision that cannot be recorded did not happen.
+async fn record_decision(
+    conn: &mut TenantConn<'_>,
+    caller: &Caller,
+    operation: &str,
+    resource: &str,
+    outcome: AuditOutcome,
+) -> Result<(), WyrdErrorResponse> {
+    audit::append_on(
+        conn,
+        &audit::audit_event(caller, operation, resource, REQUIRED_PERMISSION, outcome),
+    )
+    .await
+    .map_err(WyrdErrorResponse::from)
 }
 
 /// Open a transaction scoped to the caller's tenant.
 ///
 /// Tenant identity comes from the verified principal, never the request, so no
-/// caller can steer this at another tenant.
+/// caller can steer this at another tenant. Goes through `WyrdPostgres`, the
+/// owner of pooled tenant connections, so these routes carry the same acquire
+/// telemetry as every other tenant-plane handler.
 ///
 /// # Errors
 /// Returns an internal error when the connection cannot be opened.
@@ -79,7 +149,9 @@ async fn tenant_conn<'a>(
     state: &'a AppState,
     caller: &Caller,
 ) -> Result<TenantConn<'a>, WyrdErrorResponse> {
-    TenantConn::acquire(state.postgres.app_pool(), caller.data_tenant_id)
+    state
+        .postgres
+        .tenant_conn(caller.data_tenant_id)
         .await
         .map_err(|error| {
             WyrdErrorResponse::from(WyrdError::Internal {
@@ -134,7 +206,6 @@ async fn create_service_principal(
     caller: Caller,
     Json(request): Json<CreateServicePrincipalRequest>,
 ) -> Result<Json<CreateServicePrincipalResponse>, WyrdErrorResponse> {
-    require_principal_admin(&caller)?;
     for role in &request.roles {
         RoleRef::new(role).map_err(|_| {
             WyrdErrorResponse::from(WyrdError::Validation {
@@ -144,7 +215,14 @@ async fn create_service_principal(
         })?;
     }
 
-    let mut conn = tenant_conn(&state, &caller).await?;
+    let mut conn = authorize(
+        &state,
+        &caller,
+        "create tenant principals",
+        "auth.principal.create",
+        &format!("principal:{}", request.name),
+    )
+    .await?;
     let principal_id = Uuid::now_v7();
     insert_service_account(
         &mut conn,
@@ -196,8 +274,14 @@ async fn issue_credential(
     caller: Caller,
     Path(principal_id): Path<Uuid>,
 ) -> Result<Json<IssuedCredential>, WyrdErrorResponse> {
-    require_principal_admin(&caller)?;
-    let mut conn = tenant_conn(&state, &caller).await?;
+    let mut conn = authorize(
+        &state,
+        &caller,
+        "issue tenant credentials",
+        "auth.credential.issue",
+        &format!("principal:{principal_id}"),
+    )
+    .await?;
     let issued = mint_credential(&mut conn, principal_id, caller.principal.id.as_uuid()).await?;
     conn.commit().await.map_err(internal)?;
     Ok(Json(issued))
@@ -214,8 +298,14 @@ async fn list_credentials(
     caller: Caller,
     Path(principal_id): Path<Uuid>,
 ) -> Result<Json<CredentialListResponse>, WyrdErrorResponse> {
-    require_principal_admin(&caller)?;
-    let mut conn = tenant_conn(&state, &caller).await?;
+    let mut conn = authorize(
+        &state,
+        &caller,
+        "list tenant credentials",
+        "auth.credential.list",
+        &format!("principal:{principal_id}"),
+    )
+    .await?;
     let rows = list_api_key_metadata(&mut conn, principal_id)
         .await
         .map_err(internal)?;
@@ -226,30 +316,85 @@ async fn list_credentials(
     }))
 }
 
-/// Revoke one credential, leaving the principal and its other credentials
-/// untouched.
+/// Revoke one credential, leaving the principal and its roles untouched.
+///
+/// Revocation has to mean two things, and marking the credential row only
+/// achieves the first: the credential can mint no new token, *and* the tokens
+/// it already minted stop working. The second is the one that matters when a
+/// credential leaks, and a bearer token is useful to whoever holds it for its
+/// whole lifetime. So this also advances the principal's revocation epoch,
+/// which the verifier checks on every request.
+///
+/// That epoch is per-principal, which is the granularity the schema offers, so
+/// it also invalidates live tokens minted by the principal's *other*
+/// credentials. That does not reintroduce a rotation gap — a surviving
+/// credential re-exchanges immediately — and the alternative, letting a leaked
+/// credential's tokens outlive their revocation, is not a trade worth making.
+///
+/// Both writes are in one transaction: a credential marked revoked whose tokens
+/// still authorize is precisely the state this exists to prevent.
 ///
 /// # Errors
 /// Returns a stable Wyrd error when the caller is unauthorized, the credential
-/// is unknown, or the write fails.
+/// is unknown in this tenant, or a write fails.
 #[tracing::instrument(level = "info", skip(state, caller))]
 async fn revoke_credential(
     State(state): State<AppState>,
     caller: Caller,
-    Path((_principal_id, credential_id)): Path<(Uuid, Uuid)>,
+    Path((principal_id, credential_id)): Path<(Uuid, Uuid)>,
 ) -> Result<axum::http::StatusCode, WyrdErrorResponse> {
-    require_principal_admin(&caller)?;
-    let mut conn = tenant_conn(&state, &caller).await?;
+    let mut conn = authorize(
+        &state,
+        &caller,
+        "revoke tenant credentials",
+        "auth.credential.revoke",
+        &format!("credential:{credential_id}"),
+    )
+    .await?;
+
+    // Scoped to the principal the path names, so a credential id alone cannot
+    // revoke a credential belonging to some other principal.
+    let owned = credential_belongs_to(&mut conn, credential_id, principal_id)
+        .await
+        .map_err(internal)?;
+    if !owned {
+        return Err(WyrdErrorResponse::from(WyrdError::NotFound {
+            message: "credential not found for this principal".to_owned(),
+            details: serde_json::json!({}),
+        }));
+    }
+
     let revoked = revoke_api_key(&mut conn, credential_id)
         .await
         .map_err(internal)?;
+    revoke_service_account_principal(&mut conn, principal_id)
+        .await
+        .map_err(internal)?;
     conn.commit().await.map_err(internal)?;
+
+    // Each replica caches a principal's revocation epoch for a few seconds, so
+    // without this the revoked credential's tokens keep working elsewhere until
+    // that cache expires. Best-effort: the epoch write is durable and the TTL
+    // enforces it regardless, this only shortens the window to the NOTIFY.
+    if let Err(error) = notify_principal_revoked(
+        state.postgres.app_pool(),
+        caller.data_tenant_id,
+        PrincipalKindTag::Service,
+        wyrd_runtime::PrincipalId::new(principal_id),
+    )
+    .await
+    {
+        tracing::warn!(
+            error = %error,
+            "revocation NOTIFY failed; the epoch write is durable, TTL will enforce it"
+        );
+    }
 
     if revoked {
         Ok(axum::http::StatusCode::NO_CONTENT)
     } else {
         Err(WyrdErrorResponse::from(WyrdError::NotFound {
-            message: "credential not found in this tenant".to_owned(),
+            message: "credential not found for this principal".to_owned(),
             details: serde_json::json!({}),
         }))
     }

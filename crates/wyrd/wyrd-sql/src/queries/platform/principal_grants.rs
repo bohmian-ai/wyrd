@@ -10,6 +10,8 @@
 use serde_json::Value;
 use sqlx::types::Uuid;
 
+use sqlx::{Postgres, Transaction};
+
 use crate::{OperatorPool, SqlError};
 
 /// Replace a platform principal's granted permission set.
@@ -20,22 +22,42 @@ use crate::{OperatorPool, SqlError};
 /// # Errors
 /// Returns [`SqlError::Query`] when the write fails, including when
 /// `principal_id` does not name an existing platform principal.
+pub async fn set_platform_grant_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    principal_id: Uuid,
+    permissions: &Value,
+) -> Result<(), SqlError> {
+    sqlx::query(SET_PLATFORM_GRANT_SQL)
+        .bind(principal_id)
+        .bind(permissions)
+        .execute(&mut **tx)
+        .await
+        .map_err(SqlError::from)?;
+    Ok(())
+}
+
+/// The one grant upsert, shared by every entry point so they cannot drift.
+const SET_PLATFORM_GRANT_SQL: &str =
+    "INSERT INTO platform.principal_grants (principal_id, permissions)
+     VALUES ($1, $2)
+     ON CONFLICT (principal_id)
+     DO UPDATE SET permissions = EXCLUDED.permissions, updated_at = now()";
+
+/// Install or replace a platform principal's grant.
+///
+/// # Errors
+/// Returns [`SqlError::Query`] when the upsert fails.
 pub async fn set_platform_grant(
     pool: &OperatorPool,
     principal_id: Uuid,
     permissions: &Value,
 ) -> Result<(), SqlError> {
-    sqlx::query(
-        "INSERT INTO platform.principal_grants (principal_id, permissions)
-         VALUES ($1, $2)
-         ON CONFLICT (principal_id)
-         DO UPDATE SET permissions = EXCLUDED.permissions, updated_at = now()",
-    )
-    .bind(principal_id)
-    .bind(permissions)
-    .execute(pool.pool())
-    .await
-    .map_err(SqlError::from)?;
+    sqlx::query(SET_PLATFORM_GRANT_SQL)
+        .bind(principal_id)
+        .bind(permissions)
+        .execute(pool.pool())
+        .await
+        .map_err(SqlError::from)?;
     Ok(())
 }
 

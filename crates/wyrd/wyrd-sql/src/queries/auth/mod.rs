@@ -19,7 +19,9 @@ pub mod user_identities;
 pub mod users;
 pub mod workload_bindings;
 
-pub use api_keys::{ApiKeyMetadataRow, list_api_key_metadata, revoke_api_key};
+pub use api_keys::{
+    ApiKeyMetadataRow, credential_belongs_to, list_api_key_metadata, revoke_api_key,
+};
 pub use login_state::{LoginStateRow, insert_login_state, take_login_state};
 pub use refresh_tokens::{
     consume_active_refresh, insert_refresh_token_rotated, refresh_by_hash, revoke_refresh,

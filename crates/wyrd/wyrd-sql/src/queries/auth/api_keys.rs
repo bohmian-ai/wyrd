@@ -79,6 +79,35 @@ pub async fn list_api_key_metadata(
     .await
 }
 
+/// Report whether a credential belongs to a principal, inside this tenant.
+///
+/// Revocation is addressed by credential id, which is unique on its own, so
+/// without this check a caller could name any principal in the path and still
+/// revoke a credential belonging to another one. Row-level security already
+/// confines that to the caller's own tenant; this confines it to the principal
+/// the request actually named.
+///
+/// # Errors
+/// Returns a SQLx error when Postgres rejects the read.
+pub async fn credential_belongs_to(
+    conn: &mut TenantConn<'_>,
+    credential_id: Uuid,
+    principal_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let found: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id
+           FROM wyrd.auth_api_keys
+          WHERE data_tenant_id = wyrd.current_tenant()
+            AND id = $1
+            AND principal_id = $2",
+    )
+    .bind(credential_id)
+    .bind(principal_id)
+    .fetch_optional(&mut **conn.transaction())
+    .await?;
+    Ok(found.is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use super::REVOKE_API_KEY_SQL;

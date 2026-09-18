@@ -129,3 +129,47 @@ column guarded by a check.
 projection is a separate type. This preserves the approved two-variant
 authenticated context (`TASK-002`) without making tenancy optional on every
 handler that reads it.
+
+## Verification evidence
+
+Environment: `mise` is not installed in this container, so `mise exec -- cargo …`
+was substituted with direct `cargo` invocations against the same toolchain, and
+Postgres-backed suites ran through the repository wrapper
+`scripts/postgres/with-test-postgres.sh` (Docker daemon started locally).
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Principal persists and resolves with no credential; credential lifecycle never mutates principal or grants | `queries/platform/principals.rs`, `principal_grants.rs` | `pg_admin_principals::principal_persists_and_is_authorized_without_any_credential`, `…::credentials_are_independent_of_each_other_and_of_authority` | PASS |
+| One principal holds two live credentials; revoking one leaves the other authenticating, authorization unchanged | `queries/platform/credentials.rs` | `pg_admin_principals::credentials_are_independent_of_each_other_and_of_authority` | PASS |
+| Global-administration principal cannot persist with a tenant; tenant-scope cannot persist without one | `migrations/20260601000020_admin_principals.sql` | `pg_admin_principals::platform_principals_have_no_tenant_column`, `…::platform_store_rejects_a_tenant_scope_kind` | PASS |
+| Machine principal persists and holds a credential with no Card; Card-bound Service/Agent keep their identity | `migrations/…_admin_principals.sql`, `queries/auth/service_accounts.rs`, `wyrd-runtime/src/principal.rs` | `pg_admin_principals::tenant_admin_principal_persists_without_a_card`, `…::tenant_admin_principal_cannot_bind_a_card`, `wyrd-auth-verify::into_verified_accepts_card_free_service_with_empty_scope` | PASS |
+| Plaintext returned once; only a verifier plus non-secret metadata persisted | `queries/platform/credentials.rs` | `pg_admin_principals::listing_returns_metadata_and_never_plaintext` | PASS |
+| Every invalid-credential condition is indistinguishable | `queries/platform/credentials.rs::is_usable` | `pg_admin_principals::every_invalid_condition_yields_an_unusable_credential` | PARTIAL — the durable layer proves every condition yields an unusable credential; the single public error is owned by the authentication pipeline in `TASK-002` |
+| No unreachable second identity model remains in the schema | `migrations/…_admin_principals.sql`, `queries/platform/mod.rs`, `wyrd-sql/src/lib.rs` | `pg_migration::migrations_apply_and_are_idempotent` | PASS |
+
+Commands run:
+
+```bash
+cargo fmt --all
+cargo clippy --locked -p wyrd-spec -p wyrd-runtime -p wyrd-auth-verify \
+  -p wyrd-auth-issue -p wyrd-sql -p wyrd-auth --all-targets   # clean
+cargo test --locked -p wyrd-spec --lib auth::principal_kind    # 4 passed
+cargo test --locked -p wyrd-runtime --lib                      # 43 passed
+cargo test --locked -p wyrd-auth-verify --lib into_verified    # 11 passed
+cargo test --locked -p wyrd-auth --lib -- --skip pg_tests      # 13 passed
+scripts/postgres/with-test-postgres.sh -- bash -lc \
+  'cargo test --locked -p wyrd-sql --test pg_migration migrations_apply_and_are_idempotent'   # 1 passed
+scripts/postgres/with-test-postgres.sh -- bash -lc \
+  'cargo test --locked -p wyrd-sql --test pg_admin_principals -- --test-threads=1'            # 9 passed
+git diff --check                                               # clean
+```
+
+Material limits:
+
+- Seven `wyrd-auth-verify` external-JWKS tests fail in this container with
+  "No rustls crypto provider is configured". They construct a `reqwest::Client`
+  and are unrelated to principal or credential behavior; `VER-005` places them
+  out of scope.
+- Non-goals held: no routes, initialization, tenant provisioning, OIDC, or
+  RBAC engine changes. Token minting for a Card-free principal is refused with
+  a typed error and lands in `TASK-002` with `REQ-012`.

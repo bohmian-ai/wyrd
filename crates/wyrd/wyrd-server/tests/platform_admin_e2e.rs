@@ -287,3 +287,208 @@ async fn tenant_administration_survives_losing_every_credential() {
         "the replacement credential restores programmatic administration: {body}"
     );
 }
+
+/// Build a JSON request carrying a tenant access token.
+fn tenant_request(method: Method, uri: &str, body: Option<Value>) -> Request<Body> {
+    let builder = Request::builder().method(method).uri(uri);
+    match body {
+        Some(body) => builder
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&body).expect("serializes")))
+            .expect("request builds"),
+        None => builder.body(Body::empty()).expect("request builds"),
+    }
+}
+
+/// Exchange a tenant credential for an access token, or report the refusal.
+async fn tenant_token(srv: &WyrdTestServer, credential: &str) -> Result<String, StatusCode> {
+    let resp = srv
+        .oneshot(anonymous_post(
+            "/auth/token",
+            json!({ "grant_type": "wyrd_api_key", "api_key": credential }),
+        ))
+        .await
+        .expect("token route responds");
+    let status = resp.status();
+    if status != StatusCode::OK {
+        return Err(status);
+    }
+    let body = body_json(resp).await;
+    Ok(body["access_token"]
+        .as_str()
+        .expect("access token is a string")
+        .to_owned())
+}
+
+/// Provision a tenant and return its administrator's access token.
+async fn provisioned_tenant_admin(srv: &WyrdTestServer, slug: &str) -> String {
+    let root = initialize_platform_root(&srv.operator_pool())
+        .await
+        .expect("deployment initializes");
+    let session = platform_session(srv, secrecy::ExposeSecret::expose_secret(&root)).await;
+    let created = body_json(
+        srv.oneshot(platform_post(
+            "/platform/tenants",
+            &session,
+            json!({ "slug": slug, "display_name": slug }),
+        ))
+        .await
+        .expect("tenant route responds"),
+    )
+    .await;
+    let credential = created["admin"]["credential"]
+        .as_str()
+        .expect("admin credential");
+    tenant_token(srv, credential)
+        .await
+        .expect("the tenant administrator authenticates")
+}
+
+/// A tenant administrator creates its own automation principal and rotates its
+/// credential with no gap and no platform involvement.
+///
+/// This is the whole point of separating credentials from identity: the
+/// principal, its roles, and everything it owns survive the rotation, and the
+/// old credential stops working only when the operator says so.
+#[tokio::test]
+async fn a_tenant_rotates_an_automation_credential_without_an_outage() {
+    if !e2e_enabled() {
+        return;
+    }
+    let srv = WyrdTestServer::start_in_process()
+        .await
+        .expect("server starts");
+    let admin = provisioned_tenant_admin(&srv, "rotating").await;
+
+    // 1. The tenant creates automation that is narrower than itself.
+    let resp = srv
+        .oneshot_authenticated(
+            &admin,
+            tenant_request(
+                Method::POST,
+                "/v1/principals",
+                Some(json!({ "name": "ci-runner", "roles": ["reader"] })),
+            ),
+        )
+        .await
+        .expect("principal route responds");
+    let status = resp.status();
+    let created = body_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "principal is created: {created}");
+    let principal_id = created["principal_id"]
+        .as_str()
+        .expect("principal id")
+        .to_owned();
+    let first = created["credential"]
+        .as_str()
+        .expect("credential")
+        .to_owned();
+
+    // 2. That credential works, and carries only the role it was granted.
+    let automation = tenant_token(&srv, &first)
+        .await
+        .expect("automation authenticates");
+    let resp = srv
+        .oneshot_authenticated(
+            &automation,
+            tenant_request(
+                Method::POST,
+                "/v1/principals",
+                Some(json!({ "name": "escalated", "roles": ["admin"] })),
+            ),
+        )
+        .await
+        .expect("principal route responds");
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a reader principal cannot mint itself an administrator"
+    );
+
+    // 3. Rotation is overlap: the replacement is live before the old one dies.
+    let resp = srv
+        .oneshot_authenticated(
+            &admin,
+            tenant_request(
+                Method::POST,
+                &format!("/v1/principals/{principal_id}/credentials"),
+                None,
+            ),
+        )
+        .await
+        .expect("issue route responds");
+    let status = resp.status();
+    let issued = body_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "second credential issues: {issued}");
+    let second = issued["credential"]
+        .as_str()
+        .expect("credential")
+        .to_owned();
+    let second_id = issued["id"].as_str().expect("credential id").to_owned();
+
+    assert!(
+        tenant_token(&srv, &first).await.is_ok(),
+        "the original credential is still live during the overlap"
+    );
+    assert!(
+        tenant_token(&srv, &second).await.is_ok(),
+        "the replacement credential is live before anything is revoked"
+    );
+
+    // 4. Retiring the old one leaves the principal and the new credential alone.
+    let credentials = body_json(
+        srv.oneshot_authenticated(
+            &admin,
+            tenant_request(
+                Method::GET,
+                &format!("/v1/principals/{principal_id}/credentials"),
+                None,
+            ),
+        )
+        .await
+        .expect("list route responds"),
+    )
+    .await;
+    let listed = credentials["credentials"]
+        .as_array()
+        .expect("credential list");
+    assert_eq!(
+        listed.len(),
+        2,
+        "both credentials are visible: {credentials}"
+    );
+    assert!(
+        listed.iter().all(|entry| entry.get("credential").is_none()),
+        "a listing never returns secret material: {credentials}"
+    );
+    let first_id = listed
+        .iter()
+        .find(|entry| entry["id"] != second_id.as_str())
+        .expect("the original credential is listed")["id"]
+        .as_str()
+        .expect("credential id")
+        .to_owned();
+
+    let resp = srv
+        .oneshot_authenticated(
+            &admin,
+            tenant_request(
+                Method::DELETE,
+                &format!("/v1/principals/{principal_id}/credentials/{first_id}"),
+                None,
+            ),
+        )
+        .await
+        .expect("revoke route responds");
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT, "revocation succeeds");
+
+    assert_eq!(
+        tenant_token(&srv, &first).await.unwrap_err(),
+        StatusCode::UNAUTHORIZED,
+        "the retired credential stops working"
+    );
+    assert!(
+        tenant_token(&srv, &second).await.is_ok(),
+        "revoking one credential does not disturb the principal's other credential"
+    );
+}

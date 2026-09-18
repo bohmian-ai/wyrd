@@ -15,6 +15,7 @@ pub mod jwt_bearer;
 pub mod login;
 pub mod permission_resolver;
 pub mod pg_resolvers;
+pub mod platform_authz;
 pub mod platform_credentials;
 pub mod refresh;
 pub mod repo;

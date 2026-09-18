@@ -302,6 +302,7 @@ mod tests {
             "src/queries/platform/tenant_resolver.rs",
             "src/queries/platform/tenants.rs",
             "src/queries/platform/principals.rs",
+            "src/queries/platform/audit_authz.rs",
             "src/queries/platform/credentials.rs",
             "src/queries/platform/principal_grants.rs",
             "src/queries/storage/mod.rs",

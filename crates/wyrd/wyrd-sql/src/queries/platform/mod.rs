@@ -10,6 +10,7 @@
 //! authenticate it, and the grants that authorize it, kept as three separate
 //! concerns so rotating a credential never disturbs identity or authority.
 
+pub mod audit_authz;
 pub mod credentials;
 pub mod principal_grants;
 pub mod principals;

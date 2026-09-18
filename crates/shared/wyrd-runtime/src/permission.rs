@@ -176,7 +176,12 @@ impl Resource {
         matches!(self, Self::BifrostQuery)
     }
 
-    fn as_str(&self) -> Option<&'static str> {
+    /// Stable label for this resource, or `None` for a composite `AnyOf`.
+    ///
+    /// Audit records the label rather than the enum's debug shape so a stored
+    /// decision stays readable and comparable across releases.
+    #[must_use]
+    pub fn as_str(&self) -> Option<&'static str> {
         Some(match self {
             Self::Cards => "cards",
             Self::Services => "services",
@@ -212,7 +217,12 @@ impl Action {
         }
     }
 
-    fn as_str(&self) -> Option<&'static str> {
+    /// Stable label for this action, or `None` for a composite `AnyOf`.
+    ///
+    /// Audit records the label rather than the enum's debug shape so a stored
+    /// decision stays readable and comparable across releases.
+    #[must_use]
+    pub fn as_str(&self) -> Option<&'static str> {
         Some(match self {
             Self::Read => "read",
             Self::Write => "write",

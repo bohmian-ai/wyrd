@@ -14,7 +14,9 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use wyrd_auth_oidc::{IssuerConfigResolver, JwksCache, OidcError, OidcKid, map_claims};
+use wyrd_auth_oidc::{
+    IssuerConfigResolver, IssuerVerification, JwksCache, OidcError, OidcKid, map_claims,
+};
 use wyrd_runtime::{
     DelegationStep, PermissionSet, Principal, PrincipalId, PrincipalKind,
     PrincipalRef as RuntimePrincipalRef, RoleRef,
@@ -255,6 +257,30 @@ impl<I> Clone for ExternalVerify<I> {
             trusted: Arc::clone(&self.trusted),
         }
     }
+}
+
+/// A federated identity verified against one trusted issuer.
+///
+/// Deliberately tenant-free: it states what the issuer asserted, not where the
+/// identity belongs. [`VerifiedExternalIdentity`] is this plus the tenant the
+/// issuer was resolved under; the platform control plane uses this form
+/// directly because a platform principal has no tenant.
+#[derive(Debug, Clone)]
+pub struct ExternalClaims {
+    /// The trusted issuer that signed the token.
+    pub issuer: IssuerUrl,
+    /// Verified external subject (from `sub` or a configured claim path).
+    pub subject: String,
+    /// Optional email address; never used as the identity key.
+    pub email: Option<String>,
+    /// Groups or roles extracted from the token (RBAC resolution input).
+    pub groups: Vec<String>,
+    /// Whether the matched issuer represents human users or machine workloads.
+    pub principal_kind: IssuerTokenPolicy,
+    /// The audience the matched issuer expects.
+    pub expected_audience: String,
+    /// Full verified token claims for downstream assertion checks (e.g. nonce).
+    pub raw_claims: serde_json::Value,
 }
 
 /// Verified identity from an external OIDC issuer.
@@ -559,8 +585,6 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> TokenVe
             return Err(AuthError::BadTokenFormat);
         }
 
-        let header = decode_header(token).map_err(AuthError::from)?;
-
         // Read the unverified `iss` from the JWT payload to look up the trusted
         // issuer. JWTs are three base64url-no-padding parts: header.claims.sig.
         let iss_str = {
@@ -598,6 +622,56 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> TokenVe
             .await
             .map_err(|_| AuthError::VerifyUnavailable)?
             .ok_or(AuthError::InvalidToken)?;
+
+        let claims = self
+            .verify_external_against(&trusted.verification(), token)
+            .await?;
+
+        Ok(VerifiedExternalIdentity {
+            issuer: claims.issuer,
+            tenant_id: *tenant,
+            subject: claims.subject,
+            email: claims.email,
+            groups: claims.groups,
+            principal_kind: claims.principal_kind,
+            expected_audience: claims.expected_audience,
+            raw_claims: claims.raw_claims,
+        })
+    }
+
+    /// Verify a federated token against an issuer the caller already resolved.
+    ///
+    /// This is the single authoritative external-token verification: signature
+    /// over the issuer's JWKS, issuer and audience pinning, clock skew, and
+    /// claim mapping. [`Self::verify_external`] is the tenant-scoped entry
+    /// point that resolves the issuer from a tenant's configuration and then
+    /// delegates here.
+    ///
+    /// It exists because not every federated identity belongs to a tenant. The
+    /// platform control plane resolves its one deployment-owned connection from
+    /// the platform store, which has no tenant to key a resolver by, and must
+    /// not grow a parallel verification path to compensate. Taking the resolved
+    /// issuer as an argument keeps one implementation for both planes; the
+    /// caller owns *which* issuer is trusted, this owns *whether* the token is
+    /// valid under it.
+    ///
+    /// # Errors
+    /// - [`AuthError::BadTokenFormat`] — the token is oversized or not a JWT.
+    /// - [`AuthError::InvalidToken`] — a symmetric algorithm, a missing or
+    ///   unknown `kid`, a wrong issuer or audience, or unmappable claims.
+    /// - [`AuthError::TokenExpired`] — the token's `exp` has passed.
+    /// - [`AuthError::VerifyUnavailable`] — the JWKS endpoint is unreachable,
+    ///   or the external verification path was never configured.
+    pub async fn verify_external_against(
+        &self,
+        trusted: &IssuerVerification,
+        token: &str,
+    ) -> Result<ExternalClaims, AuthError> {
+        if token.len() > MAX_BEARER_TOKEN_BYTES {
+            return Err(AuthError::BadTokenFormat);
+        }
+        let header = decode_header(token).map_err(AuthError::from)?;
+        let ext = self.external.as_ref().ok_or(AuthError::InvalidToken)?;
 
         // Reject symmetric algorithms. Only asymmetric keys appear in JWKS.
         if matches!(
@@ -638,9 +712,8 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> TokenVe
         let mapped =
             map_claims(&trusted.claim_mapping, &raw_claims).map_err(|_| AuthError::InvalidToken)?;
 
-        Ok(VerifiedExternalIdentity {
+        Ok(ExternalClaims {
             issuer: trusted.issuer.clone(),
-            tenant_id: *tenant,
             subject: mapped.subject,
             email: mapped.email,
             groups: mapped.groups,

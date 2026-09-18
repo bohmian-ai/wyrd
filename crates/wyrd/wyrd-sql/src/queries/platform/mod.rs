@@ -9,9 +9,14 @@
 //! administrative identity: a durable principal, the credentials that
 //! authenticate it, and the grants that authorize it, kept as three separate
 //! concerns so rotating a credential never disturbs identity or authority.
+//!
+//! `identity` adds the optional federated way in: the one deployment-owned OIDC
+//! connection, its login state, and the durable `(issuer, subject)` pin that
+//! resolves a human to an existing platform principal. It never creates one.
 
 pub mod audit_authz;
 pub mod credentials;
+pub mod identity;
 pub mod principal_grants;
 pub mod principals;
 pub mod provisioning;

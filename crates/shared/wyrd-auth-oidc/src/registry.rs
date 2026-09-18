@@ -114,6 +114,52 @@ pub struct TrustedIssuer {
     pub jwks_ttl: Duration,
 }
 
+impl TrustedIssuer {
+    /// Project the facts token verification actually needs.
+    ///
+    /// Verification asks only "is this token validly signed by this issuer, for
+    /// this audience, and what do its claims mean". Tenancy, group mapping, and
+    /// default roles answer a different question — what the identity is allowed
+    /// to do once verified — and belong to the caller, not the verifier.
+    ///
+    /// Separating them is what lets one verification implementation serve both
+    /// control planes: the platform plane's single deployment-owned connection
+    /// has no tenant, so it can build this directly without borrowing a tenant
+    /// it does not have.
+    #[must_use]
+    pub fn verification(&self) -> IssuerVerification {
+        IssuerVerification {
+            issuer: self.issuer.clone(),
+            jwks_uri: self.jwks_uri.clone(),
+            expected_audience: self.expected_audience.clone(),
+            claim_mapping: self.claim_mapping.clone(),
+            principal_kind: self.principal_kind,
+        }
+    }
+}
+
+// --------------------------------------------------------------------------
+// IssuerVerification
+// --------------------------------------------------------------------------
+
+/// The issuer facts required to verify one federated token.
+///
+/// Deliberately tenant-free and authorization-free. It says how to check a
+/// token, never who the resulting identity is or what it may do.
+#[derive(Debug, Clone)]
+pub struct IssuerVerification {
+    /// Normalized OIDC issuer URL, pinned as the token's `iss`.
+    pub issuer: IssuerUrl,
+    /// JWKS endpoint the signing key is fetched from.
+    pub jwks_uri: Url,
+    /// Audience value pinned as the token's `aud`.
+    pub expected_audience: String,
+    /// How to extract normalized claims from the verified token.
+    pub claim_mapping: ClaimMapping,
+    /// Whether tokens from this issuer represent humans or machine workloads.
+    pub principal_kind: IssuerTokenPolicy,
+}
+
 // --------------------------------------------------------------------------
 // WorkloadBinding
 // --------------------------------------------------------------------------

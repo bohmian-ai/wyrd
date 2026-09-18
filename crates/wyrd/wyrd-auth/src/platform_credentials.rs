@@ -402,6 +402,38 @@ mod pg_tests {
             .expect("the live credential still authenticates");
     }
 
+    /// Revocation takes effect on the very next request.
+    ///
+    /// The platform plane issues no access tokens, so it has no authorization
+    /// epoch to advance and no cached verifier to outlive a revocation: every
+    /// request re-verifies the credential against the store. A revoked
+    /// credential that worked a moment ago stops working immediately.
+    #[tokio::test]
+    async fn revocation_takes_effect_on_the_next_request() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let pool = fixture.operator_pool();
+        let principal = seed_principal(&fixture, "revoked-mid-life").await;
+        let issued = PlatformCredentials
+            .issue(pool, principal, None)
+            .await
+            .expect("credential issues");
+
+        PlatformCredentials
+            .authenticate(pool, &issued.credential.secret)
+            .await
+            .expect("the credential works before revocation");
+
+        revoke_platform_credential(pool, issued.id)
+            .await
+            .expect("revocation succeeds");
+
+        let error = PlatformCredentials
+            .authenticate(pool, &issued.credential.secret)
+            .await
+            .expect_err("the same credential stops working immediately");
+        assert!(matches!(error, PlatformCredentialError::InvalidCredential));
+    }
+
     /// Successful use is recorded as operator-facing metadata only.
     #[tokio::test]
     async fn successful_use_records_last_used() {

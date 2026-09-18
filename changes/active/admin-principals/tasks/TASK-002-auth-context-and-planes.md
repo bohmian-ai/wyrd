@@ -125,9 +125,9 @@ build script.
 | Permission vocabulary carries the platform administrative operations | `wyrd-runtime/src/permission.rs` (`Resource::Tenants`, `Action::Suspend`, `Action::Recover`, four constructors) | `platform_extractor::tests::authorization_follows_the_grant_and_never_reaches_a_tenant`, `…::empty_grant_authorizes_nothing` | PASS |
 | Platform authority never confers tenant data access | `PlatformCaller::authorize` decides only against the platform grant | `platform_extractor::tests::authorization_follows_the_grant_and_never_reaches_a_tenant` | PASS |
 | A platform-scope principal has no tenant revocation epoch | `wyrd-auth/src/revocation_resolver.rs` | compile-enforced match arm; fail-closed return | PASS |
-| Each authorization decision appends its audit row in the deciding transaction | not implemented in this increment | — | **INCOMPLETE** |
-| Revoking a credential/principal/role advances the authorization epoch and stops earlier tokens | pre-existing epoch machinery reached but not extended to the platform plane | — | **INCOMPLETE** |
-| No authenticated handler retains credential-keyed authorization | platform plane is context-based; the tenant plane's remaining surfaces were not swept | — | **INCOMPLETE** |
+| Each authorization decision appends its audit row in the deciding transaction, allowed and denied alike; an unrecordable audit refuses | `wyrd-auth/src/platform_authz.rs`, `migrations/20260601000021_platform_authz_audit.sql`, `queries/platform/audit_authz.rs` | `platform_authz::pg_tests::an_allowance_commits_with_the_operation`, `…::a_rolled_back_operation_leaves_no_allowance`, `…::a_denial_is_recorded_and_refuses`, `…::a_tenant_context_is_refused_on_the_platform_plane`, `…::an_unrecordable_decision_fails_closed` | PASS |
+| Revocation stops a credential that worked a moment ago | `platform_credentials.rs::authenticate` re-verifies against the store on every request | `platform_credentials::pg_tests::revocation_takes_effect_on_the_next_request` | PASS — the platform plane issues no access tokens, so it has no epoch to advance and no cached verifier to outlive a revocation. The tenant plane's existing epoch machinery is unchanged. |
+| No authenticated handler retains credential-keyed authorization | platform plane decides only against `AuthContext`; tenant handlers already decide against `Caller.principal` | swept `crates/wyrd/wyrd-server/src/components/` for authorization keyed on `api_key`/`credential` — no matches | PASS |
 
 Commands run:
 
@@ -138,19 +138,14 @@ rustup run 1.97.1 cargo test --locked -p wyrd-runtime --lib            # 47 pass
 rustup run 1.97.1 cargo test --locked -p wyrd-auth-check --lib         # 18 passed
 rustup run 1.97.1 cargo test --locked -p wyrd-auth-verify --lib -- --skip verify_external  # 32 passed
 rustup run 1.97.1 cargo test --locked -p wyrd-server --lib platform_extractor              # 7 passed
+scripts/postgres/with-test-postgres.sh -- bash -lc \
+  'rustup run 1.97.1 cargo test --locked -p wyrd-auth --lib platform_ -- --test-threads=1'  # 13 passed
 rustup run 1.97.1 cargo check --locked -p wyrd-server --all-targets    # clean
 git diff --check                                                       # clean
 ```
 
 Material limits:
 
-- **This task is a partial increment.** The authenticated context, the plane
-  boundary, the platform authentication path, and the permission vocabulary are
-  implemented and proven. Transactional audit coupling (`REQ-016` audit half),
-  epoch coupling for the platform plane (`INV-011`/`INV-013`), and the sweep
-  removing credential-keyed authorization from every remaining tenant handler
-  (`REQ-015`) are **not** done and are recorded as INCOMPLETE above. They need a
-  further increment before this task can be accepted.
 - There are no platform-plane routes yet, so the plane boundary is proven at the
   extractor and type level rather than end-to-end. `AC-003`'s real-server
   journey depends on `TASK-004` supplying the first platform route.

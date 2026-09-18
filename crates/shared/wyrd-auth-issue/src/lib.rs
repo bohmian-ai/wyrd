@@ -203,6 +203,38 @@ impl IssuingKey {
         self.issue_access_token_with_claims(principal.id.to_string(), principal, roles, None, ttl)
     }
 
+    /// Mint an access token for a Card-free machine principal.
+    ///
+    /// Covers the tenant administrator and tenant automation: identities that
+    /// hold a credential and roles but bind no Card, so they carry no emit
+    /// scope. Without this a Card-free principal could be created and issued a
+    /// credential it could never exchange, which would make a provisioned
+    /// tenant unusable.
+    ///
+    /// # Errors
+    /// Returns [`IssueError::InvalidPrincipalKind`] when the kind is not a
+    /// Card-free machine kind, [`IssueError::InvalidCardRef`] when a Card is
+    /// present, and a signing or timestamp error otherwise.
+    #[tracing::instrument(level = "debug", skip(self), fields(jti = tracing::field::Empty), err)]
+    pub fn issue_cardless_access_token(
+        &self,
+        principal: TokenPrincipalRef,
+        roles: Vec<RoleRef>,
+        ttl: Duration,
+    ) -> Result<String, IssueError> {
+        if !matches!(
+            principal.kind,
+            PrincipalKindTag::TenantAdmin | PrincipalKindTag::Service
+        ) {
+            return Err(IssueError::InvalidPrincipalKind);
+        }
+        if principal.card_ref.is_some() {
+            return Err(IssueError::InvalidCardRef);
+        }
+        validate_principal_ref(&principal)?;
+        self.issue_access_token_with_claims(principal.id.to_string(), principal, roles, None, ttl)
+    }
+
     /// Mint an access token for a Service principal.
     ///
     /// # Errors

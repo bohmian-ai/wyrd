@@ -49,3 +49,31 @@ ALTER TABLE platform.tenants
 -- The live-tenant index already excludes everything that is not active, so a
 -- provisioning or failed tenant is invisible to sweepers and directory reads
 -- without any consumer change.
+
+-- ---------------------------------------------------------------------------
+-- Refresh tokens follow the tenant-scope principal kinds
+-- ---------------------------------------------------------------------------
+-- The refresh table is already principal-generic, but its kind check predates
+-- the tenant administrative principal. Without this a tenant administrator can
+-- hold a credential it can never exchange, which makes a freshly provisioned
+-- tenant unusable.
+DO $$
+DECLARE
+    doomed TEXT;
+BEGIN
+    FOR doomed IN
+        SELECT conname
+          FROM pg_constraint
+         WHERE conrelid = 'wyrd.auth_refresh_tokens'::regclass
+           AND contype = 'c'
+           AND pg_get_constraintdef(oid) LIKE '%principal_kind%'
+    LOOP
+        EXECUTE format(
+            'ALTER TABLE wyrd.auth_refresh_tokens DROP CONSTRAINT %I', doomed
+        );
+    END LOOP;
+END $$;
+
+ALTER TABLE wyrd.auth_refresh_tokens
+    ADD CONSTRAINT auth_refresh_tokens_principal_kind_check
+    CHECK (principal_kind IN ('tenant_admin','user','service','agent'));

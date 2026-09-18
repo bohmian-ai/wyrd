@@ -84,7 +84,7 @@ pub async fn initialize_platform_root(pool: &OperatorPool) -> Result<SecretStrin
     .await
     {
         Ok(()) => {}
-        Err(SqlError::Query(error)) if is_unique_violation(&error) => {
+        Err(SqlError::UniqueViolation { .. }) => {
             return Err(InitError::AlreadyInitialized);
         }
         Err(error) => return Err(InitError::Store(error)),
@@ -98,17 +98,6 @@ pub async fn initialize_platform_root(pool: &OperatorPool) -> Result<SecretStrin
         .issue(principal_id, None)
         .await?;
     Ok(issued.credential.secret)
-}
-
-/// True when a database error is a unique-constraint violation.
-///
-/// The durable name constraint is how single initialization is enforced, so
-/// this distinguishes "already initialized" from a genuine store failure that
-/// the operator should retry.
-fn is_unique_violation(error: &sqlx::Error) -> bool {
-    error
-        .as_database_error()
-        .is_some_and(|db| db.code().as_deref() == Some("23505"))
 }
 
 #[cfg(test)]

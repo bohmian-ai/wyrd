@@ -250,14 +250,12 @@ impl TenantProvisioning {
 /// Distinguish a taken slug from a genuine store failure.
 ///
 /// A slug collision is how two concurrent creations for the same tenant
-/// converge on one row, so it is an expected outcome rather than an error to
-/// surface as a fault.
+/// converge on one row, so it is an expected outcome rather than a fault. The
+/// SQL tier already classifies the violation; this only names what it means
+/// here.
 fn slug_or_store(error: SqlError) -> ProvisionError {
-    let taken = matches!(&error, SqlError::Query(inner)
-        if inner.as_database_error().is_some_and(|db| db.code().as_deref() == Some("23505")));
-    if taken {
-        ProvisionError::SlugTaken
-    } else {
-        ProvisionError::Store(error.to_string())
+    match error {
+        SqlError::UniqueViolation { .. } => ProvisionError::SlugTaken,
+        other => ProvisionError::Store(other.to_string()),
     }
 }

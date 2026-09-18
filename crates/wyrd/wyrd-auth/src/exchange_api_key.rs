@@ -364,6 +364,73 @@ impl DelegateToken {
     }
 }
 
+/// Issue tokens for a principal that binds no Card.
+///
+/// Separate from the Card-bound path because there is no card scope to resolve
+/// and no scope-mint audit to write: a Card-free principal has no emit
+/// authority to attribute. Its roles and tenant still bound what it may do.
+///
+/// # Errors
+/// Returns an issuance error when the kind is not Card-free-eligible or
+/// signing fails, and a SQL error when the refresh token cannot be stored.
+#[allow(clippy::too_many_arguments)]
+// justification: this mirrors issue_for_subject's parameter list one-for-one;
+// consolidating them into a struct used by exactly two private callers would
+// add a type without removing a decision.
+async fn issue_cardless_subject(
+    conn: &mut TenantConn<'_>,
+    issuing_key: &IssuingKey,
+    settings: &TokenExchangeSettings,
+    id: PrincipalId,
+    principal_kind: &str,
+    principal_id: Uuid,
+    roles: Vec<RoleRef>,
+    refresh: RefreshPolicy,
+    _request_id: &str,
+) -> Result<ExchangedToken, IssueOrSqlError> {
+    let wire = principal_kind_wire(principal_kind).ok_or(IssueError::InvalidPrincipalKind)?;
+    let access_token = issuing_key.issue_cardless_access_token(
+        TokenPrincipalRef {
+            id,
+            kind: wire,
+            tenant_id: conn.data_tenant_id(),
+            card_ref: None,
+            card_ref_scope: CardRefScope::default(),
+        },
+        roles,
+        settings.access_ttl,
+    )?;
+
+    let refresh_token = match refresh {
+        RefreshPolicy::Mint => {
+            let token = issuing_key.issue_refresh_token(
+                wire,
+                id,
+                conn.data_tenant_id(),
+                settings.refresh_ttl,
+            )?;
+            insert_refresh_token(
+                conn,
+                Uuid::new_v4(),
+                principal_kind,
+                principal_id,
+                &token_hash(&token),
+                Utc::now() + settings.refresh_ttl,
+            )
+            .await?;
+            Some(SecretString::from(token))
+        }
+        RefreshPolicy::Skip => None,
+    };
+
+    Ok(ExchangedToken {
+        access_token: SecretString::from(access_token),
+        refresh_token,
+        token_type: TokenType::Bearer,
+        expires_at: Utc::now() + settings.access_ttl,
+    })
+}
+
 /// Issue an access token, optional refresh token, and scope-mint audit for a principal.
 pub(crate) async fn issue_for_subject(
     conn: &mut TenantConn<'_>,
@@ -381,12 +448,23 @@ pub(crate) async fn issue_for_subject(
         roles,
     } = subject;
     let id = PrincipalId::new(principal_id);
-    // This path mints Card-bound access tokens, whose claims carry the bound
-    // Card and the emit scope derived from it. A Card-free principal has no
-    // such claims to carry, so it is refused here rather than minted with a
-    // fabricated binding.
+    // A Card-free principal — a tenant administrator or tenant automation —
+    // carries no bound Card and therefore no emit scope. It still holds roles
+    // and must be able to exchange its credential, or a provisioned tenant
+    // would hand back a credential that never works.
     let Some(card_ref) = card_ref else {
-        return Err(IssueOrSqlError::Issue(IssueError::InvalidPrincipalKind));
+        return issue_cardless_subject(
+            conn,
+            issuing_key,
+            settings,
+            id,
+            &principal_kind,
+            principal_id,
+            roles,
+            refresh,
+            request_id,
+        )
+        .await;
     };
     let card_ref_scope = resolve_card_ref_scope(conn, &card_ref).await?;
     let access_token = match principal_kind.as_str() {

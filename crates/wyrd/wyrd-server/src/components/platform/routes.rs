@@ -4,6 +4,11 @@
 //! them: the extractor is the only producer of a platform-scoped context and it
 //! accepts only a platform session. Authorization and its audit record happen
 //! inside each operation, in the transaction that performs it.
+//!
+//! These routes sit outside the `/v1` nest deliberately. That nest is
+//! default-deny on *tenant* access tokens, so a platform session would be
+//! refused there before reaching a handler — and a tenant token must never be
+//! accepted here. Two planes, two entries.
 
 use axum::extract::State;
 use axum::routing::post;
@@ -28,9 +33,20 @@ use crate::state::AppState;
 /// Build the platform control-plane routes for the `/v1` group.
 pub fn platform_router() -> Router<AppState> {
     Router::new()
-        .route("/platform/token", post(platform_token))
-        .route("/tenants", post(create_tenant))
-        .route("/tenants/admin/credentials", post(recover_tenant_admin))
+        .route("/platform/tenants", post(create_tenant))
+        .route(
+            "/platform/tenants/admin/credentials",
+            post(recover_tenant_admin),
+        )
+}
+
+/// Build the anonymous platform credential-exchange route.
+///
+/// Merged outside the authenticated nests, like the tenant plane's
+/// `/auth/token`: a caller presenting a credential has no session yet, so this
+/// route cannot sit behind a session requirement.
+pub fn platform_auth_router() -> Router<AppState> {
+    Router::new().route("/auth/platform/token", post(platform_token))
 }
 
 /// Exchange a platform credential for a short-lived session.

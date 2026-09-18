@@ -2179,6 +2179,16 @@ impl WyrdTestServer {
         self.inner.fixture.data_tenant_id()
     }
 
+    /// Return the cross-tenant operator pool for platform-plane test setup.
+    ///
+    /// The platform control plane lives outside row-level security, so a test
+    /// that establishes or inspects an administrative root reaches it through
+    /// this boundary rather than the tenant pool.
+    #[must_use]
+    pub fn operator_pool(&self) -> wyrd_sql::OperatorPool {
+        self.inner.fixture.operator_pool().clone()
+    }
+
     /// Return a clone of the app Postgres pool for direct SQL in tests.
     #[must_use]
     pub fn app_pool(&self) -> sqlx::PgPool {

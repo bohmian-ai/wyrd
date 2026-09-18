@@ -195,7 +195,7 @@ async fn issue_and_audit(
         TOKEN_EXCHANGE_OPERATION,
         workload,
         principal_kind_tag(&row.principal_kind),
-        Some(row.card_ref.0.clone()),
+        row.card_ref.clone().map(|card_ref| card_ref.0),
         AuditOutcome::Allowed,
         AuditDetail::TokenExchange {
             subject_principal_id: workload,

@@ -12,6 +12,16 @@ current change are **deferred**. The approved `../spec.md` remains the formal
 change authority. These architecture notes supply the concrete design that the
 spec summarizes.
 
+For continuous Drift and Eval, the current client contract is
+[`logic/run_api.md`](logic/run_api.md): `WyrdState` owns a Bifrost facade and
+its existing pooled queue; startup describes the fixed system tables and
+dynamic `observe.record(table, value)` describes a user table on first use;
+each scoped `observe.drift(...)` / `observe.eval(...)` call converts its input
+to the existing typed record and fixed table rows before queue insertion.
+Shared `wyrd-client` and `wyrd-queue` do not own Verifier-specific projection.
+The locked runtime flow is [`verification-control-flow.html`](verification-control-flow.html);
+`verification-runtime.html` is an earlier, superseded proposal.
+
 Do not design from Rust types inward. Begin with the exact artifact or command
 a customer writes, resolve it to the durable wire contract, and only then
 choose implementation types.

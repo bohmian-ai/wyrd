@@ -1,7 +1,8 @@
 ---
 id: SPEC-admin-principals
 revision: 6
-status: draft
+status: approved
+approved_at: 2026-09-18
 ---
 
 # Global and tenant administrative principals
@@ -689,7 +690,7 @@ None. Every decision raised during drafting has been resolved by the author.
 
 ## Revision history
 
-- **Revision 6 — 2026-09-18 — draft**: Added the **Verification scope** section
+- **Revision 6 — 2026-09-18 — approved**: Added the **Verification scope** section
   narrowing proof to focused tests, subsystem integration tests, and the named
   user journeys for principal, credential, authenticated-context,
   authorization-plane, initialization, provisioning, and administrative

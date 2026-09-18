@@ -1,6 +1,6 @@
 ---
 id: SPEC-admin-principals
-revision: 4
+revision: 5
 status: draft
 ---
 
@@ -118,16 +118,22 @@ to satisfy this specification.
   management, role grants, credential lifecycle.
 - Global-administrator recovery of tenant administration.
 - OIDC human identity resolution into the same authenticated context.
+- Platform authority as a grant, held by the bootstrap global principal and by
+  human platform principals.
+- An optional deployment-owned platform-scope OIDC connection and the platform
+  login entry it serves.
 - Tenant-created service principals with restricted grants.
 - Removal of `bootstrap-key` and its fabricated Card and operator identity.
 - HTTP, CLI, SDK, and MCP projections, audit, and documentation.
 
 ## Non-goals
 
-- OIDC *configuration*: discovery, JWKS, client credentials, claim mapping,
-  group-to-role mapping, PKCE login flow, and tenant login routing. Owned by
-  `SPEC-tenant-oidc-federation`. This change owns only the identity-resolution
-  seam in `REQ-034`.
+- *Tenant* OIDC configuration: discovery, JWKS, client credentials, claim
+  mapping, group-to-role mapping, PKCE login flow, and tenant login routing.
+  Owned by `SPEC-tenant-oidc-federation`. This change owns the
+  identity-resolution seam (`REQ-034`) and the platform-scope connection
+  (`REQ-043`), and reuses that spec's verification mechanics rather than
+  defining its own.
 - A new RBAC engine, customizable role editor, permission-scope redesign,
   explicit deny, grant options, or ownership semantics. Existing roles and the
   approved object-scoped `Permission` remain the only static grant model, and
@@ -335,6 +341,37 @@ to satisfy this specification.
   displace or require removal of the tenant administrative principal. The tenant
   retains a headless administrative path independent of its identity provider.
 
+### Platform human administration
+
+- **REQ-041**: Platform authority MUST be a grant held by a principal, not a
+  property of a principal type. Both the bootstrap global administrative
+  principal and human platform principals MUST be able to hold it. Platform
+  grants MUST be stored at platform scope, outside any tenant's RLS-bound role
+  tables.
+- **REQ-042**: Human platform principals MUST live at platform scope with no
+  tenant. A human who is also a user of a tenant holds a separate, independent
+  tenant-scoped principal; the two are never merged into one identity.
+- **REQ-043**: A deployment MAY have one platform-scope OIDC connection,
+  configured, replaced, and removed by a principal holding platform authority.
+  It is deployment-owned and distinct from every tenant-owned connection. Its
+  absence, misconfiguration, or provider outage MUST NOT prevent platform
+  administration through the global administrative credential.
+- **REQ-044**: A human platform principal MUST be pre-registered before first
+  login, against an expected issuer and a matching claim. The first successful
+  login MUST pin `(issuer, subject)` durably, and later logins MUST match on
+  that pinned identity alone. An unknown subject at the platform plane MUST be
+  denied; just-in-time provisioning of platform principals is prohibited.
+- **REQ-045**: The platform login entry MUST resolve only the platform
+  connection, and a tenant login entry only that tenant's connection. The entry
+  point selects the connection, the connection selects the principal, and the
+  principal carries the scope. No scope is inferred from a token, header,
+  hostname, or post-login chooser, and a platform session MUST carry platform
+  scope only.
+- **REQ-046**: Only a principal already holding platform authority may create a
+  platform principal or grant platform authority. No tenant-plane operation —
+  tenant administration, principal management, role grant, or OIDC group
+  mapping — may create or elevate a platform principal.
+
 ### Surfaces, audit, documentation, and replacement
 
 - **REQ-036**: Platform and tenant administrative operations MUST be available
@@ -356,9 +393,10 @@ to satisfy this specification.
   replacement.
 - **REQ-039**: The unreachable `platform.users`, `platform.roles`,
   `platform.user_roles`, and `platform.api_keys` objects and their query slots
-  MUST be removed or become the platform principal and credential store. Leaving
-  a second unreachable cross-tenant identity model in the schema is not an
-  acceptable outcome.
+  MUST become the platform principal, credential, and grant store required by
+  `REQ-041`, or be removed where they do not fit it. Leaving a second
+  unreachable cross-tenant identity model in the schema is not an acceptable
+  outcome.
 - **REQ-040**: Documentation MUST cover the three-command operator journey, the
   SaaS model in which Wyrd operates the global principal and the customer never
   receives it, credential rotation, and credential-loss recovery.
@@ -376,10 +414,14 @@ to satisfy this specification.
 - **INV-004**: The platform and tenant control planes never silently collapse.
   Global administrators manage tenant lifecycle; tenant administrators manage
   tenant resources.
-- **INV-004a**: The platform control plane is credential-only. Human principals
-  are tenant-scoped, so no OIDC login can yield a platform-scoped authenticated
-  context. Widening this requires an approved revision, not an implementation
-  choice.
+- **INV-004a**: Platform authority never confers tenant data access. A platform
+  principal may manage tenant lifecycle and recover tenant administration;
+  reaching a tenant's resources requires the explicitly named, separately
+  authorized, audited capability of `REQ-018`.
+- **INV-004b**: Platform authority is reachable only from the platform plane.
+  No tenant, tenant administrator, tenant OIDC connection, or tenant group
+  mapping can create a platform principal or confer platform authority, so a
+  tenant's compromise never escalates to platform control.
 - **INV-005**: A deployment has at most one initialization. Restart, replica
   count, crash recovery, and concurrent invocation never yield a second global
   administrative principal, a second initial credential, or a re-exposure.
@@ -493,6 +535,9 @@ documents. These amendments are part of the change.
   vocabulary pages affected by the new administrative permissions.
 - `components/admin/routes.rs` module documentation — the deliberate no-audit
   stance.
+- `changes/active/tenant-oidc-federation/spec.md` — its assumption that every
+  OIDC connection is tenant-owned, which `REQ-043` widens with one
+  deployment-owned platform-scope connection.
 
 ## Acceptance obligations
 
@@ -542,6 +587,19 @@ documents. These amendments are part of the change.
   MCP, schemas, stable errors, and documentation describe one administrative
   identity model, that `bootstrap-key` and its fabricated identities are gone,
   and that no unreachable second identity model remains in the schema.
+- **AC-015**: Bootstrap-chain evidence proves the global administrative
+  credential configures the platform OIDC connection and pre-registers the first
+  human platform administrator; that the first login pins `(issuer, subject)`
+  and succeeds; that an unknown subject is denied; and that the credential still
+  administers the platform when the connection is absent or its provider is
+  failing.
+- **AC-016**: Scope-separation evidence proves a platform session carries
+  platform scope only, that the same human authenticating through a tenant
+  connection receives an independent tenant-scoped principal and session, and
+  that neither session reaches the other's plane.
+- **AC-017**: Escalation evidence proves no tenant-plane operation — including
+  tenant principal creation, role grant, and OIDC group mapping — can create a
+  platform principal or confer platform authority.
 - **AC-014**: Cross-language evidence proves the administrative HTTP contract is
   usable from the Rust, Python, and TypeScript SDKs for the operations each is
   intended to expose.
@@ -587,6 +645,10 @@ the next.
    authenticated context.
 10. **Service principals** — tenant-created machine principals with restricted
     grants.
+11. **Platform human administration** — the platform-scope OIDC connection,
+    pre-registered human platform principals, first-login identity pinning, and
+    the platform login entry. Stage 4 carries the platform grant store this
+    depends on.
 
 ## Open material decisions
 
@@ -594,6 +656,14 @@ None. Every decision raised during drafting has been resolved by the author.
 
 ## Revision history
 
+- **Revision 5 — 2026-09-18 — draft**: Platform authority becomes a grant rather
+  than a principal-type property, holdable by the bootstrap global principal and
+  by human platform principals living at platform scope. Adds the optional
+  deployment-owned platform-scope OIDC connection, pre-registration with
+  first-login `(issuer, subject)` pinning, the platform login entry, and the
+  prohibition on any tenant-plane path creating or elevating a platform
+  principal. Repurposes the dormant `platform.*` tables as the platform
+  principal, credential, and grant store.
 - **Revision 4 — 2026-09-18 — draft**: Separated the two authentication entry
   paths (machine credential exchange, human OIDC login) from the per-request
   path, which derives the authenticated context only from verified Wyrd token

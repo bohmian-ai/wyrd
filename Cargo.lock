@@ -11327,6 +11327,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "ulid",
+ "uuid",
  "workspace-hack",
  "wyrd-auth-verify",
  "wyrd-runtime",

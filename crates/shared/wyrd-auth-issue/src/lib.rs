@@ -13,7 +13,11 @@ use jsonwebtoken::{EncodingKey, Header};
 use password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng};
 use secrecy::{ExposeSecret, SecretString};
 use ulid::Ulid;
-use wyrd_auth_verify::{AccessTokenClaims, ActClaim, Kid, RefreshTokenClaims, TokenPrincipalRef};
+use uuid::Uuid;
+use wyrd_auth_verify::{
+    AccessTokenClaims, ActClaim, Kid, PLATFORM_TOKEN_SCOPE, PlatformAccessTokenClaims,
+    RefreshTokenClaims, TokenPrincipalRef,
+};
 use wyrd_runtime::{PrincipalId, RoleRef};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalKindTag;
@@ -372,6 +376,35 @@ impl IssuingKey {
             });
         }
         Ok(token)
+    }
+
+    /// Mint a platform-scope access token.
+    ///
+    /// The platform plane has no tenant, so this never goes through the
+    /// tenant-scoped claim shape: the minted token cannot name a tenant, carries
+    /// no roles, and carries no delegation chain. Authority is resolved from the
+    /// principal's grant at verification time rather than frozen here.
+    ///
+    /// # Errors
+    /// Returns [`IssueError::Signing`] when the token cannot be signed, and a
+    /// timestamp error when the issued-at or expiry cannot be computed.
+    pub fn issue_platform_access_token(
+        &self,
+        principal_id: PrincipalId,
+        credential_id: Uuid,
+        ttl: Duration,
+    ) -> Result<String, IssueError> {
+        let (iat, exp) = timestamps(ttl)?;
+        let claims = PlatformAccessTokenClaims {
+            sub: principal_id.to_string(),
+            cid: credential_id.to_string(),
+            scope: PLATFORM_TOKEN_SCOPE.to_owned(),
+            exp,
+            iat,
+            iss: self.issuer.clone(),
+            jti: new_jti(),
+        };
+        self.encode(&claims)
     }
 
     fn issue_access_token_with_claims(

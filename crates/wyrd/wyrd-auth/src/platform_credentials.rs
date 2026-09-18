@@ -73,6 +73,15 @@ impl PlatformCredential {
     }
 }
 
+/// A credential that authenticated, with the identity of both sides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthenticatedPlatformCredential {
+    /// Principal the credential authenticates.
+    pub principal_id: PrincipalId,
+    /// The credential itself, so a session can be bound to it.
+    pub credential_id: Uuid,
+}
+
 /// A credential that was just issued, with its durable id.
 #[derive(Debug)]
 pub struct IssuedPlatformCredential {
@@ -166,6 +175,38 @@ impl PlatformCredentials {
         .await?;
 
         Ok(IssuedPlatformCredential { id, credential })
+    }
+
+    /// Authenticate a credential and report which credential it was.
+    ///
+    /// The exchange path needs the credential's identity as well as its
+    /// principal, so a minted session can be tied to — and revoked with — the
+    /// credential that produced it.
+    ///
+    /// # Errors
+    /// Returns [`PlatformCredentialError::InvalidCredential`] for every
+    /// rejection and [`PlatformCredentialError::Store`] when the lookup fails.
+    pub async fn authenticate_for_session(
+        &self,
+        presented: &SecretString,
+    ) -> Result<AuthenticatedPlatformCredential, PlatformCredentialError> {
+        let Some(prefix) = PlatformCredential::prefix_of(presented) else {
+            return Err(PlatformCredentialError::InvalidCredential);
+        };
+        let Some(row) = platform_credential_by_prefix(&self.pool, &prefix).await? else {
+            return Err(PlatformCredentialError::InvalidCredential);
+        };
+        if !row.is_usable(Utc::now()) {
+            return Err(PlatformCredentialError::InvalidCredential);
+        }
+        if !verify_api_key(presented, &row.secret_hash) {
+            return Err(PlatformCredentialError::InvalidCredential);
+        }
+        touch_platform_credential(&self.pool, row.id).await?;
+        Ok(AuthenticatedPlatformCredential {
+            principal_id: PrincipalId::new(row.principal_id),
+            credential_id: row.id,
+        })
     }
 
     /// Resolve a presented secret to the platform principal that owns it.

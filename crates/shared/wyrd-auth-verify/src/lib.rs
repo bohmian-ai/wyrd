@@ -654,6 +654,40 @@ pub struct AccessTokenClaims {
     pub jti: String,
 }
 
+/// Claims carried by a platform-scope access token.
+///
+/// Deliberately smaller than [`AccessTokenClaims`] and structurally unable to
+/// name a tenant: a platform token has no tenancy, no roles, and no delegation
+/// chain. It carries only who is acting and which credential minted it, so the
+/// verifier resolves current authority from the store rather than trusting a
+/// permission snapshot that a later grant change would leave stale.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlatformAccessTokenClaims {
+    /// Platform principal id, JWT `sub`.
+    pub sub: String,
+    /// Credential that minted this token.
+    ///
+    /// Checked on every verification so revoking a credential stops the tokens
+    /// it issued, without a separate revocation epoch, and so audit can name
+    /// which credential was used.
+    pub cid: String,
+    /// Control-plane marker. Always `platform`; any other value fails
+    /// verification, so a tenant token cannot be replayed as a platform one.
+    pub scope: String,
+    /// Expiry as Unix seconds, JWT `exp`.
+    pub exp: usize,
+    /// Issued-at as Unix seconds, JWT `iat`.
+    pub iat: usize,
+    /// Issuer, JWT `iss`.
+    pub iss: String,
+    /// Token identifier.
+    pub jti: String,
+}
+
+/// The only accepted value of [`PlatformAccessTokenClaims::scope`].
+pub const PLATFORM_TOKEN_SCOPE: &str = "platform";
+
 /// One layer of an RFC 8693 `act` delegation chain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

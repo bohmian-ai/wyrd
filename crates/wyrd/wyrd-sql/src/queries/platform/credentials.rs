@@ -124,6 +124,35 @@ pub async fn platform_credential_by_prefix(
     .map_err(SqlError::from)
 }
 
+/// Look up a platform credential by its durable id.
+///
+/// Used when verifying a platform token, which names the credential that minted
+/// it: revoking that credential must stop its tokens, so the lifecycle state is
+/// re-read rather than trusted from the token.
+///
+/// # Errors
+/// Returns [`SqlError::Query`] when the read fails.
+pub async fn platform_credential_by_id(
+    pool: &OperatorPool,
+    id: Uuid,
+) -> Result<Option<PlatformCredentialLookupRow>, SqlError> {
+    sqlx::query_as::<_, PlatformCredentialLookupRow>(
+        "SELECT c.id,
+                c.principal_id,
+                c.secret_hash,
+                p.status AS principal_status,
+                c.revoked_at,
+                c.expires_at
+           FROM platform.credentials c
+           JOIN platform.principals p ON p.id = c.principal_id
+          WHERE c.id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool.pool())
+    .await
+    .map_err(SqlError::from)
+}
+
 /// List a platform principal's credential metadata, newest first.
 ///
 /// Never returns secret material: listing exists so an operator can see what to

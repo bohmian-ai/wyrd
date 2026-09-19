@@ -441,3 +441,77 @@ documentation, and shared CI configuration, finish with `mise run gate` after
 the independently base-red auth journey is repaired or otherwise restored to a
 green baseline. Do not claim repository-wide green from a run that omits or
 filters that failure.
+
+## Implementation evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| `FIND-admin-principals-1` | `a8ecda7e1` — `wyrd-auth/src/platform_authz.rs` stages through the canonical append; `wyrd-sql/src/queries/platform/audit_authz.rs` and migration `20260601000021_platform_authz_audit.sql` deleted | `mise run test:platform:journey` (`the_two_control_planes_cannot_reach_each_other`, `an_unrecordable_tenant_mutation_leaves_nothing_behind`) | PASS |
+| `FIND-admin-principals-2` | `a8ecda7e1` — `wyrd-sql/src/operator_pool.rs`; platform components take `OperatorPool`/`TenantConn` only | `mise run test:platform:journey`, `mise run check:client-tier` | PASS |
+| `FIND-admin-principals-3` | `301067e51` — `wyrd-server/src/http/error.rs`, `components/platform/identity.rs`, `components/principals/routes.rs` | `mise run test:platform:journey` (`served_platform_failures_disclose_nothing_internal`) | PASS |
+| `FIND-admin-principals-4` | Not implemented — see *Blocked* below | — | BLOCKED |
+| `FIND-admin-principals-5` | `07100de71` — `mise.toml` principal lanes run under the repository Postgres wrapper with exact selectors | `mise run test:principals:unit` (4/4), `mise run test:principals:integration` (5/5) | PASS |
+| `FIND-admin-principals-6` | `c798e0bb2` — `wyrd-sql/src/queries/auth/service_accounts.rs`, `wyrd-testing/src/server.rs`; `aae714ec1` — `wyrd-sql/src/error.rs` intra-doc link | `mise exec -- cargo doc --locked -p wyrd-sql --no-deps` — 0 warnings | PASS |
+| `FIND-admin-principals-7` | `f908aedbe` — `wyrd-server/src/boot/init.rs`, `components/platform/identity.rs` | `mise run test:platform:journey` (`an_operator_lists_and_suspends_platform_administrators`) | PASS |
+| `FIND-admin-principals-8` | `ad25a318d` — `wyrd-sql/src/queries/platform/principals.rs` counts only grantable, pinned rows | `mise run test:platform:journey` (`the_last_active_platform_principal_cannot_be_suspended`), `pg_platform_identity` | PASS |
+| `FIND-admin-principals-9` | `7039d3fe1` — `components/platform/credentials.rs`, `wyrd-client/src/platform/handle.rs`, `wyrd-cli/src/platform/credential.rs` | `mise run test:platform:journey` (`an_operator_rotates_the_deployment_root_credential`, `revoking_a_platform_credential_ends_its_live_sessions`) | PASS |
+| `FIND-admin-principals-10` | `cf7ccb56a` — `wyrd-auth-oidc/src/screening.rs` applied in `jwks.rs`, `callback.rs`, `login.rs`, `platform_login.rs` | `mise run test:platform:journey` (`a_connection_cannot_name_an_unresolvable_issuer`), `wyrd-auth-oidc` unit lane | PASS |
+| `FIND-admin-principals-11` | `a88f885bc` — `wyrd-auth/src/platform_credentials.rs` verifies exactly once against a fixed dummy verifier | `wyrd-auth --lib` credential tests | PASS |
+| `FIND-admin-principals-12` | `d4fab19d1` — `wyrd-mcp/tests/bifrost/mcp/principals.rs` performs the authorized revocation and observes retirement | `mise run test:bifrost:journey:mcp` (9/9) | PASS |
+| `FIND-admin-principals-13` | `d4fab19d1` — `body = WyrdProblem` on every administrative error row; `RevokePrincipalRequest` required, reason recorded in `AuditDetail::PrincipalRevocation` | `mise run codegen:check`, `mise run docs:check`, `mise run test:platform:journey` (`a_tenant_revokes_a_compromised_principal_with_its_reason`) | PASS |
+| `FIND-admin-principals-14` | `18b6b3676` — `wyrd-server/src/mcp/mod.rs`, `discovery.rs`, `connectivity.rs` | `mise run test:bifrost:journey:mcp` (9/9) | PASS |
+| `FIND-TASK-001-10` | Owned by the branch owner, not this agent — see *Out of scope* below | — | DEFERRED |
+| `FIND-003-2` | `32bc80f77` — `platform_admin_e2e.rs` concurrency, per-write injected failure, and uninitialized journeys | `mise run test:platform:journey` (`initialization_has_exactly_one_winner_under_concurrency`, `initialization_retries_cleanly_after_a_failure_at_each_write`, `an_uninitialized_deployment_serves_tenants_and_refuses_the_platform_plane`) | PASS |
+| `FIND-003-3` | `6603b27f6` — `wyrd-auth/src/audit.rs`, `wyrd-server/src/boot/init.rs`, `local-development.svx` | `mise run docs:check`, `mise run lints` | PASS |
+| `FIND-004-2` | `7798918b6` — `TenantProvisioning::{list,inspect,set_suspended}`, three platform routes, `wyrd-client` and `wyrd-cli` tenant verbs, `SqlRevocationCheck` tenant-admission gate | `mise run test:platform:journey` (`an_operator_suspends_and_resumes_a_tenant_through_the_platform_plane`) | PASS |
+| `FIND-004-3` | `d5670dce4` — stale-claim adoption in `queries/platform/provisioning.rs`; promotion folded into the failure path | `mise run test:platform:journey` (`interrupted_and_racing_provisioning_converge_on_one_tenant`) | PASS |
+| `FIND-004-4` | `d5670dce4` — the journey injects a real stage failure through a slug-scoped trigger and races two creates with `tokio::join!` | same selector as `FIND-004-3` | PASS |
+| `FIND-004-5` | `bbd09ba2b` — `wyrd-cli/src/principal/credential.rs`, `platform/tenant.rs`, both self-hosting pages; `07c638d9a` — `wyrd-cli/tests/operator_journey.rs` | `mise run test:cli:journey` (`operator_journey::operator_administers_a_deployment_through_the_cli`), `mise run docs:check` | PASS |
+| `FIND-005-2` | `ad4eb9dd7` — `require_principal` guard shared by `mint_credential` and `list_credentials_for` | `mise run test:platform:journey` (`one_tenant_cannot_reach_another_tenants_identities`) | PASS |
+| `FIND-006-3` | `ad4eb9dd7` — directory gate in `components/platform/recovery.rs`, `ProvisionError::TenantUnavailable` → 404 | `mise run test:platform:journey` (`recovery_is_refused_for_every_state_but_active`) | PASS |
+| `FIND-006-4` | `a8ecda7e1` + `301067e51` — injected `vala.audit_staging` append failure refuses the mutation | `mise run test:platform:journey` (`an_unrecordable_tenant_mutation_leaves_nothing_behind`) | PASS |
+
+### Verification commands run
+
+```
+mise run fmt
+mise run lints
+mise run codegen:check
+mise run docs:check
+mise run check:client-tier
+mise run check:unwrap-audit
+mise exec -- cargo doc --locked -p wyrd-sql --no-deps
+mise run test:platform:journey        # 28/28
+mise run test:bifrost:journey:mcp     #  9/9
+mise run test:principals:integration  #  5/5
+mise run test:principals:unit         #  4/4
+mise run test:cli:journey             # 24 passed, 5 ignored
+git diff --check                      # clean
+```
+
+### Blocked
+
+`FIND-admin-principals-4` requires editing `architecture/wyrd-design.md`,
+`architecture/wyrd-security-posture.md`, `architecture/wyrd-doctrine.mdx`, and
+`AGENTS.md`. All four carry uncommitted edits from a different concurrent
+session in this worktree. Editing them would entangle two changes, and they
+cannot be committed without staging that other session's work. The finding is
+left open for the branch owner.
+
+### Out of scope
+
+`FIND-TASK-001-10` is a history rewrite owned by the branch owner. This agent
+must not run `git config`, set identity environment variables, or rewrite
+commits it did not author.
+
+### Recorded conflicts and limits
+
+- The task's closing instruction to finish with `mise run gate` conflicts with
+  approved spec revision 7 `VER-003`, which forbids broad aggregates
+  (`mise run gate`, `test:rust`, `--all-features` workspace lanes) as
+  acceptance evidence. The approved spec is the authority, so the narrowest
+  owning lanes above are the recorded evidence and `mise run gate` was not run.
+- Principal revocation advances `tokens_not_before`; it does not retire the
+  principal's credentials. A revoked principal holding a surviving credential
+  can mint a fresh working token. That is the shipped behavior of every
+  revocation path on this branch, and no finding asked to change it.

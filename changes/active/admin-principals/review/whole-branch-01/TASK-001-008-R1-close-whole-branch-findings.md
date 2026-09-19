@@ -449,7 +449,7 @@ filters that failure.
 | `FIND-admin-principals-1` | `a8ecda7e1` — `wyrd-auth/src/platform_authz.rs` stages through the canonical append; `wyrd-sql/src/queries/platform/audit_authz.rs` and migration `20260601000021_platform_authz_audit.sql` deleted | `mise run test:platform:journey` (`the_two_control_planes_cannot_reach_each_other`, `an_unrecordable_tenant_mutation_leaves_nothing_behind`) | PASS |
 | `FIND-admin-principals-2` | `a8ecda7e1` — `wyrd-sql/src/operator_pool.rs`; platform components take `OperatorPool`/`TenantConn` only | `mise run test:platform:journey`, `mise run check:client-tier` | PASS |
 | `FIND-admin-principals-3` | `301067e51` — `wyrd-server/src/http/error.rs`, `components/platform/identity.rs`, `components/principals/routes.rs` | `mise run test:platform:journey` (`served_platform_failures_disclose_nothing_internal`) | PASS |
-| `FIND-admin-principals-4` | Not implemented — see *Blocked* below | — | BLOCKED |
+| `FIND-admin-principals-4` | `5ea453f13` — `architecture/v1/00-foundations/service-identity.md` and `tenancy.md` restated to revision 7, `changes/active/tenant-oidc-federation/spec.md` distinguishes the deployment-owned platform connection; admin route module docs already current in `a8ecda7e1`/`7039d3fe1`/`ad4eb9dd7`. Four top-level authorities remain — see *Blocked* below | `mise run docs:check`, `mise run lints` | PARTIAL |
 | `FIND-admin-principals-5` | `07100de71` — `mise.toml` principal lanes run under the repository Postgres wrapper with exact selectors | `mise run test:principals:unit` (4/4), `mise run test:principals:integration` (5/5) | PASS |
 | `FIND-admin-principals-6` | `c798e0bb2` — `wyrd-sql/src/queries/auth/service_accounts.rs`, `wyrd-testing/src/server.rs`; `aae714ec1` — `wyrd-sql/src/error.rs` intra-doc link | `mise exec -- cargo doc --locked -p wyrd-sql --no-deps` — 0 warnings | PASS |
 | `FIND-admin-principals-7` | `f908aedbe` — `wyrd-server/src/boot/init.rs`, `components/platform/identity.rs` | `mise run test:platform:journey` (`an_operator_lists_and_suspends_platform_administrators`) | PASS |
@@ -491,12 +491,28 @@ git diff --check                      # clean
 
 ### Blocked
 
-`FIND-admin-principals-4` requires editing `architecture/wyrd-design.md`,
+`FIND-admin-principals-4` is closed for every owner this agent can safely
+reach: the `architecture/v1/00-foundations/` pages, the admin route module
+docs, and the tenant-OIDC specification.
+
+Four of its owners remain: `architecture/wyrd-design.md`,
 `architecture/wyrd-security-posture.md`, `architecture/wyrd-doctrine.mdx`, and
 `AGENTS.md`. All four carry uncommitted edits from a different concurrent
-session in this worktree. Editing them would entangle two changes, and they
-cannot be committed without staging that other session's work. The finding is
-left open for the branch owner.
+change (`verified-change-contract`: the `Verifier` Card kind and Operator
+connection credentials) in this shared worktree. Editing them would entangle
+two changes, and they cannot be committed without staging that change's work.
+The remaining statements to replace in them are:
+
+- `wyrd-design.md` and `wyrd-doctrine.mdx`: principal kinds closed to the old
+  `User`/`Service`/`Agent` set, machine principals required to be Card-bound
+  and tenant-owned, and the superseded audit statement.
+- `wyrd-security-posture.md`: the same principal-kind closure, plus "all OIDC
+  is tenant-owned" — revision 7 adds one deployment-owned platform-scope
+  connection and makes platform authority a grant held at platform scope.
+- `AGENTS.md`: nothing specific to this finding beyond the two-plane
+  vocabulary already described in the design owner.
+
+The branch owner should apply those once the concurrent change has landed.
 
 ### Out of scope
 

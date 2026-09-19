@@ -2,7 +2,9 @@ use std::process::ExitCode;
 
 use clap::Args;
 use url::Url;
-use wyrd_spec::auth::{LoginInitResponse, SecretBearer, TokenRequest, TokenResponse};
+use wyrd_client::auth::TokenExchange;
+use wyrd_client::transport::HttpConfig;
+use wyrd_spec::auth::{SecretBearer, TokenRequest, TokenResponse};
 
 use crate::error::WyrdCliError;
 
@@ -16,26 +18,23 @@ pub struct LoginArgs {
     pub issuer: String,
 }
 
+/// Walk an operator through an interactive OIDC login and print the tokens.
+///
+/// # Errors
+/// Returns a client-construction error for a rejected endpoint, an IO error when
+/// the pasted callback cannot be read, [`WyrdCliError::InvalidArgument`] when it
+/// carries no code and state, and the server's stable Wyrd error when the issuer
+/// is untrusted or the code is rejected.
 pub async fn dispatch(args: LoginArgs) -> Result<ExitCode, WyrdCliError> {
-    let client = reqwest::Client::new();
+    let exchange = TokenExchange::new(args.server.as_str(), HttpConfig::default().timeout_ms)
+        .map_err(crate::client::map_client_error)?;
 
-    let login_url = args
-        .server
-        .join("/auth/login")
-        .map_err(|source| WyrdCliError::UrlJoin { source })?;
-
-    let init: LoginInitResponse = client
-        .get(login_url)
-        .query(&[("issuer", &args.issuer)])
-        .header(reqwest::header::ACCEPT, "application/json")
-        .send()
+    let init = exchange
+        .begin_login(&args.issuer)
         .await
-        .map_err(|source| WyrdCliError::Http { source })?
-        .error_for_status()
-        .map_err(|source| WyrdCliError::Http { source })?
-        .json()
-        .await
-        .map_err(|source| WyrdCliError::Http { source })?;
+        .map_err(|error| WyrdCliError::Server {
+            source: error.into_wyrd(),
+        })?;
 
     println!("Open this URL in your browser:");
     println!("{}", init.authorization_url);
@@ -50,41 +49,30 @@ pub async fn dispatch(args: LoginArgs) -> Result<ExitCode, WyrdCliError> {
 
     let (code, state) = parse_callback_input(&input)?;
 
-    let token_url = args
-        .server
-        .join("/auth/token")
-        .map_err(|source| WyrdCliError::UrlJoin { source })?;
-
-    let body = serde_json::to_string(&TokenRequest::AuthorizationCode {
-        code: SecretBearer::new(code),
-        state,
-    })
-    .expect("TokenRequest serializes");
-
-    let resp = client
-        .post(token_url)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(body)
-        .send()
+    let token = exchange
+        .exchange(&TokenRequest::AuthorizationCode {
+            code: SecretBearer::new(code),
+            state,
+        })
         .await
-        .map_err(|source| WyrdCliError::Http { source })?;
+        .map_err(|error| WyrdCliError::Server {
+            source: error.into_wyrd(),
+        })?;
 
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        let detail = resp.text().await.unwrap_or_default();
-        return Err(WyrdCliError::AuthFailed { status, detail });
-    }
+    print_tokens(&token);
+    Ok(ExitCode::SUCCESS)
+}
 
-    let token: TokenResponse = resp
-        .json()
-        .await
-        .map_err(|source| WyrdCliError::Http { source })?;
+/// Print an issued token pair to the operator terminal.
+///
+/// The one place either token exists outside the server; neither is written to a
+/// file or a log by the CLI.
+pub(super) fn print_tokens(token: &TokenResponse) {
     println!("access_token:  {}", token.access_token.expose());
     if let Some(refresh_token) = &token.refresh_token {
         println!("refresh_token: {}", refresh_token.expose());
     }
     println!("expires_at:    {}", token.expires_at);
-    Ok(ExitCode::SUCCESS)
 }
 
 fn parse_callback_input(input: &str) -> Result<(String, String), WyrdCliError> {
@@ -108,9 +96,10 @@ fn parse_callback_input(input: &str) -> Result<(String, String), WyrdCliError> {
     let state = pairs.get("state").map(|v| v.as_ref().to_owned());
     match (code, state) {
         (Some(c), Some(s)) => Ok((c, s)),
-        _ => Err(WyrdCliError::AuthFailed {
-            status: 0,
-            detail: "paste the full callback URL or `code=<>&state=<>` query string".to_owned(),
+        _ => Err(WyrdCliError::InvalidArgument {
+            field: "callback".to_owned(),
+            value: input.to_owned(),
+            expected: "the full callback URL, or a `code=<>&state=<>` query string".to_owned(),
         }),
     }
 }

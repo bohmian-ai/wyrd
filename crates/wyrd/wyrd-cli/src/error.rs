@@ -199,46 +199,21 @@ pub enum WyrdCliError {
         source: std::io::Error,
     },
 
-    /// HTTP client construction failed.
-    #[error("could not build HTTP client: {source}")]
+    /// The agent endpoint under evaluation failed a turn.
+    ///
+    /// Distinct from [`Self::Server`]: the agent is a third-party URL the
+    /// operator named, not a Wyrd surface, so its failures carry no stable Wyrd
+    /// code and are reported as one CLI-local condition.
+    #[error("agent turn failed: {detail}")]
     #[wyrd_error(
-        code = "WYRD_CLI_500_HTTP_BUILD",
-        status = 500,
-        title = "HTTP client build failed",
-        remediation = "Retry with valid HTTP settings."
-    )]
-    HttpBuild {
-        /// Source error.
-        #[source]
-        source: reqwest::Error,
-    },
-
-    /// HTTP request failed.
-    #[error("HTTP request failed: {source}")]
-    #[wyrd_error(
-        code = "WYRD_CLI_502_HTTP",
+        code = "WYRD_CLI_502_AGENT_TURN",
         status = 502,
-        title = "HTTP request failed",
-        remediation = "Check the server or agent endpoint and retry."
+        title = "Agent turn failed",
+        remediation = "Check the --agent-url endpoint, its response shape, and --agent-timeout-secs, then retry."
     )]
-    Http {
-        /// Source error.
-        #[source]
-        source: reqwest::Error,
-    },
-
-    /// URL join failed.
-    #[error("URL join failed: {source}")]
-    #[wyrd_error(
-        code = "WYRD_CLI_400_URL_JOIN",
-        status = 400,
-        title = "URL construction failed",
-        remediation = "Pass a valid base URL."
-    )]
-    UrlJoin {
-        /// Source error.
-        #[source]
-        source: url::ParseError,
+    AgentTurnFailed {
+        /// What the endpoint did instead of answering.
+        detail: String,
     },
 
     /// Auth request failed (login, refresh, callback).
@@ -357,11 +332,16 @@ pub enum WyrdCliError {
     )]
     CardLoad(#[source] wyrd_loader::LoadError),
 
-    /// A registry operation returned a stable Wyrd error.
+    /// A Wyrd route returned a stable Wyrd error.
+    ///
+    /// The shared client has already mapped the response onto the catalog, so
+    /// this variant carries that error through unchanged rather than inventing a
+    /// CLI-local status-shaped one. Every command that calls a Wyrd route
+    /// reports its server failures here.
     #[error(transparent)]
     #[wyrd_error(delegate)]
-    Registry {
-        /// Registry error catalog value.
+    Server {
+        /// Stable catalog value the server reported.
         #[from]
         source: wyrd_spec::error::WyrdError,
     },

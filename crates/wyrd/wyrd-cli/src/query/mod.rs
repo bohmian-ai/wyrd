@@ -3,15 +3,10 @@
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use arrow::json::LineDelimitedWriter;
 use clap::{ArgGroup, Args, ValueEnum};
-use secrecy::SecretString;
-use wyrd_client::auth::AuthMiddleware;
 use wyrd_client::bifrost::{BifrostClientError, QueryResultStream};
-use wyrd_client::config::ClientConfig;
-use wyrd_client::transport::{HttpConfig, HttpTransport, ResolvedCredential};
 use wyrd_client::{Bifrost, WyrdClient};
 use wyrd_spec::vala::api::{BifrostQueryRequest, FreshnessPolicy, VisibilityMode};
 
@@ -160,12 +155,16 @@ fn request(command: &QueryCommand) -> Result<BifrostQueryRequest, WyrdCliError> 
     })
 }
 
-/// Constructs the existing authenticated Wyrd client stack.
+/// Constructs the authenticated Wyrd client for one query invocation.
+///
+/// `--server` and `--token` are required here rather than read from the ambient
+/// chain, because a query names the deployment it reads. Assembly itself belongs
+/// to [`crate::client`].
 ///
 /// # Errors
 ///
-/// Returns a configuration error for missing credentials or a query setup
-/// error when existing auth or transport construction rejects the settings.
+/// Returns [`WyrdCliError::QueryConfig`] when either flag is absent or blank,
+/// and the client-assembly errors documented on [`crate::client::client`].
 fn client(command: &QueryCommand) -> Result<WyrdClient, WyrdCliError> {
     let server = command
         .server
@@ -177,20 +176,7 @@ fn client(command: &QueryCommand) -> Result<WyrdClient, WyrdCliError> {
         .as_deref()
         .filter(|value| !value.is_empty())
         .ok_or(WyrdCliError::QueryConfig { field: "--token" })?;
-    let config = ClientConfig {
-        http: HttpConfig {
-            base_url: server.trim_end_matches('/').to_owned(),
-            ..HttpConfig::default()
-        },
-        ..ClientConfig::default()
-    };
-    let auth = AuthMiddleware::new(
-        &config,
-        ResolvedCredential::BearerToken(SecretString::from(token.to_owned())),
-    )
-    .map_err(output_error)?;
-    let http = HttpTransport::new(&config.http, Arc::clone(&auth)).map_err(output_error)?;
-    Ok(WyrdClient::from_parts(auth, http, config.grpc))
+    crate::client::client(server, token)
 }
 
 /// Emits record batches as typed line-delimited JSON.

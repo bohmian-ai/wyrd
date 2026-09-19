@@ -3115,7 +3115,7 @@ pub enum WyrdError {
         code = "WYRD_EVAL_401_MISSING_LEASE",
         status = 401,
         title = "Missing lease token",
-        remediation = "Send the lease_token from EvalRunOpenResponse in the Authorization: Bearer <token> header."
+        remediation = "Send the lease_token from EvalRunOpenResponse in the X-Wyrd-Eval-Lease: Bearer <token> header."
     )]
     EvalMissingLease {
         /// Human-readable error message.

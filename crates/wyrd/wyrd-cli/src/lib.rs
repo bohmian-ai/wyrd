@@ -9,6 +9,7 @@
 pub mod auth;
 mod card;
 mod cli;
+mod client;
 pub mod error;
 mod eval;
 pub mod load;

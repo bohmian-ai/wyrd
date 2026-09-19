@@ -3,18 +3,12 @@
 use std::fmt::Display;
 use std::process::ExitCode;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::{fmt, path::PathBuf};
 
 use clap::{Args, ValueEnum};
 use serde::Serialize;
-use wyrd_client::WyrdClient;
-use wyrd_client::auth::AuthMiddleware;
 use wyrd_client::cards::RegistrationReceipt;
 use wyrd_client::cards::{CardGraphHydrator, CardSelector, Cards, HydrationMode, HydrationSummary};
-use wyrd_client::config::ClientConfig;
-use wyrd_client::error::WyrdClientError;
-use wyrd_client::transport::HttpTransport;
 use wyrd_loader::{Diagnostic, LoadError, RegistrationInput, build_registration_input, load};
 use wyrd_semver::VersionBlock;
 use wyrd_spec::envelope::{Card, CardKind};
@@ -295,7 +289,7 @@ pub async fn dispatch_apply(args: ApplyArgs) -> Result<ExitCode, WyrdCliError> {
     let receipt = cards
         .register(&input)
         .await
-        .map_err(|source| WyrdCliError::Registry { source })?;
+        .map_err(|source| WyrdCliError::Server { source })?;
     match args.format {
         OutputFormat::Text => print_apply_text(&receipt),
         OutputFormat::Json => print_json(&receipt)?,
@@ -339,7 +333,7 @@ pub async fn dispatch_get(args: GetArgs) -> Result<ExitCode, WyrdCliError> {
     let output = hydrator
         .hydrate(&selector, output_dir, mode)
         .await
-        .map_err(|source| WyrdCliError::Registry { source })?;
+        .map_err(|source| WyrdCliError::Server { source })?;
     match args.format {
         OutputFormat::Text => print_get_text(&output),
         OutputFormat::Json => print_json(&output)?,
@@ -369,7 +363,7 @@ pub async fn dispatch_latest(args: LatestArgs) -> Result<ExitCode, WyrdCliError>
     let card_ref = cards
         .resolve_latest(kind, space, name)
         .await
-        .map_err(|source| WyrdCliError::Registry { source })?;
+        .map_err(|source| WyrdCliError::Server { source })?;
     let output = LatestOutput { card_ref };
     match args.format {
         OutputFormat::Text => println!("latest: {}", output.card_ref),
@@ -432,7 +426,7 @@ pub async fn dispatch_list(args: ListArgs) -> Result<ExitCode, WyrdCliError> {
     let response = cards
         .list(request)
         .await
-        .map_err(|source| WyrdCliError::Registry { source })?;
+        .map_err(|source| WyrdCliError::Server { source })?;
     match args.format {
         OutputFormat::Text => print_list_text(&response),
         OutputFormat::Json => print_json(&response)?,
@@ -463,7 +457,7 @@ pub async fn dispatch_load(args: LoadArgs) -> Result<ExitCode, WyrdCliError> {
     let loaded = cards
         .load(selector, args.path.as_deref())
         .await
-        .map_err(|source| WyrdCliError::Registry { source })?;
+        .map_err(|source| WyrdCliError::Server { source })?;
     let output = LoadOutput {
         card_ref: exact_card_ref(&loaded.card)?,
         materialized: true,
@@ -482,7 +476,7 @@ pub async fn dispatch_delete(args: DeleteArgs) -> Result<ExitCode, WyrdCliError>
     cards
         .delete(selector)
         .await
-        .map_err(|source| WyrdCliError::Registry { source })?;
+        .map_err(|source| WyrdCliError::Server { source })?;
     let output = DeleteOutput { deleted: true };
     match args.format {
         OutputFormat::Text => println!("deleted"),
@@ -491,33 +485,19 @@ pub async fn dispatch_delete(args: DeleteArgs) -> Result<ExitCode, WyrdCliError>
     Ok(ExitCode::SUCCESS)
 }
 
+/// Build the card-administration handle for one connection.
+///
+/// Construction lives in [`crate::client`]: the ambient configuration is the
+/// right default here, because `wyrd apply` and `wyrd card get` administer the
+/// deployment the user is already pointed at.
+///
+/// # Errors
+/// Returns the client-assembly errors documented on
+/// [`crate::client::from_global`].
 fn build_cards(connection: &ConnectionArgs) -> Result<Cards, WyrdCliError> {
-    let mut config = ClientConfig::from_global().map_err(map_client_error)?;
-    if let Some(server) = &connection.server {
-        config.http.base_url.clone_from(server);
-    }
-    config.http.validate().map_err(map_client_error)?;
-    let credential = config.resolve_credential().map_err(map_client_error)?;
-    let auth = AuthMiddleware::new(&config, credential).map_err(map_client_error)?;
-    let transport =
-        HttpTransport::new(&config.http, Arc::clone(&auth)).map_err(map_client_error)?;
-    Ok(Cards::with_client(WyrdClient::from_parts(
-        auth,
-        transport,
-        config.grpc,
-    )))
-}
-
-fn map_client_error(error: WyrdClientError) -> WyrdCliError {
-    match error {
-        WyrdClientError::NoCredentials => WyrdCliError::NoCredentials,
-        WyrdClientError::Config { field, reason } => WyrdCliError::ClientConfig {
-            detail: format!("{field}: {reason}"),
-        },
-        WyrdClientError::TransportDown { transport, message } => WyrdCliError::ClientTransport {
-            detail: format!("{transport}: {message}"),
-        },
-    }
+    Ok(Cards::with_client(crate::client::from_global(
+        connection.server.as_deref(),
+    )?))
 }
 
 fn selector_from_args(
@@ -631,7 +611,7 @@ fn exact_card_ref(card: &Card) -> Result<CardRef, WyrdCliError> {
         .metadata
         .resolved_pin()
         .cloned()
-        .ok_or_else(|| WyrdCliError::Registry {
+        .ok_or_else(|| WyrdCliError::Server {
             source: WyrdError::RegistryInvalidCardSpec {
                 message: "server response did not contain an exact card version".to_owned(),
                 details: serde_json::json!({}),
@@ -641,7 +621,7 @@ fn exact_card_ref(card: &Card) -> Result<CardRef, WyrdCliError> {
         .metadata
         .space
         .clone()
-        .ok_or_else(|| WyrdCliError::Registry {
+        .ok_or_else(|| WyrdCliError::Server {
             source: WyrdError::RegistryInvalidCardSpec {
                 message: "server response did not contain a card space".to_owned(),
                 details: serde_json::json!({}),

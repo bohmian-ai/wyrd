@@ -2,7 +2,9 @@ use std::process::ExitCode;
 
 use clap::Args;
 use url::Url;
-use wyrd_spec::auth::{SecretBearer, TokenRequest, TokenResponse};
+use wyrd_client::auth::TokenExchange;
+use wyrd_client::transport::HttpConfig;
+use wyrd_spec::auth::{SecretBearer, TokenRequest};
 
 use crate::error::WyrdCliError;
 
@@ -16,40 +18,24 @@ pub struct RefreshArgs {
     pub refresh_token: String,
 }
 
+/// Rotate a refresh token and print the replacement pair.
+///
+/// # Errors
+/// Returns a client-construction error for a rejected endpoint and the server's
+/// stable Wyrd error when the refresh token is unknown, expired, or already
+/// rotated.
 pub async fn dispatch(args: RefreshArgs) -> Result<ExitCode, WyrdCliError> {
-    let token_url = args
-        .server
-        .join("/auth/token")
-        .map_err(|source| WyrdCliError::UrlJoin { source })?;
-
-    let body = serde_json::to_string(&TokenRequest::RefreshToken {
-        refresh_token: SecretBearer::new(args.refresh_token),
-    })
-    .expect("TokenRequest serializes");
-
-    let resp = reqwest::Client::new()
-        .post(token_url)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(body)
-        .send()
+    let token = TokenExchange::new(args.server.as_str(), HttpConfig::default().timeout_ms)
+        .map_err(crate::client::map_client_error)?
+        .exchange(&TokenRequest::RefreshToken {
+            refresh_token: SecretBearer::new(args.refresh_token),
+        })
         .await
-        .map_err(|source| WyrdCliError::Http { source })?;
+        .map_err(|error| WyrdCliError::Server {
+            source: error.into_wyrd(),
+        })?;
 
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        let detail = resp.text().await.unwrap_or_default();
-        return Err(WyrdCliError::AuthFailed { status, detail });
-    }
-
-    let token: TokenResponse = resp
-        .json()
-        .await
-        .map_err(|source| WyrdCliError::Http { source })?;
-    println!("access_token:  {}", token.access_token.expose());
-    if let Some(refresh_token) = &token.refresh_token {
-        println!("refresh_token: {}", refresh_token.expose());
-    }
-    println!("expires_at:    {}", token.expires_at);
+    super::login::print_tokens(&token);
     Ok(ExitCode::SUCCESS)
 }
 

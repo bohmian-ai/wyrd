@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Subcommand};
+use reqwest::Method;
 use url::Url;
 use wyrd_spec::auth::{
     ClaimMappingPayload, ClientAuthKind, CreateTrustedIssuerRequest, IssuerTokenPolicy, IssuerUrl,
@@ -10,6 +11,9 @@ use wyrd_spec::auth::{
 };
 
 use crate::error::WyrdCliError;
+
+/// Collection path both the write and the read operations address.
+const TRUSTED_ISSUERS_PATH: &str = "/v1/admin/trusted-issuers";
 
 #[derive(Debug, Subcommand)]
 pub enum TrustedIssuerCommand {
@@ -108,58 +112,46 @@ pub async fn dispatch(command: TrustedIssuerCommand) -> Result<ExitCode, WyrdCli
     }
 }
 
+/// Register a trusted OIDC issuer for the caller's tenant.
+///
+/// # Errors
+/// Returns [`WyrdCliError::InvalidArgument`] for a malformed issuer URL, client
+/// auth method, principal kind, or group mapping; an IO error when the secret
+/// file cannot be read; and the server's stable Wyrd error when the caller is
+/// unauthorized or the issuer cannot be screened.
 async fn add(args: AddArgs) -> Result<ExitCode, WyrdCliError> {
-    let issuer: IssuerUrl = args.issuer.parse().map_err(|e| WyrdCliError::AdminFailed {
-        status: 400,
-        detail: format!("invalid --issuer URL: {e}"),
-    })?;
+    let issuer: IssuerUrl = args
+        .issuer
+        .parse()
+        .map_err(|error| invalid("issuer", &args.issuer, &format!("an issuer URL: {error}")))?;
     let client_auth = parse_client_auth(&args.client_auth)?;
     let principal_kind = parse_principal_kind(&args.principal_kind)?;
     let client_secret = resolve_client_secret(args.client_secret, args.client_secret_file)?;
     let group_role_map = parse_group_roles(&args.group_roles)?;
 
-    let url = args
-        .server
-        .join("/v1/admin/trusted-issuers")
-        .map_err(|source| WyrdCliError::UrlJoin { source })?;
-
-    let body = serde_json::to_string(&CreateTrustedIssuerRequest {
-        issuer,
-        expected_audience: args.expected_audience,
-        client_id: args.client_id,
-        client_auth,
-        client_secret,
-        claim_mapping: ClaimMappingPayload {
-            subject: args.claim_subject,
-            email: args.claim_email,
-            groups: args.claim_groups,
-        },
-        group_role_map,
-        default_roles: args.default_roles,
-        principal_kind,
-        jwks_ttl_secs: args.jwks_ttl_secs,
-    })
-    .expect("CreateTrustedIssuerRequest serializes");
-
-    let resp = reqwest::Client::new()
-        .post(url)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .header("x-wyrd-access-token", format!("Bearer {}", args.token))
-        .body(body)
-        .send()
+    let view: TrustedIssuerView = crate::client::client(args.server.as_str(), &args.token)?
+        .request_json(
+            Method::POST,
+            TRUSTED_ISSUERS_PATH,
+            Some(&CreateTrustedIssuerRequest {
+                issuer,
+                expected_audience: args.expected_audience,
+                client_id: args.client_id,
+                client_auth,
+                client_secret,
+                claim_mapping: ClaimMappingPayload {
+                    subject: args.claim_subject,
+                    email: args.claim_email,
+                    groups: args.claim_groups,
+                },
+                group_role_map,
+                default_roles: args.default_roles,
+                principal_kind,
+                jwks_ttl_secs: args.jwks_ttl_secs,
+            }),
+        )
         .await
-        .map_err(|source| WyrdCliError::Http { source })?;
-
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        let detail = resp.text().await.unwrap_or_default();
-        return Err(WyrdCliError::AdminFailed { status, detail });
-    }
-
-    let view: TrustedIssuerView = resp
-        .json()
-        .await
-        .map_err(|source| WyrdCliError::Http { source })?;
+        .map_err(|source| WyrdCliError::Server { source })?;
 
     println!("issuer:            {}", view.issuer);
     println!("jwks_uri:          {}", view.jwks_uri);
@@ -172,29 +164,16 @@ async fn add(args: AddArgs) -> Result<ExitCode, WyrdCliError> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// List the tenant's trusted OIDC issuers.
+///
+/// # Errors
+/// Returns a client-construction error for a rejected endpoint and the server's
+/// stable Wyrd error when the caller is unauthorized or the read fails.
 async fn list(args: ListArgs) -> Result<ExitCode, WyrdCliError> {
-    let url = args
-        .server
-        .join("/v1/admin/trusted-issuers")
-        .map_err(|source| WyrdCliError::UrlJoin { source })?;
-
-    let resp = reqwest::Client::new()
-        .get(url)
-        .header("x-wyrd-access-token", format!("Bearer {}", args.token))
-        .send()
+    let views: Vec<TrustedIssuerView> = crate::client::client(args.server.as_str(), &args.token)?
+        .request_json::<(), _>(Method::GET, TRUSTED_ISSUERS_PATH, None)
         .await
-        .map_err(|source| WyrdCliError::Http { source })?;
-
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        let detail = resp.text().await.unwrap_or_default();
-        return Err(WyrdCliError::AdminFailed { status, detail });
-    }
-
-    let views: Vec<TrustedIssuerView> = resp
-        .json()
-        .await
-        .map_err(|source| WyrdCliError::Http { source })?;
+        .map_err(|source| WyrdCliError::Server { source })?;
 
     for view in &views {
         println!("{} ({})", view.issuer, view.principal_kind);
@@ -203,59 +182,70 @@ async fn list(args: ListArgs) -> Result<ExitCode, WyrdCliError> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Remove one trusted OIDC issuer.
+///
+/// The server addresses the issuer by query, not a path segment: the route is
+/// the bare collection path and `DeleteIssuerQuery` reads `?issuer=&cascade=`.
+///
+/// # Errors
+/// Returns a client-construction error for a rejected endpoint and the server's
+/// stable Wyrd error when the caller is unauthorized, the issuer is unknown, or
+/// live workload bindings block an uncascaded removal.
 async fn rm(args: RmArgs) -> Result<ExitCode, WyrdCliError> {
-    let url = args
-        .server
-        .join("/v1/admin/trusted-issuers")
-        .map_err(|source| WyrdCliError::UrlJoin { source })?;
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("issuer", &args.issuer)
+        .append_pair("cascade", if args.cascade { "true" } else { "false" })
+        .finish();
 
-    // The server addresses the issuer by query, not a path segment: the route is
-    // the bare collection path and DeleteIssuerQuery reads ?issuer=&cascade=.
-    let cascade = args.cascade.to_string();
-    let resp = reqwest::Client::new()
-        .delete(url)
-        .query(&[
-            ("issuer", args.issuer.as_str()),
-            ("cascade", cascade.as_str()),
-        ])
-        .header("x-wyrd-access-token", format!("Bearer {}", args.token))
-        .send()
+    crate::client::client(args.server.as_str(), &args.token)?
+        .request_json::<(), serde_json::Value>(
+            Method::DELETE,
+            &format!("{TRUSTED_ISSUERS_PATH}?{query}"),
+            None,
+        )
         .await
-        .map_err(|source| WyrdCliError::Http { source })?;
-
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        let detail = resp.text().await.unwrap_or_default();
-        return Err(WyrdCliError::AdminFailed { status, detail });
-    }
+        .map_err(|source| WyrdCliError::Server { source })?;
 
     println!("deleted: {}", args.issuer);
     Ok(ExitCode::SUCCESS)
 }
 
+/// Report one rejected argument.
+fn invalid(field: &str, value: &str, expected: &str) -> WyrdCliError {
+    WyrdCliError::InvalidArgument {
+        field: field.to_owned(),
+        value: value.to_owned(),
+        expected: expected.to_owned(),
+    }
+}
+
+/// Parse the client authentication method Wyrd presents to the issuer.
+///
+/// # Errors
+/// Returns [`WyrdCliError::InvalidArgument`] for an unknown method.
 fn parse_client_auth(value: &str) -> Result<ClientAuthKind, WyrdCliError> {
     match value {
         "SecretBasic" => Ok(ClientAuthKind::SecretBasic),
         "SecretPost" => Ok(ClientAuthKind::SecretPost),
         "PrivateKeyJwt" => Ok(ClientAuthKind::PrivateKeyJwt),
         "Public" => Ok(ClientAuthKind::Public),
-        other => Err(WyrdCliError::AdminFailed {
-            status: 400,
-            detail: format!(
-                "unknown --client-auth {other:?}; expected SecretBasic, SecretPost, PrivateKeyJwt, or Public"
-            ),
-        }),
+        other => Err(invalid(
+            "client-auth",
+            other,
+            "SecretBasic, SecretPost, PrivateKeyJwt, or Public",
+        )),
     }
 }
 
+/// Parse whether tokens from this issuer represent humans or workloads.
+///
+/// # Errors
+/// Returns [`WyrdCliError::InvalidArgument`] for an unknown kind.
 fn parse_principal_kind(value: &str) -> Result<IssuerTokenPolicy, WyrdCliError> {
     match value {
         "Human" => Ok(IssuerTokenPolicy::Human),
         "Workload" => Ok(IssuerTokenPolicy::Workload),
-        other => Err(WyrdCliError::AdminFailed {
-            status: 400,
-            detail: format!("unknown --principal-kind {other:?}; expected Human or Workload"),
-        }),
+        other => Err(invalid("principal-kind", other, "Human or Workload")),
     }
 }
 
@@ -271,13 +261,7 @@ fn resolve_client_secret(
     file: Option<PathBuf>,
 ) -> Result<Option<String>, WyrdCliError> {
     if let Some(path) = file {
-        let raw = std::fs::read_to_string(&path).map_err(|error| WyrdCliError::AdminFailed {
-            status: 400,
-            detail: format!(
-                "cannot read --client-secret-file {}: {error}",
-                path.display()
-            ),
-        })?;
+        let raw = std::fs::read_to_string(&path).map_err(|source| WyrdCliError::Io { source })?;
         return Ok(Some(raw.trim_end_matches(['\n', '\r']).to_owned()));
     }
     if let Some(secret) = inline {
@@ -286,10 +270,11 @@ fn resolve_client_secret(
     match std::env::var("WYRD_ISSUER_CLIENT_SECRET") {
         Ok(secret) => Ok(Some(secret)),
         Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => Err(WyrdCliError::AdminFailed {
-            status: 400,
-            detail: "WYRD_ISSUER_CLIENT_SECRET is not valid UTF-8".to_owned(),
-        }),
+        Err(std::env::VarError::NotUnicode(_)) => Err(invalid(
+            "WYRD_ISSUER_CLIENT_SECRET",
+            "<non-UTF-8>",
+            "valid UTF-8",
+        )),
     }
 }
 
@@ -303,15 +288,13 @@ fn parse_group_roles(entries: &[String]) -> Result<HashMap<String, Vec<String>>,
     for entry in entries {
         let (group, role) = entry
             .split_once('=')
-            .ok_or_else(|| WyrdCliError::AdminFailed {
-                status: 400,
-                detail: format!("invalid --group-role {entry:?}; expected group=role"),
-            })?;
+            .ok_or_else(|| invalid("group-role", entry, "group=role"))?;
         if group.is_empty() || role.is_empty() {
-            return Err(WyrdCliError::AdminFailed {
-                status: 400,
-                detail: format!("invalid --group-role {entry:?}; group and role must be non-empty"),
-            });
+            return Err(invalid(
+                "group-role",
+                entry,
+                "group=role with a non-empty group and role",
+            ));
         }
         map.entry(group.to_owned())
             .or_default()

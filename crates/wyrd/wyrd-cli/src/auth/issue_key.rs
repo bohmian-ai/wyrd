@@ -1,6 +1,7 @@
 use std::process::ExitCode;
 
 use clap::Args;
+use reqwest::Method;
 use url::Url;
 use wyrd_spec::auth::{IssueKeyRequest, IssueKeyResponse};
 use wyrd_spec::reference::CardRef;
@@ -35,52 +36,42 @@ pub struct IssueKeyArgs {
     pub token: String,
 }
 
+/// Issue a card-bound API key and print it once.
+///
+/// The plaintext key crosses this surface exactly here, in the response that
+/// created it, and is never written anywhere but the operator's terminal.
+///
+/// # Errors
+/// Returns [`WyrdCliError::InvalidArgument`] when the card coordinates do not
+/// form a `CardRef`, a client-construction error for a rejected endpoint, and
+/// the server's stable Wyrd error when the caller is unauthorized or the card is
+/// unknown.
 pub async fn dispatch(args: IssueKeyArgs) -> Result<ExitCode, WyrdCliError> {
     let card_ref_str = format!(
         "{}/{}/{}@{}",
         args.space, args.kind, args.name, args.version
     );
-    let card_ref: CardRef = card_ref_str
-        .parse()
-        .map_err(|e| WyrdCliError::IssueKeyFailed {
-            status: 400,
-            detail: format!("invalid card ref: {e}"),
-        })?;
+    let card_ref: CardRef =
+        card_ref_str
+            .parse()
+            .map_err(|error| WyrdCliError::InvalidArgument {
+                field: "card".to_owned(),
+                value: card_ref_str.clone(),
+                expected: format!("a card ref: {error}"),
+            })?;
 
-    let issue_url = args
-        .server
-        .join("/auth/issue-key")
-        .map_err(|source| WyrdCliError::UrlJoin { source })?;
-
-    let body = serde_json::to_string(&IssueKeyRequest {
-        card_ref,
-        label: args.label,
-        expires_in_seconds: args.expires_in_seconds,
-    })
-    .expect("IssueKeyRequest serializes");
-
-    let resp = reqwest::Client::new()
-        .post(issue_url)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .header(
-            reqwest::header::AUTHORIZATION,
-            format!("Bearer {}", args.token),
+    let response: IssueKeyResponse = crate::client::client(args.server.as_str(), &args.token)?
+        .request_json(
+            Method::POST,
+            "/auth/issue-key",
+            Some(&IssueKeyRequest {
+                card_ref,
+                label: args.label,
+                expires_in_seconds: args.expires_in_seconds,
+            }),
         )
-        .body(body)
-        .send()
         .await
-        .map_err(|source| WyrdCliError::Http { source })?;
-
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        let detail = resp.text().await.unwrap_or_default();
-        return Err(WyrdCliError::IssueKeyFailed { status, detail });
-    }
-
-    let response: IssueKeyResponse = resp
-        .json()
-        .await
-        .map_err(|source| WyrdCliError::Http { source })?;
+        .map_err(|source| WyrdCliError::Server { source })?;
 
     println!("key_id:     {}", response.key_id);
     println!("key:        {}", response.key.expose());

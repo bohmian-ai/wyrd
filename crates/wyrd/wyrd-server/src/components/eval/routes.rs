@@ -19,7 +19,7 @@ use crate::components::auth::{AuthenticatedPrincipal, Caller};
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
 use axum::{Json, Router};
 use vala_eval::orchestrator::{NextDirective, RunState};
@@ -243,12 +243,20 @@ fn lookup(
     Ok(entry)
 }
 
+/// Header carrying a run's lease token.
+///
+/// The lease is a second credential on a request that already carries the
+/// caller's Wyrd token, so it needs a header of its own. It is not
+/// `Authorization`: that header belongs to the calling application and no Wyrd
+/// surface reads it.
+pub(crate) const EVAL_LEASE_HEADER: &str = "x-wyrd-eval-lease";
+
 /// Constant-time per-run lease check, retained beneath principal identity.
 fn check_lease(headers: &HeaderMap, entry: &RunEntry) -> Result<(), WyrdErrorResponse> {
     use subtle::ConstantTimeEq;
 
     let value = headers
-        .get(header::AUTHORIZATION)
+        .get(EVAL_LEASE_HEADER)
         .and_then(|value| value.to_str().ok())
         .ok_or_else(|| WyrdErrorResponse::from(eval_missing_lease()))?;
     let (scheme, token) = value

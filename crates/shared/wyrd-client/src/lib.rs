@@ -15,6 +15,7 @@ pub mod cards;
 pub mod client;
 pub mod config;
 pub mod error;
+pub mod eval;
 pub mod global_config;
 pub mod platform;
 pub mod principals;
@@ -24,6 +25,7 @@ pub mod transport;
 
 pub use bifrost::Bifrost;
 pub use client::WyrdClient;
+pub use eval::EvalProtocol;
 pub use global_config::GlobalConfig;
 pub use platform::Platform;
 pub use principals::Principals;

@@ -128,12 +128,50 @@ impl HttpTransport {
         S: Serialize,
         D: DeserializeOwned,
     {
+        self.request_json_with_headers(method, path, body, &[])
+            .await
+    }
+
+    /// Send a JSON request carrying additional request-scoped headers.
+    ///
+    /// Behaves exactly like [`Self::request_json`] — same authentication,
+    /// request id, retry, and `application/problem+json` mapping — and applies
+    /// `headers` verbatim on every attempt. It exists for a route whose
+    /// authorization needs a second credential beside the caller's Wyrd token,
+    /// such as the eval pull protocol's per-run lease.
+    ///
+    /// Deliberately crate-visible: header assembly is the transport's job, so a
+    /// capability handle inside this crate owns the header name and value while
+    /// no consumer outside it can start composing headers of its own.
+    ///
+    /// # Errors
+    /// Non-`2xx` server responses are mapped to [`WyrdError`] via
+    /// `application/problem+json`. Transport failures become
+    /// [`WyrdError::Internal`].
+    pub(crate) async fn request_json_with_headers<S, D>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&S>,
+        headers: &[(&str, &str)],
+    ) -> Result<D, WyrdError>
+    where
+        S: Serialize,
+        D: DeserializeOwned,
+    {
         let url = self.authenticated_url(path)?;
         let request_id = self.auth.request_id(None);
         let body_bytes = serialize_body(body)?;
 
         let resp = self
-            .send_with_retry(&method, &url, &request_id, body_bytes.as_deref(), None)
+            .send_with_retry(
+                &method,
+                &url,
+                &request_id,
+                body_bytes.as_deref(),
+                None,
+                headers,
+            )
             .await?;
 
         let bytes = resp.bytes().await.map_err(body_read_err)?;
@@ -172,7 +210,7 @@ impl HttpTransport {
         let body_bytes = serialize_body(body)?;
 
         let resp = self
-            .send_with_retry(&method, &url, &request_id, body_bytes.as_deref(), None)
+            .send_with_retry(&method, &url, &request_id, body_bytes.as_deref(), None, &[])
             .await?;
 
         let schema_fingerprint = header_str(&resp, HEADER_SCHEMA_FINGERPRINT).map(str::to_owned);
@@ -513,6 +551,7 @@ impl HttpTransport {
                 &request_id,
                 Some(&body_bytes),
                 Some(idempotency_key),
+                &[],
             )
             .await?;
 
@@ -563,6 +602,9 @@ impl HttpTransport {
     /// covering connection, headers, and the caller's later body read, so JSON
     /// and control responses always finish or fail within a finite wait.
     ///
+    /// `extra_headers` are request-scoped headers applied verbatim on every
+    /// attempt, used for a secondary credential such as an eval run lease.
+    ///
     /// Policy:
     /// - Fetches a fresh bearer before each attempt.
     /// - **Connect** errors (the request never reached the server) always
@@ -591,6 +633,7 @@ impl HttpTransport {
         request_id: &str,
         body: Option<&[u8]>,
         idempotency_key: Option<&str>,
+        extra_headers: &[(&str, &str)],
     ) -> Result<reqwest::Response, WyrdError> {
         // A request is replay-safe when re-sending it cannot double-apply a
         // server-side effect: idempotent HTTP methods, or any request carrying
@@ -614,6 +657,12 @@ impl HttpTransport {
 
             if let Some(key) = idempotency_key {
                 req = req.header(HEADER_IDEMPOTENCY_KEY, key);
+            }
+
+            // Re-applied on every attempt, like the bearer: a retry is a new
+            // request and must carry the same secondary credential.
+            for (name, value) in extra_headers {
+                req = req.header(*name, *value);
             }
 
             if let Some(bytes) = body {

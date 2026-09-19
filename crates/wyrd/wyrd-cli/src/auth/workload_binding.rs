@@ -1,11 +1,15 @@
 use std::process::ExitCode;
 
 use clap::{Args, Subcommand};
+use reqwest::Method;
 use url::Url;
 use wyrd_spec::auth::{CreateWorkloadBindingRequest, IssuerUrl, WorkloadBindingView};
 use wyrd_spec::reference::CardRef;
 
 use crate::error::WyrdCliError;
+
+/// Collection path every workload-binding operation addresses.
+const WORKLOAD_BINDINGS_PATH: &str = "/v1/admin/workload-bindings";
 
 #[derive(Debug, Subcommand)]
 pub enum WorkloadBindingCommand {
@@ -79,50 +83,36 @@ pub async fn dispatch(command: WorkloadBindingCommand) -> Result<ExitCode, WyrdC
     }
 }
 
+/// Bind one issuer subject to a card, so its workload token authenticates.
+///
+/// # Errors
+/// Returns [`WyrdCliError::InvalidArgument`] for a malformed card ref or issuer
+/// URL, a client-construction error for a rejected endpoint, and the server's
+/// stable Wyrd error when the caller is unauthorized or the issuer is untrusted.
 async fn add(args: AddArgs) -> Result<ExitCode, WyrdCliError> {
-    // Validate card ref locally before any HTTP call; fail 400-class on invalid input.
-    let card_ref: CardRef = args.card.parse().map_err(|e| WyrdCliError::AdminFailed {
-        status: 400,
-        detail: format!("invalid --card: {e}"),
-    })?;
+    // Validate the card ref and issuer locally, before any HTTP call.
+    let card_ref: CardRef = args
+        .card
+        .parse()
+        .map_err(|error| invalid("card", &args.card, &format!("a card ref: {error}")))?;
+    let issuer: IssuerUrl = args
+        .issuer
+        .parse()
+        .map_err(|error| invalid("issuer", &args.issuer, &format!("an issuer URL: {error}")))?;
 
-    let issuer: IssuerUrl = args.issuer.parse().map_err(|e| WyrdCliError::AdminFailed {
-        status: 400,
-        detail: format!("invalid --issuer URL: {e}"),
-    })?;
-
-    let url = args
-        .server
-        .join("/v1/admin/workload-bindings")
-        .map_err(|source| WyrdCliError::UrlJoin { source })?;
-
-    let body = serde_json::to_string(&CreateWorkloadBindingRequest {
-        issuer,
-        subject: args.subject,
-        audience: args.audience,
-        card_ref,
-    })
-    .expect("CreateWorkloadBindingRequest serializes");
-
-    let resp = reqwest::Client::new()
-        .post(url)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .header("x-wyrd-access-token", format!("Bearer {}", args.token))
-        .body(body)
-        .send()
+    let view: WorkloadBindingView = crate::client::client(args.server.as_str(), &args.token)?
+        .request_json(
+            Method::POST,
+            WORKLOAD_BINDINGS_PATH,
+            Some(&CreateWorkloadBindingRequest {
+                issuer,
+                subject: args.subject,
+                audience: args.audience,
+                card_ref,
+            }),
+        )
         .await
-        .map_err(|source| WyrdCliError::Http { source })?;
-
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        let detail = resp.text().await.unwrap_or_default();
-        return Err(WyrdCliError::AdminFailed { status, detail });
-    }
-
-    let view: WorkloadBindingView = resp
-        .json()
-        .await
-        .map_err(|source| WyrdCliError::Http { source })?;
+        .map_err(|source| WyrdCliError::Server { source })?;
 
     println!("issuer:  {}", view.issuer);
     println!("subject: {}", view.subject);
@@ -134,71 +124,74 @@ async fn add(args: AddArgs) -> Result<ExitCode, WyrdCliError> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// List workload bindings, optionally narrowed by issuer and subject.
+///
+/// # Errors
+/// Returns a client-construction error for a rejected endpoint and the server's
+/// stable Wyrd error when the caller is unauthorized or the read fails.
 async fn list(args: ListArgs) -> Result<ExitCode, WyrdCliError> {
-    let url = args
-        .server
-        .join("/v1/admin/workload-bindings")
-        .map_err(|source| WyrdCliError::UrlJoin { source })?;
-
-    let mut builder = reqwest::Client::new()
-        .get(url)
-        .header("x-wyrd-access-token", format!("Bearer {}", args.token));
-
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
     if let Some(ref issuer) = args.issuer {
-        builder = builder.query(&[("issuer", issuer.as_str())]);
+        query.append_pair("issuer", issuer);
     }
     if let Some(ref subject) = args.subject {
-        builder = builder.query(&[("subject", subject.as_str())]);
+        query.append_pair("subject", subject);
     }
 
-    let resp = builder
-        .send()
+    let views: Vec<WorkloadBindingView> = crate::client::client(args.server.as_str(), &args.token)?
+        .request_json::<(), _>(Method::GET, &path_with_query(&query.finish()), None)
         .await
-        .map_err(|source| WyrdCliError::Http { source })?;
-
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        let detail = resp.text().await.unwrap_or_default();
-        return Err(WyrdCliError::AdminFailed { status, detail });
-    }
-
-    let views: Vec<WorkloadBindingView> = resp
-        .json()
-        .await
-        .map_err(|source| WyrdCliError::Http { source })?;
+        .map_err(|source| WyrdCliError::Server { source })?;
 
     for view in &views {
-        println!("{} / {} → {}", view.issuer, view.subject, view.card_ref);
+        println!(
+            "{} / {} \u{2192} {}",
+            view.issuer, view.subject, view.card_ref
+        );
     }
 
     Ok(ExitCode::SUCCESS)
 }
 
+/// Remove one workload binding.
+///
+/// # Errors
+/// Returns a client-construction error for a rejected endpoint and the server's
+/// stable Wyrd error when the caller is unauthorized or the binding is unknown.
 async fn rm(args: RmArgs) -> Result<ExitCode, WyrdCliError> {
-    let url = args
-        .server
-        .join("/v1/admin/workload-bindings")
-        .map_err(|source| WyrdCliError::UrlJoin { source })?;
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("issuer", &args.issuer)
+        .append_pair("subject", &args.subject)
+        .finish();
 
-    let resp = reqwest::Client::new()
-        .delete(url)
-        .query(&[
-            ("issuer", args.issuer.as_str()),
-            ("subject", args.subject.as_str()),
-        ])
-        .header("x-wyrd-access-token", format!("Bearer {}", args.token))
-        .send()
+    crate::client::client(args.server.as_str(), &args.token)?
+        .request_json::<(), serde_json::Value>(Method::DELETE, &path_with_query(&query), None)
         .await
-        .map_err(|source| WyrdCliError::Http { source })?;
-
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        let detail = resp.text().await.unwrap_or_default();
-        return Err(WyrdCliError::AdminFailed { status, detail });
-    }
+        .map_err(|source| WyrdCliError::Server { source })?;
 
     println!("deleted: {} / {}", args.issuer, args.subject);
     Ok(ExitCode::SUCCESS)
+}
+
+/// Append an already-encoded query string to the collection path.
+///
+/// The server addresses a binding by query rather than by path segment, and an
+/// empty filter must not leave a bare `?` behind.
+fn path_with_query(query: &str) -> String {
+    if query.is_empty() {
+        WORKLOAD_BINDINGS_PATH.to_owned()
+    } else {
+        format!("{WORKLOAD_BINDINGS_PATH}?{query}")
+    }
+}
+
+/// Report one rejected argument.
+fn invalid(field: &str, value: &str, expected: &str) -> WyrdCliError {
+    WyrdCliError::InvalidArgument {
+        field: field.to_owned(),
+        value: value.to_owned(),
+        expected: expected.to_owned(),
+    }
 }
 
 #[cfg(test)]

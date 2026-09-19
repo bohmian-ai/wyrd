@@ -2,7 +2,7 @@ use std::process::ExitCode;
 
 use clap::Args;
 use url::Url;
-use wyrd_spec::auth::{PrincipalKindTag, RevokePrincipalRequest};
+use wyrd_spec::auth::{PrincipalId, PrincipalKindTag, RevokePrincipalRequest};
 
 use crate::error::WyrdCliError;
 
@@ -42,44 +42,32 @@ pub struct RevokeArgs {
     pub token: String,
 }
 
+/// Revoke one principal's outstanding tokens.
+///
+/// # Errors
+/// Returns [`WyrdCliError::InvalidArgument`] when the id is not a principal
+/// UUID, a client-construction error for a rejected endpoint, and the server's
+/// stable Wyrd error when the caller is unauthorized or the principal is
+/// unknown in the caller's tenant.
 pub async fn dispatch(args: RevokeArgs) -> Result<ExitCode, WyrdCliError> {
-    let revoke_url = args
-        .server
-        .join(&format!("/v1/principals/{}/revoke", args.id))
-        .map_err(|source| WyrdCliError::UrlJoin { source })?;
+    let principal_id: PrincipalId = args.id.parse().map_err(|_| WyrdCliError::InvalidArgument {
+        field: "id".to_owned(),
+        value: args.id.clone(),
+        expected: "a principal UUID".to_owned(),
+    })?;
 
-    let body = serde_json::to_string(&RevokePrincipalRequest {
-        principal_kind: PrincipalKindTag::from(args.kind),
-        reason: args.reason,
-    })
-    .expect("RevokePrincipalRequest serializes");
-
-    let resp = reqwest::Client::new()
-        .post(revoke_url)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .header(
-            reqwest::header::AUTHORIZATION,
-            format!("Bearer {}", args.token),
+    crate::client::principals(args.server.as_str(), &args.token)?
+        .revoke_principal(
+            &principal_id,
+            &RevokePrincipalRequest {
+                principal_kind: PrincipalKindTag::from(args.kind),
+                reason: args.reason,
+            },
         )
-        .body(body)
-        .send()
         .await
-        .map_err(|source| WyrdCliError::Http { source })?;
+        .map_err(|source| WyrdCliError::Server { source })?;
 
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        let detail = resp.text().await.unwrap_or_default();
-        return Err(WyrdCliError::RevokeFailed { status, detail });
-    }
-
-    let result: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|source| WyrdCliError::Http { source })?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&result).unwrap_or_default()
-    );
+    println!("revoked: {principal_id}");
     Ok(ExitCode::SUCCESS)
 }
 

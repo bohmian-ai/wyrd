@@ -1,11 +1,17 @@
 //! Principal revocation contracts.
 
-use chrono::{DateTime, Utc};
 use schemars::r#gen::SchemaGenerator;
 use schemars::schema::{InstanceType, Schema, SchemaObject, StringValidation};
 use serde::{Deserialize, Serialize};
 
-use crate::auth::{PrincipalId, PrincipalKindTag};
+use crate::auth::PrincipalKindTag;
+
+/// Byte ceiling shared by the wire reason and the audit detail it becomes.
+///
+/// The reason exists to be recorded, and the audit-detail value type refuses
+/// anything longer, so advertising a wider bound here would document a request
+/// the server must then refuse.
+pub const REASON_MAX_BYTES: u32 = 1_024;
 
 /// `POST /v1/principals/{id}/revoke` body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -24,33 +30,17 @@ fn reason_schema(_gen: &mut SchemaGenerator) -> Schema {
         instance_type: Some(InstanceType::String.into()),
         string: Some(Box::new(StringValidation {
             min_length: Some(1),
-            max_length: Some(2048),
+            max_length: Some(REASON_MAX_BYTES),
             pattern: None,
         })),
         ..Default::default()
     })
 }
 
-/// `POST /v1/principals/{id}/revoke` response.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(deny_unknown_fields)]
-pub struct RevokePrincipalResponse {
-    /// Revoked principal id.
-    pub principal_id: PrincipalId,
-    /// Revoked principal kind.
-    pub principal_kind: PrincipalKindTag,
-    /// New tokens-not-before epoch.
-    pub revoked_at: DateTime<Utc>,
-    /// Number of refresh-token family rows revoked.
-    pub refresh_tokens_revoked: u64,
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{RevokePrincipalRequest, RevokePrincipalResponse};
-    use crate::auth::{PrincipalId, PrincipalKindTag};
-    use chrono::Utc;
+    use super::RevokePrincipalRequest;
+    use crate::auth::PrincipalKindTag;
 
     #[test]
     fn revoke_principal_request_roundtrips() {
@@ -75,27 +65,6 @@ mod tests {
 
         assert!(serde_json::from_value::<RevokePrincipalRequest>(missing_kind).is_err());
         assert!(serde_json::from_value::<RevokePrincipalRequest>(missing_reason).is_err());
-    }
-
-    #[test]
-    fn revoke_principal_response_roundtrips() {
-        let id: PrincipalId = "018f5f1f-0000-7000-8000-000000000001".parse().unwrap();
-        let now = Utc::now();
-        let resp = RevokePrincipalResponse {
-            principal_id: id,
-            principal_kind: PrincipalKindTag::Agent,
-            revoked_at: now,
-            refresh_tokens_revoked: 3,
-        };
-        let value = serde_json::to_value(&resp).unwrap();
-        assert_eq!(value["principal_kind"], "agent");
-        assert_eq!(value["refresh_tokens_revoked"], 3u64);
-        assert!(value["principal_id"].as_str().is_some());
-        assert!(value["revoked_at"].as_str().is_some());
-        assert_eq!(
-            serde_json::from_value::<RevokePrincipalResponse>(value).unwrap(),
-            resp
-        );
     }
 
     #[test]

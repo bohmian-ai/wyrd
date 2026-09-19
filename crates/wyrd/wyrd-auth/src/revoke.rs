@@ -11,44 +11,61 @@ use wyrd_sql::queries::auth::{
     revoke_service_account_principal, revoke_user_principal, service_account_by_id, user_by_id,
 };
 
-/// Look up `target_id`, write the revocation timestamp, and return the principal kind.
+/// Revoke `target_id` in the table the caller's declared `kind` names.
 ///
-/// Returns `PrincipalNotFound` when `target_id` does not exist in the tenant.
+/// The kind is a selector, not a hint: principal ids are unique only within
+/// their table, so revoking on the caller's claim rather than on whichever
+/// table happens to answer first keeps a `user` request from silently
+/// retiring a service account that shares the id. A row found under a
+/// different kind than the one declared is reported as not found, so a caller
+/// cannot use the refusal to enumerate the other table.
 ///
 /// # Errors
-/// Returns a Wyrd error when the target principal is not found or the revocation
-/// write fails.
+/// Returns [`WyrdError::PrincipalNotFound`] when no principal of that kind
+/// exists in the tenant, and [`WyrdError::Internal`] when the revocation write
+/// fails or the stored kind is unrecognized.
 pub async fn revoke_principal_in_conn(
     conn: &mut TenantConn<'_>,
     target_id: PrincipalId,
+    kind: PrincipalKindTag,
     tenant: DataTenantId,
-) -> Result<PrincipalKindTag, WyrdError> {
+) -> Result<(), WyrdError> {
     let id_uuid = target_id.as_uuid();
 
-    if user_by_id(conn, id_uuid).await.ok().flatten().is_some() {
-        revoke_user_principal(conn, id_uuid)
-            .await
-            .map_err(internal_error)?;
-        return Ok(PrincipalKindTag::User);
+    if kind == PrincipalKindTag::User {
+        if user_by_id(conn, id_uuid).await.ok().flatten().is_some() {
+            revoke_user_principal(conn, id_uuid)
+                .await
+                .map_err(internal_error)?;
+            return Ok(());
+        }
+        return Err(not_found(target_id, tenant));
     }
 
-    if let Some(row) = service_account_by_id(conn, id_uuid).await.ok().flatten() {
-        revoke_service_account_principal(conn, id_uuid)
-            .await
-            .map_err(internal_error)?;
-        let kind = principal_kind_wire(&row.principal_kind).ok_or_else(|| {
-            internal_error(format!(
-                "principal {target_id} has unrecognized kind {}",
-                row.principal_kind
-            ))
-        })?;
-        return Ok(kind);
+    let Some(row) = service_account_by_id(conn, id_uuid).await.ok().flatten() else {
+        return Err(not_found(target_id, tenant));
+    };
+    let stored = principal_kind_wire(&row.principal_kind).ok_or_else(|| {
+        internal_error(format!(
+            "principal {target_id} has unrecognized kind {}",
+            row.principal_kind
+        ))
+    })?;
+    if stored != kind {
+        return Err(not_found(target_id, tenant));
     }
+    revoke_service_account_principal(conn, id_uuid)
+        .await
+        .map_err(internal_error)?;
+    Ok(())
+}
 
-    Err(WyrdError::PrincipalNotFound {
+/// Build the single non-enumerating refusal shared by every miss.
+fn not_found(target_id: PrincipalId, tenant: DataTenantId) -> WyrdError {
+    WyrdError::PrincipalNotFound {
         message: format!("principal {target_id} not found in tenant {tenant}"),
         details: serde_json::json!({ "id": target_id.to_string() }),
-    })
+    }
 }
 
 fn internal_error(error: impl std::fmt::Display) -> WyrdError {
@@ -85,7 +102,7 @@ mod pg_tests {
     }
 
     #[tokio::test]
-    async fn user_revocation_returns_user_kind() {
+    async fn a_user_is_revoked_under_the_user_kind() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
@@ -95,15 +112,18 @@ mod pg_tests {
             .await
             .expect("user inserts");
 
-        let kind = revoke_principal_in_conn(&mut conn, PrincipalId::new(user_id), tenant)
-            .await
-            .expect("revocation succeeds");
-
-        assert_eq!(kind, PrincipalKindTag::User);
+        revoke_principal_in_conn(
+            &mut conn,
+            PrincipalId::new(user_id),
+            PrincipalKindTag::User,
+            tenant,
+        )
+        .await
+        .expect("revocation succeeds");
     }
 
     #[tokio::test]
-    async fn service_account_revocation_returns_service_kind() {
+    async fn a_service_account_is_revoked_under_the_service_kind() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
@@ -124,15 +144,56 @@ mod pg_tests {
         .await
         .expect("service account inserts");
 
-        let kind = revoke_principal_in_conn(&mut conn, PrincipalId::new(sa_id), tenant)
-            .await
-            .expect("revocation succeeds");
+        revoke_principal_in_conn(
+            &mut conn,
+            PrincipalId::new(sa_id),
+            PrincipalKindTag::Service,
+            tenant,
+        )
+        .await
+        .expect("revocation succeeds");
+    }
 
-        assert_eq!(kind, PrincipalKindTag::Service);
+    /// A declared kind that does not match the stored row must refuse exactly
+    /// like an unknown id, so the refusal cannot be read as "wrong table".
+    #[tokio::test]
+    async fn a_mismatched_kind_is_refused_as_not_found() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+
+        let creator = Uuid::new_v4();
+        let sa_id = Uuid::new_v4();
+        let card_ref = make_service_card_ref("svc-revoke-mismatch");
+        seed_backing_card(&mut conn, &card_ref, creator).await;
+        insert_service_account(
+            &mut conn,
+            sa_id,
+            "service",
+            Some(&card_ref),
+            "svc-revoke-mismatch",
+            None,
+            creator,
+        )
+        .await
+        .expect("service account inserts");
+
+        let result = revoke_principal_in_conn(
+            &mut conn,
+            PrincipalId::new(sa_id),
+            PrincipalKindTag::Agent,
+            tenant,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(WyrdError::PrincipalNotFound { .. })),
+            "a service account must not be revocable as an agent, got: {result:?}"
+        );
     }
 
     #[tokio::test]
-    async fn agent_service_account_revocation_returns_agent_kind() {
+    async fn an_agent_account_is_revoked_under_the_agent_kind() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
@@ -159,21 +220,26 @@ mod pg_tests {
         .await
         .expect("agent account inserts");
 
-        let kind = revoke_principal_in_conn(&mut conn, PrincipalId::new(sa_id), tenant)
-            .await
-            .expect("revocation succeeds");
-
-        assert_eq!(kind, PrincipalKindTag::Agent);
+        revoke_principal_in_conn(
+            &mut conn,
+            PrincipalId::new(sa_id),
+            PrincipalKindTag::Agent,
+            tenant,
+        )
+        .await
+        .expect("revocation succeeds");
     }
 
     #[tokio::test]
-    async fn unknown_principal_returns_not_found() {
+    async fn an_unknown_principal_is_not_found() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
 
         let unknown_id = PrincipalId::new(Uuid::new_v4());
-        let result = revoke_principal_in_conn(&mut conn, unknown_id, tenant).await;
+        let result =
+            revoke_principal_in_conn(&mut conn, unknown_id, PrincipalKindTag::Service, tenant)
+                .await;
 
         assert!(
             matches!(result, Err(WyrdError::PrincipalNotFound { .. })),

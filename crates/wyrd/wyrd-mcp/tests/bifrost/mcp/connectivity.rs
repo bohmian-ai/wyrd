@@ -98,6 +98,38 @@ pub(crate) fn transport(
     ))
 }
 
+/// Build the first-party tenant principal handle for `server` using `credential`.
+///
+/// Shares the exact auth stack [`transport`] gives the MCP client, so a journey
+/// that reaches for an HTTP-only operation — credential issuance, which MCP
+/// deliberately does not expose — still speaks as the same principal over the
+/// same credential path.
+///
+/// # Errors
+///
+/// Returns an error when the server is not bound to a listener or when the
+/// client cannot be constructed for `credential`.
+pub(crate) fn principals(
+    server: &WyrdTestServer,
+    credential: ResolvedCredential,
+) -> Result<wyrd_client::principals::Principals, McpJourneyError> {
+    let base_url = server
+        .base_url()
+        .ok_or("journey requires a bound test server")?
+        .to_owned();
+    let mut config = ClientConfig::default();
+    config.http.base_url = base_url;
+    config.token_cache = TokenCacheMode::InMemory;
+    let auth = AuthMiddleware::new(&config, credential)?;
+    let http = wyrd_client::transport::http::HttpTransport::new(
+        &config.http,
+        std::sync::Arc::clone(&auth),
+    )?;
+    Ok(wyrd_client::principals::Principals::with_client(
+        wyrd_client::WyrdClient::from_parts(auth, http, config.grpc),
+    ))
+}
+
 /// The modern, session-free MCP lifecycle: `server/discover` plus
 /// self-contained per-request protocol metadata.
 ///

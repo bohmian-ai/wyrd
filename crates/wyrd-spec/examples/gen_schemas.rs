@@ -8,7 +8,7 @@ use schemars::schema_for;
 use serde_json::{Map, Value, json, to_string_pretty};
 use wyrd_spec::auth::{
     AbsoluteUrl, CallbackQuery, IssuerUrl, LoginInitResponse, PrincipalKindTag,
-    RevokePrincipalRequest, RevokePrincipalResponse, TokenRequest, TokenResponse,
+    RevokePrincipalRequest, TokenRequest, TokenResponse,
 };
 use wyrd_spec::card::agent::AgentSpec;
 use wyrd_spec::card::artifact::{ArtifactSpec, FrameworkAdapterRef};
@@ -191,7 +191,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<CallbackQuery>(out, golden, "auth_callback_query")?;
     write::<PrincipalKindTag>(out, golden, "auth_principal_kind")?;
     write::<RevokePrincipalRequest>(out, golden, "auth_revoke_principal_request")?;
-    write::<RevokePrincipalResponse>(out, golden, "auth_revoke_principal_response")?;
 
     // Phase 4 section 16: shared security primitives.
     write::<SecretRef>(out, golden, "security_secret_ref")?;

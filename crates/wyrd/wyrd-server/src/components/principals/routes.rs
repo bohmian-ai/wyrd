@@ -24,7 +24,7 @@ use wyrd_spec::auth::{
     CreateServicePrincipalRequest, CreateServicePrincipalResponse, CredentialListResponse,
     CredentialMetadata, IssuedCredential, SecretBearer,
 };
-use wyrd_spec::error::WyrdError;
+use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::vala::api::AuditOutcome;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
@@ -204,9 +204,9 @@ async fn mint_credential(
     responses(
         (status = 200, description = "Principal created with its first credential, returned once",
          body = CreateServicePrincipalResponse),
-        (status = 401, description = "Authentication required"),
-        (status = 403, description = "Tenant principal administration required"),
-        (status = 422, description = "A requested role does not exist in this tenant")
+        (status = 401, description = "Authentication required", body = WyrdProblem),
+        (status = 403, description = "Tenant principal administration required", body = WyrdProblem),
+        (status = 422, description = "A requested role does not exist in this tenant", body = WyrdProblem)
     ),
     tag = "Principals"
 )]
@@ -285,8 +285,8 @@ async fn create_service_principal(
     responses(
         (status = 200, description = "Credential issued, plaintext returned once",
          body = IssuedCredential),
-        (status = 401, description = "Authentication required"),
-        (status = 403, description = "Tenant principal administration required")
+        (status = 401, description = "Authentication required", body = WyrdProblem),
+        (status = 403, description = "Tenant principal administration required", body = WyrdProblem)
     ),
     tag = "Principals"
 )]
@@ -321,8 +321,8 @@ async fn issue_credential(
     responses(
         (status = 200, description = "Non-secret credential metadata, newest first",
          body = CredentialListResponse),
-        (status = 401, description = "Authentication required"),
-        (status = 403, description = "Tenant principal administration required")
+        (status = 401, description = "Authentication required", body = WyrdProblem),
+        (status = 403, description = "Tenant principal administration required", body = WyrdProblem)
     ),
     tag = "Principals"
 )]
@@ -403,9 +403,9 @@ pub(crate) async fn list_credentials_for(
     ),
     responses(
         (status = 204, description = "Credential retired"),
-        (status = 401, description = "Authentication required"),
-        (status = 403, description = "Tenant principal administration required"),
-        (status = 404, description = "No live credential for this principal")
+        (status = 401, description = "Authentication required", body = WyrdProblem),
+        (status = 403, description = "Tenant principal administration required", body = WyrdProblem),
+        (status = 404, description = "No live credential for this principal", body = WyrdProblem)
     ),
     tag = "Principals"
 )]

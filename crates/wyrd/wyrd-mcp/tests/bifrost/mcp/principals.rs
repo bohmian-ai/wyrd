@@ -5,10 +5,10 @@
 //! credential and once with an administrative one — so what it observes about
 //! the catalog and the refusal is exactly what an agent observes.
 
-use crate::connectivity::{McpJourneyError, discover, problem, structured, transport};
+use crate::connectivity::{McpJourneyError, discover, principals, problem, structured, transport};
 
 mod pg_tests {
-    use super::{McpJourneyError, discover, problem, structured, transport};
+    use super::{McpJourneyError, discover, principals, problem, structured, transport};
 
     use rmcp::ClientServiceExt as _;
     use rmcp::model::CallToolRequestParams;
@@ -149,8 +149,130 @@ mod pg_tests {
             "a listing never carries secret material"
         );
 
-        admin_client.cancel().await?;
         reader_client.cancel().await?;
+
+        // Discover, act, observe: the authorized agent retires a credential and
+        // sees the retirement, which is the only proof that the write tool is a
+        // capability rather than a catalog entry.
+        //
+        // The reader is given a replacement first, so the credential being
+        // retired is a real non-current one and the assertion afterwards is
+        // about that credential rather than about the principal losing its last
+        // way in.
+        principals(
+            &server,
+            ResolvedCredential::ApiKey(admin_key.clone().into()),
+        )?
+        .issue_credential(&reader.id().to_string().parse()?)
+        .await?;
+
+        let before = structured(
+            admin_client
+                .call_tool(
+                    CallToolRequestParams::new(LIST_CREDENTIALS).with_arguments(
+                        serde_json::json!({ "principal_id": reader.id().to_string() })
+                            .as_object()
+                            .ok_or("arguments are an object")?
+                            .clone(),
+                    ),
+                )
+                .await?,
+        )?;
+        let listed = before
+            .get("credentials")
+            .and_then(serde_json::Value::as_array)
+            .ok_or("the listing carries credential metadata")?
+            .clone();
+        assert_eq!(listed.len(), 2, "both credentials are live: {before}");
+        assert!(
+            listed.iter().all(|entry| entry
+                .get("revoked_at")
+                .is_none_or(serde_json::Value::is_null)),
+            "nothing is retired yet: {before}"
+        );
+        // The oldest is the superseded one, which is what a rotation retires.
+        let doomed = listed
+            .last()
+            .and_then(|entry| entry.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or("a listed credential carries an id")?
+            .to_owned();
+
+        let revoked = admin_client
+            .call_tool(
+                CallToolRequestParams::new(REVOKE_CREDENTIAL).with_arguments(
+                    serde_json::json!({
+                        "principal_id": reader.id().to_string(),
+                        "credential_id": doomed,
+                    })
+                    .as_object()
+                    .ok_or("arguments are an object")?
+                    .clone(),
+                ),
+            )
+            .await?;
+        assert!(
+            revoked.is_error != Some(true),
+            "the authorized revocation succeeds: {revoked:?}"
+        );
+
+        // Observed, not assumed: the agent reads the retirement back through
+        // the same read tool it used before acting.
+        let after = structured(
+            admin_client
+                .call_tool(
+                    CallToolRequestParams::new(LIST_CREDENTIALS).with_arguments(
+                        serde_json::json!({ "principal_id": reader.id().to_string() })
+                            .as_object()
+                            .ok_or("arguments are an object")?
+                            .clone(),
+                    ),
+                )
+                .await?,
+        )?;
+        let observed = after
+            .get("credentials")
+            .and_then(serde_json::Value::as_array)
+            .ok_or("the listing carries credential metadata")?;
+        for entry in observed {
+            let retired = entry
+                .get("revoked_at")
+                .is_some_and(|value| !value.is_null());
+            let is_doomed = entry.get("id").and_then(serde_json::Value::as_str) == Some(&doomed);
+            assert_eq!(
+                retired, is_doomed,
+                "exactly the revoked credential is retired: {after}"
+            );
+        }
+
+        // Replaying it finds nothing left to retire, which is how an agent
+        // learns the first call was the one that took effect.
+        let replay = admin_client
+            .call_tool(
+                CallToolRequestParams::new(REVOKE_CREDENTIAL).with_arguments(
+                    serde_json::json!({
+                        "principal_id": reader.id().to_string(),
+                        "credential_id": doomed,
+                    })
+                    .as_object()
+                    .ok_or("arguments are an object")?
+                    .clone(),
+                ),
+            )
+            .await;
+        // A refusal reaches an agent either as a protocol error or as an error
+        // result, depending on how the transport frames it; both carry the same
+        // stable Wyrd code, which is what the agent actually reads.
+        let rendered = match replay {
+            Err(error) => error.to_string(),
+            Ok(result) => problem(result)?.to_string(),
+        };
+        assert!(
+            rendered.contains("NOT_FOUND"),
+            "a replayed revocation reports the credential is already gone: {rendered}"
+        );
+
+        admin_client.cancel().await?;
         Ok(())
     }
 }

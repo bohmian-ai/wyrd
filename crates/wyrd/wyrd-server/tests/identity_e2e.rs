@@ -564,14 +564,21 @@ async fn revocation_journey() {
     // Valid before revocation → real authenticated /v1 200.
     assert_v1_authz_check_ok(&srv, &target_token, "revoke").await;
 
-    // Admin revokes the target principal (server auto-detects kind).
+    // Admin revokes the target principal, naming its kind and the reason.
     let revoke_resp = srv
         .oneshot_authenticated(
             &admin_token,
             Request::builder()
                 .method(Method::POST)
                 .uri(format!("/v1/principals/{}/revoke", target.id()))
-                .body(Body::empty())
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "principal_kind": "service",
+                        "reason": "credential believed compromised"
+                    })
+                    .to_string(),
+                ))
                 .expect("revoke request builds"),
         )
         .await
@@ -652,7 +659,14 @@ async fn revocation_requires_admin_permission() {
             Request::builder()
                 .method(Method::POST)
                 .uri(format!("/v1/principals/{}/revoke", target.id()))
-                .body(Body::empty())
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "principal_kind": "service",
+                        "reason": "unauthorized attempt"
+                    })
+                    .to_string(),
+                ))
                 .expect("request builds"),
         )
         .await

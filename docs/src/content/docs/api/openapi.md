@@ -16,6 +16,8 @@ The repository OpenAPI document is `openapi.yaml`. Its current title is `Wyrd AP
 - `/auth/platform/login`
 - `/auth/platform/token`
 - `/platform/admins`
+- `/platform/admins/{principal_id}/credentials`
+- `/platform/admins/{principal_id}/credentials/{credential_id}`
 - `/platform/admins/{principal_id}/status`
 - `/platform/oidc/connection`
 - `/platform/tenants`

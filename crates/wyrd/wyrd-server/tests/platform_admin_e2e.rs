@@ -1884,3 +1884,151 @@ async fn an_operator_rotates_the_deployment_root_credential() {
         .expect("revoke responds");
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
+
+/// A tenant administrator ends a compromised identity outright and the reason
+/// survives in the audit record.
+///
+/// Principal revocation is the blunt instrument next to credential rotation,
+/// and the only part of it that cannot be reconstructed afterwards is why an
+/// operator reached for it. The journey therefore proves three things a
+/// generated client depends on: the declared kind selects the table, a reason
+/// that looks like a credential is refused rather than persisted, and an
+/// accepted reason is what the audit row carries.
+#[tokio::test]
+async fn a_tenant_revokes_a_compromised_principal_with_its_reason() {
+    if !e2e_enabled() {
+        return;
+    }
+    let srv = WyrdTestServer::start_in_process()
+        .await
+        .expect("server starts");
+    let admin = provisioned_tenant_admin(&srv, "compromised").await;
+
+    let resp = srv
+        .oneshot_authenticated(
+            &admin,
+            tenant_request(
+                Method::POST,
+                "/v1/principals",
+                Some(json!({ "name": "leaked-runner", "roles": ["reader"] })),
+            ),
+        )
+        .await
+        .expect("principal route responds");
+    let created = body_json(resp).await;
+    let principal_id = created["principal_id"]
+        .as_str()
+        .expect("principal id")
+        .to_owned();
+    let credential = created["credential"]
+        .as_str()
+        .expect("credential")
+        .to_owned();
+
+    // Minted now and deliberately unexercised: the verifier caches a
+    // principal's revocation epoch, so a request before the revocation would
+    // seed that cache and make the assertion after it pass on stale state.
+    let live_token = tenant_token(&srv, &credential)
+        .await
+        .expect("the credential mints a token");
+
+    let revoke = |body: serde_json::Value| {
+        srv.oneshot_authenticated(
+            &admin,
+            tenant_request(
+                Method::POST,
+                &format!("/v1/principals/{principal_id}/revoke"),
+                Some(body),
+            ),
+        )
+    };
+
+    let resp = revoke(json!({
+        "principal_kind": "service",
+        "reason": "Bearer eyJhbGciOiJIUzI1NiJ9.leaked"
+    }))
+    .await
+    .expect("revoke route responds");
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a secret-like reason is refused before anything is recorded"
+    );
+
+    let resp = revoke(json!({ "principal_kind": "user", "reason": "wrong table" }))
+        .await
+        .expect("revoke route responds");
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "the declared kind selects the table rather than hinting at it"
+    );
+
+    assert!(
+        tenant_token(&srv, &credential).await.is_ok(),
+        "neither refusal revoked anything"
+    );
+
+    let reason = "leaked-runner key found in a public build log";
+    let resp = revoke(json!({ "principal_kind": "service", "reason": reason }))
+        .await
+        .expect("revoke route responds");
+    assert_eq!(resp.status(), StatusCode::OK, "the revocation is accepted");
+
+    let resp = srv
+        .oneshot_authenticated(&live_token, tenant_request(Method::GET, "/v1/cards", None))
+        .await
+        .expect("cards route responds");
+    assert_ne!(
+        resp.status(),
+        StatusCode::OK,
+        "a token minted before the revocation stops authorizing"
+    );
+    // Revocation advances the principal's authorization epoch; it does not
+    // retire the credential, which stays the administrator's call.
+
+    // Two decisions, not three: the secret-like reason never reached the
+    // authorization boundary, while the wrong-kind attempt did and its allowed
+    // decision is durable even though the revocation behind it found nothing.
+    // Read past RLS on purpose: the assertion is about the durable audit row
+    // the server wrote, which no tenant-plane route projects.
+    let rows: Vec<Option<String>> = sqlx::query_scalar(
+        "SELECT detail FROM vala.audit_staging \
+          WHERE operation = 'auth.principal.revoke' AND resource = $1 \
+          ORDER BY seq",
+    )
+    .bind(format!("principal:{principal_id}"))
+    .fetch_all(
+        &srv.pg_fixture()
+            .superuser_pool()
+            .await
+            .expect("superuser pool opens"),
+    )
+    .await
+    .expect("the revocation decisions are audited");
+    // `detail` is stored as the canonical JSON string the audit hash is taken
+    // over, so it is parsed here rather than decoded as JSONB.
+    let decisions: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|row| {
+            row.map_or(serde_json::Value::Null, |text| {
+                serde_json::from_str(&text).expect("an audit detail is canonical JSON")
+            })
+        })
+        .collect();
+    assert_eq!(
+        decisions.len(),
+        2,
+        "only the attempts that were authorized are recorded: {decisions:?}"
+    );
+
+    let detail = decisions.last().expect("the accepted decision is last");
+    assert_eq!(detail["kind"], "principal_revocation");
+    assert_eq!(detail["reason"], reason);
+    assert_eq!(detail["principal_kind"], "service");
+    assert_eq!(detail["principal_id"], principal_id);
+    assert_eq!(
+        decisions[0]["principal_kind"], "user",
+        "the refused attempt recorded the kind its caller declared: {decisions:?}"
+    );
+}

@@ -34,8 +34,16 @@ paths:
                 $ref: '#/components/schemas/PlatformTokenResponse'
         '401':
           description: Identity not accepted, indistinguishably for every cause
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
         '503':
           description: Identity provider unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
       security: []
   /auth/platform/login:
     post:
@@ -62,8 +70,16 @@ paths:
                 $ref: '#/components/schemas/LoginInitResponse'
         '404':
           description: Federated login is not configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
         '503':
           description: Identity provider unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
       security: []
   /auth/platform/token:
     post:
@@ -94,6 +110,10 @@ paths:
                 $ref: '#/components/schemas/PlatformTokenResponse'
         '401':
           description: Credential rejected, indistinguishably for every cause
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
       security: []
   /platform/admins:
     get:
@@ -121,6 +141,10 @@ paths:
                 $ref: '#/components/schemas/PlatformPrincipalListResponse'
         '401':
           description: Platform session required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
     post:
       tags:
       - Platform
@@ -154,10 +178,22 @@ paths:
                 $ref: '#/components/schemas/RegisterPlatformAdminResponse'
         '401':
           description: Platform session required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
         '409':
           description: Name or matching claim already registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
         '422':
           description: No platform OIDC connection is configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
   /platform/admins/{principal_id}/credentials:
     get:
       tags:
@@ -184,8 +220,16 @@ paths:
                 $ref: '#/components/schemas/CredentialListResponse'
         '401':
           description: Platform session required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
         '403':
           description: Platform credential administration required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
     post:
       tags:
       - Platform
@@ -221,8 +265,16 @@ paths:
                 $ref: '#/components/schemas/IssuedCredential'
         '401':
           description: Platform session required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
         '403':
           description: Platform credential administration required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
   /platform/admins/{principal_id}/credentials/{credential_id}:
     delete:
       tags:
@@ -263,10 +315,22 @@ paths:
           description: Credential retired
         '401':
           description: Platform session required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
         '403':
           description: Platform credential administration required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
         '404':
           description: No live credential for this platform principal
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
   /platform/admins/{principal_id}/status:
     put:
       tags:
@@ -306,10 +370,22 @@ paths:
           description: Status changed
         '401':
           description: Platform session required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
         '404':
           description: Platform principal not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
         '409':
           description: Would leave the deployment with no active principal
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
   /platform/oidc/connection:
     get:
       tags:
@@ -329,8 +405,16 @@ paths:
                 $ref: '#/components/schemas/PlatformOidcConnectionView'
         '401':
           description: Platform session required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
         '404':
           description: No connection configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
     put:
       tags:
       - Platform
@@ -355,10 +439,22 @@ paths:
                 $ref: '#/components/schemas/PlatformOidcConnectionView'
         '401':
           description: Platform session required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
         '403':
           description: Platform identity administration required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
         '422':
           description: Issuer invalid, unreachable, or resolving to a blocked address
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
     delete:
       tags:
       - Platform
@@ -377,8 +473,16 @@ paths:
           description: Connection removed; the global credential still administers
         '401':
           description: Platform session required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
         '404':
           description: No connection configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
   /platform/tenants:
     post:
       tags:
@@ -404,10 +508,22 @@ paths:
                 $ref: '#/components/schemas/CreateTenantResponse'
         '401':
           description: Platform session required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
         '403':
           description: Tenant creation not granted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
         '409':
           description: Slug already in use by a live tenant
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
   /platform/tenants/admin/credentials:
     post:
       tags:
@@ -433,8 +549,22 @@ paths:
                 $ref: '#/components/schemas/ProvisionedTenantAdmin'
         '401':
           description: Platform session required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
         '403':
           description: Tenant administrative recovery not granted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '404':
+          description: No active tenant to recover, indistinguishably for every cause
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
   /v1/bifrost/tables:
     get:
       tags:
@@ -1170,10 +1300,22 @@ paths:
                 $ref: '#/components/schemas/CreateServicePrincipalResponse'
         '401':
           description: Authentication required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
         '403':
           description: Tenant principal administration required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
         '422':
           description: A requested role does not exist in this tenant
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
   /v1/principals/{principal_id}/credentials:
     get:
       tags:
@@ -1200,8 +1342,16 @@ paths:
                 $ref: '#/components/schemas/CredentialListResponse'
         '401':
           description: Authentication required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
         '403':
           description: Tenant principal administration required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
     post:
       tags:
       - Principals
@@ -1230,8 +1380,16 @@ paths:
                 $ref: '#/components/schemas/IssuedCredential'
         '401':
           description: Authentication required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
         '403':
           description: Tenant principal administration required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
   /v1/principals/{principal_id}/credentials/{credential_id}:
     delete:
       tags:
@@ -1276,10 +1434,22 @@ paths:
           description: Credential retired
         '401':
           description: Authentication required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
         '403':
           description: Tenant principal administration required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
         '404':
           description: No live credential for this principal
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
   /v1/principals/{principal_id}/revoke:
     post:
       tags:
@@ -1291,11 +1461,21 @@ paths:
         row commits on its own before the `tokens_not_before` bump, so the decision
         stays durable even when the revocation fails.
 
+        The request body is the contract, not decoration. Its `principal_kind`
+        selects the table the id is resolved in, and its `reason` is folded into
+        the audited decision, because the operator's justification is the one part
+        of a revocation that cannot be reconstructed afterwards. The reason is
+        screened by [`RevocationReason`] first, so a pasted credential is refused
+        rather than persisted.
+
         # Errors
         Returns [`WyrdError::PermissionDeniedRbac`] when the caller lacks
-        `service_accounts:write`, [`WyrdError::AuditUnavailable`] when the decision
-        cannot be recorded, and an internal error when the revocation transaction
-        cannot be acquired or committed.
+        `service_accounts:write`, [`WyrdError::MissingRequiredField`] when the
+        reason is empty, oversized, or secret-like, [`WyrdError::PrincipalNotFound`]
+        when no principal of that kind exists in the tenant,
+        [`WyrdError::AuditUnavailable`] when the decision cannot be recorded, and an
+        internal error when the revocation transaction cannot be acquired or
+        committed.
       operationId: revoke_principal
       parameters:
       - name: principal_id
@@ -1304,15 +1484,45 @@ paths:
         required: true
         schema:
           type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RevokePrincipalRequest'
+        required: true
       responses:
         '200':
           description: Outstanding tokens revoked, effective on the next request
+        '400':
+          description: Missing, oversized, or secret-like revocation reason
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
         '401':
           description: Authentication required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
         '403':
           description: Tenant principal administration required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
         '404':
-          description: No such principal in the caller's tenant
+          description: No such principal of that kind in the caller's tenant
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '503':
+          description: Revocation decision could not be audited
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
   /v1/query:
     post:
       tags:
@@ -3322,6 +3532,21 @@ components:
       type: string
       format: uuid
       description: Stable principal id on auth wire contracts.
+    PrincipalKindTag:
+      type: string
+      description: |-
+        Principal-kind discriminator without a bound card.
+
+        Serializes as a bare snake_case string (`"global_admin"`, `"tenant_admin"`,
+        `"user"`, `"service"`, `"agent"`); this is a stable wire contract for the
+        revoke request body, token claims, the revocation NOTIFY channel, and the
+        durable `principal_kind` columns.
+      enum:
+      - global_admin
+      - tenant_admin
+      - user
+      - service
+      - agent
     PromptSpec:
       allOf:
       - description: Native authored prompt. Provider-specific request shape lives here.
@@ -3501,6 +3726,20 @@ components:
     RequestId:
       type: string
       description: Request correlation ID; required to be a UUID v7.
+    RevokePrincipalRequest:
+      type: object
+      description: '`POST /v1/principals/{id}/revoke` body.'
+      required:
+      - principal_kind
+      - reason
+      properties:
+        principal_kind:
+          $ref: '#/components/schemas/PrincipalKindTag'
+          description: Required kind discriminator; principal ids are only unique with their table.
+        reason:
+          type: string
+          description: Required audit reason for the revocation.
+      additionalProperties: false
     RunningQueryLifecycleState:
       type: string
       description: |-

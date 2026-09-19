@@ -33,7 +33,7 @@ pub use platform_identity::{
 };
 pub use principal_id::{PLATFORM_AUDIT_PRINCIPAL, PrincipalId};
 pub use principal_kind::PrincipalKindTag;
-pub use revoke::{RevokePrincipalRequest, RevokePrincipalResponse};
+pub use revoke::{REASON_MAX_BYTES, RevokePrincipalRequest};
 pub use secret_bearer::SecretBearer;
 pub use tenant_admin::{
     CreateTenantRequest, CreateTenantResponse, PlatformTokenRequest, PlatformTokenResponse,

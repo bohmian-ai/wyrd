@@ -135,6 +135,11 @@ audit_detail_value!(
     "Idempotent, non-secret identifier for an ingest batch."
 );
 audit_detail_value!(
+    RevocationReason,
+    "revocation_reason",
+    "Operator-supplied, non-secret justification for revoking a principal."
+);
+audit_detail_value!(
     QueryAuditDigest,
     "query_audit_digest",
     "Stable non-secret digest used by a Bifrost query audit decision."
@@ -721,6 +726,26 @@ pub enum AuditDetail {
         principal_kind: PrincipalKindTag,
         /// Number of active refresh rows revoked.
         revoked_token_count: u64,
+    },
+    /// Operator-driven revocation of one principal's whole authorization epoch.
+    ///
+    /// The row exists to answer "who ended this identity, and why": the
+    /// operator's justification is the one part of the decision that cannot be
+    /// reconstructed from the surrounding state, so it is carried here rather
+    /// than left to the request log. The chain is folded in because this
+    /// detail replaces the attribution-only detail the boundary would
+    /// otherwise have written.
+    PrincipalRevocation {
+        /// Principal whose outstanding tokens were revoked.
+        principal_id: PrincipalId,
+        /// Kind the caller declared, and the table the revocation resolved in.
+        principal_kind: PrincipalKindTag,
+        /// Operator-supplied justification, screened for secrets.
+        reason: RevocationReason,
+        /// Verified initiator-first delegation chain, empty and omitted when
+        /// the caller presented no `act` claim.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        delegation_chain: Vec<AuditDelegationStep>,
     },
     /// Authorization decision metadata.
     AuthzCheck {

@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use assert_cmd::prelude::*;
 use axum::Router;
 use axum::extract::{Request, State};
-use axum::http::{StatusCode, header};
+use axum::http::StatusCode;
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::IntoResponse;
 use axum::routing::post;
@@ -16,6 +16,9 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use crate::eval_support::{spec, write_eval_card};
 
 type CapturedRequest = (String, Option<String>, Option<String>);
+
+/// Header carrying a run's lease, as the server reads it.
+const EVAL_LEASE_HEADER: &str = "x-wyrd-eval-lease";
 
 #[derive(Clone, Default)]
 struct TestState {
@@ -29,9 +32,9 @@ async fn capture_headers(
     next: Next,
 ) -> axum::response::Response {
     let path = req.uri().path().to_owned();
-    let auth = req
+    let lease = req
         .headers()
-        .get(header::AUTHORIZATION)
+        .get(EVAL_LEASE_HEADER)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
     let access = req
@@ -39,7 +42,7 @@ async fn capture_headers(
         .get("x-wyrd-access-token")
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
-    state.captured.lock().await.push((path, auth, access));
+    state.captured.lock().await.push((path, lease, access));
     next.run(req).await
 }
 
@@ -151,9 +154,9 @@ async fn server_protocol_carries_lease_after_open() {
         })
         .collect();
     assert!(!protected.is_empty(), "expected post-open protocol calls");
-    for (_, auth, _) in protected {
+    for (_, lease, _) in protected {
         assert_eq!(
-            auth.as_deref(),
+            lease.as_deref(),
             Some("Bearer cli-lease-token"),
             "post-open calls must carry the lease token"
         );

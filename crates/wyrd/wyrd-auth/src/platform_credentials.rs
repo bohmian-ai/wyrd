@@ -429,10 +429,14 @@ mod pg_tests {
 
     /// Revocation takes effect on the very next request.
     ///
-    /// The platform plane issues no access tokens, so it has no authorization
-    /// epoch to advance and no cached verifier to outlive a revocation: every
-    /// request re-verifies the credential against the store. A revoked
-    /// credential that worked a moment ago stops working immediately.
+    /// The platform plane caches nothing. Its session token is verified for
+    /// signature and scope, and then every request re-reads the credential
+    /// record, its principal, and the principal's grant from the store, so a
+    /// revoked credential that worked a moment ago stops working immediately.
+    /// That is why this plane needs no revocation epoch: the tenant plane
+    /// advances one because it caches verified tokens and a cached verification
+    /// would otherwise outlive the revocation, and there is no such cache here
+    /// to invalidate.
     #[tokio::test]
     async fn revocation_takes_effect_on_the_next_request() {
         let fixture = PgFixture::start().await.expect("fixture starts");

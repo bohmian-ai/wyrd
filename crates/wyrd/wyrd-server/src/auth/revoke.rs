@@ -26,6 +26,18 @@ use wyrd_sql::TenantConn;
 /// `service_accounts:write`, [`WyrdError::AuditUnavailable`] when the decision
 /// cannot be recorded, and an internal error when the revocation transaction
 /// cannot be acquired or committed.
+#[utoipa::path(
+    post,
+    path = "/v1/principals/{principal_id}/revoke",
+    params(("principal_id" = String, Path, description = "Principal whose tokens stop working")),
+    responses(
+        (status = 200, description = "Outstanding tokens revoked, effective on the next request"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Tenant principal administration required"),
+        (status = 404, description = "No such principal in the caller's tenant")
+    ),
+    tag = "Principals"
+)]
 pub async fn revoke_principal(
     State(state): State<AppState>,
     caller: Caller,

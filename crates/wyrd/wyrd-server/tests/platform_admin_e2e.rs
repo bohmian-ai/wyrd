@@ -20,6 +20,12 @@ use serde_json::{Value, json};
 use wyrd_server::boot::init::{InitError, initialize_platform_root};
 use wyrd_testing::WyrdTestServer;
 
+/// The one header every Wyrd plane authenticates on.
+///
+/// Spelled here rather than imported because the server keeps it private: a test
+/// that hard-codes it fails if the wire name ever changes, which is the point.
+const WYRD_ACCESS_TOKEN_HEADER: &str = "x-wyrd-access-token";
+
 /// Skip unless the gated end-to-end lane is selected.
 fn e2e_enabled() -> bool {
     env::var("WYRD_AUTH_E2E").is_ok()
@@ -39,7 +45,7 @@ fn platform_post(uri: &str, session: &str, body: Value) -> Request<Body> {
         .method(Method::POST)
         .uri(uri)
         .header(header::CONTENT_TYPE, "application/json")
-        .header(header::AUTHORIZATION, format!("Bearer {session}"))
+        .header(WYRD_ACCESS_TOKEN_HEADER, format!("Bearer {session}"))
         .body(Body::from(serde_json::to_vec(&body).expect("serializes")))
         .expect("request builds")
 }
@@ -195,7 +201,7 @@ async fn the_two_control_planes_cannot_reach_each_other() {
             .uri("/platform/tenants")
             .header(header::CONTENT_TYPE, "application/json");
         if let Some(value) = authorization {
-            builder = builder.header(header::AUTHORIZATION, value);
+            builder = builder.header(WYRD_ACCESS_TOKEN_HEADER, value);
         }
         builder
             .body(Body::from(
@@ -237,7 +243,7 @@ async fn the_two_control_planes_cannot_reach_each_other() {
             Request::builder()
                 .method(Method::GET)
                 .uri("/v1/cards")
-                .header(header::AUTHORIZATION, format!("Bearer {session}"))
+                .header(WYRD_ACCESS_TOKEN_HEADER, format!("Bearer {session}"))
                 .body(Body::empty())
                 .expect("request builds"),
         )
@@ -852,7 +858,7 @@ fn platform_request(
     let builder = Request::builder()
         .method(method)
         .uri(uri)
-        .header(header::AUTHORIZATION, format!("Bearer {session}"));
+        .header(WYRD_ACCESS_TOKEN_HEADER, format!("Bearer {session}"));
     match body {
         Some(body) => builder
             .header(header::CONTENT_TYPE, "application/json")

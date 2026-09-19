@@ -242,6 +242,12 @@ async fn seed_eval(state: &AppState, tenant: DataTenantId, space: &str, name: &s
     card_ref(CardKind::Eval, space, name)
 }
 
+/// Header carrying a run's lease, as the eval routes read it.
+///
+/// Spelled here rather than imported because the server keeps it private: a test
+/// that hard-codes it fails if the wire name ever changes, which is the point.
+const EVAL_LEASE_HEADER: &str = "x-wyrd-eval-lease";
+
 async fn call(
     server: &WyrdTestServer,
     method: &str,
@@ -258,7 +264,7 @@ async fn call(
         builder = builder.header("x-wyrd-access-token", format!("Bearer {token}"));
     }
     if let Some(lease) = lease {
-        builder = builder.header(header::AUTHORIZATION, format!("Bearer {lease}"));
+        builder = builder.header(EVAL_LEASE_HEADER, format!("Bearer {lease}"));
     }
     let response = server
         .oneshot(
@@ -284,14 +290,14 @@ async fn open_body(eval_ref: &CardRef) -> Value {
     json!({ "eval_ref": eval_ref, "simulated_user": "client" })
 }
 
-/// Issue a request with a valid JWT but a caller-controlled raw `Authorization`
-/// header, so the lease scheme (non-`Bearer`) can be exercised — the standard
-/// `call` helper always prefixes `Bearer`.
+/// Issue a request with a valid JWT but a caller-controlled raw lease header, so
+/// the lease scheme (non-`Bearer`) can be exercised — the standard `call` helper
+/// always prefixes `Bearer`.
 async fn call_with_raw_lease(
     server: &WyrdTestServer,
     uri: &str,
     token: &str,
-    authorization: &str,
+    lease: &str,
     body: Value,
 ) -> (StatusCode, Value) {
     let response = server
@@ -301,7 +307,7 @@ async fn call_with_raw_lease(
                 .uri(uri)
                 .header(header::CONTENT_TYPE, "application/json")
                 .header("x-wyrd-access-token", format!("Bearer {token}"))
-                .header(header::AUTHORIZATION, authorization)
+                .header(EVAL_LEASE_HEADER, lease)
                 .body(Body::from(body.to_string()))
                 .expect("request builds"),
         )

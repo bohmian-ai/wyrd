@@ -36,6 +36,7 @@ paths:
           description: Identity not accepted, indistinguishably for every cause
         '503':
           description: Identity provider unavailable
+      security: []
   /auth/platform/login:
     post:
       tags:
@@ -63,6 +64,7 @@ paths:
           description: Federated login is not configured
         '503':
           description: Identity provider unavailable
+      security: []
   /auth/platform/token:
     post:
       tags:
@@ -92,6 +94,7 @@ paths:
                 $ref: '#/components/schemas/PlatformTokenResponse'
         '401':
           description: Credential rejected, indistinguishably for every cause
+      security: []
   /platform/admins:
     get:
       tags:
@@ -1168,6 +1171,39 @@ paths:
           description: Tenant principal administration required
         '404':
           description: No live credential for this principal
+  /v1/principals/{principal_id}/revoke:
+    post:
+      tags:
+      - Principals
+      summary: Revoke one principal's outstanding tokens under the caller's tenant.
+      description: |-
+        Revocation is an administrative authorization boundary: the
+        `service_accounts:write` verdict is audited for both outcomes. The allowed
+        row commits on its own before the `tokens_not_before` bump, so the decision
+        stays durable even when the revocation fails.
+
+        # Errors
+        Returns [`WyrdError::PermissionDeniedRbac`] when the caller lacks
+        `service_accounts:write`, [`WyrdError::AuditUnavailable`] when the decision
+        cannot be recorded, and an internal error when the revocation transaction
+        cannot be acquired or committed.
+      operationId: revoke_principal
+      parameters:
+      - name: principal_id
+        in: path
+        description: Principal whose tokens stop working
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Outstanding tokens revoked, effective on the next request
+        '401':
+          description: Authentication required
+        '403':
+          description: Tenant principal administration required
+        '404':
+          description: No such principal in the caller's tenant
   /v1/query:
     post:
       tags:
@@ -4493,6 +4529,14 @@ components:
           type: string
           description: Problem type URI.
       additionalProperties: false
+  securitySchemes:
+    wyrdAccessToken:
+      type: apiKey
+      in: header
+      name: X-Wyrd-Access-Token
+      description: Wyrd access token as `Bearer <token>`. A tenant access token and a platform session travel on this same header; which plane a token reaches is decided by its scope and by the route, never by the header.
+security:
+- wyrdAccessToken: []
 tags:
 - name: Bifrost
   description: Bounded Bifrost query transport

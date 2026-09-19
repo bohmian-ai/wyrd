@@ -6,7 +6,7 @@ spec_revision: 7
 reviews: changes/active/admin-principals/review/task-008-r2/
 obligations: [REQ-036, REQ-038, REQ-040, REQ-047, INV-002, INV-015, AC-013, AC-014]
 findings: [FIND-008-8, FIND-008-9, FIND-008-10, FIND-008-11, FIND-008-12, FIND-008-13, FIND-008-14]
-status: open
+status: implemented
 ---
 
 ## Subject
@@ -428,3 +428,85 @@ any `--all-features` workspace lane) as evidence for any criterion above.
 - `architecture/wyrd-design.md` (lines 495-507 for the canonical header)
 - `architecture/references/languages/implementation-execution.md`
 - `architecture/references/languages/testing-workflows.md`
+
+---
+
+## Implementation Evidence
+
+Commits `9fe02aa2e` (FIND-008-8, -9, -10, -11, -12, -14) and `67c9d2df6`
+(FIND-008-13).
+
+| # | Criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|---|
+| 1 | The four unreachable variants are gone | `crates/wyrd/wyrd-cli/src/error.rs` — `AuthFailed`, `RevokeFailed`, `AdminFailed`, `IssueKeyFailed` deleted with their attributes; no import became unused | `mise run lints` (workspace, `--all-targets`); `mise run codegen:check` | PASS |
+| 2 | The workflow page authenticates on the canonical header | `docs/src/content/docs/for-agents/workflow.svx:28,59,81` | `grep -rn 'Authorization: Bearer' docs/src/content/docs/` → no matches; `mise run docs:check` | PASS |
+| 3 | Both live `BadTokenFormat` mappers and the fixture name the canonical header | `crates/wyrd/wyrd-server/src/http/error.rs:202`, `crates/wyrd/wyrd-auth/src/error.rs:35`, `crates/wyrd-spec/src/error.rs:4168` — all now `"X-Wyrd-Access-Token is not a compact Wyrd JWT"`, reusing `token_extract::bad_token_format`'s wording; code, status and remediation untouched | `grep -rni '"authorization header' crates/` → no matches; `cargo nextest run -p wyrd-spec --lib -E 'test(/error::tests::/)'` (17 passed). No test exists for either mapper's `detail` (`nextest list -p wyrd-server --lib \| grep http::error::tests` → 0), so the grep plus the journeys are the proof. | PASS |
+| 4 | The login refusal carries no part of the paste | `crates/wyrd/wyrd-cli/src/auth/login.rs` — `value` is now `<missing code>` / `<missing state>` / `<missing code and state>` | `cargo nextest run -p wyrd-cli --lib -E 'test(/auth::login::tests::/)'` — new `the_refusal_does_not_echo_the_pasted_callback` asserts the rendered error contains neither the code value nor `code=super`; it fails against the previous arm | PASS |
+| 5 | Both touched fallible functions document intent and errors | `login.rs::parse_callback_input` (why the paste is never echoed) and `components/eval/routes.rs::check_lease` (all four missing-lease paths and the invalid-lease path) | `mise run lints`; inspection against AGENTS.md §16. No untouched item gained documentation. | PASS |
+| 6 | A journey issues a credential through the CLI and spends it | `crates/wyrd/wyrd-cli/tests/auth_issue_key_journey.rs`, registered in `tests/cli.rs`; reuses `principal_journey`'s harness, generalized to `run_cli_with_credential` | `WYRD_CLI_E2E=1 mise run test:cli:journey` — 23 passed, 5 ignored. Sensitivity confirmed: tampering the captured key fails the second call with `WYRD_AUTH_401_API_KEY_INVALID` at the reuse assertion. | PASS |
+| 7 | No `cli:dev-bootstrap` task, no `wyrd dev bootstrap` caller | `mise.toml` | `grep -n 'dev-bootstrap' mise.toml` → no matches | PASS |
+| 8 | Nothing preserved changed; no prohibited change or non-goal entered | no `sdks/`, Python or TypeScript file changed; no new check, dependency, abstraction or harness; no `#[allow]`, `#[ignore]`, or weakened test | `git diff --stat main..HEAD` for the two commits; `mise run check:client-tier`, `check:sdk-client-tier`, `check:unwrap-audit`, `codegen:check`, `docs:check` | PASS |
+
+### Two defects FIND-008-13's journey found on its first run
+
+Both are in `wyrd auth issue-key`, the command the finding names, and both made
+the criterion unprovable rather than merely unproven:
+
+1. **`clap` refused to build the subcommand.** `cli.rs` sets
+   `propagate_version = true`, so `--version` reaches every subcommand, and
+   `IssueKeyArgs` declares its own `--version` for the bound card. Parsing
+   `auth issue-key` panicked in `clap`'s debug asserts. The command's own unit
+   tests build a bare `Parser` wrapper that never receives the propagated flag,
+   which is why three of them passed against an unusable command. Fixed with
+   `#[command(disable_version_flag = true)]`, the pattern every card-selecting
+   command in `card.rs` already uses, plus `cli::tests::the_shipped_command_tree_is_consistent`
+   (`Cli::command().debug_assert()`) so the whole real tree is checked once.
+2. **`issue-key` could resolve no registered principal.**
+   `service_account_by_card_ref` matched `card_ref = $3` — whole-document JSONB
+   equality — while a stored binding carries the registered Card's `uid` and a
+   client can only name `space/Kind/name@version`. The lookup now matches by
+   containment (`card_ref @> $3`), which the existing
+   `auth_service_accounts_card_ref_gin` index serves, with `ORDER BY created_at,
+   id LIMIT 1` so an anomalous duplicate resolves deterministically the way
+   `tenant_admin_principal_id` does. Fixed at the shared query, so
+   `exchange_api_key` and `jwt_bearer` — the other two callers, both also fed
+   uid-free refs — are fixed with it. The durable key `(card_kind, card_uid)` is
+   unchanged.
+
+Also corrected in passing: `--kind`'s help gave lowercase examples
+(`e.g. service, agent`) that `CardRef` parsing rejects.
+
+### Pre-existing failure, not from this change
+
+`wyrd-server::auth_e2e::cache_ttl_path_also_flips_verdict` fails with
+`WYRD_AUTH_503_VERIFY_UNAVAILABLE` from `srv.delegate(...)`. Confirmed
+pre-existing by checking out `HEAD~1`'s `service_accounts.rs` and reproducing the
+same failure with the containment change absent. The other 42 tests in the same
+run — `identity_e2e`, the rest of `auth_e2e`, and all 17 of `platform_admin_e2e`
+— pass. Not remediated here: it is outside this task's write set and needs its
+own diagnosis.
+
+### Commands run
+
+```bash
+mise run fmt
+mise run lints
+mise run check:client-tier
+mise run check:sdk-client-tier
+mise run check:unwrap-audit
+mise run codegen:check
+mise run docs:check
+mise exec -- cargo nextest run --locked -p wyrd-cli --lib -E 'test(/auth::login::tests::/)'
+mise exec -- cargo nextest run --locked -p wyrd-cli --lib \
+  -E 'test(=cli::tests::the_shipped_command_tree_is_consistent) + test(/auth::issue_key::tests::/)'
+mise exec -- cargo nextest run --locked -p wyrd-spec --lib -E 'test(/error::tests::/)'
+mise exec -- cargo nextest run --locked -p wyrd-auth --lib \
+  -E 'test(/issue_api_key::tests::/) + test(/exchange_api_key::tests::/)'
+mise exec -- cargo nextest run --locked -p wyrd-server --lib \
+  -E 'test(/components::auth::platform_extractor::tests::/) + test(/components::auth::routes::tests::/)'
+WYRD_CLI_E2E=1 mise run test:cli:journey
+WYRD_AUTH_E2E=1 scripts/postgres/with-test-postgres.sh -- bash -lc \
+  'mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-server \
+   --test identity_e2e --test auth_e2e --test platform_admin_e2e'
+git diff --check
+```

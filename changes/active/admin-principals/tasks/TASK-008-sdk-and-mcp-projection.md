@@ -40,28 +40,27 @@ was omitted. Spec revision 7 was approved for exactly this closeout.
 
 ### Scope removed at revision 7
 
-Python and TypeScript administrative bindings are **not** an obligation of this
-change and must not be added. Both SDKs are workload-runtime surfaces — they
-exist for workloads already provisioned — while credential creation is a
-provisioning-time act by an operator or control plane. The Python package
-already reaches every administrative operation through `wyrd.cli.run_wyrd_cli`,
-the in-process CLI it ships. `AC-014` is now discharged by the generated
-contract plus the Rust SDK.
+The administrative client surfaces this change builds and proves are the **CLI
+and MCP**. Administration is an operator and agent act: the operator reaches it
+through the CLI, the agent through MCP.
 
-### Administrative client surfaces are the CLI and MCP only
+**No Python or TypeScript administrative binding is added.** Both packages are
+workload-runtime surfaces — they exist for workloads already provisioned — while
+credential creation is a provisioning-time act. The Python package already
+reaches every administrative operation through `wyrd.cli.run_wyrd_cli`, the
+in-process CLI it ships. Neither package contains an administrative binding
+today; none is to be created.
 
-No language SDK carries an administrative surface. Administration is an operator
-and agent act: the operator reaches it through the CLI, the agent through MCP. A
-language binding for it has no user the CLI does not already serve.
+**The Rust SDK is untouched.** It re-exports `wyrd-client` wholesale and that
+re-export stays; the CLI may need it. What is deleted is
+`sdks/wyrd-sdk-rust/tests/principals.rs` and `tests/platform.rs`: both were
+`#[ignore]`-gated and no `mise` lane ran them — `test:wyrd-sdk` is `--lib` only
+— so journeys that were supposed to discharge `AC-014` had never executed.
+Unrun tests do not earn their place.
 
-`sdks/wyrd-sdk-rust/tests/principals.rs` and `tests/platform.rs` are deleted.
-They were `#[ignore]`-gated and no `mise` lane ran them — `test:wyrd-sdk` is
-`--lib` only — so the journeys that were supposed to discharge `AC-014` had
-never executed. Unrun tests for a surface with no user do not earn their place.
-
-`wyrd-client` **keeps** `Principals` and `Platform`. They are not SDK surface:
-`REQ-047` requires every Wyrd-owned caller to go through the shared client, and
-the CLI is that caller. Scenario 3 is what gives them a real consumer.
+`wyrd-client` **keeps** `Principals` and `Platform`. `REQ-047` requires every
+Wyrd-owned caller to go through the shared client, and the CLI is that caller.
+Scenario 3 is what gives them a real consumer.
 
 ## Outcome and Value
 
@@ -98,9 +97,10 @@ Maps `REQ-036`, `REQ-040`, `REQ-047`, `INV-013`, `INV-014`, `INV-015`,
 
 **Prohibited changes.**
 
-- Do not add an administrative surface to any language SDK — Rust, Python, or
-  TypeScript. No PyO3 wrapper, no napi binding, no `.pyi` or `.d.ts`
-  administrative surface, and no reinstated SDK administrative journey.
+- Do not add a Python or TypeScript administrative binding: no PyO3 wrapper, no
+  napi binding, no `.pyi` or `.d.ts` administrative surface. Do not reinstate
+  the deleted Rust SDK administrative journeys. The Rust SDK's existing
+  `wyrd-client` re-export is not in scope and must not be narrowed here.
 - Do not route the platform plane through `AuthenticatedPrincipal`. It wraps
   `Arc<VerifiedToken>`, which is tenant-shaped — non-optional `tenant_id`, roles,
   delegation chain. Threading the platform plane through it would require a
@@ -285,8 +285,8 @@ review against `INV-013` at revision 7 plus the unchanged platform journey.
   call, through a lane that actually runs.
 - A tenant-scope caller cannot invoke a platform-plane operation through the CLI
   or an MCP tool; the refusal is the stable contract error.
-- No language SDK exposes an administrative surface, and no unrun administrative
-  journey remains in the tree.
+- No Python or TypeScript administrative binding exists, and no unrun
+  administrative journey remains in the tree.
 - MCP administrative write tools are unavailable without their explicit scope
   and available with it; read tools remain available.
 

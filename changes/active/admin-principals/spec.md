@@ -626,12 +626,13 @@ documents. These amendments are part of the change.
   implementable by an independent client: the generated OpenAPI document
   declares every administrative path, its typed bodies, its stable error codes,
   and the authentication scheme those paths require. The CLI and MCP exercise
-  those operations against a real server. No language SDK carries an
-  administrative surface: administration is an operator and agent act, reached
-  through the CLI and MCP, and a language binding for it has no user that the
-  CLI does not already serve. `wyrd-client` retains the shared implementation
-  because `REQ-047` requires the CLI to call through it, not because an SDK
-  projects it.
+  those operations against a real server, and they are the administrative
+  surfaces this change builds and proves: administration is an operator and
+  agent act, and a Python or TypeScript binding for it has no user the CLI does
+  not already serve. `wyrd-client` retains the shared implementation because
+  `REQ-047` requires the CLI to call through it; the Rust SDK's existing
+  re-export of that crate is unaffected and carries no separate administrative
+  surface of its own.
 
 ## Material constraints
 
@@ -733,9 +734,9 @@ None. Every decision raised during drafting has been resolved by the author.
   bindings and is re-grounded on the generated contract plus the Rust SDK.
   `REQ-036` now requires the generated contract to declare its authentication
   scheme. `REQ-047` requires every Wyrd-owned caller to use `wyrd-client`.
-  No language SDK carries an administrative surface; the CLI and MCP are the
-  only administrative client surfaces, and the unrun Rust SDK administrative
-  journeys are deleted.
+  The CLI and MCP are the administrative client surfaces this change builds and
+  proves; no Python or TypeScript administrative binding is added, and the unrun
+  Rust SDK administrative journeys are deleted.
   `INV-015` makes `X-Wyrd-Access-Token` the one authentication header on every
   plane and states that plane separation is carried by token claims and
   extractor type, not by header choice. `INV-013` is restated so each plane's

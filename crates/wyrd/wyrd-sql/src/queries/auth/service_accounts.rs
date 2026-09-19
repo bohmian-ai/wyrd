@@ -173,10 +173,15 @@ pub async fn delete_service_account(
 
 /// Find an active Service/Agent principal by card ref.
 ///
-/// Binds the caller's ref as JSONB for [`SERVICE_ACCOUNT_BY_CARD_REF_SQL`],
-/// whose documentation carries what the predicate does and does not bound. The
-/// durable key remains `(card_kind, card_uid)`; this is the lookup for the
-/// identity a client can express, and the GIN index on `card_ref` serves it.
+/// Binds the caller's ref as JSONB for a `card_ref @> $3` containment
+/// predicate, so a ref carrying no `uid` matches a stored ref that has one and
+/// a ref carrying no space matches a row in any space. The containment
+/// predicate alone does not bound the match to one row: the table's
+/// `UNIQUE (data_tenant_id, name)` and the `auth_projection` trigger keeping
+/// `name` equal to `card_ref->>'name'` do, and `ORDER BY created_at, id
+/// LIMIT 1` is the stable fallback if either is relaxed. The durable key
+/// remains `(card_kind, card_uid)`; this is the lookup for the identity a
+/// client can express, and the GIN index on `card_ref` serves it.
 ///
 /// # Errors
 /// Returns the database error when the read fails.

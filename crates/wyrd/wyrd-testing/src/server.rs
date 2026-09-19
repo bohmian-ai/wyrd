@@ -2619,15 +2619,17 @@ impl WyrdTestServer {
         })
     }
 
-    /// Seed a Service/Agent principal whose `card_ref` matches `card_ref` exactly.
+    /// Seed a Service/Agent principal under the client-expressible `card_ref`.
     ///
     /// Workload bindings resolve to a server-owned `CardRef` with `uid = None`
     /// (boot's `build_workload_bindings`), and the jwt-bearer exchange looks the
-    /// principal up by exact JSONB `card_ref` equality. The role-bearing
-    /// `bootstrap_service` helper mints a random `uid`, so it can never match a
-    /// binding. This registers the bound Card and seeds a principal under the
-    /// binding's exact `card_ref`, so a config-driven workload journey resolves
-    /// to a real account and its token mint can walk the registered card scope.
+    /// principal up by JSONB containment, so the stored ref must not carry a
+    /// `uid` the binding cannot express. The role-bearing `bootstrap_service`
+    /// helper mints a random `uid` onto the principal itself, so containment
+    /// against a uid-less binding can never select it. This registers the bound
+    /// Card under its own `uid` and seeds the principal under the binding's
+    /// uid-less ref, so a config-driven workload journey resolves to a real
+    /// account and its token mint can walk the registered card scope.
     ///
     /// # Errors
     /// Returns an error when the card kind is not Service/Agent, or SQL fails.
@@ -2643,7 +2645,7 @@ impl WyrdTestServer {
     /// Seed a Service/Agent principal under an explicit tenant.
     ///
     /// The tenant-scoped analogue of [`Self::seed_card_principal`]: the same
-    /// exact-`card_ref` seed, written through the supplied tenant's
+    /// uid-less `card_ref` seed, written through the supplied tenant's
     /// [`TenantConn`]. Multi-tenant isolation tests use this to seed a bound
     /// workload only in tenant A.
     ///
@@ -2668,7 +2670,7 @@ impl WyrdTestServer {
         let creator_id = self.ensure_fixture_admin_for(tenant_id).await?;
         let mut conn = self.tenant_conn_for(tenant_id).await?;
         // The registry row needs its own uid, while the principal keeps the
-        // binding's uid-less `card_ref` for the exact JSONB lookup.
+        // binding's uid-less `card_ref` so JSONB containment selects it.
         let registered = CardRef {
             uid: Some(
                 CardUid::new(Uuid::now_v7().to_string())

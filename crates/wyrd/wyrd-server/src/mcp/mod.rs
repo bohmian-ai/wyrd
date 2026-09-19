@@ -125,20 +125,30 @@ impl WyrdMcpHandler {
         Ok(Caller::from_authenticated(&principal, request_id))
     }
 
-    /// The tools this handler advertises and accepts.
+    /// The tools this handler advertises to every authenticated caller.
     ///
     /// Ordinary startup — production and an ordinary `WyrdTestServer` alike —
-    /// advertises exactly the three read-only Bifrost tools. The test-support
-    /// context probe joins that catalog only when a test server explicitly
-    /// opted into it, so compiling `test-support` is not enough to expose it.
+    /// advertises the three read-only Bifrost tools followed by the read-only
+    /// principal credential listing. Write tools are per caller and the
+    /// test-support probe is opt-in, so neither belongs here.
     fn catalog(&self) -> Vec<Tool> {
         let mut catalog = bifrost::descriptors();
         catalog.extend(principals::descriptors_unscoped());
+        catalog
+    }
+
+    /// The test-support context probe, when this server opted into it.
+    ///
+    /// Kept out of [`Self::catalog`] so the probe trails the complete shipped
+    /// catalog — read tools, then the caller's write tools — rather than
+    /// splitting it. Compiling `test-support` is not enough to expose it; a
+    /// test server must ask for it explicitly.
+    fn probe_descriptors(&self) -> Vec<Tool> {
         #[cfg(feature = "test-support")]
         if self.state.mcp_context_probe {
-            catalog.push(probe::descriptor());
+            return vec![probe::descriptor()];
         }
-        catalog
+        Vec::new()
     }
 }
 
@@ -160,6 +170,7 @@ impl ServerHandler for WyrdMcpHandler {
         self.catalog()
             .into_iter()
             .chain(principals::write_descriptors())
+            .chain(self.probe_descriptors())
             .find(|tool| tool.name == name)
     }
 
@@ -182,6 +193,7 @@ impl ServerHandler for WyrdMcpHandler {
         {
             catalog.extend(principals::write_descriptors());
         }
+        catalog.extend(self.probe_descriptors());
         Ok(ListToolsResult::with_all_items(catalog))
     }
 

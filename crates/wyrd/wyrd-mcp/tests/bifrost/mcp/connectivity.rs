@@ -178,6 +178,8 @@ mod pg_tests {
                 "bifrost.list_tables",
                 "bifrost.describe_table",
                 "bifrost.query",
+                "principals.list_credentials",
+                "principals.revoke_credential",
                 probe::TOOL_NAME,
             ],
             "an opted-in fixture advertises the context probe after the ordinary catalog"

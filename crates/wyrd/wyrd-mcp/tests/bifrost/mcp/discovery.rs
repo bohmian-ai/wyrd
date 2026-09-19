@@ -19,15 +19,18 @@ mod pg_tests {
     use wyrd_testing::WyrdTestServer;
     use wyrd_testing::bifrost::seed_query_fixture;
 
-    /// The exact catalog an ordinary Wyrd server advertises over `/mcp`.
-    const BIFROST_TOOLS: [&str; 3] = [
+    /// The exact catalog an ordinary Wyrd server advertises over `/mcp` to a
+    /// caller that also holds tenant principal administration.
+    const ADVERTISED_TOOLS: [&str; 5] = [
         "bifrost.list_tables",
         "bifrost.describe_table",
         "bifrost.query",
+        "principals.list_credentials",
+        "principals.revoke_credential",
     ];
 
-    /// An agent sees exactly three tools, only its own tenant's tables, and the
-    /// complete physical layout of the one it selects.
+    /// An agent sees exactly the shipped catalog, only its own tenant's tables,
+    /// and the complete physical layout of the one it selects.
     ///
     /// The two tenants are what make the list assertion a tenancy claim rather
     /// than a formatting one: both tables exist in the same catalog, and only
@@ -82,8 +85,9 @@ mod pg_tests {
             .map(|tool| tool.name.to_string())
             .collect();
         assert_eq!(
-            names, BIFROST_TOOLS,
-            "an ordinary server advertises exactly the three read tools and no test probe"
+            names, ADVERTISED_TOOLS,
+            "an ordinary server advertises exactly the three Bifrost read tools, the \
+             principal credential listing, this admin caller's revocation, and no test probe"
         );
 
         let listed = structured(

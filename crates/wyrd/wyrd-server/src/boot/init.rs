@@ -1,9 +1,9 @@
 //! Deployment initialization: establish the platform administrative root.
 //!
 //! This is the one-time operation that gives a deployment an identity to
-//! administer it with. It replaces the removed `bootstrap-key` path, which
-//! could only mint a credential for a tenant that already existed — leaving the
-//! first tenant to be created by hand.
+//! administer it with. It replaces the removed per-tenant key-minting path,
+//! which could only mint a credential for a tenant that already existed —
+//! leaving the first tenant to be created by hand.
 //!
 //! Initialization is an operator-invoked subcommand rather than a server-start
 //! side effect, so the root credential is printed to the operator's terminal

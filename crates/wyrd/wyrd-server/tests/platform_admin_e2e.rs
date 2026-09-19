@@ -882,6 +882,8 @@ async fn an_operator_configures_and_removes_federated_platform_sign_in() {
         .await
         .expect("deployment initializes");
     let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
+    let provider = discovery_server().await;
+    let issuer = provider.uri();
 
     // Before any connection exists, a login attempt has nothing to resolve.
     let resp = srv
@@ -921,8 +923,7 @@ async fn an_operator_configures_and_removes_federated_platform_sign_in() {
             "/platform/oidc/connection",
             &session,
             Some(json!({
-                "issuer_url": "https://idp.example.com/realms/platform",
-                "jwks_uri": "https://idp.example.com/realms/platform/protocol/openid-connect/certs",
+                "issuer_url": issuer,
                 "expected_audience": "wyrd-platform",
                 "client_id": "wyrd-platform",
                 "client_auth": { "method": "secret_post", "secret": secret },
@@ -949,9 +950,11 @@ async fn an_operator_configures_and_removes_federated_platform_sign_in() {
         .expect("read route responds");
     assert_eq!(resp.status(), StatusCode::OK, "connection reads back");
     let view = body_json(resp).await;
+    assert_eq!(view["issuer_url"], issuer.as_str());
     assert_eq!(
-        view["issuer_url"],
-        "https://idp.example.com/realms/platform"
+        view["jwks_uri"],
+        format!("{issuer}/jwks"),
+        "the JWKS endpoint comes from discovery, never from the request"
     );
     assert_eq!(view["client_auth"], "SecretPost");
     assert!(
@@ -1045,7 +1048,6 @@ async fn a_tenant_administrator_cannot_configure_platform_sign_in() {
             &admin,
             Some(json!({
                 "issuer_url": "https://attacker.example.com/",
-                "jwks_uri": "https://attacker.example.com/certs",
                 "expected_audience": "wyrd-platform",
                 "client_id": "wyrd-platform",
                 "client_auth": { "method": "public" },
@@ -1057,5 +1059,82 @@ async fn a_tenant_administrator_cannot_configure_platform_sign_in() {
         resp.status(),
         StatusCode::UNAUTHORIZED,
         "a tenant token cannot point the platform plane at another issuer"
+    );
+}
+
+/// Serve the one OIDC discovery document configuring a connection resolves.
+///
+/// The JWKS endpoint is deliberately not what a caller would have supplied, so
+/// a test that passed by echoing the request back would fail here.
+async fn discovery_server() -> wiremock::MockServer {
+    let server = wiremock::MockServer::start().await;
+    let issuer = server.uri();
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/.well-known/openid-configuration",
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "issuer": issuer,
+            "authorization_endpoint": format!("{issuer}/authorize"),
+            "token_endpoint": format!("{issuer}/token"),
+            "jwks_uri": format!("{issuer}/jwks"),
+            "id_token_signing_alg_values_supported": ["RS256", "EdDSA"],
+        })))
+        .mount(&server)
+        .await;
+    server
+}
+
+/// A connection cannot point the server's key fetches at a blocked address.
+///
+/// Configuring a connection is the only place an operator names an outbound
+/// host, and the anonymous login route then drives fetches to it. Without
+/// screening this route would be an SSRF primitive.
+#[tokio::test]
+async fn a_connection_cannot_name_an_unresolvable_issuer() {
+    if !e2e_enabled() {
+        return;
+    }
+    let srv = WyrdTestServer::start_in_process()
+        .await
+        .expect("server starts");
+    let root = initialize_platform_root(&srv.operator_pool())
+        .await
+        .expect("deployment initializes");
+    let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
+
+    let resp = srv
+        .oneshot(platform_request(
+            Method::PUT,
+            "/platform/oidc/connection",
+            &session,
+            Some(json!({
+                "issuer_url": "https://wyrd-invalid.invalid/realms/platform",
+                "expected_audience": "wyrd-platform",
+                "client_id": "wyrd-platform",
+                "client_auth": { "method": "public" },
+            })),
+        ))
+        .await
+        .expect("configure route responds");
+    assert_ne!(
+        resp.status(),
+        StatusCode::OK,
+        "an issuer that cannot be screened and discovered is not stored"
+    );
+
+    let resp = srv
+        .oneshot(platform_request(
+            Method::GET,
+            "/platform/oidc/connection",
+            &session,
+            None,
+        ))
+        .await
+        .expect("read route responds");
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "a refused configuration leaves no connection behind"
     );
 }

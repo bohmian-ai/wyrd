@@ -34,7 +34,7 @@ fresh database has no credentials. Mint the first admin API key with the
 server-owned bootstrap command, then use it as a bearer token:
 
 ```bash
-mise exec -- cargo run -p wyrd-server -- bootstrap-key --tenant acme
+mise exec -- cargo run -p wyrd-server -- init
 # wyrd_sk_acme_… (shown once)
 ```
 

@@ -279,10 +279,18 @@ impl PlatformLogin {
             // The store's `subject IS NULL` predicate makes this a one-time
             // transition, so a concurrent second login pins nothing and is
             // refused rather than racing.
-            let Some(claim) = claims.email.as_deref() else {
+            //
+            // The claim must be a *verified* email. An unverified one is a
+            // string the subject chose, and pinning on it would let anyone at
+            // this issuer who can set their email to the pre-registered address
+            // capture that principal — permanently, since pinning is one-way.
+            // A provider that does not assert `email_verified` cannot be used
+            // to establish a platform administrator at all, which is the right
+            // outcome rather than a weaker match.
+            let Some(claim) = verified_email(claims) else {
                 return Err(PlatformLoginError::NotAccepted);
             };
-            pin_platform_identity(&self.pool, issuer, claim, &claims.subject)
+            pin_platform_identity(&self.pool, issuer, &claim, &claims.subject)
                 .await?
                 .ok_or(PlatformLoginError::NotAccepted)?
         };
@@ -327,6 +335,21 @@ fn decode_connection(
         tracing::warn!(error = %error, "platform OIDC connection could not be decoded");
         PlatformLoginError::ConnectionUnusable
     })
+}
+
+/// Extract the subject's email only when the issuer asserts it is verified.
+///
+/// Returns `None` when the token carries no email, or carries one the provider
+/// has not verified. Pinning is one-way, so an unverified address is not a
+/// weaker match to fall back on — it is a takeover of the pre-registered
+/// principal by whoever claims that address first.
+fn verified_email(claims: &ExternalClaims) -> Option<String> {
+    let verified = claims
+        .raw_claims
+        .get("email_verified")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    verified.then(|| claims.email.clone()).flatten()
 }
 
 /// Confirm the ID token echoes the nonce this login generated.

@@ -26,7 +26,7 @@ A **grant** is how a caller proves its identity at `POST /auth/token` to get a W
 | --- | --- | --- |
 | A person logging in through your IdP | `authorization_code` (with PKCE) | [SSO and OIDC](/self-hosting/sso-and-oidc/#human-single-sign-on) |
 | A machine workload (CI job, Kubernetes pod) | `jwt-bearer` | [SSO and OIDC](/self-hosting/sso-and-oidc/#workload-federation) |
-| A service or script holding an API key | API-key exchange | [Running the server](/self-hosting/running-the-server/#bootstrap-key) |
+| A service or script holding an API key | API-key exchange | [Running the server](/self-hosting/running-the-server/#init) |
 | Any caller renewing an expiring token | `refresh_token` | Automatic once a refresh token is issued |
 
 Delegation (`token-exchange`) also exists, but it is preview-gated and not production-ready; see the [SSO and OIDC limitations](/self-hosting/sso-and-oidc/#limitations). Every grant returns a Wyrd token minted with the signing key below; how each one is verified is in the [grant reference](/concepts/authentication/#grant-types). The rest of this page is the key material every deployment provides.
@@ -72,7 +72,7 @@ The file holds base64 that must decode to exactly 32 bytes. Boot fails closed if
 
 ## First admin key
 
-A fresh deployment has no credentials. Mint the first admin API key with the `bootstrap-key` subcommand, then use it to call the rest of the API. See [Running the server](/self-hosting/running-the-server/#bootstrap-key).
+A fresh deployment has no credentials. Establish its administrative root with the `init` subcommand, then use that credential to create your first tenant over the API — which hands back the tenant's own administrative credential. See [Running the server](/self-hosting/running-the-server/#init).
 
 ## Related
 

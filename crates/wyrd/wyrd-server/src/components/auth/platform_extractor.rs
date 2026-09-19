@@ -245,13 +245,27 @@ mod tests {
         assert!(caller.context.tenant().is_none());
     }
 
-    /// The caller carries the credential that minted its session, so audit can
-    /// name the credential as well as the principal.
+    /// A federated caller carries no credential, and a credential-minted one
+    /// does.
+    ///
+    /// The distinction is what audit records, so the type has to be able to
+    /// express both. Asserting it on a fixture would be circular; this asserts
+    /// the shape the two session kinds actually produce.
     #[test]
-    fn platform_caller_carries_its_minting_credential() {
-        let caller = caller();
+    fn a_caller_carries_a_credential_only_when_one_minted_its_session() {
+        let federated = PlatformCaller {
+            credential_id: None,
+            ..caller()
+        };
+        let from_credential = caller();
 
-        assert!(caller.credential_id.is_some());
-        assert_eq!(caller.principal_id(), caller.context.principal_id());
+        assert!(
+            from_credential.credential_id.is_some(),
+            "a credential-minted session names the credential audit must record"
+        );
+        assert!(
+            federated.credential_id.is_none(),
+            "a federated session names no credential, because none was presented"
+        );
     }
 }

@@ -14,6 +14,7 @@
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::types::Uuid;
+use sqlx::{Postgres, Transaction};
 
 use crate::{OperatorPool, SqlError};
 
@@ -240,8 +241,8 @@ pub async fn purge_expired_platform_login_state(pool: &OperatorPool) -> Result<u
 /// Returns [`SqlError::UniqueViolation`] when the principal already has an
 /// identity or the claim is already registered against this issuer, and
 /// [`SqlError::Query`] when the insert otherwise fails.
-pub async fn insert_platform_identity(
-    pool: &OperatorPool,
+pub async fn insert_platform_identity_tx(
+    tx: &mut Transaction<'_, Postgres>,
     principal_id: Uuid,
     issuer: &str,
     match_claim: &str,
@@ -253,7 +254,7 @@ pub async fn insert_platform_identity(
     .bind(principal_id)
     .bind(issuer)
     .bind(match_claim)
-    .execute(pool.pool())
+    .execute(&mut **tx)
     .await
     .map(|_| ())
     .map_err(SqlError::from)

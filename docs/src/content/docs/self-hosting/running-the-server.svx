@@ -8,7 +8,7 @@ order: 3
 
 # Running the server
 
-The server is a single binary, `wyrd-server`. Run it with no subcommand and it serves. One operator subcommand exists, `bootstrap-key`, for minting the first admin key on a fresh deployment.
+The server is a single binary, `wyrd-server`. Run it with no subcommand and it serves. One operator subcommand exists, `init`, for establishing the deployment's platform administrative root.
 
 ## Command line
 
@@ -20,26 +20,30 @@ wyrd-server
 wyrd-server --mode http
 wyrd-server --mode grpc
 
-# Mint the first admin API key for a tenant, then exit.
-wyrd-server bootstrap-key --tenant acme
+# Establish this deployment's administrative root, then exit.
+wyrd-server init
 ```
 
 `--mode` overrides the `serve.mode` config field (`WYRD_SERVE_MODE`). Accepted values are `both`, `http`, and `grpc`. The default is `both`.
 
 The process uses two non-zero exit codes: `78` for a configuration error (bad env var, invalid config file, failed validation) and `70` for any other fatal error during boot or serving. A clean shutdown exits `0`.
 
-### bootstrap-key
+### init
 
-A fresh deployment has no credentials. `bootstrap-key` mints the first admin API key so you can call the rest of the API. It builds only the runtime database pool, runs the issuance in one transaction, and prints the plaintext key once to stdout. It never starts listeners, telemetry, or storage.
+A fresh deployment has no administrative identity at all — not even a tenant. `init` creates the platform administrative root, grants it the platform control plane, issues its first credential, and prints that credential once to stdout. Everything else an operator does, including creating the first tenant, is an ordinary authenticated API call made with it.
 
 ```bash
-wyrd-server bootstrap-key --tenant acme
-# wyrd_sk_acme_… (shown once, store it now)
+wyrd-server init
+# wyrd_global_… (shown once, store it now)
 ```
 
-The key is shown exactly once and stored only as an Argon2 hash. If you lose it, mint another.
+The credential is shown exactly once and stored only as an Argon2 verifier. It is printed to your terminal rather than emitted through the server's log pipeline, and server start creates no administrative state and prints no credential under any deployment profile.
 
-`bootstrap-key` needs the database environment set (it connects as `wyrd_app`), but not a signing key or storage backend. You can run it against a fresh production database before the full serving environment is in place.
+Initialization happens at most once. The root's name is unique in the database, so a second `init` — concurrent or later — refuses rather than minting a second root. All three writes commit together, so a failure leaves the deployment uninitialized and safe to retry.
+
+If you lose the credential, issue a replacement against the same principal rather than re-initializing.
+
+`init` needs the platform-admin database environment set, but not a signing key or storage backend. You can run it against a fresh production database before the full serving environment is in place.
 
 ## Serve modes
 

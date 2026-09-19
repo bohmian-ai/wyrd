@@ -19,18 +19,18 @@ use wyrd_auth::platform_authz::{PlatformAuthorization, PlatformAuthzError};
 use wyrd_auth::platform_login::{PlatformLogin, PlatformLoginError};
 use wyrd_auth_oidc::ClientAuth;
 use wyrd_runtime::Permission;
-use wyrd_spec::auth::LoginInitResponse;
 use wyrd_spec::auth::{
     ConfigurePlatformOidcRequest, PlatformCallbackRequest, PlatformClientAuth,
     PlatformLoginRequest, PlatformOidcConnectionView, PlatformTokenResponse, PrincipalId,
     PrincipalKindTag, RegisterPlatformAdminRequest, RegisterPlatformAdminResponse, SecretBearer,
 };
+use wyrd_spec::auth::{IssuerUrl, LoginInitResponse};
 use wyrd_spec::error::WyrdError;
 use wyrd_sql::queries::platform::identity::{
-    delete_platform_oidc_connection, insert_platform_identity, platform_oidc_connection,
+    delete_platform_oidc_connection, insert_platform_identity_tx, platform_oidc_connection,
     upsert_platform_oidc_connection,
 };
-use wyrd_sql::queries::platform::principals::insert_platform_principal;
+use wyrd_sql::queries::platform::principals::insert_platform_principal_tx;
 use wyrd_sql::{OperatorPool, SqlError};
 
 use crate::components::auth::PlatformCaller;
@@ -137,13 +137,28 @@ async fn configure_connection(
 
     let client_auth = match request.client_auth {
         PlatformClientAuth::SecretBasic { secret } => {
-            ClientAuth::SecretBasic(SecretString::from(secret))
+            ClientAuth::SecretBasic(secret.into_secret_string())
         }
         PlatformClientAuth::SecretPost { secret } => {
-            ClientAuth::SecretPost(SecretString::from(secret))
+            ClientAuth::SecretPost(secret.into_secret_string())
         }
         PlatformClientAuth::Public => ClientAuth::Public,
     };
+    // Discovery is the only network call on this path, and it is screened
+    // against the deployment's blocked address ranges and pinned against DNS
+    // rebinding by the same owner the tenant issuer path uses. Taking a
+    // caller-supplied JWKS URL instead would make this route an SSRF primitive:
+    // the anonymous login route drives outbound fetches to whatever is stored.
+    let issuer = IssuerUrl::new(request.issuer_url.clone()).map_err(|error| {
+        WyrdErrorResponse::from(WyrdError::Validation {
+            message: "issuer is not a valid issuer URL".to_owned(),
+            details: serde_json::json!({ "error": error.to_string() }),
+        })
+    })?;
+    let jwks_uri =
+        crate::components::admin::routes::discover_jwks_uri(&issuer, state.deployment_profile)
+            .await?;
+
     let sealed = seal_platform_client_secret(&client_auth, state.auth.sealing_key.as_deref())
         .map_err(|error| {
             // A secret-bearing connection with no sealing key fails closed
@@ -157,7 +172,7 @@ async fn configure_connection(
     upsert_platform_oidc_connection(
         &pool,
         &request.issuer_url,
-        &request.jwks_uri,
+        jwks_uri.as_str(),
         &request.expected_audience,
         &request.client_id,
         client_auth_label(&client_auth),
@@ -170,7 +185,7 @@ async fn configure_connection(
 
     Ok(Json(PlatformOidcConnectionView {
         issuer_url: request.issuer_url,
-        jwks_uri: request.jwks_uri,
+        jwks_uri: jwks_uri.to_string(),
         expected_audience: request.expected_audience,
         client_id: request.client_id,
         client_auth: client_auth_label(&client_auth).to_owned(),
@@ -263,10 +278,27 @@ async fn register_admin(
     Json(request): Json<RegisterPlatformAdminRequest>,
 ) -> Result<Json<RegisterPlatformAdminResponse>, WyrdErrorResponse> {
     let pool = operator(&state)?;
-    authorize(&pool, &caller, &Permission::platform_identity_write()).await?;
 
-    // Registering against no connection would create a principal that can never
-    // sign in, so the connection is required first.
+    // The allowance, the principal, and its identity commit together. Splitting
+    // them would let a failed identity write orphan a platform principal that
+    // can never sign in and — because the name is unique — permanently consume
+    // the name an operator would retry with.
+    //
+    // The handle must outlive the transaction it lends out.
+    let authz = PlatformAuthorization::new(pool.clone());
+    let mut tx = authz
+        .authorize(
+            &caller.context,
+            &Permission::platform_identity_write(),
+            caller.request_id.as_str(),
+            caller.credential_id,
+            None,
+        )
+        .await
+        .map_err(platform_authz_error)?;
+
+    // Registering against no connection would create a principal that could
+    // never sign in, so the connection is required first.
     let connection = platform_oidc_connection(&pool)
         .await
         .map_err(store_error)?
@@ -280,17 +312,23 @@ async fn register_admin(
         })?;
 
     let principal_id = Uuid::now_v7();
-    insert_platform_principal(&pool, principal_id, PrincipalKindTag::User, &request.name)
+    insert_platform_principal_tx(&mut tx, principal_id, PrincipalKindTag::User, &request.name)
         .await
         .map_err(taken_or_store)?;
-    insert_platform_identity(
-        &pool,
+    insert_platform_identity_tx(
+        &mut tx,
         principal_id,
         &connection.issuer_url,
         &request.match_claim,
     )
     .await
     .map_err(taken_or_store)?;
+    tx.commit().await.map_err(|error| {
+        WyrdErrorResponse::from(WyrdError::Internal {
+            message: "platform administrator registration could not be committed".to_owned(),
+            details: serde_json::json!({ "error": error.to_string() }),
+        })
+    })?;
 
     Ok(Json(RegisterPlatformAdminResponse {
         principal_id: PrincipalId::new(principal_id),

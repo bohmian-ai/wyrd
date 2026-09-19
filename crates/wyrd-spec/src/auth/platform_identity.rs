@@ -7,9 +7,13 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::auth::PrincipalId;
+use crate::auth::{PrincipalId, SecretBearer};
 
 /// How Wyrd authenticates to the platform provider's token endpoint.
+///
+/// The secret arms carry [`SecretBearer`], not `String`. This type derives
+/// `Debug`, and a plain `String` would print the provider's client secret into
+/// any log line, trace span, or error that formatted the request.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case", tag = "method")]
@@ -17,12 +21,14 @@ pub enum PlatformClientAuth {
     /// HTTP Basic with a client secret.
     SecretBasic {
         /// The client secret, sealed before storage and never returned.
-        secret: String,
+        #[schemars(with = "String")]
+        secret: SecretBearer,
     },
     /// Client secret in the request body.
     SecretPost {
         /// The client secret, sealed before storage and never returned.
-        secret: String,
+        #[schemars(with = "String")]
+        secret: SecretBearer,
     },
     /// A public client with no secret.
     Public,
@@ -34,9 +40,12 @@ pub enum PlatformClientAuth {
 #[serde(deny_unknown_fields)]
 pub struct ConfigurePlatformOidcRequest {
     /// Issuer URL, pinned as the `iss` of every accepted token.
+    ///
+    /// The JWKS endpoint is not accepted from the caller. It is resolved once,
+    /// here, by OIDC discovery against this issuer under the deployment's
+    /// address screening — so configuring a connection cannot be used to point
+    /// the server's key fetches at an arbitrary host.
     pub issuer_url: String,
-    /// JWKS endpoint signing keys are fetched from.
-    pub jwks_uri: String,
     /// Audience pinned as the `aud` of every accepted token.
     pub expected_audience: String,
     /// Wyrd's client identifier at the provider.

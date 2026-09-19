@@ -653,7 +653,7 @@ fn pinned_discovery_client(
 /// hostname is resolved, every resolved address is screened, and the discovery
 /// client is pinned to those addresses so a DNS-rebinding answer cannot redirect
 /// the connect to an internal address after the screen.
-async fn discover_jwks_uri(
+pub(crate) async fn discover_jwks_uri(
     issuer: &IssuerUrl,
     deployment_profile: DeploymentProfile,
 ) -> Result<url::Url, WyrdErrorResponse> {

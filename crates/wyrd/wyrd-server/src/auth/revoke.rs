@@ -83,10 +83,10 @@ pub async fn revoke_principal(
         delegation_chain: wyrd_runtime::audit_delegation_chain(&caller.delegation_chain),
     });
 
-    audit::record_audit(state.postgres.vala_pool(), tenant, &decision)
+    let mut conn = acquire_conn(&state, tenant).await?;
+    audit::append_on(&mut conn, &decision)
         .await
         .map_err(WyrdErrorResponse::from)?;
-    let mut conn = acquire_conn(&state, tenant).await?;
     revoke_principal_in_conn(&mut conn, target_id, request.principal_kind, tenant)
         .await
         .map_err(WyrdErrorResponse::from)?;

@@ -213,9 +213,10 @@ struct BindingFilter {
 /// through the RLS `TenantConn`. Returns the redacted [`TrustedIssuerView`]
 /// (never the secret).
 ///
-/// Local request validation runs before the verdict. The Allowed row then
-/// commits standalone before discovery, so a later discovery, sealing, or insert
-/// failure leaves the decision recorded exactly once and no issuer row.
+/// Local request validation and discovery run before the transaction opens; the
+/// Allowed row is appended on that same transaction, so the recorded decision
+/// and the issuer row commit together. A discovery or sealing failure happens
+/// before either exists, and an insert failure discards both.
 ///
 /// # Errors
 ///
@@ -241,9 +242,6 @@ async fn create_trusted_issuer(
     )
     .await
     .map_err(WyrdErrorResponse::from)?;
-    audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, &decision)
-        .await
-        .map_err(WyrdErrorResponse::from)?;
 
     // The only network call on any admin path, and only at create: discovery
     // resolves jwks_uri. A runtime read must never re-discover.
@@ -271,6 +269,9 @@ async fn create_trusted_issuer(
         .map_err(seal_error)?;
 
     let mut conn = acquire_conn(&state, &caller).await?;
+    audit::append_on(&mut conn, &decision)
+        .await
+        .map_err(WyrdErrorResponse::from)?;
     insert_trusted_issuer(&mut conn, &write)
         .await
         .map_err(map_write_error)?;
@@ -331,10 +332,10 @@ async fn delete_trusted_issuer_route(
     .await
     .map_err(WyrdErrorResponse::from)?;
 
-    audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, &decision)
+    let mut conn = acquire_conn(&state, &caller).await?;
+    audit::append_on(&mut conn, &decision)
         .await
         .map_err(WyrdErrorResponse::from)?;
-    let mut conn = acquire_conn(&state, &caller).await?;
 
     // --cascade removes the referencing bindings first so the issuer delete is
     // not blocked by the FK ON DELETE RESTRICT. Without it, a live binding makes
@@ -394,10 +395,10 @@ async fn create_workload_binding(
     };
     let write = binding_write_from_binding(&binding).map_err(internal_error)?;
 
-    audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, &decision)
+    let mut conn = acquire_conn(&state, &caller).await?;
+    audit::append_on(&mut conn, &decision)
         .await
         .map_err(WyrdErrorResponse::from)?;
-    let mut conn = acquire_conn(&state, &caller).await?;
     insert_workload_binding(&mut conn, &write)
         .await
         .map_err(|error| map_binding_write_error(error, &binding.issuer))?;
@@ -464,10 +465,10 @@ async fn delete_workload_binding_route(
     .await
     .map_err(WyrdErrorResponse::from)?;
 
-    audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, &decision)
+    let mut conn = acquire_conn(&state, &caller).await?;
+    audit::append_on(&mut conn, &decision)
         .await
         .map_err(WyrdErrorResponse::from)?;
-    let mut conn = acquire_conn(&state, &caller).await?;
     let removed = delete_workload_binding(&mut conn, &issuer, &query.subject)
         .await
         .map_err(map_write_error)?;
@@ -1006,6 +1007,11 @@ mod pg_tests {
         .expect_err("a duplicate issuer must conflict");
 
         assert!(matches!(error.0, WyrdError::AdminConflict { .. }));
+        assert_eq!(
+            decision_rows(&fixture, "admin.trusted_issuer.create").await,
+            vec![("allowed".to_owned(), 1)],
+            "only the create that actually wrote an issuer is recorded as allowed"
+        );
     }
 
     #[tokio::test]
@@ -1032,6 +1038,12 @@ mod pg_tests {
         .await
         .expect_err("missing issuer delete is not found");
         assert!(matches!(delete_err.0, WyrdError::AdminNotFound { .. }));
+        assert!(
+            decision_rows(&fixture, "admin.trusted_issuer.delete")
+                .await
+                .is_empty(),
+            "a delete that removed nothing records no allowance"
+        );
     }
 
     #[tokio::test]
@@ -1176,6 +1188,12 @@ mod pg_tests {
         .expect_err("binding create against a missing issuer must be not-found");
         // The FK violation is a missing referenced issuer (404), not a conflict.
         assert!(matches!(error.0, WyrdError::AdminNotFound { .. }));
+        assert!(
+            decision_rows(&fixture, "admin.workload_binding.create")
+                .await
+                .is_empty(),
+            "a binding that never landed records no allowance"
+        );
     }
 
     #[tokio::test]
@@ -1255,14 +1273,182 @@ mod pg_tests {
         rows
     }
 
-    /// A discovery failure after an Allowed verdict leaves exactly one Allowed row
-    /// (committed before the network call) and no issuer.
+    /// Make every append to the canonical audit staging table fail.
+    ///
+    /// The one lever that separates "the effect committed and the record did
+    /// not" from "neither did": if the two share a transaction, refusing the
+    /// append must also cost the effect.
+    ///
+    /// `vala.audit_staging` is shared by every fixture in this Postgres, so the
+    /// caller must [`allow_audit_appends`] again as soon as the call under test
+    /// returns — a trigger left installed would fail unrelated tests.
+    async fn fail_audit_appends(fixture: &PgFixture) {
+        let superuser = fixture
+            .superuser_pool()
+            .await
+            .expect("superuser pool opens");
+        sqlx::raw_sql(
+            "CREATE OR REPLACE FUNCTION vala.test_refuse_audit()
+               RETURNS trigger LANGUAGE plpgsql AS $$
+               BEGIN
+                 RAISE EXCEPTION 'injected audit failure';
+               END;
+               $$;
+             DROP TRIGGER IF EXISTS test_refuse_audit ON vala.audit_staging;
+             CREATE TRIGGER test_refuse_audit
+               BEFORE INSERT ON vala.audit_staging
+               FOR EACH ROW EXECUTE FUNCTION vala.test_refuse_audit();",
+        )
+        .execute(&superuser)
+        .await
+        .expect("audit failure installs");
+    }
+
+    /// Let audit appends succeed again.
+    async fn allow_audit_appends(fixture: &PgFixture) {
+        let superuser = fixture
+            .superuser_pool()
+            .await
+            .expect("superuser pool opens");
+        sqlx::raw_sql("DROP TRIGGER IF EXISTS test_refuse_audit ON vala.audit_staging")
+            .execute(&superuser)
+            .await
+            .expect("audit failure clears");
+    }
+
+    /// An unrecordable issuer create refuses and writes no issuer.
+    ///
+    /// The decision now rides the write transaction, so the fail-closed rule and
+    /// atomicity are the same property: nothing can be registered that the audit
+    /// log has no record of permitting.
     ///
     /// # Panics
     ///
     /// Panics when the fixture cannot start or any assertion fails.
     #[tokio::test]
-    async fn create_records_allowed_decision_before_failed_discovery() {
+    async fn an_unrecordable_issuer_create_writes_no_issuer() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let state = test_state(&fixture).await;
+        let (_server, issuer) = discovery_server().await;
+        fail_audit_appends(&fixture).await;
+
+        let error = create_trusted_issuer(
+            State(state),
+            writer(tenant),
+            Json(create_issuer_request(issuer.clone(), Some(SECRET))),
+        )
+        .await
+        .expect_err("an unrecordable create is refused");
+        allow_audit_appends(&fixture).await;
+        assert_eq!(
+            error.0.code(),
+            "WYRD_VALA_500_AUDIT_UNAVAILABLE",
+            "{:?}",
+            error.0
+        );
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let row = trusted_issuer_by_url(&mut conn, issuer.as_str())
+            .await
+            .expect("query succeeds");
+        conn.commit().await.expect("commit");
+        assert!(row.is_none(), "a refused create registers no issuer");
+    }
+
+    /// An unrecordable binding create refuses and writes no binding.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot start or any assertion fails.
+    #[tokio::test]
+    async fn an_unrecordable_binding_create_writes_no_binding() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let state = test_state(&fixture).await;
+        seed_issuer(&fixture, tenant).await;
+        fail_audit_appends(&fixture).await;
+
+        let error = create_workload_binding(
+            State(state),
+            writer(tenant),
+            Json(CreateWorkloadBindingRequest {
+                issuer: IssuerUrl::new(SEEDED_ISSUER).expect("issuer is valid"),
+                subject: "system:serviceaccount:default/sa".to_owned(),
+                audience: None,
+                card_ref: sample_card_ref(),
+            }),
+        )
+        .await
+        .expect_err("an unrecordable binding create is refused");
+        allow_audit_appends(&fixture).await;
+        assert_eq!(
+            error.0.code(),
+            "WYRD_VALA_500_AUDIT_UNAVAILABLE",
+            "{:?}",
+            error.0
+        );
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let bindings = workload_bindings_for_tenant(&mut conn, None, None)
+            .await
+            .expect("query succeeds");
+        conn.commit().await.expect("commit");
+        assert!(
+            bindings.is_empty(),
+            "a refused binding create binds nothing"
+        );
+    }
+
+    /// A revocation that finds no principal records no allowance.
+    ///
+    /// Principal revocation shares this module's `service_accounts:write` gate
+    /// and now shares its atomicity: the allowance lives on the transaction that
+    /// bumps the epoch, so a miss leaves no row claiming a revocation was
+    /// permitted. The refusal itself is still visible — it is a `404` to the
+    /// caller, and a denial would have been recorded standalone.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot start or any assertion fails.
+    #[tokio::test]
+    async fn a_revocation_that_finds_nothing_records_no_allowance() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let state = test_state(&fixture).await;
+
+        let error = crate::auth::revoke::revoke_principal(
+            State(state),
+            writer(tenant),
+            axum::extract::Path(PrincipalId::new(uuid::Uuid::new_v4())),
+            Json(wyrd_spec::auth::RevokePrincipalRequest {
+                principal_kind: wyrd_spec::auth::PrincipalKindTag::Service,
+                reason: "key rotation".to_owned(),
+            }),
+        )
+        .await
+        .expect_err("revoking an absent principal is not found");
+        assert!(matches!(error.0, WyrdError::PrincipalNotFound { .. }));
+        assert!(
+            decision_rows(&fixture, "auth.principal.revoke")
+                .await
+                .is_empty(),
+            "a revocation that changed nothing records no allowance"
+        );
+    }
+
+    /// A discovery failure refuses the create and records no allowance.
+    ///
+    /// The allowance belongs to the write transaction, and discovery runs before
+    /// that transaction exists. So there is no issuer and no row claiming one was
+    /// permitted — an allowance without its effect would read, afterwards, as an
+    /// issuer someone registered and then hid.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot start or any assertion fails.
+    #[tokio::test]
+    async fn a_failed_discovery_leaves_no_allowance_and_no_issuer() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
         let state = test_state(&fixture).await;
@@ -1279,9 +1465,11 @@ mod pg_tests {
         .expect_err("discovery failure refuses the create");
         assert!(matches!(error.0, WyrdError::DiscoveryUnavailable { .. }));
 
-        assert_eq!(
-            decision_rows(&fixture, "admin.trusted_issuer.create").await,
-            vec![("allowed".to_owned(), 1)]
+        assert!(
+            decision_rows(&fixture, "admin.trusted_issuer.create")
+                .await
+                .is_empty(),
+            "a create that never opened its transaction recorded nothing"
         );
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let row = trusted_issuer_by_url(&mut conn, issuer.as_str())

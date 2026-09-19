@@ -249,10 +249,11 @@ pub async fn authorize_recording_denial(
 ///
 /// Credential administration shares one permission across issuance, trusted
 /// issuers, workload bindings, and principal revocation, and every one of those
-/// handlers owns a tenant transaction. A denial is recorded standalone here; the
-/// returned `Allowed` event MUST be committed standalone with [`record_audit`]
-/// **before** the handler opens its transaction, so the decision survives a
-/// failed, rolled-back, or not-found administrative write.
+/// handlers owns a tenant transaction. A denial is recorded standalone here,
+/// because a refusal has no operation to join; the returned `Allowed` event MUST
+/// be [`append_on`]ed to the transaction that performs the operation, so a
+/// failed, rolled-back, or not-found administrative write leaves no allowance
+/// claiming it happened.
 ///
 /// The verdict comes from the configured `PermissionCheck` through
 /// [`authorize_recording_denial`], so the audited decision, the response, and

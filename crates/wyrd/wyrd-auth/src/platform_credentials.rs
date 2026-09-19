@@ -9,6 +9,8 @@
 //! row-level security. Platform credentials sit outside that boundary by
 //! construction and therefore run on the BYPASSRLS [`OperatorPool`].
 
+use std::sync::LazyLock;
+
 use chrono::{DateTime, Utc};
 use secrecy::{ExposeSecret, SecretString};
 use uuid::Uuid;
@@ -72,6 +74,18 @@ impl PlatformCredential {
         Some(format!("{PLATFORM_KEY_PREFIX}_{visible}"))
     }
 }
+
+/// The verifier every rejected credential is checked against.
+///
+/// Derived once per process from throwaway randomness, so no presented secret
+/// can match it and the cost of failing is the cost of succeeding. Computing it
+/// lazily rather than per request matters: Argon2 is deliberately expensive,
+/// and paying for the dummy on every rejection would be a denial-of-service
+/// amplifier rather than a timing defence.
+static DUMMY_VERIFIER: LazyLock<String> = LazyLock::new(|| {
+    hash_api_key(&SecretString::from(Uuid::new_v4().to_string()))
+        .expect("Argon2 hashing generated randomness cannot fail")
+});
 
 /// A credential that authenticated, with the identity of both sides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,18 +205,29 @@ impl PlatformCredentials {
         &self,
         presented: &SecretString,
     ) -> Result<AuthenticatedPlatformCredential, PlatformCredentialError> {
-        let Some(prefix) = PlatformCredential::prefix_of(presented) else {
+        let row = match PlatformCredential::prefix_of(presented) {
+            Some(prefix) => platform_credential_by_prefix(&self.pool, &prefix)
+                .await?
+                .filter(|row| row.is_usable(Utc::now())),
+            None => None,
+        };
+
+        // Exactly one verification, whatever was wrong with the input. A
+        // malformed shape, an unknown prefix, and a revoked, expired or
+        // suspended credential all used to answer before Argon2 ran, so a live
+        // prefix with a wrong tail took visibly longer than any of them and the
+        // endpoint enumerated live prefixes by clock. Verifying the dummy costs
+        // what verifying a real row costs, so there is nothing left to measure.
+        let verifier = row
+            .as_ref()
+            .map_or_else(|| DUMMY_VERIFIER.clone(), |row| row.secret_hash.clone());
+        let candidate = presented.clone();
+        let matched =
+            tokio::task::spawn_blocking(move || verify_api_key(&candidate, &verifier)).await?;
+
+        let Some(row) = row.filter(|_| matched) else {
             return Err(PlatformCredentialError::InvalidCredential);
         };
-        let Some(row) = platform_credential_by_prefix(&self.pool, &prefix).await? else {
-            return Err(PlatformCredentialError::InvalidCredential);
-        };
-        if !row.is_usable(Utc::now()) {
-            return Err(PlatformCredentialError::InvalidCredential);
-        }
-        if !verify_api_key(presented, &row.secret_hash) {
-            return Err(PlatformCredentialError::InvalidCredential);
-        }
         touch_platform_credential(&self.pool, row.id).await?;
         Ok(AuthenticatedPlatformCredential {
             principal_id: PrincipalId::new(row.principal_id),
@@ -405,11 +430,20 @@ mod pg_tests {
             ("suspended principal", suspended.credential.secret),
         ];
 
+        // Warm the dummy verifier so its one-off derivation is not mistaken for
+        // the per-request cost this measures.
+        let _ = PlatformCredentials::new(pool.clone())
+            .authenticate_for_session(&SecretString::from("warm".to_owned()))
+            .await;
+
+        let mut elapsed = Vec::new();
         for (label, presented) in rejections {
+            let started = std::time::Instant::now();
             let error = PlatformCredentials::new(pool.clone())
                 .authenticate_for_session(&presented)
                 .await
                 .expect_err("rejection");
+            elapsed.push((label, started.elapsed()));
             assert!(
                 matches!(error, PlatformCredentialError::InvalidCredential),
                 "{label} must be indistinguishable, got {error:?}"
@@ -418,6 +452,23 @@ mod pg_tests {
                 error.to_string(),
                 "invalid platform credential",
                 "{label} must render identically"
+            );
+        }
+
+        // Identical error bodies are not enough: a rejection that skips Argon2
+        // answers orders of magnitude sooner and says so. Argon2 dominates every
+        // one of these requests, so a shape that verified nothing would land
+        // far below the one that verified a real row against a wrong secret.
+        let wrong_secret_cost = elapsed
+            .iter()
+            .find(|(label, _)| *label == "wrong secret")
+            .expect("the known-prefix rejection was measured")
+            .1;
+        for (label, cost) in &elapsed {
+            assert!(
+                *cost * 3 >= wrong_secret_cost,
+                "{label} rejected in {cost:?} against {wrong_secret_cost:?} for a wrong secret, \
+                 so it skipped the verification that hides which prefixes are live"
             );
         }
 

@@ -29,7 +29,22 @@ use wyrd_spec::vala::api::{
         crate::query::routes::sync_query,
         crate::query::routes::list_running_queries,
         crate::query::routes::get_running_query,
-        crate::query::routes::cancel_running_query
+        crate::query::routes::cancel_running_query,
+        crate::components::principals::routes::create_service_principal,
+        crate::components::principals::routes::issue_credential,
+        crate::components::principals::routes::list_credentials,
+        crate::components::principals::routes::revoke_credential,
+        crate::components::platform::routes::platform_token,
+        crate::components::platform::routes::create_tenant,
+        crate::components::platform::routes::recover_tenant_admin,
+        crate::components::platform::identity::configure_connection,
+        crate::components::platform::identity::read_connection,
+        crate::components::platform::identity::remove_connection,
+        crate::components::platform::identity::register_admin,
+        crate::components::platform::identity::list_platform_admins,
+        crate::components::platform::identity::set_admin_status,
+        crate::components::platform::identity::begin_login,
+        crate::components::platform::identity::complete_login
     ),
     components(schemas(
         BifrostQueryRequest,
@@ -42,7 +57,17 @@ use wyrd_spec::vala::api::{
         RunningQuerySummary,
         VisibilityMode
     )),
-    tags((name = "Bifrost", description = "Bounded Bifrost query transport"))
+    tags(
+        (name = "Bifrost", description = "Bounded Bifrost query transport"),
+        (
+            name = "Principals",
+            description = "Tenant principal and credential administration"
+        ),
+        (
+            name = "Platform",
+            description = "Platform control plane: tenant lifecycle and platform identity"
+        )
+    )
 )]
 pub struct WyrdApiDoc;
 

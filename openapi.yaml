@@ -9,6 +9,320 @@ info:
     name: Apache-2.0
   version: 0.0.1
 paths:
+  /auth/platform/callback:
+    post:
+      tags:
+      - Platform
+      summary: Complete a platform federated login and return a platform session.
+      description: |-
+        # Errors
+        Returns a stable Wyrd error when the state is missing or replayed, the
+        provider cannot be reached, or the identity is not accepted.
+      operationId: complete_login
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PlatformCallbackRequest'
+        required: true
+      responses:
+        '200':
+          description: Platform session for the resolved administrator
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlatformTokenResponse'
+        '401':
+          description: Identity not accepted, indistinguishably for every cause
+        '503':
+          description: Identity provider unavailable
+  /auth/platform/login:
+    post:
+      tags:
+      - Platform
+      summary: Begin a platform federated login.
+      description: |-
+        # Errors
+        Returns a stable Wyrd error when federated login is not configured, the
+        provider cannot be reached, or the login state cannot be persisted.
+      operationId: begin_login
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PlatformLoginRequest'
+        required: true
+      responses:
+        '200':
+          description: Provider authorization URL and opaque state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginInitResponse'
+        '404':
+          description: Federated login is not configured
+        '503':
+          description: Identity provider unavailable
+  /auth/platform/token:
+    post:
+      tags:
+      - Platform
+      summary: Exchange a platform credential for a short-lived session.
+      description: |-
+        The one route that reads credential material. Every other platform route
+        takes the session this mints, so no served surface after this point handles
+        a secret.
+
+        # Errors
+        Returns an unauthenticated error for every credential rejection, so no
+        caller can distinguish which condition failed.
+      operationId: platform_token
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PlatformTokenRequest'
+        required: true
+      responses:
+        '200':
+          description: Short-lived platform session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlatformTokenResponse'
+        '401':
+          description: Credential rejected, indistinguishably for every cause
+  /platform/admins:
+    get:
+      tags:
+      - Platform
+      summary: |-
+        List every platform principal, including the ones no longer permitted to
+        act.
+      description: |-
+        A suspended administrator is shown rather than hidden: an operator auditing
+        who can administer the deployment needs to see that a revoked one really is
+        revoked. Nothing secret appears — a principal has no credential material to
+        leak, and its pinned subject is not one.
+
+        # Errors
+        Returns a stable Wyrd error when the caller is unauthorized or the read
+        fails.
+      operationId: list_platform_admins
+      responses:
+        '200':
+          description: Every platform principal, including suspended ones
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlatformPrincipalListResponse'
+        '401':
+          description: Platform session required
+    post:
+      tags:
+      - Platform
+      summary: Pre-register a human platform administrator.
+      description: |-
+        The principal is created with no credential at all: this human will
+        authenticate by federated identity, and their subject is pinned on first
+        login. Only a caller who already holds platform authority reaches here,
+        which is what stops a login from manufacturing platform authority.
+
+        The registration carries no grant. Authority is granted separately and
+        deliberately, so registering someone is never the same act as empowering
+        them.
+
+        # Errors
+        Returns a stable Wyrd error when the caller is unauthorized, no connection
+        is configured, the name or claim is already registered, or a write fails.
+      operationId: register_admin
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterPlatformAdminRequest'
+        required: true
+      responses:
+        '200':
+          description: Administrator registered, awaiting first login
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegisterPlatformAdminResponse'
+        '401':
+          description: Platform session required
+        '409':
+          description: Name or matching claim already registered
+        '422':
+          description: No platform OIDC connection is configured
+  /platform/admins/{principal_id}/status:
+    put:
+      tags:
+      - Platform
+      summary: Suspend or restore a platform principal.
+      description: |-
+        This is what makes the active-status check every platform request already
+        performs a live guard: without it nothing in the deployment could stop a
+        platform principal from acting, and a federated administrator whose identity
+        was pinned in error would be unremovable without direct database access.
+
+        Suspending the last active principal is refused. A deployment with no
+        principal that can authenticate cannot be recovered through any served
+        surface, and locking an operator out of their own control plane is not an
+        outcome a single request should be able to reach.
+
+        # Errors
+        Returns a stable Wyrd error when the caller is unauthorized, the status is
+        not a lifecycle value, the principal is unknown, the change would leave no
+        active principal, or the write fails.
+      operationId: set_admin_status
+      parameters:
+      - name: principal_id
+        in: path
+        description: Platform principal to change
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetPlatformPrincipalStatusRequest'
+        required: true
+      responses:
+        '204':
+          description: Status changed
+        '401':
+          description: Platform session required
+        '404':
+          description: Platform principal not found
+        '409':
+          description: Would leave the deployment with no active principal
+  /platform/oidc/connection:
+    get:
+      tags:
+      - Platform
+      summary: Read the configured connection, with its secret omitted.
+      description: |-
+        # Errors
+        Returns a stable Wyrd error when the caller is unauthorized, no connection
+        is configured, or the read fails.
+      operationId: read_connection
+      responses:
+        '200':
+          description: The configured connection, never its provider secret
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlatformOidcConnectionView'
+        '401':
+          description: Platform session required
+        '404':
+          description: No connection configured
+    put:
+      tags:
+      - Platform
+      summary: Install or replace the deployment's platform OIDC connection.
+      description: |-
+        # Errors
+        Returns a stable Wyrd error when the caller is unauthorized, the client
+        secret cannot be sealed, or the write fails.
+      operationId: configure_connection
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConfigurePlatformOidcRequest'
+        required: true
+      responses:
+        '200':
+          description: Connection installed; the JWKS endpoint comes from discovery
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlatformOidcConnectionView'
+        '401':
+          description: Platform session required
+        '403':
+          description: Platform identity administration required
+        '422':
+          description: Issuer invalid, unreachable, or resolving to a blocked address
+    delete:
+      tags:
+      - Platform
+      summary: Remove the platform OIDC connection.
+      description: |-
+        Platform principals and their grants are untouched. Federated login stops
+        working; the global credential does not, which is the whole reason removal
+        is safe to expose.
+
+        # Errors
+        Returns a stable Wyrd error when the caller is unauthorized or the delete
+        fails.
+      operationId: remove_connection
+      responses:
+        '204':
+          description: Connection removed; the global credential still administers
+        '401':
+          description: Platform session required
+        '404':
+          description: No connection configured
+  /platform/tenants:
+    post:
+      tags:
+      - Platform
+      summary: Provision a tenant and return its one-time administrative credential.
+      description: |-
+        # Errors
+        Returns a stable Wyrd error when the caller is unauthorized, the slug is
+        taken, the platform plane is unconfigured, or provisioning fails.
+      operationId: create_tenant
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTenantRequest'
+        required: true
+      responses:
+        '200':
+          description: Provisioned tenant and its one-time administrative credential
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateTenantResponse'
+        '401':
+          description: Platform session required
+        '403':
+          description: Tenant creation not granted
+        '409':
+          description: Slug already in use by a live tenant
+  /platform/tenants/admin/credentials:
+    post:
+      tags:
+      - Platform
+      summary: Restore administrative access to a tenant that has lost it.
+      description: |-
+        # Errors
+        Returns a stable Wyrd error when the caller is unauthorized, the tenant has
+        no administrative principal, or a write fails.
+      operationId: recover_tenant_admin
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RecoverTenantAdminRequest'
+        required: true
+      responses:
+        '200':
+          description: Replacement credential for the tenant's existing administrator
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProvisionedTenantAdmin'
+        '401':
+          description: Platform session required
+        '403':
+          description: Tenant administrative recovery not granted
   /v1/bifrost/tables:
     get:
       tags:
@@ -719,6 +1033,141 @@ paths:
                 $ref: '#/components/schemas/ListVersionsResponse'
         '503':
           description: Registry unavailable
+  /v1/principals:
+    post:
+      tags:
+      - Principals
+      summary: Create a Card-free machine principal and issue its first credential.
+      description: |-
+        # Errors
+        Returns a stable Wyrd error when the caller is unauthorized, a requested
+        role does not exist in the tenant, or a write fails.
+      operationId: create_service_principal
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateServicePrincipalRequest'
+        required: true
+      responses:
+        '200':
+          description: Principal created with its first credential, returned once
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateServicePrincipalResponse'
+        '401':
+          description: Authentication required
+        '403':
+          description: Tenant principal administration required
+        '422':
+          description: A requested role does not exist in this tenant
+  /v1/principals/{principal_id}/credentials:
+    get:
+      tags:
+      - Principals
+      summary: List a principal's credential metadata.
+      description: |-
+        # Errors
+        Returns a stable Wyrd error when the caller is unauthorized or the read
+        fails.
+      operationId: list_credentials
+      parameters:
+      - name: principal_id
+        in: path
+        description: Principal whose credentials to list
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Non-secret credential metadata, newest first
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CredentialListResponse'
+        '401':
+          description: Authentication required
+        '403':
+          description: Tenant principal administration required
+    post:
+      tags:
+      - Principals
+      summary: Issue an additional credential for an existing principal.
+      description: |-
+        This is the first half of a rotation: the principal now holds two live
+        credentials, so the old one can be retired once the new one is verified.
+
+        # Errors
+        Returns a stable Wyrd error when the caller is unauthorized or a write
+        fails.
+      operationId: issue_credential
+      parameters:
+      - name: principal_id
+        in: path
+        description: Principal to issue for
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Credential issued, plaintext returned once
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssuedCredential'
+        '401':
+          description: Authentication required
+        '403':
+          description: Tenant principal administration required
+  /v1/principals/{principal_id}/credentials/{credential_id}:
+    delete:
+      tags:
+      - Principals
+      summary: Revoke one credential, leaving the principal and its roles untouched.
+      description: |-
+        Revocation has to mean two things, and marking the credential row only
+        achieves the first: the credential can mint no new token, *and* the tokens
+        it already minted stop working. The second is the one that matters when a
+        credential leaks, and a bearer token is useful to whoever holds it for its
+        whole lifetime. So this also advances the principal's revocation epoch,
+        which the verifier checks on every request.
+
+        That epoch is per-principal, which is the granularity the schema offers, so
+        it also invalidates live tokens minted by the principal's *other*
+        credentials. That does not reintroduce a rotation gap — a surviving
+        credential re-exchanges immediately — and the alternative, letting a leaked
+        credential's tokens outlive their revocation, is not a trade worth making.
+
+        Both writes are in one transaction: a credential marked revoked whose tokens
+        still authorize is precisely the state this exists to prevent.
+
+        # Errors
+        Returns a stable Wyrd error when the caller is unauthorized, the credential
+        is unknown in this tenant, or a write fails.
+      operationId: revoke_credential
+      parameters:
+      - name: principal_id
+        in: path
+        description: Principal that owns the credential
+        required: true
+        schema:
+          type: string
+      - name: credential_id
+        in: path
+        description: Credential to retire
+        required: true
+        schema:
+          type: string
+      responses:
+        '204':
+          description: Credential retired
+        '401':
+          description: Authentication required
+        '403':
+          description: Tenant principal administration required
+        '404':
+          description: No live credential for this principal
   /v1/query:
     post:
       tags:
@@ -971,6 +1420,10 @@ paths:
                 $ref: '#/components/schemas/WyrdProblem'
 components:
   schemas:
+    AbsoluteUrl:
+      type: string
+      format: uri
+      description: Absolute URL with a scheme and authority.
     AgentSpec:
       type: object
       description: Agent authoring body inside a Wyrd Agent Card envelope.
@@ -1538,6 +1991,38 @@ components:
         Wire format is a 7- to 40-character lowercase hex string (an abbreviated or
         full git SHA). Deserialization validates, so wire payloads cannot carry a
         malformed commit.
+    ConfigurePlatformOidcRequest:
+      type: object
+      description: Install or replace the deployment's platform OIDC connection.
+      required:
+      - issuer_url
+      - expected_audience
+      - client_id
+      - client_auth
+      properties:
+        client_auth:
+          $ref: '#/components/schemas/PlatformClientAuth'
+          description: How Wyrd authenticates to the provider.
+        client_id:
+          type: string
+          description: Wyrd's client identifier at the provider.
+        expected_audience:
+          type: string
+          description: Audience pinned as the `aud` of every accepted token.
+        issuer_url:
+          type: string
+          description: |-
+            Issuer URL, pinned as the `iss` of every accepted token.
+
+            The JWKS endpoint is not accepted from the caller. It is resolved once,
+            here, by OIDC discovery against this issuer under the deployment's
+            address screening — so configuring a connection cannot be used to point
+            the server's key fetches at an arbitrary host.
+        jwks_ttl_secs:
+          type: integer
+          format: int64
+          description: JWKS cache lifetime in seconds.
+      additionalProperties: false
     CreateCardRequest:
       type: object
       description: Composite registration request.
@@ -1572,6 +2057,126 @@ components:
             $ref: '#/components/schemas/CardUploadPlan'
           description: Upload plans for artifact-bearing submissions.
       additionalProperties: false
+    CreateServicePrincipalRequest:
+      type: object
+      description: |-
+        Request to create a tenant-scoped machine principal.
+
+        The principal binds no Card: it is tenant automation — a CI runner, a
+        deployment agent — rather than a deployed workload with an emit scope.
+      required:
+      - name
+      - roles
+      properties:
+        description:
+          type:
+          - string
+          - 'null'
+          description: Optional description.
+        name:
+          type: string
+          description: Operator-facing name, unique within the tenant.
+        roles:
+          type: array
+          items:
+            type: string
+          description: |-
+            Roles to grant. Narrower than tenant administration, so automation never
+            needs the tenant administrative credential.
+      additionalProperties: false
+    CreateServicePrincipalResponse:
+      type: object
+      description: A created machine principal and its first credential.
+      required:
+      - principal_id
+      - credential
+      properties:
+        credential:
+          $ref: '#/components/schemas/SecretBearer'
+          description: Its first credential, returned exactly once.
+        principal_id:
+          $ref: '#/components/schemas/PrincipalId'
+          description: Durable principal id, stable across credential rotation.
+    CreateTenantRequest:
+      type: object
+      description: Request to provision a new tenant.
+      required:
+      - slug
+      - display_name
+      properties:
+        display_name:
+          type: string
+          description: Human-readable tenant name.
+        slug:
+          $ref: '#/components/schemas/TenantSlug'
+          description: URL-safe tenant identifier, unique across the deployment.
+      additionalProperties: false
+    CreateTenantResponse:
+      type: object
+      description: |-
+        Result of provisioning a tenant.
+
+        Carries the administrative credential exactly once. The server stores only
+        its verifier, so a caller that discards this response must recover through
+        the platform plane rather than by reading it back.
+      required:
+      - tenant
+      - admin
+      properties:
+        admin:
+          $ref: '#/components/schemas/ProvisionedTenantAdmin'
+          description: Its administrative principal and one-time credential.
+        tenant:
+          $ref: '#/components/schemas/ProvisionedTenant'
+          description: The provisioned tenant.
+    CredentialListResponse:
+      type: object
+      description: A principal's credential metadata.
+      required:
+      - credentials
+      properties:
+        credentials:
+          type: array
+          items:
+            $ref: '#/components/schemas/CredentialMetadata'
+          description: Credentials, newest first. Never any secret material.
+    CredentialMetadata:
+      type: object
+      description: |-
+        Non-secret metadata for one credential.
+
+        Rotation works by overlap — issue, verify, then revoke — so a listing shows
+        revoked and expired credentials too; an operator mid-rotation needs to see
+        that the superseded one really is gone.
+      required:
+      - id
+      - prefix
+      - created_at
+      properties:
+        created_at:
+          type: string
+          description: Creation time, RFC 3339.
+        expires_at:
+          type:
+          - string
+          - 'null'
+          description: Expiry, when bounded.
+        id:
+          type: string
+          description: Credential id.
+        last_used_at:
+          type:
+          - string
+          - 'null'
+          description: Last successful use.
+        prefix:
+          type: string
+          description: Non-secret lookup prefix.
+        revoked_at:
+          type:
+          - string
+          - 'null'
+          description: Revocation time, when revoked.
     DataSpec:
       type: object
       description: Pure-data contract for a Data Card.
@@ -1613,6 +2218,10 @@ components:
             $ref: '#/components/schemas/ColumnName'
           description: Target columns for supervised workflows.
       additionalProperties: false
+    DataTenantId:
+      type: string
+      format: uuid
+      description: Immutable tenant isolation key used by tenant-scoped Wyrd and Vala rows.
     DataTypeSpec:
       oneOf:
       - type: string
@@ -2042,6 +2651,19 @@ components:
           type: string
           description: Header value.
       additionalProperties: false
+    IssuedCredential:
+      type: object
+      description: A newly issued credential for an existing principal.
+      required:
+      - id
+      - credential
+      properties:
+        credential:
+          $ref: '#/components/schemas/SecretBearer'
+          description: The plaintext, returned exactly once.
+        id:
+          type: string
+          description: Credential id, used to revoke it.
     ListCardsResponse:
       type: object
       description: A page of card summaries.
@@ -2081,6 +2703,20 @@ components:
           items:
             $ref: '#/components/schemas/VersionBlock'
           description: Resolved versions.
+      additionalProperties: false
+    LoginInitResponse:
+      type: object
+      description: '`GET /auth/login` response.'
+      required:
+      - authorization_url
+      - state
+      properties:
+        authorization_url:
+          $ref: '#/components/schemas/AbsoluteUrl'
+          description: Authorization URL used as the redirect target.
+        state:
+          type: string
+          description: Opaque login state echoed for SDK correlation.
       additionalProperties: false
     McpSpec:
       type: object
@@ -2317,6 +2953,178 @@ components:
           items:
             $ref: '#/components/schemas/SortKeyWire'
           description: Ordered sort keys; at most four may be declared.
+    PlatformCallbackRequest:
+      type: object
+      description: Complete a platform federated login.
+      required:
+      - code
+      - state
+      properties:
+        code:
+          type: string
+          description: Authorization code returned by the provider.
+        state:
+          type: string
+          description: Opaque state key issued when the login began.
+      additionalProperties: false
+    PlatformClientAuth:
+      oneOf:
+      - type: object
+        description: HTTP Basic with a client secret.
+        required:
+        - secret
+        - method
+        properties:
+          method:
+            type: string
+            enum:
+            - secret_basic
+          secret:
+            $ref: '#/components/schemas/SecretBearer'
+            description: The client secret, sealed before storage and never returned.
+      - type: object
+        description: Client secret in the request body.
+        required:
+        - secret
+        - method
+        properties:
+          method:
+            type: string
+            enum:
+            - secret_post
+          secret:
+            $ref: '#/components/schemas/SecretBearer'
+            description: The client secret, sealed before storage and never returned.
+      - type: object
+        description: A public client with no secret.
+        required:
+        - method
+        properties:
+          method:
+            type: string
+            enum:
+            - public
+      description: |-
+        How Wyrd authenticates to the platform provider's token endpoint.
+
+        The secret arms carry [`SecretBearer`], not `String`. This type derives
+        `Debug`, and a plain `String` would print the provider's client secret into
+        any log line, trace span, or error that formatted the request.
+    PlatformLoginRequest:
+      type: object
+      description: Begin a platform federated login.
+      required:
+      - redirect_uri
+      properties:
+        redirect_uri:
+          type: string
+          description: Where the provider returns the browser after authentication.
+      additionalProperties: false
+    PlatformOidcConnectionView:
+      type: object
+      description: The configured connection, with nothing secret in it.
+      required:
+      - issuer_url
+      - jwks_uri
+      - expected_audience
+      - client_id
+      - client_auth
+      - jwks_ttl_secs
+      properties:
+        client_auth:
+          type: string
+          description: Client authentication method name only — never the secret itself.
+        client_id:
+          type: string
+          description: Client identifier.
+        expected_audience:
+          type: string
+          description: Expected audience.
+        issuer_url:
+          type: string
+          description: Issuer URL.
+        jwks_ttl_secs:
+          type: integer
+          format: int64
+          description: JWKS cache lifetime in seconds.
+        jwks_uri:
+          type: string
+          description: JWKS endpoint.
+    PlatformPrincipalListResponse:
+      type: object
+      description: Every platform principal, including the ones no longer permitted to act.
+      required:
+      - principals
+      properties:
+        principals:
+          type: array
+          items:
+            $ref: '#/components/schemas/PlatformPrincipalSummary'
+          description: Principals, newest first.
+    PlatformPrincipalSummary:
+      type: object
+      description: One platform principal as an operator sees it.
+      required:
+      - principal_id
+      - principal_kind
+      - name
+      - status
+      properties:
+        match_claim:
+          type:
+          - string
+          - 'null'
+          description: Claim a human administrator was registered against.
+        name:
+          type: string
+          description: Operator-facing name.
+        principal_id:
+          $ref: '#/components/schemas/PrincipalId'
+          description: Durable principal id.
+        principal_kind:
+          type: string
+          description: |-
+            Principal kind: `global_admin` for the deployment root, `user` for a
+            human administrator.
+        status:
+          type: string
+          description: 'Lifecycle status: `active`, `suspended`, or `deleted`.'
+        subject:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Subject pinned at first login, once one has happened. `None` means this
+            administrator has never signed in.
+    PlatformTokenRequest:
+      type: object
+      description: Request to exchange a platform credential for a session.
+      required:
+      - credential
+      properties:
+        credential:
+          $ref: '#/components/schemas/SecretBearer'
+          description: The platform credential established at initialization or rotated since.
+      additionalProperties: false
+    PlatformTokenResponse:
+      type: object
+      description: A minted platform session.
+      required:
+      - access_token
+      - token_type
+      - expires_in
+      properties:
+        access_token:
+          $ref: '#/components/schemas/SecretBearer'
+          description: Bearer token presented on subsequent platform requests.
+        expires_in:
+          type: integer
+          format: int64
+          description: Lifetime in seconds.
+          minimum: 0
+        token_type:
+          type: string
+          description: Token type, always `Bearer`.
     PolicySpec:
       type: object
       description: Declarative policy rule set.
@@ -2343,6 +3151,10 @@ components:
           items:
             $ref: '#/components/schemas/PolicyRule'
           description: Policy rules.
+    PrincipalId:
+      type: string
+      format: uuid
+      description: Stable principal id on auth wire contracts.
     PromptSpec:
       allOf:
       - description: Native authored prompt. Provider-specific request shape lives here.
@@ -2356,18 +3168,87 @@ components:
           that is compiled into the native provider request.
         - **Native** (`request` present): the stored native `Prompt` shape, as
           produced by `save()`.
+    ProvisionedTenant:
+      type: object
+      description: The tenant that was provisioned.
+      required:
+      - id
+      - slug
+      - display_name
+      - status
+      properties:
+        display_name:
+          type: string
+          description: Human-readable tenant name.
+        id:
+          $ref: '#/components/schemas/DataTenantId'
+          description: Server-assigned tenant isolation key.
+        slug:
+          $ref: '#/components/schemas/TenantSlug'
+          description: URL-safe tenant identifier.
+        status:
+          type: string
+          description: Lifecycle state. `active` once the tenant is usable.
+    ProvisionedTenantAdmin:
+      type: object
+      description: The tenant's administrative principal and its one-time credential.
+      required:
+      - principal_id
+      - credential
+      properties:
+        credential:
+          $ref: '#/components/schemas/SecretBearer'
+          description: The credential, returned exactly once and never retrievable again.
+        principal_id:
+          $ref: '#/components/schemas/PrincipalId'
+          description: Durable principal id. It survives credential rotation and loss.
     QueryClass:
       type: string
       description: Server-derived admission class.
       enum:
       - interactive
       - analytical
+    RecoverTenantAdminRequest:
+      type: object
+      description: Request to restore administrative access to a tenant.
+      required:
+      - tenant_id
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/DataTenantId'
+          description: Tenant whose administration is being restored.
+      additionalProperties: false
     RegisterOutcome:
       type: string
       description: Whether a register call created a new table or matched an existing one.
       enum:
       - Created
       - AlreadyExists
+    RegisterPlatformAdminRequest:
+      type: object
+      description: Pre-register a human platform administrator.
+      required:
+      - name
+      - match_claim
+      properties:
+        match_claim:
+          type: string
+          description: |-
+            Claim value matched on this administrator's first login only. After that
+            the pinned subject resolves them and this is no longer consulted.
+        name:
+          type: string
+          description: Operator-facing name, unique across the deployment.
+      additionalProperties: false
+    RegisterPlatformAdminResponse:
+      type: object
+      description: A registered human platform administrator, awaiting first login.
+      required:
+      - principal_id
+      properties:
+        principal_id:
+          $ref: '#/components/schemas/PrincipalId'
+          description: Durable principal id, stable across every later login.
     RegisterTableRequest:
       type: object
       description: Register (create) a Bifrost table.
@@ -2520,6 +3401,11 @@ components:
         state:
           $ref: '#/components/schemas/RunningQueryLifecycleState'
           description: Current non-terminal lifecycle state.
+    SecretBearer:
+      type: string
+      format: password
+      description: Opaque secret. Redacted in logs and audit payloads.
+      writeOnly: true
     ServiceSpec:
       type: object
       description: Composition of cards used by an application or deployment.
@@ -2590,6 +3476,16 @@ components:
           - string
           - 'null'
           description: Service type.
+      additionalProperties: false
+    SetPlatformPrincipalStatusRequest:
+      type: object
+      description: Change whether a platform principal may act.
+      required:
+      - status
+      properties:
+        status:
+          type: string
+          description: '`active` to restore, `suspended` to stop this principal acting.'
       additionalProperties: false
     SortDirectionWire:
       type: string
@@ -3231,6 +4127,9 @@ components:
       - Active
       - Deprecated
       - Quarantined
+    TenantSlug:
+      type: string
+      description: Human-visible tenant slug resolved to a DataTenantId at the auth boundary.
     TimeGranularityWire:
       type: string
       description: |-
@@ -3597,3 +4496,7 @@ components:
 tags:
 - name: Bifrost
   description: Bounded Bifrost query transport
+- name: Principals
+  description: Tenant principal and credential administration
+- name: Platform
+  description: 'Platform control plane: tenant lifecycle and platform identity'

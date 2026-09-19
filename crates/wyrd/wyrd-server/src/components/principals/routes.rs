@@ -200,6 +200,19 @@ async fn mint_credential(
 /// # Errors
 /// Returns a stable Wyrd error when the caller is unauthorized, a requested
 /// role does not exist in the tenant, or a write fails.
+#[utoipa::path(
+    post,
+    path = "/v1/principals",
+    request_body = CreateServicePrincipalRequest,
+    responses(
+        (status = 200, description = "Principal created with its first credential, returned once",
+         body = CreateServicePrincipalResponse),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Tenant principal administration required"),
+        (status = 422, description = "A requested role does not exist in this tenant")
+    ),
+    tag = "Principals"
+)]
 #[tracing::instrument(level = "info", skip(state, caller, request))]
 async fn create_service_principal(
     State(state): State<AppState>,
@@ -268,6 +281,18 @@ async fn create_service_principal(
 /// # Errors
 /// Returns a stable Wyrd error when the caller is unauthorized or a write
 /// fails.
+#[utoipa::path(
+    post,
+    path = "/v1/principals/{principal_id}/credentials",
+    params(("principal_id" = String, Path, description = "Principal to issue for")),
+    responses(
+        (status = 200, description = "Credential issued, plaintext returned once",
+         body = IssuedCredential),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Tenant principal administration required")
+    ),
+    tag = "Principals"
+)]
 #[tracing::instrument(level = "info", skip(state, caller))]
 async fn issue_credential(
     State(state): State<AppState>,
@@ -292,6 +317,18 @@ async fn issue_credential(
 /// # Errors
 /// Returns a stable Wyrd error when the caller is unauthorized or the read
 /// fails.
+#[utoipa::path(
+    get,
+    path = "/v1/principals/{principal_id}/credentials",
+    params(("principal_id" = String, Path, description = "Principal whose credentials to list")),
+    responses(
+        (status = 200, description = "Non-secret credential metadata, newest first",
+         body = CredentialListResponse),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Tenant principal administration required")
+    ),
+    tag = "Principals"
+)]
 #[tracing::instrument(level = "info", skip(state, caller))]
 async fn list_credentials(
     State(state): State<AppState>,
@@ -360,6 +397,21 @@ pub(crate) async fn list_credentials_for(
 /// # Errors
 /// Returns a stable Wyrd error when the caller is unauthorized, the credential
 /// is unknown in this tenant, or a write fails.
+#[utoipa::path(
+    delete,
+    path = "/v1/principals/{principal_id}/credentials/{credential_id}",
+    params(
+        ("principal_id" = String, Path, description = "Principal that owns the credential"),
+        ("credential_id" = String, Path, description = "Credential to retire")
+    ),
+    responses(
+        (status = 204, description = "Credential retired"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Tenant principal administration required"),
+        (status = 404, description = "No live credential for this principal")
+    ),
+    tag = "Principals"
+)]
 #[tracing::instrument(level = "info", skip(state, caller))]
 async fn revoke_credential(
     State(state): State<AppState>,

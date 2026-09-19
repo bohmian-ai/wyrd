@@ -137,6 +137,19 @@ async fn authorize(
 /// # Errors
 /// Returns a stable Wyrd error when the caller is unauthorized, the client
 /// secret cannot be sealed, or the write fails.
+#[utoipa::path(
+    put,
+    path = "/platform/oidc/connection",
+    request_body = ConfigurePlatformOidcRequest,
+    responses(
+        (status = 200, description = "Connection installed; the JWKS endpoint comes from discovery",
+         body = PlatformOidcConnectionView),
+        (status = 401, description = "Platform session required"),
+        (status = 403, description = "Platform identity administration required"),
+        (status = 422, description = "Issuer invalid, unreachable, or resolving to a blocked address")
+    ),
+    tag = "Platform"
+)]
 #[tracing::instrument(level = "info", skip(state, caller, request))]
 async fn configure_connection(
     State(state): State<AppState>,
@@ -209,6 +222,17 @@ async fn configure_connection(
 /// # Errors
 /// Returns a stable Wyrd error when the caller is unauthorized, no connection
 /// is configured, or the read fails.
+#[utoipa::path(
+    get,
+    path = "/platform/oidc/connection",
+    responses(
+        (status = 200, description = "The configured connection, never its provider secret",
+         body = PlatformOidcConnectionView),
+        (status = 401, description = "Platform session required"),
+        (status = 404, description = "No connection configured")
+    ),
+    tag = "Platform"
+)]
 #[tracing::instrument(level = "info", skip(state, caller))]
 async fn read_connection(
     State(state): State<AppState>,
@@ -247,6 +271,16 @@ async fn read_connection(
 /// # Errors
 /// Returns a stable Wyrd error when the caller is unauthorized or the delete
 /// fails.
+#[utoipa::path(
+    delete,
+    path = "/platform/oidc/connection",
+    responses(
+        (status = 204, description = "Connection removed; the global credential still administers"),
+        (status = 401, description = "Platform session required"),
+        (status = 404, description = "No connection configured")
+    ),
+    tag = "Platform"
+)]
 #[tracing::instrument(level = "info", skip(state, caller))]
 async fn remove_connection(
     State(state): State<AppState>,
@@ -282,6 +316,19 @@ async fn remove_connection(
 /// # Errors
 /// Returns a stable Wyrd error when the caller is unauthorized, no connection
 /// is configured, the name or claim is already registered, or a write fails.
+#[utoipa::path(
+    post,
+    path = "/platform/admins",
+    request_body = RegisterPlatformAdminRequest,
+    responses(
+        (status = 200, description = "Administrator registered, awaiting first login",
+         body = RegisterPlatformAdminResponse),
+        (status = 401, description = "Platform session required"),
+        (status = 409, description = "Name or matching claim already registered"),
+        (status = 422, description = "No platform OIDC connection is configured")
+    ),
+    tag = "Platform"
+)]
 #[tracing::instrument(level = "info", skip(state, caller, request))]
 async fn register_admin(
     State(state): State<AppState>,
@@ -357,6 +404,16 @@ async fn register_admin(
 /// # Errors
 /// Returns a stable Wyrd error when the caller is unauthorized or the read
 /// fails.
+#[utoipa::path(
+    get,
+    path = "/platform/admins",
+    responses(
+        (status = 200, description = "Every platform principal, including suspended ones",
+         body = PlatformPrincipalListResponse),
+        (status = 401, description = "Platform session required")
+    ),
+    tag = "Platform"
+)]
 #[tracing::instrument(level = "info", skip(state, caller))]
 async fn list_platform_admins(
     State(state): State<AppState>,
@@ -397,6 +454,19 @@ async fn list_platform_admins(
 /// Returns a stable Wyrd error when the caller is unauthorized, the status is
 /// not a lifecycle value, the principal is unknown, the change would leave no
 /// active principal, or the write fails.
+#[utoipa::path(
+    put,
+    path = "/platform/admins/{principal_id}/status",
+    params(("principal_id" = String, Path, description = "Platform principal to change")),
+    request_body = SetPlatformPrincipalStatusRequest,
+    responses(
+        (status = 204, description = "Status changed"),
+        (status = 401, description = "Platform session required"),
+        (status = 404, description = "Platform principal not found"),
+        (status = 409, description = "Would leave the deployment with no active principal")
+    ),
+    tag = "Platform"
+)]
 #[tracing::instrument(level = "info", skip(state, caller, request))]
 async fn set_admin_status(
     State(state): State<AppState>,
@@ -483,6 +553,18 @@ fn login_service(state: &AppState) -> Result<PlatformLogin, WyrdErrorResponse> {
 /// # Errors
 /// Returns a stable Wyrd error when federated login is not configured, the
 /// provider cannot be reached, or the login state cannot be persisted.
+#[utoipa::path(
+    post,
+    path = "/auth/platform/login",
+    request_body = PlatformLoginRequest,
+    responses(
+        (status = 200, description = "Provider authorization URL and opaque state",
+         body = LoginInitResponse),
+        (status = 404, description = "Federated login is not configured"),
+        (status = 503, description = "Identity provider unavailable")
+    ),
+    tag = "Platform"
+)]
 #[tracing::instrument(level = "info", skip(state, request))]
 async fn begin_login(
     State(state): State<AppState>,
@@ -500,6 +582,18 @@ async fn begin_login(
 /// # Errors
 /// Returns a stable Wyrd error when the state is missing or replayed, the
 /// provider cannot be reached, or the identity is not accepted.
+#[utoipa::path(
+    post,
+    path = "/auth/platform/callback",
+    request_body = PlatformCallbackRequest,
+    responses(
+        (status = 200, description = "Platform session for the resolved administrator",
+         body = PlatformTokenResponse),
+        (status = 401, description = "Identity not accepted, indistinguishably for every cause"),
+        (status = 503, description = "Identity provider unavailable")
+    ),
+    tag = "Platform"
+)]
 #[tracing::instrument(level = "info", skip(state, request))]
 async fn complete_login(
     State(state): State<AppState>,

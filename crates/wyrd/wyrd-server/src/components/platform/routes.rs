@@ -61,6 +61,16 @@ pub fn platform_auth_router() -> Router<AppState> {
 /// # Errors
 /// Returns an unauthenticated error for every credential rejection, so no
 /// caller can distinguish which condition failed.
+#[utoipa::path(
+    post,
+    path = "/auth/platform/token",
+    request_body = PlatformTokenRequest,
+    responses(
+        (status = 200, description = "Short-lived platform session", body = PlatformTokenResponse),
+        (status = 401, description = "Credential rejected, indistinguishably for every cause")
+    ),
+    tag = "Platform"
+)]
 #[tracing::instrument(level = "info", skip(state, request))]
 async fn platform_token(
     State(state): State<AppState>,
@@ -99,6 +109,18 @@ async fn platform_token(
 /// # Errors
 /// Returns a stable Wyrd error when the caller is unauthorized, the tenant has
 /// no administrative principal, or a write fails.
+#[utoipa::path(
+    post,
+    path = "/platform/tenants/admin/credentials",
+    request_body = RecoverTenantAdminRequest,
+    responses(
+        (status = 200, description = "Replacement credential for the tenant's existing administrator",
+         body = ProvisionedTenantAdmin),
+        (status = 401, description = "Platform session required"),
+        (status = 403, description = "Tenant administrative recovery not granted")
+    ),
+    tag = "Platform"
+)]
 #[tracing::instrument(level = "info", skip(state, caller, request))]
 async fn recover_tenant_admin(
     State(state): State<AppState>,
@@ -130,6 +152,19 @@ fn not_configured() -> WyrdErrorResponse {
 /// # Errors
 /// Returns a stable Wyrd error when the caller is unauthorized, the slug is
 /// taken, the platform plane is unconfigured, or provisioning fails.
+#[utoipa::path(
+    post,
+    path = "/platform/tenants",
+    request_body = CreateTenantRequest,
+    responses(
+        (status = 200, description = "Provisioned tenant and its one-time administrative credential",
+         body = CreateTenantResponse),
+        (status = 401, description = "Platform session required"),
+        (status = 403, description = "Tenant creation not granted"),
+        (status = 409, description = "Slug already in use by a live tenant")
+    ),
+    tag = "Platform"
+)]
 #[tracing::instrument(level = "info", skip(state, caller, request))]
 async fn create_tenant(
     State(state): State<AppState>,

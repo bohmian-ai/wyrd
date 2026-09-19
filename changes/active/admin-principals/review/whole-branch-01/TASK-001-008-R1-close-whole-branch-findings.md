@@ -406,7 +406,7 @@ identity environment variables, or add a replacement trailer.
 | `FIND-admin-principals-12` | The existing real-server MCP journey performs authorized revocation and observes retirement while preserving discovery and denied-write checks. |
 | `FIND-admin-principals-13` | Administrative OpenAPI failures carry `WyrdProblem`; revoke requires the shipped body, records its reason, and generated artifacts are current. |
 | `FIND-admin-principals-14` | Both exact MCP catalog journeys include the two principal tools in shipped order, adjacent rustdoc is current, and `mise run test:bifrost:journey:mcp` passes all 9 tests. |
-| `FIND-TASK-001-10` | Owned by the branch owner per the finding's own text. The exact rewrite command, its verification, and a correction naming the fifteen commits this remediation itself added trailers to are in `FIND-TASK-001-10-history-rewrite.md` | Verification commands recorded in that file; the rewrite is the owner's to run | DEFERRED |
+| `FIND-TASK-001-10` | Waived by the branch owner, who overrode the finding: the AI co-author trailers stay and no history rewrite is performed. Author and committer on every unmerged commit are already `Thorrester <sjforrester32@gmail.com>` | `git log main..HEAD --format='%an <%ae>' \| sort -u` | WAIVED |
 | `FIND-003-2` | Exact real-server tests prove concurrent init, retry after every injected write failure, secret-free diagnostics, and uninitialized split behavior. |
 | `FIND-003-3` | The unused variant and superseded command vocabulary/prefix are absent outside historical change records. |
 | `FIND-004-2` | A real client lists/inspects tenants, suspends one, observes both fresh and existing token refusal, resumes it, and reuses the same principal/grant state. |
@@ -498,11 +498,12 @@ principal kind preserved verbatim in the committed text.
 
 ### Out of scope
 
-`FIND-TASK-001-10` is a history rewrite the finding assigns to the branch
-owner, and forbids the implementation agent from running `git config`, setting
-identity environment variables, or adding a replacement trailer. The command,
-its verification, and the list of commits this remediation itself must clean up
-are in `FIND-TASK-001-10-history-rewrite.md`.
+`FIND-TASK-001-10` is waived. The branch owner overrode the finding on
+2026-09-19: the `Co-Authored-By` trailers are acceptable and the history
+rewrite is not to be run. `FIND-TASK-001-10-history-rewrite.md` retains the
+command should that decision be revisited. AGENTS.md section 13 still reads
+"never add AI co-author trailers", so this waiver is a branch-scoped exception
+to it, not a change to the rule.
 
 ### Recorded conflicts and limits
 

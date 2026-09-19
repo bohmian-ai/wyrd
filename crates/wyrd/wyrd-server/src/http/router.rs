@@ -19,7 +19,9 @@ use crate::components::authz::authz_router;
 use crate::components::cards::cards_router;
 use crate::components::eval::eval_router;
 use crate::components::health::health_router;
-use crate::components::platform::{platform_auth_router, platform_router};
+use crate::components::platform::{
+    platform_auth_router, platform_identity_router, platform_login_router, platform_router,
+};
 use crate::components::principals::principals_router;
 use crate::components::storage::storage_router;
 use crate::http::error::WyrdErrorResponse;
@@ -78,7 +80,9 @@ pub fn build_router(state: AppState) -> Router {
         Router::new()
             .merge(auth_routes)
             .merge(platform_auth_router())
+            .merge(platform_login_router())
             .merge(platform_router())
+            .merge(platform_identity_router())
             .merge(mcp_route)
             .nest("/v1", v1_group),
         &state,

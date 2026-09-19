@@ -99,6 +99,14 @@ pub enum Resource {
     /// tenant, never the resources inside one, so holding it grants no access
     /// to any tenant's data.
     Tenants,
+    /// The deployment's platform-scope human identity: its one OIDC connection
+    /// and the human platform principals registered against it.
+    ///
+    /// A platform-control-plane resource, distinct from [`Resource::Tenants`]
+    /// so that administering who may sign in to the platform is visible in a
+    /// grant and in audit separately from administering tenants. Holding it
+    /// grants no access to any tenant's data.
+    PlatformIdentity,
     /// RFC 8693 token exchange and delegation.
     Delegation,
     /// Bifrost table definitions (DDL: create/list/describe).
@@ -195,6 +203,7 @@ impl Resource {
             Self::ServiceAccounts => "service_accounts",
             Self::Users => "users",
             Self::Tenants => "tenants",
+            Self::PlatformIdentity => "platform_identity",
             Self::Delegation => "delegation",
             Self::BifrostTable => "bifrost_table",
             Self::BifrostRecord => "bifrost_record",
@@ -443,6 +452,34 @@ impl Permission {
         Self {
             resource: Resource::Tenants,
             action: Action::Recover,
+            scope: PermissionScope::All,
+        }
+    }
+
+    /// Read the platform-scope identity configuration.
+    ///
+    /// Reading never yields provider secrets; the connection view is redacted
+    /// at the boundary regardless of who holds this.
+    #[must_use]
+    pub const fn platform_identity_read() -> Self {
+        Self {
+            resource: Resource::PlatformIdentity,
+            action: Action::Read,
+            scope: PermissionScope::All,
+        }
+    }
+
+    /// Configure the platform OIDC connection and register human platform
+    /// principals.
+    ///
+    /// Deliberately the same permission for both: registering a principal
+    /// against a connection you also control is one capability, and splitting
+    /// it would suggest a separation the plane does not actually have.
+    #[must_use]
+    pub const fn platform_identity_write() -> Self {
+        Self {
+            resource: Resource::PlatformIdentity,
+            action: Action::Write,
             scope: PermissionScope::All,
         }
     }

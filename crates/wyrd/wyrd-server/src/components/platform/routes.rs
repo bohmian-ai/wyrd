@@ -30,7 +30,10 @@ use crate::components::platform::recovery::TenantRecovery;
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
-/// Build the platform control-plane routes for the `/v1` group.
+/// Build the authenticated platform control-plane routes.
+///
+/// Merged at the top level, not under `/v1`: see this module's documentation
+/// for why the two planes have separate entries.
 pub fn platform_router() -> Router<AppState> {
     Router::new()
         .route("/platform/tenants", post(create_tenant))

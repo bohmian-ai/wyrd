@@ -708,3 +708,221 @@ async fn automation_cannot_escalate_itself_to_an_administrator() {
         "a reader principal cannot mint itself an administrator"
     );
 }
+
+/// Build a JSON request with a platform session and an explicit method.
+fn platform_request(
+    method: Method,
+    uri: &str,
+    session: &str,
+    body: Option<Value>,
+) -> Request<Body> {
+    let builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {session}"));
+    match body {
+        Some(body) => builder
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&body).expect("serializes")))
+            .expect("request builds"),
+        None => builder.body(Body::empty()).expect("request builds"),
+    }
+}
+
+/// An operator configures federated sign-in, registers an administrator, and
+/// can take it all away again without losing the deployment.
+///
+/// The provider secret is the thing to watch: it goes in once and must never
+/// come back out of any read. And because federated login is additive, removing
+/// the connection has to leave the global credential administering the platform
+/// — otherwise a provider outage or a fat-fingered delete would lock the
+/// operator out of their own deployment.
+#[tokio::test]
+async fn an_operator_configures_and_removes_federated_platform_sign_in() {
+    if !e2e_enabled() {
+        return;
+    }
+    let srv = WyrdTestServer::start_in_process()
+        .await
+        .expect("server starts");
+    let root = initialize_platform_root(&srv.operator_pool())
+        .await
+        .expect("deployment initializes");
+    let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
+
+    // Before any connection exists, a login attempt has nothing to resolve.
+    let resp = srv
+        .oneshot(anonymous_post(
+            "/auth/platform/login",
+            json!({ "redirect_uri": "https://wyrd.example/callback" }),
+        ))
+        .await
+        .expect("login route responds");
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "federated login is unavailable until it is configured"
+    );
+
+    // Registering an administrator before the connection would create a
+    // principal that could never sign in.
+    let resp = srv
+        .oneshot(platform_request(
+            Method::POST,
+            "/platform/admins",
+            &session,
+            Some(json!({ "name": "ops-lead", "match_claim": "ops@example.com" })),
+        ))
+        .await
+        .expect("register route responds");
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "an administrator cannot be registered against no connection"
+    );
+
+    let secret = "super-secret-client-value";
+    let resp = srv
+        .oneshot(platform_request(
+            Method::PUT,
+            "/platform/oidc/connection",
+            &session,
+            Some(json!({
+                "issuer_url": "https://idp.example.com/realms/platform",
+                "jwks_uri": "https://idp.example.com/realms/platform/protocol/openid-connect/certs",
+                "expected_audience": "wyrd-platform",
+                "client_id": "wyrd-platform",
+                "client_auth": { "method": "secret_post", "secret": secret },
+            })),
+        ))
+        .await
+        .expect("configure route responds");
+    let status = resp.status();
+    let configured = body_json(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "connection configures: {configured}"
+    );
+
+    let resp = srv
+        .oneshot(platform_request(
+            Method::GET,
+            "/platform/oidc/connection",
+            &session,
+            None,
+        ))
+        .await
+        .expect("read route responds");
+    assert_eq!(resp.status(), StatusCode::OK, "connection reads back");
+    let view = body_json(resp).await;
+    assert_eq!(
+        view["issuer_url"],
+        "https://idp.example.com/realms/platform"
+    );
+    assert_eq!(view["client_auth"], "SecretPost");
+    assert!(
+        !serde_json::to_string(&view)
+            .expect("view serializes")
+            .contains(secret),
+        "the provider secret never appears in a read: {view}"
+    );
+
+    let resp = srv
+        .oneshot(platform_request(
+            Method::POST,
+            "/platform/admins",
+            &session,
+            Some(json!({ "name": "ops-lead", "match_claim": "ops@example.com" })),
+        ))
+        .await
+        .expect("register route responds");
+    let status = resp.status();
+    let registered = body_json(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "administrator registers: {registered}"
+    );
+    assert!(
+        registered["principal_id"].is_string(),
+        "a registered administrator is a durable principal"
+    );
+
+    // The same claim cannot be registered twice, or two principals would
+    // compete to be pinned by one person's first login.
+    let resp = srv
+        .oneshot(platform_request(
+            Method::POST,
+            "/platform/admins",
+            &session,
+            Some(json!({ "name": "ops-lead-again", "match_claim": "ops@example.com" })),
+        ))
+        .await
+        .expect("register route responds");
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "one matching claim registers at most one administrator"
+    );
+
+    let resp = srv
+        .oneshot(platform_request(
+            Method::DELETE,
+            "/platform/oidc/connection",
+            &session,
+            None,
+        ))
+        .await
+        .expect("delete route responds");
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT, "connection removes");
+
+    // The whole point: losing federated sign-in costs the deployment nothing
+    // else. The global credential still administers the platform.
+    let resp = srv
+        .oneshot(platform_post(
+            "/platform/tenants",
+            &session,
+            json!({ "slug": "after-oidc-removal", "display_name": "Still Working" }),
+        ))
+        .await
+        .expect("tenant route responds");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the global credential administers the platform with federated login gone"
+    );
+}
+
+/// A tenant administrator cannot configure who signs in to the platform.
+#[tokio::test]
+async fn a_tenant_administrator_cannot_configure_platform_sign_in() {
+    if !e2e_enabled() {
+        return;
+    }
+    let srv = WyrdTestServer::start_in_process()
+        .await
+        .expect("server starts");
+    let admin = provisioned_tenant_admin(&srv, "outsider").await;
+
+    let resp = srv
+        .oneshot(platform_request(
+            Method::PUT,
+            "/platform/oidc/connection",
+            &admin,
+            Some(json!({
+                "issuer_url": "https://attacker.example.com/",
+                "jwks_uri": "https://attacker.example.com/certs",
+                "expected_audience": "wyrd-platform",
+                "client_id": "wyrd-platform",
+                "client_auth": { "method": "public" },
+            })),
+        ))
+        .await
+        .expect("configure route responds");
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "a tenant token cannot point the platform plane at another issuer"
+    );
+}

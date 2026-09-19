@@ -47,15 +47,24 @@ pub enum InitError {
 
 /// The authority a freshly initialized administrative root holds.
 ///
-/// Narrow on purpose: the platform plane manages tenant lifecycle and recovers
-/// tenant administration. It grants no access to any tenant's resources, so
-/// this set names the tenant directory and nothing inside a tenant.
+/// Narrow on purpose: the platform plane manages tenant lifecycle, recovers
+/// tenant administration, and configures who may sign in to administer the
+/// platform. It grants no access to any tenant's resources, so this set names
+/// the tenant directory and the platform's own identity, and nothing inside a
+/// tenant.
+///
+/// Platform identity is here because the root is the only identity a fresh
+/// deployment has: without it, nobody could ever configure the OIDC connection
+/// or register the first human administrator, and federated login would be
+/// unreachable by construction.
 fn platform_root_grant() -> PermissionSet {
     let mut grant = PermissionSet::new();
     grant.insert(Permission::tenant_create());
     grant.insert(Permission::tenant_read());
     grant.insert(Permission::tenant_suspend());
     grant.insert(Permission::tenant_recover_admin());
+    grant.insert(Permission::platform_identity_read());
+    grant.insert(Permission::platform_identity_write());
     grant
 }
 
@@ -147,6 +156,8 @@ mod tests {
             Permission::tenant_read(),
             Permission::tenant_suspend(),
             Permission::tenant_recover_admin(),
+            Permission::platform_identity_read(),
+            Permission::platform_identity_write(),
         ] {
             assert!(grant.contains(&required), "{required:?} is granted");
         }

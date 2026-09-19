@@ -5,6 +5,7 @@ mod card_scope;
 mod issue_key;
 mod oidc;
 mod permission_scope;
+mod platform_identity;
 mod principal_id;
 mod principal_kind;
 mod revoke;
@@ -23,6 +24,11 @@ pub use oidc::{AbsoluteUrl, CallbackQuery, IssuerUrl, LoginInitResponse, UrlPars
 pub use permission_scope::{
     BifrostPermissionScope, BifrostSchemaScope, BifrostTableScope, PermissionScope,
     PermissionScopeError,
+};
+pub use platform_identity::{
+    ConfigurePlatformOidcRequest, PlatformCallbackRequest, PlatformClientAuth,
+    PlatformLoginRequest, PlatformOidcConnectionView, RegisterPlatformAdminRequest,
+    RegisterPlatformAdminResponse,
 };
 pub use principal_id::{PLATFORM_AUDIT_PRINCIPAL, PrincipalId};
 pub use principal_kind::PrincipalKindTag;

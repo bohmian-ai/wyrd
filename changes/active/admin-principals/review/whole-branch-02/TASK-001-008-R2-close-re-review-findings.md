@@ -356,7 +356,7 @@ Do not run `mise run gate`; approved VER-003 excludes it for this change.
 | `FIND-005-1` | tenant-plane issuer/binding/revoke effects commit on the allowance's own `TenantConn` (`b1b3cf072`) | `mise run test:principals:integration`; `mise run test:platform:journey` | PASS |
 | `FIND-003-2` | `an_operator_initializes_the_deployment_through_the_shipped_binary` drives `CARGO_BIN_EXE_wyrd-server init`; `init()` no longer loads serving config (`95c0e0f63`) | `cargo nextest run -p wyrd-server --test platform_admin_e2e -E 'test(=an_operator_initializes_the_deployment_through_the_shipped_binary)'` via `mise run test:platform:journey` | PASS |
 | `FIND-004-5` | `wyrd-server recover-root` (`main.rs::recover_root`) over `boot::init::issue_platform_root_credential` and `wyrd-sql` `platform_principal_id_by_name`; operator docs corrected (`5ca9727f9`) | `cargo nextest run -p wyrd-server --test platform_admin_e2e -E 'test(=an_operator_recovers_from_losing_every_platform_credential)'` via `mise run test:platform:journey` | PASS |
-| `FIND-TASK-001-10` | none — the required correction is a branch-owner history rewrite, outside implementation scope | not run | **OPEN** |
+| `FIND-TASK-001-10` | none — waived by the branch owner on 2026-09-19 (see Material limits) | not run | **WAIVED** |
 | `FIND-admin-principals-R2-2` | `PlatformPrincipal { kind, .. }` carried from credential and federated session creation into `decision_event` (`2de0256eb`) | `cargo nextest run -p wyrd-auth --lib -E 'test(=platform_authz::pg_tests::a_decision_records_the_kind_it_was_made_by)'` via `mise run test:principals:integration` | PASS |
 | `FIND-admin-principals-R2-3` | `credential_id` flows exchange -> `cid` claim -> `Principal`/`PlatformPrincipal` -> every audit builder -> `vala.audit_staging` -> `vala.system.audit_log` projection (`02a5bb578`) | `cargo nextest run -p wyrd-auth --lib -E 'test(=platform_authz::pg_tests::a_decision_records_the_credential_it_was_made_with)'` via `mise run test:principals:integration`; federated-`NULL` and no-leak asserts in `mise run test:platform:journey` | PASS |
 | `FIND-admin-principals-R2-4` | TenantAdmin refresh rotation (`e853dff03`) | `mise run test:platform:journey` | PASS |
@@ -376,15 +376,20 @@ All run from the worktree, sequentially, with repository-managed Postgres:
 
 ### Material limits
 
-- `FIND-TASK-001-10` is **not closed**. Its required correction is a rewrite of
-  the branch's own commit metadata, explicitly assigned to the branch owner.
-  The earlier candidate-authored waiver note was rejected by standards review
-  and is not re-asserted here. The conflict is live and unresolved: `AGENTS.md`
-  §13 forbids AI co-author trailers, while this session's harness attribution
-  requires `Co-Authored-By: Claude Opus 5 (1M context)` and `Claude-Session:`
-  on every commit. Every commit in this remediation therefore still carries
-  the forbidden trailers. Only the branch owner can settle which rule governs
-  and perform the rewrite.
+- `FIND-TASK-001-10` is **WAIVED by the branch owner**, 2026-09-19, in their own
+  words: "FIND-TASK-001-10 - i approve this. co-author is fine". This is a
+  direct owner instruction in the implementation session, not a
+  candidate-authored note of the kind standards review previously rejected.
+  The finding reported two things against
+  `c5c20754a167e8f4d74a555a720bd51df6179a6f..HEAD`: 84 commits carrying
+  `Co-Authored-By: Claude` / `Claude-Session:` trailers, which `AGENTS.md` §13
+  forbids, and 49 commits whose author and/or committer is not the configured
+  `Thorrester <sjforrester32@gmail.com>`. The waiver is recorded as covering the
+  finding as written. No history was rewritten and no trailer was removed;
+  every commit in this remediation is authored and committed as `Thorrester
+  <sjforrester32@gmail.com>` and carries the two attribution trailers. Git
+  identity configuration was never altered and no identity environment variable
+  was ever set.
 - `TenantProvisioning`/`TenantRecovery` retain their `WyrdPostgres` field. Both
   use only `tenant_conn(tenant_id)`, but narrowing to a raw `PgPool` or a new
   newtype is forbidden by this packet's constraints, so the broader owner stays.

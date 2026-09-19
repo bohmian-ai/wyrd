@@ -93,7 +93,11 @@ rows. The generic queue publishes Arrow IPC through Gate and Scribe, which
 commits the rows to the Bifrost table
 `vala.eval.observations`. After Scribe acknowledges the observation, the server
 attempts a best-effort asynchronous, idempotent `verifier_runs` insert per
-matching active binding. That insert cannot block or roll back ingest. If it
+matching active binding. Each inserted run freezes the observation's
+`record_id` as `input_record_id` and its exact server-managed
+`wyrd_event_time` as `input_event_time`. The runner uses both to constrain the
+later Bifrost read to the correct UTC-day partition; client `created_at` does
+not select the partition. That insert cannot block or roll back ingest. If it
 fails or the process stops first, the observation remains committed but an Eval
 run is not guaranteed; the failure is traced. There is no Eval outbox in this
 initial change.

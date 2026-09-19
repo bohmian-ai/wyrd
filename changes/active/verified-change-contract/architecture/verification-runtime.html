@@ -270,7 +270,7 @@
         <tr><td>External Notify delivery</td><td>Same delivery identity; respect provider rate-limit response</td><td>Delivered or delivery dead letter; Alert remains</td></tr>
       </tbody>
     </table></div>
-    <div class="callout warn"><strong>Recommended starting policy (not yet approved):</strong> three total attempts per stage, with 30-second then 2-minute backoff; expiring claims recover worker crashes. Invalid configuration and unauthorized input are permanent errors, not retries. A provider call with an ambiguous outcome can be delivered more than once unless that provider accepts the stable delivery id as an idempotency key. Persist attempt count, next-attempt time, last error, and terminal state for status queries; set per-attempt execution timeouts by implementation.</div>
+    <div class="callout"><strong>Locked Operator policy:</strong> three total attempts, a 30-second timeout per attempt, 30-second then 2-minute retry delays, and a five-minute deadline from dispatch creation. Global Operator concurrency is 16 and per-tenant concurrency is 4. Invalid configuration and unauthorized input are permanent errors. A provider call with an ambiguous outcome can be delivered more than once unless that provider accepts the stable delivery id as an idempotency key.</div>
     <div class="callout danger"><strong>Spec conflict:</strong> REQ-064 says exhausted retries produce <code>inconclusive</code>, while REQ-063 reserves verdicts for completed executions and REQ-079/089 require inspectable dead-letter outcomes. The terminal mapping needs one explicit rule before implementation; this diagram does not silently turn an execution error into a failed subject verdict.</div>
   </section>
 
@@ -312,7 +312,7 @@
       <div class="decision"><span class="step">AGREED DIRECTION</span><h3>Retry execution, not judgment</h3><p>Execution errors retry same durable run; completed failed verdicts dispatch the Operator once. Operator delivery retries separately.</p></div>
       <div class="decision"><span class="step">TO LOCK IN SPEC</span><h3>Baseline pending at cron</h3><p>No PSI/SPC run before the exact fitted baseline is ready. Define whether pending-baseline cron occurrences are skipped or caught up; a terminal fit failure exposes status and starts no run.</p></div>
       <div class="decision"><span class="step">TO LOCK IN SPEC</span><h3>Alert granularity</h3><p>Recommend one independent Alert per failed run/Notify dispatch, containing all findings. Reconcile the change spec with Drift logic.</p></div>
-      <div class="decision"><span class="step">TO LOCK IN SPEC</span><h3>Retry budget and windows</h3><p>Approve or change the proposed three-attempt retry default; specify per-implementation timeout, allowed lateness, missed-cron catch-up, overlap, and fitted-baseline serialization/size limit before planning.</p></div>
+      <div class="decision"><span class="step">AGREED DIRECTION</span><h3>Runtime bounds</h3><p>Verifier and Operator work each use a global ceiling of 16 and per-tenant ceiling of 4. Operator delivery uses three attempts, 30-second attempt timeouts, 30-second then 2-minute retries, and a five-minute deadline. Shutdown stops claims and drains for 30 seconds.</p></div>
     </div>
   </section>
 

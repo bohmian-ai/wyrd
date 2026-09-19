@@ -1,7 +1,7 @@
 ---
 id: SPEC-verified-change-contract
-revision: 28
-status: draft
+revision: 30
+status: approved
 ---
 
 # Verification contract
@@ -611,6 +611,9 @@ multi-table transaction design survives as an alternative.
 - **REQ-077**: Once Scribe acknowledges an Eval observation, the server MUST
   attempt an asynchronous, idempotent insert of one verifier_runs row per
   matching active binding, keyed by tenant, binding, and record identity. The
+  row MUST freeze `input_record_id` and `input_event_time`, where
+  `input_event_time` is the exact server-managed `wyrd_event_time` assigned to
+  the committed observation, not the client-authored `created_at`. The
   insert MUST NOT be part of Scribe's batch-fence transaction, delay or roll
   back the Bifrost acknowledgement, or add an outbox in this change. If enqueue
   fails or the process stops before it completes, Bifrost retains the record,
@@ -640,8 +643,12 @@ table on `(data_tenant_id, result_id)`.
 - **REQ-079**: A verifier_runs row MUST freeze the tenant, owner and binding
   identity, exact Verifier Card UID/version, input record or window, and
   effective Trigger and Operator identities. The generic runner claims it with
-  bounded lease and token-fenced settlement, loads that exact Card, and
-  dispatches its typed implementation. Engine errors retry the same run with
+  bounded lease and token-fenced settlement. For Eval, it MUST use the frozen
+  `input_event_time` to constrain the Bifrost input read to the corresponding
+  UTC `wyrd_event_time` partition and `input_record_id`; it MUST NOT derive the
+  partition from client `created_at`, search a moving lookback window, or scan
+  every historical partition. It then loads that exact Card and dispatches its
+  typed implementation. Engine errors retry the same run with
   bounded backoff and attempts; a valid failed verdict is a completed result,
   not an engine error. Expired claims are reclaimable. Terminal engine errors
   produce no verdict and no Operator dispatch.
@@ -887,8 +894,8 @@ table on `(data_tenant_id, result_id)`.
   dispatch ID in an `Idempotency-Key` header that the destination may honor;
   an authored header MUST NOT override it. An
   ambiguous external send may be delivered more than once; no Slack
-  destination deduplication is promised. Exact numeric ceilings and worker
-  capacity remain the operational-bounds decision below.
+  destination deduplication is promised. REQ-146 fixes the numeric ceilings
+  and worker capacity.
 - **REQ-143**: Until the separate server Workflow invocation change lands,
   the `workflow` Operator action is a typed but non-executable placeholder.
   It MAY be registered as an Operator Card for authoring, but it MUST be
@@ -988,6 +995,37 @@ table on `(data_tenant_id, result_id)`.
   on process-local-only run or dispatch state. No new network-serving role or
   kind-specific scheduler is created. The Drift baseline fitter is the sole
   implementation-specific background helper.
+- **REQ-145**: Verification MUST reuse the existing RBAC permissions. Composite
+  registration and binding changes require `cards:write`; a binding that names
+  an `on_failure` Operator also requires `operators:invoke`. Fixed-table
+  describes during `start_bifrost` and lazy dynamic-table describes require
+  `bifrost_table:read`. Drift, Eval, and generic record admission require
+  `bifrost_record:write` plus the existing signed Card scope for the exact
+  observed subject; generic record retains the reserved-table refusal.
+  Verification binding and run status require `cards:read`; reading analytical
+  results additionally requires `bifrost_query:read`. Direct and binding-backed
+  manual Verifier runs require `evals:run` plus scope over the exact target.
+  Each boundary that evaluates one of these permissions MUST append its allow
+  or deny through the canonical transactional audit path. The durable binding
+  freezes the already-authorized Operator; the tenant-scoped SYSTEM worker
+  executes that frozen dispatch without reevaluating an end-user permission.
+  Scheduler ticks, claims, leases, retries, Scribe commits, and worker mechanics
+  evaluate no principal permission and MUST NOT emit authorization audit rows.
+- **REQ-146**: The initial VerificationRuntime MUST use one scheduler task, a
+  shared Verifier/baseline execution ceiling of 16 globally and 4 per tenant,
+  and an external Operator execution ceiling of 16 globally and 4 per tenant.
+  A worker MUST acquire both applicable permits before claiming durable work.
+  An external Operator dispatch has three total attempts, a 30-second timeout
+  per attempt, a five-minute deadline from dispatch creation, and retry delays
+  of 30 seconds then two minutes; `Retry-After` is honored only when clipped to
+  that deadline. These are server ceilings and cannot be raised by a Card.
+  Shutdown MUST stop new claims immediately, allow 30 seconds for in-flight
+  work, then cancel remaining work and release or expire its fenced lease for
+  retry with the same durable identity. The server MUST restart an unexpectedly
+  exited runtime task and report unhealthy while a required capability is
+  absent. Existing tracing and metrics MUST expose queue depth, active work,
+  attempts, failures, and latency; this change adds no new telemetry service or
+  process-local work registry.
 - **REQ-114**: Before this change is complete, the owning Card and runtime
   architecture authorities, generated schemas, and public documentation MUST
   describe the new Verifier-only verification model. In particular, the
@@ -1099,6 +1137,10 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
   observe:eval over wyrd-client/wyrd-queue's canonical IPC path; and proves
   the new vala.eval.observations row receives a Scribe acknowledgement
   independent of the later best-effort Postgres verifier_runs insert.
+  The created run MUST retain the committed row's exact `record_id` and
+  server-managed `wyrd_event_time`, and its input read MUST demonstrate UTC-day
+  partition pruning with those frozen values even when client `created_at`
+  falls on a different day.
   Successful enqueue runs the existing Eval executor and persists
   vala.verification.results plus vala.eval.result_items joined by
   (`data_tenant_id`, `result_id`). A workflow that skips a task MUST persist
@@ -1288,21 +1330,23 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
   and `result_id` row-group pruning where the predicate is selective. The
   result and its details MUST report the same `wyrd_event_time` even when
   their separate Scribe acknowledgements straddle a UTC day boundary.
+- **AC-030**: Authorization journeys MUST prove each REQ-145 permission at its
+  public or Gate boundary, including allow and deny audit rows, subject Card
+  scope refusal, reserved-table refusal, and no audit rows for internal claims,
+  retries, Scribe commits, or worker mechanics. A multi-tenant runtime journey
+  MUST saturate one tenant at four Verifier and four Operator executions while
+  another tenant still progresses, and MUST show neither global pool exceeds
+  16. A slow local Operator endpoint MUST prove the 30-second attempt timeout,
+  three-attempt budget, 30-second/two-minute retry schedule, five-minute
+  deadline, and terminal status without rerunning the Verifier. Shutdown tests
+  MUST prove claims stop immediately, work drains for at most 30 seconds, and
+  unfinished durable work is recoverable with the same identity after restart;
+  an unexpected worker exit MUST restart and be visible through health,
+  tracing, and the required runtime metrics.
 
 ## Open material decisions
 
-The revision remains draft until these Drift/Eval and common-core decisions
-are resolved with loader-valid customer YAML. Future implementation kinds
-and Change Request work do not block this change's approval.
-
-1. **Runtime authorization and operations:** exact permissions and audit
-    decision points for registration, fixed-system-table describe at
-    `start_bifrost`, dynamic user-table describe and record admission, status,
-    manual runs, and external Operator execution; bounded worker concurrency,
-    shutdown, supervision, and telemetry needed to operate the required
-    journeys, including numeric Operator attempt/timeout/deadline ceilings
-    and per-tenant external-call capacity. Internal Scribe and worker
-    mechanics do not themselves become authorization audit events.
+None. Revision 30 was explicitly approved on 2026-09-19.
 
 ## Material authority links
 
@@ -1459,3 +1503,17 @@ and Change Request work do not block this change's approval.
   their detail tables. Existing Bifrost retention applies without a new
   verification policy. Runtime authorization and operational bounds remain
   open, so this revision remains draft.
+- **Revision 29 Eval input lookup draft (2026-09-19):** Required every
+  postcommit Eval `verifier_runs` row to freeze the committed observation's
+  `record_id` and server-managed `wyrd_event_time`. The runner uses that time
+  to constrain its Bifrost input read to the correct UTC partition rather than
+  trusting client `created_at`, using a moving lookback, or scanning history.
+  This adds no field to `vala.eval.observations`; runtime authorization and
+  operational bounds remain open, so this revision remains draft.
+- **Revision 30 runtime authorization and operations draft (2026-09-19):**
+  Reused the existing Card, Eval, Operator, and Bifrost permissions with
+  canonical audit only at boundaries that evaluate them. Fixed global and
+  per-tenant Verifier and Operator capacity, Operator timeout/attempt/deadline
+  limits, graceful shutdown, supervision, health, tracing, and metrics. No
+  material decisions remain; this revision was explicitly approved on
+  2026-09-19.

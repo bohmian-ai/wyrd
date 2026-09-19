@@ -333,6 +333,8 @@ atomic queue admission or that queue admission is a durable Scribe ACK.
   does not choose a run's destination or change the fixed system tables.
   These explicit describe requests may use the existing card-bound token
   exchange and activate the exact principal; an idle state does not refresh.
+  Each describe requires the existing `bifrost_table:read` permission and is
+  audited at the server boundary that evaluates it.
 - `observe.record(table, value)` is the generic user-table call on either the
   root run or a Card-scoped view. The table name is required on that call,
   never on `state.run()`. The input is a language-native serializable, flat
@@ -368,8 +370,10 @@ atomic queue admission or that queue admission is a durable Scribe ACK.
   shutdown and may otherwise receive a schema-fingerprint refusal.
 - `observe.record` uses ordinary user-table permissions and cannot write
   reserved or system-managed tables. The dedicated Drift and Eval calls use
-  their fixed system-table path. A generic record does not by itself create
-  a Verifier run or select a Verifier binding.
+  their fixed system-table path. All three admission paths require the existing
+  `bifrost_record:write` permission plus signed Card scope over the exact
+  observed subject, and Gate audits the allow or deny decision. A generic
+  record does not by itself create a Verifier run or select a Verifier binding.
 
 The same explicit-table insert path handles all three observe methods.
 `observe.record(table, value)` serializes one caller row after its lazy
@@ -473,13 +477,15 @@ not as provider-facing prompt text. The binding `id` names an existing
 `${media:id}` variable in the resolved judge Prompt; `kind` selects a
 supported Skald media kind rather than inferring it from the filename. The
 client queues only the small URI descriptor in the fixed
-`vala.eval.observations` projection; that exact physical Arrow layout remains
-an open schema decision. No media download, provider call, or Eval scoring
-happens inside `observe.eval(...)`.
+`vala.eval.observations` projection defined in `table_schema.md`. No media
+download, provider call, or Eval scoring happens inside `observe.eval(...)`.
 
 After Scribe acknowledges the input, the server best-effort enqueues the
-matching continuous Eval run in Postgres. The generic runner reads the
-committed record and feeds it to the existing chain:
+matching continuous Eval run in Postgres. Each run freezes
+`input_record_id` and `input_event_time`; the latter is the exact
+server-managed `wyrd_event_time` assigned to the committed row, not the
+client-authored `created_at`. The generic runner uses those values to read the
+record from its bounded UTC-day partition and feeds it to the existing chain:
 
 ```text
 vala.eval.observations

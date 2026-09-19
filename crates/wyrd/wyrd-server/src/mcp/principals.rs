@@ -28,6 +28,7 @@ use wyrd_spec::error::WyrdError;
 
 use super::WyrdMcpHandler;
 use crate::components::auth::Caller;
+use crate::http::error::internal_failure;
 
 /// Wire name of the credential-metadata listing.
 pub(super) const LIST_CREDENTIALS: &str = "principals.list_credentials";
@@ -211,9 +212,8 @@ impl WyrdMcpHandler {
         .await?;
 
         Ok(CallToolResult::structured(
-            serde_json::to_value(listing).map_err(|error| WyrdError::Internal {
-                message: "credential listing could not be projected".to_owned(),
-                details: serde_json::json!({ "error": error.to_string() }),
+            serde_json::to_value(listing).map_err(|error| {
+                internal_failure("credential listing could not be projected", &error)
             })?,
         ))
     }

@@ -27,7 +27,7 @@ use wyrd_spec::error::WyrdError;
 use crate::components::auth::PlatformCaller;
 use crate::components::platform::provisioning::{ProvisionError, TenantProvisioning};
 use crate::components::platform::recovery::TenantRecovery;
-use crate::http::error::WyrdErrorResponse;
+use crate::http::error::{WyrdErrorResponse, internal_failure};
 use crate::state::AppState;
 
 /// Build the authenticated platform control-plane routes.
@@ -97,10 +97,10 @@ async fn platform_token(
                 details: serde_json::json!({ "plane": "platform" }),
             }))
         }
-        Err(error) => Err(WyrdErrorResponse::from(WyrdError::Internal {
-            message: "platform session could not be issued".to_owned(),
-            details: serde_json::json!({ "error": error.to_string() }),
-        })),
+        Err(error) => Err(WyrdErrorResponse::from(internal_failure(
+            "platform session could not be issued",
+            &error,
+        ))),
     }
 }
 
@@ -199,10 +199,7 @@ fn provision_error(error: ProvisionError) -> WyrdErrorResponse {
             details: serde_json::json!({ "field": "slug" }),
         }),
         ProvisionError::AuditUnavailable(reason) | ProvisionError::Store(reason) => {
-            WyrdErrorResponse::from(WyrdError::Internal {
-                message: "tenant provisioning failed".to_owned(),
-                details: serde_json::json!({ "error": reason }),
-            })
+            WyrdErrorResponse::from(internal_failure("tenant provisioning failed", &reason))
         }
     }
 }

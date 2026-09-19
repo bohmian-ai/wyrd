@@ -31,7 +31,7 @@ use wyrd_sql::OperatorPool;
 use wyrd_sql::queries::platform::principal_grants::platform_grant_for_principal;
 
 use crate::components::auth::token_extract::{self, WYRD_ACCESS_TOKEN_HEADER};
-use crate::http::error::WyrdErrorResponse;
+use crate::http::error::{WyrdErrorResponse, internal_failure};
 use crate::state::AppState;
 
 /// An authenticated platform-control-plane caller.
@@ -105,19 +105,16 @@ async fn resolve_grant(
     let stored = platform_grant_for_principal(pool, principal_id.as_uuid())
         .await
         .map_err(|error| {
-            WyrdErrorResponse::from(WyrdError::Internal {
-                message: "platform grant lookup failed".to_owned(),
-                details: serde_json::json!({ "error": error.to_string() }),
-            })
+            WyrdErrorResponse::from(internal_failure("platform grant lookup failed", &error))
         })?;
     let Some(stored) = stored else {
         return Ok(PermissionSet::new());
     };
     let permissions: Vec<Permission> = serde_json::from_value(stored).map_err(|error| {
-        WyrdErrorResponse::from(WyrdError::Internal {
-            message: "platform grant permissions are corrupt".to_owned(),
-            details: serde_json::json!({ "error": error.to_string() }),
-        })
+        WyrdErrorResponse::from(internal_failure(
+            "platform grant permissions are corrupt",
+            &error,
+        ))
     })?;
     let mut set = PermissionSet::new();
     for permission in permissions {
@@ -163,10 +160,10 @@ impl FromRequestParts<AppState> for PlatformCaller {
             Ok(session) => session,
             Err(PlatformSessionError::Invalid) => return Err(unauthenticated()),
             Err(error) => {
-                return Err(WyrdErrorResponse::from(WyrdError::Internal {
-                    message: "platform session verification failed".to_owned(),
-                    details: serde_json::json!({ "error": error.to_string() }),
-                }));
+                return Err(WyrdErrorResponse::from(internal_failure(
+                    "platform session verification failed",
+                    &error,
+                )));
             }
         };
         let principal_id = session.principal_id;

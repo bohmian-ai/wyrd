@@ -38,7 +38,7 @@ use wyrd_sql::queries::platform::principals::{
 use wyrd_sql::{OperatorPool, SqlError};
 
 use crate::components::auth::PlatformCaller;
-use crate::http::error::WyrdErrorResponse;
+use crate::http::error::{WyrdErrorResponse, internal_failure};
 use crate::state::AppState;
 
 /// Claim mapping the platform connection uses.
@@ -119,10 +119,10 @@ async fn authorize(
         .await
         .map_err(platform_authz_error)?;
     decision.commit().await.map_err(|error| {
-        WyrdErrorResponse::from(WyrdError::Internal {
-            message: "platform authorization could not be committed".to_owned(),
-            details: serde_json::json!({ "error": error.to_string() }),
-        })
+        WyrdErrorResponse::from(internal_failure(
+            "platform authorization could not be committed",
+            &error,
+        ))
     })
 }
 
@@ -167,10 +167,13 @@ async fn configure_connection(
     // rebinding by the same owner the tenant issuer path uses. Taking a
     // caller-supplied JWKS URL instead would make this route an SSRF primitive:
     // the anonymous login route drives outbound fetches to whatever is stored.
+    // The parser's message names the URL library, so the caller is told which
+    // field to correct and nothing about what parsed it.
     let issuer = IssuerUrl::new(request.issuer_url.clone()).map_err(|error| {
+        tracing::warn!(cause = %error, "platform issuer URL rejected");
         WyrdErrorResponse::from(WyrdError::Validation {
             message: "issuer is not a valid issuer URL".to_owned(),
-            details: serde_json::json!({ "error": error.to_string() }),
+            details: serde_json::json!({ "field": "issuer_url" }),
         })
     })?;
     let jwks_uri =
@@ -180,10 +183,12 @@ async fn configure_connection(
     let sealed = seal_platform_client_secret(&client_auth, state.auth.sealing_key.as_deref())
         .map_err(|error| {
             // A secret-bearing connection with no sealing key fails closed
-            // rather than being stored in the clear.
+            // rather than being stored in the clear. The sealing failure names
+            // the key store, so it stays server-side.
+            tracing::error!(cause = %error, "platform client secret could not be sealed");
             WyrdErrorResponse::from(WyrdError::Validation {
                 message: "platform client secret could not be sealed".to_owned(),
-                details: serde_json::json!({ "reason": error.to_string() }),
+                details: serde_json::json!({}),
             })
         })?;
 
@@ -380,10 +385,10 @@ async fn register_admin(
     .await
     .map_err(taken_or_store)?;
     decision.commit().await.map_err(|error| {
-        WyrdErrorResponse::from(WyrdError::Internal {
-            message: "platform administrator registration could not be committed".to_owned(),
-            details: serde_json::json!({ "error": error.to_string() }),
-        })
+        WyrdErrorResponse::from(internal_failure(
+            "platform administrator registration could not be committed",
+            &error,
+        ))
     })?;
 
     Ok(Json(RegisterPlatformAdminResponse {
@@ -621,16 +626,13 @@ fn platform_authz_error(error: PlatformAuthzError) -> WyrdErrorResponse {
                 details: serde_json::json!({ "permission": "platform_identity:write" }),
             })
         }
-        PlatformAuthzError::AuditUnavailable(reason) => {
-            WyrdErrorResponse::from(WyrdError::Internal {
-                message: "platform authorization could not be audited".to_owned(),
-                details: serde_json::json!({ "error": reason.to_string() }),
-            })
+        PlatformAuthzError::AuditUnavailable(reason) => WyrdErrorResponse::from(internal_failure(
+            "platform authorization could not be audited",
+            &reason,
+        )),
+        PlatformAuthzError::Transaction(error) => {
+            WyrdErrorResponse::from(internal_failure("platform authorization failed", &error))
         }
-        PlatformAuthzError::Transaction(error) => WyrdErrorResponse::from(WyrdError::Internal {
-            message: "platform authorization failed".to_owned(),
-            details: serde_json::json!({ "error": error.to_string() }),
-        }),
     }
 }
 
@@ -656,14 +658,13 @@ fn login_error(error: PlatformLoginError) -> WyrdErrorResponse {
                 details: serde_json::json!({ "retry_after_seconds": 1 }),
             })
         }
-        PlatformLoginError::Store(error) => WyrdErrorResponse::from(WyrdError::Internal {
-            message: "platform login failed".to_owned(),
-            details: serde_json::json!({ "error": error.to_string() }),
-        }),
-        PlatformLoginError::Session(reason) => WyrdErrorResponse::from(WyrdError::Internal {
-            message: "platform session could not be issued".to_owned(),
-            details: serde_json::json!({ "error": reason }),
-        }),
+        PlatformLoginError::Store(error) => {
+            WyrdErrorResponse::from(internal_failure("platform login failed", &error))
+        }
+        PlatformLoginError::Session(reason) => WyrdErrorResponse::from(internal_failure(
+            "platform session could not be issued",
+            &reason,
+        )),
     }
 }
 
@@ -680,8 +681,5 @@ fn taken_or_store(error: SqlError) -> WyrdErrorResponse {
 
 /// Project a platform store failure onto the public catalog.
 fn store_error(error: SqlError) -> WyrdErrorResponse {
-    WyrdErrorResponse::from(WyrdError::Internal {
-        message: "platform identity store failed".to_owned(),
-        details: serde_json::json!({ "error": error.to_string() }),
-    })
+    WyrdErrorResponse::from(internal_failure("platform identity store failed", &error))
 }

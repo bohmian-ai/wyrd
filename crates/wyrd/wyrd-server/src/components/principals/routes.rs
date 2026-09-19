@@ -35,7 +35,7 @@ use wyrd_sql::queries::auth::{
 
 use crate::audit;
 use crate::components::auth::Caller;
-use crate::http::error::WyrdErrorResponse;
+use crate::http::error::{WyrdErrorResponse, internal_failure};
 use crate::state::AppState;
 
 /// Lifetime of a credential issued to tenant automation.
@@ -154,10 +154,7 @@ async fn tenant_conn<'a>(
         .tenant_conn(caller.data_tenant_id)
         .await
         .map_err(|error| {
-            WyrdErrorResponse::from(WyrdError::Internal {
-                message: "tenant connection unavailable".to_owned(),
-                details: serde_json::json!({ "error": error.to_string() }),
-            })
+            WyrdErrorResponse::from(internal_failure("tenant connection unavailable", &error))
         })
 }
 
@@ -543,8 +540,8 @@ fn metadata(row: ApiKeyMetadataRow) -> CredentialMetadata {
 
 /// Map any internal failure onto the stable catalog without leaking detail.
 fn internal(error: impl std::fmt::Display) -> WyrdErrorResponse {
-    WyrdErrorResponse::from(WyrdError::Internal {
-        message: "tenant principal administration failed".to_owned(),
-        details: serde_json::json!({ "error": error.to_string() }),
-    })
+    WyrdErrorResponse::from(internal_failure(
+        "tenant principal administration failed",
+        &error,
+    ))
 }

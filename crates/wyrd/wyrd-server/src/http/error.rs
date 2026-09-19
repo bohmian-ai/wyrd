@@ -60,6 +60,22 @@ impl IntoResponse for WyrdErrorResponse {
     }
 }
 
+/// Record an internal failure and return the stable public error for it.
+///
+/// A SQL, session, provider, key-store, cryptographic, or serialization
+/// message names the libraries and infrastructure behind the boundary and is
+/// useless to the caller, so the cause is traced server-side and the served
+/// body carries only the operation that failed. Keeping the cause out of
+/// `details` is also what stops wire behavior from tracking the error text of
+/// an internal dependency.
+pub fn internal_failure(message: &'static str, cause: &dyn std::fmt::Display) -> WyrdError {
+    tracing::error!(failure = message, cause = %cause, "request failed internally");
+    WyrdError::Internal {
+        message: message.to_owned(),
+        details: serde_json::json!({}),
+    }
+}
+
 /// Render a Wyrd error as an RFC 9457 problem+json response.
 #[must_use]
 pub fn wyrd_error_response(error: WyrdError) -> Response {

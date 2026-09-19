@@ -1478,3 +1478,201 @@ async fn an_active_tenant_slug_is_still_refused() {
         "a live tenant's slug is a genuine collision, not a resumable failure"
     );
 }
+
+/// Internal strings a served failure must never carry.
+///
+/// Each names a layer behind the boundary — the database and its schema, the
+/// SQLx and `serde_json` message shapes, the PL/pgSQL fault this test injects.
+/// A caller that can see any of them can map the server's internals from
+/// ordinary error responses.
+const INTERNAL_FRAGMENTS: [&str; 6] = [
+    "audit_staging",
+    "platform.",
+    "sqlx",
+    "plpgsql",
+    "expected value",
+    "injected",
+];
+
+/// Assert a problem body is the stable public shape and nothing more.
+///
+/// `details` is checked as a whole rather than key by key: a scrubbed boundary
+/// adds no key at all, so anything present is a leak this test should fail on.
+fn assert_safe_problem(body: &Value, code: &str) {
+    assert_eq!(body["code"], code, "stable catalog code: {body}");
+    assert_eq!(body["details"], json!({}), "details carry no cause: {body}");
+    let rendered = body.to_string().to_lowercase();
+    for fragment in INTERNAL_FRAGMENTS {
+        assert!(
+            !rendered.contains(fragment),
+            "served failure leaks {fragment}: {body}"
+        );
+    }
+}
+
+/// An injected store failure and an unreadable grant both fail safely.
+///
+/// These are the two shapes the platform plane can fail in that a caller has no
+/// business seeing: a database error raised underneath the canonical audit
+/// append, and a grant row the server itself cannot deserialize. Both used to
+/// serialize their source text into `details`.
+#[tokio::test]
+async fn served_platform_failures_disclose_nothing_internal() {
+    if !e2e_enabled() {
+        return;
+    }
+    let srv = WyrdTestServer::start_in_process()
+        .await
+        .expect("server starts");
+    let root = initialize_platform_root(&srv.operator_pool())
+        .await
+        .expect("deployment initializes");
+    let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
+
+    // A fault underneath the canonical audit append, installed the same way the
+    // card registration journey installs its own.
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool opens");
+    sqlx::query(
+        r"CREATE OR REPLACE FUNCTION vala.test_fail_platform_authz_audit()
+           RETURNS trigger LANGUAGE plpgsql AS $$
+           BEGIN
+             IF NEW.operation = 'platform.authz' THEN
+               RAISE EXCEPTION 'injected platform authorization audit failure';
+             END IF;
+             RETURN NEW;
+           END;
+           $$;",
+    )
+    .execute(&superuser)
+    .await
+    .expect("failure function installs");
+    sqlx::query(
+        r"CREATE TRIGGER test_fail_platform_authz_audit
+           BEFORE INSERT ON vala.audit_staging
+           FOR EACH ROW EXECUTE FUNCTION vala.test_fail_platform_authz_audit()",
+    )
+    .execute(&superuser)
+    .await
+    .expect("failure trigger installs");
+
+    let resp = srv
+        .oneshot(platform_post(
+            "/platform/tenants",
+            &session,
+            json!({ "slug": "unrecordable", "display_name": "Unrecordable" }),
+        ))
+        .await
+        .expect("tenant route responds");
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_safe_problem(&body_json(resp).await, "WYRD_SPEC_500_INTERNAL");
+
+    sqlx::query("DROP TRIGGER test_fail_platform_authz_audit ON vala.audit_staging")
+        .execute(&superuser)
+        .await
+        .expect("failure trigger drops");
+
+    // A grant row the server cannot read back is a serialization failure on the
+    // authenticated path itself, before any handler runs.
+    sqlx::query("UPDATE platform.principal_grants SET permissions = '\"not-a-permission-list\"'")
+        .execute(&superuser)
+        .await
+        .expect("grant corrupts");
+
+    let resp = srv
+        .oneshot(platform_post(
+            "/platform/tenants",
+            &session,
+            json!({ "slug": "corrupt-grant", "display_name": "Corrupt" }),
+        ))
+        .await
+        .expect("tenant route responds");
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_safe_problem(&body_json(resp).await, "WYRD_SPEC_500_INTERNAL");
+}
+
+/// A tenant mutation whose decision cannot be recorded happens at all.
+///
+/// Audit is fail-closed, and the append shares the mutation's transaction, so
+/// the guarantee is not merely that the caller sees an error: the principal
+/// must not exist afterwards and no audit row may survive for it either. This
+/// forces the append to fail the way the card registration journey does, at the
+/// database, so nothing in the server is mocked out of the path.
+#[tokio::test]
+async fn an_unrecordable_tenant_mutation_leaves_nothing_behind() {
+    if !e2e_enabled() {
+        return;
+    }
+    let srv = WyrdTestServer::start_in_process()
+        .await
+        .expect("server starts");
+    let admin = provisioned_tenant_admin(&srv, "unrecordable-tenant").await;
+
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool opens");
+    sqlx::query(
+        r"CREATE OR REPLACE FUNCTION vala.test_fail_principal_create_audit()
+           RETURNS trigger LANGUAGE plpgsql AS $$
+           BEGIN
+             IF NEW.operation = 'auth.principal.create' THEN
+               RAISE EXCEPTION 'injected principal creation audit failure';
+             END IF;
+             RETURN NEW;
+           END;
+           $$;",
+    )
+    .execute(&superuser)
+    .await
+    .expect("failure function installs");
+    sqlx::query(
+        r"CREATE TRIGGER test_fail_principal_create_audit
+           BEFORE INSERT ON vala.audit_staging
+           FOR EACH ROW EXECUTE FUNCTION vala.test_fail_principal_create_audit()",
+    )
+    .execute(&superuser)
+    .await
+    .expect("failure trigger installs");
+
+    let resp = srv
+        .oneshot_authenticated(
+            &admin,
+            tenant_request(
+                Method::POST,
+                "/v1/principals",
+                Some(json!({ "name": "unrecordable-runner", "roles": ["reader"] })),
+            ),
+        )
+        .await
+        .expect("principal route responds");
+    let status = resp.status();
+    let body = body_json(resp).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "refused: {body}");
+    assert_eq!(body["code"], "WYRD_VALA_500_AUDIT_UNAVAILABLE");
+
+    sqlx::query("DROP TRIGGER test_fail_principal_create_audit ON vala.audit_staging")
+        .execute(&superuser)
+        .await
+        .expect("failure trigger drops");
+
+    let principals: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM wyrd.auth_service_accounts WHERE name = 'unrecordable-runner'",
+    )
+    .fetch_one(&superuser)
+    .await
+    .expect("principal count reads");
+    assert_eq!(principals, 0, "the refused principal was never created");
+
+    let audits: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.audit_staging WHERE operation = 'auth.principal.create'",
+    )
+    .fetch_one(&superuser)
+    .await
+    .expect("audit count reads");
+    assert_eq!(audits, 0, "no allowance survives the refused mutation");
+}

@@ -76,7 +76,9 @@ evidence, not authority, and may require correction to satisfy this spec.
   customer, such as its Okta organization, Entra ID tenant, or Keycloak realm.
 - **Human OIDC connection**: one tenant-owned trusted-issuer configuration used
   for browser login and distinguished from a workload issuer by the existing
-  human issuer policy.
+  human issuer policy. It is distinct from the deployment's single
+  platform-scope connection, which resolves only platform principals and is
+  never reachable from a tenant login entry.
 - **Tenant login URL**: the public Wyrd URL that selects a candidate tenant
   before authentication. It is routing context, not trusted tenant identity.
 - **Tenant administrator**: a human principal authorized by Wyrd to manage
@@ -282,7 +284,8 @@ User browser
   connection changes.
 - **AC-009**: Contract, generated-artifact, docs, and public-surface drift
   checks prove that HTTP, CLI, UI, schemas, stable errors, and documentation
-  describe one tenant-owned OIDC model.
+  describe one tenant-owned OIDC model per tenant, distinct from the
+  deployment-owned platform-scope connection.
 - **AC-010**: Retained live-provider evidence proves successful end-to-end
   login against controlled Okta, Entra ID, and Keycloak tenants or realms over
   externally trusted TLS, including discovery, callback, JWKS verification,

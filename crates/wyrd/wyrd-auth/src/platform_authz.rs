@@ -275,6 +275,28 @@ mod pg_tests {
         .expect("staged count reads")
     }
 
+    /// Read the `credential_id` of each staged decision, oldest first.
+    ///
+    /// Ordered by the staged sequence so the caller can compare the decisions
+    /// against the order it made them in.
+    async fn staged_credential_ids(
+        fixture: &PgFixture,
+        principal: PrincipalId,
+    ) -> Vec<Option<Uuid>> {
+        let admin = fixture.superuser_pool().await.expect("superuser pool");
+        sqlx::query_scalar(
+            "SELECT credential_id FROM vala.audit_staging
+              WHERE data_tenant_id = $1 AND principal_id = $2 AND operation = $3
+              ORDER BY seq",
+        )
+        .bind(DataTenantId::SYSTEM_OWNER.as_uuid())
+        .bind(principal.as_uuid())
+        .bind(PLATFORM_AUTHZ_OPERATION)
+        .fetch_all(&admin)
+        .await
+        .expect("staged decisions are readable")
+    }
+
     /// An allowance is staged in the transaction the caller goes on to use, so
     /// the decision and the operation commit together.
     #[tokio::test]
@@ -356,6 +378,52 @@ mod pg_tests {
                 "a {expected} decision is recorded as some other kind"
             );
         }
+    }
+
+    /// The decision names the credential its session was minted from.
+    ///
+    /// One principal holds two credentials at once during a rotation, so the
+    /// principal id alone cannot say which key made a given decision — which is
+    /// exactly what an operator retiring a leaked credential needs to know. A
+    /// federated session presents no credential, so its decisions name none.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot start or a decision names the wrong
+    /// credential.
+    #[tokio::test]
+    async fn a_decision_records_the_credential_it_was_made_with() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let authz = PlatformAuthorization::new(fixture.operator_pool().clone());
+        let mut permissions = PermissionSet::new();
+        permissions.insert(Permission::tenant_create());
+        let context =
+            platform_context_of_kind(&fixture, PrincipalKindTag::GlobalAdmin, permissions).await;
+        let principal = context.principal_id();
+        let AuthContext::Platform(base) = context else {
+            panic!("a platform context is not a tenant context");
+        };
+
+        let original = Uuid::now_v7();
+        let replacement = Uuid::now_v7();
+        for credential in [Some(original), Some(replacement), None] {
+            let conn = authz
+                .authorize(
+                    &AuthContext::from(base.clone().with_credential_id(credential)),
+                    &Permission::tenant_create(),
+                    "req-credential",
+                    None,
+                )
+                .await
+                .expect("authorized");
+            conn.commit().await.expect("allowance commits");
+        }
+
+        assert_eq!(
+            staged_credential_ids(&fixture, principal).await,
+            vec![Some(original), Some(replacement), None],
+            "the three decisions did not each name the credential they were made with"
+        );
     }
 
     /// A denial is durable even though the operation never ran, and names the

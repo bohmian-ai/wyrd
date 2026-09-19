@@ -1547,6 +1547,53 @@ async fn a_failed_provisioning_can_be_retried_with_the_same_slug() {
         .is_ok(),
         "the resumed tenant's administrator authenticates"
     );
+
+    // The first attempt committed a credential whose plaintext went nowhere,
+    // so the retry has to retire it. Two usable ways in, one of them held by
+    // nobody, is the outcome this stage exists to prevent.
+    assert!(
+        tenant_token(
+            &srv,
+            created["admin"]["credential"].as_str().expect("credential")
+        )
+        .await
+        .is_err(),
+        "the abandoned attempt's credential no longer authenticates"
+    );
+
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool for the tenant's identities");
+    let tenant_uuid = original_id.parse::<uuid::Uuid>().expect("tenant uuid");
+    let administrators: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM wyrd.auth_service_accounts
+          WHERE data_tenant_id = $1 AND principal_kind = 'tenant_admin'",
+    )
+    .bind(tenant_uuid)
+    .fetch_one(&superuser)
+    .await
+    .expect("administrator count reads");
+    assert_eq!(
+        administrators, 1,
+        "the retry reuses the administrator rather than creating a second"
+    );
+
+    let usable: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM wyrd.auth_api_keys
+          WHERE data_tenant_id = $1
+            AND revoked_at IS NULL
+            AND (expires_at IS NULL OR expires_at > now())",
+    )
+    .bind(tenant_uuid)
+    .fetch_one(&superuser)
+    .await
+    .expect("usable credential count reads");
+    assert_eq!(
+        usable, 1,
+        "exactly one credential is usable, and it is the one the retry disclosed"
+    );
 }
 
 /// An occupied slug is still a conflict.
@@ -1938,44 +1985,15 @@ async fn an_operator_rotates_the_deployment_root_credential() {
         .expect("revoke responds");
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
-    // One principal, two credentials, the same operation with each: the audit
-    // record has to say which key made which decision, or "rotate the leaked
-    // credential" has no way to establish what the leaked one did.
+    // The credential's non-secret id is what travels into audit; the secret
+    // itself never reaches a staged row. Which decision named which credential
+    // is settled deterministically in `platform_authz`, because publication
+    // drains staging on its own schedule here.
     let superuser = srv
         .pg_fixture()
         .superuser_pool()
         .await
         .expect("superuser pool for staged audit");
-    let replacement_id = issued["id"].as_str().expect("credential ids are strings");
-    for credential in [original.as_str(), replacement_id] {
-        let decisions: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM vala.audit_staging
-              WHERE operation = 'platform.authz' AND credential_id = $1::uuid",
-        )
-        .bind(credential)
-        .fetch_one(&superuser)
-        .await
-        .expect("decision count reads");
-
-        assert!(
-            decisions > 0,
-            "no decision names credential {credential}, so a rotation cannot say what it did"
-        );
-    }
-    let unattributed: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM vala.audit_staging
-          WHERE operation = 'platform.authz' AND principal_id = $1::uuid
-            AND credential_id IS NULL",
-    )
-    .bind(&principal_id)
-    .fetch_one(&superuser)
-    .await
-    .expect("unattributed count reads");
-    assert_eq!(
-        unattributed, 0,
-        "every session in this journey was minted from a credential, so none may be unattributed"
-    );
-
     // What travels is the credential's id, never the credential.
     let leaked: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM vala.audit_staging WHERE to_jsonb(audit_staging)::text LIKE $1",

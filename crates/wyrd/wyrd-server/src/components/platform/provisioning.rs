@@ -24,8 +24,8 @@ use wyrd_spec::auth::{
     SecretBearer, TenantListResponse,
 };
 use wyrd_sql::queries::auth::{
-    grant_role_to_service_account, insert_api_key, insert_service_account, role_by_name,
-    tenant_admin_principal_id,
+    grant_role_to_service_account, insert_api_key, insert_service_account, list_api_key_metadata,
+    revoke_api_key, role_by_name, tenant_admin_principal_id,
 };
 use wyrd_sql::queries::platform::provisioning::{
     insert_provisioning_tenant, mark_tenant_active, mark_tenant_failed, set_tenant_suspended,
@@ -378,7 +378,22 @@ impl TenantProvisioning {
             .await
             .map_err(|e| ProvisionError::Store(e.to_string()))?
         {
-            Some(existing) => existing,
+            Some(existing) => {
+                // The failed attempt may have committed a credential before it
+                // stopped, and its plaintext was never disclosed to anyone. A
+                // retry returns exactly one usable way in, so every credential
+                // this principal already holds is retired first rather than
+                // left live and unaccounted for.
+                for credential in list_api_key_metadata(&mut conn, existing)
+                    .await
+                    .map_err(|e| ProvisionError::Store(e.to_string()))?
+                {
+                    revoke_api_key(&mut conn, credential.id)
+                        .await
+                        .map_err(|e| ProvisionError::Store(e.to_string()))?;
+                }
+                existing
+            }
             None => {
                 let principal_id = Uuid::now_v7();
                 insert_service_account(

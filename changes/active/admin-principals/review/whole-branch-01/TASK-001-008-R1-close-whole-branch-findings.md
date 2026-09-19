@@ -491,28 +491,22 @@ git diff --check                      # clean
 
 ### Blocked
 
-`FIND-admin-principals-4` is closed for every owner this agent can safely
-reach: the `architecture/v1/00-foundations/` pages, the admin route module
-docs, and the tenant-OIDC specification.
+`FIND-admin-principals-4` is closed for every owner it names except two:
+the `architecture/v1/00-foundations/` pages, the admin route module docs, and
+the tenant-OIDC specification are committed.
 
-Four of its owners remain: `architecture/wyrd-design.md`,
-`architecture/wyrd-security-posture.md`, `architecture/wyrd-doctrine.mdx`, and
-`AGENTS.md`. All four carry uncommitted edits from a different concurrent
-change (`verified-change-contract`: the `Verifier` Card kind and Operator
-connection credentials) in this shared worktree. Editing them would entangle
-two changes, and they cannot be committed without staging that change's work.
-The remaining statements to replace in them are:
+`architecture/wyrd-design.md` and `architecture/wyrd-security-posture.md`
+remain. Both carry uncommitted edits from the concurrent
+`verified-change-contract` change in this shared worktree, and its hunks land
+on the same lines this finding replaces — it has already rewritten
+`wyrd-design.md:149` and `:152` to add a `System` principal kind to the closed-
+set sentence revision 7 reopens. Selective staging cannot separate an
+overlapping hunk, so committing here would carry that change's work into this
+branch.
 
-- `wyrd-design.md` and `wyrd-doctrine.mdx`: principal kinds closed to the old
-  `User`/`Service`/`Agent` set, machine principals required to be Card-bound
-  and tenant-owned, and the superseded audit statement.
-- `wyrd-security-posture.md`: the same principal-kind closure, plus "all OIDC
-  is tenant-owned" — revision 7 adds one deployment-owned platform-scope
-  connection and makes platform authority a grant held at platform scope.
-- `AGENTS.md`: nothing specific to this finding beyond the two-plane
-  vocabulary already described in the design owner.
-
-The branch owner should apply those once the concurrent change has landed.
+The four replacements are written out verbatim, each preserving that change's
+`System` kind, in `FIND-004-pending-architecture-edits.md` beside this file.
+Apply them once the concurrent change lands.
 
 ### Out of scope
 

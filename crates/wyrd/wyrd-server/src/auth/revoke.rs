@@ -11,7 +11,7 @@ use wyrd_spec::vala::{AuditDetail, RevocationReason};
 use crate::audit;
 use crate::auth::revocation_listener::notify_principal_revoked;
 use crate::components::auth::Caller;
-use crate::http::error::WyrdErrorResponse;
+use crate::http::error::{WyrdErrorResponse, internal_failure};
 use crate::state::AppState;
 use wyrd_auth::revoke::revoke_principal_in_conn;
 use wyrd_sql::TenantConn;
@@ -123,9 +123,11 @@ async fn fan_out_notify(
     }
 }
 
-fn internal_error(e: impl std::fmt::Display) -> WyrdErrorResponse {
-    WyrdErrorResponse::from(WyrdError::Internal {
-        message: e.to_string(),
-        details: serde_json::Value::Null,
-    })
+/// Refuse a revocation request with a stable message, logging the real cause.
+///
+/// Reuses the server's one internal-failure constructor so the source's
+/// `Display` — a SQL error, a pool timeout — reaches the trace and never the
+/// problem body.
+fn internal_error(cause: impl std::fmt::Display) -> WyrdErrorResponse {
+    WyrdErrorResponse::from(internal_failure("principal revocation failed", &cause))
 }

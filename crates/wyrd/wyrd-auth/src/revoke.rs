@@ -68,9 +68,15 @@ fn not_found(target_id: PrincipalId, tenant: DataTenantId) -> WyrdError {
     }
 }
 
-fn internal_error(error: impl std::fmt::Display) -> WyrdError {
+/// Refuse a revocation without telling the caller what failed.
+///
+/// The cause names the store, the stored kind, or the statement that rejected
+/// the write; the problem renderer publishes `message` verbatim, so the cause
+/// goes to the trace and the public body carries one stable sentence.
+fn internal_error(cause: impl std::fmt::Display) -> WyrdError {
+    tracing::error!(cause = %cause, "principal revocation failed");
     WyrdError::Internal {
-        message: error.to_string(),
+        message: "principal revocation failed".to_owned(),
         details: serde_json::Value::Null,
     }
 }
@@ -228,6 +234,71 @@ mod pg_tests {
         )
         .await
         .expect("revocation succeeds");
+    }
+
+    /// A failed revocation write says so without saying how.
+    ///
+    /// `WyrdError::Internal.message` is published verbatim by the problem
+    /// renderer, so a SQL error placed there would hand a caller the table, the
+    /// role, and the statement that refused. The cause belongs in the trace.
+    #[tokio::test]
+    async fn a_failed_revocation_write_keeps_its_cause_server_side() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+
+        let creator = Uuid::new_v4();
+        let sa_id = Uuid::new_v4();
+        let card_ref = make_service_card_ref("svc-revoke-denied");
+        {
+            let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+            seed_backing_card(&mut conn, &card_ref, creator).await;
+            insert_service_account(
+                &mut conn,
+                sa_id,
+                "service",
+                Some(&card_ref),
+                "svc-revoke-denied",
+                None,
+                creator,
+            )
+            .await
+            .expect("service account inserts");
+            conn.commit().await.expect("seed commits");
+        }
+
+        // Remove the runtime role's write privilege so the revocation statement
+        // fails exactly as an unavailable or misconfigured store would.
+        let admin = fixture.superuser_pool().await.expect("superuser pool");
+        sqlx::query("REVOKE UPDATE ON wyrd.auth_service_accounts FROM wyrd_app")
+            .execute(&admin)
+            .await
+            .expect("privilege revoked");
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let result = revoke_principal_in_conn(
+            &mut conn,
+            PrincipalId::new(sa_id),
+            PrincipalKindTag::Service,
+            tenant,
+        )
+        .await;
+        drop(conn);
+
+        sqlx::query("GRANT UPDATE ON wyrd.auth_service_accounts TO wyrd_app")
+            .execute(&admin)
+            .await
+            .expect("privilege restored");
+
+        let Err(WyrdError::Internal { message, .. }) = result else {
+            panic!("a refused write must surface as an internal failure, got: {result:?}");
+        };
+        assert_eq!(message, "principal revocation failed");
+        for leaked in ["auth_service_accounts", "permission", "wyrd_app", "UPDATE"] {
+            assert!(
+                !message.contains(leaked),
+                "the public message must not name {leaked}: {message}"
+            );
+        }
     }
 
     #[tokio::test]

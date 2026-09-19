@@ -46,7 +46,7 @@ use crate::audit;
 use crate::auth::pg_resolvers::{binding_write_from_binding, issuer_write_from_trusted};
 use crate::components::auth::Caller;
 use crate::config::DeploymentProfile;
-use crate::http::error::WyrdErrorResponse;
+use crate::http::error::{WyrdErrorResponse, internal_failure};
 use crate::state::AppState;
 
 /// Default JWKS key-cache TTL when a create request omits `jwks_ttl_secs`.
@@ -666,11 +666,8 @@ fn sql_unavailable(error: impl std::fmt::Display) -> WyrdErrorResponse {
 
 /// Map an unexpected server-side failure (serialization, encryption internals)
 /// to a `500`.
-fn internal_error(error: impl std::fmt::Display) -> WyrdErrorResponse {
-    WyrdErrorResponse::from(WyrdError::Internal {
-        message: error.to_string(),
-        details: serde_json::Value::Null,
-    })
+fn internal_error(cause: impl std::fmt::Display) -> WyrdErrorResponse {
+    WyrdErrorResponse::from(internal_failure("admin request failed", &cause))
 }
 
 #[cfg(test)]

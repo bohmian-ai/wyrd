@@ -96,6 +96,12 @@ credential.
 - One principal may hold several simultaneously valid credentials. Revoking one
   retires that credential and advances the principal's authorization epoch; it
   leaves the principal, its grants, and its other credentials intact.
+- Losing every platform credential does not end administration of the
+  deployment. An operator-only action beside initialization reissues one for the
+  existing root; it is not an HTTP route, requires the deployment's
+  platform-admin database access, creates no identity and writes no grant, and
+  refuses on an uninitialized deployment. That database access is therefore
+  equivalent in authority to holding the platform credential.
 - A platform session names the credential that minted it and re-reads that
   credential on every request, so revoking a platform credential ends its live
   sessions immediately without a separate epoch. A platform session

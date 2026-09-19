@@ -100,6 +100,26 @@ const INSERT_PLATFORM_PRINCIPAL_SQL: &str =
     "INSERT INTO platform.principals (id, principal_kind, name, status)
      VALUES ($1, $2, $3, 'active')";
 
+/// Read the id of one platform principal by its operator-facing name.
+///
+/// Recovery addresses the administrative root the only way an operator can name
+/// it from outside: by the fixed name initialization gave it. The lookup is a
+/// read, not an upsert — recovery reissues a credential for an existing root and
+/// must never conjure one.
+///
+/// # Errors
+/// Returns [`SqlError::Query`] when the read fails.
+pub async fn platform_principal_id_by_name(
+    conn: &mut TenantConn<'_>,
+    name: &str,
+) -> Result<Option<Uuid>, SqlError> {
+    sqlx::query_scalar("SELECT id FROM platform.principals WHERE name = $1")
+        .bind(name)
+        .fetch_optional(&mut **conn.transaction())
+        .await
+        .map_err(SqlError::from)
+}
+
 /// Read one platform principal by id.
 ///
 /// # Errors

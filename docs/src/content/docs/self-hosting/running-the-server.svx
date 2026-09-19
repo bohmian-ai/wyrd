@@ -41,7 +41,7 @@ The credential is shown exactly once and stored only as an Argon2 verifier. It i
 
 Initialization happens at most once. The root's name is unique in the database, so a second `init` — concurrent or later — refuses rather than minting a second root. All three writes commit together, so a failure leaves the deployment uninitialized and safe to retry.
 
-If you lose the credential, issue a replacement against the same principal rather than re-initializing.
+If you lose the credential, issue a replacement against the same principal rather than re-initializing. If you lose *every* platform credential, `wyrd-server recover-root` reissues one for the existing root — see [Recovery](#recovery).
 
 `init` needs the platform-admin database environment set, but not a signing key or storage backend. You can run it against a fresh production database before the full serving environment is in place.
 
@@ -116,23 +116,42 @@ Two different losses, two different commands:
 | What was lost | Recover with | Needs |
 | --- | --- | --- |
 | A tenant's last administrative credential | `wyrd platform tenant recover-admin --tenant <id>` | The platform credential |
-| The platform credential itself | `wyrd platform credential issue --principal <platform-principal-id>` | Another live platform credential |
+| One of several platform credentials | `wyrd platform credential issue --principal <platform-principal-id>` | Another live platform credential |
+| Every platform credential | `wyrd-server recover-root` | This machine's platform-admin database access |
 
 Tenant recovery issues a replacement credential for the tenant's *existing*
 administrative principal, so the tenant's roles, resources, and history are
 untouched. It refuses a tenant that is not active: a suspended, failed, or
 still-provisioning tenant must not acquire a new durable secret.
 
-The platform credential has no such backstop. It is the deployment's root, and
-nothing above it can reissue it, so rotate it with an overlap — issue the
-replacement, verify it, then revoke the old one — and never let the last live
-platform credential be the only copy:
+Rotate the platform credential with an overlap — issue the replacement, verify
+it, then revoke the old one — so the deployment is never down between the two
+steps:
 
 ```bash
 wyrd platform credential issue  --principal <platform-principal-id>
 wyrd platform credential list   --principal <platform-principal-id>
 wyrd platform credential revoke --principal <platform-principal-id> --credential-id <old-id>
 ```
+
+If that overlap is lost and no platform credential remains, the API cannot help:
+every way to obtain a platform session needs a credential, and only a verifier is
+stored, so nothing can be read back. `wyrd-server recover-root` is the way in. It
+runs from a machine with the deployment's platform-admin database access — the
+same authority that ran `init` — and reissues a credential for the root the
+deployment already has:
+
+```bash
+wyrd-server recover-root
+# wyrd_global_… (shown once, store it now)
+```
+
+It creates no identity and writes no grant, so the root's authority and audit
+history are unchanged, and it leaves the root's other credentials alone — retire
+those through the platform plane if they are genuinely lost. It refuses on an
+uninitialized deployment; run `init` there instead. Because it needs only
+database access, treat that access as equivalent to holding the platform
+credential.
 
 <Aside title="Custody">
 

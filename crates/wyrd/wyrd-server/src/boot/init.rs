@@ -18,7 +18,9 @@ use wyrd_runtime::{Permission, PermissionSet};
 use wyrd_spec::auth::PrincipalKindTag;
 use wyrd_sql::queries::platform::credentials::insert_platform_credential_tx;
 use wyrd_sql::queries::platform::principal_grants::set_platform_grant_tx;
-use wyrd_sql::queries::platform::principals::insert_platform_principal_tx;
+use wyrd_sql::queries::platform::principals::{
+    insert_platform_principal_tx, platform_principal_id_by_name,
+};
 use wyrd_sql::{OperatorPool, SqlError};
 
 /// Operator-facing name of the deployment's administrative root.
@@ -140,6 +142,72 @@ pub async fn initialize_platform_root(pool: &OperatorPool) -> Result<SecretStrin
     )
     .await?;
 
+    conn.commit().await?;
+    Ok(credential.secret)
+}
+
+/// Failure while reissuing the administrative root's credential.
+#[derive(Debug, thiserror::Error)]
+pub enum RecoverRootError {
+    /// The deployment has no administrative root to issue for.
+    #[error("this deployment is not initialized; run `wyrd-server init` first")]
+    NotInitialized,
+    /// Credential issuance failed.
+    #[error("replacement credential could not be issued: {0}")]
+    Credential(#[from] PlatformCredentialError),
+    /// A platform store write failed.
+    #[error("platform store write failed: {0}")]
+    Store(#[from] SqlError),
+}
+
+/// Issue a replacement credential for the existing administrative root.
+///
+/// The recovery of last resort. A platform credential cannot be recovered — only
+/// its verifier is stored — so losing every one of them would otherwise leave a
+/// deployment permanently unadministrable: the platform routes need a platform
+/// session, and every way to obtain one needs a credential that no longer
+/// exists. Reissuing is available only to whoever already holds the deployment's
+/// database access, which is the same authority that ran initialization.
+///
+/// Deliberately not an HTTP route, and deliberately not a second `init`: it
+/// creates no principal, writes no grant, and reads the root by the fixed name
+/// initialization gave it, so the identity, its authority, and its audit history
+/// all stay the ones the deployment already had. Credentials this root already
+/// holds are left alone — retiring them is a separate, auditable platform
+/// operation, and a recovery that silently revoked them would cut off an
+/// operator who still had one.
+///
+/// # Errors
+/// Returns [`RecoverRootError::NotInitialized`] when no root exists,
+/// [`RecoverRootError::Credential`] when the credential cannot be generated or
+/// hashed, and [`RecoverRootError::Store`] when a write or the commit fails. A
+/// failed attempt commits nothing and can be retried unchanged.
+#[tracing::instrument(level = "info", skip(pool), err)]
+pub async fn issue_platform_root_credential(
+    pool: &OperatorPool,
+) -> Result<SecretString, RecoverRootError> {
+    let credential = PlatformCredential::generate();
+    let raw = credential.secret.clone();
+    let secret_hash = tokio::task::spawn_blocking(move || hash_api_key(&raw))
+        .await
+        .map_err(|error| RecoverRootError::Credential(PlatformCredentialError::Join(error)))?
+        .map_err(|error| RecoverRootError::Credential(PlatformCredentialError::Hash(error)))?;
+
+    let mut conn = pool.begin_platform_audited().await?;
+    let Some(principal_id) = platform_principal_id_by_name(&mut conn, PLATFORM_ROOT_NAME).await?
+    else {
+        drop(conn);
+        return Err(RecoverRootError::NotInitialized);
+    };
+    insert_platform_credential_tx(
+        &mut conn,
+        Uuid::new_v4(),
+        principal_id,
+        &credential.prefix,
+        &secret_hash,
+        None,
+    )
+    .await?;
     conn.commit().await?;
     Ok(credential.secret)
 }

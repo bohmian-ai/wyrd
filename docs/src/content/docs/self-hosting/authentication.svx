@@ -80,7 +80,7 @@ The two are not interchangeable and neither is a weaker form of the other:
 | --- | --- | --- |
 | Administers | Tenant lifecycle, tenant-admin recovery, platform sign-in | One tenant's principals, credentials, and resources |
 | Can read tenant data | No | Yes, within its own tenant |
-| Recovered by | Another live platform credential, and nothing else | The platform credential |
+| Recovered by | Another live platform credential, or `wyrd-server recover-root` from a machine with the deployment's database access | The platform credential |
 | Custody in a hosted deployment | The provider's | The tenant's |
 
 Both are stored only as Argon2 verifiers and shown exactly once. Rotate either with an overlap — issue the replacement, verify it, then revoke the one it replaces — so nothing is down between the two steps. The commands for all of this are in [Administering the deployment](/self-hosting/running-the-server/#administering-the-deployment).

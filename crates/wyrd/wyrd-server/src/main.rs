@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use secrecy::ExposeSecret;
 
 use wyrd_server::app::{BootExit, run};
-use wyrd_server::boot::init::initialize_platform_root;
+use wyrd_server::boot::init::{initialize_platform_root, issue_platform_root_credential};
 use wyrd_server::config::ServeMode;
 use wyrd_sql::WyrdPostgres;
 use wyrd_sql::postgres_boot::PostgresBoot;
@@ -29,6 +29,13 @@ enum Command {
     /// Run once per deployment. Prints the root credential to this terminal
     /// and nowhere else; it cannot be retrieved afterwards.
     Init,
+    /// Issue a replacement credential for this deployment's existing root.
+    ///
+    /// The recovery of last resort, for a deployment that has lost every
+    /// platform credential. Requires this machine's database access, creates no
+    /// identity, and leaves the root's other credentials alone. Prints the new
+    /// credential to this terminal and nowhere else.
+    RecoverRoot,
 }
 
 #[tokio::main]
@@ -39,6 +46,7 @@ async fn main() {
     let result = match cli.command {
         None => run(cli.mode).await,
         Some(Command::Init) => init().await,
+        Some(Command::RecoverRoot) => recover_root().await,
     };
 
     let exit_code = match result {
@@ -67,19 +75,7 @@ async fn main() {
 /// The plaintext is printed once to this process's stdout, which is the
 /// operator's terminal rather than the server's log pipeline.
 async fn init() -> Result<(), BootExit> {
-    let boot = PostgresBoot::from_env()
-        .await
-        .map_err(|e| BootExit::Other(Box::new(e)))?;
-    let dsns = boot.dsns().map_err(|e| BootExit::Other(Box::new(e)))?;
-    let postgres = WyrdPostgres::connect_from_dsns(&dsns)
-        .await
-        .map_err(|e| BootExit::Other(Box::new(e)))?;
-    let Some(pool) = postgres.operator_pool() else {
-        return Err(BootExit::Config(Box::new(std::io::Error::other(
-            "platform control plane is not configured; set the platform-admin DSN",
-        ))));
-    };
-
+    let pool = operator_pool().await?;
     let credential = initialize_platform_root(&pool)
         .await
         .map_err(|e| BootExit::Other(Box::new(e)))?;
@@ -89,4 +85,46 @@ async fn init() -> Result<(), BootExit> {
     println!("{}", credential.expose_secret());
     println!("Store this credential securely. It cannot be retrieved again.");
     Ok(())
+}
+
+/// Issue a replacement credential for the existing administrative root.
+///
+/// Shares initialization's shape for the same reasons: Postgres handles only, no
+/// serving configuration, and the plaintext printed once to this terminal. It
+/// differs in creating nothing — the root must already exist.
+async fn recover_root() -> Result<(), BootExit> {
+    let pool = operator_pool().await?;
+    let credential = issue_platform_root_credential(&pool)
+        .await
+        .map_err(|e| BootExit::Other(Box::new(e)))?;
+
+    println!("Replacement platform administrative credential:");
+    println!("{}", credential.expose_secret());
+    println!("Store this credential securely. It cannot be retrieved again.");
+    println!("The root's other credentials are untouched; retire them if they are lost.");
+    Ok(())
+}
+
+/// Open the deployment's cross-tenant platform boundary from the environment.
+///
+/// The one thing both operator subcommands need and neither may take from a
+/// serving surface: the DSNs come from the environment, so an operator with this
+/// machine's database access can run either without the server running.
+///
+/// # Errors
+/// Returns [`BootExit::Config`] when the platform-admin DSN is not configured
+/// and [`BootExit::Other`] when the connection cannot be established.
+async fn operator_pool() -> Result<wyrd_sql::OperatorPool, BootExit> {
+    let boot = PostgresBoot::from_env()
+        .await
+        .map_err(|e| BootExit::Other(Box::new(e)))?;
+    let dsns = boot.dsns().map_err(|e| BootExit::Other(Box::new(e)))?;
+    let postgres = WyrdPostgres::connect_from_dsns(&dsns)
+        .await
+        .map_err(|e| BootExit::Other(Box::new(e)))?;
+    postgres.operator_pool().ok_or_else(|| {
+        BootExit::Config(Box::new(std::io::Error::other(
+            "platform control plane is not configured; set the platform-admin DSN",
+        )))
+    })
 }

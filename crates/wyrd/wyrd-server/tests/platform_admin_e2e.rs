@@ -169,19 +169,19 @@ async fn initialization_happens_at_most_once() {
     );
 }
 
-/// Point a child `wyrd-server` at this test's database.
+/// Point a child `wyrd-server` operator command at this test's database.
 ///
 /// The binary resolves its DSNs from the environment, so the only thing the
 /// child needs is the lane's `WYRD_DATABASE_URL` with the database swapped for
 /// the fixture's. Every other credential and password is inherited.
-fn init_command(database: &str) -> std::process::Command {
+fn operator_command(subcommand: &str, database: &str) -> std::process::Command {
     let base = env::var("WYRD_DATABASE_URL").expect("the journey lane sets WYRD_DATABASE_URL");
     let (prefix, _) = base
         .rsplit_once('/')
         .expect("a Postgres DSN names its database after the last slash");
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_wyrd-server"));
     command
-        .arg("init")
+        .arg(subcommand)
         .env("WYRD_DATABASE_URL", format!("{prefix}/{database}"));
     command
 }
@@ -209,7 +209,9 @@ async fn an_operator_initializes_the_deployment_through_the_shipped_binary() {
         .expect("server starts");
     let database = srv.pg_fixture().database_name().to_owned();
 
-    let first = init_command(&database).output().expect("init runs");
+    let first = operator_command("init", &database)
+        .output()
+        .expect("init runs");
     let stdout = String::from_utf8(first.stdout).expect("init prints UTF-8");
     let stderr = String::from_utf8(first.stderr).expect("init prints UTF-8");
     assert!(
@@ -246,7 +248,9 @@ async fn an_operator_initializes_the_deployment_through_the_shipped_binary() {
         "the printed credential administers the platform"
     );
 
-    let second = init_command(&database).output().expect("init runs again");
+    let second = operator_command("init", &database)
+        .output()
+        .expect("init runs again");
     let repeat_stdout = String::from_utf8(second.stdout).expect("init prints UTF-8");
     let repeat_stderr = String::from_utf8(second.stderr).expect("init prints UTF-8");
     assert!(
@@ -262,6 +266,190 @@ async fn an_operator_initializes_the_deployment_through_the_shipped_binary() {
         repeat_stderr.contains("wyrd-server:"),
         "the refusal is reported on stderr rather than silently: {repeat_stderr}"
     );
+}
+
+/// Losing every platform credential is recoverable through the shipped binary.
+///
+/// A platform credential cannot be read back — only its verifier is stored — so
+/// without an operator-side recovery, losing them all would end administration
+/// of the deployment permanently: every way to obtain a platform session needs a
+/// credential, and issuing one needs a session. Recovery is available to whoever
+/// already holds this machine's database access, which is the authority that ran
+/// initialization, and it reissues for the existing root rather than creating a
+/// second one.
+///
+/// # Panics
+///
+/// Panics when recovery does not restore full platform administration without
+/// manual SQL.
+#[tokio::test]
+async fn an_operator_recovers_from_losing_every_platform_credential() {
+    if !e2e_enabled() {
+        return;
+    }
+    let srv = WyrdTestServer::start_in_process()
+        .await
+        .expect("server starts");
+    let database = srv.pg_fixture().database_name().to_owned();
+
+    let initialized = operator_command("init", &database)
+        .output()
+        .expect("init runs");
+    assert!(initialized.status.success(), "init failed");
+    let root = printed_credential(&initialized.stdout);
+    let session = platform_session(&srv, &root).await;
+
+    let resp = srv
+        .oneshot(platform_request(
+            Method::GET,
+            "/platform/admins",
+            &session,
+            None,
+        ))
+        .await
+        .expect("listing responds");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let principal_id = body_json(resp).await["principals"][0]["principal_id"]
+        .as_str()
+        .expect("the deployment root is listed")
+        .to_owned();
+
+    // Lose every platform credential the deployment has, through the platform
+    // plane itself — no SQL.
+    let resp = srv
+        .oneshot(platform_request(
+            Method::GET,
+            &format!("/platform/admins/{principal_id}/credentials"),
+            &session,
+            None,
+        ))
+        .await
+        .expect("listing responds");
+    let listing = body_json(resp).await;
+    for credential in listing["credentials"]
+        .as_array()
+        .expect("credentials are listed")
+    {
+        let id = credential["id"]
+            .as_str()
+            .expect("credential ids are strings");
+        let resp = srv
+            .oneshot(platform_request(
+                Method::DELETE,
+                &format!("/platform/admins/{principal_id}/credentials/{id}"),
+                &session,
+                None,
+            ))
+            .await
+            .expect("revoke responds");
+        assert_eq!(
+            resp.status(),
+            StatusCode::NO_CONTENT,
+            "credential {id} retires"
+        );
+    }
+
+    let resp = srv
+        .oneshot(anonymous_post(
+            "/auth/platform/token",
+            json!({ "credential": root }),
+        ))
+        .await
+        .expect("token exchange responds");
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "the deployment really has no usable platform credential left"
+    );
+
+    let recovered = operator_command("recover-root", &database)
+        .output()
+        .expect("recover-root runs");
+    let stdout = String::from_utf8(recovered.stdout).expect("recover-root prints UTF-8");
+    let stderr = String::from_utf8(recovered.stderr).expect("recover-root prints UTF-8");
+    assert!(
+        recovered.status.success(),
+        "recover-root failed: stdout={stdout} stderr={stderr}"
+    );
+    let replacement = printed_credential(stdout.as_bytes());
+    assert!(
+        !stderr.contains(&replacement),
+        "the replacement reached stderr, which is where a log pipeline reads"
+    );
+
+    // Recovery is only recovery if the whole operator journey resumes: the
+    // replacement administers tenants and configures who may sign in.
+    let recovered_session = platform_session(&srv, &replacement).await;
+    let resp = srv
+        .oneshot(platform_post(
+            "/platform/tenants",
+            &recovered_session,
+            json!({ "slug": "after-recovery", "display_name": "After recovery" }),
+        ))
+        .await
+        .expect("tenant route responds");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the recovered credential provisions tenants"
+    );
+
+    let provider = wyrd_testing::DiscoveryFixture::start().await;
+    let resp = srv
+        .oneshot(platform_request(
+            Method::PUT,
+            "/platform/oidc/connection",
+            &recovered_session,
+            Some(json!({
+                "issuer_url": provider.issuer(),
+                "expected_audience": "wyrd-platform",
+                "client_id": "wyrd-platform",
+                "client_auth": { "method": "secret_post", "secret": "super-secret-client-value" },
+            })),
+        ))
+        .await
+        .expect("configure route responds");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the recovered credential configures platform sign-in"
+    );
+
+    // The recovered root is the one the deployment already had, not a second.
+    let resp = srv
+        .oneshot(platform_request(
+            Method::GET,
+            "/platform/admins",
+            &recovered_session,
+            None,
+        ))
+        .await
+        .expect("listing responds");
+    let admins = body_json(resp).await;
+    let roots = admins["principals"]
+        .as_array()
+        .expect("principals are listed")
+        .iter()
+        .filter(|principal| principal["principal_id"] == principal_id.as_str())
+        .count();
+    assert_eq!(
+        roots, 1,
+        "recovery reissued for the existing root rather than creating another: {admins}"
+    );
+}
+
+/// Extract the one credential a `wyrd-server` operator command printed.
+///
+/// # Panics
+///
+/// Panics when the output is not UTF-8 or names no credential.
+fn printed_credential(stdout: &[u8]) -> String {
+    std::str::from_utf8(stdout)
+        .expect("operator output is UTF-8")
+        .lines()
+        .find(|line| line.starts_with("wyrd_global_"))
+        .expect("the credential is printed to stdout")
+        .to_owned()
 }
 
 /// Neither plane can act on the other, in both directions.

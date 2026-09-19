@@ -7,6 +7,26 @@ use wyrd_spec::reference::CardRef;
 
 use crate::TenantConn;
 
+/// Resolve an active Card-bound principal from the Card identity a client can
+/// express.
+///
+/// Containment, not equality: registering a Card-bound principal stores a
+/// `uid`-bearing `card_ref` — the projection at `queries::cards::auth_projection`
+/// writes `space: Some(..)` and `uid: Some(..)` — while a caller can only name
+/// `space/Kind/name@version`, so `card_ref = $3` matched no registered principal
+/// at all.
+///
+/// Containment relaxes *every* optional `CardRef` field, `space` included: a ref
+/// with no space matches a row in any space. What bounds this to one intended
+/// row is not the predicate but three facts outside it — the table's
+/// `UNIQUE (data_tenant_id, name)`, `auth_projection` keeping the `name` column
+/// equal to `card_ref->>'name'`, and every caller passing a fully qualified ref
+/// (`IssueKeyArgs::space` is required). `ORDER BY created_at, id LIMIT 1` exists
+/// because none of that chain is enforced here: relax the unique constraint,
+/// decouple the name projection, or add an optional `CardRef` field, and this
+/// predicate starts matching more rows on a credential-issuing path. The stable
+/// oldest-first pick is then the difference between a bounded anomaly and an
+/// arbitrary one — narrow the predicate rather than lean on that fallback.
 const SERVICE_ACCOUNT_BY_CARD_REF_SQL: &str = r#"
         SELECT id, principal_kind, card_ref, status
           FROM wyrd.auth_service_accounts
@@ -154,15 +174,10 @@ pub async fn delete_service_account(
 
 /// Find an active Service/Agent principal by card ref.
 ///
-/// Matches by containment rather than by whole-document equality, because the
-/// stored `card_ref` carries the registered Card's `uid` and a caller naming a
-/// principal cannot know it: a client says `space/Kind/name@version`, which is
-/// the Card identity. The durable key remains `(card_kind, card_uid)`; this is
-/// the lookup for the identity a client can express, and the GIN index on
-/// `card_ref` serves it. Two active principals sharing one Card identity would
-/// require two Cards with the same identity, so the oldest wins for the same
-/// reason [`tenant_admin_principal_id`] picks the oldest: an anomaly must still
-/// resolve to one row rather than an arbitrary one.
+/// Binds the caller's ref as JSONB for [`SERVICE_ACCOUNT_BY_CARD_REF_SQL`],
+/// whose documentation carries what the predicate does and does not bound. The
+/// durable key remains `(card_kind, card_uid)`; this is the lookup for the
+/// identity a client can express, and the GIN index on `card_ref` serves it.
 ///
 /// # Errors
 /// Returns the database error when the read fails.
@@ -416,6 +431,11 @@ mod tests {
         assert!(sql.contains("sa.data_tenant_id = k.data_tenant_id"));
     }
 
+    /// The shipped predicate matches a Card identity and returns one row.
+    ///
+    /// Pinned as text because the widening this guards is invisible at the call
+    /// site: `=` would match no registered principal, and dropping the ordered
+    /// `LIMIT 1` would make a multi-row match arbitrary rather than bounded.
     #[test]
     fn service_account_by_card_ref_uses_jsonb_card_ref_binding() {
         let card_ref = CardRef {
@@ -428,8 +448,10 @@ mod tests {
         let Json(bound) = Json(card_ref.clone());
 
         assert_eq!(bound, card_ref);
-        assert!(SERVICE_ACCOUNT_BY_CARD_REF_SQL.contains("card_ref = $3"));
+        assert!(SERVICE_ACCOUNT_BY_CARD_REF_SQL.contains("card_ref @> $3"));
         assert!(SERVICE_ACCOUNT_BY_CARD_REF_SQL.contains("principal_kind = $2"));
+        assert!(SERVICE_ACCOUNT_BY_CARD_REF_SQL.contains("ORDER BY created_at, id"));
+        assert!(SERVICE_ACCOUNT_BY_CARD_REF_SQL.contains("LIMIT 1"));
         assert!(!SERVICE_ACCOUNT_BY_CARD_REF_SQL.contains("card_ref::text"));
     }
 

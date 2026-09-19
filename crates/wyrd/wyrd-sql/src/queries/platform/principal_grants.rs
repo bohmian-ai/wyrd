@@ -10,9 +10,7 @@
 use serde_json::Value;
 use sqlx::types::Uuid;
 
-use sqlx::{Postgres, Transaction};
-
-use crate::{OperatorPool, SqlError};
+use crate::{OperatorPool, SqlError, TenantConn};
 
 /// Replace a platform principal's granted permission set.
 ///
@@ -23,14 +21,14 @@ use crate::{OperatorPool, SqlError};
 /// Returns [`SqlError::Query`] when the write fails, including when
 /// `principal_id` does not name an existing platform principal.
 pub async fn set_platform_grant_tx(
-    tx: &mut Transaction<'_, Postgres>,
+    conn: &mut TenantConn<'_>,
     principal_id: Uuid,
     permissions: &Value,
 ) -> Result<(), SqlError> {
     sqlx::query(SET_PLATFORM_GRANT_SQL)
         .bind(principal_id)
         .bind(permissions)
-        .execute(&mut **tx)
+        .execute(&mut **conn.transaction())
         .await
         .map_err(SqlError::from)?;
     Ok(())

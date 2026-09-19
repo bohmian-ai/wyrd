@@ -122,6 +122,7 @@ def main() -> int:
     check_migration_drift(failures)
     check_query_modules(failures)
     check_server_pool_usage(failures)
+    check_platform_transaction_boundary(failures)
     check_sql_source_hygiene(failures)
     check_dependency_boundaries(failures)
 
@@ -722,10 +723,42 @@ def tenant_conn_owner_violations(code: str) -> list[str]:
 def has_platform_executor(code: str) -> bool:
     return (
         re.search(
-            r"&\s*PgPool\b|&\s*mut\s+Transaction\s*<\s*'_|&\s*OperatorPool\b", code
+            r"&\s*PgPool\b|&\s*mut\s+TenantConn\s*<\s*'_|&\s*OperatorPool\b", code
         )
         is not None
     )
+
+
+# A raw `sqlx::Transaction` is unrestricted SQL capability. Platform query
+# modules and the platform server components that call them commit an audited
+# allowance and its effect in one transaction, so they need a *bounded*
+# transaction — `TenantConn`, which carries the tenant key the canonical audit
+# append names — not a portable one any caller can issue arbitrary statements
+# on.
+RAW_TRANSACTION_PATTERN = r"\bTransaction\s*<\s*'"
+
+PLATFORM_SERVER_DIRS = (
+    "crates/wyrd/wyrd-server/src/components/platform/",
+    "crates/wyrd/wyrd-server/src/boot/init.rs",
+)
+
+
+def check_platform_transaction_boundary(failures: list[str]) -> None:
+    """Forbid raw SQLx transaction types in the platform query/server surface."""
+    scanned = [
+        *rust_files(WYRD_QUERIES / "platform"),
+        *(
+            path
+            for path in rust_files(WYRD_SERVER)
+            if rel(path).startswith(PLATFORM_SERVER_DIRS)
+        ),
+    ]
+    for path in scanned:
+        code = strip_line_comments(production_source(path.read_text()))
+        if re.search(RAW_TRANSACTION_PATTERN, code):
+            failures.append(
+                f"{rel(path)}: platform code must take TenantConn, not a raw SQLx Transaction"
+            )
 
 
 def has_raw_query_marker(body: str) -> bool:

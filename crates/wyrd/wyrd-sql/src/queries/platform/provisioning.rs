@@ -9,10 +9,9 @@
 //! anywhere in between leaves a tenant that is visibly incomplete rather than
 //! one that looks live but has no way in.
 
-use sqlx::{Postgres, Transaction};
 use wyrd_spec::DataTenantId;
 
-use crate::{OperatorPool, SqlError};
+use crate::{OperatorPool, SqlError, TenantConn};
 
 /// Create a tenant directory row in the provisioning state.
 ///
@@ -25,7 +24,7 @@ use crate::{OperatorPool, SqlError};
 /// already taken — which is how a concurrent creation for the same tenant
 /// converges on one row rather than two.
 pub async fn insert_provisioning_tenant(
-    tx: &mut Transaction<'_, Postgres>,
+    conn: &mut TenantConn<'_>,
     data_tenant_id: DataTenantId,
     slug: &str,
     display_name: &str,
@@ -60,7 +59,7 @@ pub async fn insert_provisioning_tenant(
     .bind(data_tenant_id.as_uuid())
     .bind(slug)
     .bind(display_name)
-    .fetch_optional(&mut **tx)
+    .fetch_optional(&mut **conn.transaction())
     .await
     .map_err(SqlError::from)?;
 

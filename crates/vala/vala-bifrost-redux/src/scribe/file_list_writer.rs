@@ -470,7 +470,7 @@ pub async fn insert_artifact_set_fenced(
         "writer-v2 publication set is empty",
         "writer-v2 publication set is noncontiguous or crosses generations",
     )?;
-    let mut transaction = operator_pool.begin().await.map_err(SqlError::from)?;
+    let mut transaction = operator_pool.pool().begin().await.map_err(SqlError::from)?;
     let actor_live: bool =
         sqlx::query_scalar("SELECT vala.assert_scribe_publication_fence($1, $2, $3)")
             .bind(DataTenantId::SYSTEM_OWNER.as_uuid())

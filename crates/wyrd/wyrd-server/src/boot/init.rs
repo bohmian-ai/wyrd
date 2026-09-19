@@ -104,10 +104,10 @@ pub async fn initialize_platform_root(pool: &OperatorPool) -> Result<SecretStrin
         .map_err(|error| InitError::Credential(PlatformCredentialError::Join(error)))?
         .map_err(|error| InitError::Credential(PlatformCredentialError::Hash(error)))?;
 
-    let mut tx = pool.begin().await.map_err(SqlError::from)?;
+    let mut conn = pool.begin_platform_audited().await?;
 
     match insert_platform_principal_tx(
-        &mut tx,
+        &mut conn,
         principal_id,
         PrincipalKindTag::GlobalAdmin,
         PLATFORM_ROOT_NAME,
@@ -118,20 +118,20 @@ pub async fn initialize_platform_root(pool: &OperatorPool) -> Result<SecretStrin
         Err(SqlError::UniqueViolation { .. }) => {
             // Nothing was written, so the rollback is a formality; it matters
             // that we do not leave the connection holding an open transaction.
-            let _ = tx.rollback().await;
+            drop(conn);
             return Err(InitError::AlreadyInitialized);
         }
         Err(error) => {
-            let _ = tx.rollback().await;
+            drop(conn);
             return Err(InitError::Store(error));
         }
     }
 
     let grant = serde_json::to_value(platform_administrator_grant().iter().collect::<Vec<_>>())
         .expect("permission set serializes to JSON");
-    set_platform_grant_tx(&mut tx, principal_id, &grant).await?;
+    set_platform_grant_tx(&mut conn, principal_id, &grant).await?;
     insert_platform_credential_tx(
-        &mut tx,
+        &mut conn,
         Uuid::new_v4(),
         principal_id,
         &credential.prefix,
@@ -140,7 +140,7 @@ pub async fn initialize_platform_root(pool: &OperatorPool) -> Result<SecretStrin
     )
     .await?;
 
-    tx.commit().await.map_err(SqlError::from)?;
+    conn.commit().await?;
     Ok(credential.secret)
 }
 

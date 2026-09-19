@@ -154,7 +154,7 @@ impl TenantProvisioning {
         // failed attempt may already have written tenant-scoped rows, and a
         // second id would orphan them.
         let claim = insert_provisioning_tenant(
-            conn.transaction(),
+            &mut conn,
             data_tenant_id,
             request.slug.as_str(),
             &request.display_name,

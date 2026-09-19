@@ -93,19 +93,22 @@ mod pg_tests {
     async fn register(fixture: &PgFixture, name: &str, claim: &str) -> Uuid {
         let pool = fixture.operator_pool();
         let id = Uuid::now_v7();
-        let mut tx = pool.begin().await.expect("transaction opens");
+        let mut conn = pool
+            .begin_platform_audited()
+            .await
+            .expect("transaction opens");
         wyrd_sql::queries::platform::principals::insert_platform_principal_tx(
-            &mut tx,
+            &mut conn,
             id,
             PrincipalKindTag::User,
             name,
         )
         .await
         .expect("principal inserts");
-        insert_platform_identity_tx(&mut tx, id, ISSUER, claim)
+        insert_platform_identity_tx(&mut conn, id, ISSUER, claim)
             .await
             .expect("identity inserts");
-        tx.commit().await.expect("registration commits");
+        conn.commit().await.expect("registration commits");
         id
     }
 
@@ -297,9 +300,12 @@ mod pg_tests {
         insert_platform_principal(pool, second, PrincipalKindTag::User, "ops-lead-again")
             .await
             .expect("second principal inserts");
-        let mut tx = pool.begin().await.expect("transaction opens");
+        let mut conn = pool
+            .begin_platform_audited()
+            .await
+            .expect("transaction opens");
         let duplicate =
-            insert_platform_identity_tx(&mut tx, second, ISSUER, "ops@example.com").await;
+            insert_platform_identity_tx(&mut conn, second, ISSUER, "ops@example.com").await;
 
         assert!(
             matches!(duplicate, Err(wyrd_sql::SqlError::UniqueViolation { .. })),

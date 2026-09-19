@@ -372,7 +372,7 @@ async fn register_admin(
 
     let principal_id = Uuid::now_v7();
     insert_platform_principal_tx(
-        decision.transaction(),
+        &mut decision,
         principal_id,
         PrincipalKindTag::User,
         &request.name,
@@ -380,7 +380,7 @@ async fn register_admin(
     .await
     .map_err(taken_or_store)?;
     insert_platform_identity_tx(
-        decision.transaction(),
+        &mut decision,
         principal_id,
         &connection.issuer_url,
         &request.match_claim,
@@ -394,7 +394,7 @@ async fn register_admin(
     // would ship an administrator who is not one.
     let grant = serde_json::to_value(platform_administrator_grant().iter().collect::<Vec<_>>())
         .expect("permission set serializes to JSON");
-    set_platform_grant_tx(decision.transaction(), principal_id, &grant)
+    set_platform_grant_tx(&mut decision, principal_id, &grant)
         .await
         .map_err(store_error)?;
 

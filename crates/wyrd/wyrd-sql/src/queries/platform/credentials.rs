@@ -12,9 +12,7 @@
 use chrono::{DateTime, Utc};
 use sqlx::types::Uuid;
 
-use sqlx::{Postgres, Transaction};
-
-use crate::{OperatorPool, SqlError};
+use crate::{OperatorPool, SqlError, TenantConn};
 
 /// Credential lookup row joined to its owning principal.
 ///
@@ -104,7 +102,7 @@ pub async fn insert_platform_credential(
 /// Returns [`SqlError::Query`] when the insert fails, including on a repeated
 /// prefix or an unknown principal.
 pub async fn insert_platform_credential_tx(
-    tx: &mut Transaction<'_, Postgres>,
+    conn: &mut TenantConn<'_>,
     id: Uuid,
     principal_id: Uuid,
     prefix: &str,
@@ -117,7 +115,7 @@ pub async fn insert_platform_credential_tx(
         .bind(prefix)
         .bind(secret_hash)
         .bind(expires_at)
-        .execute(&mut **tx)
+        .execute(&mut **conn.transaction())
         .await
         .map_err(SqlError::from)?;
     Ok(())

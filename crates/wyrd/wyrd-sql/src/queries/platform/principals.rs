@@ -13,9 +13,7 @@
 use sqlx::types::Uuid;
 use wyrd_spec::auth::PrincipalKindTag;
 
-use sqlx::{Postgres, Transaction};
-
-use crate::{OperatorPool, SqlError};
+use crate::{OperatorPool, SqlError, TenantConn};
 
 /// A platform-scope principal row.
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -54,7 +52,7 @@ impl PlatformPrincipalRow {
 /// [`SqlError::Query`] when the insert otherwise fails, including when `kind`
 /// is not a platform-scope kind.
 pub async fn insert_platform_principal_tx(
-    tx: &mut Transaction<'_, Postgres>,
+    conn: &mut TenantConn<'_>,
     id: Uuid,
     kind: PrincipalKindTag,
     name: &str,
@@ -63,7 +61,7 @@ pub async fn insert_platform_principal_tx(
         .bind(id)
         .bind(kind.as_str())
         .bind(name)
-        .execute(&mut **tx)
+        .execute(&mut **conn.transaction())
         .await
         .map_err(SqlError::from)?;
     Ok(())

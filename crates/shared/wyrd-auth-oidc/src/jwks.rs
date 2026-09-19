@@ -10,6 +10,7 @@ use serde::Deserialize;
 use url::Url;
 
 use crate::error::OidcError;
+use crate::screening::ScreenedHttp;
 
 /// Key identifier extracted from a JWT header, scoped to OIDC key management.
 ///
@@ -125,15 +126,29 @@ fn decoding_key_from_jwk(
     Ok(Some((kid, Arc::new(dk))))
 }
 
+/// Fetch and decode one issuer's JWKS through a screened, pinned client.
+///
+/// The client is built per fetch rather than held, because pinning is only
+/// worth anything against the addresses the JWKS URI resolves to *now*: a
+/// long-lived client would carry a resolution made when the process started.
+/// Fetches happen on a cache miss, so the cost is paid rarely.
 async fn fetch_jwks(
     issuer: &str,
     jwks_uri: &Url,
-    http: &reqwest::Client,
+    http: ScreenedHttp,
     timeout: Duration,
 ) -> Result<KeyMap, OidcError> {
     tracing::debug!(%issuer, %jwks_uri, "fetching JWKS");
 
-    let response = http
+    let client = http
+        .client_for(jwks_uri)
+        .await
+        .map_err(|error| OidcError::JwksUnavailable {
+            issuer: issuer.to_owned(),
+            message: error.to_string(),
+        })?;
+
+    let response = client
         .get(jwks_uri.as_str())
         .timeout(timeout)
         .send()
@@ -187,7 +202,8 @@ async fn fetch_jwks(
 /// moka manages the concurrent access internally.
 pub struct JwksCache {
     inner: Cache<String, KeyMap>,
-    http: reqwest::Client,
+    /// Address policy every refresh is screened and pinned against.
+    http: ScreenedHttp,
     fetch_timeout: Duration,
 }
 
@@ -196,7 +212,7 @@ impl JwksCache {
     ///
     /// `max_issuers` bounds the number of cached issuer key sets. Entries
     /// beyond the capacity are evicted by LRU before TTL expiry.
-    pub fn new(http: reqwest::Client, ttl: Duration, fetch_timeout: Duration) -> Self {
+    pub fn new(http: ScreenedHttp, ttl: Duration, fetch_timeout: Duration) -> Self {
         let inner = Cache::builder().max_capacity(256).time_to_live(ttl).build();
         Self {
             inner,
@@ -246,12 +262,12 @@ impl JwksCache {
         let cache_key = jwks_uri.to_string();
         let issuer_owned = issuer.to_owned();
         let jwks_uri_owned = jwks_uri.clone();
-        let http = self.http.clone();
+        let http = self.http;
         let timeout = self.fetch_timeout;
 
         self.inner
             .try_get_with(cache_key, async move {
-                fetch_jwks(&issuer_owned, &jwks_uri_owned, &http, timeout).await
+                fetch_jwks(&issuer_owned, &jwks_uri_owned, http, timeout).await
             })
             .await
             .map_err(|e| (*e).clone())
@@ -266,6 +282,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+    use crate::screening::AddressPolicy;
 
     // Ed25519 public key x-component (base64url, no padding).
     // Matches the PUBLIC_KEY_PEM used in wyrd-auth-verify tests:
@@ -315,14 +332,46 @@ mod tests {
     }
 
     fn cache() -> JwksCache {
-        // The workspace reqwest has no built-in Rustls provider; production
-        // installs Wyrd's before building clients, so each test process must too.
-        wyrd_tls::install_crypto_provider().expect("Wyrd owns the Rustls provider");
         JwksCache::new(
-            reqwest::Client::new(),
+            ScreenedHttp::allowing_internal(),
             Duration::from_secs(300),
             Duration::from_secs(5),
         )
+    }
+
+    /// A refresh screens the JWKS address again and makes no request.
+    ///
+    /// The cache outlives the configuration that seeded it, so a name that
+    /// resolved publicly when the issuer was registered can resolve to loopback
+    /// by the time a key is first needed. That is the rebinding this refuses.
+    #[tokio::test]
+    async fn a_refresh_refuses_an_internal_jwks_without_reaching_it() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ed_jwks("ed-key-1")))
+            .mount(&server)
+            .await;
+        let jwks_uri: Url = format!("{}/jwks", server.uri()).parse().unwrap();
+
+        let cache = JwksCache::new(
+            ScreenedHttp::new(AddressPolicy::BlockInternal),
+            Duration::from_secs(300),
+            Duration::from_secs(5),
+        );
+        cache
+            .key("test-issuer", &jwks_uri, &OidcKid::new("ed-key-1"))
+            .await
+            .err()
+            .expect("an internal JWKS address is refused");
+
+        assert!(
+            server
+                .received_requests()
+                .await
+                .is_some_and(|r| r.is_empty()),
+            "the refusal must happen before any request leaves the process"
+        );
     }
 
     #[tokio::test]

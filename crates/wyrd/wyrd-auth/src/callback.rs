@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use uuid::Uuid;
 use wyrd_auth_issue::IssuingKey;
-use wyrd_auth_oidc::{ClientAuth, OidcProvider, TrustedIssuer};
+use wyrd_auth_oidc::{ClientAuth, OidcProvider, ScreenedHttp, TrustedIssuer};
 use wyrd_auth_verify::{TokenPrincipalRef, TokenVerifier};
 use wyrd_runtime::{PermissionSet, Principal, PrincipalId, PrincipalKind, RoleRef};
 use wyrd_spec::DataTenantId;
@@ -25,7 +25,7 @@ use crate::audit::{
     TOKEN_EXCHANGE_OPERATION, append_auth_audit, auth_event, auth_failure_code,
     record_auth_audit_best_effort,
 };
-use crate::error::auth_error_to_wyrd;
+use crate::error::{auth_error_to_wyrd, screen_error};
 use crate::exchange_api_key::{ExchangedToken, role_refs, token_hash};
 use crate::login::{LoginStateEntry, PgLoginStateStore};
 use crate::permission_resolver::SqlPermissionResolver;
@@ -58,6 +58,8 @@ pub struct AuthorizationCodeExchange {
     pub verifier: Arc<TokenVerifier<SqlPermissionResolver, PgIssuerResolver>>,
     /// Tenant-scoped trusted issuer resolver.
     pub trusted_issuer_resolver: Arc<PgIssuerResolver>,
+    /// Screened HTTP capability every provider request is made through.
+    pub http: ScreenedHttp,
 }
 
 impl std::fmt::Debug for AuthorizationCodeExchange {
@@ -94,7 +96,7 @@ impl AuthorizationCodeExchange {
                 &issuer,
             )
             .await?;
-            let provider = discover_provider(&trusted.issuer).await?;
+            let provider = discover_provider(&trusted.issuer, self.http).await?;
             let id_token = exchange_code_for_id_token(
                 &provider,
                 &trusted.client_id,
@@ -102,6 +104,7 @@ impl AuthorizationCodeExchange {
                 &login_state.redirect_uri,
                 &login_state.code_verifier,
                 code,
+                self.http,
             )
             .await?;
             let token = self
@@ -210,20 +213,23 @@ impl AuthorizationCodeExchange {
 ///
 /// # Errors
 ///
-/// Returns [`WyrdError::DiscoveryUnavailable`] when another Rustls provider
-/// already owns the process, the issuer URL is invalid, or discovery fails.
-/// Cancellation interrupts the request without persisting callback state.
-pub(crate) async fn discover_provider(issuer: &IssuerUrl) -> Result<OidcProvider, WyrdError> {
+/// Returns [`WyrdError::DiscoveryUnavailable`] when the issuer URL is invalid,
+/// `http` refuses the address behind it, or discovery fails. Cancellation
+/// interrupts the request without persisting callback state.
+pub(crate) async fn discover_provider(
+    issuer: &IssuerUrl,
+    http: ScreenedHttp,
+) -> Result<OidcProvider, WyrdError> {
     let issuer_url =
         url::Url::parse(issuer.as_str()).map_err(|_| WyrdError::DiscoveryUnavailable {
             message: "trusted issuer URL could not be parsed".to_owned(),
             details: serde_json::json!({}),
         })?;
-    wyrd_tls::install_crypto_provider().map_err(|_| WyrdError::DiscoveryUnavailable {
-        message: "OIDC TLS provider initialization failed".to_owned(),
-        details: serde_json::json!({}),
-    })?;
-    OidcProvider::discover(issuer_url, reqwest::Client::new())
+    let client = http
+        .client_for(&issuer_url)
+        .await
+        .map_err(|error| screen_error(&error))?;
+    OidcProvider::discover(issuer_url, client)
         .await
         .map_err(|error| {
             tracing::warn!(error = %error, "OIDC discovery failed");
@@ -254,6 +260,7 @@ pub(crate) async fn exchange_code_for_id_token(
     redirect_uri: &str,
     code_verifier: &SecretString,
     code: SecretString,
+    http: ScreenedHttp,
 ) -> Result<String, WyrdError> {
     let Some(token_endpoint) = provider.metadata.token_endpoint.clone() else {
         return Err(WyrdError::DiscoveryUnavailable {
@@ -262,11 +269,10 @@ pub(crate) async fn exchange_code_for_id_token(
         });
     };
 
-    wyrd_tls::install_crypto_provider().map_err(|_| WyrdError::DiscoveryUnavailable {
-        message: "OIDC TLS provider initialization failed".to_owned(),
-        details: serde_json::json!({}),
-    })?;
-    let client = reqwest::Client::new();
+    let client = http
+        .client_for(&token_endpoint)
+        .await
+        .map_err(|error| screen_error(&error))?;
     let mut request = client.post(token_endpoint);
     let mut form = vec![
         ("grant_type", "authorization_code".to_owned()),
@@ -506,5 +512,113 @@ fn issue_error(error: &wyrd_auth_issue::IssueError) -> WyrdError {
     WyrdError::Internal {
         message: "token issue failed".to_owned(),
         details: serde_json::json!({}),
+    }
+}
+
+#[cfg(test)]
+mod screening_tests {
+    use secrecy::SecretString;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wyrd_auth_oidc::{AddressPolicy, ClientAuth, OidcProvider, ScreenedHttp};
+    use wyrd_spec::auth::IssuerUrl;
+    use wyrd_spec::error::WyrdError;
+
+    /// Stand up a provider that advertises itself on loopback.
+    ///
+    /// Loopback is exactly the address a rebinding answer aims at, so a
+    /// deployment that blocks internal ranges must refuse this provider at the
+    /// moment of every request — even though the URL was accepted when the
+    /// issuer was configured under a different answer.
+    async fn loopback_provider() -> (MockServer, IssuerUrl) {
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": issuer,
+                "authorization_endpoint": format!("{issuer}/authorize"),
+                "token_endpoint": format!("{issuer}/token"),
+                "jwks_uri": format!("{issuer}/jwks"),
+                "id_token_signing_alg_values_supported": ["RS256"],
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id_token": "never.reached.here"
+            })))
+            .mount(&server)
+            .await;
+        let url = IssuerUrl::new(issuer).expect("mock issuer is a valid URL");
+        (server, url)
+    }
+
+    /// Beginning a login screens the issuer again and makes no request.
+    #[tokio::test]
+    async fn begin_login_refuses_an_internal_issuer_without_reaching_it() {
+        let (server, issuer) = loopback_provider().await;
+
+        let error = crate::login::discover_authorization_endpoint(
+            &issuer,
+            ScreenedHttp::new(AddressPolicy::BlockInternal),
+        )
+        .await
+        .expect_err("an internal issuer is refused");
+
+        assert!(matches!(error, WyrdError::DiscoveryUnavailable { .. }));
+        assert!(
+            server
+                .received_requests()
+                .await
+                .is_some_and(|r| r.is_empty()),
+            "the refusal must happen before any request leaves the process"
+        );
+    }
+
+    /// The token exchange screens the endpoint discovery handed it, not the
+    /// address that was acceptable when discovery ran.
+    #[tokio::test]
+    async fn the_token_exchange_refuses_an_internal_endpoint_without_reaching_it() {
+        let (server, issuer) = loopback_provider().await;
+
+        let provider = OidcProvider::discover(
+            url::Url::parse(issuer.as_str()).expect("issuer parses"),
+            ScreenedHttp::allowing_internal()
+                .client_for(&url::Url::parse(issuer.as_str()).expect("issuer parses"))
+                .await
+                .expect("a permissive deployment reaches its loopback provider"),
+        )
+        .await
+        .expect("discovery succeeds under the permissive policy");
+        let discovery_requests = server
+            .received_requests()
+            .await
+            .expect("the mock records requests")
+            .len();
+
+        let error = super::exchange_code_for_id_token(
+            &provider,
+            "wyrd",
+            &ClientAuth::Public,
+            "https://tenant.example/auth/callback",
+            &SecretString::from("verifier"),
+            SecretString::from("code"),
+            ScreenedHttp::new(AddressPolicy::BlockInternal),
+        )
+        .await
+        .expect_err("an internal token endpoint is refused");
+
+        assert!(matches!(error, WyrdError::DiscoveryUnavailable { .. }));
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .expect("the mock records requests")
+                .len(),
+            discovery_requests,
+            "no token request may leave the process after the screen refuses"
+        );
     }
 }

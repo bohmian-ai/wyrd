@@ -42,6 +42,7 @@ wyrd-tls = { workspace = true }
 
 [dev-dependencies]
 workspace-hack.workspace = true
+wiremock = { workspace = true }
 wyrd-dev-fixtures = { workspace = true, features = ["pg"] }
 
 [lints]

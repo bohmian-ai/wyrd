@@ -63,6 +63,7 @@ pub async fn exchange_authorization_code(
             .trusted_issuer_resolver
             .clone()
             .ok_or_else(auth_not_configured)?,
+        http: state.deployment_profile.screened_http(),
     };
     service
         .execute(
@@ -604,6 +605,7 @@ mod pg_tests {
                 .trusted_issuer_resolver
                 .clone()
                 .expect("test state has issuer resolver"),
+            http: state.deployment_profile.screened_http(),
         }
     }
 
@@ -723,7 +725,7 @@ mod pg_tests {
         )
         .with_external(
             Arc::new(JwksCache::new(
-                reqwest::Client::new(),
+                wyrd_auth_oidc::ScreenedHttp::allowing_internal(),
                 StdDuration::from_secs(300),
                 StdDuration::from_secs(5),
             )),

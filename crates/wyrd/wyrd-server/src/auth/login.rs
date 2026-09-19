@@ -77,6 +77,7 @@ async fn try_initiate_login(
         &trusted,
         &query.issuer,
         redirect_uri,
+        state.deployment_profile.screened_http(),
     )
     .await
     .map_err(WyrdErrorResponse::from)?;

@@ -104,7 +104,6 @@ mod pg_tests {
     use axum::http::{HeaderMap, header};
     use chrono::{Duration as ChronoDuration, Utc};
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
-    use reqwest::Client;
     use secrecy::{ExposeSecret, SecretString};
     use uuid::Uuid;
     use wiremock::matchers::{method, path};
@@ -644,7 +643,7 @@ mod pg_tests {
         )
         .with_external(
             Arc::new(JwksCache::new(
-                Client::new(),
+                wyrd_auth_oidc::ScreenedHttp::allowing_internal(),
                 StdDuration::from_secs(300),
                 StdDuration::from_secs(5),
             )),

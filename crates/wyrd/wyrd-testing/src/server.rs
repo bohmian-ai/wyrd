@@ -3786,7 +3786,7 @@ impl WyrdTestServerBuilder {
                 .with_revocation(Arc::new(revocation))
                 .with_external(
                     Arc::new(JwksCache::new(
-                        reqwest::Client::new(),
+                        wyrd_auth_oidc::ScreenedHttp::allowing_internal(),
                         Duration::from_secs(300),
                         Duration::from_secs(5),
                     )),

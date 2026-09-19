@@ -11281,6 +11281,7 @@ dependencies = [
  "url",
  "uuid",
  "vala-sql",
+ "wiremock",
  "workspace-hack",
  "wyrd-auth-issue",
  "wyrd-auth-oidc",

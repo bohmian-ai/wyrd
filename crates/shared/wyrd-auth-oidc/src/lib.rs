@@ -19,6 +19,7 @@ pub mod error;
 pub mod jwks;
 pub mod provider;
 pub mod registry;
+pub mod screening;
 
 pub use claims::{MappedClaims, map_claims};
 pub use config::IssuerConfigResolver;
@@ -29,3 +30,4 @@ pub use registry::{
     ClaimMapping, ClaimPath, ClientAuth, IssuerVerification, TrustedIssuer, TrustedIssuerRegistry,
     WorkloadBinding, WorkloadBindingResolver,
 };
+pub use screening::{AddressPolicy, ScreenError, ScreenedHttp};

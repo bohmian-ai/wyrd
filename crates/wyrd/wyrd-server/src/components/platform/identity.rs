@@ -557,6 +557,7 @@ fn login_service(state: &AppState) -> Result<PlatformLogin, WyrdErrorResponse> {
         state.auth.sealing_key.clone(),
         verifier,
         sessions,
+        state.deployment_profile.screened_http(),
     ))
 }
 

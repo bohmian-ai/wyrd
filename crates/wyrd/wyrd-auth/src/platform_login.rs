@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use chrono::{Duration, Utc};
 use secrecy::{ExposeSecret, SecretString};
-use wyrd_auth_oidc::{ClientAuth, IssuerVerification};
+use wyrd_auth_oidc::{ClientAuth, IssuerVerification, ScreenedHttp};
 use wyrd_auth_verify::{ExternalClaims, TokenVerifier};
 use wyrd_crypt::SecretKey;
 use wyrd_spec::auth::LoginInitResponse;
@@ -89,6 +89,8 @@ pub struct PlatformLogin {
     verifier: Arc<TokenVerifier<SqlPermissionResolver, PgIssuerResolver>>,
     /// Mints the platform session an accepted identity receives.
     sessions: Arc<PlatformSessions>,
+    /// Screened HTTP capability every provider request is made through.
+    http: ScreenedHttp,
 }
 
 impl std::fmt::Debug for PlatformLogin {
@@ -100,19 +102,22 @@ impl std::fmt::Debug for PlatformLogin {
 }
 
 impl PlatformLogin {
-    /// Bind platform login to the boundary, key, verifier, and session minter.
+    /// Bind platform login to the boundary, key, verifier, session minter, and
+    /// the screened HTTP capability every provider request is made through.
     #[must_use]
     pub fn new(
         pool: OperatorPool,
         sealing_key: Option<Arc<SecretKey>>,
         verifier: Arc<TokenVerifier<SqlPermissionResolver, PgIssuerResolver>>,
         sessions: Arc<PlatformSessions>,
+        http: ScreenedHttp,
     ) -> Self {
         Self {
             pool,
             sealing_key,
             verifier,
             sessions,
+            http,
         }
     }
 
@@ -147,10 +152,12 @@ impl PlatformLogin {
         redirect_uri: String,
     ) -> Result<LoginInitResponse, PlatformLoginError> {
         let connection = self.connection().await?;
-        let authorization_endpoint =
-            crate::login::discover_authorization_endpoint(&connection.verification.issuer)
-                .await
-                .map_err(|error| PlatformLoginError::ProviderUnavailable(Box::new(error)))?;
+        let authorization_endpoint = crate::login::discover_authorization_endpoint(
+            &connection.verification.issuer,
+            self.http,
+        )
+        .await
+        .map_err(|error| PlatformLoginError::ProviderUnavailable(Box::new(error)))?;
 
         let state = auth_state_key();
         let code_verifier = pkce_verifier();
@@ -221,9 +228,10 @@ impl PlatformLogin {
             return Err(PlatformLoginError::InvalidState);
         }
 
-        let provider = crate::callback::discover_provider(&connection.verification.issuer)
-            .await
-            .map_err(|error| PlatformLoginError::ProviderUnavailable(Box::new(error)))?;
+        let provider =
+            crate::callback::discover_provider(&connection.verification.issuer, self.http)
+                .await
+                .map_err(|error| PlatformLoginError::ProviderUnavailable(Box::new(error)))?;
         let id_token = crate::callback::exchange_code_for_id_token(
             &provider,
             &connection.client_id,
@@ -231,6 +239,7 @@ impl PlatformLogin {
             &login_state.redirect_uri,
             &SecretString::from(login_state.code_verifier),
             code,
+            self.http,
         )
         .await
         .map_err(|error| PlatformLoginError::ProviderUnavailable(Box::new(error)))?;

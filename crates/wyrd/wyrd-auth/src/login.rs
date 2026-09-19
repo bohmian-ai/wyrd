@@ -8,7 +8,9 @@ use rand::RngCore;
 use secrecy::{ExposeSecret, SecretString};
 use sha2::{Digest, Sha256};
 use url::Url;
-use wyrd_auth_oidc::{OidcProvider, TrustedIssuer};
+use wyrd_auth_oidc::{OidcProvider, ScreenedHttp, TrustedIssuer};
+
+use crate::error::screen_error;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{AbsoluteUrl, IssuerUrl, LoginInitResponse};
 use wyrd_spec::error::WyrdError;
@@ -99,8 +101,9 @@ pub async fn prepare_login(
     trusted: &TrustedIssuer,
     issuer: &IssuerUrl,
     redirect_uri: String,
+    http: ScreenedHttp,
 ) -> Result<LoginInitResponse, WyrdError> {
-    let authorization_endpoint = discover_authorization_endpoint(&trusted.issuer).await?;
+    let authorization_endpoint = discover_authorization_endpoint(&trusted.issuer, http).await?;
     let state_key = auth_state_key();
     let code_verifier = pkce_verifier();
     let nonce = auth_nonce();
@@ -138,20 +141,27 @@ pub async fn prepare_login(
 ///
 /// # Errors
 ///
-/// Returns [`WyrdError::DiscoveryUnavailable`] when another Rustls provider
-/// already owns the process or the issuer URL, metadata request, or response is
-/// invalid. Cancellation can interrupt discovery without persisting state.
+/// Returns [`WyrdError::DiscoveryUnavailable`] when the issuer URL is invalid,
+/// the address behind it is refused by `http`, or the metadata request or
+/// response is invalid. Cancellation can interrupt discovery without
+/// persisting state.
 ///
-pub async fn discover_authorization_endpoint(issuer: &IssuerUrl) -> Result<Url, WyrdError> {
+/// The address is screened by `http` at the moment of the request, so an
+/// issuer that resolved publicly when it was configured cannot resolve inward
+/// now.
+pub async fn discover_authorization_endpoint(
+    issuer: &IssuerUrl,
+    http: ScreenedHttp,
+) -> Result<Url, WyrdError> {
     let issuer_url = Url::parse(issuer.as_str()).map_err(|_| WyrdError::DiscoveryUnavailable {
         message: "trusted issuer URL could not be parsed".to_owned(),
         details: serde_json::json!({}),
     })?;
-    wyrd_tls::install_crypto_provider().map_err(|_| WyrdError::DiscoveryUnavailable {
-        message: "OIDC TLS provider initialization failed".to_owned(),
-        details: serde_json::json!({}),
-    })?;
-    let provider = OidcProvider::discover(issuer_url, reqwest::Client::new())
+    let client = http
+        .client_for(&issuer_url)
+        .await
+        .map_err(|error| screen_error(&error))?;
+    let provider = OidcProvider::discover(issuer_url, client)
         .await
         .map_err(|error| {
             tracing::warn!(error = %error, "OIDC discovery failed");

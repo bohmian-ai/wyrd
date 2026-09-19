@@ -2010,7 +2010,7 @@ mod tests {
         // installs Wyrd's before building clients, so each test process must too.
         wyrd_tls::install_crypto_provider().expect("Wyrd owns the Rustls provider");
         Arc::new(JwksCache::new(
-            reqwest::Client::new(),
+            wyrd_auth_oidc::ScreenedHttp::allowing_internal(),
             Duration::from_secs(300),
             Duration::from_secs(5),
         ))

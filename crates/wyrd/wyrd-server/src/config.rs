@@ -12,6 +12,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use vala_bifrost_redux::resources::ANALYTICAL_QUERY_SLOT_UNITS;
 use vala_bifrost_redux::scribe::geometry::{ScribeGeometry, ScribeGeometryError};
+use wyrd_auth_oidc::{AddressPolicy, ScreenedHttp};
 use wyrd_spec::TenantSlug;
 use wyrd_spec::auth::IssuerTokenPolicy;
 use wyrd_telemetry::TelemetryConfig;
@@ -117,6 +118,22 @@ impl DeploymentProfile {
     #[must_use]
     pub fn is_production(self) -> bool {
         matches!(self, Self::Production)
+    }
+
+    /// The outbound address policy identity-provider fetches run under.
+    ///
+    /// A multi-tenant production deployment accepts issuer URLs from
+    /// semi-trusted tenant administrators, so the whole internal address space
+    /// is off limits. Self-hosted, enterprise single-tenant, and development
+    /// deployments legitimately run their provider on loopback or a private
+    /// network. This is the one place the profile becomes a network policy;
+    /// every discovery, token, and JWKS fetch takes the result.
+    #[must_use]
+    pub const fn screened_http(self) -> ScreenedHttp {
+        ScreenedHttp::new(match self {
+            Self::Production => AddressPolicy::BlockInternal,
+            Self::Development => AddressPolicy::AllowInternal,
+        })
     }
 }
 

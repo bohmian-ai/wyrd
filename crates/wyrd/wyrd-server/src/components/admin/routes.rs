@@ -17,7 +17,6 @@
 //! survives a conflict, not-found, or failed write, and issuer create runs no
 //! network IO unaudited. The list handlers append it in their read transaction.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use axum::Json;
@@ -28,7 +27,7 @@ use axum::routing::post;
 use secrecy::SecretString;
 use serde::Deserialize;
 use wyrd_auth_oidc::{
-    ClaimMapping, ClaimPath, ClientAuth, OidcProvider, TrustedIssuer, WorkloadBinding,
+    ClaimMapping, ClaimPath, ClientAuth, OidcProvider, ScreenError, TrustedIssuer, WorkloadBinding,
 };
 use wyrd_spec::auth::{
     ClaimMappingPayload, ClientAuthKind, CreateTrustedIssuerRequest, CreateWorkloadBindingRequest,
@@ -498,161 +497,20 @@ async fn acquire_conn<'a>(
         .map_err(sql_unavailable)
 }
 
-/// Build a Reqwest client with SSRF mitigations and Wyrd-owned TLS.
+/// Resolve the issuer's `jwks_uri` via OIDC discovery.
 ///
-/// The client uses a ten-second timeout and never follows redirects.
-///
-/// # Errors
-///
-/// Returns [`WyrdErrorResponse`] when another Rustls provider already owns the
-/// process or Reqwest rejects the client configuration.
-fn discovery_client() -> Result<reqwest::Client, WyrdErrorResponse> {
-    wyrd_tls::install_crypto_provider().map_err(|_| {
-        WyrdErrorResponse::from(WyrdError::DiscoveryUnavailable {
-            message: "discovery TLS provider initialization failed".to_owned(),
-            details: serde_json::json!({ "field": "issuer" }),
-        })
-    })?;
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|_| {
-            WyrdErrorResponse::from(WyrdError::DiscoveryUnavailable {
-                message: "discovery client could not be constructed".to_owned(),
-                details: serde_json::json!({ "field": "issuer" }),
-            })
-        })
-}
-
-/// Collapse an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) to its IPv4 form so a
-/// single classifier catches metadata/internal ranges written in either family.
-/// Bare `::1`/`::` are left as IPv6 and handled by the IPv6 arms.
-fn normalize_ip(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
-        v4 => v4,
-    }
-}
-
-/// `100.64.0.0/10` — RFC 6598 carrier-grade NAT shared address space.
-fn is_cgnat(v4: Ipv4Addr) -> bool {
-    let [a, b, ..] = v4.octets();
-    a == 100 && (b & 0xc0) == 0x40
-}
-
-/// `fc00::/7` — RFC 4193 unique local addresses.
-fn is_unique_local_v6(v6: Ipv6Addr) -> bool {
-    (v6.segments()[0] & 0xfe00) == 0xfc00
-}
-
-/// Addresses that are never a legitimate IdP and are blocked in **every**
-/// deployment profile. Link-local (`169.254.0.0/16`) covers the cloud instance
-/// metadata endpoint (`169.254.169.254`); even self-hosted and development must
-/// never let an issuer URL reach it.
-fn is_always_blocked(ip: IpAddr) -> bool {
-    match normalize_ip(ip) {
-        IpAddr::V4(v4) => v4.is_link_local() || v4.is_broadcast() || v4.is_documentation(),
-        // fe80::/10 link-local.
-        IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
-    }
-}
-
-/// Internal ranges a `Production` (multi-tenant SaaS) deployment must not let a
-/// semi-untrusted tenant admin's issuer reach. Self-hosted / enterprise
-/// single-tenant and development legitimately run the IdP on these ranges, so
-/// this set is gated on the profile by [`is_blocked_addr`].
-fn is_internal(ip: IpAddr) -> bool {
-    match normalize_ip(ip) {
-        IpAddr::V4(v4) => {
-            v4.is_loopback() || v4.is_private() || v4.is_unspecified() || is_cgnat(v4)
-        }
-        IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified() || is_unique_local_v6(v6),
-    }
-}
-
-/// The SSRF address policy: block metadata/link-local everywhere, and block the
-/// broader internal ranges only under `Production`.
-fn is_blocked_addr(ip: IpAddr, profile: DeploymentProfile) -> bool {
-    is_always_blocked(ip) || (profile.is_production() && is_internal(ip))
-}
-
-/// The rejection an issuer earns when it resolves to a blocked address.
-fn blocked_issuer_error() -> WyrdErrorResponse {
-    WyrdErrorResponse::from(WyrdError::MissingRequiredField {
-        message: "issuer resolves to a blocked address range".to_owned(),
-        details: serde_json::json!({ "field": "issuer" }),
-    })
-}
-
-/// Resolve `host:port` and reject if **any** resolved address is blocked for the
-/// profile, returning the screened addresses. Rejecting on any blocked record
-/// defeats split-horizon DNS that mixes one public and one internal answer.
-async fn resolve_and_screen(
-    host: &str,
-    port: u16,
-    profile: DeploymentProfile,
-) -> Result<Vec<SocketAddr>, WyrdErrorResponse> {
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|error| {
-            tracing::warn!(%host, %error, "issuer host resolution failed");
-            WyrdErrorResponse::from(WyrdError::DiscoveryUnavailable {
-                message: "issuer host could not be resolved".to_owned(),
-                details: serde_json::json!({ "field": "issuer" }),
-            })
-        })?
-        .collect();
-
-    if addrs.is_empty() || addrs.iter().any(|addr| is_blocked_addr(addr.ip(), profile)) {
-        return Err(blocked_issuer_error());
-    }
-    Ok(addrs)
-}
-
-/// Build a discovery client pinned to the pre-screened addresses so the fetch
-/// connects to a validated IP and cannot be re-pointed at an internal address by
-/// a DNS-rebinding answer between the screen and the connect.
+/// The issuer URL is already validated by [`IssuerUrl`]; a discovery failure is
+/// a `503`. The fetch itself goes through the deployment's
+/// [`ScreenedHttp`](wyrd_auth_oidc::ScreenedHttp), which owns the address
+/// policy, the bounded resolution, the pinning, and the redirect refusal — the
+/// same capability the login, token-exchange, and JWKS-refresh paths use, so
+/// none of them can be the one that forgot.
 ///
 /// # Errors
 ///
-/// Returns [`WyrdErrorResponse`] when another Rustls provider already owns the
-/// process or Reqwest rejects the pinned client configuration.
-fn pinned_discovery_client(
-    host: &str,
-    addrs: &[SocketAddr],
-) -> Result<reqwest::Client, WyrdErrorResponse> {
-    wyrd_tls::install_crypto_provider().map_err(|_| {
-        WyrdErrorResponse::from(WyrdError::DiscoveryUnavailable {
-            message: "discovery TLS provider initialization failed".to_owned(),
-            details: serde_json::json!({ "field": "issuer" }),
-        })
-    })?;
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::none())
-        .resolve_to_addrs(host, addrs)
-        .build()
-        .map_err(|error| {
-            tracing::error!(%error, "failed to build pinned discovery client");
-            WyrdErrorResponse::from(WyrdError::DiscoveryUnavailable {
-                message: "discovery client could not be constructed".to_owned(),
-                details: serde_json::json!({ "field": "issuer" }),
-            })
-        })
-}
-
-/// Resolve the issuer's `jwks_uri` via OIDC discovery. The issuer URL is already
-/// validated by [`IssuerUrl`]; a discovery failure is a `503`.
-///
-/// SSRF policy (see [`is_blocked_addr`]): the cloud metadata / link-local range
-/// is blocked in every profile; the broader internal ranges (loopback, private,
-/// CGNAT, ULA) are blocked only in `Production`, because self-hosted /
-/// enterprise-single-tenant and development legitimately run the IdP on a
-/// private or loopback address. A literal-IP host is screened directly; a
-/// hostname is resolved, every resolved address is screened, and the discovery
-/// client is pinned to those addresses so a DNS-rebinding answer cannot redirect
-/// the connect to an internal address after the screen.
+/// Returns a `MissingRequiredField` rejection when the issuer resolves to a
+/// blocked address, and `DiscoveryUnavailable` when the host cannot be
+/// resolved, the client cannot be built, or discovery itself fails.
 pub(crate) async fn discover_jwks_uri(
     issuer: &IssuerUrl,
     deployment_profile: DeploymentProfile,
@@ -664,26 +522,11 @@ pub(crate) async fn discover_jwks_uri(
         })
     })?;
 
-    let client = match url.host() {
-        Some(url::Host::Ipv4(addr)) => {
-            if is_blocked_addr(IpAddr::V4(addr), deployment_profile) {
-                return Err(blocked_issuer_error());
-            }
-            discovery_client()?
-        }
-        Some(url::Host::Ipv6(addr)) => {
-            if is_blocked_addr(IpAddr::V6(addr), deployment_profile) {
-                return Err(blocked_issuer_error());
-            }
-            discovery_client()?
-        }
-        Some(url::Host::Domain(domain)) => {
-            let port = url.port_or_known_default().unwrap_or(443);
-            let addrs = resolve_and_screen(domain, port, deployment_profile).await?;
-            pinned_discovery_client(domain, &addrs)?
-        }
-        None => return Err(blocked_issuer_error()),
-    };
+    let client = deployment_profile
+        .screened_http()
+        .client_for(&url)
+        .await
+        .map_err(screen_error)?;
 
     let provider = OidcProvider::discover(url, client).await.map_err(|error| {
         tracing::warn!(
@@ -697,6 +540,25 @@ pub(crate) async fn discover_jwks_uri(
         })
     })?;
     Ok(provider.metadata.jwks_uri)
+}
+
+/// Project a screening refusal onto the admin error catalog.
+///
+/// A blocked address is the administrator's issuer being wrong and says so; a
+/// resolution or client failure is transient infrastructure and is a `503`.
+fn screen_error(error: ScreenError) -> WyrdErrorResponse {
+    match error {
+        ScreenError::Blocked => WyrdErrorResponse::from(WyrdError::MissingRequiredField {
+            message: "issuer resolves to a blocked address range".to_owned(),
+            details: serde_json::json!({ "field": "issuer" }),
+        }),
+        ScreenError::Unresolved | ScreenError::Client => {
+            WyrdErrorResponse::from(WyrdError::DiscoveryUnavailable {
+                message: "issuer could not be reached".to_owned(),
+                details: serde_json::json!({ "field": "issuer" }),
+            })
+        }
+    }
 }
 
 /// Normalize a query-supplied issuer to match the stored form (trailing slash
@@ -1052,48 +914,6 @@ mod pg_tests {
             WyrdError::MissingRequiredField { message, .. }
                 if message.contains("blocked address range")
         ));
-    }
-
-    #[test]
-    fn ssrf_metadata_endpoint_blocked_in_every_profile() {
-        let metadata: IpAddr = "169.254.169.254".parse().expect("valid ip");
-        assert!(is_blocked_addr(metadata, DeploymentProfile::Development));
-        assert!(is_blocked_addr(metadata, DeploymentProfile::Production));
-        // An IPv4-mapped IPv6 spelling of the same address is caught too.
-        let mapped: IpAddr = "::ffff:169.254.169.254".parse().expect("valid ip");
-        assert!(is_blocked_addr(mapped, DeploymentProfile::Development));
-    }
-
-    #[test]
-    fn ssrf_internal_ranges_blocked_only_in_production() {
-        for raw in [
-            "127.0.0.1",   // loopback
-            "10.0.0.5",    // private
-            "192.168.1.1", // private
-            "172.16.0.1",  // private
-            "100.64.0.1",  // CGNAT
-            "::1",         // v6 loopback
-            "fc00::1",     // v6 ULA
-        ] {
-            let ip: IpAddr = raw.parse().expect("valid ip");
-            assert!(
-                is_blocked_addr(ip, DeploymentProfile::Production),
-                "{raw} must be blocked in Production"
-            );
-            assert!(
-                !is_blocked_addr(ip, DeploymentProfile::Development),
-                "{raw} must be allowed in Development"
-            );
-        }
-    }
-
-    #[test]
-    fn ssrf_public_addresses_allowed_in_every_profile() {
-        for raw in ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111"] {
-            let ip: IpAddr = raw.parse().expect("valid ip");
-            assert!(!is_blocked_addr(ip, DeploymentProfile::Development));
-            assert!(!is_blocked_addr(ip, DeploymentProfile::Production));
-        }
     }
 
     #[tokio::test]

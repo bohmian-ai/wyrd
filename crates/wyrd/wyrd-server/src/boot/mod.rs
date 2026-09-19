@@ -1487,6 +1487,7 @@ async fn install_auth(
         signing_key,
         postgres.app_pool(),
         Arc::clone(&issuer_resolver),
+        config.deployment_profile.screened_http(),
     )?;
 
     Ok(ServerAuth {

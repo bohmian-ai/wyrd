@@ -13,7 +13,7 @@ use std::time::Duration;
 use secrecy::SecretString;
 use sqlx::PgPool;
 use wyrd_auth_issue::IssuingKey;
-use wyrd_auth_oidc::JwksCache;
+use wyrd_auth_oidc::{JwksCache, ScreenedHttp};
 use wyrd_auth_verify::{Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem};
 
 use crate::auth::permission_resolver::SqlPermissionResolver;
@@ -45,6 +45,10 @@ const JWKS_FETCH_TIMEOUT_SECS: u64 = 5;
 /// tenant's trusted issuers per-request from Postgres (an empty result simply
 /// means the tenant federates no issuers), so federated tokens can be exchanged.
 ///
+/// `http` is the deployment's outbound address screening. The JWKS cache is
+/// built with it rather than a bare client, so a refresh long after the issuer
+/// was configured is screened again at the moment it is made.
+///
 /// # Errors
 /// Returns [`ServerBootError::OraclePeer`] when another Rustls provider already
 /// owns the process. Returns [`ServerBootError::SigningKey`] when the PEM cannot
@@ -53,6 +57,7 @@ pub fn build_auth_handles(
     signing_key: &SecretString,
     pool: &PgPool,
     issuer_resolver: Arc<PgIssuerResolver>,
+    http: ScreenedHttp,
 ) -> Result<(Arc<IssuingKey>, Arc<WyrdTokenVerifier>), ServerBootError> {
     wyrd_tls::install_crypto_provider()
         .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?;
@@ -80,7 +85,7 @@ pub fn build_auth_handles(
 
     let verifier = verifier_base.with_external(
         Arc::new(JwksCache::new(
-            reqwest::Client::new(),
+            http,
             Duration::from_secs(JWKS_CACHE_TTL_SECS),
             Duration::from_secs(JWKS_FETCH_TIMEOUT_SECS),
         )),
@@ -130,6 +135,7 @@ mod tests {
             &SecretString::from(PRIVATE_KEY_PEM),
             &lazy_pool(),
             Arc::new(PgIssuerResolver::new(Arc::new(lazy_pool()), None)),
+            ScreenedHttp::allowing_internal(),
         )
         .expect("auth handles assemble from the signing key");
 
@@ -163,6 +169,7 @@ mod tests {
             &SecretString::from("not a pem"),
             &lazy_pool(),
             Arc::new(PgIssuerResolver::new(Arc::new(lazy_pool()), None)),
+            ScreenedHttp::allowing_internal(),
         );
         assert!(matches!(result, Err(ServerBootError::SigningKey(_))));
     }

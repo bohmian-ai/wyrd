@@ -1,8 +1,22 @@
 //! Cross-cutting auth error converters shared by all three token-issuing flows.
 
 use serde_json::json;
+use wyrd_auth_oidc::ScreenError;
 use wyrd_auth_verify::{AuthError, MAX_DELEGATION_DEPTH};
 use wyrd_spec::error::WyrdError;
+
+/// Convert an outbound address-screening refusal to the public catalog.
+///
+/// Every cause is one public error: a caller learns that the provider could not
+/// be reached, never which address range it resolved to, because that answer is
+/// a probe of the deployment's internal network.
+pub(crate) fn screen_error(error: &ScreenError) -> WyrdError {
+    tracing::warn!(%error, "identity provider request refused by address screening");
+    WyrdError::DiscoveryUnavailable {
+        message: "identity provider could not be reached".to_owned(),
+        details: json!({}),
+    }
+}
 
 /// Convert a token-verifier [`AuthError`] to the public [`WyrdError`] catalog.
 pub(crate) fn auth_error_to_wyrd(error: AuthError) -> WyrdError {

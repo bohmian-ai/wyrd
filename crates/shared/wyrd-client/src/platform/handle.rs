@@ -11,8 +11,9 @@ use wyrd_spec::auth::{
     ConfigurePlatformOidcRequest, CreateTenantRequest, CreateTenantResponse,
     CredentialListResponse, IssuePlatformCredentialRequest, IssuedCredential,
     PlatformOidcConnectionView, PlatformPrincipalListResponse, PlatformTokenRequest, PrincipalId,
-    ProvisionedTenantAdmin, RecoverTenantAdminRequest, RegisterPlatformAdminRequest,
-    RegisterPlatformAdminResponse, SecretBearer, SetPlatformPrincipalStatusRequest,
+    ProvisionedTenant, ProvisionedTenantAdmin, RecoverTenantAdminRequest,
+    RegisterPlatformAdminRequest, RegisterPlatformAdminResponse, SecretBearer,
+    SetPlatformPrincipalStatusRequest, SetTenantStatusRequest, TenantListResponse,
 };
 use wyrd_spec::error::WyrdError;
 
@@ -114,6 +115,52 @@ impl Platform {
     ) -> Result<CreateTenantResponse, WyrdError> {
         self.call(Method::POST, "/platform/tenants", Some(request))
             .await
+    }
+
+    /// List every tenant in the directory, in every lifecycle state.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the caller lacks tenant reading or the read
+    /// fails.
+    pub async fn list_tenants(&self) -> Result<TenantListResponse, WyrdError> {
+        self.call::<(), _>(Method::GET, "/platform/tenants", None)
+            .await
+    }
+
+    /// Read one tenant's directory row.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the caller lacks tenant reading or no such
+    /// tenant exists.
+    pub async fn tenant(&self, tenant_id: DataTenantId) -> Result<ProvisionedTenant, WyrdError> {
+        self.call::<(), _>(Method::GET, &format!("/platform/tenants/{tenant_id}"), None)
+            .await
+    }
+
+    /// Suspend a tenant or restore it.
+    ///
+    /// Suspension freezes admission and destroys nothing, so resuming restores
+    /// exactly what was there. The transition is refused when the tenant is not
+    /// already in the opposite state.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the caller lacks tenant suspension, the status
+    /// is neither `active` nor `suspended`, or the tenant is not in the state
+    /// the transition requires.
+    pub async fn set_tenant_status(
+        &self,
+        tenant_id: DataTenantId,
+        status: &str,
+    ) -> Result<(), WyrdError> {
+        let request = SetTenantStatusRequest {
+            status: status.to_owned(),
+        };
+        self.call_no_content(
+            Method::PUT,
+            &format!("/platform/tenants/{tenant_id}/status"),
+            Some(&request),
+        )
+        .await
     }
 
     /// Issue a replacement credential for a tenant that has lost every one.

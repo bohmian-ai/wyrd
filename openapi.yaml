@@ -484,6 +484,34 @@ paths:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
   /platform/tenants:
+    get:
+      tags:
+      - Platform
+      summary: List the tenant directory, newest first.
+      description: |-
+        # Errors
+        Returns a stable Wyrd error when the caller is unauthorized, the platform
+        plane is unconfigured, or the read fails.
+      operationId: list_tenants
+      responses:
+        '200':
+          description: Every live tenant, in every lifecycle state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TenantListResponse'
+        '401':
+          description: Platform session required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '403':
+          description: Tenant reading not granted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
     post:
       tags:
       - Platform
@@ -561,6 +589,99 @@ paths:
                 $ref: '#/components/schemas/WyrdProblem'
         '404':
           description: No active tenant to recover, indistinguishably for every cause
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+  /platform/tenants/{tenant_id}:
+    get:
+      tags:
+      - Platform
+      summary: Read one tenant's directory row.
+      description: |-
+        # Errors
+        Returns a stable Wyrd error when the caller is unauthorized, no such tenant
+        exists, the platform plane is unconfigured, or the read fails.
+      operationId: inspect_tenant
+      parameters:
+      - name: tenant_id
+        in: path
+        description: Tenant to inspect
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The tenant's directory row
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProvisionedTenant'
+        '401':
+          description: Platform session required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '403':
+          description: Tenant reading not granted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '404':
+          description: No such tenant, indistinguishably for every cause
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+  /platform/tenants/{tenant_id}/status:
+    put:
+      tags:
+      - Platform
+      summary: Suspend a tenant or restore it.
+      description: |-
+        # Errors
+        Returns a stable Wyrd error when the caller is unauthorized, the status is
+        not a settable one, the tenant is not in the state the transition requires,
+        the platform plane is unconfigured, or the write fails.
+      operationId: set_tenant_status
+      parameters:
+      - name: tenant_id
+        in: path
+        description: Tenant to transition
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetTenantStatusRequest'
+        required: true
+      responses:
+        '200':
+          description: The tenant now holds the requested status
+        '400':
+          description: Status is neither active nor suspended
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '401':
+          description: Platform session required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '403':
+          description: Tenant suspension not granted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '404':
+          description: Tenant is not in the state this transition requires
           content:
             application/json:
               schema:
@@ -3893,6 +4014,23 @@ components:
           type: string
           description: '`active` to restore, `suspended` to stop this principal acting.'
       additionalProperties: false
+    SetTenantStatusRequest:
+      type: object
+      description: |-
+        Request to move a tenant between `active` and `suspended`.
+
+        Suspension is reversible and destroys nothing: the tenant's rows, grants,
+        and credentials survive, so resuming restores exactly what was there. The
+        states a tenant reaches on its own — `provisioning`, `failed` — are not
+        settable here, because an operator declaring them would contradict what
+        provisioning observed.
+      required:
+      - status
+      properties:
+        status:
+          type: string
+          description: Either `active` or `suspended`.
+      additionalProperties: false
     SortDirectionWire:
       type: string
       description: Sort direction of one declared physical sort key.
@@ -4533,6 +4671,22 @@ components:
       - Active
       - Deprecated
       - Quarantined
+    TenantListResponse:
+      type: object
+      description: |-
+        The live tenant directory.
+
+        Every lifecycle state is listed, soft-deleted rows excluded: an operator's
+        first question about a tenant is usually why it is not active, so filtering
+        to `active` would hide exactly the rows worth looking at.
+      required:
+      - tenants
+      properties:
+        tenants:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProvisionedTenant'
+          description: Tenants newest first.
     TenantSlug:
       type: string
       description: Human-visible tenant slug resolved to a DataTenantId at the auth boundary.

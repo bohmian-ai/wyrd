@@ -2373,3 +2373,184 @@ async fn one_tenant_cannot_reach_another_tenants_identities() {
         );
     }
 }
+
+/// An operator administers the tenant lifecycle without touching the database.
+///
+/// Suspension has to mean the tenant stops admitting callers, not merely that a
+/// column changed, so both halves are checked: a credential that has not been
+/// exchanged yet is refused, and a token minted *before* the suspension stops
+/// working too. Resuming restores exactly what was there — the same
+/// administrative principal, still holding the grants it had — because
+/// suspension freezes a tenant rather than dismantling it.
+#[tokio::test]
+async fn an_operator_suspends_and_resumes_a_tenant_through_the_platform_plane() {
+    if !e2e_enabled() {
+        return;
+    }
+    let srv = WyrdTestServer::start_in_process()
+        .await
+        .expect("server starts");
+    let root = initialize_platform_root(&srv.operator_pool())
+        .await
+        .expect("deployment initializes");
+    let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
+
+    let created = body_json(
+        srv.oneshot(platform_post(
+            "/platform/tenants",
+            &session,
+            json!({ "slug": "lifecycle", "display_name": "Lifecycle" }),
+        ))
+        .await
+        .expect("tenant route responds"),
+    )
+    .await;
+    let tenant_id = created["tenant"]["id"]
+        .as_str()
+        .expect("tenant id")
+        .to_owned();
+    let admin_credential = created["admin"]["credential"]
+        .as_str()
+        .expect("credential")
+        .to_owned();
+    let admin_principal = created["admin"]["principal_id"]
+        .as_str()
+        .expect("principal id")
+        .to_owned();
+
+    // The directory is readable without SQL, in every lifecycle state.
+    let listing = body_json(
+        srv.oneshot(platform_request(
+            Method::GET,
+            "/platform/tenants",
+            &session,
+            None,
+        ))
+        .await
+        .expect("tenant listing responds"),
+    )
+    .await;
+    assert!(
+        listing["tenants"]
+            .as_array()
+            .expect("tenants are listed")
+            .iter()
+            .any(|tenant| tenant["id"] == tenant_id.as_str() && tenant["status"] == "active"),
+        "the new tenant is in the directory as active: {listing}"
+    );
+
+    let inspected = body_json(
+        srv.oneshot(platform_request(
+            Method::GET,
+            &format!("/platform/tenants/{tenant_id}"),
+            &session,
+            None,
+        ))
+        .await
+        .expect("tenant inspect responds"),
+    )
+    .await;
+    assert_eq!(
+        inspected["slug"], "lifecycle",
+        "inspection reads one tenant: {inspected}"
+    );
+
+    // A token minted before the suspension is the interesting one.
+    let live_token = tenant_token(&srv, &admin_credential)
+        .await
+        .expect("the tenant administers before suspension");
+
+    let suspend = async |status: &str| -> StatusCode {
+        srv.oneshot(platform_request(
+            Method::PUT,
+            &format!("/platform/tenants/{tenant_id}/status"),
+            &session,
+            Some(json!({ "status": status })),
+        ))
+        .await
+        .expect("tenant status route responds")
+        .status()
+    };
+    assert_eq!(
+        suspend("suspended").await,
+        StatusCode::OK,
+        "the tenant suspends"
+    );
+
+    assert!(
+        tenant_token(&srv, &admin_credential).await.is_err(),
+        "a suspended tenant mints no fresh token"
+    );
+    let resp = srv
+        .oneshot_authenticated(
+            &live_token,
+            tenant_request(
+                Method::POST,
+                "/v1/principals",
+                Some(json!({ "name": "during-suspension", "roles": ["reader"] })),
+            ),
+        )
+        .await
+        .expect("principal route responds");
+    assert_ne!(
+        resp.status(),
+        StatusCode::OK,
+        "a token minted before the suspension stops working too"
+    );
+
+    // Replaying the same transition changes nothing and says so.
+    assert_eq!(
+        suspend("suspended").await,
+        StatusCode::NOT_FOUND,
+        "a tenant already suspended is not suspended again"
+    );
+    assert_eq!(
+        suspend("deleted").await,
+        StatusCode::BAD_REQUEST,
+        "only active and suspended are settable"
+    );
+
+    assert_eq!(
+        suspend("active").await,
+        StatusCode::OK,
+        "the tenant resumes"
+    );
+
+    // Restored, not rebuilt: the same principal, still holding its grants.
+    let restored = tenant_token(&srv, &admin_credential)
+        .await
+        .expect("the resumed tenant admits its credential again");
+    let resp = srv
+        .oneshot_authenticated(
+            &restored,
+            tenant_request(
+                Method::POST,
+                "/v1/principals",
+                Some(json!({ "name": "after-resume", "roles": ["reader"] })),
+            ),
+        )
+        .await
+        .expect("principal route responds");
+    let status = resp.status();
+    let body = body_json(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the administrator keeps the grants it had: {body}"
+    );
+    let recovered = body_json(
+        srv.oneshot(platform_post(
+            "/platform/tenants/admin/credentials",
+            &session,
+            json!({ "tenant_id": tenant_id }),
+        ))
+        .await
+        .expect("recovery route responds"),
+    )
+    .await;
+    assert_eq!(
+        recovered["principal_id"].as_str().expect("principal id"),
+        admin_principal,
+        "the resumed tenant still has the administrative principal it started with"
+    );
+}

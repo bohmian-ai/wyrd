@@ -37,7 +37,8 @@ pub use revoke::{REASON_MAX_BYTES, RevokePrincipalRequest};
 pub use secret_bearer::SecretBearer;
 pub use tenant_admin::{
     CreateTenantRequest, CreateTenantResponse, PlatformTokenRequest, PlatformTokenResponse,
-    ProvisionedTenant, ProvisionedTenantAdmin, RecoverTenantAdminRequest,
+    ProvisionedTenant, ProvisionedTenantAdmin, RecoverTenantAdminRequest, SetTenantStatusRequest,
+    TenantListResponse,
 };
 pub use tenant_principals::{
     CreateServicePrincipalRequest, CreateServicePrincipalResponse, CredentialListResponse,

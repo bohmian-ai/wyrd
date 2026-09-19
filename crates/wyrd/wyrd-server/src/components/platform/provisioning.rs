@@ -21,15 +21,17 @@ use wyrd_runtime::Permission;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
     CreateTenantRequest, CreateTenantResponse, ProvisionedTenant, ProvisionedTenantAdmin,
-    SecretBearer,
+    SecretBearer, TenantListResponse,
 };
 use wyrd_sql::queries::auth::{
     grant_role_to_service_account, insert_api_key, insert_service_account, role_by_name,
     tenant_admin_principal_id,
 };
 use wyrd_sql::queries::platform::provisioning::{
-    insert_provisioning_tenant, mark_tenant_active, mark_tenant_failed,
+    insert_provisioning_tenant, mark_tenant_active, mark_tenant_failed, set_tenant_suspended,
 };
+use wyrd_sql::queries::platform::tenants::{list_tenants, tenant_by_id};
+use wyrd_sql::row_types::platform::TenantRow;
 use wyrd_sql::{OperatorPool, SqlError, WyrdPostgres};
 
 use crate::components::auth::PlatformCaller;
@@ -192,6 +194,136 @@ impl TenantProvisioning {
         }
     }
 
+    /// List the tenant directory an operator administers.
+    ///
+    /// Every lifecycle state is included, because the states an operator needs
+    /// to see are precisely the non-active ones. Reading the directory is an
+    /// authorized decision like any other and is audited as one.
+    ///
+    /// # Errors
+    /// Returns [`ProvisionError::Denied`] when the caller lacks `tenants:read`,
+    /// [`ProvisionError::AuditUnavailable`] when the decision cannot be
+    /// recorded, and [`ProvisionError::Store`] when the read fails.
+    #[tracing::instrument(level = "info", skip(self, caller), err)]
+    pub async fn list(
+        &self,
+        caller: &PlatformCaller,
+    ) -> Result<TenantListResponse, ProvisionError> {
+        self.authorize_read(caller, None).await?;
+        let rows = list_tenants(&self.operator)
+            .await
+            .map_err(|e| ProvisionError::Store(e.to_string()))?;
+        Ok(TenantListResponse {
+            tenants: rows
+                .into_iter()
+                .map(summarize)
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
+
+    /// Read one tenant's directory row.
+    ///
+    /// Refuses an unknown or soft-deleted tenant with the same
+    /// [`ProvisionError::TenantUnavailable`] every other miss uses, so an
+    /// operator learns nothing from a refusal that a listing would not tell
+    /// them anyway.
+    ///
+    /// # Errors
+    /// Returns [`ProvisionError::Denied`] when the caller lacks `tenants:read`,
+    /// [`ProvisionError::TenantUnavailable`] when no such row exists,
+    /// [`ProvisionError::AuditUnavailable`] when the decision cannot be
+    /// recorded, and [`ProvisionError::Store`] when the read fails.
+    #[tracing::instrument(level = "info", skip(self, caller), fields(tenant = %tenant_id), err)]
+    pub async fn inspect(
+        &self,
+        caller: &PlatformCaller,
+        tenant_id: DataTenantId,
+    ) -> Result<ProvisionedTenant, ProvisionError> {
+        self.authorize_read(caller, Some(tenant_id)).await?;
+        tenant_by_id(&self.operator, tenant_id)
+            .await
+            .map_err(|e| ProvisionError::Store(e.to_string()))?
+            .ok_or(ProvisionError::TenantUnavailable)
+            .and_then(summarize)
+    }
+
+    /// Suspend a tenant or restore it.
+    ///
+    /// Suspension freezes admission without destroying anything: the tenant's
+    /// rows, grants, and credentials survive, so resuming restores exactly what
+    /// was there. The transition is conditional on the tenant currently holding
+    /// the opposite state, so suspending a `provisioning` or `failed` tenant —
+    /// or replaying either call — changes nothing and is refused rather than
+    /// silently reported as done.
+    ///
+    /// # Errors
+    /// Returns [`ProvisionError::Denied`] when the caller lacks
+    /// `tenants:suspend`, [`ProvisionError::TenantUnavailable`] when the tenant
+    /// is not in the state the transition requires,
+    /// [`ProvisionError::AuditUnavailable`] when the decision cannot be
+    /// recorded — in which case nothing changes — and
+    /// [`ProvisionError::Store`] when the write fails.
+    #[tracing::instrument(level = "info", skip(self, caller), fields(tenant = %tenant_id), err)]
+    pub async fn set_suspended(
+        &self,
+        caller: &PlatformCaller,
+        tenant_id: DataTenantId,
+        suspended: bool,
+    ) -> Result<(), ProvisionError> {
+        let authz = PlatformAuthorization::new(self.operator.clone());
+        let decision = authz
+            .authorize(
+                &caller.context,
+                &Permission::tenant_suspend(),
+                caller.request_id.as_str(),
+                Some(tenant_id),
+            )
+            .await?;
+        decision
+            .commit()
+            .await
+            .map_err(|e| ProvisionError::Store(e.to_string()))?;
+
+        if set_tenant_suspended(&self.operator, tenant_id, suspended)
+            .await
+            .map_err(|e| ProvisionError::Store(e.to_string()))?
+        {
+            Ok(())
+        } else {
+            Err(ProvisionError::TenantUnavailable)
+        }
+    }
+
+    /// Authorize and audit a directory read, then release the decision.
+    ///
+    /// The read itself runs outside this transaction: it touches only the
+    /// directory the decision was recorded against, so holding the transaction
+    /// open across it would buy nothing.
+    ///
+    /// # Errors
+    /// Returns [`ProvisionError::Denied`] when the caller lacks `tenants:read`,
+    /// [`ProvisionError::AuditUnavailable`] when the decision cannot be
+    /// recorded, and [`ProvisionError::Store`] when the commit fails.
+    async fn authorize_read(
+        &self,
+        caller: &PlatformCaller,
+        tenant_id: Option<DataTenantId>,
+    ) -> Result<(), ProvisionError> {
+        let authz = PlatformAuthorization::new(self.operator.clone());
+        let decision = authz
+            .authorize(
+                &caller.context,
+                &Permission::tenant_read(),
+                caller.request_id.as_str(),
+                tenant_id,
+            )
+            .await?;
+        decision
+            .commit()
+            .await
+            .map_err(|e| ProvisionError::Store(e.to_string()))
+    }
+
     /// Create the tenant's administrative principal, roles, and credential.
     ///
     /// One tenant-scoped transaction: the principal, its builtin roles, its
@@ -289,4 +421,27 @@ fn slug_or_store(error: SqlError) -> ProvisionError {
         SqlError::UniqueViolation { .. } => ProvisionError::SlugTaken,
         other => ProvisionError::Store(other.to_string()),
     }
+}
+
+/// Project a directory row onto the wire tenant shape.
+///
+/// A stored id or slug that fails validation means the directory holds a row
+/// no current write path could have produced, so it is reported as a store
+/// failure rather than papered over with a substitute value an operator would
+/// then act on.
+///
+/// # Errors
+/// Returns [`ProvisionError::Store`] when the stored id is not a Wyrd tenant id
+/// or the stored slug is not a valid slug.
+fn summarize(row: TenantRow) -> Result<ProvisionedTenant, ProvisionError> {
+    Ok(ProvisionedTenant {
+        id: DataTenantId::new(row.data_tenant_id)
+            .map_err(|e| ProvisionError::Store(e.to_string()))?,
+        slug: row
+            .slug
+            .parse()
+            .map_err(|e: wyrd_spec::ids::IdError| ProvisionError::Store(e.to_string()))?,
+        display_name: row.display_name,
+        status: row.status,
+    })
 }

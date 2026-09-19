@@ -45,7 +45,7 @@ impl PlatformEndpoint {
     /// # Errors
     /// Returns [`WyrdCliError::Server`] when the credential is refused or the
     /// platform plane is not configured on this deployment.
-    async fn connect(&self) -> Result<Platform, WyrdCliError> {
+    pub(super) async fn connect(&self) -> Result<Platform, WyrdCliError> {
         Platform::connect(
             self.server.as_str(),
             &SecretString::from(self.credential.clone()),

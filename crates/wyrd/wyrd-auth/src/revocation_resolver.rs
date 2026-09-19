@@ -15,6 +15,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalKindTag;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{service_account_revocation_epoch, user_revocation_epoch};
+use wyrd_sql::queries::platform::tenant_resolver::tenant_admits_credentials;
 
 const EPOCH_CACHE_TTL: Duration = Duration::from_secs(5);
 const EPOCH_CACHE_MAX: u64 = 50_000;
@@ -107,6 +108,20 @@ impl RevocationCheck for SqlRevocationCheck {
                     let mut conn = TenantConn::acquire(&self.pool, *tenant)
                         .await
                         .map_err(|e| ResolveError::Unavailable(e.to_string()))?;
+                    // Suspension has to stop the tokens a tenant already
+                    // minted, not merely the next exchange, or an operator
+                    // freezing a tenant would be waiting out every live token.
+                    // This is the one place a token's continued validity is
+                    // resolved, so the tenant's admission belongs here rather
+                    // than in each handler: a tenant that no longer admits
+                    // credentials invalidates everything issued before now,
+                    // exactly as a principal's own epoch would.
+                    if !tenant_admits_credentials(&mut conn, *tenant)
+                        .await
+                        .map_err(|e| ResolveError::Unavailable(e.to_string()))?
+                    {
+                        return Ok(Some(Utc::now()));
+                    }
                     let id_uuid = principal.as_uuid();
                     let epoch =
                         match kind {

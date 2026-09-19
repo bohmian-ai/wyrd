@@ -10,17 +10,19 @@
 //! refused there before reaching a handler — and a tenant token must never be
 //! accepted here. Two planes, two entries.
 
-use axum::extract::State;
-use axum::routing::post;
+use axum::extract::{Path, State};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use secrecy::{ExposeSecret, SecretString};
 use wyrd_auth::platform_sessions::{
     DEFAULT_PLATFORM_TOKEN_TTL_MINUTES, PlatformSessionError, PlatformSessions,
 };
+use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::SecretBearer;
 use wyrd_spec::auth::{
     CreateTenantRequest, CreateTenantResponse, PlatformTokenRequest, PlatformTokenResponse,
-    ProvisionedTenantAdmin, RecoverTenantAdminRequest,
+    ProvisionedTenant, ProvisionedTenantAdmin, RecoverTenantAdminRequest, SetTenantStatusRequest,
+    TenantListResponse,
 };
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 
@@ -36,7 +38,12 @@ use crate::state::AppState;
 /// for why the two planes have separate entries.
 pub fn platform_router() -> Router<AppState> {
     Router::new()
-        .route("/platform/tenants", post(create_tenant))
+        .route("/platform/tenants", post(create_tenant).get(list_tenants))
+        .route("/platform/tenants/{tenant_id}", get(inspect_tenant))
+        .route(
+            "/platform/tenants/{tenant_id}/status",
+            put(set_tenant_status),
+        )
         .route(
             "/platform/tenants/admin/credentials",
             post(recover_tenant_admin),
@@ -207,4 +214,124 @@ fn provision_error(error: ProvisionError) -> WyrdErrorResponse {
             WyrdErrorResponse::from(internal_failure("tenant provisioning failed", &reason))
         }
     }
+}
+
+/// List the tenant directory, newest first.
+///
+/// # Errors
+/// Returns a stable Wyrd error when the caller is unauthorized, the platform
+/// plane is unconfigured, or the read fails.
+#[utoipa::path(
+    get,
+    path = "/platform/tenants",
+    responses(
+        (status = 200, description = "Every live tenant, in every lifecycle state",
+         body = TenantListResponse),
+        (status = 401, description = "Platform session required", body = WyrdProblem),
+        (status = 403, description = "Tenant reading not granted", body = WyrdProblem)
+    ),
+    tag = "Platform"
+)]
+#[tracing::instrument(level = "info", skip(state, caller))]
+async fn list_tenants(
+    State(state): State<AppState>,
+    caller: PlatformCaller,
+) -> Result<Json<TenantListResponse>, WyrdErrorResponse> {
+    directory(&state)?
+        .list(&caller)
+        .await
+        .map(Json)
+        .map_err(provision_error)
+}
+
+/// Read one tenant's directory row.
+///
+/// # Errors
+/// Returns a stable Wyrd error when the caller is unauthorized, no such tenant
+/// exists, the platform plane is unconfigured, or the read fails.
+#[utoipa::path(
+    get,
+    path = "/platform/tenants/{tenant_id}",
+    params(("tenant_id" = String, Path, description = "Tenant to inspect")),
+    responses(
+        (status = 200, description = "The tenant's directory row", body = ProvisionedTenant),
+        (status = 401, description = "Platform session required", body = WyrdProblem),
+        (status = 403, description = "Tenant reading not granted", body = WyrdProblem),
+        (status = 404, description = "No such tenant, indistinguishably for every cause",
+         body = WyrdProblem)
+    ),
+    tag = "Platform"
+)]
+#[tracing::instrument(level = "info", skip(state, caller))]
+async fn inspect_tenant(
+    State(state): State<AppState>,
+    caller: PlatformCaller,
+    Path(tenant_id): Path<DataTenantId>,
+) -> Result<Json<ProvisionedTenant>, WyrdErrorResponse> {
+    directory(&state)?
+        .inspect(&caller, tenant_id)
+        .await
+        .map(Json)
+        .map_err(provision_error)
+}
+
+/// Suspend a tenant or restore it.
+///
+/// # Errors
+/// Returns a stable Wyrd error when the caller is unauthorized, the status is
+/// not a settable one, the tenant is not in the state the transition requires,
+/// the platform plane is unconfigured, or the write fails.
+#[utoipa::path(
+    put,
+    path = "/platform/tenants/{tenant_id}/status",
+    params(("tenant_id" = String, Path, description = "Tenant to transition")),
+    request_body = SetTenantStatusRequest,
+    responses(
+        (status = 200, description = "The tenant now holds the requested status"),
+        (status = 400, description = "Status is neither active nor suspended", body = WyrdProblem),
+        (status = 401, description = "Platform session required", body = WyrdProblem),
+        (status = 403, description = "Tenant suspension not granted", body = WyrdProblem),
+        (status = 404, description = "Tenant is not in the state this transition requires",
+         body = WyrdProblem)
+    ),
+    tag = "Platform"
+)]
+#[tracing::instrument(level = "info", skip(state, caller, request))]
+async fn set_tenant_status(
+    State(state): State<AppState>,
+    caller: PlatformCaller,
+    Path(tenant_id): Path<DataTenantId>,
+    Json(request): Json<SetTenantStatusRequest>,
+) -> Result<(), WyrdErrorResponse> {
+    // Only the two states an operator may assert are settable. `provisioning`
+    // and `failed` describe what provisioning observed, and letting an operator
+    // declare them would contradict the record.
+    let suspended = match request.status.as_str() {
+        "suspended" => true,
+        "active" => false,
+        other => {
+            return Err(WyrdErrorResponse::from(WyrdError::Validation {
+                message: "tenant status must be active or suspended".to_owned(),
+                details: serde_json::json!({ "field": "status", "value": other }),
+            }));
+        }
+    };
+
+    directory(&state)?
+        .set_suspended(&caller, tenant_id, suspended)
+        .await
+        .map_err(provision_error)
+}
+
+/// Bind the tenant directory owner to this request, or report it unconfigured.
+///
+/// # Errors
+/// Returns the unconfigured-plane error when the deployment has no operator
+/// connection.
+fn directory(state: &AppState) -> Result<TenantProvisioning, WyrdErrorResponse> {
+    state
+        .postgres
+        .operator_pool()
+        .map(|operator| TenantProvisioning::new(operator, state.postgres.wyrd().clone()))
+        .ok_or_else(not_configured)
 }

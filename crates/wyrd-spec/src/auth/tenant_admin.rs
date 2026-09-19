@@ -87,3 +87,30 @@ pub struct RecoverTenantAdminRequest {
     /// Tenant whose administration is being restored.
     pub tenant_id: DataTenantId,
 }
+
+/// The live tenant directory.
+///
+/// Every lifecycle state is listed, soft-deleted rows excluded: an operator's
+/// first question about a tenant is usually why it is not active, so filtering
+/// to `active` would hide exactly the rows worth looking at.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct TenantListResponse {
+    /// Tenants newest first.
+    pub tenants: Vec<ProvisionedTenant>,
+}
+
+/// Request to move a tenant between `active` and `suspended`.
+///
+/// Suspension is reversible and destroys nothing: the tenant's rows, grants,
+/// and credentials survive, so resuming restores exactly what was there. The
+/// states a tenant reaches on its own — `provisioning`, `failed` — are not
+/// settable here, because an operator declaring them would contradict what
+/// provisioning observed.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct SetTenantStatusRequest {
+    /// Either `active` or `suspended`.
+    pub status: String,
+}

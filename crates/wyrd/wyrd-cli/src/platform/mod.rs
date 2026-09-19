@@ -7,6 +7,7 @@
 //! own.
 
 pub mod credential;
+pub mod tenant;
 
 use std::process::ExitCode;
 
@@ -20,6 +21,9 @@ pub enum PlatformCommand {
     /// Issue, list, and retire platform credentials.
     #[command(subcommand)]
     Credential(credential::CredentialCommand),
+    /// Create, inspect, suspend, resume, and recover tenants.
+    #[command(subcommand)]
+    Tenant(tenant::TenantCommand),
 }
 
 /// Dispatch one platform command through its owning module.
@@ -30,5 +34,6 @@ pub enum PlatformCommand {
 pub async fn dispatch(command: PlatformCommand) -> Result<ExitCode, WyrdCliError> {
     match command {
         PlatformCommand::Credential(command) => credential::dispatch(command).await,
+        PlatformCommand::Tenant(command) => tenant::dispatch(command).await,
     }
 }

@@ -7,6 +7,9 @@
 //! a bare `&PgPool`.
 
 use sqlx::PgPool;
+use wyrd_spec::DataTenantId;
+
+use crate::{SqlError, TenantConn};
 
 /// Audited cross-tenant BYPASSRLS Postgres pool handle.
 ///
@@ -34,6 +37,28 @@ impl OperatorPool {
     /// or begin the transaction.
     pub async fn begin(&self) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, sqlx::Error> {
         self.0.begin().await
+    }
+
+    /// Opens one operator transaction carrying the platform audit scope.
+    ///
+    /// A platform-control-plane decision has no owning tenant, so its canonical
+    /// audit row stages under the `wyrd-system` sentinel
+    /// (`DataTenantId::SYSTEM_OWNER`) while its effect lands in `platform.*`.
+    /// Both must share one transaction, and only this boundary can write
+    /// `platform.*`, so the returned [`TenantConn`] is an operator transaction
+    /// that also carries the tenant key the canonical append names.
+    ///
+    /// This is not a third connection abstraction: it is the existing operator
+    /// pool handing back the existing tenant-scoped transaction type. Row-level
+    /// security is still bypassed here, which is exactly why `append_audit`
+    /// names `data_tenant_id` in every statement rather than relying on the
+    /// policy.
+    ///
+    /// # Errors
+    /// Returns [`SqlError::Connect`] when the pool cannot begin a transaction,
+    /// and [`SqlError::TxFailed`] when the tenant binding fails.
+    pub async fn begin_platform_audited(&self) -> Result<TenantConn<'_>, SqlError> {
+        TenantConn::acquire(&self.0, DataTenantId::SYSTEM_OWNER).await
     }
 
     /// Borrow the underlying BYPASSRLS pool.

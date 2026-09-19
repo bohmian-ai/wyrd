@@ -14,7 +14,6 @@
 //! connection, its login state, and the durable `(issuer, subject)` pin that
 //! resolves a human to an existing platform principal. It never creates one.
 
-pub mod audit_authz;
 pub mod credentials;
 pub mod identity;
 pub mod principal_grants;

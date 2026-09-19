@@ -30,7 +30,7 @@ use wyrd_sql::queries::auth::{
 use wyrd_sql::queries::platform::provisioning::{
     insert_provisioning_tenant, mark_tenant_active, mark_tenant_failed,
 };
-use wyrd_sql::{OperatorPool, SqlError, TenantConn};
+use wyrd_sql::{OperatorPool, SqlError, WyrdPostgres};
 
 use crate::components::auth::PlatformCaller;
 
@@ -85,12 +85,17 @@ impl From<PlatformAuthzError> for ProvisionError {
 pub struct TenantProvisioning {
     /// Platform boundary owning the tenant directory.
     operator: OperatorPool,
-    /// Row-level-secured pool the new tenant's own rows are written through.
-    app: sqlx::PgPool,
+    /// Wyrd control-plane handle the new tenant's own rows are written through.
+    ///
+    /// Held rather than a bare pool so tenant work is acquired through
+    /// [`WyrdPostgres::tenant_conn`], which carries the acquisition telemetry
+    /// and the row-level-security tenant bind. A privileged transaction is not
+    /// a portable capability this service hands out.
+    postgres: WyrdPostgres,
 }
 
 impl std::fmt::Debug for TenantProvisioning {
-    /// Prints the handle without its pools, which have no inspectable state.
+    /// Prints the handle without its boundaries, which have no inspectable state.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TenantProvisioning").finish_non_exhaustive()
     }
@@ -99,8 +104,8 @@ impl std::fmt::Debug for TenantProvisioning {
 impl TenantProvisioning {
     /// Bind provisioning to the two boundaries it writes across.
     #[must_use]
-    pub const fn new(operator: OperatorPool, app: sqlx::PgPool) -> Self {
-        Self { operator, app }
+    pub const fn new(operator: OperatorPool, postgres: WyrdPostgres) -> Self {
+        Self { operator, postgres }
     }
 
     /// Provision a tenant and return it with its one-time admin credential.
@@ -127,12 +132,11 @@ impl TenantProvisioning {
 
         // The handle must outlive the transaction it lends out.
         let authz = PlatformAuthorization::new(self.operator.clone());
-        let mut tx = authz
+        let mut conn = authz
             .authorize(
                 &caller.context,
                 &Permission::tenant_create(),
                 caller.request_id.as_str(),
-                caller.credential_id,
                 Some(data_tenant_id),
             )
             .await?;
@@ -142,7 +146,7 @@ impl TenantProvisioning {
         // failed attempt may already have written tenant-scoped rows, and a
         // second id would orphan them.
         let claim = insert_provisioning_tenant(
-            &mut tx,
+            conn.transaction(),
             data_tenant_id,
             request.slug.as_str(),
             &request.display_name,
@@ -150,7 +154,7 @@ impl TenantProvisioning {
         .await
         .map_err(slug_or_store)?;
         let data_tenant_id = claim.tenant_id(data_tenant_id);
-        tx.commit()
+        conn.commit()
             .await
             .map_err(|e| ProvisionError::Store(e.to_string()))?;
 
@@ -195,7 +199,9 @@ impl TenantProvisioning {
         data_tenant_id: DataTenantId,
         created_by: Uuid,
     ) -> Result<ProvisionedTenantAdmin, ProvisionError> {
-        let mut conn = TenantConn::acquire(&self.app, data_tenant_id)
+        let mut conn = self
+            .postgres
+            .tenant_conn(data_tenant_id)
             .await
             .map_err(|e| ProvisionError::Store(e.to_string()))?;
 

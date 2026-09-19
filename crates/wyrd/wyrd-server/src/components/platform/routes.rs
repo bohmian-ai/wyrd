@@ -130,7 +130,7 @@ async fn recover_tenant_admin(
     let Some(operator) = state.postgres.operator_pool() else {
         return Err(not_configured());
     };
-    let recovery = TenantRecovery::new(operator, state.postgres.app_pool().clone());
+    let recovery = TenantRecovery::new(operator, state.postgres.wyrd().clone());
 
     recovery
         .recover(&caller, request.tenant_id)
@@ -174,7 +174,7 @@ async fn create_tenant(
     let Some(operator) = state.postgres.operator_pool() else {
         return Err(not_configured());
     };
-    let provisioning = TenantProvisioning::new(operator, state.postgres.app_pool().clone());
+    let provisioning = TenantProvisioning::new(operator, state.postgres.wyrd().clone());
 
     provisioning
         .provision(&caller, request)

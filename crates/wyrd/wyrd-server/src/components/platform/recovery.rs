@@ -19,7 +19,7 @@ use wyrd_runtime::Permission;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, ProvisionedTenantAdmin, SecretBearer};
 use wyrd_sql::queries::auth::{insert_api_key, tenant_admin_principal_id};
-use wyrd_sql::{OperatorPool, TenantConn};
+use wyrd_sql::{OperatorPool, WyrdPostgres};
 
 use crate::components::auth::PlatformCaller;
 use crate::components::platform::provisioning::ProvisionError;
@@ -35,8 +35,12 @@ const RECOVERY_CREDENTIAL_DAYS: i64 = 365;
 pub struct TenantRecovery {
     /// Platform boundary the decision and its audit record commit through.
     operator: OperatorPool,
-    /// Row-level-secured pool the replacement credential is written through.
-    app: sqlx::PgPool,
+    /// Wyrd control-plane handle the replacement credential is written through.
+    ///
+    /// Held rather than a bare pool so the tenant transaction is acquired
+    /// through [`WyrdPostgres::tenant_conn`] rather than handed out as a
+    /// portable privileged capability.
+    postgres: WyrdPostgres,
 }
 
 impl std::fmt::Debug for TenantRecovery {
@@ -49,8 +53,8 @@ impl std::fmt::Debug for TenantRecovery {
 impl TenantRecovery {
     /// Bind recovery to the two boundaries it writes across.
     #[must_use]
-    pub const fn new(operator: OperatorPool, app: sqlx::PgPool) -> Self {
-        Self { operator, app }
+    pub const fn new(operator: OperatorPool, postgres: WyrdPostgres) -> Self {
+        Self { operator, postgres }
     }
 
     /// Issue a replacement credential for a tenant's existing administrator.
@@ -72,22 +76,24 @@ impl TenantRecovery {
         tenant_id: DataTenantId,
     ) -> Result<ProvisionedTenantAdmin, ProvisionError> {
         let authz = PlatformAuthorization::new(self.operator.clone());
-        let tx = authz
+        let decision = authz
             .authorize(
                 &caller.context,
                 &Permission::tenant_recover_admin(),
                 caller.request_id.as_str(),
-                caller.credential_id,
                 Some(tenant_id),
             )
             .await?;
         // The decision stands on its own: the replacement credential is written
         // on the tenant boundary, which this transaction cannot reach.
-        tx.commit()
+        decision
+            .commit()
             .await
             .map_err(|e| ProvisionError::Store(e.to_string()))?;
 
-        let mut conn = TenantConn::acquire(&self.app, tenant_id)
+        let mut conn = self
+            .postgres
+            .tenant_conn(tenant_id)
             .await
             .map_err(|e| ProvisionError::Store(e.to_string()))?;
 

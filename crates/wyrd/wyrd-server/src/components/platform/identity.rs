@@ -114,17 +114,11 @@ async fn authorize(
     required: &Permission,
 ) -> Result<(), WyrdErrorResponse> {
     let authz = PlatformAuthorization::new(pool.clone());
-    let tx = authz
-        .authorize(
-            &caller.context,
-            required,
-            caller.request_id.as_str(),
-            caller.credential_id,
-            None,
-        )
+    let decision = authz
+        .authorize(&caller.context, required, caller.request_id.as_str(), None)
         .await
         .map_err(platform_authz_error)?;
-    tx.commit().await.map_err(|error| {
+    decision.commit().await.map_err(|error| {
         WyrdErrorResponse::from(WyrdError::Internal {
             message: "platform authorization could not be committed".to_owned(),
             details: serde_json::json!({ "error": error.to_string() }),
@@ -344,12 +338,11 @@ async fn register_admin(
     //
     // The handle must outlive the transaction it lends out.
     let authz = PlatformAuthorization::new(pool.clone());
-    let mut tx = authz
+    let mut decision = authz
         .authorize(
             &caller.context,
             &Permission::platform_identity_write(),
             caller.request_id.as_str(),
-            caller.credential_id,
             None,
         )
         .await
@@ -370,18 +363,23 @@ async fn register_admin(
         })?;
 
     let principal_id = Uuid::now_v7();
-    insert_platform_principal_tx(&mut tx, principal_id, PrincipalKindTag::User, &request.name)
-        .await
-        .map_err(taken_or_store)?;
+    insert_platform_principal_tx(
+        decision.transaction(),
+        principal_id,
+        PrincipalKindTag::User,
+        &request.name,
+    )
+    .await
+    .map_err(taken_or_store)?;
     insert_platform_identity_tx(
-        &mut tx,
+        decision.transaction(),
         principal_id,
         &connection.issuer_url,
         &request.match_claim,
     )
     .await
     .map_err(taken_or_store)?;
-    tx.commit().await.map_err(|error| {
+    decision.commit().await.map_err(|error| {
         WyrdErrorResponse::from(WyrdError::Internal {
             message: "platform administrator registration could not be committed".to_owned(),
             details: serde_json::json!({ "error": error.to_string() }),

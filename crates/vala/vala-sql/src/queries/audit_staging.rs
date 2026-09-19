@@ -15,7 +15,7 @@ use wyrd_sql::TenantConn;
 use crate::SqlError;
 use crate::row_types::audit_staging::AuditStagingRow;
 
-/// Append one hash-chained audit row for the current tenant, returning its `seq`.
+/// Append one hash-chained audit row for the connection's tenant, returning its `seq`.
 ///
 /// Advances `vala.audit_chain_head` under `FOR UPDATE` so concurrent appends for
 /// the same tenant serialize into a gapless sequence, then inserts the row into
@@ -23,17 +23,28 @@ use crate::row_types::audit_staging::AuditStagingRow;
 /// record is durable exactly when — and only when — the authorization decision
 /// that produced it is.
 ///
+/// Every statement names [`TenantConn::data_tenant_id`] explicitly rather than
+/// leaning on the row-level-security policy to supply it. Under the application
+/// role the two agree and nothing changes; the explicit predicate is what makes
+/// the append correct on the operator boundary too, where row-level security is
+/// bypassed and an unqualified `FOR UPDATE` would lock — and an unqualified
+/// `UPDATE` would rewrite — every tenant's chain head. Platform-plane decisions
+/// stage through that boundary under `DataTenantId::SYSTEM_OWNER`, which is
+/// why this is the one canonical append for both planes.
+///
 /// # Errors
 /// Returns [`SqlError`] when any statement fails or an RLS policy rejects a row.
 pub async fn append_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Result<i64, SqlError> {
+    let data_tenant_id = conn.data_tenant_id().as_uuid();
     let conn = &mut **conn.transaction();
     sqlx::query(
         r#"
         INSERT INTO vala.audit_chain_head (data_tenant_id)
-        VALUES (wyrd.current_tenant())
+        VALUES ($1)
         ON CONFLICT (data_tenant_id) DO NOTHING
         "#,
     )
+    .bind(data_tenant_id)
     .execute(&mut *conn)
     .await
     .map_err(SqlError::from)?;
@@ -42,9 +53,11 @@ pub async fn append_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Resu
         r#"
         SELECT last_seq, head_hash
           FROM vala.audit_chain_head
+         WHERE data_tenant_id = $1
         FOR UPDATE
         "#,
     )
+    .bind(data_tenant_id)
     .fetch_one(&mut *conn)
     .await
     .map_err(SqlError::from)?;
@@ -66,7 +79,7 @@ pub async fn append_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Resu
             (data_tenant_id, seq, prev_hash, entry_hash, request_id, trace_id,
              operation, resource, card_ref, principal_id, principal_kind,
              permission, outcome, detail)
-        VALUES (wyrd.current_tenant(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+        VALUES ($14, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                 $11, $12, $13)
         "#,
     )
@@ -83,6 +96,7 @@ pub async fn append_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Resu
     .bind(event.permission.as_str())
     .bind(outcome_str(event.outcome))
     .bind(detail.as_deref())
+    .bind(data_tenant_id)
     .execute(&mut *conn)
     .await
     .map_err(SqlError::from)?;
@@ -91,10 +105,12 @@ pub async fn append_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Resu
         r#"
         UPDATE vala.audit_chain_head
            SET last_seq = $1, head_hash = $2, updated_at = now()
+         WHERE data_tenant_id = $3
         "#,
     )
     .bind(seq)
     .bind(entry_hash.as_slice())
+    .bind(data_tenant_id)
     .execute(&mut *conn)
     .await
     .map_err(SqlError::from)?;

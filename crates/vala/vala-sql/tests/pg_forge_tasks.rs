@@ -1747,8 +1747,10 @@ mod pg_tests {
         assert!(
             !audit_grants
                 .iter()
-                .any(|value| value.1 == "wyrd_platform_admin"),
-            "Forge evaluates no permission, so the operator holds no audit authority: {audit_grants:?}"
+                .any(|value| value.1 == "wyrd_platform_admin"
+                    && value.0 == "audit_staging"
+                    && value.2 != "INSERT"),
+            "the operator appends platform decisions and can do nothing else to a tenant's audit: {audit_grants:?}"
         );
         assert!(
             sqlx::query_scalar::<_, i64>("SELECT count(*) FROM vala.audit_staging")

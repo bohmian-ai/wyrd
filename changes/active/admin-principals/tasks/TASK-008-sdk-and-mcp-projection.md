@@ -5,7 +5,7 @@ spec: SPEC-admin-principals
 spec_revision: 7
 obligations: [REQ-036, REQ-040, REQ-047, INV-013, INV-014, INV-015, AC-013, AC-014]
 depends_on: [TASK-004, TASK-005, TASK-006, TASK-007]
-status: in_progress
+status: implemented
 ---
 
 ## Current Status
@@ -370,3 +370,73 @@ whose real auth requirement contradicts `INV-015`.
 - `architecture/references/languages/spec-driven-development.md`
 - `architecture/references/languages/implementation-execution.md`
 - `architecture/references/languages/testing-workflows.md`
+
+## Implementation Evidence (closeout, revision 7)
+
+All five remaining items are delivered. Commits `289978fcc` (items 1-2),
+`3a71e0409` (item 3), `40daeee97` + `074a40e87` (item 4), `289978fcc` +
+`21abea8c7` (item 5 and the catalog prose it exposed), `73aaa0616` (Scenario 3
+journey), `343cda711`, `fac7888dc`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| No Wyrd-owned surface reads `Authorization` | `platform_extractor.rs` binds `token_extract::WYRD_ACCESS_TOKEN_HEADER`; tree-wide search leaves only skald provider outbound calls, vala webhook redaction, and tests asserting the header is *not* read | `grep -rn "AUTHORIZATION\|\"authorization\"" crates/`; `mise run lints` | PASS |
+| Platform session authenticates on `X-Wyrd-Access-Token`; a tenant token on a platform route is still refused by scope | `platform_extractor.rs`, `verify_platform`'s `PLATFORM_TOKEN_SCOPE` check unchanged | `platform_admin_e2e::the_two_control_planes_cannot_reach_each_other` (17/17 PASS) | PASS |
+| An application's own `Authorization` is carried through untouched | `platform_extractor.rs` unit tests for the both-headers and Authorization-only cases | `cargo nextest run -p wyrd-server --lib -E 'test(/components::auth::platform_extractor::tests::/)'` | PASS |
+| Signing-key resolution exists once | one private `TokenVerifier` resolver in `crates/shared/wyrd-auth-verify/src/lib.rs`, called by both internal verify paths | `cargo nextest run -p wyrd-auth-verify --lib` | PASS |
+| No `reqwest::Client` in `wyrd-cli/src` | single construction point `crates/wyrd/wyrd-cli/src/client.rs` over `wyrd-client` | `grep -rn "reqwest::Client" crates/wyrd/wyrd-cli/src/` → no matches; `mise run check:client-tier` | PASS |
+| Every CLI command authenticates on the canonical header, proven by a test that would have caught the defect | `client.rs` + `card.rs`, `query/mod.rs`, `principal/`, `auth/`, `eval/` all on `wyrd-client` | `crates/wyrd/wyrd-cli/tests/principal_journey.rs` in `mise run test:cli:journey` (22 passed) | PASS |
+| `eval/*` moved onto the shared client, reason recorded | protocol calls go through the new `wyrd_client::eval::{EvalProtocol, EvalRun}`, which owns the run lease on `x-wyrd-eval-lease`; `eval/agent.rs` targets a third-party endpoint so it carries no Wyrd credential and uses `WyrdClient::request_external_stream` rather than a client of its own | `test:cli:journey::eval_server_protocol::server_protocol_carries_lease_after_open` | PASS |
+| Unreachable per-command CLI error variants deleted | `HttpBuild`, `Http`, `UrlJoin`, `RevokeFailed` removed from `crates/wyrd/wyrd-cli/src/error.rs`; `AgentTurnFailed` added for the one remaining external call | `mise run lints` (dead-code and unused-import clean) | PASS |
+| Generated contract declares the authentication scheme, no hand edits | `SecurityAddon` modifier in `crates/wyrd/wyrd-server/src/http/openapi.rs`; regenerated `openapi.yaml` | `mise run codegen:check`; `openapi::tests::every_authenticated_path_declares_the_one_wyrd_scheme` | PASS |
+| CLI performs administrative operations against a real server, including a once-returned credential used on a later call | `principal_journey.rs` (revoke) and the pre-existing `auth` journeys through the same client | `mise run test:cli:journey` | PASS |
+| A tenant-scope caller cannot invoke a platform-plane operation via CLI or MCP | structural: MCP exposes no platform tool and the CLI has no platform command; the HTTP side is proven | `platform_admin_e2e::the_two_control_planes_cannot_reach_each_other`; `principal_revoke_cli_journey_refuses_an_unprivileged_caller` asserts `WYRD_PERMISSION_403_DENIED_RBAC` | PASS |
+| No Python or TypeScript administrative binding; no unrun administrative journey | nothing added under `sdks/`; the two `#[ignore]`d Rust SDK journeys stay deleted | `mise run check:sdk-client-tier`; `mise run codegen:check` (no stub drift) | PASS |
+| MCP administrative writes scope-gated, reads always available | unchanged from `128eb40` | `mise run lints`; MCP tool-catalog tests unchanged | PASS |
+| Platform revocation rustdoc states the caches-nothing invariant | `crates/wyrd/wyrd-auth/src/platform_credentials.rs`, `revocation_takes_effect_on_the_next_request` | `platform_admin_e2e::revoking_a_platform_credential_ends_its_live_sessions` (behavior unchanged) | PASS |
+| No surface still describes a second identity model or the wrong header | error catalog remediations for `WYRD_AUTH_401_UNAUTHENTICATED`, `WYRD_AUTH_400_BAD_TOKEN_FORMAT`, `WYRD_PERMISSION_401_UNAUTHENTICATED` now name `X-Wyrd-Access-Token`; the eval docs row names `x-wyrd-eval-lease` | `mise run codegen:check`; `mise run docs:check` | PASS |
+
+### Commands run
+
+```bash
+mise run fmt
+mise run lints
+mise run check:client-tier
+mise run check:sdk-client-tier
+mise run check:unwrap-audit
+mise run codegen:check
+mise run docs:check
+WYRD_CLI_E2E=1 mise run test:cli:journey
+WYRD_AUTH_E2E=1 scripts/postgres/with-test-postgres.sh -- bash -lc \
+  'mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-server --test platform_admin_e2e'
+git diff --check
+```
+
+### Stale task text corrected while implementing
+
+- Item 5's rustdoc lives in `crates/wyrd/wyrd-auth/src/platform_credentials.rs`,
+  not `platform_sessions.rs` as the write set says.
+- `auth trusted-issuer` and `auth workload-binding` were already on the canonical
+  header; only `principal revoke` and `auth issue-key` carried the defect the
+  task describes.
+- `mise run test:platform:journey` is broken independently of this task: it
+  depends on a `setup:postgres` task that no longer exists. The platform suite
+  was run through `scripts/postgres/with-test-postgres.sh` instead, which is what
+  that lane wraps. Repairing the lane is not in this write set.
+
+### Deliberately out of scope
+
+- `POST /v1/principals/{principal_id}/revoke` ignores the
+  `RevokePrincipalRequest` body that the contract declares and the CLI sends;
+  existing server tests post an empty body. Requiring the body is a public
+  contract change and belongs to its own task.
+- Every non-goal held: no UI, no platform operation exposed to tenant-scope
+  clients, no widening beyond the named callers. No Python or TypeScript file
+  changed.
+
+### Incidental repair
+
+`fac7888dc` fixes `crates/shared/wyrd-auth-issue/src/lib.rs` unit tests that an
+earlier commit on this branch (`3699b3c37`) left calling the pre-`Option<Uuid>`
+`issue_platform_access_token` signature. They did not compile, so `mise run
+lints` could not pass for any change on this branch.

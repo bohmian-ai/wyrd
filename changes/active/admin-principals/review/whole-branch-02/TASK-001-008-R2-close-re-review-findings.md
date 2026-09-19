@@ -341,3 +341,69 @@ with production-like nonzero cache TTL; an isolated pass does not close its
 observed nondeterminism.
 
 Do not run `mise run gate`; approved VER-003 excludes it for this change.
+
+## Implementation evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| `FIND-admin-principals-1` | `wyrd-auth/src/platform_authz.rs` `PlatformAuthorization::authorize` returns the open `TenantConn` carrying the allowance; every allowed mutation commits on it (`6d5a281a7`, `fd8ec6182`) | `mise run test:platform:journey`; `cargo nextest run -p wyrd-server --test platform_admin_e2e -E 'test(=a_failed_mutation_discards_its_own_allowance)'` | PASS |
+| `FIND-admin-principals-2` | `wyrd-sql` keeps `sqlx::Transaction` behind `TenantConn`; no exported raw pool/transaction on a platform API (`3dc2397bc`) | `mise run check:client-tier`; `RUSTDOCFLAGS='-D warnings' cargo doc -p wyrd-sql --no-deps`; `mise run lints` | PASS |
+| `FIND-admin-principals-3` | `wyrd-spec::error` derive emits stable problems; source strings stay server-side (`b50f67fa8`) | `mise run test:principals:unit`; `mise run test:principals:integration` | PASS |
+| `FIND-admin-principals-4` | `architecture/wyrd-design.md` "Two administration planes" + `architecture/wyrd-security-posture.md` "Principal and credential lifecycle" (`66bd753c0`) | `mise run docs:check`; no `PlatformAdmin`/`System`/`ServiceAccount` references remain in either authority | PASS |
+| `FIND-admin-principals-8` | lockout guard counts only granted, unexpired, unrevoked administrators (`abd699336`) | `mise run test:platform:journey` | PASS |
+| `FIND-admin-principals-13` | `wyrd-server/src/http/openapi.rs` `ProblemMediaAddon` + ten published operations; `openapi.yaml` regenerated (`e644f6fcf`) | `mise run codegen:check`; `mise run docs:check`; `cargo nextest run -p wyrd-server --lib -E 'test(=http::openapi::tests::every_served_auth_and_admin_route_is_documented) + test(=http::openapi::tests::every_problem_response_declares_its_media_type_and_stable_code)'` | PASS |
+| `FIND-004-3` | `components/platform/provisioning.rs::establish_tenant_administration` retires every credential the resumed principal already holds (`653acd085`) | `cargo nextest run -p wyrd-server --test platform_admin_e2e -E 'test(=a_failed_provisioning_can_be_retried_with_the_same_slug)'` via `mise run test:platform:journey` | PASS |
+| `FIND-005-1` | tenant-plane issuer/binding/revoke effects commit on the allowance's own `TenantConn` (`b1b3cf072`) | `mise run test:principals:integration`; `mise run test:platform:journey` | PASS |
+| `FIND-003-2` | `an_operator_initializes_the_deployment_through_the_shipped_binary` drives `CARGO_BIN_EXE_wyrd-server init`; `init()` no longer loads serving config (`95c0e0f63`) | `cargo nextest run -p wyrd-server --test platform_admin_e2e -E 'test(=an_operator_initializes_the_deployment_through_the_shipped_binary)'` via `mise run test:platform:journey` | PASS |
+| `FIND-004-5` | `wyrd-server recover-root` (`main.rs::recover_root`) over `boot::init::issue_platform_root_credential` and `wyrd-sql` `platform_principal_id_by_name`; operator docs corrected (`5ca9727f9`) | `cargo nextest run -p wyrd-server --test platform_admin_e2e -E 'test(=an_operator_recovers_from_losing_every_platform_credential)'` via `mise run test:platform:journey` | PASS |
+| `FIND-TASK-001-10` | none — the required correction is a branch-owner history rewrite, outside implementation scope | not run | **OPEN** |
+| `FIND-admin-principals-R2-2` | `PlatformPrincipal { kind, .. }` carried from credential and federated session creation into `decision_event` (`2de0256eb`) | `cargo nextest run -p wyrd-auth --lib -E 'test(=platform_authz::pg_tests::a_decision_records_the_kind_it_was_made_by)'` via `mise run test:principals:integration` | PASS |
+| `FIND-admin-principals-R2-3` | `credential_id` flows exchange -> `cid` claim -> `Principal`/`PlatformPrincipal` -> every audit builder -> `vala.audit_staging` -> `vala.system.audit_log` projection (`02a5bb578`) | `cargo nextest run -p wyrd-auth --lib -E 'test(=platform_authz::pg_tests::a_decision_records_the_credential_it_was_made_with)'` via `mise run test:principals:integration`; federated-`NULL` and no-leak asserts in `mise run test:platform:journey` | PASS |
+| `FIND-admin-principals-R2-4` | TenantAdmin refresh rotation (`e853dff03`) | `mise run test:platform:journey` | PASS |
+| `FIND-admin-principals-R2-5` | tenant admission resolved per request rather than cached with the principal epoch (`08946aeed`) | `mise run test:platform:journey` with production-like nonzero cache TTL, green on two consecutive runs | PASS |
+| `FIND-admin-principals-R2-6` | every invalid tenant API-key path performs one verifier call (`0754ca005`) | `mise run test:principals:integration` (`wyrd-auth platform_credentials::pg_tests::every_rejection_is_the_same_error`) | PASS |
+
+### Verification commands
+
+All run from the worktree, sequentially, with repository-managed Postgres:
+`mise run fmt:check`, `mise run lints`, `mise run check:client-tier`,
+`mise run check:unwrap-audit`,
+`RUSTDOCFLAGS='-D warnings' mise exec -- cargo doc --locked -p wyrd-sql --no-deps`,
+`mise run codegen:check`, `mise run docs:check`, `mise run test:principals:unit`,
+`mise run test:principals:integration`, `mise run test:platform:journey` (twice,
+32/32 both times), `mise run test:bifrost:journey:mcp`, `mise run test:cli:journey`,
+`git diff --check`. `mise run gate` was not run, per approved VER-003.
+
+### Material limits
+
+- `FIND-TASK-001-10` is **not closed**. Its required correction is a rewrite of
+  the branch's own commit metadata, explicitly assigned to the branch owner.
+  The earlier candidate-authored waiver note was rejected by standards review
+  and is not re-asserted here. The conflict is live and unresolved: `AGENTS.md`
+  §13 forbids AI co-author trailers, while this session's harness attribution
+  requires `Co-Authored-By: Claude Opus 5 (1M context)` and `Claude-Session:`
+  on every commit. Every commit in this remediation therefore still carries
+  the forbidden trailers. Only the branch owner can settle which rule governs
+  and perform the rewrite.
+- `TenantProvisioning`/`TenantRecovery` retain their `WyrdPostgres` field. Both
+  use only `tenant_conn(tenant_id)`, but narrowing to a raw `PgPool` or a new
+  newtype is forbidden by this packet's constraints, so the broader owner stays.
+- Published-audit fidelity for `principal_kind` and `credential_id` is
+  by-column through `list_publication_range` -> `project_audit_rows`. The
+  platform journey lane does not run Scribe/bifrost publication; that path is
+  covered by `crates/wyrd/wyrd-testing/tests/bifrost/server/audit_publication.rs`.
+- The OpenAPI stable-code assertion is scoped to operations tagged `Auth` or
+  `Admin`. `/auth/platform/callback` is a pre-existing route whose response
+  descriptions name no stable code; widening the assertion would fail on
+  behavior this packet does not own.
+- `mise run test:sql` reported two failures in
+  `vala-sql::pg_forge_tasks` (`watermark_pruning_identity_and_database_boundaries_fail_closed`,
+  `worker_claim_cursor_is_independent_and_success_only`). Both pass when run
+  directly under `scripts/postgres/with-test-postgres.sh`; they contend with
+  other tests in the full lane. No file in this remediation's write set touches
+  Forge task scheduling.
+- Journey-tier positive assertions on `vala.audit_staging` are inherently racy
+  because publication drains and garbage-collects staging asynchronously. The
+  positive credential-attribution proof therefore lives at the integration tier
+  in `wyrd-auth/src/platform_authz.rs`; the journey keeps only absence-based
+  assertions.

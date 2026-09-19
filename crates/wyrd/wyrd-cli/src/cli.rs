@@ -83,3 +83,22 @@ pub enum Command {
     /// Run a terminal-safe streaming Oracle query.
     Query(QueryCommand),
 }
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use super::Cli;
+
+    /// The whole command tree is internally consistent.
+    ///
+    /// `propagate_version` pushes `--version` into every subcommand, so a
+    /// subcommand that declares its own `--version` makes clap panic when that
+    /// subcommand is parsed — not when the binary starts. Per-command unit tests
+    /// build a bare wrapper without the propagated flag and cannot see it, so
+    /// this asserts the real tree the binary ships.
+    #[test]
+    fn the_shipped_command_tree_is_consistent() {
+        Cli::command().debug_assert();
+    }
+}

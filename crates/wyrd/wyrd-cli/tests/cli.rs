@@ -1,3 +1,5 @@
+#[path = "auth_issue_key_journey.rs"]
+mod auth_issue_key_journey;
 #[path = "card_lifecycle.rs"]
 mod card_lifecycle;
 #[path = "eval_local_records.rs"]

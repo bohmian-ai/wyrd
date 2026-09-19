@@ -8,9 +8,15 @@ use wyrd_spec::reference::CardRef;
 
 use crate::error::WyrdCliError;
 
+/// Arguments for `wyrd auth issue-key`.
+///
+/// `--version` names the bound card's version, so the auto-generated
+/// `--version` flag is disabled here as it is on every other card-selecting
+/// command; leaving it on makes clap refuse to build this subcommand at all.
 #[derive(Debug, Args)]
+#[command(disable_version_flag = true)]
 pub struct IssueKeyArgs {
-    /// Card kind (e.g. service, agent).
+    /// Card kind, spelled as the contract spells it (e.g. `Service`, `Agent`).
     #[arg(long, value_name = "KIND")]
     pub kind: String,
     /// Card name.

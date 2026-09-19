@@ -12,8 +12,10 @@ const SERVICE_ACCOUNT_BY_CARD_REF_SQL: &str = r#"
           FROM wyrd.auth_service_accounts
          WHERE data_tenant_id = $1
            AND principal_kind = $2
-           AND card_ref = $3
+           AND card_ref @> $3
            AND status = 'active'
+         ORDER BY created_at, id
+         LIMIT 1
         "#;
 
 const INSERT_REFRESH_TOKEN_SQL: &str = r#"
@@ -151,6 +153,19 @@ pub async fn delete_service_account(
 }
 
 /// Find an active Service/Agent principal by card ref.
+///
+/// Matches by containment rather than by whole-document equality, because the
+/// stored `card_ref` carries the registered Card's `uid` and a caller naming a
+/// principal cannot know it: a client says `space/Kind/name@version`, which is
+/// the Card identity. The durable key remains `(card_kind, card_uid)`; this is
+/// the lookup for the identity a client can express, and the GIN index on
+/// `card_ref` serves it. Two active principals sharing one Card identity would
+/// require two Cards with the same identity, so the oldest wins for the same
+/// reason [`tenant_admin_principal_id`] picks the oldest: an anomaly must still
+/// resolve to one row rather than an arbitrary one.
+///
+/// # Errors
+/// Returns the database error when the read fails.
 pub async fn service_account_by_card_ref(
     conn: &mut TenantConn<'_>,
     principal_kind: &str,

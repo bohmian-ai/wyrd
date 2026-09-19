@@ -17,35 +17,50 @@ use tokio_util::sync::CancellationToken;
 use wyrd_auth_verify::WyrdAuthVerifySettings;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
-/// Run the shipped CLI with one access token and a scrubbed ambient environment.
+/// Run the shipped CLI with one named credential and a scrubbed ambient
+/// environment.
 ///
-/// The token travels in `WYRD_ACCESS_TOKEN` rather than `--token` so no
-/// credential lands in the process table. Every other `WYRD_*` credential source
-/// is cleared, so the journey proves the command works from its arguments alone
-/// and cannot pass by picking up a developer's ambient login.
-fn run_cli(arguments: &[&str], token: &str) -> Output {
+/// The credential travels in its environment variable rather than on the command
+/// line so nothing lands in the process table. Every other `WYRD_*` credential
+/// source is cleared, so a journey proves the command works from the credential
+/// it was given and cannot pass by picking up a developer's ambient login.
+pub(crate) fn run_cli_with_credential(
+    arguments: &[&str],
+    variable: &str,
+    credential: &str,
+) -> Output {
     let mut command = Command::cargo_bin("wyrd").expect("wyrd binary builds");
     command
         .env(
             "WYRD_CONFIG_HOME",
             std::env::temp_dir().join(format!("wyrd-cli-empty-config-{}", std::process::id())),
         )
-        .env("WYRD_ACCESS_TOKEN", token)
+        .env_remove("WYRD_ACCESS_TOKEN")
         .env_remove("WYRD_WORKLOAD_TOKEN")
         .env_remove("WYRD_TENANT")
-        .env_remove("WYRD_API_KEY");
+        .env_remove("WYRD_API_KEY")
+        .env(variable, credential);
     command.args(arguments).output().expect("wyrd command runs")
 }
 
 /// Run the CLI off the async runtime, which a subprocess call would otherwise
 /// block.
-async fn run_cli_async(arguments: Vec<String>, token: String) -> Output {
+pub(crate) async fn run_cli_async_with_credential(
+    arguments: Vec<String>,
+    variable: &'static str,
+    credential: String,
+) -> Output {
     tokio::task::spawn_blocking(move || {
         let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
-        run_cli(&arguments, &token)
+        run_cli_with_credential(&arguments, variable, &credential)
     })
     .await
     .expect("CLI subprocess joins")
+}
+
+/// Run the CLI off the async runtime with an access token.
+async fn run_cli_async(arguments: Vec<String>, token: String) -> Output {
+    run_cli_async_with_credential(arguments, "WYRD_ACCESS_TOKEN", token).await
 }
 
 /// Start a test server behind a real loopback listener.
@@ -53,7 +68,7 @@ async fn run_cli_async(arguments: Vec<String>, token: String) -> Output {
 /// The CLI is a separate process, so an in-process router is not reachable: the
 /// journey needs a socket. Returns the server for bootstrapping and in-process
 /// probes, its base URL for the CLI, and the handles that stop it.
-async fn start_served(
+pub(crate) async fn start_served(
     server_name: &str,
 ) -> (WyrdTestServer, String, CancellationToken, JoinHandle<()>) {
     let socket = std::net::TcpListener::bind("127.0.0.1:0").expect("journey listener binds");
@@ -87,7 +102,7 @@ async fn start_served(
 }
 
 /// Stop the served router and the test server behind it.
-async fn stop_served(
+pub(crate) async fn stop_served(
     server: WyrdTestServer,
     shutdown: CancellationToken,
     serve_handle: JoinHandle<()>,
@@ -101,7 +116,7 @@ async fn stop_served(
 ///
 /// Uses the in-process router rather than the CLI, so the assertion is about the
 /// token's standing and not about a second command's behavior.
-async fn v1_status(server: &WyrdTestServer, token: &str) -> StatusCode {
+pub(crate) async fn v1_status(server: &WyrdTestServer, token: &str) -> StatusCode {
     server
         .oneshot_authenticated(
             token,
@@ -117,7 +132,7 @@ async fn v1_status(server: &WyrdTestServer, token: &str) -> StatusCode {
 }
 
 /// Exchange a bootstrapped machine principal's API key for an access token.
-async fn machine_token(server: &WyrdTestServer, bootstrap: &Bootstrap) -> String {
+pub(crate) async fn machine_token(server: &WyrdTestServer, bootstrap: &Bootstrap) -> String {
     let key = bootstrap
         .api_key()
         .expect("machine principal has an api key");

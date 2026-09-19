@@ -1,8 +1,8 @@
 ---
 id: SPEC-admin-principals
-revision: 6
+revision: 7
 status: approved
-approved_at: 2026-09-18
+approved_at: 2026-09-19
 ---
 
 # Global and tenant administrative principals
@@ -373,12 +373,22 @@ to satisfy this specification.
   tenant administration, principal management, role grant, or OIDC group
   mapping — may create or elevate a platform principal.
 
+- **REQ-047**: Every Wyrd-owned surface that calls a Wyrd HTTP route MUST do so
+  through `crates/shared/wyrd-client`. No CLI command, SDK, or server-side tool
+  constructs its own HTTP client, assembles its own authentication header, or
+  maps its own status codes onto errors. A surface that cannot be expressed
+  through the shared client is evidence the shared client is missing a
+  capability, not licence to hand-roll one.
+
 ### Surfaces, audit, documentation, and replacement
 
 - **REQ-036**: Platform and tenant administrative operations MUST be available
   headlessly over the language-agnostic HTTP contract with typed bodies, stable
   `WyrdError` codes, and generated artifacts. CLI, SDKs, and MCP project that
   contract; no surface introduces a second identity model or durable authority.
+  The generated contract MUST declare the authentication scheme its
+  administrative paths require, so an independent client can implement them from
+  the artifact alone.
 - **REQ-037**: Every authorization decision made by these operations MUST append
   its audit row in the same transaction as the decision, for allowed and denied
   alike, naming the principal, the credential that authenticated the request,
@@ -443,11 +453,22 @@ to satisfy this specification.
   leaks another tenant's existence, names, inventory, or configuration.
 - **INV-012**: Invalid-credential conditions remain publicly indistinguishable
   and resistant to timing and enumeration inference.
-- **INV-013**: Revoking a credential, principal, or role grant advances the
-  applicable authorization epoch transactionally; no token or cached permission
-  set outlives the earlier of its expiry or that epoch.
+- **INV-013**: Revoking a credential, principal, or role grant MUST take effect
+  no later than the next request; no token or cached permission set outlives the
+  earlier of its expiry or that revocation. Each plane satisfies this by the
+  mechanism its own caching demands, and neither mechanism is owed to the other:
+  the tenant plane caches verified tokens and therefore advances an
+  authorization epoch transactionally, while the platform plane caches nothing
+  and re-reads the credential, the principal, and the grant from the store on
+  every request. A plane that begins caching authority MUST acquire an epoch at
+  the same time.
 - **INV-014**: Administrative identity remains server-owned durable state. No
   Card kind, SDK, CLI, or UI becomes a durable source of truth.
+- **INV-015**: Every Wyrd plane authenticates on `X-Wyrd-Access-Token`. The
+  caller's own `Authorization` header belongs to the calling application and is
+  never read by any Wyrd surface. Plane separation is carried by verified token
+  claims and by the extractor type a route declares — never by which header
+  carried the token, which any client can set.
 
 ## Externally observable behavior and failure modes
 
@@ -601,9 +622,16 @@ documents. These amendments are part of the change.
 - **AC-017**: Escalation evidence proves no tenant-plane operation — including
   tenant principal creation, role grant, and OIDC group mapping — can create a
   platform principal or confer platform authority.
-- **AC-014**: Cross-language evidence proves the administrative HTTP contract is
-  usable from the Rust, Python, and TypeScript SDKs for the operations each is
-  intended to expose.
+- **AC-014**: Contract evidence proves the administrative HTTP surface is
+  implementable by an independent client: the generated OpenAPI document
+  declares every administrative path, its typed bodies, its stable error codes,
+  and the authentication scheme those paths require. The CLI and MCP exercise
+  those operations against a real server. No language SDK carries an
+  administrative surface: administration is an operator and agent act, reached
+  through the CLI and MCP, and a language binding for it has no user that the
+  CLI does not already serve. `wyrd-client` retains the shared implementation
+  because `REQ-047` requires the CLI to call through it, not because an SDK
+  projects it.
 
 ## Material constraints
 
@@ -632,8 +660,13 @@ here, not drift, and this section is the authority for planning, implementation,
 and review.
 
 - **VER-001**: Verification proves only principal, credential, authenticated
-  context, authorization-plane, initialization, tenant-provisioning, and
-  administrative-surface behavior introduced or changed by this specification.
+  context, authorization-plane, initialization, tenant-provisioning,
+  administrative-surface, and client-consolidation behavior introduced or
+  changed by this specification. Client consolidation (`REQ-047`) covers every
+  `wyrd-cli` command that calls a Wyrd route, including the authentication and
+  admin commands that predate this change: they are in scope because this
+  specification makes the canonical header normative and a command on the wrong
+  header cannot authenticate at all.
   Every acceptance obligation is satisfied by focused tests, subsystem
   integration tests, and the user journeys named in this specification.
 - **VER-002**: Every named Rust test runs through its exact focused expression,
@@ -683,6 +716,11 @@ the next.
     pre-registered human platform principals, first-login identity pinning, and
     the platform login entry. Stage 4 carries the platform grant store this
     depends on.
+12. **Surface consolidation** — one authentication pipeline on one header, one
+    signing-key resolution, the authentication scheme published in the generated
+    contract, and every Wyrd-owned caller moved onto `wyrd-client`. This stage
+    adds no capability; it removes the duplicate implementations the earlier
+    stages accumulated.
 
 ## Open material decisions
 
@@ -690,6 +728,21 @@ None. Every decision raised during drafting has been resolved by the author.
 
 ## Revision history
 
+- **Revision 7 — 2026-09-19 — approved**: Consolidation revision; adds no new
+  product capability. `AC-014` drops the Python and TypeScript administrative
+  bindings and is re-grounded on the generated contract plus the Rust SDK.
+  `REQ-036` now requires the generated contract to declare its authentication
+  scheme. `REQ-047` requires every Wyrd-owned caller to use `wyrd-client`.
+  No language SDK carries an administrative surface; the CLI and MCP are the
+  only administrative client surfaces, and the unrun Rust SDK administrative
+  journeys are deleted.
+  `INV-015` makes `X-Wyrd-Access-Token` the one authentication header on every
+  plane and states that plane separation is carried by token claims and
+  extractor type, not by header choice. `INV-013` is restated so each plane's
+  revocation mechanism follows from its own caching, recording that the platform
+  plane satisfies it by caching nothing rather than by an epoch. `VER-001`
+  widens to the consolidation surface, and stage 12 is added to the delivery
+  sequence.
 - **Revision 6 — 2026-09-18 — approved**: Added the **Verification scope** section
   narrowing proof to focused tests, subsystem integration tests, and the named
   user journeys for principal, credential, authenticated-context,

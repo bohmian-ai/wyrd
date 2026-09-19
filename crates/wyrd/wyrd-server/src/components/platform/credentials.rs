@@ -20,6 +20,7 @@ use axum::{Json, Router};
 use chrono::{Duration, Utc};
 use secrecy::ExposeSecret;
 use uuid::Uuid;
+use wyrd_auth::platform_authz::PlatformAuthorization;
 use wyrd_auth::platform_credentials::{PlatformCredentialError, PlatformCredentials};
 use wyrd_runtime::Permission;
 use wyrd_spec::auth::{
@@ -33,7 +34,7 @@ use wyrd_sql::queries::platform::credentials::{
 };
 
 use crate::components::auth::PlatformCaller;
-use crate::components::platform::identity::{authorize, operator};
+use crate::components::platform::identity::{authorize, authorize_read, commit_decision, operator};
 use crate::http::error::{WyrdErrorResponse, internal_failure};
 use crate::state::AppState;
 
@@ -83,15 +84,21 @@ async fn issue_credential(
     Json(request): Json<IssuePlatformCredentialRequest>,
 ) -> Result<Json<IssuedCredential>, WyrdErrorResponse> {
     let pool = operator(&state)?;
-    authorize(&pool, &caller, &Permission::platform_credential_write()).await?;
+    // The handle must outlive the transaction it lends out.
+    let authz = PlatformAuthorization::new(pool.clone());
+    let mut decision = authorize(&authz, &caller, &Permission::platform_credential_write()).await?;
 
     let expires_at = request
         .expires_in_days
         .map(|days| Utc::now() + Duration::days(i64::from(days)));
+    // The credential and the allowance permitting it commit together: a secret
+    // that outlived a failed decision would be usable authority nothing
+    // recorded granting.
     let issued = PlatformCredentials::new(pool)
-        .issue(principal_id, expires_at)
+        .issue(&mut decision, principal_id, expires_at)
         .await
         .map_err(credential_error)?;
+    commit_decision(decision).await?;
 
     Ok(Json(IssuedCredential {
         id: issued.id.to_string(),
@@ -123,7 +130,7 @@ async fn list_credentials(
     Path(principal_id): Path<Uuid>,
 ) -> Result<Json<CredentialListResponse>, WyrdErrorResponse> {
     let pool = operator(&state)?;
-    authorize(&pool, &caller, &Permission::platform_credential_read()).await?;
+    authorize_read(&pool, &caller, &Permission::platform_credential_read()).await?;
 
     let rows = list_platform_credentials(&pool, principal_id)
         .await
@@ -178,7 +185,9 @@ async fn revoke_credential(
     Path((principal_id, credential_id)): Path<(Uuid, Uuid)>,
 ) -> Result<axum::http::StatusCode, WyrdErrorResponse> {
     let pool = operator(&state)?;
-    authorize(&pool, &caller, &Permission::platform_credential_write()).await?;
+    // The handle must outlive the transaction it lends out.
+    let authz = PlatformAuthorization::new(pool.clone());
+    let mut decision = authorize(&authz, &caller, &Permission::platform_credential_write()).await?;
 
     let owned = platform_credential_by_id(&pool, credential_id)
         .await
@@ -193,7 +202,7 @@ async fn revoke_credential(
         return Err(not_found());
     }
 
-    if revoke_platform_credential(&pool, credential_id)
+    if revoke_platform_credential(&mut decision, credential_id)
         .await
         .map_err(|error| {
             WyrdErrorResponse::from(internal_failure(
@@ -202,6 +211,7 @@ async fn revoke_credential(
             ))
         })?
     {
+        commit_decision(decision).await?;
         Ok(axum::http::StatusCode::NO_CONTENT)
     } else {
         Err(not_found())

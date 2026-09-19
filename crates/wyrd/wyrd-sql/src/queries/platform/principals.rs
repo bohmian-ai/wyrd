@@ -194,7 +194,9 @@ const PLATFORM_STATUS_LOCK: i64 = 0x7779_7264_7073_7461;
 /// suspending the last administrator who can actually get back in leaves no way
 /// to undo it.
 ///
-/// The guard and the write are one serialized transaction. `required` is the
+/// The guard, the write, and the caller's authorization record are one
+/// serialized transaction: the advisory lock is transaction-scoped, and the
+/// caller commits. `required` is the
 /// fixed platform-administrator grant the caller owns; a remaining principal
 /// counts only if it is active, holds that grant, and has some way to
 /// authenticate — a live credential or a pinned federated identity. A principal
@@ -206,23 +208,21 @@ const PLATFORM_STATUS_LOCK: i64 = 0x7779_7264_7073_7461;
 /// Returns [`SqlError::Query`] when the lock, the count, or the update fails,
 /// including when `status` is not an accepted lifecycle value.
 pub async fn set_platform_principal_status(
-    pool: &OperatorPool,
+    conn: &mut TenantConn<'_>,
     id: Uuid,
     status: &str,
     required: &serde_json::Value,
 ) -> Result<StatusChange, SqlError> {
-    let mut tx = pool.begin().await?;
-
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(PLATFORM_STATUS_LOCK)
-        .execute(&mut *tx)
+        .execute(&mut **conn.transaction())
         .await
         .map_err(SqlError::from)?;
 
     let Some(current): Option<String> =
         sqlx::query_scalar::<_, String>("SELECT status FROM platform.principals WHERE id = $1")
             .bind(id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut **conn.transaction())
             .await
             .map_err(SqlError::from)?
     else {
@@ -236,7 +236,7 @@ pub async fn set_platform_principal_status(
         let (subject_usable, remaining): (bool, i64) = sqlx::query_as(USABLE_ADMINISTRATORS_SQL)
             .bind(id)
             .bind(required)
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut **conn.transaction())
             .await
             .map_err(SqlError::from)?;
         // Only a principal that is itself a way in can be the last one. An
@@ -249,10 +249,9 @@ pub async fn set_platform_principal_status(
     sqlx::query("UPDATE platform.principals SET status = $2, updated_at = now() WHERE id = $1")
         .bind(id)
         .bind(status)
-        .execute(&mut *tx)
+        .execute(&mut **conn.transaction())
         .await
         .map_err(SqlError::from)?;
-    tx.commit().await?;
     Ok(StatusChange::Changed)
 }
 

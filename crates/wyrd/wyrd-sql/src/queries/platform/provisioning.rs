@@ -164,7 +164,7 @@ pub async fn mark_tenant_failed(
 /// # Errors
 /// Returns [`SqlError::Query`] when the update fails.
 pub async fn set_tenant_suspended(
-    pool: &OperatorPool,
+    conn: &mut TenantConn<'_>,
     data_tenant_id: DataTenantId,
     suspended: bool,
 ) -> Result<bool, SqlError> {
@@ -181,7 +181,7 @@ pub async fn set_tenant_suspended(
     .bind(data_tenant_id.as_uuid())
     .bind(next)
     .bind(expected)
-    .execute(pool.pool())
+    .execute(&mut **conn.transaction())
     .await
     .map_err(SqlError::from)?;
     Ok(result.rows_affected() == 1)

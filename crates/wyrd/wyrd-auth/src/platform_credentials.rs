@@ -17,9 +17,9 @@ use uuid::Uuid;
 use wyrd_auth_issue::{IssueError, hash_api_key, verify_api_key};
 use wyrd_spec::auth::PrincipalId;
 use wyrd_sql::queries::platform::credentials::{
-    insert_platform_credential, platform_credential_by_prefix, touch_platform_credential,
+    insert_platform_credential_tx, platform_credential_by_prefix, touch_platform_credential,
 };
-use wyrd_sql::{OperatorPool, SqlError};
+use wyrd_sql::{OperatorPool, SqlError, TenantConn};
 
 /// Prefix identifying a platform-scope credential on sight.
 ///
@@ -163,14 +163,20 @@ impl PlatformCredentials {
     /// administrative credential established at initialization has no natural
     /// lifetime.
     ///
+    /// The insert runs on the caller's transaction — the one already carrying
+    /// the authorization allowance — and the caller commits. A credential that
+    /// committed on its own would be a usable secret the deployment never
+    /// recorded permitting.
+    ///
     /// # Errors
     /// Returns [`PlatformCredentialError::Hash`] or
     /// [`PlatformCredentialError::Join`] when hashing fails, and
     /// [`PlatformCredentialError::Store`] when the insert is rejected —
     /// including when `principal_id` names no platform principal.
-    #[tracing::instrument(level = "debug", skip(self), fields(principal_id = %principal_id), err)]
+    #[tracing::instrument(level = "debug", skip(self, conn), fields(principal_id = %principal_id), err)]
     pub async fn issue(
         &self,
+        conn: &mut TenantConn<'_>,
         principal_id: Uuid,
         expires_at: Option<DateTime<Utc>>,
     ) -> Result<IssuedPlatformCredential, PlatformCredentialError> {
@@ -179,8 +185,8 @@ impl PlatformCredentials {
         let secret_hash = tokio::task::spawn_blocking(move || hash_api_key(&raw)).await??;
 
         let id = Uuid::new_v4();
-        insert_platform_credential(
-            &self.pool,
+        insert_platform_credential_tx(
+            conn,
             id,
             principal_id,
             &credential.prefix,
@@ -331,6 +337,29 @@ mod pg_tests {
         id
     }
 
+    /// Issue one credential and commit it, as the route does.
+    ///
+    /// Issuance now writes on the caller's transaction so the credential and
+    /// the allowance permitting it commit together; these tests want the row
+    /// standing, so they commit immediately.
+    async fn issue_committed(
+        fixture: &PgFixture,
+        principal: Uuid,
+        expires_at: Option<chrono::DateTime<Utc>>,
+    ) -> super::IssuedPlatformCredential {
+        let pool = fixture.operator_pool().clone();
+        let mut conn = pool
+            .begin_platform_audited()
+            .await
+            .expect("transaction opens");
+        let issued = PlatformCredentials::new(pool.clone())
+            .issue(&mut conn, principal, expires_at)
+            .await
+            .expect("credential issues");
+        conn.commit().await.expect("credential commits");
+        issued
+    }
+
     /// The issued plaintext authenticates back to its principal, and the value
     /// stored is a verifier that is not the plaintext and cannot reproduce it.
     #[tokio::test]
@@ -339,10 +368,7 @@ mod pg_tests {
         let pool = fixture.operator_pool();
         let principal = seed_principal(&fixture, "issuing").await;
 
-        let issued = PlatformCredentials::new(pool.clone())
-            .issue(principal, None)
-            .await
-            .expect("credential issues");
+        let issued = issue_committed(&fixture, principal, None).await;
         let plaintext = issued.credential.secret.expose_secret().to_owned();
 
         let resolved = PlatformCredentials::new(pool.clone())
@@ -377,31 +403,29 @@ mod pg_tests {
         let pool = fixture.operator_pool();
 
         let live_owner = seed_principal(&fixture, "live").await;
-        let live = PlatformCredentials::new(pool.clone())
-            .issue(live_owner, None)
-            .await
-            .expect("credential issues");
+        let live = issue_committed(&fixture, live_owner, None).await;
 
         let revoked_owner = seed_principal(&fixture, "revoked").await;
-        let revoked = PlatformCredentials::new(pool.clone())
-            .issue(revoked_owner, None)
+        let revoked = issue_committed(&fixture, revoked_owner, None).await;
+        let mut revocation = pool
+            .begin_platform_audited()
             .await
-            .expect("credential issues");
-        revoke_platform_credential(pool, revoked.id)
+            .expect("transaction opens");
+        revoke_platform_credential(&mut revocation, revoked.id)
             .await
             .expect("revocation succeeds");
+        revocation.commit().await.expect("revocation commits");
 
         let expired_owner = seed_principal(&fixture, "expired").await;
-        let expired = PlatformCredentials::new(pool.clone())
-            .issue(expired_owner, Some(Utc::now() - Duration::hours(1)))
-            .await
-            .expect("credential issues");
+        let expired = issue_committed(
+            &fixture,
+            expired_owner,
+            Some(Utc::now() - Duration::hours(1)),
+        )
+        .await;
 
         let suspended_owner = seed_principal(&fixture, "suspended").await;
-        let suspended = PlatformCredentials::new(pool.clone())
-            .issue(suspended_owner, None)
-            .await
-            .expect("credential issues");
+        let suspended = issue_committed(&fixture, suspended_owner, None).await;
         sqlx::query("UPDATE platform.principals SET status = 'suspended' WHERE id = $1")
             .bind(suspended_owner)
             .execute(pool.pool())
@@ -493,19 +517,21 @@ mod pg_tests {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let pool = fixture.operator_pool();
         let principal = seed_principal(&fixture, "revoked-mid-life").await;
-        let issued = PlatformCredentials::new(pool.clone())
-            .issue(principal, None)
-            .await
-            .expect("credential issues");
+        let issued = issue_committed(&fixture, principal, None).await;
 
         PlatformCredentials::new(pool.clone())
             .authenticate_for_session(&issued.credential.secret)
             .await
             .expect("the credential works before revocation");
 
-        revoke_platform_credential(pool, issued.id)
+        let mut revocation = pool
+            .begin_platform_audited()
+            .await
+            .expect("transaction opens");
+        revoke_platform_credential(&mut revocation, issued.id)
             .await
             .expect("revocation succeeds");
+        revocation.commit().await.expect("revocation commits");
 
         let error = PlatformCredentials::new(pool.clone())
             .authenticate_for_session(&issued.credential.secret)
@@ -520,10 +546,7 @@ mod pg_tests {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let pool = fixture.operator_pool();
         let principal = seed_principal(&fixture, "touched").await;
-        let issued = PlatformCredentials::new(pool.clone())
-            .issue(principal, None)
-            .await
-            .expect("credential issues");
+        let issued = issue_committed(&fixture, principal, None).await;
 
         PlatformCredentials::new(pool.clone())
             .authenticate_for_session(&issued.credential.secret)

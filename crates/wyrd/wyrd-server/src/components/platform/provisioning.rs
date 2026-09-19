@@ -290,8 +290,9 @@ impl TenantProvisioning {
         tenant_id: DataTenantId,
         suspended: bool,
     ) -> Result<(), ProvisionError> {
+        // The handle must outlive the transaction it lends out.
         let authz = PlatformAuthorization::new(self.operator.clone());
-        let decision = authz
+        let mut decision = authz
             .authorize(
                 &caller.context,
                 &Permission::tenant_suspend(),
@@ -299,16 +300,18 @@ impl TenantProvisioning {
                 Some(tenant_id),
             )
             .await?;
-        decision
-            .commit()
-            .await
-            .map_err(|e| ProvisionError::Store(e.to_string()))?;
 
-        if set_tenant_suspended(&self.operator, tenant_id, suspended)
+        // Both halves of the same plane, so both commit together. A transition
+        // recorded as allowed that never applied — or an applied one with no
+        // record — is exactly the mismatch the canonical audit rule forbids.
+        if set_tenant_suspended(&mut decision, tenant_id, suspended)
             .await
             .map_err(|e| ProvisionError::Store(e.to_string()))?
         {
-            Ok(())
+            decision
+                .commit()
+                .await
+                .map_err(|e| ProvisionError::Store(e.to_string()))
         } else {
             Err(ProvisionError::TenantUnavailable)
         }

@@ -16,7 +16,7 @@ mod pg_tests {
     use wyrd_spec::auth::PrincipalKindTag;
     use wyrd_sql::queries::auth::insert_service_account;
     use wyrd_sql::queries::platform::credentials::{
-        insert_platform_credential, list_platform_credentials, platform_credential_by_prefix,
+        insert_platform_credential_tx, list_platform_credentials, platform_credential_by_prefix,
         revoke_platform_credential,
     };
     use wyrd_sql::queries::platform::principal_grants::{
@@ -29,6 +29,44 @@ mod pg_tests {
     /// Skip when no database is configured, matching the sibling Postgres suites.
     fn database_url() -> Option<String> {
         std::env::var("WYRD_DATABASE_URL").ok()
+    }
+
+    /// Insert one credential on its own committed transaction.
+    ///
+    /// Credential writes run on the caller's transaction so they commit with
+    /// the allowance that permitted them; a test that only needs the row
+    /// standing commits one immediately.
+    async fn insert_credential(
+        fixture: &PgFixture,
+        id: Uuid,
+        principal: Uuid,
+        prefix: &str,
+        secret_hash: &str,
+        expires_at: Option<chrono::DateTime<Utc>>,
+    ) {
+        let mut conn = fixture
+            .operator_pool()
+            .begin_platform_audited()
+            .await
+            .expect("transaction opens");
+        insert_platform_credential_tx(&mut conn, id, principal, prefix, secret_hash, expires_at)
+            .await
+            .expect("credential inserts");
+        conn.commit().await.expect("credential commits");
+    }
+
+    /// Revoke one credential on its own committed transaction.
+    async fn revoke_credential(fixture: &PgFixture, id: Uuid) -> bool {
+        let mut conn = fixture
+            .operator_pool()
+            .begin_platform_audited()
+            .await
+            .expect("transaction opens");
+        let revoked = revoke_platform_credential(&mut conn, id)
+            .await
+            .expect("revocation succeeds");
+        conn.commit().await.expect("revocation commits");
+        revoked
     }
 
     /// Store a distinguishable non-secret stand-in for an Argon2 verifier.
@@ -163,12 +201,24 @@ mod pg_tests {
         .expect("grant inserts");
 
         let (old, new) = (Uuid::now_v7(), Uuid::now_v7());
-        insert_platform_credential(pool, old, principal, "wyrd_global_a", &verifier("a"), None)
-            .await
-            .expect("first credential inserts");
-        insert_platform_credential(pool, new, principal, "wyrd_global_b", &verifier("b"), None)
-            .await
-            .expect("second credential inserts");
+        insert_credential(
+            &fixture,
+            old,
+            principal,
+            "wyrd_global_a",
+            &verifier("a"),
+            None,
+        )
+        .await;
+        insert_credential(
+            &fixture,
+            new,
+            principal,
+            "wyrd_global_b",
+            &verifier("b"),
+            None,
+        )
+        .await;
 
         let now = Utc::now();
         for prefix in ["wyrd_global_a", "wyrd_global_b"] {
@@ -179,11 +229,7 @@ mod pg_tests {
             assert!(row.is_usable(now), "{prefix} is live before rotation");
         }
 
-        assert!(
-            revoke_platform_credential(pool, old)
-                .await
-                .expect("revocation succeeds")
-        );
+        assert!(revoke_credential(&fixture, old).await);
 
         let revoked = platform_credential_by_prefix(pool, "wyrd_global_a")
             .await
@@ -230,22 +276,17 @@ mod pg_tests {
         insert_platform_principal(pool, principal, PrincipalKindTag::GlobalAdmin, "once")
             .await
             .expect("principal inserts");
-        insert_platform_credential(
-            pool,
+        insert_credential(
+            &fixture,
             credential,
             principal,
             "wyrd_global_once",
             &verifier("once"),
             None,
         )
-        .await
-        .expect("credential inserts");
+        .await;
 
-        assert!(
-            revoke_platform_credential(pool, credential)
-                .await
-                .expect("first revocation succeeds")
-        );
+        assert!(revoke_credential(&fixture, credential).await);
         let first = platform_credential_by_prefix(pool, "wyrd_global_once")
             .await
             .expect("lookup succeeds")
@@ -254,9 +295,7 @@ mod pg_tests {
             .expect("revocation time recorded");
 
         assert!(
-            !revoke_platform_credential(pool, credential)
-                .await
-                .expect("repeat revocation succeeds"),
+            !revoke_credential(&fixture, credential).await,
             "a repeat revocation reports that it changed nothing"
         );
         let second = platform_credential_by_prefix(pool, "wyrd_global_once")
@@ -283,16 +322,15 @@ mod pg_tests {
         insert_platform_principal(pool, suspended, PrincipalKindTag::GlobalAdmin, "suspended")
             .await
             .expect("principal inserts");
-        insert_platform_credential(
-            pool,
+        insert_credential(
+            &fixture,
             Uuid::now_v7(),
             suspended,
             "wyrd_global_susp",
             &verifier("susp"),
             None,
         )
-        .await
-        .expect("credential inserts");
+        .await;
         sqlx::query("UPDATE platform.principals SET status = 'suspended' WHERE id = $1")
             .bind(suspended)
             .execute(pool.pool())
@@ -308,16 +346,15 @@ mod pg_tests {
         )
         .await
         .expect("principal inserts");
-        insert_platform_credential(
-            pool,
+        insert_credential(
+            &fixture,
             Uuid::now_v7(),
             expired_owner,
             "wyrd_global_exp",
             &verifier("exp"),
             Some(now - Duration::hours(1)),
         )
-        .await
-        .expect("credential inserts");
+        .await;
 
         for prefix in ["wyrd_global_susp", "wyrd_global_exp"] {
             let row = platform_credential_by_prefix(pool, prefix)
@@ -349,16 +386,15 @@ mod pg_tests {
         insert_platform_principal(pool, principal, PrincipalKindTag::GlobalAdmin, "listed")
             .await
             .expect("principal inserts");
-        insert_platform_credential(
-            pool,
+        insert_credential(
+            &fixture,
             Uuid::now_v7(),
             principal,
             "wyrd_global_listed",
             &verifier("listed"),
             None,
         )
-        .await
-        .expect("credential inserts");
+        .await;
 
         let listed = list_platform_credentials(pool, principal)
             .await

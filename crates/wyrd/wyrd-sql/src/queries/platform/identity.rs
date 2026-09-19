@@ -87,7 +87,7 @@ pub async fn platform_oidc_connection(
 // to be destructured immediately on the other side of the call.
 #[allow(clippy::too_many_arguments)]
 pub async fn upsert_platform_oidc_connection(
-    pool: &OperatorPool,
+    conn: &mut TenantConn<'_>,
     issuer_url: &str,
     jwks_uri: &str,
     expected_audience: &str,
@@ -121,7 +121,7 @@ pub async fn upsert_platform_oidc_connection(
     .bind(claim_mapping)
     .bind(jwks_ttl_secs)
     .bind(client_secret_enc)
-    .execute(pool.pool())
+    .execute(&mut **conn.transaction())
     .await
     .map(|_| ())
     .map_err(SqlError::from)
@@ -135,9 +135,9 @@ pub async fn upsert_platform_oidc_connection(
 ///
 /// # Errors
 /// Returns [`SqlError::Query`] when the delete fails.
-pub async fn delete_platform_oidc_connection(pool: &OperatorPool) -> Result<bool, SqlError> {
+pub async fn delete_platform_oidc_connection(conn: &mut TenantConn<'_>) -> Result<bool, SqlError> {
     sqlx::query("DELETE FROM platform.oidc_connection")
-        .execute(pool.pool())
+        .execute(&mut **conn.transaction())
         .await
         .map(|done| done.rows_affected() > 0)
         .map_err(SqlError::from)

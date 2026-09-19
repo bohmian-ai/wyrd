@@ -50,14 +50,40 @@ mod pg_tests {
             .expect("grant installs");
     }
 
+    /// Apply one guarded status change on its own transaction.
+    ///
+    /// Mirrors the route: the guard, the write, and (in the server) the
+    /// authorization record share one transaction, and only a permitted change
+    /// commits. A refusal rolls back, which is what makes the advisory lock
+    /// serialize concurrent suspensions.
+    async fn set_status(fixture: &PgFixture, id: Uuid, status: &str) -> StatusChange {
+        let mut conn = fixture
+            .operator_pool()
+            .begin_platform_audited()
+            .await
+            .expect("transaction opens");
+        let outcome = set_platform_principal_status(&mut conn, id, status, &required_grant())
+            .await
+            .expect("guard runs");
+        if outcome == StatusChange::Changed {
+            conn.commit().await.expect("change commits");
+        }
+        outcome
+    }
+
     /// Install the deployment's one OIDC connection for `issuer`.
     ///
     /// The lockout guard only counts a pinned identity whose issuer is the
     /// connection currently served, so a test that wants a federated
     /// administrator to be a way in has to install one.
     async fn connect(fixture: &PgFixture, issuer: &str) {
+        let mut conn = fixture
+            .operator_pool()
+            .begin_platform_audited()
+            .await
+            .expect("transaction opens");
         upsert_platform_oidc_connection(
-            fixture.operator_pool(),
+            &mut conn,
             issuer,
             "https://idp.example.com/jwks",
             "wyrd-platform",
@@ -69,6 +95,7 @@ mod pg_tests {
         )
         .await
         .expect("connection upserts");
+        conn.commit().await.expect("connection commits");
     }
 
     /// Register a human administrator who can actually sign in.
@@ -335,9 +362,7 @@ mod pg_tests {
         );
 
         assert_eq!(
-            set_platform_principal_status(pool, principal, "suspended", &required_grant())
-                .await
-                .expect("suspension succeeds"),
+            set_status(&fixture, principal, "suspended").await,
             StatusChange::Changed,
             "suspending an active principal changes a row"
         );
@@ -350,9 +375,7 @@ mod pg_tests {
             "a suspended principal may no longer authenticate"
         );
         assert_eq!(
-            set_platform_principal_status(pool, principal, "suspended", &required_grant())
-                .await
-                .expect("repeat succeeds"),
+            set_status(&fixture, principal, "suspended").await,
             StatusChange::Unchanged,
             "suspending it again changes nothing"
         );
@@ -370,7 +393,6 @@ mod pg_tests {
             return;
         }
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let pool = fixture.operator_pool();
         connect(&fixture, ISSUER).await;
 
         // A registered human with a pinned identity and the required grant is
@@ -378,9 +400,7 @@ mod pg_tests {
         let only_way_in = register_pinned(&fixture, "ops-lead", "ops@example.com").await;
         grant(&fixture, only_way_in).await;
         assert_eq!(
-            set_platform_principal_status(pool, only_way_in, "suspended", &required_grant())
-                .await
-                .expect("guard runs"),
+            set_status(&fixture, only_way_in, "suspended").await,
             StatusChange::WouldStrandDeployment,
             "the last usable administrator cannot be suspended"
         );
@@ -388,9 +408,7 @@ mod pg_tests {
         // An ungranted principal is not protection, so suspending it is free.
         let ungranted = register(&fixture, "ops-observer", "observer@example.com").await;
         assert_eq!(
-            set_platform_principal_status(pool, ungranted, "suspended", &required_grant())
-                .await
-                .expect("guard runs"),
+            set_status(&fixture, ungranted, "suspended").await,
             StatusChange::Changed,
             "a principal with no platform authority was never a way in"
         );
@@ -399,7 +417,7 @@ mod pg_tests {
         // credential and no pinned identity.
         let unreachable = Uuid::now_v7();
         insert_platform_principal(
-            pool,
+            fixture.operator_pool(),
             unreachable,
             PrincipalKindTag::GlobalAdmin,
             "ops-orphan",
@@ -408,16 +426,12 @@ mod pg_tests {
         .expect("principal inserts");
         grant(&fixture, unreachable).await;
         assert_eq!(
-            set_platform_principal_status(pool, unreachable, "suspended", &required_grant())
-                .await
-                .expect("guard runs"),
+            set_status(&fixture, unreachable, "suspended").await,
             StatusChange::Changed,
             "authority nothing can authenticate as is not a way back in"
         );
         assert_eq!(
-            set_platform_principal_status(pool, only_way_in, "suspended", &required_grant())
-                .await
-                .expect("guard runs"),
+            set_status(&fixture, only_way_in, "suspended").await,
             StatusChange::WouldStrandDeployment,
             "neither of those made the real administrator suspendable"
         );
@@ -427,9 +441,7 @@ mod pg_tests {
         let unpinned = register(&fixture, "ops-pending", "pending@example.com").await;
         grant(&fixture, unpinned).await;
         assert_eq!(
-            set_platform_principal_status(pool, only_way_in, "suspended", &required_grant())
-                .await
-                .expect("guard runs"),
+            set_status(&fixture, only_way_in, "suspended").await,
             StatusChange::WouldStrandDeployment,
             "an unpinned registration is not a way in"
         );
@@ -438,9 +450,7 @@ mod pg_tests {
         let survivor = register_pinned(&fixture, "ops-second", "second@example.com").await;
         grant(&fixture, survivor).await;
         assert_eq!(
-            set_platform_principal_status(pool, only_way_in, "suspended", &required_grant())
-                .await
-                .expect("guard runs"),
+            set_status(&fixture, only_way_in, "suspended").await,
             StatusChange::Changed
         );
     }
@@ -471,24 +481,23 @@ mod pg_tests {
         grant(&fixture, machine).await;
         credential(&fixture, machine, "wyp_removed").await;
         assert_eq!(
-            set_platform_principal_status(pool, machine, "suspended", &required_grant())
-                .await
-                .expect("guard runs"),
+            set_status(&fixture, machine, "suspended").await,
             StatusChange::Changed,
             "a live federated administrator is a surviving way in"
         );
-        set_platform_principal_status(pool, machine, "active", &required_grant())
-            .await
-            .expect("restore succeeds");
+        set_status(&fixture, machine, "active").await;
 
-        delete_platform_oidc_connection(pool)
+        let mut removal = pool
+            .begin_platform_audited()
+            .await
+            .expect("transaction opens");
+        delete_platform_oidc_connection(&mut removal)
             .await
             .expect("connection removes");
+        removal.commit().await.expect("removal commits");
 
         assert_eq!(
-            set_platform_principal_status(pool, machine, "suspended", &required_grant())
-                .await
-                .expect("guard runs"),
+            set_status(&fixture, machine, "suspended").await,
             StatusChange::WouldStrandDeployment,
             "with the connection gone the credential holder is the last way in"
         );
@@ -522,19 +531,18 @@ mod pg_tests {
             return;
         }
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let pool = fixture.operator_pool();
+
         connect(&fixture, ISSUER).await;
         let first = register_pinned(&fixture, "ops-first", "first@example.com").await;
         let second = register_pinned(&fixture, "ops-second", "second@example.com").await;
         grant(&fixture, first).await;
         grant(&fixture, second).await;
 
-        let required = required_grant();
         let (left, right) = tokio::join!(
-            set_platform_principal_status(pool, first, "suspended", &required),
-            set_platform_principal_status(pool, second, "suspended", &required),
+            set_status(&fixture, first, "suspended"),
+            set_status(&fixture, second, "suspended"),
         );
-        let outcomes = [left.expect("first runs"), right.expect("second runs")];
+        let outcomes = [left, right];
         assert_eq!(
             outcomes
                 .iter()
@@ -561,9 +569,7 @@ mod pg_tests {
         pin_platform_identity(pool, ISSUER, "ops@example.com", "subject-alice")
             .await
             .expect("pin succeeds");
-        set_platform_principal_status(pool, principal, "suspended", &required_grant())
-            .await
-            .expect("suspension succeeds");
+        set_status(&fixture, principal, "suspended").await;
 
         let listed = list_platform_principals(pool).await.expect("listing reads");
         let row = listed
@@ -591,8 +597,12 @@ mod pg_tests {
         let mapping = serde_json::json!({ "subject": ["sub"], "email": ["email"] });
 
         for audience in ["first-audience", "second-audience"] {
+            let mut conn = pool
+                .begin_platform_audited()
+                .await
+                .expect("transaction opens");
             upsert_platform_oidc_connection(
-                pool,
+                &mut conn,
                 ISSUER,
                 "https://idp.example.com/jwks",
                 audience,
@@ -604,6 +614,7 @@ mod pg_tests {
             )
             .await
             .expect("connection upserts");
+            conn.commit().await.expect("connection commits");
         }
 
         let connection = platform_oidc_connection(pool)

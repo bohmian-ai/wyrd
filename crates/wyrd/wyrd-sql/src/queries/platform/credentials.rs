@@ -71,26 +71,6 @@ pub struct PlatformCredentialMetadataRow {
 /// # Errors
 /// Returns [`SqlError::Query`] when the insert fails, including when `prefix`
 /// collides or `principal_id` does not name an existing platform principal.
-pub async fn insert_platform_credential(
-    pool: &OperatorPool,
-    id: Uuid,
-    principal_id: Uuid,
-    prefix: &str,
-    secret_hash: &str,
-    expires_at: Option<DateTime<Utc>>,
-) -> Result<(), SqlError> {
-    sqlx::query(INSERT_PLATFORM_CREDENTIAL_SQL)
-        .bind(id)
-        .bind(principal_id)
-        .bind(prefix)
-        .bind(secret_hash)
-        .bind(expires_at)
-        .execute(pool.pool())
-        .await
-        .map_err(SqlError::from)?;
-    Ok(())
-}
-
 /// Insert a platform credential inside a caller-owned transaction.
 ///
 /// Used where the credential is only meaningful together with what else the
@@ -216,14 +196,17 @@ pub async fn list_platform_credentials(
 ///
 /// # Errors
 /// Returns [`SqlError::Query`] when the update fails.
-pub async fn revoke_platform_credential(pool: &OperatorPool, id: Uuid) -> Result<bool, SqlError> {
+pub async fn revoke_platform_credential(
+    conn: &mut TenantConn<'_>,
+    id: Uuid,
+) -> Result<bool, SqlError> {
     let result = sqlx::query(
         "UPDATE platform.credentials
             SET revoked_at = now()
           WHERE id = $1 AND revoked_at IS NULL",
     )
     .bind(id)
-    .execute(pool.pool())
+    .execute(&mut **conn.transaction())
     .await
     .map_err(SqlError::from)?;
     Ok(result.rows_affected() == 1)

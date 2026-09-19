@@ -35,7 +35,7 @@ use wyrd_sql::queries::platform::principals::{
     StatusChange, insert_platform_principal_tx, list_platform_principals,
     set_platform_principal_status,
 };
-use wyrd_sql::{OperatorPool, SqlError};
+use wyrd_sql::{OperatorPool, SqlError, TenantConn};
 
 use crate::components::auth::PlatformCaller;
 use wyrd_sql::queries::platform::principal_grants::set_platform_grant_tx;
@@ -101,32 +101,61 @@ pub(super) fn operator(state: &AppState) -> Result<OperatorPool, WyrdErrorRespon
     })
 }
 
-/// Authorize one platform identity operation, recording the decision.
+/// Authorize one platform identity operation and hand back its open decision.
 ///
-/// Reuses the platform plane's single audited authorization entry point, so a
-/// decision here is recorded in the transaction that made it exactly as a
-/// tenant-lifecycle decision is.
+/// The returned transaction already carries the allowance row, so the caller
+/// performs its mutation on it and commits once through [`commit_decision`].
+/// A read-only caller commits it immediately: there is no effect to pair the
+/// record with.
+///
+/// The authorization handle owns the pool the transaction borrows from, so it
+/// is returned alongside and must outlive the connection.
 ///
 /// # Errors
 /// Returns a permission error when the grant does not cover `required`, and an
 /// internal error when the decision cannot be recorded — in which case nothing
 /// is performed.
-pub(super) async fn authorize(
-    pool: &OperatorPool,
+pub(super) async fn authorize<'a>(
+    authz: &'a PlatformAuthorization,
     caller: &PlatformCaller,
     required: &Permission,
-) -> Result<(), WyrdErrorResponse> {
-    let authz = PlatformAuthorization::new(pool.clone());
-    let decision = authz
+) -> Result<TenantConn<'a>, WyrdErrorResponse> {
+    authz
         .authorize(&caller.context, required, caller.request_id.as_str(), None)
         .await
-        .map_err(|error| platform_authz_error(&error, required))?;
+        .map_err(|error| platform_authz_error(&error, required))
+}
+
+/// Commit an allowance together with whatever the caller wrote on it.
+///
+/// # Errors
+/// Returns an internal error when the commit fails, in which case neither the
+/// effect nor the allowance is durable.
+pub(super) async fn commit_decision(decision: TenantConn<'_>) -> Result<(), WyrdErrorResponse> {
     decision.commit().await.map_err(|error| {
         WyrdErrorResponse::from(internal_failure(
             "platform authorization could not be committed",
             &error,
         ))
     })
+}
+
+/// Authorize a read and release its record immediately.
+///
+/// A read has no effect to pair the allowance with, so holding the transaction
+/// open across it would buy nothing.
+///
+/// # Errors
+/// Returns a permission error when the grant does not cover `required`, and an
+/// internal error when the decision cannot be recorded or committed.
+pub(super) async fn authorize_read(
+    pool: &OperatorPool,
+    caller: &PlatformCaller,
+    required: &Permission,
+) -> Result<(), WyrdErrorResponse> {
+    let authz = PlatformAuthorization::new(pool.clone());
+    let decision = authorize(&authz, caller, required).await?;
+    commit_decision(decision).await
 }
 
 /// Install or replace the deployment's platform OIDC connection.
@@ -154,7 +183,9 @@ async fn configure_connection(
     Json(request): Json<ConfigurePlatformOidcRequest>,
 ) -> Result<Json<PlatformOidcConnectionView>, WyrdErrorResponse> {
     let pool = operator(&state)?;
-    authorize(&pool, &caller, &Permission::platform_identity_write()).await?;
+    // The handle must outlive the transaction it lends out.
+    let authz = PlatformAuthorization::new(pool.clone());
+    let mut decision = authorize(&authz, &caller, &Permission::platform_identity_write()).await?;
 
     let client_auth = match request.client_auth {
         PlatformClientAuth::SecretBasic { secret } => {
@@ -196,7 +227,7 @@ async fn configure_connection(
         })?;
 
     upsert_platform_oidc_connection(
-        &pool,
+        &mut decision,
         &request.issuer_url,
         jwks_uri.as_str(),
         &request.expected_audience,
@@ -208,6 +239,7 @@ async fn configure_connection(
     )
     .await
     .map_err(store_error)?;
+    commit_decision(decision).await?;
 
     Ok(Json(PlatformOidcConnectionView {
         issuer_url: request.issuer_url,
@@ -241,7 +273,7 @@ async fn read_connection(
     caller: PlatformCaller,
 ) -> Result<Json<PlatformOidcConnectionView>, WyrdErrorResponse> {
     let pool = operator(&state)?;
-    authorize(&pool, &caller, &Permission::platform_identity_read()).await?;
+    authorize_read(&pool, &caller, &Permission::platform_identity_read()).await?;
 
     let row = platform_oidc_connection(&pool)
         .await
@@ -289,12 +321,15 @@ async fn remove_connection(
     caller: PlatformCaller,
 ) -> Result<axum::http::StatusCode, WyrdErrorResponse> {
     let pool = operator(&state)?;
-    authorize(&pool, &caller, &Permission::platform_identity_write()).await?;
+    // The handle must outlive the transaction it lends out.
+    let authz = PlatformAuthorization::new(pool.clone());
+    let mut decision = authorize(&authz, &caller, &Permission::platform_identity_write()).await?;
 
-    if delete_platform_oidc_connection(&pool)
+    if delete_platform_oidc_connection(&mut decision)
         .await
         .map_err(store_error)?
     {
+        commit_decision(decision).await?;
         Ok(axum::http::StatusCode::NO_CONTENT)
     } else {
         Err(WyrdErrorResponse::from(WyrdError::NotFound {
@@ -346,15 +381,7 @@ async fn register_admin(
     //
     // The handle must outlive the transaction it lends out.
     let authz = PlatformAuthorization::new(pool.clone());
-    let mut decision = authz
-        .authorize(
-            &caller.context,
-            &Permission::platform_identity_write(),
-            caller.request_id.as_str(),
-            None,
-        )
-        .await
-        .map_err(|error| platform_authz_error(&error, &Permission::platform_identity_write()))?;
+    let mut decision = authorize(&authz, &caller, &Permission::platform_identity_write()).await?;
 
     // Registering against no connection would create a principal that could
     // never sign in, so the connection is required first.
@@ -398,12 +425,7 @@ async fn register_admin(
         .await
         .map_err(store_error)?;
 
-    decision.commit().await.map_err(|error| {
-        WyrdErrorResponse::from(internal_failure(
-            "platform administrator registration could not be committed",
-            &error,
-        ))
-    })?;
+    commit_decision(decision).await?;
 
     Ok(Json(RegisterPlatformAdminResponse {
         principal_id: PrincipalId::new(principal_id),
@@ -437,7 +459,7 @@ async fn list_platform_admins(
     caller: PlatformCaller,
 ) -> Result<Json<PlatformPrincipalListResponse>, WyrdErrorResponse> {
     let pool = operator(&state)?;
-    authorize(&pool, &caller, &Permission::platform_identity_read()).await?;
+    authorize_read(&pool, &caller, &Permission::platform_identity_read()).await?;
 
     let rows = list_platform_principals(&pool).await.map_err(store_error)?;
     Ok(Json(PlatformPrincipalListResponse {
@@ -492,7 +514,9 @@ async fn set_admin_status(
     Json(request): Json<SetPlatformPrincipalStatusRequest>,
 ) -> Result<axum::http::StatusCode, WyrdErrorResponse> {
     let pool = operator(&state)?;
-    authorize(&pool, &caller, &Permission::platform_identity_write()).await?;
+    // The handle must outlive the transaction it lends out.
+    let authz = PlatformAuthorization::new(pool.clone());
+    let mut decision = authorize(&authz, &caller, &Permission::platform_identity_write()).await?;
 
     if !matches!(request.status.as_str(), "active" | "suspended") {
         return Err(WyrdErrorResponse::from(WyrdError::Validation {
@@ -506,7 +530,7 @@ async fn set_admin_status(
     // survivor remains.
     let grant = serde_json::to_value(platform_administrator_grant().iter().collect::<Vec<_>>())
         .expect("permission set serializes to JSON");
-    match set_platform_principal_status(&pool, principal_id, &request.status, &grant)
+    match set_platform_principal_status(&mut decision, principal_id, &request.status, &grant)
         .await
         .map_err(store_error)?
     {
@@ -525,6 +549,7 @@ async fn set_admin_status(
             }));
         }
     }
+    commit_decision(decision).await?;
 
     Ok(axum::http::StatusCode::NO_CONTENT)
 }

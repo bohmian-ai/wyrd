@@ -12046,6 +12046,7 @@ dependencies = [
  "uuid",
  "vala-bifrost-redux",
  "vala-sql",
+ "wiremock",
  "workspace-hack",
  "wyrd-auth",
  "wyrd-auth-check",

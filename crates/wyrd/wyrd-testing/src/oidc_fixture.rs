@@ -358,3 +358,55 @@ fn parse_form_action(html: &str) -> Option<String> {
     // Keycloak HTML-encodes `&` as `&amp;` in form actions
     Some(raw.replace("&amp;", "&"))
 }
+
+/// A minimal OIDC discovery document served over HTTP.
+///
+/// Configuring a Wyrd OIDC connection resolves the issuer's discovery document
+/// to derive its JWKS endpoint, under the deployment's address screening. A
+/// test that wants to exercise that path needs a real HTTP issuer to point at,
+/// and standing one up is test-support rather than something each suite should
+/// carry its own mock dependency for.
+///
+/// The JWKS endpoint it advertises is deliberately derived from the server's
+/// own address, so a caller that echoed a request field back instead of
+/// resolving discovery would produce a different value.
+pub struct DiscoveryFixture {
+    /// The running mock issuer. Held so it outlives the fixture's users.
+    server: wiremock::MockServer,
+}
+
+impl DiscoveryFixture {
+    /// Start an issuer serving only its discovery document.
+    pub async fn start() -> Self {
+        let server = wiremock::MockServer::start().await;
+        let issuer = server.uri();
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/.well-known/openid-configuration",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "issuer": issuer,
+                    "authorization_endpoint": format!("{issuer}/authorize"),
+                    "token_endpoint": format!("{issuer}/token"),
+                    "jwks_uri": format!("{issuer}/jwks"),
+                    "id_token_signing_alg_values_supported": ["RS256", "EdDSA"],
+                })),
+            )
+            .mount(&server)
+            .await;
+        Self { server }
+    }
+
+    /// The issuer URL a connection is configured against.
+    #[must_use]
+    pub fn issuer(&self) -> String {
+        self.server.uri()
+    }
+
+    /// The JWKS endpoint this issuer's discovery document advertises.
+    #[must_use]
+    pub fn jwks_uri(&self) -> String {
+        format!("{}/jwks", self.server.uri())
+    }
+}

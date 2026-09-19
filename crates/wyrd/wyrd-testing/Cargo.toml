@@ -106,6 +106,8 @@ wyrd-telemetry = { workspace = true }
 wyrd-utils = { workspace = true, features = ["python"], optional = true }
 wyrd-tls = { workspace = true }
 
+wiremock = { workspace = true }
+
 [dev-dependencies]
 workspace-hack.workspace = true
 metrics = { workspace = true }

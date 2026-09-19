@@ -298,22 +298,45 @@ async fn list_credentials(
     caller: Caller,
     Path(principal_id): Path<Uuid>,
 ) -> Result<Json<CredentialListResponse>, WyrdErrorResponse> {
+    list_credentials_for(&state, &caller, principal_id)
+        .await
+        .map(Json)
+        .map_err(WyrdErrorResponse::from)
+}
+
+/// Read one principal's credential metadata.
+///
+/// The operation behind both the HTTP route and the MCP tool, so the two
+/// surfaces cannot disagree about authorization, tenancy, or what a listing
+/// contains.
+///
+/// # Errors
+/// Returns a stable Wyrd error when the caller is unauthorized, the decision
+/// cannot be audited, or the read fails.
+pub(crate) async fn list_credentials_for(
+    state: &AppState,
+    caller: &Caller,
+    principal_id: Uuid,
+) -> Result<CredentialListResponse, WyrdError> {
     let mut conn = authorize(
-        &state,
-        &caller,
+        state,
+        caller,
         "list tenant credentials",
         "auth.credential.list",
         &format!("principal:{principal_id}"),
     )
-    .await?;
+    .await
+    .map_err(WyrdError::from)?;
     let rows = list_api_key_metadata(&mut conn, principal_id)
         .await
-        .map_err(internal)?;
-    conn.commit().await.map_err(internal)?;
+        .map_err(|error| WyrdError::from(internal(error)))?;
+    conn.commit()
+        .await
+        .map_err(|error| WyrdError::from(internal(error)))?;
 
-    Ok(Json(CredentialListResponse {
+    Ok(CredentialListResponse {
         credentials: rows.into_iter().map(metadata).collect(),
-    }))
+    })
 }
 
 /// Revoke one credential, leaving the principal and its roles untouched.
@@ -343,14 +366,36 @@ async fn revoke_credential(
     caller: Caller,
     Path((principal_id, credential_id)): Path<(Uuid, Uuid)>,
 ) -> Result<axum::http::StatusCode, WyrdErrorResponse> {
+    revoke_credential_for(&state, &caller, principal_id, credential_id)
+        .await
+        .map(|()| axum::http::StatusCode::NO_CONTENT)
+        .map_err(WyrdErrorResponse::from)
+}
+
+/// Retire one credential.
+///
+/// The operation behind both the HTTP route and the MCP tool. See the route
+/// documentation above for why revocation advances the principal's epoch and
+/// what that costs.
+///
+/// # Errors
+/// Returns a stable Wyrd error when the caller is unauthorized, the credential
+/// is not found for that principal, or a write fails.
+pub(crate) async fn revoke_credential_for(
+    state: &AppState,
+    caller: &Caller,
+    principal_id: Uuid,
+    credential_id: Uuid,
+) -> Result<(), WyrdError> {
     let mut conn = authorize(
-        &state,
-        &caller,
+        state,
+        caller,
         "revoke tenant credentials",
         "auth.credential.revoke",
         &format!("credential:{credential_id}"),
     )
-    .await?;
+    .await
+    .map_err(WyrdError::from)?;
 
     // Scoped to the principal the path names, so a credential id alone cannot
     // revoke a credential belonging to some other principal. The refusal
@@ -358,10 +403,12 @@ async fn revoke_credential(
     // attempt an operator needs to find in the audit log.
     let owned = credential_belongs_to(&mut conn, credential_id, principal_id)
         .await
-        .map_err(internal)?;
+        .map_err(|error| WyrdError::from(internal(error)))?;
     if !owned {
-        conn.commit().await.map_err(internal)?;
-        return Err(not_found());
+        conn.commit()
+            .await
+            .map_err(|error| WyrdError::from(internal(error)))?;
+        return Err(WyrdError::from(not_found()));
     }
 
     // Nothing after this point runs unless *this* call is the one that retires
@@ -370,10 +417,12 @@ async fn revoke_credential(
     // not do it a second time.
     if !revoke_api_key(&mut conn, credential_id)
         .await
-        .map_err(internal)?
+        .map_err(|error| WyrdError::from(internal(error)))?
     {
-        conn.commit().await.map_err(internal)?;
-        return Err(not_found());
+        conn.commit()
+            .await
+            .map_err(|error| WyrdError::from(internal(error)))?;
+        return Err(WyrdError::from(not_found()));
     }
 
     // The kind is read rather than assumed: the epoch cache is keyed by it, so
@@ -382,19 +431,19 @@ async fn revoke_credential(
     // `tenant_admin`, not `service`.
     let kind = service_account_by_id(&mut conn, principal_id)
         .await
-        .map_err(internal)?
+        .map_err(|error| WyrdError::from(internal(error)))?
         .and_then(|row| principal_kind_wire(&row.principal_kind))
-        .ok_or_else(|| {
-            WyrdErrorResponse::from(WyrdError::Internal {
-                message: "credential owner has no recognizable principal kind".to_owned(),
-                details: serde_json::json!({}),
-            })
+        .ok_or_else(|| WyrdError::Internal {
+            message: "credential owner has no recognizable principal kind".to_owned(),
+            details: serde_json::json!({}),
         })?;
 
     revoke_service_account_principal(&mut conn, principal_id)
         .await
-        .map_err(internal)?;
-    conn.commit().await.map_err(internal)?;
+        .map_err(|error| WyrdError::from(internal(error)))?;
+    conn.commit()
+        .await
+        .map_err(|error| WyrdError::from(internal(error)))?;
 
     // Each replica caches a principal's revocation epoch for a few seconds, so
     // without this the revoked credential's tokens keep working elsewhere until
@@ -414,7 +463,7 @@ async fn revoke_credential(
         );
     }
 
-    Ok(axum::http::StatusCode::NO_CONTENT)
+    Ok(())
 }
 
 /// The one refusal for a credential this principal does not have.

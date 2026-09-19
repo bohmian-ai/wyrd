@@ -15,7 +15,7 @@
 # WHAT IT CHECKS: mockall, wiremock, and mockito references do not appear
 # outside wyrd-testing and the explicitly allowlisted provider/auth files.
 if rg -n 'mockall|wiremock|mockito' crates \
-  --glob '!crates/shared/wyrd-testing/**' \
+  --glob '!crates/wyrd/wyrd-testing/**' \
   --glob '!crates/skald/skald-providers/Cargo.toml' \
   --glob '!crates/skald/skald-providers/src/lib.rs' \
   --glob '!crates/skald/skald-providers/src/raw.rs' \

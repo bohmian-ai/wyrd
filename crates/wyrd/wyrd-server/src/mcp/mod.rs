@@ -30,6 +30,7 @@ use crate::components::auth::{AuthenticatedPrincipal, Caller};
 use crate::state::AppState;
 
 mod bifrost;
+mod principals;
 #[cfg(feature = "test-support")]
 pub mod probe;
 
@@ -132,6 +133,7 @@ impl WyrdMcpHandler {
     /// opted into it, so compiling `test-support` is not enough to expose it.
     fn catalog(&self) -> Vec<Tool> {
         let mut catalog = bifrost::descriptors();
+        catalog.extend(principals::descriptors_unscoped());
         #[cfg(feature = "test-support")]
         if self.state.mcp_context_probe {
             catalog.push(probe::descriptor());
@@ -155,7 +157,10 @@ impl ServerHandler for WyrdMcpHandler {
 
     /// Resolve only tools in this process's configured Wyrd catalog.
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        self.catalog().into_iter().find(|tool| tool.name == name)
+        self.catalog()
+            .into_iter()
+            .chain(principals::write_descriptors())
+            .find(|tool| tool.name == name)
     }
 
     /// Return the complete bounded catalog after public-edge authentication.
@@ -165,9 +170,19 @@ impl ServerHandler for WyrdMcpHandler {
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        Ok(ListToolsResult::with_all_items(self.catalog()))
+        // The advertised catalog is per caller, not per process: a write tool
+        // appears only to a caller whose verified token already carries the
+        // permission it needs. An agent therefore never discovers a capability
+        // it cannot use, and naming one anyway is still refused at dispatch.
+        let mut catalog = self.catalog();
+        if let Ok(caller) = Self::caller(&context)
+            && principals::may_administer(&caller)
+        {
+            catalog.extend(principals::write_descriptors());
+        }
+        Ok(ListToolsResult::with_all_items(catalog))
     }
 
     /// Dispatch tools with verified request context and retain the shutdown
@@ -207,6 +222,23 @@ impl ServerHandler for WyrdMcpHandler {
             bifrost::QUERY => {
                 let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
                 self.query(caller, request.arguments, &context).await
+            }
+            principals::LIST_CREDENTIALS => {
+                let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
+                self.mcp_list_credentials(caller, request.arguments)
+                    .await
+                    .map_err(wyrd_error_to_mcp)
+            }
+            principals::REVOKE_CREDENTIAL => {
+                let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
+                // No scope check here. The operation this dispatches to
+                // authorizes the same permission and records that decision in
+                // the transaction that acts on it; a second check in front of
+                // it would refuse identically while auditing nothing, so it
+                // would only be a place for the two to drift apart.
+                self.mcp_revoke_credential(caller, request.arguments)
+                    .await
+                    .map_err(wyrd_error_to_mcp)
             }
             unknown => {
                 return Err(ErrorData::new(

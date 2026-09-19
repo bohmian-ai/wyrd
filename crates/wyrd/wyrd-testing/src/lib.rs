@@ -9,7 +9,7 @@ pub mod principal;
 pub mod server;
 pub mod time;
 
-pub use oidc_fixture::{KeycloakAdmin, LoginResult, OidcIssuerFixture};
+pub use oidc_fixture::{DiscoveryFixture, KeycloakAdmin, LoginResult, OidcIssuerFixture};
 pub use principal::{Bootstrap, CheckResult};
 pub use server::{
     OracleRuntimeInspection, WyrdTestServer, WyrdTestServerBuilder, WyrdTestServerError,

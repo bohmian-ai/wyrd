@@ -882,8 +882,8 @@ async fn an_operator_configures_and_removes_federated_platform_sign_in() {
         .await
         .expect("deployment initializes");
     let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
-    let provider = discovery_server().await;
-    let issuer = provider.uri();
+    let provider = wyrd_testing::DiscoveryFixture::start().await;
+    let issuer = provider.issuer();
 
     // Before any connection exists, a login attempt has nothing to resolve.
     let resp = srv
@@ -953,7 +953,7 @@ async fn an_operator_configures_and_removes_federated_platform_sign_in() {
     assert_eq!(view["issuer_url"], issuer.as_str());
     assert_eq!(
         view["jwks_uri"],
-        format!("{issuer}/jwks"),
+        provider.jwks_uri(),
         "the JWKS endpoint comes from discovery, never from the request"
     );
     assert_eq!(view["client_auth"], "SecretPost");
@@ -1062,29 +1062,6 @@ async fn a_tenant_administrator_cannot_configure_platform_sign_in() {
     );
 }
 
-/// Serve the one OIDC discovery document configuring a connection resolves.
-///
-/// The JWKS endpoint is deliberately not what a caller would have supplied, so
-/// a test that passed by echoing the request back would fail here.
-async fn discovery_server() -> wiremock::MockServer {
-    let server = wiremock::MockServer::start().await;
-    let issuer = server.uri();
-    wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path(
-            "/.well-known/openid-configuration",
-        ))
-        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
-            "issuer": issuer,
-            "authorization_endpoint": format!("{issuer}/authorize"),
-            "token_endpoint": format!("{issuer}/token"),
-            "jwks_uri": format!("{issuer}/jwks"),
-            "id_token_signing_alg_values_supported": ["RS256", "EdDSA"],
-        })))
-        .mount(&server)
-        .await;
-    server
-}
-
 /// A connection cannot point the server's key fetches at a blocked address.
 ///
 /// Configuring a connection is the only place an operator names an outbound
@@ -1157,14 +1134,14 @@ async fn an_operator_lists_and_suspends_platform_administrators() {
         .await
         .expect("deployment initializes");
     let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
-    let provider = discovery_server().await;
+    let provider = wyrd_testing::DiscoveryFixture::start().await;
 
     srv.oneshot(platform_request(
         Method::PUT,
         "/platform/oidc/connection",
         &session,
         Some(json!({
-            "issuer_url": provider.uri(),
+            "issuer_url": provider.issuer(),
             "expected_audience": "wyrd-platform",
             "client_id": "wyrd-platform",
             "client_auth": { "method": "public" },

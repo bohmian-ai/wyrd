@@ -6,7 +6,7 @@ spec_revision: 7
 reviews: changes/active/admin-principals/review/task-008-r3/
 obligations: [REQ-047, AC-014]
 findings: [FIND-008-15, FIND-008-16]
-status: open
+status: implemented
 ---
 
 ## Subject
@@ -250,3 +250,33 @@ matrix, any `--all-features` workspace lane) as evidence for any criterion above
 - `AGENTS.md` §11, §12, §15, §16; `architecture/agent-rules.md`
 - `architecture/references/languages/implementation-execution.md`
 - `architecture/references/languages/testing-workflows.md`
+
+---
+
+## Implementation Evidence
+
+Commit `708f01ec9`. One file: `crates/wyrd/wyrd-sql/src/queries/auth/service_accounts.rs`.
+
+| # | Criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|---|
+| 1 | The test asserts the shipped predicate | `service_account_by_card_ref_uses_jsonb_card_ref_binding` now asserts `card_ref @> $3`, `ORDER BY created_at, id` and `LIMIT 1`, keeping `principal_kind = $2` and `!card_ref::text`; it gained rustdoc naming why the text is pinned | `mise exec -- cargo nextest run --locked -p wyrd-sql --lib -E 'test(=queries::auth::service_accounts::tests::service_account_by_card_ref_uses_jsonb_card_ref_binding)'` — PASS; red before the edit | PASS |
+| 2 | The SQL lane is green, nothing deleted or ignored | no test removed or `#[ignore]`d; the existing assertion was corrected, two added | `mise run test:sql` — 120 + 4 + 113 + 2 passed, 0 failed; `mise exec -- cargo nextest run --locked -p wyrd-sql --lib` — 74 passed | PASS |
+| 3 | The rustdoc names the real bound | doc moved onto `SERVICE_ACCOUNT_BY_CARD_REF_SQL`: containment relaxes every optional `CardRef` field including `space`; one row comes from `UNIQUE (data_tenant_id, name)`, `auth_projection` keeping the `name` column equal to `card_ref->>'name'`, and callers passing a qualified ref (`IssueKeyArgs::space` required); the ordered `LIMIT 1` is there because none of that is enforced here, with the instruction to narrow the predicate if a link is dropped. The "two Cards with the same identity" claim is gone. The function doc now points at the const. | inspection against AGENTS.md §16; `mise run lints` | PASS |
+| 4 | SQL, `ORDER BY`/`LIMIT`, callers and write side byte-identical to `f102e50ee` | `sed -n '/SERVICE_ACCOUNT_BY_CARD_REF_SQL: &str/,/"#;/p'` md5 matches `f102e50ee`'s (`2298c9e6b9cf3e40edb952818226b944`); the commit changes only doc comments and three assertion lines | `git diff --stat f102e50ee` — one file, docs plus assertions | PASS |
+| 5 | Nothing preserved changed, no non-goal entered, no gate weakened | no other file touched; no `#[allow]`, `#[ignore]`, or deleted test | `mise run lints`; `mise run test:sql` | PASS |
+
+### Process correction carried forward
+
+`mise run test:sql` was missing from the TASK-008 and R2 verification sets even
+though the change touched `wyrd-sql`. That omission, not the predicate, is why a
+red unit test shipped. It is in the command list below and in the R2 record's.
+
+```bash
+mise run fmt
+mise run lints
+mise run test:sql
+mise exec -- cargo nextest run --locked -p wyrd-sql --lib
+mise exec -- cargo nextest run --locked -p wyrd-sql --lib \
+  -E 'test(=queries::auth::service_accounts::tests::service_account_by_card_ref_uses_jsonb_card_ref_binding)'
+git diff --check
+```

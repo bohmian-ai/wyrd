@@ -139,19 +139,26 @@ drift, not permission for code and documentation to diverge.
       middleware in non-mesh shops.
 
     Runtime identity is a `Principal { id: PrincipalId, kind: PrincipalKind,
-    tenant_id, roles, effective_permissions }`. `PrincipalId` is a `Uuid`
-    newtype; no string-prefix encoding (no `user:`, `sa:`, `agent:`) —
-    discrimination lives on `PrincipalKind`. `PrincipalKind` is closed:
-    `PlatformAdmin`, `TenantAdmin`, `User`, `Service { card_ref }`,
-    `Agent { card_ref }`, `System`. A `PlatformAdmin` principal has no tenant;
-    every other kind has exactly one. Card binding is a property of a machine
-    principal, not a precondition for being one: Service and Agent principals
-    are card-bound and their JWT projection carries a `card_ref_scope`
-    authorization set derived at mint time, while a tenant administrative or
-    tenant-created automation principal is representable with no Card. User is
-    the marker for human identity. System is an internal tenant machine
-    principal with no Card or public credential lifecycle. Platform authority
-    is a grant held at platform scope, not a property of a kind. `wyrd apply -f service.yaml` (or an Agent card) creates
+    tenant_id, roles, effective_permissions, credential_id }`. `PrincipalId`
+    is a `Uuid` newtype; no string-prefix encoding (no `user:`, `sa:`,
+    `agent:`) — discrimination lives on the kind. The closed wire set is
+    `PrincipalKindTag`: `GlobalAdmin`, `TenantAdmin`, `User`, `Service`,
+    `Agent`, serialized as `global_admin`, `tenant_admin`, `user`, `service`,
+    `agent`. A `GlobalAdmin` is a platform-plane principal and has no tenant,
+    carried at runtime as `PlatformPrincipal { id, kind,
+    effective_permissions, credential_id }`; a platform-plane human is a
+    `User` with no tenant. Every tenant-plane principal has exactly one
+    tenant and carries the card-bearing `PrincipalKind`: `TenantAdmin`,
+    `User`, `Service { card_ref: Option<CardRef>, card_ref_scope }`, or
+    `Agent { card_ref, card_ref_scope }`. Card binding is a property of a
+    machine principal, not a precondition for being one: an Agent is always
+    card-bound and a deployed Service carries its Card, each projecting a
+    `card_ref_scope` authorization set derived at mint time, while a tenant
+    administrative or tenant-created automation principal is representable
+    with no Card and therefore no emit scope. `User` is the marker for human
+    identity. Platform authority is a grant held at platform scope, not a
+    property of a kind, and neither plane's credential or token is accepted by
+    the other. `wyrd apply -f service.yaml` (or an Agent card) creates
     or updates the principal row idempotently, keyed on
     `(tenant_id, card_kind, card_uid)`; re-apply preserves the same
     `principal_id`. No secret is returned. Credentials are issued out-of-band
@@ -441,6 +448,25 @@ Closed enums:
 - `PolicyDecision = Allow | Deny { reason: string }`
 
 ### Runtime identity
+
+#### Two administration planes
+
+Administration is split in two, and an identity belongs to exactly one plane.
+The **platform plane** operates the deployment — tenant lifecycle and recovery
+of a tenant's administration — through tenantless principals in
+`platform.principals`, reached only over `/platform/*` and only with a
+platform credential or a session from the deployment's single platform-scope
+OIDC connection. The **tenant plane** operates one tenant's resources through
+principals under `wyrd.*` behind RLS. A platform principal is never implicitly
+authorized over a tenant's resources, a tenant principal can never reach the
+platform plane, and neither plane's credential or token is accepted by the
+other.
+
+Both planes write their authorization decisions to the one canonical audit
+path: `vala.audit_staging` in the deciding transaction, then `AuditPublisher`
+into `vala.system.audit_log`. A decision records the deciding principal's
+stored kind and, when its token was minted from a credential, that
+credential's non-secret id.
 
 #### Principal model
 

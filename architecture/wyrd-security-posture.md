@@ -39,15 +39,48 @@ controls required to operate those boundaries.
 
 ## Principal and credential lifecycle
 
-`Principal { id, kind, tenant_id, roles, effective_permissions }` is the only
-runtime identity. `PrincipalKind` is the closed set `User`, `Service`, `Agent`,
-and `System`; Service and Agent principals carry a server-verified `card_ref`.
-System is an internal, tenant-scoped machine principal with no Card, API key,
-refresh, role-grant, delegation, workload-binding, or public issuance path.
+Wyrd has two administration planes, and an identity belongs to exactly one.
+
+The **platform plane** operates the deployment: tenant lifecycle and recovery
+of a tenant's administration. Its principals live in `platform.principals`,
+carry no tenant, and are never implicitly authorized over a tenant's
+resources. The **tenant plane** operates one tenant's resources. Its
+principals live under `wyrd.*` behind RLS and can never reach the platform
+plane. Neither plane's credential or token is accepted by the other.
+
+`PrincipalKindTag` is the closed wire set shared by both planes:
+`global_admin`, `tenant_admin`, `user`, `service`, and `agent`. A platform
+principal is `global_admin` or `user`; a tenant principal is `tenant_admin`,
+`user`, `service`, or `agent`. The runtime `Principal { id, kind, tenant_id,
+roles, effective_permissions, credential_id }` carries the tenant-plane
+`PrincipalKind`, and `PlatformPrincipal { id, kind, effective_permissions,
+credential_id }` the tenantless platform identity.
+
+Card binding is a property of some machine principals, not a precondition for
+holding a credential. An `agent` principal always binds an Agent Card. A
+`service` principal binds a Service Card when it is a deployed workload and
+binds none when it is tenant automation created by a tenant administrator; a
+Card-free machine principal therefore carries no emit scope. `tenant_admin`,
+`global_admin`, and `user` never bind a Card — an administrative or human
+identity is not a registered AI-system component.
 
 Card-bound identities are provisioned idempotently by tenant, principal kind,
 Card kind, and Card UID. Re-applying a Card preserves the principal identity.
 Credential issuance is a separate privileged operation and is policy-gated.
+
+A tenant administrator is created once, during tenant provisioning, and is the
+tenant's headless root of trust: it holds credentials and roles, federates no
+identity by itself, and coexists with any human administrator the tenant later
+adds. A platform administrator is created once, during deployment
+initialization, and administration of the platform plane is available through
+its credential whether or not a platform OIDC connection exists.
+
+Every authorization decision records the deciding principal's stored kind and,
+when the presented token was minted from a credential, that credential's
+non-secret id. A principal may hold several credentials at once, so the
+credential id is what makes a decision attributable across a rotation; a
+federated session, a delegated token, and a refresh rotation name no
+credential.
 
 ### API keys
 
@@ -63,6 +96,11 @@ Credential issuance is a separate privileged operation and is policy-gated.
 - One principal may hold several simultaneously valid credentials. Revoking one
   retires that credential and advances the principal's authorization epoch; it
   leaves the principal, its grants, and its other credentials intact.
+- A platform session names the credential that minted it and re-reads that
+  credential on every request, so revoking a platform credential ends its live
+  sessions immediately without a separate epoch. A platform session
+  established by federated login names no credential; the principal itself is
+  the anchor, and suspending it ends those sessions on the next request.
 - API keys have an expiry, owner, creation audit event, use metadata, and
   revocation state. Rotation creates a new key, changes deployment secrets,
   verifies token exchange, and then revokes the old key.

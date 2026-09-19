@@ -103,25 +103,28 @@ impl RevocationCheck for SqlRevocationCheck {
                 id: principal,
             };
 
+            // Tenant admission is resolved on every request, outside the cache.
+            // Suspension has to stop the tokens a tenant already minted, not
+            // merely the next exchange, or an operator freezing a tenant would
+            // be waiting out every live token. Caching it would defeat both
+            // directions: a cached admission would admit the request after the
+            // suspension, and a cached refusal would outlive the resume. It is
+            // one indexed read per request against the same connection the
+            // epoch lookup would take.
+            let mut conn = TenantConn::acquire(&self.pool, *tenant)
+                .await
+                .map_err(|e| ResolveError::Unavailable(e.to_string()))?;
+            let admits = tenant_admits_credentials(&mut conn, *tenant)
+                .await
+                .map_err(|e| ResolveError::Unavailable(e.to_string()))?;
+            if !admits {
+                // Everything issued before now is invalid, exactly as the
+                // principal's own epoch would express it.
+                return Ok(Some(Utc::now()));
+            }
+
             self.cache
                 .try_get_with(key, async {
-                    let mut conn = TenantConn::acquire(&self.pool, *tenant)
-                        .await
-                        .map_err(|e| ResolveError::Unavailable(e.to_string()))?;
-                    // Suspension has to stop the tokens a tenant already
-                    // minted, not merely the next exchange, or an operator
-                    // freezing a tenant would be waiting out every live token.
-                    // This is the one place a token's continued validity is
-                    // resolved, so the tenant's admission belongs here rather
-                    // than in each handler: a tenant that no longer admits
-                    // credentials invalidates everything issued before now,
-                    // exactly as a principal's own epoch would.
-                    if !tenant_admits_credentials(&mut conn, *tenant)
-                        .await
-                        .map_err(|e| ResolveError::Unavailable(e.to_string()))?
-                    {
-                        return Ok(Some(Utc::now()));
-                    }
                     let id_uuid = principal.as_uuid();
                     let epoch =
                         match kind {

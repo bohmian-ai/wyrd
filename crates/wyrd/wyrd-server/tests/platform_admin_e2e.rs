@@ -2454,10 +2454,30 @@ async fn an_operator_suspends_and_resumes_a_tenant_through_the_platform_plane() 
         "inspection reads one tenant: {inspected}"
     );
 
-    // A token minted before the suspension is the interesting one.
+    // A token minted before the suspension is the interesting one. Use it once
+    // first: this server runs the production five-second epoch cache, so the
+    // priming request is what makes the next assertion meaningful — the
+    // suspension has to be visible to a request whose principal is already
+    // cached as admitted, not merely to a cold one.
     let live_token = tenant_token(&srv, &admin_credential)
         .await
         .expect("the tenant administers before suspension");
+    let primed = srv
+        .oneshot_authenticated(
+            &live_token,
+            tenant_request(
+                Method::POST,
+                "/v1/principals",
+                Some(json!({ "name": "before-suspension", "roles": ["reader"] })),
+            ),
+        )
+        .await
+        .expect("principal route responds");
+    assert_eq!(
+        primed.status(),
+        StatusCode::OK,
+        "the live token works, and the admission verdict is now cached"
+    );
 
     let suspend = async |status: &str| -> StatusCode {
         srv.oneshot(platform_request(
@@ -2494,7 +2514,8 @@ async fn an_operator_suspends_and_resumes_a_tenant_through_the_platform_plane() 
     assert_ne!(
         resp.status(),
         StatusCode::OK,
-        "a token minted before the suspension stops working too"
+        "a token minted before the suspension stops working too, on the very \
+         next request rather than after the epoch cache expires"
     );
 
     // Replaying the same transition changes nothing and says so.

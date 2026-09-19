@@ -16,6 +16,7 @@ pub mod client;
 pub mod config;
 pub mod error;
 pub mod global_config;
+pub mod principals;
 pub mod state;
 pub mod storage;
 pub mod transport;
@@ -23,6 +24,7 @@ pub mod transport;
 pub use bifrost::Bifrost;
 pub use client::WyrdClient;
 pub use global_config::GlobalConfig;
+pub use principals::Principals;
 
 /// Serializes tests that read or mutate process-global `WYRD_*`/`HOME`
 /// environment variables. `ClientConfig::from_env` and

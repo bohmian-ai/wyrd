@@ -27,16 +27,22 @@ curl -s http://localhost:8080/healthz   # -> ok
 curl -s http://localhost:8080/readyz     # -> readiness snapshot
 ```
 
-## Get an admin key
+## Initialize the deployment
 
-The client-only `wyrd` CLI does not provision databases or credentials. A
-fresh database has no credentials. Mint the first admin API key with the
-server-owned bootstrap command, then use it as a bearer token:
+The client-only `wyrd` CLI does not provision databases or credentials. A fresh
+database has no administrative identity at all. `wyrd-server init` creates the
+deployment's platform administrative principal and prints its credential once,
+to your terminal and never to the server log:
 
 ```bash
 mise exec -- cargo run -p wyrd-server -- init
-# wyrd_sk_acme_… (shown once)
+# wyrd_global_… (shown once, store it now)
 ```
+
+Re-running `init` refuses rather than minting a second root, and never
+re-displays the existing credential. The platform credential administers the
+platform plane — creating tenants, for instance — and each tenant gets its own
+`wyrd_sk_<tenant>_…` credential when you create it.
 
 Wyrd does not use the standard `Authorization` header. Exchange the key for an access token, then send it as `X-Wyrd-Access-Token`:
 

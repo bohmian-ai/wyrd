@@ -191,6 +191,6 @@ mod tests {
     fn request_id_keeps_v7_and_replaces_labels() {
         let id = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1bff";
         assert_eq!(audit_request_id(id).as_str(), id);
-        assert_ne!(audit_request_id("bootstrap-key").as_str(), "bootstrap-key");
+        assert_ne!(audit_request_id("not-a-uuid").as_str(), "not-a-uuid");
     }
 }

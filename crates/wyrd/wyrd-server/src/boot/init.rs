@@ -34,9 +34,6 @@ pub enum InitError {
     /// The deployment already has its administrative root.
     #[error("this deployment is already initialized")]
     AlreadyInitialized,
-    /// The platform control plane has no operator connection configured.
-    #[error("platform control plane is not configured; set the platform-admin DSN")]
-    NotConfigured,
     /// Credential issuance failed.
     #[error("initial credential could not be issued: {0}")]
     Credential(#[from] PlatformCredentialError),

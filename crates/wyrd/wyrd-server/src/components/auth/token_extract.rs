@@ -49,6 +49,22 @@ pub(crate) fn extract_wyrd_access_token(
     Ok(SecretString::from(token.to_owned()))
 }
 
+/// Read the tenant a token claims, before the token is verified, so the
+/// verifier can be asked about the right tenant.
+///
+/// A structurally broken token is the caller's mistake and says so. A
+/// well-formed JWT whose claims are not tenant access-token claims is a
+/// different thing: the clearest case is a platform session, which travels on
+/// this same header and names no tenant. That is not malformed input — it is a
+/// credential that confers no tenant access — so it is refused as
+/// unauthenticated, the same way the tenant plane refuses any token it will not
+/// accept. Reporting it as a format error would both misdescribe it and tell a
+/// caller which kind of token it holds.
+///
+/// # Errors
+/// Returns [`WyrdError::BadTokenFormat`] when the value is not a compact JWT
+/// with a base64 payload, and [`WyrdError::Unauthenticated`] when the payload
+/// carries no tenant access-token claims.
 pub(crate) fn tenant_from_unverified_access_token(
     token: &str,
 ) -> Result<DataTenantId, WyrdErrorResponse> {
@@ -56,8 +72,12 @@ pub(crate) fn tenant_from_unverified_access_token(
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload)
         .map_err(|_| bad_token_format())?;
-    let claims: AccessTokenClaims =
-        serde_json::from_slice(&bytes).map_err(|_| bad_token_format())?;
+    let claims: AccessTokenClaims = serde_json::from_slice(&bytes).map_err(|_| {
+        WyrdErrorResponse::from(WyrdError::Unauthenticated {
+            message: "token is not a tenant access token".to_owned(),
+            details: serde_json::json!({ "plane": "tenant" }),
+        })
+    })?;
     Ok(claims.principal.tenant_id)
 }
 

@@ -30,12 +30,19 @@ pub async fn insert_provisioning_tenant(
     slug: &str,
     display_name: &str,
 ) -> Result<TenantClaim, SqlError> {
-    // A failed provisioning is resumable, so its slug is adopted rather than
-    // refused. Without this a single failure would burn the slug permanently:
-    // the row exists, the insert conflicts, and every retry of the identical
-    // request reports the slug taken forever. Only a `failed` row is adopted —
-    // an `active`, `provisioning`, or `suspended` tenant is a genuine
-    // collision and still conflicts.
+    // An interrupted provisioning is resumable, so its slug is adopted rather
+    // than refused. Without this a single failure would burn the slug
+    // permanently: the row exists, the insert conflicts, and every retry of the
+    // identical request reports the slug taken forever.
+    //
+    // Two kinds of row are adopted. A `failed` row said so on its way out. A
+    // `provisioning` row that has not moved for fifteen minutes never got the
+    // chance — it was cancelled or its process died — and is the more common
+    // case, because that is exactly what an interrupted attempt leaves behind.
+    // The window is generous so a slow but live attempt is never stolen from;
+    // provisioning is a handful of writes and takes nothing like that long. An
+    // `active` or `suspended` tenant, and a `provisioning` row that is still
+    // moving, are genuine collisions and still conflict.
     let adopted = sqlx::query_scalar::<_, uuid::Uuid>(
         "INSERT INTO platform.tenants (data_tenant_id, slug, display_name, status)
          VALUES ($1, $2, $3, 'provisioning')
@@ -46,6 +53,8 @@ pub async fn insert_provisioning_tenant(
                 provisioning_failed_reason = NULL,
                 updated_at                = now()
           WHERE platform.tenants.status = 'failed'
+             OR (platform.tenants.status = 'provisioning'
+                 AND platform.tenants.updated_at < now() - interval '15 minutes')
          RETURNING data_tenant_id",
     )
     .bind(data_tenant_id.as_uuid())
@@ -66,7 +75,7 @@ pub async fn insert_provisioning_tenant(
     Ok(if claimed == data_tenant_id.as_uuid() {
         TenantClaim::Created
     } else {
-        TenantClaim::ResumedFailed(
+        TenantClaim::Resumed(
             DataTenantId::try_from(claimed).map_err(SqlError::InvalidDataTenantId)?,
         )
     })
@@ -81,8 +90,8 @@ pub async fn insert_provisioning_tenant(
 pub enum TenantClaim {
     /// A new tenant row was created under the caller's proposed id.
     Created,
-    /// A previously failed tenant was adopted; work continues under its id.
-    ResumedFailed(DataTenantId),
+    /// An interrupted tenant was adopted; work continues under its id.
+    Resumed(DataTenantId),
 }
 
 impl TenantClaim {
@@ -91,7 +100,7 @@ impl TenantClaim {
     pub fn tenant_id(self, proposed: DataTenantId) -> DataTenantId {
         match self {
             Self::Created => proposed,
-            Self::ResumedFailed(existing) => existing,
+            Self::Resumed(existing) => existing,
         }
     }
 }

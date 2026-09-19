@@ -168,15 +168,26 @@ impl TenantProvisioning {
 
         // From here the tenant exists but is not usable. Any failure marks it
         // failed rather than leaving a tenant that looks live with no way in.
-        match self
+        // Promotion is the last stage, so it is part of what can fail: a tenant
+        // whose rows exist but that never became active is as unusable as one
+        // that never got its administrator, and must be marked the same way.
+        let established = match self
             .establish_tenant_administration(data_tenant_id, caller.principal_id().as_uuid())
             .await
         {
+            Ok(admin) => match mark_tenant_active(&self.operator, data_tenant_id).await {
+                Ok(true) => Ok(admin),
+                Ok(false) => Err(ProvisionError::Store(
+                    "tenant left provisioning before it could be promoted".to_owned(),
+                )),
+                Err(error) => Err(ProvisionError::Store(error.to_string())),
+            },
+            Err(error) => Err(error),
+        };
+
+        let error = match established {
             Ok(admin) => {
-                mark_tenant_active(&self.operator, data_tenant_id)
-                    .await
-                    .map_err(|e| ProvisionError::Store(e.to_string()))?;
-                Ok(CreateTenantResponse {
+                return Ok(CreateTenantResponse {
                     tenant: ProvisionedTenant {
                         id: data_tenant_id,
                         slug: request.slug,
@@ -184,14 +195,23 @@ impl TenantProvisioning {
                         status: "active".to_owned(),
                     },
                     admin,
-                })
+                });
             }
-            Err(error) => {
-                let _ =
-                    mark_tenant_failed(&self.operator, data_tenant_id, &error.to_string()).await;
-                Err(error)
-            }
+            Err(error) => error,
+        };
+
+        // Marking the tenant failed is what makes the slug retryable, so
+        // failing to record it is surfaced rather than swallowed: the caller
+        // otherwise retries against a row that will not be adopted until it
+        // goes stale.
+        if let Err(mark) =
+            mark_tenant_failed(&self.operator, data_tenant_id, &error.to_string()).await
+        {
+            return Err(ProvisionError::Store(format!(
+                "{error}; the tenant could not be marked failed: {mark}"
+            )));
         }
+        Err(error)
     }
 
     /// List the tenant directory an operator administers.

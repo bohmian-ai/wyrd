@@ -2554,3 +2554,220 @@ async fn an_operator_suspends_and_resumes_a_tenant_through_the_platform_plane() 
         "the resumed tenant still has the administrative principal it started with"
     );
 }
+
+/// Provisioning survives a real stage failure, an abandoned attempt, and two
+/// callers racing for the same slug.
+///
+/// The earlier retry journey marks a *successful* tenant failed, which proves
+/// the adoption query but not the state machine. Here the failure is injected
+/// where it actually happens — the tenant-scoped write that creates the
+/// administrative principal — so the server's own error path is what marks the
+/// tenant failed. The abandoned case is the one an operator hits most: a
+/// cancelled request leaves a `provisioning` row nobody will finish, and
+/// without adoption that slug is burned forever. Every case ends the same way:
+/// one active tenant under the original id, one administrative principal, one
+/// usable credential.
+#[tokio::test]
+async fn interrupted_and_racing_provisioning_converge_on_one_tenant() {
+    if !e2e_enabled() {
+        return;
+    }
+    let srv = WyrdTestServer::start_in_process()
+        .await
+        .expect("server starts");
+    let root = initialize_platform_root(&srv.operator_pool())
+        .await
+        .expect("deployment initializes");
+    let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool opens");
+
+    // Fail exactly this slug's post-claim stage, and nothing else running
+    // alongside it: the guard names the tenant through the directory row the
+    // claim just wrote.
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION wyrd.injected_stage_failure() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+             IF EXISTS (
+                 SELECT 1 FROM platform.tenants
+                  WHERE data_tenant_id = NEW.data_tenant_id AND slug = 'interrupted'
+             ) THEN
+                 RAISE EXCEPTION 'injected stage failure';
+             END IF;
+             RETURN NEW;
+         END $$",
+    )
+    .execute(&superuser)
+    .await
+    .expect("the injection function is created");
+    sqlx::query(
+        "CREATE TRIGGER fail_stage BEFORE INSERT ON wyrd.auth_service_accounts
+         FOR EACH ROW EXECUTE FUNCTION wyrd.injected_stage_failure()",
+    )
+    .execute(&superuser)
+    .await
+    .expect("the injection trigger is installed");
+
+    let create = async |slug: &str| -> (StatusCode, Value) {
+        let resp = srv
+            .oneshot(platform_post(
+                "/platform/tenants",
+                &session,
+                json!({ "slug": slug, "display_name": slug }),
+            ))
+            .await
+            .expect("tenant route responds");
+        let status = resp.status();
+        (status, body_json(resp).await)
+    };
+
+    let (status, body) = create("interrupted").await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "a stage failure is not reported as a provisioned tenant: {body}"
+    );
+    assert!(
+        !body.to_string().contains("injected stage failure"),
+        "the served failure discloses nothing internal: {body}"
+    );
+
+    // The server marked it failed itself, which is what makes the slug
+    // retryable rather than burned.
+    let (claimed_id, claimed_status): (uuid::Uuid, String) = sqlx::query_as(
+        "SELECT data_tenant_id, status FROM platform.tenants WHERE slug = 'interrupted'",
+    )
+    .fetch_one(srv.operator_pool().pool())
+    .await
+    .expect("the claim survives the failure");
+    assert_eq!(
+        claimed_status, "failed",
+        "an interrupted attempt is left visibly incomplete"
+    );
+
+    sqlx::query("DROP TRIGGER fail_stage ON wyrd.auth_service_accounts")
+        .execute(&superuser)
+        .await
+        .expect("the injection is removed");
+    sqlx::query("DROP FUNCTION wyrd.injected_stage_failure()")
+        .execute(&superuser)
+        .await
+        .expect("the injection function is removed");
+
+    let (status, retried) = create("interrupted").await;
+    assert_eq!(status, StatusCode::OK, "the retry provisions: {retried}");
+    assert_eq!(
+        retried["tenant"]["id"].as_str().expect("tenant id"),
+        claimed_id.to_string(),
+        "the retry resumes the original tenant rather than orphaning its rows"
+    );
+    assert!(
+        tenant_token(
+            &srv,
+            retried["admin"]["credential"].as_str().expect("credential")
+        )
+        .await
+        .is_ok(),
+        "the resumed tenant's administrator authenticates"
+    );
+
+    // An abandoned attempt: the row a cancelled request leaves behind, aged
+    // past the window in which it could still be in flight.
+    let (status, abandoned) = create("cancelled").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the first attempt provisions: {abandoned}"
+    );
+    let abandoned_id = abandoned["tenant"]["id"]
+        .as_str()
+        .expect("tenant id")
+        .to_owned();
+    sqlx::query(
+        "UPDATE platform.tenants
+            SET status = 'provisioning', updated_at = now() - interval '1 hour'
+          WHERE slug = 'cancelled'",
+    )
+    .execute(srv.operator_pool().pool())
+    .await
+    .expect("the attempt is aged");
+
+    let (status, resumed) = create("cancelled").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an abandoned attempt does not burn its slug: {resumed}"
+    );
+    assert_eq!(
+        resumed["tenant"]["id"].as_str().expect("tenant id"),
+        abandoned_id,
+        "the resumed attempt keeps the original tenant id"
+    );
+
+    // A `provisioning` row that is still moving is a live attempt, not an
+    // abandoned one, and is refused rather than stolen.
+    sqlx::query("UPDATE platform.tenants SET status = 'provisioning', updated_at = now() WHERE slug = 'cancelled'")
+        .execute(srv.operator_pool().pool())
+        .await
+        .expect("the attempt is made current");
+    let (status, refused) = create("cancelled").await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "an attempt still in flight is not adopted: {refused}"
+    );
+    sqlx::query("UPDATE platform.tenants SET status = 'active' WHERE slug = 'cancelled'")
+        .execute(srv.operator_pool().pool())
+        .await
+        .expect("the attempt is restored");
+
+    // Two callers racing for one slug: one tenant, one winner.
+    let (first, second) = tokio::join!(create("raced"), create("raced"));
+    let statuses = [first.0, second.0];
+    assert_eq!(
+        statuses.iter().filter(|s| **s == StatusCode::OK).count(),
+        1,
+        "exactly one racing create provisions: {statuses:?}"
+    );
+    assert!(
+        statuses.contains(&StatusCode::CONFLICT),
+        "the loser is told the slug is taken: {statuses:?}"
+    );
+    let rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM platform.tenants WHERE slug = 'raced'")
+            .fetch_one(srv.operator_pool().pool())
+            .await
+            .expect("the directory is counted");
+    assert_eq!(rows, 1, "racing creates leave one directory row");
+
+    let winner = if first.0 == StatusCode::OK {
+        first.1
+    } else {
+        second.1
+    };
+    let principals: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM wyrd.auth_service_accounts WHERE data_tenant_id = $1::uuid",
+    )
+    .bind(
+        winner["tenant"]["id"]
+            .as_str()
+            .expect("tenant id")
+            .to_owned(),
+    )
+    .fetch_one(&superuser)
+    .await
+    .expect("the tenant's principals are counted");
+    assert_eq!(principals, 1, "the winner has one administrative principal");
+    assert!(
+        tenant_token(
+            &srv,
+            winner["admin"]["credential"].as_str().expect("credential")
+        )
+        .await
+        .is_ok(),
+        "the winner's credential is usable"
+    );
+}

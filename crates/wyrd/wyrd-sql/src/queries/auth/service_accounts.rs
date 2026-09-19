@@ -18,10 +18,9 @@ use crate::TenantConn;
 ///
 /// Containment relaxes *every* optional `CardRef` field, `space` included: a ref
 /// with no space matches a row in any space. What bounds this to one intended
-/// row is not the predicate but three facts outside it — the table's
-/// `UNIQUE (data_tenant_id, name)`, `auth_projection` keeping the `name` column
-/// equal to `card_ref->>'name'`, and every caller passing a fully qualified ref
-/// (`IssueKeyArgs::space` is required). `ORDER BY created_at, id LIMIT 1` exists
+/// row is not the predicate but two facts outside it — the table's
+/// `UNIQUE (data_tenant_id, name)` and `auth_projection` keeping the `name`
+/// column equal to `card_ref->>'name'`. `ORDER BY created_at, id LIMIT 1` exists
 /// because none of that chain is enforced here: relax the unique constraint,
 /// decouple the name projection, or add an optional `CardRef` field, and this
 /// predicate starts matching more rows on a credential-issuing path. The stable

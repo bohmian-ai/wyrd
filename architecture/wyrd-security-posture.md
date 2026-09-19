@@ -53,9 +53,14 @@ Credential issuance is a separate privileged operation and is policy-gated.
   credentials.
 - Plaintext is returned once. The server stores only a memory-hard password
   hash and non-secret lookup metadata.
-- API-key lookup enters a tenant-scoped transaction before credential
-  verification and returns one indistinguishable public error for every
-  invalid-key condition.
+- A credential's non-secret prefix resolves its owning principal before
+  verification — `wyrd_global_...` at platform scope, `wyrd_sk_<tenant>_...`
+  within a tenant, the latter entering a tenant-scoped transaction first. Every
+  invalid-credential condition performs exactly one verification and returns
+  one indistinguishable public error.
+- One principal may hold several simultaneously valid credentials. Revoking one
+  retires that credential and advances the principal's authorization epoch; it
+  leaves the principal, its grants, and its other credentials intact.
 - API keys have an expiry, owner, creation audit event, use metadata, and
   revocation state. Rotation creates a new key, changes deployment secrets,
   verifies token exchange, and then revokes the old key.
@@ -95,6 +100,14 @@ Credential issuance is a separate privileged operation and is policy-gated.
 - External federation accepts tokens only from an explicitly configured
   issuer, audience, algorithm, and claim mapping. OIDC discovery does not make
   an issuer trusted.
+- A connection is selected by the login entry point, never by a token, header,
+  hostname, or post-login chooser. A tenant entry resolves only that tenant's
+  connection; the deployment's single platform-scope connection resolves only
+  platform principals pre-registered against an expected issuer and claim and
+  pinned on `(issuer, subject)` at first login. An unknown platform subject is
+  denied and never provisioned just in time, and the platform connection's
+  absence or outage never blocks administration through the global
+  administrative credential.
 - Unknown issuers, unknown keys after one bounded refresh, unavailable JWKS,
   invalid claims, and ambiguous claim mappings fail authentication.
 

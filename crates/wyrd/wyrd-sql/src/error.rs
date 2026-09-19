@@ -201,7 +201,7 @@ pub enum SqlError {
 }
 
 impl SqlError {
-    /// Wrap an [`IdError`] as an [`SqlError::InvariantViolation`].
+    /// Wrap an [`wyrd_spec::ids::IdError`] as an [`SqlError::InvariantViolation`].
     pub fn from_id_error(e: wyrd_spec::ids::IdError) -> Self {
         Self::InvariantViolation {
             detail: format!("id validation failed: {e}"),

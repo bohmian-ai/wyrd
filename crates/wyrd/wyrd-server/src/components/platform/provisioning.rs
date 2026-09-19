@@ -60,6 +60,12 @@ pub enum ProvisionError {
     /// Authorization could not be recorded, so provisioning did not proceed.
     #[error("provisioning could not be audited: {0}")]
     AuditUnavailable(String),
+    /// The named tenant is not one that may be acted on: it does not exist,
+    /// is soft-deleted, or is in a lifecycle state other than active. The
+    /// causes deliberately share one variant so a refusal cannot be used to
+    /// discover which tenants exist.
+    #[error("no active tenant to act on")]
+    TenantUnavailable,
     /// A store write failed; the tenant is left visibly incomplete.
     #[error("tenant provisioning failed: {0}")]
     Store(String),

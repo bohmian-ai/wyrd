@@ -19,6 +19,7 @@ use wyrd_runtime::Permission;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, ProvisionedTenantAdmin, SecretBearer};
 use wyrd_sql::queries::auth::{insert_api_key, tenant_admin_principal_id};
+use wyrd_sql::queries::platform::tenants::tenant_by_id;
 use wyrd_sql::{OperatorPool, WyrdPostgres};
 
 use crate::components::auth::PlatformCaller;
@@ -67,8 +68,9 @@ impl TenantRecovery {
     /// Returns [`ProvisionError::Denied`] when the caller lacks the recovery
     /// permission, [`ProvisionError::AuditUnavailable`] when the decision
     /// cannot be recorded — in which case no credential is issued — and
-    /// [`ProvisionError::Store`] when the tenant has no administrative
-    /// principal or a write fails.
+    /// [`ProvisionError::TenantUnavailable`] when the platform directory holds
+    /// no active row for `tenant_id`, and [`ProvisionError::Store`] when the
+    /// tenant has no administrative principal or a write fails.
     #[tracing::instrument(level = "info", skip(self, caller), fields(tenant = %tenant_id), err)]
     pub async fn recover(
         &self,
@@ -90,6 +92,18 @@ impl TenantRecovery {
             .commit()
             .await
             .map_err(|e| ProvisionError::Store(e.to_string()))?;
+
+        // The tenant directory decides whether this tenant may be acted on at
+        // all, and it is read on the platform boundary this call already owns.
+        // A provisioning, failed, suspended, or soft-deleted tenant must not
+        // acquire a new durable secret: recovery would hand out a working key
+        // into state the deployment has deliberately frozen or abandoned.
+        let directory = tenant_by_id(&self.operator, tenant_id)
+            .await
+            .map_err(|e| ProvisionError::Store(e.to_string()))?;
+        if !directory.is_some_and(|row| row.status == "active") {
+            return Err(ProvisionError::TenantUnavailable);
+        }
 
         let mut conn = self
             .postgres

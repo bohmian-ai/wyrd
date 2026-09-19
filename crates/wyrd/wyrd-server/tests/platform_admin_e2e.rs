@@ -2032,3 +2032,344 @@ async fn a_tenant_revokes_a_compromised_principal_with_its_reason() {
         "the refused attempt recorded the kind its caller declared: {decisions:?}"
     );
 }
+
+/// Recovery is refused for every tenant state but `active`, and the refusal
+/// costs the tenant nothing.
+///
+/// Recovery is the one path that mints a durable secret into a tenant from
+/// outside it, so the directory state is the gate: a provisioning, failed,
+/// suspended, or soft-deleted tenant must not acquire a working key into state
+/// the deployment has frozen or abandoned. Every refusal shares one
+/// non-enumerating shape, and each is checked against the credential count so
+/// a refusal that still wrote is caught. The active case closes the loop:
+/// the same principal comes back and its grants still administer the tenant.
+#[tokio::test]
+async fn recovery_is_refused_for_every_state_but_active() {
+    if !e2e_enabled() {
+        return;
+    }
+    let srv = WyrdTestServer::start_in_process()
+        .await
+        .expect("server starts");
+    let root = initialize_platform_root(&srv.operator_pool())
+        .await
+        .expect("deployment initializes");
+    let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
+
+    let created = body_json(
+        srv.oneshot(platform_post(
+            "/platform/tenants",
+            &session,
+            json!({ "slug": "frozen", "display_name": "Frozen" }),
+        ))
+        .await
+        .expect("tenant route responds"),
+    )
+    .await;
+    let tenant_id = created["tenant"]["id"]
+        .as_str()
+        .expect("tenant id")
+        .to_owned();
+    let original_principal = created["admin"]["principal_id"]
+        .as_str()
+        .expect("principal id")
+        .to_owned();
+
+    // Read past RLS on purpose: the assertion is that no durable secret was
+    // written, which no tenant-plane route projects while the tenant is frozen.
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool opens");
+    let credentials = async |tenant: &str| -> i64 {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM wyrd.auth_api_keys WHERE data_tenant_id = $1::uuid",
+        )
+        .bind(tenant.to_owned())
+        .fetch_one(&superuser)
+        .await
+        .expect("credentials are counted")
+    };
+    let before = credentials(&tenant_id).await;
+
+    for state in ["provisioning", "suspended", "failed", "deleted"] {
+        sqlx::query(
+            "UPDATE platform.tenants \
+               SET status = $1, \
+                   provisioning_failed_reason = CASE WHEN $1 = 'failed' THEN 'injected' END \
+             WHERE data_tenant_id = $2::uuid",
+        )
+        .bind(state)
+        .bind(tenant_id.clone())
+        .execute(srv.operator_pool().pool())
+        .await
+        .expect("the directory state is set");
+
+        let resp = srv
+            .oneshot(platform_post(
+                "/platform/tenants/admin/credentials",
+                &session,
+                json!({ "tenant_id": tenant_id }),
+            ))
+            .await
+            .expect("recovery route responds");
+        let status = resp.status();
+        let body = body_json(resp).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a {state} tenant is refused recovery: {body}"
+        );
+        assert!(
+            !body.to_string().contains(state),
+            "the refusal does not disclose which state it is: {body}"
+        );
+        assert_eq!(
+            credentials(&tenant_id).await,
+            before,
+            "a refused recovery writes no credential for a {state} tenant"
+        );
+    }
+
+    // Restored to active, the same principal is recovered and still administers.
+    sqlx::query(
+        "UPDATE platform.tenants \
+           SET status = 'active', provisioning_failed_reason = NULL \
+         WHERE data_tenant_id = $1::uuid",
+    )
+    .bind(tenant_id.clone())
+    .execute(srv.operator_pool().pool())
+    .await
+    .expect("the directory state is restored");
+
+    let resp = srv
+        .oneshot(platform_post(
+            "/platform/tenants/admin/credentials",
+            &session,
+            json!({ "tenant_id": tenant_id }),
+        ))
+        .await
+        .expect("recovery route responds");
+    let status = resp.status();
+    let recovered = body_json(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an active tenant recovers: {recovered}"
+    );
+    assert_eq!(
+        recovered["principal_id"].as_str().expect("principal id"),
+        original_principal,
+        "recovery restores the existing principal rather than creating a second"
+    );
+
+    let token = tenant_token(&srv, recovered["credential"].as_str().expect("credential"))
+        .await
+        .expect("the replacement credential exchanges");
+    let resp = srv
+        .oneshot_authenticated(
+            &token,
+            tenant_request(
+                Method::POST,
+                "/v1/principals",
+                Some(json!({ "name": "post-recovery", "roles": ["reader"] })),
+            ),
+        )
+        .await
+        .expect("principal route responds");
+    let status = resp.status();
+    let body = body_json(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the recovered principal keeps the grants it had: {body}"
+    );
+}
+
+/// One tenant's administrator cannot reach another tenant's identities, and
+/// learns nothing about them from the refusal.
+///
+/// Row-level security and composite keys make the isolation true in the store;
+/// this drives it through the served product path, which is where a real caller
+/// would discover a leak. Every attempt names a real principal and credential
+/// belonging to the other tenant, so a refusal proves isolation rather than a
+/// bad identifier. The refusals are `404`, not `403`: a `403` would confirm the
+/// target exists.
+#[tokio::test]
+async fn one_tenant_cannot_reach_another_tenants_identities() {
+    if !e2e_enabled() {
+        return;
+    }
+    let srv = WyrdTestServer::start_in_process()
+        .await
+        .expect("server starts");
+    let root = initialize_platform_root(&srv.operator_pool())
+        .await
+        .expect("deployment initializes");
+    let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
+
+    let provision = async |slug: &str| -> Value {
+        body_json(
+            srv.oneshot(platform_post(
+                "/platform/tenants",
+                &session,
+                json!({ "slug": slug, "display_name": slug }),
+            ))
+            .await
+            .expect("tenant route responds"),
+        )
+        .await
+    };
+    let alpha = provision("isolation-alpha").await;
+    let beta = provision("isolation-beta").await;
+
+    let alpha_admin = tenant_token(
+        &srv,
+        alpha["admin"]["credential"].as_str().expect("credential"),
+    )
+    .await
+    .expect("tenant alpha administers");
+    let beta_admin = tenant_token(
+        &srv,
+        beta["admin"]["credential"].as_str().expect("credential"),
+    )
+    .await
+    .expect("tenant beta administers");
+
+    // Tenant beta owns a principal with a live credential, which alpha will
+    // name directly in every attempt below.
+    let created = body_json(
+        srv.oneshot_authenticated(
+            &beta_admin,
+            tenant_request(
+                Method::POST,
+                "/v1/principals",
+                Some(json!({ "name": "beta-runner", "roles": ["reader"] })),
+            ),
+        )
+        .await
+        .expect("principal route responds"),
+    )
+    .await;
+    let target = created["principal_id"]
+        .as_str()
+        .expect("principal id")
+        .to_owned();
+    let target_credential = created["credential"]
+        .as_str()
+        .expect("credential")
+        .to_owned();
+    let listed = body_json(
+        srv.oneshot_authenticated(
+            &beta_admin,
+            tenant_request(
+                Method::GET,
+                &format!("/v1/principals/{target}/credentials"),
+                None,
+            ),
+        )
+        .await
+        .expect("credential listing responds"),
+    )
+    .await;
+    let target_credential_id = listed["credentials"][0]["id"]
+        .as_str()
+        .expect("credential id")
+        .to_owned();
+
+    let attempts: Vec<(&str, Request<Body>)> = vec![
+        (
+            "list credentials",
+            tenant_request(
+                Method::GET,
+                &format!("/v1/principals/{target}/credentials"),
+                None,
+            ),
+        ),
+        (
+            "issue a credential",
+            tenant_request(
+                Method::POST,
+                &format!("/v1/principals/{target}/credentials"),
+                Some(json!({})),
+            ),
+        ),
+        (
+            "revoke a credential",
+            tenant_request(
+                Method::DELETE,
+                &format!("/v1/principals/{target}/credentials/{target_credential_id}"),
+                None,
+            ),
+        ),
+        (
+            "revoke the principal",
+            tenant_request(
+                Method::POST,
+                &format!("/v1/principals/{target}/revoke"),
+                Some(json!({ "principal_kind": "service", "reason": "cross-tenant attempt" })),
+            ),
+        ),
+    ];
+    for (what, request) in attempts {
+        let resp = srv
+            .oneshot_authenticated(&alpha_admin, request)
+            .await
+            .expect("route responds");
+        let status = resp.status();
+        let body = body_json(resp).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "tenant alpha cannot {what} in tenant beta: {body}"
+        );
+        assert!(
+            !body.to_string().contains("beta-runner"),
+            "the refusal discloses nothing about the target: {body}"
+        );
+    }
+
+    // Beta's credential still authenticates as beta, and does so as beta only:
+    // none of the attempts above disturbed it.
+    let beta_runner = tenant_token(&srv, &target_credential)
+        .await
+        .expect("the target credential still exchanges");
+    let resp = srv
+        .oneshot_authenticated(
+            &beta_runner,
+            tenant_request(
+                Method::POST,
+                "/v1/principals",
+                Some(json!({ "name": "escalated", "roles": ["admin"] })),
+            ),
+        )
+        .await
+        .expect("principal route responds");
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a reader in beta administers neither tenant"
+    );
+
+    // Recovery is a platform capability, so a tenant administrator cannot use
+    // it against any tenant, its own included.
+    for (what, tenant) in [("its own", &alpha), ("another", &beta)] {
+        let resp = srv
+            .oneshot_authenticated(
+                &alpha_admin,
+                tenant_request(
+                    Method::POST,
+                    "/platform/tenants/admin/credentials",
+                    Some(json!({ "tenant_id": tenant["tenant"]["id"] })),
+                ),
+            )
+            .await
+            .expect("recovery route responds");
+        assert!(
+            resp.status() == StatusCode::UNAUTHORIZED || resp.status() == StatusCode::FORBIDDEN,
+            "a tenant administrator cannot recover {what} tenant: {}",
+            resp.status()
+        );
+    }
+}

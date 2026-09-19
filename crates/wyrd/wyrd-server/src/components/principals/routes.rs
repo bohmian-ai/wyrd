@@ -30,7 +30,7 @@ use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
     ApiKeyMetadataRow, credential_belongs_to, grant_role_to_service_account, insert_api_key,
     insert_service_account, list_api_key_metadata, revoke_api_key,
-    revoke_service_account_principal, role_by_name, service_account_by_id,
+    revoke_service_account_principal, role_by_name, service_account_by_id, user_by_id,
 };
 
 use crate::audit;
@@ -162,11 +162,45 @@ async fn tenant_conn<'a>(
 ///
 /// # Errors
 /// Returns an internal error when hashing or the insert fails.
+/// Refuse a principal id that names nothing in this caller's tenant.
+///
+/// Row-level security already keeps a foreign principal's rows unreachable, but
+/// unreachable is not the same as refused: without this, listing a foreign
+/// principal answers with an empty page and issuing for one writes a credential
+/// against an id the tenant does not own. Both surfaces route through here so
+/// they give one answer, and it is the same non-enumerating `404` a genuinely
+/// unknown id gets — a caller cannot tell the two apart, which is the point.
+///
+/// # Errors
+/// Returns [`WyrdError::PrincipalNotFound`] when neither a service-kind nor a
+/// user principal with this id exists in the tenant, or an internal error when
+/// a lookup fails.
+async fn require_principal(conn: &mut TenantConn<'_>, principal_id: Uuid) -> Result<(), WyrdError> {
+    let exists = service_account_by_id(conn, principal_id)
+        .await
+        .map_err(|error| WyrdError::from(internal(error)))?
+        .is_some()
+        || user_by_id(conn, principal_id)
+            .await
+            .map_err(|error| WyrdError::from(internal(error)))?
+            .is_some();
+    if exists {
+        return Ok(());
+    }
+    Err(WyrdError::PrincipalNotFound {
+        message: "principal not found in this tenant".to_owned(),
+        details: serde_json::json!({ "id": principal_id.to_string() }),
+    })
+}
+
 async fn mint_credential(
     conn: &mut TenantConn<'_>,
     principal_id: Uuid,
     created_by: Uuid,
 ) -> Result<IssuedCredential, WyrdErrorResponse> {
+    require_principal(conn, principal_id)
+        .await
+        .map_err(WyrdErrorResponse::from)?;
     let plaintext = WyrdApiKey::generate(conn.data_tenant_id());
     let raw = plaintext.secret.clone();
     let key_hash = tokio::task::spawn_blocking(move || wyrd_auth_issue::hash_api_key(&raw))
@@ -361,6 +395,7 @@ pub(crate) async fn list_credentials_for(
     )
     .await
     .map_err(WyrdError::from)?;
+    require_principal(&mut conn, principal_id).await?;
     let rows = list_api_key_metadata(&mut conn, principal_id)
         .await
         .map_err(|error| WyrdError::from(internal(error)))?;

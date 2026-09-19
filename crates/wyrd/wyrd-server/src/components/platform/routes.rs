@@ -22,7 +22,7 @@ use wyrd_spec::auth::{
     CreateTenantRequest, CreateTenantResponse, PlatformTokenRequest, PlatformTokenResponse,
     ProvisionedTenantAdmin, RecoverTenantAdminRequest,
 };
-use wyrd_spec::error::WyrdError;
+use wyrd_spec::error::{WyrdError, WyrdProblem};
 
 use crate::components::auth::PlatformCaller;
 use crate::components::platform::provisioning::{ProvisionError, TenantProvisioning};
@@ -67,7 +67,7 @@ pub fn platform_auth_router() -> Router<AppState> {
     request_body = PlatformTokenRequest,
     responses(
         (status = 200, description = "Short-lived platform session", body = PlatformTokenResponse),
-        (status = 401, description = "Credential rejected, indistinguishably for every cause")
+        (status = 401, description = "Credential rejected, indistinguishably for every cause", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -116,8 +116,9 @@ async fn platform_token(
     responses(
         (status = 200, description = "Replacement credential for the tenant's existing administrator",
          body = ProvisionedTenantAdmin),
-        (status = 401, description = "Platform session required"),
-        (status = 403, description = "Tenant administrative recovery not granted")
+        (status = 401, description = "Platform session required", body = WyrdProblem),
+        (status = 403, description = "Tenant administrative recovery not granted", body = WyrdProblem),
+        (status = 404, description = "No active tenant to recover, indistinguishably for every cause", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -159,9 +160,9 @@ fn not_configured() -> WyrdErrorResponse {
     responses(
         (status = 200, description = "Provisioned tenant and its one-time administrative credential",
          body = CreateTenantResponse),
-        (status = 401, description = "Platform session required"),
-        (status = 403, description = "Tenant creation not granted"),
-        (status = 409, description = "Slug already in use by a live tenant")
+        (status = 401, description = "Platform session required", body = WyrdProblem),
+        (status = 403, description = "Tenant creation not granted", body = WyrdProblem),
+        (status = 409, description = "Slug already in use by a live tenant", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -197,6 +198,10 @@ fn provision_error(error: ProvisionError) -> WyrdErrorResponse {
         ProvisionError::SlugTaken => WyrdErrorResponse::from(WyrdError::Conflict {
             message: "tenant slug is already in use".to_owned(),
             details: serde_json::json!({ "field": "slug" }),
+        }),
+        ProvisionError::TenantUnavailable => WyrdErrorResponse::from(WyrdError::NotFound {
+            message: "no active tenant to act on".to_owned(),
+            details: serde_json::json!({ "resource": "tenant" }),
         }),
         ProvisionError::AuditUnavailable(reason) | ProvisionError::Store(reason) => {
             WyrdErrorResponse::from(internal_failure("tenant provisioning failed", &reason))

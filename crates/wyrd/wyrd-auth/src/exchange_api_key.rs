@@ -20,7 +20,8 @@ use wyrd_spec::vala::audit_detail::CardScopeMintKind;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
     ApiKeyStatus, api_key_by_prefix, api_key_status_by_prefix, insert_refresh_token,
-    list_service_account_roles, service_account_by_id, touch_api_key_last_used,
+    insert_refresh_token_rotated, list_service_account_roles, service_account_by_id,
+    touch_api_key_last_used,
 };
 use wyrd_sql::queries::platform::tenant_resolver::tenant_admits_credentials;
 
@@ -133,6 +134,11 @@ impl ExchangedToken {
 pub(crate) enum RefreshPolicy {
     /// Issue and persist a refresh token (API-key exchange, human login).
     Mint,
+    /// Issue and persist a refresh token that supersedes the one named here.
+    ///
+    /// The back-link is what makes reuse of the consumed token detectable: the
+    /// family can be revoked wholesale when a rotated token reappears.
+    Rotate(Uuid),
     /// Access token only; no refresh token is issued or stored.
     Skip,
 }
@@ -418,27 +424,15 @@ async fn issue_cardless_subject(
         settings.access_ttl,
     )?;
 
-    let refresh_token = match refresh {
-        RefreshPolicy::Mint => {
-            let token = issuing_key.issue_refresh_token(
-                wire,
-                id,
-                conn.data_tenant_id(),
-                settings.refresh_ttl,
-            )?;
-            insert_refresh_token(
-                conn,
-                Uuid::new_v4(),
-                &principal_kind,
-                principal_id,
-                &token_hash(&token),
-                Utc::now() + settings.refresh_ttl,
-            )
-            .await?;
-            Some(SecretString::from(token))
-        }
-        RefreshPolicy::Skip => None,
-    };
+    let refresh_token = store_refresh_token(
+        conn,
+        issuing_key,
+        settings,
+        principal_id,
+        &principal_kind,
+        refresh,
+    )
+    .await?;
 
     Ok(ExchangedToken {
         access_token: SecretString::from(access_token),
@@ -446,6 +440,66 @@ async fn issue_cardless_subject(
         token_type: TokenType::Bearer,
         expires_at: Utc::now() + settings.access_ttl,
     })
+}
+
+/// Mint and store the refresh token `refresh` calls for, if any.
+///
+/// Both issuance shapes — Card-bound and Card-free — ask the same question, and
+/// the only difference between minting and rotating is the back-link to the
+/// token being superseded. Keeping that in one place is what stops a rotation
+/// from silently losing its `rotated_from` and with it reuse detection.
+///
+/// # Errors
+/// Returns [`IssueOrSqlError::Issue`] when signing fails and
+/// [`IssueOrSqlError::Sql`] when the row cannot be stored.
+async fn store_refresh_token(
+    conn: &mut TenantConn<'_>,
+    issuing_key: &IssuingKey,
+    settings: &TokenExchangeSettings,
+    principal_id: Uuid,
+    principal_kind: &str,
+    refresh: RefreshPolicy,
+) -> Result<Option<SecretString>, IssueOrSqlError> {
+    let rotated_from = match refresh {
+        RefreshPolicy::Skip => return Ok(None),
+        RefreshPolicy::Mint => None,
+        RefreshPolicy::Rotate(predecessor) => Some(predecessor),
+    };
+    let wire = principal_kind_wire(principal_kind).ok_or(IssueError::InvalidPrincipalKind)?;
+    let token = issuing_key.issue_refresh_token(
+        wire,
+        PrincipalId::new(principal_id),
+        conn.data_tenant_id(),
+        settings.refresh_ttl,
+    )?;
+    let hash = token_hash(&token);
+    let expires_at = Utc::now() + settings.refresh_ttl;
+    match rotated_from {
+        Some(predecessor) => {
+            insert_refresh_token_rotated(
+                conn,
+                Uuid::new_v4(),
+                principal_kind,
+                principal_id,
+                &hash,
+                expires_at,
+                predecessor,
+            )
+            .await?;
+        }
+        None => {
+            insert_refresh_token(
+                conn,
+                Uuid::new_v4(),
+                principal_kind,
+                principal_id,
+                &hash,
+                expires_at,
+            )
+            .await?;
+        }
+    }
+    Ok(Some(SecretString::from(token)))
 }
 
 /// Issue an access token, optional refresh token, and scope-mint audit for a principal.
@@ -497,27 +551,15 @@ pub(crate) async fn issue_for_subject(
             .map_err(|error| issue_or_wyrd_error(error, &card_ref))?,
         _ => return Err(IssueOrSqlError::Issue(IssueError::InvalidPrincipalKind)),
     };
-    let refresh_token = match refresh {
-        RefreshPolicy::Mint => {
-            let token = issuing_key.issue_refresh_token(
-                principal_kind_wire(&principal_kind).ok_or(IssueError::InvalidPrincipalKind)?,
-                id,
-                conn.data_tenant_id(),
-                settings.refresh_ttl,
-            )?;
-            insert_refresh_token(
-                conn,
-                Uuid::new_v4(),
-                &principal_kind,
-                principal_id,
-                &token_hash(&token),
-                Utc::now() + settings.refresh_ttl,
-            )
-            .await?;
-            Some(SecretString::from(token))
-        }
-        RefreshPolicy::Skip => None,
-    };
+    let refresh_token = store_refresh_token(
+        conn,
+        issuing_key,
+        settings,
+        principal_id,
+        &principal_kind,
+        refresh,
+    )
+    .await?;
     let expires_at = Utc::now() + settings.access_ttl;
     write_scope_mint_success_audit(
         conn,

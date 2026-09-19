@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use base64::Engine;
-use chrono::Utc;
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::json;
 use uuid::Uuid;
@@ -11,14 +10,12 @@ use wyrd_auth_issue::{IssueError, IssuingKey};
 use wyrd_auth_verify::RefreshTokenClaims;
 use wyrd_runtime::{PrincipalId, RoleRef};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::TokenType;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
-    consume_active_refresh, insert_refresh_token_rotated, list_service_account_roles,
-    refresh_by_hash, revoke_refresh_family, service_account_by_id,
+    consume_active_refresh, list_service_account_roles, refresh_by_hash, revoke_refresh_family,
+    service_account_by_id,
 };
 
 use crate::audit::{
@@ -26,13 +23,10 @@ use crate::audit::{
     principal_kind_tag,
 };
 
-use crate::card_scope::{
-    IssueErrorOrWyrd, MINT_KIND_REFRESH, issue_scope_error, resolve_card_ref_scope,
-    write_scope_mint_success_audit,
-};
+use crate::card_scope::MINT_KIND_REFRESH;
 use crate::exchange_api_key::{
-    ExchangedToken, IssueOrSqlError, TokenExchangeSettings, principal_kind_wire, role_refs,
-    token_hash,
+    ExchangedToken, IssueOrSqlError, IssueSubject, RefreshPolicy, TokenExchangeSettings,
+    issue_for_subject, role_refs, token_hash,
 };
 
 /// Refresh-token rotation service.
@@ -127,8 +121,11 @@ impl RefreshTokens {
                 let principal_kind = active.principal_kind.clone();
 
                 let exchanged = match principal_kind.as_str() {
-                    "service" | "agent" => {
-                        self.issue_rotated_for_service_principal(
+                    // A Card-free tenant administrator rotates through the same
+                    // owner as a Card-bound workload. It was excluded before, so
+                    // the refresh token its API-key exchange returns always failed.
+                    "service" | "agent" | "tenant_admin" => {
+                        self.rotate_stored_principal(
                             conn,
                             principal_id,
                             &principal_kind,
@@ -227,13 +224,20 @@ impl RefreshTokens {
         }
     }
 
-    /// Issue a new access+refresh pair for a service or agent principal and
-    /// insert the successor refresh token row with a `rotated_from` back-link.
+    /// Issue the successor access+refresh pair for a stored principal.
     ///
-    /// This intentionally does NOT call `issue_for_subject`, which inserts via
-    /// `insert_refresh_token` (no `rotated_from`). The rotation path must use
-    /// `insert_refresh_token_rotated` to preserve the chain.
-    async fn issue_rotated_for_service_principal(
+    /// The subject is re-read from the durable row rather than trusted from the
+    /// consumed token, so a principal whose roles or Card binding changed since
+    /// the last exchange rotates under its current state. Issuance itself is the
+    /// same owner the initial API-key exchange uses; this path only supplies the
+    /// `rotated_from` back-link that keeps the family chain — and therefore reuse
+    /// detection — intact.
+    ///
+    /// # Errors
+    /// Returns [`RefreshError::Database`] when the principal row or its roles
+    /// cannot be read, and [`RefreshError::Issue`] when the principal has
+    /// disappeared, carries an unusable role, or cannot be issued for.
+    async fn rotate_stored_principal(
         &self,
         conn: &mut TenantConn<'_>,
         principal_id: Uuid,
@@ -241,12 +245,12 @@ impl RefreshTokens {
         rotated_from: Uuid,
         request_id: &str,
     ) -> Result<ExchangedToken, RefreshError> {
-        let sa = service_account_by_id(conn, principal_id)
+        let stored = service_account_by_id(conn, principal_id)
             .await?
             .ok_or_else(|| {
                 tracing::warn!(
                     principal_id = %principal_id,
-                    "service account missing during refresh rotation"
+                    "principal missing during refresh rotation"
                 );
                 sqlx::Error::RowNotFound
             })?;
@@ -254,96 +258,22 @@ impl RefreshTokens {
         let roles: Vec<RoleRef> = role_refs(list_service_account_roles(conn, principal_id).await?)
             .map_err(|_| RefreshError::Issue(IssueError::InvalidPrincipalKind))?;
 
-        let pid = PrincipalId::new(principal_id);
-        let tenant_id = conn.data_tenant_id();
-        let card_ref = sa
-            .card_ref
-            .map(|card_ref| card_ref.0)
-            .ok_or(RefreshError::Issue(IssueError::InvalidPrincipalKind))?;
-        let card_ref_scope = resolve_card_ref_scope(conn, &card_ref).await?;
-
-        let access_token = match principal_kind {
-            "service" => self
-                .issuing_key
-                .issue_service_access_token(
-                    pid,
-                    tenant_id,
-                    card_ref.clone(),
-                    card_ref_scope.clone(),
-                    roles.clone(),
-                    self.settings.access_ttl,
-                )
-                .map_err(|e| map_refresh_issue_error(e, &card_ref))?,
-            "agent" => self
-                .issuing_key
-                .issue_agent_access_token(
-                    pid,
-                    tenant_id,
-                    card_ref.clone(),
-                    card_ref_scope.clone(),
-                    roles.clone(),
-                    self.settings.access_ttl,
-                )
-                .map_err(|e| map_refresh_issue_error(e, &card_ref))?,
-            _ => return Err(RefreshError::Issue(IssueError::InvalidPrincipalKind)),
-        };
-
-        let kind_wire = principal_kind_wire(principal_kind)
-            .ok_or(RefreshError::Issue(IssueError::InvalidPrincipalKind))?;
-
-        let refresh_token = self.issuing_key.issue_refresh_token(
-            kind_wire,
-            pid,
-            tenant_id,
-            self.settings.refresh_ttl,
-        )?;
-
-        let expires_at = Utc::now() + self.settings.access_ttl;
-        let refresh_expires_at = Utc::now() + self.settings.refresh_ttl;
-        let new_refresh_hash = token_hash(&refresh_token);
-
-        // Insert the successor token with the rotated_from back-link.
-        // The predecessor was already atomically revoked by consume_active_refresh.
-        insert_refresh_token_rotated(
+        issue_for_subject(
             conn,
-            Uuid::new_v4(),
-            principal_kind,
-            principal_id,
-            &new_refresh_hash,
-            refresh_expires_at,
-            rotated_from,
-        )
-        .await?;
-
-        write_scope_mint_success_audit(
-            conn,
-            principal_id,
-            &card_ref,
-            &card_ref_scope,
+            &self.issuing_key,
+            &self.settings,
+            IssueSubject {
+                principal_id,
+                principal_kind: principal_kind.to_owned(),
+                card_ref: stored.card_ref.map(|card_ref| card_ref.0),
+                roles,
+            },
+            RefreshPolicy::Rotate(rotated_from),
             request_id,
             MINT_KIND_REFRESH,
         )
-        .await?;
-
-        Ok(ExchangedToken {
-            access_token: SecretString::from(access_token),
-            refresh_token: Some(SecretString::from(refresh_token)),
-            token_type: TokenType::Bearer,
-            expires_at,
-        })
-    }
-}
-
-/// Convert a card-bound issuer error into the refresh error channel.
-///
-/// Routes `IssueError::CardScopeTooLarge` through `issue_scope_error` so that
-/// the resulting `WyrdError::CardScopeTooLarge` always carries `scope_mint_root`
-/// in its details, enabling `scope_failure_root` to extract the root for the
-/// audit failure write.
-fn map_refresh_issue_error(error: IssueError, root: &CardRef) -> RefreshError {
-    match issue_scope_error(error, root) {
-        IssueErrorOrWyrd::Issue(e) => RefreshError::Issue(e),
-        IssueErrorOrWyrd::Wyrd(e) => RefreshError::Wyrd(e),
+        .await
+        .map_err(RefreshError::from)
     }
 }
 
@@ -397,8 +327,8 @@ mod pg_tests {
     use wyrd_spec::auth::PrincipalKindTag;
     use wyrd_spec::envelope::{CardKind, Spec};
     use wyrd_spec::ids::{CardName, SpaceName};
-
     use wyrd_spec::reference::CardRef;
+
     use wyrd_sql::TenantConn;
     use wyrd_sql::queries::auth::{insert_refresh_token, insert_service_account, refresh_by_hash};
     use wyrd_sql::queries::cards::get_card_by_ref;

@@ -1987,9 +1987,12 @@ async fn a_tenant_revokes_a_compromised_principal_with_its_reason() {
     // Revocation advances the principal's authorization epoch; it does not
     // retire the credential, which stays the administrator's call.
 
-    // Two decisions, not three: the secret-like reason never reached the
-    // authorization boundary, while the wrong-kind attempt did and its allowed
-    // decision is durable even though the revocation behind it found nothing.
+    // One decision, not three. The secret-like reason never reached the
+    // authorization boundary. The wrong-kind attempt did, but its allowance now
+    // rides the transaction that performs the revocation, and that transaction
+    // found nothing and rolled back — so no row claims a revocation was
+    // permitted that never happened. The caller still learns of the refusal as a
+    // `404`, and a denial would have committed on its own.
     // Read past RLS on purpose: the assertion is about the durable audit row
     // the server wrote, which no tenant-plane route projects.
     let rows: Vec<Option<String>> = sqlx::query_scalar(
@@ -2018,8 +2021,8 @@ async fn a_tenant_revokes_a_compromised_principal_with_its_reason() {
         .collect();
     assert_eq!(
         decisions.len(),
-        2,
-        "only the attempts that were authorized are recorded: {decisions:?}"
+        1,
+        "only the revocation that happened is recorded: {decisions:?}"
     );
 
     let detail = decisions.last().expect("the accepted decision is last");
@@ -2027,10 +2030,6 @@ async fn a_tenant_revokes_a_compromised_principal_with_its_reason() {
     assert_eq!(detail["reason"], reason);
     assert_eq!(detail["principal_kind"], "service");
     assert_eq!(detail["principal_id"], principal_id);
-    assert_eq!(
-        decisions[0]["principal_kind"], "user",
-        "the refused attempt recorded the kind its caller declared: {decisions:?}"
-    );
 }
 
 /// Recovery is refused for every tenant state but `active`, and the refusal
@@ -3304,5 +3303,112 @@ async fn a_failed_platform_mutation_leaves_no_allowance() {
         staged_platform_decisions(&superuser, "allowed").await,
         allowances,
         "a refused caller earns no allowance"
+    );
+}
+
+/// A provisioned tenant administrator's refresh token actually rotates.
+///
+/// The API-key exchange has always returned a refresh token to a Card-free
+/// tenant administrator, and rotation refused every one of them: the rotation
+/// match covered only Card-bound service and agent principals. An advertised
+/// credential that never works is worse than none, because the holder builds on
+/// it.
+///
+/// Rotation is also the anti-theft mechanism, so the consumed token must stop
+/// working: replaying it is how a stolen refresh token shows up.
+#[tokio::test]
+async fn a_tenant_administrator_refreshes_and_cannot_replay() {
+    if !e2e_enabled() {
+        return;
+    }
+    let srv = WyrdTestServer::start_in_process()
+        .await
+        .expect("server starts");
+    let root = initialize_platform_root(&srv.operator_pool())
+        .await
+        .expect("deployment initializes");
+    let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
+    let created = body_json(
+        srv.oneshot(platform_post(
+            "/platform/tenants",
+            &session,
+            json!({ "slug": "refreshing", "display_name": "Refreshing" }),
+        ))
+        .await
+        .expect("tenant route responds"),
+    )
+    .await;
+    let credential = created["admin"]["credential"]
+        .as_str()
+        .expect("admin credential");
+
+    let exchanged = body_json(
+        srv.oneshot(anonymous_post(
+            "/auth/token",
+            json!({ "grant_type": "wyrd_api_key", "api_key": credential }),
+        ))
+        .await
+        .expect("token route responds"),
+    )
+    .await;
+    let refresh = exchanged["refresh_token"]
+        .as_str()
+        .expect("the exchange advertises a refresh token")
+        .to_owned();
+
+    let rotated_resp = srv
+        .oneshot(anonymous_post(
+            "/auth/token",
+            json!({ "grant_type": "refresh_token", "refresh_token": refresh }),
+        ))
+        .await
+        .expect("refresh route responds");
+    let status = rotated_resp.status();
+    let rotated = body_json(rotated_resp).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a tenant administrator's refresh token rotates: {rotated}"
+    );
+    let successor = rotated["access_token"]
+        .as_str()
+        .expect("rotation returns an access token")
+        .to_owned();
+    assert_ne!(
+        rotated["refresh_token"]
+            .as_str()
+            .expect("successor refresh"),
+        refresh,
+        "rotation replaces the refresh token"
+    );
+
+    // The rotated access token is the point: it must administer the tenant.
+    let protected = srv
+        .oneshot_authenticated(
+            &successor,
+            tenant_request(Method::GET, "/v1/admin/trusted-issuers", None),
+        )
+        .await
+        .expect("admin route responds");
+    let protected_status = protected.status();
+    let protected_body = body_json(protected).await;
+    assert_eq!(
+        protected_status,
+        StatusCode::OK,
+        "the rotated token administers the tenant: {protected_body}"
+    );
+
+    // Replaying the consumed token is the theft signal, not a second rotation.
+    let replayed = srv
+        .oneshot(anonymous_post(
+            "/auth/token",
+            json!({ "grant_type": "refresh_token", "refresh_token": refresh }),
+        ))
+        .await
+        .expect("refresh route responds");
+    assert!(
+        replayed.status().is_client_error(),
+        "a consumed refresh token is refused: {}",
+        replayed.status()
     );
 }

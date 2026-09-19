@@ -1,7 +1,6 @@
 use clap::{Parser, Subcommand};
 use secrecy::ExposeSecret;
 
-use wyrd_server::WyrdServerConfig;
 use wyrd_server::app::{BootExit, run};
 use wyrd_server::boot::init::initialize_platform_root;
 use wyrd_server::config::ServeMode;
@@ -60,11 +59,14 @@ async fn main() {
 ///
 /// Builds only the Postgres handles — never telemetry, storage, listeners, or
 /// `AppState` — so initialization neither starts nor depends on a serving
-/// surface. The plaintext is printed once to this process's stdout, which is
-/// the operator's terminal rather than the server's log pipeline.
+/// surface. It deliberately does not load the serving configuration either: the
+/// DSNs come from the environment, and validating query-engine settings here
+/// would mean an operator could not establish the administrative root until the
+/// whole serving surface was already configured.
+///
+/// The plaintext is printed once to this process's stdout, which is the
+/// operator's terminal rather than the server's log pipeline.
 async fn init() -> Result<(), BootExit> {
-    let _config = WyrdServerConfig::load().map_err(|e| BootExit::Config(Box::new(e)))?;
-
     let boot = PostgresBoot::from_env()
         .await
         .map_err(|e| BootExit::Other(Box::new(e)))?;

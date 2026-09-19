@@ -169,6 +169,101 @@ async fn initialization_happens_at_most_once() {
     );
 }
 
+/// Point a child `wyrd-server` at this test's database.
+///
+/// The binary resolves its DSNs from the environment, so the only thing the
+/// child needs is the lane's `WYRD_DATABASE_URL` with the database swapped for
+/// the fixture's. Every other credential and password is inherited.
+fn init_command(database: &str) -> std::process::Command {
+    let base = env::var("WYRD_DATABASE_URL").expect("the journey lane sets WYRD_DATABASE_URL");
+    let (prefix, _) = base
+        .rsplit_once('/')
+        .expect("a Postgres DSN names its database after the last slash");
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_wyrd-server"));
+    command
+        .arg("init")
+        .env("WYRD_DATABASE_URL", format!("{prefix}/{database}"));
+    command
+}
+
+/// The operator initializes a deployment by running the shipped binary.
+///
+/// Every other initialization journey calls the library function directly,
+/// which proves the writes but not the process an operator actually runs: that
+/// `init` parses as a subcommand, that the credential reaches the terminal and
+/// nothing else, that a second run refuses instead of minting another root, and
+/// that the exit status says which happened. A credential printed to stderr, or
+/// printed again on the second run, is a disclosed secret in a log pipeline.
+///
+/// # Panics
+///
+/// Panics when the binary cannot be run, misreports its status, or discloses
+/// the credential anywhere but the first run's stdout.
+#[tokio::test]
+async fn an_operator_initializes_the_deployment_through_the_shipped_binary() {
+    if !e2e_enabled() {
+        return;
+    }
+    let srv = WyrdTestServer::start_in_process()
+        .await
+        .expect("server starts");
+    let database = srv.pg_fixture().database_name().to_owned();
+
+    let first = init_command(&database).output().expect("init runs");
+    let stdout = String::from_utf8(first.stdout).expect("init prints UTF-8");
+    let stderr = String::from_utf8(first.stderr).expect("init prints UTF-8");
+    assert!(
+        first.status.success(),
+        "init failed: status={:?} stdout={stdout} stderr={stderr}",
+        first.status.code()
+    );
+
+    let credential = stdout
+        .lines()
+        .find(|line| line.starts_with("wyrd_global_"))
+        .expect("the credential is printed to stdout")
+        .to_owned();
+    assert!(
+        !stderr.contains(&credential),
+        "the credential reached stderr, which is where a log pipeline reads"
+    );
+
+    // The credential the terminal received is the one the deployment accepts:
+    // one-time delivery is only delivery if what was printed actually works.
+    let session = platform_session(&srv, &credential).await;
+    let resp = srv
+        .oneshot(platform_request(
+            Method::GET,
+            "/platform/admins",
+            &session,
+            None,
+        ))
+        .await
+        .expect("listing responds");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the printed credential administers the platform"
+    );
+
+    let second = init_command(&database).output().expect("init runs again");
+    let repeat_stdout = String::from_utf8(second.stdout).expect("init prints UTF-8");
+    let repeat_stderr = String::from_utf8(second.stderr).expect("init prints UTF-8");
+    assert!(
+        !second.status.success(),
+        "a second init reported success: stdout={repeat_stdout}"
+    );
+    assert!(
+        !repeat_stdout.contains("wyrd_global_") && !repeat_stderr.contains("wyrd_global_"),
+        "the refused run disclosed credential material: stdout={repeat_stdout} \
+         stderr={repeat_stderr}"
+    );
+    assert!(
+        repeat_stderr.contains("wyrd-server:"),
+        "the refusal is reported on stderr rather than silently: {repeat_stderr}"
+    );
+}
+
 /// Neither plane can act on the other, in both directions.
 #[tokio::test]
 async fn the_two_control_planes_cannot_reach_each_other() {

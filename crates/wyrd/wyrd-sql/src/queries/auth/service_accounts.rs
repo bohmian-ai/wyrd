@@ -21,11 +21,11 @@ use crate::TenantConn;
 /// row is not the predicate but two facts outside it — the table's
 /// `UNIQUE (data_tenant_id, name)` and `auth_projection` keeping the `name`
 /// column equal to `card_ref->>'name'`. `ORDER BY created_at, id LIMIT 1` exists
-/// because none of that chain is enforced here: relax the unique constraint,
-/// decouple the name projection, or add an optional `CardRef` field, and this
-/// predicate starts matching more rows on a credential-issuing path. The stable
-/// oldest-first pick is then the difference between a bounded anomaly and an
-/// arbitrary one — narrow the predicate rather than lean on that fallback.
+/// because none of that chain is enforced here: relax the unique constraint or
+/// decouple the name projection, and this predicate starts matching more rows on
+/// a credential-issuing path. The stable oldest-first pick is then the
+/// difference between a bounded anomaly and an arbitrary one — narrow the
+/// predicate rather than lean on that fallback.
 const SERVICE_ACCOUNT_BY_CARD_REF_SQL: &str = r#"
         SELECT id, principal_kind, card_ref, status
           FROM wyrd.auth_service_accounts

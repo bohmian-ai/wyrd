@@ -40,8 +40,10 @@ controls required to operate those boundaries.
 ## Principal and credential lifecycle
 
 `Principal { id, kind, tenant_id, roles, effective_permissions }` is the only
-runtime identity. `PrincipalKind` is the closed set `User`, `Service`, and
-`Agent`; Service and Agent principals carry a server-verified `card_ref`.
+runtime identity. `PrincipalKind` is the closed set `User`, `Service`, `Agent`,
+and `System`; Service and Agent principals carry a server-verified `card_ref`.
+System is an internal, tenant-scoped machine principal with no Card, API key,
+refresh, role-grant, delegation, workload-binding, or public issuance path.
 
 Card-bound identities are provisioned idempotently by tenant, principal kind,
 Card kind, and Card UID. Re-applying a Card preserves the principal identity.
@@ -198,11 +200,14 @@ engine operation.
 
 ## Source credentials and SSRF defense
 
-`SourceAuth` and Operator HTTP authentication carry secret-provider keys or
-environment-variable names, never secret bytes. The server resolves credentials
-only for the selected tenant, adapter, and operation. Secret values are
-redacted in diagnostics and are not persisted in Card specs or observations.
-Rotation changes the provider value without changing the Card contract.
+`SourceAuth` carries secret-provider keys or environment-variable names, never
+secret bytes. Operator Cards instead carry a tenant Operator-connection name;
+the server resolves its envelope-encrypted Postgres credential under the exact
+tenant, provider, HTTP origin, and auth authority immediately before delivery.
+Multi-tenant Operator credentials never use process environment selectors.
+Secret values are redacted in diagnostics and are not persisted in Card specs
+or observations. Rotation changes the connection secret without changing the
+Card contract.
 
 Before fetching any user- or tenant-supplied URL, the server must:
 

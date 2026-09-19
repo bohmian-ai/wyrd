@@ -48,7 +48,9 @@ For a scheduled run:
 Every manual run requires explicit `start` and `end`. It does not advance the
 cron cursor. Manually invoking a verification binding uses the supplied window
 and runs its `on_failure` behavior; invoking the Verifier directly is
-analysis-only.
+analysis-only. Both manual forms persist the authenticated requester principal.
+A direct run has no binding owner or binding identity; those fields remain null
+rather than borrowing the caller, subject, or Verifier Card identity.
 
 The durable run records its origin as either `direct` or `binding`. Binding
 origin includes the stable binding identity, the effective Trigger Card UID and
@@ -169,7 +171,7 @@ The fixed plan shapes and Arrow outputs are:
 |---|---|---|
 | PSI numeric | Preflight `COUNT(*) = COUNT(num_value)`; `CASE` over fitted `(lower, upper]` edges; `GROUP BY bin_id`; `COUNT(*)` | `(feature, bin_id, count)` and input-validity counts |
 | PSI categorical | `str_value IS NOT NULL`; `CASE` over fitted labels, with unmatched `bin_id = -1`; `GROUP BY bin_id`; `COUNT(*)` | `(feature, bin_id, count)` including unknown count |
-| SPC X̄–S | Preflight `COUNT(*) = COUNT(num_value)`; deterministic `ROW_NUMBER` over numeric rows per feature; group consecutive fixed-size subgroups; `COUNT(*)`, `AVG`, `STDDEV_SAMP`; retain complete groups; order by subgroup | `(feature, subgroup_index, n, mean, sample_stddev)` and input-validity counts |
+| SPC | Preflight `COUNT(*) = COUNT(num_value)`; deterministic `ROW_NUMBER` over numeric rows per feature; group consecutive frozen-size chunks; `COUNT(*)`, `AVG`; order by chunk | `(feature, chunk_index, n, mean)` and input-validity counts |
 | Custom | `COUNT(*)`, `COUNT(num_value)`, `AVG(num_value)` | `(metric, observed_count, numeric_count, window_mean)` |
 
 The shared filter is the tenant-authorized table scan plus exact subject UID,
@@ -203,91 +205,26 @@ baseline range through infinite boundary bins. For categorical PSI, categories
 absent from the fitted baseline remain part of the target total but do not
 create a new fitted bin, matching the current scorer.
 
-## SPC: initial NIST subgroup X̄–S method
+## SPC: preserve the existing scorer
 
-The initial SPC method is a fixed-size subgroup X̄–S chart with Western
-Electric (WECO) rules. It is not the NIST individuals/moving-range chart.
-Each feature uses one fixed subgroup size `n >= 2`, frozen in its fitted
-baseline. An authored `sample_size` supplies `n`; the current `0` adaptive
-form resolves to `n = 4` at fitting, not to the existing volume-dependent
-25/100/1,000/... chunk sizes. The baseline must contain at least 25 complete
-subgroups for the initial readiness gate. NIST presents 25 groups of four as
-historical guidance, not a universal mathematical constant; this gate is
-Wyrd's conservative initial product policy. The registered SPC baseline Data
-Card must provide `created_at` and unique `record_id` columns alongside its
-wide feature columns. The baseline fitter and runtime plan both sort by
-`created_at, record_id` before forming consecutive groups; the fitted-baseline
-job reports not-ready with a validation error if those columns are absent or
-invalid. DataFusion produces baseline subgroup means and sample deviations
-before Rust fits limits. Incomplete trailing baseline and window subgroups
-are excluded; they are not scored with full-`n` limits or carried into another
-immutable run window. A window without a complete subgroup is inconclusive.
-Consecutive time-ordered rows are Wyrd's operational subgroup policy; users
-must collect comparable observations because ordering alone does not prove a
-rational subgroup.
+The initial Verifier adapts the existing `vala-drift` SPC contract instead of
+inventing another chart. `SpcProfile` retains `sample_size`, `weco_rule`, and
+`alert_threshold`. An authored `sample_size` is at least two; zero selects the
+existing row-count adaptive size, which is frozen in the fitted baseline. The
+existing eight-positive-integer WECO rule string, zone assignment, trend rule,
+and alert-threshold filtering remain authoritative.
 
-For each of the `m` complete baseline subgroups, DataFusion produces its mean
-`x̄_i` and sample standard deviation `s_i`. The Rust fitter calculates
-`x̄̄ = mean(x̄_i)`, `s̄ = mean(s_i)`,
-`c4(n) = √(2/(n−1)) Γ(n/2)/Γ((n−1)/2)`, and `σ̂ = s̄ / c4(n)`; it persists
-these fitted values, `n`, and the X̄ and S chart centers/limits in the
-server-owned fitted baseline. X̄ zone spacing is `σ̂ / √n`, **not** `σ̂` as
-the current implementation uses. S zone spacing is
-`σ̂ √(1 - c4(n)²)`. For either chart, the one-, two-, and three-sigma limits
-are center ± 1/2/3 times its spacing. The X̄ center is `x̄̄`; the S center
-is `s̄`. A negative S lower control limit is operationally clamped to zero
-because a sample standard deviation cannot be negative. The fitted limits
-remain frozen for later windows; target observations never recalculate them.
-Non-finite statistics or `s̄ = 0` fail baseline readiness with a typed
-validation reason; a zero-variance baseline cannot define these control
-zones.
+The baseline fitter uses the registered Data Card's feature-row order exactly
+as the existing scorer does. Runtime rows are ordered by `created_at`, then
+`record_id`, before consecutive chunk means are formed. The server-side
+DataFusion plan returns those ordered chunk means; Rust applies the existing
+zone/rule evaluator and constructs the existing `DriftReport`. The current
+trailing-chunk behavior is preserved. A window too small for the frozen chunk
+size is `inconclusive`, not a no-drift pass.
 
-For each runtime feature, DataFusion filters non-null numeric rows, orders
-them by `created_at ASC, record_id ASC` with stable managed row identity as a
-tie-breaker if needed, assigns `ROW_NUMBER`, groups every `n` consecutive
-values, retains only groups with `COUNT(*) = n`, and returns their ordered
-`AVG(num_value)` and `STDDEV_SAMP(num_value)` with subgroup index and count.
-Rust checks the S chart first and the X̄ chart second, applying the four
-canonical WECO tests to each chart's ordered points. If S fails, report the
-variability finding and do not interpret X̄ as an independent pass; its limits
-assume stable within-subgroup variation.
-
-1. One point beyond a three-sigma limit.
-2. At least two of three consecutive points beyond two sigma on the same
-   side of center.
-3. At least four of five consecutive points beyond one sigma on the same
-   side of center.
-4. Eight consecutive points on the same side of center.
-
-Only fully available sliding windows can satisfy a multi-point rule. Compare
-the actual point values and sides: "beyond" and "same side" are strict, so a
-point exactly on a limit or center does not satisfy that condition. Do not
-infer trend or alternation from discretized zone numbers. Six-point trend and
-14-point alternation are separate
-NIST supplementary rules and are out of scope. A failed S or X̄ rule makes
-that feature drift; persist chart, rule, subgroup index, observed statistic,
-center, and limits as explainable detail. An empty/insufficient window is
-inconclusive, not `NoDrift`. NIST warns that enabling the supplementary
-signals increases false-alarm frequency, so every finding names its rule.
-
-The existing `SpcWecoRule.rule_string` is an eight-number zone/alternation
-language, **not** the four NIST WECO tests. Remove `weco_rule` and the
-zone-only `alert_threshold` from the initial Verifier Drift SPC profile;
-retain `sample_size` (`0` means the fitted default `n = 4`, `1` is invalid,
-and an authored value `>= 2` is frozen). Failure is defined by the four fixed
-rules above, with no second zone threshold that can suppress a WECO finding.
-A configurable rule set or individuals chart can be added later as an
-explicit new contract. Refactor `vala-drift` so baseline
-fitting uses subgroup mean and sample deviation, and aggregate-input scoring
-shares report construction without passing subgroup means through the old
-raw-value scorer. Replace the current WECO evaluator and its tests, including
-its same-side alternation and boundary behavior, with tests for these four
-precise rules. NIST notes that multiple rules increase false alarms; report
-which chart and rule fired rather than hiding this behind one score.
-
-Sources: [NIST variable control charts and WECO rules](https://www.itl.nist.gov/div898/handbook/pmc/section3/pmc32.htm),
-[NIST X̄–S equations](https://www.itl.nist.gov/div898/handbook/pmc/section3/pmc321.htm),
-and [NIST individuals chart (excluded)](https://www.itl.nist.gov/div898/handbook/pmc/section3/pmc322.htm).
+This delivery does not add a second S chart, fixed four-rule policy,
+25-subgroup readiness gate, or new finding schema. Those would be a separate
+public algorithm change with separate evidence.
 
 ## Customer metrics
 
@@ -383,8 +320,8 @@ claim Custom Drift run
   -> if numeric_count != observed_count or window_mean is not finite:
        complete with common verdict Inconclusive and no DriftReport
   -> otherwise apply the existing Custom score formula to window_mean
-  -> write required detail and common result batches through Gate/Scribe
-  -> after both ACKs, settle the run and dispatch configured Operators
+  -> write any produced detail rows and the common result through Gate/Scribe
+  -> after every non-empty required batch ACKs, settle the run and dispatch Operators
      only for a failed binding-created result
 ```
 
@@ -415,26 +352,14 @@ Run status and verdict remain separate:
 
 ### Result semantics
 
-Successful and inconclusive common results retain enough typed evidence to
-explain the decision:
-
-```text
-Verifier UID and version
-subject identity
-metric name
-window_start and window_end
-observed_count
-window_mean when present
-baseline_value
-score when present
-alert_threshold
-verdict
-```
-
-This evidence supplements the existing `DriftReport`; it does not replace or
-fork that type. Inconclusive results carry an explanation and counts without
-pretending an invalid window passed. Engine errors live in run status rather
-than manufacturing a Verification Result with a verdict.
+When scoring produces the existing `DriftReport`, the common result stores its
+canonical JSON and the detail table stores one row per report feature. A valid
+completed inconclusive execution that ends before scoring—an empty Custom
+window or invalid stored Custom input—stores `details = null` and no feature
+rows. It does not manufacture an empty report or a second evidence envelope.
+Non-finite report score or threshold values project to JSON/Arrow null through
+the existing nullable representation. Engine errors live in run status and
+produce no Verification Result.
 
 ### Required customer-metric tests
 
@@ -473,8 +398,9 @@ retains the subject UID and binding ID. The tenant-scoped internal SYSTEM
 principal writes each Arrow batch through `wyrd_client::Bifrost` -> Gate ->
 Scribe, not to a local Scribe instance.
 
-Write the required detail batch first and the summary batch second. Each
-requires its own Scribe ACK. Only then may the runner settle `verifier_runs`
+Write each non-empty required detail batch first and the summary batch second.
+Each written batch requires its own Scribe ACK. A pre-scoring inconclusive
+result writes no empty feature batch. Only after every required ACK may the runner settle `verifier_runs`
 and insert one `operator_dispatches` row per distinct configured Operator in
 the same Postgres transaction. A passed, inconclusive, direct analysis-only,
 or terminal engine-error run inserts none. Engine failures retry the same
@@ -507,11 +433,9 @@ Rust/Python/TypeScript client-to-server journey that proves:
    batch transfer to the Rust scorer.
 4. PSI numeric fitted-edge and categorical fitted-label counts, zero bins,
    unknown category totals, minimum sample, pass, drift, and inconclusive.
-5. SPC baseline X̄–S limits against a known fixture, `n = 4` adaptive
-   default, full-subgroup handling, S-before-X̄ analysis, all four WECO
-   tests, boundary equality, and no-data inconclusive. Tests must catch the
-   old missing `1/√n` factor, partial-group contamination, zone-only trend,
-   and same-side pseudo-alternation.
+5. SPC baseline limits against existing known fixtures, the existing adaptive
+   sample-size table, authored sample size, eight-number rule parsing, zone,
+   trend, alert-threshold, trailing-chunk, and no-data behavior.
 6. Custom raw-value averaging, strict threshold equality, missing/invalid
    input, and pass/drift/inconclusive behavior.
 7. Direct manual and binding-driven cron runs use the same analysis path;
@@ -536,12 +460,10 @@ Rust/Python/TypeScript client-to-server journey that proves:
 3. Add the fixed PSI numeric/categorical and Custom aggregate plans and
    narrow count/mean scoring inputs in `vala-drift`, sharing the existing PSI
    and Custom formulas and `DriftReport` construction.
-4. Refactor SPC fitting and scoring together: DataFusion emits baseline and
-   target complete-subgroup mean/sample-SD rows; Rust fits NIST X̄–S limits
-   and evaluates the four WECO rules on ordered aggregate rows. Update the
-   incompatible eight-number rule contract, frozen fitted-baseline shape,
-   and focused statistical fixtures in the same work.
+4. Adapt SPC without changing its public or statistical contract: preserve
+   its fitted-baseline shape and rule parser, and feed the existing scorer the
+   ordered chunk means produced by the fixed DataFusion plan.
 5. Map scored reports to the canonical detail and summary Bifrost tables,
-   require both ACKs, settle the existing run, and rely on the generic
+   require every non-empty batch ACK, settle the existing run, and rely on the generic
    Operator dispatch worker. Prove the method-specific journeys above through
    all three first-class SDKs.

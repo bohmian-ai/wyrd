@@ -1,6 +1,6 @@
 # Run API for continuous verification
 
-**Status:** Agreed client interface for this change. The overall change spec remains draft.
+**Status:** Approved client interface through specification revision 32.
 
 ## User contract
 
@@ -289,10 +289,10 @@ Verifier-kind-agnostic plumbing. In each first-class SDK:
 The Drift physical projection is fixed by
 [drift.md](drift.md#bifrost-observation-schema-and-projection): one tall table
 with `record_id`, `series`, nullable `num_value`, nullable `str_value`,
-optional `session_id`, `created_at`, and Bifrost's managed columns. The
-separate Eval observation projection remains an open table-schema decision
-except for nullable `FixedSizeBinary(16)` trace IDs and `FixedSizeBinary(8)`
-span IDs, which must match `vala.traces.spans`. The existing schema-driven
+optional `session_id`, `created_at`, and Bifrost's managed columns. The Eval
+observation projection is fixed by [table_schema.md](table_schema.md), including
+nullable `FixedSizeBinary(16)` trace IDs and `FixedSizeBinary(8)` span IDs,
+which must match `vala.traces.spans`. The existing schema-driven
 JSON-row builder must decode canonical trace/span hex into those bytes and
 reject malformed or wrong-width values; no Eval-specific queue or publisher
 is added.
@@ -422,14 +422,17 @@ analysis use three typed HTTP operations, projected through the same
 |---|---|
 | `GET /v1/verification/bindings/{binding_id}` | Exact owner/subject/Verifier identities; active gate; readiness; nullable next schedule, last activation, and last run. |
 | `POST /v1/verification/runs` | `202 { run_id }` after durable enqueue; no synchronous score. |
-| `GET /v1/verification/runs/{run_id}` | Execution status, nullable `result_id`, execution error, and independent Operator dispatch/delivery statuses. |
+| `GET /v1/verification/runs/{run_id}` | Execution status, nullable manual `requested_by_principal_id`, nullable `result_id`, execution error, and independent Operator dispatch/delivery statuses. |
 
 Manual run input is one tagged `binding { binding_id }` or direct
 `verifier { verifier_uid, subject_card_uid }` target plus a bounded
 `drift_window { start, end }` in UTC (`[start, end)`). A binding run follows
 its `on_failure` Operators; a direct run is analysis-only. The existing
 `Idempotency-Key` contract makes a retried POST refer to the same request.
-Eval remains observation-triggered in this change.
+Eval remains observation-triggered in this change. Both manual targets require
+an authenticated credential and persist that caller as
+`requested_by_principal_id`. That principal records who requested the run; it
+does not become a binding owner Card.
 
 ```json
 {
@@ -519,6 +522,12 @@ chain; only its record source differs.
   active `verified_by` bindings using the authorized subject identity.
 - Each created `verifier_runs` row freezes the exact binding and Verifier UID;
   results and detail rows carry those identities for dashboards and audits.
+- A binding-created run carries its containing Service or standalone Agent as
+  `owner_card_uid`. A direct Verifier run has no binding owner, so
+  `owner_card_uid` and `binding_id` are null. Its authenticated credential is
+  preserved separately as `requested_by_principal_id` on the Postgres run and
+  in the authorization audit; neither the caller, subject, nor Verifier is
+  copied into the owner column.
 - A Card-scoped view may be used concurrently with other views of the same
   invocation without changing their CardRefs. Unknown aliases, out-of-graph
   targets, invalid input shapes, and out-of-scope server correlation fail

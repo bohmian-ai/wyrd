@@ -1,6 +1,6 @@
 ---
 id: SPEC-verified-change-contract
-revision: 30
+revision: 32
 status: approved
 ---
 
@@ -34,6 +34,7 @@ Verifier, and its result may dispatch configured Operators.
   contracts required by Drift and Eval.
 - Durable continuous Verifier runs, queryable results, and Notify/HTTP Operator
   delivery.
+- Tenant-managed Operator connections backed by encrypted Postgres state.
 
 ## Non-goals
 
@@ -102,6 +103,17 @@ make the standalone LLM-judge Verifier implementation part of this delivery.
   created by the generic runner after a binding-created Verifier run completes
   with `failed`. It owns its own claim, retry, and delivery status; no separate
   Alert table or delivery queue is created.
+- **Attesting Eval task**: a task whose executor successfully returns an
+  `AssertionResult`. A false assertion is attesting evidence; a skipped task or
+  an executor/input failure is not.
+- **Internal SYSTEM result writer**: one server-only tenant principal, persisted
+  with a server-minted UUIDv7 and used only to publish Verification Result
+  batches. It has no public credential, Card, role grant, refresh path, or
+  delegation path.
+- **Operator connection**: one tenant-owned, provider-specific Postgres record
+  containing nonsecret delivery coordinates and an encrypted credential. Cards
+  carry only its provider-scoped name; connection reads never return secret
+  material.
 
 ## Required behavior
 
@@ -118,7 +130,12 @@ make the standalone LLM-judge Verifier implementation part of this delivery.
   with `kind: Drift` or `kind: Eval`; no compatibility alias, parallel
   registry path, or second monitor Card is introduced. Nothing using the old
   Card kinds has shipped; this change provides no compatibility registration
-  or historical-card migration path.
+  or historical-card migration path. The v1 catalog therefore contains 15
+  registrable native kinds, with `Verifier` replacing both `Drift` and `Eval`.
+  `AGENTS.md`, `architecture/wyrd-design.md`, and
+  `architecture/wyrd-doctrine.mdx` MUST publish that same catalog and
+  `verified_by` binding model; `publishes_to` MUST NOT remain as a verification
+  subscription contract.
 - **REQ-046**: `VerifierSpec` MUST contain exactly one adjacently tagged
   `implementation` whose `kind` selects a closed variant with variant-specific
   typed fields. It MUST NOT use a generic parameter or configuration object
@@ -137,7 +154,20 @@ make the standalone LLM-judge Verifier implementation part of this delivery.
   PSI and SPC runs require a version-pinned baseline Data Card and a persisted
   server-fitted profile before analysis; Custom retains its authored scalar
   baseline and requires no fitter. The user authors the strategy, not the
-  fitted distributions. No client-side binning or subgroup aggregation is
+  fitted distributions. `condition` MUST be `Statistical` for all three
+  executable pairs; `Above`, `Below`, and `Outside` remain typed vocabulary
+  but registration rejects them in this delivery because the three profiles
+  already own their thresholds. The SPC public contract remains exactly
+  `SpcProfile { sample_size, weco_rule, alert_threshold }`: `sample_size = 0`
+  uses the existing row-count adaptive chunk size and any authored value MUST
+  be at least 2; the eight-positive-integer `weco_rule.rule_string`, existing
+  zone assignment, trend rule, and `alert_threshold` filtering retain their
+  current `vala-drift` semantics. Runtime observations are ordered by
+  `created_at`, then `record_id`, before the same consecutive chunk-mean
+  scorer is applied; incomplete trailing chunks retain the scorer's current
+  behavior. This change MUST NOT replace that contract with a fixed four-rule
+  WECO policy, an X-bar/S dual-chart result, a 25-subgroup readiness gate, or
+  a new SPC result shape. No client-side binning or subgroup aggregation is
   added.
 - **REQ-111**: The Eval payload MUST retain the existing `EvalSpec` fields
   `dataset`, `tasks`, `workflow`, `sampling`, `pass_gate`, and
@@ -395,9 +425,16 @@ flows are listed in its "Input and queue boundary" section.
   active verification bindings under the authenticated Service, standalone
   Agent, or Service component occurrence; clients do not select a Verifier
   with `drift_ref` or `eval_ref`.
-- **REQ-104**: The server MUST derive a stable binding identity from the exact
-  containing Card UID and version, subject occurrence identity, and resolved
-  Verifier UID and version. Reordering bindings MUST NOT change that identity.
+- **REQ-104**: `BindingId` MUST be a typed UUIDv7 public and durable identity.
+  On the first projection insert, the server MUST mint it and persist it under
+  the unique natural key `(data_tenant_id, owner_card_uid,
+  subject_occurrence_key, verifier_uid)`. `owner_card_uid` and `verifier_uid`
+  already identify exact immutable Card versions. The subject occurrence key
+  is the reserved owner value for a Service-level or standalone-Agent binding,
+  and the component alias for a Service-component binding; component aliases
+  MUST be unique within the Service. Re-applying the identical Card projection
+  MUST preserve the stored ID, while a new owner Card UID, component alias, or
+  Verifier UID creates a new ID. Reordering bindings MUST NOT change it.
   Runs MUST also bind the effective Trigger and every Operator Card identity
   or, for inline definitions, their canonical spec digests. Users MUST NOT author a
   separate binding name or identifier.
@@ -620,18 +657,29 @@ multi-table transaction design survives as an alternative.
   no Eval run is guaranteed, and the server emits a structured tracing error.
   This best-effort loss is accepted for the initial delivery.
 - **REQ-078**: Postgres owns `verification_bindings`, `drift_baselines`,
-  `verifier_runs`, and `operator_dispatches`: exact identities,
+  `verifier_runs`, `operator_dispatches`, and tenant Operator connections:
+  exact identities,
   scheduling cursors, claims, retries, and result pointers. Bifrost owns raw
   observations and analytical results. Bifrost MUST NOT be polled as a work
   queue. The generic VerificationRuntime contains the scheduler, Verifier
   runner, and Operator worker; only the Drift baseline fitter is
-  implementation-specific background machinery.
+  implementation-specific background machinery. These five control tables
+  MUST live in the `wyrd` Postgres schema and their migrations and typed SQL
+  operations MUST be owned by `wyrd-sql`. Registration uses those operations
+  through the caller-owned `TenantConn` so the Card, card-bound principal,
+  binding projection, baseline work row, and connection validation share one
+  transaction. Vala consumers use the `vala-sql` re-export rather than import
+  `wyrd-sql` directly. All five tables MUST carry `data_tenant_id`, enable and
+  force RLS, use the existing `wyrd.current_tenant()` policy, and be reachable
+  by tenant runtime paths only through `TenantConn`; cross-tenant maintenance,
+  if required, remains an explicit `OperatorPool` operation. No second Vala
+  control schema, database, or repository layer is introduced.
 
 The locked storage split is:
 
 | Store | Existing/reused | Added by this change |
 |---|---|---|
-| Postgres control state | `wyrd.cards`, `wyrd.auth_service_accounts`, Scribe's `vala.scribe_batch_commits` fence | `verification_bindings`, `drift_baselines`, `verifier_runs`, `operator_dispatches`; `last_authenticated_at` on the existing service-principal row |
+| Postgres control state | `wyrd.cards`, `wyrd.auth_service_accounts`, Scribe's `vala.scribe_batch_commits` fence | `verification_bindings`, `drift_baselines`, `verifier_runs`, `operator_dispatches`, encrypted tenant Operator connections, and one credentialless UUIDv7 SYSTEM principal per tenant; `last_authenticated_at` on the existing service-principal row |
 | Bifrost analytical state | `vala.drift.observations`; existing Scribe/Oracle table lifecycle | `vala.eval.observations`, `vala.verification.results`, `vala.drift.result_features`, `vala.eval.result_items` |
 | Object storage | Registered Data Card Parquet artifact | No new baseline artifact format; the fitted profile is Postgres control state |
 
@@ -640,9 +688,15 @@ The removed `vala.eval.runs`, `vala.eval.assertions`, and
 dashboard starts from
 `vala.verification.results`; Drift and Eval dashboards join their detail
 table on `(data_tenant_id, result_id)`.
-- **REQ-079**: A verifier_runs row MUST freeze the tenant, owner and binding
-  identity, exact Verifier Card UID/version, input record or window, and
-  effective Trigger and Operator identities. The generic runner claims it with
+- **REQ-079**: A `verifier_runs` row MUST freeze the tenant, exact Verifier
+  Card UID/version, subject, input record or window, origin, and effective
+  Trigger and Operator identities. A binding-created run MUST freeze its
+  non-null owner Card UID and binding identity. A direct run MUST store both as
+  null rather than substituting the subject, Verifier, or caller. Every manual
+  API-created run MUST also freeze the authenticated caller as
+  `requested_by_principal_id`; scheduled and observation-created runs have no
+  manual requester. The authorization audit remains the canonical permission
+  decision record. The generic runner claims the run with
   bounded lease and token-fenced settlement. For Eval, it MUST use the frozen
   `input_event_time` to constrain the Bifrost input read to the corresponding
   UTC `wyrd_event_time` partition and `input_record_id`; it MUST NOT derive the
@@ -684,12 +738,19 @@ table on `(data_tenant_id, result_id)`.
   analysis-only. Manual invocation of a binding uses its configured
   on_failure Operators. Both routes use the same runner and Drift scorer.
 - **REQ-083**: Eval has no cron schedule. A successfully enqueued Eval run MUST
-  load its committed EvalRecordObservation from vala.eval.observations, apply authored
-  EvalSpec.sampling, and execute the existing deterministic, LLM-judge,
-  workflow-aggregation, pass_gate, and context_capture behavior. A sampled-out
-  record terminates without task execution or Operator dispatch. The existing
-  AwaitingTrace path uses bounded retry; execution errors are distinct from a
-  completed task assertion that failed.
+  load its committed `EvalRecordObservation` from `vala.eval.observations`,
+  apply authored `EvalSpec.sampling`, and execute the existing deterministic,
+  LLM-judge, workflow-aggregation, `pass_gate`, and `context_capture` behavior.
+  Sampling is decided before trace lookup or task execution. A sampled-out
+  record MUST settle `completed` with verdict `inconclusive`, persist one
+  canonical result containing the existing zero-count `EvalWorkflowSummary`,
+  persist no Eval item rows, and create no Operator dispatch. For a sampled-in
+  record that requires trace data, temporary absence uses the existing
+  `EvalStatus::AwaitingTrace` lifecycle and requeues the generic run until its
+  bounded trace deadline. Trace absence at that deadline settles `timed_out`;
+  trace-source execution failures use the normal bounded retry path and settle
+  `errored` when exhausted. Neither terminal path writes a Verification Result
+  or dispatches an Operator.
 - **REQ-130**: Continuous Eval MUST use the existing `ScenarioScoring` /
   `EvalExecutor` task path, including its existing `JudgeTaskExecutor` and
   `SkaldJudgeInvoker`. Online records and later dataset-backed offline
@@ -716,12 +777,22 @@ table on `(data_tenant_id, result_id)`.
   media is an input/execution error, not a failed assertion or pass-gate
   verdict. The same bindings must reach deterministic test invokers and the
   production Skald invoker; provider-specific media encoding stays in Skald.
-- **REQ-084**: EvalSpec.pass_gate is the sole authored criterion mapping a
-  completed Eval result to a failed Verifier verdict and on_failure dispatch.
-  Task failures do not independently bypass the pass-rate gate. An absent
-  pass_gate persists the Eval result but dispatches no Operator. Missing
-  context, invalid judge output, or non-attesting execution remains
-  inconclusive or errored, never a manufactured subject failure.
+- **REQ-084**: Only an Eval task whose executor successfully produces an
+  `AssertionResult` attests. `passed: false` is a valid assertion outcome,
+  including a valid structured judge judgment, and is evaluated only through
+  the authored `pass_gate`; it is not an execution error and does not
+  independently fail the Verifier. With at least one attesting task, an
+  authored gate maps its existing verdict to common `passed` or `failed`; an
+  absent gate maps the completed run to `inconclusive`. A completed execution
+  with zero attesting tasks, including an all-skipped workflow, is
+  `inconclusive` regardless of gate. Executor and input failures—including
+  unresolved required context, malformed judge output, and missing, invalid,
+  unauthorized, unsupported, mismatched, or oversized media—MUST remain on
+  the existing execution-error path and MUST NOT become
+  `AssertionResult { passed: false }`. Retryable failures use the run's bounded
+  retry policy; exhausted or terminal failures settle `errored` with no
+  verdict, result rows, or Operator dispatch. Only common `failed` dispatches
+  Operators.
 - **REQ-085**: Every completed Drift or Eval run MUST write one canonical
   summary and overall verdict to the new Bifrost table
   vala.verification.results, identified by `data_tenant_id` and `result_id`. Drift
@@ -729,8 +800,17 @@ table on `(data_tenant_id, result_id)`.
   vala.drift.result_features table; every `EvalReport.outcomes`
   `TaskRunOutcome`, including `Skipped`, MUST be written as one row to the new
   vala.eval.result_items table. The common summary's `details` column MUST
-  contain the serialized `DriftReport` or `EvalWorkflowSummary`, selected by
-  `implementation`; it MUST have no Drift- or Eval-specific summary columns.
+  contain the serialized `EvalWorkflowSummary` for Eval. For Drift it MUST
+  contain the serialized `DriftReport` when scoring produced one and MUST be
+  null when a valid completed inconclusive execution ended before scoring,
+  including an empty Custom window or invalid stored Custom metric input. A
+  Drift result without a report writes zero feature rows. Non-finite numeric
+  values in a produced report use the canonical JSON null projection and the
+  nullable feature score/threshold columns. A sampled-out Eval run writes its
+  zero-count summary and zero item rows; an all-skipped Eval run writes its
+  summary and `Skipped` item rows. Errored and timed-out runs write neither
+  result table.
+  The common table MUST have no Drift- or Eval-specific summary columns.
   The exact five physical Arrow schemas are fixed by
   [table_schema.md](architecture/logic/table_schema.md). Each detail table
   joins to the summary on (`data_tenant_id`, `result_id`). Existing Drift and
@@ -743,8 +823,8 @@ table on `(data_tenant_id, result_id)`.
   UID-bearing `card_ref`; its server-stamped `principal_id` identifies the
   internal writer, not the observed subject. Managed `run_id` MUST be the exact
   verification run ID. The analytical payload MUST also
-  carry exact `subject_card_uid`, `owner_card_uid`, nullable `binding_id`
-  for direct analysis, `result_id`, and the
+  carry exact `subject_card_uid`, nullable `owner_card_uid`, nullable
+  `binding_id`, `result_id`, and the
   source record identity or fixed Drift window. This permits queries by
   Verifier, subject, owner, binding, run, and time without overloading the
   single managed `card_uid`. A baseline Data Card, effective Trigger, and
@@ -758,8 +838,10 @@ table on `(data_tenant_id, result_id)`.
   `vala.verification.results`, `vala.drift.result_features`, and
   `vala.eval.result_items`, `principal_id` MUST identify the tenant-scoped
   internal SYSTEM writer and managed `card_uid` MUST identify the exact
-  Verifier Card; `subject_card_uid`, `owner_card_uid`, and `binding_id` MUST
-  remain separate columns. One client observation may feed multiple
+  Verifier Card; `subject_card_uid`, nullable `owner_card_uid`, and nullable
+  `binding_id` MUST remain separate columns. Binding-created results populate
+  both owner and binding; direct results set both to null. One client
+  observation may feed multiple
   binding-created runs without changing or duplicating its subject Card
   identity. All five
   tables retain Bifrost's physical `data_tenant_id`; it is the tenant key for
@@ -788,19 +870,45 @@ table on `(data_tenant_id, result_id)`.
   `wyrd_client::Bifrost` over its existing authenticated Arrow/gRPC path back
   through the Wyrd server's Gate to whichever Scribe owns the batch. A runner
   MUST NOT assume a Scribe is active in its own server process or write
-  directly to local Scribe state. The server writer MUST authenticate as a
-  tenant-scoped internal SYSTEM principal for the run's tenant, with a signed
-  Card scope authorizing only the exact Verifier Card and permission to write
-  the required result tables. `Verifier` MUST be an eligible scoped Bifrost
-  observation target for these writes, while normal client principals MUST
-  NOT gain permission to write reserved result tables. Gate/Scribe MUST derive
-  tenant and `principal_id` from that authority and resolve the per-row Verifier
-  `card_ref` to the managed `card_uid`; neither tenant nor Card UID may be
-  trusted from the Arrow payload. The global `SYSTEM_OWNER` tenant and the
-  existing uncorrelated audit-publisher identity MUST NOT be reused as a
-  bypass for customer-tenant results. The required detail
-  batch is written before the canonical summary batch; both are separately
-  acknowledged. Their writes
+  directly to local Scribe state. Tenant provisioning and upgrade migration
+  MUST idempotently create exactly one internal `system` principal row named
+  `verification-results-writer` for each tenant in the existing tenant machine
+  principal store. Its server-minted `PrincipalId` MUST be UUIDv7 and remain
+  stable after provisioning. It is not a Card, API key, refresh token, role
+  grant, workload binding, or user-manageable principal.
+
+  Immediately before each result-publication attempt, the runner MUST mint a
+  normal short-lived Wyrd access token using that tenant's persisted SYSTEM
+  principal. The token MUST contain the run tenant, `kind=system`, no roles or
+  bound root Card, and signed Card scope containing exactly one UID-bearing
+  `Verifier` CardRef: the run's exact Verifier version. Verification MUST reject
+  a missing or non-UUIDv7 persisted principal, a mismatched tenant, a bound root
+  Card, any role, an empty or multi-Card scope, a non-Verifier scope member, or
+  a scope member without managed Card UID. Public API-key, refresh, JWT-bearer,
+  delegation, workload-binding, principal-management, and token-exchange paths
+  MUST reject creation, credentialing, impersonation, delegation, or refresh
+  of `system`. Expiry or retry mints a new short-lived token; no credential is
+  persisted.
+
+  A valid SYSTEM result token receives only the existing
+  `bifrost_record:write` permission. Gate MUST reserve exactly
+  `vala.verification.results`, `vala.drift.result_features`, and
+  `vala.eval.result_items` for this principal kind. A write to one of those
+  tables requires `kind=system`, that permission, and the exact signed Verifier
+  scope; every other principal, including wildcard administrators, is denied.
+  SYSTEM is denied every other table. Gate MUST enforce and audit this as its
+  one canonical `bifrost_record:write` decision. Scribe MUST continue to derive
+  tenant and `principal_id` from authenticated authority, authorize every row's
+  Verifier CardRef against signed scope, and stamp the managed Verifier Card
+  UID; neither tenant nor Card UID may be trusted from Arrow payloads.
+  `Verifier` is therefore an eligible scoped Bifrost target only for this
+  internal path. The global `SYSTEM_OWNER` tenant, platform audit principal,
+  and audit-publisher identity MUST NOT be reused.
+
+  Every non-empty required detail batch is written before the canonical
+  summary batch, and each is separately acknowledged. A result with zero
+  details—such as sampled-out Eval or pre-scoring inconclusive Drift—writes no
+  empty detail batch and requires only the summary acknowledgement. Their writes
   are not atomic across tables. Only after every required batch is
   acknowledged may the runner settle verifier_runs as completed and create
   Operator dispatches. Partial result rows may be visible after a failed
@@ -819,7 +927,8 @@ table on `(data_tenant_id, result_id)`.
   generic runner MUST settle the run and insert one operator_dispatches row
   for each distinct configured Operator UID or inline-spec digest in the
   same Postgres transaction. Unique (tenant, run, Operator) identity makes
-  settlement retry idempotent. Passed, inconclusive, sampled-out, cancelled,
+  settlement retry idempotent. Passed and inconclusive completed runs,
+  including sampled-out, ungated, and all-skipped Eval, plus cancelled,
   timed-out, and errored runs create no dispatch. Direct analysis-only runs
   create no dispatch.
 - **REQ-098**: A separate generic Operator worker MUST poll committed due
@@ -848,17 +957,117 @@ table on `(data_tenant_id, result_id)`.
   fields; registration MUST reject unknown template fields. A later Workflow
   invocation MUST receive this same context, not a second payload contract.
 - **REQ-139**: The server MUST resolve every external Operator credential at
-  invocation under the exact run tenant, provider, and named connection. A
-  tenant may not name or read an arbitrary process environment variable or
-  another tenant's credential through an Operator Card. Each Notify channel
-  MUST name a nonsecret `connection`; the server's tenant-scoped connection
-  configuration binds that name to a secret reference available to every
-  Operator runner replica. Existing HTTP auth variants MUST likewise name an
-  approved tenant-scoped connection instead of carrying an unrestricted `env`
-  selector. Secret values never enter Card specs, dispatch rows, result rows,
-  status responses, or diagnostic messages. Rotation of the configured secret
-  does not require a Card revision. This change adds no public connection
-  management operation.
+  invocation from Postgres under the exact authenticated run tenant, provider,
+  and named connection. A tenant may not name or read an arbitrary process
+  environment variable or another tenant's credential through an Operator
+  Card. Each Notify channel MUST name a nonsecret `connection`; existing HTTP
+  auth variants MUST retain their scheme/header shape but replace every `env`
+  selector with that tenant-scoped connection name. The runner resolves and
+  decrypts the latest active credential immediately before each attempt, so
+  all replicas observe the same durable connection and rotation does not
+  require a Card revision or server rollout. Missing, disabled, wrong-provider,
+  and wrong-tenant connections fail closed through indistinguishable safe
+  errors. Secret values never enter Card specs, dispatch/result rows, status or
+  connection-read responses, logs, traces, audit payloads, or diagnostics.
+- **REQ-147**: Postgres MUST persist each Operator connection under a
+  server-minted UUIDv7 connection ID with tenant, closed provider
+  (`slack | pager_duty | http`), immutable validated name, provider-specific
+  nonsecret configuration, `active | disabled` status, encrypted credential,
+  encryption-key version, creator/updater principal identities, and timestamps.
+  `(data_tenant_id, provider, name)` MUST be unique and tenant access MUST use
+  `TenantConn` with forced RLS. Postgres MUST never contain plaintext secret
+  material. Each secret version MUST use tenant-scoped envelope encryption: a
+  cryptographically random data-encryption key, authenticated encryption with
+  canonical tenant/connection/provider/name/version context, and a wrapped key
+  bound to an externally held tenant-scoped key-encryption key and key version.
+  Root or key-encryption material MUST remain outside Postgres in the deployment
+  secret/KMS boundary. Rotation replaces the encrypted secret on the same
+  connection identity; key rotation MUST support rewrapping or re-encryption
+  without exposing plaintext through a public surface. Decrypted bytes exist
+  only for the bounded delivery attempt in a redacted secret type and are not
+  cached across attempts. The implementation MUST reuse `wyrd-crypt`'s
+  AES-256-GCM and operating-system randomness, extended to authenticate the
+  canonical associated data
+  `(domain, data_tenant_id, connection_id, provider, name, secret_version)`;
+  no second cryptography package or bespoke cipher is introduced. Each secret
+  version gets a fresh 256-bit DEK and nonce. That DEK is separately wrapped
+  under the exact tenant KEK version using the same authenticated primitive
+  with a distinct domain tag.
+
+  The deployment key provider is the existing external-secret resolver and
+  its `SecretRef::Vault` boundary (the configured backend may be Vault, AWS
+  Secrets Manager, or Google Secret Manager). Server configuration MUST supply
+  one external key prefix and one active positive key version; the resolver
+  reads a 32-byte KEK from
+  `<prefix>/<data_tenant_id>/<key_version>`. Multi-tenant production MUST use
+  this external provider and MUST fail startup if it or the active key is
+  unavailable; environment-sourced KEKs are development-only, while a
+  restrictive file-mounted KEK MAY be used by an explicitly single-tenant
+  deployment. Postgres stores only the key version and wrapped DEK. KEK
+  rotation publishes a new external version before making it active; new
+  writes use it, existing rows are rewrapped in bounded tenant-scoped work,
+  and an old external version is retained until no row references it. Rewrap
+  exposes only the DEK inside the process and does not decrypt the credential.
+- **REQ-148**: Tenant administrators MUST manage Operator connections through
+  typed server-owned operations: create; list/get redacted metadata; update
+  nonsecret configuration, status, or the write-only secret; and disable. The
+  HTTP surface MUST provide `POST /v1/operator-connections`,
+  `GET /v1/operator-connections`,
+  `GET /v1/operator-connections/{connection_id}`,
+  `PATCH /v1/operator-connections/{connection_id}`, and
+  `DELETE /v1/operator-connections/{connection_id}`. Provider and name are
+  immutable after creation. An omitted secret on PATCH preserves it; a supplied
+  secret atomically replaces it. DELETE disables and retains the row for Card,
+  dispatch, audit, and rotation lineage rather than physically deleting it;
+  PATCH may re-enable a valid connection. Reads expose ID, provider, name,
+  redacted nonsecret configuration, status, and timestamps only. Rust, Python,
+  TypeScript, CLI, and MCP MUST project the same typed operations; MCP writes
+  require explicit write scope. Reads require existing `operators:read` and
+  mutations existing `operators:write`, with the canonical transactional audit
+  decision. No read-secret or plaintext export operation exists.
+- **REQ-150**: Operator-connection writes MUST use one closed provider-tagged
+  wire union rather than a free-form configuration map. Create shapes are:
+  `slack { name, workspace_id, bot_token }`,
+  `pager_duty { name, integration_key }`, and
+  `http { name, origin, auth }`, where HTTP `auth` is exactly
+  `bearer { token }`, `basic { username, password }`, or
+  `header { name, value }`. `origin` is a normalized HTTPS
+  scheme/host/effective-port tuple with no path, query, fragment, or userinfo.
+  PATCH uses the matching provider-specific update shape plus optional status:
+  omitted fields are preserved; a supplied Slack token, PagerDuty integration
+  key, or complete HTTP auth value replaces the encrypted secret atomically;
+  a supplied HTTP auth value may also replace its scheme/header authority.
+  Provider and connection name never change. Redacted reads return the common
+  ID/provider/name/status/timestamps and only `workspace_id` for Slack, no
+  PagerDuty configuration, or HTTP origin plus auth scheme and custom-header
+  name; they never return a token, key, username, password, or header value.
+  `OperatorConnectionId` is the typed UUIDv7 used by path parameters and
+  responses.
+
+  Operator Cards use those exact authorities: Slack carries
+  `{ connection, channel_id, text }`; PagerDuty carries
+  `{ connection, route, severity, summary }`; HTTP auth is omitted for an
+  unauthenticated request or is one of `bearer { connection }`,
+  `basic { connection }`, or `header { name, connection }`. Thus a Card never
+  selects an environment variable or contains a credential. There is no
+  unauthenticated HTTP connection record because an auth-less HTTP Operator
+  has no secret to resolve.
+- **REQ-149**: Registration of a binding or Operator using a connection MUST
+  verify that the exact tenant/provider/name exists, is active, and is
+  compatible without decrypting it. Slack connections bind one workspace bot
+  token; PagerDuty connections bind one Global Integration key. An HTTP
+  connection additionally binds one normalized HTTPS origin and the exact
+  auth scheme and, for custom-header auth, case-insensitive header name.
+  Registration and every delivery attempt MUST require the Operator's HTTP
+  auth variant/header and effective URL origin to equal that stored authority;
+  a mismatch fails before secret decryption. Every effective templated HTTP URL and redirect MUST
+  retain that credential authority and pass the repository resolve-screen-pin
+  SSRF policy before credentials are attached; origin-changing redirects are
+  rejected. Operator-authored headers MUST NOT set `Authorization`, `Host`,
+  `Content-Length`, `Transfer-Encoding`, `Connection`, or `Idempotency-Key`.
+  Missing, empty, malformed, or unauthorized credentials are terminal;
+  transient Postgres, key-provider, or decryption-service unavailability uses
+  REQ-142's bounded retry path.
 - **REQ-140**: Slack Notify MUST use one tenant-scoped bot-token connection per
   Slack workspace and the authored `channel_id`, calling Slack
   `chat.postMessage` with `chat:write`. The app must be permitted to post in
@@ -931,9 +1140,11 @@ table on `(data_tenant_id, result_id)`.
   subject, and Verifier Card identities, the current principal-activity gate,
   readiness and reason, nullable `next_run_at` (null for Eval), nullable
   `last_activated_at`, and nullable `last_run_id`. Run GET MUST return run ID,
-  execution status, nullable `result_id`, structured execution error when
-  present, and the current independent delivery status of each configured
-  Operator dispatch. It MUST NOT duplicate the authoritative verdict or
+  execution status, nullable `requested_by_principal_id`, nullable `result_id`,
+  structured execution error when present, and the current independent
+  delivery status of each configured Operator dispatch. A manual run returns
+  its authenticated requester; scheduler- and observation-created runs return
+  null. It MUST NOT duplicate the authoritative verdict or
   Drift/Eval detail rows from Bifrost. A run may point to an acknowledged
   result before it becomes visible to an analytical query.
 - **REQ-136**: `POST /v1/verification/runs` MUST accept one tagged target:
@@ -944,7 +1155,10 @@ table on `(data_tenant_id, result_id)`.
   `202 { run_id }` after durable enqueue, without waiting for scoring.
   Binding target uses its frozen Trigger/Operator configuration and MAY
   dispatch on failed verdict; direct Verifier target is analysis-only and
-  MUST NOT dispatch. Request retries MUST use the existing HTTP
+  MUST NOT dispatch. Every manual call MUST be authenticated, authorized with
+  `evals:run` plus exact target scope, transactionally audited, and persisted
+  with that caller's `principal_id`; the credential identifies the requester,
+  not a binding owner Card. Request retries MUST use the existing HTTP
   `Idempotency-Key` contract, not a new activation resource. Invalid target,
   window, unauthorized subject, tenant mismatch, or unready baseline MUST
   fail before enqueue with a structured Wyrd error.
@@ -1005,6 +1219,10 @@ table on `(data_tenant_id, result_id)`.
   Verification binding and run status require `cards:read`; reading analytical
   results additionally requires `bifrost_query:read`. Direct and binding-backed
   manual Verifier runs require `evals:run` plus scope over the exact target.
+  Operator-connection metadata reads require `operators:read`; create, secret
+  rotation, metadata/status update, disable, and re-enable require
+  `operators:write`. No connection-management operation is authorized by
+  `operators:invoke` alone.
   Each boundary that evaluates one of these permissions MUST append its allow
   or deny through the canonical transactional audit path. The durable binding
   freezes the already-authorized Operator; the tenant-scoped SYSTEM worker
@@ -1040,6 +1258,7 @@ table on `(data_tenant_id, result_id)`.
   `run_api.md`'s one invocation ID with exact per-observation CardRef scope,
   rather than claiming that every Card switch requires a distinct Run ID.
   Operator documentation MUST also describe tenant-bound connections,
+  their encrypted Postgres management operations,
   Slack bot-token/channel-ID delivery, PagerDuty Global Integration routing,
   the unavailable Workflow invocation, and removal of the unused alert router.
 - **REQ-089**: The supported Drift and continuous Eval paths MUST have no
@@ -1054,10 +1273,12 @@ table on `(data_tenant_id, result_id)`.
   the meaning of its existing fields.
 - **REQ-062**: Every result MUST bind the exact tenant, run identity, subject,
   Verifier Card UID/version, input identity, execution status, and, for a
-  completed run, verdict and summary. Drift and Eval results bind their
-  verification binding, effective Trigger, and observation record or
-  comparison window; they MUST NOT fabricate a Change Request, Claim, or code
-  Evidence.
+  completed run, verdict and available summary. Binding-created Drift and Eval
+  results bind their owner, verification binding, effective Trigger, and
+  observation record or comparison window. Direct results have no owner,
+  binding, Trigger, or Operator identity; their run retains the authenticated
+  requesting principal. Results MUST NOT fabricate a Change Request, Claim, or
+  code Evidence.
 - **REQ-063**: Execution status and verdict MUST remain independent. Only a
   completed execution may produce `passed`, `failed`, or `inconclusive`.
   Cancelled, timed-out, and errored executions have no verdict.
@@ -1117,6 +1338,9 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
   vala.verification.results and vala.drift.result_features rows joined by
   (`data_tenant_id`, `result_id`), and queryable results. A Custom metric journey
   proves ready registration without a fit job and server-side window mean.
+  Empty and invalid Custom windows MUST persist `completed/inconclusive` with
+  null `details` and zero feature rows; scored Drift MUST persist its existing
+  report and produced feature rows.
   Invalid/non-Parquet baselines, failed fitting, insufficient data,
   unauthorized access, and cross-tenant reads fail visibly.
 - **AC-013**: A real Service binding journey registers a Drift Verifier,
@@ -1149,8 +1373,11 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
   post-commit enqueue failure MUST preserve the Bifrost observation, return
   successful ingest, emit a structured
   tracing error, and create no Eval run or Operator dispatch. A failing
-  pass_gate creates one dispatch per configured Operator; an absent or
-  passing gate creates none. The LLM judge uses a local mock provider.
+  pass_gate creates one dispatch per configured Operator; a passing gate
+  creates none; an absent gate persists `completed/inconclusive` and creates
+  none. A sampled-out record persists one zero-count summary, zero item rows,
+  and no dispatch. An all-skipped workflow persists its skipped rows and is
+  inconclusive regardless of gate. The LLM judge uses a local mock provider.
 - **AC-026**: Rust, Python, and TypeScript Eval journeys MUST emit a native
   serializable context through `observe.eval(...)` with optional session and
   media; they MUST prove the SDK constructs the existing
@@ -1186,12 +1413,16 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
   table to acknowledge while another fails: partial rows may be visible,
   the run MUST NOT settle completed or dispatch Operators, and the error or
   retry state MUST be inspectable. A fresh write_batch call MUST NOT be
-  misrepresented as an idempotent replay.
+  misrepresented as an idempotent replay. Zero-detail completed results send
+  no empty detail batch and require only the summary acknowledgement.
 - **AC-016**: Continuous Eval covers sampled-in execution, sampled-out
-  completion without tasks, AwaitingTrace retry, deterministic assertion,
-  LLM judge, context capture, task execution error versus failed assertion,
-  pass_gate pass/fail/absence, worker retry/dead-letter, and restart
-  recovery of successfully enqueued work. Offline scenario Data Card
+  `completed/inconclusive` with a zero-count summary, ungated
+  `completed/inconclusive`, all-skipped `completed/inconclusive`,
+  AwaitingTrace requeue and deadline-to-`timed_out`, deterministic assertion,
+  LLM judge, context capture, false assertion versus propagated executor/input
+  error, pass-gate pass/fail, bounded retry-to-`errored`, no result rows for
+  timed-out/errored execution, and restart recovery of successfully enqueued
+  work. Offline scenario Data Card
   registration and dataset-backed Eval are not acceptance obligations for
   this initial change.
 - **AC-017**: Each first-class Rust, Python, and TypeScript SDK MUST have
@@ -1243,7 +1474,11 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
   support a manual bounded Drift binding run and a direct analysis-only run;
   both return `202 { run_id }`, can be polled to terminal status, and expose
   a Bifrost `result_id`. A failed binding run exposes every independent
-  Operator delivery state through Run GET, while a direct run has none.
+  Operator delivery state through Run GET, while a direct run has none. Both
+  manual forms persist and return the authenticated
+  `requested_by_principal_id`; direct result/detail rows set
+  `owner_card_uid` and `binding_id` to null rather than copying the caller,
+  subject, or Verifier.
   Existing Bifrost query returns the authoritative summary and details;
   no separate result or dispatch endpoint is required. Tests cover
   idempotent manual-request retry, invalid windows, unavailable baseline,
@@ -1306,6 +1541,19 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
   the Verifier result or creating an Alert. Before release, a gated live smoke
   check MUST send to a dedicated Slack test channel and PagerDuty test
   service through the same Operator runner; fast lanes require no credentials.
+- **AC-031**: A tenant-admin journey creates Slack, PagerDuty, and HTTP
+  Operator connections through the public typed surface, lists and reads only
+  redacted metadata, rotates a secret without changing a Card, disables and
+  re-enables a connection, and proves every first-class SDK plus CLI/MCP
+  projects the same contract. Postgres inspection MUST show UUIDv7 identities,
+  forced tenant RLS, ciphertext and wrapped-key material only, authenticated
+  tenant/connection context, and key-version metadata; neither responses nor
+  logs expose plaintext. Cross-tenant lookup, under-privileged mutation,
+  read-secret attempts, wrong-provider references, disabled connections,
+  HTTP origin/auth mismatch, credential-bearing forbidden headers, and
+  origin-changing redirects MUST fail closed. A multi-replica Operator journey
+  MUST observe a Postgres rotation on the next attempt without a Card revision
+  or replica rollout.
 - **AC-023**: A multi-server journey MUST run the Verifier worker on a server
   without local Scribe ownership and prove its Arrow result batches return
   through `wyrd_client::Bifrost` to Gate/Scribe, are acknowledged, and are
@@ -1314,7 +1562,10 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
   tenant-scoped SYSTEM writer `principal_id`, exact Verifier `card_uid`, and
   explicit subject/owner/binding IDs. A forged tenant or out-of-scope Verifier
   `card_ref` MUST be rejected; no global `SYSTEM_OWNER` token may write a
-  customer-tenant result. Two bindings for one subject MUST remain
+  customer-tenant result. Provisioning MUST create one stable UUIDv7 SYSTEM
+  principal per tenant without a public credential. Tests MUST reject public
+  issuance, refresh, and delegation for SYSTEM, non-SYSTEM writes to any result
+  table, and SYSTEM writes to every other table. Two bindings for one subject MUST remain
   independently filterable through runs/results while sharing the one raw
   subject observation without Verifier/binding columns or per-binding copies.
 - **AC-024**: Bifrost catalog/schema tests MUST assert the exact column names,
@@ -1329,11 +1580,16 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
   an Oracle query plan or scan metric MUST demonstrate time-partition pruning
   and `result_id` row-group pruning where the predicate is selective. The
   result and its details MUST report the same `wyrd_event_time` even when
-  their separate Scribe acknowledgements straddle a UTC day boundary.
+  their separate Scribe acknowledgements straddle a UTC day boundary. Schema
+  evidence MUST also prove nullable `owner_card_uid` and nullable Drift
+  `details`, with null owner only for direct runs and null details only for
+  completed Drift executions that produced no report.
 - **AC-030**: Authorization journeys MUST prove each REQ-145 permission at its
   public or Gate boundary, including allow and deny audit rows, subject Card
   scope refusal, reserved-table refusal, and no audit rows for internal claims,
-  retries, Scribe commits, or worker mechanics. A multi-tenant runtime journey
+  retries, Scribe commits, or worker mechanics. They MUST also prove
+  `operators:read` versus `operators:write` separation for connection
+  management and Gate's closed SYSTEM/result-table matrix. A multi-tenant runtime journey
   MUST saturate one tenant at four Verifier and four Operator executions while
   another tenant still progresses, and MUST show neither global pool exceeds
   16. A slow local Operator endpoint MUST prove the 30-second attempt timeout,
@@ -1346,7 +1602,8 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
 
 ## Open material decisions
 
-None. Revision 30 was explicitly approved on 2026-09-19.
+None. Revision 32 was explicitly approved by the user's delegated
+Ponytail blocker resolver on 2026-09-19.
 
 ## Material authority links
 
@@ -1516,4 +1773,27 @@ None. Revision 30 was explicitly approved on 2026-09-19.
   per-tenant Verifier and Operator capacity, Operator timeout/attempt/deadline
   limits, graceful shutdown, supervision, health, tracing, and metrics. No
   material decisions remain; this revision was explicitly approved on
+  2026-09-19.
+- **Revision 31 result, identity, and connection correction (2026-09-19):**
+  Made Eval terminal behavior explicit: sampled-out, ungated, and
+  zero-attestation executions complete inconclusive; execution/input failures
+  remain errored or timed out rather than becoming failed assertions. Allowed
+  completed pre-scoring Drift results to omit `DriftReport` details and feature
+  rows. Replaced deterministic SYSTEM identity with one persisted UUIDv7
+  internal principal per tenant and fixed its reserved-table admission matrix.
+  Replaced process-local Operator secret references with tenant-isolated,
+  envelope-encrypted Postgres connections and typed redacted management
+  operations. Separated manual requester identity from nullable binding-owner
+  identity on direct runs. These corrections were explicitly approved on
+  2026-09-19.
+- **Revision 32 planning-blocker resolution (2026-09-19):** Replaced Drift and
+  Eval with Verifier in the authoritative 15-kind catalog and binding doctrine.
+  Preserved the existing SPC profile and scorer instead of introducing the
+  conflicting fixed-rule dual-chart design. Fixed UUIDv7 BindingId persistence,
+  `wyrd-sql` ownership of RLS-protected verification control tables, closed
+  provider-specific Operator-connection CRUD shapes, exact HTTP credential
+  authority matching, and external tenant/version KEK resolution and rotation.
+  Synchronized the linked runtime diagram's ingest-time windows, no-backfill,
+  post-ack Eval enqueue, and no-Alert flow. This revision was explicitly
+  approved through the user's delegated blocker-resolution authority on
   2026-09-19.

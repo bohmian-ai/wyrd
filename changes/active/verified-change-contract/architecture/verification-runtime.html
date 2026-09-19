@@ -123,14 +123,14 @@
     <div>
       <div class="eyebrow">Wyrd / architecture decision aid</div>
       <h1>Verification runtime</h1>
-      <p>The full path from registered Cards to scheduled Drift, automatic Eval, durable results, retries, Alerts, and notifications.</p>
+      <p>The full path from registered Cards to scheduled Drift, automatic Eval, durable results, retries, and Operator delivery.</p>
     </div>
     <div class="stamp">Proposed architecture<br>Not implemented<br>16 Sep 2026</div>
   </header>
 
   <div class="callout warn"><strong>Earlier proposal, superseded.</strong> Use <a href="verification-control-flow.html">verification-control-flow.html</a> for the locked initial runtime and <a href="logic/run_api.md">run_api.md</a> for the client contract. In particular, <code>WyrdState</code> owns a Bifrost facade with the existing pooled queue; <code>observe.drift(...)</code> and <code>observe.eval(...)</code> finish kind-specific record and fixed-row projection before inserting through it. Shared <code>wyrd-client</code>/<code>wyrd-queue</code> never interprets Verifier kinds. Other flow or storage claims below are historical proposals, not authority.</div>
 
-  <div class="takeaway"><strong>The rule for continuous bindings:</strong> Trigger creates binding activation, which creates a run. VerifierRunner executes it. A <em>completed failed verdict</em> may enqueue an Operator. An <em>execution error</em> retries the same run and does not alert. Direct/offline runs use the same runner without a Trigger or automatic reaction.</div>
+  <div class="takeaway"><strong>The rule for continuous bindings:</strong> Trigger creates binding activation, which creates a run. VerifierRunner executes it. A <em>completed failed verdict</em> may enqueue an Operator. An <em>execution error</em> retries the same run and does not alert. Direct manual runs use the same runner without a Trigger or automatic reaction.</div>
 
   <section class="section" aria-labelledby="overview">
     <div class="section-head"><span class="eyebrow">01 / System map</span><h2 id="overview">Who owns what</h2></div>
@@ -167,7 +167,7 @@
           <div class="node data"><span class="tag">Bifrost</span><strong>Verification Result</strong><small>Common verdict + DriftReport or EvalResults</small></div>
           <div class="node control"><span class="tag">Failed binding verdict</span><strong>Operator dispatch</strong><small>Unique by binding-created run</small></div>
           <div class="node control"><span class="tag">VerificationRuntime</span><strong>Operator</strong><small>Notify, HTTP, or Workflow; own retry state</small></div>
-          <div class="node action"><span class="tag">Notify only</span><strong>Alert → delivery work</strong><small>Separate delivery retry state before Slack</small></div>
+          <div class="node action"><span class="tag">Notify only</span><strong>External delivery</strong><small>The dispatch row owns delivery retries; no Alert resource</small></div>
         </div>
       </div>
     </div>
@@ -192,16 +192,16 @@
       <div class="node card"><span class="tag">Register</span><strong>Drift Verifier</strong><small>PSI/SPC: Data Card baseline ref + profile. Custom: authored metric baseline.</small></div><div class="arrow" aria-hidden="true">→</div>
       <div class="node control"><span class="tag">Prepare</span><strong>Baseline readiness</strong><small>PSI/SPC: async Parquet → FittedBaseline. Custom: ready, no fit job.</small></div><div class="arrow" aria-hidden="true">→</div>
       <div class="node data"><span class="tag">Observe</span><strong>Raw Drift records</strong><small>Existing record → Wyrd queue → Gate → Scribe → Bifrost.</small></div><div class="arrow" aria-hidden="true">→</div>
-      <div class="node control"><span class="tag">Schedule</span><strong>Due + active + ready</strong><small>Cron materializes one fixed [start,end) window; run eligible after allowed_lateness.</small></div><div class="arrow" aria-hidden="true">→</div>
+      <div class="node control"><span class="tag">Schedule</span><strong>Due + active + ready</strong><small>Cron materializes one fixed [start,end) ingest-time window.</small></div><div class="arrow" aria-hidden="true">→</div>
       <div class="node control"><span class="tag">Run</span><strong>Query + aggregate</strong><small>Oracle reads window; server computes PSI bins, SPC subgroup means, or Custom mean.</small></div><div class="arrow" aria-hidden="true">→</div>
       <div class="node data"><span class="tag">Score + persist</span><strong>DriftReport</strong><small>Existing vala-drift scorer → typed report + common Verification Result.</small></div><div class="arrow" aria-hidden="true">→</div>
-      <div class="node action"><span class="tag">React</span><strong>Failed only</strong><small>Binding-created run dispatches optional on_failure; Notify creates Alert.</small></div>
+      <div class="node action"><span class="tag">React</span><strong>Failed only</strong><small>Binding-created run dispatches optional on_failure; no Alert resource.</small></div>
     </div></div>
     <div class="branch-grid">
       <div class="path"><h3>PSI and SPC baseline path</h3><ol><li>Data Card authoring from Pandas, Polars, or Arrow registers Parquet. Verifier registration resolves that exact Data identity and queues fitting without blocking.</li><li>Status exposes pending → building → ready/failed. Only ready PSI/SPC Verifiers can score; each run loads the persisted exact fitted baseline.</li><li>PSI compares server-counted window bins to fitted baseline distribution. SPC evaluates ordered subgroup means against fitted control limits. Empty or insufficient windows become inconclusive, not drift.</li></ol></div>
       <div class="path"><h3>Custom metric and manual path</h3><ol><li>Custom validates its scalar baseline and threshold at registration; it has no Data baseline reference, fitting job, or persisted fitted profile.</li><li>Server selects the named raw numeric series in the same fixed window, computes its mean, and calls the existing custom scorer.</li><li>A direct Verifier request selects an explicit bounded window and is analysis-only. A manual <em>binding</em> invocation also supplies an explicit window, leaves the cron cursor unchanged, and may dispatch its configured <code>on_failure</code>.</li></ol></div>
     </div>
-    <div class="callout"><strong>Window rule:</strong> first scheduled window is <code>[owner becomes runtime-active, first cron)</code>; later windows are <code>[previous cron, current cron)</code>. A run is eligible at <code>window_end + allowed_lateness</code>. Oracle filters <code>DriftRecordObservation.created_at</code> within that stored half-open window; retries reuse the same window. Missed occurrences for an active owner are materialized separately in bounded batches; occurrences while inactive are skipped, never backfilled.</div>
+    <div class="callout"><strong>Window rule:</strong> first scheduled window is <code>[owner becomes runtime-active, first cron)</code>; later windows are <code>[previous cron, current cron)</code>. Oracle filters managed <code>wyrd_event_time</code> within that stored half-open window; <code>created_at</code> remains lineage and SPC ordering only. Retries reuse the same window. Missed, inactive, or baseline-unready occurrences are skipped, never backfilled; the cursor advances to the next future boundary.</div>
   </section>
 
   <section class="section" aria-labelledby="eval-path">
@@ -209,22 +209,22 @@
     <div class="flow-wrap"><div class="flow">
       <div class="node card"><span class="tag">Register</span><strong>Eval Verifier</strong><small>EvalSpec tasks, sampling, pass_gate, context_capture; observations_ready binding.</small></div><div class="arrow" aria-hidden="true">→</div>
       <div class="node data"><span class="tag">Observe</span><strong>Eval record</strong><small>Existing record → Wyrd queue → Gate → Scribe → Bifrost.</small></div><div class="arrow" aria-hidden="true">→</div>
-      <div class="node control"><span class="tag">Commit</span><strong>Activation</strong><small>Scribe batch-control transaction enqueues once for active exact binding + record_id.</small></div><div class="arrow" aria-hidden="true">→</div>
-      <div class="node control"><span class="tag">Select</span><strong>Sample + trace</strong><small>Sampled-out stops; sampled-in may enter AwaitingTrace before tasks.</small></div><div class="arrow" aria-hidden="true">→</div>
+      <div class="node control"><span class="tag">After ACK</span><strong>Best-effort run enqueue</strong><small>Asynchronous idempotent insert for active exact binding + record_id.</small></div><div class="arrow" aria-hidden="true">→</div>
+      <div class="node control"><span class="tag">Select</span><strong>Sample + trace</strong><small>Sampled-out completes inconclusive with a zero-count summary; sampled-in may await trace.</small></div><div class="arrow" aria-hidden="true">→</div>
       <div class="node control"><span class="tag">Execute</span><strong>Existing Eval engine</strong><small>Deterministic assertions, LLM judge, workflow aggregation.</small></div><div class="arrow" aria-hidden="true">→</div>
       <div class="node data"><span class="tag">Persist</span><strong>EvalResults</strong><small>Apply context_capture before storage/public output; pass_gate maps common verdict.</small></div><div class="arrow" aria-hidden="true">→</div>
-      <div class="node action"><span class="tag">React</span><strong>Failed gate only</strong><small>Optional on_failure dispatch; absent gate never invents failure or Alert.</small></div>
+      <div class="node action"><span class="tag">React</span><strong>Failed gate only</strong><small>Optional on_failure dispatch; absent gate never invents failure.</small></div>
     </div></div>
     <div class="branch-grid">
-      <div class="path"><h3>Continuous Eval decisions</h3><ol><li>Only a committed observation routed to an active exact binding creates work; Scribe's commit and activation insertion share the tenant-scoped control transaction.</li><li>Sampling is applied before task execution. A sampled-out activation terminates without tasks or dispatch. Trace-dependent records use the existing AwaitingTrace retry/dead-letter lifecycle. Task execution error is not an assertion failure.</li><li>The authored <code>EvalSpec.pass_gate</code> alone decides failure. An executed Eval without a gate persists <code>EvalResults</code> but creates no dispatch. Context capture changes stored evidence, not the verdict.</li></ol></div>
-      <div class="path"><h3>Offline Eval is a separate entry path</h3><ol><li>Register <code>EvalScenarioCollection</code> as a Data Card backed by a Bifrost table; <code>EvalSpec.dataset</code> references it.</li><li>An explicit offline run loads those scenarios and executes the existing Eval workflow against the selected subject—no observations-ready trigger and no cron.</li><li>Persist complete <code>EvalResults</code> plus the common Verification Result with exact dataset, subject, Verifier, and run identities.</li></ol></div>
+      <div class="path"><h3>Continuous Eval decisions</h3><ol><li>After Scribe acknowledges a committed observation, the server asynchronously attempts one idempotent run insert per active exact binding. It is not part of the Scribe batch-fence transaction; failure is observable but the observation remains committed and no run is guaranteed.</li><li>Sampling is applied before task execution. A sampled-out activation completes inconclusive with a zero-count summary, no item rows, and no dispatch. Trace-dependent records use <code>AwaitingTrace</code>; deadline expiry is <code>timed_out</code>. Task execution error is not an assertion failure.</li><li>An authored <code>EvalSpec.pass_gate</code> maps an attested workflow to passed or failed. No gate or zero attesting tasks is inconclusive. Context capture changes stored evidence, not the verdict.</li></ol></div>
+      <div class="path"><h3>Offline Eval remains future scope</h3><ol><li>This change does not register scenario datasets or expose a dataset-backed run entry point.</li><li>A later offline path must reuse the same scoring and judging implementation as continuous Eval.</li><li>Adding that path requires its own approved contract and acceptance journeys.</li></ol></div>
     </div>
   </section>
 
   <section class="section" aria-labelledby="contracts">
     <div class="section-head"><span class="eyebrow">05 / Shared runner</span><h2 id="contracts">One run lifecycle; implementation-specific input and execution</h2></div>
     <div class="flow-wrap"><div class="flow">
-      <div class="node control"><span class="tag">Entry</span><strong>Activation / invocation</strong><small>Cron, committed record, offline request, or future Change Request.</small></div><div class="arrow" aria-hidden="true">→</div>
+      <div class="node control"><span class="tag">Entry</span><strong>Activation / invocation</strong><small>Cron, committed record, manual request, or future Change Request.</small></div><div class="arrow" aria-hidden="true">→</div>
       <div class="node control"><span class="tag">Durable</span><strong>Verifier run</strong><small>Exact tenant, subject, Verifier version, activation/invocation, bounded input selector.</small></div><div class="arrow" aria-hidden="true">→</div>
       <div class="node control"><span class="tag">Dispatch</span><strong>Typed implementation</strong><small>Load authorized inputs and execute Drift/Eval now; other variants later.</small></div><div class="arrow" aria-hidden="true">→</div>
       <div class="node data"><span class="tag">Normalize</span><strong>Common result</strong><small>Persist typed output, then verdict/summary/findings and result pointer.</small></div><div class="arrow" aria-hidden="true">→</div>
@@ -235,7 +235,7 @@
       <thead><tr><th>Implementation</th><th>Run's input selector</th><th>Runner retrieves</th><th>Typed output</th><th>Verdict source</th></tr></thead>
       <tbody>
         <tr><td>Drift · now</td><td>Binding + fixed window; or analysis-only direct request</td><td>Oracle window; fitted baseline for PSI/SPC, authored scalar for Custom</td><td><code>DriftReport</code></td><td>DriftSpec method/threshold</td></tr>
-        <tr><td>Eval · now</td><td>Binding + committed <code>record_id</code>; or offline dataset/run</td><td>Record/optional trace, or scenario Data Card; EvalSpec</td><td><code>EvalResults</code></td><td>Authored <code>pass_gate</code>; absent gate does not invent failure</td></tr>
+        <tr><td>Eval · now</td><td>Binding + committed <code>record_id</code></td><td>Record and optional trace; EvalSpec</td><td><code>EvalResults</code></td><td>Authored <code>pass_gate</code>; absent gate is inconclusive</td></tr>
         <tr><td>Code review · later</td><td>Exact Change Request revision and optional Claim</td><td>Declared candidate-bound <code>code_diff</code> Evidence</td><td>Structured review findings</td><td>Declared review criteria</td></tr>
         <tr><td>CI test review · later</td><td>Exact Change Request revision and optional Claim</td><td>Declared test-results Evidence with execution provenance</td><td>Test judgment</td><td>Distinguishes failed tests from incomplete CI</td></tr>
         <tr><td>HTTP/API · later</td><td>Exact invocation and declared Evidence identities</td><td>Bounded mapped request, server-resolved secret; async job ID/retrieval when needed</td><td>Mapped remote judgment</td><td>Mapped terminal response</td></tr>
@@ -253,13 +253,13 @@
     <div class="outcomes">
       <div class="outcome pass"><span class="tag">Engine completed</span><h3>Passed / inconclusive</h3><div class="rule">completed → persist result → no Operator</div><p>A pass means criteria were met. Inconclusive means the completed analysis could not decide, such as insufficient Drift samples. Neither retries merely to seek a different verdict.</p></div>
       <div class="outcome fail"><span class="tag">Engine completed</span><h3>Failed verdict</h3><div class="rule">completed + failed → persist result → optional dispatch</div><p>Drift detected or the Eval pass gate failed. This is a valid judgment, not an execution failure. Do <strong>not</strong> rerun the verifier automatically. Only a binding-created run with <code>on_failure</code> dispatches an Operator; external delivery retries separately.</p></div>
-      <div class="outcome error"><span class="tag">Engine did not complete</span><h3>Execution error</h3><div class="rule">running → retry_wait → same run_id → dead_lettered</div><p>Transient Oracle/LLM/HTTP outage, timeout, worker crash, or unavailable dependency retries with bounded attempts and backoff. Permanent invalid input/configuration ends errored. No Operator/Alert is created.</p></div>
+      <div class="outcome error"><span class="tag">Engine did not complete</span><h3>Execution error</h3><div class="rule">running → retry_wait → same run_id → errored</div><p>Transient Oracle/LLM/HTTP outage, worker crash, or unavailable dependency retries with bounded attempts and backoff. Permanent invalid input/configuration ends errored; a trace deadline ends timed_out. Neither writes results or dispatches an Operator.</p></div>
     </div>
-    <div class="state-chain" aria-label="Verifier run state sequence">queued → running (claim token + expiry) → completed [passed | failed | inconclusive] &nbsp; OR &nbsp; retry_wait → running → … → dead_lettered</div>
+    <div class="state-chain" aria-label="Verifier run state sequence">queued → running (claim token + expiry) → completed [passed | failed | inconclusive] &nbsp; OR &nbsp; retry_wait → running → … → errored; trace deadline → timed_out</div>
     <div class="decision-grid" style="margin-top:12px">
       <div class="decision"><span class="step">RUN CLAIM</span><h3>No long database lock</h3><p>Worker claims a row with an expiring token and commits. Settlement checks the same token. A crashed worker's claim expires and another worker retries.</p></div>
-      <div class="decision"><span class="step">RESULT REPLAY</span><h3>No duplicate result</h3><p>Result batch identity derives from <code>run_id</code>. If Bifrost append succeeds but Postgres settlement crashes, retry replays the same batch and Scribe deduplicates it.</p></div>
-      <div class="decision"><span class="step">DELIVERY RETRY</span><h3>Independent lifecycle</h3><p>A failed Slack delivery retries delivery work, not the Operator dispatch or Verifier run. The Alert and Verification Result remain durable and unchanged.</p></div>
+      <div class="decision"><span class="step">RESULT RETRY</span><h3>Reuse the sealed batch</h3><p>An unacknowledged result retry preserves the same table, batch ID, and bytes so Scribe can deduplicate it. A fresh write call is not deduplicated replay.</p></div>
+      <div class="decision"><span class="step">DELIVERY RETRY</span><h3>Independent lifecycle</h3><p>A failed Slack delivery retries the same Operator dispatch, not the Verifier run. The dispatch and Verification Result remain durable and unchanged.</p></div>
     </div>
     <div class="table-wrap" style="margin-top:14px"><table>
       <thead><tr><th>Durable stage</th><th>Retry after transient failure</th><th>Terminal / observable outcome</th></tr></thead>
@@ -267,7 +267,7 @@
         <tr><td>Binding activation</td><td>Same activation identity; recover expired claim</td><td>One Verifier run or activation dead letter</td></tr>
         <tr><td>Verifier execution</td><td>Same <code>run_id</code>, exact Card versions and input window; idempotent result replay</td><td>Completed verdict, permanent error, or run dead letter</td></tr>
         <tr><td>Operator dispatch</td><td>Same dispatch identity; never rerun Verifier</td><td>Action completed or dispatch dead letter</td></tr>
-        <tr><td>External Notify delivery</td><td>Same delivery identity; respect provider rate-limit response</td><td>Delivered or delivery dead letter; Alert remains</td></tr>
+        <tr><td>External Notify delivery</td><td>Same dispatch identity; respect provider rate-limit response</td><td>Delivered or terminal dispatch error</td></tr>
       </tbody>
     </table></div>
     <div class="callout"><strong>Locked Operator policy:</strong> three total attempts, a 30-second timeout per attempt, 30-second then 2-minute retry delays, and a five-minute deadline from dispatch creation. Global Operator concurrency is 16 and per-tenant concurrency is 4. Invalid configuration and unauthorized input are permanent errors. A provider call with an ambiguous outcome can be delivered more than once unless that provider accepts the stable delivery id as an idempotency key.</div>
@@ -275,18 +275,18 @@
   </section>
 
   <section class="section" aria-labelledby="reaction">
-    <div class="section-head"><span class="eyebrow">07 / Reaction</span><h2 id="reaction">Result → Operator → Alert</h2></div>
+    <div class="section-head"><span class="eyebrow">07 / Reaction</span><h2 id="reaction">Result → Operator → delivery</h2></div>
     <div class="flow-wrap"><div class="flow">
       <div class="node data"><span class="tag">Bifrost</span><strong>Failed binding result</strong><small>Immutable verdict and findings; not direct analysis-only run.</small></div><div class="arrow" aria-hidden="true">→</div>
       <div class="node control"><span class="tag">Postgres</span><strong>Dispatch</strong><small>Inserted once while run settles; exact Operator config.</small></div><div class="arrow" aria-hidden="true">→</div>
       <div class="node control"><span class="tag">Operator worker</span><strong>Claim + execute</strong><small>Separate token, retries, and terminal status.</small></div><div class="arrow" aria-hidden="true">→</div>
-      <div class="node action"><span class="tag">Notify only</span><strong>Alert → delivery work</strong><small>Store Alert first; delivery owns its retries.</small></div>
+      <div class="node action"><span class="tag">Notify only</span><strong>External delivery</strong><small>The dispatch owns delivery retries.</small></div>
     </div></div>
     <div class="two-up">
-      <div class="decision"><span class="step">NOTIFY</span><h3>What is recorded?</h3><p>One proposed Alert per failed run/Notify dispatch, carrying its bounded findings and link to the immutable Bifrost result. External delivery has its own status and retry identity. Later passing runs do not resolve old Alerts.</p></div>
-      <div class="decision"><span class="step">HTTP / WORKFLOW</span><h3>What is not recorded?</h3><p>These actions use the same dispatch lifecycle but do not manufacture Alerts. They receive bounded run/result context, not raw observation tables.</p></div>
+      <div class="decision"><span class="step">NOTIFY</span><h3>What is recorded?</h3><p>One Operator dispatch per configured action, carrying bounded result context and its own delivery status. Later passing runs do not mutate old dispatches.</p></div>
+      <div class="decision"><span class="step">HTTP / WORKFLOW</span><h3>What is not recorded?</h3><p>These actions use the same dispatch lifecycle and receive bounded run/result context, not raw observation tables. Workflow remains unsupported for this change.</p></div>
     </div>
-    <div class="callout danger"><strong>Decision conflict to resolve:</strong> the change spec expects one Alert per failed run, while the Drift logic document says one Alert per finding. This diagram recommends one per failed run with findings attached; that is <em>not yet an approved spec revision</em>.</div>
+    <div class="callout"><strong>No Alert resource:</strong> the durable Operator dispatch is the only reaction and delivery work row.</div>
   </section>
 
   <section class="section" aria-labelledby="storage">
@@ -296,12 +296,12 @@
       <tbody>
         <tr><td>Card registry · Postgres</td><td>Service, Model, Data, Verifier, Trigger, Operator specs and exact references</td><td>Versioned declarations and relationships; no running state on Cards</td></tr>
         <tr><td>Auth · Postgres</td><td>Exact card-bound principal + <code>last_authenticated_at</code> (proposed column)</td><td>Eligibility from the existing authentication/refresh path; no heartbeat table</td></tr>
-        <tr><td>Verification control · Postgres</td><td>Binding projection/cursor, baseline readiness/profile, activations, runs, dispatches, Alerts, delivery work; each stage's status/claim/retry</td><td>Small durable coordination and immediate status reads</td></tr>
+        <tr><td>Verification control · Postgres</td><td>Binding projection/cursor, baseline readiness/profile, runs, Operator dispatches, and connections; each work stage's status/claim/retry</td><td>Small durable coordination and immediate status reads</td></tr>
         <tr><td>Bifrost</td><td>Raw Drift/Eval observations, common Verification Results, DriftReports, EvalResults</td><td>High-volume analytical facts and historical reports; never a work queue</td></tr>
         <tr><td>Registered Data artifact</td><td>Baseline source Parquet</td><td>Exact user-registered source for fitting; not duplicated into Postgres</td></tr>
       </tbody>
     </table></div>
-    <div class="callout warn"><strong>Baseline placement recommendation:</strong> persist compact, versioned fitted PSI/SPC state in Postgres alongside readiness and the exact Data/Verifier identities. The existing <code>FittedBaseline</code> has no serialization contract yet; that format and size bound still need to be specified. This is not another Card.</div>
+    <div class="callout"><strong>Baseline placement:</strong> persist the existing fitted PSI/SPC state in the RLS-protected Postgres control row alongside readiness and the exact Data/Verifier identities. Serialization and a defensive row-size bound are reversible implementation details owned by the Drift task; this is not another Card or a new artifact format.</div>
   </section>
 
   <section class="section" aria-labelledby="decisions">
@@ -310,8 +310,8 @@
       <div class="decision"><span class="step">AGREED DIRECTION</span><h3>One runtime, three owners</h3><p>Scheduler creates scheduled Drift runs. VerifierRunner executes Drift/Eval and later implementations. Operator executes reactions. Baseline fitting is an internal helper.</p></div>
       <div class="decision"><span class="step">AGREED DIRECTION</span><h3>Activity gates scheduled work</h3><p>Successful exchange activates or renews the exact owner version. Default inactivity cutoff: 24 hours. No per-observation writes; token expiry alone is not an exchange.</p></div>
       <div class="decision"><span class="step">AGREED DIRECTION</span><h3>Retry execution, not judgment</h3><p>Execution errors retry same durable run; completed failed verdicts dispatch the Operator once. Operator delivery retries separately.</p></div>
-      <div class="decision"><span class="step">TO LOCK IN SPEC</span><h3>Baseline pending at cron</h3><p>No PSI/SPC run before the exact fitted baseline is ready. Define whether pending-baseline cron occurrences are skipped or caught up; a terminal fit failure exposes status and starts no run.</p></div>
-      <div class="decision"><span class="step">TO LOCK IN SPEC</span><h3>Alert granularity</h3><p>Recommend one independent Alert per failed run/Notify dispatch, containing all findings. Reconcile the change spec with Drift logic.</p></div>
+      <div class="decision"><span class="step">LOCKED</span><h3>Baseline pending at cron</h3><p>No PSI/SPC run starts before the exact fitted baseline is ready. Unready occurrences are skipped without catch-up; a terminal fit failure remains visible.</p></div>
+      <div class="decision"><span class="step">LOCKED</span><h3>No Alert resource</h3><p>One independent Operator dispatch is the durable reaction and delivery state for each configured failed-run action.</p></div>
       <div class="decision"><span class="step">AGREED DIRECTION</span><h3>Runtime bounds</h3><p>Verifier and Operator work each use a global ceiling of 16 and per-tenant ceiling of 4. Operator delivery uses three attempts, 30-second attempt timeouts, 30-second then 2-minute retries, and a five-minute deadline. Shutdown stops claims and drains for 30 seconds.</p></div>
     </div>
   </section>

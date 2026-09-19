@@ -73,7 +73,7 @@ express the concept without lying.
 
 ## Card kinds
 
-The v1 doctrine has 16 registrable native kinds. `CardKind::External` is a
+The v1 doctrine has 15 registrable native kinds. `CardKind::External` is a
 non-registrable discriminator for foreign schema descriptors, not a Card spec.
 
 | Domain | Kinds |
@@ -82,7 +82,7 @@ non-registrable discriminator for foreign schema descriptors, not a Card spec.
 | Agent plane | Prompt, Agent, Workflow, Mcp |
 | Composition | Service |
 | Governance | Policy, Audit |
-| Observability | Drift, Eval, Source |
+| Observability | Verifier, Source |
 | Reaction | Trigger, Operator |
 
 Tools are runtime names resolved by Skald's tool registry; they are not Cards.
@@ -130,9 +130,10 @@ durable persistence. `CardRef` carries `kind`, `name`, one `version` field,
 optional `space`, and optional `uid`. The server derives relationships from
 these references; users do not author a parallel lineage graph.
 
-Drift and Eval are reusable, subject-less peers. Deployment composition binds
-them through versioned `publishes_to`, while runtime observations carry the
-subject identity used for evaluation and filtering.
+A Verifier is a reusable, subject-less peer with one typed Drift or Eval
+implementation. Deployment composition binds it through versioned
+`verified_by`; runtime observations carry the subject identity used for
+evaluation and filtering.
 
 ## Service boundaries
 

@@ -22,7 +22,7 @@ drift, not permission for code and documentation to diverge.
 
 - [Doctrine](#doctrine) — 21 design principles
 - [Client model](#client-model) — language-agnostic protocol and first-class SDKs
-- [Kind catalog](#kind-catalog) — 16 registrable kinds + External discriminator
+- [Kind catalog](#kind-catalog) — 15 registrable kinds + External discriminator
 - [Per-kind specs](#per-kind-specs) — field shapes per kind
   - [Data](#data) · [Model](#model) · [Artifact](#artifact) · [Experiment](#experiment)
   - [Prompt](#prompt) · [Agent](#agent) · [Workflow](#workflow) · [Mcp](#mcp)
@@ -45,20 +45,16 @@ drift, not permission for code and documentation to diverge.
    deployment unit is a directory of card YAMLs applied together.
 2. **One fact, one owning Kind.** If a field could live in two places, the
    doctrine has a gap. Surface it.
-3. **Deployment composition declares subscriptions; monitors are subject-less.**
-   `ServiceComponent.publishes_to` binds a reusable component Card to the peer
-   Drift/Eval cards that receive its observations in that exact Service
-   version. `Service.publishes_to` covers Service-subject observations, while a
-   standalone Agent may declare its own `publishes_to`. Reusable Model and Data
-   lineage anchors never encode deployment-specific monitor bindings. Peer
-   cards (Drift, Eval, Operator) carry no `subject_ref` — subject identity is
-   supplied by the runtime observation. Triggers filter subscriptions by
-   subject via `TriggerSource.*.subject_filter: Option<CardRef>`.
-4. **Reactions are Operators; wiring is Triggers.** Drift/Eval/Policy never
+3. **Deployment composition declares verification bindings; Verifiers are subject-less.**
+   `verified_by` on a Service component, Service, or standalone Agent binds a
+   reusable Verifier Card to that exact owner version and subject occurrence.
+   Runtime observations supply subject identity; the binding supplies the
+   Verifier, Trigger activation, and optional failure Operators.
+4. **Reactions are Operators; wiring is Triggers.** Verifier/Policy never
    inline reaction logic.
 5. **Service composes deployment and subscription wiring, not monitor
-   definitions.** Drift/Eval/Trigger/Operator/Audit/Source are peer cards, not
-   Service components; component publication bindings point to those peers.
+   definitions.** Verifier/Trigger/Operator/Audit/Source are peer cards, not
+   Service components; component verification bindings point to those peers.
 6. **Enforcement is composed at the enforcing surface.** Service
    composes Policy for runtime gates.
 7. **Native observation first; external data by reading only.** AI services
@@ -79,13 +75,13 @@ drift, not permission for code and documentation to diverge.
 12. **Tools are runtime names, not cards.** `AgentSpec.tool_names: Vec<String>`
     resolves through the runtime tool registry. MCP servers auto-register
     their tools by name; host tools register themselves. No `Tool` kind.
-13. **No event vocabulary on the wire.** "Observation" comes from Drift/Eval;
+13. **No event vocabulary on the wire.** "Observation" comes from Verifier implementations;
     "trigger firing" comes from the `TriggerSource` enum. Free-form
     event-name strings are doctrine drift.
 14. **Host config stays off Cards.** Permission modes,
     sandboxes, isolation, effort, and per-CLI compatibility are properties of
     the host that runs the Agent, not of the Agent contract.
-15. **Monitors are pure observation producers.** Drift and Eval describe what
+15. **Verifiers are pure judgment producers.** Drift and Eval implementations describe what
     is observed and what counts as an observation. They do not carry
     scheduling and they do not carry dispatch. Scheduling lives on
     `Trigger.schedule`. Dispatch lives on `Operator`. There is no `Alert`
@@ -93,7 +89,7 @@ drift, not permission for code and documentation to diverge.
 16. **Heavy cards anchor lineage; light cards are spec-only.** Model, Data, and
     Experiment carry durable artifact bytes and MUST be pre-registered before
     anything else can point at them — they're the lineage anchors. Every other
-    kind (Prompt, Agent, Eval, Policy, Trigger, Operator, Source, Mcp,
+    kind (Prompt, Agent, Verifier, Policy, Trigger, Operator, Source, Mcp,
     Workflow, Audit, Service) is spec-only: `wyrd apply -f file.yaml` reads
     and registers in one move. No separate storage step, no programmatic
     registration prerequisite.
@@ -212,24 +208,13 @@ drift, not permission for code and documentation to diverge.
     batch. A bug that only appears when state crosses a module boundary is
     exactly what a journey catches and an isolated test misses. See AGENTS.md
     §11 for the tier definitions and gates.
-21. **`publishes_to` is the versioned deployment subscription contract.**
-    `ServiceComponent`, `Service`, and standalone `Agent` MAY declare
-    `publishes_to: Vec<CardRef>`. Each ref MUST resolve to `Eval` or `Drift` —
-    no other kind is a publication target. A component binding applies only
-    when that component emits under the containing Service version; the same
-    Model, Data, or Agent may therefore use different monitors in different
-    Services without creating a new component Card version.
-    `Service.publishes_to` applies only when the observation subject is the
-    Service itself. These fields are **static declarations**, not a per-request
-    runtime routing table: changing a component binding bumps the containing
-    Service's `spec_hash`, while changing a standalone Agent binding bumps the
-    Agent's `spec_hash`. Duplicate targets within one binding are rejected with
-    `WYRD_SPEC_400_DUPLICATE_PUBLISH_TARGET`; non-`Eval`/`Drift` targets
-    with `WYRD_SPEC_400_INVALID_PUBLISH_TARGET_KIND`. `publishes_to`
-    also authorizes emit — a card enters a principal's emit scope when
-    it is reachable through the transitive card-ref graph, which
-    includes `publishes_to`. See §Registry lifecycle for the composite
-    registration wire that lands `publishes_to` refs.
+21. **`verified_by` is the versioned verification subscription contract.**
+    A Service component, Service, or standalone Agent declares typed
+    `VerificationBinding` values. Each binding resolves one exact Verifier,
+    one Trigger activation, and zero or more failure Operators. The binding is
+    static declaration and never a per-request routing table; changing it
+    changes the containing Card spec. `publishes_to` has no verification
+    meaning.
 
 ## Client model
 
@@ -283,7 +268,7 @@ and ingest clients or implement their own HTTP or gRPC transports.
 
 ## Kind catalog
 
-Wyrd registers 16 native Card kinds. `CardKind::External` is a non-registrable
+Wyrd registers 15 native Card kinds. `CardKind::External` is a non-registrable
 discriminator used when reading foreign or unknown kind metadata. The foreign
 payload remains opaque and source-specific; it is not a Wyrd Card. There is no
 `ExternalSpec` and no External Card registration path.
@@ -294,7 +279,7 @@ payload remains opaque and source-specific; it is not a Wyrd Card. There is no
 | Agent plane   | Prompt, Agent, Workflow, Mcp |
 | Composition   | Service |
 | Governance    | Policy, Audit |
-| Observability | Drift, Eval, Source |
+| Observability | Verifier, Source |
 | Reaction      | Trigger, Operator |
 
 ---
@@ -374,7 +359,7 @@ spec:
   prompt: InlineableRef<Prompt>  # Ref (→ Prompt), authored Path, or inline Prompt
   tool_names: [string]
   run_config: AgentRunConfigSpec # max_iterations, tool_concurrency_cap, session_recent_limit, timeout_ms
-  publishes_to: [CardRef]        # → Eval | Drift for a standalone Agent principal
+  verified_by: [VerificationBinding]
 ```
 
 ### Workflow
@@ -403,16 +388,16 @@ spec:
 
 ### Service
 Runtime composition for deployment. **Components are runtime-aliased only.**
-Drift/Eval/Trigger/Operator/Audit/Source are peer cards in the deployment
+Verifier/Trigger/Operator/Audit/Source are peer cards in the deployment
 directory, not Service components.
 ```yaml
 spec:
   description?: string
-  components: [ServiceComponent] # { alias, ref | path, publishes_to: [Eval | Drift] }
+  components: [ServiceComponent] # { alias, ref | path, verified_by: [...] }
   entry_point?: string           # SDK AppState bootstrap module (e.g. `acme.copilot.app:app`).
                                  # Importing it materializes the service's locked card snapshot
                                  # at runtime. Wyrd doesn't import this; the deploy image does.
-  publishes_to: [CardRef]        # → Eval | Drift for Service-subject observations
+  verified_by: [VerificationBinding]
 ```
 
 Identity is derived from the Service's `card_ref` and bound on first deploy
@@ -629,12 +614,10 @@ Consequences, stated so they stop drifting:
 - **The observation owns subject identity.** Under pub/sub (Doctrine #3, #21),
   the observation's `card_ref` IS its subject — no separate `subject_ref` on
   the envelope and no monitor-emits-about-a-different-card case. For a Service
-  principal, the server selects the publication binding from the locked
-  Service version and the matching component `card_ref`; Service-level
-  `publishes_to` applies only when the subject is the Service Card itself.
-  Declared targets enter the principal's emit scope through the transitive
-  card-ref graph (Doctrine #18), so authorization still reduces to the one
-  `card_ref` on the row.
+  principal, the server validates the subject against the locked Service
+  version and matching component `card_ref`. Verification routing is resolved
+  later from that subject's `verified_by` bindings; authorization still
+  reduces to the one subject `card_ref` on the row.
 
 ### Runtime authz: `POST /v1/authz/check`
 
@@ -868,7 +851,7 @@ typed refs is a versioned breaking change that adds variants.
 
 | Variant           | Source-card fields                                                          |
 |-------------------|-----------------------------------------------------------------------------|
-| `Publication`     | `Service.components[].publishes_to`, `Service.publishes_to`, `Agent.publishes_to` |
+| `Verification`    | `Service.components[].verified_by`, `Service.verified_by`, `Agent.verified_by` |
 | `SubjectFilter`   | `Trigger.source.*.subject_filter`                                           |
 | `Component`       | `Service.components[].ref`, `Workflow.steps[].target`                       |
 | `Artifact`        | `Data.card_refs[]`, `Model.card_refs[]`                                     |
@@ -881,10 +864,10 @@ typed refs is a versioned breaking change that adds variants.
 | `Workflow`  | `Operator.action.workflow_ref`                                    |
 | `Hook`      | `Operator.pre_invoke`, `Operator.post_invoke`                     |
 
-For `Service.components[].publishes_to`, the derived publication edge is
-`Service → Eval|Drift`, and `Relationship.via` preserves the exact component
-field path. The reusable component Card is the observation subject at runtime,
-but it does not own a global relationship to the monitor.
+For `Service.components[].verified_by`, derived edges retain the exact
+Verifier, Trigger, and Operator references and `Relationship.via` preserves
+the component field path. The reusable component Card remains the observation
+subject at runtime.
 
 **Integrity.** Both `LineageNode.attributes_digest` and the Audit card's
 own `digest` use the same recipe: **JCS canonicalization (RFC 8785) +
@@ -959,36 +942,36 @@ captures what *was* materialized at `snapshot_at`.
 Multi-party attestations are not part of the v1 Audit wire contract. Values in
 `details` are descriptive and never acquire approval or authorization meaning.
 
-### Drift
-Subject-less observation definition. Envelope is orthogonal: signal +
+### Verifier
+
+A subject-less verification declaration with exactly one typed implementation.
+The initial closed variants are Drift and Eval. Scheduling and failure reaction
+remain on the binding's Trigger and Operators.
+
+#### Drift implementation
+Subject-less observation definition. The implementation is orthogonal: signal +
 condition + math. Subject identity is supplied by the publisher at
 observation time (Doctrine #3, #21). No scheduling, no dispatch.
 Scheduling is a `Trigger`; dispatch is an `Operator`.
 ```yaml
 spec:
   description?: string
-  method: DriftMethod            # Spc | Psi | Custom | External
+  method: DriftMethod            # Spc | Psi | Custom
   signal: DriftSignal            # how the measurement enters the monitor
   condition: DriftCondition      # when a sample becomes an emittable observation
-  profile?: DriftProfile         # method-specific math config (PSI bins, SPC window, etc.)
-  details: { string: NonSecretValue }
+  profile: DriftProfile          # matching PSI, SPC, or Custom config
 ```
 
-**`Agent` is deliberately absent from `DriftMethod` in v1.** Agent-behavior drift
-(tool-call distribution shifts, response-format drift, step-count anomalies) is
-real but underspecified: it has no settled signal vocabulary, no profile shape,
-and no canonical scoring algorithm. Adding the enum variant would freeze a
-contract Wyrd cannot honor. Eval-score drift on agents uses `DriftSignal::EvalScore` +
-`DriftMethod::Spc`.
+**`Agent`, `External`, and Eval-score methods/signals are deliberately absent
+from this delivery.** They have no complete input, fitting, or scoring contract
+here; adding them would freeze behavior Wyrd cannot yet honor.
 
-`DriftSignal` is a closed enum:
+`DriftSignal` is a closed enum for this implementation:
 
 | Variant         | Carries                                          | Use |
 |-----------------|--------------------------------------------------|-----|
 | `Distribution`  | `baseline_ref: CardRef` (→ Data), `features: [string]` | PSI / SPC over a baseline dataset |
 | `Metric`        | `name: string`                                   | Named scalar from subject runtime (mae, p99_latency_ms, tokens_per_call, cost_per_run_usd) |
-| `EvalScore`     | `eval_ref: CardRef` (→ Eval)                     | Score stream from an Eval card — the typed Eval↔Drift bridge |
-| `External`      | `source_ref: CardRef` (→ Source)                 | Measurement from an external system (Prometheus, OTel) |
 
 `DriftCondition` is a closed enum — one comparator vocabulary, no separate
 "baselined" shape (baseline + delta resolves to `Outside { lower, upper }` at
@@ -1001,8 +984,8 @@ authoring; the card stores resolved bounds):
 | `Below`         | `limit: f64`                     | Sample < `limit` |
 | `Outside`       | `lower: f64`, `upper: f64`       | Sample < `lower` or > `upper` |
 
-### Eval
-Subject-less behavioral assessment definition. Envelope is orthogonal:
+#### Eval implementation
+Subject-less behavioral assessment definition. The implementation is orthogonal:
 **how** to judge (`tasks` DAG), **where to read observations from**
 (`source_ref`, deferred), and an optional **offline driver** (`dataset`).
 Subject identity is supplied by the publisher at observation time
@@ -1040,12 +1023,10 @@ of refs is the mode):
 | unset         | unset        | Online over `vala`'s default observation archive. |
 
 **Directional flow.** A Service component binding or standalone Agent declares
-`publishes_to: [Eval]` and the runtime emits observations carrying the
-component's `card_ref` as subject identity. The engine resolves `source_ref`
-(read location, deferred — see DESIGN.md §13), opens the Source, queries
-records scoped to that subject identity, feeds them into the `tasks` workflow,
-and aggregates per-task pass/fail into a score stream consumed downstream by a
-`Drift` card with `DriftSignal::EvalScore`.
+`verified_by` with an Eval-backed Verifier and the runtime emits observations
+carrying the component's `card_ref` as subject identity. Continuous evaluation
+loads the committed subject record, executes the typed task workflow, and
+persists the common Verification Result plus Eval item details.
 
 `EvalTask` is a closed tagged union. Every variant carries `id: TaskId`,
 `depends_on: Vec<TaskId>`, and `condition: Option<EvalCondition>`.
@@ -1330,7 +1311,7 @@ struct CreateCardResponse {
 ```
 
 **Server-derived root.** Clients never nominate a root. The server
-builds the DAG from `CardRef` edges (including `publishes_to`),
+builds the DAG from typed `CardRef` edges (including `verified_by`),
 topo-sorts, and picks the single node with no incoming edges. Multi-root
 DAGs are an SDK bug and surface as `WYRD_INTERNAL_500` — not a stable
 public error. Cycles surface as
@@ -1496,14 +1477,14 @@ heavy. There is one canonical slot inventory, and the loader, diagnostics, and
 relationship tests all project from it:
 
 - `Service.components[].ref` (light and heavy targets)
-- `Service.components[].publishes_to`
+- `Service.components[].verified_by`
 - `Agent.prompt`
 - `Trigger.target`
 - `Workflow.steps[].target`
 - `Eval` task refs, including `EvalTask::LlmJudge.judge_ref`
 - `Drift.signal.eval_ref`, `Drift.signal.source_ref`
 - `TriggerSource.*.subject_filter`
-- `Agent.publishes_to`, `Service.publishes_to`
+- `Agent.verified_by`, `Service.verified_by`
 - Heavy anchors: `Model`/`Data`/`Experiment` `*_refs`, `Artifact` refs
 
  A new reference-bearing field is added to this inventory in one place; it then
@@ -1667,16 +1648,15 @@ foreign-card content pinning are not supported workflows.
 |---------|--------------------------------------|--------------------------------|
 | Data    | `card_refs`, `splits`                 | `Drift.signal.baseline_ref`, `Eval.dataset`, `Experiment.target_refs`, `TriggerSource.*.subject_filter` |
 | Model   | `card_refs`                           | `Service.components.ref`, `Experiment.target_refs`, `TriggerSource.*.subject_filter` |
-| Agent   | `prompt`, `tool_names`, `publishes_to` | `Service.components.ref`, Agent prompts (sub-agent calls), `TriggerSource.*.subject_filter` |
+| Agent   | `prompt`, `tool_names`, `verified_by` | `Service.components.ref`, Agent prompts (sub-agent calls), `TriggerSource.*.subject_filter` |
 | Workflow| `steps.*.target`                     | `Service.components.ref`, `Operator.action.workflow_ref`, `TriggerSource.*.subject_filter` |
 | Mcp     | `server_name`, `transport`, `scopes` | `Service.components.ref` |
-| Drift   | `signal.*` (`baseline_ref` \| `eval_ref` \| `source_ref`) | `TriggerSource.DriftObservation.drift_ref`, `Drift.signal.eval_ref` (other Drifts watching an Eval indirectly) |
-| Eval    | `dataset`, `source_ref` (deferred), `tasks[].LlmJudge.judge_ref` (Agent ref) | `Drift.signal.eval_ref`, `TriggerSource.EvalObservation.eval_ref` |
+| Verifier| Drift `signal.baseline_ref`; Eval `dataset`, `tasks[].LlmJudge.judge_ref` | `*.verified_by[].verifier` |
 | Audit   | `subject_refs`, `query` (roots), `lineage` (nodes), `investigator` (Agent variant) | — |
-| Service | `components[].ref`, `components[].publishes_to`, `publishes_to` | `TriggerSource.*.subject_filter` (service-level) |
+| Service | `components[].ref`, `components[].verified_by`, `verified_by` | `TriggerSource.*.subject_filter` (service-level) |
 | Policy  | `rules`                              | `Service.components.ref` |
-| Trigger | `schedule`, `source.drift_ref` \| `source.eval_ref`, `source.subject_filter?`, `operator_ref` | — |
-| Operator| `action` (`workflow_ref` \| typed `channel` shape \| `auth.env`) | `Trigger.operator_ref` |
+| Trigger | `schedule` or `observations_ready` activation | `*.verified_by[].runs_on` |
+| Operator| `action` (`workflow_ref` \| typed `channel` shape \| tenant connection) | `*.verified_by[].on_failure` |
 | Source  | `kind` (bucket), `connection` (vendor + `*_env`) | `Drift.signal.source_ref` (External variant), `Eval.source_ref` |
 
 `Service.components` accepts: Agent, Prompt, Model, Workflow, Mcp, Policy. No

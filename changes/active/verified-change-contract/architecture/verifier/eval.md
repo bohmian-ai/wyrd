@@ -1,6 +1,6 @@
 # Eval Verifier
 
-**Status:** agreed on 2026-09-14
+**Status:** approved continuous-Eval semantics in specification revision 32
 
 Eval becomes one implementation of a `Verifier` Card. The current `EvalSpec`,
 scenario, task, workflow, sampling, gate, context-capture, and result types
@@ -28,7 +28,10 @@ The current `EvalSpec` and its nested types remain unchanged. Runtime types
 that currently carry an Eval Card reference will instead carry the enclosing
 Verifier Card reference.
 
-## Offline evaluation flow
+## Future offline evaluation flow (outside this change)
+
+This is the intended reuse path for a later approved change, not an acceptance
+obligation or public run entry point in this one.
 
 1. The user defines an `EvalScenarioCollection` containing one or more
    `EvalScenario` values.
@@ -116,8 +119,30 @@ Scribe; a fresh write call is not.
 
 Eval runs from `observations_ready` and has no schedule. A failed authored
 `pass_gate` dispatches the binding's effective `on_failure` when present. An
-absent `pass_gate` persists results but produces no dispatch or Alert; Wyrd does
+absent `pass_gate` completes inconclusive and produces no dispatch; Wyrd does
 not invent a default gate.
+
+### Terminal mapping
+
+Execution status answers whether Wyrd completed the workflow. Verdict answers
+what a successfully executed workflow established:
+
+| Scenario | Run status | Common result | Item rows | Dispatch |
+|---|---|---|---|---|
+| Sampled out before execution | `completed` | `inconclusive`; zero-count `EvalWorkflowSummary` | none | none |
+| At least one task attests and authored gate passes | `completed` | `passed` | every `Ran` and `Skipped` outcome | none |
+| At least one task attests and authored gate fails | `completed` | `failed` | every `Ran` and `Skipped` outcome | configured Operators |
+| At least one task attests and no gate is authored | `completed` | `inconclusive` | every outcome | none |
+| Every task skips, so nothing attests | `completed` | `inconclusive` regardless of gate | every `Skipped` outcome | none |
+| A valid comparison returns false | normal `Ran { passed: false }` | evaluated through the authored gate | persisted | only if the gate fails |
+| Required context/media is invalid, judge output is malformed, or execution/provider fails | bounded retry then `errored` | none | none | none |
+| Required trace has not landed | requeue through `EvalStatus::AwaitingTrace` | none while waiting | none | none |
+| Required trace remains absent at its deadline | `timed_out` | none | none | none |
+
+Only a successfully returned `AssertionResult` attests. Executor and input
+errors propagate through the existing `Result` error path and never become a
+synthetic failed assertion. `AwaitingTrace` remains Eval's internal lifecycle;
+the generic run is queued between attempts and running while leased.
 
 ## Context capture
 
@@ -134,19 +159,18 @@ uncaptured values, and messages must not interpolate raw observed values when
 the policy is `hash` or `redact`. Capture changes stored evidence only; it does
 not change task execution or verdicts.
 
-## Required verification work
+## Required continuous-Eval verification work
 
-- Register an `EvalScenarioCollection` as a Data Card and store its rows in
-  Bifrost.
-- Resolve `EvalSpec.dataset` and read those scenario rows for an offline run.
 - Execute the existing Eval workflow and collect `EvalResults`.
 - Persist the common Verification Result and typed Eval results.
 - Apply `EvalContextCapture` consistently to intermediate, returned, and
   persisted results.
 - Replace top-level Eval Card references in runtime contracts with the
-  enclosing Verifier Card during resolution without renaming the existing
-  observation field.
+  enclosing Verifier Card during resolution and remove the obsolete
+  observation reference.
 - Add a real SDK-to-server journey covering one deterministic assertion and
   one LLM judge, binding-driven durable execution, Bifrost results, and one
-  Notify-created Alert. Cover inline and referenced Trigger and Operator
-  definitions.
+  Notify delivery. Cover inline and referenced Trigger and Operator definitions.
+
+The offline scenario flow above remains the future path supported by the same
+types and engine; implementing and accepting it is outside this change.

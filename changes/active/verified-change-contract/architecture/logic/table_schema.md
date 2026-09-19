@@ -1,7 +1,7 @@
 # Verification table schemas
 
 These are the complete physical Arrow schemas for the five Bifrost tables in
-`SPEC-verified-change-contract`, revision 28. Each table has exactly its
+`SPEC-verified-change-contract`, revision 32. Each table has exactly its
 listed authored columns, followed in order by the shared managed columns
 below. This document is the schema authority for the spec; the locked
 control-flow diagram remains the runtime-flow authority. `Nullable: no` means
@@ -78,7 +78,7 @@ these fields.
 | `execution_status` | Utf8 | no | `completed` for every row in this table. |
 | `verdict` | Utf8 | no | Common `passed`, `failed`, or `inconclusive` verdict. |
 | `verifier_version` | Utf8 | no | Exact Verifier Card version used. |
-| `owner_card_uid` | Utf8 | no | Service or standalone Agent binding owner. |
+| `owner_card_uid` | Utf8 | yes | Service or standalone Agent binding owner; null for a direct Verifier run. |
 | `subject_card_uid` | Utf8 | no | Verified subject Card. |
 | `binding_id` | Utf8 | yes | Binding identity; null for a direct Verifier run. |
 | `trigger_identity` | Utf8 | yes | Canonical JSON of frozen Trigger Card UID/version or inline digest; null for a direct run. |
@@ -87,9 +87,11 @@ these fields.
 | `window_end` | Timestamp(Microsecond, UTC) | yes | Drift window end; null for Eval. |
 | `started_at` | Timestamp(Microsecond, UTC) | no | Verifier execution start. |
 | `ended_at` | Timestamp(Microsecond, UTC) | no | Verifier execution end. |
-| `details` | Utf8 | no | Canonical JSON of the existing `DriftReport` for Drift or `EvalWorkflowSummary` for Eval. |
+| `details` | Utf8 | yes | Canonical JSON of the existing `DriftReport` when Drift scoring produced one, or `EvalWorkflowSummary` for Eval; null only for completed pre-scoring inconclusive Drift. |
 
-`details` is the single implementation-specific summary payload. There are no
+`details` is the single implementation-specific summary payload. A sampled-out
+Eval writes the existing zero-count summary. A completed Drift execution that
+cannot score valid input writes null rather than fabricating a report. There are no
 separate Drift method, Eval count, pass-rate, duration, or pass-gate columns in
 this shared table. Managed `run_id` is the Verifier run and managed `card_uid`
 is the Verifier Card. Results join details on (`data_tenant_id`, `result_id`).
@@ -102,7 +104,7 @@ columns above after these fields.
 | Column | Arrow type | Nullable | Meaning |
 |---|---|---|---|
 | `result_id` | Utf8 | no | Parent `vala.verification.results` identity. |
-| `owner_card_uid` | Utf8 | no | Binding owner. |
+| `owner_card_uid` | Utf8 | yes | Binding owner; null for a direct Verifier run. |
 | `subject_card_uid` | Utf8 | no | Verified subject. |
 | `binding_id` | Utf8 | yes | Binding identity; null for a direct run. |
 | `window_start` | Timestamp(Microsecond, UTC) | no | Analyzed Drift window start. |
@@ -123,7 +125,7 @@ columns above after these fields.
 | Column | Arrow type | Nullable | Meaning |
 |---|---|---|---|
 | `result_id` | Utf8 | no | Parent `vala.verification.results` identity. |
-| `owner_card_uid` | Utf8 | no | Binding owner. |
+| `owner_card_uid` | Utf8 | yes | Binding owner; null for a direct Verifier run. |
 | `subject_card_uid` | Utf8 | no | Verified subject. |
 | `binding_id` | Utf8 | yes | Binding identity; null for a direct run. |
 | `source_record_id` | Utf8 | no | Committed Eval input record ID. |
@@ -147,6 +149,10 @@ while producing `EvalResults`; the Verifier runner must retain its existing
 `EvalReport` through persistence so every outcome appears here. This uses the
 same Eval engine. `EvalWorkflowSummary` in the common result counts only
 executed tasks; skipped outcomes remain visible in this table.
+
+A sampled-out Eval run writes no item rows. An all-skipped workflow writes its
+`Skipped` rows. Errored and timed-out runs write neither the common result nor
+item rows.
 
 ## Retention
 

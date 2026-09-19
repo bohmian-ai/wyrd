@@ -27,8 +27,9 @@ pub use permission_scope::{
 };
 pub use platform_identity::{
     ConfigurePlatformOidcRequest, PlatformCallbackRequest, PlatformClientAuth,
-    PlatformLoginRequest, PlatformOidcConnectionView, RegisterPlatformAdminRequest,
-    RegisterPlatformAdminResponse,
+    PlatformLoginRequest, PlatformOidcConnectionView, PlatformPrincipalListResponse,
+    PlatformPrincipalSummary, RegisterPlatformAdminRequest, RegisterPlatformAdminResponse,
+    SetPlatformPrincipalStatusRequest,
 };
 pub use principal_id::{PLATFORM_AUDIT_PRINCIPAL, PrincipalId};
 pub use principal_kind::PrincipalKindTag;

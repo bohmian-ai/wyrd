@@ -120,3 +120,90 @@ pub async fn platform_principal_by_id(
     .await
     .map_err(SqlError::from)
 }
+
+/// A platform principal with its federated identity, when it has one.
+///
+/// The identity is what makes a listing actionable: an operator auditing who
+/// can administer the deployment needs to see the issuer and subject a
+/// principal resolves from, not just its name.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct PlatformPrincipalListRow {
+    /// Stable principal id.
+    pub id: Uuid,
+    /// Principal kind label.
+    pub principal_kind: String,
+    /// Operator-facing name.
+    pub name: String,
+    /// Lifecycle status.
+    pub status: String,
+    /// Claim this principal was registered against, for a human principal.
+    pub match_claim: Option<String>,
+    /// Subject pinned at first login, once one has happened.
+    pub subject: Option<String>,
+}
+
+/// List every platform principal, newest first.
+///
+/// Includes suspended and deleted principals deliberately: an operator
+/// reviewing who holds platform authority needs to see that a revoked
+/// administrator really is revoked, which a listing of only live rows could not
+/// tell them.
+///
+/// # Errors
+/// Returns [`SqlError::Query`] when the read fails.
+pub async fn list_platform_principals(
+    pool: &OperatorPool,
+) -> Result<Vec<PlatformPrincipalListRow>, SqlError> {
+    sqlx::query_as::<_, PlatformPrincipalListRow>(
+        "SELECT p.id, p.principal_kind, p.name, p.status,
+                i.match_claim, i.subject
+           FROM platform.principals p
+           LEFT JOIN platform.principal_identities i ON i.principal_id = p.id
+          ORDER BY p.id DESC",
+    )
+    .fetch_all(pool.pool())
+    .await
+    .map_err(SqlError::from)
+}
+
+/// Set a platform principal's lifecycle status.
+///
+/// Suspension is what makes the active-status check on every platform request a
+/// live guard rather than a dormant one: nothing else in the deployment can
+/// stop a platform principal from acting. Returns whether a row changed, so a
+/// caller can distinguish an unknown principal from one already in that state.
+///
+/// # Errors
+/// Returns [`SqlError::Query`] when the update fails, including when `status`
+/// is not an accepted lifecycle value.
+pub async fn set_platform_principal_status(
+    pool: &OperatorPool,
+    id: Uuid,
+    status: &str,
+) -> Result<bool, SqlError> {
+    sqlx::query(
+        "UPDATE platform.principals
+            SET status = $2, updated_at = now()
+          WHERE id = $1 AND status <> $2",
+    )
+    .bind(id)
+    .bind(status)
+    .execute(pool.pool())
+    .await
+    .map(|done| done.rows_affected() > 0)
+    .map_err(SqlError::from)
+}
+
+/// Count the platform principals that may still authenticate.
+///
+/// Used to refuse the suspension that would leave a deployment with no way in
+/// at all.
+///
+/// # Errors
+/// Returns [`SqlError::Query`] when the read fails.
+pub async fn count_active_platform_principals(pool: &OperatorPool) -> Result<i64, SqlError> {
+    sqlx::query_scalar::<_, i64>("SELECT count(*) FROM platform.principals WHERE status = 'active'")
+        .fetch_one(pool.pool())
+        .await
+        .map_err(SqlError::from)
+}

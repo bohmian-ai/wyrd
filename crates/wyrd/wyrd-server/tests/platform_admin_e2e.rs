@@ -1138,3 +1138,177 @@ async fn a_connection_cannot_name_an_unresolvable_issuer() {
         "a refused configuration leaves no connection behind"
     );
 }
+
+/// An operator can see who administers the platform, and stop one of them.
+///
+/// Without this the active-status check every platform request performs is a
+/// dormant guard: nothing in the deployment could make a platform principal
+/// inactive, so an administrator whose identity was pinned in error would be
+/// unremovable without direct database access.
+#[tokio::test]
+async fn an_operator_lists_and_suspends_platform_administrators() {
+    if !e2e_enabled() {
+        return;
+    }
+    let srv = WyrdTestServer::start_in_process()
+        .await
+        .expect("server starts");
+    let root = initialize_platform_root(&srv.operator_pool())
+        .await
+        .expect("deployment initializes");
+    let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
+    let provider = discovery_server().await;
+
+    srv.oneshot(platform_request(
+        Method::PUT,
+        "/platform/oidc/connection",
+        &session,
+        Some(json!({
+            "issuer_url": provider.uri(),
+            "expected_audience": "wyrd-platform",
+            "client_id": "wyrd-platform",
+            "client_auth": { "method": "public" },
+        })),
+    ))
+    .await
+    .expect("configure route responds");
+
+    let registered = body_json(
+        srv.oneshot(platform_request(
+            Method::POST,
+            "/platform/admins",
+            &session,
+            Some(json!({ "name": "ops-lead", "match_claim": "ops@example.com" })),
+        ))
+        .await
+        .expect("register route responds"),
+    )
+    .await;
+    let admin_id = registered["principal_id"].as_str().expect("principal id");
+
+    let listed = body_json(
+        srv.oneshot(platform_request(
+            Method::GET,
+            "/platform/admins",
+            &session,
+            None,
+        ))
+        .await
+        .expect("list route responds"),
+    )
+    .await;
+    let principals = listed["principals"].as_array().expect("principal list");
+    let registered_row = principals
+        .iter()
+        .find(|row| row["principal_id"] == admin_id)
+        .expect("the registered administrator is listed");
+    assert_eq!(registered_row["status"], "active");
+    assert_eq!(registered_row["match_claim"], "ops@example.com");
+    assert!(
+        registered_row["subject"].is_null(),
+        "an administrator who has never signed in has no pinned subject"
+    );
+
+    let suspend = |target: &str, status: &str| {
+        platform_request(
+            Method::PUT,
+            &format!("/platform/admins/{target}/status"),
+            &session,
+            Some(json!({ "status": status })),
+        )
+    };
+    let resp = srv
+        .oneshot(suspend(admin_id, "suspended"))
+        .await
+        .expect("status route responds");
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT, "suspension succeeds");
+
+    let listed = body_json(
+        srv.oneshot(platform_request(
+            Method::GET,
+            "/platform/admins",
+            &session,
+            None,
+        ))
+        .await
+        .expect("list route responds"),
+    )
+    .await;
+    assert_eq!(
+        listed["principals"]
+            .as_array()
+            .expect("principal list")
+            .iter()
+            .find(|row| row["principal_id"] == admin_id)
+            .expect("a suspended administrator is still listed")["status"],
+        "suspended",
+        "the listing shows a revoked administrator rather than hiding it"
+    );
+}
+
+/// The deployment cannot be locked out of its own control plane.
+#[tokio::test]
+async fn the_last_active_platform_principal_cannot_be_suspended() {
+    if !e2e_enabled() {
+        return;
+    }
+    let srv = WyrdTestServer::start_in_process()
+        .await
+        .expect("server starts");
+    let root = initialize_platform_root(&srv.operator_pool())
+        .await
+        .expect("deployment initializes");
+    let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
+
+    let listed = body_json(
+        srv.oneshot(platform_request(
+            Method::GET,
+            "/platform/admins",
+            &session,
+            None,
+        ))
+        .await
+        .expect("list route responds"),
+    )
+    .await;
+    let principals = listed["principals"].as_array().expect("principal list");
+    assert_eq!(
+        principals.len(),
+        1,
+        "a freshly initialized deployment has exactly one platform principal"
+    );
+    let root_id = principals[0]["principal_id"]
+        .as_str()
+        .expect("principal id")
+        .to_owned();
+
+    let resp = srv
+        .oneshot(platform_request(
+            Method::PUT,
+            &format!("/platform/admins/{root_id}/status"),
+            &session,
+            Some(json!({ "status": "suspended" })),
+        ))
+        .await
+        .expect("status route responds");
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "suspending the only way in is refused"
+    );
+
+    // And the deployment still works.
+    let resp = srv
+        .oneshot(platform_post(
+            "/platform/tenants",
+            &session,
+            json!({ "slug": "still-administrable", "display_name": "Still Administrable" }),
+        ))
+        .await
+        .expect("tenant route responds");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the refused suspension left the deployment administrable"
+    );
+}

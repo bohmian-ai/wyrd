@@ -9,7 +9,7 @@
 //! away, so removing the connection or losing the provider leaves the
 //! deployment administrable.
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use secrecy::{ExposeSecret, SecretString};
@@ -20,17 +20,21 @@ use wyrd_auth::platform_login::{PlatformLogin, PlatformLoginError};
 use wyrd_auth_oidc::ClientAuth;
 use wyrd_runtime::Permission;
 use wyrd_spec::auth::{
-    ConfigurePlatformOidcRequest, PlatformCallbackRequest, PlatformClientAuth,
-    PlatformLoginRequest, PlatformOidcConnectionView, PlatformTokenResponse, PrincipalId,
+    ConfigurePlatformOidcRequest, IssuerUrl, LoginInitResponse, PlatformCallbackRequest,
+    PlatformClientAuth, PlatformLoginRequest, PlatformOidcConnectionView,
+    PlatformPrincipalListResponse, PlatformPrincipalSummary, PlatformTokenResponse, PrincipalId,
     PrincipalKindTag, RegisterPlatformAdminRequest, RegisterPlatformAdminResponse, SecretBearer,
+    SetPlatformPrincipalStatusRequest,
 };
-use wyrd_spec::auth::{IssuerUrl, LoginInitResponse};
 use wyrd_spec::error::WyrdError;
 use wyrd_sql::queries::platform::identity::{
     delete_platform_oidc_connection, insert_platform_identity_tx, platform_oidc_connection,
     upsert_platform_oidc_connection,
 };
-use wyrd_sql::queries::platform::principals::insert_platform_principal_tx;
+use wyrd_sql::queries::platform::principals::{
+    count_active_platform_principals, insert_platform_principal_tx, list_platform_principals,
+    platform_principal_by_id, set_platform_principal_status,
+};
 use wyrd_sql::{OperatorPool, SqlError};
 
 use crate::components::auth::PlatformCaller;
@@ -60,7 +64,14 @@ pub fn platform_identity_router() -> Router<AppState> {
                 .put(configure_connection)
                 .delete(remove_connection),
         )
-        .route("/platform/admins", post(register_admin))
+        .route(
+            "/platform/admins",
+            post(register_admin).get(list_platform_admins),
+        )
+        .route(
+            "/platform/admins/{principal_id}/status",
+            axum::routing::put(set_admin_status),
+        )
 }
 
 /// Build the anonymous platform login routes.
@@ -333,6 +344,107 @@ async fn register_admin(
     Ok(Json(RegisterPlatformAdminResponse {
         principal_id: PrincipalId::new(principal_id),
     }))
+}
+
+/// List every platform principal, including the ones no longer permitted to
+/// act.
+///
+/// A suspended administrator is shown rather than hidden: an operator auditing
+/// who can administer the deployment needs to see that a revoked one really is
+/// revoked. Nothing secret appears — a principal has no credential material to
+/// leak, and its pinned subject is not one.
+///
+/// # Errors
+/// Returns a stable Wyrd error when the caller is unauthorized or the read
+/// fails.
+#[tracing::instrument(level = "info", skip(state, caller))]
+async fn list_platform_admins(
+    State(state): State<AppState>,
+    caller: PlatformCaller,
+) -> Result<Json<PlatformPrincipalListResponse>, WyrdErrorResponse> {
+    let pool = operator(&state)?;
+    authorize(&pool, &caller, &Permission::platform_identity_read()).await?;
+
+    let rows = list_platform_principals(&pool).await.map_err(store_error)?;
+    Ok(Json(PlatformPrincipalListResponse {
+        principals: rows
+            .into_iter()
+            .map(|row| PlatformPrincipalSummary {
+                principal_id: PrincipalId::new(row.id),
+                principal_kind: row.principal_kind,
+                name: row.name,
+                status: row.status,
+                match_claim: row.match_claim,
+                subject: row.subject,
+            })
+            .collect(),
+    }))
+}
+
+/// Suspend or restore a platform principal.
+///
+/// This is what makes the active-status check every platform request already
+/// performs a live guard: without it nothing in the deployment could stop a
+/// platform principal from acting, and a federated administrator whose identity
+/// was pinned in error would be unremovable without direct database access.
+///
+/// Suspending the last active principal is refused. A deployment with no
+/// principal that can authenticate cannot be recovered through any served
+/// surface, and locking an operator out of their own control plane is not an
+/// outcome a single request should be able to reach.
+///
+/// # Errors
+/// Returns a stable Wyrd error when the caller is unauthorized, the status is
+/// not a lifecycle value, the principal is unknown, the change would leave no
+/// active principal, or the write fails.
+#[tracing::instrument(level = "info", skip(state, caller, request))]
+async fn set_admin_status(
+    State(state): State<AppState>,
+    caller: PlatformCaller,
+    Path(principal_id): Path<Uuid>,
+    Json(request): Json<SetPlatformPrincipalStatusRequest>,
+) -> Result<axum::http::StatusCode, WyrdErrorResponse> {
+    let pool = operator(&state)?;
+    authorize(&pool, &caller, &Permission::platform_identity_write()).await?;
+
+    if !matches!(request.status.as_str(), "active" | "suspended") {
+        return Err(WyrdErrorResponse::from(WyrdError::Validation {
+            message: "status must be active or suspended".to_owned(),
+            details: serde_json::json!({ "status": request.status }),
+        }));
+    }
+
+    let principal = platform_principal_by_id(&pool, principal_id)
+        .await
+        .map_err(store_error)?
+        .ok_or_else(|| {
+            WyrdErrorResponse::from(WyrdError::NotFound {
+                message: "platform principal not found".to_owned(),
+                details: serde_json::json!({}),
+            })
+        })?;
+
+    // Checked before the write, and only for the transition that can cause it.
+    // Restoring a principal can never reduce the count.
+    if request.status == "suspended"
+        && principal.is_active()
+        && count_active_platform_principals(&pool)
+            .await
+            .map_err(store_error)?
+            <= 1
+    {
+        return Err(WyrdErrorResponse::from(WyrdError::Conflict {
+            message: "suspending the last active platform principal would leave the deployment \
+                      with no way in"
+                .to_owned(),
+            details: serde_json::json!({ "principal_id": principal_id.to_string() }),
+        }));
+    }
+
+    set_platform_principal_status(&pool, principal_id, &request.status)
+        .await
+        .map_err(store_error)?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 /// Build the platform login service from server state.

@@ -120,3 +120,40 @@ pub struct PlatformCallbackRequest {
     /// Opaque state key issued when the login began.
     pub state: String,
 }
+
+/// One platform principal as an operator sees it.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct PlatformPrincipalSummary {
+    /// Durable principal id.
+    pub principal_id: PrincipalId,
+    /// Principal kind: `global_admin` for the deployment root, `user` for a
+    /// human administrator.
+    pub principal_kind: String,
+    /// Operator-facing name.
+    pub name: String,
+    /// Lifecycle status: `active`, `suspended`, or `deleted`.
+    pub status: String,
+    /// Claim a human administrator was registered against.
+    pub match_claim: Option<String>,
+    /// Subject pinned at first login, once one has happened. `None` means this
+    /// administrator has never signed in.
+    pub subject: Option<String>,
+}
+
+/// Every platform principal, including the ones no longer permitted to act.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct PlatformPrincipalListResponse {
+    /// Principals, newest first.
+    pub principals: Vec<PlatformPrincipalSummary>,
+}
+
+/// Change whether a platform principal may act.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct SetPlatformPrincipalStatusRequest {
+    /// `active` to restore, `suspended` to stop this principal acting.
+    pub status: String,
+}

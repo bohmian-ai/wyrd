@@ -25,22 +25,6 @@ use crate::{SqlError, TenantConn};
 pub struct OperatorPool(PgPool);
 
 impl OperatorPool {
-    /// Opens one operator-owned transaction for a bounded cross-tenant operation.
-    ///
-    /// Crate-private on purpose. A raw `sqlx::Transaction` is unrestricted SQL
-    /// capability: handed across a crate boundary it lets any caller issue any
-    /// statement the BYPASSRLS role can. The query modules in this crate are
-    /// the only place that capability is bounded by a reviewed statement, so
-    /// callers outside it take [`begin_platform_audited`](Self::begin_platform_audited)
-    /// and get a [`TenantConn`] instead.
-    ///
-    /// # Errors
-    /// Returns the database error when PostgreSQL cannot acquire a connection
-    /// or begin the transaction.
-    pub(crate) async fn begin(&self) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, sqlx::Error> {
-        self.0.begin().await
-    }
-
     /// Opens one operator transaction carrying the platform audit scope.
     ///
     /// A platform-control-plane decision has no owning tenant, so its canonical

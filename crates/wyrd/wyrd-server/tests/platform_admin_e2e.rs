@@ -3028,3 +3028,281 @@ async fn an_uninitialized_deployment_serves_tenants_and_refuses_the_platform_pla
         .expect("platform principals are counted");
     assert_eq!(roots, 0, "serving traffic establishes no platform identity");
 }
+
+/// Install a trigger that makes every write to `table` fail.
+///
+/// This is the only honest way to prove the coupling: the allowance is written
+/// by the server, and the effect is written by the server, and what has to be
+/// shown is that a failure of the *second* also discards the *first*. A
+/// statement-level trigger is the smallest thing that makes the second fail
+/// without touching the code under test.
+async fn fail_writes_to(pool: &sqlx::PgPool, label: &str, table: &str, event: &str) {
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE OR REPLACE FUNCTION platform.test_fail_{label}()
+           RETURNS trigger LANGUAGE plpgsql AS $$
+           BEGIN
+             RAISE EXCEPTION 'injected {label} failure';
+           END;
+           $$;"
+    )))
+    .execute(pool)
+    .await
+    .expect("failure function installs");
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE TRIGGER test_fail_{label}
+           BEFORE {event} ON {table}
+           FOR EACH ROW EXECUTE FUNCTION platform.test_fail_{label}()"
+    )))
+    .execute(pool)
+    .await
+    .expect("failure trigger installs");
+}
+
+/// Remove an injected write failure.
+async fn stop_failing_writes(pool: &sqlx::PgPool, label: &str, table: &str) {
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "DROP TRIGGER test_fail_{label} ON {table}"
+    )))
+    .execute(pool)
+    .await
+    .expect("failure trigger drops");
+}
+
+/// Count staged platform authorization rows by outcome.
+async fn staged_platform_decisions(pool: &sqlx::PgPool, outcome: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM vala.audit_staging
+          WHERE operation = 'platform.authz' AND outcome = $1",
+    )
+    .bind(outcome)
+    .fetch_one(pool)
+    .await
+    .expect("decision count reads")
+}
+
+/// A failed platform mutation leaves no allowance saying it was permitted.
+///
+/// REQ-037 makes the decision and its effect one transaction. The failure mode
+/// it exists for is durable and silent: a recorded allowance for an operation
+/// that never happened is indistinguishable, to anyone auditing afterwards,
+/// from one that did. Four mutation classes cover the plane's write surface —
+/// the identity connection, a credential, a principal's status, and a tenant's
+/// admission — and each is driven through the real route with its own table's
+/// writes failing.
+///
+/// Denials are the control. They commit on their own by design, because a
+/// refusal is durable evidence of an attempt and there is no effect to pair it
+/// with.
+#[tokio::test]
+async fn a_failed_platform_mutation_leaves_no_allowance() {
+    if !e2e_enabled() {
+        return;
+    }
+    let srv = WyrdTestServer::start_in_process()
+        .await
+        .expect("server starts");
+    let root = initialize_platform_root(&srv.operator_pool())
+        .await
+        .expect("deployment initializes");
+    let secret = secrecy::ExposeSecret::expose_secret(&root).to_owned();
+    let session = platform_session(&srv, &secret).await;
+    let provider = wyrd_testing::DiscoveryFixture::start().await;
+
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool opens");
+
+    // A tenant and a registered administrator to aim the status and suspension
+    // classes at, written before any failure is injected.
+    let tenant = body_json(
+        srv.oneshot(platform_post(
+            "/platform/tenants",
+            &session,
+            json!({ "slug": "atomic-tenant", "display_name": "Atomic" }),
+        ))
+        .await
+        .expect("tenant route responds"),
+    )
+    .await;
+    let tenant_id = tenant["tenant"]["id"]
+        .as_str()
+        .expect("tenant id")
+        .to_owned();
+    let tenant_credential = tenant["admin"]["credential"]
+        .as_str()
+        .expect("admin credential")
+        .to_owned();
+
+    srv.oneshot(platform_request(
+        Method::PUT,
+        "/platform/oidc/connection",
+        &session,
+        Some(json!({
+            "issuer_url": provider.issuer(),
+            "expected_audience": "wyrd-platform",
+            "client_id": "wyrd-platform",
+            "client_auth": { "method": "public" },
+        })),
+    ))
+    .await
+    .expect("configure route responds");
+
+    let registered = body_json(
+        srv.oneshot(platform_request(
+            Method::POST,
+            "/platform/admins",
+            &session,
+            Some(json!({ "name": "atomic-admin", "match_claim": "atomic@example.com" })),
+        ))
+        .await
+        .expect("register route responds"),
+    )
+    .await;
+    let admin_id = registered["principal_id"].as_str().expect("id").to_owned();
+
+    let root_principal: String =
+        sqlx::query_scalar("SELECT id::text FROM platform.principals WHERE name = $1")
+            .bind(wyrd_server::boot::init::PLATFORM_ROOT_NAME)
+            .fetch_one(&superuser)
+            .await
+            .expect("root principal reads");
+
+    // Every allowance recorded so far is legitimate; the assertions below are
+    // about what the *failed* attempts add.
+    let baseline = staged_platform_decisions(&superuser, "allowed").await;
+
+    let classes: Vec<(&str, &str, &str, Request<Body>)> = vec![
+        (
+            "identity",
+            "platform.oidc_connection",
+            "INSERT OR UPDATE",
+            platform_request(
+                Method::PUT,
+                "/platform/oidc/connection",
+                &session,
+                Some(json!({
+                    "issuer_url": provider.issuer(),
+                    "expected_audience": "wyrd-platform-two",
+                    "client_id": "wyrd-platform",
+                    "client_auth": { "method": "public" },
+                })),
+            ),
+        ),
+        (
+            "credential",
+            "platform.credentials",
+            "INSERT",
+            platform_request(
+                Method::POST,
+                &format!("/platform/admins/{root_principal}/credentials"),
+                &session,
+                Some(json!({})),
+            ),
+        ),
+        (
+            "status",
+            "platform.principals",
+            "UPDATE",
+            platform_request(
+                Method::PUT,
+                &format!("/platform/admins/{admin_id}/status"),
+                &session,
+                Some(json!({ "status": "suspended" })),
+            ),
+        ),
+        (
+            "suspension",
+            "platform.tenants",
+            "UPDATE",
+            platform_request(
+                Method::PUT,
+                &format!("/platform/tenants/{tenant_id}/status"),
+                &session,
+                Some(json!({ "status": "suspended" })),
+            ),
+        ),
+    ];
+
+    for (label, table, event, request) in classes {
+        fail_writes_to(&superuser, label, table, event).await;
+        let resp = srv.oneshot(request).await.expect("route responds");
+        let status = resp.status();
+        stop_failing_writes(&superuser, label, table).await;
+
+        assert!(
+            status.is_server_error(),
+            "the {label} mutation must refuse rather than report success: {status}"
+        );
+        assert_eq!(
+            staged_platform_decisions(&superuser, "allowed").await,
+            baseline,
+            "the {label} failure rolled back its own allowance"
+        );
+    }
+
+    // The effects never landed either.
+    let audience: String = sqlx::query_scalar(
+        "SELECT expected_audience FROM platform.oidc_connection WHERE singleton",
+    )
+    .fetch_one(&superuser)
+    .await
+    .expect("connection reads");
+    assert_eq!(audience, "wyrd-platform", "the identity write rolled back");
+
+    let credentials: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM platform.credentials WHERE principal_id = $1::uuid",
+    )
+    .bind(&root_principal)
+    .fetch_one(&superuser)
+    .await
+    .expect("credential count reads");
+    assert_eq!(credentials, 1, "no credential outlived its failed decision");
+
+    let admin_status: String =
+        sqlx::query_scalar("SELECT status FROM platform.principals WHERE id = $1::uuid")
+            .bind(&admin_id)
+            .fetch_one(&superuser)
+            .await
+            .expect("status reads");
+    assert_eq!(admin_status, "active", "the status write rolled back");
+
+    let tenant_status: String =
+        sqlx::query_scalar("SELECT status FROM platform.tenants WHERE data_tenant_id = $1::uuid")
+            .bind(&tenant_id)
+            .fetch_one(&superuser)
+            .await
+            .expect("tenant status reads");
+    assert_eq!(tenant_status, "active", "the suspension rolled back");
+
+    // The control: a refusal writes no allowance either. Durability of the
+    // denial row itself is proved where a denial is actually reachable —
+    // `wyrd_auth::platform_authz::pg_tests::a_denial_is_recorded_and_refuses`
+    // — because every credential this plane issues carries the fixed platform
+    // grant, so the only refusal an HTTP caller can provoke is the session
+    // extractor's, which evaluates no permission and stages nothing.
+    let allowances = staged_platform_decisions(&superuser, "allowed").await;
+    let tenant_admin = tenant_token(&srv, &tenant_credential)
+        .await
+        .expect("the tenant administrator authenticates");
+    let refused = srv
+        .oneshot(platform_request(
+            Method::POST,
+            "/platform/admins",
+            &tenant_admin,
+            Some(json!({ "name": "nope", "match_claim": "nope@example.com" })),
+        ))
+        .await
+        .expect("register route responds");
+    assert_eq!(
+        refused.status(),
+        StatusCode::UNAUTHORIZED,
+        "tenant authority never reaches the platform plane"
+    );
+    assert_eq!(
+        staged_platform_decisions(&superuser, "allowed").await,
+        allowances,
+        "a refused caller earns no allowance"
+    );
+}

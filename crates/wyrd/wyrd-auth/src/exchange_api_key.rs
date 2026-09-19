@@ -26,6 +26,7 @@ use wyrd_sql::queries::auth::{
 use wyrd_sql::queries::platform::tenant_resolver::tenant_admits_credentials;
 
 use crate::audit::{TOKEN_EXCHANGE_OPERATION, append_auth_audit, auth_event};
+use crate::credential_verify::verify_presented;
 
 use crate::card_scope::{
     IssueErrorOrWyrd, MINT_KIND_API_KEY_EXCHANGE, MINT_KIND_DELEGATION, issue_scope_error,
@@ -228,6 +229,11 @@ impl ExchangeApiKey {
     /// # Errors
     /// All authentication failures map to `WyrdError::ApiKeyInvalid` at the HTTP
     /// boundary. Internal variants carry distinct failure paths for diagnostics.
+    ///
+    /// # Panics
+    /// Panics only if the refusal bookkeeping below is ever changed so that an
+    /// absent credential row leaves no refusal — the invariant the `expect`
+    /// names.
     #[tracing::instrument(level = "debug", skip(self, conn, api_key), err)]
     pub async fn execute(
         &self,
@@ -235,32 +241,40 @@ impl ExchangeApiKey {
         api_key: SecretString,
         request_id: &str,
     ) -> Result<ExchangedToken, ExchangeError> {
-        let parsed =
-            WyrdApiKey::parse(api_key.expose_secret()).map_err(|_| ExchangeError::NotFound)?;
-        if parsed.tenant_id != conn.data_tenant_id() {
-            return Err(ExchangeError::CrossTenant);
-        }
-        // The tenant's own lifecycle decides before the principal's does.
-        // Suspending a tenant has to stop its credentials working, or the
-        // status is a label rather than a control — and this is the one place
-        // every credential-bearing entry to a tenant converges, so checking
-        // here cannot be forgotten by a route added later.
-        if !tenant_admits_credentials(conn, parsed.tenant_id).await? {
-            return Err(ExchangeError::TenantNotAdmitting);
-        }
-
-        let Some(row) = api_key_by_prefix(conn, &parsed.prefix).await? else {
-            return Err(ExchangeError::NotFound);
+        // Every refusal is decided first and answered last, because Argon2 is
+        // what a refusal costs. A malformed key, another tenant's key, a
+        // suspended tenant, an unknown prefix, and a disabled account all used
+        // to return before verification ran, so a live prefix with a wrong tail
+        // took measurably longer than any of them — enough to enumerate live
+        // prefixes by clock without ever guessing a secret.
+        let (row, refusal) = match WyrdApiKey::parse(api_key.expose_secret()) {
+            Err(_) => (None, Some(ExchangeError::NotFound)),
+            Ok(parsed) if parsed.tenant_id != conn.data_tenant_id() => {
+                (None, Some(ExchangeError::CrossTenant))
+            }
+            // The tenant's own lifecycle decides before the principal's does.
+            // Suspending a tenant has to stop its credentials working, or the
+            // status is a label rather than a control — and this is the one place
+            // every credential-bearing entry to a tenant converges, so checking
+            // here cannot be forgotten by a route added later.
+            Ok(parsed) if !tenant_admits_credentials(conn, parsed.tenant_id).await? => {
+                (None, Some(ExchangeError::TenantNotAdmitting))
+            }
+            Ok(parsed) => match api_key_by_prefix(conn, &parsed.prefix).await? {
+                None => (None, Some(ExchangeError::NotFound)),
+                Some(row) if row.status != "active" => (None, Some(ExchangeError::AccountDisabled)),
+                Some(row) => (Some(row), None),
+            },
         };
-        if row.status != "active" {
-            return Err(ExchangeError::AccountDisabled);
-        }
 
-        let raw = api_key.clone();
-        let hash = row.key_hash.clone();
-        let ok = tokio::task::spawn_blocking(move || wyrd_auth_issue::verify_api_key(&raw, &hash))
-            .await?;
-        if !ok {
+        let matched = verify_presented(&api_key, row.as_ref().map(|row| row.key_hash.as_str()))
+            .await
+            .map_err(ExchangeError::Join)?;
+        if let Some(refusal) = refusal {
+            return Err(refusal);
+        }
+        let row = row.expect("invariant: a refusal was recorded for every absent row");
+        if !matched {
             return Err(ExchangeError::HashMismatch);
         }
 
@@ -759,52 +773,59 @@ fn reason_from_api_key_status(
 
 /// Map API-key exchange errors to public Wyrd errors.
 ///
-/// Credential failures keep the single public
-/// `WYRD_AUTH_401_API_KEY_INVALID` code and discriminate through
-/// `details.reason`.
+/// Every credential refusal renders as the same `WYRD_AUTH_401_API_KEY_INVALID`
+/// problem, byte for byte. The reason used to be projected in
+/// `details.reason` — `revoked`, `expired`, `cross_tenant`, `account_disabled`,
+/// `not_found` — which handed an unauthenticated caller the enumeration oracle
+/// the constant-cost verification exists to close: learning that a prefix is
+/// *revoked* is learning that it exists. The reason is still recorded, in the
+/// server's own logs, where the operator reading them has already been
+/// authenticated by the deployment.
+///
+/// Infrastructure failures stay distinct, because a caller that should retry
+/// needs to know that it should.
 pub async fn map_exchange_error_to_wyrd(
     conn: &mut TenantConn<'_>,
     prefix: &str,
     error: ExchangeError,
 ) -> WyrdError {
-    match error {
-        ExchangeError::CrossTenant => WyrdError::ApiKeyInvalid {
-            message: "API key tenant does not match connection tenant".to_owned(),
-            details: json!({ "reason": "cross_tenant" }),
-        },
-        ExchangeError::NotFound => {
-            let reason = resolve_not_found_reason(conn, prefix).await;
-            WyrdError::ApiKeyInvalid {
-                message: format!("API key {reason}"),
-                details: json!({ "reason": reason }),
-            }
-        }
-        ExchangeError::AccountDisabled => WyrdError::ApiKeyInvalid {
-            message: "service account is not active".to_owned(),
-            details: json!({ "reason": "account_disabled" }),
-        },
-        // Rendered as an ordinary invalid key. A caller learns that its
-        // credential does not work, never that the tenant behind it is
-        // suspended — which would tell an outsider that the tenant exists.
-        ExchangeError::TenantNotAdmitting => WyrdError::ApiKeyInvalid {
-            message: "API key is not valid".to_owned(),
-            details: json!({ "reason": "not_found" }),
-        },
-        ExchangeError::HashMismatch => WyrdError::ApiKeyInvalid {
-            message: "API key hash verification failed".to_owned(),
-            details: json!({ "reason": "hash_mismatch" }),
-        },
+    let reason: &str = match error {
+        ExchangeError::CrossTenant => "cross_tenant",
+        ExchangeError::AccountDisabled => "account_disabled",
+        ExchangeError::HashMismatch => "hash_mismatch",
+        ExchangeError::TenantNotAdmitting => "tenant_not_admitting",
+        // The lifecycle lookup that used to shape the response now only shapes
+        // the log line: an operator still needs to know whether a key was
+        // revoked or expired.
+        ExchangeError::NotFound => resolve_not_found_reason(conn, prefix).await,
         ExchangeError::Issue(_) | ExchangeError::Join(_) | ExchangeError::InvalidRole => {
-            WyrdError::Internal {
+            return WyrdError::Internal {
                 message: "failed to exchange API key".to_owned(),
                 details: json!({}),
-            }
+            };
         }
-        ExchangeError::Wyrd(error) => error,
-        ExchangeError::Database(_) => WyrdError::AuthVerifyUnavailable {
-            message: "auth backend unavailable".to_owned(),
-            details: json!({ "retry_after_seconds": 1 }),
-        },
+        ExchangeError::Wyrd(error) => return error,
+        ExchangeError::Database(_) => {
+            return WyrdError::AuthVerifyUnavailable {
+                message: "auth backend unavailable".to_owned(),
+                details: json!({ "retry_after_seconds": 1 }),
+            };
+        }
+    };
+    tracing::info!(prefix = %prefix, reason, "api key exchange refused");
+    api_key_invalid()
+}
+
+/// The one refusal every invalid tenant API key earns.
+///
+/// Identical for every cause on purpose: a caller must not be able to tell a
+/// wrong secret from an unknown prefix, a revoked key from an expired one, or a
+/// suspended tenant from one that never existed.
+#[must_use]
+pub fn api_key_invalid() -> WyrdError {
+    WyrdError::ApiKeyInvalid {
+        message: "API key is not valid".to_owned(),
+        details: json!({}),
     }
 }
 
@@ -841,7 +862,6 @@ impl From<DelegateError> for WyrdError {
 
 #[cfg(test)]
 mod pg_tests {
-    use std::collections::BTreeSet;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -862,6 +882,8 @@ mod pg_tests {
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::reference::{CardRef, CardRefScope};
     use wyrd_sql::TenantConn;
+
+    use crate::credential_verify;
     use wyrd_sql::queries::auth::ApiKeyStatus;
 
     use super::{
@@ -976,13 +998,13 @@ mod pg_tests {
         .expect("api key lifecycle row inserts");
     }
 
-    fn api_key_invalid_reason(error: &WyrdError) -> &str {
-        match error {
-            WyrdError::ApiKeyInvalid { details, .. } => details["reason"]
-                .as_str()
-                .expect("api key invalid details.reason is a string"),
-            other => panic!("expected ApiKeyInvalid, got {other:?}"),
-        }
+    /// Render one refusal the way the HTTP boundary would, for comparison.
+    ///
+    /// Compares the whole projected problem rather than a field, because the
+    /// property under test is that two refusals are indistinguishable — and any
+    /// field that differs is a field a caller can read.
+    fn rendered(error: &WyrdError) -> serde_json::Value {
+        serde_json::to_value(error.problem()).expect("a problem serializes")
     }
 
     #[test]
@@ -1062,8 +1084,19 @@ mod pg_tests {
         assert_eq!(flat[1], b.principal.id.to_string());
     }
 
+    /// Every invalid API-key condition renders the same public problem.
+    ///
+    /// The reason used to be projected in `details.reason`, which handed an
+    /// unauthenticated caller the enumeration oracle the constant-cost
+    /// verification exists to close: `revoked` means the prefix exists,
+    /// `not_found` means it does not. Comparing the full rendered problem is the
+    /// point — a single differing field is a readable field.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot start or any assertion fails.
     #[tokio::test]
-    async fn api_key_invalid_reason_distinct_for_every_variant() {
+    async fn every_invalid_api_key_condition_renders_one_problem() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
         let card_ref = test_service_card_ref();
@@ -1093,7 +1126,7 @@ mod pg_tests {
         )
         .await;
 
-        let mut reasons = BTreeSet::new();
+        let expected = rendered(&super::api_key_invalid());
         for (prefix, error) in [
             ("direct", ExchangeError::CrossTenant),
             ("missing-prefix", ExchangeError::NotFound),
@@ -1101,32 +1134,168 @@ mod pg_tests {
             ("expired-prefix", ExchangeError::NotFound),
             ("direct", ExchangeError::AccountDisabled),
             ("direct", ExchangeError::HashMismatch),
+            ("direct", ExchangeError::TenantNotAdmitting),
         ] {
             let mapped = super::map_exchange_error_to_wyrd(&mut conn, prefix, error).await;
-            let reason = api_key_invalid_reason(&mapped);
-            assert!(!reason.is_empty());
-            assert!(
-                reasons.insert(reason.to_owned()),
-                "duplicate reason {reason}"
+            assert_eq!(
+                rendered(&mapped),
+                expected,
+                "the {prefix} refusal is distinguishable from the others"
             );
         }
 
-        let backend_unavailable =
-            super::reason_from_api_key_status(Err(sqlx::Error::RowNotFound), "prefix");
-        assert_eq!(backend_unavailable, "backend_unavailable");
-        assert!(reasons.insert(backend_unavailable.to_owned()));
-
+        // The operator still gets the distinction, in the log line.
         assert_eq!(
-            reasons,
-            BTreeSet::from([
-                "account_disabled".to_owned(),
-                "backend_unavailable".to_owned(),
-                "cross_tenant".to_owned(),
-                "expired".to_owned(),
-                "hash_mismatch".to_owned(),
-                "not_found".to_owned(),
-                "revoked".to_owned(),
-            ])
+            super::reason_from_api_key_status(Err(sqlx::Error::RowNotFound), "prefix"),
+            "backend_unavailable"
+        );
+    }
+
+    /// Give a suspended service account one live API key.
+    ///
+    /// The suspended-principal refusal needs a credential row that the prefix
+    /// lookup finds and then rejects on status, which is a different shape from
+    /// the lifecycle rows [`insert_lifecycle_key`] seeds.
+    async fn seed_suspended_account_key(
+        conn: &mut TenantConn<'_>,
+        tenant: DataTenantId,
+        created_by: Uuid,
+        base_card: &CardRef,
+        prefix: &str,
+    ) {
+        let card_ref = CardRef {
+            name: CardName::new("suspended-exchange-subject").expect("static name"),
+            ..base_card.clone()
+        };
+        let sa_id = insert_test_service_account(conn, tenant, created_by, &card_ref).await;
+        sqlx::query("UPDATE wyrd.auth_service_accounts SET status = 'suspended' WHERE id = $1")
+            .bind(sa_id)
+            .execute(&mut **conn.transaction())
+            .await
+            .expect("service account suspends");
+        insert_lifecycle_key(
+            conn,
+            tenant,
+            sa_id,
+            created_by,
+            prefix,
+            Utc::now() + Duration::days(1),
+            false,
+        )
+        .await;
+    }
+
+    /// Every refusal path pays for exactly one Argon2 verification.
+    ///
+    /// The refusal-then-verify order in [`ExchangeApiKey::execute`] is what makes
+    /// the paths indistinguishable by clock: a malformed key, another tenant's
+    /// key, a tenant that no longer admits credentials, an unknown prefix, a
+    /// disabled account, a revoked or expired key, and a live prefix with the
+    /// wrong tail must all do the same work. Counting verifications is the only
+    /// way to assert that without measuring wall-clock time, which is unstable
+    /// under a shared test Postgres.
+    ///
+    /// The counter is process-global; `cargo nextest` runs each test in its own
+    /// process, so the deltas below belong to this test alone.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot start or any assertion fails.
+    #[tokio::test]
+    async fn every_invalid_api_key_costs_exactly_one_verification() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let card_ref = test_service_card_ref();
+
+        let unknown = WyrdApiKey::generate(tenant);
+        let disabled = WyrdApiKey::generate(tenant);
+        let revoked = WyrdApiKey::generate(tenant);
+        let wrong_tail = WyrdApiKey::generate(tenant);
+        let foreign = WyrdApiKey::generate(DataTenantId::new_v7());
+        // A tenant absent from `platform.tenants` does not admit credentials,
+        // which is the same answer a suspended one gives.
+        let unadmitted_tenant = DataTenantId::new_v7();
+        let unadmitted = WyrdApiKey::generate(unadmitted_tenant);
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let user_id = insert_test_user(&mut conn, tenant).await;
+        let live_sa = insert_test_service_account(&mut conn, tenant, user_id, &card_ref).await;
+
+        insert_lifecycle_key(
+            &mut conn,
+            tenant,
+            live_sa,
+            user_id,
+            &revoked.prefix,
+            Utc::now() + Duration::days(1),
+            true,
+        )
+        .await;
+        insert_lifecycle_key(
+            &mut conn,
+            tenant,
+            live_sa,
+            user_id,
+            &wrong_tail.prefix,
+            Utc::now() + Duration::days(1),
+            false,
+        )
+        .await;
+
+        seed_suspended_account_key(&mut conn, tenant, user_id, &card_ref, &disabled.prefix).await;
+
+        let expected = rendered(&super::api_key_invalid());
+        let service = exchange_service();
+        let cases = [
+            ("malformed", SecretString::from("not-a-wyrd-api-key")),
+            ("cross_tenant", foreign.secret),
+            ("unknown_prefix", unknown.secret),
+            ("suspended_account", disabled.secret),
+            ("revoked", revoked.secret),
+            ("wrong_tail", wrong_tail.secret),
+        ];
+        for (label, presented) in cases {
+            let before = credential_verify::verifications_performed();
+            let error = service
+                .execute(&mut conn, presented, &format!("req-{label}"))
+                .await
+                .expect_err("an invalid api key is refused");
+            assert_eq!(
+                credential_verify::verifications_performed() - before,
+                1,
+                "the {label} path did not perform exactly one verification"
+            );
+            let prefix = "probe";
+            assert_eq!(
+                rendered(&super::map_exchange_error_to_wyrd(&mut conn, prefix, error).await),
+                expected,
+                "the {label} refusal is distinguishable"
+            );
+        }
+
+        // Admission is decided on the presented key's own tenant, so it needs a
+        // connection bound to that tenant rather than the fixture's.
+        let mut unadmitted_conn = fixture
+            .tenant_conn_for(unadmitted_tenant)
+            .await
+            .expect("unadmitted tenant conn opens");
+        let before = credential_verify::verifications_performed();
+        let error = service
+            .execute(&mut unadmitted_conn, unadmitted.secret, "req-unadmitted")
+            .await
+            .expect_err("a tenant that does not admit credentials is refused");
+        assert!(matches!(error, ExchangeError::TenantNotAdmitting));
+        assert_eq!(
+            credential_verify::verifications_performed() - before,
+            1,
+            "the unadmitted-tenant path did not perform exactly one verification"
+        );
+        assert_eq!(
+            rendered(
+                &super::map_exchange_error_to_wyrd(&mut unadmitted_conn, "probe", error).await
+            ),
+            expected,
+            "the unadmitted-tenant refusal is distinguishable"
         );
     }
 

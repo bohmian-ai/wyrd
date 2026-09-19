@@ -20,13 +20,17 @@ use crate::auth::card_scope::{
     MINT_KIND_API_KEY_EXCHANGE, MINT_KIND_DELEGATION, MINT_KIND_REFRESH,
     audit_scope_mint_failure_best_effort,
 };
-use crate::auth::exchange_api_key::{DelegateToken, ExchangeApiKey, map_exchange_error_to_wyrd};
+use crate::auth::credential_verify::verify_presented;
+use crate::auth::exchange_api_key::{
+    DelegateToken, ExchangeApiKey, api_key_invalid, map_exchange_error_to_wyrd,
+};
 use crate::auth::issue_api_key::{IssueApiKey, WyrdApiKey};
 use crate::auth::jwt_bearer::JwtBearer;
 use crate::auth::login::login as login_handler;
 use crate::auth::refresh::{RefreshTokens, tenant_from_refresh_jwt};
 use crate::components::auth::{AuthenticatedPrincipal, Caller};
 use crate::http::error::WyrdErrorResponse;
+use crate::http::error::internal_failure;
 use crate::state::AppState;
 
 /// Build auth routes.
@@ -63,12 +67,27 @@ async fn token(
     };
     match request {
         TokenRequest::WyrdApiKey { api_key } => {
-            let parsed = WyrdApiKey::parse(api_key.expose()).map_err(|_| {
-                WyrdErrorResponse::from(WyrdError::ApiKeyInvalid {
-                    message: "API key format is invalid".to_owned(),
-                    details: serde_json::json!({ "reason": "format" }),
-                })
-            })?;
+            // A key that does not parse names no tenant, so there is no
+            // connection to reach and no row to verify against — and returning
+            // here for free is exactly what makes a malformed key
+            // distinguishable by clock from a live prefix with a wrong tail.
+            // One verification against the fixed dummy costs what the real
+            // comparison costs, and the refusal is the same one every invalid
+            // key earns.
+            let parsed = match WyrdApiKey::parse(api_key.expose()) {
+                Ok(parsed) => parsed,
+                Err(_) => {
+                    verify_presented(&SecretString::from(api_key.expose().to_owned()), None)
+                        .await
+                        .map_err(|error| {
+                            WyrdErrorResponse::from(internal_failure(
+                                "api key verification failed",
+                                &error,
+                            ))
+                        })?;
+                    return Err(WyrdErrorResponse::from(api_key_invalid()));
+                }
+            };
             let issuing_key = state
                 .auth
                 .issuing_key

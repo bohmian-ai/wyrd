@@ -9,17 +9,17 @@
 //! row-level security. Platform credentials sit outside that boundary by
 //! construction and therefore run on the BYPASSRLS [`OperatorPool`].
 
-use std::sync::LazyLock;
-
 use chrono::{DateTime, Utc};
 use secrecy::{ExposeSecret, SecretString};
 use uuid::Uuid;
-use wyrd_auth_issue::{IssueError, hash_api_key, verify_api_key};
+use wyrd_auth_issue::{IssueError, hash_api_key};
 use wyrd_spec::auth::PrincipalId;
 use wyrd_sql::queries::platform::credentials::{
     insert_platform_credential_tx, platform_credential_by_prefix, touch_platform_credential,
 };
 use wyrd_sql::{OperatorPool, SqlError, TenantConn};
+
+use crate::credential_verify::verify_presented;
 
 /// Prefix identifying a platform-scope credential on sight.
 ///
@@ -74,18 +74,6 @@ impl PlatformCredential {
         Some(format!("{PLATFORM_KEY_PREFIX}_{visible}"))
     }
 }
-
-/// The verifier every rejected credential is checked against.
-///
-/// Derived once per process from throwaway randomness, so no presented secret
-/// can match it and the cost of failing is the cost of succeeding. Computing it
-/// lazily rather than per request matters: Argon2 is deliberately expensive,
-/// and paying for the dummy on every rejection would be a denial-of-service
-/// amplifier rather than a timing defence.
-static DUMMY_VERIFIER: LazyLock<String> = LazyLock::new(|| {
-    hash_api_key(&SecretString::from(Uuid::new_v4().to_string()))
-        .expect("Argon2 hashing generated randomness cannot fail")
-});
 
 /// A credential that authenticated, with the identity of both sides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,18 +206,13 @@ impl PlatformCredentials {
             None => None,
         };
 
-        // Exactly one verification, whatever was wrong with the input. A
+        // Exactly one verification, whatever was wrong with the input: a
         // malformed shape, an unknown prefix, and a revoked, expired or
         // suspended credential all used to answer before Argon2 ran, so a live
         // prefix with a wrong tail took visibly longer than any of them and the
-        // endpoint enumerated live prefixes by clock. Verifying the dummy costs
-        // what verifying a real row costs, so there is nothing left to measure.
-        let verifier = row
-            .as_ref()
-            .map_or_else(|| DUMMY_VERIFIER.clone(), |row| row.secret_hash.clone());
-        let candidate = presented.clone();
+        // endpoint enumerated live prefixes by clock.
         let matched =
-            tokio::task::spawn_blocking(move || verify_api_key(&candidate, &verifier)).await?;
+            verify_presented(presented, row.as_ref().map(|row| row.secret_hash.as_str())).await?;
 
         let Some(row) = row.filter(|_| matched) else {
             return Err(PlatformCredentialError::InvalidCredential);

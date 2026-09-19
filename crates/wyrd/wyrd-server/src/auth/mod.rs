@@ -6,6 +6,7 @@ pub mod login;
 pub mod revoke;
 
 pub(crate) use wyrd_auth::card_scope;
+pub(crate) use wyrd_auth::credential_verify;
 pub(crate) use wyrd_auth::{
     exchange_api_key, issue_api_key, pg_resolvers, refresh, revocation_listener,
     revocation_resolver, roles,

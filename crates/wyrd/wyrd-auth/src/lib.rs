@@ -7,6 +7,7 @@
 pub mod audit;
 pub mod callback;
 pub mod card_scope;
+pub mod credential_verify;
 pub(crate) mod error;
 pub mod exchange_api_key;
 pub mod issue_api_key;

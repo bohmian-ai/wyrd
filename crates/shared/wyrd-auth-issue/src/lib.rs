@@ -961,14 +961,14 @@ mod tests {
         let credential = uuid::Uuid::now_v7();
 
         let token = issuing_key()
-            .issue_platform_access_token(principal, credential, Duration::minutes(15))
+            .issue_platform_access_token(principal, Some(credential), Duration::minutes(15))
             .expect("platform token issues");
         let claims: PlatformAccessTokenClaims =
             verify_eddsa(&token, &public_key(), Some("wyrd")).expect("platform token verifies");
 
         assert_eq!(claims.scope, PLATFORM_TOKEN_SCOPE);
         assert_eq!(claims.sub, principal.to_string());
-        assert_eq!(claims.cid, credential.to_string());
+        assert_eq!(claims.cid, Some(credential.to_string()));
     }
 
     /// A tenant token cannot be read as platform claims, and a platform token
@@ -981,7 +981,7 @@ mod tests {
         let platform_token = issuing_key()
             .issue_platform_access_token(
                 PrincipalId::new(uuid::Uuid::now_v7()),
-                uuid::Uuid::now_v7(),
+                Some(uuid::Uuid::now_v7()),
                 Duration::minutes(15),
             )
             .expect("platform token issues");

@@ -22,6 +22,8 @@ The repository OpenAPI document is `openapi.yaml`. Its current title is `Wyrd AP
 - `/platform/oidc/connection`
 - `/platform/tenants`
 - `/platform/tenants/admin/credentials`
+- `/platform/tenants/{tenant_id}`
+- `/platform/tenants/{tenant_id}/status`
 - `/v1/bifrost/tables`
 - `/v1/bifrost/tables/{namespace}/{name}`
 - `/v1/cards`

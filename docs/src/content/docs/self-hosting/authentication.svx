@@ -70,9 +70,20 @@ export WYRD_SEALING_KEY_FILE=/run/secrets/sealing-key.b64
 
 The file holds base64 that must decode to exactly 32 bytes. Boot fails closed if it decodes to any other length, or if an issuer needs a sealing key and none is set.
 
-## First admin key
+## Platform and tenant credentials
 
-A fresh deployment has no credentials. Establish its administrative root with the `init` subcommand, then use that credential to create your first tenant over the API — which hands back the tenant's own administrative credential. See [Running the server](/self-hosting/running-the-server/#init).
+A fresh deployment has no credentials. `wyrd-server init` establishes its administrative root and prints one **platform credential** (`wyrd_global_…`), and that credential creates your first tenant — which hands back the tenant's own **tenant credential** (`wyrd_sk_<tenant>_…`).
+
+The two are not interchangeable and neither is a weaker form of the other:
+
+| | Platform credential | Tenant credential |
+| --- | --- | --- |
+| Administers | Tenant lifecycle, tenant-admin recovery, platform sign-in | One tenant's principals, credentials, and resources |
+| Can read tenant data | No | Yes, within its own tenant |
+| Recovered by | Another live platform credential, and nothing else | The platform credential |
+| Custody in a hosted deployment | The provider's | The tenant's |
+
+Both are stored only as Argon2 verifiers and shown exactly once. Rotate either with an overlap — issue the replacement, verify it, then revoke the one it replaces — so nothing is down between the two steps. The commands for all of this are in [Administering the deployment](/self-hosting/running-the-server/#administering-the-deployment).
 
 ## Related
 

@@ -45,6 +45,105 @@ If you lose the credential, issue a replacement against the same principal rathe
 
 `init` needs the platform-admin database environment set, but not a signing key or storage backend. You can run it against a fresh production database before the full serving environment is in place.
 
+## Administering the deployment
+
+Everything after `init` is an ordinary authenticated call. The `wyrd` CLI
+projects the same routes the SDKs call, so no operator task on this page needs
+SQL.
+
+The platform plane is reached with the credential `init` printed. Export it
+once and every `wyrd platform` command below picks it up:
+
+```bash
+export WYRD_SERVER_URL=https://wyrd.example
+export WYRD_PLATFORM_CREDENTIAL=wyrd_global_…
+```
+
+### Tenants
+
+```bash
+# Create a tenant. The administrative credential is printed once.
+wyrd platform tenant create --slug acme --display-name "Acme"
+
+# See the directory, in every lifecycle state.
+wyrd platform tenant list
+wyrd platform tenant inspect --tenant <tenant-id>
+
+# Freeze admission without destroying anything, then restore it.
+wyrd platform tenant suspend --tenant <tenant-id>
+wyrd platform tenant resume  --tenant <tenant-id>
+```
+
+Suspension stops the tokens the tenant has already minted, not only its next
+credential exchange, and destroys nothing: rows, grants, and credentials all
+survive, so `resume` restores exactly what was there.
+
+### Tenant administration
+
+Inside a tenant, administration uses the tenant's own access token, never the
+platform credential:
+
+```bash
+export WYRD_ACCESS_TOKEN=<tenant access token>
+
+# A principal narrower than the tenant administrator.
+wyrd principal credential create-principal --name ci-runner --role reader
+
+# Rotate with an overlap: issue, deploy, verify, then retire the old one.
+wyrd principal credential issue  --principal <principal-id>
+wyrd principal credential list   --principal <principal-id>
+wyrd principal credential revoke --principal <principal-id> --credential-id <old-id>
+
+# Compromise, not rotation: end every token the principal holds.
+wyrd principal revoke <principal-id> --kind service --reason "key found in a build log"
+```
+
+The overlap is the point of issuing before revoking: both credentials are live
+between the two commands, so nothing is down while the new one is deployed.
+Listing includes revoked credentials on purpose, so an operator can confirm the
+superseded one really is gone.
+
+Revoking a *principal* ends its live tokens by advancing its authorization
+epoch. It does not retire the principal's credentials — a surviving credential
+can still mint a new working token — so a compromised credential is revoked as
+a credential, and the principal revocation is what stops the tokens already out
+there.
+
+### Recovery
+
+Two different losses, two different commands:
+
+| What was lost | Recover with | Needs |
+| --- | --- | --- |
+| A tenant's last administrative credential | `wyrd platform tenant recover-admin --tenant <id>` | The platform credential |
+| The platform credential itself | `wyrd platform credential issue --principal <platform-principal-id>` | Another live platform credential |
+
+Tenant recovery issues a replacement credential for the tenant's *existing*
+administrative principal, so the tenant's roles, resources, and history are
+untouched. It refuses a tenant that is not active: a suspended, failed, or
+still-provisioning tenant must not acquire a new durable secret.
+
+The platform credential has no such backstop. It is the deployment's root, and
+nothing above it can reissue it, so rotate it with an overlap — issue the
+replacement, verify it, then revoke the old one — and never let the last live
+platform credential be the only copy:
+
+```bash
+wyrd platform credential issue  --principal <platform-principal-id>
+wyrd platform credential list   --principal <platform-principal-id>
+wyrd platform credential revoke --principal <platform-principal-id> --credential-id <old-id>
+```
+
+<Aside title="Custody">
+
+In a hosted deployment the platform credential is the provider's, not the
+tenant's: it administers every tenant on the deployment and grants nothing
+inside any of them. Tenants receive only their own tenant credential. Keep the
+platform credential in the same custody as the signing key — a secret manager,
+not a shell history — and rotate it on the same schedule.
+
+</Aside>
+
 ## Serve modes
 
 The server speaks two protocols. HTTP serves the REST/JSON API that your clients, the SDK, the CLI, and the UI call: card registration, queries, admin. gRPC is the ingest transport that machine workers use. They are independent, which is the reason `--mode` exists.
@@ -108,3 +207,4 @@ When `metrics.enabled` is true (the default), the server serves Prometheus metri
 - [Configuration](/self-hosting/configuration/): the full env var and config file reference.
 - [Architecture](/self-hosting/architecture/): what supervises these tasks and how shutdown drains.
 - [Local development](/self-hosting/local-development/): embedded Postgres and server-owned credential bootstrap.
+- [Authentication](/self-hosting/authentication/): the key material and grants behind these commands.

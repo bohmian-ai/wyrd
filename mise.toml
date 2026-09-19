@@ -1078,10 +1078,6 @@ run = [
   """,
 ]
 
-[tasks."cli:dev-bootstrap"]
-description = "Seed the local Wyrd tenant and service credentials"
-run = "cargo run --locked -p wyrd-cli -- dev bootstrap"
-
 [tasks."cli:init"]
 description = "Establish this deployment's platform administrative root and print its credential once"
 run = "cargo run --locked -p wyrd-server -- init"

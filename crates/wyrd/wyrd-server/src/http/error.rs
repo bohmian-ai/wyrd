@@ -199,7 +199,9 @@ pub fn auth_error_to_wyrd(error: AuthError) -> WyrdError {
             message: "credential revoked".to_owned(),
             details: serde_json::json!({}),
         },
-        AuthError::BadTokenFormat => bad_token_format("authorization header malformed"),
+        AuthError::BadTokenFormat => {
+            bad_token_format("X-Wyrd-Access-Token is not a compact Wyrd JWT")
+        }
         AuthError::VerifyUnavailable => WyrdError::AuthVerifyUnavailable {
             message: "auth verify backend unavailable".to_owned(),
             details: serde_json::json!({ "retry_after_seconds": 1 }),

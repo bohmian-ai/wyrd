@@ -252,6 +252,20 @@ fn lookup(
 pub(crate) const EVAL_LEASE_HEADER: &str = "x-wyrd-eval-lease";
 
 /// Constant-time per-run lease check, retained beneath principal identity.
+///
+/// Every protocol call on an open run passes through here after the caller's own
+/// token has authenticated them: the lease is what binds a permitted caller to
+/// the one run it opened, so a principal that may run evals still cannot drive
+/// another's. The comparison is constant-time because the lease is a secret and
+/// the caller controls the candidate.
+///
+/// # Errors
+/// Returns `WYRD_EVAL_401_MISSING_LEASE` when [`EVAL_LEASE_HEADER`] is absent,
+/// not valid UTF-8, carries no space-separated scheme, names a scheme other than
+/// `Bearer`, or carries an empty token — a caller that presented nothing usable
+/// is told the same thing however it failed to. Returns
+/// `WYRD_EVAL_403_INVALID_LEASE` when a well-formed lease does not match the one
+/// minted for this run.
 fn check_lease(headers: &HeaderMap, entry: &RunEntry) -> Result<(), WyrdErrorResponse> {
     use subtle::ConstantTimeEq;
 

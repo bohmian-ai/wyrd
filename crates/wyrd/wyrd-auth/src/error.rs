@@ -32,7 +32,7 @@ pub(crate) fn auth_error_to_wyrd(error: AuthError) -> WyrdError {
             details: json!({}),
         },
         AuthError::BadTokenFormat => WyrdError::BadTokenFormat {
-            message: "authorization header malformed".to_owned(),
+            message: "X-Wyrd-Access-Token is not a compact Wyrd JWT".to_owned(),
             details: json!({}),
         },
         AuthError::VerifyUnavailable => WyrdError::AuthVerifyUnavailable {

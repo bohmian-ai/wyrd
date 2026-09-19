@@ -4165,7 +4165,7 @@ mod tests {
                 details: serde_json::json!({}),
             },
             WyrdError::BadTokenFormat {
-                message: "authorization header malformed".to_owned(),
+                message: "X-Wyrd-Access-Token is not a compact Wyrd JWT".to_owned(),
                 details: serde_json::json!({}),
             },
             WyrdError::UnsupportedGrantType {

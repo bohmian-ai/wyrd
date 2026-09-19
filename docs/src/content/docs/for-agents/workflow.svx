@@ -25,7 +25,7 @@ Cards are addressed by their `(space, name, version)` identity:
 
 ```bash
 curl -sf "$WYRD_SERVER_URL/v1/cards/default/my-dataset/0.1.0" \
-  -H "Authorization: Bearer $WYRD_ACCESS_TOKEN"
+  -H "X-Wyrd-Access-Token: Bearer $WYRD_ACCESS_TOKEN"
 ```
 
 A `200` returns the stored envelope — read it and continue. A `404` means the card
@@ -56,7 +56,7 @@ card.save(Path("./my-dataset"))
 
 ```bash
 curl -X POST "$WYRD_SERVER_URL/v1/cards" \
-  -H "Authorization: Bearer $WYRD_ACCESS_TOKEN" \
+  -H "X-Wyrd-Access-Token: Bearer $WYRD_ACCESS_TOKEN" \
   -H "Content-Type: application/json" \
   -H "Idempotency-Key: my-dataset-register-001" \
   --data @my-dataset/register-request.json
@@ -78,7 +78,7 @@ import httpx
 resp = httpx.post(
     f"{server_url}/v1/cards",
     headers={
-        "Authorization": f"Bearer {token}",
+        "X-Wyrd-Access-Token": f"Bearer {token}",
         "Idempotency-Key": "my-dataset-register-001",
     },
     json={"submissions": [card_submission]},

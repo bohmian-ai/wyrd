@@ -75,6 +75,22 @@ pub(super) fn print_tokens(token: &TokenResponse) {
     println!("expires_at:    {}", token.expires_at);
 }
 
+/// Recover the authorization code and state from what the operator pasted.
+///
+/// The IdP redirects to a callback URL the CLI cannot listen on, so the operator
+/// carries the result back by hand. Accepts either the whole URL or just its
+/// query string, and reads the two parameters the code exchange needs.
+///
+/// The pasted text is a live credential: it carries a single-use authorization
+/// code that stays redeemable until used or expired. It is therefore never
+/// placed in the returned error, which the CLI prints to stderr twice — once as
+/// collectable JSON — where it would outlive the login in scrollback and CI
+/// logs.
+///
+/// # Errors
+/// Returns [`WyrdCliError::InvalidArgument`] when either `code` or `state` is
+/// absent from both readings, naming which parameter was missing and nothing
+/// else about the input.
 fn parse_callback_input(input: &str) -> Result<(String, String), WyrdCliError> {
     if let Ok(url) = Url::parse(input) {
         let code = url
@@ -96,9 +112,13 @@ fn parse_callback_input(input: &str) -> Result<(String, String), WyrdCliError> {
     let state = pairs.get("state").map(|v| v.as_ref().to_owned());
     match (code, state) {
         (Some(c), Some(s)) => Ok((c, s)),
-        _ => Err(WyrdCliError::InvalidArgument {
+        (code, state) => Err(WyrdCliError::InvalidArgument {
             field: "callback".to_owned(),
-            value: input.to_owned(),
+            value: match (code.is_some(), state.is_some()) {
+                (false, true) => "<missing code>".to_owned(),
+                (true, false) => "<missing state>".to_owned(),
+                _ => "<missing code and state>".to_owned(),
+            },
             expected: "the full callback URL, or a `code=<>&state=<>` query string".to_owned(),
         }),
     }
@@ -128,5 +148,30 @@ mod tests {
     fn rejects_missing_code() {
         let url = "http://localhost:8080/auth/callback?state=xyz789";
         assert!(parse_callback_input(url).is_err());
+    }
+
+    /// The refusal names the missing parameter and never echoes the paste.
+    ///
+    /// A pasted callback carries a live single-use authorization code, and the
+    /// CLI prints this error to stderr twice, once as collectable JSON. Echoing
+    /// the input would put that code in scrollback and CI logs, so the rendered
+    /// error must contain neither the value nor the `code=` that precedes it.
+    #[test]
+    fn the_refusal_does_not_echo_the_pasted_callback() {
+        let error = parse_callback_input("code=super-secret-code")
+            .expect_err("a callback with no state is refused");
+        let rendered = error.to_string();
+        assert!(
+            !rendered.contains("super-secret-code"),
+            "the authorization code leaked into the error: {rendered}"
+        );
+        assert!(
+            !rendered.contains("code=super"),
+            "the raw paste leaked into the error: {rendered}"
+        );
+        assert!(
+            rendered.contains("<missing state>"),
+            "the error names which parameter was absent: {rendered}"
+        );
     }
 }

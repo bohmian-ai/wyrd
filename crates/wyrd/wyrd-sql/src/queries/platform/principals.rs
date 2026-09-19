@@ -264,6 +264,12 @@ pub async fn set_platform_principal_status(
 /// platform authority, and authority is not one if nothing can authenticate as
 /// it. `@>` is grant containment, so a principal counts only when it holds
 /// every permission in the required set.
+///
+/// An identity row is only a way in once it is *usable*: its subject must be
+/// pinned, because an unpinned registration cannot resolve a login, and its
+/// issuer must be the connection the deployment currently serves, because a
+/// removed or replaced connection cannot verify that subject any more. Counting
+/// either would let the last administrator who can really sign in be suspended.
 const USABLE_ADMINISTRATORS_SQL: &str = "WITH usable AS (
         SELECT p.id
           FROM platform.principals p
@@ -278,7 +284,12 @@ const USABLE_ADMINISTRATORS_SQL: &str = "WITH usable AS (
                AND (c.expires_at IS NULL OR c.expires_at > now())
           )
           OR EXISTS (
-            SELECT 1 FROM platform.principal_identities i WHERE i.principal_id = p.id
+            SELECT 1
+              FROM platform.principal_identities i
+              JOIN platform.oidc_connection o
+                ON o.singleton AND o.issuer_url = i.issuer
+             WHERE i.principal_id = p.id
+               AND i.subject IS NOT NULL
           )
         )
       )

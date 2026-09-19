@@ -16,9 +16,10 @@ mod pg_tests {
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::auth::PrincipalKindTag;
     use wyrd_sql::queries::platform::identity::{
-        insert_platform_identity_tx, insert_platform_login_state, pin_platform_identity,
-        platform_identity_by_subject, platform_oidc_connection, purge_expired_platform_login_state,
-        take_platform_login_state, upsert_platform_oidc_connection,
+        delete_platform_oidc_connection, insert_platform_identity_tx, insert_platform_login_state,
+        pin_platform_identity, platform_identity_by_subject, platform_oidc_connection,
+        purge_expired_platform_login_state, take_platform_login_state,
+        upsert_platform_oidc_connection,
     };
     use wyrd_sql::queries::platform::principal_grants::set_platform_grant;
     use wyrd_sql::queries::platform::principals::{
@@ -47,6 +48,45 @@ mod pg_tests {
         set_platform_grant(fixture.operator_pool(), principal, &required_grant())
             .await
             .expect("grant installs");
+    }
+
+    /// Install the deployment's one OIDC connection for `issuer`.
+    ///
+    /// The lockout guard only counts a pinned identity whose issuer is the
+    /// connection currently served, so a test that wants a federated
+    /// administrator to be a way in has to install one.
+    async fn connect(fixture: &PgFixture, issuer: &str) {
+        upsert_platform_oidc_connection(
+            fixture.operator_pool(),
+            issuer,
+            "https://idp.example.com/jwks",
+            "wyrd-platform",
+            "wyrd-platform",
+            "Public",
+            &serde_json::json!({"subject": ["sub"], "email": ["email"], "groups": null}),
+            300,
+            None,
+        )
+        .await
+        .expect("connection upserts");
+    }
+
+    /// Register a human administrator who can actually sign in.
+    ///
+    /// Registration alone is not a way in: the subject is pinned at first login
+    /// and the guard counts only pinned identities, so a test that needs a
+    /// usable survivor pins one here.
+    async fn register_pinned(fixture: &PgFixture, name: &str, claim: &str) -> Uuid {
+        let id = register(fixture, name, claim).await;
+        pin_platform_identity(
+            fixture.operator_pool(),
+            ISSUER,
+            claim,
+            &format!("subject-{name}"),
+        )
+        .await
+        .expect("pin succeeds");
+        id
     }
 
     /// Register a human platform principal awaiting its first login.
@@ -325,10 +365,11 @@ mod pg_tests {
         }
         let fixture = PgFixture::start().await.expect("fixture starts");
         let pool = fixture.operator_pool();
+        connect(&fixture, ISSUER).await;
 
         // A registered human with a pinned identity and the required grant is
         // the deployment's only way in.
-        let only_way_in = register(&fixture, "ops-lead", "ops@example.com").await;
+        let only_way_in = register_pinned(&fixture, "ops-lead", "ops@example.com").await;
         grant(&fixture, only_way_in).await;
         assert_eq!(
             set_platform_principal_status(pool, only_way_in, "suspended", &required_grant())
@@ -375,8 +416,20 @@ mod pg_tests {
             "neither of those made the real administrator suspendable"
         );
 
+        // Nor is a granted human whose subject was never pinned. A registration
+        // awaiting its first login resolves no token, so it cannot sign in.
+        let unpinned = register(&fixture, "ops-pending", "pending@example.com").await;
+        grant(&fixture, unpinned).await;
+        assert_eq!(
+            set_platform_principal_status(pool, only_way_in, "suspended", &required_grant())
+                .await
+                .expect("guard runs"),
+            StatusChange::WouldStrandDeployment,
+            "an unpinned registration is not a way in"
+        );
+
         // A second usable administrator does.
-        let survivor = register(&fixture, "ops-second", "second@example.com").await;
+        let survivor = register_pinned(&fixture, "ops-second", "second@example.com").await;
         grant(&fixture, survivor).await;
         assert_eq!(
             set_platform_principal_status(pool, only_way_in, "suspended", &required_grant())
@@ -384,6 +437,72 @@ mod pg_tests {
                 .expect("guard runs"),
             StatusChange::Changed
         );
+    }
+
+    /// A pinned identity stops being a way in when its connection is removed.
+    ///
+    /// Removal is an exposed route, and the deployment keeps its global
+    /// credential afterwards. What it must not do is leave the guard counting
+    /// administrators nothing can verify any more.
+    #[tokio::test]
+    async fn a_removed_connection_stops_its_identities_counting() {
+        if database_url().is_none() {
+            return;
+        }
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let pool = fixture.operator_pool();
+        connect(&fixture, ISSUER).await;
+
+        let federated = register_pinned(&fixture, "ops-lead", "ops@example.com").await;
+        grant(&fixture, federated).await;
+
+        // A credential holder is the subject under test: it must stay protected
+        // while the federated administrator is the only other candidate.
+        let machine = Uuid::now_v7();
+        insert_platform_principal(pool, machine, PrincipalKindTag::GlobalAdmin, "ops-root")
+            .await
+            .expect("principal inserts");
+        grant(&fixture, machine).await;
+        credential(&fixture, machine, "wyp_removed").await;
+        assert_eq!(
+            set_platform_principal_status(pool, machine, "suspended", &required_grant())
+                .await
+                .expect("guard runs"),
+            StatusChange::Changed,
+            "a live federated administrator is a surviving way in"
+        );
+        set_platform_principal_status(pool, machine, "active", &required_grant())
+            .await
+            .expect("restore succeeds");
+
+        delete_platform_oidc_connection(pool)
+            .await
+            .expect("connection removes");
+
+        assert_eq!(
+            set_platform_principal_status(pool, machine, "suspended", &required_grant())
+                .await
+                .expect("guard runs"),
+            StatusChange::WouldStrandDeployment,
+            "with the connection gone the credential holder is the last way in"
+        );
+    }
+
+    /// Issue a live platform credential for `principal`.
+    ///
+    /// The hash is a literal because the guard only asks whether an unrevoked,
+    /// unexpired row exists; no verification happens here.
+    async fn credential(fixture: &PgFixture, principal: Uuid, prefix: &str) {
+        sqlx::query(
+            "INSERT INTO platform.credentials (id, principal_id, prefix, secret_hash)
+             VALUES ($1, $2, $3, 'argon2-placeholder')",
+        )
+        .bind(Uuid::now_v7())
+        .bind(principal)
+        .bind(prefix)
+        .execute(fixture.operator_pool().pool())
+        .await
+        .expect("credential inserts");
     }
 
     /// Two administrators suspending each other at once leave one standing.
@@ -398,8 +517,9 @@ mod pg_tests {
         }
         let fixture = PgFixture::start().await.expect("fixture starts");
         let pool = fixture.operator_pool();
-        let first = register(&fixture, "ops-first", "first@example.com").await;
-        let second = register(&fixture, "ops-second", "second@example.com").await;
+        connect(&fixture, ISSUER).await;
+        let first = register_pinned(&fixture, "ops-first", "first@example.com").await;
+        let second = register_pinned(&fixture, "ops-second", "second@example.com").await;
         grant(&fixture, first).await;
         grant(&fixture, second).await;
 

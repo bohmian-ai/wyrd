@@ -914,6 +914,7 @@ mod tests {
             tenant_id: tenant,
             roles: Vec::new(),
             effective_permissions: PermissionSet::new(),
+            credential_id: None,
         };
         let make_frame = |value: String| decoded_size_frame(tenant, &principal, value);
         let admission_before = scribe.admission_snapshot();

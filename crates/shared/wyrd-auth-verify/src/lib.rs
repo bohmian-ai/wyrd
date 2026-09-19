@@ -774,6 +774,16 @@ pub struct AccessTokenClaims {
     pub iss: String,
     /// Token identifier.
     pub jti: String,
+    /// Non-secret id of the credential this token was exchanged from, when a
+    /// credential was presented.
+    ///
+    /// Carried so audit can name which of a principal's several live
+    /// credentials made a decision — the one thing needed to revoke the right
+    /// key after a leak. Absent for a federated human session and for tokens
+    /// the server mints internally. It is not an authority: verification
+    /// resolves what the principal may do from the store, exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cid: Option<String>,
 }
 
 /// Claims carried by a platform-scope access token.
@@ -943,7 +953,8 @@ impl AccessTokenClaims {
             self.principal.tenant_id,
             self.roles.clone(),
             effective_permissions,
-        );
+        )
+        .with_credential_id(self.cid.as_deref().and_then(|cid| cid.parse().ok()));
         let delegation_chain = flatten_act_chain(self.act.as_deref())?;
         let exp =
             DateTime::<Utc>::from_timestamp(self.exp as i64, 0).ok_or(AuthError::InvalidToken)?;
@@ -1746,6 +1757,7 @@ mod tests {
             iat,
             iss: "wyrd".to_owned(),
             jti: "01K00000000000000000000000".to_owned(),
+            cid: None,
         }
     }
 

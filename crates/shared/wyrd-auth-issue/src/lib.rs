@@ -22,7 +22,7 @@ use wyrd_runtime::{PrincipalId, RoleRef};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalKindTag;
 use wyrd_spec::envelope::CardKind;
-use wyrd_spec::reference::{CardRef, CardRefScope};
+use wyrd_spec::reference::CardRefScope;
 
 pub use wyrd_auth_verify::{MAX_BEARER_TOKEN_BYTES, MAX_DELEGATION_DEPTH};
 
@@ -200,7 +200,14 @@ impl IssuingKey {
             return Err(IssueError::InvalidPrincipalKind);
         }
         validate_principal_ref(&principal)?;
-        self.issue_access_token_with_claims(principal.id.to_string(), principal, roles, None, ttl)
+        self.issue_access_token_with_claims(
+            principal.id.to_string(),
+            principal,
+            roles,
+            None,
+            None,
+            ttl,
+        )
     }
 
     /// Mint an access token for a Card-free machine principal.
@@ -220,6 +227,7 @@ impl IssuingKey {
         &self,
         principal: TokenPrincipalRef,
         roles: Vec<RoleRef>,
+        credential_id: Option<Uuid>,
         ttl: Duration,
     ) -> Result<String, IssueError> {
         if !matches!(
@@ -232,89 +240,72 @@ impl IssuingKey {
             return Err(IssueError::InvalidCardRef);
         }
         validate_principal_ref(&principal)?;
-        self.issue_access_token_with_claims(principal.id.to_string(), principal, roles, None, ttl)
+        self.issue_access_token_with_claims(
+            principal.id.to_string(),
+            principal,
+            roles,
+            None,
+            credential_id,
+            ttl,
+        )
     }
 
-    /// Mint an access token for a Service principal.
+    /// Mint an access token for a Card-bound principal.
+    ///
+    /// Service and Agent differ only in which `CardKind` the bound Card must
+    /// have, so one entry point covers both: the principal's own kind tag names
+    /// the expected Card kind, and a mismatch between the two is exactly the
+    /// confusion this check exists to reject.
+    ///
+    /// The presented scope is re-derived from the root Card so a caller cannot
+    /// widen it by passing extra members, and `credential_id` records which
+    /// credential the token was minted from so a decision made with it is
+    /// attributable after a rotation.
     ///
     /// # Errors
-    /// Returns an error when the card reference is not a Service, TTL is invalid, or signing fails.
+    /// Returns [`IssueError::InvalidPrincipalKind`] when the kind is not
+    /// Service or Agent, [`IssueError::InvalidCardRef`] when no Card is bound
+    /// or its kind does not match the principal's, and a signing or timestamp
+    /// error otherwise.
     #[tracing::instrument(
         level = "debug",
-        skip(self, card_ref),
+        skip(self, principal),
         fields(
             kid = %self.kid,
-            sa_id = %sa_id,
-            tenant_id = %tenant_id,
+            principal_id = %principal.id,
+            tenant_id = %principal.tenant_id,
             jti = tracing::field::Empty,
         ),
         err,
     )]
-    pub fn issue_service_access_token(
+    pub fn issue_card_access_token(
         &self,
-        sa_id: PrincipalId,
-        tenant_id: DataTenantId,
-        card_ref: CardRef,
-        card_ref_scope: CardRefScope,
+        principal: TokenPrincipalRef,
         roles: Vec<RoleRef>,
+        credential_id: Option<Uuid>,
         ttl: Duration,
     ) -> Result<String, IssueError> {
-        if card_ref.kind != CardKind::Service {
+        let expected = match principal.kind {
+            PrincipalKindTag::Service => CardKind::Service,
+            PrincipalKindTag::Agent => CardKind::Agent,
+            _ => return Err(IssueError::InvalidPrincipalKind),
+        };
+        let Some(card_ref) = principal.card_ref.clone() else {
+            return Err(IssueError::InvalidCardRef);
+        };
+        if card_ref.kind != expected {
             return Err(IssueError::InvalidCardRef);
         }
         let card_ref_scope = CardRefScope::from_root_and_members(
             &card_ref,
-            card_ref_scope.as_slice().iter().cloned(),
+            principal.card_ref_scope.as_slice().iter().cloned(),
         );
+        let subject = principal.id.to_string();
         let principal = TokenPrincipalRef {
-            id: sa_id,
-            kind: PrincipalKindTag::Service,
-            tenant_id,
-            card_ref: Some(card_ref),
             card_ref_scope,
+            ..principal
         };
-        self.issue_access_token_with_claims(sa_id.to_string(), principal, roles, None, ttl)
-    }
-
-    /// Mint an access token for an Agent principal.
-    ///
-    /// # Errors
-    /// Returns an error when the card reference is not an Agent, TTL is invalid, or signing fails.
-    #[tracing::instrument(
-        level = "debug",
-        skip(self, card_ref),
-        fields(
-            kid = %self.kid,
-            agent_id = %agent_id,
-            tenant_id = %tenant_id,
-            jti = tracing::field::Empty,
-        ),
-        err,
-    )]
-    pub fn issue_agent_access_token(
-        &self,
-        agent_id: PrincipalId,
-        tenant_id: DataTenantId,
-        card_ref: CardRef,
-        card_ref_scope: CardRefScope,
-        roles: Vec<RoleRef>,
-        ttl: Duration,
-    ) -> Result<String, IssueError> {
-        if card_ref.kind != CardKind::Agent {
-            return Err(IssueError::InvalidCardRef);
-        }
-        let card_ref_scope = CardRefScope::from_root_and_members(
-            &card_ref,
-            card_ref_scope.as_slice().iter().cloned(),
-        );
-        let principal = TokenPrincipalRef {
-            id: agent_id,
-            kind: PrincipalKindTag::Agent,
-            tenant_id,
-            card_ref: Some(card_ref),
-            card_ref_scope,
-        };
-        self.issue_access_token_with_claims(agent_id.to_string(), principal, roles, None, ttl)
+        self.issue_access_token_with_claims(subject, principal, roles, None, credential_id, ttl)
     }
 
     /// Mint a delegated access token via RFC 8693 token exchange.
@@ -360,6 +351,8 @@ impl IssuingKey {
             requested_subject,
             requested_roles,
             act,
+            // A delegated token is minted from a token, not from a credential.
+            None,
             ttl,
         )
     }
@@ -445,6 +438,7 @@ impl IssuingKey {
         principal: TokenPrincipalRef,
         roles: Vec<RoleRef>,
         act: Option<Box<ActClaim>>,
+        credential_id: Option<Uuid>,
         ttl: Duration,
     ) -> Result<String, IssueError> {
         let (iat, exp) = timestamps(ttl)?;
@@ -459,6 +453,7 @@ impl IssuingKey {
             iat,
             iss: self.issuer.clone(),
             jti,
+            cid: credential_id.map(|id| id.to_string()),
         };
         self.encode(&claims)
     }
@@ -608,16 +603,32 @@ mod tests {
         assert_eq!(claims.jti.len(), 26);
     }
 
+    /// Build a Card-bound principal reference for the issuance tests.
+    ///
+    /// The kind and the Card kind are independent parameters so a test can
+    /// present the mismatched pair the issuer must reject.
+    fn card_principal(id: &str, kind: PrincipalKindTag, card_kind: CardKind) -> TokenPrincipalRef {
+        TokenPrincipalRef {
+            id: principal_id(id),
+            kind,
+            tenant_id: tenant_id(),
+            card_ref: Some(card_ref(card_kind)),
+            card_ref_scope: CardRefScope::default(),
+        }
+    }
+
     #[test]
-    fn issue_service_access_token_forces_service_card_ref() {
+    fn issue_card_access_token_forces_service_card_ref() {
         let card_ref = card_ref(CardKind::Service);
         let token = issuing_key()
-            .issue_service_access_token(
-                principal_id("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b02"),
-                tenant_id(),
-                card_ref.clone(),
-                CardRefScope::default(),
+            .issue_card_access_token(
+                card_principal(
+                    "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b02",
+                    PrincipalKindTag::Service,
+                    CardKind::Service,
+                ),
                 vec![role("service")],
+                None,
                 Duration::minutes(5),
             )
             .expect("token issues");
@@ -633,13 +644,15 @@ mod tests {
     }
 
     #[test]
-    fn issue_service_access_token_rejects_agent_card_ref() {
-        let result = issuing_key().issue_service_access_token(
-            principal_id("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b02"),
-            tenant_id(),
-            card_ref(CardKind::Agent),
-            CardRefScope::default(),
+    fn issue_card_access_token_rejects_agent_card_ref_for_a_service() {
+        let result = issuing_key().issue_card_access_token(
+            card_principal(
+                "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b02",
+                PrincipalKindTag::Service,
+                CardKind::Agent,
+            ),
             vec![role("service")],
+            None,
             Duration::minutes(5),
         );
 
@@ -647,15 +660,17 @@ mod tests {
     }
 
     #[test]
-    fn issue_agent_access_token_forces_agent_card_ref() {
+    fn issue_card_access_token_forces_agent_card_ref() {
         let card_ref = card_ref(CardKind::Agent);
         let token = issuing_key()
-            .issue_agent_access_token(
-                principal_id("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b04"),
-                tenant_id(),
-                card_ref.clone(),
-                CardRefScope::default(),
+            .issue_card_access_token(
+                card_principal(
+                    "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b04",
+                    PrincipalKindTag::Agent,
+                    CardKind::Agent,
+                ),
                 vec![role("agent")],
+                None,
                 Duration::minutes(5),
             )
             .expect("token issues");
@@ -671,13 +686,15 @@ mod tests {
     }
 
     #[test]
-    fn issue_agent_access_token_rejects_service_card_ref() {
-        let result = issuing_key().issue_agent_access_token(
-            principal_id("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b04"),
-            tenant_id(),
-            card_ref(CardKind::Service),
-            CardRefScope::default(),
+    fn issue_card_access_token_rejects_service_card_ref_for_an_agent() {
+        let result = issuing_key().issue_card_access_token(
+            card_principal(
+                "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b04",
+                PrincipalKindTag::Agent,
+                CardKind::Service,
+            ),
             vec![role("agent")],
+            None,
             Duration::minutes(5),
         );
 

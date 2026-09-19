@@ -890,6 +890,7 @@ impl ChildConfig {
             tenant_id: self.tenant_id,
             roles: Vec::new(),
             effective_permissions: wyrd_runtime::PermissionSet::new(),
+            credential_id: None,
         };
         scribe
             .ingest_native_for_test(vala_bifrost_redux::scribe::NativeIngressTestFrame {

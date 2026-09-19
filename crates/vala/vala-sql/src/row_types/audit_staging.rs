@@ -25,8 +25,12 @@ pub struct AuditStagingRow {
     pub card_ref: Option<String>,
     /// Stable ID of the acting principal.
     pub principal_id: Uuid,
-    /// Principal kind tag: `user`, `service`, or `agent`.
+    /// Principal kind tag: `global_admin`, `tenant_admin`, `user`, `service`,
+    /// or `agent`.
     pub principal_kind: String,
+    /// Non-secret id of the credential that authenticated the request, when one
+    /// was presented.
+    pub credential_id: Option<Uuid>,
     /// Effective dynamic permission the boundary evaluated.
     pub permission: String,
     /// Authorization outcome: `allowed` or `denied`.

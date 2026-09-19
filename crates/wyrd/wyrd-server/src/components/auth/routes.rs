@@ -430,6 +430,7 @@ mod pg_tests {
             iat: 0,
             iss: "test".to_owned(),
             jti: "01K00000000000000000000000".to_owned(),
+            cid: None,
         };
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
             serde_json::to_string(&claims)
@@ -485,6 +486,7 @@ mod pg_tests {
                 tenant_id: tenant,
                 roles: Vec::new(),
                 effective_permissions: permissions,
+                credential_id: None,
             },
             delegation_chain: Vec::new(),
             exp: chrono::Utc::now() + chrono::Duration::minutes(5),

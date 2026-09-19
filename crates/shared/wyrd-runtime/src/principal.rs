@@ -4,6 +4,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalKindTag;
 use wyrd_spec::reference::{CardRef, CardRefScope};
@@ -25,6 +26,14 @@ pub struct Principal {
     pub roles: Vec<RoleRef>,
     /// Permissions resolved from roles at verify time.
     pub effective_permissions: PermissionSet,
+    /// Non-secret id of the credential the request authenticated with, when one
+    /// was presented.
+    ///
+    /// Audit records it so a decision names which of a principal's several live
+    /// credentials made it. `None` for a federated human session and for an
+    /// identity the server minted for itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<Uuid>,
 }
 
 /// Kind of authenticated identity.
@@ -130,6 +139,11 @@ pub struct InvalidRoleName;
 
 impl Principal {
     /// Construct a principal.
+    ///
+    /// The authenticating credential is attached separately with
+    /// [`Principal::with_credential_id`], because most callers — internal
+    /// service identities, federated humans, test fixtures — have no credential
+    /// to name and would otherwise all pass `None`.
     #[must_use]
     pub fn new(
         id: PrincipalId,
@@ -144,7 +158,15 @@ impl Principal {
             tenant_id,
             roles,
             effective_permissions,
+            credential_id: None,
         }
+    }
+
+    /// Name the credential this principal authenticated with.
+    #[must_use]
+    pub fn with_credential_id(mut self, credential_id: Option<Uuid>) -> Self {
+        self.credential_id = credential_id;
+        self
     }
 
     /// Returns the bound card ref, when this principal has one.
@@ -281,6 +303,7 @@ mod tests {
             tenant_id: wyrd_spec::DataTenantId::new_v7(),
             roles: vec![RoleRef::new("agent").expect("static role is valid")],
             effective_permissions: PermissionSet::from_iter([Permission::card_read()]),
+            credential_id: None,
         };
 
         assert_eq!(principal.card_ref(), Some(&card_ref));
@@ -298,6 +321,7 @@ mod tests {
             tenant_id: wyrd_spec::DataTenantId::new_v7(),
             roles: vec![RoleRef::new("agent").expect("static role is valid")],
             effective_permissions: PermissionSet::new(),
+            credential_id: None,
         };
 
         let principal_ref = PrincipalRef::from_principal(&principal);
@@ -325,6 +349,7 @@ mod tests {
             tenant_id: wyrd_spec::DataTenantId::new_v7(),
             roles: Vec::new(),
             effective_permissions: PermissionSet::new(),
+            credential_id: None,
         };
 
         assert!(principal.authorizes_card(&own));
@@ -343,6 +368,7 @@ mod tests {
             tenant_id: wyrd_spec::DataTenantId::new_v7(),
             roles: Vec::new(),
             effective_permissions: PermissionSet::new(),
+            credential_id: None,
         };
 
         assert!(!principal.authorizes_card(&service_card_ref()));
@@ -374,6 +400,10 @@ pub struct PlatformPrincipal {
     /// Absence of a grant is denial: a platform principal with an empty set
     /// authenticates but authorizes nothing.
     pub effective_permissions: PermissionSet,
+    /// Non-secret id of the credential the session was minted from, when one
+    /// was presented. `None` for a federated login.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<Uuid>,
 }
 
 impl PlatformPrincipal {
@@ -388,7 +418,15 @@ impl PlatformPrincipal {
             id,
             kind,
             effective_permissions,
+            credential_id: None,
         }
+    }
+
+    /// Name the credential this session was minted from.
+    #[must_use]
+    pub const fn with_credential_id(mut self, credential_id: Option<Uuid>) -> Self {
+        self.credential_id = credential_id;
+        self
     }
 }
 
@@ -454,6 +492,19 @@ impl AuthContext {
         match self {
             Self::Platform(principal) => principal.kind,
             Self::Tenant(principal) => principal.kind.tag(),
+        }
+    }
+
+    /// The credential the request authenticated with, on either plane.
+    ///
+    /// Audit records it beside the principal, because a principal may hold
+    /// several live credentials at once and the recorded decision has to say
+    /// which one was used.
+    #[must_use]
+    pub const fn credential_id(&self) -> Option<Uuid> {
+        match self {
+            Self::Platform(principal) => principal.credential_id,
+            Self::Tenant(principal) => principal.credential_id,
         }
     }
 

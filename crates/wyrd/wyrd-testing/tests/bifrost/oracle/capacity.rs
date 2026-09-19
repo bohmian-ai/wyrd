@@ -877,6 +877,7 @@ fn fixture_principal(tenant: DataTenantId) -> wyrd_runtime::principal::Principal
         tenant_id: tenant,
         roles: Vec::new(),
         effective_permissions: wyrd_runtime::PermissionSet::new(),
+        credential_id: None,
     }
 }
 

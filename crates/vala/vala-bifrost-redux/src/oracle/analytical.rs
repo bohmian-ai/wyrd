@@ -4578,6 +4578,7 @@ mod tests {
                 tenant_id: tenant,
                 roles: Vec::new(),
                 effective_permissions: wyrd_runtime::permission::PermissionSet::default(),
+                credential_id: None,
             },
             tenant,
             wyrd_spec::request_id::RequestId::now_v7(),

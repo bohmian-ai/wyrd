@@ -7,7 +7,7 @@ use crate::tables::{CorrelationPolicy, DomainTable, PayloadClass, sort_asc, sort
 use wyrd_spec::vala::api::{PhysicalLayoutWire, TimeGranularityWire};
 use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
-/// `vala.system.audit_log` — 13 authorization-decision content columns plus the
+/// `vala.system.audit_log` — 14 authorization-decision content columns plus the
 /// managed physical envelope.
 ///
 /// Audit carries its own principal and Card identity, so the table appends no
@@ -53,6 +53,7 @@ impl DomainTable for AuditLogTable {
             utf8("audit_card_ref", true),
             utf8("audit_principal_id", false),
             utf8("principal_kind", false),
+            utf8("credential_id", true),
             utf8("permission", false),
             utf8("outcome", false),
             utf8("detail", true),

@@ -1840,6 +1840,7 @@ fn query_context(
         tenant_id: tenant,
         roles: Vec::new(),
         effective_permissions: wyrd_runtime::permission::PermissionSet::from_iter(permissions),
+        credential_id: None,
     };
     vala_bifrost_redux::oracle::AuthorizedQueryContext::try_new(
         principal,

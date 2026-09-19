@@ -387,6 +387,7 @@ mod tests {
             tenant_id,
             roles: Vec::new(),
             effective_permissions: permissions,
+            credential_id: None,
         }
     }
 

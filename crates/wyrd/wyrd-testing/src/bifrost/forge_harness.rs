@@ -1719,6 +1719,7 @@ async fn scribe_append_and_seal(
         tenant_id: tenant,
         roles: Vec::new(),
         effective_permissions: wyrd_runtime::PermissionSet::new(),
+        credential_id: None,
     };
     scribe
         .ingest_native_for_test(NativeIngressTestFrame {

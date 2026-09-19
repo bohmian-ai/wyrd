@@ -49,6 +49,10 @@ impl AuthzAuditWriter for RealAuthzAuditWriter {
             card_ref: ctx.caller.card_ref().cloned(),
             principal_id: ctx.caller.id,
             principal_kind: ctx.caller.kind.tag(),
+            // The row is attributed to the immediate delegator, and a delegated
+            // token is minted from a token rather than from a credential, so
+            // there is no credential of that principal's to name here.
+            credential_id: None,
             permission: ctx.request.action.clone(),
             outcome,
             detail: None,
@@ -147,6 +151,7 @@ mod pg_tests {
             tenant_id,
             roles: Vec::new(),
             effective_permissions: PermissionSet::new(),
+            credential_id: None,
         }
     }
 

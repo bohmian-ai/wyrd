@@ -182,6 +182,9 @@ async fn issue_and_audit(
             principal_kind: row.principal_kind.clone(),
             card_ref: row.card_ref.clone().map(|card_ref| card_ref.0),
             roles,
+            // A federated workload presents a provider assertion, not a Wyrd
+            // credential, so there is no credential id to record.
+            credential_id: None,
         },
         RefreshPolicy::Skip,
         request_id,

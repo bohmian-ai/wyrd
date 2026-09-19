@@ -101,6 +101,7 @@ mod tests {
             tenant_id: DataTenantId::new_v7(),
             roles: Vec::new(),
             effective_permissions: PermissionSet::new(),
+            credential_id: None,
         }
     }
 
@@ -160,6 +161,7 @@ mod properties {
             tenant_id: DataTenantId::new_v7(),
             roles: Vec::new(),
             effective_permissions: PermissionSet::new(),
+            credential_id: None,
         }
     }
 

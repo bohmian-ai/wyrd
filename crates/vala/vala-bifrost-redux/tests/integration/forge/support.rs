@@ -2737,6 +2737,7 @@ async fn append_only(
         tenant_id: tenant,
         roles: Vec::new(),
         effective_permissions: wyrd_runtime::PermissionSet::new(),
+        credential_id: None,
     };
     scribe
         .ingest_native_for_test(NativeIngressTestFrame {

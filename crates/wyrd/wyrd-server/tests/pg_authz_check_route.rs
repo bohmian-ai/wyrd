@@ -304,12 +304,16 @@ fn mint_service_jwt(state: &AppState, tenant: DataTenantId, name: &str) -> Strin
         .issuing_key
         .as_ref()
         .expect("composed server carries an issuing key")
-        .issue_service_access_token(
-            PrincipalId::new(uuid::Uuid::now_v7()),
-            tenant,
-            card_ref(CardKind::Service, name),
-            wyrd_spec::reference::CardRefScope::default(),
+        .issue_card_access_token(
+            wyrd_auth_verify::TokenPrincipalRef {
+                id: PrincipalId::new(uuid::Uuid::now_v7()),
+                kind: wyrd_spec::auth::PrincipalKindTag::Service,
+                tenant_id: tenant,
+                card_ref: Some(card_ref(CardKind::Service, name)),
+                card_ref_scope: wyrd_spec::reference::CardRefScope::default(),
+            },
             Vec::new(),
+            None,
             Duration::minutes(5),
         )
         .expect("service jwt mints")

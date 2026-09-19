@@ -24,6 +24,14 @@
         }
       ]
     },
+    "credential_id": {
+      "description": "Non-secret id of the credential that authenticated the request, when one did.\n\nA principal may hold several credentials at once so rotation can overlap, which makes the principal alone too coarse to answer \"which key did this\": revoking the compromised one requires knowing which one was used. `None` when no credential was presented — a federated human session, or an internal decision made by the server itself.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid"
+    },
     "detail": {
       "description": "Optional typed, redacted operation detail used as the canonical hash preimage.",
       "anyOf": [

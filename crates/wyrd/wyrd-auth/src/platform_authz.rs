@@ -173,6 +173,7 @@ impl PlatformAuthorization {
             card_ref: None,
             principal_id,
             principal_kind: context.principal_kind(),
+            credential_id: context.credential_id(),
             permission: required.to_string(),
             outcome,
             detail: Some(AuditDetail::AuthzCheck {

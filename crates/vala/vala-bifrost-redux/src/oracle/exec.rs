@@ -3802,6 +3802,7 @@ mod tests {
                 tenant_id: tenant,
                 roles: Vec::new(),
                 effective_permissions: PermissionSet::default(),
+                credential_id: None,
             };
             let context = AuthorizedQueryContext::try_new(
                 principal,
@@ -3871,6 +3872,7 @@ mod tests {
             tenant_id: tenant,
             roles: Vec::new(),
             effective_permissions: PermissionSet::default(),
+            credential_id: None,
         };
         let context = AuthorizedQueryContext::try_new(
             principal,
@@ -6373,6 +6375,7 @@ mod tests {
             tenant_id: tenant,
             roles: Vec::new(),
             effective_permissions: PermissionSet::default(),
+            credential_id: None,
         };
         let context = AuthorizedQueryContext::try_new(
             principal,
@@ -6650,6 +6653,7 @@ mod tests {
             tenant_id: tenant,
             roles: Vec::new(),
             effective_permissions: PermissionSet::default(),
+            credential_id: None,
         };
         let context = AuthorizedQueryContext::try_new(
             principal,

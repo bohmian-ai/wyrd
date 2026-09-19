@@ -79,6 +79,7 @@ fn principal(tenant: DataTenantId) -> Principal {
         tenant_id: tenant,
         roles: Vec::new(),
         effective_permissions: PermissionSet::new(),
+        credential_id: None,
     }
 }
 

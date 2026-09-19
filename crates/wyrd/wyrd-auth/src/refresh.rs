@@ -267,6 +267,9 @@ impl RefreshTokens {
                 principal_kind: principal_kind.to_owned(),
                 card_ref: stored.card_ref.map(|card_ref| card_ref.0),
                 roles,
+                // A rotation presents the refresh token, not the credential the
+                // first exchange used, and the stored token does not name it.
+                credential_id: None,
             },
             RefreshPolicy::Rotate(rotated_from),
             request_id,

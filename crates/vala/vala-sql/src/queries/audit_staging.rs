@@ -78,9 +78,9 @@ pub async fn append_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Resu
         INSERT INTO vala.audit_staging
             (data_tenant_id, seq, prev_hash, entry_hash, request_id, trace_id,
              operation, resource, card_ref, principal_id, principal_kind,
-             permission, outcome, detail)
-        VALUES ($14, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                $11, $12, $13)
+             credential_id, permission, outcome, detail)
+        VALUES ($15, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                $11, $12, $13, $14)
         "#,
     )
     .bind(seq)
@@ -93,6 +93,7 @@ pub async fn append_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Resu
     .bind(card_ref.as_deref())
     .bind(event.principal_id.as_uuid())
     .bind(event.principal_kind.as_str())
+    .bind(event.credential_id)
     .bind(event.permission.as_str())
     .bind(outcome_str(event.outcome))
     .bind(detail.as_deref())
@@ -137,7 +138,7 @@ pub async fn list_audit_events_for_resource(
         r#"
         SELECT data_tenant_id, seq, entry_hash, prev_hash, request_id, trace_id,
                operation, resource, card_ref, principal_id, principal_kind,
-               permission, outcome, detail, created_at
+               credential_id, permission, outcome, detail, created_at
           FROM vala.audit_staging
          WHERE resource = $1
            AND seq > $2
@@ -170,7 +171,7 @@ pub async fn list_publication_batch(
         r#"
         SELECT data_tenant_id, seq, entry_hash, prev_hash, request_id, trace_id,
                operation, resource, card_ref, principal_id, principal_kind,
-               permission, outcome, detail, created_at
+               credential_id, permission, outcome, detail, created_at
           FROM vala.audit_staging
          ORDER BY seq
          LIMIT $1
@@ -279,7 +280,7 @@ pub async fn list_publication_range(
         r#"
         SELECT data_tenant_id, seq, entry_hash, prev_hash, request_id, trace_id,
                operation, resource, card_ref, principal_id, principal_kind,
-               permission, outcome, detail, created_at
+               credential_id, permission, outcome, detail, created_at
           FROM vala.audit_staging
          WHERE seq BETWEEN $1 AND $2
          ORDER BY seq
@@ -353,6 +354,9 @@ fn entry_hash(
     card_ref: Option<&str>,
     detail: Option<&str>,
 ) -> [u8; 32] {
+    // Hyphenated lowercase, the same spelling the column renders, so a retained
+    // row reproduces its own hash from what it stores.
+    let credential = event.credential_id.map(|id| id.to_string());
     let mut buf = Vec::new();
     buf.extend_from_slice(prev_hash);
     buf.extend_from_slice(&seq.to_be_bytes());
@@ -363,6 +367,7 @@ fn entry_hash(
     push_opt(&mut buf, card_ref);
     buf.extend_from_slice(event.principal_id.as_uuid().as_bytes());
     push_str(&mut buf, event.principal_kind.as_str());
+    push_opt(&mut buf, credential.as_deref());
     push_str(&mut buf, &event.permission);
     push_str(&mut buf, outcome_str(event.outcome));
     push_opt(&mut buf, detail);

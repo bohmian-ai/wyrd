@@ -155,6 +155,10 @@ pub(crate) struct IssueSubject {
     pub card_ref: Option<CardRef>,
     /// Effective roles embedded in the access token.
     pub roles: Vec<RoleRef>,
+    /// Non-secret id of the credential presented to earn this token, when one
+    /// was. It travels in the access token's claims so audit names the key a
+    /// decision was made with, not merely its holder.
+    pub credential_id: Option<Uuid>,
 }
 
 /// API-key exchange failure.
@@ -290,6 +294,7 @@ impl ExchangeApiKey {
                 principal_kind: row.principal_kind,
                 card_ref: row.card_ref.map(|card_ref| card_ref.0),
                 roles,
+                credential_id: Some(row.api_key_id),
             },
             RefreshPolicy::Mint,
             request_id,
@@ -423,6 +428,7 @@ async fn issue_cardless_subject(
         principal_kind,
         card_ref: _,
         roles,
+        credential_id,
     } = subject;
     let id = PrincipalId::new(principal_id);
     let wire = principal_kind_wire(&principal_kind).ok_or(IssueError::InvalidPrincipalKind)?;
@@ -435,6 +441,7 @@ async fn issue_cardless_subject(
             card_ref_scope: CardRefScope::default(),
         },
         roles,
+        credential_id,
         settings.access_ttl,
     )?;
 
@@ -538,33 +545,30 @@ pub(crate) async fn issue_for_subject(
         principal_kind,
         card_ref,
         roles,
+        credential_id,
     } = subject;
     let id = PrincipalId::new(principal_id);
     let card_ref = card_ref.expect("invariant: card-free subjects returned above");
     let card_ref_scope = resolve_card_ref_scope(conn, &card_ref).await?;
-    let access_token = match principal_kind.as_str() {
-        "service" => issuing_key
-            .issue_service_access_token(
-                id,
-                conn.data_tenant_id(),
-                card_ref.clone(),
-                card_ref_scope.clone(),
-                roles.clone(),
-                settings.access_ttl,
-            )
-            .map_err(|error| issue_or_wyrd_error(error, &card_ref))?,
-        "agent" => issuing_key
-            .issue_agent_access_token(
-                id,
-                conn.data_tenant_id(),
-                card_ref.clone(),
-                card_ref_scope.clone(),
-                roles.clone(),
-                settings.access_ttl,
-            )
-            .map_err(|error| issue_or_wyrd_error(error, &card_ref))?,
+    let kind = match principal_kind.as_str() {
+        "service" => PrincipalKindTag::Service,
+        "agent" => PrincipalKindTag::Agent,
         _ => return Err(IssueOrSqlError::Issue(IssueError::InvalidPrincipalKind)),
     };
+    let access_token = issuing_key
+        .issue_card_access_token(
+            TokenPrincipalRef {
+                id,
+                kind,
+                tenant_id: conn.data_tenant_id(),
+                card_ref: Some(card_ref.clone()),
+                card_ref_scope: card_ref_scope.clone(),
+            },
+            roles.clone(),
+            credential_id,
+            settings.access_ttl,
+        )
+        .map_err(|error| issue_or_wyrd_error(error, &card_ref))?;
     let refresh_token = store_refresh_token(
         conn,
         issuing_key,
@@ -870,13 +874,15 @@ mod pg_tests {
     use sqlx::types::Json;
     use uuid::Uuid;
     use wyrd_auth_issue::IssuingKey;
-    use wyrd_auth_verify::{Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem};
+    use wyrd_auth_verify::{
+        Kid, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem,
+    };
     use wyrd_dev_fixtures::cards::seed_backing_card;
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_runtime::{PrincipalId, RbacCheck, RoleRef};
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::RequestedSubject;
+    use wyrd_spec::auth::{PrincipalKindTag, RequestedSubject};
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::error::WyrdError;
     use wyrd_spec::ids::{CardName, SpaceName};
@@ -1416,12 +1422,16 @@ mod pg_tests {
         // Issue a service token with no roles → effective permissions are empty
         // → delegation_issue check fails before any database lookup.
         let subject_token = issuing_key
-            .issue_service_access_token(
-                PrincipalId::new(Uuid::new_v4()),
-                tenant,
-                test_service_card_ref(),
-                CardRefScope::default(),
+            .issue_card_access_token(
+                TokenPrincipalRef {
+                    id: PrincipalId::new(Uuid::new_v4()),
+                    kind: PrincipalKindTag::Service,
+                    tenant_id: tenant,
+                    card_ref: Some(test_service_card_ref()),
+                    card_ref_scope: CardRefScope::default(),
+                },
                 vec![],
+                None,
                 Duration::minutes(15),
             )
             .expect("subject token issues");
@@ -1485,12 +1495,16 @@ mod pg_tests {
 
         let issuing_key = test_issuing_key();
         let subject_token = issuing_key
-            .issue_service_access_token(
-                PrincipalId::new(Uuid::new_v4()),
-                tenant,
-                test_service_card_ref(),
-                CardRefScope::default(),
+            .issue_card_access_token(
+                TokenPrincipalRef {
+                    id: PrincipalId::new(Uuid::new_v4()),
+                    kind: PrincipalKindTag::Service,
+                    tenant_id: tenant,
+                    card_ref: Some(test_service_card_ref()),
+                    card_ref_scope: CardRefScope::default(),
+                },
                 vec![RoleRef::new("runtime_admin").expect("role name is valid")],
+                None,
                 Duration::minutes(15),
             )
             .expect("subject token issues");

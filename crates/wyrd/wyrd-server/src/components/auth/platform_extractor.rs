@@ -172,11 +172,10 @@ impl FromRequestParts<AppState> for PlatformCaller {
         let request_id = token_extract::request_id(parts)?;
 
         Ok(Self {
-            context: AuthContext::from(PlatformPrincipal::new(
-                principal_id,
-                session.principal_kind,
-                effective_permissions,
-            )),
+            context: AuthContext::from(
+                PlatformPrincipal::new(principal_id, session.principal_kind, effective_permissions)
+                    .with_credential_id(session.credential_id),
+            ),
             credential_id: session.credential_id,
             request_id,
         })

@@ -1126,6 +1126,22 @@ async fn an_operator_configures_and_removes_federated_platform_sign_in() {
             "decisions by {principal} were recorded as {kinds:?}, expected only {expected}"
         );
     }
+
+    // A federated sign-in presents a provider token, not a credential, so
+    // there is no credential of this principal's for a decision to name.
+    let attributed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.audit_staging
+          WHERE operation = 'platform.authz' AND principal_id = $1::uuid
+            AND credential_id IS NOT NULL",
+    )
+    .bind(registered["principal_id"].as_str().expect("principal id"))
+    .fetch_one(&superuser)
+    .await
+    .expect("attributed count reads");
+    assert_eq!(
+        attributed, 0,
+        "a federated session names no credential, so its decisions must not claim one"
+    );
 }
 
 /// A tenant administrator cannot configure who signs in to the platform.
@@ -1921,6 +1937,54 @@ async fn an_operator_rotates_the_deployment_root_credential() {
         .await
         .expect("revoke responds");
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // One principal, two credentials, the same operation with each: the audit
+    // record has to say which key made which decision, or "rotate the leaked
+    // credential" has no way to establish what the leaked one did.
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool for staged audit");
+    let replacement_id = issued["id"].as_str().expect("credential ids are strings");
+    for credential in [original.as_str(), replacement_id] {
+        let decisions: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM vala.audit_staging
+              WHERE operation = 'platform.authz' AND credential_id = $1::uuid",
+        )
+        .bind(credential)
+        .fetch_one(&superuser)
+        .await
+        .expect("decision count reads");
+
+        assert!(
+            decisions > 0,
+            "no decision names credential {credential}, so a rotation cannot say what it did"
+        );
+    }
+    let unattributed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.audit_staging
+          WHERE operation = 'platform.authz' AND principal_id = $1::uuid
+            AND credential_id IS NULL",
+    )
+    .bind(&principal_id)
+    .fetch_one(&superuser)
+    .await
+    .expect("unattributed count reads");
+    assert_eq!(
+        unattributed, 0,
+        "every session in this journey was minted from a credential, so none may be unattributed"
+    );
+
+    // What travels is the credential's id, never the credential.
+    let leaked: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.audit_staging WHERE to_jsonb(audit_staging)::text LIKE $1",
+    )
+    .bind(format!("%{replacement}%"))
+    .fetch_one(&superuser)
+    .await
+    .expect("staged rows scan");
+    assert_eq!(leaked, 0, "no staged audit row carries credential material");
 }
 
 /// A tenant administrator ends a compromised identity outright and the reason

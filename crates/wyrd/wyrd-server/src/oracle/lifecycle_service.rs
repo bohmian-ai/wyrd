@@ -306,12 +306,16 @@ pub(crate) mod pg_tests {
         card_ref: CardRef,
     ) -> wyrd_tonic::tonic::Request<T> {
         let token = issuer
-            .issue_service_access_token(
-                PrincipalId::new(uuid::Uuid::now_v7()),
-                tenant,
-                card_ref.clone(),
-                CardRefScope::own(&card_ref),
+            .issue_card_access_token(
+                wyrd_auth_verify::TokenPrincipalRef {
+                    id: PrincipalId::new(uuid::Uuid::now_v7()),
+                    kind: wyrd_spec::auth::PrincipalKindTag::Service,
+                    tenant_id: tenant,
+                    card_ref: Some(card_ref.clone()),
+                    card_ref_scope: CardRefScope::own(&card_ref),
+                },
                 Vec::<RoleRef>::new(),
+                None,
                 chrono::Duration::minutes(5),
             )
             .expect("test Service token signs");
@@ -480,6 +484,7 @@ pub(crate) mod pg_tests {
             tenant_id,
             roles: Vec::new(),
             effective_permissions: permissions,
+            credential_id: None,
         };
         let allowed = principal(
             service_kind.clone(),

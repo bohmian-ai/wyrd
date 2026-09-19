@@ -2149,6 +2149,7 @@ mod tests {
             tenant_id: tenant,
             roles: Vec::new(),
             effective_permissions: wyrd_runtime::PermissionSet::new(),
+            credential_id: None,
         };
         let request_id = RequestId::now_v7();
         let fence_request_id = request_id.clone();

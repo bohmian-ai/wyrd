@@ -31,7 +31,7 @@ pub struct AuditProjection {
     /// so every replica and every crash replay of the same frozen range
     /// presents Scribe the same identity and lands on its durable batch fence.
     pub batch_id: Uuid,
-    /// The 13 content fields declared by [`AuditLogTable`], plus the
+    /// The 14 content fields declared by [`AuditLogTable`], plus the
     /// `wyrd_event_time` the decision was stamped with in Postgres.
     pub rows: RecordBatch,
 }
@@ -128,7 +128,7 @@ fn validate_range(
             index,
             "principal_kind",
             &row.principal_kind,
-            ["user", "service", "agent"],
+            ["global_admin", "tenant_admin", "user", "service", "agent"],
         )?;
         validate_enum(index, "outcome", &row.outcome, ["allowed", "denied"])?;
 
@@ -182,6 +182,10 @@ fn project_record_batch(rows: &[AuditStagingRow]) -> Result<RecordBatch, AuditPr
         .iter()
         .map(|row| row.principal_kind.clone())
         .collect::<Vec<_>>();
+    let credential_id_values = rows
+        .iter()
+        .map(|row| row.credential_id.map(|id| id.to_string()))
+        .collect::<Vec<_>>();
     let outcome_values = rows
         .iter()
         .map(|row| row.outcome.clone())
@@ -219,6 +223,7 @@ fn project_record_batch(rows: &[AuditStagingRow]) -> Result<RecordBatch, AuditPr
         Arc::new(StringArray::from(card_ref_values)),
         Arc::new(StringArray::from(principal_id_values)),
         Arc::new(StringArray::from(principal_kind_values)),
+        Arc::new(StringArray::from(credential_id_values)),
         Arc::new(StringArray::from(permission_values)),
         Arc::new(StringArray::from(outcome_values)),
         Arc::new(StringArray::from(detail_values)),
@@ -315,6 +320,7 @@ mod tests {
             card_ref: None,
             principal_id: Uuid::now_v7(),
             principal_kind: "user".to_owned(),
+            credential_id: None,
             permission: "audit:write".to_owned(),
             outcome: "allowed".to_owned(),
             detail: None,

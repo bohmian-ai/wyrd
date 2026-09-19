@@ -1048,6 +1048,7 @@ mod tests {
                 tenant_id: tenant,
                 roles: Vec::new(),
                 effective_permissions: PermissionSet::new(),
+                credential_id: None,
             },
             expected_schema_fingerprint: fingerprint,
             request_id: RequestId::now_v7(),

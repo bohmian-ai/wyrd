@@ -39,6 +39,7 @@ mod pg_tests {
                 card_ref: None,
                 principal_id: PrincipalId::new(Uuid::now_v7()),
                 principal_kind: PrincipalKindTag::User,
+                credential_id: None,
                 permission: "bifrost.write".to_string(),
                 outcome: AuditOutcome::Allowed,
                 detail: None,

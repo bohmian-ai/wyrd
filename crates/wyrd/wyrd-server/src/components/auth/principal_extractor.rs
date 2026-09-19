@@ -135,6 +135,7 @@ mod pg_tests {
                 tenant_id: tenant,
                 roles: Vec::new(),
                 effective_permissions: Default::default(),
+                credential_id: None,
             },
             delegation_chain: Vec::new(),
             exp: chrono::Utc::now() + chrono::Duration::minutes(5),

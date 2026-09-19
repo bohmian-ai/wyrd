@@ -1,0 +1,15 @@
+-- Name the credential a decision was authenticated by, not just the principal.
+--
+-- A principal holds several credentials at once so rotation can overlap, and
+-- until now the audit chain recorded only the principal. Two decisions made
+-- with two different keys were therefore indistinguishable, which is the one
+-- question an operator has after a leak: which key did this, so which key do I
+-- revoke. The credential id is non-secret — it is what the listing and the
+-- revoke route already name — so recording it discloses nothing the holder of
+-- the audit log could not already read.
+--
+-- Nullable because not every decision has a credential behind it: a federated
+-- human presents an identity, and the server's own internal decisions present
+-- nothing. The chain hash covers the column's absence distinctly from any
+-- value, so existing entries are unaffected and no rewrite is needed.
+ALTER TABLE vala.audit_staging ADD COLUMN credential_id uuid;

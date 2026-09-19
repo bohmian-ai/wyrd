@@ -2723,6 +2723,16 @@ pub struct AuditEvent {
     /// Kind of the acting principal (tag encoding; card payload is not the audit
     /// subject — `card_ref` is its own field).
     pub principal_kind: PrincipalKindTag,
+    /// Non-secret id of the credential that authenticated the request, when one
+    /// did.
+    ///
+    /// A principal may hold several credentials at once so rotation can
+    /// overlap, which makes the principal alone too coarse to answer "which key
+    /// did this": revoking the compromised one requires knowing which one was
+    /// used. `None` when no credential was presented — a federated human
+    /// session, or an internal decision made by the server itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<uuid::Uuid>,
     /// Effective dynamic permission the boundary evaluated.
     pub permission: String,
     /// The authorization outcome this boundary decided.
@@ -2758,10 +2768,21 @@ impl AuditEvent {
             card_ref,
             principal_id,
             principal_kind,
+            credential_id: None,
             permission,
             outcome,
             detail: None,
         }
+    }
+
+    /// Name the credential that authenticated the audited request.
+    ///
+    /// Takes an `Option` because most callers are simply forwarding whatever
+    /// the authenticated context holds, and a federated session holds nothing.
+    #[must_use]
+    pub const fn with_credential_id(mut self, credential_id: Option<uuid::Uuid>) -> Self {
+        self.credential_id = credential_id;
+        self
     }
 
     /// Attach typed, already-redacted detail to this event.

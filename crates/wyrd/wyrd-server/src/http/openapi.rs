@@ -18,10 +18,13 @@ const WYRD_ACCESS_TOKEN_SCHEME: &str = "wyrdAccessToken";
 /// tomorrow is documented as authenticated without anyone remembering to say so.
 /// A new anonymous route must be listed here; until it is, the contract
 /// overstates its protection rather than understating it.
-const ANONYMOUS_PATHS: [&str; 3] = [
+const ANONYMOUS_PATHS: [&str; 6] = [
     "/auth/platform/token",
     "/auth/platform/login",
     "/auth/platform/callback",
+    "/auth/login",
+    "/auth/callback",
+    "/auth/token",
 ];
 
 /// Declares how every Wyrd surface authenticates.
@@ -76,11 +79,70 @@ impl Modify for SecurityAddon {
     }
 }
 
+/// Media type RFC 9457 problem bodies are actually served with.
+const PROBLEM_MEDIA_TYPE: &str = "application/problem+json";
+
+/// Serves every documented problem body under its real media type.
+///
+/// Handlers return `application/problem+json`, but `#[utoipa::path]` has no way
+/// to say so per response without repeating a content-type on every error on
+/// every route — which is exactly the kind of repetition that drifts. Rewriting
+/// it once here means a generated client's error branch matches what the server
+/// sends, for every route that names [`WyrdProblem`] and every route added
+/// later.
+struct ProblemMediaAddon;
+
+impl Modify for ProblemMediaAddon {
+    /// Rename the `application/json` content of every problem-bodied response.
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        for item in openapi.paths.paths.values_mut() {
+            for operation in [
+                item.get.as_mut(),
+                item.put.as_mut(),
+                item.post.as_mut(),
+                item.delete.as_mut(),
+                item.patch.as_mut(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                for response in operation.responses.responses.values_mut() {
+                    let utoipa::openapi::RefOr::T(response) = response else {
+                        continue;
+                    };
+                    if !is_problem(response.content.get("application/json")) {
+                        continue;
+                    }
+                    let Some(content) = response.content.shift_remove("application/json") else {
+                        continue;
+                    };
+                    response
+                        .content
+                        .insert(PROBLEM_MEDIA_TYPE.to_owned(), content);
+                }
+            }
+        }
+    }
+}
+
+/// Whether a response body is the problem document rather than a success shape.
+///
+/// A problem response is declared as `body = WyrdProblem`, which utoipa emits as
+/// a reference to that component; matching on the reference is what keeps the
+/// media-type rewrite off success bodies, which really are `application/json`.
+fn is_problem(content: Option<&utoipa::openapi::Content>) -> bool {
+    matches!(
+        content.and_then(|content| content.schema.as_ref()),
+        Some(utoipa::openapi::RefOr::Ref(reference))
+            if reference.ref_location.ends_with("/WyrdProblem")
+    )
+}
+
 /// Authoritative Wyrd HTTP contract.
 #[derive(OpenApi)]
 #[openapi(
     info(title = "Wyrd API", version = "0.0.1", license(name = "Apache-2.0")),
-    modifiers(&SecurityAddon),
+    modifiers(&SecurityAddon, &ProblemMediaAddon),
     paths(
         crate::components::cards::routes::register_card_http,
         crate::components::cards::routes::get_card_http,
@@ -121,7 +183,17 @@ impl Modify for SecurityAddon {
         crate::components::platform::identity::complete_login,
         crate::components::platform::credentials::issue_credential,
         crate::components::platform::credentials::list_credentials,
-        crate::components::platform::credentials::revoke_credential
+        crate::components::platform::credentials::revoke_credential,
+        crate::auth::login::login,
+        crate::components::auth::routes::callback,
+        crate::components::auth::routes::token,
+        crate::components::auth::routes::issue_key,
+        crate::components::admin::routes::create_trusted_issuer,
+        crate::components::admin::routes::list_trusted_issuers,
+        crate::components::admin::routes::delete_trusted_issuer_route,
+        crate::components::admin::routes::create_workload_binding,
+        crate::components::admin::routes::list_workload_bindings,
+        crate::components::admin::routes::delete_workload_binding_route
     ),
     components(schemas(
         BifrostQueryRequest,
@@ -139,6 +211,14 @@ impl Modify for SecurityAddon {
         (
             name = "Principals",
             description = "Tenant principal and credential administration"
+        ),
+        (
+            name = "Auth",
+            description = "Tenant-plane sign-in, credential exchange, and credential issuance"
+        ),
+        (
+            name = "Admin",
+            description = "Tenant administration of trusted OIDC issuers and workload bindings"
         ),
         (
             name = "Platform",
@@ -171,6 +251,124 @@ mod tests {
         ] {
             assert!(document.paths.paths.contains_key(path), "missing {path}");
         }
+    }
+
+    /// Every auth and admin route the server actually serves is documented.
+    ///
+    /// The comparison reads the route tables themselves rather than a list
+    /// maintained beside them: a second list would drift in exactly the way
+    /// that left `/auth/token` and the admin CRUD undocumented while they were
+    /// live. Adding a route to either router without annotating it fails here.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a served path is absent from the contract.
+    #[test]
+    fn every_served_auth_and_admin_route_is_documented() {
+        let document = WyrdApiDoc::openapi();
+        let served = [
+            (
+                include_str!("../components/auth/routes.rs"),
+                "",
+                "auth router",
+            ),
+            (
+                include_str!("../components/admin/routes.rs"),
+                "/v1",
+                "admin router",
+            ),
+        ];
+
+        let mut checked = BTreeSet::new();
+        for (source, prefix, name) in served {
+            for path in registered_routes(source) {
+                let path = format!("{prefix}{path}");
+                assert!(
+                    document.paths.paths.contains_key(&path),
+                    "the {name} serves {path}, which the OpenAPI contract does not declare"
+                );
+                checked.insert(path);
+            }
+        }
+        assert_eq!(
+            checked.len(),
+            6,
+            "the route tables no longer register the expected surfaces: {checked:?}"
+        );
+    }
+
+    /// Extract the paths a router module registers with `.route("...")`.
+    ///
+    /// Reading the source is what makes this a comparison against the served
+    /// surface rather than against a restatement of it.
+    fn registered_routes(source: &str) -> Vec<String> {
+        source
+            .split(".route(")
+            .skip(1)
+            .filter_map(|rest| rest.split_once('"'))
+            .filter_map(|(_, rest)| rest.split_once('"'))
+            .map(|(path, _)| path.to_owned())
+            .collect()
+    }
+
+    /// Every documented problem body is served as `application/problem+json`,
+    /// and every Auth or Admin problem names a stable code matching its status.
+    ///
+    /// A generated client branches on the media type and on the code; declaring
+    /// a problem as plain `application/json`, or naming a code that disagrees
+    /// with the status it is documented under, breaks that branch silently. The
+    /// media-type half holds document-wide because the modifier applies it
+    /// there; the stable-code half covers the two tags whose descriptions name
+    /// codes today, and extends by tagging more of them.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a problem response uses the wrong media type or names no
+    /// code for its status.
+    #[test]
+    fn every_problem_response_declares_its_media_type_and_stable_code() {
+        let document = serde_json::to_value(WyrdApiDoc::openapi()).expect("OpenAPI is JSON");
+        let mut problems = 0_usize;
+
+        for (path, item) in document["paths"]
+            .as_object()
+            .expect("paths is an object")
+            .iter()
+        {
+            for (method, operation) in item.as_object().expect("path item is an object") {
+                let responses = operation["responses"]
+                    .as_object()
+                    .expect("an operation declares responses");
+                for (status, response) in responses {
+                    let content = &response["content"];
+                    if content["application/json"]["schema"]["$ref"]
+                        .as_str()
+                        .is_some_and(|reference| reference.ends_with("/WyrdProblem"))
+                    {
+                        panic!("{method} {path} {status} declares a problem as application/json");
+                    }
+                    if !content[super::PROBLEM_MEDIA_TYPE].is_object() {
+                        continue;
+                    }
+                    problems += 1;
+                    let tags = operation["tags"].to_string();
+                    if !(tags.contains("\"Auth\"") || tags.contains("\"Admin\"")) {
+                        continue;
+                    }
+                    let description = response["description"].as_str().unwrap_or_default();
+                    assert!(
+                        description.contains(&format!("_{status}_")),
+                        "{method} {path} {status} names no stable code for its status: \
+                         {description}"
+                    );
+                }
+            }
+        }
+
+        assert!(
+            problems > 0,
+            "the contract declares no problem responses at all"
+        );
     }
 
     /// The contract names one authentication scheme, requires it everywhere, and

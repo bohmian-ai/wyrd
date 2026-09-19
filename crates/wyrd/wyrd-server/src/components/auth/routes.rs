@@ -12,7 +12,7 @@ use tower_governor::governor::GovernorConfigBuilder;
 use uuid::Uuid;
 use wyrd_auth_verify::AccessTokenClaims;
 use wyrd_spec::auth::{CallbackQuery, IssueKeyRequest, TokenRequest, TokenResponse};
-use wyrd_spec::error::WyrdError;
+use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::request_id::RequestId;
 
 use crate::auth::callback::exchange_authorization_code;
@@ -51,6 +51,30 @@ pub fn auth_router() -> Router<AppState> {
         .layer(GovernorLayer::new(auth_governor))
 }
 
+/// `POST /auth/token` — exchange a credential for a short-lived access token.
+///
+/// The one tenant-plane entry point: a Wyrd API key, an external JWT bearer
+/// bound to a workload, a refresh token, or an RFC 8693 delegation all arrive
+/// here and leave with the same [`TokenResponse`]. Tenant and principal are
+/// derived from the verified credential, never from a client-supplied header.
+///
+/// Every invalid-credential condition returns one indistinguishable `401` so
+/// the response cannot be used to probe which part was wrong.
+#[utoipa::path(
+    post,
+    path = "/auth/token",
+    request_body = TokenRequest,
+    responses(
+        (status = 200, description = "Access token issued", body = TokenResponse),
+        (status = 401, description = "The presented credential is not usable, for any reason \
+          (WYRD_AUTH_401_API_KEY_INVALID)", body = WyrdProblem),
+        (status = 403, description = "The credential is valid but its principal may not obtain \
+          this token (WYRD_AUTHZ_403_PERMISSION_DENIED)", body = WyrdProblem),
+        (status = 503, description = "The auth backend or audit path is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Auth"
+)]
 async fn token(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -251,6 +275,27 @@ async fn token(
     }
 }
 
+/// `GET /auth/callback` — complete an OIDC login and return the session.
+///
+/// Anonymous by construction: the caller is mid-login and has no Wyrd session
+/// yet. The opaque `state` generated at initiation is what binds the callback
+/// to that login, so a code presented without it is refused.
+#[utoipa::path(
+    get,
+    path = "/auth/callback",
+    params(
+        ("code" = String, Query, description = "Authorization code from the identity provider"),
+        ("state" = String, Query, description = "Opaque login state Wyrd generated at initiation")
+    ),
+    responses(
+        (status = 200, description = "Login completed and a session issued", body = TokenResponse),
+        (status = 401, description = "The code or login state is not usable \
+          (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
+        (status = 503, description = "The identity provider or auth backend is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Auth"
+)]
 async fn callback(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -276,6 +321,29 @@ async fn callback(
     Ok(Json(exchanged))
 }
 
+/// `POST /auth/issue-key` — mint a Card-bound API key for an existing principal.
+///
+/// Gated on `service_accounts:write`. The principal must already exist — a
+/// credential is issued against an identity, never in place of one — and the
+/// plaintext is returned exactly once.
+#[utoipa::path(
+    post,
+    path = "/auth/issue-key",
+    request_body = IssueKeyRequest,
+    responses(
+        (status = 200, description = "Key issued, plaintext returned once",
+         body = wyrd_spec::auth::IssueKeyResponse),
+        (status = 401, description = "An access token is required \
+          (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
+        (status = 403, description = "Caller lacks service_accounts:write \
+          (WYRD_AUTHZ_403_PERMISSION_DENIED)", body = WyrdProblem),
+        (status = 404, description = "No principal is bound to the named Card \
+          (WYRD_AUTH_404_ADMIN_NOT_FOUND)", body = WyrdProblem),
+        (status = 503, description = "The store or audit path is unavailable \
+          (WYRD_AUDIT_503_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Auth"
+)]
 async fn issue_key(
     State(state): State<AppState>,
     caller: AuthenticatedPrincipal,

@@ -33,7 +33,7 @@ use wyrd_spec::auth::{
     ClaimMappingPayload, ClientAuthKind, CreateTrustedIssuerRequest, CreateWorkloadBindingRequest,
     IssuerTokenPolicy, IssuerUrl, TrustedIssuerView, WorkloadBindingView,
 };
-use wyrd_spec::error::WyrdError;
+use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_sql::queries::auth::{
     TrustedIssuerWrite, WorkloadBindingWrite, delete_trusted_issuer, delete_workload_binding,
     delete_workload_bindings_for_issuer, insert_trusted_issuer, insert_workload_binding,
@@ -224,6 +224,27 @@ struct BindingFilter {
 /// `AuditUnavailable` when the decision cannot be recorded, a `503` when
 /// discovery, the sealing key, or the store is unavailable, and a `409` for a
 /// duplicate issuer.
+#[utoipa::path(
+    post,
+    path = "/v1/admin/trusted-issuers",
+    request_body = CreateTrustedIssuerRequest,
+    responses(
+        (status = 200, description = "Issuer registered; the client secret is never returned",
+         body = TrustedIssuerView),
+        (status = 400, description = "The issuer URL is malformed, resolves to a blocked address, \
+          or a required field is missing (WYRD_VALIDATION_400_MISSING_REQUIRED_FIELD)",
+         body = WyrdProblem),
+        (status = 401, description = "An access token is required \
+          (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
+        (status = 403, description = "Caller lacks service_accounts:write \
+          (WYRD_AUTHZ_403_PERMISSION_DENIED)", body = WyrdProblem),
+        (status = 409, description = "The issuer is already registered for this tenant \
+          (WYRD_AUTH_409_ADMIN_CONFLICT)", body = WyrdProblem),
+        (status = 503, description = "OIDC discovery, the sealing key, the store, or the audit \
+          path is unavailable (WYRD_AUTH_503_DISCOVERY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Admin"
+)]
 async fn create_trusted_issuer(
     State(state): State<AppState>,
     caller: Caller,
@@ -283,6 +304,21 @@ async fn create_trusted_issuer(
 /// `GET /v1/admin/trusted-issuers` — list the caller tenant's trusted issuers as
 /// redacted [`TrustedIssuerView`]s. Gated on `service_accounts:write`; no
 /// discovery or secret ever leaves the store.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/trusted-issuers",
+    responses(
+        (status = 200, description = "The tenant's trusted issuers, client secrets redacted",
+         body = Vec<TrustedIssuerView>),
+        (status = 401, description = "An access token is required \
+          (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
+        (status = 403, description = "Caller lacks service_accounts:write \
+          (WYRD_AUTHZ_403_PERMISSION_DENIED)", body = WyrdProblem),
+        (status = 503, description = "The store or the audit path is unavailable \
+          (WYRD_AUDIT_503_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Admin"
+)]
 async fn list_trusted_issuers(
     State(state): State<AppState>,
     caller: Caller,
@@ -316,6 +352,29 @@ async fn list_trusted_issuers(
 /// workload bindings are deleted first so the FK `ON DELETE RESTRICT` does not
 /// block the issuer delete; without it, a live binding fails the delete closed
 /// (`409`). A missing issuer is a `404`. Returns `204 No Content`.
+#[utoipa::path(
+    delete,
+    path = "/v1/admin/trusted-issuers",
+    params(
+        ("issuer" = String, Query, description = "Issuer URL to remove"),
+        ("cascade" = Option<bool>, Query,
+         description = "Remove the issuer's workload bindings first instead of failing closed")
+    ),
+    responses(
+        (status = 204, description = "Issuer removed"),
+        (status = 401, description = "An access token is required \
+          (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
+        (status = 403, description = "Caller lacks service_accounts:write \
+          (WYRD_AUTHZ_403_PERMISSION_DENIED)", body = WyrdProblem),
+        (status = 404, description = "No such issuer in this tenant \
+          (WYRD_AUTH_404_ADMIN_NOT_FOUND)", body = WyrdProblem),
+        (status = 409, description = "Live workload bindings still reference the issuer and \
+          cascade was not requested (WYRD_AUTH_409_ADMIN_CONFLICT)", body = WyrdProblem),
+        (status = 503, description = "The store or the audit path is unavailable \
+          (WYRD_AUDIT_503_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Admin"
+)]
 async fn delete_trusted_issuer_route(
     State(state): State<AppState>,
     caller: Caller,
@@ -367,6 +426,27 @@ async fn delete_trusted_issuer_route(
 /// Gated on `service_accounts:write`. The referenced issuer must already be
 /// registered in this tenant; an FK violation maps to a `404` (create the issuer
 /// first), a duplicate binding to a `409`. Writes through the RLS `TenantConn`.
+#[utoipa::path(
+    post,
+    path = "/v1/admin/workload-bindings",
+    request_body = CreateWorkloadBindingRequest,
+    responses(
+        (status = 200, description = "Binding created", body = WorkloadBindingView),
+        (status = 400, description = "A required field is missing or malformed \
+          (WYRD_VALIDATION_400_MISSING_REQUIRED_FIELD)", body = WyrdProblem),
+        (status = 401, description = "An access token is required \
+          (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
+        (status = 403, description = "Caller lacks service_accounts:write \
+          (WYRD_AUTHZ_403_PERMISSION_DENIED)", body = WyrdProblem),
+        (status = 404, description = "The named issuer is not trusted by this tenant \
+          (WYRD_AUTH_404_ADMIN_NOT_FOUND)", body = WyrdProblem),
+        (status = 409, description = "The binding already exists \
+          (WYRD_AUTH_409_ADMIN_CONFLICT)", body = WyrdProblem),
+        (status = 503, description = "The store or the audit path is unavailable \
+          (WYRD_AUDIT_503_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Admin"
+)]
 async fn create_workload_binding(
     State(state): State<AppState>,
     caller: Caller,
@@ -411,6 +491,25 @@ async fn create_workload_binding(
 /// workload bindings, optionally filtered by exact issuer and/or subject. Gated
 /// on `service_accounts:write`. The issuer filter is normalized to the stored
 /// form so a trailing slash does not silently miss.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/workload-bindings",
+    params(
+        ("issuer" = Option<String>, Query, description = "Exact issuer to filter by"),
+        ("subject" = Option<String>, Query, description = "Exact subject to filter by")
+    ),
+    responses(
+        (status = 200, description = "The tenant's workload bindings",
+         body = Vec<WorkloadBindingView>),
+        (status = 401, description = "An access token is required \
+          (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
+        (status = 403, description = "Caller lacks service_accounts:write \
+          (WYRD_AUTHZ_403_PERMISSION_DENIED)", body = WyrdProblem),
+        (status = 503, description = "The store or the audit path is unavailable \
+          (WYRD_AUDIT_503_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Admin"
+)]
 async fn list_workload_bindings(
     State(state): State<AppState>,
     caller: Caller,
@@ -449,6 +548,26 @@ async fn list_workload_bindings(
 /// `DELETE /v1/admin/workload-bindings?issuer=&subject=` — remove one binding
 /// addressed by `(issuer, subject)`. Gated on `service_accounts:write`. A missing
 /// binding is a `404`. Returns `204 No Content`.
+#[utoipa::path(
+    delete,
+    path = "/v1/admin/workload-bindings",
+    params(
+        ("issuer" = String, Query, description = "Issuer of the binding to remove"),
+        ("subject" = String, Query, description = "Subject of the binding to remove")
+    ),
+    responses(
+        (status = 204, description = "Binding removed"),
+        (status = 401, description = "An access token is required \
+          (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
+        (status = 403, description = "Caller lacks service_accounts:write \
+          (WYRD_AUTHZ_403_PERMISSION_DENIED)", body = WyrdProblem),
+        (status = 404, description = "No such binding in this tenant \
+          (WYRD_AUTH_404_ADMIN_NOT_FOUND)", body = WyrdProblem),
+        (status = 503, description = "The store or the audit path is unavailable \
+          (WYRD_AUDIT_503_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Admin"
+)]
 async fn delete_workload_binding_route(
     State(state): State<AppState>,
     caller: Caller,

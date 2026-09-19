@@ -6,7 +6,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use serde::Deserialize;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::IssuerUrl;
-use wyrd_spec::error::WyrdError;
+use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::ids::TenantSlug;
 use wyrd_spec::request_id::RequestId;
 
@@ -27,6 +27,19 @@ pub struct LoginQuery {
 /// A refused attempt is recorded as structured diagnostics instead, and the
 /// durable record of the session it goes on to establish belongs to the
 /// authentication tables, not to the authorization chain.
+#[utoipa::path(
+    get,
+    path = "/auth/login",
+    params(("issuer" = String, Query, description = "Trusted issuer URL to begin login against")),
+    responses(
+        (status = 303, description = "Redirect to the trusted issuer's authorization endpoint"),
+        (status = 401, description = "The host names no tenant, or the issuer is not trusted by it \
+          (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
+        (status = 503, description = "The auth backend is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Auth"
+)]
 #[tracing::instrument(level = "debug", skip(state, headers, maybe_request_id), fields(issuer = %query.issuer))]
 pub async fn login(
     State(state): State<AppState>,

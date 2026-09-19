@@ -12,9 +12,13 @@ The repository OpenAPI document is `openapi.yaml`. Its current title is `Wyrd AP
 
 ## Routes
 
+- `/auth/callback`
+- `/auth/issue-key`
+- `/auth/login`
 - `/auth/platform/callback`
 - `/auth/platform/login`
 - `/auth/platform/token`
+- `/auth/token`
 - `/platform/admins`
 - `/platform/admins/{principal_id}/credentials`
 - `/platform/admins/{principal_id}/credentials/{credential_id}`
@@ -24,6 +28,8 @@ The repository OpenAPI document is `openapi.yaml`. Its current title is `Wyrd AP
 - `/platform/tenants/admin/credentials`
 - `/platform/tenants/{tenant_id}`
 - `/platform/tenants/{tenant_id}/status`
+- `/v1/admin/trusted-issuers`
+- `/v1/admin/workload-bindings`
 - `/v1/bifrost/tables`
 - `/v1/bifrost/tables/{namespace}/{name}`
 - `/v1/cards`

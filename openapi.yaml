@@ -9,6 +9,131 @@ info:
     name: Apache-2.0
   version: 0.0.1
 paths:
+  /auth/callback:
+    get:
+      tags:
+      - Auth
+      summary: '`GET /auth/callback` — complete an OIDC login and return the session.'
+      description: |-
+        Anonymous by construction: the caller is mid-login and has no Wyrd session
+        yet. The opaque `state` generated at initiation is what binds the callback
+        to that login, so a code presented without it is refused.
+      operationId: callback
+      parameters:
+      - name: code
+        in: query
+        description: Authorization code from the identity provider
+        required: true
+        schema:
+          type: string
+      - name: state
+        in: query
+        description: Opaque login state Wyrd generated at initiation
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Login completed and a session issued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenResponse'
+        '401':
+          description: The code or login state is not usable (WYRD_AUTH_401_INVALID_TOKEN)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '503':
+          description: The identity provider or auth backend is unavailable (WYRD_AUTH_503_VERIFY_UNAVAILABLE)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+      security: []
+  /auth/issue-key:
+    post:
+      tags:
+      - Auth
+      summary: '`POST /auth/issue-key` — mint a Card-bound API key for an existing principal.'
+      description: |-
+        Gated on `service_accounts:write`. The principal must already exist — a
+        credential is issued against an identity, never in place of one — and the
+        plaintext is returned exactly once.
+      operationId: issue_key
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssueKeyRequest'
+        required: true
+      responses:
+        '200':
+          description: Key issued, plaintext returned once
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssueKeyResponse'
+        '401':
+          description: An access token is required (WYRD_AUTH_401_INVALID_TOKEN)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '403':
+          description: Caller lacks service_accounts:write (WYRD_AUTHZ_403_PERMISSION_DENIED)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '404':
+          description: No principal is bound to the named Card (WYRD_AUTH_404_ADMIN_NOT_FOUND)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '503':
+          description: The store or audit path is unavailable (WYRD_AUDIT_503_UNAVAILABLE)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+  /auth/login:
+    get:
+      tags:
+      - Auth
+      summary: Handler for `GET /auth/login`.
+      description: |-
+        Login initiation evaluates no principal permission — it answers "who is
+        calling?", not "may they do this?" — so it appends no canonical audit event.
+        A refused attempt is recorded as structured diagnostics instead, and the
+        durable record of the session it goes on to establish belongs to the
+        authentication tables, not to the authorization chain.
+      operationId: login
+      parameters:
+      - name: issuer
+        in: query
+        description: Trusted issuer URL to begin login against
+        required: true
+        schema:
+          type: string
+      responses:
+        '303':
+          description: Redirect to the trusted issuer's authorization endpoint
+        '401':
+          description: The host names no tenant, or the issuer is not trusted by it (WYRD_AUTH_401_INVALID_TOKEN)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '503':
+          description: The auth backend is unavailable (WYRD_AUTH_503_VERIFY_UNAVAILABLE)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+      security: []
   /auth/platform/callback:
     post:
       tags:
@@ -35,13 +160,13 @@ paths:
         '401':
           description: Identity not accepted, indistinguishably for every cause
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '503':
           description: Identity provider unavailable
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
       security: []
@@ -71,13 +196,13 @@ paths:
         '404':
           description: Federated login is not configured
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '503':
           description: Identity provider unavailable
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
       security: []
@@ -111,7 +236,53 @@ paths:
         '401':
           description: Credential rejected, indistinguishably for every cause
           content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+      security: []
+  /auth/token:
+    post:
+      tags:
+      - Auth
+      summary: '`POST /auth/token` — exchange a credential for a short-lived access token.'
+      description: |-
+        The one tenant-plane entry point: a Wyrd API key, an external JWT bearer
+        bound to a workload, a refresh token, or an RFC 8693 delegation all arrive
+        here and leave with the same [`TokenResponse`]. Tenant and principal are
+        derived from the verified credential, never from a client-supplied header.
+
+        Every invalid-credential condition returns one indistinguishable `401` so
+        the response cannot be used to probe which part was wrong.
+      operationId: token
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TokenRequest'
+        required: true
+      responses:
+        '200':
+          description: Access token issued
+          content:
             application/json:
+              schema:
+                $ref: '#/components/schemas/TokenResponse'
+        '401':
+          description: The presented credential is not usable, for any reason (WYRD_AUTH_401_API_KEY_INVALID)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '403':
+          description: The credential is valid but its principal may not obtain this token (WYRD_AUTHZ_403_PERMISSION_DENIED)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '503':
+          description: The auth backend or audit path is unavailable (WYRD_AUTH_503_VERIFY_UNAVAILABLE)
+          content:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
       security: []
@@ -142,7 +313,7 @@ paths:
         '401':
           description: Platform session required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
     post:
@@ -179,19 +350,19 @@ paths:
         '401':
           description: Platform session required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '409':
           description: Name or matching claim already registered
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '422':
           description: No platform OIDC connection is configured
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
   /platform/admins/{principal_id}/credentials:
@@ -221,13 +392,13 @@ paths:
         '401':
           description: Platform session required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '403':
           description: Platform credential administration required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
     post:
@@ -266,13 +437,13 @@ paths:
         '401':
           description: Platform session required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '403':
           description: Platform credential administration required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
   /platform/admins/{principal_id}/credentials/{credential_id}:
@@ -316,19 +487,19 @@ paths:
         '401':
           description: Platform session required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '403':
           description: Platform credential administration required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '404':
           description: No live credential for this platform principal
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
   /platform/admins/{principal_id}/status:
@@ -371,19 +542,19 @@ paths:
         '401':
           description: Platform session required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '404':
           description: Platform principal not found
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '409':
           description: Would leave the deployment with no active principal
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
   /platform/oidc/connection:
@@ -406,13 +577,13 @@ paths:
         '401':
           description: Platform session required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '404':
           description: No connection configured
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
     put:
@@ -440,19 +611,19 @@ paths:
         '401':
           description: Platform session required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '403':
           description: Platform identity administration required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '422':
           description: Issuer invalid, unreachable, or resolving to a blocked address
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
     delete:
@@ -474,13 +645,13 @@ paths:
         '401':
           description: Platform session required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '404':
           description: No connection configured
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
   /platform/tenants:
@@ -503,13 +674,13 @@ paths:
         '401':
           description: Platform session required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '403':
           description: Tenant reading not granted
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
     post:
@@ -537,19 +708,19 @@ paths:
         '401':
           description: Platform session required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '403':
           description: Tenant creation not granted
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '409':
           description: Slug already in use by a live tenant
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
   /platform/tenants/admin/credentials:
@@ -578,19 +749,19 @@ paths:
         '401':
           description: Platform session required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '403':
           description: Tenant administrative recovery not granted
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '404':
           description: No active tenant to recover, indistinguishably for every cause
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
   /platform/tenants/{tenant_id}:
@@ -620,19 +791,19 @@ paths:
         '401':
           description: Platform session required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '403':
           description: Tenant reading not granted
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '404':
           description: No such tenant, indistinguishably for every cause
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
   /platform/tenants/{tenant_id}/status:
@@ -665,25 +836,343 @@ paths:
         '400':
           description: Status is neither active nor suspended
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '401':
           description: Platform session required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '403':
           description: Tenant suspension not granted
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '404':
           description: Tenant is not in the state this transition requires
           content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+  /v1/admin/trusted-issuers:
+    get:
+      tags:
+      - Admin
+      summary: |-
+        `GET /v1/admin/trusted-issuers` — list the caller tenant's trusted issuers as
+        redacted [`TrustedIssuerView`]s. Gated on `service_accounts:write`; no
+        discovery or secret ever leaves the store.
+      operationId: list_trusted_issuers
+      responses:
+        '200':
+          description: The tenant's trusted issuers, client secrets redacted
+          content:
             application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/TrustedIssuerView'
+        '401':
+          description: An access token is required (WYRD_AUTH_401_INVALID_TOKEN)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '403':
+          description: Caller lacks service_accounts:write (WYRD_AUTHZ_403_PERMISSION_DENIED)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '503':
+          description: The store or the audit path is unavailable (WYRD_AUDIT_503_UNAVAILABLE)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+    post:
+      tags:
+      - Admin
+      summary: |-
+        `POST /v1/admin/trusted-issuers` — register a trusted OIDC issuer for the
+        caller's tenant.
+      description: |-
+        Gated on `service_accounts:write`. Resolves OIDC discovery once to fill
+        `jwks_uri`, encrypts any client secret with the process sealing key before
+        insert (fails closed if a secret is supplied without a key), and writes
+        through the RLS `TenantConn`. Returns the redacted [`TrustedIssuerView`]
+        (never the secret).
+
+        Local request validation and discovery run before the transaction opens; the
+        Allowed row is appended on that same transaction, so the recorded decision
+        and the issuer row commit together. A discovery or sealing failure happens
+        before either exists, and an insert failure discards both.
+
+        # Errors
+
+        Returns a `400` for a missing secret or blocked issuer, the RBAC denial,
+        `AuditUnavailable` when the decision cannot be recorded, a `503` when
+        discovery, the sealing key, or the store is unavailable, and a `409` for a
+        duplicate issuer.
+      operationId: create_trusted_issuer
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTrustedIssuerRequest'
+        required: true
+      responses:
+        '200':
+          description: Issuer registered; the client secret is never returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrustedIssuerView'
+        '400':
+          description: The issuer URL is malformed, resolves to a blocked address, or a required field is missing (WYRD_VALIDATION_400_MISSING_REQUIRED_FIELD)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '401':
+          description: An access token is required (WYRD_AUTH_401_INVALID_TOKEN)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '403':
+          description: Caller lacks service_accounts:write (WYRD_AUTHZ_403_PERMISSION_DENIED)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '409':
+          description: The issuer is already registered for this tenant (WYRD_AUTH_409_ADMIN_CONFLICT)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '503':
+          description: OIDC discovery, the sealing key, the store, or the audit path is unavailable (WYRD_AUTH_503_DISCOVERY_UNAVAILABLE)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+    delete:
+      tags:
+      - Admin
+      summary: '`DELETE /v1/admin/trusted-issuers?issuer=&cascade=` — remove one issuer.'
+      description: |-
+        Gated on `service_accounts:write`. With `cascade=true` the referencing
+        workload bindings are deleted first so the FK `ON DELETE RESTRICT` does not
+        block the issuer delete; without it, a live binding fails the delete closed
+        (`409`). A missing issuer is a `404`. Returns `204 No Content`.
+      operationId: delete_trusted_issuer_route
+      parameters:
+      - name: issuer
+        in: query
+        description: Issuer URL to remove
+        required: true
+        schema:
+          type: string
+      - name: cascade
+        in: query
+        description: Remove the issuer's workload bindings first instead of failing closed
+        required: false
+        schema:
+          type: boolean
+      responses:
+        '204':
+          description: Issuer removed
+        '401':
+          description: An access token is required (WYRD_AUTH_401_INVALID_TOKEN)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '403':
+          description: Caller lacks service_accounts:write (WYRD_AUTHZ_403_PERMISSION_DENIED)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '404':
+          description: No such issuer in this tenant (WYRD_AUTH_404_ADMIN_NOT_FOUND)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '409':
+          description: Live workload bindings still reference the issuer and cascade was not requested (WYRD_AUTH_409_ADMIN_CONFLICT)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '503':
+          description: The store or the audit path is unavailable (WYRD_AUDIT_503_UNAVAILABLE)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+  /v1/admin/workload-bindings:
+    get:
+      tags:
+      - Admin
+      summary: |-
+        `GET /v1/admin/workload-bindings?issuer=&subject=` — list the caller tenant's
+        workload bindings, optionally filtered by exact issuer and/or subject. Gated
+        on `service_accounts:write`. The issuer filter is normalized to the stored
+        form so a trailing slash does not silently miss.
+      operationId: list_workload_bindings
+      parameters:
+      - name: issuer
+        in: query
+        description: Exact issuer to filter by
+        required: false
+        schema:
+          type: string
+      - name: subject
+        in: query
+        description: Exact subject to filter by
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The tenant's workload bindings
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/WorkloadBindingView'
+        '401':
+          description: An access token is required (WYRD_AUTH_401_INVALID_TOKEN)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '403':
+          description: Caller lacks service_accounts:write (WYRD_AUTHZ_403_PERMISSION_DENIED)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '503':
+          description: The store or the audit path is unavailable (WYRD_AUDIT_503_UNAVAILABLE)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+    post:
+      tags:
+      - Admin
+      summary: |-
+        `POST /v1/admin/workload-bindings` — bind a workload identity
+        `(issuer, subject, audience)` to a server-owned `CardRef`.
+      description: |-
+        Gated on `service_accounts:write`. The referenced issuer must already be
+        registered in this tenant; an FK violation maps to a `404` (create the issuer
+        first), a duplicate binding to a `409`. Writes through the RLS `TenantConn`.
+      operationId: create_workload_binding
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateWorkloadBindingRequest'
+        required: true
+      responses:
+        '200':
+          description: Binding created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkloadBindingView'
+        '400':
+          description: A required field is missing or malformed (WYRD_VALIDATION_400_MISSING_REQUIRED_FIELD)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '401':
+          description: An access token is required (WYRD_AUTH_401_INVALID_TOKEN)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '403':
+          description: Caller lacks service_accounts:write (WYRD_AUTHZ_403_PERMISSION_DENIED)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '404':
+          description: The named issuer is not trusted by this tenant (WYRD_AUTH_404_ADMIN_NOT_FOUND)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '409':
+          description: The binding already exists (WYRD_AUTH_409_ADMIN_CONFLICT)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '503':
+          description: The store or the audit path is unavailable (WYRD_AUDIT_503_UNAVAILABLE)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+    delete:
+      tags:
+      - Admin
+      summary: |-
+        `DELETE /v1/admin/workload-bindings?issuer=&subject=` — remove one binding
+        addressed by `(issuer, subject)`. Gated on `service_accounts:write`. A missing
+        binding is a `404`. Returns `204 No Content`.
+      operationId: delete_workload_binding_route
+      parameters:
+      - name: issuer
+        in: query
+        description: Issuer of the binding to remove
+        required: true
+        schema:
+          type: string
+      - name: subject
+        in: query
+        description: Subject of the binding to remove
+        required: true
+        schema:
+          type: string
+      responses:
+        '204':
+          description: Binding removed
+        '401':
+          description: An access token is required (WYRD_AUTH_401_INVALID_TOKEN)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '403':
+          description: Caller lacks service_accounts:write (WYRD_AUTHZ_403_PERMISSION_DENIED)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '404':
+          description: No such binding in this tenant (WYRD_AUTH_404_ADMIN_NOT_FOUND)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '503':
+          description: The store or the audit path is unavailable (WYRD_AUDIT_503_UNAVAILABLE)
+          content:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
   /v1/bifrost/tables:
@@ -930,25 +1419,25 @@ paths:
         '400':
           description: Invalid list query
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '401':
           description: Authentication required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '403':
           description: Card read permission required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '503':
           description: Registry unavailable
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
     post:
@@ -996,31 +1485,31 @@ paths:
         '400':
           description: Invalid request
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '401':
           description: Authentication required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '403':
           description: Card write permission required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '409':
           description: Idempotency or version conflict
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '503':
           description: Registry unavailable
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
   /v1/cards/by-ref:
@@ -1281,43 +1770,43 @@ paths:
         '400':
           description: Invalid Card UID or idempotency key
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '401':
           description: Authentication required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '403':
           description: Card write permission required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '404':
           description: Card not found
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '409':
           description: Card is not pending
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '503':
           description: Registry unavailable
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '507':
           description: Artifact verification failed
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
   /v1/cards/{kind}/{space}/{name}/latest:
@@ -1422,19 +1911,19 @@ paths:
         '401':
           description: Authentication required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '403':
           description: Tenant principal administration required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '422':
           description: A requested role does not exist in this tenant
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
   /v1/principals/{principal_id}/credentials:
@@ -1464,13 +1953,13 @@ paths:
         '401':
           description: Authentication required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '403':
           description: Tenant principal administration required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
     post:
@@ -1502,13 +1991,13 @@ paths:
         '401':
           description: Authentication required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '403':
           description: Tenant principal administration required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
   /v1/principals/{principal_id}/credentials/{credential_id}:
@@ -1556,19 +2045,19 @@ paths:
         '401':
           description: Authentication required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '403':
           description: Tenant principal administration required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '404':
           description: No live credential for this principal
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
   /v1/principals/{principal_id}/revoke:
@@ -1617,31 +2106,31 @@ paths:
         '400':
           description: Missing, oversized, or secret-like revocation reason
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '401':
           description: Authentication required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '403':
           description: Tenant principal administration required
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '404':
           description: No such principal of that kind in the caller's tenant
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
         '503':
           description: Revocation decision could not be audited
           content:
-            application/json:
+            application/problem+json:
               schema:
                 $ref: '#/components/schemas/WyrdProblem'
   /v1/query:
@@ -2459,6 +2948,36 @@ components:
             $ref: '#/components/schemas/CardUploadEntry'
           description: One server-minted upload per manifest entry.
       additionalProperties: false
+    ClaimMappingPayload:
+      type: object
+      description: |-
+        Serde mirror of the domain claim mapping, whose claim paths are not directly
+        (de)serializable.
+      required:
+      - subject
+      properties:
+        email:
+          type:
+          - string
+          - 'null'
+          description: Optional claim path that yields the principal email.
+        groups:
+          type:
+          - string
+          - 'null'
+          description: Optional claim path that yields the principal groups.
+        subject:
+          type: string
+          description: Claim path that yields the principal subject.
+      additionalProperties: false
+    ClientAuthKind:
+      type: string
+      description: How Wyrd authenticates to the IdP token endpoint, as authored by the admin.
+      enum:
+      - SecretBasic
+      - SecretPost
+      - PrivateKeyJwt
+      - Public
     CommitSha:
       type: string
       description: |-
@@ -2605,6 +3124,85 @@ components:
         tenant:
           $ref: '#/components/schemas/ProvisionedTenant'
           description: The provisioned tenant.
+    CreateTrustedIssuerRequest:
+      type: object
+      description: '`POST /v1/admin/trusted-issuers` body.'
+      required:
+      - issuer
+      - expected_audience
+      - client_id
+      - client_auth
+      - claim_mapping
+      - principal_kind
+      properties:
+        claim_mapping:
+          $ref: '#/components/schemas/ClaimMappingPayload'
+          description: Claim-to-principal mapping.
+        client_auth:
+          $ref: '#/components/schemas/ClientAuthKind'
+          description: How Wyrd authenticates to the issuer token endpoint.
+        client_id:
+          type: string
+          description: Client id Wyrd presents to the issuer.
+        client_secret:
+          type:
+          - string
+          - 'null'
+          description: Client secret, required for the secret-bearing client-auth variants.
+        default_roles:
+          type: array
+          items:
+            type: string
+          description: Roles granted to every principal from this issuer.
+        expected_audience:
+          type: string
+          description: Expected audience for tokens from this issuer.
+        group_role_map:
+          type: object
+          description: Mapping from issuer group to Wyrd roles.
+          additionalProperties:
+            type: array
+            items:
+              type: string
+          propertyNames:
+            type: string
+        issuer:
+          $ref: '#/components/schemas/IssuerUrl'
+          description: Trusted OIDC issuer URL.
+        jwks_ttl_secs:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Optional JWKS key-cache TTL override in seconds.
+          minimum: 0
+        principal_kind:
+          $ref: '#/components/schemas/IssuerTokenPolicy'
+          description: Whether tokens represent humans or workloads.
+      additionalProperties: false
+    CreateWorkloadBindingRequest:
+      type: object
+      description: '`POST /v1/admin/workload-bindings` body.'
+      required:
+      - issuer
+      - subject
+      - card_ref
+      properties:
+        audience:
+          type:
+          - string
+          - 'null'
+          description: Optional audience constraint.
+        card_ref:
+          $ref: '#/components/schemas/CardRef'
+          description: Card the bound workload acts as.
+        issuer:
+          $ref: '#/components/schemas/IssuerUrl'
+          description: Trusted issuer the binding belongs to.
+        subject:
+          type: string
+          description: Token subject the binding matches.
+      additionalProperties: false
     CredentialListResponse:
       type: object
       description: A principal's credential metadata.
@@ -3127,6 +3725,60 @@ components:
           type: string
           description: Header value.
       additionalProperties: false
+    IssueKeyRequest:
+      type: object
+      description: Body of `POST /auth/issue-key`.
+      required:
+      - card_ref
+      properties:
+        card_ref:
+          $ref: '#/components/schemas/CardRef'
+          description: Service or Agent card the key binds to.
+        expires_in_seconds:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: Optional TTL override in seconds.
+          minimum: 0
+        label:
+          type:
+          - string
+          - 'null'
+          description: Optional operator label stored with the key row.
+      additionalProperties: false
+    IssueKeyResponse:
+      type: object
+      description: Response from `POST /auth/issue-key`.
+      required:
+      - key_id
+      - key
+      - prefix
+      - card_ref
+      - created_at
+      - expires_at
+      properties:
+        card_ref:
+          $ref: '#/components/schemas/CardRef'
+          description: Confirmed card binding.
+        created_at:
+          type: string
+          format: date-time
+          description: Creation timestamp.
+        expires_at:
+          type: string
+          format: date-time
+          description: Expiry timestamp.
+        key:
+          $ref: '#/components/schemas/SecretBearer'
+          description: Plaintext API key, returned exactly once.
+        key_id:
+          type: string
+          description: API key row id.
+        prefix:
+          type: string
+          description: Log-safe prefix used for lookup.
+      additionalProperties: false
     IssuePlatformCredentialRequest:
       type: object
       description: |-
@@ -3162,6 +3814,21 @@ components:
         id:
           type: string
           description: Credential id, used to revoke it.
+    IssuerTokenPolicy:
+      type: string
+      description: |-
+        Whether an issuer's tokens represent human users or machine workloads.
+
+        This is the issuer token policy — distinct from [`super::PrincipalKindTag`], which
+        discriminates the resulting principal identity. One canonical type backs the
+        admin wire body, the OIDC domain registry, and the server config DTO.
+      enum:
+      - human
+      - workload
+    IssuerUrl:
+      type: string
+      format: uri
+      description: Absolute OIDC issuer URL. Trailing slashes are normalized away.
     ListCardsResponse:
       type: object
       description: A page of card summaries.
@@ -3847,6 +4514,35 @@ components:
     RequestId:
       type: string
       description: Request correlation ID; required to be a UUID v7.
+    RequestedSubject:
+      oneOf:
+      - type: object
+        description: Target by principal id.
+        required:
+        - id
+        - kind
+        properties:
+          id:
+            $ref: '#/components/schemas/PrincipalId'
+            description: Stable principal id.
+          kind:
+            type: string
+            enum:
+            - principal_id
+      - type: object
+        description: Target by card reference.
+        required:
+        - card_ref
+        - kind
+        properties:
+          card_ref:
+            $ref: '#/components/schemas/CardRef'
+            description: Service or Agent card reference.
+          kind:
+            type: string
+            enum:
+            - card_ref
+      description: Token-exchange target.
     RevokePrincipalRequest:
       type: object
       description: '`POST /v1/principals/{id}/revoke` body.'
@@ -4664,6 +5360,11 @@ components:
           format: int64
           description: Stored byte length.
       additionalProperties: false
+    SubjectTokenType:
+      type: string
+      description: Supported token type for RFC 8693 subject token.
+      enum:
+      - urn:ietf:params:oauth:token-type:access_token
     TableStatus:
       type: string
       description: Lifecycle status of a registered Bifrost table.
@@ -4708,6 +5409,131 @@ components:
       - Millisecond
       - Microsecond
       - Nanosecond
+    TokenRequest:
+      oneOf:
+      - type: object
+        description: Wyrd-native API key exchange.
+        required:
+        - api_key
+        - grant_type
+        properties:
+          api_key:
+            $ref: '#/components/schemas/SecretBearer'
+            description: API key from the deployment secret store.
+          grant_type:
+            type: string
+            enum:
+            - wyrd_api_key
+      - type: object
+        description: RFC 8693 token exchange for agent/service delegation.
+        required:
+        - subject_token
+        - subject_token_type
+        - requested_subject
+        - grant_type
+        properties:
+          grant_type:
+            type: string
+            enum:
+            - urn:ietf:params:oauth:grant-type:token-exchange
+          requested_subject:
+            $ref: '#/components/schemas/RequestedSubject'
+            description: Requested non-human target principal.
+          subject_token:
+            $ref: '#/components/schemas/SecretBearer'
+            description: Existing access token to delegate from.
+          subject_token_type:
+            $ref: '#/components/schemas/SubjectTokenType'
+            description: Type of `subject_token`.
+      - type: object
+        description: |-
+          Human OIDC login completion.
+
+          The public completion carries only callback material. The server loads
+          `code_verifier`, `nonce`, `redirect_uri`, issuer, and tenant from the
+          login state keyed by `state`.
+        required:
+        - code
+        - state
+        - grant_type
+        properties:
+          code:
+            $ref: '#/components/schemas/SecretBearer'
+            description: Authorization code from the identity provider callback.
+          grant_type:
+            type: string
+            enum:
+            - authorization_code
+          state:
+            type: string
+            description: Single-use login state key generated by Wyrd.
+      - type: object
+        description: 'Workload identity: platform-attested OIDC assertion.'
+        required:
+        - assertion
+        - grant_type
+        properties:
+          assertion:
+            $ref: '#/components/schemas/SecretBearer'
+            description: Kubernetes service-account token, SPIFFE JWT-SVID, or cloud token.
+          grant_type:
+            type: string
+            enum:
+            - urn:ietf:params:oauth:grant-type:jwt-bearer
+          tenant:
+            oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/TenantSlug'
+              description: Tenant selector fallback when the request host does not carry tenant.
+      - type: object
+        description: Wyrd refresh-token rotation.
+        required:
+        - refresh_token
+        - grant_type
+        properties:
+          grant_type:
+            type: string
+            enum:
+            - refresh_token
+          refresh_token:
+            $ref: '#/components/schemas/SecretBearer'
+            description: Signed Wyrd refresh token.
+      description: Body of `POST /auth/token`.
+    TokenResponse:
+      type: object
+      description: Response from `POST /auth/token`.
+      required:
+      - access_token
+      - token_type
+      - expires_at
+      properties:
+        access_token:
+          $ref: '#/components/schemas/SecretBearer'
+          description: Signed Wyrd access token.
+        expires_at:
+          type: string
+          format: date-time
+          description: Access-token expiry timestamp.
+        refresh_token:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/SecretBearer'
+            description: |-
+              Refresh token. Present only for grants that issue one: human OIDC login
+              (`authorization_code`), API-key exchange (`wyrd_api_key`), and refresh
+              rotation (`refresh_token`). Absent for the workload `jwt-bearer` and
+              `token-exchange` (delegation) grants, whose clients re-present their
+              durable credential to obtain a fresh access token instead of holding a
+              long-lived refresh secret.
+        token_type:
+          $ref: '#/components/schemas/TokenType'
+          description: Token type.
+      additionalProperties: false
+    TokenType:
+      type: string
+      description: Bearer token marker.
+      enum:
+      - Bearer
     TriggerSpec:
       type: object
       description: Declarative schedule and optional observation source for an Operator.
@@ -4731,6 +5557,50 @@ components:
           - type: 'null'
           - $ref: '#/components/schemas/TriggerSource'
             description: Optional observation stream to evaluate on each schedule tick.
+      additionalProperties: false
+    TrustedIssuerView:
+      type: object
+      description: Redacted issuer projection. Never carries the client secret.
+      required:
+      - issuer
+      - jwks_uri
+      - expected_audience
+      - client_id
+      - client_auth
+      - principal_kind
+      - jwks_ttl_secs
+      - claim_mapping
+      - group_role_map
+      - default_roles
+      properties:
+        claim_mapping:
+          description: Claim-to-principal mapping, as stored JSON.
+        client_auth:
+          type: string
+          description: Client-auth method, rendered as a string.
+        client_id:
+          type: string
+          description: Client id Wyrd presents to the issuer.
+        default_roles:
+          description: Default roles, as stored JSON.
+        expected_audience:
+          type: string
+          description: Expected audience for tokens from this issuer.
+        group_role_map:
+          description: Group-to-roles mapping, as stored JSON.
+        issuer:
+          type: string
+          description: Normalized issuer URL.
+        jwks_ttl_secs:
+          type: integer
+          format: int64
+          description: JWKS key-cache TTL in seconds.
+        jwks_uri:
+          type: string
+          description: Resolved JWKS URI.
+        principal_kind:
+          type: string
+          description: Principal kind, rendered as a string.
       additionalProperties: false
     UploadId:
       type: string
@@ -5018,6 +5888,28 @@ components:
           items:
             $ref: '#/components/schemas/WorkflowStep'
           description: Workflow steps.
+    WorkloadBindingView:
+      type: object
+      description: Workload-binding projection.
+      required:
+      - issuer
+      - subject
+      - card_ref
+      properties:
+        audience:
+          type:
+          - string
+          - 'null'
+          description: Optional audience constraint.
+        card_ref:
+          description: Card the bound workload acts as, as stored JSON.
+        issuer:
+          type: string
+          description: Normalized issuer URL.
+        subject:
+          type: string
+          description: Token subject the binding matches.
+      additionalProperties: false
     WyrdProblem:
       type: object
       description: RFC 9457 problem value emitted by every public Wyrd error boundary.
@@ -5066,5 +5958,9 @@ tags:
   description: Bounded Bifrost query transport
 - name: Principals
   description: Tenant principal and credential administration
+- name: Auth
+  description: Tenant-plane sign-in, credential exchange, and credential issuance
+- name: Admin
+  description: Tenant administration of trusted OIDC issuers and workload bindings
 - name: Platform
   description: 'Platform control plane: tenant lifecycle, platform identity, and platform credentials'

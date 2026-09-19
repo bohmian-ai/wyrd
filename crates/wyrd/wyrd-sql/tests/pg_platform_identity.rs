@@ -20,8 +20,9 @@ mod pg_tests {
         platform_identity_by_subject, platform_oidc_connection, purge_expired_platform_login_state,
         take_platform_login_state, upsert_platform_oidc_connection,
     };
+    use wyrd_sql::queries::platform::principal_grants::set_platform_grant;
     use wyrd_sql::queries::platform::principals::{
-        count_active_platform_principals, insert_platform_principal, list_platform_principals,
+        StatusChange, insert_platform_principal, list_platform_principals,
         platform_principal_by_id, set_platform_principal_status,
     };
 
@@ -32,6 +33,21 @@ mod pg_tests {
 
     /// The issuer every test in this module registers against.
     const ISSUER: &str = "https://idp.example.com/realms/platform";
+
+    /// The grant the lockout guard requires a surviving administrator to hold.
+    ///
+    /// Spelled here rather than imported so this suite proves the storage-level
+    /// containment test, not the server's idea of what the set contains.
+    fn required_grant() -> serde_json::Value {
+        serde_json::json!(["tenants:write", "platform_identity:write"])
+    }
+
+    /// Give a registered principal the required grant.
+    async fn grant(fixture: &PgFixture, principal: Uuid) {
+        set_platform_grant(fixture.operator_pool(), principal, &required_grant())
+            .await
+            .expect("grant installs");
+    }
 
     /// Register a human platform principal awaiting its first login.
     async fn register(fixture: &PgFixture, name: &str, claim: &str) -> Uuid {
@@ -260,6 +276,9 @@ mod pg_tests {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let pool = fixture.operator_pool();
         let principal = register(&fixture, "ops-lead", "ops@example.com").await;
+        let survivor = register(&fixture, "ops-second", "second@example.com").await;
+        grant(&fixture, principal).await;
+        grant(&fixture, survivor).await;
 
         assert!(
             platform_principal_by_id(pool, principal)
@@ -269,10 +288,11 @@ mod pg_tests {
                 .is_active()
         );
 
-        assert!(
-            set_platform_principal_status(pool, principal, "suspended")
+        assert_eq!(
+            set_platform_principal_status(pool, principal, "suspended", &required_grant())
                 .await
                 .expect("suspension succeeds"),
+            StatusChange::Changed,
             "suspending an active principal changes a row"
         );
         assert!(
@@ -283,11 +303,123 @@ mod pg_tests {
                 .is_active(),
             "a suspended principal may no longer authenticate"
         );
-        assert!(
-            !set_platform_principal_status(pool, principal, "suspended")
+        assert_eq!(
+            set_platform_principal_status(pool, principal, "suspended", &required_grant())
                 .await
                 .expect("repeat succeeds"),
+            StatusChange::Unchanged,
             "suspending it again changes nothing"
+        );
+    }
+
+    /// The guard protects the last administrator that can actually get back in.
+    ///
+    /// Three shapes have to be told apart, and the old count could tell apart
+    /// none of them: a principal with no grant is not a way in, a granted
+    /// principal with no credential and no pinned identity is not a way in
+    /// either, and only the one that is both must be refused.
+    #[tokio::test]
+    async fn only_a_usable_administrator_is_protected_from_suspension() {
+        if database_url().is_none() {
+            return;
+        }
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let pool = fixture.operator_pool();
+
+        // A registered human with a pinned identity and the required grant is
+        // the deployment's only way in.
+        let only_way_in = register(&fixture, "ops-lead", "ops@example.com").await;
+        grant(&fixture, only_way_in).await;
+        assert_eq!(
+            set_platform_principal_status(pool, only_way_in, "suspended", &required_grant())
+                .await
+                .expect("guard runs"),
+            StatusChange::WouldStrandDeployment,
+            "the last usable administrator cannot be suspended"
+        );
+
+        // An ungranted principal is not protection, so suspending it is free.
+        let ungranted = register(&fixture, "ops-observer", "observer@example.com").await;
+        assert_eq!(
+            set_platform_principal_status(pool, ungranted, "suspended", &required_grant())
+                .await
+                .expect("guard runs"),
+            StatusChange::Changed,
+            "a principal with no platform authority was never a way in"
+        );
+
+        // Nor is a granted principal nothing can authenticate as: it has no
+        // credential and no pinned identity.
+        let unreachable = Uuid::now_v7();
+        insert_platform_principal(
+            pool,
+            unreachable,
+            PrincipalKindTag::GlobalAdmin,
+            "ops-orphan",
+        )
+        .await
+        .expect("principal inserts");
+        grant(&fixture, unreachable).await;
+        assert_eq!(
+            set_platform_principal_status(pool, unreachable, "suspended", &required_grant())
+                .await
+                .expect("guard runs"),
+            StatusChange::Changed,
+            "authority nothing can authenticate as is not a way back in"
+        );
+        assert_eq!(
+            set_platform_principal_status(pool, only_way_in, "suspended", &required_grant())
+                .await
+                .expect("guard runs"),
+            StatusChange::WouldStrandDeployment,
+            "neither of those made the real administrator suspendable"
+        );
+
+        // A second usable administrator does.
+        let survivor = register(&fixture, "ops-second", "second@example.com").await;
+        grant(&fixture, survivor).await;
+        assert_eq!(
+            set_platform_principal_status(pool, only_way_in, "suspended", &required_grant())
+                .await
+                .expect("guard runs"),
+            StatusChange::Changed
+        );
+    }
+
+    /// Two administrators suspending each other at once leave one standing.
+    ///
+    /// Serialization is the whole guarantee: read-then-write without it lets
+    /// both transactions see the other's subject still active and both commit,
+    /// which is exactly the lockout the guard exists to prevent.
+    #[tokio::test]
+    async fn concurrent_suspensions_cannot_empty_the_platform() {
+        if database_url().is_none() {
+            return;
+        }
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let pool = fixture.operator_pool();
+        let first = register(&fixture, "ops-first", "first@example.com").await;
+        let second = register(&fixture, "ops-second", "second@example.com").await;
+        grant(&fixture, first).await;
+        grant(&fixture, second).await;
+
+        let required = required_grant();
+        let (left, right) = tokio::join!(
+            set_platform_principal_status(pool, first, "suspended", &required),
+            set_platform_principal_status(pool, second, "suspended", &required),
+        );
+        let outcomes = [left.expect("first runs"), right.expect("second runs")];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == StatusChange::Changed)
+                .count(),
+            1,
+            "exactly one suspension wins: {outcomes:?}"
+        );
+        assert!(
+            outcomes.contains(&StatusChange::WouldStrandDeployment),
+            "the loser is refused rather than silently applied: {outcomes:?}"
         );
     }
 
@@ -303,7 +435,7 @@ mod pg_tests {
         pin_platform_identity(pool, ISSUER, "ops@example.com", "subject-alice")
             .await
             .expect("pin succeeds");
-        set_platform_principal_status(pool, principal, "suspended")
+        set_platform_principal_status(pool, principal, "suspended", &required_grant())
             .await
             .expect("suspension succeeds");
 
@@ -319,38 +451,6 @@ mod pg_tests {
             row.subject.as_deref(),
             Some("subject-alice"),
             "the listing names the identity this principal resolves from"
-        );
-    }
-
-    /// The active count is what a lockout guard reads.
-    #[tokio::test]
-    async fn the_active_count_tracks_suspension() {
-        if database_url().is_none() {
-            return;
-        }
-        let fixture = PgFixture::start().await.expect("fixture starts");
-        let pool = fixture.operator_pool();
-        let before = count_active_platform_principals(pool)
-            .await
-            .expect("count reads");
-
-        let principal = register(&fixture, "ops-lead", "ops@example.com").await;
-        assert_eq!(
-            count_active_platform_principals(pool)
-                .await
-                .expect("count reads"),
-            before + 1
-        );
-
-        set_platform_principal_status(pool, principal, "suspended")
-            .await
-            .expect("suspension succeeds");
-        assert_eq!(
-            count_active_platform_principals(pool)
-                .await
-                .expect("count reads"),
-            before,
-            "a suspended principal no longer counts as a way in"
         );
     }
 

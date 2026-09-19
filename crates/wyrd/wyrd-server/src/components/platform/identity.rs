@@ -32,8 +32,8 @@ use wyrd_sql::queries::platform::identity::{
     upsert_platform_oidc_connection,
 };
 use wyrd_sql::queries::platform::principals::{
-    count_active_platform_principals, insert_platform_principal_tx, list_platform_principals,
-    platform_principal_by_id, set_platform_principal_status,
+    StatusChange, insert_platform_principal_tx, list_platform_principals,
+    set_platform_principal_status,
 };
 use wyrd_sql::{OperatorPool, SqlError};
 
@@ -501,36 +501,31 @@ async fn set_admin_status(
         }));
     }
 
-    let principal = platform_principal_by_id(&pool, principal_id)
+    // The guard and the write are one serialized operator transaction, so two
+    // administrators suspending each other at once cannot both be told a
+    // survivor remains.
+    let grant = serde_json::to_value(platform_administrator_grant().iter().collect::<Vec<_>>())
+        .expect("permission set serializes to JSON");
+    match set_platform_principal_status(&pool, principal_id, &request.status, &grant)
         .await
         .map_err(store_error)?
-        .ok_or_else(|| {
-            WyrdErrorResponse::from(WyrdError::NotFound {
+    {
+        StatusChange::Changed | StatusChange::Unchanged => {}
+        StatusChange::NotFound => {
+            return Err(WyrdErrorResponse::from(WyrdError::NotFound {
                 message: "platform principal not found".to_owned(),
                 details: serde_json::json!({}),
-            })
-        })?;
-
-    // Checked before the write, and only for the transition that can cause it.
-    // Restoring a principal can never reduce the count.
-    if request.status == "suspended"
-        && principal.is_active()
-        && count_active_platform_principals(&pool)
-            .await
-            .map_err(store_error)?
-            <= 1
-    {
-        return Err(WyrdErrorResponse::from(WyrdError::Conflict {
-            message: "suspending the last active platform principal would leave the deployment \
-                      with no way in"
-                .to_owned(),
-            details: serde_json::json!({ "principal_id": principal_id.to_string() }),
-        }));
+            }));
+        }
+        StatusChange::WouldStrandDeployment => {
+            return Err(WyrdErrorResponse::from(WyrdError::Conflict {
+                message: "suspending this administrator would leave the deployment with no way                           in"
+                    .to_owned(),
+                details: serde_json::json!({ "principal_id": principal_id.to_string() }),
+            }));
+        }
     }
 
-    set_platform_principal_status(&pool, principal_id, &request.status)
-        .await
-        .map_err(store_error)?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 

@@ -166,44 +166,121 @@ pub async fn list_platform_principals(
     .map_err(SqlError::from)
 }
 
-/// Set a platform principal's lifecycle status.
+/// Outcome of a guarded platform principal status change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusChange {
+    /// The principal's status is now the requested one.
+    Changed,
+    /// The principal already held the requested status; nothing was written.
+    Unchanged,
+    /// No platform principal has that id.
+    NotFound,
+    /// The change would leave the deployment with no way in, and was refused.
+    WouldStrandDeployment,
+}
+
+/// Lock word serializing every guarded platform status change.
+///
+/// Suspension is decided by counting the administrators that would remain, so
+/// two concurrent suspensions must not each see the other's subject still
+/// active. A transaction-scoped advisory lock is the narrowest thing that makes
+/// them take turns: it needs no table, is released by commit or rollback alike,
+/// and touches nothing else in the deployment.
+const PLATFORM_STATUS_LOCK: i64 = 0x7779_7264_7073_7461;
+
+/// Set a platform principal's lifecycle status without stranding the deployment.
 ///
 /// Suspension is what makes the active-status check on every platform request a
 /// live guard rather than a dormant one: nothing else in the deployment can
-/// stop a platform principal from acting. Returns whether a row changed, so a
-/// caller can distinguish an unknown principal from one already in that state.
+/// stop a platform principal from acting. That is also why it is dangerous —
+/// suspending the last administrator who can actually get back in leaves no way
+/// to undo it.
+///
+/// The guard and the write are one serialized transaction. `required` is the
+/// fixed platform-administrator grant the caller owns; a remaining principal
+/// counts only if it is active, holds that grant, and has some way to
+/// authenticate — a live credential or a pinned federated identity. A principal
+/// with a grant and no way in cannot justify suspending the one that has both.
+///
+/// Restoring a principal can only raise that count, so it is never guarded.
 ///
 /// # Errors
-/// Returns [`SqlError::Query`] when the update fails, including when `status`
-/// is not an accepted lifecycle value.
+/// Returns [`SqlError::Query`] when the lock, the count, or the update fails,
+/// including when `status` is not an accepted lifecycle value.
 pub async fn set_platform_principal_status(
     pool: &OperatorPool,
     id: Uuid,
     status: &str,
-) -> Result<bool, SqlError> {
-    sqlx::query(
-        "UPDATE platform.principals
-            SET status = $2, updated_at = now()
-          WHERE id = $1 AND status <> $2",
-    )
-    .bind(id)
-    .bind(status)
-    .execute(pool.pool())
-    .await
-    .map(|done| done.rows_affected() > 0)
-    .map_err(SqlError::from)
+    required: &serde_json::Value,
+) -> Result<StatusChange, SqlError> {
+    let mut tx = pool.begin().await?;
+
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(PLATFORM_STATUS_LOCK)
+        .execute(&mut *tx)
+        .await
+        .map_err(SqlError::from)?;
+
+    let Some(current): Option<String> =
+        sqlx::query_scalar::<_, String>("SELECT status FROM platform.principals WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(SqlError::from)?
+    else {
+        return Ok(StatusChange::NotFound);
+    };
+    if current == status {
+        return Ok(StatusChange::Unchanged);
+    }
+
+    if status == "suspended" {
+        let (subject_usable, remaining): (bool, i64) = sqlx::query_as(USABLE_ADMINISTRATORS_SQL)
+            .bind(id)
+            .bind(required)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(SqlError::from)?;
+        // Only a principal that is itself a way in can be the last one. An
+        // ungranted or unauthenticable row is not protection worth refusing for.
+        if subject_usable && remaining == 0 {
+            return Ok(StatusChange::WouldStrandDeployment);
+        }
+    }
+
+    sqlx::query("UPDATE platform.principals SET status = $2, updated_at = now() WHERE id = $1")
+        .bind(id)
+        .bind(status)
+        .execute(&mut *tx)
+        .await
+        .map_err(SqlError::from)?;
+    tx.commit().await?;
+    Ok(StatusChange::Changed)
 }
 
-/// Count the platform principals that may still authenticate.
+/// Report whether `$1` is a way into the deployment, and how many others are.
 ///
-/// Used to refuse the suspension that would leave a deployment with no way in
-/// at all.
-///
-/// # Errors
-/// Returns [`SqlError::Query`] when the read fails.
-pub async fn count_active_platform_principals(pool: &OperatorPool) -> Result<i64, SqlError> {
-    sqlx::query_scalar::<_, i64>("SELECT count(*) FROM platform.principals WHERE status = 'active'")
-        .fetch_one(pool.pool())
-        .await
-        .map_err(SqlError::from)
-}
+/// "A way in" is the whole point: an active row is not one if it holds no
+/// platform authority, and authority is not one if nothing can authenticate as
+/// it. `@>` is grant containment, so a principal counts only when it holds
+/// every permission in the required set.
+const USABLE_ADMINISTRATORS_SQL: &str = "WITH usable AS (
+        SELECT p.id
+          FROM platform.principals p
+          JOIN platform.principal_grants g ON g.principal_id = p.id
+         WHERE p.status = 'active'
+           AND g.permissions @> $2
+           AND (
+          EXISTS (
+            SELECT 1 FROM platform.credentials c
+             WHERE c.principal_id = p.id
+               AND c.revoked_at IS NULL
+               AND (c.expires_at IS NULL OR c.expires_at > now())
+          )
+          OR EXISTS (
+            SELECT 1 FROM platform.principal_identities i WHERE i.principal_id = p.id
+          )
+        )
+      )
+      SELECT EXISTS (SELECT 1 FROM usable WHERE id = $1),
+             (SELECT count(*) FROM usable WHERE id <> $1)";

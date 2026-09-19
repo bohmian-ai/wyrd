@@ -142,6 +142,7 @@ hide = true
 description = "Run the durable principal, credential, and grant Postgres suites with their lifecycle already provisioned"
 run = """
 cargo nextest run --locked -p wyrd-sql --test pg_admin_principals
+cargo nextest run --locked -p wyrd-sql --test pg_platform_identity
 cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^platform_authz::pg_tests::/)'
 cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^platform_credentials::pg_tests::/)'
 cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^exchange_api_key::pg_tests::/)'

@@ -12,6 +12,8 @@
 
 use std::env;
 
+use chrono::{DateTime, Utc};
+
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, Response, StatusCode, header};
 use serde_json::{Value, json};
@@ -575,6 +577,137 @@ async fn a_tenant_rotates_an_automation_credential_without_an_outage() {
         tenant_token(&srv, &second).await.is_ok(),
         "the principal's other credential still authenticates, so rotation has no gap"
     );
+}
+
+/// Replaying a revoke changes nothing.
+///
+/// Advancing the revocation epoch is not idempotent in effect: it kills every
+/// live token the principal holds. A retried DELETE — an SDK retry after a
+/// timed-out 204, a re-run pipeline, a second operator — must therefore not
+/// perform it again, or an already-completed rotation would lose the surviving
+/// credential's live tokens for no reason.
+#[tokio::test]
+async fn replaying_a_revoke_does_not_disturb_the_surviving_credential() {
+    if !e2e_enabled() {
+        return;
+    }
+    let srv = WyrdTestServer::start_in_process()
+        .await
+        .expect("server starts");
+    let admin = provisioned_tenant_admin(&srv, "replayed").await;
+
+    let created = body_json(
+        srv.oneshot_authenticated(
+            &admin,
+            tenant_request(
+                Method::POST,
+                "/v1/principals",
+                Some(json!({ "name": "ci-runner", "roles": ["reader"] })),
+            ),
+        )
+        .await
+        .expect("principal route responds"),
+    )
+    .await;
+    let principal_id = created["principal_id"].as_str().expect("principal id");
+
+    let issued = body_json(
+        srv.oneshot_authenticated(
+            &admin,
+            tenant_request(
+                Method::POST,
+                &format!("/v1/principals/{principal_id}/credentials"),
+                None,
+            ),
+        )
+        .await
+        .expect("issue route responds"),
+    )
+    .await;
+    let second = issued["credential"]
+        .as_str()
+        .expect("credential")
+        .to_owned();
+
+    let listed = body_json(
+        srv.oneshot_authenticated(
+            &admin,
+            tenant_request(
+                Method::GET,
+                &format!("/v1/principals/{principal_id}/credentials"),
+                None,
+            ),
+        )
+        .await
+        .expect("list route responds"),
+    )
+    .await;
+    let first_id = listed["credentials"]
+        .as_array()
+        .expect("credential list")
+        .iter()
+        .find(|entry| entry["id"] != issued["id"])
+        .expect("the original credential is listed")["id"]
+        .as_str()
+        .expect("credential id")
+        .to_owned();
+
+    let revoke = |credential: String| {
+        tenant_request(
+            Method::DELETE,
+            &format!("/v1/principals/{principal_id}/credentials/{credential}"),
+            None,
+        )
+    };
+    let resp = srv
+        .oneshot_authenticated(&admin, revoke(first_id.clone()))
+        .await
+        .expect("revoke route responds");
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "the first revoke acts"
+    );
+
+    // The epoch itself is the assertion. A live token would be a weaker and
+    // flakier proxy: JWT `iat` is whole seconds, so a token minted in the same
+    // second as an epoch advance is already below it and would fail for a
+    // reason that has nothing to do with the replay.
+    let epoch_after_first = revocation_epoch(&srv, principal_id).await;
+
+    let resp = srv
+        .oneshot_authenticated(&admin, revoke(first_id))
+        .await
+        .expect("revoke route responds");
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "a replayed revoke reports that there was nothing left to retire"
+    );
+
+    assert_eq!(
+        revocation_epoch(&srv, principal_id).await,
+        epoch_after_first,
+        "the replay advanced no epoch, so the surviving credential's live tokens are untouched"
+    );
+
+    // And the surviving credential is still a working way in.
+    assert!(
+        tenant_token(&srv, &second).await.is_ok(),
+        "the surviving credential still authenticates after the replay"
+    );
+}
+
+/// Read a principal's revocation epoch through the operator boundary.
+///
+/// Goes around row-level security deliberately: the test is asserting on
+/// server-owned state that no tenant-plane route exposes.
+async fn revocation_epoch(srv: &WyrdTestServer, principal_id: &str) -> Option<DateTime<Utc>> {
+    sqlx::query_scalar("SELECT tokens_not_before FROM wyrd.auth_service_accounts WHERE id = $1")
+        .bind(principal_id.parse::<uuid::Uuid>().expect("principal uuid"))
+        .fetch_one(srv.operator_pool().pool())
+        .await
+        .expect("revocation epoch reads")
 }
 
 /// A credential can only be revoked through the principal that owns it.

@@ -16,10 +16,10 @@ use axum::{Json, Router};
 use chrono::Duration;
 use secrecy::ExposeSecret;
 use uuid::Uuid;
+use wyrd_auth::exchange_api_key::principal_kind_wire;
 use wyrd_auth::issue_api_key::WyrdApiKey;
 use wyrd_auth::revocation_listener::notify_principal_revoked;
 use wyrd_runtime::RoleRef;
-use wyrd_spec::auth::PrincipalKindTag;
 use wyrd_spec::auth::{
     CreateServicePrincipalRequest, CreateServicePrincipalResponse, CredentialListResponse,
     CredentialMetadata, IssuedCredential, SecretBearer,
@@ -30,7 +30,7 @@ use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
     ApiKeyMetadataRow, credential_belongs_to, grant_role_to_service_account, insert_api_key,
     insert_service_account, list_api_key_metadata, revoke_api_key,
-    revoke_service_account_principal, role_by_name,
+    revoke_service_account_principal, role_by_name, service_account_by_id,
 };
 
 use crate::audit;
@@ -353,20 +353,44 @@ async fn revoke_credential(
     .await?;
 
     // Scoped to the principal the path names, so a credential id alone cannot
-    // revoke a credential belonging to some other principal.
+    // revoke a credential belonging to some other principal. The refusal
+    // commits, because a probe for someone else's credential is exactly the
+    // attempt an operator needs to find in the audit log.
     let owned = credential_belongs_to(&mut conn, credential_id, principal_id)
         .await
         .map_err(internal)?;
     if !owned {
-        return Err(WyrdErrorResponse::from(WyrdError::NotFound {
-            message: "credential not found for this principal".to_owned(),
-            details: serde_json::json!({}),
-        }));
+        conn.commit().await.map_err(internal)?;
+        return Err(not_found());
     }
 
-    let revoked = revoke_api_key(&mut conn, credential_id)
+    // Nothing after this point runs unless *this* call is the one that retires
+    // the credential. Advancing the epoch is not idempotent in effect — it
+    // kills every live token the principal holds — so a replayed revoke must
+    // not do it a second time.
+    if !revoke_api_key(&mut conn, credential_id)
         .await
-        .map_err(internal)?;
+        .map_err(internal)?
+    {
+        conn.commit().await.map_err(internal)?;
+        return Err(not_found());
+    }
+
+    // The kind is read rather than assumed: the epoch cache is keyed by it, so
+    // naming the wrong one invalidates nothing and leaves the window this
+    // exists to close wide open. A tenant's administrative principal is
+    // `tenant_admin`, not `service`.
+    let kind = service_account_by_id(&mut conn, principal_id)
+        .await
+        .map_err(internal)?
+        .and_then(|row| principal_kind_wire(&row.principal_kind))
+        .ok_or_else(|| {
+            WyrdErrorResponse::from(WyrdError::Internal {
+                message: "credential owner has no recognizable principal kind".to_owned(),
+                details: serde_json::json!({}),
+            })
+        })?;
+
     revoke_service_account_principal(&mut conn, principal_id)
         .await
         .map_err(internal)?;
@@ -379,7 +403,7 @@ async fn revoke_credential(
     if let Err(error) = notify_principal_revoked(
         state.postgres.app_pool(),
         caller.data_tenant_id,
-        PrincipalKindTag::Service,
+        kind,
         wyrd_runtime::PrincipalId::new(principal_id),
     )
     .await
@@ -390,14 +414,18 @@ async fn revoke_credential(
         );
     }
 
-    if revoked {
-        Ok(axum::http::StatusCode::NO_CONTENT)
-    } else {
-        Err(WyrdErrorResponse::from(WyrdError::NotFound {
-            message: "credential not found for this principal".to_owned(),
-            details: serde_json::json!({}),
-        }))
-    }
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// The one refusal for a credential this principal does not have.
+///
+/// An unknown credential and an already-retired one render identically, so a
+/// replay learns nothing a first call would not have told it.
+fn not_found() -> WyrdErrorResponse {
+    WyrdErrorResponse::from(WyrdError::NotFound {
+        message: "credential not found for this principal".to_owned(),
+        details: serde_json::json!({}),
+    })
 }
 
 /// Project a stored credential row onto its non-secret wire metadata.

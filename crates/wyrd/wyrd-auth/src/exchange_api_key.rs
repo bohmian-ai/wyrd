@@ -583,7 +583,12 @@ pub(crate) fn role_refs(names: Vec<String>) -> Result<Vec<RoleRef>, wyrd_runtime
 }
 
 /// Convert a stored principal kind string into the token wire enum.
-pub(crate) fn principal_kind_wire(value: &str) -> Option<PrincipalKindTag> {
+///
+/// Public because the kind is not merely informational: the revocation-epoch
+/// cache is keyed by it, so any caller fanning out a revocation has to name the
+/// stored kind rather than assume one. `None` for an unrecognized value, which
+/// every caller must treat as a refusal rather than defaulting.
+pub fn principal_kind_wire(value: &str) -> Option<PrincipalKindTag> {
     match value {
         "tenant_admin" => Some(PrincipalKindTag::TenantAdmin),
         "service" => Some(PrincipalKindTag::Service),

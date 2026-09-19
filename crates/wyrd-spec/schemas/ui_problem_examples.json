@@ -48,7 +48,7 @@
     "code": "WYRD_AUTH_401_UNAUTHENTICATED",
     "detail": "Not authenticated",
     "details": {},
-    "remediation": "Present a valid Wyrd token in the Authorization header.",
+    "remediation": "Present a valid Wyrd token as `X-Wyrd-Access-Token: Bearer <token>`.",
     "status": 401,
     "title": "Not authenticated",
     "type": "https://wyrd.dev/problems/WYRD_AUTH_401_UNAUTHENTICATED"

@@ -504,7 +504,7 @@ pub enum WyrdError {
         code = "WYRD_AUTH_401_UNAUTHENTICATED",
         status = 401,
         title = "Not authenticated",
-        remediation = "Present a valid Wyrd token in the Authorization header."
+        remediation = "Present a valid Wyrd token as `X-Wyrd-Access-Token: Bearer <token>`."
     )]
     Unauthenticated {
         /// Human-readable error message.
@@ -540,13 +540,13 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// Authorization header shape is malformed.
+    /// `X-Wyrd-Access-Token` header shape is malformed.
     #[error("[WYRD_AUTH_400_BAD_TOKEN_FORMAT] {message}")]
     #[wyrd_error(
         code = "WYRD_AUTH_400_BAD_TOKEN_FORMAT",
         status = 400,
-        title = "Authorization header malformed",
-        remediation = "Use `Authorization: Bearer <token>` with a single Bearer credential."
+        title = "Access token header malformed",
+        remediation = "Use `X-Wyrd-Access-Token: Bearer <token>` with a single Bearer credential."
     )]
     BadTokenFormat {
         /// Human-readable error message.
@@ -882,7 +882,7 @@ pub enum WyrdError {
         code = "WYRD_PERMISSION_401_UNAUTHENTICATED",
         status = 401,
         title = "Authentication required",
-        remediation = "Send a valid `Authorization: Bearer <token>` header before invoking permission-protected routes."
+        remediation = "Send a valid `X-Wyrd-Access-Token: Bearer <token>` header before invoking permission-protected routes."
     )]
     PermissionUnauthenticated {
         /// Human-readable error message.
@@ -3973,7 +3973,7 @@ mod tests {
     fn auth_variant_problem_json_roundtrips() {
         let error = WyrdError::Unauthenticated {
             message: "missing bearer token".to_owned(),
-            details: serde_json::json!({ "header": "authorization" }),
+            details: serde_json::json!({ "header": "x-wyrd-access-token" }),
         };
         let problem = error.as_problem_json();
 
@@ -3982,10 +3982,10 @@ mod tests {
         assert_eq!(problem["title"], "Not authenticated");
         assert_eq!(
             problem["remediation"],
-            "Present a valid Wyrd token in the Authorization header."
+            "Present a valid Wyrd token as `X-Wyrd-Access-Token: Bearer <token>`."
         );
         assert_eq!(problem["detail"], "missing bearer token");
-        assert_eq!(problem["details"]["header"], "authorization");
+        assert_eq!(problem["details"]["header"], "x-wyrd-access-token");
         assert!(
             problem["type"]
                 .as_str()

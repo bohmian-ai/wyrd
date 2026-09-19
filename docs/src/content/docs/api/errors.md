@@ -91,8 +91,8 @@ This page is the generated error catalog. For how an agent should act on these e
 | Code | Status | When |
 | --- | --- | --- |
 | `WYRD_EVAL_404_RUN_NOT_FOUND` | 404 | The `run_id` path parameter does not match any open run. Re-open with `POST /v1/eval/runs`. |
-| `WYRD_EVAL_401_MISSING_LEASE` | 401 | The request did not include an `Authorization: Bearer <token>` header. Send the `lease_token` from the open response. |
-| `WYRD_EVAL_403_INVALID_LEASE` | 403 | The bearer token does not match the lease minted for the run. Re-open the run via `POST /v1/eval/runs`; leases are bound to one run. |
+| `WYRD_EVAL_401_MISSING_LEASE` | 401 | The request did not include an `x-wyrd-eval-lease: Bearer <token>` header. Send the `lease_token` from the open response. |
+| `WYRD_EVAL_403_INVALID_LEASE` | 403 | The lease credential does not match the lease minted for the run. Re-open the run via `POST /v1/eval/runs`; leases are bound to one run. |
 | `WYRD_EVAL_409_SUBMISSION_MISMATCH` | 409 | The submission kind, scenario id, or turn counter does not match the outstanding directive. Call `POST /v1/eval/runs/{run_id}/next` to retrieve the current directive and retry. |
 | `WYRD_EVAL_429_TOO_MANY_RUNS` | 429 | The server has reached its concurrent-run cap. Wait for an existing run to complete, then retry. |
 | `WYRD_EVAL_500_RUN_FAILED` | 500 | The eval engine or scenario loader encountered an internal error. Inspect server logs for the chained detail. |

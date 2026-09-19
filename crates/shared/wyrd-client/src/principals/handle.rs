@@ -5,7 +5,7 @@ use std::sync::Arc;
 use reqwest::Method;
 use wyrd_spec::auth::{
     CreateServicePrincipalRequest, CreateServicePrincipalResponse, CredentialListResponse,
-    IssuedCredential, PrincipalId,
+    IssuedCredential, PrincipalId, RevokePrincipalRequest,
 };
 use wyrd_spec::error::WyrdError;
 
@@ -114,6 +114,32 @@ impl Principals {
                 Method::GET,
                 &format!("/v1/principals/{principal_id}/credentials"),
                 None,
+            )
+            .await
+    }
+
+    /// Revoke a principal outright, ending every token it holds.
+    ///
+    /// The blunt instrument next to [`Self::revoke_credential`]: rather than
+    /// retiring one credential, this advances the principal's authorization
+    /// epoch, so tokens already minted and cached anywhere in the deployment
+    /// stop verifying on their next use. Use it when the identity is
+    /// compromised, not when a credential is merely being rotated.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the caller lacks principal administration, the
+    /// principal is unknown in this tenant, or the revocation decision cannot be
+    /// audited.
+    pub async fn revoke_principal(
+        &self,
+        principal_id: &PrincipalId,
+        request: &RevokePrincipalRequest,
+    ) -> Result<(), WyrdError> {
+        self.client
+            .request_json(
+                Method::POST,
+                &format!("/v1/principals/{principal_id}/revoke"),
+                Some(request),
             )
             .await
     }

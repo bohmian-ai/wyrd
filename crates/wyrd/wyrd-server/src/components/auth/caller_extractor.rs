@@ -2,10 +2,9 @@ use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use wyrd_runtime::{DelegationStep, Principal};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 
-use crate::components::auth::AuthenticatedPrincipal;
+use crate::components::auth::{AuthenticatedPrincipal, token_extract};
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
@@ -62,21 +61,9 @@ impl FromRequestParts<AppState> for Caller {
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         let principal = AuthenticatedPrincipal::from_request_parts(parts, state).await?;
-        let request_id = parts
-            .extensions
-            .get::<RequestId>()
-            .cloned()
-            .ok_or_else(missing_request_id)
-            .map_err(WyrdErrorResponse::from)?;
+        let request_id = token_extract::request_id(parts)?;
 
         Ok(Self::from_authenticated(&principal, request_id))
-    }
-}
-
-fn missing_request_id() -> WyrdError {
-    WyrdError::Internal {
-        message: "missing RequestId extension".to_owned(),
-        details: serde_json::json!({ "extension": "RequestId" }),
     }
 }
 

@@ -5,12 +5,15 @@
 //! managing who may administer the platform itself.
 //!
 //! It is a separate handle rather than another method on the tenant client
-//! because the two planes are separate all the way down to the wire. A platform
-//! session arrives on `Authorization: Bearer`; a tenant access token arrives on
-//! `X-Wyrd-Access-Token`. Neither header is read by the other plane, so a client
-//! holding a tenant credential cannot reach a platform route by accident or by
-//! construction — which is the property the server enforces and this surface
-//! must not quietly paper over.
+//! because the two identities are separate: a platform session names a
+//! principal with no tenant, and a tenant token names one with no platform
+//! authority. Both travel on `X-Wyrd-Access-Token`, the one header every Wyrd
+//! plane authenticates on — the header is not what keeps them apart, since any
+//! client can set any header. What keeps them apart is the scope marker the
+//! server requires of a platform session and the extractor each route declares:
+//! a tenant token presented to a platform route carries the wrong scope and is
+//! refused. Holding the two sessions on two handles means a caller does not
+//! reach for a platform route with a tenant credential in the first place.
 
 mod handle;
 

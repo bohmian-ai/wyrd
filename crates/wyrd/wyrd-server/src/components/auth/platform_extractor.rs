@@ -3,9 +3,15 @@
 //! A platform request presents a platform **session token**, never credential
 //! material: the credential is exchanged once and the token carries every
 //! request after that, so no served surface reads a secret, a lookup prefix, or
-//! a credential record. The token arrives on `Authorization: Bearer`, distinct
-//! from the tenant plane's `X-Wyrd-Access-Token`, so the two planes cannot be
-//! confused by a misrouted header.
+//! a credential record. The token arrives on `X-Wyrd-Access-Token`, the one
+//! header every Wyrd plane authenticates on; the caller's own `Authorization`
+//! header belongs to the calling application and is never read here.
+//!
+//! The header does not separate the planes — any client can set any header.
+//! What separates them is the scope marker `verify_platform` requires and the
+//! extractor a route declares: a tenant access token carries the wrong scope
+//! and is refused here, and a platform session produces no tenant so it cannot
+//! satisfy [`Caller`](super::Caller).
 //!
 //! The extractor is the only producer of a platform-scoped
 //! [`AuthContext`](wyrd_runtime::AuthContext). A route that takes
@@ -13,8 +19,8 @@
 //! that takes [`Caller`](super::Caller) cannot receive a platform one.
 
 use axum::extract::FromRequestParts;
+use axum::http::HeaderMap;
 use axum::http::request::Parts;
-use axum::http::{HeaderMap, HeaderName};
 use secrecy::{ExposeSecret, SecretString};
 use uuid::Uuid;
 use wyrd_auth::platform_sessions::{PlatformSessionError, PlatformSessions};
@@ -24,11 +30,9 @@ use wyrd_spec::request_id::RequestId;
 use wyrd_sql::OperatorPool;
 use wyrd_sql::queries::platform::principal_grants::platform_grant_for_principal;
 
+use crate::components::auth::token_extract::{self, WYRD_ACCESS_TOKEN_HEADER};
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
-
-/// Header carrying a platform administrative credential.
-const AUTHORIZATION: HeaderName = HeaderName::from_static("authorization");
 
 /// An authenticated platform-control-plane caller.
 ///
@@ -59,12 +63,16 @@ impl PlatformCaller {
     }
 }
 
-/// Read a platform session token from `Authorization: Bearer`.
+/// Read a platform session token from `X-Wyrd-Access-Token`.
 ///
-/// Every malformed or missing case yields the same unauthenticated error as an
-/// unknown credential, so header shape is not an oracle either.
+/// Every malformed or missing case yields `None`, which the caller renders as
+/// the same unauthenticated error as an unknown credential, so header shape is
+/// not an oracle either. That is why this does not reuse
+/// `token_extract::extract_wyrd_access_token`, whose informative
+/// missing-versus-malformed distinction a legitimate client never needs and an
+/// enumerating one would read.
 fn extract_platform_token(headers: &HeaderMap) -> Option<SecretString> {
-    let raw = headers.get(AUTHORIZATION)?.to_str().ok()?;
+    let raw = headers.get(WYRD_ACCESS_TOKEN_HEADER)?.to_str().ok()?;
     let token = raw.strip_prefix("Bearer ")?;
     if token.is_empty() {
         return None;
@@ -164,16 +172,7 @@ impl FromRequestParts<AppState> for PlatformCaller {
         let principal_id = session.principal_id;
 
         let effective_permissions = resolve_grant(&pool, principal_id).await?;
-        let request_id = parts
-            .extensions
-            .get::<RequestId>()
-            .cloned()
-            .ok_or_else(|| {
-                WyrdErrorResponse::from(WyrdError::Internal {
-                    message: "missing RequestId extension".to_owned(),
-                    details: serde_json::json!({ "extension": "RequestId" }),
-                })
-            })?;
+        let request_id = token_extract::request_id(parts)?;
 
         Ok(Self {
             context: AuthContext::from(PlatformPrincipal::new(principal_id, effective_permissions)),
@@ -205,12 +204,12 @@ mod tests {
         }
     }
 
-    /// A bearer session token is read from the platform header.
+    /// A bearer session token is read from the canonical Wyrd header.
     #[test]
     fn bearer_session_token_is_extracted() {
         let mut headers = HeaderMap::new();
         headers.insert(
-            "authorization",
+            "x-wyrd-access-token",
             "Bearer header.payload.sig".parse().unwrap(),
         );
 
@@ -226,13 +225,51 @@ mod tests {
         for value in ["", "Bearer ", "Basic abc", "header.payload.sig"] {
             let mut headers = HeaderMap::new();
             if !value.is_empty() {
-                headers.insert("authorization", value.parse().unwrap());
+                headers.insert("x-wyrd-access-token", value.parse().unwrap());
             }
             assert!(
                 extract_platform_token(&headers).is_none(),
                 "{value:?} must not resolve to a session token"
             );
         }
+    }
+
+    /// The application's own `Authorization` header is left to the application.
+    ///
+    /// A request carrying both authenticates on the Wyrd header and the
+    /// application's bearer is never consulted, so a caller that already speaks
+    /// OAuth to its own upstream does not have to surrender that header to
+    /// reach Wyrd.
+    #[test]
+    fn an_applications_own_authorization_header_is_never_read() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            "Bearer the.applications.own.token".parse().unwrap(),
+        );
+        headers.insert(
+            "x-wyrd-access-token",
+            "Bearer the.wyrd.session".parse().unwrap(),
+        );
+
+        let extracted = extract_platform_token(&headers).expect("the Wyrd header is read");
+
+        assert_eq!(extracted.expose_secret(), "the.wyrd.session");
+    }
+
+    /// An `Authorization` header alone authenticates nothing.
+    #[test]
+    fn authorization_alone_yields_no_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            "Bearer a.platform.session".parse().unwrap(),
+        );
+
+        assert!(
+            extract_platform_token(&headers).is_none(),
+            "a token on Authorization must not authenticate a platform request"
+        );
     }
 
     /// A platform caller has no tenant to offer any handler, so a platform

@@ -2,12 +2,14 @@
 
 use std::sync::Arc;
 
+use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderName};
 use base64::Engine;
 use secrecy::{ExposeSecret, SecretString};
 use wyrd_auth_verify::AccessTokenClaims;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::request_id::RequestId;
 
 use crate::http::error::WyrdErrorResponse;
 
@@ -97,4 +99,24 @@ pub(crate) async fn verify_authenticated_principal(
         .await
         .map_err(WyrdErrorResponse::from)?;
     Ok(super::AuthenticatedPrincipal::from_verified(verified))
+}
+
+/// Read the per-request [`RequestId`] the request-id layer inserted.
+///
+/// Every authenticated extractor needs the correlator for audit and for the
+/// response header, and every one of them fails the same way when the layer is
+/// absent: the request reached a handler without passing through the layer that
+/// mints it, which is a server wiring fault rather than a caller error. Owning
+/// that read once is what keeps the tenant and platform extractors from
+/// disagreeing about how it is reported.
+///
+/// # Errors
+/// Returns [`WyrdError::Internal`] when the extension is missing.
+pub(crate) fn request_id(parts: &Parts) -> Result<RequestId, WyrdErrorResponse> {
+    parts.extensions.get::<RequestId>().cloned().ok_or_else(|| {
+        WyrdErrorResponse::from(WyrdError::Internal {
+            message: "missing RequestId extension".to_owned(),
+            details: serde_json::json!({ "extension": "RequestId" }),
+        })
+    })
 }

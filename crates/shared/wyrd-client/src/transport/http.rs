@@ -204,7 +204,7 @@ impl HttpTransport {
         body: reqwest::Body,
     ) -> Result<reqwest::Response, WyrdError> {
         let url = self.authenticated_url(path)?;
-        let bearer = self.auth.bearer().await.map_err(auth_to_wyrd)?;
+        let bearer = self.auth.bearer().await.map_err(AuthError::into_wyrd)?;
         let request = self
             .client
             .request(method, url)
@@ -280,7 +280,7 @@ impl HttpTransport {
         path: &str,
     ) -> Result<reqwest::Response, WyrdError> {
         let url = self.authenticated_url(path)?;
-        let bearer = self.auth.bearer().await.map_err(auth_to_wyrd)?;
+        let bearer = self.auth.bearer().await.map_err(AuthError::into_wyrd)?;
         let response = self
             .client
             .request(method, url)
@@ -378,7 +378,7 @@ impl HttpTransport {
         S: Serialize,
     {
         let url = self.authenticated_url(path)?;
-        let bearer = self.auth.bearer().await.map_err(auth_to_wyrd)?;
+        let bearer = self.auth.bearer().await.map_err(AuthError::into_wyrd)?;
         let payload = serde_json::to_vec(body).map_err(|error| WyrdError::Internal {
             message: format!("request serialization failed: {error}"),
             details: serde_json::json!({}),
@@ -600,7 +600,7 @@ impl HttpTransport {
         let mut auth_retried = false;
 
         loop {
-            let bearer = self.auth.bearer().await.map_err(auth_to_wyrd)?;
+            let bearer = self.auth.bearer().await.map_err(AuthError::into_wyrd)?;
 
             let mut req = self
                 .client
@@ -730,18 +730,6 @@ fn body_read_err(err: reqwest::Error) -> WyrdError {
     WyrdError::Internal {
         message: format!("transport error reading response body: {err}"),
         details: serde_json::json!({"transport": "http"}),
-    }
-}
-
-/// Convert an [`AuthError`] to a [`WyrdError`].
-///
-/// Server-reported auth failures pass through; client-local auth failures
-/// (transport down during token exchange) keep their `WYRD_CLIENT_*` identity
-/// through the shared client-error projection.
-fn auth_to_wyrd(err: AuthError) -> WyrdError {
-    match err {
-        AuthError::Server(wyrd) => wyrd,
-        AuthError::Client(client_err) => client_err.into(),
     }
 }
 

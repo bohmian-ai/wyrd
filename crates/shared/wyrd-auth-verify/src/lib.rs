@@ -391,6 +391,39 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> TokenVe
         self
     }
 
+    /// Resolve the deployment key that signed one compact token.
+    ///
+    /// Reads the `kid` from the token's unverified header and looks it up in
+    /// this verifier's configured key set, recording the key id on the current
+    /// span so a verification failure names the key it was attempted against.
+    /// Nothing about the token is trusted beyond the key id, which is a lookup
+    /// key and not an assertion: the signature check the caller performs next is
+    /// what makes the header credible.
+    ///
+    /// Both internal verify paths — the tenant access token and the platform
+    /// session — resolve their key here so one deployment cannot end up with two
+    /// notions of which keys it trusts. `verify_external_against` is deliberately
+    /// not a caller: it resolves against a tenant's external JWKS, which is a
+    /// different trust anchor.
+    ///
+    /// # Errors
+    /// Returns [`AuthError::InvalidToken`] when the token is not a decodable
+    /// JWT, carries no `kid`, carries a malformed one, or names a key this
+    /// deployment does not hold.
+    fn signing_key(&self, token: &str) -> Result<Arc<DecodingKey>, AuthError> {
+        let header = decode_header(token).map_err(AuthError::from)?;
+        let kid = header
+            .kid
+            .ok_or(AuthError::InvalidToken)
+            .and_then(|kid| Kid::new(kid).map_err(|_| AuthError::InvalidToken))?;
+        tracing::Span::current().record("kid", tracing::field::display(&kid));
+        Ok(Arc::clone(
+            self.decoding_keys
+                .get(&kid)
+                .ok_or(AuthError::InvalidToken)?,
+        ))
+    }
+
     /// Verify a platform-scope access token.
     ///
     /// Shares this verifier's key set and issuer policy with the tenant path so
@@ -408,16 +441,7 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> TokenVe
     /// signature, a wrong issuer, or a non-platform scope marker, and
     /// [`AuthError::TokenExpired`] for an expired token.
     pub fn verify_platform(&self, token: &str) -> Result<PlatformAccessTokenClaims, AuthError> {
-        let header = decode_header(token).map_err(AuthError::from)?;
-        let kid = header
-            .kid
-            .ok_or(AuthError::InvalidToken)
-            .and_then(|kid| Kid::new(kid).map_err(|_| AuthError::InvalidToken))?;
-        let key = Arc::clone(
-            self.decoding_keys
-                .get(&kid)
-                .ok_or(AuthError::InvalidToken)?,
-        );
+        let key = self.signing_key(token)?;
         let claims: PlatformAccessTokenClaims =
             verify_eddsa(token, &key, Some(self.issuer.as_str()))?;
         if claims.scope != PLATFORM_TOKEN_SCOPE {
@@ -485,17 +509,7 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> TokenVe
         let result = self
             .cache
             .try_get_with(hash, async {
-                let header = decode_header(token).map_err(AuthError::from)?;
-                let kid = header
-                    .kid
-                    .ok_or(AuthError::InvalidToken)
-                    .and_then(|kid| Kid::new(kid).map_err(|_| AuthError::InvalidToken))?;
-                tracing::Span::current().record("kid", tracing::field::display(&kid));
-                let key = Arc::clone(
-                    self.decoding_keys
-                        .get(&kid)
-                        .ok_or(AuthError::InvalidToken)?,
-                );
+                let key = self.signing_key(token)?;
 
                 let claims = verify_access_token(token, &key, self.validation())?;
                 tracing::Span::current().record("principal_id", claims.principal.id.to_string());

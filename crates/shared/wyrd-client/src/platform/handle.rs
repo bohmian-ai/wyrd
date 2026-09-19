@@ -2,21 +2,25 @@
 
 use std::sync::Arc;
 
-use reqwest::{Method, StatusCode};
+use reqwest::Method;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
     ConfigurePlatformOidcRequest, CreateTenantRequest, CreateTenantResponse,
-    PlatformOidcConnectionView, PlatformPrincipalListResponse, PlatformTokenRequest,
-    PlatformTokenResponse, PrincipalId, ProvisionedTenantAdmin, RecoverTenantAdminRequest,
-    RegisterPlatformAdminRequest, RegisterPlatformAdminResponse, SecretBearer,
-    SetPlatformPrincipalStatusRequest,
+    PlatformOidcConnectionView, PlatformPrincipalListResponse, PlatformTokenRequest, PrincipalId,
+    ProvisionedTenantAdmin, RecoverTenantAdminRequest, RegisterPlatformAdminRequest,
+    RegisterPlatformAdminResponse, SecretBearer, SetPlatformPrincipalStatusRequest,
 };
 use wyrd_spec::error::WyrdError;
 
-use crate::error::{WyrdClientError, from_problem_json};
+use crate::auth::{AuthMiddleware, TokenExchange};
+use crate::client::WyrdClient;
+use crate::config::ClientConfig;
+use crate::transport::config::HttpConfig;
+use crate::transport::credential::ResolvedCredential;
+use crate::transport::http::HttpTransport;
 
 /// A short-lived platform session token.
 ///
@@ -37,60 +41,61 @@ impl std::fmt::Debug for PlatformSession {
 
 /// Platform control-plane client.
 ///
-/// Owns the server address and one session. Cheap to clone; every clone
-/// presents the same session, so they expire together.
-#[derive(Clone)]
+/// Owns one authenticated client bound to one session. Cheap to clone; every
+/// clone presents the same session, so they expire together.
+#[derive(Clone, Debug)]
 pub struct Platform {
-    /// Server base URL, without a trailing slash.
-    base_url: Arc<str>,
-    /// Shared HTTP pool.
-    http: reqwest::Client,
-    /// The session every request after the exchange presents.
-    session: PlatformSession,
-}
-
-impl std::fmt::Debug for Platform {
-    /// Prints the handle without its session.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Platform")
-            .field("base_url", &self.base_url)
-            .finish_non_exhaustive()
-    }
+    /// Shared client whose credential is the platform session, so every request
+    /// travels the same transport, retry policy, and error mapping as any other
+    /// Wyrd call.
+    client: Arc<WyrdClient>,
 }
 
 impl Platform {
     /// Exchange a platform credential for a session and bind a client to it.
     ///
-    /// This is the only call that reads credential material. Everything after
-    /// it presents the returned session, so no later request handles a secret —
-    /// the same shape the server's own surface enforces.
+    /// This is the only call that reads credential material. The session it
+    /// returns becomes the client's bearer, so every later request presents it
+    /// on `X-Wyrd-Access-Token` like any other Wyrd token — the plane is
+    /// separated by the session's scope marker and by the extractor its routes
+    /// declare, never by which header carried the token.
     ///
     /// # Errors
     /// Returns [`WyrdError::Unauthenticated`] for every credential rejection,
     /// indistinguishably, and a transport error when the server cannot be
     /// reached.
     pub async fn connect(base_url: &str, credential: &SecretString) -> Result<Self, WyrdError> {
-        let base_url: Arc<str> = Arc::from(base_url.trim_end_matches('/'));
-        let http = reqwest::Client::new();
-        let request = PlatformTokenRequest {
-            credential: SecretBearer::new(credential.expose_secret().to_owned()),
+        let config = ClientConfig {
+            http: HttpConfig {
+                base_url: base_url.trim_end_matches('/').to_owned(),
+                ..HttpConfig::default()
+            },
+            ..ClientConfig::default()
         };
-        let response: PlatformTokenResponse = send(
-            &http,
-            &base_url,
-            Method::POST,
-            "/auth/platform/token",
-            None,
-            Some(&request),
-        )
-        .await?;
+        let exchange = TokenExchange::new(&config.http.base_url, config.http.timeout_ms)
+            .map_err(WyrdError::from)?;
+        let response = exchange
+            .platform_session(&PlatformTokenRequest {
+                credential: SecretBearer::new(credential.expose_secret().to_owned()),
+            })
+            .await
+            .map_err(crate::auth::AuthError::into_wyrd)?;
+        let session = PlatformSession(SecretString::from(
+            response.access_token.expose().to_owned(),
+        ));
+        Self::with_session(config, session)
+    }
 
+    /// Bind a client to an already minted session.
+    ///
+    /// # Errors
+    /// Returns a transport error when the HTTP client cannot be assembled.
+    fn with_session(config: ClientConfig, session: PlatformSession) -> Result<Self, WyrdError> {
+        let auth = AuthMiddleware::new(&config, ResolvedCredential::BearerToken(session.0.clone()))
+            .map_err(WyrdError::from)?;
+        let http = HttpTransport::new(&config.http, Arc::clone(&auth)).map_err(WyrdError::from)?;
         Ok(Self {
-            base_url,
-            http,
-            session: PlatformSession(SecretString::from(
-                response.access_token.expose().to_owned(),
-            )),
+            client: Arc::new(WyrdClient::from_parts(auth, http, config.grpc)),
         })
     }
 
@@ -206,18 +211,13 @@ impl Platform {
         S: Serialize,
         D: DeserializeOwned,
     {
-        send(
-            &self.http,
-            &self.base_url,
-            method,
-            path,
-            Some(&self.session),
-            body,
-        )
-        .await
+        self.client.request_json(method, path, body).await
     }
 
     /// Send one authenticated platform request expecting no body.
+    ///
+    /// The shared transport decodes an empty `2xx` body as JSON `null`, so the
+    /// no-content routes need no second code path — only a unit target.
     ///
     /// # Errors
     /// Returns the server's stable Wyrd error, or a transport error.
@@ -230,105 +230,6 @@ impl Platform {
     where
         S: Serialize,
     {
-        let response = dispatch(
-            &self.http,
-            &self.base_url,
-            method,
-            path,
-            Some(&self.session),
-            body,
-        )
-        .await?;
-        if response.status().is_success() {
-            Ok(())
-        } else {
-            Err(error_from(response).await)
-        }
-    }
-}
-
-/// Send a request and decode its JSON body.
-///
-/// # Errors
-/// Returns the server's stable Wyrd error when the status is not a success, and
-/// a transport error when the request cannot be sent or decoded.
-async fn send<S, D>(
-    http: &reqwest::Client,
-    base_url: &str,
-    method: Method,
-    path: &str,
-    session: Option<&PlatformSession>,
-    body: Option<&S>,
-) -> Result<D, WyrdError>
-where
-    S: Serialize,
-    D: DeserializeOwned,
-{
-    let response = dispatch(http, base_url, method, path, session, body).await?;
-    if !response.status().is_success() {
-        return Err(error_from(response).await);
-    }
-    response.json::<D>().await.map_err(|error| {
-        WyrdError::from(WyrdClientError::TransportDown {
-            message: format!("platform response could not be decoded: {error}"),
-            transport: "http".to_owned(),
-        })
-    })
-}
-
-/// Build and send one request, without interpreting its status.
-///
-/// The session travels on `Authorization: Bearer`, the header the platform
-/// plane reads. A tenant access token is never attached here, and the tenant
-/// header is never attached at all, so this client cannot present a tenant
-/// identity to a platform route.
-///
-/// # Errors
-/// Returns a transport error when the request cannot be built or sent.
-async fn dispatch<S>(
-    http: &reqwest::Client,
-    base_url: &str,
-    method: Method,
-    path: &str,
-    session: Option<&PlatformSession>,
-    body: Option<&S>,
-) -> Result<reqwest::Response, WyrdError>
-where
-    S: Serialize,
-{
-    let mut request = http.request(method, format!("{base_url}{path}"));
-    if let Some(session) = session {
-        request = request.header(
-            reqwest::header::AUTHORIZATION,
-            format!("Bearer {}", session.0.expose_secret()),
-        );
-    }
-    if let Some(body) = body {
-        request = request.json(body);
-    }
-    request.send().await.map_err(|error| {
-        WyrdError::from(WyrdClientError::TransportDown {
-            message: error.to_string(),
-            transport: "http".to_owned(),
-        })
-    })
-}
-
-/// Map a non-success response onto the stable catalog.
-///
-/// An undecodable error body still becomes a Wyrd error rather than a panic or
-/// a silent success: a failed request must never be reported as anything else.
-async fn error_from(response: reqwest::Response) -> WyrdError {
-    let status = response.status();
-    match response.json::<serde_json::Value>().await {
-        Ok(body) => from_problem_json(&body),
-        Err(_) if status == StatusCode::UNAUTHORIZED => WyrdError::Unauthenticated {
-            message: "invalid platform session".to_owned(),
-            details: serde_json::json!({ "plane": "platform" }),
-        },
-        Err(error) => WyrdError::from(WyrdClientError::TransportDown {
-            message: format!("platform error body could not be decoded: {error}"),
-            transport: "http".to_owned(),
-        }),
+        self.client.request_json::<S, ()>(method, path, body).await
     }
 }

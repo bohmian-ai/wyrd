@@ -19,11 +19,15 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use secrecy::{ExposeSecret, SecretString};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use uuid::Uuid;
-use wyrd_spec::auth::{SecretBearer, TokenRequest, TokenResponse};
+use wyrd_spec::auth::{
+    LoginInitResponse, PlatformTokenRequest, PlatformTokenResponse, SecretBearer, TokenRequest,
+    TokenResponse,
+};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::TenantSlug;
 
@@ -54,6 +58,24 @@ pub enum AuthError {
     Server(WyrdError),
 }
 
+impl AuthError {
+    /// Project this failure onto the stable Wyrd catalog.
+    ///
+    /// A server-reported failure already *is* a catalog error and passes
+    /// through; a client-local one keeps its `WYRD_CLIENT_*` identity through
+    /// the shared client-error projection. Every caller that surfaces an auth
+    /// failure to an application — the HTTP transport, the platform handle —
+    /// maps it here, so a rejected credential reads the same whichever layer
+    /// noticed it.
+    #[must_use]
+    pub fn into_wyrd(self) -> WyrdError {
+        match self {
+            Self::Server(wyrd) => wyrd,
+            Self::Client(client_error) => client_error.into(),
+        }
+    }
+}
+
 /// One cached access token plus its expiry. The refresh token is never stored.
 #[derive(Debug, Clone)]
 struct CachedToken {
@@ -76,11 +98,170 @@ struct DiskTokenRecord {
     expires_at: DateTime<Utc>,
 }
 
+/// The unauthenticated `/auth` surface of one Wyrd deployment.
+///
+/// Every grant that *mints* a Wyrd credential is presented without one: the API
+/// key and workload exchanges behind [`AuthMiddleware`], an interactive OIDC
+/// login, a refresh-token rotation, and the platform credential exchange all
+/// POST to a route that no access token could reach. This type owns that one
+/// wire path — the URL join, the POST, the `application/problem+json` mapping,
+/// and the typed decode — so those callers do not each grow their own HTTP
+/// client and their own idea of what a rejection looks like.
+///
+/// It is separate from [`crate::transport::HttpTransport`] because that layer
+/// injects a bearer on every request, and none of these calls has one yet.
+#[derive(Clone)]
+pub struct TokenExchange {
+    /// Deployment base URL, without a trailing slash.
+    base_url: String,
+    /// Shared connection pool for the exchange routes.
+    http: reqwest::Client,
+}
+
+impl std::fmt::Debug for TokenExchange {
+    /// Prints the target without the pool, which carries no secret but no
+    /// useful detail either.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenExchange")
+            .field("base_url", &self.base_url)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TokenExchange {
+    /// Bind an exchange to one deployment.
+    ///
+    /// Installs Wyrd's process TLS provider first, for the same reason the
+    /// authenticated transport does: the provider is process-global and the
+    /// first client to build must be the one that sets it.
+    ///
+    /// # Errors
+    /// Returns [`WyrdClientError::TransportDown`] when another Rustls provider
+    /// already owns the process or the HTTP client cannot be built.
+    pub fn new(base_url: &str, timeout_ms: u64) -> Result<Self, WyrdClientError> {
+        wyrd_tls::install_crypto_provider().map_err(|error| WyrdClientError::TransportDown {
+            transport: "http".to_owned(),
+            message: error.to_string(),
+        })?;
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_millis(timeout_ms))
+            .build()
+            .map_err(|err| WyrdClientError::TransportDown {
+                transport: "http".to_owned(),
+                message: format!("failed to build HTTP client: {err}"),
+            })?;
+        Ok(Self {
+            base_url: base_url.trim_end_matches('/').to_owned(),
+            http,
+        })
+    }
+
+    /// The normalized deployment base URL this exchange targets.
+    #[must_use]
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// Exchange one tenant grant at `/auth/token`.
+    ///
+    /// Returns the server's response whole, refresh token included. The
+    /// middleware drops the refresh token because it caches nothing durable; an
+    /// interactive caller that must show the operator their new refresh token
+    /// needs it, which is why the discarding happens in the caller and not here.
+    ///
+    /// # Errors
+    /// Returns [`AuthError::Server`] with the stable Wyrd error for a rejected
+    /// grant, and [`AuthError::Client`] when the server cannot be reached or its
+    /// body cannot be decoded.
+    pub async fn exchange(&self, request: &TokenRequest) -> Result<TokenResponse, AuthError> {
+        self.post("/auth/token", request).await
+    }
+
+    /// Exchange a platform credential for a short-lived platform session.
+    ///
+    /// The one platform call that reads credential material; every later
+    /// platform request presents the returned session on the canonical header.
+    ///
+    /// # Errors
+    /// Returns [`AuthError::Server`] with the plane's indistinguishable
+    /// unauthenticated error for every credential rejection, and
+    /// [`AuthError::Client`] for a transport or decode failure.
+    pub async fn platform_session(
+        &self,
+        request: &PlatformTokenRequest,
+    ) -> Result<PlatformTokenResponse, AuthError> {
+        self.post("/auth/platform/token", request).await
+    }
+
+    /// Begin an interactive login against one trusted issuer.
+    ///
+    /// Returns the provider authorization URL and the state the callback must
+    /// echo. Nothing is authenticated yet: this is the call that produces the
+    /// code a later [`Self::exchange`] trades for a token.
+    ///
+    /// # Errors
+    /// Returns [`AuthError::Server`] when the issuer is not trusted by this
+    /// deployment, and [`AuthError::Client`] for a transport or decode failure.
+    pub async fn begin_login(&self, issuer: &str) -> Result<LoginInitResponse, AuthError> {
+        let url = format!("{}/auth/login", self.base_url);
+        let response = self
+            .http
+            .get(&url)
+            .query(&[("issuer", issuer)])
+            .header(reqwest::header::ACCEPT, "application/json")
+            .send()
+            .await
+            .map_err(transport_down)?;
+        Self::decode(response).await
+    }
+
+    /// POST a JSON body to one unauthenticated `/auth` path and decode the reply.
+    ///
+    /// # Errors
+    /// Returns [`AuthError::Server`] for a non-success status and
+    /// [`AuthError::Client`] for a transport or decode failure.
+    async fn post<S, D>(&self, path: &str, body: &S) -> Result<D, AuthError>
+    where
+        S: Serialize,
+        D: DeserializeOwned,
+    {
+        let url = format!("{}{path}", self.base_url);
+        let response = self
+            .http
+            .post(&url)
+            .json(body)
+            .send()
+            .await
+            .map_err(transport_down)?;
+        Self::decode(response).await
+    }
+
+    /// Map one response onto the catalog or the typed success body.
+    ///
+    /// A non-success status is read as `application/problem+json` so every
+    /// caller reports the server's own stable code rather than inventing a
+    /// status-shaped error of its own.
+    ///
+    /// # Errors
+    /// Returns [`AuthError::Server`] for a non-success status and
+    /// [`AuthError::Client`] when the body cannot be read or decoded.
+    async fn decode<D: DeserializeOwned>(response: reqwest::Response) -> Result<D, AuthError> {
+        if !response.status().is_success() {
+            let body = response
+                .json::<serde_json::Value>()
+                .await
+                .map_err(transport_down)?;
+            return Err(AuthError::Server(from_problem_json(&body)));
+        }
+        response.json::<D>().await.map_err(transport_down)
+    }
+}
+
 /// Single, `Arc`-shared auth path: token exchange, cache, and refresh.
 pub struct AuthMiddleware {
     credential: ResolvedCredential,
-    http_base_url: String,
-    http_client: reqwest::Client,
+    /// The unauthenticated `/auth` surface this middleware exchanges against.
+    exchange: TokenExchange,
     cache: Mutex<Option<CachedToken>>,
     cache_mode: TokenCacheMode,
     /// Resolved on-disk token-cache path, computed once at construction in
@@ -97,7 +278,7 @@ impl std::fmt::Debug for AuthMiddleware {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthMiddleware")
             .field("credential", &self.credential)
-            .field("http_base_url", &self.http_base_url)
+            .field("http_base_url", &self.exchange.base_url)
             .field("cache_mode", &self.cache_mode)
             .finish_non_exhaustive()
     }
@@ -141,24 +322,13 @@ impl AuthMiddleware {
         credential: ResolvedCredential,
         cache_path: Option<PathBuf>,
     ) -> Result<Arc<Self>, WyrdClientError> {
-        wyrd_tls::install_crypto_provider().map_err(|error| WyrdClientError::TransportDown {
-            transport: "http".to_owned(),
-            message: error.to_string(),
-        })?;
-        let http_client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(config.http.timeout_ms))
-            .build()
-            .map_err(|err| WyrdClientError::TransportDown {
-                transport: "http".to_owned(),
-                message: format!("failed to build HTTP client: {err}"),
-            })?;
+        let exchange = TokenExchange::new(&config.http.base_url, config.http.timeout_ms)?;
 
         let initial = cache_path.as_deref().and_then(load_disk_record);
 
         Ok(Arc::new(Self {
             credential,
-            http_base_url: config.http.base_url.clone(),
-            http_client,
+            exchange,
             cache: Mutex::new(initial),
             cache_mode: config.token_cache.clone(),
             cache_path,
@@ -198,7 +368,7 @@ impl AuthMiddleware {
     /// requests actually reach.
     #[must_use]
     pub fn base_url(&self) -> &str {
-        &self.http_base_url
+        self.exchange.base_url()
     }
 
     /// Return the current access token, exchanging or refreshing as needed.
@@ -353,27 +523,7 @@ impl AuthMiddleware {
     /// [`from_problem_json`] into [`AuthError::Server`], and decode the success
     /// body into a [`CachedToken`]. The shared POST/decode tail of every grant.
     async fn post_token_request(&self, request: TokenRequest) -> Result<CachedToken, AuthError> {
-        let url = format!("{}/auth/token", self.http_base_url.trim_end_matches('/'));
-        let response = self
-            .http_client
-            .post(&url)
-            .json(&request)
-            .send()
-            .await
-            .map_err(transport_down)?;
-
-        if !response.status().is_success() {
-            let body = response
-                .json::<serde_json::Value>()
-                .await
-                .map_err(transport_down)?;
-            return Err(AuthError::Server(from_problem_json(&body)));
-        }
-
-        let token = response
-            .json::<TokenResponse>()
-            .await
-            .map_err(transport_down)?;
+        let token = self.exchange.exchange(&request).await?;
         self.warn_if_short_ttl(token.expires_at);
         // `token.refresh_token` is intentionally dropped here: never cached,
         // never written to disk. The durable secret is re-exchanged instead.

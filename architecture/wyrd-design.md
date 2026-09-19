@@ -146,10 +146,16 @@ drift, not permission for code and documentation to diverge.
     tenant_id, roles, effective_permissions }`. `PrincipalId` is a `Uuid`
     newtype; no string-prefix encoding (no `user:`, `sa:`, `agent:`) —
     discrimination lives on `PrincipalKind`. `PrincipalKind` is closed:
-    `User`, `Service { card_ref }`, `Agent { card_ref }`. Service and Agent
-    are deployable, card-bound, non-human principals; their JWT projection also
-    carries a `card_ref_scope` authorization set derived at mint time. User is
-    the marker for human identity. `wyrd apply -f service.yaml` (or an Agent card) creates
+    `PlatformAdmin`, `TenantAdmin`, `User`, `Service { card_ref }`,
+    `Agent { card_ref }`, `System`. A `PlatformAdmin` principal has no tenant;
+    every other kind has exactly one. Card binding is a property of a machine
+    principal, not a precondition for being one: Service and Agent principals
+    are card-bound and their JWT projection carries a `card_ref_scope`
+    authorization set derived at mint time, while a tenant administrative or
+    tenant-created automation principal is representable with no Card. User is
+    the marker for human identity. System is an internal tenant machine
+    principal with no Card or public credential lifecycle. Platform authority
+    is a grant held at platform scope, not a property of a kind. `wyrd apply -f service.yaml` (or an Agent card) creates
     or updates the principal row idempotently, keyed on
     `(tenant_id, card_kind, card_uid)`; re-apply preserves the same
     `principal_id`. No secret is returned. Credentials are issued out-of-band
@@ -453,11 +459,13 @@ Closed enums:
 
 #### Principal model
 
-Wyrd principals are UUID-backed runtime identities for `User`, `Service`,
-and `Agent` kinds. `Service` and `Agent` principals are card-bound: each
-carries a `card_ref` discriminated on `PrincipalKind`, and its JWT carries a
-mint-time `card_ref_scope` derived from the transitive card-ref graph rooted at
-that card. `wyrd apply` for a Service or Agent card creates or updates the
+Wyrd principals are UUID-backed runtime identities that exist independently of
+any credential: issuing, rotating, revoking, or losing a credential never
+creates, destroys, or alters a principal or its role grants. `Service` and
+`Agent` principals are card-bound — each carries a `card_ref` discriminated on
+`PrincipalKind`, and its JWT carries a mint-time `card_ref_scope` derived from
+the transitive card-ref graph rooted at that card — but the administrative and
+automation principals a tenant creates for itself hold no Card at all. `wyrd apply` for a Service or Agent card creates or updates the
 principal row idempotently (keyed on `(tenant_id, card_kind, card_uid)`);
 re-apply preserves the same
 `principal_id`. No secret is returned. The declarative and credential

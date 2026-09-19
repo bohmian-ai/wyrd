@@ -11453,6 +11453,7 @@ dependencies = [
  "vala-eval",
  "wiremock",
  "workspace-hack",
+ "wyrd-auth-verify",
  "wyrd-client",
  "wyrd-dev-fixtures",
  "wyrd-error-derive",

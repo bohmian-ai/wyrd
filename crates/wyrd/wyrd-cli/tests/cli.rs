@@ -8,5 +8,7 @@ mod eval_server_protocol;
 mod eval_support;
 #[path = "loader.rs"]
 mod loader;
+#[path = "principal_journey.rs"]
+mod principal_journey;
 #[path = "query_server_journey.rs"]
 mod query_server_journey;

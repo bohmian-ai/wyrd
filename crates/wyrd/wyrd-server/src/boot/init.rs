@@ -42,7 +42,12 @@ pub enum InitError {
     Store(#[from] SqlError),
 }
 
-/// The authority a freshly initialized administrative root holds.
+/// The fixed authority every platform administrator holds.
+///
+/// One set, not one per administrator: platform authority is not editable, so
+/// the root established at initialization and a human registered against the
+/// OIDC connection later hold exactly this and are distinguishable only by how
+/// they authenticate.
 ///
 /// Narrow on purpose: the platform plane manages tenant lifecycle, recovers
 /// tenant administration, and configures who may sign in to administer the
@@ -54,7 +59,7 @@ pub enum InitError {
 /// deployment has: without it, nobody could ever configure the OIDC connection
 /// or register the first human administrator, and federated login would be
 /// unreachable by construction.
-fn platform_root_grant() -> PermissionSet {
+pub(crate) fn platform_administrator_grant() -> PermissionSet {
     let mut grant = PermissionSet::new();
     grant.insert(Permission::tenant_create());
     grant.insert(Permission::tenant_read());
@@ -120,7 +125,7 @@ pub async fn initialize_platform_root(pool: &OperatorPool) -> Result<SecretStrin
         }
     }
 
-    let grant = serde_json::to_value(platform_root_grant().iter().collect::<Vec<_>>())
+    let grant = serde_json::to_value(platform_administrator_grant().iter().collect::<Vec<_>>())
         .expect("permission set serializes to JSON");
     set_platform_grant_tx(&mut tx, principal_id, &grant).await?;
     insert_platform_credential_tx(
@@ -139,14 +144,14 @@ pub async fn initialize_platform_root(pool: &OperatorPool) -> Result<SecretStrin
 
 #[cfg(test)]
 mod tests {
-    use super::platform_root_grant;
+    use super::platform_administrator_grant;
     use wyrd_runtime::Permission;
 
     /// The administrative root can manage tenant lifecycle and recover tenant
     /// administration, and nothing inside a tenant.
     #[test]
     fn the_root_grant_covers_the_platform_plane_only() {
-        let grant = platform_root_grant();
+        let grant = platform_administrator_grant();
 
         for required in [
             Permission::tenant_create(),

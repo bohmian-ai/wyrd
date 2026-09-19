@@ -38,6 +38,9 @@ use wyrd_sql::queries::platform::principals::{
 use wyrd_sql::{OperatorPool, SqlError};
 
 use crate::components::auth::PlatformCaller;
+use wyrd_sql::queries::platform::principal_grants::set_platform_grant_tx;
+
+use crate::boot::init::platform_administrator_grant;
 use crate::http::error::{WyrdErrorResponse, internal_failure};
 use crate::state::AppState;
 
@@ -384,6 +387,17 @@ async fn register_admin(
     )
     .await
     .map_err(taken_or_store)?;
+
+    // Authority comes with registration, in the same transaction. A registered
+    // human with no grant can complete federated login and then call nothing:
+    // an absent grant denies every platform operation, so splitting this out
+    // would ship an administrator who is not one.
+    let grant = serde_json::to_value(platform_administrator_grant().iter().collect::<Vec<_>>())
+        .expect("permission set serializes to JSON");
+    set_platform_grant_tx(decision.transaction(), principal_id, &grant)
+        .await
+        .map_err(store_error)?;
+
     decision.commit().await.map_err(|error| {
         WyrdErrorResponse::from(internal_failure(
             "platform administrator registration could not be committed",

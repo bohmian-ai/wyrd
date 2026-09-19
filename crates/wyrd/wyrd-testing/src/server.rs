@@ -2206,6 +2206,30 @@ impl WyrdTestServer {
             .map_err(|error| WyrdTestServerError::Io(error.to_string()))
     }
 
+    /// Mint the session a registered administrator gets after federated login.
+    ///
+    /// Stands in for the provider round trip, not for anything the server
+    /// decides: this is the same issuance the callback performs once a provider
+    /// token has been verified and resolved to a pre-registered principal, so a
+    /// journey can exercise what that administrator may then do without a live
+    /// identity provider in the lane.
+    ///
+    /// # Errors
+    /// Returns an error when the principal is unknown or not active, or when
+    /// the session cannot be signed.
+    pub async fn federated_platform_session(
+        &self,
+        principal_id: uuid::Uuid,
+    ) -> Result<secrecy::SecretString, WyrdTestServerError> {
+        wyrd_auth::platform_sessions::PlatformSessions::new(
+            self.operator_pool(),
+            std::sync::Arc::clone(&self.inner.issuing_key),
+        )
+        .issue_federated(principal_id)
+        .await
+        .map_err(|error| WyrdTestServerError::Auth(error.to_string()))
+    }
+
     /// Return a clone of the app Postgres pool for direct SQL in tests.
     #[must_use]
     pub fn app_pool(&self) -> sqlx::PgPool {

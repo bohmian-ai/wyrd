@@ -1008,6 +1008,60 @@ async fn an_operator_configures_and_removes_federated_platform_sign_in() {
         "one matching claim registers at most one administrator"
     );
 
+    // Registration is what confers authority, so the registered human can
+    // administer the platform as soon as a provider verifies them — not after
+    // some further grant step that does not exist.
+    let registered_id: uuid::Uuid = registered["principal_id"]
+        .as_str()
+        .expect("principal id")
+        .parse()
+        .expect("principal id is a UUID");
+    let human = srv
+        .federated_platform_session(registered_id)
+        .await
+        .expect("a verified administrator takes a session");
+    let human = secrecy::ExposeSecret::expose_secret(&human).to_owned();
+    let resp = srv
+        .oneshot(platform_post(
+            "/platform/tenants",
+            &human,
+            json!({ "slug": "human-provisioned", "display_name": "Human" }),
+        ))
+        .await
+        .expect("tenant route responds");
+    let status = resp.status();
+    let provisioned = body_json(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the registered administrator holds the fixed platform grant: {provisioned}"
+    );
+
+    // And that authority is the platform's alone: the tenant it just created
+    // cannot register a platform administrator or hand one a grant.
+    let tenant_admin = tenant_token(
+        &srv,
+        provisioned["admin"]["credential"]
+            .as_str()
+            .expect("admin credential"),
+    )
+    .await
+    .expect("the tenant administrator authenticates");
+    let resp = srv
+        .oneshot(platform_request(
+            Method::POST,
+            "/platform/admins",
+            &tenant_admin,
+            Some(json!({ "name": "escalation", "match_claim": "attacker@example.com" })),
+        ))
+        .await
+        .expect("register route responds");
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "tenant authority never reaches the platform plane"
+    );
+
     let resp = srv
         .oneshot(platform_request(
             Method::DELETE,

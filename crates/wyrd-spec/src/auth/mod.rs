@@ -26,10 +26,10 @@ pub use permission_scope::{
     PermissionScopeError,
 };
 pub use platform_identity::{
-    ConfigurePlatformOidcRequest, PlatformCallbackRequest, PlatformClientAuth,
-    PlatformLoginRequest, PlatformOidcConnectionView, PlatformPrincipalListResponse,
-    PlatformPrincipalSummary, RegisterPlatformAdminRequest, RegisterPlatformAdminResponse,
-    SetPlatformPrincipalStatusRequest,
+    ConfigurePlatformOidcRequest, IssuePlatformCredentialRequest, PlatformCallbackRequest,
+    PlatformClientAuth, PlatformLoginRequest, PlatformOidcConnectionView,
+    PlatformPrincipalListResponse, PlatformPrincipalSummary, RegisterPlatformAdminRequest,
+    RegisterPlatformAdminResponse, SetPlatformPrincipalStatusRequest,
 };
 pub use principal_id::{PLATFORM_AUDIT_PRINCIPAL, PrincipalId};
 pub use principal_kind::PrincipalKindTag;

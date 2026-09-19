@@ -9,6 +9,7 @@ use serde::de::DeserializeOwned;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
     ConfigurePlatformOidcRequest, CreateTenantRequest, CreateTenantResponse,
+    CredentialListResponse, IssuePlatformCredentialRequest, IssuedCredential,
     PlatformOidcConnectionView, PlatformPrincipalListResponse, PlatformTokenRequest, PrincipalId,
     ProvisionedTenantAdmin, RecoverTenantAdminRequest, RegisterPlatformAdminRequest,
     RegisterPlatformAdminResponse, SecretBearer, SetPlatformPrincipalStatusRequest,
@@ -198,6 +199,68 @@ impl Platform {
             Method::PUT,
             &format!("/platform/admins/{principal_id}/status"),
             Some(&request),
+        )
+        .await
+    }
+
+    /// Mint a credential for an existing platform principal.
+    ///
+    /// The plaintext is in the response and nowhere else. Store it before
+    /// dropping the response: no later call can recover it.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the caller lacks platform credential
+    /// administration, the principal is unknown, or the write fails.
+    pub async fn issue_credential(
+        &self,
+        principal_id: &PrincipalId,
+        expires_in_days: Option<u32>,
+    ) -> Result<IssuedCredential, WyrdError> {
+        self.call(
+            Method::POST,
+            &format!("/platform/admins/{principal_id}/credentials"),
+            Some(&IssuePlatformCredentialRequest { expires_in_days }),
+        )
+        .await
+    }
+
+    /// List a platform principal's credential metadata, newest first.
+    ///
+    /// Never returns credential material; the listing exists so an operator can
+    /// see what is live, expired, or already retired before rotating.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the caller is unauthorized or the read fails.
+    pub async fn list_credentials(
+        &self,
+        principal_id: &PrincipalId,
+    ) -> Result<CredentialListResponse, WyrdError> {
+        self.call::<(), _>(
+            Method::GET,
+            &format!("/platform/admins/{principal_id}/credentials"),
+            None,
+        )
+        .await
+    }
+
+    /// Retire one of a platform principal's credentials.
+    ///
+    /// Takes effect on the next request: a platform session names the
+    /// credential that minted it, so the retired credential's live sessions
+    /// stop working immediately.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the caller is unauthorized, or the credential
+    /// is not this principal's or is already retired.
+    pub async fn revoke_credential(
+        &self,
+        principal_id: &PrincipalId,
+        credential_id: &str,
+    ) -> Result<(), WyrdError> {
+        self.call_no_content::<()>(
+            Method::DELETE,
+            &format!("/platform/admins/{principal_id}/credentials/{credential_id}"),
+            None,
         )
         .await
     }

@@ -67,6 +67,8 @@ pub(crate) fn platform_administrator_grant() -> PermissionSet {
     grant.insert(Permission::tenant_recover_admin());
     grant.insert(Permission::platform_identity_read());
     grant.insert(Permission::platform_identity_write());
+    grant.insert(Permission::platform_credential_read());
+    grant.insert(Permission::platform_credential_write());
     grant
 }
 

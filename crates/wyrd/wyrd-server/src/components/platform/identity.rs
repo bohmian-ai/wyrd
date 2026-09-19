@@ -92,7 +92,7 @@ pub fn platform_login_router() -> Router<AppState> {
 ///
 /// # Errors
 /// Returns an internal error when no operator connection is configured.
-fn operator(state: &AppState) -> Result<OperatorPool, WyrdErrorResponse> {
+pub(super) fn operator(state: &AppState) -> Result<OperatorPool, WyrdErrorResponse> {
     state.postgres.operator_pool().ok_or_else(|| {
         WyrdErrorResponse::from(WyrdError::Internal {
             message: "platform control plane is not configured".to_owned(),
@@ -111,7 +111,7 @@ fn operator(state: &AppState) -> Result<OperatorPool, WyrdErrorResponse> {
 /// Returns a permission error when the grant does not cover `required`, and an
 /// internal error when the decision cannot be recorded — in which case nothing
 /// is performed.
-async fn authorize(
+pub(super) async fn authorize(
     pool: &OperatorPool,
     caller: &PlatformCaller,
     required: &Permission,
@@ -120,7 +120,7 @@ async fn authorize(
     let decision = authz
         .authorize(&caller.context, required, caller.request_id.as_str(), None)
         .await
-        .map_err(platform_authz_error)?;
+        .map_err(|error| platform_authz_error(&error, required))?;
     decision.commit().await.map_err(|error| {
         WyrdErrorResponse::from(internal_failure(
             "platform authorization could not be committed",
@@ -354,7 +354,7 @@ async fn register_admin(
             None,
         )
         .await
-        .map_err(platform_authz_error)?;
+        .map_err(|error| platform_authz_error(&error, &Permission::platform_identity_write()))?;
 
     // Registering against no connection would create a principal that could
     // never sign in, so the connection is required first.
@@ -628,12 +628,12 @@ async fn complete_login(
 }
 
 /// Project a platform authorization failure onto the public catalog.
-fn platform_authz_error(error: PlatformAuthzError) -> WyrdErrorResponse {
+fn platform_authz_error(error: &PlatformAuthzError, required: &Permission) -> WyrdErrorResponse {
     match error {
         PlatformAuthzError::Denied { .. } => {
             WyrdErrorResponse::from(WyrdError::PermissionDeniedRbac {
-                message: "not authorized to administer platform identity".to_owned(),
-                details: serde_json::json!({ "permission": "platform_identity:write" }),
+                message: "not authorized to perform this platform operation".to_owned(),
+                details: serde_json::json!({ "permission": required.to_string() }),
             })
         }
         PlatformAuthzError::AuditUnavailable(reason) => WyrdErrorResponse::from(internal_failure(

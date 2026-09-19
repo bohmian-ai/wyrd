@@ -115,7 +115,10 @@ impl Modify for SecurityAddon {
         crate::components::platform::identity::list_platform_admins,
         crate::components::platform::identity::set_admin_status,
         crate::components::platform::identity::begin_login,
-        crate::components::platform::identity::complete_login
+        crate::components::platform::identity::complete_login,
+        crate::components::platform::credentials::issue_credential,
+        crate::components::platform::credentials::list_credentials,
+        crate::components::platform::credentials::revoke_credential
     ),
     components(schemas(
         BifrostQueryRequest,
@@ -136,7 +139,7 @@ impl Modify for SecurityAddon {
         ),
         (
             name = "Platform",
-            description = "Platform control plane: tenant lifecycle and platform identity"
+            description = "Platform control plane: tenant lifecycle, platform identity, and platform credentials"
         )
     )
 )]

@@ -107,6 +107,15 @@ pub enum Resource {
     /// grant and in audit separately from administering tenants. Holding it
     /// grants no access to any tenant's data.
     PlatformIdentity,
+    /// Platform-scope credentials: the secrets that authenticate a platform
+    /// principal to the control plane.
+    ///
+    /// Separate from [`Resource::PlatformIdentity`] because the two answer
+    /// different questions. Identity administration decides *who* the platform
+    /// recognizes; credential administration mints and retires the secrets that
+    /// prove it. An operator may need to rotate the deployment's root
+    /// credential without also being able to register new administrators.
+    PlatformCredentials,
     /// RFC 8693 token exchange and delegation.
     Delegation,
     /// Bifrost table definitions (DDL: create/list/describe).
@@ -204,6 +213,7 @@ impl Resource {
             Self::Users => "users",
             Self::Tenants => "tenants",
             Self::PlatformIdentity => "platform_identity",
+            Self::PlatformCredentials => "platform_credentials",
             Self::Delegation => "delegation",
             Self::BifrostTable => "bifrost_table",
             Self::BifrostRecord => "bifrost_record",
@@ -479,6 +489,34 @@ impl Permission {
     pub const fn platform_identity_write() -> Self {
         Self {
             resource: Resource::PlatformIdentity,
+            action: Action::Write,
+            scope: PermissionScope::All,
+        }
+    }
+
+    /// List the non-secret metadata of a platform principal's credentials.
+    ///
+    /// Listing never yields credential material; it exists so an operator can
+    /// see what is live, expired, or already retired before rotating.
+    #[must_use]
+    pub const fn platform_credential_read() -> Self {
+        Self {
+            resource: Resource::PlatformCredentials,
+            action: Action::Read,
+            scope: PermissionScope::All,
+        }
+    }
+
+    /// Issue and revoke platform credentials.
+    ///
+    /// One permission for both halves of rotation: an operator who can mint a
+    /// replacement must be able to retire what it replaces, and splitting them
+    /// would leave a superseded credential live because the second half was
+    /// separately granted.
+    #[must_use]
+    pub const fn platform_credential_write() -> Self {
+        Self {
+            resource: Resource::PlatformCredentials,
             action: Action::Write,
             scope: PermissionScope::All,
         }

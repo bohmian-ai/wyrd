@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 use crate::auth::AuthCommand;
 use crate::card::{ApplyArgs, DeleteArgs, GetArgs, LatestArgs, ListArgs, LoadArgs, PlanArgs};
 use crate::eval::run::EvalCommand;
+use crate::platform::PlatformCommand;
 use crate::principal::PrincipalCommand;
 use crate::query::QueryCommand;
 
@@ -44,6 +45,9 @@ impl Cli {
             Command::Eval(command) => crate::eval::run::dispatch(command)
                 .await
                 .map_err(Into::into),
+            Command::Platform(command) => {
+                crate::platform::dispatch(command).await.map_err(Into::into)
+            }
             Command::Principal(command) => crate::principal::dispatch(command)
                 .await
                 .map_err(Into::into),
@@ -77,6 +81,9 @@ pub enum Command {
     /// Run, manage, and compare evaluations.
     #[command(subcommand)]
     Eval(EvalCommand),
+    /// Administer the platform control plane (credentials).
+    #[command(subcommand)]
+    Platform(PlatformCommand),
     /// Manage Wyrd principals (revoke).
     #[command(subcommand)]
     Principal(PrincipalCommand),

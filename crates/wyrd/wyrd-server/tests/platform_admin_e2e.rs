@@ -1730,3 +1730,157 @@ async fn an_unrecordable_tenant_mutation_leaves_nothing_behind() {
     .expect("audit count reads");
     assert_eq!(audits, 0, "no allowance survives the refused mutation");
 }
+
+/// The deployment root is rotatable through Wyrd, with no outage and no SQL.
+///
+/// This is the journey the platform credential routes exist for. Until they
+/// shipped, a leaked root credential had no remedy inside the product: issuing
+/// was internal and revoking was reachable only from a test. The sequence an
+/// operator actually performs is issue → verify → revoke, in that order, and it
+/// has to hold end to end: the replacement must administer the platform before
+/// the original is retired, the listing must show both so the operator can see
+/// what they are retiring, and retiring the original must end its sessions
+/// while leaving the replacement's untouched.
+#[tokio::test]
+async fn an_operator_rotates_the_deployment_root_credential() {
+    if !e2e_enabled() {
+        return;
+    }
+    let srv = WyrdTestServer::start_in_process()
+        .await
+        .expect("server starts");
+    let root = initialize_platform_root(&srv.operator_pool())
+        .await
+        .expect("deployment initializes");
+    let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
+
+    let resp = srv
+        .oneshot(platform_request(
+            Method::GET,
+            "/platform/admins",
+            &session,
+            None,
+        ))
+        .await
+        .expect("listing responds");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let principal_id = body_json(resp).await["principals"][0]["principal_id"]
+        .as_str()
+        .expect("the deployment root is listed")
+        .to_owned();
+
+    let resp = srv
+        .oneshot(platform_post(
+            &format!("/platform/admins/{principal_id}/credentials"),
+            &session,
+            json!({ "expires_in_days": 30 }),
+        ))
+        .await
+        .expect("issue responds");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let issued = body_json(resp).await;
+    let replacement = issued["credential"]
+        .as_str()
+        .expect("the plaintext is returned once")
+        .to_owned();
+
+    // The replacement works before anything is retired, which is what makes the
+    // rotation outage-free rather than a window with no usable credential.
+    let rotated = platform_session(&srv, &replacement).await;
+    let resp = srv
+        .oneshot(platform_post(
+            "/platform/tenants",
+            &rotated,
+            json!({ "slug": "rotated-root", "display_name": "Rotated" }),
+        ))
+        .await
+        .expect("tenant route responds");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the replacement administers the platform before the original is retired"
+    );
+
+    let resp = srv
+        .oneshot(platform_request(
+            Method::GET,
+            &format!("/platform/admins/{principal_id}/credentials"),
+            &rotated,
+            None,
+        ))
+        .await
+        .expect("listing responds");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let listing = body_json(resp).await;
+    let credentials = listing["credentials"]
+        .as_array()
+        .expect("credentials are listed");
+    assert_eq!(
+        credentials.len(),
+        2,
+        "the operator sees the original and its replacement: {listing}"
+    );
+    assert!(
+        !listing.to_string().contains(&replacement),
+        "a listing never carries credential material"
+    );
+    let original = credentials
+        .iter()
+        .find(|credential| credential["id"] != issued["id"])
+        .expect("the original is still listed")["id"]
+        .as_str()
+        .expect("credential ids are strings")
+        .to_owned();
+
+    let resp = srv
+        .oneshot(platform_request(
+            Method::DELETE,
+            &format!("/platform/admins/{principal_id}/credentials/{original}"),
+            &rotated,
+            None,
+        ))
+        .await
+        .expect("revoke responds");
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let resp = srv
+        .oneshot(platform_post(
+            "/platform/tenants",
+            &session,
+            json!({ "slug": "after-rotation", "display_name": "After" }),
+        ))
+        .await
+        .expect("tenant route responds");
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "the retired credential's live session stops administering the platform"
+    );
+
+    let resp = srv
+        .oneshot(platform_post(
+            "/platform/tenants",
+            &rotated,
+            json!({ "slug": "still-administrable", "display_name": "Still" }),
+        ))
+        .await
+        .expect("tenant route responds");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "retiring the original leaves the replacement's session working"
+    );
+
+    // Replaying the revoke is refused rather than silently accepted, so an
+    // operator cannot mistake a no-op for a second retirement.
+    let resp = srv
+        .oneshot(platform_request(
+            Method::DELETE,
+            &format!("/platform/admins/{principal_id}/credentials/{original}"),
+            &rotated,
+            None,
+        ))
+        .await
+        .expect("revoke responds");
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}

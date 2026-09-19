@@ -157,3 +157,21 @@ pub struct SetPlatformPrincipalStatusRequest {
     /// `active` to restore, `suspended` to stop this principal acting.
     pub status: String,
 }
+
+/// Mint a new credential for an existing platform principal.
+///
+/// Rotation is issue-then-revoke, so this never retires what it replaces: the
+/// operator verifies the new credential works and revokes the old one as a
+/// separate, deliberate call.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct IssuePlatformCredentialRequest {
+    /// Lifetime in days, or unbounded when omitted.
+    ///
+    /// The deployment root's first credential is unbounded by necessity — it
+    /// exists before anything that could rotate it — but a credential minted
+    /// afterwards usually should not be, so the bound is expressible here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_in_days: Option<u32>,
+}

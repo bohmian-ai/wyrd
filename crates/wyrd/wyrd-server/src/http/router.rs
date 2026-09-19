@@ -20,7 +20,8 @@ use crate::components::cards::cards_router;
 use crate::components::eval::eval_router;
 use crate::components::health::health_router;
 use crate::components::platform::{
-    platform_auth_router, platform_identity_router, platform_login_router, platform_router,
+    platform_auth_router, platform_credentials_router, platform_identity_router,
+    platform_login_router, platform_router,
 };
 use crate::components::principals::principals_router;
 use crate::components::storage::storage_router;
@@ -83,6 +84,7 @@ pub fn build_router(state: AppState) -> Router {
             .merge(platform_login_router())
             .merge(platform_router())
             .merge(platform_identity_router())
+            .merge(platform_credentials_router())
             .merge(mcp_route)
             .nest("/v1", v1_group),
         &state,

@@ -220,6 +220,7 @@ fn workload_exchange_error(error: ExchangeError) -> WyrdError {
         }
         ExchangeError::NotFound
         | ExchangeError::AccountDisabled
+        | ExchangeError::TenantNotAdmitting
         | ExchangeError::HashMismatch
         | ExchangeError::CrossTenant => internal_error("failed to issue workload token"),
     }

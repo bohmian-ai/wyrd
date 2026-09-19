@@ -22,6 +22,7 @@ use wyrd_sql::queries::auth::{
     ApiKeyStatus, api_key_by_prefix, api_key_status_by_prefix, insert_refresh_token,
     list_service_account_roles, service_account_by_id, touch_api_key_last_used,
 };
+use wyrd_sql::queries::platform::tenant_resolver::tenant_admits_credentials;
 
 use crate::audit::{TOKEN_EXCHANGE_OPERATION, append_auth_audit, auth_event};
 
@@ -161,6 +162,14 @@ pub enum ExchangeError {
     /// Key exists but the associated service account is not active.
     #[error("service account is not active")]
     AccountDisabled,
+    /// The key's tenant is not in a state that admits credentials.
+    ///
+    /// Distinct from [`ExchangeError::AccountDisabled`] internally so a
+    /// suspended tenant is diagnosable, and rendered identically at the
+    /// boundary so a caller cannot tell a suspended tenant from a disabled
+    /// principal or an unknown key.
+    #[error("tenant does not admit credentials")]
+    TenantNotAdmitting,
     /// Key exists and account is active but Argon2 hash verification failed.
     #[error("api key hash mismatch")]
     HashMismatch,
@@ -225,6 +234,15 @@ impl ExchangeApiKey {
         if parsed.tenant_id != conn.data_tenant_id() {
             return Err(ExchangeError::CrossTenant);
         }
+        // The tenant's own lifecycle decides before the principal's does.
+        // Suspending a tenant has to stop its credentials working, or the
+        // status is a label rather than a control — and this is the one place
+        // every credential-bearing entry to a tenant converges, so checking
+        // here cannot be forgotten by a route added later.
+        if !tenant_admits_credentials(conn, parsed.tenant_id).await? {
+            return Err(ExchangeError::TenantNotAdmitting);
+        }
+
         let Some(row) = api_key_by_prefix(conn, &parsed.prefix).await? else {
             return Err(ExchangeError::NotFound);
         };
@@ -722,6 +740,13 @@ pub async fn map_exchange_error_to_wyrd(
         ExchangeError::AccountDisabled => WyrdError::ApiKeyInvalid {
             message: "service account is not active".to_owned(),
             details: json!({ "reason": "account_disabled" }),
+        },
+        // Rendered as an ordinary invalid key. A caller learns that its
+        // credential does not work, never that the tenant behind it is
+        // suspended — which would tell an outsider that the tenant exists.
+        ExchangeError::TenantNotAdmitting => WyrdError::ApiKeyInvalid {
+            message: "API key is not valid".to_owned(),
+            details: json!({ "reason": "not_found" }),
         },
         ExchangeError::HashMismatch => WyrdError::ApiKeyInvalid {
             message: "API key hash verification failed".to_owned(),

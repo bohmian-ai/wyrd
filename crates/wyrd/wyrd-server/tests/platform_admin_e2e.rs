@@ -1289,3 +1289,186 @@ async fn the_last_active_platform_principal_cannot_be_suspended() {
         "the refused suspension left the deployment administrable"
     );
 }
+
+/// Suspending a tenant stops its credentials working.
+///
+/// Tenant lifecycle states existed before this and were read nowhere on the
+/// authentication path, which made suspension a label rather than a control.
+/// The check lives at credential exchange, the one place every credential-
+/// bearing entry to a tenant converges.
+#[tokio::test]
+async fn a_suspended_tenant_admits_no_credential() {
+    if !e2e_enabled() {
+        return;
+    }
+    let srv = WyrdTestServer::start_in_process()
+        .await
+        .expect("server starts");
+    let root = initialize_platform_root(&srv.operator_pool())
+        .await
+        .expect("deployment initializes");
+    let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
+
+    let created = body_json(
+        srv.oneshot(platform_post(
+            "/platform/tenants",
+            &session,
+            json!({ "slug": "suspendable", "display_name": "Suspendable" }),
+        ))
+        .await
+        .expect("tenant route responds"),
+    )
+    .await;
+    let credential = created["admin"]["credential"]
+        .as_str()
+        .expect("credential")
+        .to_owned();
+    let tenant_id = created["tenant"]["id"].as_str().expect("tenant id");
+
+    assert!(
+        tenant_token(&srv, &credential).await.is_ok(),
+        "an active tenant's credential authenticates"
+    );
+
+    sqlx::query("UPDATE platform.tenants SET status = 'suspended' WHERE data_tenant_id = $1")
+        .bind(tenant_id.parse::<uuid::Uuid>().expect("tenant uuid"))
+        .execute(srv.operator_pool().pool())
+        .await
+        .expect("tenant suspends");
+
+    assert_eq!(
+        tenant_token(&srv, &credential).await.unwrap_err(),
+        StatusCode::UNAUTHORIZED,
+        "a suspended tenant's credential stops authenticating"
+    );
+
+    // Restoring the tenant restores its credentials, so suspension is
+    // reversible rather than destructive.
+    sqlx::query("UPDATE platform.tenants SET status = 'active' WHERE data_tenant_id = $1")
+        .bind(tenant_id.parse::<uuid::Uuid>().expect("tenant uuid"))
+        .execute(srv.operator_pool().pool())
+        .await
+        .expect("tenant restores");
+    assert!(
+        tenant_token(&srv, &credential).await.is_ok(),
+        "restoring the tenant restores its credentials"
+    );
+}
+
+/// A failed provisioning can be retried with the same slug.
+///
+/// A bare insert would burn the slug permanently: the row exists, every retry
+/// of the identical request conflicts, and the operator can never create that
+/// tenant. Resuming keeps the original tenant id, because the failed attempt
+/// may already have written rows under it.
+#[tokio::test]
+async fn a_failed_provisioning_can_be_retried_with_the_same_slug() {
+    if !e2e_enabled() {
+        return;
+    }
+    let srv = WyrdTestServer::start_in_process()
+        .await
+        .expect("server starts");
+    let root = initialize_platform_root(&srv.operator_pool())
+        .await
+        .expect("deployment initializes");
+    let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
+
+    let created = body_json(
+        srv.oneshot(platform_post(
+            "/platform/tenants",
+            &session,
+            json!({ "slug": "retryable", "display_name": "Retryable" }),
+        ))
+        .await
+        .expect("tenant route responds"),
+    )
+    .await;
+    let original_id = created["tenant"]["id"]
+        .as_str()
+        .expect("tenant id")
+        .to_owned();
+
+    // Put the tenant in the state a mid-provisioning failure leaves behind.
+    sqlx::query(
+        "UPDATE platform.tenants
+            SET status = 'failed', provisioning_failed_reason = 'simulated failure'
+          WHERE data_tenant_id = $1",
+    )
+    .bind(original_id.parse::<uuid::Uuid>().expect("tenant uuid"))
+    .execute(srv.operator_pool().pool())
+    .await
+    .expect("tenant marks failed");
+
+    let resp = srv
+        .oneshot(platform_post(
+            "/platform/tenants",
+            &session,
+            json!({ "slug": "retryable", "display_name": "Retryable" }),
+        ))
+        .await
+        .expect("tenant route responds");
+    let status = resp.status();
+    let retried = body_json(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "retrying a failed provisioning succeeds rather than reporting the slug taken: {retried}"
+    );
+    assert_eq!(
+        retried["tenant"]["id"].as_str().expect("tenant id"),
+        original_id,
+        "the retry resumes the original tenant rather than creating a second"
+    );
+    assert_eq!(retried["tenant"]["status"], "active");
+
+    // The credential the retry hands back is usable, which is what makes the
+    // resumed tenant genuinely provisioned rather than merely marked active.
+    assert!(
+        tenant_token(
+            &srv,
+            retried["admin"]["credential"].as_str().expect("credential")
+        )
+        .await
+        .is_ok(),
+        "the resumed tenant's administrator authenticates"
+    );
+}
+
+/// An occupied slug is still a conflict.
+#[tokio::test]
+async fn an_active_tenant_slug_is_still_refused() {
+    if !e2e_enabled() {
+        return;
+    }
+    let srv = WyrdTestServer::start_in_process()
+        .await
+        .expect("server starts");
+    let root = initialize_platform_root(&srv.operator_pool())
+        .await
+        .expect("deployment initializes");
+    let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
+
+    let create = || {
+        platform_post(
+            "/platform/tenants",
+            &session,
+            json!({ "slug": "taken", "display_name": "Taken" }),
+        )
+    };
+    assert_eq!(
+        srv.oneshot(create())
+            .await
+            .expect("tenant route responds")
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        srv.oneshot(create())
+            .await
+            .expect("tenant route responds")
+            .status(),
+        StatusCode::CONFLICT,
+        "a live tenant's slug is a genuine collision, not a resumable failure"
+    );
+}

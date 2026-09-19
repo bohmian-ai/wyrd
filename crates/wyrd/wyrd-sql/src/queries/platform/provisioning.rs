@@ -29,18 +29,71 @@ pub async fn insert_provisioning_tenant(
     data_tenant_id: DataTenantId,
     slug: &str,
     display_name: &str,
-) -> Result<(), SqlError> {
-    sqlx::query(
+) -> Result<TenantClaim, SqlError> {
+    // A failed provisioning is resumable, so its slug is adopted rather than
+    // refused. Without this a single failure would burn the slug permanently:
+    // the row exists, the insert conflicts, and every retry of the identical
+    // request reports the slug taken forever. Only a `failed` row is adopted —
+    // an `active`, `provisioning`, or `suspended` tenant is a genuine
+    // collision and still conflicts.
+    let adopted = sqlx::query_scalar::<_, uuid::Uuid>(
         "INSERT INTO platform.tenants (data_tenant_id, slug, display_name, status)
-         VALUES ($1, $2, $3, 'provisioning')",
+         VALUES ($1, $2, $3, 'provisioning')
+         ON CONFLICT (slug) DO UPDATE
+            SET data_tenant_id            = platform.tenants.data_tenant_id,
+                display_name              = EXCLUDED.display_name,
+                status                    = 'provisioning',
+                provisioning_failed_reason = NULL,
+                updated_at                = now()
+          WHERE platform.tenants.status = 'failed'
+         RETURNING data_tenant_id",
     )
     .bind(data_tenant_id.as_uuid())
     .bind(slug)
     .bind(display_name)
-    .execute(&mut **tx)
+    .fetch_optional(&mut **tx)
     .await
     .map_err(SqlError::from)?;
-    Ok(())
+
+    // `ON CONFLICT ... WHERE` that matches nothing returns no row rather than
+    // raising, so an occupied slug is this absence, not an error.
+    let Some(claimed) = adopted else {
+        return Err(SqlError::UniqueViolation {
+            constraint: "tenants_slug_key".to_owned(),
+        });
+    };
+
+    Ok(if claimed == data_tenant_id.as_uuid() {
+        TenantClaim::Created
+    } else {
+        TenantClaim::ResumedFailed(
+            DataTenantId::try_from(claimed).map_err(SqlError::InvalidDataTenantId)?,
+        )
+    })
+}
+
+/// Which tenant row a provisioning attempt ended up owning.
+///
+/// Resuming keeps the original tenant id, because a failed attempt may already
+/// have written tenant-scoped rows under it. Handing back a second id would
+/// orphan them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TenantClaim {
+    /// A new tenant row was created under the caller's proposed id.
+    Created,
+    /// A previously failed tenant was adopted; work continues under its id.
+    ResumedFailed(DataTenantId),
+}
+
+impl TenantClaim {
+    /// The tenant id this attempt must actually provision under.
+    #[must_use]
+    pub fn tenant_id(self, proposed: DataTenantId) -> DataTenantId {
+        match self {
+            Self::Created => proposed,
+            Self::ResumedFailed(existing) => existing,
+        }
+    }
 }
 
 /// Promote a provisioning tenant to active.

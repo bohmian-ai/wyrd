@@ -25,6 +25,7 @@ use wyrd_spec::auth::{
 };
 use wyrd_sql::queries::auth::{
     grant_role_to_service_account, insert_api_key, insert_service_account, role_by_name,
+    tenant_admin_principal_id,
 };
 use wyrd_sql::queries::platform::provisioning::{
     insert_provisioning_tenant, mark_tenant_active, mark_tenant_failed,
@@ -136,7 +137,11 @@ impl TenantProvisioning {
             )
             .await?;
 
-        insert_provisioning_tenant(
+        // A previously failed attempt at this slug is resumed under its own
+        // tenant id rather than refused. Keeping the original id matters: the
+        // failed attempt may already have written tenant-scoped rows, and a
+        // second id would orphan them.
+        let claim = insert_provisioning_tenant(
             &mut tx,
             data_tenant_id,
             request.slug.as_str(),
@@ -144,6 +149,7 @@ impl TenantProvisioning {
         )
         .await
         .map_err(slug_or_store)?;
+        let data_tenant_id = claim.tenant_id(data_tenant_id);
         tx.commit()
             .await
             .map_err(|e| ProvisionError::Store(e.to_string()))?;
@@ -197,18 +203,31 @@ impl TenantProvisioning {
             .await
             .map_err(|e| ProvisionError::Store(e.to_string()))?;
 
-        let principal_id = Uuid::now_v7();
-        insert_service_account(
-            &mut conn,
-            principal_id,
-            "tenant_admin",
-            None,
-            "tenant-admin",
-            Some("Tenant administrative principal"),
-            created_by,
-        )
-        .await
-        .map_err(|e| ProvisionError::Store(e.to_string()))?;
+        // A resumed attempt may find the administrative principal already
+        // created by the failed one. Reusing it is what keeps the tenant's
+        // identity stable across the retry; creating a second would leave the
+        // first behind holding the same role.
+        let principal_id = match tenant_admin_principal_id(&mut conn)
+            .await
+            .map_err(|e| ProvisionError::Store(e.to_string()))?
+        {
+            Some(existing) => existing,
+            None => {
+                let principal_id = Uuid::now_v7();
+                insert_service_account(
+                    &mut conn,
+                    principal_id,
+                    "tenant_admin",
+                    None,
+                    "tenant-admin",
+                    Some("Tenant administrative principal"),
+                    created_by,
+                )
+                .await
+                .map_err(|e| ProvisionError::Store(e.to_string()))?;
+                principal_id
+            }
+        };
 
         let role = role_by_name(&mut conn, TENANT_ADMIN_ROLE)
             .await

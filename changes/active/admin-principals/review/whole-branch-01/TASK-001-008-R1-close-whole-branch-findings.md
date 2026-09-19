@@ -395,7 +395,7 @@ identity environment variables, or add a replacement trailer.
 | `FIND-admin-principals-1` | Allowed and denied platform decisions stage canonically and publish once; append or same-plane mutation failure leaves no allowance/effect mismatch; `platform.audit_authz` is absent. |
 | `FIND-admin-principals-2` | Changed library fields/signatures expose only `TenantConn` or `OperatorPool`; initialization, registration, authorization, provisioning, and recovery retain their behavior. |
 | `FIND-admin-principals-3` | Injected SQL, session/key, provider, and serialization failures return stable safe problem bodies while scrubbed source diagnostics remain server-side. |
-| `FIND-admin-principals-4` | Governing architecture and security owners agree with revision 7 and contain no superseded principal, OIDC, or audit claims. |
+| `FIND-admin-principals-4` | `5ea453f13` — `architecture/v1/00-foundations/service-identity.md`, `tenancy.md`, and the tenant-OIDC spec; `4c9c81f6d` — `wyrd-security-posture.md` credential and login model; `50fc266d0` — `wyrd-design.md` principal kinds reopened to both planes, preserving the concurrent change's `System` kind; admin route module docs already current in `a8ecda7e1`/`7039d3fe1`/`ad4eb9dd7` | `mise run docs:check`, `mise run lints` | PASS |
 | `FIND-admin-principals-5` | Every changed `mise` task provisions its owned environment, selects a nonzero exact test set, and passes from a clean invocation. |
 | `FIND-admin-principals-6` | The fixture comment describes containment and `cargo doc -p wyrd-sql --no-deps` emits no candidate private-link warning. |
 | `FIND-admin-principals-7` | A registered and verified human receives the fixed grant and performs a protected platform operation; tenant authority cannot create or grant a platform principal. |
@@ -491,23 +491,10 @@ git diff --check                      # clean
 
 ### Blocked
 
-`FIND-admin-principals-4` is closed for every owner it names except two:
-the `architecture/v1/00-foundations/` pages, the admin route module docs, and
-the tenant-OIDC specification are committed.
-
-`architecture/wyrd-design.md` remains; `wyrd-security-posture.md` is closed in
-`4c9c81f6d` — its conflicting hunks sit at lines 43-44 and 188-192 and this
-finding's edits at 58 and 100, so only this change's hunks were staged. It carries uncommitted edits from the concurrent
-`verified-change-contract` change in this shared worktree, and its hunks land
-on the same lines this finding replaces — it has already rewritten
-`wyrd-design.md:149` and `:152` to add a `System` principal kind to the closed-
-set sentence revision 7 reopens. Selective staging cannot separate an
-overlapping hunk, so committing here would carry that change's work into this
-branch.
-
-The four replacements are written out verbatim, each preserving that change's
-`System` kind, in `FIND-004-pending-architecture-edits.md` beside this file.
-Apply them once the concurrent change lands.
+None. `FIND-admin-principals-4`'s two conflicted files were committed by
+staging only this change's hunks against `HEAD`, leaving the concurrent
+`verified-change-contract` edits unstaged in the worktree and its `System`
+principal kind preserved verbatim in the committed text.
 
 ### Out of scope
 

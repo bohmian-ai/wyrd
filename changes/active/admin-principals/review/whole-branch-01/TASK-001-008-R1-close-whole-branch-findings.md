@@ -495,8 +495,9 @@ git diff --check                      # clean
 the `architecture/v1/00-foundations/` pages, the admin route module docs, and
 the tenant-OIDC specification are committed.
 
-`architecture/wyrd-design.md` and `architecture/wyrd-security-posture.md`
-remain. Both carry uncommitted edits from the concurrent
+`architecture/wyrd-design.md` remains; `wyrd-security-posture.md` is closed in
+`4c9c81f6d` — its conflicting hunks sit at lines 43-44 and 188-192 and this
+finding's edits at 58 and 100, so only this change's hunks were staged. It carries uncommitted edits from the concurrent
 `verified-change-contract` change in this shared worktree, and its hunks land
 on the same lines this finding replaces — it has already rewritten
 `wyrd-design.md:149` and `:152` to add a `System` principal kind to the closed-

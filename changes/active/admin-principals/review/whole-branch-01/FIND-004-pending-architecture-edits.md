@@ -71,7 +71,7 @@ the transitive card-ref graph rooted at that card — but the administrative and
 automation principals a tenant creates for itself hold no Card at all.
 ```
 
-## `architecture/wyrd-security-posture.md`
+## `architecture/wyrd-security-posture.md` — APPLIED in `4c9c81f6d`
 
 ### 3. Credential lookup (currently around line 58)
 

@@ -1088,6 +1088,44 @@ async fn an_operator_configures_and_removes_federated_platform_sign_in() {
         StatusCode::OK,
         "the global credential administers the platform with federated login gone"
     );
+
+    // Both principals performed the same operation on the same plane, so the
+    // recorded kind is the only thing separating a machine root's decision from
+    // a registered human's. It used to be hard-coded `global_admin` for every
+    // platform decision, which filed every human action under a machine.
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool for staged audit");
+    let root_id: String =
+        sqlx::query_scalar("SELECT id::text FROM platform.principals WHERE name = $1")
+            .bind(wyrd_server::boot::init::PLATFORM_ROOT_NAME)
+            .fetch_one(&superuser)
+            .await
+            .expect("the root principal exists");
+    for (principal, expected) in [
+        (root_id.as_str(), "global_admin"),
+        (
+            registered["principal_id"].as_str().expect("principal id"),
+            "user",
+        ),
+    ] {
+        let kinds: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT principal_kind FROM vala.audit_staging
+              WHERE operation = 'platform.authz' AND principal_id = $1::uuid",
+        )
+        .bind(principal)
+        .fetch_all(&superuser)
+        .await
+        .expect("staged decisions read");
+
+        assert_eq!(
+            kinds,
+            vec![expected.to_owned()],
+            "decisions by {principal} were recorded as {kinds:?}, expected only {expected}"
+        );
+    }
 }
 
 /// A tenant administrator cannot configure who signs in to the platform.

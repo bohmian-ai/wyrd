@@ -17,11 +17,12 @@ use secrecy::SecretString;
 use uuid::Uuid;
 use wyrd_auth_issue::IssuingKey;
 use wyrd_auth_verify::{PLATFORM_TOKEN_SCOPE, PlatformAccessTokenClaims};
-use wyrd_spec::auth::PrincipalId;
+use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_sql::queries::platform::credentials::platform_credential_by_id;
 use wyrd_sql::queries::platform::principals::platform_principal_by_id;
 use wyrd_sql::{OperatorPool, SqlError};
 
+use crate::audit::principal_kind_tag;
 use crate::platform_credentials::{PlatformCredentialError, PlatformCredentials};
 
 /// Default platform session lifetime.
@@ -47,6 +48,10 @@ pub struct PlatformSession {
 pub struct VerifiedPlatformSession {
     /// Principal the request acts as.
     pub principal_id: PrincipalId,
+    /// The kind the directory stores for that principal, read here rather than
+    /// carried in the token so a re-registered or corrected kind takes effect
+    /// on the next request.
+    pub principal_kind: PrincipalKindTag,
     /// Credential that minted the presented token, recorded in audit so an
     /// operation is traceable to the credential as well as the identity.
     ///
@@ -249,6 +254,7 @@ impl PlatformSessions {
 
         Ok(VerifiedPlatformSession {
             principal_id: PrincipalId::new(principal_id),
+            principal_kind: principal_kind_tag(&row.principal_kind),
             credential_id: Some(credential_id),
         })
     }
@@ -276,6 +282,7 @@ impl PlatformSessions {
 
         Ok(VerifiedPlatformSession {
             principal_id: PrincipalId::new(principal_id),
+            principal_kind: principal_kind_tag(&principal.principal_kind),
             credential_id: None,
         })
     }

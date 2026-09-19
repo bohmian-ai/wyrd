@@ -172,7 +172,11 @@ impl FromRequestParts<AppState> for PlatformCaller {
         let request_id = token_extract::request_id(parts)?;
 
         Ok(Self {
-            context: AuthContext::from(PlatformPrincipal::new(principal_id, effective_permissions)),
+            context: AuthContext::from(PlatformPrincipal::new(
+                principal_id,
+                session.principal_kind,
+                effective_permissions,
+            )),
             credential_id: session.credential_id,
             request_id,
         })
@@ -193,6 +197,7 @@ mod tests {
         PlatformCaller {
             context: AuthContext::from(PlatformPrincipal::new(
                 PrincipalId::new(Uuid::now_v7()),
+                wyrd_spec::auth::PrincipalKindTag::GlobalAdmin,
                 PermissionSet::new(),
             )),
             credential_id: Some(Uuid::now_v7()),

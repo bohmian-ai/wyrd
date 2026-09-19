@@ -362,6 +362,13 @@ mod tests {
 pub struct PlatformPrincipal {
     /// Stable principal id.
     pub id: PrincipalId,
+    /// The kind the platform directory stores for this principal.
+    ///
+    /// `GlobalAdmin` for a machine root, `User` for a human registered for
+    /// federated sign-in. Audit reads it, so a human's decision is never
+    /// recorded as a machine's. It is read from the store at session
+    /// verification, never inferred from what the principal may do.
+    pub kind: PrincipalKindTag,
     /// Permissions resolved from the principal's platform grant.
     ///
     /// Absence of a grant is denial: a platform principal with an empty set
@@ -372,9 +379,14 @@ pub struct PlatformPrincipal {
 impl PlatformPrincipal {
     /// Construct a platform-scope principal.
     #[must_use]
-    pub const fn new(id: PrincipalId, effective_permissions: PermissionSet) -> Self {
+    pub const fn new(
+        id: PrincipalId,
+        kind: PrincipalKindTag,
+        effective_permissions: PermissionSet,
+    ) -> Self {
         Self {
             id,
+            kind,
             effective_permissions,
         }
     }
@@ -431,6 +443,20 @@ impl AuthContext {
         }
     }
 
+    /// The kind of principal behind the request, whichever plane it names.
+    ///
+    /// Audit records this, so it has to be what the store holds rather than a
+    /// per-plane constant: a platform plane carrying both machine roots and
+    /// registered humans would otherwise attribute every human decision to a
+    /// machine.
+    #[must_use]
+    pub fn principal_kind(&self) -> PrincipalKindTag {
+        match self {
+            Self::Platform(principal) => principal.kind,
+            Self::Tenant(principal) => principal.kind.tag(),
+        }
+    }
+
     /// The permissions authorization is decided against.
     ///
     /// One vocabulary and one checker serve both planes; only the set differs.
@@ -471,16 +497,22 @@ impl From<PlatformPrincipal> for AuthContext {
 mod auth_context_tests {
     use wyrd_spec::DataTenantId;
 
+    use wyrd_spec::auth::PrincipalKindTag;
+
     use super::{AuthContext, PlatformPrincipal, Principal, PrincipalId, PrincipalKind};
     use crate::permission::{Permission, PermissionSet};
 
     /// A platform principal holding tenant-lifecycle authority.
     fn platform() -> PlatformPrincipal {
-        PlatformPrincipal::new(PrincipalId::new(uuid::Uuid::now_v7()), {
-            let mut set = PermissionSet::new();
-            set.insert(Permission::tenant_create());
-            set
-        })
+        PlatformPrincipal::new(
+            PrincipalId::new(uuid::Uuid::now_v7()),
+            PrincipalKindTag::GlobalAdmin,
+            {
+                let mut set = PermissionSet::new();
+                set.insert(Permission::tenant_create());
+                set
+            },
+        )
     }
 
     /// A tenant administrative principal in some tenant.

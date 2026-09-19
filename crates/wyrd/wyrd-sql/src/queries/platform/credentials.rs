@@ -29,6 +29,9 @@ pub struct PlatformCredentialLookupRow {
     pub secret_hash: String,
     /// Owning principal's lifecycle status.
     pub principal_status: String,
+    /// Owning principal's stored kind, so a session records what it acts as
+    /// rather than assuming every platform principal is a machine root.
+    pub principal_kind: String,
     /// Revocation time, when revoked.
     pub revoked_at: Option<DateTime<Utc>>,
     /// Expiry, when the credential is bounded.
@@ -124,6 +127,7 @@ pub async fn platform_credential_by_prefix(
                 c.principal_id,
                 c.secret_hash,
                 p.status AS principal_status,
+                p.principal_kind,
                 c.revoked_at,
                 c.expires_at
            FROM platform.credentials c
@@ -153,6 +157,7 @@ pub async fn platform_credential_by_id(
                 c.principal_id,
                 c.secret_hash,
                 p.status AS principal_status,
+                p.principal_kind,
                 c.revoked_at,
                 c.expires_at
            FROM platform.credentials c

@@ -16,7 +16,6 @@
 
 use wyrd_runtime::{AuthContext, Permission};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::PrincipalKindTag;
 use wyrd_spec::vala::api::{AuditDetail, AuditEvent, AuditOutcome};
 use wyrd_spec::vala::audit_detail::AuditErrorCode;
 use wyrd_sql::{OperatorPool, SqlError, TenantConn};
@@ -173,7 +172,7 @@ impl PlatformAuthorization {
             ),
             card_ref: None,
             principal_id,
-            principal_kind: PrincipalKindTag::GlobalAdmin,
+            principal_kind: context.principal_kind(),
             permission: required.to_string(),
             outcome,
             detail: Some(AuditDetail::AuthzCheck {
@@ -206,16 +205,48 @@ mod pg_tests {
 
     /// A platform context holding exactly `permissions`, backed by a real row.
     async fn platform_context(fixture: &PgFixture, permissions: PermissionSet) -> AuthContext {
+        platform_context_of_kind(fixture, PrincipalKindTag::GlobalAdmin, permissions).await
+    }
+
+    /// A platform context of a given stored kind, backed by a real row.
+    ///
+    /// The kind is written to `platform.principals` and carried on the context
+    /// the way session verification carries it, so a test can assert what the
+    /// decision records for a machine root and for a registered human.
+    async fn platform_context_of_kind(
+        fixture: &PgFixture,
+        kind: PrincipalKindTag,
+        permissions: PermissionSet,
+    ) -> AuthContext {
         let id = Uuid::now_v7();
         insert_platform_principal(
             fixture.operator_pool(),
             id,
-            PrincipalKindTag::GlobalAdmin,
+            kind,
             &format!("principal-{id}"),
         )
         .await
         .expect("platform principal inserts");
-        AuthContext::from(PlatformPrincipal::new(PrincipalId::new(id), permissions))
+        AuthContext::from(PlatformPrincipal::new(
+            PrincipalId::new(id),
+            kind,
+            permissions,
+        ))
+    }
+
+    /// Read the `principal_kind` one staged decision recorded.
+    async fn staged_principal_kind(fixture: &PgFixture, principal: PrincipalId) -> String {
+        let admin = fixture.superuser_pool().await.expect("superuser pool");
+        sqlx::query_scalar(
+            "SELECT principal_kind FROM vala.audit_staging
+              WHERE data_tenant_id = $1 AND principal_id = $2 AND operation = $3",
+        )
+        .bind(DataTenantId::SYSTEM_OWNER.as_uuid())
+        .bind(principal.as_uuid())
+        .bind(PLATFORM_AUTHZ_OPERATION)
+        .fetch_one(&admin)
+        .await
+        .expect("staged decision is readable")
     }
 
     /// Count canonical staged rows for one principal, by outcome.
@@ -286,6 +317,44 @@ mod pg_tests {
         drop(conn);
 
         assert_eq!(staged_rows(&fixture, principal, "allowed").await, 0);
+    }
+
+    /// The decision records the principal's stored kind, not the plane's.
+    ///
+    /// Both platform kinds hold the same fixed grant and perform the same
+    /// operation, so the audit row's `principal_kind` is the only thing that
+    /// separates a machine root's decision from a registered human's. It used to
+    /// be hard-coded, which attributed every human decision to a machine.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot start or either kind is misrecorded.
+    #[tokio::test]
+    async fn a_decision_records_the_stored_principal_kind() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let authz = PlatformAuthorization::new(fixture.operator_pool().clone());
+
+        for (kind, expected) in [
+            (PrincipalKindTag::GlobalAdmin, "global_admin"),
+            (PrincipalKindTag::User, "user"),
+        ] {
+            let mut permissions = PermissionSet::new();
+            permissions.insert(Permission::tenant_create());
+            let context = platform_context_of_kind(&fixture, kind, permissions).await;
+            let principal = context.principal_id();
+
+            let conn = authz
+                .authorize(&context, &Permission::tenant_create(), "req-kind", None)
+                .await
+                .expect("authorized");
+            conn.commit().await.expect("allowance commits");
+
+            assert_eq!(
+                staged_principal_kind(&fixture, principal).await,
+                expected,
+                "a {expected} decision is recorded as some other kind"
+            );
+        }
     }
 
     /// A denial is durable even though the operation never ran, and names the

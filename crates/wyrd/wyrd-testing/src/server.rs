@@ -2189,6 +2189,23 @@ impl WyrdTestServer {
         self.inner.fixture.operator_pool().clone()
     }
 
+    /// Establish this deployment's platform administrative root.
+    ///
+    /// Test-support for journeys that need a platform session. It exists here
+    /// rather than in each suite so an SDK journey does not have to depend on
+    /// the server crate to reach one server-owned initialization step.
+    ///
+    /// # Errors
+    /// Returns an error when the deployment is already initialized or the
+    /// platform store write fails.
+    pub async fn initialize_platform_root(
+        &self,
+    ) -> Result<secrecy::SecretString, WyrdTestServerError> {
+        wyrd_server::boot::init::initialize_platform_root(&self.operator_pool())
+            .await
+            .map_err(|error| WyrdTestServerError::Io(error.to_string()))
+    }
+
     /// Return a clone of the app Postgres pool for direct SQL in tests.
     #[must_use]
     pub fn app_pool(&self) -> sqlx::PgPool {

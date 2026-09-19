@@ -97,6 +97,7 @@ wyrd-storage = { workspace = true }
 temp-env = { workspace = true }
 tempfile = { workspace = true }
 tokio-stream = "0.1"
+tracing-subscriber = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 wiremock = { workspace = true }
 wyrd-dev-fixtures = { path = "../../shared/wyrd-dev-fixtures", version = "0.0.1", features = ["pg"] }

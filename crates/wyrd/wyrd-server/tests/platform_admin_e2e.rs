@@ -2771,3 +2771,260 @@ async fn interrupted_and_racing_provisioning_converge_on_one_tenant() {
         "the winner's credential is usable"
     );
 }
+
+/// Two operators initializing at once produce one root and one refusal.
+///
+/// Singleness is enforced by the unique principal name rather than a
+/// read-then-write check, so this is the case that distinguishes the two: a
+/// check-then-insert would let both attempts pass the check and leave a
+/// deployment with two administrative roots, each believing it is the only one.
+#[tokio::test(flavor = "multi_thread")]
+async fn initialization_has_exactly_one_winner_under_concurrency() {
+    if !e2e_enabled() {
+        return;
+    }
+    let srv = WyrdTestServer::start_in_process()
+        .await
+        .expect("server starts");
+
+    let attempts = futures_util::future::join_all(
+        (0..8).map(|_| async { initialize_platform_root(&srv.operator_pool()).await }),
+    )
+    .await;
+
+    let established = attempts.iter().filter(|result| result.is_ok()).count();
+    assert_eq!(established, 1, "exactly one attempt establishes the root");
+    assert!(
+        attempts
+            .iter()
+            .filter(|result| result.is_err())
+            .all(|result| matches!(result, Err(InitError::AlreadyInitialized))),
+        "every loser is told the deployment is already initialized"
+    );
+
+    let roots: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM platform.principals WHERE principal_kind = 'global_admin'",
+    )
+    .fetch_one(srv.operator_pool().pool())
+    .await
+    .expect("platform principals are counted");
+    assert_eq!(roots, 1, "the deployment has one administrative root");
+}
+
+/// A failure at any of initialization's three writes leaves nothing behind, and
+/// the identical retry then succeeds.
+///
+/// The three writes commit together for a reason: the principal's name is
+/// unique, so a partial initialization would leave a root with no credential
+/// that no later attempt could replace, and the deployment would be
+/// permanently unadministrable. Each write is failed in turn to prove that.
+/// The captured diagnostics are checked in the same pass, because the credential
+/// is generated before any of these writes and a failure is exactly when an
+/// error path is tempted to print what it was holding.
+#[tokio::test]
+async fn initialization_retries_cleanly_after_a_failure_at_each_write() {
+    if !e2e_enabled() {
+        return;
+    }
+    let srv = WyrdTestServer::start_in_process()
+        .await
+        .expect("server starts");
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool opens");
+
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION platform.injected_init_failure() RETURNS trigger
+         LANGUAGE plpgsql AS $$
+         BEGIN RAISE EXCEPTION 'injected write failure'; END $$",
+    )
+    .execute(&superuser)
+    .await
+    .expect("the injection function is created");
+
+    let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+
+    // Written out per table rather than interpolated: a dynamic SQL string
+    // would have to be audited for injection, and there are exactly three
+    // writes to fail.
+    let stages = [
+        (
+            "principals",
+            "CREATE TRIGGER injected_failure BEFORE INSERT ON platform.principals
+             FOR EACH ROW EXECUTE FUNCTION platform.injected_init_failure()",
+            "DROP TRIGGER injected_failure ON platform.principals",
+        ),
+        (
+            "principal_grants",
+            "CREATE TRIGGER injected_failure BEFORE INSERT ON platform.principal_grants
+             FOR EACH ROW EXECUTE FUNCTION platform.injected_init_failure()",
+            "DROP TRIGGER injected_failure ON platform.principal_grants",
+        ),
+        (
+            "credentials",
+            "CREATE TRIGGER injected_failure BEFORE INSERT ON platform.credentials
+             FOR EACH ROW EXECUTE FUNCTION platform.injected_init_failure()",
+            "DROP TRIGGER injected_failure ON platform.credentials",
+        ),
+    ];
+    for (table, install, remove) in stages {
+        sqlx::query(install)
+            .execute(&superuser)
+            .await
+            .expect("the injection trigger is installed");
+
+        let sink = std::sync::Arc::clone(&logs);
+        let failed = {
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(move || CaptureWriter(std::sync::Arc::clone(&sink)))
+                .with_max_level(tracing::Level::TRACE)
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+            initialize_platform_root(&srv.operator_pool()).await
+        };
+        let error = failed.expect_err("the injected failure is surfaced");
+        assert!(
+            matches!(error, InitError::Store(_)),
+            "a write failure is a store failure, not a false already-initialized: {error}"
+        );
+
+        // Nothing committed: a partial root is the one state that cannot be
+        // recovered from, so its absence is the point of the transaction.
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM platform.principals WHERE principal_kind = 'global_admin'",
+        )
+        .fetch_one(srv.operator_pool().pool())
+        .await
+        .expect("platform principals are counted");
+        assert_eq!(
+            rows, 0,
+            "a failure at {table} leaves the deployment uninitialized"
+        );
+
+        sqlx::query(remove)
+            .execute(&superuser)
+            .await
+            .expect("the injection is removed");
+    }
+
+    // The identical invocation now succeeds, which is what "retryable" means.
+    let credential = initialize_platform_root(&srv.operator_pool())
+        .await
+        .expect("the retry initializes the deployment");
+    let plaintext = secrecy::ExposeSecret::expose_secret(&credential);
+    // Exchanging it is the proof it is a working root, not merely a row.
+    let _session = platform_session(&srv, plaintext).await;
+
+    let captured = String::from_utf8(logs.lock().expect("the capture is readable").clone())
+        .expect("captured output is UTF-8");
+    assert!(
+        !captured.contains(plaintext),
+        "no credential material reaches the diagnostics"
+    );
+    assert!(
+        !captured.contains("wyrd_global_"),
+        "not even a credential prefix reaches the diagnostics"
+    );
+
+    // What is stored is a verifier, not the secret.
+    let stored: Vec<String> = sqlx::query_scalar("SELECT secret_hash FROM platform.credentials")
+        .fetch_all(srv.operator_pool().pool())
+        .await
+        .expect("platform credentials are read");
+    assert!(
+        stored.iter().all(|hash| !hash.contains(plaintext)),
+        "the stored verifier does not carry the credential"
+    );
+}
+
+/// Collects a subscriber's output into a shared buffer for inspection.
+struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CaptureWriter {
+    /// Appends to the shared buffer, ignoring a poisoned lock as unreachable
+    /// here: nothing else writes to it while a test holds the subscriber.
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Ok(mut sink) = self.0.lock() {
+            sink.extend_from_slice(buf);
+        }
+        Ok(buf.len())
+    }
+
+    /// Nothing is buffered beyond the shared vector, so flushing is a no-op.
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// An uninitialized deployment serves its tenants and refuses its platform plane.
+///
+/// Initialization is an operator subcommand, not a server-start side effect, so
+/// a deployment can run indefinitely without one. That must be a stable state
+/// rather than a broken one: ordinary tenant traffic works, the platform plane
+/// refuses every caller because there is no identity that could administer it,
+/// and the refusal is the same on the tenth attempt as on the first.
+#[tokio::test]
+async fn an_uninitialized_deployment_serves_tenants_and_refuses_the_platform_plane() {
+    if !e2e_enabled() {
+        return;
+    }
+    let srv = WyrdTestServer::start_in_process()
+        .await
+        .expect("server starts");
+
+    // Tenant traffic is unaffected: tenants do not depend on a platform root.
+    let tenant = srv
+        .bootstrap_service("uninitialized-tenant", &["admin"])
+        .await
+        .expect("tenant principal seeds");
+    let token = srv
+        .exchange_api_key(tenant.api_key().expect("machine key"))
+        .await
+        .expect("tenant token exchanges");
+    let resp = srv
+        .oneshot_authenticated(
+            &token,
+            tenant_request(
+                Method::POST,
+                "/v1/principals",
+                Some(json!({ "name": "unaffected", "roles": ["reader"] })),
+            ),
+        )
+        .await
+        .expect("principal route responds");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "an uninitialized deployment still serves its tenants"
+    );
+
+    // The platform plane admits nobody, the same way every time.
+    for attempt in 0..3 {
+        let resp = srv
+            .oneshot(anonymous_post(
+                "/auth/platform/token",
+                json!({ "credential": "wyrd_global_not_a_real_credential" }),
+            ))
+            .await
+            .expect("platform token route responds");
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "attempt {attempt} is refused"
+        );
+        let body = body_json(resp).await;
+        assert!(
+            !body.to_string().to_lowercase().contains("uninitialized"),
+            "the refusal does not advertise that the deployment is uninitialized: {body}"
+        );
+    }
+
+    // And nothing about that state created an identity by accident.
+    let roots: i64 = sqlx::query_scalar("SELECT count(*) FROM platform.principals")
+        .fetch_one(srv.operator_pool().pool())
+        .await
+        .expect("platform principals are counted");
+    assert_eq!(roots, 0, "serving traffic establishes no platform identity");
+}

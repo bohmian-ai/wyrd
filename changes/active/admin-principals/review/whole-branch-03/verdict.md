@@ -13,6 +13,26 @@ The candidate remained pinned throughout review. The owner waived all of
 committer identities. The bundled verified-change-contract work is approved
 cumulative scope and is not drift.
 
+## Post-review owner decisions
+
+After this review, the owner approved revisions 8 through 10 and superseded two
+remediation directions without changing the reviewed candidate or the
+`FIX_REQUIRED` verdict:
+
+- `utoipa`, its typed annotations, the runtime `WyrdApiDoc`, `/openapi.json`,
+  focused contract tests, and user documentation are required. The checked-in
+  YAML snapshot, YAML endpoint/feature/dependency, emitter, OpenAPI
+  codegen/drift wiring, snapshot parser, and unimplemented release OpenAPI
+  digest are deleted; no second schema owner is added.
+- Required Python `.pyi` and TypeScript `.d.ts` declarations remain generated
+  public SDK surfaces for typing, editor ergonomics, and documentation.
+- Machine grants issue no refresh token and `wyrd-client` continues to
+  re-exchange durable API-key/workload credentials. Refresh rotation is reserved
+  for human OIDC sessions and the eventual HTTP-only UI/BFF session boundary.
+
+The remediation packet is authoritative for these revised correction outcomes;
+`findings-validation.md` remains the historical validation record.
+
 ## Verdict
 
 **FIX_REQUIRED**
@@ -30,10 +50,10 @@ and boundary defects.
 | Two-plane authorization and tenant admission | Platform journeys twice; source review | PASS |
 | Narrow SQL ownership | `TenantProvisioning` and `TenantRecovery` retain `WyrdPostgres` | FAIL — `FIND-admin-principals-2` |
 | Safe public errors | Two admin conflict mappers expose physical constraints | FAIL — `FIND-admin-principals-3` |
-| Complete generated administrative contract | OpenAPI stable-code, response-schema, and revoke prose gaps | FAIL — `FIND-admin-principals-13` |
+| Complete generated administrative contract | OpenAPI omits exact administrative types and reachable stable errors | FAIL — `FIND-admin-principals-13` |
 | Allowed decision and same-plane effect are atomic | `/auth/issue-key` commits its allowance first | FAIL — `FIND-005-1` |
 | Executable self-hosted operator workflow | CLI journey and operator page skip tenant configuration | FAIL — `FIND-004-5` |
-| Authenticating credential attribution | Refresh rotation and successor access context erase the refresh-row id | FAIL — `FIND-admin-principals-R2-3` |
+| Coherent renewal model | Machine grants mint unused refresh tokens while User refresh rotation is unfinished | FAIL — `FIND-admin-principals-R2-3` |
 | Refresh replay containment | Reuse revocation and audit roll back on the error return | FAIL — `FIND-admin-principals-R2-4` |
 | Audit identifies the acted-on resource | Platform audit uses generic, missing, or discarded targets | FAIL — `FIND-admin-principals-R3-1` |
 | Platform OIDC first-login interoperability | Accepted trailing-slash issuer is stored noncanonically | FAIL — `FIND-admin-principals-R3-2` |
@@ -66,11 +86,11 @@ passed, closing the evidence-only thirteenth root without a code change.
 |---|---|---|
 | `FIND-admin-principals-2` | VIOLATION | Remove broad `WyrdPostgres` ownership from live provisioning/recovery owners. |
 | `FIND-admin-principals-3` | VIOLATION | Keep physical constraint identifiers server-side. |
-| `FIND-admin-principals-13` | INCORRECT | Publish typed bodies, exact reachable stable codes, and truthful generated prose. |
+| `FIND-admin-principals-13` | INCORRECT | Keep and repair `/openapi.json` as the one `utoipa` contract; delete the explicitly enumerated checked-in/YAML/codegen/release duplicates without deleting documentation, SDK declarations, or boundary checks. |
 | `FIND-005-1` | VIOLATION | Commit issue-key allowance, issuance, and issuance evidence once. |
 | `FIND-004-5` | MISSING | Prove and document tenant configuration in the real operator CLI journey. |
-| `FIND-admin-principals-R2-3` | INCORRECT | Preserve the consumed refresh credential id in rotation and successor context. |
-| `FIND-admin-principals-R2-4` | INCORRECT | Durably commit replay family revocation and its audit before returning 401. |
+| `FIND-admin-principals-R2-3` | INCORRECT | Stop machine refresh issuance; complete attributed User refresh rotation for human sessions. |
+| `FIND-admin-principals-R2-4` | INCORRECT | Durably commit human-session replay family revocation and its audit before returning 401. |
 | `FIND-admin-principals-R3-1` | INCORRECT | Record the exact platform operation target, including truthful retry identity. |
 | `FIND-admin-principals-R3-2` | INCORRECT | Persist and compare one canonical platform issuer value. |
 | `FIND-admin-principals-R3-3` | VIOLATION | Reuse the existing secret-bearing types and redacted debug behavior. |

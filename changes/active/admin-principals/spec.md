@@ -1,6 +1,6 @@
 ---
 id: SPEC-admin-principals
-revision: 7
+revision: 10
 status: approved
 approved_at: 2026-09-19
 ---
@@ -125,7 +125,7 @@ to satisfy this specification.
   login entry it serves.
 - Tenant-created service principals with restricted grants.
 - Removal of `bootstrap-key` and its fabricated Card and operator identity.
-- HTTP, CLI, SDK, and MCP projections, audit, and documentation.
+- HTTP, OpenAPI, CLI, SDK, and MCP projections, audit, and documentation.
 
 ## Non-goals
 
@@ -379,16 +379,35 @@ to satisfy this specification.
   maps its own status codes onto errors. A surface that cannot be expressed
   through the shared client is evidence the shared client is missing a
   capability, not licence to hand-roll one.
+- **REQ-048**: Machine authentication and human-session continuation MUST use
+  different renewal models. API-key and workload-identity grants MUST return a
+  short-lived access token and no refresh token. `wyrd-client` MUST cache that
+  access token, re-exchange the original durable credential before expiry, and
+  after one authentication refusal re-exchange and retry the refused request at
+  most once. Refresh tokens are reserved for human OIDC sessions: they MUST be
+  stored as one-way verifiers, rotate on every use, revoke the active family on
+  reuse, and name the consumed refresh credential in audit and successor access
+  context. The eventual UI owns automatic human-session renewal and MUST keep
+  refresh material in an HTTP-only server/BFF session rather than browser
+  JavaScript storage; implementing that UI is not part of this change.
+- **REQ-049**: `utoipa` is the single mandatory OpenAPI owner. The server MUST
+  generate the canonical document from typed DTOs and route annotations and
+  expose it at `/openapi.json` for Swagger-compatible tooling. The document
+  MUST describe every served public route, authentication scheme, typed request
+  and response body, problem media type, and reachable stable `WyrdError` code.
+  Wyrd MUST NOT maintain a checked-in OpenAPI snapshot, a second YAML endpoint,
+  an OpenAPI file generator or drift lane, a release-manifest OpenAPI digest, a
+  hand-written route catalog, or an independent error list.
 
 ### Surfaces, audit, documentation, and replacement
 
 - **REQ-036**: Platform and tenant administrative operations MUST be available
   headlessly over the language-agnostic HTTP contract with typed bodies, stable
-  `WyrdError` codes, and generated artifacts. CLI, SDKs, and MCP project that
-  contract; no surface introduces a second identity model or durable authority.
-  The generated contract MUST declare the authentication scheme its
-  administrative paths require, so an independent client can implement them from
-  the artifact alone.
+  `WyrdError` codes, and generated OpenAPI. CLI, SDKs, MCP, and documentation
+  project that contract; no surface introduces a second identity model or
+  durable authority. The generated contract MUST declare the authentication
+  scheme its administrative paths require, so an independent client can
+  implement them from the served document alone.
 - **REQ-037**: Every authorization decision made by these operations MUST append
   its audit row in the same transaction as the decision, for allowed and denied
   alike, naming the principal, the credential that authenticated the request,
@@ -540,6 +559,14 @@ Tenant administrative principal
 - Credential ownership becomes principal-generic in the durable schema.
 - Administrative surfaces are transactionally audited, superseding the current
   no-audit stance on the admin routes.
+- Machine credentials are re-exchanged; refresh-token families are reserved for
+  human OIDC sessions and the eventual server-owned UI session boundary.
+- OpenAPI generated through `utoipa` is a mandatory public contract served by
+  the server at `/openapi.json`. It has no checked-in snapshot, duplicate YAML
+  endpoint, file-generation lane, or speculative release digest. Typed wire
+  DTOs, stable problem responses, first-class clients, MCP, CLI, JSON Schemas,
+  required Python `.pyi` declarations, and required TypeScript `.d.ts`
+  declarations remain separate required surfaces.
 - `bootstrap-key`, its fabricated Card, and `SYSTEM_OPERATOR_ID` are deleted
   rather than retained alongside the new model.
 
@@ -605,10 +632,12 @@ documents. These amendments are part of the change.
 - **AC-012**: Service-principal evidence proves a tenant administrator can
   create a restricted machine principal whose credential performs its granted
   operations and is denied tenant administration.
-- **AC-013**: Contract and generated-artifact evidence proves HTTP, CLI, SDK,
-  MCP, schemas, stable errors, and documentation describe one administrative
-  identity model, that `bootstrap-key` and its fabricated identities are gone,
-  and that no unreachable second identity model remains in the schema.
+- **AC-013**: Contract and generated-artifact evidence proves HTTP, OpenAPI,
+  CLI, SDK, MCP, JSON Schemas, required Python `.pyi` declarations, required
+  TypeScript `.d.ts` declarations, stable errors, and documentation describe
+  one administrative identity model, that `bootstrap-key` and its fabricated
+  identities are gone, and that no unreachable second identity model remains
+  in the schema.
 - **AC-015**: Bootstrap-chain evidence proves the global administrative
   credential configures the platform OIDC connection and pre-registers the first
   human platform administrator; that the first login pins `(issuer, subject)`
@@ -623,16 +652,26 @@ documents. These amendments are part of the change.
   tenant principal creation, role grant, and OIDC group mapping — can create a
   platform principal or confer platform authority.
 - **AC-014**: Contract evidence proves the administrative HTTP surface is
-  implementable by an independent client: the generated OpenAPI document
-  declares every administrative path, its typed bodies, its stable error codes,
-  and the authentication scheme those paths require. The CLI and MCP exercise
-  those operations against a real server, and they are the administrative
+  implementable by an independent client: the generated OpenAPI document and
+  the served `/openapi.json` endpoint declare every administrative path, its
+  typed bodies, reachable stable error codes, problem media, and authentication
+  scheme. The CLI and MCP exercise those operations
+  against a real server, and they are the administrative
   surfaces this change builds and proves: administration is an operator and
   agent act, and a Python or TypeScript binding for it has no user the CLI does
   not already serve. `wyrd-client` retains the shared implementation because
   `REQ-047` requires the CLI to call through it; the Rust SDK's existing
   re-export of that crate is unaffected and carries no separate administrative
   surface of its own.
+- **AC-018**: Renewal evidence proves API-key and workload grants return no
+  refresh token; `wyrd-client` re-exchanges before expiry and once after an
+  authentication refusal; a human OIDC session rotates its refresh token,
+  successfully uses the successor access token after the original expires, and
+  durably revokes the successor family when the consumed token is replayed.
+- **AC-019**: OpenAPI evidence proves `utoipa` remains the single generator,
+  `/openapi.json` serves its runtime document, route/auth/body/problem/error
+  coverage is exact without a parallel catalog, and no checked-in snapshot,
+  YAML endpoint, file-generation lane, or release OpenAPI digest remains.
 
 ## Material constraints
 
@@ -684,9 +723,11 @@ and review.
   They are not this change's obligation to diagnose, fix, skip, or report as
   regressions, and they do not block its acceptance. This does not license
   weakening, disabling, or deleting any test to produce a passing result.
-- **VER-006**: Contract regeneration (`mise run codegen:check`) remains in scope
-  because this change owns the HTTP, error-catalog, schema, and stub contracts
-  it alters.
+- **VER-006**: Contract regeneration remains in scope for the error catalog,
+  JSON Schemas, required Python `.pyi` declarations, and required TypeScript
+  `.d.ts` declarations this change alters. Runtime OpenAPI correctness is
+  verified by the owning server contract tests rather than a generated-file
+  drift check.
 
 ## Delivery sequence
 
@@ -718,10 +759,11 @@ the next.
     the platform login entry. Stage 4 carries the platform grant store this
     depends on.
 12. **Surface consolidation** — one authentication pipeline on one header, one
-    signing-key resolution, the authentication scheme published in the generated
-    contract, and every Wyrd-owned caller moved onto `wyrd-client`. This stage
-    adds no capability; it removes the duplicate implementations the earlier
-    stages accumulated.
+    signing-key resolution, every Wyrd-owned caller moved onto `wyrd-client`,
+    machine renewal by durable-credential re-exchange, human refresh rotation,
+    and one accurate `utoipa` OpenAPI document served at `/openapi.json`. This
+    stage removes duplicate renewal and OpenAPI artifact machinery and keeps one
+    runtime HTTP contract.
 
 ## Open material decisions
 
@@ -729,6 +771,28 @@ None. Every decision raised during drafting has been resolved by the author.
 
 ## Revision history
 
+- **Revision 10 — 2026-09-19 — approved**: Narrows revision 9 to the one
+  OpenAPI surface users need. `utoipa`, its route/schema annotations, the
+  runtime `WyrdApiDoc`, `/openapi.json`, contract tests, and user documentation
+  remain required. The checked-in `openapi.yaml`, `/openapi.yaml`, its emitter,
+  codegen/drift wiring, YAML-only dependency features, snapshot-parsing docs
+  machinery, and the unimplemented release OpenAPI digest are deleted. Python
+  `.pyi` and TypeScript `.d.ts` declarations remain required SDK surfaces.
+- **Revision 9 — 2026-09-19 — approved**: Corrects revision 8's OpenAPI
+  deletion. `utoipa`, checked-in generated OpenAPI, drift verification, docs,
+  and runtime `/openapi.json` and `/openapi.yaml` endpoints are hard
+  requirements for Swagger-compatible organizational tooling. The revision-8
+  machine-versus-human renewal split remains approved and unchanged.
+- **Revision 8 — 2026-09-19 — approved**: Owner-approved simplification.
+  Machine API-key and workload grants no longer issue refresh tokens;
+  `wyrd-client` re-exchanges their durable credential before expiry and once
+  after an authentication refusal. Refresh rotation is reserved for human OIDC
+  sessions and the eventual HTTP-only UI/BFF session boundary. OpenAPI is
+  deleted as an unused duplicate contract: artifact, runtime endpoints,
+  generator, `utoipa` machinery, docs, release references, tasks, and checks.
+  Typed HTTP bodies, stable errors, first-class SDKs, CLI, MCP, JSON Schemas,
+  required Python `.pyi` declarations, required TypeScript `.d.ts`
+  declarations, behavioral tests, and generated docs remain authoritative.
 - **Revision 7 — 2026-09-19 — approved**: Consolidation revision; adds no new
   product capability. `AC-014` drops the Python and TypeScript administrative
   bindings and is re-grounded on the generated contract plus the Rust SDK.

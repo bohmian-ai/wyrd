@@ -17,7 +17,7 @@ use wyrd_spec::auth::PrincipalId;
 use wyrd_sql::queries::platform::credentials::{
     insert_platform_credential_tx, platform_credential_by_prefix_tx, touch_platform_credential_tx,
 };
-use wyrd_sql::{OperatorPool, SqlError, TenantConn};
+use wyrd_sql::{SqlError, TenantConn};
 
 use crate::credential_verify::verify_presented;
 
@@ -115,121 +115,90 @@ pub enum PlatformCredentialError {
     Store(#[from] SqlError),
 }
 
-/// Issues and verifies platform-scope credentials.
+/// Mint a credential for an existing platform principal.
 ///
-/// Owns the operator boundary it writes through, so callers discover credential
-/// work as `credentials.issue(...)` and
-/// `credentials.authenticate_for_session(...)` rather
-/// than threading a pool through every call.
-#[derive(Clone)]
-pub struct PlatformCredentials {
-    /// Cross-tenant boundary the platform credential store lives behind.
-    pool: OperatorPool,
+/// Generates the secret, hashes it off the async runtime because Argon2 is
+/// deliberately expensive, persists only the verifier, and hands the
+/// plaintext back for its single exposure. `expires_at` is optional: an
+/// administrative credential established at initialization has no natural
+/// lifetime.
+///
+/// The insert runs on the caller's transaction — the one already carrying
+/// the authorization allowance — and the caller commits. A credential that
+/// committed on its own would be a usable secret the deployment never
+/// recorded permitting.
+///
+/// # Errors
+/// Returns [`PlatformCredentialError::Hash`] or
+/// [`PlatformCredentialError::Join`] when hashing fails, and
+/// [`PlatformCredentialError::Store`] when the insert is rejected —
+/// including when `principal_id` names no platform principal.
+#[tracing::instrument(level = "debug", skip(conn), fields(principal_id = %principal_id), err)]
+pub async fn issue_platform_credential(
+    conn: &mut TenantConn<'_>,
+    principal_id: Uuid,
+    expires_at: Option<DateTime<Utc>>,
+) -> Result<IssuedPlatformCredential, PlatformCredentialError> {
+    let credential = PlatformCredential::generate();
+    let raw = credential.secret.clone();
+    let secret_hash = tokio::task::spawn_blocking(move || hash_api_key(&raw)).await??;
+
+    let id = Uuid::new_v4();
+    insert_platform_credential_tx(
+        conn,
+        id,
+        principal_id,
+        &credential.prefix,
+        &secret_hash,
+        expires_at,
+    )
+    .await?;
+
+    Ok(IssuedPlatformCredential { id, credential })
 }
 
-impl std::fmt::Debug for PlatformCredentials {
-    /// Prints the handle without its pool: a connection source has no
-    /// inspectable state and printing it would only add noise to a trace.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PlatformCredentials")
-            .finish_non_exhaustive()
-    }
-}
+/// Authenticate a credential and report which credential it was.
+///
+/// The exchange path needs the credential's identity as well as its
+/// principal, so a minted session can be tied to — and revoked with — the
+/// credential that produced it.
+///
+/// Runs on the caller's operator transaction rather than the pool, because
+/// the grant this authenticates is one boundary: the lookup, the last-used
+/// touch, the canonical audit row, and the commit either all happen or none
+/// do. A pool-scoped read here would let a refused or rolled-back grant
+/// still leave a recorded use behind.
+///
+/// # Errors
+/// Returns [`PlatformCredentialError::InvalidCredential`] for every
+/// rejection and [`PlatformCredentialError::Store`] when the lookup fails.
+pub async fn authenticate_for_session(
+    conn: &mut TenantConn<'_>,
+    presented: &SecretString,
+) -> Result<AuthenticatedPlatformCredential, PlatformCredentialError> {
+    let row = match PlatformCredential::prefix_of(presented) {
+        Some(prefix) => platform_credential_by_prefix_tx(conn, &prefix)
+            .await?
+            .filter(|row| row.is_usable(Utc::now())),
+        None => None,
+    };
 
-impl PlatformCredentials {
-    /// Bind credential issuance and verification to one operator boundary.
-    #[must_use]
-    pub const fn new(pool: OperatorPool) -> Self {
-        Self { pool }
-    }
+    // Exactly one verification, whatever was wrong with the input: a
+    // malformed shape, an unknown prefix, and a revoked, expired or
+    // suspended credential all used to answer before Argon2 ran, so a live
+    // prefix with a wrong tail took visibly longer than any of them and the
+    // endpoint enumerated live prefixes by clock.
+    let matched =
+        verify_presented(presented, row.as_ref().map(|row| row.secret_hash.as_str())).await?;
 
-    /// Mint a credential for an existing platform principal.
-    ///
-    /// Generates the secret, hashes it off the async runtime because Argon2 is
-    /// deliberately expensive, persists only the verifier, and hands the
-    /// plaintext back for its single exposure. `expires_at` is optional: an
-    /// administrative credential established at initialization has no natural
-    /// lifetime.
-    ///
-    /// The insert runs on the caller's transaction — the one already carrying
-    /// the authorization allowance — and the caller commits. A credential that
-    /// committed on its own would be a usable secret the deployment never
-    /// recorded permitting.
-    ///
-    /// # Errors
-    /// Returns [`PlatformCredentialError::Hash`] or
-    /// [`PlatformCredentialError::Join`] when hashing fails, and
-    /// [`PlatformCredentialError::Store`] when the insert is rejected —
-    /// including when `principal_id` names no platform principal.
-    #[tracing::instrument(level = "debug", skip(self, conn), fields(principal_id = %principal_id), err)]
-    pub async fn issue(
-        &self,
-        conn: &mut TenantConn<'_>,
-        principal_id: Uuid,
-        expires_at: Option<DateTime<Utc>>,
-    ) -> Result<IssuedPlatformCredential, PlatformCredentialError> {
-        let credential = PlatformCredential::generate();
-        let raw = credential.secret.clone();
-        let secret_hash = tokio::task::spawn_blocking(move || hash_api_key(&raw)).await??;
-
-        let id = Uuid::new_v4();
-        insert_platform_credential_tx(
-            conn,
-            id,
-            principal_id,
-            &credential.prefix,
-            &secret_hash,
-            expires_at,
-        )
-        .await?;
-
-        Ok(IssuedPlatformCredential { id, credential })
-    }
-
-    /// Authenticate a credential and report which credential it was.
-    ///
-    /// The exchange path needs the credential's identity as well as its
-    /// principal, so a minted session can be tied to — and revoked with — the
-    /// credential that produced it.
-    ///
-    /// Runs on the caller's operator transaction rather than the pool, because
-    /// the grant this authenticates is one boundary: the lookup, the last-used
-    /// touch, the canonical audit row, and the commit either all happen or none
-    /// do. A pool-scoped read here would let a refused or rolled-back grant
-    /// still leave a recorded use behind.
-    ///
-    /// # Errors
-    /// Returns [`PlatformCredentialError::InvalidCredential`] for every
-    /// rejection and [`PlatformCredentialError::Store`] when the lookup fails.
-    pub async fn authenticate_for_session(
-        &self,
-        conn: &mut TenantConn<'_>,
-        presented: &SecretString,
-    ) -> Result<AuthenticatedPlatformCredential, PlatformCredentialError> {
-        let row = match PlatformCredential::prefix_of(presented) {
-            Some(prefix) => platform_credential_by_prefix_tx(conn, &prefix)
-                .await?
-                .filter(|row| row.is_usable(Utc::now())),
-            None => None,
-        };
-
-        // Exactly one verification, whatever was wrong with the input: a
-        // malformed shape, an unknown prefix, and a revoked, expired or
-        // suspended credential all used to answer before Argon2 ran, so a live
-        // prefix with a wrong tail took visibly longer than any of them and the
-        // endpoint enumerated live prefixes by clock.
-        let matched =
-            verify_presented(presented, row.as_ref().map(|row| row.secret_hash.as_str())).await?;
-
-        let Some(row) = row.filter(|_| matched) else {
-            return Err(PlatformCredentialError::InvalidCredential);
-        };
-        touch_platform_credential_tx(conn, row.id).await?;
-        Ok(AuthenticatedPlatformCredential {
-            principal_id: PrincipalId::new(row.principal_id),
-            credential_id: row.id,
-        })
-    }
+    let Some(row) = row.filter(|_| matched) else {
+        return Err(PlatformCredentialError::InvalidCredential);
+    };
+    touch_platform_credential_tx(conn, row.id).await?;
+    Ok(AuthenticatedPlatformCredential {
+        principal_id: PrincipalId::new(row.principal_id),
+        credential_id: row.id,
+    })
 }
 
 #[cfg(test)]
@@ -311,7 +280,7 @@ mod pg_tests {
     use wyrd_sql::queries::platform::credentials::revoke_platform_credential;
     use wyrd_sql::queries::platform::principals::insert_platform_principal;
 
-    use super::{PlatformCredentialError, PlatformCredentials};
+    use super::{PlatformCredentialError, authenticate_for_session, issue_platform_credential};
 
     /// Seed a platform principal and return its id.
     async fn seed_principal(fixture: &PgFixture, name: &str) -> Uuid {
@@ -342,8 +311,7 @@ mod pg_tests {
             .begin_platform_audited()
             .await
             .expect("transaction opens");
-        let issued = PlatformCredentials::new(pool.clone())
-            .issue(&mut conn, principal, expires_at)
+        let issued = issue_platform_credential(&mut conn, principal, expires_at)
             .await
             .expect("credential issues");
         conn.commit().await.expect("credential commits");
@@ -365,9 +333,7 @@ mod pg_tests {
             .begin_platform_audited()
             .await
             .expect("transaction opens");
-        let result = PlatformCredentials::new(pool.clone())
-            .authenticate_for_session(&mut conn, presented)
-            .await;
+        let result = authenticate_for_session(&mut conn, presented).await;
         if result.is_ok() {
             conn.commit().await.expect("authentication commits");
         }

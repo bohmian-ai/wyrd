@@ -724,7 +724,7 @@ async fn tenant_token(srv: &WyrdTestServer, credential: &str) -> Result<String, 
 
 /// Provision a tenant and return its administrator's access token.
 async fn provisioned_tenant_admin(srv: &WyrdTestServer, slug: &str) -> String {
-    let root = initialize_platform_root(&srv)
+    let root = initialize_platform_root(srv)
         .await
         .expect("deployment initializes");
     let session = platform_session(srv, secrecy::ExposeSecret::expose_secret(&root)).await;

@@ -26,7 +26,7 @@ use wyrd_sql::queries::platform::principals::{
 use wyrd_sql::{OperatorPool, SqlError, TenantConn};
 
 use crate::audit::{TOKEN_EXCHANGE_OPERATION, auth_event, principal_kind_tag};
-use crate::platform_credentials::{PlatformCredentialError, PlatformCredentials};
+use crate::platform_credentials::{PlatformCredentialError, authenticate_for_session};
 
 /// Default platform session lifetime.
 ///
@@ -147,11 +147,8 @@ impl PlatformSessions {
         presented: &SecretString,
         request_id: &str,
     ) -> Result<PlatformSession, PlatformSessionError> {
-        let credentials = PlatformCredentials::new(self.pool.clone());
         let mut conn = self.pool.begin_platform_audited().await?;
-        let authenticated = credentials
-            .authenticate_for_session(&mut conn, presented)
-            .await?;
+        let authenticated = authenticate_for_session(&mut conn, presented).await?;
         let token = self
             .issuing_key
             .issue_platform_access_token(
@@ -375,7 +372,7 @@ mod pg_tests {
 
     use super::{PlatformSessionError, PlatformSessions};
     use crate::audit::TOKEN_EXCHANGE_OPERATION;
-    use crate::platform_credentials::PlatformCredentials;
+    use crate::platform_credentials::issue_platform_credential;
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
 
@@ -412,8 +409,7 @@ mod pg_tests {
             .begin_platform_audited()
             .await
             .expect("transaction opens");
-        let issued = PlatformCredentials::new(pool.clone())
-            .issue(&mut conn, principal, None)
+        let issued = issue_platform_credential(&mut conn, principal, None)
             .await
             .expect("credential issues");
         conn.commit().await.expect("credential commits");

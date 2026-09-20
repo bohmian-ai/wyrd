@@ -23,7 +23,7 @@ use uuid::Uuid;
 use wyrd_auth::platform_authz::{
     PlatformAuthorization, platform_credential_resource, platform_principal_resource,
 };
-use wyrd_auth::platform_credentials::{PlatformCredentialError, PlatformCredentials};
+use wyrd_auth::platform_credentials::{PlatformCredentialError, issue_platform_credential};
 use wyrd_runtime::Permission;
 use wyrd_spec::auth::{
     CredentialListResponse, CredentialMetadata, IssuePlatformCredentialRequest, IssuedCredential,
@@ -103,8 +103,7 @@ async fn issue_credential(
     // The credential and the allowance permitting it commit together: a secret
     // that outlived a failed decision would be usable authority nothing
     // recorded granting.
-    let issued = PlatformCredentials::new(pool)
-        .issue(&mut decision, principal_id, expires_at)
+    let issued = issue_platform_credential(&mut decision, principal_id, expires_at)
         .await
         .map_err(credential_error)?;
     commit_decision(decision).await?;

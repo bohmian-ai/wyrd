@@ -710,10 +710,19 @@ async fn begin_login(
 #[tracing::instrument(level = "info", skip(state, request))]
 async fn complete_login(
     State(state): State<AppState>,
+    request_id: Option<axum::Extension<wyrd_spec::request_id::RequestId>>,
     Json(request): Json<PlatformCallbackRequest>,
 ) -> Result<Json<PlatformTokenResponse>, WyrdErrorResponse> {
+    let fallback_request_id: String;
+    let req_id = match request_id.as_ref() {
+        Some(axum::Extension(id)) => id.as_str(),
+        None => {
+            fallback_request_id = uuid::Uuid::new_v4().to_string();
+            &fallback_request_id
+        }
+    };
     let token = login_service(&state)?
-        .complete(SecretString::from(request.code), &request.state)
+        .complete(SecretString::from(request.code), &request.state, req_id)
         .await
         .map_err(login_error)?;
 

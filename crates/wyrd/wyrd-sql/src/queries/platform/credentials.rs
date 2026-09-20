@@ -122,8 +122,17 @@ pub async fn platform_credential_by_prefix(
     pool: &OperatorPool,
     prefix: &str,
 ) -> Result<Option<PlatformCredentialLookupRow>, SqlError> {
-    sqlx::query_as::<_, PlatformCredentialLookupRow>(
-        "SELECT c.id,
+    sqlx::query_as::<_, PlatformCredentialLookupRow>(CREDENTIAL_BY_PREFIX_SQL)
+        .bind(prefix)
+        .fetch_optional(pool.pool())
+        .await
+        .map_err(SqlError::from)
+}
+
+/// The one credential-by-prefix read, shared by the pool and transaction entry
+/// points so an authentication that participates in a grant transaction cannot
+/// drift from one that does not.
+const CREDENTIAL_BY_PREFIX_SQL: &str = "SELECT c.id,
                 c.principal_id,
                 c.secret_hash,
                 p.status AS principal_status,
@@ -132,12 +141,26 @@ pub async fn platform_credential_by_prefix(
                 c.expires_at
            FROM platform.credentials c
            JOIN platform.principals p ON p.id = c.principal_id
-          WHERE c.prefix = $1",
-    )
-    .bind(prefix)
-    .fetch_optional(pool.pool())
-    .await
-    .map_err(SqlError::from)
+          WHERE c.prefix = $1";
+
+/// Look up a platform credential by prefix inside an open operator
+/// transaction.
+///
+/// The credential-exchange grant reads, touches, audits, and commits as one
+/// boundary, so the read has to be on that transaction: a pool read could
+/// observe a credential that the grant's own transaction later cannot.
+///
+/// # Errors
+/// Returns [`SqlError::Query`] when the read fails.
+pub async fn platform_credential_by_prefix_tx(
+    conn: &mut TenantConn<'_>,
+    prefix: &str,
+) -> Result<Option<PlatformCredentialLookupRow>, SqlError> {
+    sqlx::query_as::<_, PlatformCredentialLookupRow>(CREDENTIAL_BY_PREFIX_SQL)
+        .bind(prefix)
+        .fetch_optional(&mut **conn.transaction())
+        .await
+        .map_err(SqlError::from)
 }
 
 /// Look up a platform credential by its durable id.
@@ -225,9 +248,33 @@ pub async fn revoke_platform_credential(
 /// # Errors
 /// Returns [`SqlError::Query`] when the update fails.
 pub async fn touch_platform_credential(pool: &OperatorPool, id: Uuid) -> Result<(), SqlError> {
-    sqlx::query("UPDATE platform.credentials SET last_used_at = now() WHERE id = $1")
+    sqlx::query(TOUCH_CREDENTIAL_SQL)
         .bind(id)
         .execute(pool.pool())
+        .await
+        .map_err(SqlError::from)?;
+    Ok(())
+}
+
+/// The one last-used update, shared by the pool and transaction entry points.
+const TOUCH_CREDENTIAL_SQL: &str =
+    "UPDATE platform.credentials SET last_used_at = now() WHERE id = $1";
+
+/// Record a successful credential use inside an open operator transaction.
+///
+/// The exchange grant commits the touch with the audit row and the session it
+/// authorized, so a rolled-back grant leaves no trace of a use that never
+/// produced a token.
+///
+/// # Errors
+/// Returns [`SqlError::Query`] when the update fails.
+pub async fn touch_platform_credential_tx(
+    conn: &mut TenantConn<'_>,
+    id: Uuid,
+) -> Result<(), SqlError> {
+    sqlx::query(TOUCH_CREDENTIAL_SQL)
+        .bind(id)
+        .execute(&mut **conn.transaction())
         .await
         .map_err(SqlError::from)?;
     Ok(())

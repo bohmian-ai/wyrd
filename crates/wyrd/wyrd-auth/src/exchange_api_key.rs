@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -454,7 +454,22 @@ pub(crate) async fn issue_for_subject(
     // and must be able to exchange its credential, or a provisioned tenant
     // would hand back a credential that never works.
     if subject.card_ref.is_none() {
-        return issue_cardless_subject(conn, issuing_key, settings, subject);
+        let principal_id = subject.principal_id;
+        let credential_id = subject.credential_id;
+        let kind =
+            principal_kind_wire(&subject.principal_kind).ok_or(IssueError::InvalidPrincipalKind)?;
+        let exchanged = issue_cardless_subject(conn, issuing_key, settings, subject)?;
+        append_token_exchange_audit(
+            conn,
+            principal_id,
+            kind,
+            None,
+            credential_id,
+            exchanged.expires_at,
+            request_id,
+        )
+        .await?;
+        return Ok(exchanged);
     }
     let IssueSubject {
         principal_id,
@@ -486,6 +501,20 @@ pub(crate) async fn issue_for_subject(
         )
         .map_err(|error| issue_or_wyrd_error(error, &card_ref))?;
     let expires_at = Utc::now() + settings.access_ttl;
+    // Two different decisions, two records. The scope mint says what emit
+    // authority the Card conferred; the exchange says a credential was spent to
+    // obtain a token and which one. Folding them would lose the credential a
+    // leak investigation needs to revoke.
+    append_token_exchange_audit(
+        conn,
+        principal_id,
+        kind,
+        Some(card_ref.clone()),
+        credential_id,
+        expires_at,
+        request_id,
+    )
+    .await?;
     write_scope_mint_success_audit(
         conn,
         principal_id,
@@ -502,6 +531,50 @@ pub(crate) async fn issue_for_subject(
         token_type: TokenType::Bearer,
         expires_at,
     })
+}
+
+/// Append the one canonical grant record for a tenant token exchange.
+///
+/// Every tenant grant passes through here, Card-free and Card-bound alike, so
+/// the record naming the spent credential cannot be forgotten by a caller that
+/// only handles one of the two shapes. The event goes on the caller's
+/// `TenantConn`, so the token and its record commit together: a returned token
+/// with no committed grant row, or a row for a grant that was rolled back, are
+/// both impossible.
+///
+/// `credential_id` is the API-key row the holder presented, absent only when a
+/// grant names no stored credential.
+///
+/// # Errors
+/// Returns the append failure, which refuses the grant. A token the deployment
+/// cannot account for is worse than a refused exchange the caller can retry.
+async fn append_token_exchange_audit(
+    conn: &mut TenantConn<'_>,
+    principal_id: Uuid,
+    kind: PrincipalKindTag,
+    card_ref: Option<CardRef>,
+    credential_id: Option<Uuid>,
+    expires_at: DateTime<Utc>,
+    request_id: &str,
+) -> Result<(), IssueOrSqlError> {
+    let id = PrincipalId::new(principal_id);
+    let event = auth_event(
+        request_id,
+        TOKEN_EXCHANGE_OPERATION,
+        id,
+        kind,
+        card_ref,
+        AuditOutcome::Allowed,
+        AuditDetail::TokenExchange {
+            subject_principal_id: id,
+            actor_principal_id: id,
+            delegation_chain: Vec::new(),
+            expires_at,
+        },
+    )
+    .with_credential_id(credential_id);
+    append_auth_audit(conn, &event).await?;
+    Ok(())
 }
 
 /// Map card-bound issuer errors into the API-key exchange error channel.
@@ -776,6 +849,8 @@ mod pg_tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use crate::audit::{CARD_SCOPE_MINT_OPERATION, TOKEN_EXCHANGE_OPERATION};
+
     use chrono::{Duration, Utc};
     use secrecy::SecretString;
     use sqlx::types::Json;
@@ -1008,6 +1083,155 @@ mod pg_tests {
     /// # Panics
     ///
     /// Panics when the fixture cannot start or any assertion fails.
+    /// Seed a live API key for a principal and return its row id and secret.
+    ///
+    /// The row id is what a grant record must name, so the attribution tests
+    /// need it rather than a fresh UUID.
+    async fn insert_live_api_key(
+        conn: &mut TenantConn<'_>,
+        tenant: DataTenantId,
+        principal_id: Uuid,
+        created_by: Uuid,
+    ) -> (Uuid, SecretString) {
+        let key = WyrdApiKey::generate(tenant);
+        let hash = wyrd_auth_issue::hash_api_key(&key.secret).expect("api key hashes");
+        let api_key_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO wyrd.auth_api_keys
+                 (id, data_tenant_id, principal_id, prefix, key_hash, created_by, expires_at)
+             VALUES ($1, $2, $3, $4, $5, $6, now() + interval '1 day')",
+        )
+        .bind(api_key_id)
+        .bind(tenant.as_uuid())
+        .bind(principal_id)
+        .bind(&key.prefix)
+        .bind(&hash)
+        .bind(created_by)
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("live api key inserts");
+        (api_key_id, key.secret)
+    }
+
+    /// Count the grant records staged for a principal, and read the credential
+    /// the single record names.
+    async fn staged_exchange(
+        conn: &mut TenantConn<'_>,
+        tenant: DataTenantId,
+        principal_id: Uuid,
+    ) -> (i64, Option<Uuid>) {
+        let rows: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
+            "SELECT principal_id, credential_id FROM vala.audit_staging
+              WHERE data_tenant_id = $1 AND operation = $2 AND principal_id = $3",
+        )
+        .bind(tenant.as_uuid())
+        .bind(TOKEN_EXCHANGE_OPERATION)
+        .bind(principal_id)
+        .fetch_all(&mut **conn.transaction())
+        .await
+        .expect("grant record query runs");
+        let credential = rows.first().and_then(|(_, credential)| *credential);
+        (
+            i64::try_from(rows.len()).expect("a test never stages more rows than an i64 holds"),
+            credential,
+        )
+    }
+
+    /// A Card-free tenant grant is recorded and names the key that bought it.
+    ///
+    /// A tenant administrator binds no Card, so it takes the Card-free branch
+    /// and writes no scope mint. Without a grant record on that branch the most
+    /// privileged tenant principal could exchange its credential repeatedly and
+    /// leave nothing behind to attribute afterwards.
+    ///
+    /// # Panics
+    /// Panics when the exchange fails, when the grant is not recorded exactly
+    /// once, or when the record does not name the presented key.
+    #[tokio::test]
+    async fn a_card_free_exchange_commits_one_attributed_grant_record() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let user_id = insert_test_user(&mut conn, tenant).await;
+        let admin_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO wyrd.auth_service_accounts
+                 (id, data_tenant_id, principal_kind, name, status, created_by)
+             VALUES ($1, $2, 'tenant_admin', $3, 'active', $4)",
+        )
+        .bind(admin_id)
+        .bind(tenant.as_uuid())
+        .bind(format!("admin-{admin_id}"))
+        .bind(user_id)
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("card-free administrator inserts");
+        let (api_key_id, secret) = insert_live_api_key(&mut conn, tenant, admin_id, user_id).await;
+
+        exchange_service()
+            .execute(&mut conn, secret, "req-cardfree-grant")
+            .await
+            .expect("a card-free administrator exchanges its credential");
+
+        let (count, credential) = staged_exchange(&mut conn, tenant, admin_id).await;
+        assert_eq!(count, 1, "exactly one grant record is staged");
+        assert_eq!(
+            credential,
+            Some(api_key_id),
+            "the grant names the api key that was spent"
+        );
+    }
+
+    /// A Card-bound tenant grant records the exchange and the scope mint.
+    ///
+    /// They answer different questions — which credential bought a token, and
+    /// what emit authority the Card conferred — so one cannot stand in for the
+    /// other.
+    ///
+    /// # Panics
+    /// Panics when the exchange fails, when the grant is not recorded exactly
+    /// once naming the key, or when the scope mint is missing.
+    #[tokio::test]
+    async fn a_card_bound_exchange_records_the_grant_and_the_scope_mint() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let card_ref = test_service_card_ref();
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let user_id = insert_test_user(&mut conn, tenant).await;
+        let sa_id = insert_test_service_account(&mut conn, tenant, user_id, &card_ref).await;
+        let (api_key_id, secret) = insert_live_api_key(&mut conn, tenant, sa_id, user_id).await;
+
+        exchange_service()
+            .execute(&mut conn, secret, "req-cardbound-grant")
+            .await
+            .expect("a card-bound service exchanges its credential");
+
+        let (count, credential) = staged_exchange(&mut conn, tenant, sa_id).await;
+        assert_eq!(count, 1, "exactly one grant record is staged");
+        assert_eq!(
+            credential,
+            Some(api_key_id),
+            "the grant names the api key that was spent"
+        );
+
+        let mints: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM vala.audit_staging
+              WHERE data_tenant_id = $1 AND operation = $2 AND principal_id = $3",
+        )
+        .bind(tenant.as_uuid())
+        .bind(CARD_SCOPE_MINT_OPERATION)
+        .bind(sa_id)
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("scope mint query runs");
+        assert_eq!(
+            mints, 1,
+            "the distinct scope-mint decision is still recorded on its own"
+        );
+    }
+
     #[tokio::test]
     async fn api_key_exchange_issues_no_refresh_token_or_row() {
         let fixture = PgFixture::start().await.expect("fixture starts");

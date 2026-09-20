@@ -82,8 +82,17 @@ pub fn platform_auth_router() -> Router<AppState> {
 #[tracing::instrument(level = "info", skip(state, request))]
 async fn platform_token(
     State(state): State<AppState>,
+    request_id: Option<axum::Extension<wyrd_spec::request_id::RequestId>>,
     Json(request): Json<PlatformTokenRequest>,
 ) -> Result<Json<PlatformTokenResponse>, WyrdErrorResponse> {
+    let fallback_request_id: String;
+    let req_id = match request_id.as_ref() {
+        Some(axum::Extension(id)) => id.as_str(),
+        None => {
+            fallback_request_id = uuid::Uuid::new_v4().to_string();
+            &fallback_request_id
+        }
+    };
     let Some(operator) = state.postgres.operator_pool() else {
         return Err(not_configured());
     };
@@ -93,7 +102,7 @@ async fn platform_token(
 
     let sessions = PlatformSessions::new(operator, issuing_key);
     let presented = SecretString::from(request.credential.expose().to_owned());
-    match sessions.exchange(&presented).await {
+    match sessions.exchange(&presented, req_id).await {
         Ok(session) => Ok(Json(PlatformTokenResponse {
             access_token: SecretBearer::new(session.token.expose_secret().to_owned()),
             token_type: "Bearer".to_owned(),

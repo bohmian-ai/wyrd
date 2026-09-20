@@ -145,6 +145,7 @@ cargo nextest run --locked -p wyrd-sql --test pg_admin_principals
 cargo nextest run --locked -p wyrd-sql --test pg_platform_identity
 cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^platform_authz::pg_tests::/)'
 cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^platform_credentials::pg_tests::/)'
+cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^platform_sessions::pg_tests::/)'
 cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^exchange_api_key::pg_tests::/)'
 cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^revoke::pg_tests::/)'
 cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^callback::pg_tests::/)'

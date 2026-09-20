@@ -215,6 +215,7 @@ impl PlatformLogin {
         &self,
         code: SecretString,
         state: &str,
+        request_id: &str,
     ) -> Result<SecretString, PlatformLoginError> {
         let connection = self.connection().await?;
         let login_state = take_platform_login_state(&self.pool, state)
@@ -257,7 +258,7 @@ impl PlatformLogin {
         let principal_id = self.resolve_principal(&connection, &claims).await?;
         let token = self
             .sessions
-            .issue_federated(principal_id)
+            .issue_federated(principal_id, request_id)
             .await
             .map_err(|error| PlatformLoginError::Session(error.to_string()))?;
         Ok(token)

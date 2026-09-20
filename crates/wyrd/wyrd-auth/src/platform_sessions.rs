@@ -18,11 +18,14 @@ use uuid::Uuid;
 use wyrd_auth_issue::IssuingKey;
 use wyrd_auth_verify::{PLATFORM_TOKEN_SCOPE, PlatformAccessTokenClaims};
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
+use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
 use wyrd_sql::queries::platform::credentials::platform_credential_by_id;
-use wyrd_sql::queries::platform::principals::platform_principal_by_id;
-use wyrd_sql::{OperatorPool, SqlError};
+use wyrd_sql::queries::platform::principals::{
+    platform_principal_by_id, platform_principal_by_id_tx,
+};
+use wyrd_sql::{OperatorPool, SqlError, TenantConn};
 
-use crate::audit::principal_kind_tag;
+use crate::audit::{TOKEN_EXCHANGE_OPERATION, auth_event, principal_kind_tag};
 use crate::platform_credentials::{PlatformCredentialError, PlatformCredentials};
 
 /// Default platform session lifetime.
@@ -142,9 +145,13 @@ impl PlatformSessions {
     pub async fn exchange(
         &self,
         presented: &SecretString,
+        request_id: &str,
     ) -> Result<PlatformSession, PlatformSessionError> {
         let credentials = PlatformCredentials::new(self.pool.clone());
-        let authenticated = credentials.authenticate_for_session(presented).await?;
+        let mut conn = self.pool.begin_platform_audited().await?;
+        let authenticated = credentials
+            .authenticate_for_session(&mut conn, presented)
+            .await?;
         let token = self
             .issuing_key
             .issue_platform_access_token(
@@ -153,6 +160,14 @@ impl PlatformSessions {
                 self.ttl,
             )
             .map_err(|error| PlatformSessionError::Key(error.to_string()))?;
+        self.record_grant(
+            &mut conn,
+            authenticated.principal_id,
+            Some(authenticated.credential_id),
+            request_id,
+        )
+        .await?;
+        conn.commit().await?;
 
         Ok(PlatformSession {
             token: SecretString::from(token),
@@ -177,8 +192,10 @@ impl PlatformSessions {
     pub async fn issue_federated(
         &self,
         principal_id: Uuid,
+        request_id: &str,
     ) -> Result<SecretString, PlatformSessionError> {
-        let Some(principal) = platform_principal_by_id(&self.pool, principal_id).await? else {
+        let mut conn = self.pool.begin_platform_audited().await?;
+        let Some(principal) = platform_principal_by_id_tx(&mut conn, principal_id).await? else {
             return Err(PlatformSessionError::Invalid);
         };
         if !principal.is_active() {
@@ -189,7 +206,55 @@ impl PlatformSessions {
             .issuing_key
             .issue_platform_access_token(PrincipalId::new(principal_id), None, self.ttl)
             .map_err(|error| PlatformSessionError::Key(error.to_string()))?;
+        // A federated grant names the principal the provider resolved to and no
+        // credential, because none was presented.
+        self.record_grant(&mut conn, PrincipalId::new(principal_id), None, request_id)
+            .await?;
+        conn.commit().await?;
         Ok(SecretString::from(token))
+    }
+
+    /// Append the one canonical grant record for a platform session.
+    ///
+    /// Both platform grants — credential exchange and federated issuance —
+    /// converge here, so the record cannot be present on one path and missing
+    /// on the other. It is appended on the caller's audited operator
+    /// transaction, which is what makes the token and its record inseparable:
+    /// an append failure drops the transaction, so no grant-side effect
+    /// survives and no token is returned.
+    ///
+    /// `credential_id` names the credential spent, and is absent for a
+    /// federated session where the identity is the whole story.
+    ///
+    /// # Errors
+    /// Returns [`PlatformSessionError::Store`] when the append is rejected.
+    async fn record_grant(
+        &self,
+        conn: &mut TenantConn<'_>,
+        principal_id: PrincipalId,
+        credential_id: Option<Uuid>,
+        request_id: &str,
+    ) -> Result<(), PlatformSessionError> {
+        let expires_at = Utc::now() + self.ttl;
+        let mut event = auth_event(
+            request_id,
+            TOKEN_EXCHANGE_OPERATION,
+            principal_id,
+            PrincipalKindTag::GlobalAdmin,
+            None,
+            AuditOutcome::Allowed,
+            AuditDetail::TokenExchange {
+                subject_principal_id: principal_id,
+                actor_principal_id: principal_id,
+                delegation_chain: Vec::new(),
+                expires_at,
+            },
+        );
+        event.credential_id = credential_id;
+        vala_sql::queries::audit_staging::append_audit(conn, &event)
+            .await
+            .map_err(PlatformSessionError::Store)?;
+        Ok(())
     }
 
     /// Confirm that verified platform claims still name a live session.
@@ -285,5 +350,200 @@ impl PlatformSessions {
             principal_kind: principal_kind_tag(&principal.principal_kind),
             credential_id: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod pg_tests {
+    //! Durable proof that every platform grant is recorded before it is served.
+    //!
+    //! A platform session is the most privileged bearer the deployment issues.
+    //! Both ways of obtaining one — spending a credential and federated login —
+    //! must leave exactly one canonical grant row, and an append the store
+    //! refuses must leave neither a token nor any grant-side effect.
+
+    use std::sync::Arc;
+
+    use secrecy::SecretString;
+    use uuid::Uuid;
+    use wyrd_auth_issue::IssuingKey;
+    use wyrd_auth_verify::Kid;
+    use wyrd_dev_fixtures::pg::PgFixture;
+    use wyrd_spec::DataTenantId;
+    use wyrd_spec::auth::PrincipalKindTag;
+    use wyrd_sql::queries::platform::principals::insert_platform_principal;
+
+    use super::{PlatformSessionError, PlatformSessions};
+    use crate::audit::TOKEN_EXCHANGE_OPERATION;
+    use crate::platform_credentials::PlatformCredentials;
+
+    const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
+
+    /// The signing key platform sessions are minted with in these tests.
+    fn issuing_key() -> Arc<IssuingKey> {
+        Arc::new(
+            IssuingKey::from_ed_pem(
+                SecretString::from(PRIVATE_KEY_PEM),
+                Kid::new("k1").expect("kid is valid"),
+                "wyrd",
+            )
+            .expect("test private key loads"),
+        )
+    }
+
+    /// Seed a platform principal and return its id.
+    async fn seed_principal(fixture: &PgFixture, name: &str) -> Uuid {
+        let id = Uuid::now_v7();
+        insert_platform_principal(
+            fixture.operator_pool(),
+            id,
+            PrincipalKindTag::GlobalAdmin,
+            name,
+        )
+        .await
+        .expect("platform principal inserts");
+        id
+    }
+
+    /// Issue one credential for `principal` and commit it, as the route does.
+    async fn issue_credential(fixture: &PgFixture, principal: Uuid) -> SecretString {
+        let pool = fixture.operator_pool().clone();
+        let mut conn = pool
+            .begin_platform_audited()
+            .await
+            .expect("transaction opens");
+        let issued = PlatformCredentials::new(pool.clone())
+            .issue(&mut conn, principal, None)
+            .await
+            .expect("credential issues");
+        conn.commit().await.expect("credential commits");
+        issued.credential.secret
+    }
+
+    /// Read the grant records staged for `principal` and the credential each
+    /// one names.
+    ///
+    /// Staging is written by the platform transaction and read back here as
+    /// the superuser, because `wyrd_platform_admin` is granted append-only access to
+    /// `vala.audit_staging` and cannot select from it.
+    async fn staged_grants(fixture: &PgFixture, principal: Uuid) -> Vec<Option<Uuid>> {
+        let admin = fixture.superuser_pool().await.expect("superuser pool");
+        sqlx::query_as::<_, (Option<Uuid>,)>(
+            "SELECT credential_id FROM vala.audit_staging
+              WHERE data_tenant_id = $1 AND operation = $2 AND principal_id = $3",
+        )
+        .bind(DataTenantId::SYSTEM_OWNER.as_uuid())
+        .bind(TOKEN_EXCHANGE_OPERATION)
+        .bind(principal)
+        .fetch_all(&admin)
+        .await
+        .expect("grant record query runs")
+        .into_iter()
+        .map(|(credential,)| credential)
+        .collect()
+    }
+
+    /// Spending a credential commits one grant record naming that credential.
+    ///
+    /// # Panics
+    /// Panics when the exchange fails or the record is missing, duplicated, or
+    /// unattributed.
+    #[tokio::test]
+    async fn a_credential_exchange_commits_one_attributed_grant() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let principal = seed_principal(&fixture, "exchange-audited").await;
+        let secret = issue_credential(&fixture, principal).await;
+
+        let session = PlatformSessions::new(fixture.operator_pool().clone(), issuing_key())
+            .exchange(&secret, "req-platform-exchange")
+            .await
+            .expect("the credential exchanges");
+
+        let grants = staged_grants(&fixture, principal).await;
+        assert_eq!(grants.len(), 1, "exactly one grant record is committed");
+        assert_eq!(
+            grants[0],
+            Some(session.credential_id),
+            "the grant names the credential that was spent"
+        );
+    }
+
+    /// Federated issuance commits one grant record naming no credential.
+    ///
+    /// The identity is the whole story on this path, so naming a credential
+    /// would record one that was never presented.
+    ///
+    /// # Panics
+    /// Panics when issuance fails or the record is missing, duplicated, or
+    /// falsely attributed.
+    #[tokio::test]
+    async fn federated_issuance_commits_one_grant_naming_no_credential() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let principal = seed_principal(&fixture, "federated-audited").await;
+
+        PlatformSessions::new(fixture.operator_pool().clone(), issuing_key())
+            .issue_federated(principal, "req-platform-federated")
+            .await
+            .expect("the registered administrator is issued a session");
+
+        let grants = staged_grants(&fixture, principal).await;
+        assert_eq!(grants.len(), 1, "exactly one grant record is committed");
+        assert_eq!(
+            grants[0], None,
+            "a federated grant names no credential because none was presented"
+        );
+    }
+
+    /// An audit store that refuses the append returns no token and no effect.
+    ///
+    /// The grant, its record, and the credential's last-used touch share one
+    /// transaction, so a refused append rolls all of it back. A token handed
+    /// out here would be a platform session the deployment cannot account for.
+    ///
+    /// # Panics
+    /// Panics when the exchange succeeds, when the failure is reported as an
+    /// invalid credential rather than a store failure, or when the rolled-back
+    /// touch survived.
+    #[tokio::test]
+    async fn a_refused_audit_append_returns_no_token_and_no_effect() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let principal = seed_principal(&fixture, "audit-refused").await;
+        let secret = issue_credential(&fixture, principal).await;
+
+        let admin = fixture.superuser_pool().await.expect("superuser pool");
+        sqlx::query("REVOKE INSERT ON vala.audit_staging FROM wyrd_platform_admin")
+            .execute(&admin)
+            .await
+            .expect("append privilege revoked");
+
+        let result = PlatformSessions::new(fixture.operator_pool().clone(), issuing_key())
+            .exchange(&secret, "req-platform-unauditable")
+            .await;
+
+        sqlx::query("GRANT INSERT ON vala.audit_staging TO wyrd_platform_admin")
+            .execute(&admin)
+            .await
+            .expect("append privilege restored");
+
+        assert!(
+            matches!(result, Err(PlatformSessionError::Store(_))),
+            "an unrecordable grant is refused as a store failure, got: {result:?}"
+        );
+        assert!(
+            staged_grants(&fixture, principal).await.is_empty(),
+            "no grant record survives the refusal"
+        );
+        let touched: Option<Option<chrono::DateTime<chrono::Utc>>> = sqlx::query_scalar(
+            "SELECT last_used_at FROM platform.credentials WHERE principal_id = $1",
+        )
+        .bind(principal)
+        .fetch_optional(&admin)
+        .await
+        .expect("credential metadata reads back");
+        assert_eq!(
+            touched,
+            Some(None),
+            "the rolled-back grant leaves no record of a use that produced no token"
+        );
     }
 }

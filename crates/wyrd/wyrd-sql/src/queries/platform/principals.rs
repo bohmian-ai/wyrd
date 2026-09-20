@@ -128,15 +128,37 @@ pub async fn platform_principal_by_id(
     pool: &OperatorPool,
     id: Uuid,
 ) -> Result<Option<PlatformPrincipalRow>, SqlError> {
-    sqlx::query_as::<_, PlatformPrincipalRow>(
-        "SELECT id, principal_kind, name, status
+    sqlx::query_as::<_, PlatformPrincipalRow>(PRINCIPAL_BY_ID_SQL)
+        .bind(id)
+        .fetch_optional(pool.pool())
+        .await
+        .map_err(SqlError::from)
+}
+
+/// The one principal-by-id read, shared by the pool and transaction entry
+/// points so they cannot drift apart.
+const PRINCIPAL_BY_ID_SQL: &str = "SELECT id, principal_kind, name, status
            FROM platform.principals
-          WHERE id = $1",
-    )
-    .bind(id)
-    .fetch_optional(pool.pool())
-    .await
-    .map_err(SqlError::from)
+          WHERE id = $1";
+
+/// Read a platform principal inside an open operator transaction.
+///
+/// Federated issuance pins the identity it is about to mint a session for on
+/// the same transaction that records the grant, so a principal suspended
+/// concurrently cannot be admitted by a read the grant's own transaction would
+/// not have seen.
+///
+/// # Errors
+/// Returns [`SqlError::Query`] when the read fails.
+pub async fn platform_principal_by_id_tx(
+    conn: &mut TenantConn<'_>,
+    id: Uuid,
+) -> Result<Option<PlatformPrincipalRow>, SqlError> {
+    sqlx::query_as::<_, PlatformPrincipalRow>(PRINCIPAL_BY_ID_SQL)
+        .bind(id)
+        .fetch_optional(&mut **conn.transaction())
+        .await
+        .map_err(SqlError::from)
 }
 
 /// A platform principal with its federated identity, when it has one.

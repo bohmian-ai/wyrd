@@ -15,7 +15,7 @@ use uuid::Uuid;
 use wyrd_auth_issue::{IssueError, hash_api_key};
 use wyrd_spec::auth::PrincipalId;
 use wyrd_sql::queries::platform::credentials::{
-    insert_platform_credential_tx, platform_credential_by_prefix, touch_platform_credential,
+    insert_platform_credential_tx, platform_credential_by_prefix_tx, touch_platform_credential_tx,
 };
 use wyrd_sql::{OperatorPool, SqlError, TenantConn};
 
@@ -192,15 +192,22 @@ impl PlatformCredentials {
     /// principal, so a minted session can be tied to — and revoked with — the
     /// credential that produced it.
     ///
+    /// Runs on the caller's operator transaction rather than the pool, because
+    /// the grant this authenticates is one boundary: the lookup, the last-used
+    /// touch, the canonical audit row, and the commit either all happen or none
+    /// do. A pool-scoped read here would let a refused or rolled-back grant
+    /// still leave a recorded use behind.
+    ///
     /// # Errors
     /// Returns [`PlatformCredentialError::InvalidCredential`] for every
     /// rejection and [`PlatformCredentialError::Store`] when the lookup fails.
     pub async fn authenticate_for_session(
         &self,
+        conn: &mut TenantConn<'_>,
         presented: &SecretString,
     ) -> Result<AuthenticatedPlatformCredential, PlatformCredentialError> {
         let row = match PlatformCredential::prefix_of(presented) {
-            Some(prefix) => platform_credential_by_prefix(&self.pool, &prefix)
+            Some(prefix) => platform_credential_by_prefix_tx(conn, &prefix)
                 .await?
                 .filter(|row| row.is_usable(Utc::now())),
             None => None,
@@ -217,7 +224,7 @@ impl PlatformCredentials {
         let Some(row) = row.filter(|_| matched) else {
             return Err(PlatformCredentialError::InvalidCredential);
         };
-        touch_platform_credential(&self.pool, row.id).await?;
+        touch_platform_credential_tx(conn, row.id).await?;
         Ok(AuthenticatedPlatformCredential {
             principal_id: PrincipalId::new(row.principal_id),
             credential_id: row.id,
@@ -343,6 +350,30 @@ mod pg_tests {
         issued
     }
 
+    /// Authenticate one credential on its own committed transaction.
+    ///
+    /// `authenticate_for_session` now participates in the caller's grant
+    /// transaction, so these tests open the same audited operator transaction
+    /// the exchange route opens and commit it, which is what leaves the
+    /// last-used touch standing.
+    async fn authenticate_committed(
+        fixture: &PgFixture,
+        presented: &SecretString,
+    ) -> Result<super::AuthenticatedPlatformCredential, PlatformCredentialError> {
+        let pool = fixture.operator_pool().clone();
+        let mut conn = pool
+            .begin_platform_audited()
+            .await
+            .expect("transaction opens");
+        let result = PlatformCredentials::new(pool.clone())
+            .authenticate_for_session(&mut conn, presented)
+            .await;
+        if result.is_ok() {
+            conn.commit().await.expect("authentication commits");
+        }
+        result
+    }
+
     /// The issued plaintext authenticates back to its principal, and the value
     /// stored is a verifier that is not the plaintext and cannot reproduce it.
     #[tokio::test]
@@ -354,8 +385,7 @@ mod pg_tests {
         let issued = issue_committed(&fixture, principal, None).await;
         let plaintext = issued.credential.secret.expose_secret().to_owned();
 
-        let resolved = PlatformCredentials::new(pool.clone())
-            .authenticate_for_session(&issued.credential.secret)
+        let resolved = authenticate_committed(&fixture, &issued.credential.secret)
             .await
             .expect("the issued credential authenticates");
         assert_eq!(resolved.principal_id.as_uuid(), principal);
@@ -439,15 +469,12 @@ mod pg_tests {
 
         // Warm the dummy verifier so its one-off derivation is not mistaken for
         // the per-request cost this measures.
-        let _ = PlatformCredentials::new(pool.clone())
-            .authenticate_for_session(&SecretString::from("warm".to_owned()))
-            .await;
+        let _ = authenticate_committed(&fixture, &SecretString::from("warm".to_owned())).await;
 
         let mut elapsed = Vec::new();
         for (label, presented) in rejections {
             let started = std::time::Instant::now();
-            let error = PlatformCredentials::new(pool.clone())
-                .authenticate_for_session(&presented)
+            let error = authenticate_committed(&fixture, &presented)
                 .await
                 .expect_err("rejection");
             elapsed.push((label, started.elapsed()));
@@ -479,8 +506,7 @@ mod pg_tests {
             );
         }
 
-        PlatformCredentials::new(pool.clone())
-            .authenticate_for_session(&live.credential.secret)
+        authenticate_committed(&fixture, &live.credential.secret)
             .await
             .expect("the live credential still authenticates");
     }
@@ -502,8 +528,7 @@ mod pg_tests {
         let principal = seed_principal(&fixture, "revoked-mid-life").await;
         let issued = issue_committed(&fixture, principal, None).await;
 
-        PlatformCredentials::new(pool.clone())
-            .authenticate_for_session(&issued.credential.secret)
+        authenticate_committed(&fixture, &issued.credential.secret)
             .await
             .expect("the credential works before revocation");
 
@@ -516,8 +541,7 @@ mod pg_tests {
             .expect("revocation succeeds");
         revocation.commit().await.expect("revocation commits");
 
-        let error = PlatformCredentials::new(pool.clone())
-            .authenticate_for_session(&issued.credential.secret)
+        let error = authenticate_committed(&fixture, &issued.credential.secret)
             .await
             .expect_err("the same credential stops working immediately");
         assert!(matches!(error, PlatformCredentialError::InvalidCredential));
@@ -531,8 +555,7 @@ mod pg_tests {
         let principal = seed_principal(&fixture, "touched").await;
         let issued = issue_committed(&fixture, principal, None).await;
 
-        PlatformCredentials::new(pool.clone())
-            .authenticate_for_session(&issued.credential.secret)
+        authenticate_committed(&fixture, &issued.credential.secret)
             .await
             .expect("authenticates");
 

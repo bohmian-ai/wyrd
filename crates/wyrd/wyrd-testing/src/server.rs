@@ -2225,7 +2225,7 @@ impl WyrdTestServer {
             self.operator_pool(),
             std::sync::Arc::clone(&self.inner.issuing_key),
         )
-        .issue_federated(principal_id)
+        .issue_federated(principal_id, "test-platform-session")
         .await
         .map_err(|error| WyrdTestServerError::Auth(error.to_string()))
     }

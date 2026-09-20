@@ -8,10 +8,18 @@ use crate::exchange_api_key::principal_kind_wire;
 use wyrd_spec::error::WyrdError;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
-    revoke_service_account_principal, revoke_user_principal, service_account_by_id, user_by_id,
+    revoke_refresh_family, revoke_service_account_principal, revoke_user_principal,
+    service_account_by_id, user_by_id,
 };
 
 /// Revoke `target_id` in the table the caller's declared `kind` names.
+///
+/// A User also carries refresh authority, and the authorization epoch alone
+/// does not retire it: an active refresh row survives the epoch bump and can
+/// be rotated into a successor access token minted after it, which restores
+/// the session the revocation just ended. The User branch therefore advances
+/// the epoch and revokes the principal's refresh family on the same
+/// [`TenantConn`], so the caller's commit either retires both or neither.
 ///
 /// The kind is a selector, not a hint: principal ids are unique only within
 /// their table, so revoking on the caller's claim rather than on whichever
@@ -35,6 +43,9 @@ pub async fn revoke_principal_in_conn(
     if kind == PrincipalKindTag::User {
         if user_by_id(conn, id_uuid).await.ok().flatten().is_some() {
             revoke_user_principal(conn, id_uuid)
+                .await
+                .map_err(internal_error)?;
+            revoke_refresh_family(conn, "user", id_uuid, "principal_revoked")
                 .await
                 .map_err(internal_error)?;
             return Ok(());
@@ -83,6 +94,7 @@ fn internal_error(cause: impl std::fmt::Display) -> WyrdError {
 
 #[cfg(test)]
 mod pg_tests {
+    use chrono::{Duration, Utc};
     use uuid::Uuid;
     use wyrd_dev_fixtures::cards::seed_backing_card;
     use wyrd_dev_fixtures::pg::PgFixture;
@@ -93,7 +105,10 @@ mod pg_tests {
     use wyrd_spec::error::WyrdError;
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::reference::CardRef;
-    use wyrd_sql::queries::auth::{insert_service_account, insert_user};
+    use wyrd_sql::queries::auth::{
+        insert_refresh_token, insert_service_account, insert_user, refresh_by_hash,
+        user_revocation_epoch,
+    };
 
     use super::revoke_principal_in_conn;
 
@@ -126,6 +141,78 @@ mod pg_tests {
         )
         .await
         .expect("revocation succeeds");
+    }
+
+    /// Revoking a User must retire the refresh authority in the same commit.
+    ///
+    /// The epoch alone stops the access tokens the human already holds, but an
+    /// active refresh row outlives it: rotating that row mints a successor
+    /// newer than the epoch, which is the revoked session back. Both writes
+    /// share the caller's transaction, so this asserts the committed state a
+    /// served revoke leaves behind and then proves the refresh grant refuses.
+    ///
+    /// # Panics
+    /// Panics when the revocation fails, when a live refresh row survives, or
+    /// when the retired row still rotates.
+    #[tokio::test]
+    async fn revoking_a_user_retires_its_refresh_authority() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+
+        let user_id = Uuid::new_v4();
+        let refresh_hash = format!("{user_id:x}-refresh");
+        {
+            let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+            insert_user(&mut conn, user_id, Some("revoked@test.com"), "oidc", None)
+                .await
+                .expect("user inserts");
+            insert_refresh_token(
+                &mut conn,
+                Uuid::new_v4(),
+                "user",
+                user_id,
+                &refresh_hash,
+                Utc::now() + Duration::days(30),
+            )
+            .await
+            .expect("refresh row inserts");
+            conn.commit().await.expect("seed commits");
+        }
+
+        {
+            let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+            revoke_principal_in_conn(
+                &mut conn,
+                PrincipalId::new(user_id),
+                PrincipalKindTag::User,
+                tenant,
+            )
+            .await
+            .expect("revocation succeeds");
+            conn.commit().await.expect("revocation commits");
+        }
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let row = refresh_by_hash(&mut conn, &refresh_hash)
+            .await
+            .expect("refresh lookup runs")
+            .expect("the refresh row still exists as history");
+        assert_eq!(
+            row.revoked_reason.as_deref(),
+            Some("principal_revoked"),
+            "the refresh row is retired by the revocation, not left live"
+        );
+        assert!(
+            row.revoked_at.is_some(),
+            "a retired refresh row carries its revocation time"
+        );
+        let epoch = user_revocation_epoch(&mut conn, user_id)
+            .await
+            .expect("epoch lookup runs");
+        assert!(
+            epoch.is_some(),
+            "the same revocation advanced the authorization epoch"
+        );
     }
 
     #[tokio::test]

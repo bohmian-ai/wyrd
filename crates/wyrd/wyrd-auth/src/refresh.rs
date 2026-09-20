@@ -185,7 +185,13 @@ impl RefreshTokens {
                             principal_kind: owner_kind,
                             revoked_token_count: revoked,
                         },
-                    );
+                    )
+                    // The containment record names the row that was replayed.
+                    // Successful rotation already attributes its consumed
+                    // predecessor this way; without it the one event that
+                    // reports a theft is the only one that cannot say which of
+                    // a principal's refresh rows was presented.
+                    .with_credential_id(Some(stale.id));
                     append_auth_audit(conn, &event).await?;
 
                     tracing::warn!(
@@ -354,15 +360,20 @@ mod pg_tests {
         sa_id
     }
 
+    /// Seed one active refresh row and return its durable id.
+    ///
+    /// The id is the value audit attributes a consumed or replayed row to, so
+    /// the tests that assert attribution need it rather than a fresh UUID.
     async fn seed_active_refresh(
         conn: &mut TenantConn<'_>,
         principal_kind: &str,
         principal_id: Uuid,
         token_hash: &str,
-    ) {
+    ) -> Uuid {
+        let id = Uuid::new_v4();
         insert_refresh_token(
             conn,
-            Uuid::new_v4(),
+            id,
             principal_kind,
             principal_id,
             token_hash,
@@ -370,6 +381,7 @@ mod pg_tests {
         )
         .await
         .expect("refresh token inserts");
+        id
     }
 
     /// A human session rotates: the consumed row is retired and the successor
@@ -720,7 +732,8 @@ mod pg_tests {
         let user_id = insert_test_user(&mut setup_conn, tenant).await;
         let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::User, user_id, tenant);
         let original_hash = hash_of(&refresh_jwt);
-        seed_active_refresh(&mut setup_conn, "user", user_id, &original_hash).await;
+        let consumed_id =
+            seed_active_refresh(&mut setup_conn, "user", user_id, &original_hash).await;
         setup_conn.commit().await.expect("setup commits");
 
         // The legitimate rotation, committed the way the route commits it.
@@ -784,6 +797,27 @@ mod pg_tests {
         assert_eq!(
             revocations, 1,
             "exactly one family revocation is visible from another transaction"
+        );
+
+        // The containment row names the refresh row that was actually
+        // presented. Without it the only event that reports a theft cannot say
+        // which of the principal's rows the attacker held.
+        let attributed: Option<Uuid> = sqlx::query_scalar(
+            "SELECT credential_id FROM vala.audit_staging
+              WHERE data_tenant_id = $1
+                AND operation = $2
+                AND principal_id = $3",
+        )
+        .bind(tenant.as_uuid())
+        .bind(REFRESH_FAMILY_REVOKE_OPERATION)
+        .bind(user_id)
+        .fetch_one(&mut **conn_c.transaction())
+        .await
+        .expect("credential attribution query runs");
+        assert_eq!(
+            attributed,
+            Some(consumed_id),
+            "the replay record names the consumed refresh row"
         );
 
         let successor_replay = refresh_service()

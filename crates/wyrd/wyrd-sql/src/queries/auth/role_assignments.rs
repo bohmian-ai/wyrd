@@ -41,10 +41,14 @@ const REPLACE_USER_ROLES_SQL: &str = r#"
              WHERE data_tenant_id = wyrd.current_tenant()
                AND user_id = $1
                AND role_id NOT IN (SELECT id FROM wanted)
+            RETURNING role_id
+        ), added AS (
+            INSERT INTO wyrd.auth_user_roles (data_tenant_id, user_id, role_id)
+            SELECT wyrd.current_tenant(), $1, id FROM wanted
+            ON CONFLICT (data_tenant_id, user_id, role_id) DO NOTHING
+            RETURNING role_id
         )
-        INSERT INTO wyrd.auth_user_roles (data_tenant_id, user_id, role_id)
-        SELECT wyrd.current_tenant(), $1, id FROM wanted
-        ON CONFLICT (data_tenant_id, user_id, role_id) DO NOTHING
+        SELECT (SELECT count(*) FROM removed) + (SELECT count(*) FROM added)
         "#;
 
 const GRANT_ROLE_TO_SERVICE_ACCOUNT_SQL: &str = r#"
@@ -123,19 +127,27 @@ pub async fn revoke_role_from_user(
 /// are removed in the same statement, which is how a provider-side revocation
 /// reaches Wyrd.
 ///
+/// Returns `true` when the persisted set actually moved — a row was removed or
+/// added. The caller needs that answer to decide whether the human's previously
+/// issued access tokens still describe their authority: those tokens carry role
+/// names in signed claims, so a provider-side role removal only reaches a live
+/// session if the caller also advances the principal's authorization epoch. A
+/// login that re-asserts the same roles reports `false` so it does not sign the
+/// human out of their other sessions for no reason.
+///
 /// # Errors
 /// Returns a SQLx error when Postgres rejects the statement.
 pub async fn replace_user_roles(
     conn: &mut TenantConn<'_>,
     user_id: Uuid,
     role_names: &[&str],
-) -> Result<(), sqlx::Error> {
-    sqlx::query(REPLACE_USER_ROLES_SQL)
+) -> Result<bool, sqlx::Error> {
+    let changed: i64 = sqlx::query_scalar(REPLACE_USER_ROLES_SQL)
         .bind(user_id)
         .bind(role_names)
-        .execute(&mut **conn.transaction())
+        .fetch_one(&mut **conn.transaction())
         .await?;
-    Ok(())
+    Ok(changed > 0)
 }
 
 /// List role names granted to a user, ordered by name.

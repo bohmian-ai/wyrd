@@ -84,6 +84,42 @@ pub async fn revoke_user_principal(
     Ok(result.rows_affected() > 0)
 }
 
+/// Advance a user's authorization epoch to the start of the current second.
+///
+/// The federated sign-in path calls this when the provider's asserted role set
+/// no longer matches the persisted one. Access tokens carry role names in
+/// signed claims, so a removed role stays spendable until the epoch moves past
+/// the tokens that name it.
+///
+/// The truncation is what makes the successor usable. Access-token `iat` is
+/// whole seconds, so an epoch carrying sub-second precision could land ahead of
+/// a token issued moments later in the same transaction and revoke the session
+/// the login just established. `date_trunc` to the second removes that race in
+/// the only direction it can go wrong; tokens issued in an earlier second are
+/// still retired.
+///
+/// Returns `Ok(true)` when a row was updated, `Ok(false)` when no row matched.
+///
+/// # Errors
+/// Returns a SQLx error on database failure.
+pub async fn advance_user_epoch_to_second(
+    conn: &mut TenantConn<'_>,
+    id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        r#"
+        UPDATE wyrd.auth_users
+           SET tokens_not_before = date_trunc('second', now())
+         WHERE data_tenant_id = wyrd.current_tenant()
+           AND id = $1
+        "#,
+    )
+    .bind(id)
+    .execute(&mut **conn.transaction())
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 /// Bump `tokens_not_before = now()` for a service account or agent.
 ///
 /// Returns `Ok(true)` when a row was updated, `Ok(false)` when no row matched.

@@ -17,8 +17,8 @@ use wyrd_spec::auth::{IssuerUrl, TokenResponse, TokenType};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
 use wyrd_sql::queries::auth::{
-    delete_user, insert_refresh_token, insert_refresh_token_rotated, insert_user,
-    replace_user_roles, upsert_user_identity, user_id_by_identity,
+    advance_user_epoch_to_second, delete_user, insert_refresh_token, insert_refresh_token_rotated,
+    insert_user, replace_user_roles, upsert_user_identity, user_id_by_identity,
 };
 use wyrd_sql::{SqlError, TenantConn, WyrdPostgres};
 
@@ -200,9 +200,21 @@ impl AuthorizationCodeExchange {
         // grant table the truth a later refresh rotation can re-read; without
         // it, renewal would mint an authority-free successor.
         let role_names = roles.iter().map(RoleRef::as_str).collect::<Vec<_>>();
-        replace_user_roles(&mut conn, principal_id, &role_names)
+        let roles_changed = replace_user_roles(&mut conn, principal_id, &role_names)
             .await
             .map_err(sql_error)?;
+        // A role the provider withdrew is still spendable by every access token
+        // this human already holds, because the names travel in signed claims.
+        // Moving the authorization epoch in the same transaction is what makes
+        // the withdrawal reach those live sessions; the successor issued below
+        // is minted after the epoch and is admitted by it. An unchanged login
+        // moves nothing, so re-authenticating never signs the human out of
+        // their other sessions.
+        if roles_changed {
+            advance_user_epoch_to_second(&mut conn, principal_id)
+                .await
+                .map_err(sql_error)?;
+        }
         let exchanged = issue_and_record_user_session(
             &mut conn,
             self.issuing_key.as_ref(),
@@ -668,6 +680,127 @@ mod screening_tests {
                 .len(),
             discovery_requests,
             "no token request may leave the process after the screen refuses"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pg_tests {
+    //! Durable proof for the role half of a federated sign-in.
+    //!
+    //! The callback replaces the human's persisted roles and, when that set
+    //! actually moved, advances their authorization epoch in the same
+    //! transaction. Both halves are schema behavior, so they are proven against
+    //! real Postgres rather than a stand-in.
+
+    use chrono::Utc;
+    use uuid::Uuid;
+    use wyrd_dev_fixtures::pg::PgFixture;
+    use wyrd_sql::queries::auth::{
+        advance_user_epoch_to_second, insert_role, insert_user, replace_user_roles,
+        user_revocation_epoch,
+    };
+
+    /// Seed a user and two assignable roles, returning the user's id.
+    async fn seed_user_with_roles(fixture: &PgFixture) -> Uuid {
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let user_id = Uuid::new_v4();
+        insert_user(&mut conn, user_id, Some("federated@test.com"), "oidc", None)
+            .await
+            .expect("user inserts");
+        for name in ["runtime_admin", "writer"] {
+            insert_role(
+                &mut conn,
+                Uuid::new_v4(),
+                name,
+                &serde_json::json!([]),
+                false,
+            )
+            .await
+            .expect("role inserts");
+        }
+        replace_user_roles(&mut conn, user_id, &["runtime_admin", "writer"])
+            .await
+            .expect("initial roles persist");
+        conn.commit().await.expect("seed commits");
+        user_id
+    }
+
+    /// A login that withdraws a role reports the change and moves the epoch.
+    ///
+    /// Role names travel in signed access-token claims, so the withdrawal only
+    /// reaches a live session through the epoch. The epoch must also stay at or
+    /// below the second the successor is issued in, or the login would revoke
+    /// the session it just established.
+    ///
+    /// # Panics
+    /// Panics when the role write fails, when the reduced set is not reported
+    /// as a change, or when the epoch does not land in the current second.
+    #[tokio::test]
+    async fn a_withdrawn_role_reports_a_change_and_advances_the_epoch() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let user_id = seed_user_with_roles(&fixture).await;
+        let before = Utc::now();
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let changed = replace_user_roles(&mut conn, user_id, &["writer"])
+            .await
+            .expect("reduced role set persists");
+        assert!(changed, "removing a role is a change the caller must see");
+        advance_user_epoch_to_second(&mut conn, user_id)
+            .await
+            .expect("epoch advances");
+        conn.commit().await.expect("role change commits");
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let epoch = user_revocation_epoch(&mut conn, user_id)
+            .await
+            .expect("epoch lookup runs")
+            .expect("a changed login leaves an epoch");
+        assert!(
+            epoch <= Utc::now(),
+            "the epoch never lands in the future: {epoch}"
+        );
+        assert!(
+            epoch >= before - chrono::Duration::seconds(1),
+            "the epoch advanced to this login rather than staying at an older value: {epoch}"
+        );
+        // The successor's `iat` is whole seconds, so an epoch carrying
+        // sub-second precision would refuse the token the login just minted.
+        assert_eq!(
+            epoch.timestamp_subsec_nanos(),
+            0,
+            "the epoch is truncated to the second the successor can carry"
+        );
+    }
+
+    /// Re-asserting the same roles must not sign the human out elsewhere.
+    ///
+    /// # Panics
+    /// Panics when an unchanged login reports a change or when it moves the
+    /// authorization epoch.
+    #[tokio::test]
+    async fn an_unchanged_login_reports_no_change_and_leaves_the_epoch_alone() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let user_id = seed_user_with_roles(&fixture).await;
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let changed = replace_user_roles(&mut conn, user_id, &["runtime_admin", "writer"])
+            .await
+            .expect("identical role set persists");
+        conn.commit().await.expect("unchanged login commits");
+        assert!(
+            !changed,
+            "an identical role set is not a change and must not retire live sessions"
+        );
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let epoch = user_revocation_epoch(&mut conn, user_id)
+            .await
+            .expect("epoch lookup runs");
+        assert!(
+            epoch.is_none(),
+            "an unchanged login leaves the authorization epoch untouched, got: {epoch:?}"
         );
     }
 }

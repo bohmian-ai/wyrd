@@ -64,6 +64,7 @@ use crate::otlp_metrics_decode::{decode_metrics_protobuf, preflight_metrics_prot
 use crate::otlp_metrics_json::decode_metrics_json;
 use crate::otlp_trace_json::decode_trace_json;
 use crate::state::AppState;
+use wyrd_spec::error::WyrdProblem;
 
 /// The OTLP signal type handled by a specific export endpoint.
 ///
@@ -193,6 +194,45 @@ where
     skip_all,
     fields(tenant, encoding, accepted_spans, rejected_spans)
 )]
+#[utoipa::path(
+    post,
+    path = "/v1/traces",
+    request_body(content = Vec<u8>, content_type = "application/x-protobuf",
+      description = "OTLP `ExportTraceServiceRequest`, protobuf or protobuf-JSON"),
+    responses(
+        (status = 200, description = "OTLP `ExportTraceServiceResponse`, encoded the way \
+          the request was, carrying `partial_success` when spans were rejected",
+         content_type = "application/x-protobuf"),
+        (status = 400, description = "The export could not be decoded, or an event time fell \
+          outside the accepted window (WYRD_VALA_400_OTLP_REQUEST_MALFORMED, \
+          WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token, or the token \
+          named no resolvable principal (WYRD_AUTH_401_UNAUTHENTICATED, \
+          WYRD_VALA_401_INGEST_AUTH, WYRD_VALA_401_PRINCIPAL_UNRESOLVED)", body = WyrdProblem),
+        (status = 403, description = "The principal may not write this table, or its card scope \
+          does not cover the export (WYRD_PERMISSION_403_DENIED_RBAC, \
+          WYRD_VALA_403_BIFROST_RESERVED_BUILTIN_WRITE, WYRD_VALA_403_BIFROST_CARD_SCOPE, \
+          WYRD_VALA_403_CARD_UNRESOLVED)", body = WyrdProblem),
+        (status = 404, description = "The destination table is not registered \
+          (WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND)", body = WyrdProblem),
+        (status = 409, description = "The export does not match the registered schema \
+          (WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH)", body = WyrdProblem),
+        (status = 413, description = "The frame or its decoded row count exceeds the ingest \
+          bounds (WYRD_VALA_413_PAYLOAD_TOO_LARGE, WYRD_VALA_413_INGEST_OVERSIZED)",
+         body = WyrdProblem),
+        (status = 429, description = "Ingest is saturated; retry the whole export, none of it \
+          was written (WYRD_VALA_429_INGEST_BUSY)", body = WyrdProblem),
+        (status = 500, description = "Ingest failed internally, or the decision could not be \
+          audited (WYRD_VALA_500_BIFROST_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)",
+         body = WyrdProblem),
+        (status = 503, description = "The writer is unavailable, or the revocation store could \
+          not vouch for the token (WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE, \
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem),
+        (status = 507, description = "The write-ahead log is out of disk \
+          (WYRD_VALA_507_WAL_DISK_FULL)", body = WyrdProblem)
+    ),
+    tag = "Observability"
+)]
 async fn export_traces(
     State(state): State<AppState>,
     caller: Caller,
@@ -274,6 +314,45 @@ async fn export_traces(
     name = "otlp.http.metrics.export",
     skip_all,
     fields(tenant, encoding, accepted_points, rejected_points)
+)]
+#[utoipa::path(
+    post,
+    path = "/v1/metrics",
+    request_body(content = Vec<u8>, content_type = "application/x-protobuf",
+      description = "OTLP `ExportMetricsServiceRequest`, protobuf or protobuf-JSON"),
+    responses(
+        (status = 200, description = "OTLP `ExportMetricsServiceResponse`, encoded the way \
+          the request was, carrying `partial_success` when data points were rejected",
+         content_type = "application/x-protobuf"),
+        (status = 400, description = "The export could not be decoded, or an event time fell \
+          outside the accepted window (WYRD_VALA_400_OTLP_REQUEST_MALFORMED, \
+          WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token, or the token \
+          named no resolvable principal (WYRD_AUTH_401_UNAUTHENTICATED, \
+          WYRD_VALA_401_INGEST_AUTH, WYRD_VALA_401_PRINCIPAL_UNRESOLVED)", body = WyrdProblem),
+        (status = 403, description = "The principal may not write this table, or its card scope \
+          does not cover the export (WYRD_PERMISSION_403_DENIED_RBAC, \
+          WYRD_VALA_403_BIFROST_RESERVED_BUILTIN_WRITE, WYRD_VALA_403_BIFROST_CARD_SCOPE, \
+          WYRD_VALA_403_CARD_UNRESOLVED)", body = WyrdProblem),
+        (status = 404, description = "The destination table is not registered \
+          (WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND)", body = WyrdProblem),
+        (status = 409, description = "The export does not match the registered schema \
+          (WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH)", body = WyrdProblem),
+        (status = 413, description = "The frame or its decoded row count exceeds the ingest \
+          bounds (WYRD_VALA_413_PAYLOAD_TOO_LARGE, WYRD_VALA_413_INGEST_OVERSIZED)",
+         body = WyrdProblem),
+        (status = 429, description = "Ingest is saturated; retry the whole export, none of it \
+          was written (WYRD_VALA_429_INGEST_BUSY)", body = WyrdProblem),
+        (status = 500, description = "Ingest failed internally, or the decision could not be \
+          audited (WYRD_VALA_500_BIFROST_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)",
+         body = WyrdProblem),
+        (status = 503, description = "The writer is unavailable, or the revocation store could \
+          not vouch for the token (WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE, \
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem),
+        (status = 507, description = "The write-ahead log is out of disk \
+          (WYRD_VALA_507_WAL_DISK_FULL)", body = WyrdProblem)
+    ),
+    tag = "Observability"
 )]
 async fn export_metrics(
     State(state): State<AppState>,
@@ -357,6 +436,45 @@ async fn export_metrics(
     name = "otlp.http.logs.export",
     skip_all,
     fields(tenant, encoding, accepted_records, rejected_records)
+)]
+#[utoipa::path(
+    post,
+    path = "/v1/logs",
+    request_body(content = Vec<u8>, content_type = "application/x-protobuf",
+      description = "OTLP `ExportLogsServiceRequest`, protobuf or protobuf-JSON"),
+    responses(
+        (status = 200, description = "OTLP `ExportLogsServiceResponse`, encoded the way \
+          the request was, carrying `partial_success` when log records were rejected",
+         content_type = "application/x-protobuf"),
+        (status = 400, description = "The export could not be decoded, or an event time fell \
+          outside the accepted window (WYRD_VALA_400_OTLP_REQUEST_MALFORMED, \
+          WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token, or the token \
+          named no resolvable principal (WYRD_AUTH_401_UNAUTHENTICATED, \
+          WYRD_VALA_401_INGEST_AUTH, WYRD_VALA_401_PRINCIPAL_UNRESOLVED)", body = WyrdProblem),
+        (status = 403, description = "The principal may not write this table, or its card scope \
+          does not cover the export (WYRD_PERMISSION_403_DENIED_RBAC, \
+          WYRD_VALA_403_BIFROST_RESERVED_BUILTIN_WRITE, WYRD_VALA_403_BIFROST_CARD_SCOPE, \
+          WYRD_VALA_403_CARD_UNRESOLVED)", body = WyrdProblem),
+        (status = 404, description = "The destination table is not registered \
+          (WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND)", body = WyrdProblem),
+        (status = 409, description = "The export does not match the registered schema \
+          (WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH)", body = WyrdProblem),
+        (status = 413, description = "The frame or its decoded row count exceeds the ingest \
+          bounds (WYRD_VALA_413_PAYLOAD_TOO_LARGE, WYRD_VALA_413_INGEST_OVERSIZED)",
+         body = WyrdProblem),
+        (status = 429, description = "Ingest is saturated; retry the whole export, none of it \
+          was written (WYRD_VALA_429_INGEST_BUSY)", body = WyrdProblem),
+        (status = 500, description = "Ingest failed internally, or the decision could not be \
+          audited (WYRD_VALA_500_BIFROST_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)",
+         body = WyrdProblem),
+        (status = 503, description = "The writer is unavailable, or the revocation store could \
+          not vouch for the token (WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE, \
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem),
+        (status = 507, description = "The write-ahead log is out of disk \
+          (WYRD_VALA_507_WAL_DISK_FULL)", body = WyrdProblem)
+    ),
+    tag = "Observability"
 )]
 async fn export_logs(
     State(state): State<AppState>,

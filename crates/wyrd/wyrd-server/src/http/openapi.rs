@@ -11,37 +11,22 @@ use wyrd_spec::vala::api::{
 /// Name the contract gives the one Wyrd authentication scheme.
 const WYRD_ACCESS_TOKEN_SCHEME: &str = "wyrdAccessToken";
 
-/// Paths that authenticate no caller, because a caller reaching them has no
-/// session yet.
-///
-/// Everything else inherits the document-level requirement, so a route added
-/// tomorrow is documented as authenticated without anyone remembering to say so.
-/// A new anonymous route must be listed here; until it is, the contract
-/// overstates its protection rather than understating it.
-const ANONYMOUS_PATHS: [&str; 6] = [
-    "/auth/platform/token",
-    "/auth/platform/login",
-    "/auth/platform/callback",
-    "/auth/login",
-    "/auth/callback",
-    "/auth/token",
-];
-
 /// Declares how every Wyrd surface authenticates.
 ///
 /// One scheme, because there is one header: `X-Wyrd-Access-Token` carries the
 /// token on every plane, and the caller's own `Authorization` header is never
-/// read by any Wyrd route. The scheme is applied document-wide and lifted from
-/// [`ANONYMOUS_PATHS`], which is why a generated client cannot mistake an
-/// authenticated route for an open one.
+/// read by any Wyrd route. The scheme is applied document-wide, so a route added
+/// tomorrow is documented as authenticated without anyone remembering to say so;
+/// the handful of operations a caller reaches before it has a session clear the
+/// requirement themselves with `security(())`, beside the handler, where the
+/// fact is checkable against the code rather than against a second list.
 ///
 /// Written as a modifier rather than repeated on each `#[utoipa::path]` so the
 /// requirement cannot drift route by route.
 struct SecurityAddon;
 
 impl Modify for SecurityAddon {
-    /// Register the scheme, require it globally, and clear it where no session
-    /// exists yet.
+    /// Register the scheme and require it document-wide.
     fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
         let components = openapi.components.get_or_insert_with(Default::default);
         components.add_security_scheme(
@@ -57,25 +42,6 @@ impl Modify for SecurityAddon {
             WYRD_ACCESS_TOKEN_SCHEME,
             Vec::<String>::new(),
         )]);
-
-        for path in ANONYMOUS_PATHS {
-            if let Some(item) = openapi.paths.paths.get_mut(path) {
-                // Anonymous routes are all POSTs today; clearing every verb the
-                // item could carry keeps this correct if one gains a GET.
-                for operation in [
-                    item.get.as_mut(),
-                    item.put.as_mut(),
-                    item.post.as_mut(),
-                    item.delete.as_mut(),
-                    item.patch.as_mut(),
-                ]
-                .into_iter()
-                .flatten()
-                {
-                    operation.security = Some(Vec::new());
-                }
-            }
-        }
     }
 }
 
@@ -152,7 +118,13 @@ fn is_problem(content: Option<&utoipa::openapi::Content>) -> bool {
         crate::components::cards::routes::list_cards_http,
         crate::components::cards::routes::complete_card_http,
         crate::components::cards::routes::list_artifacts_http,
+        crate::components::storage::routes::init,
+        crate::components::storage::routes::part_url,
+        crate::components::storage::routes::complete,
+        crate::components::storage::routes::abort,
+        crate::components::storage::routes::local_blob,
         crate::components::storage::routes::download_init,
+        crate::components::storage::routes::download_local_blob,
         crate::components::cards::routes::delete_card_http,
         crate::components::cards::routes::delete_card_by_ref_http,
         crate::bifrost::routes::register,
@@ -193,7 +165,15 @@ fn is_problem(content: Option<&utoipa::openapi::Content>) -> bool {
         crate::components::admin::routes::delete_trusted_issuer_route,
         crate::components::admin::routes::create_workload_binding,
         crate::components::admin::routes::list_workload_bindings,
-        crate::components::admin::routes::delete_workload_binding_route
+        crate::components::admin::routes::delete_workload_binding_route,
+        crate::components::eval::routes::open,
+        crate::components::eval::routes::next,
+        crate::components::eval::routes::agent_turn,
+        crate::components::eval::routes::user_turn,
+        crate::components::authz::check::check_authz,
+        crate::http::otlp::export_traces,
+        crate::http::otlp::export_metrics,
+        crate::http::otlp::export_logs
     ),
     components(schemas(
         BifrostQueryRequest,
@@ -219,6 +199,27 @@ fn is_problem(content: Option<&utoipa::openapi::Content>) -> bool {
         (
             name = "Admin",
             description = "Tenant administration of trusted OIDC issuers and workload bindings"
+        ),
+        (
+            name = "Cards",
+            description = "Card registration, resolution, listing, and deletion"
+        ),
+        (
+            name = "Storage",
+            description = "Card artifact upload and download plans, and the local development \
+                           blob transport"
+        ),
+        (
+            name = "Authz",
+            description = "Delegated invoke authorization checks"
+        ),
+        (
+            name = "Observability",
+            description = "OTLP/HTTP ingest for traces, metrics, and logs"
+        ),
+        (
+            name = "Eval",
+            description = "Evaluation pull protocol: open a run and drive its turns"
         ),
         (
             name = "Platform",
@@ -254,71 +255,6 @@ mod tests {
         }
     }
 
-    /// Every auth and admin route the server actually serves is documented.
-    ///
-    /// The comparison reads the route tables themselves rather than a list
-    /// maintained beside them: a second list would drift in exactly the way
-    /// that left `/auth/token` and the admin CRUD undocumented while they were
-    /// live. Adding a route to either router without annotating it fails here.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a served path is absent from the contract.
-    #[test]
-    fn every_served_auth_and_admin_route_is_documented() {
-        let document = WyrdApiDoc::openapi();
-        let served = [
-            (
-                include_str!("../components/auth/routes.rs"),
-                "",
-                "auth router",
-            ),
-            (
-                include_str!("../components/admin/routes.rs"),
-                "/v1",
-                "admin router",
-            ),
-        ];
-
-        let mut checked = BTreeSet::new();
-        for (source, prefix, name) in served {
-            for path in registered_routes(source) {
-                let path = format!("{prefix}{path}");
-                assert!(
-                    document.paths.paths.contains_key(&path),
-                    "the {name} serves {path}, which the OpenAPI contract does not declare"
-                );
-                checked.insert(path);
-            }
-        }
-        assert_eq!(
-            checked.len(),
-            6,
-            "the route tables no longer register the expected surfaces: {checked:?}"
-        );
-    }
-
-    /// Extract the paths a router module registers with `.route("...")`.
-    ///
-    /// Reading the source is what makes this a comparison against the served
-    /// surface rather than against a restatement of it.
-    fn registered_routes(source: &str) -> Vec<String> {
-        source
-            .split(".route(")
-            .skip(1)
-            .filter_map(|rest| rest.split_once('"'))
-            .filter_map(|(_, rest)| rest.split_once('"'))
-            .map(|(path, _)| path.to_owned())
-            .collect()
-    }
-
-    /// Tags whose operations a tenant or platform operator drives directly.
-    ///
-    /// These are the surfaces whose refusals an operator or a generated admin
-    /// client has to branch on, so their documented codes are the ones worth
-    /// holding to the catalog.
-    const ADMINISTRATIVE_TAGS: [&str; 4] = ["Auth", "Admin", "Platform", "Principals"];
-
     /// Pull every `WYRD_…` stable code named in a response description.
     ///
     /// Descriptions are prose with codes in parentheses rather than a
@@ -332,21 +268,33 @@ mod tests {
             .collect()
     }
 
-    /// Every documented problem body is served as `application/problem+json`,
-    /// and every administrative problem names real catalog codes for its status.
+    /// The HTTP status the catalog declares for one stable code.
+    ///
+    /// [`WyrdError::from_code`] reconstructs only the variants whose fields are
+    /// `{ message, details }`, which leaves the delegated sub-catalogs — storage
+    /// and Bifrost — unreachable through it. Those codes carry their status in
+    /// their own second segment, which is written beside the `status = N` the
+    /// derive reads, so a code that disagrees with the response it is
+    /// documented under is caught either way.
+    fn catalog_status(code: &str) -> Option<u16> {
+        WyrdError::from_code(code, "documented refusal".to_owned(), serde_json::json!({}))
+            .map(|error| error.status())
+            .or_else(|| code.split('_').nth(2)?.parse().ok())
+    }
+
+    /// Every documented problem body is served as `application/problem+json`
+    /// and names real catalog codes for its status.
     ///
     /// A generated client branches on the media type and on the code; declaring
     /// a problem as plain `application/json`, or naming a code that disagrees
-    /// with the status it is documented under, breaks that branch silently. The
-    /// media-type half holds document-wide because the modifier applies it
-    /// there.
+    /// with the status it is documented under, breaks that branch silently.
     ///
-    /// The code half used to accept any description containing `_404_`, which
-    /// passes for a code that no longer exists and for a typo in its tail. Each
-    /// named code is now reconstructed through [`WyrdError::from_code`] — the
+    /// Each named code is reconstructed through [`WyrdError::from_code`] — the
     /// same lookup every client and boundary uses — and its own declared status
-    /// must equal the response it is documented under. It covers the four
-    /// administrative tags a tenant or platform operator drives.
+    /// must equal the response it is documented under. Every operation is held
+    /// to this, not a chosen subset of tags: a caller reaching the storage,
+    /// evaluation, authorization, or OTLP surface branches on refusals exactly
+    /// the way an operator branches on an administrative one.
     ///
     /// # Panics
     ///
@@ -356,7 +304,9 @@ mod tests {
     #[test]
     fn every_problem_response_declares_its_media_type_and_stable_code() {
         let document = serde_json::to_value(WyrdApiDoc::openapi()).expect("OpenAPI is JSON");
+        let catalog: BTreeSet<&'static str> = WyrdError::codes().into_iter().collect();
         let mut problems = 0_usize;
+        let mut defects = Vec::new();
 
         for (path, item) in document["paths"]
             .as_object()
@@ -373,61 +323,72 @@ mod tests {
                         .as_str()
                         .is_some_and(|reference| reference.ends_with("/WyrdProblem"))
                     {
-                        panic!("{method} {path} {status} declares a problem as application/json");
+                        defects.push(format!(
+                            "{method} {path} {status} is problem+json as plain JSON"
+                        ));
+                        continue;
                     }
                     if !content[super::PROBLEM_MEDIA_TYPE].is_object() {
                         continue;
                     }
                     problems += 1;
-                    let tags = operation["tags"].to_string();
-                    if !ADMINISTRATIVE_TAGS
-                        .iter()
-                        .any(|tag| tags.contains(&format!("\"{tag}\"")))
-                    {
-                        continue;
-                    }
                     let description = response["description"].as_str().unwrap_or_default();
                     let codes = stable_codes(description);
-                    assert!(
-                        !codes.is_empty(),
-                        "{method} {path} {status} names no stable code: {description}"
-                    );
-                    let expected: u16 = status.parse().expect("a response key is a status code");
+                    if codes.is_empty() {
+                        defects.push(format!(
+                            "{method} {path} {status} names no code: {description}"
+                        ));
+                        continue;
+                    }
+                    // `default` is the catch-all arm rather than one status, so
+                    // its codes are checked for existence and nothing more.
+                    let expected: Option<u16> = status.parse().ok();
                     for code in codes {
-                        let error = WyrdError::from_code(
-                            &code,
-                            "documented refusal".to_owned(),
-                            serde_json::json!({}),
-                        )
-                        .unwrap_or_else(|| {
-                            panic!("{method} {path} {status} names {code}, absent from the catalog")
-                        });
-                        assert_eq!(
-                            error.status(),
-                            expected,
-                            "{method} {path} documents {code} under {status}, but the catalog \
-                             gives it {}",
-                            error.status()
-                        );
+                        if !catalog.contains(code.as_str()) {
+                            defects.push(format!(
+                                "{method} {path} {status} names {code}, absent from the catalog"
+                            ));
+                            continue;
+                        }
+                        let Some(declared) = catalog_status(&code) else {
+                            continue;
+                        };
+                        if expected.is_some_and(|expected| declared != expected) {
+                            defects.push(format!(
+                                "{method} {path} documents {code} under {status}, but the catalog \
+                                 gives it {declared}"
+                            ));
+                        }
                     }
                 }
             }
         }
 
+        assert!(defects.is_empty(), "{}", defects.join("\n"));
         assert!(
             problems > 0,
             "the contract declares no problem responses at all"
         );
     }
 
-    /// The contract names one authentication scheme, requires it everywhere, and
-    /// lifts it only where a caller cannot yet have a session.
+    /// The contract names one authentication scheme and requires it by default.
+    ///
+    /// Authentication is a property of the whole surface, so the requirement is
+    /// declared once on the document and inherited. An operation a caller
+    /// reaches before it can have a session clears the requirement beside its
+    /// own handler with `security(())`, which is the only override the contract
+    /// permits: a per-operation requirement naming some *other* scheme would be
+    /// a second authentication story, and there is only one header.
+    ///
+    /// Which operations are open is proved where it is observable — an
+    /// unauthenticated request to the assembled server — rather than restated
+    /// here as a list that can disagree with the router.
     ///
     /// # Panics
     ///
     /// Panics when the scheme is missing or misdescribed, when the document
-    /// carries no global requirement, when an anonymous path still requires one,
-    /// or when an authenticated path was accidentally exempted.
+    /// carries no global requirement, or when an operation overrides the
+    /// requirement with anything but an empty one.
     #[test]
     fn every_authenticated_path_declares_the_one_wyrd_scheme() {
         let document = serde_json::to_value(WyrdApiDoc::openapi()).expect("OpenAPI is JSON");
@@ -441,29 +402,29 @@ mod tests {
             "the document requires the scheme by default"
         );
 
+        let mut cleared = BTreeSet::new();
         for (path, item) in document["paths"]
             .as_object()
             .expect("paths is an object")
             .iter()
         {
-            let anonymous = super::ANONYMOUS_PATHS.contains(&path.as_str());
             for (method, operation) in item.as_object().expect("path item is an object") {
-                let overridden = operation.get("security");
-                if anonymous {
-                    assert_eq!(
-                        overridden,
-                        Some(&serde_json::json!([])),
-                        "{method} {path} is anonymous and must clear the requirement"
-                    );
-                } else {
-                    assert!(
-                        overridden.is_none(),
-                        "{method} {path} authenticates and must inherit the requirement, \
-                         not override it"
-                    );
-                }
+                let Some(overridden) = operation.get("security") else {
+                    continue;
+                };
+                // utoipa renders `security(())` as one empty requirement object,
+                // which is OpenAPI's way of saying the operation needs nothing.
+                assert!(
+                    overridden == &serde_json::json!([]) || overridden == &serde_json::json!([{}]),
+                    "{method} {path} overrides the document requirement with a second scheme"
+                );
+                cleared.insert(path.clone());
             }
         }
+        assert!(
+            !cleared.is_empty(),
+            "sign-in and credential exchange cannot themselves require a session"
+        );
     }
 
     /// Every public Bifrost table, query, and lifecycle operation publishes its

@@ -38,6 +38,9 @@ pub struct LoginQuery {
         (status = 503, description = "The auth backend is unavailable \
           (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
+    // No session exists yet at this operation, so it clears the document-wide
+    // requirement instead of inheriting it.
+    security(()),
     tag = "Auth"
 )]
 #[tracing::instrument(level = "debug", skip(state, headers, maybe_request_id), fields(issuer = %query.issuer))]

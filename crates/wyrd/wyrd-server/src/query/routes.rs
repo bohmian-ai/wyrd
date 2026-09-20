@@ -93,11 +93,24 @@ pub fn router() -> Router<AppState> {
     path = "/v1/query/running",
     responses(
         (status = 200, description = "Active queries", body = ListRunningQueriesResponse),
-        (status = 401, description = "Authentication required", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = 403, description = "Query lifecycle permission required", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = 409, description = "Query owner conflict", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = 503, description = "Query control unavailable", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other catalog-backed refusal", body = WyrdProblem, content_type = "application/problem+json")
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 403, description = "The principal may not drive query lifecycle \
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 409, description = "The query's owner moved while the request was in \
+          flight (WYRD_VALA_409_RUNNING_QUERY_CONFLICT)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 503, description = "The query-control or Oracle role is unavailable, the \
+          decision could not be audited, or the revocation store could not vouch for the token \
+          (WYRD_VALA_503_RUNNING_QUERY_CONTROL_UNAVAILABLE, WYRD_VALA_503_ORACLE_ROLE_UNAVAILABLE, \
+          WYRD_VALA_503_QUERY_AUDIT_UNAVAILABLE, \
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = "default", description = "Any other query refusal, each carrying its own \
+          stable code (WYRD_VALA_429_QUERY_ADMISSION_REJECTED, \
+          WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE, WYRD_VALA_413_QUERY_RESULT_TOO_LARGE, \
+          WYRD_VALA_504_QUERY_TIMEOUT, WYRD_VALA_500_QUERY_EXECUTION_FAILED, \
+          WYRD_VALA_500_AUDIT_UNAVAILABLE)",
+         body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Bifrost"
 )]
@@ -125,13 +138,28 @@ pub(crate) async fn list_running_queries(
     params(("request_id" = String, Path, description = "Canonical query request ID")),
     responses(
         (status = 200, description = "Active query", body = RunningQuerySummary),
-        (status = 400, description = "Invalid request ID", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = 401, description = "Authentication required", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = 403, description = "Query lifecycle permission required", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = 404, description = "No visible active query", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = 409, description = "Query owner conflict", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = 503, description = "Query control unavailable", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other catalog-backed refusal", body = WyrdProblem, content_type = "application/problem+json")
+        (status = 400, description = "The request identifier is not a canonical Wyrd request \
+          ID (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 403, description = "The principal may not drive query lifecycle \
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 404, description = "No active query of that identifier is visible to this \
+          tenant (WYRD_VALA_404_RUNNING_QUERY_NOT_FOUND)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 409, description = "The query's owner moved while the request was in \
+          flight (WYRD_VALA_409_RUNNING_QUERY_CONFLICT)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 503, description = "The query-control or Oracle role is unavailable, the \
+          decision could not be audited, or the revocation store could not vouch for the token \
+          (WYRD_VALA_503_RUNNING_QUERY_CONTROL_UNAVAILABLE, WYRD_VALA_503_ORACLE_ROLE_UNAVAILABLE, \
+          WYRD_VALA_503_QUERY_AUDIT_UNAVAILABLE, \
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = "default", description = "Any other query refusal, each carrying its own \
+          stable code (WYRD_VALA_429_QUERY_ADMISSION_REJECTED, \
+          WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE, WYRD_VALA_413_QUERY_RESULT_TOO_LARGE, \
+          WYRD_VALA_504_QUERY_TIMEOUT, WYRD_VALA_500_QUERY_EXECUTION_FAILED, \
+          WYRD_VALA_500_AUDIT_UNAVAILABLE)",
+         body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Bifrost"
 )]
@@ -167,13 +195,28 @@ pub(crate) async fn get_running_query(
     params(("request_id" = String, Path, description = "Canonical query request ID")),
     responses(
         (status = 200, description = "Cancellation accepted", body = CancelRunningQueryResponse),
-        (status = 400, description = "Invalid request ID", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = 401, description = "Authentication required", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = 403, description = "Query lifecycle permission required", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = 404, description = "No visible active query", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = 409, description = "Query owner conflict", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = 503, description = "Query control unavailable", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other catalog-backed refusal", body = WyrdProblem, content_type = "application/problem+json")
+        (status = 400, description = "The request identifier is not a canonical Wyrd request \
+          ID (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 403, description = "The principal may not drive query lifecycle \
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 404, description = "No active query of that identifier is visible to this \
+          tenant (WYRD_VALA_404_RUNNING_QUERY_NOT_FOUND)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 409, description = "The query's owner moved while the request was in \
+          flight (WYRD_VALA_409_RUNNING_QUERY_CONFLICT)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 503, description = "The query-control or Oracle role is unavailable, the \
+          decision could not be audited, or the revocation store could not vouch for the token \
+          (WYRD_VALA_503_RUNNING_QUERY_CONTROL_UNAVAILABLE, WYRD_VALA_503_ORACLE_ROLE_UNAVAILABLE, \
+          WYRD_VALA_503_QUERY_AUDIT_UNAVAILABLE, \
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = "default", description = "Any other query refusal, each carrying its own \
+          stable code (WYRD_VALA_429_QUERY_ADMISSION_REJECTED, \
+          WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE, WYRD_VALA_413_QUERY_RESULT_TOO_LARGE, \
+          WYRD_VALA_504_QUERY_TIMEOUT, WYRD_VALA_500_QUERY_EXECUTION_FAILED, \
+          WYRD_VALA_500_AUDIT_UNAVAILABLE)",
+         body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Bifrost"
 )]
@@ -220,11 +263,26 @@ pub(crate) async fn cancel_running_query(
                 )
             )
         ),
-        (status = 400, description = "Invalid query request", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = 401, description = "Authentication required", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = 403, description = "Query permission required", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = 503, description = "Oracle role is unavailable", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other catalog-backed refusal", body = WyrdProblem, content_type = "application/problem+json")
+        (status = 400, description = "The statement is not admissible Bifrost SQL \
+          (WYRD_VALA_400_QUERY_INVALID_SQL, WYRD_QUERY_400_INVALID_SYNTAX, \
+          WYRD_QUERY_400_TOO_COMPLEX, WYRD_SPEC_400_VALIDATION)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 403, description = "The principal may not query, or a peer presented \
+          unacceptable credentials (WYRD_PERMISSION_403_DENIED_RBAC, \
+          WYRD_VALA_403_QUERY_PEER_SECURITY)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 503, description = "The Oracle role is unavailable, visibility could not be \
+          resolved, the decision could not be audited, or the revocation store could not vouch \
+          for the token (WYRD_VALA_503_ORACLE_ROLE_UNAVAILABLE, \
+          WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE, WYRD_VALA_503_QUERY_AUDIT_UNAVAILABLE, \
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = "default", description = "Any other query refusal, each carrying its own \
+          stable code (WYRD_VALA_429_QUERY_ADMISSION_REJECTED, \
+          WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE, WYRD_VALA_413_QUERY_RESULT_TOO_LARGE, \
+          WYRD_VALA_504_QUERY_TIMEOUT, WYRD_VALA_500_QUERY_EXECUTION_FAILED, \
+          WYRD_VALA_500_AUDIT_UNAVAILABLE)",
+         body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Bifrost"
 )]

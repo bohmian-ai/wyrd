@@ -75,7 +75,9 @@ pub fn platform_credentials_router() -> Router<AppState> {
          body = IssuedCredential),
         (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
         (status = 403, description = "Platform credential administration required \
-          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem)
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 500, description = "A platform store read or write failed, or the platform \
+          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -128,7 +130,9 @@ async fn issue_credential(
          body = CredentialListResponse),
         (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
         (status = 403, description = "Platform credential administration required \
-          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem)
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 500, description = "A platform store read or write failed, or the platform \
+          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -191,7 +195,9 @@ async fn list_credentials(
         (status = 403, description = "Platform credential administration required \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No live credential for this platform principal \
-          (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem)
+          (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem),
+        (status = 500, description = "A platform store read or write failed, or the platform \
+          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]

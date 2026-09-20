@@ -62,11 +62,23 @@ pub fn cards_router() -> Router<AppState> {
     ),
     responses(
         (status = 200, description = "Hydrated Card", body = GetCardResponse),
-        (status = 401, description = "Authentication required"),
-        (status = 403, description = "Card read permission required"),
-        (status = 404, description = "Card not found"),
-        (status = 503, description = "Registry unavailable")
-    )
+        (status = 400, description = "The Card kind, space, name, version, or UID is not well formed (WYRD_REGISTRY_400_INVALID_CARD_SPEC, WYRD_REGISTRY_400_VERSION_REQUIRED, WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+        (status = 403, description = "The principal may not read Cards \
+          (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_AUTH_403_PRINCIPAL_ORPHANED)",
+         body = WyrdProblem),
+        (status = 404, description = "No such Card is visible to this tenant \
+          (WYRD_REGISTRY_404_CARD_NOT_FOUND)", body = WyrdProblem),
+        (status = 500, description = "The authorization decision could not be audited \
+          (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 503, description = "The registry is unavailable, or the revocation store \
+          could not vouch for the token \
+          (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Cards"
 )]
 #[tracing::instrument(skip(state, caller), fields(operation = "card.read.uid"))]
 async fn get_card_http(
@@ -106,9 +118,23 @@ async fn get_card_http(
     ),
     responses(
         (status = 200, description = "Hydrated Card", body = GetCardResponse),
-        (status = 404, description = "Card not found"),
-        (status = 503, description = "Registry unavailable")
-    )
+        (status = 400, description = "The Card kind, space, name, version, or UID is not well formed (WYRD_REGISTRY_400_INVALID_CARD_SPEC, WYRD_REGISTRY_400_VERSION_REQUIRED, WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+        (status = 403, description = "The principal may not read Cards \
+          (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_AUTH_403_PRINCIPAL_ORPHANED)",
+         body = WyrdProblem),
+        (status = 404, description = "No such Card is visible to this tenant \
+          (WYRD_REGISTRY_404_CARD_NOT_FOUND)", body = WyrdProblem),
+        (status = 500, description = "The authorization decision could not be audited \
+          (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 503, description = "The registry is unavailable, or the revocation store \
+          could not vouch for the token \
+          (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Cards"
 )]
 #[tracing::instrument(skip(state, caller), fields(operation = "card.read.ref"))]
 async fn get_card_by_ref_http(
@@ -135,9 +161,23 @@ async fn get_card_by_ref_http(
     ),
     responses(
         (status = 200, description = "Latest Active Card", body = GetCardResponse),
-        (status = 404, description = "Card not found"),
-        (status = 503, description = "Registry unavailable")
-    )
+        (status = 400, description = "The Card kind, space, name, version, or UID is not well formed (WYRD_REGISTRY_400_INVALID_CARD_SPEC, WYRD_REGISTRY_400_VERSION_REQUIRED, WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+        (status = 403, description = "The principal may not read Cards \
+          (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_AUTH_403_PRINCIPAL_ORPHANED)",
+         body = WyrdProblem),
+        (status = 404, description = "No such Card is visible to this tenant \
+          (WYRD_REGISTRY_404_CARD_NOT_FOUND)", body = WyrdProblem),
+        (status = 500, description = "The authorization decision could not be audited \
+          (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 503, description = "The registry is unavailable, or the revocation store \
+          could not vouch for the token \
+          (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Cards"
 )]
 #[tracing::instrument(skip(state, caller), fields(operation = "card.read.latest"))]
 async fn get_latest_card_http(
@@ -173,8 +213,21 @@ async fn get_latest_card_http(
     ),
     responses(
         (status = 200, description = "Card versions", body = ListVersionsResponse),
-        (status = 503, description = "Registry unavailable")
-    )
+        (status = 400, description = "The Card kind, space, name, version, or UID is not well formed (WYRD_REGISTRY_400_INVALID_CARD_SPEC, WYRD_REGISTRY_400_VERSION_REQUIRED, WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+        (status = 403, description = "The principal may not read Cards \
+          (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_AUTH_403_PRINCIPAL_ORPHANED)",
+         body = WyrdProblem),
+        (status = 500, description = "The authorization decision could not be audited \
+          (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 503, description = "The registry is unavailable, or the revocation store \
+          could not vouch for the token \
+          (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Cards"
 )]
 async fn list_versions_http(
     State(state): State<AppState>,
@@ -215,11 +268,21 @@ async fn list_versions_http(
     ),
     responses(
         (status = 200, description = "Card summaries", body = ListCardsResponse),
-        (status = 400, description = "Invalid list query", body = WyrdProblem),
-        (status = 401, description = "Authentication required", body = WyrdProblem),
-        (status = 403, description = "Card read permission required", body = WyrdProblem),
-        (status = 503, description = "Registry unavailable", body = WyrdProblem)
-    )
+        (status = 400, description = "The list filter, limit, or cursor is not usable (WYRD_REGISTRY_400_LIST_LIMIT_OUT_OF_RANGE, WYRD_REGISTRY_400_CURSOR_MISMATCH, WYRD_QUERY_400_INVALID_FIELD, WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+        (status = 403, description = "The principal may not read Cards \
+          (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_AUTH_403_PRINCIPAL_ORPHANED)",
+         body = WyrdProblem),
+        (status = 500, description = "The authorization decision could not be audited \
+          (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 503, description = "The registry is unavailable, or the revocation store \
+          could not vouch for the token \
+          (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Cards"
 )]
 async fn list_cards_http(
     State(state): State<AppState>,
@@ -239,10 +302,25 @@ async fn list_cards_http(
     path = "/v1/cards/{card_uid}/artifacts",
     params(("card_uid" = String, Path, description = "Card UID")),
     responses(
-        (status = 200, description = "Artifact inventory", body = wyrd_spec::registry::ArtifactInventoryResponse),
-        (status = 404, description = "Card not found"),
-        (status = 503, description = "Registry unavailable")
-    )
+        (status = 200, description = "Artifact inventory",
+         body = wyrd_spec::registry::ArtifactInventoryResponse),
+        (status = 400, description = "The Card kind, space, name, version, or UID is not well formed (WYRD_REGISTRY_400_INVALID_CARD_SPEC, WYRD_REGISTRY_400_VERSION_REQUIRED, WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+        (status = 403, description = "The principal may not read Cards \
+          (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_AUTH_403_PRINCIPAL_ORPHANED)",
+         body = WyrdProblem),
+        (status = 404, description = "No such Card is visible to this tenant \
+          (WYRD_REGISTRY_404_CARD_NOT_FOUND)", body = WyrdProblem),
+        (status = 500, description = "The authorization decision could not be audited \
+          (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 503, description = "The registry is unavailable, or the revocation store \
+          could not vouch for the token \
+          (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Cards"
 )]
 async fn list_artifacts_http(
     State(state): State<AppState>,
@@ -271,13 +349,28 @@ async fn list_artifacts_http(
         ("Idempotency-Key" = String, Header, description = "Stable key reused for retries", example = "card-register-001")
     ),
     responses(
-        (status = 201, description = "Card registered", body = wyrd_spec::registry::CreateCardResponse),
-        (status = 400, description = "Invalid request", body = WyrdProblem),
-        (status = 401, description = "Authentication required", body = WyrdProblem),
-        (status = 403, description = "Card write permission required", body = WyrdProblem),
-        (status = 409, description = "Idempotency or version conflict", body = WyrdProblem),
-        (status = 503, description = "Registry unavailable", body = WyrdProblem)
-    )
+        (status = 201, description = "Card registered",
+         body = wyrd_spec::registry::CreateCardResponse),
+        (status = 400, description = "The submission is not a valid Card, or its idempotency key is missing or malformed (WYRD_REGISTRY_400_INVALID_CARD_SPEC, WYRD_REGISTRY_400_SPEC_TOO_LARGE, WYRD_REGISTRY_400_IDEMPOTENCY_KEY_REQUIRED, WYRD_REGISTRY_400_IDEMPOTENCY_KEY_INVALID, WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+        (status = 403, description = "The principal may not register Cards \
+          (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_AUTH_403_PRINCIPAL_ORPHANED)",
+         body = WyrdProblem),
+        (status = 409, description = "The idempotency key was reused with a different \
+          submission, or the version already exists (WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT, \
+          WYRD_SPEC_409_CONFLICT)", body = WyrdProblem),
+        (status = 422, description = "A declared dependency does not resolve \
+          (WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY)", body = WyrdProblem),
+        (status = 500, description = "The authorization decision could not be audited \
+          (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 503, description = "The registry is unavailable, or the revocation store \
+          could not vouch for the token \
+          (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Cards"
 )]
 #[tracing::instrument(
     skip(state, caller, headers, body),
@@ -340,14 +433,29 @@ pub(crate) async fn register_card_http(
     ),
     responses(
         (status = 200, description = "Card completed", body = CreateCardResponse),
-        (status = 400, description = "Invalid Card UID or idempotency key", body = WyrdProblem),
-        (status = 401, description = "Authentication required", body = WyrdProblem),
-        (status = 403, description = "Card write permission required", body = WyrdProblem),
-        (status = 404, description = "Card not found", body = WyrdProblem),
-        (status = 409, description = "Card is not pending", body = WyrdProblem),
-        (status = 503, description = "Registry unavailable", body = WyrdProblem),
-        (status = 507, description = "Artifact verification failed", body = WyrdProblem)
-    )
+        (status = 400, description = "The Card UID or idempotency key is malformed, or an artifact never finished uploading (WYRD_REGISTRY_400_INVALID_CARD_SPEC, WYRD_REGISTRY_400_IDEMPOTENCY_KEY_INVALID, WYRD_REGISTRY_400_UPLOAD_INTERRUPTED, WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+        (status = 403, description = "The principal may not write Cards \
+          (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_AUTH_403_PRINCIPAL_ORPHANED)",
+         body = WyrdProblem),
+        (status = 404, description = "No such Card is visible to this tenant \
+          (WYRD_REGISTRY_404_CARD_NOT_FOUND)", body = WyrdProblem),
+        (status = 409, description = "The Card is no longer pending \
+          (WYRD_SPEC_409_CONFLICT)", body = WyrdProblem),
+        (status = 410, description = "The pending registration expired before completion \
+          (WYRD_REGISTRY_410_OPERATION_EXPIRED)", body = WyrdProblem),
+        (status = 500, description = "The authorization decision could not be audited \
+          (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 503, description = "The registry is unavailable, or the revocation store \
+          could not vouch for the token \
+          (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem),
+        (status = 507, description = "A stored artifact failed verification \
+          (WYRD_REGISTRY_507_ARTIFACT_VERIFY_FAILED)", body = WyrdProblem)
+    ),
+    tag = "Cards"
 )]
 #[tracing::instrument(skip(state, caller), fields(operation = "card.registration.complete"))]
 async fn complete_card_http(
@@ -391,11 +499,27 @@ async fn complete_card_http(
     ),
     responses(
         (status = 200, description = "Card deleted", body = DeleteCardResponse),
-        (status = 404, description = "Card not found"),
-        (status = 409, description = "Card has inbound references"),
-        (status = 503, description = "Registry unavailable"),
-        (status = 507, description = "Storage cleanup incomplete")
-    )
+        (status = 400, description = "The Card kind, space, name, version, or UID is not well formed (WYRD_REGISTRY_400_INVALID_CARD_SPEC, WYRD_REGISTRY_400_VERSION_REQUIRED, WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+        (status = 403, description = "The principal may not delete Cards \
+          (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_AUTH_403_PRINCIPAL_ORPHANED)",
+         body = WyrdProblem),
+        (status = 404, description = "No such Card is visible to this tenant \
+          (WYRD_REGISTRY_404_CARD_NOT_FOUND)", body = WyrdProblem),
+        (status = 409, description = "Another Card still references this one \
+          (WYRD_SPEC_409_CONFLICT)", body = WyrdProblem),
+        (status = 500, description = "The authorization decision could not be audited \
+          (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 503, description = "The registry is unavailable, or the revocation store \
+          could not vouch for the token \
+          (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem),
+        (status = 507, description = "Stored artifacts could not all be removed \
+          (WYRD_REGISTRY_507_ARTIFACT_VERIFY_FAILED)", body = WyrdProblem)
+    ),
+    tag = "Cards"
 )]
 #[tracing::instrument(skip(state, caller), fields(operation = "card.registration.delete"))]
 async fn delete_card_http(
@@ -444,11 +568,27 @@ async fn delete_card_http(
     ),
     responses(
         (status = 200, description = "Card deleted", body = DeleteCardResponse),
-        (status = 404, description = "Card not found"),
-        (status = 409, description = "Card has inbound references"),
-        (status = 503, description = "Registry unavailable"),
-        (status = 507, description = "Storage cleanup incomplete")
-    )
+        (status = 400, description = "The Card kind, space, name, version, or UID is not well formed (WYRD_REGISTRY_400_INVALID_CARD_SPEC, WYRD_REGISTRY_400_VERSION_REQUIRED, WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+        (status = 403, description = "The principal may not delete Cards \
+          (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_AUTH_403_PRINCIPAL_ORPHANED)",
+         body = WyrdProblem),
+        (status = 404, description = "No such Card is visible to this tenant \
+          (WYRD_REGISTRY_404_CARD_NOT_FOUND)", body = WyrdProblem),
+        (status = 409, description = "Another Card still references this one \
+          (WYRD_SPEC_409_CONFLICT)", body = WyrdProblem),
+        (status = 500, description = "The authorization decision could not be audited \
+          (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 503, description = "The registry is unavailable, or the revocation store \
+          could not vouch for the token \
+          (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem),
+        (status = 507, description = "Stored artifacts could not all be removed \
+          (WYRD_REGISTRY_507_ARTIFACT_VERIFY_FAILED)", body = WyrdProblem)
+    ),
+    tag = "Cards"
 )]
 #[tracing::instrument(skip(state, caller), fields(operation = "card.registration.delete"))]
 async fn delete_card_by_ref_http(

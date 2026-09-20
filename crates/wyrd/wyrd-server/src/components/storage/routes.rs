@@ -16,7 +16,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use tokio_util::io::ReaderStream;
 use wyrd_runtime::Permission;
-use wyrd_spec::error::WyrdError;
+use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::ids::IdempotencyKey;
 use wyrd_spec::storage::{
     AbortResponse, DownloadInitRequest, IDEMPOTENCY_KEY_HEADER, LocalBlobUploadResponse,
@@ -49,6 +49,36 @@ pub fn storage_router(state: &AppState) -> Router<AppState> {
 }
 
 /// Create or replay a storage upload initialization.
+#[utoipa::path(
+    post,
+    path = "/v1/cards/upload/init",
+    request_body = UploadInitRequest,
+    params(("Idempotency-Key" = Option<String>, Header, description = "Replays an \
+      initialization instead of planning a second upload")),
+    responses(
+        (status = 200, description = "Upload plan, replayed unchanged for a repeated \
+          idempotency key", body = wyrd_spec::storage::UploadInitResponse),
+        (status = 400, description = "The idempotency key, the artifact path, or the declared \
+          digest or size is invalid (WYRD_SPEC_400_VALIDATION, \
+          WYRD_STORAGE_400_TENANT_PATH_MISMATCH, WYRD_STORAGE_400_ARTIFACT_TOO_LARGE, \
+          WYRD_STORAGE_400_SHA256_INVALID, WYRD_STORAGE_400_SIZE_INVALID)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+        (status = 403, description = "The principal lacks card write, or the object belongs to \
+          another tenant (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_STORAGE_403_UPLOAD_FOREIGN_TENANT)", body = WyrdProblem),
+        (status = 409, description = "The upload record conflicts with one already stored \
+          (WYRD_SPEC_409_CONFLICT)", body = WyrdProblem),
+        (status = 500, description = "The storage backend or the platform store failed, or the \
+          decision could not be audited (WYRD_STORAGE_500_BACKEND, WYRD_SPEC_500_INTERNAL, \
+          WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 503, description = "The revocation store could not vouch for the token, or \
+          the storage backend is transiently unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE, \
+          WYRD_STORAGE_503_BACKEND_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Storage"
+)]
 async fn init(
     State(state): State<AppState>,
     caller: Caller,
@@ -83,6 +113,36 @@ struct PartUrlQuery {
 }
 
 /// Mint a URL or equivalent protocol data for one upload part.
+#[utoipa::path(
+    post,
+    path = "/v1/cards/upload/{id}/part-url",
+    params(
+        ("id" = String, Path, description = "Upload the part belongs to"),
+        ("part_number" = u32, Query, description = "One-based multipart part number")
+    ),
+    responses(
+        (status = 200, description = "Part upload instructions", body = PartUrlResponse),
+        (status = 400, description = "The upload identifier is not one this server minted \
+          (WYRD_STORAGE_400_INVALID_UPLOAD_ID)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+        (status = 403, description = "The principal lacks card write, or the object belongs to \
+          another tenant (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_STORAGE_403_UPLOAD_FOREIGN_TENANT)", body = WyrdProblem),
+        (status = 404, description = "No such upload (WYRD_STORAGE_404_UPLOAD_NOT_FOUND)",
+         body = WyrdProblem),
+        (status = 409, description = "The upload is already terminal \
+          (WYRD_STORAGE_409_UPLOAD_NOT_PENDING)", body = WyrdProblem),
+        (status = 500, description = "The storage backend or the platform store failed, or the \
+          decision could not be audited (WYRD_STORAGE_500_BACKEND, WYRD_SPEC_500_INTERNAL, \
+          WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 503, description = "The revocation store could not vouch for the token, or \
+          the storage backend is transiently unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE, \
+          WYRD_STORAGE_503_BACKEND_UNAVAILABLE, WYRD_STORAGE_503_PRESIGN_EXPIRED)", body = WyrdProblem)
+    ),
+    tag = "Storage"
+)]
 async fn part_url(
     State(state): State<AppState>,
     caller: Caller,
@@ -115,6 +175,44 @@ async fn part_url(
 /// The optional `Idempotency-Key` is forwarded to the storage service so a
 /// retried client completion keeps the same request context. The service
 /// verifies the backend object before persisting its artifact metadata.
+#[utoipa::path(
+    post,
+    path = "/v1/cards/upload/{id}/complete",
+    params(
+        ("id" = String, Path, description = "Upload to finish"),
+        ("Idempotency-Key" = Option<String>, Header, description = "Correlates a retried \
+          completion with the original request")
+    ),
+    request_body = UploadCompleteRequest,
+    responses(
+        (status = 200, description = "The stored artifact's recorded metadata",
+         body = wyrd_spec::storage::UploadCompleteResponse),
+        (status = 400, description = "The idempotency key or upload identifier is malformed, or \
+          the stored bytes disagree with what was declared (WYRD_SPEC_400_VALIDATION, \
+          WYRD_STORAGE_400_INVALID_UPLOAD_ID, WYRD_STORAGE_400_SHA256_MISMATCH, \
+          WYRD_STORAGE_400_SIZE_MISMATCH)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+        (status = 403, description = "The principal lacks card write, or the object belongs to \
+          another tenant (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_STORAGE_403_UPLOAD_FOREIGN_TENANT)", body = WyrdProblem),
+        (status = 404, description = "No such upload, or its object never reached the backend \
+          (WYRD_STORAGE_404_UPLOAD_NOT_FOUND, WYRD_STORAGE_404_OBJECT_NOT_FOUND)",
+         body = WyrdProblem),
+        (status = 409, description = "The upload is already terminal, the backend did not \
+          advertise encryption, or the artifact row conflicts \
+          (WYRD_STORAGE_409_UPLOAD_NOT_PENDING, WYRD_STORAGE_409_ENCRYPTION_MISSING, \
+          WYRD_SPEC_409_CONFLICT)", body = WyrdProblem),
+        (status = 500, description = "The storage backend or the platform store failed, or the \
+          decision could not be audited (WYRD_STORAGE_500_BACKEND, WYRD_SPEC_500_INTERNAL, \
+          WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 503, description = "The revocation store could not vouch for the token, or \
+          the storage backend is transiently unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE, \
+          WYRD_STORAGE_503_BACKEND_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Storage"
+)]
 async fn complete(
     State(state): State<AppState>,
     caller: Caller,
@@ -150,6 +248,38 @@ async fn complete(
 /// Aborts are safe to retry: the server treats an already completed or
 /// already aborted upload as a no-op, while the idempotency key remains
 /// available to the service for request correlation.
+#[utoipa::path(
+    post,
+    path = "/v1/cards/upload/{id}/abort",
+    params(
+        ("id" = String, Path, description = "Upload to release"),
+        ("Idempotency-Key" = Option<String>, Header, description = "Correlates a retried abort \
+          with the original request")
+    ),
+    responses(
+        (status = 200, description = "The upload is released; a repeat is a no-op",
+         body = AbortResponse),
+        (status = 400, description = "The idempotency key or upload identifier is malformed \
+          (WYRD_SPEC_400_VALIDATION, WYRD_STORAGE_400_INVALID_UPLOAD_ID)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+        (status = 403, description = "The principal lacks card write, or the object belongs to \
+          another tenant (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_STORAGE_403_UPLOAD_FOREIGN_TENANT)", body = WyrdProblem),
+        (status = 404, description = "No such upload (WYRD_STORAGE_404_UPLOAD_NOT_FOUND)",
+         body = WyrdProblem),
+        (status = 409, description = "The upload is already terminal \
+          (WYRD_STORAGE_409_UPLOAD_NOT_PENDING)", body = WyrdProblem),
+        (status = 500, description = "The storage backend or the platform store failed, or the \
+          decision could not be audited (WYRD_STORAGE_500_BACKEND, WYRD_SPEC_500_INTERNAL, \
+          WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 503, description = "The revocation store could not vouch for the token, or \
+          the storage backend is transiently unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE, \
+          WYRD_STORAGE_503_BACKEND_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Storage"
+)]
 async fn abort(
     State(state): State<AppState>,
     caller: Caller,
@@ -179,6 +309,34 @@ async fn abort(
 }
 
 /// Store bytes for the local development backend.
+#[utoipa::path(
+    put,
+    path = "/v1/cards/upload/local/{id}",
+    params(("id" = String, Path, description = "Upload the bytes belong to")),
+    request_body(content = Vec<u8>, content_type = "application/octet-stream"),
+    responses(
+        (status = 200, description = "The bytes were stored", body = LocalBlobUploadResponse),
+        (status = 400, description = "The upload identifier is not one this server minted \
+          (WYRD_STORAGE_400_INVALID_UPLOAD_ID)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+        (status = 403, description = "The principal lacks card write, or the object belongs to \
+          another tenant (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_STORAGE_403_UPLOAD_FOREIGN_TENANT)", body = WyrdProblem),
+        (status = 404, description = "No such upload (WYRD_STORAGE_404_UPLOAD_NOT_FOUND)",
+         body = WyrdProblem),
+        (status = 409, description = "The upload is already terminal \
+          (WYRD_STORAGE_409_UPLOAD_NOT_PENDING)", body = WyrdProblem),
+        (status = 500, description = "The storage backend or the platform store failed, or the \
+          decision could not be audited (WYRD_STORAGE_500_BACKEND, WYRD_SPEC_500_INTERNAL, \
+          WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 503, description = "The revocation store could not vouch for the token, or \
+          the storage backend is transiently unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE, \
+          WYRD_STORAGE_503_BACKEND_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Storage"
+)]
 async fn local_blob(
     State(state): State<AppState>,
     caller: Caller,
@@ -212,11 +370,28 @@ async fn local_blob(
     path = "/v1/cards/download/init",
     request_body = DownloadInitRequest,
     responses(
-        (status = 200, description = "Download plan", body = wyrd_spec::storage::DownloadInitResponse),
-        (status = 403, description = "Card read permission required"),
-        (status = 404, description = "Card artifact not found"),
-        (status = 503, description = "Storage unavailable")
-    )
+        (status = 200, description = "Download plan",
+         body = wyrd_spec::storage::DownloadInitResponse),
+        (status = 400, description = "The stored URI or its tenant prefix is unreadable \
+          (WYRD_STORAGE_400_INVALID_URI, WYRD_STORAGE_400_TENANT_PREFIX_INVALID)",
+         body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+        (status = 403, description = "The principal lacks card read, or the object belongs to \
+          another tenant (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_STORAGE_403_UPLOAD_FOREIGN_TENANT)", body = WyrdProblem),
+        (status = 404, description = "No such card artifact, or its object is gone from the \
+          backend (WYRD_SPEC_404_NOT_FOUND, WYRD_STORAGE_404_OBJECT_NOT_FOUND)",
+         body = WyrdProblem),
+        (status = 500, description = "The storage backend or the platform store failed, or the \
+          decision could not be audited (WYRD_STORAGE_500_BACKEND, WYRD_SPEC_500_INTERNAL, \
+          WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 503, description = "The revocation store could not vouch for the token, or \
+          the storage backend is transiently unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE, \
+          WYRD_STORAGE_503_BACKEND_UNAVAILABLE, WYRD_STORAGE_503_PRESIGN_EXPIRED)", body = WyrdProblem)
+    ),
+    tag = "Storage"
 )]
 async fn download_init(
     State(state): State<AppState>,
@@ -238,6 +413,30 @@ async fn download_init(
 }
 
 /// Stream bytes from the local development backend.
+#[utoipa::path(
+    get,
+    path = "/v1/cards/download/local/{path}",
+    params(("path" = String, Path, description = "Stored object path to stream")),
+    responses(
+        (status = 200, description = "The stored bytes",
+         content_type = "application/octet-stream"),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+        (status = 403, description = "The principal lacks card read, or the object belongs to \
+          another tenant (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_STORAGE_403_UPLOAD_FOREIGN_TENANT)", body = WyrdProblem),
+        (status = 404, description = "No such stored object \
+          (WYRD_STORAGE_404_OBJECT_NOT_FOUND)", body = WyrdProblem),
+        (status = 500, description = "The storage backend or the platform store failed, or the \
+          decision could not be audited (WYRD_STORAGE_500_BACKEND, WYRD_SPEC_500_INTERNAL, \
+          WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 503, description = "The revocation store could not vouch for the token, or \
+          the storage backend is transiently unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE, \
+          WYRD_STORAGE_503_BACKEND_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Storage"
+)]
 async fn download_local_blob(
     State(state): State<AppState>,
     caller: Caller,

@@ -43,20 +43,25 @@ use wyrd_sql::TenantConn;
 /// committed.
 #[utoipa::path(
     post,
-    path = "/v1/principals/{principal_id}/revoke",
-    params(("principal_id" = String, Path, description = "Principal whose tokens stop working")),
+    path = "/v1/principals/{id}/revoke",
+    params(("id" = String, Path, description = "Principal whose tokens stop working")),
     request_body = RevokePrincipalRequest,
     responses(
         (status = 200, description = "Outstanding tokens revoked, effective on the next request"),
         (status = 400, description = "Missing, oversized, or secret-like revocation reason \
           (WYRD_VALIDATION_400_MISSING_REQUIRED_FIELD)", body = WyrdProblem),
-        (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
         (status = 403, description = "Tenant principal administration required \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No such principal of that kind in the caller's tenant \
           (WYRD_AUTH_404_PRINCIPAL_NOT_FOUND)", body = WyrdProblem),
-        (status = 503, description = "Revocation decision could not be audited \
-          (WYRD_AUDIT_503_UNAVAILABLE)", body = WyrdProblem)
+        (status = 500, description = "A tenant store read or write failed, or the revocation \
+          decision could not be audited (WYRD_SPEC_500_INTERNAL, \
+          WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 503, description = "The revocation store could not vouch for the token (\
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Principals"
 )]

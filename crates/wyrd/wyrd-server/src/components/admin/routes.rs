@@ -268,14 +268,20 @@ struct BindingFilter {
         (status = 400, description = "The issuer URL is malformed, resolves to a blocked address, \
           or a required field is missing (WYRD_VALIDATION_400_MISSING_REQUIRED_FIELD)",
          body = WyrdProblem),
-        (status = 401, description = "An access token is required \
-          (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
         (status = 403, description = "Caller lacks service_accounts:write \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 409, description = "The issuer is already registered for this tenant \
           (WYRD_AUTH_409_ADMIN_CONFLICT)", body = WyrdProblem),
-        (status = 503, description = "OIDC discovery, the sealing key, the store, or the audit \
-          path is unavailable (WYRD_AUTH_503_DISCOVERY_UNAVAILABLE)", body = WyrdProblem)
+        (status = 500, description = "The sealing key or a tenant store write failed, or the \
+          decision could not be audited (WYRD_SPEC_500_INTERNAL, \
+          WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 503, description = "OIDC discovery or the store is unavailable, or the \
+          revocation store could not vouch for the token \
+          (WYRD_AUTH_503_DISCOVERY_UNAVAILABLE, \
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Admin"
 )]
@@ -344,12 +350,17 @@ async fn create_trusted_issuer(
     responses(
         (status = 200, description = "The tenant's trusted issuers, client secrets redacted",
          body = Vec<TrustedIssuerView>),
-        (status = 401, description = "An access token is required \
-          (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
         (status = 403, description = "Caller lacks service_accounts:write \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
-        (status = 503, description = "The store or the audit path is unavailable \
-          (WYRD_AUDIT_503_UNAVAILABLE)", body = WyrdProblem)
+        (status = 500, description = "A tenant store read or write failed, or the decision \
+          could not be audited (WYRD_SPEC_500_INTERNAL, \
+          WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 503, description = "The store is unavailable, or the revocation store could \
+          not vouch for the token (\
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Admin"
 )]
@@ -399,16 +410,21 @@ async fn list_trusted_issuers(
     ),
     responses(
         (status = 204, description = "Issuer removed"),
-        (status = 401, description = "An access token is required \
-          (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
         (status = 403, description = "Caller lacks service_accounts:write \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No such issuer in this tenant \
           (WYRD_AUTH_404_ADMIN_NOT_FOUND)", body = WyrdProblem),
         (status = 409, description = "Live workload bindings still reference the issuer and \
           cascade was not requested (WYRD_AUTH_409_ADMIN_CONFLICT)", body = WyrdProblem),
-        (status = 503, description = "The store or the audit path is unavailable \
-          (WYRD_AUDIT_503_UNAVAILABLE)", body = WyrdProblem)
+        (status = 500, description = "A tenant store read or write failed, or the decision \
+          could not be audited (WYRD_SPEC_500_INTERNAL, \
+          WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 503, description = "The store is unavailable, or the revocation store could \
+          not vouch for the token (\
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Admin"
 )]
@@ -471,16 +487,21 @@ async fn delete_trusted_issuer_route(
         (status = 200, description = "Binding created", body = WorkloadBindingView),
         (status = 400, description = "A required field is missing or malformed \
           (WYRD_VALIDATION_400_MISSING_REQUIRED_FIELD)", body = WyrdProblem),
-        (status = 401, description = "An access token is required \
-          (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
         (status = 403, description = "Caller lacks service_accounts:write \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "The named issuer is not trusted by this tenant \
           (WYRD_AUTH_404_ADMIN_NOT_FOUND)", body = WyrdProblem),
         (status = 409, description = "The binding already exists \
           (WYRD_AUTH_409_ADMIN_CONFLICT)", body = WyrdProblem),
-        (status = 503, description = "The store or the audit path is unavailable \
-          (WYRD_AUDIT_503_UNAVAILABLE)", body = WyrdProblem)
+        (status = 500, description = "A tenant store read or write failed, or the decision \
+          could not be audited (WYRD_SPEC_500_INTERNAL, \
+          WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 503, description = "The store is unavailable, or the revocation store could \
+          not vouch for the token (\
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Admin"
 )]
@@ -538,12 +559,17 @@ async fn create_workload_binding(
     responses(
         (status = 200, description = "The tenant's workload bindings",
          body = Vec<WorkloadBindingView>),
-        (status = 401, description = "An access token is required \
-          (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
         (status = 403, description = "Caller lacks service_accounts:write \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
-        (status = 503, description = "The store or the audit path is unavailable \
-          (WYRD_AUDIT_503_UNAVAILABLE)", body = WyrdProblem)
+        (status = 500, description = "A tenant store read or write failed, or the decision \
+          could not be audited (WYRD_SPEC_500_INTERNAL, \
+          WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 503, description = "The store is unavailable, or the revocation store could \
+          not vouch for the token (\
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Admin"
 )]
@@ -594,14 +620,19 @@ async fn list_workload_bindings(
     ),
     responses(
         (status = 204, description = "Binding removed"),
-        (status = 401, description = "An access token is required \
-          (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
         (status = 403, description = "Caller lacks service_accounts:write \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No such binding in this tenant \
           (WYRD_AUTH_404_ADMIN_NOT_FOUND)", body = WyrdProblem),
-        (status = 503, description = "The store or the audit path is unavailable \
-          (WYRD_AUDIT_503_UNAVAILABLE)", body = WyrdProblem)
+        (status = 500, description = "A tenant store read or write failed, or the decision \
+          could not be audited (WYRD_SPEC_500_INTERNAL, \
+          WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 503, description = "The store is unavailable, or the revocation store could \
+          not vouch for the token (\
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Admin"
 )]

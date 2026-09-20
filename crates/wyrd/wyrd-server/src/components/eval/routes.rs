@@ -25,7 +25,7 @@ use axum::{Json, Router};
 use vala_eval::orchestrator::{NextDirective, RunState};
 use wyrd_runtime::{Permission, Principal};
 use wyrd_spec::envelope::CardKind;
-use wyrd_spec::error::WyrdError;
+use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::eval::protocol::{
     AgentTurnSubmission, EvalRunOpenRequest, EvalRunOpenResponse, TurnDirective, UserTurnSubmission,
@@ -51,6 +51,30 @@ pub fn eval_router() -> Router<AppState> {
         .route("/eval/runs/{run_id}/user-turn", post(user_turn))
 }
 
+/// Open one evaluation run and lease it to this caller.
+#[utoipa::path(
+    post,
+    path = "/v1/eval/runs",
+    request_body = EvalRunOpenRequest,
+    responses(
+        (status = 200, description = "Run opened; the lease token is returned once",
+         body = EvalRunOpenResponse),
+        (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED)",
+         body = WyrdProblem),
+        (status = 403, description = "The `evals:run` permission is required \
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 404, description = "The eval or its dataset card does not exist in this \
+          tenant (WYRD_EVAL_404_RUN_NOT_FOUND)", body = WyrdProblem),
+        (status = 429, description = "This tenant already holds the maximum number of open \
+          runs (WYRD_EVAL_429_TOO_MANY_RUNS)", body = WyrdProblem),
+        (status = 500, description = "The run could not be opened, or the authorization \
+          decision could not be audited (WYRD_EVAL_500_RUN_FAILED, \
+          WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 503, description = "The revocation store could not vouch for the token (\
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Eval"
+)]
 #[tracing::instrument(
     skip(state, caller, req),
     fields(
@@ -129,6 +153,27 @@ async fn open(
     }))
 }
 
+/// Advance one leased run by a single protocol step.
+#[utoipa::path(
+    post,
+    path = "/v1/eval/runs/{run_id}/next",
+    params(("run_id" = String, Path, description = "Run to advance")),
+    responses(
+        (status = 200, description = "The next directive for this run", body = TurnDirective),
+        (status = 401, description = "Authentication is required and the lease token must be \
+          presented (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_EVAL_401_MISSING_LEASE)",
+         body = WyrdProblem),
+        (status = 403, description = "The presented lease does not hold this run \
+          (WYRD_EVAL_403_INVALID_LEASE)", body = WyrdProblem),
+        (status = 404, description = "No such run for this tenant and principal \
+          (WYRD_EVAL_404_RUN_NOT_FOUND)", body = WyrdProblem),
+        (status = 500, description = "The run could not be advanced \
+          (WYRD_EVAL_500_RUN_FAILED)", body = WyrdProblem),
+        (status = 503, description = "The revocation store could not vouch for the token \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Eval"
+)]
 #[tracing::instrument(skip(state, principal, headers), fields(wyrd.run_id = %run_id))]
 async fn next(
     State(state): State<AppState>,
@@ -178,6 +223,28 @@ async fn next(
     }
 }
 
+/// Submit the agent's half of one turn.
+#[utoipa::path(
+    post,
+    path = "/v1/eval/runs/{run_id}/agent-turn",
+    params(("run_id" = String, Path, description = "Run the turn belongs to")),
+    request_body = AgentTurnSubmission,
+    responses(
+        (status = 202, description = "The turn was accepted"),
+        (status = 401, description = "Authentication is required and the lease token must be \
+          presented (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_EVAL_401_MISSING_LEASE)",
+         body = WyrdProblem),
+        (status = 403, description = "The presented lease does not hold this run \
+          (WYRD_EVAL_403_INVALID_LEASE)", body = WyrdProblem),
+        (status = 404, description = "No such run for this tenant and principal \
+          (WYRD_EVAL_404_RUN_NOT_FOUND)", body = WyrdProblem),
+        (status = 409, description = "The submission does not match the turn the run is \
+          waiting on (WYRD_EVAL_409_SUBMISSION_MISMATCH)", body = WyrdProblem),
+        (status = 503, description = "The revocation store could not vouch for the token \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Eval"
+)]
 #[tracing::instrument(skip(state, principal, headers, sub), fields(wyrd.run_id = %run_id))]
 async fn agent_turn(
     State(state): State<AppState>,
@@ -197,6 +264,28 @@ async fn agent_turn(
     Ok(StatusCode::ACCEPTED)
 }
 
+/// Submit the simulated user's half of one turn.
+#[utoipa::path(
+    post,
+    path = "/v1/eval/runs/{run_id}/user-turn",
+    params(("run_id" = String, Path, description = "Run the turn belongs to")),
+    request_body = UserTurnSubmission,
+    responses(
+        (status = 202, description = "The turn was accepted"),
+        (status = 401, description = "Authentication is required and the lease token must be \
+          presented (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_EVAL_401_MISSING_LEASE)",
+         body = WyrdProblem),
+        (status = 403, description = "The presented lease does not hold this run \
+          (WYRD_EVAL_403_INVALID_LEASE)", body = WyrdProblem),
+        (status = 404, description = "No such run for this tenant and principal \
+          (WYRD_EVAL_404_RUN_NOT_FOUND)", body = WyrdProblem),
+        (status = 409, description = "The submission does not match the turn the run is \
+          waiting on (WYRD_EVAL_409_SUBMISSION_MISMATCH)", body = WyrdProblem),
+        (status = 503, description = "The revocation store could not vouch for the token \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Eval"
+)]
 #[tracing::instrument(skip(state, principal, headers, sub), fields(wyrd.run_id = %run_id))]
 async fn user_turn(
     State(state): State<AppState>,

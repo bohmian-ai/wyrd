@@ -12,7 +12,7 @@ use wyrd_auth_check::{
 };
 use wyrd_runtime::{Permission, PermissionDenyReason, PermissionVerdict};
 use wyrd_spec::card::policy::PolicyDecision;
-use wyrd_spec::error::WyrdError;
+use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::request_id::RequestId;
 
 use crate::components::auth::token_extract::{
@@ -23,6 +23,33 @@ use crate::state::AppState;
 
 /// Check a delegated Service/Agent invoke request.
 #[tracing::instrument(skip(state, headers, body), fields(request_id = %request_id))]
+#[utoipa::path(
+    post,
+    path = "/v1/authz/check",
+    request_body(content = String, content_type = "application/json",
+      description = "`AuthzCheckRequest`: the action the delegated caller wants to perform"),
+    responses(
+        (status = 200, description = "`AuthzCheckResponse`: allowed, or denied for a missing \
+          permission", content_type = "application/json"),
+        (status = 400, description = "The token is not a compact JWT, the body is not a valid \
+          check request, a required check header is missing, or the action is unknown \
+          (WYRD_AUTH_400_BAD_TOKEN_FORMAT, WYRD_SPEC_400_VALIDATION, \
+          WYRD_VALIDATION_400_MISSING_REQUIRED_FIELD)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+        (status = 403, description = "The token is not a delegated invoke token, or policy \
+          refused the invocation (WYRD_AUTHZ_403_REQUIRES_DELEGATED_TOKEN, \
+          WYRD_AUTHZ_403_POLICY_DENIED)", body = WyrdProblem),
+        (status = 500, description = "The request context could not be assembled, or the \
+          decision could not be audited (WYRD_SPEC_500_INTERNAL, \
+          WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 503, description = "Authentication is unconfigured, or the revocation store \
+          could not vouch for the token \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+    ),
+    tag = "Authz"
+)]
 pub async fn check_authz(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,

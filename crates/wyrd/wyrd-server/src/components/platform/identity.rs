@@ -187,7 +187,9 @@ pub(super) async fn authorize_read(
           or a client secret that cannot be sealed (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
         (status = 403, description = "Platform identity administration required \
-          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem)
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 500, description = "A platform store read or write failed, or the platform \
+          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -290,7 +292,9 @@ async fn configure_connection(
         (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
         (status = 403, description = "Platform identity administration required \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
-        (status = 404, description = "No connection configured (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem)
+        (status = 404, description = "No connection configured (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem),
+        (status = 500, description = "A platform store read or write failed, or the platform \
+          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -346,7 +350,9 @@ async fn read_connection(
         (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
         (status = 403, description = "Platform identity administration required \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
-        (status = 404, description = "No connection configured (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem)
+        (status = 404, description = "No connection configured (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem),
+        (status = 500, description = "A platform store read or write failed, or the platform \
+          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -407,7 +413,9 @@ async fn remove_connection(
         (status = 403, description = "Platform identity administration required \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 409, description = "Name or matching claim already registered \
-          (WYRD_SPEC_409_CONFLICT)", body = WyrdProblem)
+          (WYRD_SPEC_409_CONFLICT)", body = WyrdProblem),
+        (status = 500, description = "A platform store read or write failed, or the platform \
+          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -505,7 +513,9 @@ async fn register_admin(
          body = PlatformPrincipalListResponse),
         (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
         (status = 403, description = "Platform identity administration required \
-          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem)
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 500, description = "A platform store read or write failed, or the platform \
+          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -568,7 +578,9 @@ async fn list_platform_admins(
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "Platform principal not found (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem),
         (status = 409, description = "Would leave the deployment with no active principal \
-          (WYRD_SPEC_409_CONFLICT)", body = WyrdProblem)
+          (WYRD_SPEC_409_CONFLICT)", body = WyrdProblem),
+        (status = 500, description = "A platform store read or write failed, or the platform \
+          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -672,8 +684,13 @@ fn login_service(state: &AppState) -> Result<PlatformLogin, WyrdErrorResponse> {
          body = LoginInitResponse),
         (status = 404, description = "Federated login is not configured (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem),
         (status = 503, description = "Identity provider unavailable \
-          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem),
+        (status = 500, description = "A platform store read or write failed \
+          (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
+    // No session exists yet at this operation, so it clears the document-wide
+    // requirement instead of inheriting it.
+    security(()),
     tag = "Platform"
 )]
 #[tracing::instrument(level = "info", skip(state, request))]
@@ -703,8 +720,13 @@ async fn begin_login(
         (status = 401, description = "Identity not accepted, indistinguishably for every cause \
           (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
         (status = 503, description = "Identity provider unavailable \
-          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem),
+        (status = 500, description = "A platform store read or write failed \
+          (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
+    // No session exists yet at this operation, so it clears the document-wide
+    // requirement instead of inheriting it.
+    security(()),
     tag = "Platform"
 )]
 #[tracing::instrument(level = "info", skip(state, request))]

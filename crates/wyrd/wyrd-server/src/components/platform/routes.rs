@@ -75,8 +75,13 @@ pub fn platform_auth_router() -> Router<AppState> {
     responses(
         (status = 200, description = "Short-lived platform session", body = PlatformTokenResponse),
         (status = 401, description = "Credential rejected, indistinguishably for every cause \
-          (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem)
+          (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
+        (status = 500, description = "A platform store read or write failed, or the platform \
+          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
+    // No session exists yet at this operation, so it clears the document-wide
+    // requirement instead of inheriting it.
+    security(()),
     tag = "Platform"
 )]
 #[tracing::instrument(level = "info", skip(state, request))]
@@ -137,7 +142,9 @@ async fn platform_token(
         (status = 403, description = "Tenant administrative recovery not granted \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No active tenant to recover, indistinguishably for every \
-          cause (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem)
+          cause (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem),
+        (status = 500, description = "A platform store read or write failed, or the platform \
+          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -186,7 +193,9 @@ fn not_configured() -> WyrdErrorResponse {
          body = CreateTenantResponse),
         (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
         (status = 403, description = "Tenant creation not granted (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
-        (status = 409, description = "Slug already in use by a live tenant (WYRD_SPEC_409_CONFLICT)", body = WyrdProblem)
+        (status = 409, description = "Slug already in use by a live tenant (WYRD_SPEC_409_CONFLICT)", body = WyrdProblem),
+        (status = 500, description = "A platform store read or write failed, or the platform \
+          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -256,7 +265,9 @@ fn provision_error(error: ProvisionError) -> WyrdErrorResponse {
         (status = 200, description = "Every live tenant, in every lifecycle state",
          body = TenantListResponse),
         (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
-        (status = 403, description = "Tenant reading not granted (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem)
+        (status = 403, description = "Tenant reading not granted (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 500, description = "A platform store read or write failed, or the platform \
+          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -286,7 +297,9 @@ async fn list_tenants(
         (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
         (status = 403, description = "Tenant reading not granted (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No such tenant, indistinguishably for every cause \
-          (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem)
+          (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem),
+        (status = 500, description = "A platform store read or write failed, or the platform \
+          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -320,7 +333,9 @@ async fn inspect_tenant(
         (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
         (status = 403, description = "Tenant suspension not granted (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "Tenant is not in the state this transition requires \
-          (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem)
+          (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem),
+        (status = 500, description = "A platform store read or write failed, or the platform \
+          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]

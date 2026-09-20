@@ -26,12 +26,27 @@ pub fn router() -> Router<AppState> {
     request_body = RegisterTableRequest,
     responses(
         (status = 200, description = "Table created or matched", body = RegisterTableResponse),
-        (status = 400, description = "Invalid table declaration", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = 401, description = "Authentication required", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = 403, description = "Bifrost table registration permission required", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = 409, description = "Schema fingerprint conflict", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = 503, description = "Catalog unavailable", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other catalog-backed refusal", body = WyrdProblem, content_type = "application/problem+json")
+        (status = 400, description = "The declaration is not a caller-owned dataset, or its \
+          fields are not a valid Bifrost schema (WYRD_SPEC_400_VALIDATION, \
+          WYRD_VALA_400_SCHEMA_PARSE, WYRD_VALA_400_BIFROST_RESERVED_COLUMN)",
+         body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 403, description = "The principal may not register Bifrost tables \
+          (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_VALA_403_BIFROST_RESERVED_BUILTIN_WRITE)",
+         body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 409, description = "An existing table of this name has a different schema \
+          or physical layout (WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH, \
+          WYRD_VALA_409_BIFROST_COMMIT_CONFLICT)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 503, description = "This server carries no catalog, the catalog or its \
+          object store is unreachable, or the revocation store could not vouch for the \
+          token (WYRD_VALA_503_SCRIBE_ROLE_UNAVAILABLE, \
+          WYRD_VALA_503_BIFROST_CATALOG_UNREACHABLE, WYRD_VALA_503_BIFROST_STORAGE_UNREACHABLE, \
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = "default", description = "Any other catalog-backed refusal, each carrying \
+          its own stable code from the Bifrost catalog (WYRD_VALA_500_BIFROST_INTERNAL, \
+          WYRD_VALA_500_BIFROST_METADATA_MISMATCH, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Bifrost"
 )]
@@ -58,10 +73,19 @@ pub(crate) async fn register(
     path = "/v1/bifrost/tables",
     responses(
         (status = 200, description = "Visible table entries", body = Vec<BifrostTableEntry>),
-        (status = 401, description = "Authentication required", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = 403, description = "Bifrost table read permission required", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = 503, description = "Catalog unavailable", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other catalog-backed refusal", body = WyrdProblem, content_type = "application/problem+json")
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 403, description = "The principal may not read the Bifrost catalog \
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 503, description = "This server carries no catalog, the catalog or its \
+          object store is unreachable, or the revocation store could not vouch for the \
+          token (WYRD_VALA_503_SCRIBE_ROLE_UNAVAILABLE, \
+          WYRD_VALA_503_BIFROST_CATALOG_UNREACHABLE, WYRD_VALA_503_BIFROST_STORAGE_UNREACHABLE, \
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = "default", description = "Any other catalog-backed refusal, each carrying \
+          its own stable code from the Bifrost catalog (WYRD_VALA_500_BIFROST_INTERNAL, \
+          WYRD_VALA_500_BIFROST_METADATA_MISMATCH, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Bifrost"
 )]
@@ -90,12 +114,23 @@ pub(crate) async fn list(
     ),
     responses(
         (status = 200, description = "Table description", body = BifrostTableDescription),
-        (status = 400, description = "Invalid table name", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = 401, description = "Authentication required", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = 403, description = "Bifrost table read permission required", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = 404, description = "No visible table", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = 503, description = "Catalog unavailable", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other catalog-backed refusal", body = WyrdProblem, content_type = "application/problem+json")
+        (status = 400, description = "The namespace is not one Bifrost serves \
+          (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 403, description = "The principal may not read the Bifrost catalog \
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 404, description = "No table of that name is visible to this tenant \
+          (WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = 503, description = "This server carries no catalog, the catalog or its \
+          object store is unreachable, or the revocation store could not vouch for the \
+          token (WYRD_VALA_503_SCRIBE_ROLE_UNAVAILABLE, \
+          WYRD_VALA_503_BIFROST_CATALOG_UNREACHABLE, WYRD_VALA_503_BIFROST_STORAGE_UNREACHABLE, \
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
+        (status = "default", description = "Any other catalog-backed refusal, each carrying \
+          its own stable code from the Bifrost catalog (WYRD_VALA_500_BIFROST_INTERNAL, \
+          WYRD_VALA_500_BIFROST_METADATA_MISMATCH, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Bifrost"
 )]

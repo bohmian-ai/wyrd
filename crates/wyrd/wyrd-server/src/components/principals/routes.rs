@@ -240,11 +240,16 @@ async fn mint_credential(
          body = CreateServicePrincipalResponse),
         (status = 400, description = "A requested role name is invalid or does not exist in \
           this tenant (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
-        (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
         (status = 403, description = "Tenant principal administration required \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
-        (status = 503, description = "The authorization decision could not be audited \
-          (WYRD_AUDIT_503_UNAVAILABLE)", body = WyrdProblem)
+        (status = 500, description = "A tenant store read or write failed, or the authorization \
+          decision could not be audited (WYRD_SPEC_500_INTERNAL, \
+          WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 503, description = "The revocation store could not vouch for the token (\
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Principals"
 )]
@@ -323,11 +328,18 @@ async fn create_service_principal(
     responses(
         (status = 200, description = "Credential issued, plaintext returned once",
          body = IssuedCredential),
-        (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
         (status = 403, description = "Tenant principal administration required \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
-        (status = 503, description = "The authorization decision could not be audited \
-          (WYRD_AUDIT_503_UNAVAILABLE)", body = WyrdProblem)
+        (status = 404, description = "No such principal in the caller's tenant \
+          (WYRD_AUTH_404_PRINCIPAL_NOT_FOUND)", body = WyrdProblem),
+        (status = 500, description = "A tenant store read or write failed, or the authorization \
+          decision could not be audited (WYRD_SPEC_500_INTERNAL, \
+          WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 503, description = "The revocation store could not vouch for the token (\
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Principals"
 )]
@@ -362,11 +374,18 @@ async fn issue_credential(
     responses(
         (status = 200, description = "Non-secret credential metadata, newest first",
          body = CredentialListResponse),
-        (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
         (status = 403, description = "Tenant principal administration required \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
-        (status = 503, description = "The authorization decision could not be audited \
-          (WYRD_AUDIT_503_UNAVAILABLE)", body = WyrdProblem)
+        (status = 404, description = "No such principal in the caller's tenant \
+          (WYRD_AUTH_404_PRINCIPAL_NOT_FOUND)", body = WyrdProblem),
+        (status = 500, description = "A tenant store read or write failed, or the authorization \
+          decision could not be audited (WYRD_SPEC_500_INTERNAL, \
+          WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 503, description = "The revocation store could not vouch for the token (\
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Principals"
 )]
@@ -448,12 +467,19 @@ pub(crate) async fn list_credentials_for(
     ),
     responses(
         (status = 204, description = "Credential retired"),
-        (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
         (status = 403, description = "Tenant principal administration required \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
-        (status = 404, description = "No live credential for this principal (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem),
-        (status = 503, description = "The authorization decision could not be audited \
-          (WYRD_AUDIT_503_UNAVAILABLE)", body = WyrdProblem)
+        (status = 404, description = "No such principal in the caller's tenant, or it holds \
+          no live credential of that id (WYRD_AUTH_404_PRINCIPAL_NOT_FOUND, \
+          WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem),
+        (status = 500, description = "A tenant store read or write failed, or the authorization \
+          decision could not be audited (WYRD_SPEC_500_INTERNAL, \
+          WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
+        (status = 503, description = "The revocation store could not vouch for the token (\
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Principals"
 )]

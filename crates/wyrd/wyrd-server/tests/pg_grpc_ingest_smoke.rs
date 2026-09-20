@@ -540,7 +540,10 @@ async fn ingest_valid_token_is_not_rejected_as_unauthenticated() {
         .await
         .expect("test server starts");
     let state = server.state();
-    let tenant = DataTenantId::new_v7();
+    // The fixture's own tenant, not an invented id: admission is resolved on
+    // every request, so a token minted for a tenant that was never provisioned
+    // is refused before anything about the token itself is considered.
+    let tenant = server.data_tenant_id();
     let jwt = mint_user_jwt(state, tenant, &[]);
 
     let (_, health_service) = health_reporter();

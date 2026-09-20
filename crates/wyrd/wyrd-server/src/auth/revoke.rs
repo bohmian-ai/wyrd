@@ -19,9 +19,12 @@ use wyrd_sql::TenantConn;
 /// Revoke one principal's outstanding tokens under the caller's tenant.
 ///
 /// Revocation is an administrative authorization boundary: the
-/// `service_accounts:write` verdict is audited for both outcomes. The allowed
-/// row commits on its own before the `tokens_not_before` bump, so the decision
-/// stays durable even when the revocation fails.
+/// `service_accounts:write` verdict is audited for both outcomes. A refusal is
+/// durable on its own, because a denied attempt is evidence whether or not
+/// anything followed it. An allowance is appended to the same transaction as
+/// the `tokens_not_before` bump and commits with it, so the record and the
+/// effect cannot disagree: there is no committed allowance for a revocation
+/// that did not happen.
 ///
 /// The request body is the contract, not decoration. Its `principal_kind`
 /// selects the table the id is resolved in, and its `reason` is folded into
@@ -45,11 +48,15 @@ use wyrd_sql::TenantConn;
     request_body = RevokePrincipalRequest,
     responses(
         (status = 200, description = "Outstanding tokens revoked, effective on the next request"),
-        (status = 400, description = "Missing, oversized, or secret-like revocation reason", body = WyrdProblem),
-        (status = 401, description = "Authentication required", body = WyrdProblem),
-        (status = 403, description = "Tenant principal administration required", body = WyrdProblem),
-        (status = 404, description = "No such principal of that kind in the caller's tenant", body = WyrdProblem),
-        (status = 503, description = "Revocation decision could not be audited", body = WyrdProblem)
+        (status = 400, description = "Missing, oversized, or secret-like revocation reason \
+          (WYRD_VALIDATION_400_MISSING_REQUIRED_FIELD)", body = WyrdProblem),
+        (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
+        (status = 403, description = "Tenant principal administration required \
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 404, description = "No such principal of that kind in the caller's tenant \
+          (WYRD_AUTH_404_PRINCIPAL_NOT_FOUND)", body = WyrdProblem),
+        (status = 503, description = "Revocation decision could not be audited \
+          (WYRD_AUDIT_503_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Principals"
 )]

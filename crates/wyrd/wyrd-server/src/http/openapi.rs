@@ -234,6 +234,7 @@ mod tests {
 
     use super::WyrdApiDoc;
     use utoipa::OpenApi;
+    use wyrd_spec::error::WyrdError;
 
     #[test]
     fn registration_route_is_published() {
@@ -311,20 +312,47 @@ mod tests {
             .collect()
     }
 
+    /// Tags whose operations a tenant or platform operator drives directly.
+    ///
+    /// These are the surfaces whose refusals an operator or a generated admin
+    /// client has to branch on, so their documented codes are the ones worth
+    /// holding to the catalog.
+    const ADMINISTRATIVE_TAGS: [&str; 4] = ["Auth", "Admin", "Platform", "Principals"];
+
+    /// Pull every `WYRD_…` stable code named in a response description.
+    ///
+    /// Descriptions are prose with codes in parentheses rather than a
+    /// structured field, so the codes are recovered by scanning for the one
+    /// prefix the catalog uses and taking the identifier that follows.
+    fn stable_codes(description: &str) -> Vec<String> {
+        description
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|token| token.starts_with("WYRD_"))
+            .map(str::to_owned)
+            .collect()
+    }
+
     /// Every documented problem body is served as `application/problem+json`,
-    /// and every Auth or Admin problem names a stable code matching its status.
+    /// and every administrative problem names real catalog codes for its status.
     ///
     /// A generated client branches on the media type and on the code; declaring
     /// a problem as plain `application/json`, or naming a code that disagrees
     /// with the status it is documented under, breaks that branch silently. The
     /// media-type half holds document-wide because the modifier applies it
-    /// there; the stable-code half covers the two tags whose descriptions name
-    /// codes today, and extends by tagging more of them.
+    /// there.
+    ///
+    /// The code half used to accept any description containing `_404_`, which
+    /// passes for a code that no longer exists and for a typo in its tail. Each
+    /// named code is now reconstructed through [`WyrdError::from_code`] — the
+    /// same lookup every client and boundary uses — and its own declared status
+    /// must equal the response it is documented under. It covers the four
+    /// administrative tags a tenant or platform operator drives.
     ///
     /// # Panics
     ///
-    /// Panics when a problem response uses the wrong media type or names no
-    /// code for its status.
+    /// Panics when a problem response uses the wrong media type, names no code,
+    /// or names one that is absent from the catalog or belongs to another
+    /// status.
     #[test]
     fn every_problem_response_declares_its_media_type_and_stable_code() {
         let document = serde_json::to_value(WyrdApiDoc::openapi()).expect("OpenAPI is JSON");
@@ -352,15 +380,36 @@ mod tests {
                     }
                     problems += 1;
                     let tags = operation["tags"].to_string();
-                    if !(tags.contains("\"Auth\"") || tags.contains("\"Admin\"")) {
+                    if !ADMINISTRATIVE_TAGS
+                        .iter()
+                        .any(|tag| tags.contains(&format!("\"{tag}\"")))
+                    {
                         continue;
                     }
                     let description = response["description"].as_str().unwrap_or_default();
+                    let codes = stable_codes(description);
                     assert!(
-                        description.contains(&format!("_{status}_")),
-                        "{method} {path} {status} names no stable code for its status: \
-                         {description}"
+                        !codes.is_empty(),
+                        "{method} {path} {status} names no stable code: {description}"
                     );
+                    let expected: u16 = status.parse().expect("a response key is a status code");
+                    for code in codes {
+                        let error = WyrdError::from_code(
+                            &code,
+                            "documented refusal".to_owned(),
+                            serde_json::json!({}),
+                        )
+                        .unwrap_or_else(|| {
+                            panic!("{method} {path} {status} names {code}, absent from the catalog")
+                        });
+                        assert_eq!(
+                            error.status(),
+                            expected,
+                            "{method} {path} documents {code} under {status}, but the catalog \
+                             gives it {}",
+                            error.status()
+                        );
+                    }
                 }
             }
         }

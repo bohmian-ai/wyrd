@@ -10,7 +10,7 @@ Agent-facing APIs include:
 
 - MCP tools
 - JSON schemas
-- OpenAPI output
+- The runtime OpenAPI document at `GET /openapi.json`
 - CLI commands with machine-readable output
 - Structured errors (Wyrd error catalog)
 - Docs generated from source contracts
@@ -68,14 +68,19 @@ contract.
 Generated artifacts are part of the harness. Keep generation commands
 stable and fail on drift:
 
-- `mise run codegen:check` — fail on drift for OpenAPI, JSON schemas, and
-  public Python stubs
+- `mise run codegen:check` — fail on drift for JSON schemas, language
+  declarations, and public Python stubs
 - `mise run codegen:regen` — regenerate every artifact owned by the
   code-generation lane from source
 - `mise run codegen:stubs` — regenerate Python stubs
-- `mise run codegen:openapi` — emit `openapi.yaml` from `WyrdApiDoc`
 
-If a schema, stub, or OpenAPI artifact is wrong, fix the source or generator
+The OpenAPI document is not a generated artifact: `utoipa` builds it from the
+server's handlers and the server serves it at `GET /openapi.json`, so OpenAPI
+changes are proved by the focused `wyrd-server` contract tests
+(`cargo test -p wyrd-server --lib http::openapi`) rather than by a drift
+snapshot.
+
+If a schema, stub, or declaration is wrong, fix the source or generator
 instead of editing the artifact. Runtime MCP catalogs are verified by their
 owning MCP contract and behavior tests; do not infer MCP coverage from the
 code-generation lane.

@@ -1230,14 +1230,12 @@ cargo hakari verify
 """
 
 [tasks."codegen:regen"]
-description = "Regenerate OpenAPI / JSON schemas / MCP tool list / pyi stubs from source"
+description = "Regenerate JSON schemas / MCP tool list / pyi stubs from source"
 run = """
 cargo run --locked -p wyrd-spec --example gen_schemas --features server
 cargo run --locked -p wyrd-client --example gen_schemas
 cargo run --locked -p vala-core --example gen_schemas
-mise run codegen:openapi
 mise run codegen:stubs
-test -f openapi.yaml || { echo 'openapi.yaml missing'; exit 1; }
 """
 
 [tasks."codegen:stubs"]
@@ -1250,11 +1248,10 @@ uv run ruff check --fix --select I python/wyrd
 """
 
 [tasks."codegen:check"]
-description = "Fail if generated openapi/schemas/MCP/pyi drift from source"
+description = "Fail if generated schemas/MCP/pyi drift from source"
 run = """
 snapshot_codegen() {
   {
-    test -f openapi.yaml && printf '%s\n' openapi.yaml
     find crates/wyrd-spec/schemas crates/wyrd-spec/tests/schemas -type f -name '*.json'
     find crates/shared/wyrd-client/schemas crates/shared/wyrd-client/tests/schemas -type f -name '*.json'
     find crates/vala/vala-core/schemas crates/vala/vala-core/tests/schemas -type f -name '*.json'
@@ -1275,23 +1272,17 @@ diff -u "$BEFORE" "$AFTER" \
   || { echo 'codegen drift detected - run mise run codegen:regen and commit'; exit 1; }
 """
 
-# --- Stage-5 OpenAPI + napi TypeScript pipeline -----------------------------------
-# Task shells defined ahead of implementation, mirroring `test:bifrost:journey`. They
-# are INERT until their owning slice lands the code: `codegen:openapi` needs the
-# `wyrd-server` `gen_openapi` example (slice 06c); every `ts:*` task needs the napi
-# bindings + package roots (slice 13a). Two separate pnpm packages under `sdks/wyrd-sdk-ts/`
-# glued by `sdks/wyrd-sdk-ts/pnpm-workspace.yaml`: public `@wyrd/sdk` (`sdks/wyrd-sdk-ts/wyrd`,
-# built from `sdks/wyrd-sdk-ts/native`) and private `@wyrd/testing`
-# (`sdks/wyrd-sdk-ts/testing`, built from `sdks/wyrd-sdk-ts/native-testing`, test-tier).
-# One napi addon per package so the harness never overwrites the SDK's generated
-# loader/`.d.ts`. 06c wires `codegen:openapi` into `codegen:regen`; 13a adds
+# --- napi TypeScript pipeline -----------------------------------------------------
+# The OpenAPI contract is served at runtime from `GET /openapi.json` and is proved by
+# the focused `wyrd-server` contract tests, so nothing here emits or checks it.
+# Every `ts:*` task needs the napi bindings + package roots (slice 13a). Two separate
+# pnpm packages under `sdks/wyrd-sdk-ts/` glued by `sdks/wyrd-sdk-ts/pnpm-workspace.yaml`:
+# public `@wyrd/sdk` (`sdks/wyrd-sdk-ts/wyrd`, built from `sdks/wyrd-sdk-ts/native`) and
+# private `@wyrd/testing` (`sdks/wyrd-sdk-ts/testing`, built from
+# `sdks/wyrd-sdk-ts/native-testing`, test-tier). One napi addon per package so the
+# harness never overwrites the SDK's generated loader/`.d.ts`. 13a adds
 # `ts:napi:check`/`ts:typecheck`/`ts:test:unit` to `gate`; `ts:test:integration`
 # runs in the closeout journey lane.
-[tasks."codegen:openapi"]
-description = "Emit openapi.yaml from wyrd-server WyrdApiDoc (slice 06c; wired into codegen:regen). Requires utoipa 'yaml' feature on wyrd-server."
-# Emit to a temp file and move on success so a build/emit failure cannot truncate the
-# committed openapi.yaml to empty.
-run = "cargo run --locked -p wyrd-server --example gen_openapi > openapi.yaml.tmp && mv openapi.yaml.tmp openapi.yaml"
 
 [tasks."ts:install"]
 hide = true

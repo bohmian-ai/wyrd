@@ -74,7 +74,8 @@ pub fn platform_auth_router() -> Router<AppState> {
     request_body = PlatformTokenRequest,
     responses(
         (status = 200, description = "Short-lived platform session", body = PlatformTokenResponse),
-        (status = 401, description = "Credential rejected, indistinguishably for every cause", body = WyrdProblem)
+        (status = 401, description = "Credential rejected, indistinguishably for every cause \
+          (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -123,9 +124,11 @@ async fn platform_token(
     responses(
         (status = 200, description = "Replacement credential for the tenant's existing administrator",
          body = ProvisionedTenantAdmin),
-        (status = 401, description = "Platform session required", body = WyrdProblem),
-        (status = 403, description = "Tenant administrative recovery not granted", body = WyrdProblem),
-        (status = 404, description = "No active tenant to recover, indistinguishably for every cause", body = WyrdProblem)
+        (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
+        (status = 403, description = "Tenant administrative recovery not granted \
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 404, description = "No active tenant to recover, indistinguishably for every \
+          cause (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -167,9 +170,9 @@ fn not_configured() -> WyrdErrorResponse {
     responses(
         (status = 200, description = "Provisioned tenant and its one-time administrative credential",
          body = CreateTenantResponse),
-        (status = 401, description = "Platform session required", body = WyrdProblem),
-        (status = 403, description = "Tenant creation not granted", body = WyrdProblem),
-        (status = 409, description = "Slug already in use by a live tenant", body = WyrdProblem)
+        (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
+        (status = 403, description = "Tenant creation not granted (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 409, description = "Slug already in use by a live tenant (WYRD_SPEC_409_CONFLICT)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -227,8 +230,8 @@ fn provision_error(error: ProvisionError) -> WyrdErrorResponse {
     responses(
         (status = 200, description = "Every live tenant, in every lifecycle state",
          body = TenantListResponse),
-        (status = 401, description = "Platform session required", body = WyrdProblem),
-        (status = 403, description = "Tenant reading not granted", body = WyrdProblem)
+        (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
+        (status = 403, description = "Tenant reading not granted (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -255,10 +258,10 @@ async fn list_tenants(
     params(("tenant_id" = String, Path, description = "Tenant to inspect")),
     responses(
         (status = 200, description = "The tenant's directory row", body = ProvisionedTenant),
-        (status = 401, description = "Platform session required", body = WyrdProblem),
-        (status = 403, description = "Tenant reading not granted", body = WyrdProblem),
-        (status = 404, description = "No such tenant, indistinguishably for every cause",
-         body = WyrdProblem)
+        (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
+        (status = 403, description = "Tenant reading not granted (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 404, description = "No such tenant, indistinguishably for every cause \
+          (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -288,11 +291,11 @@ async fn inspect_tenant(
     request_body = SetTenantStatusRequest,
     responses(
         (status = 200, description = "The tenant now holds the requested status"),
-        (status = 400, description = "Status is neither active nor suspended", body = WyrdProblem),
-        (status = 401, description = "Platform session required", body = WyrdProblem),
-        (status = 403, description = "Tenant suspension not granted", body = WyrdProblem),
-        (status = 404, description = "Tenant is not in the state this transition requires",
-         body = WyrdProblem)
+        (status = 400, description = "Status is neither active nor suspended (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
+        (status = 403, description = "Tenant suspension not granted (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 404, description = "Tenant is not in the state this transition requires \
+          (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]

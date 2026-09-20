@@ -153,8 +153,16 @@ mise run ts:napi:check        # napi-generated index.d.ts committed
 ### Contract, schema, OpenAPI, or stub changes
 
 ```bash
-mise run codegen:check   # fail if OpenAPI / JSON schema / public pyi drift
+mise run codegen:check   # fail if JSON schema / public pyi / .d.ts drift
 mise run codegen:regen   # regenerate everything from source
+```
+
+The OpenAPI document is served at runtime from `GET /openapi.json` and is not
+part of that snapshot; prove an OpenAPI change with the focused server contract
+tests instead:
+
+```bash
+mise exec -- cargo test --locked -p wyrd-server --lib http::openapi
 ```
 
 Runtime MCP catalogs are verified through their owning MCP tests, not through

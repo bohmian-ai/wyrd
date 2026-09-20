@@ -170,9 +170,11 @@ pub(super) async fn authorize_read(
     responses(
         (status = 200, description = "Connection installed; the JWKS endpoint comes from discovery",
          body = PlatformOidcConnectionView),
-        (status = 401, description = "Platform session required", body = WyrdProblem),
-        (status = 403, description = "Platform identity administration required", body = WyrdProblem),
-        (status = 422, description = "Issuer invalid, unreachable, or resolving to a blocked address", body = WyrdProblem)
+        (status = 400, description = "Issuer invalid, unreachable, resolving to a blocked address, \
+          or a client secret that cannot be sealed (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
+        (status = 403, description = "Platform identity administration required \
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -266,8 +268,10 @@ async fn configure_connection(
     responses(
         (status = 200, description = "The configured connection, never its provider secret",
          body = PlatformOidcConnectionView),
-        (status = 401, description = "Platform session required", body = WyrdProblem),
-        (status = 404, description = "No connection configured", body = WyrdProblem)
+        (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
+        (status = 403, description = "Platform identity administration required \
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 404, description = "No connection configured (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -314,8 +318,10 @@ async fn read_connection(
     path = "/platform/oidc/connection",
     responses(
         (status = 204, description = "Connection removed; the global credential still administers"),
-        (status = 401, description = "Platform session required", body = WyrdProblem),
-        (status = 404, description = "No connection configured", body = WyrdProblem)
+        (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
+        (status = 403, description = "Platform identity administration required \
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 404, description = "No connection configured (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -364,9 +370,13 @@ async fn remove_connection(
     responses(
         (status = 200, description = "Administrator registered, awaiting first login",
          body = RegisterPlatformAdminResponse),
-        (status = 401, description = "Platform session required", body = WyrdProblem),
-        (status = 409, description = "Name or matching claim already registered", body = WyrdProblem),
-        (status = 422, description = "No platform OIDC connection is configured", body = WyrdProblem)
+        (status = 400, description = "No platform OIDC connection is configured, so the \
+          administrator could never sign in (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
+        (status = 403, description = "Platform identity administration required \
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 409, description = "Name or matching claim already registered \
+          (WYRD_SPEC_409_CONFLICT)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -453,7 +463,9 @@ async fn register_admin(
     responses(
         (status = 200, description = "Every platform principal, including suspended ones",
          body = PlatformPrincipalListResponse),
-        (status = 401, description = "Platform session required", body = WyrdProblem)
+        (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
+        (status = 403, description = "Platform identity administration required \
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -504,9 +516,13 @@ async fn list_platform_admins(
     request_body = SetPlatformPrincipalStatusRequest,
     responses(
         (status = 204, description = "Status changed"),
-        (status = 401, description = "Platform session required", body = WyrdProblem),
-        (status = 404, description = "Platform principal not found", body = WyrdProblem),
-        (status = 409, description = "Would leave the deployment with no active principal", body = WyrdProblem)
+        (status = 400, description = "Status is neither active nor suspended (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
+        (status = 403, description = "Platform identity administration required \
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 404, description = "Platform principal not found (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem),
+        (status = 409, description = "Would leave the deployment with no active principal \
+          (WYRD_SPEC_409_CONFLICT)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -602,8 +618,9 @@ fn login_service(state: &AppState) -> Result<PlatformLogin, WyrdErrorResponse> {
     responses(
         (status = 200, description = "Provider authorization URL and opaque state",
          body = LoginInitResponse),
-        (status = 404, description = "Federated login is not configured", body = WyrdProblem),
-        (status = 503, description = "Identity provider unavailable", body = WyrdProblem)
+        (status = 404, description = "Federated login is not configured (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem),
+        (status = 503, description = "Identity provider unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -631,8 +648,10 @@ async fn begin_login(
     responses(
         (status = 200, description = "Platform session for the resolved administrator",
          body = PlatformTokenResponse),
-        (status = 401, description = "Identity not accepted, indistinguishably for every cause", body = WyrdProblem),
-        (status = 503, description = "Identity provider unavailable", body = WyrdProblem)
+        (status = 401, description = "Identity not accepted, indistinguishably for every cause \
+          (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
+        (status = 503, description = "Identity provider unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]

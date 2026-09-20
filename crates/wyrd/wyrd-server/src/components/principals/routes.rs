@@ -238,9 +238,13 @@ async fn mint_credential(
     responses(
         (status = 200, description = "Principal created with its first credential, returned once",
          body = CreateServicePrincipalResponse),
-        (status = 401, description = "Authentication required", body = WyrdProblem),
-        (status = 403, description = "Tenant principal administration required", body = WyrdProblem),
-        (status = 422, description = "A requested role does not exist in this tenant", body = WyrdProblem)
+        (status = 400, description = "A requested role name is invalid or does not exist in \
+          this tenant (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
+        (status = 403, description = "Tenant principal administration required \
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 503, description = "The authorization decision could not be audited \
+          (WYRD_AUDIT_503_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Principals"
 )]
@@ -319,8 +323,11 @@ async fn create_service_principal(
     responses(
         (status = 200, description = "Credential issued, plaintext returned once",
          body = IssuedCredential),
-        (status = 401, description = "Authentication required", body = WyrdProblem),
-        (status = 403, description = "Tenant principal administration required", body = WyrdProblem)
+        (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
+        (status = 403, description = "Tenant principal administration required \
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 503, description = "The authorization decision could not be audited \
+          (WYRD_AUDIT_503_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Principals"
 )]
@@ -355,8 +362,11 @@ async fn issue_credential(
     responses(
         (status = 200, description = "Non-secret credential metadata, newest first",
          body = CredentialListResponse),
-        (status = 401, description = "Authentication required", body = WyrdProblem),
-        (status = 403, description = "Tenant principal administration required", body = WyrdProblem)
+        (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
+        (status = 403, description = "Tenant principal administration required \
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 503, description = "The authorization decision could not be audited \
+          (WYRD_AUDIT_503_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Principals"
 )]
@@ -438,9 +448,12 @@ pub(crate) async fn list_credentials_for(
     ),
     responses(
         (status = 204, description = "Credential retired"),
-        (status = 401, description = "Authentication required", body = WyrdProblem),
-        (status = 403, description = "Tenant principal administration required", body = WyrdProblem),
-        (status = 404, description = "No live credential for this principal", body = WyrdProblem)
+        (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
+        (status = 403, description = "Tenant principal administration required \
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 404, description = "No live credential for this principal (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem),
+        (status = 503, description = "The authorization decision could not be audited \
+          (WYRD_AUDIT_503_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Principals"
 )]

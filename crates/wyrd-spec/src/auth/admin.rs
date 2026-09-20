@@ -9,7 +9,6 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use crate::auth::IssuerUrl;
 use crate::reference::CardRef;
@@ -112,12 +111,12 @@ pub struct TrustedIssuerView {
     pub principal_kind: String,
     /// JWKS key-cache TTL in seconds.
     pub jwks_ttl_secs: i64,
-    /// Claim-to-principal mapping, as stored JSON.
-    pub claim_mapping: Value,
-    /// Group-to-roles mapping, as stored JSON.
-    pub group_role_map: Value,
-    /// Default roles, as stored JSON.
-    pub default_roles: Value,
+    /// Claim-to-principal mapping.
+    pub claim_mapping: ClaimMappingPayload,
+    /// Mapping from issuer group to Wyrd roles.
+    pub group_role_map: HashMap<String, Vec<String>>,
+    /// Roles granted to every principal from this issuer.
+    pub default_roles: Vec<String>,
 }
 
 /// `POST /v1/admin/workload-bindings` body.
@@ -137,7 +136,7 @@ pub struct CreateWorkloadBindingRequest {
 }
 
 /// Workload-binding projection.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct WorkloadBindingView {
@@ -147,6 +146,6 @@ pub struct WorkloadBindingView {
     pub subject: String,
     /// Optional audience constraint.
     pub audience: Option<String>,
-    /// Card the bound workload acts as, as stored JSON.
-    pub card_ref: Value,
+    /// Card the bound workload acts as.
+    pub card_ref: CardRef,
 }

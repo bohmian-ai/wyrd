@@ -1,6 +1,6 @@
 ---
 title: OpenAPI
-description: Generated summary of the Wyrd OpenAPI contract.
+description: Where the live Wyrd OpenAPI contract is served and how to consume it.
 pillar: wyrd
 group: Reference
 order: 22
@@ -8,46 +8,21 @@ order: 22
 
 # OpenAPI
 
-The repository OpenAPI document is `openapi.yaml`. Its current title is `Wyrd API` and its version is `0.0.1`.
+Wyrd serves one OpenAPI 3.1 document, and it is generated at runtime from the
+server's own route handlers rather than checked into the repository. A running
+server publishes it unauthenticated at `GET /openapi.json`, so the contract you
+read is always the contract that deployment serves.
 
-## Routes
+## Consume it
 
-- `/auth/callback`
-- `/auth/issue-key`
-- `/auth/login`
-- `/auth/platform/callback`
-- `/auth/platform/login`
-- `/auth/platform/token`
-- `/auth/token`
-- `/platform/admins`
-- `/platform/admins/{principal_id}/credentials`
-- `/platform/admins/{principal_id}/credentials/{credential_id}`
-- `/platform/admins/{principal_id}/status`
-- `/platform/oidc/connection`
-- `/platform/tenants`
-- `/platform/tenants/admin/credentials`
-- `/platform/tenants/{tenant_id}`
-- `/platform/tenants/{tenant_id}/status`
-- `/v1/admin/trusted-issuers`
-- `/v1/admin/workload-bindings`
-- `/v1/bifrost/tables`
-- `/v1/bifrost/tables/{namespace}/{name}`
-- `/v1/cards`
-- `/v1/cards/by-ref`
-- `/v1/cards/by-uid/{kind}/{card_uid}`
-- `/v1/cards/download/init`
-- `/v1/cards/{card_uid}/artifacts`
-- `/v1/cards/{card_uid}/complete`
-- `/v1/cards/{kind}/{space}/{name}/latest`
-- `/v1/cards/{kind}/{space}/{name}/versions`
-- `/v1/principals`
-- `/v1/principals/{principal_id}/credentials`
-- `/v1/principals/{principal_id}/credentials/{credential_id}`
-- `/v1/principals/{principal_id}/revoke`
-- `/v1/query`
-- `/v1/query/running`
-- `/v1/query/{request_id}`
+```bash
+curl -s http://localhost:8080/openapi.json > openapi.json
+```
 
-## Refresh
+Any Swagger- or OpenAPI-compatible tool takes that URL or file directly:
+point Swagger UI, Redoc, or an `openapi-generator` client at it, or load it
+into Postman or Bruno to explore the API interactively.
 
-Run `mise run codegen:check` to verify generated API metadata and `mise run docs:generate` to refresh this page.
+Every operation declares its authentication, typed request and response
+bodies, `application/problem+json` error media type, and the stable Wyrd
+error codes it can return.

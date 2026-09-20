@@ -18,44 +18,23 @@ def md_escape(value: str) -> str:
 
 DOCS_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = DOCS_ROOT.parent
-OPENAPI_PATH = REPO_ROOT / "openapi.yaml"
 SCHEMA_DIR = REPO_ROOT / "crates" / "wyrd-spec" / "schemas"
 OUT_DIR = DOCS_ROOT / "src" / "content" / "docs" / "api"
 
 
-def yaml_value(key: str, text: str) -> str | None:
-    match = re.search(rf"^\s*{re.escape(key)}:\s*(.+?)\s*$", text, re.MULTILINE)
-    if not match:
-        return None
-    return match.group(1).strip().strip('"')
-
-
-def route_lines(text: str) -> list[str]:
-    lines = text.splitlines()
-    in_paths = False
-    routes: list[str] = []
-    for line in lines:
-        if line.startswith("paths:"):
-            in_paths = True
-            continue
-        if in_paths and line and not line.startswith(" "):
-            break
-        match = re.match(r"^\s{2}(/[^:]+):\s*$", line)
-        if match:
-            routes.append(match.group(1))
-    return routes
-
-
 def render_openapi() -> str:
-    text = OPENAPI_PATH.read_text(encoding="utf-8") if OPENAPI_PATH.exists() else ""
-    title = yaml_value("title", text) or "Wyrd API"
-    version = yaml_value("version", text) or "unversioned"
-    routes = route_lines(text)
+    """Describe the one live OpenAPI contract and how tooling consumes it.
 
+    There is no repository OpenAPI file to summarize: the document is built by
+    `utoipa` from the server's own handlers and served at runtime, so anything
+    checked in here would be a second contract that can disagree with the first.
+    This page therefore explains where the real one lives rather than restating
+    a stale copy of it.
+    """
     lines = [
         "---",
         "title: OpenAPI",
-        "description: Generated summary of the Wyrd OpenAPI contract.",
+        "description: Where the live Wyrd OpenAPI contract is served and how to consume it.",
         "pillar: wyrd",
         "group: Reference",
         "order: 22",
@@ -63,25 +42,26 @@ def render_openapi() -> str:
         "",
         "# OpenAPI",
         "",
-        f"The repository OpenAPI document is `{md_escape(str(OPENAPI_PATH.relative_to(REPO_ROOT)))}`. Its current title is `{md_escape(title)}` and its version is `{md_escape(version)}`.",
+        "Wyrd serves one OpenAPI 3.1 document, and it is generated at runtime from the",
+        "server's own route handlers rather than checked into the repository. A running",
+        "server publishes it unauthenticated at `GET /openapi.json`, so the contract you",
+        "read is always the contract that deployment serves.",
         "",
-        "## Routes",
+        "## Consume it",
+        "",
+        "```bash",
+        "curl -s http://localhost:8080/openapi.json > openapi.json",
+        "```",
+        "",
+        "Any Swagger- or OpenAPI-compatible tool takes that URL or file directly:",
+        "point Swagger UI, Redoc, or an `openapi-generator` client at it, or load it",
+        "into Postman or Bruno to explore the API interactively.",
+        "",
+        "Every operation declares its authentication, typed request and response",
+        "bodies, `application/problem+json` error media type, and the stable Wyrd",
+        "error codes it can return.",
         "",
     ]
-    if routes:
-        lines.extend(f"- `{md_escape(route)}`" for route in routes)
-    else:
-        lines.append("No HTTP routes are published in the current OpenAPI document.")
-
-    lines.extend(
-        [
-            "",
-            "## Refresh",
-            "",
-            "Run `mise run codegen:check` to verify generated API metadata and `mise run docs:generate` to refresh this page.",
-            "",
-        ]
-    )
     return "\n".join(lines)
 
 

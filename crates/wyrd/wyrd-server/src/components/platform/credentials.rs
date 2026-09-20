@@ -71,8 +71,9 @@ pub fn platform_credentials_router() -> Router<AppState> {
     responses(
         (status = 200, description = "Credential issued, plaintext returned once",
          body = IssuedCredential),
-        (status = 401, description = "Platform session required", body = WyrdProblem),
-        (status = 403, description = "Platform credential administration required", body = WyrdProblem)
+        (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
+        (status = 403, description = "Platform credential administration required \
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -118,8 +119,9 @@ async fn issue_credential(
     responses(
         (status = 200, description = "Non-secret credential metadata, newest first",
          body = CredentialListResponse),
-        (status = 401, description = "Platform session required", body = WyrdProblem),
-        (status = 403, description = "Platform credential administration required", body = WyrdProblem)
+        (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
+        (status = 403, description = "Platform credential administration required \
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -172,9 +174,11 @@ async fn list_credentials(
     ),
     responses(
         (status = 204, description = "Credential retired"),
-        (status = 401, description = "Platform session required", body = WyrdProblem),
-        (status = 403, description = "Platform credential administration required", body = WyrdProblem),
-        (status = 404, description = "No live credential for this platform principal", body = WyrdProblem)
+        (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
+        (status = 403, description = "Platform credential administration required \
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 404, description = "No live credential for this platform principal \
+          (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]

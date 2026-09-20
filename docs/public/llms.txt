@@ -76,7 +76,7 @@
 
 - [API reference](https://mitari-ai.github.io/wyrd/api/): Error catalog, OpenAPI summary, and JSON Schema inventory — all generated from source.
 - [Errors](https://mitari-ai.github.io/wyrd/api/errors/): Error handling guidance for Wyrd API clients and agents.
-- [OpenAPI](https://mitari-ai.github.io/wyrd/api/openapi/): Generated summary of the Wyrd OpenAPI contract.
+- [OpenAPI](https://mitari-ai.github.io/wyrd/api/openapi/): Where the live Wyrd OpenAPI contract is served and how to consume it.
 - [Schemas](https://mitari-ai.github.io/wyrd/api/schemas/): Generated inventory of Wyrd JSON Schemas.
 
 ## Reference

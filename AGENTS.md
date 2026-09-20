@@ -450,9 +450,12 @@ not use a positional filter that can pass after selecting no test.
   repository-managed setup wrapper when the test needs it.
 - Python package change: run `mise run py:test:unit`; add
   `mise run py:typecheck` when stubs, exports, or public Python typing changed.
-- Contract, schema, OpenAPI, or stub generation change: run
-  `mise run codegen:check`. MCP behavior changes also run the owning MCP tests;
-  the codegen lane does not independently prove the runtime MCP tool catalog.
+- Contract, schema, or stub generation change: run `mise run codegen:check`.
+  MCP behavior changes also run the owning MCP tests; the codegen lane does not
+  independently prove the runtime MCP tool catalog. The OpenAPI document is
+  served at runtime from `GET /openapi.json` and is not a checked-in artifact:
+  prove an OpenAPI change with the focused `wyrd-server` contract tests
+  (`cargo test --locked -p wyrd-server --lib http::openapi`).
 - Boundary-sensitive change: run the matching boundary check, such as
   `mise run check:client-tier`, `mise run check:pyo3-scope`, or
   `mise run check:unwrap-audit`.

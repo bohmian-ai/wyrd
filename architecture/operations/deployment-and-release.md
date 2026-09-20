@@ -181,7 +181,7 @@ An unknown `apiVersion`, kind, field, or required-contract variant fails
 closed. The manifest is stored beside the immutable artifact and contains:
 
 - artifact digest and build identity;
-- public OpenAPI/schema/stub digest;
+- public schema/stub digest;
 - ordered Wyrd and Vala migration-registry digests;
 - configuration-schema digest;
 - Bifrost RPC, peer-ticket, WAL, staged-manifest, Parquet-layout, and Iceberg

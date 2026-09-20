@@ -122,8 +122,15 @@ fn required_secret(
 }
 
 /// Redacted issuer projection from a write row. Never carries the client secret.
-fn trusted_issuer_view_from_write(write: &TrustedIssuerWrite) -> TrustedIssuerView {
-    TrustedIssuerView {
+///
+/// # Errors
+/// Returns [`WyrdError::Internal`] when a JSONB column this server just wrote
+/// does not decode into its contract type — the response is typed, so a row
+/// that cannot be projected is a server defect rather than a caller error.
+fn trusted_issuer_view_from_write(
+    write: &TrustedIssuerWrite,
+) -> Result<TrustedIssuerView, WyrdErrorResponse> {
+    Ok(TrustedIssuerView {
         issuer: write.issuer_url.clone(),
         jwks_uri: write.jwks_uri.clone(),
         expected_audience: write.expected_audience.clone(),
@@ -131,15 +138,21 @@ fn trusted_issuer_view_from_write(write: &TrustedIssuerWrite) -> TrustedIssuerVi
         client_auth: write.client_auth.clone(),
         principal_kind: write.principal_kind.clone(),
         jwks_ttl_secs: write.jwks_ttl_secs,
-        claim_mapping: write.claim_mapping.clone(),
-        group_role_map: write.group_role_map.clone(),
-        default_roles: write.default_roles.clone(),
-    }
+        claim_mapping: from_stored_json(&write.claim_mapping)?,
+        group_role_map: from_stored_json(&write.group_role_map)?,
+        default_roles: from_stored_json(&write.default_roles)?,
+    })
 }
 
 /// Redacted issuer projection from a stored row.
-fn trusted_issuer_view_from_row(row: TrustedIssuerRow) -> TrustedIssuerView {
-    TrustedIssuerView {
+///
+/// # Errors
+/// Returns [`WyrdError::Internal`] when a stored JSONB column does not decode
+/// into its contract type.
+fn trusted_issuer_view_from_row(
+    row: TrustedIssuerRow,
+) -> Result<TrustedIssuerView, WyrdErrorResponse> {
+    Ok(TrustedIssuerView {
         issuer: row.issuer_url,
         jwks_uri: row.jwks_uri,
         expected_audience: row.expected_audience,
@@ -147,32 +160,53 @@ fn trusted_issuer_view_from_row(row: TrustedIssuerRow) -> TrustedIssuerView {
         client_auth: row.client_auth,
         principal_kind: row.principal_kind,
         jwks_ttl_secs: row.jwks_ttl_secs,
-        claim_mapping: row.claim_mapping,
-        group_role_map: row.group_role_map,
-        default_roles: row.default_roles,
-    }
+        claim_mapping: from_stored_json(&row.claim_mapping)?,
+        group_role_map: from_stored_json(&row.group_role_map)?,
+        default_roles: from_stored_json(&row.default_roles)?,
+    })
+}
+
+/// Decode one stored JSONB column into the concrete type the wire declares.
+///
+/// The admin views used to hand these columns back as raw `serde_json::Value`,
+/// which made the published contract a lie: a caller could not tell a claim
+/// mapping from a role list. Decoding here is what lets the response type name
+/// the real shape.
+///
+/// # Errors
+/// Returns [`WyrdError::Internal`] when the column does not match `T`. Nothing
+/// about the stored value reaches the caller; a malformed row is this
+/// deployment's problem, not the requester's.
+fn from_stored_json<T: serde::de::DeserializeOwned>(
+    stored: &serde_json::Value,
+) -> Result<T, WyrdErrorResponse> {
+    serde_json::from_value(stored.clone()).map_err(internal_error)
 }
 
 /// Workload-binding projection from a write row.
-fn workload_binding_view_from_write(write: &WorkloadBindingWrite) -> WorkloadBindingView {
-    WorkloadBindingView {
+///
+/// # Errors
+/// Returns [`WyrdError::Internal`] when the stored card reference does not
+/// decode into a [`CardRef`].
+fn workload_binding_view_from_write(
+    write: &WorkloadBindingWrite,
+) -> Result<WorkloadBindingView, WyrdErrorResponse> {
+    Ok(WorkloadBindingView {
         issuer: write.issuer_url.clone(),
         subject: write.subject.clone(),
         audience: write.audience.clone(),
-        card_ref: write.card_ref.clone(),
-    }
+        card_ref: from_stored_json(&write.card_ref)?,
+    })
 }
 
 /// Workload-binding projection from a stored row.
-fn workload_binding_view_from_row(
-    row: WorkloadBindingRow,
-) -> Result<WorkloadBindingView, WyrdErrorResponse> {
-    Ok(WorkloadBindingView {
+fn workload_binding_view_from_row(row: WorkloadBindingRow) -> WorkloadBindingView {
+    WorkloadBindingView {
         issuer: row.issuer_url,
         subject: row.subject,
         audience: row.audience,
-        card_ref: serde_json::to_value(row.card_ref).map_err(internal_error)?,
-    })
+        card_ref: row.card_ref,
+    }
 }
 
 /// Query for deleting one issuer, with the cascade flag.
@@ -237,7 +271,7 @@ struct BindingFilter {
         (status = 401, description = "An access token is required \
           (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
         (status = 403, description = "Caller lacks service_accounts:write \
-          (WYRD_AUTHZ_403_PERMISSION_DENIED)", body = WyrdProblem),
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 409, description = "The issuer is already registered for this tenant \
           (WYRD_AUTH_409_ADMIN_CONFLICT)", body = WyrdProblem),
         (status = 503, description = "OIDC discovery, the sealing key, the store, or the audit \
@@ -298,7 +332,7 @@ async fn create_trusted_issuer(
         .map_err(|error| map_write_error(error, AdminWriteTarget::TrustedIssuer))?;
     conn.commit().await.map_err(sql_unavailable)?;
 
-    Ok(Json(trusted_issuer_view_from_write(&write)))
+    Ok(Json(trusted_issuer_view_from_write(&write)?))
 }
 
 /// `GET /v1/admin/trusted-issuers` — list the caller tenant's trusted issuers as
@@ -313,7 +347,7 @@ async fn create_trusted_issuer(
         (status = 401, description = "An access token is required \
           (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
         (status = 403, description = "Caller lacks service_accounts:write \
-          (WYRD_AUTHZ_403_PERMISSION_DENIED)", body = WyrdProblem),
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 503, description = "The store or the audit path is unavailable \
           (WYRD_AUDIT_503_UNAVAILABLE)", body = WyrdProblem)
     ),
@@ -342,7 +376,10 @@ async fn list_trusted_issuers(
         .map_err(sql_unavailable)?;
     conn.commit().await.map_err(sql_unavailable)?;
 
-    let views = rows.into_iter().map(trusted_issuer_view_from_row).collect();
+    let views = rows
+        .into_iter()
+        .map(trusted_issuer_view_from_row)
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(Json(views))
 }
 
@@ -365,7 +402,7 @@ async fn list_trusted_issuers(
         (status = 401, description = "An access token is required \
           (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
         (status = 403, description = "Caller lacks service_accounts:write \
-          (WYRD_AUTHZ_403_PERMISSION_DENIED)", body = WyrdProblem),
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No such issuer in this tenant \
           (WYRD_AUTH_404_ADMIN_NOT_FOUND)", body = WyrdProblem),
         (status = 409, description = "Live workload bindings still reference the issuer and \
@@ -437,7 +474,7 @@ async fn delete_trusted_issuer_route(
         (status = 401, description = "An access token is required \
           (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
         (status = 403, description = "Caller lacks service_accounts:write \
-          (WYRD_AUTHZ_403_PERMISSION_DENIED)", body = WyrdProblem),
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "The named issuer is not trusted by this tenant \
           (WYRD_AUTH_404_ADMIN_NOT_FOUND)", body = WyrdProblem),
         (status = 409, description = "The binding already exists \
@@ -484,7 +521,7 @@ async fn create_workload_binding(
         .map_err(|error| map_binding_write_error(error, &binding.issuer))?;
     conn.commit().await.map_err(sql_unavailable)?;
 
-    Ok(Json(workload_binding_view_from_write(&write)))
+    Ok(Json(workload_binding_view_from_write(&write)?))
 }
 
 /// `GET /v1/admin/workload-bindings?issuer=&subject=` — list the caller tenant's
@@ -504,7 +541,7 @@ async fn create_workload_binding(
         (status = 401, description = "An access token is required \
           (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
         (status = 403, description = "Caller lacks service_accounts:write \
-          (WYRD_AUTHZ_403_PERMISSION_DENIED)", body = WyrdProblem),
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 503, description = "The store or the audit path is unavailable \
           (WYRD_AUDIT_503_UNAVAILABLE)", body = WyrdProblem)
     ),
@@ -541,7 +578,7 @@ async fn list_workload_bindings(
     let views = rows
         .into_iter()
         .map(workload_binding_view_from_row)
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Vec<_>>();
     Ok(Json(views))
 }
 
@@ -560,7 +597,7 @@ async fn list_workload_bindings(
         (status = 401, description = "An access token is required \
           (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
         (status = 403, description = "Caller lacks service_accounts:write \
-          (WYRD_AUTHZ_403_PERMISSION_DENIED)", body = WyrdProblem),
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No such binding in this tenant \
           (WYRD_AUTH_404_ADMIN_NOT_FOUND)", body = WyrdProblem),
         (status = 503, description = "The store or the audit path is unavailable \

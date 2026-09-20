@@ -66,10 +66,20 @@ pub fn auth_router() -> Router<AppState> {
     request_body = TokenRequest,
     responses(
         (status = 200, description = "Access token issued", body = TokenResponse),
-        (status = 401, description = "The presented credential is not usable, for any reason \
-          (WYRD_AUTH_401_API_KEY_INVALID)", body = WyrdProblem),
+        (status = 400, description = "The delegation would exceed the configured chain depth \
+          (WYRD_AUTH_400_DELEGATION_DEPTH_EXCEEDED)", body = WyrdProblem),
+        (status = 401, description = "The presented credential is not usable. Every \
+          invalid-credential condition renders one indistinguishable refusal \
+          (WYRD_AUTH_401_API_KEY_INVALID); a refresh token that was already consumed reports \
+          the reuse it contained (WYRD_AUTH_401_REFRESH_REUSED), one that is revoked, expired, \
+          or malformed reports that (WYRD_AUTH_401_REFRESH_REVOKED), and a subject token whose \
+          delegation chain is already at the limit reports that \
+          (WYRD_AUTH_401_DELEGATION_DEPTH_EXCEEDED)", body = WyrdProblem),
         (status = 403, description = "The credential is valid but its principal may not obtain \
-          this token (WYRD_AUTHZ_403_PERMISSION_DENIED)", body = WyrdProblem),
+          this token (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 404, description = "No principal in this tenant matches the requested \
+          delegation subject or the presented workload assertion \
+          (WYRD_AUTH_404_PRINCIPAL_NOT_FOUND)", body = WyrdProblem),
         (status = 503, description = "The auth backend or audit path is unavailable \
           (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
@@ -347,7 +357,7 @@ async fn callback(
         (status = 401, description = "An access token is required \
           (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
         (status = 403, description = "Caller lacks service_accounts:write \
-          (WYRD_AUTHZ_403_PERMISSION_DENIED)", body = WyrdProblem),
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No principal is bound to the named Card \
           (WYRD_AUTH_404_ADMIN_NOT_FOUND)", body = WyrdProblem),
         (status = 503, description = "The store or audit path is unavailable \

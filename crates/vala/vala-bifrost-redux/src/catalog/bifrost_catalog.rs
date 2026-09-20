@@ -4,10 +4,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use arrow::datatypes::{Field, Schema};
+use iceberg::TableCreation;
 use iceberg::io::{FileIO, FileIOBuilder};
 use iceberg::spec::{FormatVersion, Transform};
-use iceberg::transaction::{AddColumn, ApplyTransactionAction, Transaction};
-use iceberg::{TableCreation, TableIdent};
 use sha2::{Digest as _, Sha256};
 use vala_sql::queries::file_list::HotFileCatalog;
 use vala_sql::{TenantConn, ValaPostgres};
@@ -34,7 +33,7 @@ use crate::namespaces::BifrostNamespace;
 use crate::provider::ReduxTableProvider;
 use crate::schema::{SchemaFingerprint, with_managed_columns};
 use crate::storage::BifrostStorage;
-use crate::tables::{BuiltinTableDefinition, DomainTable, builtin_table};
+use crate::tables::{BuiltinTableDefinition, builtin_table};
 
 /// Hashes an ordered metadata identity projection for immutable cut auditing.
 fn digest_strings(values: impl IntoIterator<Item = String>) -> String {
@@ -976,12 +975,7 @@ impl BifrostCatalog {
         let physical_exists = self.catalog.table_exists(&table_ident).await?;
 
         if let Some(row) = row {
-            // Exactly one registration may differ from its declaration: an
-            // `audit_log` written before the table carried `credential_id`.
-            // That one is evolved forward below; every other difference stays
-            // a refusal.
-            let evolving = row.fingerprint.as_slice() != fingerprint.as_ref();
-            if evolving && !is_audit_log_credential_upgrade(&fqn, &row.fingerprint) {
+            if row.fingerprint.as_slice() != fingerprint.as_ref() {
                 return Err(BifrostCatalogError::FingerprintMismatch(fqn));
             }
             if layout_wire_from_row(&row)? != layout_wire {
@@ -993,19 +987,6 @@ impl BifrostCatalog {
                 return Err(BifrostCatalogError::MetadataMismatch(format!(
                     "control registration exists without physical table: {table_ident}"
                 )));
-            }
-            if evolving {
-                let table_uid = TableUid::from_row(&row.table_uid, &row.fqn)?;
-                self.append_audit_log_credential_column(&table_ident)
-                    .await?;
-                vala_sql::queries::olap_catalog::upsert_table(
-                    &mut conn,
-                    table_uid.as_bytes(),
-                    &fqn,
-                    &fingerprint.0,
-                    &layout_json,
-                )
-                .await?;
             }
             let physical = self.catalog.load_table(&table_ident).await?;
             self.validate_physical_table(&physical, &binding, &arrow_schema, &layout)?;
@@ -1037,49 +1018,6 @@ impl BifrostCatalog {
         append_registration_audit(&mut conn, request.audit.as_ref(), &fqn).await?;
         conn.commit().await?;
         Ok(table_uid)
-    }
-
-    /// Append `credential_id` to an existing `vala.system.audit_log`.
-    ///
-    /// Idempotent by inspection: a table that already carries the column is
-    /// left alone, which is also the reconciliation path for a retry whose
-    /// physical evolution committed but whose control row did not — the caller
-    /// rewrites the control fingerprint in the same transaction afterwards, so
-    /// the pair converges on either ordering of the two failures.
-    ///
-    /// Iceberg appends the new column and assigns it one fresh id, so every
-    /// pre-existing field id — and therefore every object already written —
-    /// survives untouched. The column is optional with no default, which is
-    /// exactly the read semantics a historical row needs: no credential.
-    ///
-    /// # Errors
-    /// Returns [`BifrostCatalogError::Iceberg`] when the table cannot be
-    /// loaded, the schema update cannot be applied, or the commit fails.
-    async fn append_audit_log_credential_column(
-        &self,
-        table_ident: &TableIdent,
-    ) -> Result<(), BifrostCatalogError> {
-        let physical = self.catalog.load_table(table_ident).await?;
-        if physical
-            .metadata()
-            .current_schema()
-            .field_by_name(crate::tables::audit::CREDENTIAL_ID)
-            .is_some()
-        {
-            return Ok(());
-        }
-        let transaction = Transaction::new(&physical);
-        let action = transaction.update_schema().add_column(AddColumn::optional(
-            crate::tables::audit::CREDENTIAL_ID,
-            iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::String),
-        ));
-        let applied = ApplyTransactionAction::apply(action, transaction)?;
-        applied.commit(self.catalog.as_ref()).await?;
-        tracing::info!(
-            table = %table_ident,
-            "evolved retained audit history to carry credential_id"
-        );
-        Ok(())
     }
 
     /// Create the physical Iceberg table for one canonical layout.
@@ -1493,34 +1431,12 @@ impl BifrostCatalog {
 /// Arrow and `+00:00` by Iceberg. Field order, names, nullability, units, and
 /// every other data-type detail remain exact.
 pub(crate) fn schema_shape_matches(expected: &Schema, actual: &Schema) -> bool {
-    if expected.fields().len() == actual.fields().len()
+    expected.fields().len() == actual.fields().len()
         && expected
             .fields()
             .iter()
             .zip(actual.fields())
             .all(|(expected, actual)| field_shape_matches(expected, actual))
-    {
-        return true;
-    }
-    // Position is the comparison, and stays the comparison for every table
-    // whose two sides line up. Only when it does not do the declared Iceberg
-    // field ids get a say, and then only if both sides state a complete,
-    // unambiguous set: an additive `ADD COLUMN` appends the new column
-    // physically last while the declaration names it in its canonical
-    // position, and Iceberg calls those the same table because it identifies
-    // a column by id. Nothing else reaches here, so no table that used to be
-    // refused for a real shape conflict is accepted now.
-    let (Some(expected_by_id), Some(actual_by_id)) =
-        (fields_by_stable_id(expected), fields_by_stable_id(actual))
-    else {
-        return false;
-    };
-    expected_by_id.len() == actual_by_id.len()
-        && expected_by_id.iter().all(|(id, expected)| {
-            actual_by_id
-                .get(id)
-                .is_some_and(|actual| field_shape_matches(expected, actual))
-        })
 }
 
 /// Whether two fields describe the same column name, nullability, and layout.
@@ -1528,41 +1444,6 @@ fn field_shape_matches(expected: &Field, actual: &Field) -> bool {
     expected.name() == actual.name()
         && expected.is_nullable() == actual.is_nullable()
         && crate::tables::arrow_type_shape_matches(expected.data_type(), actual.data_type())
-}
-
-/// Index one schema's top-level fields by their declared Iceberg field id.
-///
-/// Returns `None` unless every field carries a parseable id and no id repeats,
-/// so a partially annotated or malformed schema falls back to the positional
-/// comparison rather than silently matching on a subset.
-fn fields_by_stable_id(schema: &Schema) -> Option<HashMap<i32, &Field>> {
-    let mut by_id = HashMap::with_capacity(schema.fields().len());
-    for field in schema.fields() {
-        let id = field
-            .metadata()
-            .get(crate::tables::fields::PARQUET_FIELD_ID)?
-            .parse::<i32>()
-            .ok()?;
-        if by_id.insert(id, field.as_ref()).is_some() {
-            return None;
-        }
-    }
-    Some(by_id)
-}
-
-/// Whether one registration is the recognized `audit_log` credential upgrade.
-///
-/// The only difference this catalog forgives is a `vala.system.audit_log`
-/// control row still holding the fingerprint of the thirteen content columns
-/// the table declared before `credential_id`. Matching the exact predecessor
-/// — not merely "some other audit fingerprint" — keeps every unrelated schema
-/// conflict a refusal.
-fn is_audit_log_credential_upgrade(fqn: &str, registered: &[u8]) -> bool {
-    fqn.ends_with(&format!(
-        ".{}.{}",
-        crate::tables::audit::AuditLogTable::NAMESPACE,
-        crate::tables::audit::AuditLogTable::NAME
-    )) && registered == crate::tables::audit::AuditLogTable::legacy_schema_fingerprint()
 }
 
 /// Resolves the physical schema and canonical layout one registration writes.
@@ -1677,6 +1558,26 @@ mod schema_shape_tests {
         )]);
 
         assert!(!schema_shape_matches(&utc, &other));
+    }
+
+    /// The same columns in a different order are a different physical shape.
+    ///
+    /// Position is the whole comparison. Nothing consults a declared Iceberg
+    /// field id to call two orderings the same table, so a reordered canonical
+    /// schema is a mismatch here and a `MetadataMismatch` at registration.
+    #[test]
+    fn schema_shape_rejects_reordered_columns() {
+        let declared = Schema::new(vec![
+            Field::new("seq", DataType::Int64, false),
+            Field::new("entry_hash", DataType::Utf8, false),
+        ]);
+        let reordered = Schema::new(vec![
+            Field::new("entry_hash", DataType::Utf8, false),
+            Field::new("seq", DataType::Int64, false),
+        ]);
+
+        assert!(!schema_shape_matches(&declared, &reordered));
+        assert!(!schema_shape_matches(&reordered, &declared));
     }
 
     /// Table providers are constructed directly from one pinned Iceberg table
@@ -2216,191 +2117,6 @@ mod production_pin_tests {
                     case.name
                 );
             }
-        });
-    }
-}
-
-#[cfg(all(test, feature = "test-support"))]
-mod audit_log_upgrade_tests {
-    use arrow::datatypes::{Field, Schema, SchemaRef};
-    use secrecy::ExposeSecret as _;
-
-    use super::BifrostCatalog;
-    use crate::catalog::{TableRef, TenantTableBinding};
-    use crate::namespaces::BifrostNamespace;
-    use crate::tables::fields::PARQUET_FIELD_ID;
-    use crate::tables::managed_columns::ensure_managed_columns;
-    use crate::tables::{
-        AuditLogTable, BuiltinTableDefinition, CorrelationPolicy, DomainTable, PayloadClass,
-        builtin_table,
-    };
-
-    /// The content columns the table declared before it carried a credential.
-    fn legacy_fields() -> Vec<Field> {
-        AuditLogTable::legacy_arrow_fields()
-    }
-
-    /// The physical schema an older build registered: managed append, no ids.
-    fn legacy_schema() -> SchemaRef {
-        SchemaRef::new(Schema::new(ensure_managed_columns(
-            legacy_fields(),
-            CorrelationPolicy::None,
-        )))
-    }
-
-    /// The user-schema fingerprint of that older registration.
-    fn legacy_fingerprint() -> [u8; 32] {
-        AuditLogTable::legacy_schema_fingerprint()
-    }
-
-    /// The exact pre-change `audit_log` definition, as a deployment that has
-    /// been retaining history already registered it.
-    ///
-    /// Seeding through the real registration path rather than by hand is what
-    /// makes the upgrade proof meaningful: the starting state is whatever the
-    /// previous build actually wrote, including its auto-assigned field ids.
-    static LEGACY_AUDIT_LOG: BuiltinTableDefinition = BuiltinTableDefinition {
-        namespace: AuditLogTable::NAMESPACE,
-        name: AuditLogTable::NAME,
-        correlation_policy: CorrelationPolicy::None,
-        payload_class: PayloadClass::Standard,
-        sensitive_payload_columns: &[],
-        past_event_time_exempt: true,
-        arrow_fields: legacy_fields,
-        schema_fingerprint: legacy_fingerprint,
-        schema: legacy_schema,
-        canonical_fields: <AuditLogTable as DomainTable>::canonical_fields,
-        canonical_physical_fingerprint:
-            <AuditLogTable as DomainTable>::canonical_physical_fingerprint,
-        canonical_validator: None,
-        physical_layout: <AuditLogTable as DomainTable>::physical_layout,
-    };
-
-    /// Read one physical column's Iceberg field id by name.
-    ///
-    /// # Panics
-    /// Panics when the column is absent, which every assertion here treats as
-    /// the failure it is.
-    fn field_id(table: &iceberg::table::Table, name: &str) -> i32 {
-        table
-            .metadata()
-            .current_schema()
-            .field_by_name(name)
-            .unwrap_or_else(|| panic!("physical schema carries {name}"))
-            .id
-    }
-
-    /// A pre-credential `audit_log` evolves forward, keeping every old id.
-    ///
-    /// The same registration is then repeated, and repeated again after the
-    /// control row is rolled back to its pre-change fingerprint, so both
-    /// orderings of an interrupted upgrade converge instead of deadlocking on
-    /// a fingerprint conflict.
-    #[test]
-    fn a_pre_credential_audit_log_upgrades_and_keeps_its_field_ids() {
-        wyrd_runtime::runtime().block_on(async {
-            let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
-                .await
-                .expect("postgres fixture starts");
-            let warehouse = tempfile::tempdir().expect("warehouse directory");
-            let catalog = BifrostCatalog::new(
-                fixture.catalog_dsn().expose_secret(),
-                super::production_pin_tests::local_storage_owner(warehouse.path()),
-                fixture.vala_postgres().clone(),
-            )
-            .await
-            .expect("redux catalog builds over the fixture");
-
-            let tenant = fixture.data_tenant_id();
-            let table = TableRef::new(BifrostNamespace::Audit, AuditLogTable::NAME);
-            let binding =
-                TenantTableBinding::resolve((tenant, table)).expect("audit binding resolves");
-            let ident = binding.table_ident();
-
-            let seeded = catalog
-                .ensure_builtin(tenant, &LEGACY_AUDIT_LOG)
-                .await
-                .expect("the pre-change registration succeeds");
-            let before = catalog
-                .iceberg_catalog()
-                .load_table(&ident)
-                .await
-                .expect("the seeded physical table loads");
-            assert!(
-                before
-                    .metadata()
-                    .current_schema()
-                    .field_by_name(crate::tables::audit::CREDENTIAL_ID)
-                    .is_none(),
-                "the seeded table predates the credential column"
-            );
-            let legacy_ids: Vec<(String, i32)> = before
-                .metadata()
-                .current_schema()
-                .as_struct()
-                .fields()
-                .iter()
-                .map(|field| (field.name.clone(), field.id))
-                .collect();
-
-            let definition = builtin_table(AuditLogTable::NAMESPACE, AuditLogTable::NAME)
-                .expect("audit_log is a built-in");
-            let upgraded = catalog
-                .ensure_builtin(tenant, definition)
-                .await
-                .expect("the credential upgrade succeeds");
-            assert_eq!(upgraded, seeded, "the table keeps its identity");
-
-            let after = catalog
-                .iceberg_catalog()
-                .load_table(&ident)
-                .await
-                .expect("the upgraded physical table loads");
-            for (name, id) in &legacy_ids {
-                assert_eq!(
-                    field_id(&after, name),
-                    *id,
-                    "{name} keeps the id every already-written object tags it with"
-                );
-            }
-            let credential_id = field_id(&after, crate::tables::audit::CREDENTIAL_ID);
-            let declared: i32 = AuditLogTable::schema()
-                .field_with_name(crate::tables::audit::CREDENTIAL_ID)
-                .expect("the declaration names the column")
-                .metadata()
-                .get(PARQUET_FIELD_ID)
-                .expect("the declaration states its id")
-                .parse()
-                .expect("the declared id is an integer");
-            assert_eq!(
-                credential_id, declared,
-                "an evolved table and a freshly created one agree on the new id"
-            );
-
-            catalog
-                .ensure_builtin(tenant, definition)
-                .await
-                .expect("the upgrade is idempotent");
-
-            // Reconcile the retry whose physical evolution committed and whose
-            // control row did not.
-            let mut conn = fixture
-                .vala_postgres()
-                .tenant_conn(tenant)
-                .await
-                .expect("tenant transaction opens");
-            sqlx::query("UPDATE vala.bifrost_tables SET fingerprint = $1 WHERE fqn = $2")
-                .bind(legacy_fingerprint().as_slice())
-                .bind(binding.table_ref.fqn())
-                .execute(&mut **conn.transaction())
-                .await
-                .expect("the control row rolls back");
-            conn.commit().await.expect("the rollback commits");
-
-            catalog
-                .ensure_builtin(tenant, definition)
-                .await
-                .expect("a half-applied upgrade reconciles");
         });
     }
 }

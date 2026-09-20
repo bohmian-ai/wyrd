@@ -348,9 +348,8 @@ pub async fn settle_publication(conn: &mut TenantConn<'_>, seq_hi: i64) -> Resul
 /// chain is reproducible from the stored columns alone. `card_ref` is passed as
 /// its already-canonicalized string to avoid recomputing it.
 ///
-/// The credential segment is appended last and only when the decision names a
-/// credential, which keeps the preimage of every historical null-credential
-/// row exactly what it was when that row was written.
+/// The credential segment is encoded like every other optional column —
+/// present or absent — so one preimage covers every row the chain holds.
 fn entry_hash(
     prev_hash: &[u8],
     seq: i64,
@@ -374,13 +373,7 @@ fn entry_hash(
     push_str(&mut buf, &event.permission);
     push_str(&mut buf, outcome_str(event.outcome));
     push_opt(&mut buf, detail);
-    // Appended, and only when there is one. Every row hashed before decisions
-    // carried a credential ends here, so a chain written by an older build
-    // still verifies byte for byte against what it stored; a row that does
-    // name a credential commits to it in the one segment beyond that preimage.
-    if let Some(credential) = credential.as_deref() {
-        push_str(&mut buf, credential);
-    }
+    push_opt(&mut buf, credential.as_deref());
     Sha256::digest(&buf).into()
 }
 
@@ -436,8 +429,12 @@ mod tests {
         }
     }
 
-    /// The preimage an older build hashed, before `credential_id` existed.
-    fn legacy_preimage(prev_hash: &[u8], seq: i64, event: &AuditEvent) -> [u8; 32] {
+    /// The preimage a reader reproduces from the columns a row stores.
+    ///
+    /// Spelled out independently of [`entry_hash`] so the encoding the chain
+    /// commits to is pinned by a second statement of it rather than by the
+    /// implementation agreeing with itself.
+    fn reader_preimage(prev_hash: &[u8], seq: i64, event: &AuditEvent) -> [u8; 32] {
         let mut buf = Vec::new();
         buf.extend_from_slice(prev_hash);
         buf.extend_from_slice(&seq.to_be_bytes());
@@ -451,19 +448,35 @@ mod tests {
         push_str(&mut buf, &event.permission);
         push_str(&mut buf, "allowed");
         push_opt(&mut buf, None);
+        push_opt(
+            &mut buf,
+            event.credential_id.map(|id| id.to_string()).as_deref(),
+        );
         Sha256::digest(&buf).into()
     }
 
-    /// A row with no credential hashes exactly what it hashed before the
-    /// column existed, so retained history still verifies.
+    /// A credential-free row reproduces its stored hash from its own columns.
     #[test]
-    fn a_credential_free_decision_keeps_its_original_preimage() {
+    fn a_credential_free_decision_reproduces_its_stored_hash() {
         let event = event(None);
         let prev_hash = [7_u8; 32];
         assert_eq!(
             entry_hash(&prev_hash, 42, &event, None, None),
-            legacy_preimage(&prev_hash, 42, &event),
-            "the absent credential adds nothing to the preimage"
+            reader_preimage(&prev_hash, 42, &event),
+            "an absent credential is encoded, not omitted"
+        );
+    }
+
+    /// A credential-bearing row reproduces its stored hash from its own
+    /// columns.
+    #[test]
+    fn a_credential_bearing_decision_reproduces_its_stored_hash() {
+        let event = event(Some(uuid::Uuid::from_u128(1)));
+        let prev_hash = [7_u8; 32];
+        assert_eq!(
+            entry_hash(&prev_hash, 42, &event, None, None),
+            reader_preimage(&prev_hash, 42, &event),
+            "the named credential is encoded in the preimage"
         );
     }
 

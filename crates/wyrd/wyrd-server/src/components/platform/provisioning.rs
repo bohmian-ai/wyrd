@@ -397,7 +397,7 @@ impl TenantProvisioning {
                 &caller.context,
                 &Permission::tenant_read(),
                 caller.request_id.as_str(),
-                &resource,
+                resource,
             )
             .await?;
         decision

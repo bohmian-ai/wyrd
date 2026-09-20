@@ -174,6 +174,11 @@ async fn initialization_happens_at_most_once() {
 /// The binary resolves its DSNs from the environment, so the only thing the
 /// child needs is the lane's `WYRD_DATABASE_URL` with the database swapped for
 /// the fixture's. Every other credential and password is inherited.
+///
+/// # Panics
+///
+/// Panics when the lane did not set `WYRD_DATABASE_URL`, or when its value is
+/// not a Postgres DSN naming its database after the last slash.
 fn operator_command(subcommand: &str, database: &str) -> std::process::Command {
     let base = env::var("WYRD_DATABASE_URL").expect("the journey lane sets WYRD_DATABASE_URL");
     let (prefix, _) = base
@@ -3459,6 +3464,11 @@ async fn an_uninitialized_deployment_serves_tenants_and_refuses_the_platform_pla
 /// shown is that a failure of the *second* also discards the *first*. A
 /// statement-level trigger is the smallest thing that makes the second fail
 /// without touching the code under test.
+///
+/// # Panics
+///
+/// Panics when the failure function or its trigger cannot be created, which
+/// means the fixture cannot prove the coupling it exists for.
 async fn fail_writes_to(pool: &sqlx::PgPool, label: &str, table: &str, event: &str) {
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "CREATE OR REPLACE FUNCTION platform.test_fail_{label}()
@@ -3482,6 +3492,11 @@ async fn fail_writes_to(pool: &sqlx::PgPool, label: &str, table: &str, event: &s
 }
 
 /// Remove an injected write failure.
+///
+/// # Panics
+///
+/// Panics when the trigger cannot be dropped, which would leave later
+/// assertions in the same test failing for the wrong reason.
 async fn stop_failing_writes(pool: &sqlx::PgPool, label: &str, table: &str) {
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "DROP TRIGGER test_fail_{label} ON {table}"
@@ -3492,6 +3507,10 @@ async fn stop_failing_writes(pool: &sqlx::PgPool, label: &str, table: &str) {
 }
 
 /// Count staged platform authorization rows by outcome.
+///
+/// # Panics
+///
+/// Panics when the staging table cannot be read.
 async fn staged_platform_decisions(pool: &sqlx::PgPool, outcome: &str) -> i64 {
     sqlx::query_scalar(
         "SELECT count(*) FROM vala.audit_staging

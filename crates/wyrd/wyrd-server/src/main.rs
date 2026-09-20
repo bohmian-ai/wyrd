@@ -74,6 +74,12 @@ async fn main() {
 ///
 /// The plaintext is printed once to this process's stdout, which is the
 /// operator's terminal rather than the server's log pipeline.
+///
+/// # Errors
+/// Returns [`BootExit::Config`] when the platform-admin DSN is missing or the
+/// operator pool cannot be opened, and [`BootExit::Other`] when establishing
+/// the root fails — including a deployment that is already initialized,
+/// credential hashing, and any Postgres write or commit failure.
 async fn init() -> Result<(), BootExit> {
     let pool = operator_pool().await?;
     let credential = initialize_platform_root(&pool)
@@ -92,6 +98,12 @@ async fn init() -> Result<(), BootExit> {
 /// Shares initialization's shape for the same reasons: Postgres handles only, no
 /// serving configuration, and the plaintext printed once to this terminal. It
 /// differs in creating nothing — the root must already exist.
+///
+/// # Errors
+/// Returns [`BootExit::Config`] when the platform-admin DSN is missing or the
+/// operator pool cannot be opened, and [`BootExit::Other`] when issuing the
+/// replacement fails — including a deployment whose root has never been
+/// initialized, credential hashing, and any Postgres write or commit failure.
 async fn recover_root() -> Result<(), BootExit> {
     let pool = operator_pool().await?;
     let credential = issue_platform_root_credential(&pool)

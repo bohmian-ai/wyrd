@@ -908,6 +908,87 @@ async fn human_oidc_login_journey() {
 
     // Step 4: human token reaches a real authenticated /v1 200 via delegation.
     assert_v1_authz_check_ok(&srv, access_token, "human-sso").await;
+
+    // Step 5: the human session carries a refresh token. Only human sessions
+    // do; a machine client re-exchanges its durable credential instead.
+    let refresh_token = token_body["refresh_token"]
+        .as_str()
+        .expect("a human session is issued a refresh token")
+        .to_owned();
+
+    // Step 6: renew the session. A real UI does this once the 15-minute access
+    // token expires; the grant does not consult the clock, so presenting the
+    // refresh token is the whole renewal.
+    let (rotated_status, rotated_body) = post_refresh(&srv, &refresh_token).await;
+    assert_eq!(
+        rotated_status,
+        StatusCode::OK,
+        "refresh rotation returns 200: {rotated_body}"
+    );
+    let rotated_access = rotated_body["access_token"]
+        .as_str()
+        .expect("rotation returns an access token")
+        .to_owned();
+    let successor_refresh = rotated_body["refresh_token"]
+        .as_str()
+        .expect("rotation returns the successor refresh token")
+        .to_owned();
+
+    // Step 7: the successor reaches the same protected /v1 200, proving the
+    // renewed session kept the authority the provider asserted at login.
+    assert_v1_authz_check_ok(&srv, &rotated_access, "human-sso-rotated").await;
+
+    // Step 8: replaying the consumed token is refused and contains the theft.
+    let (replay_status, replay_body) = post_refresh(&srv, &refresh_token).await;
+    assert_eq!(
+        replay_status,
+        StatusCode::UNAUTHORIZED,
+        "replaying the consumed refresh token is refused: {replay_body}"
+    );
+    assert_eq!(
+        response_code(&replay_body),
+        "WYRD_AUTH_401_REFRESH_REUSED",
+        "replay renders the reuse code: {replay_body}"
+    );
+
+    // Step 9: containment was committed with the refusal, so the successor the
+    // attacker would hold is dead on a separate request and transaction.
+    let (successor_status, successor_body) = post_refresh(&srv, &successor_refresh).await;
+    assert_eq!(
+        successor_status,
+        StatusCode::UNAUTHORIZED,
+        "the successor cannot rotate after replay: {successor_body}"
+    );
+}
+
+/// Present a refresh token to `POST /auth/token` and read the status and body.
+///
+/// The rotation half of the human session journey runs several times — renew,
+/// replay, and then the revoked successor — and each call needs the same
+/// tenant host header and JSON envelope.
+async fn post_refresh(srv: &WyrdTestServer, refresh_token: &str) -> (StatusCode, Value) {
+    let body = serde_json::json!({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+    });
+    let response = srv
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/auth/token")
+                .header(header::HOST, "test-tenant-1.wyrd.test")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("refresh request builds"),
+        )
+        .await
+        .expect("refresh call completes");
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 65_536)
+        .await
+        .expect("refresh body reads");
+    let parsed = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, parsed)
 }
 
 // ─── Federated cloud journey: CLI-authored issuer + binding ───────────────────

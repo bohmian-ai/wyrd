@@ -42,7 +42,9 @@ wyrd auth login --server https://acme.wyrd.cloud --issuer https://id.acme.com
 
 ### auth refresh
 
-Rotate a Wyrd refresh token and print the new access and refresh tokens.
+Rotate a human session's Wyrd refresh token and print the new access and
+refresh tokens. Only a `User` principal holds one; a machine renews by
+re-exchanging its API key instead.
 
 ```bash
 wyrd auth refresh --server https://acme.wyrd.cloud --refresh-token "$TOKEN"

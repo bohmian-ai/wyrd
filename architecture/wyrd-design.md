@@ -114,8 +114,10 @@ drift, not permission for code and documentation to diverge.
     `Audit`, `Operator`, `Trigger`) may be referenced for governance but never
     enter the emit scope. Service principals start from their Service card and
     therefore include declared `Service.components`; Agent principals start from
-    their Agent card and include its declared card refs. Token mint and refresh
-    resolve those bounded scope identities to Card UIDs and sign that mapping.
+    their Agent card and include its declared card refs. Every token mint —
+    including the re-exchange a machine performs when its access token expires
+    — resolves those bounded scope identities to Card UIDs and signs that
+    mapping.
     An observation may carry the run's Target `card_ref`; when present, the
     server authorizes it against that scope and stamps the mapped `card_uid`.
     Generic telemetry may omit it and retains the authenticated publisher through
@@ -166,8 +168,9 @@ drift, not permission for code and documentation to diverge.
     against the existing principal. The caller uploads the key to the deploy
     environment's secret store (Vault, AWS Secrets Manager, GCP Secret
     Manager); deploy-time secret injection puts it into the pod as
-    `WYRD_API_KEY`. The SDK exchanges it once at startup at `POST /auth/token`
-    for a short-lived JWT. `/auth/token` derives `tenant_id` and
+    `WYRD_API_KEY`. The SDK exchanges it at `POST /auth/token` for a short-lived
+    JWT and re-exchanges the same durable key whenever that token expires or
+    the server refuses it; a machine holds no refresh token. `/auth/token` derives `tenant_id` and
     `principal_id` from the verified API-key record — never from a
     client-supplied header. The JWT carries top-level `principal` (current
     actor / callee under delegation) and an RFC 8693 `act` chain
@@ -473,9 +476,10 @@ credential's non-secret id.
 Wyrd principals are UUID-backed runtime identities that exist independently of
 any credential: issuing, rotating, revoking, or losing a credential never
 creates, destroys, or alters a principal or its role grants. `Service` and
-`Agent` principals are card-bound — each carries a `card_ref` discriminated on
-`PrincipalKind`, and its JWT carries a mint-time `card_ref_scope` derived from
-the transitive card-ref graph rooted at that card — but the administrative and
+`Agent` principal is always card-bound and a deployed `Service` carries its
+Card — the `card_ref` is discriminated on `PrincipalKind`, and the JWT carries a
+mint-time `card_ref_scope` derived from the transitive card-ref graph rooted at
+that card — but a `Service` binding is optional, and the administrative and
 automation principals a tenant creates for itself hold no Card at all. `wyrd apply` for a Service or Agent card creates or updates the
 principal row idempotently (keyed on `(tenant_id, card_kind, card_uid)`);
 re-apply preserves the same
@@ -492,8 +496,12 @@ operations are separated, matching the kubectl pattern (`apply` then
 
 Deploy-time secret injection (Vault Agent, External Secrets Operator, AWS
 Secrets Manager CSI driver, etc.) puts the API key into the pod as
-`WYRD_API_KEY`. The SDK exchanges it ONCE at startup at `POST /auth/token` for
-a short-lived JWT (~15m), and auto-refreshes before expiry. `/auth/token`
+`WYRD_API_KEY`. The SDK exchanges it at `POST /auth/token` for a short-lived
+JWT (~15m) and re-exchanges the same durable key when that token nears expiry
+or is refused — a machine grant issues no refresh token, so the key in the
+secret store is the only renewable authority and revoking it ends renewal.
+Rotating renewal authority is a human concern: only an OIDC login returns a
+refresh token, and only that token rotates. `/auth/token`
 derives `tenant_id` and `principal_id` from the verified API-key record;
 no client-supplied tenant header is accepted. The JWT carries the principal
 as the top-level `principal` claim, and for delegated tokens (token
@@ -503,13 +511,13 @@ Env vars in deployed services:
 
 | Env var | Required? | Source | Used for |
 |---|---|---|---|
-| `WYRD_API_KEY` | REQUIRED | Deploy environment's secret store (key minted by `wyrd auth issue-key <card_ref>`) | Exchanged ONCE at startup at `POST /auth/token` for short-lived JWT. SDK auto-refreshes. JWT carries the card-bound `principal` claim (kind, id, tenant, `card_ref`). |
+| `WYRD_API_KEY` | REQUIRED | Deploy environment's secret store (key minted by `wyrd auth issue-key <card_ref>`) | Exchanged at `POST /auth/token` for a short-lived JWT and re-exchanged by the SDK when that token expires or is refused; no refresh token is issued. JWT carries the card-bound `principal` claim (kind, id, tenant, `card_ref`). |
 | `WYRD_SERVER_URL` | REQUIRED | Static config | Wyrd server HTTP base URL (default `http://localhost:50050`). Read by `ClientConfig::from_env`. |
 | `WYRD_GRPC_URL` | OPTIONAL | Static config | Wyrd server gRPC endpoint (default `http://localhost:50051`). Read by `ClientConfig::from_env`. |
 
 #### Cross-service delegation
 
-The API key is exchanged at startup — never on the wire. The JWT — not the API
+The API key is exchanged at `/auth/token` — never on the wire. The JWT — not the API
 key — is what travels on cross-service calls in the dedicated
 `X-Wyrd-Access-Token: Bearer <jwt>` header. The JWT must be a **delegated**
 Wyrd token: its top-level `principal` identifies the protected callee
@@ -621,9 +629,10 @@ Consequences, stated so they stop drifting:
   specs contribute their declared card refs according to the shared card-ref
   extraction rules. A `card_ref` outside that set is rejected: a principal may
   not attribute records to a card outside its declared graph. The scope can be resolved from the
-  signed `card_ref_scope` claim minted into the JWT at `/auth/token`. Token mint
-  and refresh resolve each bounded member against the tenant Card registry and
-  sign its authoritative UID with the identity. Ingest uses that verified
+  signed `card_ref_scope` claim minted into the JWT at `/auth/token`. Every
+  token mint — a first exchange, a machine's re-exchange, or a human refresh
+  rotation — resolves each bounded member against the tenant Card registry and
+  signs its authoritative UID with the identity. Ingest uses that verified
   in-memory mapping and performs no Card-registry Postgres or cache lookup.
 - **This is not the governance token.** `card_ref` is one field in the
   observation envelope, authorized by the existing JWT plus the principal's

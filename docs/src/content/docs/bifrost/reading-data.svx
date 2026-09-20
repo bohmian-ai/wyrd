@@ -156,10 +156,13 @@ Let the MCP client manage protocol framing and metadata.
 
 Every request must carry `x-wyrd-access-token: Bearer <access-token>`, including
 discovery and tool calls. Obtain the access token by exchanging a Wyrd API key
-at `POST /auth/token`, and refresh it before expiry. The first-party Rust
-`WyrdMcpHttpClient` decorator reuses `AuthMiddleware` to supply a current bearer
-and a `wyrd-request-id` on every request. It preserves a supplied request ID
-and leaves the application's `Authorization` header untouched.
+at `POST /auth/token`; there is no refresh token to rotate, so re-exchange the
+same key when the access token expires. The first-party Rust
+`WyrdMcpHttpClient` decorator is built from a configured `WyrdClient` and takes
+that renewal from it: it supplies a current bearer and a `wyrd-request-id` on
+every request, and after a `401` it re-exchanges once and replays the request
+once. It preserves a supplied request ID and leaves the application's
+`Authorization` header untouched.
 
 After discovery, use `tools/list` to find `bifrost.list_tables`,
 `bifrost.describe_table`, and `bifrost.query`, then invoke them with `tools/call`.

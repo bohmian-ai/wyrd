@@ -90,7 +90,7 @@ Two distinct "kind" fields appear in auth that are easy to confuse:
     { header: 'What it means' }
   ]}
   rows={[
-    ['PrincipalKind', 'User | Service { card_ref } | Agent { card_ref }', 'The identity of the token holder: who is acting.'],
+    ['PrincipalKind', 'TenantAdmin | User | Service { card_ref: Option<CardRef> } | Agent { card_ref }', 'The identity of the tenant-plane token holder: who is acting. A Service card binding is optional; an Agent is always card-bound. Platform-plane principals carry PlatformPrincipal instead and never reach a tenant route.'],
     ['PrincipalKindPolicy', 'Human | Workload', 'Per-issuer config: whether an OIDC issuer is for human login or machine workloads.']
   ]}
 />
@@ -316,10 +316,12 @@ struct SameSpacePolicy;
 impl PolicyHook for SameSpacePolicy {
     async fn evaluate(&self, ctx: &AuthzCheckContext) -> PolicyDecision {
         let callee_space = match &ctx.callee.kind {
-            PrincipalKind::Service { card_ref } | PrincipalKind::Agent { card_ref } => {
-                &card_ref.space
+            PrincipalKind::Service {
+                card_ref: Some(card_ref),
+                ..
             }
-            _ => return PolicyDecision::deny("callee is not a service or agent"),
+            | PrincipalKind::Agent { card_ref, .. } => &card_ref.space,
+            _ => return PolicyDecision::deny("callee is not a card-bound service or agent"),
         };
 
         if &ctx.request.target.space != callee_space {

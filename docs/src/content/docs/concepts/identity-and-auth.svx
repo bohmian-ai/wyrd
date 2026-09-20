@@ -1,6 +1,6 @@
 ---
 title: Identity and auth
-description: End-to-end map of how Wyrd scopes identity across tenants, users, services, agents, and workloads, and how the server verifies every request.
+description: End-to-end map of how Wyrd scopes identity across its platform and tenant planes and five principal kinds, and how the server verifies every request.
 pillar: wyrd
 group: Concepts
 order: 6
@@ -13,6 +13,11 @@ one credential: a Wyrd-signed access token in the `X-Wyrd-Access-Token` header.
 The server verifies it, resolves the caller's permissions, and decides what runs.
 There is no session cookie and no ambient identity. A client can hold a token, but
 only the server decides what it means.
+
+Identity spans two planes. The **platform plane** operates the deployment
+itself — creating tenants, recovering tenant administration — and its principals
+hold no tenant. The **tenant plane** holds everything inside one tenant. Neither
+plane's credential or token is accepted by the other.
 
 This page is the map. The three pages it links to hold the detail:
 
@@ -31,12 +36,14 @@ This page is the map. The three pages it links to hold the detail:
   ]}
   rows={[
     ['Tenant', 'Isolation boundary. Every principal, token, role, issuer, and binding belongs to exactly one tenant. Postgres row-level security enforces it.'],
-    ['Principal', 'The identity a token acts as. One of three kinds: User, Service, or Agent.'],
+    ['Principal', 'The identity a token acts as. One of five kinds: GlobalAdmin, TenantAdmin, User, Service, or Agent.'],
+    ['GlobalAdmin', 'Platform-plane administrator. Holds no tenant and operates tenant lifecycle and tenant-administration recovery; never implicitly authorized over a tenant\'s resources.'],
+    ['TenantAdmin', 'The tenant\'s headless root of trust, created during provisioning. Carries no card.'],
     ['User', 'A human, authenticated through OIDC. Identified by email; no card.'],
-    ['Service', 'A non-human principal bound to a ServiceCard. Authenticates with an API key or a workload assertion.'],
-    ['Agent', 'A non-human principal bound to an AgentCard. Same auth paths as a Service.'],
+    ['Service', 'A non-human principal that may be bound to a ServiceCard. Authenticates with an API key or a workload assertion.'],
+    ['Agent', 'A non-human principal, always bound to an AgentCard. Same auth paths as a Service.'],
     ['Access token', 'Short-lived EdDSA JWT sent on every request. Carries the principal, tenant, and role claims.'],
-    ['Refresh token', 'Single-use, rotated token that mints a new access token. Issued only for human login and API-key exchange.'],
+    ['Refresh token', 'Single-use, rotated token that mints a new access token. Issued only for human OIDC login; a machine re-exchanges its durable credential instead.'],
     ['Delegated token', 'Access token minted on behalf of another Service/Agent, carrying an act chain. No refresh token.'],
     ['act chain', 'RFC 8693 delegation record embedded in a token: the ordered list of principals that delegated down to the callee.'],
     ['Trusted issuer', 'An external OIDC issuer whose JWTs Wyrd will verify, scoped to one tenant.'],
@@ -86,7 +93,7 @@ Human login is the exception: it starts at `GET /auth/login` and finishes with t
   title="/auth/token grant dispatch"
   steps={[
     { label: 'POST /auth/token', sub: 'match TokenRequest' },
-    { label: 'wyrd_api_key', sub: 'API key → access + refresh' },
+    { label: 'wyrd_api_key', sub: 'API key → access only' },
     { label: 'jwt-bearer', sub: 'workload assertion → access only' },
     { label: 'authorization_code', sub: 'OIDC callback → access + refresh' },
     { label: 'refresh_token', sub: 'rotate → access + refresh' },
@@ -99,7 +106,9 @@ Who uses which grant:
 - **Humans** log in through OIDC (`authorization_code`) and receive **User**
   tokens.
 - **Services and Agents** authenticate with an API key (`wyrd_api_key`) or a
-  workload assertion (`jwt-bearer`).
+  workload assertion (`jwt-bearer`). Neither grant returns a refresh token: a
+  machine renews by re-exchanging the durable credential it already holds, so
+  revoking that credential ends its renewal.
 - **Delegation** (`token-exchange`) lets a caller mint a scoped token for
   another Service/Agent. It is gated behind preview auth and never issues a
   refresh token. See [Authorization](/concepts/authorization/#delegation).

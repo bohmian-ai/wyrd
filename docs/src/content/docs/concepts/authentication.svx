@@ -1,6 +1,6 @@
 ---
 title: Authentication
-description: How Wyrd tokens work and how humans, API-key principals, and machine workloads each obtain one.
+description: How Wyrd tokens work, how humans, API-key principals, and machine workloads each obtain one, and how each renews — human refresh rotation or machine re-exchange.
 pillar: wyrd
 group: Concepts
 order: 7
@@ -19,26 +19,34 @@ page covers how each caller obtains a token.
 
 ## Token and principal model
 
-Every token is bound to a **principal**, the identity that performed the exchange.
-Three kinds exist:
+Every token is bound to a **principal**, the identity that performed the
+exchange. Five kinds exist, across two planes:
 
 <DataTable
   columns={[
     { header: 'Kind', role: 'name' },
+    { header: 'Plane' },
     { header: 'Identity source' },
     { header: 'Card kind' }
   ]}
   rows={[
-    ['User', 'Human OIDC login via an external IdP', 'None (email-based)'],
-    ['Service', 'API key or workload jwt-bearer, bound to a ServiceCard', 'service'],
-    ['Agent', 'API key or workload jwt-bearer, bound to an AgentCard', 'agent']
+    ['GlobalAdmin', 'Platform', 'Platform credential issued at deployment initialization', 'None'],
+    ['TenantAdmin', 'Tenant', 'Credential printed once when the tenant is created', 'None'],
+    ['User', 'Either', 'Human OIDC login via an external IdP', 'None (email-based)'],
+    ['Service', 'Tenant', 'API key or workload jwt-bearer; optionally bound to a ServiceCard', 'service (optional)'],
+    ['Agent', 'Tenant', 'API key or workload jwt-bearer, bound to an AgentCard', 'agent (required)']
   ]}
 />
 
-Access tokens are short-lived. Refresh tokens are issued alongside for grants
-that support rotation (human login, API-key exchange). Workload grants issue
-access only, with no refresh, because the workload can always re-assert its
-identity.
+Neither plane's credential or token is accepted by the other: a platform
+administrator operates tenant lifecycle and tenant-administration recovery, and
+is never implicitly authorized over a tenant's resources.
+
+Access tokens are short-lived, and how a caller renews one splits along the same
+line as identity. A **human** OIDC login receives a rotating refresh token. A
+**machine** — API key or workload assertion — receives access only and renews by
+re-exchanging the durable credential it already holds, so that credential is the
+single thing to revoke to end its access.
 
 ## Grant types
 
@@ -49,11 +57,11 @@ identity.
     { header: 'Issues refresh?' }
   ]}
   rows={[
-    ['wyrd_api_key', 'POST /auth/token', 'Yes'],
-    ['jwt-bearer (workload)', 'POST /auth/token', 'No'],
+    ['wyrd_api_key', 'POST /auth/token', 'No — re-exchange the key'],
+    ['jwt-bearer (workload)', 'POST /auth/token', 'No — re-assert the platform JWT'],
     ['authorization_code (OIDC)', 'POST /auth/token', 'Yes'],
     ['token-exchange (delegation)', 'POST /auth/token', 'No'],
-    ['refresh_token', 'POST /auth/token', 'Yes (rotated)']
+    ['refresh_token', 'POST /auth/token', 'Yes (rotated) · human sessions only']
   ]}
 />
 
@@ -115,7 +123,7 @@ hash.
     { from: 'Wyrd server', to: 'Client', label: 'plaintext key (shown once)', dashed: true },
     { from: 'Client', to: 'Wyrd server', label: 'POST /auth/token · wyrd_api_key' },
     { from: 'Wyrd server', to: 'Wyrd server', label: 'verify hash · tenant · active · resolve roles' },
-    { from: 'Wyrd server', to: 'Client', label: 'access + refresh', dashed: true }
+    { from: 'Wyrd server', to: 'Client', label: 'access only · re-exchange to renew', dashed: true }
   ]}
 />
 
@@ -126,7 +134,9 @@ hash.
    raw key.
 3. Server parses the tenant prefix, verifies the Argon2 hash, checks the
    principal is active and scoped to the request tenant, resolves roles.
-4. Server issues **access + refresh** tokens.
+4. Server issues an **access token only**. The key itself is the renewable
+   authority: the client repeats this exchange when its access token expires or
+   is refused, and no refresh token or row is created.
 
 ## Workload jwt-bearer flow
 
@@ -161,12 +171,19 @@ carries only the assertion.
 6. Server loads the Service/Agent principal for that `CardRef` and its roles.
 7. Server issues access only, with no refresh token.
 
-## Token refresh
+## Renewing a token
 
-Refresh tokens are single-use and rotated on each use. Send
-`grant_type: refresh_token` to `POST /auth/token` with the current refresh
-token. The server issues a new access + refresh pair and invalidates the
-presented token.
+A **human session** rotates. Refresh tokens are single-use and rotated on each
+use: send `grant_type: refresh_token` to `POST /auth/token` with the current
+refresh token, and the server issues a new access + refresh pair and invalidates
+the presented one. Replaying a consumed token revokes the whole family. Only a
+`User` principal may rotate; a refresh row presented for any other kind is
+refused.
+
+A **machine** re-exchanges. There is no refresh token to rotate, so an API-key or
+workload client repeats its original grant against `POST /auth/token` — the
+first-party clients do this on expiry and once more if the server refuses a
+request — and revoking the key or the workload binding ends renewal immediately.
 
 <Aside title="Limitations">
 
@@ -174,8 +191,10 @@ presented token.
 implemented. The callback flow uses `client_secret` (basic or post) or PKCE
 only. `PrivateKeyJwt` support is planned.
 
-Workload grants do not issue refresh tokens. That is intentional: workloads
-re-assert via their platform credential.
+Machine grants do not issue refresh tokens. That is intentional: a workload
+re-asserts via its platform credential and an API-key client re-exchanges its
+key, so renewal authority is the durable credential an operator already
+controls.
 
 </Aside>
 

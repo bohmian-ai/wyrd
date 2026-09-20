@@ -3855,3 +3855,104 @@ async fn a_tenant_administrator_refreshes_and_cannot_replay() {
         replayed.status()
     );
 }
+
+/// A trailing-slash issuer configures, preregisters, and still pins on first
+/// login.
+///
+/// `https://idp.example/` and `https://idp.example` are the same issuer, and
+/// `IssuerUrl` says so by trimming the slash. Configuration used to store the
+/// request text verbatim while login reparsed the row and searched with the
+/// normalized form, so a provider whose URL an operator typed with a trailing
+/// slash preregistered an administrator that first login could never find. The
+/// pin is a one-way transition, so that failure is permanent for that claim.
+///
+/// # Panics
+///
+/// Panics when configuration, registration, or the first-login pin does not
+/// behave as an operator following the documented path would require.
+#[tokio::test]
+async fn a_trailing_slash_platform_issuer_completes_first_login() {
+    if !e2e_enabled() {
+        return;
+    }
+    let srv = WyrdTestServer::start_in_process()
+        .await
+        .expect("server starts");
+    let root = initialize_platform_root(&srv.operator_pool())
+        .await
+        .expect("deployment initializes");
+    let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
+    let provider = wyrd_testing::DiscoveryFixture::start().await;
+    let canonical = provider.issuer();
+    let typed = format!("{canonical}/");
+
+    let resp = srv
+        .oneshot(platform_request(
+            Method::PUT,
+            "/platform/oidc/connection",
+            &session,
+            Some(json!({
+                "issuer_url": typed,
+                "expected_audience": "wyrd-platform",
+                "client_id": "wyrd-platform",
+                "client_auth": { "method": "public" },
+            })),
+        ))
+        .await
+        .expect("configure route responds");
+    let status = resp.status();
+    let view = body_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "connection configures: {view}");
+    assert_eq!(
+        view["issuer_url"], canonical,
+        "the connection reports the canonical issuer, not the request text"
+    );
+
+    let resp = srv
+        .oneshot(platform_request(
+            Method::POST,
+            "/platform/admins",
+            &session,
+            Some(json!({ "name": "ops-lead", "match_claim": "ops@example.com" })),
+        ))
+        .await
+        .expect("register route responds");
+    let status = resp.status();
+    let registered = body_json(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "administrator registers: {registered}"
+    );
+
+    // What login actually searches with: the stored row, reparsed by the same
+    // resolver the served login path uses.
+    let pool = srv.operator_pool();
+    let row = wyrd_sql::queries::platform::identity::platform_oidc_connection(&pool)
+        .await
+        .expect("connection reads")
+        .expect("a connection was configured");
+    let connection = wyrd_auth::pg_resolvers::platform_connection_from_row(row, None)
+        .expect("the stored connection decodes");
+    let searched = connection.verification.issuer.as_str();
+    assert_eq!(
+        searched, canonical,
+        "login searches with the canonical issuer"
+    );
+
+    // First login: the real one-time pin, against the registration that was
+    // just written. `None` here is the defect this test exists for.
+    let pinned = wyrd_sql::queries::platform::identity::pin_platform_identity(
+        &pool,
+        searched,
+        "ops@example.com",
+        "provider-subject-1",
+    )
+    .await
+    .expect("the pin runs");
+    assert_eq!(
+        pinned.map(|id| id.to_string()).as_deref(),
+        registered["principal_id"].as_str(),
+        "first login pins the preregistered administrator"
+    );
+}

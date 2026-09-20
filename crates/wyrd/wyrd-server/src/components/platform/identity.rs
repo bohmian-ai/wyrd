@@ -203,7 +203,7 @@ async fn configure_connection(
     // the anonymous login route drives outbound fetches to whatever is stored.
     // The parser's message names the URL library, so the caller is told which
     // field to correct and nothing about what parsed it.
-    let issuer = IssuerUrl::new(request.issuer_url.clone()).map_err(|error| {
+    let issuer = IssuerUrl::new(request.issuer_url).map_err(|error| {
         tracing::warn!(cause = %error, "platform issuer URL rejected");
         WyrdErrorResponse::from(WyrdError::Validation {
             message: "issuer is not a valid issuer URL".to_owned(),
@@ -226,9 +226,13 @@ async fn configure_connection(
             })
         })?;
 
+    // The parsed issuer, not the request text, is what gets stored: login
+    // reparses the stored row into an `IssuerUrl` and pins the identity by that
+    // normalized string, so persisting `https://idp.example/` verbatim while
+    // searching for `https://idp.example` would make first login impossible.
     upsert_platform_oidc_connection(
         &mut decision,
-        &request.issuer_url,
+        issuer.as_str(),
         jwks_uri.as_str(),
         &request.expected_audience,
         &request.client_id,
@@ -242,7 +246,7 @@ async fn configure_connection(
     commit_decision(decision).await?;
 
     Ok(Json(PlatformOidcConnectionView {
-        issuer_url: request.issuer_url,
+        issuer_url: issuer.as_str().to_owned(),
         jwks_uri: jwks_uri.to_string(),
         expected_audience: request.expected_audience,
         client_id: request.client_id,

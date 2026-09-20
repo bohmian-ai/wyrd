@@ -693,13 +693,28 @@ mod pg_tests {
     //! transaction. Both halves are schema behavior, so they are proven against
     //! real Postgres rather than a stand-in.
 
-    use chrono::Utc;
+    use chrono::{DateTime, Utc};
     use uuid::Uuid;
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_sql::queries::auth::{
         advance_user_epoch_to_second, insert_role, insert_user, replace_user_roles,
         user_revocation_epoch,
     };
+
+    /// Read the store's own clock.
+    ///
+    /// The epoch is written by Postgres, so bounding it against the test
+    /// process's clock would measure the skew between the host and the database
+    /// rather than the behavior under test.
+    async fn store_now(fixture: &PgFixture) -> DateTime<Utc> {
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let (now,): (DateTime<Utc>,) = sqlx::query_as("SELECT now()")
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect("the store reports its clock");
+        conn.commit().await.expect("clock read commits");
+        now
+    }
 
     /// Seed a user and two assignable roles, returning the user's id.
     async fn seed_user_with_roles(fixture: &PgFixture) -> Uuid {
@@ -740,7 +755,7 @@ mod pg_tests {
     async fn a_withdrawn_role_reports_a_change_and_advances_the_epoch() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let user_id = seed_user_with_roles(&fixture).await;
-        let before = Utc::now();
+        let before = store_now(&fixture).await;
 
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let changed = replace_user_roles(&mut conn, user_id, &["writer"])
@@ -758,7 +773,7 @@ mod pg_tests {
             .expect("epoch lookup runs")
             .expect("a changed login leaves an epoch");
         assert!(
-            epoch <= Utc::now(),
+            epoch <= store_now(&fixture).await,
             "the epoch never lands in the future: {epoch}"
         );
         assert!(

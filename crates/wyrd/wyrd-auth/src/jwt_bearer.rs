@@ -22,8 +22,7 @@ use wyrd_sql::queries::auth::{
 use wyrd_sql::{TenantConn, WyrdPostgres};
 
 use crate::audit::{
-    TOKEN_EXCHANGE_OPERATION, append_auth_audit, auth_event, auth_failure_code, principal_kind_tag,
-    record_auth_audit_best_effort,
+    TOKEN_EXCHANGE_OPERATION, auth_event, auth_failure_code, record_auth_audit_best_effort,
 };
 use crate::card_scope::MINT_KIND_JWT_BEARER;
 use crate::error::auth_error_to_wyrd;
@@ -191,22 +190,9 @@ async fn issue_and_audit(
     )
     .await
     .map_err(|error| workload_exchange_error(ExchangeError::from(error)))?;
-    let workload = PrincipalId::new(row.id);
-    let event = auth_event(
-        request_id,
-        TOKEN_EXCHANGE_OPERATION,
-        workload,
-        principal_kind_tag(&row.principal_kind),
-        row.card_ref.clone().map(|card_ref| card_ref.0),
-        AuditOutcome::Allowed,
-        AuditDetail::TokenExchange {
-            subject_principal_id: workload,
-            actor_principal_id: workload,
-            delegation_chain: Vec::new(),
-            expires_at: exchanged.expires_at,
-        },
-    );
-    append_auth_audit(conn, &event).await?;
+    // `issue_for_subject` commits the one canonical grant record for every
+    // tenant exchange, this one included, so appending a second here would
+    // double-count the same grant.
     Ok(exchanged)
 }
 

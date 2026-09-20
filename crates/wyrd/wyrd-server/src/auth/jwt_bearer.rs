@@ -559,8 +559,8 @@ mod pg_tests {
 
         assert_eq!(exchanged.token_type, TokenType::Bearer);
         assert!(
-            exchanged.refresh_token.is_some(),
-            "api-key exchange must still issue a refresh token"
+            exchanged.refresh_token.is_none(),
+            "a machine re-exchanges its durable credential instead of holding a refresh token"
         );
     }
 

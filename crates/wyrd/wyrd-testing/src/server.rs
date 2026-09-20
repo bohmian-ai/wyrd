@@ -2195,15 +2195,32 @@ impl WyrdTestServer {
     /// rather than in each suite so an SDK journey does not have to depend on
     /// the server crate to reach one server-owned initialization step.
     ///
+    /// The credential is read back out of the disclosure the operation writes,
+    /// because that disclosure is the only place it exists — exactly as it is
+    /// for an operator reading their terminal.
+    ///
     /// # Errors
-    /// Returns an error when the deployment is already initialized or the
-    /// platform store write fails.
+    /// Returns an error when the deployment is already initialized, the
+    /// platform store write fails, or the disclosure does not name a
+    /// credential.
     pub async fn initialize_platform_root(
         &self,
     ) -> Result<secrecy::SecretString, WyrdTestServerError> {
-        wyrd_server::boot::init::initialize_platform_root(&self.operator_pool())
+        let mut disclosure = Vec::new();
+        wyrd_server::boot::init::initialize_platform_root(&self.operator_pool(), &mut disclosure)
             .await
-            .map_err(|error| WyrdTestServerError::Io(error.to_string()))
+            .map_err(|error| WyrdTestServerError::Io(error.to_string()))?;
+        let disclosed = String::from_utf8(disclosure)
+            .map_err(|error| WyrdTestServerError::Io(error.to_string()))?;
+        disclosed
+            .lines()
+            .find(|line| line.starts_with("wyrd_global_"))
+            .map(|line| secrecy::SecretString::from(line.to_owned()))
+            .ok_or_else(|| {
+                WyrdTestServerError::Io(
+                    "initialization disclosed no platform credential".to_owned(),
+                )
+            })
     }
 
     /// Mint the session a registered administrator gets after federated login.

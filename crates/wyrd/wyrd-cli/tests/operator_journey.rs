@@ -11,7 +11,6 @@
 use secrecy::ExposeSecret as _;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-use wyrd_server::boot::init::initialize_platform_root;
 
 use crate::principal_journey::{
     run_cli_async_with_credential, start_served, stop_served, v1_status,
@@ -78,7 +77,8 @@ async fn operator_administers_a_deployment_through_the_cli() {
     }
 
     let (server, base_url, shutdown, serve_handle) = start_served("operator workflow").await;
-    let root = initialize_platform_root(&server.operator_pool())
+    let root = server
+        .initialize_platform_root()
         .await
         .expect("deployment initializes");
     let platform = root.expose_secret().to_owned();

@@ -72,24 +72,23 @@ async fn main() {
 /// would mean an operator could not establish the administrative root until the
 /// whole serving surface was already configured.
 ///
-/// The plaintext is printed once to this process's stdout, which is the
-/// operator's terminal rather than the server's log pipeline.
+/// The plaintext is written once to this process's stdout, which is the
+/// operator's terminal rather than the server's log pipeline. Initialization
+/// owns that write: it happens inside the transaction, so a terminal that
+/// cannot take the secret leaves the deployment uninitialized rather than
+/// durable and unadministrable.
 ///
 /// # Errors
 /// Returns [`BootExit::Config`] when the platform-admin DSN is missing or the
 /// operator pool cannot be opened, and [`BootExit::Other`] when establishing
 /// the root fails — including a deployment that is already initialized,
-/// credential hashing, and any Postgres write or commit failure.
+/// credential hashing, a stdout write or flush failure, and any Postgres write
+/// or commit failure.
 async fn init() -> Result<(), BootExit> {
     let pool = operator_pool().await?;
-    let credential = initialize_platform_root(&pool)
+    initialize_platform_root(&pool, &mut std::io::stdout().lock())
         .await
         .map_err(|e| BootExit::Other(Box::new(e)))?;
-
-    println!("Wyrd initialization complete.");
-    println!("Platform administrative credential:");
-    println!("{}", credential.expose_secret());
-    println!("Store this credential securely. It cannot be retrieved again.");
     Ok(())
 }
 

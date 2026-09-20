@@ -10,7 +10,7 @@
 //! instead of the server's log pipeline. Server start creates no administrative
 //! state and emits no credential material under any deployment profile.
 
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use uuid::Uuid;
 use wyrd_auth::platform_credentials::{PlatformCredential, PlatformCredentialError};
 use wyrd_auth_issue::hash_api_key;
@@ -42,6 +42,9 @@ pub enum InitError {
     /// A platform store write failed.
     #[error("platform store write failed: {0}")]
     Store(#[from] SqlError),
+    /// The credential could not be disclosed to the operator.
+    #[error("initial credential could not be disclosed: {0}")]
+    Disclose(#[from] std::io::Error),
 }
 
 /// The fixed authority every platform administrator holds.
@@ -74,11 +77,21 @@ pub(crate) fn platform_administrator_grant() -> PermissionSet {
     grant
 }
 
-/// Establish the deployment's administrative root and return its credential.
+/// Establish the deployment's administrative root, disclosing its credential.
 ///
 /// Creates the platform principal, grants it the platform-plane authority
-/// above, and issues its first credential, returning the plaintext for a single
-/// print. The plaintext is never persisted, logged, or traced.
+/// above, issues its first credential, and writes the plaintext to
+/// `disclosure` exactly once. The plaintext is never persisted, logged,
+/// traced, or returned.
+///
+/// Disclosure is a step of the transaction, not something the caller does
+/// afterwards. The write and its flush both happen while the transaction is
+/// still open, so a closed or failing writer drops the transaction and leaves
+/// the deployment uninitialized and retryable instead of leaving a durable
+/// root whose only credential nobody ever read. The reverse ordering is not
+/// attainable across two systems: a commit that fails after a successful
+/// disclosure leaves the operator holding a secret that was never stored,
+/// which costs them one retry rather than the deployment.
 ///
 /// All three writes commit together. That is not tidiness: the principal's name
 /// is unique, so a partial initialization would leave a root with no credential
@@ -94,10 +107,14 @@ pub(crate) fn platform_administrator_grant() -> PermissionSet {
 /// # Errors
 /// Returns [`InitError::AlreadyInitialized`] when a root already exists,
 /// [`InitError::Credential`] when the credential cannot be generated or hashed,
+/// [`InitError::Disclose`] when the credential cannot be written or flushed,
 /// and [`InitError::Store`] when a write or the commit fails. A failed
 /// initialization commits nothing and can be retried unchanged.
-#[tracing::instrument(level = "info", skip(pool), err)]
-pub async fn initialize_platform_root(pool: &OperatorPool) -> Result<SecretString, InitError> {
+#[tracing::instrument(level = "info", skip(pool, disclosure), err)]
+pub async fn initialize_platform_root(
+    pool: &OperatorPool,
+    disclosure: &mut dyn std::io::Write,
+) -> Result<(), InitError> {
     let principal_id = Uuid::now_v7();
     let credential = PlatformCredential::generate();
     let raw = credential.secret.clone();
@@ -142,8 +159,39 @@ pub async fn initialize_platform_root(pool: &OperatorPool) -> Result<SecretStrin
     )
     .await?;
 
+    match disclose_credential(disclosure, &credential.secret) {
+        Ok(()) => {}
+        Err(error) => {
+            drop(conn);
+            return Err(InitError::Disclose(error));
+        }
+    }
+
     conn.commit().await?;
-    Ok(credential.secret)
+    Ok(())
+}
+
+/// Write the one disclosure of a freshly minted root credential and flush it.
+///
+/// Separate from the workflow above so the ordering it protects is legible:
+/// every byte, including the flush that proves the operator's terminal
+/// actually took them, must succeed before the transaction may commit.
+///
+/// # Errors
+/// Returns the underlying [`std::io::Error`] when any write or the flush
+/// fails.
+fn disclose_credential(
+    disclosure: &mut dyn std::io::Write,
+    secret: &SecretString,
+) -> std::io::Result<()> {
+    writeln!(disclosure, "Wyrd initialization complete.")?;
+    writeln!(disclosure, "Platform administrative credential:")?;
+    writeln!(disclosure, "{}", secret.expose_secret())?;
+    writeln!(
+        disclosure,
+        "Store this credential securely. It cannot be retrieved again."
+    )?;
+    disclosure.flush()
 }
 
 /// Failure while reissuing the administrative root's credential.

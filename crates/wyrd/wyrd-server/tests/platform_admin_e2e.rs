@@ -17,7 +17,7 @@ use chrono::{DateTime, Utc};
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, Response, StatusCode, header};
 use serde_json::{Value, json};
-use wyrd_server::boot::init::{InitError, initialize_platform_root};
+use wyrd_server::boot::init::InitError;
 use wyrd_testing::WyrdTestServer;
 
 /// The one header every Wyrd plane authenticates on.
@@ -29,6 +29,30 @@ const WYRD_ACCESS_TOKEN_HEADER: &str = "x-wyrd-access-token";
 /// Skip unless the gated end-to-end lane is selected.
 fn e2e_enabled() -> bool {
     env::var("WYRD_AUTH_E2E").is_ok()
+}
+
+/// Establish the deployment's root and hand back the credential it disclosed.
+///
+/// Initialization writes the plaintext to a caller-supplied sink and returns
+/// nothing, because the disclosure is the only place the secret exists. This
+/// reads it back out of an in-memory sink the way an operator reads it off a
+/// terminal, so every journey below stays a journey rather than a plumbing
+/// exercise.
+///
+/// # Panics
+/// Panics when initialization succeeded but disclosed no credential line.
+async fn initialize_platform_root(
+    srv: &WyrdTestServer,
+) -> Result<secrecy::SecretString, InitError> {
+    let mut disclosure = Vec::new();
+    wyrd_server::boot::init::initialize_platform_root(&srv.operator_pool(), &mut disclosure)
+        .await?;
+    let disclosed = String::from_utf8(disclosure).expect("the disclosure is UTF-8");
+    let line = disclosed
+        .lines()
+        .find(|line| line.starts_with("wyrd_global_"))
+        .expect("initialization discloses the credential it minted");
+    Ok(secrecy::SecretString::from(line.to_owned()))
 }
 
 /// Decode a JSON response body.
@@ -95,7 +119,7 @@ async fn operator_provisions_a_usable_tenant_without_touching_the_database() {
         .expect("server starts");
 
     // 1. Initialization is the one step that runs against the database.
-    let root = initialize_platform_root(&srv.operator_pool())
+    let root = initialize_platform_root(&srv)
         .await
         .expect("deployment initializes");
     let root_credential = secrecy::ExposeSecret::expose_secret(&root).to_owned();
@@ -157,11 +181,11 @@ async fn initialization_happens_at_most_once() {
         .await
         .expect("server starts");
 
-    initialize_platform_root(&srv.operator_pool())
+    initialize_platform_root(&srv)
         .await
         .expect("first initialization succeeds");
 
-    let second = initialize_platform_root(&srv.operator_pool()).await;
+    let second = initialize_platform_root(&srv).await;
 
     assert!(
         matches!(second, Err(InitError::AlreadyInitialized)),
@@ -466,7 +490,7 @@ async fn the_two_control_planes_cannot_reach_each_other() {
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
-    let root = initialize_platform_root(&srv.operator_pool())
+    let root = initialize_platform_root(&srv)
         .await
         .expect("deployment initializes");
     let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
@@ -557,7 +581,7 @@ async fn revoking_a_platform_credential_ends_its_live_sessions() {
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
-    let root = initialize_platform_root(&srv.operator_pool())
+    let root = initialize_platform_root(&srv)
         .await
         .expect("deployment initializes");
     let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
@@ -612,7 +636,7 @@ async fn tenant_administration_survives_losing_every_credential() {
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
-    let root = initialize_platform_root(&srv.operator_pool())
+    let root = initialize_platform_root(&srv)
         .await
         .expect("deployment initializes");
     let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
@@ -700,7 +724,7 @@ async fn tenant_token(srv: &WyrdTestServer, credential: &str) -> Result<String, 
 
 /// Provision a tenant and return its administrator's access token.
 async fn provisioned_tenant_admin(srv: &WyrdTestServer, slug: &str) -> String {
-    let root = initialize_platform_root(&srv.operator_pool())
+    let root = initialize_platform_root(&srv)
         .await
         .expect("deployment initializes");
     let session = platform_session(srv, secrecy::ExposeSecret::expose_secret(&root)).await;
@@ -1172,7 +1196,7 @@ async fn an_operator_configures_and_removes_federated_platform_sign_in() {
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
-    let root = initialize_platform_root(&srv.operator_pool())
+    let root = initialize_platform_root(&srv)
         .await
         .expect("deployment initializes");
     let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
@@ -1477,7 +1501,7 @@ async fn a_connection_cannot_name_an_unresolvable_issuer() {
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
-    let root = initialize_platform_root(&srv.operator_pool())
+    let root = initialize_platform_root(&srv)
         .await
         .expect("deployment initializes");
     let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
@@ -1532,7 +1556,7 @@ async fn an_operator_lists_and_suspends_platform_administrators() {
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
-    let root = initialize_platform_root(&srv.operator_pool())
+    let root = initialize_platform_root(&srv)
         .await
         .expect("deployment initializes");
     let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
@@ -1634,7 +1658,7 @@ async fn the_last_active_platform_principal_cannot_be_suspended() {
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
-    let root = initialize_platform_root(&srv.operator_pool())
+    let root = initialize_platform_root(&srv)
         .await
         .expect("deployment initializes");
     let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
@@ -1706,7 +1730,7 @@ async fn a_suspended_tenant_admits_no_credential() {
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
-    let root = initialize_platform_root(&srv.operator_pool())
+    let root = initialize_platform_root(&srv)
         .await
         .expect("deployment initializes");
     let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
@@ -1771,7 +1795,7 @@ async fn a_failed_provisioning_can_be_retried_with_the_same_slug() {
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
-    let root = initialize_platform_root(&srv.operator_pool())
+    let root = initialize_platform_root(&srv)
         .await
         .expect("deployment initializes");
     let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
@@ -1910,7 +1934,7 @@ async fn an_active_tenant_slug_is_still_refused() {
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
-    let root = initialize_platform_root(&srv.operator_pool())
+    let root = initialize_platform_root(&srv)
         .await
         .expect("deployment initializes");
     let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
@@ -1984,7 +2008,7 @@ async fn served_platform_failures_disclose_nothing_internal() {
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
-    let root = initialize_platform_root(&srv.operator_pool())
+    let root = initialize_platform_root(&srv)
         .await
         .expect("deployment initializes");
     let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
@@ -2155,7 +2179,7 @@ async fn an_operator_rotates_the_deployment_root_credential() {
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
-    let root = initialize_platform_root(&srv.operator_pool())
+    let root = initialize_platform_root(&srv)
         .await
         .expect("deployment initializes");
     let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
@@ -2475,7 +2499,7 @@ async fn recovery_is_refused_for_every_state_but_active() {
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
-    let root = initialize_platform_root(&srv.operator_pool())
+    let root = initialize_platform_root(&srv)
         .await
         .expect("deployment initializes");
     let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
@@ -2628,7 +2652,7 @@ async fn one_tenant_cannot_reach_another_tenants_identities() {
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
-    let root = initialize_platform_root(&srv.operator_pool())
+    let root = initialize_platform_root(&srv)
         .await
         .expect("deployment initializes");
     let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
@@ -2814,7 +2838,7 @@ async fn an_operator_suspends_and_resumes_a_tenant_through_the_platform_plane() 
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
-    let root = initialize_platform_root(&srv.operator_pool())
+    let root = initialize_platform_root(&srv)
         .await
         .expect("deployment initializes");
     let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
@@ -3020,7 +3044,7 @@ async fn interrupted_and_racing_provisioning_converge_on_one_tenant() {
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
-    let root = initialize_platform_root(&srv.operator_pool())
+    let root = initialize_platform_root(&srv)
         .await
         .expect("deployment initializes");
     let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
@@ -3233,7 +3257,7 @@ async fn initialization_has_exactly_one_winner_under_concurrency() {
         .expect("server starts");
 
     let attempts = futures_util::future::join_all(
-        (0..8).map(|_| async { initialize_platform_root(&srv.operator_pool()).await }),
+        (0..8).map(|_| async { initialize_platform_root(&srv).await }),
     )
     .await;
 
@@ -3254,6 +3278,82 @@ async fn initialization_has_exactly_one_winner_under_concurrency() {
     .await
     .expect("platform principals are counted");
     assert_eq!(roots, 1, "the deployment has one administrative root");
+}
+
+/// A terminal that cannot take the credential leaves the deployment
+/// uninitialized, and the identical retry then succeeds once.
+///
+/// This is the cross-system ordering initialization exists to get right. The
+/// root's name is unique, so a commit that outran a failed disclosure would
+/// leave a durable root whose only credential nobody ever read and which no
+/// later attempt could replace — the deployment would be permanently
+/// unadministrable.
+#[tokio::test]
+async fn a_terminal_that_cannot_take_the_credential_leaves_nothing_behind() {
+    if !e2e_enabled() {
+        return;
+    }
+    let srv = WyrdTestServer::start_in_process()
+        .await
+        .expect("server starts");
+
+    /// A closed terminal: every write it is offered fails.
+    struct ClosedTerminal;
+
+    impl std::io::Write for ClosedTerminal {
+        /// Refuses the bytes the way a closed pipe does.
+        ///
+        /// # Errors
+        /// Always returns [`std::io::ErrorKind::BrokenPipe`].
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+
+        /// Nothing was ever buffered, so there is nothing to flush.
+        ///
+        /// # Errors
+        /// Never returns an error.
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let refused = wyrd_server::boot::init::initialize_platform_root(
+        &srv.operator_pool(),
+        &mut ClosedTerminal,
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(InitError::Disclose(_))),
+        "an undisclosable credential is refused as a disclosure failure, got: {refused:?}"
+    );
+
+    for (count_sql, what) in [
+        ("SELECT count(*) FROM platform.principals", "root"),
+        ("SELECT count(*) FROM platform.principal_grants", "grant"),
+        ("SELECT count(*) FROM platform.credentials", "credential"),
+    ] {
+        let rows: i64 = sqlx::query_scalar(count_sql)
+            .fetch_one(srv.operator_pool().pool())
+            .await
+            .expect("platform rows are counted");
+        assert_eq!(
+            rows, 0,
+            "an undisclosed initialization leaves no {what} behind"
+        );
+    }
+
+    // The identical invocation now succeeds, which is what "retryable" means.
+    let root = initialize_platform_root(&srv)
+        .await
+        .expect("the retry initializes the deployment");
+    let _session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
+
+    let roots: i64 = sqlx::query_scalar("SELECT count(*) FROM platform.principals")
+        .fetch_one(srv.operator_pool().pool())
+        .await
+        .expect("platform principals are counted");
+    assert_eq!(roots, 1, "the retry establishes exactly one root");
 }
 
 /// A failure at any of initialization's three writes leaves nothing behind, and
@@ -3327,7 +3427,7 @@ async fn initialization_retries_cleanly_after_a_failure_at_each_write() {
                 .with_max_level(tracing::Level::TRACE)
                 .finish();
             let _guard = tracing::subscriber::set_default(subscriber);
-            initialize_platform_root(&srv.operator_pool()).await
+            initialize_platform_root(&srv).await
         };
         let error = failed.expect_err("the injected failure is surfaced");
         assert!(
@@ -3355,7 +3455,7 @@ async fn initialization_retries_cleanly_after_a_failure_at_each_write() {
     }
 
     // The identical invocation now succeeds, which is what "retryable" means.
-    let credential = initialize_platform_root(&srv.operator_pool())
+    let credential = initialize_platform_root(&srv)
         .await
         .expect("the retry initializes the deployment");
     let plaintext = secrecy::ExposeSecret::expose_secret(&credential);
@@ -3560,7 +3660,7 @@ async fn a_failed_platform_mutation_leaves_no_allowance() {
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
-    let root = initialize_platform_root(&srv.operator_pool())
+    let root = initialize_platform_root(&srv)
         .await
         .expect("deployment initializes");
     let secret = secrecy::ExposeSecret::expose_secret(&root).to_owned();
@@ -3781,7 +3881,7 @@ async fn a_tenant_administrator_renews_by_re_exchanging_its_credential() {
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
-    let root = initialize_platform_root(&srv.operator_pool())
+    let root = initialize_platform_root(&srv)
         .await
         .expect("deployment initializes");
     let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
@@ -3872,7 +3972,7 @@ async fn a_trailing_slash_platform_issuer_completes_first_login() {
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
-    let root = initialize_platform_root(&srv.operator_pool())
+    let root = initialize_platform_root(&srv)
         .await
         .expect("deployment initializes");
     let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;

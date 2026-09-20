@@ -451,6 +451,21 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> TokenVe
     }
 
     /// Verify a bearer token for the active tenant.
+    ///
+    /// A positive result is cached by token hash, but the cache is never the
+    /// last word on admission: both the cache-hit and the cache-miss path
+    /// re-read the principal's revocation epoch before returning. When that
+    /// read fails the deployment cannot say whether the principal is still
+    /// admitted, so the cached entry is dropped and the request is refused
+    /// rather than served on stale evidence.
+    ///
+    /// # Errors
+    /// Returns [`AuthError::BadTokenFormat`] for an oversized bearer,
+    /// [`AuthError::InvalidToken`] for an unknown key, a failed signature, or a
+    /// token belonging to another tenant, [`AuthError::TokenExpired`] for an
+    /// expired token, [`AuthError::Revoked`] when the token predates the
+    /// principal's revocation epoch, and [`AuthError::VerifyUnavailable`] when
+    /// the revocation store or permission resolver cannot be read.
     #[tracing::instrument(
         level = "debug",
         skip(self, token),
@@ -497,8 +512,10 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> TokenVe
                     Err(err) => {
                         tracing::warn!(
                             error = %err,
-                            "revocation resolver unavailable; failing open (token may be revoked)"
+                            "revocation resolver unavailable; refusing the cached token"
                         );
+                        self.cache.invalidate(&hash).await;
+                        return Err(AuthError::VerifyUnavailable);
                     }
                     _ => {}
                 }
@@ -537,8 +554,10 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> TokenVe
                 Err(err) => {
                     tracing::warn!(
                         error = %err,
-                        "revocation resolver unavailable; failing open (token may be revoked)"
+                        "revocation resolver unavailable; refusing the freshly verified token"
                     );
+                    self.cache.invalidate(&hash).await;
+                    return Err(AuthError::VerifyUnavailable);
                 }
                 _ => {}
             }
@@ -1117,7 +1136,7 @@ pub fn public_key_from_pem(pem: &[u8]) -> Result<DecodingKey, AuthError> {
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
     use chrono::{DateTime, Utc};
@@ -1624,10 +1643,17 @@ mod tests {
     // F11: principal-epoch revocation
     // -------------------------------------------------------------------------
 
+    /// Revocation stand-in whose answer and availability the test controls.
+    ///
+    /// `unavailable` is atomic so one test can cache a positive verify while the
+    /// store is healthy and then take the store down, which is the only way to
+    /// reach the cache-hit uncertainty branch.
     #[derive(Debug)]
     struct TestRevocation {
+        /// Epoch returned while the store is available.
         epoch: Option<DateTime<Utc>>,
-        unavailable: bool,
+        /// When set, every lookup reports [`ResolveError::Unavailable`].
+        unavailable: AtomicBool,
     }
 
     impl RevocationCheck for TestRevocation {
@@ -1643,7 +1669,7 @@ mod tests {
                     + 'a,
             >,
         > {
-            if self.unavailable {
+            if self.unavailable.load(Ordering::SeqCst) {
                 Box::pin(std::future::ready(Err(ResolveError::Unavailable(
                     "test outage".to_owned(),
                 ))))
@@ -1659,7 +1685,7 @@ mod tests {
     ) -> TokenVerifier<TestResolver, StubIssuerResolver> {
         let check = Arc::new(TestRevocation {
             epoch,
-            unavailable: false,
+            unavailable: AtomicBool::new(false),
         });
         verifier(resolver, WyrdAuthVerifySettings::default()).with_revocation(check)
     }
@@ -1706,14 +1732,54 @@ mod tests {
             .expect("token issued after epoch must pass");
     }
 
+    /// A fresh verify whose revocation store is down must refuse, not admit.
+    ///
+    /// This is the cache-miss branch: the signature and claims are good, but the
+    /// deployment cannot answer whether the principal is still admitted, so the
+    /// request gets the retryable unavailable refusal instead of a token.
+    ///
+    /// # Panics
+    /// Panics when the verifier returns anything other than
+    /// [`AuthError::VerifyUnavailable`].
     #[tokio::test]
-    async fn revocation_unavailable_fails_open_and_allows_token() {
+    async fn revocation_unavailable_refuses_a_fresh_verify() {
         let resolver = Arc::new(TestResolver::default());
         let check = Arc::new(TestRevocation {
             epoch: None,
-            unavailable: true,
+            unavailable: AtomicBool::new(true),
         });
         let verifier = verifier(resolver, WyrdAuthVerifySettings::default()).with_revocation(check);
+        let token = SecretString::from(encode_eddsa_with_kid(&claims_with_times(
+            now() + 3_600,
+            now() - 5,
+        )));
+
+        let err = verifier.verify(&token, &tenant_id()).await;
+        assert!(
+            matches!(err, Err(AuthError::VerifyUnavailable)),
+            "an unreadable revocation store must fail closed, got: {err:?}"
+        );
+    }
+
+    /// A cached positive verify must not outlive the revocation store.
+    ///
+    /// The first verify populates the cache while the store is healthy. Once the
+    /// store is down the cached entry is no longer evidence of admission, so the
+    /// second verify must refuse and drop the entry rather than serve the stale
+    /// permissions.
+    ///
+    /// # Panics
+    /// Panics when the warm-up verify fails or when the post-outage verify
+    /// returns anything other than [`AuthError::VerifyUnavailable`].
+    #[tokio::test]
+    async fn revocation_unavailable_refuses_a_cached_token() {
+        let resolver = Arc::new(TestResolver::default());
+        let check = Arc::new(TestRevocation {
+            epoch: None,
+            unavailable: AtomicBool::new(false),
+        });
+        let verifier = verifier(Arc::clone(&resolver), WyrdAuthVerifySettings::default())
+            .with_revocation(Arc::clone(&check) as Arc<dyn RevocationCheck>);
         let token = SecretString::from(encode_eddsa_with_kid(&claims_with_times(
             now() + 3_600,
             now() - 5,
@@ -1722,7 +1788,15 @@ mod tests {
         verifier
             .verify(&token, &tenant_id())
             .await
-            .expect("unavailable revocation resolver must fail open");
+            .expect("a healthy revocation store admits the token and caches it");
+
+        check.unavailable.store(true, Ordering::SeqCst);
+
+        let err = verifier.verify(&token, &tenant_id()).await;
+        assert!(
+            matches!(err, Err(AuthError::VerifyUnavailable)),
+            "a cached token must not survive an unreadable revocation store, got: {err:?}"
+        );
     }
 
     #[tokio::test]

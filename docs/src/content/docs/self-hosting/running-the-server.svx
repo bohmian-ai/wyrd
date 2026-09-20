@@ -8,7 +8,7 @@ order: 3
 
 # Running the server
 
-The server is a single binary, `wyrd-server`. Run it with no subcommand and it serves. One operator subcommand exists, `init`, for establishing the deployment's platform administrative root.
+The server is a single binary, `wyrd-server`. Run it with no subcommand and it serves. Two operator subcommands exist: `init`, which establishes the deployment's platform administrative root, and `recover-root`, which reissues a credential for that root when every platform credential is gone.
 
 ## Command line
 
@@ -22,6 +22,9 @@ wyrd-server --mode grpc
 
 # Establish this deployment's administrative root, then exit.
 wyrd-server init
+
+# Reissue a credential for the existing root, then exit.
+wyrd-server recover-root
 ```
 
 `--mode` overrides the `serve.mode` config field (`WYRD_SERVE_MODE`). Accepted values are `both`, `http`, and `grpc`. The default is `both`.
@@ -85,6 +88,18 @@ platform credential:
 
 ```bash
 export WYRD_ACCESS_TOKEN=<tenant access token>
+
+# Configure first: the issuer this tenant's workloads federate from. Wyrd
+# resolves the JWKS endpoint from the issuer's own discovery document.
+wyrd auth trusted-issuer add \
+  --issuer https://idp.example.com \
+  --expected-audience wyrd \
+  --client-id wyrd \
+  --client-auth Public \
+  --claim-subject sub \
+  --principal-kind Workload \
+  --default-role reader
+wyrd auth trusted-issuer list
 
 # A principal narrower than the tenant administrator.
 wyrd principal credential create-principal --name ci-runner --role reader

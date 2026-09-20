@@ -9,6 +9,8 @@
 //! operator following the page would.
 
 use secrecy::ExposeSecret as _;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_server::boot::init::initialize_platform_root;
 
 use crate::principal_journey::{
@@ -44,6 +46,28 @@ fn field(stdout: &str, key: &str) -> String {
         .unwrap_or_else(|| panic!("output carries {key}: {stdout}"))
         .trim()
         .to_owned()
+}
+
+/// Stand up an OIDC issuer the server can actually discover.
+///
+/// Tenant issuer configuration resolves the JWKS endpoint from the issuer's
+/// own discovery document, so the journey has to serve one rather than assert
+/// against a URL nothing answers.
+async fn discovery_server() -> (MockServer, String) {
+    let server = MockServer::start().await;
+    let issuer = server.uri();
+    Mock::given(method("GET"))
+        .and(path("/.well-known/openid-configuration"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "issuer": issuer,
+            "authorization_endpoint": format!("{issuer}/authorize"),
+            "token_endpoint": format!("{issuer}/token"),
+            "jwks_uri": format!("{issuer}/jwks"),
+            "id_token_signing_alg_values_supported": ["RS256", "EdDSA"],
+        })))
+        .mount(&server)
+        .await;
+    (server, issuer)
 }
 
 /// An operator administers a deployment end to end through the shipped binary.
@@ -94,11 +118,60 @@ async fn operator_administers_a_deployment_through_the_cli() {
     assert_eq!(field(&inspected, "status"), "active");
     assert_eq!(field(&inspected, "slug"), "cli-operator");
 
-    // 3. Inside the tenant: a principal narrower than its administrator.
+    // 3. Inside the tenant: configure the issuer its workloads federate from.
+    //
+    // This is the step that makes the tenant usable by anything other than the
+    // credential just printed, and it is the shipped command an operator runs
+    // to do it — not a SQL insert and not a server-side seed.
     let tenant_token = server
         .exchange_api_key(&secrecy::SecretString::from(tenant_credential))
         .await
         .expect("the tenant administrator's credential exchanges");
+    let (idp, issuer) = discovery_server().await;
+    let mut arguments = vec![
+        "auth".to_owned(),
+        "trusted-issuer".to_owned(),
+        "add".to_owned(),
+        "--issuer".to_owned(),
+        issuer.clone(),
+        "--expected-audience".to_owned(),
+        "wyrd-cli-operator".to_owned(),
+        "--client-id".to_owned(),
+        "wyrd".to_owned(),
+        "--client-auth".to_owned(),
+        "Public".to_owned(),
+        "--claim-subject".to_owned(),
+        "sub".to_owned(),
+        "--principal-kind".to_owned(),
+        "Workload".to_owned(),
+        "--default-role".to_owned(),
+        "reader".to_owned(),
+    ];
+    arguments.extend(endpoint());
+    let configured = succeeded(
+        "trusted issuer add",
+        &tenant_cli(arguments, tenant_token.clone()).await,
+    );
+    assert_eq!(field(&configured, "issuer"), issuer);
+    assert_eq!(field(&configured, "jwks_uri"), format!("{issuer}/jwks"));
+
+    let mut arguments = vec![
+        "auth".to_owned(),
+        "trusted-issuer".to_owned(),
+        "list".to_owned(),
+    ];
+    arguments.extend(endpoint());
+    let listed = succeeded(
+        "trusted issuer list",
+        &tenant_cli(arguments, tenant_token.clone()).await,
+    );
+    assert!(
+        listed.contains(&issuer),
+        "the configured issuer is readable back: {listed}"
+    );
+    drop(idp);
+
+    // 4. Inside the tenant: a principal narrower than its administrator.
     let mut arguments = vec![
         "principal".to_owned(),
         "credential".to_owned(),
@@ -125,7 +198,7 @@ async fn operator_administers_a_deployment_through_the_cli() {
         "the restricted principal works before rotation"
     );
 
-    // 4. Rotate with an overlap: issue, verify, then retire the old one.
+    // 5. Rotate with an overlap: issue, verify, then retire the old one.
     let mut arguments = vec![
         "principal".to_owned(),
         "credential".to_owned(),
@@ -182,7 +255,7 @@ async fn operator_administers_a_deployment_through_the_cli() {
         &tenant_cli(arguments, tenant_token.clone()).await,
     );
 
-    // 5. Lifecycle administration, from the platform plane.
+    // 6. Lifecycle administration, from the platform plane.
     for verb in ["suspend", "resume"] {
         let mut arguments = vec![
             "platform".to_owned(),
@@ -195,7 +268,7 @@ async fn operator_administers_a_deployment_through_the_cli() {
         succeeded(verb, &platform_cli(arguments, platform.clone()).await);
     }
 
-    // 6. Recovery restores the tenant's existing administrator.
+    // 7. Recovery restores the tenant's existing administrator.
     let mut arguments = vec![
         "platform".to_owned(),
         "tenant".to_owned(),

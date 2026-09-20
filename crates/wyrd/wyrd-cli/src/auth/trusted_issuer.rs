@@ -323,6 +323,7 @@ fn parse_group_roles(entries: &[String]) -> Result<HashMap<String, Vec<String>>,
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    use secrecy::{ExposeSecret, SecretString};
 
     use super::TrustedIssuerCommand;
 

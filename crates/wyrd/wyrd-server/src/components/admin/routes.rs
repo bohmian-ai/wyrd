@@ -295,7 +295,7 @@ async fn create_trusted_issuer(
         .map_err(WyrdErrorResponse::from)?;
     insert_trusted_issuer(&mut conn, &write)
         .await
-        .map_err(map_write_error)?;
+        .map_err(|error| map_write_error(error, AdminWriteTarget::TrustedIssuer))?;
     conn.commit().await.map_err(sql_unavailable)?;
 
     Ok(Json(trusted_issuer_view_from_write(&write)))
@@ -402,12 +402,12 @@ async fn delete_trusted_issuer_route(
     if query.cascade {
         delete_workload_bindings_for_issuer(&mut conn, &issuer)
             .await
-            .map_err(map_write_error)?;
+            .map_err(|error| map_write_error(error, AdminWriteTarget::WorkloadBinding))?;
     }
 
     let removed = delete_trusted_issuer(&mut conn, &issuer)
         .await
-        .map_err(map_write_error)?;
+        .map_err(|error| map_write_error(error, AdminWriteTarget::TrustedIssuer))?;
     if removed == 0 {
         return Err(issuer_not_found(&issuer));
     }
@@ -590,7 +590,7 @@ async fn delete_workload_binding_route(
         .map_err(WyrdErrorResponse::from)?;
     let removed = delete_workload_binding(&mut conn, &issuer, &query.subject)
         .await
-        .map_err(map_write_error)?;
+        .map_err(|error| map_write_error(error, AdminWriteTarget::WorkloadBinding))?;
     if removed == 0 {
         return Err(binding_not_found(&issuer, &query.subject));
     }
@@ -693,19 +693,92 @@ fn normalize_issuer(value: &str) -> String {
 /// that still has live bindings, `ON DELETE RESTRICT`) are both `409` conflicts.
 /// Anything else is a backend-unavailable `503`.
 ///
+/// `target` names the administrative object in the caller's own vocabulary.
+/// The physical constraint that fired is traced server-side and never returned:
+/// it is an internal schema identifier, and putting it on the wire would both
+/// disclose the schema to any authenticated tenant and make a physical rename a
+/// change to the public contract.
+///
 /// The binding-insert path does not use this mapper: there an FK violation means
 /// the referenced issuer is missing, which is a `404`, not a conflict. See
 /// [`map_binding_write_error`].
-fn map_write_error(error: sqlx::Error) -> WyrdErrorResponse {
+fn map_write_error(error: sqlx::Error, target: AdminWriteTarget) -> WyrdErrorResponse {
     match SqlError::from(error) {
-        SqlError::UniqueViolation { constraint } | SqlError::FkViolation { constraint } => {
-            WyrdErrorResponse::from(WyrdError::AdminConflict {
-                message: format!("admin mutation conflicted on constraint {constraint}"),
-                details: serde_json::json!({ "constraint": constraint }),
-            })
+        SqlError::UniqueViolation { constraint } => {
+            trace_conflict(&constraint, target, "duplicate");
+            target.duplicate()
+        }
+        SqlError::FkViolation { constraint } => {
+            trace_conflict(&constraint, target, "referenced");
+            target.still_referenced()
         }
         other => sql_unavailable(other),
     }
+}
+
+/// The administrative object an admin write was acting on.
+///
+/// Conflict text is derived from this rather than from PostgreSQL so that the
+/// public contract is owned by the route and stays stable across physical
+/// schema changes.
+#[derive(Clone, Copy, Debug)]
+enum AdminWriteTarget {
+    /// A tenant's trusted issuer registration.
+    TrustedIssuer,
+    /// A workload identity bound to a server-owned card.
+    WorkloadBinding,
+}
+
+impl AdminWriteTarget {
+    /// The stable wire spelling used in conflict details and traces.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TrustedIssuer => "trusted_issuer",
+            Self::WorkloadBinding => "workload_binding",
+        }
+    }
+
+    /// `409` for a create that collides with an existing row.
+    fn duplicate(self) -> WyrdErrorResponse {
+        let message = match self {
+            Self::TrustedIssuer => "a trusted issuer with this issuer URL already exists",
+            Self::WorkloadBinding => {
+                "a workload binding for this issuer, subject, and audience already exists"
+            }
+        };
+        WyrdErrorResponse::from(WyrdError::AdminConflict {
+            message: message.to_owned(),
+            details: serde_json::json!({ "target": self.as_str(), "reason": "duplicate" }),
+        })
+    }
+
+    /// `409` for a delete blocked by rows that still reference this one.
+    fn still_referenced(self) -> WyrdErrorResponse {
+        let message = match self {
+            Self::TrustedIssuer => {
+                "this trusted issuer still has workload bindings; remove them or retry with \
+                 cascade"
+            }
+            Self::WorkloadBinding => "this workload binding is still referenced",
+        };
+        WyrdErrorResponse::from(WyrdError::AdminConflict {
+            message: message.to_owned(),
+            details: serde_json::json!({ "target": self.as_str(), "reason": "referenced" }),
+        })
+    }
+}
+
+/// Record the physical constraint that produced a public conflict.
+///
+/// The operator needs the constraint name to diagnose an unexpected conflict;
+/// the caller must not have it. This is the only place it goes.
+fn trace_conflict(constraint: &str, target: AdminWriteTarget, reason: &'static str) {
+    tracing::warn!(
+        constraint = %constraint,
+        target = target.as_str(),
+        reason,
+        "admin write conflicted"
+    );
 }
 
 /// Map a workload-binding insert error to an admin response.
@@ -728,10 +801,8 @@ fn map_binding_write_error(error: sqlx::Error, issuer: &IssuerUrl) -> WyrdErrorR
             details: serde_json::json!({ "issuer": issuer.as_str() }),
         }),
         SqlError::UniqueViolation { constraint } => {
-            WyrdErrorResponse::from(WyrdError::AdminConflict {
-                message: format!("admin mutation conflicted on constraint {constraint}"),
-                details: serde_json::json!({ "constraint": constraint }),
-            })
+            trace_conflict(&constraint, AdminWriteTarget::WorkloadBinding, "duplicate");
+            AdminWriteTarget::WorkloadBinding.duplicate()
         }
         other => sql_unavailable(other),
     }
@@ -1102,6 +1173,38 @@ mod pg_tests {
         );
     }
 
+    /// Every physical identifier an administrative conflict must never
+    /// disclose.
+    ///
+    /// PostgreSQL derives constraint names from table names, so the two table
+    /// names cover `*_pkey` and the composite `*_fkey` alike. A response that
+    /// carried one would both hand an authenticated tenant the schema and make
+    /// a physical rename a change to the public contract.
+    const PHYSICAL_NAMES: [&str; 3] = [
+        "auth_trusted_issuers",
+        "auth_workload_bindings",
+        "constraint",
+    ];
+
+    /// Assert a conflict keeps its stable code and leaks no physical name.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the error is not an [`WyrdError::AdminConflict`], or when
+    /// its rendered message or details contain a physical identifier.
+    fn assert_safe_conflict(error: &WyrdErrorResponse) {
+        let WyrdError::AdminConflict { message, details } = &error.0 else {
+            panic!("expected a 409 admin conflict, got {:?}", error.0);
+        };
+        let rendered = format!("{message} {details}").to_lowercase();
+        for name in PHYSICAL_NAMES {
+            assert!(
+                !rendered.contains(name),
+                "a public conflict disclosed the physical name {name}: {rendered}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn duplicate_create_conflicts() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -1125,7 +1228,7 @@ mod pg_tests {
         .await
         .expect_err("a duplicate issuer must conflict");
 
-        assert!(matches!(error.0, WyrdError::AdminConflict { .. }));
+        assert_safe_conflict(&error);
         assert_eq!(
             decision_rows(&fixture, "admin.trusted_issuer.create").await,
             vec![("allowed".to_owned(), 1)],
@@ -1197,7 +1300,7 @@ mod pg_tests {
         )
         .await
         .expect_err("delete blocked by a live binding must conflict");
-        assert!(matches!(conflict.0, WyrdError::AdminConflict { .. }));
+        assert_safe_conflict(&conflict);
 
         // --cascade removes the binding first, then the issuer.
         let status = delete_trusted_issuer_route(
@@ -1241,7 +1344,7 @@ mod pg_tests {
             create_workload_binding(State(state.clone()), writer(tenant), Json(make_request()))
                 .await
                 .expect_err("duplicate binding must conflict");
-        assert!(matches!(conflict.0, WyrdError::AdminConflict { .. }));
+        assert_safe_conflict(&conflict);
 
         // LIST with the issuer filter resolves the binding.
         let listed = list_workload_bindings(

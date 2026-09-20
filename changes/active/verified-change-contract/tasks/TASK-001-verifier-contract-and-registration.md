@@ -177,4 +177,3 @@ reference model, a new permission, or changes to approved Drift/Eval semantics.
 - `architecture/wyrd-security-posture.md`
 - `architecture/references/languages/spec-driven-development.md`
 - `AGENTS.md`
-

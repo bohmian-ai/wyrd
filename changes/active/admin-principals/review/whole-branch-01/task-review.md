@@ -295,4 +295,3 @@ required journey proofs, and violates the repository's commit-identity rule.
 
 - TREV-008 — delete the remaining dead/legacy bootstrap vocabulary while closing
   the bounded remediation.
-

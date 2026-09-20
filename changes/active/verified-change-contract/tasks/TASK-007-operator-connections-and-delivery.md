@@ -226,4 +226,3 @@ delivery claim, or weaker SSRF/audit/tenancy behavior.
 - `architecture/wyrd-security-posture.md`
 - `architecture/agent-rules.md`
 - `AGENTS.md`
-

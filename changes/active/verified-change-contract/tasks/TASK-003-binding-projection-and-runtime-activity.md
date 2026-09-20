@@ -174,4 +174,3 @@ protocol, changed token refresh semantics, or weakened RLS/audit behavior.
 - `architecture/wyrd-security-posture.md`
 - `architecture/agent-rules.md`
 - `AGENTS.md`
-

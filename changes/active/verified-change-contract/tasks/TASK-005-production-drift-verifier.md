@@ -191,4 +191,3 @@ SQL, new result fields, backfill, or different insufficient-input semantics.
 - `architecture/bifrost-design.md`
 - `architecture/references/domain/evaluation.md`
 - `AGENTS.md`
-

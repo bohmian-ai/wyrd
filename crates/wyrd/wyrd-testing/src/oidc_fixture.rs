@@ -278,31 +278,7 @@ impl OidcIssuerFixture {
             .admin
             .as_ref()
             .expect("call with_keycloak_admin before rotate_signing_key");
-
-        // Obtain an admin access token
-        let token_url = format!(
-            "{}/realms/master/protocol/openid-connect/token",
-            admin.base_url
-        );
-        let token_resp: serde_json::Value = self
-            .http
-            .post(&token_url)
-            .form(&[
-                ("grant_type", "password"),
-                ("client_id", "admin-cli"),
-                ("username", admin.username.as_str()),
-                ("password", admin.password.as_str()),
-            ])
-            .send()
-            .await
-            .expect("Keycloak admin token request")
-            .json()
-            .await
-            .expect("admin token response is JSON");
-
-        let admin_token = token_resp["access_token"]
-            .as_str()
-            .expect("admin token present");
+        let admin_token = self.admin_token().await;
 
         // Trigger key rotation: create a new RSA key and activate it
         let keys_url = format!("{}/admin/realms/{}/components", admin.base_url, admin.realm);
@@ -323,7 +299,7 @@ impl OidcIssuerFixture {
         let resp = self
             .http
             .post(&keys_url)
-            .bearer_auth(admin_token)
+            .bearer_auth(&admin_token)
             .json(&new_key_body)
             .send()
             .await
@@ -333,6 +309,122 @@ impl OidcIssuerFixture {
             resp.status().is_success() || resp.status() == reqwest::StatusCode::CREATED,
             "key rotation failed: status={}",
             resp.status()
+        );
+    }
+
+    /// Mint a Keycloak admin access token for one privileged REST call.
+    ///
+    /// Every privileged fixture operation authenticates the same way — the
+    /// master realm's `admin-cli` password grant — so the credential handling
+    /// lives here rather than in each operation. The token is deliberately not
+    /// cached: it is short-lived, and a long journey that reused a stale one
+    /// would fail as an unrelated authorization error.
+    ///
+    /// # Panics
+    /// Panics when admin credentials were never attached with
+    /// [`Self::with_keycloak_admin`], the token request fails, or the response
+    /// carries no `access_token`.
+    async fn admin_token(&self) -> String {
+        let admin = self
+            .admin
+            .as_ref()
+            .expect("call with_keycloak_admin before a privileged operation");
+        let token_url = format!(
+            "{}/realms/master/protocol/openid-connect/token",
+            admin.base_url
+        );
+        let token_resp: serde_json::Value = self
+            .http
+            .post(&token_url)
+            .form(&[
+                ("grant_type", "password"),
+                ("client_id", "admin-cli"),
+                ("username", admin.username.as_str()),
+                ("password", admin.password.as_str()),
+            ])
+            .send()
+            .await
+            .expect("Keycloak admin token request")
+            .json()
+            .await
+            .expect("admin token response is JSON");
+
+        token_resp["access_token"]
+            .as_str()
+            .expect("admin token present")
+            .to_owned()
+    }
+
+    /// Add or remove `username`'s membership of the realm group `group`.
+    ///
+    /// The realm's `groups` protocol mapper puts a member's group names in the
+    /// ID token, and a Wyrd issuer maps those names onto Wyrd roles. A journey
+    /// that needs the provider to grant or withdraw authority therefore moves
+    /// the membership the claim is derived from, which is the only lever a
+    /// real identity administrator has.
+    ///
+    /// Keycloak offers no single "set membership" call, so the user and the
+    /// group are each resolved by name and the membership is then `PUT` or
+    /// `DELETE`d. Both directions are idempotent — a repeated add and a
+    /// redundant removal are accepted — so a journey may restore the starting
+    /// state unconditionally in its cleanup.
+    ///
+    /// # Panics
+    /// Panics when admin credentials are absent, the user or the group does
+    /// not exist in the realm, or the membership call is refused.
+    pub async fn set_group_membership(&self, username: &str, group: &str, member: bool) {
+        let admin = self
+            .admin
+            .as_ref()
+            .expect("call with_keycloak_admin before set_group_membership");
+        let admin_token = self.admin_token().await;
+        let realm_url = format!("{}/admin/realms/{}", admin.base_url, admin.realm);
+
+        let users: serde_json::Value = self
+            .http
+            .get(format!("{realm_url}/users"))
+            .query(&[("username", username), ("exact", "true")])
+            .bearer_auth(&admin_token)
+            .send()
+            .await
+            .expect("Keycloak user lookup")
+            .json()
+            .await
+            .expect("user lookup response is JSON");
+        let user_id = users[0]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("realm user {username} exists: {users}"));
+
+        let groups: serde_json::Value = self
+            .http
+            .get(format!("{realm_url}/groups"))
+            .query(&[("search", group)])
+            .bearer_auth(&admin_token)
+            .send()
+            .await
+            .expect("Keycloak group lookup")
+            .json()
+            .await
+            .expect("group lookup response is JSON");
+        let group_id = groups[0]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("realm group {group} exists: {groups}"));
+
+        let membership_url = format!("{realm_url}/users/{user_id}/groups/{group_id}");
+        let request = if member {
+            self.http.put(&membership_url)
+        } else {
+            self.http.delete(&membership_url)
+        };
+        let response = request
+            .bearer_auth(&admin_token)
+            .send()
+            .await
+            .expect("Keycloak group membership call");
+        assert!(
+            response.status().is_success(),
+            "group membership change failed for {username}/{group}: status={}",
+            response.status()
         );
     }
 }

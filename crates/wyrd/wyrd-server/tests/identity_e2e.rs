@@ -43,6 +43,20 @@ fn dex_issuer() -> String {
     env::var("WYRD_DEX_ISSUER").unwrap_or_else(|_| "http://localhost:5556".to_owned())
 }
 
+/// Admin credentials for the fixture realm's privileged REST operations.
+///
+/// Signing-key rotation and group-membership changes are both driven through
+/// the Keycloak admin API with the compose file's fixed development admin, so
+/// the credential is written once here rather than at each call site.
+fn keycloak_admin() -> KeycloakAdmin {
+    KeycloakAdmin {
+        base_url: "http://localhost:8080".to_owned(),
+        username: "admin".to_owned(),
+        password: "admin".to_owned(),
+        realm: "wyrd-test".to_owned(),
+    }
+}
+
 /// Tenant slug the fixture provisions; jwt-bearer resolves it to the implicit
 /// `DataTenantId` the config seam binds issuers and bindings to.
 const FIXTURE_TENANT_SLUG: &str = "test-tenant-1";
@@ -780,42 +794,55 @@ async fn service_account_issuer_full_chain() {
 
 // ─── Human OIDC login journey (Keycloak) ──────────────────────────────────────
 
-/// Drive a complete config-driven human OIDC login:
-///   1. boot trusts Keycloak via `[[trusted_issuers]]` (config-driven), granting
-///      `runtime_admin` as a default role so the federated human can delegate,
-///   2. `GET /auth/login` → authorization URL + state,
-///   3. `OidcIssuerFixture::human_login` authenticates alice → code + state,
-///   4. `GET /auth/callback` → Wyrd access token,
-///   5. the human token reaches a real `/v1/authz/check` `200` via delegation.
-#[tokio::test]
-async fn human_oidc_login_journey() {
-    if !e2e_enabled() {
-        return;
-    }
-
-    let keycloak = OidcIssuerFixture::connect(&keycloak_issuer()).await;
-
-    // wyrd-human is a public PKCE client. Config-driven boot binds it to the
-    // fixture's implicit tenant and runs OIDC discovery for jwks_uri.
-    let mut human_issuer = IssuerEntry {
+/// Build the `wyrd-human` public-PKCE issuer entry every human journey boots on.
+///
+/// The three human journeys differ only in where the federated user's Wyrd
+/// authority comes from: a baseline `default_roles` grant, or a
+/// `group_role_map` over the realm's `groups` claim. Everything else — the
+/// public PKCE client, the claim paths, the human token policy — is the same
+/// deployment shape, so it is written once here. Config-driven boot binds the
+/// entry to the fixture's implicit tenant and runs OIDC discovery for
+/// `jwks_uri`.
+fn human_issuer_entry(
+    default_roles: Vec<String>,
+    group_role_map: HashMap<String, Vec<String>>,
+) -> IssuerEntry {
+    let mut entry = IssuerEntry {
         client_auth: ClientAuthEntry::Public,
         claim_mapping: ClaimMappingEntry {
             subject: "sub".to_owned(),
             email: Some("email".to_owned()),
-            groups: Some("realm_access.roles".to_owned()),
+            groups: Some("groups".to_owned()),
         },
-        default_roles: vec!["runtime_admin".to_owned()],
+        default_roles,
+        group_role_map,
         ..issuer_entry(&keycloak_issuer(), "wyrd-human", IssuerTokenPolicy::Human)
     };
-    human_issuer.client_id = "wyrd-human".to_owned();
+    entry.client_id = "wyrd-human".to_owned();
+    entry
+}
 
-    let srv = WyrdTestServerBuilder::default()
-        .with_trusted_issuer_configs(vec![human_issuer])
-        .start_in_process()
-        .await
-        .expect("test server starts");
-
-    // Step 1: initiate login — request JSON to get authorization_url + state.
+/// Drive one complete browser login and return the token response body.
+///
+/// This is the served human path end to end: `GET /auth/login` mints the
+/// authorization URL, PKCE challenge, nonce, and state; the Keycloak fixture
+/// authenticates the user against the real HTML login form and returns the
+/// authorization code; `GET /auth/callback` exchanges it for a Wyrd session.
+/// Every human journey starts here, and the role-change journey runs it
+/// several times against the same user, so the flow is one helper rather than
+/// three copies.
+///
+/// # Panics
+/// Panics when any leg of the flow does not return `200`, when the
+/// authorization URL omits the PKCE challenge or nonce, or when the IdP echoes
+/// a different `state` than the one Wyrd issued — each is a broken login, not
+/// a condition a caller could handle.
+async fn human_login(
+    srv: &WyrdTestServer,
+    keycloak: &OidcIssuerFixture,
+    username: &str,
+    password: &str,
+) -> Value {
     let issuer_encoded: String =
         url::form_urlencoded::byte_serialize(keycloak_issuer().as_bytes()).collect();
     let login_resp = srv
@@ -859,15 +886,14 @@ async fn human_oidc_login_journey() {
         .map(|(_, v)| v.into_owned())
         .expect("authorization_url carries nonce");
 
-    // Step 2: drive Keycloak login form as alice.
     let redirect_uri: Url = "http://test-tenant-1.wyrd.test/auth/callback"
         .parse()
         .expect("redirect URI parses");
     let login_result = keycloak
         .human_login(
             "wyrd-human",
-            "alice",
-            "alice-password",
+            username,
+            password,
             &redirect_uri,
             state_key,
             &code_challenge,
@@ -880,17 +906,17 @@ async fn human_oidc_login_journey() {
     );
     assert_eq!(login_result.state, state_key, "state echoed back correctly");
 
-    // Step 3: exchange authorization code.
     let code_encoded: String =
         url::form_urlencoded::byte_serialize(login_result.code.as_bytes()).collect();
     let state_encoded: String =
         url::form_urlencoded::byte_serialize(login_result.state.as_bytes()).collect();
-    let callback_uri = format!("/auth/callback?code={code_encoded}&state={state_encoded}");
     let callback_resp = srv
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri(&callback_uri)
+                .uri(format!(
+                    "/auth/callback?code={code_encoded}&state={state_encoded}"
+                ))
                 .header(header::HOST, "test-tenant-1.wyrd.test")
                 .body(Body::empty())
                 .expect("callback request builds"),
@@ -906,7 +932,51 @@ async fn human_oidc_login_journey() {
     let token_bytes = to_bytes(callback_resp.into_body(), 65_536)
         .await
         .expect("token body reads");
-    let token_body: Value = serde_json::from_slice(&token_bytes).expect("token response is JSON");
+    serde_json::from_slice(&token_bytes).expect("token response is JSON")
+}
+
+/// Read the Wyrd principal id a session's access token was minted for.
+///
+/// Wyrd puts the principal id in `sub`, so a journey that has only driven the
+/// browser flow can still name the principal an administrator must revoke.
+/// There is no served endpoint that answers "who am I" with the id, and
+/// reaching into the tenant store instead would prove the revocation against
+/// state the caller never sees.
+///
+/// # Panics
+/// Panics when the token carries no string `sub`.
+fn principal_id_of(access_token: &str) -> String {
+    jwt_claims(access_token)["sub"]
+        .as_str()
+        .expect("a Wyrd access token names its principal in sub")
+        .to_owned()
+}
+
+/// Drive a complete config-driven human OIDC login:
+///   1. boot trusts Keycloak via `[[trusted_issuers]]` (config-driven), granting
+///      `runtime_admin` as a default role so the federated human can delegate,
+///   2. `GET /auth/login` → authorization URL + state,
+///   3. `OidcIssuerFixture::human_login` authenticates alice → code + state,
+///   4. `GET /auth/callback` → Wyrd access token,
+///   5. the human token reaches a real `/v1/authz/check` `200` via delegation.
+#[tokio::test]
+async fn human_oidc_login_journey() {
+    if !e2e_enabled() {
+        return;
+    }
+
+    let keycloak = OidcIssuerFixture::connect(&keycloak_issuer()).await;
+
+    let srv = WyrdTestServerBuilder::default()
+        .with_trusted_issuer_configs(vec![human_issuer_entry(
+            vec!["runtime_admin".to_owned()],
+            HashMap::new(),
+        )])
+        .start_in_process()
+        .await
+        .expect("test server starts");
+
+    let token_body = human_login(&srv, &keycloak, "alice", "alice-password").await;
     let access_token = token_body["access_token"]
         .as_str()
         .expect("access_token present in response");
@@ -995,6 +1065,243 @@ async fn post_refresh(srv: &WyrdTestServer, refresh_token: &str) -> (StatusCode,
         .expect("refresh body reads");
     let parsed = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     (status, parsed)
+}
+
+/// Revoking a human retires the refresh authority along with the access token.
+///
+/// The epoch bump alone only stops tokens already minted. A human session also
+/// holds a refresh token, and rotating it mints a successor stamped after the
+/// epoch — which would hand back the session the revocation just ended. This
+/// journey drives the served path an operator actually uses: log in, use the
+/// access token, revoke the User principal through `/v1/principals/{id}/revoke`,
+/// and then show that neither half of the session survives — the old access
+/// token is refused as revoked, and the refresh token cannot rotate, so no
+/// successor row exists to carry the session forward.
+#[tokio::test]
+async fn revoking_a_human_kills_the_session_refresh_authority() {
+    if !e2e_enabled() {
+        return;
+    }
+
+    let keycloak = OidcIssuerFixture::connect(&keycloak_issuer()).await;
+    let srv = WyrdTestServerBuilder::default()
+        .with_auth_verify_settings(WyrdAuthVerifySettings {
+            cache_ttl: StdDuration::ZERO,
+            ..WyrdAuthVerifySettings::default()
+        })
+        .with_trusted_issuer_configs(vec![human_issuer_entry(
+            vec!["runtime_admin".to_owned()],
+            HashMap::new(),
+        )])
+        .start_in_process()
+        .await
+        .expect("test server starts");
+
+    let token_body = human_login(&srv, &keycloak, "alice", "alice-password").await;
+    let access_token = token_body["access_token"]
+        .as_str()
+        .expect("access_token present")
+        .to_owned();
+    let refresh_token = token_body["refresh_token"]
+        .as_str()
+        .expect("a human session is issued a refresh token")
+        .to_owned();
+
+    // The live session works before anyone revokes it.
+    assert_v1_authz_check_ok(&srv, &access_token, "human-revoke").await;
+
+    // An administrator revokes the human principal by id and kind.
+    let admin = srv
+        .bootstrap_service("human-revoke-admin", &["admin"])
+        .await
+        .expect("admin bootstraps");
+    let admin_token = srv
+        .exchange_api_key(&admin.api_key().expect("admin has api key").clone())
+        .await
+        .expect("admin api key exchange succeeds");
+    let revoke_resp = srv
+        .oneshot_authenticated(
+            &admin_token,
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!(
+                    "/v1/principals/{}/revoke",
+                    principal_id_of(&access_token)
+                ))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "principal_kind": "user",
+                        "reason": "offboarded, session must end now"
+                    })
+                    .to_string(),
+                ))
+                .expect("revoke request builds"),
+        )
+        .await
+        .expect("revoke call completes");
+    assert!(
+        revoke_resp.status().is_success(),
+        "revoking the human principal succeeds: {}",
+        revoke_resp.status()
+    );
+
+    // The access token half of the session is refused as revoked.
+    let callee = srv
+        .bootstrap_service("human-revoke-after-callee", &["writer"])
+        .await
+        .expect("callee bootstraps");
+    let after = srv
+        .oneshot_authenticated(
+            &access_token,
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/authz/check")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&authz_check_request(&callee, "card_write"))
+                        .expect("serializes"),
+                ))
+                .expect("request builds"),
+        )
+        .await
+        .expect("post-revoke call completes");
+    assert_eq!(
+        after.status(),
+        StatusCode::UNAUTHORIZED,
+        "the revoked human's access token is refused: {}",
+        after.status()
+    );
+    let after_bytes = to_bytes(after.into_body(), 65_536)
+        .await
+        .expect("body reads");
+    let after_body: Value = serde_json::from_slice(&after_bytes).unwrap_or_default();
+    assert_eq!(
+        response_code(&after_body),
+        "WYRD_AUTH_401_CREDENTIAL_REVOKED",
+        "refusal names revocation: {after_body}"
+    );
+
+    // The refresh half is retired in the same transaction, so rotation is
+    // refused and mints no successor for the session to continue under.
+    let (refresh_status, refresh_body) = post_refresh(&srv, &refresh_token).await;
+    assert_eq!(
+        refresh_status,
+        StatusCode::UNAUTHORIZED,
+        "the revoked human's refresh token cannot rotate: {refresh_body}"
+    );
+    assert!(
+        refresh_body["access_token"].is_null() && refresh_body["refresh_token"].is_null(),
+        "a refused rotation issues no successor: {refresh_body}"
+    );
+}
+
+/// A withdrawn provider role ends the sessions that still name it.
+///
+/// Wyrd's access token carries the role names resolved at login, so a human
+/// whose provider group was removed would keep the authority in an outstanding
+/// token until it expired. The callback advances the User's authorization epoch
+/// whenever the persisted role set actually moves, which is what this journey
+/// drives from the provider side: log in as a member of `wyrd-admins`, log in
+/// again unchanged and show the first session still works, then remove the
+/// group at Keycloak and log in once more. The unchanged login must not
+/// invalidate anything; the changed one must refuse the old token and issue a
+/// successor that can no longer delegate.
+///
+/// The membership is restored before the journey returns, because the realm is
+/// shared with every other Keycloak journey in this target.
+#[tokio::test]
+async fn a_withdrawn_oidc_group_invalidates_the_roles_it_granted() {
+    if !e2e_enabled() {
+        return;
+    }
+
+    let keycloak = OidcIssuerFixture::connect(&keycloak_issuer())
+        .await
+        .with_keycloak_admin(keycloak_admin());
+    keycloak
+        .set_group_membership("alice", "wyrd-admins", true)
+        .await;
+
+    let srv = WyrdTestServerBuilder::default()
+        .with_auth_verify_settings(WyrdAuthVerifySettings {
+            cache_ttl: StdDuration::ZERO,
+            ..WyrdAuthVerifySettings::default()
+        })
+        .with_trusted_issuer_configs(vec![human_issuer_entry(
+            Vec::new(),
+            HashMap::from([("wyrd-admins".to_owned(), vec!["runtime_admin".to_owned()])]),
+        )])
+        .start_in_process()
+        .await
+        .expect("test server starts");
+
+    // The group grants runtime_admin, so the first session can delegate.
+    let granted = human_login(&srv, &keycloak, "alice", "alice-password").await;
+    let granted_token = granted["access_token"]
+        .as_str()
+        .expect("access_token present")
+        .to_owned();
+    assert_v1_authz_check_ok(&srv, &granted_token, "roles-granted").await;
+
+    // A second login asserting the same groups changes nothing, so the first
+    // session keeps working: re-authenticating must not log a user out.
+    let _unchanged = human_login(&srv, &keycloak, "alice", "alice-password").await;
+    assert_v1_authz_check_ok(&srv, &granted_token, "roles-unchanged").await;
+
+    // The provider withdraws the group; the next login persists the reduced set.
+    keycloak
+        .set_group_membership("alice", "wyrd-admins", false)
+        .await;
+    let reduced = human_login(&srv, &keycloak, "alice", "alice-password").await;
+    let reduced_token = reduced["access_token"]
+        .as_str()
+        .expect("access_token present")
+        .to_owned();
+
+    // The epoch moved with the role set, so the token naming the withdrawn role
+    // is refused even though it has not expired.
+    let callee = srv
+        .bootstrap_service("roles-withdrawn-callee", &["writer"])
+        .await
+        .expect("callee bootstraps");
+    let stale = srv
+        .oneshot_authenticated(
+            &granted_token,
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/authz/check")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&authz_check_request(&callee, "card_write"))
+                        .expect("serializes"),
+                ))
+                .expect("request builds"),
+        )
+        .await
+        .expect("stale-token call completes");
+    assert_eq!(
+        stale.status(),
+        StatusCode::UNAUTHORIZED,
+        "the token naming the withdrawn role is refused: {}",
+        stale.status()
+    );
+
+    // The successor the same login issued carries the reduced authority: it can
+    // still authenticate, but it can no longer delegate.
+    assert!(
+        srv.delegate(
+            &reduced_token,
+            callee.card_ref().expect("callee carries a card_ref"),
+        )
+        .await
+        .is_err(),
+        "the reduced session cannot delegate"
+    );
+
+    keycloak
+        .set_group_membership("alice", "wyrd-admins", true)
+        .await;
 }
 
 // ─── Federated cloud journey: CLI-authored issuer + binding ───────────────────
@@ -1456,12 +1763,7 @@ async fn key_rotation_keycloak_admin_api() {
     }
     let keycloak = OidcIssuerFixture::connect(&keycloak_issuer())
         .await
-        .with_keycloak_admin(KeycloakAdmin {
-            base_url: "http://localhost:8080".to_owned(),
-            username: "admin".to_owned(),
-            password: "admin".to_owned(),
-            realm: "wyrd-test".to_owned(),
-        });
+        .with_keycloak_admin(keycloak_admin());
 
     let pre_token = keycloak
         .workload_token("wyrd-workload", "wyrd-workload-secret", "wyrd-workload")

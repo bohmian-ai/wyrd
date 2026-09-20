@@ -702,7 +702,7 @@ fn count_u32(value: usize) -> Result<u32, TableError> {
 ///
 /// Delegates to [`crate::schema::fingerprint::SchemaFingerprint`] so a
 /// registered table and an ingested batch of the same shape always agree.
-fn fingerprint_fields(fields: &[Field]) -> [u8; 32] {
+pub(crate) fn fingerprint_fields(fields: &[Field]) -> [u8; 32] {
     let owned: Vec<std::sync::Arc<Field>> =
         fields.iter().cloned().map(std::sync::Arc::new).collect();
     crate::schema::fingerprint::SchemaFingerprint::from_fields(owned.iter()).0

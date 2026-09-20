@@ -10,6 +10,7 @@
 --
 -- Nullable because not every decision has a credential behind it: a federated
 -- human presents an identity, and the server's own internal decisions present
--- nothing. The chain hash covers the column's absence distinctly from any
--- value, so existing entries are unaffected and no rewrite is needed.
+-- nothing. The chain hash appends a credential segment only when there is one,
+-- so the preimage of every row written before this column existed is byte for
+-- byte what it was: existing entries still verify and no rewrite is needed.
 ALTER TABLE vala.audit_staging ADD COLUMN credential_id uuid;

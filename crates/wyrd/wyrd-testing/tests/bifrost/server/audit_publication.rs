@@ -765,3 +765,82 @@ async fn audited_transitions_retire_only_into_retained_history() -> Result<(), S
     server.shutdown().await?;
     Ok(())
 }
+
+/// Counts retained rows matching one additional predicate.
+///
+/// The projection is what an operator actually asks after a leak — which key
+/// made this decision — so the assertion filters on the public column rather
+/// than only counting the operation.
+///
+/// # Errors
+/// Returns the authorization or query failure.
+async fn retained_matching(
+    server: &WyrdTestServer,
+    tenant: DataTenantId,
+    operation: &str,
+    predicate: &str,
+) -> Result<u64, ServerJourneyError> {
+    let outcome = wyrd_server::query::scheduled::ScheduledQueryCaller::new(
+        server.state().clone(),
+        scheduled_context(tenant)?,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .run(BifrostQueryRequest {
+        sql: format!("SELECT seq FROM {AUDIT_LOG} WHERE operation = '{operation}' AND {predicate}"),
+        visibility: VisibilityMode::Fused,
+        freshness: FreshnessPolicy::Strict,
+        deadline_ms: Some(60_000),
+    })
+    .await?;
+    Ok(outcome.rows)
+}
+
+/// Retained history carries both credential shapes in one uninterrupted read.
+///
+/// A decision made by a federated human names no credential and a decision
+/// made with an API key names exactly one. Both travel the same canonical
+/// staging-to-publisher path into the same retained table, so the proof that
+/// the added column did not split history is reading both back from it —
+/// through the public query surface, under one operation.
+///
+/// # Errors
+/// Returns the server, Postgres, publication, or query failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn retained_history_carries_both_credential_shapes() -> Result<(), ServerJourneyError> {
+    let server = WyrdTestServer::start_bound().await?;
+    let tenant = server.data_tenant_id();
+    let operation = format!(
+        "wyrd.journey.audit_credential.{}",
+        uuid::Uuid::now_v7().simple()
+    );
+    let credential = uuid::Uuid::now_v7();
+
+    append_decision(&server, tenant, &operation).await?;
+    let mut conn = server.tenant_conn_for(tenant).await?;
+    let mut with_credential = decision(&operation);
+    with_credential.credential_id = Some(credential);
+    append_audit(&mut conn, &with_credential).await?;
+    conn.commit().await?;
+
+    await_retained(&server, tenant, &operation, 2).await?;
+    assert_eq!(
+        retained_matching(&server, tenant, &operation, "credential_id IS NULL").await?,
+        1,
+        "the credential-free decision is retained with no credential"
+    );
+    assert_eq!(
+        retained_matching(
+            &server,
+            tenant,
+            &operation,
+            &format!("credential_id = '{credential}'"),
+        )
+        .await?,
+        1,
+        "the credentialed decision names the key it was made with"
+    );
+
+    server.shutdown().await?;
+    Ok(())
+}

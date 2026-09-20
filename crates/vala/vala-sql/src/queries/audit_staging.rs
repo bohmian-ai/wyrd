@@ -347,6 +347,10 @@ pub async fn settle_publication(conn: &mut TenantConn<'_>, seq_hi: i64) -> Resul
 /// The canonical encoding is a length-prefixed concatenation owned here, so the
 /// chain is reproducible from the stored columns alone. `card_ref` is passed as
 /// its already-canonicalized string to avoid recomputing it.
+///
+/// The credential segment is appended last and only when the decision names a
+/// credential, which keeps the preimage of every historical null-credential
+/// row exactly what it was when that row was written.
 fn entry_hash(
     prev_hash: &[u8],
     seq: i64,
@@ -367,10 +371,16 @@ fn entry_hash(
     push_opt(&mut buf, card_ref);
     buf.extend_from_slice(event.principal_id.as_uuid().as_bytes());
     push_str(&mut buf, event.principal_kind.as_str());
-    push_opt(&mut buf, credential.as_deref());
     push_str(&mut buf, &event.permission);
     push_str(&mut buf, outcome_str(event.outcome));
     push_opt(&mut buf, detail);
+    // Appended, and only when there is one. Every row hashed before decisions
+    // carried a credential ends here, so a chain written by an older build
+    // still verifies byte for byte against what it stored; a row that does
+    // name a credential commits to it in the one segment beyond that preimage.
+    if let Some(credential) = credential.as_deref() {
+        push_str(&mut buf, credential);
+    }
     Sha256::digest(&buf).into()
 }
 
@@ -397,5 +407,75 @@ fn outcome_str(outcome: AuditOutcome) -> &'static str {
     match outcome {
         AuditOutcome::Allowed => "allowed",
         AuditOutcome::Denied => "denied",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sha2::{Digest as _, Sha256};
+    use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
+    use wyrd_spec::request_id::RequestId;
+    use wyrd_spec::vala::api::{AuditEvent, AuditOutcome};
+
+    use super::{entry_hash, push_opt, push_str};
+
+    /// One decision, with or without the credential that authenticated it.
+    fn event(credential_id: Option<uuid::Uuid>) -> AuditEvent {
+        AuditEvent {
+            request_id: RequestId::now_v7(),
+            trace_id: None,
+            operation: "platform.authz".to_owned(),
+            resource: "platform:tenants".to_owned(),
+            card_ref: None,
+            principal_id: PrincipalId::new(uuid::Uuid::nil()),
+            principal_kind: PrincipalKindTag::Service,
+            credential_id,
+            permission: "tenants:write".to_owned(),
+            outcome: AuditOutcome::Allowed,
+            detail: None,
+        }
+    }
+
+    /// The preimage an older build hashed, before `credential_id` existed.
+    fn legacy_preimage(prev_hash: &[u8], seq: i64, event: &AuditEvent) -> [u8; 32] {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(prev_hash);
+        buf.extend_from_slice(&seq.to_be_bytes());
+        push_str(&mut buf, event.request_id.as_str());
+        push_opt(&mut buf, event.trace_id.as_deref());
+        push_str(&mut buf, &event.operation);
+        push_str(&mut buf, &event.resource);
+        push_opt(&mut buf, None);
+        buf.extend_from_slice(event.principal_id.as_uuid().as_bytes());
+        push_str(&mut buf, event.principal_kind.as_str());
+        push_str(&mut buf, &event.permission);
+        push_str(&mut buf, "allowed");
+        push_opt(&mut buf, None);
+        Sha256::digest(&buf).into()
+    }
+
+    /// A row with no credential hashes exactly what it hashed before the
+    /// column existed, so retained history still verifies.
+    #[test]
+    fn a_credential_free_decision_keeps_its_original_preimage() {
+        let event = event(None);
+        let prev_hash = [7_u8; 32];
+        assert_eq!(
+            entry_hash(&prev_hash, 42, &event, None, None),
+            legacy_preimage(&prev_hash, 42, &event),
+            "the absent credential adds nothing to the preimage"
+        );
+    }
+
+    /// A row that names a credential commits to it, so the two are distinct.
+    #[test]
+    fn a_credential_bearing_decision_commits_to_the_credential() {
+        let credential = uuid::Uuid::from_u128(1);
+        let prev_hash = [7_u8; 32];
+        assert_ne!(
+            entry_hash(&prev_hash, 42, &event(Some(credential)), None, None),
+            entry_hash(&prev_hash, 42, &event(None), None, None),
+            "the credential segment is part of what the chain commits to"
+        );
     }
 }

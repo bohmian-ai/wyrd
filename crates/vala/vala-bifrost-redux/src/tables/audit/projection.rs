@@ -223,10 +223,10 @@ fn project_record_batch(rows: &[AuditStagingRow]) -> Result<RecordBatch, AuditPr
         Arc::new(StringArray::from(card_ref_values)),
         Arc::new(StringArray::from(principal_id_values)),
         Arc::new(StringArray::from(principal_kind_values)),
-        Arc::new(StringArray::from(credential_id_values)),
         Arc::new(StringArray::from(permission_values)),
         Arc::new(StringArray::from(outcome_values)),
         Arc::new(StringArray::from(detail_values)),
+        Arc::new(StringArray::from(credential_id_values)),
         Arc::new(
             TimestampMicrosecondArray::from(event_time_values).with_timezone(Arc::from("UTC")),
         ),

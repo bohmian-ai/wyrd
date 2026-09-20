@@ -177,6 +177,13 @@ impl IssuingKey {
 
     /// Mint an access token for a user principal.
     ///
+    /// `credential_id` names the stored credential that authenticated this
+    /// request when there is one. A federated sign-in presents a provider
+    /// token and holds none, so it passes `None`; a session renewed through the
+    /// refresh grant names the refresh row it consumed, which is what makes a
+    /// renewed human decision attributable rather than indistinguishable from
+    /// credential-free federation.
+    ///
     /// # Errors
     /// Returns an error when the principal is not a user, TTL is invalid, or signing fails.
     #[tracing::instrument(
@@ -194,6 +201,7 @@ impl IssuingKey {
         &self,
         principal: TokenPrincipalRef,
         roles: Vec<RoleRef>,
+        credential_id: Option<Uuid>,
         ttl: Duration,
     ) -> Result<String, IssueError> {
         if principal.kind != PrincipalKindTag::User {
@@ -205,7 +213,7 @@ impl IssuingKey {
             principal,
             roles,
             None,
-            None,
+            credential_id,
             ttl,
         )
     }
@@ -586,6 +594,7 @@ mod tests {
             .issue_user_access_token(
                 user_principal(),
                 vec![role("runtime_admin")],
+                None,
                 Duration::minutes(5),
             )
             .expect("token issues");
@@ -706,6 +715,7 @@ mod tests {
         let result = issuing_key().issue_user_access_token(
             service_principal(),
             vec![role("service")],
+            None,
             Duration::minutes(5),
         );
 
@@ -720,6 +730,7 @@ mod tests {
                 ..user_principal()
             },
             vec![role("runtime_admin")],
+            None,
             Duration::minutes(5),
         );
 
@@ -754,6 +765,7 @@ mod tests {
         let result = issuing_key().issue_user_access_token(
             user_principal(),
             vec![role("runtime_admin")],
+            None,
             Duration::zero(),
         );
         assert!(matches!(result, Err(IssueError::InvalidTtl)));
@@ -764,6 +776,7 @@ mod tests {
         let result = issuing_key().issue_user_access_token(
             user_principal(),
             vec![role("runtime_admin")],
+            None,
             Duration::minutes(-1),
         );
         assert!(matches!(result, Err(IssueError::InvalidTtl)));
@@ -775,6 +788,7 @@ mod tests {
             .issue_user_access_token(
                 user_principal(),
                 vec![role("runtime_admin")],
+                None,
                 Duration::minutes(5),
             )
             .expect("caller token issues");
@@ -919,6 +933,7 @@ mod tests {
             .issue_user_access_token(
                 user_principal(),
                 vec![role("runtime_admin")],
+                None,
                 Duration::minutes(5),
             )
             .expect("token issues");
@@ -944,6 +959,7 @@ mod tests {
             .issue_user_access_token(
                 user_principal(),
                 vec![role("runtime_admin")],
+                None,
                 Duration::minutes(5),
             )
             .expect("token issues");
@@ -1030,7 +1046,7 @@ mod tests {
 
     fn issue_user_test_token(ttl: Duration) -> String {
         issuing_key()
-            .issue_user_access_token(user_principal(), vec![role("runtime_admin")], ttl)
+            .issue_user_access_token(user_principal(), vec![role("runtime_admin")], None, ttl)
             .expect("token issues")
     }
 

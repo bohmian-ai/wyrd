@@ -19,9 +19,8 @@ use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
 use wyrd_spec::vala::audit_detail::CardScopeMintKind;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
-    ApiKeyStatus, api_key_by_prefix, api_key_status_by_prefix, insert_refresh_token,
-    insert_refresh_token_rotated, list_service_account_roles, service_account_by_id,
-    touch_api_key_last_used,
+    ApiKeyStatus, api_key_by_prefix, api_key_status_by_prefix, list_service_account_roles,
+    service_account_by_id, touch_api_key_last_used,
 };
 use wyrd_sql::queries::platform::tenant_resolver::tenant_admits_credentials;
 
@@ -98,9 +97,10 @@ impl std::fmt::Debug for DelegateToken {
 pub struct ExchangedToken {
     /// Access token.
     pub access_token: SecretString,
-    /// Refresh token. `None` for grants that do not issue one (workload
-    /// `jwt-bearer` and `token-exchange` delegation), whose callers hold a
-    /// durable credential they can re-present for a fresh access token.
+    /// Refresh token. Present only for a human OIDC session, which has no
+    /// durable credential to re-present. Every machine grant — API-key
+    /// exchange, workload `jwt-bearer`, and `token-exchange` delegation —
+    /// leaves this `None` and re-exchanges its credential instead.
     pub refresh_token: Option<SecretString>,
     /// Token type.
     pub token_type: TokenType,
@@ -121,27 +121,6 @@ impl ExchangedToken {
             expires_at: self.expires_at,
         }
     }
-}
-
-/// Whether a token-issuing path mints a refresh token alongside the access
-/// token.
-///
-/// Refresh tokens exist to spare a credential holder from re-proving identity.
-/// A human OIDC session and an API key benefit from that. A workload with a
-/// platform-attested assertion, or a short-lived delegated principal, do not:
-/// they can re-present their durable credential, so issuing a long-lived
-/// refresh secret only widens the leak surface.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RefreshPolicy {
-    /// Issue and persist a refresh token (API-key exchange, human login).
-    Mint,
-    /// Issue and persist a refresh token that supersedes the one named here.
-    ///
-    /// The back-link is what makes reuse of the consumed token detectable: the
-    /// family can be revoked wholesale when a rotated token reappears.
-    Rotate(Uuid),
-    /// Access token only; no refresh token is issued or stored.
-    Skip,
 }
 
 /// The service/agent principal a token is being issued for.
@@ -296,7 +275,6 @@ impl ExchangeApiKey {
                 roles,
                 credential_id: Some(row.api_key_id),
             },
-            RefreshPolicy::Mint,
             request_id,
             MINT_KIND_API_KEY_EXCHANGE,
         )
@@ -421,7 +399,6 @@ async fn issue_cardless_subject(
     issuing_key: &IssuingKey,
     settings: &TokenExchangeSettings,
     subject: IssueSubject,
-    refresh: RefreshPolicy,
 ) -> Result<ExchangedToken, IssueOrSqlError> {
     let IssueSubject {
         principal_id,
@@ -445,91 +422,26 @@ async fn issue_cardless_subject(
         settings.access_ttl,
     )?;
 
-    let refresh_token = store_refresh_token(
-        conn,
-        issuing_key,
-        settings,
-        principal_id,
-        &principal_kind,
-        refresh,
-    )
-    .await?;
-
     Ok(ExchangedToken {
         access_token: SecretString::from(access_token),
-        refresh_token,
+        refresh_token: None,
         token_type: TokenType::Bearer,
         expires_at: Utc::now() + settings.access_ttl,
     })
 }
 
-/// Mint and store the refresh token `refresh` calls for, if any.
+/// Issue an access token and scope-mint audit for a machine principal.
 ///
-/// Both issuance shapes — Card-bound and Card-free — ask the same question, and
-/// the only difference between minting and rotating is the back-link to the
-/// token being superseded. Keeping that in one place is what stops a rotation
-/// from silently losing its `rotated_from` and with it reuse detection.
-///
-/// # Errors
-/// Returns [`IssueOrSqlError::Issue`] when signing fails and
-/// [`IssueOrSqlError::Sql`] when the row cannot be stored.
-async fn store_refresh_token(
-    conn: &mut TenantConn<'_>,
-    issuing_key: &IssuingKey,
-    settings: &TokenExchangeSettings,
-    principal_id: Uuid,
-    principal_kind: &str,
-    refresh: RefreshPolicy,
-) -> Result<Option<SecretString>, IssueOrSqlError> {
-    let rotated_from = match refresh {
-        RefreshPolicy::Skip => return Ok(None),
-        RefreshPolicy::Mint => None,
-        RefreshPolicy::Rotate(predecessor) => Some(predecessor),
-    };
-    let wire = principal_kind_wire(principal_kind).ok_or(IssueError::InvalidPrincipalKind)?;
-    let token = issuing_key.issue_refresh_token(
-        wire,
-        PrincipalId::new(principal_id),
-        conn.data_tenant_id(),
-        settings.refresh_ttl,
-    )?;
-    let hash = token_hash(&token);
-    let expires_at = Utc::now() + settings.refresh_ttl;
-    match rotated_from {
-        Some(predecessor) => {
-            insert_refresh_token_rotated(
-                conn,
-                Uuid::new_v4(),
-                principal_kind,
-                principal_id,
-                &hash,
-                expires_at,
-                predecessor,
-            )
-            .await?;
-        }
-        None => {
-            insert_refresh_token(
-                conn,
-                Uuid::new_v4(),
-                principal_kind,
-                principal_id,
-                &hash,
-                expires_at,
-            )
-            .await?;
-        }
-    }
-    Ok(Some(SecretString::from(token)))
-}
-
-/// Issue an access token, optional refresh token, and scope-mint audit for a principal.
+/// No refresh token: every caller here holds a durable credential — an API key
+/// or a platform-attested assertion — and re-exchanges it for a fresh access
+/// token. Minting a long-lived refresh secret for a holder that never needs one
+/// only widens the leak surface. Only a human OIDC session, which has no
+/// durable credential to re-present, receives and rotates a refresh token.
 pub(crate) async fn issue_for_subject(
     conn: &mut TenantConn<'_>,
     issuing_key: &IssuingKey,
     settings: &TokenExchangeSettings,
     subject: IssueSubject,
-    refresh: RefreshPolicy,
     request_id: &str,
     mint_kind: CardScopeMintKind,
 ) -> Result<ExchangedToken, IssueOrSqlError> {
@@ -538,7 +450,7 @@ pub(crate) async fn issue_for_subject(
     // and must be able to exchange its credential, or a provisioned tenant
     // would hand back a credential that never works.
     if subject.card_ref.is_none() {
-        return issue_cardless_subject(conn, issuing_key, settings, subject, refresh).await;
+        return issue_cardless_subject(conn, issuing_key, settings, subject).await;
     }
     let IssueSubject {
         principal_id,
@@ -569,15 +481,6 @@ pub(crate) async fn issue_for_subject(
             settings.access_ttl,
         )
         .map_err(|error| issue_or_wyrd_error(error, &card_ref))?;
-    let refresh_token = store_refresh_token(
-        conn,
-        issuing_key,
-        settings,
-        principal_id,
-        &principal_kind,
-        refresh,
-    )
-    .await?;
     let expires_at = Utc::now() + settings.access_ttl;
     write_scope_mint_success_audit(
         conn,
@@ -591,7 +494,7 @@ pub(crate) async fn issue_for_subject(
 
     Ok(ExchangedToken {
         access_token: SecretString::from(access_token),
-        refresh_token,
+        refresh_token: None,
         token_type: TokenType::Bearer,
         expires_at,
     })

@@ -288,6 +288,7 @@ fn mint_user_jwt(state: &AppState, tenant: DataTenantId) -> String {
                 card_ref_scope: wyrd_spec::reference::CardRefScope::default(),
             },
             Vec::new(),
+            None,
             Duration::minutes(5),
         )
         .expect("user jwt mints")

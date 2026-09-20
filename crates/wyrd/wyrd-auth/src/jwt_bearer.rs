@@ -28,8 +28,8 @@ use crate::audit::{
 use crate::card_scope::MINT_KIND_JWT_BEARER;
 use crate::error::auth_error_to_wyrd;
 use crate::exchange_api_key::{
-    ExchangeError, ExchangedToken, IssueSubject, RefreshPolicy, TokenExchangeSettings,
-    issue_for_subject, role_refs,
+    ExchangeError, ExchangedToken, IssueSubject, TokenExchangeSettings, issue_for_subject,
+    role_refs,
 };
 use crate::issue_api_key::principal_kind_for_card;
 use crate::permission_resolver::SqlPermissionResolver;
@@ -186,7 +186,6 @@ async fn issue_and_audit(
             // credential, so there is no credential id to record.
             credential_id: None,
         },
-        RefreshPolicy::Skip,
         request_id,
         MINT_KIND_JWT_BEARER,
     )

@@ -2313,7 +2313,12 @@ impl WyrdTestServer {
         let jwt = self
             .inner
             .issuing_key
-            .issue_user_access_token(principal, role_refs(roles)?, chrono::Duration::minutes(15))
+            .issue_user_access_token(
+                principal,
+                role_refs(roles)?,
+                None,
+                chrono::Duration::minutes(15),
+            )
             .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?;
         Ok(Bootstrap::User {
             id: PrincipalId::new(user_id),

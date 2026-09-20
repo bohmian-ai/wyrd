@@ -17,7 +17,8 @@ use wyrd_spec::auth::{IssuerUrl, TokenResponse, TokenType};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
 use wyrd_sql::queries::auth::{
-    delete_user, insert_refresh_token, insert_user, upsert_user_identity, user_id_by_identity,
+    delete_user, insert_refresh_token, insert_refresh_token_rotated, insert_user,
+    upsert_user_identity, user_id_by_identity,
 };
 use wyrd_sql::{SqlError, TenantConn, WyrdPostgres};
 
@@ -200,6 +201,7 @@ impl AuthorizationCodeExchange {
             tenant_id,
             principal_id,
             roles,
+            None,
             request_id,
         )
         .await?;
@@ -353,12 +355,34 @@ pub async fn ensure_user_identity(
     Ok(canonical)
 }
 
-async fn issue_and_record_user_session(
+/// Issue a human session's access and refresh pair and audit the grant.
+///
+/// The one owner for both ends of a human session: the OIDC callback that
+/// establishes it and the refresh grant that renews it. Keeping them together
+/// is what makes the family chain, the TTLs, and the audited grant identical
+/// on renewal — a second issuance site would drift from this one silently.
+///
+/// `rotated_from` is absent at first login and carries the consumed refresh row
+/// on renewal. It is both the family back-link that makes reuse detectable and
+/// the credential id of the renewed session: a federated sign-in presents a
+/// provider token and names no stored credential, but a request authenticated
+/// by a stored refresh row does.
+///
+/// Only human sessions get a refresh token. A machine client re-exchanges its
+/// durable credential instead, so no machine grant reaches this owner.
+///
+/// # Errors
+/// Returns a [`WyrdError`] when the access or refresh token cannot be signed,
+/// the refresh row cannot be written, or the audit append fails. Nothing is
+/// committed here: the caller's transaction commits the row, the audit, and
+/// the session together or not at all.
+pub(crate) async fn issue_and_record_user_session(
     conn: &mut TenantConn<'_>,
     issuing_key: &IssuingKey,
     tenant_id: DataTenantId,
     principal_id: Uuid,
     roles: Vec<RoleRef>,
+    rotated_from: Option<Uuid>,
     request_id: &str,
 ) -> Result<ExchangedToken, WyrdError> {
     let principal = Principal::new(
@@ -372,6 +396,7 @@ async fn issue_and_record_user_session(
         .issue_user_access_token(
             TokenPrincipalRef::from(&principal),
             roles.clone(),
+            rotated_from,
             ACCESS_TTL,
         )
         .map_err(|error| issue_error(&error))?;
@@ -385,16 +410,31 @@ async fn issue_and_record_user_session(
         .map_err(|error| issue_error(&error))?;
     let now = Utc::now();
     let expires_at = now + ACCESS_TTL;
-    insert_refresh_token(
-        conn,
-        Uuid::new_v4(),
-        "user",
-        principal_id,
-        &token_hash(&refresh_token),
-        now + REFRESH_TTL,
-    )
-    .await
-    .map_err(sql_error)?;
+    let hash = token_hash(&refresh_token);
+    let successor = Uuid::new_v4();
+    match rotated_from {
+        Some(predecessor) => insert_refresh_token_rotated(
+            conn,
+            successor,
+            "user",
+            principal_id,
+            &hash,
+            now + REFRESH_TTL,
+            predecessor,
+        )
+        .await
+        .map_err(sql_error)?,
+        None => insert_refresh_token(
+            conn,
+            successor,
+            "user",
+            principal_id,
+            &hash,
+            now + REFRESH_TTL,
+        )
+        .await
+        .map_err(sql_error)?,
+    }
     let user = PrincipalId::new(principal_id);
     let event = auth_event(
         request_id,
@@ -409,7 +449,8 @@ async fn issue_and_record_user_session(
             delegation_chain: Vec::new(),
             expires_at,
         },
-    );
+    )
+    .with_credential_id(rotated_from);
     append_auth_audit(conn, &event).await?;
 
     Ok(ExchangedToken {

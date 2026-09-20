@@ -67,6 +67,7 @@ fn mint_jwt(state: &AppState, tenant: DataTenantId, roles: &[&str]) -> String {
                 card_ref_scope: Default::default(),
             },
             role_refs,
+            None,
             Duration::minutes(15),
         )
         .expect("jwt mints")

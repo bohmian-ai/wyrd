@@ -5,28 +5,24 @@ use std::sync::Arc;
 use base64::Engine;
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::json;
-use uuid::Uuid;
 use wyrd_auth_issue::{IssueError, IssuingKey};
 use wyrd_auth_verify::RefreshTokenClaims;
-use wyrd_runtime::{PrincipalId, RoleRef};
+use wyrd_runtime::PrincipalId;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
-    consume_active_refresh, list_service_account_roles, refresh_by_hash, revoke_refresh_family,
-    service_account_by_id,
+    consume_active_refresh, list_user_roles, refresh_by_hash, revoke_refresh_family,
 };
 
 use crate::audit::{
-    REFRESH_FAMILY_REVOKE_OPERATION, TOKEN_EXCHANGE_OPERATION, append_auth_audit, auth_event,
-    principal_kind_tag,
+    REFRESH_FAMILY_REVOKE_OPERATION, append_auth_audit, auth_event, principal_kind_tag,
 };
 
-use crate::card_scope::MINT_KIND_REFRESH;
+use crate::callback::issue_and_record_user_session;
 use crate::exchange_api_key::{
-    ExchangedToken, IssueOrSqlError, IssueSubject, RefreshPolicy, TokenExchangeSettings,
-    issue_for_subject, role_refs, token_hash,
+    ExchangedToken, IssueOrSqlError, TokenExchangeSettings, role_refs, token_hash,
 };
 
 /// Refresh-token rotation service.
@@ -114,63 +110,47 @@ impl RefreshTokens {
         request_id: &str,
     ) -> Result<ExchangedToken, RefreshError> {
         let hash = token_hash(presented.expose_secret());
+        let conn_tenant = conn.data_tenant_id();
 
         match consume_active_refresh(conn, &hash).await? {
             Some(active) => {
                 let principal_id = active.principal_id;
                 let principal_kind = active.principal_kind.clone();
 
-                let exchanged = match principal_kind.as_str() {
-                    // A Card-free tenant administrator rotates through the same
-                    // owner as a Card-bound workload. It was excluded before, so
-                    // the refresh token its API-key exchange returns always failed.
-                    "service" | "agent" | "tenant_admin" => {
-                        self.rotate_stored_principal(
-                            conn,
-                            principal_id,
-                            &principal_kind,
-                            active.id,
-                            request_id,
-                        )
-                        .await?
-                    }
-                    "user" => {
-                        // Deferred to commit 06 (user-role lookup helper).
-                        todo!("user refresh rotation: implement in commit 06")
-                    }
-                    other => {
-                        tracing::error!(
-                            principal_kind = other,
-                            "unknown principal_kind in refresh token row"
-                        );
-                        return Err(RefreshError::Issue(IssueError::InvalidPrincipalKind));
-                    }
-                };
+                // Only a human session holds a refresh token. A machine
+                // client re-exchanges its durable API key or workload
+                // assertion, so a machine row here is either pre-existing state
+                // from before that split or a forgery, and neither may rotate.
+                if principal_kind.as_str() != "user" {
+                    tracing::warn!(
+                        principal_kind = %principal_kind,
+                        "refresh rotation refused for a non-human principal"
+                    );
+                    return Err(RefreshError::Issue(IssueError::InvalidPrincipalKind));
+                }
 
-                // Audit the rotation (F08): subject = actor; a refresh grant
-                // carries no delegation chain.
-                let rotated = PrincipalId::new(principal_id);
-                let event = auth_event(
+                // The successor carries the roles the user holds now, not the
+                // ones the consumed token was minted with, so a revoked role
+                // does not survive a renewal. Issuance, the family back-link,
+                // and the audited grant all run through the same owner first
+                // login used.
+                let roles = role_refs(list_user_roles(conn, principal_id).await?)
+                    .map_err(|_| RefreshError::Issue(IssueError::InvalidPrincipalKind))?;
+                let exchanged = issue_and_record_user_session(
+                    conn,
+                    self.issuing_key.as_ref(),
+                    conn_tenant,
+                    principal_id,
+                    roles,
+                    Some(active.id),
                     request_id,
-                    TOKEN_EXCHANGE_OPERATION,
-                    rotated,
-                    principal_kind_tag(&principal_kind),
-                    None,
-                    AuditOutcome::Allowed,
-                    AuditDetail::TokenExchange {
-                        subject_principal_id: rotated,
-                        actor_principal_id: rotated,
-                        delegation_chain: Vec::new(),
-                        expires_at: exchanged.expires_at,
-                    },
-                );
-                append_auth_audit(conn, &event).await?;
+                )
+                .await?;
 
                 tracing::debug!(
                     principal_id = %principal_id,
-                    principal_kind = %principal_kind,
                     rotated_from = %active.id,
-                    "refresh token rotated"
+                    "human refresh token rotated"
                 );
 
                 Ok(exchanged)
@@ -223,61 +203,6 @@ impl RefreshTokens {
             }
         }
     }
-
-    /// Issue the successor access+refresh pair for a stored principal.
-    ///
-    /// The subject is re-read from the durable row rather than trusted from the
-    /// consumed token, so a principal whose roles or Card binding changed since
-    /// the last exchange rotates under its current state. Issuance itself is the
-    /// same owner the initial API-key exchange uses; this path only supplies the
-    /// `rotated_from` back-link that keeps the family chain — and therefore reuse
-    /// detection — intact.
-    ///
-    /// # Errors
-    /// Returns [`RefreshError::Database`] when the principal row or its roles
-    /// cannot be read, and [`RefreshError::Issue`] when the principal has
-    /// disappeared, carries an unusable role, or cannot be issued for.
-    async fn rotate_stored_principal(
-        &self,
-        conn: &mut TenantConn<'_>,
-        principal_id: Uuid,
-        principal_kind: &str,
-        rotated_from: Uuid,
-        request_id: &str,
-    ) -> Result<ExchangedToken, RefreshError> {
-        let stored = service_account_by_id(conn, principal_id)
-            .await?
-            .ok_or_else(|| {
-                tracing::warn!(
-                    principal_id = %principal_id,
-                    "principal missing during refresh rotation"
-                );
-                sqlx::Error::RowNotFound
-            })?;
-
-        let roles: Vec<RoleRef> = role_refs(list_service_account_roles(conn, principal_id).await?)
-            .map_err(|_| RefreshError::Issue(IssueError::InvalidPrincipalKind))?;
-
-        issue_for_subject(
-            conn,
-            &self.issuing_key,
-            &self.settings,
-            IssueSubject {
-                principal_id,
-                principal_kind: principal_kind.to_owned(),
-                card_ref: stored.card_ref.map(|card_ref| card_ref.0),
-                roles,
-                // A rotation presents the refresh token, not the credential the
-                // first exchange used, and the stored token does not name it.
-                credential_id: None,
-            },
-            RefreshPolicy::Rotate(rotated_from),
-            request_id,
-            MINT_KIND_REFRESH,
-        )
-        .await
-        .map_err(RefreshError::from)
-    }
 }
 
 /// Decode refresh token claims from the JWT payload without signature
@@ -319,47 +244,24 @@ mod pg_tests {
     use secrecy::{ExposeSecret, SecretString};
     use sha2::{Digest, Sha256};
     use uuid::Uuid;
-    use wyrd_auth_issue::IssuingKey;
-    use wyrd_auth_verify::{
-        AccessTokenClaims, Kid, PermissionResolver, ResolveError, public_key_from_pem, verify_eddsa,
-    };
+    use wyrd_auth_issue::{IssueError, IssuingKey};
+    use wyrd_auth_verify::Kid;
     use wyrd_dev_fixtures::pg::PgFixture;
-    use wyrd_runtime::{PermissionSet, PrincipalId, PrincipalKind, RoleRef};
+    use wyrd_runtime::PrincipalId;
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::PrincipalKindTag;
-    use wyrd_spec::envelope::{CardKind, Spec};
+    use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::reference::CardRef;
 
     use wyrd_sql::TenantConn;
     use wyrd_sql::queries::auth::{insert_refresh_token, insert_service_account, refresh_by_hash};
-    use wyrd_sql::queries::cards::get_card_by_ref;
 
-    use wyrd_dev_fixtures::cards::{seed_backing_card, seed_card_with_spec};
+    use wyrd_dev_fixtures::cards::seed_backing_card;
 
     use super::{RefreshError, RefreshTokens};
     use crate::exchange_api_key::TokenExchangeSettings;
-
-    /// Return the resolved space of a test card reference.
-    fn space_of(card_ref: &CardRef) -> &SpaceName {
-        card_ref.space.as_ref().expect("test card ref has a space")
-    }
-
-    /// Resolver stub for token projection: this test asserts signed Card scope,
-    /// not role permissions, so it grants nothing.
-    #[derive(Debug)]
-    struct AllowNothingResolver;
-
-    impl PermissionResolver for AllowNothingResolver {
-        async fn resolve(
-            &self,
-            _tenant_id: &DataTenantId,
-            _roles: &[RoleRef],
-        ) -> Result<PermissionSet, ResolveError> {
-            Ok(PermissionSet::new())
-        }
-    }
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
 
@@ -466,20 +368,20 @@ mod pg_tests {
         .expect("refresh token inserts");
     }
 
+    /// A human session rotates: the consumed row is retired and the successor
+    /// links back to it.
     #[tokio::test]
     async fn happy_rotation_mints_new_pair_and_revokes_old_row() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
         let key = test_issuing_key();
-        let card_ref = service_card_ref();
 
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let user_id = insert_test_user(&mut conn, tenant).await;
-        let sa_id = insert_test_service_account(&mut conn, user_id, &card_ref).await;
 
-        let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::Service, sa_id, tenant);
+        let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::User, user_id, tenant);
         let original_hash = hash_of(&refresh_jwt);
-        seed_active_refresh(&mut conn, "service", sa_id, &original_hash).await;
+        seed_active_refresh(&mut conn, "user", user_id, &original_hash).await;
 
         let result = refresh_service()
             .execute(&mut conn, refresh_jwt, "req-happy-rotation")
@@ -572,15 +474,13 @@ mod pg_tests {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
         let key = test_issuing_key();
-        let card_ref = service_card_ref();
 
         let mut setup_conn = fixture.tenant_conn().await.expect("setup conn opens");
         let user_id = insert_test_user(&mut setup_conn, tenant).await;
-        let sa_id = insert_test_service_account(&mut setup_conn, user_id, &card_ref).await;
 
-        let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::Service, sa_id, tenant);
+        let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::User, user_id, tenant);
         let original_hash = hash_of(&refresh_jwt);
-        seed_active_refresh(&mut setup_conn, "service", sa_id, &original_hash).await;
+        seed_active_refresh(&mut setup_conn, "user", user_id, &original_hash).await;
         setup_conn.commit().await.expect("setup commits");
 
         // First caller: present the token, rotate, and commit.
@@ -686,8 +586,61 @@ mod pg_tests {
         );
     }
 
+    /// The rotation's audited grant names the refresh row it consumed.
+    ///
+    /// Without it, a renewed human session and a first federated sign-in are
+    /// indistinguishable in retained evidence, even though one of them was
+    /// authenticated by a stored credential this deployment can revoke.
     #[tokio::test]
     async fn f08_audit_row_written_on_rotation() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let key = test_issuing_key();
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let user_id = insert_test_user(&mut conn, tenant).await;
+
+        let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::User, user_id, tenant);
+        let hash = hash_of(&refresh_jwt);
+        seed_active_refresh(&mut conn, "user", user_id, &hash).await;
+        let consumed = refresh_by_hash(&mut conn, &hash)
+            .await
+            .expect("lookup")
+            .expect("seeded row exists")
+            .id;
+
+        refresh_service()
+            .execute(&mut conn, refresh_jwt, "req-audit-check")
+            .await
+            .expect("rotation succeeds");
+
+        let credentials: Vec<Option<Uuid>> = sqlx::query_scalar(
+            "SELECT credential_id FROM vala.audit_staging
+              WHERE data_tenant_id = $1
+                AND operation = 'auth.token.exchange'
+                AND principal_id = $2",
+        )
+        .bind(tenant.as_uuid())
+        .bind(user_id)
+        .fetch_all(&mut **conn.transaction())
+        .await
+        .expect("audit query runs");
+
+        assert_eq!(
+            credentials,
+            vec![Some(consumed)],
+            "the rotation is audited once, naming the consumed refresh row"
+        );
+    }
+
+    /// A machine principal's refresh row cannot rotate.
+    ///
+    /// Machine clients re-exchange a durable credential; they are never issued
+    /// a refresh token. A row claiming otherwise is either pre-split residue or
+    /// a forgery, and rotating it would hand out a long-lived successor to a
+    /// holder the split says should not have one.
+    #[tokio::test]
+    async fn a_machine_refresh_row_cannot_rotate() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
         let key = test_issuing_key();
@@ -701,24 +654,17 @@ mod pg_tests {
         let hash = hash_of(&refresh_jwt);
         seed_active_refresh(&mut conn, "service", sa_id, &hash).await;
 
-        refresh_service()
-            .execute(&mut conn, refresh_jwt, "req-audit-check")
-            .await
-            .expect("rotation succeeds");
+        let result = refresh_service()
+            .execute(&mut conn, refresh_jwt, "req-machine-rotate")
+            .await;
 
-        let count: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM vala.audit_staging
-              WHERE data_tenant_id = $1
-                AND operation = 'auth.token.exchange'
-                AND principal_id = $2",
-        )
-        .bind(tenant.as_uuid())
-        .bind(sa_id)
-        .fetch_one(&mut **conn.transaction())
-        .await
-        .expect("audit count query runs");
-
-        assert!(count.0 >= 1, "at least one audit row written on rotation");
+        assert!(
+            matches!(
+                result,
+                Err(RefreshError::Issue(IssueError::InvalidPrincipalKind))
+            ),
+            "a machine refresh row is refused: {result:?}"
+        );
     }
 
     #[test]
@@ -768,159 +714,5 @@ mod pg_tests {
         let extracted = super::tenant_from_refresh_jwt(&jwt).expect("tenant extracted");
 
         assert_eq!(extracted, tenant_id);
-    }
-
-    /// Ingest resolves Card correlation from signed claims alone, so a real
-    /// rotation must sign, verify, and project every scope member's registry
-    /// UID through to the runtime `Principal`.
-    #[tokio::test]
-    async fn refresh_signs_resolved_scope_uids() {
-        let fixture = PgFixture::start().await.expect("fixture starts");
-        let tenant = fixture.data_tenant_id();
-        let key = test_issuing_key();
-        let root = service_card_ref();
-        let secondary = CardRef {
-            name: CardName::new("scope-secondary").expect("static name is valid"),
-            ..service_card_ref()
-        };
-
-        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        let user_id = insert_test_user(&mut conn, tenant).await;
-        seed_backing_card(&mut conn, &secondary, user_id).await;
-        let root_spec = Spec::from_kind_and_value(
-            &CardKind::Service,
-            serde_json::json!({
-                "components": [{
-                    "alias": "secondary",
-                    "ref": {
-                        "kind": "Service",
-                        "space": space_of(&secondary).as_str(),
-                        "name": secondary.name.as_str(),
-                        "version": secondary.version.as_str(),
-                    },
-                }],
-            }),
-        )
-        .expect("root service spec decodes");
-        seed_card_with_spec(&mut conn, &root, &root_spec, user_id).await;
-        let sa_id = insert_test_service_account(&mut conn, user_id, &root).await;
-
-        let expected_root_uid = get_card_by_ref(
-            &mut conn,
-            root.kind.clone(),
-            space_of(&root),
-            &root.name,
-            &root.version,
-        )
-        .await
-        .expect("root card row loads")
-        .card_uid;
-        let expected_secondary_uid = get_card_by_ref(
-            &mut conn,
-            secondary.kind.clone(),
-            space_of(&secondary),
-            &secondary.name,
-            &secondary.version,
-        )
-        .await
-        .expect("secondary card row loads")
-        .card_uid;
-
-        let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::Service, sa_id, tenant);
-        let hash = hash_of(&refresh_jwt);
-        seed_active_refresh(&mut conn, "service", sa_id, &hash).await;
-
-        let exchanged = refresh_service()
-            .execute(&mut conn, refresh_jwt, "req-scope-uids")
-            .await
-            .expect("rotation succeeds");
-
-        let verifying_pem = key.verifying_key_pem().expect("verifying key encodes");
-        let decoding_key =
-            public_key_from_pem(verifying_pem.as_bytes()).expect("verifying key decodes");
-        let claims: AccessTokenClaims = verify_eddsa(
-            exchanged.access_token.expose_secret(),
-            &decoding_key,
-            Some("wyrd"),
-        )
-        .expect("signed access token verifies");
-
-        let verified = claims
-            .into_verified(&AllowNothingResolver)
-            .await
-            .expect("verified token projects");
-        let PrincipalKind::Service { card_ref_scope, .. } = verified.principal.kind.clone() else {
-            panic!("service rotation yields a service principal");
-        };
-
-        assert_eq!(
-            card_ref_scope.len(),
-            2,
-            "root and secondary are both signed"
-        );
-        let signed_root = card_ref_scope
-            .as_slice()
-            .iter()
-            .find(|member| member.same_identity(&root))
-            .expect("root member is signed");
-        assert_eq!(
-            signed_root.uid.as_ref(),
-            Some(&expected_root_uid),
-            "verified root member keeps its registry uid"
-        );
-        let signed_secondary = card_ref_scope
-            .as_slice()
-            .iter()
-            .find(|member| member.same_identity(&secondary))
-            .expect("secondary member is signed");
-        assert_eq!(
-            signed_secondary.uid.as_ref(),
-            Some(&expected_secondary_uid),
-            "verified secondary member keeps its registry uid"
-        );
-    }
-
-    #[tokio::test]
-    async fn rotation_writes_card_scope_mint_audit_row() {
-        let fixture = PgFixture::start().await.expect("fixture starts");
-        let tenant = fixture.data_tenant_id();
-        let key = test_issuing_key();
-        let card_ref = service_card_ref();
-
-        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        let user_id = insert_test_user(&mut conn, tenant).await;
-        let sa_id = insert_test_service_account(&mut conn, user_id, &card_ref).await;
-
-        let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::Service, sa_id, tenant);
-        let hash = hash_of(&refresh_jwt);
-        seed_active_refresh(&mut conn, "service", sa_id, &hash).await;
-
-        refresh_service()
-            .execute(&mut conn, refresh_jwt, "req-scope-audit")
-            .await
-            .expect("rotation succeeds");
-
-        let (outcome, detail): (String, String) = sqlx::query_as(
-            "SELECT outcome, detail
-               FROM vala.audit_staging
-              WHERE data_tenant_id = $1
-                AND operation = 'auth.card_scope.mint'
-                AND principal_id = $2
-              LIMIT 1",
-        )
-        .bind(tenant.as_uuid())
-        .bind(sa_id)
-        .fetch_one(&mut **conn.transaction())
-        .await
-        .expect("card scope mint audit event is staged");
-        let detail: serde_json::Value =
-            serde_json::from_str(&detail).expect("audit detail is json");
-
-        assert_eq!(detail["mint_kind"], "refresh", "mint_kind is refresh");
-        assert_eq!(outcome, "allowed", "mint is allowed");
-        assert_eq!(
-            detail["scope_member_count"], 1,
-            "single-card scope has member count 1"
-        );
     }
 }

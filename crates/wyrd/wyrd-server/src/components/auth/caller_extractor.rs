@@ -170,7 +170,7 @@ mod pg_tests {
             .issuing_key
             .as_ref()
             .expect("test state has issuing key")
-            .issue_user_access_token(principal, vec![], chrono::Duration::minutes(5))
+            .issue_user_access_token(principal, vec![], None, chrono::Duration::minutes(5))
             .expect("test jwt mints")
     }
 }

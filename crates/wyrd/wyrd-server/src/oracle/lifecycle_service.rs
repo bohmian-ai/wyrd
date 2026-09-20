@@ -281,6 +281,7 @@ pub(crate) mod pg_tests {
             .issue_user_access_token(
                 principal,
                 Vec::<RoleRef>::new(),
+                None,
                 chrono::Duration::minutes(5),
             )
             .expect("test token signs");

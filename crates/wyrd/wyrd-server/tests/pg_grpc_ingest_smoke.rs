@@ -95,6 +95,7 @@ fn mint_user_jwt(state: &AppState, tenant: DataTenantId, roles: &[&str]) -> Stri
                 .iter()
                 .map(|role| RoleRef::new(role).expect("static role is valid"))
                 .collect(),
+            None,
             ChronoDuration::minutes(5),
         )
         .expect("test jwt mints")

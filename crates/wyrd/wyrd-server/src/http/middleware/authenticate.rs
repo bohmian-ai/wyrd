@@ -193,7 +193,7 @@ mod pg_tests {
             .issuing_key
             .as_ref()
             .expect("test state has issuing key")
-            .issue_user_access_token(principal, vec![], ttl)
+            .issue_user_access_token(principal, vec![], None, ttl)
             .expect("test jwt mints")
     }
 

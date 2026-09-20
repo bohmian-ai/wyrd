@@ -27,7 +27,7 @@ use crate::auth::exchange_api_key::{
 use crate::auth::issue_api_key::{IssueApiKey, WyrdApiKey};
 use crate::auth::jwt_bearer::JwtBearer;
 use crate::auth::login::login as login_handler;
-use crate::auth::refresh::{RefreshTokens, tenant_from_refresh_jwt};
+use crate::auth::refresh::{RefreshError, RefreshTokens, tenant_from_refresh_jwt};
 use crate::components::auth::{AuthenticatedPrincipal, Caller};
 use crate::http::error::WyrdErrorResponse;
 use crate::http::error::internal_failure;
@@ -228,6 +228,17 @@ async fn token(
             let exchanged = match exchanged {
                 Ok(exchanged) => exchanged,
                 Err(error) => {
+                    // Replay is the one refusal that also writes. Detection
+                    // revoked the whole family and appended the canonical
+                    // revocation event on this transaction; rolling that back
+                    // with every other error would tell the legitimate holder
+                    // the theft was contained while leaving the attacker's
+                    // successor usable. Committing first makes the containment
+                    // durable, and the 401 is rendered from the typed outcome
+                    // exactly as before.
+                    if matches!(error, RefreshError::Reused) {
+                        conn.commit().await.map_err(sql_error)?;
+                    }
                     let wyrd = WyrdError::from(error);
                     audit_scope_mint_failure_best_effort(
                         state.postgres.app_pool(),

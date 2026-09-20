@@ -143,6 +143,7 @@ mod tests {
             .issue_user_access_token(
                 user_principal(),
                 vec![RoleRef::new("runtime_admin").expect("static role is valid")],
+                None,
                 ChronoDuration::minutes(5),
             )
             .expect("issuing key mints a token");

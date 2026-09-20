@@ -1493,28 +1493,34 @@ impl BifrostCatalog {
 /// Arrow and `+00:00` by Iceberg. Field order, names, nullability, units, and
 /// every other data-type detail remain exact.
 pub(crate) fn schema_shape_matches(expected: &Schema, actual: &Schema) -> bool {
-    // Iceberg identifies a column by field id, not by position. When both
-    // sides state their ids, compare on them: a table evolved by an additive
-    // `ADD COLUMN` carries the new column physically last while a table
-    // created fresh declares it in its canonical position, and the two are the
-    // same table. Position remains the comparison wherever ids are auto
-    // assigned, because there position *is* the id.
-    if let (Some(expected_by_id), Some(actual_by_id)) =
-        (fields_by_stable_id(expected), fields_by_stable_id(actual))
-    {
-        return expected_by_id.len() == actual_by_id.len()
-            && expected_by_id.iter().all(|(id, expected)| {
-                actual_by_id
-                    .get(id)
-                    .is_some_and(|actual| field_shape_matches(expected, actual))
-            });
-    }
-    expected.fields().len() == actual.fields().len()
+    if expected.fields().len() == actual.fields().len()
         && expected
             .fields()
             .iter()
             .zip(actual.fields())
             .all(|(expected, actual)| field_shape_matches(expected, actual))
+    {
+        return true;
+    }
+    // Position is the comparison, and stays the comparison for every table
+    // whose two sides line up. Only when it does not do the declared Iceberg
+    // field ids get a say, and then only if both sides state a complete,
+    // unambiguous set: an additive `ADD COLUMN` appends the new column
+    // physically last while the declaration names it in its canonical
+    // position, and Iceberg calls those the same table because it identifies
+    // a column by id. Nothing else reaches here, so no table that used to be
+    // refused for a real shape conflict is accepted now.
+    let (Some(expected_by_id), Some(actual_by_id)) =
+        (fields_by_stable_id(expected), fields_by_stable_id(actual))
+    else {
+        return false;
+    };
+    expected_by_id.len() == actual_by_id.len()
+        && expected_by_id.iter().all(|(id, expected)| {
+            actual_by_id
+                .get(id)
+                .is_some_and(|actual| field_shape_matches(expected, actual))
+        })
 }
 
 /// Whether two fields describe the same column name, nullability, and layout.

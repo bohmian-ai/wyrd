@@ -261,6 +261,7 @@ mod pg_tests {
     use wyrd_dev_fixtures::cards::seed_backing_card;
 
     use super::{RefreshError, RefreshTokens};
+    use crate::audit::REFRESH_FAMILY_REVOKE_OPERATION;
     use crate::exchange_api_key::TokenExchangeSettings;
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
@@ -417,13 +418,11 @@ mod pg_tests {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
         let key = test_issuing_key();
-        let card_ref = service_card_ref();
 
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let user_id = insert_test_user(&mut conn, tenant).await;
-        let sa_id = insert_test_service_account(&mut conn, user_id, &card_ref).await;
 
-        let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::Service, sa_id, tenant);
+        let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::User, user_id, tenant);
         let stale_hash = hash_of(&refresh_jwt);
 
         // Insert the token as already-revoked (simulates a previously rotated token).
@@ -432,19 +431,19 @@ mod pg_tests {
             INSERT INTO wyrd.auth_refresh_tokens
                 (id, data_tenant_id, principal_kind, principal_id, token_hash,
                  expires_at, revoked_at, revoked_reason)
-            VALUES ($1, $2, 'service', $3, $4, now() + interval '30 days', now(), 'rotated')
+            VALUES ($1, $2, 'user', $3, $4, now() + interval '30 days', now(), 'rotated')
             ",
         )
         .bind(Uuid::new_v4())
         .bind(tenant.as_uuid())
-        .bind(sa_id)
+        .bind(user_id)
         .bind(&stale_hash)
         .execute(&mut **conn.transaction())
         .await
         .expect("stale token inserts");
 
         // Insert a second active token for the same principal (a sibling in the family).
-        seed_active_refresh(&mut conn, "service", sa_id, "hash-active-sibling").await;
+        seed_active_refresh(&mut conn, "user", user_id, "hash-active-sibling").await;
 
         let result = refresh_service()
             .execute(&mut conn, refresh_jwt, "req-reuse")
@@ -630,6 +629,100 @@ mod pg_tests {
             credentials,
             vec![Some(consumed)],
             "the rotation is audited once, naming the consumed refresh row"
+        );
+    }
+
+    /// R2-4: replay containment survives the refused request.
+    ///
+    /// Reuse is the one refusal that also writes. The route commits the staged
+    /// family revocation before rendering its `401`, so this drives the same
+    /// sequence a real caller does — rotate, replay, commit the refusal — and
+    /// then opens a *fresh* transaction to prove the containment is durable
+    /// rather than rolled back with the failed request: the attacker's
+    /// successor is dead, it cannot itself rotate, and the family revocation
+    /// was audited exactly once.
+    #[tokio::test]
+    async fn f09_replay_containment_commits_and_kills_the_successor() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let key = test_issuing_key();
+
+        let mut setup_conn = fixture.tenant_conn().await.expect("setup conn opens");
+        let user_id = insert_test_user(&mut setup_conn, tenant).await;
+        let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::User, user_id, tenant);
+        let original_hash = hash_of(&refresh_jwt);
+        seed_active_refresh(&mut setup_conn, "user", user_id, &original_hash).await;
+        setup_conn.commit().await.expect("setup commits");
+
+        // The legitimate rotation, committed the way the route commits it.
+        let mut conn_a = fixture.tenant_conn().await.expect("conn_a opens");
+        let rotated = refresh_service()
+            .execute(
+                &mut conn_a,
+                SecretString::from(refresh_jwt.expose_secret().to_owned()),
+                "req-replay-rotate",
+            )
+            .await
+            .expect("rotation succeeds");
+        conn_a.commit().await.expect("conn_a commits");
+        let successor = rotated
+            .refresh_token
+            .expect("rotation issues a refresh token");
+        let successor_hash = hash_of(&successor);
+
+        // The replay. The route commits this transaction for `Reused` alone.
+        let mut conn_b = fixture.tenant_conn().await.expect("conn_b opens");
+        let replay = refresh_service()
+            .execute(
+                &mut conn_b,
+                SecretString::from(refresh_jwt.expose_secret().to_owned()),
+                "req-replay",
+            )
+            .await;
+        assert!(
+            matches!(replay, Err(RefreshError::Reused)),
+            "replaying the consumed token is refused: {replay:?}"
+        );
+        conn_b
+            .commit()
+            .await
+            .expect("the refused request still commits");
+
+        // A separate transaction: everything below is committed state.
+        let mut conn_c = fixture.tenant_conn().await.expect("conn_c opens");
+        let successor_row = refresh_by_hash(&mut conn_c, &successor_hash)
+            .await
+            .expect("lookup")
+            .expect("successor row exists");
+        assert_eq!(
+            successor_row.revoked_reason.as_deref(),
+            Some("reuse_detected"),
+            "the successor is revoked in committed state"
+        );
+
+        let revocations: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM vala.audit_staging
+              WHERE data_tenant_id = $1
+                AND operation = $2
+                AND principal_id = $3",
+        )
+        .bind(tenant.as_uuid())
+        .bind(REFRESH_FAMILY_REVOKE_OPERATION)
+        .bind(user_id)
+        .fetch_one(&mut **conn_c.transaction())
+        .await
+        .expect("audit query runs");
+        assert_eq!(
+            revocations, 1,
+            "exactly one family revocation is visible from another transaction"
+        );
+
+        let successor_replay = refresh_service()
+            .execute(&mut conn_c, successor, "req-successor")
+            .await;
+        assert!(
+            matches!(successor_replay, Err(RefreshError::Reused)),
+            "the successor cannot rotate: {successor_replay:?}"
         );
     }
 

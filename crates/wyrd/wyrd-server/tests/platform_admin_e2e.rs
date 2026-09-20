@@ -3024,6 +3024,222 @@ async fn an_operator_suspends_and_resumes_a_tenant_through_the_platform_plane() 
     );
 }
 
+/// Every durable provisioning stage, failed in turn, leaves nothing usable and
+/// converges on one tenant when retried.
+///
+/// The stages are the actual commit boundaries the workflow crosses: the
+/// directory claim's audit row, the role seed, the administrative principal,
+/// its grant, its credential, the tenant transaction's own commit, and the
+/// promotion to active. Each one is forced to fail by a trigger scoped to that
+/// stage's slug, so the server's real error path — not a test's idea of it —
+/// is what marks the tenant failed. The property under test is the same at
+/// every stage: no admitted tenant, no usable credential, and a retry that
+/// lands on the original tenant id holding exactly one administrative
+/// principal, one grant, and one live credential.
+///
+/// The commit-time case uses a deferred constraint trigger, which is the only
+/// way to fail the tenant transaction at `COMMIT` rather than at a statement.
+#[tokio::test]
+async fn every_durable_provisioning_stage_fails_closed_and_retries_clean() {
+    if !e2e_enabled() {
+        return;
+    }
+    let srv = WyrdTestServer::start_in_process()
+        .await
+        .expect("server starts");
+    let root = initialize_platform_root(&srv)
+        .await
+        .expect("deployment initializes");
+    let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool opens");
+
+    // One guard for every stage, told which slug to fail through a trigger
+    // argument: Postgres forbids a subquery in a trigger `WHEN` clause, so the
+    // slug lookup has to happen in the function body. Scoping to one slug is
+    // what keeps an installed trigger from disturbing another stage's tenant
+    // or the deployment's own rows.
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION wyrd.injected_stage_failure() RETURNS trigger
+         LANGUAGE plpgsql AS $$
+         DECLARE
+             target text := TG_ARGV[0];
+             mine boolean;
+         BEGIN
+             IF TG_TABLE_NAME = 'audit_staging' THEN
+                 mine := NEW.resource = 'tenant_slug:' || target;
+             ELSIF TG_TABLE_NAME = 'tenants' THEN
+                 mine := NEW.slug = target AND NEW.status = 'active';
+             ELSE
+                 mine := EXISTS (
+                     SELECT 1 FROM platform.tenants
+                      WHERE data_tenant_id = NEW.data_tenant_id AND slug = target);
+             END IF;
+             IF mine THEN
+                 RAISE EXCEPTION 'injected stage failure';
+             END IF;
+             RETURN NEW;
+         END $$",
+    )
+    .execute(&superuser)
+    .await
+    .expect("the injection function is created");
+
+    let stages: [(&str, &str, &str); 7] = [
+        (
+            "claim-audit",
+            "CREATE TRIGGER fail_stage BEFORE INSERT ON vala.audit_staging
+             FOR EACH ROW EXECUTE FUNCTION wyrd.injected_stage_failure('stage-claim-audit')",
+            "DROP TRIGGER fail_stage ON vala.audit_staging",
+        ),
+        (
+            "role-seed",
+            "CREATE TRIGGER fail_stage BEFORE INSERT ON wyrd.auth_roles
+             FOR EACH ROW EXECUTE FUNCTION wyrd.injected_stage_failure('stage-role-seed')",
+            "DROP TRIGGER fail_stage ON wyrd.auth_roles",
+        ),
+        (
+            "principal",
+            "CREATE TRIGGER fail_stage BEFORE INSERT ON wyrd.auth_service_accounts
+             FOR EACH ROW EXECUTE FUNCTION wyrd.injected_stage_failure('stage-principal')",
+            "DROP TRIGGER fail_stage ON wyrd.auth_service_accounts",
+        ),
+        (
+            "grant",
+            "CREATE TRIGGER fail_stage BEFORE INSERT ON wyrd.auth_service_account_roles
+             FOR EACH ROW EXECUTE FUNCTION wyrd.injected_stage_failure('stage-grant')",
+            "DROP TRIGGER fail_stage ON wyrd.auth_service_account_roles",
+        ),
+        (
+            "credential",
+            "CREATE TRIGGER fail_stage BEFORE INSERT ON wyrd.auth_api_keys
+             FOR EACH ROW EXECUTE FUNCTION wyrd.injected_stage_failure('stage-credential')",
+            "DROP TRIGGER fail_stage ON wyrd.auth_api_keys",
+        ),
+        (
+            "tenant-commit",
+            "CREATE CONSTRAINT TRIGGER fail_stage AFTER INSERT ON wyrd.auth_api_keys
+             DEFERRABLE INITIALLY DEFERRED
+             FOR EACH ROW EXECUTE FUNCTION wyrd.injected_stage_failure('stage-tenant-commit')",
+            "DROP TRIGGER fail_stage ON wyrd.auth_api_keys",
+        ),
+        (
+            "active-promotion",
+            "CREATE TRIGGER fail_stage BEFORE UPDATE ON platform.tenants
+             FOR EACH ROW EXECUTE FUNCTION wyrd.injected_stage_failure('stage-active-promotion')",
+            "DROP TRIGGER fail_stage ON platform.tenants",
+        ),
+    ];
+
+    let create = async |slug: &str| -> (StatusCode, Value) {
+        let resp = srv
+            .oneshot(platform_post(
+                "/platform/tenants",
+                &session,
+                json!({ "slug": slug, "display_name": slug }),
+            ))
+            .await
+            .expect("tenant route responds");
+        let status = resp.status();
+        (status, body_json(resp).await)
+    };
+
+    for (stage, install, remove) in stages {
+        let slug = format!("stage-{stage}");
+        sqlx::query(install)
+            .execute(&superuser)
+            .await
+            .unwrap_or_else(|error| panic!("the {stage} injection installs: {error}"));
+
+        let (status, body) = create(&slug).await;
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "a {stage} failure is not reported as a provisioned tenant: {body}"
+        );
+        assert!(
+            !body.to_string().contains("injected stage failure"),
+            "the served {stage} failure discloses nothing internal: {body}"
+        );
+
+        // Nothing admitted: a directory row that survived the failure is
+        // visibly incomplete, and a stage that failed before the claim
+        // committed left no row at all.
+        let claimed: Option<(uuid::Uuid, String)> =
+            sqlx::query_as("SELECT data_tenant_id, status FROM platform.tenants WHERE slug = $1")
+                .bind(&slug)
+                .fetch_optional(srv.operator_pool().pool())
+                .await
+                .expect("the directory reads back");
+        if let Some((_, status)) = &claimed {
+            assert_eq!(
+                status, "failed",
+                "an interrupted {stage} leaves the tenant visibly incomplete"
+            );
+        }
+
+        // No usable credential: a plaintext was never returned, and anything
+        // a partial attempt committed is revoked or rolled back.
+        assert!(
+            body.get("admin").is_none(),
+            "a failed {stage} returns no credential: {body}"
+        );
+
+        sqlx::query(remove)
+            .execute(&superuser)
+            .await
+            .unwrap_or_else(|error| panic!("the {stage} injection is removed: {error}"));
+
+        let (status, retried) = create(&slug).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the retry after a {stage} failure provisions: {retried}"
+        );
+        let tenant_id = retried["tenant"]["id"].as_str().expect("tenant id");
+        if let Some((claimed_id, _)) = claimed {
+            assert_eq!(
+                tenant_id,
+                claimed_id.to_string(),
+                "the retry after a {stage} failure resumes the claimed tenant"
+            );
+        }
+
+        let counts: (i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM wyrd.auth_service_accounts WHERE data_tenant_id = $1),
+                    (SELECT count(*) FROM wyrd.auth_service_account_roles WHERE data_tenant_id = $1),
+                    (SELECT count(*) FROM wyrd.auth_api_keys
+                      WHERE data_tenant_id = $1 AND revoked_at IS NULL)",
+        )
+        .bind(uuid::Uuid::parse_str(tenant_id).expect("the tenant id is a uuid"))
+        .fetch_one(&superuser)
+        .await
+        .expect("the tenant's durable rows are counted");
+        assert_eq!(
+            counts,
+            (1, 1, 1),
+            "the retry after a {stage} failure leaves one principal, grant, and live credential"
+        );
+        assert!(
+            tenant_token(
+                &srv,
+                retried["admin"]["credential"].as_str().expect("credential")
+            )
+            .await
+            .is_ok(),
+            "the credential the retry after a {stage} failure returned is usable"
+        );
+    }
+
+    sqlx::query("DROP FUNCTION wyrd.injected_stage_failure()")
+        .execute(&superuser)
+        .await
+        .expect("the injection function is removed");
+}
+
 /// Provisioning survives a real stage failure, an abandoned attempt, and two
 /// callers racing for the same slug.
 ///

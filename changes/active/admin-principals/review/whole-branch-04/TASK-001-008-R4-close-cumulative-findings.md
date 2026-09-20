@@ -398,14 +398,13 @@ implementation evidence table mapping every acceptance row above to the commit,
 exact focused proof, broader lanes, and result. A status narrative or aggregate
 count is not proof of a specifically named test.
 
-## Implementation state (in progress — handoff)
+## Implementation state
 
 Base `c5c20754a167e8f4d74a555a720bd51df6179a6f`, branch
-`claude/admin-principals-spec-qfsmjc`, worktree
-`/Users/stevenforrester/Documents/GitHub/wyrd-bifrost-surfaces`.
+`claude/admin-principals-spec-qfsmjc`.
 
-All fifteen findings are implemented and committed. What remains is the tail of
-the required verification list and the final evidence table below.
+All fifteen findings are implemented and committed, and the complete required
+verification list has been run on the final tree.
 
 ### Preserved uncommitted owner state — do not commit
 
@@ -484,50 +483,125 @@ WYRD_IDENTITY_E2E=1 WYRD_KEYCLOAK_ISSUER=http://localhost:8080/realms/wyrd-test 
 → Summary: 2 tests run: 2 passed, 18 skipped
 ```
 
-### Required lanes run on the final tree so far
+
+### `R4-12` completion (`42c2b654c`)
+
+The diff-based audit over `c5c20754…` → working tree was rebuilt as a throwaway
+scratchpad script (never committed; the packet forbids a permanent documentation
+scanner). It maps every changed line to the innermost enclosing item by brace
+span, walks upward past multi-line attribute blocks to find a `///`, accepts an
+inner `//!` for a module, exempts trait-impl methods (they inherit the trait's
+documented contract) and `#[cfg(test)]` module interiors, and separately
+requires a `# Errors` section on every non-test fn returning `Result<`.
+
+Its first correct run reported gaps the earlier pass had missed, all now closed:
+
+- `# Errors` contracts added to 24 fallible items across `wyrd-auth-oidc`,
+  `wyrd-auth-verify`, `wyrd-client`, `vala-bifrost-redux`, `wyrd-auth`,
+  `wyrd-cli`, `wyrd-server`, `wyrd-sql`, and `wyrd-testing`.
+- Rustdoc added to undocumented items: `REPLACE_USER_ROLES_SQL`,
+  `PRIVATE_KEY_PEM`, the `provisioning` module in the `platform` query tree,
+  `reason_schema`, `issue_access_token_with_claims`, `workload_exchange_error`,
+  `PrincipalCommand`, `AddArgs`, `wyrd-server`'s `main`, and nine test items in
+  `/tests/` files this change touched.
+- Three intra-doc links this branch introduced that resolved to private or
+  absent items were made plain: `VERIFICATIONS` in `credential_verify.rs`,
+  `OperatorPool` in `platform_credentials.rs`, and
+  `HttpTransport::authenticated_url` in `transport/http.rs`.
+
+The final run reports three residual entries, each a limitation of the throwaway
+script rather than a gap: `wyrd-auth-check/src/hook.rs` `principal` lives inside
+`#[cfg(all(test, feature = "test-helpers"))]`, `pg_audit_staging.rs`
+`mod audit_staging` is nested inside an already-documented `mod pg_tests`, and
+`pub mod provisioning;` is documented by both its parent's `//!` and its own
+child `//!` (which follows a `//` allowlist line the script stops at).
+
+Pre-existing broken intra-doc links remain in files this change does not touch
+(`wyrd-auth-oidc/src/provider.rs`, `wyrd-client/src/bifrost/{facade,scope}.rs`,
+`wyrd-auth/src/card_scope.rs`, several `wyrd-server` and `vala-bifrost-redux`
+modules). No repository lane covers them, and fixing them is rustdoc-lane
+policy widening, which this packet excludes.
+
+### Environment substitutions on this host
+
+Recorded so the commands are reproducible rather than silently different:
+
+- `mise run check:unwrap-audit`, `check:clippy-allow-audit`,
+  `check:tenant-isolation`, and `docs:check` shell out to `python`, which this
+  host does not provide and which `mise run` will not take from an outer
+  `PATH`. Each was run as the identical script under `python3`; `docs:check`
+  was run step by step (`generate_card_docs`, `generate_api_docs`,
+  `generate_llms_txt`, the generated-docs drift `git diff --exit-code`,
+  `check_commands`, `mise run docs:build`, `check_links`, `check_a11y`).
+- `check:client-tier` needs `rg`; ripgrep 15.2.0 was installed into
+  `~/.cargo/bin` and the task then ran unmodified.
+- The host's Docker publishes a container port slightly after reporting the
+  container healthy, so a lane occasionally dies with
+  `psql: connection refused` or, inside a test, `pool timed out while waiting
+  for an open connection`. Failures rotate between runs and never repeat on the
+  same test, so lanes were retried until a clean run; every result below is a
+  single clean run, not a merge of partial runs. `test:shared` additionally ran
+  with `NEXTEST_TEST_THREADS=4`.
+
+### Required lanes on the final candidate `42c2b654c`
 
 | Lane | Result |
 |---|---|
 | `mise run fmt` / `mise run fmt:check` | PASS |
 | `mise run lints` | PASS |
 | `mise run check:client-tier` | PASS |
-| `mise run check:unwrap-audit` | PASS |
-| `mise run check:clippy-allow-audit` | PASS |
-| `mise run check:tenant-isolation` | PASS |
-| `mise run test:shared` | PASS — 664 tests run, 664 passed |
-| `mise run test:principals:unit` | PASS — 11 / 11 / 4 passed |
-| `mise run test:principals:integration` | PASS — 2 / 12 / 15 passed |
+| `mise run check:unwrap-audit` (`python3 scripts/check_unwrap_audit.py`) | PASS |
+| `mise run check:clippy-allow-audit` (`python3 scripts/check_clippy_allow.py`) | PASS |
+| `mise run check:tenant-isolation` (`python3 scripts/check_tenant_isolation.py`) | PASS |
+| `mise run test:shared` | PASS — 664 tests run, 664 passed, 3 skipped |
+| `mise run test:principals:unit` | PASS — 2 / 11 / 11 / 4 passed |
+| `mise run test:principals:integration` | PASS — 9 / 11 / 7 / 4 / 3 / 14 / 7 / 2 / 12 / 15 passed |
 | `mise run test:platform:journey` (run 1) | PASS — 35 tests run, 35 passed |
 | `mise run test:platform:journey` (run 2) | PASS — 35 tests run, 35 passed |
 | `mise run test:identity:journey` | PASS — 20 tests run, 20 passed |
-| `mise run test:cli:journey` | PASS |
+| `mise run test:cli:journey` | PASS — 24 passed, 5 ignored |
 | `mise run test:bifrost:journey:mcp` | PASS — 9 tests run, 9 passed |
-| `mise run test:wyrd` | PASS — 2022 tests run, 2022 passed |
-| `mise run docs:check` | PASS — 60 pages, contrast AA |
+| `mise run test:sql` | PASS — 122 / 4 / 116 / 2 passed |
+| `mise run test:bifrost:integration:redux` | PASS — 979 tests run, 979 passed |
+| `mise run test:bifrost:integration:server` | PASS — 67 tests run, 67 passed |
+| `mise run test:bifrost:integration:sql` | PASS — 116 tests run, 116 passed |
+| `mise run codegen:check` | PASS — all checks passed |
+| `mise run check:examples` | PASS |
+| `mise run docs:check` | PASS — no generated drift, 60 pages, contrast AA |
+| `RUSTDOCFLAGS="-D warnings" cargo doc --locked -p wyrd-sql --no-deps` | PASS |
+| diff-based all-item Rustdoc audit (`R4-12`) | PASS — no real gap remains |
 | `git diff --check c5c20754a167e8f4d74a555a720bd51df6179a6f HEAD` | PASS — silent, exit 0 |
 
-### Remaining work for the next agent
+`mise run gate` was not run; approved `VER-003` excludes it.
 
-1. Run and record the still-unrun required lanes:
-   `mise run test:sql`, `mise run test:bifrost:integration:redux`,
-   `mise run test:bifrost:integration:server`,
-   `mise run test:bifrost:integration:sql`, `mise run codegen:check`,
-   `mise run check:examples`, strict `wyrd-sql` rustdoc with warnings denied,
-   and the diff-based all-item Rustdoc audit required by `R4-12`.
-   Do not substitute `mise run gate`; approved `VER-003` excludes it.
-   A failing lane is broken and gets fixed, whether or not it also fails at the
-   base commit.
-2. The `R4-12` Rustdoc audit was run from a throwaway script kept in the session
-   scratchpad (never in the repo — the packet forbids a permanent documentation
-   scanner). It diffs `git diff -U0 <BASE> -- '*.rs'` against the **working
-   tree**, maps changed lines to the enclosing item declaration, walks upward
-   past attributes and `//` comments to find a `///`, accepts an inner `//!` on
-   the line after `mod X {`, and separately requires a `# Errors` section on any
-   fn returning `Result<`. Rebuild it the same way; it reported zero findings at
-   `5475d1168`.
-3. Re-run `git diff --check c5c20754a167e8f4d74a555a720bd51df6179a6f <final-candidate>`
-   after any further commit and confirm it stays silent.
-4. Append the final evidence table (acceptance criterion → implementation
-   evidence → verification evidence → result) mapping every acceptance row to
-   its commit, exact focused proof, broader lanes, and result, and confirm each
-   non-goal stayed excluded and no unrelated file changed.
+## Implementation evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| `FIND-admin-principals-R4-1` | `231612b3f` — both verifier branches invalidate the cached positive and return `AuthError::VerifyUnavailable` | `test:shared` (`wyrd-auth-verify` fail-closed cases), `test:principals:integration` protected-route case | PASS |
+| `FIND-admin-principals-R4-2` | `fd2b12d77` — User revocation retires the refresh family and the epoch in one `TenantConn` | `mise exec -- cargo nextest run --locked -p wyrd-auth --lib -E 'test(=refresh::pg_tests::a_machine_refresh_row_cannot_rotate)'` → 1 passed; served journey `revoking_a_human_kills_the_session_refresh_authority` in `test:identity:journey` (20/20) | PASS |
+| `FIND-admin-principals-R4-3` | `fd2b12d77` — role replacement reports a real change and advances the User epoch in the same transaction | `a_withdrawn_oidc_group_invalidates_the_roles_it_granted` and `human_oidc_login_journey` in `test:identity:journey` (20/20) | PASS |
+| `FIND-admin-principals-R4-4` | `fd2b12d77` — the replay `auth.refresh.revoke_family` event carries `stale.id` | `mise exec -- cargo nextest run --locked -p wyrd-auth --lib -E 'test(=refresh::pg_tests::f09_replay_containment_commits_and_kills_the_successor) or test(=refresh::pg_tests::reuse_detection_revokes_family)'` → 2 passed | PASS |
+| `FIND-admin-principals-R4-5` | `fb776e9f9`, `36517f5ba` — one `auth.token.exchange` per tenant grant; platform grants run inside `OperatorPool::begin_platform_audited` | `test:principals:integration` (audit-attribution and injected-append-failure cases), `test:platform:journey` ×2 (35/35 each) | PASS |
+| `FIND-admin-principals-R4-6` | `952f26217` — the credential disclosure is a fallible flushed write before commit | `test:platform:journey` initialization cases (35/35) | PASS |
+| `FIND-admin-principals-R4-7` | `47e216866`, `6448a79f6` — stable-id fallback, legacy fingerprint, additive evolution, reconciliation, legacy field-id map and preimage deleted; `credential_id` folded into the original staging migration | `test:bifrost:integration:redux` (979/979), `test:bifrost:integration:sql` (116/116), `test:sql` (122/4/116/2) | PASS |
+| `FIND-admin-principals-R4-8` | `c6a262fd2` — the real Postgres journey is parameterized over every durable provisioning stage | `test:platform:journey` ×2 (35/35 each, consecutive) | PASS |
+| `FIND-admin-principals-13` | `c31113564` — every mounted public operation annotated and registered, `ANONYMOUS_PATHS` deleted, closure derived from the owning declarations | `test:principals:integration` (`pg_openapi_contract` requests the assembled server's `/openapi.json` and proves `/openapi.yaml` unrouted), `mise run codegen:check` | PASS |
+| `FIND-admin-principals-R4-9` | `945c15967` — `wyrd-mcp` takes HTTP/auth from the configured `WyrdClient`/`HttpTransport`; no raw client or Wyrd header construction remains in the crate | `mise run test:bifrost:journey:mcp` → 9/9 passed | PASS |
+| `FIND-admin-principals-R4-10` | `b460710ef` — active design and public identity/authorization/self-hosting/Bifrost pages describe five kinds, two planes, and split renewal; LLM indexes regenerated | `mise run docs:check` — no generated drift, 60 pages, contrast AA | PASS |
+| `FIND-admin-principals-R4-11` | `d60a2ac80` — the operator journey passes the printed tenant credential straight through the shipped CLI credential input | `mise run test:cli:journey` → 24 passed; `test:platform:journey` operator cases | PASS |
+| `FIND-admin-principals-R4-12` | `5475d1168`, `42c2b654c` — every new or materially modified Rust item documented, with `# Errors` on fallible ones | diff-based all-item audit: no real gap remains; `RUSTDOCFLAGS="-D warnings" cargo doc -p wyrd-sql --no-deps` PASS; `mise run lints` PASS | PASS |
+| `FIND-admin-principals-R4-13` | `28c49b868`, `a368d81e0` — the seven extra EOF blank lines removed and nothing else reformatted | `git diff --check c5c20754a167e8f4d74a555a720bd51df6179a6f HEAD` → silent, exit 0 | PASS |
+| `FIND-admin-principals-R3-6` | evidence-only | the three literal exact commands recorded above, each with a nonzero passing selection (5, 2, and 1 tests) | PASS |
+
+### Non-goals confirmed excluded
+
+No new database pool wrapper, audit table or sink, route catalog, transport,
+token service, role engine, cache, migration framework, failure-injection
+framework, or permanent documentation scanner was added. No OpenAPI snapshot,
+YAML route, generator, drift task, or release digest was restored. No UI state,
+browser token storage, platform-human CLI expansion, or Card-name schema change
+was implemented. `mise run gate` was not substituted for `VER-003`. No history
+was rewritten and no Git identity or provenance was touched. The only files
+changed outside the already-committed remediation are the Rust documentation
+edits in `42c2b654c` and this packet's evidence.

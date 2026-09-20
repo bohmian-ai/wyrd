@@ -1,0 +1,16 @@
+-- Record which credential authenticated an audited decision.
+--
+-- `vala.audit_staging` was created before a principal could hold several
+-- credentials at once. Rotation makes that normal, and "which key did this" is
+-- the first question an operator has after a leak, so the decision row has to
+-- carry the credential it was authenticated by.
+--
+-- Nullable because not every decision has one behind it: a federated human
+-- presents an identity, and the server's own internal decisions present
+-- nothing. Adding the column forward rather than editing the original creating
+-- migration is what keeps an already-migrated database startable — SQLx
+-- verifies the checksum of every applied migration before the pools open.
+--
+-- The chain hash covers the canonical encoding of the event, so existing
+-- staged rows are unaffected and no rewrite is needed.
+ALTER TABLE vala.audit_staging ADD COLUMN credential_id uuid;

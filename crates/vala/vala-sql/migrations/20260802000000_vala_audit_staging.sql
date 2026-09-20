@@ -55,12 +55,6 @@ CREATE TABLE vala.audit_staging (
     permission      text   NOT NULL,
     outcome         text   NOT NULL CHECK (outcome IN ('allowed', 'denied')),
     detail          text,
-    -- The credential the decision was authenticated by. A principal holds
-    -- several at once so rotation can overlap, and "which key did this" is the
-    -- question an operator has after a leak. Nullable because not every
-    -- decision has one behind it: a federated human presents an identity and
-    -- the server's own internal decisions present nothing.
-    credential_id   uuid,
     created_at      timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (data_tenant_id, seq)
 );

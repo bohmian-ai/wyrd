@@ -119,4 +119,100 @@ mod pg_tests {
         .expect("role count reads");
         assert_eq!(roles, 2);
     }
+
+    /// The creating audit-staging migration still carries the bytes it shipped
+    /// with.
+    ///
+    /// SQLx records a checksum for every migration it applies and refuses to
+    /// open the pools when a recorded checksum no longer matches the file, so
+    /// editing an already-shipped migration takes every migrated deployment
+    /// down before it can serve. A fresh-database lane cannot see that: it has
+    /// no recorded checksum to disagree with. This pins the shipped digest so
+    /// an edit fails here instead of on an operator's upgrade.
+    #[test]
+    fn shipped_audit_staging_migration_is_immutable() {
+        use sha2::Digest;
+
+        let digest = sha2::Sha256::digest(
+            include_bytes!("../migrations/20260802000000_vala_audit_staging.sql").as_slice(),
+        );
+        assert_eq!(
+            format!("{digest:x}"),
+            "ce869581019efb6689d9413efa77245f2381f464127e707458f4026178ca5d84",
+            "20260802000000_vala_audit_staging.sql changed; applied migrations are immutable, \
+             add a forward migration instead"
+        );
+    }
+
+    /// The forward credential-attribution migration upgrades a database that
+    /// already staged rows under the original audit-staging shape.
+    ///
+    /// Credential attribution arrives as an added nullable column rather than
+    /// an edit to the creating migration, so an upgrade must leave the rows
+    /// staged before it untouched and readable, with no credential of their
+    /// own. This rebuilds the original shape, stages a row in it, then applies
+    /// the exact forward migration over it.
+    #[tokio::test]
+    async fn staged_rows_survive_the_credential_attribution_upgrade() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let pool = fixture.superuser_pool().await.expect("superuser pool");
+        sqlx::raw_sql(
+            "DROP TABLE vala.audit_staging CASCADE; \
+             DROP TABLE vala.audit_chain_head CASCADE; \
+             DROP FUNCTION vala.audit_staging_immutable() CASCADE;",
+        )
+        .execute(&pool)
+        .await
+        .expect("current audit staging shape drops");
+        sqlx::raw_sql(include_str!(
+            "../migrations/20260802000000_vala_audit_staging.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("original audit staging shape applies");
+
+        let tenant = uuid::Uuid::from(wyrd_spec::DataTenantId::SYSTEM_OWNER);
+        sqlx::query(
+            "INSERT INTO vala.audit_staging \
+             (data_tenant_id,seq,prev_hash,entry_hash,request_id,operation,resource, \
+              principal_id,principal_kind,permission,outcome) \
+             VALUES ($1,1,$2,$3,'req-1','card.register','card:demo',$4,'user','write','allowed')",
+        )
+        .bind(tenant)
+        .bind([0u8; 32].as_slice())
+        .bind([1u8; 32].as_slice())
+        .bind(uuid::Uuid::now_v7())
+        .execute(&pool)
+        .await
+        .expect("row stages under the original shape");
+
+        sqlx::raw_sql(include_str!(
+            "../migrations/20260910000027_audit_staging_credential_id.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("forward credential attribution applies over staged rows");
+
+        let credential: Option<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT credential_id FROM vala.audit_staging WHERE data_tenant_id=$1 AND seq=1",
+        )
+        .bind(tenant)
+        .fetch_one(&pool)
+        .await
+        .expect("pre-upgrade row still reads");
+        assert!(
+            credential.is_none(),
+            "a decision staged before credential attribution has no credential"
+        );
+
+        let nullable: Option<String> = sqlx::query_scalar(
+            "SELECT is_nullable FROM information_schema.columns \
+             WHERE table_schema='vala' AND table_name='audit_staging' \
+               AND column_name='credential_id'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .expect("column metadata reads");
+        assert_eq!(nullable.as_deref(), Some("YES"));
+    }
 }

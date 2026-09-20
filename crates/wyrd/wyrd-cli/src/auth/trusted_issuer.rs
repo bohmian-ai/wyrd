@@ -4,10 +4,11 @@ use std::process::ExitCode;
 
 use clap::{Args, Subcommand};
 use reqwest::Method;
+use secrecy::{ExposeSecret, SecretString};
 use url::Url;
 use wyrd_spec::auth::{
     ClaimMappingPayload, ClientAuthKind, CreateTrustedIssuerRequest, IssuerTokenPolicy, IssuerUrl,
-    TrustedIssuerView,
+    SecretBearer, TrustedIssuerView,
 };
 
 use crate::error::WyrdCliError;
@@ -42,8 +43,8 @@ pub struct AddArgs {
     /// Client secret (required for SecretBasic and SecretPost). Prefer
     /// --client-secret-file or WYRD_ISSUER_CLIENT_SECRET to keep the secret out
     /// of shell history and the process argument list.
-    #[arg(long, value_name = "SECRET")]
-    pub client_secret: Option<String>,
+    #[arg(long, value_name = "SECRET", value_parser = secret_argument)]
+    pub client_secret: Option<SecretString>,
     /// Read the client secret from a file (trailing newline trimmed). Mutually
     /// exclusive with --client-secret.
     #[arg(long, value_name = "PATH", conflicts_with = "client_secret")]
@@ -126,7 +127,8 @@ async fn add(args: AddArgs) -> Result<ExitCode, WyrdCliError> {
         .map_err(|error| invalid("issuer", &args.issuer, &format!("an issuer URL: {error}")))?;
     let client_auth = parse_client_auth(&args.client_auth)?;
     let principal_kind = parse_principal_kind(&args.principal_kind)?;
-    let client_secret = resolve_client_secret(args.client_secret, args.client_secret_file)?;
+    let client_secret = resolve_client_secret(args.client_secret, args.client_secret_file)?
+        .map(|secret| SecretBearer::new(secret.expose_secret().to_owned()));
     let group_role_map = parse_group_roles(&args.group_roles)?;
 
     let view: TrustedIssuerView = crate::client::client(args.server.as_str(), &args.token)?
@@ -249,6 +251,19 @@ fn parse_principal_kind(value: &str) -> Result<IssuerTokenPolicy, WyrdCliError> 
     }
 }
 
+/// Hold a `--client-secret` argument value without it becoming debug-visible.
+///
+/// `AddArgs` derives `Debug`, and clap itself renders argument values in some
+/// error paths, so the secret is wrapped the moment it leaves the command line
+/// rather than after resolution. Infallible — every UTF-8 argument is a valid
+/// secret — but clap requires the `Result` shape.
+///
+/// # Errors
+/// Never returns an error; the `Result` satisfies clap's parser contract.
+fn secret_argument(raw: &str) -> Result<SecretString, std::convert::Infallible> {
+    Ok(SecretString::from(raw.to_owned()))
+}
+
 /// Resolve the client secret from the flag, a file, or the environment.
 ///
 /// `--client-secret-file` and `--client-secret` are mutually exclusive at the
@@ -257,18 +272,20 @@ fn parse_principal_kind(value: &str) -> Result<IssuerTokenPolicy, WyrdCliError> 
 /// Keeping the secret in a file or env var avoids leaking it into shell history
 /// and the process argument list.
 fn resolve_client_secret(
-    inline: Option<String>,
+    inline: Option<SecretString>,
     file: Option<PathBuf>,
-) -> Result<Option<String>, WyrdCliError> {
+) -> Result<Option<SecretString>, WyrdCliError> {
     if let Some(path) = file {
         let raw = std::fs::read_to_string(&path).map_err(|source| WyrdCliError::Io { source })?;
-        return Ok(Some(raw.trim_end_matches(['\n', '\r']).to_owned()));
+        return Ok(Some(SecretString::from(
+            raw.trim_end_matches(['\n', '\r']).to_owned(),
+        )));
     }
     if let Some(secret) = inline {
         return Ok(Some(secret));
     }
     match std::env::var("WYRD_ISSUER_CLIENT_SECRET") {
-        Ok(secret) => Ok(Some(secret)),
+        Ok(secret) => Ok(Some(SecretString::from(secret))),
         Err(std::env::VarError::NotPresent) => Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => Err(invalid(
             "WYRD_ISSUER_CLIENT_SECRET",
@@ -415,7 +432,10 @@ mod tests {
         assert!(parsed.is_ok(), "parse failed: {parsed:?}");
         match parsed.unwrap().command {
             TrustedIssuerCommand::Add(args) => {
-                assert_eq!(args.client_secret.as_deref(), Some("s3cr3t"));
+                assert_eq!(
+                    args.client_secret.as_ref().map(ExposeSecret::expose_secret),
+                    Some("s3cr3t")
+                );
                 assert_eq!(args.jwks_ttl_secs, Some(3600));
             }
             _ => panic!("expected Add"),
@@ -595,8 +615,11 @@ mod tests {
         use super::resolve_client_secret;
 
         assert_eq!(
-            resolve_client_secret(Some("inline".to_owned()), None).expect("inline resolves"),
-            Some("inline".to_owned())
+            resolve_client_secret(Some(SecretString::from("inline".to_owned())), None)
+                .expect("inline resolves")
+                .as_ref()
+                .map(ExposeSecret::expose_secret),
+            Some("inline")
         );
 
         let dir = std::env::temp_dir();
@@ -605,7 +628,10 @@ mod tests {
         let resolved =
             resolve_client_secret(None, Some(path.clone())).expect("file secret resolves");
         std::fs::remove_file(&path).ok();
-        assert_eq!(resolved, Some("file-secret".to_owned()));
+        assert_eq!(
+            resolved.as_ref().map(ExposeSecret::expose_secret),
+            Some("file-secret")
+        );
     }
 
     #[tokio::test]
@@ -636,7 +662,7 @@ mod tests {
             expected_audience: "wyrd".to_owned(),
             client_id: "myapp".to_owned(),
             client_auth: "SecretPost".to_owned(),
-            client_secret: Some("s3cr3t".to_owned()),
+            client_secret: Some(SecretString::from("s3cr3t".to_owned())),
             client_secret_file: None,
             claim_subject: "sub".to_owned(),
             claim_email: None,

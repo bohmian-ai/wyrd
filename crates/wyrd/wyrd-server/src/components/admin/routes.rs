@@ -31,7 +31,7 @@ use wyrd_auth_oidc::{
 };
 use wyrd_spec::auth::{
     ClaimMappingPayload, ClientAuthKind, CreateTrustedIssuerRequest, CreateWorkloadBindingRequest,
-    IssuerTokenPolicy, IssuerUrl, TrustedIssuerView, WorkloadBindingView,
+    IssuerTokenPolicy, IssuerUrl, SecretBearer, TrustedIssuerView, WorkloadBindingView,
 };
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_sql::queries::auth::{
@@ -111,8 +111,8 @@ fn request_client_auth(
 fn required_secret(
     request: &CreateTrustedIssuerRequest,
 ) -> Result<SecretString, WyrdErrorResponse> {
-    match request.client_secret.as_deref() {
-        Some(secret) if !secret.is_empty() => Ok(SecretString::from(secret.to_owned())),
+    match request.client_secret.as_ref() {
+        Some(secret) if !secret.expose().is_empty() => Ok(secret.clone().into_secret_string()),
         _ => Err(WyrdErrorResponse::from(WyrdError::MissingRequiredField {
             message: "client_secret is required for SecretBasic and SecretPost client auth"
                 .to_owned(),
@@ -1017,7 +1017,7 @@ mod pg_tests {
             expected_audience: "wyrd-api".to_owned(),
             client_id: "wyrd-client".to_owned(),
             client_auth: ClientAuthKind::SecretPost,
-            client_secret: secret.map(ToOwned::to_owned),
+            client_secret: secret.map(|raw| SecretBearer::new(raw.to_owned())),
             claim_mapping: ClaimMappingPayload {
                 subject: "sub".to_owned(),
                 email: Some("email".to_owned()),
@@ -1227,12 +1227,18 @@ mod pg_tests {
     ///
     /// # Panics
     ///
-    /// Panics when the error is not an [`WyrdError::AdminConflict`], or when
-    /// its rendered message or details contain a physical identifier.
+    /// Panics when the error is not an [`WyrdError::AdminConflict`], when it
+    /// does not carry `WYRD_AUTH_409_ADMIN_CONFLICT`, or when its rendered
+    /// message or details contain a physical identifier.
     fn assert_safe_conflict(error: &WyrdErrorResponse) {
         let WyrdError::AdminConflict { message, details } = &error.0 else {
             panic!("expected a 409 admin conflict, got {:?}", error.0);
         };
+        assert_eq!(
+            error.0.code(),
+            "WYRD_AUTH_409_ADMIN_CONFLICT",
+            "a conflict keeps its stable code"
+        );
         let rendered = format!("{message} {details}").to_lowercase();
         for name in PHYSICAL_NAMES {
             assert!(

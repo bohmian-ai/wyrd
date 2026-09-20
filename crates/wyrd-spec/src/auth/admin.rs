@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::auth::IssuerUrl;
+use crate::auth::{IssuerUrl, SecretBearer};
 use crate::reference::CardRef;
 
 /// Serde mirror of the domain claim mapping, whose claim paths are not directly
@@ -75,8 +75,13 @@ pub struct CreateTrustedIssuerRequest {
     /// How Wyrd authenticates to the issuer token endpoint.
     pub client_auth: ClientAuthKind,
     /// Client secret, required for the secret-bearing client-auth variants.
+    ///
+    /// A [`SecretBearer`] rather than a `String`: the JSON wire shape is
+    /// unchanged, but the value is redacted in `Debug` and the generated
+    /// schema marks it write-only, so a logged request body cannot carry an
+    /// IdP credential.
     #[serde(default)]
-    pub client_secret: Option<String>,
+    pub client_secret: Option<SecretBearer>,
     /// Claim-to-principal mapping.
     pub claim_mapping: ClaimMappingPayload,
     /// Mapping from issuer group to Wyrd roles.

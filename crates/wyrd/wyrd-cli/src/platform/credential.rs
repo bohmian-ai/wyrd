@@ -188,6 +188,7 @@ async fn revoke(args: RevokeArgs) -> Result<ExitCode, WyrdCliError> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Argument parsing for the platform credential verbs.
 #[cfg(test)]
 mod tests {
     use clap::Parser;

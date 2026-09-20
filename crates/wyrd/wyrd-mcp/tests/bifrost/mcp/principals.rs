@@ -7,6 +7,7 @@
 
 use crate::connectivity::{McpJourneyError, discover, principals, problem, structured, transport};
 
+/// The Postgres-backed half of the credential journey.
 mod pg_tests {
     use super::{McpJourneyError, discover, principals, problem, structured, transport};
 
@@ -30,6 +31,11 @@ mod pg_tests {
     /// to do. What stops an under-scoped agent is the operation behind the
     /// tool, which authorizes the permission and records the denial — the same
     /// decision the HTTP surface makes, from the same code.
+    ///
+    /// # Errors
+    ///
+    /// Returns server startup, bootstrap, credential-issuance, MCP transport,
+    /// or tool-call failures.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires the Postgres-backed Bifrost journey lane"]
     async fn a_write_tool_is_scoped_at_dispatch_not_merely_hidden() -> Result<(), McpJourneyError> {

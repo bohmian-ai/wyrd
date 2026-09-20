@@ -82,6 +82,12 @@ pub enum PlatformSessionError {
 }
 
 impl From<PlatformCredentialError> for PlatformSessionError {
+    /// Narrow a credential failure to what a session caller may learn.
+    ///
+    /// Only two outcomes carry through: the credential was not usable, or the
+    /// store failed. Every other cause collapses into an opaque key error, so
+    /// the exchange route cannot leak which condition rejected a presented
+    /// credential.
     fn from(error: PlatformCredentialError) -> Self {
         match error {
             PlatformCredentialError::InvalidCredential => Self::Invalid,

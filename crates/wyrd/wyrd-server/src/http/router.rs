@@ -168,6 +168,7 @@ async fn v1_not_found(request: Request) -> Result<(), WyrdErrorResponse> {
     .into())
 }
 
+/// The generated OpenAPI document, checked in isolation from the router.
 #[cfg(test)]
 mod tests {
     use utoipa::OpenApi;

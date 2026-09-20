@@ -626,6 +626,10 @@ mod tests {
         }
     }
 
+    /// A Service token carries its Card and the emit scope rooted at it.
+    ///
+    /// The `card_ref_scope` claim is what later authorizes an observation, so
+    /// the issuer must sign it rather than leave a consumer to re-derive it.
     #[test]
     fn issue_card_access_token_forces_service_card_ref() {
         let card_ref = card_ref(CardKind::Service);
@@ -652,6 +656,10 @@ mod tests {
         assert_eq!(claims.sub, claims.principal.id.to_string());
     }
 
+    /// A Service principal may not be signed holding an Agent Card.
+    ///
+    /// Kind and Card kind are separate inputs, so nothing but this check stops
+    /// a caller from minting a token whose claimed kind and Card disagree.
     #[test]
     fn issue_card_access_token_rejects_agent_card_ref_for_a_service() {
         let result = issuing_key().issue_card_access_token(
@@ -668,6 +676,10 @@ mod tests {
         assert!(matches!(result, Err(IssueError::InvalidCardRef)));
     }
 
+    /// An Agent token carries its Card and the emit scope rooted at it.
+    ///
+    /// The Agent half of the same contract: an Agent is always Card-bound, so
+    /// a successful issuance always signs a `card_ref` and its own scope.
     #[test]
     fn issue_card_access_token_forces_agent_card_ref() {
         let card_ref = card_ref(CardKind::Agent);
@@ -694,6 +706,10 @@ mod tests {
         assert_eq!(claims.sub, claims.principal.id.to_string());
     }
 
+    /// An Agent principal may not be signed holding a Service Card.
+    ///
+    /// The mirror of the Service rejection: the check is symmetric, so neither
+    /// kind can borrow the other's Card.
     #[test]
     fn issue_card_access_token_rejects_service_card_ref_for_an_agent() {
         let result = issuing_key().issue_card_access_token(

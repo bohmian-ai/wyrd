@@ -193,6 +193,22 @@ async fn require_principal(conn: &mut TenantConn<'_>, principal_id: Uuid) -> Res
     })
 }
 
+/// Mint one API key for an existing principal inside the caller's transaction.
+///
+/// The shared tail of principal creation and credential issuance. The
+/// principal is re-checked in this same connection first, so a credential can
+/// never be written against an id that is absent or belongs to another tenant.
+/// Argon2 hashing is handed to a blocking thread because it is deliberately
+/// expensive and would otherwise stall the request executor. Only the hash is
+/// inserted; the plaintext is returned to the caller once and never stored.
+///
+/// The insert joins the caller's transaction rather than committing on its
+/// own, so a later failure in the same request rolls the credential back with
+/// everything else and leaves no orphan key.
+///
+/// # Errors
+/// Returns [`WyrdError::PrincipalNotFound`] when no such principal exists in
+/// the tenant, and an internal failure when hashing or the insert fails.
 async fn mint_credential(
     conn: &mut TenantConn<'_>,
     principal_id: Uuid,

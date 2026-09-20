@@ -403,6 +403,7 @@ fn outcome_str(outcome: AuditOutcome) -> &'static str {
     }
 }
 
+/// The staged entry hash: exactly which fields enter it, and in what order.
 #[cfg(test)]
 mod tests {
     use sha2::{Digest as _, Sha256};

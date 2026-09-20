@@ -77,6 +77,13 @@ pub enum ProvisionError {
 }
 
 impl From<PlatformAuthzError> for ProvisionError {
+    /// Carry an authorization outcome into the provisioning vocabulary.
+    ///
+    /// The three arms stay distinct on purpose: a denial is the caller's
+    /// answer, an unrecordable decision is a refusal to proceed at all, and a
+    /// transaction failure is a store fault that leaves the tenant visibly
+    /// incomplete. Collapsing any pair would make a provisioning attempt
+    /// indistinguishable from a refused one.
     fn from(error: PlatformAuthzError) -> Self {
         match error {
             PlatformAuthzError::Denied { .. } => Self::Denied,

@@ -124,8 +124,28 @@ async fn resolve_grant(
 }
 
 impl FromRequestParts<AppState> for PlatformCaller {
+    /// Every refusal is a Wyrd problem response, so a handler never sees a
+    /// partially authenticated caller.
     type Rejection = WyrdErrorResponse;
 
+    /// Authenticate one platform-plane request and resolve its authority.
+    ///
+    /// Running as an extractor is what makes this unskippable: a handler that
+    /// names [`PlatformCaller`] cannot execute without it. The order is
+    /// deliberate — the session token is verified and confirmed against the
+    /// store *before* any grant is read, so a stale or retired session never
+    /// reaches the permission lookup. A missing operator pool, verifier, or
+    /// issuing key is a deployment fault rather than a caller fault and is
+    /// reported as internal, while every credential-shaped failure collapses
+    /// into one indistinguishable unauthenticated refusal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WyrdError::Unauthenticated`] when the request carries no
+    /// platform token, the token does not verify, or the session is no longer
+    /// valid; and an internal failure when the platform control plane is not
+    /// configured, the session store fails, or the stored grant cannot be
+    /// read.
     async fn from_request_parts(
         parts: &mut Parts,
         state: &AppState,
@@ -182,6 +202,7 @@ impl FromRequestParts<AppState> for PlatformCaller {
     }
 }
 
+/// Token extraction and the caller shape the extractor hands a handler.
 #[cfg(test)]
 mod tests {
     use axum::http::HeaderMap;

@@ -533,17 +533,27 @@ impl AuthContext {
 }
 
 impl From<Principal> for AuthContext {
+    /// Lift a verified tenant principal into the shared context.
+    ///
+    /// Boxed because a tenant principal carries its roles and resolved
+    /// permissions, and the platform variant carries far less; keeping the
+    /// enum small matters where it is passed by value on every request.
     fn from(principal: Principal) -> Self {
         Self::Tenant(Box::new(principal))
     }
 }
 
 impl From<PlatformPrincipal> for AuthContext {
+    /// Lift a verified platform principal into the shared context.
+    ///
+    /// The platform arm is the one that carries no tenant, which is what
+    /// downstream tenancy checks read the context for.
     fn from(principal: PlatformPrincipal) -> Self {
         Self::Platform(principal)
     }
 }
 
+/// The plane an [`AuthContext`] reports, and the tenancy that follows from it.
 #[cfg(test)]
 mod auth_context_tests {
     use wyrd_spec::DataTenantId;

@@ -1232,6 +1232,12 @@ mod pg_tests {
         );
     }
 
+    /// A machine exchange returns access only and writes no refresh row.
+    ///
+    /// The key itself is the renewable authority, so a stored refresh row
+    /// would be a second one an operator cannot see or revoke. Both halves are
+    /// asserted: the absent token in the response and the absent row in
+    /// `wyrd.auth_refresh_tokens`.
     #[tokio::test]
     async fn api_key_exchange_issues_no_refresh_token_or_row() {
         let fixture = PgFixture::start().await.expect("fixture starts");

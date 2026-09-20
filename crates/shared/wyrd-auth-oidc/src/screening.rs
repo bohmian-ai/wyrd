@@ -201,6 +201,7 @@ fn is_internal(ip: IpAddr) -> bool {
     }
 }
 
+/// Address-policy screening for outbound OIDC calls.
 #[cfg(test)]
 mod tests {
     use super::{AddressPolicy, ScreenError, ScreenedHttp};

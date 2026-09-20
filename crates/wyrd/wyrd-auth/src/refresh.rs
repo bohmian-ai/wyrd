@@ -863,6 +863,11 @@ mod pg_tests {
         );
     }
 
+    /// The unverified payload read exposes the three routing claims intact.
+    ///
+    /// Rotation reads tenant, principal, and kind out of the presented token
+    /// before it can verify anything — the tenant is what selects the verifier
+    /// — so this decode has to be exact even though it grants nothing.
     #[test]
     fn claims_from_refresh_jwt_decodes_payload() {
         let key = test_issuing_key();
@@ -886,12 +891,17 @@ mod pg_tests {
         assert_eq!(claims.principal_kind, PrincipalKindTag::Service);
     }
 
+    /// A token that is not a three-part JWT is refused, not guessed at.
     #[test]
     fn claims_from_refresh_jwt_rejects_malformed_input() {
         assert!(super::claims_from_refresh_jwt("not.a.jwt").is_err());
         assert!(super::claims_from_refresh_jwt("onlyone").is_err());
     }
 
+    /// The tenant-only read agrees with the full claims read.
+    ///
+    /// Routing to a tenant verifier needs just the tenant, and that narrower
+    /// path must not diverge from the one rotation itself uses.
     #[test]
     fn tenant_from_refresh_jwt_extracts_tenant() {
         let key = test_issuing_key();

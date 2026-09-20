@@ -576,6 +576,11 @@ fn issue_error(error: &wyrd_auth_issue::IssueError) -> WyrdError {
     }
 }
 
+/// Outbound address screening on the federated callback's own HTTP calls.
+///
+/// A trusted issuer URL is screened when it is registered, but DNS can answer
+/// differently later; these cases drive the callback against a provider that
+/// really does resolve to a blocked range.
 #[cfg(test)]
 mod screening_tests {
     use secrecy::SecretString;

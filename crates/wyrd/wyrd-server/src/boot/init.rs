@@ -260,6 +260,7 @@ pub async fn issue_platform_root_credential(
     Ok(credential.secret)
 }
 
+/// The shape of the grant the administrative root is initialized with.
 #[cfg(test)]
 mod tests {
     use super::platform_administrator_grant;

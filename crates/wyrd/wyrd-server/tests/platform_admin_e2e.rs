@@ -39,6 +39,11 @@ fn e2e_enabled() -> bool {
 /// terminal, so every journey below stays a journey rather than a plumbing
 /// exercise.
 ///
+/// # Errors
+/// Returns the [`InitError`] initialization produced, notably when the
+/// platform root already exists — initialization is idempotent only in the
+/// sense that it refuses rather than mints a second root.
+///
 /// # Panics
 /// Panics when initialization succeeded but disclosed no credential line.
 async fn initialize_platform_root(
@@ -703,6 +708,10 @@ fn tenant_request(method: Method, uri: &str, body: Option<Value>) -> Request<Bod
 }
 
 /// Exchange a tenant credential for an access token, or report the refusal.
+///
+/// # Errors
+/// Returns the refusal's [`StatusCode`] when the exchange is not accepted, so
+/// a journey can assert the status a real operator would see.
 async fn tenant_token(srv: &WyrdTestServer, credential: &str) -> Result<String, StatusCode> {
     let resp = srv
         .oneshot(anonymous_post(
@@ -3706,6 +3715,11 @@ struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 impl std::io::Write for CaptureWriter {
     /// Appends to the shared buffer, ignoring a poisoned lock as unreachable
     /// here: nothing else writes to it while a test holds the subscriber.
+    ///
+    /// # Errors
+    /// Never fails: a poisoned lock is dropped silently and the write is
+    /// reported as fully accepted, because losing capture output must not fail
+    /// the subscriber a test is observing through.
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if let Ok(mut sink) = self.0.lock() {
             sink.extend_from_slice(buf);
@@ -3714,6 +3728,9 @@ impl std::io::Write for CaptureWriter {
     }
 
     /// Nothing is buffered beyond the shared vector, so flushing is a no-op.
+    ///
+    /// # Errors
+    /// Never fails.
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }

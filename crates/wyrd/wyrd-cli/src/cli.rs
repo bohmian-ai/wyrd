@@ -91,6 +91,7 @@ pub enum Command {
     Query(QueryCommand),
 }
 
+/// Structural checks over the assembled command tree.
 #[cfg(test)]
 mod tests {
     use clap::CommandFactory;

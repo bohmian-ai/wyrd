@@ -205,6 +205,7 @@ async fn recover_admin(args: TenantArgs) -> Result<ExitCode, WyrdCliError> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Argument parsing for the platform tenant verbs.
 #[cfg(test)]
 mod tests {
     use clap::Parser;

@@ -201,6 +201,7 @@ pub async fn authenticate_for_session(
     })
 }
 
+/// Generation and shape of a platform credential, without a store.
 #[cfg(test)]
 mod tests {
     use secrecy::{ExposeSecret, SecretString};
@@ -324,6 +325,17 @@ mod pg_tests {
     /// transaction, so these tests open the same audited operator transaction
     /// the exchange route opens and commit it, which is what leaves the
     /// last-used touch standing.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`PlatformCredentialError`] the authentication produced. A
+    /// refusal leaves the transaction uncommitted and therefore rolled back,
+    /// so no last-used touch survives a rejected credential.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the operator transaction cannot be opened or a successful
+    /// authentication cannot be committed, both of which are fixture faults.
     async fn authenticate_committed(
         fixture: &PgFixture,
         presented: &SecretString,

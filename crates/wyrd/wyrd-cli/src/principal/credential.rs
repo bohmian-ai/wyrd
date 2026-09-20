@@ -187,6 +187,7 @@ async fn revoke(args: RevokeCredentialArgs) -> Result<ExitCode, WyrdCliError> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Argument parsing for the tenant principal credential verbs.
 #[cfg(test)]
 mod tests {
     use clap::Parser;

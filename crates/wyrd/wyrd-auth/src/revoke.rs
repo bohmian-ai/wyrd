@@ -122,6 +122,12 @@ mod pg_tests {
         }
     }
 
+    /// A user is revocable only as a user, and the revocation moves the epoch.
+    ///
+    /// The requested kind selects the table the id is resolved in, so naming
+    /// the wrong kind must miss rather than revoke a same-id row of another
+    /// kind. The epoch advance is the half that makes outstanding tokens stop
+    /// working.
     #[tokio::test]
     async fn a_user_is_revoked_under_the_user_kind() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -215,6 +221,10 @@ mod pg_tests {
         );
     }
 
+    /// A service account is revocable only as a service.
+    ///
+    /// Same contract as the user case, from the machine side: an agent-kinded
+    /// request must not reach a service row.
     #[tokio::test]
     async fn a_service_account_is_revoked_under_the_service_kind() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -285,6 +295,10 @@ mod pg_tests {
         );
     }
 
+    /// An agent account is revocable only as an agent.
+    ///
+    /// The third arm of the kind separation, and the one that also checks the
+    /// refusal message names nothing the caller did not already send.
     #[tokio::test]
     async fn an_agent_account_is_revoked_under_the_agent_kind() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -388,6 +402,10 @@ mod pg_tests {
         }
     }
 
+    /// An id that exists in no table is a not-found, not a silent success.
+    ///
+    /// Revocation reports zero rows as a refusal so an operator never reads a
+    /// typo as a completed revocation.
     #[tokio::test]
     async fn an_unknown_principal_is_not_found() {
         let fixture = PgFixture::start().await.expect("fixture starts");

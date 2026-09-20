@@ -470,6 +470,11 @@ pub async fn dispatch_load(args: LoadArgs) -> Result<ExitCode, WyrdCliError> {
 }
 
 /// Dispatch `wyrd delete`.
+///
+/// # Errors
+/// Returns [`WyrdCliError::InvalidArgument`] for a selector that does not name
+/// exactly one card, a connection error when the client cannot be built, and
+/// [`WyrdCliError::Server`] when the server refuses the delete.
 pub async fn dispatch_delete(args: DeleteArgs) -> Result<ExitCode, WyrdCliError> {
     let selector = selector_from_args(&args.selector, true)?;
     let cards = build_cards(&args.connection)?;
@@ -606,6 +611,15 @@ fn invalid_argument(field: &str, value: &str, expected: &str) -> WyrdCliError {
     }
 }
 
+/// Pin a server-returned card to the exact version it resolved to.
+///
+/// Output and follow-up commands quote the resolved version rather than the
+/// requirement the caller typed, so a later run cannot silently address a
+/// different card.
+///
+/// # Errors
+/// Returns [`WyrdCliError::Server`] when the response carries no resolved
+/// version, which means the server did not answer with an exact card.
 fn exact_card_ref(card: &Card) -> Result<CardRef, WyrdCliError> {
     let version = card
         .metadata

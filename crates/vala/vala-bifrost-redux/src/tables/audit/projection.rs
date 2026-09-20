@@ -93,6 +93,18 @@ struct ValidatedAuditRange {
     seq_hi: i64,
 }
 
+/// Check that a staged slice is one contiguous, single-tenant audit range and
+/// return its inclusive sequence bounds.
+///
+/// Publication derives its batch id from these bounds, so a gap or a foreign
+/// row must be refused here rather than silently reshaping the published range.
+///
+/// # Errors
+/// Returns [`AuditProjectionError::Empty`] for no rows,
+/// [`AuditProjectionError::TenantMismatch`] when a row belongs to another
+/// tenant, [`AuditProjectionError::NonContiguousSequence`] when the sequence
+/// skips, and [`AuditProjectionError::SequenceOverflow`] when the next expected
+/// sequence cannot be represented.
 fn validate_range(
     authenticated_tenant: DataTenantId,
     rows: &[AuditStagingRow],
@@ -142,6 +154,14 @@ fn validate_range(
     Ok(ValidatedAuditRange { seq_lo, seq_hi })
 }
 
+/// Project validated staging rows into the published `audit_log` batch.
+///
+/// Column order follows the canonical table schema, so a reordering here is a
+/// schema change and is caught by registration rather than accepted.
+///
+/// # Errors
+/// Returns [`AuditProjectionError`] when a row's stored hash is not valid hex
+/// or the Arrow batch cannot be assembled from the projected columns.
 fn project_record_batch(rows: &[AuditStagingRow]) -> Result<RecordBatch, AuditProjectionError> {
     let seq_values = rows.iter().map(|row| row.seq).collect::<Vec<_>>();
     let entry_hash_values = rows

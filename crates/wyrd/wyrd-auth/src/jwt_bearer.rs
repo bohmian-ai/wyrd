@@ -164,6 +164,16 @@ async fn load_service_account_subject(
     Ok((row, roles))
 }
 
+/// Issue the workload's access token and record the grant in the same
+/// transaction the caller opened.
+///
+/// Signing and the canonical audit append share one boundary, so a grant that
+/// cannot be attributed is never served.
+///
+/// # Errors
+/// Returns [`WyrdError`] when issuance fails for the resolved subject or when
+/// the audit append fails; in either case no token is returned and the
+/// transaction the caller holds is left to roll back.
 async fn issue_and_audit(
     conn: &mut TenantConn<'_>,
     issuing_key: &IssuingKey,
@@ -196,6 +206,11 @@ async fn issue_and_audit(
     Ok(exchanged)
 }
 
+/// Map an exchange failure onto the stable error a workload caller sees.
+///
+/// A store failure is retryable and reports the auth backend as unavailable;
+/// everything else already carries its own stable code and passes through, so
+/// the refusal never narrows to which part of the credential was wrong.
 fn workload_exchange_error(error: ExchangeError) -> WyrdError {
     match error {
         ExchangeError::Database(_) => WyrdError::AuthVerifyUnavailable {

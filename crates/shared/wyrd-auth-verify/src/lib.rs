@@ -989,6 +989,18 @@ impl AccessTokenClaims {
     }
 }
 
+/// Resolve the wire principal-kind tag and Card binding into a `PrincipalKind`.
+///
+/// This is where the closed kind set meets the Card-binding rule: Service
+/// binding is optional, Agent binding is required, administrative kinds carry
+/// no Card, and a platform tag is never admissible on the tenant plane.
+///
+/// # Errors
+/// Returns [`AuthError::InvalidToken`] for a platform-scope tag, which cannot
+/// name a tenant principal, and [`AuthError::InvalidCardRef`] when the token's
+/// Card binding does not match what the kind allows — a Card on an
+/// administrative or User principal, a missing or wrong-kind Card on an Agent,
+/// or a non-Service Card on a Service.
 fn wire_kind_into_principal_kind(
     wire: PrincipalKindTag,
     card_ref: Option<&CardRef>,

@@ -95,6 +95,12 @@ impl PgLoginStateStore {
 }
 
 /// Resolve the `IdP` authorization URL and persist login state for the callback.
+///
+/// # Errors
+/// Returns [`WyrdError`] when the issuer's authorization endpoint cannot be
+/// discovered, when the authorization URL cannot be built from the trusted
+/// issuer's configuration, or when the login state cannot be persisted. No
+/// redirect is returned unless its state row is durable.
 pub async fn prepare_login(
     pool: &sqlx::PgPool,
     tenant_id: DataTenantId,

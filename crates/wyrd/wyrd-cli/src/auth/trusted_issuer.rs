@@ -27,6 +27,10 @@ pub enum TrustedIssuerCommand {
 }
 
 #[derive(Debug, Args)]
+/// Arguments for `wyrd auth trusted-issuer add`.
+///
+/// The client secret is accepted by file or environment as well as inline so an
+/// operator is not forced to put it in shell history or the argument list.
 pub struct AddArgs {
     /// Trusted OIDC issuer URL.
     #[arg(long, value_name = "URL")]
@@ -271,6 +275,9 @@ fn secret_argument(raw: &str) -> Result<SecretString, std::convert::Infallible> 
 /// present; otherwise the inline flag; otherwise `WYRD_ISSUER_CLIENT_SECRET`.
 /// Keeping the secret in a file or env var avoids leaking it into shell history
 /// and the process argument list.
+///
+/// # Errors
+/// Returns [`WyrdCliError::Io`] when `--client-secret-file` cannot be read.
 fn resolve_client_secret(
     inline: Option<SecretString>,
     file: Option<PathBuf>,
@@ -300,6 +307,10 @@ fn resolve_client_secret(
 /// A group may appear more than once to grant multiple roles; the roles
 /// accumulate in flag order. Each entry must contain exactly one `=` with a
 /// non-empty group and role.
+///
+/// # Errors
+/// Returns a validation error when an entry has no `=`, or an empty group or
+/// role.
 fn parse_group_roles(entries: &[String]) -> Result<HashMap<String, Vec<String>>, WyrdCliError> {
     let mut map: HashMap<String, Vec<String>> = HashMap::new();
     for entry in entries {

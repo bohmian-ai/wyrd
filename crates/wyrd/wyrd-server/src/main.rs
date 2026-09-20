@@ -38,6 +38,15 @@ enum Command {
     RecoverRoot,
 }
 
+/// Run the Wyrd server binary.
+///
+/// The CLI is parsed before any telemetry or serve initialization so the
+/// default serve path stays exactly what it was before the administrative
+/// subcommands existed; each subcommand owns its own exit code.
+///
+/// # Panics
+/// Panics when argument parsing fails, which `clap` reports to the terminal
+/// before exiting.
 #[tokio::main]
 async fn main() {
     // Parse the CLI before any telemetry/serve init so the serve path on the

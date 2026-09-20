@@ -286,6 +286,11 @@ pub async fn insert_api_key(
 }
 
 /// Lookup an unexpired, unrevoked API key by prefix.
+///
+/// # Errors
+/// Returns the [`sqlx::Error`] of the failing read. A key that does not exist,
+/// is expired, or is revoked is `Ok(None)`, so every public invalid-key case
+/// costs the caller the same one verification.
 pub async fn api_key_by_prefix(
     conn: &mut TenantConn<'_>,
     prefix: &str,

@@ -441,6 +441,13 @@ fn issue_cardless_subject(
 /// token. Minting a long-lived refresh secret for a holder that never needs one
 /// only widens the leak surface. Only a human OIDC session, which has no
 /// durable credential to re-present, receives and rotates a refresh token.
+///
+/// # Errors
+/// Returns [`IssueOrSqlError`] when the principal kind is not issuable, when a
+/// Card-bound subject's Card cannot be resolved or does not match the kind's
+/// binding rule, when signing fails, or when the audit append or store access
+/// fails. The grant and its audit rows share one transaction, so a failure here
+/// serves no token.
 pub(crate) async fn issue_for_subject(
     conn: &mut TenantConn<'_>,
     issuing_key: &IssuingKey,

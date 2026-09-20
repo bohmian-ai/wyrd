@@ -72,6 +72,13 @@ impl std::fmt::Debug for AuthorizationCodeExchange {
 
 impl AuthorizationCodeExchange {
     /// Execute the authorization-code grant.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError`] when the login state is unknown, already consumed,
+    /// or expired, when the issuer refuses the code or its id token fails
+    /// verification, when role persistence or successor issuance fails, or when
+    /// the decision cannot be audited. Every refusal is audited before it is
+    /// returned, and the grant transaction commits or rolls back whole.
     pub async fn execute(
         &self,
         postgres: &WyrdPostgres,
@@ -164,6 +171,15 @@ impl AuthorizationCodeExchange {
         Ok((token, audit_principal_id))
     }
 
+    /// Complete the grant once the id token has been verified: persist the
+    /// asserted roles, advance the user's authorization epoch when that set
+    /// actually changed, and issue the successor session inside the same
+    /// transaction.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError`] when role replacement, the epoch advance, token
+    /// issuance, the canonical audit append, or the commit fails; no session is
+    /// returned unless all of them committed together.
     async fn finish_authorization_code_exchange(
         &self,
         input: FinishAuthorizationCodeInput<'_>,

@@ -151,6 +151,8 @@ mod pg_tests {
     }
 
     #[tokio::test]
+    /// The full migration set applies to an empty database and applying it
+    /// again is a no-op, so a redeploy cannot half-apply schema.
     async fn migrations_apply_and_are_idempotent() {
         let Some(url) = database_url() else {
             return;

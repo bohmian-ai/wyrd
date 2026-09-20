@@ -2766,6 +2766,14 @@ impl WyrdTestServer {
         .await
     }
 
+    /// Insert a machine principal with its Card binding, roles, and one API
+    /// key in the named tenant, returning the material a journey needs to act
+    /// as it.
+    ///
+    /// # Errors
+    /// Returns [`WyrdTestServerError`] when the tenant's fixture administrator
+    /// cannot be ensured, the Card reference is not valid for the kind, or any
+    /// of the inserts fail.
     async fn bootstrap_machine_in_tenant(
         &self,
         tenant_id: DataTenantId,

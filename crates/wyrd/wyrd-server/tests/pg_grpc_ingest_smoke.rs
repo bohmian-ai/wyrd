@@ -535,6 +535,9 @@ async fn ingest_unauthenticated_is_rejected() {
 }
 
 #[tokio::test]
+/// A token minted for a tenant that exists reaches the ingest service as an
+/// authenticated caller, so an authentication regression cannot hide behind a
+/// fixture that never had a tenant to authenticate against.
 async fn ingest_valid_token_is_not_rejected_as_unauthenticated() {
     let server = WyrdTestServer::start_in_process()
         .await

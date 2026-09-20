@@ -25,6 +25,9 @@ pub struct RevokePrincipalRequest {
     pub reason: String,
 }
 
+/// Constrain the audit reason in the generated schema to a non-empty, bounded
+/// string, so a client cannot publish a revocation with no stated cause or an
+/// unbounded one.
 fn reason_schema(_gen: &mut SchemaGenerator) -> Schema {
     Schema::Object(SchemaObject {
         instance_type: Some(InstanceType::String.into()),

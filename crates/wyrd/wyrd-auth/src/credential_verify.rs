@@ -62,7 +62,7 @@ pub async fn verify_presented(
 
 /// Read the process-wide verification count.
 ///
-/// See [`VERIFICATIONS`]. Monotonic and process-wide, so a caller compares two
+/// See `VERIFICATIONS`. Monotonic and process-wide, so a caller compares two
 /// readings around one operation rather than expecting an absolute value.
 #[must_use]
 pub fn verifications_performed() -> u64 {

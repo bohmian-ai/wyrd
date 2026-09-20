@@ -56,6 +56,13 @@ impl Caller {
 impl FromRequestParts<AppState> for Caller {
     type Rejection = WyrdErrorResponse;
 
+    /// Resolve the authenticated principal and the request id a served
+    /// handler needs, so every handler takes one already-verified `Caller`.
+    ///
+    /// # Errors
+    /// Returns [`WyrdErrorResponse`] when authentication fails — no usable
+    /// token, an invalid, expired, or revoked one, or a revocation store that
+    /// cannot vouch for it — or when the request carries no request id.
     async fn from_request_parts(
         parts: &mut Parts,
         state: &AppState,

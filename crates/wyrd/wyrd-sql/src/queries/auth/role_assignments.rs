@@ -30,6 +30,9 @@ const LIST_USER_ROLES_SQL: &str = r#"
          ORDER BY r.name
         "#;
 
+/// Replaces a user's role bindings with exactly the named set in one
+/// statement, reporting whether the persisted set actually changed so the
+/// caller can advance the authorization epoch only on a real change.
 const REPLACE_USER_ROLES_SQL: &str = r#"
         WITH wanted AS (
             SELECT id

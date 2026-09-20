@@ -7,7 +7,7 @@
 //!
 //! The tenant plane's equivalent is [`crate::issue_api_key`], which runs under
 //! row-level security. Platform credentials sit outside that boundary by
-//! construction and therefore run on the BYPASSRLS [`OperatorPool`].
+//! construction and therefore run on the BYPASSRLS `OperatorPool`.
 
 use chrono::{DateTime, Utc};
 use secrecy::{ExposeSecret, SecretString};

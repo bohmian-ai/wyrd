@@ -132,6 +132,12 @@ fn decoding_key_from_jwk(
 /// worth anything against the addresses the JWKS URI resolves to *now*: a
 /// long-lived client would carry a resolution made when the process started.
 /// Fetches happen on a cache miss, so the cost is paid rarely.
+///
+/// # Errors
+/// Returns [`OidcError::JwksUnavailable`] when the screened client cannot be
+/// built for the URI, the request fails, the issuer answers with a non-success
+/// status, or the body does not decode as a JWKS document. Keys the decoder
+/// does not recognize are skipped rather than failing the fetch.
 async fn fetch_jwks(
     issuer: &str,
     jwks_uri: &Url,
@@ -258,6 +264,14 @@ impl JwksCache {
             })
     }
 
+    /// Return the issuer's key map from cache, fetching it once per miss.
+    ///
+    /// Concurrent misses for the same URI coalesce onto a single fetch, so a
+    /// burst of first requests costs one network round trip.
+    ///
+    /// # Errors
+    /// Returns the [`OidcError`] that the coalesced [`fetch_jwks`] produced,
+    /// cloned out of the shared cache entry; nothing is cached on failure.
     async fn fetch_cached(&self, issuer: &str, jwks_uri: &Url) -> Result<KeyMap, OidcError> {
         let cache_key = jwks_uri.to_string();
         let issuer_owned = issuer.to_owned();

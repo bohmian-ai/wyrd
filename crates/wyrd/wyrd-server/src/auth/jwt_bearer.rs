@@ -660,6 +660,11 @@ mod pg_tests {
             })
     }
 
+    /// Insert a workload principal with the named roles and return its id, so
+    /// each test starts from a principal the grant path can actually resolve.
+    ///
+    /// # Errors
+    /// Returns the [`sqlx::Error`] of the failing insert.
     async fn bootstrap_principal(
         fixture: &PgFixture,
         tenant: DataTenantId,

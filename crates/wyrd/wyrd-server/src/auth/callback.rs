@@ -39,6 +39,12 @@ pub async fn callback(
 }
 
 /// Execute the authorization-code grant for `POST /auth/token`.
+///
+/// # Errors
+/// Returns [`WyrdErrorResponse`] when the callback tenant cannot be resolved
+/// from the request, or when the grant itself is refused — unknown, consumed,
+/// or expired login state, a refused code or unverifiable id token, or a failed
+/// role, epoch, issuance, or audit write.
 pub async fn exchange_authorization_code(
     state: &AppState,
     headers: &HeaderMap,

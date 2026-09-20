@@ -60,6 +60,15 @@ pub fn auth_router() -> Router<AppState> {
 ///
 /// Every invalid-credential condition returns one indistinguishable `401` so
 /// the response cannot be used to probe which part was wrong.
+///
+/// # Errors
+/// Returns a `400` when a delegation would exceed the configured chain depth, a
+/// `401` for every unusable credential — including a reused, revoked, or
+/// expired refresh token — a `403` when a valid credential's principal may not
+/// obtain this token, a `404` when no principal matches the delegation subject
+/// or the presented workload assertion, and a `503` when the auth backend, the
+/// revocation store, or the audit path is unavailable. The grant and its
+/// exchange audit commit together, so a refusal serves no token.
 #[utoipa::path(
     post,
     path = "/auth/token",
@@ -353,6 +362,12 @@ async fn callback(
 /// Gated on `service_accounts:write`. The principal must already exist — a
 /// credential is issued against an identity, never in place of one — and the
 /// plaintext is returned exactly once.
+///
+/// # Errors
+/// Returns a `401` without a usable token, a `403` without
+/// `service_accounts:write`, a `404` when the named principal does not exist in
+/// this tenant, a `500` when the write or its audit fails, and a `503` when the
+/// store or the revocation store is unavailable.
 #[utoipa::path(
     post,
     path = "/auth/issue-key",

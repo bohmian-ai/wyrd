@@ -8,6 +8,7 @@
 
 use crate::connectivity::{McpJourneyError, client, discover, problem, structured, transport};
 
+/// The query journey's Postgres-backed cases.
 mod pg_tests {
     use super::{McpJourneyError, client, discover, problem, structured, transport};
 

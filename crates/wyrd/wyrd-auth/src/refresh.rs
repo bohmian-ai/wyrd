@@ -103,6 +103,13 @@ impl RefreshTokens {
     ///      - Stale row found → reuse detected; family revoked, audit, return Reused.
     ///      - No row → return `NotFound`.
     #[tracing::instrument(level = "debug", skip(self, conn, presented), err)]
+    ///
+    /// # Errors
+    /// Returns [`RefreshError::NotFound`] when no row matches the presented
+    /// token, [`RefreshError::Reused`] when a stale row is presented — the
+    /// family is revoked and the containment audited before returning — and a
+    /// store or issuance error when the successor cannot be minted. A machine
+    /// refresh row cannot rotate and is refused.
     pub async fn execute(
         &self,
         conn: &mut TenantConn<'_>,

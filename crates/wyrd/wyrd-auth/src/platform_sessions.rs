@@ -380,6 +380,8 @@ mod pg_tests {
     use crate::audit::TOKEN_EXCHANGE_OPERATION;
     use crate::platform_credentials::issue_platform_credential;
 
+    /// A throwaway Ed25519 key these tests mint and verify platform sessions
+    /// with, so no test depends on deployment key material.
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
 
     /// The signing key platform sessions are minted with in these tests.

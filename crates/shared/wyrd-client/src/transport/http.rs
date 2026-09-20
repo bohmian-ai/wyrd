@@ -15,7 +15,7 @@
 //! forwarding seam already exists ([`AuthMiddleware::request_id`] accepts an
 //! inbound id) for a future relay caller; the helpers pass `None` today.
 //!
-//! All authenticated helpers route through [`HttpTransport::authenticated_url`],
+//! All authenticated helpers route through `HttpTransport::authenticated_url`,
 //! which rejects absolute URLs that do not match the configured Wyrd origin.
 //! This prevents `x-wyrd-access-token` and `wyrd-request-id` from being
 //! attached to a third-party host. Cross-origin traffic (S3/GCS/Azure
@@ -518,6 +518,17 @@ impl HttpTransport {
             .await
     }
 
+    /// Send a JSON body to `path` and decode the response, attaching an
+    /// idempotency key when one is supplied or generated.
+    ///
+    /// The single tail every write method shares, so authentication, request
+    /// id, idempotency, and problem-json mapping are decided once.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::Validation`] when `path` is not a server-relative
+    /// path, [`WyrdError::Internal`] when the body cannot be serialized or the
+    /// response cannot be decoded, and the server's own mapped error when the
+    /// request fails or answers non-2xx.
     async fn submit_with_optional_idempotency_key<S, D>(
         &self,
         method: reqwest::Method,

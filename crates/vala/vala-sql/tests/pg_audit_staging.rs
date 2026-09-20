@@ -30,6 +30,8 @@ mod pg_tests {
             (fixture, superuser, tenant)
         }
 
+        /// One canonical audit event named by its operation, so each case
+        /// differs only in the field it is about to assert on.
         fn event(operation: &str) -> AuditEvent {
             AuditEvent {
                 request_id: RequestId::parse(&Uuid::now_v7().to_string()).unwrap(),

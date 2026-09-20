@@ -73,6 +73,13 @@ pub async fn login(
         })
 }
 
+/// Build the redirect for a login attempt, separated from the caller so every
+/// refusal is logged once at one place.
+///
+/// # Errors
+/// Returns [`WyrdErrorResponse`] when the issuer is not trusted for the tenant,
+/// when its authorization endpoint cannot be discovered, or when the login
+/// state cannot be persisted.
 async fn try_initiate_login(
     state: &AppState,
     headers: &HeaderMap,

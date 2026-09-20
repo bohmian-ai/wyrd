@@ -522,6 +522,10 @@ impl AuthMiddleware {
     /// POST a token request to `/auth/token`, map a non-2xx body via
     /// [`from_problem_json`] into [`AuthError::Server`], and decode the success
     /// body into a [`CachedToken`]. The shared POST/decode tail of every grant.
+    ///
+    /// # Errors
+    /// Returns the [`AuthError`] the exchange produced: a transport failure, or
+    /// [`AuthError::Server`] carrying the server's problem-json refusal.
     async fn post_token_request(&self, request: TokenRequest) -> Result<CachedToken, AuthError> {
         let token = self.exchange.exchange(&request).await?;
         self.warn_if_short_ttl(token.expires_at);

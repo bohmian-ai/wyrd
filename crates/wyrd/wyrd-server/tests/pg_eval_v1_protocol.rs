@@ -48,6 +48,8 @@ use wyrd_testing::WyrdTestServer;
 // Harness
 // --------------------------------------------------------------------------
 
+/// Mint an access token for the named roles in a tenant, so each case starts
+/// from exactly the authority it means to exercise.
 fn mint_jwt(state: &AppState, tenant: DataTenantId, roles: &[&str]) -> String {
     let role_refs = roles
         .iter()
@@ -249,6 +251,8 @@ async fn seed_eval(state: &AppState, tenant: DataTenantId, space: &str, name: &s
 /// that hard-codes it fails if the wire name ever changes, which is the point.
 const EVAL_LEASE_HEADER: &str = "x-wyrd-eval-lease";
 
+/// Issue one eval request against the assembled server, attaching the token
+/// and lease when the case supplies them, and return its status and body.
 async fn call(
     server: &WyrdTestServer,
     method: &str,

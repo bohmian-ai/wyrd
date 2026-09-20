@@ -11,7 +11,13 @@ use wyrd_sql::TenantConn;
 /// Audit writer used by the authz-check route.
 #[async_trait]
 pub trait AuthzAuditWriter: Send + Sync {
-    /// Write one authz-check audit fact.
+    /// Append the authorization decision to `vala.audit_staging` on the
+    /// caller's own transaction, so the decision and whatever it authorized
+    /// commit or roll back together.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError`] when the canonical append fails, which fails the
+    /// decision closed rather than serving an unaudited allowance.
     async fn write_authz_check(
         &self,
         conn: &mut TenantConn<'_>,

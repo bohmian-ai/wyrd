@@ -26,6 +26,8 @@ struct TestState {
     next_call: Arc<AtomicU32>,
 }
 
+/// Record every request's path, headers, and call ordinal, so the assertions
+/// read the wire the CLI actually produced rather than the client's intent.
 async fn capture_headers(
     State(state): State<TestState>,
     req: Request,
@@ -77,6 +79,8 @@ async fn handle_submission() -> StatusCode {
 }
 
 #[tokio::test]
+/// The CLI attaches the lease the open response handed it to every later call
+/// in the run, so a server that fences on the lease sees one continuous run.
 async fn server_protocol_carries_lease_after_open() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let eval_path = tmp.path().join("eval.json");

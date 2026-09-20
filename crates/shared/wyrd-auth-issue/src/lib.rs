@@ -440,6 +440,16 @@ impl IssuingKey {
         self.encode(&claims)
     }
 
+    /// Assemble and sign one access token from an already-resolved subject,
+    /// principal projection, and delegation chain.
+    ///
+    /// The single signing tail every issuance path shares, so claim shape and
+    /// `jti` allocation are decided in one place rather than per caller.
+    ///
+    /// # Errors
+    /// Returns [`IssueError`] when the requested TTL is not positive, when the
+    /// principal projection is not admissible for its kind, or when the claims
+    /// cannot be encoded and signed.
     fn issue_access_token_with_claims(
         &self,
         sub: String,

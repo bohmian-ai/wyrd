@@ -783,7 +783,7 @@ mod pg_tests {
             .await
             .expect_err("an unbound card cannot be issued a key");
         assert!(
-            matches!(error.0, WyrdError::AdminNotFound { .. }),
+            matches!(error.0, WyrdError::PrincipalNotFound { .. }),
             "expected the unbound-card refusal, got {:?}",
             error.0
         );

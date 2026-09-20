@@ -391,11 +391,15 @@ impl DelegateToken {
 /// and no scope-mint audit to write: a Card-free principal has no emit
 /// authority to attribute. Its roles and tenant still bound what it may do.
 ///
+/// Synchronous because a Card-free grant writes nothing: it reads the tenant
+/// key off the caller's transaction and signs, leaving no renewal state
+/// behind.
+///
 /// # Errors
 /// Returns an issuance error when the kind is not Card-free-eligible or
-/// signing fails, and a SQL error when the refresh token cannot be stored.
-async fn issue_cardless_subject(
-    conn: &mut TenantConn<'_>,
+/// signing fails.
+fn issue_cardless_subject(
+    conn: &TenantConn<'_>,
     issuing_key: &IssuingKey,
     settings: &TokenExchangeSettings,
     subject: IssueSubject,
@@ -450,7 +454,7 @@ pub(crate) async fn issue_for_subject(
     // and must be able to exchange its credential, or a provisioned tenant
     // would hand back a credential that never works.
     if subject.card_ref.is_none() {
-        return issue_cardless_subject(conn, issuing_key, settings, subject).await;
+        return issue_cardless_subject(conn, issuing_key, settings, subject);
     }
     let IssueSubject {
         principal_id,

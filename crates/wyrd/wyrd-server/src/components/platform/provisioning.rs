@@ -32,7 +32,7 @@ use wyrd_sql::queries::platform::provisioning::{
 };
 use wyrd_sql::queries::platform::tenants::{list_tenants, tenant_by_id};
 use wyrd_sql::row_types::platform::TenantRow;
-use wyrd_sql::{OperatorPool, SqlError, WyrdPostgres};
+use wyrd_sql::{OperatorPool, SqlError, TenantConn};
 
 use crate::components::auth::PlatformCaller;
 
@@ -87,19 +87,17 @@ impl From<PlatformAuthzError> for ProvisionError {
 
 /// Provisions tenants on behalf of an authorized platform caller.
 ///
-/// Owns both boundaries it must write across, because provisioning is only
-/// correct as the ordered composition of the two.
+/// Provisioning is only correct as the ordered composition of two boundaries,
+/// and this owner sequences both. It holds the platform one and borrows the
+/// tenant one for the duration of a single call.
 #[derive(Clone)]
 pub struct TenantProvisioning {
     /// Platform boundary owning the tenant directory.
-    operator: OperatorPool,
-    /// Wyrd control-plane handle the new tenant's own rows are written through.
     ///
-    /// Held rather than a bare pool so tenant work is acquired through
-    /// [`WyrdPostgres::tenant_conn`], which carries the acquisition telemetry
-    /// and the row-level-security tenant bind. A privileged transaction is not
-    /// a portable capability this service hands out.
-    postgres: WyrdPostgres,
+    /// The only durable capability this owner holds. Tenant-scoped work is
+    /// lent to it as an already-acquired [`TenantConn`], so provisioning
+    /// cannot open a transaction against a tenant its caller did not name.
+    operator: OperatorPool,
 }
 
 impl std::fmt::Debug for TenantProvisioning {
@@ -110,19 +108,25 @@ impl std::fmt::Debug for TenantProvisioning {
 }
 
 impl TenantProvisioning {
-    /// Bind provisioning to the two boundaries it writes across.
+    /// Bind provisioning to the platform boundary it owns.
     #[must_use]
-    pub const fn new(operator: OperatorPool, postgres: WyrdPostgres) -> Self {
-        Self { operator, postgres }
+    pub const fn new(operator: OperatorPool) -> Self {
+        Self { operator }
     }
 
-    /// Provision a tenant and return it with its one-time admin credential.
+    /// Claim the directory row and report which tenant the work belongs to.
+    ///
+    /// The first of provisioning's two phases. It is separate because the
+    /// tenant transaction cannot be acquired before the directory has decided
+    /// which tenant id the rows belong to: a resumed attempt adopts the failed
+    /// attempt's id rather than the proposed one, and a connection bound to the
+    /// discarded proposal would write the new tenant's rows nowhere useful.
     ///
     /// The authorization decision and the directory row commit together, so a
-    /// tenant never exists without a recorded decision permitting it. The
-    /// tenant-scoped work then commits on its own boundary, and only then is the
-    /// tenant promoted to active. A failure after the directory row exists marks
-    /// the tenant failed rather than leaving it to look live.
+    /// tenant never exists without a recorded decision permitting it. On
+    /// return the tenant exists but is not usable; the caller acquires a
+    /// [`TenantConn`] for the returned id and passes it to [`Self::provision`],
+    /// which owns every outcome from here including marking the tenant failed.
     ///
     /// # Errors
     /// Returns [`ProvisionError::Denied`] when the caller lacks
@@ -131,11 +135,11 @@ impl TenantProvisioning {
     /// recorded — in which case nothing is created — and
     /// [`ProvisionError::Store`] when a write fails.
     #[tracing::instrument(level = "info", skip(self, caller), fields(slug = %request.slug), err)]
-    pub async fn provision(
+    pub async fn claim(
         &self,
         caller: &PlatformCaller,
-        request: CreateTenantRequest,
-    ) -> Result<CreateTenantResponse, ProvisionError> {
+        request: &CreateTenantRequest,
+    ) -> Result<DataTenantId, ProvisionError> {
         let data_tenant_id = DataTenantId::new_v7();
 
         // The handle must outlive the transaction it lends out.
@@ -165,23 +169,43 @@ impl TenantProvisioning {
         conn.commit()
             .await
             .map_err(|e| ProvisionError::Store(e.to_string()))?;
+        Ok(data_tenant_id)
+    }
 
-        // From here the tenant exists but is not usable. Any failure marks it
-        // failed rather than leaving a tenant that looks live with no way in.
-        // Promotion is the last stage, so it is part of what can fail: a tenant
-        // whose rows exist but that never became active is as unusable as one
-        // that never got its administrator, and must be marked the same way.
-        let established = match self
-            .establish_tenant_administration(data_tenant_id, caller.principal_id().as_uuid())
-            .await
-        {
-            Ok(admin) => match mark_tenant_active(&self.operator, data_tenant_id).await {
-                Ok(true) => Ok(admin),
-                Ok(false) => Err(ProvisionError::Store(
-                    "tenant left provisioning before it could be promoted".to_owned(),
-                )),
-                Err(error) => Err(ProvisionError::Store(error.to_string())),
-            },
+    /// Make a claimed tenant usable and return its one-time admin credential.
+    ///
+    /// The second phase, run against the tenant connection the caller acquired
+    /// for the id [`Self::claim`] returned. The tenant-scoped work commits on
+    /// its own boundary, and only then is the tenant promoted to active. Any
+    /// failure — including a failure to acquire the connection at all — marks
+    /// the tenant failed rather than leaving it to look live, which is why the
+    /// acquisition result is passed in rather than unwrapped by the caller:
+    /// the row is already committed, and only this owner knows how to retire
+    /// it.
+    ///
+    /// # Errors
+    /// Returns [`ProvisionError::Store`] when the tenant connection could not
+    /// be acquired, when any tenant-scoped write fails, or when the tenant
+    /// could not be promoted. A store failure that also could not be recorded
+    /// against the directory row names both causes.
+    #[tracing::instrument(
+        level = "info",
+        skip(self, caller, conn),
+        fields(tenant = %data_tenant_id, slug = %request.slug),
+        err
+    )]
+    pub async fn provision(
+        &self,
+        caller: &PlatformCaller,
+        data_tenant_id: DataTenantId,
+        request: CreateTenantRequest,
+        conn: Result<TenantConn<'_>, SqlError>,
+    ) -> Result<CreateTenantResponse, ProvisionError> {
+        let established = match conn.map_err(|e| ProvisionError::Store(e.to_string())) {
+            Ok(conn) => {
+                self.establish_and_promote(conn, data_tenant_id, caller.principal_id().as_uuid())
+                    .await
+            }
             Err(error) => Err(error),
         };
 
@@ -212,6 +236,35 @@ impl TenantProvisioning {
             )));
         }
         Err(error)
+    }
+
+    /// Establish the tenant's administration, then promote it to active.
+    ///
+    /// Promotion is the last stage and is part of what can fail: a tenant
+    /// whose rows exist but that never became active is as unusable as one
+    /// that never got its administrator, so both failures reach the caller's
+    /// single failure path.
+    ///
+    /// # Errors
+    /// Returns [`ProvisionError::Store`] when a tenant-scoped write fails,
+    /// when the directory row left `provisioning` before it could be promoted,
+    /// or when the promotion write fails.
+    async fn establish_and_promote(
+        &self,
+        conn: TenantConn<'_>,
+        data_tenant_id: DataTenantId,
+        created_by: Uuid,
+    ) -> Result<ProvisionedTenantAdmin, ProvisionError> {
+        let admin = self
+            .establish_tenant_administration(conn, data_tenant_id, created_by)
+            .await?;
+        match mark_tenant_active(&self.operator, data_tenant_id).await {
+            Ok(true) => Ok(admin),
+            Ok(false) => Err(ProvisionError::Store(
+                "tenant left provisioning before it could be promoted".to_owned(),
+            )),
+            Err(error) => Err(ProvisionError::Store(error.to_string())),
+        }
     }
 
     /// List the tenant directory an operator administers.
@@ -357,15 +410,10 @@ impl TenantProvisioning {
     /// Returns [`ProvisionError::Store`] when any write fails.
     async fn establish_tenant_administration(
         &self,
+        mut conn: TenantConn<'_>,
         data_tenant_id: DataTenantId,
         created_by: Uuid,
     ) -> Result<ProvisionedTenantAdmin, ProvisionError> {
-        let mut conn = self
-            .postgres
-            .tenant_conn(data_tenant_id)
-            .await
-            .map_err(|e| ProvisionError::Store(e.to_string()))?;
-
         seed_builtin_roles_for_tenant(&mut conn, data_tenant_id)
             .await
             .map_err(|e| ProvisionError::Store(e.to_string()))?;

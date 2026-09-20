@@ -122,7 +122,7 @@ def main() -> int:
     check_migration_drift(failures)
     check_query_modules(failures)
     check_server_pool_usage(failures)
-    check_platform_transaction_boundary(failures)
+    check_platform_capability_boundary(failures)
     check_sql_source_hygiene(failures)
     check_dependency_boundaries(failures)
 
@@ -737,14 +737,30 @@ def has_platform_executor(code: str) -> bool:
 # on.
 RAW_TRANSACTION_PATTERN = r"\bTransaction\s*<\s*'"
 
+# A connection pool is the same unrestricted capability one step earlier: a
+# holder can open a transaction against any tenant it names, at any time, for
+# any reason. Pool composition belongs to boot and to the route boundary that
+# already resolves the caller's tenant; the platform workflow owners below it
+# take the acquired `TenantConn` and the `OperatorPool` their platform rows
+# need, and nothing wider. Scoped to the server components: the platform query
+# modules include the pre-tenant slug resolver, which necessarily runs on the
+# app pool before any tenant is known.
+BROAD_POOL_PATTERN = r"\bWyrdPostgres\b|\bPgPool\b"
+
 PLATFORM_SERVER_DIRS = (
     "crates/wyrd/wyrd-server/src/components/platform/",
     "crates/wyrd/wyrd-server/src/boot/init.rs",
 )
 
 
-def check_platform_transaction_boundary(failures: list[str]) -> None:
-    """Forbid raw SQLx transaction types in the platform query/server surface."""
+def check_platform_capability_boundary(failures: list[str]) -> None:
+    """Forbid unbounded SQL capability in the platform query/server surface.
+
+    Two shapes of the same violation: a raw SQLx transaction type, and a
+    connection pool a workflow owner could acquire one from. Both are checked
+    over the platform query modules and the platform server components, whose
+    only permitted SQL capabilities are `TenantConn` and `OperatorPool`.
+    """
     scanned = [
         *rust_files(WYRD_QUERIES / "platform"),
         *(
@@ -758,6 +774,13 @@ def check_platform_transaction_boundary(failures: list[str]) -> None:
         if re.search(RAW_TRANSACTION_PATTERN, code):
             failures.append(
                 f"{rel(path)}: platform code must take TenantConn, not a raw SQLx Transaction"
+            )
+        if rel(path).startswith(PLATFORM_SERVER_DIRS) and re.search(
+            BROAD_POOL_PATTERN, code
+        ):
+            failures.append(
+                f"{rel(path)}: platform code must take TenantConn or OperatorPool, "
+                "not a connection pool it can acquire arbitrary tenant transactions from"
             )
 
 

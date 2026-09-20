@@ -20,7 +20,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, ProvisionedTenantAdmin, SecretBearer};
 use wyrd_sql::queries::auth::{insert_api_key, tenant_admin_principal_id};
 use wyrd_sql::queries::platform::tenants::tenant_by_id;
-use wyrd_sql::{OperatorPool, WyrdPostgres};
+use wyrd_sql::{OperatorPool, TenantConn};
 
 use crate::components::auth::PlatformCaller;
 use crate::components::platform::provisioning::ProvisionError;
@@ -35,13 +35,11 @@ const RECOVERY_CREDENTIAL_DAYS: i64 = 365;
 #[derive(Clone)]
 pub struct TenantRecovery {
     /// Platform boundary the decision and its audit record commit through.
-    operator: OperatorPool,
-    /// Wyrd control-plane handle the replacement credential is written through.
     ///
-    /// Held rather than a bare pool so the tenant transaction is acquired
-    /// through [`WyrdPostgres::tenant_conn`] rather than handed out as a
-    /// portable privileged capability.
-    postgres: WyrdPostgres,
+    /// The only durable capability this owner holds. The tenant transaction
+    /// the replacement credential is written on is lent to it per call, so
+    /// recovery cannot reach a tenant its caller did not name.
+    operator: OperatorPool,
 }
 
 impl std::fmt::Debug for TenantRecovery {
@@ -52,10 +50,10 @@ impl std::fmt::Debug for TenantRecovery {
 }
 
 impl TenantRecovery {
-    /// Bind recovery to the two boundaries it writes across.
+    /// Bind recovery to the platform boundary it owns.
     #[must_use]
-    pub const fn new(operator: OperatorPool, postgres: WyrdPostgres) -> Self {
-        Self { operator, postgres }
+    pub const fn new(operator: OperatorPool) -> Self {
+        Self { operator }
     }
 
     /// Issue a replacement credential for a tenant's existing administrator.
@@ -64,6 +62,11 @@ impl TenantRecovery {
     /// one, and duplicating it would leave two roots of trust where the tenant
     /// expects one. The returned credential is the plaintext, exposed once.
     ///
+    /// `conn` is the tenant transaction the caller acquired for `tenant_id`.
+    /// It is therefore open before the directory refusal below, but nothing is
+    /// ever written on it for a tenant that is not active: an unused
+    /// transaction is discarded when this call returns.
+    ///
     /// # Errors
     /// Returns [`ProvisionError::Denied`] when the caller lacks the recovery
     /// permission, [`ProvisionError::AuditUnavailable`] when the decision
@@ -71,11 +74,12 @@ impl TenantRecovery {
     /// [`ProvisionError::TenantUnavailable`] when the platform directory holds
     /// no active row for `tenant_id`, and [`ProvisionError::Store`] when the
     /// tenant has no administrative principal or a write fails.
-    #[tracing::instrument(level = "info", skip(self, caller), fields(tenant = %tenant_id), err)]
+    #[tracing::instrument(level = "info", skip(self, caller, conn), fields(tenant = %tenant_id), err)]
     pub async fn recover(
         &self,
         caller: &PlatformCaller,
         tenant_id: DataTenantId,
+        mut conn: TenantConn<'_>,
     ) -> Result<ProvisionedTenantAdmin, ProvisionError> {
         let authz = PlatformAuthorization::new(self.operator.clone());
         let decision = authz
@@ -104,12 +108,6 @@ impl TenantRecovery {
         if !directory.is_some_and(|row| row.status == "active") {
             return Err(ProvisionError::TenantUnavailable);
         }
-
-        let mut conn = self
-            .postgres
-            .tenant_conn(tenant_id)
-            .await
-            .map_err(|e| ProvisionError::Store(e.to_string()))?;
 
         let principal_id = tenant_admin_principal_id(&mut conn)
             .await

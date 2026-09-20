@@ -141,10 +141,15 @@ async fn recover_tenant_admin(
     let Some(operator) = state.postgres.operator_pool() else {
         return Err(not_configured());
     };
-    let recovery = TenantRecovery::new(operator, state.postgres.wyrd().clone());
+    let recovery = TenantRecovery::new(operator);
+    let conn = state
+        .postgres
+        .tenant_conn(request.tenant_id)
+        .await
+        .map_err(|_| not_configured())?;
 
     recovery
-        .recover(&caller, request.tenant_id)
+        .recover(&caller, request.tenant_id, conn)
         .await
         .map(Json)
         .map_err(provision_error)
@@ -185,10 +190,21 @@ async fn create_tenant(
     let Some(operator) = state.postgres.operator_pool() else {
         return Err(not_configured());
     };
-    let provisioning = TenantProvisioning::new(operator, state.postgres.wyrd().clone());
+    let provisioning = TenantProvisioning::new(operator);
+
+    // Two phases because the tenant id is only settled by the directory claim:
+    // a resumed attempt adopts the failed attempt's id. The connection is
+    // acquired here, at the boundary that owns pool composition, and the
+    // acquisition result is handed on so provisioning can retire the row it
+    // already committed if the tenant boundary is unreachable.
+    let tenant_id = provisioning
+        .claim(&caller, &request)
+        .await
+        .map_err(provision_error)?;
+    let conn = state.postgres.tenant_conn(tenant_id).await;
 
     provisioning
-        .provision(&caller, request)
+        .provision(&caller, tenant_id, request, conn)
         .await
         .map(Json)
         .map_err(provision_error)
@@ -335,6 +351,6 @@ fn directory(state: &AppState) -> Result<TenantProvisioning, WyrdErrorResponse> 
     state
         .postgres
         .operator_pool()
-        .map(|operator| TenantProvisioning::new(operator, state.postgres.wyrd().clone()))
+        .map(TenantProvisioning::new)
         .ok_or_else(not_configured)
 }

@@ -116,4 +116,3 @@ Therefore this review does not claim every test in the repository was executed.
 The base-reproduced auth cache failure, Card-name constraint, stale testing
 comment, and possible rustdoc-lane widening remain excluded exactly as recorded
 in the validated ledger.
-

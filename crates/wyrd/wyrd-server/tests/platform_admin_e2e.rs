@@ -1882,6 +1882,23 @@ async fn a_failed_provisioning_can_be_retried_with_the_same_slug() {
         usable, 1,
         "exactly one credential is usable, and it is the one the retry disclosed"
     );
+
+    // Both creation decisions name the slug. The retry proposed a fresh tenant
+    // id that the directory discarded in favour of the original, so a decision
+    // recorded against a proposed id would name a tenant that does not exist.
+    let creation_resources: Vec<String> = sqlx::query_scalar(
+        "SELECT resource FROM vala.audit_staging
+          WHERE operation = 'platform.authz' AND permission = 'tenants:write'
+          ORDER BY resource",
+    )
+    .fetch_all(&superuser)
+    .await
+    .expect("creation decision resources read");
+    assert_eq!(
+        creation_resources,
+        vec!["tenant_slug:retryable".to_owned(); 2],
+        "every provisioning decision names the requested slug, never a proposed tenant id"
+    );
 }
 
 /// An occupied slug is still a conflict.

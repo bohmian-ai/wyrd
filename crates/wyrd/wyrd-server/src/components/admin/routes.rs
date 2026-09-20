@@ -31,7 +31,7 @@ use wyrd_auth_oidc::{
 };
 use wyrd_spec::auth::{
     ClaimMappingPayload, ClientAuthKind, CreateTrustedIssuerRequest, CreateWorkloadBindingRequest,
-    IssuerTokenPolicy, IssuerUrl, SecretBearer, TrustedIssuerView, WorkloadBindingView,
+    IssuerTokenPolicy, IssuerUrl, TrustedIssuerView, WorkloadBindingView,
 };
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_sql::queries::auth::{
@@ -921,7 +921,7 @@ mod pg_tests {
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::IssuerTokenPolicy;
-    use wyrd_spec::auth::IssuerUrl;
+    use wyrd_spec::auth::{IssuerUrl, SecretBearer};
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::reference::CardRef;

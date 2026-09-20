@@ -393,15 +393,19 @@ async fn issue_key(
     .await
     .map_err(WyrdErrorResponse::from)?;
 
+    // The allowance rides the same transaction as the key it permits. A
+    // refusal is durable on its own — a denied attempt is evidence whether or
+    // not anything followed it — but an allowance is not: committing it first
+    // would leave a record permitting a key that a later failure never issued.
     let tenant = caller.principal().tenant_id;
-    crate::audit::record_audit(state.postgres.vala_pool(), tenant, &decision)
-        .await
-        .map_err(WyrdErrorResponse::from)?;
     let mut conn = state
         .postgres
         .tenant_conn(tenant)
         .await
         .map_err(sql_error)?;
+    crate::audit::append_on(&mut conn, &decision)
+        .await
+        .map_err(WyrdErrorResponse::from)?;
     let service = IssueApiKey::default();
     let issued = service
         .execute(&mut conn, request, caller.principal())
@@ -745,5 +749,64 @@ mod pg_tests {
             audit_request_id, expected_request_id,
             "audit records the request id"
         );
+    }
+
+    /// A failure after authorization commits neither the key nor the allowance.
+    ///
+    /// The caller holds `service_accounts:write`, so the decision is an
+    /// allowance — but the named Card binds no principal, so issuance fails
+    /// after it. The allowance rides the issuing transaction, so it rolls back
+    /// with the effect it was permitting: a record saying a key was allowed,
+    /// with no key anywhere, is the mismatch the canonical audit rule forbids.
+    #[tokio::test]
+    async fn a_failed_issue_commits_neither_the_key_nor_its_allowance() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let creator = insert_test_user(&mut conn, tenant).await;
+        conn.commit().await.expect("seed commits");
+
+        let state = fixture_state(&fixture).await;
+        let caller = caller_with(
+            creator,
+            tenant,
+            PermissionSet::from_iter([Permission::service_accounts_write()]),
+        );
+        let request = IssueKeyRequest {
+            card_ref: service_card_ref(),
+            label: None,
+            expires_in_seconds: None,
+        };
+
+        let error = issue_key(State(state), caller, None, Json(request))
+            .await
+            .expect_err("an unbound card cannot be issued a key");
+        assert!(
+            matches!(error.0, WyrdError::AdminNotFound { .. }),
+            "expected the unbound-card refusal, got {:?}",
+            error.0
+        );
+
+        let mut verify_conn = fixture.tenant_conn().await.expect("verify conn opens");
+        let staged: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM vala.audit_staging
+              WHERE data_tenant_id = $1
+                AND operation = 'auth.api_key.issue'
+                AND outcome = 'allowed'",
+        )
+        .bind(tenant.as_uuid())
+        .fetch_one(&mut **verify_conn.transaction())
+        .await
+        .expect("allowance count reads");
+        assert_eq!(staged, 0, "a failed issue leaves no committed allowance");
+
+        let keys: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM wyrd.auth_api_keys WHERE data_tenant_id = $1")
+                .bind(tenant.as_uuid())
+                .fetch_one(&mut **verify_conn.transaction())
+                .await
+                .expect("key count reads");
+        assert_eq!(keys, 0, "a failed issue leaves no key");
     }
 }

@@ -15,7 +15,10 @@ use axum::{Json, Router};
 use secrecy::{ExposeSecret, SecretString};
 use uuid::Uuid;
 use wyrd_auth::pg_resolvers::{client_auth_label, seal_platform_client_secret};
-use wyrd_auth::platform_authz::{PlatformAuthorization, PlatformAuthzError};
+use wyrd_auth::platform_authz::{
+    PLATFORM_ADMINS_RESOURCE, PLATFORM_CONNECTION_RESOURCE, PlatformAuthorization,
+    PlatformAuthzError, platform_principal_resource,
+};
 use wyrd_auth::platform_login::{PlatformLogin, PlatformLoginError};
 use wyrd_auth_oidc::ClientAuth;
 use wyrd_runtime::Permission;
@@ -109,7 +112,8 @@ pub(super) fn operator(state: &AppState) -> Result<OperatorPool, WyrdErrorRespon
 /// record with.
 ///
 /// The authorization handle owns the pool the transaction borrows from, so it
-/// is returned alongside and must outlive the connection.
+/// is returned alongside and must outlive the connection. `resource` is the
+/// exact object the decision is about, recorded verbatim in the audit row.
 ///
 /// # Errors
 /// Returns a permission error when the grant does not cover `required`, and an
@@ -119,9 +123,15 @@ pub(super) async fn authorize<'a>(
     authz: &'a PlatformAuthorization,
     caller: &PlatformCaller,
     required: &Permission,
+    resource: &str,
 ) -> Result<TenantConn<'a>, WyrdErrorResponse> {
     authz
-        .authorize(&caller.context, required, caller.request_id.as_str(), None)
+        .authorize(
+            &caller.context,
+            required,
+            caller.request_id.as_str(),
+            resource,
+        )
         .await
         .map_err(|error| platform_authz_error(&error, required))
 }
@@ -152,9 +162,10 @@ pub(super) async fn authorize_read(
     pool: &OperatorPool,
     caller: &PlatformCaller,
     required: &Permission,
+    resource: &str,
 ) -> Result<(), WyrdErrorResponse> {
     let authz = PlatformAuthorization::new(pool.clone());
-    let decision = authorize(&authz, caller, required).await?;
+    let decision = authorize(&authz, caller, required, resource).await?;
     commit_decision(decision).await
 }
 
@@ -187,7 +198,13 @@ async fn configure_connection(
     let pool = operator(&state)?;
     // The handle must outlive the transaction it lends out.
     let authz = PlatformAuthorization::new(pool.clone());
-    let mut decision = authorize(&authz, &caller, &Permission::platform_identity_write()).await?;
+    let mut decision = authorize(
+        &authz,
+        &caller,
+        &Permission::platform_identity_write(),
+        PLATFORM_CONNECTION_RESOURCE,
+    )
+    .await?;
 
     let client_auth = match request.client_auth {
         PlatformClientAuth::SecretBasic { secret } => {
@@ -281,7 +298,13 @@ async fn read_connection(
     caller: PlatformCaller,
 ) -> Result<Json<PlatformOidcConnectionView>, WyrdErrorResponse> {
     let pool = operator(&state)?;
-    authorize_read(&pool, &caller, &Permission::platform_identity_read()).await?;
+    authorize_read(
+        &pool,
+        &caller,
+        &Permission::platform_identity_read(),
+        PLATFORM_CONNECTION_RESOURCE,
+    )
+    .await?;
 
     let row = platform_oidc_connection(&pool)
         .await
@@ -333,7 +356,13 @@ async fn remove_connection(
     let pool = operator(&state)?;
     // The handle must outlive the transaction it lends out.
     let authz = PlatformAuthorization::new(pool.clone());
-    let mut decision = authorize(&authz, &caller, &Permission::platform_identity_write()).await?;
+    let mut decision = authorize(
+        &authz,
+        &caller,
+        &Permission::platform_identity_write(),
+        PLATFORM_CONNECTION_RESOURCE,
+    )
+    .await?;
 
     if delete_platform_oidc_connection(&mut decision)
         .await
@@ -395,7 +424,17 @@ async fn register_admin(
     //
     // The handle must outlive the transaction it lends out.
     let authz = PlatformAuthorization::new(pool.clone());
-    let mut decision = authorize(&authz, &caller, &Permission::platform_identity_write()).await?;
+    // The id is minted before the decision so the record names the principal
+    // this request creates. Nothing has adopted an existing row here — unlike
+    // tenant provisioning — so the minted id is the one that is written.
+    let principal_id = Uuid::now_v7();
+    let mut decision = authorize(
+        &authz,
+        &caller,
+        &Permission::platform_identity_write(),
+        &platform_principal_resource(principal_id),
+    )
+    .await?;
 
     // Registering against no connection would create a principal that could
     // never sign in, so the connection is required first.
@@ -411,7 +450,6 @@ async fn register_admin(
             })
         })?;
 
-    let principal_id = Uuid::now_v7();
     insert_platform_principal_tx(
         &mut decision,
         principal_id,
@@ -475,7 +513,13 @@ async fn list_platform_admins(
     caller: PlatformCaller,
 ) -> Result<Json<PlatformPrincipalListResponse>, WyrdErrorResponse> {
     let pool = operator(&state)?;
-    authorize_read(&pool, &caller, &Permission::platform_identity_read()).await?;
+    authorize_read(
+        &pool,
+        &caller,
+        &Permission::platform_identity_read(),
+        PLATFORM_ADMINS_RESOURCE,
+    )
+    .await?;
 
     let rows = list_platform_principals(&pool).await.map_err(store_error)?;
     Ok(Json(PlatformPrincipalListResponse {
@@ -536,7 +580,13 @@ async fn set_admin_status(
     let pool = operator(&state)?;
     // The handle must outlive the transaction it lends out.
     let authz = PlatformAuthorization::new(pool.clone());
-    let mut decision = authorize(&authz, &caller, &Permission::platform_identity_write()).await?;
+    let mut decision = authorize(
+        &authz,
+        &caller,
+        &Permission::platform_identity_write(),
+        &platform_principal_resource(principal_id),
+    )
+    .await?;
 
     if !matches!(request.status.as_str(), "active" | "suspended") {
         return Err(WyrdErrorResponse::from(WyrdError::Validation {

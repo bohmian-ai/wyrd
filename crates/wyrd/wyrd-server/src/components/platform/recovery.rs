@@ -14,7 +14,7 @@
 use chrono::Duration;
 use secrecy::ExposeSecret;
 use uuid::Uuid;
-use wyrd_auth::platform_authz::PlatformAuthorization;
+use wyrd_auth::platform_authz::{PlatformAuthorization, tenant_resource};
 use wyrd_runtime::Permission;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, ProvisionedTenantAdmin, SecretBearer};
@@ -87,7 +87,7 @@ impl TenantRecovery {
                 &caller.context,
                 &Permission::tenant_recover_admin(),
                 caller.request_id.as_str(),
-                Some(tenant_id),
+                &tenant_resource(tenant_id),
             )
             .await?;
         // The decision stands on its own: the replacement credential is written

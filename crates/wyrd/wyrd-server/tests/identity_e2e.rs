@@ -1068,7 +1068,7 @@ async fn federated_cloud_journey_cli_authored_keycloak() {
         expected_audience: "wyrd-workload".to_owned(),
         client_id: "wyrd-workload".to_owned(),
         client_auth: "SecretPost".to_owned(),
-        client_secret: Some(client_secret.to_owned()),
+        client_secret: Some(secrecy::SecretString::from(client_secret.to_owned())),
         client_secret_file: None,
         claim_subject: "sub".to_owned(),
         claim_email: None,

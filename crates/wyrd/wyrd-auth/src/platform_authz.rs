@@ -14,6 +14,7 @@
 //! publisher and the same reader as every tenant-plane decision. There is no
 //! platform audit table, publisher, or reader.
 
+use uuid::Uuid;
 use wyrd_runtime::{AuthContext, Permission};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{AuditDetail, AuditEvent, AuditOutcome};
@@ -28,6 +29,52 @@ use crate::audit::audit_request_id;
 /// row's `permission` column, so a reader filters the plane by operation and
 /// the capability by permission without parsing either.
 pub const PLATFORM_AUTHZ_OPERATION: &str = "platform.authz";
+
+/// Audited resource for a decision about the deployment's OIDC connection.
+///
+/// There is exactly one connection per deployment, so the spelling names the
+/// object rather than an identifier.
+pub const PLATFORM_CONNECTION_RESOURCE: &str = "platform:oidc_connection";
+
+/// Audited resource for a decision about the platform administrator directory
+/// as a whole, rather than about one administrator in it.
+pub const PLATFORM_ADMINS_RESOURCE: &str = "platform:admins";
+
+/// Audited resource for a decision about the tenant directory as a whole,
+/// rather than about one tenant in it.
+pub const PLATFORM_TENANTS_RESOURCE: &str = "platform:tenants";
+
+/// Audited resource naming one tenant that already exists.
+///
+/// Used wherever the tenant id is settled before the decision is recorded, so
+/// the row names the tenant the operation actually acted on.
+#[must_use]
+pub fn tenant_resource(tenant_id: DataTenantId) -> String {
+    format!("tenant:{tenant_id}")
+}
+
+/// Audited resource naming a tenant that does not exist yet.
+///
+/// Provisioning cannot name a tenant id truthfully: the id it proposes is
+/// discarded when the directory adopts a previously failed attempt under that
+/// attempt's own id. The requested slug is the one thing a fresh and a resumed
+/// attempt agree on, so it is what the decision records.
+#[must_use]
+pub fn tenant_slug_resource(slug: &str) -> String {
+    format!("tenant_slug:{slug}")
+}
+
+/// Audited resource naming one platform administrative principal.
+#[must_use]
+pub fn platform_principal_resource(principal_id: Uuid) -> String {
+    format!("platform_principal:{principal_id}")
+}
+
+/// Audited resource naming one platform administrative credential.
+#[must_use]
+pub fn platform_credential_resource(credential_id: Uuid) -> String {
+    format!("platform_credential:{credential_id}")
+}
 
 /// Platform authorization failure.
 #[derive(Debug, thiserror::Error)]
@@ -106,9 +153,9 @@ impl PlatformAuthorization {
         context: &AuthContext,
         required: &Permission,
         request_id: &str,
-        target_tenant_id: Option<DataTenantId>,
+        resource: &str,
     ) -> Result<TenantConn<'_>, PlatformAuthzError> {
-        let resource = required.resource.as_str().unwrap_or("any_of");
+        let denied_resource = required.resource.as_str().unwrap_or("any_of");
         let action = required.action.as_str().unwrap_or("any_of");
 
         let allowed = match context {
@@ -123,7 +170,7 @@ impl PlatformAuthorization {
             .await
             .map_err(PlatformAuthzError::Transaction)?;
 
-        let event = Self::decision_event(context, required, request_id, target_tenant_id, allowed);
+        let event = Self::decision_event(context, required, request_id, resource, allowed);
         if let Err(error) = vala_sql::queries::audit_staging::append_audit(&mut conn, &event).await
         {
             // Fail closed: a decision that cannot be recorded did not happen.
@@ -136,7 +183,10 @@ impl PlatformAuthorization {
             conn.commit()
                 .await
                 .map_err(PlatformAuthzError::Transaction)?;
-            return Err(PlatformAuthzError::Denied { resource, action });
+            return Err(PlatformAuthzError::Denied {
+                resource: denied_resource,
+                action,
+            });
         }
 
         Ok(conn)
@@ -144,16 +194,16 @@ impl PlatformAuthorization {
 
     /// Build the canonical audit row for one platform decision.
     ///
-    /// The resource names what the decision was *about* — the tenant created,
-    /// suspended, or recovered, or the platform plane itself for a decision
-    /// that names no tenant. That is not a tenancy scope: the row is staged
+    /// The resource names what the decision was *about*, in the caller's own
+    /// exact terms: the tenant, slug, administrator, credential, or connection
+    /// the operation acted on. That is not a tenancy scope: the row is staged
     /// under the sentinel tenant regardless, because platform authority is not
     /// a tenant's.
     fn decision_event(
         context: &AuthContext,
         required: &Permission,
         request_id: &str,
-        target_tenant_id: Option<DataTenantId>,
+        resource: &str,
         allowed: bool,
     ) -> AuditEvent {
         let principal_id = context.principal_id();
@@ -166,10 +216,7 @@ impl PlatformAuthorization {
             request_id: audit_request_id(request_id),
             trace_id: None,
             operation: PLATFORM_AUTHZ_OPERATION.to_owned(),
-            resource: target_tenant_id.map_or_else(
-                || "platform".to_owned(),
-                |tenant| format!("tenant:{tenant}"),
-            ),
+            resource: resource.to_owned(),
             card_ref: None,
             principal_id,
             principal_kind: context.principal_kind(),
@@ -191,6 +238,7 @@ impl PlatformAuthorization {
 mod pg_tests {
     //! Decision and canonical-audit coupling against real Postgres.
 
+    use super::{PLATFORM_TENANTS_RESOURCE, tenant_resource};
     use sqlx::Row;
     use uuid::Uuid;
     use wyrd_dev_fixtures::pg::PgFixture;
@@ -309,7 +357,12 @@ mod pg_tests {
 
         let authz = PlatformAuthorization::new(fixture.operator_pool().clone());
         let conn = authz
-            .authorize(&context, &Permission::tenant_create(), "req-allow", None)
+            .authorize(
+                &context,
+                &Permission::tenant_create(),
+                "req-allow",
+                PLATFORM_TENANTS_RESOURCE,
+            )
             .await
             .expect("authorized");
 
@@ -334,7 +387,12 @@ mod pg_tests {
 
         let authz = PlatformAuthorization::new(fixture.operator_pool().clone());
         let conn = authz
-            .authorize(&context, &Permission::tenant_create(), "req-rollback", None)
+            .authorize(
+                &context,
+                &Permission::tenant_create(),
+                "req-rollback",
+                PLATFORM_TENANTS_RESOURCE,
+            )
             .await
             .expect("authorized");
         drop(conn);
@@ -367,7 +425,12 @@ mod pg_tests {
             let principal = context.principal_id();
 
             let conn = authz
-                .authorize(&context, &Permission::tenant_create(), "req-kind", None)
+                .authorize(
+                    &context,
+                    &Permission::tenant_create(),
+                    "req-kind",
+                    PLATFORM_TENANTS_RESOURCE,
+                )
                 .await
                 .expect("authorized");
             conn.commit().await.expect("allowance commits");
@@ -412,7 +475,7 @@ mod pg_tests {
                     &AuthContext::from(base.clone().with_credential_id(credential)),
                     &Permission::tenant_create(),
                     "req-credential",
-                    None,
+                    PLATFORM_TENANTS_RESOURCE,
                 )
                 .await
                 .expect("authorized");
@@ -441,7 +504,7 @@ mod pg_tests {
                 &context,
                 &Permission::tenant_suspend(),
                 "req-deny",
-                Some(target),
+                &tenant_resource(target),
             )
             .await
             .err()
@@ -489,7 +552,7 @@ mod pg_tests {
                 &context,
                 &Permission::tenant_create(),
                 "req-wrong-plane",
-                None,
+                PLATFORM_TENANTS_RESOURCE,
             )
             .await
             .err()
@@ -523,7 +586,12 @@ mod pg_tests {
 
         let authz = PlatformAuthorization::new(fixture.operator_pool().clone());
         let error = authz
-            .authorize(&context, &Permission::tenant_create(), "req-no-audit", None)
+            .authorize(
+                &context,
+                &Permission::tenant_create(),
+                "req-no-audit",
+                PLATFORM_TENANTS_RESOURCE,
+            )
             .await
             .err()
             .expect("refused when the decision cannot be recorded");

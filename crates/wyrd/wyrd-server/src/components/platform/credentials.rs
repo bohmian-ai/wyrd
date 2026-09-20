@@ -20,7 +20,9 @@ use axum::{Json, Router};
 use chrono::{Duration, Utc};
 use secrecy::ExposeSecret;
 use uuid::Uuid;
-use wyrd_auth::platform_authz::PlatformAuthorization;
+use wyrd_auth::platform_authz::{
+    PlatformAuthorization, platform_credential_resource, platform_principal_resource,
+};
 use wyrd_auth::platform_credentials::{PlatformCredentialError, PlatformCredentials};
 use wyrd_runtime::Permission;
 use wyrd_spec::auth::{
@@ -87,7 +89,13 @@ async fn issue_credential(
     let pool = operator(&state)?;
     // The handle must outlive the transaction it lends out.
     let authz = PlatformAuthorization::new(pool.clone());
-    let mut decision = authorize(&authz, &caller, &Permission::platform_credential_write()).await?;
+    let mut decision = authorize(
+        &authz,
+        &caller,
+        &Permission::platform_credential_write(),
+        &platform_principal_resource(principal_id),
+    )
+    .await?;
 
     let expires_at = request
         .expires_in_days
@@ -132,7 +140,13 @@ async fn list_credentials(
     Path(principal_id): Path<Uuid>,
 ) -> Result<Json<CredentialListResponse>, WyrdErrorResponse> {
     let pool = operator(&state)?;
-    authorize_read(&pool, &caller, &Permission::platform_credential_read()).await?;
+    authorize_read(
+        &pool,
+        &caller,
+        &Permission::platform_credential_read(),
+        &platform_principal_resource(principal_id),
+    )
+    .await?;
 
     let rows = list_platform_credentials(&pool, principal_id)
         .await
@@ -191,7 +205,13 @@ async fn revoke_credential(
     let pool = operator(&state)?;
     // The handle must outlive the transaction it lends out.
     let authz = PlatformAuthorization::new(pool.clone());
-    let mut decision = authorize(&authz, &caller, &Permission::platform_credential_write()).await?;
+    let mut decision = authorize(
+        &authz,
+        &caller,
+        &Permission::platform_credential_write(),
+        &platform_credential_resource(credential_id),
+    )
+    .await?;
 
     let owned = platform_credential_by_id(&pool, credential_id)
         .await

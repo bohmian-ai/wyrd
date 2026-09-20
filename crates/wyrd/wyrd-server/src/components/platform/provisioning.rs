@@ -15,7 +15,10 @@
 use chrono::Duration;
 use secrecy::ExposeSecret;
 use uuid::Uuid;
-use wyrd_auth::platform_authz::{PlatformAuthorization, PlatformAuthzError};
+use wyrd_auth::platform_authz::{
+    PLATFORM_TENANTS_RESOURCE, PlatformAuthorization, PlatformAuthzError, tenant_resource,
+    tenant_slug_resource,
+};
 use wyrd_auth::seed::seed_builtin_roles_for_tenant;
 use wyrd_runtime::Permission;
 use wyrd_spec::DataTenantId;
@@ -149,7 +152,7 @@ impl TenantProvisioning {
                 &caller.context,
                 &Permission::tenant_create(),
                 caller.request_id.as_str(),
-                Some(data_tenant_id),
+                &tenant_slug_resource(request.slug.as_str()),
             )
             .await?;
 
@@ -282,7 +285,8 @@ impl TenantProvisioning {
         &self,
         caller: &PlatformCaller,
     ) -> Result<TenantListResponse, ProvisionError> {
-        self.authorize_read(caller, None).await?;
+        self.authorize_read(caller, PLATFORM_TENANTS_RESOURCE)
+            .await?;
         let rows = list_tenants(&self.operator)
             .await
             .map_err(|e| ProvisionError::Store(e.to_string()))?;
@@ -312,7 +316,8 @@ impl TenantProvisioning {
         caller: &PlatformCaller,
         tenant_id: DataTenantId,
     ) -> Result<ProvisionedTenant, ProvisionError> {
-        self.authorize_read(caller, Some(tenant_id)).await?;
+        self.authorize_read(caller, &tenant_resource(tenant_id))
+            .await?;
         tenant_by_id(&self.operator, tenant_id)
             .await
             .map_err(|e| ProvisionError::Store(e.to_string()))?
@@ -350,7 +355,7 @@ impl TenantProvisioning {
                 &caller.context,
                 &Permission::tenant_suspend(),
                 caller.request_id.as_str(),
-                Some(tenant_id),
+                &tenant_resource(tenant_id),
             )
             .await?;
 
@@ -374,7 +379,8 @@ impl TenantProvisioning {
     ///
     /// The read itself runs outside this transaction: it touches only the
     /// directory the decision was recorded against, so holding the transaction
-    /// open across it would buy nothing.
+    /// open across it would buy nothing. `resource` is what the read was about
+    /// — the whole directory, or the one tenant row being inspected.
     ///
     /// # Errors
     /// Returns [`ProvisionError::Denied`] when the caller lacks `tenants:read`,
@@ -383,7 +389,7 @@ impl TenantProvisioning {
     async fn authorize_read(
         &self,
         caller: &PlatformCaller,
-        tenant_id: Option<DataTenantId>,
+        resource: &str,
     ) -> Result<(), ProvisionError> {
         let authz = PlatformAuthorization::new(self.operator.clone());
         let decision = authz
@@ -391,7 +397,7 @@ impl TenantProvisioning {
                 &caller.context,
                 &Permission::tenant_read(),
                 caller.request_id.as_str(),
-                tenant_id,
+                &resource,
             )
             .await?;
         decision

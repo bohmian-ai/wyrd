@@ -54,9 +54,11 @@ use crate::state::AppState;
 /// group-to-role mapping here at all, because a platform principal's authority
 /// comes from its grant and must never be assertable by a provider.
 fn platform_claim_mapping() -> serde_json::Value {
+    // Claim paths are stored as dotted strings, the shape the login resolver
+    // decodes this row with. An array here parses as nothing at all.
     serde_json::json!({
-        "subject": ["sub"],
-        "email": ["email"],
+        "subject": "sub",
+        "email": "email",
         "groups": null,
     })
 }

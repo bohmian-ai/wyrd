@@ -3766,18 +3766,15 @@ async fn a_failed_platform_mutation_leaves_no_allowance() {
     );
 }
 
-/// A provisioned tenant administrator's refresh token actually rotates.
+/// A provisioned tenant administrator renews by re-exchanging its credential.
 ///
-/// The API-key exchange has always returned a refresh token to a Card-free
-/// tenant administrator, and rotation refused every one of them: the rotation
-/// match covered only Card-bound service and agent principals. An advertised
-/// credential that never works is worse than none, because the holder builds on
-/// it.
-///
-/// Rotation is also the anti-theft mechanism, so the consumed token must stop
-/// working: replaying it is how a stolen refresh token shows up.
+/// A tenant administrator authenticates with a durable API key, which makes its
+/// grant a machine grant: the exchange advertises no refresh token and stores no
+/// refresh row, and renewal is spending the same durable credential again. Only
+/// a human OIDC session receives and rotates a refresh token, which
+/// `identity_e2e::human_oidc_login_journey` drives end to end.
 #[tokio::test]
-async fn a_tenant_administrator_refreshes_and_cannot_replay() {
+async fn a_tenant_administrator_renews_by_re_exchanging_its_credential() {
     if !e2e_enabled() {
         return;
     }
@@ -3811,38 +3808,32 @@ async fn a_tenant_administrator_refreshes_and_cannot_replay() {
         .expect("token route responds"),
     )
     .await;
-    let refresh = exchanged["refresh_token"]
+    assert!(
+        exchanged.get("refresh_token").is_none_or(Value::is_null),
+        "a machine grant advertises no refresh token: {exchanged}"
+    );
+    let access = exchanged["access_token"]
         .as_str()
-        .expect("the exchange advertises a refresh token")
+        .expect("the exchange returns an access token")
         .to_owned();
 
-    let rotated_resp = srv
-        .oneshot(anonymous_post(
+    // Renewal is the second exchange of the same durable credential, and the
+    // token it returns must administer the tenant exactly as the first did.
+    let renewed = body_json(
+        srv.oneshot(anonymous_post(
             "/auth/token",
-            json!({ "grant_type": "refresh_token", "refresh_token": refresh }),
+            json!({ "grant_type": "wyrd_api_key", "api_key": credential }),
         ))
         .await
-        .expect("refresh route responds");
-    let status = rotated_resp.status();
-    let rotated = body_json(rotated_resp).await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "a tenant administrator's refresh token rotates: {rotated}"
-    );
-    let successor = rotated["access_token"]
+        .expect("token route responds"),
+    )
+    .await;
+    let successor = renewed["access_token"]
         .as_str()
-        .expect("rotation returns an access token")
+        .expect("re-exchange returns an access token")
         .to_owned();
-    assert_ne!(
-        rotated["refresh_token"]
-            .as_str()
-            .expect("successor refresh"),
-        refresh,
-        "rotation replaces the refresh token"
-    );
+    assert_ne!(successor, access, "re-exchange mints a new access token");
 
-    // The rotated access token is the point: it must administer the tenant.
     let protected = srv
         .oneshot_authenticated(
             &successor,
@@ -3855,21 +3846,7 @@ async fn a_tenant_administrator_refreshes_and_cannot_replay() {
     assert_eq!(
         protected_status,
         StatusCode::OK,
-        "the rotated token administers the tenant: {protected_body}"
-    );
-
-    // Replaying the consumed token is the theft signal, not a second rotation.
-    let replayed = srv
-        .oneshot(anonymous_post(
-            "/auth/token",
-            json!({ "grant_type": "refresh_token", "refresh_token": refresh }),
-        ))
-        .await
-        .expect("refresh route responds");
-    assert!(
-        replayed.status().is_client_error(),
-        "a consumed refresh token is refused: {}",
-        replayed.status()
+        "the re-exchanged token administers the tenant: {protected_body}"
     );
 }
 

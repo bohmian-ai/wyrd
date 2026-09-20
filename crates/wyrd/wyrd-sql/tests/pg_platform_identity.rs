@@ -89,7 +89,7 @@ mod pg_tests {
             "wyrd-platform",
             "wyrd-platform",
             "Public",
-            &serde_json::json!({"subject": ["sub"], "email": ["email"], "groups": null}),
+            &serde_json::json!({"subject": "sub", "email": "email", "groups": null}),
             300,
             None,
         )
@@ -594,7 +594,7 @@ mod pg_tests {
         }
         let fixture = PgFixture::start().await.expect("fixture starts");
         let pool = fixture.operator_pool();
-        let mapping = serde_json::json!({ "subject": ["sub"], "email": ["email"] });
+        let mapping = serde_json::json!({ "subject": "sub", "email": "email" });
 
         for audience in ["first-audience", "second-audience"] {
             let mut conn = pool

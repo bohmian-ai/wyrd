@@ -21,9 +21,15 @@ async fn platform_cli(arguments: Vec<String>, credential: String) -> std::proces
     run_cli_async_with_credential(arguments, "WYRD_PLATFORM_CREDENTIAL", credential).await
 }
 
-/// Run a `wyrd` invocation carrying a tenant access token.
-async fn tenant_cli(arguments: Vec<String>, token: String) -> std::process::Output {
-    run_cli_async_with_credential(arguments, "WYRD_ACCESS_TOKEN", token).await
+/// Run a `wyrd` invocation carrying a tenant credential.
+///
+/// The value is whatever the operator was handed — the tenant administrator's
+/// API key, printed once at tenant creation — passed through the CLI's one
+/// explicit credential input. The shared client classifies it and exchanges a
+/// key for a token itself, so the journey never has to know which kind it
+/// holds, and never has to mint one out of band.
+async fn tenant_cli(arguments: Vec<String>, credential: String) -> std::process::Output {
+    run_cli_async_with_credential(arguments, "WYRD_ACCESS_TOKEN", credential).await
 }
 
 /// Assert a command succeeded and return its stdout.
@@ -123,10 +129,6 @@ async fn operator_administers_a_deployment_through_the_cli() {
     // This is the step that makes the tenant usable by anything other than the
     // credential just printed, and it is the shipped command an operator runs
     // to do it — not a SQL insert and not a server-side seed.
-    let tenant_token = server
-        .exchange_api_key(&secrecy::SecretString::from(tenant_credential))
-        .await
-        .expect("the tenant administrator's credential exchanges");
     let (idp, issuer) = discovery_server().await;
     let mut arguments = vec![
         "auth".to_owned(),
@@ -150,7 +152,7 @@ async fn operator_administers_a_deployment_through_the_cli() {
     arguments.extend(endpoint());
     let configured = succeeded(
         "trusted issuer add",
-        &tenant_cli(arguments, tenant_token.clone()).await,
+        &tenant_cli(arguments, tenant_credential.clone()).await,
     );
     assert_eq!(field(&configured, "issuer"), issuer);
     assert_eq!(field(&configured, "jwks_uri"), format!("{issuer}/jwks"));
@@ -163,7 +165,7 @@ async fn operator_administers_a_deployment_through_the_cli() {
     arguments.extend(endpoint());
     let listed = succeeded(
         "trusted issuer list",
-        &tenant_cli(arguments, tenant_token.clone()).await,
+        &tenant_cli(arguments, tenant_credential.clone()).await,
     );
     assert!(
         listed.contains(&issuer),
@@ -184,7 +186,7 @@ async fn operator_administers_a_deployment_through_the_cli() {
     arguments.extend(endpoint());
     let principal = succeeded(
         "principal create",
-        &tenant_cli(arguments, tenant_token.clone()).await,
+        &tenant_cli(arguments, tenant_credential.clone()).await,
     );
     let principal_id = field(&principal, "principal_id");
     let first_credential = field(&principal, "credential");
@@ -209,7 +211,7 @@ async fn operator_administers_a_deployment_through_the_cli() {
     arguments.extend(endpoint());
     let issued = succeeded(
         "credential issue",
-        &tenant_cli(arguments, tenant_token.clone()).await,
+        &tenant_cli(arguments, tenant_credential.clone()).await,
     );
     let replacement = server
         .exchange_api_key(&secrecy::SecretString::from(field(&issued, "credential")))
@@ -231,7 +233,7 @@ async fn operator_administers_a_deployment_through_the_cli() {
     arguments.extend(endpoint());
     let listed = succeeded(
         "credential list",
-        &tenant_cli(arguments, tenant_token.clone()).await,
+        &tenant_cli(arguments, tenant_credential.clone()).await,
     );
     let superseded = listed
         .lines()
@@ -252,7 +254,7 @@ async fn operator_administers_a_deployment_through_the_cli() {
     arguments.extend(endpoint());
     succeeded(
         "credential revoke",
-        &tenant_cli(arguments, tenant_token.clone()).await,
+        &tenant_cli(arguments, tenant_credential.clone()).await,
     );
 
     // 6. Lifecycle administration, from the platform plane.

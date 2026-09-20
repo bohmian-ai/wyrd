@@ -83,11 +83,13 @@ survive, so `resume` restores exactly what was there.
 
 ### Tenant administration
 
-Inside a tenant, administration uses the tenant's own access token, never the
-platform credential:
+Inside a tenant, administration uses the tenant's own credential, never the
+platform credential. `tenant create` printed that credential once — pass it
+straight through; Wyrd classifies an API key and exchanges it for a token
+itself, so there is no separate exchange step and nothing else to configure:
 
 ```bash
-export WYRD_ACCESS_TOKEN=<tenant access token>
+export WYRD_ACCESS_TOKEN=<the admin_credential tenant create printed>
 
 # Configure first: the issuer this tenant's workloads federate from. Wyrd
 # resolves the JWKS endpoint from the issuer's own discovery document.

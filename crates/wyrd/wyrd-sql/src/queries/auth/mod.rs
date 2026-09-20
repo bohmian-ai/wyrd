@@ -33,7 +33,7 @@ pub use revocation::{
 };
 pub use role_assignments::{
     grant_role_to_service_account, grant_role_to_user, list_service_account_roles, list_user_roles,
-    revoke_role_from_service_account, revoke_role_from_user,
+    replace_user_roles, revoke_role_from_service_account, revoke_role_from_user,
 };
 pub use roles::{
     RoleRow, delete_role, insert_role, list_roles, role_by_id, role_by_name, roles_by_name,

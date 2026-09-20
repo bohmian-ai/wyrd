@@ -18,7 +18,7 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
 use wyrd_sql::queries::auth::{
     delete_user, insert_refresh_token, insert_refresh_token_rotated, insert_user,
-    upsert_user_identity, user_id_by_identity,
+    replace_user_roles, upsert_user_identity, user_id_by_identity,
 };
 use wyrd_sql::{SqlError, TenantConn, WyrdPostgres};
 
@@ -195,6 +195,14 @@ impl AuthorizationCodeExchange {
         .map_err(sql_error)?;
         *audit_principal_id = principal_id;
         let roles = role_names_to_refs(trusted, &verified.groups)?;
+        // The provider just asserted this human's authority, and nothing else
+        // in Wyrd grants a user a role. Recording it here is what makes the
+        // grant table the truth a later refresh rotation can re-read; without
+        // it, renewal would mint an authority-free successor.
+        let role_names = roles.iter().map(RoleRef::as_str).collect::<Vec<_>>();
+        replace_user_roles(&mut conn, principal_id, &role_names)
+            .await
+            .map_err(sql_error)?;
         let exchanged = issue_and_record_user_session(
             &mut conn,
             self.issuing_key.as_ref(),

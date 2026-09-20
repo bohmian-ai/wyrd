@@ -245,7 +245,7 @@ mod pg_tests {
     use sha2::{Digest, Sha256};
     use uuid::Uuid;
     use wyrd_auth_issue::{IssueError, IssuingKey};
-    use wyrd_auth_verify::Kid;
+    use wyrd_auth_verify::{AccessTokenClaims, Kid, public_key_from_pem, verify_eddsa};
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_runtime::PrincipalId;
     use wyrd_semver::VersionBlock;
@@ -256,7 +256,10 @@ mod pg_tests {
     use wyrd_spec::reference::CardRef;
 
     use wyrd_sql::TenantConn;
-    use wyrd_sql::queries::auth::{insert_refresh_token, insert_service_account, refresh_by_hash};
+    use wyrd_sql::queries::auth::{
+        insert_refresh_token, insert_role, insert_service_account, list_user_roles,
+        refresh_by_hash, replace_user_roles,
+    };
 
     use wyrd_dev_fixtures::cards::seed_backing_card;
 
@@ -629,6 +632,72 @@ mod pg_tests {
             credentials,
             vec![Some(consumed)],
             "the rotation is audited once, naming the consumed refresh row"
+        );
+    }
+
+    /// A rotated human session keeps the authority its login established.
+    ///
+    /// Rotation re-reads the grant table rather than trusting the consumed
+    /// token, so the federated login path has to have persisted what the
+    /// provider asserted. This seeds that state the way login writes it —
+    /// including a name with no local role row, which resolves to no
+    /// permission anywhere and is therefore not stored — and proves the
+    /// successor access token is signed with the roles that survived.
+    #[tokio::test]
+    async fn rotation_carries_the_roles_login_persisted() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let key = test_issuing_key();
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let user_id = insert_test_user(&mut conn, tenant).await;
+        insert_role(
+            &mut conn,
+            Uuid::new_v4(),
+            "runtime_admin",
+            &serde_json::json!([]),
+            false,
+        )
+        .await
+        .expect("role seeds");
+        replace_user_roles(&mut conn, user_id, &["runtime_admin", "only-at-the-idp"])
+            .await
+            .expect("login persists the asserted roles");
+        assert_eq!(
+            list_user_roles(&mut conn, user_id)
+                .await
+                .expect("roles list"),
+            vec!["runtime_admin".to_owned()],
+            "a name with no local role row is not recorded as authority"
+        );
+
+        let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::User, user_id, tenant);
+        let hash = hash_of(&refresh_jwt);
+        seed_active_refresh(&mut conn, "user", user_id, &hash).await;
+
+        let exchanged = refresh_service()
+            .execute(&mut conn, refresh_jwt, "req-rotation-roles")
+            .await
+            .expect("rotation succeeds");
+
+        let verifying_pem = key.verifying_key_pem().expect("verifying key encodes");
+        let decoding_key =
+            public_key_from_pem(verifying_pem.as_bytes()).expect("verifying key decodes");
+        let claims: AccessTokenClaims = verify_eddsa(
+            exchanged.access_token.expose_secret(),
+            &decoding_key,
+            Some("wyrd"),
+        )
+        .expect("successor access token verifies");
+
+        assert_eq!(
+            claims
+                .roles
+                .iter()
+                .map(|role| role.as_str().to_owned())
+                .collect::<Vec<_>>(),
+            vec!["runtime_admin".to_owned()],
+            "the successor carries the session's authority"
         );
     }
 

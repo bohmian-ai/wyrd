@@ -186,6 +186,36 @@ impl IssuingKey {
     ///
     /// # Errors
     /// Returns an error when the principal is not a user, TTL is invalid, or signing fails.
+    pub fn issue_user_access_token(
+        &self,
+        principal: TokenPrincipalRef,
+        roles: Vec<RoleRef>,
+        credential_id: Option<Uuid>,
+        ttl: Duration,
+    ) -> Result<String, IssueError> {
+        self.issue_user_access_token_at(principal, roles, credential_id, Utc::now(), ttl)
+    }
+
+    /// Mint an access token for a user principal with an explicitly chosen
+    /// issuing instant.
+    ///
+    /// `iat` is whole seconds and the revocation epoch retires a token only
+    /// when `iat` is strictly older, so a caller that moves the epoch and mints
+    /// the successor in the same transaction cannot let the wall clock decide
+    /// the order: a predecessor minted earlier in the same second would share
+    /// the successor's `iat` and survive the withdrawal. The federated sign-in
+    /// path therefore advances the epoch to the *next* whole second and passes
+    /// that instant here, which puts every already-issued token strictly behind
+    /// the epoch while admitting the one it just minted.
+    ///
+    /// Every other caller wants the wall clock and should use
+    /// [`IssuingKey::issue_user_access_token`].
+    ///
+    /// # Errors
+    /// Returns [`IssueError::InvalidPrincipalKind`] when the principal is not a
+    /// user, [`IssueError::InvalidCardRef`] when it binds a Card,
+    /// [`IssueError::InvalidTtl`] when the TTL is not positive or the instant
+    /// is not representable, and [`IssueError::Signing`] when signing fails.
     #[tracing::instrument(
         level = "debug",
         skip(self, principal),
@@ -197,11 +227,12 @@ impl IssuingKey {
         ),
         err,
     )]
-    pub fn issue_user_access_token(
+    pub fn issue_user_access_token_at(
         &self,
         principal: TokenPrincipalRef,
         roles: Vec<RoleRef>,
         credential_id: Option<Uuid>,
+        issued_at: DateTime<Utc>,
         ttl: Duration,
     ) -> Result<String, IssueError> {
         if principal.kind != PrincipalKindTag::User {
@@ -214,6 +245,7 @@ impl IssuingKey {
             roles,
             None,
             credential_id,
+            issued_at,
             ttl,
         )
     }
@@ -254,6 +286,7 @@ impl IssuingKey {
             roles,
             None,
             credential_id,
+            Utc::now(),
             ttl,
         )
     }
@@ -313,7 +346,15 @@ impl IssuingKey {
             card_ref_scope,
             ..principal
         };
-        self.issue_access_token_with_claims(subject, principal, roles, None, credential_id, ttl)
+        self.issue_access_token_with_claims(
+            subject,
+            principal,
+            roles,
+            None,
+            credential_id,
+            Utc::now(),
+            ttl,
+        )
     }
 
     /// Mint a delegated access token via RFC 8693 token exchange.
@@ -361,6 +402,7 @@ impl IssuingKey {
             act,
             // A delegated token is minted from a token, not from a credential.
             None,
+            Utc::now(),
             ttl,
         )
     }
@@ -388,7 +430,7 @@ impl IssuingKey {
         tenant_id: DataTenantId,
         ttl: Duration,
     ) -> Result<String, IssueError> {
-        let (iat, exp) = timestamps(ttl)?;
+        let (iat, exp) = timestamps(Utc::now(), ttl)?;
         let jti = new_jti();
         tracing::Span::current().record("jti", &jti);
         let claims = RefreshTokenClaims {
@@ -427,7 +469,7 @@ impl IssuingKey {
         credential_id: Option<Uuid>,
         ttl: Duration,
     ) -> Result<String, IssueError> {
-        let (iat, exp) = timestamps(ttl)?;
+        let (iat, exp) = timestamps(Utc::now(), ttl)?;
         let claims = PlatformAccessTokenClaims {
             sub: principal_id.to_string(),
             cid: credential_id.map(|id| id.to_string()),
@@ -457,9 +499,10 @@ impl IssuingKey {
         roles: Vec<RoleRef>,
         act: Option<Box<ActClaim>>,
         credential_id: Option<Uuid>,
+        issued_at: DateTime<Utc>,
         ttl: Duration,
     ) -> Result<String, IssueError> {
-        let (iat, exp) = timestamps(ttl)?;
+        let (iat, exp) = timestamps(issued_at, ttl)?;
         let jti = new_jti();
         tracing::Span::current().record("jti", &jti);
         let claims = AccessTokenClaims {
@@ -516,12 +559,11 @@ fn argon2() -> Argon2<'static> {
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
 }
 
-fn timestamps(ttl: Duration) -> Result<(usize, usize), IssueError> {
+fn timestamps(issued_at: DateTime<Utc>, ttl: Duration) -> Result<(usize, usize), IssueError> {
     if ttl <= Duration::zero() {
         return Err(IssueError::InvalidTtl);
     }
 
-    let issued_at = Utc::now();
     let iat: usize = issued_at
         .timestamp()
         .try_into()
@@ -734,6 +776,36 @@ mod tests {
         );
 
         assert!(matches!(result, Err(IssueError::InvalidCardRef)));
+    }
+
+    /// An explicit issuing instant lands in `iat`, and `exp` is measured from
+    /// it.
+    ///
+    /// The federated role-change path picks the instant so the successor sorts
+    /// against the epoch it just wrote. If `iat` came from the wall clock
+    /// anyway, a predecessor minted in the same second would survive the
+    /// withdrawal; if `exp` were measured from the wall clock instead of the
+    /// chosen instant, the successor's lifetime would drift from its TTL.
+    ///
+    /// # Panics
+    /// Panics when the issued claims do not carry the chosen instant.
+    #[test]
+    fn issue_user_access_token_at_carries_the_chosen_instant() {
+        let issued_at = chrono::DateTime::from_timestamp(1_800_000_000, 0)
+            .expect("the chosen instant is representable");
+        let token = issuing_key()
+            .issue_user_access_token_at(
+                user_principal(),
+                vec![role("runtime_admin")],
+                None,
+                issued_at,
+                Duration::minutes(5),
+            )
+            .expect("token issues");
+        let claims = verify_access_token(&token);
+
+        assert_eq!(claims.iat, 1_800_000_000);
+        assert_eq!(claims.exp, 1_800_000_000 + 300);
     }
 
     #[test]

@@ -28,7 +28,7 @@ pub use refresh_tokens::{
     revoke_refresh_family,
 };
 pub use revocation::{
-    advance_user_epoch_to_second, revoke_service_account_principal, revoke_user_principal,
+    advance_user_epoch_to_next_second, revoke_service_account_principal, revoke_user_principal,
     service_account_revocation_epoch, user_revocation_epoch,
 };
 pub use role_assignments::{

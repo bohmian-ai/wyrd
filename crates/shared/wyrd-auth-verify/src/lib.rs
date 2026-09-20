@@ -1744,6 +1744,33 @@ mod tests {
             .expect("token issued after epoch must pass");
     }
 
+    /// The successor minted at exactly the epoch is admitted.
+    ///
+    /// A role change advances the epoch to the next whole second and mints the
+    /// replacement token at that same instant, so `iat == epoch` is the shape
+    /// the ordering depends on: retiring it would sign the human out of the
+    /// session the change just established, while admitting anything older
+    /// would leave the withdrawn role spendable.
+    ///
+    /// # Panics
+    /// Panics when the equal-second successor is refused.
+    #[tokio::test]
+    async fn revocation_epoch_admits_the_successor_minted_at_the_epoch() {
+        let resolver = Arc::new(TestResolver::default());
+        let iat_unix = now() - 5;
+        let epoch = DateTime::from_timestamp(iat_unix as i64, 0).expect("static epoch is valid");
+        let verifier = verifier_with_revocation(Arc::clone(&resolver), Some(epoch));
+        let token = SecretString::from(encode_eddsa_with_kid(&claims_with_times(
+            now() + 3_600,
+            iat_unix,
+        )));
+
+        verifier
+            .verify(&token, &tenant_id())
+            .await
+            .expect("the successor minted at the epoch is the one token it admits");
+    }
+
     /// A fresh verify whose revocation store is down must refuse, not admit.
     ///
     /// This is the cache-miss branch: the signature and claims are good, but the

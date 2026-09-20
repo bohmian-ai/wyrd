@@ -150,6 +150,9 @@ impl RefreshTokens {
                     principal_id,
                     roles,
                     Some(active.id),
+                    // Renewal is not a role change, so the epoch does not move
+                    // and the successor is minted at the wall clock.
+                    None,
                     request_id,
                 )
                 .await?;

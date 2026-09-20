@@ -84,40 +84,43 @@ pub async fn revoke_user_principal(
     Ok(result.rows_affected() > 0)
 }
 
-/// Advance a user's authorization epoch to the start of the current second.
+/// Advance a user's authorization epoch to the start of the next whole second
+/// and return the value it was set to.
 ///
 /// The federated sign-in path calls this when the provider's asserted role set
 /// no longer matches the persisted one. Access tokens carry role names in
 /// signed claims, so a removed role stays spendable until the epoch moves past
 /// the tokens that name it.
 ///
-/// The truncation is what makes the successor usable. Access-token `iat` is
-/// whole seconds, so an epoch carrying sub-second precision could land ahead of
-/// a token issued moments later in the same transaction and revoke the session
-/// the login just established. `date_trunc` to the second removes that race in
-/// the only direction it can go wrong; tokens issued in an earlier second are
-/// still retired.
+/// The epoch has to land on a whole second, because `iat` is whole seconds and
+/// a sub-second epoch would retire tokens by rounding rather than by order. The
+/// *next* second is what makes the withdrawal complete: truncating to the
+/// current second leaves a token minted earlier in that same second with
+/// `iat == epoch`, and the verifier retires a token only when `iat` is strictly
+/// older, so that predecessor would keep spending the role the provider just
+/// withdrew. The caller mints the successor at exactly the returned instant, so
+/// it is admitted while every earlier token is not.
 ///
-/// Returns `Ok(true)` when a row was updated, `Ok(false)` when no row matched.
+/// Returns the stored epoch, or `None` when no row matched.
 ///
 /// # Errors
 /// Returns a SQLx error on database failure.
-pub async fn advance_user_epoch_to_second(
+pub async fn advance_user_epoch_to_next_second(
     conn: &mut TenantConn<'_>,
     id: Uuid,
-) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query(
+) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+    sqlx::query_scalar(
         r#"
         UPDATE wyrd.auth_users
-           SET tokens_not_before = date_trunc('second', now())
+           SET tokens_not_before = date_trunc('second', now()) + interval '1 second'
          WHERE data_tenant_id = wyrd.current_tenant()
            AND id = $1
+        RETURNING tokens_not_before
         "#,
     )
     .bind(id)
-    .execute(&mut **conn.transaction())
-    .await?;
-    Ok(result.rows_affected() > 0)
+    .fetch_optional(&mut **conn.transaction())
+    .await
 }
 
 /// Bump `tokens_not_before = now()` for a service account or agent.

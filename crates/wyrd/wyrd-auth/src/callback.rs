@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use serde_json::Value;
@@ -17,8 +17,9 @@ use wyrd_spec::auth::{IssuerUrl, TokenResponse, TokenType};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
 use wyrd_sql::queries::auth::{
-    advance_user_epoch_to_second, delete_user, insert_refresh_token, insert_refresh_token_rotated,
-    insert_user, replace_user_roles, upsert_user_identity, user_id_by_identity,
+    advance_user_epoch_to_next_second, delete_user, insert_refresh_token,
+    insert_refresh_token_rotated, insert_user, replace_user_roles, upsert_user_identity,
+    user_id_by_identity,
 };
 use wyrd_sql::{SqlError, TenantConn, WyrdPostgres};
 
@@ -222,15 +223,20 @@ impl AuthorizationCodeExchange {
         // A role the provider withdrew is still spendable by every access token
         // this human already holds, because the names travel in signed claims.
         // Moving the authorization epoch in the same transaction is what makes
-        // the withdrawal reach those live sessions; the successor issued below
-        // is minted after the epoch and is admitted by it. An unchanged login
-        // moves nothing, so re-authenticating never signs the human out of
-        // their other sessions.
-        if roles_changed {
-            advance_user_epoch_to_second(&mut conn, principal_id)
+        // the withdrawal reach those live sessions. The epoch lands on the next
+        // whole second and the successor is minted at exactly that instant, so
+        // the ordering is decided here rather than by how the wall clock
+        // happens to fall: a token minted earlier in the same second is
+        // strictly older than the epoch and is retired, while the successor is
+        // admitted. An unchanged login moves nothing, so re-authenticating
+        // never signs the human out of their other sessions.
+        let issued_at = if roles_changed {
+            advance_user_epoch_to_next_second(&mut conn, principal_id)
                 .await
-                .map_err(sql_error)?;
-        }
+                .map_err(sql_error)?
+        } else {
+            None
+        };
         let exchanged = issue_and_record_user_session(
             &mut conn,
             self.issuing_key.as_ref(),
@@ -238,6 +244,7 @@ impl AuthorizationCodeExchange {
             principal_id,
             roles,
             None,
+            issued_at,
             request_id,
         )
         .await?;
@@ -419,6 +426,7 @@ pub(crate) async fn issue_and_record_user_session(
     principal_id: Uuid,
     roles: Vec<RoleRef>,
     rotated_from: Option<Uuid>,
+    issued_at: Option<DateTime<Utc>>,
     request_id: &str,
 ) -> Result<ExchangedToken, WyrdError> {
     let principal = Principal::new(
@@ -429,10 +437,11 @@ pub(crate) async fn issue_and_record_user_session(
         PermissionSet::default(),
     );
     let access_token = issuing_key
-        .issue_user_access_token(
+        .issue_user_access_token_at(
             TokenPrincipalRef::from(&principal),
             roles.clone(),
             rotated_from,
+            issued_at.unwrap_or_else(Utc::now),
             ACCESS_TTL,
         )
         .map_err(|error| issue_error(&error))?;
@@ -714,11 +723,11 @@ mod pg_tests {
     //! transaction. Both halves are schema behavior, so they are proven against
     //! real Postgres rather than a stand-in.
 
-    use chrono::{DateTime, Utc};
+    use chrono::{DateTime, Timelike, Utc};
     use uuid::Uuid;
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_sql::queries::auth::{
-        advance_user_epoch_to_second, insert_role, insert_user, replace_user_roles,
+        advance_user_epoch_to_next_second, insert_role, insert_user, replace_user_roles,
         user_revocation_epoch,
     };
 
@@ -762,51 +771,65 @@ mod pg_tests {
         user_id
     }
 
-    /// A login that withdraws a role reports the change and moves the epoch.
+    /// A login that withdraws a role reports the change and moves the epoch
+    /// past every token that could already have been minted.
     ///
     /// Role names travel in signed access-token claims, so the withdrawal only
-    /// reaches a live session through the epoch. The epoch must also stay at or
-    /// below the second the successor is issued in, or the login would revoke
-    /// the session it just established.
+    /// reaches a live session through the epoch. `iat` is whole seconds, so an
+    /// epoch merely truncated to the current second leaves a predecessor minted
+    /// earlier in that same second with `iat == epoch`, which the verifier
+    /// admits. The epoch therefore lands on the next whole second: strictly
+    /// ahead of every `iat` obtainable before the change, and exactly the
+    /// instant the successor is minted at.
     ///
     /// # Panics
     /// Panics when the role write fails, when the reduced set is not reported
-    /// as a change, or when the epoch does not land in the current second.
+    /// as a change, or when the epoch does not strictly follow the second the
+    /// predecessor was minted in.
     #[tokio::test]
-    async fn a_withdrawn_role_reports_a_change_and_advances_the_epoch() {
+    async fn a_withdrawn_role_advances_the_epoch_past_a_same_second_token() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let user_id = seed_user_with_roles(&fixture).await;
-        let before = store_now(&fixture).await;
+        // The `iat` an access token minted immediately before the withdrawal
+        // carries: the store's clock truncated to whole seconds.
+        let predecessor_iat = store_now(&fixture)
+            .await
+            .with_nanosecond(0)
+            .expect("truncating to the second is representable");
 
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let changed = replace_user_roles(&mut conn, user_id, &["writer"])
             .await
             .expect("reduced role set persists");
         assert!(changed, "removing a role is a change the caller must see");
-        advance_user_epoch_to_second(&mut conn, user_id)
+        let epoch = advance_user_epoch_to_next_second(&mut conn, user_id)
             .await
-            .expect("epoch advances");
+            .expect("epoch advances")
+            .expect("advancing a seeded user's epoch matches a row");
         conn.commit().await.expect("role change commits");
 
-        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        let epoch = user_revocation_epoch(&mut conn, user_id)
-            .await
-            .expect("epoch lookup runs")
-            .expect("a changed login leaves an epoch");
         assert!(
-            epoch <= store_now(&fixture).await,
-            "the epoch never lands in the future: {epoch}"
+            epoch > predecessor_iat,
+            "a token minted in the same second as the withdrawal is retired: \
+             epoch {epoch} must strictly follow iat {predecessor_iat}"
         );
-        assert!(
-            epoch >= before - chrono::Duration::seconds(1),
-            "the epoch advanced to this login rather than staying at an older value: {epoch}"
-        );
-        // The successor's `iat` is whole seconds, so an epoch carrying
-        // sub-second precision would refuse the token the login just minted.
+        // The successor is minted at exactly this instant, and the verifier
+        // retires a token only when `iat` is strictly older, so the epoch must
+        // be a whole second the successor can carry in its claims.
         assert_eq!(
             epoch.timestamp_subsec_nanos(),
             0,
-            "the epoch is truncated to the second the successor can carry"
+            "the epoch is a whole second the successor can carry"
+        );
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let stored = user_revocation_epoch(&mut conn, user_id)
+            .await
+            .expect("epoch lookup runs")
+            .expect("a changed login leaves an epoch");
+        assert_eq!(
+            stored, epoch,
+            "the returned epoch is the one the successor is ordered against"
         );
     }
 

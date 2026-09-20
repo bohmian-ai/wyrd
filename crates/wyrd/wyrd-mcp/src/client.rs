@@ -1,23 +1,31 @@
 //! Wyrd credential decoration for the official `rmcp` Streamable HTTP client.
 //!
 //! Wyrd owns exactly one thing on the MCP client path: the per-request Wyrd
-//! headers. Everything else — protocol framing, MCP headers, session handling,
-//! SSE parsing, request cancellation — belongs to `rmcp` and its reqwest
-//! transport, which this type decorates rather than replaces. There is no Wyrd
-//! MCP client facade, handler, or lifecycle wrapper.
+//! headers, and the bounded credential replay that goes with them. Everything
+//! else — protocol framing, MCP headers, session handling, SSE parsing,
+//! request cancellation — belongs to `rmcp` and its reqwest transport, which
+//! this type decorates rather than replaces. There is no Wyrd MCP client
+//! facade, handler, or lifecycle wrapper.
+//!
+//! The decorator owns no HTTP or credential machinery of its own: both come
+//! from the caller's configured [`WyrdClient`], so MCP reaches Wyrd over the
+//! same connection pool, TLS provider, token cache, and re-exchange policy as
+//! every other first-party surface.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::future::Future;
 use std::io;
 use std::sync::Arc;
 
 use futures_util::stream::BoxStream;
-use http::{HeaderName, HeaderValue};
+use http::{HeaderName, HeaderValue, StatusCode};
 use rmcp::model::ClientJsonRpcMessage;
 use rmcp::transport::streamable_http_client::{
     SseError, StreamableHttpClient, StreamableHttpError, StreamableHttpPostResponse,
 };
 use sse_stream::Sse;
+use wyrd_client::WyrdClient;
 use wyrd_client::auth::AuthMiddleware;
 
 /// Wyrd's bearer credential header. The application-owned `Authorization`
@@ -27,6 +35,30 @@ const HEADER_WYRD_ACCESS_TOKEN: HeaderName = HeaderName::from_static("x-wyrd-acc
 /// Wyrd's request-correlation header, propagated end to end.
 const HEADER_WYRD_REQUEST_ID: HeaderName = HeaderName::from_static("wyrd-request-id");
 
+/// Does this delegated failure mean the server refused the credential?
+///
+/// Wyrd's edge answers an unusable token with a bare `401` carrying an
+/// `application/problem+json` body. It issues no `WWW-Authenticate` challenge,
+/// so `rmcp` never raises its OAuth-shaped `AuthRequired` variant, and the
+/// refusal surfaces in one of two shapes depending on which delegated
+/// operation met it:
+///
+/// - the SSE and session paths call `error_for_status`, so the typed status
+///   survives on the transport's own error;
+/// - the POST path re-renders any non-success response it cannot read as
+///   JSON-RPC into `HTTP {status}: {body}` — a Wyrd problem body is not
+///   `application/json`, so it always takes that branch and the rendered
+///   status line is the only signal left.
+fn is_unauthorized(error: &StreamableHttpError<reqwest::Error>) -> bool {
+    match error {
+        StreamableHttpError::Client(client) => client.status() == Some(StatusCode::UNAUTHORIZED),
+        StreamableHttpError::UnexpectedServerResponse(message) => {
+            message.starts_with(&format!("HTTP {}:", StatusCode::UNAUTHORIZED))
+        }
+        _ => false,
+    }
+}
+
 /// An `rmcp` Streamable HTTP client that adds Wyrd's per-request headers.
 ///
 /// One instance is handed to
@@ -34,26 +66,55 @@ const HEADER_WYRD_REQUEST_ID: HeaderName = HeaderName::from_static("wyrd-request
 /// the transport then drives it for every POST, SSE stream, and session delete.
 #[derive(Clone)]
 pub struct WyrdMcpHttpClient {
-    /// The `rmcp`-implemented transport this type decorates.
+    /// The configured Wyrd HTTP pool this type decorates, shared with every
+    /// other capability of the originating [`WyrdClient`].
     inner: reqwest::Client,
-    /// Sole owner of Wyrd credentials and their proactive refresh.
+    /// Sole owner of Wyrd credentials, their proactive refresh, and the
+    /// reactive re-exchange a `401` triggers.
     auth: Arc<AuthMiddleware>,
 }
 
 impl WyrdMcpHttpClient {
-    /// Decorate `inner` with the credentials `auth` owns.
+    /// Decorate `client`'s HTTP pool with the credentials `client` owns.
+    ///
+    /// Both halves come from the one configured capability so the MCP surface
+    /// cannot drift from the rest of the client: no separate pool, TLS
+    /// provider, header vocabulary, or token cache exists in this crate.
     #[must_use]
-    pub fn new(inner: reqwest::Client, auth: Arc<AuthMiddleware>) -> Self {
-        Self { inner, auth }
+    pub fn new(client: &WyrdClient) -> Self {
+        Self {
+            inner: client.http().client(),
+            auth: client.auth(),
+        }
+    }
+
+    /// Render the current Wyrd bearer as a header value.
+    ///
+    /// `force` selects the reactive path: [`AuthMiddleware::force_refresh`]
+    /// re-exchanges a durable credential unconditionally, where
+    /// [`AuthMiddleware::bearer`] serves the cached token until its own
+    /// proactive skew expires it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StreamableHttpError::Io`] wrapping the credential error when
+    /// the middleware cannot produce a bearer, and when the rendered value is
+    /// not valid for HTTP transport.
+    async fn bearer_header(
+        &self,
+        force: bool,
+    ) -> Result<HeaderValue, StreamableHttpError<reqwest::Error>> {
+        let bearer = if force {
+            self.auth.force_refresh().await
+        } else {
+            self.auth.bearer().await
+        }
+        .map_err(|error| StreamableHttpError::Io(io::Error::other(error)))?;
+        HeaderValue::from_str(&format!("Bearer {}", bearer.expose()))
+            .map_err(|error| StreamableHttpError::Io(io::Error::other(error)))
     }
 
     /// Add Wyrd's headers to the transport-supplied custom headers.
-    ///
-    /// The bearer comes from [`AuthMiddleware::bearer`] on every request, which
-    /// already owns proactive refresh — so there is deliberately no reactive
-    /// 401 parsing or retry here. `rmcp`'s reqwest transport erases the typed
-    /// status and the Wyrd problem body for a pre-protocol 401, leaving nothing
-    /// a retry could key on that `bearer()` has not already handled.
     ///
     /// A caller-supplied `wyrd-request-id` is preserved; otherwise one is
     /// minted through the same [`AuthMiddleware::request_id`] path the HTTP
@@ -68,14 +129,7 @@ impl WyrdMcpHttpClient {
         &self,
         mut custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<HashMap<HeaderName, HeaderValue>, StreamableHttpError<reqwest::Error>> {
-        let bearer = self
-            .auth
-            .bearer()
-            .await
-            .map_err(|error| StreamableHttpError::Io(io::Error::other(error)))?;
-        let token = HeaderValue::from_str(&format!("Bearer {}", bearer.expose()))
-            .map_err(|error| StreamableHttpError::Io(io::Error::other(error)))?;
-        custom_headers.insert(HEADER_WYRD_ACCESS_TOKEN, token);
+        custom_headers.insert(HEADER_WYRD_ACCESS_TOKEN, self.bearer_header(false).await?);
 
         if let Entry::Vacant(slot) = custom_headers.entry(HEADER_WYRD_REQUEST_ID) {
             let request_id = HeaderValue::from_str(&self.auth.request_id(None))
@@ -84,6 +138,41 @@ impl WyrdMcpHttpClient {
         }
         Ok(custom_headers)
     }
+
+    /// Drive one delegated transport operation, replaying it once after a `401`.
+    ///
+    /// This is the MCP side of the client's shared reactive-credential policy:
+    /// exactly one [`AuthMiddleware::force_refresh`] and exactly one replay,
+    /// after which a second refusal is terminal and surfaces to the caller.
+    /// Replaying is safe for every operation here because Wyrd's public edge
+    /// rejects an unusable credential before the MCP service is reached, so
+    /// the first attempt applied nothing.
+    ///
+    /// The replay reuses the first attempt's header map — correlation id
+    /// included — and swaps only the bearer, so both HTTP requests join to one
+    /// logical MCP message in the server's audit and traces.
+    ///
+    /// # Errors
+    ///
+    /// Returns the credential or header error from [`Self::wyrd_headers`], and
+    /// otherwise whatever the delegated operation returned on the last attempt.
+    async fn replaying_once_on_refusal<T, F, O>(
+        &self,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+        operation: F,
+    ) -> Result<T, StreamableHttpError<reqwest::Error>>
+    where
+        F: Fn(HashMap<HeaderName, HeaderValue>) -> O,
+        O: Future<Output = Result<T, StreamableHttpError<reqwest::Error>>>,
+    {
+        let mut headers = self.wyrd_headers(custom_headers).await?;
+        let first = operation(headers.clone()).await;
+        if !matches!(&first, Err(error) if is_unauthorized(error)) {
+            return first;
+        }
+        headers.insert(HEADER_WYRD_ACCESS_TOKEN, self.bearer_header(true).await?);
+        operation(headers).await
+    }
 }
 
 impl StreamableHttpClient for WyrdMcpHttpClient {
@@ -91,7 +180,8 @@ impl StreamableHttpClient for WyrdMcpHttpClient {
     /// enclosing `StreamableHttpError::Io` variant.
     type Error = reqwest::Error;
 
-    /// Refresh Wyrd headers before delegating MCP message framing to `rmcp`.
+    /// Refresh Wyrd headers before delegating MCP message framing to `rmcp`,
+    /// re-exchanging and replaying once if the edge refuses the credential.
     ///
     /// # Errors
     /// Returns credential, invalid-header, or delegated HTTP/protocol errors.
@@ -103,10 +193,16 @@ impl StreamableHttpClient for WyrdMcpHttpClient {
         auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
-        let headers = self.wyrd_headers(custom_headers).await?;
-        self.inner
-            .post_message(uri, message, session_id, auth_header, headers)
-            .await
+        self.replaying_once_on_refusal(custom_headers, |headers| {
+            self.inner.post_message(
+                Arc::clone(&uri),
+                message.clone(),
+                session_id.clone(),
+                auth_header.clone(),
+                headers,
+            )
+        })
+        .await
     }
 
     /// Send a decorated message while preserving the transport's SSE size bound.
@@ -122,17 +218,17 @@ impl StreamableHttpClient for WyrdMcpHttpClient {
         custom_headers: HashMap<HeaderName, HeaderValue>,
         max_sse_event_size: usize,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
-        let headers = self.wyrd_headers(custom_headers).await?;
-        self.inner
-            .post_message_with_max_sse_event_size(
-                uri,
-                message,
-                session_id,
-                auth_header,
+        self.replaying_once_on_refusal(custom_headers, |headers| {
+            self.inner.post_message_with_max_sse_event_size(
+                Arc::clone(&uri),
+                message.clone(),
+                session_id.clone(),
+                auth_header.clone(),
                 headers,
                 max_sse_event_size,
             )
-            .await
+        })
+        .await
     }
 
     /// Authenticate transport-requested session deletion with current credentials.
@@ -146,10 +242,15 @@ impl StreamableHttpClient for WyrdMcpHttpClient {
         auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<(), StreamableHttpError<Self::Error>> {
-        let headers = self.wyrd_headers(custom_headers).await?;
-        self.inner
-            .delete_session(uri, session_id, auth_header, headers)
-            .await
+        self.replaying_once_on_refusal(custom_headers, |headers| {
+            self.inner.delete_session(
+                Arc::clone(&uri),
+                Arc::clone(&session_id),
+                auth_header.clone(),
+                headers,
+            )
+        })
+        .await
     }
 
     /// Open the transport's resumable SSE stream with refreshed Wyrd headers.
@@ -165,10 +266,16 @@ impl StreamableHttpClient for WyrdMcpHttpClient {
         auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<BoxStream<'static, Result<Sse, SseError>>, StreamableHttpError<Self::Error>> {
-        let headers = self.wyrd_headers(custom_headers).await?;
-        self.inner
-            .get_stream(uri, session_id, last_event_id, auth_header, headers)
-            .await
+        self.replaying_once_on_refusal(custom_headers, |headers| {
+            self.inner.get_stream(
+                Arc::clone(&uri),
+                session_id.clone(),
+                last_event_id.clone(),
+                auth_header.clone(),
+                headers,
+            )
+        })
+        .await
     }
 
     /// Open a decorated SSE stream under the caller's event-size ceiling.
@@ -185,17 +292,17 @@ impl StreamableHttpClient for WyrdMcpHttpClient {
         custom_headers: HashMap<HeaderName, HeaderValue>,
         max_sse_event_size: usize,
     ) -> Result<BoxStream<'static, Result<Sse, SseError>>, StreamableHttpError<Self::Error>> {
-        let headers = self.wyrd_headers(custom_headers).await?;
-        self.inner
-            .get_stream_with_max_sse_event_size(
-                uri,
-                session_id,
-                last_event_id,
-                auth_header,
+        self.replaying_once_on_refusal(custom_headers, |headers| {
+            self.inner.get_stream_with_max_sse_event_size(
+                Arc::clone(&uri),
+                session_id.clone(),
+                last_event_id.clone(),
+                auth_header.clone(),
                 headers,
                 max_sse_event_size,
             )
-            .await
+        })
+        .await
     }
 }
 
@@ -212,14 +319,22 @@ mod tests {
     };
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::TcpListener;
+    use wyrd_client::WyrdClient;
     use wyrd_client::auth::AuthMiddleware;
     use wyrd_client::config::{ClientConfig, TokenCacheMode};
     use wyrd_client::transport::credential::ResolvedCredential;
+    use wyrd_client::transport::http::HttpTransport;
 
     use super::WyrdMcpHttpClient;
 
     /// A bounded local HTTP server that mints rotating access tokens and
     /// records every header of every MCP request it receives.
+    ///
+    /// Two knobs shape what the recorder proves: how long a minted token stays
+    /// fresh — short enough and every `bearer()` re-exchanges, long enough and
+    /// only a forced refresh does — and how many leading MCP requests are
+    /// refused with `401`, which is the only way to drive the decorator's
+    /// reactive path from in-process.
     struct Recorder {
         /// Base URL both the auth middleware and the MCP client target.
         base_url: String,
@@ -301,13 +416,18 @@ mod tests {
 
     /// Start a [`Recorder`] on an ephemeral loopback port.
     ///
-    /// `/auth/token` mints `access-1`, `access-2`, ... and always expires
-    /// inside the middleware's proactive-refresh skew, so every `bearer()`
-    /// re-exchanges and each request must observe a different current token.
-    /// Every other path is treated as the MCP endpoint and answered `202
-    /// Accepted`, which is what `rmcp`'s reqwest transport expects for a
-    /// notification.
-    async fn spawn_recorder() -> Recorder {
+    /// `/auth/token` mints `access-1`, `access-2`, ..., each valid for
+    /// `token_ttl_seconds`: five seconds lands inside the middleware's
+    /// proactive-refresh skew so every `bearer()` re-exchanges, while an hour
+    /// leaves the cached token fresh so an exchange can only come from a
+    /// forced refresh.
+    ///
+    /// Every other path is the MCP endpoint. The first `refusals` requests to
+    /// it answer `401` with no `WWW-Authenticate` challenge — exactly the shape
+    /// Wyrd's edge produces — and the rest answer `202 Accepted`, which is what
+    /// `rmcp`'s reqwest transport expects for a notification. Every MCP
+    /// request is recorded either way, so a refused attempt is still evidence.
+    async fn spawn_recorder(token_ttl_seconds: i64, refusals: usize) -> Recorder {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("recorder binds");
@@ -317,10 +437,12 @@ mod tests {
         let token_exchanges = Arc::new(AtomicUsize::new(0));
         let requests = Arc::clone(&mcp_requests);
         let exchanges = Arc::clone(&token_exchanges);
+        let refusals = Arc::new(AtomicUsize::new(refusals));
         let handle = tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
                 let requests = Arc::clone(&requests);
                 let exchanges = Arc::clone(&exchanges);
+                let refusals = Arc::clone(&refusals);
                 tokio::spawn(async move {
                     let head = read_request(&mut stream).await;
                     let mut lines = head.lines();
@@ -336,7 +458,8 @@ mod tests {
                         let body = serde_json::json!({
                             "access_token": format!("access-{nth}"),
                             "token_type": "Bearer",
-                            "expires_at": chrono::Utc::now() + chrono::Duration::seconds(5),
+                            "expires_at": chrono::Utc::now()
+                                + chrono::Duration::seconds(token_ttl_seconds),
                         })
                         .to_string();
                         format!(
@@ -349,8 +472,18 @@ mod tests {
                             .lock()
                             .expect("recorder lock is healthy")
                             .push(headers);
-                        "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
-                            .to_owned()
+                        let refuse = refusals
+                            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                                left.checked_sub(1)
+                            })
+                            .is_ok();
+                        if refuse {
+                            "HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                                .to_owned()
+                        } else {
+                            "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                                .to_owned()
+                        }
                     };
                     let _ = stream.write_all(response.as_bytes()).await;
                     let _ = stream.flush().await;
@@ -363,6 +496,30 @@ mod tests {
             token_exchanges,
             handle,
         }
+    }
+
+    /// Build the decorator over a [`WyrdClient`] configured against `recorder`.
+    ///
+    /// This is the production assembly path in miniature: one configured
+    /// client owns the pool and the credential, and the MCP decorator is
+    /// derived from it rather than built beside it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the auth middleware or HTTP transport cannot be built for
+    /// the recorder's URL, which is a fault in the test itself.
+    fn client_for(recorder: &Recorder) -> WyrdMcpHttpClient {
+        let mut config = ClientConfig::default();
+        config.http.base_url = recorder.base_url.clone();
+        config.token_cache = TokenCacheMode::InMemory;
+        let auth = AuthMiddleware::new(
+            &config,
+            ResolvedCredential::ApiKey("api-key-value".to_owned().into()),
+        )
+        .expect("auth middleware builds");
+        let http =
+            HttpTransport::new(&config.http, Arc::clone(&auth)).expect("HTTP transport builds");
+        WyrdMcpHttpClient::new(&WyrdClient::from_parts(auth, http, config.grpc))
     }
 
     /// A minimal client-to-server MCP message that needs no session.
@@ -383,16 +540,8 @@ mod tests {
     /// and may not turn one MCP message into more than one HTTP request.
     #[tokio::test]
     async fn decorator_adds_current_wyrd_headers_once_per_request() {
-        let recorder = spawn_recorder().await;
-        let mut config = ClientConfig::default();
-        config.http.base_url = recorder.base_url.clone();
-        config.token_cache = TokenCacheMode::InMemory;
-        let auth = AuthMiddleware::new(
-            &config,
-            ResolvedCredential::ApiKey("api-key-value".to_owned().into()),
-        )
-        .expect("auth middleware builds");
-        let client = WyrdMcpHttpClient::new(reqwest::Client::new(), auth);
+        let recorder = spawn_recorder(5, 0).await;
+        let client = client_for(&recorder);
         let uri: Arc<str> = Arc::from(format!("{}/mcp", recorder.base_url).as_str());
 
         let supplied_id = "11111111-2222-3333-4444-555555555555";
@@ -461,5 +610,84 @@ mod tests {
                 Some("application/json")
             );
         }
+    }
+
+    /// One `401` costs exactly one re-exchange and exactly one replay.
+    ///
+    /// The minted token stays fresh for an hour, so the cache would serve the
+    /// first bearer indefinitely: a second exchange can only come from the
+    /// forced refresh the refusal triggers. The replayed request carries the
+    /// newly exchanged token and the first attempt's correlation id, because
+    /// both HTTP requests are one logical MCP message.
+    #[tokio::test]
+    async fn one_refusal_costs_one_re_exchange_and_one_replay() {
+        let recorder = spawn_recorder(3600, 1).await;
+        let client = client_for(&recorder);
+        let uri: Arc<str> = Arc::from(format!("{}/mcp", recorder.base_url).as_str());
+
+        let response = client
+            .post_message(uri, notification(), None, None, HashMap::new())
+            .await
+            .expect("the replay after the re-exchange is accepted");
+
+        assert!(matches!(response, StreamableHttpPostResponse::Accepted));
+        assert_eq!(
+            recorder.mcp_request_count(),
+            2,
+            "the refused attempt is replayed exactly once"
+        );
+        assert_eq!(
+            recorder.token_exchanges.load(Ordering::SeqCst),
+            2,
+            "a fresh cached token is re-exchanged only because the server refused it"
+        );
+        let refused = recorder.mcp_request(0);
+        let replayed = recorder.mcp_request(1);
+        assert_eq!(
+            refused.get("x-wyrd-access-token").map(String::as_str),
+            Some("Bearer access-1")
+        );
+        assert_eq!(
+            replayed.get("x-wyrd-access-token").map(String::as_str),
+            Some("Bearer access-2"),
+            "the replay carries the re-exchanged credential, not the refused one"
+        );
+        assert_eq!(
+            refused.get("wyrd-request-id"),
+            replayed.get("wyrd-request-id"),
+            "both attempts join to the one logical MCP message"
+        );
+    }
+
+    /// A second refusal is terminal: no third attempt, no third exchange.
+    ///
+    /// This is the bound the whole policy rests on. A server that refuses
+    /// every credential must produce one failure, not a re-exchange loop
+    /// against its own token endpoint.
+    #[tokio::test]
+    async fn a_second_refusal_is_terminal() {
+        let recorder = spawn_recorder(3600, usize::MAX).await;
+        let client = client_for(&recorder);
+        let uri: Arc<str> = Arc::from(format!("{}/mcp", recorder.base_url).as_str());
+
+        let error = client
+            .post_message(uri, notification(), None, None, HashMap::new())
+            .await
+            .expect_err("a server that refuses every credential fails the request");
+
+        assert!(
+            super::is_unauthorized(&error),
+            "the second refusal reaches the caller as the server's own rejection: {error}"
+        );
+        assert_eq!(
+            recorder.mcp_request_count(),
+            2,
+            "the decorator attempts the request twice and then stops"
+        );
+        assert_eq!(
+            recorder.token_exchanges.load(Ordering::SeqCst),
+            2,
+            "exactly one forced re-exchange follows the first refusal"
+        );
     }
 }

@@ -55,64 +55,23 @@ pub(crate) fn problem(
     Ok(content)
 }
 
-/// Build the first-party MCP client transport for `server` using `credential`.
+/// Build the first-party Wyrd client for `server` using `credential`.
 ///
-/// The credential path is the production one: for an API key the middleware
+/// The one configured capability every journey surface is derived from: the
+/// MCP transport takes its HTTP pool and credential from it, and an HTTP-only
+/// operation speaks as the same principal over the same token cache. The
+/// credential path is the production one — for an API key the middleware
 /// exchanges it at the server's real `/auth/token` route, for a bearer it
-/// carries the token as issued, and the decorator attaches the resulting bearer
-/// to every MCP request.
-///
-/// When `request_id` is supplied it is seeded into the transport's custom
-/// headers as `wyrd-request-id`, which the decorator preserves rather than
-/// minting its own — the only way a test can join a durable audit row to the
-/// exact request that produced it.
+/// carries the token as issued.
 ///
 /// # Errors
 ///
 /// Returns an error when the server is not bound to a listener or when the
-/// middleware cannot be constructed for `credential`.
-pub(crate) fn transport(
+/// auth or HTTP layers cannot be constructed for `credential`.
+pub(crate) fn client(
     server: &WyrdTestServer,
     credential: ResolvedCredential,
-    request_id: Option<&RequestId>,
-) -> Result<StreamableHttpClientTransport<WyrdMcpHttpClient>, McpJourneyError> {
-    let base_url = server
-        .base_url()
-        .ok_or("journey requires a bound test server")?
-        .to_owned();
-    let mut config = ClientConfig::default();
-    config.http.base_url = base_url.clone();
-    config.token_cache = TokenCacheMode::InMemory;
-    let auth = AuthMiddleware::new(&config, credential)?;
-    let mut transport_config =
-        StreamableHttpClientTransportConfig::with_uri(format!("{base_url}/mcp"));
-    if let Some(request_id) = request_id {
-        transport_config.custom_headers.insert(
-            HeaderName::from_static("wyrd-request-id"),
-            HeaderValue::from_str(request_id.as_str())?,
-        );
-    }
-    Ok(StreamableHttpClientTransport::with_client(
-        WyrdMcpHttpClient::new(reqwest::Client::new(), auth),
-        transport_config,
-    ))
-}
-
-/// Build the first-party tenant principal handle for `server` using `credential`.
-///
-/// Shares the exact auth stack [`transport`] gives the MCP client, so a journey
-/// that reaches for an HTTP-only operation — credential issuance, which MCP
-/// deliberately does not expose — still speaks as the same principal over the
-/// same credential path.
-///
-/// # Errors
-///
-/// Returns an error when the server is not bound to a listener or when the
-/// client cannot be constructed for `credential`.
-pub(crate) fn principals(
-    server: &WyrdTestServer,
-    credential: ResolvedCredential,
-) -> Result<wyrd_client::principals::Principals, McpJourneyError> {
+) -> Result<wyrd_client::WyrdClient, McpJourneyError> {
     let base_url = server
         .base_url()
         .ok_or("journey requires a bound test server")?
@@ -125,9 +84,65 @@ pub(crate) fn principals(
         &config.http,
         std::sync::Arc::clone(&auth),
     )?;
-    Ok(wyrd_client::principals::Principals::with_client(
-        wyrd_client::WyrdClient::from_parts(auth, http, config.grpc),
+    Ok(wyrd_client::WyrdClient::from_parts(auth, http, config.grpc))
+}
+
+/// Build the first-party MCP client transport for `server` using `credential`.
+///
+/// The decorator is derived from [`client`], so the journey constructs no HTTP
+/// client and writes no Wyrd header of its own: pool, TLS, token cache, and
+/// the bounded re-exchange after a `401` are all the shipped client's.
+///
+/// When `request_id` is supplied it is seeded into the transport's custom
+/// headers as `wyrd-request-id`, which the decorator preserves rather than
+/// minting its own — the only way a test can join a durable audit row to the
+/// exact request that produced it.
+///
+/// # Errors
+///
+/// Returns an error when the server is not bound to a listener or when the
+/// client cannot be constructed for `credential`.
+pub(crate) fn transport(
+    server: &WyrdTestServer,
+    credential: ResolvedCredential,
+    request_id: Option<&RequestId>,
+) -> Result<StreamableHttpClientTransport<WyrdMcpHttpClient>, McpJourneyError> {
+    let base_url = server
+        .base_url()
+        .ok_or("journey requires a bound test server")?
+        .to_owned();
+    let mut transport_config =
+        StreamableHttpClientTransportConfig::with_uri(format!("{base_url}/mcp"));
+    if let Some(request_id) = request_id {
+        transport_config.custom_headers.insert(
+            HeaderName::from_static("wyrd-request-id"),
+            HeaderValue::from_str(request_id.as_str())?,
+        );
+    }
+    Ok(StreamableHttpClientTransport::with_client(
+        WyrdMcpHttpClient::new(&client(server, credential)?),
+        transport_config,
     ))
+}
+
+/// Build the first-party tenant principal handle for `server` using `credential`.
+///
+/// Shares the exact client [`transport`] gives the MCP surface, so a journey
+/// that reaches for an HTTP-only operation — credential issuance, which MCP
+/// deliberately does not expose — still speaks as the same principal over the
+/// same credential path.
+///
+/// # Errors
+///
+/// Returns an error when the server is not bound to a listener or when the
+/// client cannot be constructed for `credential`.
+pub(crate) fn principals(
+    server: &WyrdTestServer,
+    credential: ResolvedCredential,
+) -> Result<wyrd_client::principals::Principals, McpJourneyError> {
+    Ok(wyrd_client::principals::Principals::with_client(client(
+        server, credential,
+    )?))
 }
 
 /// The modern, session-free MCP lifecycle: `server/discover` plus

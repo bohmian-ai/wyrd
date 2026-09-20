@@ -6,10 +6,10 @@
 //! terminal settlement. Both are driven by a real `rmcp` client against the
 //! real `/mcp` endpoint, never by calling the adapter in process.
 
-use crate::connectivity::{McpJourneyError, discover, problem, structured, transport};
+use crate::connectivity::{McpJourneyError, client, discover, problem, structured, transport};
 
 mod pg_tests {
-    use super::{McpJourneyError, discover, problem, structured, transport};
+    use super::{McpJourneyError, client, discover, problem, structured, transport};
 
     use std::time::Duration;
 
@@ -389,20 +389,22 @@ mod pg_tests {
             })
         })
         .collect();
-        let response = reqwest::Client::new()
-            .post(format!("{}/v1/traces", server.base_url().ok_or("server is bound")?))
-            .header("x-wyrd-access-token", format!("Bearer {token}"))
-            .json(&serde_json::json!({"resourceSpans": [{
+        // Ingestion rides the same first-party client the MCP transport is
+        // built from, so this journey writes no Wyrd header of its own.
+        let _: serde_json::Value = client(
+            &server,
+            ResolvedCredential::BearerToken(token.clone().into()),
+        )?
+        .request_json(
+            reqwest::Method::POST,
+            "/v1/traces",
+            Some(&serde_json::json!({"resourceSpans": [{
                 "resource": {"attributes": [{"key": "service.name", "value": {"stringValue": "mcp-query-trace"}}]},
                 "scopeSpans": [{"spans": spans}],
-            }]}))
-            .send().await?;
-        let status = response.status();
-        let body = response.text().await?;
-        assert!(
-            status.is_success(),
-            "OTLP ingestion failed ({status}): {body}"
-        );
+            }]})),
+        )
+        .await
+        .map_err(|error| format!("OTLP ingestion failed: {error}"))?;
         server.flush_bifrost().await?;
         let table = "vala.traces.spans";
         let client = ()

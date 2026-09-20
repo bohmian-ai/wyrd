@@ -993,6 +993,64 @@ mod pg_tests {
         assert_eq!(flat[1], b.principal.id.to_string());
     }
 
+    /// A machine credential exchange mints no refresh token and no refresh row.
+    ///
+    /// Machine clients renew by presenting their durable API key again, so the
+    /// grant has nothing to rotate. The response field has to stay absent and —
+    /// the half a response assertion cannot see — the transaction must leave
+    /// `wyrd.auth_refresh_tokens` empty, because a stored row would be a
+    /// long-lived credential nobody ever asked for and nobody rotates.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot start or any assertion fails.
+    #[tokio::test]
+    async fn api_key_exchange_issues_no_refresh_token_or_row() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let card_ref = test_service_card_ref();
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let user_id = insert_test_user(&mut conn, tenant).await;
+        let sa_id = insert_test_service_account(&mut conn, tenant, user_id, &card_ref).await;
+
+        let key = WyrdApiKey::generate(tenant);
+        let hash = wyrd_auth_issue::hash_api_key(&key.secret).expect("api key hashes");
+        sqlx::query(
+            "INSERT INTO wyrd.auth_api_keys
+                 (id, data_tenant_id, principal_id, prefix, key_hash, created_by, expires_at)
+             VALUES ($1, $2, $3, $4, $5, $6, now() + interval '1 day')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(tenant.as_uuid())
+        .bind(sa_id)
+        .bind(&key.prefix)
+        .bind(&hash)
+        .bind(user_id)
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("live api key inserts");
+
+        let exchanged = exchange_service()
+            .execute(&mut conn, key.secret, "req-api-key-no-refresh")
+            .await
+            .expect("a live api key exchanges");
+
+        assert!(
+            exchanged.refresh_token.is_none(),
+            "an api-key exchange must not issue a refresh token"
+        );
+
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM wyrd.auth_refresh_tokens WHERE principal_id = $1",
+        )
+        .bind(sa_id)
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("refresh row count runs");
+        assert_eq!(rows, 0, "an api-key exchange stores no refresh row");
+    }
+
     /// Every invalid API-key condition renders the same public problem.
     ///
     /// The reason used to be projected in `details.reason`, which handed an
@@ -1448,6 +1506,11 @@ mod pg_tests {
             exchanged.refresh_token.is_none(),
             "delegated token-exchange must not issue a refresh token"
         );
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM wyrd.auth_refresh_tokens")
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect("refresh row count runs");
+        assert_eq!(rows, 0, "delegation stores no refresh row either");
         assert_eq!(exchanged.token_type, wyrd_spec::auth::TokenType::Bearer);
     }
 }

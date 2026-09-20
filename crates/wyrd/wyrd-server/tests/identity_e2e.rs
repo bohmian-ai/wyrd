@@ -412,6 +412,12 @@ async fn workload_jwt_bearer_journey_keycloak() {
     let wyrd_token = token_body["access_token"]
         .as_str()
         .expect("access_token present");
+    // A workload renews by re-presenting its platform assertion, so the grant
+    // hands back nothing to rotate.
+    assert!(
+        token_body.get("refresh_token").is_none_or(Value::is_null),
+        "a workload grant issues no refresh token: {token_body}"
+    );
 
     assert_v1_authz_check_ok(&srv, wyrd_token, "workload").await;
 }

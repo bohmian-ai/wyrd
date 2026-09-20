@@ -340,11 +340,16 @@ mod tests {
         assert_eq!(projection.tenant, authenticated);
         assert_eq!((projection.seq_lo, projection.seq_hi), (7, 8));
         assert_eq!(projection.batch_id, derive_batch_id(authenticated, 7, 8));
-        assert_eq!(projection.rows.num_columns(), 14);
+        assert_eq!(projection.rows.num_columns(), 15);
         assert_eq!(
-            projection.rows.schema().field(13).name(),
+            projection.rows.schema().field(14).name(),
             WYRD_EVENT_TIME,
             "the decision instant travels as the managed event time"
+        );
+        assert_eq!(
+            projection.rows.schema().field(13).name(),
+            crate::tables::audit::CREDENTIAL_ID,
+            "the credential column is the appended content column, ahead of the managed one"
         );
 
         let hashes = projection
@@ -357,6 +362,10 @@ mod tests {
         assert!(projection.rows.column(4).is_null(0));
         assert!(projection.rows.column(7).is_null(0));
         assert!(projection.rows.column(12).is_null(0));
+        assert!(
+            projection.rows.column(13).is_null(0),
+            "a decision made with no credential projects a null credential"
+        );
     }
 
     #[test]

@@ -632,6 +632,81 @@ async fn revoke_every_platform_credential(srv: &WyrdTestServer) {
         .expect("credentials revoke");
 }
 
+/// A live platform session observes grant and principal changes immediately.
+///
+/// Every platform request re-reads the session's principal and its grant, so
+/// the same session is forbidden on the request after its grant is withdrawn,
+/// regains authority when the grant returns, and is unauthenticated on the
+/// request after its principal is suspended. Nothing is cached to invalidate.
+#[tokio::test]
+async fn a_live_platform_session_observes_grant_withdrawal_and_suspension_on_its_next_request() {
+    if !e2e_enabled() {
+        return;
+    }
+    let srv = WyrdTestServer::start_in_process()
+        .await
+        .expect("server starts");
+    let root = initialize_platform_root(&srv)
+        .await
+        .expect("deployment initializes");
+    let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
+    let operator = srv.operator_pool();
+    let create = |slug: &str| {
+        platform_post(
+            "/platform/tenants",
+            &session,
+            json!({ "slug": slug, "display_name": slug }),
+        )
+    };
+
+    let withheld: serde_json::Value =
+        sqlx::query_scalar("DELETE FROM platform.principal_grants RETURNING permissions")
+            .fetch_one(operator.pool())
+            .await
+            .expect("grant withdraws");
+    let resp = srv
+        .oneshot(create("grant-withdrawn"))
+        .await
+        .expect("route responds");
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "the request after withdrawal holds no platform authority"
+    );
+
+    sqlx::query(
+        "INSERT INTO platform.principal_grants (principal_id, permissions) \
+         SELECT id, $1 FROM platform.principals",
+    )
+    .bind(&withheld)
+    .execute(operator.pool())
+    .await
+    .expect("grant restores");
+    let resp = srv
+        .oneshot(create("grant-restored"))
+        .await
+        .expect("route responds");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the request after restoration administers the platform again"
+    );
+
+    sqlx::query("UPDATE platform.principals SET status = 'suspended'")
+        .execute(operator.pool())
+        .await
+        .expect("principal suspends");
+    let resp = srv
+        .oneshot(create("principal-suspended"))
+        .await
+        .expect("route responds");
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "the request after suspension is no longer a platform session"
+    );
+}
+
 /// Losing every tenant credential does not cost the tenant: the platform plane
 /// issues a replacement for the same principal.
 #[tokio::test]

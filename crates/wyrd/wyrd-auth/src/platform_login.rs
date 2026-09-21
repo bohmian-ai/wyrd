@@ -37,7 +37,7 @@ use crate::login::{auth_nonce, auth_state_key, build_authorization_url, pkce_ver
 use crate::permission_resolver::SqlPermissionResolver;
 use crate::pg_resolvers::{PgIssuerResolver, platform_connection_from_row};
 use crate::platform_sessions::{PlatformSessionError, PlatformSessions};
-use std::fmt::{self, Debug, Formatter};
+use std::fmt::{Debug, Formatter, Result as FmtResult};
 
 /// How long a started platform login may take to complete.
 ///
@@ -96,7 +96,7 @@ pub struct PlatformLogin {
 impl Debug for PlatformLogin {
     /// Prints the handle without its key, pool, or verifier, none of which may
     /// reach a log or trace.
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.debug_struct("PlatformLogin").finish_non_exhaustive()
     }
 }

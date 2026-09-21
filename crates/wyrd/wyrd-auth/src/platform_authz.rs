@@ -22,7 +22,7 @@ use wyrd_spec::vala::audit_detail::AuditErrorCode;
 use wyrd_sql::{OperatorPool, SqlError, TenantConn};
 
 use crate::audit::audit_request_id;
-use std::fmt::{self, Debug, Formatter};
+use std::fmt::{Debug, Formatter, Result as FmtResult};
 
 /// Operation name recorded for every platform-plane authorization decision.
 ///
@@ -111,7 +111,7 @@ pub struct PlatformAuthorization {
 impl Debug for PlatformAuthorization {
     /// Prints the handle without its pool: a connection source has no
     /// inspectable state and printing it would only add noise to a trace.
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.debug_struct("PlatformAuthorization")
             .finish_non_exhaustive()
     }

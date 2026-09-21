@@ -2,6 +2,7 @@
 // raw-query grep allowlist: auth tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use chrono::{DateTime, Utc};
+use sqlx::Error as SqlxError;
 use sqlx::types::{Json, Uuid};
 use wyrd_spec::reference::CardRef;
 
@@ -229,7 +230,7 @@ pub async fn service_account_by_id(
 /// Returns the database error when the read fails.
 pub async fn tenant_admin_principal_id(
     conn: &mut TenantConn<'_>,
-) -> Result<Option<Uuid>, sqlx::Error> {
+) -> Result<Option<Uuid>, SqlxError> {
     sqlx::query_scalar(
         r#"
         SELECT id

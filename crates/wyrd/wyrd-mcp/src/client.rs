@@ -9,6 +9,7 @@
 //! reqwest transport, which this type decorates rather than replaces. There is
 //! no Wyrd MCP client facade, handler, or lifecycle wrapper.
 
+use reqwest::Client as ReqwestClient;
 use reqwest::Error as ReqwestError;
 use std::collections::HashMap;
 use std::future::Future;
@@ -63,7 +64,7 @@ pub struct WyrdMcpHttpClient {
     /// The configured Wyrd HTTP pool this type decorates, shared with every
     /// other capability of the originating [`WyrdClient`]. `rmcp` composes its
     /// own requests on this pool.
-    inner: reqwest::Client,
+    inner: ReqwestClient,
     /// Sole owner of Wyrd's header vocabulary, its credentials, and the
     /// bounded replay an authentication refusal buys. Cloned from the
     /// originating client, so it shares that client's token cache.
@@ -100,10 +101,10 @@ impl WyrdMcpHttpClient {
         &self,
         custom_headers: HashMap<HeaderName, HeaderValue>,
         operation: F,
-    ) -> Result<T, StreamableHttpError<reqwest::Error>>
+    ) -> Result<T, StreamableHttpError<ReqwestError>>
     where
         F: Fn(HashMap<HeaderName, HeaderValue>) -> O,
-        O: Future<Output = Result<T, StreamableHttpError<reqwest::Error>>>,
+        O: Future<Output = Result<T, StreamableHttpError<ReqwestError>>>,
     {
         self.transport
             .authenticated_replay(custom_headers, delegated_status, operation)
@@ -120,7 +121,7 @@ impl WyrdMcpHttpClient {
 impl StreamableHttpClient for WyrdMcpHttpClient {
     /// Underlying HTTP transport failure; credential/header failures use the
     /// enclosing `StreamableHttpError::Io` variant.
-    type Error = reqwest::Error;
+    type Error = ReqwestError;
 
     /// Refresh Wyrd headers before delegating MCP message framing to `rmcp`,
     /// re-exchanging and replaying once if the edge refuses the credential.

@@ -4,6 +4,7 @@
 //! scoping.
 // raw-query grep allowlist: auth tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
+use sqlx::Error as SqlxError;
 use sqlx::types::Uuid;
 
 use crate::TenantConn;
@@ -144,7 +145,7 @@ pub async fn replace_user_roles(
     conn: &mut TenantConn<'_>,
     user_id: Uuid,
     role_names: &[&str],
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, SqlxError> {
     let changed: i64 = sqlx::query_scalar(REPLACE_USER_ROLES_SQL)
         .bind(user_id)
         .bind(role_names)

@@ -35,7 +35,7 @@ use crate::config::{ClientConfig, TokenCacheMode};
 use crate::error::{WyrdClientError, from_problem_json};
 use crate::transport::credential::ResolvedCredential;
 use reqwest::{Client, Response};
-use std::fmt::{self, Debug, Formatter};
+use std::fmt::{Debug, Formatter, Result as FmtResult};
 
 /// Fixed proactive-refresh skew. A cached access token is considered stale once
 /// `now >= expires_at - SKEW`, so the client refreshes before the server would
@@ -123,7 +123,7 @@ pub struct TokenExchange {
 impl Debug for TokenExchange {
     /// Prints the target without the pool, which carries no secret but no
     /// useful detail either.
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.debug_struct("TokenExchange")
             .field("base_url", &self.base_url)
             .finish_non_exhaustive()
@@ -277,7 +277,7 @@ pub struct AuthMiddleware {
 }
 
 impl Debug for AuthMiddleware {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.debug_struct("AuthMiddleware")
             .field("credential", &self.credential)
             .field("http_base_url", &self.exchange.base_url)

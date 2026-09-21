@@ -4,6 +4,7 @@
 // raw-query grep allowlist: auth tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use chrono::{DateTime, Utc};
+use sqlx::Error as SqlxError;
 use sqlx::types::Uuid;
 
 use crate::TenantConn;
@@ -63,7 +64,7 @@ pub struct ApiKeyMetadataRow {
 pub async fn list_api_key_metadata(
     conn: &mut TenantConn<'_>,
     principal_id: Uuid,
-) -> Result<Vec<ApiKeyMetadataRow>, sqlx::Error> {
+) -> Result<Vec<ApiKeyMetadataRow>, SqlxError> {
     sqlx::query_as::<_, ApiKeyMetadataRow>(
         r#"
         SELECT id, prefix, created_at, expires_at, revoked_at, last_used_at
@@ -93,7 +94,7 @@ pub async fn credential_belongs_to(
     conn: &mut TenantConn<'_>,
     credential_id: Uuid,
     principal_id: Uuid,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, SqlxError> {
     let found: Option<Uuid> = sqlx::query_scalar(
         "SELECT id
            FROM wyrd.auth_api_keys

@@ -1,6 +1,6 @@
 //! Runtime tenant slug resolver for the auth boundary.
 
-use sqlx::{PgPool, types::Uuid};
+use sqlx::{Error as SqlxError, PgPool, types::Uuid};
 use wyrd_spec::{DataTenantId, TenantSlug};
 
 use crate::{SqlError, TenantConn};
@@ -51,7 +51,7 @@ pub async fn resolve_by_slug_for_app(
 pub async fn tenant_admits_credentials(
     conn: &mut TenantConn<'_>,
     tenant: DataTenantId,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, SqlxError> {
     sqlx::query_scalar::<_, bool>("SELECT platform.tenant_admits_credentials($1)")
         .bind(tenant.as_uuid())
         .fetch_one(&mut **conn.transaction())

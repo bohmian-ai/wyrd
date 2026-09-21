@@ -39,7 +39,7 @@ pub struct CreateServicePrincipalResponse {
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct IssuedCredential {
     /// Credential id, used to revoke it.
-    pub id: String,
+    pub id: Uuid,
     /// The plaintext, returned exactly once.
     #[schemars(with = "String")]
     pub credential: SecretBearer,
@@ -54,7 +54,7 @@ pub struct IssuedCredential {
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct CredentialMetadata {
     /// Credential id.
-    pub id: String,
+    pub id: Uuid,
     /// Non-secret lookup prefix.
     pub prefix: String,
     /// Creation time, RFC 3339.

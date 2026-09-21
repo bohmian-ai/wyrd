@@ -520,6 +520,23 @@ async fn card_contract_publishes_typed_lifecycle_and_problem_shapes() {
     server.shutdown().await.expect("server shuts down");
 }
 
+/// Issued and listed credential ids publish the same UUID contract the revoke
+/// path parameter and the MCP tools use, so no surface advertises free text.
+#[tokio::test]
+async fn credential_ids_publish_their_uuid_contract() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+
+    for component in ["IssuedCredential", "CredentialMetadata"] {
+        let id = &document["components"]["schemas"][component]["properties"]["id"];
+        assert_eq!(id["format"], "uuid", "{component}.id is a UUID: {id}");
+    }
+
+    server.shutdown().await.expect("server shuts down");
+}
+
 /// `GET /openapi.json` is the whole contract: no YAML projection is routed, and
 /// the served document identifies itself as `OpenAPI` and describes real paths.
 #[tokio::test]

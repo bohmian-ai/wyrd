@@ -6,6 +6,7 @@ use reqwest::Method;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use uuid::Uuid;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
     ConfigurePlatformOidcRequest, CreateTenantRequest, CreateTenantResponse,
@@ -303,7 +304,7 @@ impl Platform {
     pub async fn revoke_credential(
         &self,
         principal_id: &PrincipalId,
-        credential_id: &str,
+        credential_id: Uuid,
     ) -> Result<(), WyrdError> {
         self.call_no_content::<()>(
             Method::DELETE,

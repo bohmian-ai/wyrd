@@ -111,7 +111,7 @@ async fn issue_credential(
     commit_decision(decision).await?;
 
     Ok(Json(IssuedCredential {
-        id: issued.id.to_string(),
+        id: issued.id,
         credential: SecretBearer::new(issued.credential.secret.expose_secret().to_owned()),
     }))
 }
@@ -266,7 +266,7 @@ async fn revoke_credential(
 /// credentials reads one format, and nothing secret is in it.
 fn metadata(row: PlatformCredentialMetadataRow) -> CredentialMetadata {
     CredentialMetadata {
-        id: row.id.to_string(),
+        id: row.id,
         prefix: row.prefix,
         created_at: row.created_at.to_rfc3339(),
         expires_at: row.expires_at.map(|at| at.to_rfc3339()),

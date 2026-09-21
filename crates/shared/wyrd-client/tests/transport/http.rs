@@ -446,7 +446,7 @@ mod transport_behavior {
         );
 
         principals
-            .revoke_credential(&principal, "cred-1")
+            .revoke_credential(&principal, uuid::Uuid::nil())
             .await
             .expect("the replay after renewal retires the credential");
 
@@ -491,7 +491,7 @@ mod transport_behavior {
         );
 
         principals
-            .revoke_credential(&principal, "cred-1")
+            .revoke_credential(&principal, uuid::Uuid::nil())
             .await
             .expect_err("a refused replay is reported, not retried again");
 

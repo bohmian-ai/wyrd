@@ -237,7 +237,7 @@ async fn mint_credential(
     .map_err(internal)?;
 
     Ok(IssuedCredential {
-        id: credential_id.to_string(),
+        id: credential_id,
         credential: SecretBearer::new(plaintext.secret.expose_secret().to_owned()),
     })
 }
@@ -591,7 +591,7 @@ fn not_found() -> WyrdErrorResponse {
 /// Project a stored credential row onto its non-secret wire metadata.
 fn metadata(row: ApiKeyMetadataRow) -> CredentialMetadata {
     CredentialMetadata {
-        id: row.id.to_string(),
+        id: row.id,
         prefix: row.prefix,
         created_at: row.created_at.to_rfc3339(),
         expires_at: row.expires_at.map(|at| at.to_rfc3339()),

@@ -9,6 +9,7 @@ use std::process::ExitCode;
 
 use clap::{Args, Subcommand};
 use url::Url;
+use uuid::Uuid;
 use wyrd_spec::auth::{CreateServicePrincipalRequest, PrincipalId};
 
 use crate::error::WyrdCliError;
@@ -78,7 +79,7 @@ pub struct RevokeCredentialArgs {
     pub principal: String,
     /// Credential to retire.
     #[arg(long, value_name = "UUID")]
-    pub credential_id: String,
+    pub credential_id: Uuid,
     /// Deployment; the credential comes from the ambient chain.
     #[command(flatten)]
     pub endpoint: TenantEndpoint,
@@ -183,7 +184,7 @@ async fn list(args: PrincipalArgs) -> Result<ExitCode, WyrdCliError> {
 async fn revoke(args: RevokeCredentialArgs) -> Result<ExitCode, WyrdCliError> {
     let principal = principal_id(&args.principal)?;
     crate::client::principals(args.endpoint.server.as_str())?
-        .revoke_credential(&principal, &args.credential_id)
+        .revoke_credential(&principal, args.credential_id)
         .await
         .map_err(|source| WyrdCliError::Server { source })?;
 
@@ -238,6 +239,26 @@ mod tests {
             "https://wyrd.example",
         ]);
         assert!(parsed.is_err(), "revoke must require --principal");
+    }
+
+    /// A credential id is parsed as a UUID at the argument edge, so malformed
+    /// or path-shaping text is refused before any request is constructed.
+    #[test]
+    fn a_malformed_credential_id_is_refused_before_dispatch() {
+        let parsed = Cli::try_parse_from([
+            "wyrd",
+            "revoke",
+            "--principal",
+            "00000000-0000-7000-8000-000000000001",
+            "--credential-id",
+            "../other/credentials/x",
+            "--server",
+            "https://wyrd.example",
+        ]);
+        assert!(
+            parsed.is_err(),
+            "revoke must refuse a non-UUID credential id"
+        );
     }
 
     /// The tenant credential is never an argument: passing one is refused

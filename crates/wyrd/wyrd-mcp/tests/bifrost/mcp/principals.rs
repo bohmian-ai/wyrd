@@ -190,6 +190,22 @@ mod pg_tests {
         }
         let list_result = validator(&list_output)?;
         let revoke_result = validator(&revoke_output)?;
+        // Listed credential ids carry the same UUID contract revocation takes.
+        let listed = |id: &str| {
+            serde_json::json!({ "credentials": [{
+                "id": id,
+                "prefix": "wyrd_sk_",
+                "created_at": "2026-01-01T00:00:00Z",
+                "expires_at": null,
+                "revoked_at": null,
+                "last_used_at": null,
+            }] })
+        };
+        assert!(list_result.is_valid(&listed(&credential)));
+        assert!(
+            !list_result.is_valid(&listed("not-a-uuid")),
+            "the advertised listing schema types credential ids as UUIDs"
+        );
 
         // The reader is offered only the read tool.
         let reader_client = ()

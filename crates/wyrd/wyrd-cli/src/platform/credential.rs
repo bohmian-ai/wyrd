@@ -9,6 +9,7 @@ use std::process::ExitCode;
 use clap::{Args, Subcommand};
 use secrecy::SecretString;
 use url::Url;
+use uuid::Uuid;
 use wyrd_client::Platform;
 use wyrd_spec::auth::PrincipalId;
 
@@ -98,7 +99,7 @@ pub struct RevokeArgs {
     pub principal: String,
     /// Credential to retire.
     #[arg(long, value_name = "UUID")]
-    pub credential_id: String,
+    pub credential_id: Uuid,
     /// Deployment and platform credential.
     #[command(flatten)]
     pub endpoint: PlatformEndpoint,
@@ -190,7 +191,7 @@ async fn revoke(args: RevokeArgs) -> Result<ExitCode, WyrdCliError> {
     args.endpoint
         .connect()
         .await?
-        .revoke_credential(&principal, &args.credential_id)
+        .revoke_credential(&principal, args.credential_id)
         .await
         .map_err(|source| WyrdCliError::Server { source })?;
 

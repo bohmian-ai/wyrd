@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use reqwest::Method;
+use uuid::Uuid;
 use wyrd_spec::auth::{
     CreateServicePrincipalRequest, CreateServicePrincipalResponse, CredentialListResponse,
     IssuedCredential, PrincipalId, RevokePrincipalRequest,
@@ -157,7 +158,7 @@ impl Principals {
     pub async fn revoke_credential(
         &self,
         principal_id: &PrincipalId,
-        credential_id: &str,
+        credential_id: Uuid,
     ) -> Result<(), WyrdError> {
         // Through the shared request owner like every other control call, so a
         // cached bearer the server has stopped accepting is re-exchanged and

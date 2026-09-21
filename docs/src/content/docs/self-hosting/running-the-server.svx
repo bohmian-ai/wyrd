@@ -93,7 +93,7 @@ export WYRD_API_KEY=<the admin_credential tenant create printed>
 
 # Configure first: the issuer this tenant's workloads federate from. Wyrd
 # resolves the JWKS endpoint from the issuer's own discovery document.
-# `wyrd auth` commands read their credential from WYRD_ACCESS_TOKEN.
+# `wyrd auth` and `wyrd principal revoke` read WYRD_ACCESS_TOKEN.
 WYRD_ACCESS_TOKEN="$WYRD_API_KEY" wyrd auth trusted-issuer add \
   --issuer https://idp.example.com \
   --expected-audience wyrd \
@@ -113,7 +113,7 @@ wyrd principal credential list   --principal <principal-id>
 wyrd principal credential revoke --principal <principal-id> --credential-id <old-id>
 
 # Compromise, not rotation: suspend the principal so it mints no new tokens.
-wyrd principal revoke <principal-id> --kind service --reason "key found in a build log"
+WYRD_ACCESS_TOKEN="$WYRD_API_KEY" wyrd principal revoke <principal-id> --kind service --reason "key found in a build log"
 ```
 
 The overlap is the point of issuing before revoking: both credentials are live

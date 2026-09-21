@@ -44,8 +44,7 @@ async fn principal_cli(arguments: Vec<String>, credential: String) -> Output {
 
 /// Run an invocation with every Wyrd credential source cleared.
 async fn uncredentialed_cli(arguments: Vec<String>) -> Output {
-    run_cli_async_with_credential(arguments, "WYRD_CLI_JOURNEY_NO_CREDENTIAL", String::new())
-        .await
+    run_cli_async_with_credential(arguments, "WYRD_CLI_JOURNEY_NO_CREDENTIAL", String::new()).await
 }
 
 /// Assert a command failed with one stable CLI error code.

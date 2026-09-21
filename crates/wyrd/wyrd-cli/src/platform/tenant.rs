@@ -244,12 +244,7 @@ mod tests {
     /// invoked without naming which tenant it freezes or restores.
     #[test]
     fn suspending_requires_the_tenant() {
-        let parsed = Cli::try_parse_from([
-            "wyrd",
-            "suspend",
-            "--server",
-            "https://wyrd.example",
-        ]);
+        let parsed = Cli::try_parse_from(["wyrd", "suspend", "--server", "https://wyrd.example"]);
         assert!(parsed.is_err(), "suspend must require --tenant");
     }
 }

@@ -43,8 +43,8 @@ pub async fn callback(
 /// # Errors
 /// Returns [`WyrdErrorResponse`] when the callback tenant cannot be resolved
 /// from the request, or when the grant itself is refused — unknown, consumed,
-/// or expired login state, a refused code or unverifiable id token, or a failed
-/// role, epoch, issuance, or audit write.
+/// or expired login state, a refused code or unverifiable id token, an
+/// inactive user, or a failed role, issuance, or audit write.
 pub async fn exchange_authorization_code(
     state: &AppState,
     headers: &HeaderMap,
@@ -54,14 +54,10 @@ pub async fn exchange_authorization_code(
 ) -> Result<TokenResponse, WyrdErrorResponse> {
     let tenant_id = resolve_callback_tenant(state, headers).await?;
     let service = wyrd_auth::callback::AuthorizationCodeExchange {
-        issuing_key: state
-            .auth
-            .issuing_key
-            .clone()
-            .ok_or_else(auth_not_configured)?,
+        issuer: state.auth.tenant_issuer().ok_or_else(auth_not_configured)?,
         verifier: state
             .auth
-            .token_verifier
+            .external_verifier
             .clone()
             .ok_or_else(auth_not_configured)?,
         trusted_issuer_resolver: state
@@ -117,6 +113,9 @@ mod pg_tests {
     use std::sync::Arc;
     use std::time::Duration as StdDuration;
 
+    use crate::auth::pg_resolvers::{PgIssuerResolver, issuer_write_from_trusted};
+    use crate::http::error::WyrdErrorResponse;
+    use crate::state::AppState;
     use axum::http::{HeaderMap, HeaderValue, header};
     use chrono::{Duration as ChronoDuration, Utc};
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
@@ -124,9 +123,16 @@ mod pg_tests {
     use uuid::Uuid;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wyrd_auth::callback::{
+        AuthorizationCodeExchange, audit_authorization_code_failure, ensure_user_identity,
+        role_names_to_refs, verify_nonce,
+    };
+    use wyrd_auth::login::{LoginStateEntry, PgLoginStateStore};
     use wyrd_auth_issue::IssuingKey;
     use wyrd_auth_oidc::{ClaimMapping, ClaimPath, ClientAuth, JwksCache, TrustedIssuer};
-    use wyrd_auth_verify::{Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem};
+    use wyrd_auth_verify::{
+        ExternalVerifier, Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem,
+    };
     use wyrd_crypt::SecretKey;
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::DataTenantId;
@@ -134,16 +140,6 @@ mod pg_tests {
     use wyrd_spec::auth::{IssuerUrl, TokenResponse, TokenType};
     use wyrd_sql::queries::auth::upsert_trusted_issuer;
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
-
-    use crate::auth::permission_resolver::SqlPermissionResolver;
-    use crate::auth::pg_resolvers::{PgIssuerResolver, issuer_write_from_trusted};
-    use crate::http::error::WyrdErrorResponse;
-    use crate::state::AppState;
-    use wyrd_auth::callback::{
-        AuthorizationCodeExchange, audit_authorization_code_failure, ensure_user_identity,
-        role_names_to_refs, verify_nonce,
-    };
-    use wyrd_auth::login::{LoginStateEntry, PgLoginStateStore};
 
     use crate::auth::tenant_slug_from_host;
 
@@ -596,16 +592,15 @@ mod pg_tests {
 
     fn authorization_exchange_service(state: &AppState) -> AuthorizationCodeExchange {
         AuthorizationCodeExchange {
-            issuing_key: state
+            issuer: state
                 .auth
-                .issuing_key
-                .clone()
+                .tenant_issuer()
                 .expect("test state has issuing key"),
             verifier: state
                 .auth
-                .token_verifier
+                .external_verifier
                 .clone()
-                .expect("test state has verifier"),
+                .expect("test state has external verifier"),
             trusted_issuer_resolver: state
                 .auth
                 .trusted_issuer_resolver
@@ -721,27 +716,22 @@ mod pg_tests {
             Kid::new("k1").expect("kid is valid"),
             Arc::new(public_key_from_pem(PUBLIC_KEY_PEM).expect("public key parses")),
         );
-        let verifier = TokenVerifier::new(
-            local_keys,
-            "wyrd",
-            Arc::new(SqlPermissionResolver::new(Arc::new(
-                fixture.app_pool().clone(),
-            ))),
-            WyrdAuthVerifySettings::default(),
-        )
-        .with_external(
+        let verifier = TokenVerifier::new(local_keys, "wyrd", WyrdAuthVerifySettings::default());
+        let external_verifier = ExternalVerifier::new(
             Arc::new(JwksCache::new(
                 wyrd_auth_oidc::ScreenedHttp::allowing_internal(),
                 StdDuration::from_secs(300),
                 StdDuration::from_secs(5),
             )),
             Arc::clone(&issuer_resolver),
+            WyrdAuthVerifySettings::default(),
         );
         test_state(fixture)
             .await
             .with_auth(crate::components::auth::ServerAuth {
                 issuing_key: Some(issuing_key),
                 token_verifier: Some(Arc::new(verifier)),
+                external_verifier: Some(Arc::new(external_verifier)),
                 trusted_issuer_resolver: Some(issuer_resolver),
                 sealing_key: Some(sealing_key),
                 ..crate::components::auth::ServerAuth::default()

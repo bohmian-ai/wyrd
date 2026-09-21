@@ -68,12 +68,13 @@ impl FromRequestParts<AppState> for AuthenticatedPrincipal {
         if let Some(principal) = parts.extensions.get::<AuthenticatedPrincipal>() {
             return Ok(principal.clone());
         }
-        verify_authenticated_principal(state.auth.token_verifier.clone(), &parts.headers).await
+        verify_authenticated_principal(state.auth.token_verifier.as_deref(), &parts.headers)
     }
 }
 
 #[cfg(test)]
 mod pg_tests {
+    use crate::http::error::WyrdErrorResponse;
     use axum::extract::FromRequestParts;
     use axum::http::Request;
     use axum::http::request::Parts;
@@ -87,9 +88,6 @@ mod pg_tests {
     use wyrd_runtime::{PrincipalId, PrincipalKind};
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::PrincipalKindTag;
-
-    use crate::auth::permission_resolver::SqlPermissionResolver;
-    use crate::http::error::WyrdErrorResponse;
 
     use super::AuthenticatedPrincipal;
 
@@ -139,7 +137,6 @@ mod pg_tests {
             },
             delegation_chain: Vec::new(),
             exp: chrono::Utc::now() + chrono::Duration::minutes(5),
-            iat: chrono::Utc::now(),
         }));
         // No token header — fallback path would reject with Unauthenticated;
         // extension hit must short-circuit and return the stored principal.
@@ -218,10 +215,8 @@ mod pg_tests {
         let verifier = Arc::new(TokenVerifier::new(
             keys,
             "wyrd",
-            Arc::new(SqlPermissionResolver::new(Arc::new(app_pool.clone()))),
             WyrdAuthVerifySettings {
                 allowed_clock_skew: StdDuration::ZERO,
-                ..WyrdAuthVerifySettings::default()
             },
         ));
         let wyrd = wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), None);
@@ -256,7 +251,16 @@ mod pg_tests {
             .issuing_key
             .as_ref()
             .expect("test state has issuing key")
-            .issue_user_access_token(principal, vec![], None, ttl)
+            .issue_access_token(
+                wyrd_auth_issue::AccessGrant {
+                    principal,
+                    roles: vec![],
+                    permissions: wyrd_runtime::PermissionSet::new(),
+                    credential_id: None,
+                    delegated_by: None,
+                },
+                ttl,
+            )
             .expect("test jwt mints")
     }
 
@@ -284,16 +288,20 @@ mod pg_tests {
             .issuing_key
             .as_ref()
             .expect("test state has issuing key")
-            .issue_delegated_access_token(
-                &caller,
-                TokenPrincipalRef {
-                    id: subject,
-                    kind: PrincipalKindTag::User,
-                    tenant_id: tenant,
-                    card_ref: None,
-                    card_ref_scope: Default::default(),
+            .issue_access_token(
+                wyrd_auth_issue::AccessGrant {
+                    principal: TokenPrincipalRef {
+                        id: subject,
+                        kind: PrincipalKindTag::User,
+                        tenant_id: tenant,
+                        card_ref: None,
+                        card_ref_scope: Default::default(),
+                    },
+                    roles: vec![],
+                    permissions: wyrd_runtime::PermissionSet::new(),
+                    credential_id: None,
+                    delegated_by: Some(caller),
                 },
-                vec![],
                 chrono::Duration::minutes(5),
             )
             .expect("delegated jwt mints")

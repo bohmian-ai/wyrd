@@ -113,8 +113,8 @@ mod pg_tests {
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::reference::CardRef;
     use wyrd_sql::queries::auth::{
-        insert_refresh_token, insert_service_account, insert_user, refresh_by_hash, service_account_by_id,
-        user_by_id,
+        insert_refresh_token, insert_service_account, insert_user, refresh_by_hash,
+        service_account_by_id, user_by_id,
     };
 
     use super::revoke_principal_in_conn;

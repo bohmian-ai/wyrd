@@ -212,20 +212,12 @@ pub fn auth_error_to_wyrd(error: AuthError) -> WyrdError {
             ),
             details: serde_json::json!({ "max": MAX_DELEGATION_DEPTH }),
         },
-        AuthError::Revoked => WyrdError::CredentialRevoked {
-            message: "credential revoked".to_owned(),
-            details: serde_json::json!({}),
-        },
         AuthError::BadTokenFormat => {
             bad_token_format("X-Wyrd-Access-Token is not a compact Wyrd JWT")
         }
         AuthError::VerifyUnavailable => WyrdError::AuthVerifyUnavailable {
             message: "auth verify backend unavailable".to_owned(),
             details: serde_json::json!({ "retry_after_seconds": 1 }),
-        },
-        AuthError::PermissionsCorrupt => WyrdError::RoleCorrupt {
-            message: "stored role permissions failed to decode".to_owned(),
-            details: serde_json::json!({}),
         },
     }
 }
@@ -532,10 +524,6 @@ mod error_mapper_tests {
             (
                 auth_error_to_wyrd(AuthError::VerifyUnavailable),
                 "WYRD_AUTH_503_VERIFY_UNAVAILABLE",
-            ),
-            (
-                auth_error_to_wyrd(AuthError::PermissionsCorrupt),
-                "WYRD_PERMISSION_500_ROLE_CORRUPT",
             ),
         ];
 

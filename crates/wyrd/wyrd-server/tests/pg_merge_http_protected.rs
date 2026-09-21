@@ -45,7 +45,16 @@ fn mint_user_jwt(state: &AppState, tenant: DataTenantId) -> String {
         .issuing_key
         .as_ref()
         .expect("composed server carries an issuing key")
-        .issue_user_access_token(principal, vec![], None, Duration::minutes(5))
+        .issue_access_token(
+            wyrd_auth_issue::AccessGrant {
+                principal,
+                roles: vec![],
+                permissions: wyrd_runtime::PermissionSet::new(),
+                credential_id: None,
+                delegated_by: None,
+            },
+            Duration::minutes(5),
+        )
         .expect("test jwt mints")
 }
 

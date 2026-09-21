@@ -956,9 +956,6 @@ mod pg_tests {
         let verifier = Arc::new(TokenVerifier::new(
             keys,
             "wyrd",
-            Arc::new(
-                crate::auth::permission_resolver::SqlPermissionResolver::new(Arc::new(app_pool)),
-            ),
             WyrdAuthVerifySettings::default(),
         ));
         let storage = Arc::new(StorageHandle::new(BackendSigner::Local(signer)));

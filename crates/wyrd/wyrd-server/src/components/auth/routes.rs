@@ -25,7 +25,7 @@ use crate::auth::exchange_api_key::{
     DelegateToken, ExchangeApiKey, api_key_invalid, map_exchange_error_to_wyrd,
 };
 use crate::auth::issue_api_key::{IssueApiKey, WyrdApiKey};
-use crate::auth::jwt_bearer::JwtBearer;
+use crate::auth::jwt_bearer::exchange_jwt_bearer;
 use crate::auth::refresh::{RefreshError, RefreshTokens, tenant_from_refresh_jwt};
 use crate::components::auth::{AuthenticatedPrincipal, Caller};
 use crate::http::error::WyrdErrorResponse;
@@ -67,8 +67,8 @@ pub fn auth_router() -> OpenApiRouter<AppState> {
 /// `401` for every unusable credential — including a reused, revoked, or
 /// expired refresh token — a `403` when a valid credential's principal may not
 /// obtain this token, a `404` when no principal matches the delegation subject
-/// or the presented workload assertion, and a `503` when the auth backend, the
-/// revocation store, or the audit path is unavailable. The grant and its
+/// or the presented workload assertion, and a `503` when the auth backend or
+/// the audit path is unavailable. The grant and its
 /// exchange audit commit together, so a refusal serves no token.
 #[utoipa::path(
     post,
@@ -92,7 +92,7 @@ pub fn auth_router() -> OpenApiRouter<AppState> {
           (WYRD_AUTH_404_PRINCIPAL_NOT_FOUND)", body = WyrdProblem),
         (status = 500, description = "Token issuance or the server's own auth configuration \
           failed, so no token was served (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
-        (status = 503, description = "The auth backend or the revocation store is unavailable \
+        (status = 503, description = "The auth backend is unavailable \
           (WYRD_AUTH_503_VERIFY_UNAVAILABLE), or the exchange audit could not be staged, which \
           fails the grant closed (WYRD_AUDIT_503_UNAVAILABLE)", body = WyrdProblem)
     ),
@@ -138,27 +138,20 @@ async fn token(
                     return Err(WyrdErrorResponse::from(api_key_invalid()));
                 }
             };
-            let issuing_key = state
-                .auth
-                .issuing_key
-                .clone()
-                .ok_or_else(auth_not_configured)?;
+            let issuer = state.auth.tenant_issuer().ok_or_else(auth_not_configured)?;
             let mut conn = state
                 .postgres
                 .tenant_conn(parsed.tenant_id)
                 .await
                 .map_err(sql_error)?;
             let prefix = parsed.prefix.clone();
-            let exchanged = ExchangeApiKey {
-                issuing_key,
-                settings: state.auth.token_exchange_settings.clone(),
-            }
-            .execute(
-                &mut conn,
-                SecretString::from(api_key.expose().to_owned()),
-                req_id,
-            )
-            .await;
+            let exchanged = ExchangeApiKey { issuer }
+                .execute(
+                    &mut conn,
+                    SecretString::from(api_key.expose().to_owned()),
+                    req_id,
+                )
+                .await;
             let exchanged = match exchanged {
                 Ok(exchanged) => exchanged,
                 Err(error) => {
@@ -185,11 +178,7 @@ async fn token(
             if !state.auth.allow_preview {
                 return Err(WyrdErrorResponse::from(preview_disabled()));
             }
-            let issuing_key = state
-                .auth
-                .issuing_key
-                .clone()
-                .ok_or_else(auth_not_configured)?;
+            let issuer = state.auth.tenant_issuer().ok_or_else(auth_not_configured)?;
             let verifier = state
                 .auth
                 .token_verifier
@@ -202,10 +191,9 @@ async fn token(
                 .await
                 .map_err(sql_error)?;
             let exchanged = DelegateToken {
-                issuing_key,
+                issuer,
                 verifier,
                 permission_check: state.authz.permission_check.clone(),
-                settings: state.auth.token_exchange_settings.clone(),
             }
             .execute(
                 &mut conn,
@@ -240,17 +228,10 @@ async fn token(
                 .tenant_conn(tenant_id)
                 .await
                 .map_err(sql_error)?;
-            let issuing_key = state
-                .auth
-                .issuing_key
-                .clone()
-                .ok_or_else(auth_not_configured)?;
-            let exchanged = RefreshTokens {
-                issuing_key,
-                settings: state.auth.token_exchange_settings.clone(),
-            }
-            .execute(&mut conn, SecretString::from(secret), req_id)
-            .await;
+            let issuer = state.auth.tenant_issuer().ok_or_else(auth_not_configured)?;
+            let exchanged = RefreshTokens { issuer }
+                .execute(&mut conn, SecretString::from(secret), req_id)
+                .await;
             let exchanged = match exchanged {
                 Ok(exchanged) => exchanged,
                 Err(error) => {
@@ -296,10 +277,7 @@ async fn token(
             Ok(Json(exchanged))
         }
         TokenRequest::JwtBearer { assertion, tenant } => {
-            let exchanged = JwtBearer {
-                settings: state.auth.token_exchange_settings.clone(),
-            }
-            .execute(
+            let exchanged = exchange_jwt_bearer(
                 &state,
                 &headers,
                 assertion.into_secret_string(),
@@ -371,7 +349,7 @@ async fn callback(
 /// Returns a `401` without a usable token, a `403` without
 /// `service_accounts:write`, a `404` when the named principal does not exist in
 /// this tenant, a `500` when the write or its audit fails, and a `503` when the
-/// store or the revocation store is unavailable.
+/// store is unavailable or no token verifier is configured.
 #[utoipa::path(
     post,
     path = "/auth/issue-key",
@@ -545,7 +523,9 @@ mod pg_tests {
                 card_ref_scope: Default::default(),
             },
             roles: vec![],
+            permissions: Default::default(),
             act: None,
+            aud: "wyrd".to_owned(),
             exp: 9_999_999_999,
             iat: 0,
             iss: "test".to_owned(),
@@ -610,7 +590,6 @@ mod pg_tests {
             },
             delegation_chain: Vec::new(),
             exp: chrono::Utc::now() + chrono::Duration::minutes(5),
-            iat: chrono::Utc::now(),
         }))
     }
 

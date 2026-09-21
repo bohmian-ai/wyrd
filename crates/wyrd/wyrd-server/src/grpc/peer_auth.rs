@@ -34,7 +34,7 @@ use wyrd_tonic::tonic::codegen::http::{Request, Response};
 use wyrd_tonic::tonic::metadata::MetadataMap;
 use wyrd_tonic::tonic::server::NamedService;
 
-use crate::state::WyrdTokenVerifier;
+use wyrd_auth_verify::TokenVerifier;
 
 /// The exact peer Service principal this process admits on its peer listener.
 ///
@@ -64,7 +64,7 @@ impl PeerWorkloadIdentity {
     /// identity must not serve a peer listener.
     pub async fn resolve(
         credentials: &dyn OraclePeerCredentials,
-        verifier: &WyrdTokenVerifier,
+        verifier: &TokenVerifier,
     ) -> Result<Self, String> {
         let bearer = credentials
             .bearer(false)
@@ -76,7 +76,6 @@ impl PeerWorkloadIdentity {
             .map_err(|_| "Bifrost peer access token is invalid".to_owned())?;
         metadata.insert("x-wyrd-access-token", value);
         let authenticated = vala_bifrost_redux::gate::auth::authenticate(verifier, &metadata)
-            .await
             .map_err(|_| "Bifrost peer access token was rejected".to_owned())?;
         Self::from_principal(&authenticated.principal)
     }
@@ -149,7 +148,7 @@ pub struct PeerWorkloadAuthLayer {
 /// State one peer listener's authentication boundary owns.
 struct PeerWorkloadAuthState {
     /// The verifier public ingest also uses; the peer plane adds no second one.
-    verifier: Arc<WyrdTokenVerifier>,
+    verifier: Arc<TokenVerifier>,
     /// The one principal this listener admits.
     expected: PeerWorkloadIdentity,
     /// Sink for canonical refusal records.
@@ -166,7 +165,7 @@ impl PeerWorkloadAuthLayer {
     /// Composes the peer plane's authentication boundary.
     #[must_use]
     pub fn new(
-        verifier: Arc<WyrdTokenVerifier>,
+        verifier: Arc<TokenVerifier>,
         expected: PeerWorkloadIdentity,
         audit: Arc<dyn PeerSecurityAudit>,
         denial_concurrency: usize,
@@ -205,7 +204,7 @@ impl PeerWorkloadAuthState {
         let metadata = MetadataMap::from_headers(parts.headers.clone());
         let credential_digest = credential_digest(&metadata);
         let authenticated =
-            match vala_bifrost_redux::gate::auth::authenticate(&self.verifier, &metadata).await {
+            match vala_bifrost_redux::gate::auth::authenticate(&self.verifier, &metadata) {
                 Ok(authenticated) => authenticated,
                 Err(error) => {
                     self.audit_denial(BifrostSecurityViolationKind::PeerAudience)

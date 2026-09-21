@@ -497,9 +497,7 @@ async fn ttl_expiry_journey() {
     let srv = WyrdTestServerBuilder::default()
         .with_access_ttl(ChronoDuration::seconds(2))
         .with_auth_verify_settings(WyrdAuthVerifySettings {
-            cache_ttl: StdDuration::from_secs(1),
             allowed_clock_skew: StdDuration::ZERO,
-            ..WyrdAuthVerifySettings::default()
         })
         .start_in_process()
         .await
@@ -521,8 +519,8 @@ async fn ttl_expiry_journey() {
     // Valid before expiry → real authenticated /v1 200.
     assert_v1_authz_check_ok(&srv, &access_token, "ttl").await;
 
-    // Sleep past access_ttl + cache_ttl (2s + 1s; use 4s).
-    tokio::time::sleep(StdDuration::from_secs(4)).await;
+    // Sleep past access_ttl (2s) with margin for second-granular `exp`.
+    tokio::time::sleep(StdDuration::from_secs(3)).await;
 
     // Expired token is rejected on /v1 (verify fails before the delegation guard).
     let callee = srv

@@ -60,7 +60,7 @@ use wyrd_sql::TenantConn;
         (status = 500, description = "A tenant store read or write failed, or the revocation \
           decision could not be audited (WYRD_SPEC_500_INTERNAL, \
           WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
-        (status = 503, description = "The revocation store could not vouch for the token (\
+        (status = 503, description = "No verifier is configured for the access token (\
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Principals"

@@ -99,7 +99,7 @@ pub fn router() -> OpenApiRouter<AppState> {
         (status = 409, description = "The query's owner moved while the request was in \
           flight (WYRD_VALA_409_RUNNING_QUERY_CONFLICT)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "The query-control or Oracle role is unavailable, the \
-          decision could not be audited, or the revocation store could not vouch for the token \
+          decision could not be audited, or no verifier is configured for the access token \
           (WYRD_VALA_503_RUNNING_QUERY_CONTROL_UNAVAILABLE, WYRD_VALA_503_ORACLE_ROLE_UNAVAILABLE, \
           WYRD_VALA_503_QUERY_AUDIT_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
@@ -148,7 +148,7 @@ pub(crate) async fn list_running_queries(
         (status = 409, description = "The query's owner moved while the request was in \
           flight (WYRD_VALA_409_RUNNING_QUERY_CONFLICT)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "The query-control or Oracle role is unavailable, the \
-          decision could not be audited, or the revocation store could not vouch for the token \
+          decision could not be audited, or no verifier is configured for the access token \
           (WYRD_VALA_503_RUNNING_QUERY_CONTROL_UNAVAILABLE, WYRD_VALA_503_ORACLE_ROLE_UNAVAILABLE, \
           WYRD_VALA_503_QUERY_AUDIT_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
@@ -205,7 +205,7 @@ pub(crate) async fn get_running_query(
         (status = 409, description = "The query's owner moved while the request was in \
           flight (WYRD_VALA_409_RUNNING_QUERY_CONFLICT)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "The query-control or Oracle role is unavailable, the \
-          decision could not be audited, or the revocation store could not vouch for the token \
+          decision could not be audited, or no verifier is configured for the access token \
           (WYRD_VALA_503_RUNNING_QUERY_CONTROL_UNAVAILABLE, WYRD_VALA_503_ORACLE_ROLE_UNAVAILABLE, \
           WYRD_VALA_503_QUERY_AUDIT_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
@@ -271,8 +271,8 @@ pub(crate) async fn cancel_running_query(
           unacceptable credentials (WYRD_PERMISSION_403_DENIED_RBAC, \
           WYRD_VALA_403_QUERY_PEER_SECURITY)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "The Oracle role is unavailable, visibility could not be \
-          resolved, the decision could not be audited, or the revocation store could not vouch \
-          for the token (WYRD_VALA_503_ORACLE_ROLE_UNAVAILABLE, \
+          resolved, the decision could not be audited, or no verifier is configured for \
+          the access token (WYRD_VALA_503_ORACLE_ROLE_UNAVAILABLE, \
           WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE, WYRD_VALA_503_QUERY_AUDIT_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = "default", description = "Any other query refusal, each carrying its own \

@@ -25,8 +25,7 @@ pub async fn require_authenticated(
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
-    match verify_authenticated_principal(state.auth.token_verifier.clone(), request.headers()).await
-    {
+    match verify_authenticated_principal(state.auth.token_verifier.as_deref(), request.headers()) {
         Ok(principal) => {
             request.extensions_mut().insert(principal);
             next.run(request).await
@@ -50,20 +49,17 @@ mod pg_tests {
     use axum::routing::get;
     use chrono::Duration;
     use tower::ServiceExt;
-    use wyrd_auth::revocation_resolver::SqlRevocationCheck;
     use wyrd_auth_issue::IssuingKey;
     use wyrd_auth_verify::{
-        Kid, RevocationCheck, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings,
-        public_key_from_pem,
+        Kid, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem,
     };
     use wyrd_runtime::PrincipalId;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::PrincipalKindTag;
 
     use super::require_authenticated;
-    use crate::auth::permission_resolver::SqlPermissionResolver;
     use crate::components::auth::AuthenticatedPrincipal;
-    use crate::state::{AppState, WyrdTokenVerifier};
+    use crate::state::AppState;
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
     const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n";
@@ -125,23 +121,25 @@ mod pg_tests {
         assert_error_code(response, "WYRD_AUTH_400_BAD_TOKEN_FORMAT").await;
     }
 
-    /// A protected route must refuse while the revocation store is unreadable.
+    /// A protected route must refuse when no token verifier is configured.
     ///
-    /// The verifier carries the production [`SqlRevocationCheck`] over a pool
-    /// that cannot connect, which is exactly the outage shape the served path
-    /// sees. The token itself is good, so anything other than the retryable
-    /// `503` would be the served surface admitting a principal it cannot prove
-    /// is still admitted.
+    /// The token itself is good, so anything other than the retryable `503`
+    /// would be the served surface admitting a principal it never verified.
     ///
     /// # Panics
     /// Panics when the router fails to respond, or when the response is not the
     /// stable retryable verify-unavailable problem.
     #[tokio::test]
-    async fn unreadable_revocation_store_refuses_a_protected_route() {
+    async fn missing_verifier_refuses_a_protected_route() {
         let tenant = DataTenantId::new_v7();
         let state = test_state().await;
         let jwt = mint_test_user_jwt(&state, tenant, chrono::Duration::minutes(5));
-        let state = state_with_revocation(state, unreadable_revocation_check());
+        let issuing_key = state.auth.issuing_key.clone();
+        let state = state.with_auth(crate::components::auth::ServerAuth {
+            issuing_key,
+            token_verifier: None,
+            ..crate::components::auth::ServerAuth::default()
+        });
 
         let response = test_router(state)
             .oneshot(
@@ -214,69 +212,34 @@ mod pg_tests {
             .issuing_key
             .as_ref()
             .expect("test state has issuing key")
-            .issue_user_access_token(principal, vec![], None, ttl)
+            .issue_access_token(
+                wyrd_auth_issue::AccessGrant {
+                    principal,
+                    roles: vec![],
+                    permissions: wyrd_runtime::PermissionSet::new(),
+                    credential_id: None,
+                    delegated_by: None,
+                },
+                ttl,
+            )
             .expect("test jwt mints")
     }
 
-    /// Build the same token verifier the served tests use.
-    ///
-    /// Shared by the default test state and the revocation-outage case so both
-    /// verify identical tokens with identical settings and differ only in
-    /// whether a revocation store is attached.
-    fn build_verifier() -> WyrdTokenVerifier {
-        use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-
+    /// Build the local token verifier the served tests use, with zero clock
+    /// skew so expiry cases observe `exp` exactly.
+    fn build_verifier() -> TokenVerifier {
         let mut keys = HashMap::new();
         keys.insert(
             Kid::new("k1").expect("kid is valid"),
             Arc::new(public_key_from_pem(PUBLIC_KEY_PEM).expect("public key loads")),
         );
-        let pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
         TokenVerifier::new(
             keys,
             "wyrd",
-            Arc::new(SqlPermissionResolver::new(Arc::new(pool))),
             WyrdAuthVerifySettings {
                 allowed_clock_skew: StdDuration::ZERO,
-                ..WyrdAuthVerifySettings::default()
             },
         )
-    }
-
-    /// Build the production revocation check over a pool that cannot connect.
-    ///
-    /// `connect_lazy_with` defers the connection to first use, so every epoch
-    /// lookup this check performs fails with the same unavailable error a real
-    /// database or pool outage produces.
-    fn unreadable_revocation_check() -> Arc<SqlRevocationCheck> {
-        use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-
-        let pool = PgPoolOptions::new()
-            .acquire_timeout(StdDuration::from_millis(250))
-            .connect_lazy_with(
-                PgConnectOptions::new()
-                    .host("127.0.0.1")
-                    .port(1)
-                    .username("wyrd")
-                    .database("wyrd"),
-            );
-        Arc::new(SqlRevocationCheck::new(Arc::new(pool)))
-    }
-
-    /// Re-issue the test state with the same issuing key and a verifier that
-    /// consults `revocation`.
-    ///
-    /// The verifier is rebuilt rather than mutated because `TokenVerifier` owns
-    /// its revocation dependency at construction, which is the same shape the
-    /// server uses when it wires `SqlRevocationCheck` at startup.
-    fn state_with_revocation(state: AppState, revocation: Arc<SqlRevocationCheck>) -> AppState {
-        let issuing_key = state.auth.issuing_key.clone();
-        let verifier = build_verifier().with_revocation(revocation as Arc<dyn RevocationCheck>);
-        state.with_auth(crate::components::auth::ServerAuth {
-            issuing_key,
-            token_verifier: Some(Arc::new(verifier)),
-            ..crate::components::auth::ServerAuth::default()
-        })
     }
 
     async fn assert_error_code(response: axum::response::Response, code: &str) {

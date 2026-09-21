@@ -71,7 +71,7 @@ pub fn eval_router() -> OpenApiRouter<AppState> {
         (status = 500, description = "The run could not be opened, or the authorization \
           decision could not be audited (WYRD_EVAL_500_RUN_FAILED, \
           WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
-        (status = 503, description = "The revocation store could not vouch for the token (\
+        (status = 503, description = "No verifier is configured for the access token (\
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Eval"
@@ -170,7 +170,7 @@ async fn open(
           (WYRD_EVAL_404_RUN_NOT_FOUND)", body = WyrdProblem),
         (status = 500, description = "The run could not be advanced \
           (WYRD_EVAL_500_RUN_FAILED)", body = WyrdProblem),
-        (status = 503, description = "The revocation store could not vouch for the token \
+        (status = 503, description = "No verifier is configured for the access token \
           (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Eval"
@@ -241,7 +241,7 @@ async fn next(
           (WYRD_EVAL_404_RUN_NOT_FOUND)", body = WyrdProblem),
         (status = 409, description = "The submission does not match the turn the run is \
           waiting on (WYRD_EVAL_409_SUBMISSION_MISMATCH)", body = WyrdProblem),
-        (status = 503, description = "The revocation store could not vouch for the token \
+        (status = 503, description = "No verifier is configured for the access token \
           (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Eval"
@@ -282,7 +282,7 @@ async fn agent_turn(
           (WYRD_EVAL_404_RUN_NOT_FOUND)", body = WyrdProblem),
         (status = 409, description = "The submission does not match the turn the run is \
           waiting on (WYRD_EVAL_409_SUBMISSION_MISMATCH)", body = WyrdProblem),
-        (status = 503, description = "The revocation store could not vouch for the token \
+        (status = 503, description = "No verifier is configured for the access token \
           (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Eval"

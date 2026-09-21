@@ -14,7 +14,6 @@ use secrecy::ExposeSecret;
 use tempfile::TempDir;
 use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_sql::ValaPostgres;
-use wyrd_auth::permission_resolver::SqlPermissionResolver;
 use wyrd_auth_verify::{TokenVerifier, WyrdAuthVerifySettings};
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_sql::WyrdPostgres;
@@ -144,9 +143,6 @@ pub fn test_app_state(
     let verifier = Arc::new(TokenVerifier::new(
         shell_decoding_keys(),
         "wyrd",
-        Arc::new(SqlPermissionResolver::new(Arc::new(
-            shared()._fixture.app_pool().clone(),
-        ))),
         WyrdAuthVerifySettings::default(),
     ));
     let shutdown = tokio_util::sync::CancellationToken::new();

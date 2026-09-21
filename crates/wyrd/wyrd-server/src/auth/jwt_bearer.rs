@@ -3,7 +3,7 @@
 use axum::http::HeaderMap;
 use secrecy::SecretString;
 use serde_json::json;
-use wyrd_auth::exchange_api_key::{ExchangedToken, TokenExchangeSettings};
+use wyrd_auth::issuance::ExchangedToken;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::TenantSlug;
@@ -12,48 +12,42 @@ use crate::auth::{auth_not_configured, invalid_token, tenant_slug_from_host};
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
-/// Workload OIDC `jwt-bearer` exchange service.
-#[derive(Debug, Clone, Default)]
-pub struct JwtBearer {
-    /// Access/refresh token settings.
-    pub settings: TokenExchangeSettings,
-}
-
-impl JwtBearer {
-    /// Exchange a platform-attested workload assertion for a Wyrd token pair.
-    #[tracing::instrument(level = "debug", skip(self, state, headers, assertion))]
-    pub async fn execute(
-        &self,
-        state: &AppState,
-        headers: &HeaderMap,
-        assertion: SecretString,
-        tenant: Option<TenantSlug>,
-        request_id: &str,
-    ) -> Result<ExchangedToken, WyrdErrorResponse> {
-        let tenant_id = resolve_workload_tenant(state, headers, tenant).await?;
-        let service = wyrd_auth::jwt_bearer::JwtBearer {
-            settings: self.settings.clone(),
-            issuing_key: state
-                .auth
-                .issuing_key
-                .clone()
-                .ok_or_else(auth_not_configured)?,
-            verifier: state
-                .auth
-                .token_verifier
-                .clone()
-                .ok_or_else(auth_not_configured)?,
-            workload_binding_resolver: state
-                .auth
-                .workload_binding_resolver
-                .clone()
-                .ok_or_else(auth_not_configured)?,
-        };
-        service
-            .execute(state.postgres.wyrd(), tenant_id, assertion, request_id)
-            .await
-            .map_err(WyrdErrorResponse::from)
-    }
+/// Exchange a platform-attested workload assertion for a Wyrd access token.
+///
+/// Resolves the tenant from the request host (or the caller's fallback slug),
+/// then hands the assertion to the workload exchange, which verifies it with
+/// the issuance-side external verifier and mints through the shared tenant
+/// issuer.
+///
+/// # Errors
+/// Returns [`WyrdErrorResponse`] when the tenant cannot be resolved, auth is
+/// not configured, or the workload exchange refuses the assertion.
+#[tracing::instrument(level = "debug", skip(state, headers, assertion))]
+pub async fn exchange_jwt_bearer(
+    state: &AppState,
+    headers: &HeaderMap,
+    assertion: SecretString,
+    tenant: Option<TenantSlug>,
+    request_id: &str,
+) -> Result<ExchangedToken, WyrdErrorResponse> {
+    let tenant_id = resolve_workload_tenant(state, headers, tenant).await?;
+    let service = wyrd_auth::jwt_bearer::JwtBearer {
+        issuer: state.auth.tenant_issuer().ok_or_else(auth_not_configured)?,
+        verifier: state
+            .auth
+            .external_verifier
+            .clone()
+            .ok_or_else(auth_not_configured)?,
+        workload_binding_resolver: state
+            .auth
+            .workload_binding_resolver
+            .clone()
+            .ok_or_else(auth_not_configured)?,
+    };
+    service
+        .execute(state.postgres.wyrd(), tenant_id, assertion, request_id)
+        .await
+        .map_err(WyrdErrorResponse::from)
 }
 
 async fn resolve_workload_tenant(
@@ -112,7 +106,9 @@ mod pg_tests {
     use wyrd_auth_oidc::{
         ClaimMapping, ClaimPath, ClientAuth, JwksCache, TrustedIssuer, WorkloadBinding,
     };
-    use wyrd_auth_verify::{Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem};
+    use wyrd_auth_verify::{
+        ExternalVerifier, Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem,
+    };
     use wyrd_dev_fixtures::cards::seed_card_with_spec;
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_runtime::{PrincipalKind, RoleRef};
@@ -133,14 +129,13 @@ mod pg_tests {
 
     use crate::AppState;
     use crate::auth::issue_api_key::WyrdApiKey;
-    use crate::auth::permission_resolver::SqlPermissionResolver;
     use crate::auth::pg_resolvers::{
         PgIssuerResolver, PgWorkloadBindingResolver, binding_write_from_binding,
         issuer_write_from_trusted,
     };
     use crate::auth::seed::seed_builtin_roles_for_tenant;
 
-    use super::JwtBearer;
+    use super::exchange_jwt_bearer;
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
     const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n";
@@ -181,16 +176,15 @@ mod pg_tests {
             EXTERNAL_AUDIENCE,
             ChronoDuration::hours(1),
         ));
-        let exchanged = JwtBearer::default()
-            .execute(
-                &state,
-                &tenant_headers(tenant_slug(&fixture)),
-                SecretString::from(assertion),
-                None,
-                "req-1",
-            )
-            .await
-            .expect("jwt-bearer exchange succeeds");
+        let exchanged = exchange_jwt_bearer(
+            &state,
+            &tenant_headers(tenant_slug(&fixture)),
+            SecretString::from(assertion),
+            None,
+            "req-1",
+        )
+        .await
+        .expect("jwt-bearer exchange succeeds");
 
         let verified = verify_issued_token(&state, tenant, exchanged.access_token.expose_secret())
             .await
@@ -245,16 +239,15 @@ mod pg_tests {
             EXTERNAL_AUDIENCE,
             ChronoDuration::hours(1),
         ));
-        let exchanged = JwtBearer::default()
-            .execute(
-                &state,
-                &localhost_headers(),
-                SecretString::from(assertion),
-                Some(slug),
-                "req-2",
-            )
-            .await
-            .expect("jwt-bearer exchange succeeds");
+        let exchanged = exchange_jwt_bearer(
+            &state,
+            &localhost_headers(),
+            SecretString::from(assertion),
+            Some(slug),
+            "req-2",
+        )
+        .await
+        .expect("jwt-bearer exchange succeeds");
 
         let verified = verify_issued_token(&state, tenant, exchanged.access_token.expose_secret())
             .await
@@ -295,16 +288,15 @@ mod pg_tests {
             "wrong-audience",
             ChronoDuration::hours(1),
         ));
-        let error = JwtBearer::default()
-            .execute(
-                &state,
-                &tenant_headers(tenant_slug(&fixture)),
-                SecretString::from(assertion),
-                None,
-                "req-3",
-            )
-            .await
-            .expect_err("wrong audience rejected");
+        let error = exchange_jwt_bearer(
+            &state,
+            &tenant_headers(tenant_slug(&fixture)),
+            SecretString::from(assertion),
+            None,
+            "req-3",
+        )
+        .await
+        .expect_err("wrong audience rejected");
         assert!(matches!(error.0, WyrdError::InvalidToken { .. }));
 
         let rows = audit_rows(&fixture, tenant).await;
@@ -340,16 +332,15 @@ mod pg_tests {
             EXTERNAL_AUDIENCE,
             ChronoDuration::seconds(-120),
         ));
-        let error = JwtBearer::default()
-            .execute(
-                &state,
-                &tenant_headers(tenant_slug(&fixture)),
-                SecretString::from(assertion),
-                None,
-                "req-4",
-            )
-            .await
-            .expect_err("expired assertion rejected");
+        let error = exchange_jwt_bearer(
+            &state,
+            &tenant_headers(tenant_slug(&fixture)),
+            SecretString::from(assertion),
+            None,
+            "req-4",
+        )
+        .await
+        .expect_err("expired assertion rejected");
         assert!(matches!(error.0, WyrdError::TokenExpired { .. }));
     }
 
@@ -375,16 +366,15 @@ mod pg_tests {
             "exp": (Utc::now() + ChronoDuration::hours(1)).timestamp(),
             "iat": Utc::now().timestamp(),
         }));
-        let error = JwtBearer::default()
-            .execute(
-                &state,
-                &tenant_headers(tenant_slug(&fixture)),
-                SecretString::from(assertion),
-                None,
-                "req-5",
-            )
-            .await
-            .expect_err("untrusted issuer rejected");
+        let error = exchange_jwt_bearer(
+            &state,
+            &tenant_headers(tenant_slug(&fixture)),
+            SecretString::from(assertion),
+            None,
+            "req-5",
+        )
+        .await
+        .expect_err("untrusted issuer rejected");
         assert!(matches!(error.0, WyrdError::InvalidToken { .. }));
     }
 
@@ -412,16 +402,15 @@ mod pg_tests {
             EXTERNAL_AUDIENCE,
             ChronoDuration::hours(1),
         ));
-        let error = JwtBearer::default()
-            .execute(
-                &state,
-                &tenant_headers(tenant_slug(&fixture)),
-                SecretString::from(assertion),
-                None,
-                "req-6",
-            )
-            .await
-            .expect_err("unbound workload rejected");
+        let error = exchange_jwt_bearer(
+            &state,
+            &tenant_headers(tenant_slug(&fixture)),
+            SecretString::from(assertion),
+            None,
+            "req-6",
+        )
+        .await
+        .expect_err("unbound workload rejected");
         assert!(matches!(error.0, WyrdError::PrincipalNotFound { .. }));
     }
 
@@ -463,16 +452,15 @@ mod pg_tests {
             EXTERNAL_AUDIENCE,
             ChronoDuration::hours(1),
         ));
-        let exchanged = JwtBearer::default()
-            .execute(
-                &state,
-                &tenant_headers(tenant_slug(&fixture)),
-                SecretString::from(assertion),
-                None,
-                "req-cloud",
-            )
-            .await
-            .expect("cloud workload exchange succeeds");
+        let exchanged = exchange_jwt_bearer(
+            &state,
+            &tenant_headers(tenant_slug(&fixture)),
+            SecretString::from(assertion),
+            None,
+            "req-cloud",
+        )
+        .await
+        .expect("cloud workload exchange succeeds");
 
         let verified = verify_issued_token(&state, tenant, exchanged.access_token.expose_secret())
             .await
@@ -516,16 +504,15 @@ mod pg_tests {
             EXTERNAL_AUDIENCE,
             ChronoDuration::hours(1),
         ));
-        let error = JwtBearer::default()
-            .execute(
-                &state,
-                &localhost_headers(),
-                SecretString::from(assertion),
-                Some(TenantSlug::new("workload-tenant-b").expect("slug is valid")),
-                "req-7",
-            )
-            .await
-            .expect_err("tenant B binding missing");
+        let error = exchange_jwt_bearer(
+            &state,
+            &localhost_headers(),
+            SecretString::from(assertion),
+            Some(TenantSlug::new("workload-tenant-b").expect("slug is valid")),
+            "req-7",
+        )
+        .await
+        .expect_err("tenant B binding missing");
         assert!(matches!(error.0, WyrdError::PrincipalNotFound { .. }));
     }
 
@@ -545,12 +532,7 @@ mod pg_tests {
             .await
             .expect("tenant conn opens");
         let exchanged = crate::auth::exchange_api_key::ExchangeApiKey {
-            issuing_key: state
-                .auth
-                .issuing_key
-                .clone()
-                .expect("issuing key configured"),
-            settings: Default::default(),
+            issuer: state.auth.tenant_issuer().expect("issuing key configured"),
         }
         .execute(&mut conn, SecretString::from(token), "req-api-key")
         .await
@@ -633,27 +615,22 @@ mod pg_tests {
             Kid::new("k1").expect("kid is valid"),
             Arc::new(public_key_from_pem(PUBLIC_KEY_PEM).expect("public key parses")),
         );
-        let verifier = TokenVerifier::new(
-            local_keys,
-            "wyrd",
-            Arc::new(SqlPermissionResolver::new(Arc::new(
-                fixture.app_pool().clone(),
-            ))),
-            WyrdAuthVerifySettings::default(),
-        )
-        .with_external(
+        let verifier = TokenVerifier::new(local_keys, "wyrd", WyrdAuthVerifySettings::default());
+        let external_verifier = ExternalVerifier::new(
             Arc::new(JwksCache::new(
                 wyrd_auth_oidc::ScreenedHttp::allowing_internal(),
                 StdDuration::from_secs(300),
                 StdDuration::from_secs(5),
             )),
             Arc::clone(&issuer_resolver),
+            WyrdAuthVerifySettings::default(),
         );
         test_state(fixture)
             .await
             .with_auth(crate::components::auth::ServerAuth {
                 issuing_key: Some(issuing_key),
                 token_verifier: Some(Arc::new(verifier)),
+                external_verifier: Some(Arc::new(external_verifier)),
                 trusted_issuer_resolver: Some(issuer_resolver),
                 workload_binding_resolver: Some(binding_resolver),
                 ..crate::components::auth::ServerAuth::default()
@@ -868,8 +845,6 @@ mod pg_tests {
             .as_ref()
             .expect("token verifier configured")
             .verify(&SecretString::from(token.to_owned()), &tenant)
-            .await
-            .map(|token| (*token).clone())
     }
 
     fn builtin_role_name() -> &'static str {

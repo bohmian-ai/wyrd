@@ -11,16 +11,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use secrecy::SecretString;
-use sqlx::PgPool;
 use wyrd_auth_issue::IssuingKey;
 use wyrd_auth_oidc::{JwksCache, ScreenedHttp};
-use wyrd_auth_verify::{Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem};
+use wyrd_auth_verify::{
+    ExternalVerifier, Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem,
+};
 
-use crate::auth::permission_resolver::SqlPermissionResolver;
 use crate::auth::pg_resolvers::PgIssuerResolver;
-use crate::auth::revocation_resolver::SqlRevocationCheck;
 use crate::boot::ServerBootError;
-use crate::state::WyrdTokenVerifier;
 
 /// Wyrd's own issuer identity, stamped into minted tokens (`iss`) and checked by
 /// the verifier. A single self-hosted deployment has one issuer.
@@ -36,14 +34,26 @@ const JWKS_CACHE_TTL_SECS: u64 = 300;
 /// Per-fetch timeout when refreshing a foreign issuer's JWKS.
 const JWKS_FETCH_TIMEOUT_SECS: u64 = 5;
 
-/// Build Wyrd's issuing key and token verifier from the configured signing key.
+/// The auth handles production boot installs on [`crate::state::AppState`].
+pub struct AuthHandles {
+    /// Signs every Wyrd access, refresh, and platform token.
+    pub issuing_key: Arc<IssuingKey>,
+    /// Verifies Wyrd tenant access tokens on every request, locally.
+    pub token_verifier: Arc<TokenVerifier>,
+    /// Verifies foreign OIDC ID tokens and workload assertions at issuance.
+    pub external_verifier: Arc<ExternalVerifier<PgIssuerResolver>>,
+}
+
+/// Build Wyrd's issuing key, request verifier, and issuance-side external
+/// verifier from the configured signing key.
 ///
 /// The public verification key is derived from the private signing key (see
 /// [`IssuingKey::verifying_key_pem`]), so a single environment-provided signing
-/// key is sufficient. The verifier's external (foreign-OIDC) path is always
-/// wired to the supplied [`PgIssuerResolver`]; it resolves the requesting
-/// tenant's trusted issuers per-request from Postgres (an empty result simply
-/// means the tenant federates no issuers), so federated tokens can be exchanged.
+/// key is sufficient. The request verifier holds only that key, the issuer,
+/// the `wyrd` audience, and clock skew; it reads no database. The external
+/// verifier resolves the requesting tenant's trusted issuers from Postgres
+/// through the supplied [`PgIssuerResolver`] and is used only where a foreign
+/// token is exchanged for a Wyrd one.
 ///
 /// `http` is the deployment's outbound address screening. The JWKS cache is
 /// built with it rather than a bare client, so a refresh long after the issuer
@@ -53,12 +63,15 @@ const JWKS_FETCH_TIMEOUT_SECS: u64 = 5;
 /// Returns [`ServerBootError::OraclePeer`] when another Rustls provider already
 /// owns the process. Returns [`ServerBootError::SigningKey`] when the PEM cannot
 /// be loaded as an Ed25519 signing key or its public key cannot be derived.
+///
+/// # Panics
+/// Panics only if the static signing `kid` is invalid, which is a compile-time
+/// constant invariant.
 pub fn build_auth_handles(
     signing_key: &SecretString,
-    pool: &PgPool,
     issuer_resolver: Arc<PgIssuerResolver>,
     http: ScreenedHttp,
-) -> Result<(Arc<IssuingKey>, Arc<WyrdTokenVerifier>), ServerBootError> {
+) -> Result<AuthHandles, ServerBootError> {
     wyrd_tls::install_crypto_provider()
         .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?;
     let kid = Kid::new(WYRD_SIGNING_KID).expect("static signing kid is valid");
@@ -73,77 +86,87 @@ pub fn build_auth_handles(
 
     let mut decoding_keys = HashMap::new();
     decoding_keys.insert(kid, Arc::new(decoding));
-
-    let resolver = Arc::new(SqlPermissionResolver::new(Arc::new(pool.clone())));
-    let verifier_base = TokenVerifier::new(
-        decoding_keys,
-        WYRD_ISSUER,
-        resolver,
-        WyrdAuthVerifySettings::default(),
-    )
-    .with_revocation(Arc::new(SqlRevocationCheck::new(Arc::new(pool.clone()))));
-
-    let verifier = verifier_base.with_external(
+    let settings = WyrdAuthVerifySettings::default();
+    let token_verifier = TokenVerifier::new(decoding_keys, WYRD_ISSUER, settings.clone());
+    let external_verifier = ExternalVerifier::new(
         Arc::new(JwksCache::new(
             http,
             Duration::from_secs(JWKS_CACHE_TTL_SECS),
             Duration::from_secs(JWKS_FETCH_TIMEOUT_SECS),
         )),
         issuer_resolver,
+        settings,
     );
 
-    Ok((Arc::new(issuing_key), Arc::new(verifier)))
+    Ok(AuthHandles {
+        issuing_key: Arc::new(issuing_key),
+        token_verifier: Arc::new(token_verifier),
+        external_verifier: Arc::new(external_verifier),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::Duration as ChronoDuration;
+    use sqlx::PgPool;
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-    use wyrd_auth_verify::{AccessTokenClaims, TokenPrincipalRef, decode_kid, verify_eddsa};
-    use wyrd_runtime::{PrincipalId, RoleRef};
+    use wyrd_auth_issue::AccessGrant;
+    use wyrd_auth_verify::{TokenPrincipalRef, decode_kid};
+    use wyrd_runtime::{Permission, PrincipalId};
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::PrincipalKindTag;
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
 
+    /// A pool that never connects; the assembler must not touch the database.
     fn lazy_pool() -> PgPool {
         PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new())
     }
 
+    /// The tenant the fixture token is minted for.
+    fn tenant() -> DataTenantId {
+        "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b01"
+            .parse::<DataTenantId>()
+            .expect("static tenant id is valid")
+    }
+
+    /// A human principal in [`tenant`].
     fn user_principal() -> TokenPrincipalRef {
         TokenPrincipalRef {
             id: "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00"
                 .parse::<PrincipalId>()
                 .expect("static principal id is valid"),
             kind: PrincipalKindTag::User,
-            tenant_id: "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b01"
-                .parse::<DataTenantId>()
-                .expect("static tenant id is valid"),
+            tenant_id: tenant(),
             card_ref: None,
             card_ref_scope: Default::default(),
         }
     }
 
-    // Drives the production auth-handle assembler directly: the issuing key it
-    // returns must mint a token that the verifier's derived public key accepts,
-    // under the same kid/issuer the assembler installs. This is the config→
-    // verifier coverage the test harness previously held exclusively.
+    /// Drives the production auth-handle assembler directly: the issuing key it
+    /// returns must mint a token that the assembled request verifier accepts,
+    /// under the same kid, issuer, and audience, with the signed permissions as
+    /// the principal's authority.
     #[tokio::test(flavor = "current_thread")]
-    async fn build_auth_handles_mints_tokens_verifiable_by_the_derived_key() {
-        let (issuing_key, _verifier) = build_auth_handles(
+    async fn build_auth_handles_mints_tokens_the_request_verifier_accepts() {
+        let handles = build_auth_handles(
             &SecretString::from(PRIVATE_KEY_PEM),
-            &lazy_pool(),
             Arc::new(PgIssuerResolver::new(Arc::new(lazy_pool()), None)),
             ScreenedHttp::allowing_internal(),
         )
         .expect("auth handles assemble from the signing key");
 
-        let token = issuing_key
-            .issue_user_access_token(
-                user_principal(),
-                vec![RoleRef::new("runtime_admin").expect("static role is valid")],
-                None,
+        let token = handles
+            .issuing_key
+            .issue_access_token(
+                AccessGrant {
+                    principal: user_principal(),
+                    roles: Vec::new(),
+                    permissions: std::iter::once(Permission::card_read()).collect(),
+                    credential_id: None,
+                    delegated_by: None,
+                },
                 ChronoDuration::minutes(5),
             )
             .expect("issuing key mints a token");
@@ -152,23 +175,24 @@ mod tests {
             decode_kid(&token).expect("kid decodes"),
             Some(WYRD_SIGNING_KID.to_owned())
         );
-
-        let derived_pem = issuing_key
-            .verifying_key_pem()
-            .expect("public key derives from the signing key");
-        let decoding = public_key_from_pem(derived_pem.as_bytes()).expect("derived key loads");
-        let claims = verify_eddsa::<AccessTokenClaims>(&token, &decoding, Some(WYRD_ISSUER))
-            .expect("minted token verifies against the assembler's derived key and issuer");
-
-        assert_eq!(claims.principal.kind, PrincipalKindTag::User);
-        assert_eq!(claims.iss, WYRD_ISSUER);
+        let verified = handles
+            .token_verifier
+            .verify(&SecretString::from(token), &tenant())
+            .expect("minted token verifies against the assembled request verifier");
+        assert_eq!(verified.principal.kind.tag(), PrincipalKindTag::User);
+        assert!(
+            verified
+                .principal
+                .effective_permissions
+                .contains(&Permission::card_read())
+        );
     }
 
+    /// An unparseable signing key fails boot rather than serving unsigned.
     #[tokio::test(flavor = "current_thread")]
     async fn build_auth_handles_rejects_an_invalid_signing_key() {
         let result = build_auth_handles(
             &SecretString::from("not a pem"),
-            &lazy_pool(),
             Arc::new(PgIssuerResolver::new(Arc::new(lazy_pool()), None)),
             ScreenedHttp::allowing_internal(),
         );

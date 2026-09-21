@@ -48,9 +48,28 @@ use wyrd_testing::WyrdTestServer;
 // Harness
 // --------------------------------------------------------------------------
 
-/// Mint an access token for the named roles in a tenant, so each case starts
-/// from exactly the authority it means to exercise.
+/// Mint an access token for the named built-in roles in a tenant, so each
+/// case starts from exactly the authority it means to exercise.
+///
+/// The token carries the roles' built-in permissions, exactly as the issuer
+/// would sign them for a principal holding those roles.
 fn mint_jwt(state: &AppState, tenant: DataTenantId, roles: &[&str]) -> String {
+    let permissions = wyrd_runtime::builtin_roles::BUILTIN_ROLES
+        .iter()
+        .filter(|builtin| roles.contains(&builtin.name))
+        .flat_map(|builtin| builtin.permissions.iter().cloned())
+        .collect();
+    mint_jwt_with_permissions(state, tenant, roles, permissions)
+}
+
+/// Mint an access token for `roles` carrying exactly `permissions`, for a
+/// custom role whose grants the case seeds itself.
+fn mint_jwt_with_permissions(
+    state: &AppState,
+    tenant: DataTenantId,
+    roles: &[&str],
+    permissions: wyrd_runtime::PermissionSet,
+) -> String {
     let role_refs = roles
         .iter()
         .map(|role| RoleRef::new(role).expect("valid role"))
@@ -60,16 +79,20 @@ fn mint_jwt(state: &AppState, tenant: DataTenantId, roles: &[&str]) -> String {
         .issuing_key
         .as_ref()
         .expect("issuing key")
-        .issue_user_access_token(
-            TokenPrincipalRef {
-                id: PrincipalId::new(uuid::Uuid::now_v7()),
-                kind: PrincipalKindTag::User,
-                tenant_id: tenant,
-                card_ref: None,
-                card_ref_scope: Default::default(),
+        .issue_access_token(
+            wyrd_auth_issue::AccessGrant {
+                principal: TokenPrincipalRef {
+                    id: PrincipalId::new(uuid::Uuid::now_v7()),
+                    kind: PrincipalKindTag::User,
+                    tenant_id: tenant,
+                    card_ref: None,
+                    card_ref_scope: Default::default(),
+                },
+                roles: role_refs,
+                permissions,
+                credential_id: None,
+                delegated_by: None,
             },
-            role_refs,
-            None,
             Duration::minutes(15),
         )
         .expect("jwt mints")
@@ -816,7 +839,17 @@ async fn open_requires_eval_run_permission() {
 
     // Both principals resolve the Eval card (RLS is tenant-scoped); only the one
     // holding evals:run may open a run.
-    let card_only_jwt = mint_jwt(state, tenant, &["card_only"]);
+    let card_only_jwt = mint_jwt_with_permissions(
+        state,
+        tenant,
+        &["card_only"],
+        serde_json::from_value::<Vec<wyrd_runtime::Permission>>(json!([
+            { "resource": "cards", "action": "write", "scope": "all" }
+        ]))
+        .expect("custom role permissions decode")
+        .into_iter()
+        .collect(),
+    );
     let writer_jwt = mint_jwt(state, tenant, &["writer"]);
 
     let (denied_status, denied_body) = call(

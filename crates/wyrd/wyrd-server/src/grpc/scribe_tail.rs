@@ -75,7 +75,6 @@ impl ScribeTailGrpc {
             .as_ref()
             .ok_or_else(|| Status::unavailable("auth backend not configured"))?;
         let auth = vala_bifrost_redux::gate::auth::authenticate(verifier.as_ref(), metadata)
-            .await
             .map_err(|error| Status::unauthenticated(error.to_string()))?;
         if !matches!(auth.principal.kind, PrincipalKind::Service { .. }) {
             return Err(Status::permission_denied(

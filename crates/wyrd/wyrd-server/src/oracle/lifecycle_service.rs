@@ -17,7 +17,7 @@ use wyrd_tonic::wyrd::v1::oracle_lifecycle_service_server::{
 /// Private generated adapter over the process-wide running-query registry.
 pub struct OracleLifecycleGrpc {
     /// Exact verifier used at the private transport boundary.
-    verifier: Arc<crate::state::WyrdTokenVerifier>,
+    verifier: Arc<wyrd_auth_verify::TokenVerifier>,
     /// Canonical process-wide owner-local active-query registry.
     registry: Arc<vala_bifrost_redux::oracle::RunningQueryRegistry>,
 }
@@ -26,7 +26,7 @@ impl OracleLifecycleGrpc {
     /// Creates the owner-local adapter around the canonical registry.
     #[must_use]
     pub fn new(
-        verifier: Arc<crate::state::WyrdTokenVerifier>,
+        verifier: Arc<wyrd_auth_verify::TokenVerifier>,
         runtime: Arc<crate::state::Oracle>,
     ) -> Self {
         Self {
@@ -67,7 +67,6 @@ impl OracleLifecycleGrpc {
         metadata: &wyrd_tonic::tonic::metadata::MetadataMap,
     ) -> Result<Principal, Status> {
         vala_bifrost_redux::gate::auth::authenticate(self.verifier.as_ref(), metadata)
-            .await
             .map(|auth| auth.principal)
             .map_err(|error| Status::unauthenticated(error.to_string()))
     }
@@ -206,7 +205,6 @@ pub(crate) mod pg_tests {
     use wyrd_tonic::wyrd::v1::oracle_lifecycle_service_server::OracleLifecycleService;
 
     use super::OracleLifecycleGrpc;
-    use crate::auth::permission_resolver::SqlPermissionResolver;
     use crate::components::auth::ServerAuth;
     use crate::postgres::ServerPostgres;
 
@@ -228,10 +226,8 @@ pub(crate) mod pg_tests {
         let verifier = Arc::new(TokenVerifier::new(
             keys,
             "wyrd",
-            Arc::new(SqlPermissionResolver::new(Arc::new(app_pool.clone()))),
             WyrdAuthVerifySettings {
                 allowed_clock_skew: StdDuration::ZERO,
-                ..WyrdAuthVerifySettings::default()
             },
         ));
         let issuing_key = Arc::new(
@@ -278,10 +274,14 @@ pub(crate) mod pg_tests {
             card_ref_scope: Default::default(),
         };
         let token = issuer
-            .issue_user_access_token(
-                principal,
-                Vec::<RoleRef>::new(),
-                None,
+            .issue_access_token(
+                wyrd_auth_issue::AccessGrant {
+                    principal,
+                    roles: Vec::<RoleRef>::new(),
+                    permissions: wyrd_runtime::PermissionSet::new(),
+                    credential_id: None,
+                    delegated_by: None,
+                },
                 chrono::Duration::minutes(5),
             )
             .expect("test token signs");
@@ -307,16 +307,20 @@ pub(crate) mod pg_tests {
         card_ref: CardRef,
     ) -> wyrd_tonic::tonic::Request<T> {
         let token = issuer
-            .issue_card_access_token(
-                wyrd_auth_verify::TokenPrincipalRef {
-                    id: PrincipalId::new(uuid::Uuid::now_v7()),
-                    kind: wyrd_spec::auth::PrincipalKindTag::Service,
-                    tenant_id: tenant,
-                    card_ref: Some(card_ref.clone()),
-                    card_ref_scope: CardRefScope::own(&card_ref),
+            .issue_access_token(
+                wyrd_auth_issue::AccessGrant {
+                    principal: wyrd_auth_verify::TokenPrincipalRef {
+                        id: PrincipalId::new(uuid::Uuid::now_v7()),
+                        kind: wyrd_spec::auth::PrincipalKindTag::Service,
+                        tenant_id: tenant,
+                        card_ref: Some(card_ref.clone()),
+                        card_ref_scope: CardRefScope::own(&card_ref),
+                    },
+                    roles: Vec::<RoleRef>::new(),
+                    permissions: wyrd_runtime::PermissionSet::new(),
+                    credential_id: None,
+                    delegated_by: None,
                 },
-                Vec::<RoleRef>::new(),
-                None,
                 chrono::Duration::minutes(5),
             )
             .expect("test Service token signs");

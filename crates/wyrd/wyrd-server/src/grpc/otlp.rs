@@ -179,7 +179,7 @@ where
         let maximum_message_size = self.decoding_limit.for_service(ScribeOtlpService::Traces);
         Box::pin(async move {
             let metadata = MetadataMap::from_headers(request.headers().clone());
-            let auth = match gate.gate().authenticate_otlp_metadata(&metadata).await {
+            let auth = match gate.gate().authenticate_otlp_metadata(&metadata) {
                 Ok(auth) => auth,
                 Err(error) => return Ok(Status::from(error).into_http()),
             };
@@ -383,7 +383,7 @@ where
         let maximum_message_size = self.decoding_limit.for_service(ScribeOtlpService::Metrics);
         Box::pin(async move {
             let metadata = MetadataMap::from_headers(request.headers().clone());
-            let auth = match gate.gate().authenticate_otlp_metadata(&metadata).await {
+            let auth = match gate.gate().authenticate_otlp_metadata(&metadata) {
                 Ok(auth) => auth,
                 Err(error) => return Ok(Status::from(error).into_http()),
             };
@@ -554,7 +554,7 @@ where
         let maximum_message_size = self.decoding_limit.for_service(ScribeOtlpService::Logs);
         Box::pin(async move {
             let metadata = MetadataMap::from_headers(request.headers().clone());
-            let auth = match gate.gate().authenticate_otlp_metadata(&metadata).await {
+            let auth = match gate.gate().authenticate_otlp_metadata(&metadata) {
                 Ok(auth) => auth,
                 Err(error) => return Ok(Status::from(error).into_http()),
             };

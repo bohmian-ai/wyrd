@@ -757,9 +757,15 @@ mod pg_tests {
     /// Seed an active human user, returning its id.
     async fn seed_user(conn: &mut TenantConn<'_>) -> Uuid {
         let user_id = Uuid::new_v4();
-        insert_user(conn, user_id, Some(&format!("{user_id}@test.com")), "oidc", None)
-            .await
-            .expect("user inserts");
+        insert_user(
+            conn,
+            user_id,
+            Some(&format!("{user_id}@test.com")),
+            "oidc",
+            None,
+        )
+        .await
+        .expect("user inserts");
         user_id
     }
 
@@ -807,7 +813,12 @@ mod pg_tests {
             .await
             .expect("role revokes");
         let withdrawn = issuer()
-            .issue(&mut conn, principal, TenantGrant::JwtBearer, "req-withdrawn")
+            .issue(
+                &mut conn,
+                principal,
+                TenantGrant::JwtBearer,
+                "req-withdrawn",
+            )
             .await
             .expect("issuance succeeds");
         assert!(

@@ -61,8 +61,8 @@ impl FromRequestParts<AppState> for Caller {
     ///
     /// # Errors
     /// Returns [`WyrdErrorResponse`] when authentication fails — no usable
-    /// token, an invalid, expired, or revoked one, or a revocation store that
-    /// cannot vouch for it — or when the request carries no request id.
+    /// token, an invalid or expired one, or no configured verifier — or when
+    /// the request carries no request id.
     async fn from_request_parts(
         parts: &mut Parts,
         state: &AppState,
@@ -76,6 +76,7 @@ impl FromRequestParts<AppState> for Caller {
 
 #[cfg(test)]
 mod pg_tests {
+    use crate::components::auth::Caller;
     use axum::extract::FromRequestParts;
     use axum::http::Request;
     use std::sync::Arc;
@@ -88,9 +89,6 @@ mod pg_tests {
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::PrincipalKindTag;
     use wyrd_spec::request_id::RequestId;
-
-    use crate::auth::permission_resolver::SqlPermissionResolver;
-    use crate::components::auth::Caller;
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
     const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n";
@@ -143,10 +141,8 @@ mod pg_tests {
         let verifier = Arc::new(TokenVerifier::new(
             keys,
             "wyrd",
-            Arc::new(SqlPermissionResolver::new(Arc::new(app_pool.clone()))),
             WyrdAuthVerifySettings {
                 allowed_clock_skew: StdDuration::ZERO,
-                ..WyrdAuthVerifySettings::default()
             },
         ));
         let wyrd = wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), None);
@@ -177,7 +173,16 @@ mod pg_tests {
             .issuing_key
             .as_ref()
             .expect("test state has issuing key")
-            .issue_user_access_token(principal, vec![], None, chrono::Duration::minutes(5))
+            .issue_access_token(
+                wyrd_auth_issue::AccessGrant {
+                    principal,
+                    roles: vec![],
+                    permissions: wyrd_runtime::PermissionSet::new(),
+                    credential_id: None,
+                    delegated_by: None,
+                },
+                chrono::Duration::minutes(5),
+            )
             .expect("test jwt mints")
     }
 }

@@ -62,8 +62,8 @@ pub fn cards_router() -> OpenApiRouter<AppState> {
           (WYRD_REGISTRY_404_CARD_NOT_FOUND)", body = WyrdProblem),
         (status = 500, description = "The authorization decision could not be audited \
           (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
-        (status = 503, description = "The registry is unavailable, or the revocation store \
-          could not vouch for the token \
+        (status = 503, description = "The registry is unavailable, or no verifier is \
+          configured for the access token \
           (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
@@ -118,8 +118,8 @@ async fn get_card_http(
           (WYRD_REGISTRY_404_CARD_NOT_FOUND)", body = WyrdProblem),
         (status = 500, description = "The authorization decision could not be audited \
           (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
-        (status = 503, description = "The registry is unavailable, or the revocation store \
-          could not vouch for the token \
+        (status = 503, description = "The registry is unavailable, or no verifier is \
+          configured for the access token \
           (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
@@ -161,8 +161,8 @@ async fn get_card_by_ref_http(
           (WYRD_REGISTRY_404_CARD_NOT_FOUND)", body = WyrdProblem),
         (status = 500, description = "The authorization decision could not be audited \
           (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
-        (status = 503, description = "The registry is unavailable, or the revocation store \
-          could not vouch for the token \
+        (status = 503, description = "The registry is unavailable, or no verifier is \
+          configured for the access token \
           (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
@@ -211,8 +211,8 @@ async fn get_latest_card_http(
          body = WyrdProblem),
         (status = 500, description = "The authorization decision could not be audited \
           (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
-        (status = 503, description = "The registry is unavailable, or the revocation store \
-          could not vouch for the token \
+        (status = 503, description = "The registry is unavailable, or no verifier is \
+          configured for the access token \
           (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
@@ -266,8 +266,8 @@ async fn list_versions_http(
          body = WyrdProblem),
         (status = 500, description = "The authorization decision could not be audited \
           (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
-        (status = 503, description = "The registry is unavailable, or the revocation store \
-          could not vouch for the token \
+        (status = 503, description = "The registry is unavailable, or no verifier is \
+          configured for the access token \
           (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
@@ -304,8 +304,8 @@ async fn list_cards_http(
           (WYRD_REGISTRY_404_CARD_NOT_FOUND)", body = WyrdProblem),
         (status = 500, description = "The authorization decision could not be audited \
           (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
-        (status = 503, description = "The registry is unavailable, or the revocation store \
-          could not vouch for the token \
+        (status = 503, description = "The registry is unavailable, or no verifier is \
+          configured for the access token \
           (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
@@ -354,8 +354,8 @@ async fn list_artifacts_http(
           (WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY)", body = WyrdProblem),
         (status = 500, description = "The authorization decision could not be audited \
           (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
-        (status = 503, description = "The registry is unavailable, or the revocation store \
-          could not vouch for the token \
+        (status = 503, description = "The registry is unavailable, or no verifier is \
+          configured for the access token \
           (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
@@ -437,8 +437,8 @@ pub(crate) async fn register_card_http(
           (WYRD_REGISTRY_410_OPERATION_EXPIRED)", body = WyrdProblem),
         (status = 500, description = "The authorization decision could not be audited \
           (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
-        (status = 503, description = "The registry is unavailable, or the revocation store \
-          could not vouch for the token \
+        (status = 503, description = "The registry is unavailable, or no verifier is \
+          configured for the access token \
           (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem),
         (status = 507, description = "A stored artifact failed verification \
@@ -501,8 +501,8 @@ async fn complete_card_http(
           (WYRD_SPEC_409_CONFLICT)", body = WyrdProblem),
         (status = 500, description = "The authorization decision could not be audited \
           (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
-        (status = 503, description = "The registry is unavailable, or the revocation store \
-          could not vouch for the token \
+        (status = 503, description = "The registry is unavailable, or no verifier is \
+          configured for the access token \
           (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem),
         (status = 507, description = "Stored artifacts could not all be removed \
@@ -570,8 +570,8 @@ async fn delete_card_http(
           (WYRD_SPEC_409_CONFLICT)", body = WyrdProblem),
         (status = 500, description = "The authorization decision could not be audited \
           (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
-        (status = 503, description = "The registry is unavailable, or the revocation store \
-          could not vouch for the token \
+        (status = 503, description = "The registry is unavailable, or no verifier is \
+          configured for the access token \
           (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem),
         (status = 507, description = "Stored artifacts could not all be removed \

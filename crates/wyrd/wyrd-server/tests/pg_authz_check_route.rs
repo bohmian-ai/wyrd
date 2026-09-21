@@ -279,16 +279,20 @@ fn mint_user_jwt(state: &AppState, tenant: DataTenantId) -> String {
         .issuing_key
         .as_ref()
         .expect("composed server carries an issuing key")
-        .issue_user_access_token(
-            TokenPrincipalRef {
-                id: PrincipalId::new(uuid::Uuid::now_v7()),
-                kind: PrincipalKindTag::User,
-                tenant_id: tenant,
-                card_ref: None,
-                card_ref_scope: wyrd_spec::reference::CardRefScope::default(),
+        .issue_access_token(
+            wyrd_auth_issue::AccessGrant {
+                principal: TokenPrincipalRef {
+                    id: PrincipalId::new(uuid::Uuid::now_v7()),
+                    kind: PrincipalKindTag::User,
+                    tenant_id: tenant,
+                    card_ref: None,
+                    card_ref_scope: wyrd_spec::reference::CardRefScope::default(),
+                },
+                roles: Vec::new(),
+                permissions: wyrd_runtime::PermissionSet::new(),
+                credential_id: None,
+                delegated_by: None,
             },
-            Vec::new(),
-            None,
             Duration::minutes(5),
         )
         .expect("user jwt mints")
@@ -305,16 +309,20 @@ fn mint_service_jwt(state: &AppState, tenant: DataTenantId, name: &str) -> Strin
         .issuing_key
         .as_ref()
         .expect("composed server carries an issuing key")
-        .issue_card_access_token(
-            wyrd_auth_verify::TokenPrincipalRef {
-                id: PrincipalId::new(uuid::Uuid::now_v7()),
-                kind: wyrd_spec::auth::PrincipalKindTag::Service,
-                tenant_id: tenant,
-                card_ref: Some(card_ref(CardKind::Service, name)),
-                card_ref_scope: wyrd_spec::reference::CardRefScope::default(),
+        .issue_access_token(
+            wyrd_auth_issue::AccessGrant {
+                principal: wyrd_auth_verify::TokenPrincipalRef {
+                    id: PrincipalId::new(uuid::Uuid::now_v7()),
+                    kind: wyrd_spec::auth::PrincipalKindTag::Service,
+                    tenant_id: tenant,
+                    card_ref: Some(card_ref(CardKind::Service, name)),
+                    card_ref_scope: wyrd_spec::reference::CardRefScope::default(),
+                },
+                roles: Vec::new(),
+                permissions: wyrd_runtime::PermissionSet::new(),
+                credential_id: None,
+                delegated_by: None,
             },
-            Vec::new(),
-            None,
             Duration::minutes(5),
         )
         .expect("service jwt mints")
@@ -349,14 +357,18 @@ fn mint_delegated_service_jwt(state: &AppState, tenant: DataTenantId) -> String 
         .issuing_key
         .as_ref()
         .expect("composed server carries an issuing key")
-        .issue_delegated_access_token(
-            &DelegationCaller {
-                sub: caller.id.to_string(),
-                principal: caller,
-                act: None::<Box<ActClaim>>,
+        .issue_access_token(
+            wyrd_auth_issue::AccessGrant {
+                principal: requested,
+                roles: Vec::<RoleRef>::new(),
+                permissions: wyrd_runtime::PermissionSet::new(),
+                credential_id: None,
+                delegated_by: Some(DelegationCaller {
+                    sub: caller.id.to_string(),
+                    principal: caller,
+                    act: None::<Box<ActClaim>>,
+                }),
             },
-            requested,
-            Vec::<RoleRef>::new(),
             Duration::minutes(5),
         )
         .expect("delegated jwt mints")

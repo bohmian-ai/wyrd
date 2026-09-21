@@ -294,8 +294,7 @@ pub struct Gate<A: GateAudit + 'static> {
     closed: Arc<AtomicBool>,
 }
 
-impl<A: GateAudit + 'static> Clone for Gate<A>
-{
+impl<A: GateAudit + 'static> Clone for Gate<A> {
     /// Share one Gate across transports without cloning its dependencies.
     ///
     /// Every field is either an `Arc` handle or an immutable bound, so a clone
@@ -314,8 +313,7 @@ impl<A: GateAudit + 'static> Clone for Gate<A>
     }
 }
 
-impl<A: GateAudit + 'static> Gate<A>
-{
+impl<A: GateAudit + 'static> Gate<A> {
     /// Requests an exact root-backed decode child from Scribe for the adapter.
     ///
     /// # Errors
@@ -923,8 +921,7 @@ pub fn resolve_fqn(fqn: &str) -> Result<(BifrostNamespace, String), IngestError>
 }
 
 #[wyrd_tonic::tonic::async_trait]
-impl<A: GateAudit + 'static> BifrostIngestService for Gate<A>
-{
+impl<A: GateAudit + 'static> BifrostIngestService for Gate<A> {
     #[tracing::instrument(name = "bifrost.gate.write", skip_all, fields(operation = "write"))]
     async fn insert_batch(
         &self,
@@ -1831,9 +1828,7 @@ mod tests {
     }
 
     /// Builds a query-only Gate: no Scribe, optionally one dispatch seam.
-    fn query_gate(
-        dispatch: Option<Arc<TestQueryDispatch>>,
-    ) -> Gate<RecordingAudit> {
+    fn query_gate(dispatch: Option<Arc<TestQueryDispatch>>) -> Gate<RecordingAudit> {
         let gate = Gate::without_scribe(test_interceptor(), IngestLimits::default());
         match dispatch {
             Some(dispatch) => gate.with_query_dispatch(dispatch),

@@ -493,7 +493,10 @@ mod tests {
     #[test]
     fn issue_access_token_uses_principal_roles_permissions_audience_and_jti_shape() {
         let token = issuing_key()
-            .issue_access_token(grant(user_principal(), vec![role("runtime_admin")]), Duration::minutes(5))
+            .issue_access_token(
+                grant(user_principal(), vec![role("runtime_admin")]),
+                Duration::minutes(5),
+            )
             .expect("token issues");
         let claims = verify_access_token(&token);
 
@@ -534,11 +537,17 @@ mod tests {
     fn issue_access_token_forces_service_card_ref() {
         let card_ref = card_ref(CardKind::Service);
         let token = issuing_key()
-            .issue_access_token(grant(card_principal(
-                    "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b02",
-                    PrincipalKindTag::Service,
-                    CardKind::Service,
-                ), vec![role("service")]), Duration::minutes(5))
+            .issue_access_token(
+                grant(
+                    card_principal(
+                        "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b02",
+                        PrincipalKindTag::Service,
+                        CardKind::Service,
+                    ),
+                    vec![role("service")],
+                ),
+                Duration::minutes(5),
+            )
             .expect("token issues");
         let claims = verify_access_token(&token);
 
@@ -557,11 +566,17 @@ mod tests {
     /// a caller from minting a token whose claimed kind and Card disagree.
     #[test]
     fn issue_access_token_rejects_agent_card_ref_for_a_service() {
-        let result = issuing_key().issue_access_token(grant(card_principal(
-                "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b02",
-                PrincipalKindTag::Service,
-                CardKind::Agent,
-            ), vec![role("service")]), Duration::minutes(5));
+        let result = issuing_key().issue_access_token(
+            grant(
+                card_principal(
+                    "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b02",
+                    PrincipalKindTag::Service,
+                    CardKind::Agent,
+                ),
+                vec![role("service")],
+            ),
+            Duration::minutes(5),
+        );
 
         assert!(matches!(result, Err(IssueError::InvalidCardRef)));
     }
@@ -574,11 +589,17 @@ mod tests {
     fn issue_access_token_forces_agent_card_ref() {
         let card_ref = card_ref(CardKind::Agent);
         let token = issuing_key()
-            .issue_access_token(grant(card_principal(
-                    "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b04",
-                    PrincipalKindTag::Agent,
-                    CardKind::Agent,
-                ), vec![role("agent")]), Duration::minutes(5))
+            .issue_access_token(
+                grant(
+                    card_principal(
+                        "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b04",
+                        PrincipalKindTag::Agent,
+                        CardKind::Agent,
+                    ),
+                    vec![role("agent")],
+                ),
+                Duration::minutes(5),
+            )
             .expect("token issues");
         let claims = verify_access_token(&token);
 
@@ -597,21 +618,33 @@ mod tests {
     /// kind can borrow the other's Card.
     #[test]
     fn issue_access_token_rejects_service_card_ref_for_an_agent() {
-        let result = issuing_key().issue_access_token(grant(card_principal(
-                "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b04",
-                PrincipalKindTag::Agent,
-                CardKind::Service,
-            ), vec![role("agent")]), Duration::minutes(5));
+        let result = issuing_key().issue_access_token(
+            grant(
+                card_principal(
+                    "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b04",
+                    PrincipalKindTag::Agent,
+                    CardKind::Service,
+                ),
+                vec![role("agent")],
+            ),
+            Duration::minutes(5),
+        );
 
         assert!(matches!(result, Err(IssueError::InvalidCardRef)));
     }
 
     #[test]
     fn issue_access_token_rejects_user_with_card_ref() {
-        let result = issuing_key().issue_access_token(grant(TokenPrincipalRef {
-                card_ref: Some(card_ref(CardKind::Service)),
-                ..user_principal()
-            }, vec![role("runtime_admin")]), Duration::minutes(5));
+        let result = issuing_key().issue_access_token(
+            grant(
+                TokenPrincipalRef {
+                    card_ref: Some(card_ref(CardKind::Service)),
+                    ..user_principal()
+                },
+                vec![role("runtime_admin")],
+            ),
+            Duration::minutes(5),
+        );
 
         assert!(matches!(result, Err(IssueError::InvalidCardRef)));
     }
@@ -641,8 +674,8 @@ mod tests {
             .map(|index| role(&format!("role_{index:04}")))
             .collect();
 
-        let result = issuing_key()
-            .issue_access_token(grant(user_principal(), roles), Duration::minutes(5));
+        let result =
+            issuing_key().issue_access_token(grant(user_principal(), roles), Duration::minutes(5));
 
         assert!(matches!(
             result,
@@ -698,20 +731,29 @@ mod tests {
 
     #[test]
     fn issue_access_token_rejects_zero_ttl() {
-        let result = issuing_key().issue_access_token(grant(user_principal(), vec![role("runtime_admin")]), Duration::zero());
+        let result = issuing_key().issue_access_token(
+            grant(user_principal(), vec![role("runtime_admin")]),
+            Duration::zero(),
+        );
         assert!(matches!(result, Err(IssueError::InvalidTtl)));
     }
 
     #[test]
     fn issue_access_token_rejects_negative_ttl() {
-        let result = issuing_key().issue_access_token(grant(user_principal(), vec![role("runtime_admin")]), Duration::minutes(-1));
+        let result = issuing_key().issue_access_token(
+            grant(user_principal(), vec![role("runtime_admin")]),
+            Duration::minutes(-1),
+        );
         assert!(matches!(result, Err(IssueError::InvalidTtl)));
     }
 
     #[test]
     fn issue_access_token_delegated_extends_act_chain() {
         let caller_token = issuing_key()
-            .issue_access_token(grant(user_principal(), vec![role("runtime_admin")]), Duration::minutes(5))
+            .issue_access_token(
+                grant(user_principal(), vec![role("runtime_admin")]),
+                Duration::minutes(5),
+            )
             .expect("caller token issues");
         let raw = verify_access_token(&caller_token);
         let caller = DelegationCaller {
@@ -720,7 +762,13 @@ mod tests {
             act: raw.act.clone(),
         };
         let delegated_token = issuing_key()
-            .issue_access_token(AccessGrant { delegated_by: Some(caller), ..grant(agent_principal(), vec![role("agent")]) }, Duration::minutes(5))
+            .issue_access_token(
+                AccessGrant {
+                    delegated_by: Some(caller),
+                    ..grant(agent_principal(), vec![role("agent")])
+                },
+                Duration::minutes(5),
+            )
             .expect("delegated token issues");
         let delegated_claims = verify_access_token(&delegated_token);
         let act = delegated_claims.act.as_ref().expect("act chain is present");
@@ -741,7 +789,13 @@ mod tests {
             act: Some(Box::new(act_chain(MAX_DELEGATION_DEPTH))),
         };
 
-        let result = issuing_key().issue_access_token(AccessGrant { delegated_by: Some(caller), ..grant(agent_principal(), vec![role("agent")]) }, Duration::minutes(5));
+        let result = issuing_key().issue_access_token(
+            AccessGrant {
+                delegated_by: Some(caller),
+                ..grant(agent_principal(), vec![role("agent")])
+            },
+            Duration::minutes(5),
+        );
 
         assert!(matches!(
             result,
@@ -759,7 +813,13 @@ mod tests {
             act: Some(Box::new(act_chain(MAX_DELEGATION_DEPTH - 1))),
         };
 
-        let result = issuing_key().issue_access_token(AccessGrant { delegated_by: Some(caller), ..grant(agent_principal(), vec![role("agent")]) }, Duration::minutes(5));
+        let result = issuing_key().issue_access_token(
+            AccessGrant {
+                delegated_by: Some(caller),
+                ..grant(agent_principal(), vec![role("agent")])
+            },
+            Duration::minutes(5),
+        );
 
         assert!(result.is_ok());
     }
@@ -836,7 +896,10 @@ mod tests {
             public_key_from_pem(derived_pem.as_bytes()).expect("derived public key loads");
 
         let token = key
-            .issue_access_token(grant(user_principal(), vec![role("runtime_admin")]), Duration::minutes(5))
+            .issue_access_token(
+                grant(user_principal(), vec![role("runtime_admin")]),
+                Duration::minutes(5),
+            )
             .expect("token issues");
         let claims = verify_eddsa::<AccessTokenClaims>(&token, &decoding, Some("wyrd"))
             .expect("token verifies against the derived public key");
@@ -857,7 +920,10 @@ mod tests {
         .expect("derived public key loads");
 
         let token = key
-            .issue_access_token(grant(user_principal(), vec![role("runtime_admin")]), Duration::minutes(5))
+            .issue_access_token(
+                grant(user_principal(), vec![role("runtime_admin")]),
+                Duration::minutes(5),
+            )
             .expect("token issues");
         let claims = verify_eddsa::<AccessTokenClaims>(&token, &decoding, Some("wyrd"))
             .expect("token verifies against the generated key's derived public key");

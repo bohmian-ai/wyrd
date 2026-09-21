@@ -44,8 +44,8 @@ use crate::state::AppState;
         (status = 500, description = "The request context could not be assembled, or the \
           decision could not be audited (WYRD_SPEC_500_INTERNAL, \
           WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
-        (status = 503, description = "Authentication is unconfigured, or the revocation store \
-          could not vouch for the token \
+        (status = 503, description = "Authentication is unconfigured, or no verifier is \
+          configured for the access token \
           (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Authz"
@@ -58,14 +58,12 @@ pub async fn check_authz(
 ) -> Result<Json<AuthzCheckResponse>, WyrdErrorResponse> {
     let token = extract_wyrd_access_token(&headers)?;
     let expected_tenant = tenant_from_unverified_access_token(token.expose_secret())?;
-    let verifier = state
+    let verified = state
         .auth
         .token_verifier
-        .clone()
-        .ok_or_else(auth_not_configured)?;
-    let verified = verifier
+        .as_deref()
+        .ok_or_else(auth_not_configured)?
         .verify(&token, &expected_tenant)
-        .await
         .map_err(WyrdErrorResponse::from)?;
 
     match guard_reason(&verified.principal, verified.delegation_chain.len()) {

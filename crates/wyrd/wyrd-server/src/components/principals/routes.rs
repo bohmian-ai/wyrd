@@ -28,8 +28,8 @@ use wyrd_spec::vala::api::AuditOutcome;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
     ApiKeyMetadataRow, credential_belongs_to, grant_role_to_service_account, insert_api_key,
-    insert_service_account, list_api_key_metadata, revoke_api_key,
-    revoke_service_account_principal, role_by_name, service_account_by_id, user_by_id,
+    insert_service_account, list_api_key_metadata, revoke_api_key, role_by_name,
+    service_account_by_id, user_by_id,
 };
 
 use crate::audit;
@@ -263,7 +263,7 @@ async fn mint_credential(
         (status = 500, description = "A tenant store read or write failed, or the authorization \
           decision could not be audited (WYRD_SPEC_500_INTERNAL, \
           WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
-        (status = 503, description = "The revocation store could not vouch for the token (\
+        (status = 503, description = "No verifier is configured for the access token (\
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Principals"
@@ -360,7 +360,7 @@ async fn create_service_principal(
         (status = 500, description = "A tenant store read or write failed, or the authorization \
           decision could not be audited (WYRD_SPEC_500_INTERNAL, \
           WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
-        (status = 503, description = "The revocation store could not vouch for the token (\
+        (status = 503, description = "No verifier is configured for the access token (\
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Principals"
@@ -407,7 +407,7 @@ async fn issue_credential(
         (status = 500, description = "A tenant store read or write failed, or the authorization \
           decision could not be audited (WYRD_SPEC_500_INTERNAL, \
           WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
-        (status = 503, description = "The revocation store could not vouch for the token (\
+        (status = 503, description = "No verifier is configured for the access token (\
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Principals"
@@ -462,21 +462,12 @@ pub(crate) async fn list_credentials_for(
 
 /// Revoke one credential, leaving the principal and its roles untouched.
 ///
-/// Revocation has to mean two things, and marking the credential row only
-/// achieves the first: the credential can mint no new token, *and* the tokens
-/// it already minted stop working. The second is the one that matters when a
-/// credential leaks, and a bearer token is useful to whoever holds it for its
-/// whole lifetime. So this also advances the principal's revocation epoch,
-/// which the verifier checks on every request.
+/// Revocation retires the credential so it can mint no new token. Tenant
+/// tokens are self-contained and short-lived, so a token the credential already
+/// minted keeps authorizing until it expires — at most one access-token TTL —
+/// while the principal's other credentials are unaffected and keep working.
 ///
-/// That epoch is per-principal, which is the granularity the schema offers, so
-/// it also invalidates live tokens minted by the principal's *other*
-/// credentials. That does not reintroduce a rotation gap — a surviving
-/// credential re-exchanges immediately — and the alternative, letting a leaked
-/// credential's tokens outlive their revocation, is not a trade worth making.
-///
-/// Both writes are in one transaction: a credential marked revoked whose tokens
-/// still authorize is precisely the state this exists to prevent.
+/// The retirement and its audited authorization decision commit together.
 ///
 /// # Errors
 /// Returns a stable Wyrd error when the caller is unauthorized, the credential
@@ -501,7 +492,7 @@ pub(crate) async fn list_credentials_for(
         (status = 500, description = "A tenant store read or write failed, or the authorization \
           decision could not be audited (WYRD_SPEC_500_INTERNAL, \
           WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
-        (status = 503, description = "The revocation store could not vouch for the token (\
+        (status = 503, description = "No verifier is configured for the access token (\
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Principals"
@@ -521,8 +512,7 @@ async fn revoke_credential(
 /// Retire one credential.
 ///
 /// The operation behind both the HTTP route and the MCP tool. See the route
-/// documentation above for why revocation advances the principal's epoch and
-/// what that costs.
+/// documentation above for what retirement does and does not stop.
 ///
 /// # Errors
 /// Returns a stable Wyrd error when the caller is unauthorized, the credential
@@ -557,10 +547,8 @@ pub(crate) async fn revoke_credential_for(
         return Err(WyrdError::from(not_found()));
     }
 
-    // Nothing after this point runs unless *this* call is the one that retires
-    // the credential. Advancing the epoch is not idempotent in effect — it
-    // kills every live token the principal holds — so a replayed revoke must
-    // not do it a second time.
+    // An already-retired credential renders as not found, so a replayed revoke
+    // learns nothing a first call would not have told it.
     if !revoke_api_key(&mut conn, credential_id)
         .await
         .map_err(|error| WyrdError::from(internal(error)))?
@@ -571,9 +559,6 @@ pub(crate) async fn revoke_credential_for(
         return Err(WyrdError::from(not_found()));
     }
 
-    revoke_service_account_principal(&mut conn, principal_id)
-        .await
-        .map_err(|error| WyrdError::from(internal(error)))?;
     conn.commit()
         .await
         .map_err(|error| WyrdError::from(internal(error)))?;

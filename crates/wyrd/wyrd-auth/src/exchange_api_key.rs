@@ -37,7 +37,7 @@ pub struct DelegateToken {
     /// The shared tenant issuance workflow.
     pub issuer: TenantTokenIssuer,
     /// Wyrd access-token verifier for the caller's subject token.
-    pub verifier: TokenVerifier,
+    pub verifier: std::sync::Arc<TokenVerifier>,
     /// Permission checker.
     pub permission_check: std::sync::Arc<dyn PermissionCheck>,
 }
@@ -483,7 +483,11 @@ mod pg_tests {
         decoding_keys.insert(Kid::new("k1").expect("kid is valid"), Arc::new(public_key));
         DelegateToken {
             issuer: test_issuer(),
-            verifier: TokenVerifier::new(decoding_keys, "wyrd", WyrdAuthVerifySettings::default()),
+            verifier: Arc::new(TokenVerifier::new(
+                decoding_keys,
+                "wyrd",
+                WyrdAuthVerifySettings::default(),
+            )),
             permission_check: Arc::new(RbacCheck),
         }
     }
@@ -974,6 +978,60 @@ mod pg_tests {
         insert_live_api_key(conn, tenant, sa_id, created_by).await.1
     }
 
+    /// Seed a live service-account API key in a second tenant, then suspend
+    /// that tenant so it no longer admits credentials.
+    ///
+    /// Admission is decided on the presented key's own tenant, so the refusal
+    /// under test needs a key whose tenant exists, held a live credential, and
+    /// was suspended afterwards. Returns the suspended tenant and the key.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any seed write, commit, or the suspension fails.
+    async fn seed_unadmitted_tenant_key(
+        fixture: &PgFixture,
+        card_ref: &CardRef,
+    ) -> (DataTenantId, SecretString) {
+        let unadmitted_tenant = fixture
+            .seed_additional_tenant("unadmitted")
+            .await
+            .expect("second tenant seeds");
+        let mut unadmitted_conn = fixture
+            .tenant_conn_for(unadmitted_tenant)
+            .await
+            .expect("unadmitted tenant conn opens");
+        let unadmitted_user = insert_test_user(&mut unadmitted_conn, unadmitted_tenant).await;
+        let unadmitted_sa = insert_test_service_account(
+            &mut unadmitted_conn,
+            unadmitted_tenant,
+            unadmitted_user,
+            card_ref,
+        )
+        .await;
+        let (_, unadmitted) = insert_live_api_key(
+            &mut unadmitted_conn,
+            unadmitted_tenant,
+            unadmitted_sa,
+            unadmitted_user,
+        )
+        .await;
+        unadmitted_conn
+            .commit()
+            .await
+            .expect("second tenant seed commits");
+        sqlx::query("UPDATE platform.tenants SET status = 'suspended' WHERE data_tenant_id = $1")
+            .bind(unadmitted_tenant.as_uuid())
+            .execute(
+                &fixture
+                    .superuser_pool()
+                    .await
+                    .expect("superuser pool opens"),
+            )
+            .await
+            .expect("second tenant suspends");
+        (unadmitted_tenant, unadmitted)
+    }
+
     /// Every refusal path pays for exactly one Argon2 verification.
     ///
     /// The refusal-then-verify order in [`ExchangeApiKey::execute`] is what makes
@@ -1060,35 +1118,7 @@ mod pg_tests {
         // Admission is decided on the presented key's own tenant, so the key
         // lives in a second tenant that is suspended once it holds a live
         // credential; the shared issuer then refuses it after verification.
-        let unadmitted_tenant = fixture
-            .seed_additional_tenant("unadmitted")
-            .await
-            .expect("second tenant seeds");
-        let mut unadmitted_conn = fixture
-            .tenant_conn_for(unadmitted_tenant)
-            .await
-            .expect("unadmitted tenant conn opens");
-        let unadmitted_user = insert_test_user(&mut unadmitted_conn, unadmitted_tenant).await;
-        let unadmitted_sa = insert_test_service_account(
-            &mut unadmitted_conn,
-            unadmitted_tenant,
-            unadmitted_user,
-            &card_ref,
-        )
-        .await;
-        let (_, unadmitted) = insert_live_api_key(
-            &mut unadmitted_conn,
-            unadmitted_tenant,
-            unadmitted_sa,
-            unadmitted_user,
-        )
-        .await;
-        unadmitted_conn.commit().await.expect("second tenant seed commits");
-        sqlx::query("UPDATE platform.tenants SET status = 'suspended' WHERE data_tenant_id = $1")
-            .bind(unadmitted_tenant.as_uuid())
-            .execute(&fixture.superuser_pool().await.expect("superuser pool opens"))
-            .await
-            .expect("second tenant suspends");
+        let (unadmitted_tenant, unadmitted) = seed_unadmitted_tenant_key(&fixture, &card_ref).await;
         let mut unadmitted_conn = fixture
             .tenant_conn_for(unadmitted_tenant)
             .await

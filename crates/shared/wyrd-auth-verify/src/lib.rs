@@ -148,7 +148,6 @@ impl Default for WyrdAuthVerifySettings {
     }
 }
 
-
 /// A federated identity verified against one trusted issuer.
 ///
 /// Deliberately tenant-free: it states what the issuer asserted, not where the
@@ -548,7 +547,6 @@ impl<I: IssuerConfigResolver> ExternalVerifier<I> {
     }
 }
 
-
 /// Resolved Wyrd access-token claims.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -588,7 +586,6 @@ pub struct AccessTokenClaims {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cid: Option<String>,
 }
-
 
 /// Claims carried by a platform-scope access token.
 ///
@@ -765,7 +762,6 @@ impl AccessTokenClaims {
         })
     }
 }
-
 
 /// Resolve the wire principal-kind tag and Card binding into a `PrincipalKind`.
 ///
@@ -1078,9 +1074,7 @@ mod tests {
             ..claims_with_times(now() + 3_600, now())
         };
 
-        let verified = claims
-            .into_verified()
-            .expect("claims convert");
+        let verified = claims.into_verified().expect("claims convert");
 
         assert!(
             verified
@@ -1114,9 +1108,7 @@ mod tests {
             ..claims_with_times(now() + 3_600, now())
         };
 
-        let verified = claims
-            .into_verified()
-            .expect("card-free service resolves");
+        let verified = claims.into_verified().expect("card-free service resolves");
 
         assert!(matches!(
             verified.principal.kind,
@@ -1199,9 +1191,7 @@ mod tests {
             ..claims_with_times(now() + 3_600, now())
         };
 
-        let verified = claims
-            .into_verified()
-            .expect("agent claims verify");
+        let verified = claims.into_verified().expect("agent claims verify");
 
         assert!(matches!(
             verified.principal.kind,
@@ -1847,9 +1837,7 @@ mod tests {
         let issuer = IssuerUrl::new(EXTERNAL_ISSUER).expect("test issuer is valid");
         let tid = tenant_id();
         let trusted = make_trusted_issuer(tid, issuer, EXTERNAL_AUDIENCE, jwks_uri);
-        let v = with_external_issuer(trusted,
-            make_jwks_cache(),
-        );
+        let v = with_external_issuer(trusted, make_jwks_cache());
 
         let claims = external_claims(EXTERNAL_ISSUER, "wrong-audience", now() + 3_600, now());
         let token = encode_external_token(&claims, EXTERNAL_KID);
@@ -1877,7 +1865,6 @@ mod tests {
         let tid = tenant_id();
         let settings = WyrdAuthVerifySettings {
             allowed_clock_skew: Duration::ZERO,
-            ..WyrdAuthVerifySettings::default()
         };
         let trusted = make_trusted_issuer(tid, issuer, EXTERNAL_AUDIENCE, jwks_uri);
         let stub = Arc::new(StubIssuerResolver::new(vec![trusted]));
@@ -1906,9 +1893,7 @@ mod tests {
         let issuer = IssuerUrl::new(EXTERNAL_ISSUER).expect("test issuer is valid");
         let tid = tenant_id();
         let trusted = make_trusted_issuer(tid, issuer, EXTERNAL_AUDIENCE, jwks_uri);
-        let v = with_external_issuer(trusted,
-            make_jwks_cache(),
-        );
+        let v = with_external_issuer(trusted, make_jwks_cache());
 
         let claims = external_claims(EXTERNAL_ISSUER, EXTERNAL_AUDIENCE, now() + 3_600, now());
         let token = encode_external_token(&claims, EXTERNAL_KID);
@@ -1953,7 +1938,11 @@ mod tests {
             make_trusted_issuer(tid, issuer.clone(), EXTERNAL_AUDIENCE, jwks_uri.clone());
         let stub = Arc::new(StubIssuerResolver::new(vec![trusted_for_old]));
         {
-            let v = ExternalVerifier::new(Arc::clone(&jwks), Arc::clone(&stub), WyrdAuthVerifySettings::default());
+            let v = ExternalVerifier::new(
+                Arc::clone(&jwks),
+                Arc::clone(&stub),
+                WyrdAuthVerifySettings::default(),
+            );
             let old_claims =
                 external_claims(EXTERNAL_ISSUER, EXTERNAL_AUDIENCE, now() + 3_600, now());
             let old_token = encode_external_token(&old_claims, old_kid);

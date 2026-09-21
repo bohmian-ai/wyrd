@@ -39,17 +39,16 @@ use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
 use vala_sql::queries::oracle_reader_authority::OracleTableProtections;
 use vala_sql::row_types::oracle_reader_authority::{ProtectionRecord, TableAuthorityIdentity};
-use wyrd_auth::exchange_api_key::{ExchangeApiKey, TokenExchangeSettings};
+use wyrd_auth::exchange_api_key::ExchangeApiKey;
+use wyrd_auth::issuance::{TenantGrant, TenantTokenIssuer, TokenExchangeSettings};
 use wyrd_auth::issue_api_key::WyrdApiKey;
-use wyrd_auth::permission_resolver::SqlPermissionResolver;
 use wyrd_auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
-use wyrd_auth::revocation_resolver::SqlRevocationCheck;
 use wyrd_auth::seed::seed_builtin_roles_for_tenant;
 use wyrd_auth_check::{AuthzCheckRequest, AuthzCheckResponse, PolicyHook};
 use wyrd_auth_issue::IssuingKey;
 use wyrd_auth_oidc::JwksCache;
 use wyrd_auth_verify::{
-    Kid, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem,
+    ExternalVerifier, Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem,
 };
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
@@ -57,7 +56,7 @@ use wyrd_crypt::SecretKey;
 use wyrd_dev_fixtures::pg::PgFixture;
 #[cfg(test)]
 use wyrd_runtime::PermissionSet;
-use wyrd_runtime::{Permission, PrincipalId, RbacCheck, RoleRef};
+use wyrd_runtime::{Permission, PrincipalId, RbacCheck};
 use wyrd_semver::VersionBlock;
 use wyrd_server::boot::build_workload_bindings;
 use wyrd_server::boot::data_root::BifrostDataRoot;
@@ -142,7 +141,6 @@ impl OraclePeerCredentials for TestOraclePeerCredentials {
     }
 }
 
-use wyrd_spec::auth::PrincipalKindTag;
 use wyrd_spec::auth::{
     RequestedSubject, SecretBearer, SubjectTokenType, TokenRequest, TokenResponse,
 };
@@ -248,7 +246,6 @@ struct WyrdTestServerInner {
     bifrost_data_root: BifrostDataRoot,
     state: AppState,
     router: axum::Router,
-    verifier: Arc<TokenVerifier<SqlPermissionResolver, PgIssuerResolver>>,
     issuing_key: Arc<IssuingKey>,
     api_key: SecretString,
     forge_publisher: StagingFilePublisher,
@@ -2336,28 +2333,27 @@ impl WyrdTestServer {
         for role in roles {
             grant_role(&mut conn, user_id, PrincipalTable::User, role).await?;
         }
-        conn.commit().await.map_err(sql)?;
-
-        let principal = TokenPrincipalRef {
-            id: PrincipalId::new(user_id),
-            kind: PrincipalKindTag::User,
-            tenant_id: self.data_tenant_id(),
-            card_ref: None,
-            card_ref_scope: Default::default(),
-        };
-        let jwt = self
+        // Mint through the production login grant so the token carries the
+        // permissions the server itself would sign for these roles.
+        let issuer = self
             .inner
-            .issuing_key
-            .issue_user_access_token(
-                principal,
-                role_refs(roles)?,
-                None,
-                chrono::Duration::minutes(15),
+            .state
+            .auth
+            .tenant_issuer()
+            .ok_or_else(|| WyrdTestServerError::Auth("no issuing key".to_owned()))?;
+        let exchanged = issuer
+            .issue(
+                &mut conn,
+                user_id,
+                TenantGrant::OidcLogin,
+                "test-bootstrap-user",
             )
+            .await
             .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?;
+        conn.commit().await.map_err(sql)?;
         Ok(Bootstrap::User {
             id: PrincipalId::new(user_id),
-            jwt,
+            jwt: exchanged.access_token.expose_secret().to_owned(),
         })
     }
 
@@ -2566,22 +2562,6 @@ impl WyrdTestServer {
             }
         }
         conn.commit().await.map_err(sql)
-    }
-
-    /// Force the verifier to re-read permissions for this exact JWT.
-    pub async fn force_recheck(&self, jwt: &str) {
-        self.inner
-            .verifier
-            .invalidate(&SecretString::from(jwt.to_owned()))
-            .await;
-    }
-
-    /// Force the verifier to re-read permissions for this principal.
-    pub async fn force_recheck_principal(&self, principal: &Bootstrap) {
-        self.inner
-            .verifier
-            .invalidate_principal(principal.id())
-            .await;
     }
 
     /// Exchange an API key through the real `/auth/token` route.
@@ -3021,9 +3001,12 @@ impl WyrdTestServer {
         bearer: String,
     ) -> Result<PermissionSet, WyrdTestServerError> {
         self.inner
-            .verifier
+            .state
+            .auth
+            .token_verifier
+            .as_deref()
+            .ok_or_else(|| WyrdTestServerError::Auth("no token verifier".to_owned()))?
             .verify(&SecretString::from(bearer), &DataTenantId::SYSTEM_OWNER)
-            .await
             .map(|verified| verified.principal.effective_permissions.clone())
             .map_err(|error| WyrdTestServerError::Auth(error.to_string()))
     }
@@ -3390,7 +3373,7 @@ impl WyrdTestServerBuilder {
     /// Override the access token TTL for all exchange paths.
     ///
     /// Use this in TTL-expiry journey tests to mint short-lived tokens without
-    /// waiting for the 15-minute production default. Pair with
+    /// waiting for the five-minute production default. Pair with
     /// [`Self::with_auth_verify_settings`] to reduce the clock-skew tolerance.
     #[must_use]
     pub fn with_access_ttl(mut self, ttl: ChronoDuration) -> Self {
@@ -3400,9 +3383,8 @@ impl WyrdTestServerBuilder {
 
     /// Replace the token verifier settings.
     ///
-    /// Use this to reduce `allowed_clock_skew` and `cache_ttl` to near-zero for
-    /// TTL journey tests so a real `exp` can be observed without a multi-minute
-    /// sleep.
+    /// Use this to reduce `allowed_clock_skew` to near-zero for TTL journey
+    /// tests so a real `exp` can be observed without a multi-minute sleep.
     #[must_use]
     pub fn with_auth_verify_settings(mut self, settings: WyrdAuthVerifySettings) -> Self {
         self.auth_verify_settings = Some(settings);
@@ -3785,9 +3767,6 @@ impl WyrdTestServerBuilder {
                     .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
             ),
         );
-        let resolver = Arc::new(SqlPermissionResolver::new(Arc::new(
-            runtime_wyrd.app_pool().clone(),
-        )));
         let verify_settings = self.auth_verify_settings.unwrap_or_default();
 
         // Postgres-backed boot, mirroring a self-hosted deployment: discover and
@@ -3819,20 +3798,20 @@ impl WyrdTestServerBuilder {
             runtime_wyrd.app_pool().clone(),
         )));
 
-        // The production constructor: the epoch is read fresh on every verify.
-        let revocation = SqlRevocationCheck::new(Arc::new(runtime_wyrd.app_pool().clone()));
-        let verifier = Arc::new(
-            TokenVerifier::new(decoding_keys, "wyrd", resolver, verify_settings)
-                .with_revocation(Arc::new(revocation))
-                .with_external(
-                    Arc::new(JwksCache::new(
-                        wyrd_auth_oidc::ScreenedHttp::allowing_internal(),
-                        Duration::from_secs(300),
-                        Duration::from_secs(5),
-                    )),
-                    Arc::clone(&issuer_resolver),
-                ),
-        );
+        let verifier = Arc::new(TokenVerifier::new(
+            decoding_keys,
+            "wyrd",
+            verify_settings.clone(),
+        ));
+        let external_verifier = Arc::new(ExternalVerifier::new(
+            Arc::new(JwksCache::new(
+                wyrd_auth_oidc::ScreenedHttp::allowing_internal(),
+                Duration::from_secs(300),
+                Duration::from_secs(5),
+            )),
+            Arc::clone(&issuer_resolver),
+            verify_settings,
+        ));
 
         let exchange_settings = if let Some(ttl) = self.access_ttl {
             TokenExchangeSettings {
@@ -4142,6 +4121,7 @@ impl WyrdTestServerBuilder {
                 allow_preview: self.allow_preview_auth,
                 issuing_key: Some(Arc::clone(&issuing_key)),
                 token_verifier: (!self.omit_token_verifier).then(|| Arc::clone(&verifier)),
+                external_verifier: Some(external_verifier),
                 token_exchange_settings: exchange_settings,
                 trusted_issuer_resolver: Some(issuer_resolver),
                 workload_binding_resolver: Some(binding_resolver),
@@ -4170,7 +4150,6 @@ impl WyrdTestServerBuilder {
                 bifrost_data_root,
                 state,
                 router,
-                verifier,
                 issuing_key,
                 api_key: SecretString::from(String::new()),
                 forge_publisher,
@@ -4640,8 +4619,7 @@ pub(crate) async fn oracle_peer_credentials_from_key(
         tenant_id,
         api_key,
         exchange: ExchangeApiKey {
-            issuing_key,
-            settings: TokenExchangeSettings::default(),
+            issuer: TenantTokenIssuer::new(issuing_key, TokenExchangeSettings::default()),
         },
         bearer: tokio::sync::Mutex::new(None),
     });
@@ -4671,15 +4649,6 @@ async fn lookup_role_id(
 fn fixture_admin_id(tenant_id: DataTenantId) -> Uuid {
     const BASE: u128 = 0x018f_0000_0000_7000_8000_0000_0000_0001;
     Uuid::from_u128(BASE ^ tenant_id.as_uuid().as_u128())
-}
-
-fn role_refs(roles: &[&str]) -> Result<Vec<RoleRef>, WyrdTestServerError> {
-    roles
-        .iter()
-        .map(|role| {
-            RoleRef::new(role).map_err(|error| WyrdTestServerError::Auth(error.to_string()))
-        })
-        .collect()
 }
 
 fn card_ref(kind: CardKind, name: &str) -> Result<CardRef, WyrdTestServerError> {

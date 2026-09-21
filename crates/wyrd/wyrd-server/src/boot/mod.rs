@@ -1473,8 +1473,8 @@ async fn install_auth(
     // Postgres is the single source of issuer/binding resolution. Both resolvers
     // are always attached; an empty config simply means the tenant federates no
     // issuers and binds no workloads, which they resolve as empty results. The
-    // issuer resolver also feeds the token verifier's external (foreign-OIDC)
-    // path so federated tokens can be exchanged per-request.
+    // issuer resolver also feeds the issuance-side external (foreign-OIDC)
+    // verifier so federated tokens can be exchanged for Wyrd tokens.
     let issuer_resolver = Arc::new(PgIssuerResolver::new(
         Arc::new(postgres.app_pool().clone()),
         sealing_key.clone(),
@@ -1483,21 +1483,21 @@ async fn install_auth(
         postgres.app_pool().clone(),
     )));
 
-    let (issuing_key, verifier) = crate::boot::auth::build_auth_handles(
+    let handles = crate::boot::auth::build_auth_handles(
         signing_key,
-        postgres.app_pool(),
         Arc::clone(&issuer_resolver),
         config.deployment_profile.screened_http(),
     )?;
 
     Ok(ServerAuth {
         allow_preview: config.auth.allow_preview,
-        issuing_key: Some(issuing_key),
-        token_verifier: Some(verifier),
+        issuing_key: Some(handles.issuing_key),
+        token_verifier: Some(handles.token_verifier),
+        external_verifier: Some(handles.external_verifier),
         trusted_issuer_resolver: Some(Arc::clone(&issuer_resolver)),
         workload_binding_resolver: Some(binding_resolver),
         sealing_key: sealing_key.clone(),
-        token_exchange_settings: crate::auth::exchange_api_key::TokenExchangeSettings::default(),
+        token_exchange_settings: wyrd_auth::issuance::TokenExchangeSettings::default(),
     })
 }
 
@@ -1524,7 +1524,7 @@ struct OracleRoleBuilder<'a> {
     /// Root-derived selected-role resource graph.
     resources: BifrostRoleResources,
     /// Exact boot-constructed token verifier used for peer preflight.
-    token_verifier: Arc<crate::state::WyrdTokenVerifier>,
+    token_verifier: Arc<wyrd_auth_verify::TokenVerifier>,
     /// Validated Bifrost configuration borrowed for this activation.
     config: &'a crate::config::BifrostRuntimeConfig,
     /// Closed process target controlling Oracle selection.
@@ -1741,7 +1741,6 @@ impl<'a> OracleRoleBuilder<'a> {
         metadata.insert("x-wyrd-access-token", bearer);
         let authenticated =
             vala_bifrost_redux::gate::auth::authenticate(token_verifier.as_ref(), &metadata)
-                .await
                 .map_err(|_| {
                     ServerBootError::OraclePeer("Oracle peer access token was rejected".to_owned())
                 })?;

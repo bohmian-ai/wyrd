@@ -226,8 +226,8 @@ where
         (status = 500, description = "Ingest failed internally, or the decision could not be \
           audited (WYRD_VALA_500_BIFROST_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)",
          body = WyrdProblem),
-        (status = 503, description = "The writer is unavailable, or the revocation store could \
-          not vouch for the token (WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE, \
+        (status = 503, description = "The writer is unavailable, or no verifier is configured \
+          for the access token (WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem),
         (status = 507, description = "The write-ahead log is out of disk \
           (WYRD_VALA_507_WAL_DISK_FULL)", body = WyrdProblem)
@@ -347,8 +347,8 @@ async fn export_traces(
         (status = 500, description = "Ingest failed internally, or the decision could not be \
           audited (WYRD_VALA_500_BIFROST_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)",
          body = WyrdProblem),
-        (status = 503, description = "The writer is unavailable, or the revocation store could \
-          not vouch for the token (WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE, \
+        (status = 503, description = "The writer is unavailable, or no verifier is configured \
+          for the access token (WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem),
         (status = 507, description = "The write-ahead log is out of disk \
           (WYRD_VALA_507_WAL_DISK_FULL)", body = WyrdProblem)
@@ -469,8 +469,8 @@ async fn export_metrics(
         (status = 500, description = "Ingest failed internally, or the decision could not be \
           audited (WYRD_VALA_500_BIFROST_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)",
          body = WyrdProblem),
-        (status = 503, description = "The writer is unavailable, or the revocation store could \
-          not vouch for the token (WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE, \
+        (status = 503, description = "The writer is unavailable, or no verifier is configured \
+          for the access token (WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem),
         (status = 507, description = "The write-ahead log is out of disk \
           (WYRD_VALA_507_WAL_DISK_FULL)", body = WyrdProblem)

@@ -282,8 +282,8 @@ struct BindingFilter {
         (status = 500, description = "The sealing key or a tenant store write failed, or the \
           decision could not be audited (WYRD_SPEC_500_INTERNAL, \
           WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
-        (status = 503, description = "OIDC discovery or the store is unavailable, or the \
-          revocation store could not vouch for the token \
+        (status = 503, description = "OIDC discovery or the store is unavailable, or no \
+          verifier is configured for the access token \
           (WYRD_AUTH_503_DISCOVERY_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
@@ -368,8 +368,8 @@ async fn create_trusted_issuer(
         (status = 500, description = "A tenant store read or write failed, or the decision \
           could not be audited (WYRD_SPEC_500_INTERNAL, \
           WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
-        (status = 503, description = "The store is unavailable, or the revocation store could \
-          not vouch for the token (\
+        (status = 503, description = "The store is unavailable, or no verifier is configured \
+          for the access token (\
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Admin"
@@ -438,8 +438,8 @@ async fn list_trusted_issuers(
         (status = 500, description = "A tenant store read or write failed, or the decision \
           could not be audited (WYRD_SPEC_500_INTERNAL, \
           WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
-        (status = 503, description = "The store is unavailable, or the revocation store could \
-          not vouch for the token (\
+        (status = 503, description = "The store is unavailable, or no verifier is configured \
+          for the access token (\
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Admin"
@@ -526,8 +526,8 @@ async fn delete_trusted_issuer_route(
         (status = 500, description = "A tenant store read or write failed, or the decision \
           could not be audited (WYRD_SPEC_500_INTERNAL, \
           WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
-        (status = 503, description = "The store is unavailable, or the revocation store could \
-          not vouch for the token (\
+        (status = 503, description = "The store is unavailable, or no verifier is configured \
+          for the access token (\
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Admin"
@@ -599,8 +599,8 @@ async fn create_workload_binding(
         (status = 500, description = "A tenant store read or write failed, or the decision \
           could not be audited (WYRD_SPEC_500_INTERNAL, \
           WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
-        (status = 503, description = "The store is unavailable, or the revocation store could \
-          not vouch for the token (\
+        (status = 503, description = "The store is unavailable, or no verifier is configured \
+          for the access token (\
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Admin"
@@ -668,8 +668,8 @@ async fn list_workload_bindings(
         (status = 500, description = "A tenant store read or write failed, or the decision \
           could not be audited (WYRD_SPEC_500_INTERNAL, \
           WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
-        (status = 503, description = "The store is unavailable, or the revocation store could \
-          not vouch for the token (\
+        (status = 503, description = "The store is unavailable, or no verifier is configured \
+          for the access token (\
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Admin"

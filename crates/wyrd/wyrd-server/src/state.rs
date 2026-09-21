@@ -30,8 +30,6 @@ use wyrd_storage::StorageHandle;
 use wyrd_telemetry::TelemetryGuard;
 use wyrd_tonic::tonic_health::server::HealthReporter;
 
-use crate::auth::permission_resolver::SqlPermissionResolver;
-use crate::auth::pg_resolvers::PgIssuerResolver;
 use crate::bifrost::gate_audit::PostgresGateAudit;
 use crate::boot::data_root::BifrostDataRoot;
 use crate::components::auth::{ServerAuth, ServerAuthz};
@@ -54,12 +52,6 @@ pub(crate) fn registry_db_error(error: impl std::fmt::Display) -> WyrdError {
     tracing::error!(%error, "card registration database operation failed");
     WyrdError::registry_unavailable("card registry unavailable")
 }
-
-/// Production [`TokenVerifier`] specialization: SQL-backed permission resolution
-/// (`SqlPermissionResolver`) plus Postgres-backed issuer resolution
-/// (`PgIssuerResolver`). Aliased so the nested handle type stays readable across
-/// `AppState`, the boot path, and the test harness.
-pub type WyrdTokenVerifier = TokenVerifier<SqlPermissionResolver, PgIssuerResolver>;
 
 /// External dependency graph consumed exactly once by production Bifrost composition.
 pub struct BifrostBuildInputs {
@@ -84,7 +76,7 @@ pub struct BifrostBuildInputs {
     /// One shared current-ready cluster registry.
     pub cluster: Arc<ClusterRegistry>,
     /// Exact public and private request token verifier.
-    pub token_verifier: Arc<WyrdTokenVerifier>,
+    pub token_verifier: Arc<TokenVerifier>,
     /// Existing outbound peer bearer owner.
     pub peer_credentials: Arc<dyn OraclePeerCredentials>,
     /// Immutable peer TLS trust policy validated before composition.
@@ -337,10 +329,9 @@ pub struct BifrostTestControls {
 }
 /// The one monomorphic Bifrost Gate specialization served by this process.
 ///
-/// [`WyrdTokenVerifier`] already fixes both resolver parameters, so the alias
-/// keeps [`Bifrost`] and [`AppState`] non-generic while the Gate itself stays
-/// generic for other embedders.
-pub type ServerGate = Gate<SqlPermissionResolver, PgIssuerResolver, PostgresGateAudit>;
+/// Fixing the audit sink keeps [`Bifrost`] and [`AppState`] non-generic while
+/// the Gate itself stays generic over its sink.
+pub type ServerGate = Gate<PostgresGateAudit>;
 
 /// Ordered local lifecycle states for one independently fenced role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1515,7 +1506,7 @@ pub struct Bifrost {
     /// Process-wide encoded-body admission shared by every transport edge.
     transport: vala_bifrost_redux::gate::limits::BifrostTransportAdmission,
     /// Verifier shared by public Gate work and the private peer service.
-    token_verifier: Arc<WyrdTokenVerifier>,
+    token_verifier: Arc<TokenVerifier>,
     /// The one peer Service principal this process admits, when it serves the
     /// private plane. Absent for targets that open no peer listener.
     peer_identity: Option<crate::grpc::PeerWorkloadIdentity>,
@@ -1556,7 +1547,7 @@ pub(crate) struct BifrostComposition {
     /// Process-wide encoded-body admission shared by every transport edge.
     pub(crate) transport: vala_bifrost_redux::gate::limits::BifrostTransportAdmission,
     /// Verifier shared by public Gate work and the private peer service.
-    pub(crate) token_verifier: Arc<WyrdTokenVerifier>,
+    pub(crate) token_verifier: Arc<TokenVerifier>,
     /// The one peer Service principal this process admits, when it serves the
     /// private plane.
     pub(crate) peer_identity: Option<crate::grpc::PeerWorkloadIdentity>,
@@ -1607,7 +1598,7 @@ impl Bifrost {
     /// Builds an ownerless unit-test shell for non-Bifrost route fixtures.
     #[cfg(feature = "test-support")]
     #[must_use]
-    pub fn test_shell(token_verifier: Arc<WyrdTokenVerifier>) -> Arc<Self> {
+    pub fn test_shell(token_verifier: Arc<TokenVerifier>) -> Arc<Self> {
         Arc::new(Self {
             bifrost_storage: None,
             gate: ServerGate::without_scribe(
@@ -1639,7 +1630,7 @@ impl Bifrost {
     #[cfg(feature = "test-support")]
     #[must_use]
     pub fn test_shell_with_catalog(
-        token_verifier: Arc<WyrdTokenVerifier>,
+        token_verifier: Arc<TokenVerifier>,
         catalog: Arc<BifrostCatalog>,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -1681,13 +1672,13 @@ impl Bifrost {
     /// as public ingest; exposing the verifier here keeps that from becoming a
     /// third authentication path.
     #[must_use]
-    pub fn token_verifier(&self) -> &WyrdTokenVerifier {
+    pub fn token_verifier(&self) -> &TokenVerifier {
         &self.token_verifier
     }
 
     /// Borrows the shared verifier as an owner the peer boundary can retain.
     #[must_use]
-    pub fn shared_token_verifier(&self) -> Arc<WyrdTokenVerifier> {
+    pub fn shared_token_verifier(&self) -> Arc<TokenVerifier> {
         Arc::clone(&self.token_verifier)
     }
 
@@ -2549,8 +2540,7 @@ mod tests {
     /// [`super::Bifrost::test_shell`] hands the verifier straight to the Gate
     /// auth interceptor, and `TokenVerifier::new` requires at least one key, so
     /// the shell cannot be composed from an empty key map.
-    fn shell_token_verifier() -> Arc<super::WyrdTokenVerifier> {
-        let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
+    fn shell_token_verifier() -> Arc<super::TokenVerifier> {
         let mut keys = std::collections::HashMap::new();
         keys.insert(
             wyrd_auth_verify::Kid::new("test").expect("static kid is valid"),
@@ -2564,9 +2554,6 @@ mod tests {
         Arc::new(wyrd_auth_verify::TokenVerifier::new(
             keys,
             "wyrd",
-            Arc::new(
-                crate::auth::permission_resolver::SqlPermissionResolver::new(Arc::new(app_pool)),
-            ),
             wyrd_auth_verify::WyrdAuthVerifySettings::default(),
         ))
     }
@@ -2721,7 +2708,6 @@ mod tests {
                 principal: PrincipalRef::from_principal(&caller),
             }],
             exp: chrono::Utc::now(),
-            iat: chrono::Utc::now(),
         };
         let request = wyrd_auth_check::AuthzCheckRequest {
             target: card_ref("callee"),

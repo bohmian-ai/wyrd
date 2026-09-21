@@ -1,5 +1,4 @@
 use std::env;
-use std::time::Duration;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, Response, StatusCode, header};
@@ -140,7 +139,6 @@ async fn journey_role_revocation_flips_verdict() {
     assert_allow(&first);
 
     srv.revoke_role(&sa, "writer").await.expect("revoke");
-    srv.force_recheck_principal(&sa).await;
 
     let second = permission_check_via_delegation(&srv, &init_jwt, &sa, "card_write").await;
     assert_deny(&second);
@@ -167,7 +165,6 @@ async fn journey_role_grant_flips_verdict() {
     assert_deny(&first);
 
     srv.grant_role(&sa, "writer").await.expect("grant");
-    srv.force_recheck_principal(&sa).await;
 
     let second = permission_check_via_delegation(&srv, &init_jwt, &sa, "card_write").await;
     assert_allow(&second);
@@ -248,7 +245,6 @@ async fn journey_delegation_then_revoke_underlying_role() {
     assert_allow(&body_json(first).await);
 
     srv.revoke_role(&b, "writer").await.expect("revoke b");
-    srv.force_recheck_principal(&b).await;
 
     let delegated2 = srv
         .delegate(&a_jwt, b.card_ref().expect("machine"))
@@ -283,12 +279,10 @@ async fn journey_agent_revoke_grant_flip() {
     assert_allow(&d1);
 
     srv.revoke_role(&agent, "writer").await.expect("revoke");
-    srv.force_recheck_principal(&agent).await;
     let d2 = permission_check_via_delegation(&srv, &init_jwt, &agent, "card_write").await;
     assert_deny(&d2);
 
     srv.grant_role(&agent, "writer").await.expect("grant");
-    srv.force_recheck_principal(&agent).await;
     let d3 = permission_check_via_delegation(&srv, &init_jwt, &agent, "card_write").await;
     assert_allow(&d3);
     srv.shutdown().await.expect("shutdown");
@@ -320,32 +314,5 @@ async fn journey_cross_principal_kind_isolation_via_independent_bootstrap() {
     let agent_decision =
         permission_check_via_delegation(&srv, &init_jwt, &agent, "card_write").await;
     assert_deny(&agent_decision);
-    srv.shutdown().await.expect("shutdown");
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn cache_ttl_path_also_flips_verdict() {
-    if !e2e_enabled() {
-        return;
-    }
-    let srv = WyrdTestServer::start_in_process().await.expect("start");
-    let sa = srv
-        .bootstrap_service("sa-ttl", &["writer"])
-        .await
-        .expect("bootstrap");
-    let initiator = neutral_initiator(&srv, "j8-init").await;
-    let init_jwt = srv
-        .exchange_api_key(initiator.api_key().expect("machine"))
-        .await
-        .expect("initiator jwt");
-
-    let first = permission_check_via_delegation(&srv, &init_jwt, &sa, "card_write").await;
-    assert_allow(&first);
-
-    srv.revoke_role(&sa, "writer").await.expect("revoke");
-    srv.advance(Duration::from_secs(70)).await;
-
-    let second = permission_check_via_delegation(&srv, &init_jwt, &sa, "card_write").await;
-    assert_deny(&second);
     srv.shutdown().await.expect("shutdown");
 }

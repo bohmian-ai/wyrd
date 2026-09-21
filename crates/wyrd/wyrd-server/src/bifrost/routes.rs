@@ -41,7 +41,7 @@ pub fn router() -> OpenApiRouter<AppState> {
           or physical layout (WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH, \
           WYRD_VALA_409_BIFROST_COMMIT_CONFLICT)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "This server carries no catalog, the catalog or its \
-          object store is unreachable, or the revocation store could not vouch for the \
+          object store is unreachable, or no verifier is configured for the access \
           token (WYRD_VALA_503_SCRIBE_ROLE_UNAVAILABLE, \
           WYRD_VALA_503_BIFROST_CATALOG_UNREACHABLE, WYRD_VALA_503_BIFROST_STORAGE_UNREACHABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
@@ -80,7 +80,7 @@ pub(crate) async fn register(
         (status = 403, description = "The principal may not read the Bifrost catalog \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "This server carries no catalog, the catalog or its \
-          object store is unreachable, or the revocation store could not vouch for the \
+          object store is unreachable, or no verifier is configured for the access \
           token (WYRD_VALA_503_SCRIBE_ROLE_UNAVAILABLE, \
           WYRD_VALA_503_BIFROST_CATALOG_UNREACHABLE, WYRD_VALA_503_BIFROST_STORAGE_UNREACHABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
@@ -125,7 +125,7 @@ pub(crate) async fn list(
         (status = 404, description = "No table of that name is visible to this tenant \
           (WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "This server carries no catalog, the catalog or its \
-          object store is unreachable, or the revocation store could not vouch for the \
+          object store is unreachable, or no verifier is configured for the access \
           token (WYRD_VALA_503_SCRIBE_ROLE_UNAVAILABLE, \
           WYRD_VALA_503_BIFROST_CATALOG_UNREACHABLE, WYRD_VALA_503_BIFROST_STORAGE_UNREACHABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),

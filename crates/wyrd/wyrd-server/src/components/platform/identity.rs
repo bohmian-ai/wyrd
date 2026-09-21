@@ -654,9 +654,9 @@ fn login_service(state: &AppState) -> Result<PlatformLogin, WyrdErrorResponse> {
             details: serde_json::json!({ "plane": "platform" }),
         })
     })?;
-    let verifier = state.auth.token_verifier.clone().ok_or_else(|| {
+    let verifier = state.auth.external_verifier.clone().ok_or_else(|| {
         WyrdErrorResponse::from(WyrdError::Internal {
-            message: "token verification is not configured".to_owned(),
+            message: "external token verification is not configured".to_owned(),
             details: serde_json::json!({ "plane": "platform" }),
         })
     })?;

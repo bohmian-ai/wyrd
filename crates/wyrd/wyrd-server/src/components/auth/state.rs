@@ -5,10 +5,11 @@ use wyrd_auth_issue::IssuingKey;
 use wyrd_crypt::SecretKey;
 use wyrd_runtime::{PermissionCheck, RbacCheck};
 
-use crate::auth::exchange_api_key::TokenExchangeSettings;
+use wyrd_auth::issuance::{TenantTokenIssuer, TokenExchangeSettings};
+use wyrd_auth_verify::{ExternalVerifier, TokenVerifier};
+
 use crate::auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
 use crate::components::auth::audit_writer::{AuthzAuditWriter, NoopAuthzAuditWriter};
-use crate::state::WyrdTokenVerifier;
 
 /// Authentication handles: token issuance + verification + issuer/binding resolution.
 #[derive(Clone, Default)]
@@ -20,7 +21,10 @@ pub struct ServerAuth {
     pub issuing_key: Option<Arc<IssuingKey>>,
     /// Verifies bearer tokens on every authenticated request. Required in production
     /// (enforced by `AppState::production_validate`).
-    pub token_verifier: Option<Arc<WyrdTokenVerifier>>,
+    pub token_verifier: Option<Arc<TokenVerifier>>,
+    /// Verifies foreign OIDC ID tokens and workload assertions at issuance
+    /// (login callback, platform login, `jwt-bearer`); never used per request.
+    pub external_verifier: Option<Arc<ExternalVerifier<PgIssuerResolver>>>,
     /// Resolves trusted OIDC issuers from Postgres for foreign-OIDC verification paths.
     pub trusted_issuer_resolver: Option<Arc<PgIssuerResolver>>,
     /// Resolves workload-to-principal bindings from Postgres for the JWT-bearer exchange path.
@@ -29,6 +33,20 @@ pub struct ServerAuth {
     pub sealing_key: Option<Arc<SecretKey>>,
     /// TTL and delegation settings for token exchange responses.
     pub token_exchange_settings: TokenExchangeSettings,
+}
+
+impl ServerAuth {
+    /// Build the one tenant issuance owner over the configured signing key.
+    ///
+    /// Every tenant grant route mints through this, so all five paths share
+    /// the same activity checks, grant resolution, lifetimes, and audit.
+    /// Returns `None` when no signing key is configured.
+    #[must_use]
+    pub fn tenant_issuer(&self) -> Option<TenantTokenIssuer> {
+        self.issuing_key
+            .clone()
+            .map(|key| TenantTokenIssuer::new(key, self.token_exchange_settings.clone()))
+    }
 }
 
 /// Authorization handles: policy decision + RBAC evaluation + decision audit.

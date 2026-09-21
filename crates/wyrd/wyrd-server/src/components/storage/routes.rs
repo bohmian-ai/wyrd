@@ -73,7 +73,7 @@ pub fn storage_router(state: &AppState) -> OpenApiRouter<AppState> {
         (status = 500, description = "The storage backend or the platform store failed, or the \
           decision could not be audited (WYRD_STORAGE_500_BACKEND, WYRD_SPEC_500_INTERNAL, \
           WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
-        (status = 503, description = "The revocation store could not vouch for the token, or \
+        (status = 503, description = "No verifier is configured for the access token, or \
           the storage backend is transiently unavailable \
           (WYRD_AUTH_503_VERIFY_UNAVAILABLE, \
           WYRD_STORAGE_503_BACKEND_UNAVAILABLE)", body = WyrdProblem)
@@ -137,7 +137,7 @@ struct PartUrlQuery {
         (status = 500, description = "The storage backend or the platform store failed, or the \
           decision could not be audited (WYRD_STORAGE_500_BACKEND, WYRD_SPEC_500_INTERNAL, \
           WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
-        (status = 503, description = "The revocation store could not vouch for the token, or \
+        (status = 503, description = "No verifier is configured for the access token, or \
           the storage backend is transiently unavailable \
           (WYRD_AUTH_503_VERIFY_UNAVAILABLE, \
           WYRD_STORAGE_503_BACKEND_UNAVAILABLE, WYRD_STORAGE_503_PRESIGN_EXPIRED)", body = WyrdProblem)
@@ -207,7 +207,7 @@ async fn part_url(
         (status = 500, description = "The storage backend or the platform store failed, or the \
           decision could not be audited (WYRD_STORAGE_500_BACKEND, WYRD_SPEC_500_INTERNAL, \
           WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
-        (status = 503, description = "The revocation store could not vouch for the token, or \
+        (status = 503, description = "No verifier is configured for the access token, or \
           the storage backend is transiently unavailable \
           (WYRD_AUTH_503_VERIFY_UNAVAILABLE, \
           WYRD_STORAGE_503_BACKEND_UNAVAILABLE)", body = WyrdProblem)
@@ -274,7 +274,7 @@ async fn complete(
         (status = 500, description = "The storage backend or the platform store failed, or the \
           decision could not be audited (WYRD_STORAGE_500_BACKEND, WYRD_SPEC_500_INTERNAL, \
           WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
-        (status = 503, description = "The revocation store could not vouch for the token, or \
+        (status = 503, description = "No verifier is configured for the access token, or \
           the storage backend is transiently unavailable \
           (WYRD_AUTH_503_VERIFY_UNAVAILABLE, \
           WYRD_STORAGE_503_BACKEND_UNAVAILABLE)", body = WyrdProblem)
@@ -344,7 +344,7 @@ async fn abort(
         (status = 500, description = "The storage backend or the platform store failed, or the \
           decision could not be audited (WYRD_STORAGE_500_BACKEND, WYRD_SPEC_500_INTERNAL, \
           WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
-        (status = 503, description = "The revocation store could not vouch for the token, or \
+        (status = 503, description = "No verifier is configured for the access token, or \
           the storage backend is transiently unavailable \
           (WYRD_AUTH_503_VERIFY_UNAVAILABLE, \
           WYRD_STORAGE_503_BACKEND_UNAVAILABLE)", body = WyrdProblem)
@@ -400,7 +400,7 @@ async fn local_blob(
         (status = 500, description = "The storage backend or the platform store failed, or the \
           decision could not be audited (WYRD_STORAGE_500_BACKEND, WYRD_SPEC_500_INTERNAL, \
           WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
-        (status = 503, description = "The revocation store could not vouch for the token, or \
+        (status = 503, description = "No verifier is configured for the access token, or \
           the storage backend is transiently unavailable \
           (WYRD_AUTH_503_VERIFY_UNAVAILABLE, \
           WYRD_STORAGE_503_BACKEND_UNAVAILABLE, WYRD_STORAGE_503_PRESIGN_EXPIRED)", body = WyrdProblem)
@@ -465,7 +465,7 @@ struct LocalDownloadQuery {
         (status = 500, description = "The storage backend or the platform store failed, or the \
           decision could not be audited (WYRD_STORAGE_500_BACKEND, WYRD_SPEC_500_INTERNAL, \
           WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
-        (status = 503, description = "The revocation store could not vouch for the token, or \
+        (status = 503, description = "No verifier is configured for the access token, or \
           the storage backend is transiently unavailable \
           (WYRD_AUTH_503_VERIFY_UNAVAILABLE, \
           WYRD_STORAGE_503_BACKEND_UNAVAILABLE)", body = WyrdProblem)

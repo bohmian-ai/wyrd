@@ -107,8 +107,8 @@ pub(crate) fn auth_not_configured() -> WyrdErrorResponse {
 /// middleware) and `AuthenticatedPrincipal::from_request_parts` (the extractor fallback for
 /// off-nest routes such as `/auth/issue-key`). Both call sites produce identical
 /// `400`/`401`/`503` error responses because they share this function.
-pub(crate) async fn verify_authenticated_principal(
-    verifier: Option<Arc<crate::state::WyrdTokenVerifier>>,
+pub(crate) fn verify_authenticated_principal(
+    verifier: Option<&wyrd_auth_verify::TokenVerifier>,
     headers: &HeaderMap,
 ) -> Result<super::AuthenticatedPrincipal, WyrdErrorResponse> {
     let token = extract_wyrd_access_token(headers)?;
@@ -116,9 +116,10 @@ pub(crate) async fn verify_authenticated_principal(
     let verifier = verifier.ok_or_else(auth_not_configured)?;
     let verified = verifier
         .verify(&token, &expected_tenant)
-        .await
         .map_err(WyrdErrorResponse::from)?;
-    Ok(super::AuthenticatedPrincipal::from_verified(verified))
+    Ok(super::AuthenticatedPrincipal::from_verified(Arc::new(
+        verified,
+    )))
 }
 
 /// Read the per-request [`RequestId`] the request-id layer inserted.

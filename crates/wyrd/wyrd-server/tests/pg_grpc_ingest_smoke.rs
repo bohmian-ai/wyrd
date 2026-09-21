@@ -71,7 +71,7 @@ async fn seed_tenant(server: &WyrdTestServer, tenant: DataTenantId, slug: &str) 
         .expect("fixture seeds the requested tenant");
 }
 
-/// Mints one user token with the requested SQL-resolved built-in roles.
+/// Mints one user token carrying the requested built-in roles' permissions.
 ///
 /// # Panics
 ///
@@ -89,13 +89,21 @@ fn mint_user_jwt(state: &AppState, tenant: DataTenantId, roles: &[&str]) -> Stri
         .issuing_key
         .as_ref()
         .expect("test state has issuing key")
-        .issue_user_access_token(
-            principal,
-            roles
-                .iter()
-                .map(|role| RoleRef::new(role).expect("static role is valid"))
-                .collect(),
-            None,
+        .issue_access_token(
+            wyrd_auth_issue::AccessGrant {
+                principal,
+                roles: roles
+                    .iter()
+                    .map(|role| RoleRef::new(role).expect("static role is valid"))
+                    .collect(),
+                permissions: wyrd_runtime::builtin_roles::BUILTIN_ROLES
+                    .iter()
+                    .filter(|builtin| roles.contains(&builtin.name))
+                    .flat_map(|builtin| builtin.permissions.iter().cloned())
+                    .collect(),
+                credential_id: None,
+                delegated_by: None,
+            },
             ChronoDuration::minutes(5),
         )
         .expect("test jwt mints")

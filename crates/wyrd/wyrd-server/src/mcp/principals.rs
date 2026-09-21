@@ -2,7 +2,7 @@
 //!
 //! The adapter owns exactly three things: parsing a closed request, projecting
 //! an answer an agent can act on, and translating failure onto the protocol.
-//! Authorization, tenancy, audit, and the revocation epoch all stay with the
+//! Authorization, tenancy, audit, and credential retirement all stay with the
 //! server operations this module calls, so there is one implementation of each
 //! rather than an MCP-shaped copy.
 //!

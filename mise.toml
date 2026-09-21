@@ -117,8 +117,9 @@ description = "Run the principal and credential model unit slices"
 run = """
 cargo nextest run --locked -p wyrd-spec --lib -E 'test(/^auth::principal_kind::/)'
 cargo nextest run --locked -p wyrd-runtime --lib -E 'test(/^principal::/)'
-cargo nextest run --locked -p wyrd-auth-verify --lib -E 'test(/^tests::into_verified_/)'
+cargo nextest run --locked -p wyrd-auth-verify --lib -E 'test(/^tests::(into_verified_|token_verifier_)/)'
 cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^platform_credentials::tests::/)'
+cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^issuance::tests::/)'
 """
 
 [tasks."test:platform:journey"]
@@ -145,9 +146,9 @@ cargo nextest run --locked -p wyrd-sql --test pg_platform_identity
 cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^platform_authz::pg_tests::/)'
 cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^platform_credentials::pg_tests::/)'
 cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^platform_sessions::pg_tests::/)'
+cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^issuance::pg_tests::/)'
 cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^exchange_api_key::pg_tests::/)'
 cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^revoke::pg_tests::/)'
-cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^callback::pg_tests::/)'
 cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^refresh::pg_tests::/)'
 cargo nextest run --locked -p wyrd-server --lib -E 'test(/^components::admin::routes::pg_tests::/)'
 cargo nextest run --locked -p wyrd-server --test pg_openapi_contract

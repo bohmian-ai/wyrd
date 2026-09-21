@@ -9,30 +9,29 @@ use crate::exchange_api_key::principal_kind_wire;
 use wyrd_spec::error::WyrdError;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
-    revoke_refresh_family, revoke_service_account_principal, revoke_user_principal,
-    service_account_by_id, user_by_id,
+    revoke_refresh_family, service_account_by_id, suspend_service_account_principal,
+    suspend_user_principal, user_by_id,
 };
 
 /// Revoke `target_id` in the table the caller's declared `kind` names.
 ///
-/// A User also carries refresh authority, and the authorization epoch alone
-/// does not retire it: an active refresh row survives the epoch bump and can
-/// be rotated into a successor access token minted after it, which restores
-/// the session the revocation just ended. The User branch therefore advances
-/// the epoch and revokes the principal's refresh family on the same
-/// [`TenantConn`], so the caller's commit either retires both or neither.
+/// Revocation suspends the principal, which every tenant issuance path reads
+/// before it mints, so the principal's next token is refused on every grant;
+/// tokens it already holds lapse at their five-minute expiry. A User also
+/// carries refresh authority, so the User branch retires the refresh family on
+/// the same [`TenantConn`] and the caller's commit retires both or neither.
 ///
 /// The kind is a selector, not a hint: principal ids are unique only within
 /// their table, so revoking on the caller's claim rather than on whichever
 /// table happens to answer first keeps a `user` request from silently
 /// retiring a service account that shares the id. A row found under a
 /// different kind than the one declared is reported as not found, so a caller
-/// cannot use the refusal to enumerate the other table.
+/// cannot use the refusal to enumerate the other table. A miss writes nothing.
 ///
 /// # Errors
 /// Returns [`WyrdError::PrincipalNotFound`] when no principal of that kind
-/// exists in the tenant, and [`WyrdError::Internal`] when the revocation write
-/// fails or the stored kind is unrecognized.
+/// exists in the tenant, and [`WyrdError::Internal`] when the lookup or the
+/// revocation write fails or the stored kind is unrecognized.
 pub async fn revoke_principal_in_conn(
     conn: &mut TenantConn<'_>,
     target_id: PrincipalId,
@@ -42,19 +41,26 @@ pub async fn revoke_principal_in_conn(
     let id_uuid = target_id.as_uuid();
 
     if kind == PrincipalKindTag::User {
-        if user_by_id(conn, id_uuid).await.ok().flatten().is_some() {
-            revoke_user_principal(conn, id_uuid)
-                .await
-                .map_err(internal_error)?;
-            revoke_refresh_family(conn, "user", id_uuid, "principal_revoked")
-                .await
-                .map_err(internal_error)?;
-            return Ok(());
+        if user_by_id(conn, id_uuid)
+            .await
+            .map_err(internal_error)?
+            .is_none()
+        {
+            return Err(not_found(target_id, tenant));
         }
-        return Err(not_found(target_id, tenant));
+        suspend_user_principal(conn, id_uuid)
+            .await
+            .map_err(internal_error)?;
+        revoke_refresh_family(conn, "user", id_uuid, "principal_revoked")
+            .await
+            .map_err(internal_error)?;
+        return Ok(());
     }
 
-    let Some(row) = service_account_by_id(conn, id_uuid).await.ok().flatten() else {
+    let Some(row) = service_account_by_id(conn, id_uuid)
+        .await
+        .map_err(internal_error)?
+    else {
         return Err(not_found(target_id, tenant));
     };
     let stored = principal_kind_wire(&row.principal_kind).ok_or_else(|| {
@@ -66,7 +72,7 @@ pub async fn revoke_principal_in_conn(
     if stored != kind {
         return Err(not_found(target_id, tenant));
     }
-    revoke_service_account_principal(conn, id_uuid)
+    suspend_service_account_principal(conn, id_uuid)
         .await
         .map_err(internal_error)?;
     Ok(())
@@ -107,8 +113,8 @@ mod pg_tests {
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::reference::CardRef;
     use wyrd_sql::queries::auth::{
-        insert_refresh_token, insert_service_account, insert_user, refresh_by_hash,
-        user_revocation_epoch,
+        insert_refresh_token, insert_service_account, insert_user, refresh_by_hash, service_account_by_id,
+        user_by_id,
     };
 
     use super::revoke_principal_in_conn;
@@ -123,12 +129,11 @@ mod pg_tests {
         }
     }
 
-    /// A user is revocable only as a user, and the revocation moves the epoch.
+    /// A user is revocable only as a user, and the revocation suspends it.
     ///
     /// The requested kind selects the table the id is resolved in, so naming
     /// the wrong kind must miss rather than revoke a same-id row of another
-    /// kind. The epoch advance is the half that makes outstanding tokens stop
-    /// working.
+    /// kind. Suspension is the half that refuses the user's next token.
     #[tokio::test]
     async fn a_user_is_revoked_under_the_user_kind() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -148,19 +153,24 @@ mod pg_tests {
         )
         .await
         .expect("revocation succeeds");
+
+        let row = user_by_id(&mut conn, user_id)
+            .await
+            .expect("user lookup runs")
+            .expect("the user still exists");
+        assert_eq!(row.status, "suspended", "revocation suspends the user");
     }
 
     /// Revoking a User must retire the refresh authority in the same commit.
     ///
-    /// The epoch alone stops the access tokens the human already holds, but an
-    /// active refresh row outlives it: rotating that row mints a successor
-    /// newer than the epoch, which is the revoked session back. Both writes
-    /// share the caller's transaction, so this asserts the committed state a
-    /// served revoke leaves behind and then proves the refresh grant refuses.
+    /// Suspension already refuses a rotation, but a live refresh row would
+    /// outlast a later reactivation and restore the revoked session. Both
+    /// writes share the caller's transaction, so this asserts the committed
+    /// state a served revoke leaves behind.
     ///
     /// # Panics
     /// Panics when the revocation fails, when a live refresh row survives, or
-    /// when the retired row still rotates.
+    /// when the user is not suspended.
     #[tokio::test]
     async fn revoking_a_user_retires_its_refresh_authority() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -213,12 +223,13 @@ mod pg_tests {
             row.revoked_at.is_some(),
             "a retired refresh row carries its revocation time"
         );
-        let epoch = user_revocation_epoch(&mut conn, user_id)
+        let user = user_by_id(&mut conn, user_id)
             .await
-            .expect("epoch lookup runs");
-        assert!(
-            epoch.is_some(),
-            "the same revocation advanced the authorization epoch"
+            .expect("user lookup runs")
+            .expect("the user still exists");
+        assert_eq!(
+            user.status, "suspended",
+            "the same revocation suspended the user"
         );
     }
 
@@ -256,6 +267,14 @@ mod pg_tests {
         )
         .await
         .expect("revocation succeeds");
+
+        assert!(
+            service_account_by_id(&mut conn, sa_id)
+                .await
+                .expect("service account lookup runs")
+                .is_none(),
+            "revocation suspends the service account, so no active row remains"
+        );
     }
 
     /// A declared kind that does not match the stored row must refuse exactly

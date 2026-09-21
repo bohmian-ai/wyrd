@@ -1,36 +1,32 @@
 //! Refresh-token grant: single-use rotation with reuse detection (F07/F08).
 
-use std::sync::Arc;
-
 use base64::Engine;
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::json;
-use wyrd_auth_issue::{IssueError, IssuingKey};
+use wyrd_auth_issue::IssueError;
 use wyrd_auth_verify::RefreshTokenClaims;
 use wyrd_runtime::PrincipalId;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
 use wyrd_sql::TenantConn;
-use wyrd_sql::queries::auth::{
-    consume_active_refresh, list_user_roles, refresh_by_hash, revoke_refresh_family,
-};
+use wyrd_sql::queries::auth::{consume_active_refresh, refresh_by_hash, revoke_refresh_family};
 
 use crate::audit::{
     REFRESH_FAMILY_REVOKE_OPERATION, append_auth_audit, auth_event, principal_kind_tag,
 };
-
-use crate::callback::{UserSessionGrant, issue_and_record_user_session};
-use crate::exchange_api_key::{
-    ExchangedToken, IssueOrSqlError, TokenExchangeSettings, role_refs, token_hash,
-};
+use crate::exchange_api_key::token_hash;
+use crate::issuance::{ExchangedToken, IssuanceError, TenantTokenIssuer};
 
 /// Refresh-token rotation service.
+///
+/// Owns only the single-use rotation and reuse containment; the successor
+/// session is minted by the shared [`TenantTokenIssuer`], so a suspended user
+/// or withdrawn grant governs a renewal exactly as it governs a first login.
+#[derive(Debug, Clone)]
 pub struct RefreshTokens {
-    /// JWT issuing key for minting access and refresh tokens.
-    pub issuing_key: Arc<IssuingKey>,
-    /// Token lifetime settings.
-    pub settings: TokenExchangeSettings,
+    /// The tenant issuance owner that mints the successor session.
+    pub issuer: TenantTokenIssuer,
 }
 
 /// Refresh grant failure modes.
@@ -45,22 +41,12 @@ pub enum RefreshError {
     /// Database operation failed.
     #[error("database error")]
     Database(#[from] sqlx::Error),
-    /// Token issue failed.
-    #[error("token issue error")]
-    Issue(#[from] IssueError),
+    /// The shared issuance owner refused or failed to mint the successor.
+    #[error("token issuance error")]
+    Issuance(#[from] IssuanceError),
     /// Wyrd contract error.
     #[error("wyrd error")]
     Wyrd(#[from] WyrdError),
-}
-
-impl From<IssueOrSqlError> for RefreshError {
-    fn from(error: IssueOrSqlError) -> Self {
-        match error {
-            IssueOrSqlError::Issue(e) => Self::Issue(e),
-            IssueOrSqlError::Database(e) => Self::Database(e),
-            IssueOrSqlError::Wyrd(e) => Self::Wyrd(e),
-        }
-    }
 }
 
 impl From<RefreshError> for WyrdError {
@@ -70,7 +56,12 @@ impl From<RefreshError> for WyrdError {
                 message: "Refresh token family revoked due to reuse of a rotated token".to_owned(),
                 details: json!({}),
             },
-            RefreshError::NotFound => WyrdError::RefreshRevoked {
+            // A suspended user or a tenant that stopped admitting credentials
+            // ends the session the same way a revoked refresh row does.
+            RefreshError::NotFound
+            | RefreshError::Issuance(
+                IssuanceError::PrincipalInactive | IssuanceError::TenantNotAdmitting,
+            ) => WyrdError::RefreshRevoked {
                 message: "Refresh token not found, expired, or revoked".to_owned(),
                 details: json!({}),
             },
@@ -78,10 +69,7 @@ impl From<RefreshError> for WyrdError {
                 message: "auth backend unavailable".to_owned(),
                 details: json!({ "retry_after_seconds": 1 }),
             },
-            RefreshError::Issue(_) => WyrdError::Internal {
-                message: "token issue failed during refresh rotation".to_owned(),
-                details: json!({}),
-            },
+            RefreshError::Issuance(error) => error.into(),
             RefreshError::Wyrd(error) => error,
         }
     }
@@ -117,7 +105,6 @@ impl RefreshTokens {
         request_id: &str,
     ) -> Result<ExchangedToken, RefreshError> {
         let hash = token_hash(presented.expose_secret());
-        let conn_tenant = conn.data_tenant_id();
 
         match consume_active_refresh(conn, &hash).await? {
             Some(active) => {
@@ -133,31 +120,18 @@ impl RefreshTokens {
                         principal_kind = %principal_kind,
                         "refresh rotation refused for a non-human principal"
                     );
-                    return Err(RefreshError::Issue(IssueError::InvalidPrincipalKind));
+                    return Err(RefreshError::Issuance(IssuanceError::Issue(
+                        IssueError::InvalidPrincipalKind,
+                    )));
                 }
 
-                // The successor carries the roles the user holds now, not the
-                // ones the consumed token was minted with, so a revoked role
-                // does not survive a renewal. Issuance, the family back-link,
-                // and the audited grant all run through the same owner first
-                // login used.
-                let roles = role_refs(list_user_roles(conn, principal_id).await?)
-                    .map_err(|_| RefreshError::Issue(IssueError::InvalidPrincipalKind))?;
-                let exchanged = issue_and_record_user_session(
-                    conn,
-                    self.issuing_key.as_ref(),
-                    conn_tenant,
-                    UserSessionGrant {
-                        principal_id,
-                        roles,
-                        rotated_from: Some(active.id),
-                        // Renewal is not a role change, so the epoch does not
-                        // move and the successor is minted at the wall clock.
-                        issued_at: None,
-                    },
-                    request_id,
-                )
-                .await?;
+                // The successor is minted from the user's current status and
+                // grants, not the consumed token's, so a suspension or revoked
+                // role does not survive a renewal.
+                let exchanged = self
+                    .issuer
+                    .issue_human_session(conn, principal_id, Some(active.id), request_id)
+                    .await?;
 
                 tracing::debug!(
                     principal_id = %principal_id,
@@ -283,7 +257,7 @@ mod pg_tests {
 
     use super::{RefreshError, RefreshTokens};
     use crate::audit::REFRESH_FAMILY_REVOKE_OPERATION;
-    use crate::exchange_api_key::TokenExchangeSettings;
+    use crate::issuance::{IssuanceError, TenantTokenIssuer, TokenExchangeSettings};
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
 
@@ -300,8 +274,7 @@ mod pg_tests {
 
     fn refresh_service() -> RefreshTokens {
         RefreshTokens {
-            issuing_key: test_issuing_key(),
-            settings: TokenExchangeSettings::default(),
+            issuer: TenantTokenIssuer::new(test_issuing_key(), TokenExchangeSettings::default()),
         }
     }
 
@@ -869,7 +842,9 @@ mod pg_tests {
         assert!(
             matches!(
                 result,
-                Err(RefreshError::Issue(IssueError::InvalidPrincipalKind))
+                Err(RefreshError::Issuance(IssuanceError::Issue(
+                    IssueError::InvalidPrincipalKind
+                )))
             ),
             "a machine refresh row is refused: {result:?}"
         );

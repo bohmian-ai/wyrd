@@ -2,39 +2,31 @@
 
 use std::sync::Arc;
 
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use serde_json::Value;
 use uuid::Uuid;
-use wyrd_auth_issue::IssuingKey;
 use wyrd_auth_oidc::{ClientAuth, OidcProvider, ScreenedHttp, TrustedIssuer};
-use wyrd_auth_verify::{TokenPrincipalRef, TokenVerifier};
-use wyrd_runtime::{PermissionSet, Principal, PrincipalId, PrincipalKind, RoleRef};
+use wyrd_auth_verify::ExternalVerifier;
+use wyrd_runtime::{PrincipalId, RoleRef};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalKindTag;
-use wyrd_spec::auth::{IssuerUrl, TokenResponse, TokenType};
+use wyrd_spec::auth::{IssuerUrl, TokenResponse};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
 use wyrd_sql::queries::auth::{
-    advance_user_epoch_to_next_second, delete_user, insert_refresh_token,
-    insert_refresh_token_rotated, insert_user, replace_user_roles, upsert_user_identity,
-    user_id_by_identity,
+    delete_user, insert_user, replace_user_roles, upsert_user_identity, user_id_by_identity,
 };
 use wyrd_sql::{SqlError, TenantConn, WyrdPostgres};
 
 use crate::audit::{
-    TOKEN_EXCHANGE_OPERATION, append_auth_audit, auth_event, auth_failure_code,
-    record_auth_audit_best_effort,
+    TOKEN_EXCHANGE_OPERATION, auth_event, auth_failure_code, record_auth_audit_best_effort,
 };
 use crate::error::{auth_error_to_wyrd, screen_error};
-use crate::exchange_api_key::{ExchangedToken, role_refs, token_hash};
+use crate::exchange_api_key::role_refs;
+use crate::issuance::TenantTokenIssuer;
 use crate::login::{LoginStateEntry, PgLoginStateStore};
-use crate::permission_resolver::SqlPermissionResolver;
 use crate::pg_resolvers::PgIssuerResolver;
-
-const ACCESS_TTL: ChronoDuration = ChronoDuration::minutes(15);
-const REFRESH_TTL: ChronoDuration = ChronoDuration::days(30);
 
 #[derive(Debug, Deserialize)]
 struct TokenEndpointResponse {
@@ -54,10 +46,10 @@ struct FinishAuthorizationCodeInput<'a> {
 /// Human OIDC authorization-code exchange service.
 #[derive(Clone)]
 pub struct AuthorizationCodeExchange {
-    /// JWT issuing key.
-    pub issuing_key: Arc<IssuingKey>,
-    /// External/OIDC token verifier.
-    pub verifier: Arc<TokenVerifier<SqlPermissionResolver, PgIssuerResolver>>,
+    /// The shared tenant issuance workflow.
+    pub issuer: TenantTokenIssuer,
+    /// External OIDC id-token verifier.
+    pub verifier: Arc<ExternalVerifier<PgIssuerResolver>>,
     /// Tenant-scoped trusted issuer resolver.
     pub trusted_issuer_resolver: Arc<PgIssuerResolver>,
     /// Screened HTTP capability every provider request is made through.
@@ -173,14 +165,14 @@ impl AuthorizationCodeExchange {
     }
 
     /// Complete the grant once the id token has been verified: persist the
-    /// asserted roles, advance the user's authorization epoch when that set
-    /// actually changed, and issue the successor session inside the same
-    /// transaction.
+    /// asserted roles, then issue the session through the shared issuance
+    /// workflow inside the same transaction, so the access token carries the
+    /// permissions of the roles just recorded.
     ///
     /// # Errors
-    /// Returns [`WyrdError`] when role replacement, the epoch advance, token
-    /// issuance, the canonical audit append, or the commit fails; no session is
-    /// returned unless all of them committed together.
+    /// Returns [`WyrdError`] when identity or role persistence, issuance, the
+    /// canonical audit append, or the commit fails; no session is returned
+    /// unless all of them committed together.
     async fn finish_authorization_code_exchange(
         &self,
         input: FinishAuthorizationCodeInput<'_>,
@@ -217,39 +209,13 @@ impl AuthorizationCodeExchange {
         // grant table the truth a later refresh rotation can re-read; without
         // it, renewal would mint an authority-free successor.
         let role_names = roles.iter().map(RoleRef::as_str).collect::<Vec<_>>();
-        let roles_changed = replace_user_roles(&mut conn, principal_id, &role_names)
+        replace_user_roles(&mut conn, principal_id, &role_names)
             .await
             .map_err(sql_error)?;
-        // A role the provider withdrew is still spendable by every access token
-        // this human already holds, because the names travel in signed claims.
-        // Moving the authorization epoch in the same transaction is what makes
-        // the withdrawal reach those live sessions. The epoch lands on the next
-        // whole second and the successor is minted at exactly that instant, so
-        // the ordering is decided here rather than by how the wall clock
-        // happens to fall: a token minted earlier in the same second is
-        // strictly older than the epoch and is retired, while the successor is
-        // admitted. An unchanged login moves nothing, so re-authenticating
-        // never signs the human out of their other sessions.
-        let issued_at = if roles_changed {
-            advance_user_epoch_to_next_second(&mut conn, principal_id)
-                .await
-                .map_err(sql_error)?
-        } else {
-            None
-        };
-        let exchanged = issue_and_record_user_session(
-            &mut conn,
-            self.issuing_key.as_ref(),
-            tenant_id,
-            UserSessionGrant {
-                principal_id,
-                roles,
-                rotated_from: None,
-                issued_at,
-            },
-            request_id,
-        )
-        .await?;
+        let exchanged = self
+            .issuer
+            .issue_human_session(&mut conn, principal_id, None, request_id)
+            .await?;
         conn.commit().await.map_err(sql_error)?;
 
         Ok(exchanged.into_response())
@@ -400,135 +366,6 @@ pub async fn ensure_user_identity(
     Ok(canonical)
 }
 
-/// The facts one human session grant is minted from.
-///
-/// Grouped because they travel together through both entry points and are one
-/// decision about which session is being established: whose it is, what it may
-/// do, which refresh row it supersedes, and when it starts.
-pub(crate) struct UserSessionGrant {
-    /// Human principal the session belongs to.
-    pub(crate) principal_id: Uuid,
-    /// Roles the session carries, already resolved.
-    pub(crate) roles: Vec<RoleRef>,
-    /// Consumed refresh row on renewal; absent at first login. Doubles as the
-    /// credential id of a session authenticated by a stored refresh row.
-    pub(crate) rotated_from: Option<Uuid>,
-    /// Explicit `iat` for the access token, used when the session has to be
-    /// ordered against a revocation epoch. Absent means the wall clock.
-    pub(crate) issued_at: Option<DateTime<Utc>>,
-}
-
-/// Issue a human session's access and refresh pair and audit the grant.
-///
-/// The one owner for both ends of a human session: the OIDC callback that
-/// establishes it and the refresh grant that renews it. Keeping them together
-/// is what makes the family chain, the TTLs, and the audited grant identical
-/// on renewal — a second issuance site would drift from this one silently.
-///
-/// `rotated_from` is absent at first login and carries the consumed refresh row
-/// on renewal. It is both the family back-link that makes reuse detectable and
-/// the credential id of the renewed session: a federated sign-in presents a
-/// provider token and names no stored credential, but a request authenticated
-/// by a stored refresh row does.
-///
-/// Only human sessions get a refresh token. A machine client re-exchanges its
-/// durable credential instead, so no machine grant reaches this owner.
-///
-/// # Errors
-/// Returns a [`WyrdError`] when the access or refresh token cannot be signed,
-/// the refresh row cannot be written, or the audit append fails. Nothing is
-/// committed here: the caller's transaction commits the row, the audit, and
-/// the session together or not at all.
-pub(crate) async fn issue_and_record_user_session(
-    conn: &mut TenantConn<'_>,
-    issuing_key: &IssuingKey,
-    tenant_id: DataTenantId,
-    grant: UserSessionGrant,
-    request_id: &str,
-) -> Result<ExchangedToken, WyrdError> {
-    let UserSessionGrant {
-        principal_id,
-        roles,
-        rotated_from,
-        issued_at,
-    } = grant;
-    let principal = Principal::new(
-        PrincipalId::new(principal_id),
-        PrincipalKind::User,
-        tenant_id,
-        roles.clone(),
-        PermissionSet::default(),
-    );
-    let access_token = issuing_key
-        .issue_user_access_token_at(
-            TokenPrincipalRef::from(&principal),
-            roles.clone(),
-            rotated_from,
-            issued_at.unwrap_or_else(Utc::now),
-            ACCESS_TTL,
-        )
-        .map_err(|error| issue_error(&error))?;
-    let refresh_token = issuing_key
-        .issue_refresh_token(
-            PrincipalKindTag::User,
-            PrincipalId::new(principal_id),
-            tenant_id,
-            REFRESH_TTL,
-        )
-        .map_err(|error| issue_error(&error))?;
-    let now = Utc::now();
-    let expires_at = now + ACCESS_TTL;
-    let hash = token_hash(&refresh_token);
-    let successor = Uuid::new_v4();
-    match rotated_from {
-        Some(predecessor) => insert_refresh_token_rotated(
-            conn,
-            successor,
-            "user",
-            principal_id,
-            &hash,
-            now + REFRESH_TTL,
-            predecessor,
-        )
-        .await
-        .map_err(sql_error)?,
-        None => insert_refresh_token(
-            conn,
-            successor,
-            "user",
-            principal_id,
-            &hash,
-            now + REFRESH_TTL,
-        )
-        .await
-        .map_err(sql_error)?,
-    }
-    let user = PrincipalId::new(principal_id);
-    let event = auth_event(
-        request_id,
-        TOKEN_EXCHANGE_OPERATION,
-        user,
-        PrincipalKindTag::User,
-        None,
-        AuditOutcome::Allowed,
-        AuditDetail::TokenExchange {
-            subject_principal_id: user,
-            actor_principal_id: user,
-            delegation_chain: Vec::new(),
-            expires_at,
-        },
-    )
-    .with_credential_id(rotated_from);
-    append_auth_audit(conn, &event).await?;
-
-    Ok(ExchangedToken {
-        access_token: SecretString::from(access_token),
-        refresh_token: Some(SecretString::from(refresh_token)),
-        token_type: TokenType::Bearer,
-        expires_at,
-    })
-}
-
 /// Best-effort audit of a refused human authorization-code exchange.
 ///
 /// Stages one denied `auth.token.exchange` event carrying the closed failure
@@ -613,14 +450,6 @@ fn sql_error(error: impl Into<SqlError>) -> WyrdError {
     WyrdError::AuthVerifyUnavailable {
         message: "auth backend unavailable".to_owned(),
         details: serde_json::json!({ "retry_after_seconds": 1 }),
-    }
-}
-
-fn issue_error(error: &wyrd_auth_issue::IssueError) -> WyrdError {
-    tracing::warn!(error = %error, "OIDC token issue failed");
-    WyrdError::Internal {
-        message: "token issue failed".to_owned(),
-        details: serde_json::json!({}),
     }
 }
 
@@ -733,156 +562,6 @@ mod screening_tests {
                 .len(),
             discovery_requests,
             "no token request may leave the process after the screen refuses"
-        );
-    }
-}
-
-#[cfg(test)]
-mod pg_tests {
-    //! Durable proof for the role half of a federated sign-in.
-    //!
-    //! The callback replaces the human's persisted roles and, when that set
-    //! actually moved, advances their authorization epoch in the same
-    //! transaction. Both halves are schema behavior, so they are proven against
-    //! real Postgres rather than a stand-in.
-
-    use chrono::{DateTime, Timelike, Utc};
-    use uuid::Uuid;
-    use wyrd_dev_fixtures::pg::PgFixture;
-    use wyrd_sql::queries::auth::{
-        advance_user_epoch_to_next_second, insert_role, insert_user, replace_user_roles,
-        user_revocation_epoch,
-    };
-
-    /// Read the store's own clock.
-    ///
-    /// The epoch is written by Postgres, so bounding it against the test
-    /// process's clock would measure the skew between the host and the database
-    /// rather than the behavior under test.
-    async fn store_now(fixture: &PgFixture) -> DateTime<Utc> {
-        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        let (now,): (DateTime<Utc>,) = sqlx::query_as("SELECT now()")
-            .fetch_one(&mut **conn.transaction())
-            .await
-            .expect("the store reports its clock");
-        conn.commit().await.expect("clock read commits");
-        now
-    }
-
-    /// Seed a user and two assignable roles, returning the user's id.
-    async fn seed_user_with_roles(fixture: &PgFixture) -> Uuid {
-        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        let user_id = Uuid::new_v4();
-        insert_user(&mut conn, user_id, Some("federated@test.com"), "oidc", None)
-            .await
-            .expect("user inserts");
-        for name in ["runtime_admin", "writer"] {
-            insert_role(
-                &mut conn,
-                Uuid::new_v4(),
-                name,
-                &serde_json::json!([]),
-                false,
-            )
-            .await
-            .expect("role inserts");
-        }
-        replace_user_roles(&mut conn, user_id, &["runtime_admin", "writer"])
-            .await
-            .expect("initial roles persist");
-        conn.commit().await.expect("seed commits");
-        user_id
-    }
-
-    /// A login that withdraws a role reports the change and moves the epoch
-    /// past every token that could already have been minted.
-    ///
-    /// Role names travel in signed access-token claims, so the withdrawal only
-    /// reaches a live session through the epoch. `iat` is whole seconds, so an
-    /// epoch merely truncated to the current second leaves a predecessor minted
-    /// earlier in that same second with `iat == epoch`, which the verifier
-    /// admits. The epoch therefore lands on the next whole second: strictly
-    /// ahead of every `iat` obtainable before the change, and exactly the
-    /// instant the successor is minted at.
-    ///
-    /// # Panics
-    /// Panics when the role write fails, when the reduced set is not reported
-    /// as a change, or when the epoch does not strictly follow the second the
-    /// predecessor was minted in.
-    #[tokio::test]
-    async fn a_withdrawn_role_advances_the_epoch_past_a_same_second_token() {
-        let fixture = PgFixture::start().await.expect("fixture starts");
-        let user_id = seed_user_with_roles(&fixture).await;
-        // The `iat` an access token minted immediately before the withdrawal
-        // carries: the store's clock truncated to whole seconds.
-        let predecessor_iat = store_now(&fixture)
-            .await
-            .with_nanosecond(0)
-            .expect("truncating to the second is representable");
-
-        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        let changed = replace_user_roles(&mut conn, user_id, &["writer"])
-            .await
-            .expect("reduced role set persists");
-        assert!(changed, "removing a role is a change the caller must see");
-        let epoch = advance_user_epoch_to_next_second(&mut conn, user_id)
-            .await
-            .expect("epoch advances")
-            .expect("advancing a seeded user's epoch matches a row");
-        conn.commit().await.expect("role change commits");
-
-        assert!(
-            epoch > predecessor_iat,
-            "a token minted in the same second as the withdrawal is retired: \
-             epoch {epoch} must strictly follow iat {predecessor_iat}"
-        );
-        // The successor is minted at exactly this instant, and the verifier
-        // retires a token only when `iat` is strictly older, so the epoch must
-        // be a whole second the successor can carry in its claims.
-        assert_eq!(
-            epoch.timestamp_subsec_nanos(),
-            0,
-            "the epoch is a whole second the successor can carry"
-        );
-
-        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        let stored = user_revocation_epoch(&mut conn, user_id)
-            .await
-            .expect("epoch lookup runs")
-            .expect("a changed login leaves an epoch");
-        assert_eq!(
-            stored, epoch,
-            "the returned epoch is the one the successor is ordered against"
-        );
-    }
-
-    /// Re-asserting the same roles must not sign the human out elsewhere.
-    ///
-    /// # Panics
-    /// Panics when an unchanged login reports a change or when it moves the
-    /// authorization epoch.
-    #[tokio::test]
-    async fn an_unchanged_login_reports_no_change_and_leaves_the_epoch_alone() {
-        let fixture = PgFixture::start().await.expect("fixture starts");
-        let user_id = seed_user_with_roles(&fixture).await;
-
-        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        let changed = replace_user_roles(&mut conn, user_id, &["runtime_admin", "writer"])
-            .await
-            .expect("identical role set persists");
-        conn.commit().await.expect("unchanged login commits");
-        assert!(
-            !changed,
-            "an identical role set is not a change and must not retire live sessions"
-        );
-
-        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        let epoch = user_revocation_epoch(&mut conn, user_id)
-            .await
-            .expect("epoch lookup runs");
-        assert!(
-            epoch.is_none(),
-            "an unchanged login leaves the authorization epoch untouched, got: {epoch:?}"
         );
     }
 }

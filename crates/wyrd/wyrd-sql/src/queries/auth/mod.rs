@@ -27,10 +27,7 @@ pub use refresh_tokens::{
     consume_active_refresh, insert_refresh_token_rotated, refresh_by_hash, revoke_refresh,
     revoke_refresh_family,
 };
-pub use revocation::{
-    PrincipalAdmission, advance_user_epoch_to_next_second, revoke_service_account_principal,
-    revoke_user_principal, service_account_admission, user_admission, user_revocation_epoch,
-};
+pub use revocation::{suspend_service_account_principal, suspend_user_principal};
 pub use role_assignments::{
     grant_role_to_service_account, grant_role_to_user, list_service_account_roles, list_user_roles,
     replace_user_roles, revoke_role_from_service_account, revoke_role_from_user,

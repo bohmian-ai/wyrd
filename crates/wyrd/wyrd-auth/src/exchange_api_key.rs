@@ -1,143 +1,53 @@
-//! API-key exchange and RFC 8693 delegation services.
+//! API-key exchange and RFC 8693 delegation entry paths.
+//!
+//! Each verifies only its own grant-specific evidence — the presented API key
+//! or the caller's access token and delegation permission — then mints through
+//! the shared [`TenantTokenIssuer`].
 
-use std::sync::Arc;
-
-use chrono::{DateTime, Duration, Utc};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use uuid::Uuid;
-use wyrd_auth_issue::{DelegationCaller, IssueError, IssuingKey};
+use wyrd_auth_issue::DelegationCaller;
 use wyrd_auth_verify::{ActClaim, AuthError, TokenPrincipalRef, TokenVerifier};
-use wyrd_runtime::{Permission, PermissionCheck, PrincipalId, PrincipalKind, RoleRef};
+use wyrd_runtime::{Permission, PermissionCheck, RoleRef};
 use wyrd_spec::auth::PrincipalKindTag;
-use wyrd_spec::auth::{RequestedSubject, SecretBearer, TokenResponse, TokenType};
-use wyrd_spec::envelope::CardKind;
+use wyrd_spec::auth::RequestedSubject;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::reference::{CardRef, CardRefScope};
-use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
-use wyrd_spec::vala::audit_detail::CardScopeMintKind;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
-    ApiKeyStatus, api_key_by_prefix, api_key_status_by_prefix, list_service_account_roles,
-    service_account_by_id, touch_api_key_last_used,
+    ApiKeyStatus, api_key_by_prefix, api_key_status_by_prefix, service_account_by_id,
+    touch_api_key_last_used,
 };
-use wyrd_sql::queries::platform::tenant_resolver::tenant_admits_credentials;
 
-use crate::audit::{TOKEN_EXCHANGE_OPERATION, append_auth_audit, auth_event};
 use crate::credential_verify::verify_presented;
-
-use crate::card_scope::{
-    IssueErrorOrWyrd, MINT_KIND_API_KEY_EXCHANGE, MINT_KIND_DELEGATION, issue_scope_error,
-    resolve_card_ref_scope, write_scope_mint_success_audit,
-};
 use crate::error::auth_error_to_wyrd;
+use crate::issuance::{ExchangedToken, IssuanceError, TenantGrant, TenantTokenIssuer};
 use crate::issue_api_key::{WyrdApiKey, principal_kind_for_card};
-use crate::permission_resolver::SqlPermissionResolver;
-use crate::pg_resolvers::PgIssuerResolver;
-
-/// Token exchange settings.
-#[derive(Debug, Clone)]
-pub struct TokenExchangeSettings {
-    /// Access token lifetime.
-    pub access_ttl: Duration,
-    /// Refresh token lifetime.
-    pub refresh_ttl: Duration,
-}
-
-impl Default for TokenExchangeSettings {
-    fn default() -> Self {
-        Self {
-            access_ttl: Duration::minutes(15),
-            refresh_ttl: Duration::days(30),
-        }
-    }
-}
 
 /// API-key exchange service.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ExchangeApiKey {
-    /// JWT issuing key.
-    pub issuing_key: Arc<IssuingKey>,
-    /// Settings.
-    pub settings: TokenExchangeSettings,
-}
-
-impl std::fmt::Debug for ExchangeApiKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ExchangeApiKey")
-            .field("settings", &self.settings)
-            .finish_non_exhaustive()
-    }
+    /// The shared tenant issuance workflow.
+    pub issuer: TenantTokenIssuer,
 }
 
 /// Delegated token service.
 #[derive(Clone)]
 pub struct DelegateToken {
-    /// JWT issuing key.
-    pub issuing_key: Arc<IssuingKey>,
-    /// JWT verifier.
-    pub verifier: Arc<TokenVerifier<SqlPermissionResolver, PgIssuerResolver>>,
+    /// The shared tenant issuance workflow.
+    pub issuer: TenantTokenIssuer,
+    /// Wyrd access-token verifier for the caller's subject token.
+    pub verifier: TokenVerifier,
     /// Permission checker.
-    pub permission_check: Arc<dyn PermissionCheck>,
-    /// Settings.
-    pub settings: TokenExchangeSettings,
+    pub permission_check: std::sync::Arc<dyn PermissionCheck>,
 }
 
 impl std::fmt::Debug for DelegateToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DelegateToken")
-            .field("settings", &self.settings)
+            .field("issuer", &self.issuer)
             .finish_non_exhaustive()
     }
-}
-
-/// Internal exchanged-token shape.
-#[derive(Debug, Clone)]
-pub struct ExchangedToken {
-    /// Access token.
-    pub access_token: SecretString,
-    /// Refresh token. Present only for a human OIDC session, which has no
-    /// durable credential to re-present. Every machine grant — API-key
-    /// exchange, workload `jwt-bearer`, and `token-exchange` delegation —
-    /// leaves this `None` and re-exchanges its credential instead.
-    pub refresh_token: Option<SecretString>,
-    /// Token type.
-    pub token_type: TokenType,
-    /// Access token expiry.
-    pub expires_at: chrono::DateTime<Utc>,
-}
-
-impl ExchangedToken {
-    /// Convert to public token response.
-    #[must_use]
-    pub fn into_response(self) -> TokenResponse {
-        TokenResponse {
-            access_token: SecretBearer::new(self.access_token.expose_secret().to_owned()),
-            refresh_token: self
-                .refresh_token
-                .map(|token| SecretBearer::new(token.expose_secret().to_owned())),
-            token_type: self.token_type,
-            expires_at: self.expires_at,
-        }
-    }
-}
-
-/// The service/agent principal a token is being issued for.
-pub(crate) struct IssueSubject {
-    /// Stable principal id.
-    pub principal_id: Uuid,
-    /// Principal kind label, as stored on the durable principal row.
-    pub principal_kind: String,
-    /// Bound Card reference embedded in the access token, absent for a
-    /// principal that binds no Card.
-    pub card_ref: Option<CardRef>,
-    /// Effective roles embedded in the access token.
-    pub roles: Vec<RoleRef>,
-    /// Non-secret id of the credential presented to earn this token, when one
-    /// was. It travels in the access token's claims so audit names the key a
-    /// decision was made with, not merely its holder.
-    pub credential_id: Option<Uuid>,
 }
 
 /// API-key exchange failure.
@@ -149,8 +59,8 @@ pub enum ExchangeError {
     /// No unexpired, unrevoked key matching this prefix exists.
     #[error("api key not found")]
     NotFound,
-    /// Key exists but the associated service account is not active.
-    #[error("service account is not active")]
+    /// Key exists but the associated principal is not active.
+    #[error("principal is not active")]
     AccountDisabled,
     /// The key's tenant is not in a state that admits credentials.
     ///
@@ -160,24 +70,30 @@ pub enum ExchangeError {
     /// principal or an unknown key.
     #[error("tenant does not admit credentials")]
     TenantNotAdmitting,
-    /// Key exists and account is active but Argon2 hash verification failed.
+    /// Key exists but Argon2 hash verification failed.
     #[error("api key hash mismatch")]
     HashMismatch,
-    /// JWT issue failure.
-    #[error("token issue failed")]
-    Issue(#[from] IssueError),
     /// Blocking task failed.
     #[error("api key verify task failed")]
     Join(#[from] tokio::task::JoinError),
-    /// Role name from SQL was invalid.
-    #[error("role name is invalid")]
-    InvalidRole,
     /// Database operation failed.
     #[error("database operation failed")]
     Database(#[from] sqlx::Error),
-    /// Wyrd contract error.
-    #[error("wyrd error")]
-    Wyrd(#[from] WyrdError),
+    /// The shared issuance workflow failed for a reason other than an
+    /// inactive tenant or principal.
+    #[error("token issuance failed")]
+    Issuance(IssuanceError),
+}
+
+impl From<IssuanceError> for ExchangeError {
+    fn from(error: IssuanceError) -> Self {
+        match error {
+            IssuanceError::TenantNotAdmitting => Self::TenantNotAdmitting,
+            IssuanceError::PrincipalInactive => Self::AccountDisabled,
+            IssuanceError::Database(error) => Self::Database(error),
+            other => Self::Issuance(other),
+        }
+    }
 }
 
 /// Delegated token failure.
@@ -186,28 +102,36 @@ pub enum DelegateError {
     /// Subject token failed verification.
     #[error("subject token invalid")]
     InvalidSubjectToken(#[from] AuthError),
-    /// Requested subject not found.
+    /// Requested subject not found, inactive, or not Card-bound.
     #[error("requested subject not found")]
     SubjectNotFound,
     /// Permission denied.
     #[error("caller lacks delegation issue permission")]
     PermissionDenied,
-    /// JWT issue failure.
-    #[error("token issue failed")]
-    Issue(#[from] IssueError),
-    /// Role name from SQL was invalid.
-    #[error("role name is invalid")]
-    InvalidRole,
     /// Database operation failed.
     #[error("database operation failed")]
     Database(#[from] sqlx::Error),
-    /// Wyrd contract error.
-    #[error("wyrd error")]
-    Wyrd(#[from] WyrdError),
+    /// The shared issuance workflow failed.
+    #[error("token issuance failed")]
+    Issuance(IssuanceError),
+}
+
+impl From<IssuanceError> for DelegateError {
+    fn from(error: IssuanceError) -> Self {
+        match error {
+            IssuanceError::PrincipalInactive => Self::SubjectNotFound,
+            other => Self::Issuance(other),
+        }
+    }
 }
 
 impl ExchangeApiKey {
-    /// Exchange a Wyrd API key for access and refresh tokens.
+    /// Exchange a Wyrd API key for a tenant access token.
+    ///
+    /// Verifies the key itself — format, tenant, an unexpired unrevoked row
+    /// for its prefix, and the Argon2 secret — at a fixed cost, records the
+    /// key's use, then mints through the shared issuance workflow, which
+    /// refuses an inactive tenant or principal and resolves current grants.
     ///
     /// # Errors
     /// All authentication failures map to `WyrdError::ApiKeyInvalid` at the HTTP
@@ -225,27 +149,17 @@ impl ExchangeApiKey {
         request_id: &str,
     ) -> Result<ExchangedToken, ExchangeError> {
         // Every refusal is decided first and answered last, because Argon2 is
-        // what a refusal costs. A malformed key, another tenant's key, a
-        // suspended tenant, an unknown prefix, and a disabled account all used
-        // to return before verification ran, so a live prefix with a wrong tail
-        // took measurably longer than any of them — enough to enumerate live
-        // prefixes by clock without ever guessing a secret.
+        // what a refusal costs. A malformed key, another tenant's key, or an
+        // unknown prefix must not return before verification runs, or a live
+        // prefix with a wrong tail would take measurably longer than any of
+        // them — enough to enumerate live prefixes by clock.
         let (row, refusal) = match WyrdApiKey::parse(api_key.expose_secret()) {
             Err(_) => (None, Some(ExchangeError::NotFound)),
             Ok(parsed) if parsed.tenant_id != conn.data_tenant_id() => {
                 (None, Some(ExchangeError::CrossTenant))
             }
-            // The tenant's own lifecycle decides before the principal's does.
-            // Suspending a tenant has to stop its credentials working, or the
-            // status is a label rather than a control — and this is the one place
-            // every credential-bearing entry to a tenant converges, so checking
-            // here cannot be forgotten by a route added later.
-            Ok(parsed) if !tenant_admits_credentials(conn, parsed.tenant_id).await? => {
-                (None, Some(ExchangeError::TenantNotAdmitting))
-            }
             Ok(parsed) => match api_key_by_prefix(conn, &parsed.prefix).await? {
                 None => (None, Some(ExchangeError::NotFound)),
-                Some(row) if row.status != "active" => (None, Some(ExchangeError::AccountDisabled)),
                 Some(row) => (Some(row), None),
             },
         };
@@ -261,34 +175,32 @@ impl ExchangeApiKey {
             return Err(ExchangeError::HashMismatch);
         }
 
-        let roles = role_refs(list_service_account_roles(conn, row.principal_id).await?)
-            .map_err(|_| ExchangeError::InvalidRole)?;
         touch_api_key_last_used(conn, row.api_key_id).await?;
-        issue_for_subject(
-            conn,
-            &self.issuing_key,
-            &self.settings,
-            IssueSubject {
-                principal_id: row.principal_id,
-                principal_kind: row.principal_kind,
-                card_ref: row.card_ref.map(|card_ref| card_ref.0),
-                roles,
-                credential_id: Some(row.api_key_id),
-            },
-            request_id,
-            MINT_KIND_API_KEY_EXCHANGE,
-        )
-        .await
-        .map_err(ExchangeError::from)
+        Ok(self
+            .issuer
+            .issue(
+                conn,
+                row.principal_id,
+                TenantGrant::ApiKey {
+                    credential_id: row.api_key_id,
+                },
+                request_id,
+            )
+            .await?)
     }
 }
 
 impl DelegateToken {
     /// Exchange an access token for a delegated Service/Agent token.
     ///
+    /// Verifies the caller's access token locally, requires the delegation
+    /// permission in its claims, and resolves the requested Card-bound
+    /// subject, then mints through the shared issuance workflow with the
+    /// caller as the newest `act` layer.
+    ///
     /// # Errors
     /// Returns a typed error when verification, permission, subject resolution,
-    /// issue, or database work fails.
+    /// issuance, or database work fails.
     #[tracing::instrument(level = "debug", skip(self, conn, subject_token), err)]
     pub async fn execute(
         &self,
@@ -297,330 +209,33 @@ impl DelegateToken {
         requested_subject: RequestedSubject,
         request_id: &str,
     ) -> Result<ExchangedToken, DelegateError> {
-        let verified = self
-            .verifier
-            .verify(&subject_token, &conn.data_tenant_id())
-            .await?;
+        let tenant = conn.data_tenant_id();
+        let verified = self.verifier.verify(&subject_token, &tenant)?;
         self.permission_check
             .check(&verified.principal, &Permission::delegation_issue())
             .into_result()
             .map_err(|_| DelegateError::PermissionDenied)?;
 
         let row = resolve_requested_subject(conn, requested_subject).await?;
-        let requested_card_ref = row
-            .card_ref
-            .clone()
-            .map(|card_ref| card_ref.0)
-            .ok_or(DelegateError::SubjectNotFound)?;
-        let card_ref_scope = resolve_card_ref_scope(conn, &requested_card_ref).await?;
-        let _ = runtime_principal_kind(&row.principal_kind, Some(requested_card_ref.clone()))
-            .ok_or(DelegateError::SubjectNotFound)?;
-        let roles = role_refs(list_service_account_roles(conn, row.id).await?)
-            .map_err(|_| DelegateError::InvalidRole)?;
+        // Delegation hands a caller's authority to a deployed workload, so
+        // the target must be Card-bound.
+        if row.card_ref.is_none() {
+            return Err(DelegateError::SubjectNotFound);
+        }
         let caller = DelegationCaller {
             sub: verified.delegation_chain.first().map_or_else(
                 || verified.principal.id.to_string(),
                 |step| step.principal.id.to_string(),
             ),
             principal: TokenPrincipalRef::from(&verified.principal),
-            act: act_from_chain(&verified.delegation_chain, conn.data_tenant_id()),
+            act: act_from_chain(&verified.delegation_chain, tenant),
         };
-        let requested_ref = principal_ref(
-            row.id,
-            &row.principal_kind,
-            conn.data_tenant_id(),
-            requested_card_ref.clone(),
-            card_ref_scope.clone(),
-        )
-        .ok_or(DelegateError::SubjectNotFound)?;
-        let access_token = self
-            .issuing_key
-            .issue_delegated_access_token(
-                &caller,
-                requested_ref,
-                roles.clone(),
-                self.settings.access_ttl,
-            )
-            .map_err(|error| delegate_issue_error(error, &requested_card_ref))?;
         // Delegated tokens are short-lived and non-refreshable by design
-        // (RFC 8693). The caller re-delegates when the access token expires, so
-        // no refresh token is issued or persisted for the delegated principal.
-        let expires_at = Utc::now() + self.settings.access_ttl;
-        let mut event = auth_event(
-            request_id,
-            TOKEN_EXCHANGE_OPERATION,
-            verified.principal.id,
-            verified.principal.kind.tag(),
-            verified.principal.card_ref().cloned(),
-            AuditOutcome::Allowed,
-            AuditDetail::TokenExchange {
-                subject_principal_id: PrincipalId::new(row.id),
-                actor_principal_id: verified.principal.id,
-                delegation_chain: verified
-                    .delegation_chain
-                    .iter()
-                    .filter_map(|step| step.principal.card_ref().cloned())
-                    .collect(),
-                expires_at,
-            },
-        );
-        event.permission = Permission::delegation_issue().to_string();
-        append_auth_audit(conn, &event).await?;
-        write_scope_mint_success_audit(
-            conn,
-            row.id,
-            &requested_card_ref,
-            &card_ref_scope,
-            request_id,
-            MINT_KIND_DELEGATION,
-        )
-        .await?;
-
-        Ok(ExchangedToken {
-            access_token: SecretString::from(access_token),
-            refresh_token: None,
-            token_type: TokenType::Bearer,
-            expires_at,
-        })
-    }
-}
-
-/// Issue tokens for a principal that binds no Card.
-///
-/// Separate from the Card-bound path because there is no card scope to resolve
-/// and no scope-mint audit to write: a Card-free principal has no emit
-/// authority to attribute. Its roles and tenant still bound what it may do.
-///
-/// Synchronous because a Card-free grant writes nothing: it reads the tenant
-/// key off the caller's transaction and signs, leaving no renewal state
-/// behind.
-///
-/// # Errors
-/// Returns an issuance error when the kind is not Card-free-eligible or
-/// signing fails.
-fn issue_cardless_subject(
-    conn: &TenantConn<'_>,
-    issuing_key: &IssuingKey,
-    settings: &TokenExchangeSettings,
-    subject: IssueSubject,
-) -> Result<ExchangedToken, IssueOrSqlError> {
-    let IssueSubject {
-        principal_id,
-        principal_kind,
-        card_ref: _,
-        roles,
-        credential_id,
-    } = subject;
-    let id = PrincipalId::new(principal_id);
-    let wire = principal_kind_wire(&principal_kind).ok_or(IssueError::InvalidPrincipalKind)?;
-    let access_token = issuing_key.issue_cardless_access_token(
-        TokenPrincipalRef {
-            id,
-            kind: wire,
-            tenant_id: conn.data_tenant_id(),
-            card_ref: None,
-            card_ref_scope: CardRefScope::default(),
-        },
-        roles,
-        credential_id,
-        settings.access_ttl,
-    )?;
-
-    Ok(ExchangedToken {
-        access_token: SecretString::from(access_token),
-        refresh_token: None,
-        token_type: TokenType::Bearer,
-        expires_at: Utc::now() + settings.access_ttl,
-    })
-}
-
-/// Issue an access token and scope-mint audit for a machine principal.
-///
-/// No refresh token: every caller here holds a durable credential — an API key
-/// or a platform-attested assertion — and re-exchanges it for a fresh access
-/// token. Minting a long-lived refresh secret for a holder that never needs one
-/// only widens the leak surface. Only a human OIDC session, which has no
-/// durable credential to re-present, receives and rotates a refresh token.
-///
-/// # Errors
-/// Returns [`IssueOrSqlError`] when the principal kind is not issuable, when a
-/// Card-bound subject's Card cannot be resolved or does not match the kind's
-/// binding rule, when signing fails, or when the audit append or store access
-/// fails. The grant and its audit rows share one transaction, so a failure here
-/// serves no token.
-pub(crate) async fn issue_for_subject(
-    conn: &mut TenantConn<'_>,
-    issuing_key: &IssuingKey,
-    settings: &TokenExchangeSettings,
-    subject: IssueSubject,
-    request_id: &str,
-    mint_kind: CardScopeMintKind,
-) -> Result<ExchangedToken, IssueOrSqlError> {
-    // A Card-free principal — a tenant administrator or tenant automation —
-    // carries no bound Card and therefore no emit scope. It still holds roles
-    // and must be able to exchange its credential, or a provisioned tenant
-    // would hand back a credential that never works.
-    if subject.card_ref.is_none() {
-        let principal_id = subject.principal_id;
-        let credential_id = subject.credential_id;
-        let kind =
-            principal_kind_wire(&subject.principal_kind).ok_or(IssueError::InvalidPrincipalKind)?;
-        let exchanged = issue_cardless_subject(conn, issuing_key, settings, subject)?;
-        append_token_exchange_audit(
-            conn,
-            principal_id,
-            kind,
-            None,
-            credential_id,
-            exchanged.expires_at,
-            request_id,
-        )
-        .await?;
-        return Ok(exchanged);
-    }
-    let IssueSubject {
-        principal_id,
-        principal_kind,
-        card_ref,
-        roles,
-        credential_id,
-    } = subject;
-    let id = PrincipalId::new(principal_id);
-    let card_ref = card_ref.expect("invariant: card-free subjects returned above");
-    let card_ref_scope = resolve_card_ref_scope(conn, &card_ref).await?;
-    let kind = match principal_kind.as_str() {
-        "service" => PrincipalKindTag::Service,
-        "agent" => PrincipalKindTag::Agent,
-        _ => return Err(IssueOrSqlError::Issue(IssueError::InvalidPrincipalKind)),
-    };
-    let access_token = issuing_key
-        .issue_card_access_token(
-            TokenPrincipalRef {
-                id,
-                kind,
-                tenant_id: conn.data_tenant_id(),
-                card_ref: Some(card_ref.clone()),
-                card_ref_scope: card_ref_scope.clone(),
-            },
-            roles.clone(),
-            credential_id,
-            settings.access_ttl,
-        )
-        .map_err(|error| issue_or_wyrd_error(error, &card_ref))?;
-    let expires_at = Utc::now() + settings.access_ttl;
-    // Two different decisions, two records. The scope mint says what emit
-    // authority the Card conferred; the exchange says a credential was spent to
-    // obtain a token and which one. Folding them would lose the credential a
-    // leak investigation needs to revoke.
-    append_token_exchange_audit(
-        conn,
-        principal_id,
-        kind,
-        Some(card_ref.clone()),
-        credential_id,
-        expires_at,
-        request_id,
-    )
-    .await?;
-    write_scope_mint_success_audit(
-        conn,
-        principal_id,
-        &card_ref,
-        &card_ref_scope,
-        request_id,
-        mint_kind,
-    )
-    .await?;
-
-    Ok(ExchangedToken {
-        access_token: SecretString::from(access_token),
-        refresh_token: None,
-        token_type: TokenType::Bearer,
-        expires_at,
-    })
-}
-
-/// Append the one canonical grant record for a tenant token exchange.
-///
-/// Every tenant grant passes through here, Card-free and Card-bound alike, so
-/// the record naming the spent credential cannot be forgotten by a caller that
-/// only handles one of the two shapes. The event goes on the caller's
-/// `TenantConn`, so the token and its record commit together: a returned token
-/// with no committed grant row, or a row for a grant that was rolled back, are
-/// both impossible.
-///
-/// `credential_id` is the API-key row the holder presented, absent only when a
-/// grant names no stored credential.
-///
-/// # Errors
-/// Returns the append failure, which refuses the grant. A token the deployment
-/// cannot account for is worse than a refused exchange the caller can retry.
-async fn append_token_exchange_audit(
-    conn: &mut TenantConn<'_>,
-    principal_id: Uuid,
-    kind: PrincipalKindTag,
-    card_ref: Option<CardRef>,
-    credential_id: Option<Uuid>,
-    expires_at: DateTime<Utc>,
-    request_id: &str,
-) -> Result<(), IssueOrSqlError> {
-    let id = PrincipalId::new(principal_id);
-    let event = auth_event(
-        request_id,
-        TOKEN_EXCHANGE_OPERATION,
-        id,
-        kind,
-        card_ref,
-        AuditOutcome::Allowed,
-        AuditDetail::TokenExchange {
-            subject_principal_id: id,
-            actor_principal_id: id,
-            delegation_chain: Vec::new(),
-            expires_at,
-        },
-    )
-    .with_credential_id(credential_id);
-    append_auth_audit(conn, &event).await?;
-    Ok(())
-}
-
-/// Map card-bound issuer errors into the API-key exchange error channel.
-fn issue_or_wyrd_error(error: IssueError, root: &CardRef) -> IssueOrSqlError {
-    match issue_scope_error(error, root) {
-        IssueErrorOrWyrd::Issue(error) => IssueOrSqlError::Issue(error),
-        IssueErrorOrWyrd::Wyrd(error) => IssueOrSqlError::Wyrd(error),
-    }
-}
-
-/// Map card-bound issuer errors into the delegation error channel.
-fn delegate_issue_error(error: IssueError, root: &CardRef) -> DelegateError {
-    match issue_scope_error(error, root) {
-        IssueErrorOrWyrd::Issue(error) => DelegateError::Issue(error),
-        IssueErrorOrWyrd::Wyrd(error) => DelegateError::Wyrd(error),
-    }
-}
-
-/// Error channel for token issue and database work during subject token minting.
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum IssueOrSqlError {
-    /// Token issuer rejected the mint operation.
-    #[error("issue")]
-    Issue(#[from] IssueError),
-    /// Database operation failed.
-    #[error("db")]
-    Database(#[from] sqlx::Error),
-    /// Public Wyrd contract error.
-    #[error("wyrd")]
-    Wyrd(#[from] WyrdError),
-}
-
-impl From<IssueOrSqlError> for ExchangeError {
-    fn from(error: IssueOrSqlError) -> Self {
-        match error {
-            IssueOrSqlError::Issue(error) => Self::Issue(error),
-            IssueOrSqlError::Database(error) => Self::Database(error),
-            IssueOrSqlError::Wyrd(error) => Self::Wyrd(error),
-        }
+        // (RFC 8693): the caller re-delegates when the token expires.
+        Ok(self
+            .issuer
+            .issue(conn, row.id, TenantGrant::Delegation(caller), request_id)
+            .await?)
     }
 }
 
@@ -647,12 +262,10 @@ pub(crate) fn role_refs(names: Vec<String>) -> Result<Vec<RoleRef>, wyrd_runtime
     names.into_iter().map(|name| RoleRef::new(&name)).collect()
 }
 
-/// Convert a stored principal kind string into the token wire enum.
+/// Convert a stored tenant machine-principal kind into the token wire enum.
 ///
-/// Public because the kind is not merely informational: the revocation-epoch
-/// cache is keyed by it, so any caller fanning out a revocation has to name the
-/// stored kind rather than assume one. `None` for an unrecognized value, which
-/// every caller must treat as a refusal rather than defaulting.
+/// `None` for an unrecognized value, which every caller must treat as a
+/// refusal rather than defaulting.
 pub fn principal_kind_wire(value: &str) -> Option<PrincipalKindTag> {
     match value {
         "tenant_admin" => Some(PrincipalKindTag::TenantAdmin),
@@ -662,53 +275,8 @@ pub fn principal_kind_wire(value: &str) -> Option<PrincipalKindTag> {
     }
 }
 
-/// Rebuild the runtime principal kind from its durable label and Card binding.
-///
-/// Card binding is a property of a machine principal rather than a
-/// precondition, so a `service` row with no Card resolves to a Card-free
-/// service that carries no emit scope. A mismatched Card kind resolves to
-/// `None`, which the caller turns into a fail-closed refusal.
-fn runtime_principal_kind(value: &str, card_ref: Option<CardRef>) -> Option<PrincipalKind> {
-    match (value, card_ref) {
-        ("tenant_admin", None) => Some(PrincipalKind::TenantAdmin),
-        ("service", None) => Some(PrincipalKind::Service {
-            card_ref: None,
-            card_ref_scope: CardRefScope::default(),
-        }),
-        ("service", Some(card_ref)) if card_ref.kind == CardKind::Service => {
-            let card_ref_scope = CardRefScope::own(&card_ref);
-            Some(PrincipalKind::Service {
-                card_ref: Some(card_ref),
-                card_ref_scope,
-            })
-        }
-        ("agent", Some(card_ref)) if card_ref.kind == CardKind::Agent => {
-            let card_ref_scope = CardRefScope::own(&card_ref);
-            Some(PrincipalKind::Agent {
-                card_ref,
-                card_ref_scope,
-            })
-        }
-        _ => None,
-    }
-}
-
-fn principal_ref(
-    id: Uuid,
-    kind: &str,
-    tenant_id: wyrd_spec::DataTenantId,
-    card_ref: CardRef,
-    card_ref_scope: CardRefScope,
-) -> Option<TokenPrincipalRef> {
-    Some(TokenPrincipalRef {
-        id: PrincipalId::new(id),
-        kind: principal_kind_wire(kind)?,
-        tenant_id,
-        card_ref: Some(card_ref),
-        card_ref_scope,
-    })
-}
-
+/// Rebuild an RFC 8693 `act` chain (newest layer outermost) from a verified
+/// initiator-first delegation chain.
 fn act_from_chain(
     chain: &[wyrd_runtime::DelegationStep],
     tenant_id: wyrd_spec::DataTenantId,
@@ -789,13 +357,13 @@ pub async fn map_exchange_error_to_wyrd(
         // the log line: an operator still needs to know whether a key was
         // revoked or expired.
         ExchangeError::NotFound => resolve_not_found_reason(conn, prefix).await,
-        ExchangeError::Issue(_) | ExchangeError::Join(_) | ExchangeError::InvalidRole => {
+        ExchangeError::Join(_) => {
             return WyrdError::Internal {
                 message: "failed to exchange API key".to_owned(),
                 details: json!({}),
             };
         }
-        ExchangeError::Wyrd(error) => return error,
+        ExchangeError::Issuance(error) => return error.into(),
         ExchangeError::Database(_) => {
             return WyrdError::AuthVerifyUnavailable {
                 message: "auth backend unavailable".to_owned(),
@@ -832,21 +400,8 @@ impl From<DelegateError> for WyrdError {
                 message: "caller lacks delegation issue permission".to_owned(),
                 details: json!({ "required": Permission::delegation_issue() }),
             },
-            DelegateError::Issue(IssueError::DelegationDepthExceeded { max }) => {
-                WyrdError::DelegationDepthExceededIssue {
-                    message: format!("delegation chain would exceed max depth of {max}"),
-                    details: json!({ "max": max }),
-                }
-            }
-            DelegateError::Issue(_) | DelegateError::InvalidRole => WyrdError::Internal {
-                message: "failed to issue delegated token".to_owned(),
-                details: json!({}),
-            },
-            DelegateError::Wyrd(error) => error,
-            DelegateError::Database(_) => WyrdError::AuthVerifyUnavailable {
-                message: "auth backend unavailable".to_owned(),
-                details: json!({ "retry_after_seconds": 1 }),
-            },
+            DelegateError::Database(error) => IssuanceError::Database(error).into(),
+            DelegateError::Issuance(error) => error.into(),
         }
     }
 }
@@ -863,13 +418,13 @@ mod pg_tests {
     use serde_json::Value as JsonValue;
     use sqlx::types::Json;
     use uuid::Uuid;
-    use wyrd_auth_issue::IssuingKey;
+    use wyrd_auth_issue::{AccessGrant, IssuingKey};
     use wyrd_auth_verify::{
         Kid, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem,
     };
     use wyrd_dev_fixtures::cards::seed_backing_card;
     use wyrd_dev_fixtures::pg::PgFixture;
-    use wyrd_runtime::{PrincipalId, RbacCheck, RoleRef};
+    use wyrd_runtime::{Permission, PermissionSet, PrincipalId, RbacCheck};
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::{PrincipalKindTag, RequestedSubject};
@@ -882,11 +437,9 @@ mod pg_tests {
     use crate::credential_verify;
     use wyrd_sql::queries::auth::ApiKeyStatus;
 
-    use super::{
-        DelegateError, DelegateToken, ExchangeApiKey, ExchangeError, TokenExchangeSettings,
-    };
+    use super::{DelegateError, DelegateToken, ExchangeApiKey, ExchangeError};
+    use crate::issuance::{TenantTokenIssuer, TokenExchangeSettings};
     use crate::issue_api_key::WyrdApiKey;
-    use crate::permission_resolver::SqlPermissionResolver;
     use crate::seed::seed_builtin_roles_for_tenant;
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
@@ -913,11 +466,48 @@ mod pg_tests {
         )
     }
 
+    fn test_issuer() -> TenantTokenIssuer {
+        TenantTokenIssuer::new(test_issuing_key(), TokenExchangeSettings::default())
+    }
+
     fn exchange_service() -> ExchangeApiKey {
         ExchangeApiKey {
-            issuing_key: test_issuing_key(),
-            settings: TokenExchangeSettings::default(),
+            issuer: test_issuer(),
         }
+    }
+
+    /// Build a delegation service whose verifier trusts the test signing key.
+    fn delegate_service() -> DelegateToken {
+        let public_key = public_key_from_pem(PUBLIC_KEY_PEM).expect("test public key loads");
+        let mut decoding_keys = HashMap::new();
+        decoding_keys.insert(Kid::new("k1").expect("kid is valid"), Arc::new(public_key));
+        DelegateToken {
+            issuer: test_issuer(),
+            verifier: TokenVerifier::new(decoding_keys, "wyrd", WyrdAuthVerifySettings::default()),
+            permission_check: Arc::new(RbacCheck),
+        }
+    }
+
+    /// Mint a Card-bound Service subject token carrying `permissions`.
+    fn subject_token(tenant: DataTenantId, permissions: PermissionSet) -> String {
+        test_issuing_key()
+            .issue_access_token(
+                AccessGrant {
+                    principal: TokenPrincipalRef {
+                        id: PrincipalId::new(Uuid::new_v4()),
+                        kind: PrincipalKindTag::Service,
+                        tenant_id: tenant,
+                        card_ref: Some(test_service_card_ref()),
+                        card_ref_scope: CardRefScope::default(),
+                    },
+                    roles: vec![],
+                    permissions,
+                    credential_id: None,
+                    delegated_by: None,
+                },
+                Duration::minutes(5),
+            )
+            .expect("subject token issues")
     }
 
     async fn insert_test_user(conn: &mut TenantConn<'_>, tenant_id: DataTenantId) -> Uuid {
@@ -1360,18 +950,17 @@ mod pg_tests {
         );
     }
 
-    /// Give a suspended service account one live API key.
+    /// Give a suspended service account one live API key and return its secret.
     ///
-    /// The suspended-principal refusal needs a credential row that the prefix
-    /// lookup finds and then rejects on status, which is a different shape from
-    /// the lifecycle rows [`insert_lifecycle_key`] seeds.
+    /// The suspended-principal refusal needs a credential that verifies and is
+    /// then refused by the shared issuer on status, which is a different shape
+    /// from the placeholder-hash lifecycle rows [`insert_lifecycle_key`] seeds.
     async fn seed_suspended_account_key(
         conn: &mut TenantConn<'_>,
         tenant: DataTenantId,
         created_by: Uuid,
         base_card: &CardRef,
-        prefix: &str,
-    ) {
+    ) -> SecretString {
         let card_ref = CardRef {
             name: CardName::new("suspended-exchange-subject").expect("static name"),
             ..base_card.clone()
@@ -1382,16 +971,7 @@ mod pg_tests {
             .execute(&mut **conn.transaction())
             .await
             .expect("service account suspends");
-        insert_lifecycle_key(
-            conn,
-            tenant,
-            sa_id,
-            created_by,
-            prefix,
-            Utc::now() + Duration::days(1),
-            false,
-        )
-        .await;
+        insert_live_api_key(conn, tenant, sa_id, created_by).await.1
     }
 
     /// Every refusal path pays for exactly one Argon2 verification.
@@ -1417,14 +997,9 @@ mod pg_tests {
         let card_ref = test_service_card_ref();
 
         let unknown = WyrdApiKey::generate(tenant);
-        let disabled = WyrdApiKey::generate(tenant);
         let revoked = WyrdApiKey::generate(tenant);
         let wrong_tail = WyrdApiKey::generate(tenant);
         let foreign = WyrdApiKey::generate(DataTenantId::new_v7());
-        // A tenant absent from `platform.tenants` does not admit credentials,
-        // which is the same answer a suspended one gives.
-        let unadmitted_tenant = DataTenantId::new_v7();
-        let unadmitted = WyrdApiKey::generate(unadmitted_tenant);
 
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let user_id = insert_test_user(&mut conn, tenant).await;
@@ -1451,7 +1026,7 @@ mod pg_tests {
         )
         .await;
 
-        seed_suspended_account_key(&mut conn, tenant, user_id, &card_ref, &disabled.prefix).await;
+        let disabled = seed_suspended_account_key(&mut conn, tenant, user_id, &card_ref).await;
 
         let expected = rendered(&super::api_key_invalid());
         let service = exchange_service();
@@ -1459,7 +1034,7 @@ mod pg_tests {
             ("malformed", SecretString::from("not-a-wyrd-api-key")),
             ("cross_tenant", foreign.secret),
             ("unknown_prefix", unknown.secret),
-            ("suspended_account", disabled.secret),
+            ("suspended_account", disabled),
             ("revoked", revoked.secret),
             ("wrong_tail", wrong_tail.secret),
         ];
@@ -1482,15 +1057,45 @@ mod pg_tests {
             );
         }
 
-        // Admission is decided on the presented key's own tenant, so it needs a
-        // connection bound to that tenant rather than the fixture's.
+        // Admission is decided on the presented key's own tenant, so the key
+        // lives in a second tenant that is suspended once it holds a live
+        // credential; the shared issuer then refuses it after verification.
+        let unadmitted_tenant = fixture
+            .seed_additional_tenant("unadmitted")
+            .await
+            .expect("second tenant seeds");
         let mut unadmitted_conn = fixture
             .tenant_conn_for(unadmitted_tenant)
             .await
             .expect("unadmitted tenant conn opens");
+        let unadmitted_user = insert_test_user(&mut unadmitted_conn, unadmitted_tenant).await;
+        let unadmitted_sa = insert_test_service_account(
+            &mut unadmitted_conn,
+            unadmitted_tenant,
+            unadmitted_user,
+            &card_ref,
+        )
+        .await;
+        let (_, unadmitted) = insert_live_api_key(
+            &mut unadmitted_conn,
+            unadmitted_tenant,
+            unadmitted_sa,
+            unadmitted_user,
+        )
+        .await;
+        unadmitted_conn.commit().await.expect("second tenant seed commits");
+        sqlx::query("UPDATE platform.tenants SET status = 'suspended' WHERE data_tenant_id = $1")
+            .bind(unadmitted_tenant.as_uuid())
+            .execute(&fixture.superuser_pool().await.expect("superuser pool opens"))
+            .await
+            .expect("second tenant suspends");
+        let mut unadmitted_conn = fixture
+            .tenant_conn_for(unadmitted_tenant)
+            .await
+            .expect("unadmitted tenant conn reopens");
         let before = credential_verify::verifications_performed();
         let error = service
-            .execute(&mut unadmitted_conn, unadmitted.secret, "req-unadmitted")
+            .execute(&mut unadmitted_conn, unadmitted, "req-unadmitted")
             .await
             .expect_err("a tenant that does not admit credentials is refused");
         assert!(matches!(error, ExchangeError::TenantNotAdmitting));
@@ -1620,43 +1225,10 @@ mod pg_tests {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
 
-        let issuing_key = test_issuing_key();
-
-        // Issue a service token with no roles → effective permissions are empty
-        // → delegation_issue check fails before any database lookup.
-        let subject_token = issuing_key
-            .issue_card_access_token(
-                TokenPrincipalRef {
-                    id: PrincipalId::new(Uuid::new_v4()),
-                    kind: PrincipalKindTag::Service,
-                    tenant_id: tenant,
-                    card_ref: Some(test_service_card_ref()),
-                    card_ref_scope: CardRefScope::default(),
-                },
-                vec![],
-                None,
-                Duration::minutes(15),
-            )
-            .expect("subject token issues");
-
-        let public_key = public_key_from_pem(PUBLIC_KEY_PEM).expect("test public key loads");
-        let mut decoding_keys = HashMap::new();
-        decoding_keys.insert(Kid::new("k1").expect("kid is valid"), Arc::new(public_key));
-        let verifier = Arc::new(TokenVerifier::new(
-            decoding_keys,
-            "wyrd",
-            Arc::new(SqlPermissionResolver::new(Arc::new(
-                fixture.app_pool().clone(),
-            ))),
-            WyrdAuthVerifySettings::default(),
-        ));
-
-        let delegate = DelegateToken {
-            issuing_key,
-            verifier,
-            permission_check: Arc::new(RbacCheck),
-            settings: TokenExchangeSettings::default(),
-        };
+        // A subject token with no permissions fails the delegation_issue
+        // check before any database lookup.
+        let subject_token = subject_token(tenant, PermissionSet::new());
+        let delegate = delegate_service();
 
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let result = delegate
@@ -1678,9 +1250,9 @@ mod pg_tests {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
 
-        // Seed the per-tenant builtin roles so the resolver maps the delegator's
-        // `runtime_admin` role claim to `delegation_issue`, and insert the target
-        // Service principal the exchange resolves by card_ref.
+        // The delegator's token carries `delegation_issue` directly; seed the
+        // builtin roles and the target Service principal the exchange
+        // resolves by card_ref.
         let target_card_ref = CardRef {
             kind: CardKind::Service,
             name: CardName::new("delegation-target").expect("static name is valid"),
@@ -1696,40 +1268,11 @@ mod pg_tests {
         insert_test_service_account(&mut conn, tenant, creator, &target_card_ref).await;
         conn.commit().await.expect("seed commits");
 
-        let issuing_key = test_issuing_key();
-        let subject_token = issuing_key
-            .issue_card_access_token(
-                TokenPrincipalRef {
-                    id: PrincipalId::new(Uuid::new_v4()),
-                    kind: PrincipalKindTag::Service,
-                    tenant_id: tenant,
-                    card_ref: Some(test_service_card_ref()),
-                    card_ref_scope: CardRefScope::default(),
-                },
-                vec![RoleRef::new("runtime_admin").expect("role name is valid")],
-                None,
-                Duration::minutes(15),
-            )
-            .expect("subject token issues");
-
-        let public_key = public_key_from_pem(PUBLIC_KEY_PEM).expect("test public key loads");
-        let mut decoding_keys = HashMap::new();
-        decoding_keys.insert(Kid::new("k1").expect("kid is valid"), Arc::new(public_key));
-        let verifier = Arc::new(TokenVerifier::new(
-            decoding_keys,
-            "wyrd",
-            Arc::new(SqlPermissionResolver::new(Arc::new(
-                fixture.app_pool().clone(),
-            ))),
-            WyrdAuthVerifySettings::default(),
-        ));
-
-        let delegate = DelegateToken {
-            issuing_key,
-            verifier,
-            permission_check: Arc::new(RbacCheck),
-            settings: TokenExchangeSettings::default(),
-        };
+        let subject_token = subject_token(
+            tenant,
+            std::iter::once(Permission::delegation_issue()).collect(),
+        );
+        let delegate = delegate_service();
 
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let exchanged = delegate

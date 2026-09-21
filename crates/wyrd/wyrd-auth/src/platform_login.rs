@@ -22,7 +22,7 @@ use std::sync::Arc;
 use chrono::{Duration, Utc};
 use secrecy::{ExposeSecret, SecretString};
 use wyrd_auth_oidc::{ClientAuth, IssuerVerification, ScreenedHttp};
-use wyrd_auth_verify::{ExternalClaims, TokenVerifier};
+use wyrd_auth_verify::{ExternalClaims, ExternalVerifier};
 use wyrd_crypt::SecretKey;
 use wyrd_spec::auth::LoginInitResponse;
 use wyrd_spec::error::WyrdError;
@@ -34,7 +34,6 @@ use wyrd_sql::{OperatorPool, SqlError};
 
 use crate::error::auth_error_to_wyrd;
 use crate::login::{auth_nonce, auth_state_key, build_authorization_url, pkce_verifier};
-use crate::permission_resolver::SqlPermissionResolver;
 use crate::pg_resolvers::{PgIssuerResolver, platform_connection_from_row};
 use crate::platform_sessions::{PlatformSessionError, PlatformSessions};
 use std::fmt::{Debug, Formatter, Result as FmtResult};
@@ -86,7 +85,7 @@ pub struct PlatformLogin {
     /// Process sealing key the stored client secret is opened with.
     sealing_key: Option<Arc<SecretKey>>,
     /// The deployment's single external-token verification implementation.
-    verifier: Arc<TokenVerifier<SqlPermissionResolver, PgIssuerResolver>>,
+    verifier: Arc<ExternalVerifier<PgIssuerResolver>>,
     /// Mints the platform session an accepted identity receives.
     sessions: Arc<PlatformSessions>,
     /// Screened HTTP capability every provider request is made through.
@@ -108,7 +107,7 @@ impl PlatformLogin {
     pub fn new(
         pool: OperatorPool,
         sealing_key: Option<Arc<SecretKey>>,
-        verifier: Arc<TokenVerifier<SqlPermissionResolver, PgIssuerResolver>>,
+        verifier: Arc<ExternalVerifier<PgIssuerResolver>>,
         sessions: Arc<PlatformSessions>,
         http: ScreenedHttp,
     ) -> Self {

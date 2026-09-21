@@ -41,10 +41,6 @@ pub(crate) fn auth_error_to_wyrd(error: AuthError) -> WyrdError {
             ),
             details: json!({ "max": MAX_DELEGATION_DEPTH }),
         },
-        AuthError::Revoked => WyrdError::CredentialRevoked {
-            message: "credential revoked".to_owned(),
-            details: json!({}),
-        },
         AuthError::BadTokenFormat => WyrdError::BadTokenFormat {
             message: "X-Wyrd-Access-Token is not a compact Wyrd JWT".to_owned(),
             details: json!({}),
@@ -52,10 +48,6 @@ pub(crate) fn auth_error_to_wyrd(error: AuthError) -> WyrdError {
         AuthError::VerifyUnavailable => WyrdError::AuthVerifyUnavailable {
             message: "auth verify backend unavailable".to_owned(),
             details: json!({ "retry_after_seconds": 1 }),
-        },
-        AuthError::PermissionsCorrupt => WyrdError::RoleCorrupt {
-            message: "stored role permissions failed to decode".to_owned(),
-            details: json!({}),
         },
     }
 }

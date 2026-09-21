@@ -372,11 +372,14 @@ async fn remove_connection(
     )
     .await?;
 
-    if delete_platform_oidc_connection(&mut decision)
+    let removed = delete_platform_oidc_connection(&mut decision)
         .await
-        .map_err(store_error)?
-    {
-        commit_decision(decision).await?;
+        .map_err(store_error)?;
+    // Permission was evaluated and allowed either way. "There was nothing to
+    // remove" is a stable answer to an authorized request, not a failure, so
+    // the decision stays durable rather than being rolled back with it.
+    commit_decision(decision).await?;
+    if removed {
         Ok(axum::http::StatusCode::NO_CONTENT)
     } else {
         Err(WyrdErrorResponse::from(WyrdError::NotFound {
@@ -591,6 +594,15 @@ async fn set_admin_status(
     Path(principal_id): Path<Uuid>,
     Json(request): Json<SetPlatformPrincipalStatusRequest>,
 ) -> Result<axum::http::StatusCode, WyrdErrorResponse> {
+    // A malformed status is refused before any permission is evaluated, so the
+    // request never opens a decision it would then have to discard.
+    if !matches!(request.status.as_str(), "active" | "suspended") {
+        return Err(WyrdErrorResponse::from(WyrdError::Validation {
+            message: "status must be active or suspended".to_owned(),
+            details: serde_json::json!({ "status": request.status }),
+        }));
+    }
+
     let pool = operator(&state)?;
     // The handle must outlive the transaction it lends out.
     let authz = PlatformAuthorization::new(pool.clone());
@@ -602,40 +614,33 @@ async fn set_admin_status(
     )
     .await?;
 
-    if !matches!(request.status.as_str(), "active" | "suspended") {
-        return Err(WyrdErrorResponse::from(WyrdError::Validation {
-            message: "status must be active or suspended".to_owned(),
-            details: serde_json::json!({ "status": request.status }),
-        }));
-    }
-
     // The guard and the write are one serialized operator transaction, so two
     // administrators suspending each other at once cannot both be told a
     // survivor remains.
     let grant = serde_json::to_value(platform_administrator_grant().iter().collect::<Vec<_>>())
         .expect("permission set serializes to JSON");
-    match set_platform_principal_status(&mut decision, principal_id, &request.status, &grant)
-        .await
-        .map_err(store_error)?
-    {
-        StatusChange::Changed | StatusChange::Unchanged => {}
-        StatusChange::NotFound => {
-            return Err(WyrdErrorResponse::from(WyrdError::NotFound {
-                message: "platform principal not found".to_owned(),
-                details: serde_json::json!({}),
-            }));
-        }
-        StatusChange::WouldStrandDeployment => {
-            return Err(WyrdErrorResponse::from(WyrdError::Conflict {
-                message: "suspending this administrator would leave the deployment with no way                           in"
-                    .to_owned(),
-                details: serde_json::json!({ "principal_id": principal_id.to_string() }),
-            }));
-        }
-    }
+    let change =
+        set_platform_principal_status(&mut decision, principal_id, &request.status, &grant)
+            .await
+            .map_err(store_error)?;
+    // Each outcome here is a stable administrative answer reached after the
+    // permission was evaluated and allowed, so the decision commits in every
+    // one of them. Only a store failure above rolls back, taking its attempted
+    // effect with it.
     commit_decision(decision).await?;
-
-    Ok(axum::http::StatusCode::NO_CONTENT)
+    match change {
+        StatusChange::Changed | StatusChange::Unchanged => Ok(axum::http::StatusCode::NO_CONTENT),
+        StatusChange::NotFound => Err(WyrdErrorResponse::from(WyrdError::NotFound {
+            message: "platform principal not found".to_owned(),
+            details: serde_json::json!({}),
+        })),
+        StatusChange::WouldStrandDeployment => Err(WyrdErrorResponse::from(WyrdError::Conflict {
+            message:
+                "suspending this administrator would leave the deployment with no way                           in"
+                    .to_owned(),
+            details: serde_json::json!({ "principal_id": principal_id.to_string() }),
+        })),
+    }
 }
 
 /// Build the platform login service from server state.

@@ -477,10 +477,15 @@ async fn delete_trusted_issuer_route(
     let removed = delete_trusted_issuer(&mut conn, &issuer)
         .await
         .map_err(|error| map_write_error(error, AdminWriteTarget::TrustedIssuer))?;
+    // "No such issuer" is a stable answer to a request whose permission was
+    // already evaluated and allowed, so the decision commits with it. Returning
+    // before the commit would roll the decision back and leave an authorized
+    // probe with no durable record; only the store failures above, which take
+    // their attempted effect with them, roll back.
+    conn.commit().await.map_err(sql_unavailable)?;
     if removed == 0 {
         return Err(issuer_not_found(&issuer));
     }
-    conn.commit().await.map_err(sql_unavailable)?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -692,10 +697,13 @@ async fn delete_workload_binding_route(
     let removed = delete_workload_binding(&mut conn, &issuer, &query.subject)
         .await
         .map_err(|error| map_write_error(error, AdminWriteTarget::WorkloadBinding))?;
+    // An already-absent binding is a stable answer reached after the permission
+    // was evaluated and allowed, so the decision commits with it rather than
+    // being rolled back alongside it.
+    conn.commit().await.map_err(sql_unavailable)?;
     if removed == 0 {
         return Err(binding_not_found(&issuer, &query.subject));
     }
-    conn.commit().await.map_err(sql_unavailable)?;
 
     Ok(StatusCode::NO_CONTENT)
 }

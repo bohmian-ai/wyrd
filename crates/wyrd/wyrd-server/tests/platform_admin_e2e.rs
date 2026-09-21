@@ -3856,6 +3856,208 @@ async fn stop_failing_writes(pool: &sqlx::PgPool, label: &str, table: &str) {
     .expect("failure trigger drops");
 }
 
+/// Count staged authorization decisions for one operation and outcome.
+///
+/// # Panics
+///
+/// Panics when the staging table cannot be read.
+async fn staged_decisions(pool: &sqlx::PgPool, operation: &str, outcome: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM vala.audit_staging
+          WHERE operation = $1 AND outcome = $2",
+    )
+    .bind(operation)
+    .bind(outcome)
+    .fetch_one(pool)
+    .await
+    .expect("decision count reads")
+}
+
+/// An authorized request that changes nothing still records the decision.
+///
+/// Every route here evaluates the caller's permission, allows it, appends the
+/// decision on that transaction, and then discovers there is nothing to do:
+/// the credential is unknown or belongs to someone else, the revoke is a
+/// replay, no connection is configured, the principal does not exist,
+/// suspending it would strand the deployment, or the issuer or binding is
+/// already gone. Each is a stable administrative answer, not a failure, so the
+/// decision has to survive it. Rolling back with the response would let an
+/// authorized caller probe the deployment's administrative state and leave no
+/// durable evidence that permission was ever evaluated — which is exactly what
+/// an attacker mapping a plane would want.
+///
+/// # Panics
+///
+/// Panics when a no-effect response records no decision, records more than
+/// one, or mutates anything.
+#[tokio::test]
+async fn an_authorized_request_that_changes_nothing_still_records_the_decision() {
+    if !e2e_enabled() {
+        return;
+    }
+    let srv = WyrdTestServer::start_in_process()
+        .await
+        .expect("server starts");
+    let root = initialize_platform_root(&srv)
+        .await
+        .expect("deployment initializes");
+    let secret = secrecy::ExposeSecret::expose_secret(&root).to_owned();
+    let session = platform_session(&srv, &secret).await;
+    // Staged decisions are read as the superuser: `vala.audit_staging` is under
+    // row-level security, and this reads across the platform sentinel and the
+    // provisioned tenant.
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool for staged decisions");
+
+    // Each case: the request, the status it must answer with, and what it is.
+    // `platform.authz` is one operation, so the cases are counted one at a time
+    // against the running total rather than filtered apart.
+    let mut expected = staged_decisions(&superuser, "platform.authz", "allowed").await;
+    let unknown = uuid::Uuid::now_v7();
+    let cases: Vec<(Request<Body>, StatusCode, &str)> = vec![
+        (
+            platform_request(
+                Method::DELETE,
+                &format!("/platform/admins/{unknown}/credentials/{unknown}"),
+                &session,
+                None,
+            ),
+            StatusCode::NOT_FOUND,
+            "revoking a credential that does not exist",
+        ),
+        (
+            platform_request(Method::DELETE, "/platform/oidc/connection", &session, None),
+            StatusCode::NOT_FOUND,
+            "removing a connection that was never configured",
+        ),
+        (
+            platform_request(
+                Method::PUT,
+                &format!("/platform/admins/{unknown}/status"),
+                &session,
+                Some(json!({ "status": "suspended" })),
+            ),
+            StatusCode::NOT_FOUND,
+            "changing the status of a principal that does not exist",
+        ),
+    ];
+    for (request, status, what) in cases {
+        let resp = srv.oneshot(request).await.expect("route responds");
+        assert_eq!(resp.status(), status, "{what} answers {status}");
+        expected += 1;
+        assert_eq!(
+            staged_decisions(&superuser, "platform.authz", "allowed").await,
+            expected,
+            "{what} records exactly one allowed decision"
+        );
+    }
+
+    // Suspending the deployment's only active principal is refused as a
+    // conflict, and that refusal is still an evaluated permission.
+    let root_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT id FROM platform.principals WHERE status = 'active' LIMIT 1")
+            .fetch_one(&superuser)
+            .await
+            .expect("the deployment root reads");
+    let resp = srv
+        .oneshot(platform_request(
+            Method::PUT,
+            &format!("/platform/admins/{root_id}/status"),
+            &session,
+            Some(json!({ "status": "suspended" })),
+        ))
+        .await
+        .expect("status route responds");
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "the last active principal cannot be suspended"
+    );
+    expected += 1;
+    assert_eq!(
+        staged_decisions(&superuser, "platform.authz", "allowed").await,
+        expected,
+        "a last-admin conflict records exactly one allowed decision"
+    );
+    let still_active: String =
+        sqlx::query_scalar("SELECT status FROM platform.principals WHERE id = $1")
+            .bind(root_id)
+            .fetch_one(&superuser)
+            .await
+            .expect("root status reads");
+    assert_eq!(still_active, "active", "the refusal changed nothing");
+
+    // A malformed status is refused before any permission is evaluated, so it
+    // must not record a decision at all.
+    let resp = srv
+        .oneshot(platform_request(
+            Method::PUT,
+            &format!("/platform/admins/{root_id}/status"),
+            &session,
+            Some(json!({ "status": "retired" })),
+        ))
+        .await
+        .expect("status route responds");
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        staged_decisions(&superuser, "platform.authz", "allowed").await,
+        expected,
+        "a request refused on syntax opens no decision to record"
+    );
+
+    // The tenant plane has the same shape: the delete finds nothing, and the
+    // decision appended on that transaction has to commit with the answer.
+    let created = body_json(
+        srv.oneshot(platform_post(
+            "/platform/tenants",
+            &session,
+            json!({ "slug": "no-effect", "display_name": "no-effect" }),
+        ))
+        .await
+        .expect("tenant route responds"),
+    )
+    .await;
+    let admin = tenant_token(
+        &srv,
+        created["admin"]["credential"]
+            .as_str()
+            .expect("admin credential"),
+    )
+    .await
+    .expect("the tenant administrator authenticates");
+    for (operation, uri, what) in [
+        (
+            "admin.trusted_issuer.delete",
+            "/v1/admin/trusted-issuers?issuer=https://absent.example",
+            "deleting an issuer that is not configured",
+        ),
+        (
+            "admin.workload_binding.delete",
+            "/v1/admin/workload-bindings?issuer=https://absent.example&subject=nobody",
+            "deleting a binding that is not configured",
+        ),
+    ] {
+        let before = staged_decisions(&superuser, operation, "allowed").await;
+        let resp = srv
+            .oneshot_authenticated(&admin, tenant_request(Method::DELETE, uri, None))
+            .await
+            .expect("admin route responds");
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "{what} answers 404 Not Found"
+        );
+        assert_eq!(
+            staged_decisions(&superuser, operation, "allowed").await,
+            before + 1,
+            "{what} records exactly one allowed decision"
+        );
+    }
+}
+
 /// Count staged platform authorization rows by outcome.
 ///
 /// # Panics

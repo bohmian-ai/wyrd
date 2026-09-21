@@ -227,20 +227,26 @@ async fn revoke_credential(
             ))
         })?
         .is_some_and(|row| row.principal_id == principal_id);
+    // Permission was evaluated and allowed, so the decision is durable whatever
+    // the credential turns out to be. An unknown credential, one owned by
+    // another principal, and a replayed revoke are stable administrative
+    // answers, not failures: dropping the transaction would erase the record
+    // that an authorized caller probed this credential and learned its state.
     if !owned {
+        commit_decision(decision).await?;
         return Err(not_found());
     }
 
-    if revoke_platform_credential(&mut decision, credential_id)
+    let revoked = revoke_platform_credential(&mut decision, credential_id)
         .await
         .map_err(|error| {
             WyrdErrorResponse::from(internal_failure(
                 "platform credential could not be revoked",
                 &error,
             ))
-        })?
-    {
-        commit_decision(decision).await?;
+        })?;
+    commit_decision(decision).await?;
+    if revoked {
         Ok(axum::http::StatusCode::NO_CONTENT)
     } else {
         Err(not_found())

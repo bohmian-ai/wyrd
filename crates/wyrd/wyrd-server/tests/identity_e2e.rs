@@ -542,8 +542,9 @@ async fn ttl_expiry_journey() {
 // ─── Revocation journey ───────────────────────────────────────────────────────
 
 /// Mint a token, reach a real `/v1/authz/check` `200`, revoke the principal via
-/// admin, and verify the token is immediately rejected `401` with
-/// `WYRD_AUTH_401_CREDENTIAL_REVOKED` on `/v1`.
+/// admin, and show revocation governs issuance: the principal's durable key can
+/// no longer exchange, while the token it already holds keeps its immutable
+/// authority until its short expiry.
 #[tokio::test]
 async fn revocation_journey() {
     if !e2e_enabled() {
@@ -603,41 +604,15 @@ async fn revocation_journey() {
         revoke_resp.status()
     );
 
-    // Revoked token rejected on /v1 with CREDENTIAL_REVOKED (verify runs first).
-    let callee = srv
-        .bootstrap_service("revoke-after-callee", &["writer"])
-        .await
-        .expect("callee bootstraps");
-    let resp = srv
-        .oneshot_authenticated(
-            &target_token,
-            Request::builder()
-                .method(Method::POST)
-                .uri("/v1/authz/check")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    serde_json::to_vec(&authz_check_request(&callee, "card_write"))
-                        .expect("serializes"),
-                ))
-                .expect("request builds"),
-        )
-        .await
-        .expect("post-revoke call completes");
-    assert_eq!(
-        resp.status(),
-        StatusCode::UNAUTHORIZED,
-        "token rejected after revocation: {}",
-        resp.status()
+    // The suspended principal's key mints nothing new.
+    assert!(
+        srv.exchange_api_key(&target_key).await.is_err(),
+        "a revoked principal cannot exchange its key again"
     );
-    let body_bytes = to_bytes(resp.into_body(), 65_536)
-        .await
-        .expect("body reads");
-    let body: Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
-    assert_eq!(
-        response_code(&body),
-        "WYRD_AUTH_401_CREDENTIAL_REVOKED",
-        "error code is CREDENTIAL_REVOKED; body={body}"
-    );
+
+    // The token minted before revocation is a self-contained snapshot, so it
+    // keeps authorizing until it expires rather than being introspected.
+    assert_v1_authz_check_ok(&srv, &target_token, "revoke-window").await;
 }
 
 /// Non-admin cannot revoke a principal — must return 403.
@@ -1061,16 +1036,14 @@ async fn post_refresh(srv: &WyrdTestServer, refresh_token: &str) -> (StatusCode,
     (status, parsed)
 }
 
-/// Revoking a human retires the refresh authority along with the access token.
+/// Revoking a human retires the session's refresh authority immediately.
 ///
-/// The epoch bump alone only stops tokens already minted. A human session also
-/// holds a refresh token, and rotating it mints a successor stamped after the
-/// epoch — which would hand back the session the revocation just ended. This
+/// A human session holds a short-lived access token and a refresh token. This
 /// journey drives the served path an operator actually uses: log in, use the
 /// access token, revoke the User principal through `/v1/principals/{id}/revoke`,
-/// and then show that neither half of the session survives — the old access
-/// token is refused as revoked, and the refresh token cannot rotate, so no
-/// successor row exists to carry the session forward.
+/// and then show the session cannot continue — the refresh token cannot rotate,
+/// so no successor exists — while the access token already issued keeps its
+/// snapshot authority only until its five-minute expiry.
 #[tokio::test]
 async fn revoking_a_human_kills_the_session_refresh_authority() {
     if !e2e_enabled() {
@@ -1136,41 +1109,8 @@ async fn revoking_a_human_kills_the_session_refresh_authority() {
         revoke_resp.status()
     );
 
-    // The access token half of the session is refused as revoked.
-    let callee = srv
-        .bootstrap_service("human-revoke-after-callee", &["writer"])
-        .await
-        .expect("callee bootstraps");
-    let after = srv
-        .oneshot_authenticated(
-            &access_token,
-            Request::builder()
-                .method(Method::POST)
-                .uri("/v1/authz/check")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    serde_json::to_vec(&authz_check_request(&callee, "card_write"))
-                        .expect("serializes"),
-                ))
-                .expect("request builds"),
-        )
-        .await
-        .expect("post-revoke call completes");
-    assert_eq!(
-        after.status(),
-        StatusCode::UNAUTHORIZED,
-        "the revoked human's access token is refused: {}",
-        after.status()
-    );
-    let after_bytes = to_bytes(after.into_body(), 65_536)
-        .await
-        .expect("body reads");
-    let after_body: Value = serde_json::from_slice(&after_bytes).unwrap_or_default();
-    assert_eq!(
-        response_code(&after_body),
-        "WYRD_AUTH_401_CREDENTIAL_REVOKED",
-        "refusal names revocation: {after_body}"
-    );
+    // The access token is a self-contained snapshot and lapses at expiry.
+    assert_v1_authz_check_ok(&srv, &access_token, "human-revoke-window").await;
 
     // The refresh half is retired in the same transaction, so rotation is
     // refused and mints no successor for the session to continue under.
@@ -1186,17 +1126,15 @@ async fn revoking_a_human_kills_the_session_refresh_authority() {
     );
 }
 
-/// A withdrawn provider role ends the sessions that still name it.
+/// A withdrawn provider role governs every token issued after it.
 ///
-/// Wyrd's access token carries the role names resolved at login, so a human
-/// whose provider group was removed would keep the authority in an outstanding
-/// token until it expired. The callback advances the User's authorization epoch
-/// whenever the persisted role set actually moves, which is what this journey
-/// drives from the provider side: log in as a member of `wyrd-admins`, log in
-/// again unchanged and show the first session still works, then remove the
-/// group at Keycloak and log in once more. The unchanged login must not
-/// invalidate anything; the changed one must refuse the old token and issue a
-/// successor that can no longer delegate.
+/// Wyrd's access token carries the permissions resolved at issuance, so a
+/// token issued before the provider withdrew a group keeps that snapshot until
+/// its five-minute expiry. This journey drives that from the provider side: log
+/// in as a member of `wyrd-admins`, log in again unchanged and show the first
+/// session still works, then remove the group at Keycloak and log in once more.
+/// The changed login persists the reduced role set and issues a successor that
+/// can no longer delegate; the earlier token is not introspected.
 ///
 /// The membership is restored before the journey returns, because the realm is
 /// shared with every other Keycloak journey in this target.
@@ -1245,33 +1183,10 @@ async fn a_withdrawn_oidc_group_invalidates_the_roles_it_granted() {
         .expect("access_token present")
         .to_owned();
 
-    // The epoch moved with the role set, so the token naming the withdrawn role
-    // is refused even though it has not expired.
     let callee = srv
         .bootstrap_service("roles-withdrawn-callee", &["writer"])
         .await
         .expect("callee bootstraps");
-    let stale = srv
-        .oneshot_authenticated(
-            &granted_token,
-            Request::builder()
-                .method(Method::POST)
-                .uri("/v1/authz/check")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    serde_json::to_vec(&authz_check_request(&callee, "card_write"))
-                        .expect("serializes"),
-                ))
-                .expect("request builds"),
-        )
-        .await
-        .expect("stale-token call completes");
-    assert_eq!(
-        stale.status(),
-        StatusCode::UNAUTHORIZED,
-        "the token naming the withdrawn role is refused: {}",
-        stale.status()
-    );
 
     // The successor the same login issued carries the reduced authority: it can
     // still authenticate, but it can no longer delegate.

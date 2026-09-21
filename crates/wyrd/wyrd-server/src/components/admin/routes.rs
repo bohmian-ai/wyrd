@@ -352,8 +352,8 @@ async fn create_trusted_issuer(
 /// # Errors
 /// Returns a `401` when the request carries no usable token, a `403` when the
 /// caller lacks `service_accounts:write`, a `500` when the store read or the
-/// decision's audit fails, and a `503` when the store or the revocation store
-/// is unavailable.
+/// decision's audit fails, and a `503` when the store is unavailable or no
+/// token verifier is configured.
 #[utoipa::path(
     get,
     path = "/admin/trusted-issuers",
@@ -415,7 +415,7 @@ async fn list_trusted_issuers(
 /// Returns a `401` without a usable token, a `403` without
 /// `service_accounts:write`, a `404` for an unknown issuer, a `409` when a live
 /// binding still references it, a `500` when the delete or its audit fails, and
-/// a `503` when the store or the revocation store is unavailable.
+/// a `503` when the store is unavailable or no token verifier is configured.
 #[utoipa::path(
     delete,
     path = "/admin/trusted-issuers",
@@ -505,7 +505,7 @@ async fn delete_trusted_issuer_route(
 /// Returns a `401` without a usable token, a `403` without
 /// `service_accounts:write`, a `404` when the issuer is not registered in this
 /// tenant, a `409` for a duplicate binding, a `500` when the write or its audit
-/// fails, and a `503` when the store or the revocation store is unavailable.
+/// fails, and a `503` when the store is unavailable or no token verifier is configured.
 #[utoipa::path(
     post,
     path = "/admin/workload-bindings",
@@ -580,7 +580,7 @@ async fn create_workload_binding(
 /// # Errors
 /// Returns a `401` without a usable token, a `403` without
 /// `service_accounts:write`, a `500` when the read or its audit fails, and a
-/// `503` when the store or the revocation store is unavailable.
+/// `503` when the store is unavailable or no token verifier is configured.
 #[utoipa::path(
     get,
     path = "/admin/workload-bindings",

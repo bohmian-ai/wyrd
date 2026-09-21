@@ -504,10 +504,9 @@ mod pg_tests {
     /// signature and scope, and then every request re-reads the credential
     /// record, its principal, and the principal's grant from the store, so a
     /// revoked credential that worked a moment ago stops working immediately.
-    /// That is why this plane needs no revocation epoch: the tenant plane
-    /// advances one because it caches verified tokens and a cached verification
-    /// would otherwise outlive the revocation, and there is no such cache here
-    /// to invalidate.
+    /// Unlike a tenant token, whose authority is a five-minute snapshot, a
+    /// platform session carries no authority of its own to outlive the
+    /// revocation.
     #[tokio::test]
     async fn revocation_takes_effect_on_the_next_request() {
         let fixture = PgFixture::start().await.expect("fixture starts");

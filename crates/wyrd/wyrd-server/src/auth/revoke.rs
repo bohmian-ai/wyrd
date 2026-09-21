@@ -1,4 +1,4 @@
-//! `POST /v1/principals/{id}/revoke` — bump `tokens_not_before` to now().
+//! `POST /v1/principals/{id}/revoke` — suspend a principal so it can mint no new token.
 
 use axum::Json;
 use axum::extract::{Path, State};
@@ -16,15 +16,20 @@ use crate::state::AppState;
 use wyrd_auth::revoke::revoke_principal_in_conn;
 use wyrd_sql::TenantConn;
 
-/// Revoke one principal's outstanding tokens under the caller's tenant.
+/// Revoke one principal under the caller's tenant.
+///
+/// Revocation suspends the principal, so every tenant issuance path refuses its
+/// next token; a token it already holds lapses at its five-minute expiry.
 ///
 /// Revocation is an administrative authorization boundary: the
 /// `service_accounts:write` verdict is audited for both outcomes. A refusal is
 /// durable on its own, because a denied attempt is evidence whether or not
 /// anything followed it. An allowance is appended to the same transaction as
-/// the `tokens_not_before` bump and commits with it, so the record and the
-/// effect cannot disagree: there is no committed allowance for a revocation
-/// that did not happen.
+/// the suspension and commits with it, so the record and the effect cannot
+/// disagree. An authorized revoke that names no principal of that kind is still
+/// an authorization decision: its allowance commits with no effect before the
+/// not-found refusal returns. A store failure rolls back the allowance and any
+/// effect together.
 ///
 /// The request body is the contract, not decoration. Its `principal_kind`
 /// selects the table the id is resolved in, and its `reason` is folded into
@@ -47,7 +52,8 @@ use wyrd_sql::TenantConn;
     params(("id" = String, Path, description = "Principal whose tokens stop working")),
     request_body = RevokePrincipalRequest,
     responses(
-        (status = 200, description = "Outstanding tokens revoked, effective on the next request"),
+        (status = 200, description = "Principal suspended; it can mint no new token, and tokens \
+          it already holds lapse at expiry"),
         (status = 400, description = "Missing, oversized, or secret-like revocation reason \
           (WYRD_VALIDATION_400_MISSING_REQUIRED_FIELD)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
@@ -99,12 +105,17 @@ pub async fn revoke_principal(
     audit::append_on(&mut conn, &decision)
         .await
         .map_err(WyrdErrorResponse::from)?;
-    revoke_principal_in_conn(&mut conn, target_id, request.principal_kind, tenant)
-        .await
-        .map_err(WyrdErrorResponse::from)?;
+    // A miss is an authorized decision with no effect, so its allowance
+    // commits; any other failure drops `conn` and rolls the allowance back.
+    let outcome =
+        revoke_principal_in_conn(&mut conn, target_id, request.principal_kind, tenant).await;
+    if let Err(error) = &outcome
+        && !matches!(error, WyrdError::PrincipalNotFound { .. })
+    {
+        return outcome.map_err(WyrdErrorResponse::from);
+    }
     conn.commit().await.map_err(internal_error)?;
-
-    Ok(())
+    outcome.map_err(WyrdErrorResponse::from)
 }
 
 async fn acquire_conn(

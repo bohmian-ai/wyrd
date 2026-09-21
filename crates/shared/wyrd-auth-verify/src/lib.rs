@@ -601,9 +601,9 @@ pub struct PlatformAccessTokenClaims {
     pub sub: String,
     /// Credential that minted this token, when one did.
     ///
-    /// Checked on every verification so revoking a credential stops the tokens
-    /// it issued, without a separate revocation epoch, and so audit can name
-    /// which credential was used.
+    /// Re-read on every platform request so revoking a credential stops the
+    /// sessions it issued on the next request, and so audit can name which
+    /// credential was used.
     ///
     /// Absent for a session established by federated login: a human presents an
     /// identity, not a credential, so there is no credential to name or revoke.

@@ -17,8 +17,6 @@ use std::io::{Result as IoResult, Write};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
-use chrono::{DateTime, Utc};
-
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, Response, StatusCode, header};
 use serde_json::{Value, json};
@@ -578,8 +576,8 @@ async fn the_two_control_planes_cannot_reach_each_other() {
 
 /// A platform session dies with the credential that minted it.
 ///
-/// The platform plane has no revocation epoch; its answer is that every request
-/// re-reads the minting credential. That claim is load-bearing, and only a real
+/// The platform plane revalidates current state instead of trusting a token
+/// snapshot: every request re-reads the minting credential. That claim is load-bearing, and only a real
 /// request against a real route can show it holds.
 #[tokio::test]
 async fn revoking_a_platform_credential_ends_its_live_sessions() {
@@ -763,7 +761,10 @@ async fn provisioned_tenant_admin(srv: &WyrdTestServer, slug: &str) -> String {
 ///
 /// This is the whole point of separating credentials from identity: the
 /// principal, its roles, and everything it owns survive the rotation, and the
-/// old credential stops working only when the operator says so.
+/// old credential mints nothing once the operator retires it. A token it
+/// already minted is a self-contained snapshot that lapses at its five-minute
+/// expiry, while the surviving credential exchanges and spends immediately —
+/// no ordering between the two tokens is involved.
 #[tokio::test]
 async fn a_tenant_rotates_an_automation_credential_without_an_outage() {
     if !e2e_enabled() {
@@ -862,13 +863,7 @@ async fn a_tenant_rotates_an_automation_credential_without_an_outage() {
         .expect("credential id")
         .to_owned();
 
-    // A token minted by the credential about to be revoked. The property that
-    // matters when a credential leaks is not that it can mint no *new* token —
-    // it is that what it already minted stops working.
-    //
-    // The token is used before the revocation so the verifier has already
-    // cached it as valid: the next request after the revocation commits has to
-    // re-read the principal's epoch rather than answer from that warm state.
+    // A token minted by the credential about to be revoked.
     let live_token = tenant_token(&srv, &first)
         .await
         .expect("the original credential still mints a token");
@@ -879,7 +874,7 @@ async fn a_tenant_rotates_an_automation_credential_without_an_outage() {
     assert_eq!(
         resp.status(),
         StatusCode::OK,
-        "the token authorizes, and is now cached as verified"
+        "the token authorizes before revocation"
     );
 
     let resp = srv
@@ -904,24 +899,30 @@ async fn a_tenant_rotates_an_automation_credential_without_an_outage() {
         .oneshot_authenticated(&live_token, tenant_request(Method::GET, "/v1/cards", None))
         .await
         .expect("cards route responds");
-    assert_ne!(
+    assert_eq!(
         resp.status(),
         StatusCode::OK,
-        "a token the revoked credential already minted stops authorizing"
+        "a token the revoked credential already minted keeps its snapshot until expiry"
     );
-    assert!(
-        tenant_token(&srv, &second).await.is_ok(),
-        "the principal's other credential still authenticates, so rotation has no gap"
+    let surviving = tenant_token(&srv, &second)
+        .await
+        .expect("the principal's other credential still authenticates, so rotation has no gap");
+    let resp = srv
+        .oneshot_authenticated(&surviving, tenant_request(Method::GET, "/v1/cards", None))
+        .await
+        .expect("cards route responds");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the surviving credential's fresh token spends immediately"
     );
 }
 
 /// Replaying a revoke changes nothing.
 ///
-/// Advancing the revocation epoch is not idempotent in effect: it kills every
-/// live token the principal holds. A retried DELETE — an SDK retry after a
-/// timed-out 204, a re-run pipeline, a second operator — must therefore not
-/// perform it again, or an already-completed rotation would lose the surviving
-/// credential's live tokens for no reason.
+/// A retried DELETE — an SDK retry after a timed-out 204, a re-run pipeline, a
+/// second operator — finds nothing left to retire and must leave the
+/// surviving credential working.
 #[tokio::test]
 async fn replaying_a_revoke_does_not_disturb_the_surviving_credential() {
     if !e2e_enabled() {
@@ -1005,12 +1006,6 @@ async fn replaying_a_revoke_does_not_disturb_the_surviving_credential() {
         "the first revoke acts"
     );
 
-    // The epoch itself is the assertion. A live token would be a weaker and
-    // flakier proxy: JWT `iat` is whole seconds, so a token minted in the same
-    // second as an epoch advance is already below it and would fail for a
-    // reason that has nothing to do with the replay.
-    let epoch_after_first = revocation_epoch(&srv, principal_id).await;
-
     let resp = srv
         .oneshot_authenticated(&admin, revoke(first_id))
         .await
@@ -1021,12 +1016,6 @@ async fn replaying_a_revoke_does_not_disturb_the_surviving_credential() {
         "a replayed revoke reports that there was nothing left to retire"
     );
 
-    assert_eq!(
-        revocation_epoch(&srv, principal_id).await,
-        epoch_after_first,
-        "the replay advanced no epoch, so the surviving credential's live tokens are untouched"
-    );
-
     // And the surviving credential is still a working way in.
     assert!(
         tenant_token(&srv, &second).await.is_ok(),
@@ -1034,34 +1023,26 @@ async fn replaying_a_revoke_does_not_disturb_the_surviving_credential() {
     );
 }
 
-/// Read a principal's revocation epoch through the operator boundary.
+/// Revoking tenant credential A refuses A's next exchange at once, while the
+/// token A already minted keeps authorizing until its expiry and surviving
+/// credential B exchanges and spends immediately.
 ///
-/// Goes around row-level security deliberately: the test is asserting on
-/// server-owned state that no tenant-plane route exposes.
-async fn revocation_epoch(srv: &WyrdTestServer, principal_id: &str) -> Option<DateTime<Utc>> {
-    sqlx::query_scalar("SELECT tokens_not_before FROM wyrd.auth_service_accounts WHERE id = $1")
-        .bind(principal_id.parse::<uuid::Uuid>().expect("principal uuid"))
-        .fetch_one(srv.operator_pool().pool())
-        .await
-        .expect("revocation epoch reads")
-}
-
-/// Revoking a tenant administrator's credential ends a token already cached as
-/// verified on the very next request, and the surviving credential still
-/// authenticates.
-///
-/// This runs the production verifier wiring: the verified-token cache is on,
-/// and the token is used before the revocation so that cache is warm. The
-/// revocation epoch is read on every verification rather than memoized, so
-/// the refusal does not wait out any cache and needs no cross-replica
-/// notification. `tenant_admin` is the kind a per-kind invalidation path once
-/// omitted, which is why this is the case pinned here.
+/// The server issues short-lived tokens with no clock-skew allowance, so the
+/// lapse of A's token is observed directly instead of waiting out the
+/// five-minute production lifetime. Tenant verification reads no auth store,
+/// so there is nothing to invalidate and no ordering between A's and B's
+/// tokens.
 #[tokio::test]
-async fn a_revoked_tenant_admin_credential_refuses_its_warm_token_next_request() {
+async fn a_revoked_credential_mints_nothing_and_its_token_lapses_at_expiry() {
     if !e2e_enabled() {
         return;
     }
-    let srv = WyrdTestServer::start_in_process()
+    let srv = wyrd_testing::WyrdTestServerBuilder::default()
+        .with_access_ttl(chrono::Duration::seconds(4))
+        .with_auth_verify_settings(wyrd_auth_verify::WyrdAuthVerifySettings {
+            allowed_clock_skew: std::time::Duration::ZERO,
+        })
+        .start_in_process()
         .await
         .expect("server starts");
     let root = initialize_platform_root(&srv)
@@ -1072,7 +1053,7 @@ async fn a_revoked_tenant_admin_credential_refuses_its_warm_token_next_request()
         srv.oneshot(platform_post(
             "/platform/tenants",
             &session,
-            json!({ "slug": "warm-admin", "display_name": "Warm admin" }),
+            json!({ "slug": "revoked-admin", "display_name": "Revoked admin" }),
         ))
         .await
         .expect("tenant route responds"),
@@ -1087,7 +1068,7 @@ async fn a_revoked_tenant_admin_credential_refuses_its_warm_token_next_request()
         .expect("admin credential")
         .to_owned();
 
-    let warm = tenant_token(&srv, &first)
+    let token_a = tenant_token(&srv, &first)
         .await
         .expect("the administrator authenticates");
     let cards = async |token: &str| {
@@ -1097,14 +1078,14 @@ async fn a_revoked_tenant_admin_credential_refuses_its_warm_token_next_request()
             .status()
     };
     assert_eq!(
-        cards(&warm).await,
+        cards(&token_a).await,
         StatusCode::OK,
-        "the warm token authorizes"
+        "credential A's token authorizes"
     );
 
     let issued = body_json(
         srv.oneshot_authenticated(
-            &warm,
+            &token_a,
             tenant_request(
                 Method::POST,
                 &format!("/v1/principals/{admin_id}/credentials"),
@@ -1122,7 +1103,7 @@ async fn a_revoked_tenant_admin_credential_refuses_its_warm_token_next_request()
     let second_id = issued["id"].as_str().expect("credential id").to_owned();
     let listed = body_json(
         srv.oneshot_authenticated(
-            &warm,
+            &token_a,
             tenant_request(
                 Method::GET,
                 &format!("/v1/principals/{admin_id}/credentials"),
@@ -1142,15 +1123,10 @@ async fn a_revoked_tenant_admin_credential_refuses_its_warm_token_next_request()
         .as_str()
         .expect("credential id")
         .to_owned();
-    assert_eq!(
-        cards(&warm).await,
-        StatusCode::OK,
-        "still warm before revocation"
-    );
 
     let resp = srv
         .oneshot_authenticated(
-            &warm,
+            &token_a,
             tenant_request(
                 Method::DELETE,
                 &format!("/v1/principals/{admin_id}/credentials/{first_id}"),
@@ -1162,13 +1138,30 @@ async fn a_revoked_tenant_admin_credential_refuses_its_warm_token_next_request()
     assert_eq!(resp.status(), StatusCode::NO_CONTENT, "revocation succeeds");
 
     assert_eq!(
-        cards(&warm).await,
+        tenant_token(&srv, &first).await.unwrap_err(),
         StatusCode::UNAUTHORIZED,
-        "the warm predecessor is refused on the next request"
+        "revoked credential A cannot exchange again"
     );
-    assert!(
-        tenant_token(&srv, &second).await.is_ok(),
-        "the administrator's other credential still authenticates"
+    assert_eq!(
+        cards(&token_a).await,
+        StatusCode::OK,
+        "A's existing token keeps its snapshot authority before expiry"
+    );
+    let token_b = tenant_token(&srv, &second)
+        .await
+        .expect("surviving credential B exchanges immediately");
+    assert_eq!(
+        cards(&token_b).await,
+        StatusCode::OK,
+        "B's fresh token spends immediately"
+    );
+
+    // Past the short lifetime, A's token lapses on its own.
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    assert_eq!(
+        cards(&token_a).await,
+        StatusCode::UNAUTHORIZED,
+        "A's token is refused once it expires"
     );
 }
 
@@ -2518,9 +2511,6 @@ async fn a_tenant_revokes_a_compromised_principal_with_its_reason() {
         .expect("credential")
         .to_owned();
 
-    // Minted now and deliberately unexercised: the verifier caches a
-    // principal's revocation epoch, so a request before the revocation would
-    // seed that cache and make the assertion after it pass on stale state.
     let live_token = tenant_token(&srv, &credential)
         .await
         .expect("the credential mints a token");
@@ -2572,20 +2562,22 @@ async fn a_tenant_revokes_a_compromised_principal_with_its_reason() {
         .oneshot_authenticated(&live_token, tenant_request(Method::GET, "/v1/cards", None))
         .await
         .expect("cards route responds");
-    assert_ne!(
+    assert_eq!(
         resp.status(),
         StatusCode::OK,
-        "a token minted before the revocation stops authorizing"
+        "a token minted before the revocation keeps its snapshot until expiry"
     );
-    // Revocation advances the principal's authorization epoch; it does not
-    // retire the credential, which stays the administrator's call.
+    assert_eq!(
+        tenant_token(&srv, &credential).await.unwrap_err(),
+        StatusCode::UNAUTHORIZED,
+        "the suspended principal's credential mints nothing new"
+    );
 
-    // One decision, not three. The secret-like reason never reached the
-    // authorization boundary. The wrong-kind attempt did, but its allowance now
-    // rides the transaction that performs the revocation, and that transaction
-    // found nothing and rolled back — so no row claims a revocation was
-    // permitted that never happened. The caller still learns of the refusal as a
-    // `404`, and a denial would have committed on its own.
+    // Two decisions, not three. The secret-like reason never reached the
+    // authorization boundary. The wrong-kind attempt was an authorized decision
+    // that found nothing: its allowance commits with no effect before the
+    // `404`, so an operator can see the attempt. The accepted revocation
+    // commits its allowance together with the suspension.
     // Read past RLS on purpose: the assertion is about the durable audit row
     // the server wrote, which no tenant-plane route projects.
     let rows: Vec<Option<String>> = sqlx::query_scalar(
@@ -2614,9 +2606,11 @@ async fn a_tenant_revokes_a_compromised_principal_with_its_reason() {
         .collect();
     assert_eq!(
         decisions.len(),
-        1,
-        "only the revocation that happened is recorded: {decisions:?}"
+        2,
+        "the wrong-kind miss and the accepted revocation are recorded: {decisions:?}"
     );
+    assert_eq!(decisions[0]["principal_kind"], "user");
+    assert_eq!(decisions[0]["reason"], "wrong table");
 
     let detail = decisions.last().expect("the accepted decision is last");
     assert_eq!(detail["kind"], "principal_revocation");
@@ -3047,11 +3041,8 @@ async fn an_operator_suspends_and_resumes_a_tenant_through_the_platform_plane() 
         "inspection reads one tenant: {inspected}"
     );
 
-    // A token minted before the suspension is the interesting one. Use it once
-    // first: this server runs the production five-second epoch cache, so the
-    // priming request is what makes the next assertion meaningful — the
-    // suspension has to be visible to a request whose principal is already
-    // cached as admitted, not merely to a cold one.
+    // A token minted before the suspension is the interesting one: suspension
+    // governs issuance, and an issued token is a self-contained snapshot.
     let live_token = tenant_token(&srv, &admin_credential)
         .await
         .expect("the tenant administers before suspension");
@@ -3069,7 +3060,7 @@ async fn an_operator_suspends_and_resumes_a_tenant_through_the_platform_plane() 
     assert_eq!(
         primed.status(),
         StatusCode::OK,
-        "the live token works, and the admission verdict is now cached"
+        "the live token works before suspension"
     );
 
     let suspend = async |status: &str| -> StatusCode {
@@ -3104,11 +3095,11 @@ async fn an_operator_suspends_and_resumes_a_tenant_through_the_platform_plane() 
         )
         .await
         .expect("principal route responds");
-    assert_ne!(
+    assert_eq!(
         resp.status(),
         StatusCode::OK,
-        "a token minted before the suspension stops working too, on the very \
-         next request rather than after the epoch cache expires"
+        "a token minted before the suspension keeps its snapshot authority \
+         until its five-minute expiry; verification reads no tenant state"
     );
 
     // Replaying the same transition changes nothing and says so.

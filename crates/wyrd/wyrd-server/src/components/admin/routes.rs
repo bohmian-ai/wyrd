@@ -274,7 +274,7 @@ struct BindingFilter {
          body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
-          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
         (status = 403, description = "Caller lacks service_accounts:write \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 409, description = "The issuer is already registered for this tenant \
@@ -362,7 +362,7 @@ async fn create_trusted_issuer(
          body = Vec<TrustedIssuerView>),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
-          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
         (status = 403, description = "Caller lacks service_accounts:write \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 500, description = "A tenant store read or write failed, or the decision \
@@ -428,7 +428,7 @@ async fn list_trusted_issuers(
         (status = 204, description = "Issuer removed"),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
-          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
         (status = 403, description = "Caller lacks service_accounts:write \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No such issuer in this tenant \
@@ -516,7 +516,7 @@ async fn delete_trusted_issuer_route(
           (WYRD_VALIDATION_400_MISSING_REQUIRED_FIELD)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
-          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
         (status = 403, description = "Caller lacks service_accounts:write \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "The named issuer is not trusted by this tenant \
@@ -593,7 +593,7 @@ async fn create_workload_binding(
          body = Vec<WorkloadBindingView>),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
-          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
         (status = 403, description = "Caller lacks service_accounts:write \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 500, description = "A tenant store read or write failed, or the decision \
@@ -660,7 +660,7 @@ async fn list_workload_bindings(
         (status = 204, description = "Binding removed"),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
-          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
         (status = 403, description = "Caller lacks service_accounts:write \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No such binding in this tenant \

@@ -133,7 +133,8 @@ wyrd eval run --eval ./eval.yaml --records ./observations.jsonl
 
 ## wyrd principal revoke
 
-Revoke a principal's credentials immediately. Requires an admin access token. The
+Suspend a principal so it can mint no new token; tokens it already holds lapse
+within five minutes. Requires an admin access token. The
 principal ID is positional; `--kind` is required because IDs are unique only
 within a kind.
 

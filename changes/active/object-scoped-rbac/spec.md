@@ -100,8 +100,9 @@ containment, exact UID matching, and distributed authority binding.
   fails closed before data IO and cannot produce partial success.
 - **INV-004:** Wildcard resource/action behavior grants object-wide access only
   when paired with `All` scope.
-- **INV-005:** Scoped decisions participate in existing revocation epoch,
-  audit, and distributed permission-digest boundaries.
+- **INV-005:** Scoped decisions participate in the existing five-minute
+  token permission snapshot, audit, and distributed permission-digest
+  boundaries.
 
 ## Scope and non-goals
 

@@ -131,7 +131,7 @@ fn revoke_credential_tool() -> Tool {
         REVOKE_CREDENTIAL,
         "Revoke a credential",
         "Retire one credential belonging to a principal in this caller's tenant. The credential \
-         can mint no further token and the tokens it already minted stop authorizing. The \
+         can mint no further token; a token it already minted lapses within five minutes. The \
          principal, its roles, and its other credentials are untouched. Requires \
          service_accounts:write.",
         false,

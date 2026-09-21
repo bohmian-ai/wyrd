@@ -51,7 +51,6 @@ chrono = { workspace = true }
 jsonwebtoken = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
-moka = { version = "0.12", features = ["future"] }
 rand = { workspace = true }
 rustix = { workspace = true }
 secrecy = { workspace = true, features = ["serde"] }

@@ -93,7 +93,7 @@ pub fn router() -> OpenApiRouter<AppState> {
         (status = 200, description = "Active queries", body = ListRunningQueriesResponse),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
-          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem, content_type = "application/problem+json"),
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "The principal may not drive query lifecycle \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 409, description = "The query's owner moved while the request was in \
@@ -140,7 +140,7 @@ pub(crate) async fn list_running_queries(
           ID (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
-          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem, content_type = "application/problem+json"),
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "The principal may not drive query lifecycle \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 404, description = "No active query of that identifier is visible to this \
@@ -197,7 +197,7 @@ pub(crate) async fn get_running_query(
           ID (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
-          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem, content_type = "application/problem+json"),
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "The principal may not drive query lifecycle \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 404, description = "No active query of that identifier is visible to this \
@@ -266,7 +266,7 @@ pub(crate) async fn cancel_running_query(
           WYRD_QUERY_400_TOO_COMPLEX, WYRD_SPEC_400_VALIDATION)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
-          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem, content_type = "application/problem+json"),
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "The principal may not query, or a peer presented \
           unacceptable credentials (WYRD_PERMISSION_403_DENIED_RBAC, \
           WYRD_VALA_403_QUERY_PEER_SECURITY)", body = WyrdProblem, content_type = "application/problem+json"),

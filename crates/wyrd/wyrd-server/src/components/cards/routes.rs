@@ -54,7 +54,7 @@ pub fn cards_router() -> OpenApiRouter<AppState> {
         (status = 400, description = "The Card kind, space, name, version, or UID is not well formed (WYRD_REGISTRY_400_INVALID_CARD_SPEC, WYRD_REGISTRY_400_VERSION_REQUIRED, WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
-          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
         (status = 403, description = "The principal may not read Cards \
           (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_AUTH_403_PRINCIPAL_ORPHANED)",
          body = WyrdProblem),
@@ -110,7 +110,7 @@ async fn get_card_http(
         (status = 400, description = "The Card kind, space, name, version, or UID is not well formed (WYRD_REGISTRY_400_INVALID_CARD_SPEC, WYRD_REGISTRY_400_VERSION_REQUIRED, WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
-          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
         (status = 403, description = "The principal may not read Cards \
           (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_AUTH_403_PRINCIPAL_ORPHANED)",
          body = WyrdProblem),
@@ -153,7 +153,7 @@ async fn get_card_by_ref_http(
         (status = 400, description = "The Card kind, space, name, version, or UID is not well formed (WYRD_REGISTRY_400_INVALID_CARD_SPEC, WYRD_REGISTRY_400_VERSION_REQUIRED, WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
-          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
         (status = 403, description = "The principal may not read Cards \
           (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_AUTH_403_PRINCIPAL_ORPHANED)",
          body = WyrdProblem),
@@ -205,7 +205,7 @@ async fn get_latest_card_http(
         (status = 400, description = "The Card kind, space, name, version, or UID is not well formed (WYRD_REGISTRY_400_INVALID_CARD_SPEC, WYRD_REGISTRY_400_VERSION_REQUIRED, WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
-          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
         (status = 403, description = "The principal may not read Cards \
           (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_AUTH_403_PRINCIPAL_ORPHANED)",
          body = WyrdProblem),
@@ -260,7 +260,7 @@ async fn list_versions_http(
         (status = 400, description = "The list filter, limit, or cursor is not usable (WYRD_REGISTRY_400_LIST_LIMIT_OUT_OF_RANGE, WYRD_REGISTRY_400_CURSOR_MISMATCH, WYRD_QUERY_400_INVALID_FIELD, WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
-          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
         (status = 403, description = "The principal may not read Cards \
           (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_AUTH_403_PRINCIPAL_ORPHANED)",
          body = WyrdProblem),
@@ -296,7 +296,7 @@ async fn list_cards_http(
         (status = 400, description = "The Card kind, space, name, version, or UID is not well formed (WYRD_REGISTRY_400_INVALID_CARD_SPEC, WYRD_REGISTRY_400_VERSION_REQUIRED, WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
-          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
         (status = 403, description = "The principal may not read Cards \
           (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_AUTH_403_PRINCIPAL_ORPHANED)",
          body = WyrdProblem),
@@ -343,7 +343,7 @@ async fn list_artifacts_http(
         (status = 400, description = "The submission is not a valid Card, or its idempotency key is missing or malformed (WYRD_REGISTRY_400_INVALID_CARD_SPEC, WYRD_REGISTRY_400_SPEC_TOO_LARGE, WYRD_REGISTRY_400_IDEMPOTENCY_KEY_REQUIRED, WYRD_REGISTRY_400_IDEMPOTENCY_KEY_INVALID, WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
-          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
         (status = 403, description = "The principal may not register Cards \
           (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_AUTH_403_PRINCIPAL_ORPHANED)",
          body = WyrdProblem),
@@ -425,7 +425,7 @@ pub(crate) async fn register_card_http(
         (status = 400, description = "The Card UID or idempotency key is malformed, or an artifact never finished uploading (WYRD_REGISTRY_400_INVALID_CARD_SPEC, WYRD_REGISTRY_400_IDEMPOTENCY_KEY_INVALID, WYRD_REGISTRY_400_UPLOAD_INTERRUPTED, WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
-          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
         (status = 403, description = "The principal may not write Cards \
           (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_AUTH_403_PRINCIPAL_ORPHANED)",
          body = WyrdProblem),
@@ -491,7 +491,7 @@ async fn complete_card_http(
         (status = 400, description = "The Card kind, space, name, version, or UID is not well formed (WYRD_REGISTRY_400_INVALID_CARD_SPEC, WYRD_REGISTRY_400_VERSION_REQUIRED, WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
-          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
         (status = 403, description = "The principal may not delete Cards \
           (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_AUTH_403_PRINCIPAL_ORPHANED)",
          body = WyrdProblem),
@@ -560,7 +560,7 @@ async fn delete_card_http(
         (status = 400, description = "The Card kind, space, name, version, or UID is not well formed (WYRD_REGISTRY_400_INVALID_CARD_SPEC, WYRD_REGISTRY_400_VERSION_REQUIRED, WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
-          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
         (status = 403, description = "The principal may not delete Cards \
           (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_AUTH_403_PRINCIPAL_ORPHANED)",
          body = WyrdProblem),

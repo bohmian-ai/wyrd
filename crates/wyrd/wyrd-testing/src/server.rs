@@ -2482,7 +2482,7 @@ impl WyrdTestServer {
     /// authenticated caller holding one permission and deliberately lacking
     /// another cannot express that with a builtin name. This seeds the role
     /// the same way tenant seeding does, through the shared upsert, so a
-    /// principal granted it resolves the exact permission set at verify time.
+    /// principal granted it is issued exactly that permission set.
     ///
     /// # Errors
     ///

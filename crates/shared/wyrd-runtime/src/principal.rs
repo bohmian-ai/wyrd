@@ -24,7 +24,8 @@ pub struct Principal {
     pub tenant_id: DataTenantId,
     /// Role names carried by the verified token.
     pub roles: Vec<RoleRef>,
-    /// Permissions resolved from roles at verify time.
+    /// The token's permission snapshot: resolved from the principal's roles
+    /// once at issuance and carried unchanged until the token expires.
     pub effective_permissions: PermissionSet,
     /// Non-secret id of the credential the request authenticated with, when one
     /// was presented.

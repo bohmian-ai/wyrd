@@ -42,7 +42,10 @@ pub struct RevokeArgs {
     pub token: String,
 }
 
-/// Revoke one principal's outstanding tokens.
+/// Suspend one principal so every issuance path refuses its next token.
+///
+/// A token it already holds is a five-minute permission snapshot and lapses
+/// at expiry; nothing is checked per request.
 ///
 /// # Errors
 /// Returns [`WyrdCliError::InvalidArgument`] when the id is not a principal

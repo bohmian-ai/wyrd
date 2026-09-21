@@ -67,7 +67,7 @@ pub fn storage_router(state: &AppState) -> OpenApiRouter<AppState> {
           WYRD_STORAGE_400_SHA256_INVALID, WYRD_STORAGE_400_SIZE_INVALID)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
-          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
         (status = 403, description = "The principal lacks card write, or the object belongs to \
           another tenant (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_STORAGE_403_UPLOAD_FOREIGN_TENANT)", body = WyrdProblem),
         (status = 409, description = "The upload record conflicts with one already stored \
@@ -129,7 +129,7 @@ struct PartUrlQuery {
           (WYRD_STORAGE_400_INVALID_UPLOAD_ID)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
-          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
         (status = 403, description = "The principal lacks card write, or the object belongs to \
           another tenant (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_STORAGE_403_UPLOAD_FOREIGN_TENANT)", body = WyrdProblem),
         (status = 404, description = "No such upload (WYRD_STORAGE_404_UPLOAD_NOT_FOUND)",
@@ -196,7 +196,7 @@ async fn part_url(
           WYRD_STORAGE_400_SIZE_MISMATCH)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
-          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
         (status = 403, description = "The principal lacks card write, or the object belongs to \
           another tenant (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_STORAGE_403_UPLOAD_FOREIGN_TENANT)", body = WyrdProblem),
         (status = 404, description = "No such upload, or its object never reached the backend \
@@ -266,7 +266,7 @@ async fn complete(
           (WYRD_SPEC_400_VALIDATION, WYRD_STORAGE_400_INVALID_UPLOAD_ID)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
-          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
         (status = 403, description = "The principal lacks card write, or the object belongs to \
           another tenant (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_STORAGE_403_UPLOAD_FOREIGN_TENANT)", body = WyrdProblem),
         (status = 404, description = "No such upload (WYRD_STORAGE_404_UPLOAD_NOT_FOUND)",
@@ -336,7 +336,7 @@ async fn abort(
           WYRD_STORAGE_400_SIZE_MISMATCH, WYRD_STORAGE_400_SHA256_MISMATCH)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
-          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
         (status = 403, description = "The principal lacks card write, or the object belongs to \
           another tenant (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_STORAGE_403_UPLOAD_FOREIGN_TENANT)", body = WyrdProblem),
         (status = 404, description = "No such upload (WYRD_STORAGE_404_UPLOAD_NOT_FOUND)",
@@ -398,7 +398,7 @@ async fn local_blob(
          body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
-          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
         (status = 403, description = "The principal lacks card read, or the object belongs to \
           another tenant (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_STORAGE_403_UPLOAD_FOREIGN_TENANT)", body = WyrdProblem),
         (status = 404, description = "No such card artifact, or its object is gone from the \
@@ -470,7 +470,7 @@ struct LocalDownloadQuery {
           WYRD_STORAGE_400_TENANT_PATH_MISMATCH)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
-          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
         (status = 403, description = "The principal lacks card read, or the object belongs to \
           another tenant (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_STORAGE_403_UPLOAD_FOREIGN_TENANT)", body = WyrdProblem),
         (status = 404, description = "No such stored object \

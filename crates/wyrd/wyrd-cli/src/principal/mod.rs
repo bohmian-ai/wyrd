@@ -12,7 +12,8 @@ use crate::error::WyrdCliError;
 /// acting on the credentials that authenticate it are kept apart so revoking
 /// access never reads as a credential edit.
 pub enum PrincipalCommand {
-    /// Revoke a principal's credentials immediately.
+    /// Suspend a principal so it can mint no new token; tokens it already
+    /// holds lapse within five minutes.
     Revoke(revoke::RevokeArgs),
     /// Create principals and administer their credentials.
     #[command(subcommand)]

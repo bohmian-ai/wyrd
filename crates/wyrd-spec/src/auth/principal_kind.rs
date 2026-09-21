@@ -4,8 +4,8 @@
 //! (`global_admin` / `tenant_admin` / `user` / `service` / `agent`) without a
 //! bound card. It is the single wire
 //! encoding for every site that identifies a principal kind: the revoke-by-id
-//! request body, access- and refresh-token claims, the revocation NOTIFY
-//! channel, revocation-epoch lookups, the audit event, and the CLI.
+//! request body, access- and refresh-token claims, the audit event, and the
+//! CLI.
 //!
 //! The **data-bearing** identity (the kind plus its bound `card_ref` and
 //! transitive `card_ref_scope`) is a runtime concept and lives on
@@ -19,8 +19,8 @@ use serde::{Deserialize, Serialize};
 ///
 /// Serializes as a bare snake_case string (`"global_admin"`, `"tenant_admin"`,
 /// `"user"`, `"service"`, `"agent"`); this is a stable wire contract for the
-/// revoke request body, token claims, the revocation NOTIFY channel, and the
-/// durable `principal_kind` columns.
+/// revoke request body, token claims, and the durable `principal_kind`
+/// columns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]

@@ -77,9 +77,10 @@ wyrd platform tenant suspend --tenant <tenant-id>
 wyrd platform tenant resume  --tenant <tenant-id>
 ```
 
-Suspension stops the tokens the tenant has already minted, not only its next
-credential exchange, and destroys nothing: rows, grants, and credentials all
-survive, so `resume` restores exactly what was there.
+Suspension refuses the tenant's next credential exchange immediately; a tenant
+token already minted is a five-minute snapshot and lapses at expiry. Suspension
+destroys nothing: rows, grants, and credentials all survive, so `resume`
+restores exactly what was there.
 
 ### Tenant administration
 

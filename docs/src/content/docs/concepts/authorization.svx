@@ -27,8 +27,10 @@ permission; a scope-less entry is rejected at decode, and there is no
 compatibility decoder. A grant subsumes a request only when all three axes
 cover it.
 
-Roles carry a JSONB set of permissions; role claims are embedded in the token at
-issuance and resolved against the database at verify time.
+Roles carry a JSONB set of permissions. Issuance resolves the principal's roles
+once and signs the result into the token's `permissions` claim; verification is
+local and reads no database, so a grant change governs the next token and an
+issued token keeps its snapshot for at most five minutes.
 
 ```json
 [

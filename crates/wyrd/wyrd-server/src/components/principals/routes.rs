@@ -258,7 +258,7 @@ async fn mint_credential(
           this tenant (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
-          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
         (status = 403, description = "Tenant principal administration required \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 500, description = "A tenant store read or write failed, or the authorization \
@@ -355,7 +355,7 @@ async fn create_service_principal(
           (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
-          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
         (status = 403, description = "Tenant principal administration required \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No such principal in the caller's tenant \
@@ -405,7 +405,7 @@ async fn issue_credential(
           (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
-          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
         (status = 403, description = "Tenant principal administration required \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No such principal in the caller's tenant \
@@ -492,7 +492,7 @@ pub(crate) async fn list_credentials_for(
           (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
-          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
         (status = 403, description = "Tenant principal administration required \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No such principal in the caller's tenant, or it holds \

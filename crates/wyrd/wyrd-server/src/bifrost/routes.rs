@@ -33,7 +33,7 @@ pub fn router() -> OpenApiRouter<AppState> {
          body = WyrdProblem, content_type = "application/problem+json"),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
-          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem, content_type = "application/problem+json"),
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "The principal may not register Bifrost tables \
           (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_VALA_403_BIFROST_RESERVED_BUILTIN_WRITE)",
          body = WyrdProblem, content_type = "application/problem+json"),
@@ -76,7 +76,7 @@ pub(crate) async fn register(
         (status = 200, description = "Visible table entries", body = Vec<BifrostTableEntry>),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
-          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem, content_type = "application/problem+json"),
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "The principal may not read the Bifrost catalog \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "This server carries no catalog, the catalog or its \
@@ -119,7 +119,7 @@ pub(crate) async fn list(
           (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
-          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem, content_type = "application/problem+json"),
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "The principal may not read the Bifrost catalog \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 404, description = "No table of that name is visible to this tenant \

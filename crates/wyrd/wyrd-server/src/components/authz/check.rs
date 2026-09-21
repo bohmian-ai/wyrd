@@ -37,7 +37,7 @@ use crate::state::AppState;
           WYRD_VALIDATION_400_MISSING_REQUIRED_FIELD)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
-          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
         (status = 403, description = "The token is not a delegated invoke token, or policy \
           refused the invocation (WYRD_AUTHZ_403_REQUIRES_DELEGATED_TOKEN, \
           WYRD_AUTHZ_403_POLICY_DENIED)", body = WyrdProblem),

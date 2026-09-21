@@ -141,6 +141,15 @@ mod pg_tests {
             "the read tool advertises its result shape: {list_output:?}"
         );
         let revoke_tool = descriptor(REVOKE_CREDENTIAL)?;
+        // An agent planning a revocation reads the same auth contract the
+        // server enforces: the next issuance is refused, and a token already
+        // minted is a snapshot that lapses within five minutes.
+        let revoke_description = revoke_tool.description.as_deref().unwrap_or_default();
+        assert!(
+            revoke_description.contains("lapses within five minutes")
+                && !revoke_description.contains("stop authorizing"),
+            "the write tool describes the five-minute snapshot: {revoke_description}"
+        );
         assert_eq!(
             required(&revoke_tool.input_schema),
             vec!["credential_id", "principal_id"],

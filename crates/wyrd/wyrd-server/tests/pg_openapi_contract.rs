@@ -365,6 +365,48 @@ async fn every_authenticated_path_declares_the_one_wyrd_scheme() {
     server.shutdown().await.expect("server shuts down");
 }
 
+/// A protected tenant operation documents only the refusals its local verifier
+/// can reach.
+///
+/// Tenant access tokens are five-minute permission snapshots verified without
+/// a database, so a request can be unauthenticated, invalid, or expired, but
+/// never `WYRD_AUTH_401_CREDENTIAL_REVOKED`: revocation refuses the next
+/// issuance instead. Operations that clear the document requirement (issuance)
+/// and the platform plane, which revalidates current state, are excluded.
+#[tokio::test]
+async fn protected_tenant_operations_document_no_revocation_refusal() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+
+    let mut protected = 0;
+    for (path, item) in document["paths"].as_object().expect("paths object") {
+        if path.starts_with("/platform") {
+            continue;
+        }
+        for (method, operation) in item.as_object().expect("path item is an object") {
+            if !METHODS.contains(&method.as_str()) || operation.get("security").is_some() {
+                continue;
+            }
+            protected += 1;
+            let description = operation["responses"]["401"]["description"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(
+                !stable_codes(description).contains(&"WYRD_AUTH_401_CREDENTIAL_REVOKED".to_owned()),
+                "{method} {path} documents a revocation refusal its verifier cannot emit"
+            );
+        }
+    }
+    assert!(
+        protected > 0,
+        "the document serves protected tenant operations"
+    );
+
+    server.shutdown().await.expect("server shuts down");
+}
+
 /// Every public Bifrost table, query, and lifecycle operation publishes its
 /// pre-stream refusals as typed `WyrdProblem` bodies.
 #[tokio::test]

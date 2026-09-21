@@ -1,7 +1,8 @@
 ---
 id: SPEC-admin-principals
 revision: 13
-status: draft
+status: approved
+approved_at: 2026-09-21
 ---
 
 # Global and tenant administrative principals
@@ -839,12 +840,11 @@ the next.
 
 ## Open material decisions
 
-Revision 13 requires explicit human approval of `REQ-012c`, `INV-013a`, and
-`AC-020` before delegation remediation begins.
+None. Every decision raised during drafting has been resolved by the author.
 
 ## Revision history
 
-- **Revision 13 — 2026-09-21 — draft**: Brings RFC 8693 delegation into the
+- **Revision 13 — 2026-09-21 — approved**: Brings RFC 8693 delegation into the
   credential-exchange security boundary. Delegated permissions are the semantic
   intersection of the caller's verified authority and the target principal's
   current grants, and every allowed or denied delegation authorization decision

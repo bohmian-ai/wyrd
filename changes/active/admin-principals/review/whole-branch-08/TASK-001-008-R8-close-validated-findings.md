@@ -2,15 +2,12 @@
 
 ## Route and authority
 
-**BLOCKED:** do not implement this packet until draft specification revision 13
-is explicitly approved and this task is revised to include its delegation
-requirements. After approval, implement the resulting remediation with
-`$wyrd-implement`. The next
+Implement this remediation with `$wyrd-implement`. The next
 `$wyrd-task-review` must reassess the complete cumulative candidate.
 
 - Approved specification: `changes/active/admin-principals/spec.md`, revision
-  12, status `approved`, SHA-256
-  `1a2fd760de9012767499cf9ca41d41c21d502ffe6e13613ddf5cdd2328bcf856`.
+  13, status `approved`, SHA-256
+  `57f91317e68b06e7b4d34ea94b964e4a1dd99678275a2ee67d1d51f9b4b46332`.
 - Original tasks: `changes/active/admin-principals/tasks/TASK-001-*.md`
   through `TASK-008-*.md`.
 - Parent remediation:
@@ -21,18 +18,23 @@ requirements. After approval, implement the resulting remediation with
 - Validated ledger:
   `changes/active/admin-principals/review/whole-branch-08/findings-validation.md`.
 - Remediates: `FIND-admin-principals-R6-1`,
-  `FIND-admin-principals-R7-5`, and
-  `FIND-admin-principals-R8-1` through
-  `FIND-admin-principals-R8-7`.
+  `FIND-admin-principals-R7-5`, `FIND-admin-principals-R8-2`,
+  `FIND-admin-principals-R8-3`, and `FIND-admin-principals-R8-5` through
+  `FIND-admin-principals-R8-7`. The human authority rejected
+  `FIND-admin-principals-R8-1` and `FIND-admin-principals-R8-4`; keep
+  `67b4d0ba` and add no pre-release audit compatibility migration.
+- Implements newly approved `REQ-012c`, `INV-013a`, and `AC-020`.
 
 ## Outcome
 
-Keep the approved authentication architecture exactly as implemented: one
+Keep the approved core authentication architecture: one
 shared issuance owner mints five-minute tenant JWTs whose `permissions` claim
 is the request authority; tenant requests verify those JWTs locally; platform
 requests revalidate current state through Postgres. Close the remaining live
 contract, security, upgrade, RLS, gRPC-proof, public-error, evidence, and scope
 defects without introducing another auth mechanism or general framework.
+Delegation must attenuate permissions to the caller/target overlap and durably
+audit every authorization decision before responding.
 
 ## Findings and required corrections
 
@@ -67,16 +69,6 @@ command, positive selected count, pass result, and owning lane. Use the existing
 runner and environment-owning wrapper; add no test harness and do not replace
 focused proof with a family aggregate.
 
-### `FIND-admin-principals-R8-1` — unrelated audit concurrency policy entered the task
-
-Commit `67b4d0ba` changes the audit publisher from blocking `FOR UPDATE` to
-`FOR UPDATE NOWAIT` and rewrites its replay journey. The R7 packet identifies
-this as out of task, and `VER-005` excludes repairing unrelated failures.
-
-Remove only that commit's production and test effects from the cumulative
-candidate, restoring the prior publisher lock semantics and journey. Do not
-redesign or fix audit-publisher contention here; it requires its own change.
-
 ### `FIND-admin-principals-R8-2` — CLI secrets enter argv and debug output
 
 The new platform and tenant administration endpoint arguments accept
@@ -95,24 +87,6 @@ The candidate imports `sha2::Digest` inside
 `shipped_audit_staging_migration_is_immutable`, contrary to the module-scope
 import rule. Move only that import into the existing `pg_tests` import block;
 add no wrapper, alias, or new test.
-
-### `FIND-admin-principals-R8-4` — retained audit history cannot upgrade
-
-Credential attribution adds a column and changes the audit hash encoding, but
-the built-in table owner rejects the predecessor fingerprint and the new hash
-encoder appends an optional segment even when no credential exists. A tenant
-with a pre-change retained `vala.system.audit_log` therefore loops on
-`FingerprintMismatch`, and old credential-free hashes cannot be reproduced by
-the new algorithm.
-
-Teach the existing built-in audit-table owner exactly one predecessor
-transition: recognize only the prior audit fingerprint, use the installed
-Iceberg schema-evolution mechanism to append nullable `credential_id`, and
-atomically advance the catalog fingerprint. Continue rejecting every other
-mismatch. Preserve the predecessor hash encoding whenever `credential_id` is
-absent and append the new segment only when present, so old and new null rows
-share one reproducible preimage. Do not add a generic migration framework or
-accept arbitrary schema drift.
 
 ### `FIND-admin-principals-R8-5` — tenant queries duplicate forced RLS
 
@@ -151,6 +125,39 @@ problem mechanism used by the local-transfer correction. Add the reachable 400
 problem and stable code to each affected operation. Add no middleware, second
 parser, compatibility alias, or new error type.
 
+### Revision 13 — delegation must not amplify authority
+
+The current RFC 8693 exchange verifies that the caller has
+`delegation:issue`, then the shared issuer signs the target principal's complete
+current `PermissionSet`. A caller can therefore obtain a delegated token with
+permissions the caller never held.
+
+Keep `delegation:issue` as the entry permission, but mint the delegated token
+with the semantic intersection of the verified caller token's permissions and
+the target principal's current permissions. For every overlapping wildcard,
+schema, or exact-object grant, retain the narrower scope; include no permission
+unless both authorities cover it. Keep the existing target identity,
+delegation chain, maximum depth, five-minute lifetime, no-refresh behavior, and
+emit Card scope. Reuse the existing permission coverage semantics and shared
+issuer; add no second RBAC engine or delegation policy layer.
+
+### Revision 13 — delegation decisions must be durably audited
+
+The current permission-denied branch returns before appending canonical audit,
+and an allowed check followed by subject resolution or issuance failure leaves
+no committed authorization decision. That violates the repository's one-row-
+per-decision rule.
+
+Every actual evaluation of `delegation:issue` must commit exactly one allowed
+or denied decision to the canonical audit staging path before the response. A
+successful exchange may use its existing token-exchange audit as the allowed
+row, but must not add a duplicate. If permission is allowed and later subject
+resolution or issuance refuses, commit the allowed no-effect decision. If the
+audit append cannot commit, fail closed and issue no token. An invalid subject
+token that never reaches permission evaluation creates no authorization
+decision. Preserve the existing public denial and not-found errors and add no
+second audit sink or best-effort fallback.
+
 ## Constraints and preserved behavior
 
 - Preserve the five issuance entries, one concrete `TenantTokenIssuer`, the
@@ -163,12 +170,15 @@ parser, compatibility alias, or new error type.
 - Preserve platform current-state authorization through `OperatorPool` and
   tenant data access through `TenantConn` with forced RLS.
 - Preserve the canonical audit staging/publisher path and credential
-  attribution. Only the unrelated `NOWAIT` repair is removed.
+  attribution. Keep `67b4d0ba`'s `FOR UPDATE NOWAIT` behavior and replay proof:
+  one locked tenant must not stall publication for every tenant.
+- Wyrd has not shipped: keep the new audit schema and hash encoding as the sole
+  format and add no predecessor-table or predecessor-hash compatibility path.
 - Preserve local-transfer problem mapping, principal-revoke no-effect audit,
   shared-client ownership, stable errors, and generated-contract ownership.
-- Do not change delegation authority or denial-audit behavior in this task;
-  Wave 2 proved both predate the base and the approved specification excludes
-  delegation-chain redesign.
+- Preserve delegation-chain representation, ordering, maximum depth, subject
+  identity, no-refresh behavior, and emit Card scope; change only permission
+  attenuation and canonical decision audit required by revision 13.
 - Do not rewrite historical reviews, completed evidence, or immutable
   migrations merely to remove obsolete words.
 - Do not add a general schema-migration system, credential-source layer, test
@@ -180,13 +190,13 @@ parser, compatibility alias, or new error type.
 |---|---|
 | `FIND-admin-principals-R6-1` | Every live tenant-auth contract describes the five-minute permission snapshot; protected tenant OpenAPI contains only reachable verifier errors; direct server metadata has no unused `moka`; every residual obsolete term is classified as history, unrelated platform usage, or defect |
 | `FIND-admin-principals-R7-5` | Every named closure test maps one-to-one to a literal final-tree command, positive selected count, result, and owning lane, with no placeholder |
-| `FIND-admin-principals-R8-1` | The cumulative diff contains none of `67b4d0ba`'s `NOWAIT` production or replay-journey rewrite |
 | `FIND-admin-principals-R8-2` | Tenant and platform CLI administration accept no secret-valued option, authenticate from their existing ambient/environment sources, fail when absent, and never render a supplied secret in debug output |
 | `FIND-admin-principals-R8-3` | The migration test compiles and passes with no function-scoped `use` |
-| `FIND-admin-principals-R8-4` | A predecessor retained audit table and old hash chain upgrade, accept old credential-free plus new attributed decisions in one history, and reproduce every stored hash; unknown fingerprints remain rejected |
 | `FIND-admin-principals-R8-5` | The four statements contain no redundant tenant filter while same-tenant behavior and cross-tenant invisibility remain correct through `TenantConn` |
 | `FIND-admin-principals-R8-6` | One exact nonzero server-journey selector proves a scoped JWT allows the covered gRPC table and refuses an uncovered table before streaming |
 | `FIND-admin-principals-R8-7` | Served OpenAPI and authenticated runtime requests agree for malformed IDs on a tenant principal, platform principal, and platform tenant path: typed schema, status, problem media, stable code, and operation-listed error |
+| `REQ-012c` / `INV-013a` | Delegated JWT permissions equal the semantic caller/target intersection for wildcard, schema, exact-object, and disjoint grants; no delegated token contains authority not covered by both |
+| `AC-020` | Allowed and denied `delegation:issue` evaluations each commit exactly one canonical audit row; allowed later failure retains a no-effect row; audit failure issues no token; successful issuance has no duplicate decision |
 
 ## Focused proof and broader verification
 
@@ -201,11 +211,14 @@ At minimum, prove:
 - CLI parsing/help, ambient tenant auth, environment platform auth, missing
   credentials, and redacted debug;
 - the existing migration checksum test;
-- predecessor retained-audit schema evolution and mixed old/new hash history;
 - same-tenant and cross-tenant behavior for the four corrected SQL statements;
 - scoped allow/refuse through the real Bifrost gRPC query boundary; and
 - malformed administrative identifiers through the assembled authenticated
-  router and served OpenAPI.
+  router and served OpenAPI;
+- delegated permission attenuation for wildcard, schema, exact-object, and
+  disjoint caller/target combinations; and
+- successful, denied, allowed-then-refused, and audit-append-failed delegation
+  decisions through real Postgres, proving exactly one durable row or no token.
 
 Run the narrowest owning lanes, including:
 

@@ -4252,7 +4252,7 @@ async fn an_authorized_request_that_changes_nothing_still_records_the_decision()
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "roleless", "roles": ["absent-role"] })),
+                Some(json!({ "name": "roleless", "roles": ["absent_role"] })),
             ),
             StatusCode::BAD_REQUEST,
             "creating a principal with a role that does not exist",

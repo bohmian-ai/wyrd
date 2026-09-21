@@ -199,8 +199,8 @@ pub struct AuditPublicationRange {
 
 /// Freeze, or reuse, the one contiguous range this tenant owes retained history.
 ///
-/// The chain head is locked `FOR UPDATE` so two publishers cannot establish
-/// two different bounds. An existing `publishing_seq_hi` is reused verbatim —
+/// The chain head is locked `FOR UPDATE NOWAIT` so two publishers cannot
+/// establish two different bounds. An existing `publishing_seq_hi` is reused verbatim —
 /// that is what makes a competing or restarted publisher derive the identical
 /// batch identity — and is otherwise established from the bounded staging
 /// prefix above the watermark. Returns `None` when the tenant has never
@@ -211,9 +211,17 @@ pub struct AuditPublicationRange {
 /// the bound is durable progress state, not a lease, so no owner token,
 /// deadline, or audit-chain lock travels with it.
 ///
+/// Lock acquisition never waits. When another transaction holds this tenant's
+/// chain head, the locked read fails immediately with PostgreSQL `55P03`
+/// (`lock_not_available`) before any publication state changes: no bound is
+/// frozen and no staged row is read. The publisher logs that failure and
+/// retries the unchanged tenant on a later sweep, so a contended tenant never
+/// holds a sweep open and delays only itself.
+///
 /// # Errors
-/// Returns [`SqlError`] when the locked read or the bound update fails, or RLS
-/// rejects the tenant's own chain head.
+/// Returns [`SqlError`] when the locked read or the bound update fails, when
+/// another transaction holds the tenant's chain head (lock contention is this
+/// error, never `None`), or when RLS rejects the tenant's own chain head.
 pub async fn freeze_publication_range(
     conn: &mut TenantConn<'_>,
     limit: i64,
@@ -223,7 +231,7 @@ pub async fn freeze_publication_range(
         WITH head AS (
             SELECT published_seq, publishing_seq_hi
               FROM vala.audit_chain_head
-            FOR UPDATE
+            FOR UPDATE NOWAIT
         )
         SELECT head.published_seq + 1,
                COALESCE(

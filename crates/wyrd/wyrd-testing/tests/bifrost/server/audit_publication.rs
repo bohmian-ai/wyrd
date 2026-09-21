@@ -219,50 +219,6 @@ async fn release_fence(mut fence: TenantConn<'_>) -> Result<(), ServerJourneyErr
     Ok(())
 }
 
-/// Reads the Postgres backend process id serving one tenant transaction.
-///
-/// The id names that transaction in `pg_blocking_pids`, which is how the
-/// journey observes lock queue order without sleeping.
-///
-/// # Errors
-/// Returns the query failure Postgres raised.
-async fn backend_pid(conn: &mut TenantConn<'_>) -> Result<i32, ServerJourneyError> {
-    Ok(sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut **conn.transaction())
-        .await?)
-}
-
-/// Waits until backend `waiter` is queued behind the transaction `holder` owns.
-///
-/// Polls `pg_blocking_pids` from the holder's own transaction, so the check
-/// neither takes nor releases any lock.
-///
-/// # Errors
-/// Returns the query failure, or a timeout when the waiter never queues.
-async fn await_blocked_behind(
-    holder: &mut TenantConn<'_>,
-    waiter: i32,
-) -> Result<(), ServerJourneyError> {
-    let deadline = std::time::Instant::now() + PUBLICATION_BUDGET;
-    loop {
-        let queued: bool =
-            sqlx::query_scalar("SELECT pg_backend_pid() = ANY(pg_blocking_pids($1))")
-                .bind(waiter)
-                .fetch_one(&mut **holder.transaction())
-                .await?;
-        if queued {
-            return Ok(());
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err(format!(
-                "backend {waiter} never queued behind the freeze within {PUBLICATION_BUDGET:?}"
-            )
-            .into());
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-}
-
 /// Waits until at least `waiters` backends are blocked on a lock.
 ///
 /// Postgres queues a second waiter for a row behind the first waiter's tuple
@@ -342,25 +298,25 @@ async fn frozen_bound(
 /// indifferent to it: staging is drained first, the three real decisions are
 /// appended in one transaction so any sweep freezes all of them or none, and
 /// their staged rows are fenced before the range is frozen, so no cycle can
-/// settle them. The frozen range must then be exactly those three rows,
-/// whichever publisher froze it. A tail decision commits in the same
-/// transaction as that freeze, so it is staged above a bound already live. A
-/// competing freeze queued on the chain head before that commit is granted the
-/// lock ahead of any settlement and must reuse the identical bound while the
-/// tail exists. Two full `publish_tenant` cycles are queued on the chain head
-/// behind that freeze as well, so both are granted the lock before any
-/// settlement can exist. `crashing` reports the range its own Scribe append returned for —
-/// the durable append, attributed to that cycle even while the server's sweep
-/// competes — and retained history sees it while the tail stays unretained.
-/// With every settlement held by the fence, `crashing` is aborted, which is
-/// exactly the crash-after-append, before-settlement state, and the bound is
-/// read back unchanged. `survivor` read the same range before any settlement
-/// and is paused before its append; only after the abort is it released, and
-/// it must report its own Scribe append of exactly that range, tail excluded,
-/// while the fence still blocks settlement and the bound stays live. Releasing
-/// the fence then lets it settle the reused bound. The
-/// frozen decisions must be retained exactly once, the tail must then be
-/// published by its own later range, and the tenant must drain to zero.
+/// settle them. The range is then frozen and committed before any competitor
+/// starts: the freeze takes the chain head `FOR UPDATE NOWAIT`, so competitors
+/// never queue on it and each one must instead observe the committed bound.
+/// The frozen range must be exactly those three rows, whichever publisher froze
+/// it. A tail decision is appended above that committed bound, and a direct SQL
+/// freeze must reuse the identical bound while the tail exists. `survivor`
+/// freezes the same bound and is paused after reading the range, before its
+/// append; only then does `crashing` run a full cycle, so both freezes read the
+/// committed bound before any cycle reaches settlement. `crashing` reports the
+/// range its own Scribe append returned for — the durable append, attributed to
+/// that cycle even while the server's sweep competes — and retained history
+/// sees it while the tail stays unretained. With every settlement held by the
+/// fence, `crashing` is aborted, which is exactly the crash-after-append,
+/// before-settlement state, and the bound is read back unchanged. `survivor` is
+/// released only after the abort, and it must report its own Scribe append of
+/// exactly that range, tail excluded, while the fence still blocks settlement
+/// and the bound stays live. Releasing the fence then lets it settle the reused
+/// bound. The frozen decisions must be retained exactly once, the tail must
+/// then be published by its own later range, and the tenant must drain to zero.
 ///
 /// # Errors
 /// Returns the server, Postgres, projection, publication, or query failure.
@@ -382,28 +338,35 @@ async fn frozen_audit_range_replays_once_while_its_tail_waits() -> Result<(), Se
     let appended = AuditPublicationRange { seq_lo, seq_hi };
     let mut fence = fence_staged_rows(&server, tenant, appended).await?;
 
-    // The freeze and the tail commit together, so the tail is staged above a
-    // bound that is already live and no cycle can observe one without the other.
+    // The bound is committed before any competitor starts, so every later
+    // freeze reads it rather than contending for the chain head.
     let mut freezer = server.tenant_conn_for(tenant).await?;
     let range = freeze_publication_range(&mut freezer, 512)
         .await?
         .ok_or("three appended decisions owe a range")?;
+    freezer.commit().await?;
     assert_eq!(
         range, appended,
         "a drained tenant's frozen range must be exactly the three decisions appended together"
     );
-    let tail_seq = append_audit(&mut freezer, &decision(&tail_op)).await?;
+    let tail_seq = append_decision(&server, tenant, &tail_op).await?;
     assert!(
         tail_seq > range.seq_hi,
         "the tail {tail_seq} must stage above the frozen bound {range:?}"
     );
+    let mut competitor = server.tenant_conn_for(tenant).await?;
+    let competing = freeze_publication_range(&mut competitor, 512).await?;
+    competitor.commit().await?;
+    assert_eq!(
+        competing,
+        Some(range),
+        "a competing freeze must reuse the frozen bound while the tail is staged above it"
+    );
 
-    // Every competitor queues on the chain head before the freeze commits, so
-    // each is granted the lock ahead of every settlement — no cycle can append,
-    // and so none can settle, until the freeze commits — and must reuse the
-    // bound. The SQL freeze pins that seam directly; `survivor` and `crashing`
-    // are two full production cycles. `survivor` pauses after reading the
-    // frozen range, so its own append can only follow the crash.
+    // `survivor` freezes and reads the committed range, then pauses before its
+    // append, so its own append can only follow the crash. `crashing` starts
+    // only once `survivor` has read the range, so neither freeze can meet a
+    // settlement already holding the chain head.
     let mut survivor_publisher = AuditPublisher::from_state(server.state())
         .ok_or("a Scribe-bearing server composes the audit publisher")?;
     let mut survivor_appended = survivor_publisher.observe_appends();
@@ -411,27 +374,14 @@ async fn frozen_audit_range_replays_once_while_its_tail_waits() -> Result<(), Se
     let mut crashing_publisher = AuditPublisher::from_state(server.state())
         .ok_or("a Scribe-bearing server composes the audit publisher")?;
     let mut crashing_appended = crashing_publisher.observe_appends();
-    let mut competitor = server.tenant_conn_for(tenant).await?;
-    let competitor_pid = backend_pid(&mut competitor).await?;
-    let competing = async {
-        let range = freeze_publication_range(&mut competitor, 512).await?;
-        competitor.commit().await?;
-        Ok::<_, ServerJourneyError>(range)
-    };
-    let committing = async {
-        await_blocked_behind(&mut freezer, competitor_pid).await?;
-        let survivor = tokio::spawn(async move { survivor_publisher.publish_tenant(tenant).await });
-        let crashing = tokio::spawn(async move { crashing_publisher.publish_tenant(tenant).await });
-        await_blocked_backends(&mut freezer, 3).await?;
-        freezer.commit().await?;
-        Ok::<_, ServerJourneyError>((survivor, crashing))
-    };
-    let (competing, (survivor, crashing)) = tokio::try_join!(competing, committing)?;
-    assert_eq!(
-        competing,
-        Some(range),
-        "a competing freeze must reuse the frozen bound while the tail is staged above it"
-    );
+    let survivor = tokio::spawn(async move { survivor_publisher.publish_tenant(tenant).await });
+    tokio::time::timeout(
+        PUBLICATION_BUDGET,
+        survivor_paused.wait_for(|paused| *paused),
+    )
+    .await
+    .map_err(|_| "the surviving cycle never read its frozen range")??;
+    let crashing = tokio::spawn(async move { crashing_publisher.publish_tenant(tenant).await });
 
     // `crashing` reports only after its own Scribe append returned, so the
     // range is durable in retained history while the fence still holds every
@@ -449,12 +399,6 @@ async fn frozen_audit_range_replays_once_while_its_tail_waits() -> Result<(), Se
     );
     await_retained(&server, tenant, &frozen_op, 3).await?;
     await_retained(&server, tenant, &tail_op, 0).await?;
-    tokio::time::timeout(
-        PUBLICATION_BUDGET,
-        survivor_paused.wait_for(|paused| *paused),
-    )
-    .await
-    .map_err(|_| "the surviving cycle never read its frozen range")??;
     await_blocked_backends(&mut fence, 1).await?;
     assert!(
         !crashing.is_finished() && !survivor.is_finished(),

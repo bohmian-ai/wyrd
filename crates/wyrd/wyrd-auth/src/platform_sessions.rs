@@ -315,7 +315,7 @@ impl PlatformSessions {
     /// Signature, issuer, and scope are settled by the token verifier; this is
     /// the half that cannot be settled from the token alone. Re-reading the
     /// credential that minted it is what makes revoking a credential end its
-    /// sessions immediately, without a separate authorization epoch.
+    /// sessions on their next request.
     ///
     /// # Errors
     /// Returns [`PlatformSessionError::Invalid`] when the claims are malformed,

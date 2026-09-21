@@ -1276,7 +1276,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // F11: principal-epoch revocation
+    // Claim-built principals
     // -------------------------------------------------------------------------
 
     /// The verifier builds the runtime principal from the token alone: its

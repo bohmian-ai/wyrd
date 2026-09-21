@@ -839,7 +839,7 @@
           }
         },
         {
-          "description": "Operator-driven revocation of one principal's whole authorization epoch.\n\nThe row exists to answer \"who ended this identity, and why\": the operator's justification is the one part of the decision that cannot be reconstructed from the surrounding state, so it is carried here rather than left to the request log. The chain is folded in because this detail replaces the attribution-only detail the boundary would otherwise have written.",
+          "description": "Operator-driven suspension of one principal, stopping all further issuance.\n\nThe row exists to answer \"who ended this identity, and why\": the operator's justification is the one part of the decision that cannot be reconstructed from the surrounding state, so it is carried here rather than left to the request log. The chain is folded in because this detail replaces the attribution-only detail the boundary would otherwise have written.",
           "type": "object",
           "required": [
             "kind",
@@ -862,7 +862,7 @@
               ]
             },
             "principal_id": {
-              "description": "Principal whose outstanding tokens were revoked.",
+              "description": "Principal suspended so none of its credentials mint again.",
               "type": "string",
               "format": "uuid"
             },

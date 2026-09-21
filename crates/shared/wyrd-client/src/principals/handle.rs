@@ -119,13 +119,14 @@ impl Principals {
             .await
     }
 
-    /// Revoke a principal outright, ending every token it holds.
+    /// Revoke a principal outright, suspending it so it mints no new tokens.
     ///
     /// The blunt instrument next to [`Self::revoke_credential`]: rather than
-    /// retiring one credential, this advances the principal's authorization
-    /// epoch, so tokens already minted and cached anywhere in the deployment
-    /// stop verifying on their next use. Use it when the identity is
-    /// compromised, not when a credential is merely being rotated.
+    /// retiring one credential, this suspends the principal so none of its
+    /// credentials can exchange again and a user's refresh sessions end. Tokens
+    /// it already holds are five-minute snapshots that lapse at expiry. Use it
+    /// when the identity is compromised, not when a credential is merely being
+    /// rotated.
     ///
     /// # Errors
     /// Returns a Wyrd error when the caller lacks principal administration, the

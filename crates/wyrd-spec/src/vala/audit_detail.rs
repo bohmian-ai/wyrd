@@ -727,7 +727,7 @@ pub enum AuditDetail {
         /// Number of active refresh rows revoked.
         revoked_token_count: u64,
     },
-    /// Operator-driven revocation of one principal's whole authorization epoch.
+    /// Operator-driven suspension of one principal, stopping all further issuance.
     ///
     /// The row exists to answer "who ended this identity, and why": the
     /// operator's justification is the one part of the decision that cannot be
@@ -736,7 +736,7 @@ pub enum AuditDetail {
     /// detail replaces the attribution-only detail the boundary would
     /// otherwise have written.
     PrincipalRevocation {
-        /// Principal whose outstanding tokens were revoked.
+        /// Principal suspended so none of its credentials mint again.
         principal_id: PrincipalId,
         /// Kind the caller declared, and the table the revocation resolved in.
         principal_kind: PrincipalKindTag,

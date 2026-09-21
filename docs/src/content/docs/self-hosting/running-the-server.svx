@@ -111,7 +111,7 @@ wyrd principal credential issue  --principal <principal-id>
 wyrd principal credential list   --principal <principal-id>
 wyrd principal credential revoke --principal <principal-id> --credential-id <old-id>
 
-# Compromise, not rotation: end every token the principal holds.
+# Compromise, not rotation: suspend the principal so it mints no new tokens.
 wyrd principal revoke <principal-id> --kind service --reason "key found in a build log"
 ```
 
@@ -120,11 +120,10 @@ between the two commands, so nothing is down while the new one is deployed.
 Listing includes revoked credentials on purpose, so an operator can confirm the
 superseded one really is gone.
 
-Revoking a *principal* ends its live tokens by advancing its authorization
-epoch. It does not retire the principal's credentials — a surviving credential
-can still mint a new working token — so a compromised credential is revoked as
-a credential, and the principal revocation is what stops the tokens already out
-there.
+Revoking a *principal* suspends it: none of its credentials can mint another
+token, and a user's refresh sessions end. Tokens it already holds are
+five-minute snapshots and lapse at expiry, so a compromised identity stops
+working within five minutes without any per-request lookup.
 
 ### Recovery
 

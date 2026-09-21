@@ -1,6 +1,7 @@
 //! Wire contract for tenant-scoped principal and credential administration.
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::auth::{PrincipalId, SecretBearer};
 
@@ -84,8 +85,9 @@ pub struct CredentialListResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ListCredentialsArgs {
-    /// Principal whose credentials to list, as a UUID.
-    pub principal_id: String,
+    /// Principal whose credentials to list. Advertised as a UUID string, so a
+    /// schema-valid argument is always one the server can act on.
+    pub principal_id: PrincipalId,
 }
 
 /// Arguments naming one credential and the principal that owns it.
@@ -95,10 +97,10 @@ pub struct ListCredentialsArgs {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RevokeCredentialArgs {
-    /// Principal that owns the credential, as a UUID.
-    pub principal_id: String,
-    /// Credential to retire, as a UUID.
-    pub credential_id: String,
+    /// Principal that owns the credential.
+    pub principal_id: PrincipalId,
+    /// Credential to retire.
+    pub credential_id: Uuid,
 }
 
 /// Acknowledgement that one credential was retired.
@@ -111,6 +113,6 @@ pub struct RevokeCredentialArgs {
 pub struct CredentialRevoked {
     /// Always true; the call fails rather than reporting a refusal here.
     pub revoked: bool,
-    /// The credential that was retired, as a UUID.
-    pub credential_id: String,
+    /// The credential that was retired.
+    pub credential_id: Uuid,
 }

@@ -25,7 +25,6 @@ use schemars::JsonSchema;
 use schemars::r#gen::SchemaGenerator;
 use serde::de::DeserializeOwned;
 use serde_json::Value as JsonValue;
-use uuid::Uuid;
 use wyrd_runtime::Permission;
 use wyrd_spec::auth::{
     CredentialListResponse, CredentialRevoked, ListCredentialsArgs, RevokeCredentialArgs,
@@ -139,17 +138,6 @@ fn revoke_credential_tool() -> Tool {
     )
 }
 
-/// Parse a UUID argument, refusing anything else.
-///
-/// # Errors
-/// Returns [`WyrdError::Validation`] when the value is not a UUID.
-fn uuid_arg(value: &str, field: &str) -> Result<Uuid, WyrdError> {
-    value.parse::<Uuid>().map_err(|_| WyrdError::Validation {
-        message: format!("{field} must be a UUID"),
-        details: serde_json::json!({ "field": field }),
-    })
-}
-
 /// Decode a tool's closed argument object.
 ///
 /// # Errors
@@ -181,11 +169,10 @@ impl WyrdMcpHandler {
         arguments: Option<JsonMap<String, JsonValue>>,
     ) -> Result<CallToolResult, WyrdError> {
         let args: ListCredentialsArgs = parse_args(arguments, LIST_CREDENTIALS)?;
-        let principal_id = uuid_arg(&args.principal_id, "principal_id")?;
         let listing = crate::components::principals::routes::list_credentials_for(
             &self.state,
             &caller,
-            principal_id,
+            args.principal_id.as_uuid(),
         )
         .await?;
 
@@ -208,20 +195,18 @@ impl WyrdMcpHandler {
         arguments: Option<JsonMap<String, JsonValue>>,
     ) -> Result<CallToolResult, WyrdError> {
         let args: RevokeCredentialArgs = parse_args(arguments, REVOKE_CREDENTIAL)?;
-        let principal_id = uuid_arg(&args.principal_id, "principal_id")?;
-        let credential_id = uuid_arg(&args.credential_id, "credential_id")?;
         crate::components::principals::routes::revoke_credential_for(
             &self.state,
             &caller,
-            principal_id,
-            credential_id,
+            args.principal_id.as_uuid(),
+            args.credential_id,
         )
         .await?;
 
         Ok(CallToolResult::structured(
             serde_json::to_value(CredentialRevoked {
                 revoked: true,
-                credential_id: credential_id.to_string(),
+                credential_id: args.credential_id,
             })
             .map_err(|error| {
                 internal_failure("credential revocation could not be projected", &error)

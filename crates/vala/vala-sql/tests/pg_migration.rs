@@ -5,6 +5,7 @@ mod pg_tests {
     //! test suite remains credential-free.
 
     use secrecy::ExposeSecret;
+    use sha2::Digest;
     use wyrd_dev_fixtures::pg::PgFixture;
 
     /// Fresh Vala migrations apply repeatedly without schema drift.
@@ -131,8 +132,6 @@ mod pg_tests {
     /// an edit fails here instead of on an operator's upgrade.
     #[test]
     fn shipped_audit_staging_migration_is_immutable() {
-        use sha2::Digest;
-
         let digest = sha2::Sha256::digest(
             include_bytes!("../migrations/20260802000000_vala_audit_staging.sql").as_slice(),
         );

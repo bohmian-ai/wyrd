@@ -23,9 +23,13 @@
 //! [`HttpTransport::request_external_stream`], which never sends Wyrd auth
 //! headers.
 
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use reqwest::header::{HeaderName, HeaderValue};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
@@ -55,6 +59,51 @@ const QUERY_STREAM_CONTENT_TYPE: &str = "application/vnd.wyrd.bifrost-query-stre
 /// this header only; the application's own `Authorization` header is reserved
 /// for the embedding app and is never read or written by Wyrd.
 const HEADER_WYRD_ACCESS_TOKEN: &str = "x-wyrd-access-token";
+
+/// [`HEADER_WYRD_ACCESS_TOKEN`] as a typed header name.
+///
+/// The externally-framed path in [`HttpTransport::authenticated_replay`] hands
+/// its caller a typed header map rather than a `reqwest::RequestBuilder`, so
+/// the one header vocabulary has to be reachable in both forms.
+///
+/// # Panics
+/// Never: the constant is a valid lowercase header name.
+fn access_token_header() -> HeaderName {
+    HeaderName::from_static(HEADER_WYRD_ACCESS_TOKEN)
+}
+
+/// [`HEADER_REQUEST_ID`] as a typed header name.
+///
+/// # Panics
+/// Never: the constant is a valid lowercase header name.
+fn request_id_header() -> HeaderName {
+    HeaderName::from_static(HEADER_REQUEST_ID)
+}
+
+/// Why an externally-framed authenticated operation did not produce a value.
+///
+/// Splitting the credential half from the operation half is what lets a caller
+/// that owns its own protocol — MCP over `rmcp`, for instance — map each back
+/// into its own error vocabulary without inspecting Wyrd's.
+#[derive(Debug, thiserror::Error)]
+pub enum AuthenticatedReplayError<E> {
+    /// A Wyrd credential could not be produced or rendered as a header.
+    #[error("wyrd credential unavailable: {0}")]
+    Credential(WyrdError),
+    /// The operation itself failed, on its last attempt.
+    #[error("authenticated operation failed")]
+    Operation(E),
+}
+
+impl<E> AuthenticatedReplayError<E> {
+    /// Report a value that cannot travel as an HTTP header.
+    fn header(error: &reqwest::header::InvalidHeaderValue) -> Self {
+        Self::Credential(WyrdError::Internal {
+            message: format!("wyrd header value is not valid for transport: {error}"),
+            details: serde_json::json!({}),
+        })
+    }
+}
 
 /// Async `reqwest` HTTP transport for Wyrd read and admin paths.
 ///
@@ -104,6 +153,94 @@ impl HttpTransport {
             auth,
             base_url: config.base_url.trim_end_matches('/').to_owned(),
         })
+    }
+
+    /// Run one externally-framed operation under Wyrd's credential policy.
+    ///
+    /// Some first-party surfaces do not compose their request through this
+    /// transport — the MCP client hands its HTTP call to `rmcp`, which owns the
+    /// framing, session, and SSE semantics — but they still speak to the same
+    /// Wyrd edge and must present the same credential under the same rules.
+    /// This is that policy, and the only copy of it: the Wyrd bearer and
+    /// correlation headers are decorated onto `custom_headers`, the operation
+    /// runs, and a refusal buys exactly one [`AuthMiddleware::force_refresh`]
+    /// and exactly one replay before it is reported. Replaying is safe because
+    /// Wyrd's edge rejects an unusable credential before any service acts on
+    /// the request, so a refused first attempt applied nothing.
+    ///
+    /// The replay reuses the first attempt's header map — correlation id
+    /// included — and swaps only the bearer, so both HTTP requests join to one
+    /// logical message in the server's audit and traces.
+    ///
+    /// `status_of` is the caller's only contribution: reading a status out of
+    /// its own error type is framing, which stays with the framing owner. What
+    /// a `401` *means* is decided here.
+    ///
+    /// A caller-supplied `wyrd-request-id` is preserved; otherwise one is
+    /// minted through the same path every other request uses. Headers the
+    /// caller's own protocol needs are passed through untouched.
+    ///
+    /// # Errors
+    /// Returns [`AuthenticatedReplayError::Credential`] when the middleware
+    /// cannot produce a bearer or either header value is not valid for HTTP
+    /// transport, and [`AuthenticatedReplayError::Operation`] carrying whatever
+    /// the operation returned on its last attempt.
+    pub async fn authenticated_replay<T, E, F, O>(
+        &self,
+        mut custom_headers: HashMap<HeaderName, HeaderValue>,
+        status_of: impl Fn(&E) -> Option<reqwest::StatusCode>,
+        operation: F,
+    ) -> Result<T, AuthenticatedReplayError<E>>
+    where
+        F: Fn(HashMap<HeaderName, HeaderValue>) -> O,
+        O: Future<Output = Result<T, E>>,
+    {
+        custom_headers.insert(access_token_header(), self.bearer_header(false).await?);
+        if let Entry::Vacant(slot) = custom_headers.entry(request_id_header()) {
+            slot.insert(
+                HeaderValue::from_str(&self.auth.request_id(None))
+                    .map_err(|error| AuthenticatedReplayError::header(&error))?,
+            );
+        }
+
+        let first = operation(custom_headers.clone()).await;
+        let refused = match &first {
+            Err(error) => status_of(error) == Some(reqwest::StatusCode::UNAUTHORIZED),
+            Ok(_) => false,
+        };
+        if !refused {
+            return first.map_err(AuthenticatedReplayError::Operation);
+        }
+
+        custom_headers.insert(access_token_header(), self.bearer_header(true).await?);
+        operation(custom_headers)
+            .await
+            .map_err(AuthenticatedReplayError::Operation)
+    }
+
+    /// Render the current Wyrd bearer as a header value.
+    ///
+    /// `force` selects the reactive path: [`AuthMiddleware::force_refresh`]
+    /// re-exchanges a durable credential unconditionally, where
+    /// [`AuthMiddleware::bearer`] serves the cached token until its own
+    /// proactive skew expires it.
+    ///
+    /// # Errors
+    /// Returns [`AuthenticatedReplayError::Credential`] when the middleware
+    /// cannot produce a bearer or the rendered value is not valid for HTTP
+    /// transport.
+    async fn bearer_header<E>(
+        &self,
+        force: bool,
+    ) -> Result<HeaderValue, AuthenticatedReplayError<E>> {
+        let bearer = if force {
+            self.auth.force_refresh().await
+        } else {
+            self.auth.bearer().await
+        }
+        .map_err(|error| AuthenticatedReplayError::Credential(AuthError::into_wyrd(error)))?;
+        HeaderValue::from_str(&format!("Bearer {}", bearer.expose()))
+            .map_err(|error| AuthenticatedReplayError::header(&error))
     }
 
     /// Send a JSON request and decode the JSON response body.

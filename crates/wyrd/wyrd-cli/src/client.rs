@@ -13,6 +13,10 @@
 //! at a second deployment. The token is passed as an explicit credential, which
 //! the client classifies — an API key is exchanged, an access token is presented
 //! verbatim — so an operator never has to say which kind they hold.
+//!
+//! Principal administration takes only `--server`: its credential comes from
+//! the ambient chain via [`from_global`], so an administrative secret never
+//! enters argv or shell history.
 
 use std::sync::Arc;
 
@@ -78,12 +82,16 @@ fn assemble(config: ClientConfig) -> Result<WyrdClient, WyrdCliError> {
     Ok(WyrdClient::from_parts(auth, http, config.grpc))
 }
 
-/// Build the tenant principal-administration handle for one operator token.
+/// Build the tenant principal-administration handle for one deployment.
+///
+/// The credential comes from the ambient chain rather than an argument, so an
+/// administrative secret never enters argv; `server` re-points only the
+/// endpoint.
 ///
 /// # Errors
-/// Returns the same construction errors as [`client`].
-pub fn principals(server: &str, token: &str) -> Result<Principals, WyrdCliError> {
-    Ok(Principals::with_client(client(server, token)?))
+/// Returns the same construction errors as [`from_global`].
+pub fn principals(server: &str) -> Result<Principals, WyrdCliError> {
+    Ok(Principals::with_client(from_global(Some(server))?))
 }
 
 /// Project a client-assembly failure onto the CLI's local error catalog.

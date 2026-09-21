@@ -232,8 +232,6 @@ mod tests {
             "Acme",
             "--server",
             "https://wyrd.example",
-            "--credential",
-            "wyrd_global_abc",
         ])
         .expect("the create verb parses");
         let TenantCommand::Create(args) = parsed.command else {
@@ -251,8 +249,6 @@ mod tests {
             "suspend",
             "--server",
             "https://wyrd.example",
-            "--credential",
-            "wyrd_global_abc",
         ]);
         assert!(parsed.is_err(), "suspend must require --tenant");
     }

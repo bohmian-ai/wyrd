@@ -27,14 +27,18 @@ pub enum CredentialCommand {
 }
 
 /// How every tenant command reaches a deployment.
+///
+/// Only the endpoint is an argument. The credential comes from the same
+/// ambient chain the SDKs read — `WYRD_ACCESS_TOKEN`, workload identity,
+/// `WYRD_API_KEY`, or `credentials.toml` — so it never enters argv, shell
+/// history, or the derived `Debug` of parsed arguments.
 #[derive(Debug, Args)]
 pub struct TenantEndpoint {
-    /// Wyrd server base URL.
+    /// Wyrd server base URL. The credential is read from the ambient chain
+    /// (`WYRD_ACCESS_TOKEN`, workload identity, `WYRD_API_KEY`, or
+    /// `credentials.toml`).
     #[arg(long, value_name = "URL", env = "WYRD_SERVER_URL")]
     pub server: Url,
-    /// Bearer access token with tenant principal administration.
-    #[arg(long, value_name = "TOKEN", env = "WYRD_ACCESS_TOKEN")]
-    pub token: String,
 }
 
 /// Create a restricted machine principal.
@@ -50,7 +54,7 @@ pub struct CreateArgs {
     /// Optional description recorded with the principal.
     #[arg(long, value_name = "TEXT")]
     pub description: Option<String>,
-    /// Deployment and access token.
+    /// Deployment; the credential comes from the ambient chain.
     #[command(flatten)]
     pub endpoint: TenantEndpoint,
 }
@@ -61,7 +65,7 @@ pub struct PrincipalArgs {
     /// Principal to act on.
     #[arg(long, value_name = "UUID")]
     pub principal: String,
-    /// Deployment and access token.
+    /// Deployment; the credential comes from the ambient chain.
     #[command(flatten)]
     pub endpoint: TenantEndpoint,
 }
@@ -75,7 +79,7 @@ pub struct RevokeCredentialArgs {
     /// Credential to retire.
     #[arg(long, value_name = "UUID")]
     pub credential_id: String,
-    /// Deployment and access token.
+    /// Deployment; the credential comes from the ambient chain.
     #[command(flatten)]
     pub endpoint: TenantEndpoint,
 }
@@ -112,7 +116,7 @@ fn principal_id(value: &str) -> Result<PrincipalId, WyrdCliError> {
 /// # Errors
 /// Returns the errors documented on [`dispatch`].
 async fn create(args: CreateArgs) -> Result<ExitCode, WyrdCliError> {
-    let created = crate::client::principals(args.endpoint.server.as_str(), &args.endpoint.token)?
+    let created = crate::client::principals(args.endpoint.server.as_str())?
         .create_service_principal(&CreateServicePrincipalRequest {
             name: args.name,
             roles: args.roles,
@@ -133,7 +137,7 @@ async fn create(args: CreateArgs) -> Result<ExitCode, WyrdCliError> {
 /// Returns the errors documented on [`dispatch`].
 async fn issue(args: PrincipalArgs) -> Result<ExitCode, WyrdCliError> {
     let principal = principal_id(&args.principal)?;
-    let issued = crate::client::principals(args.endpoint.server.as_str(), &args.endpoint.token)?
+    let issued = crate::client::principals(args.endpoint.server.as_str())?
         .issue_credential(&principal)
         .await
         .map_err(|source| WyrdCliError::Server { source })?;
@@ -150,7 +154,7 @@ async fn issue(args: PrincipalArgs) -> Result<ExitCode, WyrdCliError> {
 /// Returns the errors documented on [`dispatch`].
 async fn list(args: PrincipalArgs) -> Result<ExitCode, WyrdCliError> {
     let principal = principal_id(&args.principal)?;
-    let listing = crate::client::principals(args.endpoint.server.as_str(), &args.endpoint.token)?
+    let listing = crate::client::principals(args.endpoint.server.as_str())?
         .list_credentials(&principal)
         .await
         .map_err(|source| WyrdCliError::Server { source })?;
@@ -178,7 +182,7 @@ async fn list(args: PrincipalArgs) -> Result<ExitCode, WyrdCliError> {
 /// Returns the errors documented on [`dispatch`].
 async fn revoke(args: RevokeCredentialArgs) -> Result<ExitCode, WyrdCliError> {
     let principal = principal_id(&args.principal)?;
-    crate::client::principals(args.endpoint.server.as_str(), &args.endpoint.token)?
+    crate::client::principals(args.endpoint.server.as_str())?
         .revoke_credential(&principal, &args.credential_id)
         .await
         .map_err(|source| WyrdCliError::Server { source })?;
@@ -213,8 +217,6 @@ mod tests {
             "ci-runner",
             "--server",
             "https://wyrd.example",
-            "--token",
-            "tok",
         ])
         .expect("the create verb parses");
         let CredentialCommand::CreatePrincipal(args) = parsed.command else {
@@ -234,9 +236,37 @@ mod tests {
             "00000000-0000-7000-8000-000000000002",
             "--server",
             "https://wyrd.example",
-            "--token",
-            "tok",
         ]);
         assert!(parsed.is_err(), "revoke must require --principal");
+    }
+
+    /// The tenant credential is never an argument: passing one is refused
+    /// without echoing it, and parsed arguments cannot render one in `Debug`.
+    #[test]
+    fn the_tenant_credential_is_not_an_argument() {
+        let secret = "wyrd_sk_secret_value";
+        let refused = Cli::try_parse_from([
+            "wyrd",
+            "list",
+            "--principal",
+            "00000000-0000-7000-8000-000000000001",
+            "--server",
+            "https://wyrd.example",
+            "--token",
+            secret,
+        ])
+        .expect_err("--token is not accepted");
+        assert!(!refused.to_string().contains(secret));
+
+        let parsed = Cli::try_parse_from([
+            "wyrd",
+            "list",
+            "--principal",
+            "00000000-0000-7000-8000-000000000001",
+            "--server",
+            "https://wyrd.example",
+        ])
+        .expect("the list verb parses from --server alone");
+        assert!(!format!("{parsed:?}").contains(secret));
     }
 }

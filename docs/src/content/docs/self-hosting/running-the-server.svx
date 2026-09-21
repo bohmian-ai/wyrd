@@ -84,16 +84,17 @@ survive, so `resume` restores exactly what was there.
 ### Tenant administration
 
 Inside a tenant, administration uses the tenant's own credential, never the
-platform credential. `tenant create` printed that credential once — pass it
-straight through; Wyrd classifies an API key and exchanges it for a token
-itself, so there is no separate exchange step and nothing else to configure:
+platform credential. `tenant create` printed that credential once — an API
+key. Put it in the environment rather than on the command line; Wyrd exchanges
+it for a token itself, so there is no separate exchange step:
 
 ```bash
-export WYRD_ACCESS_TOKEN=<the admin_credential tenant create printed>
+export WYRD_API_KEY=<the admin_credential tenant create printed>
 
 # Configure first: the issuer this tenant's workloads federate from. Wyrd
 # resolves the JWKS endpoint from the issuer's own discovery document.
-wyrd auth trusted-issuer add \
+# `wyrd auth` commands read their credential from WYRD_ACCESS_TOKEN.
+WYRD_ACCESS_TOKEN="$WYRD_API_KEY" wyrd auth trusted-issuer add \
   --issuer https://idp.example.com \
   --expected-audience wyrd \
   --client-id wyrd \
@@ -101,7 +102,7 @@ wyrd auth trusted-issuer add \
   --claim-subject sub \
   --principal-kind Workload \
   --default-role reader
-wyrd auth trusted-issuer list
+WYRD_ACCESS_TOKEN="$WYRD_API_KEY" wyrd auth trusted-issuer list
 
 # A principal narrower than the tenant administrator.
 wyrd principal credential create-principal --name ci-runner --role reader

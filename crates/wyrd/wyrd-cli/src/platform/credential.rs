@@ -25,33 +25,43 @@ pub enum CredentialCommand {
     Revoke(RevokeArgs),
 }
 
+/// Environment variable holding the platform credential.
+///
+/// The credential is accepted only here, never as an argument, so it cannot
+/// reach argv, shell history, or the derived `Debug` of parsed arguments.
+const PLATFORM_CREDENTIAL_ENV: &str = "WYRD_PLATFORM_CREDENTIAL";
+
 /// How every platform command reaches a deployment.
 ///
 /// Flattened into each verb rather than hoisted onto the group so a command
-/// reads the same whether it is invoked directly or through the group.
+/// reads the same whether it is invoked directly or through the group. The
+/// platform credential is read from [`PLATFORM_CREDENTIAL_ENV`] at connect time.
 #[derive(Debug, Args)]
 pub struct PlatformEndpoint {
-    /// Wyrd server base URL.
+    /// Wyrd server base URL. The platform credential is read from
+    /// `WYRD_PLATFORM_CREDENTIAL`.
     #[arg(long, value_name = "URL", env = "WYRD_SERVER_URL")]
     pub server: Url,
-    /// Platform credential, exchanged for a short-lived platform session.
-    #[arg(long, value_name = "CREDENTIAL", env = "WYRD_PLATFORM_CREDENTIAL")]
-    pub credential: String,
 }
 
 impl PlatformEndpoint {
-    /// Exchange the credential and bind a platform client to the session.
+    /// Exchange the environment's platform credential and bind a platform
+    /// client to the session.
     ///
     /// # Errors
-    /// Returns [`WyrdCliError::Server`] when the credential is refused or the
-    /// platform plane is not configured on this deployment.
+    /// Returns [`WyrdCliError::NoPlatformCredential`] when
+    /// `WYRD_PLATFORM_CREDENTIAL` is unset or empty, and
+    /// [`WyrdCliError::Server`] when the credential is refused or the platform
+    /// plane is not configured on this deployment.
     pub(super) async fn connect(&self) -> Result<Platform, WyrdCliError> {
-        Platform::connect(
-            self.server.as_str(),
-            &SecretString::from(self.credential.clone()),
-        )
-        .await
-        .map_err(|source| WyrdCliError::Server { source })
+        let credential = std::env::var(PLATFORM_CREDENTIAL_ENV)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .map(SecretString::from)
+            .ok_or(WyrdCliError::NoPlatformCredential)?;
+        Platform::connect(self.server.as_str(), &credential)
+            .await
+            .map_err(|source| WyrdCliError::Server { source })
     }
 }
 
@@ -213,8 +223,6 @@ mod tests {
             "00000000-0000-7000-8000-000000000001",
             "--server",
             "https://wyrd.example",
-            "--credential",
-            "wyrd_global_abc",
         ])
         .expect("the issue verb parses");
         let CredentialCommand::Issue(args) = parsed.command else {
@@ -233,9 +241,37 @@ mod tests {
             "00000000-0000-7000-8000-000000000002",
             "--server",
             "https://wyrd.example",
-            "--credential",
-            "wyrd_global_abc",
         ]);
         assert!(parsed.is_err(), "revoke must require --principal");
+    }
+
+    /// The platform credential is never an argument: passing one is refused
+    /// without echoing it, and parsed arguments cannot render one in `Debug`.
+    #[test]
+    fn the_platform_credential_is_not_an_argument() {
+        let secret = "wyrd_global_secret_value";
+        let refused = Cli::try_parse_from([
+            "wyrd",
+            "list",
+            "--principal",
+            "00000000-0000-7000-8000-000000000001",
+            "--server",
+            "https://wyrd.example",
+            "--credential",
+            secret,
+        ])
+        .expect_err("--credential is not accepted");
+        assert!(!refused.to_string().contains(secret));
+
+        let parsed = Cli::try_parse_from([
+            "wyrd",
+            "list",
+            "--principal",
+            "00000000-0000-7000-8000-000000000001",
+            "--server",
+            "https://wyrd.example",
+        ])
+        .expect("the list verb parses from --server alone");
+        assert!(!format!("{parsed:?}").contains(secret));
     }
 }

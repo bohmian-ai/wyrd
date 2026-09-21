@@ -309,6 +309,19 @@ pub enum WyrdCliError {
     )]
     NoCredentials,
 
+    /// A platform command ran without the deployment's platform credential.
+    ///
+    /// The credential is read only from the environment so it never enters
+    /// argv or shell history.
+    #[error("no platform credential available")]
+    #[wyrd_error(
+        code = "WYRD_CLI_401_NO_PLATFORM_CREDENTIAL",
+        status = 401,
+        title = "No platform credential",
+        remediation = "Set WYRD_PLATFORM_CREDENTIAL to a platform credential for this deployment."
+    )]
+    NoPlatformCredential,
+
     /// The card client could not reach the configured server.
     #[error("card client transport failed: {detail}")]
     #[wyrd_error(

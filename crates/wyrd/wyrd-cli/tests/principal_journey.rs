@@ -37,6 +37,7 @@ pub(crate) fn run_cli_with_credential(
         .env_remove("WYRD_WORKLOAD_TOKEN")
         .env_remove("WYRD_TENANT")
         .env_remove("WYRD_API_KEY")
+        .env_remove("WYRD_PLATFORM_CREDENTIAL")
         .env(variable, credential);
     command.args(arguments).output().expect("wyrd command runs")
 }

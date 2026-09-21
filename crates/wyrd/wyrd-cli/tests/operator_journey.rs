@@ -33,6 +33,30 @@ async fn tenant_cli(arguments: Vec<String>, credential: String) -> Output {
     run_cli_async_with_credential(arguments, "WYRD_ACCESS_TOKEN", credential).await
 }
 
+/// Run a principal-administration invocation with the tenant administrator's
+/// API key in the ambient chain.
+///
+/// Principal administration takes no credential argument; it reads the same
+/// ambient chain the SDKs read, where an API key belongs in `WYRD_API_KEY`.
+async fn principal_cli(arguments: Vec<String>, credential: String) -> Output {
+    run_cli_async_with_credential(arguments, "WYRD_API_KEY", credential).await
+}
+
+/// Run an invocation with every Wyrd credential source cleared.
+async fn uncredentialed_cli(arguments: Vec<String>) -> Output {
+    run_cli_async_with_credential(arguments, "WYRD_CLI_JOURNEY_NO_CREDENTIAL", String::new())
+        .await
+}
+
+/// Assert a command failed with one stable CLI error code.
+fn failed_with(what: &str, output: &Output, code: &str) {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success() && stderr.contains(code),
+        "{what} must fail with {code}: stderr={stderr}"
+    );
+}
+
 /// Assert a command succeeded and return its stdout.
 fn succeeded(what: &str, output: &Output) -> String {
     assert!(
@@ -187,7 +211,7 @@ async fn operator_administers_a_deployment_through_the_cli() {
     arguments.extend(endpoint());
     let principal = succeeded(
         "principal create",
-        &tenant_cli(arguments, tenant_credential.clone()).await,
+        &principal_cli(arguments, tenant_credential.clone()).await,
     );
     let principal_id = field(&principal, "principal_id");
     let first_credential = field(&principal, "credential");
@@ -201,6 +225,34 @@ async fn operator_administers_a_deployment_through_the_cli() {
         "the restricted principal works before rotation"
     );
 
+    // Neither administration plane runs without its ambient credential.
+    let mut arguments = vec![
+        "principal".to_owned(),
+        "credential".to_owned(),
+        "list".to_owned(),
+        "--principal".to_owned(),
+        principal_id.clone(),
+    ];
+    arguments.extend(endpoint());
+    failed_with(
+        "uncredentialed credential list",
+        &uncredentialed_cli(arguments).await,
+        "WYRD_CLI_401_NO_CREDENTIALS",
+    );
+    let mut arguments = vec![
+        "platform".to_owned(),
+        "tenant".to_owned(),
+        "inspect".to_owned(),
+        "--tenant".to_owned(),
+        tenant_id.clone(),
+    ];
+    arguments.extend(endpoint());
+    failed_with(
+        "uncredentialed tenant inspect",
+        &uncredentialed_cli(arguments).await,
+        "WYRD_CLI_401_NO_PLATFORM_CREDENTIAL",
+    );
+
     // 5. Rotate with an overlap: issue, verify, then retire the old one.
     let mut arguments = vec![
         "principal".to_owned(),
@@ -212,7 +264,7 @@ async fn operator_administers_a_deployment_through_the_cli() {
     arguments.extend(endpoint());
     let issued = succeeded(
         "credential issue",
-        &tenant_cli(arguments, tenant_credential.clone()).await,
+        &principal_cli(arguments, tenant_credential.clone()).await,
     );
     let replacement = server
         .exchange_api_key(&secrecy::SecretString::from(field(&issued, "credential")))
@@ -234,7 +286,7 @@ async fn operator_administers_a_deployment_through_the_cli() {
     arguments.extend(endpoint());
     let listed = succeeded(
         "credential list",
-        &tenant_cli(arguments, tenant_credential.clone()).await,
+        &principal_cli(arguments, tenant_credential.clone()).await,
     );
     let superseded = listed
         .lines()
@@ -255,7 +307,7 @@ async fn operator_administers_a_deployment_through_the_cli() {
     arguments.extend(endpoint());
     succeeded(
         "credential revoke",
-        &tenant_cli(arguments, tenant_credential.clone()).await,
+        &principal_cli(arguments, tenant_credential.clone()).await,
     );
 
     // 6. Lifecycle administration, from the platform plane.

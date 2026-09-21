@@ -2,8 +2,8 @@
 
 **Open-source verification and assurance infrastructure for AI systems.**
 
-Wyrd verifies that models, prompts, agents, workflows, and AI services behave
-as intended from development through production.
+Wyrd verifies that AI services behave as intended from development through
+production.
 
 Teams define expected behavior with typed, versioned contracts. Wyrd observes
 real execution, evaluates it with reusable Verifiers, and preserves the
@@ -14,6 +14,138 @@ applications and infrastructure; it does not replace them.
 [Architecture](architecture/wyrd-design.md) ·
 [Release tracker](https://github.com/orgs/bohmian-ai/projects/1) ·
 [Contributing](CONTRIBUTING.md)
+
+## Verify a Pydantic AI service
+
+Define the service once. This bundle contains one Agent and its Prompt, an Eval
+Verifier, and the Slack Operator to run when verification fails.
+
+```yaml
+# service.yaml
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: support-service
+  version: "1.0.0"
+  space: default
+spec:
+  service_type: agent
+  components:
+    - alias: support_agent
+      ref: ./agent.yaml
+      verified_by:
+        - verifier: ./verifier.yaml
+          runs_on:
+            kind: observations_ready
+          on_failure:
+            - kind: notify
+              channel:
+                kind: slack
+                connection: primary-workspace
+                channel_id: C0123456789
+                text: Support Agent verification failed.
+---
+# agent.yaml
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: support-agent
+  version: "1.0.0"
+  space: default
+spec:
+  prompt: ./prompt.yaml
+  tool_names: []
+  run_config:
+    max_iterations: 1
+---
+# prompt.yaml
+apiVersion: wyrd/v1
+kind: Prompt
+metadata:
+  name: support-prompt
+  version: "1.0.0"
+  space: default
+spec:
+  provider: openai
+  model: gpt-5.6-sol
+  system: Answer questions using the published refund policy.
+  messages:
+    - "{{question}}"
+---
+# verifier.yaml
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: support-agent-eval
+  version: "1.0.0"
+  space: default
+spec:
+  implementation:
+    kind: eval
+    pass_gate:
+      kind: all_pass
+    tasks:
+      explains_refunds:
+        kind: assertion
+        id: explains_refunds
+        context_path: $.answer
+        operator: contains_ignore_case
+        expected: refund
+```
+
+Register the graph and hydrate its exact versions for the application:
+
+```bash
+wyrd apply ./support-service
+wyrd get --kind Service --space default --name support-service \
+  --version 1.0.0 --output-dir ./support-service-bundle
+```
+
+Load the Agent and Prompt into Pydantic AI, then record what happened:
+
+```python
+from pydantic import BaseModel
+from pydantic_ai import Agent
+from wyrd import WyrdState
+
+
+class SupportExchange(BaseModel):
+    question: str
+    answer: str
+
+
+state = WyrdState.from_path("./support-service-bundle")
+state.start_bifrost()
+
+declared_agent = state.agent("support_agent")
+declared_prompt = declared_agent.prompt
+instructions = "\n".join(
+    message["content"] for message in declared_prompt.system_messages
+)
+agent = Agent(
+    f"{declared_prompt.provider}:{declared_prompt.model}",
+    instructions=instructions,
+)
+
+question = "What is the refund policy?"
+result = agent.run_sync(question)
+
+run = state.run().for_card("support_agent")
+run.observe.eval(
+    SupportExchange(question=question, answer=result.output),
+    session_id="support-session-123",
+)
+state.shutdown()
+```
+
+Wyrd ties the observation to the exact Service, Agent, Prompt, and Verifier
+versions. The Eval runs asynchronously after the observation is committed. A
+failed verdict is retained as evidence and dispatches the configured Slack
+Operator.
+
+> This is the approved `v0.1.0` verification interface. The end-to-end path is
+> being completed for the first public release; the current runnable source
+> workflow is documented below.
 
 ## Why Wyrd exists
 
@@ -111,27 +243,14 @@ initialization, and production configuration.
 > schemas may change between minor versions; `v0.1.0` will not include upgrade
 > migrations.
 
-Today, a source checkout supports local Card authoring and a development server.
-Public packages, container images, and the complete end-to-end verification
-path will ship with `v0.1.0`.
-
-`v0.1.0` is a self-hosted, headless release. Its release gates cover the
-capabilities described above as one end-to-end system. The release also
-includes platform and tenant administration, published Rust, Python, and
-TypeScript SDKs, and `bohmianai/wyrd` Docker images for Linux `amd64` and
-`arm64`.
-
-Python and TypeScript packages will support Linux and macOS on `x86_64` and
-`arm64`. Windows is not part of `v0.1.0`. Work that misses a release gate
-moves to `v0.1.1`.
+Today, a source checkout supports local Card authoring and a development
+server. `v0.1.0` adds the complete self-hosted verification path, public Rust,
+Python, and TypeScript SDKs, and Linux Docker images. Windows is not part of
+this release.
 
 Track progress in the
 [`v0.1.0` milestone](https://github.com/bohmian-ai/wyrd/milestone/1) and
 [release project](https://github.com/orgs/bohmian-ai/projects/1).
-
-`v0.2.0` adds the production UI, Wyrd-operated SaaS, tenant OIDC
-federation, and stronger compatibility and migration guarantees. It will still
-be pre-1.0.
 
 ## Documentation
 

@@ -1,8 +1,8 @@
 //! Platform control-plane commands.
 //!
 //! The platform plane is reached with a platform credential rather than a
-//! tenant token, so these commands take `--credential` and exchange it for a
-//! short-lived session through [`wyrd_client::Platform`] — the same exchange any
+//! tenant token, so these commands read it from `WYRD_PLATFORM_CREDENTIAL` —
+//! never from an argument — and exchange it for a short-lived session through [`wyrd_client::Platform`] — the same exchange any
 //! other platform client performs. The CLI owns no platform transport of its
 //! own.
 

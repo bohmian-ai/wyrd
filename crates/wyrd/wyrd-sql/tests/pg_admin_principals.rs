@@ -14,7 +14,10 @@ mod pg_tests {
     use uuid::Uuid;
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::auth::PrincipalKindTag;
-    use wyrd_sql::queries::auth::insert_service_account;
+    use wyrd_sql::queries::auth::{
+        credential_belongs_to, insert_api_key, insert_role, insert_service_account, insert_user,
+        list_api_key_metadata, list_user_roles, replace_user_roles, tenant_admin_principal_id,
+    };
     use wyrd_sql::queries::platform::credentials::{
         insert_platform_credential_tx, list_platform_credentials, platform_credential_by_prefix,
         revoke_platform_credential,
@@ -486,6 +489,130 @@ mod pg_tests {
         assert!(
             result.is_err(),
             "an administrative principal cannot carry a Card binding"
+        );
+    }
+
+    /// The tenant-scoped principal queries carry no tenant predicate of their
+    /// own, so forced row-level security under [`TenantConn`] must be what
+    /// confines them.
+    ///
+    /// Tenant A holds an administrative principal, its credential, a user, and
+    /// a role; tenant B holds a same-named role. Tenant A sees and replaces its
+    /// own rows, and resolving the shared role name binds only A's role. Tenant
+    /// B sees no administrative principal, no credential metadata, and no
+    /// ownership of A's credential.
+    ///
+    /// [`TenantConn`]: wyrd_sql::TenantConn
+    #[tokio::test]
+    async fn tenant_principal_queries_are_confined_by_row_level_security() {
+        let Some(_) = database_url() else {
+            return;
+        };
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant_a = fixture.data_tenant_id();
+        let tenant_b = fixture
+            .seed_additional_tenant(&format!("rls-principals-{}", Uuid::now_v7()))
+            .await
+            .expect("second tenant seeds");
+        let principal = Uuid::now_v7();
+        let credential = Uuid::now_v7();
+        let user = Uuid::now_v7();
+        let role_a = Uuid::now_v7();
+        let permissions = serde_json::json!([]);
+
+        let mut conn = fixture.tenant_conn_for(tenant_b).await.expect("B opens");
+        insert_role(&mut conn, Uuid::now_v7(), "rls-probe", &permissions, false)
+            .await
+            .expect("B role inserts");
+        conn.commit().await.expect("B commits");
+
+        let mut conn = fixture.tenant_conn_for(tenant_a).await.expect("A opens");
+        insert_service_account(
+            &mut conn,
+            principal,
+            "tenant_admin",
+            None,
+            "tenant-admin",
+            None,
+            Uuid::now_v7(),
+        )
+        .await
+        .expect("A principal inserts");
+        insert_api_key(
+            &mut conn,
+            credential,
+            principal,
+            "wyrd_sk_rlsprobe",
+            &verifier("rls"),
+            principal,
+            None,
+        )
+        .await
+        .expect("A credential inserts");
+        insert_user(&mut conn, user, Some("rls@example.test"), "oidc", None)
+            .await
+            .expect("A user inserts");
+        insert_role(&mut conn, role_a, "rls-probe", &permissions, false)
+            .await
+            .expect("A role inserts");
+        replace_user_roles(&mut conn, user, &["rls-probe"])
+            .await
+            .expect("A replaces roles against its own role");
+        assert_eq!(
+            tenant_admin_principal_id(&mut conn).await.expect("A reads"),
+            Some(principal)
+        );
+        assert_eq!(
+            list_api_key_metadata(&mut conn, principal)
+                .await
+                .expect("A lists")
+                .len(),
+            1
+        );
+        assert!(
+            credential_belongs_to(&mut conn, credential, principal)
+                .await
+                .expect("A checks ownership")
+        );
+        assert_eq!(
+            list_user_roles(&mut conn, user)
+                .await
+                .expect("A lists roles"),
+            ["rls-probe"]
+        );
+        let bound: Uuid =
+            sqlx::query_scalar("SELECT role_id FROM wyrd.auth_user_roles WHERE user_id = $1")
+                .bind(user)
+                .fetch_one(&mut **conn.transaction())
+                .await
+                .expect("A binding reads");
+        assert_eq!(bound, role_a, "the shared role name binds A's role only");
+        replace_user_roles(&mut conn, user, &[])
+            .await
+            .expect("A clears roles");
+        assert!(
+            list_user_roles(&mut conn, user)
+                .await
+                .expect("A lists roles")
+                .is_empty()
+        );
+        conn.commit().await.expect("A commits");
+
+        let mut conn = fixture.tenant_conn_for(tenant_b).await.expect("B reopens");
+        assert_eq!(
+            tenant_admin_principal_id(&mut conn).await.expect("B reads"),
+            None
+        );
+        assert!(
+            list_api_key_metadata(&mut conn, principal)
+                .await
+                .expect("B lists")
+                .is_empty()
+        );
+        assert!(
+            !credential_belongs_to(&mut conn, credential, principal)
+                .await
+                .expect("B checks ownership")
         );
     }
 }

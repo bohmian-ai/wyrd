@@ -69,12 +69,10 @@ pub async fn list_api_key_metadata(
         r#"
         SELECT id, prefix, created_at, expires_at, revoked_at, last_used_at
           FROM wyrd.auth_api_keys
-         WHERE data_tenant_id = $1
-           AND principal_id = $2
+         WHERE principal_id = $1
          ORDER BY created_at DESC
         "#,
     )
-    .bind(conn.data_tenant_id().as_uuid())
     .bind(principal_id)
     .fetch_all(&mut **conn.transaction())
     .await
@@ -98,8 +96,7 @@ pub async fn credential_belongs_to(
     let found: Option<Uuid> = sqlx::query_scalar(
         "SELECT id
            FROM wyrd.auth_api_keys
-          WHERE data_tenant_id = wyrd.current_tenant()
-            AND id = $1
+          WHERE id = $1
             AND principal_id = $2",
     )
     .bind(credential_id)

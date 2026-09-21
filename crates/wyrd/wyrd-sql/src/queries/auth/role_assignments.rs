@@ -37,12 +37,10 @@ const REPLACE_USER_ROLES_SQL: &str = r#"
         WITH wanted AS (
             SELECT id
               FROM wyrd.auth_roles
-             WHERE data_tenant_id = wyrd.current_tenant()
-               AND name = ANY($2)
+             WHERE name = ANY($2)
         ), removed AS (
             DELETE FROM wyrd.auth_user_roles
-             WHERE data_tenant_id = wyrd.current_tenant()
-               AND user_id = $1
+             WHERE user_id = $1
                AND role_id NOT IN (SELECT id FROM wanted)
         )
         INSERT INTO wyrd.auth_user_roles (data_tenant_id, user_id, role_id)

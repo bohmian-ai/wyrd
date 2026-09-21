@@ -235,14 +235,12 @@ pub async fn tenant_admin_principal_id(
         r#"
         SELECT id
           FROM wyrd.auth_service_accounts
-         WHERE data_tenant_id = $1
-           AND principal_kind = 'tenant_admin'
+         WHERE principal_kind = 'tenant_admin'
            AND status = 'active'
          ORDER BY created_at
          LIMIT 1
         "#,
     )
-    .bind(conn.data_tenant_id().as_uuid())
     .fetch_optional(&mut **conn.transaction())
     .await
 }

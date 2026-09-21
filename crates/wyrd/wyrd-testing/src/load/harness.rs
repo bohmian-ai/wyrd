@@ -48,7 +48,9 @@ pub enum LoadError {
     /// A callback returned an error.
     #[error("load callback failed for tenant {tenant}: {message}")]
     Callback {
+        /// Tenant whose workload callback failed.
         tenant: DataTenantId,
+        /// The callback's error message.
         message: String,
     },
     /// A latency histogram could not accept a sample.

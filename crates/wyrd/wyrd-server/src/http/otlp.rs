@@ -26,7 +26,7 @@
 //! written. The gRPC edge maps the same condition to gRPC
 //! `RESOURCE_EXHAUSTED` (also retryable, per the OTLP spec's backpressure
 //! guidance). Every other ingest failure maps to its stable `WYRD_VALA_*`
-//! [`WyrdError`] and problem+json status. Authentication is enforced by the
+//! [`WyrdError`](wyrd_spec::error::WyrdError) and problem+json status. Authentication is enforced by the
 //! `require_authenticated` layer on the `/v1` group; the [`Caller`] extractor
 //! then yields the token-derived tenant/principal (never wire-derived).
 //!

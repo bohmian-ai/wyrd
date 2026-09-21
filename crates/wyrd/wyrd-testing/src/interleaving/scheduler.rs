@@ -39,10 +39,18 @@ pub enum SchedulerError {
     NoTasks,
     /// A task remained pending after the executor's safety bound.
     #[error("interleaving scheduler exceeded {steps} polling steps for seed {seed}")]
-    StepLimitExceeded { seed: u64, steps: usize },
+    StepLimitExceeded {
+        /// Seed of the run that hit the bound, for replay.
+        seed: u64,
+        /// Polling steps taken before giving up.
+        steps: usize,
+    },
     /// The scheduler selected a task whose future was already completed.
     #[error("interleaving scheduler selected missing task {task_id}")]
-    MissingTask { task_id: TaskId },
+    MissingTask {
+        /// The already-completed task the scheduler picked.
+        task_id: TaskId,
+    },
 }
 
 /// The result of one deterministic scheduler run.

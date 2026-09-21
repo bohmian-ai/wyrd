@@ -16,11 +16,19 @@ use wyrd_spec::request_id::RequestId;
 #[derive(Debug, Clone)]
 pub enum Bootstrap {
     /// Human User bootstrap.
-    User { id: PrincipalId, jwt: String },
+    User {
+        /// The bootstrapped user principal.
+        id: PrincipalId,
+        /// Tenant JWT for that user.
+        jwt: String,
+    },
     /// Service or Agent bootstrap.
     Machine {
+        /// The bootstrapped machine principal.
         id: PrincipalId,
+        /// API key the machine authenticates with.
         api_key: SecretString,
+        /// Card the machine acts as.
         card_ref: CardRef,
     },
 }

@@ -13,12 +13,12 @@ use crate::state::AppState;
 ///
 /// A `from_fn_with_state` layer modeled on `attach_request_id`: it verifies the
 /// Wyrd access token carried in `X-Wyrd-Access-Token`, and on success inserts the
-/// verified [`AuthenticatedPrincipal`] into request extensions before calling
+/// verified [`AuthenticatedPrincipal`](crate::components::auth::principal_extractor::AuthenticatedPrincipal) into request extensions before calling
 /// `next`. On any failure it returns the mapped Wyrd error response immediately
 /// and does not call `next`.
 ///
 /// It reuses the same token-extract and error-mapping helpers as
-/// [`AuthenticatedPrincipal`]'s extractor, so its `400`/`401`/`503` rejections
+/// [`AuthenticatedPrincipal`](crate::components::auth::principal_extractor::AuthenticatedPrincipal)'s extractor, so its `400`/`401`/`503` rejections
 /// are identical by construction.
 pub async fn require_authenticated(
     State(state): State<AppState>,

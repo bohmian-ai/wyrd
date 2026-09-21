@@ -719,7 +719,7 @@ impl WyrdTestServer {
     /// Shut down the server, cancelling the serve task and dropping fixtures.
     ///
     /// A serve task that panicked is a real production defect, so its
-    /// [`JoinError`] is propagated rather than discarded: swallowing it lets a
+    /// [`JoinError`](tokio::task::JoinError) is propagated rather than discarded: swallowing it lets a
     /// panic on a `tokio-runtime-worker` thread finish the run green, which is
     /// precisely the failure mode this seam exists to catch. A join *timeout*
     /// remains tolerated — the bounded budget here is deliberately short and a
@@ -3480,7 +3480,7 @@ impl WyrdTestServerBuilder {
 
     /// Run this server under one production Bifrost process target.
     ///
-    /// The role set is derived by [`BifrostRoles::for_target`] — the same
+    /// The role set is derived by [`BifrostRoles::for_target`](wyrd_server::config::BifrostRoles::for_target) — the same
     /// derivation `WYRD_TARGET` drives in production — so a Scribe-only test
     /// server activates exactly the subsystems a Scribe pod activates, without
     /// a test-specific topology.

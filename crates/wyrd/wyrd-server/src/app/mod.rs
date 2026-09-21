@@ -18,6 +18,7 @@ use crate::state::AppState;
 
 pub mod metrics;
 pub mod peer_plane;
+/// Plain HTTP serving of an assembled router with graceful shutdown.
 pub mod serve;
 pub mod server;
 pub mod shutdown;

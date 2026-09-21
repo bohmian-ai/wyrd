@@ -570,7 +570,7 @@ pub struct SeededCanonicalSignals {
 ///
 /// # Errors
 ///
-/// Returns a [`WyrdTestServerError`] when provisioning, bootstrap, describe,
+/// Returns a [`WyrdTestServerError`](crate::server::WyrdTestServerError) when provisioning, bootstrap, describe,
 /// the batch write, the flush, endpoint discovery, or token exchange fails.
 pub async fn seed_canonical_signals(
     server: &crate::server::WyrdTestServer,

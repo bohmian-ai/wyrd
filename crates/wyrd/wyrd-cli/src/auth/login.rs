@@ -8,6 +8,7 @@ use wyrd_spec::auth::{SecretBearer, TokenRequest, TokenResponse};
 
 use crate::error::WyrdCliError;
 
+/// Arguments for `wyrd auth login`: the server to exchange with and the trusted issuer to log in through.
 #[derive(Debug, Args)]
 pub struct LoginArgs {
     /// Wyrd server base URL (e.g. `https://acme.wyrd.cloud`).

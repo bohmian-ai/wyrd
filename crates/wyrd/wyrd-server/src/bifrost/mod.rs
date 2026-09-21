@@ -3,6 +3,7 @@
 //! conversion and schema fingerprinting the register path needs.
 
 pub mod convert;
+/// Canonical audit sink for Bifrost gate admission decisions.
 pub mod gate_audit;
 pub mod routes;
 pub mod service;

@@ -17,6 +17,7 @@ use crate::error::WyrdCliError;
 /// Collection path both the write and the read operations address.
 const TRUSTED_ISSUERS_PATH: &str = "/v1/admin/trusted-issuers";
 
+/// Subcommands of `wyrd auth trusted-issuer`.
 #[derive(Debug, Subcommand)]
 pub enum TrustedIssuerCommand {
     /// Register a trusted OIDC issuer (POST /v1/admin/trusted-issuers).
@@ -84,6 +85,7 @@ pub struct AddArgs {
     pub token: String,
 }
 
+/// Arguments for `wyrd auth trusted-issuer list`.
 #[derive(Debug, Args)]
 pub struct ListArgs {
     /// Wyrd server base URL.
@@ -94,6 +96,7 @@ pub struct ListArgs {
     pub token: String,
 }
 
+/// Arguments for `wyrd auth trusted-issuer rm`.
 #[derive(Debug, Args)]
 pub struct RmArgs {
     /// Trusted issuer URL to remove.
@@ -110,6 +113,11 @@ pub struct RmArgs {
     pub token: String,
 }
 
+/// Run one `wyrd auth trusted-issuer` subcommand.
+///
+/// # Errors
+/// Returns the selected operation's error: an invalid argument, an IO failure
+/// reading the client secret, or the server's stable Wyrd error.
 pub async fn dispatch(command: TrustedIssuerCommand) -> Result<ExitCode, WyrdCliError> {
     match command {
         TrustedIssuerCommand::Add(args) => add(*args).await,

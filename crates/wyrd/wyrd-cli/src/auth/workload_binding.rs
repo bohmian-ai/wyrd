@@ -11,6 +11,7 @@ use crate::error::WyrdCliError;
 /// Collection path every workload-binding operation addresses.
 const WORKLOAD_BINDINGS_PATH: &str = "/v1/admin/workload-bindings";
 
+/// Subcommands of `wyrd auth workload-binding`.
 #[derive(Debug, Subcommand)]
 pub enum WorkloadBindingCommand {
     /// Create a workload binding (POST /v1/admin/workload-bindings).
@@ -21,6 +22,7 @@ pub enum WorkloadBindingCommand {
     Rm(RmArgs),
 }
 
+/// Arguments for `wyrd auth workload-binding add`.
 #[derive(Debug, Args)]
 pub struct AddArgs {
     /// Trusted issuer URL the binding belongs to.
@@ -43,6 +45,7 @@ pub struct AddArgs {
     pub token: String,
 }
 
+/// Arguments for `wyrd auth workload-binding list`; the filters are optional.
 #[derive(Debug, Args)]
 pub struct ListArgs {
     /// Filter by issuer URL.
@@ -59,6 +62,7 @@ pub struct ListArgs {
     pub token: String,
 }
 
+/// Arguments for `wyrd auth workload-binding rm`.
 #[derive(Debug, Args)]
 pub struct RmArgs {
     /// Trusted issuer URL of the binding to remove.
@@ -75,6 +79,11 @@ pub struct RmArgs {
     pub token: String,
 }
 
+/// Run one `wyrd auth workload-binding` subcommand.
+///
+/// # Errors
+/// Returns the selected operation's error: an invalid card ref or issuer URL,
+/// a client-construction failure, or the server's stable Wyrd error.
 pub async fn dispatch(command: WorkloadBindingCommand) -> Result<ExitCode, WyrdCliError> {
     match command {
         WorkloadBindingCommand::Add(args) => add(args).await,

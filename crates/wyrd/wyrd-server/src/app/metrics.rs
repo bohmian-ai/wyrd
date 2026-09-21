@@ -29,6 +29,7 @@ const BIFROST_DURATION_BUCKETS: &[f64] = &[
 
 /// Wyrd metric names. Keep these stable — dashboards depend on them.
 pub const HTTP_REQUESTS_TOTAL: &str = "wyrd_http_requests_total";
+/// Histogram of HTTP request latency in seconds, labelled like [`HTTP_REQUESTS_TOTAL`].
 pub const HTTP_REQUEST_DURATION_SECONDS: &str = "wyrd_http_request_duration_seconds";
 
 /// Production-facing query duration metric.

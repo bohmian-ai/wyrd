@@ -23,7 +23,7 @@ pub struct ScheduledQueryOutcome {
 /// Server-side caller that runs one already-authorized statement like a client.
 ///
 /// A scheduled statement is not a second query surface: it holds a context the
-/// server authorized once, dispatches through the same [`AppState::query_sql`]
+/// server authorized once, dispatches through the same [`Bifrost::query_sql`](crate::state::Bifrost::query_sql)
 /// entry every public caller uses, and settles the returned stream itself. It
 /// deliberately owns no clock, queue, job, loop, path selector, or alternate
 /// operation — whatever decides *when* a statement runs stays outside it.

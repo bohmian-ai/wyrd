@@ -8,6 +8,7 @@ use wyrd_spec::auth::{SecretBearer, TokenRequest};
 
 use crate::error::WyrdCliError;
 
+/// Arguments for `wyrd auth refresh`: the server and the refresh token to rotate.
 #[derive(Debug, Args)]
 pub struct RefreshArgs {
     /// Wyrd server base URL.

@@ -213,7 +213,7 @@ impl WyrdServer {
     /// unless it brought them itself. Use only for deliberately unprotected
     /// routes or routes that finalized their own edge stack.
     ///
-    /// For enterprise write routes, prefer [`merge_http_protected`].
+    /// For enterprise write routes, prefer [`Self::merge_http_protected`].
     #[must_use]
     pub fn merge_http(mut self, extra: Router) -> Self {
         self.http_router = self.http_router.merge(extra);

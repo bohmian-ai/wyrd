@@ -717,6 +717,10 @@ fn harness_error(error: impl std::fmt::Display) -> wyrd_spec::error::WyrdError {
     }
 }
 
+/// Register the Python-visible test-server classes on `module`.
+///
+/// # Errors
+/// Returns the PyO3 error raised when a class cannot be added.
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<WyrdTestServer>()
 }

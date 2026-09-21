@@ -6,6 +6,7 @@
 //! in process — exactly what an operator runs — instead of re-implementing the
 //! admin wire calls.
 
+/// `wyrd auth` tenant identity commands: API keys, OIDC login, refresh, trusted issuers, and workload bindings.
 pub mod auth;
 mod card;
 mod cli;

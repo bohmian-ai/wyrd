@@ -14,7 +14,9 @@ use tokio_util::sync::CancellationToken;
 /// Identifies a supervised task for terminal-error classification and logging.
 #[derive(Debug, Clone, Copy)]
 pub enum TaskId {
+    /// The public HTTP listener.
     Http,
+    /// The public gRPC listener.
     Grpc,
     /// The private mutually authenticated Bifrost peer listener.
     ///
@@ -22,13 +24,17 @@ pub enum TaskId {
     /// peer-listener exit is terminal for a peer-bearing role even while the
     /// public listener is healthy.
     BifrostPeer,
+    /// The Prometheus metrics listener.
     Metrics,
+    /// The OS shutdown-signal watcher.
     Signal,
+    /// A named background worker.
     Worker(&'static str),
 }
 
 /// The resolved outcome of one supervised task.
 pub struct TaskExit {
+    /// Which supervised task exited.
     pub id: TaskId,
     /// `Ok(())` on clean completion; `Err(message)` on failure.
     pub outcome: Result<(), String>,

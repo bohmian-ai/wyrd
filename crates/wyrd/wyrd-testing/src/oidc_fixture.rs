@@ -36,7 +36,7 @@ pub struct LoginResult {
 /// Connected OIDC provider fixture.
 ///
 /// Construct via [`OidcIssuerFixture::connect`].  Use
-/// [`OidcIssuerFixture::keycloak`] when Keycloak admin operations are needed.
+/// [`OidcIssuerFixture::with_keycloak_admin`] when Keycloak admin operations are needed.
 pub struct OidcIssuerFixture {
     /// Normalized issuer URL (used for `TrustedIssuer.issuer`).
     pub issuer: IssuerUrl,

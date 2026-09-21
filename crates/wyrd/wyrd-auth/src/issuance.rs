@@ -116,6 +116,12 @@ pub enum TenantGrant {
         /// the target's permissions that this set also covers, so delegation
         /// can narrow authority but never amplify it.
         ceiling: PermissionSet,
+        /// The credential that authenticated the caller, when one did.
+        ///
+        /// Audit-only: it attributes the `delegation:issue` decision to the
+        /// caller's API key or refresh session, and never enters the delegated
+        /// token, which was minted by delegation rather than by presenting it.
+        caller_credential_id: Option<Uuid>,
     },
 }
 
@@ -499,14 +505,20 @@ fn permission_set_from_rows(rows: Vec<RoleRow>) -> Result<PermissionSet, Issuanc
 /// A direct grant names its principal as both subject and actor, with the
 /// spent credential attached. A delegated grant names the delegating caller as
 /// actor, records the Card references of the older delegation layers
-/// initiator-first, and carries the delegation permission the caller spent.
+/// initiator-first, and carries the delegation permission the caller spent
+/// and the credential that authenticated the caller, when one did.
 fn exchange_audit_event(
     subject: &TokenPrincipalRef,
     grant: &TenantGrant,
     expires_at: DateTime<Utc>,
     request_id: &str,
 ) -> wyrd_spec::vala::api::AuditEvent {
-    let TenantGrant::Delegation { caller, .. } = grant else {
+    let TenantGrant::Delegation {
+        caller,
+        caller_credential_id,
+        ..
+    } = grant
+    else {
         return auth_event(
             request_id,
             TOKEN_EXCHANGE_OPERATION,
@@ -545,7 +557,7 @@ fn exchange_audit_event(
         },
     );
     event.permission = Permission::delegation_issue().to_string();
-    event
+    event.with_credential_id(*caller_credential_id)
 }
 
 #[cfg(test)]
@@ -888,6 +900,7 @@ mod pg_tests {
                 TenantGrant::Delegation {
                     caller: Box::new(caller),
                     ceiling: wyrd_runtime::PermissionSet::new(),
+                    caller_credential_id: None,
                 },
             ),
         ];

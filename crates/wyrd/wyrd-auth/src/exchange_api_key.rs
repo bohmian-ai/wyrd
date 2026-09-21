@@ -307,6 +307,7 @@ impl DelegateToken {
                 TenantGrant::Delegation {
                     caller: Box::new(caller),
                     ceiling: verified.principal.effective_permissions.clone(),
+                    caller_credential_id: verified.principal.credential_id,
                 },
                 request_id,
             )
@@ -1514,6 +1515,72 @@ mod pg_tests {
         );
         assert!(exchanged.refresh_token.is_none());
         assert_eq!(delegation_decisions(&fixture).await, ["allowed"]);
+    }
+
+    /// A successful delegation by a caller whose token came from an API key
+    /// commits one allowed decision naming that caller and key, while the
+    /// delegated token itself names no credential: it was minted by
+    /// delegation, not by presenting the caller's key.
+    ///
+    /// # Panics
+    /// Panics when seeding, the exchange, or the delegation fails, or when the
+    /// committed decision or delegated token carries the wrong attribution.
+    #[tokio::test]
+    async fn a_successful_delegation_names_the_callers_credential_only_in_audit() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let target = seed_delegation_target(&fixture, serde_json::json!([])).await;
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let creator = insert_test_user(&mut conn, tenant).await;
+        let caller =
+            insert_test_service_account(&mut conn, tenant, creator, &test_service_card_ref()).await;
+        let role_id = Uuid::new_v4();
+        let permissions = serde_json::to_value([Permission::delegation_issue()])
+            .expect("delegation permission serializes");
+        insert_role(&mut conn, role_id, "delegator", &permissions, false)
+            .await
+            .expect("caller role seeds");
+        grant_role_to_service_account(&mut conn, caller, role_id)
+            .await
+            .expect("caller role grants");
+        let (api_key_id, secret) = insert_live_api_key(&mut conn, tenant, caller, creator).await;
+        let caller_token = exchange_service()
+            .execute(&mut conn, secret, "req-delegation-caller")
+            .await
+            .expect("the caller exchanges its api key");
+        conn.commit().await.expect("caller exchange commits");
+
+        let exchanged = delegate_to(
+            &fixture,
+            secrecy::ExposeSecret::expose_secret(&caller_token.access_token).to_owned(),
+            target,
+        )
+        .await
+        .expect("delegation succeeds");
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let rows: Vec<(String, Uuid, Option<Uuid>)> = sqlx::query_as(
+            "SELECT outcome, principal_id, credential_id FROM vala.audit_staging
+              WHERE operation = $1 AND permission = 'delegation:issue'",
+        )
+        .bind(TOKEN_EXCHANGE_OPERATION)
+        .fetch_all(&mut **conn.transaction())
+        .await
+        .expect("decision query runs");
+        assert_eq!(
+            rows,
+            [("allowed".to_owned(), caller, Some(api_key_id))],
+            "one allowed decision names the caller and the key that authenticated it"
+        );
+        let delegated = delegate_service()
+            .verifier
+            .verify(&exchanged.access_token, &tenant)
+            .expect("delegated token verifies");
+        assert_eq!(
+            delegated.principal.credential_id, None,
+            "the delegated token is not attributed to the caller's key"
+        );
     }
 
     /// An audit store that refuses the append fails the exchange closed: no

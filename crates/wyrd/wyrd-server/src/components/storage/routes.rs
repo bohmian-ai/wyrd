@@ -430,7 +430,7 @@ async fn download_init(
 ///
 /// A stored object path carries slashes, so it travels as one query value
 /// rather than a path tail: that is the one request position both the router
-/// and the OpenAPI document represent exactly.
+/// and the `OpenAPI` document represent exactly.
 #[derive(Debug, Deserialize)]
 struct LocalDownloadQuery {
     /// Full tenant-prefixed storage path, as issued in a local download plan.

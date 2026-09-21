@@ -721,7 +721,7 @@ async fn download_url(
 ///
 /// The stored path carries slashes, so it is carried as the percent-encoded
 /// `path` query value of the documented `GET /v1/cards/download/local`
-/// operation rather than as a path tail the OpenAPI document cannot express.
+/// operation rather than as a path tail the `OpenAPI` document cannot express.
 ///
 /// # Errors
 /// Returns an internal error when no public base URL is bound or it cannot

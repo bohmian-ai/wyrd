@@ -28,7 +28,7 @@ const PROBLEM_MEDIA_TYPE: &str = "application/problem+json";
 /// Name the contract gives the one Wyrd authentication scheme.
 const WYRD_ACCESS_TOKEN_SCHEME: &str = "wyrdAccessToken";
 
-/// The HTTP methods an OpenAPI path item may key an operation by.
+/// The HTTP methods an `OpenAPI` path item may key an operation by.
 const METHODS: [&str; 7] = ["get", "put", "post", "delete", "options", "head", "patch"];
 
 /// Fetch and parse the document the assembled server serves.
@@ -479,7 +479,7 @@ async fn card_contract_publishes_typed_lifecycle_and_problem_shapes() {
 }
 
 /// `GET /openapi.json` is the whole contract: no YAML projection is routed, and
-/// the served document identifies itself as OpenAPI and describes real paths.
+/// the served document identifies itself as `OpenAPI` and describes real paths.
 #[tokio::test]
 async fn no_yaml_projection_is_routed() {
     let server = WyrdTestServer::start_in_process()

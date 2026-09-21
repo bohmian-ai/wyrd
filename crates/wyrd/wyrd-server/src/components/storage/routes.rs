@@ -9,12 +9,14 @@ use std::str::FromStr;
 
 use axum::Json;
 use axum::body::{Body, Bytes};
+use axum::extract::rejection::{PathRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use tokio_util::io::ReaderStream;
 use wyrd_runtime::Permission;
+use wyrd_spec::error::storage::WyrdStorageError;
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::ids::IdempotencyKey;
 use wyrd_spec::storage::{
@@ -316,8 +318,8 @@ async fn abort(
 /// against the declared size and digest before the local write.
 ///
 /// # Errors
-/// Returns a stable storage error when the identifier is malformed or
-/// unknown, the upload is terminal, the bytes disagree with the declaration,
+/// Returns a stable storage error when the identifier is undecodable,
+/// malformed, or unknown, the upload is terminal, the bytes disagree with the declaration,
 /// the caller lacks card write, or the backend fails.
 #[utoipa::path(
     put,
@@ -354,9 +356,14 @@ async fn abort(
 async fn local_blob(
     State(state): State<AppState>,
     caller: Caller,
-    Path(id): Path<String>,
+    id: Result<Path<String>, PathRejection>,
     body: Bytes,
 ) -> Result<Json<LocalBlobUploadResponse>, WyrdErrorResponse> {
+    let Path(id) = id.map_err(|rejection| {
+        WyrdErrorResponse::from(WyrdError::from(WyrdStorageError::InvalidUploadId {
+            reason: rejection.body_text(),
+        }))
+    })?;
     let upload_id = parse_upload_id(&id)?;
     authorize_card_write(
         &state,
@@ -442,9 +449,14 @@ struct LocalDownloadQuery {
 /// The URL is the `get_url` a local download plan hands out. The path is
 /// re-validated against the caller's tenant before anything is opened.
 ///
+/// A missing or undecodable `path` query is refused through the canonical
+/// problem response before anything is authorized or opened.
+///
 /// # Errors
-/// Returns a stable storage error when the path is invalid or foreign, the
-/// object is missing, the caller lacks card read, or the backend fails.
+/// Returns [`WyrdError::MissingRequiredField`] when the `path` query is missing
+/// or undecodable, and a stable storage error when the path is invalid or
+/// foreign, the object is missing, the caller lacks card read, or the backend
+/// fails.
 #[utoipa::path(
     get,
     path = "/cards/download/local",
@@ -453,8 +465,9 @@ struct LocalDownloadQuery {
     responses(
         (status = 200, description = "The stored bytes", body = [u8],
          content_type = "application/octet-stream"),
-        (status = 400, description = "The stored path is not a valid tenant path \
-          (WYRD_STORAGE_400_TENANT_PATH_MISMATCH)", body = WyrdProblem),
+        (status = 400, description = "The `path` query is missing or undecodable, or the \
+          stored path is not a valid tenant path (WYRD_VALIDATION_400_MISSING_REQUIRED_FIELD, \
+          WYRD_STORAGE_400_TENANT_PATH_MISMATCH)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
           WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
@@ -475,8 +488,17 @@ struct LocalDownloadQuery {
 async fn download_local_blob(
     State(state): State<AppState>,
     caller: Caller,
-    Query(LocalDownloadQuery { path }): Query<LocalDownloadQuery>,
+    query: Result<Query<LocalDownloadQuery>, QueryRejection>,
 ) -> Result<Response, WyrdErrorResponse> {
+    let Query(LocalDownloadQuery { path }) = query.map_err(|rejection| {
+        WyrdErrorResponse::from(WyrdError::MissingRequiredField {
+            message: format!(
+                "the `path` query is missing or undecodable: {}",
+                rejection.body_text()
+            ),
+            details: serde_json::json!({ "field": "path" }),
+        })
+    })?;
     authorize_card_read(
         &state,
         &caller,

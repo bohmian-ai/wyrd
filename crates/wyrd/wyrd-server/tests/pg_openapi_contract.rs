@@ -679,6 +679,90 @@ async fn an_unknown_upload_answers_with_a_code_the_operation_documents() {
     server.shutdown().await.expect("server shuts down");
 }
 
+/// A local transfer whose locator cannot be extracted answers with the
+/// canonical problem response and a code its own operation documents.
+///
+/// A missing or undecodable download `path` query and an undecodable upload
+/// identifier are refused by the route's extractor before the handler body
+/// runs, so this drives each through the assembled authenticated router and
+/// checks status, problem media type, envelope shape, and the documented code.
+///
+/// # Panics
+/// Panics when the server cannot start, a request fails, or a refusal is not
+/// the documented problem response.
+#[tokio::test]
+async fn an_unextractable_local_transfer_locator_answers_with_a_documented_problem() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let writer = server
+        .bootstrap_service("openapi-local-transfer", &["writer"])
+        .await
+        .expect("service bootstraps");
+    let token = server
+        .exchange_api_key(writer.api_key().expect("machine has key"))
+        .await
+        .expect("api key exchanges");
+
+    let cases = [
+        (
+            "GET",
+            "/v1/cards/download/local",
+            "/v1/cards/download/local",
+            "get",
+            "WYRD_VALIDATION_400_MISSING_REQUIRED_FIELD",
+        ),
+        (
+            "GET",
+            "/v1/cards/download/local?path=a&path=b",
+            "/v1/cards/download/local",
+            "get",
+            "WYRD_VALIDATION_400_MISSING_REQUIRED_FIELD",
+        ),
+        (
+            "PUT",
+            "/v1/cards/upload/local/%FF",
+            "/v1/cards/upload/local/{id}",
+            "put",
+            "WYRD_STORAGE_400_INVALID_UPLOAD_ID",
+        ),
+    ];
+    for (method, uri, path, operation, expected) in cases {
+        let response = server
+            .oneshot_authenticated(
+                &token,
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{method} {uri}");
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some(PROBLEM_MEDIA_TYPE),
+            "{method} {uri} is a problem response"
+        );
+        let problem = problem_json(response).await;
+        assert_eq!(problem["status"], 400, "{method} {uri}: {problem}");
+        assert!(problem["title"].is_string(), "{method} {uri}: {problem}");
+        assert_eq!(problem["code"], expected, "{method} {uri}: {problem}");
+        assert!(
+            documented_description(&document, path, operation, 400).contains(expected),
+            "{method} {path} names {expected} on its 400"
+        );
+    }
+
+    server.shutdown().await.expect("server shuts down");
+}
+
 /// An audit store the server cannot append to must fail the decision closed
 /// with the stable code its own operation documents.
 ///

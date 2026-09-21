@@ -20,19 +20,55 @@ the public doctrine summary for developers and agents.
 
 ## Purpose
 
-Wyrd is the AI layer for human and agentic work. It does not become the user's
-application runtime, training framework, workflow engine, or cloud platform.
+Wyrd is open-source verification and assurance infrastructure for AI systems.
+It verifies that models, prompts, agents, workflows, and AI services behave as
+intended from development through production.
 
-Wyrd makes AI work declarative, connectable, inspectable, auditable,
-reproducible, and operable. Users and agents
-describe the things that matter. Wyrd records those descriptions, validates
-them, links them, observes what happens, governs decisions, and exposes the
-result through human- and agent-facing surfaces.
-Wyrd is the platform users and agents love to build on, not the platform that builds for them.
+Verification is Wyrd's primary product outcome: observed behavior is evaluated
+against declared expectations for exact, versioned system components. Assurance
+is the confidence supported by durable evidence that makes those judgments
+attributable, reproducible, governable, and auditable.
+
+Wyrd does not become the user's application runtime, training framework,
+workflow engine, or cloud platform. User code executes in the user's runtime;
+Wyrd declares what matters, observes what happens, evaluates behavior, and
+preserves the evidence.
+
+## Verification model
+
+Wyrd owns a complete verification loop:
+
+```text
+Cards and Specs declare the system
+        ↓
+Verification bindings attach Verifiers
+        ↓
+Runs and Observations record measured behavior
+        ↓
+Verifiers produce judgments
+        ↓
+Bifrost, lineage, and audit preserve the evidence
+        ↓
+Policy governs decisions and Operators react
+```
+
+The terms are distinct:
+
+| Term | Meaning |
+|---|---|
+| Verification | Evaluating observed behavior against declared criteria and producing a judgment. |
+| Assurance | Confidence supported by durable verification evidence, provenance, policy decisions, and audit history. |
+| Observation | A measured fact. An observation is evidence, not a judgment by itself. |
+| Verifier | A reusable, subject-less declaration that interprets observations and produces judgments. |
+
+Cards, registry, lineage, observations, evaluation, drift, policy, audit, and
+analytical storage are the substrate of verification. They do not make Wyrd a
+passive integration, catalog, or observability product whose purpose is merely
+to assemble other tools.
 
 ## Object model
 
-Wyrd is built around declared intent.
+Wyrd verification begins with declared intent.
 
 | Layer | Meaning |
 |---|---|
@@ -54,8 +90,10 @@ Relationships explain.
 Status tracks lifecycle.
 Runs record execution.
 Observations record measured facts.
+Verifiers produce judgments.
 Policy governs decisions.
 Audit records accountability.
+Operators react.
 ```
 
 ## Core nouns
@@ -160,11 +198,12 @@ Services compose foundations instead of inventing private shapes:
 
 ## Runtime boundary
 
-Wyrd records, validates, governs, links, installs, observes, and exposes AI
+Wyrd records, validates, links, observes, verifies, governs, and exposes AI
 system components. User code owns inference loops, training loops, app servers,
-agent processes, and deployment mechanics. Wyrd provides the observation and
-governance layer: services emit runtime behavior through Wyrd's native system
-and hook into it for lineage, policy enforcement, and drift monitoring.
+agent processes, and deployment mechanics. Wyrd provides the verification and
+assurance infrastructure: services emit runtime behavior through Wyrd's native
+observation system and bind it to evaluation, lineage, policy enforcement,
+drift monitoring, and audit.
 
 Runtime results that persist become runs, observations, artifact cards,
 relationships, audit records, or status updates through service-owned paths.
@@ -236,10 +275,14 @@ the MCP tool input.
 
 Every implementation should preserve the doctrine:
 
+- verification is the primary product outcome
+- assurance claims are backed by durable evidence
 - contracts are typed
 - specs are declarative
 - CardRefs are explicit
 - relationships are derived
+- observations remain measured facts
+- Verifiers produce judgments
 - artifacts are cards
 - registration is centralized
 - runtime behavior stays out of durable specs

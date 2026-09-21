@@ -41,6 +41,14 @@ drift, not permission for code and documentation to diverge.
 
 ## Doctrine
 
+Wyrd is open-source verification and assurance infrastructure for AI systems.
+Its primary product outcome is verification: evaluating observed behavior
+against declared expectations for exact, versioned system components. Assurance
+is the confidence supported by durable evidence that makes those judgments
+attributable, reproducible, governable, and auditable. Cards, observations,
+lineage, policy, audit, and analytical storage are the verification substrate,
+not a passive integration or inventory product.
+
 1. **Cards are independent.** No card "owns" another. The
    deployment unit is a directory of card YAMLs applied together.
 2. **One fact, one owning Kind.** If a field could live in two places, the

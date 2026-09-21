@@ -41,8 +41,23 @@ Locked cross-cutting decisions that any contributor must honor:
   is the first design filter for Wyrd nouns, layers, services, and public
   surfaces. Internal APIs, external APIs, Python SDK, HTTP, CLI, MCP, UI, docs,
   generated schemas, and agent-facing contracts must align with it.
-- Wyrd is the AI layer for human and agentic workflows, not a general-purpose framework or
-  runtime for arbitrary code execution.
+- Wyrd is open-source verification and assurance infrastructure for AI systems.
+  Its primary product outcome is verification: evaluating observed behavior
+  against declared expectations for exact, versioned system components.
+  Assurance is the confidence supported by durable evidence that makes those
+  judgments attributable, reproducible, governable, and auditable.
+- Wyrd's verification model is explicit. Cards and Specs identify what is under
+  verification; verification bindings attach exact Verifiers; Runs and
+  Observations record measured behavior; Verifiers produce judgments; lineage
+  connects evidence to exact component versions; Bifrost retains and queries
+  that evidence; Policy governs decisions; Audit records accountability; and
+  Operators react to failed verification.
+- Cards, registry, lineage, observations, evaluation, drift, policy, audit, and
+  analytical storage are the substrate of verification. Wyrd is not a passive
+  integration, catalog, or observability product whose purpose is merely to
+  assemble other tools.
+- Wyrd verifies and assures human and agentic workflows without becoming a
+  general-purpose framework or runtime for arbitrary code execution.
 - Wyrd follows a language-agnostic client/server model. The Wyrd server owns
   durable behavior and core logic; clients project server contracts and call
   API surfaces.

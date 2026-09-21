@@ -1,22 +1,14 @@
 # Wyrd
 
-Wyrd is the open-source assurance and verification layer for the entire AI
-stack: data, models, prompts, agents, workflows, and the services around them.
+**Open-source verification and assurance infrastructure for AI systems.**
 
-It gives AI engineers and platform teams one system for declaring what an AI
-system is, connecting its components, observing what it does, and defining how
-its behavior is continuously verified from development through production.
-Wyrd works alongside your applications and infrastructure; it does not replace
-them.
+Wyrd verifies that models, prompts, agents, workflows, and AI services behave
+as intended from development through production.
 
-> **Pre-release:** Wyrd `v0.1.0` is targeted for September 25, 2026. It will
-> be the first public release. Wyrd will remain pre-1.0, so APIs and persisted
-> schemas may change between minor versions; `v0.1.0` will not include upgrade
-> migrations.
-
-Today, a source checkout supports local Card authoring and a development server.
-Public packages, container images, and the complete end-to-end verification
-path will ship with `v0.1.0`.
+Teams define expected behavior with typed, versioned contracts. Wyrd observes
+real execution, evaluates it with reusable Verifiers, and preserves the
+resulting evidence through lineage, policy, and audit. It works alongside your
+applications and infrastructure; it does not replace them.
 
 [Getting started](docs/src/content/docs/get-started/index.svx) ·
 [Architecture](architecture/wyrd-design.md) ·
@@ -25,49 +17,44 @@ path will ship with `v0.1.0`.
 
 ## Why Wyrd exists
 
-AI systems combine data, models, prompts, agents, workflows, services, policies,
-and external systems. Their definitions live in different registries and
-repositories. Their runtime behavior lands in disconnected telemetry and
-evaluation tools.
+An AI service can remain available and return valid responses while its quality,
+safety, or intended behavior quietly degrades. Its behavior depends on changing
+data, model versions, prompts, tools, providers, and runtime context, so testing
+the application once is not enough.
 
-That fragmentation creates a trust problem. Code review can tell you what
-changed at one point in time; it cannot continuously prove what is running,
-which component versions produced a result, whether the system still behaves as
-intended, or what evidence supports that conclusion.
+Teams often respond with separate evaluation scripts, telemetry pipelines,
+drift monitors, registries, policy checks, and audit systems. Each represents
+the system differently, making verification inconsistent, difficult to
+reproduce, and expensive to maintain.
 
-Wyrd connects declared intent, lineage, runtime observations, policy, audit, and
-verification results in one system.
+Wyrd makes verification a shared infrastructure capability instead of something
+every team rebuilds.
 
-## What Wyrd does
-
-- Declares the AI stack as typed, versioned **Cards**.
-- Connects exact component versions and derives their relationships and lineage.
-- Records authenticated observations and ingests OpenTelemetry traces, metrics,
-  and logs.
-- Stores and queries analytical data in **Bifrost**, Wyrd's distributed online
-  analytical processing (OLAP) warehouse.
-- Evaluates **Drift** and **Agent Eval Verifiers**, then routes failed results
-  through **Operators** such as Slack and PagerDuty.
-- Runs provider-backed LLM work through a tenant-governed gateway and **Skald**
-  workflows.
-
-## How it fits together
-
-Cards are typed, versioned declarations of the parts of an AI system. Card
-references connect exact versions; Wyrd validates those references and derives
-the system's relationships and lineage.
+## How Wyrd verifies AI systems
 
 ```text
-Cards declare the system and its verification bindings
+Declare the system and its expected behavior
         ↓
-Applications, agents, and workflows run
+Observe real executions
         ↓
-Observations enter Vala and Bifrost
+Evaluate behavior with Verifiers
         ↓
-Verifiers evaluate behavior continuously
+Record evidence and lineage
         ↓
-Results remain queryable; failed verdicts dispatch Operators
+Enforce policy or trigger action
 ```
+
+- **Cards** identify the exact data, models, prompts, agents, workflows, and
+  services being verified.
+- **Verifiers** define reusable Drift and Agent Eval checks.
+- **Runs and Observations** record what happened during execution.
+- **Lineage** connects verification evidence to exact component versions.
+- **Bifrost** stores and queries the evidence produced by verification.
+- **Policy and Audit** govern consequential decisions and record
+  accountability.
+- **Operators** respond when verification fails.
+
+## How the platform fits together
 
 - **Wyrd** is the control plane for Cards, registry, lineage, identity, policy,
   and audit.
@@ -118,6 +105,15 @@ ephemeral signing key. See
 initialization, and production configuration.
 
 ## Release status
+
+> **Pre-release:** Wyrd `v0.1.0` is targeted for September 25, 2026. It will
+> be the first public release. Wyrd will remain pre-1.0, so APIs and persisted
+> schemas may change between minor versions; `v0.1.0` will not include upgrade
+> migrations.
+
+Today, a source checkout supports local Card authoring and a development server.
+Public packages, container images, and the complete end-to-end verification
+path will ship with `v0.1.0`.
 
 `v0.1.0` is a self-hosted, headless release. Its release gates cover the
 capabilities described above as one end-to-end system. The release also

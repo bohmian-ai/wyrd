@@ -1,8 +1,7 @@
 ---
 id: SPEC-admin-principals
-revision: 12
-status: approved
-approved_at: 2026-09-21
+revision: 13
+status: draft
 ---
 
 # Global and tenant administrative principals
@@ -146,8 +145,9 @@ to satisfy this specification.
   to the database and secret store (`REQ-032`).
 - Billing, plans, quotas, an `Organization` noun, custom domains, tenant
   deletion or data destruction, and tenant migration.
-- Changing `wyrd apply` Card-bound principal provisioning, delegation chains, or
-  the emit card scope.
+- Changing `wyrd apply` Card-bound principal provisioning, delegation-chain
+  representation or depth, or the emit card scope. Delegated permission
+  attenuation and delegation-decision audit are amended by `REQ-012c`.
 - A SaaS customer-facing signup UI. The SaaS control plane is an ordinary holder
   of a global administrative credential.
 
@@ -238,6 +238,18 @@ to satisfy this specification.
   database-backed issuer or identity lookup remain on the issuance side. No
   common verifier trait, factory, checker, or database dependency may join
   those two responsibilities.
+- **REQ-012c**: RFC 8693 delegation MUST NOT amplify authority. The caller MUST
+  hold `delegation:issue`, and the delegated token's `permissions` MUST be the
+  semantic intersection of the caller token's verified `PermissionSet` and the
+  target principal's current `PermissionSet`, retaining the narrower scope for
+  every overlap. No delegated permission may exist unless both sets cover it;
+  wildcard, schema, and exact-object grants MUST attenuate under the same rule.
+  Every evaluation of `delegation:issue` MUST append exactly one allowed or
+  denied decision through the canonical audit path and commit it before the
+  response, including an allowed decision followed by subject resolution or
+  issuance failure. An unrecordable decision MUST fail closed. The existing
+  successful token-exchange audit MAY serve as the allowed decision when it
+  satisfies that contract.
 - **REQ-013**: The authenticated context MUST carry server-verified principal
   identity, principal type, and control-plane scope — platform, or exactly one
   tenant. It MUST be a closed two-variant type so a platform identity is not
@@ -498,6 +510,11 @@ to satisfy this specification.
   platform plane re-reads current credential, principal, and grant state without
   caching. Tenant authentication has no authorization epoch, revocation list,
   introspection read, or verified-token cache.
+- **INV-013a**: Delegation is authority attenuation, never authority
+  acquisition. A delegated actor can exercise only the overlap between the
+  delegator's verified token authority and the target principal's current
+  grants, and every delegation authorization decision is durably attributable
+  even when no token is issued.
 - **INV-014**: Administrative identity remains server-owned durable state. No
   Card kind, SDK, CLI, or UI becomes a durable source of truth.
 - **INV-015**: Every Wyrd plane authenticates on `X-Wyrd-Access-Token`. The
@@ -717,6 +734,13 @@ documents. These amendments are part of the change.
   `/openapi.json` serves its runtime document, route/auth/body/problem/error
   coverage is exact without a parallel catalog, and no checked-in snapshot,
   YAML endpoint, file-generation lane, or release OpenAPI digest remains.
+- **AC-020**: Delegation evidence proves a caller cannot obtain any permission
+  outside its own verified authority or the target principal's current grants;
+  wildcard, schema, exact-object, and disjoint permission combinations produce
+  the semantic intersection; allowed and denied `delegation:issue` decisions
+  each commit exactly one canonical audit row; a later subject or issuance
+  refusal retains the allowed no-effect decision; and audit failure issues no
+  token and returns no unaudited authorization result.
 
 ## Material constraints
 
@@ -815,10 +839,17 @@ the next.
 
 ## Open material decisions
 
-None. Every decision raised during drafting has been resolved by the author.
+Revision 13 requires explicit human approval of `REQ-012c`, `INV-013a`, and
+`AC-020` before delegation remediation begins.
 
 ## Revision history
 
+- **Revision 13 — 2026-09-21 — draft**: Brings RFC 8693 delegation into the
+  credential-exchange security boundary. Delegated permissions are the semantic
+  intersection of the caller's verified authority and the target principal's
+  current grants, and every allowed or denied delegation authorization decision
+  commits through the canonical audit path before a response. Delegation-chain
+  representation, depth, and emit Card scope remain unchanged.
 - **Revision 12 — 2026-09-21 — approved**: Names the tenant JWT authority claim
   `permissions`; requires API-key exchange, OIDC login, human refresh, workload
   `jwt-bearer`, and RFC 8693 delegation to share one current-state issuance

@@ -399,6 +399,108 @@ mod transport_behavior {
         HttpTransport::new(&http_config, auth).expect("transport builds")
     }
 
+    /// Build an API-key [`WyrdClient`] over a mock server, so a public handle
+    /// exercises the same renewal the transport owns.
+    fn make_api_key_client(base_url: String) -> wyrd_client::WyrdClient {
+        let credential = ResolvedCredential::ApiKey("api-key-value".to_owned().into());
+        let mut config = ClientConfig::default();
+        config.http.base_url = base_url.clone();
+        let auth = AuthMiddleware::new(&config, credential).expect("auth builds");
+        let http_config = HttpConfig {
+            base_url,
+            ..HttpConfig::default()
+        };
+        let transport =
+            HttpTransport::new(&http_config, Arc::clone(&auth)).expect("transport builds");
+        wyrd_client::WyrdClient::from_parts(auth, transport, config.grpc)
+    }
+
+    /// Revoking a credential renews once after an authentication refusal, like
+    /// every other control call.
+    ///
+    /// This operation used to be the one control request that sent exactly once
+    /// and never refreshed, so a durable API key whose cached bearer the server
+    /// had stopped accepting could revoke nothing while its neighbours renewed
+    /// and succeeded. The 204 the route answers with carries no body, which is
+    /// what had made the raw path look like the natural fit.
+    #[tokio::test]
+    async fn revoke_credential_re_exchanges_once_and_replays() {
+        let server = spawn_mock(vec![
+            MockResponse::ok(&token_response("tok-A")),
+            MockResponse::status(
+                401,
+                r#"{"code":"WYRD_AUTH_401_INVALID_TOKEN","detail":"unauthorized","details":{}}"#,
+            ),
+            MockResponse::ok(&token_response("tok-B")),
+            MockResponse::status(204, ""),
+        ])
+        .await;
+        let principals = wyrd_client::principals::Principals::with_client(make_api_key_client(
+            server.base_url.clone(),
+        ));
+        let principal = wyrd_spec::auth::PrincipalId::new(
+            "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00"
+                .parse()
+                .expect("principal id parses"),
+        );
+
+        principals
+            .revoke_credential(&principal, "cred-1")
+            .await
+            .expect("the replay after renewal retires the credential");
+
+        assert_eq!(
+            server.hits.load(Ordering::SeqCst),
+            4,
+            "expected: exchange, 401, re-exchange, replay"
+        );
+        let captured = server.captured.lock().await;
+        assert_eq!(
+            extract_header(&captured[3], "x-wyrd-access-token").as_deref(),
+            Some("Bearer tok-B"),
+            "the replay carries the re-exchanged token"
+        );
+        assert!(
+            captured[3].starts_with("DELETE /v1/principals/"),
+            "the replay repeats the same revocation: {}",
+            captured[3].lines().next().unwrap_or_default()
+        );
+    }
+
+    /// A second authentication refusal is terminal: renewal is replayed once,
+    /// never in a loop.
+    #[tokio::test]
+    async fn revoke_credential_stops_after_a_second_refusal() {
+        let unauthorized =
+            r#"{"code":"WYRD_AUTH_401_INVALID_TOKEN","detail":"unauthorized","details":{}}"#;
+        let server = spawn_mock(vec![
+            MockResponse::ok(&token_response("tok-A")),
+            MockResponse::status(401, unauthorized),
+            MockResponse::ok(&token_response("tok-B")),
+            MockResponse::status(401, unauthorized),
+        ])
+        .await;
+        let principals = wyrd_client::principals::Principals::with_client(make_api_key_client(
+            server.base_url.clone(),
+        ));
+        let principal = wyrd_spec::auth::PrincipalId::new(
+            "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00"
+                .parse()
+                .expect("principal id parses"),
+        );
+
+        principals
+            .revoke_credential(&principal, "cred-1")
+            .await
+            .expect_err("a refused replay is reported, not retried again");
+
+        assert_eq!(
+            server.hits.load(Ordering::SeqCst),
+            4,
+            "expected: exchange, 401, re-exchange, refused replay — and no more"
+        );
+    }
+
     fn token_response(access: &str) -> String {
         serde_json::json!({
             "access_token": access,

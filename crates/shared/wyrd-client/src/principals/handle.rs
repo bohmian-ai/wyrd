@@ -157,14 +157,16 @@ impl Principals {
         principal_id: &PrincipalId,
         credential_id: &str,
     ) -> Result<(), WyrdError> {
-        // `request_raw` already maps a non-success status onto the stable
-        // catalog, so reaching here means the credential is retired. The
-        // response carries no body to decode: revocation's only outcome worth
-        // reporting is whether it happened.
+        // Through the shared request owner like every other control call, so a
+        // cached bearer the server has stopped accepting is re-exchanged and
+        // the revoke replayed once rather than failing terminally. The 204 it
+        // answers with decodes as the unit type: revocation's only outcome
+        // worth reporting is whether it happened.
         self.client
-            .request_raw(
+            .request_json::<(), ()>(
                 Method::DELETE,
                 &format!("/v1/principals/{principal_id}/credentials/{credential_id}"),
+                None,
             )
             .await?;
         Ok(())

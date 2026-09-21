@@ -19,14 +19,21 @@ use wyrd_testing::{Bootstrap, WyrdTestServer};
 /// environment.
 ///
 /// The credential travels in its environment variable rather than on the command
-/// line so nothing lands in the process table. Every other `WYRD_*` credential
-/// source is cleared, so a journey proves the command works from the credential
-/// it was given and cannot pass by picking up a developer's ambient login.
+/// line so nothing lands in the process table.
 pub(crate) fn run_cli_with_credential(
     arguments: &[&str],
     variable: &str,
     credential: &str,
 ) -> Output {
+    run_cli_with_env(arguments, &[(variable, credential)])
+}
+
+/// Run the shipped CLI with only the named environment sources set.
+///
+/// Every `WYRD_*` secret source is cleared first, so a journey proves the
+/// command works from the sources it was given and cannot pass by picking up a
+/// developer's ambient login.
+pub(crate) fn run_cli_with_env(arguments: &[&str], sources: &[(&str, &str)]) -> Output {
     let mut command = Command::cargo_bin("wyrd").expect("wyrd binary builds");
     command
         .env(
@@ -38,7 +45,9 @@ pub(crate) fn run_cli_with_credential(
         .env_remove("WYRD_TENANT")
         .env_remove("WYRD_API_KEY")
         .env_remove("WYRD_PLATFORM_CREDENTIAL")
-        .env(variable, credential);
+        .env_remove("WYRD_REFRESH_TOKEN")
+        .env_remove("WYRD_ISSUER_CLIENT_SECRET")
+        .envs(sources.iter().copied());
     command.args(arguments).output().expect("wyrd command runs")
 }
 

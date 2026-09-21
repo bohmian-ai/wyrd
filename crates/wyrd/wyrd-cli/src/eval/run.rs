@@ -47,12 +47,12 @@ pub struct EvalRunArgs {
     /// Card that emitted the pre-collected records.
     #[arg(long, value_name = "CARD_REF", requires = "records")]
     pub subject: Option<CardRef>,
-    /// Drive a remote server protocol router.
+    /// Drive a remote server protocol router. The credential for the
+    /// authenticated `/v1/eval` surface is read from the ambient chain
+    /// (`WYRD_ACCESS_TOKEN`, workload identity, `WYRD_API_KEY`, or
+    /// `credentials.toml`), never from an argument.
     #[arg(long, value_name = "URL", conflicts_with = "records")]
     pub server: Option<Url>,
-    /// Wyrd access token (JWT) for the authenticated `/v1/eval` surface.
-    #[arg(long, value_name = "TOKEN", env = "WYRD_ACCESS_TOKEN")]
-    pub token: Option<String>,
     /// Use a deterministic judge invoker (all LLM judge tasks return passed: true; results do not reflect real judge behavior).
     #[arg(long, default_value_t = false)]
     pub judge_mock: bool,
@@ -113,9 +113,6 @@ async fn run(args: EvalRunArgs) -> Result<ExitCode, WyrdCliError> {
 fn validate_args(args: &EvalRunArgs) -> Result<(), WyrdCliError> {
     if args.server.is_some() && args.agent_url.is_none() {
         return Err(WyrdCliError::ServerRequiresAgentUrl);
-    }
-    if args.server.is_some() && args.token.is_none() {
-        return Err(WyrdCliError::ServerRequiresToken);
     }
     if matches!(args.simulated_user, SimulatedUserCli::Client)
         && args.simulated_user_script.is_none()

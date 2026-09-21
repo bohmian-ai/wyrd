@@ -21,12 +21,11 @@ use crate::error::{CliBoundaryError, WyrdCliError};
         .args(["sql", "file"])
 ))]
 pub struct QueryCommand {
-    /// Wyrd server base URL.
+    /// Wyrd server base URL. The credential is read from the ambient chain
+    /// (`WYRD_ACCESS_TOKEN`, workload identity, `WYRD_API_KEY`, or
+    /// `credentials.toml`), never from an argument.
     #[arg(long, env = "WYRD_SERVER_URL")]
     pub server: Option<String>,
-    /// Bearer access token.
-    #[arg(long, env = "WYRD_ACCESS_TOKEN", hide_env_values = true)]
-    pub token: Option<String>,
     /// SELECT-only SQL text.
     #[arg(long)]
     pub sql: Option<String>,
@@ -157,26 +156,22 @@ fn request(command: &QueryCommand) -> Result<BifrostQueryRequest, WyrdCliError> 
 
 /// Constructs the authenticated Wyrd client for one query invocation.
 ///
-/// `--server` and `--token` are required here rather than read from the ambient
-/// chain, because a query names the deployment it reads. Assembly itself belongs
-/// to [`crate::client`].
+/// `--server` is required because a query names the deployment it reads; the
+/// credential comes from the ambient chain like every other command. Assembly
+/// itself belongs to [`crate::client`].
 ///
 /// # Errors
 ///
-/// Returns [`WyrdCliError::QueryConfig`] when either flag is absent or blank,
-/// and the client-assembly errors documented on [`crate::client::client`].
+/// Returns [`WyrdCliError::QueryConfig`] when `--server` is absent or blank,
+/// and the client-assembly errors documented on
+/// [`crate::client::from_global`].
 fn client(command: &QueryCommand) -> Result<WyrdClient, WyrdCliError> {
     let server = command
         .server
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .ok_or(WyrdCliError::QueryConfig { field: "--server" })?;
-    let token = command
-        .token
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .ok_or(WyrdCliError::QueryConfig { field: "--token" })?;
-    crate::client::client(server, token)
+    crate::client::from_global(Some(server))
 }
 
 /// Emits record batches as typed line-delimited JSON.
@@ -269,17 +264,13 @@ mod tests {
     /// Proves exactly one SQL source is required.
     #[test]
     fn query_parser_rejects_missing_or_duplicate_sql_source() {
-        assert!(
-            TestCli::try_parse_from(["wyrd", "query", "--server", "x", "--token", "y"]).is_err()
-        );
+        assert!(TestCli::try_parse_from(["wyrd", "query", "--server", "x"]).is_err());
         assert!(
             TestCli::try_parse_from([
                 "wyrd",
                 "query",
                 "--server",
                 "x",
-                "--token",
-                "y",
                 "--sql",
                 "SELECT 1",
                 "--file",
@@ -292,10 +283,8 @@ mod tests {
     /// Pins the operator-facing defaults.
     #[test]
     fn query_parser_uses_safe_defaults() {
-        let cli = TestCli::try_parse_from([
-            "wyrd", "query", "--server", "x", "--token", "y", "--sql", "SELECT 1",
-        ])
-        .expect("query arguments are valid");
+        let cli = TestCli::try_parse_from(["wyrd", "query", "--server", "x", "--sql", "SELECT 1"])
+            .expect("query arguments are valid");
         let TestCommand::Query(command) = cli.command;
         assert_eq!(command.visibility, QueryVisibility::PublishedOnly);
         assert_eq!(command.freshness, QueryFreshness::Strict);
@@ -307,7 +296,6 @@ mod tests {
     fn query_request_defaults_match_shared_client_contract() {
         let command = QueryCommand {
             server: Some("http://localhost".to_owned()),
-            token: Some("token".to_owned()),
             sql: Some("SELECT 1".to_owned()),
             file: None,
             visibility: QueryVisibility::PublishedOnly,
@@ -331,7 +319,6 @@ mod tests {
     fn query_request_explicit_opt_ins_are_preserved() {
         let command = QueryCommand {
             server: Some("http://localhost".to_owned()),
-            token: Some("token".to_owned()),
             sql: Some("SELECT 1".to_owned()),
             file: None,
             visibility: QueryVisibility::Fused,

@@ -34,12 +34,11 @@ pub struct RevokeArgs {
     /// Audit reason for the revocation.
     #[arg(long, value_name = "TEXT")]
     pub reason: String,
-    /// Wyrd server base URL.
+    /// Wyrd server base URL. The credential is read from the ambient chain
+    /// (`WYRD_ACCESS_TOKEN`, workload identity, `WYRD_API_KEY`, or
+    /// `credentials.toml`), never from an argument.
     #[arg(long, value_name = "URL", env = "WYRD_SERVER_URL")]
     pub server: Url,
-    /// Bearer access token with admin privileges.
-    #[arg(long, value_name = "TOKEN", env = "WYRD_ACCESS_TOKEN")]
-    pub token: String,
 }
 
 /// Suspend one principal so every issuance path refuses its next token.
@@ -59,7 +58,7 @@ pub async fn dispatch(args: RevokeArgs) -> Result<ExitCode, WyrdCliError> {
         expected: "a principal UUID".to_owned(),
     })?;
 
-    wyrd_client::Principals::with_client(crate::client::client(args.server.as_str(), &args.token)?)
+    wyrd_client::Principals::with_client(crate::client::from_global(Some(args.server.as_str()))?)
         .revoke_principal(
             &principal_id,
             &RevokePrincipalRequest {
@@ -95,8 +94,6 @@ mod tests {
             "test",
             "--server",
             "https://acme.wyrd.cloud",
-            "--token",
-            "tok",
         ]);
         assert!(parsed.is_err(), "revoke must require --kind");
     }
@@ -113,8 +110,6 @@ mod tests {
                 "test",
                 "--server",
                 "https://acme.wyrd.cloud",
-                "--token",
-                "tok",
             ]);
             assert!(parsed.is_ok(), "kind={kind} failed: {parsed:?}");
         }

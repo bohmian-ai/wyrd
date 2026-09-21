@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::convert::Infallible;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -31,8 +30,9 @@ pub enum TrustedIssuerCommand {
 #[derive(Debug, Args)]
 /// Arguments for `wyrd auth trusted-issuer add`.
 ///
-/// The client secret is accepted by file or environment as well as inline so an
-/// operator is not forced to put it in shell history or the argument list.
+/// The client secret is accepted only by file or environment, never inline, so
+/// it cannot reach shell history, the process argument list, or the derived
+/// `Debug` of parsed arguments.
 pub struct AddArgs {
     /// Trusted OIDC issuer URL.
     #[arg(long, value_name = "URL")]
@@ -46,14 +46,10 @@ pub struct AddArgs {
     /// How Wyrd authenticates to the issuer (SecretBasic, SecretPost, PrivateKeyJwt, Public).
     #[arg(long, value_name = "METHOD")]
     pub client_auth: String,
-    /// Client secret (required for SecretBasic and SecretPost). Prefer
-    /// --client-secret-file or WYRD_ISSUER_CLIENT_SECRET to keep the secret out
-    /// of shell history and the process argument list.
-    #[arg(long, value_name = "SECRET", value_parser = secret_argument)]
-    pub client_secret: Option<SecretString>,
-    /// Read the client secret from a file (trailing newline trimmed). Mutually
-    /// exclusive with --client-secret.
-    #[arg(long, value_name = "PATH", conflicts_with = "client_secret")]
+    /// Read the client secret (required for SecretBasic and SecretPost) from a
+    /// file, trailing newline trimmed. Without it the secret is read from
+    /// `WYRD_ISSUER_CLIENT_SECRET`.
+    #[arg(long, value_name = "PATH")]
     pub client_secret_file: Option<PathBuf>,
     /// Claim path that yields the principal subject.
     #[arg(long, value_name = "CLAIM")]
@@ -77,23 +73,21 @@ pub struct AddArgs {
     /// JWKS key-cache TTL override in seconds.
     #[arg(long, value_name = "SECS")]
     pub jwks_ttl_secs: Option<u64>,
-    /// Wyrd server base URL.
+    /// Wyrd server base URL. The credential is read from the ambient chain
+    /// (`WYRD_ACCESS_TOKEN`, workload identity, `WYRD_API_KEY`, or
+    /// `credentials.toml`), never from an argument.
     #[arg(long, value_name = "URL", env = "WYRD_SERVER_URL")]
     pub server: Url,
-    /// Bearer access token with admin privileges.
-    #[arg(long, value_name = "TOKEN", env = "WYRD_ACCESS_TOKEN")]
-    pub token: String,
 }
 
 /// Arguments for `wyrd auth trusted-issuer list`.
 #[derive(Debug, Args)]
 pub struct ListArgs {
-    /// Wyrd server base URL.
+    /// Wyrd server base URL. The credential is read from the ambient chain
+    /// (`WYRD_ACCESS_TOKEN`, workload identity, `WYRD_API_KEY`, or
+    /// `credentials.toml`), never from an argument.
     #[arg(long, value_name = "URL", env = "WYRD_SERVER_URL")]
     pub server: Url,
-    /// Bearer access token with admin privileges.
-    #[arg(long, value_name = "TOKEN", env = "WYRD_ACCESS_TOKEN")]
-    pub token: String,
 }
 
 /// Arguments for `wyrd auth trusted-issuer rm`.
@@ -105,12 +99,11 @@ pub struct RmArgs {
     /// Remove even if live workload bindings exist.
     #[arg(long)]
     pub cascade: bool,
-    /// Wyrd server base URL.
+    /// Wyrd server base URL. The credential is read from the ambient chain
+    /// (`WYRD_ACCESS_TOKEN`, workload identity, `WYRD_API_KEY`, or
+    /// `credentials.toml`), never from an argument.
     #[arg(long, value_name = "URL", env = "WYRD_SERVER_URL")]
     pub server: Url,
-    /// Bearer access token with admin privileges.
-    #[arg(long, value_name = "TOKEN", env = "WYRD_ACCESS_TOKEN")]
-    pub token: String,
 }
 
 /// Run one `wyrd auth trusted-issuer` subcommand.
@@ -140,11 +133,11 @@ async fn add(args: AddArgs) -> Result<ExitCode, WyrdCliError> {
         .map_err(|error| invalid("issuer", &args.issuer, &format!("an issuer URL: {error}")))?;
     let client_auth = parse_client_auth(&args.client_auth)?;
     let principal_kind = parse_principal_kind(&args.principal_kind)?;
-    let client_secret = resolve_client_secret(args.client_secret, args.client_secret_file)?
+    let client_secret = resolve_client_secret(args.client_secret_file)?
         .map(|secret| SecretBearer::new(secret.expose_secret().to_owned()));
     let group_role_map = parse_group_roles(&args.group_roles)?;
 
-    let view: TrustedIssuerView = crate::client::client(args.server.as_str(), &args.token)?
+    let view: TrustedIssuerView = crate::client::from_global(Some(args.server.as_str()))?
         .request_json(
             Method::POST,
             TRUSTED_ISSUERS_PATH,
@@ -185,7 +178,7 @@ async fn add(args: AddArgs) -> Result<ExitCode, WyrdCliError> {
 /// Returns a client-construction error for a rejected endpoint and the server's
 /// stable Wyrd error when the caller is unauthorized or the read fails.
 async fn list(args: ListArgs) -> Result<ExitCode, WyrdCliError> {
-    let views: Vec<TrustedIssuerView> = crate::client::client(args.server.as_str(), &args.token)?
+    let views: Vec<TrustedIssuerView> = crate::client::from_global(Some(args.server.as_str()))?
         .request_json::<(), _>(Method::GET, TRUSTED_ISSUERS_PATH, None)
         .await
         .map_err(|source| WyrdCliError::Server { source })?;
@@ -212,7 +205,7 @@ async fn rm(args: RmArgs) -> Result<ExitCode, WyrdCliError> {
         .append_pair("cascade", if args.cascade { "true" } else { "false" })
         .finish();
 
-    crate::client::client(args.server.as_str(), &args.token)?
+    crate::client::from_global(Some(args.server.as_str()))?
         .request_json::<(), serde_json::Value>(
             Method::DELETE,
             &format!("{TRUSTED_ISSUERS_PATH}?{query}"),
@@ -264,41 +257,20 @@ fn parse_principal_kind(value: &str) -> Result<IssuerTokenPolicy, WyrdCliError> 
     }
 }
 
-/// Hold a `--client-secret` argument value without it becoming debug-visible.
+/// Resolve the client secret from a file or the environment.
 ///
-/// `AddArgs` derives `Debug`, and clap itself renders argument values in some
-/// error paths, so the secret is wrapped the moment it leaves the command line
-/// rather than after resolution. Infallible — every UTF-8 argument is a valid
-/// secret — but clap requires the `Result` shape.
-///
-/// # Errors
-/// Never returns an error; the `Result` satisfies clap's parser contract.
-fn secret_argument(raw: &str) -> Result<SecretString, Infallible> {
-    Ok(SecretString::from(raw.to_owned()))
-}
-
-/// Resolve the client secret from the flag, a file, or the environment.
-///
-/// `--client-secret-file` and `--client-secret` are mutually exclusive at the
-/// clap layer, so at most one of `inline`/`file` is set. The file path wins when
-/// present; otherwise the inline flag; otherwise `WYRD_ISSUER_CLIENT_SECRET`.
-/// Keeping the secret in a file or env var avoids leaking it into shell history
-/// and the process argument list.
+/// The file path wins when present; otherwise `WYRD_ISSUER_CLIENT_SECRET`.
+/// Neither source puts the secret in shell history or the process argument
+/// list.
 ///
 /// # Errors
 /// Returns [`WyrdCliError::Io`] when `--client-secret-file` cannot be read.
-fn resolve_client_secret(
-    inline: Option<SecretString>,
-    file: Option<PathBuf>,
-) -> Result<Option<SecretString>, WyrdCliError> {
+fn resolve_client_secret(file: Option<PathBuf>) -> Result<Option<SecretString>, WyrdCliError> {
     if let Some(path) = file {
         let raw = std::fs::read_to_string(&path).map_err(|source| WyrdCliError::Io { source })?;
         return Ok(Some(SecretString::from(
             raw.trim_end_matches(['\n', '\r']).to_owned(),
         )));
-    }
-    if let Some(secret) = inline {
-        return Ok(Some(secret));
     }
     match std::env::var("WYRD_ISSUER_CLIENT_SECRET") {
         Ok(secret) => Ok(Some(SecretString::from(secret))),
@@ -343,7 +315,7 @@ fn parse_group_roles(entries: &[String]) -> Result<HashMap<String, Vec<String>>,
 #[cfg(test)]
 mod tests {
     use clap::Parser;
-    use secrecy::{ExposeSecret, SecretString};
+    use secrecy::ExposeSecret;
 
     use super::TrustedIssuerCommand;
 
@@ -372,8 +344,6 @@ mod tests {
             "Workload",
             "--server",
             "https://acme.wyrd.cloud",
-            "--token",
-            "tok",
         ]);
         assert!(parsed.is_ok(), "parse failed: {parsed:?}");
     }
@@ -395,8 +365,6 @@ mod tests {
             "Workload",
             "--server",
             "https://acme.wyrd.cloud",
-            "--token",
-            "tok",
         ]);
         assert!(parsed.is_err(), "must require --issuer");
     }
@@ -418,14 +386,12 @@ mod tests {
             "sub",
             "--server",
             "https://acme.wyrd.cloud",
-            "--token",
-            "tok",
         ]);
         assert!(parsed.is_err(), "must require --principal-kind");
     }
 
     #[test]
-    fn add_accepts_optional_client_secret_and_ttl() {
+    fn add_accepts_optional_client_secret_file_and_ttl() {
         let parsed = Cli::try_parse_from([
             "wyrd",
             "add",
@@ -437,8 +403,8 @@ mod tests {
             "myapp",
             "--client-auth",
             "SecretBasic",
-            "--client-secret",
-            "s3cr3t",
+            "--client-secret-file",
+            "/run/secrets/issuer",
             "--claim-subject",
             "sub",
             "--principal-kind",
@@ -447,15 +413,13 @@ mod tests {
             "3600",
             "--server",
             "https://acme.wyrd.cloud",
-            "--token",
-            "tok",
         ]);
         assert!(parsed.is_ok(), "parse failed: {parsed:?}");
         match parsed.unwrap().command {
             TrustedIssuerCommand::Add(args) => {
                 assert_eq!(
-                    args.client_secret.as_ref().map(ExposeSecret::expose_secret),
-                    Some("s3cr3t")
+                    args.client_secret_file.as_deref(),
+                    Some(std::path::Path::new("/run/secrets/issuer"))
                 );
                 assert_eq!(args.jwks_ttl_secs, Some(3600));
             }
@@ -465,20 +429,13 @@ mod tests {
 
     #[test]
     fn list_parses_required_args() {
-        let parsed = Cli::try_parse_from([
-            "wyrd",
-            "list",
-            "--server",
-            "https://acme.wyrd.cloud",
-            "--token",
-            "tok",
-        ]);
+        let parsed = Cli::try_parse_from(["wyrd", "list", "--server", "https://acme.wyrd.cloud"]);
         assert!(parsed.is_ok(), "parse failed: {parsed:?}");
     }
 
     #[test]
     fn list_requires_server() {
-        let parsed = Cli::try_parse_from(["wyrd", "list", "--token", "tok"]);
+        let parsed = Cli::try_parse_from(["wyrd", "list"]);
         assert!(parsed.is_err(), "must require --server when env is absent");
     }
 
@@ -491,8 +448,6 @@ mod tests {
             "https://idp.example.com",
             "--server",
             "https://acme.wyrd.cloud",
-            "--token",
-            "tok",
         ]);
         assert!(parsed.is_ok(), "parse failed: {parsed:?}");
     }
@@ -507,8 +462,6 @@ mod tests {
             "--cascade",
             "--server",
             "https://acme.wyrd.cloud",
-            "--token",
-            "tok",
         ]);
         assert!(parsed.is_ok(), "parse failed: {parsed:?}");
         match parsed.unwrap().command {
@@ -519,14 +472,7 @@ mod tests {
 
     #[test]
     fn rm_requires_issuer() {
-        let parsed = Cli::try_parse_from([
-            "wyrd",
-            "rm",
-            "--server",
-            "https://acme.wyrd.cloud",
-            "--token",
-            "tok",
-        ]);
+        let parsed = Cli::try_parse_from(["wyrd", "rm", "--server", "https://acme.wyrd.cloud"]);
         assert!(parsed.is_err(), "must require --issuer");
     }
 
@@ -542,9 +488,12 @@ mod tests {
         assert!(parse_principal_kind("Robot").is_err());
     }
 
+    /// The client secret is never an argument: an inline value is refused
+    /// without being echoed back.
     #[test]
-    fn add_rejects_client_secret_and_file_together() {
-        let parsed = Cli::try_parse_from([
+    fn add_refuses_an_inline_client_secret() {
+        let secret = "issuer-client-secret-sentinel";
+        let refused = Cli::try_parse_from([
             "wyrd",
             "add",
             "--issuer",
@@ -556,22 +505,16 @@ mod tests {
             "--client-auth",
             "SecretPost",
             "--client-secret",
-            "s3cr3t",
-            "--client-secret-file",
-            "/tmp/secret",
+            secret,
             "--claim-subject",
             "sub",
             "--principal-kind",
             "Workload",
             "--server",
             "https://acme.wyrd.cloud",
-            "--token",
-            "tok",
-        ]);
-        assert!(
-            parsed.is_err(),
-            "--client-secret and --client-secret-file must conflict"
-        );
+        ])
+        .expect_err("--client-secret is not accepted");
+        assert!(!refused.to_string().contains(secret));
     }
 
     #[test]
@@ -607,8 +550,6 @@ mod tests {
             "Human",
             "--server",
             "https://acme.wyrd.cloud",
-            "--token",
-            "tok",
         ]);
         assert!(parsed.is_ok(), "parse failed: {parsed:?}");
         match parsed.unwrap().command {
@@ -631,86 +572,19 @@ mod tests {
         assert!(super::parse_group_roles(&["dev=".to_owned()]).is_err());
     }
 
+    /// A secret file is read with its trailing newline trimmed.
     #[test]
-    fn resolve_client_secret_prefers_inline_then_reads_file() {
+    fn resolve_client_secret_reads_a_file() {
         use super::resolve_client_secret;
-
-        assert_eq!(
-            resolve_client_secret(Some(SecretString::from("inline".to_owned())), None)
-                .expect("inline resolves")
-                .as_ref()
-                .map(ExposeSecret::expose_secret),
-            Some("inline")
-        );
 
         let dir = std::env::temp_dir();
         let path = dir.join(format!("wyrd-cli-secret-{}", std::process::id()));
         std::fs::write(&path, "file-secret\n").expect("write temp secret");
-        let resolved =
-            resolve_client_secret(None, Some(path.clone())).expect("file secret resolves");
+        let resolved = resolve_client_secret(Some(path.clone())).expect("file secret resolves");
         std::fs::remove_file(&path).ok();
         assert_eq!(
             resolved.as_ref().map(ExposeSecret::expose_secret),
             Some("file-secret")
         );
-    }
-
-    #[tokio::test]
-    async fn add_posts_secret_and_role_flags_in_body() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/admin/trusted-issuers"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "issuer": "https://idp.example.com",
-                "jwks_uri": "https://idp.example.com/jwks",
-                "expected_audience": "wyrd",
-                "client_id": "myapp",
-                "client_auth": "SecretPost",
-                "principal_kind": "Workload",
-                "jwks_ttl_secs": 3600,
-                "claim_mapping": { "subject": "sub" },
-                "group_role_map": { "dev": ["reader"] },
-                "default_roles": ["reader"]
-            })))
-            .mount(&server)
-            .await;
-
-        let args = super::AddArgs {
-            issuer: "https://idp.example.com".to_owned(),
-            expected_audience: "wyrd".to_owned(),
-            client_id: "myapp".to_owned(),
-            client_auth: "SecretPost".to_owned(),
-            client_secret: Some(SecretString::from("s3cr3t".to_owned())),
-            client_secret_file: None,
-            claim_subject: "sub".to_owned(),
-            claim_email: None,
-            claim_groups: None,
-            default_roles: vec!["reader".to_owned()],
-            group_roles: vec!["dev=reader".to_owned()],
-            principal_kind: "Workload".to_owned(),
-            jwks_ttl_secs: None,
-            server: server.uri().parse().expect("mock uri parses"),
-            token: "tok".to_owned(),
-        };
-
-        super::add(args).await.expect("add dispatch succeeds");
-
-        let requests = server.received_requests().await.expect("requests recorded");
-        assert_eq!(requests.len(), 1, "exactly one POST expected");
-        let body: serde_json::Value =
-            serde_json::from_slice(&requests[0].body).expect("body is JSON");
-        assert_eq!(body["client_secret"], "s3cr3t");
-        assert_eq!(body["client_auth"], "SecretPost");
-        assert_eq!(body["default_roles"], serde_json::json!(["reader"]));
-        assert_eq!(body["group_role_map"]["dev"], serde_json::json!(["reader"]));
-        // The admin token is presented on the wire.
-        let auth = requests[0]
-            .headers
-            .get("x-wyrd-access-token")
-            .expect("access token header present");
-        assert_eq!(auth, "Bearer tok");
     }
 }

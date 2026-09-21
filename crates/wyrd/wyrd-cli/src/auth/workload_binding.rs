@@ -37,12 +37,11 @@ pub struct AddArgs {
     /// Card the bound workload acts as (space/kind/name@version[#uid]).
     #[arg(long, value_name = "CARD_REF")]
     pub card: String,
-    /// Wyrd server base URL.
+    /// Wyrd server base URL. The credential is read from the ambient chain
+    /// (`WYRD_ACCESS_TOKEN`, workload identity, `WYRD_API_KEY`, or
+    /// `credentials.toml`), never from an argument.
     #[arg(long, value_name = "URL", env = "WYRD_SERVER_URL")]
     pub server: Url,
-    /// Bearer access token with admin privileges.
-    #[arg(long, value_name = "TOKEN", env = "WYRD_ACCESS_TOKEN")]
-    pub token: String,
 }
 
 /// Arguments for `wyrd auth workload-binding list`; the filters are optional.
@@ -54,12 +53,11 @@ pub struct ListArgs {
     /// Filter by subject.
     #[arg(long, value_name = "SUBJECT")]
     pub subject: Option<String>,
-    /// Wyrd server base URL.
+    /// Wyrd server base URL. The credential is read from the ambient chain
+    /// (`WYRD_ACCESS_TOKEN`, workload identity, `WYRD_API_KEY`, or
+    /// `credentials.toml`), never from an argument.
     #[arg(long, value_name = "URL", env = "WYRD_SERVER_URL")]
     pub server: Url,
-    /// Bearer access token with admin privileges.
-    #[arg(long, value_name = "TOKEN", env = "WYRD_ACCESS_TOKEN")]
-    pub token: String,
 }
 
 /// Arguments for `wyrd auth workload-binding rm`.
@@ -71,12 +69,11 @@ pub struct RmArgs {
     /// Subject of the binding to remove.
     #[arg(long, value_name = "SUBJECT")]
     pub subject: String,
-    /// Wyrd server base URL.
+    /// Wyrd server base URL. The credential is read from the ambient chain
+    /// (`WYRD_ACCESS_TOKEN`, workload identity, `WYRD_API_KEY`, or
+    /// `credentials.toml`), never from an argument.
     #[arg(long, value_name = "URL", env = "WYRD_SERVER_URL")]
     pub server: Url,
-    /// Bearer access token with admin privileges.
-    #[arg(long, value_name = "TOKEN", env = "WYRD_ACCESS_TOKEN")]
-    pub token: String,
 }
 
 /// Run one `wyrd auth workload-binding` subcommand.
@@ -109,7 +106,7 @@ async fn add(args: AddArgs) -> Result<ExitCode, WyrdCliError> {
         .parse()
         .map_err(|error| invalid("issuer", &args.issuer, &format!("an issuer URL: {error}")))?;
 
-    let view: WorkloadBindingView = crate::client::client(args.server.as_str(), &args.token)?
+    let view: WorkloadBindingView = crate::client::from_global(Some(args.server.as_str()))?
         .request_json(
             Method::POST,
             WORKLOAD_BINDINGS_PATH,
@@ -147,7 +144,7 @@ async fn list(args: ListArgs) -> Result<ExitCode, WyrdCliError> {
         query.append_pair("subject", subject);
     }
 
-    let views: Vec<WorkloadBindingView> = crate::client::client(args.server.as_str(), &args.token)?
+    let views: Vec<WorkloadBindingView> = crate::client::from_global(Some(args.server.as_str()))?
         .request_json::<(), _>(Method::GET, &path_with_query(&query.finish()), None)
         .await
         .map_err(|source| WyrdCliError::Server { source })?;
@@ -173,7 +170,7 @@ async fn rm(args: RmArgs) -> Result<ExitCode, WyrdCliError> {
         .append_pair("subject", &args.subject)
         .finish();
 
-    crate::client::client(args.server.as_str(), &args.token)?
+    crate::client::from_global(Some(args.server.as_str()))?
         .request_json::<(), serde_json::Value>(Method::DELETE, &path_with_query(&query), None)
         .await
         .map_err(|source| WyrdCliError::Server { source })?;
@@ -228,8 +225,6 @@ mod tests {
             "prod/service/my-svc@1.0.0",
             "--server",
             "https://acme.wyrd.cloud",
-            "--token",
-            "tok",
         ]);
         assert!(parsed.is_ok(), "parse failed: {parsed:?}");
     }
@@ -245,8 +240,6 @@ mod tests {
             "system:ci-runner",
             "--server",
             "https://acme.wyrd.cloud",
-            "--token",
-            "tok",
         ]);
         assert!(parsed.is_err(), "must require --card");
     }
@@ -262,8 +255,6 @@ mod tests {
             "prod/service/my-svc@1.0.0",
             "--server",
             "https://acme.wyrd.cloud",
-            "--token",
-            "tok",
         ]);
         assert!(parsed.is_err(), "must require --subject");
     }
@@ -283,8 +274,6 @@ mod tests {
             "prod/service/my-svc@1.0.0",
             "--server",
             "https://acme.wyrd.cloud",
-            "--token",
-            "tok",
         ]);
         assert!(parsed.is_ok(), "parse failed: {parsed:?}");
         match parsed.unwrap().command {
@@ -310,8 +299,6 @@ mod tests {
             "not-a-valid-card-ref",
             "--server",
             "https://acme.wyrd.cloud",
-            "--token",
-            "tok",
         ]);
         // Clap itself accepts any string; dispatch() validates and rejects before HTTP.
         assert!(
@@ -329,14 +316,7 @@ mod tests {
 
     #[test]
     fn list_parses_with_no_filters() {
-        let parsed = Cli::try_parse_from([
-            "wyrd",
-            "list",
-            "--server",
-            "https://acme.wyrd.cloud",
-            "--token",
-            "tok",
-        ]);
+        let parsed = Cli::try_parse_from(["wyrd", "list", "--server", "https://acme.wyrd.cloud"]);
         assert!(parsed.is_ok(), "parse failed: {parsed:?}");
         match parsed.unwrap().command {
             WorkloadBindingCommand::List(args) => {
@@ -356,8 +336,6 @@ mod tests {
             "https://idp.example.com",
             "--server",
             "https://acme.wyrd.cloud",
-            "--token",
-            "tok",
         ]);
         assert!(parsed.is_ok(), "parse failed: {parsed:?}");
         match parsed.unwrap().command {
@@ -370,7 +348,7 @@ mod tests {
 
     #[test]
     fn list_requires_server() {
-        let parsed = Cli::try_parse_from(["wyrd", "list", "--token", "tok"]);
+        let parsed = Cli::try_parse_from(["wyrd", "list"]);
         assert!(parsed.is_err(), "must require --server when env is absent");
     }
 
@@ -385,8 +363,6 @@ mod tests {
             "system:ci-runner",
             "--server",
             "https://acme.wyrd.cloud",
-            "--token",
-            "tok",
         ]);
         assert!(parsed.is_ok(), "parse failed: {parsed:?}");
     }
@@ -400,8 +376,6 @@ mod tests {
             "https://idp.example.com",
             "--server",
             "https://acme.wyrd.cloud",
-            "--token",
-            "tok",
         ]);
         assert!(parsed.is_err(), "must require --subject");
     }
@@ -415,8 +389,6 @@ mod tests {
             "system:ci-runner",
             "--server",
             "https://acme.wyrd.cloud",
-            "--token",
-            "tok",
         ]);
         assert!(parsed.is_err(), "must require --issuer");
     }

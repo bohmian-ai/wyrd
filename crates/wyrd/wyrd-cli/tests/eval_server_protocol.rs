@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use assert_cmd::prelude::*;
 use axum::Router;
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
@@ -119,9 +118,9 @@ async fn server_protocol_carries_lease_after_open() {
     let agent_url = agent.uri();
     let eval_arg = eval_path.to_str().expect("utf8 path").to_owned();
     tokio::task::spawn_blocking(move || {
-        std::process::Command::cargo_bin("wyrd")
-            .expect("wyrd binary")
-            .args([
+        // The access token travels in the ambient chain, never in argv.
+        let output = crate::principal_journey::run_cli_with_credential(
+            &[
                 "eval",
                 "run",
                 "--server",
@@ -130,12 +129,16 @@ async fn server_protocol_carries_lease_after_open() {
                 &agent_url,
                 "--eval",
                 &eval_arg,
-                "--token",
-                "test-access-jwt",
                 "--judge-mock",
-            ])
-            .assert()
-            .success();
+            ],
+            "WYRD_ACCESS_TOKEN",
+            "test-access-jwt",
+        );
+        assert!(
+            output.status.success(),
+            "eval run failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     })
     .await
     .expect("blocking command task joins");

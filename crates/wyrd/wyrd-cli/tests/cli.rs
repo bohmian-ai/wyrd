@@ -16,3 +16,5 @@ mod operator_journey;
 mod principal_journey;
 #[path = "query_server_journey.rs"]
 mod query_server_journey;
+#[path = "secret_sources.rs"]
+mod secret_sources;

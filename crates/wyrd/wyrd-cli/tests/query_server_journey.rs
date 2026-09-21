@@ -1,9 +1,7 @@
 //! Real-server journey for the compiled `wyrd query` command.
 
-use assert_cmd::prelude::*;
 use secrecy::SecretString;
 use serde_json::Value;
-use std::process::Command;
 use std::sync::Arc;
 use wyrd_client::auth::AuthMiddleware;
 use wyrd_client::config::ClientConfig;
@@ -78,21 +76,19 @@ async fn query_command_reads_seeded_table() {
         .await
         .expect("query fixture seeds");
     let sql = format!("SELECT id, value FROM {}", fixture.table);
-    let output = Command::cargo_bin("wyrd")
-        .expect("wyrd binary")
-        .args([
+    let output = crate::principal_journey::run_cli_with_credential(
+        &[
             "query",
             "--server",
             &fixture.endpoint,
-            "--token",
-            &fixture.token,
             "--sql",
             &sql,
             "--format",
             "jsonl",
-        ])
-        .output()
-        .expect("compiled query command runs");
+        ],
+        "WYRD_ACCESS_TOKEN",
+        &fixture.token,
+    );
     assert!(
         output.status.success(),
         "query command failed: {}",
@@ -141,19 +137,11 @@ async fn query_command_denial_preserves_problem_without_read_decision() {
         .expect("typed denied query fails");
     assert_eq!(denied_expected.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
     assert_eq!(denied_expected.status(), 403);
-    let output = Command::cargo_bin("wyrd")
-        .expect("wyrd binary")
-        .args([
-            "query",
-            "--server",
-            &fixture.endpoint,
-            "--token",
-            &denied,
-            "--sql",
-            &sql,
-        ])
-        .output()
-        .expect("compiled query command runs");
+    let output = crate::principal_journey::run_cli_with_credential(
+        &["query", "--server", &fixture.endpoint, "--sql", &sql],
+        "WYRD_ACCESS_TOKEN",
+        &denied,
+    );
     assert!(!output.status.success());
     let problem: Value = String::from_utf8(output.stderr)
         .expect("stderr is UTF-8")
@@ -175,19 +163,11 @@ async fn query_command_denial_preserves_problem_without_read_decision() {
         .expect("typed invalid query fails");
     assert_eq!(invalid_expected.code(), "WYRD_VALA_400_QUERY_INVALID_SQL");
     assert_eq!(invalid_expected.status(), 400);
-    let invalid = Command::cargo_bin("wyrd")
-        .expect("wyrd binary")
-        .args([
-            "query",
-            "--server",
-            &fixture.endpoint,
-            "--token",
-            &fixture.token,
-            "--sql",
-            invalid_sql,
-        ])
-        .output()
-        .expect("compiled invalid query runs");
+    let invalid = crate::principal_journey::run_cli_with_credential(
+        &["query", "--server", &fixture.endpoint, "--sql", invalid_sql],
+        "WYRD_ACCESS_TOKEN",
+        &fixture.token,
+    );
     assert!(!invalid.status.success());
     let invalid_problem: Value = String::from_utf8(invalid.stderr)
         .expect("invalid stderr is UTF-8")

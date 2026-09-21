@@ -34,12 +34,11 @@ pub struct IssueKeyArgs {
     /// Optional TTL override in seconds.
     #[arg(long, value_name = "SECS")]
     pub expires_in_seconds: Option<u32>,
-    /// Wyrd server base URL.
+    /// Wyrd server base URL. The credential is read from the ambient chain
+    /// (`WYRD_ACCESS_TOKEN`, workload identity, `WYRD_API_KEY`, or
+    /// `credentials.toml`), never from an argument.
     #[arg(long, value_name = "URL", env = "WYRD_SERVER_URL")]
     pub server: Url,
-    /// Bearer access token with admin privileges.
-    #[arg(long, value_name = "TOKEN", env = "WYRD_ACCESS_TOKEN")]
-    pub token: String,
 }
 
 /// Issue a card-bound API key and print it once.
@@ -66,7 +65,7 @@ pub async fn dispatch(args: IssueKeyArgs) -> Result<ExitCode, WyrdCliError> {
                 expected: format!("a card ref: {error}"),
             })?;
 
-    let response: IssueKeyResponse = crate::client::client(args.server.as_str(), &args.token)?
+    let response: IssueKeyResponse = crate::client::from_global(Some(args.server.as_str()))?
         .request_json(
             Method::POST,
             "/auth/issue-key",
@@ -115,8 +114,6 @@ mod tests {
             "default",
             "--server",
             "https://acme.wyrd.cloud",
-            "--token",
-            "tok",
         ]);
         assert!(parsed.is_ok(), "parse failed: {parsed:?}");
     }
@@ -133,8 +130,6 @@ mod tests {
             "default",
             "--server",
             "https://acme.wyrd.cloud",
-            "--token",
-            "tok",
         ]);
         assert!(parsed.is_err(), "must require --kind");
     }
@@ -153,8 +148,6 @@ mod tests {
             "prod",
             "--server",
             "https://acme.wyrd.cloud",
-            "--token",
-            "tok",
             "--label",
             "ci-key",
             "--expires-in-seconds",

@@ -25,10 +25,6 @@ use crate::eval::run::{self, EvalRunArgs, SimulatedUserCli};
 /// fail.
 pub async fn run_server(args: EvalRunArgs, server_url: Url) -> Result<ExitCode, WyrdCliError> {
     let (eval_ref, _) = run::load_eval_card(&args.eval)?;
-    let token = args
-        .token
-        .as_deref()
-        .ok_or(WyrdCliError::ServerRequiresToken)?;
     let agent_url = args
         .agent_url
         .clone()
@@ -36,7 +32,7 @@ pub async fn run_server(args: EvalRunArgs, server_url: Url) -> Result<ExitCode, 
 
     // One client for both planes: the protocol calls authenticate with it, and
     // the agent calls reuse its pool through the credential-free external seam.
-    let client = Arc::new(crate::client::client(server_url.as_str(), token)?);
+    let client = Arc::new(crate::client::from_global(Some(server_url.as_str()))?);
     let agent = AgentClient::new(
         Arc::clone(&client),
         agent_url,

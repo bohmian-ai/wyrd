@@ -94,7 +94,7 @@ pub enum Command {
 /// Structural checks over the assembled command tree.
 #[cfg(test)]
 mod tests {
-    use clap::CommandFactory;
+    use clap::{CommandFactory, Parser};
 
     use super::Cli;
 
@@ -108,5 +108,102 @@ mod tests {
     #[test]
     fn the_shipped_command_tree_is_consistent() {
         Cli::command().debug_assert();
+    }
+
+    /// Environment variables that carry a credential. Clap copies an `env`
+    /// fallback into the parsed field, so none may back an argument.
+    const SECRET_ENVS: [&str; 5] = [
+        "WYRD_ACCESS_TOKEN",
+        "WYRD_API_KEY",
+        "WYRD_REFRESH_TOKEN",
+        "WYRD_ISSUER_CLIENT_SECRET",
+        "WYRD_PLATFORM_CREDENTIAL",
+    ];
+
+    /// Collect every argument that could carry a secret, with its command path.
+    ///
+    /// A secret-shaped long name is one naming a token, secret, password, API
+    /// key, or credential; a path to a secret file (`-file`) or an identifier
+    /// (`-id`) names no secret itself.
+    fn secret_arguments(command: &clap::Command, path: &str, found: &mut Vec<String>) {
+        for argument in command.get_arguments() {
+            let long = argument.get_long().unwrap_or_default();
+            let secret_named = ["token", "secret", "password", "api-key", "credential"]
+                .iter()
+                .any(|word| long.contains(word))
+                && !long.ends_with("-file")
+                && !long.ends_with("-id");
+            let secret_env = argument
+                .get_env()
+                .and_then(|env| env.to_str())
+                .is_some_and(|env| SECRET_ENVS.contains(&env));
+            if secret_named || secret_env {
+                found.push(format!("{path} --{long}"));
+            }
+        }
+        for subcommand in command.get_subcommands() {
+            secret_arguments(
+                subcommand,
+                &format!("{path} {}", subcommand.get_name()),
+                found,
+            );
+        }
+    }
+
+    /// No shipped command accepts a secret through argv or a clap `env`
+    /// fallback, so none can reach shell history, the process table, or the
+    /// derived `Debug` of parsed arguments.
+    #[test]
+    fn no_shipped_command_takes_a_secret_argument() {
+        let mut found = Vec::new();
+        secret_arguments(&Cli::command(), "wyrd", &mut found);
+        assert!(found.is_empty(), "secret-valued arguments: {found:?}");
+    }
+
+    /// Every former secret spelling is refused by the real root parser, and
+    /// the refusal never echoes the value supplied.
+    #[test]
+    fn the_root_parser_refuses_every_former_secret_option_without_echo() {
+        let secret = "wyrd-cli-sentinel-secret";
+        let server = ["--server", "https://wyrd.example"];
+        let cases: [&[&str]; 12] = [
+            &["auth", "issue-key", "--token"],
+            &["auth", "trusted-issuer", "add", "--token"],
+            &["auth", "trusted-issuer", "add", "--client-secret"],
+            &["auth", "trusted-issuer", "list", "--token"],
+            &["auth", "trusted-issuer", "rm", "--token"],
+            &["auth", "workload-binding", "add", "--token"],
+            &["auth", "workload-binding", "list", "--token"],
+            &["auth", "workload-binding", "rm", "--token"],
+            &["auth", "refresh", "--refresh-token"],
+            &["principal", "revoke", "--token"],
+            &["query", "--token"],
+            &["eval", "run", "--token"],
+        ];
+        for case in cases {
+            let (option, command) = case.split_last().expect("every case names an option");
+            for argv in [
+                [&["wyrd"], command, &server, &[*option, secret]].concat(),
+                [
+                    &["wyrd"],
+                    command,
+                    &server,
+                    &[format!("{option}={secret}").as_str()],
+                ]
+                .concat(),
+            ] {
+                let refused =
+                    Cli::try_parse_from(&argv).expect_err("a former secret option is not accepted");
+                assert_eq!(
+                    refused.kind(),
+                    clap::error::ErrorKind::UnknownArgument,
+                    "{argv:?}"
+                );
+                assert!(
+                    !refused.to_string().contains(secret),
+                    "{argv:?} echoed the secret: {refused}"
+                );
+            }
+        }
     }
 }

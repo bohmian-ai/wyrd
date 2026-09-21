@@ -12,7 +12,7 @@ pub enum WyrdCliError {
         code = "WYRD_CLI_400_QUERY_CONFIG",
         status = 400,
         title = "Query configuration missing",
-        remediation = "Pass --server and --token or set WYRD_SERVER_URL and WYRD_ACCESS_TOKEN."
+        remediation = "Pass --server or set WYRD_SERVER_URL; the credential comes from the ambient chain."
     )]
     QueryConfig {
         /// Missing command field.
@@ -76,16 +76,6 @@ pub enum WyrdCliError {
         remediation = "Pass --agent-url <URL> when using --server."
     )]
     ServerRequiresAgentUrl,
-
-    /// Server mode requires a Wyrd access token.
-    #[error("--server requires --token (or WYRD_ACCESS_TOKEN)")]
-    #[wyrd_error(
-        code = "WYRD_CLI_400_SERVER_REQUIRES_TOKEN",
-        status = 400,
-        title = "Server mode requires an access token",
-        remediation = "Pass --token <JWT> or set WYRD_ACCESS_TOKEN when using --server."
-    )]
-    ServerRequiresToken,
 
     /// Server mode does not accept pre-collected records.
     #[error("--server is incompatible with --records")]
@@ -321,6 +311,19 @@ pub enum WyrdCliError {
         remediation = "Set WYRD_PLATFORM_CREDENTIAL to a platform credential for this deployment."
     )]
     NoPlatformCredential,
+
+    /// `wyrd auth refresh` ran without a refresh token.
+    ///
+    /// The refresh token is read only from the environment so it never enters
+    /// argv or shell history.
+    #[error("no refresh token available")]
+    #[wyrd_error(
+        code = "WYRD_CLI_401_NO_REFRESH_TOKEN",
+        status = 401,
+        title = "No refresh token",
+        remediation = "Set WYRD_REFRESH_TOKEN to the refresh token to rotate."
+    )]
+    NoRefreshToken,
 
     /// The card client could not reach the configured server.
     #[error("card client transport failed: {detail}")]

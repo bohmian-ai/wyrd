@@ -6,44 +6,23 @@
 //! the shared client cannot express is evidence the client is missing a
 //! capability, not licence for the command to hand-roll one.
 //!
-//! Commands take `--server` and `--token` because an operator administering a
-//! deployment is usually not the workload that lives in it: the ambient
-//! credential chain [`ClientConfig::resolve_credential`] reads is the right
-//! default for `wyrd apply`, and the wrong one for pointing a recovery command
-//! at a second deployment. The token is passed as an explicit credential, which
-//! the client classifies — an API key is exchanged, an access token is presented
-//! verbatim — so an operator never has to say which kind they hold.
-//!
-//! Principal administration takes only `--server`: its credential comes from
-//! the ambient chain via [`from_global`], so an administrative secret never
-//! enters argv or shell history.
+//! Commands take only `--server`: the credential comes from the ambient chain
+//! [`ClientConfig::resolve_credential`] reads — `WYRD_ACCESS_TOKEN`, workload
+//! identity, `WYRD_API_KEY`, or `credentials.toml` — via [`from_global`], so a
+//! secret never enters argv, shell history, or the derived `Debug` of parsed
+//! arguments. The client classifies what it finds — an API key is exchanged,
+//! an access token is presented verbatim — so an operator never has to say
+//! which kind they hold.
 
 use std::sync::Arc;
 
-use secrecy::SecretString;
 use wyrd_client::auth::AuthMiddleware;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::error::WyrdClientError;
-use wyrd_client::transport::{HttpConfig, HttpTransport};
+use wyrd_client::transport::HttpTransport;
 use wyrd_client::{Principals, WyrdClient};
 
 use crate::error::WyrdCliError;
-
-/// Build an authenticated client for one deployment and one operator token.
-///
-/// # Errors
-/// Returns [`WyrdCliError::ClientConfig`] for a rejected endpoint and
-/// [`WyrdCliError::ClientTransport`] when the HTTP stack cannot be assembled.
-pub fn client(server: &str, token: &str) -> Result<WyrdClient, WyrdCliError> {
-    assemble(ClientConfig {
-        http: HttpConfig {
-            base_url: server.trim_end_matches('/').to_owned(),
-            ..HttpConfig::default()
-        },
-        credential: Some(SecretString::from(token.to_owned())),
-        ..ClientConfig::default()
-    })
-}
 
 /// Build a client from the ambient configuration, optionally re-pointed.
 ///
@@ -60,7 +39,7 @@ pub fn client(server: &str, token: &str) -> Result<WyrdClient, WyrdCliError> {
 pub fn from_global(server: Option<&str>) -> Result<WyrdClient, WyrdCliError> {
     let mut config = ClientConfig::from_global().map_err(map_client_error)?;
     if let Some(server) = server {
-        config.http.base_url = server.to_owned();
+        config.http.base_url = server.trim_end_matches('/').to_owned();
     }
     assemble(config)
 }

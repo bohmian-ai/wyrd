@@ -936,7 +936,9 @@ async fn await_clean_analytical(
 /// The journey also proves the denial is durable: one refusal writes exactly one
 /// tenant-bound denial event and no accepted-read event, and a refusal whose own
 /// audit append fails is reported as audit-unavailable rather than as a plain
-/// rejection.
+/// rejection. Finally a schema-scoped bearer is presented directly on the
+/// generated gRPC query service: its covered query drains and an uncovered one
+/// is refused before a response stream opens.
 ///
 /// # Panics
 ///
@@ -1072,7 +1074,64 @@ async fn prove_object_scoped_role_matrix() -> Result<(), ServerJourneyError> {
     server.restore_query_object_denial_audit();
     refuses(&analyst, TRACES_SQL).await?;
 
+    prove_scoped_bearer_over_grpc(&server, &analyst).await?;
+
     server.shutdown().await?;
+    Ok(())
+}
+
+/// Presents one schema-scoped bearer on the generated gRPC query service.
+///
+/// The HTTP matrix above proves Oracle's table decision; this proves the gRPC
+/// adapter hands the same signed `permissions` to it. The `vala.logs` bearer
+/// drains its covered query, and an uncovered `vala.traces` query is refused
+/// with `WYRD_VALA_403_QUERY_FORBIDDEN` from the call itself, before any
+/// response stream exists.
+///
+/// # Errors
+///
+/// Returns the first claim that broke.
+async fn prove_scoped_bearer_over_grpc(
+    server: &WyrdTestServer,
+    analyst: &wyrd_client::WyrdClient,
+) -> Result<(), ServerJourneyError> {
+    let bearer = format!("Bearer {}", analyst.auth().bearer().await?.expose());
+    let mut grpc = BifrostQueryServiceClient::new(
+        wyrd_tonic::tonic::transport::Endpoint::from_shared(
+            server.grpc_url().ok_or("missing gRPC URL")?,
+        )?
+        .connect()
+        .await?,
+    );
+    let query = |sql: &str| -> Result<_, ServerJourneyError> {
+        let mut request =
+            wyrd_tonic::tonic::Request::new(proto::BifrostQueryRequest::from(request(sql)));
+        request
+            .metadata_mut()
+            .insert("x-wyrd-access-token", bearer.parse()?);
+        Ok(request)
+    };
+
+    let covered = grpc
+        .query(query(LOGS_SQL)?)
+        .await
+        .map_err(|status| format!("the covered gRPC query must be admitted: {status:?}"))?;
+    drain_grpc(covered.into_inner())
+        .await
+        .map_err(|error| format!("the covered gRPC query must drain: {error}"))?;
+
+    match grpc.query(query(TRACES_SQL)?).await {
+        Err(status)
+            if status.code() == wyrd_tonic::tonic::Code::PermissionDenied
+                && wyrd_client::error::from_grpc_status(&status).code() == QUERY_FORBIDDEN => {}
+        Err(status) => {
+            return Err(format!(
+                "the uncovered gRPC query must be refused with {QUERY_FORBIDDEN}, got {status:?}"
+            )
+            .into());
+        }
+        Ok(_) => return Err("the uncovered gRPC query opened a response stream".into()),
+    }
     Ok(())
 }
 

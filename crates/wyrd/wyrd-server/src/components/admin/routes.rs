@@ -1736,19 +1736,17 @@ mod pg_tests {
         );
     }
 
-    /// A revocation that finds no principal records no allowance.
+    /// A revocation that finds no principal commits its one allowed decision.
     ///
-    /// Principal revocation shares this module's `service_accounts:write` gate
-    /// and now shares its atomicity: the allowance lives on the transaction that
-    /// bumps the epoch, so a miss leaves no row claiming a revocation was
-    /// permitted. The refusal itself is still visible — it is a `404` to the
-    /// caller, and a denial would have been recorded standalone.
+    /// Principal revocation shares this module's `service_accounts:write` gate.
+    /// The caller was permitted to ask, so the miss commits exactly that one
+    /// allowed decision with no effect, and the caller still sees a `404`.
     ///
     /// # Panics
     ///
     /// Panics when the fixture cannot start or any assertion fails.
     #[tokio::test]
-    async fn a_revocation_that_finds_nothing_records_no_allowance() {
+    async fn a_revocation_that_finds_nothing_records_one_allowance() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
         let state = test_state(&fixture).await;
@@ -1765,11 +1763,10 @@ mod pg_tests {
         .await
         .expect_err("revoking an absent principal is not found");
         assert!(matches!(error.0, WyrdError::PrincipalNotFound { .. }));
-        assert!(
-            decision_rows(&fixture, "auth.principal.revoke")
-                .await
-                .is_empty(),
-            "a revocation that changed nothing records no allowance"
+        assert_eq!(
+            decision_rows(&fixture, "auth.principal.revoke").await,
+            vec![("allowed".to_owned(), 1)],
+            "a revocation that changed nothing commits exactly its allowed decision"
         );
     }
 

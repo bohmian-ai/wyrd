@@ -763,6 +763,142 @@ async fn an_unextractable_local_transfer_locator_answers_with_a_documented_probl
     server.shutdown().await.expect("server shuts down");
 }
 
+/// Resolve one operation's path-parameter schema, following a component `$ref`.
+///
+/// # Panics
+/// Panics when the operation does not publish the named path parameter.
+fn path_parameter_schema(document: &Value, path: &str, method: &str, name: &str) -> Value {
+    let schema = document["paths"][path][method]["parameters"]
+        .as_array()
+        .and_then(|parameters| {
+            parameters
+                .iter()
+                .find(|parameter| parameter["name"] == name && parameter["in"] == "path")
+        })
+        .unwrap_or_else(|| panic!("{method} {path} publishes path parameter {name}"))["schema"]
+        .clone();
+    match schema["$ref"].as_str() {
+        Some(reference) => {
+            let component = reference.trim_start_matches("#/components/schemas/");
+            document["components"]["schemas"][component].clone()
+        }
+        None => schema,
+    }
+}
+
+/// A malformed administrative path identifier is excluded by the published
+/// typed parameter and refused at runtime with the problem that operation
+/// documents.
+///
+/// Covers one tenant principal path, one platform principal path, and one
+/// platform tenant path through the assembled authenticated router: each
+/// publishes a UUID-formatted parameter, and a non-UUID segment answers `400`
+/// `application/problem+json` with `WYRD_SPEC_400_VALIDATION`, which the
+/// operation lists under its `400`.
+///
+/// # Panics
+/// Panics when the server cannot start, a credential cannot be exchanged, or a
+/// refusal disagrees with the published contract.
+#[tokio::test]
+async fn a_malformed_administrative_identifier_answers_with_a_documented_problem() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let tenant = server
+        .bootstrap_service("openapi-malformed-id", &["reader"])
+        .await
+        .expect("service bootstraps");
+    let tenant_token = server
+        .exchange_api_key(tenant.api_key().expect("machine has key"))
+        .await
+        .expect("api key exchanges");
+    let root = server
+        .initialize_platform_root()
+        .await
+        .expect("platform root initializes");
+    let exchanged = server
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/platform/token")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "credential": root.expose_secret() }).to_string(),
+                ))
+                .expect("request builds"),
+        )
+        .await
+        .expect("platform token route responds");
+    assert_eq!(exchanged.status(), StatusCode::OK);
+    let platform_token = problem_json(exchanged).await["access_token"]
+        .as_str()
+        .expect("platform session token")
+        .to_owned();
+
+    let cases = [
+        (
+            tenant_token.as_str(),
+            "/v1/principals/not-a-uuid/credentials",
+            "/v1/principals/{principal_id}/credentials",
+            "principal_id",
+        ),
+        (
+            platform_token.as_str(),
+            "/platform/admins/not-a-uuid/credentials",
+            "/platform/admins/{principal_id}/credentials",
+            "principal_id",
+        ),
+        (
+            platform_token.as_str(),
+            "/platform/tenants/not-a-uuid",
+            "/platform/tenants/{tenant_id}",
+            "tenant_id",
+        ),
+    ];
+    for (token, uri, path, parameter) in cases {
+        let schema = path_parameter_schema(&document, path, "get", parameter);
+        assert_eq!(
+            schema["format"], "uuid",
+            "{path} publishes a typed {parameter}: {schema}"
+        );
+
+        let response = server
+            .oneshot_authenticated(
+                token,
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "GET {uri}");
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some(PROBLEM_MEDIA_TYPE),
+            "GET {uri} is a problem response"
+        );
+        let problem = problem_json(response).await;
+        assert_eq!(problem["status"], 400, "GET {uri}: {problem}");
+        assert_eq!(
+            problem["code"], "WYRD_SPEC_400_VALIDATION",
+            "GET {uri}: {problem}"
+        );
+        assert!(
+            documented_description(&document, path, "get", 400)
+                .contains("WYRD_SPEC_400_VALIDATION"),
+            "GET {path} lists WYRD_SPEC_400_VALIDATION on its 400"
+        );
+    }
+
+    server.shutdown().await.expect("server shuts down");
+}
+
 /// An audit store the server cannot append to must fail the decision closed
 /// with the stable code its own operation documents.
 ///

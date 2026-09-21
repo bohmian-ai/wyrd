@@ -15,6 +15,7 @@
 //! tool result is transcript material.
 
 use axum::Json;
+use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use chrono::{Duration, Utc};
@@ -37,7 +38,7 @@ use wyrd_sql::queries::platform::credentials::{
 
 use crate::components::auth::PlatformCaller;
 use crate::components::platform::identity::{authorize, authorize_read, commit_decision, operator};
-use crate::http::error::{WyrdErrorResponse, internal_failure};
+use crate::http::error::{WyrdErrorResponse, internal_failure, path_rejection};
 use crate::state::AppState;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
@@ -64,11 +65,13 @@ pub fn platform_credentials_router() -> OpenApiRouter<AppState> {
 #[utoipa::path(
     post,
     path = "/platform/admins/{principal_id}/credentials",
-    params(("principal_id" = String, Path, description = "Platform principal to issue for")),
+    params(("principal_id" = Uuid, Path, description = "Platform principal to issue for")),
     request_body = IssuePlatformCredentialRequest,
     responses(
         (status = 200, description = "Credential issued, plaintext returned once",
          body = IssuedCredential),
+        (status = 400, description = "A path identifier is not a valid UUID \
+          (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
         (status = 403, description = "Platform credential administration required \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
@@ -81,9 +84,10 @@ pub fn platform_credentials_router() -> OpenApiRouter<AppState> {
 async fn issue_credential(
     State(state): State<AppState>,
     caller: PlatformCaller,
-    Path(principal_id): Path<Uuid>,
+    principal_id: Result<Path<Uuid>, PathRejection>,
     Json(request): Json<IssuePlatformCredentialRequest>,
 ) -> Result<Json<IssuedCredential>, WyrdErrorResponse> {
+    let Path(principal_id) = principal_id.map_err(|rejection| path_rejection(&rejection))?;
     let pool = operator(&state)?;
     // The handle must outlive the transaction it lends out.
     let authz = PlatformAuthorization::new(pool.clone());
@@ -120,10 +124,12 @@ async fn issue_credential(
 #[utoipa::path(
     get,
     path = "/platform/admins/{principal_id}/credentials",
-    params(("principal_id" = String, Path, description = "Platform principal whose credentials to list")),
+    params(("principal_id" = Uuid, Path, description = "Platform principal whose credentials to list")),
     responses(
         (status = 200, description = "Non-secret credential metadata, newest first",
          body = CredentialListResponse),
+        (status = 400, description = "A path identifier is not a valid UUID \
+          (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
         (status = 403, description = "Platform credential administration required \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
@@ -136,8 +142,9 @@ async fn issue_credential(
 async fn list_credentials(
     State(state): State<AppState>,
     caller: PlatformCaller,
-    Path(principal_id): Path<Uuid>,
+    principal_id: Result<Path<Uuid>, PathRejection>,
 ) -> Result<Json<CredentialListResponse>, WyrdErrorResponse> {
+    let Path(principal_id) = principal_id.map_err(|rejection| path_rejection(&rejection))?;
     let pool = operator(&state)?;
     authorize_read(
         &pool,
@@ -182,11 +189,13 @@ async fn list_credentials(
     delete,
     path = "/platform/admins/{principal_id}/credentials/{credential_id}",
     params(
-        ("principal_id" = String, Path, description = "Platform principal that owns the credential"),
-        ("credential_id" = String, Path, description = "Credential to retire")
+        ("principal_id" = Uuid, Path, description = "Platform principal that owns the credential"),
+        ("credential_id" = Uuid, Path, description = "Credential to retire")
     ),
     responses(
         (status = 204, description = "Credential retired"),
+        (status = 400, description = "A path identifier is not a valid UUID \
+          (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
         (status = 403, description = "Platform credential administration required \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
@@ -201,8 +210,10 @@ async fn list_credentials(
 async fn revoke_credential(
     State(state): State<AppState>,
     caller: PlatformCaller,
-    Path((principal_id, credential_id)): Path<(Uuid, Uuid)>,
+    ids: Result<Path<(Uuid, Uuid)>, PathRejection>,
 ) -> Result<StatusCode, WyrdErrorResponse> {
+    let Path((principal_id, credential_id)) =
+        ids.map_err(|rejection| path_rejection(&rejection))?;
     let pool = operator(&state)?;
     // The handle must outlive the transaction it lends out.
     let authz = PlatformAuthorization::new(pool.clone());

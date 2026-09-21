@@ -1,6 +1,7 @@
 //! `POST /v1/principals/{id}/revoke` — suspend a principal so it can mint no new token.
 
 use axum::Json;
+use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, State};
 use std::fmt::Display;
 use wyrd_runtime::PrincipalId;
@@ -11,7 +12,7 @@ use wyrd_spec::vala::{AuditDetail, RevocationReason};
 
 use crate::audit;
 use crate::components::auth::Caller;
-use crate::http::error::{WyrdErrorResponse, internal_failure};
+use crate::http::error::{WyrdErrorResponse, internal_failure, path_rejection};
 use crate::state::AppState;
 use wyrd_auth::revoke::revoke_principal_in_conn;
 use wyrd_sql::TenantConn;
@@ -49,13 +50,14 @@ use wyrd_sql::TenantConn;
 #[utoipa::path(
     post,
     path = "/principals/{id}/revoke",
-    params(("id" = String, Path, description = "Principal whose tokens stop working")),
+    params(("id" = PrincipalId, Path, description = "Principal whose tokens stop working")),
     request_body = RevokePrincipalRequest,
     responses(
         (status = 200, description = "Principal suspended; it can mint no new token, and tokens \
           it already holds lapse at expiry"),
-        (status = 400, description = "Missing, oversized, or secret-like revocation reason \
-          (WYRD_VALIDATION_400_MISSING_REQUIRED_FIELD)", body = WyrdProblem),
+        (status = 400, description = "A path identifier is not a valid UUID, or the revocation \
+          reason is missing, oversized, or secret-like (WYRD_SPEC_400_VALIDATION, \
+          WYRD_VALIDATION_400_MISSING_REQUIRED_FIELD)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
           WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
@@ -74,9 +76,10 @@ use wyrd_sql::TenantConn;
 pub async fn revoke_principal(
     State(state): State<AppState>,
     caller: Caller,
-    Path(target_id): Path<PrincipalId>,
+    target_id: Result<Path<PrincipalId>, PathRejection>,
     Json(request): Json<RevokePrincipalRequest>,
 ) -> Result<(), WyrdErrorResponse> {
+    let Path(target_id) = target_id.map_err(|rejection| path_rejection(&rejection))?;
     let tenant = caller.principal.tenant_id;
     let reason = RevocationReason::new(request.reason).map_err(|error| {
         WyrdErrorResponse::from(WyrdError::MissingRequiredField {

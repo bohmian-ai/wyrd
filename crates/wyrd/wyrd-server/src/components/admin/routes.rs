@@ -1754,7 +1754,7 @@ mod pg_tests {
         let error = crate::auth::revoke::revoke_principal(
             State(state),
             writer(tenant),
-            axum::extract::Path(PrincipalId::new(uuid::Uuid::new_v4())),
+            Ok(axum::extract::Path(PrincipalId::new(uuid::Uuid::new_v4()))),
             Json(wyrd_spec::auth::RevokePrincipalRequest {
                 principal_kind: wyrd_spec::auth::PrincipalKindTag::Service,
                 reason: "key rotation".to_owned(),

@@ -12,6 +12,7 @@
 
 use axum::Extension;
 use axum::Json;
+use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, State};
 use secrecy::{ExposeSecret, SecretString};
 use wyrd_auth::platform_sessions::{
@@ -30,7 +31,7 @@ use wyrd_spec::request_id::RequestId;
 use crate::components::auth::PlatformCaller;
 use crate::components::platform::provisioning::{ProvisionError, TenantProvisioning};
 use crate::components::platform::recovery::TenantRecovery;
-use crate::http::error::{WyrdErrorResponse, internal_failure};
+use crate::http::error::{WyrdErrorResponse, internal_failure, path_rejection};
 use crate::state::AppState;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
@@ -288,9 +289,11 @@ async fn list_tenants(
 #[utoipa::path(
     get,
     path = "/platform/tenants/{tenant_id}",
-    params(("tenant_id" = String, Path, description = "Tenant to inspect")),
+    params(("tenant_id" = DataTenantId, Path, description = "Tenant to inspect")),
     responses(
         (status = 200, description = "The tenant's directory row", body = ProvisionedTenant),
+        (status = 400, description = "A path identifier is not a valid UUID \
+          (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
         (status = 403, description = "Tenant reading not granted (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No such tenant, indistinguishably for every cause \
@@ -304,8 +307,9 @@ async fn list_tenants(
 async fn inspect_tenant(
     State(state): State<AppState>,
     caller: PlatformCaller,
-    Path(tenant_id): Path<DataTenantId>,
+    tenant_id: Result<Path<DataTenantId>, PathRejection>,
 ) -> Result<Json<ProvisionedTenant>, WyrdErrorResponse> {
+    let Path(tenant_id) = tenant_id.map_err(|rejection| path_rejection(&rejection))?;
     directory(&state)?
         .inspect(&caller, tenant_id)
         .await
@@ -322,11 +326,12 @@ async fn inspect_tenant(
 #[utoipa::path(
     put,
     path = "/platform/tenants/{tenant_id}/status",
-    params(("tenant_id" = String, Path, description = "Tenant to transition")),
+    params(("tenant_id" = DataTenantId, Path, description = "Tenant to transition")),
     request_body = SetTenantStatusRequest,
     responses(
         (status = 200, description = "The tenant now holds the requested status"),
-        (status = 400, description = "Status is neither active nor suspended (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 400, description = "A path identifier is not a valid UUID, or status is \
+          neither active nor suspended (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
         (status = 403, description = "Tenant suspension not granted (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "Tenant is not in the state this transition requires \
@@ -340,9 +345,10 @@ async fn inspect_tenant(
 async fn set_tenant_status(
     State(state): State<AppState>,
     caller: PlatformCaller,
-    Path(tenant_id): Path<DataTenantId>,
+    tenant_id: Result<Path<DataTenantId>, PathRejection>,
     Json(request): Json<SetTenantStatusRequest>,
 ) -> Result<(), WyrdErrorResponse> {
+    let Path(tenant_id) = tenant_id.map_err(|rejection| path_rejection(&rejection))?;
     // Only the two states an operator may assert are settable. `provisioning`
     // and `failed` describe what provisioning observed, and letting an operator
     // declare them would contradict the record.

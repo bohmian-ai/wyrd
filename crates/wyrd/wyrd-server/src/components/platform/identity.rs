@@ -11,6 +11,7 @@
 
 use axum::Extension;
 use axum::Json;
+use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use secrecy::{ExposeSecret, SecretString};
@@ -47,7 +48,7 @@ use crate::components::auth::PlatformCaller;
 use wyrd_sql::queries::platform::principal_grants::set_platform_grant_tx;
 
 use crate::boot::init::platform_administrator_grant;
-use crate::http::error::{WyrdErrorResponse, internal_failure};
+use crate::http::error::{WyrdErrorResponse, internal_failure, path_rejection};
 use crate::state::AppState;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
@@ -569,11 +570,12 @@ async fn list_platform_admins(
 #[utoipa::path(
     put,
     path = "/platform/admins/{principal_id}/status",
-    params(("principal_id" = String, Path, description = "Platform principal to change")),
+    params(("principal_id" = Uuid, Path, description = "Platform principal to change")),
     request_body = SetPlatformPrincipalStatusRequest,
     responses(
         (status = 204, description = "Status changed"),
-        (status = 400, description = "Status is neither active nor suspended (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 400, description = "A path identifier is not a valid UUID, or status is \
+          neither active nor suspended (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
         (status = 403, description = "Platform identity administration required \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
@@ -589,9 +591,10 @@ async fn list_platform_admins(
 async fn set_admin_status(
     State(state): State<AppState>,
     caller: PlatformCaller,
-    Path(principal_id): Path<Uuid>,
+    principal_id: Result<Path<Uuid>, PathRejection>,
     Json(request): Json<SetPlatformPrincipalStatusRequest>,
 ) -> Result<StatusCode, WyrdErrorResponse> {
+    let Path(principal_id) = principal_id.map_err(|rejection| path_rejection(&rejection))?;
     // A malformed status is refused before any permission is evaluated, so the
     // request never opens a decision it would then have to discard.
     if !matches!(request.status.as_str(), "active" | "suspended") {

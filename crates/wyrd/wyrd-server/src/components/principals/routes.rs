@@ -11,6 +11,7 @@
 //! touches the principal or its roles.
 
 use axum::Json;
+use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use chrono::Duration;
@@ -34,7 +35,7 @@ use wyrd_sql::queries::auth::{
 
 use crate::audit;
 use crate::components::auth::Caller;
-use crate::http::error::{WyrdErrorResponse, internal_failure};
+use crate::http::error::{WyrdErrorResponse, internal_failure, path_rejection};
 use crate::state::AppState;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
@@ -346,10 +347,12 @@ async fn create_service_principal(
 #[utoipa::path(
     post,
     path = "/principals/{principal_id}/credentials",
-    params(("principal_id" = String, Path, description = "Principal to issue for")),
+    params(("principal_id" = Uuid, Path, description = "Principal to issue for")),
     responses(
         (status = 200, description = "Credential issued, plaintext returned once",
          body = IssuedCredential),
+        (status = 400, description = "A path identifier is not a valid UUID \
+          (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
           WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
@@ -369,8 +372,9 @@ async fn create_service_principal(
 async fn issue_credential(
     State(state): State<AppState>,
     caller: Caller,
-    Path(principal_id): Path<Uuid>,
+    principal_id: Result<Path<Uuid>, PathRejection>,
 ) -> Result<Json<IssuedCredential>, WyrdErrorResponse> {
+    let Path(principal_id) = principal_id.map_err(|rejection| path_rejection(&rejection))?;
     let conn = authorize(
         &state,
         &caller,
@@ -393,10 +397,12 @@ async fn issue_credential(
 #[utoipa::path(
     get,
     path = "/principals/{principal_id}/credentials",
-    params(("principal_id" = String, Path, description = "Principal whose credentials to list")),
+    params(("principal_id" = Uuid, Path, description = "Principal whose credentials to list")),
     responses(
         (status = 200, description = "Non-secret credential metadata, newest first",
          body = CredentialListResponse),
+        (status = 400, description = "A path identifier is not a valid UUID \
+          (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
           WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
@@ -416,8 +422,9 @@ async fn issue_credential(
 async fn list_credentials(
     State(state): State<AppState>,
     caller: Caller,
-    Path(principal_id): Path<Uuid>,
+    principal_id: Result<Path<Uuid>, PathRejection>,
 ) -> Result<Json<CredentialListResponse>, WyrdErrorResponse> {
+    let Path(principal_id) = principal_id.map_err(|rejection| path_rejection(&rejection))?;
     list_credentials_for(&state, &caller, principal_id)
         .await
         .map(Json)
@@ -476,11 +483,13 @@ pub(crate) async fn list_credentials_for(
     delete,
     path = "/principals/{principal_id}/credentials/{credential_id}",
     params(
-        ("principal_id" = String, Path, description = "Principal that owns the credential"),
-        ("credential_id" = String, Path, description = "Credential to retire")
+        ("principal_id" = Uuid, Path, description = "Principal that owns the credential"),
+        ("credential_id" = Uuid, Path, description = "Credential to retire")
     ),
     responses(
         (status = 204, description = "Credential retired"),
+        (status = 400, description = "A path identifier is not a valid UUID \
+          (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
           WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
@@ -501,8 +510,10 @@ pub(crate) async fn list_credentials_for(
 async fn revoke_credential(
     State(state): State<AppState>,
     caller: Caller,
-    Path((principal_id, credential_id)): Path<(Uuid, Uuid)>,
+    ids: Result<Path<(Uuid, Uuid)>, PathRejection>,
 ) -> Result<StatusCode, WyrdErrorResponse> {
+    let Path((principal_id, credential_id)) =
+        ids.map_err(|rejection| path_rejection(&rejection))?;
     revoke_credential_for(&state, &caller, principal_id, credential_id)
         .await
         .map(|()| axum::http::StatusCode::NO_CONTENT)

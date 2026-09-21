@@ -1,6 +1,7 @@
 //! HTTP response mapping for Wyrd errors.
 
 use axum::body::Body;
+use axum::extract::rejection::PathRejection;
 use axum::http::{StatusCode, header::CONTENT_TYPE};
 use axum::response::{IntoResponse, Response};
 use std::fmt::Display;
@@ -75,6 +76,21 @@ pub fn internal_failure(message: &'static str, cause: &dyn Display) -> WyrdError
         message: message.to_owned(),
         details: serde_json::json!({}),
     }
+}
+
+/// Refuse a path identifier the route's typed extractor could not decode.
+///
+/// Handlers that take `Result<Path<T>, PathRejection>` pass the rejection here
+/// so a malformed identifier — which the published typed parameter already
+/// excludes — answers with the canonical `WYRD_SPEC_400_VALIDATION` problem
+/// instead of Axum's plain-text body. The rejection text names only the
+/// segment that failed to parse, never request state.
+#[must_use]
+pub fn path_rejection(rejection: &PathRejection) -> WyrdErrorResponse {
+    WyrdErrorResponse(WyrdError::Validation {
+        message: format!("path identifier is invalid: {}", rejection.body_text()),
+        details: serde_json::json!({ "location": "path" }),
+    })
 }
 
 /// Render a Wyrd error as an RFC 9457 problem+json response.

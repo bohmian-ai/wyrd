@@ -12,7 +12,10 @@ Reference for the `wyrd` binary. It has three command groups: `auth`, `eval`, an
 `principal`. The binary is built from the repo — see [Get started](/get-started/).
 
 Every server-facing command reads `--server` from `WYRD_SERVER_URL` when the flag
-is omitted. Admin commands read the bearer token from `WYRD_ACCESS_TOKEN`.
+is omitted. No command takes a secret as an argument: server-facing commands
+read their credential from the ambient chain (`WYRD_ACCESS_TOKEN`, workload
+identity, `WYRD_API_KEY`, or `~/.config/wyrd/credentials.toml`), so it never
+lands in shell history or the process table.
 
 ## wyrd auth
 
@@ -44,10 +47,11 @@ wyrd auth login --server https://acme.wyrd.cloud --issuer https://id.acme.com
 
 Rotate a human session's Wyrd refresh token and print the new access and
 refresh tokens. Only a `User` principal holds one; a machine renews by
-re-exchanging its API key instead.
+re-exchanging its API key instead. The refresh token is read only from
+`WYRD_REFRESH_TOKEN`.
 
 ```bash
-wyrd auth refresh --server https://acme.wyrd.cloud --refresh-token "$TOKEN"
+WYRD_REFRESH_TOKEN="$TOKEN" wyrd auth refresh --server https://acme.wyrd.cloud
 ```
 
 <DataTable
@@ -58,20 +62,19 @@ wyrd auth refresh --server https://acme.wyrd.cloud --refresh-token "$TOKEN"
     { header: 'Meaning' }
   ]}
   rows={[
-    ['--server', 'yes', 'WYRD_SERVER_URL', 'Wyrd server base URL.'],
-    ['--refresh-token', 'yes', 'WYRD_REFRESH_TOKEN', 'Refresh token to rotate.']
+    ['--server', 'yes', 'WYRD_SERVER_URL', 'Wyrd server base URL.']
   ]}
 />
 
 ### auth issue-key
 
 Issue an API key bound to a card ref (`POST /auth/issue-key`). Requires an admin
-access token.
+credential in the ambient chain.
 
 ```bash
 wyrd auth issue-key \
   --kind service --name checkout --version 1.0.0 --space prod \
-  --server https://acme.wyrd.cloud --token "$WYRD_ACCESS_TOKEN"
+  --server https://acme.wyrd.cloud
 ```
 
 <DataTable
@@ -88,8 +91,7 @@ wyrd auth issue-key \
     ['--space', 'yes', '—', 'Card space.'],
     ['--label', 'no', '—', 'Label stored with the key row.'],
     ['--expires-in-seconds', 'no', '—', 'TTL override in seconds.'],
-    ['--server', 'yes', 'WYRD_SERVER_URL', 'Wyrd server base URL.'],
-    ['--token', 'yes', 'WYRD_ACCESS_TOKEN', 'Bearer access token with admin privileges.']
+    ['--server', 'yes', 'WYRD_SERVER_URL', 'Wyrd server base URL.']
   ]}
 />
 
@@ -134,13 +136,13 @@ wyrd eval run --eval ./eval.yaml --records ./observations.jsonl
 ## wyrd principal revoke
 
 Suspend a principal so it can mint no new token; tokens it already holds lapse
-within five minutes. Requires an admin access token. The
+within five minutes. Requires an admin credential in the ambient chain. The
 principal ID is positional; `--kind` is required because IDs are unique only
 within a kind.
 
 ```bash
 wyrd principal revoke 3f9a...uuid --kind service --reason "key leaked" \
-  --server https://acme.wyrd.cloud --token "$WYRD_ACCESS_TOKEN"
+  --server https://acme.wyrd.cloud
 ```
 
 <DataTable
@@ -154,8 +156,7 @@ wyrd principal revoke 3f9a...uuid --kind service --reason "key leaked" \
     ['<id>', 'yes', '—', 'Principal ID (UUID) to revoke.'],
     ['--kind', 'yes', '—', 'Principal kind: user, service, or agent.'],
     ['--reason', 'yes', '—', 'Audit reason for the revocation.'],
-    ['--server', 'yes', 'WYRD_SERVER_URL', 'Wyrd server base URL.'],
-    ['--token', 'yes', 'WYRD_ACCESS_TOKEN', 'Bearer access token with admin privileges.']
+    ['--server', 'yes', 'WYRD_SERVER_URL', 'Wyrd server base URL.']
   ]}
 />
 

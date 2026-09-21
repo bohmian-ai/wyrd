@@ -268,19 +268,50 @@ pub async fn platform_identity_by_subject(
     issuer: &str,
     subject: &str,
 ) -> Result<Option<PlatformIdentityRow>, SqlError> {
-    sqlx::query_as::<_, PlatformIdentityRow>(
-        "SELECT principal_id, issuer, match_claim, subject
+    sqlx::query_as::<_, PlatformIdentityRow>(IDENTITY_BY_SUBJECT_SQL)
+        .bind(issuer)
+        .bind(subject)
+        .fetch_optional(pool.pool())
+        .await
+        .map_err(SqlError::from)
+}
+
+/// The one identity-by-subject read, shared by the pool and transaction entry
+/// points so a resolution that participates in a grant transaction cannot drift
+/// from one that does not.
+const IDENTITY_BY_SUBJECT_SQL: &str = "SELECT principal_id, issuer, match_claim, subject
          FROM platform.principal_identities
-         WHERE issuer = $1 AND subject = $2",
-    )
-    .bind(issuer)
-    .bind(subject)
-    .fetch_optional(pool.pool())
-    .await
-    .map_err(SqlError::from)
+         WHERE issuer = $1 AND subject = $2";
+
+/// Resolve a platform principal from a pinned subject inside an open operator
+/// transaction.
+///
+/// The federated grant resolves, pins, issues, audits, and commits as one
+/// boundary, so the read has to be on that transaction: a pool read could
+/// observe an identity the grant's own transaction later cannot.
+///
+/// # Errors
+/// Returns [`SqlError::Query`] when the read fails.
+pub async fn platform_identity_by_subject_tx(
+    conn: &mut TenantConn<'_>,
+    issuer: &str,
+    subject: &str,
+) -> Result<Option<PlatformIdentityRow>, SqlError> {
+    sqlx::query_as::<_, PlatformIdentityRow>(IDENTITY_BY_SUBJECT_SQL)
+        .bind(issuer)
+        .bind(subject)
+        .fetch_optional(&mut **conn.transaction())
+        .await
+        .map_err(SqlError::from)
 }
 
 /// Pin a subject onto an unpinned pre-registration, matching on the claim.
+///
+/// Runs on the caller's transaction, not the pool, because pinning is permanent
+/// and one-way: autocommitting it before the grant that audits it would leave
+/// durable, unattributed identity state behind whenever the grant then failed.
+/// The caller commits the pin, the session, and its audit row together or none
+/// of them.
 ///
 /// The `subject IS NULL` predicate is the whole safety property: it makes
 /// pinning a one-time transition that a second login cannot repeat and cannot
@@ -291,7 +322,7 @@ pub async fn platform_identity_by_subject(
 /// Returns [`SqlError::UniqueViolation`] when the subject is already pinned to
 /// a different principal, and [`SqlError::Query`] when the update fails.
 pub async fn pin_platform_identity(
-    pool: &OperatorPool,
+    conn: &mut TenantConn<'_>,
     issuer: &str,
     match_claim: &str,
     subject: &str,
@@ -305,7 +336,7 @@ pub async fn pin_platform_identity(
     .bind(issuer)
     .bind(match_claim)
     .bind(subject)
-    .fetch_optional(pool.pool())
+    .fetch_optional(&mut **conn.transaction())
     .await
     .map_err(SqlError::from)
 }

@@ -105,14 +105,15 @@ mod pg_tests {
     /// usable survivor pins one here.
     async fn register_pinned(fixture: &PgFixture, name: &str, claim: &str) -> Uuid {
         let id = register(fixture, name, claim).await;
-        pin_platform_identity(
-            fixture.operator_pool(),
-            ISSUER,
-            claim,
-            &format!("subject-{name}"),
-        )
-        .await
-        .expect("pin succeeds");
+        let mut conn = fixture
+            .operator_pool()
+            .begin_platform_audited()
+            .await
+            .expect("transaction opens");
+        pin_platform_identity(&mut conn, ISSUER, claim, &format!("subject-{name}"))
+            .await
+            .expect("pin succeeds");
+        conn.commit().await.expect("pin commits");
         id
     }
 
@@ -279,7 +280,11 @@ mod pg_tests {
         let pool = fixture.operator_pool();
         let principal = register(&fixture, "ops-lead", "ops@example.com").await;
 
-        let pinned = pin_platform_identity(pool, ISSUER, "ops@example.com", "subject-alice")
+        let mut conn = pool
+            .begin_platform_audited()
+            .await
+            .expect("transaction opens");
+        let pinned = pin_platform_identity(&mut conn, ISSUER, "ops@example.com", "subject-alice")
             .await
             .expect("pin succeeds")
             .expect("the registration matched");
@@ -288,12 +293,13 @@ mod pg_tests {
         // A different subject presenting the same claim later gets nothing:
         // the registration is no longer unpinned.
         assert!(
-            pin_platform_identity(pool, ISSUER, "ops@example.com", "subject-mallory")
+            pin_platform_identity(&mut conn, ISSUER, "ops@example.com", "subject-mallory")
                 .await
                 .expect("pin succeeds")
                 .is_none(),
             "a second subject cannot capture an already-pinned principal"
         );
+        conn.commit().await.expect("pin commits");
 
         // And the original subject still resolves to the same principal.
         let resolved = platform_identity_by_subject(pool, ISSUER, "subject-alice")
@@ -566,9 +572,14 @@ mod pg_tests {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let pool = fixture.operator_pool();
         let principal = register(&fixture, "ops-lead", "ops@example.com").await;
-        pin_platform_identity(pool, ISSUER, "ops@example.com", "subject-alice")
+        let mut conn = pool
+            .begin_platform_audited()
+            .await
+            .expect("transaction opens");
+        pin_platform_identity(&mut conn, ISSUER, "ops@example.com", "subject-alice")
             .await
             .expect("pin succeeds");
+        conn.commit().await.expect("pin commits");
         set_status(&fixture, principal, "suspended").await;
 
         let listed = list_platform_principals(pool).await.expect("listing reads");

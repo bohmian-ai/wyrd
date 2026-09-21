@@ -20,6 +20,9 @@ use wyrd_auth_verify::{PLATFORM_TOKEN_SCOPE, PlatformAccessTokenClaims};
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
 use wyrd_sql::queries::platform::credentials::platform_credential_by_id;
+use wyrd_sql::queries::platform::identity::{
+    pin_platform_identity, platform_identity_by_subject_tx,
+};
 use wyrd_sql::queries::platform::principals::{
     platform_principal_by_id, platform_principal_by_id_tx,
 };
@@ -166,6 +169,7 @@ impl PlatformSessions {
         self.record_grant(
             &mut conn,
             authenticated.principal_id,
+            authenticated.principal_kind,
             Some(authenticated.credential_id),
             request_id,
         )
@@ -179,25 +183,57 @@ impl PlatformSessions {
         })
     }
 
-    /// Mint a platform session for an identity that federated login accepted.
+    /// Mint a platform session for an identity federated login just verified.
     ///
-    /// No credential is involved: the caller has already established *who* this
-    /// is by verifying a provider token and resolving it to a pre-registered
-    /// principal. The principal is re-read here so a suspended administrator
-    /// cannot obtain a session even with a valid provider token, which keeps
-    /// "authority is read from the store, not the token" true on this path too.
+    /// Owns the whole grant boundary: resolving the pinned subject, pinning a
+    /// pre-registration on its first login, re-reading the principal, minting
+    /// the token, and appending the canonical record all run on one audited
+    /// transaction. Pinning is permanent and one-way, so committing it ahead of
+    /// the grant would leave durable identity state that nothing audited and
+    /// nobody granted whenever the append or the signing then failed. The
+    /// caller passes only what it verified — the issuer it checked the token
+    /// against, the subject the token asserted, and the verified claim to match
+    /// a first login on — and gets a token or nothing.
+    ///
+    /// No credential is involved: the provider token established who this is.
+    /// The principal is re-read here so a suspended administrator cannot obtain
+    /// a session even with a valid provider token, which keeps "authority is
+    /// read from the store, not the token" true on this path too.
+    ///
+    /// `match_claim` is `None` when the provider asserted no claim this
+    /// deployment will pin on, which can only refuse a first login.
     ///
     /// # Errors
-    /// Returns [`PlatformSessionError::Invalid`] when the principal is unknown
-    /// or not active, [`PlatformSessionError::Key`] when signing fails, and
-    /// [`PlatformSessionError::Store`] when the principal cannot be read.
+    /// Returns [`PlatformSessionError::Invalid`] when no registration matches
+    /// the subject or claim, when another login pinned it first, or when the
+    /// resolved principal is not active, [`PlatformSessionError::Key`] when
+    /// signing fails, and [`PlatformSessionError::Store`] when the store fails.
     #[tracing::instrument(level = "debug", skip(self), err)]
     pub async fn issue_federated(
         &self,
-        principal_id: Uuid,
+        issuer: &str,
+        subject: &str,
+        match_claim: Option<&str>,
         request_id: &str,
     ) -> Result<SecretString, PlatformSessionError> {
         let mut conn = self.pool.begin_platform_audited().await?;
+        let principal_id = match platform_identity_by_subject_tx(&mut conn, issuer, subject).await?
+        {
+            Some(identity) => identity.principal_id,
+            None => {
+                // First login: match the pre-registered claim and pin the
+                // subject. The store's `subject IS NULL` predicate makes this a
+                // one-time transition, so a concurrent second login pins
+                // nothing and is refused rather than racing.
+                let Some(claim) = match_claim else {
+                    return Err(PlatformSessionError::Invalid);
+                };
+                pin_platform_identity(&mut conn, issuer, claim, subject)
+                    .await?
+                    .ok_or(PlatformSessionError::Invalid)?
+            }
+        };
+
         let Some(principal) = platform_principal_by_id_tx(&mut conn, principal_id).await? else {
             return Err(PlatformSessionError::Invalid);
         };
@@ -209,10 +245,17 @@ impl PlatformSessions {
             .issuing_key
             .issue_platform_access_token(PrincipalId::new(principal_id), None, self.ttl)
             .map_err(|error| PlatformSessionError::Key(error.to_string()))?;
-        // A federated grant names the principal the provider resolved to and no
-        // credential, because none was presented.
-        self.record_grant(&mut conn, PrincipalId::new(principal_id), None, request_id)
-            .await?;
+        // A federated grant names the principal the provider resolved to, the
+        // kind the directory stores for it, and no credential, because none was
+        // presented.
+        self.record_grant(
+            &mut conn,
+            PrincipalId::new(principal_id),
+            principal_kind_tag(&principal.principal_kind),
+            None,
+            request_id,
+        )
+        .await?;
         conn.commit().await?;
         Ok(SecretString::from(token))
     }
@@ -226,6 +269,12 @@ impl PlatformSessions {
     /// an append failure drops the transaction, so no grant-side effect
     /// survives and no token is returned.
     ///
+    /// `principal_kind` is the kind the directory stores for this principal,
+    /// read on the grant's own transaction rather than assumed: a federated
+    /// human is registered as a `user`, and recording every platform grant as
+    /// the deployment root would make retained history attribute an operator's
+    /// sign-in to the machine identity.
+    ///
     /// `credential_id` names the credential spent, and is absent for a
     /// federated session where the identity is the whole story.
     ///
@@ -235,6 +284,7 @@ impl PlatformSessions {
         &self,
         conn: &mut TenantConn<'_>,
         principal_id: PrincipalId,
+        principal_kind: PrincipalKindTag,
         credential_id: Option<Uuid>,
         request_id: &str,
     ) -> Result<(), PlatformSessionError> {
@@ -243,7 +293,7 @@ impl PlatformSessions {
             request_id,
             TOKEN_EXCHANGE_OPERATION,
             principal_id,
-            PrincipalKindTag::GlobalAdmin,
+            principal_kind,
             None,
             AuditOutcome::Allowed,
             AuditDetail::TokenExchange {
@@ -367,18 +417,22 @@ mod pg_tests {
 
     use std::sync::Arc;
 
-    use secrecy::SecretString;
+    use secrecy::{ExposeSecret, SecretString};
     use uuid::Uuid;
     use wyrd_auth_issue::IssuingKey;
     use wyrd_auth_verify::Kid;
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::PrincipalKindTag;
+    use wyrd_sql::queries::platform::identity::insert_platform_identity_tx;
     use wyrd_sql::queries::platform::principals::insert_platform_principal;
 
     use super::{PlatformSessionError, PlatformSessions};
     use crate::audit::TOKEN_EXCHANGE_OPERATION;
     use crate::platform_credentials::issue_platform_credential;
+
+    /// The issuer these tests register federated identities against.
+    const TEST_ISSUER: &str = "https://issuer.test";
 
     /// A throwaway Ed25519 key these tests mint and verify platform sessions
     /// with, so no test depends on deployment key material.
@@ -424,16 +478,54 @@ mod pg_tests {
         issued.credential.secret
     }
 
-    /// Read the grant records staged for `principal` and the credential each
-    /// one names.
+    /// Seed an inactive-free platform principal of `kind` plus an unpinned
+    /// federated pre-registration, as the administrative registration route
+    /// does, and return its id.
     ///
-    /// Staging is written by the platform transaction and read back here as
-    /// the superuser, because `wyrd_platform_admin` is granted append-only access to
+    /// A federated administrator is registered as a `user`: the deployment root
+    /// kind belongs to the machine identity that bootstrapped the platform, not
+    /// to a human who signs in through a provider.
+    async fn seed_registered_human(fixture: &PgFixture, name: &str, claim: &str) -> Uuid {
+        let id = Uuid::now_v7();
+        insert_platform_principal(fixture.operator_pool(), id, PrincipalKindTag::User, name)
+            .await
+            .expect("platform principal inserts");
+        let mut conn = fixture
+            .operator_pool()
+            .begin_platform_audited()
+            .await
+            .expect("transaction opens");
+        insert_platform_identity_tx(&mut conn, id, TEST_ISSUER, claim)
+            .await
+            .expect("pre-registration inserts");
+        conn.commit().await.expect("pre-registration commits");
+        id
+    }
+
+    /// Read the subject pinned onto `principal`'s pre-registration, if any.
+    async fn pinned_subject(fixture: &PgFixture, principal: Uuid) -> Option<String> {
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT subject FROM platform.principal_identities WHERE principal_id = $1",
+        )
+        .bind(principal)
+        .fetch_one(fixture.operator_pool().pool())
+        .await
+        .expect("pre-registration reads")
+    }
+
+    /// Read the grant records staged for `principal` and the kind and
+    /// credential each one names.
+    ///
+    /// Staging is written by the platform transaction and read back here as the
+    /// superuser, because `wyrd_platform_admin` is granted append-only access to
     /// `vala.audit_staging` and cannot select from it.
-    async fn staged_grants(fixture: &PgFixture, principal: Uuid) -> Vec<Option<Uuid>> {
+    async fn staged_grant_attribution(
+        fixture: &PgFixture,
+        principal: Uuid,
+    ) -> Vec<(String, Option<Uuid>)> {
         let admin = fixture.superuser_pool().await.expect("superuser pool");
-        sqlx::query_as::<_, (Option<Uuid>,)>(
-            "SELECT credential_id FROM vala.audit_staging
+        sqlx::query_as::<_, (String, Option<Uuid>)>(
+            "SELECT principal_kind, credential_id FROM vala.audit_staging
               WHERE data_tenant_id = $1 AND operation = $2 AND principal_id = $3",
         )
         .bind(DataTenantId::SYSTEM_OWNER.as_uuid())
@@ -442,16 +534,14 @@ mod pg_tests {
         .fetch_all(&admin)
         .await
         .expect("grant record query runs")
-        .into_iter()
-        .map(|(credential,)| credential)
-        .collect()
     }
 
-    /// Spending a credential commits one grant record naming that credential.
+    /// Spending a credential commits one grant record naming that credential
+    /// and the kind the directory stores for its owner.
     ///
     /// # Panics
     /// Panics when the exchange fails or the record is missing, duplicated, or
-    /// unattributed.
+    /// misattributed.
     #[tokio::test]
     async fn a_credential_exchange_commits_one_attributed_grant() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -463,38 +553,88 @@ mod pg_tests {
             .await
             .expect("the credential exchanges");
 
-        let grants = staged_grants(&fixture, principal).await;
+        let grants = staged_grant_attribution(&fixture, principal).await;
         assert_eq!(grants.len(), 1, "exactly one grant record is committed");
         assert_eq!(
             grants[0],
-            Some(session.credential_id),
-            "the grant names the credential that was spent"
+            ("global_admin".to_owned(), Some(session.credential_id)),
+            "the grant names the stored kind and the credential that was spent"
         );
     }
 
-    /// Federated issuance commits one grant record naming no credential.
+    /// A first federated login pins, grants, and audits as one boundary, or
+    /// leaves nothing behind.
     ///
-    /// The identity is the whole story on this path, so naming a credential
-    /// would record one that was never presented.
+    /// Pinning a subject is permanent and one-way, so a pin that outlived a
+    /// failed grant would be durable identity state nothing audited and nobody
+    /// was granted — and the human it silently claimed could never be
+    /// re-registered. The grant also has to record the kind the directory
+    /// stores: a federated human is a `user`, and attributing their sign-in to
+    /// the deployment root would make retained history name the wrong identity.
     ///
     /// # Panics
-    /// Panics when issuance fails or the record is missing, duplicated, or
-    /// falsely attributed.
+    /// Panics when the failed attempt leaves a pin or a token, when the retry
+    /// does not produce exactly one pin and one grant, or when that grant is
+    /// misattributed.
     #[tokio::test]
-    async fn federated_issuance_commits_one_grant_naming_no_credential() {
+    async fn a_first_federated_login_pins_grants_and_audits_atomically() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let principal = seed_principal(&fixture, "federated-audited").await;
+        let principal =
+            seed_registered_human(&fixture, "federated-human", "admin@example.test").await;
+        let sessions = PlatformSessions::new(fixture.operator_pool().clone(), issuing_key());
 
-        PlatformSessions::new(fixture.operator_pool().clone(), issuing_key())
-            .issue_federated(principal, "req-platform-federated")
+        let admin = fixture.superuser_pool().await.expect("superuser pool");
+        sqlx::query("REVOKE INSERT ON vala.audit_staging FROM wyrd_platform_admin")
+            .execute(&admin)
             .await
-            .expect("the registered administrator is issued a session");
+            .expect("append privilege revoked");
 
-        let grants = staged_grants(&fixture, principal).await;
+        let refused = sessions
+            .issue_federated(
+                TEST_ISSUER,
+                "subject-1",
+                Some("admin@example.test"),
+                "req-platform-unauditable",
+            )
+            .await;
+
+        sqlx::query("GRANT INSERT ON vala.audit_staging TO wyrd_platform_admin")
+            .execute(&admin)
+            .await
+            .expect("append privilege restored");
+
+        assert!(
+            matches!(refused, Err(PlatformSessionError::Store(_))),
+            "an unauditable grant is a store failure, not a rejected identity: {refused:?}"
+        );
+        assert_eq!(
+            pinned_subject(&fixture, principal).await,
+            None,
+            "a failed grant leaves the pre-registration unpinned"
+        );
+
+        let token = sessions
+            .issue_federated(
+                TEST_ISSUER,
+                "subject-1",
+                Some("admin@example.test"),
+                "req-platform-federated",
+            )
+            .await
+            .expect("the retry is granted a session");
+        assert!(!token.expose_secret().is_empty());
+
+        assert_eq!(
+            pinned_subject(&fixture, principal).await.as_deref(),
+            Some("subject-1"),
+            "the retry pins the subject exactly once"
+        );
+        let grants = staged_grant_attribution(&fixture, principal).await;
         assert_eq!(grants.len(), 1, "exactly one grant record is committed");
         assert_eq!(
-            grants[0], None,
-            "a federated grant names no credential because none was presented"
+            grants[0],
+            ("user".to_owned(), None),
+            "the grant names the stored kind and no credential, because none was presented"
         );
     }
 
@@ -534,7 +674,9 @@ mod pg_tests {
             "an unrecordable grant is refused as a store failure, got: {result:?}"
         );
         assert!(
-            staged_grants(&fixture, principal).await.is_empty(),
+            staged_grant_attribution(&fixture, principal)
+                .await
+                .is_empty(),
             "no grant record survives the refusal"
         );
         let touched: Option<Option<chrono::DateTime<chrono::Utc>>> = sqlx::query_scalar(

@@ -27,17 +27,16 @@ use wyrd_crypt::SecretKey;
 use wyrd_spec::auth::LoginInitResponse;
 use wyrd_spec::error::WyrdError;
 use wyrd_sql::queries::platform::identity::{
-    PlatformOidcConnectionRow, insert_platform_login_state, pin_platform_identity,
-    platform_identity_by_subject, platform_oidc_connection, take_platform_login_state,
+    PlatformOidcConnectionRow, insert_platform_login_state, platform_oidc_connection,
+    take_platform_login_state,
 };
-use wyrd_sql::queries::platform::principals::platform_principal_by_id;
 use wyrd_sql::{OperatorPool, SqlError};
 
 use crate::error::auth_error_to_wyrd;
 use crate::login::{auth_nonce, auth_state_key, build_authorization_url, pkce_verifier};
 use crate::permission_resolver::SqlPermissionResolver;
 use crate::pg_resolvers::{PgIssuerResolver, platform_connection_from_row};
-use crate::platform_sessions::PlatformSessions;
+use crate::platform_sessions::{PlatformSessionError, PlatformSessions};
 
 /// How long a started platform login may take to complete.
 ///
@@ -255,63 +254,32 @@ impl PlatformLogin {
             })?;
         verify_nonce(&login_state.nonce, &claims)?;
 
-        let principal_id = self.resolve_principal(&connection, &claims).await?;
-        let token = self
-            .sessions
-            .issue_federated(principal_id, request_id)
+        // Everything after this point is the grant, and the grant is one
+        // transaction the sessions owner holds: resolving or pinning the
+        // identity, re-reading the principal, minting, and auditing commit
+        // together or not at all. This owner hands over only what it verified.
+        //
+        // The claim must be a *verified* email. An unverified one is a string
+        // the subject chose, and pinning on it would let anyone at this issuer
+        // who can set their email to the pre-registered address capture that
+        // principal — permanently, since pinning is one-way. A provider that
+        // does not assert `email_verified` cannot be used to establish a
+        // platform administrator at all, which is the right outcome rather than
+        // a weaker match.
+        let match_claim = verified_email(&claims);
+        self.sessions
+            .issue_federated(
+                connection.verification.issuer.as_str(),
+                &claims.subject,
+                match_claim.as_deref(),
+                request_id,
+            )
             .await
-            .map_err(|error| PlatformLoginError::Session(error.to_string()))?;
-        Ok(token)
-    }
-
-    /// Resolve a verified subject to an active platform principal.
-    ///
-    /// Tries the durable pin first, so an administrator who changes the claim
-    /// they were registered under keeps their identity, and someone who later
-    /// acquires that claim value does not inherit it. Only an unpinned
-    /// registration falls back to the claim, and only once.
-    ///
-    /// # Errors
-    /// Returns [`PlatformLoginError::NotAccepted`] when no registration matches
-    /// or the resolved principal is not active, and
-    /// [`PlatformLoginError::Store`] when a read or the pin fails.
-    async fn resolve_principal(
-        &self,
-        connection: &PlatformConnection,
-        claims: &ExternalClaims,
-    ) -> Result<uuid::Uuid, PlatformLoginError> {
-        let issuer = connection.verification.issuer.as_str();
-        let pinned = platform_identity_by_subject(&self.pool, issuer, &claims.subject).await?;
-        let principal_id = if let Some(identity) = pinned {
-            identity.principal_id
-        } else {
-            // First login: match the pre-registered claim and pin the subject.
-            // The store's `subject IS NULL` predicate makes this a one-time
-            // transition, so a concurrent second login pins nothing and is
-            // refused rather than racing.
-            //
-            // The claim must be a *verified* email. An unverified one is a
-            // string the subject chose, and pinning on it would let anyone at
-            // this issuer who can set their email to the pre-registered address
-            // capture that principal — permanently, since pinning is one-way.
-            // A provider that does not assert `email_verified` cannot be used
-            // to establish a platform administrator at all, which is the right
-            // outcome rather than a weaker match.
-            let Some(claim) = verified_email(claims) else {
-                return Err(PlatformLoginError::NotAccepted);
-            };
-            pin_platform_identity(&self.pool, issuer, &claim, &claims.subject)
-                .await?
-                .ok_or(PlatformLoginError::NotAccepted)?
-        };
-
-        let principal = platform_principal_by_id(&self.pool, principal_id)
-            .await?
-            .ok_or(PlatformLoginError::NotAccepted)?;
-        if !principal.is_active() {
-            return Err(PlatformLoginError::NotAccepted);
-        }
-        Ok(principal_id)
+            .map_err(|error| match error {
+                PlatformSessionError::Invalid => PlatformLoginError::NotAccepted,
+                PlatformSessionError::Store(error) => PlatformLoginError::Store(error),
+                PlatformSessionError::Key(message) => PlatformLoginError::Session(message),
+            })
     }
 }
 

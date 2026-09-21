@@ -2231,18 +2231,37 @@ impl WyrdTestServer {
     /// journey can exercise what that administrator may then do without a live
     /// identity provider in the lane.
     ///
+    /// The principal's own pre-registration supplies the issuer and claim, and
+    /// the subject the provider would have asserted is derived from the
+    /// principal id, so the first call exercises the real pin and every later
+    /// one resolves it.
+    ///
     /// # Errors
-    /// Returns an error when the principal is unknown or not active, or when
-    /// the session cannot be signed.
+    /// Returns an error when the principal has no registration, is unknown or
+    /// not active, or when the session cannot be signed.
     pub async fn federated_platform_session(
         &self,
         principal_id: uuid::Uuid,
     ) -> Result<secrecy::SecretString, WyrdTestServerError> {
+        let (issuer, match_claim): (String, String) = sqlx::query_as(
+            "SELECT issuer, match_claim FROM platform.principal_identities
+              WHERE principal_id = $1",
+        )
+        .bind(principal_id)
+        .fetch_one(self.operator_pool().pool())
+        .await
+        .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?;
+
         wyrd_auth::platform_sessions::PlatformSessions::new(
             self.operator_pool(),
             std::sync::Arc::clone(&self.inner.issuing_key),
         )
-        .issue_federated(principal_id, "test-platform-session")
+        .issue_federated(
+            &issuer,
+            &format!("subject-{principal_id}"),
+            Some(&match_claim),
+            "test-platform-session",
+        )
         .await
         .map_err(|error| WyrdTestServerError::Auth(error.to_string()))
     }

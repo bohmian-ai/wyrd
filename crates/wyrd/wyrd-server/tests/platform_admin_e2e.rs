@@ -4269,14 +4269,19 @@ async fn a_trailing_slash_platform_issuer_completes_first_login() {
 
     // First login: the real one-time pin, against the registration that was
     // just written. `None` here is the defect this test exists for.
+    let mut conn = pool
+        .begin_platform_audited()
+        .await
+        .expect("the grant transaction opens");
     let pinned = wyrd_sql::queries::platform::identity::pin_platform_identity(
-        &pool,
+        &mut conn,
         searched,
         "ops@example.com",
         "provider-subject-1",
     )
     .await
     .expect("the pin runs");
+    conn.commit().await.expect("the pin commits");
     assert_eq!(
         pinned.map(|id| id.to_string()).as_deref(),
         registered["principal_id"].as_str(),

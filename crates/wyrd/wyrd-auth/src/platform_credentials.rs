@@ -13,12 +13,13 @@ use chrono::{DateTime, Utc};
 use secrecy::{ExposeSecret, SecretString};
 use uuid::Uuid;
 use wyrd_auth_issue::{IssueError, hash_api_key};
-use wyrd_spec::auth::PrincipalId;
+use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_sql::queries::platform::credentials::{
     insert_platform_credential_tx, platform_credential_by_prefix_tx, touch_platform_credential_tx,
 };
 use wyrd_sql::{SqlError, TenantConn};
 
+use crate::audit::principal_kind_tag;
 use crate::credential_verify::verify_presented;
 
 /// Prefix identifying a platform-scope credential on sight.
@@ -80,6 +81,10 @@ impl PlatformCredential {
 pub struct AuthenticatedPlatformCredential {
     /// Principal the credential authenticates.
     pub principal_id: PrincipalId,
+    /// The kind the directory stores for that principal, read alongside the
+    /// credential so the grant records what the session acts as rather than
+    /// assuming every platform credential belongs to the deployment root.
+    pub principal_kind: PrincipalKindTag,
     /// The credential itself, so a session can be bound to it.
     pub credential_id: Uuid,
 }
@@ -197,6 +202,7 @@ pub async fn authenticate_for_session(
     touch_platform_credential_tx(conn, row.id).await?;
     Ok(AuthenticatedPlatformCredential {
         principal_id: PrincipalId::new(row.principal_id),
+        principal_kind: principal_kind_tag(&row.principal_kind),
         credential_id: row.id,
     })
 }

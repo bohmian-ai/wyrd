@@ -105,11 +105,10 @@ fn catalog_status(code: &str) -> Option<u16> {
 
 /// The served document describes the routes the server mounts.
 ///
-/// Routing and documentation now come out of one `utoipa-axum` registration, so
-/// a served method that is undocumented is not something a test has to look for
-/// — it cannot be written. What is still worth pinning is that the composition
-/// actually ran: that the nesting prefix reached the operations and that the
-/// surfaces mounted on both planes are present.
+/// Routing and documentation come out of one `utoipa-axum` registration for
+/// every route registered through `routes!`. What is pinned here is that the
+/// composition actually ran: that the nesting prefix reached the operations and
+/// that the surfaces mounted on both planes are present.
 #[tokio::test]
 async fn the_served_document_describes_the_composed_surface() {
     let server = WyrdTestServer::start_in_process()
@@ -142,6 +141,97 @@ async fn the_served_document_describes_the_composed_surface() {
     assert!(
         !paths.contains_key("/mcp"),
         "the MCP endpoint speaks its own protocol and is not an OpenAPI operation"
+    );
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// The local backend's byte-transfer operations are public Wyrd operations and
+/// are published with their real contract.
+///
+/// Upload initialization and download initialization hand these URLs out and
+/// the shared client dispatches to them, so an independent client needs their
+/// method, typed locator, binary body, authentication, and stable refusals from
+/// the same document as every other operation. The in-process test server runs
+/// the local backend, so both are mounted here.
+#[tokio::test]
+async fn local_transfer_operations_publish_their_binary_contract() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let problem_ref = "#/components/schemas/WyrdProblem";
+    let octets = "application/octet-stream";
+
+    let upload = &document["paths"]["/v1/cards/upload/local/{id}"]["put"];
+    assert!(upload.is_object(), "the local upload is a documented PUT");
+    let id = upload["parameters"]
+        .as_array()
+        .and_then(|params| params.iter().find(|param| param["name"] == "id"))
+        .expect("the upload names its identifier");
+    assert_eq!(id["in"], "path");
+    assert_eq!(id["required"], true);
+    assert_eq!(
+        id["schema"]["$ref"], "#/components/schemas/UploadId",
+        "the upload locator is the typed upload identifier"
+    );
+    assert!(
+        upload["requestBody"]["content"][octets].is_object(),
+        "the upload body is raw bytes: {}",
+        upload["requestBody"]
+    );
+    assert_eq!(
+        upload["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/LocalBlobUploadResponse"
+    );
+
+    let download = &document["paths"]["/v1/cards/download/local"]["get"];
+    assert!(
+        download.is_object(),
+        "the local download is a documented GET"
+    );
+    let path = download["parameters"]
+        .as_array()
+        .and_then(|params| params.iter().find(|param| param["name"] == "path"))
+        .expect("the download names its object");
+    assert_eq!(
+        path["in"], "query",
+        "a slash-bearing object path is one query value"
+    );
+    assert_eq!(path["required"], true);
+    assert!(
+        download["responses"]["200"]["content"][octets].is_object(),
+        "the download answers with raw bytes: {}",
+        download["responses"]["200"]
+    );
+
+    for (operation, specific) in [
+        (upload, ["400", "404", "409"].as_slice()),
+        (download, &["400", "404"]),
+    ] {
+        assert!(
+            operation.get("security").is_none(),
+            "a local transfer inherits the document's authentication requirement"
+        );
+        for status in ["401", "403", "500", "503"].iter().chain(specific) {
+            let response = &operation["responses"][*status];
+            assert_eq!(
+                response["content"][PROBLEM_MEDIA_TYPE]["schema"]["$ref"], problem_ref,
+                "{status} is published as WyrdProblem problem+json"
+            );
+            assert!(
+                !stable_codes(response["description"].as_str().unwrap_or_default()).is_empty(),
+                "{status} names its stable codes"
+            );
+        }
+    }
+    assert!(
+        document["paths"]
+            .as_object()
+            .expect("paths object")
+            .keys()
+            .all(|key| !key.contains('*')),
+        "no wildcard route template reaches the document"
     );
 
     server.shutdown().await.expect("server shuts down");

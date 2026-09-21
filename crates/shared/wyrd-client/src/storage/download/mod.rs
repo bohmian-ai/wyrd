@@ -31,7 +31,7 @@ pub(crate) async fn dispatch(
     plan: &DownloadPlan,
     dest: &Path,
 ) -> Result<DownloadOutcome, StorageClientError> {
-    if plan.get_url.contains("/v1/cards/download/local/") {
+    if plan.get_url.contains("/v1/cards/download/local?") {
         local_fs::download(client, plan, dest).await
     } else {
         single_get::download(client, plan, dest).await
@@ -71,7 +71,7 @@ pub(crate) async fn dispatch_verified(
         expected_sha256,
         expected_size_bytes,
     };
-    if plan.get_url.contains("/v1/cards/download/local/") {
+    if plan.get_url.contains("/v1/cards/download/local?") {
         local_fs::download_verified(client, plan, dest, verification, &progress).await
     } else {
         single_get::download_verified(client, plan, dest, verification, &progress).await

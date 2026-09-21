@@ -258,7 +258,10 @@ async fn run_client_server_journey(settings: StorageSettings, relative_path: &st
     let plan = if relative_path.starts_with("local/") {
         let base_url = srv.base_url().expect("bound server exposes base URL");
         DownloadPlan {
-            get_url: format!("{base_url}/v1/cards/download/local/{}", init.storage_path),
+            get_url: format!(
+                "{base_url}/v1/cards/download/local?path={}",
+                init.storage_path
+            ),
             ttl_secs: 0,
         }
     } else {
@@ -426,8 +429,8 @@ async fn local_upload_capability_rejects_raw_paths_and_bad_bytes() {
         .expect_err("raw storage paths are not upload capabilities");
     assert_eq!(
         error.code(),
-        "WYRD_STORAGE_400_INVALID_UPLOAD_ID",
-        "raw path rejection returned {error:?}"
+        "WYRD_SPEC_404_NOT_FOUND",
+        "a nested storage path matches no upload operation: {error:?}"
     );
 
     let error = client

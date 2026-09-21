@@ -158,11 +158,12 @@ mise run codegen:regen   # regenerate everything from source
 ```
 
 The OpenAPI document is served at runtime from `GET /openapi.json` and is not
-part of that snapshot; prove an OpenAPI change with the focused server contract
-tests instead:
+part of that snapshot; prove an OpenAPI change against the served document
+with the assembled-server contract suite
+(`crates/wyrd/wyrd-server/tests/pg_openapi_contract.rs`) instead:
 
 ```bash
-mise exec -- cargo test --locked -p wyrd-server --lib http::openapi
+mise run test:principals:integration
 ```
 
 Runtime MCP catalogs are verified through their owning MCP tests, not through

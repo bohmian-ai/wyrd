@@ -7,6 +7,7 @@ use base64::Engine;
 use sha2::{Digest, Sha256};
 use sqlx::types::Uuid;
 use tracing::instrument;
+use url::Url;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::error::storage::WyrdStorageError;
@@ -716,6 +717,15 @@ async fn download_url(
         .map_err(map_storage_error)
 }
 
+/// Mint the local backend's download URL for one validated object.
+///
+/// The stored path carries slashes, so it is carried as the percent-encoded
+/// `path` query value of the documented `GET /v1/cards/download/local`
+/// operation rather than as a path tail the OpenAPI document cannot express.
+///
+/// # Errors
+/// Returns an internal error when no public base URL is bound or it cannot
+/// form a URL.
 fn local_download_url(
     storage: &StorageHandle,
     validated: &ValidatedPath,
@@ -727,7 +737,14 @@ fn local_download_url(
         )
     })?;
     let base = normalize_base_url(base);
-    Ok(format!("{base}/v1/cards/download/local/{}", validated.full))
+    let mut url = Url::parse(&format!("{base}/v1/cards/download/local")).map_err(|error| {
+        internal_error(
+            "local storage public base URL cannot form a download URL",
+            serde_json::json!({ "source": error.to_string() }),
+        )
+    })?;
+    url.query_pairs_mut().append_pair("path", &validated.full);
+    Ok(url.into())
 }
 
 async fn open_local_blob(
@@ -1546,8 +1563,8 @@ mod tests {
         assert_eq!(
             url,
             format!(
-                "https://wyrd.test/v1/cards/download/local/{}",
-                validated.full
+                "https://wyrd.test/v1/cards/download/local?path={}",
+                validated.full.replace('/', "%2F")
             )
         );
     }

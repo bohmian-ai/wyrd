@@ -76,9 +76,9 @@ stable and fail on drift:
 
 The OpenAPI document is not a generated artifact: `utoipa` builds it from the
 server's handlers and the server serves it at `GET /openapi.json`, so OpenAPI
-changes are proved by the focused `wyrd-server` contract tests
-(`cargo test -p wyrd-server --lib http::openapi`) rather than by a drift
-snapshot.
+changes are proved against the served document by the assembled-server
+contract suite (`crates/wyrd/wyrd-server/tests/pg_openapi_contract.rs`, run by
+`mise run test:principals:integration`) rather than by a drift snapshot.
 
 If a schema, stub, or declaration is wrong, fix the source or generator
 instead of editing the artifact. Runtime MCP catalogs are verified by their

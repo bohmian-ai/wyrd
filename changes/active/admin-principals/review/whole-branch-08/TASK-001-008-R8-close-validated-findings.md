@@ -248,3 +248,105 @@ Do not substitute `mise run gate`, `test:rust`, another broad family aggregate,
 or an ad hoc `--all-features` test lane. Append one evidence table mapping each
 acceptance row to implementation commits, literal focused commands and selected
 counts, owning lanes, and results.
+
+## Implementation evidence
+
+Final candidate: `20e5becad` on `claude/admin-principals-spec-qfsmjc`.
+Implementation commits: `fa9a24b22` (R8-3), `dc7e6cc31` (R8-5), `71a68703d` +
+`aaf753607` (R8-2), `3074983c5` (R8-7), `c2d262b3d` (R8-6), `7b9fbaad1`
+(spec revision 13), `5d7353346` + `8ea8fca46` + `c62c77dba` (REQ-012c,
+INV-013a, AC-020), `c39f1b6fd` + `f67024f7c` (R6-1), `a25864af2` + `20e5becad`
+(strict rustdoc and `git diff --check` cleanup).
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| `FIND-admin-principals-R6-1` | `c39f1b6fd`: `WYRD_AUTH_401_CREDENTIAL_REVOKED` removed from protected tenant 401 descriptions (`auth/revoke.rs`, `bifrost/routes.rs`, `components/{admin,authz/check,cards,principals,storage}`, `query/routes.rs`); direct `moka` dependency removed from `wyrd-server` (OIDC JWKS cache in `wyrd-auth-oidc` retained); snapshot prose in `principal_kind.rs`, `principal.rs`, `mcp/principals.rs`, `wyrd-cli/src/principal/{mod,revoke}.rs`, `wyrd-testing/src/server.rs`, docs `cli.svx`, `authorization.svx`, `running-the-server.svx`, `object-scoped-rbac/spec.md` INV-005; schemas regenerated. `f67024f7c`: served-document and MCP proofs | `protected_tenant_operations_document_no_revocation_refusal` 1/1; `principals::pg_tests::a_write_tool_is_scoped_at_dispatch_not_merely_hidden` 1/1; `mise run codegen:check` rc=0; `mise run test:principals:integration` rc=0; `mise run test:bifrost:journey:mcp` 9/9 | PASS |
+| `FIND-admin-principals-R7-5` | This table and the focused command list below: literal command, selected count and result for every named test | 16 focused commands, each `1 test run: 1 passed` on the final tree | PASS |
+| `FIND-admin-principals-R8-2` | `71a68703d`, `aaf753607`: `--credential`/`--token` removed from platform and tenant administration; ambient `ClientConfig` chain for tenant commands, `WYRD_PLATFORM_CREDENTIAL` for platform commands, carried as `SecretString` | `the_platform_credential_is_not_an_argument` 1/1; `the_tenant_credential_is_not_an_argument` 1/1; `operator_journey::operator_administers_a_deployment_through_the_cli` 1/1 (missing-credential refusals); `mise run test:cli:journey` 24 passed, 5 ignored (pre-existing, gated to other lanes) | PASS |
+| `FIND-admin-principals-R8-3` | `fa9a24b22`: `sha2::Digest` moved into the module-scope `pg_tests` import block | `pg_tests::shipped_audit_staging_migration_is_immutable` 1/1 | PASS |
+| `FIND-admin-principals-R8-5` | `dc7e6cc31`: redundant tenant `WHERE` expressions and binds removed from the four statements in `queries/auth/{api_keys,role_assignments,service_accounts}.rs`; inserts, composite joins and RLS policies untouched | `pg_tests::tenant_principal_queries_are_confined_by_row_level_security` 1/1 (same-tenant visible, cross-tenant invisible through `TenantConn`); `mise run test:sql` 247/247; `mise run check:tenant-isolation` rc=0 | PASS |
+| `FIND-admin-principals-R8-6` | `c2d262b3d`: `prove_scoped_bearer_over_grpc` extends the existing bound-server matrix with the generated gRPC client | `query::tenant_scoped_roles_reach_only_their_granted_bifrost_tables` 1/1; `mise run test:bifrost:journey:server` 14/14 | PASS |
+| `FIND-admin-principals-R8-7` | `3074983c5`: typed path parameters published; Axum `PathRejection` mapped through `http::error::path_rejection` to the canonical validation problem; 400 listed on each affected operation | `a_malformed_administrative_identifier_answers_with_a_documented_problem` 1/1 (tenant principal, platform principal, platform tenant) | PASS |
+| `REQ-012c` / `INV-013a` | `5d7353346`: `PermissionSet::intersection` (narrower scope for overlaps; `AnyOf` flattened; disjoint yields nothing); `TenantGrant::Delegation { caller, ceiling }` narrows the target's resolved set to the verified caller set; `c62c77dba` boxes the caller | `permission::tests::intersection_keeps_only_the_narrower_shared_authority` 1/1 (wildcard, schema/table, disjoint table, `AnyOf`, disjoint); `exchange_api_key::pg_tests::a_delegated_token_carries_only_the_caller_and_target_intersection` 1/1; `journey_delegation_cannot_amplify_the_caller` 1/1 | PASS |
+| `AC-020` | `5d7353346`: `DelegateToken::execute` owns the `TenantConn`; a denied decision appends one denied row and commits; allowed-then-refused appends one allowed no-effect row and commits; success reuses the token-exchange audit row; a store failure returns without commit and without a token | `a_denied_delegation_commits_one_denied_decision` 1/1; `an_allowed_delegation_that_refuses_later_commits_one_allowed_decision` 1/1; `an_unverifiable_subject_token_records_no_decision` 1/1; `a_refused_delegation_audit_issues_no_token` 1/1 | PASS |
+
+### Focused commands (final tree)
+
+| Command | Selected | Result |
+|---|---|---|
+| `mise exec -- cargo nextest run --locked -p wyrd-runtime --lib -E 'test(=permission::tests::intersection_keeps_only_the_narrower_shared_authority)'` | 1 | pass |
+| `scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-auth --lib -E 'test(=exchange_api_key::pg_tests::a_denied_delegation_commits_one_denied_decision)'"` | 1 | pass |
+| `scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-auth --lib -E 'test(=exchange_api_key::pg_tests::an_allowed_delegation_that_refuses_later_commits_one_allowed_decision)'"` | 1 | pass |
+| `scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-auth --lib -E 'test(=exchange_api_key::pg_tests::an_unverifiable_subject_token_records_no_decision)'"` | 1 | pass |
+| `scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-auth --lib -E 'test(=exchange_api_key::pg_tests::a_delegated_token_carries_only_the_caller_and_target_intersection)'"` | 1 | pass |
+| `scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-auth --lib -E 'test(=exchange_api_key::pg_tests::a_refused_delegation_audit_issues_no_token)'"` | 1 | pass |
+| `WYRD_AUTH_E2E=1 scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-server --test auth_e2e -E 'test(=journey_delegation_cannot_amplify_the_caller)'"` | 1 | pass |
+| `scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-server --test pg_openapi_contract -E 'test(=protected_tenant_operations_document_no_revocation_refusal)'"` | 1 | pass |
+| `scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-server --test pg_openapi_contract -E 'test(=a_malformed_administrative_identifier_answers_with_a_documented_problem)'"` | 1 | pass |
+| `scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-mcp --test mcp -P journey --run-ignored=all -E 'test(=principals::pg_tests::a_write_tool_is_scoped_at_dispatch_not_merely_hidden)'"` | 1 | pass |
+| `scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p vala-sql --test pg_migration -E 'test(=pg_tests::shipped_audit_staging_migration_is_immutable)'"` | 1 | pass |
+| `scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-sql --test pg_admin_principals -E 'test(=pg_tests::tenant_principal_queries_are_confined_by_row_level_security)'"` | 1 | pass |
+| `scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test server -P journey --run-ignored=all -E 'test(=query::tenant_scoped_roles_reach_only_their_granted_bifrost_tables)'"` | 1 | pass |
+| `mise exec -- cargo nextest run --locked -p wyrd-cli --lib -E 'test(=platform::credential::tests::the_platform_credential_is_not_an_argument)'` | 1 | pass |
+| `mise exec -- cargo nextest run --locked -p wyrd-cli --lib -E 'test(=principal::credential::tests::the_tenant_credential_is_not_an_argument)'` | 1 | pass |
+| `WYRD_CLI_E2E=1 scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-cli --test cli -E 'test(=operator_journey::operator_administers_a_deployment_through_the_cli)'"` | 1 | pass |
+
+### Lanes
+
+| Lane | Result |
+|---|---|
+| `mise run fmt:check` | rc=0 |
+| `mise run lints` | rc=0 (after `c62c77dba` boxed `TenantGrant::Delegation::caller` for `clippy::large_enum_variant`) |
+| `mise run check:client-tier` | rc=0 |
+| `mise run check:unwrap-audit` | rc=0 |
+| `mise run check:clippy-allow-audit` | rc=0 |
+| `mise run check:tenant-isolation` | rc=0 |
+| `mise run check:from-pools-allowlist` | rc=0 |
+| `mise run test:principals:unit` | rc=0 (2, 11, 18, 4, 4 passed) |
+| `mise run test:principals:integration` | rc=0 |
+| `mise run test:shared` | rc=0 (664 passed) |
+| `mise run test:sql` | rc=0 (123 + 4 + 118 + 2 passed) |
+| `mise run test:platform:journey` ×2 consecutive | rc=0, 38/38 both runs |
+| `mise run test:identity:journey` | rc=0 (20/20) |
+| `mise run test:cli:journey` | rc=0 (24 passed, 5 ignored pre-existing) |
+| `mise run test:bifrost:journey:mcp` | rc=0 (9/9) |
+| `mise run test:bifrost:integration:server` | rc=0 (67/67) |
+| `mise run test:bifrost:journey:server` | rc=0 (14/14) |
+| `mise run codegen:check` | rc=0 |
+| `mise run docs:check` | rc=0 |
+| Strict rustdoc (`RUSTDOCFLAGS="-D missing_docs -D rustdoc::broken_intra_doc_links" cargo doc --locked --no-deps --all-features -p wyrd-runtime -p wyrd-auth -p wyrd-server -p wyrd-cli -p wyrd-spec -p wyrd-sql -p wyrd-testing -p wyrd-mcp`) | rc=0 after `a25864af2` |
+| `git diff --check c5c20754a167e8f4d74a555a720bd51df6179a6f 20e5becad` | rc=0 after `20e5becad` |
+
+Environment note: the local mise task shell resolves no `python` executable, so
+the four Python-script tasks (`check:unwrap-audit`, `check:clippy-allow-audit`,
+`check:tenant-isolation`, `docs:check`) were run with `python` resolving to
+`python3` on `PATH`. The tasks themselves are unchanged.
+
+### Residual obsolete-term classification (R6-1)
+
+- History, retained: `changes/active/admin-principals/spec.md` deletion
+  prohibitions; TASK-002/TASK-008 evidence; object-scoped-rbac task and review
+  evidence.
+- Correct live usage: `identity_e2e.rs` comments state tokens are "not
+  introspected"; "ends renewal immediately" in `authentication.svx` and
+  `identity-and-auth.svx` describe issuance, not request verification.
+- Unrelated: `wyrd-sql` column introspection; `reader_pins.rs` "stop
+  authorizing source IO"; `architecture/wyrd-design.md` and verified-change
+  NOTIFY channels; the `wyrd-client` facade "introspection door".
+- Defects remaining: none.
+
+### Non-goals confirmed
+
+- `FIND-admin-principals-R8-1` rejected: the `67b4d0ba` `FOR UPDATE NOWAIT`
+  behavior and its replay proof are unchanged.
+- `FIND-admin-principals-R8-4` rejected: no audit compatibility migration or
+  predecessor-hash path was added.
+- No checker, cache, epoch, introspection, credential-source layer, second
+  client builder, test harness, or second audit sink was added.
+
+### Follow-up (out of scope)
+
+The pre-existing `wyrd auth trusted-issuer`, `wyrd auth workload-binding`, and
+`wyrd auth refresh` commands still accept bearer or refresh tokens as argv
+options (`--token`, `--refresh-token`, both with environment fallbacks). R8-2
+covered only the new administration commands.

@@ -2547,9 +2547,28 @@ async fn a_tenant_revokes_a_compromised_principal_with_its_reason() {
         "the declared kind selects the table rather than hinting at it"
     );
 
+    // An unknown id is the same authorized miss as a wrong kind.
+    let unknown = uuid::Uuid::now_v7();
+    let resp = srv
+        .oneshot_authenticated(
+            &admin,
+            tenant_request(
+                Method::POST,
+                &format!("/v1/principals/{unknown}/revoke"),
+                Some(json!({ "principal_kind": "service", "reason": "no such runner" })),
+            ),
+        )
+        .await
+        .expect("revoke route responds");
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "an unknown principal is not found"
+    );
+
     assert!(
         tenant_token(&srv, &credential).await.is_ok(),
-        "neither refusal revoked anything"
+        "no refusal revoked anything"
     );
 
     let reason = "leaked-runner key found in a public build log";
@@ -2580,18 +2599,30 @@ async fn a_tenant_revokes_a_compromised_principal_with_its_reason() {
     // commits its allowance together with the suspension.
     // Read past RLS on purpose: the assertion is about the durable audit row
     // the server wrote, which no tenant-plane route projects.
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool opens");
+    let unknown_decisions: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.audit_staging \
+          WHERE operation = 'auth.principal.revoke' AND resource = $1",
+    )
+    .bind(format!("principal:{unknown}"))
+    .fetch_one(&superuser)
+    .await
+    .expect("the unknown-id decision is audited");
+    assert_eq!(
+        unknown_decisions, 1,
+        "the unknown-id miss commits exactly one allowed decision"
+    );
     let rows: Vec<Option<String>> = sqlx::query_scalar(
         "SELECT detail FROM vala.audit_staging \
           WHERE operation = 'auth.principal.revoke' AND resource = $1 \
           ORDER BY seq",
     )
     .bind(format!("principal:{principal_id}"))
-    .fetch_all(
-        &srv.pg_fixture()
-            .superuser_pool()
-            .await
-            .expect("superuser pool opens"),
-    )
+    .fetch_all(&superuser)
     .await
     .expect("the revocation decisions are audited");
     // `detail` is stored as the canonical JSON string the audit hash is taken

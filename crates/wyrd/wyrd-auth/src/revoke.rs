@@ -277,6 +277,36 @@ mod pg_tests {
         );
     }
 
+    /// A lookup that fails is an internal failure, never a not-found.
+    ///
+    /// The served route commits its allowed decision only on a miss, so a
+    /// store failure reported as not-found would durably record a decision the
+    /// store never answered. The transaction is aborted by a failing statement
+    /// first, so the real Postgres refuses the principal lookup itself.
+    ///
+    /// # Panics
+    /// Panics when the fixture cannot start or the failure is not internal.
+    #[tokio::test]
+    async fn a_lookup_failure_is_internal_rather_than_not_found() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        sqlx::query("SELECT 1 / 0")
+            .execute(&mut **conn.transaction())
+            .await
+            .expect_err("the division aborts the transaction");
+
+        for kind in [PrincipalKindTag::User, PrincipalKindTag::Service] {
+            let result =
+                revoke_principal_in_conn(&mut conn, PrincipalId::new(Uuid::new_v4()), kind, tenant)
+                    .await;
+            assert!(
+                matches!(result, Err(WyrdError::Internal { .. })),
+                "a failed {kind:?} lookup must be internal, got: {result:?}"
+            );
+        }
+    }
+
     /// A declared kind that does not match the stored row must refuse exactly
     /// like an unknown id, so the refusal cannot be read as "wrong table".
     #[tokio::test]

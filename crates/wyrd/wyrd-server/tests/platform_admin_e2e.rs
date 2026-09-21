@@ -866,15 +866,21 @@ async fn a_tenant_rotates_an_automation_credential_without_an_outage() {
     // matters when a credential leaks is not that it can mint no *new* token —
     // it is that what it already minted stops working.
     //
-    // This token is deliberately not exercised before the revocation. The
-    // verifier caches a principal's revocation epoch for five seconds, so a
-    // request made now would seed that cache and the assertion after the
-    // revocation would pass on stale state — proving nothing. Leaving it unused
-    // means the first request it makes is a cache miss that reads the epoch
-    // fresh, which is the state a real caller is in.
+    // The token is used before the revocation so the verifier has already
+    // cached it as valid: the next request after the revocation commits has to
+    // re-read the principal's epoch rather than answer from that warm state.
     let live_token = tenant_token(&srv, &first)
         .await
         .expect("the original credential still mints a token");
+    let resp = srv
+        .oneshot_authenticated(&live_token, tenant_request(Method::GET, "/v1/cards", None))
+        .await
+        .expect("cards route responds");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the token authorizes, and is now cached as verified"
+    );
 
     let resp = srv
         .oneshot_authenticated(
@@ -1038,6 +1044,136 @@ async fn revocation_epoch(srv: &WyrdTestServer, principal_id: &str) -> Option<Da
         .fetch_one(srv.operator_pool().pool())
         .await
         .expect("revocation epoch reads")
+}
+
+/// Revoking a tenant administrator's credential ends a token already cached as
+/// verified on the very next request, and the surviving credential's successor
+/// is admitted.
+///
+/// This runs the production verifier wiring: the verified-token cache is on,
+/// and the token is used before the revocation so that cache is warm. The
+/// revocation epoch is read on every verification rather than memoized, so
+/// the refusal does not wait out any cache and needs no cross-replica
+/// notification. `tenant_admin` is the kind a per-kind invalidation path once
+/// omitted, which is why this is the case pinned here.
+#[tokio::test]
+async fn a_revoked_tenant_admin_credential_refuses_its_warm_token_next_request() {
+    if !e2e_enabled() {
+        return;
+    }
+    let srv = WyrdTestServer::start_in_process()
+        .await
+        .expect("server starts");
+    let root = initialize_platform_root(&srv)
+        .await
+        .expect("deployment initializes");
+    let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
+    let created = body_json(
+        srv.oneshot(platform_post(
+            "/platform/tenants",
+            &session,
+            json!({ "slug": "warm-admin", "display_name": "Warm admin" }),
+        ))
+        .await
+        .expect("tenant route responds"),
+    )
+    .await;
+    let admin_id = created["admin"]["principal_id"]
+        .as_str()
+        .expect("admin principal id")
+        .to_owned();
+    let first = created["admin"]["credential"]
+        .as_str()
+        .expect("admin credential")
+        .to_owned();
+
+    let warm = tenant_token(&srv, &first)
+        .await
+        .expect("the administrator authenticates");
+    let cards = async |token: &str| {
+        srv.oneshot_authenticated(token, tenant_request(Method::GET, "/v1/cards", None))
+            .await
+            .expect("cards route responds")
+            .status()
+    };
+    assert_eq!(
+        cards(&warm).await,
+        StatusCode::OK,
+        "the warm token authorizes"
+    );
+
+    let issued = body_json(
+        srv.oneshot_authenticated(
+            &warm,
+            tenant_request(
+                Method::POST,
+                &format!("/v1/principals/{admin_id}/credentials"),
+                None,
+            ),
+        )
+        .await
+        .expect("issue route responds"),
+    )
+    .await;
+    let second = issued["credential"]
+        .as_str()
+        .expect("replacement credential")
+        .to_owned();
+    let second_id = issued["id"].as_str().expect("credential id").to_owned();
+    let listed = body_json(
+        srv.oneshot_authenticated(
+            &warm,
+            tenant_request(
+                Method::GET,
+                &format!("/v1/principals/{admin_id}/credentials"),
+                None,
+            ),
+        )
+        .await
+        .expect("list route responds"),
+    )
+    .await;
+    let first_id = listed["credentials"]
+        .as_array()
+        .expect("credential list")
+        .iter()
+        .find(|entry| entry["id"] != second_id.as_str())
+        .expect("the original credential is listed")["id"]
+        .as_str()
+        .expect("credential id")
+        .to_owned();
+    assert_eq!(
+        cards(&warm).await,
+        StatusCode::OK,
+        "still warm before revocation"
+    );
+
+    let resp = srv
+        .oneshot_authenticated(
+            &warm,
+            tenant_request(
+                Method::DELETE,
+                &format!("/v1/principals/{admin_id}/credentials/{first_id}"),
+                None,
+            ),
+        )
+        .await
+        .expect("revoke route responds");
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT, "revocation succeeds");
+
+    assert_eq!(
+        cards(&warm).await,
+        StatusCode::UNAUTHORIZED,
+        "the warm predecessor is refused on the next request"
+    );
+    let successor = tenant_token(&srv, &second)
+        .await
+        .expect("the surviving credential re-exchanges");
+    assert_eq!(
+        cards(&successor).await,
+        StatusCode::OK,
+        "the successor minted after the revocation is admitted"
+    );
 }
 
 /// A credential can only be revoked through the principal that owns it.
@@ -3946,6 +4082,25 @@ async fn an_authorized_request_that_changes_nothing_still_records_the_decision()
             StatusCode::NOT_FOUND,
             "changing the status of a principal that does not exist",
         ),
+        (
+            platform_request(
+                Method::PUT,
+                &format!("/platform/tenants/{unknown}/status"),
+                &session,
+                Some(json!({ "status": "suspended" })),
+            ),
+            StatusCode::NOT_FOUND,
+            "suspending a tenant that does not exist",
+        ),
+        (
+            platform_post(
+                "/platform/admins",
+                &session,
+                json!({ "name": "unreachable", "match_claim": "nobody@example.com" }),
+            ),
+            StatusCode::BAD_REQUEST,
+            "registering an administrator with no platform connection",
+        ),
     ];
     for (request, status, what) in cases {
         let resp = srv.oneshot(request).await.expect("route responds");
@@ -3992,6 +4147,12 @@ async fn an_authorized_request_that_changes_nothing_still_records_the_decision()
             .await
             .expect("root status reads");
     assert_eq!(still_active, "active", "the refusal changed nothing");
+    let registered: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM platform.principals WHERE name = 'unreachable'")
+            .fetch_one(&superuser)
+            .await
+            .expect("platform principals read");
+    assert_eq!(registered, 0, "a refused registration writes no principal");
 
     // A malformed status is refused before any permission is evaluated, so it
     // must not record a decision at all.
@@ -4031,6 +4192,98 @@ async fn an_authorized_request_that_changes_nothing_still_records_the_decision()
     )
     .await
     .expect("the tenant administrator authenticates");
+
+    // Resuming a tenant that is already active is the replayed transition: it
+    // changes nothing and is refused, but the permission was evaluated.
+    let tenant_id = created["tenant"]["id"].as_str().expect("tenant id");
+    let before = staged_decisions(&superuser, "platform.authz", "allowed").await;
+    let resp = srv
+        .oneshot(platform_request(
+            Method::PUT,
+            &format!("/platform/tenants/{tenant_id}/status"),
+            &session,
+            Some(json!({ "status": "active" })),
+        ))
+        .await
+        .expect("tenant status route responds");
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "a replayed resume answers 404"
+    );
+    assert_eq!(
+        staged_decisions(&superuser, "platform.authz", "allowed").await,
+        before + 1,
+        "a replayed resume records exactly one allowed decision"
+    );
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM platform.tenants WHERE data_tenant_id = $1")
+            .bind(tenant_id.parse::<uuid::Uuid>().expect("tenant uuid"))
+            .fetch_one(&superuser)
+            .await
+            .expect("tenant status reads");
+    assert_eq!(status, "active", "the replayed resume changed nothing");
+
+    // Tenant principal administration: an unknown principal and an unknown
+    // role are stable refusals of an evaluated permission.
+    for (operation, request, status, what) in [
+        (
+            "auth.credential.issue",
+            tenant_request(
+                Method::POST,
+                &format!("/v1/principals/{unknown}/credentials"),
+                None,
+            ),
+            StatusCode::NOT_FOUND,
+            "issuing for a principal that does not exist",
+        ),
+        (
+            "auth.credential.list",
+            tenant_request(
+                Method::GET,
+                &format!("/v1/principals/{unknown}/credentials"),
+                None,
+            ),
+            StatusCode::NOT_FOUND,
+            "listing for a principal that does not exist",
+        ),
+        (
+            "auth.principal.create",
+            tenant_request(
+                Method::POST,
+                "/v1/principals",
+                Some(json!({ "name": "roleless", "roles": ["absent-role"] })),
+            ),
+            StatusCode::BAD_REQUEST,
+            "creating a principal with a role that does not exist",
+        ),
+    ] {
+        let before = staged_decisions(&superuser, operation, "allowed").await;
+        let resp = srv
+            .oneshot_authenticated(&admin, request)
+            .await
+            .expect("principal route responds");
+        assert_eq!(resp.status(), status, "{what} answers {status}");
+        assert_eq!(
+            staged_decisions(&superuser, operation, "allowed").await,
+            before + 1,
+            "{what} records exactly one allowed decision"
+        );
+    }
+    let effects: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM wyrd.auth_service_accounts WHERE name = 'roleless'),
+                (SELECT count(*) FROM wyrd.auth_api_keys WHERE sa_id = $1)",
+    )
+    .bind(unknown)
+    .fetch_one(&superuser)
+    .await
+    .expect("tenant principal tables read");
+    assert_eq!(
+        effects,
+        (0, 0),
+        "no refused request wrote a principal or credential"
+    );
+
     for (operation, uri, what) in [
         (
             "admin.trusted_issuer.delete",

@@ -28,8 +28,8 @@ pub use refresh_tokens::{
     revoke_refresh_family,
 };
 pub use revocation::{
-    advance_user_epoch_to_next_second, revoke_service_account_principal, revoke_user_principal,
-    service_account_revocation_epoch, user_revocation_epoch,
+    PrincipalAdmission, advance_user_epoch_to_next_second, revoke_service_account_principal,
+    revoke_user_principal, service_account_admission, user_admission, user_revocation_epoch,
 };
 pub use role_assignments::{
     grant_role_to_service_account, grant_role_to_user, list_service_account_roles, list_user_roles,

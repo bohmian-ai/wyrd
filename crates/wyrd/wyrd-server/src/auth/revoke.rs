@@ -5,12 +5,11 @@ use axum::extract::{Path, State};
 use std::fmt::Display;
 use wyrd_runtime::PrincipalId;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{PrincipalKindTag, RevokePrincipalRequest};
+use wyrd_spec::auth::RevokePrincipalRequest;
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::vala::{AuditDetail, RevocationReason};
 
 use crate::audit;
-use crate::auth::revocation_listener::notify_principal_revoked;
 use crate::components::auth::Caller;
 use crate::http::error::{WyrdErrorResponse, internal_failure};
 use crate::state::AppState;
@@ -105,8 +104,6 @@ pub async fn revoke_principal(
         .map_err(WyrdErrorResponse::from)?;
     conn.commit().await.map_err(internal_error)?;
 
-    fan_out_notify(&state, tenant, request.principal_kind, target_id).await;
-
     Ok(())
 }
 
@@ -119,21 +116,6 @@ async fn acquire_conn(
         .tenant_conn(tenant)
         .await
         .map_err(internal_error)
-}
-
-/// Send the cross-pod revocation NOTIFY. Best-effort; failure does not undo the DB write.
-async fn fan_out_notify(
-    state: &AppState,
-    tenant: DataTenantId,
-    kind: PrincipalKindTag,
-    id: PrincipalId,
-) {
-    if let Err(e) = notify_principal_revoked(state.postgres.app_pool(), tenant, kind, id).await {
-        tracing::warn!(
-            error = %e,
-            "revocation NOTIFY failed; the epoch write is durable, TTL will enforce it"
-        );
-    }
 }
 
 /// Refuse a revocation request with a stable message, logging the real cause.

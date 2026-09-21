@@ -22,7 +22,6 @@ pub mod platform_login;
 pub mod platform_sessions;
 pub mod refresh;
 pub mod repo;
-pub mod revocation_listener;
 pub mod revocation_resolver;
 pub mod revoke;
 pub mod roles;

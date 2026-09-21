@@ -48,6 +48,7 @@ mod pg_tests {
     use axum::http::{Request, StatusCode};
     use axum::middleware::from_fn_with_state;
     use axum::routing::get;
+    use chrono::Duration;
     use tower::ServiceExt;
     use wyrd_auth::revocation_resolver::SqlRevocationCheck;
     use wyrd_auth_issue::IssuingKey;
@@ -200,7 +201,7 @@ mod pg_tests {
         })
     }
 
-    fn mint_test_user_jwt(state: &AppState, tenant: DataTenantId, ttl: chrono::Duration) -> String {
+    fn mint_test_user_jwt(state: &AppState, tenant: DataTenantId, ttl: Duration) -> String {
         let principal = TokenPrincipalRef {
             id: PrincipalId::new(uuid::Uuid::now_v7()),
             kind: PrincipalKindTag::User,
@@ -246,8 +247,7 @@ mod pg_tests {
     ///
     /// `connect_lazy_with` defers the connection to first use, so every epoch
     /// lookup this check performs fails with the same unavailable error a real
-    /// database or pool outage produces. The zero TTL keeps the in-process cache
-    /// from masking that failure.
+    /// database or pool outage produces.
     fn unreadable_revocation_check() -> Arc<SqlRevocationCheck> {
         use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
@@ -260,10 +260,7 @@ mod pg_tests {
                     .username("wyrd")
                     .database("wyrd"),
             );
-        Arc::new(SqlRevocationCheck::new_with_ttl(
-            Arc::new(pool),
-            StdDuration::ZERO,
-        ))
+        Arc::new(SqlRevocationCheck::new(Arc::new(pool)))
     }
 
     /// Re-issue the test state with the same issuing key and a verifier that

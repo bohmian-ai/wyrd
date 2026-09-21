@@ -448,18 +448,18 @@ async fn register_admin(
     .await?;
 
     // Registering against no connection would create a principal that could
-    // never sign in, so the connection is required first.
-    let connection = platform_oidc_connection(&pool)
-        .await
-        .map_err(store_error)?
-        .ok_or_else(|| {
-            WyrdErrorResponse::from(WyrdError::Validation {
-                message: "configure the platform OIDC connection before registering an \
-                          administrator"
-                    .to_owned(),
-                details: serde_json::json!({}),
-            })
-        })?;
+    // never sign in, so the connection is required first. That refusal is a
+    // stable outcome of an evaluated permission, so the decision commits alone
+    // before it; a failed read commits nothing.
+    let Some(connection) = platform_oidc_connection(&pool).await.map_err(store_error)? else {
+        commit_decision(decision).await?;
+        return Err(WyrdErrorResponse::from(WyrdError::Validation {
+            message: "configure the platform OIDC connection before registering an \
+                      administrator"
+                .to_owned(),
+            details: serde_json::json!({}),
+        }));
+    };
 
     insert_platform_principal_tx(
         &mut decision,

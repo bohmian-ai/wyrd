@@ -11,10 +11,8 @@ use std::process::{Command, Output};
 use assert_cmd::prelude::*;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
-use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use wyrd_auth_verify::WyrdAuthVerifySettings;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
 /// Run the shipped CLI with one named credential and a scrubbed ambient
@@ -79,15 +77,7 @@ pub(crate) async fn start_served(
         .local_addr()
         .expect("journey listener has an address");
     let base_url = format!("http://{address}");
-    // A zero token-verification cache is what makes revocation observable here:
-    // an in-process server has no NOTIFY invalidator, so a cached epoch would
-    // otherwise outlive the revocation for its five-second lifetime.
-    let server = WyrdTestServer::builder()
-        .with_auth_verify_settings(WyrdAuthVerifySettings {
-            cache_ttl: Duration::ZERO,
-            ..WyrdAuthVerifySettings::default()
-        })
-        .start_in_process()
+    let server = WyrdTestServer::start_in_process()
         .await
         .unwrap_or_else(|error| panic!("{server_name} test server starts: {error}"));
     let router = wyrd_server::build_router(server.state().clone());

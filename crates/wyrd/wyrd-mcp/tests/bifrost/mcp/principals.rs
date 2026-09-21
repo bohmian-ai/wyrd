@@ -11,6 +11,7 @@ use crate::connectivity::{McpJourneyError, discover, principals, problem, struct
 mod pg_tests {
     use super::{McpJourneyError, discover, principals, problem, structured, transport};
 
+    use jsonschema::JSONSchema;
     use rmcp::ClientServiceExt as _;
     use rmcp::model::CallToolRequestParams;
     use secrecy::ExposeSecret as _;
@@ -41,6 +42,20 @@ mod pg_tests {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Compile one advertised schema the way a strict agent-side validator
+    /// would, honoring the `uuid` format the identifier fields declare.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the advertised schema does not compile.
+    fn validator(schema: &JsonMap<String, JsonValue>) -> Result<JSONSchema, McpJourneyError> {
+        JSONSchema::options()
+            .should_validate_formats(true)
+            .with_format("uuid", |value| uuid::Uuid::parse_str(value).is_ok())
+            .compile(&JsonValue::Object(schema.clone()))
+            .map_err(|error| format!("an advertised schema compiles: {error}").into())
     }
 
     /// An administrative agent sees the write tool; a reader does not, and is
@@ -142,6 +157,31 @@ mod pg_tests {
             "the write tool advertises its result shape: {revoke_output:?}"
         );
 
+        // The identifiers are typed in the catalog, not only at dispatch: an
+        // argument the advertised schema accepts is one the server can act on,
+        // and a malformed one is rejected before any call is made.
+        let list_input = validator(&list_tool.input_schema)?;
+        let revoke_input = validator(&revoke_tool.input_schema)?;
+        let principal = uuid::Uuid::now_v7().to_string();
+        let credential = uuid::Uuid::now_v7().to_string();
+        assert!(list_input.is_valid(&serde_json::json!({ "principal_id": principal })));
+        assert!(!list_input.is_valid(&serde_json::json!({ "principal_id": "not-a-uuid" })));
+        assert!(revoke_input.is_valid(&serde_json::json!({
+            "principal_id": principal,
+            "credential_id": credential,
+        })));
+        for malformed in [
+            serde_json::json!({ "principal_id": "not-a-uuid", "credential_id": credential }),
+            serde_json::json!({ "principal_id": principal, "credential_id": "not-a-uuid" }),
+        ] {
+            assert!(
+                !revoke_input.is_valid(&malformed),
+                "the advertised revocation schema rejects {malformed}"
+            );
+        }
+        let list_result = validator(&list_output)?;
+        let revoke_result = validator(&revoke_output)?;
+
         // The reader is offered only the read tool.
         let reader_client = ()
             .serve_with_lifecycle(
@@ -215,12 +255,48 @@ mod pg_tests {
             );
         }
         assert!(
-            content.get("credentials").is_some(),
-            "the listing projects credential metadata: {content}"
+            list_result.is_valid(&content),
+            "a real listing satisfies the advertised output schema: {content}"
         );
         assert!(
             !content.to_string().contains(&admin_key),
             "a listing never carries secret material"
+        );
+
+        // Listing an unknown principal is the stable, non-enumerating refusal,
+        // and the permission it evaluated is still recorded.
+        let superuser = server.pg_fixture().superuser_pool().await?;
+        let listed_decisions = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM vala.audit_staging
+                  WHERE operation = 'auth.credential.list' AND outcome = 'allowed'",
+            )
+            .fetch_one(&superuser)
+            .await
+        };
+        let before = listed_decisions().await?;
+        let unknown = admin_client
+            .call_tool(
+                CallToolRequestParams::new(LIST_CREDENTIALS).with_arguments(
+                    serde_json::json!({ "principal_id": uuid::Uuid::now_v7().to_string() })
+                        .as_object()
+                        .ok_or("arguments are an object")?
+                        .clone(),
+                ),
+            )
+            .await;
+        let rendered = match unknown {
+            Err(error) => error.to_string(),
+            Ok(result) => problem(result)?.to_string(),
+        };
+        assert!(
+            rendered.contains("NOT_FOUND"),
+            "an unknown principal is refused as not found: {rendered}"
+        );
+        assert_eq!(
+            listed_decisions().await?,
+            before + 1,
+            "the refused listing records exactly one allowed decision"
         );
 
         reader_client.cancel().await?;
@@ -290,6 +366,10 @@ mod pg_tests {
             "the authorized revocation succeeds: {revoked:?}"
         );
         let acknowledgement = structured(revoked)?;
+        assert!(
+            revoke_result.is_valid(&acknowledgement),
+            "a real acknowledgement satisfies the advertised output schema: {acknowledgement}"
+        );
         for property in required(&revoke_output) {
             assert!(
                 acknowledgement.get(property).is_some(),

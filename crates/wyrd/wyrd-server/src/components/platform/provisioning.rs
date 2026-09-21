@@ -38,7 +38,7 @@ use wyrd_sql::row_types::platform::TenantRow;
 use wyrd_sql::{OperatorPool, SqlError, TenantConn};
 
 use crate::components::auth::PlatformCaller;
-use std::fmt::{self, Debug, Formatter};
+use std::fmt::{Debug, Formatter, Result as FmtResult};
 
 /// Role a tenant administrative principal is granted at provisioning.
 ///
@@ -113,7 +113,7 @@ pub struct TenantProvisioning {
 
 impl Debug for TenantProvisioning {
     /// Prints the handle without its boundaries, which have no inspectable state.
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.debug_struct("TenantProvisioning").finish_non_exhaustive()
     }
 }
@@ -370,14 +370,19 @@ impl TenantProvisioning {
         // Both halves of the same plane, so both commit together. A transition
         // recorded as allowed that never applied — or an applied one with no
         // record — is exactly the mismatch the canonical audit rule forbids.
-        if set_tenant_suspended(&mut decision, tenant_id, suspended)
+        // A missing tenant or one already in the requested state changes
+        // nothing, but the permission was still evaluated, so the decision
+        // commits alone before the stable refusal. A failed write commits
+        // neither.
+        let applied = set_tenant_suspended(&mut decision, tenant_id, suspended)
             .await
-            .map_err(|e| ProvisionError::Store(e.to_string()))?
-        {
-            decision
-                .commit()
-                .await
-                .map_err(|e| ProvisionError::Store(e.to_string()))
+            .map_err(|e| ProvisionError::Store(e.to_string()))?;
+        decision
+            .commit()
+            .await
+            .map_err(|e| ProvisionError::Store(e.to_string()))?;
+        if applied {
+            Ok(())
         } else {
             Err(ProvisionError::TenantUnavailable)
         }

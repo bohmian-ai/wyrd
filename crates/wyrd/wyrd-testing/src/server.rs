@@ -3819,16 +3819,8 @@ impl WyrdTestServerBuilder {
             runtime_wyrd.app_pool().clone(),
         )));
 
-        // Match production's five-second epoch cache so repeated requests do not
-        // force a SQL lookup each. A caller that disables the token cache asks to
-        // observe revocation immediately, and in-process servers have no NOTIFY
-        // invalidator, so that caller reads the epoch fresh on every verify.
-        let revocation_pool = Arc::new(runtime_wyrd.app_pool().clone());
-        let revocation = if verify_settings.cache_ttl.is_zero() {
-            SqlRevocationCheck::new_with_ttl(revocation_pool, Duration::ZERO)
-        } else {
-            SqlRevocationCheck::new(revocation_pool)
-        };
+        // The production constructor: the epoch is read fresh on every verify.
+        let revocation = SqlRevocationCheck::new(Arc::new(runtime_wyrd.app_pool().clone()));
         let verifier = Arc::new(
             TokenVerifier::new(decoding_keys, "wyrd", resolver, verify_settings)
                 .with_revocation(Arc::new(revocation))

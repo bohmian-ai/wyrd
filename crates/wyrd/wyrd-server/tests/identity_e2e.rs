@@ -553,10 +553,6 @@ async fn revocation_journey() {
     }
 
     let srv = WyrdTestServerBuilder::default()
-        .with_auth_verify_settings(WyrdAuthVerifySettings {
-            cache_ttl: StdDuration::ZERO,
-            ..WyrdAuthVerifySettings::default()
-        })
         .start_in_process()
         .await
         .expect("test server starts");
@@ -1085,10 +1081,6 @@ async fn revoking_a_human_kills_the_session_refresh_authority() {
 
     let keycloak = OidcIssuerFixture::connect(&keycloak_issuer()).await;
     let srv = WyrdTestServerBuilder::default()
-        .with_auth_verify_settings(WyrdAuthVerifySettings {
-            cache_ttl: StdDuration::ZERO,
-            ..WyrdAuthVerifySettings::default()
-        })
         .with_trusted_issuer_configs(vec![human_issuer_entry(
             vec!["runtime_admin".to_owned()],
             HashMap::new(),
@@ -1224,10 +1216,6 @@ async fn a_withdrawn_oidc_group_invalidates_the_roles_it_granted() {
         .await;
 
     let srv = WyrdTestServerBuilder::default()
-        .with_auth_verify_settings(WyrdAuthVerifySettings {
-            cache_ttl: StdDuration::ZERO,
-            ..WyrdAuthVerifySettings::default()
-        })
         .with_trusted_issuer_configs(vec![human_issuer_entry(
             Vec::new(),
             HashMap::from([("wyrd-admins".to_owned(), vec!["runtime_admin".to_owned()])]),

@@ -17,9 +17,7 @@ use chrono::Duration;
 use secrecy::ExposeSecret;
 use std::fmt::Display;
 use uuid::Uuid;
-use wyrd_auth::exchange_api_key::principal_kind_wire;
 use wyrd_auth::issue_api_key::WyrdApiKey;
-use wyrd_auth::revocation_listener::notify_principal_revoked;
 use wyrd_runtime::RoleRef;
 use wyrd_spec::auth::{
     CreateServicePrincipalRequest, CreateServicePrincipalResponse, CredentialListResponse,
@@ -155,10 +153,6 @@ async fn tenant_conn<'a>(
         })
 }
 
-/// Mint a credential for `principal_id` inside the caller's tenant.
-///
-/// # Errors
-/// Returns an internal error when hashing or the insert fails.
 /// Refuse a principal id that names nothing in this caller's tenant.
 ///
 /// Row-level security already keeps a foreign principal's rows unreachable, but
@@ -168,22 +162,33 @@ async fn tenant_conn<'a>(
 /// they give one answer, and it is the same non-enumerating `404` a genuinely
 /// unknown id gets — a caller cannot tell the two apart, which is the point.
 ///
+/// Takes the caller's decision transaction by value. When the principal is
+/// absent the allowance already appended to it still records an evaluated
+/// permission, so the transaction commits that decision alone before the
+/// refusal; when it exists the transaction is handed back for the operation.
+///
 /// # Errors
 /// Returns [`WyrdError::PrincipalNotFound`] when neither a service-kind nor a
 /// user principal with this id exists in the tenant, or an internal error when
-/// a lookup fails.
-async fn require_principal(conn: &mut TenantConn<'_>, principal_id: Uuid) -> Result<(), WyrdError> {
-    let exists = service_account_by_id(conn, principal_id)
+/// a lookup or the decision commit fails. A failed lookup commits nothing.
+async fn require_principal(
+    mut conn: TenantConn<'_>,
+    principal_id: Uuid,
+) -> Result<TenantConn<'_>, WyrdError> {
+    let exists = service_account_by_id(&mut conn, principal_id)
         .await
         .map_err(|error| WyrdError::from(internal(error)))?
         .is_some()
-        || user_by_id(conn, principal_id)
+        || user_by_id(&mut conn, principal_id)
             .await
             .map_err(|error| WyrdError::from(internal(error)))?
             .is_some();
     if exists {
-        return Ok(());
+        return Ok(conn);
     }
+    conn.commit()
+        .await
+        .map_err(|error| WyrdError::from(internal(error)))?;
     Err(WyrdError::PrincipalNotFound {
         message: "principal not found in this tenant".to_owned(),
         details: serde_json::json!({ "id": principal_id.to_string() }),
@@ -192,10 +197,11 @@ async fn require_principal(conn: &mut TenantConn<'_>, principal_id: Uuid) -> Res
 
 /// Mint one API key for an existing principal inside the caller's transaction.
 ///
-/// The shared tail of principal creation and credential issuance. The
-/// principal is re-checked in this same connection first, so a credential can
-/// never be written against an id that is absent or belongs to another tenant.
-/// Argon2 hashing is handed to a blocking thread because it is deliberately
+/// The shared tail of principal creation and credential issuance. The caller
+/// has already established, in this same transaction, that the principal
+/// exists in the tenant — creation by inserting it, issuance through
+/// [`require_principal`] — so a credential is never written against an absent
+/// or foreign id. Argon2 hashing is handed to a blocking thread because it is deliberately
 /// expensive and would otherwise stall the request executor. Only the hash is
 /// inserted; the plaintext is returned to the caller once and never stored.
 ///
@@ -204,16 +210,12 @@ async fn require_principal(conn: &mut TenantConn<'_>, principal_id: Uuid) -> Res
 /// everything else and leaves no orphan key.
 ///
 /// # Errors
-/// Returns [`WyrdError::PrincipalNotFound`] when no such principal exists in
-/// the tenant, and an internal failure when hashing or the insert fails.
+/// Returns an internal failure when hashing or the insert fails.
 async fn mint_credential(
     conn: &mut TenantConn<'_>,
     principal_id: Uuid,
     created_by: Uuid,
 ) -> Result<IssuedCredential, WyrdErrorResponse> {
-    require_principal(conn, principal_id)
-        .await
-        .map_err(WyrdErrorResponse::from)?;
     let plaintext = WyrdApiKey::generate(conn.data_tenant_id());
     let raw = plaintext.secret.clone();
     let key_hash = tokio::task::spawn_blocking(move || wyrd_auth_issue::hash_api_key(&raw))
@@ -289,6 +291,22 @@ async fn create_service_principal(
         &format!("principal:{}", request.name),
     )
     .await?;
+
+    // Every role is resolved before anything is written. An absent role is a
+    // stable refusal of an evaluated permission, so the decision commits alone
+    // and no tentative principal ever exists to roll back with it.
+    let mut role_ids = Vec::with_capacity(request.roles.len());
+    for role in &request.roles {
+        let Some(row) = role_by_name(&mut conn, role).await.map_err(internal)? else {
+            conn.commit().await.map_err(internal)?;
+            return Err(WyrdErrorResponse::from(WyrdError::Validation {
+                message: "role does not exist in this tenant".to_owned(),
+                details: serde_json::json!({ "role": role }),
+            }));
+        };
+        role_ids.push(row.id);
+    }
+
     let principal_id = Uuid::now_v7();
     insert_service_account(
         &mut conn,
@@ -302,17 +320,8 @@ async fn create_service_principal(
     .await
     .map_err(internal)?;
 
-    for role in &request.roles {
-        let row = role_by_name(&mut conn, role)
-            .await
-            .map_err(internal)?
-            .ok_or_else(|| {
-                WyrdErrorResponse::from(WyrdError::Validation {
-                    message: "role does not exist in this tenant".to_owned(),
-                    details: serde_json::json!({ "role": role }),
-                })
-            })?;
-        grant_role_to_service_account(&mut conn, principal_id, row.id)
+    for role_id in role_ids {
+        grant_role_to_service_account(&mut conn, principal_id, role_id)
             .await
             .map_err(internal)?;
     }
@@ -362,7 +371,7 @@ async fn issue_credential(
     caller: Caller,
     Path(principal_id): Path<Uuid>,
 ) -> Result<Json<IssuedCredential>, WyrdErrorResponse> {
-    let mut conn = authorize(
+    let conn = authorize(
         &state,
         &caller,
         "issue tenant credentials",
@@ -370,6 +379,7 @@ async fn issue_credential(
         &format!("principal:{principal_id}"),
     )
     .await?;
+    let mut conn = require_principal(conn, principal_id).await?;
     let issued = mint_credential(&mut conn, principal_id, caller.principal.id.as_uuid()).await?;
     conn.commit().await.map_err(internal)?;
     Ok(Json(issued))
@@ -428,7 +438,7 @@ pub(crate) async fn list_credentials_for(
     caller: &Caller,
     principal_id: Uuid,
 ) -> Result<CredentialListResponse, WyrdError> {
-    let mut conn = authorize(
+    let conn = authorize(
         state,
         caller,
         "list tenant credentials",
@@ -437,7 +447,7 @@ pub(crate) async fn list_credentials_for(
     )
     .await
     .map_err(WyrdError::from)?;
-    require_principal(&mut conn, principal_id).await?;
+    let mut conn = require_principal(conn, principal_id).await?;
     let rows = list_api_key_metadata(&mut conn, principal_id)
         .await
         .map_err(|error| WyrdError::from(internal(error)))?;
@@ -561,43 +571,12 @@ pub(crate) async fn revoke_credential_for(
         return Err(WyrdError::from(not_found()));
     }
 
-    // The kind is read rather than assumed: the epoch cache is keyed by it, so
-    // naming the wrong one invalidates nothing and leaves the window this
-    // exists to close wide open. A tenant's administrative principal is
-    // `tenant_admin`, not `service`.
-    let kind = service_account_by_id(&mut conn, principal_id)
-        .await
-        .map_err(|error| WyrdError::from(internal(error)))?
-        .and_then(|row| principal_kind_wire(&row.principal_kind))
-        .ok_or_else(|| WyrdError::Internal {
-            message: "credential owner has no recognizable principal kind".to_owned(),
-            details: serde_json::json!({}),
-        })?;
-
     revoke_service_account_principal(&mut conn, principal_id)
         .await
         .map_err(|error| WyrdError::from(internal(error)))?;
     conn.commit()
         .await
         .map_err(|error| WyrdError::from(internal(error)))?;
-
-    // Each replica caches a principal's revocation epoch for a few seconds, so
-    // without this the revoked credential's tokens keep working elsewhere until
-    // that cache expires. Best-effort: the epoch write is durable and the TTL
-    // enforces it regardless, this only shortens the window to the NOTIFY.
-    if let Err(error) = notify_principal_revoked(
-        state.postgres.app_pool(),
-        caller.data_tenant_id,
-        kind,
-        wyrd_runtime::PrincipalId::new(principal_id),
-    )
-    .await
-    {
-        tracing::warn!(
-            error = %error,
-            "revocation NOTIFY failed; the epoch write is durable, TTL will enforce it"
-        );
-    }
 
     Ok(())
 }

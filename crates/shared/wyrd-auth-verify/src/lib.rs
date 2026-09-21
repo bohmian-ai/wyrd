@@ -9,12 +9,10 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode_header};
-use moka::future::Cache;
 use secrecy::{ExposeSecret, SecretString};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use sha2::{Digest, Sha256};
 use wyrd_auth_oidc::{
     IssuerConfigResolver, IssuerVerification, JwksCache, OidcError, OidcKid, map_claims,
 };
@@ -97,18 +95,12 @@ pub enum AuthError {
     /// Delegation chain exceeded the supported depth.
     #[error("delegation depth exceeded")]
     DelegationDepthExceeded,
-    /// Token was revoked.
-    #[error("credential revoked")]
-    Revoked,
     /// Bearer token format is invalid.
     #[error("bad token format")]
     BadTokenFormat,
-    /// Permission resolution store is unavailable.
+    /// An external issuer's trust configuration or JWKS cannot be read.
     #[error("token verification unavailable")]
     VerifyUnavailable,
-    /// Stored role permissions are corrupt.
-    #[error("role permissions are corrupt")]
-    PermissionsCorrupt,
 }
 
 impl From<jsonwebtoken::errors::Error> for AuthError {
@@ -120,145 +112,42 @@ impl From<jsonwebtoken::errors::Error> for AuthError {
     }
 }
 
-/// Resolve role refs to an effective permission set.
-pub trait PermissionResolver: Send + Sync + fmt::Debug {
-    /// Resolve role permissions for a tenant.
-    fn resolve<'a>(
-        &'a self,
-        tenant_id: &'a DataTenantId,
-        roles: &'a [RoleRef],
-    ) -> impl std::future::Future<Output = Result<PermissionSet, ResolveError>> + Send + 'a;
-}
-
-/// Permission resolution failure.
-#[derive(Debug, thiserror::Error)]
-pub enum ResolveError {
-    /// The backing permission store is unavailable.
-    #[error("permission store unavailable: {0}")]
-    Unavailable(String),
-    /// A stored role permission document is malformed.
-    #[error("permissions JSONB malformed for role {role}: {source}")]
-    BadPermissionsJson {
-        /// Role whose permissions failed to decode.
-        role: String,
-        /// JSON decode error.
-        #[source]
-        source: serde_json::Error,
-    },
-}
-
-/// Future returned by [`RevocationCheck::epoch`].
-pub type RevocationEpochFuture<'a> = std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<Option<DateTime<Utc>>, ResolveError>> + Send + 'a>,
->;
-
-/// Check whether a principal's revocation epoch has been bumped.
+/// The fixed `aud` of every Wyrd tenant access token.
 ///
-/// The verifier calls this on every verify path — both cache hits and fresh
-/// verifies — so a revoked principal's cached tokens are rejected before the
-/// positive-cache early return (F11). Implementations are expected to serve
-/// the result from a short-TTL in-process cache; the verifier does not add
-/// network IO to the hot path.
+/// Issuance stamps it and [`TokenVerifier::verify`] requires it, so a token
+/// Wyrd signed for another purpose (a refresh token, a platform session)
+/// cannot be presented as a tenant access token.
+pub const WYRD_ACCESS_TOKEN_AUDIENCE: &str = "wyrd";
+
+/// Tenant-checked token claims ready to populate request context.
 ///
-/// Object-safe (returns a boxed `Future`) so `TokenVerifier<R>` can hold
-/// `Option<Arc<dyn RevocationCheck>>` without an extra type parameter.
-pub trait RevocationCheck: Send + Sync + fmt::Debug {
-    /// Return the principal's revocation epoch, if any.
-    ///
-    /// `None` means the principal has never been revoked. An access token whose
-    /// `iat < epoch` is dead.
-    fn epoch<'a>(
-        &'a self,
-        tenant: &'a DataTenantId,
-        principal: PrincipalId,
-        kind: PrincipalKindTag,
-    ) -> RevocationEpochFuture<'a>;
-}
-
-/// Zero-cost no-op revocation check used when revocation is not configured.
-#[derive(Debug, Clone, Copy)]
-pub struct NoRevocation;
-
-impl RevocationCheck for NoRevocation {
-    fn epoch<'a>(
-        &'a self,
-        _tenant: &'a DataTenantId,
-        _principal: PrincipalId,
-        _kind: PrincipalKindTag,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<Option<DateTime<Utc>>, ResolveError>>
-                + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(std::future::ready(Ok(None)))
-    }
-}
-
-/// Resolved, tenant-checked token ready to populate request context.
+/// Built entirely from one verified JWT: the principal's authority is the
+/// token's `permissions` claim, fixed when the token was issued.
 #[derive(Clone, Debug)]
 pub struct VerifiedToken {
-    /// Current actor with effective permissions filled.
+    /// Current actor with the token's permission snapshot as its authority.
     pub principal: Principal,
     /// Flattened RFC 8693 actor chain in initiator-first order.
     pub delegation_chain: Vec<DelegationStep>,
-    /// JWT expiry as UTC timestamp for cache-hit lifetime checks.
+    /// JWT expiry as a UTC timestamp.
     pub exp: DateTime<Utc>,
-    /// JWT issued-at as UTC timestamp, used for epoch revocation checks (F11).
-    pub iat: DateTime<Utc>,
 }
 
 /// Token verification settings.
 #[derive(Clone, Debug)]
 pub struct WyrdAuthVerifySettings {
-    /// Token-hash cache TTL.
-    pub cache_ttl: Duration,
-    /// Maximum token-hash cache entries.
-    pub max_cache_entries: u64,
-    /// Allowed JWT clock skew.
+    /// Allowed JWT clock skew, applied to `exp` for local and external tokens.
     pub allowed_clock_skew: Duration,
 }
 
 impl Default for WyrdAuthVerifySettings {
     fn default() -> Self {
         Self {
-            cache_ttl: Duration::from_secs(60),
-            max_cache_entries: 10_000,
             allowed_clock_skew: Duration::from_secs(30),
         }
     }
 }
 
-/// Opaque hash of a presented bearer token.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct TokenHash([u8; 32]);
-
-impl TokenHash {
-    fn of(token: &str) -> Self {
-        let mut hash = Sha256::new();
-        hash.update(token.as_bytes());
-        Self(hash.finalize().into())
-    }
-}
-
-/// External OIDC verify path. `None` until `with_external` is called.
-///
-/// Generic over the issuer resolver `I` (RPITIT trait — not dyn-compatible),
-/// so trust lookups happen per-request against the live config store.
-struct ExternalVerify<I> {
-    jwks: Arc<JwksCache>,
-    trusted: Arc<I>,
-}
-
-impl<I> Clone for ExternalVerify<I> {
-    fn clone(&self) -> Self {
-        Self {
-            jwks: Arc::clone(&self.jwks),
-            trusted: Arc::clone(&self.trusted),
-        }
-    }
-}
 
 /// A federated identity verified against one trusted issuer.
 ///
@@ -312,36 +201,21 @@ pub struct VerifiedExternalIdentity {
     pub raw_claims: JsonValue,
 }
 
-/// Stateful verifier with token-hash cache and resolver-backed permission refresh.
+/// Wyrd-minted access-token verifier.
 ///
-/// Parametrized by the permission resolver `R` and the issuer-config resolver
-/// `I`. Both traits are RPITIT (not dyn-compatible), so the verifier holds them
-/// generically behind trait bounds rather than as trait objects.
-pub struct TokenVerifier<R: PermissionResolver, I: IssuerConfigResolver> {
+/// Owns only local cryptographic validation state: the deployment's decoding
+/// keys, its issuer, the fixed Wyrd audience, and the clock-skew policy.
+/// Verification is synchronous and reads no store — a tenant token carries
+/// its own authority snapshot, and a platform session's current state is
+/// revalidated by the platform plane after this signature check.
+#[derive(Clone)]
+pub struct TokenVerifier {
     decoding_keys: Arc<HashMap<Kid, Arc<DecodingKey>>>,
     issuer: Arc<String>,
-    resolver: Arc<R>,
-    revocation: Option<Arc<dyn RevocationCheck>>,
-    cache: Cache<TokenHash, Arc<VerifiedToken>>,
-    settings: Arc<WyrdAuthVerifySettings>,
-    external: Option<ExternalVerify<I>>,
+    settings: WyrdAuthVerifySettings,
 }
 
-impl<R: PermissionResolver, I: IssuerConfigResolver> Clone for TokenVerifier<R, I> {
-    fn clone(&self) -> Self {
-        Self {
-            decoding_keys: Arc::clone(&self.decoding_keys),
-            issuer: Arc::clone(&self.issuer),
-            resolver: Arc::clone(&self.resolver),
-            revocation: self.revocation.clone(),
-            cache: self.cache.clone(),
-            settings: Arc::clone(&self.settings),
-            external: self.external.clone(),
-        }
-    }
-}
-
-impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> TokenVerifier<R, I> {
+impl TokenVerifier {
     /// Construct a token verifier.
     ///
     /// # Panics
@@ -350,46 +224,17 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> TokenVe
     pub fn new(
         decoding_keys: HashMap<Kid, Arc<DecodingKey>>,
         issuer: impl Into<String>,
-        resolver: Arc<R>,
         settings: WyrdAuthVerifySettings,
     ) -> Self {
         assert!(
             !decoding_keys.is_empty(),
             "TokenVerifier requires at least one decoding key"
         );
-        let cache = Cache::builder()
-            .max_capacity(settings.max_cache_entries)
-            .time_to_live(settings.cache_ttl)
-            .build();
         Self {
             decoding_keys: Arc::new(decoding_keys),
             issuer: Arc::new(issuer.into()),
-            resolver,
-            revocation: None,
-            cache,
-            settings: Arc::new(settings),
-            external: None,
+            settings,
         }
-    }
-
-    /// Attach an external OIDC verification path backed by a JWKS cache and an
-    /// issuer-config resolver. Until this is called, `verify_external` always
-    /// returns `AuthError::InvalidToken`.
-    #[must_use]
-    pub fn with_external(mut self, jwks: Arc<JwksCache>, trusted: Arc<I>) -> Self {
-        self.external = Some(ExternalVerify { jwks, trusted });
-        self
-    }
-
-    /// Attach a principal-epoch revocation resolver (F11).
-    ///
-    /// Any type implementing `RevocationCheck` is accepted. In production this
-    /// is `SqlRevocationCheck`; in tests `NoRevocation` is the default when
-    /// this method is never called.
-    #[must_use]
-    pub fn with_revocation(mut self, revocation: Arc<dyn RevocationCheck>) -> Self {
-        self.revocation = Some(revocation);
-        self
     }
 
     /// Resolve the deployment key that signed one compact token.
@@ -451,22 +296,23 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> TokenVe
         Ok(claims)
     }
 
-    /// Verify a bearer token for the active tenant.
+    /// Verify a tenant access token for the active tenant.
     ///
-    /// A positive result is cached by token hash, but the cache is never the
-    /// last word on admission: both the cache-hit and the cache-miss path
-    /// re-read the principal's revocation epoch before returning. When that
-    /// read fails the deployment cannot say whether the principal is still
-    /// admitted, so the cached entry is dropped and the request is refused
-    /// rather than served on stale evidence.
+    /// Checks the bearer size, the Ed25519 signature under the named
+    /// deployment key, the issuer, the fixed Wyrd audience, and expiry (with
+    /// the configured skew), then requires the token's tenant to be the
+    /// request's tenant and builds the runtime principal from the claims.
+    /// Nothing is read from a store and nothing is cached: the token's
+    /// `permissions` claim is its authority until it expires.
     ///
     /// # Errors
     /// Returns [`AuthError::BadTokenFormat`] for an oversized bearer,
-    /// [`AuthError::InvalidToken`] for an unknown key, a failed signature, or a
-    /// token belonging to another tenant, [`AuthError::TokenExpired`] for an
-    /// expired token, [`AuthError::Revoked`] when the token predates the
-    /// principal's revocation epoch, and [`AuthError::VerifyUnavailable`] when
-    /// the revocation store or permission resolver cannot be read.
+    /// [`AuthError::InvalidToken`] for an unknown key, a wrong issuer or
+    /// audience, or a token belonging to another tenant,
+    /// [`AuthError::Jwt`] for a failed signature or undecodable claims
+    /// (including malformed permissions), [`AuthError::TokenExpired`] for an
+    /// expired token, and the claim-shape errors of
+    /// [`AccessTokenClaims::into_verified`].
     #[tracing::instrument(
         level = "debug",
         skip(self, token),
@@ -478,113 +324,66 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> TokenVe
         ),
         err,
     )]
-    pub async fn verify(
+    pub fn verify(
         &self,
         token: &SecretString,
         expected_tenant: &DataTenantId,
-    ) -> Result<Arc<VerifiedToken>, AuthError> {
+    ) -> Result<VerifiedToken, AuthError> {
         let token = token.expose_secret();
         if token.len() > MAX_BEARER_TOKEN_BYTES {
             return Err(AuthError::BadTokenFormat);
         }
-
-        let hash = TokenHash::of(token);
-        if let Some(cached) = self.cache.get(&hash).await {
-            if &cached.principal.tenant_id != expected_tenant {
-                self.cache.invalidate(&hash).await;
-                return Err(AuthError::InvalidToken);
-            }
-            if self.is_expired(cached.exp) {
-                self.cache.invalidate(&hash).await;
-                return Err(AuthError::TokenExpired);
-            }
-            // F11: check revocation epoch BEFORE returning the positive cache hit.
-            // A principal revoked after this token was cached must be rejected here.
-            if let Some(ref rev) = self.revocation {
-                let kind = cached.principal.kind.tag();
-                match rev
-                    .epoch(&cached.principal.tenant_id, cached.principal.id, kind)
-                    .await
-                {
-                    Ok(Some(epoch)) if cached.iat < epoch => {
-                        self.cache.invalidate(&hash).await;
-                        return Err(AuthError::Revoked);
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            "revocation resolver unavailable; refusing the cached token"
-                        );
-                        self.cache.invalidate(&hash).await;
-                        return Err(AuthError::VerifyUnavailable);
-                    }
-                    _ => {}
-                }
-            }
-            return Ok(cached);
+        let key = self.signing_key(token)?;
+        let claims = verify_access_token(token, &key, self.validation())?;
+        tracing::Span::current().record("principal_id", claims.principal.id.to_string());
+        tracing::Span::current().record("jti", claims.jti.as_str());
+        if &claims.principal.tenant_id != expected_tenant {
+            return Err(AuthError::InvalidToken);
         }
-
-        let result = self
-            .cache
-            .try_get_with(hash, async {
-                let key = self.signing_key(token)?;
-
-                let claims = verify_access_token(token, &key, self.validation())?;
-                tracing::Span::current().record("principal_id", claims.principal.id.to_string());
-                tracing::Span::current().record("jti", claims.jti.as_str());
-                if &claims.principal.tenant_id != expected_tenant {
-                    return Err(AuthError::InvalidToken);
-                }
-                let verified = claims.into_verified(&*self.resolver).await?;
-                Ok::<_, AuthError>(Arc::new(verified))
-            })
-            .await
-            .map_err(|error| AuthError::clone(&error))?;
-
-        // Also check revocation for fresh (cache-miss) verifies.
-        if let Some(ref rev) = self.revocation {
-            let kind = result.principal.kind.tag();
-            match rev
-                .epoch(&result.principal.tenant_id, result.principal.id, kind)
-                .await
-            {
-                Ok(Some(epoch)) if result.iat < epoch => {
-                    self.cache.invalidate(&hash).await;
-                    return Err(AuthError::Revoked);
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        error = %err,
-                        "revocation resolver unavailable; refusing the freshly verified token"
-                    );
-                    self.cache.invalidate(&hash).await;
-                    return Err(AuthError::VerifyUnavailable);
-                }
-                _ => {}
-            }
-        }
-
-        Ok(result)
+        claims.into_verified()
     }
 
-    /// Remove a token from the cache.
-    #[tracing::instrument(level = "debug", skip(self, token))]
-    pub async fn invalidate(&self, token: &SecretString) {
-        self.cache
-            .invalidate(&TokenHash::of(token.expose_secret()))
-            .await;
+    fn validation(&self) -> Validation {
+        let mut validation = Validation::new(Algorithm::EdDSA);
+        validation.set_issuer(&[self.issuer.as_str()]);
+        validation.set_audience(&[WYRD_ACCESS_TOKEN_AUDIENCE]);
+        validation.leeway = self.settings.allowed_clock_skew.as_secs();
+        validation
     }
+}
 
-    /// Remove cached tokens for a principal from the cache.
-    #[tracing::instrument(level = "debug", skip(self))]
-    pub async fn invalidate_principal(&self, principal_id: PrincipalId) {
-        let hashes = self
-            .cache
-            .iter()
-            .filter_map(|(hash, verified)| (verified.principal.id == principal_id).then_some(*hash))
-            .collect::<Vec<_>>();
-        for hash in hashes {
-            self.cache.invalidate(&hash).await;
+/// Issuance-side verifier for tokens minted by a trusted external OIDC issuer.
+///
+/// Used by OIDC login, workload `jwt-bearer`, and platform federated login to
+/// validate the external assertion before a Wyrd token is issued. It never
+/// verifies a Wyrd access token. Generic over the issuer resolver `I`
+/// (an RPITIT trait, not dyn-compatible), so trust lookups happen per call
+/// against the live config store.
+pub struct ExternalVerifier<I> {
+    jwks: Arc<JwksCache>,
+    trusted: Arc<I>,
+    settings: WyrdAuthVerifySettings,
+}
+
+impl<I> Clone for ExternalVerifier<I> {
+    fn clone(&self) -> Self {
+        Self {
+            jwks: Arc::clone(&self.jwks),
+            trusted: Arc::clone(&self.trusted),
+            settings: self.settings.clone(),
+        }
+    }
+}
+
+impl<I: IssuerConfigResolver> ExternalVerifier<I> {
+    /// Construct an external verifier over a JWKS cache and an issuer-config
+    /// resolver.
+    #[must_use]
+    pub fn new(jwks: Arc<JwksCache>, trusted: Arc<I>, settings: WyrdAuthVerifySettings) -> Self {
+        Self {
+            jwks,
+            trusted,
+            settings,
         }
     }
 
@@ -592,16 +391,16 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> TokenVe
     ///
     /// Returns a [`VerifiedExternalIdentity`] with the verified subject, optional
     /// profile claims, and the raw JSON claims for downstream assertion checks
-    /// (e.g. nonce). Does **not** build a `Principal` or call the
-    /// `PermissionResolver` (R03 — the server flow owns that step).
+    /// (e.g. nonce). Does **not** build a `Principal`; the issuance flow owns
+    /// identity lookup and grant resolution.
     ///
-    /// The lookup is keyed by `(tenant, iss)` (F02). Calling this with a
-    /// Wyrd-minted local token (i.e. `iss == self.issuer`) returns an error;
-    /// use `verify()` for those.
+    /// The lookup is keyed by `(tenant, iss)`, so only an issuer the tenant
+    /// trusts can vouch for an identity.
     ///
     /// # Errors
-    /// - `AuthError::InvalidToken` — unknown issuer, bad token shape, wrong
-    ///   audience, or the external path was not configured.
+    /// - `AuthError::BadTokenFormat` — the token is oversized or not a JWT.
+    /// - `AuthError::InvalidToken` — untrusted issuer, bad token shape, or
+    ///   wrong audience.
     /// - `AuthError::TokenExpired` — the token's `exp` has passed.
     /// - `AuthError::VerifyUnavailable` — the JWKS endpoint is unreachable.
     #[tracing::instrument(
@@ -636,13 +435,6 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> TokenVe
                 .to_owned()
         };
 
-        // Local tokens must go through verify(), not here.
-        if iss_str == self.issuer.as_str() {
-            return Err(AuthError::InvalidToken);
-        }
-
-        let ext = self.external.as_ref().ok_or(AuthError::InvalidToken)?;
-
         // Parse the issuer string into the typed form for the trust lookup.
         let iss_url = IssuerUrl::new(iss_str).map_err(|_| AuthError::InvalidToken)?;
 
@@ -650,7 +442,7 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> TokenVe
         // live config store. A resolver outage fails closed as
         // VerifyUnavailable; no matching issuer fails closed as InvalidToken
         // (untrusted or cross-tenant).
-        let trusted = ext
+        let trusted = self
             .trusted
             .trusted_issuer(tenant, &iss_url)
             .await
@@ -694,8 +486,7 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> TokenVe
     /// - [`AuthError::InvalidToken`] — a symmetric algorithm, a missing or
     ///   unknown `kid`, a wrong issuer or audience, or unmappable claims.
     /// - [`AuthError::TokenExpired`] — the token's `exp` has passed.
-    /// - [`AuthError::VerifyUnavailable`] — the JWKS endpoint is unreachable,
-    ///   or the external verification path was never configured.
+    /// - [`AuthError::VerifyUnavailable`] — the JWKS endpoint is unreachable.
     pub async fn verify_external_against(
         &self,
         trusted: &IssuerVerification,
@@ -705,7 +496,6 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> TokenVe
             return Err(AuthError::BadTokenFormat);
         }
         let header = decode_header(token).map_err(AuthError::from)?;
-        let ext = self.external.as_ref().ok_or(AuthError::InvalidToken)?;
 
         // Reject symmetric algorithms. Only asymmetric keys appear in JWKS.
         if matches!(
@@ -719,7 +509,7 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> TokenVe
         let kid_str = header.kid.ok_or(AuthError::InvalidToken)?;
         let oidc_kid = OidcKid::new(kid_str);
 
-        let decoding_key = ext
+        let decoding_key = self
             .jwks
             .key(trusted.issuer.as_str(), &trusted.jwks_uri, &oidc_kid)
             .await
@@ -756,22 +546,8 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> TokenVe
             raw_claims,
         })
     }
-
-    fn validation(&self) -> Validation {
-        let mut validation = Validation::new(Algorithm::EdDSA);
-        validation.validate_aud = false;
-        validation.set_issuer(&[self.issuer.as_str()]);
-        validation.leeway = self.settings.allowed_clock_skew.as_secs();
-        validation
-    }
-
-    fn is_expired(&self, exp: DateTime<Utc>) -> bool {
-        let Ok(skew) = chrono::Duration::from_std(self.settings.allowed_clock_skew) else {
-            return true;
-        };
-        Utc::now() > exp + skew
-    }
 }
+
 
 /// Resolved Wyrd access-token claims.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -779,13 +555,21 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> TokenVe
 pub struct AccessTokenClaims {
     /// Ultimate initiator, JWT `sub`.
     pub sub: String,
-    /// Current actor whose roles are evaluated for authorization.
+    /// Current actor whose authority the token carries.
     pub principal: TokenPrincipalRef,
     /// Roles assigned to the current actor at issue time.
+    ///
+    /// Informational metadata only. No request resolves or authorizes from
+    /// it; [`Self::permissions`] is the token's authority.
     pub roles: Vec<RoleRef>,
+    /// The current actor's effective permissions, resolved from its grants
+    /// when the token was issued. The only tenant authority claim.
+    pub permissions: PermissionSet,
     /// RFC 8693 actor chain for delegated tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub act: Option<Box<ActClaim>>,
+    /// Audience, JWT `aud`; always [`WYRD_ACCESS_TOKEN_AUDIENCE`].
+    pub aud: String,
     /// Expiry as Unix seconds, JWT `exp`.
     pub exp: usize,
     /// Issued-at as Unix seconds, JWT `iat`.
@@ -800,11 +584,11 @@ pub struct AccessTokenClaims {
     /// Carried so audit can name which of a principal's several live
     /// credentials made a decision — the one thing needed to revoke the right
     /// key after a leak. Absent for a federated human session and for tokens
-    /// the server mints internally. It is not an authority: verification
-    /// resolves what the principal may do from the store, exactly as before.
+    /// the server mints internally. It is attribution, not authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cid: Option<String>,
 }
+
 
 /// Claims carried by a platform-scope access token.
 ///
@@ -948,47 +732,40 @@ impl From<&Principal> for TokenPrincipalRef {
 impl AccessTokenClaims {
     /// Convert verified claims into a runtime verified-token envelope.
     ///
+    /// The runtime principal is built directly from the claims: its effective
+    /// permissions are the `permissions` claim and nothing is read from a
+    /// store. `roles` is copied through as informational metadata.
+    ///
     /// # Errors
-    /// Returns an error when card-bound principal invariants fail, role resolution fails, the
-    /// delegation chain is too deep, or the expiry timestamp is invalid.
-    pub async fn into_verified<R: PermissionResolver>(
-        &self,
-        resolver: &R,
-    ) -> Result<VerifiedToken, AuthError> {
+    /// Returns an error when card-bound principal invariants fail, the
+    /// delegation chain is too deep or malformed, or the expiry timestamp is
+    /// out of range.
+    pub fn into_verified(&self) -> Result<VerifiedToken, AuthError> {
         let kind = wire_kind_into_principal_kind(
             self.principal.kind,
             self.principal.card_ref.as_ref(),
             &self.principal.card_ref_scope,
         )?;
-        let effective_permissions = resolver
-            .resolve(&self.principal.tenant_id, &self.roles)
-            .await
-            .map_err(|error| match error {
-                ResolveError::Unavailable(_) => AuthError::VerifyUnavailable,
-                ResolveError::BadPermissionsJson { .. } => AuthError::PermissionsCorrupt,
-            })?;
         let principal = Principal::new(
             self.principal.id,
             kind,
             self.principal.tenant_id,
             self.roles.clone(),
-            effective_permissions,
+            self.permissions.clone(),
         )
         .with_credential_id(self.cid.as_deref().and_then(|cid| cid.parse().ok()));
         let delegation_chain = flatten_act_chain(self.act.as_deref())?;
         let exp =
             DateTime::<Utc>::from_timestamp(self.exp as i64, 0).ok_or(AuthError::InvalidToken)?;
-        let iat =
-            DateTime::<Utc>::from_timestamp(self.iat as i64, 0).ok_or(AuthError::InvalidToken)?;
 
         Ok(VerifiedToken {
             principal,
             delegation_chain,
             exp,
-            iat,
         })
     }
 }
+
 
 /// Resolve the wire principal-kind tag and Card binding into a `PrincipalKind`.
 ///
@@ -1149,10 +926,7 @@ pub fn public_key_from_pem(pem: &[u8]) -> Result<DecodingKey, AuthError> {
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
-
-    use chrono::{DateTime, Utc};
 
     use jsonwebtoken::{Algorithm, EncodingKey, Header, Validation, encode};
     use secrecy::SecretString;
@@ -1173,14 +947,16 @@ mod tests {
     use wyrd_spec::reference::{CardRef, CardRefScope};
 
     use super::{
-        AccessTokenClaims, ActClaim, AuthError, Kid, MAX_BEARER_TOKEN_BYTES, MAX_DELEGATION_DEPTH,
-        PermissionResolver, PrincipalKindTag, ResolveError, RevocationCheck, TokenPrincipalRef,
-        TokenVerifier, WyrdAuthVerifySettings, decode_kid, public_key_from_pem, verify_eddsa,
-        verify_eddsa_with,
+        AccessTokenClaims, ActClaim, AuthError, ExternalVerifier, Kid, MAX_BEARER_TOKEN_BYTES,
+        MAX_DELEGATION_DEPTH, PrincipalKindTag, TokenPrincipalRef, TokenVerifier,
+        WYRD_ACCESS_TOKEN_AUDIENCE, WyrdAuthVerifySettings, decode_kid, public_key_from_pem,
+        verify_eddsa, verify_eddsa_with,
     };
 
     const PRIVATE_KEY_PEM: &[u8] = b"-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
     const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n";
+    /// A second Ed25519 key the verifier does not trust.
+    const OTHER_PRIVATE_KEY_PEM: &[u8] = b"-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIByme/fpiJQ3GvvAlTUcSGe2JZmngm9PVGO0YGL1dMM/\n-----END PRIVATE KEY-----\n";
 
     #[test]
     fn verify_eddsa_roundtrips_access_token() {
@@ -1283,9 +1059,8 @@ mod tests {
         assert_no_sqlx_in_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"));
     }
 
-    #[tokio::test]
-    async fn into_verified_resolves_permissions_and_flattens_delegation_initiator_first() {
-        let resolver = TestResolver::default();
+    #[test]
+    fn into_verified_carries_permissions_claim_and_flattens_delegation_initiator_first() {
         let initiator = service_ref("initiator");
         let immediate = service_ref("immediate");
         let claims = AccessTokenClaims {
@@ -1304,8 +1079,7 @@ mod tests {
         };
 
         let verified = claims
-            .into_verified(&resolver)
-            .await
+            .into_verified()
             .expect("claims convert");
 
         assert!(
@@ -1323,14 +1097,13 @@ mod tests {
             verified.delegation_chain[1].principal.card_ref(),
             immediate.card_ref.as_ref()
         );
-        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
     }
 
     /// A Card-free service is a valid machine principal: Card binding is a
     /// property of a deployed workload, not a precondition for holding a
     /// credential. It resolves with no bound Card and therefore no emit scope.
-    #[tokio::test]
-    async fn into_verified_accepts_card_free_service_with_empty_scope() {
+    #[test]
+    fn into_verified_accepts_card_free_service_with_empty_scope() {
         let claims = AccessTokenClaims {
             principal: TokenPrincipalRef {
                 kind: PrincipalKindTag::Service,
@@ -1342,8 +1115,7 @@ mod tests {
         };
 
         let verified = claims
-            .into_verified(&TestResolver::default())
-            .await
+            .into_verified()
             .expect("card-free service resolves");
 
         assert!(matches!(
@@ -1363,8 +1135,8 @@ mod tests {
 
     /// A Card-free service claiming emit scope is refused: scope is derived
     /// from a bound Card, so a populated scope without one is unattributable.
-    #[tokio::test]
-    async fn into_verified_rejects_card_free_service_claiming_scope() {
+    #[test]
+    fn into_verified_rejects_card_free_service_claiming_scope() {
         let borrowed = card_ref(CardKind::Service);
         let claims = AccessTokenClaims {
             principal: TokenPrincipalRef {
@@ -1376,15 +1148,15 @@ mod tests {
             ..claims_with_times(now() + 3_600, now())
         };
 
-        let result = claims.into_verified(&TestResolver::default()).await;
+        let result = claims.into_verified();
 
         assert!(matches!(result, Err(AuthError::InvalidCardRef)));
     }
 
     /// A platform-scope kind can never resolve to a tenant-scope principal,
     /// even from an otherwise valid token.
-    #[tokio::test]
-    async fn into_verified_rejects_platform_scope_kind() {
+    #[test]
+    fn into_verified_rejects_platform_scope_kind() {
         let claims = AccessTokenClaims {
             principal: TokenPrincipalRef {
                 kind: PrincipalKindTag::GlobalAdmin,
@@ -1394,13 +1166,13 @@ mod tests {
             ..claims_with_times(now() + 3_600, now())
         };
 
-        let result = claims.into_verified(&TestResolver::default()).await;
+        let result = claims.into_verified();
 
         assert!(matches!(result, Err(AuthError::InvalidToken)));
     }
 
-    #[tokio::test]
-    async fn into_verified_rejects_card_ref_kind_mismatch() {
+    #[test]
+    fn into_verified_rejects_card_ref_kind_mismatch() {
         let claims = AccessTokenClaims {
             principal: TokenPrincipalRef {
                 kind: PrincipalKindTag::Agent,
@@ -1410,13 +1182,13 @@ mod tests {
             ..claims_with_times(now() + 3_600, now())
         };
 
-        let result = claims.into_verified(&TestResolver::default()).await;
+        let result = claims.into_verified();
 
         assert!(matches!(result, Err(AuthError::InvalidCardRef)));
     }
 
-    #[tokio::test]
-    async fn agent_token_with_card_ref_promotes_to_typed_kind() {
+    #[test]
+    fn agent_token_with_card_ref_promotes_to_typed_kind() {
         let card_ref = card_ref(CardKind::Agent);
         let claims = AccessTokenClaims {
             principal: TokenPrincipalRef {
@@ -1428,8 +1200,7 @@ mod tests {
         };
 
         let verified = claims
-            .into_verified(&TestResolver::default())
-            .await
+            .into_verified()
             .expect("agent claims verify");
 
         assert!(matches!(
@@ -1438,8 +1209,8 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn into_verified_rejects_scope_missing_root_card() {
+    #[test]
+    fn into_verified_rejects_scope_missing_root_card() {
         // Forge a service token whose card_ref_scope does NOT contain the card_ref.
         // The scope is built from a different card ("other-service"), but card_ref
         // is "billing". seed_scope should reject with CardScopeMissingRoot.
@@ -1455,7 +1226,7 @@ mod tests {
             ..claims_with_times(now() + 3_600, now())
         };
 
-        let result = claims.into_verified(&TestResolver::default()).await;
+        let result = claims.into_verified();
 
         assert!(
             matches!(result, Err(AuthError::CardScopeMissingRoot)),
@@ -1463,8 +1234,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn into_verified_accepts_scope_containing_root_card() {
+    #[test]
+    fn into_verified_accepts_scope_containing_root_card() {
         let card_ref = card_ref(CardKind::Service);
         let claims = AccessTokenClaims {
             principal: TokenPrincipalRef {
@@ -1476,7 +1247,7 @@ mod tests {
             ..claims_with_times(now() + 3_600, now())
         };
 
-        let result = claims.into_verified(&TestResolver::default()).await;
+        let result = claims.into_verified();
 
         assert!(
             result.is_ok(),
@@ -1490,369 +1261,199 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn into_verified_rejects_delegation_depth_over_max() {
+    #[test]
+    fn into_verified_rejects_delegation_depth_over_max() {
         let claims = AccessTokenClaims {
             act: Some(Box::new(act_chain(MAX_DELEGATION_DEPTH + 1))),
             ..claims_with_times(now() + 3_600, now())
         };
 
-        let result = claims.into_verified(&TestResolver::default()).await;
+        let result = claims.into_verified();
 
         assert!(matches!(result, Err(AuthError::DelegationDepthExceeded)));
     }
 
-    #[tokio::test]
-    async fn into_verified_accepts_delegation_depth_at_max() {
+    #[test]
+    fn into_verified_accepts_delegation_depth_at_max() {
         let claims = AccessTokenClaims {
             act: Some(Box::new(act_chain(MAX_DELEGATION_DEPTH))),
             ..claims_with_times(now() + 3_600, now())
         };
 
-        let result = claims.into_verified(&TestResolver::default()).await;
+        let result = claims.into_verified();
 
         assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn into_verified_maps_resolver_unavailable_to_verify_unavailable() {
-        let resolver = TestResolver {
-            unavailable: true,
-            ..TestResolver::default()
-        };
-        let claims = claims_with_times(now() + 3_600, now());
-
-        let result = claims.into_verified(&resolver).await;
-
-        assert!(matches!(result, Err(AuthError::VerifyUnavailable)));
-    }
-
-    #[tokio::test]
-    async fn token_verifier_caches_by_token_hash() {
-        let resolver = Arc::new(TestResolver::default());
-        let verifier = verifier(Arc::clone(&resolver), WyrdAuthVerifySettings::default());
-        let token = SecretString::from(encode_eddsa_with_kid(&claims_with_times(
-            now() + 3_600,
-            now(),
-        )));
-
-        verifier
-            .verify(&token, &tenant_id())
-            .await
-            .expect("first verify succeeds");
-        verifier
-            .verify(&token, &tenant_id())
-            .await
-            .expect("second verify succeeds from cache");
-
-        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn token_verifier_rejects_cross_tenant_hit_and_evicts_cached_token() {
-        let resolver = Arc::new(TestResolver::default());
-        let verifier = verifier(Arc::clone(&resolver), WyrdAuthVerifySettings::default());
-        let token = SecretString::from(encode_eddsa_with_kid(&claims_with_times(
-            now() + 3_600,
-            now(),
-        )));
-
-        verifier
-            .verify(&token, &tenant_id())
-            .await
-            .expect("first verify succeeds");
-        let wrong_tenant = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b09"
-            .parse()
-            .expect("static tenant id is valid");
-        let result = verifier.verify(&token, &wrong_tenant).await;
-        assert!(matches!(result, Err(AuthError::InvalidToken)));
-
-        verifier
-            .verify(&token, &tenant_id())
-            .await
-            .expect("verify after tenant mismatch re-resolves");
-        assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
-    }
-
-    #[tokio::test]
-    async fn token_verifier_rejects_cross_tenant_miss_before_resolver() {
-        let resolver = Arc::new(TestResolver::default());
-        let verifier = verifier(Arc::clone(&resolver), WyrdAuthVerifySettings::default());
-        let token = SecretString::from(encode_eddsa_with_kid(&claims_with_times(
-            now() + 3_600,
-            now(),
-        )));
-        let wrong_tenant = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b09"
-            .parse()
-            .expect("static tenant id is valid");
-
-        let result = verifier.verify(&token, &wrong_tenant).await;
-
-        assert!(matches!(result, Err(AuthError::InvalidToken)));
-        assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn token_verifier_rejects_oversize_token() {
-        let verifier = verifier(
-            Arc::new(TestResolver::default()),
-            WyrdAuthVerifySettings::default(),
-        );
-        let token = SecretString::from("x".repeat(MAX_BEARER_TOKEN_BYTES + 1));
-
-        let result = verifier.verify(&token, &tenant_id()).await;
-
-        assert!(matches!(result, Err(AuthError::BadTokenFormat)));
-    }
-
-    #[tokio::test]
-    async fn invalidate_removes_entry_and_forces_re_resolve() {
-        let resolver = Arc::new(TestResolver::default());
-        let verifier = verifier(Arc::clone(&resolver), WyrdAuthVerifySettings::default());
-        let token = SecretString::from(encode_eddsa_with_kid(&claims_with_times(
-            now() + 3_600,
-            now(),
-        )));
-
-        verifier
-            .verify(&token, &tenant_id())
-            .await
-            .expect("first verify succeeds");
-        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
-
-        verifier.invalidate(&token).await;
-
-        verifier
-            .verify(&token, &tenant_id())
-            .await
-            .expect("verify after invalidate succeeds");
-        assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
-    }
-
-    #[tokio::test]
-    async fn invalidate_principal_removes_matching_entries_and_forces_re_resolve() {
-        let resolver = Arc::new(TestResolver::default());
-        let verifier = verifier(Arc::clone(&resolver), WyrdAuthVerifySettings::default());
-        let claims = claims_with_times(now() + 3_600, now());
-        let principal_id = claims.principal.id;
-        let token = SecretString::from(encode_eddsa_with_kid(&claims));
-
-        verifier
-            .verify(&token, &tenant_id())
-            .await
-            .expect("first verify succeeds");
-        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
-
-        verifier.invalidate_principal(principal_id).await;
-
-        verifier
-            .verify(&token, &tenant_id())
-            .await
-            .expect("verify after principal invalidate succeeds");
-        assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
     }
 
     // -------------------------------------------------------------------------
     // F11: principal-epoch revocation
     // -------------------------------------------------------------------------
 
-    /// Revocation stand-in whose answer and availability the test controls.
-    ///
-    /// `unavailable` is atomic so one test can cache a positive verify while the
-    /// store is healthy and then take the store down, which is the only way to
-    /// reach the cache-hit uncertainty branch.
-    #[derive(Debug)]
-    struct TestRevocation {
-        /// Epoch returned while the store is available.
-        epoch: Option<DateTime<Utc>>,
-        /// When set, every lookup reports [`ResolveError::Unavailable`].
-        unavailable: AtomicBool,
-    }
+    /// The verifier builds the runtime principal from the token alone: its
+    /// authority is the signed `permissions` claim, `roles` rides along as
+    /// metadata, and the credential attribution survives.
+    #[test]
+    fn token_verifier_builds_principal_from_permissions_claim() {
+        let credential = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b0c";
+        let claims = AccessTokenClaims {
+            cid: Some(credential.to_owned()),
+            ..claims_with_times(now() + 3_600, now())
+        };
+        let token = SecretString::from(encode_eddsa_with_kid(&claims));
 
-    impl RevocationCheck for TestRevocation {
-        fn epoch<'a>(
-            &'a self,
-            _tenant: &'a DataTenantId,
-            _principal: PrincipalId,
-            _kind: PrincipalKindTag,
-        ) -> std::pin::Pin<
-            Box<
-                dyn std::future::Future<Output = Result<Option<DateTime<Utc>>, ResolveError>>
-                    + Send
-                    + 'a,
-            >,
-        > {
-            if self.unavailable.load(Ordering::SeqCst) {
-                Box::pin(std::future::ready(Err(ResolveError::Unavailable(
-                    "test outage".to_owned(),
-                ))))
-            } else {
-                Box::pin(std::future::ready(Ok(self.epoch)))
-            }
-        }
-    }
-
-    fn verifier_with_revocation(
-        resolver: Arc<TestResolver>,
-        epoch: Option<DateTime<Utc>>,
-    ) -> TokenVerifier<TestResolver, StubIssuerResolver> {
-        let check = Arc::new(TestRevocation {
-            epoch,
-            unavailable: AtomicBool::new(false),
-        });
-        verifier(resolver, WyrdAuthVerifySettings::default()).with_revocation(check)
-    }
-
-    #[tokio::test]
-    async fn revocation_epoch_rejects_cache_hit_when_iat_predates_epoch() {
-        let resolver = Arc::new(TestResolver::default());
-        let iat_unix = now() - 10;
-        let epoch =
-            DateTime::from_timestamp(iat_unix as i64 + 1, 0).expect("static epoch is valid");
-        let verifier = verifier_with_revocation(Arc::clone(&resolver), Some(epoch));
-        let token = SecretString::from(encode_eddsa_with_kid(&claims_with_times(
-            now() + 3_600,
-            iat_unix,
-        )));
-
-        verifier
+        let verified = verifier(WyrdAuthVerifySettings::default())
             .verify(&token, &tenant_id())
-            .await
-            .expect_err("fresh verify with iat < epoch must fail");
+            .expect("valid token verifies");
 
-        let err = verifier.verify(&token, &tenant_id()).await;
-        assert!(
-            matches!(err, Err(AuthError::Revoked)),
-            "both fresh and cached verify must return Revoked, got: {err:?}"
+        assert_eq!(verified.principal.id, principal_id());
+        assert_eq!(verified.principal.tenant_id, tenant_id());
+        assert_eq!(verified.principal.roles, vec![role()]);
+        assert_eq!(verified.principal.effective_permissions, claims.permissions);
+        assert_eq!(
+            verified.principal.credential_id.map(|id| id.to_string()),
+            Some(credential.to_owned())
         );
     }
 
-    #[tokio::test]
-    async fn revocation_epoch_passes_when_iat_at_or_after_epoch() {
-        let resolver = Arc::new(TestResolver::default());
-        let iat_unix = now() - 5;
-        let epoch =
-            DateTime::from_timestamp(iat_unix as i64 - 1, 0).expect("static epoch is valid");
-        let verifier = verifier_with_revocation(Arc::clone(&resolver), Some(epoch));
-        let token = SecretString::from(encode_eddsa_with_kid(&claims_with_times(
-            now() + 3_600,
-            iat_unix,
-        )));
+    /// `roles` carries no authority: a token naming a role but granting no
+    /// permissions yields a principal with no permissions.
+    #[test]
+    fn token_verifier_treats_roles_as_informational() {
+        let claims = AccessTokenClaims {
+            permissions: PermissionSet::new(),
+            ..claims_with_times(now() + 3_600, now())
+        };
+        let token = SecretString::from(encode_eddsa_with_kid(&claims));
 
-        verifier
+        let verified = verifier(WyrdAuthVerifySettings::default())
             .verify(&token, &tenant_id())
-            .await
-            .expect("token issued after epoch must pass");
+            .expect("valid token verifies");
+
+        assert_eq!(verified.principal.roles, vec![role()]);
+        assert!(verified.principal.effective_permissions.is_empty());
     }
 
-    /// The successor minted at exactly the epoch is admitted.
-    ///
-    /// A role change advances the epoch to the next whole second and mints the
-    /// replacement token at that same instant, so `iat == epoch` is the shape
-    /// the ordering depends on: retiring it would sign the human out of the
-    /// session the change just established, while admitting anything older
-    /// would leave the withdrawn role spendable.
-    ///
-    /// # Panics
-    /// Panics when the equal-second successor is refused.
-    #[tokio::test]
-    async fn revocation_epoch_admits_the_successor_minted_at_the_epoch() {
-        let resolver = Arc::new(TestResolver::default());
-        let iat_unix = now() - 5;
-        let epoch = DateTime::from_timestamp(iat_unix as i64, 0).expect("static epoch is valid");
-        let verifier = verifier_with_revocation(Arc::clone(&resolver), Some(epoch));
+    /// The `permissions` claim round-trips through signing and decoding.
+    #[test]
+    fn access_token_claims_round_trip_permissions() {
+        let claims = claims_with_times(now() + 3_600, now());
+        let decoded = verify_eddsa_with::<AccessTokenClaims>(
+            &encode_eddsa(&claims),
+            &public_key(),
+            wyrd_validation(),
+        )
+        .expect("valid token decodes");
+
+        assert_eq!(decoded, claims);
+    }
+
+    /// A token signed by a key other than the named deployment key fails.
+    #[test]
+    fn token_verifier_rejects_wrong_signature() {
+        let other = EncodingKey::from_ed_pem(OTHER_PRIVATE_KEY_PEM).expect("other key parses");
+        let mut header = Header::new(Algorithm::EdDSA);
+        header.kid = Some("k1".to_owned());
+        let token = encode(&header, &claims_with_times(now() + 3_600, now()), &other)
+            .expect("test token signs");
+
+        let result = verifier(WyrdAuthVerifySettings::default())
+            .verify(&SecretString::from(token), &tenant_id());
+
+        assert!(matches!(result, Err(AuthError::Jwt(_))), "{result:?}");
+    }
+
+    /// A token from another issuer fails.
+    #[test]
+    fn token_verifier_rejects_wrong_issuer() {
+        let claims = AccessTokenClaims {
+            iss: "other".to_owned(),
+            ..claims_with_times(now() + 3_600, now())
+        };
+        let token = SecretString::from(encode_eddsa_with_kid(&claims));
+
+        let result = verifier(WyrdAuthVerifySettings::default()).verify(&token, &tenant_id());
+
+        assert!(matches!(result, Err(AuthError::Jwt(_))), "{result:?}");
+    }
+
+    /// A token for another audience fails.
+    #[test]
+    fn token_verifier_rejects_wrong_audience() {
+        let claims = AccessTokenClaims {
+            aud: "not-wyrd".to_owned(),
+            ..claims_with_times(now() + 3_600, now())
+        };
+        let token = SecretString::from(encode_eddsa_with_kid(&claims));
+
+        let result = verifier(WyrdAuthVerifySettings::default()).verify(&token, &tenant_id());
+
+        assert!(matches!(result, Err(AuthError::Jwt(_))), "{result:?}");
+    }
+
+    /// An expired token fails as expired, with no skew allowance.
+    #[test]
+    fn token_verifier_rejects_expired_token() {
         let token = SecretString::from(encode_eddsa_with_kid(&claims_with_times(
-            now() + 3_600,
-            iat_unix,
+            now() - 1,
+            now() - 301,
         )));
-
-        verifier
-            .verify(&token, &tenant_id())
-            .await
-            .expect("the successor minted at the epoch is the one token it admits");
-    }
-
-    /// A fresh verify whose revocation store is down must refuse, not admit.
-    ///
-    /// This is the cache-miss branch: the signature and claims are good, but the
-    /// deployment cannot answer whether the principal is still admitted, so the
-    /// request gets the retryable unavailable refusal instead of a token.
-    ///
-    /// # Panics
-    /// Panics when the verifier returns anything other than
-    /// [`AuthError::VerifyUnavailable`].
-    #[tokio::test]
-    async fn revocation_unavailable_refuses_a_fresh_verify() {
-        let resolver = Arc::new(TestResolver::default());
-        let check = Arc::new(TestRevocation {
-            epoch: None,
-            unavailable: AtomicBool::new(true),
-        });
-        let verifier = verifier(resolver, WyrdAuthVerifySettings::default()).with_revocation(check);
-        let token = SecretString::from(encode_eddsa_with_kid(&claims_with_times(
-            now() + 3_600,
-            now() - 5,
-        )));
-
-        let err = verifier.verify(&token, &tenant_id()).await;
-        assert!(
-            matches!(err, Err(AuthError::VerifyUnavailable)),
-            "an unreadable revocation store must fail closed, got: {err:?}"
-        );
-    }
-
-    /// A cached positive verify must not outlive the revocation store.
-    ///
-    /// The first verify populates the cache while the store is healthy. Once the
-    /// store is down the cached entry is no longer evidence of admission, so the
-    /// second verify must refuse and drop the entry rather than serve the stale
-    /// permissions.
-    ///
-    /// # Panics
-    /// Panics when the warm-up verify fails or when the post-outage verify
-    /// returns anything other than [`AuthError::VerifyUnavailable`].
-    #[tokio::test]
-    async fn revocation_unavailable_refuses_a_cached_token() {
-        let resolver = Arc::new(TestResolver::default());
-        let check = Arc::new(TestRevocation {
-            epoch: None,
-            unavailable: AtomicBool::new(false),
-        });
-        let verifier = verifier(Arc::clone(&resolver), WyrdAuthVerifySettings::default())
-            .with_revocation(Arc::clone(&check) as Arc<dyn RevocationCheck>);
-        let token = SecretString::from(encode_eddsa_with_kid(&claims_with_times(
-            now() + 3_600,
-            now() - 5,
-        )));
-
-        verifier
-            .verify(&token, &tenant_id())
-            .await
-            .expect("a healthy revocation store admits the token and caches it");
-
-        check.unavailable.store(true, Ordering::SeqCst);
-
-        let err = verifier.verify(&token, &tenant_id()).await;
-        assert!(
-            matches!(err, Err(AuthError::VerifyUnavailable)),
-            "a cached token must not survive an unreadable revocation store, got: {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn is_expired_with_zero_skew_returns_true_for_past_timestamp() {
         let settings = WyrdAuthVerifySettings {
             allowed_clock_skew: Duration::ZERO,
-            ..WyrdAuthVerifySettings::default()
         };
-        let v = verifier(Arc::new(TestResolver::default()), settings);
-        let past = DateTime::<Utc>::from_timestamp((now() as i64) - 3_600, 0)
-            .expect("static past timestamp is valid");
-        let future = DateTime::<Utc>::from_timestamp((now() as i64) + 3_600, 0)
-            .expect("static future timestamp is valid");
 
-        assert!(v.is_expired(past));
-        assert!(!v.is_expired(future));
+        let result = verifier(settings).verify(&token, &tenant_id());
+
+        assert!(matches!(result, Err(AuthError::TokenExpired)), "{result:?}");
+    }
+
+    /// A signed token whose `permissions` claim is not a permission set fails.
+    #[test]
+    fn token_verifier_rejects_malformed_permissions() {
+        let mut claims = serde_json::to_value(claims_with_times(now() + 3_600, now()))
+            .expect("claims serialize");
+        claims["permissions"] = serde_json::json!([{ "resource": "nope" }]);
+        let mut header = Header::new(Algorithm::EdDSA);
+        header.kid = Some("k1".to_owned());
+        let token = encode(&header, &claims, &private_key()).expect("test token signs");
+
+        let result = verifier(WyrdAuthVerifySettings::default())
+            .verify(&SecretString::from(token), &tenant_id());
+
+        assert!(matches!(result, Err(AuthError::Jwt(_))), "{result:?}");
+    }
+
+    /// A valid token for one tenant is refused under another.
+    #[test]
+    fn token_verifier_rejects_cross_tenant_token() {
+        let token = SecretString::from(encode_eddsa_with_kid(&claims_with_times(
+            now() + 3_600,
+            now(),
+        )));
+        let wrong_tenant = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b09"
+            .parse()
+            .expect("static tenant id is valid");
+
+        let result = verifier(WyrdAuthVerifySettings::default()).verify(&token, &wrong_tenant);
+
+        assert!(matches!(result, Err(AuthError::InvalidToken)));
+    }
+
+    /// An oversized bearer is refused before any decoding.
+    #[test]
+    fn token_verifier_rejects_oversize_token() {
+        let token = SecretString::from("x".repeat(MAX_BEARER_TOKEN_BYTES + 1));
+
+        let result = verifier(WyrdAuthVerifySettings::default()).verify(&token, &tenant_id());
+
+        assert!(matches!(result, Err(AuthError::BadTokenFormat)));
+    }
+
+    /// Validation matching [`TokenVerifier`]'s tenant access-token policy.
+    fn wyrd_validation() -> Validation {
+        let mut validation = Validation::new(Algorithm::EdDSA);
+        validation.set_issuer(&["wyrd"]);
+        validation.set_audience(&[WYRD_ACCESS_TOKEN_AUDIENCE]);
+        validation
     }
 
     fn claims_with_times(exp: usize, iat: usize) -> AccessTokenClaims {
@@ -1866,7 +1467,9 @@ mod tests {
                 card_ref_scope: CardRefScope::default(),
             },
             roles: vec![role()],
+            permissions: PermissionSet::from_iter([Permission::card_read()]),
             act: None,
+            aud: WYRD_ACCESS_TOKEN_AUDIENCE.to_owned(),
             exp,
             iat,
             iss: "wyrd".to_owned(),
@@ -2004,16 +1607,13 @@ mod tests {
         act
     }
 
-    fn verifier(
-        resolver: Arc<TestResolver>,
-        settings: WyrdAuthVerifySettings,
-    ) -> TokenVerifier<TestResolver, StubIssuerResolver> {
+    fn verifier(settings: WyrdAuthVerifySettings) -> TokenVerifier {
         let mut keys = HashMap::new();
         keys.insert(
             Kid::new("k1").expect("kid is valid"),
             Arc::new(public_key()),
         );
-        TokenVerifier::new(keys, "wyrd", resolver, settings)
+        TokenVerifier::new(keys, "wyrd", settings)
     }
 
     /// DB-free stub `IssuerConfigResolver` for the crate's own unit tests.
@@ -2045,51 +1645,6 @@ mod tests {
                 .collect();
             async move { Ok(issuers) }
         }
-    }
-
-    #[derive(Debug, Default)]
-    struct TestResolver {
-        calls: AtomicUsize,
-        unavailable: bool,
-        bad_json: bool,
-    }
-
-    impl PermissionResolver for TestResolver {
-        #[allow(clippy::manual_async_fn)]
-        fn resolve<'a>(
-            &'a self,
-            _tenant_id: &'a DataTenantId,
-            _roles: &'a [RoleRef],
-        ) -> impl std::future::Future<Output = Result<PermissionSet, ResolveError>> + Send + 'a
-        {
-            async move {
-                self.calls.fetch_add(1, Ordering::SeqCst);
-                if self.unavailable {
-                    return Err(ResolveError::Unavailable("test outage".to_owned()));
-                }
-                if self.bad_json {
-                    let source = serde_json::from_str::<serde_json::Value>("not json")
-                        .expect_err("bad json is not valid");
-                    return Err(ResolveError::BadPermissionsJson {
-                        role: "test_role".to_owned(),
-                        source,
-                    });
-                }
-                Ok(PermissionSet::from_iter([Permission::card_read()]))
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn into_verified_maps_bad_permissions_json_to_permissions_corrupt() {
-        let resolver = TestResolver {
-            bad_json: true,
-            ..TestResolver::default()
-        };
-        let result = claims_with_times(now() + 3_600, now())
-            .into_verified(&resolver)
-            .await;
-        assert!(matches!(result, Err(AuthError::PermissionsCorrupt)));
     }
 
     // -------------------------------------------------------------------------
@@ -2172,12 +1727,11 @@ mod tests {
     }
 
     fn with_external_issuer(
-        resolver: Arc<TestResolver>,
         trusted: TrustedIssuer,
         jwks: Arc<JwksCache>,
-    ) -> TokenVerifier<TestResolver, StubIssuerResolver> {
+    ) -> ExternalVerifier<StubIssuerResolver> {
         let stub = Arc::new(StubIssuerResolver::new(vec![trusted]));
-        verifier(resolver, WyrdAuthVerifySettings::default()).with_external(jwks, stub)
+        ExternalVerifier::new(jwks, stub, WyrdAuthVerifySettings::default())
     }
 
     // -------------------------------------------------------------------------
@@ -2199,8 +1753,7 @@ mod tests {
         let issuer = IssuerUrl::new(EXTERNAL_ISSUER).expect("test issuer is valid");
         let tid = tenant_id();
         let trusted = make_trusted_issuer(tid, issuer.clone(), EXTERNAL_AUDIENCE, jwks_uri);
-        let resolver = Arc::new(TestResolver::default());
-        let v = with_external_issuer(Arc::clone(&resolver), trusted, make_jwks_cache());
+        let v = with_external_issuer(trusted, make_jwks_cache());
 
         let claims = external_claims(EXTERNAL_ISSUER, EXTERNAL_AUDIENCE, now() + 3_600, now());
         let token = encode_external_token(&claims, EXTERNAL_KID);
@@ -2215,8 +1768,6 @@ mod tests {
         assert_eq!(identity.subject, "ext-user@idp.example.com");
         assert_eq!(identity.email.as_deref(), Some("ext@example.com"));
         assert_eq!(identity.groups, vec!["viewer"]);
-        // R03: no PermissionResolver call on the external path.
-        assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -2245,11 +1796,7 @@ mod tests {
 
         let stub = Arc::new(StubIssuerResolver::new(vec![trusted_a, trusted_b]));
         let jwks = make_jwks_cache();
-        let v = verifier(
-            Arc::new(TestResolver::default()),
-            WyrdAuthVerifySettings::default(),
-        )
-        .with_external(jwks, stub);
+        let v = ExternalVerifier::new(jwks, stub, WyrdAuthVerifySettings::default());
 
         // Token signed with aud-for-a.
         let claims_a = external_claims(EXTERNAL_ISSUER, "aud-for-a", now() + 3_600, now());
@@ -2273,11 +1820,7 @@ mod tests {
         // Empty resolver — the (tenant, iss) pair is not trusted.
         let stub = Arc::new(StubIssuerResolver::default());
         let jwks = make_jwks_cache();
-        let v = verifier(
-            Arc::new(TestResolver::default()),
-            WyrdAuthVerifySettings::default(),
-        )
-        .with_external(jwks, stub);
+        let v = ExternalVerifier::new(jwks, stub, WyrdAuthVerifySettings::default());
 
         let claims = external_claims(EXTERNAL_ISSUER, EXTERNAL_AUDIENCE, now() + 3_600, now());
         let token = encode_external_token(&claims, EXTERNAL_KID);
@@ -2286,37 +1829,6 @@ mod tests {
         assert!(
             matches!(result, Err(AuthError::InvalidToken)),
             "untrusted issuer should be InvalidToken"
-        );
-    }
-
-    #[tokio::test]
-    async fn verify_external_without_external_configured_returns_invalid_token() {
-        // No with_external() call → external path is None.
-        let v = verifier(
-            Arc::new(TestResolver::default()),
-            WyrdAuthVerifySettings::default(),
-        );
-        let claims = external_claims(EXTERNAL_ISSUER, EXTERNAL_AUDIENCE, now() + 3_600, now());
-        let token = encode_external_token(&claims, EXTERNAL_KID);
-
-        let result = v.verify_external(&tenant_id(), &token).await;
-        assert!(matches!(result, Err(AuthError::InvalidToken)));
-    }
-
-    #[tokio::test]
-    async fn verify_external_rejects_local_issuer_token() {
-        // Token with iss == local issuer ("wyrd") must go through verify(), not verify_external().
-        let v = verifier(
-            Arc::new(TestResolver::default()),
-            WyrdAuthVerifySettings::default(),
-        );
-        let claims = claims_with_times(now() + 3_600, now()); // iss: "wyrd"
-        let token = encode_eddsa_with_kid(&claims);
-
-        let result = v.verify_external(&tenant_id(), &token).await;
-        assert!(
-            matches!(result, Err(AuthError::InvalidToken)),
-            "local-issuer token should be rejected by verify_external"
         );
     }
 
@@ -2335,9 +1847,7 @@ mod tests {
         let issuer = IssuerUrl::new(EXTERNAL_ISSUER).expect("test issuer is valid");
         let tid = tenant_id();
         let trusted = make_trusted_issuer(tid, issuer, EXTERNAL_AUDIENCE, jwks_uri);
-        let v = with_external_issuer(
-            Arc::new(TestResolver::default()),
-            trusted,
+        let v = with_external_issuer(trusted,
             make_jwks_cache(),
         );
 
@@ -2371,8 +1881,7 @@ mod tests {
         };
         let trusted = make_trusted_issuer(tid, issuer, EXTERNAL_AUDIENCE, jwks_uri);
         let stub = Arc::new(StubIssuerResolver::new(vec![trusted]));
-        let v = verifier(Arc::new(TestResolver::default()), settings)
-            .with_external(make_jwks_cache(), stub);
+        let v = ExternalVerifier::new(make_jwks_cache(), stub, settings);
 
         let claims = external_claims(
             EXTERNAL_ISSUER,
@@ -2397,9 +1906,7 @@ mod tests {
         let issuer = IssuerUrl::new(EXTERNAL_ISSUER).expect("test issuer is valid");
         let tid = tenant_id();
         let trusted = make_trusted_issuer(tid, issuer, EXTERNAL_AUDIENCE, jwks_uri);
-        let v = with_external_issuer(
-            Arc::new(TestResolver::default()),
-            trusted,
+        let v = with_external_issuer(trusted,
             make_jwks_cache(),
         );
 
@@ -2446,11 +1953,7 @@ mod tests {
             make_trusted_issuer(tid, issuer.clone(), EXTERNAL_AUDIENCE, jwks_uri.clone());
         let stub = Arc::new(StubIssuerResolver::new(vec![trusted_for_old]));
         {
-            let v = verifier(
-                Arc::new(TestResolver::default()),
-                WyrdAuthVerifySettings::default(),
-            )
-            .with_external(Arc::clone(&jwks), Arc::clone(&stub));
+            let v = ExternalVerifier::new(Arc::clone(&jwks), Arc::clone(&stub), WyrdAuthVerifySettings::default());
             let old_claims =
                 external_claims(EXTERNAL_ISSUER, EXTERNAL_AUDIENCE, now() + 3_600, now());
             let old_token = encode_external_token(&old_claims, old_kid);
@@ -2464,11 +1967,7 @@ mod tests {
         // triggers one refetch → found in the new key set → success.
         let trusted_for_new = make_trusted_issuer(tid, issuer, EXTERNAL_AUDIENCE, jwks_uri);
         let stub2 = Arc::new(StubIssuerResolver::new(vec![trusted_for_new]));
-        let v2 = verifier(
-            Arc::new(TestResolver::default()),
-            WyrdAuthVerifySettings::default(),
-        )
-        .with_external(Arc::clone(&jwks), stub2);
+        let v2 = ExternalVerifier::new(Arc::clone(&jwks), stub2, WyrdAuthVerifySettings::default());
         let new_claims = external_claims(EXTERNAL_ISSUER, EXTERNAL_AUDIENCE, now() + 3_600, now());
         let new_token = encode_external_token(&new_claims, new_kid);
         v2.verify_external(&tid, &new_token)

@@ -16,9 +16,9 @@ use ulid::Ulid;
 use uuid::Uuid;
 use wyrd_auth_verify::{
     AccessTokenClaims, ActClaim, Kid, PLATFORM_TOKEN_SCOPE, PlatformAccessTokenClaims,
-    RefreshTokenClaims, TokenPrincipalRef,
+    RefreshTokenClaims, TokenPrincipalRef, WYRD_ACCESS_TOKEN_AUDIENCE,
 };
-use wyrd_runtime::{PrincipalId, RoleRef};
+use wyrd_runtime::{PermissionSet, PrincipalId, RoleRef};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalKindTag;
 use wyrd_spec::envelope::CardKind;
@@ -85,14 +85,14 @@ pub enum IssueError {
     /// Key id was malformed.
     #[error("kid must match ^[A-Za-z0-9._-]{{1,64}}$")]
     InvalidKid,
-    /// Principal kind did not match the requested issue helper.
-    #[error("principal kind does not match token issue helper")]
+    /// Principal kind cannot hold a tenant access token.
+    #[error("principal kind cannot hold a tenant access token")]
     InvalidPrincipalKind,
     /// Principal card reference was missing or mismatched.
     #[error("principal card_ref is missing or mismatched")]
     InvalidCardRef,
     /// Encoded token would exceed the verifier bearer-token size limit.
-    #[error("card_ref_scope token too large: encoded length {encoded_len} exceeds limit {limit}")]
+    #[error("token too large: encoded length {encoded_len} exceeds limit {limit}")]
     CardScopeTooLarge {
         /// Encoded token byte length.
         encoded_len: usize,
@@ -101,10 +101,31 @@ pub enum IssueError {
     },
 }
 
-/// Minimal caller context for RFC 8693 token delegation.
+/// Everything one tenant access token asserts, resolved by the issuance
+/// workflow before signing.
 ///
-/// Contains only the three fields read by [`IssuingKey::issue_delegated_access_token`],
-/// avoiding fabrication of unused fields such as `iss`, `jti`, `roles`, and timestamps.
+/// A plain value: the issuance owner loads the current principal and grants,
+/// then hands this to [`IssuingKey::issue_access_token`], which owns claim
+/// shape, audience, TTL arithmetic, and signing.
+#[derive(Debug)]
+pub struct AccessGrant {
+    /// Principal the token is minted for (the current actor).
+    pub principal: TokenPrincipalRef,
+    /// Roles assigned to the principal; informational metadata only.
+    pub roles: Vec<RoleRef>,
+    /// The principal's effective permissions; the token's authority.
+    pub permissions: PermissionSet,
+    /// Stored credential the token was exchanged from, when one was presented.
+    pub credential_id: Option<Uuid>,
+    /// Delegating caller for an RFC 8693 exchange; `None` for a direct token.
+    pub delegated_by: Option<DelegationCaller>,
+}
+
+/// Caller context for RFC 8693 token delegation.
+///
+/// The delegating token's subject, principal, and `act` chain, which become
+/// the newest layer of the delegated token's `act` chain.
+#[derive(Debug)]
 pub struct DelegationCaller {
     /// Subject identifier of the original caller (the `sub` claim of their token).
     pub sub: String,
@@ -175,232 +196,101 @@ impl IssuingKey {
         Ok(SecretString::from(pem.to_string()))
     }
 
-    /// Mint an access token for a user principal.
+    /// Mint a tenant access token for one resolved grant.
     ///
-    /// `credential_id` names the stored credential that authenticated this
-    /// request when there is one. A federated sign-in presents a provider
-    /// token and holds none, so it passes `None`; a session renewed through the
-    /// refresh grant names the refresh row it consumed, which is what makes a
-    /// renewed human decision attributable rather than indistinguishable from
-    /// credential-free federation.
-    ///
-    /// # Errors
-    /// Returns an error when the principal is not a user, TTL is invalid, or signing fails.
-    pub fn issue_user_access_token(
-        &self,
-        principal: TokenPrincipalRef,
-        roles: Vec<RoleRef>,
-        credential_id: Option<Uuid>,
-        ttl: Duration,
-    ) -> Result<String, IssueError> {
-        self.issue_user_access_token_at(principal, roles, credential_id, Utc::now(), ttl)
-    }
-
-    /// Mint an access token for a user principal with an explicitly chosen
-    /// issuing instant.
-    ///
-    /// `iat` is whole seconds and the revocation epoch retires a token only
-    /// when `iat` is strictly older, so a caller that moves the epoch and mints
-    /// the successor in the same transaction cannot let the wall clock decide
-    /// the order: a predecessor minted earlier in the same second would share
-    /// the successor's `iat` and survive the withdrawal. The federated sign-in
-    /// path therefore advances the epoch to the *next* whole second and passes
-    /// that instant here, which puts every already-issued token strictly behind
-    /// the epoch while admitting the one it just minted.
-    ///
-    /// Every other caller wants the wall clock and should use
-    /// [`IssuingKey::issue_user_access_token`].
+    /// The only tenant access-token signing path. It validates that the
+    /// principal's kind and Card binding agree, re-derives a Card-bound
+    /// principal's scope from its root so a caller cannot widen it with extra
+    /// members, extends the RFC 8693 `act` chain when the grant is delegated
+    /// (the delegating caller becomes the newest layer and `sub` stays the
+    /// original initiator), and stamps the fixed Wyrd audience, the grant's
+    /// `permissions` authority snapshot, informational `roles`, and the
+    /// credential attribution. The encoded token must fit the verifier's
+    /// bearer-size limit.
     ///
     /// # Errors
-    /// Returns [`IssueError::InvalidPrincipalKind`] when the principal is not a
-    /// user, [`IssueError::InvalidCardRef`] when it binds a Card,
-    /// [`IssueError::InvalidTtl`] when the TTL is not positive or the instant
-    /// is not representable, and [`IssueError::Signing`] when signing fails.
+    /// Returns [`IssueError::InvalidPrincipalKind`] for a platform-scope kind,
+    /// [`IssueError::InvalidCardRef`] when kind and Card binding disagree,
+    /// [`IssueError::DelegationDepthExceeded`] when the resulting chain would
+    /// exceed [`MAX_DELEGATION_DEPTH`], [`IssueError::InvalidTtl`] for a
+    /// non-positive TTL, [`IssueError::CardScopeTooLarge`] when the encoded
+    /// token exceeds [`MAX_BEARER_TOKEN_BYTES`], and [`IssueError::Signing`]
+    /// when signing fails.
     #[tracing::instrument(
         level = "debug",
-        skip(self, principal),
+        skip(self, grant),
         fields(
             kid = %self.kid,
-            principal_id = %principal.id,
-            principal_kind = ?principal.kind,
-            jti = tracing::field::Empty,
-        ),
-        err,
-    )]
-    pub fn issue_user_access_token_at(
-        &self,
-        principal: TokenPrincipalRef,
-        roles: Vec<RoleRef>,
-        credential_id: Option<Uuid>,
-        issued_at: DateTime<Utc>,
-        ttl: Duration,
-    ) -> Result<String, IssueError> {
-        if principal.kind != PrincipalKindTag::User {
-            return Err(IssueError::InvalidPrincipalKind);
-        }
-        validate_principal_ref(&principal)?;
-        self.issue_access_token_with_claims(
-            principal.id.to_string(),
-            principal,
-            roles,
-            None,
-            credential_id,
-            TokenWindow { issued_at, ttl },
-        )
-    }
-
-    /// Mint an access token for a Card-free machine principal.
-    ///
-    /// Covers the tenant administrator and tenant automation: identities that
-    /// hold a credential and roles but bind no Card, so they carry no emit
-    /// scope. Without this a Card-free principal could be created and issued a
-    /// credential it could never exchange, which would make a provisioned
-    /// tenant unusable.
-    ///
-    /// # Errors
-    /// Returns [`IssueError::InvalidPrincipalKind`] when the kind is not a
-    /// Card-free machine kind, [`IssueError::InvalidCardRef`] when a Card is
-    /// present, and a signing or timestamp error otherwise.
-    #[tracing::instrument(level = "debug", skip(self), fields(jti = tracing::field::Empty), err)]
-    pub fn issue_cardless_access_token(
-        &self,
-        principal: TokenPrincipalRef,
-        roles: Vec<RoleRef>,
-        credential_id: Option<Uuid>,
-        ttl: Duration,
-    ) -> Result<String, IssueError> {
-        if !matches!(
-            principal.kind,
-            PrincipalKindTag::TenantAdmin | PrincipalKindTag::Service
-        ) {
-            return Err(IssueError::InvalidPrincipalKind);
-        }
-        if principal.card_ref.is_some() {
-            return Err(IssueError::InvalidCardRef);
-        }
-        validate_principal_ref(&principal)?;
-        self.issue_access_token_with_claims(
-            principal.id.to_string(),
-            principal,
-            roles,
-            None,
-            credential_id,
-            TokenWindow::starting_now(ttl),
-        )
-    }
-
-    /// Mint an access token for a Card-bound principal.
-    ///
-    /// Service and Agent differ only in which `CardKind` the bound Card must
-    /// have, so one entry point covers both: the principal's own kind tag names
-    /// the expected Card kind, and a mismatch between the two is exactly the
-    /// confusion this check exists to reject.
-    ///
-    /// The presented scope is re-derived from the root Card so a caller cannot
-    /// widen it by passing extra members, and `credential_id` records which
-    /// credential the token was minted from so a decision made with it is
-    /// attributable after a rotation.
-    ///
-    /// # Errors
-    /// Returns [`IssueError::InvalidPrincipalKind`] when the kind is not
-    /// Service or Agent, [`IssueError::InvalidCardRef`] when no Card is bound
-    /// or its kind does not match the principal's, and a signing or timestamp
-    /// error otherwise.
-    #[tracing::instrument(
-        level = "debug",
-        skip(self, principal),
-        fields(
-            kid = %self.kid,
-            principal_id = %principal.id,
-            tenant_id = %principal.tenant_id,
-            jti = tracing::field::Empty,
-        ),
-        err,
-    )]
-    pub fn issue_card_access_token(
-        &self,
-        principal: TokenPrincipalRef,
-        roles: Vec<RoleRef>,
-        credential_id: Option<Uuid>,
-        ttl: Duration,
-    ) -> Result<String, IssueError> {
-        let expected = match principal.kind {
-            PrincipalKindTag::Service => CardKind::Service,
-            PrincipalKindTag::Agent => CardKind::Agent,
-            _ => return Err(IssueError::InvalidPrincipalKind),
-        };
-        let Some(card_ref) = principal.card_ref.clone() else {
-            return Err(IssueError::InvalidCardRef);
-        };
-        if card_ref.kind != expected {
-            return Err(IssueError::InvalidCardRef);
-        }
-        let card_ref_scope = CardRefScope::from_root_and_members(
-            &card_ref,
-            principal.card_ref_scope.as_slice().iter().cloned(),
-        );
-        let subject = principal.id.to_string();
-        let principal = TokenPrincipalRef {
-            card_ref_scope,
-            ..principal
-        };
-        self.issue_access_token_with_claims(
-            subject,
-            principal,
-            roles,
-            None,
-            credential_id,
-            TokenWindow::starting_now(ttl),
-        )
-    }
-
-    /// Mint a delegated access token via RFC 8693 token exchange.
-    ///
-    /// # Errors
-    /// Returns an error when the requested subject is invalid, TTL is invalid, delegation depth is
-    /// exceeded, or signing fails.
-    #[tracing::instrument(
-        level = "debug",
-        skip(self, caller, requested_subject),
-        fields(
-            kid = %self.kid,
-            requested_subject = %requested_subject.id,
+            principal_id = %grant.principal.id,
+            principal_kind = ?grant.principal.kind,
+            tenant_id = %grant.principal.tenant_id,
             delegation_depth = tracing::field::Empty,
             jti = tracing::field::Empty,
         ),
         err,
     )]
-    pub fn issue_delegated_access_token(
+    pub fn issue_access_token(
         &self,
-        caller: &DelegationCaller,
-        requested_subject: TokenPrincipalRef,
-        requested_roles: Vec<RoleRef>,
+        grant: AccessGrant,
         ttl: Duration,
     ) -> Result<String, IssueError> {
-        validate_principal_ref(&requested_subject)?;
-        let resulting_depth = act_depth(caller.act.as_deref()) + 1;
-        tracing::Span::current().record("delegation_depth", resulting_depth);
-        if resulting_depth > MAX_DELEGATION_DEPTH {
-            return Err(IssueError::DelegationDepthExceeded {
-                max: MAX_DELEGATION_DEPTH,
+        let AccessGrant {
+            mut principal,
+            roles,
+            permissions,
+            credential_id,
+            delegated_by,
+        } = grant;
+        validate_principal_ref(&principal)?;
+        if let Some(card_ref) = &principal.card_ref {
+            principal.card_ref_scope = CardRefScope::from_root_and_members(
+                card_ref,
+                principal.card_ref_scope.as_slice().iter().cloned(),
+            );
+        }
+        let (sub, act) = match delegated_by {
+            None => (principal.id.to_string(), None),
+            Some(caller) => {
+                let resulting_depth = act_depth(caller.act.as_deref()) + 1;
+                tracing::Span::current().record("delegation_depth", resulting_depth);
+                if resulting_depth > MAX_DELEGATION_DEPTH {
+                    return Err(IssueError::DelegationDepthExceeded {
+                        max: MAX_DELEGATION_DEPTH,
+                    });
+                }
+                let sub = caller.sub.clone();
+                let act = ActClaim {
+                    sub: caller.sub,
+                    principal: caller.principal,
+                    act: caller.act,
+                };
+                (sub, Some(Box::new(act)))
+            }
+        };
+        let (iat, exp) = timestamps(Utc::now(), ttl)?;
+        let jti = new_jti();
+        tracing::Span::current().record("jti", &jti);
+        let claims = AccessTokenClaims {
+            sub,
+            principal,
+            roles,
+            permissions,
+            act,
+            aud: WYRD_ACCESS_TOKEN_AUDIENCE.to_owned(),
+            exp,
+            iat,
+            iss: self.issuer.clone(),
+            jti,
+            cid: credential_id.map(|id| id.to_string()),
+        };
+        let token = self.encode(&claims)?;
+        if token.len() > MAX_BEARER_TOKEN_BYTES {
+            return Err(IssueError::CardScopeTooLarge {
+                encoded_len: token.len(),
+                limit: MAX_BEARER_TOKEN_BYTES,
             });
         }
-
-        let act = Some(Box::new(ActClaim {
-            sub: caller.sub.clone(),
-            principal: caller.principal.clone(),
-            act: caller.act.clone(),
-        }));
-
-        self.issue_access_token_with_claims(
-            caller.sub.clone(),
-            requested_subject,
-            requested_roles,
-            act,
-            // A delegated token is minted from a token, not from a credential.
-            None,
-            TokenWindow::starting_now(ttl),
-        )
+        Ok(token)
     }
 
     /// Mint a refresh token for any principal kind.
@@ -478,42 +368,6 @@ impl IssuingKey {
         self.encode(&claims)
     }
 
-    /// Assemble and sign one access token from an already-resolved subject,
-    /// principal projection, and delegation chain.
-    ///
-    /// The single signing tail every issuance path shares, so claim shape and
-    /// `jti` allocation are decided in one place rather than per caller.
-    ///
-    /// # Errors
-    /// Returns [`IssueError`] when the requested TTL is not positive, when the
-    /// principal projection is not admissible for its kind, or when the claims
-    /// cannot be encoded and signed.
-    fn issue_access_token_with_claims(
-        &self,
-        sub: String,
-        principal: TokenPrincipalRef,
-        roles: Vec<RoleRef>,
-        act: Option<Box<ActClaim>>,
-        credential_id: Option<Uuid>,
-        window: TokenWindow,
-    ) -> Result<String, IssueError> {
-        let (iat, exp) = timestamps(window.issued_at, window.ttl)?;
-        let jti = new_jti();
-        tracing::Span::current().record("jti", &jti);
-        let claims = AccessTokenClaims {
-            sub,
-            principal,
-            roles,
-            act,
-            exp,
-            iat,
-            iss: self.issuer.clone(),
-            jti,
-            cid: credential_id.map(|id| id.to_string()),
-        };
-        self.encode(&claims)
-    }
-
     fn encode<T: serde::Serialize>(&self, claims: &T) -> Result<String, IssueError> {
         let encoding = EncodingKey::from_ed_pem(self.pem.expose_secret().as_bytes())
             .map_err(IssueError::Signing)?;
@@ -552,30 +406,6 @@ fn argon2() -> Argon2<'static> {
     let params = Params::new(ARGON2_M_COST_KIB, ARGON2_T_COST, ARGON2_P_COST, None)
         .expect("OWASP Argon2id params are valid");
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
-}
-
-/// The instant a token is minted at and how long it stays valid.
-///
-/// Kept together because they are one decision: a caller that wants to order a
-/// token against a revocation epoch chooses the instant, and the expiry has to
-/// be derived from that same instant rather than from the wall clock a moment
-/// later.
-struct TokenWindow {
-    /// The `iat` the token will carry.
-    issued_at: DateTime<Utc>,
-    /// How long after `issued_at` the token stays valid.
-    ttl: Duration,
-}
-
-impl TokenWindow {
-    /// A window opening now, which is what every path but an explicitly
-    /// ordered re-issue wants.
-    fn starting_now(ttl: Duration) -> Self {
-        Self {
-            issued_at: Utc::now(),
-            ttl,
-        }
-    }
 }
 
 fn timestamps(issued_at: DateTime<Utc>, ttl: Duration) -> Result<(usize, usize), IssueError> {
@@ -641,9 +471,10 @@ mod tests {
     use secrecy::{ExposeSecret, SecretString};
     use wyrd_auth_verify::{
         AccessTokenClaims, ActClaim, PLATFORM_TOKEN_SCOPE, PlatformAccessTokenClaims,
-        RefreshTokenClaims, TokenPrincipalRef, decode_kid, public_key_from_pem, verify_eddsa,
+        RefreshTokenClaims, TokenPrincipalRef, WYRD_ACCESS_TOKEN_AUDIENCE, decode_kid,
+        public_key_from_pem, verify_eddsa,
     };
-    use wyrd_runtime::{PrincipalId, RoleRef};
+    use wyrd_runtime::{Permission, PermissionSet, PrincipalId, RoleRef};
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::PrincipalKindTag;
@@ -652,22 +483,17 @@ mod tests {
     use wyrd_spec::reference::{CardRef, CardRefScope};
 
     use super::{
-        ARGON2_M_COST_KIB, DelegationCaller, IssueError, IssuingKey, Kid, MAX_DELEGATION_DEPTH,
-        hash_api_key, verify_api_key,
+        ARGON2_M_COST_KIB, AccessGrant, DelegationCaller, IssueError, IssuingKey, Kid,
+        MAX_BEARER_TOKEN_BYTES, MAX_DELEGATION_DEPTH, hash_api_key, verify_api_key,
     };
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
     const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n";
 
     #[test]
-    fn issue_user_access_token_uses_principal_roles_act_and_jti_shape() {
+    fn issue_access_token_uses_principal_roles_permissions_audience_and_jti_shape() {
         let token = issuing_key()
-            .issue_user_access_token(
-                user_principal(),
-                vec![role("runtime_admin")],
-                None,
-                Duration::minutes(5),
-            )
+            .issue_access_token(grant(user_principal(), vec![role("runtime_admin")]), Duration::minutes(5))
             .expect("token issues");
         let claims = verify_access_token(&token);
 
@@ -678,6 +504,9 @@ mod tests {
         assert_eq!(claims.principal.kind, PrincipalKindTag::User);
         assert_eq!(claims.principal.card_ref, None);
         assert_eq!(claims.roles, vec![role("runtime_admin")]);
+        assert_eq!(claims.permissions, permissions());
+        assert_eq!(claims.aud, WYRD_ACCESS_TOKEN_AUDIENCE);
+        assert_eq!(claims.cid, None);
         assert_eq!(claims.act, None);
         assert_eq!(claims.iss, "wyrd");
         assert_eq!(claims.jti.len(), 26);
@@ -702,19 +531,14 @@ mod tests {
     /// The `card_ref_scope` claim is what later authorizes an observation, so
     /// the issuer must sign it rather than leave a consumer to re-derive it.
     #[test]
-    fn issue_card_access_token_forces_service_card_ref() {
+    fn issue_access_token_forces_service_card_ref() {
         let card_ref = card_ref(CardKind::Service);
         let token = issuing_key()
-            .issue_card_access_token(
-                card_principal(
+            .issue_access_token(grant(card_principal(
                     "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b02",
                     PrincipalKindTag::Service,
                     CardKind::Service,
-                ),
-                vec![role("service")],
-                None,
-                Duration::minutes(5),
-            )
+                ), vec![role("service")]), Duration::minutes(5))
             .expect("token issues");
         let claims = verify_access_token(&token);
 
@@ -732,17 +556,12 @@ mod tests {
     /// Kind and Card kind are separate inputs, so nothing but this check stops
     /// a caller from minting a token whose claimed kind and Card disagree.
     #[test]
-    fn issue_card_access_token_rejects_agent_card_ref_for_a_service() {
-        let result = issuing_key().issue_card_access_token(
-            card_principal(
+    fn issue_access_token_rejects_agent_card_ref_for_a_service() {
+        let result = issuing_key().issue_access_token(grant(card_principal(
                 "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b02",
                 PrincipalKindTag::Service,
                 CardKind::Agent,
-            ),
-            vec![role("service")],
-            None,
-            Duration::minutes(5),
-        );
+            ), vec![role("service")]), Duration::minutes(5));
 
         assert!(matches!(result, Err(IssueError::InvalidCardRef)));
     }
@@ -752,19 +571,14 @@ mod tests {
     /// The Agent half of the same contract: an Agent is always Card-bound, so
     /// a successful issuance always signs a `card_ref` and its own scope.
     #[test]
-    fn issue_card_access_token_forces_agent_card_ref() {
+    fn issue_access_token_forces_agent_card_ref() {
         let card_ref = card_ref(CardKind::Agent);
         let token = issuing_key()
-            .issue_card_access_token(
-                card_principal(
+            .issue_access_token(grant(card_principal(
                     "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b04",
                     PrincipalKindTag::Agent,
                     CardKind::Agent,
-                ),
-                vec![role("agent")],
-                None,
-                Duration::minutes(5),
-            )
+                ), vec![role("agent")]), Duration::minutes(5))
             .expect("token issues");
         let claims = verify_access_token(&token);
 
@@ -782,76 +596,81 @@ mod tests {
     /// The mirror of the Service rejection: the check is symmetric, so neither
     /// kind can borrow the other's Card.
     #[test]
-    fn issue_card_access_token_rejects_service_card_ref_for_an_agent() {
-        let result = issuing_key().issue_card_access_token(
-            card_principal(
+    fn issue_access_token_rejects_service_card_ref_for_an_agent() {
+        let result = issuing_key().issue_access_token(grant(card_principal(
                 "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b04",
                 PrincipalKindTag::Agent,
                 CardKind::Service,
-            ),
-            vec![role("agent")],
-            None,
-            Duration::minutes(5),
-        );
+            ), vec![role("agent")]), Duration::minutes(5));
 
         assert!(matches!(result, Err(IssueError::InvalidCardRef)));
     }
 
-    /// An explicit issuing instant lands in `iat`, and `exp` is measured from
-    /// it.
-    ///
-    /// The federated role-change path picks the instant so the successor sorts
-    /// against the epoch it just wrote. If `iat` came from the wall clock
-    /// anyway, a predecessor minted in the same second would survive the
-    /// withdrawal; if `exp` were measured from the wall clock instead of the
-    /// chosen instant, the successor's lifetime would drift from its TTL.
-    ///
-    /// # Panics
-    /// Panics when the issued claims do not carry the chosen instant.
     #[test]
-    fn issue_user_access_token_at_carries_the_chosen_instant() {
-        let issued_at = chrono::DateTime::from_timestamp(1_800_000_000, 0)
-            .expect("the chosen instant is representable");
-        let token = issuing_key()
-            .issue_user_access_token_at(
-                user_principal(),
-                vec![role("runtime_admin")],
-                None,
-                issued_at,
-                Duration::minutes(5),
-            )
-            .expect("token issues");
-        let claims = verify_access_token(&token);
+    fn issue_access_token_rejects_user_with_card_ref() {
+        let result = issuing_key().issue_access_token(grant(TokenPrincipalRef {
+                card_ref: Some(card_ref(CardKind::Service)),
+                ..user_principal()
+            }, vec![role("runtime_admin")]), Duration::minutes(5));
 
-        assert_eq!(claims.iat, 1_800_000_000);
-        assert_eq!(claims.exp, 1_800_000_000 + 300);
+        assert!(matches!(result, Err(IssueError::InvalidCardRef)));
     }
 
+    /// A platform-scope kind can never hold a tenant access token.
     #[test]
-    fn issue_user_access_token_rejects_non_user_principal() {
-        let result = issuing_key().issue_user_access_token(
-            service_principal(),
-            vec![role("service")],
-            None,
+    fn issue_access_token_rejects_platform_kind() {
+        let result = issuing_key().issue_access_token(
+            grant(
+                TokenPrincipalRef {
+                    kind: PrincipalKindTag::GlobalAdmin,
+                    ..user_principal()
+                },
+                Vec::new(),
+            ),
             Duration::minutes(5),
         );
 
         assert!(matches!(result, Err(IssueError::InvalidPrincipalKind)));
     }
 
+    /// A grant whose encoded token would exceed the verifier's bearer limit is
+    /// refused at issuance rather than minted unverifiable.
     #[test]
-    fn issue_user_access_token_rejects_user_with_card_ref() {
-        let result = issuing_key().issue_user_access_token(
-            TokenPrincipalRef {
-                card_ref: Some(card_ref(CardKind::Service)),
-                ..user_principal()
-            },
-            vec![role("runtime_admin")],
-            None,
-            Duration::minutes(5),
-        );
+    fn issue_access_token_rejects_token_over_bearer_limit() {
+        let roles = (0..800)
+            .map(|index| role(&format!("role_{index:04}")))
+            .collect();
 
-        assert!(matches!(result, Err(IssueError::InvalidCardRef)));
+        let result = issuing_key()
+            .issue_access_token(grant(user_principal(), roles), Duration::minutes(5));
+
+        assert!(matches!(
+            result,
+            Err(IssueError::CardScopeTooLarge {
+                limit: MAX_BEARER_TOKEN_BYTES,
+                ..
+            })
+        ));
+    }
+
+    /// The credential attribution rides in `cid`.
+    #[test]
+    fn issue_access_token_carries_credential_id() {
+        let credential = uuid::Uuid::now_v7();
+        let token = issuing_key()
+            .issue_access_token(
+                AccessGrant {
+                    credential_id: Some(credential),
+                    ..grant(service_principal(), vec![role("service")])
+                },
+                Duration::minutes(5),
+            )
+            .expect("token issues");
+
+        assert_eq!(
+            verify_access_token(&token).cid,
+            Some(credential.to_string())
+        );
     }
 
     #[test]
@@ -878,36 +697,21 @@ mod tests {
     }
 
     #[test]
-    fn issue_user_access_token_rejects_zero_ttl() {
-        let result = issuing_key().issue_user_access_token(
-            user_principal(),
-            vec![role("runtime_admin")],
-            None,
-            Duration::zero(),
-        );
+    fn issue_access_token_rejects_zero_ttl() {
+        let result = issuing_key().issue_access_token(grant(user_principal(), vec![role("runtime_admin")]), Duration::zero());
         assert!(matches!(result, Err(IssueError::InvalidTtl)));
     }
 
     #[test]
-    fn issue_user_access_token_rejects_negative_ttl() {
-        let result = issuing_key().issue_user_access_token(
-            user_principal(),
-            vec![role("runtime_admin")],
-            None,
-            Duration::minutes(-1),
-        );
+    fn issue_access_token_rejects_negative_ttl() {
+        let result = issuing_key().issue_access_token(grant(user_principal(), vec![role("runtime_admin")]), Duration::minutes(-1));
         assert!(matches!(result, Err(IssueError::InvalidTtl)));
     }
 
     #[test]
-    fn issue_delegated_access_token_extends_act_chain() {
+    fn issue_access_token_delegated_extends_act_chain() {
         let caller_token = issuing_key()
-            .issue_user_access_token(
-                user_principal(),
-                vec![role("runtime_admin")],
-                None,
-                Duration::minutes(5),
-            )
+            .issue_access_token(grant(user_principal(), vec![role("runtime_admin")]), Duration::minutes(5))
             .expect("caller token issues");
         let raw = verify_access_token(&caller_token);
         let caller = DelegationCaller {
@@ -916,12 +720,7 @@ mod tests {
             act: raw.act.clone(),
         };
         let delegated_token = issuing_key()
-            .issue_delegated_access_token(
-                &caller,
-                agent_principal(),
-                vec![role("agent")],
-                Duration::minutes(5),
-            )
+            .issue_access_token(AccessGrant { delegated_by: Some(caller), ..grant(agent_principal(), vec![role("agent")]) }, Duration::minutes(5))
             .expect("delegated token issues");
         let delegated_claims = verify_access_token(&delegated_token);
         let act = delegated_claims.act.as_ref().expect("act chain is present");
@@ -935,19 +734,14 @@ mod tests {
     }
 
     #[test]
-    fn issue_delegated_access_token_rejects_depth_over_max() {
+    fn issue_access_token_delegated_rejects_depth_over_max() {
         let caller = DelegationCaller {
             sub: user_principal().id.to_string(),
             principal: user_principal(),
             act: Some(Box::new(act_chain(MAX_DELEGATION_DEPTH))),
         };
 
-        let result = issuing_key().issue_delegated_access_token(
-            &caller,
-            agent_principal(),
-            vec![role("agent")],
-            Duration::minutes(5),
-        );
+        let result = issuing_key().issue_access_token(AccessGrant { delegated_by: Some(caller), ..grant(agent_principal(), vec![role("agent")]) }, Duration::minutes(5));
 
         assert!(matches!(
             result,
@@ -958,19 +752,14 @@ mod tests {
     }
 
     #[test]
-    fn issue_delegated_access_token_accepts_depth_at_max() {
+    fn issue_access_token_delegated_accepts_depth_at_max() {
         let caller = DelegationCaller {
             sub: user_principal().id.to_string(),
             principal: user_principal(),
             act: Some(Box::new(act_chain(MAX_DELEGATION_DEPTH - 1))),
         };
 
-        let result = issuing_key().issue_delegated_access_token(
-            &caller,
-            agent_principal(),
-            vec![role("agent")],
-            Duration::minutes(5),
-        );
+        let result = issuing_key().issue_access_token(AccessGrant { delegated_by: Some(caller), ..grant(agent_principal(), vec![role("agent")]) }, Duration::minutes(5));
 
         assert!(result.is_ok());
     }
@@ -1047,12 +836,7 @@ mod tests {
             public_key_from_pem(derived_pem.as_bytes()).expect("derived public key loads");
 
         let token = key
-            .issue_user_access_token(
-                user_principal(),
-                vec![role("runtime_admin")],
-                None,
-                Duration::minutes(5),
-            )
+            .issue_access_token(grant(user_principal(), vec![role("runtime_admin")]), Duration::minutes(5))
             .expect("token issues");
         let claims = verify_eddsa::<AccessTokenClaims>(&token, &decoding, Some("wyrd"))
             .expect("token verifies against the derived public key");
@@ -1073,12 +857,7 @@ mod tests {
         .expect("derived public key loads");
 
         let token = key
-            .issue_user_access_token(
-                user_principal(),
-                vec![role("runtime_admin")],
-                None,
-                Duration::minutes(5),
-            )
+            .issue_access_token(grant(user_principal(), vec![role("runtime_admin")]), Duration::minutes(5))
             .expect("token issues");
         let claims = verify_eddsa::<AccessTokenClaims>(&token, &decoding, Some("wyrd"))
             .expect("token verifies against the generated key's derived public key");
@@ -1157,13 +936,29 @@ mod tests {
         .expect("test private key loads")
     }
 
+    /// A direct, credential-free grant carrying the test permission set.
+    fn grant(principal: TokenPrincipalRef, roles: Vec<RoleRef>) -> AccessGrant {
+        AccessGrant {
+            principal,
+            roles,
+            permissions: permissions(),
+            credential_id: None,
+            delegated_by: None,
+        }
+    }
+
+    /// The permission set every test grant carries.
+    fn permissions() -> PermissionSet {
+        PermissionSet::from_iter([Permission::card_read()])
+    }
+
     fn public_key() -> jsonwebtoken::DecodingKey {
         public_key_from_pem(PUBLIC_KEY_PEM).expect("test public key loads")
     }
 
     fn issue_user_test_token(ttl: Duration) -> String {
         issuing_key()
-            .issue_user_access_token(user_principal(), vec![role("runtime_admin")], None, ttl)
+            .issue_access_token(grant(user_principal(), vec![role("runtime_admin")]), ttl)
             .expect("token issues")
     }
 

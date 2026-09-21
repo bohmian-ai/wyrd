@@ -1184,6 +1184,94 @@ async fn refuses_with(
     }
 }
 
+/// Access-token lifetime the stream-admission journey mints under.
+const SHORT_ACCESS_TTL: chrono::Duration = chrono::Duration::seconds(3);
+
+/// A bearer is checked once, when a query stream is admitted.
+///
+/// The server mints three-second tokens with no clock-skew allowance, so a real
+/// `exp` is crossed in-test. One stream is opened while the bearer is valid and
+/// drained only after it lapses: admitted work finishes under its own query
+/// deadline because nothing re-verifies mid-stream. The same bearer then cannot
+/// open another stream, which is refused as unauthenticated before planning.
+///
+/// # Panics
+///
+/// Panics when the admitted stream fails after expiry or the expired bearer
+/// opens a new stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn an_expired_bearer_finishes_its_admitted_stream_but_opens_no_other() {
+    prove_stream_admission_expiry()
+        .await
+        .expect("stream-admission expiry journey");
+}
+
+/// Drives one admitted stream past its bearer's expiry, then retries admission.
+///
+/// # Errors
+///
+/// Returns the first claim that broke.
+async fn prove_stream_admission_expiry() -> Result<(), ServerJourneyError> {
+    let server = wyrd_testing::WyrdTestServerBuilder::default()
+        .with_access_ttl(SHORT_ACCESS_TTL)
+        .with_auth_verify_settings(wyrd_auth_verify::WyrdAuthVerifySettings {
+            allowed_clock_skew: std::time::Duration::ZERO,
+        })
+        .start_bound()
+        .await?;
+    let tenant = server.data_tenant_id();
+    server
+        .state()
+        .bifrost_catalog()
+        .ok_or("server composed no Bifrost catalog")?
+        .ensure_builtin(
+            tenant,
+            vala_bifrost_redux::tables::builtin_table("logs", "records")
+                .ok_or("no canonical vala.logs.records definition")?,
+        )
+        .await?;
+    await_server_ready(server.base_url().ok_or("missing HTTP URL")?).await?;
+
+    let client =
+        scoped_client(&server, "stream_reader", wyrd_runtime::PermissionScope::All).await?;
+    let bearer = format!("Bearer {}", client.auth().bearer().await?.expose());
+    let mut grpc = BifrostQueryServiceClient::new(
+        wyrd_tonic::tonic::transport::Endpoint::from_shared(
+            server.grpc_url().ok_or("missing gRPC URL")?,
+        )?
+        .connect()
+        .await?,
+    );
+    let query = |bearer: &str| -> Result<_, ServerJourneyError> {
+        let mut request =
+            wyrd_tonic::tonic::Request::new(proto::BifrostQueryRequest::from(request(LOGS_SQL)));
+        request
+            .metadata_mut()
+            .insert("x-wyrd-access-token", bearer.parse()?);
+        Ok(request)
+    };
+
+    let admitted = grpc.query(query(&bearer)?).await?.into_inner();
+    tokio::time::sleep((SHORT_ACCESS_TTL + chrono::Duration::seconds(1)).to_std()?).await;
+    drain_grpc(admitted)
+        .await
+        .map_err(|error| format!("an admitted stream must finish after expiry: {error}"))?;
+
+    match grpc.query(query(&bearer)?).await {
+        Err(status) if status.code() == wyrd_tonic::tonic::Code::Unauthenticated => {}
+        Err(status) => {
+            return Err(
+                format!("an expired bearer must be unauthenticated, got {status:?}").into(),
+            );
+        }
+        Ok(_) => return Err("an expired bearer opened a new query stream".into()),
+    }
+
+    server.shutdown().await?;
+    Ok(())
+}
+
 /// Generic protected-edge limit used by the staged query timeout journey.
 const EDGE_LIMIT: std::time::Duration = std::time::Duration::from_secs(1);
 

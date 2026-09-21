@@ -551,9 +551,8 @@ async fn ingest_valid_token_is_not_rejected_as_unauthenticated() {
         .await
         .expect("test server starts");
     let state = server.state();
-    // The fixture's own tenant, not an invented id: admission is resolved on
-    // every request, so a token minted for a tenant that was never provisioned
-    // is refused before anything about the token itself is considered.
+    // The fixture's own tenant, so any refusal past verification is about the
+    // request rather than a tenant the fixture never provisioned.
     let tenant = server.data_tenant_id();
     let jwt = mint_user_jwt(state, tenant, &[]);
 

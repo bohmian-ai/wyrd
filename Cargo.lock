@@ -10447,7 +10447,6 @@ dependencies = [
  "uuid",
  "vala-sql",
  "workspace-hack",
- "wyrd-auth-oidc",
  "wyrd-auth-verify",
  "wyrd-bench",
  "wyrd-dev-fixtures",

@@ -65,7 +65,6 @@ blake3 = { workspace = true }
 uuid = { workspace = true }
 base64 = { workspace = true }
 secrecy = { workspace = true }
-wyrd-auth-oidc = { workspace = true }
 wyrd-auth-verify = { workspace = true }
 wyrd-tonic = { workspace = true, features = ["server", "client"] }
 prost = { workspace = true }

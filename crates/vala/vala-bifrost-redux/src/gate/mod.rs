@@ -12,8 +12,6 @@ use arrow::record_batch::RecordBatch;
 use sha2::{Digest as _, Sha256};
 use tracing::Instrument;
 use uuid::Uuid;
-use wyrd_auth_oidc::IssuerConfigResolver;
-use wyrd_auth_verify::PermissionResolver;
 use wyrd_runtime::PermissionCheck;
 use wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest;
 use wyrd_tonic::otlp::metrics_service::ExportMetricsServiceRequest;
@@ -278,11 +276,7 @@ pub trait GateAudit: Send + Sync {
 /// `A` is the durable audit sink this Gate records write decisions through.
 /// There is one production sink and one test sink, so the choice is made
 /// statically by the composition root rather than through runtime dispatch.
-pub struct Gate<
-    R: PermissionResolver + 'static,
-    I: IssuerConfigResolver + 'static,
-    A: GateAudit + 'static,
-> {
+pub struct Gate<A: GateAudit + 'static> {
     /// Optional durable write capability; absent on a query-only replica.
     scribe: Option<Arc<dyn Scribe>>,
     /// Optional SQL dispatch seam reaching an Oracle this Gate does not own.
@@ -295,13 +289,12 @@ pub struct Gate<
     /// Immutable transport and typed-ingress bounds.
     limits: IngestLimits,
     /// Shared bearer-token verification adapter for every public transport.
-    auth: IngestAuthInterceptor<R, I>,
+    auth: IngestAuthInterceptor,
     /// Shared admission closure observed by ingest and query alike.
     closed: Arc<AtomicBool>,
 }
 
-impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static, A: GateAudit + 'static>
-    Clone for Gate<R, I, A>
+impl<A: GateAudit + 'static> Clone for Gate<A>
 {
     /// Share one Gate across transports without cloning its dependencies.
     ///
@@ -321,8 +314,7 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static, A: Gate
     }
 }
 
-impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static, A: GateAudit + 'static>
-    Gate<R, I, A>
+impl<A: GateAudit + 'static> Gate<A>
 {
     /// Requests an exact root-backed decode child from Scribe for the adapter.
     ///
@@ -361,7 +353,7 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static, A: Gate
     #[must_use]
     pub fn with_scribe(
         scribe: Arc<crate::scribe::ScribeImpl>,
-        auth: IngestAuthInterceptor<R, I>,
+        auth: IngestAuthInterceptor,
         limits: IngestLimits,
     ) -> Self {
         initialize_gate_metrics();
@@ -379,7 +371,7 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static, A: Gate
     #[cfg(test)]
     fn with_test_scribe(
         scribe: Arc<dyn Scribe>,
-        auth: IngestAuthInterceptor<R, I>,
+        auth: IngestAuthInterceptor,
         limits: IngestLimits,
     ) -> Self {
         initialize_gate_metrics();
@@ -399,7 +391,7 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static, A: Gate
     /// closed role check and receives the stable unavailable response without a
     /// WAL allocation.
     #[must_use]
-    pub fn without_scribe(auth: IngestAuthInterceptor<R, I>, limits: IngestLimits) -> Self {
+    pub fn without_scribe(auth: IngestAuthInterceptor, limits: IngestLimits) -> Self {
         initialize_gate_metrics();
         Self {
             scribe: None,
@@ -528,10 +520,18 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static, A: Gate
         Ok(())
     }
 
-    async fn authenticate(&self, metadata: &MetadataMap) -> Result<AuthContext, IngestError> {
+    /// Verify one request's bearer and refuse it once the Gate has closed.
+    ///
+    /// Records the auth attempt, resolution latency, and rejection metrics
+    /// around the shared synchronous verifier.
+    ///
+    /// # Errors
+    /// Returns the verifier's [`IngestError::Unauthenticated`] refusal, or the
+    /// ingress-closed refusal when lifecycle shutdown already closed the Gate.
+    fn authenticate(&self, metadata: &MetadataMap) -> Result<AuthContext, IngestError> {
         let started = std::time::Instant::now();
         record_gate_event("auth_attempt");
-        match self.auth.authenticate(metadata).await {
+        match self.auth.authenticate(metadata) {
             Ok(auth) => {
                 metrics::histogram!("bifrost_gate_resolution_seconds", "stage" => "auth")
                     .record(started.elapsed().as_secs_f64());
@@ -556,11 +556,11 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static, A: Gate
     ///
     /// Returns the stable authentication or ingress-closed refusal produced by
     /// the ordinary generated-service path.
-    pub async fn authenticate_otlp_metadata(
+    pub fn authenticate_otlp_metadata(
         &self,
         metadata: &MetadataMap,
     ) -> Result<AuthContext, IngestError> {
-        self.authenticate(metadata).await
+        self.authenticate(metadata)
     }
 
     /// Mount the Gate on the shared tonic router.
@@ -923,8 +923,7 @@ pub fn resolve_fqn(fqn: &str) -> Result<(BifrostNamespace, String), IngestError>
 }
 
 #[wyrd_tonic::tonic::async_trait]
-impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static, A: GateAudit + 'static>
-    BifrostIngestService for Gate<R, I, A>
+impl<A: GateAudit + 'static> BifrostIngestService for Gate<A>
 {
     #[tracing::instrument(name = "bifrost.gate.write", skip_all, fields(operation = "write"))]
     async fn insert_batch(
@@ -935,7 +934,6 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static, A: Gate
         let result: Result<Response<InsertBatchResponse>, Status> = async {
             let auth = self
                 .authenticate(request.metadata())
-                .await
                 .inspect_err(|_| record_gate_rejection("write", "auth"))
                 .map_err(Status::from)?;
             let frame = request.into_inner();
@@ -1041,8 +1039,6 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use async_trait::async_trait;
     use futures_util::StreamExt as _;
-    use wyrd_auth_oidc::IssuerConfigResolver;
-    use wyrd_auth_verify::PermissionResolver;
     use wyrd_runtime::{Permission, PermissionSet, Principal, PrincipalKind};
     use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::ids::DataTenantId;
@@ -1245,31 +1241,6 @@ mod tests {
             wyrd_tonic::tonic::Status,
         > = Err(status);
         assert_eq!(super::ingest_request_outcome(&result), "rejected");
-    }
-
-    #[derive(Debug)]
-    struct TestPermissionResolver;
-
-    impl PermissionResolver for TestPermissionResolver {
-        async fn resolve(
-            &self,
-            _tenant_id: &DataTenantId,
-            _roles: &[wyrd_runtime::RoleRef],
-        ) -> Result<wyrd_runtime::PermissionSet, wyrd_auth_verify::ResolveError> {
-            Ok(wyrd_runtime::PermissionSet::new())
-        }
-    }
-
-    #[derive(Debug)]
-    struct TestIssuerResolver;
-
-    impl IssuerConfigResolver for TestIssuerResolver {
-        async fn trusted_issuers(
-            &self,
-            _tenant: &DataTenantId,
-        ) -> Result<Vec<wyrd_auth_oidc::TrustedIssuer>, wyrd_auth_oidc::OidcError> {
-            Ok(Vec::new())
-        }
     }
 
     struct TestScribe;
@@ -1509,8 +1480,7 @@ mod tests {
         DecodedOtlp::new(request, 0, crate::scribe::otlp_decode_owner_for_test(1))
     }
 
-    fn test_interceptor()
-    -> super::auth::IngestAuthInterceptor<TestPermissionResolver, TestIssuerResolver> {
+    fn test_interceptor() -> super::auth::IngestAuthInterceptor {
         let mut keys = std::collections::HashMap::new();
         keys.insert(
             wyrd_auth_verify::Kid::new("test").expect("test kid is valid"),
@@ -1524,7 +1494,6 @@ mod tests {
         let verifier = wyrd_auth_verify::TokenVerifier::new(
             keys,
             "wyrd",
-            Arc::new(TestPermissionResolver),
             wyrd_auth_verify::WyrdAuthVerifySettings::default(),
         );
         super::auth::ingest_auth_interceptor(Arc::new(verifier))
@@ -1547,19 +1516,16 @@ mod tests {
                 .expect("test key is valid"),
             ),
         );
-        let verifier: wyrd_auth_verify::TokenVerifier<TestPermissionResolver, TestIssuerResolver> =
-            wyrd_auth_verify::TokenVerifier::new(
-                keys,
-                "wyrd",
-                Arc::new(TestPermissionResolver),
-                wyrd_auth_verify::WyrdAuthVerifySettings::default(),
-            );
-        let _gate =
-            Gate::<TestPermissionResolver, TestIssuerResolver, RecordingAudit>::with_test_scribe(
-                Arc::new(TestScribe),
-                crate::gate::auth::ingest_auth_interceptor(Arc::new(verifier)),
-                IngestLimits::default(),
-            );
+        let verifier = wyrd_auth_verify::TokenVerifier::new(
+            keys,
+            "wyrd",
+            wyrd_auth_verify::WyrdAuthVerifySettings::default(),
+        );
+        let _gate = Gate::<RecordingAudit>::with_test_scribe(
+            Arc::new(TestScribe),
+            crate::gate::auth::ingest_auth_interceptor(Arc::new(verifier)),
+            IngestLimits::default(),
+        );
     }
 
     /// Gate records the write decision before it admits or refuses the write.
@@ -1574,7 +1540,7 @@ mod tests {
         let scribe_calls = Arc::new(AtomicUsize::new(0));
         // A Gate that cannot record its decision refuses before evaluating one,
         // so an unrecorded write never reaches Scribe.
-        let unrecorded = Gate::<_, _, RecordingAudit>::with_test_scribe(
+        let unrecorded = Gate::<RecordingAudit>::with_test_scribe(
             Arc::new(CountingScribe::new(Arc::clone(&scribe_calls))),
             test_interceptor(),
             IngestLimits::default(),
@@ -1590,7 +1556,7 @@ mod tests {
         assert_eq!(scribe_calls.load(Ordering::Relaxed), 0);
 
         let audit = RecordingAudit::new();
-        let gate = Gate::<_, _, RecordingAudit>::with_test_scribe(
+        let gate = Gate::<RecordingAudit>::with_test_scribe(
             Arc::new(CountingScribe::new(Arc::clone(&scribe_calls))),
             test_interceptor(),
             IngestLimits::default(),
@@ -1623,13 +1589,13 @@ mod tests {
     /// and no audit sink is needed to reach the refusal.
     #[tokio::test]
     async fn gate_authenticates_before_reading_frames() {
-        let gate = Gate::<_, _, RecordingAudit>::with_test_scribe(
+        let gate = Gate::<RecordingAudit>::with_test_scribe(
             Arc::new(TestScribe),
             test_interceptor(),
             IngestLimits::default(),
         );
         let metadata = wyrd_tonic::tonic::metadata::MetadataMap::new();
-        assert!(gate.authenticate(&metadata).await.is_err());
+        assert!(gate.authenticate(&metadata).is_err());
     }
 
     /// One valid span in `resource_spans` position `index`, or an invalid one.
@@ -1675,7 +1641,7 @@ mod tests {
         let scribe = Arc::new(CountingScribe::new(Arc::clone(&scribe_calls)));
         let rows = Arc::clone(&scribe.rows);
         let card_refs = Arc::clone(&scribe.card_refs);
-        let gate = Gate::<_, _, RecordingAudit>::with_test_scribe(
+        let gate = Gate::<RecordingAudit>::with_test_scribe(
             scribe,
             test_interceptor(),
             IngestLimits::default(),
@@ -1721,7 +1687,7 @@ mod tests {
     #[tokio::test]
     async fn all_invalid_otlp_returns_existing_outcome_without_scribe() {
         let scribe_calls = Arc::new(AtomicUsize::new(0));
-        let gate = Gate::<_, _, RecordingAudit>::with_test_scribe(
+        let gate = Gate::<RecordingAudit>::with_test_scribe(
             Arc::new(CountingScribe::new(Arc::clone(&scribe_calls))),
             test_interceptor(),
             IngestLimits::default(),
@@ -1751,7 +1717,7 @@ mod tests {
     #[tokio::test]
     async fn close_rejects_new_work_before_scribe_handoff() {
         let scribe_calls = Arc::new(AtomicUsize::new(0));
-        let gate = Gate::<_, _, RecordingAudit>::with_test_scribe(
+        let gate = Gate::<RecordingAudit>::with_test_scribe(
             Arc::new(CountingScribe::new(Arc::clone(&scribe_calls))),
             test_interceptor(),
             IngestLimits::default(),
@@ -1775,7 +1741,7 @@ mod tests {
     /// Scribe call itself, so the double panics if it is ever reached.
     #[tokio::test]
     async fn gate_rejects_ingest_when_scribe_recovery_is_incomplete() {
-        let gate = Gate::<_, _, RecordingAudit>::with_test_scribe(
+        let gate = Gate::<RecordingAudit>::with_test_scribe(
             Arc::new(NotReadyScribe),
             test_interceptor(),
             IngestLimits::default(),
@@ -1867,7 +1833,7 @@ mod tests {
     /// Builds a query-only Gate: no Scribe, optionally one dispatch seam.
     fn query_gate(
         dispatch: Option<Arc<TestQueryDispatch>>,
-    ) -> Gate<TestPermissionResolver, TestIssuerResolver, RecordingAudit> {
+    ) -> Gate<RecordingAudit> {
         let gate = Gate::without_scribe(test_interceptor(), IngestLimits::default());
         match dispatch {
             Some(dispatch) => gate.with_query_dispatch(dispatch),
@@ -1975,7 +1941,7 @@ mod tests {
     /// A closed Gate refuses OTLP decode before reserving Scribe memory.
     #[test]
     fn closed_gate_refuses_otlp_decode_before_reserving() {
-        let gate = Gate::<_, _, RecordingAudit>::with_test_scribe(
+        let gate = Gate::<RecordingAudit>::with_test_scribe(
             Arc::new(NotReadyScribe),
             test_interceptor(),
             IngestLimits::default(),

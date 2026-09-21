@@ -3,10 +3,12 @@
 //! The interceptor binds to the **same** [`TokenVerifier`] the HTTP
 //! `AuthenticatedPrincipal` uses: it reads the bearer from the
 //! `x-wyrd-access-token` metadata, derives the expected tenant from the
-//! unverified token, and verifies the signature against that tenant through the
-//! single verifier seam. The resulting [`AuthContext`] carries the resolved
-//! `Principal` (with its `card_scope`) plus the request correlator; scope
-//! enforcement is the service's job, not the interceptor's.
+//! unverified token, and verifies signature, issuer, audience, expiry, and
+//! tenant locally. The resulting [`AuthContext`] carries the `Principal` built
+//! from the token's `permissions` claim (with its `card_scope`) plus the request
+//! correlator; object authorization is the service's job, not the
+//! interceptor's. Verification reads no database, so a token is checked once
+//! when its stream or call begins and lives at most its five-minute expiry.
 //!
 //! `wyrd-request-id`: the interceptor reads the inbound correlator or mints a
 //! `UUIDv7` when absent so the C5 audit event carries the same id the HTTP
@@ -16,8 +18,7 @@ use std::sync::Arc;
 
 use base64::Engine;
 use secrecy::{ExposeSecret, SecretString};
-use wyrd_auth_oidc::IssuerConfigResolver;
-use wyrd_auth_verify::{PermissionResolver, TokenVerifier};
+use wyrd_auth_verify::TokenVerifier;
 use wyrd_runtime::{DelegationStep, Principal};
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::request_id::RequestId;
@@ -100,102 +101,54 @@ pub fn read_or_mint_request_id(metadata: &MetadataMap) -> RequestId {
 /// Verify the inbound stream's bearer through `verifier` and build the
 /// [`AuthContext`].
 ///
+/// Synchronous and database-free: the tenant is read from the unverified
+/// payload only to select the expected tenant, and the verifier refuses a token
+/// whose signed tenant differs.
+///
 /// # Errors
 /// Returns [`IngestError::Unauthenticated`] when the bearer is missing, does not
-/// name a tenant, or fails signature/tenant verification.
-pub async fn authenticate<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static>(
-    verifier: &TokenVerifier<R, I>,
+/// name a tenant, or fails signature, issuer, audience, expiry, or tenant
+/// verification.
+pub fn authenticate(
+    verifier: &TokenVerifier,
     metadata: &MetadataMap,
 ) -> Result<AuthContext, IngestError> {
     let token = extract_bearer(metadata)?;
     let expected_tenant = tenant_from_unverified_access_token(token.expose_secret())?;
     let verified_token = verifier
         .verify(&token, &expected_tenant)
-        .await
         .map_err(|error| IngestError::Unauthenticated(error.to_string()))?;
-    let request_id = read_or_mint_request_id(metadata);
     Ok(AuthContext {
-        principal: verified_token.principal.clone(),
+        principal: verified_token.principal,
         tenant: expected_tenant,
-        request_id,
-        delegation_chain: verified_token.delegation_chain.clone(),
+        request_id: read_or_mint_request_id(metadata),
+        delegation_chain: verified_token.delegation_chain,
     })
 }
 
-/// Verifies owned metadata with an owned verifier for `Send` transport futures.
+/// The Gate's handle on the shared tenant token verifier.
 ///
-/// Verification is awaited inline rather than on a spawned task. The owned
-/// `Arc` verifier and owned token already satisfy the `Send` bound every
-/// transport handler needs, so a task would add only a scheduler hop and a
-/// detach: a cancelled request would leave verification running with nothing
-/// observing its result.
-///
-/// # Errors
-///
-/// Returns [`IngestError::Unauthenticated`] when bearer metadata is missing or
-/// malformed, when the tenant cannot be read from the unverified token, or when
-/// the verifier rejects the token.
-pub async fn authenticate_owned<
-    R: PermissionResolver + 'static,
-    I: IssuerConfigResolver + 'static,
->(
-    verifier: Arc<TokenVerifier<R, I>>,
-    metadata: MetadataMap,
-) -> Result<AuthContext, IngestError> {
-    let token = extract_bearer(&metadata)?;
-    let expected_tenant = tenant_from_unverified_access_token(token.expose_secret())?;
-    let verified_token = verifier
-        .verify(&token, &expected_tenant)
-        .await
-        .map_err(|error| IngestError::Unauthenticated(error.to_string()))?;
-    let request_id = read_or_mint_request_id(&metadata);
-    Ok(AuthContext {
-        principal: verified_token.principal.clone(),
-        tenant: expected_tenant,
-        request_id,
-        delegation_chain: verified_token.delegation_chain.clone(),
-    })
+/// Keeps the verifier seam in one place so ingest can never grow a second
+/// auth path.
+#[derive(Clone)]
+pub struct IngestAuthInterceptor {
+    /// The one tenant access-token verifier every transport shares.
+    verifier: Arc<TokenVerifier>,
 }
 
-/// Interceptor holder generic over the concrete resolver-backed verifier.
-///
-/// S3.C2 injects the concrete `SqlPermissionResolver`-backed verifier at mount
-/// and wires [`authenticate`] into request-extension population; this type keeps
-/// the verifier seam in one place so ingest can never grow a second auth path.
-pub struct IngestAuthInterceptor<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static>
-{
-    verifier: Arc<TokenVerifier<R, I>>,
-}
-
-impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Clone
-    for IngestAuthInterceptor<R, I>
-{
-    fn clone(&self) -> Self {
-        Self {
-            verifier: Arc::clone(&self.verifier),
-        }
-    }
-}
-
-impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static>
-    IngestAuthInterceptor<R, I>
-{
+impl IngestAuthInterceptor {
     /// Verify `metadata`'s bearer and produce the [`AuthContext`].
     ///
     /// # Errors
     /// Propagates [`authenticate`]'s failure.
-    pub async fn authenticate(&self, metadata: &MetadataMap) -> Result<AuthContext, IngestError> {
-        authenticate(&self.verifier, metadata).await
+    pub fn authenticate(&self, metadata: &MetadataMap) -> Result<AuthContext, IngestError> {
+        authenticate(&self.verifier, metadata)
     }
 }
 
 /// Construct an [`IngestAuthInterceptor`] bound to `verifier`.
-pub fn ingest_auth_interceptor<
-    R: PermissionResolver + 'static,
-    I: IssuerConfigResolver + 'static,
->(
-    verifier: Arc<TokenVerifier<R, I>>,
-) -> IngestAuthInterceptor<R, I> {
+#[must_use]
+pub fn ingest_auth_interceptor(verifier: Arc<TokenVerifier>) -> IngestAuthInterceptor {
     IngestAuthInterceptor { verifier }
 }
 

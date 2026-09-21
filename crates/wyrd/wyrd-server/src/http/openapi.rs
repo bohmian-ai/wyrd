@@ -149,8 +149,7 @@ fn is_problem(content: Option<&Content>) -> bool {
         ),
         (
             name = "Storage",
-            description = "Card artifact upload and download plans, and the local development \
-                           blob transport"
+            description = "Card artifact upload and download plans"
         ),
         (
             name = "Authz",

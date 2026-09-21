@@ -12,6 +12,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use axum::routing::{get, put};
 use serde::Deserialize;
 use tokio_util::io::ReaderStream;
 use wyrd_runtime::Permission;
@@ -41,9 +42,16 @@ pub fn storage_router(state: &AppState) -> OpenApiRouter<AppState> {
         .routes(routes!(download_init));
 
     if matches!(state.storage.backend_config(), BackendConfig::Local { .. }) {
+        // The local development blob transport is mounted, not documented. Both
+        // routes take a wildcard tail — a stored object path carries slashes —
+        // and OpenAPI path templating has no wildcard, so co-registering them
+        // would publish a template that does not match what is served. They
+        // exist only when the backend is local; a deployment's storage plane is
+        // the presigned object store the documented `init`/`part-url` routes
+        // hand out.
         router
-            .routes(routes!(local_blob))
-            .routes(routes!(download_local_blob))
+            .route("/cards/upload/local/{*id}", put(local_blob))
+            .route("/cards/download/local/{*path}", get(download_local_blob))
     } else {
         router
     }
@@ -310,34 +318,6 @@ async fn abort(
 }
 
 /// Store bytes for the local development backend.
-#[utoipa::path(
-    put,
-    path = "/cards/upload/local/{id}",
-    params(("id" = String, Path, description = "Upload the bytes belong to")),
-    request_body(content = Vec<u8>, content_type = "application/octet-stream"),
-    responses(
-        (status = 200, description = "The bytes were stored", body = LocalBlobUploadResponse),
-        (status = 400, description = "The upload identifier is not one this server minted \
-          (WYRD_STORAGE_400_INVALID_UPLOAD_ID)", body = WyrdProblem),
-        (status = 401, description = "The request carried no usable access token \
-          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
-          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
-        (status = 403, description = "The principal lacks card write, or the object belongs to \
-          another tenant (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_STORAGE_403_UPLOAD_FOREIGN_TENANT)", body = WyrdProblem),
-        (status = 404, description = "No such upload (WYRD_STORAGE_404_UPLOAD_NOT_FOUND)",
-         body = WyrdProblem),
-        (status = 409, description = "The upload is already terminal \
-          (WYRD_STORAGE_409_UPLOAD_NOT_PENDING)", body = WyrdProblem),
-        (status = 500, description = "The storage backend or the platform store failed, or the \
-          decision could not be audited (WYRD_STORAGE_500_BACKEND, WYRD_SPEC_500_INTERNAL, \
-          WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
-        (status = 503, description = "The revocation store could not vouch for the token, or \
-          the storage backend is transiently unavailable \
-          (WYRD_AUTH_503_VERIFY_UNAVAILABLE, \
-          WYRD_STORAGE_503_BACKEND_UNAVAILABLE)", body = WyrdProblem)
-    ),
-    tag = "Storage"
-)]
 async fn local_blob(
     State(state): State<AppState>,
     caller: Caller,
@@ -414,30 +394,6 @@ async fn download_init(
 }
 
 /// Stream bytes from the local development backend.
-#[utoipa::path(
-    get,
-    path = "/cards/download/local/{path}",
-    params(("path" = String, Path, description = "Stored object path to stream")),
-    responses(
-        (status = 200, description = "The stored bytes",
-         content_type = "application/octet-stream"),
-        (status = 401, description = "The request carried no usable access token \
-          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
-          WYRD_AUTH_401_TOKEN_EXPIRED, WYRD_AUTH_401_CREDENTIAL_REVOKED)", body = WyrdProblem),
-        (status = 403, description = "The principal lacks card read, or the object belongs to \
-          another tenant (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_STORAGE_403_UPLOAD_FOREIGN_TENANT)", body = WyrdProblem),
-        (status = 404, description = "No such stored object \
-          (WYRD_STORAGE_404_OBJECT_NOT_FOUND)", body = WyrdProblem),
-        (status = 500, description = "The storage backend or the platform store failed, or the \
-          decision could not be audited (WYRD_STORAGE_500_BACKEND, WYRD_SPEC_500_INTERNAL, \
-          WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
-        (status = 503, description = "The revocation store could not vouch for the token, or \
-          the storage backend is transiently unavailable \
-          (WYRD_AUTH_503_VERIFY_UNAVAILABLE, \
-          WYRD_STORAGE_503_BACKEND_UNAVAILABLE)", body = WyrdProblem)
-    ),
-    tag = "Storage"
-)]
 async fn download_local_blob(
     State(state): State<AppState>,
     caller: Caller,

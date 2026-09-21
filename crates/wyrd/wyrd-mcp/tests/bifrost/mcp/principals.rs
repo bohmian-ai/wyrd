@@ -23,6 +23,24 @@ mod pg_tests {
     /// The write tool only an administrative agent may use.
     const REVOKE_CREDENTIAL: &str = "principals.revoke_credential";
 
+    /// The property names one advertised schema declares required.
+    ///
+    /// Reading the catalog's own schema rather than restating it is the point:
+    /// the assertion fails if the published contract stops matching the shared
+    /// DTO the server parses and returns.
+    fn required(schema: &serde_json::Map<String, serde_json::Value>) -> Vec<&str> {
+        schema
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// An administrative agent sees the write tool; a reader does not, and is
     /// refused when it names the tool anyway.
     ///
@@ -78,6 +96,48 @@ mod pg_tests {
         assert!(
             admin_names.contains(&REVOKE_CREDENTIAL),
             "an administrative agent is offered the write tool: {admin_names:?}"
+        );
+
+        // Both tools publish the shape they speak, in and out, so an agent can
+        // plan a call and read a result without guessing at either end.
+        let descriptor = |name: &str| {
+            admin_tools
+                .iter()
+                .find(|tool| tool.name.as_ref() == name)
+                .cloned()
+                .ok_or("an advertised tool carries a descriptor")
+        };
+        let list_tool = descriptor(LIST_CREDENTIALS)?;
+        assert_eq!(
+            required(&list_tool.input_schema),
+            vec!["principal_id"],
+            "the read tool advertises its input shape: {:?}",
+            list_tool.input_schema
+        );
+        let list_output = list_tool
+            .output_schema
+            .clone()
+            .ok_or("the read tool publishes an output schema")?;
+        assert_eq!(
+            required(&list_output),
+            vec!["credentials"],
+            "the read tool advertises its result shape: {list_output:?}"
+        );
+        let revoke_tool = descriptor(REVOKE_CREDENTIAL)?;
+        assert_eq!(
+            required(&revoke_tool.input_schema),
+            vec!["credential_id", "principal_id"],
+            "the write tool advertises its input shape: {:?}",
+            revoke_tool.input_schema
+        );
+        let revoke_output = revoke_tool
+            .output_schema
+            .clone()
+            .ok_or("the write tool publishes an output schema")?;
+        assert_eq!(
+            required(&revoke_output),
+            vec!["credential_id", "revoked"],
+            "the write tool advertises its result shape: {revoke_output:?}"
         );
 
         // The reader is offered only the read tool.
@@ -146,6 +206,12 @@ mod pg_tests {
             )
             .await?;
         let content = structured(listing)?;
+        for property in required(&list_output) {
+            assert!(
+                content.get(property).is_some(),
+                "a real listing carries every advertised property: {content}"
+            );
+        }
         assert!(
             content.get("credentials").is_some(),
             "the listing projects credential metadata: {content}"
@@ -220,6 +286,20 @@ mod pg_tests {
         assert!(
             revoked.is_error != Some(true),
             "the authorized revocation succeeds: {revoked:?}"
+        );
+        let acknowledgement = structured(revoked)?;
+        for property in required(&revoke_output) {
+            assert!(
+                acknowledgement.get(property).is_some(),
+                "a real acknowledgement carries every advertised property: {acknowledgement}"
+            );
+        }
+        assert_eq!(
+            acknowledgement
+                .get("credential_id")
+                .and_then(serde_json::Value::as_str),
+            Some(doomed.as_str()),
+            "the acknowledgement names the credential that was retired: {acknowledgement}"
         );
 
         // Observed, not assumed: the agent reads the retirement back through

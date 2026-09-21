@@ -73,3 +73,44 @@ pub struct CredentialListResponse {
     /// Credentials, newest first. Never any secret material.
     pub credentials: Vec<CredentialMetadata>,
 }
+
+/// Arguments naming the principal whose credentials to list.
+///
+/// The MCP tool advertises this type as its input schema and parses that same
+/// schema back out, so an agent reading the catalog and the server reading the
+/// call can never disagree about the shape. It lives here, beside the response
+/// it leads to, rather than in the MCP surface, because the surface projects
+/// the administrative contract instead of restating it.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ListCredentialsArgs {
+    /// Principal whose credentials to list, as a UUID.
+    pub principal_id: String,
+}
+
+/// Arguments naming one credential and the principal that owns it.
+///
+/// The principal is named as well as the credential so a credential id alone
+/// cannot retire a credential belonging to a different principal.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RevokeCredentialArgs {
+    /// Principal that owns the credential, as a UUID.
+    pub principal_id: String,
+    /// Credential to retire, as a UUID.
+    pub credential_id: String,
+}
+
+/// Acknowledgement that one credential was retired.
+///
+/// Revocation has nothing to return but the fact that it happened: the
+/// credential is gone, and its metadata is no longer worth projecting. Naming
+/// the credential back is what lets an agent confirm it retired the one it
+/// meant to.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CredentialRevoked {
+    /// Always true; the call fails rather than reporting a refusal here.
+    pub revoked: bool,
+    /// The credential that was retired, as a UUID.
+    pub credential_id: String,
+}

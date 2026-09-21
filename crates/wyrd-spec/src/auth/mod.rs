@@ -42,6 +42,7 @@ pub use tenant_admin::{
 };
 pub use tenant_principals::{
     CreateServicePrincipalRequest, CreateServicePrincipalResponse, CredentialListResponse,
-    CredentialMetadata, IssuedCredential,
+    CredentialMetadata, CredentialRevoked, IssuedCredential, ListCredentialsArgs,
+    RevokeCredentialArgs,
 };
 pub use token::{RequestedSubject, SubjectTokenType, TokenRequest, TokenResponse, TokenType};

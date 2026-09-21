@@ -56,6 +56,7 @@ rand = { workspace = true }
 rustix = { workspace = true }
 secrecy = { workspace = true, features = ["serde"] }
 serde = { workspace = true }
+schemars = { workspace = true }
 serde_json = { workspace = true }
 serde_jcs = { workspace = true }
 sha2 = { workspace = true }

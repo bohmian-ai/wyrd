@@ -11798,6 +11798,7 @@ dependencies = [
  "reqwest 0.13.4",
  "rmcp",
  "rustix",
+ "schemars 0.8.22",
  "secrecy",
  "serde",
  "serde_jcs",

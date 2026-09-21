@@ -20,10 +20,15 @@
 use std::sync::Arc;
 
 use rmcp::model::{CallToolResult, Tool, ToolAnnotations};
-use serde::Deserialize;
+use schemars::JsonSchema;
+use schemars::r#gen::SchemaGenerator;
+use serde::de::DeserializeOwned;
 use serde_json::Value as JsonValue;
 use uuid::Uuid;
 use wyrd_runtime::Permission;
+use wyrd_spec::auth::{
+    CredentialListResponse, CredentialRevoked, ListCredentialsArgs, RevokeCredentialArgs,
+};
 use wyrd_spec::error::WyrdError;
 
 use super::WyrdMcpHandler;
@@ -68,21 +73,37 @@ pub(super) fn may_administer(caller: &Caller) -> bool {
         .contains(&Permission::service_accounts_write())
 }
 
-/// Build one tool descriptor from its static input schema.
+/// Derive one tool schema from the Rust type the tool actually speaks.
+///
+/// rmcp's typed helpers are unusable here because rmcp carries `schemars` 1
+/// while the shared `wyrd-spec` DTOs derive the workspace `schemars` 0.8, so
+/// the schema is generated from the same derive the repository uses everywhere
+/// else and handed to rmcp as a raw object.
 ///
 /// # Panics
-/// Panics if `schema` is not a JSON object, which every caller below passes.
-fn tool(
-    name: &'static str,
-    title: &str,
-    description: &'static str,
-    read_only: bool,
-    schema: JsonValue,
-) -> Tool {
-    let JsonValue::Object(schema) = schema else {
-        unreachable!("every principal tool input schema is a JSON object")
+/// Panics when the derived schema is not a JSON object, which the `JsonSchema`
+/// derive cannot produce for a struct.
+fn schema_of<T: JsonSchema>() -> Arc<serde_json::Map<String, JsonValue>> {
+    let root = SchemaGenerator::default().into_root_schema_for::<T>();
+    let JsonValue::Object(schema) = serde_json::to_value(root).expect("a derived schema is JSON")
+    else {
+        panic!("a derived struct schema is a JSON object");
     };
-    Tool::new(name, description, Arc::new(schema))
+    Arc::new(schema)
+}
+
+/// Build one tool descriptor around the types it actually speaks.
+///
+/// Both schemas come from the shared `wyrd-spec` DTOs the handler below
+/// deserializes and returns, so the advertised contract is the parsed one. A
+/// handwritten schema beside a separate struct is how the two drift.
+fn tool<I, O>(name: &'static str, title: &str, description: &'static str, read_only: bool) -> Tool
+where
+    I: JsonSchema,
+    O: JsonSchema,
+{
+    Tool::new(name, description, schema_of::<I>())
+        .with_raw_output_schema(schema_of::<O>())
         .with_title(title)
         .annotate({
             let mut annotations = ToolAnnotations::default().read_only(read_only);
@@ -93,7 +114,7 @@ fn tool(
 
 /// Descriptor for the credential-metadata listing.
 fn list_credentials_tool() -> Tool {
-    tool(
+    tool::<ListCredentialsArgs, CredentialListResponse>(
         LIST_CREDENTIALS,
         "List a principal's credentials",
         "List the non-secret credential metadata for one principal in this caller's tenant: \
@@ -101,23 +122,12 @@ fn list_credentials_tool() -> Tool {
          secret material. Includes revoked and expired credentials, so a rotation can be \
          confirmed complete.",
         true,
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "principal_id": {
-                    "type": "string",
-                    "description": "Principal whose credentials to list, as a UUID."
-                }
-            },
-            "required": ["principal_id"],
-            "additionalProperties": false
-        }),
     )
 }
 
 /// Descriptor for the credential revocation.
 fn revoke_credential_tool() -> Tool {
-    tool(
+    tool::<RevokeCredentialArgs, CredentialRevoked>(
         REVOKE_CREDENTIAL,
         "Revoke a credential",
         "Retire one credential belonging to a principal in this caller's tenant. The credential \
@@ -125,40 +135,7 @@ fn revoke_credential_tool() -> Tool {
          principal, its roles, and its other credentials are untouched. Requires \
          service_accounts:write.",
         false,
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "principal_id": {
-                    "type": "string",
-                    "description": "Principal that owns the credential, as a UUID."
-                },
-                "credential_id": {
-                    "type": "string",
-                    "description": "Credential to retire, as a UUID."
-                }
-            },
-            "required": ["principal_id", "credential_id"],
-            "additionalProperties": false
-        }),
     )
-}
-
-/// Arguments naming one principal.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PrincipalArgs {
-    /// Principal whose credentials to read.
-    principal_id: String,
-}
-
-/// Arguments naming one credential and the principal that owns it.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CredentialArgs {
-    /// Principal that owns the credential.
-    principal_id: String,
-    /// Credential to retire.
-    credential_id: String,
 }
 
 /// Parse a UUID argument, refusing anything else.
@@ -177,7 +154,7 @@ fn uuid_arg(value: &str, field: &str) -> Result<Uuid, WyrdError> {
 /// # Errors
 /// Returns [`WyrdError::Validation`] when the arguments are absent or do not
 /// match the advertised schema.
-fn parse_args<T: serde::de::DeserializeOwned>(
+fn parse_args<T: DeserializeOwned>(
     arguments: Option<serde_json::Map<String, JsonValue>>,
     tool: &str,
 ) -> Result<T, WyrdError> {
@@ -202,7 +179,7 @@ impl WyrdMcpHandler {
         caller: Caller,
         arguments: Option<serde_json::Map<String, JsonValue>>,
     ) -> Result<CallToolResult, WyrdError> {
-        let args: PrincipalArgs = parse_args(arguments, LIST_CREDENTIALS)?;
+        let args: ListCredentialsArgs = parse_args(arguments, LIST_CREDENTIALS)?;
         let principal_id = uuid_arg(&args.principal_id, "principal_id")?;
         let listing = crate::components::principals::routes::list_credentials_for(
             &self.state,
@@ -229,7 +206,7 @@ impl WyrdMcpHandler {
         caller: Caller,
         arguments: Option<serde_json::Map<String, JsonValue>>,
     ) -> Result<CallToolResult, WyrdError> {
-        let args: CredentialArgs = parse_args(arguments, REVOKE_CREDENTIAL)?;
+        let args: RevokeCredentialArgs = parse_args(arguments, REVOKE_CREDENTIAL)?;
         let principal_id = uuid_arg(&args.principal_id, "principal_id")?;
         let credential_id = uuid_arg(&args.credential_id, "credential_id")?;
         crate::components::principals::routes::revoke_credential_for(
@@ -240,9 +217,14 @@ impl WyrdMcpHandler {
         )
         .await?;
 
-        Ok(CallToolResult::structured(serde_json::json!({
-            "revoked": true,
-            "credential_id": credential_id.to_string(),
-        })))
+        Ok(CallToolResult::structured(
+            serde_json::to_value(CredentialRevoked {
+                revoked: true,
+                credential_id: credential_id.to_string(),
+            })
+            .map_err(|error| {
+                internal_failure("credential revocation could not be projected", &error)
+            })?,
+        ))
     }
 }

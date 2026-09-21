@@ -94,8 +94,9 @@ credential.
   invalid-credential condition performs exactly one verification and returns
   one indistinguishable public error.
 - One principal may hold several simultaneously valid credentials. Revoking one
-  retires that credential and advances the principal's authorization epoch; it
-  leaves the principal, its grants, and its other credentials intact.
+  retires that credential so it mints no new token; tokens it already minted
+  lapse at their expiry, and the principal, its grants, and its other
+  credentials stay intact.
 - Losing every platform credential does not end administration of the
   deployment. An operator-only action beside initialization reissues one for the
   existing root; it is not an HTTP route, requires the deployment's
@@ -104,7 +105,7 @@ credential.
   equivalent in authority to holding the platform credential.
 - A platform session names the credential that minted it and re-reads that
   credential on every request, so revoking a platform credential ends its live
-  sessions immediately without a separate epoch. A platform session
+  sessions on the next request. A platform session
   established by federated login names no credential; the principal itself is
   the anchor, and suspending it ends those sessions on the next request.
 - API keys have an expiry, owner, creation audit event, use metadata, and
@@ -118,23 +119,28 @@ credential.
 - `/auth/token` derives tenant and principal identity from a verified API key
   or trusted token-exchange subject. Client-supplied tenant identity is
   rejected.
-- Access tokens expire no later than 15 minutes after issuance. Privileged
+- Tenant access tokens expire five minutes after issuance. Privileged
   operations may require a shorter configured lifetime, but never a longer
   one.
 - Refresh tokens are stored by one-way digest, rotated on every successful
   use, and invalidated when replay is detected. Reuse of a rotated refresh
   token revokes its token family and emits a security audit event.
-- Every access token carries issuer, audience, subject, issued-at, expiry,
-  unique token identity, principal, tenant, roles, permissions, and credential
-  or principal authorization epoch. Verification rejects a token issued before
-  the effective revocation epoch.
-- Revoking a principal, API key, refresh family, role binding, or credential
-  advances the applicable authorization epoch transactionally. Verifier and
-  permission caches cannot outlive the earlier of token expiry or that epoch.
-- Bearer access tokens remain replayable until expiry or epoch revocation.
-  TLS, short lifetime, token-family replay detection, authorization epochs,
-  least privilege, and audit are the required replay controls. Logs and traces
-  never record bearer material.
+- Every tenant access token carries issuer, audience `wyrd`, subject,
+  issued-at, expiry, unique token identity, principal, tenant, Card scope,
+  credential attribution, delegation chain, informational roles, and one
+  `permissions` set. The `permissions` claim is the only tenant authority; one
+  `TenantTokenIssuer` resolves it from current grants at issuance for API-key
+  exchange, OIDC login, human refresh, workload `jwt-bearer`, and delegation.
+  Verification is local and synchronous — signature, issuer, audience, expiry —
+  and reads no store, holds no cache, and resolves no roles.
+- Revoking a credential, suspending or deleting a principal, suspending a
+  tenant, or changing grants refuses the next issuance immediately. A tenant
+  token already issued keeps its snapshot authority until its five-minute
+  expiry; there is no revocation list or authorization epoch. The platform
+  plane instead revalidates current state on every request.
+- Bearer access tokens remain replayable until expiry. TLS, short lifetime,
+  token-family replay detection, least privilege, and audit are the required
+  replay controls. Logs and traces never record bearer material.
 
 ### Delegation and federation
 
@@ -173,8 +179,8 @@ selected key URLs are rejected.
   overlap window is at least the maximum token lifetime plus permitted clock
   skew. A key is removed only after that window and after all issuers have
   stopped using it.
-- Emergency compromise disables signing immediately, advances affected
-  authorization epochs, removes the key from accepted verification state, and
+- Emergency compromise disables signing immediately, revokes affected
+  credentials, removes the key from accepted verification state, and
   invokes the
   [credential-compromise runbook](operations/runbooks.md#credential-or-signing-key-compromise).
   Availability never justifies accepting a token whose key state is unknown.
@@ -184,8 +190,8 @@ selected key URLs are rejected.
 ## Authorization and policy
 
 Every route declares one typed `Permission { resource, action, scope }`.
-Verification constructs the runtime principal, and permission resolution is
-scoped to that principal's verified tenant. Scope never selects or widens
+Issuance resolves permissions within the principal's tenant and signs them into
+the token; verification constructs the runtime principal from that claim. Scope never selects or widens
 tenancy: tenant identity comes only from the verified principal.
 
 A route whose objects are not known until the request is planned — a Bifrost
@@ -201,8 +207,8 @@ It requires a valid delegated Wyrd token and denies when the policy engine,
 policy inputs, Card state, or audit path is unavailable. An enforcement point
 may cache a decision only when the cache key includes the complete verified
 principal, delegation chain, target, action, policy revision, and relevant
-Card revisions. A cached allow expires no later than the token, policy
-revision, or authorization epoch and is invalidated on any of those changes.
+Card revisions. A cached allow expires no later than the token or policy
+revision and is invalidated on either change.
 There is no stale-allow mode.
 
 Service-local policy may tighten organization policy and cannot override an

@@ -31,8 +31,8 @@ wyrd-auth-issue
   delegation depth validation
 
 wyrd-auth-verify
-  JWT verifier, key map, PermissionResolver trait,
-  verified token promotion
+  synchronous JWT verifier, key map, verified token
+  promotion from the permissions claim
 
 wyrd-sql
   tenant-bound role lookup, service-account lookup,
@@ -43,19 +43,21 @@ wyrd-server
   transactional credential/audit writes, error mapping
 ```
 
-Shared auth crates do not depend on SQL. The resolver seam is
-`PermissionResolver`: `wyrd-auth-verify` asks for roles and permissions, while
-`wyrd-server` provides the SQL-backed implementation.
+Shared auth crates do not depend on SQL. Tenant permissions are resolved once,
+at issuance, by `wyrd-auth`'s `TenantTokenIssuer` over `TenantConn`; the signed
+token carries the resulting `PermissionSet`, and `wyrd-auth-verify` builds the
+request principal from that claim with no store read.
 
 ## Cross-Cuts
 
-Access-token TTL is short by design: revocation and role changes are bounded by
-token expiry and verifier-cache expiry. The default access-token TTL is 15
-minutes, refresh-token TTL is 30 days, and API-key TTL is 365 days.
+Access-token TTL is short by design: revocation, suspension, and role changes
+refuse the next issuance immediately and are bounded for issued tenant tokens by
+their expiry. The default access-token TTL is five minutes, refresh-token TTL is
+30 days, and API-key TTL is 365 days.
 
 Tenant isolation is enforced at every boundary: JWT tenant claims, tenant-bound
 database connections, tenant-bearing service-account lookup, and role
-resolution from the caller's tenant only.
+resolution at issuance from the principal's tenant only.
 
 `MAX_DELEGATION_DEPTH` is five. Issuance refuses deeper chains and verification
 rejects deeper chains so non-conforming tokens do not enter request context.
@@ -66,12 +68,12 @@ backoff; permission denial is `WYRD_PERMISSION_403_DENIED_RBAC`.
 
 ## Security contract
 
-Production composition supplies a real permission resolver, policy decision
+Production composition supplies the real issuance owner, policy decision
 point, and canonical audit writer. Permit-all, no-op,
 in-memory, and test substitutes cannot satisfy production readiness.
 
 Mesh `ext_authz` uses the same `X-Wyrd-Access-Token` contract; no additional
 Wyrd identity header is introduced. JWT verification uses configured issuer,
-audience, algorithm, key identity, JWKS refresh, revocation epoch, delegation,
-and expiry rules from the repository-level security posture. Uncertainty in
-identity, policy, or revocation state fails closed.
+audience, algorithm, key identity, delegation, and expiry rules from the
+repository-level security posture; external JWKS refresh stays on the issuance
+side. Uncertainty in identity or policy fails closed.

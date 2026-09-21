@@ -19,8 +19,10 @@ audit-chain head, and assigned incident/evidence owners.
 1. Remove token issuance and every role that requires the affected key from
    readiness. Preserve verification for unaffected keys.
 2. Disable the compromised signing key or credential at its authority and
-   advance affected principal, credential, or tenant authorization epochs in
-   one audited operation.
+   revoke the affected credentials or suspend the affected principals or
+   tenants in one audited operation, so no new tenant token issues. Tenant
+   tokens already issued lapse within their five-minute lifetime; removing a
+   compromised signing key from verification state refuses them at once.
 3. Revoke refresh-token families and API keys whose confidentiality cannot be
    established. Fence affected peer-ticket issuers independently from user JWT
    issuers.
@@ -31,8 +33,8 @@ audit-chain head, and assigned incident/evidence owners.
 
 1. Create replacement material under a new identity and access policy.
 2. Publish replacement public verification state before enabling issuance.
-3. Verify issuer, audience, algorithm, `kid`, epoch, delegation, expiry, and
-   replay behavior with positive and negative journeys.
+3. Verify issuer, audience, algorithm, `kid`, delegation, expiry, and replay
+   behavior with positive and negative journeys.
 4. Rotate workload secrets, Source credentials, peer trust, or signing keys in
    the dependency order dictated by the compromised class.
 5. Prove that retired material is rejected at gateway, server, peer, and
@@ -41,7 +43,8 @@ audit-chain head, and assigned incident/evidence owners.
 ### Go/no-go
 
 Restore readiness only when the new key path is healthy, old material is
-rejected, authorization epochs have propagated, refresh replay is contained,
+rejected, issued tenant tokens from revoked grants have expired, refresh replay
+is contained,
 the audit path remains healthy, and the incident owner
 accepts the identified exposure window. Otherwise remain fenced.
 

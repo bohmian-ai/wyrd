@@ -62,24 +62,28 @@ correct tenant verifier, not to grant anything.
 
 <WyrdSequenceDiagram
   title="Authenticated request verification"
-  participants={['Client', 'Wyrd server', 'Postgres']}
+  participants={['Client', 'Wyrd server']}
   messages={[
     { from: 'Client', to: 'Wyrd server', label: 'X-Wyrd-Access-Token: Bearer <jwt>' },
     { from: 'Wyrd server', to: 'Wyrd server', label: 'tenant from unverified token → route' },
-    { from: 'Wyrd server', to: 'Wyrd server', label: 'verify sig · kid · iss=wyrd · exp · tenant · revocation' },
-    { from: 'Wyrd server', to: 'Postgres', label: 'resolve roles → effective_permissions' },
-    { from: 'Postgres', to: 'Wyrd server', label: 'permissions', dashed: true },
+    { from: 'Wyrd server', to: 'Wyrd server', label: 'verify sig · kid · iss=wyrd · aud=wyrd · exp · tenant' },
+    { from: 'Wyrd server', to: 'Wyrd server', label: 'permissions claim → effective_permissions' },
     { from: 'Wyrd server', to: 'Client', label: 'AuthenticatedPrincipal → handler runs', dashed: true }
   ]}
 />
 
-`TokenVerifier::verify` checks five things: the EdDSA signature against the key
-named by the token's `kid`, the `iss=wyrd` claim, expiry (with a configured clock
-skew), the tenant binding, and the principal's revocation epoch. A token issued
-before the principal's `tokens_not_before` is rejected. The verifier then resolves
-the token's role claims to an effective permission set through
-`SqlPermissionResolver`. The handler receives an `AuthenticatedPrincipal` and never
+`TokenVerifier::verify` is synchronous and reads no database: it checks the
+EdDSA signature against the key named by the token's `kid`, the `iss=wyrd` and
+`aud=wyrd` claims, expiry (with a configured clock skew), and the tenant binding,
+then builds the effective permission set directly from the token's
+`permissions` claim. The handler receives an `AuthenticatedPrincipal` and never
 re-parses the raw token.
+
+A tenant access token is a five-minute snapshot of the principal's authority,
+resolved once at issuance. Revoking a credential, suspending a principal or
+tenant, or changing grants refuses the next token immediately; a token already
+issued keeps working until it expires. Clients re-exchange before expiry and
+once after an authentication refusal.
 
 ## Obtaining a token: `/auth/token` grant dispatch
 

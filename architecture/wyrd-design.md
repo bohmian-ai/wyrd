@@ -497,14 +497,15 @@ operations are separated, matching the kubectl pattern (`apply` then
 Deploy-time secret injection (Vault Agent, External Secrets Operator, AWS
 Secrets Manager CSI driver, etc.) puts the API key into the pod as
 `WYRD_API_KEY`. The SDK exchanges it at `POST /auth/token` for a short-lived
-JWT (~15m) and re-exchanges the same durable key when that token nears expiry
+JWT (five minutes) and re-exchanges the same durable key when that token nears expiry
 or is refused — a machine grant issues no refresh token, so the key in the
 secret store is the only renewable authority and revoking it ends renewal.
 Rotating renewal authority is a human concern: only an OIDC login returns a
 refresh token, and only that token rotates. `/auth/token`
 derives `tenant_id` and `principal_id` from the verified API-key record;
 no client-supplied tenant header is accepted. The JWT carries the principal
-as the top-level `principal` claim, and for delegated tokens (token
+as the top-level `principal` claim, the `permissions` resolved from its current
+grants at issuance as its only authority, and for delegated tokens (token
 exchange) an RFC 8693 `act` chain of upstream delegators.
 
 Env vars in deployed services:

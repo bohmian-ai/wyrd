@@ -253,8 +253,9 @@ owner, communications owner, and evidence custodian. The response sequence is:
    obligations, root cause, and corrective controls.
 
 Security incidents additionally rotate affected signing, peer, Source, and
-storage credentials; advance authorization epochs; and verify that no retired
-material remains accepted.
+storage credentials; revoke affected credentials and suspend affected
+principals so no new token issues; and verify that no retired material remains
+accepted once issued tenant tokens reach their five-minute expiry.
 
 The executable provider-neutral procedures are in
 [`runbooks.md`](runbooks.md). A deployment maps each procedure's named evidence

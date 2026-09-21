@@ -10,8 +10,6 @@ Auth modules added for the security foundation:
 - `auth::exchange_api_key`: exchanges Wyrd API keys for Service or Agent JWTs,
   inserts principal-generic refresh-token rows, and supports delegated token
   issuance through the verifier and RBAC permission check.
-- `auth::permission_resolver`: resolves role names from verified JWTs to
-  runtime `PermissionSet` values through tenant-scoped SQL.
 - `auth::seed` and `auth::roles`: seed and protect builtin RBAC roles.
 
 The HTTP routes are preview-gated until the registry plane projects Service and

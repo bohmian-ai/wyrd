@@ -56,10 +56,12 @@ approved scoped decision is bound into the distributed permission digest, so a
 peer worker cannot widen it.
 
 The resolution path:
-1. Token carries a list of role names in its claims.
-2. On verify, `SqlPermissionResolver.roles_by_name` fetches the permission sets
-   for those role names from the tenant's role table.
-3. `effective_permissions` merges the sets, applying wildcard (`resource:*`) and
+1. At issuance, the server reads the principal's current roles from the
+   tenant's role table and fetches their permission sets.
+2. It signs those merged permissions into the token's `permissions` claim; the
+   `roles` claim is informational only.
+3. On verify, `effective_permissions` is built from that claim with no database
+   read. Merging applies, applying wildcard (`resource:*`) and
    `AnyOf` subsumption. A role with `cards:*` subsumes `cards:read`, `cards:write`,
    and every other `cards` action.
 

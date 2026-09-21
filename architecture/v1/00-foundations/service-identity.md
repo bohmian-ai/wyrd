@@ -17,8 +17,9 @@ principal — and, for a tenant-scoped principal, its tenant — before verifica
 `wyrd_global_...` at platform scope, `wyrd_sk_<tenant>_...` within a tenant.
 Rotation is overlap: issue B, verify B, revoke A, with no window in which the
 principal holds no usable credential. Revoking a credential retires that
-credential and advances the principal's authorization epoch; it leaves the
-principal, its grants, and its other credentials intact. Every invalid
+credential so it mints no new token; tokens it already minted lapse at their
+five-minute expiry, and the principal, its grants, and its other credentials
+stay intact. Every invalid
 credential case performs exactly one verification and returns the same public
 code: `WYRD_AUTH_401_API_KEY_INVALID`.
 

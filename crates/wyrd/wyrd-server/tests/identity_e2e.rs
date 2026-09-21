@@ -1271,12 +1271,13 @@ async fn federated_cloud_journey_cli_authored_keycloak() {
     // Author the trusted issuer THROUGH the real CLI verb, with a SecretPost
     // client secret that must round-trip to ciphertext at rest.
     let client_secret = "cli-authored-issuer-secret";
+    set_cli_environment("WYRD_ACCESS_TOKEN", &admin_token);
+    set_cli_environment("WYRD_ISSUER_CLIENT_SECRET", client_secret);
     trusted_issuer::dispatch(TrustedIssuerCommand::Add(Box::new(TrustedIssuerAddArgs {
         issuer: keycloak_issuer(),
         expected_audience: "wyrd-workload".to_owned(),
         client_id: "wyrd-workload".to_owned(),
         client_auth: "SecretPost".to_owned(),
-        client_secret: Some(secrecy::SecretString::from(client_secret.to_owned())),
         client_secret_file: None,
         claim_subject: "sub".to_owned(),
         claim_email: None,
@@ -1286,7 +1287,6 @@ async fn federated_cloud_journey_cli_authored_keycloak() {
         principal_kind: "Workload".to_owned(),
         jwks_ttl_secs: Some(300),
         server: server_url.clone(),
-        token: admin_token.clone(),
     })))
     .await
     .expect("CLI trusted-issuer add succeeds");
@@ -1298,7 +1298,6 @@ async fn federated_cloud_journey_cli_authored_keycloak() {
         audience: Some("wyrd-workload".to_owned()),
         card: card_ref.to_string(),
         server: server_url.clone(),
-        token: admin_token.clone(),
     }))
     .await
     .expect("CLI workload-binding add succeeds");
@@ -1481,12 +1480,12 @@ async fn same_issuer_two_tenant_isolation_keycloak() {
 
     // Author the SAME issuer URL in BOTH tenants via the real CLI.
     for token in [&admin_token_a, &admin_token_b] {
+        set_cli_environment("WYRD_ACCESS_TOKEN", token);
         trusted_issuer::dispatch(TrustedIssuerCommand::Add(Box::new(TrustedIssuerAddArgs {
             issuer: keycloak_issuer(),
             expected_audience: "wyrd-workload".to_owned(),
             client_id: "wyrd-workload".to_owned(),
             client_auth: "Public".to_owned(),
-            client_secret: None,
             client_secret_file: None,
             claim_subject: "sub".to_owned(),
             claim_email: None,
@@ -1496,7 +1495,6 @@ async fn same_issuer_two_tenant_isolation_keycloak() {
             principal_kind: "Workload".to_owned(),
             jwks_ttl_secs: Some(300),
             server: server_url.clone(),
-            token: token.clone(),
         })))
         .await
         .expect("CLI trusted-issuer add succeeds");
@@ -1504,13 +1502,13 @@ async fn same_issuer_two_tenant_isolation_keycloak() {
 
     // Bind the subject ONLY in tenant A (CLI), and seed its principal in A only.
     let card_ref = binding_card_ref(CardKind::Service, "iso-sa", "prod");
+    set_cli_environment("WYRD_ACCESS_TOKEN", &admin_token_a);
     workload_binding::dispatch(WorkloadBindingCommand::Add(WorkloadBindingAddArgs {
         issuer: keycloak_issuer(),
         subject: subject.clone(),
         audience: Some("wyrd-workload".to_owned()),
         card: card_ref.to_string(),
         server: server_url.clone(),
-        token: admin_token_a.clone(),
     }))
     .await
     .expect("CLI workload-binding add (tenant A) succeeds");
@@ -1693,4 +1691,16 @@ fn extract_kid(jwt: &str) -> Option<String> {
         .ok()?;
     let header: Value = serde_json::from_slice(&bytes).ok()?;
     header["kid"].as_str().map(|s| s.to_owned())
+}
+
+/// Set one environment source the in-process CLI verbs read.
+///
+/// The CLI takes no secret as an argument: its tenant credential comes from
+/// the ambient chain and the issuer client secret from the environment, so an
+/// in-process verb is authenticated exactly as an operator's shell would.
+fn set_cli_environment(name: &str, value: &str) {
+    // SAFETY: nextest runs each test in its own process and this lane runs a
+    // single test thread, so nothing else reads the environment while it
+    // changes.
+    unsafe { env::set_var(name, value) };
 }

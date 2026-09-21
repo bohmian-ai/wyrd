@@ -134,9 +134,10 @@ pub(crate) async fn machine_token(server: &WyrdTestServer, bootstrap: &Bootstrap
 
 /// An administrator revokes a principal through the CLI, against a real server.
 ///
-/// The pre-revocation probe is what makes the post-revocation `401` meaningful:
-/// without it, a CLI that silently failed to authenticate would look identical
-/// to a successful revocation.
+/// Revocation suspends the principal: its API key can no longer mint a token,
+/// while the token it already holds is a five-minute snapshot that keeps
+/// working until expiry. The pre-revocation probe proves the CLI really
+/// authenticated, so the refused exchange is the revocation's doing.
 #[tokio::test]
 async fn principal_revoke_cli_journey() {
     if std::env::var("WYRD_CLI_E2E").as_deref() != Ok("1") {
@@ -183,10 +184,17 @@ async fn principal_revoke_cli_journey() {
         String::from_utf8_lossy(&revoke.stderr)
     );
 
+    assert!(
+        server
+            .exchange_api_key(target.api_key().expect("target has an api key"))
+            .await
+            .is_err(),
+        "the revoked principal cannot mint another token"
+    );
     assert_eq!(
         v1_status(&server, &target_token).await,
-        StatusCode::UNAUTHORIZED,
-        "the revoked principal's token stops working on the next request"
+        StatusCode::OK,
+        "a token minted before revocation is a snapshot that lapses at expiry"
     );
 
     stop_served(server, shutdown, serve_handle).await;

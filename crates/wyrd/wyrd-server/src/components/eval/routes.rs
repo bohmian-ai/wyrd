@@ -18,10 +18,9 @@ use crate::audit;
 use crate::components::auth::{AuthenticatedPrincipal, Caller};
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::routing::post;
-use axum::{Json, Router};
 use vala_eval::orchestrator::{NextDirective, RunState};
 use wyrd_runtime::{Permission, Principal};
 use wyrd_spec::envelope::CardKind;
@@ -38,23 +37,25 @@ use super::error::{
 };
 use super::resolver;
 use super::state::{MAX_CONCURRENT_RUNS, RunEntry, sweep_and_count_tenant};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 /// Build the four eval pull-protocol routes for the `/v1` group.
 ///
 /// Mirrors `crate::components::storage::storage_router`. Every route resolves the principal
 /// per-handler; there is no group-level auth layer to rely on.
-pub fn eval_router() -> Router<AppState> {
-    Router::new()
-        .route("/eval/runs", post(open))
-        .route("/eval/runs/{run_id}/next", post(next))
-        .route("/eval/runs/{run_id}/agent-turn", post(agent_turn))
-        .route("/eval/runs/{run_id}/user-turn", post(user_turn))
+pub fn eval_router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(open))
+        .routes(routes!(next))
+        .routes(routes!(agent_turn))
+        .routes(routes!(user_turn))
 }
 
 /// Open one evaluation run and lease it to this caller.
 #[utoipa::path(
     post,
-    path = "/v1/eval/runs",
+    path = "/eval/runs",
     request_body = EvalRunOpenRequest,
     responses(
         (status = 200, description = "Run opened; the lease token is returned once",
@@ -156,7 +157,7 @@ async fn open(
 /// Advance one leased run by a single protocol step.
 #[utoipa::path(
     post,
-    path = "/v1/eval/runs/{run_id}/next",
+    path = "/eval/runs/{run_id}/next",
     params(("run_id" = String, Path, description = "Run to advance")),
     responses(
         (status = 200, description = "The next directive for this run", body = TurnDirective),
@@ -226,7 +227,7 @@ async fn next(
 /// Submit the agent's half of one turn.
 #[utoipa::path(
     post,
-    path = "/v1/eval/runs/{run_id}/agent-turn",
+    path = "/eval/runs/{run_id}/agent-turn",
     params(("run_id" = String, Path, description = "Run the turn belongs to")),
     request_body = AgentTurnSubmission,
     responses(
@@ -267,7 +268,7 @@ async fn agent_turn(
 /// Submit the simulated user's half of one turn.
 #[utoipa::path(
     post,
-    path = "/v1/eval/runs/{run_id}/user-turn",
+    path = "/eval/runs/{run_id}/user-turn",
     params(("run_id" = String, Path, description = "Run the turn belongs to")),
     request_body = UserTurnSubmission,
     responses(

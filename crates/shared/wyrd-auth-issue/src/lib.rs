@@ -245,8 +245,7 @@ impl IssuingKey {
             roles,
             None,
             credential_id,
-            issued_at,
-            ttl,
+            TokenWindow { issued_at, ttl },
         )
     }
 
@@ -286,8 +285,7 @@ impl IssuingKey {
             roles,
             None,
             credential_id,
-            Utc::now(),
-            ttl,
+            TokenWindow::starting_now(ttl),
         )
     }
 
@@ -352,8 +350,7 @@ impl IssuingKey {
             roles,
             None,
             credential_id,
-            Utc::now(),
-            ttl,
+            TokenWindow::starting_now(ttl),
         )
     }
 
@@ -402,8 +399,7 @@ impl IssuingKey {
             act,
             // A delegated token is minted from a token, not from a credential.
             None,
-            Utc::now(),
-            ttl,
+            TokenWindow::starting_now(ttl),
         )
     }
 
@@ -499,10 +495,9 @@ impl IssuingKey {
         roles: Vec<RoleRef>,
         act: Option<Box<ActClaim>>,
         credential_id: Option<Uuid>,
-        issued_at: DateTime<Utc>,
-        ttl: Duration,
+        window: TokenWindow,
     ) -> Result<String, IssueError> {
-        let (iat, exp) = timestamps(issued_at, ttl)?;
+        let (iat, exp) = timestamps(window.issued_at, window.ttl)?;
         let jti = new_jti();
         tracing::Span::current().record("jti", &jti);
         let claims = AccessTokenClaims {
@@ -557,6 +552,30 @@ fn argon2() -> Argon2<'static> {
     let params = Params::new(ARGON2_M_COST_KIB, ARGON2_T_COST, ARGON2_P_COST, None)
         .expect("OWASP Argon2id params are valid");
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+}
+
+/// The instant a token is minted at and how long it stays valid.
+///
+/// Kept together because they are one decision: a caller that wants to order a
+/// token against a revocation epoch chooses the instant, and the expiry has to
+/// be derived from that same instant rather than from the wall clock a moment
+/// later.
+struct TokenWindow {
+    /// The `iat` the token will carry.
+    issued_at: DateTime<Utc>,
+    /// How long after `issued_at` the token stays valid.
+    ttl: Duration,
+}
+
+impl TokenWindow {
+    /// A window opening now, which is what every path but an explicitly
+    /// ordered re-issue wants.
+    fn starting_now(ttl: Duration) -> Self {
+        Self {
+            issued_at: Utc::now(),
+            ttl,
+        }
+    }
 }
 
 fn timestamps(issued_at: DateTime<Utc>, ttl: Duration) -> Result<(usize, usize), IssueError> {

@@ -7,12 +7,11 @@
 
 use std::str::FromStr;
 
+use axum::Json;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
-use axum::{Json, Router};
 use serde::Deserialize;
 use tokio_util::io::ReaderStream;
 use wyrd_runtime::Permission;
@@ -29,20 +28,22 @@ use crate::audit;
 use crate::components::auth::Caller;
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 /// Build storage routes for the `/v1` group.
-pub fn storage_router(state: &AppState) -> Router<AppState> {
-    let router = Router::new()
-        .route("/cards/upload/init", post(init))
-        .route("/cards/upload/{id}/part-url", post(part_url))
-        .route("/cards/upload/{id}/complete", post(complete))
-        .route("/cards/upload/{id}/abort", post(abort))
-        .route("/cards/download/init", post(download_init));
+pub fn storage_router(state: &AppState) -> OpenApiRouter<AppState> {
+    let router = OpenApiRouter::new()
+        .routes(routes!(init))
+        .routes(routes!(part_url))
+        .routes(routes!(complete))
+        .routes(routes!(abort))
+        .routes(routes!(download_init));
 
     if matches!(state.storage.backend_config(), BackendConfig::Local { .. }) {
         router
-            .route("/cards/upload/local/{*id}", put(local_blob))
-            .route("/cards/download/local/{*path}", get(download_local_blob))
+            .routes(routes!(local_blob))
+            .routes(routes!(download_local_blob))
     } else {
         router
     }
@@ -51,7 +52,7 @@ pub fn storage_router(state: &AppState) -> Router<AppState> {
 /// Create or replay a storage upload initialization.
 #[utoipa::path(
     post,
-    path = "/v1/cards/upload/init",
+    path = "/cards/upload/init",
     request_body = UploadInitRequest,
     params(("Idempotency-Key" = Option<String>, Header, description = "Replays an \
       initialization instead of planning a second upload")),
@@ -115,7 +116,7 @@ struct PartUrlQuery {
 /// Mint a URL or equivalent protocol data for one upload part.
 #[utoipa::path(
     post,
-    path = "/v1/cards/upload/{id}/part-url",
+    path = "/cards/upload/{id}/part-url",
     params(
         ("id" = String, Path, description = "Upload the part belongs to"),
         ("part_number" = u32, Query, description = "One-based multipart part number")
@@ -177,7 +178,7 @@ async fn part_url(
 /// verifies the backend object before persisting its artifact metadata.
 #[utoipa::path(
     post,
-    path = "/v1/cards/upload/{id}/complete",
+    path = "/cards/upload/{id}/complete",
     params(
         ("id" = String, Path, description = "Upload to finish"),
         ("Idempotency-Key" = Option<String>, Header, description = "Correlates a retried \
@@ -250,7 +251,7 @@ async fn complete(
 /// available to the service for request correlation.
 #[utoipa::path(
     post,
-    path = "/v1/cards/upload/{id}/abort",
+    path = "/cards/upload/{id}/abort",
     params(
         ("id" = String, Path, description = "Upload to release"),
         ("Idempotency-Key" = Option<String>, Header, description = "Correlates a retried abort \
@@ -311,7 +312,7 @@ async fn abort(
 /// Store bytes for the local development backend.
 #[utoipa::path(
     put,
-    path = "/v1/cards/upload/local/{id}",
+    path = "/cards/upload/local/{id}",
     params(("id" = String, Path, description = "Upload the bytes belong to")),
     request_body(content = Vec<u8>, content_type = "application/octet-stream"),
     responses(
@@ -367,7 +368,7 @@ async fn local_blob(
 /// Create a signed or local download plan for a stored artifact.
 #[utoipa::path(
     post,
-    path = "/v1/cards/download/init",
+    path = "/cards/download/init",
     request_body = DownloadInitRequest,
     responses(
         (status = 200, description = "Download plan",
@@ -415,7 +416,7 @@ async fn download_init(
 /// Stream bytes from the local development backend.
 #[utoipa::path(
     get,
-    path = "/v1/cards/download/local/{path}",
+    path = "/cards/download/local/{path}",
     params(("path" = String, Path, description = "Stored object path to stream")),
     responses(
         (status = 200, description = "The stored bytes",

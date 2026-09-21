@@ -10,9 +10,8 @@
 //! refused there before reaching a handler — and a tenant token must never be
 //! accepted here. Two planes, two entries.
 
+use axum::Json;
 use axum::extract::{Path, State};
-use axum::routing::{get, post, put};
-use axum::{Json, Router};
 use secrecy::{ExposeSecret, SecretString};
 use wyrd_auth::platform_sessions::{
     DEFAULT_PLATFORM_TOKEN_TTL_MINUTES, PlatformSessionError, PlatformSessions,
@@ -31,23 +30,19 @@ use crate::components::platform::provisioning::{ProvisionError, TenantProvisioni
 use crate::components::platform::recovery::TenantRecovery;
 use crate::http::error::{WyrdErrorResponse, internal_failure};
 use crate::state::AppState;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 /// Build the authenticated platform control-plane routes.
 ///
 /// Merged at the top level, not under `/v1`: see this module's documentation
 /// for why the two planes have separate entries.
-pub fn platform_router() -> Router<AppState> {
-    Router::new()
-        .route("/platform/tenants", post(create_tenant).get(list_tenants))
-        .route("/platform/tenants/{tenant_id}", get(inspect_tenant))
-        .route(
-            "/platform/tenants/{tenant_id}/status",
-            put(set_tenant_status),
-        )
-        .route(
-            "/platform/tenants/admin/credentials",
-            post(recover_tenant_admin),
-        )
+pub fn platform_router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(create_tenant, list_tenants))
+        .routes(routes!(inspect_tenant))
+        .routes(routes!(set_tenant_status))
+        .routes(routes!(recover_tenant_admin))
 }
 
 /// Build the anonymous platform credential-exchange route.
@@ -55,8 +50,8 @@ pub fn platform_router() -> Router<AppState> {
 /// Merged outside the authenticated nests, like the tenant plane's
 /// `/auth/token`: a caller presenting a credential has no session yet, so this
 /// route cannot sit behind a session requirement.
-pub fn platform_auth_router() -> Router<AppState> {
-    Router::new().route("/auth/platform/token", post(platform_token))
+pub fn platform_auth_router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new().routes(routes!(platform_token))
 }
 
 /// Exchange a platform credential for a short-lived session.

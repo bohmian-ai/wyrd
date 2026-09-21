@@ -241,10 +241,12 @@ impl AuthorizationCodeExchange {
             &mut conn,
             self.issuing_key.as_ref(),
             tenant_id,
-            principal_id,
-            roles,
-            None,
-            issued_at,
+            UserSessionGrant {
+                principal_id,
+                roles,
+                rotated_from: None,
+                issued_at,
+            },
             request_id,
         )
         .await?;
@@ -398,6 +400,24 @@ pub async fn ensure_user_identity(
     Ok(canonical)
 }
 
+/// The facts one human session grant is minted from.
+///
+/// Grouped because they travel together through both entry points and are one
+/// decision about which session is being established: whose it is, what it may
+/// do, which refresh row it supersedes, and when it starts.
+pub(crate) struct UserSessionGrant {
+    /// Human principal the session belongs to.
+    pub(crate) principal_id: Uuid,
+    /// Roles the session carries, already resolved.
+    pub(crate) roles: Vec<RoleRef>,
+    /// Consumed refresh row on renewal; absent at first login. Doubles as the
+    /// credential id of a session authenticated by a stored refresh row.
+    pub(crate) rotated_from: Option<Uuid>,
+    /// Explicit `iat` for the access token, used when the session has to be
+    /// ordered against a revocation epoch. Absent means the wall clock.
+    pub(crate) issued_at: Option<DateTime<Utc>>,
+}
+
 /// Issue a human session's access and refresh pair and audit the grant.
 ///
 /// The one owner for both ends of a human session: the OIDC callback that
@@ -423,12 +443,15 @@ pub(crate) async fn issue_and_record_user_session(
     conn: &mut TenantConn<'_>,
     issuing_key: &IssuingKey,
     tenant_id: DataTenantId,
-    principal_id: Uuid,
-    roles: Vec<RoleRef>,
-    rotated_from: Option<Uuid>,
-    issued_at: Option<DateTime<Utc>>,
+    grant: UserSessionGrant,
     request_id: &str,
 ) -> Result<ExchangedToken, WyrdError> {
+    let UserSessionGrant {
+        principal_id,
+        roles,
+        rotated_from,
+        issued_at,
+    } = grant;
     let principal = Principal::new(
         PrincipalId::new(principal_id),
         PrincipalKind::User,

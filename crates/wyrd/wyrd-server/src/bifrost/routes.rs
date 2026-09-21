@@ -1,8 +1,7 @@
 //! Axum adapters for the Bifrost catalog service functions.
 
+use axum::Json;
 use axum::extract::{Path, State};
-use axum::routing::{get, post};
-use axum::{Json, Router};
 use wyrd_spec::error::WyrdProblem;
 use wyrd_spec::vala::api::{
     BifrostTableDescription, BifrostTableEntry, RegisterTableRequest, RegisterTableResponse,
@@ -12,17 +11,19 @@ use crate::bifrost::service;
 use crate::components::auth::Caller;
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 /// Standalone Bifrost catalog router for the `/v1` group.
-pub fn router() -> Router<AppState> {
-    Router::new()
-        .route("/bifrost/tables", post(register).get(list))
-        .route("/bifrost/tables/{namespace}/{name}", get(describe))
+pub fn router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(register, list))
+        .routes(routes!(describe))
 }
 
 #[utoipa::path(
     post,
-    path = "/v1/bifrost/tables",
+    path = "/bifrost/tables",
     request_body = RegisterTableRequest,
     responses(
         (status = 200, description = "Table created or matched", body = RegisterTableResponse),
@@ -70,7 +71,7 @@ pub(crate) async fn register(
 
 #[utoipa::path(
     get,
-    path = "/v1/bifrost/tables",
+    path = "/bifrost/tables",
     responses(
         (status = 200, description = "Visible table entries", body = Vec<BifrostTableEntry>),
         (status = 401, description = "The request carried no usable access token \
@@ -107,7 +108,7 @@ pub(crate) async fn list(
 
 #[utoipa::path(
     get,
-    path = "/v1/bifrost/tables/{namespace}/{name}",
+    path = "/bifrost/tables/{namespace}/{name}",
     params(
         ("namespace" = String, Path, description = "Table namespace"),
         ("name" = String, Path, description = "Table name")

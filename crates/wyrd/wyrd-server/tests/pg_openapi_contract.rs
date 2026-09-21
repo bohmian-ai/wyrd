@@ -2,22 +2,30 @@
 //!
 //! Every case drives [`WyrdTestServer`], so the document under assertion is the
 //! one the composed production router actually serves rather than a rendering
-//! of [`WyrdApiDoc`] in isolation. The suite locks the four properties the
-//! contract has to hold: the document is served as JSON and nothing else is,
-//! every route the server mounts is described by it, the operations that clear
-//! the document-wide security requirement are exactly the ones an anonymous
-//! caller can reach, and a refusal produced at runtime carries a stable code
-//! that the owning operation already documents.
-//!
-//! [`WyrdApiDoc`]: wyrd_server::http::openapi::WyrdApiDoc
+//! of the document type in isolation. Routing and documentation come out of one
+//! `utoipa-axum` registration in the owning route modules, so the suite asserts
+//! what that registration cannot make true by construction: the document is
+//! served as JSON and nothing else is, the composed surface carries its nesting
+//! prefix, every problem body names a real catalog code under its own status,
+//! the operations that clear the document-wide security requirement are exactly
+//! the ones an anonymous caller can reach, and a refusal produced at runtime
+//! carries a stable code that the owning operation already documents.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
+use secrecy::ExposeSecret as _;
 use serde_json::Value;
+use wyrd_spec::error::WyrdError;
 use wyrd_spec::storage::ids::UploadId;
 use wyrd_testing::WyrdTestServer;
+
+/// Media type RFC 9457 problem bodies are served with.
+const PROBLEM_MEDIA_TYPE: &str = "application/problem+json";
+
+/// Name the contract gives the one Wyrd authentication scheme.
+const WYRD_ACCESS_TOKEN_SCHEME: &str = "wyrdAccessToken";
 
 /// The HTTP methods an OpenAPI path item may key an operation by.
 const METHODS: [&str; 7] = ["get", "put", "post", "delete", "options", "head", "patch"];
@@ -67,179 +75,313 @@ async fn problem_json(response: axum::response::Response) -> Value {
     serde_json::from_slice(&body).expect("problem JSON")
 }
 
-/// Extract every literal path passed to `.route("…")` inside one source span.
+/// Pull every `WYRD_…` stable code named in a response description.
 ///
-/// Axum exposes no route table, so the registrations themselves are the only
-/// declaration of what the server mounts. Wildcard captures are normalized
-/// (`{*id}` → `{id}`) because OpenAPI has one template syntax. `.route_service`
-/// is deliberately not matched: the MCP endpoint it mounts speaks its own
-/// protocol and is not an OpenAPI operation.
-fn routes_in(source: &str) -> Vec<String> {
-    source
-        .split(".route(")
-        .skip(1)
-        .filter_map(|rest| {
-            let open = rest.find('"')?;
-            let close = rest[open + 1..].find('"')?;
-            Some(rest[open + 1..=open + close].replace("{*", "{"))
-        })
+/// Descriptions are prose with codes in parentheses rather than a structured
+/// field, so the codes are recovered by scanning for the one prefix the catalog
+/// uses and taking the identifier that follows.
+fn stable_codes(description: &str) -> Vec<String> {
+    description
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|token| token.starts_with("WYRD_"))
+        .map(str::to_owned)
         .collect()
 }
 
-/// Extract every identifier passed to `.merge(…)` inside one source span.
-fn merges_in(source: &str) -> Vec<String> {
-    source
-        .split(".merge(")
-        .skip(1)
-        .filter_map(|rest| {
-            let name: String = rest
-                .chars()
-                .take_while(|c| c.is_alphanumeric() || *c == '_')
-                .collect();
-            (!name.is_empty()).then_some(name)
-        })
-        .collect()
-}
-
-/// Return the source span between `open` and the first following `close`.
+/// The HTTP status the catalog declares for one stable code.
 ///
-/// # Panics
-/// Panics when either marker is absent, which means the router was restructured
-/// and this derivation needs to follow it.
-fn span<'a>(source: &'a str, open: &str, close: &str) -> &'a str {
-    let start = source.find(open).unwrap_or_else(|| panic!("{open} exists"));
-    let rest = &source[start..];
-    let end = rest.find(close).unwrap_or_else(|| panic!("{close} exists"));
-    &rest[..end]
+/// [`WyrdError::from_code`] reconstructs only the variants whose fields are
+/// `{ message, details }`, which leaves the delegated sub-catalogs — storage and
+/// Bifrost — unreachable through it. Those codes carry their status in their own
+/// second segment, which is written beside the `status = N` the derive reads, so
+/// a code that disagrees with the response it is documented under is caught
+/// either way.
+fn catalog_status(code: &str) -> Option<u16> {
+    WyrdError::from_code(code, "documented refusal".to_owned(), serde_json::json!({}))
+        .map(|error| error.status())
+        .or_else(|| code.split('_').nth(2)?.parse().ok())
 }
 
-/// Return the body of the top-level `fn <name>` in one source file.
+/// The served document describes the routes the server mounts.
 ///
-/// Scoping to the defining function keeps routes registered by a test module
-/// beside it out of the derivation.
-///
-/// # Panics
-/// Panics when the file defines no such function.
-fn fn_body(source: &str, name: &str) -> String {
-    let start = source
-        .find(&format!("fn {name}("))
-        .unwrap_or_else(|| panic!("fn {name} is defined here"));
-    let rest = &source[start..];
-    let end = rest.find("\n}\n").map_or(rest.len(), |offset| offset + 2);
-    rest[..end].to_owned()
-}
-
-/// Read the source of the router-building function `build_router` calls under
-/// `name`, following the router's own `use … as …` aliases to the module that
-/// defines it and otherwise searching the crate for the definition.
-///
-/// # Panics
-/// Panics when neither the alias target nor a crate-wide definition resolves.
-fn router_source(router: &str, name: &str) -> String {
-    let alias = format!(" as {name};");
-    if let Some(line) = router
-        .lines()
-        .find(|line| line.starts_with("use ") && line.ends_with(&alias))
-    {
-        let mut parts: Vec<&str> = line
-            .trim_start_matches("use ")
-            .split(" as ")
-            .next()
-            .expect("the import names a path")
-            .split("::")
-            .collect();
-        let function = parts.pop().expect("the path names a function");
-        parts.remove(0);
-        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src")
-            .join(parts.join("/"));
-        let file = [base.with_extension("rs"), base.join("mod.rs")]
-            .into_iter()
-            .find(|candidate| candidate.exists())
-            .unwrap_or_else(|| panic!("{name} resolves to a module file"));
-        return fn_body(
-            &std::fs::read_to_string(file).expect("module reads"),
-            function,
-        );
-    }
-    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    for file in walk(&src) {
-        let source = std::fs::read_to_string(&file).expect("source file reads");
-        if source.contains(&format!("fn {name}(")) {
-            return fn_body(&source, name);
-        }
-    }
-    panic!("{name} is defined somewhere under src/");
-}
-
-/// Every `.rs` file under `root`, recursively.
-fn walk(root: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let mut files = Vec::new();
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return files;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            files.extend(walk(&path));
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
-            files.push(path);
-        }
-    }
-    files
-}
-
-/// Derive every public operation the assembled router mounts, as
-/// `(method-agnostic) path` strings carrying the prefix the router nests them
-/// under.
-///
-/// The derivation follows `build_router`: the component routers merged into
-/// `v1_group` are nested under `/v1`, the ones merged into `protected` are
-/// served unprefixed. The liveness probes are not merged into either group and
-/// so are excluded by construction, not by a list.
-fn mounted_paths() -> Vec<String> {
-    let router = include_str!("../src/http/router.rs");
-    let aliases: BTreeMap<&str, &str> = [("auth_routes", "auth_router")].into_iter().collect();
-    let mut paths = Vec::new();
-    for (span_open, span_close, prefix) in [
-        ("let v1_group = Router::new()", ".fallback(", "/v1"),
-        ("let protected = apply_protected_edge(", ".nest(", ""),
-    ] {
-        for name in merges_in(span(router, span_open, span_close)) {
-            let name = aliases.get(name.as_str()).map_or(name.as_str(), |it| it);
-            if !name.ends_with("_router") {
-                continue;
-            }
-            paths.extend(
-                routes_in(&router_source(router, name))
-                    .into_iter()
-                    .map(|path| format!("{prefix}{path}")),
-            );
-        }
-    }
-    paths
-}
-
-/// Every route the composed router mounts must be described by the document it
-/// serves, so a caller that reads the contract learns the whole public surface.
+/// Routing and documentation now come out of one `utoipa-axum` registration, so
+/// a served method that is undocumented is not something a test has to look for
+/// — it cannot be written. What is still worth pinning is that the composition
+/// actually ran: that the nesting prefix reached the operations and that the
+/// surfaces mounted on both planes are present.
 #[tokio::test]
-async fn every_mounted_public_route_is_documented() {
+async fn the_served_document_describes_the_composed_surface() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
     let document = served_document(&server).await;
+    let paths = document["paths"].as_object().expect("paths object");
 
-    let documented = document["paths"].as_object().expect("paths object");
-    let mounted = mounted_paths();
-    assert!(!mounted.is_empty(), "the router mounts public routes");
-    let undocumented: Vec<&String> = mounted
-        .iter()
-        .filter(|path| !documented.contains_key(path.as_str()))
-        .collect();
-
+    for path in [
+        "/v1/cards",
+        "/v1/cards/by-uid/{kind}/{card_uid}",
+        "/v1/cards/by-ref",
+        "/v1/cards/{kind}/{space}/{name}/latest",
+        "/v1/cards/{kind}/{space}/{name}/versions",
+        "/v1/cards/{card_uid}/artifacts",
+        "/v1/cards/{card_uid}/complete",
+        "/v1/cards/download/init",
+        "/v1/principals/{principal_id}/credentials/{credential_id}",
+        "/v1/bifrost/tables",
+        "/v1/bifrost/tables/{namespace}/{name}",
+        "/auth/token",
+        "/platform/tenants",
+    ] {
+        assert!(paths.contains_key(path), "missing {path}");
+    }
     assert!(
-        undocumented.is_empty(),
-        "mounted routes missing from /openapi.json: {undocumented:?}"
+        !paths.contains_key("/v1/cards/{card_uid}/abort"),
+        "a route the server does not mount is not documented"
+    );
+    assert!(
+        !paths.contains_key("/mcp"),
+        "the MCP endpoint speaks its own protocol and is not an OpenAPI operation"
+    );
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// Every documented problem body is served as `application/problem+json` and
+/// names real catalog codes for its status.
+///
+/// A generated client branches on the media type and on the code; declaring a
+/// problem as plain `application/json`, or naming a code that disagrees with the
+/// status it is documented under, breaks that branch silently.
+///
+/// Every operation is held to this, not a chosen subset of tags: a caller
+/// reaching the storage, evaluation, authorization, or OTLP surface branches on
+/// refusals exactly the way an operator branches on an administrative one.
+#[tokio::test]
+async fn every_problem_response_declares_its_media_type_and_stable_code() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let catalog: BTreeSet<&'static str> = WyrdError::codes().into_iter().collect();
+    let mut problems = 0_usize;
+    let mut defects = Vec::new();
+
+    for (path, item) in document["paths"].as_object().expect("paths object") {
+        for (method, operation) in item.as_object().expect("path item is an object") {
+            let responses = operation["responses"]
+                .as_object()
+                .expect("an operation declares responses");
+            for (status, response) in responses {
+                let content = &response["content"];
+                if content["application/json"]["schema"]["$ref"]
+                    .as_str()
+                    .is_some_and(|reference| reference.ends_with("/WyrdProblem"))
+                {
+                    defects.push(format!(
+                        "{method} {path} {status} is problem+json as plain JSON"
+                    ));
+                    continue;
+                }
+                if !content[PROBLEM_MEDIA_TYPE].is_object() {
+                    continue;
+                }
+                problems += 1;
+                let description = response["description"].as_str().unwrap_or_default();
+                let codes = stable_codes(description);
+                if codes.is_empty() {
+                    defects.push(format!(
+                        "{method} {path} {status} names no code: {description}"
+                    ));
+                    continue;
+                }
+                // `default` is the catch-all arm rather than one status, so its
+                // codes are checked for existence and nothing more.
+                let expected: Option<u16> = status.parse().ok();
+                for code in codes {
+                    if !catalog.contains(code.as_str()) {
+                        defects.push(format!(
+                            "{method} {path} {status} names {code}, absent from the catalog"
+                        ));
+                        continue;
+                    }
+                    let Some(declared) = catalog_status(&code) else {
+                        continue;
+                    };
+                    if expected.is_some_and(|expected| declared != expected) {
+                        defects.push(format!(
+                            "{method} {path} documents {code} under {status}, but the catalog \
+                             gives it {declared}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(defects.is_empty(), "{}", defects.join("\n"));
+    assert!(
+        problems > 0,
+        "the contract declares no problem responses at all"
+    );
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// The contract names one authentication scheme and requires it by default.
+///
+/// Authentication is a property of the whole surface, so the requirement is
+/// declared once on the document and inherited. An operation a caller reaches
+/// before it can have a session clears the requirement beside its own handler
+/// with `security(())`, which is the only override the contract permits: a
+/// per-operation requirement naming some *other* scheme would be a second
+/// authentication story, and there is only one header.
+#[tokio::test]
+async fn every_authenticated_path_declares_the_one_wyrd_scheme() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let scheme = &document["components"]["securitySchemes"][WYRD_ACCESS_TOKEN_SCHEME];
+    assert_eq!(scheme["type"], "apiKey");
+    assert_eq!(scheme["in"], "header");
+    assert_eq!(scheme["name"], "X-Wyrd-Access-Token");
+    assert_eq!(
+        document["security"],
+        serde_json::json!([{ WYRD_ACCESS_TOKEN_SCHEME: [] }]),
+        "the document requires the scheme by default"
+    );
+
+    let mut cleared = BTreeSet::new();
+    for (path, item) in document["paths"].as_object().expect("paths object") {
+        for (method, operation) in item.as_object().expect("path item is an object") {
+            let Some(overridden) = operation.get("security") else {
+                continue;
+            };
+            // utoipa renders `security(())` as one empty requirement object,
+            // which is OpenAPI's way of saying the operation needs nothing.
+            assert!(
+                overridden == &serde_json::json!([]) || overridden == &serde_json::json!([{}]),
+                "{method} {path} overrides the document requirement with a second scheme"
+            );
+            cleared.insert(path.clone());
+        }
+    }
+    assert!(
+        !cleared.is_empty(),
+        "sign-in and credential exchange cannot themselves require a session"
+    );
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// Every public Bifrost table, query, and lifecycle operation publishes its
+/// pre-stream refusals as typed `WyrdProblem` bodies.
+#[tokio::test]
+async fn bifrost_operations_publish_typed_problem_refusals() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let problem_ref = "#/components/schemas/WyrdProblem";
+    let operations: [(&str, &str, &[&str]); 7] = [
+        ("/v1/bifrost/tables", "post", &["400", "409", "503"]),
+        ("/v1/bifrost/tables", "get", &["503"]),
+        (
+            "/v1/bifrost/tables/{namespace}/{name}",
+            "get",
+            &["400", "404", "503"],
+        ),
+        ("/v1/query", "post", &["400", "503"]),
+        ("/v1/query/running", "get", &["409", "503"]),
+        (
+            "/v1/query/{request_id}",
+            "get",
+            &["400", "404", "409", "503"],
+        ),
+        (
+            "/v1/query/{request_id}",
+            "delete",
+            &["400", "404", "409", "503"],
+        ),
+    ];
+    for (path, method, specific) in operations {
+        let responses = &document["paths"][path][method]["responses"];
+        for status in ["401", "403", "default"].iter().chain(specific) {
+            assert_eq!(
+                responses[*status]["content"][PROBLEM_MEDIA_TYPE]["schema"]["$ref"], problem_ref,
+                "{method} {path} must publish {status} as WyrdProblem problem+json"
+            );
+            assert!(
+                responses[*status]["content"]["application/json"].is_null(),
+                "{method} {path} must not publish {status} as plain JSON"
+            );
+        }
+    }
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// The card surface publishes its typed lifecycle, parameter, and problem
+/// shapes.
+#[tokio::test]
+async fn card_contract_publishes_typed_lifecycle_and_problem_shapes() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let paths = document["paths"].as_object().expect("paths object");
+
+    let parameters = paths["/v1/cards"]["get"]["parameters"]
+        .as_array()
+        .expect("list parameters");
+    let parameter_names: BTreeSet<&str> = parameters
+        .iter()
+        .filter_map(|parameter| parameter["name"].as_str())
+        .collect();
+    assert_eq!(
+        parameter_names,
+        BTreeSet::from([
+            "kind",
+            "space",
+            "name",
+            "version_range",
+            "status",
+            "filter",
+            "include_prerelease",
+            "limit",
+            "cursor",
+        ])
+    );
+
+    let card = &document["components"]["schemas"]["Card"];
+    let required = card["required"].as_array().expect("Card required fields");
+    assert!(required.iter().any(|field| field == "apiVersion"));
+    assert_eq!(
+        document["components"]["schemas"]["Spec"]["oneOf"]
+            .as_array()
+            .expect("typed spec alternatives")
+            .len(),
+        16
+    );
+
+    let problem = &document["components"]["schemas"]["WyrdProblem"];
+    let problem_required: BTreeSet<&str> = problem["required"]
+        .as_array()
+        .expect("problem required fields")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    assert_eq!(
+        problem_required,
+        BTreeSet::from([
+            "type",
+            "title",
+            "status",
+            "detail",
+            "code",
+            "details",
+            "remediation",
+        ])
     );
 
     server.shutdown().await.expect("server shuts down");
@@ -505,6 +647,78 @@ async fn an_unavailable_audit_store_answers_with_a_code_the_operation_documents(
         documented_description(&document, "/v1/cards/upload/{id}/part-url", "post", 500)
             .contains(code),
         "the owning operation names {code} on its 500"
+    );
+
+    sqlx::query("ALTER TABLE vala.audit_staging_offline RENAME TO audit_staging")
+        .execute(&pool)
+        .await
+        .expect("audit staging comes back");
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// A credential exchange whose audit cannot be staged fails closed with the
+/// stable code `/auth/token` documents.
+///
+/// `/auth/token` is the one operation every caller reaches before it has a
+/// session, so the set of refusals it declares is the set a client has to be
+/// able to branch on. The audit-unavailable arm is the one that used to go
+/// undeclared: it is reachable from a perfectly valid credential, and it is the
+/// arm that proves the grant and its audit commit together.
+///
+/// The failure is injected at the store — the canonical staging table is
+/// renamed out from under the append — so no handler seam has to be stubbed.
+#[tokio::test]
+async fn an_unstageable_exchange_audit_answers_with_a_code_the_token_operation_documents() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let service = server
+        .bootstrap_service("openapi-token-audit", &["reader"])
+        .await
+        .expect("service bootstraps");
+    let api_key = service
+        .api_key()
+        .expect("machine bootstraps with a key")
+        .expose_secret()
+        .to_owned();
+    let pool = server
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool opens");
+    sqlx::query("ALTER TABLE vala.audit_staging RENAME TO audit_staging_offline")
+        .execute(&pool)
+        .await
+        .expect("audit staging goes offline");
+
+    let response = server
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/token")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "grant_type": "wyrd_api_key",
+                        "api_key": api_key,
+                    })
+                    .to_string(),
+                ))
+                .expect("request builds"),
+        )
+        .await
+        .expect("router responds");
+
+    let status = response.status();
+    let problem = problem_json(response).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{problem}");
+    let code = problem["code"].as_str().expect("problem carries a code");
+    assert_eq!(code, "WYRD_AUDIT_503_UNAVAILABLE");
+    assert!(
+        documented_description(&document, "/auth/token", "post", 503).contains(code),
+        "the token operation names {code} on its 503"
     );
 
     sqlx::query("ALTER TABLE vala.audit_staging_offline RENAME TO audit_staging")

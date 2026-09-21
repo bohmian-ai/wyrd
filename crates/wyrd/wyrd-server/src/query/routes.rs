@@ -8,8 +8,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::{Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::{Extension, Json, Router};
+use axum::{Extension, Json};
 use futures_util::StreamExt;
 use vala_bifrost_redux::oracle::OracleQueryStream;
 use wyrd_spec::error::{WyrdError, WyrdProblem};
@@ -26,6 +25,8 @@ use crate::http::error::WyrdErrorResponse;
 use crate::http::middleware::edge_timeout::QueryEdgeTimer;
 use crate::query::service;
 use crate::state::AppState;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 /// Content type of the length-delimited Bifrost query frame stream.
 const QUERY_STREAM_CONTENT_TYPE: &str = "application/vnd.wyrd.bifrost-query-stream";
@@ -78,19 +79,16 @@ fn encode_query_frame(
 }
 
 /// Standalone query router for the `/v1` group.
-pub fn router() -> Router<AppState> {
-    Router::new()
-        .route("/query", post(sync_query))
-        .route("/query/running", get(list_running_queries))
-        .route(
-            "/query/{request_id}",
-            get(get_running_query).delete(cancel_running_query),
-        )
+pub fn router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(sync_query))
+        .routes(routes!(list_running_queries))
+        .routes(routes!(get_running_query, cancel_running_query))
 }
 
 #[utoipa::path(
     get,
-    path = "/v1/query/running",
+    path = "/query/running",
     responses(
         (status = 200, description = "Active queries", body = ListRunningQueriesResponse),
         (status = 401, description = "The request carried no usable access token \
@@ -134,7 +132,7 @@ pub(crate) async fn list_running_queries(
 
 #[utoipa::path(
     get,
-    path = "/v1/query/{request_id}",
+    path = "/query/{request_id}",
     params(("request_id" = String, Path, description = "Canonical query request ID")),
     responses(
         (status = 200, description = "Active query", body = RunningQuerySummary),
@@ -191,7 +189,7 @@ pub(crate) async fn get_running_query(
 
 #[utoipa::path(
     delete,
-    path = "/v1/query/{request_id}",
+    path = "/query/{request_id}",
     params(("request_id" = String, Path, description = "Canonical query request ID")),
     responses(
         (status = 200, description = "Cancellation accepted", body = CancelRunningQueryResponse),
@@ -248,7 +246,7 @@ pub(crate) async fn cancel_running_query(
 
 #[utoipa::path(
     post,
-    path = "/v1/query",
+    path = "/query",
     request_body = BifrostQueryRequest,
     responses(
         (

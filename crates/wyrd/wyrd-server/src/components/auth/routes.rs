@@ -1,8 +1,8 @@
 //! HTTP routes for auth preview surfaces.
 
+use axum::Json;
 use axum::extract::{Extension, Query, State};
 use axum::http::HeaderMap;
-use axum::{Json, Router};
 use std::sync::Arc;
 
 use base64::Engine;
@@ -26,15 +26,16 @@ use crate::auth::exchange_api_key::{
 };
 use crate::auth::issue_api_key::{IssueApiKey, WyrdApiKey};
 use crate::auth::jwt_bearer::JwtBearer;
-use crate::auth::login::login as login_handler;
 use crate::auth::refresh::{RefreshError, RefreshTokens, tenant_from_refresh_jwt};
 use crate::components::auth::{AuthenticatedPrincipal, Caller};
 use crate::http::error::WyrdErrorResponse;
 use crate::http::error::internal_failure;
 use crate::state::AppState;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 /// Build auth routes.
-pub fn auth_router() -> Router<AppState> {
+pub fn auth_router() -> OpenApiRouter<AppState> {
     let auth_governor = Arc::new(
         GovernorConfigBuilder::default()
             .per_millisecond(100)
@@ -43,11 +44,11 @@ pub fn auth_router() -> Router<AppState> {
             .expect("static auth governor config is valid"),
     );
 
-    Router::new()
-        .route("/auth/login", axum::routing::get(login_handler))
-        .route("/auth/callback", axum::routing::get(callback))
-        .route("/auth/token", axum::routing::post(token))
-        .route("/auth/issue-key", axum::routing::post(issue_key))
+    OpenApiRouter::new()
+        .routes(routes!(crate::auth::login::login))
+        .routes(routes!(callback))
+        .routes(routes!(token))
+        .routes(routes!(issue_key))
         .layer(GovernorLayer::new(auth_governor))
 }
 
@@ -89,8 +90,11 @@ pub fn auth_router() -> Router<AppState> {
         (status = 404, description = "No principal in this tenant matches the requested \
           delegation subject or the presented workload assertion \
           (WYRD_AUTH_404_PRINCIPAL_NOT_FOUND)", body = WyrdProblem),
-        (status = 503, description = "The auth backend or audit path is unavailable \
-          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+        (status = 500, description = "Token issuance or the server's own auth configuration \
+          failed, so no token was served (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
+        (status = 503, description = "The auth backend or the revocation store is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE), or the exchange audit could not be staged, which \
+          fails the grant closed (WYRD_AUDIT_503_UNAVAILABLE)", body = WyrdProblem)
     ),
     // No session exists yet at this operation, so it clears the document-wide
     // requirement instead of inheriting it.

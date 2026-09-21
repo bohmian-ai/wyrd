@@ -14,9 +14,8 @@
 //! There is deliberately no MCP projection: issuance returns a secret, and a
 //! tool result is transcript material.
 
+use axum::Json;
 use axum::extract::{Path, State};
-use axum::routing::get;
-use axum::{Json, Router};
 use chrono::{Duration, Utc};
 use secrecy::ExposeSecret;
 use uuid::Uuid;
@@ -39,21 +38,17 @@ use crate::components::auth::PlatformCaller;
 use crate::components::platform::identity::{authorize, authorize_read, commit_decision, operator};
 use crate::http::error::{WyrdErrorResponse, internal_failure};
 use crate::state::AppState;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 /// Build the platform credential-administration routes.
 ///
 /// Nested under the principal they belong to, like the tenant plane's, so a
 /// credential id alone can never address a credential across principals.
-pub fn platform_credentials_router() -> Router<AppState> {
-    Router::new()
-        .route(
-            "/platform/admins/{principal_id}/credentials",
-            get(list_credentials).post(issue_credential),
-        )
-        .route(
-            "/platform/admins/{principal_id}/credentials/{credential_id}",
-            axum::routing::delete(revoke_credential),
-        )
+pub fn platform_credentials_router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(list_credentials, issue_credential))
+        .routes(routes!(revoke_credential))
 }
 
 /// Mint a credential for an existing platform principal.

@@ -9,9 +9,8 @@
 //! away, so removing the connection or losing the provider leaves the
 //! deployment administrable.
 
+use axum::Json;
 use axum::extract::{Path, State};
-use axum::routing::{get, post};
-use axum::{Json, Router};
 use secrecy::{ExposeSecret, SecretString};
 use uuid::Uuid;
 use wyrd_auth::pg_resolvers::{client_auth_label, seal_platform_client_secret};
@@ -46,6 +45,8 @@ use wyrd_sql::queries::platform::principal_grants::set_platform_grant_tx;
 use crate::boot::init::platform_administrator_grant;
 use crate::http::error::{WyrdErrorResponse, internal_failure};
 use crate::state::AppState;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 /// Claim mapping the platform connection uses.
 ///
@@ -64,22 +65,15 @@ fn platform_claim_mapping() -> serde_json::Value {
 }
 
 /// Build the authenticated platform identity routes.
-pub fn platform_identity_router() -> Router<AppState> {
-    Router::new()
-        .route(
-            "/platform/oidc/connection",
-            get(read_connection)
-                .put(configure_connection)
-                .delete(remove_connection),
-        )
-        .route(
-            "/platform/admins",
-            post(register_admin).get(list_platform_admins),
-        )
-        .route(
-            "/platform/admins/{principal_id}/status",
-            axum::routing::put(set_admin_status),
-        )
+pub fn platform_identity_router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(
+            read_connection,
+            configure_connection,
+            remove_connection
+        ))
+        .routes(routes!(register_admin, list_platform_admins))
+        .routes(routes!(set_admin_status))
 }
 
 /// Build the anonymous platform login routes.
@@ -87,10 +81,10 @@ pub fn platform_identity_router() -> Router<AppState> {
 /// Separate from the authenticated router because a human signing in has no
 /// platform session yet — requiring one would make federated login impossible
 /// for exactly the people it exists for.
-pub fn platform_login_router() -> Router<AppState> {
-    Router::new()
-        .route("/auth/platform/login", post(begin_login))
-        .route("/auth/platform/callback", post(complete_login))
+pub fn platform_login_router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(begin_login))
+        .routes(routes!(complete_login))
 }
 
 /// Resolve the platform boundary, or report the plane unconfigured.

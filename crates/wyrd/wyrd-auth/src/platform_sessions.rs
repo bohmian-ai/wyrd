@@ -217,21 +217,20 @@ impl PlatformSessions {
         request_id: &str,
     ) -> Result<SecretString, PlatformSessionError> {
         let mut conn = self.pool.begin_platform_audited().await?;
-        let principal_id = match platform_identity_by_subject_tx(&mut conn, issuer, subject).await?
-        {
-            Some(identity) => identity.principal_id,
-            None => {
-                // First login: match the pre-registered claim and pin the
-                // subject. The store's `subject IS NULL` predicate makes this a
-                // one-time transition, so a concurrent second login pins
-                // nothing and is refused rather than racing.
-                let Some(claim) = match_claim else {
-                    return Err(PlatformSessionError::Invalid);
-                };
-                pin_platform_identity(&mut conn, issuer, claim, subject)
-                    .await?
-                    .ok_or(PlatformSessionError::Invalid)?
-            }
+        let pinned = platform_identity_by_subject_tx(&mut conn, issuer, subject).await?;
+        let principal_id = if let Some(identity) = pinned {
+            identity.principal_id
+        } else {
+            // First login: match the pre-registered claim and pin the subject.
+            // The store's `subject IS NULL` predicate makes this a one-time
+            // transition, so a concurrent second login pins nothing and is
+            // refused rather than racing.
+            let Some(claim) = match_claim else {
+                return Err(PlatformSessionError::Invalid);
+            };
+            pin_platform_identity(&mut conn, issuer, claim, subject)
+                .await?
+                .ok_or(PlatformSessionError::Invalid)?
         };
 
         let Some(principal) = platform_principal_by_id_tx(&mut conn, principal_id).await? else {

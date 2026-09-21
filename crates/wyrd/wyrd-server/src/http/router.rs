@@ -1,5 +1,7 @@
 //! Axum router namespace for Wyrd server surfaces.
 
+use std::sync::Arc;
+
 use axum::Router;
 use axum::error_handling::HandleErrorLayer;
 use axum::extract::Request;
@@ -9,7 +11,8 @@ use tower::limit::ConcurrencyLimitLayer;
 use tower::load_shed::LoadShedLayer;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::trace::TraceLayer;
-use utoipa::OpenApi;
+use utoipa::{Modify, OpenApi};
+use utoipa_axum::router::OpenApiRouter;
 use wyrd_spec::error::WyrdError;
 
 use crate::bifrost::routes::router as bifrost_router;
@@ -27,7 +30,7 @@ use crate::components::principals::principals_router;
 use crate::components::storage::storage_router;
 use crate::http::error::WyrdErrorResponse;
 use crate::http::middleware::authenticate::require_authenticated;
-use crate::http::openapi::WyrdApiDoc;
+use crate::http::openapi::{ProblemMediaAddon, SecurityAddon, WyrdApiDoc};
 use crate::http::otlp::router as otlp_router;
 use crate::query::routes::router as query_router;
 use crate::state::AppState;
@@ -48,7 +51,7 @@ pub fn build_router(state: AppState) -> Router {
     // are rejected with 401 before v1_not_found runs (no route-existence oracle).
     // attach_request_id remains outermost on `protected`, so the RequestId
     // extension is already present when this layer runs.
-    let v1_group = Router::new()
+    let v1_group = OpenApiRouter::new()
         .merge(storage_router(&state))
         .merge(eval_router())
         .merge(authz_router())
@@ -69,7 +72,9 @@ pub fn build_router(state: AppState) -> Router {
     // concurrency, timeout, body limit — and carries the same default-deny
     // authentication, so `rmcp` never sees an unverified caller. The route is
     // not nested under `/v1`: the MCP protocol version, not the Wyrd API
-    // version, governs this surface's compatibility.
+    // version, governs this surface's compatibility. It speaks its own
+    // protocol rather than the Wyrd HTTP contract, so it is mounted on a plain
+    // Axum router and is deliberately not an OpenAPI operation.
     let mcp_route = Router::new()
         .route_service("/mcp", crate::mcp::mcp_service(&state))
         .layer(middleware::from_fn_with_state(
@@ -77,24 +82,35 @@ pub fn build_router(state: AppState) -> Router {
             require_authenticated,
         ));
 
-    let protected = apply_protected_edge(
-        Router::new()
-            .merge(auth_routes)
-            .merge(platform_auth_router())
-            .merge(platform_login_router())
-            .merge(platform_router())
-            .merge(platform_identity_router())
-            .merge(platform_credentials_router())
-            .merge(mcp_route)
-            .nest("/v1", v1_group),
-        &state,
-    );
+    // Routing and documentation come out of the same composition: every handler
+    // is registered once, through `routes!`, and the served document is
+    // whatever that registration produced. There is no second list of paths to
+    // keep in step with this one.
+    let (routed, mut document) = OpenApiRouter::with_openapi(WyrdApiDoc::openapi())
+        .merge(auth_routes)
+        .merge(platform_auth_router())
+        .merge(platform_login_router())
+        .merge(platform_router())
+        .merge(platform_identity_router())
+        .merge(platform_credentials_router())
+        .nest("/v1", v1_group)
+        .split_for_parts();
+    // The document-wide modifiers run after composition because both of them
+    // read the assembled paths.
+    SecurityAddon.modify(&mut document);
+    ProblemMediaAddon.modify(&mut document);
+    let document = Arc::new(document);
+
+    let protected = apply_protected_edge(routed.merge(mcp_route), &state);
 
     Router::new()
         .merge(unprotected)
         .route(
             "/openapi.json",
-            axum::routing::get(|| async { axum::Json(WyrdApiDoc::openapi()) }),
+            axum::routing::get(move || {
+                let document = Arc::clone(&document);
+                async move { axum::Json(document) }
+            }),
         )
         .merge(protected)
         .with_state(state)
@@ -166,30 +182,4 @@ async fn v1_not_found(request: Request) -> Result<(), WyrdErrorResponse> {
         details: serde_json::json!({ "path": request.uri().path() }),
     }
     .into())
-}
-
-/// The generated OpenAPI document, checked in isolation from the router.
-#[cfg(test)]
-mod tests {
-    use utoipa::OpenApi;
-
-    use super::WyrdApiDoc;
-
-    /// The generated document renders, so a handler whose schema cannot be
-    /// produced fails here rather than at the first caller.
-    ///
-    /// That the router serves it at `/openapi.json` and serves no YAML
-    /// projection is proved against the assembled server in
-    /// `tests/pg_openapi_contract.rs`, by requesting both.
-    #[test]
-    fn the_generated_document_renders() {
-        let document = serde_json::to_value(WyrdApiDoc::openapi())
-            .expect("the generated OpenAPI document serializes as JSON");
-        assert!(
-            document["paths"]
-                .as_object()
-                .is_some_and(|paths| !paths.is_empty()),
-            "the served document describes the server's routes"
-        );
-    }
 }

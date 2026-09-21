@@ -10,9 +10,8 @@
 //! credential and revoking the first is a rotation with no gap, and it never
 //! touches the principal or its roles.
 
+use axum::Json;
 use axum::extract::{Path, State};
-use axum::routing::{get, post};
-use axum::{Json, Router};
 use chrono::Duration;
 use secrecy::ExposeSecret;
 use uuid::Uuid;
@@ -37,6 +36,8 @@ use crate::audit;
 use crate::components::auth::Caller;
 use crate::http::error::{WyrdErrorResponse, internal_failure};
 use crate::state::AppState;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 /// Lifetime of a credential issued to tenant automation.
 const AUTOMATION_CREDENTIAL_DAYS: i64 = 90;
@@ -45,17 +46,11 @@ const AUTOMATION_CREDENTIAL_DAYS: i64 = 90;
 const REQUIRED_PERMISSION: &str = "service_accounts:write";
 
 /// Build the tenant principal-administration routes for the `/v1` group.
-pub fn principals_router() -> Router<AppState> {
-    Router::new()
-        .route("/principals", post(create_service_principal))
-        .route(
-            "/principals/{principal_id}/credentials",
-            get(list_credentials).post(issue_credential),
-        )
-        .route(
-            "/principals/{principal_id}/credentials/{credential_id}",
-            axum::routing::delete(revoke_credential),
-        )
+pub fn principals_router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(create_service_principal))
+        .routes(routes!(list_credentials, issue_credential))
+        .routes(routes!(revoke_credential))
 }
 
 /// Refuse a caller that lacks tenant principal-management authority.
@@ -249,7 +244,7 @@ async fn mint_credential(
 /// role does not exist in the tenant, or a write fails.
 #[utoipa::path(
     post,
-    path = "/v1/principals",
+    path = "/principals",
     request_body = CreateServicePrincipalRequest,
     responses(
         (status = 200, description = "Principal created with its first credential, returned once",
@@ -339,7 +334,7 @@ async fn create_service_principal(
 /// fails.
 #[utoipa::path(
     post,
-    path = "/v1/principals/{principal_id}/credentials",
+    path = "/principals/{principal_id}/credentials",
     params(("principal_id" = String, Path, description = "Principal to issue for")),
     responses(
         (status = 200, description = "Credential issued, plaintext returned once",
@@ -385,7 +380,7 @@ async fn issue_credential(
 /// fails.
 #[utoipa::path(
     get,
-    path = "/v1/principals/{principal_id}/credentials",
+    path = "/principals/{principal_id}/credentials",
     params(("principal_id" = String, Path, description = "Principal whose credentials to list")),
     responses(
         (status = 200, description = "Non-secret credential metadata, newest first",
@@ -476,7 +471,7 @@ pub(crate) async fn list_credentials_for(
 /// is unknown in this tenant, or a write fails.
 #[utoipa::path(
     delete,
-    path = "/v1/principals/{principal_id}/credentials/{credential_id}",
+    path = "/principals/{principal_id}/credentials/{credential_id}",
     params(
         ("principal_id" = String, Path, description = "Principal that owns the credential"),
         ("credential_id" = String, Path, description = "Credential to retire")

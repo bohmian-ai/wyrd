@@ -5,10 +5,9 @@
 //! specific to this write operation, not an authentication decision shared by
 //! every protected route.
 
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
-use axum::routing::{get, post};
-use axum::{Json, Router};
 use serde::Deserialize;
 use wyrd_runtime::Permission;
 use wyrd_spec::envelope::CardKind;
@@ -27,35 +26,25 @@ use crate::components::auth::Caller;
 use crate::components::cards::service;
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 /// Build card routes for the `/v1` group.
-pub fn cards_router() -> Router<AppState> {
-    Router::new()
-        .route("/cards", get(list_cards_http).post(register_card_http))
-        .route(
-            "/cards/by-uid/{kind}/{card_uid}",
-            get(get_card_http).delete(delete_card_http),
-        )
-        .route(
-            "/cards/by-ref",
-            get(get_card_by_ref_http).delete(delete_card_by_ref_http),
-        )
-        .route(
-            "/cards/{kind}/{space}/{name}/latest",
-            get(get_latest_card_http),
-        )
-        .route(
-            "/cards/{kind}/{space}/{name}/versions",
-            get(list_versions_http),
-        )
-        .route("/cards/{card_uid}/artifacts", get(list_artifacts_http))
-        .route("/cards/{card_uid}/complete", post(complete_card_http))
+pub fn cards_router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(list_cards_http, register_card_http))
+        .routes(routes!(get_card_http, delete_card_http))
+        .routes(routes!(get_card_by_ref_http, delete_card_by_ref_http))
+        .routes(routes!(get_latest_card_http))
+        .routes(routes!(list_versions_http))
+        .routes(routes!(list_artifacts_http))
+        .routes(routes!(complete_card_http))
 }
 
 /// Fetch one Card by its exact kind-qualified UID.
 #[utoipa::path(
     get,
-    path = "/v1/cards/by-uid/{kind}/{card_uid}",
+    path = "/cards/by-uid/{kind}/{card_uid}",
     params(
         ("kind" = String, Path, description = "Card kind namespace"),
         ("card_uid" = String, Path, description = "Server-minted Card UID")
@@ -109,7 +98,7 @@ async fn get_card_http(
 /// Fetch one Card by its exact kind/space/name/version identity.
 #[utoipa::path(
     get,
-    path = "/v1/cards/by-ref",
+    path = "/cards/by-ref",
     params(
         ("kind" = String, Query, description = "Exact Card kind"),
         ("space" = String, Query, description = "Exact Card space"),
@@ -153,7 +142,7 @@ async fn get_card_by_ref_http(
 /// Resolve the newest stable Active Card in an identity line.
 #[utoipa::path(
     get,
-    path = "/v1/cards/{kind}/{space}/{name}/latest",
+    path = "/cards/{kind}/{space}/{name}/latest",
     params(
         ("kind" = String, Path, description = "Card kind"),
         ("space" = String, Path, description = "Card space"),
@@ -204,7 +193,7 @@ async fn get_latest_card_http(
 /// List versions in one exact Card identity line.
 #[utoipa::path(
     get,
-    path = "/v1/cards/{kind}/{space}/{name}/versions",
+    path = "/cards/{kind}/{space}/{name}/versions",
     params(
         ("kind" = String, Path, description = "Card kind"),
         ("space" = String, Path, description = "Card space"),
@@ -254,7 +243,7 @@ async fn list_versions_http(
 /// List tenant-visible Card summaries with keyset pagination.
 #[utoipa::path(
     get,
-    path = "/v1/cards",
+    path = "/cards",
     params(
         ("kind" = Option<String>, Query, description = "Filter by Card kind"),
         ("space" = Option<String>, Query, description = "Filter by Card space"),
@@ -299,7 +288,7 @@ async fn list_cards_http(
 /// List server-authoritative stored artifacts for one Card.
 #[utoipa::path(
     get,
-    path = "/v1/cards/{card_uid}/artifacts",
+    path = "/cards/{card_uid}/artifacts",
     params(("card_uid" = String, Path, description = "Card UID")),
     responses(
         (status = 200, description = "Artifact inventory",
@@ -343,7 +332,7 @@ async fn list_artifacts_http(
 
 #[utoipa::path(
     post,
-    path = "/v1/cards",
+    path = "/cards",
     request_body = CreateCardRequest,
     params(
         ("Idempotency-Key" = String, Header, description = "Stable key reused for retries", example = "card-register-001")
@@ -426,7 +415,7 @@ pub(crate) async fn register_card_http(
 /// this lifecycle boundary.
 #[utoipa::path(
     post,
-    path = "/v1/cards/{card_uid}/complete",
+    path = "/cards/{card_uid}/complete",
     params(
         ("card_uid" = String, Path, description = "Server-minted Card UID"),
         ("Idempotency-Key" = String, Header, description = "Registration key reused for retries", example = "card-register-001")
@@ -492,7 +481,7 @@ async fn complete_card_http(
 /// conflict, registry unavailability, and incomplete storage cleanup.
 #[utoipa::path(
     delete,
-    path = "/v1/cards/by-uid/{kind}/{card_uid}",
+    path = "/cards/by-uid/{kind}/{card_uid}",
     params(
         ("kind" = String, Path, description = "Card kind namespace"),
         ("card_uid" = String, Path, description = "Server-minted Card UID")
@@ -559,7 +548,7 @@ async fn delete_card_http(
 /// conflict, registry unavailability, and incomplete storage cleanup.
 #[utoipa::path(
     delete,
-    path = "/v1/cards/by-ref",
+    path = "/cards/by-ref",
     params(
         ("kind" = String, Query, description = "Exact Card kind"),
         ("space" = String, Query, description = "Exact Card space"),

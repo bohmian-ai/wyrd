@@ -20,7 +20,7 @@ use crate::audit::{
     REFRESH_FAMILY_REVOKE_OPERATION, append_auth_audit, auth_event, principal_kind_tag,
 };
 
-use crate::callback::issue_and_record_user_session;
+use crate::callback::{UserSessionGrant, issue_and_record_user_session};
 use crate::exchange_api_key::{
     ExchangedToken, IssueOrSqlError, TokenExchangeSettings, role_refs, token_hash,
 };
@@ -147,12 +147,14 @@ impl RefreshTokens {
                     conn,
                     self.issuing_key.as_ref(),
                     conn_tenant,
-                    principal_id,
-                    roles,
-                    Some(active.id),
-                    // Renewal is not a role change, so the epoch does not move
-                    // and the successor is minted at the wall clock.
-                    None,
+                    UserSessionGrant {
+                        principal_id,
+                        roles,
+                        rotated_from: Some(active.id),
+                        // Renewal is not a role change, so the epoch does not
+                        // move and the successor is minted at the wall clock.
+                        issued_at: None,
+                    },
                     request_id,
                 )
                 .await?;

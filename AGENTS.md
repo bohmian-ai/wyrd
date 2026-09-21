@@ -453,9 +453,11 @@ not use a positional filter that can pass after selecting no test.
 - Contract, schema, or stub generation change: run `mise run codegen:check`.
   MCP behavior changes also run the owning MCP tests; the codegen lane does not
   independently prove the runtime MCP tool catalog. The OpenAPI document is
-  served at runtime from `GET /openapi.json` and is not a checked-in artifact:
-  prove an OpenAPI change with the focused `wyrd-server` contract tests
-  (`cargo test --locked -p wyrd-server --lib http::openapi`).
+  served at runtime from `GET /openapi.json`, composed from the same
+  `utoipa-axum` registrations that mount the routes, and is not a checked-in
+  artifact: prove an OpenAPI change against the served document with
+  `mise run test:principals:integration`
+  (`crates/wyrd/wyrd-server/tests/pg_openapi_contract.rs`).
 - Boundary-sensitive change: run the matching boundary check, such as
   `mise run check:client-tier`, `mise run check:pyo3-scope`, or
   `mise run check:unwrap-audit`.

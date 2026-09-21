@@ -43,7 +43,7 @@ use wyrd_sql::TenantConn;
 /// committed.
 #[utoipa::path(
     post,
-    path = "/v1/principals/{id}/revoke",
+    path = "/principals/{id}/revoke",
     params(("id" = String, Path, description = "Principal whose tokens stop working")),
     request_body = RevokePrincipalRequest,
     responses(

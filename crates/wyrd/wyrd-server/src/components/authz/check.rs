@@ -25,7 +25,7 @@ use crate::state::AppState;
 #[tracing::instrument(skip(state, headers, body), fields(request_id = %request_id))]
 #[utoipa::path(
     post,
-    path = "/v1/authz/check",
+    path = "/authz/check",
     request_body(content = String, content_type = "application/json",
       description = "`AuthzCheckRequest`: the action the delegated caller wants to perform"),
     responses(

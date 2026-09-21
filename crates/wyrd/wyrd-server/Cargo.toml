@@ -87,6 +87,7 @@ wyrd-storage = { workspace = true }
 wyrd-tls = { workspace = true }
 ed25519-dalek = { workspace = true }
 utoipa = { workspace = true }
+utoipa-axum = { workspace = true }
 
 [dev-dependencies]
 workspace-hack.workspace = true

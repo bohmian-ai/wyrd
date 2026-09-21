@@ -20,10 +20,8 @@
 use std::time::Duration;
 
 use axum::Json;
-use axum::Router;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
-use axum::routing::post;
 use secrecy::SecretString;
 use serde::Deserialize;
 use wyrd_auth_oidc::{
@@ -48,25 +46,25 @@ use crate::components::auth::Caller;
 use crate::config::DeploymentProfile;
 use crate::http::error::{WyrdErrorResponse, internal_failure};
 use crate::state::AppState;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 /// Default JWKS key-cache TTL when a create request omits `jwks_ttl_secs`.
 const DEFAULT_JWKS_TTL: Duration = Duration::from_secs(3600);
 
 /// Build the tenant-admin CRUD routes for the `/v1` group.
-pub fn admin_router() -> Router<AppState> {
-    Router::new()
-        .route(
-            "/admin/trusted-issuers",
-            post(create_trusted_issuer)
-                .get(list_trusted_issuers)
-                .delete(delete_trusted_issuer_route),
-        )
-        .route(
-            "/admin/workload-bindings",
-            post(create_workload_binding)
-                .get(list_workload_bindings)
-                .delete(delete_workload_binding_route),
-        )
+pub fn admin_router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(
+            create_trusted_issuer,
+            list_trusted_issuers,
+            delete_trusted_issuer_route
+        ))
+        .routes(routes!(
+            create_workload_binding,
+            list_workload_bindings,
+            delete_workload_binding_route
+        ))
 }
 
 // --------------------------------------------------------------------------
@@ -264,7 +262,7 @@ struct BindingFilter {
 /// duplicate issuer.
 #[utoipa::path(
     post,
-    path = "/v1/admin/trusted-issuers",
+    path = "/admin/trusted-issuers",
     request_body = CreateTrustedIssuerRequest,
     responses(
         (status = 200, description = "Issuer registered; the client secret is never returned",
@@ -356,7 +354,7 @@ async fn create_trusted_issuer(
 /// is unavailable.
 #[utoipa::path(
     get,
-    path = "/v1/admin/trusted-issuers",
+    path = "/admin/trusted-issuers",
     responses(
         (status = 200, description = "The tenant's trusted issuers, client secrets redacted",
          body = Vec<TrustedIssuerView>),
@@ -418,7 +416,7 @@ async fn list_trusted_issuers(
 /// a `503` when the store or the revocation store is unavailable.
 #[utoipa::path(
     delete,
-    path = "/v1/admin/trusted-issuers",
+    path = "/admin/trusted-issuers",
     params(
         ("issuer" = String, Query, description = "Issuer URL to remove"),
         ("cascade" = Option<bool>, Query,
@@ -508,7 +506,7 @@ async fn delete_trusted_issuer_route(
 /// fails, and a `503` when the store or the revocation store is unavailable.
 #[utoipa::path(
     post,
-    path = "/v1/admin/workload-bindings",
+    path = "/admin/workload-bindings",
     request_body = CreateWorkloadBindingRequest,
     responses(
         (status = 200, description = "Binding created", body = WorkloadBindingView),
@@ -583,7 +581,7 @@ async fn create_workload_binding(
 /// `503` when the store or the revocation store is unavailable.
 #[utoipa::path(
     get,
-    path = "/v1/admin/workload-bindings",
+    path = "/admin/workload-bindings",
     params(
         ("issuer" = Option<String>, Query, description = "Exact issuer to filter by"),
         ("subject" = Option<String>, Query, description = "Exact subject to filter by")
@@ -651,7 +649,7 @@ async fn list_workload_bindings(
 /// store is unavailable.
 #[utoipa::path(
     delete,
-    path = "/v1/admin/workload-bindings",
+    path = "/admin/workload-bindings",
     params(
         ("issuer" = String, Query, description = "Issuer of the binding to remove"),
         ("subject" = String, Query, description = "Subject of the binding to remove")
@@ -1375,11 +1373,10 @@ mod pg_tests {
         .await
         .expect_err("missing issuer delete is not found");
         assert!(matches!(delete_err.0, WyrdError::AdminNotFound { .. }));
-        assert!(
-            decision_rows(&fixture, "admin.trusted_issuer.delete")
-                .await
-                .is_empty(),
-            "a delete that removed nothing records no allowance"
+        assert_eq!(
+            decision_rows(&fixture, "admin.trusted_issuer.delete").await,
+            vec![("allowed".to_owned(), 1)],
+            "a delete that removed nothing still records the decision it evaluated"
         );
     }
 

@@ -37,12 +37,11 @@
 //! then a response encoded in the request's encoding with `partial_success` for
 //! per-item rejections.
 
+use axum::Json;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
-use axum::{Json, Router};
 use serde::Serialize;
 use std::sync::Arc;
 use vala_bifrost_redux::contracts::DecodedOtlp;
@@ -64,6 +63,8 @@ use crate::otlp_metrics_decode::{decode_metrics_protobuf, preflight_metrics_prot
 use crate::otlp_metrics_json::decode_metrics_json;
 use crate::otlp_trace_json::decode_trace_json;
 use crate::state::AppState;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 use wyrd_spec::error::WyrdProblem;
 
 /// The OTLP signal type handled by a specific export endpoint.
@@ -143,11 +144,11 @@ impl OtlpEncoding {
 /// Registers all three OTLP signal endpoints. Each is wired to its shared
 /// decode→write core (`traces`/`metrics`/`logs`) with identical Content-Type
 /// handling and `partial_success` semantics.
-pub fn router() -> Router<AppState> {
-    Router::new()
-        .route("/traces", post(export_traces))
-        .route("/metrics", post(export_metrics))
-        .route("/logs", post(export_logs))
+pub fn router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(export_traces))
+        .routes(routes!(export_metrics))
+        .routes(routes!(export_logs))
 }
 
 /// Encode an OTLP response message in the request's `encoding` and attach the
@@ -196,7 +197,7 @@ where
 )]
 #[utoipa::path(
     post,
-    path = "/v1/traces",
+    path = "/traces",
     request_body(content = Vec<u8>, content_type = "application/x-protobuf",
       description = "OTLP `ExportTraceServiceRequest`, protobuf or protobuf-JSON"),
     responses(
@@ -317,7 +318,7 @@ async fn export_traces(
 )]
 #[utoipa::path(
     post,
-    path = "/v1/metrics",
+    path = "/metrics",
     request_body(content = Vec<u8>, content_type = "application/x-protobuf",
       description = "OTLP `ExportMetricsServiceRequest`, protobuf or protobuf-JSON"),
     responses(
@@ -439,7 +440,7 @@ async fn export_metrics(
 )]
 #[utoipa::path(
     post,
-    path = "/v1/logs",
+    path = "/logs",
     request_body(content = Vec<u8>, content_type = "application/x-protobuf",
       description = "OTLP `ExportLogsServiceRequest`, protobuf or protobuf-JSON"),
     responses(

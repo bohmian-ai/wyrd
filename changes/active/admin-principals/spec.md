@@ -1,8 +1,8 @@
 ---
 id: SPEC-admin-principals
-revision: 10
+revision: 12
 status: approved
-approved_at: 2026-09-19
+approved_at: 2026-09-21
 ---
 
 # Global and tenant administrative principals
@@ -182,10 +182,11 @@ to satisfy this specification.
   principals keep their `card_ref`, `card_ref_scope`, `wyrd apply` provisioning,
   and emit-scope behavior unchanged. A tenant administrative principal or
   tenant-created automation principal MUST be representable with no Card.
-- **REQ-005**: Principal status MUST gate authentication. A suspended or deleted
-  principal MUST NOT authenticate, and its live tokens MUST stop being honored
-  at the applicable authorization epoch, without destroying the principal, its
-  grants, or its data.
+- **REQ-005**: Principal status MUST gate token issuance. A suspended or deleted
+  principal MUST NOT receive a new token. An already-issued tenant token remains
+  valid only until its five-minute expiry; a platform request MUST observe the
+  current principal status. Suspension and deletion MUST NOT destroy the
+  principal's grants or data.
 
 ### Credentials
 
@@ -212,18 +213,31 @@ to satisfy this specification.
 
 ### Authentication pipeline
 
-- **REQ-012**: Authentication has two entry paths and one request path.
-  Machine credential exchange MUST resolve the credential record, verify the
-  secret, resolve the principal, and check principal and tenant status before
-  issuing a Wyrd token. Human OIDC login MUST verify the provider token and
-  resolve the federated identity to a principal before issuing a Wyrd token.
-  Both entry paths MUST mint tokens carrying the same principal
-  representation.
+- **REQ-012**: API-key exchange, OIDC authorization-code login, human refresh,
+  workload `jwt-bearer`, and RFC 8693 delegation MUST all use one tenant-token
+  issuance workflow after validating their grant-specific evidence. That
+  workflow MUST load the current tenant and principal, reject inactive state,
+  resolve current grants into one `PermissionSet`, and mint the same
+  five-minute JWT shape. The JWT authority claim MUST be named `permissions`.
+  Any retained `roles` claim is informational only and MUST NOT participate in
+  request authorization. Refresh-token rotation and replay containment remain
+  unchanged, but refresh MUST perform the same current-state checks and
+  permission resolution as every other issuance path.
 - **REQ-012a**: The per-request path MUST construct the authenticated context
-  only from verified Wyrd token claims, subject to the existing authorization
-  epoch. No served surface MAY authorize from credential material, a lookup
-  prefix, a credential record, or a provider token directly, and no request
-  handler MAY branch on which entry path minted the token.
+  only from verified Wyrd token claims. Tenant-token verification MUST validate
+  signature, issuer, audience, and expiry locally and MUST NOT read Postgres,
+  resolve roles, introspect principal status, consult a revocation epoch, or use
+  a positive verified-token cache. No served surface MAY authorize from raw
+  credential material, a lookup prefix, or a provider token directly, and no
+  request handler MAY branch on which entry path minted the token. Platform
+  requests remain database-backed and MUST revalidate the current credential,
+  principal, and grants without caching on every request.
+- **REQ-012b**: Tenant access-token verification MUST be a concrete,
+  synchronous, cryptographic operation that owns only local verification keys,
+  issuer, audience, and clock-skew policy. External OIDC verification and its
+  database-backed issuer or identity lookup remain on the issuance side. No
+  common verifier trait, factory, checker, or database dependency may join
+  those two responsibilities.
 - **REQ-013**: The authenticated context MUST carry server-verified principal
   identity, principal type, and control-plane scope — platform, or exactly one
   tenant. It MUST be a closed two-variant type so a platform identity is not
@@ -238,8 +252,10 @@ to satisfy this specification.
 
 - **REQ-016**: Every protected operation MUST authenticate, resolve the
   principal, authorize the action against the resource, and only then execute.
-- **REQ-017**: Authorization MUST use the existing role-derived `Permission`
-  vocabulary and synchronous checker. The vocabulary MUST gain the
+- **REQ-017**: Authorization MUST use the existing `Permission` vocabulary and
+  synchronous checker. Tenant requests MUST check the `permissions`
+  `PermissionSet` carried by the verified token; platform requests MUST check
+  the current grants loaded for that request. The vocabulary MUST gain the
   administrative operations this change requires — at minimum tenant creation,
   listing, inspection, suspension, and administrative recovery on the platform
   plane, and tenant configuration, OIDC configuration, principal management, and
@@ -381,7 +397,7 @@ to satisfy this specification.
   capability, not licence to hand-roll one.
 - **REQ-048**: Machine authentication and human-session continuation MUST use
   different renewal models. API-key and workload-identity grants MUST return a
-  short-lived access token and no refresh token. `wyrd-client` MUST cache that
+  five-minute access token and no refresh token. `wyrd-client` MUST cache that
   access token, re-exchange the original durable credential before expiry, and
   after one authentication refusal re-exchange and retry the refused request at
   most once. Refresh tokens are reserved for human OIDC sessions: they MUST be
@@ -463,8 +479,10 @@ to satisfy this specification.
   tenant.
 - **INV-008**: Losing every credential of a principal never destroys the
   principal, its tenant, its roles, or its data.
-- **INV-009**: Credential rotation never requires reconstructing permissions,
-  because authorization belongs to the principal.
+- **INV-009**: Authorization belongs durably to the principal, never the
+  credential. Tenant token issuance resolves the principal's current grants
+  into one effective authority snapshot; credential rotation does not copy or
+  mutate grants.
 - **INV-010**: Every privileged operation is attributable to a real principal,
   never to a synthetic identity or to "an API key".
 - **INV-011**: Every outcome is fail-closed: unknown, ambiguous, unverifiable,
@@ -472,15 +490,14 @@ to satisfy this specification.
   leaks another tenant's existence, names, inventory, or configuration.
 - **INV-012**: Invalid-credential conditions remain publicly indistinguishable
   and resistant to timing and enumeration inference.
-- **INV-013**: Revoking a credential, principal, or role grant MUST take effect
-  no later than the next request; no token or cached permission set outlives the
-  earlier of its expiry or that revocation. Each plane satisfies this by the
-  mechanism its own caching demands, and neither mechanism is owed to the other:
-  the tenant plane caches verified tokens and therefore advances an
-  authorization epoch transactionally, while the platform plane caches nothing
-  and re-reads the credential, the principal, and the grant from the store on
-  every request. A plane that begins caching authority MUST acquire an epoch at
-  the same time.
+- **INV-013**: Revoking a tenant credential, suspending or deleting a tenant
+  principal, or changing its grants MUST prevent new tokens immediately.
+  Tenant tokens already issued remain valid for no more than their five-minute
+  lifetime; their authority is immutable for that lifetime. Platform
+  revocation and grant changes MUST take effect on the next request because the
+  platform plane re-reads current credential, principal, and grant state without
+  caching. Tenant authentication has no authorization epoch, revocation list,
+  introspection read, or verified-token cache.
 - **INV-014**: Administrative identity remains server-owned durable state. No
   Card kind, SDK, CLI, or UI becomes a durable source of truth.
 - **INV-015**: Every Wyrd plane authenticates on `X-Wyrd-Access-Token`. The
@@ -503,10 +520,10 @@ to satisfy this specification.
 | Tenant credential calls a platform operation | Denied; the tenant directory is unchanged and unenumerated. |
 | Global credential calls an ordinary tenant operation | Denied; global privilege does not imply tenant access. |
 | Tenant A targets tenant B's principals, credentials, roles, or data | Denied; nothing about tenant B is revealed. |
-| Tenant administrator rotates (issue B, verify B, revoke A) | Administration uninterrupted; A stops working; authorization unchanged. |
+| Tenant administrator rotates (issue B, verify B, revoke A) | Administration is uninterrupted; A cannot mint another token, and an access token already minted through A remains valid only until its five-minute expiry. |
 | Every tenant administrative credential is lost | The global administrator issues a replacement for the **same** principal; roles unchanged; no second principal. |
 | Global administrative credential is lost | Recoverable only by an operator with database and secret-store access. |
-| Tenant or principal is suspended | Credentials stop authenticating; live tokens stop at the epoch; state and grants survive. |
+| Tenant or principal is suspended | New tenant tokens are refused immediately; existing tenant tokens expire within five minutes; platform requests refuse on their next current-state check; state and grants survive. |
 | Credential expired or revoked | The single indistinguishable invalid-credential error. |
 | A required audit row cannot be written | The operation refuses and commits nothing. |
 | A credential secret is requested after creation | No surface returns it; only metadata is available. |
@@ -551,6 +568,15 @@ Tenant administrative principal
 - The authenticated context is one closed two-variant type — platform scope or
   tenant scope — produced by one authentication pipeline, making `INV-004` a
   type-level guarantee that mirrors the `OperatorPool` / `TenantConn` split.
+- Tenant access tokens are standard five-minute self-contained JWTs. Issuance
+  resolves current identity and grants once; requests verify signature, issuer,
+  audience, and expiry locally and authorize from the `permissions` claim. A
+  Bifrost request or stream must hold a valid token when admitted; admitted
+  bounded work may finish under its existing deadline after token expiry, while
+  any later request or stream establishment is refused. The lower-volume
+  privileged platform plane remains database-backed on
+  every request. No hybrid JWT cache, authorization epoch, revocation checker,
+  or per-request tenant-auth introspection is permitted.
 - Initialization is an operator-invoked subcommand authorized by database-
   credential possession, not a server-start side effect. Server boot never emits
   credential material, so the deployment root credential never enters the log
@@ -579,9 +605,16 @@ documents. These amendments are part of the change.
   `tenant_id`, and the statement that non-human principals are Card-bound.
 - `architecture/wyrd-security-posture.md` — the principal and credential
   lifecycle section, which currently states the same closed set and Card
-  binding.
+  binding, plus any tenant epoch, next-request revocation, permission-cache, or
+  per-request introspection description superseded by revision 11.
 - `architecture/v1/00-foundations/` — the Auth foundation and permission
-  vocabulary pages affected by the new administrative permissions.
+  vocabulary pages affected by the new administrative permissions and the
+  tenant JWT / platform current-state split.
+- Every active architecture or operator document that describes tenant
+  `tokens_not_before`, authorization epochs, revocation checking, verified-token
+  caching, or request-time role resolution MUST be deleted or rewritten to the
+  revision-11 flow; historical completed records remain historical evidence and
+  are not rewritten.
 - `components/admin/routes.rs` module documentation — the deliberate no-audit
   stance.
 - `changes/active/tenant-oidc-federation/spec.md` — its assumption that every
@@ -606,32 +639,41 @@ documents. These amendments are part of the change.
   roles, configuration, or data.
 - **AC-005**: Credential-lifecycle evidence proves multiple concurrent
   credentials per principal, overlapping rotation with uninterrupted
-  administration, independent revocation, expiry, metadata-only listing, and
-  that the plaintext is unobtainable after creation.
+  administration, independent revocation, five-minute access-token expiry,
+  metadata-only listing, immediate refusal of new exchange through a revoked
+  credential, bounded validity of its already-issued token, and that the
+  plaintext is unobtainable after creation.
 - **AC-006**: Recovery evidence proves a tenant administrative principal with
   zero usable credentials is restored against the same principal id, with
   unchanged grants and no second administrative principal.
 - **AC-007**: Provisioning-failure and retry evidence proves an injected failure
   at each stage produces no usable tenant, and that retry and concurrent
   creation converge on exactly one tenant and one administrative principal.
-- **AC-008**: Suspension evidence proves a suspended tenant's principals stop
-  authenticating and their live tokens stop at the authorization epoch, and that
-  resuming restores access with state and grants intact.
+- **AC-008**: Suspension evidence proves a suspended tenant or principal cannot
+  receive a new token, a previously issued tenant token remains bounded by its
+  five-minute expiry, the platform plane observes suspension on its next
+  request, and resuming restores issuance with state and grants intact.
 - **AC-009**: Audit evidence proves each covered decision appends its row in the
   decision's transaction for allowed and denied outcomes, naming principal,
   credential, permission, resource, tenant, and outcome; that an unrecordable
   audit refuses the operation; and that no secret reaches an audit payload.
 - **AC-010**: Security evidence proves the single indistinguishable
   invalid-credential error, verifier-only persistence, absence of plaintext in
-  every durable and diagnostic surface, epoch coupling on revocation, and RLS as
-  the tenant boundary with no hand-written tenant filters added.
+  every durable and diagnostic surface, local tenant JWT verification with no
+  authorization epoch, revocation checker, positive verifier cache, per-request
+  admission read, or request-time permission resolution, current-state platform
+  revalidation, and RLS as the tenant boundary with no hand-written tenant
+  filters added.
 - **AC-011**: Human-identity evidence proves a verified federated identity and a
   machine credential produce the same authenticated context, and that a human
   tenant administrator coexists with the tenant administrative principal without
   displacing it.
 - **AC-012**: Service-principal evidence proves a tenant administrator can
   create a restricted machine principal whose credential performs its granted
-  operations and is denied tenant administration.
+  operations and is denied tenant administration. Bifrost evidence resolves a
+  requested table to its stable identity and authorizes it against the exact,
+  schema-wide, or global Bifrost permission carried in that principal's token;
+  no authentication-store read occurs on the Bifrost request path.
 - **AC-013**: Contract and generated-artifact evidence proves HTTP, OpenAPI,
   CLI, SDK, MCP, JSON Schemas, required Python `.pyi` declarations, required
   TypeScript `.d.ts` declarations, stable errors, and documentation describe
@@ -663,11 +705,14 @@ documents. These amendments are part of the change.
   `REQ-047` requires the CLI to call through it; the Rust SDK's existing
   re-export of that crate is unaffected and carries no separate administrative
   surface of its own.
-- **AC-018**: Renewal evidence proves API-key and workload grants return no
-  refresh token; `wyrd-client` re-exchanges before expiry and once after an
-  authentication refusal; a human OIDC session rotates its refresh token,
-  successfully uses the successor access token after the original expires, and
-  durably revokes the successor family when the consumed token is replayed.
+- **AC-018**: Issuance evidence proves API-key exchange, OIDC login, human
+  refresh, workload `jwt-bearer`, and RFC 8693 delegation use one workflow and
+  mint the same five-minute tenant access-token shape. API-key and workload
+  grants return no refresh token; `wyrd-client` re-exchanges before expiry and
+  once after an authentication refusal; a human OIDC session rotates its
+  refresh token, successfully uses the successor access token after the
+  original expires, and durably revokes the successor family when the consumed
+  token is replayed.
 - **AC-019**: OpenAPI evidence proves `utoipa` remains the single generator,
   `/openapi.json` serves its runtime document, route/auth/body/problem/error
   coverage is exact without a parallel catalog, and no checked-in snapshot,
@@ -679,9 +724,10 @@ documents. These amendments are part of the change.
   tenancy, and authorization.
 - Full tenant separation applies across principals, credentials, roles,
   configuration, caches, logs, audit, and generated artifacts.
-- Existing Wyrd permission, API-key, token, revocation-epoch, audit,
-  stable-error, RLS, and `OperatorPool` contracts remain authoritative except
-  where this specification amends them explicitly.
+- Existing Wyrd permission, API-key, token, audit, stable-error, RLS, and
+  `OperatorPool` contracts remain authoritative except where this specification
+  amends them explicitly. The tenant revocation-epoch and request-time
+  permission-resolution contracts are superseded and MUST be removed.
 - Security or availability uncertainty fails closed; no fallback crosses a
   tenant or control-plane boundary.
 - No compatibility route, alias, legacy name, or migration shim is introduced;
@@ -712,10 +758,12 @@ and review.
 - **VER-002**: Every named Rust test runs through its exact focused expression,
   `mise exec -- cargo nextest run --locked -p <crate> <target> -E 'test(=...)'`,
   with the repository-managed setup wrapper where Postgres is required.
-- **VER-003**: Broad aggregates MUST NOT be run or required as evidence:
+- **VER-003**: Broad test aggregates MUST NOT be run or required as evidence:
   `mise run gate`, `test:rust`, whole-crate and family lanes, the storage
-  matrix, and any `--all-features` workspace lane. A reviewer MUST NOT treat
-  their absence as missing verification.
+  matrix, and ad hoc `--all-features` test lanes. The canonical `mise run lints`
+  workspace Clippy lane remains required even though it uses `--all-features`;
+  a reviewer MUST NOT treat the other aggregates' absence as missing
+  verification.
 - **VER-004**: Compilation and type checking are limited to the crates this
   change touches and their direct dependents. Workspace-wide compilation is not
   an acceptance obligation for this change.
@@ -771,6 +819,25 @@ None. Every decision raised during drafting has been resolved by the author.
 
 ## Revision history
 
+- **Revision 12 — 2026-09-21 — approved**: Names the tenant JWT authority claim
+  `permissions`; requires API-key exchange, OIDC login, human refresh, workload
+  `jwt-bearer`, and RFC 8693 delegation to share one current-state issuance
+  workflow; fixes the verifier as one concrete crypto-only boundary; and states
+  that a Bifrost request or stream is authenticated at admission and may finish
+  only under its existing bounded deadline. It also distinguishes the required
+  all-features lint lane from prohibited broad test aggregates.
+- **Revision 11 — 2026-09-21 — approved**: Replaces the rejected hybrid tenant
+  authentication flow with standard five-minute self-contained JWT access
+  tokens. Credential and OIDC exchange resolve current principal, tenant, and
+  effective permissions once; each tenant request verifies signature, issuer,
+  audience, and expiry locally and authorizes from the token's effective
+  `PermissionSet`. Revocation, suspension, deletion, and grant changes prevent
+  new tenant tokens immediately and affect existing tokens no later than
+  expiry. The privileged lower-volume platform plane remains current-state and
+  database-backed on every request. Tenant authorization epochs,
+  `tokens_not_before`, revocation checks, positive verifier caching,
+  per-request admission SQL, and request-time permission resolution are deleted,
+  together with architecture prose that prescribes them.
 - **Revision 10 — 2026-09-19 — approved**: Narrows revision 9 to the one
   OpenAPI surface users need. `utoipa`, its route/schema annotations, the
   runtime `WyrdApiDoc`, `/openapi.json`, contract tests, and user documentation

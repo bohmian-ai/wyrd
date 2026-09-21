@@ -14,7 +14,7 @@
 //! satisfy [`Caller`](super::Caller).
 //!
 //! The extractor is the only producer of a platform-scoped
-//! [`AuthContext`](wyrd_runtime::AuthContext). A route that takes
+//! [`wyrd_runtime::AuthContext`]. A route that takes
 //! [`PlatformCaller`] therefore cannot receive a tenant identity, and a route
 //! that takes [`Caller`](super::Caller) cannot receive a platform one.
 

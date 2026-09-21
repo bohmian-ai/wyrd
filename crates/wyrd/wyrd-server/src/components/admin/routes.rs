@@ -191,7 +191,7 @@ fn from_stored_json<T: DeserializeOwned>(stored: &JsonValue) -> Result<T, WyrdEr
 ///
 /// # Errors
 /// Returns [`WyrdError::Internal`] when the stored card reference does not
-/// decode into a [`CardRef`].
+/// decode into a [`CardRef`](wyrd_spec::reference::CardRef).
 fn workload_binding_view_from_write(
     write: &WorkloadBindingWrite,
 ) -> Result<WorkloadBindingView, WyrdErrorResponse> {

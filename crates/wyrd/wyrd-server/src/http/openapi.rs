@@ -57,8 +57,8 @@ pub(crate) const PROBLEM_MEDIA_TYPE: &str = "application/problem+json";
 /// to say so per response without repeating a content-type on every error on
 /// every route — which is exactly the kind of repetition that drifts. Rewriting
 /// it once here means a generated client's error branch matches what the server
-/// sends, for every route that names [`WyrdProblem`] and every route added
-/// later.
+/// sends, for every route that names
+/// [`WyrdProblem`](wyrd_spec::error::WyrdProblem) and every route added later.
 pub(crate) struct ProblemMediaAddon;
 
 impl Modify for ProblemMediaAddon {

@@ -190,7 +190,7 @@ mod pg_tests {
             .start_bound()
             .await?;
         let initiator = server
-            .bootstrap_service("mcp-initiator", &["runtime_admin"])
+            .bootstrap_service("mcp-initiator", &["runtime_admin", "admin"])
             .await?;
         let caller = server
             .bootstrap_service("mcp-connectivity", &["admin"])

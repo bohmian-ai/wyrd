@@ -58,13 +58,14 @@ mod pg_tests {
         let fixture = seed_query_fixture(&server, "mcp-delegation").await?;
         let sql = format!("SELECT id, value FROM {} ORDER BY id", fixture.table);
 
-        // A acts through B, which acts as C. Only C's own roles authorize the
-        // read; A and B are attribution.
+        // A acts through B, which acts as C. Each hop narrows authority to
+        // what both sides hold, so A and B carry the admin authority C reads
+        // with; C's own roles still bound the read.
         let initiator = server
-            .bootstrap_service("mcp-delegation-initiator", &["runtime_admin"])
+            .bootstrap_service("mcp-delegation-initiator", &["runtime_admin", "admin"])
             .await?;
         let middle = server
-            .bootstrap_service("mcp-delegation-middle", &["runtime_admin"])
+            .bootstrap_service("mcp-delegation-middle", &["runtime_admin", "admin"])
             .await?;
         let subject = server
             .bootstrap_service("mcp-delegation-subject", &["admin"])

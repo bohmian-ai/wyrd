@@ -111,7 +111,7 @@ pub enum TenantGrant {
     /// An RFC 8693 delegation by a verified, authorized caller.
     Delegation {
         /// The delegating caller, recorded as the newest `act` layer.
-        caller: DelegationCaller,
+        caller: Box<DelegationCaller>,
         /// The caller's verified permissions. The delegated token carries only
         /// the target's permissions that this set also covers, so delegation
         /// can narrow authority but never amplify it.
@@ -338,7 +338,7 @@ impl TenantTokenIssuer {
             .map(|(kind, root)| (kind, root, principal.card_ref_scope.clone()));
         let event = exchange_audit_event(&principal, &grant, expires_at, request_id);
         let delegated_by = match grant {
-            TenantGrant::Delegation { caller, .. } => Some(caller),
+            TenantGrant::Delegation { caller, .. } => Some(*caller),
             _ => None,
         };
         let access_token = self
@@ -886,7 +886,7 @@ mod pg_tests {
             (
                 machine,
                 TenantGrant::Delegation {
-                    caller,
+                    caller: Box::new(caller),
                     ceiling: wyrd_runtime::PermissionSet::new(),
                 },
             ),

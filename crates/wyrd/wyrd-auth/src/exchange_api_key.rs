@@ -305,7 +305,7 @@ impl DelegateToken {
                 conn,
                 row.id,
                 TenantGrant::Delegation {
-                    caller,
+                    caller: Box::new(caller),
                     ceiling: verified.principal.effective_permissions.clone(),
                 },
                 request_id,

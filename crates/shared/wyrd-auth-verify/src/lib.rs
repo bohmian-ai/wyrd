@@ -13,6 +13,7 @@ use moka::future::Cache;
 use secrecy::{ExposeSecret, SecretString};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use wyrd_auth_oidc::{
     IssuerConfigResolver, IssuerVerification, JwksCache, OidcError, OidcKid, map_claims,
@@ -280,7 +281,7 @@ pub struct ExternalClaims {
     /// The audience the matched issuer expects.
     pub expected_audience: String,
     /// Full verified token claims for downstream assertion checks (e.g. nonce).
-    pub raw_claims: serde_json::Value,
+    pub raw_claims: JsonValue,
 }
 
 /// Verified identity from an external OIDC issuer.
@@ -308,7 +309,7 @@ pub struct VerifiedExternalIdentity {
     /// audience constraint without a second issuer resolution.
     pub expected_audience: String,
     /// Full verified token claims for downstream assertion checks (e.g. nonce).
-    pub raw_claims: serde_json::Value,
+    pub raw_claims: JsonValue,
 }
 
 /// Stateful verifier with token-hash cache and resolver-backed permission refresh.

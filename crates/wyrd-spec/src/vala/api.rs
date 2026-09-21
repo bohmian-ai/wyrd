@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::DataTenantId;
 use crate::auth::{PrincipalId, PrincipalKindTag};
@@ -2732,7 +2733,7 @@ pub struct AuditEvent {
     /// used. `None` when no credential was presented — a federated human
     /// session, or an internal decision made by the server itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub credential_id: Option<uuid::Uuid>,
+    pub credential_id: Option<Uuid>,
     /// Effective dynamic permission the boundary evaluated.
     pub permission: String,
     /// The authorization outcome this boundary decided.
@@ -2780,7 +2781,7 @@ impl AuditEvent {
     /// Takes an `Option` because most callers are simply forwarding whatever
     /// the authenticated context holds, and a federated session holds nothing.
     #[must_use]
-    pub const fn with_credential_id(mut self, credential_id: Option<uuid::Uuid>) -> Self {
+    pub const fn with_credential_id(mut self, credential_id: Option<Uuid>) -> Self {
         self.credential_id = credential_id;
         self
     }

@@ -10,7 +10,12 @@
 //!
 //! Gated on `WYRD_AUTH_E2E` so the default lane stays server-free.
 
+use secrecy::SecretString;
+use sqlx::PgPool;
 use std::env;
+use std::io::{Result as IoResult, Write};
+use std::process::Command;
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 
@@ -46,9 +51,7 @@ fn e2e_enabled() -> bool {
 ///
 /// # Panics
 /// Panics when initialization succeeded but disclosed no credential line.
-async fn initialize_platform_root(
-    srv: &WyrdTestServer,
-) -> Result<secrecy::SecretString, InitError> {
+async fn initialize_platform_root(srv: &WyrdTestServer) -> Result<SecretString, InitError> {
     let mut disclosure = Vec::new();
     wyrd_server::boot::init::initialize_platform_root(&srv.operator_pool(), &mut disclosure)
         .await?;
@@ -208,7 +211,7 @@ async fn initialization_happens_at_most_once() {
 ///
 /// Panics when the lane did not set `WYRD_DATABASE_URL`, or when its value is
 /// not a Postgres DSN naming its database after the last slash.
-fn operator_command(subcommand: &str, database: &str) -> std::process::Command {
+fn operator_command(subcommand: &str, database: &str) -> Command {
     let base = env::var("WYRD_DATABASE_URL").expect("the journey lane sets WYRD_DATABASE_URL");
     let (prefix, _) = base
         .rsplit_once('/')
@@ -3525,12 +3528,12 @@ async fn a_terminal_that_cannot_take_the_credential_leaves_nothing_behind() {
     /// A closed terminal: every write it is offered fails.
     struct ClosedTerminal;
 
-    impl std::io::Write for ClosedTerminal {
+    impl Write for ClosedTerminal {
         /// Refuses the bytes the way a closed pipe does.
         ///
         /// # Errors
         /// Always returns [`std::io::ErrorKind::BrokenPipe`].
-        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+        fn write(&mut self, _buf: &[u8]) -> IoResult<usize> {
             Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
         }
 
@@ -3538,7 +3541,7 @@ async fn a_terminal_that_cannot_take_the_credential_leaves_nothing_behind() {
         ///
         /// # Errors
         /// Never returns an error.
-        fn flush(&mut self) -> std::io::Result<()> {
+        fn flush(&mut self) -> IoResult<()> {
             Ok(())
         }
     }
@@ -3710,9 +3713,9 @@ async fn initialization_retries_cleanly_after_a_failure_at_each_write() {
 }
 
 /// Collects a subscriber's output into a shared buffer for inspection.
-struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
 
-impl std::io::Write for CaptureWriter {
+impl Write for CaptureWriter {
     /// Appends to the shared buffer, ignoring a poisoned lock as unreachable
     /// here: nothing else writes to it while a test holds the subscriber.
     ///
@@ -3720,7 +3723,7 @@ impl std::io::Write for CaptureWriter {
     /// Never fails: a poisoned lock is dropped silently and the write is
     /// reported as fully accepted, because losing capture output must not fail
     /// the subscriber a test is observing through.
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
         if let Ok(mut sink) = self.0.lock() {
             sink.extend_from_slice(buf);
         }
@@ -3731,7 +3734,7 @@ impl std::io::Write for CaptureWriter {
     ///
     /// # Errors
     /// Never fails.
-    fn flush(&mut self) -> std::io::Result<()> {
+    fn flush(&mut self) -> IoResult<()> {
         Ok(())
     }
 }
@@ -3819,7 +3822,7 @@ async fn an_uninitialized_deployment_serves_tenants_and_refuses_the_platform_pla
 ///
 /// Panics when the failure function or its trigger cannot be created, which
 /// means the fixture cannot prove the coupling it exists for.
-async fn fail_writes_to(pool: &sqlx::PgPool, label: &str, table: &str, event: &str) {
+async fn fail_writes_to(pool: &PgPool, label: &str, table: &str, event: &str) {
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "CREATE OR REPLACE FUNCTION platform.test_fail_{label}()
            RETURNS trigger LANGUAGE plpgsql AS $$
@@ -3847,7 +3850,7 @@ async fn fail_writes_to(pool: &sqlx::PgPool, label: &str, table: &str, event: &s
 ///
 /// Panics when the trigger cannot be dropped, which would leave later
 /// assertions in the same test failing for the wrong reason.
-async fn stop_failing_writes(pool: &sqlx::PgPool, label: &str, table: &str) {
+async fn stop_failing_writes(pool: &PgPool, label: &str, table: &str) {
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "DROP TRIGGER test_fail_{label} ON {table}"
     )))
@@ -3861,7 +3864,7 @@ async fn stop_failing_writes(pool: &sqlx::PgPool, label: &str, table: &str) {
 /// # Panics
 ///
 /// Panics when the staging table cannot be read.
-async fn staged_decisions(pool: &sqlx::PgPool, operation: &str, outcome: &str) -> i64 {
+async fn staged_decisions(pool: &PgPool, operation: &str, outcome: &str) -> i64 {
     sqlx::query_scalar(
         "SELECT count(*) FROM vala.audit_staging
           WHERE operation = $1 AND outcome = $2",
@@ -4063,7 +4066,7 @@ async fn an_authorized_request_that_changes_nothing_still_records_the_decision()
 /// # Panics
 ///
 /// Panics when the staging table cannot be read.
-async fn staged_platform_decisions(pool: &sqlx::PgPool, outcome: &str) -> i64 {
+async fn staged_platform_decisions(pool: &PgPool, outcome: &str) -> i64 {
     sqlx::query_scalar(
         "SELECT count(*) FROM vala.audit_staging
           WHERE operation = 'platform.authz' AND outcome = $1",

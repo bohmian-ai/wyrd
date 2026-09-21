@@ -10,6 +10,7 @@ use wyrd_spec::auth::{
 use wyrd_spec::error::WyrdError;
 
 use crate::client::WyrdClient;
+use std::fmt::{self, Debug, Formatter};
 
 /// Cheap-to-clone, tenant-scoped principal administration handle.
 ///
@@ -24,9 +25,9 @@ pub struct Principals {
     client: Arc<WyrdClient>,
 }
 
-impl std::fmt::Debug for Principals {
+impl Debug for Principals {
     /// Prints the handle without its client, which holds credential material.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("Principals").finish_non_exhaustive()
     }
 }

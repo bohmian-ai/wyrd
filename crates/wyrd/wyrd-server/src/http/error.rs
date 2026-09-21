@@ -3,6 +3,7 @@
 use axum::body::Body;
 use axum::http::{StatusCode, header::CONTENT_TYPE};
 use axum::response::{IntoResponse, Response};
+use std::fmt::Display;
 use wyrd_auth_verify::{AuthError, MAX_DELEGATION_DEPTH};
 use wyrd_runtime::PermissionDenyReason;
 use wyrd_spec::error::WyrdError;
@@ -68,7 +69,7 @@ impl IntoResponse for WyrdErrorResponse {
 /// body carries only the operation that failed. Keeping the cause out of
 /// `details` is also what stops wire behavior from tracking the error text of
 /// an internal dependency.
-pub fn internal_failure(message: &'static str, cause: &dyn std::fmt::Display) -> WyrdError {
+pub fn internal_failure(message: &'static str, cause: &dyn Display) -> WyrdError {
     tracing::error!(failure = message, cause = %cause, "request failed internally");
     WyrdError::Internal {
         message: message.to_owned(),

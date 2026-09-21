@@ -5,6 +5,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use wyrd_sql::OperatorPool;
 
 use arrow::datatypes::{DataType, Field, Schema};
 use async_trait::async_trait;
@@ -2185,7 +2186,7 @@ impl WyrdTestServer {
     /// that establishes or inspects an administrative root reaches it through
     /// this boundary rather than the tenant pool.
     #[must_use]
-    pub fn operator_pool(&self) -> wyrd_sql::OperatorPool {
+    pub fn operator_pool(&self) -> OperatorPool {
         self.inner.fixture.operator_pool().clone()
     }
 
@@ -2203,9 +2204,7 @@ impl WyrdTestServer {
     /// Returns an error when the deployment is already initialized, the
     /// platform store write fails, or the disclosure does not name a
     /// credential.
-    pub async fn initialize_platform_root(
-        &self,
-    ) -> Result<secrecy::SecretString, WyrdTestServerError> {
+    pub async fn initialize_platform_root(&self) -> Result<SecretString, WyrdTestServerError> {
         let mut disclosure = Vec::new();
         wyrd_server::boot::init::initialize_platform_root(&self.operator_pool(), &mut disclosure)
             .await
@@ -2241,8 +2240,8 @@ impl WyrdTestServer {
     /// not active, or when the session cannot be signed.
     pub async fn federated_platform_session(
         &self,
-        principal_id: uuid::Uuid,
-    ) -> Result<secrecy::SecretString, WyrdTestServerError> {
+        principal_id: Uuid,
+    ) -> Result<SecretString, WyrdTestServerError> {
         let (issuer, match_claim): (String, String) = sqlx::query_as(
             "SELECT issuer, match_claim FROM platform.principal_identities
               WHERE principal_id = $1",

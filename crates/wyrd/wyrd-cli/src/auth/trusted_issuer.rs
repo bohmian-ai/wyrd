@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -264,7 +265,7 @@ fn parse_principal_kind(value: &str) -> Result<IssuerTokenPolicy, WyrdCliError> 
 ///
 /// # Errors
 /// Never returns an error; the `Result` satisfies clap's parser contract.
-fn secret_argument(raw: &str) -> Result<SecretString, std::convert::Infallible> {
+fn secret_argument(raw: &str) -> Result<SecretString, Infallible> {
     Ok(SecretString::from(raw.to_owned()))
 }
 

@@ -407,6 +407,7 @@ fn outcome_str(outcome: AuditOutcome) -> &'static str {
 #[cfg(test)]
 mod tests {
     use sha2::{Digest as _, Sha256};
+    use uuid::Uuid;
     use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::{AuditEvent, AuditOutcome};
@@ -414,7 +415,7 @@ mod tests {
     use super::{entry_hash, push_opt, push_str};
 
     /// One decision, with or without the credential that authenticated it.
-    fn event(credential_id: Option<uuid::Uuid>) -> AuditEvent {
+    fn event(credential_id: Option<Uuid>) -> AuditEvent {
         AuditEvent {
             request_id: RequestId::now_v7(),
             trace_id: None,

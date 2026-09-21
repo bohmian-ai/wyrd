@@ -24,6 +24,7 @@ use wyrd_sql::{OperatorPool, TenantConn};
 
 use crate::components::auth::PlatformCaller;
 use crate::components::platform::provisioning::ProvisionError;
+use std::fmt::{self, Debug, Formatter};
 
 /// Lifetime of a recovery credential.
 ///
@@ -42,9 +43,9 @@ pub struct TenantRecovery {
     operator: OperatorPool,
 }
 
-impl std::fmt::Debug for TenantRecovery {
+impl Debug for TenantRecovery {
     /// Prints the handle without its pools, which have no inspectable state.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("TenantRecovery").finish_non_exhaustive()
     }
 }

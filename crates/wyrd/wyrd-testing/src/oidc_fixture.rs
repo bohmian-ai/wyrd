@@ -6,6 +6,7 @@
 //! 08) verifies discovery; the journey tests (commit 09) drive the full flows.
 
 use url::Url;
+use wiremock::MockServer;
 use wyrd_auth_oidc::{OidcProvider, ProviderMetadata};
 use wyrd_spec::auth::IssuerUrl;
 
@@ -464,7 +465,7 @@ fn parse_form_action(html: &str) -> Option<String> {
 /// resolving discovery would produce a different value.
 pub struct DiscoveryFixture {
     /// The running mock issuer. Held so it outlives the fixture's users.
-    server: wiremock::MockServer,
+    server: MockServer,
 }
 
 impl DiscoveryFixture {

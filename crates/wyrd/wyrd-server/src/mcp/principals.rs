@@ -17,6 +17,7 @@
 //! once-returned secret is least defensible. Agents observe and revoke; a human
 //! or a deployment pipeline issues.
 
+use serde_json::Map as JsonMap;
 use std::sync::Arc;
 
 use rmcp::model::{CallToolResult, Tool, ToolAnnotations};
@@ -83,7 +84,7 @@ pub(super) fn may_administer(caller: &Caller) -> bool {
 /// # Panics
 /// Panics when the derived schema is not a JSON object, which the `JsonSchema`
 /// derive cannot produce for a struct.
-fn schema_of<T: JsonSchema>() -> Arc<serde_json::Map<String, JsonValue>> {
+fn schema_of<T: JsonSchema>() -> Arc<JsonMap<String, JsonValue>> {
     let root = SchemaGenerator::default().into_root_schema_for::<T>();
     let JsonValue::Object(schema) = serde_json::to_value(root).expect("a derived schema is JSON")
     else {
@@ -155,7 +156,7 @@ fn uuid_arg(value: &str, field: &str) -> Result<Uuid, WyrdError> {
 /// Returns [`WyrdError::Validation`] when the arguments are absent or do not
 /// match the advertised schema.
 fn parse_args<T: DeserializeOwned>(
-    arguments: Option<serde_json::Map<String, JsonValue>>,
+    arguments: Option<JsonMap<String, JsonValue>>,
     tool: &str,
 ) -> Result<T, WyrdError> {
     let arguments = arguments.ok_or_else(|| WyrdError::Validation {
@@ -177,7 +178,7 @@ impl WyrdMcpHandler {
     pub(super) async fn mcp_list_credentials(
         &self,
         caller: Caller,
-        arguments: Option<serde_json::Map<String, JsonValue>>,
+        arguments: Option<JsonMap<String, JsonValue>>,
     ) -> Result<CallToolResult, WyrdError> {
         let args: ListCredentialsArgs = parse_args(arguments, LIST_CREDENTIALS)?;
         let principal_id = uuid_arg(&args.principal_id, "principal_id")?;
@@ -204,7 +205,7 @@ impl WyrdMcpHandler {
     pub(super) async fn mcp_revoke_credential(
         &self,
         caller: Caller,
-        arguments: Option<serde_json::Map<String, JsonValue>>,
+        arguments: Option<JsonMap<String, JsonValue>>,
     ) -> Result<CallToolResult, WyrdError> {
         let args: RevokeCredentialArgs = parse_args(arguments, REVOKE_CREDENTIAL)?;
         let principal_id = uuid_arg(&args.principal_id, "principal_id")?;

@@ -9,7 +9,7 @@ mod pg_tests {
     //! Skipped automatically when the database environment is unset so the
     //! default suite stays credential-free.
 
-    use chrono::{Duration, Utc};
+    use chrono::{DateTime, Duration, Utc};
     use sqlx::Row;
     use uuid::Uuid;
     use wyrd_dev_fixtures::pg::PgFixture;
@@ -42,7 +42,7 @@ mod pg_tests {
         principal: Uuid,
         prefix: &str,
         secret_hash: &str,
-        expires_at: Option<chrono::DateTime<Utc>>,
+        expires_at: Option<DateTime<Utc>>,
     ) {
         let mut conn = fixture
             .operator_pool()

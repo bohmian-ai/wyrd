@@ -1,5 +1,6 @@
 //! Principal revocation domain operations.
 
+use std::fmt::Display;
 use wyrd_runtime::PrincipalId;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalKindTag;
@@ -84,7 +85,7 @@ fn not_found(target_id: PrincipalId, tenant: DataTenantId) -> WyrdError {
 /// The cause names the store, the stored kind, or the statement that rejected
 /// the write; the problem renderer publishes `message` verbatim, so the cause
 /// goes to the trace and the public body carries one stable sentence.
-fn internal_error(cause: impl std::fmt::Display) -> WyrdError {
+fn internal_error(cause: impl Display) -> WyrdError {
     tracing::error!(cause = %cause, "principal revocation failed");
     WyrdError::Internal {
         message: "principal revocation failed".to_owned(),

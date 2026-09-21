@@ -9,9 +9,12 @@
 //! away, so removing the connection or losing the provider leaves the
 //! deployment administrable.
 
+use axum::Extension;
 use axum::Json;
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use secrecy::{ExposeSecret, SecretString};
+use serde_json::Value as JsonValue;
 use uuid::Uuid;
 use wyrd_auth::pg_resolvers::{client_auth_label, seal_platform_client_secret};
 use wyrd_auth::platform_authz::{
@@ -29,6 +32,7 @@ use wyrd_spec::auth::{
     SetPlatformPrincipalStatusRequest,
 };
 use wyrd_spec::error::{WyrdError, WyrdProblem};
+use wyrd_spec::request_id::RequestId;
 use wyrd_sql::queries::platform::identity::{
     delete_platform_oidc_connection, insert_platform_identity_tx, platform_oidc_connection,
     upsert_platform_oidc_connection,
@@ -54,7 +58,7 @@ use utoipa_axum::routes;
 /// administrator on their email and pins the standard `sub`. There is no
 /// group-to-role mapping here at all, because a platform principal's authority
 /// comes from its grant and must never be assertable by a provider.
-fn platform_claim_mapping() -> serde_json::Value {
+fn platform_claim_mapping() -> JsonValue {
     // Claim paths are stored as dotted strings, the shape the login resolver
     // decodes this row with. An array here parses as nothing at all.
     serde_json::json!({
@@ -354,7 +358,7 @@ async fn read_connection(
 async fn remove_connection(
     State(state): State<AppState>,
     caller: PlatformCaller,
-) -> Result<axum::http::StatusCode, WyrdErrorResponse> {
+) -> Result<StatusCode, WyrdErrorResponse> {
     let pool = operator(&state)?;
     // The handle must outlive the transaction it lends out.
     let authz = PlatformAuthorization::new(pool.clone());
@@ -587,7 +591,7 @@ async fn set_admin_status(
     caller: PlatformCaller,
     Path(principal_id): Path<Uuid>,
     Json(request): Json<SetPlatformPrincipalStatusRequest>,
-) -> Result<axum::http::StatusCode, WyrdErrorResponse> {
+) -> Result<StatusCode, WyrdErrorResponse> {
     // A malformed status is refused before any permission is evaluated, so the
     // request never opens a decision it would then have to discard.
     if !matches!(request.status.as_str(), "active" | "suspended") {
@@ -731,7 +735,7 @@ async fn begin_login(
 #[tracing::instrument(level = "info", skip(state, request))]
 async fn complete_login(
     State(state): State<AppState>,
-    request_id: Option<axum::Extension<wyrd_spec::request_id::RequestId>>,
+    request_id: Option<Extension<RequestId>>,
     Json(request): Json<PlatformCallbackRequest>,
 ) -> Result<Json<PlatformTokenResponse>, WyrdErrorResponse> {
     let fallback_request_id: String;

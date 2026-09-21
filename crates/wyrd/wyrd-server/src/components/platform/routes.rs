@@ -10,6 +10,7 @@
 //! refused there before reaching a handler — and a tenant token must never be
 //! accepted here. Two planes, two entries.
 
+use axum::Extension;
 use axum::Json;
 use axum::extract::{Path, State};
 use secrecy::{ExposeSecret, SecretString};
@@ -24,6 +25,7 @@ use wyrd_spec::auth::{
     TenantListResponse,
 };
 use wyrd_spec::error::{WyrdError, WyrdProblem};
+use wyrd_spec::request_id::RequestId;
 
 use crate::components::auth::PlatformCaller;
 use crate::components::platform::provisioning::{ProvisionError, TenantProvisioning};
@@ -82,7 +84,7 @@ pub fn platform_auth_router() -> OpenApiRouter<AppState> {
 #[tracing::instrument(level = "info", skip(state, request))]
 async fn platform_token(
     State(state): State<AppState>,
-    request_id: Option<axum::Extension<wyrd_spec::request_id::RequestId>>,
+    request_id: Option<Extension<RequestId>>,
     Json(request): Json<PlatformTokenRequest>,
 ) -> Result<Json<PlatformTokenResponse>, WyrdErrorResponse> {
     let fallback_request_id: String;

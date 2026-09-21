@@ -21,6 +21,7 @@ use wyrd_sql::{SqlError, TenantConn};
 
 use crate::audit::principal_kind_tag;
 use crate::credential_verify::verify_presented;
+use tokio::task::JoinError;
 
 /// Prefix identifying a platform-scope credential on sight.
 ///
@@ -114,7 +115,7 @@ pub enum PlatformCredentialError {
     Hash(#[from] IssueError),
     /// The hashing task could not be joined.
     #[error("platform credential hash task failed")]
-    Join(#[from] tokio::task::JoinError),
+    Join(#[from] JoinError),
     /// The platform store rejected the operation.
     #[error("platform credential store failed: {0}")]
     Store(#[from] SqlError),
@@ -287,7 +288,9 @@ mod pg_tests {
     use wyrd_sql::queries::platform::credentials::revoke_platform_credential;
     use wyrd_sql::queries::platform::principals::insert_platform_principal;
 
+    use super::{AuthenticatedPlatformCredential, IssuedPlatformCredential};
     use super::{PlatformCredentialError, authenticate_for_session, issue_platform_credential};
+    use chrono::DateTime;
 
     /// Seed a platform principal and return its id.
     async fn seed_principal(fixture: &PgFixture, name: &str) -> Uuid {
@@ -311,8 +314,8 @@ mod pg_tests {
     async fn issue_committed(
         fixture: &PgFixture,
         principal: Uuid,
-        expires_at: Option<chrono::DateTime<Utc>>,
-    ) -> super::IssuedPlatformCredential {
+        expires_at: Option<DateTime<Utc>>,
+    ) -> IssuedPlatformCredential {
         let pool = fixture.operator_pool().clone();
         let mut conn = pool
             .begin_platform_audited()
@@ -345,7 +348,7 @@ mod pg_tests {
     async fn authenticate_committed(
         fixture: &PgFixture,
         presented: &SecretString,
-    ) -> Result<super::AuthenticatedPlatformCredential, PlatformCredentialError> {
+    ) -> Result<AuthenticatedPlatformCredential, PlatformCredentialError> {
         let pool = fixture.operator_pool().clone();
         let mut conn = pool
             .begin_platform_audited()

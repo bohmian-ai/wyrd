@@ -30,6 +30,7 @@ use wyrd_sql::{OperatorPool, SqlError, TenantConn};
 
 use crate::audit::{TOKEN_EXCHANGE_OPERATION, auth_event, principal_kind_tag};
 use crate::platform_credentials::{PlatformCredentialError, authenticate_for_session};
+use std::fmt::{self, Debug, Formatter};
 
 /// Default platform session lifetime.
 ///
@@ -113,10 +114,10 @@ pub struct PlatformSessions {
     ttl: Duration,
 }
 
-impl std::fmt::Debug for PlatformSessions {
+impl Debug for PlatformSessions {
     /// Prints the handle without its key or pool, neither of which may reach a
     /// log or trace.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("PlatformSessions")
             .field("ttl", &self.ttl)
             .finish_non_exhaustive()

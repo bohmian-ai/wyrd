@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::platform_login::PlatformConnection;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -460,7 +461,7 @@ fn trusted_issuer_from_row(
 pub fn platform_connection_from_row(
     row: PlatformOidcConnectionRow,
     sealing_key: Option<&SecretKey>,
-) -> Result<crate::platform_login::PlatformConnection, PlatformConnectionError> {
+) -> Result<PlatformConnection, PlatformConnectionError> {
     let issuer = IssuerUrl::new(row.issuer_url.clone())
         .map_err(|error| PlatformConnectionError::IssuerUrl(error.to_string()))?;
     let jwks_uri = Url::parse(&row.jwks_uri)

@@ -9,6 +9,7 @@
 //! operator following the page would.
 
 use secrecy::ExposeSecret as _;
+use std::process::Output;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -17,7 +18,7 @@ use crate::principal_journey::{
 };
 
 /// Run a `wyrd` invocation carrying the platform credential.
-async fn platform_cli(arguments: Vec<String>, credential: String) -> std::process::Output {
+async fn platform_cli(arguments: Vec<String>, credential: String) -> Output {
     run_cli_async_with_credential(arguments, "WYRD_PLATFORM_CREDENTIAL", credential).await
 }
 
@@ -28,12 +29,12 @@ async fn platform_cli(arguments: Vec<String>, credential: String) -> std::proces
 /// explicit credential input. The shared client classifies it and exchanges a
 /// key for a token itself, so the journey never has to know which kind it
 /// holds, and never has to mint one out of band.
-async fn tenant_cli(arguments: Vec<String>, credential: String) -> std::process::Output {
+async fn tenant_cli(arguments: Vec<String>, credential: String) -> Output {
     run_cli_async_with_credential(arguments, "WYRD_ACCESS_TOKEN", credential).await
 }
 
 /// Assert a command succeeded and return its stdout.
-fn succeeded(what: &str, output: &std::process::Output) -> String {
+fn succeeded(what: &str, output: &Output) -> String {
     assert!(
         output.status.success(),
         "{what} failed: stdout={} stderr={}",

@@ -10,6 +10,9 @@ use wyrd_spec::vala::eval::protocol::{
 use wyrd_spec::vala::ids::RunId;
 
 use crate::client::WyrdClient;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use std::fmt::{self, Debug, Formatter};
 
 /// Header carrying a run's lease token.
 ///
@@ -32,9 +35,9 @@ pub struct EvalProtocol {
     client: Arc<WyrdClient>,
 }
 
-impl std::fmt::Debug for EvalProtocol {
+impl Debug for EvalProtocol {
     /// Prints the handle without its client, which holds credential material.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("EvalProtocol").finish_non_exhaustive()
     }
 }
@@ -94,9 +97,9 @@ pub struct EvalRun {
     lease: String,
 }
 
-impl std::fmt::Debug for EvalRun {
+impl Debug for EvalRun {
     /// Prints the run's identity and withholds its lease, which is a secret.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("EvalRun")
             .field("run_id", &self.run_id)
             .finish_non_exhaustive()
@@ -159,8 +162,8 @@ impl EvalRun {
         body: Option<&S>,
     ) -> Result<D, WyrdError>
     where
-        S: serde::Serialize,
-        D: serde::de::DeserializeOwned,
+        S: Serialize,
+        D: DeserializeOwned,
     {
         let path = format!("/v1/eval/runs/{}/{leaf}", self.run_id);
         self.client

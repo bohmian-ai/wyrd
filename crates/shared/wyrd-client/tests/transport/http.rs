@@ -242,6 +242,7 @@ mod transport_behavior {
     use tokio::net::TcpListener;
     use tokio::sync::Mutex;
 
+    use wyrd_client::WyrdClient;
     use wyrd_client::auth::AuthMiddleware;
     use wyrd_client::config::ClientConfig;
     use wyrd_client::transport::HttpTransport;
@@ -401,7 +402,7 @@ mod transport_behavior {
 
     /// Build an API-key [`WyrdClient`] over a mock server, so a public handle
     /// exercises the same renewal the transport owns.
-    fn make_api_key_client(base_url: String) -> wyrd_client::WyrdClient {
+    fn make_api_key_client(base_url: String) -> WyrdClient {
         let credential = ResolvedCredential::ApiKey("api-key-value".to_owned().into());
         let mut config = ClientConfig::default();
         config.http.base_url = base_url.clone();

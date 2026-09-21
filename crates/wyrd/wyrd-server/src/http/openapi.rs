@@ -1,6 +1,7 @@
 //! Generated OpenAPI document for the public HTTP surface.
 
 use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityRequirement, SecurityScheme};
+use utoipa::openapi::{Content, OpenApi as OpenApiDocument};
 use utoipa::{Modify, OpenApi};
 use wyrd_spec::vala::api::{
     BifrostQueryRequest, CancelRunningQueryResponse, FreshnessPolicy, ListRunningQueriesResponse,
@@ -29,7 +30,7 @@ pub(crate) struct SecurityAddon;
 
 impl Modify for SecurityAddon {
     /// Register the scheme and require it document-wide.
-    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+    fn modify(&self, openapi: &mut OpenApiDocument) {
         let components = openapi.components.get_or_insert_with(Default::default);
         components.add_security_scheme(
             WYRD_ACCESS_TOKEN_SCHEME,
@@ -62,7 +63,7 @@ pub(crate) struct ProblemMediaAddon;
 
 impl Modify for ProblemMediaAddon {
     /// Rename the `application/json` content of every problem-bodied response.
-    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+    fn modify(&self, openapi: &mut OpenApiDocument) {
         for item in openapi.paths.paths.values_mut() {
             for operation in [
                 item.get.as_mut(),
@@ -98,7 +99,7 @@ impl Modify for ProblemMediaAddon {
 /// A problem response is declared as `body = WyrdProblem`, which utoipa emits as
 /// a reference to that component; matching on the reference is what keeps the
 /// media-type rewrite off success bodies, which really are `application/json`.
-fn is_problem(content: Option<&utoipa::openapi::Content>) -> bool {
+fn is_problem(content: Option<&Content>) -> bool {
     matches!(
         content.and_then(|content| content.schema.as_ref()),
         Some(utoipa::openapi::RefOr::Ref(reference))

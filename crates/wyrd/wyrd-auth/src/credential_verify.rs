@@ -13,6 +13,7 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use secrecy::SecretString;
+use tokio::task::JoinError;
 use uuid::Uuid;
 use wyrd_auth_issue::{hash_api_key, verify_api_key};
 
@@ -51,7 +52,7 @@ static VERIFICATIONS: AtomicU64 = AtomicU64::new(0);
 pub async fn verify_presented(
     presented: &SecretString,
     stored: Option<&str>,
-) -> Result<bool, tokio::task::JoinError> {
+) -> Result<bool, JoinError> {
     let verifier = stored.map_or_else(|| DUMMY_VERIFIER.clone(), ToOwned::to_owned);
     let candidate = presented.clone();
     let matched =

@@ -23,6 +23,7 @@ use crate::config::ClientConfig;
 use crate::transport::config::HttpConfig;
 use crate::transport::credential::ResolvedCredential;
 use crate::transport::http::HttpTransport;
+use std::fmt::{self, Debug, Formatter};
 
 /// A short-lived platform session token.
 ///
@@ -32,9 +33,9 @@ use crate::transport::http::HttpTransport;
 #[derive(Clone)]
 pub struct PlatformSession(SecretString);
 
-impl std::fmt::Debug for PlatformSession {
+impl Debug for PlatformSession {
     /// Prints the session without its token.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_tuple("PlatformSession")
             .field(&"[REDACTED]")
             .finish()

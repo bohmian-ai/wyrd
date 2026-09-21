@@ -38,6 +38,7 @@ pub async fn require_authenticated(
 #[cfg(test)]
 mod pg_tests {
     use std::collections::HashMap;
+
     use std::sync::Arc;
     use std::time::Duration as StdDuration;
 
@@ -61,6 +62,7 @@ mod pg_tests {
     use super::require_authenticated;
     use crate::auth::permission_resolver::SqlPermissionResolver;
     use crate::components::auth::AuthenticatedPrincipal;
+    use crate::state::{AppState, WyrdTokenVerifier};
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
     const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n";
@@ -160,14 +162,14 @@ mod pg_tests {
         StatusCode::OK
     }
 
-    fn test_router(state: crate::state::AppState) -> Router {
+    fn test_router(state: AppState) -> Router {
         Router::new()
             .route("/v1/protected", get(protected))
             .layer(from_fn_with_state(state.clone(), require_authenticated))
             .with_state(state)
     }
 
-    async fn test_state() -> crate::state::AppState {
+    async fn test_state() -> AppState {
         use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
         use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
 
@@ -198,11 +200,7 @@ mod pg_tests {
         })
     }
 
-    fn mint_test_user_jwt(
-        state: &crate::state::AppState,
-        tenant: DataTenantId,
-        ttl: chrono::Duration,
-    ) -> String {
+    fn mint_test_user_jwt(state: &AppState, tenant: DataTenantId, ttl: chrono::Duration) -> String {
         let principal = TokenPrincipalRef {
             id: PrincipalId::new(uuid::Uuid::now_v7()),
             kind: PrincipalKindTag::User,
@@ -224,7 +222,7 @@ mod pg_tests {
     /// Shared by the default test state and the revocation-outage case so both
     /// verify identical tokens with identical settings and differ only in
     /// whether a revocation store is attached.
-    fn build_verifier() -> crate::state::WyrdTokenVerifier {
+    fn build_verifier() -> WyrdTokenVerifier {
         use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
         let mut keys = HashMap::new();
@@ -274,10 +272,7 @@ mod pg_tests {
     /// The verifier is rebuilt rather than mutated because `TokenVerifier` owns
     /// its revocation dependency at construction, which is the same shape the
     /// server uses when it wires `SqlRevocationCheck` at startup.
-    fn state_with_revocation(
-        state: crate::state::AppState,
-        revocation: Arc<SqlRevocationCheck>,
-    ) -> crate::state::AppState {
+    fn state_with_revocation(state: AppState, revocation: Arc<SqlRevocationCheck>) -> AppState {
         let issuing_key = state.auth.issuing_key.clone();
         let verifier = build_verifier().with_revocation(revocation as Arc<dyn RevocationCheck>);
         state.with_auth(crate::components::auth::ServerAuth {

@@ -34,6 +34,8 @@ use wyrd_spec::ids::TenantSlug;
 use crate::config::{ClientConfig, TokenCacheMode};
 use crate::error::{WyrdClientError, from_problem_json};
 use crate::transport::credential::ResolvedCredential;
+use reqwest::{Client, Response};
+use std::fmt::{self, Debug, Formatter};
 
 /// Fixed proactive-refresh skew. A cached access token is considered stale once
 /// `now >= expires_at - SKEW`, so the client refreshes before the server would
@@ -115,13 +117,13 @@ pub struct TokenExchange {
     /// Deployment base URL, without a trailing slash.
     base_url: String,
     /// Shared connection pool for the exchange routes.
-    http: reqwest::Client,
+    http: Client,
 }
 
-impl std::fmt::Debug for TokenExchange {
+impl Debug for TokenExchange {
     /// Prints the target without the pool, which carries no secret but no
     /// useful detail either.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("TokenExchange")
             .field("base_url", &self.base_url)
             .finish_non_exhaustive()
@@ -245,7 +247,7 @@ impl TokenExchange {
     /// # Errors
     /// Returns [`AuthError::Server`] for a non-success status and
     /// [`AuthError::Client`] when the body cannot be read or decoded.
-    async fn decode<D: DeserializeOwned>(response: reqwest::Response) -> Result<D, AuthError> {
+    async fn decode<D: DeserializeOwned>(response: Response) -> Result<D, AuthError> {
         if !response.status().is_success() {
             let body = response
                 .json::<serde_json::Value>()
@@ -274,8 +276,8 @@ pub struct AuthMiddleware {
     short_ttl_warned: AtomicBool,
 }
 
-impl std::fmt::Debug for AuthMiddleware {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for AuthMiddleware {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("AuthMiddleware")
             .field("credential", &self.credential)
             .field("http_base_url", &self.exchange.base_url)

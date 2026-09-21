@@ -17,6 +17,10 @@
 //! survives a conflict, not-found, or failed write, and issuer create runs no
 //! network IO unaudited. The list handlers append it in their read transaction.
 
+use serde::de::DeserializeOwned;
+use serde_json::Value as JsonValue;
+use sqlx::Error as SqlxError;
+use std::fmt::Display;
 use std::time::Duration;
 
 use axum::Json;
@@ -179,9 +183,7 @@ fn trusted_issuer_view_from_row(
 /// Returns [`WyrdError::Internal`] when the column does not match `T`. Nothing
 /// about the stored value reaches the caller; a malformed row is this
 /// deployment's problem, not the requester's.
-fn from_stored_json<T: serde::de::DeserializeOwned>(
-    stored: &serde_json::Value,
-) -> Result<T, WyrdErrorResponse> {
+fn from_stored_json<T: DeserializeOwned>(stored: &JsonValue) -> Result<T, WyrdErrorResponse> {
     serde_json::from_value(stored.clone()).map_err(internal_error)
 }
 
@@ -809,7 +811,7 @@ fn normalize_issuer(value: &str) -> String {
 /// The binding-insert path does not use this mapper: there an FK violation means
 /// the referenced issuer is missing, which is a `404`, not a conflict. See
 /// [`map_binding_write_error`].
-fn map_write_error(error: sqlx::Error, target: AdminWriteTarget) -> WyrdErrorResponse {
+fn map_write_error(error: SqlxError, target: AdminWriteTarget) -> WyrdErrorResponse {
     match SqlError::from(error) {
         SqlError::UniqueViolation { constraint } => {
             trace_conflict(&constraint, target, "duplicate");
@@ -964,7 +966,7 @@ fn sql_unavailable(error: impl std::fmt::Display) -> WyrdErrorResponse {
 
 /// Map an unexpected server-side failure (serialization, encryption internals)
 /// to a `500`.
-fn internal_error(cause: impl std::fmt::Display) -> WyrdErrorResponse {
+fn internal_error(cause: impl Display) -> WyrdErrorResponse {
     WyrdErrorResponse::from(internal_failure("admin request failed", &cause))
 }
 

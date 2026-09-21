@@ -2,6 +2,7 @@
 
 use axum::Json;
 use axum::extract::{Path, State};
+use std::fmt::Display;
 use wyrd_runtime::PrincipalId;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalKindTag, RevokePrincipalRequest};
@@ -140,6 +141,6 @@ async fn fan_out_notify(
 /// Reuses the server's one internal-failure constructor so the source's
 /// `Display` — a SQL error, a pool timeout — reaches the trace and never the
 /// problem body.
-fn internal_error(cause: impl std::fmt::Display) -> WyrdErrorResponse {
+fn internal_error(cause: impl Display) -> WyrdErrorResponse {
     WyrdErrorResponse::from(internal_failure("principal revocation failed", &cause))
 }

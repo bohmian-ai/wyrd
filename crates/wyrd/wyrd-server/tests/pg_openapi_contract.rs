@@ -11,6 +11,7 @@
 //! the ones an anonymous caller can reach, and a refusal produced at runtime
 //! carries a stable code that the owning operation already documents.
 
+use axum::response::Response;
 use std::collections::BTreeSet;
 
 use axum::body::{Body, to_bytes};
@@ -68,7 +69,7 @@ async fn served_document(server: &WyrdTestServer) -> Value {
 ///
 /// # Panics
 /// Panics when the body cannot be collected or is not valid JSON.
-async fn problem_json(response: axum::response::Response) -> Value {
+async fn problem_json(response: Response) -> Value {
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("body collects");

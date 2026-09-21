@@ -10,8 +10,10 @@
 use http::{HeaderName, HeaderValue};
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+use wyrd_client::WyrdClient;
 use wyrd_client::auth::AuthMiddleware;
 use wyrd_client::config::{ClientConfig, TokenCacheMode};
+use wyrd_client::principals::Principals;
 use wyrd_client::transport::credential::ResolvedCredential;
 use wyrd_mcp::client::WyrdMcpHttpClient;
 use wyrd_spec::request_id::RequestId;
@@ -71,7 +73,7 @@ pub(crate) fn problem(
 pub(crate) fn client(
     server: &WyrdTestServer,
     credential: ResolvedCredential,
-) -> Result<wyrd_client::WyrdClient, McpJourneyError> {
+) -> Result<WyrdClient, McpJourneyError> {
     let base_url = server
         .base_url()
         .ok_or("journey requires a bound test server")?
@@ -139,7 +141,7 @@ pub(crate) fn transport(
 pub(crate) fn principals(
     server: &WyrdTestServer,
     credential: ResolvedCredential,
-) -> Result<wyrd_client::principals::Principals, McpJourneyError> {
+) -> Result<Principals, McpJourneyError> {
     Ok(wyrd_client::principals::Principals::with_client(client(
         server, credential,
     )?))

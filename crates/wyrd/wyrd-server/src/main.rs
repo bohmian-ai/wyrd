@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use secrecy::ExposeSecret;
+use wyrd_sql::OperatorPool;
 
 use wyrd_server::app::{BootExit, run};
 use wyrd_server::boot::init::{initialize_platform_root, issue_platform_root_credential};
@@ -134,7 +135,7 @@ async fn recover_root() -> Result<(), BootExit> {
 /// # Errors
 /// Returns [`BootExit::Config`] when the platform-admin DSN is not configured
 /// and [`BootExit::Other`] when the connection cannot be established.
-async fn operator_pool() -> Result<wyrd_sql::OperatorPool, BootExit> {
+async fn operator_pool() -> Result<OperatorPool, BootExit> {
     let boot = PostgresBoot::from_env()
         .await
         .map_err(|e| BootExit::Other(Box::new(e)))?;

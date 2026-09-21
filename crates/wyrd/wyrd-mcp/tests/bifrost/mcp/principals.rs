@@ -14,6 +14,8 @@ mod pg_tests {
     use rmcp::ClientServiceExt as _;
     use rmcp::model::CallToolRequestParams;
     use secrecy::ExposeSecret as _;
+    use serde_json::Map as JsonMap;
+    use serde_json::Value as JsonValue;
     use wyrd_client::transport::credential::ResolvedCredential;
     use wyrd_testing::WyrdTestServer;
 
@@ -28,7 +30,7 @@ mod pg_tests {
     /// Reading the catalog's own schema rather than restating it is the point:
     /// the assertion fails if the published contract stops matching the shared
     /// DTO the server parses and returns.
-    fn required(schema: &serde_json::Map<String, serde_json::Value>) -> Vec<&str> {
+    fn required(schema: &JsonMap<String, JsonValue>) -> Vec<&str> {
         schema
             .get("required")
             .and_then(serde_json::Value::as_array)

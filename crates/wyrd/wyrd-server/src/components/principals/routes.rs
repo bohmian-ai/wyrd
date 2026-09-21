@@ -12,8 +12,10 @@
 
 use axum::Json;
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use chrono::Duration;
 use secrecy::ExposeSecret;
+use std::fmt::Display;
 use uuid::Uuid;
 use wyrd_auth::exchange_api_key::principal_kind_wire;
 use wyrd_auth::issue_api_key::WyrdApiKey;
@@ -499,7 +501,7 @@ async fn revoke_credential(
     State(state): State<AppState>,
     caller: Caller,
     Path((principal_id, credential_id)): Path<(Uuid, Uuid)>,
-) -> Result<axum::http::StatusCode, WyrdErrorResponse> {
+) -> Result<StatusCode, WyrdErrorResponse> {
     revoke_credential_for(&state, &caller, principal_id, credential_id)
         .await
         .map(|()| axum::http::StatusCode::NO_CONTENT)
@@ -624,7 +626,7 @@ fn metadata(row: ApiKeyMetadataRow) -> CredentialMetadata {
 }
 
 /// Map any internal failure onto the stable catalog without leaking detail.
-fn internal(error: impl std::fmt::Display) -> WyrdErrorResponse {
+fn internal(error: impl Display) -> WyrdErrorResponse {
     WyrdErrorResponse::from(internal_failure(
         "tenant principal administration failed",
         &error,

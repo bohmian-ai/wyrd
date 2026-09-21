@@ -1752,10 +1752,13 @@ mod tests {
 #[cfg(all(test, feature = "test-support"))]
 mod production_pin_tests {
     use std::collections::HashMap;
+    use std::path::Path;
 
     use iceberg::transaction::{ApplyTransactionAction, Transaction};
     use secrecy::ExposeSecret as _;
     use wyrd_spec::vala::WYRD_EVENT_TIME;
+
+    use crate::storage::BifrostStorage;
 
     use std::sync::Arc;
 
@@ -1785,9 +1788,7 @@ mod production_pin_tests {
     /// # Panics
     /// Panics when the signer, resource observation, or storage policy the
     /// fixture asks for is invalid.
-    pub(super) fn local_storage_owner(
-        root: &std::path::Path,
-    ) -> Arc<crate::storage::BifrostStorage> {
+    pub(super) fn local_storage_owner(root: &Path) -> Arc<BifrostStorage> {
         let signer = wyrd_storage::signer::BackendSigner::Local(
             wyrd_storage::local::LocalSigner::new(root.to_path_buf())
                 .expect("fixture local signer"),

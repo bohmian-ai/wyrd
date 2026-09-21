@@ -39,6 +39,9 @@ use wyrd_spec::request_id::RequestId;
 use crate::auth::{AuthError, AuthMiddleware};
 use crate::error::{WyrdClientError, from_problem_json};
 use crate::transport::config::HttpConfig;
+use reqwest::Method;
+use reqwest::StatusCode;
+use reqwest::header::InvalidHeaderValue;
 
 /// Response from a raw Arrow IPC request.
 pub struct ArrowResponse {
@@ -97,7 +100,7 @@ pub enum AuthenticatedReplayError<E> {
 
 impl<E> AuthenticatedReplayError<E> {
     /// Report a value that cannot travel as an HTTP header.
-    fn header(error: &reqwest::header::InvalidHeaderValue) -> Self {
+    fn header(error: &InvalidHeaderValue) -> Self {
         Self::Credential(WyrdError::Internal {
             message: format!("wyrd header value is not valid for transport: {error}"),
             details: serde_json::json!({}),
@@ -188,7 +191,7 @@ impl HttpTransport {
     pub async fn authenticated_replay<T, E, F, O>(
         &self,
         mut custom_headers: HashMap<HeaderName, HeaderValue>,
-        status_of: impl Fn(&E) -> Option<reqwest::StatusCode>,
+        status_of: impl Fn(&E) -> Option<StatusCode>,
         operation: F,
     ) -> Result<T, AuthenticatedReplayError<E>>
     where
@@ -257,7 +260,7 @@ impl HttpTransport {
     /// [`WyrdError::Internal`].
     pub async fn request_json<S, D>(
         &self,
-        method: reqwest::Method,
+        method: Method,
         path: &str,
         body: Option<&S>,
     ) -> Result<D, WyrdError>
@@ -287,7 +290,7 @@ impl HttpTransport {
     /// [`WyrdError::Internal`].
     pub(crate) async fn request_json_with_headers<S, D>(
         &self,
-        method: reqwest::Method,
+        method: Method,
         path: &str,
         body: Option<&S>,
         headers: &[(&str, &str)],
@@ -335,7 +338,7 @@ impl HttpTransport {
     /// [`WyrdError::Internal`].
     pub async fn request_arrow<S>(
         &self,
-        method: reqwest::Method,
+        method: Method,
         path: &str,
         body: Option<&S>,
     ) -> Result<ArrowResponse, WyrdError>
@@ -374,7 +377,7 @@ impl HttpTransport {
     /// problem responses.
     pub async fn request_stream(
         &self,
-        method: reqwest::Method,
+        method: Method,
         path: &str,
         body: reqwest::Body,
     ) -> Result<reqwest::Response, WyrdError> {
@@ -423,7 +426,7 @@ impl HttpTransport {
     /// `StorageClientError`.
     pub async fn request_external_stream(
         &self,
-        method: reqwest::Method,
+        method: Method,
         url: &str,
         body: Option<reqwest::Body>,
         headers: &[(&str, &str)],
@@ -451,7 +454,7 @@ impl HttpTransport {
     /// problem responses.
     pub async fn request_raw(
         &self,
-        method: reqwest::Method,
+        method: Method,
         path: &str,
     ) -> Result<reqwest::Response, WyrdError> {
         let url = self.authenticated_url(path)?;
@@ -495,7 +498,7 @@ impl HttpTransport {
     /// transport, HTTP problem responses, or an unexpected success media type.
     pub async fn request_json_stream<S>(
         &self,
-        method: reqwest::Method,
+        method: Method,
         path: &str,
         body: &S,
     ) -> Result<reqwest::Response, WyrdError>
@@ -520,7 +523,7 @@ impl HttpTransport {
     /// mismatched response request ID.
     pub async fn request_json_stream_with_id<S>(
         &self,
-        method: reqwest::Method,
+        method: Method,
         path: &str,
         body: &S,
         request_id: &RequestId,
@@ -543,7 +546,7 @@ impl HttpTransport {
     /// media-type, or request-identity errors.
     async fn request_json_stream_inner<S>(
         &self,
-        method: reqwest::Method,
+        method: Method,
         path: &str,
         body: &S,
         request_id: &str,
@@ -623,7 +626,7 @@ impl HttpTransport {
     /// [`WyrdError::Internal`].
     pub async fn submit_idempotent<S, D>(
         &self,
-        method: reqwest::Method,
+        method: Method,
         path: &str,
         body: &S,
     ) -> Result<D, WyrdError>
@@ -642,7 +645,7 @@ impl HttpTransport {
     /// replay should use [`Self::submit_idempotent`].
     pub async fn submit_with_idempotency_key<S, D>(
         &self,
-        method: reqwest::Method,
+        method: Method,
         path: &str,
         body: &S,
         key: &str,
@@ -668,7 +671,7 @@ impl HttpTransport {
     /// request fails or answers non-2xx.
     async fn submit_with_optional_idempotency_key<S, D>(
         &self,
-        method: reqwest::Method,
+        method: Method,
         path: &str,
         body: &S,
         key: Option<&str>,

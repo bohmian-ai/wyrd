@@ -9,6 +9,7 @@
 //! reqwest transport, which this type decorates rather than replaces. There is
 //! no Wyrd MCP client facade, handler, or lifecycle wrapper.
 
+use reqwest::Error as ReqwestError;
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;
@@ -37,7 +38,7 @@ use wyrd_client::transport::{AuthenticatedReplayError, HttpTransport};
 ///   with an `application/problem+json` body, which is not `application/json`,
 ///   so it always takes that branch and the rendered status line is the only
 ///   signal left.
-fn delegated_status(error: &StreamableHttpError<reqwest::Error>) -> Option<StatusCode> {
+fn delegated_status(error: &StreamableHttpError<ReqwestError>) -> Option<StatusCode> {
     match error {
         StreamableHttpError::Client(client) => client.status(),
         // The rendering is `HTTP {status}: {body}`, and `StatusCode`'s own

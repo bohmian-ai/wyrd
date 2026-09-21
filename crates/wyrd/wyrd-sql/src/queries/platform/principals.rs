@@ -10,6 +10,7 @@
 //! reads, writes, or is affected by credential state.
 // raw-query grep allowlist: platform administrative tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
+use serde_json::Value as JsonValue;
 use sqlx::types::Uuid;
 use wyrd_spec::auth::PrincipalKindTag;
 
@@ -253,7 +254,7 @@ pub async fn set_platform_principal_status(
     conn: &mut TenantConn<'_>,
     id: Uuid,
     status: &str,
-    required: &serde_json::Value,
+    required: &JsonValue,
 ) -> Result<StatusChange, SqlError> {
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(PLATFORM_STATUS_LOCK)

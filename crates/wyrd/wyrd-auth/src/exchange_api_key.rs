@@ -860,6 +860,7 @@ mod pg_tests {
 
     use chrono::{Duration, Utc};
     use secrecy::SecretString;
+    use serde_json::Value as JsonValue;
     use sqlx::types::Json;
     use uuid::Uuid;
     use wyrd_auth_issue::IssuingKey;
@@ -998,7 +999,7 @@ mod pg_tests {
     /// Compares the whole projected problem rather than a field, because the
     /// property under test is that two refusals are indistinguishable — and any
     /// field that differs is a field a caller can read.
-    fn rendered(error: &WyrdError) -> serde_json::Value {
+    fn rendered(error: &WyrdError) -> JsonValue {
         serde_json::to_value(error.problem()).expect("a problem serializes")
     }
 

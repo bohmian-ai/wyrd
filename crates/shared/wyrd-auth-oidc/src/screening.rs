@@ -13,6 +13,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
+use reqwest::Client;
 use url::Url;
 
 /// How long any provider fetch may take.
@@ -93,7 +94,7 @@ impl ScreenedHttp {
     /// resolved address is blocked, [`ScreenError::Unresolved`] when resolution
     /// fails, and [`ScreenError::Client`] when TLS setup or client construction
     /// fails.
-    pub async fn client_for(&self, url: &Url) -> Result<reqwest::Client, ScreenError> {
+    pub async fn client_for(&self, url: &Url) -> Result<Client, ScreenError> {
         wyrd_tls::install_crypto_provider().map_err(|_| ScreenError::Client)?;
         let builder = reqwest::Client::builder()
             .timeout(FETCH_TIMEOUT)

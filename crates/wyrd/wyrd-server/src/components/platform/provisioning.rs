@@ -38,6 +38,7 @@ use wyrd_sql::row_types::platform::TenantRow;
 use wyrd_sql::{OperatorPool, SqlError, TenantConn};
 
 use crate::components::auth::PlatformCaller;
+use std::fmt::{self, Debug, Formatter};
 
 /// Role a tenant administrative principal is granted at provisioning.
 ///
@@ -110,9 +111,9 @@ pub struct TenantProvisioning {
     operator: OperatorPool,
 }
 
-impl std::fmt::Debug for TenantProvisioning {
+impl Debug for TenantProvisioning {
     /// Prints the handle without its boundaries, which have no inspectable state.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("TenantProvisioning").finish_non_exhaustive()
     }
 }

@@ -12,6 +12,7 @@ mod pg_tests {
     //! default suite stays credential-free.
 
     use chrono::{Duration, Utc};
+    use serde_json::Value as JsonValue;
     use uuid::Uuid;
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::auth::PrincipalKindTag;
@@ -39,7 +40,7 @@ mod pg_tests {
     ///
     /// Spelled here rather than imported so this suite proves the storage-level
     /// containment test, not the server's idea of what the set contains.
-    fn required_grant() -> serde_json::Value {
+    fn required_grant() -> JsonValue {
         serde_json::json!(["tenants:write", "platform_identity:write"])
     }
 

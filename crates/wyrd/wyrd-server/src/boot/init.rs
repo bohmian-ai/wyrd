@@ -11,6 +11,7 @@
 //! state and emits no credential material under any deployment profile.
 
 use secrecy::{ExposeSecret, SecretString};
+use std::io::{Error as IoError, Result as IoResult, Write};
 use uuid::Uuid;
 use wyrd_auth::platform_credentials::{PlatformCredential, PlatformCredentialError};
 use wyrd_auth_issue::hash_api_key;
@@ -44,7 +45,7 @@ pub enum InitError {
     Store(#[from] SqlError),
     /// The credential could not be disclosed to the operator.
     #[error("initial credential could not be disclosed: {0}")]
-    Disclose(#[from] std::io::Error),
+    Disclose(#[from] IoError),
 }
 
 /// The fixed authority every platform administrator holds.
@@ -113,7 +114,7 @@ pub(crate) fn platform_administrator_grant() -> PermissionSet {
 #[tracing::instrument(level = "info", skip(pool, disclosure), err)]
 pub async fn initialize_platform_root(
     pool: &OperatorPool,
-    disclosure: &mut dyn std::io::Write,
+    disclosure: &mut dyn Write,
 ) -> Result<(), InitError> {
     let principal_id = Uuid::now_v7();
     let credential = PlatformCredential::generate();
@@ -180,10 +181,7 @@ pub async fn initialize_platform_root(
 /// # Errors
 /// Returns the underlying [`std::io::Error`] when any write or the flush
 /// fails.
-fn disclose_credential(
-    disclosure: &mut dyn std::io::Write,
-    secret: &SecretString,
-) -> std::io::Result<()> {
+fn disclose_credential(disclosure: &mut dyn Write, secret: &SecretString) -> IoResult<()> {
     writeln!(disclosure, "Wyrd initialization complete.")?;
     writeln!(disclosure, "Platform administrative credential:")?;
     writeln!(disclosure, "{}", secret.expose_secret())?;

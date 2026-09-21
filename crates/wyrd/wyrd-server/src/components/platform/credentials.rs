@@ -16,6 +16,7 @@
 
 use axum::Json;
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use chrono::{Duration, Utc};
 use secrecy::ExposeSecret;
 use uuid::Uuid;
@@ -201,7 +202,7 @@ async fn revoke_credential(
     State(state): State<AppState>,
     caller: PlatformCaller,
     Path((principal_id, credential_id)): Path<(Uuid, Uuid)>,
-) -> Result<axum::http::StatusCode, WyrdErrorResponse> {
+) -> Result<StatusCode, WyrdErrorResponse> {
     let pool = operator(&state)?;
     // The handle must outlive the transaction it lends out.
     let authz = PlatformAuthorization::new(pool.clone());

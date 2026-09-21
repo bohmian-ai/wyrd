@@ -183,6 +183,15 @@ impl Resource {
         }
     }
 
+    /// The single resources this one names: an `AnyOf` flattened, anything
+    /// else itself. Used to meet two grants member by member.
+    fn members(&self) -> Vec<&Self> {
+        match self {
+            Self::AnyOf(resources) => resources.iter().flat_map(Self::members).collect(),
+            resource => vec![resource],
+        }
+    }
+
     /// True when this resource owns Bifrost objects a grant may be scoped to.
     ///
     /// Only the Bifrost query surface names a table. `AnyOf` and `Wildcard` are
@@ -233,6 +242,15 @@ impl Action {
             (Self::Wildcard, _) => true,
             (Self::AnyOf(actions), other) => actions.iter().any(|action| action.covers(other)),
             (self_action, other_action) => self_action == other_action,
+        }
+    }
+
+    /// The single actions this one names: an `AnyOf` flattened, anything else
+    /// itself. Used to meet two grants member by member.
+    fn members(&self) -> Vec<&Self> {
+        match self {
+            Self::AnyOf(actions) => actions.iter().flat_map(Self::members).collect(),
+            action => vec![action],
         }
     }
 
@@ -732,6 +750,50 @@ impl PermissionSet {
         })
     }
 
+    /// The authority both sets grant: every permission covered by `self` and by
+    /// `other`, and nothing else.
+    ///
+    /// Delegation mints with this so a delegated token can never carry more
+    /// than its caller holds. Each pair of grants meets axis by axis through the
+    /// same `covers` relations authorization uses: an `AnyOf` is split into its
+    /// members, each axis keeps the narrower side when one covers the other, and
+    /// a pair with a disjoint axis contributes nothing. A wildcard therefore
+    /// yields the other grant, and a schema grant meeting a table grant in that
+    /// schema yields the table grant.
+    #[must_use]
+    pub fn intersection(&self, other: &Self) -> Self {
+        let mut meet = Self::new();
+        for left in &self.0 {
+            for right in &other.0 {
+                let Some(scope) = narrower(&left.scope, &right.scope, PermissionScope::covers)
+                else {
+                    continue;
+                };
+                for resource in meets(
+                    &left.resource.members(),
+                    &right.resource.members(),
+                    Resource::covers,
+                ) {
+                    for action in meets(
+                        &left.action.members(),
+                        &right.action.members(),
+                        Action::covers,
+                    ) {
+                        let permission = Permission {
+                            resource: resource.clone(),
+                            action: action.clone(),
+                            scope: scope.clone(),
+                        };
+                        if permission.validate().is_ok() {
+                            meet.insert(permission);
+                        }
+                    }
+                }
+            }
+        }
+        meet
+    }
+
     /// Iterate over stored permissions.
     pub fn iter(&self) -> impl Iterator<Item = &Permission> {
         self.0.iter()
@@ -748,6 +810,28 @@ impl PermissionSet {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+}
+
+/// The narrower of two values on one axis, or `None` when neither covers the
+/// other and the axis is disjoint.
+///
+/// Exact for the resource, action, and scope axes because each is a tree under
+/// its `covers` relation once `AnyOf` is split into members.
+fn narrower<'a, T>(left: &'a T, right: &'a T, covers: fn(&T, &T) -> bool) -> Option<&'a T> {
+    if covers(left, right) {
+        Some(right)
+    } else if covers(right, left) {
+        Some(left)
+    } else {
+        None
+    }
+}
+
+/// Every non-empty [`narrower`] meet between two lists of axis members.
+fn meets<'a, T>(left: &[&'a T], right: &[&'a T], covers: fn(&T, &T) -> bool) -> Vec<&'a T> {
+    left.iter()
+        .flat_map(|l| right.iter().filter_map(move |r| narrower(*l, *r, covers)))
+        .collect()
 }
 
 impl FromIterator<Permission> for PermissionSet {
@@ -986,6 +1070,56 @@ mod tests {
                 table_uid: uid,
             })),
         }
+    }
+
+    /// Proves the intersection keeps only authority both sides grant, at the
+    /// narrower scope: wildcard, schema, exact-object, and disjoint grants.
+    #[test]
+    fn intersection_keeps_only_the_narrower_shared_authority() {
+        let uid = uuid::Uuid::from_u128(0x77);
+        let set = |permissions: Vec<Permission>| permissions.into_iter().collect::<PermissionSet>();
+
+        let wildcard = set(vec![Permission::wildcard()]);
+        let target = set(vec![Permission::card_read(), logs_schema_grant()]);
+        assert_eq!(wildcard.intersection(&target), target);
+        assert_eq!(target.intersection(&wildcard), target);
+
+        let schema = set(vec![logs_schema_grant()]);
+        let table = set(vec![table_requirement("logs", uid)]);
+        assert_eq!(schema.intersection(&table), table);
+        assert_eq!(table.intersection(&schema), table);
+
+        let other_table = set(vec![table_requirement("logs", uuid::Uuid::from_u128(0x78))]);
+        assert!(table.intersection(&other_table).is_empty());
+        assert!(
+            set(vec![table_requirement("traces", uid)])
+                .intersection(&schema)
+                .is_empty()
+        );
+
+        let all_reads = set(vec![Permission {
+            resource: Resource::Wildcard,
+            action: Action::Read,
+            scope: PermissionScope::All,
+        }]);
+        let cards_any = set(vec![Permission {
+            resource: Resource::AnyOf(vec![Resource::Cards, Resource::Audit]),
+            action: Action::Wildcard,
+            scope: PermissionScope::All,
+        }]);
+        assert_eq!(
+            all_reads.intersection(&cards_any),
+            set(vec![Permission::card_read(), Permission::audit_read()])
+        );
+
+        assert!(
+            set(vec![Permission::card_write()])
+                .intersection(&set(vec![
+                    Permission::card_read(),
+                    Permission::delegation_issue()
+                ]))
+                .is_empty()
+        );
     }
 
     /// Proves the persisted permission JSON is exactly the approved three-field

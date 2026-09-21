@@ -80,8 +80,10 @@ fn assert_deny(decision: &Value) {
     );
 }
 
+/// Bootstrap a delegating caller that holds the `writer` authority it hands
+/// on, so the target's own grants decide each delegated verdict.
 async fn neutral_initiator(srv: &WyrdTestServer, label: &str) -> Bootstrap {
-    srv.bootstrap_service(label, &["runtime_admin"])
+    srv.bootstrap_service(label, &["runtime_admin", "writer"])
         .await
         .expect("bootstrap neutral initiator")
 }
@@ -178,7 +180,7 @@ async fn journey_delegated_call_via_token_exchange() {
     }
     let srv = WyrdTestServer::start_in_process().await.expect("start");
     let a = srv
-        .bootstrap_service("svc-a", &["runtime_admin"])
+        .bootstrap_service("svc-a", &["runtime_admin", "writer"])
         .await
         .expect("bootstrap a");
     let b = srv
@@ -220,7 +222,7 @@ async fn journey_delegation_then_revoke_underlying_role() {
     }
     let srv = WyrdTestServer::start_in_process().await.expect("start");
     let a = srv
-        .bootstrap_service("svc-a-revoke", &["runtime_admin"])
+        .bootstrap_service("svc-a-revoke", &["runtime_admin", "writer"])
         .await
         .expect("bootstrap a");
     let b = srv
@@ -314,5 +316,31 @@ async fn journey_cross_principal_kind_isolation_via_independent_bootstrap() {
     let agent_decision =
         permission_check_via_delegation(&srv, &init_jwt, &agent, "card_write").await;
     assert_deny(&agent_decision);
+    srv.shutdown().await.expect("shutdown");
+}
+
+/// Delegation never amplifies: a caller holding only `delegation:issue` gets a
+/// delegated token for a `writer` target, but that token cannot write cards.
+#[tokio::test(flavor = "current_thread")]
+async fn journey_delegation_cannot_amplify_the_caller() {
+    if !e2e_enabled() {
+        return;
+    }
+    let srv = WyrdTestServer::start_in_process().await.expect("start");
+    let target = srv
+        .bootstrap_service("svc-amplify-target", &["writer"])
+        .await
+        .expect("bootstrap target");
+    let caller = srv
+        .bootstrap_service("svc-amplify-caller", &["runtime_admin"])
+        .await
+        .expect("bootstrap caller");
+    let caller_jwt = srv
+        .exchange_api_key(caller.api_key().expect("machine"))
+        .await
+        .expect("caller jwt");
+
+    let decision = permission_check_via_delegation(&srv, &caller_jwt, &target, "card_write").await;
+    assert_deny(&decision);
     srv.shutdown().await.expect("shutdown");
 }

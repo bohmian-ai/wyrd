@@ -109,7 +109,14 @@ pub enum TenantGrant {
     /// A verified workload `jwt-bearer` assertion.
     JwtBearer,
     /// An RFC 8693 delegation by a verified, authorized caller.
-    Delegation(DelegationCaller),
+    Delegation {
+        /// The delegating caller, recorded as the newest `act` layer.
+        caller: DelegationCaller,
+        /// The caller's verified permissions. The delegated token carries only
+        /// the target's permissions that this set also covers, so delegation
+        /// can narrow authority but never amplify it.
+        ceiling: PermissionSet,
+    },
 }
 
 impl TenantGrant {
@@ -123,7 +130,7 @@ impl TenantGrant {
         match self {
             Self::ApiKey { credential_id } => Some(*credential_id),
             Self::Refresh { consumed } => Some(*consumed),
-            Self::OidcLogin | Self::JwtBearer | Self::Delegation(_) => None,
+            Self::OidcLogin | Self::JwtBearer | Self::Delegation { .. } => None,
         }
     }
 
@@ -133,7 +140,7 @@ impl TenantGrant {
         match self {
             Self::ApiKey { .. } => Some(MINT_KIND_API_KEY_EXCHANGE),
             Self::JwtBearer => Some(MINT_KIND_JWT_BEARER),
-            Self::Delegation(_) => Some(MINT_KIND_DELEGATION),
+            Self::Delegation { .. } => Some(MINT_KIND_DELEGATION),
             Self::OidcLogin | Self::Refresh { .. } => None,
         }
     }
@@ -249,7 +256,9 @@ impl TenantTokenIssuer {
     /// credentials; the principal's current row (a user for human grants, a
     /// tenant machine principal otherwise), refusing anything not active; the
     /// principal's current role assignments and those roles' permissions; and,
-    /// for a Card-bound principal, its transitive Card scope. It then signs a
+    /// for a Card-bound principal, its transitive Card scope. A delegated
+    /// grant narrows those permissions to their intersection with the caller's
+    /// ceiling. It then signs a
     /// token carrying that `PermissionSet` for the configured access TTL and
     /// appends the canonical token-exchange audit (plus the Card-scope mint
     /// audit for a Card-bound principal). A delegated grant's audit names the
@@ -314,7 +323,12 @@ impl TenantTokenIssuer {
         let roles = role_refs(role_names).map_err(|error| IssuanceError::RoleCorrupt {
             role: error.to_string(),
         })?;
-        let permissions = resolve_permissions(conn, &roles).await?;
+        let permissions = match &grant {
+            TenantGrant::Delegation { ceiling, .. } => resolve_permissions(conn, &roles)
+                .await?
+                .intersection(ceiling),
+            _ => resolve_permissions(conn, &roles).await?,
+        };
 
         let expires_at = Utc::now() + self.settings.access_ttl;
         let credential_id = grant.credential_id();
@@ -324,7 +338,7 @@ impl TenantTokenIssuer {
             .map(|(kind, root)| (kind, root, principal.card_ref_scope.clone()));
         let event = exchange_audit_event(&principal, &grant, expires_at, request_id);
         let delegated_by = match grant {
-            TenantGrant::Delegation(caller) => Some(caller),
+            TenantGrant::Delegation { caller, .. } => Some(caller),
             _ => None,
         };
         let access_token = self
@@ -492,7 +506,7 @@ fn exchange_audit_event(
     expires_at: DateTime<Utc>,
     request_id: &str,
 ) -> wyrd_spec::vala::api::AuditEvent {
-    let TenantGrant::Delegation(caller) = grant else {
+    let TenantGrant::Delegation { caller, .. } = grant else {
         return auth_event(
             request_id,
             TOKEN_EXCHANGE_OPERATION,
@@ -869,7 +883,13 @@ mod pg_tests {
                 },
             ),
             (machine, TenantGrant::JwtBearer),
-            (machine, TenantGrant::Delegation(caller)),
+            (
+                machine,
+                TenantGrant::Delegation {
+                    caller,
+                    ceiling: wyrd_runtime::PermissionSet::new(),
+                },
+            ),
         ];
         for (principal, grant) in cases {
             let label = format!("{grant:?}");

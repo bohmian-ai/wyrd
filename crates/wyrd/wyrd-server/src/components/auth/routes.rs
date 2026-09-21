@@ -185,18 +185,20 @@ async fn token(
                 .clone()
                 .ok_or_else(auth_not_configured)?;
             let tenant_id = tenant_from_unverified_access_token(subject_token.expose())?;
-            let mut conn = state
+            let conn = state
                 .postgres
                 .tenant_conn(tenant_id)
                 .await
                 .map_err(sql_error)?;
+            // The exchange commits its own authorization decision, so a
+            // refusal after the permission check is still durably audited.
             let exchanged = DelegateToken {
                 issuer,
                 verifier,
                 permission_check: state.authz.permission_check.clone(),
             }
             .execute(
-                &mut conn,
+                conn,
                 SecretString::from(subject_token.expose().to_owned()),
                 requested_subject,
                 req_id,
@@ -217,7 +219,6 @@ async fn token(
                     return Err(WyrdErrorResponse::from(wyrd));
                 }
             };
-            conn.commit().await.map_err(sql_error)?;
             Ok(Json(exchanged.into_response()))
         }
         TokenRequest::RefreshToken { refresh_token } => {

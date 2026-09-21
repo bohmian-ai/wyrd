@@ -69,7 +69,7 @@ async fn authz_delegated_token_allows() {
         .await
         .expect("test server starts");
     let caller = server
-        .bootstrap_service("route-caller", &["runtime_admin"])
+        .bootstrap_service("route-caller", &["runtime_admin", "writer"])
         .await
         .expect("caller bootstraps");
     let callee = server

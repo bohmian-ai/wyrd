@@ -81,15 +81,95 @@ but their public Bifrost constructors create a different client from options.
 The delegated authentication state cannot reach any operation, and current
 tests prove only validation or unreachable-server failures.
 
-Expose the smallest idiomatic composition from each existing foreign
-`WyrdClient` wrapper into its existing Bifrost facade, backed by the current
-Rust Bifrost-from-client composition. Keep exchange, bearer access, caching,
-renewal, retry, headers, and transport private in Rust. Do not broaden Cards or
+Keep credential machinery on `WyrdClient`; do not add `on_behalf_of` to
+`Bifrost`. Preserve Bifrost's current zero-argument/environment behavior in all
+three languages, and add only an optional existing-client input for callers
+that already hold explicit or delegated authentication state.
+
+The public interfaces and flow are fixed as follows:
+
+```rust
+// Normal use: Bifrost resolves Service B from the environment.
+let bifrost_b = Bifrost::from_env().await?;
+
+// Delegated use: WyrdClient performs the exchange; Bifrost consumes it.
+let service_b = WyrdClient::from_env()?;
+let delegated = service_b
+    .on_behalf_of(service_a_token, TokenAudience::Bifrost)
+    .await?;
+let bifrost_as_a = Bifrost::connect(&delegated).await?;
+```
+
+Rust already has both Bifrost constructors; do not add another Rust interface.
+
+```python
+# Normal use: resolves Service B from the environment exactly as today.
+bifrost_b = Bifrost()
+
+# Delegated use: the optional client carries the delegated token.
+service_b = WyrdClient()
+delegated = service_b.on_behalf_of(service_a_token, audience="bifrost")
+bifrost_as_a = Bifrost(client=delegated)
+```
+
+Python adds `client: WyrdClient | None = None` to the existing `Bifrost`
+constructor. When omitted, the existing environment/config resolution is
+unchanged. When supplied, Bifrost uses that client and does not resolve another
+credential. `client` may be combined with the existing table binding, but not
+with `server_url`, `credential`, or `grpc_url`; conflicting inputs return the
+existing stable validation error.
+
+```typescript
+// Normal use: resolves Service B from the environment exactly as today.
+const bifrostB = await Bifrost.connect();
+
+// Delegated use: the optional client carries the delegated token.
+const serviceB = WyrdClient.connect();
+const delegated = await serviceB.onBehalfOf(serviceAToken, {
+  audience: "bifrost",
+});
+const bifrostAsA = await Bifrost.connect({ client: delegated });
+```
+
+TypeScript adds `client?: WyrdClient` to the existing `Bifrost.connect`
+options. Its public options type must make `client` mutually exclusive with
+`serverUrl`, `credential`, and `grpcUrl`, while retaining the optional table
+binding. When `client` is absent, existing environment/config resolution is
+unchanged.
+
+Both foreign projections must call the current Rust
+`Bifrost::connect`/`connect_with_table` owner with the wrapped Rust client.
+Keep exchange, bearer access, caching, renewal, retry, headers, and transport
+private in Rust. Do not add Bifrost delegation methods, broaden Cards or
 `WyrdState`, expose raw tokens, duplicate Bifrost, or create a new harness.
 
 Use each existing Python and TypeScript integration harness to prove the same
 real A-read/B-read-write delegation scenario. A lower-tier binding test is not
 a substitute for these public journeys.
+
+The Python proving scenario must exercise the public workflow directly:
+
+```python
+service_b = WyrdClient(server_url=server.url, credential=b_api_key)
+delegated = service_b.on_behalf_of(a_access_token, audience="bifrost")
+bifrost_as_a = Bifrost(client=delegated)
+
+assert bifrost_as_a.sql("SELECT * FROM allowed.orders").to_arrow().num_rows >= 0
+with pytest.raises(WyrdError) as denied:
+    bifrost_as_a.write_batch("allowed.orders", batch)
+assert denied.value.status == 403
+
+# The same operation uses B's full authority only through B's normal client.
+bifrost_as_b = Bifrost(client=service_b)
+bifrost_as_b.write_batch("allowed.orders", batch)
+```
+
+The TypeScript journey must perform the same sequence through
+`WyrdClient.onBehalfOf` and `Bifrost.connect({ client: delegated })`: delegated
+read succeeds, delegated write is denied before effect, and the ordinary
+Service-B Bifrost client can perform the write. The exact table/row fixtures
+come from each existing integration harness rather than a new delegation-only
+fixture.
 
 ### `FIND-admin-principals-R11-5` — native-ingest audit loses actor B
 
@@ -178,7 +258,7 @@ transport.
 | `R11-1` | A production-valid server configuration accepts standard token exchange without any preview setting; obsolete preview config/error/docs/generated residue is absent; real policy/audit/verifier production checks remain |
 | `R11-2` | Every delegated allow, deny, and allowed-then-refused event has `operation=auth.token.exchange`, `permission=invoke`, and exactly one canonical row |
 | `R11-3` | With valid tokens and one directed policy, A-subject/B-actor succeeds while B-subject/A-actor receives the stable denial, commits one denied invoke decision, and issues no token or effect |
-| `R11-4` | Public Python and TypeScript helpers return clients consumable by their existing Bifrost facades; each real SDK journey proves A-authorized read succeeds and B-only write is denied before effect |
+| `R11-4` | Normal `Bifrost()`/`Bifrost.connect()` environment resolution is unchanged; Python `Bifrost(client=delegated)` and TypeScript `Bifrost.connect({ client: delegated })` consume the Rust-owned delegated client; conflicting client/credential/endpoint inputs are rejected; each real SDK journey proves A-authorized read succeeds, B-only write is denied before effect, and direct B still writes |
 | `R11-5` | Delegated native ingest retains subject A and actor B in both allowed/denied audit as applicable; a direct B call remains unattributed and can exercise B's own permission |
 | `R11-6` | Published query guidance uses the ambient credential chain and contains no secret-valued argument |
 | `R9-2` | Card-bound issue-key response, generated schema, served OpenAPI, and consumers use UUID for the credential ID |
@@ -203,8 +283,9 @@ Revise the existing proving scenarios rather than adding parallel suites:
    stub/missing-component refusals remain.
 4. Extend `credential_ids_publish_their_uuid_contract` and the existing
    issue-key route/journey for the UUID response.
-5. Add successful delegated Bifrost scenarios to the existing Python and
-   TypeScript integration harnesses and run them through
+5. Add the explicit delegated-client scenarios above to the existing Python
+   and TypeScript integration harnesses, including unchanged environment-only
+   Bifrost construction and client/credential conflict refusal, and run them through
    `mise run py:test:integration` and `mise run ts:test:integration` with
    positive named selections.
 6. Rerun the existing root CLI secret-option proof and `mise run docs:check`

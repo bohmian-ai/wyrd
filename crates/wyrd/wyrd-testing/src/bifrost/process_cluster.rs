@@ -763,19 +763,30 @@ pub enum ProcessClusterError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddressPlan {
     /// One distinct loopback address per pod, canonical ports.
-    DistinctLoopbackAddresses,
+    DistinctLoopbackAddresses {
+        /// Middle octets of this cluster's `127.a.b.0/24` block.
+        ///
+        /// Canonical ports make every address a host-wide resource, so a fixed
+        /// block collides whenever two clusters overlap — concurrent tests in
+        /// one run, or runs from separate checkouts. A random block per cluster
+        /// keeps pod-like addressing while making that overlap vanishingly
+        /// unlikely.
+        subnet: [u8; 2],
+    },
     /// One loopback address, distinct ephemeral ports per pod.
     DistinctPortsOnLocalhost,
 }
 
 impl AddressPlan {
-    /// Detects whether this platform can assign distinct loopback addresses.
+    /// Detects whether this platform can assign distinct loopback addresses,
+    /// and picks this cluster's random loopback block when it can.
     #[must_use]
     pub fn detect() -> Self {
-        match TcpListener::bind((Ipv4Addr::new(127, 0, 0, 2), 0)) {
+        let subnet: [u8; 2] = rand::random();
+        match TcpListener::bind((Ipv4Addr::new(127, subnet[0], subnet[1], 2), 0)) {
             Ok(listener) => {
                 drop(listener);
-                Self::DistinctLoopbackAddresses
+                Self::DistinctLoopbackAddresses { subnet }
             }
             Err(_) => Self::DistinctPortsOnLocalhost,
         }
@@ -789,11 +800,11 @@ impl AddressPlan {
     /// be reserved under the fallback plan.
     fn sockets(self, index: usize) -> Result<PodSockets, ProcessClusterError> {
         match self {
-            Self::DistinctLoopbackAddresses => {
+            Self::DistinctLoopbackAddresses { subnet } => {
                 let host = Ipv4Addr::new(
                     127,
-                    0,
-                    0,
+                    subnet[0],
+                    subnet[1],
                     u8::try_from(index + 2).map_err(|_| {
                         ProcessClusterError::Resource(
                             "process cluster exceeded the loopback address block".to_owned(),

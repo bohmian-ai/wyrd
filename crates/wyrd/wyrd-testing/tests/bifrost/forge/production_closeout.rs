@@ -887,20 +887,20 @@ impl CloseoutJourney {
     /// Corroborates every completed rewrite with its lineage and metrics.
     ///
     /// An attempt publishes each of its admitted plans independently, so a
-    /// completed rewrite settles *one operation per plan*, not one per task.
-    /// The count is therefore a floor rather than an equality, and the
-    /// identities carry the real evidence: each plan holds its own operation in
-    /// `vala.forge_operation_state`, settled into a terminal phase. Forge
-    /// evaluates no principal permission, so that projection — not audit — is
-    /// the authority read here.
+    /// completed rewrite settles *one operation per plan*, not one per task —
+    /// and a task whose planning finds nothing to rewrite self-settles with
+    /// none. The task count therefore bounds nothing; each plan holds its own
+    /// operation in `vala.forge_operation_state`, settled into a terminal
+    /// phase. Forge evaluates no principal permission, so that projection — not
+    /// audit — is the authority read here.
     ///
     /// Returns how many operations that evidence covers, so the caller can hold
     /// it against the snapshots the same passes published.
     ///
     /// # Panics
-    /// Panics on absent or unsettled operation evidence, on two plans sharing
-    /// one operation identity, or on missing physical data-flow counters.
-    async fn assert_rewrite_evidence(&self, tenant: DataTenantId, expected: usize) -> usize {
+    /// Panics on unsettled operation evidence, on two plans sharing one
+    /// operation identity, or on missing physical data-flow counters.
+    async fn assert_rewrite_evidence(&self, tenant: DataTenantId) -> usize {
         let mut conn = self
             .coordinator()
             .tenant_conn_for(tenant)
@@ -917,12 +917,6 @@ impl CloseoutJourney {
         conn.commit()
             .await
             .expect("read-only lineage inspection completes");
-        assert!(
-            rows.len() >= expected,
-            "every completed rewrite settles at least one plan's operation: \
-             {} operations for {expected} rewrites",
-            rows.len()
-        );
         assert_eq!(
             rows.iter()
                 .map(|(operation, ..)| *operation)
@@ -1403,7 +1397,7 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
     journey.assert_objects(&inputs).await;
     // Each admitted plan publishes on its own, so the rewrite passes owe one
     // operation per snapshot they added — not one per completed task.
-    let operations = journey.assert_rewrite_evidence(tenant, rewrites).await;
+    let operations = journey.assert_rewrite_evidence(tenant).await;
     assert_eq!(
         operations,
         journey.snapshot_count(&table.binding).await - published_before,

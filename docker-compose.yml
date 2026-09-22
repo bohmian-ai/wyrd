@@ -24,7 +24,9 @@ services:
     ports:
       - "127.0.0.1::5432"
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "wyrd_test_admin", "-d", "wyrd"]
+      # TCP, not the socket: the image's init-time server listens only on the
+      # socket, so a socket probe reports healthy before the real server is up.
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "wyrd_test_admin", "-d", "wyrd"]
       interval: 2s
       timeout: 3s
       retries: 20

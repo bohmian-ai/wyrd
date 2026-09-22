@@ -196,4 +196,3 @@ None. Both implementation defects have bounded fixes, and the blocking workflow 
 - The recorded Python-command substitution is environmental and does not change the scripts or their asserted results.
 - `git diff --check c5c20754a167e8f4d74a555a720bd51df6179a6f..84b7f4ad6eeaf2f20006761c35e34ce8d51ce7f6` is clean.
 - The final identity recheck found `HEAD == 84b7f4ad6eeaf2f20006761c35e34ce8d51ce7f6`; only this review artifact is uncommitted.
-

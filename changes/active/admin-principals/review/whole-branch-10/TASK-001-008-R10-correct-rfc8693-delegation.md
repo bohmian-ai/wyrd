@@ -259,3 +259,68 @@ Do not substitute `mise run gate`, `test:rust`, or an ad hoc all-features test
 aggregate. Append one evidence table mapping each acceptance row to
 implementation commits, exact focused commands and selected counts, owning
 lanes, and results.
+
+## Implementation evidence
+
+Status: `IMPLEMENTED`. Commits `596a50bdd`, `47548e32f`, `29a3cad30`,
+`57229ffbe`, `10315484f`, `3912612fe`, `5794e6cf9`, `be0ec96fd`, `61ab3c689`,
+`3a3bcc60d`, plus the evidence commit that carries this table.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| RFC request semantics | `596a50bdd`, `47548e32f`: `TokenRequest::TokenExchange { subject_token, actor_token, audience }`; `crates/wyrd/wyrd-auth/src/exchange_api_key.rs` verifies both tokens, checks the same tenant and invoke policy, and fails closed | `scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-auth --lib -E 'test(=exchange_api_key::pg_tests::invalid_or_malformed_identity_input_records_no_decision) \| test(=exchange_api_key::pg_tests::a_policy_denied_exchange_commits_one_denied_decision) \| test(=exchange_api_key::pg_tests::an_allowed_exchange_for_a_missing_actor_commits_one_allowed_decision) \| test(=exchange_api_key::pg_tests::a_refused_exchange_audit_issues_no_token) \| test(=exchange_api_key::pg_tests::an_exchange_names_subject_and_actor_and_carries_only_the_intersection)'"`: 5 run, 5 passed (the cross-tenant actor, missing/invalid actor and malformed input are cases inside `invalid_or_malformed_identity_input_records_no_decision`) | PASS |
+| JWT structure | `TenantGrant::into_access_grant` (`crates/wyrd/wyrd-auth/src/issuance.rs`); `flatten_act_chain` orders the chain earliest first, so the current actor is last | `mise exec -- cargo nextest run --locked -p wyrd-auth-issue --lib -E 'test(=tests::issue_access_token_delegated_names_subject_and_outer_actor)'`: 1 passed; `mise exec -- cargo nextest run --locked -p wyrd-auth-verify --lib -E 'test(=tests::into_verified_keeps_subject_and_orders_actors_earliest_first) \| test(=tests::bifrost_audience_is_accepted_only_on_the_bifrost_surface) \| test(=tests::token_verifier_rejects_cross_tenant_token)'`: 3 passed | PASS |
+| Attenuation | `PermissionSet::intersection` reused in `into_access_grant` | `mise exec -- cargo nextest run --locked -p wyrd-runtime --lib -E 'test(=permission::tests::intersection_keeps_only_the_narrower_shared_authority)'`: 1 passed; `an_exchange_names_subject_and_actor_and_carries_only_the_intersection` (above); `auth_e2e` `journey_delegation_cannot_amplify_the_subject` | PASS |
+| Automatic request verification | `29a3cad30`: `require_bifrost_authenticated` layers only the Bifrost and query routers; the gRPC gate uses `verify_on(.., TokenAudience::Bifrost)`; verification is JWT-only (no DB read) | Primary journey `scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test server -P journey --run-ignored=all -E 'test(=query::service_b_acts_for_service_a_with_only_a_table_authority)'"`: 1 passed (read succeeds; table write gets RBAC 403; a Wyrd route gets 401; audit names A as subject and B as actor); `mise run test:bifrost:journey:server` PASS; `mise run test:bifrost:integration:server` PASS | PASS |
+| Client helper | Rust `WyrdClient::on_behalf_of` (`57229ffbe`); Python `wyrd.WyrdClient.on_behalf_of` (`3912612fe`, `sdks/wyrd-sdk-python/src/client.rs`); TS `WyrdClient.onBehalfOf` (`5794e6cf9`, `sdks/wyrd-sdk-ts/native/src/client.rs`); both SDKs call the Rust method, with no exchange, caching or HTTP logic of their own | `mise exec -- cargo nextest run --locked -p wyrd-client --lib -E 'test(=auth::tests::on_behalf_of_caches_the_exchange_and_redacts_the_subject)'`: 1 passed; `mise exec -- uv run pytest tests/unit/client/test_client.py` (in `sdks/wyrd-sdk-python`): 3 passed; `mise run ts:test:unit`: 15 passed, including `wyrd-client.test.ts` (2) and the `WyrdClient.connect` no-credentials case | PASS |
+| Removal | `delegation:issue`, `Resource::Delegation`, `Action::Issue`, `requested_subject` and the callee/caller model are removed from code; schemas regenerated (`61ab3c689`); docs rewritten (`3a3bcc60d`) | `git grep -e requested_subject -e RequestedSubject -e delegation:issue -- ':!changes'` returns nothing; `mise run codegen:check` PASS; `mise run docs:check` PASS | PASS |
+| Audit | Exchange audit: operation `auth.token.exchange`, principal is the subject, detail carries actor and subject, resource is the audience, and the actor credential is attributed; `a_refused_exchange_audit_issues_no_token` shows an audit failure issues no token | Focused `wyrd-auth` pg tests (above); `scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && WYRD_AUTH_E2E=1 mise exec -- cargo nextest run --locked -p wyrd-server --test auth_e2e"` PASS; the primary journey asserts both the exchange audit row and the read-decision audit row | PASS |
+
+Owning lanes: all passed at the final candidate.
+- Build, format and lint:
+  - `mise run fmt:check`
+  - `mise run lints`
+  - `mise run py:format:check`
+  - `mise run py:lints`
+  - `mise run py:typecheck`
+  - `mise run py:test:unit`
+  - `mise run ts:build`
+  - `mise run ts:typecheck`
+  - `mise run ts:test:unit`
+- Boundary checks:
+  - `mise run check:client-tier`
+  - `mise run check:pyo3-scope`
+  - `mise run check:unwrap-audit`
+  - `mise run check:clippy-allow-audit`
+  - `mise run check:tenant-isolation`
+  - `mise run check:from-pools-allowlist`
+- Test lanes:
+  - `mise run test:principals:unit`
+  - `mise run test:principals:integration`
+  - `mise run test:shared`
+  - `mise run test:sql`
+- Generated artifacts:
+  - `mise run codegen:check`
+  - `mise run docs:check`
+- Strict rustdoc: `RUSTDOCFLAGS="-D missing_docs -D rustdoc::broken_intra_doc_links" cargo doc --locked --no-deps` passes for:
+  - `wyrd-spec`
+  - `wyrd-auth-issue`
+  - `wyrd-auth-verify`
+  - `wyrd-auth`
+  - `wyrd-auth-check`
+  - `wyrd-client`
+  - `wyrd-sdk-ts`
+  - `wyrd-server`
+  - `wyrd-sdk-python --features python`
+- Whitespace: `git diff --check c5c20754a167e8f4d74a555a720bd51df6179a6f HEAD` is clean.
+
+Limits:
+- **Local `python` shim.** This machine has only `python3`, so the four lanes that call `python` (`check:unwrap-audit`, `check:clippy-allow-audit`, `check:tenant-isolation` and `docs:check`) ran with a scratchpad `python`→`python3` shim on `PATH`.
+- **Flaky first `test:shared` run.** It failed once because the test server's port was already taken (`Address already in use`) and passed 658/658 on the re-run.
+- **Strict rustdoc for `vala-bifrost-redux`.** It fails on missing docs this change did not introduce; only one line of `gate/auth.rs` changed there. That crate is not in `check:docs`.
+- **Trailing blank lines.** Two review records from `33feb673b` had trailing blank lines. Only the whitespace was removed, so `diff --check` passes.
+- **Python/TS delegation journey.** There is no Python or TS end-to-end delegation journey: the SDK test harnesses cannot seed two services and an invoke policy. The delegation behavior is proven by the Rust journey, and the SDK tests prove the projection and that errors flow from Rust.
+
+Non-goals were kept out of scope:
+- no table, role, permission, trait, migration, second audit path or compatibility endpoint was added;
+- Bifrost, Cards and `WyrdState` SDK constructors are unchanged.

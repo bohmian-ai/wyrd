@@ -46,8 +46,8 @@ assert_not_contains() { ! grep -Fq -- "$2" "$1" || { echo "unexpected '$2' in $1
 
 rm -f "$FAKE_DOCKER_LOG" "$FAKE_PSQL_LOG"
 env_capture="$temp_dir/env"
-"$wrapper" -- bash -c 'printf "%s\n%s\n%s\n" "$DATABASE_URL" "$WYRD_DATABASE_URL" "$BIFROST_TEST_DB_URL" >"$1"' _ "$env_capture"
-test "$(wc -l <"$env_capture" | tr -d ' ')" -eq 3
+"$wrapper" -- bash -c 'printf "%s\n%s\n" "$DATABASE_URL" "$WYRD_DATABASE_URL" >"$1"' _ "$env_capture"
+test "$(wc -l <"$env_capture" | tr -d ' ')" -eq 2
 grep -Eq '^postgres://wyrd_migrator:.*@127\.0\.0\.1:[1-9][0-9]*/wyrd$' "$env_capture"
 grep -Eq '^postgres://wyrd_app:.*@127\.0\.0\.1:[1-9][0-9]*/wyrd$' "$env_capture"
 up_project="$(awk '/ up / {for(i=1;i<=NF;i++) if($i=="--project-name") print $(i+1)}' "$FAKE_DOCKER_LOG")"

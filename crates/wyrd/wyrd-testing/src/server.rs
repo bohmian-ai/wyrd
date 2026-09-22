@@ -67,6 +67,7 @@ use wyrd_server::config::{
     IssuerEntry, ServeMode, WorkloadBindingEntry,
 };
 use wyrd_server::postgres::ServerPostgres;
+use wyrd_server::query::scheduled::ScheduledQueryCaller;
 use wyrd_server::state::{
     BifrostBuildInputs, BifrostShutdownReport, BifrostTestControls, ComposedBifrost,
     QueryStreamFault, QueryStreamFaultController, ScribeCoordinationRuntime,
@@ -160,6 +161,24 @@ use crate::time::ClockHandle;
 
 /// Dedicated least-privilege role assigned to the test Oracle Service.
 const BIFROST_PEER_ROLE: &str = "bifrost_peer";
+
+/// Retained authorization history: the durable home of every published decision.
+const AUDIT_LOG: &str = "vala.system.audit_log";
+
+/// Bound on every wait for the server-owned audit publisher to make progress.
+const RETAINED_AUDIT_BUDGET: Duration = Duration::from_secs(90);
+
+/// The fixed principal every retained-audit inspection query runs as.
+///
+/// Inspection reads go through the ordinary query entry, so Oracle records a
+/// `bifrost.query.read_decision` for each one exactly as it would for a public
+/// caller. Giving the inspector one stable identity is what lets a retained
+/// count exclude the reads it performed itself, so counting read decisions
+/// does not count the counting.
+const AUDIT_INSPECTION_PRINCIPAL: Uuid = Uuid::from_u128(0x0AD1_7000_0000_0000_0000_0000_0000_0001);
+
+/// The retained read-decision operation every Bifrost read commits.
+const READ_DECISION: &str = "bifrost.query.read_decision";
 
 /// Default Forge compaction budget a harness node carrying a Forge role names.
 ///
@@ -1543,14 +1562,319 @@ impl WyrdTestServer {
         }
     }
 
+    /// Counts retained audit rows matching one predicate, through the read path.
+    ///
+    /// `vala.audit_staging` is transient: the server's publisher moves a
+    /// tenant's staged rows into retained history every few seconds and deletes
+    /// them, so a test that reads staging to prove a decision *was* recorded
+    /// races that sweep. This reads the durable table instead, fused and strict
+    /// so a row Scribe still holds counts the same as one already in an object.
+    ///
+    /// `predicate` is the `WHERE` fragment naming the exact rows under
+    /// assertion, so one owner serves every shape a journey needs
+    /// (operation/resource/outcome, or a single request's decision). Every
+    /// query additionally excludes [`AUDIT_INSPECTION_PRINCIPAL`], so a count
+    /// of read decisions never counts the inspection reads that produced it.
+    ///
+    /// A tenant that has never published owns no retained table yet, which is an
+    /// honest zero rather than a failure. A strict fused read may also refuse
+    /// with the retryable `QueryVisibilityUnavailable` while publication moves
+    /// the live cut; that yields `None` so a bounded poll retries instead of
+    /// failing early.
+    ///
+    /// # Errors
+    /// Returns the authorization failure or any non-retryable query failure.
+    /// Builds the authorized context every retained-audit inspection runs under.
+    ///
+    /// It is the same context the public query service builds, except that its
+    /// principal is the fixed [`AUDIT_INSPECTION_PRINCIPAL`], which is what lets
+    /// a retained read exclude the decisions inspection itself commits.
+    ///
+    /// # Errors
+    /// Returns the tenant invariant error when the principal and tenant disagree.
+    fn audit_inspection_context(
+        &self,
+        tenant: DataTenantId,
+    ) -> Result<vala_bifrost_redux::oracle::AuthorizedQueryContext, WyrdTestServerError> {
+        let permission = Permission::bifrost_query_read();
+        let principal = wyrd_runtime::Principal::new(
+            PrincipalId::new(AUDIT_INSPECTION_PRINCIPAL),
+            wyrd_runtime::PrincipalKind::User,
+            tenant,
+            Vec::new(),
+            wyrd_runtime::permission::PermissionSet::from_iter([permission.clone()]),
+        );
+        vala_bifrost_redux::oracle::AuthorizedQueryContext::try_new(
+            principal,
+            tenant,
+            wyrd_spec::request_id::RequestId::now_v7(),
+            None,
+            wyrd_spec::vala::api::AuthMethod::Internal,
+            permission,
+        )
+        .map_err(|error| WyrdTestServerError::Audit(error.to_string()))
+    }
+
+    /// Reads retained audit rows, every selected column projected as text.
+    ///
+    /// `projection` is the `SELECT` list and must cast each column to text, so
+    /// one decoder serves every assertion shape. Rows come back in the tenant's
+    /// own `seq` order — the order the decisions were made — and the inspector's
+    /// own reads are excluded by principal exactly as they are for a count.
+    ///
+    /// # Errors
+    /// Returns the authorization, query, decode, or stream failure. A tenant
+    /// that has never published owns no retained table yet, which reads as no
+    /// rows rather than a failure.
+    pub async fn retained_audit_records(
+        &self,
+        tenant: DataTenantId,
+        projection: &str,
+        predicate: &str,
+    ) -> Result<Vec<Vec<Option<String>>>, WyrdTestServerError> {
+        use arrow::array::Array as _;
+        use futures_util::StreamExt as _;
+        use vala_bifrost_redux::oracle::QueryIpcDecoder;
+        use wyrd_spec::vala::api::QueryStreamFrame;
+        use wyrd_spec::vala::error::BifrostError;
+
+        let audit = |error: &dyn std::fmt::Display| WyrdTestServerError::Audit(error.to_string());
+        let context = self.audit_inspection_context(tenant)?;
+        let stream = self
+            .inner
+            .state
+            .bifrost
+            .query_sql(
+                context,
+                wyrd_spec::vala::api::BifrostQueryRequest {
+                    sql: format!(
+                        "SELECT {projection} FROM {AUDIT_LOG} WHERE ({predicate}) \
+                         AND audit_principal_id <> '{AUDIT_INSPECTION_PRINCIPAL}' \
+                         ORDER BY seq"
+                    ),
+                    visibility: wyrd_spec::vala::api::VisibilityMode::Fused,
+                    freshness: wyrd_spec::vala::api::FreshnessPolicy::Strict,
+                    deadline_ms: Some(60_000),
+                },
+            )
+            .await;
+        let mut stream = match stream {
+            Ok(stream) => stream,
+            Err(BifrostError::TableNotFound { .. }) => return Ok(Vec::new()),
+            Err(error) => return Err(audit(&error)),
+        };
+        let mut decoder = QueryIpcDecoder::new();
+        let mut records = Vec::new();
+        while let Some(frame) = stream.frames.next().await {
+            match frame.map_err(|error| audit(&error))? {
+                QueryStreamFrame::Schema(schema) => {
+                    decoder
+                        .accept_schema(&schema.arrow_ipc_schema)
+                        .map_err(|error| audit(&error))?;
+                }
+                QueryStreamFrame::Batch(batch) => {
+                    let batch = decoder
+                        .accept_batch(&batch.arrow_ipc_batch)
+                        .map_err(|error| audit(&error))?;
+                    let columns: Vec<_> = batch
+                        .columns()
+                        .iter()
+                        .map(|column| {
+                            column
+                                .as_any()
+                                .downcast_ref::<arrow::array::StringArray>()
+                                .ok_or_else(|| {
+                                    WyrdTestServerError::Audit(
+                                        "retained audit projection is not text".to_owned(),
+                                    )
+                                })
+                        })
+                        .collect::<Result<_, _>>()?;
+                    for index in 0..batch.num_rows() {
+                        records.push(
+                            columns
+                                .iter()
+                                .map(|column| {
+                                    column
+                                        .is_valid(index)
+                                        .then(|| column.value(index).to_owned())
+                                })
+                                .collect(),
+                        );
+                    }
+                }
+                QueryStreamFrame::Terminal(_) => {}
+            }
+        }
+        Ok(records)
+    }
+
+    async fn retained_audit_rows(
+        &self,
+        tenant: DataTenantId,
+        predicate: &str,
+    ) -> Result<Option<u64>, WyrdTestServerError> {
+        use wyrd_spec::error::WyrdError;
+        use wyrd_spec::vala::error::BifrostError;
+
+        let context = self.audit_inspection_context(tenant)?;
+        let outcome =
+            ScheduledQueryCaller::new(self.inner.state.clone(), context, CancellationToken::new())
+                .run(wyrd_spec::vala::api::BifrostQueryRequest {
+                    sql: format!(
+                        "SELECT seq FROM {AUDIT_LOG} WHERE ({predicate}) \
+                 AND audit_principal_id <> '{AUDIT_INSPECTION_PRINCIPAL}'"
+                    ),
+                    visibility: wyrd_spec::vala::api::VisibilityMode::Fused,
+                    freshness: wyrd_spec::vala::api::FreshnessPolicy::Strict,
+                    deadline_ms: Some(60_000),
+                })
+                .await;
+        match outcome {
+            Ok(outcome) => Ok(Some(outcome.rows)),
+            Err(WyrdError::Vala {
+                error: BifrostError::TableNotFound { .. },
+            }) => Ok(Some(0)),
+            Err(WyrdError::Vala {
+                error: BifrostError::QueryVisibilityUnavailable,
+            }) => Ok(None),
+            Err(error) => Err(WyrdTestServerError::Audit(error.to_string())),
+        }
+    }
+
+    /// Waits until retained history holds exactly `expected` rows for `predicate`.
+    ///
+    /// Publication is a server-owned background move, so a read taken
+    /// immediately after a decision can honestly precede it. This polls the
+    /// durable read rather than sleeping past the publisher, and on timeout
+    /// fails naming the count it last observed.
+    ///
+    /// # Errors
+    /// Returns the query failure, or a timeout naming the last observed count.
+    pub async fn await_retained_audit_count(
+        &self,
+        tenant: DataTenantId,
+        predicate: &str,
+        expected: u64,
+    ) -> Result<(), WyrdTestServerError> {
+        let deadline = std::time::Instant::now() + RETAINED_AUDIT_BUDGET;
+        loop {
+            let observed = self.retained_audit_rows(tenant, predicate).await?;
+            if observed == Some(expected) {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(WyrdTestServerError::Audit(format!(
+                    "retained `{predicate}` was observed {observed:?} times within \
+                     {RETAINED_AUDIT_BUDGET:?} (None: visibility unavailable), expected {expected}"
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Counts retained rows for `predicate`, retrying only a transient refusal.
+    ///
+    /// # Errors
+    /// Returns the query failure, or a timeout when strict fused visibility
+    /// stays unavailable for the whole budget.
+    async fn retained_audit_count(
+        &self,
+        tenant: DataTenantId,
+        predicate: &str,
+    ) -> Result<i64, WyrdTestServerError> {
+        let deadline = std::time::Instant::now() + RETAINED_AUDIT_BUDGET;
+        loop {
+            if let Some(count) = self.retained_audit_rows(tenant, predicate).await? {
+                return i64::try_from(count).map_err(|error| {
+                    WyrdTestServerError::Audit(format!("retained count does not fit: {error}"))
+                });
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(WyrdTestServerError::Audit(format!(
+                    "retained `{predicate}` stayed visibility-unavailable for \
+                     {RETAINED_AUDIT_BUDGET:?}"
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Waits until this tenant owes retained history nothing.
+    ///
+    /// This is synchronization, never an assertion source: it settles the
+    /// server-owned publisher so a following retained-history read sees every
+    /// decision committed so far. Oracle's read-decision commits are tracked
+    /// tasks that land in staging slightly after the query returns, so those
+    /// are drained first; the chain head then reports the publisher's own
+    /// progress as `published_seq` catching up to `last_seq`. A tenant with no
+    /// chain-head row has appended nothing and owes nothing.
+    ///
+    /// # Errors
+    /// Returns the Postgres failure, or a timeout naming the tenant and the
+    /// sequence pair it last observed.
+    pub async fn await_audit_published(
+        &self,
+        tenant: DataTenantId,
+    ) -> Result<(), WyrdTestServerError> {
+        if self.oracle_runtime_inspection().is_ok() {
+            let pending = self.wait_oracle_audit_staged(RETAINED_AUDIT_BUDGET).await?;
+            if pending != 0 {
+                return Err(WyrdTestServerError::Audit(format!(
+                    "read-audit commits did not finish: {pending} pending after \
+                     {RETAINED_AUDIT_BUDGET:?}"
+                )));
+            }
+        }
+        let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
+        let deadline = std::time::Instant::now() + RETAINED_AUDIT_BUDGET;
+        loop {
+            let head = sqlx::query_as::<_, (i64, i64)>(
+                "SELECT last_seq, published_seq FROM vala.audit_chain_head \
+                 WHERE data_tenant_id = $1",
+            )
+            .bind(tenant.as_uuid())
+            .fetch_optional(&pool)
+            .await
+            .map_err(sql)?
+            .unwrap_or((0, 0));
+            if head.0 == head.1 {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(WyrdTestServerError::Audit(format!(
+                    "tenant {tenant} published {} of {} audit rows within \
+                     {RETAINED_AUDIT_BUDGET:?}",
+                    head.1, head.0
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Counts retained audit rows whose operation matches one `LIKE` pattern.
+    ///
+    /// Callers that already settled publication use this to assert on an
+    /// operation family (`bifrost.query.stage%`) as well as an exact name.
+    ///
+    /// # Errors
+    /// Returns the retained-history query failure.
+    pub async fn retained_audit_operation_count(
+        &self,
+        tenant: DataTenantId,
+        operation: &str,
+    ) -> Result<i64, WyrdTestServerError> {
+        self.retained_audit_count(tenant, &format!("operation LIKE '{operation}'"))
+            .await
+    }
+
     /// Count Bifrost read-decision audit rows for the fixture tenant.
     ///
     /// Agent-surface denial journeys use this test-only probe to prove Gate
     /// rejection occurs before Oracle planning or durable read accounting.
     ///
     /// # Errors
-    /// Returns an error when the fixture's superuser pool cannot be acquired
-    /// or the tenant-scoped audit query fails.
+    /// Returns the publication or retained-history failure.
     pub async fn bifrost_read_decision_count(&self) -> Result<i64, WyrdTestServerError> {
         self.bifrost_read_decision_count_for_tenant(self.data_tenant_id())
             .await
@@ -1558,65 +1882,36 @@ impl WyrdTestServer {
 
     /// Count tenant-bound Bifrost read-decision audit rows.
     ///
+    /// The count comes from retained history after the publication barrier, so
+    /// it is cumulative: unlike transient staging, a published row stays
+    /// counted and a before/after pair measures the reads between them.
+    ///
     /// # Errors
-    /// Returns an error when the fixture's superuser pool cannot be acquired
-    /// or the tenant-scoped audit query fails.
+    /// Returns the publication or retained-history failure.
     pub async fn bifrost_read_decision_count_for_tenant(
         &self,
         tenant: DataTenantId,
     ) -> Result<i64, WyrdTestServerError> {
-        let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
-        let count = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM vala.audit_staging WHERE data_tenant_id = $1 AND operation = 'bifrost.query.read_decision'",
-        )
-        .bind(tenant.as_uuid())
-        .fetch_one(&pool)
-        .await
-        .map_err(sql)?;
-        Ok(count)
+        self.await_audit_published(tenant).await?;
+        self.retained_audit_count(tenant, &format!("operation = '{READ_DECISION}'"))
+            .await
     }
 
     /// Count the exact tenant-bound read-decision audit row for one request ID.
     ///
     /// # Errors
-    /// Returns an error when the fixture's superuser pool cannot be acquired
-    /// or the request-scoped audit query fails.
+    /// Returns the publication or retained-history failure.
     pub async fn bifrost_read_decision_for_request(
         &self,
         tenant: DataTenantId,
         request_id: &str,
     ) -> Result<i64, WyrdTestServerError> {
-        let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
-        sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM vala.audit_staging WHERE data_tenant_id = $1 AND request_id = $2 AND operation = 'bifrost.query.read_decision'",
+        self.await_audit_published(tenant).await?;
+        self.retained_audit_count(
+            tenant,
+            &format!("operation = '{READ_DECISION}' AND request_id = '{request_id}'"),
         )
-        .bind(tenant.as_uuid())
-        .bind(request_id)
-        .fetch_one(&pool)
         .await
-        .map_err(sql)
-    }
-
-    /// Return the newest tenant-bound Bifrost read-decision request ID.
-    ///
-    /// Callers bracket one serialized public query with the tenant count, then
-    /// use this read-only probe to join that exact newly committed audit row.
-    ///
-    /// # Errors
-    /// Returns an error when the fixture's superuser pool cannot be acquired
-    /// or the tenant-scoped audit query fails.
-    pub async fn latest_bifrost_read_decision_request_id(
-        &self,
-        tenant: DataTenantId,
-    ) -> Result<Option<String>, WyrdTestServerError> {
-        let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
-        sqlx::query_scalar::<_, String>(
-            "SELECT request_id FROM vala.audit_staging WHERE data_tenant_id = $1 AND operation = 'bifrost.query.read_decision' ORDER BY seq DESC LIMIT 1",
-        )
-        .bind(tenant.as_uuid())
-        .fetch_optional(&pool)
-        .await
-        .map_err(sql)
     }
 
     /// Return every claim this pod's Scribe has published, in commit order.

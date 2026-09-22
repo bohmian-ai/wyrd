@@ -454,10 +454,6 @@ pub struct OracleInspection {
     pub memberships: Vec<OracleMembershipInspection>,
     /// Live-tail fences retained across every Scribe process.
     pub active_tail_fences: u64,
-    /// Number of durable audit rows observed across tenants.
-    pub audit_rows: u64,
-    /// Durable Oracle read-decision audit rows observed across tenants.
-    pub read_audit_rows: u64,
     /// Active local Oracle queries across running pods.
     pub active_queries: u64,
     /// Queued local Oracle queries across running pods.
@@ -1897,16 +1893,6 @@ impl WyrdTestCluster {
                 })
             })
             .collect::<Result<Vec<_>, ClusterError>>()?;
-        let audit_rows: i64 = sqlx::query_scalar("SELECT COUNT(*)::bigint FROM vala.audit_staging")
-            .fetch_one(pool)
-            .await
-            .map_err(|error| ClusterError::Resource(error.to_string()))?;
-        let read_audit_rows: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)::bigint FROM vala.audit_staging WHERE operation = 'bifrost.query.read_decision'",
-        )
-        .fetch_one(pool)
-        .await
-        .map_err(|error| ClusterError::Resource(error.to_string()))?;
         let (
             forge_active_claims,
             forge_active_attempts,
@@ -1968,10 +1954,6 @@ impl WyrdTestCluster {
         Ok(OracleInspection {
             memberships,
             active_tail_fences,
-            audit_rows: u64::try_from(audit_rows)
-                .map_err(|error| ClusterError::Resource(error.to_string()))?,
-            read_audit_rows: u64::try_from(read_audit_rows)
-                .map_err(|error| ClusterError::Resource(error.to_string()))?,
             active_queries: runtime.active_queries,
             queued_queries: runtime.queued_queries,
             reserved_memory_bytes: runtime.reserved_memory_bytes,
@@ -2209,24 +2191,6 @@ impl WyrdTestCluster {
     /// reclaim has cleared the durable ownership columns.
     pub fn retain_panic_attempt_for_test(&mut self, task_id: uuid::Uuid, attempt_id: uuid::Uuid) {
         self.reclaimed_panic_attempts.insert(task_id, attempt_id);
-    }
-
-    /// Return the canonical audit-staging row count for panic-clock assertions.
-    ///
-    /// # Errors
-    ///
-    /// Returns a fixture or SQL error when the privileged assertion connection
-    /// cannot read canonical staging.
-    pub async fn audit_staging_count_for_test(&self) -> Result<i64, ClusterError> {
-        let pool = self
-            .fixture
-            .superuser_pool()
-            .await
-            .map_err(|error| ClusterError::Resource(error.to_string()))?;
-        sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging")
-            .fetch_one(&pool)
-            .await
-            .map_err(|error| ClusterError::Resource(error.to_string()))
     }
 
     /// Reclaim expired Forge attempts through production and retain their exact evidence.

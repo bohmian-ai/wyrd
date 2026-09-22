@@ -81,6 +81,9 @@ tempfile = { workspace = true }
 
 [dev-dependencies]
 workspace-hack.workspace = true
+# The test-only features are owned here, not by a lane's `--features` string, so
+# every lane that builds this crate's tests compiles the same suite.
+vala-bifrost-redux = { path = ".", features = ["test-support", "bench-support"] }
 # `time` and `test-util` are test-only: the publication retry schedule is proved
 # with paused time rather than a clock abstraction the production path would
 # then have to carry.

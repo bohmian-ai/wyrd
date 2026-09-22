@@ -61,7 +61,6 @@ export WYRD_DATABASE_MIGRATOR_PASSWORD="$migrator_password"
 export WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD="$platform_admin_password"
 export WYRD_DATABASE_CATALOG_APP_PASSWORD="$catalog_app_password"
 export WYRD_MIGRATOR_DSN="$DATABASE_URL"
-export BIFROST_TEST_DB_URL="$DATABASE_URL"
 
 # Journey and e2e lanes boot one WyrdTestServer per test, each retaining an
 # app pool sized for a production server (PoolConfig::app_defaults, 32). A test

@@ -32,8 +32,9 @@ mod pg_tests {
 
     /// Builds one valid, already-eligible enqueue request with caller-selected identity.
     ///
-    /// The one-second margin keeps host and container clocks from making an
-    /// immediate claim nondeterministically observe a future `ready_at`.
+    /// `ready_at` is left to the database clock, the only clock the fair claim
+    /// compares it against, so an immediate claim never observes a future
+    /// `ready_at` because this process' clock leads Postgres'.
     ///
     /// # Panics
     /// Panics when the fixed test identity is invalid.
@@ -54,7 +55,7 @@ mod pg_tests {
                 files: 1,
                 bytes: 100,
             },
-            ready_at: Utc::now() - Duration::seconds(1),
+            ready_at: None,
         }
     }
 
@@ -134,10 +135,10 @@ mod pg_tests {
         // return them oldest-first.
         let owner = Uuid::now_v7();
         let mut older = task(tenant, "older", 51);
-        older.ready_at = Utc::now() - Duration::seconds(120);
+        older.ready_at = Some(Utc::now() - Duration::seconds(120));
         let older_id = tasks.enqueue(&older).await.expect("older task");
         let mut newer = task(tenant, "newer", 52);
-        newer.ready_at = Utc::now() - Duration::seconds(1);
+        newer.ready_at = Some(Utc::now() - Duration::seconds(1));
         tasks.enqueue(&newer).await.expect("newer task");
         tasks
             .acquire_scheduler(owner, 30)
@@ -517,12 +518,7 @@ mod pg_tests {
             )
             .await
             .expect("start");
-        assert!(
-            tasks
-                .retry(id, Uuid::now_v7(), owner, Utc::now())
-                .await
-                .is_err()
-        );
+        assert!(tasks.retry(id, Uuid::now_v7(), owner, None).await.is_err());
     }
 
     /// Proves the durable tenant cursor rotates strictly forward across a
@@ -880,7 +876,7 @@ mod pg_tests {
             ForgeTaskTransitionOutcome::Applied
         );
         commit_terminal.commit().await.expect("commit terminal");
-        assert!(tasks.retry(id, attempt, owner, Utc::now()).await.is_err());
+        assert!(tasks.retry(id, attempt, owner, None).await.is_err());
         let mut terminal_replay = TenantConn::acquire(fixture.app_pool(), tenant)
             .await
             .expect("terminal replay");
@@ -3579,7 +3575,7 @@ mod pg_tests {
         // and the cursor survives both the release and the successor claim.
         let (_, attempts_before) = state_and_attempts(&admin, id).await;
         tasks
-            .retry(id, attempt, owner, Utc::now() - Duration::seconds(1))
+            .retry(id, attempt, owner, None)
             .await
             .expect("partial scan release");
         let (state, attempts_after) = state_and_attempts(&admin, id).await;

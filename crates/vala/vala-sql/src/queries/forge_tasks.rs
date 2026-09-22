@@ -344,7 +344,7 @@ impl ForgeTasks {
             }
             task.estimates.validate()?;
             let plan = crate::row_types::forge_tasks::plan_to_value(&task.plan);
-            let committed = sqlx::query("INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,state,ready_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'ready',$12) ON CONFLICT DO NOTHING")
+            let committed = sqlx::query("INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,state,ready_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'ready',COALESCE($12::timestamptz,statement_timestamp())) ON CONFLICT DO NOTHING")
                 .bind(Uuid::now_v7()).bind(task.data_tenant_id.as_uuid()).bind(&task.table_ref.catalog).bind(&task.table_ref.namespace).bind(&task.table_ref.table).bind(task.strategy.as_str()).bind(task.base_snapshot_id).bind(plan).bind(task.plan_hash.as_slice()).bind(i64::from(task.estimates.files)).bind(i64::try_from(task.estimates.bytes).map_err(|_|SqlError::Conflict{detail:"estimated bytes overflow".to_owned()})?).bind(task.ready_at).execute(&mut *tx).await.map_err(SqlError::from)?;
             if committed.rows_affected() == 1 {
                 inserted.push(task.strategy);
@@ -519,7 +519,7 @@ impl ForgeTasks {
         task.estimates.validate()?;
         let plan = crate::row_types::forge_tasks::plan_to_value(&task.plan);
         let task_id = Uuid::now_v7();
-        sqlx::query_scalar(r#"INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,state,ready_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'ready',$12) ON CONFLICT (data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan_hash) DO UPDATE SET updated_at=vala.forge_tasks.updated_at RETURNING task_id"#)
+        sqlx::query_scalar(r#"INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,state,ready_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'ready',COALESCE($12::timestamptz,statement_timestamp())) ON CONFLICT (data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan_hash) DO UPDATE SET updated_at=vala.forge_tasks.updated_at RETURNING task_id"#)
             .bind(task_id).bind(task.data_tenant_id.as_uuid()).bind(&task.table_ref.catalog).bind(&task.table_ref.namespace).bind(&task.table_ref.table).bind(task.strategy.as_str()).bind(task.base_snapshot_id).bind(plan).bind(task.plan_hash.as_slice()).bind(i64::from(task.estimates.files)).bind(i64::try_from(task.estimates.bytes).map_err(|_|SqlError::Conflict{detail:"estimated bytes overflow".to_owned()})?).bind(task.ready_at).fetch_one(self.operator_pool.pool()).await.map_err(SqlError::from)
     }
 
@@ -831,6 +831,11 @@ impl ForgeTasks {
 
     /// Returns an exact Claimed or Running attempt to Retryable with a new eligibility time.
     ///
+    /// `ready_at` is `None` for an immediate release, which Postgres stamps
+    /// from its own clock inside this statement so the released task is
+    /// eligible against the same clock the fair claim gates on. `Some` defers
+    /// the retry to an absolute instant the caller owns.
+    ///
     /// # Errors
     /// Returns conflict for stale task/attempt/owner/state or SQL errors.
     ///
@@ -841,9 +846,9 @@ impl ForgeTasks {
         task_id: Uuid,
         attempt: Uuid,
         owner: Uuid,
-        ready_at: DateTime<Utc>,
+        ready_at: Option<DateTime<Utc>>,
     ) -> Result<(), SqlError> {
-        let changed=sqlx::query("UPDATE vala.forge_tasks SET state='retryable',attempt_id=NULL,claimed_by=NULL,claim_expires_at=NULL,watermark_snapshot_id=NULL,watermark_timestamp_ms=NULL,ready_at=$4,updated_at=statement_timestamp() WHERE task_id=$1 AND state IN ('claimed','running') AND attempt_id=$2 AND claimed_by=$3").bind(task_id).bind(attempt).bind(owner).bind(ready_at).execute(self.operator_pool.pool()).await.map_err(SqlError::from)?.rows_affected();
+        let changed=sqlx::query("UPDATE vala.forge_tasks SET state='retryable',attempt_id=NULL,claimed_by=NULL,claim_expires_at=NULL,watermark_snapshot_id=NULL,watermark_timestamp_ms=NULL,ready_at=COALESCE($4::timestamptz,statement_timestamp()),updated_at=statement_timestamp() WHERE task_id=$1 AND state IN ('claimed','running') AND attempt_id=$2 AND claimed_by=$3").bind(task_id).bind(attempt).bind(owner).bind(ready_at).execute(self.operator_pool.pool()).await.map_err(SqlError::from)?.rows_affected();
         exact_one(changed, "retry")
     }
 

@@ -121,29 +121,88 @@ mod pg_tests {
         Bifrost::with_sink(&client, Some(table(fqn)), sink, config)
     }
 
-    /// Returns durable lifecycle audit facts for one tenant and operation in sequence order.
+    /// The retained resource name one lifecycle decision is recorded against.
+    fn lifecycle_resource(id: &RequestId) -> String {
+        format!("vala.query.lifecycle/{id}")
+    }
+
+    /// Asserts retained history holds exactly these lifecycle decisions.
+    ///
+    /// `vala.audit_staging` is transient delivery state: the server's publisher
+    /// moves a tenant's staged rows into `vala.system.audit_log` every few
+    /// seconds and deletes them, so a journey that reads staging to prove a
+    /// decision was recorded races that sweep. Each distinct resource/outcome
+    /// pair is counted exactly, and the operation's own total is counted too so
+    /// an unexpected extra row cannot hide behind matching pairs.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a count does not converge within the harness budget.
+    async fn assert_lifecycle_audit(
+        srv: &WyrdTestServer,
+        tenant: DataTenantId,
+        operation: &str,
+        expected: &[(String, String)],
+    ) {
+        // The operation's total is the one count that has to wait for the
+        // publisher. Once it converges every row for this operation is retained,
+        // so each pair is a single settled read rather than its own poll.
+        srv.await_retained_audit_count(
+            tenant,
+            &format!("operation = '{operation}'"),
+            expected.len() as u64,
+        )
+        .await
+        .expect("retained lifecycle decision total");
+        let mut pairs: std::collections::BTreeMap<&(String, String), u64> =
+            std::collections::BTreeMap::new();
+        for pair in expected {
+            *pairs.entry(pair).or_default() += 1;
+        }
+        for ((resource, outcome), count) in pairs {
+            srv.await_retained_audit_count(
+                tenant,
+                &format!(
+                    "operation = '{operation}' AND resource = '{resource}' \
+                     AND outcome = '{outcome}'"
+                ),
+                count,
+            )
+            .await
+            .expect("retained lifecycle decision");
+        }
+    }
+
+    /// Counts transient staged rows for one exact operation and resource.
+    ///
+    /// Staging is the only place that can prove a *refused* append left nothing
+    /// behind: a row that was never staged is never published either, so the
+    /// assertion reads the transient table directly and names the exact
+    /// operation and resource so unrelated staging cannot affect it.
     ///
     /// # Panics
     ///
     /// Panics when the tenant connection, audit query, or read transaction fails.
-    async fn lifecycle_audit_rows(
+    async fn staged_audit_count(
         srv: &WyrdTestServer,
         tenant: DataTenantId,
         operation: &str,
-    ) -> Vec<(String, String)> {
+        resource: &str,
+    ) -> i64 {
         let mut conn = srv
             .tenant_conn_for(tenant)
             .await
             .expect("tenant lifecycle audit connection");
-        let rows = sqlx::query_as(
-            "SELECT resource, outcome FROM vala.audit_staging WHERE operation = $1 ORDER BY seq",
+        let count = sqlx::query_scalar(
+            "SELECT count(*) FROM vala.audit_staging WHERE operation = $1 AND resource = $2",
         )
         .bind(operation)
-        .fetch_all(&mut **conn.transaction())
+        .bind(resource)
+        .fetch_one(&mut **conn.transaction())
         .await
-        .expect("read lifecycle audit rows");
+        .expect("read staged lifecycle audit rows");
         conn.commit().await.expect("commit lifecycle audit read");
-        rows
+        count
     }
 
     /// Adds one Wyrd access token to a typed public gRPC request.
@@ -368,10 +427,16 @@ mod pg_tests {
             .await
             .expect("query remains active after audit fault");
         assert!(!after_failed_audit.cancellation_requested);
-        assert!(
-            lifecycle_audit_rows(&srv, srv.data_tenant_id(), "vala.query.running.cancel")
-                .await
-                .is_empty()
+        assert_eq!(
+            staged_audit_count(
+                &srv,
+                srv.data_tenant_id(),
+                "vala.query.running.cancel",
+                &lifecycle_resource(&request_id),
+            )
+            .await,
+            0,
+            "a refused cancellation audit stages no transient row"
         );
         assert!(
             query
@@ -387,28 +452,39 @@ mod pg_tests {
                 .expect("idempotent cancel")
                 .cancellation_started
         );
-        let lifecycle = |id: &RequestId| format!("vala.query.lifecycle/{id}");
-        let allowed = |id: &RequestId| (lifecycle(id), "allowed".to_owned());
-        assert_eq!(
-            lifecycle_audit_rows(&srv, srv.data_tenant_id(), "vala.query.running.cancel").await,
-            vec![allowed(&request_id), allowed(&request_id)]
-        );
-        assert_eq!(
-            lifecycle_audit_rows(&srv, other_tenant, "vala.query.running.cancel").await,
-            vec![allowed(&request_id), allowed(&unknown_id)]
-        );
-        assert_eq!(
-            lifecycle_audit_rows(&srv, other_tenant, "vala.query.running.get").await,
-            vec![
+        let allowed = |id: &RequestId| (lifecycle_resource(id), "allowed".to_owned());
+        assert_lifecycle_audit(
+            &srv,
+            srv.data_tenant_id(),
+            "vala.query.running.cancel",
+            &[allowed(&request_id), allowed(&request_id)],
+        )
+        .await;
+        assert_lifecycle_audit(
+            &srv,
+            other_tenant,
+            "vala.query.running.cancel",
+            &[allowed(&request_id), allowed(&unknown_id)],
+        )
+        .await;
+        assert_lifecycle_audit(
+            &srv,
+            other_tenant,
+            "vala.query.running.get",
+            &[
                 allowed(&request_id),
                 allowed(&unknown_id),
-                (lifecycle(&request_id), "denied".to_owned()),
-            ]
-        );
-        assert_eq!(
-            lifecycle_audit_rows(&srv, srv.data_tenant_id(), "vala.query.running.get").await,
-            vec![allowed(&request_id)]
-        );
+                (lifecycle_resource(&request_id), "denied".to_owned()),
+            ],
+        )
+        .await;
+        assert_lifecycle_audit(
+            &srv,
+            srv.data_tenant_id(),
+            "vala.query.running.get",
+            &[allowed(&request_id)],
+        )
+        .await;
 
         task.abort();
         let _ = task.await;
@@ -528,18 +604,11 @@ mod pg_tests {
             .expect("gRPC idempotent cancel")
             .into_inner();
         assert!(!second.cancellation_started);
-        assert_eq!(
-            lifecycle_audit_rows(&srv, srv.data_tenant_id(), "vala.query.running.cancel")
+        for tenant in [srv.data_tenant_id(), other_tenant] {
+            srv.await_retained_audit_count(tenant, "operation = 'vala.query.running.cancel'", 2)
                 .await
-                .len(),
-            2,
-        );
-        assert_eq!(
-            lifecycle_audit_rows(&srv, other_tenant, "vala.query.running.cancel")
-                .await
-                .len(),
-            2,
-        );
+                .expect("retained gRPC cancellation decisions");
+        }
 
         task.abort();
         let _ = task.await;

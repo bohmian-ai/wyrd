@@ -12,8 +12,10 @@ env:
   MISE_LOCKED: "true"
 
 jobs:
-  # gate plus the real-server journeys it does not reach. gate already covers
-  # the storage emulator matrix; live cloud and performance run elsewhere.
+  # gate plus the lanes it does not reach. gate already covers the storage
+  # emulator matrix, the real-server journeys, the Python and TypeScript
+  # integration suites, and the identity journey; live cloud and performance
+  # run elsewhere.
   gate:
     name: nightly ${{ matrix.task }}
     runs-on: ubuntu-24.04
@@ -23,12 +25,7 @@ jobs:
       matrix:
         task:
           - gate
-          - test:cards:integration
-          - test:cli:journey
-          - test:wyrdstate:journey
           - py:test:testing
-          - py:test:integration
-          - ts:test:integration
     steps:
       - uses: actions/checkout@v4
 
@@ -69,20 +66,6 @@ jobs:
 
       - name: Run ${{ matrix.task }}
         run: mise run ${{ matrix.task }}
-
-  identity:
-    name: identity journey
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: ./.github/actions/setup-rust-ci
-        with:
-          docker-images: "false"
-
-      - name: Run identity journey
-        run: mise run test:identity:journey
 
   postgres:
     name: isolated Postgres checks

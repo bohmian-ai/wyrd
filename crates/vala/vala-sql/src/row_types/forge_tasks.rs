@@ -1553,8 +1553,16 @@ pub struct NewForgeTask {
     pub plan_hash: [u8; 32],
     /// Positive admission estimates.
     pub estimates: ForgeTaskEstimates,
-    /// First eligible claim time.
-    pub ready_at: DateTime<Utc>,
+    /// First eligible claim time, or `None` to defer to the database clock.
+    ///
+    /// The fair claim gates on `ready_at <= statement_timestamp()`, so this
+    /// deadline is only meaningful on the database's clock. An application
+    /// clock running ahead of the database would make a freshly planned task
+    /// unclaimable for the skew window, and one running behind would release
+    /// it early. `None` therefore means "eligible now" and is stamped by
+    /// Postgres inside the inserting statement; `Some` is reserved for a
+    /// deliberate deferral whose absolute instant the caller owns.
+    pub ready_at: Option<DateTime<Utc>>,
 }
 
 /// One fully validated durable Forge task.

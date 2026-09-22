@@ -44,6 +44,27 @@ pub struct PromotableHotFileRow {
     pub promotion_record: serde_json::Value,
 }
 
+/// Durable settlement state of one exact planned hot object.
+///
+/// Returned only by [`HotFileCatalog::planned_settlement`], whose caller asks
+/// about identities it planned rather than about the current promotable set.
+/// `committed_snapshot_id` and `forge_publication_operation_id` are the two
+/// halves of the catalog-to-SQL settlement window: both present means the
+/// group provably landed in that snapshot under that operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedHotFileRow {
+    /// Durable file-list identity this state describes.
+    pub id: uuid::Uuid,
+    /// Canonical object-store path of the planned hot object.
+    pub file_path: String,
+    /// Snapshot that settled this row, when a promotion already committed it.
+    pub committed_snapshot_id: Option<i64>,
+    /// Forge publication operation that settled this row, when one did.
+    pub forge_publication_operation_id: Option<uuid::Uuid>,
+    /// Whether the row has left the hot scan set.
+    pub compacted: bool,
+}
+
 /// Classifies one row against the pinned publication cut.
 fn is_unresolved_hot(
     row: &HotFileRow,
@@ -172,6 +193,63 @@ impl HotFileCatalog {
                 },
             )
             .collect()
+    }
+
+    /// Reads the durable settlement state of an exact set of planned hot rows.
+    ///
+    /// Promotion planning records the precise `file_list` identities one task
+    /// will promote. Between planning and execution another task can commit the
+    /// same group, which settles those rows and removes them from the
+    /// promotable projection. A worker therefore needs the state of *its own*
+    /// planned identities rather than whatever is promotable now: a row that is
+    /// settled is evidence the group already landed, while a row that vanished
+    /// without settlement is evidence of loss. Rows absent from the result no
+    /// longer exist and are the caller's signal for the latter.
+    ///
+    /// The projection is intentionally the settlement triple plus identity; it
+    /// carries no evidence a caller could mistake for a promotable group.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError::Query`] when the RLS-bound read fails.
+    pub async fn planned_settlement(
+        &self,
+        conn: &mut TenantConn<'_>,
+        file_ids: &[uuid::Uuid],
+    ) -> Result<Vec<PlannedHotFileRow>, SqlError> {
+        // raw-query grep allowlist: this tenant-scoped file-list read post-dates the sqlx offline cache; run `mise run sqlx:prepare` to promote it to a macro. It remains bound to `TenantConn` and `wyrd.current_tenant()` and introduces no tenant-boundary exception.
+        let rows: Vec<(uuid::Uuid, String, Option<i64>, Option<uuid::Uuid>, bool)> =
+            sqlx::query_as(
+                r#"
+            SELECT id, file_path, committed_snapshot_id, forge_publication_operation_id, compacted
+              FROM vala.file_list
+             WHERE data_tenant_id = wyrd.current_tenant()
+               AND namespace = $1
+               AND table_name = $2
+               AND id = ANY($3)
+             ORDER BY created_at, file_ordinal, id
+            "#,
+            )
+            .bind(&self.namespace)
+            .bind(&self.table_name)
+            .bind(file_ids)
+            .fetch_all(&mut **conn.transaction())
+            .await
+            .map_err(SqlError::from)?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(id, file_path, committed_snapshot_id, forge_publication_operation_id, compacted)| {
+                    PlannedHotFileRow {
+                        id,
+                        file_path,
+                        committed_snapshot_id,
+                        forge_publication_operation_id,
+                        compacted,
+                    }
+                },
+            )
+            .collect())
     }
 
     /// Records that one committed promotion snapshot now represents these rows.

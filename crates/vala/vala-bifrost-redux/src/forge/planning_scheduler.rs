@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use chrono::Utc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vala_sql::SqlError;
@@ -820,6 +819,7 @@ impl<'forge> ForgeScheduler<'forge> {
             &mut conn,
             binding,
             super::scribe_promotion::PROMOTION_BRANCH,
+            None,
         )
         .await?;
         conn.commit().await.map_err(ForgeError::Sql)?;
@@ -1150,7 +1150,7 @@ impl<'forge> ForgeScheduler<'forge> {
                 plan: task.plan,
                 plan_hash: task.plan_hash,
                 estimates: task.estimates,
-                ready_at: Utc::now(),
+                ready_at: None,
             });
         }
         // Orphan cleanup is deliberately last. It reclaims objects no metadata
@@ -1254,7 +1254,7 @@ impl<'forge> ForgeScheduler<'forge> {
             plan,
             plan_hash,
             estimates: ForgeTaskEstimates { files: 1, bytes: 1 },
-            ready_at: Utc::now(),
+            ready_at: None,
         })
     }
 
@@ -1428,7 +1428,7 @@ pub(super) fn cleanup_projection(
         plan,
         plan_hash,
         estimates: ForgeTaskEstimates { files, bytes },
-        ready_at: Utc::now(),
+        ready_at: None,
     })
 }
 

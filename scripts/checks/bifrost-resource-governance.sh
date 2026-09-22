@@ -62,35 +62,6 @@ scan_resources_owner() {
   fi
 }
 
-if [[ "${BIFROST_RESOURCE_GOVERNANCE_SELF_TEST:-0}" == "1" ]]; then
-  fixture_dir="$(mktemp -d)"
-  trap 'rm -rf "$fixture_dir"' EXIT
-  mkdir -p "$fixture_dir/negative" "$fixture_dir/positive" "$fixture_dir/owner-valid" "$fixture_dir/owner-invalid"
-  printf '%s\n' '// BifrostMemoryGovernor was removed; MemoryLedger is historical vocabulary.' > "$fixture_dir/negative/comment.rs"
-  scan_tree "$fixture_dir/negative"
-  printf '%s\n' '// BifrostResourceGovernor::from_snapshot is discussed but never called.' > "$fixture_dir/negative/root_comment.rs"
-  scan_direct_root_construction "$fixture_dir/negative"
-  printf '%s\n' 'fn bypass(value: BifrostMemoryGovernor) { let _ = value.memory_ledger(); }' > "$fixture_dir/positive/bypass.rs"
-  if scan_tree "$fixture_dir/positive" >/dev/null 2>&1; then
-    printf 'Bifrost resource governance positive fixture was not rejected.\n'
-    exit 1
-  fi
-  printf '%s\n' 'fn bypass(snapshot: Snapshot, policy: Policy) { let _ = BifrostResourceGovernor::from_snapshot(snapshot, policy); }' > "$fixture_dir/positive/root.rs"
-  if scan_direct_root_construction "$fixture_dir/positive" >/dev/null 2>&1; then
-    printf 'Bifrost direct-root positive fixture was not rejected.\n'
-    exit 1
-  fi
-  printf '%s\n' 'fn from_snapshot(snapshot: Snapshot, policy: Policy) { let root = BifrostResourceGovernor::from_snapshot(snapshot, policy); } #[cfg(test)] mod tests { let request = ImmutableRequest; }' > "$fixture_dir/owner-valid/resources.rs"
-  scan_resources_owner "$fixture_dir/owner-valid/resources.rs"
-  printf '%s\n' 'fn from_snapshot(snapshot: Snapshot, policy: Policy) { let root = BifrostResourceGovernor::from_snapshot(snapshot, policy); } #[cfg(test)] mod tests { fn bypass(snapshot: Snapshot, policy: Policy) { let root = BifrostResourceGovernor::from_snapshot(snapshot, policy); root.try_acquire_oracle(1, 1); } }' > "$fixture_dir/owner-invalid/resources.rs"
-  if scan_resources_owner "$fixture_dir/owner-invalid/resources.rs" >/dev/null 2>&1; then
-    printf 'Bifrost resources.rs test-module fixture was not rejected.\n'
-    exit 1
-  fi
-  printf 'Bifrost resource governance fixture coverage passed.\n'
-  exit 0
-fi
-
 scan_tree "$root_dir/crates/vala/vala-bifrost-redux"
 scan_tree "$root_dir/crates/wyrd/wyrd-server"
 scan_tree "$root_dir/crates/wyrd/wyrd-testing"

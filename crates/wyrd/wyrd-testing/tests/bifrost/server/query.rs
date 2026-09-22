@@ -77,66 +77,61 @@ fn journey_delegation_chain() -> Vec<wyrd_runtime::DelegationStep> {
         .collect()
 }
 
-/// Reads the exact committed read-decision detail for one request id.
+/// Reads the retained read-decision detail for one request id.
+///
+/// The decision is read from `vala.system.audit_log` after publication settles,
+/// because the staged row it came from is transient and the publisher is
+/// entitled to have drained it already.
 ///
 /// # Errors
 ///
-/// Returns a SQL or JSON failure, or the absence of the expected audit row.
+/// Returns a query or JSON failure, or the absence of the expected audit row.
 async fn read_decision_detail(
     server: &WyrdTestServer,
     tenant: DataTenantId,
     request_id: &str,
 ) -> Result<serde_json::Value, ServerJourneyError> {
-    let mut conn = server.tenant_conn_for(tenant).await?;
-    let detail: String = sqlx::query_scalar(
-        "SELECT detail FROM vala.audit_staging \
-         WHERE operation = 'bifrost.query.read_decision' AND request_id = $1 \
-         ORDER BY seq DESC LIMIT 1",
-    )
-    .bind(request_id)
-    .fetch_one(&mut **conn.transaction())
-    .await?;
-    conn.commit().await?;
-    Ok(serde_json::from_str(&detail)?)
+    server.await_audit_published(tenant).await?;
+    let records = server
+        .retained_audit_records(
+            tenant,
+            "detail",
+            &format!("operation = 'bifrost.query.read_decision' AND request_id = '{request_id}'"),
+        )
+        .await?;
+    let [record] = records.as_slice() else {
+        return Err(format!("one retained read decision for {request_id}, got {records:?}").into());
+    };
+    let detail = record
+        .first()
+        .and_then(Option::as_deref)
+        .ok_or("the retained read decision carries a detail")?;
+    Ok(serde_json::from_str(detail)?)
 }
-
-/// Bounded budget for in-flight read-audit commits to finish before a count.
-const AUDIT_STAGED_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Bounded budget for every selected role to publish its readiness bit.
 const READINESS_CEILING: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Counts audit rows written under one operation name.
+/// Counts retained audit rows written under one operation name.
 ///
-/// Waits for in-flight Oracle audit commits first so the count reflects every
-/// read decision. A server hosting no Oracle role has none to wait for.
+/// `vala.audit_staging` is transient: the publisher drains it into retained
+/// history every few seconds, so counting staged rows measures the sweep rather
+/// than the journey. The harness settles in-flight Oracle commits and then
+/// publication, and counts `vala.system.audit_log`; its own inspection reads are
+/// excluded there by principal, so counting read decisions never counts itself.
 ///
 /// # Errors
 ///
-/// Returns a failure naming the residual when commits do not finish within
-/// [`AUDIT_STAGED_BUDGET`], or the tenant-connection or SQL error.
+/// Returns the publication-barrier timeout or the retained-history query error.
 async fn audit_rows(
     server: &WyrdTestServer,
     tenant: DataTenantId,
     operation: &str,
 ) -> Result<i64, ServerJourneyError> {
-    if server.oracle_runtime_inspection().is_ok() {
-        let pending = server.wait_oracle_audit_staged(AUDIT_STAGED_BUDGET).await?;
-        if pending != 0 {
-            return Err(format!(
-                "read-audit commits did not finish: {pending} pending after {AUDIT_STAGED_BUDGET:?}"
-            )
-            .into());
-        }
-    }
-    let mut conn = server.tenant_conn_for(tenant).await?;
-    let count: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging WHERE operation LIKE $1")
-            .bind(operation)
-            .fetch_one(&mut **conn.transaction())
-            .await?;
-    conn.commit().await?;
-    Ok(count)
+    server.await_audit_published(tenant).await?;
+    Ok(server
+        .retained_audit_operation_count(tenant, operation)
+        .await?)
 }
 
 /// Real lifecycle controls require terminal proof even when the queried owner is absent.
@@ -1398,16 +1393,25 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
     assert_eq!(values, [2], "only B's own write landed");
 
     audit_rows(&server, tenant, READ_DECISION_OPERATION).await?;
-    let mut conn = server.tenant_conn_for(tenant).await?;
-    let attributed: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT operation, resource, detail FROM vala.audit_staging \
-         WHERE principal_id = $1 AND operation IN ('auth.token.exchange', $2) ORDER BY seq",
-    )
-    .bind(uuid::Uuid::parse_str(&a.id().to_string())?)
-    .bind(READ_DECISION_OPERATION)
-    .fetch_all(&mut **conn.transaction())
-    .await?;
-    conn.commit().await?;
+    let attributed: Vec<(String, String, String)> = server
+        .retained_audit_records(
+            tenant,
+            "operation, resource, detail",
+            &format!(
+                "audit_principal_id = '{}' \
+                 AND operation IN ('auth.token.exchange', '{READ_DECISION_OPERATION}')",
+                a.id()
+            ),
+        )
+        .await?
+        .into_iter()
+        .map(|record| match record.as_slice() {
+            [Some(operation), Some(resource), Some(detail)] => {
+                Ok((operation.clone(), resource.clone(), detail.clone()))
+            }
+            other => Err(format!("attributed decision is incomplete: {other:?}")),
+        })
+        .collect::<Result<_, _>>()?;
     let b_id = b.id().to_string();
     let exchange = attributed
         .iter()
@@ -1435,35 +1439,54 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
             .bind(uuid::Uuid::parse_str(&b_id)?)
             .fetch_one(&mut **conn.transaction())
             .await?;
-    let exchange_row: (String, Option<uuid::Uuid>) = sqlx::query_as(
-        "SELECT permission, credential_id FROM vala.audit_staging \
-         WHERE principal_id = $1 AND operation = 'auth.token.exchange' AND resource = 'bifrost' \
-           AND outcome = 'allowed'",
-    )
-    .bind(uuid::Uuid::parse_str(&a.id().to_string())?)
-    .fetch_one(&mut **conn.transaction())
-    .await?;
-    assert_eq!(
-        exchange_row,
-        ("invoke".to_owned(), Some(b_credential)),
-        "the exchange records the invoke decision and B's credential"
-    );
-    let writes: Vec<(String, uuid::Uuid, Option<String>)> = sqlx::query_as(
-        "SELECT outcome, principal_id, detail FROM vala.audit_staging \
-         WHERE operation = 'bifrost.record.write' ORDER BY seq",
-    )
-    .fetch_all(&mut **conn.transaction())
-    .await?;
     conn.commit().await?;
+    let exchange_rows = server
+        .retained_audit_records(
+            tenant,
+            "permission, credential_id",
+            &format!(
+                "audit_principal_id = '{}' AND operation = 'auth.token.exchange' \
+                 AND resource = 'bifrost' AND outcome = 'allowed'",
+                a.id()
+            ),
+        )
+        .await?;
+    // The journey exchanges A's token more than once, and every allowed exchange
+    // must record the same decision: the `invoke` permission against B's
+    // credential. Asserting the property across all of them stays exact without
+    // depending on how many exchanges the journey happened to make.
+    let expected_exchange = [Some("invoke".to_owned()), Some(b_credential.to_string())];
+    if exchange_rows.is_empty()
+        || !exchange_rows
+            .iter()
+            .all(|row| row.as_slice() == expected_exchange)
+    {
+        return Err(format!(
+            "every allowed exchange records the invoke decision and B's credential, \
+             got {exchange_rows:?}"
+        )
+        .into());
+    }
+    let writes = server
+        .retained_audit_records(
+            tenant,
+            "outcome, audit_principal_id, detail",
+            "operation = 'bifrost.record.write'",
+        )
+        .await?;
     let [
-        (denied, denied_principal, denied_detail),
-        (allowed, allowed_principal, allowed_detail),
-    ] = writes.as_slice()
+        [Some(denied), Some(denied_principal), denied_detail],
+        [Some(allowed), Some(allowed_principal), allowed_detail],
+    ] = writes
+        .iter()
+        .map(Vec::as_slice)
+        .collect::<Vec<_>>()
+        .as_slice()
     else {
         return Err(format!("one refused and one admitted native write, got {writes:?}").into());
     };
     assert_eq!(denied, "denied");
-    assert_eq!(denied_principal.to_string(), a.id().to_string());
+    assert_eq!(*denied_principal, a.id().to_string());
     let denied_detail: serde_json::Value = serde_json::from_str(
         denied_detail
             .as_deref()
@@ -1474,7 +1497,7 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
         "the refused native write names B as actor: {denied_detail}"
     );
     assert_eq!(allowed, "allowed");
-    assert_eq!(allowed_principal.to_string(), b_id);
+    assert_eq!(*allowed_principal, b_id);
     assert!(
         allowed_detail.is_none(),
         "B's direct write carries no delegation attribution: {allowed_detail:?}"
@@ -1484,28 +1507,39 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
     Ok(())
 }
 
-/// Committed `(outcome, permission)` token-exchange decisions recorded under
+/// Retained `(outcome, permission)` token-exchange decisions recorded under
 /// `principal`, oldest first.
+///
+/// Read from retained history rather than staging: these are the decisions the
+/// journey made earlier, and the publisher is entitled to have drained their
+/// staged rows by the time the assertion runs.
 ///
 /// # Errors
 ///
-/// Returns a connection, query, or commit failure.
+/// Returns the publication-barrier or retained-history failure, or a row that
+/// does not carry both columns.
 async fn exchange_decisions(
     server: &WyrdTestServer,
     tenant: DataTenantId,
     principal: &str,
 ) -> Result<Vec<(String, String)>, ServerJourneyError> {
-    let mut conn = server.tenant_conn_for(tenant).await?;
-    let rows = sqlx::query_as(
-        "SELECT outcome, permission FROM vala.audit_staging \
-         WHERE principal_id = $1 AND operation = 'auth.token.exchange' AND resource = 'bifrost' \
-         ORDER BY seq",
-    )
-    .bind(uuid::Uuid::parse_str(principal)?)
-    .fetch_all(&mut **conn.transaction())
-    .await?;
-    conn.commit().await?;
-    Ok(rows)
+    server.await_audit_published(tenant).await?;
+    server
+        .retained_audit_records(
+            tenant,
+            "outcome, permission",
+            &format!(
+                "audit_principal_id = '{principal}' AND operation = 'auth.token.exchange' \
+                 AND resource = 'bifrost'"
+            ),
+        )
+        .await?
+        .into_iter()
+        .map(|record| match record.as_slice() {
+            [Some(outcome), Some(permission)] => Ok((outcome.clone(), permission.clone())),
+            other => Err(format!("exchange decision is incomplete: {other:?}").into()),
+        })
+        .collect()
 }
 
 /// Invoke policy that allows exactly one directed subject/actor relation.

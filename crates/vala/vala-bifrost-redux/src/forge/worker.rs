@@ -46,7 +46,7 @@ use super::metrics::{ForgeTaskResult, ForgeTelemetry};
 use super::orphan_gc::{ExpiredCleanupExemption, GcEligibility, ObjectEvidence};
 use super::path::catalog_path_to_object_key;
 use super::scribe_promotion::{
-    ForgePromotionCommit, ForgePromotionSettlement, ScribePromotionPlan,
+    ForgePromotionCommit, ForgePromotionSettlement, PromotionPlanStatus, ScribePromotionPlan,
 };
 use super::{Forge, ForgeRoleReadiness};
 use crate::catalog::TenantTableBinding;
@@ -3257,9 +3257,9 @@ redacted
     /// # Errors
     ///
     /// Returns [`ForgeError::Sql`] for a genuine database failure (connection,
-    /// pool, or statement error) and [`ForgeError::InvalidConfig`] when the
-    /// release timestamp cannot be read. A benign no-match is not an error and
-    /// returns `Ok(())`.
+    /// pool, or statement error). The release is immediate and Postgres stamps
+    /// its own `ready_at`, so no clock read can fail here. A benign no-match is
+    /// not an error and returns `Ok(())`.
     async fn release_cancelled_claim(
         &self,
         task_id: Uuid,
@@ -3273,12 +3273,7 @@ redacted
                 detail: "injected Forge cancelled claim release failure".to_owned(),
             }));
         }
-        let ready_at = self.forge.core.clock.now()?;
-        match self
-            .tasks
-            .retry(task_id, attempt, self.owner, ready_at)
-            .await
-        {
+        match self.tasks.retry(task_id, attempt, self.owner, None).await {
             // Success releases the claim; a benign `Conflict` means the claim
             // already advanced past the pre-effect guard and stays retained.
             Ok(()) | Err(vala_sql::SqlError::Conflict { .. }) => Ok(()),
@@ -4528,6 +4523,25 @@ redacted
             // The requested effect never ran, so this is a healthy exit that
             // recorded no successful completion.
             return Ok(FencedStart::Superseded);
+        }
+        if matches!(
+            claim.strategy,
+            ForgeClaimStrategy::Known(ForgeTaskStrategy::ScribePromotion)
+        ) {
+            // A promotion plan can be cut between a sibling's Iceberg commit and
+            // its SQL settlement, so a matching base proves nothing about the
+            // planned rows themselves. Asking before Prepared keeps that promise
+            // off a group that already landed.
+            let plan = Self::promotion_plan(claim)?;
+            if self
+                .forge
+                .classify_planned_promotion(binding, &plan, &table)
+                .await?
+                == PromotionPlanStatus::Superseded
+            {
+                self.cancel_superseded(claim).await?;
+                return Ok(FencedStart::Superseded);
+            }
         }
         let watermark = Self::execution_watermark(&table, claim, committed_recovery.as_ref())?;
         self.begin_attempt(claim, attempt, watermark).await?;
@@ -7197,7 +7211,7 @@ impl ForgeWorker {
             // A bounded pass is progress, not a failure: the same task returns
             // to the pool with its position intact and its budget untouched.
             self.tasks
-                .retry(claim.task_id, attempt, self.owner, chrono::Utc::now())
+                .retry(claim.task_id, attempt, self.owner, None)
                 .await
                 .map_err(ForgeError::Sql)?;
         } else {

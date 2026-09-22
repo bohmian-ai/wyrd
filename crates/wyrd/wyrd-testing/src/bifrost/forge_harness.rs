@@ -1502,26 +1502,6 @@ impl ForgeFixture {
         .await
         .expect("Forge fixture live reference");
     }
-
-    /// Count one tenant/table-scoped Forge audit operation.
-    pub async fn operation_count(&self, operation: &str) -> i64 {
-        let mut conn = self
-            .vala
-            .tenant_conn(self.tenant)
-            .await
-            .expect("Forge fixture audit tenant connection");
-        sqlx::query_scalar(
-            "SELECT count(*) FROM vala.audit_staging WHERE data_tenant_id = wyrd.current_tenant() AND resource = $1 AND operation = $2",
-        )
-        .bind(format!(
-            "bifrost://{}/{}/{}",
-            self.tenant, self.binding.logical_namespace, self.binding.table_name
-        ))
-        .bind(operation)
-        .fetch_one(&mut **conn.transaction())
-        .await
-        .expect("Forge fixture audit count")
-    }
 }
 
 /// Return whether a fixture-owned spill directory contains no files.

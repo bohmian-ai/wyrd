@@ -1728,3 +1728,143 @@ async fn worker_prepared_fatal_closes_before_release_and_observation() {
         "Prepared fatal: ready=false while release held; reconciliation error preserved; uncertain attempt/duration delta=1; active=0"
     );
 }
+
+/// Reads the snapshot the fixture's table currently serves.
+///
+/// A promotion task is bound to the snapshot its planning pass observed, so a
+/// scenario that has to build the task a *later* pass would have produced needs
+/// the current one rather than the one it started from.
+///
+/// # Panics
+/// Panics when the table cannot be loaded or serves no snapshot yet.
+async fn current_snapshot_id(fixture: &PromotionIntegrationFixture) -> i64 {
+    fixture
+        .catalog
+        .iceberg_catalog()
+        .load_table(&fixture.binding.table_ident())
+        .await
+        .expect("fixture table load")
+        .metadata()
+        .current_snapshot()
+        .expect("the table serves a snapshot")
+        .snapshot_id()
+}
+
+/// A promotion planned inside a sibling's settlement window is superseded.
+///
+/// Promotion lands in two durable steps — the Iceberg append, then the SQL
+/// settlement that stops Oracle scanning those rows as hot — and a planning
+/// pass can fall between them. The pass then observes rows that are still
+/// promotable and a base snapshot that already contains them, and enqueues a
+/// task whose whole group has in fact already been published.
+///
+/// The task built here is exactly that: the plan production arbitration
+/// produced for the sealed rows, bound to the snapshot the first promotion
+/// created. Claiming it must retire it as superseded before it promises
+/// anything, because the alternative observed in production was a
+/// reconciliation failure — the demand its plan names is gone, having been
+/// settled by the sibling that already promoted it.
+///
+/// # Panics
+/// Panics if the superseded claim raises a worker error, if any object is
+/// appended twice, if the stale task is not retired, or if demand sealed
+/// afterwards is not replanned and promoted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn a_promotion_planned_in_the_settlement_window_is_superseded() {
+    let fixture = PromotionIntegrationFixture::start("settle_window").await;
+    let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let forge = fixture.build_forge_for_test(
+        fixture.catalog.iceberg_catalog(),
+        store,
+        ForgeClock::system(),
+        ForgeWorkerCompletionObserver::default(),
+        ForgeSchedulerTrigger::default(),
+    );
+    let stop = CancellationToken::new();
+    let observed = Utc::now();
+    // Captured before the promotion runs: once it settles SQL these rows are no
+    // longer promotable, so arbitration would produce nothing to rebind.
+    let planned = ForgeScheduler::with_owner_for_test(&forge, Uuid::now_v7())
+        .expect("fixture scheduler")
+        .arbitrate_demand_for_test(&demand(&fixture, observed))
+        .await
+        .expect("production arbitration runs")
+        .into_iter()
+        .find(|task| task.strategy == ForgeTaskStrategy::ScribePromotion)
+        .expect("the sealed rows are owed a promotion");
+
+    let mut scheduler = ForgeScheduler::new(&forge).expect("scheduler");
+    scheduler
+        .schedule_once(&stop)
+        .await
+        .expect("promotion discovery");
+    let worker = ForgeWorker::new(
+        Arc::clone(&forge),
+        ForgeWorkerConfig::default(),
+        Uuid::now_v7(),
+    )
+    .expect("production worker");
+    assert!(
+        worker
+            .execute_one_for_test(&stop)
+            .await
+            .expect("the first promotion commits"),
+        "the planned promotion is claimed"
+    );
+    let promoted = fixture.live_data_paths().await;
+    assert!(
+        !promoted.is_empty(),
+        "the first promotion referenced its objects"
+    );
+
+    let in_window = NewForgeTask {
+        base_snapshot_id: current_snapshot_id(&fixture).await,
+        ..planned
+    };
+    enqueue(&fixture, &in_window, observed).await;
+    assert!(
+        worker
+            .execute_one_for_test(&stop)
+            .await
+            .expect("a superseded promotion is retired without a worker error"),
+        "the stale in-window task is claimed"
+    );
+    assert_eq!(
+        fixture.live_data_paths().await,
+        promoted,
+        "a superseded promotion appends no object a second time"
+    );
+    let retired = fixture
+        .forge_tasks()
+        .await
+        .into_iter()
+        .filter(|task| task.base_snapshot_id == in_window.base_snapshot_id)
+        .filter(|task| task.strategy == ForgeTaskStrategy::ScribePromotion.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        retired
+            .iter()
+            .map(|task| task.state.as_str())
+            .collect::<Vec<_>>(),
+        vec!["cancelled"],
+        "the stale task is retired as cancelled, not failed: {retired:?}"
+    );
+
+    fixture.seal_more(2).await;
+    scheduler
+        .schedule_once(&stop)
+        .await
+        .expect("the remaining demand is replanned");
+    assert!(
+        worker
+            .execute_one_for_test(&stop)
+            .await
+            .expect("the replanned promotion commits"),
+        "the replanned promotion is claimed"
+    );
+    assert!(
+        fixture.live_data_paths().await.len() > promoted.len(),
+        "demand sealed after the superseded task is promoted"
+    );
+}

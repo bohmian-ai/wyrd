@@ -40,14 +40,6 @@ WYRD_DEV_PG_CACHE = "${HOME}/.cache/wyrd/pg"
 # this, so a failure report never costs a second run to reproduce with
 # backtraces enabled.
 RUST_BACKTRACE = "1"
-# Canonical vala-bifrost-redux test feature union. wyrd-testing depends on
-# vala-bifrost-redux with `test-support` + `bench-support` (a default-feature
-# wyrd-testing unit test uses `vala_bifrost_redux::bench_support`), so every
-# wyrd-testing test lane already compiles the crate at that union. The direct
-# vala-bifrost-redux `--test integration` lanes reference this same string so
-# they reuse that one compiled DataFusion cone instead of building a second
-# `test-support`-only artifact.
-WYRD_REDUX_TEST_FEATURES = "test-support,bench-support"
 
 [tasks.fmt]
 description = "Format all Rust code"
@@ -204,6 +196,26 @@ run = "cargo nextest run --locked -p wyrd-sdk-rust --lib"
 description = "Run every Bifrost unit, integration, and Rust/Python/TypeScript journey test under one Postgres lifecycle."
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:bifrost:inner'"
 
+[tasks."test:bifrost:gate"]
+hide = true
+description = """The gate's share of Bifrost: only the ignored Rust tests plus the Python Bifrost unit
+tests. Every non-ignored Rust test belongs to a family lane, and py:test:integration,
+ts:test:integration, and ts:test:unit own the SDK Bifrost files. One `nextest` invocation schedules
+every selected binary together. Run `test:bifrost` for the complete, standalone lane."""
+run = """
+scripts/postgres/with-test-postgres.sh -- bash -lc '
+set -e
+mise run db:migrate:all:inner
+cargo nextest run --locked \
+  -p wyrd-client --test pg_bifrost_e2e \
+  -p wyrd-testing --test forge --test scribe --test oracle --test otlp --test server \
+  -p wyrd-mcp --test mcp \
+  -p vala-bifrost-redux --test integration \
+  --features wyrd-client/test-support \
+  -P journey --run-ignored=only
+mise run test:bifrost:unit:python:inner'
+"""
+
 [tasks."test:bifrost:inner"]
 hide = true
 description = "Run the complete Bifrost test scope against an already-provisioned Postgres lifecycle."
@@ -232,8 +244,8 @@ run = "pnpm exec vitest run tests/unit/bifrost-query.test.ts"
 
 [tasks."test:bifrost:integration:redux:inner"]
 hide = true
-description = "Run the complete vala-bifrost-redux tier-2 suite at its canonical feature union."
-run = "cargo nextest run --locked -p vala-bifrost-redux --features \"$WYRD_REDUX_TEST_FEATURES\" -P journey --run-ignored=all"
+description = "Run the complete vala-bifrost-redux tier-2 suite; its manifest owns the test-only features."
+run = "cargo nextest run --locked -p vala-bifrost-redux -P journey --run-ignored=all"
 
 [tasks."test:bifrost:integration:redux"]
 description = "Run the complete vala-bifrost-redux tier-2 suite."
@@ -403,8 +415,8 @@ description = "Validate Bifrost Oracle Kubernetes role selectors and rollback"
 run = "cargo nextest run --locked -p wyrd-testing --lib -E 'test(/^bifrost::deployment_contract::bifrost_deployment_contract_/)'"
 
 [tasks."check:bifrost-resource-governance"]
-description = "Reject obsolete Bifrost resource ownership and verify checker fixtures"
-run = "BIFROST_RESOURCE_GOVERNANCE_SELF_TEST=1 bash scripts/checks/bifrost-resource-governance.sh && bash scripts/checks/bifrost-resource-governance.sh"
+description = "Reject obsolete Bifrost resource ownership"
+run = "bash scripts/checks/bifrost-resource-governance.sh"
 
 [tasks."check:bifrost"]
 description = "Run formatting, scoped Clippy, and static Bifrost boundary checks."
@@ -422,20 +434,20 @@ description = "Complete Bifrost change gate: scoped checks plus every Bifrost te
 depends = ["check:bifrost", "test:bifrost"]
 
 [tasks."test:rust"]
-description = """Aggregate Rust test gate: complete default-feature family lanes + storage emulator matrix + feature-specific SQL and tonic lanes.
+description = """Aggregate Rust test gate: the family lanes + storage emulator matrix. Every workspace crate belongs to
+one family (check:test-coverage proves it), so the focused crate lanes select no test this does not run.
 Bifrost (DataFusion-heavy) runs as a separate CI job via test:bifrost to avoid artifact-lock
 contention; add test:bifrost to gate or run it directly to include it locally.
 Only real-credential cloud storage tests (test:storage:{s3,gcs,azure}:cloud) are gated to
 storage-integration-cloud.yml; emulator-backed storage tests run here because they are just
 docker containers, same difficulty as Postgres.
 """
-depends = ["test:wyrd", "test:skald", "test:vala", "test:shared", "test:storage:matrix", "test:sql", "test:tonic"]
+depends = ["test:wyrd", "test:skald", "test:vala", "test:shared", "test:storage:matrix"]
 
 [tasks."test:tonic"]
-description = """Run every wyrd-tonic test at the feature union its private-conversion
-contracts require. The family lanes invoke Cargo with default features, and
-wyrd-tonic's `default = []` leaves the `server`/`client` code uncompiled there,
-so this general crate lane is the only place those conversions execute."""
+description = """Focused lane for wyrd-tonic. The crate's manifest owns the `server`/`client`
+test feature union, so the family lanes run these tests too; this task is the fast way to run
+only them."""
 run = "cargo nextest run --locked -p wyrd-tonic --features server,client"
 
 [tasks."test:identity:journey"]
@@ -558,11 +570,6 @@ RUSTDOCFLAGS="-D missing_docs -D rustdoc::broken_intra_doc_links" cargo doc --lo
   -p wyrd-auth-issue \
   -p wyrd-auth-verify
 """
-
-[tasks."cardkind:check"]
-hide = true
-description = "Verify CardKind native count and External serde shape"
-run = "cargo nextest run -p wyrd-spec --lib --features server card::kind_tests"
 
 [tasks."check:client-tier"]
 hide = true
@@ -813,30 +820,10 @@ hide = true
 description = "Audit unwrap/expect calls outside tests and examples"
 run = "uv run python scripts/check_unwrap_audit.py"
 
-[tasks."check:audit-script"]
-hide = true
-description = "Self-tests for the unwrap/expect audit script"
-run = "uv run python scripts/tests/test_check_unwrap_audit.py"
-
 [tasks."check:clippy-allow-audit"]
 hide = true
 description = "Audit `#[allow(clippy::...)]` attributes outside tests and examples (requires a `// justification:` comment on the previous line)"
 run = "uv run python scripts/check_clippy_allow.py"
-
-[tasks."check:tenant-isolation:self"]
-hide = true
-description = "Self-tests for the tenant isolation check script"
-run = "uv run python scripts/tests/test_check_tenant_isolation.py"
-
-[tasks."check:clippy-allow-audit:self"]
-hide = true
-description = "Self-tests for the clippy-allow audit script"
-run = "uv run python scripts/tests/test_check_clippy_allow.py"
-
-[tasks."check:test-coverage:self"]
-hide = true
-description = "Self-tests for the test-family coverage checker (dedup, missing, phantom detection)"
-run = "bash scripts/tests/test_test_coverage.sh"
 
 [tasks."check:ci-selection"]
 hide = true
@@ -1381,10 +1368,12 @@ depends = [
   "check",
   "check:skills-sync",
   "test:rust",
-  "test:bifrost",
+  "test:bifrost:gate",
   "test:identity:journey",
+  "py:test:integration",
+  "ts:test:integration",
+  "docs:check",
   "codegen:check",
-  "cardkind:check",
   "check:client-tier",
   "check:registry-client-tier",
   "check:cli-client-tier",
@@ -1394,11 +1383,7 @@ depends = [
   "check:pyo3-scope",
   "check:mocks-scope",
   "check:unwrap-audit",
-  "check:audit-script",
   "check:clippy-allow-audit",
-  "check:clippy-allow-audit:self",
-  "check:tenant-isolation:self",
-  "check:test-coverage:self",
   "check:ci-selection",
   "check:storage:drift",
   "check:registry-tx-coupling",
@@ -1425,7 +1410,6 @@ depends = [
   "check:from-pools-allowlist",
   "check:fixtures-no-server",
   "check:no-testing-in-prod-deps",
-  "check:bifrost-oracle-deploy",
   "check:bifrost-resource-governance",
   "check:test-coverage"]
 

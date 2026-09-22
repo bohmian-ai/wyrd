@@ -10445,6 +10445,7 @@ dependencies = [
  "ulid",
  "url",
  "uuid",
+ "vala-bifrost-redux",
  "vala-sql",
  "workspace-hack",
  "wyrd-auth-verify",
@@ -12094,6 +12095,7 @@ dependencies = [
  "workspace-hack",
  "wyrd-spec",
  "wyrd-tls",
+ "wyrd-tonic",
 ]
 
 [[package]]

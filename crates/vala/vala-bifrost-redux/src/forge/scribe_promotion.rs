@@ -443,6 +443,7 @@ pub(super) async fn read_promotion_demand(
     conn: &mut wyrd_sql::TenantConn<'_>,
     binding: &TenantTableBinding,
     branch: &str,
+    only: Option<&BTreeSet<Uuid>>,
 ) -> Result<Option<ScribePromotionDemand>, ForgeError> {
     let rows = HotFileCatalog::new(
         &binding.table_ref.namespace.to_string(),
@@ -451,6 +452,17 @@ pub(super) async fn read_promotion_demand(
     .list_promotable(conn)
     .await
     .map_err(ForgeError::Sql)?;
+    let rows: Vec<_> = match only {
+        // Revalidation asks about the group it planned. Hot objects Scribe
+        // published after planning are new demand for the next pass, not a
+        // contradiction of this plan, so they are excluded here rather than
+        // allowed to fail the digest comparison.
+        Some(ids) => rows
+            .into_iter()
+            .filter(|row| ids.contains(&row.id))
+            .collect(),
+        None => rows,
+    };
     if rows.is_empty() {
         return Ok(None);
     }
@@ -547,7 +559,159 @@ pub(super) struct ForgePromotionSettlement<'a> {
     pub(super) committed_snapshot_id: Option<i64>,
 }
 
+
+/// What a claimed promotion plan still means against durable state.
+///
+/// A promotion task is planned against the rows one scheduler pass observed.
+/// Between that pass and the worker's claim, a sibling task can commit the same
+/// group and settle those rows, because the Iceberg commit and the SQL
+/// settlement are two steps and a plan can be cut between them. The claimed
+/// task must then distinguish "my group is still owed" from "my group already
+/// landed", and only the first is work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PromotionPlanStatus {
+    /// Every planned row is still unsettled, so the plan is exactly owed.
+    Current,
+    /// Some or all planned rows already landed under another operation.
+    ///
+    /// The claim is stale rather than wrong: the effect it would perform has
+    /// been performed. Its caller cancels it as superseded and leaves any
+    /// remaining demand to the next planning pass.
+    Superseded,
+}
+
 impl Forge {
+    /// Classifies one claimed promotion plan against its own durable rows.
+    ///
+    /// This runs before the Prepared transition, because Prepared is a promise
+    /// that this exact group will be appended and a superseded group must never
+    /// make that promise. The question asked is deliberately narrow: what
+    /// happened to *these* `file_list` identities? Rows that are still
+    /// unsettled mean the plan is owed unchanged. Rows carrying a committed
+    /// snapshot mean a sibling promotion already appended them, which is proven
+    /// by finding their paths alive in the table's current snapshot before the
+    /// claim is retired — settlement alone is a SQL claim, and the catalog is
+    /// the authority on whether the data is actually there.
+    ///
+    /// Partial settlement is also [`PromotionPlanStatus::Superseded`]: this
+    /// plan's digest binds the whole ordered group, so it can no longer be
+    /// appended as planned, and the unsettled remainder is ordinary demand for
+    /// the next planning pass rather than something to salvage here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Sql`] when the tenant-scoped read fails,
+    /// [`ForgeError::Catalog`] when the current snapshot's manifests cannot be
+    /// read, and [`ForgeError::Reconciliation`] for the two states that are not
+    /// stale but lost: a planned row that disappeared without durable
+    /// settlement, and a settled row whose path is absent from the current
+    /// snapshot.
+    pub(super) async fn classify_planned_promotion(
+        &self,
+        binding: &TenantTableBinding,
+        plan: &ScribePromotionPlan,
+        table: &iceberg::table::Table,
+    ) -> Result<PromotionPlanStatus, ForgeError> {
+        let planned = plan.file_ids();
+        let mut conn = self
+            .core
+            .vala
+            .tenant_conn(binding.tenant)
+            .await
+            .map_err(ForgeError::Sql)?;
+        let rows = HotFileCatalog::new(
+            &binding.table_ref.namespace.to_string(),
+            &binding.table_ref.name,
+        )
+        .planned_settlement(&mut conn, &planned)
+        .await
+        .map_err(ForgeError::Sql)?;
+        conn.commit().await.map_err(ForgeError::Sql)?;
+        if rows.len() != planned.len() {
+            let present: BTreeSet<Uuid> = rows.iter().map(|row| row.id).collect();
+            let missing: Vec<Uuid> = planned
+                .iter()
+                .filter(|id| !present.contains(id))
+                .copied()
+                .collect();
+            return Err(ForgeError::Reconciliation {
+                detail: format!(
+                    "planned Scribe promotion rows disappeared without durable settlement: {missing:?}"
+                ),
+            });
+        }
+        let settled: Vec<&vala_sql::queries::file_list::PlannedHotFileRow> = rows
+            .iter()
+            .filter(|row| row.committed_snapshot_id.is_some())
+            .collect();
+        if settled.is_empty() {
+            return Ok(PromotionPlanStatus::Current);
+        }
+        let live = self.live_data_object_keys(binding, table).await?;
+        for row in settled {
+            if !live.contains(&row.file_path) {
+                return Err(ForgeError::Reconciliation {
+                    detail: format!(
+                        "planned Scribe promotion row {} records committed snapshot {:?} but its path is absent from the current snapshot",
+                        row.file_path, row.committed_snapshot_id
+                    ),
+                });
+            }
+        }
+        Ok(PromotionPlanStatus::Superseded)
+    }
+
+    /// Collects the object keys of every live data file in the current snapshot.
+    ///
+    /// Promotion settlement is only believable if the catalog agrees, so the
+    /// comparison is made against the paths the table actually serves. Catalog
+    /// paths are normalized into the tenant's object keys, which is the form
+    /// `vala.file_list` records, so the two sides are comparable without
+    /// guessing at prefixes. An empty current snapshot yields an empty set,
+    /// which correctly makes any claimed settlement unprovable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Catalog`] when the manifest list or a manifest
+    /// cannot be read, and [`ForgeError::Invariant`] when a catalog path does
+    /// not normalize into this binding's object prefix.
+    async fn live_data_object_keys(
+        &self,
+        binding: &TenantTableBinding,
+        table: &iceberg::table::Table,
+    ) -> Result<BTreeSet<String>, ForgeError> {
+        let Some(snapshot) = table.metadata().current_snapshot() else {
+            return Ok(BTreeSet::new());
+        };
+        let table_location = table.metadata().location();
+        let manifests = table
+            .manifest_list_reader(snapshot)
+            .load()
+            .await
+            .map_err(ForgeError::Catalog)?;
+        let mut live = BTreeSet::new();
+        for manifest_file in manifests.entries() {
+            let manifest = manifest_file
+                .load_manifest(table.file_io())
+                .await
+                .map_err(ForgeError::Catalog)?;
+            for entry in manifest
+                .entries()
+                .iter()
+                .filter(|entry| entry.is_alive())
+                .filter(|entry| entry.content_type() == iceberg::spec::DataContentType::Data)
+            {
+                live.insert(super::path::catalog_path_to_object_key(
+                    table_location,
+                    binding,
+                    &self.core.staging,
+                    entry.file_path(),
+                )?);
+            }
+        }
+        Ok(live)
+    }
+
     /// Revalidates one prepared promotion group against the objects that exist.
     ///
     /// Revalidation is what makes the append safe to perform unchanged: the
@@ -589,7 +753,9 @@ impl Forge {
             .tenant_conn(binding.tenant)
             .await
             .map_err(ForgeError::Sql)?;
-        let demand = read_promotion_demand(&mut conn, binding, plan.branch()).await?;
+        let planned: BTreeSet<Uuid> = plan.file_ids().into_iter().collect();
+        let demand = read_promotion_demand(&mut conn, binding, plan.branch(), Some(&planned))
+            .await?;
         conn.commit().await.map_err(ForgeError::Sql)?;
         let demand = demand.ok_or_else(|| ForgeError::Reconciliation {
             detail: "prepared Scribe promotion has no durable demand left".to_owned(),

@@ -547,7 +547,7 @@ impl BifrostClusterLoad {
                 "Jain fairness {fairness:.3} is below 0.95"
             )));
         }
-        let cancellation_owners = phase_owner_checkpoint(cluster).await?;
+        let cancellation_owners = phase_owner_checkpoint(cluster, &tenants).await?;
         let (_, cancellation) = sampled_phase(
             &self.telemetry,
             ClusterTelemetryExpectation {
@@ -560,7 +560,7 @@ impl BifrostClusterLoad {
             || async { exercise_query_cancellation(setup_server, &setup_client, &table).await },
         )
         .await?;
-        let cancellation_finished_owners = phase_owner_checkpoint(cluster).await?;
+        let cancellation_finished_owners = phase_owner_checkpoint(cluster, &tenants).await?;
         let cancellation_owner_delta =
             owner_delta(cancellation_owners, cancellation_finished_owners)?;
         assert_cancellation_outcomes(&cancellation.phase)?;
@@ -835,7 +835,7 @@ async fn run_public_matrix(
         }
         Ok::<_, ClusterLoadError>(())
     };
-    let matrix_owners = phase_owner_checkpoint(cluster).await?;
+    let matrix_owners = phase_owner_checkpoint(cluster, tenants).await?;
     let ((phase_progress, mut tasks), warmup) = sampled_phase(
         telemetry,
         ClusterTelemetryExpectation {
@@ -910,7 +910,7 @@ async fn run_public_matrix(
     )
     .await
     .map_err(|error| ClusterLoadError::Telemetry(format!("warmup: {error}")))?;
-    let warmup_owners = phase_owner_checkpoint(cluster).await?;
+    let warmup_owners = phase_owner_checkpoint(cluster, tenants).await?;
     let warmup_owner_delta = owner_delta(matrix_owners, warmup_owners)?;
     let (_, measured) = sampled_phase(
         telemetry,
@@ -929,7 +929,7 @@ async fn run_public_matrix(
     )
     .await
     .map_err(|error| ClusterLoadError::Telemetry(format!("measured: {error}")))?;
-    let measured_owners = phase_owner_checkpoint(cluster).await?;
+    let measured_owners = phase_owner_checkpoint(cluster, tenants).await?;
     let measured_owner_delta = owner_delta(warmup_owners, measured_owners)?;
 
     let mut results = BTreeMap::new();
@@ -950,7 +950,7 @@ async fn run_public_matrix(
         publish_tenants,
     )
     .await?;
-    let publication_owners = phase_owner_checkpoint(cluster).await?;
+    let publication_owners = phase_owner_checkpoint(cluster, tenants).await?;
     let publication_owner_delta = owner_delta(measured_owners, publication_owners)?;
     let (_, final_verification) = sampled_phase(telemetry, ClusterTelemetryExpectation {
         topology: profile.topology,
@@ -980,10 +980,6 @@ async fn run_public_matrix(
         let final_client =
             public_client(reader, tenant, &format!("load-final-{tenant_index}")).await?;
         let query = wyrd_client::Bifrost::query_only(&final_client);
-        let audit_count_before = reader
-            .bifrost_read_decision_count_for_tenant(tenant)
-            .await
-            .map_err(|error| ClusterLoadError::Cluster(error.to_string()))?;
         let final_sql = if profile.pressured_tenant == Some(tenant_index) {
             format!("SELECT id, tenant, batch FROM {table}")
         } else {
@@ -991,19 +987,24 @@ async fn run_public_matrix(
                 "SELECT id, tenant, batch FROM {table} WHERE CAST(batch AS BIGINT) >= 2"
             )
         };
-        let final_result = query
-            .collect_bounded(
-                &BifrostQueryRequest {
-                    sql: final_sql,
-                    visibility: VisibilityMode::PublishedOnly,
-                    freshness: FreshnessPolicy::Strict,
-                    deadline_ms: Some(5_000),
-                },
-                CollectedQueryLimits {
-                    max_rows: usize::MAX,
-                    max_encoded_bytes: 256 * 1024 * 1024,
-                },
-            )
+        // The stream names its own request before any row is taken, so the
+        // audit row this read commits is joined by an identity the caller
+        // already holds rather than by guessing at the newest staged row.
+        let final_stream = query
+            .query(&BifrostQueryRequest {
+                sql: final_sql,
+                visibility: VisibilityMode::PublishedOnly,
+                freshness: FreshnessPolicy::Strict,
+                deadline_ms: Some(5_000),
+            })
+            .await
+            .map_err(|error| ClusterLoadError::Client(error.to_string()))?;
+        let final_request_id = final_stream.request_id().to_string();
+        let final_result = final_stream
+            .collect_bounded(CollectedQueryLimits {
+                max_rows: usize::MAX,
+                max_encoded_bytes: 256 * 1024 * 1024,
+            })
             .await
             .map_err(|error| ClusterLoadError::Client(error.to_string()))?;
         let report = results
@@ -1058,34 +1059,15 @@ async fn run_public_matrix(
             )));
         }
         report.final_terminal_count = u8::from(terminal_valid);
-        // Wait for the tracked read-audit tasks to commit the just-executed public
-        // read into audit_staging before asserting on its durable row count; the
-        // pending count is exact, so this converges without masking a shortfall.
-        await_read_audit_convergence(cluster).await?;
-        let audit_count_after = reader
-            .bifrost_read_decision_count_for_tenant(tenant)
-            .await
-            .map_err(|error| ClusterLoadError::Cluster(error.to_string()))?;
-        if audit_count_after != audit_count_before + 1 {
-            return Err(ClusterLoadError::Assertion(format!(
-                "tenant {tenant} final public read committed {} audit rows, expected one",
-                audit_count_after.saturating_sub(audit_count_before)
-            )));
-        }
-        let final_request_id = reader
-            .latest_bifrost_read_decision_request_id(tenant)
-            .await
-            .map_err(|error| ClusterLoadError::Cluster(error.to_string()))?
-            .ok_or_else(|| {
-                ClusterLoadError::Assertion(format!(
-                    "tenant {tenant} final public read omitted its request ID"
-                ))
-            })?;
         uuid::Uuid::parse_str(&final_request_id).map_err(|error| {
             ClusterLoadError::Assertion(format!(
                 "tenant {tenant} final audit request ID is invalid: {error}"
             ))
         })?;
+        // The read decision reaches retained history through the publisher, so
+        // the probe settles publication first and then counts the one row this
+        // exact request owns. Scoping by request rather than by tenant total
+        // keeps the assertion exact without depending on transient staging.
         report.tenant_audit_rows = reader
             .bifrost_read_decision_for_request(tenant, &final_request_id)
             .await
@@ -1149,7 +1131,7 @@ async fn run_public_matrix(
         Ok(())
     })
     .await?;
-    let final_owners = phase_owner_checkpoint(cluster).await?;
+    let final_owners = phase_owner_checkpoint(cluster, tenants).await?;
     let final_owner_delta = owner_delta(publication_owners, final_owners)?;
     reconcile_matrix_telemetry(
         profile,
@@ -1180,9 +1162,11 @@ const AUDIT_STAGED_BUDGET: Duration = Duration::from_secs(30);
 /// Capture durable Forge and Oracle owner counts for one phase boundary.
 ///
 /// Before reading the counts, this polls every pod's in-flight Oracle audit
-/// outbox commits (`audit_pending`) until none remain, so the subsequent
-/// `vala.audit_staging` row counts include every read decision. The asserted
-/// counts are unchanged and the wait errors loudly if commits do not finish.
+/// outbox commits (`audit_pending`) until none remain, so no read decision is
+/// still on its way to being staged. The read-decision totals then come from
+/// each tenant's retained history rather than from transient staging, which the
+/// publisher is entitled to drain between two checkpoints: a published row
+/// stays counted, so a phase delta measures the phase rather than the sweep.
 ///
 /// # Errors
 /// Returns [`ClusterLoadError::Cluster`] when the shared database inspection
@@ -1190,11 +1174,27 @@ const AUDIT_STAGED_BUDGET: Duration = Duration::from_secs(30);
 /// within [`AUDIT_STAGED_BUDGET`].
 async fn phase_owner_checkpoint(
     cluster: &WyrdTestCluster,
+    tenants: &[DataTenantId],
 ) -> Result<PhaseOwnerCheckpoint, ClusterLoadError> {
     let inspection = await_read_audit_convergence(cluster).await?;
+    let reader = cluster
+        .servers()
+        .find(|server| server.oracle_runtime_inspection().is_ok())
+        .ok_or_else(|| ClusterLoadError::Cluster("cluster hosts no Oracle".to_owned()))?;
+    let mut read_audit_rows = 0_u64;
+    for &tenant in tenants {
+        let count = reader
+            .bifrost_read_decision_count_for_tenant(tenant)
+            .await
+            .map_err(|error| ClusterLoadError::Cluster(error.to_string()))?;
+        read_audit_rows =
+            read_audit_rows.saturating_add(u64::try_from(count).map_err(|error| {
+                ClusterLoadError::Cluster(format!("negative read-decision count: {error}"))
+            })?);
+    }
     Ok(PhaseOwnerCheckpoint {
         forge_terminal_tasks: inspection.forge_terminal_tasks,
-        read_audit_rows: inspection.read_audit_rows,
+        read_audit_rows,
     })
 }
 

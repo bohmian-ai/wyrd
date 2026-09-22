@@ -18,7 +18,6 @@ use axum::Json;
 use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use chrono::{Duration, Utc};
 use secrecy::ExposeSecret;
 use uuid::Uuid;
 use wyrd_auth::platform_authz::{
@@ -99,13 +98,14 @@ async fn issue_credential(
     )
     .await?;
 
-    let expires_at = request
+    // PostgreSQL derives the stored expiry from this requested lifetime.
+    let lifetime = request
         .expires_in_days
-        .map(|days| Utc::now() + Duration::days(i64::from(days)));
+        .map(|days| std::time::Duration::from_secs(u64::from(days) * 24 * 60 * 60));
     // The credential and the allowance permitting it commit together: a secret
     // that outlived a failed decision would be usable authority nothing
     // recorded granting.
-    let issued = issue_platform_credential(&mut decision, principal_id, expires_at)
+    let issued = issue_platform_credential(&mut decision, principal_id, lifetime)
         .await
         .map_err(credential_error)?;
     commit_decision(decision).await?;

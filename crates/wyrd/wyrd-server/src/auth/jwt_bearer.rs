@@ -784,7 +784,7 @@ mod pg_tests {
             &prefix,
             &key_hash,
             created_by,
-            Some(Utc::now() + ChronoDuration::days(30)),
+            Some(std::time::Duration::from_secs(30 * 24 * 60 * 60)),
         )
         .await
         .expect("api key inserts");

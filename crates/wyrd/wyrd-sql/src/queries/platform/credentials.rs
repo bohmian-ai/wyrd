@@ -9,6 +9,8 @@
 //! then revoke the superseded one.
 // raw-query grep allowlist: platform administrative tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
+use std::time::Duration;
+
 use chrono::{DateTime, Utc};
 use sqlx::types::Uuid;
 
@@ -32,24 +34,13 @@ pub struct PlatformCredentialLookupRow {
     /// Owning principal's stored kind, so a session records what it acts as
     /// rather than assuming every platform principal is a machine root.
     pub principal_kind: String,
-    /// Revocation time, when revoked.
-    pub revoked_at: Option<DateTime<Utc>>,
-    /// Expiry, when the credential is bounded.
-    pub expires_at: Option<DateTime<Utc>>,
-}
-
-impl PlatformCredentialLookupRow {
-    /// True when this credential is presently usable.
+    /// Whether PostgreSQL judged this credential presently usable.
     ///
     /// Usable means the credential is neither revoked nor expired and its
-    /// principal is active. Callers must still verify the secret; this decides
-    /// only the lifecycle half.
-    #[must_use]
-    pub fn is_usable(&self, now: DateTime<Utc>) -> bool {
-        self.revoked_at.is_none()
-            && self.expires_at.is_none_or(|expiry| expiry > now)
-            && self.principal_status == "active"
-    }
+    /// principal is active, all decided by the statement that owns the row.
+    /// Callers must still verify the secret; this decides only the lifecycle
+    /// half, and every lookup path projects the same expression.
+    pub usable: bool,
 }
 
 /// Non-secret credential metadata for listing.
@@ -76,6 +67,9 @@ pub struct PlatformCredentialMetadataRow {
 /// collides or `principal_id` does not name an existing platform principal.
 /// Insert a platform credential inside a caller-owned transaction.
 ///
+/// `lifetime` is a relative lifetime or `None` for no expiry; PostgreSQL
+/// derives the stored `expires_at` from its own `statement_timestamp()`.
+///
 /// Used where the credential is only meaningful together with what else the
 /// transaction writes — notably deployment initialization, where a principal
 /// without its first credential would be an unusable root that the unique name
@@ -90,14 +84,14 @@ pub async fn insert_platform_credential_tx(
     principal_id: Uuid,
     prefix: &str,
     secret_hash: &str,
-    expires_at: Option<DateTime<Utc>>,
+    lifetime: Option<Duration>,
 ) -> Result<(), SqlError> {
     sqlx::query(INSERT_PLATFORM_CREDENTIAL_SQL)
         .bind(id)
         .bind(principal_id)
         .bind(prefix)
         .bind(secret_hash)
-        .bind(expires_at)
+        .bind(lifetime.map(|lifetime| lifetime.as_secs_f64()))
         .execute(&mut **conn.transaction())
         .await
         .map_err(SqlError::from)?;
@@ -108,7 +102,10 @@ pub async fn insert_platform_credential_tx(
 /// so they cannot drift apart.
 const INSERT_PLATFORM_CREDENTIAL_SQL: &str = "INSERT INTO platform.credentials
      (id, principal_id, prefix, secret_hash, expires_at)
- VALUES ($1, $2, $3, $4, $5)";
+ VALUES ($1, $2, $3, $4,
+         CASE WHEN $5::double precision IS NULL THEN NULL
+              ELSE statement_timestamp() + ($5 * interval '1 second')
+         END)";
 
 /// Look up a platform credential by its non-secret prefix.
 ///
@@ -137,8 +134,9 @@ const CREDENTIAL_BY_PREFIX_SQL: &str = "SELECT c.id,
                 c.secret_hash,
                 p.status AS principal_status,
                 p.principal_kind,
-                c.revoked_at,
-                c.expires_at
+                (c.revoked_at IS NULL
+                 AND (c.expires_at IS NULL OR c.expires_at > statement_timestamp())
+                 AND p.status = 'active') AS usable
            FROM platform.credentials c
            JOIN platform.principals p ON p.id = c.principal_id
           WHERE c.prefix = $1";
@@ -181,8 +179,9 @@ pub async fn platform_credential_by_id(
                 c.secret_hash,
                 p.status AS principal_status,
                 p.principal_kind,
-                c.revoked_at,
-                c.expires_at
+                (c.revoked_at IS NULL
+                 AND (c.expires_at IS NULL OR c.expires_at > statement_timestamp())
+                 AND p.status = 'active') AS usable
            FROM platform.credentials c
            JOIN platform.principals p ON p.id = c.principal_id
           WHERE c.id = $1",

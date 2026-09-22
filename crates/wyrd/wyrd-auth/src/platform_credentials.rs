@@ -9,7 +9,8 @@
 //! row-level security. Platform credentials sit outside that boundary by
 //! construction and therefore run on the BYPASSRLS `OperatorPool`.
 
-use chrono::{DateTime, Utc};
+use std::time::Duration;
+
 use secrecy::{ExposeSecret, SecretString};
 use uuid::Uuid;
 use wyrd_auth_issue::{IssueError, hash_api_key};
@@ -125,9 +126,9 @@ pub enum PlatformCredentialError {
 ///
 /// Generates the secret, hashes it off the async runtime because Argon2 is
 /// deliberately expensive, persists only the verifier, and hands the
-/// plaintext back for its single exposure. `expires_at` is optional: an
+/// plaintext back for its single exposure. `lifetime` is optional: an
 /// administrative credential established at initialization has no natural
-/// lifetime.
+/// lifetime. PostgreSQL derives the stored expiry from that lifetime.
 ///
 /// The insert runs on the caller's transaction — the one already carrying
 /// the authorization allowance — and the caller commits. A credential that
@@ -143,7 +144,7 @@ pub enum PlatformCredentialError {
 pub async fn issue_platform_credential(
     conn: &mut TenantConn<'_>,
     principal_id: Uuid,
-    expires_at: Option<DateTime<Utc>>,
+    lifetime: Option<Duration>,
 ) -> Result<IssuedPlatformCredential, PlatformCredentialError> {
     let credential = PlatformCredential::generate();
     let raw = credential.secret.clone();
@@ -156,7 +157,7 @@ pub async fn issue_platform_credential(
         principal_id,
         &credential.prefix,
         &secret_hash,
-        expires_at,
+        lifetime,
     )
     .await?;
 
@@ -185,7 +186,7 @@ pub async fn authenticate_for_session(
     let row = match PlatformCredential::prefix_of(presented) {
         Some(prefix) => platform_credential_by_prefix_tx(conn, &prefix)
             .await?
-            .filter(|row| row.is_usable(Utc::now())),
+            .filter(|row| row.usable),
         None => None,
     };
 
@@ -280,7 +281,9 @@ mod pg_tests {
     //! is generated here and never stored, and that every rejection is one
     //! indistinguishable outcome.
 
-    use chrono::{Duration, Utc};
+    use std::time::Duration;
+
+    use chrono::Utc;
     use secrecy::{ExposeSecret, SecretString};
     use uuid::Uuid;
     use wyrd_dev_fixtures::pg::PgFixture;
@@ -290,7 +293,6 @@ mod pg_tests {
 
     use super::{AuthenticatedPlatformCredential, IssuedPlatformCredential};
     use super::{PlatformCredentialError, authenticate_for_session, issue_platform_credential};
-    use chrono::DateTime;
 
     /// Seed a platform principal and return its id.
     async fn seed_principal(fixture: &PgFixture, name: &str) -> Uuid {
@@ -314,14 +316,14 @@ mod pg_tests {
     async fn issue_committed(
         fixture: &PgFixture,
         principal: Uuid,
-        expires_at: Option<DateTime<Utc>>,
+        lifetime: Option<Duration>,
     ) -> IssuedPlatformCredential {
         let pool = fixture.operator_pool().clone();
         let mut conn = pool
             .begin_platform_audited()
             .await
             .expect("transaction opens");
-        let issued = issue_platform_credential(&mut conn, principal, expires_at)
+        let issued = issue_platform_credential(&mut conn, principal, lifetime)
             .await
             .expect("credential issues");
         conn.commit().await.expect("credential commits");
@@ -417,12 +419,9 @@ mod pg_tests {
         revocation.commit().await.expect("revocation commits");
 
         let expired_owner = seed_principal(&fixture, "expired").await;
-        let expired = issue_committed(
-            &fixture,
-            expired_owner,
-            Some(Utc::now() - Duration::hours(1)),
-        )
-        .await;
+        // A zero lifetime expires the instant PostgreSQL writes it, so no
+        // host-clock arithmetic decides expiry.
+        let expired = issue_committed(&fixture, expired_owner, Some(Duration::ZERO)).await;
 
         let suspended_owner = seed_principal(&fixture, "suspended").await;
         let suspended = issue_committed(&fixture, suspended_owner, None).await;

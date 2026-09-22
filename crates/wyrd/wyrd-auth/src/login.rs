@@ -3,7 +3,6 @@
 use std::time::Duration;
 
 use base64::Engine;
-use chrono::Utc;
 use rand::RngCore;
 use secrecy::{ExposeSecret, SecretString};
 use sha2::{Digest, Sha256};
@@ -47,11 +46,7 @@ impl PgLoginStateStore {
         Self { pool }
     }
 
-    /// Store one login-state row.
-    ///
-    /// # Panics
-    ///
-    /// Panics only if the provided TTL cannot fit in `chrono::Duration`.
+    /// Store one login-state row whose expiry PostgreSQL derives from `ttl`.
     pub async fn put(
         &self,
         tenant: DataTenantId,
@@ -60,9 +55,6 @@ impl PgLoginStateStore {
         ttl: Duration,
     ) -> Result<(), SqlError> {
         let mut conn = TenantConn::acquire(&self.pool, tenant).await?;
-        let expires_at = Utc::now()
-            + chrono::Duration::from_std(ttl)
-                .expect("login-state TTL is bounded and must fit chrono duration");
         insert_login_state(
             &mut conn,
             state,
@@ -70,7 +62,7 @@ impl PgLoginStateStore {
             &entry.nonce,
             &entry.issuer,
             &entry.redirect_uri,
-            expires_at,
+            ttl,
         )
         .await?;
         conn.commit().await

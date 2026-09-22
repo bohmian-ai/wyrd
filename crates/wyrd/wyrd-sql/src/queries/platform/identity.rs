@@ -11,7 +11,8 @@
 //! platform authority" a property of the database rather than of server code.
 // raw-query grep allowlist: platform administrative tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
-use chrono::{DateTime, Utc};
+use std::time::Duration;
+
 use serde_json::Value;
 use sqlx::types::Uuid;
 
@@ -143,7 +144,11 @@ pub async fn delete_platform_oidc_connection(conn: &mut TenantConn<'_>) -> Resul
         .map_err(SqlError::from)
 }
 
-/// Persist one single-use login state row.
+/// Persist one single-use login state row whose expiry PostgreSQL derives from
+/// `ttl`.
+///
+/// The caller binds a lifetime, never an absolute instant, so the row's expiry
+/// and the consume predicate that evaluates it share one clock.
 ///
 /// # Errors
 /// Returns [`SqlError::Query`] when the insert fails, including on a repeated
@@ -155,19 +160,20 @@ pub async fn insert_platform_login_state(
     nonce: &str,
     issuer: &str,
     redirect_uri: &str,
-    expires_at: DateTime<Utc>,
+    ttl: Duration,
 ) -> Result<(), SqlError> {
     sqlx::query(
         "INSERT INTO platform.login_state
              (state, code_verifier, nonce, issuer, redirect_uri, expires_at)
-         VALUES ($1, $2, $3, $4, $5, $6)",
+         VALUES ($1, $2, $3, $4, $5,
+                 statement_timestamp() + ($6 * interval '1 second'))",
     )
     .bind(state)
     .bind(code_verifier)
     .bind(nonce)
     .bind(issuer)
     .bind(redirect_uri)
-    .bind(expires_at)
+    .bind(ttl.as_secs_f64())
     .execute(pool.pool())
     .await
     .map(|_| ())
@@ -185,8 +191,8 @@ pub struct PlatformLoginStateRow {
     pub issuer: String,
     /// Redirect URI the authorization code was bound to.
     pub redirect_uri: String,
-    /// When this row stops being usable.
-    pub expires_at: DateTime<Utc>,
+    /// Whether PostgreSQL judged the row still live when it deleted it.
+    pub live: bool,
 }
 
 /// Consume a login state row exactly once.
@@ -205,14 +211,15 @@ pub async fn take_platform_login_state(
     let row = sqlx::query_as::<_, PlatformLoginStateRow>(
         "DELETE FROM platform.login_state
          WHERE state = $1
-         RETURNING code_verifier, nonce, issuer, redirect_uri, expires_at",
+         RETURNING code_verifier, nonce, issuer, redirect_uri,
+                   expires_at > statement_timestamp() AS live",
     )
     .bind(state)
     .fetch_optional(pool.pool())
     .await
     .map_err(SqlError::from)?;
 
-    Ok(row.filter(|row| row.expires_at > Utc::now()))
+    Ok(row.filter(|row| row.live))
 }
 
 /// Delete every login-state row that has expired.
@@ -223,7 +230,7 @@ pub async fn take_platform_login_state(
 /// # Errors
 /// Returns [`SqlError::Query`] when the delete fails.
 pub async fn purge_expired_platform_login_state(pool: &OperatorPool) -> Result<u64, SqlError> {
-    sqlx::query("DELETE FROM platform.login_state WHERE expires_at <= now()")
+    sqlx::query("DELETE FROM platform.login_state WHERE expires_at <= statement_timestamp()")
         .execute(pool.pool())
         .await
         .map(|done| done.rows_affected())

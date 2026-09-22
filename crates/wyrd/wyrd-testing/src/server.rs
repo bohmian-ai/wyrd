@@ -3109,7 +3109,7 @@ impl WyrdTestServer {
             &api_key.prefix,
             &key_hash,
             creator_id,
-            Some(chrono::Utc::now() + chrono::Duration::days(365)),
+            Some(std::time::Duration::from_secs(365 * 24 * 60 * 60)),
         )
         .await
         .map_err(sql)?;
@@ -4731,7 +4731,7 @@ pub(crate) async fn provision_tenant_service_principal(
         &api_key.prefix,
         &key_hash,
         creator_id,
-        Some(chrono::Utc::now() + chrono::Duration::days(1)),
+        Some(std::time::Duration::from_secs(24 * 60 * 60)),
     )
     .await
     .map_err(sql)?;
@@ -4889,7 +4889,7 @@ pub(crate) async fn provision_bifrost_peer_principal(
         &api_key.prefix,
         &key_hash,
         creator_id,
-        Some(chrono::Utc::now() + chrono::Duration::days(1)),
+        Some(std::time::Duration::from_secs(24 * 60 * 60)),
     )
     .await
     .map_err(sql)?;

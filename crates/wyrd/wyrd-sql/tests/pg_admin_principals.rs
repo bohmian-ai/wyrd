@@ -9,14 +9,15 @@ mod pg_tests {
     //! Skipped automatically when the database environment is unset so the
     //! default suite stays credential-free.
 
-    use chrono::{DateTime, Duration, Utc};
+    use chrono::{DateTime, Utc};
     use sqlx::Row;
     use uuid::Uuid;
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::auth::PrincipalKindTag;
     use wyrd_sql::queries::auth::{
-        credential_belongs_to, insert_api_key, insert_role, insert_service_account, insert_user,
-        list_api_key_metadata, list_user_roles, replace_user_roles, tenant_admin_principal_id,
+        ApiKeyStatus, api_key_by_prefix, api_key_status_by_prefix, credential_belongs_to,
+        insert_api_key, insert_role, insert_service_account, insert_user, list_api_key_metadata,
+        list_user_roles, replace_user_roles, tenant_admin_principal_id,
     };
     use wyrd_sql::queries::platform::credentials::{
         insert_platform_credential_tx, list_platform_credentials, platform_credential_by_prefix,
@@ -39,20 +40,36 @@ mod pg_tests {
     /// Credential writes run on the caller's transaction so they commit with
     /// the allowance that permitted them; a test that only needs the row
     /// standing commits one immediately.
+    /// Reads a platform credential's durable revocation time.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the read fails or the credential was never revoked.
+    async fn revoked_at_of(fixture: &PgFixture, id: Uuid) -> DateTime<Utc> {
+        sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+            "SELECT revoked_at FROM platform.credentials WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(fixture.operator_pool().pool())
+        .await
+        .expect("revocation time is readable")
+        .expect("revocation time recorded")
+    }
+
     async fn insert_credential(
         fixture: &PgFixture,
         id: Uuid,
         principal: Uuid,
         prefix: &str,
         secret_hash: &str,
-        expires_at: Option<DateTime<Utc>>,
+        lifetime: Option<std::time::Duration>,
     ) {
         let mut conn = fixture
             .operator_pool()
             .begin_platform_audited()
             .await
             .expect("transaction opens");
-        insert_platform_credential_tx(&mut conn, id, principal, prefix, secret_hash, expires_at)
+        insert_platform_credential_tx(&mut conn, id, principal, prefix, secret_hash, lifetime)
             .await
             .expect("credential inserts");
         conn.commit().await.expect("credential commits");
@@ -223,13 +240,12 @@ mod pg_tests {
         )
         .await;
 
-        let now = Utc::now();
         for prefix in ["wyrd_global_a", "wyrd_global_b"] {
             let row = platform_credential_by_prefix(pool, prefix)
                 .await
                 .expect("lookup succeeds")
                 .expect("credential exists");
-            assert!(row.is_usable(now), "{prefix} is live before rotation");
+            assert!(row.usable, "{prefix} is live before rotation");
         }
 
         assert!(revoke_credential(&fixture, old).await);
@@ -238,15 +254,12 @@ mod pg_tests {
             .await
             .expect("lookup succeeds")
             .expect("credential row survives revocation");
-        assert!(
-            !revoked.is_usable(now),
-            "the superseded credential stops working"
-        );
+        assert!(!revoked.usable, "the superseded credential stops working");
         let live = platform_credential_by_prefix(pool, "wyrd_global_b")
             .await
             .expect("lookup succeeds")
             .expect("credential exists");
-        assert!(live.is_usable(now), "the replacement keeps working");
+        assert!(live.usable, "the replacement keeps working");
 
         assert!(
             platform_principal_by_id(pool, principal)
@@ -290,23 +303,13 @@ mod pg_tests {
         .await;
 
         assert!(revoke_credential(&fixture, credential).await);
-        let first = platform_credential_by_prefix(pool, "wyrd_global_once")
-            .await
-            .expect("lookup succeeds")
-            .expect("row exists")
-            .revoked_at
-            .expect("revocation time recorded");
+        let first = revoked_at_of(&fixture, credential).await;
 
         assert!(
             !revoke_credential(&fixture, credential).await,
             "a repeat revocation reports that it changed nothing"
         );
-        let second = platform_credential_by_prefix(pool, "wyrd_global_once")
-            .await
-            .expect("lookup succeeds")
-            .expect("row exists")
-            .revoked_at
-            .expect("revocation time still recorded");
+        let second = revoked_at_of(&fixture, credential).await;
         assert_eq!(first, second, "the original revocation time is preserved");
     }
 
@@ -319,7 +322,6 @@ mod pg_tests {
         };
         let fixture = PgFixture::start().await.expect("fixture starts");
         let pool = fixture.operator_pool();
-        let now = Utc::now();
 
         let suspended = Uuid::now_v7();
         insert_platform_principal(pool, suspended, PrincipalKindTag::GlobalAdmin, "suspended")
@@ -355,7 +357,9 @@ mod pg_tests {
             expired_owner,
             "wyrd_global_exp",
             &verifier("exp"),
-            Some(now - Duration::hours(1)),
+            // A zero lifetime expires the moment PostgreSQL writes it, so
+            // every later statement sees it expired without host-clock aging.
+            Some(std::time::Duration::ZERO),
         )
         .await;
 
@@ -364,7 +368,7 @@ mod pg_tests {
                 .await
                 .expect("lookup succeeds")
                 .expect("row exists");
-            assert!(!row.is_usable(now), "{prefix} must not be usable");
+            assert!(!row.usable, "{prefix} must not be usable");
         }
         assert!(
             platform_credential_by_prefix(pool, "wyrd_global_unknown")
@@ -373,6 +377,145 @@ mod pg_tests {
                 .is_none(),
             "an unknown prefix resolves to nothing for the caller to distinguish"
         );
+    }
+
+    /// Tenant API-key status and the relative expiry it reports both come from
+    /// PostgreSQL, so status, active lookup, and the issued expiry agree.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture, inserts, or status assertions fail.
+    #[tokio::test]
+    async fn tenant_api_key_status_and_relative_expiry_use_database_time() {
+        let Some(_) = database_url() else {
+            return;
+        };
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let principal = Uuid::now_v7();
+        let mut conn = fixture
+            .tenant_conn()
+            .await
+            .expect("tenant connection opens");
+        insert_service_account(
+            &mut conn,
+            principal,
+            "tenant_admin",
+            None,
+            "api-key-clock",
+            None,
+            Uuid::now_v7(),
+        )
+        .await
+        .expect("principal inserts");
+
+        // The insert returns the exact stored expiry the issuance consumer
+        // reports, derived by PostgreSQL from the requested lifetime.
+        let active_id = Uuid::now_v7();
+        let (created_at, expires_at) = insert_api_key(
+            &mut conn,
+            active_id,
+            principal,
+            "wyrd_sk_active",
+            &verifier("active"),
+            principal,
+            Some(std::time::Duration::from_secs(3600)),
+        )
+        .await
+        .expect("active key inserts");
+        let expires_at = expires_at.expect("a bound lifetime yields an expiry");
+        let stored: DateTime<Utc> =
+            sqlx::query_scalar("SELECT expires_at FROM wyrd.auth_api_keys WHERE id = $1")
+                .bind(active_id)
+                .fetch_one(&mut **conn.transaction())
+                .await
+                .expect("stored expiry is readable");
+        assert_eq!(
+            expires_at, stored,
+            "issuance reports exactly the expiry PostgreSQL stored"
+        );
+        assert_eq!(
+            (expires_at - created_at).num_seconds(),
+            3600,
+            "the stored expiry is the requested lifetime after the insert"
+        );
+
+        // A zero lifetime is already expired in database time.
+        let expired_id = Uuid::now_v7();
+        insert_api_key(
+            &mut conn,
+            expired_id,
+            principal,
+            "wyrd_sk_expired",
+            &verifier("expired"),
+            principal,
+            Some(std::time::Duration::ZERO),
+        )
+        .await
+        .expect("expired key inserts");
+
+        let revoked_id = Uuid::now_v7();
+        insert_api_key(
+            &mut conn,
+            revoked_id,
+            principal,
+            "wyrd_sk_revoked",
+            &verifier("revoked"),
+            principal,
+            Some(std::time::Duration::from_secs(3600)),
+        )
+        .await
+        .expect("revoked key inserts");
+        sqlx::query(
+            "UPDATE wyrd.auth_api_keys SET revoked_at = statement_timestamp() WHERE id = $1",
+        )
+        .bind(revoked_id)
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("key revokes");
+
+        assert_eq!(
+            api_key_status_by_prefix(&mut conn, "wyrd_sk_active")
+                .await
+                .expect("status read"),
+            ApiKeyStatus::Active
+        );
+        assert_eq!(
+            api_key_status_by_prefix(&mut conn, "wyrd_sk_expired")
+                .await
+                .expect("status read"),
+            ApiKeyStatus::Expired
+        );
+        assert_eq!(
+            api_key_status_by_prefix(&mut conn, "wyrd_sk_revoked")
+                .await
+                .expect("status read"),
+            ApiKeyStatus::Revoked
+        );
+        assert_eq!(
+            api_key_status_by_prefix(&mut conn, "wyrd_sk_unknown")
+                .await
+                .expect("status read"),
+            ApiKeyStatus::Missing
+        );
+
+        // Status and the active lookup are decided by the same clock.
+        assert!(
+            api_key_by_prefix(&mut conn, "wyrd_sk_active")
+                .await
+                .expect("lookup succeeds")
+                .is_some(),
+            "an active key resolves"
+        );
+        for prefix in ["wyrd_sk_expired", "wyrd_sk_revoked"] {
+            assert!(
+                api_key_by_prefix(&mut conn, prefix)
+                    .await
+                    .expect("lookup succeeds")
+                    .is_none(),
+                "{prefix} must not resolve as an active key"
+            );
+        }
+        conn.commit().await.expect("commits");
     }
 
     /// Listing exposes only non-secret metadata, and the stored verifier is

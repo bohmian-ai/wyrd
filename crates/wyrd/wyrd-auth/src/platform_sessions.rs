@@ -366,7 +366,7 @@ impl PlatformSessions {
         let Some(row) = platform_credential_by_id(&self.pool, credential_id).await? else {
             return Err(PlatformSessionError::Invalid);
         };
-        if row.principal_id != principal_id || !row.is_usable(Utc::now()) {
+        if row.principal_id != principal_id || !row.usable {
             return Err(PlatformSessionError::Invalid);
         }
 

@@ -19,7 +19,6 @@
 
 use std::sync::Arc;
 
-use chrono::{Duration, Utc};
 use secrecy::{ExposeSecret, SecretString};
 use wyrd_auth_oidc::{ClientAuth, IssuerVerification, ScreenedHttp};
 use wyrd_auth_verify::{ExternalClaims, ExternalVerifier};
@@ -43,7 +42,7 @@ use std::fmt::{Debug, Formatter, Result as FmtResult};
 /// The same five minutes the tenant flow allows: long enough for a real
 /// provider round-trip including a password and a second factor, short enough
 /// that an abandoned login is not a standing replay target.
-const LOGIN_STATE_TTL: Duration = Duration::minutes(5);
+const LOGIN_STATE_TTL: std::time::Duration = std::time::Duration::from_mins(5);
 
 /// Failure during platform federated login.
 #[derive(Debug, thiserror::Error)]
@@ -177,7 +176,7 @@ impl PlatformLogin {
             &nonce,
             connection.verification.issuer.as_str(),
             &redirect_uri,
-            Utc::now() + LOGIN_STATE_TTL,
+            LOGIN_STATE_TTL,
         )
         .await?;
 

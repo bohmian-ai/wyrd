@@ -1,6 +1,6 @@
 //! API-key issuance for card-bound non-human principals.
 
-use chrono::{Duration, Utc};
+use chrono::Duration;
 use secrecy::{ExposeSecret, SecretString};
 use uuid::Uuid;
 use wyrd_auth_issue::{self, IssueError};
@@ -108,19 +108,22 @@ impl IssueApiKey {
             .expires_in_seconds
             .and_then(|seconds| Duration::try_seconds(i64::from(seconds)))
             .unwrap_or(self.settings.default_ttl);
-        let now = Utc::now();
-        let expires_at = now + ttl;
-
-        insert_api_key(
+        // PostgreSQL derives the stored expiry from this lifetime and returns
+        // the exact row timestamps, so the response describes what was written.
+        // A negative configured TTL keeps its previous meaning: an already
+        // expired key, not a rejection.
+        let ttl = ttl.to_std().unwrap_or(std::time::Duration::ZERO);
+        let (created_at, expires_at) = insert_api_key(
             conn,
             api_key_id,
             row.id,
             &prefix,
             &key_hash,
             actor.id.as_uuid(),
-            Some(expires_at),
+            Some(ttl),
         )
         .await?;
+        let expires_at = expires_at.expect("a bound API key lifetime always yields an expiry");
 
         Ok(IssuedApiKey {
             response: IssueKeyResponse {
@@ -128,7 +131,7 @@ impl IssueApiKey {
                 key: SecretBearer::new(plaintext.secret.expose_secret().to_owned()),
                 prefix,
                 card_ref: request.card_ref,
-                created_at: now,
+                created_at,
                 expires_at,
             },
             service_account_id: row.id,

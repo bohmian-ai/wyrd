@@ -12,7 +12,6 @@
 //! tenant that is visibly incomplete rather than one that looks live and has no
 //! way in.
 
-use chrono::Duration;
 use secrecy::ExposeSecret;
 use uuid::Uuid;
 use wyrd_auth::platform_authz::{
@@ -52,7 +51,9 @@ const TENANT_ADMIN_ROLE: &str = "admin";
 /// Long, because it is the only way into a brand-new tenant and an operator may
 /// not configure it immediately. Rotating it to something shorter-lived is the
 /// tenant administrator's first available action.
-const INITIAL_CREDENTIAL_DAYS: i64 = 365;
+/// Lifetime of the initial tenant-administrator credential.
+const INITIAL_CREDENTIAL_LIFETIME: std::time::Duration =
+    std::time::Duration::from_secs(365 * 24 * 60 * 60);
 
 /// Tenant provisioning failure.
 #[derive(Debug, thiserror::Error)]
@@ -499,7 +500,7 @@ impl TenantProvisioning {
             &plaintext.prefix,
             &key_hash,
             created_by,
-            Some(chrono::Utc::now() + Duration::days(INITIAL_CREDENTIAL_DAYS)),
+            Some(INITIAL_CREDENTIAL_LIFETIME),
         )
         .await
         .map_err(|e| ProvisionError::Store(e.to_string()))?;

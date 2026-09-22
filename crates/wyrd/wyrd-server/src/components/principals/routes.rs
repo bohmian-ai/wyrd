@@ -14,7 +14,6 @@ use axum::Json;
 use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use chrono::Duration;
 use secrecy::ExposeSecret;
 use std::fmt::Display;
 use uuid::Uuid;
@@ -41,7 +40,9 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 /// Lifetime of a credential issued to tenant automation.
-const AUTOMATION_CREDENTIAL_DAYS: i64 = 90;
+/// Lifetime of an automation principal's first credential.
+const AUTOMATION_CREDENTIAL_LIFETIME: std::time::Duration =
+    std::time::Duration::from_secs(90 * 24 * 60 * 60);
 
 /// Permission every operation on this surface requires.
 const REQUIRED_PERMISSION: &str = "service_accounts:write";
@@ -231,7 +232,7 @@ async fn mint_credential(
         &plaintext.prefix,
         &key_hash,
         created_by,
-        Some(chrono::Utc::now() + Duration::days(AUTOMATION_CREDENTIAL_DAYS)),
+        Some(AUTOMATION_CREDENTIAL_LIFETIME),
     )
     .await
     .map_err(internal)?;

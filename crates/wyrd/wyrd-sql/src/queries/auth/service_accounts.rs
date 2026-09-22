@@ -1,6 +1,8 @@
 //! Tenant-scoped non-human principal and API-key queries.
 // raw-query grep allowlist: auth tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
+use std::time::Duration;
+
 use chrono::{DateTime, Utc};
 use sqlx::Error as SqlxError;
 use sqlx::types::{Json, Uuid};
@@ -82,11 +84,11 @@ pub struct ApiKeyLookupRow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiKeyStatus {
     /// Row exists, `revoked_at IS NULL`, and the credential is unexpired —
-    /// either `expires_at IS NULL` or `expires_at > now()`.
+    /// either `expires_at IS NULL` or `expires_at > statement_timestamp()`.
     Active,
     /// Row exists and `revoked_at IS NOT NULL`.
     Revoked,
-    /// Row exists, is not revoked, and `expires_at <= now()`.
+    /// Row exists, is not revoked, and `expires_at <= statement_timestamp()`.
     Expired,
     /// No row matches the prefix.
     Missing,
@@ -249,9 +251,12 @@ pub async fn tenant_admin_principal_id(
 ///
 /// Stores only the Argon2 verifier and non-secret lookup metadata; the
 /// plaintext is returned once by the issuing caller and never persisted.
-/// `expires_at` is optional: an administrative credential issued during tenant
-/// provisioning or recovery has no natural lifetime, while a workload key keeps
-/// the bounded expiry its issuance path supplies.
+/// `lifetime` is optional: an administrative credential issued during tenant
+/// provisioning or recovery has no natural lifetime, while a workload key
+/// supplies the bounded lifetime its issuance path requested. PostgreSQL turns
+/// that lifetime into the stored expiry, and the insert returns the exact
+/// `created_at` and `expires_at` it wrote so no caller reconstructs them from
+/// the host clock.
 ///
 /// # Errors
 /// Returns the database error when the insert fails, including when `prefix`
@@ -263,13 +268,17 @@ pub async fn insert_api_key(
     prefix: &str,
     key_hash: &str,
     created_by: Uuid,
-    expires_at: Option<DateTime<Utc>>,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
+    lifetime: Option<Duration>,
+) -> Result<(DateTime<Utc>, Option<DateTime<Utc>>), sqlx::Error> {
+    sqlx::query_as(
         r#"
         INSERT INTO wyrd.auth_api_keys (
             id, data_tenant_id, principal_id, prefix, key_hash, created_by, expires_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ) VALUES ($1, $2, $3, $4, $5, $6,
+                  CASE WHEN $7::double precision IS NULL THEN NULL
+                       ELSE statement_timestamp() + ($7 * interval '1 second')
+                  END)
+        RETURNING created_at, expires_at
         "#,
     )
     .bind(id)
@@ -278,10 +287,9 @@ pub async fn insert_api_key(
     .bind(prefix)
     .bind(key_hash)
     .bind(created_by)
-    .bind(expires_at)
-    .execute(&mut **conn.transaction())
-    .await?;
-    Ok(())
+    .bind(lifetime.map(|lifetime| lifetime.as_secs_f64()))
+    .fetch_one(&mut **conn.transaction())
+    .await
 }
 
 /// Lookup an unexpired, unrevoked API key by prefix.
@@ -309,7 +317,7 @@ pub async fn api_key_by_prefix(
          WHERE k.data_tenant_id = $1
            AND k.prefix = $2
            AND k.revoked_at IS NULL
-           AND (k.expires_at IS NULL OR k.expires_at > now())
+           AND (k.expires_at IS NULL OR k.expires_at > statement_timestamp())
          LIMIT 1
         "#,
     )
@@ -321,15 +329,19 @@ pub async fn api_key_by_prefix(
 
 /// Resolve an API key status by prefix without filtering invalid states.
 ///
+/// The revoked/expired verdict is computed by the same statement that owns the
+/// row, so status and the active-key lookup cannot disagree over clock skew.
+///
 /// # Errors
 /// Returns a SQLx error when Postgres rejects the query or row decoding fails.
 pub async fn api_key_status_by_prefix(
     conn: &mut TenantConn<'_>,
     prefix: &str,
 ) -> Result<ApiKeyStatus, sqlx::Error> {
-    let row: Option<(Option<DateTime<Utc>>, DateTime<Utc>)> = sqlx::query_as(
+    let row: Option<(bool, bool)> = sqlx::query_as(
         r#"
-        SELECT revoked_at, expires_at
+        SELECT revoked_at IS NOT NULL,
+               COALESCE(expires_at <= statement_timestamp(), false)
           FROM wyrd.auth_api_keys
          WHERE data_tenant_id = $1
            AND prefix = $2
@@ -343,9 +355,9 @@ pub async fn api_key_status_by_prefix(
 
     Ok(match row {
         None => ApiKeyStatus::Missing,
-        Some((Some(_), _)) => ApiKeyStatus::Revoked,
-        Some((None, expires_at)) if expires_at <= Utc::now() => ApiKeyStatus::Expired,
-        Some((None, _)) => ApiKeyStatus::Active,
+        Some((true, _)) => ApiKeyStatus::Revoked,
+        Some((false, true)) => ApiKeyStatus::Expired,
+        Some((false, false)) => ApiKeyStatus::Active,
     })
 }
 
@@ -428,13 +440,13 @@ mod tests {
          WHERE k.data_tenant_id = $1
            AND k.prefix = $2
            AND k.revoked_at IS NULL
-           AND (k.expires_at IS NULL OR k.expires_at > now())
+           AND (k.expires_at IS NULL OR k.expires_at > statement_timestamp())
          LIMIT 1
         "#;
 
         assert!(sql.contains("k.prefix = $2"));
         assert!(sql.contains("k.revoked_at IS NULL"));
-        assert!(sql.contains("(k.expires_at IS NULL OR k.expires_at > now())"));
+        assert!(sql.contains("(k.expires_at IS NULL OR k.expires_at > statement_timestamp())"));
         assert!(sql.contains("sa.id = k.principal_id"));
         assert!(sql.contains("sa.data_tenant_id = k.data_tenant_id"));
     }

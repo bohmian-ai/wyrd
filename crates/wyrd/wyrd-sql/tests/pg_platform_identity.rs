@@ -11,7 +11,6 @@ mod pg_tests {
     //! Skipped automatically when the database environment is unset so the
     //! default suite stays credential-free.
 
-    use chrono::{Duration, Utc};
     use serde_json::Value as JsonValue;
     use uuid::Uuid;
     use wyrd_dev_fixtures::pg::PgFixture;
@@ -161,7 +160,7 @@ mod pg_tests {
             "nonce-1",
             ISSUER,
             "https://wyrd.example/callback",
-            Utc::now() + Duration::minutes(5),
+            std::time::Duration::from_mins(5),
         )
         .await
         .expect("state inserts");
@@ -198,7 +197,8 @@ mod pg_tests {
             "nonce",
             ISSUER,
             "https://wyrd.example/callback",
-            Utc::now() - Duration::seconds(1),
+            // A zero lifetime expires the instant PostgreSQL writes it.
+            std::time::Duration::ZERO,
         )
         .await
         .expect("state inserts");
@@ -235,7 +235,7 @@ mod pg_tests {
             "n",
             ISSUER,
             "https://wyrd.example/callback",
-            Utc::now() + Duration::minutes(5),
+            std::time::Duration::from_mins(5),
         )
         .await
         .expect("live state inserts");
@@ -246,7 +246,7 @@ mod pg_tests {
             "n",
             ISSUER,
             "https://wyrd.example/callback",
-            Utc::now() - Duration::minutes(5),
+            std::time::Duration::ZERO,
         )
         .await
         .expect("dead state inserts");

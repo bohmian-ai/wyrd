@@ -11,7 +11,6 @@
 //! platform principal that recovers a tenant still cannot read or write
 //! anything inside it.
 
-use chrono::Duration;
 use secrecy::ExposeSecret;
 use uuid::Uuid;
 use wyrd_auth::platform_authz::{PlatformAuthorization, tenant_resource};
@@ -30,7 +29,9 @@ use std::fmt::{Debug, Formatter, Result as FmtResult};
 ///
 /// Matches the credential issued at provisioning: recovery restores the same
 /// kind of access, not a lesser or more urgent one.
-const RECOVERY_CREDENTIAL_DAYS: i64 = 365;
+/// Lifetime of a recovery-issued tenant-administrator credential.
+const RECOVERY_CREDENTIAL_LIFETIME: std::time::Duration =
+    std::time::Duration::from_secs(365 * 24 * 60 * 60);
 
 /// Restores administrative access to tenants that have lost it.
 #[derive(Clone)]
@@ -133,7 +134,7 @@ impl TenantRecovery {
             &plaintext.prefix,
             &key_hash,
             caller.principal_id().as_uuid(),
-            Some(chrono::Utc::now() + Duration::days(RECOVERY_CREDENTIAL_DAYS)),
+            Some(RECOVERY_CREDENTIAL_LIFETIME),
         )
         .await
         .map_err(|e| ProvisionError::Store(e.to_string()))?;

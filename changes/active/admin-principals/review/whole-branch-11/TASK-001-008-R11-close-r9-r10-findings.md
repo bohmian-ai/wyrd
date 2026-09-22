@@ -334,3 +334,38 @@ Approved `VER-003` forbids substituting or requiring `mise run gate`; do not
 run it as remediation evidence. Append one evidence table mapping every
 acceptance row to implementation commits, exact focused commands and positive
 selected counts, owning lanes, and results.
+
+## Implementation evidence
+
+Candidate: `395a0dee5` on `claude/admin-principals-spec-qfsmjc`. Focused commands
+ran through `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run
+db:migrate:all:inner && mise exec -- <command>'` where Postgres is required.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| `R11-1` production delegation without preview | `c7a87f76c` removes the preview config, error, state, builder switch, docs, and TS error code | `cargo nextest run --locked -p wyrd-server --lib -E 'test(=config::tests::production_auth_carries_no_preview_setting)'`: 1 passed; `cargo nextest run --locked -p wyrd-server --test pg_router_smoke -E 'test(=production_valid_target_serves_token_exchange_without_preview)'`: 1 passed | PASS |
+| `R11-2` `auth.token.exchange` / `invoke` on every delegation decision | `4c98bb397` (`exchange_api_key.rs`, `issuance.rs`) | `-p wyrd-auth --lib -E 'test(=exchange_api_key::pg_tests::<name>)'` each 1 passed for `an_exchange_names_subject_and_actor_and_carries_only_the_intersection`, `a_policy_denied_exchange_commits_one_denied_decision`, `an_allowed_exchange_for_a_missing_actor_commits_one_allowed_decision`, `a_refused_exchange_audit_issues_no_token`; `-p wyrd-server --test pg_openapi_contract -E 'test(=an_unstageable_exchange_audit_answers_with_a_code_the_token_operation_documents)'`: 1 passed | PASS |
+| `R11-3` directed A→B succeeds, B→A denied with one denied decision | `bb6788b99` | `cargo nextest run --locked -p wyrd-testing --test server --run-ignored=all -E 'test(=query::service_b_acts_for_service_a_with_only_a_table_authority)'`: 1 passed | PASS |
+| `R11-4` Python/TS Bifrost consume a delegated client | `f7655e90f` (Python), `7fec8a115` (TS) | `uv run python -m pytest -q -m integration tests/integration/bifrost/test_bifrost_e2e.py -k 'test_delegated_client_reads_as_a_and_cannot_write_with_b_authority or test_client_cannot_be_combined_with_transport_options'` (in `sdks/wyrd-sdk-python`): 2 passed; `pnpm exec vitest run tests/integration/bifrost-write.test.ts -t "reads as A but cannot write with B's authority through a delegated client"` (in `sdks/wyrd-sdk-ts/wyrd`): 1 passed (covers env-only construction and the client/credential conflict refusal); `mise run py:test:integration`: 57 passed; `mise run ts:test:integration`: 18 passed | PASS |
+| `R11-5` delegated native ingest keeps subject A and actor B | `5c17276ed` (`gate_audit.rs`), proved in `bb6788b99` | R11-3 journey above (delegated ingest denied before effect with A/B attribution; direct-B ingest succeeds) | PASS |
+| `R11-6` query docs use the ambient credential chain | `7da7b5185` (`reading-data.svx`) | `-p wyrd-cli --lib -E 'test(=cli::tests::no_shipped_command_takes_a_secret_argument)'`: 1 passed; `-E 'test(=cli::tests::the_root_parser_refuses_every_former_secret_option_without_echo)'`: 1 passed; `mise run docs:check`: pass | PASS |
+| `R9-2` issued key credential id is a UUID | `710a3fd0a` | `-p wyrd-server --test pg_openapi_contract -E 'test(=credential_ids_publish_their_uuid_contract)'`: 1 passed; `-p wyrd-cli --test cli -E 'test(=auth_issue_key_journey::auth_issue_key_cli_journey)'`: 1 passed (2.7s, real server) | PASS |
+| `R11-7` R9/R10 Rust items documented | `bf85bc038` (inventory: its 29-file diff across wyrd-auth-check, wyrd-auth-issue, wyrd-auth-verify, wyrd-client, wyrd-runtime, wyrd-spec, wyrd-auth, wyrd-cli, wyrd-server, wyrd-testing) | `mise run check:docs` (strict `-D missing_docs -D rustdoc::broken_intra_doc_links`): pass; the focused tests above | PASS |
+| `R11-8` TS authority permits only the thin shared-client projection | `7da7b5185` (`typescript-guide.md`) | Review of the diff: duplication bans retained; `mise run ts:typecheck`: pass | PASS |
+
+Owning lanes on this candidate: `mise run test:principals:unit` (39 passed),
+`mise run test:principals:integration` (77 passed), `mise run test:cli:journey`,
+the `auth_e2e` command (8 passed), `mise run test:wyrd` (2024 passed),
+`mise run test:sql` (247 passed), `mise run test:identity:journey` (20 passed),
+`mise run test:shared` (658 passed), `mise run test:bifrost` (9/9 lanes),
+`fmt:check`, `lints`, `py:format:check`, `py:lints`, `py:typecheck`,
+`py:test:unit`, `ts:typecheck`, `ts:test:unit`, `codegen:check`, and the
+`check:client-tier`, `check:pyo3-scope`, `check:unwrap-audit`,
+`check:clippy-allow-audit`, `check:tenant-isolation`, and
+`check:from-pools-allowlist` boundary checks: all pass.
+
+Harness corrections made while proving this task, outside the R11 findings:
+`WyrdTestServer` now traces through the process telemetry stack (`a2dee208b`);
+the `WYRD_*_E2E` early-returns, which reported 110 unrun Postgres tests as
+passed, are deleted and those suites run in `test:wyrd`/`test:sql`
+(`1fec93048`, `395a0dee5`). Non-goals stayed excluded.

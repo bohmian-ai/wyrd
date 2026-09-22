@@ -64,15 +64,13 @@ fn assert_cli_problem(problem: &Value, expected: &WyrdError) {
 
 /// The compiled CLI reads two seeded rows and reports a successful terminal.
 ///
-/// This journey requires the serialized Postgres-backed CLI lane; the default
-/// Wyrd test lane intentionally remains database-free.
+/// Runs in the Postgres-backed `test:wyrd` lane on its own isolated server.
 ///
 /// # Panics
 /// Panics when the server, fixture, or shutdown fails, the CLI exits
 /// non-zero, stdout rows are not UTF-8 JSON equal to the seeded rows, or the
 /// final stderr line is not a complete two-row success terminal.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires the serialized Postgres-backed CLI journey lane"]
 async fn query_command_reads_seeded_table() {
     let server = WyrdTestServer::start_bound()
         .await
@@ -129,7 +127,6 @@ async fn query_command_reads_seeded_table() {
 /// structured problem matching the typed error, or either refusal changes the
 /// Bifrost read-decision count.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires the serialized Postgres-backed CLI journey lane"]
 async fn query_command_denial_preserves_problem_without_read_decision() {
     let server = WyrdTestServer::start_bound()
         .await

@@ -762,10 +762,6 @@ mod pg_tests {
 
     #[tokio::test]
     async fn card_lifecycle_cli_journey() {
-        if std::env::var("WYRD_CLI_E2E").as_deref() != Ok("1") {
-            return;
-        }
-
         let temp = tempfile::tempdir().expect("tempdir creates");
         let path = write_prompt(&temp);
         let (server, base_url, storage_root, shutdown, serve_handle) = start_cli_server().await;
@@ -1222,7 +1218,6 @@ mod pg_tests {
     /// server awaiting cleanup; the published bundle is written atomically and
     /// offline loading does not leave partial in-memory state.
     #[tokio::test]
-    #[ignore = "requires embedded Postgres WyrdTestServer"]
     async fn cli_bundle_loads_typed_wyrdstate_after_server_shutdown() {
         let fixture = RuntimeServiceFixture::new().expect("typed fixture copies");
         let server = WyrdTestServer::start_bound()
@@ -1390,10 +1385,6 @@ mod pg_tests {
     /// all registered state belongs to the journey's isolated tenant.
     #[tokio::test]
     async fn canonical_authored_directory_runs_real_cli_journey() {
-        if std::env::var("WYRD_CLI_E2E").as_deref() != Ok("1") {
-            return;
-        }
-
         let fixture_root =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/loader/end_to_end");
         let data_path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1499,10 +1490,6 @@ mod pg_tests {
     /// Prove real registry output hydrates into runtime state and rejects metadata-only output.
     #[tokio::test]
     async fn multi_card_service_get_hydrates_complete_and_metadata_bundles() {
-        if std::env::var("WYRD_CLI_E2E").as_deref() != Ok("1") {
-            return;
-        }
-
         let temp = tempfile::tempdir().expect("tempdir creates");
         let service_path = write_multi_card_service(&temp);
         let (server, base_url, storage_root, shutdown, serve_handle) = start_cli_server().await;
@@ -1906,10 +1893,6 @@ mod pg_tests {
     /// not report the fail-closed refusal.
     #[tokio::test]
     async fn apply_refuses_when_completion_decision_audit_fails() {
-        if std::env::var("WYRD_CLI_E2E").as_deref() != Ok("1") {
-            return;
-        }
-
         let temp = tempfile::tempdir().expect("tempdir creates");
         let path = write_prompt(&temp);
         let (server, base_url, _storage_root, shutdown, serve_handle) = start_cli_server().await;
@@ -1983,7 +1966,6 @@ mod pg_tests {
     /// Cancellation can leave the isolated test server awaiting shutdown, but
     /// the registry materializer keeps an incomplete destination unpublished.
     #[tokio::test]
-    #[ignore = "requires embedded Postgres WyrdTestServer"]
     async fn cli_load_renders_download_progress() {
         let temp = tempfile::tempdir().expect("tempdir creates");
         let path = write_prompt(&temp);
@@ -2058,7 +2040,6 @@ mod pg_tests {
     /// Cancellation can leave the isolated test server awaiting shutdown, but
     /// the graph hydrator removes its unpublished staging bundle on failure.
     #[tokio::test]
-    #[ignore = "requires embedded Postgres WyrdTestServer"]
     async fn cli_get_renders_download_progress() {
         let temp = tempfile::tempdir().expect("tempdir creates");
         let path = write_prompt(&temp);

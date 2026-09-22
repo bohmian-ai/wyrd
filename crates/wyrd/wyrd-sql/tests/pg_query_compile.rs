@@ -3,10 +3,7 @@ mod pg_tests {
     //!
     //! Validates that compiled SQL + binds execute correctly against Postgres and
     //! that the chosen NULL semantics hold for typed-column negation operators.
-    //! Requires a live database. Opt in via `WYRD_REG_E2E=1 cargo test --features
-    //! testing -- --include-ignored`.
-
-    use std::env;
+    //! Requires a live database; the Postgres-backed `test:sql` lane provides it.
 
     use sqlx::{PgConnection, Postgres, QueryBuilder, Row};
     use wyrd_dev_fixtures::pg::PgFixture;
@@ -14,17 +11,10 @@ mod pg_tests {
     use wyrd_spec::query::{FieldRef, MetadataQuery, QueryFieldErrorDetail, ValueType};
     use wyrd_sql::query::{FieldColumn, FieldResolver, compile_query};
 
-    fn should_run_e2e() -> bool {
-        env::var("WYRD_REG_E2E").as_deref() == Ok("1")
-    }
-
     macro_rules! e2e_test {
         ($name:ident, $body:block) => {
             #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
             async fn $name() {
-                if !should_run_e2e() {
-                    return;
-                }
                 $body
             }
         };

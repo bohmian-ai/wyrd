@@ -154,10 +154,6 @@ pub(crate) async fn machine_token(server: &WyrdTestServer, bootstrap: &Bootstrap
 /// authenticated, so the refused exchange is the revocation's doing.
 #[tokio::test]
 async fn principal_revoke_cli_journey() {
-    if std::env::var("WYRD_CLI_E2E").as_deref() != Ok("1") {
-        return;
-    }
-
     let (server, base_url, shutdown, serve_handle) = start_served("principal revoke").await;
     let admin = server
         .bootstrap_service("cli-revoke-admin", &["admin"])
@@ -220,10 +216,6 @@ async fn principal_revoke_cli_journey() {
 /// guess: a CLI that decided this itself would be a second, driftable policy.
 #[tokio::test]
 async fn principal_revoke_cli_journey_refuses_an_unprivileged_caller() {
-    if std::env::var("WYRD_CLI_E2E").as_deref() != Ok("1") {
-        return;
-    }
-
     let (server, base_url, shutdown, serve_handle) = start_served("principal revoke denial").await;
     let caller = server
         .bootstrap_service("cli-revoke-unprivileged", &["reader"])

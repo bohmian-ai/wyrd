@@ -8,7 +8,7 @@
 //! unit test can establish: a platform session cannot reach tenant resources
 //! and a tenant token cannot reach the tenant directory.
 //!
-//! Gated on `WYRD_AUTH_E2E` so the default lane stays server-free.
+//! Runs in the Postgres-backed `test:wyrd` lane like every other server suite.
 
 use secrecy::SecretString;
 use sqlx::PgPool;
@@ -28,11 +28,6 @@ use wyrd_testing::WyrdTestServer;
 /// Spelled here rather than imported because the server keeps it private: a test
 /// that hard-codes it fails if the wire name ever changes, which is the point.
 const WYRD_ACCESS_TOKEN_HEADER: &str = "x-wyrd-access-token";
-
-/// Skip unless the gated end-to-end lane is selected.
-fn e2e_enabled() -> bool {
-    env::var("WYRD_AUTH_E2E").is_ok()
-}
 
 /// Establish the deployment's root and hand back the credential it disclosed.
 ///
@@ -117,9 +112,6 @@ async fn platform_session(srv: &WyrdTestServer, credential: &str) -> String {
 /// access after the first step.
 #[tokio::test]
 async fn operator_provisions_a_usable_tenant_without_touching_the_database() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
@@ -180,9 +172,6 @@ async fn operator_provisions_a_usable_tenant_without_touching_the_database() {
 /// Re-running initialization refuses rather than minting a second root.
 #[tokio::test]
 async fn initialization_happens_at_most_once() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
@@ -236,9 +225,6 @@ fn operator_command(subcommand: &str, database: &str) -> Command {
 /// the credential anywhere but the first run's stdout.
 #[tokio::test]
 async fn an_operator_initializes_the_deployment_through_the_shipped_binary() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
@@ -319,9 +305,6 @@ async fn an_operator_initializes_the_deployment_through_the_shipped_binary() {
 /// manual SQL.
 #[tokio::test]
 async fn an_operator_recovers_from_losing_every_platform_credential() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
@@ -490,9 +473,6 @@ fn printed_credential(stdout: &[u8]) -> String {
 /// Neither plane can act on the other, in both directions.
 #[tokio::test]
 async fn the_two_control_planes_cannot_reach_each_other() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
@@ -581,9 +561,6 @@ async fn the_two_control_planes_cannot_reach_each_other() {
 /// request against a real route can show it holds.
 #[tokio::test]
 async fn revoking_a_platform_credential_ends_its_live_sessions() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
@@ -640,9 +617,6 @@ async fn revoke_every_platform_credential(srv: &WyrdTestServer) {
 /// request after its principal is suspended. Nothing is cached to invalidate.
 #[tokio::test]
 async fn a_live_platform_session_observes_grant_withdrawal_and_suspension_on_its_next_request() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
@@ -711,9 +685,6 @@ async fn a_live_platform_session_observes_grant_withdrawal_and_suspension_on_its
 /// issues a replacement for the same principal.
 #[tokio::test]
 async fn tenant_administration_survives_losing_every_credential() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
@@ -842,9 +813,6 @@ async fn provisioned_tenant_admin(srv: &WyrdTestServer, slug: &str) -> String {
 /// no ordering between the two tokens is involved.
 #[tokio::test]
 async fn a_tenant_rotates_an_automation_credential_without_an_outage() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
@@ -1000,9 +968,6 @@ async fn a_tenant_rotates_an_automation_credential_without_an_outage() {
 /// surviving credential working.
 #[tokio::test]
 async fn replaying_a_revoke_does_not_disturb_the_surviving_credential() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
@@ -1109,9 +1074,6 @@ async fn replaying_a_revoke_does_not_disturb_the_surviving_credential() {
 /// tokens.
 #[tokio::test]
 async fn a_revoked_credential_mints_nothing_and_its_token_lapses_at_expiry() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = wyrd_testing::WyrdTestServerBuilder::default()
         .with_access_ttl(chrono::Duration::seconds(4))
         .with_auth_verify_settings(wyrd_auth_verify::WyrdAuthVerifySettings {
@@ -1243,9 +1205,6 @@ async fn a_revoked_credential_mints_nothing_and_its_token_lapses_at_expiry() {
 /// A credential can only be revoked through the principal that owns it.
 #[tokio::test]
 async fn a_credential_cannot_be_revoked_through_another_principal() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
@@ -1328,9 +1287,6 @@ async fn a_credential_cannot_be_revoked_through_another_principal() {
 /// roles it was granted, so it needs a real request from a real token.
 #[tokio::test]
 async fn automation_cannot_escalate_itself_to_an_administrator() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
@@ -1402,9 +1358,6 @@ fn platform_request(
 /// operator out of their own deployment.
 #[tokio::test]
 async fn an_operator_configures_and_removes_federated_platform_sign_in() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
@@ -1671,9 +1624,6 @@ async fn an_operator_configures_and_removes_federated_platform_sign_in() {
 /// A tenant administrator cannot configure who signs in to the platform.
 #[tokio::test]
 async fn a_tenant_administrator_cannot_configure_platform_sign_in() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
@@ -1707,9 +1657,6 @@ async fn a_tenant_administrator_cannot_configure_platform_sign_in() {
 /// screening this route would be an SSRF primitive.
 #[tokio::test]
 async fn a_connection_cannot_name_an_unresolvable_issuer() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
@@ -1762,9 +1709,6 @@ async fn a_connection_cannot_name_an_unresolvable_issuer() {
 /// unremovable without direct database access.
 #[tokio::test]
 async fn an_operator_lists_and_suspends_platform_administrators() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
@@ -1864,9 +1808,6 @@ async fn an_operator_lists_and_suspends_platform_administrators() {
 /// The deployment cannot be locked out of its own control plane.
 #[tokio::test]
 async fn the_last_active_platform_principal_cannot_be_suspended() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
@@ -1936,9 +1877,6 @@ async fn the_last_active_platform_principal_cannot_be_suspended() {
 /// bearing entry to a tenant converges.
 #[tokio::test]
 async fn a_suspended_tenant_admits_no_credential() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
@@ -2001,9 +1939,6 @@ async fn a_suspended_tenant_admits_no_credential() {
 /// may already have written rows under it.
 #[tokio::test]
 async fn a_failed_provisioning_can_be_retried_with_the_same_slug() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
@@ -2140,9 +2075,6 @@ async fn a_failed_provisioning_can_be_retried_with_the_same_slug() {
 /// An occupied slug is still a conflict.
 #[tokio::test]
 async fn an_active_tenant_slug_is_still_refused() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
@@ -2214,9 +2146,6 @@ fn assert_safe_problem(body: &Value, code: &str) {
 /// serialize their source text into `details`.
 #[tokio::test]
 async fn served_platform_failures_disclose_nothing_internal() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
@@ -2299,9 +2228,6 @@ async fn served_platform_failures_disclose_nothing_internal() {
 /// database, so nothing in the server is mocked out of the path.
 #[tokio::test]
 async fn an_unrecordable_tenant_mutation_leaves_nothing_behind() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
@@ -2385,9 +2311,6 @@ async fn an_unrecordable_tenant_mutation_leaves_nothing_behind() {
 /// while leaving the replacement's untouched.
 #[tokio::test]
 async fn an_operator_rotates_the_deployment_root_credential() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
@@ -2557,9 +2480,6 @@ async fn an_operator_rotates_the_deployment_root_credential() {
 /// accepted reason is what the audit row carries.
 #[tokio::test]
 async fn a_tenant_revokes_a_compromised_principal_with_its_reason() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
@@ -2737,9 +2657,6 @@ async fn a_tenant_revokes_a_compromised_principal_with_its_reason() {
 /// the same principal comes back and its grants still administer the tenant.
 #[tokio::test]
 async fn recovery_is_refused_for_every_state_but_active() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
@@ -2890,9 +2807,6 @@ async fn recovery_is_refused_for_every_state_but_active() {
 /// target exists.
 #[tokio::test]
 async fn one_tenant_cannot_reach_another_tenants_identities() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
@@ -3076,9 +2990,6 @@ async fn one_tenant_cannot_reach_another_tenants_identities() {
 /// suspension freezes a tenant rather than dismantling it.
 #[tokio::test]
 async fn an_operator_suspends_and_resumes_a_tenant_through_the_platform_plane() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
@@ -3282,9 +3193,6 @@ async fn an_operator_suspends_and_resumes_a_tenant_through_the_platform_plane() 
 /// way to fail the tenant transaction at `COMMIT` rather than at a statement.
 #[tokio::test]
 async fn every_durable_provisioning_stage_fails_closed_and_retries_clean() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
@@ -3495,9 +3403,6 @@ async fn every_durable_provisioning_stage_fails_closed_and_retries_clean() {
 /// usable credential.
 #[tokio::test]
 async fn interrupted_and_racing_provisioning_converge_on_one_tenant() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
@@ -3706,9 +3611,6 @@ async fn interrupted_and_racing_provisioning_converge_on_one_tenant() {
 /// deployment with two administrative roots, each believing it is the only one.
 #[tokio::test(flavor = "multi_thread")]
 async fn initialization_has_exactly_one_winner_under_concurrency() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
@@ -3747,9 +3649,6 @@ async fn initialization_has_exactly_one_winner_under_concurrency() {
 /// unadministrable.
 #[tokio::test]
 async fn a_terminal_that_cannot_take_the_credential_leaves_nothing_behind() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
@@ -3825,9 +3724,6 @@ async fn a_terminal_that_cannot_take_the_credential_leaves_nothing_behind() {
 /// error path is tempted to print what it was holding.
 #[tokio::test]
 async fn initialization_retries_cleanly_after_a_failure_at_each_write() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
@@ -3977,9 +3873,6 @@ impl Write for CaptureWriter {
 /// and the refusal is the same on the tenth attempt as on the first.
 #[tokio::test]
 async fn an_uninitialized_deployment_serves_tenants_and_refuses_the_platform_plane() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
@@ -4124,9 +4017,6 @@ async fn staged_decisions(pool: &PgPool, operation: &str, outcome: &str) -> i64 
 /// one, or mutates anything.
 #[tokio::test]
 async fn an_authorized_request_that_changes_nothing_still_records_the_decision() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
@@ -4438,9 +4328,6 @@ async fn staged_platform_decisions(pool: &PgPool, outcome: &str) -> i64 {
 /// with.
 #[tokio::test]
 async fn a_failed_platform_mutation_leaves_no_allowance() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
@@ -4659,9 +4546,6 @@ async fn a_failed_platform_mutation_leaves_no_allowance() {
 /// `identity_e2e::human_oidc_login_journey` drives end to end.
 #[tokio::test]
 async fn a_tenant_administrator_renews_by_re_exchanging_its_credential() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");
@@ -4750,9 +4634,6 @@ async fn a_tenant_administrator_renews_by_re_exchanging_its_credential() {
 /// behave as an operator following the documented path would require.
 #[tokio::test]
 async fn a_trailing_slash_platform_issuer_completes_first_login() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process()
         .await
         .expect("server starts");

@@ -91,8 +91,6 @@ async fn discovery_server() -> (MockServer, String) {
 
 /// An operator administers a deployment end to end through the shipped binary.
 ///
-/// Skips unless `WYRD_CLI_E2E=1`.
-///
 /// # Panics
 /// Panics when deployment initialization fails, any CLI step fails or reports
 /// unexpected fields, an uncredentialed command is not refused with its
@@ -100,10 +98,6 @@ async fn discovery_server() -> (MockServer, String) {
 /// exchange and serve `/v1` status, or the credential listing is empty.
 #[tokio::test]
 async fn operator_administers_a_deployment_through_the_cli() {
-    if std::env::var("WYRD_CLI_E2E").as_deref() != Ok("1") {
-        return;
-    }
-
     let (server, base_url, shutdown, serve_handle) = start_served("operator workflow").await;
     let root = server
         .initialize_platform_root()

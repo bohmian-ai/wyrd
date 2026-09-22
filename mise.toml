@@ -99,13 +99,11 @@ cargo test --locked -p wyrd-server --lib components::cards
 
 [tasks."test:cards:integration"]
 description = "Run the durable card registration Postgres suite"
-env = { WYRD_REG_E2E = "1" }
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:cards:integration:inner'"
 
 [tasks."test:cards:integration:inner"]
 hide = true
 description = "Run the durable card registration Postgres suite with its lifecycle already provisioned"
-env = { WYRD_REG_E2E = "1" }
 run = """
 cargo test --locked -p wyrd-sql --test pg_cards_register -- --nocapture --test-threads=1
 cargo test --locked -p wyrd-server --test pg_card_registration_route -- --nocapture --test-threads=1
@@ -123,13 +121,11 @@ cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^issuance::tests::/)'
 
 [tasks."test:platform:journey"]
 description = "Real-server operator journey: init, platform session, tenant provisioning, recovery"
-env = { WYRD_AUTH_E2E = "1" }
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:platform:journey:inner'"
 
 [tasks."test:platform:journey:inner"]
 hide = true
 description = "Run the real-server platform administration journey with its lifecycle already provisioned"
-env = { WYRD_AUTH_E2E = "1" }
 run = "cargo nextest run --locked -p wyrd-server --test platform_admin_e2e"
 
 [tasks."test:principals:integration"]
@@ -155,13 +151,11 @@ cargo nextest run --locked -p wyrd-server --test pg_openapi_contract
 
 [tasks."test:cli:journey"]
 description = "Run the real-server CLI Card lifecycle journey"
-env = { WYRD_CLI_E2E = "1" }
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:cli:journey:inner'"
 
 [tasks."test:cli:journey:inner"]
 hide = true
 description = "Run the real-server CLI Card lifecycle journey with its lifecycle already provisioned"
-env = { WYRD_CLI_E2E = "1" }
 run = "cargo test --locked -p wyrd-cli --test cli -- --nocapture --test-threads=1"
 
 [tasks."test:wyrdstate:journey"]
@@ -172,7 +166,7 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:a
 hide = true
 description = "Run the real-server CLI and Rust SDK typed WyrdState journeys with their lifecycle already provisioned"
 run = [
-  "cargo test --locked -p wyrd-cli --test cli -- --ignored cli_bundle_loads_typed_wyrdstate_after_server_shutdown --nocapture --test-threads=1",
+  "cargo nextest run --locked -p wyrd-cli --test cli -E 'test(=card_lifecycle::pg_tests::cli_bundle_loads_typed_wyrdstate_after_server_shutdown)'",
   "cargo nextest run --locked -p wyrd-sdk-rust --test cards_state --run-ignored all -E 'test(=registers_reads_hydrates_and_loads_offline_state)'",
 ]
 
@@ -448,18 +442,18 @@ run = "cargo nextest run --locked -p wyrd-tonic --features server,client"
 hide = true
 description = """Stand up real OIDC providers (Keycloak + Dex), seed test users via the Keycloak
 admin REST API, export env gates, run the identity e2e suite against both issuers, then tear down.
-Gated by WYRD_IDENTITY_E2E=1; skipped when the env var is unset so default local runs are fast.
+Its tests are #[ignore]d so the family lanes, which start no identity providers, skip them visibly.
 """
-env = { WYRD_IDENTITY_E2E = "1", WYRD_KEYCLOAK_ISSUER = "http://localhost:8080/realms/wyrd-test", WYRD_DEX_ISSUER = "http://localhost:5556" }
+env = { WYRD_KEYCLOAK_ISSUER = "http://localhost:8080/realms/wyrd-test", WYRD_DEX_ISSUER = "http://localhost:5556" }
 
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:identity:journey:inner'"
 [tasks."test:identity:journey:inner"]
 hide = true
 description = """Stand up real OIDC providers (Keycloak + Dex), seed test users via the Keycloak
 admin REST API, export env gates, run the identity e2e suite against both issuers, then tear down.
-Gated by WYRD_IDENTITY_E2E=1; skipped when the env var is unset so default local runs are fast.
+Its tests are #[ignore]d so the family lanes, which start no identity providers, skip them visibly.
 """
-env = { WYRD_IDENTITY_E2E = "1", WYRD_KEYCLOAK_ISSUER = "http://localhost:8080/realms/wyrd-test", WYRD_DEX_ISSUER = "http://localhost:5556" }
+env = { WYRD_KEYCLOAK_ISSUER = "http://localhost:8080/realms/wyrd-test", WYRD_DEX_ISSUER = "http://localhost:5556" }
 run = """
 set -e
 
@@ -540,7 +534,7 @@ create_user("bob", "bob@wyrd.test", "wyrd-test", "wyrd-viewers")
 print("Keycloak users seeded")
 PYEOF
 
-cargo nextest run -p wyrd-server --all-features --test identity_e2e --test-threads=1
+cargo nextest run --locked -p wyrd-server --all-features --test identity_e2e --run-ignored=all --test-threads=1
 
 docker compose stop keycloak dex
 """
@@ -1388,6 +1382,7 @@ depends = [
   "check:skills-sync",
   "test:rust",
   "test:bifrost",
+  "test:identity:journey",
   "codegen:check",
   "cardkind:check",
   "check:client-tier",
@@ -1455,7 +1450,6 @@ hide = true
 description = """Run live Postgres SQL integration tests against docker-compose Postgres.
 Brings up Postgres, provisions roles, then runs the SQL migration, reset, fixture, Vala SQL, and registry e2e suites.
 """
-env = { WYRD_REG_E2E = "1" }
 
 run = "scripts/postgres/with-test-postgres.sh -- mise run test:sql:inner"
 [tasks."test:sql:inner"]
@@ -1463,7 +1457,6 @@ hide = true
 description = """Run live Postgres SQL integration tests against docker-compose Postgres.
 Brings up Postgres, provisions roles, then runs the SQL migration, reset, fixture, Vala SQL, and registry e2e suites.
 """
-env = { WYRD_REG_E2E = "1" }
 run = """
 cargo nextest run --locked -p wyrd-sql --test-threads=1
 cargo nextest run --locked -p wyrd-dev-fixtures --features pg --test-threads=1

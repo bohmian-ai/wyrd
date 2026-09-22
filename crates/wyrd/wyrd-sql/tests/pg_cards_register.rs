@@ -1,7 +1,5 @@
 //! PgFixture coverage for composite card-registration persistence primitives.
 
-use std::env;
-
 use chrono::{Duration, Utc};
 use uuid::Uuid;
 use wyrd_dev_fixtures::pg::PgFixture;
@@ -19,11 +17,6 @@ use wyrd_sql::queries::cards::{
     soft_delete_card_by_ref, soft_delete_card_with_state,
 };
 use wyrd_sql::row_types::cards::CardStatus;
-
-/// Return whether live Postgres registration tests are enabled.
-fn enabled() -> bool {
-    env::var("WYRD_REG_E2E").as_deref() == Ok("1")
-}
 
 /// Build one resolved Prompt card fixture.
 fn prompt_card(name: &str) -> Card {
@@ -51,9 +44,6 @@ fn artifact() -> ArtifactManifestEntry {
 /// Prove the consolidated migration contains every PR-one lifecycle column and table.
 #[tokio::test]
 async fn consolidated_registration_migration_has_locked_shape() {
-    if !enabled() {
-        return;
-    }
     let fixture = PgFixture::start().await.expect("fixture starts");
     let columns: Vec<String> = sqlx::query_scalar(
         "SELECT column_name FROM information_schema.columns \
@@ -111,9 +101,6 @@ async fn consolidated_registration_migration_has_locked_shape() {
 /// Persist an operation, pending card, and manifest atomically through TenantConn.
 #[tokio::test]
 async fn pending_card_and_manifest_share_registration_transaction() {
-    if !enabled() {
-        return;
-    }
     let fixture = PgFixture::start().await.expect("fixture starts");
     let principal_id = PrincipalId::new(Uuid::now_v7());
     let operation_id = RegistrationOperationId::new(Uuid::now_v7());
@@ -197,9 +184,6 @@ async fn pending_card_and_manifest_share_registration_transaction() {
 /// after the third failed attempt without a fourth claim.
 #[tokio::test]
 async fn reconciliation_claims_are_bounded_and_lease_safe() {
-    if !enabled() {
-        return;
-    }
     let fixture = PgFixture::start().await.expect("fixture starts");
     let principal_id = PrincipalId::new(Uuid::now_v7());
     let operation_id = RegistrationOperationId::new(Uuid::now_v7());
@@ -335,9 +319,6 @@ async fn reconciliation_claims_are_bounded_and_lease_safe() {
 /// Persist a UID-bearing outbound edge atomically with its source Card row.
 #[tokio::test]
 async fn relationship_rows_preserve_exact_target_identity() {
-    if !enabled() {
-        return;
-    }
     let fixture = PgFixture::start().await.expect("fixture starts");
     let principal_id = PrincipalId::new(Uuid::now_v7());
     let target_operation = RegistrationOperationId::new(Uuid::now_v7());
@@ -439,9 +420,6 @@ async fn relationship_rows_preserve_exact_target_identity() {
 /// Hold the target lifecycle row lock until the relationship transaction commits.
 #[tokio::test]
 async fn relationship_recheck_blocks_target_lifecycle_race() {
-    if !enabled() {
-        return;
-    }
     let fixture = PgFixture::start().await.expect("fixture starts");
     let principal_id = PrincipalId::new(Uuid::now_v7());
     let target_operation = RegistrationOperationId::new(Uuid::now_v7());
@@ -597,9 +575,6 @@ async fn relationship_recheck_blocks_target_lifecycle_race() {
 /// Exact delete blocks visible inbound references, preserves tenant parity, and retries idempotently.
 #[tokio::test]
 async fn exact_delete_enforces_inbound_references_and_is_idempotent() {
-    if !enabled() {
-        return;
-    }
     let fixture = PgFixture::start().await.expect("fixture starts");
     let tenant = fixture.data_tenant_id();
     let other_tenant = fixture

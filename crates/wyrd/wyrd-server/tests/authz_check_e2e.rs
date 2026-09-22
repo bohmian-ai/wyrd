@@ -1,4 +1,3 @@
-use std::env;
 use std::sync::Arc;
 
 use axum::body::{Body, to_bytes};
@@ -8,10 +7,6 @@ use serde_json::{Value, json};
 use wyrd_auth_check::{DenyAllPolicyHook, RecordingPolicyHook};
 use wyrd_spec::auth::TokenAudience;
 use wyrd_testing::{Bootstrap, WyrdTestServer, WyrdTestServerError};
-
-fn e2e_enabled() -> bool {
-    env::var("WYRD_AUTHZ_CHECK_E2E").is_ok()
-}
 
 async fn srv_with_recorder() -> (WyrdTestServer, Arc<RecordingPolicyHook>) {
     let recorder = Arc::new(RecordingPolicyHook::default());
@@ -76,9 +71,6 @@ async fn service_jwt(srv: &WyrdTestServer, service: &Bootstrap) -> String {
 /// chain, actor, or subject differs.
 #[tokio::test(flavor = "current_thread")]
 async fn service_c_acts_for_a_through_b_extends_chain_correctly() {
-    if !e2e_enabled() {
-        return;
-    }
     let (srv, recorder) = srv_with_recorder().await;
     let a = srv
         .bootstrap_service("svc-a", &["writer"])
@@ -137,9 +129,6 @@ async fn service_c_acts_for_a_through_b_extends_chain_correctly() {
 /// not record a one-step chain with actor B and subject A.
 #[tokio::test(flavor = "current_thread")]
 async fn single_hop_allow_records_subject_and_actor() {
-    if !e2e_enabled() {
-        return;
-    }
     let (srv, recorder) = srv_with_recorder().await;
     let a = srv
         .bootstrap_service("svc-a-allow", &["writer"])
@@ -175,9 +164,6 @@ async fn single_hop_allow_records_subject_and_actor() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn non_delegated_token_rejected_before_hook() {
-    if !e2e_enabled() {
-        return;
-    }
     let (srv, recorder) = srv_with_recorder().await;
     let service = srv
         .bootstrap_service("sa-direct", &["writer"])
@@ -214,9 +200,6 @@ async fn non_delegated_token_rejected_before_hook() {
 /// `WYRD_AUTHZ_403_POLICY_DENIED` carrying reason `policy_x`.
 #[tokio::test(flavor = "current_thread")]
 async fn deny_decision_refuses_the_exchange_with_reason() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = srv_with_deny("policy_x").await;
     let a = srv
         .bootstrap_service("svc-a-deny", &["writer"])

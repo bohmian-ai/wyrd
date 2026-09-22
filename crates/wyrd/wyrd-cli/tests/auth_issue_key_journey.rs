@@ -45,10 +45,6 @@ fn issued_key(stdout: &str) -> String {
 /// `200` on `/v1`.
 #[tokio::test]
 async fn auth_issue_key_cli_journey() {
-    if std::env::var("WYRD_CLI_E2E").as_deref() != Ok("1") {
-        return;
-    }
-
     let (server, base_url, shutdown, serve_handle) = start_served("auth issue-key").await;
     let admin = server
         .bootstrap_service("cli-issue-key-admin", &["admin"])

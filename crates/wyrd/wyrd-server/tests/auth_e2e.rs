@@ -1,15 +1,9 @@
-use std::env;
-
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, Response, StatusCode, header};
 use base64::Engine;
 use serde_json::{Value, json};
 use wyrd_spec::auth::TokenAudience;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
-
-fn e2e_enabled() -> bool {
-    env::var("WYRD_AUTH_E2E").is_ok()
-}
 
 /// Build a `POST /v1/authz/check` request asking whether `action` is allowed
 /// on `target`'s own Card, the terminal probe every journey here sends.
@@ -126,9 +120,6 @@ fn decode_jwt_claims_for_test(jwt: &str) -> Value {
 
 #[tokio::test(flavor = "current_thread")]
 async fn journey_user_admin_creates_service_account_and_grants_writer_role() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process().await.expect("start");
     let _admin = srv
         .bootstrap_user("admin", &["runtime_admin"])
@@ -151,9 +142,6 @@ async fn journey_user_admin_creates_service_account_and_grants_writer_role() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn journey_role_revocation_flips_verdict() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process().await.expect("start");
     let sa = srv
         .bootstrap_service("sa-rev", &["writer"])
@@ -177,9 +165,6 @@ async fn journey_role_revocation_flips_verdict() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn journey_role_grant_flips_verdict() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process().await.expect("start");
     let sa = srv
         .bootstrap_service("sa-grant", &[])
@@ -211,9 +196,6 @@ async fn journey_role_grant_flips_verdict() {
 /// single-hop B.
 #[tokio::test(flavor = "current_thread")]
 async fn journey_delegated_call_via_token_exchange() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process().await.expect("start");
     let a = srv
         .bootstrap_service("svc-a", &["writer"])
@@ -261,9 +243,6 @@ async fn journey_delegated_call_via_token_exchange() {
 /// is not `200`, or the verdicts are not allow then `missing_permission` deny.
 #[tokio::test(flavor = "current_thread")]
 async fn journey_delegation_then_revoke_underlying_role() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process().await.expect("start");
     let a = srv
         .bootstrap_service("svc-a-revoke", &["writer"])
@@ -305,9 +284,6 @@ async fn journey_delegation_then_revoke_underlying_role() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn journey_agent_revoke_grant_flip() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process().await.expect("start");
     let agent = srv
         .bootstrap_agent("agent-flip", &["writer"])
@@ -334,9 +310,6 @@ async fn journey_agent_revoke_grant_flip() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn journey_cross_principal_kind_isolation_via_independent_bootstrap() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process().await.expect("start");
     let sa = srv
         .bootstrap_service("sa-only", &["writer"])
@@ -369,9 +342,6 @@ async fn journey_cross_principal_kind_isolation_via_independent_bootstrap() {
 /// `card_write` check is not a `missing_permission` deny.
 #[tokio::test(flavor = "current_thread")]
 async fn journey_delegation_cannot_amplify_the_subject() {
-    if !e2e_enabled() {
-        return;
-    }
     let srv = WyrdTestServer::start_in_process().await.expect("start");
     let actor = srv
         .bootstrap_service("svc-amplify-actor", &["writer"])

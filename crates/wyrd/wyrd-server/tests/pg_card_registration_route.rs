@@ -1,6 +1,5 @@
 //! Public card-registration journey through the authenticated HTTP surface.
 
-use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,11 +27,6 @@ use wyrd_spec::registry::{CardLifecycleStatus, RegistrationOutcomeKind};
 use wyrd_sql::queries::cards::get_card_by_uid;
 use wyrd_storage::settings::{BackendConfig, StorageSettings};
 use wyrd_testing::{Bootstrap, WyrdTestServer};
-
-/// Return whether the explicitly gated Postgres route tests should run.
-fn enabled() -> bool {
-    env::var("WYRD_REG_E2E").as_deref() == Ok("1")
-}
 
 /// Seed a dependency row directly so the journey can exercise non-Active states.
 async fn seed_dependency(
@@ -339,10 +333,6 @@ fn heavy_registration_request(idempotency_key: &str) -> Request<Body> {
 #[tokio::test(flavor = "current_thread")]
 /// The native registry saga returns only a final Active receipt.
 async fn client_registration_saga_returns_active_receipt() {
-    if !enabled() {
-        return;
-    }
-
     let temp = tempfile::tempdir().expect("loader workspace creates");
     let prompt_path = temp.path().join("client-prompt.yaml");
     let artifact = b"native registry artifact";
@@ -478,10 +468,6 @@ async fn client_registration_saga_returns_active_receipt() {
 #[tokio::test(flavor = "current_thread")]
 /// Registering the same request twice returns the stored response without duplicate writes.
 async fn registration_replays_through_public_authenticated_route() {
-    if !enabled() {
-        return;
-    }
-
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -536,10 +522,6 @@ async fn registration_replays_through_public_authenticated_route() {
 #[tokio::test(flavor = "current_thread")]
 /// Registration resolves an external child reference and persists its UID.
 async fn registration_resolves_child_card_refs_before_persisting() {
-    if !enabled() {
-        return;
-    }
-
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -602,10 +584,6 @@ async fn registration_resolves_child_card_refs_before_persisting() {
 #[tokio::test(flavor = "current_thread")]
 /// The offline loader hands its wire projection to the composite registration route.
 async fn registration_accepts_loader_projection_and_persists_sibling_binding() {
-    if !enabled() {
-        return;
-    }
-
     let temp = tempfile::tempdir().expect("loader workspace creates");
     let prompt_path = temp.path().join("prompt.yaml");
     let agent_path = temp.path().join("agent.yaml");
@@ -678,9 +656,6 @@ async fn registration_accepts_loader_projection_and_persists_sibling_binding() {
 /// Reusing an idempotency key for different content returns the stable conflict.
 #[tokio::test(flavor = "current_thread")]
 async fn registration_rejects_idempotency_key_reuse_for_different_content() {
-    if !enabled() {
-        return;
-    }
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -719,9 +694,6 @@ async fn registration_rejects_idempotency_key_reuse_for_different_content() {
 /// Resolve failures return 422 before any registration operation is reserved.
 #[tokio::test(flavor = "current_thread")]
 async fn unresolved_dependency_leaves_no_registration_operation() {
-    if !enabled() {
-        return;
-    }
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -765,9 +737,6 @@ async fn unresolved_dependency_leaves_no_registration_operation() {
 /// Reject non-Active and cross-tenant targets before any registration write.
 #[tokio::test(flavor = "current_thread")]
 async fn non_active_and_cross_tenant_dependencies_leave_no_writes() {
-    if !enabled() {
-        return;
-    }
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -869,9 +838,6 @@ async fn assert_no_registration_writes(server: &WyrdTestServer, operation_key: &
 /// Reject an artifact-bearing submission when another card shares the request.
 #[tokio::test(flavor = "current_thread")]
 async fn composite_with_manifest_rejects_before_writes() {
-    if !enabled() {
-        return;
-    }
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -917,9 +883,6 @@ async fn composite_with_manifest_rejects_before_writes() {
 /// Concurrent identical registrations persist one operation and one card.
 #[tokio::test(flavor = "current_thread")]
 async fn concurrent_same_key_resolves_to_one_registration() {
-    if !enabled() {
-        return;
-    }
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -973,9 +936,6 @@ async fn concurrent_same_key_resolves_to_one_registration() {
 /// Persist a composite in leaf-first order and return the graph-selected root.
 #[tokio::test(flavor = "current_thread")]
 async fn composite_registration_returns_leaf_first_outcomes_and_root() {
-    if !enabled() {
-        return;
-    }
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -1065,9 +1025,6 @@ async fn composite_registration_returns_leaf_first_outcomes_and_root() {
 /// Initialize a sole heavy card after commit and advance its manifest row.
 #[tokio::test(flavor = "current_thread")]
 async fn heavy_registration_initializes_upload_after_commit() {
-    if !enabled() {
-        return;
-    }
     let storage_root = tempfile::tempdir().expect("storage root creates");
     let server = WyrdTestServer::builder()
         .with_storage_settings(StorageSettings {
@@ -1224,9 +1181,6 @@ async fn heavy_registration_initializes_upload_after_commit() {
 /// after the object becomes available.
 #[tokio::test(flavor = "current_thread")]
 async fn card_reconciler_recovers_after_storage_retry() {
-    if !enabled() {
-        return;
-    }
     let storage_root = tempfile::tempdir().expect("storage root creates");
     let server = WyrdTestServer::builder()
         .with_storage_settings(StorageSettings {
@@ -1311,9 +1265,6 @@ async fn card_reconciler_recovers_after_storage_retry() {
 /// fail, or the dead-letter state, error metadata, or attempt count differ.
 #[tokio::test(flavor = "current_thread")]
 async fn card_reconciler_dead_letters_after_three_failures() {
-    if !enabled() {
-        return;
-    }
     let storage_root = tempfile::tempdir().expect("storage root creates");
     let server = WyrdTestServer::builder()
         .with_storage_settings(StorageSettings {
@@ -1393,9 +1344,6 @@ async fn card_reconciler_dead_letters_after_three_failures() {
 /// Completion refuses and leaves the card Pending when its decision audit fails.
 #[tokio::test(flavor = "current_thread")]
 async fn completion_audit_failure_keeps_card_pending() {
-    if !enabled() {
-        return;
-    }
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -1505,9 +1453,6 @@ async fn completion_audit_failure_keeps_card_pending() {
 /// Delete refuses and keeps the card Active when its decision audit fails.
 #[tokio::test(flavor = "current_thread")]
 async fn delete_audit_failure_keeps_card_active() {
-    if !enabled() {
-        return;
-    }
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -1601,9 +1546,6 @@ async fn delete_audit_failure_keeps_card_active() {
 /// staged verdict rows are not exactly one `allowed`.
 #[tokio::test(flavor = "current_thread")]
 async fn delete_by_ref_not_found_records_one_decision() {
-    if !enabled() {
-        return;
-    }
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -1645,9 +1587,6 @@ async fn delete_by_ref_not_found_records_one_decision() {
 /// Backend cleanup failure leaves a committed tombstone and retryable blob state.
 #[tokio::test(flavor = "current_thread")]
 async fn delete_storage_failure_preserves_cleanup_state() {
-    if !enabled() {
-        return;
-    }
     let storage_root = tempfile::tempdir().expect("storage root creates");
     let server = WyrdTestServer::builder()
         .with_storage_settings(StorageSettings {
@@ -1726,9 +1665,6 @@ async fn delete_storage_failure_preserves_cleanup_state() {
 /// is not left `failed` with no blob URI and a recorded failure time.
 #[tokio::test(flavor = "current_thread")]
 async fn blob_storage_failure_leaves_durable_failure_state() {
-    if !enabled() {
-        return;
-    }
     let storage_root = tempfile::tempdir().expect("storage root creates");
     let server = WyrdTestServer::builder()
         .with_storage_settings(StorageSettings {
@@ -1799,9 +1735,6 @@ async fn blob_storage_failure_leaves_durable_failure_state() {
 /// Card row survives the failed decision audit.
 #[tokio::test(flavor = "current_thread")]
 async fn registration_refuses_when_its_decision_audit_fails() {
-    if !enabled() {
-        return;
-    }
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -1877,9 +1810,6 @@ async fn registration_refuses_when_its_decision_audit_fails() {
 /// Reject a cyclic sibling graph before reserving an idempotency operation.
 #[tokio::test(flavor = "current_thread")]
 async fn dependency_cycle_rejects_before_writes() {
-    if !enabled() {
-        return;
-    }
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -1926,9 +1856,6 @@ async fn dependency_cycle_rejects_before_writes() {
 /// Reject malformed Service peer composition through the raw authenticated HTTP route.
 #[tokio::test(flavor = "current_thread")]
 async fn service_peer_composition_rejects_before_registry_resolution() {
-    if !enabled() {
-        return;
-    }
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -2019,9 +1946,6 @@ async fn service_peer_composition_rejects_before_registry_resolution() {
 /// Canonical hashing replays an identical graph authored in another wire order.
 #[tokio::test(flavor = "current_thread")]
 async fn wire_order_permutation_replays_identical_graph() {
-    if !enabled() {
-        return;
-    }
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -2066,10 +1990,6 @@ async fn wire_order_permutation_replays_identical_graph() {
 #[tokio::test(flavor = "current_thread")]
 /// Public Card reads preserve graph relationships, pagination, tenant isolation, and tombstones.
 async fn card_reads_list_latest_and_delete_are_tenant_safe() {
-    if !enabled() {
-        return;
-    }
-
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");

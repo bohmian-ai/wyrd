@@ -33,10 +33,6 @@ use wyrd_testing::{
     Bootstrap, KeycloakAdmin, OidcIssuerFixture, WyrdTestServer, WyrdTestServerBuilder,
 };
 
-fn e2e_enabled() -> bool {
-    env::var("WYRD_IDENTITY_E2E").is_ok()
-}
-
 fn keycloak_issuer() -> String {
     env::var("WYRD_KEYCLOAK_ISSUER")
         .unwrap_or_else(|_| "http://localhost:8080/realms/wyrd-test".to_owned())
@@ -201,10 +197,8 @@ fn response_code(body: &Value) -> &str {
 // ─── Discovery smoke tests ────────────────────────────────────────────────────
 
 #[tokio::test]
+#[ignore = "requires the Keycloak and Dex identity lane"]
 async fn discovery_resolves_keycloak() {
-    if !e2e_enabled() {
-        return;
-    }
     let fixture = OidcIssuerFixture::connect(&keycloak_issuer()).await;
     let meta = fixture.metadata();
     assert!(
@@ -229,10 +223,8 @@ async fn discovery_resolves_keycloak() {
 }
 
 #[tokio::test]
+#[ignore = "requires the Keycloak and Dex identity lane"]
 async fn discovery_resolves_dex() {
-    if !e2e_enabled() {
-        return;
-    }
     let fixture = OidcIssuerFixture::connect(&dex_issuer()).await;
     let meta = fixture.metadata();
     assert!(
@@ -300,18 +292,14 @@ async fn assert_config_driven_trust_layer(issuer: &str, audience: &str) {
 }
 
 #[tokio::test]
+#[ignore = "requires the Keycloak and Dex identity lane"]
 async fn trust_layer_config_driven_keycloak() {
-    if !e2e_enabled() {
-        return;
-    }
     assert_config_driven_trust_layer(&keycloak_issuer(), "wyrd-workload").await;
 }
 
 #[tokio::test]
+#[ignore = "requires the Keycloak and Dex identity lane"]
 async fn trust_layer_config_driven_dex() {
-    if !e2e_enabled() {
-        return;
-    }
     assert_config_driven_trust_layer(&dex_issuer(), "wyrd-server").await;
 }
 
@@ -321,10 +309,8 @@ async fn trust_layer_config_driven_dex() {
 /// audience claims the jwt-bearer route verifies — asserted standalone so a
 /// failing journey has a clear root cause.
 #[tokio::test]
+#[ignore = "requires the Keycloak and Dex identity lane"]
 async fn workload_token_keycloak_claims() {
-    if !e2e_enabled() {
-        return;
-    }
     let keycloak = OidcIssuerFixture::connect(&keycloak_issuer()).await;
     let raw_token = keycloak
         .workload_token("wyrd-workload", "wyrd-workload-secret", "wyrd-workload")
@@ -356,10 +342,8 @@ async fn workload_token_keycloak_claims() {
 
 /// A workload token must NOT carry an unrelated audience.
 #[tokio::test]
+#[ignore = "requires the Keycloak and Dex identity lane"]
 async fn workload_token_wrong_aud_absent_keycloak() {
-    if !e2e_enabled() {
-        return;
-    }
     let keycloak = OidcIssuerFixture::connect(&keycloak_issuer()).await;
     let raw_token = keycloak
         .workload_token("wyrd-workload", "wyrd-workload-secret", "wyrd-workload")
@@ -393,11 +377,8 @@ async fn workload_token_wrong_aud_absent_keycloak() {
 /// omits `access_token` or issues a refresh token, or the delegated authz
 /// check does not return `200`.
 #[tokio::test]
+#[ignore = "requires the Keycloak and Dex identity lane"]
 async fn workload_jwt_bearer_journey_keycloak() {
-    if !e2e_enabled() {
-        return;
-    }
-
     let keycloak = OidcIssuerFixture::connect(&keycloak_issuer()).await;
     let assertion = keycloak
         .workload_token("wyrd-workload", "wyrd-workload-secret", "wyrd-workload")
@@ -457,11 +438,8 @@ async fn workload_jwt_bearer_journey_keycloak() {
 /// An unbound subject (issuer trusted, no matching binding) returns
 /// `WYRD_AUTH_404_PRINCIPAL_NOT_FOUND` from the jwt-bearer route.
 #[tokio::test]
+#[ignore = "requires the Keycloak and Dex identity lane"]
 async fn workload_jwt_bearer_unbound_subject_returns_404_keycloak() {
-    if !e2e_enabled() {
-        return;
-    }
-
     let keycloak = OidcIssuerFixture::connect(&keycloak_issuer()).await;
     let assertion = keycloak
         .workload_token("wyrd-workload", "wyrd-workload-secret", "wyrd-workload")
@@ -512,11 +490,8 @@ async fn workload_jwt_bearer_unbound_subject_returns_404_keycloak() {
 /// fresh token does not reach `200`, or when the expired token is not rejected
 /// with `401`.
 #[tokio::test]
+#[ignore = "requires the Keycloak and Dex identity lane"]
 async fn ttl_expiry_journey() {
-    if !e2e_enabled() {
-        return;
-    }
-
     let srv = WyrdTestServerBuilder::default()
         .with_access_ttl(ChronoDuration::seconds(2))
         .with_auth_verify_settings(WyrdAuthVerifySettings {
@@ -574,11 +549,8 @@ async fn ttl_expiry_journey() {
 /// succeed, the revoked key can still exchange, or the pre-revocation token
 /// stops reaching `200` before its expiry.
 #[tokio::test]
+#[ignore = "requires the Keycloak and Dex identity lane"]
 async fn revocation_journey() {
-    if !e2e_enabled() {
-        return;
-    }
-
     let srv = WyrdTestServerBuilder::default()
         .start_in_process()
         .await
@@ -645,11 +617,8 @@ async fn revocation_journey() {
 
 /// Non-admin cannot revoke a principal — must return 403.
 #[tokio::test]
+#[ignore = "requires the Keycloak and Dex identity lane"]
 async fn revocation_requires_admin_permission() {
-    if !e2e_enabled() {
-        return;
-    }
-
     let srv = WyrdTestServerBuilder::default()
         .start_in_process()
         .await
@@ -713,11 +682,8 @@ async fn revocation_requires_admin_permission() {
 /// not return `200` with a non-nil `key_id`, or the issued key's token does not
 /// reach `/v1/authz/check` `200`.
 #[tokio::test]
+#[ignore = "requires the Keycloak and Dex identity lane"]
 async fn service_account_issuer_full_chain() {
-    if !e2e_enabled() {
-        return;
-    }
-
     let srv = WyrdTestServerBuilder::default()
         .start_in_process()
         .await
@@ -971,11 +937,8 @@ fn principal_id_of(access_token: &str) -> String {
 /// fails to reach `200`, the replay is not `401 WYRD_AUTH_401_REFRESH_REUSED`,
 /// or the successor can still rotate after the replay.
 #[tokio::test]
+#[ignore = "requires the Keycloak and Dex identity lane"]
 async fn human_oidc_login_journey() {
-    if !e2e_enabled() {
-        return;
-    }
-
     let keycloak = OidcIssuerFixture::connect(&keycloak_issuer()).await;
 
     let srv = WyrdTestServerBuilder::default()
@@ -1093,11 +1056,8 @@ async fn post_refresh(srv: &WyrdTestServer, refresh_token: &str) -> (StatusCode,
 /// stops reaching `200` inside its window, or the refresh rotation is not `401`
 /// or returns any successor token.
 #[tokio::test]
+#[ignore = "requires the Keycloak and Dex identity lane"]
 async fn revoking_a_human_kills_the_session_refresh_authority() {
-    if !e2e_enabled() {
-        return;
-    }
-
     let keycloak = OidcIssuerFixture::connect(&keycloak_issuer()).await;
     let srv = WyrdTestServerBuilder::default()
         .with_trusted_issuer_configs(vec![human_issuer_entry(
@@ -1195,11 +1155,8 @@ async fn revoking_a_human_kills_the_session_refresh_authority() {
 /// session's delegated `card_write` check is not `Deny`. A panic skips the
 /// membership restore and leaves the shared realm altered.
 #[tokio::test]
+#[ignore = "requires the Keycloak and Dex identity lane"]
 async fn a_withdrawn_oidc_group_invalidates_the_roles_it_granted() {
-    if !e2e_enabled() {
-        return;
-    }
-
     let keycloak = OidcIssuerFixture::connect(&keycloak_issuer())
         .await
         .with_keycloak_admin(keycloak_admin());
@@ -1297,11 +1254,8 @@ async fn a_withdrawn_oidc_group_invalidates_the_roles_it_granted() {
 /// reach `200`, the client middleware lifecycle assertions fail, or shutdown
 /// fails.
 #[tokio::test]
+#[ignore = "requires the Keycloak and Dex identity lane"]
 async fn federated_cloud_journey_cli_authored_keycloak() {
-    if !e2e_enabled() {
-        return;
-    }
-
     // Real socket: the `wyrd auth` CLI authors through HTTP against `/admin`.
     let srv = WyrdTestServerBuilder::default()
         .start_bound()
@@ -1502,11 +1456,8 @@ async fn assert_client_workload_lifecycle(srv: &WyrdTestServer, assertion: &str)
 /// visible under B, tenant A's exchange is not `200`, or tenant B's exchange
 /// does not fail closed with `WYRD_AUTH_404_PRINCIPAL_NOT_FOUND`.
 #[tokio::test]
+#[ignore = "requires the Keycloak and Dex identity lane"]
 async fn same_issuer_two_tenant_isolation_keycloak() {
-    if !e2e_enabled() {
-        return;
-    }
-
     let srv = WyrdTestServerBuilder::default()
         .start_bound()
         .await
@@ -1654,11 +1605,8 @@ async fn same_issuer_two_tenant_isolation_keycloak() {
 /// A jwt-bearer exchange against a server with no trusted external issuer fails
 /// closed with a 401-family error code.
 #[tokio::test]
+#[ignore = "requires the Keycloak and Dex identity lane"]
 async fn conformance_untrusted_issuer_rejected() {
-    if !e2e_enabled() {
-        return;
-    }
-
     let srv = WyrdTestServerBuilder::default()
         .start_in_process()
         .await
@@ -1689,11 +1637,8 @@ async fn conformance_untrusted_issuer_rejected() {
 
 /// `GET /auth/login` without a valid Host header returns 401 INVALID_TOKEN.
 #[tokio::test]
+#[ignore = "requires the Keycloak and Dex identity lane"]
 async fn conformance_login_rejects_bare_localhost_host() {
-    if !e2e_enabled() {
-        return;
-    }
-
     let srv = WyrdTestServerBuilder::default()
         .start_in_process()
         .await
@@ -1733,10 +1678,8 @@ async fn conformance_login_rejects_bare_localhost_host() {
 /// Force a Keycloak signing-key rotation via the admin REST API and verify that
 /// both pre- and post-rotation tokens are well-formed JWTs with a `kid` header.
 #[tokio::test]
+#[ignore = "requires the Keycloak and Dex identity lane"]
 async fn key_rotation_keycloak_admin_api() {
-    if !e2e_enabled() {
-        return;
-    }
     let keycloak = OidcIssuerFixture::connect(&keycloak_issuer())
         .await
         .with_keycloak_admin(keycloak_admin());

@@ -158,6 +158,21 @@ impl HttpTransport {
         })
     }
 
+    /// Rebind this transport to another auth path, sharing its connection pool.
+    ///
+    /// Used by [`WyrdClient::on_behalf_of`](crate::WyrdClient::on_behalf_of),
+    /// whose delegated client reaches the same deployment under a different
+    /// bearer.
+    #[must_use]
+    pub(crate) fn with_auth(&self, auth: Arc<AuthMiddleware>) -> Self {
+        Self {
+            client: self.client.clone(),
+            request_timeout: self.request_timeout,
+            auth,
+            base_url: self.base_url.clone(),
+        }
+    }
+
     /// Run one externally-framed operation under Wyrd's credential policy.
     ///
     /// Some first-party surfaces do not compose their request through this

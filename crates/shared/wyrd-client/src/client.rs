@@ -15,12 +15,14 @@
 
 use std::sync::Arc;
 
+use secrecy::SecretString;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use wyrd_spec::auth::TokenAudience;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 
-use crate::auth::AuthMiddleware;
+use crate::auth::{AuthError, AuthMiddleware};
 use crate::config::ClientConfig;
 use crate::error::WyrdClientError;
 use crate::transport::config::GrpcConfig;
@@ -268,6 +270,38 @@ impl WyrdClient {
         self.http
             .request_json_stream_with_id(method, path, body, request_id)
             .await
+    }
+
+    /// Return a client in which this client acts for the holder of
+    /// `subject_token`, bound to `audience` (RFC 8693 token exchange).
+    ///
+    /// This client's own credential is the actor: its current bearer is
+    /// presented as `actor_token` alongside the inbound `subject_token`. The
+    /// server verifies both, asks the invoke policy whether the subject may be
+    /// served by this actor, and issues a short-lived token whose subject is
+    /// the inbound principal, whose outer `act` is this client's principal, and
+    /// whose permissions are the intersection of both. The first exchange runs
+    /// here so a refusal surfaces at the call site; the returned client caches
+    /// the delegated token in memory only and re-exchanges before expiry or
+    /// after one authentication refusal. It shares this client's connection
+    /// pools.
+    ///
+    /// # Errors
+    /// Returns the server's stable error when the exchange is refused — an
+    /// invalid subject or actor token, a policy denial, a missing actor — or a
+    /// transport error when `/auth/token` cannot be reached.
+    pub async fn on_behalf_of(
+        &self,
+        subject_token: SecretString,
+        audience: TokenAudience,
+    ) -> Result<Self, WyrdError> {
+        let auth = self.auth.on_behalf_of(subject_token, audience);
+        auth.bearer().await.map_err(AuthError::into_wyrd)?;
+        Ok(Self {
+            http: self.http.with_auth(Arc::clone(&auth)),
+            auth,
+            grpc_config: self.grpc_config.clone(),
+        })
     }
 
     /// Return the shared [`AuthMiddleware`] handle.

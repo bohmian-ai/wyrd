@@ -10,7 +10,10 @@
 //! Both durable-secret arms — [`ResolvedCredential::ApiKey`] and
 //! [`ResolvedCredential::WorkloadJwt`] — exchange their secret for a short-lived
 //! access token through the *same* cache and single-flight gate. A directly
-//! supplied [`ResolvedCredential::BearerToken`] is passed through as-is.
+//! supplied [`ResolvedCredential::BearerToken`] is passed through as-is. A
+//! [`ResolvedCredential::Delegated`] middleware, built by
+//! [`AuthMiddleware::on_behalf_of`], re-runs its RFC 8693 exchange through the
+//! same cache and gate, drawing the actor token from the acting middleware.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -25,8 +28,8 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 use wyrd_spec::auth::{
-    LoginInitResponse, PlatformTokenRequest, PlatformTokenResponse, SecretBearer, TokenRequest,
-    TokenResponse,
+    ExchangeTokenType, LoginInitResponse, PlatformTokenRequest, PlatformTokenResponse,
+    SecretBearer, TokenAudience, TokenRequest, TokenResponse,
 };
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::TenantSlug;
@@ -349,6 +352,34 @@ impl AuthMiddleware {
         Self::build(config, credential, cache_path)
     }
 
+    /// Derive a middleware in which this one acts for the holder of
+    /// `subject_token` against `audience`.
+    ///
+    /// The derived middleware shares this one's `/auth` connection pool and
+    /// caches the delegated token in memory only, never on disk. Each exchange
+    /// presents this middleware's current bearer as the RFC 8693 actor token,
+    /// so the actor's own refresh keeps working underneath. No network call is
+    /// made here.
+    #[must_use]
+    pub fn on_behalf_of(
+        self: &Arc<Self>,
+        subject_token: SecretString,
+        audience: TokenAudience,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            credential: ResolvedCredential::Delegated {
+                subject_token,
+                audience,
+                actor: Arc::clone(self),
+            },
+            exchange: self.exchange.clone(),
+            cache: Mutex::new(None),
+            cache_mode: TokenCacheMode::InMemory,
+            cache_path: None,
+            short_ttl_warned: AtomicBool::new(false),
+        })
+    }
+
     /// The credential this middleware authenticates with.
     ///
     /// Exposed so a client-tier owner can fingerprint the secret material it
@@ -382,7 +413,8 @@ impl AuthMiddleware {
     /// [`ResolvedCredential::BearerToken`] is returned directly without
     /// exchange. A [`ResolvedCredential::WorkloadJwt`] follows the same
     /// cache/single-flight path as the API key, exchanging the ambient OIDC
-    /// assertion via the `jwt-bearer` grant.
+    /// assertion via the `jwt-bearer` grant. A [`ResolvedCredential::Delegated`]
+    /// follows it too, running the RFC 8693 token exchange.
     ///
     /// # Errors
     /// Returns [`AuthError::Client`] on transport failure or an invalid tenant
@@ -411,6 +443,22 @@ impl AuthMiddleware {
                 }
                 self.exchange_and_store(api_key, &mut cache).await
             }
+            ResolvedCredential::Delegated {
+                subject_token,
+                audience,
+                actor,
+            } => {
+                let mut cache = self.cache.lock().await;
+                if let Some(entry) = cache.as_ref()
+                    && !entry.is_stale()
+                {
+                    return Ok(entry.access_token.clone());
+                }
+                let entry = self
+                    .exchange_delegated(subject_token, *audience, actor)
+                    .await?;
+                Ok(self.store(entry, &mut cache))
+            }
         }
     }
 
@@ -436,6 +484,17 @@ impl AuthMiddleware {
             ResolvedCredential::ApiKey(api_key) => {
                 let mut cache = self.cache.lock().await;
                 self.exchange_and_store(api_key, &mut cache).await
+            }
+            ResolvedCredential::Delegated {
+                subject_token,
+                audience,
+                actor,
+            } => {
+                let mut cache = self.cache.lock().await;
+                let entry = self
+                    .exchange_delegated(subject_token, *audience, actor)
+                    .await?;
+                Ok(self.store(entry, &mut cache))
             }
         }
     }
@@ -517,6 +576,30 @@ impl AuthMiddleware {
         let request = TokenRequest::JwtBearer {
             assertion: SecretBearer::new(jwt.expose_secret().to_owned()),
             tenant: Some(tenant),
+        };
+        self.post_token_request(request).await
+    }
+
+    /// Run the RFC 8693 exchange: `actor`'s current bearer acts for the holder
+    /// of `subject_token`, bound to `audience`.
+    ///
+    /// # Errors
+    /// Returns the actor's own [`AuthError`] when it cannot produce a bearer,
+    /// and otherwise the exchange's transport failure or server refusal.
+    async fn exchange_delegated(
+        &self,
+        subject_token: &SecretString,
+        audience: TokenAudience,
+        actor: &AuthMiddleware,
+    ) -> Result<CachedToken, AuthError> {
+        let request = TokenRequest::TokenExchange {
+            subject_token: SecretBearer::new(subject_token.expose_secret().to_owned()),
+            subject_token_type: ExchangeTokenType::AccessToken,
+            // Boxed because the actor may itself be delegated, which makes
+            // `bearer` recursive.
+            actor_token: Box::pin(actor.bearer()).await?,
+            actor_token_type: ExchangeTokenType::AccessToken,
+            audience,
         };
         self.post_token_request(request).await
     }
@@ -780,6 +863,44 @@ mod tests {
             2,
             "force_refresh must perform exactly one additional exchange"
         );
+    }
+
+    /// A delegated middleware exchanges once (after the actor's own exchange),
+    /// serves the result from its memory cache, re-exchanges exactly once on a
+    /// forced refresh while reusing the actor's cached bearer, and never prints
+    /// the subject token.
+    ///
+    /// # Panics
+    /// Panics when an exchange fails or a hit count or redaction check differs.
+    #[tokio::test]
+    async fn on_behalf_of_caches_the_exchange_and_redacts_the_subject() {
+        let mock = spawn_mock("HTTP/1.1 200 OK", token_body("delegated-1", 3600)).await;
+        let actor = AuthMiddleware::new(
+            &config_for(mock.base_url.clone(), TokenCacheMode::InMemory),
+            api_key_credential(),
+        )
+        .expect("middleware builds");
+        let delegated = actor.on_behalf_of(
+            "subject-secret".to_owned().into(),
+            wyrd_spec::auth::TokenAudience::Bifrost,
+        );
+
+        let bearer = delegated.bearer().await.expect("delegated exchange");
+        assert_eq!(bearer.expose(), "delegated-1");
+        assert_eq!(mock.hits.load(Ordering::SeqCst), 2, "actor then exchange");
+        delegated.bearer().await.expect("cached");
+        assert_eq!(mock.hits.load(Ordering::SeqCst), 2, "served from cache");
+        delegated.force_refresh().await.expect("forced re-exchange");
+        assert_eq!(
+            mock.hits.load(Ordering::SeqCst),
+            3,
+            "only the delegated exchange repeats"
+        );
+
+        assert!(delegated.cache_path.is_none(), "never persisted to disk");
+        let debug = format!("{delegated:?}");
+        assert!(!debug.contains("subject-secret"), "{debug}");
+        assert!(debug.contains("Bifrost"), "{debug}");
     }
 
     #[tokio::test]

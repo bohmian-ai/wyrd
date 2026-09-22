@@ -5,9 +5,13 @@
 //! client startup (from env vars, explicit config, or workload metadata) and
 //! resolved before each outbound request.
 
+use std::sync::Arc;
+
 use secrecy::{ExposeSecret, SecretString};
+use wyrd_spec::auth::TokenAudience;
 use wyrd_utils::config_dir::wyrd_config_dir;
 
+use crate::auth::AuthMiddleware;
 use crate::error::WyrdClientError;
 
 /// A resolved credential ready to attach to an outbound request.
@@ -28,6 +32,22 @@ pub enum ResolvedCredential {
     },
     /// A Wyrd API key for the `wyrd_api_key` grant.
     ApiKey(SecretString),
+    /// An RFC 8693 delegation: `actor` acts for the holder of `subject_token`.
+    ///
+    /// Built only by [`AuthMiddleware::on_behalf_of`]. The middleware holding
+    /// it exchanges the subject token plus the actor's current bearer at
+    /// `/auth/token` for a short-lived token bound to `audience`, caching that
+    /// result in memory only.
+    ///
+    /// [`AuthMiddleware::on_behalf_of`]: crate::auth::AuthMiddleware::on_behalf_of
+    Delegated {
+        /// The inbound access token of the subject being acted for.
+        subject_token: SecretString,
+        /// The Wyrd surface the delegated token is bound to.
+        audience: TokenAudience,
+        /// The acting client's own auth path, which supplies the actor token.
+        actor: Arc<AuthMiddleware>,
+    },
 }
 
 impl std::fmt::Debug for ResolvedCredential {
@@ -40,6 +60,11 @@ impl std::fmt::Debug for ResolvedCredential {
                 .field("tenant", tenant)
                 .finish(),
             Self::ApiKey(_) => f.debug_tuple("ApiKey").field(&"[REDACTED]").finish(),
+            Self::Delegated { audience, .. } => f
+                .debug_struct("Delegated")
+                .field("subject_token", &"[REDACTED]")
+                .field("audience", audience)
+                .finish_non_exhaustive(),
         }
     }
 }

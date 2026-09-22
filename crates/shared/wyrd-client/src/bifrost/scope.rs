@@ -85,14 +85,25 @@ impl ClientScope {
 /// SHA-256 hex digest of the credential's secret bytes.
 ///
 /// Reads `expose_secret()` on the variant's secret material — the only
-/// reachable identity material — and hashes the raw bytes. No JWT decode.
+/// reachable identity material — and hashes the raw bytes. No JWT decode. A
+/// delegated credential hashes the subject token, the audience, and the
+/// actor's own fingerprint, so two subjects behind one actor never share a
+/// producer pool.
 fn fingerprint_credential(credential: &ResolvedCredential) -> String {
-    let secret = match credential {
-        ResolvedCredential::BearerToken(token) => token.expose_secret(),
-        ResolvedCredential::WorkloadJwt { jwt, .. } => jwt.expose_secret(),
-        ResolvedCredential::ApiKey(key) => key.expose_secret(),
-    };
     let mut hasher = Sha256::new();
-    hasher.update(secret.as_bytes());
+    match credential {
+        ResolvedCredential::BearerToken(token) => hasher.update(token.expose_secret()),
+        ResolvedCredential::WorkloadJwt { jwt, .. } => hasher.update(jwt.expose_secret()),
+        ResolvedCredential::ApiKey(key) => hasher.update(key.expose_secret()),
+        ResolvedCredential::Delegated {
+            subject_token,
+            audience,
+            actor,
+        } => {
+            hasher.update(subject_token.expose_secret());
+            hasher.update(audience.as_str());
+            hasher.update(fingerprint_credential(actor.credential()));
+        }
+    }
     hex::encode(hasher.finalize())
 }

@@ -736,13 +736,13 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// Requested delegated principal was not found in the tenant.
+    /// A token-exchange party's principal no longer exists in the tenant.
     #[error("[WYRD_AUTH_404_PRINCIPAL_NOT_FOUND] {message}")]
     #[wyrd_error(
         code = "WYRD_AUTH_404_PRINCIPAL_NOT_FOUND",
         status = 404,
         title = "Requested principal not found in tenant",
-        remediation = "Verify the `requested_subject` is a Service or Agent principal in the current tenant. Delegation to User principals is not supported in this Wyrd version."
+        remediation = "The principal named by the `subject_token` or `actor_token` no longer exists in the current tenant. Re-authenticate both parties and retry the exchange."
     )]
     PrincipalNotFound {
         /// Human-readable error message.

@@ -128,18 +128,9 @@ mod tests {
             PermissionVerdict::Allow
         );
         assert_eq!(
-            RbacCheck.check(&principal, &Permission::delegation_issue()),
+            RbacCheck.check(&principal, &Permission::bifrost_record_write()),
             PermissionVerdict::Allow
         );
-    }
-
-    #[test]
-    fn rbac_allows_delegation_for_runtime_admin() {
-        let principal = principal_with_permissions([Permission::delegation_issue()]);
-
-        let verdict = RbacCheck.check(&principal, &Permission::delegation_issue());
-
-        assert_eq!(verdict, PermissionVerdict::Allow);
     }
 
     #[test]

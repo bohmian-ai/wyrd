@@ -56,10 +56,7 @@ pub const BUILTIN_ROLES: &[BuiltinRole] = &[
     },
     BuiltinRole {
         name: "runtime_admin",
-        permissions: &[
-            Permission::service_accounts_write(),
-            Permission::delegation_issue(),
-        ],
+        permissions: &[Permission::service_accounts_write()],
     },
 ];
 
@@ -97,20 +94,6 @@ mod tests {
             .collect::<BTreeSet<_>>();
 
         assert_eq!(names.len(), BUILTIN_ROLES.len());
-    }
-
-    #[test]
-    fn runtime_admin_has_delegation_issue() {
-        let runtime_admin = BUILTIN_ROLES
-            .iter()
-            .find(|role| role.name == "runtime_admin")
-            .expect("runtime_admin role exists");
-
-        assert!(
-            runtime_admin
-                .permissions
-                .contains(&Permission::delegation_issue())
-        );
     }
 
     #[test]

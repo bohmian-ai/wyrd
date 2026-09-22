@@ -5,9 +5,8 @@ use schemars::r#gen::SchemaGenerator;
 use schemars::schema::{InstanceType, Schema, SchemaObject, StringValidation};
 use serde::{Deserialize, Serialize};
 
-use crate::auth::{PrincipalId, SecretBearer};
+use crate::auth::SecretBearer;
 use crate::ids::TenantSlug;
-use crate::reference::CardRef;
 
 /// Body of `POST /auth/token`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -19,15 +18,23 @@ pub enum TokenRequest {
         /// API key from the deployment secret store.
         api_key: SecretBearer,
     },
-    /// RFC 8693 token exchange for agent/service delegation.
+    /// RFC 8693 token exchange: the actor acts on behalf of the subject.
+    ///
+    /// The issued token names the subject as its top-level principal, the actor
+    /// as the outermost `act` layer, and `audience` as its `aud`. Its authority
+    /// is the intersection of both parties' permissions.
     #[serde(rename = "urn:ietf:params:oauth:grant-type:token-exchange")]
     TokenExchange {
-        /// Existing access token to delegate from.
+        /// Wyrd access token of the party being acted for (the subject).
         subject_token: SecretBearer,
         /// Type of `subject_token`.
-        subject_token_type: SubjectTokenType,
-        /// Requested non-human target principal.
-        requested_subject: RequestedSubject,
+        subject_token_type: ExchangeTokenType,
+        /// Wyrd access token of the party doing the work (the actor).
+        actor_token: SecretBearer,
+        /// Type of `actor_token`.
+        actor_token_type: ExchangeTokenType,
+        /// Wyrd resource the delegated token is issued for.
+        audience: TokenAudience,
     },
     /// Human OIDC login completion.
     ///
@@ -56,30 +63,39 @@ pub enum TokenRequest {
     },
 }
 
-/// Token-exchange target.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum RequestedSubject {
-    /// Target by principal id.
-    PrincipalId {
-        /// Stable principal id.
-        id: PrincipalId,
-    },
-    /// Target by card reference.
-    CardRef {
-        /// Service or Agent card reference.
-        card_ref: CardRef,
-    },
-}
-
-/// Supported token type for RFC 8693 subject token.
+/// Supported RFC 8693 token type for a subject or actor token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub enum SubjectTokenType {
+pub enum ExchangeTokenType {
     /// OAuth access token.
     #[serde(rename = "urn:ietf:params:oauth:token-type:access_token")]
     AccessToken,
+}
+
+/// Audience (`aud`) of a Wyrd tenant access token.
+///
+/// Every directly issued token is [`Self::Wyrd`] and is accepted on every
+/// tenant surface. A [`Self::Bifrost`] token is accepted only on the Bifrost
+/// surfaces, so a token delegated for Bifrost cannot be replayed elsewhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum TokenAudience {
+    /// Every Wyrd tenant surface.
+    Wyrd,
+    /// Only the Bifrost ingest and query surfaces.
+    Bifrost,
+}
+
+impl TokenAudience {
+    /// The canonical `aud` claim value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Wyrd => "wyrd",
+            Self::Bifrost => "bifrost",
+        }
+    }
 }
 
 /// Response from `POST /auth/token`.
@@ -126,13 +142,9 @@ fn state_key_schema(_gen: &mut SchemaGenerator) -> Schema {
 
 #[cfg(test)]
 mod tests {
-    use super::{RequestedSubject, TokenRequest, TokenResponse, TokenType};
+    use super::{ExchangeTokenType, TokenAudience, TokenRequest, TokenResponse, TokenType};
     use crate::auth::SecretBearer;
-    use crate::envelope::CardKind;
-    use crate::ids::{CardName, SpaceName};
-    use crate::reference::CardRef;
     use chrono::Utc;
-    use wyrd_semver::VersionBlock;
 
     #[test]
     fn token_response_has_no_card_ref_wire_field() {
@@ -150,13 +162,7 @@ mod tests {
 
     #[test]
     fn token_exchange_uses_rfc_8693_grant_type() {
-        let request = TokenRequest::TokenExchange {
-            subject_token: SecretBearer::new("access".to_owned()),
-            subject_token_type: super::SubjectTokenType::AccessToken,
-            requested_subject: RequestedSubject::CardRef {
-                card_ref: card_ref(CardKind::Agent),
-            },
-        };
+        let request = exchange_request();
 
         let json = serde_json::to_value(request).expect("serializes");
 
@@ -171,13 +177,7 @@ mod tests {
         let api_key_request = TokenRequest::WyrdApiKey {
             api_key: SecretBearer::new("key".to_owned()),
         };
-        let exchange_request = TokenRequest::TokenExchange {
-            subject_token: SecretBearer::new("access".to_owned()),
-            subject_token_type: super::SubjectTokenType::AccessToken,
-            requested_subject: RequestedSubject::CardRef {
-                card_ref: card_ref(CardKind::Agent),
-            },
-        };
+        let exchange_request = exchange_request();
         let authorization_code_request = TokenRequest::AuthorizationCode {
             code: SecretBearer::new("code".to_owned()),
             state: "state-123".to_owned(),
@@ -384,13 +384,41 @@ mod tests {
         );
     }
 
-    fn card_ref(kind: CardKind) -> CardRef {
-        CardRef {
-            kind,
-            name: CardName::new("runtime").expect("static name is valid"),
-            version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            space: Some(SpaceName::new("prod").expect("static space is valid")),
-            uid: None,
+    /// Build one Bifrost-audience exchange with placeholder bearers.
+    fn exchange_request() -> TokenRequest {
+        TokenRequest::TokenExchange {
+            subject_token: SecretBearer::new("subject".to_owned()),
+            subject_token_type: ExchangeTokenType::AccessToken,
+            actor_token: SecretBearer::new("actor".to_owned()),
+            actor_token_type: ExchangeTokenType::AccessToken,
+            audience: TokenAudience::Bifrost,
         }
+    }
+
+    /// The exchange wire carries RFC 8693 subject/actor fields and a closed
+    /// audience set; an unsupported audience or a stale `requested_subject`
+    /// field is rejected at deserialization.
+    #[test]
+    fn token_exchange_wire_is_rfc_8693_subject_actor_audience() {
+        let json = serde_json::to_value(exchange_request()).expect("serializes");
+        let token_type = "urn:ietf:params:oauth:token-type:access_token";
+        assert_eq!(json["subject_token_type"], token_type);
+        assert_eq!(json["actor_token_type"], token_type);
+        assert_eq!(json["audience"], "bifrost");
+
+        let mut unsupported = json.clone();
+        unsupported["audience"] = serde_json::json!("storage");
+        assert!(serde_json::from_value::<TokenRequest>(unsupported).is_err());
+
+        let mut stale = json.clone();
+        stale["requested_subject"] = serde_json::json!({"kind": "principal_id"});
+        assert!(serde_json::from_value::<TokenRequest>(stale).is_err());
+
+        let mut missing_actor = json;
+        missing_actor
+            .as_object_mut()
+            .expect("request is an object")
+            .remove("actor_token");
+        assert!(serde_json::from_value::<TokenRequest>(missing_actor).is_err());
     }
 }

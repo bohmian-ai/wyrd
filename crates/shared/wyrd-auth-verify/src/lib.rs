@@ -21,6 +21,7 @@ use wyrd_runtime::{
     PrincipalRef as RuntimePrincipalRef, RoleRef,
 };
 use wyrd_spec::DataTenantId;
+pub use wyrd_spec::auth::TokenAudience;
 use wyrd_spec::auth::{IssuerTokenPolicy, IssuerUrl, PrincipalKindTag};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::reference::{CardRef, CardRefScope};
@@ -112,22 +113,17 @@ impl From<jsonwebtoken::errors::Error> for AuthError {
     }
 }
 
-/// The fixed `aud` of every Wyrd tenant access token.
-///
-/// Issuance stamps it and [`TokenVerifier::verify`] requires it, so a token
-/// Wyrd signed for another purpose (a refresh token, a platform session)
-/// cannot be presented as a tenant access token.
-pub const WYRD_ACCESS_TOKEN_AUDIENCE: &str = "wyrd";
-
 /// Tenant-checked token claims ready to populate request context.
 ///
 /// Built entirely from one verified JWT: the principal's authority is the
 /// token's `permissions` claim, fixed when the token was issued.
 #[derive(Clone, Debug)]
 pub struct VerifiedToken {
-    /// Current actor with the token's permission snapshot as its authority.
+    /// The token's subject, carrying the token's permission snapshot as its
+    /// authority. For a delegated token this is the party being acted for.
     pub principal: Principal,
-    /// Flattened RFC 8693 actor chain in initiator-first order.
+    /// Flattened RFC 8693 actor chain, earliest actor first. The last entry is
+    /// the current actor; the chain is attribution, never authority.
     pub delegation_chain: Vec<DelegationStep>,
     /// JWT expiry as a UTC timestamp.
     pub exp: DateTime<Utc>,
@@ -295,14 +291,31 @@ impl TokenVerifier {
         Ok(claims)
     }
 
-    /// Verify a tenant access token for the active tenant.
+    /// Verify a tenant access token presented to a general Wyrd surface.
+    ///
+    /// Equivalent to [`Self::verify_on`] with [`TokenAudience::Wyrd`]: only a
+    /// `wyrd`-audience token is accepted, so a token delegated for a narrower
+    /// resource such as Bifrost cannot be replayed here.
+    ///
+    /// # Errors
+    /// Returns the errors of [`Self::verify_on`].
+    pub fn verify(
+        &self,
+        token: &SecretString,
+        expected_tenant: &DataTenantId,
+    ) -> Result<VerifiedToken, AuthError> {
+        self.verify_on(token, expected_tenant, TokenAudience::Wyrd)
+    }
+
+    /// Verify a tenant access token presented to the `surface` audience.
     ///
     /// Checks the bearer size, the Ed25519 signature under the named
-    /// deployment key, the issuer, the fixed Wyrd audience, and expiry (with
-    /// the configured skew), then requires the token's tenant to be the
-    /// request's tenant and builds the runtime principal from the claims.
-    /// Nothing is read from a store and nothing is cached: the token's
-    /// `permissions` claim is its authority until it expires.
+    /// deployment key, the issuer, the audience, and expiry (with the
+    /// configured skew), then requires the token's tenant to be the request's
+    /// tenant and builds the runtime principal from the claims. The accepted
+    /// audiences are `wyrd` — which every tenant surface honors — and
+    /// `surface` itself. Nothing is read from a store and nothing is cached:
+    /// the token's `permissions` claim is its authority until it expires.
     ///
     /// # Errors
     /// Returns [`AuthError::BadTokenFormat`] for an oversized bearer,
@@ -320,20 +333,22 @@ impl TokenVerifier {
             principal_id = tracing::field::Empty,
             jti = tracing::field::Empty,
             tenant_id = %expected_tenant,
+            surface = surface.as_str(),
         ),
         err,
     )]
-    pub fn verify(
+    pub fn verify_on(
         &self,
         token: &SecretString,
         expected_tenant: &DataTenantId,
+        surface: TokenAudience,
     ) -> Result<VerifiedToken, AuthError> {
         let token = token.expose_secret();
         if token.len() > MAX_BEARER_TOKEN_BYTES {
             return Err(AuthError::BadTokenFormat);
         }
         let key = self.signing_key(token)?;
-        let claims = verify_access_token(token, &key, self.validation())?;
+        let claims = verify_access_token(token, &key, self.validation(surface))?;
         tracing::Span::current().record("principal_id", claims.principal.id.to_string());
         tracing::Span::current().record("jti", claims.jti.as_str());
         if &claims.principal.tenant_id != expected_tenant {
@@ -342,10 +357,11 @@ impl TokenVerifier {
         claims.into_verified()
     }
 
-    fn validation(&self) -> Validation {
+    /// Access-token validation accepting `wyrd` and the `surface` audience.
+    fn validation(&self, surface: TokenAudience) -> Validation {
         let mut validation = Validation::new(Algorithm::EdDSA);
         validation.set_issuer(&[self.issuer.as_str()]);
-        validation.set_audience(&[WYRD_ACCESS_TOKEN_AUDIENCE]);
+        validation.set_audience(&[TokenAudience::Wyrd.as_str(), surface.as_str()]);
         validation.leeway = self.settings.allowed_clock_skew.as_secs();
         validation
     }
@@ -551,22 +567,24 @@ impl<I: IssuerConfigResolver> ExternalVerifier<I> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AccessTokenClaims {
-    /// Ultimate initiator, JWT `sub`.
+    /// Subject id, JWT `sub`; always `principal.id`.
     pub sub: String,
-    /// Current actor whose authority the token carries.
+    /// Subject whose attenuated authority the token carries.
     pub principal: TokenPrincipalRef,
-    /// Roles assigned to the current actor at issue time.
+    /// Roles assigned to the subject at issue time.
     ///
     /// Informational metadata only. No request resolves or authorizes from
     /// it; [`Self::permissions`] is the token's authority.
     pub roles: Vec<RoleRef>,
-    /// The current actor's effective permissions, resolved from its grants
-    /// when the token was issued. The only tenant authority claim.
+    /// Effective permissions resolved when the token was issued — for a
+    /// delegated token, the intersection of the subject's and the actor's.
+    /// The only tenant authority claim.
     pub permissions: PermissionSet,
-    /// RFC 8693 actor chain for delegated tokens.
+    /// RFC 8693 actor chain for delegated tokens: the outermost layer is the
+    /// current actor, and earlier actors nest inside it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub act: Option<Box<ActClaim>>,
-    /// Audience, JWT `aud`; always [`WYRD_ACCESS_TOKEN_AUDIENCE`].
+    /// Audience, JWT `aud`: a [`TokenAudience`] value.
     pub aud: String,
     /// Expiry as Unix seconds, JWT `exp`.
     pub exp: usize,
@@ -627,15 +645,16 @@ pub struct PlatformAccessTokenClaims {
 /// The only accepted value of [`PlatformAccessTokenClaims::scope`].
 pub const PLATFORM_TOKEN_SCOPE: &str = "platform";
 
-/// One layer of an RFC 8693 `act` delegation chain.
+/// One layer of an RFC 8693 `act` delegation chain: one actor, with the
+/// actor before it nested in [`Self::act`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ActClaim {
-    /// Subject at this delegation layer.
+    /// Actor id at this delegation layer.
     pub sub: String,
-    /// Principal at this delegation layer.
+    /// Actor principal at this delegation layer.
     pub principal: TokenPrincipalRef,
-    /// Next older delegation layer.
+    /// The actor that acted before this one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub act: Option<Box<ActClaim>>,
 }
@@ -840,6 +859,15 @@ fn verify_access_token(
         .map_err(AuthError::from)
 }
 
+/// Flatten a nested `act` claim into actors ordered earliest first.
+///
+/// The outermost layer is the current actor, so the walk collects newest
+/// first and reverses; the current actor is therefore the last entry.
+///
+/// # Errors
+/// Returns [`AuthError::DelegationDepthExceeded`] past
+/// [`MAX_DELEGATION_DEPTH`] layers, and the Card-binding errors of
+/// `wire_kind_into_principal_kind` for a malformed layer.
 fn flatten_act_chain(mut act: Option<&ActClaim>) -> Result<Vec<DelegationStep>, AuthError> {
     let mut out = Vec::new();
     while let Some(layer) = act {
@@ -945,8 +973,8 @@ mod tests {
     use super::{
         AccessTokenClaims, ActClaim, AuthError, ExternalVerifier, Kid, MAX_BEARER_TOKEN_BYTES,
         MAX_DELEGATION_DEPTH, PrincipalKindTag, TokenPrincipalRef, TokenVerifier,
-        WYRD_ACCESS_TOKEN_AUDIENCE, WyrdAuthVerifySettings, decode_kid, public_key_from_pem,
-        verify_eddsa, verify_eddsa_with,
+        TokenAudience, WyrdAuthVerifySettings, decode_kid, public_key_from_pem, verify_eddsa,
+        verify_eddsa_with,
     };
 
     const PRIVATE_KEY_PEM: &[u8] = b"-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
@@ -1055,19 +1083,22 @@ mod tests {
         assert_no_sqlx_in_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"));
     }
 
+    /// The outermost `act` is the current actor and earlier actors nest inside
+    /// it; verification keeps the subject as the principal and flattens the
+    /// actors earliest first, current actor last.
     #[test]
-    fn into_verified_carries_permissions_claim_and_flattens_delegation_initiator_first() {
-        let initiator = service_ref("initiator");
-        let immediate = service_ref("immediate");
+    fn into_verified_keeps_subject_and_orders_actors_earliest_first() {
+        let earlier_actor = service_ref("earlier-actor");
+        let current_actor = service_ref("current-actor");
         let claims = AccessTokenClaims {
-            principal: service_ref("current"),
+            principal: service_ref("subject"),
             roles: vec![role()],
             act: Some(Box::new(ActClaim {
-                sub: immediate.id.to_string(),
-                principal: immediate.clone(),
+                sub: current_actor.id.to_string(),
+                principal: current_actor.clone(),
                 act: Some(Box::new(ActClaim {
-                    sub: initiator.id.to_string(),
-                    principal: initiator.clone(),
+                    sub: earlier_actor.id.to_string(),
+                    principal: earlier_actor.clone(),
                     act: None,
                 })),
             })),
@@ -1076,6 +1107,10 @@ mod tests {
 
         let verified = claims.into_verified().expect("claims convert");
 
+        assert_eq!(
+            verified.principal.card_ref(),
+            service_ref("subject").card_ref.as_ref()
+        );
         assert!(
             verified
                 .principal
@@ -1085,11 +1120,11 @@ mod tests {
         assert_eq!(verified.delegation_chain.len(), 2);
         assert_eq!(
             verified.delegation_chain[0].principal.card_ref(),
-            initiator.card_ref.as_ref()
+            earlier_actor.card_ref.as_ref()
         );
         assert_eq!(
             verified.delegation_chain[1].principal.card_ref(),
-            immediate.card_ref.as_ref()
+            current_actor.card_ref.as_ref()
         );
     }
 
@@ -1380,6 +1415,37 @@ mod tests {
         assert!(matches!(result, Err(AuthError::Jwt(_))), "{result:?}");
     }
 
+    /// A Bifrost-audience token verifies only on the Bifrost surface, while a
+    /// `wyrd` token verifies on both, so a delegated Bifrost token cannot be
+    /// replayed against a general Wyrd surface.
+    #[test]
+    fn bifrost_audience_is_accepted_only_on_the_bifrost_surface() {
+        let bifrost = SecretString::from(encode_eddsa_with_kid(&AccessTokenClaims {
+            aud: TokenAudience::Bifrost.as_str().to_owned(),
+            ..claims_with_times(now() + 3_600, now())
+        }));
+        let wyrd = SecretString::from(encode_eddsa_with_kid(&claims_with_times(
+            now() + 3_600,
+            now(),
+        )));
+        let verifier = verifier(WyrdAuthVerifySettings::default());
+
+        assert!(matches!(
+            verifier.verify(&bifrost, &tenant_id()),
+            Err(AuthError::Jwt(_))
+        ));
+        assert!(
+            verifier
+                .verify_on(&bifrost, &tenant_id(), TokenAudience::Bifrost)
+                .is_ok()
+        );
+        assert!(
+            verifier
+                .verify_on(&wyrd, &tenant_id(), TokenAudience::Bifrost)
+                .is_ok()
+        );
+    }
+
     /// An expired token fails as expired, with no skew allowance.
     #[test]
     fn token_verifier_rejects_expired_token() {
@@ -1442,7 +1508,7 @@ mod tests {
     fn wyrd_validation() -> Validation {
         let mut validation = Validation::new(Algorithm::EdDSA);
         validation.set_issuer(&["wyrd"]);
-        validation.set_audience(&[WYRD_ACCESS_TOKEN_AUDIENCE]);
+        validation.set_audience(&[TokenAudience::Wyrd.as_str()]);
         validation
     }
 
@@ -1459,7 +1525,7 @@ mod tests {
             roles: vec![role()],
             permissions: PermissionSet::from_iter([Permission::card_read()]),
             act: None,
-            aud: WYRD_ACCESS_TOKEN_AUDIENCE.to_owned(),
+            aud: TokenAudience::Wyrd.as_str().to_owned(),
             exp,
             iat,
             iss: "wyrd".to_owned(),

@@ -116,8 +116,6 @@ pub enum Resource {
     /// prove it. An operator may need to rotate the deployment's root
     /// credential without also being able to register new administrators.
     PlatformCredentials,
-    /// RFC 8693 token exchange and delegation.
-    Delegation,
     /// Bifrost table definitions (DDL: create/list/describe).
     BifrostTable,
     /// Bifrost record ingest (the streaming write surface).
@@ -154,8 +152,6 @@ pub enum Action {
     Lock,
     /// Run.
     Run,
-    /// Issue a token or delegated credential.
-    Issue,
     /// Suspend a resource without destroying it, and resume it.
     Suspend,
     /// Restore administrative access a tenant can no longer reach itself.
@@ -223,7 +219,6 @@ impl Resource {
             Self::Tenants => "tenants",
             Self::PlatformIdentity => "platform_identity",
             Self::PlatformCredentials => "platform_credentials",
-            Self::Delegation => "delegation",
             Self::BifrostTable => "bifrost_table",
             Self::BifrostRecord => "bifrost_record",
             Self::BifrostQuery => "bifrost_query",
@@ -268,7 +263,6 @@ impl Action {
             Self::Install => "install",
             Self::Lock => "lock",
             Self::Run => "run",
-            Self::Issue => "issue",
             Self::Suspend => "suspend",
             Self::Recover => "recover",
             Self::Wildcard => "wildcard",
@@ -550,16 +544,6 @@ impl Permission {
         }
     }
 
-    /// Issue delegated tokens.
-    #[must_use]
-    pub const fn delegation_issue() -> Self {
-        Self {
-            resource: Resource::Delegation,
-            action: Action::Issue,
-            scope: PermissionScope::All,
-        }
-    }
-
     /// Write Bifrost records (the ingest surface).
     #[must_use]
     pub const fn bifrost_record_write() -> Self {
@@ -684,7 +668,6 @@ fn parse_resource(value: &str) -> Result<Resource, PermissionParseError> {
         "triggers" => Resource::Triggers,
         "service_accounts" => Resource::ServiceAccounts,
         "users" => Resource::Users,
-        "delegation" => Resource::Delegation,
         "bifrost_table" => Resource::BifrostTable,
         "bifrost_record" => Resource::BifrostRecord,
         "bifrost_peer" => Resource::BifrostPeer,
@@ -703,7 +686,6 @@ fn parse_action(value: &str) -> Result<Action, PermissionParseError> {
         "install" => Action::Install,
         "lock" => Action::Lock,
         "run" => Action::Run,
-        "issue" => Action::Issue,
         "wildcard" => Action::Wildcard,
         _ => return Err(PermissionParseError),
     })
@@ -864,7 +846,6 @@ mod tests {
             Resource::Triggers,
             Resource::ServiceAccounts,
             Resource::Users,
-            Resource::Delegation,
             Resource::AnyOf(vec![Resource::Operators, Resource::Evals]),
             Resource::Wildcard,
         ];
@@ -883,7 +864,6 @@ mod tests {
             Action::Install,
             Action::Lock,
             Action::Run,
-            Action::Issue,
             Action::AnyOf(vec![Action::Read, Action::Write]),
             Action::Wildcard,
         ];
@@ -951,7 +931,7 @@ mod tests {
 
         assert!(permission.covers(&Permission::card_read()));
         assert!(permission.covers(&Permission::card_write()));
-        assert!(permission.covers(&Permission::delegation_issue()));
+        assert!(permission.covers(&Permission::bifrost_record_write()));
     }
 
     #[test]
@@ -973,21 +953,6 @@ mod tests {
             action: Action::Invoke,
             scope: PermissionScope::All,
         }));
-    }
-
-    #[test]
-    fn delegation_issue_const_fn_round_trips() {
-        let permission = Permission::delegation_issue();
-        let value = serde_json::to_value(&permission).expect("permission serializes");
-
-        assert_eq!(
-            value,
-            json!({"resource": "delegation", "action": "issue", "scope": "all"})
-        );
-
-        let round_trip: Permission =
-            serde_json::from_value(value).expect("permission deserializes");
-        assert_eq!(round_trip, permission);
     }
 
     #[test]
@@ -1013,7 +978,7 @@ mod tests {
         let set = PermissionSet::from_iter([Permission::wildcard()]);
 
         assert!(set.contains(&Permission::card_read()));
-        assert!(set.contains(&Permission::delegation_issue()));
+        assert!(set.contains(&Permission::bifrost_record_write()));
     }
 
     #[test]
@@ -1026,7 +991,6 @@ mod tests {
                 action: Action::Invoke,
                 scope: PermissionScope::All,
             },
-            Permission::delegation_issue(),
             Permission::wildcard(),
         ];
         let value = serde_json::to_value(&permissions).expect("permissions serialize");
@@ -1037,7 +1001,6 @@ mod tests {
                 {"resource": "cards", "action": "write", "scope": "all"},
                 {"resource": "cards", "action": "read", "scope": "all"},
                 {"resource": {"any_of": ["operators", "evals"]}, "action": "invoke", "scope": "all"},
-                {"resource": "delegation", "action": "issue", "scope": "all"},
                 {"resource": "wildcard", "action": "wildcard", "scope": "all"}
             ])
         );
@@ -1116,7 +1079,7 @@ mod tests {
             set(vec![Permission::card_write()])
                 .intersection(&set(vec![
                     Permission::card_read(),
-                    Permission::delegation_issue()
+                    Permission::bifrost_record_write()
                 ]))
                 .is_empty()
         );

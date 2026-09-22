@@ -16,7 +16,7 @@ use ulid::Ulid;
 use uuid::Uuid;
 use wyrd_auth_verify::{
     AccessTokenClaims, ActClaim, Kid, PLATFORM_TOKEN_SCOPE, PlatformAccessTokenClaims,
-    RefreshTokenClaims, TokenPrincipalRef, WYRD_ACCESS_TOKEN_AUDIENCE,
+    RefreshTokenClaims, TokenAudience, TokenPrincipalRef,
 };
 use wyrd_runtime::{PermissionSet, PrincipalId, RoleRef};
 use wyrd_spec::DataTenantId;
@@ -109,30 +109,21 @@ pub enum IssueError {
 /// shape, audience, TTL arithmetic, and signing.
 #[derive(Debug)]
 pub struct AccessGrant {
-    /// Principal the token is minted for (the current actor).
+    /// Subject the token is minted for: the requesting principal for a direct
+    /// token, the party being acted for in an RFC 8693 exchange.
     pub principal: TokenPrincipalRef,
-    /// Roles assigned to the principal; informational metadata only.
+    /// Roles assigned to the subject; informational metadata only.
     pub roles: Vec<RoleRef>,
-    /// The principal's effective permissions; the token's authority.
+    /// The token's authority: the subject's effective permissions, already
+    /// attenuated to the actor's for a delegated token.
     pub permissions: PermissionSet,
     /// Stored credential the token was exchanged from, when one was presented.
     pub credential_id: Option<Uuid>,
-    /// Delegating caller for an RFC 8693 exchange; `None` for a direct token.
-    pub delegated_by: Option<DelegationCaller>,
-}
-
-/// Caller context for RFC 8693 token delegation.
-///
-/// The delegating token's subject, principal, and `act` chain, which become
-/// the newest layer of the delegated token's `act` chain.
-#[derive(Debug)]
-pub struct DelegationCaller {
-    /// Subject identifier of the original caller (the `sub` claim of their token).
-    pub sub: String,
-    /// Principal reference of the caller.
-    pub principal: TokenPrincipalRef,
-    /// Act chain from the caller's token, if any.
+    /// RFC 8693 actor chain for a delegated token, outermost layer the current
+    /// actor; `None` for a direct token. Attribution only, never authority.
     pub act: Option<Box<ActClaim>>,
+    /// Audience the token is issued for.
+    pub audience: TokenAudience,
 }
 
 impl IssuingKey {
@@ -201,12 +192,10 @@ impl IssuingKey {
     /// The only tenant access-token signing path. It validates that the
     /// principal's kind and Card binding agree, re-derives a Card-bound
     /// principal's scope from its root so a caller cannot widen it with extra
-    /// members, extends the RFC 8693 `act` chain when the grant is delegated
-    /// (the delegating caller becomes the newest layer and `sub` stays the
-    /// original initiator), and stamps the fixed Wyrd audience, the grant's
-    /// `permissions` authority snapshot, informational `roles`, and the
-    /// credential attribution. The encoded token must fit the verifier's
-    /// bearer-size limit.
+    /// members, bounds a delegated grant's RFC 8693 `act` chain, and stamps
+    /// `sub` as the subject, the grant's audience, its `permissions` authority
+    /// snapshot, informational `roles`, and the credential attribution. The
+    /// encoded token must fit the verifier's bearer-size limit.
     ///
     /// # Errors
     /// Returns [`IssueError::InvalidPrincipalKind`] for a platform-scope kind,
@@ -239,7 +228,8 @@ impl IssuingKey {
             roles,
             permissions,
             credential_id,
-            delegated_by,
+            act,
+            audience,
         } = grant;
         validate_principal_ref(&principal)?;
         if let Some(card_ref) = &principal.card_ref {
@@ -248,25 +238,14 @@ impl IssuingKey {
                 principal.card_ref_scope.as_slice().iter().cloned(),
             );
         }
-        let (sub, act) = match delegated_by {
-            None => (principal.id.to_string(), None),
-            Some(caller) => {
-                let resulting_depth = act_depth(caller.act.as_deref()) + 1;
-                tracing::Span::current().record("delegation_depth", resulting_depth);
-                if resulting_depth > MAX_DELEGATION_DEPTH {
-                    return Err(IssueError::DelegationDepthExceeded {
-                        max: MAX_DELEGATION_DEPTH,
-                    });
-                }
-                let sub = caller.sub.clone();
-                let act = ActClaim {
-                    sub: caller.sub,
-                    principal: caller.principal,
-                    act: caller.act,
-                };
-                (sub, Some(Box::new(act)))
-            }
-        };
+        let depth = act_depth(act.as_deref());
+        tracing::Span::current().record("delegation_depth", depth);
+        if depth > MAX_DELEGATION_DEPTH {
+            return Err(IssueError::DelegationDepthExceeded {
+                max: MAX_DELEGATION_DEPTH,
+            });
+        }
+        let sub = principal.id.to_string();
         let (iat, exp) = timestamps(Utc::now(), ttl)?;
         let jti = new_jti();
         tracing::Span::current().record("jti", &jti);
@@ -276,7 +255,7 @@ impl IssuingKey {
             roles,
             permissions,
             act,
-            aud: WYRD_ACCESS_TOKEN_AUDIENCE.to_owned(),
+            aud: audience.as_str().to_owned(),
             exp,
             iat,
             iss: self.issuer.clone(),
@@ -428,6 +407,7 @@ fn new_jti() -> String {
     Ulid::new().to_string()
 }
 
+/// Count the layers of an `act` chain.
 fn act_depth(act: Option<&ActClaim>) -> usize {
     let Some(act) = act else {
         return 0;
@@ -471,8 +451,8 @@ mod tests {
     use secrecy::{ExposeSecret, SecretString};
     use wyrd_auth_verify::{
         AccessTokenClaims, ActClaim, PLATFORM_TOKEN_SCOPE, PlatformAccessTokenClaims,
-        RefreshTokenClaims, TokenPrincipalRef, WYRD_ACCESS_TOKEN_AUDIENCE, decode_kid,
-        public_key_from_pem, verify_eddsa,
+        RefreshTokenClaims, TokenAudience, TokenPrincipalRef, decode_kid, public_key_from_pem,
+        verify_eddsa,
     };
     use wyrd_runtime::{Permission, PermissionSet, PrincipalId, RoleRef};
     use wyrd_semver::VersionBlock;
@@ -483,7 +463,7 @@ mod tests {
     use wyrd_spec::reference::{CardRef, CardRefScope};
 
     use super::{
-        ARGON2_M_COST_KIB, AccessGrant, DelegationCaller, IssueError, IssuingKey, Kid,
+        ARGON2_M_COST_KIB, AccessGrant, IssueError, IssuingKey, Kid,
         MAX_BEARER_TOKEN_BYTES, MAX_DELEGATION_DEPTH, hash_api_key, verify_api_key,
     };
 
@@ -508,7 +488,7 @@ mod tests {
         assert_eq!(claims.principal.card_ref, None);
         assert_eq!(claims.roles, vec![role("runtime_admin")]);
         assert_eq!(claims.permissions, permissions());
-        assert_eq!(claims.aud, WYRD_ACCESS_TOKEN_AUDIENCE);
+        assert_eq!(claims.aud, "wyrd");
         assert_eq!(claims.cid, None);
         assert_eq!(claims.act, None);
         assert_eq!(claims.iss, "wyrd");
@@ -747,52 +727,42 @@ mod tests {
         assert!(matches!(result, Err(IssueError::InvalidTtl)));
     }
 
+    /// A delegated grant keeps the subject as `sub` and principal, names the
+    /// actor in the outermost `act`, and carries the requested audience.
     #[test]
-    fn issue_access_token_delegated_extends_act_chain() {
-        let caller_token = issuing_key()
-            .issue_access_token(
-                grant(user_principal(), vec![role("runtime_admin")]),
-                Duration::minutes(5),
-            )
-            .expect("caller token issues");
-        let raw = verify_access_token(&caller_token);
-        let caller = DelegationCaller {
-            sub: raw.sub.clone(),
-            principal: raw.principal.clone(),
-            act: raw.act.clone(),
-        };
+    fn issue_access_token_delegated_names_subject_and_outer_actor() {
+        let actor = agent_principal();
         let delegated_token = issuing_key()
             .issue_access_token(
                 AccessGrant {
-                    delegated_by: Some(caller),
-                    ..grant(agent_principal(), vec![role("agent")])
+                    act: Some(Box::new(ActClaim {
+                        sub: actor.id.to_string(),
+                        principal: actor.clone(),
+                        act: None,
+                    })),
+                    audience: TokenAudience::Bifrost,
+                    ..grant(user_principal(), vec![role("reader")])
                 },
                 Duration::minutes(5),
             )
             .expect("delegated token issues");
-        let delegated_claims = verify_access_token(&delegated_token);
-        let act = delegated_claims.act.as_ref().expect("act chain is present");
+        let claims = verify_access_token(&delegated_token);
+        let act = claims.act.as_ref().expect("act chain is present");
 
-        assert_eq!(delegated_claims.sub, raw.sub);
-        assert_eq!(delegated_claims.principal.kind, PrincipalKindTag::Agent);
-        assert_eq!(delegated_claims.roles, vec![role("agent")]);
-        assert_eq!(act.sub, raw.sub);
-        assert_eq!(act.principal, raw.principal);
+        assert_eq!(claims.sub, user_principal().id.to_string());
+        assert_eq!(claims.principal, user_principal());
+        assert_eq!(claims.aud, "bifrost");
+        assert_eq!(act.sub, actor.id.to_string());
+        assert_eq!(act.principal, actor);
         assert_eq!(act.act, None);
     }
 
     #[test]
     fn issue_access_token_delegated_rejects_depth_over_max() {
-        let caller = DelegationCaller {
-            sub: user_principal().id.to_string(),
-            principal: user_principal(),
-            act: Some(Box::new(act_chain(MAX_DELEGATION_DEPTH))),
-        };
-
         let result = issuing_key().issue_access_token(
             AccessGrant {
-                delegated_by: Some(caller),
-                ..grant(agent_principal(), vec![role("agent")])
+                act: Some(Box::new(act_chain(MAX_DELEGATION_DEPTH + 1))),
+                ..grant(user_principal(), vec![role("reader")])
             },
             Duration::minutes(5),
         );
@@ -807,16 +777,10 @@ mod tests {
 
     #[test]
     fn issue_access_token_delegated_accepts_depth_at_max() {
-        let caller = DelegationCaller {
-            sub: user_principal().id.to_string(),
-            principal: user_principal(),
-            act: Some(Box::new(act_chain(MAX_DELEGATION_DEPTH - 1))),
-        };
-
         let result = issuing_key().issue_access_token(
             AccessGrant {
-                delegated_by: Some(caller),
-                ..grant(agent_principal(), vec![role("agent")])
+                act: Some(Box::new(act_chain(MAX_DELEGATION_DEPTH))),
+                ..grant(user_principal(), vec![role("reader")])
             },
             Duration::minutes(5),
         );
@@ -1009,7 +973,8 @@ mod tests {
             roles,
             permissions: permissions(),
             credential_id: None,
-            delegated_by: None,
+            act: None,
+            audience: TokenAudience::Wyrd,
         }
     }
 

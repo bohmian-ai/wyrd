@@ -3,9 +3,10 @@
 use async_trait::async_trait;
 use vala_sql::queries::audit_staging::append_audit;
 use wyrd_auth_check::AuthzCheckContext;
+use wyrd_runtime::DelegationStep;
 use wyrd_spec::card::policy::PolicyDecision;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::vala::api::{AuditEvent, AuditOutcome};
+use wyrd_spec::vala::api::{AuditDetail, AuditEvent, AuditOutcome};
 use wyrd_sql::TenantConn;
 
 /// Audit writer used by the authz-check route.
@@ -47,21 +48,30 @@ impl AuthzAuditWriter for RealAuthzAuditWriter {
             PolicyDecision::Allow => AuditOutcome::Allowed,
             _ => AuditOutcome::Denied,
         };
+        let chain: Vec<DelegationStep> = ctx
+            .chain
+            .iter()
+            .map(|principal| DelegationStep {
+                principal: principal.clone(),
+            })
+            .collect();
         let event = AuditEvent {
             request_id: ctx.request_id.clone(),
             trace_id: None,
             operation: "authz.check".to_owned(),
             resource: ctx.request.target.to_string(),
-            card_ref: ctx.caller.card_ref().cloned(),
-            principal_id: ctx.caller.id,
-            principal_kind: ctx.caller.kind.tag(),
-            // The row is attributed to the immediate delegator, and a delegated
-            // token is minted from a token rather than from a credential, so
-            // there is no credential of that principal's to name here.
+            card_ref: ctx.subject.card_ref().cloned(),
+            principal_id: ctx.subject.id,
+            principal_kind: ctx.subject.kind.tag(),
+            // The row is attributed to the subject being acted for, with the
+            // actors in its detail. A delegated token is minted from tokens
+            // rather than presented credentials, so there is none to name.
             credential_id: None,
             permission: ctx.request.action.clone(),
             outcome,
-            detail: None,
+            detail: Some(AuditDetail::DelegationAttribution {
+                delegation_chain: wyrd_runtime::audit_delegation_chain(&chain),
+            }),
         };
         append_audit(conn, &event)
             .await
@@ -122,12 +132,12 @@ mod pg_tests {
 
     fn context() -> AuthzCheckContext {
         let tenant = DataTenantId::new_v7();
-        let caller = principal("caller", tenant);
-        let callee = principal("callee", tenant);
+        let actor = principal("actor", tenant);
+        let subject = principal("subject", tenant);
         let verified = VerifiedToken {
-            principal: callee,
+            principal: subject,
             delegation_chain: vec![DelegationStep {
-                principal: PrincipalRef::from_principal(&caller),
+                principal: PrincipalRef::from_principal(&actor),
             }],
             exp: chrono::Utc::now(),
         };
@@ -135,7 +145,7 @@ mod pg_tests {
         AuthzCheckContext::from_verified(
             &verified,
             AuthzCheckRequest {
-                target: card_ref("callee"),
+                target: card_ref("actor"),
                 action: "card_write".to_owned(),
                 context: serde_json::json!({}),
             },

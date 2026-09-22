@@ -91,7 +91,8 @@ fn mint_jwt_with_permissions(
                 roles: role_refs,
                 permissions,
                 credential_id: None,
-                delegated_by: None,
+                act: None,
+                audience: wyrd_spec::auth::TokenAudience::Wyrd,
             },
             Duration::minutes(15),
         )

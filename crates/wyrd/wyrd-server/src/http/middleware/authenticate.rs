@@ -6,13 +6,15 @@ use axum::http::Request;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
+use wyrd_auth_verify::TokenAudience;
+
 use crate::components::auth::token_extract::verify_authenticated_principal;
 use crate::state::AppState;
 
 /// Reject unauthenticated requests before they reach protected handlers.
 ///
 /// A `from_fn_with_state` layer modeled on `attach_request_id`: it verifies the
-/// Wyrd access token carried in `X-Wyrd-Access-Token`, and on success inserts the
+/// `wyrd`-audience access token carried in `X-Wyrd-Access-Token`, and on success inserts the
 /// verified [`AuthenticatedPrincipal`](crate::components::auth::principal_extractor::AuthenticatedPrincipal) into request extensions before calling
 /// `next`. On any failure it returns the mapped Wyrd error response immediately
 /// and does not call `next`.
@@ -22,10 +24,38 @@ use crate::state::AppState;
 /// are identical by construction.
 pub async fn require_authenticated(
     State(state): State<AppState>,
-    mut request: Request<Body>,
+    request: Request<Body>,
     next: Next,
 ) -> Response {
-    match verify_authenticated_principal(state.auth.token_verifier.as_deref(), request.headers()) {
+    authenticate_on(&state, request, next, TokenAudience::Wyrd).await
+}
+
+/// Reject unauthenticated requests to the Bifrost HTTP surface.
+///
+/// Identical to [`require_authenticated`] except that it also accepts a
+/// `bifrost`-audience delegated token. It layers only the Bifrost and query
+/// routers, which is what confines a Bifrost-bound token to Bifrost.
+pub async fn require_bifrost_authenticated(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    authenticate_on(&state, request, next, TokenAudience::Bifrost).await
+}
+
+/// Verify the request's token for `surface`, insert the principal, and run
+/// `next`; any verification failure is returned without calling `next`.
+async fn authenticate_on(
+    state: &AppState,
+    mut request: Request<Body>,
+    next: Next,
+    surface: TokenAudience,
+) -> Response {
+    match verify_authenticated_principal(
+        state.auth.token_verifier.as_deref(),
+        request.headers(),
+        surface,
+    ) {
         Ok(principal) => {
             request.extensions_mut().insert(principal);
             next.run(request).await
@@ -218,7 +248,8 @@ mod pg_tests {
                     roles: vec![],
                     permissions: wyrd_runtime::PermissionSet::new(),
                     credential_id: None,
-                    delegated_by: None,
+                    act: None,
+                    audience: wyrd_spec::auth::TokenAudience::Wyrd,
                 },
                 ttl,
             )

@@ -12,13 +12,12 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use chrono::Duration;
 use wyrd_auth_check::DenyAllPolicyHook;
-use wyrd_auth_issue::DelegationCaller;
 use wyrd_auth_verify::{ActClaim, TokenPrincipalRef};
 use wyrd_runtime::{PrincipalId, RoleRef};
 use wyrd_semver::VersionBlock;
 use wyrd_server::AppState;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::PrincipalKindTag;
+use wyrd_spec::auth::{PrincipalKindTag, TokenAudience};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::CardRef;
@@ -42,7 +41,7 @@ async fn authz_user_jwt_returns_403_kind_not_eligible() {
     server.shutdown().await.expect("server shuts down");
 }
 
-/// A service token minted without a delegation chain carries no caller, so the
+/// A service token minted without a delegation chain carries no actor, so the
 /// route must refuse it with the distinct `chain_empty` reason rather than
 /// collapsing both refusals into one opaque 403.
 #[tokio::test]
@@ -61,37 +60,38 @@ async fn authz_direct_service_jwt_returns_403_chain_empty() {
     server.shutdown().await.expect("server shuts down");
 }
 
-/// The full production path: two bootstrapped services, an API-key exchange, a
-/// real delegation, and an allow decision carrying a request id.
+/// The full production path: two bootstrapped services, two API-key exchanges,
+/// a real RFC 8693 exchange in which the actor works for the subject, and an allow decision carrying a request id.
 #[tokio::test]
 async fn authz_delegated_token_allows() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
-    let caller = server
-        .bootstrap_service("route-caller", &["runtime_admin", "writer"])
+    let subject = server
+        .bootstrap_service("route-subject", &["writer"])
         .await
-        .expect("caller bootstraps");
-    let callee = server
-        .bootstrap_service("route-callee", &["writer"])
+        .expect("subject bootstraps");
+    let actor = server
+        .bootstrap_service("route-actor", &["writer"])
         .await
-        .expect("callee bootstraps");
-    let caller_jwt = server
-        .exchange_api_key(caller.api_key().expect("machine has key"))
+        .expect("actor bootstraps");
+    let subject_jwt = server
+        .exchange_api_key(subject.api_key().expect("machine has key"))
         .await
-        .expect("caller key exchanges");
+        .expect("subject key exchanges");
+    let actor_jwt = server
+        .exchange_api_key(actor.api_key().expect("machine has key"))
+        .await
+        .expect("actor key exchanges");
     let delegated = server
-        .delegate(
-            &caller_jwt,
-            callee.card_ref().expect("machine has card ref"),
-        )
+        .delegate(&subject_jwt, &actor_jwt, TokenAudience::Wyrd)
         .await
         .expect("delegates");
 
     let response = server
         .oneshot_authenticated(
             &delegated,
-            authz_request_without_token(callee.card_ref().expect("machine has card ref"), true),
+            authz_request_without_token(subject.card_ref().expect("machine has card ref"), true),
         )
         .await
         .expect("router responds");
@@ -291,7 +291,8 @@ fn mint_user_jwt(state: &AppState, tenant: DataTenantId) -> String {
                 roles: Vec::new(),
                 permissions: wyrd_runtime::PermissionSet::new(),
                 credential_id: None,
-                delegated_by: None,
+                act: None,
+                audience: TokenAudience::Wyrd,
             },
             Duration::minutes(5),
         )
@@ -321,35 +322,36 @@ fn mint_service_jwt(state: &AppState, tenant: DataTenantId, name: &str) -> Strin
                 roles: Vec::new(),
                 permissions: wyrd_runtime::PermissionSet::new(),
                 credential_id: None,
-                delegated_by: None,
+                act: None,
+                audience: TokenAudience::Wyrd,
             },
             Duration::minutes(5),
         )
         .expect("service jwt mints")
 }
 
-/// Mint a delegated service token whose chain names a distinct caller and
-/// callee, so the route's delegation gate admits it and evaluation proceeds to
-/// the policy hook and permission check.
+/// Mint a delegated service token whose subject is `subject` and whose outer
+/// actor is a distinct `actor` service, so the route's delegation gate admits
+/// it and evaluation proceeds to the policy hook.
 ///
 /// # Panics
-/// Panics when the composed state has no issuing key or minting fails.
+/// Panics when the composed server carries no issuing key or minting fails.
 fn mint_delegated_service_jwt(state: &AppState, tenant: DataTenantId) -> String {
-    let caller_ref = card_ref(CardKind::Service, "caller");
-    let caller = TokenPrincipalRef {
+    let actor_ref = card_ref(CardKind::Service, "actor");
+    let actor = TokenPrincipalRef {
         id: PrincipalId::new(uuid::Uuid::now_v7()),
         kind: PrincipalKindTag::Service,
         tenant_id: tenant,
-        card_ref: Some(caller_ref.clone()),
-        card_ref_scope: wyrd_spec::reference::CardRefScope::own(&caller_ref),
+        card_ref: Some(actor_ref.clone()),
+        card_ref_scope: wyrd_spec::reference::CardRefScope::own(&actor_ref),
     };
-    let requested_ref = card_ref(CardKind::Service, "callee");
-    let requested = TokenPrincipalRef {
+    let subject_ref = card_ref(CardKind::Service, "callee");
+    let subject = TokenPrincipalRef {
         id: PrincipalId::new(uuid::Uuid::now_v7()),
         kind: PrincipalKindTag::Service,
         tenant_id: tenant,
-        card_ref: Some(requested_ref.clone()),
-        card_ref_scope: wyrd_spec::reference::CardRefScope::own(&requested_ref),
+        card_ref: Some(subject_ref.clone()),
+        card_ref_scope: wyrd_spec::reference::CardRefScope::own(&subject_ref),
     };
 
     state
@@ -359,15 +361,16 @@ fn mint_delegated_service_jwt(state: &AppState, tenant: DataTenantId) -> String 
         .expect("composed server carries an issuing key")
         .issue_access_token(
             wyrd_auth_issue::AccessGrant {
-                principal: requested,
+                principal: subject,
                 roles: Vec::<RoleRef>::new(),
                 permissions: wyrd_runtime::PermissionSet::new(),
                 credential_id: None,
-                delegated_by: Some(DelegationCaller {
-                    sub: caller.id.to_string(),
-                    principal: caller,
-                    act: None::<Box<ActClaim>>,
-                }),
+                act: Some(Box::new(ActClaim {
+                    sub: actor.id.to_string(),
+                    principal: actor,
+                    act: None,
+                })),
+                audience: TokenAudience::Wyrd,
             },
             Duration::minutes(5),
         )

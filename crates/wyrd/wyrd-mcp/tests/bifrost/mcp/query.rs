@@ -19,6 +19,7 @@ mod pg_tests {
     use rmcp::service::PeerRequestOptions;
     use rmcp::service::ServiceError;
     use wyrd_client::transport::credential::ResolvedCredential;
+    use wyrd_spec::auth::TokenAudience;
     use wyrd_spec::request_id::RequestId;
     use wyrd_testing::WyrdTestServer;
     use wyrd_testing::bifrost::seed_query_fixture;
@@ -38,12 +39,12 @@ mod pg_tests {
         )
     }
 
-    /// An agent acting for another agent reads Bifrost as the principal its
+    /// An agent acting for another agent reads Bifrost as the subject its
     /// delegated token names.
     ///
     /// A real two-hop delegated token reaches the real `bifrost.query` tool and
-    /// authorization stays bound to the effective principal: the permitted
-    /// delegate reads, a nondelegated caller in the same tenant reads, and an
+    /// authorization stays bound to the subject and the attenuated permissions:
+    /// the permitted delegate reads, a nondelegated caller in the same tenant reads, and an
     /// under-privileged delegate is refused before any row. Audit attribution
     /// of the chain is owned by the server query journey, not this MCP path.
     ///
@@ -52,37 +53,37 @@ mod pg_tests {
     /// Returns fixture, delegation, transport, or shutdown failures.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires the Postgres-backed Bifrost journey lane"]
-    async fn delegated_agent_query_is_authorized_as_the_effective_principal()
-    -> Result<(), McpJourneyError> {
+    async fn delegated_agent_query_is_authorized_as_the_subject() -> Result<(), McpJourneyError> {
         let server = WyrdTestServer::start_bound().await?;
         let fixture = seed_query_fixture(&server, "mcp-delegation").await?;
         let sql = format!("SELECT id, value FROM {} ORDER BY id", fixture.table);
 
-        // A acts through B, which acts as C. Each hop narrows authority to
-        // what both sides hold, so A and B carry the admin authority C reads
-        // with; C's own roles still bound the read.
-        let initiator = server
-            .bootstrap_service("mcp-delegation-initiator", &["runtime_admin", "admin"])
-            .await?;
-        let middle = server
-            .bootstrap_service("mcp-delegation-middle", &["runtime_admin", "admin"])
-            .await?;
+        // C acts for A through B: B exchanges A's token, then C exchanges the
+        // result. Each hop narrows authority to what both sides hold, so every
+        // party carries the admin authority the read needs.
         let subject = server
             .bootstrap_service("mcp-delegation-subject", &["admin"])
             .await?;
-        let initiator_jwt = server
-            .exchange_api_key(initiator.api_key().ok_or("a service carries a key")?)
+        let middle = server
+            .bootstrap_service("mcp-delegation-middle", &["admin"])
             .await?;
-        let one_hop = server.delegate(
-            &initiator_jwt,
-            middle.card_ref().ok_or("a service carries a card ref")?,
-        );
-        let one_hop = one_hop.await?;
+        let actor = server
+            .bootstrap_service("mcp-delegation-actor", &["admin"])
+            .await?;
+        let subject_jwt = server
+            .exchange_api_key(subject.api_key().ok_or("a service carries a key")?)
+            .await?;
+        let middle_jwt = server
+            .exchange_api_key(middle.api_key().ok_or("a service carries a key")?)
+            .await?;
+        let actor_jwt = server
+            .exchange_api_key(actor.api_key().ok_or("a service carries a key")?)
+            .await?;
+        let one_hop = server
+            .delegate(&subject_jwt, &middle_jwt, TokenAudience::Wyrd)
+            .await?;
         let two_hop = server
-            .delegate(
-                &one_hop,
-                subject.card_ref().ok_or("a service carries a card ref")?,
-            )
+            .delegate(&one_hop, &actor_jwt, TokenAudience::Wyrd)
             .await?;
 
         let request_id = RequestId::now_v7();
@@ -129,13 +130,11 @@ mod pg_tests {
         let underprivileged = server
             .bootstrap_service("mcp-delegation-reader", &["reader"])
             .await?;
+        let reader_jwt = server
+            .exchange_api_key(underprivileged.api_key().ok_or("a service carries a key")?)
+            .await?;
         let denied_token = server
-            .delegate(
-                &initiator_jwt,
-                underprivileged
-                    .card_ref()
-                    .ok_or("a service carries a card ref")?,
-            )
+            .delegate(&subject_jwt, &reader_jwt, TokenAudience::Wyrd)
             .await?;
         let denied_request_id = RequestId::now_v7();
         let denied_client = ()

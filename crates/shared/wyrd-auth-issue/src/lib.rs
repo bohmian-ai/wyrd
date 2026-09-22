@@ -463,8 +463,8 @@ mod tests {
     use wyrd_spec::reference::{CardRef, CardRefScope};
 
     use super::{
-        ARGON2_M_COST_KIB, AccessGrant, IssueError, IssuingKey, Kid,
-        MAX_BEARER_TOKEN_BYTES, MAX_DELEGATION_DEPTH, hash_api_key, verify_api_key,
+        ARGON2_M_COST_KIB, AccessGrant, IssueError, IssuingKey, Kid, MAX_BEARER_TOKEN_BYTES,
+        MAX_DELEGATION_DEPTH, hash_api_key, verify_api_key,
     };
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";

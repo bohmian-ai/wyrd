@@ -556,8 +556,9 @@ pub fn api_key_invalid() -> WyrdError {
 impl From<DelegateError> for WyrdError {
     fn from(error: DelegateError) -> Self {
         match error {
-            DelegateError::InvalidSubjectToken(error)
-            | DelegateError::InvalidActorToken(error) => auth_error_to_wyrd(error),
+            DelegateError::InvalidSubjectToken(error) | DelegateError::InvalidActorToken(error) => {
+                auth_error_to_wyrd(error)
+            }
             DelegateError::MalformedIdentity(reason) => WyrdError::Validation {
                 message: "token exchange identity input is malformed".to_owned(),
                 details: json!({ "reason": reason }),
@@ -1618,7 +1619,10 @@ mod pg_tests {
         )
         .await;
 
-        assert!(matches!(result, Err(DelegateError::ActorNotFound)), "{result:?}");
+        assert!(
+            matches!(result, Err(DelegateError::ActorNotFound)),
+            "{result:?}"
+        );
         assert_eq!(exchange_outcomes(&fixture).await, ["allowed"]);
     }
 
@@ -1654,7 +1658,11 @@ mod pg_tests {
         let policy = Arc::new(RecordingPolicyHook::default());
 
         let cases: [(&str, String, String); 6] = [
-            ("invalid subject", "not-a-token".to_owned(), actor_token(actor, tenant)),
+            (
+                "invalid subject",
+                "not-a-token".to_owned(),
+                actor_token(actor, tenant),
+            ),
             ("invalid actor", subject.clone(), "not-a-token".to_owned()),
             ("cross-tenant actor", subject.clone(), foreign_actor),
             ("delegated actor", subject.clone(), delegated_actor),
@@ -1672,7 +1680,10 @@ mod pg_tests {
                 ),
                 _ => matches!(result, Err(DelegateError::MalformedIdentity(_))),
             };
-            assert!(refused_early, "{label} must be refused early, got {result:?}");
+            assert!(
+                refused_early,
+                "{label} must be refused early, got {result:?}"
+            );
         }
         assert!(policy.calls().is_empty(), "no refusal reaches the policy");
         assert!(exchange_outcomes(&fixture).await.is_empty());
@@ -1728,9 +1739,14 @@ mod pg_tests {
         );
         let policy = Arc::new(RecordingPolicyHook::default());
 
-        let exchanged = exchange(&fixture, policy.clone(), subject, actor_token(actor, tenant))
-            .await
-            .expect("exchange succeeds");
+        let exchanged = exchange(
+            &fixture,
+            policy.clone(),
+            subject,
+            actor_token(actor, tenant),
+        )
+        .await
+        .expect("exchange succeeds");
 
         let verifier = delegate_service(allow()).verifier;
         assert!(

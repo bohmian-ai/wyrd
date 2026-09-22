@@ -179,7 +179,8 @@ mod pg_tests {
                     roles: vec![],
                     permissions: wyrd_runtime::PermissionSet::new(),
                     credential_id: None,
-                    delegated_by: None,
+                    act: None,
+                    audience: wyrd_spec::auth::TokenAudience::Wyrd,
                 },
                 chrono::Duration::minutes(5),
             )

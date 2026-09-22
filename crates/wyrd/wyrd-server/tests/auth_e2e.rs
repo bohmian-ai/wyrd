@@ -4,15 +4,16 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, Response, StatusCode, header};
 use base64::Engine;
 use serde_json::{Value, json};
+use wyrd_spec::auth::TokenAudience;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
 fn e2e_enabled() -> bool {
     env::var("WYRD_AUTH_E2E").is_ok()
 }
 
-fn authz_check_request(callee: &Bootstrap, action: &str) -> Request<Body> {
+fn authz_check_request(target: &Bootstrap, action: &str) -> Request<Body> {
     let body = json!({
-        "target": callee.card_ref().expect("machine target carries a card_ref"),
+        "target": target.card_ref().expect("machine target carries a card_ref"),
         "action": action,
         "context": {},
     });
@@ -33,23 +34,41 @@ async fn body_json(resp: Response<Body>) -> Value {
     serde_json::from_slice(&bytes).expect("decode body")
 }
 
+/// Exchange a service's API key for its direct Wyrd access token.
+///
+/// # Panics
+/// Panics when the bootstrap carries no key or the exchange fails.
+async fn machine_jwt(srv: &WyrdTestServer, machine: &Bootstrap) -> String {
+    srv.exchange_api_key(machine.api_key().expect("machine"))
+        .await
+        .expect("machine key exchanges")
+}
+
+/// Have `actor` act for the holder of `subject_jwt`, then check `action` on
+/// the actor's own Card with the delegated token.
+///
+/// The verdict reflects the intersection of the subject's token permissions
+/// and the actor's current grants, which is read at exchange time.
+///
+/// # Panics
+/// Panics when the exchange fails or the check does not return an RBAC
+/// decision body.
 async fn permission_check_via_delegation(
     srv: &WyrdTestServer,
-    initiator_jwt: &str,
-    callee: &Bootstrap,
+    subject_jwt: &str,
+    actor: &Bootstrap,
     action: &str,
 ) -> Value {
     let delegated = srv
         .delegate(
-            initiator_jwt,
-            callee
-                .card_ref()
-                .expect("machine target carries a card_ref"),
+            subject_jwt,
+            &machine_jwt(srv, actor).await,
+            TokenAudience::Wyrd,
         )
         .await
         .expect("delegate");
     let resp = srv
-        .oneshot_authenticated(&delegated, authz_check_request(callee, action))
+        .oneshot_authenticated(&delegated, authz_check_request(actor, action))
         .await
         .expect("authz_check call");
     if resp.status() != StatusCode::OK {
@@ -80,10 +99,10 @@ fn assert_deny(decision: &Value) {
     );
 }
 
-/// Bootstrap a delegating caller that holds the `writer` authority it hands
-/// on, so the target's own grants decide each delegated verdict.
+/// Bootstrap a subject that holds the `writer` authority an actor may use on
+/// its behalf, so the actor's own grants decide each delegated verdict.
 async fn neutral_initiator(srv: &WyrdTestServer, label: &str) -> Bootstrap {
-    srv.bootstrap_service(label, &["runtime_admin", "writer"])
+    srv.bootstrap_service(label, &["writer"])
         .await
         .expect("bootstrap neutral initiator")
 }
@@ -180,7 +199,7 @@ async fn journey_delegated_call_via_token_exchange() {
     }
     let srv = WyrdTestServer::start_in_process().await.expect("start");
     let a = srv
-        .bootstrap_service("svc-a", &["runtime_admin", "writer"])
+        .bootstrap_service("svc-a", &["writer"])
         .await
         .expect("bootstrap a");
     let b = srv
@@ -188,14 +207,14 @@ async fn journey_delegated_call_via_token_exchange() {
         .await
         .expect("bootstrap b");
 
-    let a_jwt = srv
-        .exchange_api_key(a.api_key().expect("machine"))
-        .await
-        .expect("exchange a");
     let delegated = srv
-        .delegate(&a_jwt, b.card_ref().expect("machine"))
+        .delegate(
+            &machine_jwt(&srv, &a).await,
+            &machine_jwt(&srv, &b).await,
+            TokenAudience::Wyrd,
+        )
         .await
-        .expect("delegate a to b");
+        .expect("b acts for a");
 
     let resp = srv
         .oneshot_authenticated(&delegated, authz_check_request(&b, "card_write"))
@@ -206,8 +225,9 @@ async fn journey_delegated_call_via_token_exchange() {
     assert_allow(&body);
 
     let decoded = decode_jwt_claims_for_test(&delegated);
+    assert_eq!(decoded["sub"], a.id().to_string(), "subject is A");
     let act = decoded["act"].as_object().expect("act chain");
-    assert_eq!(act["sub"], a.id().to_string());
+    assert_eq!(act["sub"], b.id().to_string(), "current actor is B");
     assert!(
         act.get("act").is_none(),
         "single-hop chain has no parent act"
@@ -222,7 +242,7 @@ async fn journey_delegation_then_revoke_underlying_role() {
     }
     let srv = WyrdTestServer::start_in_process().await.expect("start");
     let a = srv
-        .bootstrap_service("svc-a-revoke", &["runtime_admin", "writer"])
+        .bootstrap_service("svc-a-revoke", &["writer"])
         .await
         .expect("bootstrap a");
     let b = srv
@@ -230,12 +250,10 @@ async fn journey_delegation_then_revoke_underlying_role() {
         .await
         .expect("bootstrap b");
 
-    let a_jwt = srv
-        .exchange_api_key(a.api_key().expect("machine"))
-        .await
-        .expect("exchange a");
+    let a_jwt = machine_jwt(&srv, &a).await;
+    let b_jwt = machine_jwt(&srv, &b).await;
     let delegated = srv
-        .delegate(&a_jwt, b.card_ref().expect("machine"))
+        .delegate(&a_jwt, &b_jwt, TokenAudience::Wyrd)
         .await
         .expect("delegate");
 
@@ -249,7 +267,7 @@ async fn journey_delegation_then_revoke_underlying_role() {
     srv.revoke_role(&b, "writer").await.expect("revoke b");
 
     let delegated2 = srv
-        .delegate(&a_jwt, b.card_ref().expect("machine"))
+        .delegate(&a_jwt, &b_jwt, TokenAudience::Wyrd)
         .await
         .expect("re-delegate");
     let second = srv
@@ -319,28 +337,25 @@ async fn journey_cross_principal_kind_isolation_via_independent_bootstrap() {
     srv.shutdown().await.expect("shutdown");
 }
 
-/// Delegation never amplifies: a caller holding only `delegation:issue` gets a
-/// delegated token for a `writer` target, but that token cannot write cards.
+/// Delegation never amplifies: an actor holding `writer` that acts for a
+/// subject holding nothing receives a delegated token that cannot write cards.
 #[tokio::test(flavor = "current_thread")]
-async fn journey_delegation_cannot_amplify_the_caller() {
+async fn journey_delegation_cannot_amplify_the_subject() {
     if !e2e_enabled() {
         return;
     }
     let srv = WyrdTestServer::start_in_process().await.expect("start");
-    let target = srv
-        .bootstrap_service("svc-amplify-target", &["writer"])
+    let actor = srv
+        .bootstrap_service("svc-amplify-actor", &["writer"])
         .await
-        .expect("bootstrap target");
-    let caller = srv
-        .bootstrap_service("svc-amplify-caller", &["runtime_admin"])
+        .expect("bootstrap actor");
+    let subject = srv
+        .bootstrap_service("svc-amplify-subject", &[])
         .await
-        .expect("bootstrap caller");
-    let caller_jwt = srv
-        .exchange_api_key(caller.api_key().expect("machine"))
-        .await
-        .expect("caller jwt");
+        .expect("bootstrap subject");
+    let subject_jwt = machine_jwt(&srv, &subject).await;
 
-    let decision = permission_check_via_delegation(&srv, &caller_jwt, &target, "card_write").await;
+    let decision = permission_check_via_delegation(&srv, &subject_jwt, &actor, "card_write").await;
     assert_deny(&decision);
     srv.shutdown().await.expect("shutdown");
 }

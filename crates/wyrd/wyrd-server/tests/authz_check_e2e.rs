@@ -6,7 +6,8 @@ use axum::http::{Method, Request, Response, StatusCode, header};
 use insta::assert_json_snapshot;
 use serde_json::{Value, json};
 use wyrd_auth_check::{DenyAllPolicyHook, RecordingPolicyHook};
-use wyrd_testing::{Bootstrap, WyrdTestServer};
+use wyrd_spec::auth::TokenAudience;
+use wyrd_testing::{Bootstrap, WyrdTestServer, WyrdTestServerError};
 
 fn e2e_enabled() -> bool {
     env::var("WYRD_AUTHZ_CHECK_E2E").is_ok()
@@ -55,28 +56,31 @@ async fn body_json(resp: Response<Body>) -> Value {
     serde_json::from_slice(&bytes).expect("decode body")
 }
 
-fn redact_volatile(body: &Value) -> Value {
-    let mut redacted = body.clone();
-    if let Some(obj) = redacted.as_object_mut()
-        && obj.contains_key("wyrd_request_id")
-    {
-        obj["wyrd_request_id"] = json!("[redacted]");
-    }
-    redacted
+/// Exchange one service's API key for its Wyrd access token.
+///
+/// # Panics
+/// Panics when the bootstrap carries no API key or the exchange fails.
+async fn service_jwt(srv: &WyrdTestServer, service: &Bootstrap) -> String {
+    srv.exchange_api_key(service.api_key().expect("machine has key"))
+        .await
+        .expect("service key exchanges")
 }
 
+/// C acting for A through B re-exchanges the delegated subject token, so the
+/// verified chain names B then C (earliest first), C is the current actor, and
+/// A stays the subject the check authorizes.
 #[tokio::test(flavor = "current_thread")]
-async fn service_b_calls_c_on_behalf_of_a_extends_chain_correctly() {
+async fn service_c_acts_for_a_through_b_extends_chain_correctly() {
     if !e2e_enabled() {
         return;
     }
     let (srv, recorder) = srv_with_recorder().await;
     let a = srv
-        .bootstrap_service("svc-a", &["runtime_admin"])
+        .bootstrap_service("svc-a", &["writer"])
         .await
         .expect("a");
     let b = srv
-        .bootstrap_service("svc-b", &["runtime_admin"])
+        .bootstrap_service("svc-b", &["writer"])
         .await
         .expect("b");
     let c = srv
@@ -84,53 +88,51 @@ async fn service_b_calls_c_on_behalf_of_a_extends_chain_correctly() {
         .await
         .expect("c");
 
-    let a_jwt = srv
-        .exchange_api_key(a.api_key().expect("machine has key"))
+    let b_for_a = srv
+        .delegate(
+            &service_jwt(&srv, &a).await,
+            &service_jwt(&srv, &b).await,
+            TokenAudience::Wyrd,
+        )
         .await
-        .expect("a jwt");
-    let a_to_b = srv
-        .delegate(&a_jwt, b.card_ref().expect("machine has card ref"))
+        .expect("b acts for a");
+    let c_for_a = srv
+        .delegate(&b_for_a, &service_jwt(&srv, &c).await, TokenAudience::Wyrd)
         .await
-        .expect("a to b");
-    let b_to_c = srv
-        .delegate(&a_to_b, c.card_ref().expect("machine has card ref"))
-        .await
-        .expect("b to c");
+        .expect("c acts for a through b");
 
     let resp = srv
-        .oneshot_authenticated(&b_to_c, authz_check_request(&c, "card_write"))
+        .oneshot_authenticated(&c_for_a, authz_check_request(&a, "card_write"))
         .await
         .expect("call");
     assert_eq!(resp.status(), StatusCode::OK);
 
     let last = recorder.last().expect("hook called");
-    assert_eq!(last.chain.len(), 2, "two-hop chain");
+    let chain: Vec<String> = last.chain.iter().map(|step| step.id.to_string()).collect();
     assert_eq!(
-        last.chain[0].id.to_string(),
-        a.id().to_string(),
-        "initiator-first chain"
+        chain,
+        [b.id().to_string(), c.id().to_string()],
+        "earliest actor first"
     );
     assert_eq!(
-        last.chain[1].id.to_string(),
-        b.id().to_string(),
-        "intermediate caller"
-    );
-    assert_eq!(
-        last.callee.id.to_string(),
+        last.actor.id.to_string(),
         c.id().to_string(),
-        "callee identity"
+        "current actor"
     );
+    assert_eq!(last.subject.id.to_string(), a.id().to_string(), "subject");
     srv.shutdown().await.expect("shutdown");
 }
 
+/// One exchange yields subject A and actor B; the check hook sees exactly
+/// that pair.
 #[tokio::test(flavor = "current_thread")]
-async fn single_hop_allow_records_caller_and_callee() {
+async fn single_hop_allow_records_subject_and_actor() {
     if !e2e_enabled() {
         return;
     }
     let (srv, recorder) = srv_with_recorder().await;
     let a = srv
-        .bootstrap_service("svc-a-allow", &["runtime_admin"])
+        .bootstrap_service("svc-a-allow", &["writer"])
         .await
         .expect("a");
     let b = srv
@@ -138,17 +140,17 @@ async fn single_hop_allow_records_caller_and_callee() {
         .await
         .expect("b");
 
-    let a_jwt = srv
-        .exchange_api_key(a.api_key().expect("machine has key"))
-        .await
-        .expect("a jwt");
     let delegated = srv
-        .delegate(&a_jwt, b.card_ref().expect("machine has card ref"))
+        .delegate(
+            &service_jwt(&srv, &a).await,
+            &service_jwt(&srv, &b).await,
+            TokenAudience::Wyrd,
+        )
         .await
         .expect("delegate");
 
     let resp = srv
-        .oneshot_authenticated(&delegated, authz_check_request(&b, "card_write"))
+        .oneshot_authenticated(&delegated, authz_check_request(&a, "card_write"))
         .await
         .expect("call");
     assert_eq!(resp.status(), StatusCode::OK);
@@ -156,8 +158,8 @@ async fn single_hop_allow_records_caller_and_callee() {
 
     let last = recorder.last().expect("hook called");
     assert_eq!(last.chain.len(), 1);
-    assert_eq!(last.chain[0].id.to_string(), a.id().to_string());
-    assert_eq!(last.callee.id.to_string(), b.id().to_string());
+    assert_eq!(last.actor.id.to_string(), b.id().to_string());
+    assert_eq!(last.subject.id.to_string(), a.id().to_string());
     srv.shutdown().await.expect("shutdown");
 }
 
@@ -193,14 +195,16 @@ async fn non_delegated_token_rejected_before_hook() {
     srv.shutdown().await.expect("shutdown");
 }
 
+/// A denying invoke policy refuses the exchange itself, with the policy's
+/// reason, so no delegated token ever exists to present to the check.
 #[tokio::test(flavor = "current_thread")]
-async fn deny_decision_returns_403_with_reason() {
+async fn deny_decision_refuses_the_exchange_with_reason() {
     if !e2e_enabled() {
         return;
     }
     let srv = srv_with_deny("policy_x").await;
     let a = srv
-        .bootstrap_service("svc-a-deny", &["runtime_admin"])
+        .bootstrap_service("svc-a-deny", &["writer"])
         .await
         .expect("a");
     let b = srv
@@ -208,23 +212,20 @@ async fn deny_decision_returns_403_with_reason() {
         .await
         .expect("b");
 
-    let a_jwt = srv
-        .exchange_api_key(a.api_key().expect("machine has key"))
+    let refusal = srv
+        .delegate(
+            &service_jwt(&srv, &a).await,
+            &service_jwt(&srv, &b).await,
+            TokenAudience::Wyrd,
+        )
         .await
-        .expect("a jwt");
-    let delegated = srv
-        .delegate(&a_jwt, b.card_ref().expect("machine has card ref"))
-        .await
-        .expect("delegate");
-
-    let resp = srv
-        .oneshot_authenticated(&delegated, authz_check_request(&b, "card_write"))
-        .await
-        .expect("call");
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    assert_json_snapshot!(
-        "deny_decision_response",
-        redact_volatile(&body_json(resp).await)
-    );
+        .expect_err("policy denies the exchange");
+    let WyrdTestServerError::Http { status, code, body } = refusal else {
+        panic!("expected an HTTP refusal, got {refusal:?}");
+    };
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(code, "WYRD_AUTHZ_403_POLICY_DENIED");
+    let body: Value = serde_json::from_str(&body).expect("problem json");
+    assert_eq!(body["details"]["reason"], "policy_x");
     srv.shutdown().await.expect("shutdown");
 }

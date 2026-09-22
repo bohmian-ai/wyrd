@@ -231,8 +231,6 @@ mod tests {
             vec![principal(agent_kind("agent"))],
         );
 
-        assert!(
-            AuthzCheckContext::from_verified(&verified, request(), None, request_id()).is_ok()
-        );
+        assert!(AuthzCheckContext::from_verified(&verified, request(), None, request_id()).is_ok());
     }
 }

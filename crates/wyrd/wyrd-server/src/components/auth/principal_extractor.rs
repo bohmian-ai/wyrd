@@ -68,7 +68,11 @@ impl FromRequestParts<AppState> for AuthenticatedPrincipal {
         if let Some(principal) = parts.extensions.get::<AuthenticatedPrincipal>() {
             return Ok(principal.clone());
         }
-        verify_authenticated_principal(state.auth.token_verifier.as_deref(), &parts.headers)
+        verify_authenticated_principal(
+            state.auth.token_verifier.as_deref(),
+            &parts.headers,
+            wyrd_auth_verify::TokenAudience::Wyrd,
+        )
     }
 }
 
@@ -257,22 +261,23 @@ mod pg_tests {
                     roles: vec![],
                     permissions: wyrd_runtime::PermissionSet::new(),
                     credential_id: None,
-                    delegated_by: None,
+                    act: None,
+                    audience: wyrd_spec::auth::TokenAudience::Wyrd,
                 },
                 ttl,
             )
             .expect("test jwt mints")
     }
 
-    /// Mint an access token whose `act` chain names `initiator` as the sole
-    /// delegating actor and `subject` as the effective principal.
+    /// Mint an access token whose outer `act` names `initiator` as the sole
+    /// actor working for `subject`, the token's principal.
     fn mint_delegated_user_jwt(
         state: &crate::state::AppState,
         tenant: DataTenantId,
         initiator: PrincipalId,
         subject: PrincipalId,
     ) -> String {
-        let caller = wyrd_auth_issue::DelegationCaller {
+        let actor = wyrd_auth_verify::ActClaim {
             sub: initiator.to_string(),
             principal: TokenPrincipalRef {
                 id: initiator,
@@ -300,7 +305,8 @@ mod pg_tests {
                     roles: vec![],
                     permissions: wyrd_runtime::PermissionSet::new(),
                     credential_id: None,
-                    delegated_by: Some(caller),
+                    act: Some(Box::new(actor)),
+                    audience: wyrd_spec::auth::TokenAudience::Wyrd,
                 },
                 chrono::Duration::minutes(5),
             )

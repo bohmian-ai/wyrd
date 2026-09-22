@@ -17,8 +17,7 @@ use wyrd_spec::request_id::RequestId;
 
 use crate::auth::callback::exchange_authorization_code;
 use crate::auth::card_scope::{
-    MINT_KIND_API_KEY_EXCHANGE, MINT_KIND_DELEGATION, MINT_KIND_REFRESH,
-    audit_scope_mint_failure_best_effort,
+    MINT_KIND_API_KEY_EXCHANGE, MINT_KIND_REFRESH, audit_scope_mint_failure_best_effort,
 };
 use crate::auth::credential_verify::verify_presented;
 use crate::auth::exchange_api_key::{
@@ -63,21 +62,24 @@ pub fn auth_router() -> OpenApiRouter<AppState> {
 /// the response cannot be used to probe which part was wrong.
 ///
 /// # Errors
-/// Returns a `400` when a delegation would exceed the configured chain depth, a
-/// `401` for every unusable credential — including a reused, revoked, or
-/// expired refresh token — a `403` when a valid credential's principal may not
-/// obtain this token, a `404` when no principal matches the delegation subject
-/// or the presented workload assertion, and a `503` when the auth backend or
-/// the audit path is unavailable. The grant and its
-/// exchange audit commit together, so a refusal serves no token.
+/// Returns a `400` when a token exchange's identity input is malformed or its
+/// delegation would exceed the configured chain depth, a `401` for every
+/// unusable credential — including a reused, revoked, or expired refresh token
+/// and an invalid subject or actor token — a `403` when the invoke policy does
+/// not let the actor act for the subject, a `404` when the actor's principal or
+/// the presented workload assertion matches no principal, and a `503` when the
+/// auth backend or the audit path is unavailable. The grant and its exchange
+/// audit commit together, so a refusal serves no token.
 #[utoipa::path(
     post,
     path = "/auth/token",
     request_body = TokenRequest,
     responses(
         (status = 200, description = "Access token issued", body = TokenResponse),
-        (status = 400, description = "The delegation would exceed the configured chain depth \
-          (WYRD_AUTH_400_DELEGATION_DEPTH_EXCEEDED)", body = WyrdProblem),
+        (status = 400, description = "The token exchange's identity input is malformed — a \
+          delegated or Card-free actor token, or a party exchanging with itself \
+          (WYRD_SPEC_400_VALIDATION) — or the delegation would exceed the configured chain \
+          depth (WYRD_AUTH_400_DELEGATION_DEPTH_EXCEEDED)", body = WyrdProblem),
         (status = 401, description = "The presented credential is not usable. Every \
           invalid-credential condition renders one indistinguishable refusal \
           (WYRD_AUTH_401_API_KEY_INVALID); a refresh token that was already consumed reports \
@@ -85,10 +87,11 @@ pub fn auth_router() -> OpenApiRouter<AppState> {
           or malformed reports that (WYRD_AUTH_401_REFRESH_REVOKED), and a subject token whose \
           delegation chain is already at the limit reports that \
           (WYRD_AUTH_401_DELEGATION_DEPTH_EXCEEDED)", body = WyrdProblem),
-        (status = 403, description = "The credential is valid but its principal may not obtain \
-          this token (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
-        (status = 404, description = "No principal in this tenant matches the requested \
-          delegation subject or the presented workload assertion \
+        (status = 403, description = "Both exchange tokens are valid but the invoke policy \
+          does not let the actor act for the subject (WYRD_AUTHZ_403_POLICY_DENIED)",
+          body = WyrdProblem),
+        (status = 404, description = "No principal in this tenant matches the token \
+          exchange's actor or the presented workload assertion \
           (WYRD_AUTH_404_PRINCIPAL_NOT_FOUND)", body = WyrdProblem),
         (status = 500, description = "Token issuance or the server's own auth configuration \
           failed, so no token was served (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
@@ -173,7 +176,9 @@ async fn token(
         TokenRequest::TokenExchange {
             subject_token,
             subject_token_type: _,
-            requested_subject,
+            actor_token,
+            actor_token_type: _,
+            audience,
         } => {
             if !state.auth.allow_preview {
                 return Err(WyrdErrorResponse::from(preview_disabled()));
@@ -184,6 +189,8 @@ async fn token(
                 .token_verifier
                 .clone()
                 .ok_or_else(auth_not_configured)?;
+            // Both tokens are verified against this tenant, so an actor token
+            // from any other tenant is refused.
             let tenant_id = tenant_from_unverified_access_token(subject_token.expose())?;
             let conn = state
                 .postgres
@@ -191,34 +198,21 @@ async fn token(
                 .await
                 .map_err(sql_error)?;
             // The exchange commits its own authorization decision, so a
-            // refusal after the permission check is still durably audited.
+            // refusal after the policy decision is still durably audited.
             let exchanged = DelegateToken {
                 issuer,
                 verifier,
-                permission_check: state.authz.permission_check.clone(),
+                policy: state.authz.policy_hook.clone(),
             }
             .execute(
                 conn,
                 SecretString::from(subject_token.expose().to_owned()),
-                requested_subject,
+                SecretString::from(actor_token.expose().to_owned()),
+                audience,
                 req_id,
             )
-            .await;
-            let exchanged = match exchanged {
-                Ok(exchanged) => exchanged,
-                Err(error) => {
-                    let wyrd = WyrdError::from(error);
-                    audit_scope_mint_failure_best_effort(
-                        state.postgres.app_pool(),
-                        tenant_id,
-                        req_id,
-                        MINT_KIND_DELEGATION,
-                        &wyrd,
-                    )
-                    .await;
-                    return Err(WyrdErrorResponse::from(wyrd));
-                }
-            };
+            .await
+            .map_err(|error| WyrdErrorResponse::from(WyrdError::from(error)))?;
             Ok(Json(exchanged.into_response()))
         }
         TokenRequest::RefreshToken { refresh_token } => {

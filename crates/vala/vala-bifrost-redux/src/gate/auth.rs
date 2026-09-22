@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use base64::Engine;
 use secrecy::{ExposeSecret, SecretString};
-use wyrd_auth_verify::TokenVerifier;
+use wyrd_auth_verify::{TokenAudience, TokenVerifier};
 use wyrd_runtime::{DelegationStep, Principal};
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::request_id::RequestId;
@@ -116,7 +116,7 @@ pub fn authenticate(
     let token = extract_bearer(metadata)?;
     let expected_tenant = tenant_from_unverified_access_token(token.expose_secret())?;
     let verified_token = verifier
-        .verify(&token, &expected_tenant)
+        .verify_on(&token, &expected_tenant, TokenAudience::Bifrost)
         .map_err(|error| IngestError::Unauthenticated(error.to_string()))?;
     Ok(AuthContext {
         principal: verified_token.principal,

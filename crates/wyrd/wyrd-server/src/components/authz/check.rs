@@ -21,7 +21,11 @@ use crate::components::auth::token_extract::{
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
-/// Check a delegated Service/Agent invoke request.
+/// Check whether a Service/Agent actor's call on a subject's behalf may proceed.
+///
+/// The delegated token's subject carries the attenuated authority the required
+/// permission is checked against; its current actor must be a Card-bound
+/// Service or Agent, and the policy sees the full actor chain.
 #[tracing::instrument(skip(state, headers, body), fields(request_id = %request_id))]
 #[utoipa::path(
     post,
@@ -66,7 +70,8 @@ pub async fn check_authz(
         .verify(&token, &expected_tenant)
         .map_err(WyrdErrorResponse::from)?;
 
-    match guard_reason(&verified.principal, verified.delegation_chain.len()) {
+    let actor = verified.delegation_chain.last().map(|step| &step.principal);
+    match guard_reason(actor) {
         GuardOutcome::Allow => {}
         GuardOutcome::Reject(reason) => {
             return Err(WyrdError::AuthzRequiresDelegatedToken {
@@ -93,14 +98,16 @@ pub async fn check_authz(
         .map_err(WyrdError::from)?;
     let hook_decision = state.authz.policy_hook.evaluate(&ctx).await;
     let decision = match hook_decision {
-        PolicyDecision::Allow => match state.authz.permission_check.check(&ctx.callee, &required) {
-            PermissionVerdict::Allow => PolicyDecision::Allow,
-            PermissionVerdict::Deny {
-                reason: PermissionDenyReason::Rbac { .. },
-            } => PolicyDecision::Deny {
-                reason: "missing_permission".to_owned(),
-            },
-        },
+        PolicyDecision::Allow => {
+            match state.authz.permission_check.check(&ctx.subject, &required) {
+                PermissionVerdict::Allow => PolicyDecision::Allow,
+                PermissionVerdict::Deny {
+                    reason: PermissionDenyReason::Rbac { .. },
+                } => PolicyDecision::Deny {
+                    reason: "missing_permission".to_owned(),
+                },
+            }
+        }
         PolicyDecision::Deny { reason } => PolicyDecision::Deny { reason },
         _ => PolicyDecision::Deny {
             reason: "unsupported_decision".to_owned(),
@@ -112,7 +119,7 @@ pub async fn check_authz(
     if !state.authz.audit_writer.is_stub_default() {
         let mut conn = state
             .postgres
-            .tenant_conn(ctx.callee.tenant_id)
+            .tenant_conn(ctx.subject.tenant_id)
             .await
             .map_err(sql_error)?;
         state

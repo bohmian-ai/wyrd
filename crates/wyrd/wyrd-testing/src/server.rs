@@ -142,7 +142,7 @@ impl OraclePeerCredentials for TestOraclePeerCredentials {
 }
 
 use wyrd_spec::auth::{
-    RequestedSubject, SecretBearer, SubjectTokenType, TokenRequest, TokenResponse,
+    ExchangeTokenType, SecretBearer, TokenAudience, TokenRequest, TokenResponse,
 };
 use wyrd_spec::envelope::{CardKind, Spec};
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
@@ -2590,21 +2590,27 @@ impl WyrdTestServer {
         Ok(token.access_token.expose().to_owned())
     }
 
-    /// Delegate a JWT to a target Service or Agent through `/auth/token`.
+    /// Exchange `subject_jwt` and `actor_jwt` through `/auth/token` for a
+    /// token letting the actor act on the subject's behalf at `audience`.
+    ///
+    /// Server-side tests that need a delegated token without a client use this;
+    /// SDK journeys use the client's `on_behalf_of` instead.
     ///
     /// # Errors
-    /// Returns an error when delegation is unavailable, denied, or response parsing fails.
+    /// Returns an error when the exchange is unavailable, denied, or response
+    /// parsing fails.
     pub async fn delegate(
         &self,
-        from_jwt: &str,
-        target: &CardRef,
+        subject_jwt: &str,
+        actor_jwt: &str,
+        audience: TokenAudience,
     ) -> Result<String, WyrdTestServerError> {
         let body = serde_json::to_vec(&TokenRequest::TokenExchange {
-            subject_token: SecretBearer::new(from_jwt.to_owned()),
-            subject_token_type: SubjectTokenType::AccessToken,
-            requested_subject: RequestedSubject::CardRef {
-                card_ref: target.clone(),
-            },
+            subject_token: SecretBearer::new(subject_jwt.to_owned()),
+            subject_token_type: ExchangeTokenType::AccessToken,
+            actor_token: SecretBearer::new(actor_jwt.to_owned()),
+            actor_token_type: ExchangeTokenType::AccessToken,
+            audience,
         })
         .map_err(|error| WyrdTestServerError::Io(error.to_string()))?;
         let response = self

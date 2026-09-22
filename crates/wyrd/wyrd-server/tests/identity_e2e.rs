@@ -10,6 +10,7 @@ use secrecy::SecretString;
 use serde_json::Value;
 use url::Url;
 use wyrd_auth_check::AuthzCheckRequest;
+use wyrd_auth_check::response::AuthzCheckDecision;
 use wyrd_auth_oidc::IssuerConfigResolver;
 use wyrd_auth_verify::WyrdAuthVerifySettings;
 use wyrd_cli::auth::trusted_issuer::{self, AddArgs as TrustedIssuerAddArgs, TrustedIssuerCommand};
@@ -22,7 +23,9 @@ use wyrd_client::transport::config::HttpConfig;
 use wyrd_client::transport::credential::ResolvedCredential;
 use wyrd_semver::VersionBlock;
 use wyrd_server::config::{ClaimMappingEntry, ClientAuthEntry, IssuerEntry, WorkloadBindingEntry};
-use wyrd_spec::auth::{IssueKeyRequest, IssueKeyResponse, IssuerTokenPolicy, IssuerUrl};
+use wyrd_spec::auth::{
+    IssueKeyRequest, IssueKeyResponse, IssuerTokenPolicy, IssuerUrl, TokenAudience,
+};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::CardRef;
@@ -154,24 +157,28 @@ fn authz_check_request(target: &Bootstrap, action: &str) -> AuthzCheckRequest {
 
 /// Drive a delegated token to a real authenticated `/v1/authz/check` `200`.
 ///
-/// `delegator_jwt` must belong to a Service/Agent (or Human) principal that
-/// holds `delegation_issue` (e.g. `runtime_admin`). It delegates to a freshly
-/// seeded `writer` callee, then runs the check on that callee — the proven
-/// guard-passing terminal (delegated chain, eligible callee, `card_write`).
-async fn assert_v1_authz_check_ok(srv: &WyrdTestServer, delegator_jwt: &str, label: &str) {
-    let callee = srv
-        .bootstrap_service(&format!("{label}-callee"), &["writer"])
+/// `subject_jwt` is the token of a principal holding `writer`. A freshly
+/// seeded `writer` service exchanges it as the RFC 8693 actor, then runs the
+/// check on its own Card — the proven guard-passing terminal (delegated chain,
+/// eligible actor, `card_write` in the subject/actor intersection).
+///
+/// # Panics
+/// Panics when bootstrap, exchange, or the check fails, or the check is not `200`.
+async fn assert_v1_authz_check_ok(srv: &WyrdTestServer, subject_jwt: &str, label: &str) {
+    let actor = srv
+        .bootstrap_service(&format!("{label}-actor"), &["writer"])
         .await
-        .expect("callee bootstraps");
+        .expect("actor bootstraps");
+    let actor_jwt = srv
+        .exchange_api_key(actor.api_key().expect("actor has key"))
+        .await
+        .expect("actor key exchanges");
     let delegated = srv
-        .delegate(
-            delegator_jwt,
-            callee.card_ref().expect("callee carries a card_ref"),
-        )
+        .delegate(subject_jwt, &actor_jwt, TokenAudience::Wyrd)
         .await
         .expect("delegation succeeds");
     let result = srv
-        .authz_check(&delegated, authz_check_request(&callee, "card_write"))
+        .authz_check(&delegated, authz_check_request(&actor, "card_write"))
         .await
         .expect("authz-check completes");
     assert_eq!(
@@ -179,6 +186,11 @@ async fn assert_v1_authz_check_ok(srv: &WyrdTestServer, delegator_jwt: &str, lab
         StatusCode::OK,
         "{label}: /v1/authz/check returns 200, got {}",
         result.status
+    );
+    assert_eq!(
+        result.response.map(|response| response.decision),
+        Some(AuthzCheckDecision::Allow),
+        "{label}: the subject/actor intersection allows card_write"
     );
 }
 
@@ -407,8 +419,8 @@ async fn workload_jwt_bearer_journey_keycloak() {
         .expect("server boots config-driven");
 
     // Seed the bound principal under the exact server-owned card_ref. It holds
-    // runtime_admin so the minted workload token can delegate to the terminal.
-    srv.seed_card_principal(&card_ref, &["runtime_admin"])
+    // writer so the minted workload token can be the terminal's subject.
+    srv.seed_card_principal(&card_ref, &["writer"])
         .await
         .expect("workload principal seeds");
 
@@ -504,7 +516,7 @@ async fn ttl_expiry_journey() {
         .expect("test server starts");
 
     let principal = srv
-        .bootstrap_service("ttl-svc", &["runtime_admin"])
+        .bootstrap_service("ttl-svc", &["writer"])
         .await
         .expect("service bootstraps");
     let api_key = principal
@@ -567,7 +579,7 @@ async fn revocation_journey() {
         .expect("admin api key exchange succeeds");
 
     let target = srv
-        .bootstrap_service("revoke-target", &["runtime_admin"])
+        .bootstrap_service("revoke-target", &["writer"])
         .await
         .expect("target bootstraps");
     let target_key = target.api_key().expect("target has api key").clone();
@@ -704,9 +716,9 @@ async fn service_account_issuer_full_chain() {
         .expect("admin api key exchange succeeds");
 
     // Target service card: the card a key will be issued for.
-    // Holds runtime_admin so the issued token can later delegate to the terminal.
+    // Holds writer so the issued token can later be the terminal's subject.
     let target = srv
-        .bootstrap_service("sa-chain-target", &["runtime_admin"])
+        .bootstrap_service("sa-chain-target", &["writer"])
         .await
         .expect("target service account bootstraps");
     let target_card_ref = target
@@ -923,7 +935,7 @@ fn principal_id_of(access_token: &str) -> String {
 
 /// Drive a complete config-driven human OIDC login:
 ///   1. boot trusts Keycloak via `[[trusted_issuers]]` (config-driven), granting
-///      `runtime_admin` as a default role so the federated human can delegate,
+///      `writer` as a default role so the federated human can be a subject,
 ///   2. `GET /auth/login` → authorization URL + state,
 ///   3. `OidcIssuerFixture::human_login` authenticates alice → code + state,
 ///   4. `GET /auth/callback` → Wyrd access token,
@@ -938,7 +950,7 @@ async fn human_oidc_login_journey() {
 
     let srv = WyrdTestServerBuilder::default()
         .with_trusted_issuer_configs(vec![human_issuer_entry(
-            vec!["runtime_admin".to_owned()],
+            vec!["writer".to_owned()],
             HashMap::new(),
         )])
         .start_in_process()
@@ -1053,7 +1065,7 @@ async fn revoking_a_human_kills_the_session_refresh_authority() {
     let keycloak = OidcIssuerFixture::connect(&keycloak_issuer()).await;
     let srv = WyrdTestServerBuilder::default()
         .with_trusted_issuer_configs(vec![human_issuer_entry(
-            vec!["runtime_admin".to_owned()],
+            vec!["writer".to_owned()],
             HashMap::new(),
         )])
         .start_in_process()
@@ -1134,7 +1146,8 @@ async fn revoking_a_human_kills_the_session_refresh_authority() {
 /// in as a member of `wyrd-admins`, log in again unchanged and show the first
 /// session still works, then remove the group at Keycloak and log in once more.
 /// The changed login persists the reduced role set and issues a successor that
-/// can no longer delegate; the earlier token is not introspected.
+/// yields a delegated token that can no longer write; the earlier token is not
+/// introspected.
 ///
 /// The membership is restored before the journey returns, because the realm is
 /// shared with every other Keycloak journey in this target.
@@ -1154,13 +1167,13 @@ async fn a_withdrawn_oidc_group_invalidates_the_roles_it_granted() {
     let srv = WyrdTestServerBuilder::default()
         .with_trusted_issuer_configs(vec![human_issuer_entry(
             Vec::new(),
-            HashMap::from([("wyrd-admins".to_owned(), vec!["runtime_admin".to_owned()])]),
+            HashMap::from([("wyrd-admins".to_owned(), vec!["writer".to_owned()])]),
         )])
         .start_in_process()
         .await
         .expect("test server starts");
 
-    // The group grants runtime_admin, so the first session can delegate.
+    // The group grants writer, so the first session's delegated checks allow.
     let granted = human_login(&srv, &keycloak, "alice", "alice-password").await;
     let granted_token = granted["access_token"]
         .as_str()
@@ -1183,21 +1196,29 @@ async fn a_withdrawn_oidc_group_invalidates_the_roles_it_granted() {
         .expect("access_token present")
         .to_owned();
 
-    let callee = srv
-        .bootstrap_service("roles-withdrawn-callee", &["writer"])
+    let actor = srv
+        .bootstrap_service("roles-withdrawn-actor", &["writer"])
         .await
-        .expect("callee bootstraps");
+        .expect("actor bootstraps");
+    let actor_jwt = srv
+        .exchange_api_key(actor.api_key().expect("actor has key"))
+        .await
+        .expect("actor key exchanges");
 
     // The successor the same login issued carries the reduced authority: it can
-    // still authenticate, but it can no longer delegate.
-    assert!(
-        srv.delegate(
-            &reduced_token,
-            callee.card_ref().expect("callee carries a card_ref"),
-        )
+    // still be a subject, but the intersection no longer holds card_write.
+    let delegated = srv
+        .delegate(&reduced_token, &actor_jwt, TokenAudience::Wyrd)
         .await
-        .is_err(),
-        "the reduced session cannot delegate"
+        .expect("the reduced session is still a valid subject");
+    let result = srv
+        .authz_check(&delegated, authz_check_request(&actor, "card_write"))
+        .await
+        .expect("authz-check completes");
+    assert_eq!(
+        result.response.map(|response| response.decision),
+        Some(AuthzCheckDecision::Deny),
+        "the reduced session cannot write through its actor"
     );
 
     keycloak
@@ -1264,7 +1285,7 @@ async fn federated_cloud_journey_cli_authored_keycloak() {
 
     // The server-owned card the binding resolves to; seed its principal.
     let card_ref = binding_card_ref(CardKind::Service, "cloud-journey-sa", "prod");
-    srv.seed_card_principal(&card_ref, &["runtime_admin"])
+    srv.seed_card_principal(&card_ref, &["writer"])
         .await
         .expect("workload principal seeds");
 

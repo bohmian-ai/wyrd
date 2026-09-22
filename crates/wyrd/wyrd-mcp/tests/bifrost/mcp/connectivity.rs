@@ -170,6 +170,7 @@ mod pg_tests {
     use wyrd_runtime::Permission;
     use wyrd_server::mcp::probe;
     use wyrd_spec::DataTenantId;
+    use wyrd_spec::auth::TokenAudience;
     use wyrd_testing::WyrdTestServer;
 
     /// A real `rmcp` client reaches the `/mcp` endpoint and sees the exact
@@ -189,24 +190,18 @@ mod pg_tests {
             .with_mcp_context_probe_for_test()
             .start_bound()
             .await?;
-        let initiator = server
-            .bootstrap_service("mcp-initiator", &["runtime_admin", "admin"])
-            .await?;
-        let caller = server
+        let subject = server.bootstrap_service("mcp-subject", &["admin"]).await?;
+        let actor = server
             .bootstrap_service("mcp-connectivity", &["admin"])
             .await?;
-        let initiator_jwt = server
-            .exchange_api_key(
-                initiator
-                    .api_key()
-                    .ok_or("service bootstrap carries a key")?,
-            )
+        let subject_jwt = server
+            .exchange_api_key(subject.api_key().ok_or("service bootstrap carries a key")?)
+            .await?;
+        let actor_jwt = server
+            .exchange_api_key(actor.api_key().ok_or("service bootstrap carries a key")?)
             .await?;
         let delegated_jwt = server
-            .delegate(
-                &initiator_jwt,
-                caller.card_ref().ok_or("a service carries a card ref")?,
-            )
+            .delegate(&subject_jwt, &actor_jwt, TokenAudience::Wyrd)
             .await?;
         let client = ()
             .serve_with_lifecycle(
@@ -248,18 +243,18 @@ mod pg_tests {
         );
         assert_eq!(
             context["principal_id"],
-            serde_json::Value::String(caller.id().to_string()),
-            "the server binds the verified caller"
+            serde_json::Value::String(subject.id().to_string()),
+            "the server binds the verified subject"
         );
         assert_eq!(
             context["roles"],
             serde_json::json!(["admin"]),
-            "the delegated bearer carries exactly the target's own roles"
+            "the delegated bearer carries the subject's roles"
         );
         assert_eq!(
             context["delegation_chain"],
-            serde_json::json!([initiator.id().to_string()]),
-            "the chain is initiator-first and stops at the single hop taken"
+            serde_json::json!([actor.id().to_string()]),
+            "the chain names the one actor that exchanged the subject token"
         );
         assert_eq!(context["cancelled"], serde_json::Value::Bool(false));
         assert!(

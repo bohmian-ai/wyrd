@@ -972,9 +972,8 @@ mod tests {
 
     use super::{
         AccessTokenClaims, ActClaim, AuthError, ExternalVerifier, Kid, MAX_BEARER_TOKEN_BYTES,
-        MAX_DELEGATION_DEPTH, PrincipalKindTag, TokenPrincipalRef, TokenVerifier,
-        TokenAudience, WyrdAuthVerifySettings, decode_kid, public_key_from_pem, verify_eddsa,
-        verify_eddsa_with,
+        MAX_DELEGATION_DEPTH, PrincipalKindTag, TokenAudience, TokenPrincipalRef, TokenVerifier,
+        WyrdAuthVerifySettings, decode_kid, public_key_from_pem, verify_eddsa, verify_eddsa_with,
     };
 
     const PRIVATE_KEY_PEM: &[u8] = b"-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";

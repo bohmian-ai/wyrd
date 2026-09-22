@@ -165,7 +165,8 @@ mod tests {
                     roles: Vec::new(),
                     permissions: std::iter::once(Permission::card_read()).collect(),
                     credential_id: None,
-                    delegated_by: None,
+                    act: None,
+                    audience: wyrd_spec::auth::TokenAudience::Wyrd,
                 },
                 ChronoDuration::minutes(5),
             )

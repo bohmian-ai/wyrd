@@ -17,6 +17,7 @@ use wyrd_spec::error::WyrdError;
 
 use crate::bifrost::routes::router as bifrost_router;
 use crate::components::admin::admin_router;
+use crate::components::auth::AuthenticatedPrincipal;
 use crate::components::auth::auth_router;
 use crate::components::authz::authz_router;
 use crate::components::cards::cards_router;
@@ -29,7 +30,7 @@ use crate::components::platform::{
 use crate::components::principals::principals_router;
 use crate::components::storage::storage_router;
 use crate::http::error::WyrdErrorResponse;
-use crate::http::middleware::authenticate::require_authenticated;
+use crate::http::middleware::authenticate::{require_authenticated, require_bifrost_authenticated};
 use crate::http::openapi::{ProblemMediaAddon, SecurityAddon, WyrdApiDoc};
 use crate::http::otlp::router as otlp_router;
 use crate::query::routes::router as query_router;
@@ -46,11 +47,21 @@ pub fn build_router(state: AppState) -> Router {
     let auth_routes = auth_router();
 
     // Default-deny: authentication is a property of the whole /v1 nest, not any
-    // single handler. Attaching require_authenticated to v1_group *after* its
-    // .fallback means Router::layer wraps the fallback too, so unknown /v1 paths
-    // are rejected with 401 before v1_not_found runs (no route-existence oracle).
-    // attach_request_id remains outermost on `protected`, so the RequestId
-    // extension is already present when this layer runs.
+    // single handler. Each route group carries the verification layer for its
+    // audience: the Bifrost and query routers accept a `bifrost`-audience
+    // delegated token, every other group accepts only `wyrd`, so a token bound
+    // to Bifrost cannot be replayed anywhere else. Unknown /v1 paths reach
+    // v1_not_found, whose `AuthenticatedPrincipal` extractor rejects with 401
+    // before the 404 is built (no route-existence oracle). attach_request_id
+    // remains outermost on `protected`, so the RequestId extension is already
+    // present when these layers run.
+    let bifrost_group = OpenApiRouter::new()
+        .merge(bifrost_router())
+        .merge(query_router())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_bifrost_authenticated,
+        ));
     let v1_group = OpenApiRouter::new()
         .merge(storage_router(&state))
         .merge(eval_router())
@@ -58,14 +69,13 @@ pub fn build_router(state: AppState) -> Router {
         .merge(cards_router())
         .merge(principals_router())
         .merge(admin_router())
-        .merge(bifrost_router())
-        .merge(query_router())
         .merge(otlp_router())
-        .fallback(v1_not_found)
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_authenticated,
-        ));
+        ))
+        .merge(bifrost_group)
+        .fallback(v1_not_found);
 
     // One MCP endpoint on the one public listener. It sits inside the same
     // protected edge as `/v1` — request-id, panic capture, load-shed,
@@ -176,7 +186,18 @@ where
         ))
 }
 
-async fn v1_not_found(request: Request) -> Result<(), WyrdErrorResponse> {
+/// Answer an unmatched `/v1` path with `404` — but only for an authenticated
+/// caller.
+///
+/// The [`AuthenticatedPrincipal`] extractor runs first and rejects with `401`,
+/// so an unauthenticated caller cannot probe which routes exist.
+///
+/// # Errors
+/// Always returns an error: the extractor's `400`/`401`/`503`, or `404`.
+async fn v1_not_found(
+    _principal: AuthenticatedPrincipal,
+    request: Request,
+) -> Result<(), WyrdErrorResponse> {
     Err(WyrdError::NotFound {
         message: "Wyrd route not found".to_owned(),
         details: serde_json::json!({ "path": request.uri().path() }),

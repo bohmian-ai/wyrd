@@ -31,8 +31,8 @@ use wyrd_sql::queries::platform::tenant_resolver::tenant_admits_credentials;
 
 use crate::audit::{TOKEN_EXCHANGE_OPERATION, append_auth_audit, auth_event};
 use crate::card_scope::{
-    IssueErrorOrWyrd, MINT_KIND_API_KEY_EXCHANGE, MINT_KIND_JWT_BEARER,
-    issue_scope_error, resolve_card_ref_scope, write_scope_mint_success_audit,
+    IssueErrorOrWyrd, MINT_KIND_API_KEY_EXCHANGE, MINT_KIND_JWT_BEARER, issue_scope_error,
+    resolve_card_ref_scope, write_scope_mint_success_audit,
 };
 use crate::exchange_api_key::{principal_kind_wire, role_refs, token_hash};
 

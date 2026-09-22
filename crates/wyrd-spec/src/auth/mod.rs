@@ -45,6 +45,4 @@ pub use tenant_principals::{
     CredentialMetadata, CredentialRevoked, IssuedCredential, ListCredentialsArgs,
     RevokeCredentialArgs,
 };
-pub use token::{
-    ExchangeTokenType, TokenAudience, TokenRequest, TokenResponse, TokenType,
-};
+pub use token::{ExchangeTokenType, TokenAudience, TokenRequest, TokenResponse, TokenType};

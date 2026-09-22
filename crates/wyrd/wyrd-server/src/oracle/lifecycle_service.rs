@@ -280,7 +280,8 @@ pub(crate) mod pg_tests {
                     roles: Vec::<RoleRef>::new(),
                     permissions: wyrd_runtime::PermissionSet::new(),
                     credential_id: None,
-                    delegated_by: None,
+                    act: None,
+                    audience: wyrd_spec::auth::TokenAudience::Wyrd,
                 },
                 chrono::Duration::minutes(5),
             )
@@ -319,7 +320,8 @@ pub(crate) mod pg_tests {
                     roles: Vec::<RoleRef>::new(),
                     permissions: wyrd_runtime::PermissionSet::new(),
                     credential_id: None,
-                    delegated_by: None,
+                    act: None,
+                    audience: wyrd_spec::auth::TokenAudience::Wyrd,
                 },
                 chrono::Duration::minutes(5),
             )

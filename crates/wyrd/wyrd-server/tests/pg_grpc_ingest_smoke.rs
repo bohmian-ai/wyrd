@@ -102,7 +102,8 @@ fn mint_user_jwt(state: &AppState, tenant: DataTenantId, roles: &[&str]) -> Stri
                     .flat_map(|builtin| builtin.permissions.iter().cloned())
                     .collect(),
                 credential_id: None,
-                delegated_by: None,
+                act: None,
+                audience: wyrd_spec::auth::TokenAudience::Wyrd,
             },
             ChronoDuration::minutes(5),
         )

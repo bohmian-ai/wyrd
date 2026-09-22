@@ -32,8 +32,6 @@ const SCOPE_AUDIT_MEMBER_SUMMARY_LIMIT: usize = 16;
 pub const MINT_KIND_API_KEY_EXCHANGE: CardScopeMintKind = CardScopeMintKind::ApiKeyExchange;
 /// Audit mint kind for refresh-token scope minting.
 pub const MINT_KIND_REFRESH: CardScopeMintKind = CardScopeMintKind::Refresh;
-/// Audit mint kind for delegated-token scope minting.
-pub const MINT_KIND_DELEGATION: CardScopeMintKind = CardScopeMintKind::Delegation;
 /// Audit mint kind for JWT bearer workload scope minting.
 pub const MINT_KIND_JWT_BEARER: CardScopeMintKind = CardScopeMintKind::JwtBearer;
 

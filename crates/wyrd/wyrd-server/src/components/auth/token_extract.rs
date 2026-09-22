@@ -103,19 +103,29 @@ pub(crate) fn auth_not_configured() -> WyrdErrorResponse {
 /// if none is set, (4) cryptographically verify the token against the tenant, and (5) build
 /// the [`AuthenticatedPrincipal`](super::AuthenticatedPrincipal) from the verified claims.
 ///
-/// This is the single verify pipeline shared by `require_authenticated` (the `/v1` default-deny
-/// middleware) and `AuthenticatedPrincipal::from_request_parts` (the extractor fallback for
-/// off-nest routes such as `/auth/issue-key`). Both call sites produce identical
+/// `surface` is the audience of the route being served: every surface accepts
+/// `wyrd`, and a Bifrost route additionally accepts a `bifrost`-audience
+/// delegated token, so a token minted for Bifrost cannot be replayed against
+/// any other Wyrd surface.
+///
+/// This is the single verify pipeline shared by the `/v1` default-deny
+/// middlewares and `AuthenticatedPrincipal::from_request_parts` (the extractor fallback for
+/// off-nest routes such as `/auth/issue-key`). Every call site produces identical
 /// `400`/`401`/`503` error responses because they share this function.
+///
+/// # Errors
+/// Returns `401` when the header is missing or verification fails, `400` when
+/// the token is malformed, and `503` when no verifier is configured.
 pub(crate) fn verify_authenticated_principal(
     verifier: Option<&wyrd_auth_verify::TokenVerifier>,
     headers: &HeaderMap,
+    surface: wyrd_auth_verify::TokenAudience,
 ) -> Result<super::AuthenticatedPrincipal, WyrdErrorResponse> {
     let token = extract_wyrd_access_token(headers)?;
     let expected_tenant = tenant_from_unverified_access_token(token.expose_secret())?;
     let verifier = verifier.ok_or_else(auth_not_configured)?;
     let verified = verifier
-        .verify(&token, &expected_tenant)
+        .verify_on(&token, &expected_tenant, surface)
         .map_err(WyrdErrorResponse::from)?;
     Ok(super::AuthenticatedPrincipal::from_verified(Arc::new(
         verified,

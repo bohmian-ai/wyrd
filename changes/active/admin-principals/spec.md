@@ -1,6 +1,6 @@
 ---
 id: SPEC-admin-principals
-revision: 13
+revision: 14
 status: approved
 approved_at: 2026-09-21
 ---
@@ -146,9 +146,9 @@ to satisfy this specification.
   to the database and secret store (`REQ-032`).
 - Billing, plans, quotas, an `Organization` noun, custom domains, tenant
   deletion or data destruction, and tenant migration.
-- Changing `wyrd apply` Card-bound principal provisioning, delegation-chain
-  representation or depth, or the emit card scope. Delegated permission
-  attenuation and delegation-decision audit are amended by `REQ-012c`.
+- Changing `wyrd apply` Card-bound principal provisioning or the emit card
+  scope. RFC 8693 subject/actor semantics, delegation-chain representation,
+  attenuation, and delegation-decision audit are amended by `REQ-012c`.
 - A SaaS customer-facing signup UI. The SaaS control plane is an ordinary holder
   of a global administrative credential.
 
@@ -239,18 +239,24 @@ to satisfy this specification.
   database-backed issuer or identity lookup remain on the issuance side. No
   common verifier trait, factory, checker, or database dependency may join
   those two responsibilities.
-- **REQ-012c**: RFC 8693 delegation MUST NOT amplify authority. The caller MUST
-  hold `delegation:issue`, and the delegated token's `permissions` MUST be the
-  semantic intersection of the caller token's verified `PermissionSet` and the
-  target principal's current `PermissionSet`, retaining the narrower scope for
-  every overlap. No delegated permission may exist unless both sets cover it;
-  wildcard, schema, and exact-object grants MUST attenuate under the same rule.
-  Every evaluation of `delegation:issue` MUST append exactly one allowed or
-  denied decision through the canonical audit path and commit it before the
-  response, including an allowed decision followed by subject resolution or
-  issuance failure. An unrecordable decision MUST fail closed. The existing
-  successful token-exchange audit MAY serve as the allowed decision when it
-  satisfies that contract.
+- **REQ-012c**: RFC 8693 delegation MUST use the standard subject/actor model.
+  For Service A authorizing Service B to act on A's behalf, A's access token is
+  the `subject_token`, B authenticates with its own access token as the
+  `actor_token`, and the issued JWT keeps A as the top-level `sub`, places B as
+  the current outermost `act.sub`, and binds `aud` to the requested Wyrd
+  resource such as Bifrost. Both input tokens MUST be verified, tenant-equal,
+  active for new issuance, and authorized by the existing cross-service invoke
+  policy for the directed A-to-B relationship. The delegated token's
+  `permissions` MUST be the semantic intersection of A's verified authority,
+  B's current authority, and any narrower requested resource scope; wildcard,
+  schema, and exact-object grants MUST attenuate under the same rule. The
+  generic `delegation:issue` permission and its `runtime_admin` coupling MUST
+  be removed: authenticated actor identity plus the existing directed invoke
+  policy are the delegation authorization, not a parallel RBAC role. Each
+  policy and issuance decision MUST use the canonical audit path, preserve A
+  as subject and B as actor, commit before returning a token, and fail closed
+  when either identity, policy, attenuation, audience, or audit cannot be
+  established.
 - **REQ-013**: The authenticated context MUST carry server-verified principal
   identity, principal type, and control-plane scope — platform, or exactly one
   tenant. It MUST be a closed two-variant type so a platform identity is not
@@ -407,7 +413,14 @@ to satisfy this specification.
   constructs its own HTTP client, assembles its own authentication header, or
   maps its own status codes onto errors. A surface that cannot be expressed
   through the shared client is evidence the shared client is missing a
-  capability, not licence to hand-roll one.
+  capability, not licence to hand-roll one. The shared client MUST own one
+  `on_behalf_of` delegation operation that uses the caller's existing
+  authentication state as the RFC 8693 actor and accepts the inbound subject
+  token plus target audience. It returns a client bound to the short-lived
+  delegated token and renews by repeating that exchange; it never persists or
+  logs either bearer. Rust exposes this owner directly, while the Python and
+  TypeScript SDKs provide idiomatic projections of the same operation without
+  duplicating exchange, caching, header, or retry logic.
 - **REQ-048**: Machine authentication and human-session continuation MUST use
   different renewal models. API-key and workload-identity grants MUST return a
   five-minute access token and no refresh token. `wyrd-client` MUST cache that
@@ -512,10 +525,12 @@ to satisfy this specification.
   caching. Tenant authentication has no authorization epoch, revocation list,
   introspection read, or verified-token cache.
 - **INV-013a**: Delegation is authority attenuation, never authority
-  acquisition. A delegated actor can exercise only the overlap between the
-  delegator's verified token authority and the target principal's current
-  grants, and every delegation authorization decision is durably attributable
-  even when no token is issued.
+  acquisition or identity inversion. A delegated JWT names the represented
+  principal as top-level subject and the service performing the work as the
+  current actor. The actor can exercise only the overlap between the subject's
+  verified authority, the actor's current grants, and the requested resource
+  scope, and every delegation decision is durably attributable even when no
+  token is issued.
 - **INV-014**: Administrative identity remains server-owned durable state. No
   Card kind, SDK, CLI, or UI becomes a durable source of truth.
 - **INV-015**: Every Wyrd plane authenticates on `X-Wyrd-Access-Token`. The
@@ -546,6 +561,7 @@ to satisfy this specification.
 | A required audit row cannot be written | The operation refuses and commits nothing. |
 | A credential secret is requested after creation | No surface returns it; only metadata is available. |
 | A federated human authenticates | Resolves through `(issuer, subject)` to a human principal producing the same authenticated context as a machine credential. |
+| Service B acts for Service A against Bifrost | B authenticates itself while presenting A's subject token; Wyrd issues `sub=A`, outer `act.sub=B`, `aud=bifrost`, and only the authority shared by A, B, and the requested resource; middleware verifies and authorizes that signed result automatically. |
 
 ## Required system boundaries and cross-boundary flow
 
@@ -595,6 +611,12 @@ Tenant administrative principal
   privileged platform plane remains database-backed on
   every request. No hybrid JWT cache, authorization epoch, revocation checker,
   or per-request tenant-auth introspection is permitted.
+- Delegation follows RFC 8693 subject/actor semantics: the represented
+  principal remains the top-level subject, the current service is the
+  outermost actor, the audience identifies the target Wyrd resource, and
+  authority only narrows. A generic delegation role is not a substitute for
+  authenticating the actor and authorizing the directed subject-to-actor
+  relationship through the existing invoke-policy owner.
 - Initialization is an operator-invoked subcommand authorized by database-
   credential possession, not a server-start side effect. Server boot never emits
   credential material, so the deployment root credential never enters the log
@@ -625,6 +647,12 @@ documents. These amendments are part of the change.
   lifecycle section, which currently states the same closed set and Card
   binding, plus any tenant epoch, next-request revocation, permission-cache, or
   per-request introspection description superseded by revision 11.
+- `architecture/wyrd-design.md`, `architecture/wyrd-security-posture.md`, and
+  `architecture/wyrd-doctrine.mdx` — replace the inverted delegation model
+  (`principal=callee`, `act=caller`) with RFC 8693 `sub=represented subject`,
+  `act=current actor`, resource audience, authenticated actor-token exchange,
+  and automatic request-time verification. Update `AGENTS.md` or agent rules
+  only if their live text encodes the superseded model.
 - `architecture/v1/00-foundations/` — the Auth foundation and permission
   vocabulary pages affected by the new administrative permissions and the
   tenant JWT / platform current-state split.
@@ -735,13 +763,18 @@ documents. These amendments are part of the change.
   `/openapi.json` serves its runtime document, route/auth/body/problem/error
   coverage is exact without a parallel catalog, and no checked-in snapshot,
   YAML endpoint, file-generation lane, or release OpenAPI digest remains.
-- **AC-020**: Delegation evidence proves a caller cannot obtain any permission
-  outside its own verified authority or the target principal's current grants;
-  wildcard, schema, exact-object, and disjoint permission combinations produce
-  the semantic intersection; allowed and denied `delegation:issue` decisions
-  each commit exactly one canonical audit row; a later subject or issuance
-  refusal retains the allowed no-effect decision; and audit failure issues no
-  token and returns no unaudited authorization result.
+- **AC-020**: A real client-to-server-to-Bifrost journey proves Service A with
+  read-only table authority can call Service B, which normally has read/write
+  authority, and B can act for A only through a delegated JWT whose top-level
+  `sub` is A, outermost `act.sub` is B, `aud` is Bifrost, and `permissions`
+  contain read but not write. The journey MUST use the shared client helper,
+  prove the read succeeds and the write is denied, and prove a missing or
+  invalid B actor token, cross-tenant pair, policy-denied A-to-B relationship,
+  reversed subject/actor claims, and audit failure issue no token. Focused
+  contract tests MUST cover nested actor order plus wildcard, schema,
+  exact-object, and disjoint intersections. Canonical audit MUST identify A as
+  subject and B as actor without introducing a second audit sink or issuance
+  path.
 
 ## Material constraints
 
@@ -844,6 +877,15 @@ None. Every decision raised during drafting has been resolved by the author.
 
 ## Revision history
 
+- **Revision 14 — 2026-09-21 — approved**: Corrects delegation to RFC 8693
+  subject/actor semantics. Service A remains the represented top-level subject,
+  Service B authenticates as the current actor, the issued token is
+  resource-audience-bound, and authority is the intersection of subject,
+  actor, and requested resource scope. The existing cross-service invoke
+  policy authorizes A-to-B; the generic `delegation:issue` role is removed.
+  Request middleware verifies the signed result automatically, and the shared
+  client exposes one delegation helper through the Rust, Python, and TypeScript
+  SDKs.
 - **Revision 13 — 2026-09-21 — approved**: Brings RFC 8693 delegation into the
   credential-exchange security boundary. Delegated permissions are the semantic
   intersection of the caller's verified authority and the target principal's

@@ -3180,13 +3180,6 @@ impl WyrdTestServerBuilder {
         self
     }
 
-    /// Attach the process-installed production telemetry guard.
-    #[must_use]
-    pub fn with_telemetry_for_test(mut self, telemetry: Arc<TelemetryGuard>) -> Self {
-        self.telemetry = Some(telemetry);
-        self
-    }
-
     /// Select the production Forge process role for this fixture.
     #[must_use]
     pub fn with_forge_process_role_for_test(mut self, role: BifrostTarget) -> Self {
@@ -3643,9 +3636,19 @@ impl WyrdTestServerBuilder {
 
     /// Build and start an in-process server.
     ///
+    /// Without an attached guard, the server shares the process production
+    /// telemetry, so `WYRD_LOG`/`RUST_LOG` trace every test server and a
+    /// panic prints the captured spans and metrics. A process whose subscriber
+    /// or metrics recorder already has another owner keeps that owner's.
+    ///
     /// # Errors
     /// Returns an error when database, storage, auth, or router state cannot be created.
     pub async fn start_in_process(mut self) -> Result<WyrdTestServer, WyrdTestServerError> {
+        if self.telemetry.is_none() {
+            self.telemetry = crate::bifrost::shared_process_telemetry_for_test()
+                .ok()
+                .map(|(guard, _capture)| guard);
+        }
         let fixture = Arc::new(
             PgFixture::start()
                 .await

@@ -14,8 +14,8 @@ use chrono::{DateTime, Duration, Utc};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::json;
 use uuid::Uuid;
-use wyrd_auth_issue::{AccessGrant, DelegationCaller, IssueError, IssuingKey};
-use wyrd_auth_verify::{ActClaim, TokenPrincipalRef};
+use wyrd_auth_issue::{AccessGrant, IssueError, IssuingKey};
+use wyrd_auth_verify::{ActClaim, TokenAudience, TokenPrincipalRef};
 use wyrd_runtime::{Permission, PermissionSet, PrincipalId, RoleRef};
 use wyrd_spec::auth::{PrincipalKindTag, SecretBearer, TokenResponse, TokenType};
 use wyrd_spec::error::WyrdError;
@@ -31,7 +31,7 @@ use wyrd_sql::queries::platform::tenant_resolver::tenant_admits_credentials;
 
 use crate::audit::{TOKEN_EXCHANGE_OPERATION, append_auth_audit, auth_event};
 use crate::card_scope::{
-    IssueErrorOrWyrd, MINT_KIND_API_KEY_EXCHANGE, MINT_KIND_DELEGATION, MINT_KIND_JWT_BEARER,
+    IssueErrorOrWyrd, MINT_KIND_API_KEY_EXCHANGE, MINT_KIND_JWT_BEARER,
     issue_scope_error, resolve_card_ref_scope, write_scope_mint_success_audit,
 };
 use crate::exchange_api_key::{principal_kind_wire, role_refs, token_hash};
@@ -108,20 +108,29 @@ pub enum TenantGrant {
     },
     /// A verified workload `jwt-bearer` assertion.
     JwtBearer,
-    /// An RFC 8693 delegation by a verified, authorized caller.
+    /// An RFC 8693 exchange: the issued principal is the actor, who acts on
+    /// behalf of the verified subject.
+    ///
+    /// The issuer resolves the actor's current row and grants; the token names
+    /// the subject as its principal and the actor as its outermost `act`.
     Delegation {
-        /// The delegating caller, recorded as the newest `act` layer.
-        caller: Box<DelegationCaller>,
-        /// The caller's verified permissions. The delegated token carries only
-        /// the target's permissions that this set also covers, so delegation
-        /// can narrow authority but never amplify it.
-        ceiling: PermissionSet,
-        /// The credential that authenticated the caller, when one did.
+        /// The subject being acted for, from its verified access token.
+        subject: TokenPrincipalRef,
+        /// The subject's roles; informational metadata only.
+        subject_roles: Vec<RoleRef>,
+        /// The subject's verified permissions. The token carries only the
+        /// actor's current permissions that this set also covers, so
+        /// delegation can narrow authority but never amplify either party.
+        subject_permissions: PermissionSet,
+        /// Earlier actors from the subject token, nested inside the new actor.
+        prior_act: Option<Box<ActClaim>>,
+        /// Audience the delegated token is issued for.
+        audience: TokenAudience,
+        /// Credential that authenticated the actor's token, when one did.
         ///
-        /// Audit-only: it attributes the `delegation:issue` decision to the
-        /// caller's API key or refresh session, and never enters the delegated
-        /// token, which was minted by delegation rather than by presenting it.
-        caller_credential_id: Option<Uuid>,
+        /// Audit-only: it attributes the exchange to the actor's credential and
+        /// never enters the delegated token.
+        actor_credential_id: Option<Uuid>,
     },
 }
 
@@ -146,8 +155,9 @@ impl TenantGrant {
         match self {
             Self::ApiKey { .. } => Some(MINT_KIND_API_KEY_EXCHANGE),
             Self::JwtBearer => Some(MINT_KIND_JWT_BEARER),
-            Self::Delegation { .. } => Some(MINT_KIND_DELEGATION),
-            Self::OidcLogin | Self::Refresh { .. } => None,
+            // The subject's Card scope was minted with its own token; the
+            // exchange confers no new emit authority.
+            Self::OidcLogin | Self::Refresh { .. } | Self::Delegation { .. } => None,
         }
     }
 }
@@ -262,13 +272,15 @@ impl TenantTokenIssuer {
     /// credentials; the principal's current row (a user for human grants, a
     /// tenant machine principal otherwise), refusing anything not active; the
     /// principal's current role assignments and those roles' permissions; and,
-    /// for a Card-bound principal, its transitive Card scope. A delegated
-    /// grant narrows those permissions to their intersection with the caller's
-    /// ceiling. It then signs a
+    /// for a Card-bound principal, its transitive Card scope. It then signs a
     /// token carrying that `PermissionSet` for the configured access TTL and
     /// appends the canonical token-exchange audit (plus the Card-scope mint
-    /// audit for a Card-bound principal). A delegated grant's audit names the
-    /// delegating caller as actor and the delegation permission it spent.
+    /// audit for a Card-bound principal).
+    ///
+    /// For a [`TenantGrant::Delegation`], `principal_id` is the actor: the
+    /// token instead names the grant's subject as its principal, carries the
+    /// intersection of the actor's current permissions with the subject's, and
+    /// records the actor as its outermost `act`.
     ///
     /// Nothing is committed here; the caller commits or rolls back the grant
     /// whole.
@@ -329,12 +341,7 @@ impl TenantTokenIssuer {
         let roles = role_refs(role_names).map_err(|error| IssuanceError::RoleCorrupt {
             role: error.to_string(),
         })?;
-        let permissions = match &grant {
-            TenantGrant::Delegation { ceiling, .. } => resolve_permissions(conn, &roles)
-                .await?
-                .intersection(ceiling),
-            _ => resolve_permissions(conn, &roles).await?,
-        };
+        let permissions = resolve_permissions(conn, &roles).await?;
 
         let expires_at = Utc::now() + self.settings.access_ttl;
         let credential_id = grant.credential_id();
@@ -343,9 +350,34 @@ impl TenantTokenIssuer {
             .zip(principal.card_ref.clone())
             .map(|(kind, root)| (kind, root, principal.card_ref_scope.clone()));
         let event = exchange_audit_event(&principal, &grant, expires_at, request_id);
-        let delegated_by = match grant {
-            TenantGrant::Delegation { caller, .. } => Some(*caller),
-            _ => None,
+        let (principal, roles, permissions, act, audience) = match grant {
+            TenantGrant::Delegation {
+                subject,
+                subject_roles,
+                subject_permissions,
+                prior_act,
+                audience,
+                ..
+            } => {
+                // The actor is attribution only: its Card binding names it,
+                // and its scope stays out of the token.
+                let actor = ActClaim {
+                    sub: principal.id.to_string(),
+                    principal: TokenPrincipalRef {
+                        card_ref_scope: CardRefScope::default(),
+                        ..principal
+                    },
+                    act: prior_act,
+                };
+                (
+                    subject,
+                    subject_roles,
+                    permissions.intersection(&subject_permissions),
+                    Some(Box::new(actor)),
+                    audience,
+                )
+            }
+            _ => (principal, roles, permissions, None, TokenAudience::Wyrd),
         };
         let access_token = self
             .issuing_key
@@ -355,7 +387,8 @@ impl TenantTokenIssuer {
                     roles,
                     permissions,
                     credential_id,
-                    delegated_by,
+                    act,
+                    audience,
                 },
                 self.settings.access_ttl,
             )
@@ -503,32 +536,35 @@ fn permission_set_from_rows(rows: Vec<RoleRow>) -> Result<PermissionSet, Issuanc
 /// Build the canonical token-exchange audit event for one issuance.
 ///
 /// A direct grant names its principal as both subject and actor, with the
-/// spent credential attached. A delegated grant names the delegating caller as
-/// actor, records the Card references of the older delegation layers
-/// initiator-first, and carries the delegation permission the caller spent
-/// and the credential that authenticated the caller, when one did.
+/// spent credential attached. A delegated grant is recorded under the subject
+/// being acted for, like every request its token later makes, names `issued`
+/// — the actor — as the exchange's actor, records the Card references of the
+/// earlier actors earliest first, targets the requested audience, and
+/// attaches the credential that authenticated the actor, when one did.
 fn exchange_audit_event(
-    subject: &TokenPrincipalRef,
+    issued: &TokenPrincipalRef,
     grant: &TenantGrant,
     expires_at: DateTime<Utc>,
     request_id: &str,
 ) -> wyrd_spec::vala::api::AuditEvent {
     let TenantGrant::Delegation {
-        caller,
-        caller_credential_id,
+        subject,
+        prior_act,
+        audience,
+        actor_credential_id,
         ..
     } = grant
     else {
         return auth_event(
             request_id,
             TOKEN_EXCHANGE_OPERATION,
-            subject.id,
-            subject.kind,
-            subject.card_ref.clone(),
+            issued.id,
+            issued.kind,
+            issued.card_ref.clone(),
             AuditOutcome::Allowed,
             AuditDetail::TokenExchange {
-                subject_principal_id: subject.id,
-                actor_principal_id: subject.id,
+                subject_principal_id: issued.id,
+                actor_principal_id: issued.id,
                 delegation_chain: Vec::new(),
                 expires_at,
             },
@@ -536,7 +572,7 @@ fn exchange_audit_event(
         .with_credential_id(grant.credential_id());
     };
     let mut delegation_chain = Vec::new();
-    let mut layer: Option<&ActClaim> = caller.act.as_deref();
+    let mut layer: Option<&ActClaim> = prior_act.as_deref();
     while let Some(act) = layer {
         delegation_chain.extend(act.principal.card_ref.clone());
         layer = act.act.as_deref();
@@ -545,19 +581,19 @@ fn exchange_audit_event(
     let mut event = auth_event(
         request_id,
         TOKEN_EXCHANGE_OPERATION,
-        caller.principal.id,
-        caller.principal.kind,
-        caller.principal.card_ref.clone(),
+        subject.id,
+        subject.kind,
+        subject.card_ref.clone(),
         AuditOutcome::Allowed,
         AuditDetail::TokenExchange {
             subject_principal_id: subject.id,
-            actor_principal_id: caller.principal.id,
+            actor_principal_id: issued.id,
             delegation_chain,
             expires_at,
         },
     );
-    event.permission = Permission::delegation_issue().to_string();
-    event.with_credential_id(*caller_credential_id)
+    event.resource = audience.as_str().to_owned();
+    event.with_credential_id(*actor_credential_id)
 }
 
 #[cfg(test)]
@@ -717,9 +753,10 @@ mod pg_tests {
     use secrecy::SecretString;
     use serde_json::json;
     use uuid::Uuid;
-    use wyrd_auth_issue::{DelegationCaller, IssuingKey};
+    use wyrd_auth_issue::IssuingKey;
     use wyrd_auth_verify::{
-        Kid, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem,
+        Kid, TokenAudience, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings,
+        public_key_from_pem,
     };
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_runtime::{Permission, PrincipalId};
@@ -869,16 +906,12 @@ mod pg_tests {
             .await
             .expect("machine suspends");
 
-        let caller = DelegationCaller {
-            sub: Uuid::new_v4().to_string(),
-            principal: TokenPrincipalRef {
-                id: PrincipalId::new(Uuid::new_v4()),
-                kind: PrincipalKindTag::Service,
-                tenant_id: tenant,
-                card_ref: None,
-                card_ref_scope: CardRefScope::default(),
-            },
-            act: None,
+        let subject = TokenPrincipalRef {
+            id: PrincipalId::new(Uuid::new_v4()),
+            kind: PrincipalKindTag::Service,
+            tenant_id: tenant,
+            card_ref: None,
+            card_ref_scope: CardRefScope::default(),
         };
         let cases = [
             (user, TenantGrant::OidcLogin),
@@ -898,9 +931,12 @@ mod pg_tests {
             (
                 machine,
                 TenantGrant::Delegation {
-                    caller: Box::new(caller),
-                    ceiling: wyrd_runtime::PermissionSet::new(),
-                    caller_credential_id: None,
+                    subject,
+                    subject_roles: Vec::new(),
+                    subject_permissions: wyrd_runtime::PermissionSet::new(),
+                    prior_act: None,
+                    audience: TokenAudience::Bifrost,
+                    actor_credential_id: None,
                 },
             ),
         ];

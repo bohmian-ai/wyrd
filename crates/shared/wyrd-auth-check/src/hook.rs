@@ -137,17 +137,17 @@ mod test_helpers {
     }
 
     fn context() -> AuthzCheckContext {
-        let caller = principal("caller");
-        let callee = principal("callee");
+        let actor = principal("actor");
+        let subject = principal("subject");
         let verified = VerifiedToken {
-            principal: callee,
+            principal: subject,
             delegation_chain: vec![DelegationStep {
-                principal: PrincipalRef::from_principal(&caller),
+                principal: PrincipalRef::from_principal(&actor),
             }],
             exp: chrono::Utc::now(),
         };
         let request = AuthzCheckRequest {
-            target: card_ref("callee"),
+            target: card_ref("actor"),
             action: "card_write".to_owned(),
             context: serde_json::json!({}),
         };

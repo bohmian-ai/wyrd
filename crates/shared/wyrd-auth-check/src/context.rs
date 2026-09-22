@@ -8,14 +8,17 @@ use wyrd_spec::request_id::RequestId;
 
 use crate::request::{AuthzCheckRequest, AuthzCheckRequestMetadata};
 
-/// Authz-check evaluation context.
+/// Authz-check evaluation context in RFC 8693 subject/actor terms.
+///
+/// Built from a verified delegated token for `/v1/authz/check`, and directly
+/// by the token exchange to ask whether an actor may act for a subject.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthzCheckContext {
-    /// Principal the call is being made as.
-    pub callee: Principal,
-    /// Immediate delegator for this hop.
-    pub caller: PrincipalRef,
-    /// Initiator-first delegation chain. The callee is not included.
+    /// The party being acted for, carrying the token's attenuated authority.
+    pub subject: Principal,
+    /// The current actor: the Service or Agent performing the call.
+    pub actor: PrincipalRef,
+    /// Actor chain earliest first; its last entry is [`Self::actor`].
     pub chain: Vec<PrincipalRef>,
     /// Header-derived request metadata.
     pub request: AuthzCheckRequest,
@@ -28,10 +31,10 @@ pub struct AuthzCheckContext {
 /// Context construction failures.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AuthzCheckContextError {
-    /// The principal kind is not Service or Agent.
-    #[error("authz check requires a Service or Agent principal kind")]
+    /// The current actor's kind is not Service or Agent.
+    #[error("authz check requires a Service or Agent actor")]
     RequiresServiceOrAgentKind,
-    /// The delegation chain is empty (direct token).
+    /// The actor chain is empty (direct token).
     #[error("authz check requires a non-empty delegation chain (direct token not accepted)")]
     RequiresDelegationChain,
 }
@@ -52,50 +55,43 @@ impl From<AuthzCheckContextError> for WyrdError {
 impl AuthzCheckContext {
     /// Build an authz-check context from a verified delegated token.
     ///
+    /// The token's principal is the subject; the last verified actor is the
+    /// current actor, which must be a Service or Agent.
+    ///
     /// # Errors
-    /// Returns a specific [`AuthzCheckContextError`] variant for each failure condition:
-    /// wrong principal kind or empty delegation chain.
+    /// Returns [`AuthzCheckContextError::RequiresDelegationChain`] for a
+    /// direct token and [`AuthzCheckContextError::RequiresServiceOrAgentKind`]
+    /// when the current actor is neither a Service nor an Agent.
     pub fn from_verified(
         verified: &VerifiedToken,
         request: AuthzCheckRequest,
         metadata: Option<AuthzCheckRequestMetadata>,
         request_id: RequestId,
     ) -> Result<Self, AuthzCheckContextError> {
-        if !matches!(
-            verified.principal.kind,
-            PrincipalKind::Service { .. } | PrincipalKind::Agent { .. }
-        ) {
-            return Err(AuthzCheckContextError::RequiresServiceOrAgentKind);
-        }
-
-        let callee = verified.principal.clone();
         let chain: Vec<_> = verified
             .delegation_chain
             .iter()
             .map(|step| step.principal.clone())
             .collect();
-        let Some(caller) = chain.last().cloned() else {
+        let Some(actor) = chain.last().cloned() else {
             return Err(AuthzCheckContextError::RequiresDelegationChain);
         };
+        if !matches!(
+            actor.kind,
+            PrincipalKind::Service { .. } | PrincipalKind::Agent { .. }
+        ) {
+            return Err(AuthzCheckContextError::RequiresServiceOrAgentKind);
+        }
 
         Ok(Self {
-            callee,
-            caller,
+            subject: verified.principal.clone(),
+            actor,
             chain,
             request,
             metadata,
             request_id,
         })
     }
-}
-
-/// Return true when a verified token is eligible for `/v1/authz/check`.
-#[must_use]
-pub fn is_delegated_token(verified: &VerifiedToken) -> bool {
-    matches!(
-        verified.principal.kind,
-        PrincipalKind::Service { .. } | PrincipalKind::Agent { .. }
-    ) && !verified.delegation_chain.is_empty()
 }
 
 #[cfg(test)]
@@ -111,7 +107,7 @@ mod tests {
     use wyrd_spec::reference::{CardRef, CardRefScope};
     use wyrd_spec::request_id::RequestId;
 
-    use crate::context::{AuthzCheckContext, AuthzCheckContextError, is_delegated_token};
+    use crate::context::{AuthzCheckContext, AuthzCheckContextError};
     use crate::request::AuthzCheckRequest;
 
     fn card_ref(kind: CardKind, name: &str) -> CardRef {
@@ -179,58 +175,64 @@ mod tests {
         }
     }
 
+    /// The subject stays the context's principal and the last actor is the
+    /// current actor, with the chain earliest first.
     #[test]
-    fn delegated_service_token_builds_initiator_first_context() {
-        let initiator = principal(service_kind("initiator"));
-        let immediate = principal(service_kind("caller"));
-        let callee = principal(service_kind("callee"));
-        let verified = verified(callee.clone(), vec![initiator.clone(), immediate.clone()]);
+    fn delegated_token_builds_subject_and_current_actor_context() {
+        let earlier = principal(service_kind("earlier-actor"));
+        let actor = principal(service_kind("actor"));
+        let subject = principal(service_kind("subject"));
+        let verified = verified(subject.clone(), vec![earlier.clone(), actor.clone()]);
 
         let ctx = AuthzCheckContext::from_verified(&verified, request(), None, request_id())
             .expect("delegated token is accepted");
 
-        assert_eq!(ctx.callee, callee);
-        assert_eq!(ctx.caller, PrincipalRef::from_principal(&immediate));
+        assert_eq!(ctx.subject, subject);
+        assert_eq!(ctx.actor, PrincipalRef::from_principal(&actor));
         assert_eq!(
             ctx.chain,
             vec![
-                PrincipalRef::from_principal(&initiator),
-                PrincipalRef::from_principal(&immediate)
+                PrincipalRef::from_principal(&earlier),
+                PrincipalRef::from_principal(&actor)
             ]
         );
     }
 
+    /// A direct token has no actor and is refused.
     #[test]
-    fn direct_service_token_is_rejected_with_delegation_chain_error() {
-        let callee = principal(service_kind("callee"));
-        let verified = verified(callee, Vec::new());
+    fn direct_token_is_rejected_with_delegation_chain_error() {
+        let verified = verified(principal(service_kind("subject")), Vec::new());
 
-        assert!(!is_delegated_token(&verified));
         assert_eq!(
             AuthzCheckContext::from_verified(&verified, request(), None, request_id()),
             Err(AuthzCheckContextError::RequiresDelegationChain)
         );
     }
 
+    /// A human actor is refused; only a Service or Agent may act.
     #[test]
-    fn delegated_user_token_is_rejected_with_kind_error() {
-        let user = principal(PrincipalKind::User);
-        let initiator = principal(service_kind("initiator"));
-        let verified = verified(user, vec![initiator]);
+    fn user_actor_is_rejected_with_kind_error() {
+        let verified = verified(
+            principal(service_kind("subject")),
+            vec![principal(PrincipalKind::User)],
+        );
 
-        assert!(!is_delegated_token(&verified));
         assert_eq!(
             AuthzCheckContext::from_verified(&verified, request(), None, request_id()),
             Err(AuthzCheckContextError::RequiresServiceOrAgentKind)
         );
     }
 
+    /// A human subject is served by an Agent actor.
     #[test]
-    fn delegated_agent_token_is_accepted() {
-        let initiator = principal(service_kind("initiator"));
-        let callee = principal(agent_kind("agent"));
-        let verified = verified(callee, vec![initiator]);
+    fn agent_actor_for_user_subject_is_accepted() {
+        let verified = verified(
+            principal(PrincipalKind::User),
+            vec![principal(agent_kind("agent"))],
+        );
 
-        assert!(is_delegated_token(&verified));
+        assert!(
+            AuthzCheckContext::from_verified(&verified, request(), None, request_id()).is_ok()
+        );
     }
 }

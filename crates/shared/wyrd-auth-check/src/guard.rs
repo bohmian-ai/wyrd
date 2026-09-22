@@ -1,6 +1,6 @@
 //! Delegated-token guard for authz-check.
 
-use wyrd_runtime::{Principal, PrincipalKind};
+use wyrd_runtime::{PrincipalKind, PrincipalRef};
 
 /// Delegated-token guard outcome.
 #[derive(Debug, PartialEq, Eq)]
@@ -14,9 +14,9 @@ pub enum GuardOutcome {
 /// Stable delegated-token guard rejection reason.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum GuardReason {
-    /// The callee principal kind is neither Service nor Agent.
+    /// The current actor's kind is neither Service nor Agent.
     KindNotEligible,
-    /// The callee principal lacks a card reference.
+    /// The current actor lacks a card reference.
     CardRefMissing,
     /// The token is direct and does not carry an actor chain.
     ChainEmpty,
@@ -35,58 +35,89 @@ impl GuardReason {
 }
 
 /// Authoritative delegated-token guard for `/v1/authz/check`.
+///
+/// `actor` is the token's current actor — the last verified `act` layer, or
+/// `None` for a direct token. Only a Card-bound Service or Agent actor may ask
+/// whether its call on the subject's behalf is permitted.
 #[must_use]
-pub fn guard_reason(callee: &Principal, chain_len: usize) -> GuardOutcome {
+pub fn guard_reason(actor: Option<&PrincipalRef>) -> GuardOutcome {
+    let Some(actor) = actor else {
+        return GuardOutcome::Reject(GuardReason::ChainEmpty);
+    };
     if !matches!(
-        callee.kind,
+        actor.kind,
         PrincipalKind::Service { .. } | PrincipalKind::Agent { .. }
     ) {
         return GuardOutcome::Reject(GuardReason::KindNotEligible);
     }
-    if callee.card_ref().is_none() {
+    if actor.card_ref().is_none() {
         return GuardOutcome::Reject(GuardReason::CardRefMissing);
-    }
-    if chain_len == 0 {
-        return GuardOutcome::Reject(GuardReason::ChainEmpty);
     }
     GuardOutcome::Allow
 }
 
 #[cfg(test)]
 mod tests {
-    use wyrd_runtime::{PermissionSet, Principal, PrincipalId, PrincipalKind};
+    use wyrd_runtime::{PrincipalId, PrincipalKind, PrincipalRef};
     use wyrd_semver::VersionBlock;
-    use wyrd_spec::DataTenantId;
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::reference::{CardRef, CardRefScope};
 
     use super::{GuardOutcome, GuardReason, guard_reason};
 
+    /// A direct token has no actor.
     #[test]
-    fn user_kind_is_not_eligible_before_chain_check() {
+    fn direct_token_reports_chain_empty() {
         assert_eq!(
-            guard_reason(&principal(PrincipalKind::User), 0),
-            GuardOutcome::Reject(GuardReason::KindNotEligible)
-        );
-    }
-
-    #[test]
-    fn direct_service_token_reports_chain_empty() {
-        assert_eq!(
-            guard_reason(&principal(service_kind("service")), 0),
+            guard_reason(None),
             GuardOutcome::Reject(GuardReason::ChainEmpty)
         );
     }
 
+    /// A human actor is not eligible.
     #[test]
-    fn delegated_agent_token_is_allowed() {
+    fn user_actor_is_not_eligible() {
         assert_eq!(
-            guard_reason(&principal(agent_kind("agent")), 1),
-            GuardOutcome::Allow
+            guard_reason(Some(&actor(PrincipalKind::User))),
+            GuardOutcome::Reject(GuardReason::KindNotEligible)
         );
     }
 
+    /// A Card-free Service actor has no Card to evaluate policy against.
+    #[test]
+    fn card_free_service_actor_reports_card_ref_missing() {
+        let kind = PrincipalKind::Service {
+            card_ref: None,
+            card_ref_scope: CardRefScope::default(),
+        };
+        assert_eq!(
+            guard_reason(Some(&actor(kind))),
+            GuardOutcome::Reject(GuardReason::CardRefMissing)
+        );
+    }
+
+    /// Card-bound Service and Agent actors are allowed.
+    #[test]
+    fn card_bound_service_and_agent_actors_are_allowed() {
+        for card_kind in [CardKind::Service, CardKind::Agent] {
+            let card_ref = card_ref(card_kind.clone());
+            let kind = if card_kind == CardKind::Service {
+                PrincipalKind::Service {
+                    card_ref: Some(card_ref.clone()),
+                    card_ref_scope: CardRefScope::own(&card_ref),
+                }
+            } else {
+                PrincipalKind::Agent {
+                    card_ref: card_ref.clone(),
+                    card_ref_scope: CardRefScope::own(&card_ref),
+                }
+            };
+            assert_eq!(guard_reason(Some(&actor(kind))), GuardOutcome::Allow);
+        }
+    }
+
+    /// Reason slugs are a stable wire projection.
     #[test]
     fn reason_slugs_are_locked() {
         assert_eq!(GuardReason::KindNotEligible.as_str(), "kind_not_eligible");
@@ -94,142 +125,22 @@ mod tests {
         assert_eq!(GuardReason::ChainEmpty.as_str(), "chain_empty");
     }
 
-    fn principal(kind: PrincipalKind) -> Principal {
-        Principal {
+    /// Build an actor reference of `kind`.
+    fn actor(kind: PrincipalKind) -> PrincipalRef {
+        PrincipalRef {
             id: PrincipalId::new(uuid::Uuid::now_v7()),
             kind,
-            tenant_id: DataTenantId::new_v7(),
-            roles: Vec::new(),
-            effective_permissions: PermissionSet::new(),
-            credential_id: None,
         }
     }
 
-    fn card_ref(kind: CardKind, name: &str) -> CardRef {
+    /// Build a static Card reference of `kind`.
+    fn card_ref(kind: CardKind) -> CardRef {
         CardRef {
             kind,
-            name: CardName::new(name).expect("static card name is valid"),
+            name: CardName::new("actor").expect("static card name is valid"),
             version: VersionBlock::parse("1.0.0").expect("static version is valid"),
             space: Some(SpaceName::new("prod").expect("static space is valid")),
             uid: None,
         }
-    }
-
-    /// Build a scoped service principal kind for guard tests.
-    fn service_kind(name: &str) -> PrincipalKind {
-        let card_ref = card_ref(CardKind::Service, name);
-        PrincipalKind::Service {
-            card_ref: Some(card_ref.clone()),
-            card_ref_scope: CardRefScope::own(&card_ref),
-        }
-    }
-
-    /// Build a scoped agent principal kind for guard tests.
-    fn agent_kind(name: &str) -> PrincipalKind {
-        let card_ref = card_ref(CardKind::Agent, name);
-        PrincipalKind::Agent {
-            card_ref: card_ref.clone(),
-            card_ref_scope: CardRefScope::own(&card_ref),
-        }
-    }
-}
-
-#[cfg(test)]
-mod properties {
-    use crate::guard::{GuardOutcome, GuardReason, guard_reason};
-    use wyrd_runtime::{PermissionSet, Principal, PrincipalId, PrincipalKind};
-    use wyrd_semver::VersionBlock;
-    use wyrd_spec::DataTenantId;
-    use wyrd_spec::envelope::CardKind;
-    use wyrd_spec::ids::{CardName, SpaceName};
-    use wyrd_spec::reference::{CardRef, CardRefScope};
-
-    fn card_ref(kind: CardKind, name: &str) -> CardRef {
-        CardRef {
-            kind,
-            name: CardName::new(name).expect("static card name is valid"),
-            version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            space: Some(SpaceName::new("prod").expect("static space is valid")),
-            uid: None,
-        }
-    }
-
-    fn principal(kind: PrincipalKind) -> Principal {
-        Principal {
-            id: PrincipalId::new(uuid::Uuid::now_v7()),
-            kind,
-            tenant_id: DataTenantId::new_v7(),
-            roles: Vec::new(),
-            effective_permissions: PermissionSet::new(),
-            credential_id: None,
-        }
-    }
-
-    fn user() -> Principal {
-        principal(PrincipalKind::User)
-    }
-
-    fn service() -> Principal {
-        let card_ref = card_ref(CardKind::Service, "service");
-        principal(PrincipalKind::Service {
-            card_ref: Some(card_ref.clone()),
-            card_ref_scope: CardRefScope::own(&card_ref),
-        })
-    }
-
-    fn agent() -> Principal {
-        let card_ref = card_ref(CardKind::Agent, "agent");
-        principal(PrincipalKind::Agent {
-            card_ref: card_ref.clone(),
-            card_ref_scope: CardRefScope::own(&card_ref),
-        })
-    }
-
-    fn assert_reject(outcome: GuardOutcome, expected: GuardReason) {
-        match outcome {
-            GuardOutcome::Reject(actual) => assert_eq!(actual, expected),
-            GuardOutcome::Allow => panic!("expected rejection {expected:?}, got allow"),
-        }
-    }
-
-    fn assert_allow(outcome: GuardOutcome) {
-        assert_eq!(outcome, GuardOutcome::Allow);
-    }
-
-    #[test]
-    fn user_kind_rejects_regardless_of_chain() {
-        for chain_len in [0, 1, 3] {
-            assert_reject(
-                guard_reason(&user(), chain_len),
-                GuardReason::KindNotEligible,
-            );
-        }
-    }
-
-    #[test]
-    fn service_kind_rejects_when_chain_empty() {
-        assert_reject(guard_reason(&service(), 0), GuardReason::ChainEmpty);
-    }
-
-    #[test]
-    fn service_kind_with_chain_allows() {
-        assert_allow(guard_reason(&service(), 1));
-        assert_allow(guard_reason(&service(), 5));
-    }
-
-    #[test]
-    fn agent_kind_rejects_when_chain_empty() {
-        assert_reject(guard_reason(&agent(), 0), GuardReason::ChainEmpty);
-    }
-
-    #[test]
-    fn agent_kind_with_chain_allows() {
-        assert_allow(guard_reason(&agent(), 1));
-        assert_allow(guard_reason(&agent(), 5));
-    }
-
-    #[test]
-    fn card_ref_missing_slug_is_card_ref_missing() {
-        assert_eq!(GuardReason::CardRefMissing.as_str(), "card_ref_missing");
     }
 }

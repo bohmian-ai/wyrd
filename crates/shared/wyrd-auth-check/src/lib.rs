@@ -8,7 +8,7 @@ pub mod hook;
 pub mod request;
 pub mod response;
 
-pub use context::{AuthzCheckContext, AuthzCheckContextError, is_delegated_token};
+pub use context::{AuthzCheckContext, AuthzCheckContextError};
 #[cfg(feature = "test-helpers")]
 pub use hook::{DenyAllPolicyHook, RecordingPolicyHook};
 pub use hook::{PolicyHook, StubAllowPolicyHook};

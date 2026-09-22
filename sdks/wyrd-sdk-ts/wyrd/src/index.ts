@@ -21,12 +21,14 @@ const nativeBinding = require("../index.cjs") as typeof import("../index.cjs");
 const {
   connectBifrost,
   connectCards,
+  connectWyrdClient,
   describeTableConfig,
   openWyrdState,
   tableConfigFromJsonSchema,
 } = nativeBinding;
 type NativeBifrost = import("../index.cjs").NativeBifrost;
 type NativeCards = import("../index.cjs").NativeCards;
+type NativeWyrdClient = import("../index.cjs").NativeWyrdClient;
 type NativeWyrdState = import("../index.cjs").NativeWyrdState;
 type NativeTableConfig = import("../index.cjs").NativeTableConfig;
 
@@ -972,6 +974,63 @@ export interface HydratedArtifact {
 /** Card references cross the native boundary as text or serialized JSON. */
 function cardRefText(ref: CardRef | string): string {
   return typeof ref === "string" ? ref : JSON.stringify(ref);
+}
+
+/** Audience a delegated token is bound to. */
+export type TokenAudience = "wyrd" | "bifrost";
+
+/**
+ * Authenticated Wyrd client over the shared Rust `WyrdClient`.
+ *
+ * Token exchange, caching, and renewal run in Rust; failures throw a
+ * structured {@link WyrdError}.
+ */
+export class WyrdClient {
+  readonly #native: NativeWyrdClient;
+
+  private constructor(native: NativeWyrdClient) {
+    this.#native = native;
+  }
+
+  /**
+   * Build a client without performing IO.
+   *
+   * Omitted options resolve from the environment, then
+   * `~/.config/wyrd/credentials.toml`.
+   */
+  static connect(
+    options: {
+      readonly serverUrl?: string;
+      readonly credential?: string;
+      readonly grpcUrl?: string;
+    } = {},
+  ): WyrdClient {
+    const result = connectWyrdClient(
+      options.serverUrl,
+      options.credential,
+      options.grpcUrl,
+    );
+    return new WyrdClient(nativeHandle(result.client, result.error));
+  }
+
+  /**
+   * Return a client that acts for the holder of `subjectToken` (RFC 8693).
+   *
+   * This client's credential is the actor. The issued token's subject is the
+   * inbound principal, its actor is this client, and its permissions are the
+   * intersection of both. The first exchange runs here; the returned client
+   * re-exchanges before expiry.
+   */
+  async onBehalfOf(
+    subjectToken: string,
+    options: { readonly audience?: TokenAudience } = {},
+  ): Promise<WyrdClient> {
+    const result = await this.#native.onBehalfOf(
+      subjectToken,
+      options.audience ?? "bifrost",
+    );
+    return new WyrdClient(nativeHandle(result.client, result.error));
+  }
 }
 
 /**

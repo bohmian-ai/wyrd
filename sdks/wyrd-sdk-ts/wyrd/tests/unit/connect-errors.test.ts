@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { Bifrost, Cards, TableConfig, WyrdError } from "@wyrd/sdk";
+import { Bifrost, Cards, TableConfig, WyrdClient, WyrdError } from "@wyrd/sdk";
 
 const CREDENTIAL_VARS = [
   "WYRD_ACCESS_TOKEN",
@@ -40,6 +40,16 @@ function expectCatalogError(error: unknown, code: string, status: number): void 
 }
 
 describe("native construction failures", () => {
+  it("WyrdClient.connect throws the no-credentials WyrdError", () => {
+    let caught: unknown;
+    try {
+      WyrdClient.connect({ serverUrl: "http://127.0.0.1:1" });
+    } catch (error) {
+      caught = error;
+    }
+    expectCatalogError(caught, "WYRD_CLIENT_401_NO_CREDENTIALS", 401);
+  });
+
   it("Cards.connect throws the no-credentials WyrdError", () => {
     let caught: unknown;
     try {

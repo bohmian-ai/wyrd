@@ -268,6 +268,19 @@ export declare class NativeQueryStart {
   get errorDetailsJson(): string | null
 }
 
+/** Node-facing handle to one authenticated [`WyrdClient`]. */
+export declare class NativeWyrdClient {
+  /**
+   * Returns a client that acts for the holder of `subject_token`.
+   *
+   * This client's credential is the actor. The first exchange runs here so a
+   * refusal is returned at the call site; the returned client re-exchanges
+   * in Rust before expiry. An `audience` other than `wyrd` or `bifrost` is a
+   * `WYRD_SPEC_400_VALIDATION` result.
+   */
+  onBehalfOf(subjectToken: string, audience: string): Promise<NativeWyrdClientResult>
+}
+
 /**
  * Offline hydrated-bundle view over the shared `wyrd_client` `WyrdState`.
  *
@@ -340,6 +353,15 @@ export declare function connectBifrost(table?: NativeTableConfig | undefined | n
  * Credential and configuration failures are returned as catalog metadata.
  */
 export declare function connectCards(serverUrl?: string | undefined | null, credential?: string | undefined | null): NativeCardsConnection
+
+/**
+ * Builds one client without performing IO.
+ *
+ * Omitted arguments resolve through `client_from_options`: the environment,
+ * then `~/.config/wyrd/credentials.toml`. Failures are returned as catalog
+ * metadata.
+ */
+export declare function connectWyrdClient(serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null): NativeWyrdClientResult
 
 /**
  * Fetches an already-registered table's config by name.
@@ -452,6 +474,14 @@ export interface NativeTableConfigResult {
   /** Described table config when the server answered. */
   config?: NativeTableConfig
   /** Catalog failure when description failed. */
+  error?: NativeWyrdError
+}
+
+/** Closed result of building or delegating one client: a handle or a catalog error. */
+export interface NativeWyrdClientResult {
+  /** Client when construction or the exchange succeeded. */
+  client?: NativeWyrdClient
+  /** Catalog failure otherwise. */
   error?: NativeWyrdError
 }
 

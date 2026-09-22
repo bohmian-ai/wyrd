@@ -134,7 +134,6 @@ fn connect(base_url: &str, credential: &str) -> Cards {
 /// # Panics
 /// Panics when any journey step or structured-error expectation fails.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn registers_reads_hydrates_and_loads_offline_state() {
     let root = tempfile::tempdir().expect("fixture root creates");
     let service = write_service_graph(root.path());

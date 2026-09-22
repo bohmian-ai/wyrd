@@ -167,7 +167,7 @@ hide = true
 description = "Run the real-server CLI and Rust SDK typed WyrdState journeys with their lifecycle already provisioned"
 run = [
   "cargo nextest run --locked -p wyrd-cli --test cli -E 'test(=card_lifecycle::pg_tests::cli_bundle_loads_typed_wyrdstate_after_server_shutdown)'",
-  "cargo nextest run --locked -p wyrd-sdk-rust --test cards_state --run-ignored all -E 'test(=registers_reads_hydrates_and_loads_offline_state)'",
+  "cargo nextest run --locked -p wyrd-sdk-rust --test cards_state -E 'test(=registers_reads_hydrates_and_loads_offline_state)'",
 ]
 
 [tasks."test:skald"]

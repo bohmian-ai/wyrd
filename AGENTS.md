@@ -663,6 +663,10 @@ shared workflow skill and `mise run check:skills-sync` to detect drift. Codex
 
 - `wyrd-spec` is foundational but it not a dumping grounds for all contracts. If it's not spec-related, it doesn't go in `wyrd-spec`. Find another place for it.
 - `wyrd-sql` is the durable Postgres layer.
+- PostgreSQL owns timestamps used for database coordination, eligibility,
+  leases, and relative expiry. Callers bind durations; SQL derives deadlines
+  with `statement_timestamp()`. Domain event times and caller-supplied
+  absolute dates remain producer-owned.
 - `wyrd-storage` is the durable storage layer that provides storage functionality for wyrd and vala.
 - Deployment: Wyrd is meant to be deployed as self-hosted, cloud SaaS (single-server multi-tenant), and enterprise cloud (single-server single-tenant). Plan work and implementation accordingly. "Single-server" means one logical serving surface, not a single process or pod: a topology may horizontally scale `wyrd-server` into multiple replicas and targeted pods (selected by `WYRD_TARGET`) behind one gateway, each activating a subset of subsystems. `wyrd-server` remains the only serving surface.
 - Wyrd is open source and independently publishable. It contains no private

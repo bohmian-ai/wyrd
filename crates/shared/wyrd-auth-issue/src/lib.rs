@@ -272,7 +272,12 @@ impl IssuingKey {
         Ok(token)
     }
 
-    /// Mint a refresh token for any principal kind.
+    /// Mint a refresh token for any principal kind from an explicit instant.
+    ///
+    /// `issued_at` is supplied by the caller rather than sampled here so that
+    /// the signed `exp` and the durable refresh row that records it are derived
+    /// from one clock. Callers that persist the token pass the PostgreSQL
+    /// issuance instant of their own transaction.
     ///
     /// # Errors
     /// Returns an error when TTL is invalid or signing fails.
@@ -293,9 +298,10 @@ impl IssuingKey {
         principal_kind: PrincipalKindTag,
         principal_id: PrincipalId,
         tenant_id: DataTenantId,
+        issued_at: DateTime<Utc>,
         ttl: Duration,
     ) -> Result<String, IssueError> {
-        let (iat, exp) = timestamps(Utc::now(), ttl)?;
+        let (iat, exp) = timestamps(issued_at, ttl)?;
         let jti = new_jti();
         tracing::Span::current().record("jti", &jti);
         let claims = RefreshTokenClaims {
@@ -446,7 +452,7 @@ fn validate_principal_ref(principal: &TokenPrincipalRef) -> Result<(), IssueErro
 
 #[cfg(test)]
 mod tests {
-    use chrono::Duration;
+    use chrono::{Duration, Utc};
     use jsonwebtoken::{Algorithm, decode_header};
     use secrecy::{ExposeSecret, SecretString};
     use wyrd_auth_verify::{
@@ -823,6 +829,7 @@ mod tests {
                 PrincipalKindTag::Service,
                 principal_id("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b02"),
                 tenant_id(),
+                Utc::now(),
                 Duration::days(30),
             )
             .expect("refresh token issues");

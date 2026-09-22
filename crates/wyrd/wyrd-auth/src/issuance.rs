@@ -25,7 +25,7 @@ use wyrd_spec::vala::audit_detail::CardScopeMintKind;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
     RoleRow, insert_refresh_token, insert_refresh_token_rotated, list_service_account_roles,
-    list_user_roles, roles_by_name, service_account_by_id, user_by_id,
+    list_user_roles, refresh_issuance_instant, roles_by_name, service_account_by_id, user_by_id,
 };
 use wyrd_sql::queries::platform::tenant_resolver::tenant_admits_credentials;
 
@@ -464,13 +464,18 @@ impl TenantTokenIssuer {
             None => TenantGrant::OidcLogin,
         };
         let access = self.issue(conn, principal_id, grant, request_id).await?;
+        // One PostgreSQL instant, sampled in the caller's transaction, feeds both
+        // the signed `exp` and the durable row expiry that PostgreSQL later
+        // evaluates, so the two can never disagree.
+        let issued_at = refresh_issuance_instant(conn).await?;
         let refresh_token = self.issuing_key.issue_refresh_token(
             PrincipalKindTag::User,
             PrincipalId::new(principal_id),
             conn.data_tenant_id(),
+            issued_at,
             self.settings.refresh_ttl,
         )?;
-        let refresh_expires_at = Utc::now() + self.settings.refresh_ttl;
+        let refresh_expires_at = issued_at + self.settings.refresh_ttl;
         let hash = token_hash(&refresh_token);
         let successor = Uuid::new_v4();
         match rotated_from {

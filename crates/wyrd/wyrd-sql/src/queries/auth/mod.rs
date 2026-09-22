@@ -24,8 +24,8 @@ pub use api_keys::{
 };
 pub use login_state::{LoginStateRow, insert_login_state, take_login_state};
 pub use refresh_tokens::{
-    consume_active_refresh, insert_refresh_token_rotated, refresh_by_hash, revoke_refresh,
-    revoke_refresh_family,
+    consume_active_refresh, insert_refresh_token_rotated, refresh_by_hash,
+    refresh_issuance_instant, revoke_refresh, revoke_refresh_family,
 };
 pub use revocation::{suspend_service_account_principal, suspend_user_principal};
 pub use role_assignments::{

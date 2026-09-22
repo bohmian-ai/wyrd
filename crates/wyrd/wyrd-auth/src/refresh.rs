@@ -303,6 +303,7 @@ mod pg_tests {
                 principal_kind,
                 PrincipalId::new(principal_id),
                 tenant_id,
+                Utc::now(),
                 Duration::days(30),
             )
             .expect("refresh token issues");
@@ -411,6 +412,28 @@ mod pg_tests {
             .expect("new row exists");
         assert_eq!(new_row.rotated_from, Some(old_row.id));
         assert!(new_row.revoked_at.is_none(), "new token is active");
+
+        // The signed successor and its durable row are derived from one
+        // whole-second PostgreSQL issuance instant, so the `exp` the verifier
+        // enforces and the expiry PostgreSQL enforces are the same instant.
+        let successor_claims = super::claims_from_refresh_jwt(
+            exchanged
+                .refresh_token
+                .as_ref()
+                .expect("rotation issues a refresh token")
+                .expose_secret(),
+        )
+        .expect("successor refresh jwt decodes");
+        assert_eq!(
+            new_row.expires_at.timestamp_subsec_nanos(),
+            0,
+            "the stored successor expiry is a whole second"
+        );
+        assert_eq!(
+            i64::try_from(successor_claims.exp).expect("exp fits in i64"),
+            new_row.expires_at.timestamp(),
+            "signed exp equals the stored successor row expiry"
+        );
     }
 
     #[tokio::test]
@@ -867,6 +890,7 @@ mod pg_tests {
                 PrincipalKindTag::Service,
                 PrincipalId::new(principal_id),
                 tenant_id,
+                Utc::now(),
                 Duration::days(30),
             )
             .expect("refresh jwt issues");
@@ -900,6 +924,7 @@ mod pg_tests {
                 PrincipalKindTag::Service,
                 PrincipalId::new(Uuid::new_v4()),
                 tenant_id,
+                Utc::now(),
                 Duration::days(30),
             )
             .expect("refresh jwt issues");

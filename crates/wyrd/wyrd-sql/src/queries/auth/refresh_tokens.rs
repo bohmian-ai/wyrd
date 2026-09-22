@@ -13,14 +13,18 @@ use crate::row_types::auth::RefreshTokenRow;
 
 const CONSUME_ACTIVE_REFRESH_SQL: &str = r#"
     UPDATE wyrd.auth_refresh_tokens
-       SET revoked_at = now(),
+       SET revoked_at = statement_timestamp(),
            revoked_reason = 'rotated'
      WHERE token_hash = $1
        AND data_tenant_id = $2
        AND revoked_at IS NULL
-       AND expires_at > now()
+       AND expires_at > statement_timestamp()
     RETURNING id, data_tenant_id, principal_kind, principal_id, token_hash,
               issued_at, expires_at, rotated_from, revoked_at, revoked_reason
+"#;
+
+const REFRESH_ISSUANCE_INSTANT_SQL: &str = r#"
+    SELECT date_trunc('second', statement_timestamp())
 "#;
 
 const REFRESH_BY_HASH_SQL: &str = r#"
@@ -38,6 +42,25 @@ const INSERT_REFRESH_TOKEN_ROTATED_SQL: &str = r#"
         token_hash, expires_at, rotated_from
     ) VALUES ($1, $2, $3, $4, $5, $6, $7)
 "#;
+
+/// Sample the PostgreSQL issuance instant for a refresh token, truncated to a
+/// whole second.
+///
+/// The signed `exp` claim carries only whole seconds, so truncating here makes
+/// the JWT expiry and the durable row expiry derived from this instant exactly
+/// equal rather than equal-to-the-second. The caller mints and inserts inside
+/// the same transaction, and the consume predicate that later evaluates the
+/// stored expiry uses the same database clock.
+///
+/// # Errors
+/// Returns a SQLx error when Postgres rejects the statement.
+pub async fn refresh_issuance_instant(
+    conn: &mut TenantConn<'_>,
+) -> Result<DateTime<Utc>, sqlx::Error> {
+    sqlx::query_scalar::<_, DateTime<Utc>>(REFRESH_ISSUANCE_INSTANT_SQL)
+        .fetch_one(&mut **conn.transaction())
+        .await
+}
 
 /// Atomically revoke the active row and return it.
 ///
@@ -172,7 +195,7 @@ mod tests {
     fn consume_active_refresh_is_atomic_update_returning() {
         assert!(CONSUME_ACTIVE_REFRESH_SQL.contains("UPDATE wyrd.auth_refresh_tokens"));
         assert!(CONSUME_ACTIVE_REFRESH_SQL.contains("revoked_at IS NULL"));
-        assert!(CONSUME_ACTIVE_REFRESH_SQL.contains("expires_at > now()"));
+        assert!(CONSUME_ACTIVE_REFRESH_SQL.contains("expires_at > statement_timestamp()"));
         assert!(CONSUME_ACTIVE_REFRESH_SQL.contains("revoked_reason = 'rotated'"));
         assert!(CONSUME_ACTIVE_REFRESH_SQL.contains("data_tenant_id = $2"));
         assert!(CONSUME_ACTIVE_REFRESH_SQL.contains("RETURNING"));

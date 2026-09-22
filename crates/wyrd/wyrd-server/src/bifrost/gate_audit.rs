@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use vala_bifrost_redux::gate::{AuthContext, GateAudit, IngestError};
-use wyrd_spec::vala::api::{AuditEvent, AuditOutcome};
+use wyrd_spec::vala::api::{AuditDetail, AuditEvent, AuditOutcome};
 
 use crate::audit;
 use crate::postgres::ServerPostgres;
@@ -28,6 +28,12 @@ impl PostgresGateAudit {
 impl GateAudit for PostgresGateAudit {
     /// Commits one write decision to the caller's tenant audit chain.
     ///
+    /// The row is attributed to the verified principal — the subject a
+    /// delegated token acts for — and, when the token carries a non-empty
+    /// delegation chain, names its actors through the same
+    /// [`AuditDetail::DelegationAttribution`] projection HTTP and Oracle audit
+    /// use. A direct call keeps no detail, exactly as before delegation.
+    ///
     /// # Errors
     ///
     /// Returns [`IngestError::AuditUnavailable`] when the tenant connection,
@@ -39,7 +45,7 @@ impl GateAudit for PostgresGateAudit {
         resource: &str,
         outcome: AuditOutcome,
     ) -> Result<(), IngestError> {
-        let event = AuditEvent::new(
+        let mut event = AuditEvent::new(
             auth.request_id.clone(),
             None,
             "bifrost.record.write".to_owned(),
@@ -50,6 +56,11 @@ impl GateAudit for PostgresGateAudit {
             "bifrost:record:write".to_owned(),
             outcome,
         );
+        if !auth.delegation_chain.is_empty() {
+            event = event.with_detail(AuditDetail::DelegationAttribution {
+                delegation_chain: wyrd_runtime::audit_delegation_chain(&auth.delegation_chain),
+            });
+        }
         let mut conn = self
             .postgres
             .tenant_conn(auth.tenant)

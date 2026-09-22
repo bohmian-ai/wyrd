@@ -279,6 +279,22 @@ export declare class NativeWyrdClient {
    * `WYRD_SPEC_400_VALIDATION` result.
    */
   onBehalfOf(subjectToken: string, audience: string): Promise<NativeWyrdClientResult>
+  /**
+   * Connects one Bifrost client over this client's authentication and
+   * transport, optionally already bound to a write target.
+   *
+   * A delegated client therefore reads and writes as its subject with its
+   * actor attributed. The transport arguments exist only so a caller that
+   * also supplies them is refused with `WYRD_SPEC_400_VALIDATION` rather
+   * than having them silently ignored.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the supplied table config is not one
+   * serialized `TableConfig`; the conflict and ingest-dial failures are
+   * returned as catalog metadata.
+   */
+  connectBifrost(table?: NativeTableConfig | undefined | null, serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null): Promise<NativeBifrostConnection>
 }
 
 /**

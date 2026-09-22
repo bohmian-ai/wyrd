@@ -668,21 +668,42 @@ export class Bifrost {
    * `WYRD_SERVER_URL`, `grpcUrl` from `WYRD_GRPC_URL`, and `credential`
    * through `WYRD_ACCESS_TOKEN` → `WYRD_WORKLOAD_TOKEN` + tenant →
    * `WYRD_API_KEY` → `~/.config/wyrd/credentials.toml`.
+   *
+   * `client` reuses an existing, possibly delegated, {@link WyrdClient} for
+   * authentication and transport. It cannot be combined with `serverUrl`,
+   * `credential`, or `grpcUrl`; doing so throws `WYRD_SPEC_400_VALIDATION`.
    */
   static async connect(
-    options: {
-      readonly table?: TableConfig;
-      readonly serverUrl?: string;
-      readonly credential?: string;
-      readonly grpcUrl?: string;
-    } = {},
+    options:
+      | {
+          readonly table?: TableConfig;
+          readonly serverUrl?: string;
+          readonly credential?: string;
+          readonly grpcUrl?: string;
+          readonly client?: never;
+        }
+      | {
+          readonly table?: TableConfig;
+          readonly client: WyrdClient;
+          readonly serverUrl?: never;
+          readonly credential?: never;
+          readonly grpcUrl?: never;
+        } = {},
   ): Promise<Bifrost> {
-    const connection = await connectBifrost(
-      options.table?.native,
-      options.serverUrl,
-      options.credential,
-      options.grpcUrl,
-    );
+    const connection =
+      options.client === undefined
+        ? await connectBifrost(
+            options.table?.native,
+            options.serverUrl,
+            options.credential,
+            options.grpcUrl,
+          )
+        : await wyrdClientNative(options.client).connectBifrost(
+            options.table?.native,
+            options.serverUrl,
+            options.credential,
+            options.grpcUrl,
+          );
     return new Bifrost(nativeHandle(connection.bifrost, connection.error));
   }
 
@@ -979,6 +1000,9 @@ function cardRefText(ref: CardRef | string): string {
 /** Audience a delegated token is bound to. */
 export type TokenAudience = "wyrd" | "bifrost";
 
+/** Reads a {@link WyrdClient}'s native handle for {@link Bifrost.connect}. */
+let wyrdClientNative: (client: WyrdClient) => NativeWyrdClient;
+
 /**
  * Authenticated Wyrd client over the shared Rust `WyrdClient`.
  *
@@ -987,6 +1011,10 @@ export type TokenAudience = "wyrd" | "bifrost";
  */
 export class WyrdClient {
   readonly #native: NativeWyrdClient;
+
+  static {
+    wyrdClientNative = (client) => client.#native;
+  }
 
   private constructor(native: NativeWyrdClient) {
     this.#native = native;

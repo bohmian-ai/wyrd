@@ -1,9 +1,17 @@
-import { tableFromIPC, type Table } from "apache-arrow";
+import {
+  RecordBatch,
+  Struct,
+  makeBuilder,
+  makeData,
+  tableFromIPC,
+  type Schema,
+  type Table,
+} from "apache-arrow";
 import { z } from "zod";
 import { startTestServer } from "@wyrd/testing";
 import { describe, expect, it } from "vitest";
 
-import { Bifrost, TableConfig } from "@wyrd/sdk";
+import { Bifrost, TableConfig, WyrdClient, WyrdError } from "@wyrd/sdk";
 
 const SCHEMA = {
   type: "object",
@@ -20,7 +28,126 @@ function connect(server: ReturnType<typeof startTestServer>, table?: TableConfig
   });
 }
 
+/**
+ * Exchange `apiKey` for an access token through the public token route.
+ *
+ * Service A's inbound bearer token is what a real Service B receives; the
+ * public `/auth/token` route is how Service A obtained it.
+ */
+async function accessToken(
+  server: ReturnType<typeof startTestServer>,
+  apiKey: string,
+): Promise<string> {
+  const response = await fetch(`${server.baseUrl}/auth/token`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ grant_type: "wyrd_api_key", api_key: apiKey }),
+  });
+  expect(response.status).toBe(200);
+  return ((await response.json()) as { access_token: string }).access_token;
+}
+
+/** One single-column batch holding `value`, shaped by the described schema. */
+function valueBatch(schema: Schema, value: bigint): RecordBatch {
+  const builder = makeBuilder({ type: schema.fields[0]!.type });
+  builder.append(value);
+  builder.finish();
+  return new RecordBatch(
+    schema,
+    makeData({ type: new Struct(schema.fields), length: 1, children: [builder.flush()] }),
+  );
+}
+
+/** Capture an asynchronous structured catalog error. */
+async function rejection(promise: Promise<unknown>): Promise<WyrdError> {
+  const error = await promise.then(
+    () => undefined,
+    (reason: unknown) => reason,
+  );
+  expect(error).toBeInstanceOf(WyrdError);
+  return error as WyrdError;
+}
+
 describe("Bifrost write journey", () => {
+  it("reads as A but cannot write with B's authority through a delegated client", async () => {
+    const server = startTestServer();
+    try {
+      server.seedBifrostRows(server.tableFqn, [11, 12]);
+      const aKey = server.scopedApiKey("ts_delegation_a", ["bifrost_query:read"]);
+      const bKey = server.scopedApiKey("ts_delegation_b", [
+        "bifrost_query:read",
+        "bifrost_record:write",
+        "bifrost_table:read",
+      ]);
+      const serviceB = WyrdClient.connect({
+        serverUrl: server.baseUrl,
+        credential: bKey,
+        grpcUrl: server.grpcUrl,
+      });
+      const delegated = await serviceB.onBehalfOf(await accessToken(server, aKey), {
+        audience: "bifrost",
+      });
+      const bifrostAsA = await Bifrost.connect({ client: delegated });
+
+      const read = await bifrostAsA.sql(
+        `SELECT value FROM ${server.tableFqn} ORDER BY value`,
+      );
+      expect(Array.from(read.batches[0]?.getChildAt(0)?.toArray() ?? [])).toEqual([
+        11n,
+        12n,
+      ]);
+      const { arrowSchema } = await TableConfig.describe(server.tableFqn, {
+        serverUrl: server.baseUrl,
+        credential: bKey,
+        grpcUrl: server.grpcUrl,
+      });
+      const denied = await rejection(
+        bifrostAsA.writeBatch(server.tableFqn, valueBatch(arrowSchema, 41n)),
+      );
+      expect(denied.status).toBe(403);
+
+      const bifrostAsB = await Bifrost.connect({ client: serviceB });
+      await bifrostAsB.writeBatch(server.tableFqn, valueBatch(arrowSchema, 42n));
+      server.flushBifrost();
+      const written = await bifrostAsB.sql(
+        `SELECT value FROM ${server.tableFqn} WHERE value > 40`,
+      );
+      expect(Array.from(written.batches[0]?.getChildAt(0)?.toArray() ?? [])).toEqual([
+        42n,
+      ]);
+
+      // Without `client`, the environment chain still resolves B unchanged.
+      const saved = ["WYRD_SERVER_URL", "WYRD_GRPC_URL", "WYRD_API_KEY"].map(
+        (name) => [name, process.env[name]] as const,
+      );
+      Object.assign(process.env, {
+        WYRD_SERVER_URL: server.baseUrl,
+        WYRD_GRPC_URL: server.grpcUrl,
+        WYRD_API_KEY: bKey,
+      });
+      try {
+        const fromEnv = await Bifrost.connect();
+        expect(
+          (await fromEnv.sql(`SELECT value FROM ${server.tableFqn} WHERE value > 40`))
+            .numRows,
+        ).toBe(1);
+      } finally {
+        for (const [name, value] of saved) {
+          if (value === undefined) delete process.env[name];
+          else process.env[name] = value;
+        }
+      }
+
+      const conflict = await rejection(
+        // @ts-expect-error `client` is mutually exclusive with every transport option.
+        Bifrost.connect({ client: serviceB, credential: bKey }),
+      );
+      expect(conflict.code).toBe("WYRD_SPEC_400_VALIDATION");
+    } finally {
+      server.shutdown();
+    }
+  }, 30_000);
+
   it("registers, writes, flushes, swaps tables, and reads back", async () => {
     const server = startTestServer();
     try {

@@ -7,10 +7,12 @@
 use napi_derive::napi;
 use secrecy::SecretString;
 use wyrd_client::WyrdClient;
+use wyrd_client::bifrost::Bifrost;
+use wyrd_queue::QueueConfig;
 use wyrd_spec::auth::TokenAudience;
 use wyrd_spec::error::WyrdError;
 
-use crate::NativeWyrdError;
+use crate::{NativeBifrostConnection, NativeTableConfig, NativeWyrdError};
 
 /// Node-facing handle to one authenticated [`WyrdClient`].
 #[napi]
@@ -95,5 +97,42 @@ impl NativeWyrdClient {
                 .on_behalf_of(SecretString::from(subject_token), audience)
                 .await,
         )
+    }
+
+    /// Connects one Bifrost client over this client's authentication and
+    /// transport, optionally already bound to a write target.
+    ///
+    /// A delegated client therefore reads and writes as its subject with its
+    /// actor attributed. The transport arguments exist only so a caller that
+    /// also supplies them is refused with `WYRD_SPEC_400_VALIDATION` rather
+    /// than having them silently ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the supplied table config is not one
+    /// serialized `TableConfig`; the conflict and ingest-dial failures are
+    /// returned as catalog metadata.
+    #[napi]
+    pub async fn connect_bifrost(
+        &self,
+        table: Option<NativeTableConfig>,
+        server_url: Option<String>,
+        credential: Option<String>,
+        grpc_url: Option<String>,
+    ) -> napi::Result<NativeBifrostConnection> {
+        if server_url.is_some() || credential.is_some() || grpc_url.is_some() {
+            return Ok(NativeBifrostConnection {
+                bifrost: None,
+                error: Some(NativeWyrdError::from_wyrd(&WyrdError::Validation {
+                    message: "client cannot be combined with serverUrl, credential, or grpcUrl"
+                        .to_owned(),
+                    details: serde_json::json!({ "field": "client" }),
+                })),
+            });
+        }
+        let table = table.map(|table| table.parse()).transpose()?;
+        Ok(NativeBifrostConnection::from_outcome(
+            Bifrost::connect_with_config(&self.client, table, QueueConfig::default()).await,
+        ))
     }
 }

@@ -187,6 +187,25 @@ pub struct NativeBifrostConnection {
     pub error: Option<NativeWyrdError>,
 }
 
+impl NativeBifrostConnection {
+    /// Project one connection outcome onto the closed result, so every
+    /// constructor path reports a failure through the same catalog shape.
+    fn from_outcome(connected: StdResult<Bifrost, BifrostClientError>) -> Self {
+        match connected {
+            Ok(handle) => Self {
+                bifrost: Some(NativeBifrost {
+                    client: Arc::new(handle),
+                }),
+                error: None,
+            },
+            Err(error) => Self {
+                bifrost: None,
+                error: Some(NativeWyrdError::from_wyrd(&WyrdError::from(&error))),
+            },
+        }
+    }
+}
+
 /// Closed result of describing one table: its config or a catalog error.
 #[napi(object, object_from_js = false)]
 pub struct NativeTableConfigResult {
@@ -492,18 +511,7 @@ pub async fn connect_bifrost(
         Ok(client) => Bifrost::connect_with_config(&client, table, QueueConfig::default()).await,
         Err(error) => Err(error),
     };
-    Ok(match connected {
-        Ok(handle) => NativeBifrostConnection {
-            bifrost: Some(NativeBifrost {
-                client: Arc::new(handle),
-            }),
-            error: None,
-        },
-        Err(error) => NativeBifrostConnection {
-            bifrost: None,
-            error: Some(NativeWyrdError::from_wyrd(&WyrdError::from(&error))),
-        },
-    })
+    Ok(NativeBifrostConnection::from_outcome(connected))
 }
 
 #[napi]

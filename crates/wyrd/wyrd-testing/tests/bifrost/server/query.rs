@@ -1135,6 +1135,205 @@ async fn prove_scoped_bearer_over_grpc(
     Ok(())
 }
 
+/// Service B acts for Service A against Bifrost and holds only A's authority.
+///
+/// A holds read on one concrete table; B holds read on that table plus table
+/// write. B, configured as an ordinary shared client, calls `on_behalf_of` with
+/// A's token: the delegated token names A as subject, B as the outer actor, and
+/// the Bifrost audience, and carries only the exact-table read. On the real
+/// Bifrost surface the read succeeds and a table registration is refused before
+/// effect, while B's own token then creates that same table. The invoke policy saw
+/// A-to-B, and both the exchange and the read decision are audited under A
+/// with B as the actor. The same token is refused on a non-Bifrost route.
+///
+/// # Panics
+///
+/// Panics when any contract claim, access decision, or attribution breaks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn service_b_acts_for_service_a_with_only_a_table_authority() {
+    prove_service_b_acts_for_service_a()
+        .await
+        .expect("service B acts for service A with only A's table authority");
+}
+
+/// Drives the A-to-B delegation journey.
+///
+/// # Errors
+///
+/// Returns the first claim that broke.
+async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> {
+    let policy = std::sync::Arc::new(wyrd_auth_check::RecordingPolicyHook::default());
+    let server = WyrdTestServer::builder()
+        .with_policy_hook(policy.clone())
+        .start_bound()
+        .await?;
+    let tenant = server.data_tenant_id();
+    let catalog = server
+        .state()
+        .bifrost_catalog()
+        .ok_or("server composed no Bifrost catalog")?;
+    let spans_uid = catalog
+        .ensure_builtin(
+            tenant,
+            vala_bifrost_redux::tables::builtin_table("traces", "spans")
+                .ok_or("no canonical vala.traces.spans definition")?,
+        )
+        .await?;
+    await_server_ready(server.base_url().ok_or("missing HTTP URL")?).await?;
+
+    let spans_read = Permission {
+        resource: wyrd_runtime::Resource::BifrostQuery,
+        action: wyrd_runtime::Action::Read,
+        scope: wyrd_runtime::PermissionScope::Bifrost(wyrd_runtime::BifrostPermissionScope::Table(
+            wyrd_runtime::BifrostTableScope {
+                catalog: "vala".to_owned(),
+                schema: "traces".to_owned(),
+                table_uid: uuid::Uuid::from_bytes(*spans_uid.as_bytes()),
+            },
+        )),
+    };
+    let write = Permission::bifrost_table_write();
+    server
+        .seed_role("delegation_subject", std::slice::from_ref(&spans_read))
+        .await?;
+    server
+        .seed_role("delegation_actor", &[spans_read.clone(), write.clone()])
+        .await?;
+    let a = server
+        .bootstrap_service_in_tenant(tenant, "delegation-a", &["delegation_subject"])
+        .await?;
+    let b = server
+        .bootstrap_service_in_tenant(tenant, "delegation-b", &["delegation_actor"])
+        .await?;
+    let a_token = server
+        .exchange_api_key(a.api_key().ok_or("A carries no API key")?)
+        .await?;
+    let b_client = client_for(&server, b.api_key().ok_or("B carries no API key")?)?;
+
+    let delegated = b_client
+        .on_behalf_of(
+            secrecy::SecretString::from(a_token),
+            wyrd_spec::auth::TokenAudience::Bifrost,
+        )
+        .await?;
+
+    let bearer = delegated.auth().bearer().await?;
+    let claims = decode_claims(bearer.expose())?;
+    assert_eq!(claims["sub"], a.id().to_string(), "subject is A: {claims}");
+    assert_eq!(
+        claims["act"]["sub"],
+        b.id().to_string(),
+        "outer actor is B: {claims}"
+    );
+    assert!(claims["act"].get("act").is_none(), "one actor: {claims}");
+    assert_eq!(claims["aud"], "bifrost", "Bifrost audience: {claims}");
+    let permissions: PermissionSet = serde_json::from_value(claims["permissions"].clone())?;
+    assert!(
+        permissions.contains(&spans_read),
+        "exact-table read: {claims}"
+    );
+    assert!(!permissions.contains(&write), "no write: {claims}");
+
+    let invoke = policy.last().ok_or("the invoke policy was not asked")?;
+    assert_eq!(invoke.subject.id.to_string(), a.id().to_string());
+    assert_eq!(invoke.actor.id.to_string(), b.id().to_string());
+
+    accepts(&delegated, TRACES_SQL).await?;
+    let register = wyrd_spec::vala::api::RegisterTableRequest {
+        namespace: "vala.datasets".to_owned(),
+        name: "delegation_events".to_owned(),
+        fields: vec![wyrd_spec::vala::api::FieldSpec {
+            name: "value".to_owned(),
+            data_type: wyrd_spec::vala::api::DataTypeSpec::Int64,
+            nullable: true,
+            metadata: std::collections::BTreeMap::new(),
+        }],
+        physical_layout: None,
+    };
+    let refused = delegated
+        .request_json::<_, serde_json::Value>(
+            reqwest::Method::POST,
+            "/v1/bifrost/tables",
+            Some(&register),
+        )
+        .await
+        .err()
+        .ok_or("the delegated token must not register a table")?;
+    assert_eq!(refused.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
+    // The Bifrost-bound token cannot be replayed against a non-Bifrost route.
+    let replayed = delegated
+        .request_json::<(), serde_json::Value>(
+            reqwest::Method::GET,
+            &format!("/v1/principals/{}/credentials", a.id()),
+            None,
+        )
+        .await
+        .err()
+        .ok_or("a Bifrost-audience token must not reach a Wyrd route")?;
+    assert!(
+        replayed.code().starts_with("WYRD_AUTH_401"),
+        "audience mismatch is unauthenticated: {replayed:?}"
+    );
+
+    // B's own token then creates the table, so the refused call left nothing.
+    let own: wyrd_spec::vala::api::RegisterTableResponse = b_client
+        .request_json(reqwest::Method::POST, "/v1/bifrost/tables", Some(&register))
+        .await?;
+    assert_eq!(
+        own.outcome,
+        wyrd_spec::vala::api::RegisterOutcome::Created,
+        "the refused registration had no effect"
+    );
+
+    audit_rows(&server, tenant, READ_DECISION_OPERATION).await?;
+    let mut conn = server.tenant_conn_for(tenant).await?;
+    let attributed: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT operation, resource, detail FROM vala.audit_staging \
+         WHERE principal_id = $1 AND operation IN ('auth.token.exchange', $2) ORDER BY seq",
+    )
+    .bind(uuid::Uuid::parse_str(&a.id().to_string())?)
+    .bind(READ_DECISION_OPERATION)
+    .fetch_all(&mut **conn.transaction())
+    .await?;
+    conn.commit().await?;
+    let b_id = b.id().to_string();
+    let exchange = attributed
+        .iter()
+        .filter(|(operation, ..)| operation == "auth.token.exchange")
+        .map(|(_, resource, detail)| Ok((resource, serde_json::from_str(detail)?)))
+        .collect::<Result<Vec<(&String, serde_json::Value)>, ServerJourneyError>>()?
+        .into_iter()
+        .find(|(_, detail)| detail["actor_principal_id"] == b_id.as_str())
+        .ok_or("the delegated exchange is audited under A with B as actor")?;
+    assert_eq!(exchange.0, "bifrost", "the exchange targets Bifrost");
+    assert_eq!(exchange.1["subject_principal_id"], a.id().to_string());
+    let read = attributed
+        .iter()
+        .find(|(operation, ..)| operation == READ_DECISION_OPERATION)
+        .ok_or("the delegated read is audited under A")?;
+    let read_detail: serde_json::Value = serde_json::from_str(&read.2)?;
+    assert_eq!(
+        read_detail["delegation_chain"][0]["principal_id"], b_id,
+        "the read names B as actor: {read_detail}"
+    );
+
+    server.shutdown().await?;
+    Ok(())
+}
+
+/// Decodes a JWT payload for contract assertions only; never verifies it.
+///
+/// # Errors
+///
+/// Returns a failure when the token has no payload segment or it is not JSON.
+fn decode_claims(jwt: &str) -> Result<serde_json::Value, ServerJourneyError> {
+    use base64::Engine as _;
+    let payload = jwt.split('.').nth(1).ok_or("the JWT has no payload")?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload)?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
 /// Seeds one tenant-local role at `scope` and returns a client bound to it.
 ///
 /// The role exists only here. Neither name is a builtin: the matrix is a
@@ -1161,10 +1360,24 @@ async fn scoped_client(
     let bootstrap = server
         .bootstrap_service_in_tenant(server.data_tenant_id(), role, &[role])
         .await?;
-    let api_key = bootstrap
-        .api_key()
-        .ok_or("the bootstrapped service carries no API key")?
-        .clone();
+    client_for(
+        server,
+        bootstrap
+            .api_key()
+            .ok_or("the bootstrapped service carries no API key")?,
+    )
+}
+
+/// Builds an ordinary shared client authenticating with `api_key` against
+/// `server`'s HTTP and gRPC listeners.
+///
+/// # Errors
+///
+/// Returns a missing-listener or client-construction failure.
+fn client_for(
+    server: &WyrdTestServer,
+    api_key: &secrecy::SecretString,
+) -> Result<wyrd_client::WyrdClient, ServerJourneyError> {
     Ok(wyrd_client::WyrdClient::with_config(
         wyrd_client::config::ClientConfig {
             grpc: wyrd_client::transport::GrpcConfig {
@@ -1176,7 +1389,7 @@ async fn scoped_client(
                 base_url: server.base_url().ok_or("missing HTTP URL")?.to_owned(),
                 ..wyrd_client::transport::HttpConfig::default()
             },
-            credential: Some(api_key),
+            credential: Some(api_key.clone()),
             ..wyrd_client::config::ClientConfig::default()
         },
     )?)

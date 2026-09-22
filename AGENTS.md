@@ -419,6 +419,14 @@ behavior has no cross-boundary state (record the reason).
   lifetime-dependent behavior must be loaded and exercised through the owning
   language runtime.
 
+### Debugging Failures
+
+- Bifrost and the server are fully traced and logged. Before diagnosing any
+  failing test, re-run it with tracing on (`WYRD_LOG`, else `RUST_LOG`, e.g.
+  `WYRD_LOG=info,vala_bifrost_redux=debug`) and read the trace. Do not diagnose
+  from a panic line and source alone. A test binary that installs no subscriber
+  is a harness gap to fix, not a reason to debug blind.
+
 ### Host Load
 
 - Never generate synthetic host load to reproduce a failure: no `stress-ng`,

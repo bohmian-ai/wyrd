@@ -1641,7 +1641,10 @@ mod pg_tests {
         );
         assert_eq!(
             exchange_outcomes(&fixture).await,
-            [("allowed".to_owned(), super::DELEGATION_POLICY_ACTION.to_owned())],
+            [(
+                "allowed".to_owned(),
+                super::DELEGATION_POLICY_ACTION.to_owned()
+            )],
             "one allowance names the evaluated invoke action"
         );
     }

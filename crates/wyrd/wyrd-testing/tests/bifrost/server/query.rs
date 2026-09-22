@@ -1246,8 +1246,7 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
         .await
     {
         Err(wyrd_testing::WyrdTestServerError::Http { status, code, .. })
-            if status.as_u16() == 403
-                && code == "WYRD_AUTHZ_403_POLICY_DENIED" => {}
+            if status.as_u16() == 403 && code == "WYRD_AUTHZ_403_POLICY_DENIED" => {}
         other => {
             return Err(format!(
                 "B-subject/A-actor must be refused by the invoke policy, got {other:?}"
@@ -1448,15 +1447,20 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
     .fetch_all(&mut **conn.transaction())
     .await?;
     conn.commit().await?;
-    let [(denied, denied_principal, denied_detail), (allowed, allowed_principal, allowed_detail)] =
-        writes.as_slice()
+    let [
+        (denied, denied_principal, denied_detail),
+        (allowed, allowed_principal, allowed_detail),
+    ] = writes.as_slice()
     else {
         return Err(format!("one refused and one admitted native write, got {writes:?}").into());
     };
     assert_eq!(denied, "denied");
     assert_eq!(denied_principal.to_string(), a.id().to_string());
-    let denied_detail: serde_json::Value =
-        serde_json::from_str(denied_detail.as_deref().ok_or("the refusal names its actor")?)?;
+    let denied_detail: serde_json::Value = serde_json::from_str(
+        denied_detail
+            .as_deref()
+            .ok_or("the refusal names its actor")?,
+    )?;
     assert_eq!(
         denied_detail["delegation_chain"][0]["principal_id"], b_id,
         "the refused native write names B as actor: {denied_detail}"

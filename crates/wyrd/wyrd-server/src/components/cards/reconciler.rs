@@ -1,6 +1,5 @@
 //! Bounded Card lifecycle reconciliation worker.
 
-use chrono::{Duration as ChronoDuration, Utc};
 use metrics::counter;
 use tokio_util::sync::CancellationToken;
 use wyrd_spec::DataTenantId;
@@ -15,7 +14,7 @@ use crate::state::AppState;
 
 const CLAIM_LIMIT: i64 = 32;
 const LEASE_SECONDS: i64 = 30;
-const LEASE_SAFETY_SECONDS: i64 = 5;
+const LEASE_SAFETY: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Run the supervised Card reconciler until shutdown is requested.
 pub(crate) async fn run(state: AppState, operator: OperatorPool, shutdown: CancellationToken) {
@@ -36,23 +35,28 @@ pub(crate) async fn run(state: AppState, operator: OperatorPool, shutdown: Cance
 /// Run one claim-and-reconcile pass.
 pub(crate) async fn run_once(state: &AppState, operator: &OperatorPool) -> Result<(), WyrdError> {
     for _ in 0..CLAIM_LIMIT {
-        let now = Utc::now();
-        let mut claims = claim_card_reconciliation(
-            operator,
-            now,
-            now + ChronoDuration::seconds(LEASE_SECONDS),
-            1,
-        )
-        .await?;
+        // Sampled before the claim statement so the projected deadline
+        // conservatively absorbs query and return latency.
+        let claim_started = tokio::time::Instant::now();
+        let mut claims = claim_card_reconciliation(operator, LEASE_SECONDS, 1).await?;
         let Some(claim) = claims.pop() else {
             break;
         };
-        process_claim(state, claim).await;
+        process_claim(state, claim, claim_started).await;
     }
     Ok(())
 }
 
-async fn process_claim(state: &AppState, claim: CardReconcileClaim) {
+/// Reconcile one claim, giving up the lease when too little of it remains.
+///
+/// The lease budget is projected from the database-reported remainder onto the
+/// local monotonic clock sampled before the claim; the database deadline is
+/// never compared with the host wall clock.
+async fn process_claim(
+    state: &AppState,
+    claim: CardReconcileClaim,
+    claim_started: tokio::time::Instant,
+) {
     counter!("wyrd_card_reconciliation_attempts_total", "kind" => claim.reconcile_kind.clone())
         .increment(1);
     let Ok(tenant_id) = DataTenantId::try_from(claim.data_tenant_id) else {
@@ -60,16 +64,11 @@ async fn process_claim(state: &AppState, claim: CardReconcileClaim) {
         return;
     };
     let caller = service::reconciliation_caller(tenant_id);
-    if claim.reconcile_lease_expires_at
-        <= Utc::now() + ChronoDuration::seconds(LEASE_SAFETY_SECONDS)
-    {
-        if let Err(error) = service::reschedule_reconciliation_claim(
-            state,
-            &caller,
-            &claim,
-            Utc::now() + ChronoDuration::seconds(1),
-        )
-        .await
+    let lease_deadline =
+        claim_started + std::time::Duration::from_secs_f64(claim.lease_remaining_seconds.max(0.0));
+    if lease_deadline <= tokio::time::Instant::now() + LEASE_SAFETY {
+        if let Err(error) =
+            service::reschedule_reconciliation_claim(state, &caller, &claim, 1).await
         {
             tracing::error!(
                 code = error.code(),
@@ -89,9 +88,15 @@ async fn process_claim(state: &AppState, claim: CardReconcileClaim) {
                 .increment(1);
         }
         Err(error) => {
-            let retry_at = Utc::now() + retry_delay(claim.reconcile_attempts);
-            match service::record_reconciliation_failure(state, &caller, &claim, &error, retry_at)
-                .await
+            let retry_delay_seconds = retry_delay_seconds(claim.reconcile_attempts);
+            match service::record_reconciliation_failure(
+                state,
+                &caller,
+                &claim,
+                &error,
+                retry_delay_seconds,
+            )
+            .await
             {
                 Ok(true) => {
                     counter!("wyrd_card_reconciliation_dead_letters_total", "kind" => claim.reconcile_kind.clone())
@@ -124,23 +129,28 @@ async fn process_claim(state: &AppState, claim: CardReconcileClaim) {
     }
 }
 
-fn retry_delay(attempt: i32) -> ChronoDuration {
+/// Fixed retry backoff, in seconds, for the given completed attempt number.
+///
+/// PostgreSQL turns this delay into the next-attempt deadline, so the schedule
+/// is independent of the reconciler host's wall clock.
+fn retry_delay_seconds(attempt: i32) -> i64 {
     match attempt {
-        1 => ChronoDuration::seconds(1),
-        2 => ChronoDuration::seconds(4),
-        _ if attempt >= MAX_RECONCILE_ATTEMPTS => ChronoDuration::seconds(16),
-        _ => ChronoDuration::seconds(1),
+        2 => 4,
+        _ if attempt >= MAX_RECONCILE_ATTEMPTS => 16,
+        _ => 1,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::retry_delay;
+    use super::retry_delay_seconds;
 
+    /// The retry backoff stays `1s`, `4s`, `16s` after moving to SQL-derived
+    /// deadlines.
     #[test]
     fn retry_schedule_is_fixed_and_bounded() {
-        assert_eq!(retry_delay(1).num_seconds(), 1);
-        assert_eq!(retry_delay(2).num_seconds(), 4);
-        assert_eq!(retry_delay(3).num_seconds(), 16);
+        assert_eq!(retry_delay_seconds(1), 1);
+        assert_eq!(retry_delay_seconds(2), 4);
+        assert_eq!(retry_delay_seconds(3), 16);
     }
 }

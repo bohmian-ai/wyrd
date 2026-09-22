@@ -39,19 +39,33 @@ pub struct CardReconcileClaim {
     pub reconcile_attempts: i32,
     /// Lease owner assigned to this claim batch.
     pub reconcile_lease_owner: Uuid,
-    /// Lease deadline assigned by the claim transaction.
+    /// Lease deadline assigned by the claim transaction, in database time.
     pub reconcile_lease_expires_at: DateTime<Utc>,
+    /// Seconds of lease remaining as measured by the claim statement itself.
+    ///
+    /// Callers project this remainder onto a local monotonic `Instant` instead
+    /// of comparing the database deadline with the host wall clock.
+    pub lease_remaining_seconds: f64,
 }
 
 /// Claim due Card lifecycle work through the audited cross-tenant operator pool.
 ///
+/// Eligibility and the new lease deadline are both derived from the claim
+/// statement's `statement_timestamp()`, so a host clock that leads or lags
+/// PostgreSQL cannot defer or shorten reconciliation. `lease_seconds` is the
+/// requested lease length; the statement returns the remainder it actually
+/// granted.
+///
 /// The single claim statement only stamps the lease and attempt number; its
 /// statement transaction commits before storage IO or retry delays begin.
+///
+/// # Errors
+///
+/// Returns `registry_unavailable` when the claim statement fails.
 // tenant-isolation: cross-tenant OperatorPool
 pub async fn claim_card_reconciliation(
     operator: &OperatorPool,
-    now: DateTime<Utc>,
-    lease_expires_at: DateTime<Utc>,
+    lease_seconds: i64,
     limit: i64,
 ) -> Result<Vec<CardReconcileClaim>, WyrdError> {
     let lease_owner = Uuid::now_v7();
@@ -61,29 +75,30 @@ pub async fn claim_card_reconciliation(
                   FROM wyrd.cards
                  WHERE (
                          (reconcile_status = 'pending'
-                          AND reconcile_next_attempt_at <= $1)
+                          AND reconcile_next_attempt_at <= statement_timestamp())
                       OR (reconcile_status = 'leased'
-                          AND reconcile_lease_expires_at <= $1)
+                          AND reconcile_lease_expires_at <= statement_timestamp())
                        )
                    AND (
-                         reconcile_attempts < $4
-                      OR (reconcile_attempts = $4 AND reconcile_status = 'leased')
+                         reconcile_attempts < $3
+                      OR (reconcile_attempts = $3 AND reconcile_status = 'leased')
                        )
                  ORDER BY reconcile_next_attempt_at NULLS FIRST,
                           reconcile_lease_expires_at NULLS FIRST,
                           updated_at
                  FOR UPDATE SKIP LOCKED
-                 LIMIT $3
+                 LIMIT $2
             )
             UPDATE wyrd.cards card
                SET reconcile_status = 'leased',
                    reconcile_attempts = CASE
-                       WHEN card.reconcile_attempts < $4
+                       WHEN card.reconcile_attempts < $3
                        THEN card.reconcile_attempts + 1
                        ELSE card.reconcile_attempts
                    END,
-                   reconcile_lease_owner = $2,
-                   reconcile_lease_expires_at = $5,
+                   reconcile_lease_owner = $1,
+                   reconcile_lease_expires_at =
+                       statement_timestamp() + ($4 * interval '1 second'),
                    updated_at = now()
               FROM candidates
              WHERE card.card_uid = candidates.card_uid
@@ -94,13 +109,15 @@ pub async fn claim_card_reconciliation(
                    card.reconcile_kind,
                    card.reconcile_attempts,
                    card.reconcile_lease_owner,
-                   card.reconcile_lease_expires_at"#,
+                   card.reconcile_lease_expires_at,
+                   EXTRACT(EPOCH FROM (card.reconcile_lease_expires_at
+                                       - statement_timestamp()))::double precision
+                       AS lease_remaining_seconds"#,
     )
-    .bind(now)
     .bind(lease_owner)
     .bind(limit)
     .bind(MAX_RECONCILE_ATTEMPTS)
-    .bind(lease_expires_at)
+    .bind(lease_seconds as f64)
     .fetch_all(operator.pool())
     .await
     .map_err(|error| {
@@ -122,7 +139,7 @@ pub async fn lock_card_reconciliation_lease(
             WHERE card_uid = $1
               AND reconcile_status = 'leased'
               AND reconcile_lease_owner = $2
-              AND reconcile_lease_expires_at > now()
+              AND reconcile_lease_expires_at > statement_timestamp()
             FOR UPDATE"#,
     )
     .bind(card_uid.as_uuid())
@@ -137,11 +154,19 @@ pub async fn lock_card_reconciliation_lease(
 }
 
 /// Schedule tenant-owned lifecycle work after a client-visible side effect failed.
+///
+/// `retry_delay_seconds` is a delay, not a deadline: PostgreSQL derives the
+/// next attempt from its own `statement_timestamp()` so host clock skew cannot
+/// make freshly scheduled work ineligible.
+///
+/// # Errors
+///
+/// Returns `registry_unavailable` when the update statement fails.
 pub async fn schedule_card_reconciliation(
     conn: &mut TenantConn<'_>,
     card_uid: &CardUid,
     kind: &str,
-    next_attempt_at: DateTime<Utc>,
+    retry_delay_seconds: i64,
     error_code: &str,
     error_message: &str,
 ) -> Result<bool, WyrdError> {
@@ -150,7 +175,8 @@ pub async fn schedule_card_reconciliation(
               SET reconcile_kind = $2,
                   reconcile_status = 'pending',
                   reconcile_attempts = 0,
-                  reconcile_next_attempt_at = $3,
+                  reconcile_next_attempt_at =
+                      statement_timestamp() + ($3 * interval '1 second'),
                   reconcile_lease_owner = NULL,
                   reconcile_lease_expires_at = NULL,
                   reconcile_last_error_code = $4,
@@ -163,7 +189,7 @@ pub async fn schedule_card_reconciliation(
     )
     .bind(card_uid.as_uuid())
     .bind(kind)
-    .bind(next_attempt_at)
+    .bind(retry_delay_seconds as f64)
     .bind(error_code)
     .bind(error_message)
     .execute(&mut **conn.transaction())
@@ -176,11 +202,18 @@ pub async fn schedule_card_reconciliation(
 }
 
 /// Return a claimed row to the retry queue without consuming an attempt.
+///
+/// `retry_delay_seconds` is a delay evaluated against PostgreSQL's own
+/// `statement_timestamp()`.
+///
+/// # Errors
+///
+/// Returns `registry_unavailable` when the update statement fails.
 pub async fn reschedule_card_reconciliation(
     conn: &mut TenantConn<'_>,
     card_uid: &CardUid,
     lease_owner: Uuid,
-    next_attempt_at: DateTime<Utc>,
+    retry_delay_seconds: i64,
     error_code: &str,
     error_message: &str,
 ) -> Result<bool, WyrdError> {
@@ -188,7 +221,8 @@ pub async fn reschedule_card_reconciliation(
         r#"UPDATE wyrd.cards
               SET reconcile_status = 'pending',
                   reconcile_attempts = GREATEST(reconcile_attempts - 1, 0),
-                  reconcile_next_attempt_at = $3,
+                  reconcile_next_attempt_at =
+                      statement_timestamp() + ($3 * interval '1 second'),
                   reconcile_lease_owner = NULL,
                   reconcile_lease_expires_at = NULL,
                   reconcile_last_error_code = $4,
@@ -200,7 +234,7 @@ pub async fn reschedule_card_reconciliation(
     )
     .bind(card_uid.as_uuid())
     .bind(lease_owner)
-    .bind(next_attempt_at)
+    .bind(retry_delay_seconds as f64)
     .bind(error_code)
     .bind(error_message)
     .execute(&mut **conn.transaction())
@@ -235,7 +269,7 @@ pub async fn mark_card_reconciliation_succeeded(
                 WHERE card_uid = $1
                   AND reconcile_status = 'leased'
                   AND reconcile_lease_owner = $2
-                  AND reconcile_lease_expires_at > now()"#,
+                  AND reconcile_lease_expires_at > statement_timestamp()"#,
             )
             .bind(card_uid.as_uuid())
             .bind(lease_owner)
@@ -271,11 +305,18 @@ pub async fn mark_card_reconciliation_succeeded(
 }
 
 /// Record a failed claimed attempt, dead-lettering exactly the third failure.
+///
+/// `retry_delay_seconds` is a delay evaluated against PostgreSQL's own
+/// `statement_timestamp()`.
+///
+/// # Errors
+///
+/// Returns `registry_unavailable` when the update statement fails.
 pub async fn record_card_reconciliation_failure(
     conn: &mut TenantConn<'_>,
     card_uid: &CardUid,
     lease_owner: Uuid,
-    next_attempt_at: DateTime<Utc>,
+    retry_delay_seconds: i64,
     error_code: &str,
     error_message: &str,
 ) -> Result<bool, WyrdError> {
@@ -287,7 +328,7 @@ pub async fn record_card_reconciliation_failure(
                   END,
                   reconcile_next_attempt_at = CASE
                       WHEN reconcile_attempts >= $3 THEN NULL
-                      ELSE $4
+                      ELSE statement_timestamp() + ($4 * interval '1 second')
                   END,
                   reconcile_lease_owner = NULL,
                   reconcile_lease_expires_at = NULL,
@@ -301,13 +342,13 @@ pub async fn record_card_reconciliation_failure(
             WHERE card_uid = $1
               AND reconcile_status = 'leased'
               AND reconcile_lease_owner = $2
-              AND reconcile_lease_expires_at > now()
+              AND reconcile_lease_expires_at > statement_timestamp()
          RETURNING reconcile_status"#,
     )
     .bind(card_uid.as_uuid())
     .bind(lease_owner)
     .bind(MAX_RECONCILE_ATTEMPTS)
-    .bind(next_attempt_at)
+    .bind(retry_delay_seconds as f64)
     .bind(error_code)
     .bind(error_message)
     .fetch_optional(&mut **conn.transaction())
@@ -346,8 +387,12 @@ pub struct CardManifestCompletionRow {
     pub storage_expected_size_bytes: Option<i64>,
     /// Storage backend bound to the upload.
     pub storage_backend: Option<String>,
-    /// Existing storage-session expiration, when an upload row is linked.
-    pub storage_expires_at: Option<DateTime<Utc>>,
+    /// Whether PostgreSQL considers the linked upload session live and resumable.
+    ///
+    /// The verdict combines the upload status with `expires_at >
+    /// statement_timestamp()` inside the owning query, so no caller compares a
+    /// storage deadline with the host clock.
+    pub storage_upload_live: bool,
 }
 
 /// Load all manifest entries and their upload rows for one Card.
@@ -368,7 +413,9 @@ pub async fn manifest_completion_rows(
                   u.expected_sha256 AS storage_expected_sha256,
                   u.expected_size_bytes AS storage_expected_size_bytes,
                   u.backend AS storage_backend,
-                  u.expires_at AS storage_expires_at
+                  COALESCE(u.status IN ('initiating', 'pending')
+                           AND u.expires_at > statement_timestamp(), false)
+                      AS storage_upload_live
              FROM wyrd.card_artifact_manifest m
               LEFT JOIN wyrd.storage_multipart_uploads u
                ON u.id = m.upload_id

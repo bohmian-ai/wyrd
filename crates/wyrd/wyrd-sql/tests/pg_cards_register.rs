@@ -1,6 +1,5 @@
 //! PgFixture coverage for composite card-registration persistence primitives.
 
-use chrono::{Duration, Utc};
 use uuid::Uuid;
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_runtime::PermissionSet;
@@ -13,8 +12,8 @@ use wyrd_spec::registry::{ArtifactManifestEntry, RegistrationOperationId};
 use wyrd_sql::queries::cards::{
     NewCardRow, NewRegistrationOperation, RECONCILE_KIND_REGISTRATION, claim_card_reconciliation,
     insert_artifact_manifest_rows, insert_card_row, insert_registration_operation,
-    persist_outbound_relationships, recheck_active_card_refs, record_card_reconciliation_failure,
-    soft_delete_card_by_ref, soft_delete_card_with_state,
+    manifest_completion_rows, persist_outbound_relationships, recheck_active_card_refs,
+    record_card_reconciliation_failure, soft_delete_card_by_ref, soft_delete_card_with_state,
 };
 use wyrd_sql::row_types::cards::CardStatus;
 
@@ -220,11 +219,41 @@ async fn reconciliation_claims_are_bounded_and_lease_safe() {
     .expect("card inserts");
     conn.commit().await.expect("setup commits");
 
+    // A misleading host-derived reporting timestamp must not be able to defer
+    // eligibility: registration seeds it from PostgreSQL's own clock.
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    let (pending_since_recorded, eligible_now, eligibility_is_independent) =
+        sqlx::query_as::<_, (bool, bool, bool)>(
+            "SELECT pending_since IS NOT NULL, \
+                    reconcile_next_attempt_at <= statement_timestamp(), \
+                    reconcile_next_attempt_at IS DISTINCT FROM pending_since \
+               FROM wyrd.cards WHERE card_uid = $1",
+        )
+        .bind(card_uid.as_uuid())
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("registration seeding is observable");
+    conn.commit().await.expect("seed assertion commits");
+    assert!(
+        pending_since_recorded,
+        "pending_since remains reporting data"
+    );
+    assert!(
+        eligible_now,
+        "a pending Card is immediately eligible in database time"
+    );
+    assert!(
+        eligibility_is_independent,
+        "eligibility must not be seeded from the host-derived pending_since"
+    );
+
     let operator = fixture.operator_pool().clone();
-    let first_now = Utc::now() + Duration::seconds(1);
     let (left, right) = tokio::join!(
-        claim_card_reconciliation(&operator, first_now, first_now + Duration::seconds(30), 32),
-        claim_card_reconciliation(&operator, first_now, first_now + Duration::seconds(30), 32),
+        claim_card_reconciliation(&operator, 30, 32),
+        claim_card_reconciliation(&operator, 30, 32),
     );
     let left = left.expect("left concurrent claim succeeds");
     let right = right.expect("right concurrent claim succeeds");
@@ -237,25 +266,27 @@ async fn reconciliation_claims_are_bounded_and_lease_safe() {
     assert_eq!(first.len(), 1);
     assert_eq!(first[0].reconcile_kind, RECONCILE_KIND_REGISTRATION);
     assert_eq!(first[0].reconcile_attempts, 1);
+    assert!(
+        first[0].lease_remaining_seconds > 0.0 && first[0].lease_remaining_seconds <= 30.0,
+        "the claim statement reports a positive lease remainder: {}",
+        first[0].lease_remaining_seconds
+    );
 
-    let immediate =
-        claim_card_reconciliation(&operator, first_now, first_now + Duration::seconds(30), 32)
-            .await
-            .expect("second claim succeeds");
+    let immediate = claim_card_reconciliation(&operator, 30, 32)
+        .await
+        .expect("second claim succeeds");
     assert!(immediate.is_empty(), "live lease must exclude the Card");
 
-    let crash_recovered = claim_card_reconciliation(
-        &operator,
-        first_now + Duration::seconds(31),
-        first_now + Duration::seconds(61),
-        32,
-    )
-    .await
-    .expect("expired lease is recoverable");
+    expire_lease(&fixture, &card_uid).await;
+    let crash_recovered = claim_card_reconciliation(&operator, 30, 32)
+        .await
+        .expect("expired lease is recoverable");
     assert_eq!(crash_recovered.len(), 1);
     assert_eq!(crash_recovered[0].reconcile_attempts, 2);
     let owner = crash_recovered[0].reconcile_lease_owner;
 
+    // A requested retry delay, not a caller-supplied absolute instant, decides
+    // when the next attempt becomes eligible.
     let mut conn = fixture
         .tenant_conn()
         .await
@@ -264,7 +295,7 @@ async fn reconciliation_claims_are_bounded_and_lease_safe() {
         &mut conn,
         &card_uid,
         owner,
-        first_now + Duration::seconds(35),
+        600,
         "WYRD_STORAGE_500_BACKEND",
         "Card blob persistence failed; retry the storage transition",
     )
@@ -272,15 +303,18 @@ async fn reconciliation_claims_are_bounded_and_lease_safe() {
     .expect("second failure records");
     assert!(!dead);
     conn.commit().await.expect("failure commits");
+    assert!(
+        claim_card_reconciliation(&operator, 30, 32)
+            .await
+            .expect("delayed claim succeeds")
+            .is_empty(),
+        "the requested retry delay must defer the next attempt"
+    );
 
-    let third = claim_card_reconciliation(
-        &operator,
-        first_now + Duration::seconds(36),
-        first_now + Duration::seconds(66),
-        32,
-    )
-    .await
-    .expect("third claim succeeds");
+    make_retry_due(&fixture, &card_uid).await;
+    let third = claim_card_reconciliation(&operator, 30, 32)
+        .await
+        .expect("third claim succeeds");
     assert_eq!(third.len(), 1);
     assert_eq!(third[0].reconcile_attempts, 3);
     let owner = third[0].reconcile_lease_owner;
@@ -293,7 +327,7 @@ async fn reconciliation_claims_are_bounded_and_lease_safe() {
         &mut conn,
         &card_uid,
         owner,
-        first_now + Duration::seconds(100),
+        1,
         "WYRD_STORAGE_500_BACKEND",
         "Card blob persistence failed; retry the storage transition",
     )
@@ -302,17 +336,154 @@ async fn reconciliation_claims_are_bounded_and_lease_safe() {
     assert!(dead);
     conn.commit().await.expect("dead letter commits");
 
-    let fourth = claim_card_reconciliation(
-        &operator,
-        first_now + Duration::seconds(101),
-        first_now + Duration::seconds(131),
-        32,
-    )
-    .await
-    .expect("bounded claim succeeds");
+    let fourth = claim_card_reconciliation(&operator, 30, 32)
+        .await
+        .expect("bounded claim succeeds");
     assert!(
         fourth.is_empty(),
         "dead-lettered Card must not be claimed again"
+    );
+}
+
+/// Age a Card's reconciliation lease in database time so a crashed worker's
+/// claim becomes recoverable without sleeping or trusting the host clock.
+async fn expire_lease(fixture: &PgFixture, card_uid: &CardUid) {
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    sqlx::query(
+        "UPDATE wyrd.cards \
+            SET reconcile_lease_expires_at = statement_timestamp() - interval '1 second' \
+          WHERE card_uid = $1",
+    )
+    .bind(card_uid.as_uuid())
+    .execute(&mut **conn.transaction())
+    .await
+    .expect("lease ages");
+    conn.commit().await.expect("lease aging commits");
+}
+
+/// Bring a deferred retry forward in database time so the next attempt is due.
+async fn make_retry_due(fixture: &PgFixture, card_uid: &CardUid) {
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    sqlx::query(
+        "UPDATE wyrd.cards \
+            SET reconcile_next_attempt_at = statement_timestamp() - interval '1 second' \
+          WHERE card_uid = $1",
+    )
+    .bind(card_uid.as_uuid())
+    .execute(&mut **conn.transaction())
+    .await
+    .expect("retry deadline ages");
+    conn.commit().await.expect("retry aging commits");
+}
+
+/// PostgreSQL, not the Rust host clock, decides whether a manifest's upload
+/// session is still live and resumable.
+#[tokio::test]
+async fn manifest_upload_liveness_is_decided_by_postgres() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let principal_id = PrincipalId::new(Uuid::now_v7());
+    let operation_id = RegistrationOperationId::new(Uuid::now_v7());
+    let card_uid = CardUid::from_uuid(Uuid::now_v7()).expect("UUIDv7 is a valid card UID");
+    let card = prompt_card("manifest-liveness");
+    let upload_id = Uuid::now_v7();
+
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    insert_registration_operation(
+        &mut conn,
+        NewRegistrationOperation {
+            operation_id,
+            principal_id,
+            idempotency_key: "manifest-liveness-001",
+            request_hash: "manifest-liveness-hash",
+        },
+    )
+    .await
+    .expect("operation inserts");
+    insert_card_row(
+        &mut conn,
+        NewCardRow {
+            card: &card,
+            card_uid: card_uid.clone(),
+            principal_id,
+            operation_id,
+            status: CardStatus::Pending,
+            spec_hash: "manifest-liveness-spec",
+            artifact_hash: None,
+        },
+    )
+    .await
+    .expect("card inserts");
+    insert_artifact_manifest_rows(&mut conn, &card_uid, &[artifact()])
+        .await
+        .expect("manifest inserts");
+    sqlx::query(
+        "INSERT INTO wyrd.storage_multipart_uploads \
+             (id, data_tenant_id, card_uid, relative_path, storage_path, backend, \
+              wire_protocol, expected_sha256, expected_size_bytes, part_count_planned, \
+              part_size_bytes, status, expires_at) \
+         VALUES ($1, wyrd.current_tenant(), $2, 'prompt.txt', 'objects/prompt.txt', 'local', \
+                 'local_fs_v1', 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=', \
+                 1, 1, 1, 'pending', \
+                 statement_timestamp() + interval '1 hour')",
+    )
+    .bind(upload_id)
+    .bind(card_uid.as_str())
+    .execute(&mut **conn.transaction())
+    .await
+    .expect("upload row inserts");
+    sqlx::query(
+        "UPDATE wyrd.card_artifact_manifest SET upload_id = $2, upload_status = 'pending' \
+          WHERE card_uid = $1",
+    )
+    .bind(card_uid.as_uuid())
+    .bind(upload_id)
+    .execute(&mut **conn.transaction())
+    .await
+    .expect("manifest links the upload");
+    conn.commit().await.expect("setup commits");
+
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    let live = manifest_completion_rows(&mut conn, &card_uid)
+        .await
+        .expect("manifest projection loads");
+    conn.commit().await.expect("live read commits");
+    assert_eq!(live.len(), 1);
+    assert!(
+        live[0].storage_upload_live,
+        "an unexpired pending upload is live"
+    );
+
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    sqlx::query(
+        "UPDATE wyrd.storage_multipart_uploads \
+            SET expires_at = statement_timestamp() - interval '1 second' WHERE id = $1",
+    )
+    .bind(upload_id)
+    .execute(&mut **conn.transaction())
+    .await
+    .expect("upload session ages");
+    let expired = manifest_completion_rows(&mut conn, &card_uid)
+        .await
+        .expect("manifest projection reloads");
+    conn.commit().await.expect("expired read commits");
+    assert!(
+        !expired[0].storage_upload_live,
+        "an expired upload session is not live"
     );
 }
 

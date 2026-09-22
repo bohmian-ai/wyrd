@@ -247,7 +247,7 @@ pub async fn insert_card_row(
            VALUES ($1, wyrd.current_tenant(), $2, $3, $4, $5, $6, $7, $8,
                    $9, $10, $11, $12, $13, $14,
                    CASE WHEN $11 = 'pending' THEN 'pending' ELSE 'idle' END,
-                   CASE WHEN $11 = 'pending' THEN $14 ELSE NULL END)
+                   CASE WHEN $11 = 'pending' THEN statement_timestamp() ELSE NULL END)
            RETURNING created_at"#,
     )
     .bind(input.card_uid.as_uuid())

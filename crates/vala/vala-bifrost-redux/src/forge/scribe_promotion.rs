@@ -559,7 +559,6 @@ pub(super) struct ForgePromotionSettlement<'a> {
     pub(super) committed_snapshot_id: Option<i64>,
 }
 
-
 /// What a claimed promotion plan still means against durable state.
 ///
 /// A promotion task is planned against the rows one scheduler pass observed.
@@ -754,8 +753,8 @@ impl Forge {
             .await
             .map_err(ForgeError::Sql)?;
         let planned: BTreeSet<Uuid> = plan.file_ids().into_iter().collect();
-        let demand = read_promotion_demand(&mut conn, binding, plan.branch(), Some(&planned))
-            .await?;
+        let demand =
+            read_promotion_demand(&mut conn, binding, plan.branch(), Some(&planned)).await?;
         conn.commit().await.map_err(ForgeError::Sql)?;
         let demand = demand.ok_or_else(|| ForgeError::Reconciliation {
             detail: "prepared Scribe promotion has no durable demand left".to_owned(),

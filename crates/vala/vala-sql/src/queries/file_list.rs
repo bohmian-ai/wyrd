@@ -239,7 +239,13 @@ impl HotFileCatalog {
         Ok(rows
             .into_iter()
             .map(
-                |(id, file_path, committed_snapshot_id, forge_publication_operation_id, compacted)| {
+                |(
+                    id,
+                    file_path,
+                    committed_snapshot_id,
+                    forge_publication_operation_id,
+                    compacted,
+                )| {
                     PlannedHotFileRow {
                         id,
                         file_path,

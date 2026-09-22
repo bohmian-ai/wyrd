@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use base64::Engine;
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
@@ -1488,14 +1488,14 @@ pub(crate) async fn record_reconciliation_failure(
     caller: &Caller,
     claim: &CardReconcileClaim,
     error: &WyrdError,
-    next_attempt_at: DateTime<Utc>,
+    retry_delay_seconds: i64,
 ) -> Result<bool, WyrdError> {
     let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
     let dead_lettered = record_card_reconciliation_failure(
         &mut conn,
         &CardUid::from_uuid(claim.card_uid).map_err(WyrdError::from_card_uid_error)?,
         claim.reconcile_lease_owner,
-        next_attempt_at,
+        retry_delay_seconds,
         error.code(),
         reconciliation_error_message(&claim.reconcile_kind),
     )
@@ -1518,14 +1518,14 @@ pub(crate) async fn reschedule_reconciliation_claim(
     state: &AppState,
     caller: &Caller,
     claim: &CardReconcileClaim,
-    next_attempt_at: DateTime<Utc>,
+    retry_delay_seconds: i64,
 ) -> Result<(), WyrdError> {
     let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
     reschedule_card_reconciliation(
         &mut conn,
         &CardUid::from_uuid(claim.card_uid).map_err(WyrdError::from_card_uid_error)?,
         claim.reconcile_lease_owner,
-        next_attempt_at,
+        retry_delay_seconds,
         "WYRD_REGISTRY_503_RECONCILIATION_LEASE_BUDGET",
         "reconciliation lease budget was exhausted before storage work began",
     )
@@ -1682,7 +1682,7 @@ async fn schedule_client_reconciliation(
         &mut conn,
         card_uid,
         kind,
-        Utc::now() + ChronoDuration::seconds(1),
+        1,
         error.code(),
         reconciliation_error_message(kind),
     )
@@ -1895,16 +1895,6 @@ async fn load_card_reconciliation_state(
     Ok(CardCompletionState { card, manifests })
 }
 
-/// Return whether a manifest has a live, resumable storage session.
-fn manifest_has_live_upload(manifest: &CardManifestCompletionRow) -> bool {
-    matches!(
-        manifest.storage_status.as_deref(),
-        Some("initiating" | "pending")
-    ) && manifest
-        .storage_expires_at
-        .is_some_and(|expires_at| expires_at > Utc::now())
-}
-
 /// Return whether the manifest has reached a storage state completion can use.
 fn manifest_ready_for_completion(manifest: &CardManifestCompletionRow) -> bool {
     manifest.manifest_status == "verified"
@@ -1913,7 +1903,7 @@ fn manifest_ready_for_completion(manifest: &CardManifestCompletionRow) -> bool {
 
 /// Return whether a manifest must be abandoned and cleaned up.
 fn manifest_needs_cleanup(manifest: &CardManifestCompletionRow) -> bool {
-    if manifest_ready_for_completion(manifest) || manifest_has_live_upload(manifest) {
+    if manifest_ready_for_completion(manifest) || manifest.storage_upload_live {
         return false;
     }
     manifest.upload_id.is_some()

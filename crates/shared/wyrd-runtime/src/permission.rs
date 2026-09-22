@@ -925,6 +925,11 @@ mod tests {
         assert!(!permission.covers(&Permission::artifact_write()));
     }
 
+    /// The resource-and-action wildcard covers every concrete grant, including
+    /// Bifrost record writes outside the Card family.
+    ///
+    /// # Panics
+    /// Panics when the wildcard fails to cover any probed permission.
     #[test]
     fn covers_double_wildcard() {
         let permission = Permission::wildcard();
@@ -973,6 +978,11 @@ mod tests {
         assert_eq!(set.iter().next(), Some(&Permission::wildcard()));
     }
 
+    /// Set membership resolves through coverage, so a set holding only the
+    /// wildcard contains every concrete permission.
+    ///
+    /// # Panics
+    /// Panics when the wildcard-only set does not contain a probed permission.
     #[test]
     fn permission_set_contains_resolves_through_wildcard() {
         let set = PermissionSet::from_iter([Permission::wildcard()]);
@@ -1037,6 +1047,10 @@ mod tests {
 
     /// Proves the intersection keeps only authority both sides grant, at the
     /// narrower scope: wildcard, schema, exact-object, and disjoint grants.
+    ///
+    /// # Panics
+    /// Panics when an intersection keeps broader, one-sided, or disjoint
+    /// authority, or drops authority both sides grant.
     #[test]
     fn intersection_keeps_only_the_narrower_shared_authority() {
         let uid = uuid::Uuid::from_u128(0x77);

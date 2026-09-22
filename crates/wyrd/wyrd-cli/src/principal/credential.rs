@@ -243,6 +243,9 @@ mod tests {
 
     /// A credential id is parsed as a UUID at the argument edge, so malformed
     /// or path-shaping text is refused before any request is constructed.
+    ///
+    /// # Panics
+    /// Panics when clap accepts the non-UUID credential id.
     #[test]
     fn a_malformed_credential_id_is_refused_before_dispatch() {
         let parsed = Cli::try_parse_from([

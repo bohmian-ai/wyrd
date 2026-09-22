@@ -424,6 +424,11 @@ mod transport_behavior {
     /// had stopped accepting could revoke nothing while its neighbours renewed
     /// and succeeded. The 204 the route answers with carries no body, which is
     /// what had made the raw path look like the natural fit.
+    ///
+    /// # Panics
+    /// Panics when the revocation fails, the mock is not hit exactly four
+    /// times, or the replay is not the same `DELETE` carrying the renewed
+    /// bearer.
     #[tokio::test]
     async fn revoke_credential_re_exchanges_once_and_replays() {
         let server = spawn_mock(vec![
@@ -470,6 +475,10 @@ mod transport_behavior {
 
     /// A second authentication refusal is terminal: renewal is replayed once,
     /// never in a loop.
+    ///
+    /// # Panics
+    /// Panics when the revocation succeeds or the mock is hit other than
+    /// exactly four times.
     #[tokio::test]
     async fn revoke_credential_stops_after_a_second_refusal() {
         let unauthorized =

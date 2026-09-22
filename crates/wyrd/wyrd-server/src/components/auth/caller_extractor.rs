@@ -160,6 +160,12 @@ mod pg_tests {
         })
     }
 
+    /// Mint a five-minute `wyrd`-audience access token for a fresh User
+    /// principal in `tenant`, signed by the test state's issuing key and
+    /// carrying no permissions.
+    ///
+    /// # Panics
+    /// Panics when the test state has no issuing key or signing fails.
     fn mint_test_user_jwt(state: &crate::state::AppState, tenant: DataTenantId) -> String {
         let principal = TokenPrincipalRef {
             id: PrincipalId::new(uuid::Uuid::now_v7()),

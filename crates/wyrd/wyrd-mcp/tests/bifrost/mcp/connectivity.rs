@@ -182,6 +182,17 @@ mod pg_tests {
     /// handler's recovery of both from the transport's request extensions.
     /// The catalog assertion pins the other half of the contract: the probe is
     /// visible only to a fixture that explicitly opted in.
+    ///
+    /// # Errors
+    /// Returns [`McpJourneyError`] when the server fails to start or shut down,
+    /// service bootstrap, key exchange, or delegation fails, a bootstrap carries
+    /// no API key, the MCP client cannot connect, list tools, call the probe, or
+    /// cancel, or the probe returns no structured content.
+    ///
+    /// # Panics
+    /// Panics when the advertised catalog differs, the probe call reports an
+    /// error, or the verified tenant, subject, roles, delegation chain,
+    /// cancellation flag, or request id differ from the expected context.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires the Postgres-backed Bifrost journey lane"]
     async fn streamable_http_client_reaches_authenticated_server_context()

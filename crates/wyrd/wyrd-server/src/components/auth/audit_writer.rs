@@ -38,6 +38,16 @@ pub struct RealAuthzAuditWriter;
 
 #[async_trait]
 impl AuthzAuditWriter for RealAuthzAuditWriter {
+    /// Append one `authz.check` audit row on `conn`'s transaction.
+    ///
+    /// The row is attributed to the subject being acted for, records
+    /// `Allowed` only for an allow decision (any other decision is `Denied`),
+    /// and carries the actor chain as delegation attribution in its detail.
+    /// It commits or rolls back with the caller's transaction.
+    ///
+    /// # Errors
+    /// Returns the audit-unavailable [`WyrdError`] when the canonical
+    /// `vala.audit_staging` append fails, so the decision fails closed.
     async fn write_authz_check(
         &self,
         conn: &mut TenantConn<'_>,
@@ -130,6 +140,12 @@ mod pg_tests {
             .expect("noop writer succeeds");
     }
 
+    /// Build a delegated authz-check context: `subject` acted for by one
+    /// `actor` in a fresh tenant, requesting `card_write` on the actor's Card.
+    ///
+    /// # Panics
+    /// Panics when the generated request id fails to parse or the context
+    /// refuses the verified token.
     fn context() -> AuthzCheckContext {
         let tenant = DataTenantId::new_v7();
         let actor = principal("actor", tenant);

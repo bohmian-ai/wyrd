@@ -80,6 +80,12 @@ async fn handle_submission() -> StatusCode {
 #[tokio::test]
 /// The CLI attaches the lease the open response handed it to every later call
 /// in the run, so a server that fences on the lease sees one continuous run.
+///
+/// # Panics
+///
+/// Panics when the temp dir, listener, or eval path setup fails, the CLI run
+/// fails, no protocol calls were captured, any call lacks the access-token
+/// JWT, or any post-open call lacks the lease token.
 async fn server_protocol_carries_lease_after_open() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let eval_path = tmp.path().join("eval.json");

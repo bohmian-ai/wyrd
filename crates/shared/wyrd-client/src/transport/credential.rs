@@ -51,6 +51,8 @@ pub enum ResolvedCredential {
 }
 
 impl std::fmt::Debug for ResolvedCredential {
+    /// Format the credential with every secret replaced by `[REDACTED]`;
+    /// only non-secret routing fields (tenant slug, audience) are shown.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::BearerToken(_) => f.debug_tuple("BearerToken").field(&"[REDACTED]").finish(),

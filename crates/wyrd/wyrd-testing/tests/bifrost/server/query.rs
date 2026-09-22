@@ -1169,6 +1169,14 @@ async fn service_b_acts_for_service_a_with_only_a_table_authority() {
 /// # Errors
 ///
 /// Returns the first claim that broke.
+///
+/// # Panics
+///
+/// Panics when the delegated token's claims are wrong (subject, single outer
+/// actor, audience, or permissions), the policy saw other questions, a refused
+/// call returns the wrong code, B's registration is not `Created`, the table
+/// holds other than B's one row, or an exchange, read, or native-write audit
+/// row names the wrong principal, actor, permission, credential, or outcome.
 async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> {
     let policy = std::sync::Arc::new(DirectedInvokePolicy::default());
     let server = WyrdTestServer::builder()

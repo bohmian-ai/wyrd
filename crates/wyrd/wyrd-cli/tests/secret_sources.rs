@@ -17,6 +17,11 @@ use crate::principal_journey::run_cli_with_env;
 const CLIENT_SECRET: &str = "issuer-client-secret-sentinel";
 
 /// Run the CLI off the async runtime with only `sources` in its environment.
+///
+/// # Panics
+///
+/// Panics when the blocking CLI subprocess task panics or is cancelled before
+/// it joins.
 async fn run(arguments: Vec<String>, sources: Vec<(&'static str, String)>) -> Output {
     tokio::task::spawn_blocking(move || {
         let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
@@ -31,6 +36,10 @@ async fn run(arguments: Vec<String>, sources: Vec<(&'static str, String)>) -> Ou
 }
 
 /// Assert a command failed with one stable CLI error code.
+///
+/// # Panics
+///
+/// Panics when the command succeeded or its stderr does not contain `code`.
 fn failed_with(output: &Output, code: &str) {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -91,6 +100,12 @@ fn trusted_issuer_add(server: &MockServer, extra: &[&str]) -> Vec<String> {
 }
 
 /// Assert the one recorded request carried the ambient token and the secret.
+///
+/// # Panics
+///
+/// Panics when the mock did not record exactly one request, the body is not
+/// JSON, the secret, auth mode, or role fields differ, or the
+/// `x-wyrd-access-token` header is missing or not the ambient bearer token.
 async fn assert_issuer_posted(server: &MockServer) {
     let requests = server.received_requests().await.expect("requests recorded");
     assert_eq!(requests.len(), 1, "exactly one POST expected");
@@ -111,6 +126,11 @@ async fn assert_issuer_posted(server: &MockServer) {
 
 /// The issuer client secret is read from the environment, and the tenant
 /// credential from the ambient chain.
+///
+/// # Panics
+///
+/// Panics when the command fails, stdout echoes the client secret, or the
+/// recorded request lacks the environment secret or ambient token.
 #[tokio::test]
 async fn trusted_issuer_add_reads_the_client_secret_from_the_environment() {
     let server = MockServer::start().await;
@@ -135,6 +155,12 @@ async fn trusted_issuer_add_reads_the_client_secret_from_the_environment() {
 }
 
 /// The issuer client secret is read from a file, trailing newline trimmed.
+///
+/// # Panics
+///
+/// Panics when the temporary secret file cannot be created or written, its
+/// path is not UTF-8, the command fails, or the recorded request lacks the
+/// trimmed file secret or ambient token.
 #[tokio::test]
 async fn trusted_issuer_add_reads_the_client_secret_from_a_file() {
     let server = MockServer::start().await;
@@ -159,6 +185,11 @@ async fn trusted_issuer_add_reads_the_client_secret_from_a_file() {
 
 /// A tenant command with no ambient credential fails with the stable code and
 /// sends nothing.
+///
+/// # Panics
+///
+/// Panics when the command does not fail with `WYRD_CLI_401_NO_CREDENTIALS`
+/// or the mock server received any request.
 #[tokio::test]
 async fn a_tenant_command_without_an_ambient_credential_fails_clearly() {
     let server = MockServer::start().await;
@@ -186,6 +217,13 @@ async fn a_tenant_command_without_an_ambient_credential_fails_clearly() {
 }
 
 /// `wyrd auth refresh` rotates the refresh token read from the environment.
+///
+/// # Panics
+///
+/// Panics when the refresh fails, stdout lacks the rotated token, the posted
+/// body does not carry the environment refresh token, or the run without one
+/// does not fail with `WYRD_CLI_401_NO_REFRESH_TOKEN` before sending a
+/// request.
 #[tokio::test]
 async fn refresh_reads_the_refresh_token_from_the_environment() {
     let server = MockServer::start().await;

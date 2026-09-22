@@ -160,6 +160,11 @@ mod tests {
         assert!(json.get("card_ref").is_none());
     }
 
+    /// A token-exchange request serializes the RFC 8693 `grant_type` URN.
+    ///
+    /// # Panics
+    /// Panics when serialization fails or `grant_type` is not the token-exchange
+    /// URN.
     #[test]
     fn token_exchange_uses_rfc_8693_grant_type() {
         let request = exchange_request();
@@ -172,6 +177,12 @@ mod tests {
         );
     }
 
+    /// Every `TokenRequest` variant serializes its `grant_type` discriminator
+    /// and round-trips back to the same variant.
+    ///
+    /// # Panics
+    /// Panics when a variant fails to serialize or deserialize, emits the wrong
+    /// `grant_type`, or does not round-trip to an equal request.
     #[test]
     fn serde_grant_type_discriminator() {
         let api_key_request = TokenRequest::WyrdApiKey {
@@ -398,6 +409,11 @@ mod tests {
     /// The exchange wire carries RFC 8693 subject/actor fields and a closed
     /// audience set; an unsupported audience or a stale `requested_subject`
     /// field is rejected at deserialization.
+    ///
+    /// # Panics
+    /// Panics when the token-type or audience fields serialize wrongly, or an
+    /// unsupported audience, a `requested_subject` field, or a missing
+    /// `actor_token` deserializes successfully.
     #[test]
     fn token_exchange_wire_is_rfc_8693_subject_actor_audience() {
         let json = serde_json::to_value(exchange_request()).expect("serializes");

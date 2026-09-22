@@ -668,6 +668,15 @@ mod pg_tests {
         );
     }
 
+    /// A caller holding `service_accounts:write` mints a key for a Card-bound
+    /// Service principal: the response names the stored credential, and one
+    /// issuance audit row records the issuing actor, target principal, tenant,
+    /// and request id.
+    ///
+    /// # Panics
+    /// Panics when seeding or issuance fails, the response names a different
+    /// Card or credential than the stored row, or the staged issuance audit row
+    /// is missing or records the wrong actor, target, tenant, or request id.
     #[tokio::test]
     async fn issue_key_with_permission_mints_response() {
         let fixture = PgFixture::start().await.expect("fixture starts");

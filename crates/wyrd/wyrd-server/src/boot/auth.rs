@@ -148,6 +148,11 @@ mod tests {
     /// returns must mint a token that the assembled request verifier accepts,
     /// under the same kid, issuer, and audience, with the signed permissions as
     /// the principal's authority.
+    ///
+    /// # Panics
+    /// Panics when the handles fail to assemble, issuance or verification fails,
+    /// the token's kid is not the Wyrd signing kid, or the verified principal is
+    /// not a user holding `card_read`.
     #[tokio::test(flavor = "current_thread")]
     async fn build_auth_handles_mints_tokens_the_request_verifier_accepts() {
         let handles = build_auth_handles(

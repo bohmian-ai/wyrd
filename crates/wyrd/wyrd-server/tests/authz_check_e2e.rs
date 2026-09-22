@@ -69,6 +69,11 @@ async fn service_jwt(srv: &WyrdTestServer, service: &Bootstrap) -> String {
 /// C acting for A through B re-exchanges the delegated subject token, so the
 /// verified chain names B then C (earliest first), C is the current actor, and
 /// A stays the subject the check authorizes.
+///
+/// # Panics
+/// Panics when bootstrap, either exchange, the check call, or shutdown fails,
+/// the check is not `200 OK`, the hook was never called, or the recorded
+/// chain, actor, or subject differs.
 #[tokio::test(flavor = "current_thread")]
 async fn service_c_acts_for_a_through_b_extends_chain_correctly() {
     if !e2e_enabled() {
@@ -125,6 +130,11 @@ async fn service_c_acts_for_a_through_b_extends_chain_correctly() {
 
 /// One exchange yields subject A and actor B; the check hook sees exactly
 /// that pair.
+///
+/// # Panics
+/// Panics when bootstrap, the exchange, the check call, or shutdown fails,
+/// the check is not `200 OK`, the response snapshot differs, or the hook did
+/// not record a one-step chain with actor B and subject A.
 #[tokio::test(flavor = "current_thread")]
 async fn single_hop_allow_records_subject_and_actor() {
     if !e2e_enabled() {
@@ -197,6 +207,11 @@ async fn non_delegated_token_rejected_before_hook() {
 
 /// A denying invoke policy refuses the exchange itself, with the policy's
 /// reason, so no delegated token ever exists to present to the check.
+///
+/// # Panics
+/// Panics when bootstrap or shutdown fails, the exchange succeeds or fails
+/// with a non-HTTP error, or the refusal is not `403`
+/// `WYRD_AUTHZ_403_POLICY_DENIED` carrying reason `policy_x`.
 #[tokio::test(flavor = "current_thread")]
 async fn deny_decision_refuses_the_exchange_with_reason() {
     if !e2e_enabled() {

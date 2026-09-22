@@ -71,6 +71,14 @@ mod pg_tests {
     ///
     /// Returns server startup, bootstrap, credential-issuance, MCP transport,
     /// or tool-call failures.
+    ///
+    /// # Panics
+    /// Panics when the catalog offers the write tool to the reader or withholds
+    /// either tool from the administrator, an advertised input or output schema
+    /// differs or accepts a malformed id, the reader's revocation is not
+    /// refused for permission, an unknown-principal listing is not a not-found
+    /// refusal with exactly one recorded decision, or the administrator's
+    /// listing, revocation, or read-back contradicts its advertised shape.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires the Postgres-backed Bifrost journey lane"]
     async fn a_write_tool_is_scoped_at_dispatch_not_merely_hidden() -> Result<(), McpJourneyError> {

@@ -390,6 +390,13 @@ mod tests {
         assert!(parsed.is_err(), "must require --principal-kind");
     }
 
+    /// `add` accepts the optional `--client-secret-file` path and
+    /// `--jwks-ttl-secs` override and carries both into its parsed arguments.
+    ///
+    /// # Panics
+    ///
+    /// Panics when parsing fails, the command is not `Add`, or the parsed secret
+    /// file path or JWKS TTL differ from the supplied values.
     #[test]
     fn add_accepts_optional_client_secret_file_and_ttl() {
         let parsed = Cli::try_parse_from([
@@ -427,12 +434,23 @@ mod tests {
         }
     }
 
+    /// `list` parses with only its required `--server` argument.
+    ///
+    /// # Panics
+    ///
+    /// Panics when clap rejects the `list` invocation.
     #[test]
     fn list_parses_required_args() {
         let parsed = Cli::try_parse_from(["wyrd", "list", "--server", "https://acme.wyrd.cloud"]);
         assert!(parsed.is_ok(), "parse failed: {parsed:?}");
     }
 
+    /// `list` without `--server` is rejected at parse time when the
+    /// `WYRD_SERVER_URL` fallback is unset.
+    ///
+    /// # Panics
+    ///
+    /// Panics when clap accepts `list` without a server.
     #[test]
     fn list_requires_server() {
         let parsed = Cli::try_parse_from(["wyrd", "list"]);
@@ -470,6 +488,12 @@ mod tests {
         }
     }
 
+    /// `rm` without `--issuer` is rejected at parse time, so a removal always
+    /// names the issuer it deletes.
+    ///
+    /// # Panics
+    ///
+    /// Panics when clap accepts `rm` without an issuer.
     #[test]
     fn rm_requires_issuer() {
         let parsed = Cli::try_parse_from(["wyrd", "rm", "--server", "https://acme.wyrd.cloud"]);
@@ -490,6 +514,11 @@ mod tests {
 
     /// The client secret is never an argument: an inline value is refused
     /// without being echoed back.
+    ///
+    /// # Panics
+    ///
+    /// Panics when clap accepts `--client-secret` or its error message echoes
+    /// the secret value.
     #[test]
     fn add_refuses_an_inline_client_secret() {
         let secret = "issuer-client-secret-sentinel";
@@ -573,6 +602,11 @@ mod tests {
     }
 
     /// A secret file is read with its trailing newline trimmed.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the temporary secret file cannot be written, resolution fails,
+    /// or the resolved secret is not the trimmed file contents.
     #[test]
     fn resolve_client_secret_reads_a_file() {
         use super::resolve_client_secret;

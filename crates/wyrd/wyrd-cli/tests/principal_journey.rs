@@ -33,6 +33,10 @@ pub(crate) fn run_cli_with_credential(
 /// Every `WYRD_*` secret source is cleared first, so a journey proves the
 /// command works from the sources it was given and cannot pass by picking up a
 /// developer's ambient login.
+///
+/// # Panics
+/// Panics when the `wyrd` binary cannot be built or located, or the process
+/// fails to spawn.
 pub(crate) fn run_cli_with_env(arguments: &[&str], sources: &[(&str, &str)]) -> Output {
     let mut command = Command::cargo_bin("wyrd").expect("wyrd binary builds");
     command

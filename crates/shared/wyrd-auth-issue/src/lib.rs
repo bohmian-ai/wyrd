@@ -470,6 +470,15 @@ mod tests {
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
     const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n";
 
+    /// A direct (undelegated) user grant mints a token whose `sub`, principal,
+    /// roles, permission snapshot, default `wyrd` audience, issuer, and ULID-shaped
+    /// `jti` all come from the grant, with no Card binding, credential id, or
+    /// `act` chain.
+    ///
+    /// # Panics
+    ///
+    /// Panics when issuance or verification fails or any verified claim differs
+    /// from the grant.
     #[test]
     fn issue_access_token_uses_principal_roles_permissions_audience_and_jti_shape() {
         let token = issuing_key()
@@ -729,6 +738,12 @@ mod tests {
 
     /// A delegated grant keeps the subject as `sub` and principal, names the
     /// actor in the outermost `act`, and carries the requested audience.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the delegated token fails to issue or verify, the `act` chain
+    /// is missing, or the subject, audience, or actor claims differ from the
+    /// grant.
     #[test]
     fn issue_access_token_delegated_names_subject_and_outer_actor() {
         let actor = agent_principal();
@@ -757,6 +772,13 @@ mod tests {
         assert_eq!(act.act, None);
     }
 
+    /// An `act` chain one hop deeper than [`MAX_DELEGATION_DEPTH`] is refused
+    /// before signing.
+    ///
+    /// # Panics
+    ///
+    /// Panics when issuance does not fail with
+    /// [`IssueError::DelegationDepthExceeded`] naming the maximum.
     #[test]
     fn issue_access_token_delegated_rejects_depth_over_max() {
         let result = issuing_key().issue_access_token(
@@ -775,6 +797,12 @@ mod tests {
         ));
     }
 
+    /// An `act` chain exactly [`MAX_DELEGATION_DEPTH`] hops deep is the
+    /// inclusive boundary and still issues.
+    ///
+    /// # Panics
+    ///
+    /// Panics when issuance of the at-limit chain fails.
     #[test]
     fn issue_access_token_delegated_accepts_depth_at_max() {
         let result = issuing_key().issue_access_token(

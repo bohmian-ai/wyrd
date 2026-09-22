@@ -314,6 +314,13 @@ mod tests {
         }
     }
 
+    /// `list` parses with only `--server` and leaves the issuer and subject
+    /// filters unset, so an unfiltered listing is the default.
+    ///
+    /// # Panics
+    ///
+    /// Panics when parsing fails, the command is not `List`, or either filter is
+    /// set.
     #[test]
     fn list_parses_with_no_filters() {
         let parsed = Cli::try_parse_from(["wyrd", "list", "--server", "https://acme.wyrd.cloud"]);
@@ -346,6 +353,12 @@ mod tests {
         }
     }
 
+    /// `list` without `--server` is rejected at parse time when the
+    /// `WYRD_SERVER_URL` fallback is unset.
+    ///
+    /// # Panics
+    ///
+    /// Panics when clap accepts `list` without a server.
     #[test]
     fn list_requires_server() {
         let parsed = Cli::try_parse_from(["wyrd", "list"]);

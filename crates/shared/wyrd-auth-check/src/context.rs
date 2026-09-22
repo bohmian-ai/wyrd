@@ -177,6 +177,10 @@ mod tests {
 
     /// The subject stays the context's principal and the last actor is the
     /// current actor, with the chain earliest first.
+    ///
+    /// # Panics
+    /// Panics when the delegated token is refused or the context's subject,
+    /// current actor, or chain order differs.
     #[test]
     fn delegated_token_builds_subject_and_current_actor_context() {
         let earlier = principal(service_kind("earlier-actor"));
@@ -199,6 +203,10 @@ mod tests {
     }
 
     /// A direct token has no actor and is refused.
+    ///
+    /// # Panics
+    /// Panics when the context is not refused with
+    /// `RequiresDelegationChain`.
     #[test]
     fn direct_token_is_rejected_with_delegation_chain_error() {
         let verified = verified(principal(service_kind("subject")), Vec::new());
@@ -210,6 +218,10 @@ mod tests {
     }
 
     /// A human actor is refused; only a Service or Agent may act.
+    ///
+    /// # Panics
+    /// Panics when the context is not refused with
+    /// `RequiresServiceOrAgentKind`.
     #[test]
     fn user_actor_is_rejected_with_kind_error() {
         let verified = verified(
@@ -224,6 +236,9 @@ mod tests {
     }
 
     /// A human subject is served by an Agent actor.
+    ///
+    /// # Panics
+    /// Panics when the Agent actor is refused.
     #[test]
     fn agent_actor_for_user_subject_is_accepted() {
         let verified = verified(

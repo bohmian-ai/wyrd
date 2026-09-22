@@ -62,6 +62,11 @@ async fn authz_direct_service_jwt_returns_403_chain_empty() {
 
 /// The full production path: two bootstrapped services, two API-key exchanges,
 /// a real RFC 8693 exchange in which the actor works for the subject, and an allow decision carrying a request id.
+///
+/// # Panics
+/// Panics when server start, bootstrap, key exchange, or delegation fails, or
+/// the route does not return `200` with a `wyrd-request-id` header and an
+/// `allow` decision body.
 #[tokio::test]
 async fn authz_delegated_token_allows() {
     let server = WyrdTestServer::start_in_process()

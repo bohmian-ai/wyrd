@@ -119,6 +119,11 @@ mod tests {
         );
     }
 
+    /// A principal holding only the wildcard permission is allowed any
+    /// concrete permission, proving RBAC resolves through wildcard grants.
+    ///
+    /// # Panics
+    /// Panics when `card_write` or `bifrost_record_write` is not allowed.
     #[test]
     fn rbac_resolves_through_wildcard() {
         let principal = principal_with_permissions([Permission::wildcard()]);

@@ -67,6 +67,9 @@ mod tests {
     use super::{GuardOutcome, GuardReason, guard_reason};
 
     /// A direct token has no actor.
+    ///
+    /// # Panics
+    /// Panics when a missing actor is not rejected as `ChainEmpty`.
     #[test]
     fn direct_token_reports_chain_empty() {
         assert_eq!(
@@ -76,6 +79,9 @@ mod tests {
     }
 
     /// A human actor is not eligible.
+    ///
+    /// # Panics
+    /// Panics when a `User` actor is not rejected as `KindNotEligible`.
     #[test]
     fn user_actor_is_not_eligible() {
         assert_eq!(
@@ -85,6 +91,10 @@ mod tests {
     }
 
     /// A Card-free Service actor has no Card to evaluate policy against.
+    ///
+    /// # Panics
+    /// Panics when a Card-free Service actor is not rejected as
+    /// `CardRefMissing`.
     #[test]
     fn card_free_service_actor_reports_card_ref_missing() {
         let kind = PrincipalKind::Service {
@@ -98,6 +108,9 @@ mod tests {
     }
 
     /// Card-bound Service and Agent actors are allowed.
+    ///
+    /// # Panics
+    /// Panics when either Card-bound actor kind is not allowed.
     #[test]
     fn card_bound_service_and_agent_actors_are_allowed() {
         for card_kind in [CardKind::Service, CardKind::Agent] {
@@ -134,6 +147,9 @@ mod tests {
     }
 
     /// Build a static Card reference of `kind`.
+    ///
+    /// # Panics
+    /// Panics when a static name, version, or space literal fails validation.
     fn card_ref(kind: CardKind) -> CardRef {
         CardRef {
             kind,

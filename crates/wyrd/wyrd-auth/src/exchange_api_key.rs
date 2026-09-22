@@ -154,6 +154,9 @@ impl DelegateError {
 }
 
 impl From<IssuanceError> for DelegateError {
+    /// Lift a shared-issuance failure into the exchange error, reporting an
+    /// inactive principal as [`DelegateError::ActorNotFound`] because the
+    /// exchange only issues for the actor.
     fn from(error: IssuanceError) -> Self {
         match error {
             IssuanceError::PrincipalInactive => Self::ActorNotFound,
@@ -556,6 +559,8 @@ pub fn api_key_invalid() -> WyrdError {
 }
 
 impl From<DelegateError> for WyrdError {
+    /// Map an exchange failure to its public catalog error at the HTTP, MCP,
+    /// and SDK boundary so each refusal carries a stable code.
     fn from(error: DelegateError) -> Self {
         match error {
             DelegateError::InvalidSubjectToken(error) | DelegateError::InvalidActorToken(error) => {
@@ -630,11 +635,15 @@ mod pg_tests {
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
     const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n";
 
+    /// The default static Service Card reference, named `test-service`.
     fn test_service_card_ref() -> CardRef {
         named_service_card_ref("test-service")
     }
 
     /// A static Service Card reference named `name`.
+    ///
+    /// # Panics
+    /// Panics when `name` is not a valid Card name.
     fn named_service_card_ref(name: &str) -> CardRef {
         CardRef {
             kind: CardKind::Service,
@@ -668,6 +677,9 @@ mod pg_tests {
 
     /// Build an exchange service whose verifier trusts the test signing key and
     /// whose invoke policy is `policy`.
+    ///
+    /// # Panics
+    /// Panics when the static test public key or key id fails to load.
     fn delegate_service(policy: Arc<dyn PolicyHook>) -> DelegateToken {
         let public_key = public_key_from_pem(PUBLIC_KEY_PEM).expect("test public key loads");
         let mut decoding_keys = HashMap::new();
@@ -685,6 +697,9 @@ mod pg_tests {
 
     /// Mint a direct `wyrd`-audience token for `principal` carrying
     /// `permissions`, attributed to `credential_id`, with an optional `act`.
+    ///
+    /// # Panics
+    /// Panics when the test issuing key cannot sign the token.
     fn mint(
         principal: TokenPrincipalRef,
         permissions: PermissionSet,
@@ -934,6 +949,9 @@ mod pg_tests {
     /// A direct grant evaluates no dynamic permission, so only rows whose
     /// permission is the operation itself are counted; a direct row carrying
     /// any other permission leaves the count at zero.
+    ///
+    /// # Panics
+    /// Panics when the staging query fails.
     async fn staged_exchange(
         conn: &mut TenantConn<'_>,
         tenant: DataTenantId,
@@ -1475,6 +1493,10 @@ mod pg_tests {
 
     /// Seed a Card-bound Service actor holding `permissions` through one role
     /// and return its id.
+    ///
+    /// # Panics
+    /// Panics when the tenant connection, role seed, role grant, or commit
+    /// fails.
     async fn seed_actor(fixture: &PgFixture, permissions: serde_json::Value) -> Uuid {
         let tenant = fixture.data_tenant_id();
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
@@ -1509,6 +1531,12 @@ mod pg_tests {
     }
 
     /// Exchange `subject` and `actor` tokens for a Bifrost token under `policy`.
+    ///
+    /// # Errors
+    /// Returns the [`DelegateError`] the exchange refuses with, unchanged.
+    ///
+    /// # Panics
+    /// Panics when the tenant connection cannot be opened.
     async fn exchange(
         fixture: &PgFixture,
         policy: Arc<dyn PolicyHook>,
@@ -1573,6 +1601,11 @@ mod pg_tests {
 
     /// A policy-denied actor is refused and the denial commits under the
     /// subject, naming the actor as the current actor and its credential.
+    ///
+    /// # Panics
+    /// Panics when the exchange is not policy-denied with the hook's reason, or
+    /// when anything other than one denied decision naming the subject, the
+    /// actor's credential, and a one-step actor chain commits.
     #[tokio::test]
     async fn a_policy_denied_exchange_commits_one_denied_decision() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -1622,6 +1655,11 @@ mod pg_tests {
 
     /// An allowed exchange whose actor no longer exists keeps its allowance
     /// with no effect.
+    ///
+    /// # Panics
+    /// Panics when the exchange does not fail with
+    /// [`DelegateError::ActorNotFound`] or anything other than one allowed
+    /// invoke decision commits.
     #[tokio::test]
     async fn an_allowed_exchange_for_a_missing_actor_commits_one_allowed_decision() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -1651,6 +1689,10 @@ mod pg_tests {
 
     /// Unverifiable, cross-tenant, or malformed identity input is refused
     /// before the policy decides and records nothing.
+    ///
+    /// # Panics
+    /// Panics when a case is not refused with its expected early error, the
+    /// policy is consulted, or any decision commits.
     #[tokio::test]
     async fn invalid_or_malformed_identity_input_records_no_decision() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -1717,6 +1759,12 @@ mod pg_tests {
     /// authority both parties hold at the narrower scope, is Bifrost-only,
     /// asks the policy the directed A-to-B question, commits one allowed
     /// decision naming both parties, and issues no refresh token.
+    ///
+    /// # Panics
+    /// Panics when the exchange fails, the token verifies on the general Wyrd
+    /// audience, the principal, chain, or narrowed permissions differ, a
+    /// refresh token is issued, the policy question differs, or the single
+    /// committed decision does not name both parties.
     #[tokio::test]
     async fn an_exchange_names_subject_and_actor_and_carries_only_the_intersection() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -1827,6 +1875,10 @@ mod pg_tests {
 
     /// An audit store that refuses the append fails the exchange closed: no
     /// token and no committed decision.
+    ///
+    /// # Panics
+    /// Panics when the append privilege cannot be revoked or restored, the
+    /// exchange is not refused as audit-unavailable, or any decision commits.
     #[tokio::test]
     async fn a_refused_exchange_audit_issues_no_token() {
         let fixture = PgFixture::start().await.expect("fixture starts");

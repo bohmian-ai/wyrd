@@ -262,6 +262,10 @@ mod tests {
     }
 
     /// Proves exactly one SQL source is required.
+    ///
+    /// # Panics
+    /// Panics when the parser accepts a query with no SQL source or with both
+    /// `--sql` and `--file`.
     #[test]
     fn query_parser_rejects_missing_or_duplicate_sql_source() {
         assert!(TestCli::try_parse_from(["wyrd", "query", "--server", "x"]).is_err());
@@ -281,6 +285,10 @@ mod tests {
     }
 
     /// Pins the operator-facing defaults.
+    ///
+    /// # Panics
+    /// Panics when valid arguments fail to parse or a default visibility,
+    /// freshness, or output format differs.
     #[test]
     fn query_parser_uses_safe_defaults() {
         let cli = TestCli::try_parse_from(["wyrd", "query", "--server", "x", "--sql", "SELECT 1"])

@@ -58,6 +58,17 @@ impl From<AuthenticatedPrincipal> for Principal {
 impl FromRequestParts<AppState> for AuthenticatedPrincipal {
     type Rejection = WyrdErrorResponse;
 
+    /// Resolve the caller's verified principal for a handler.
+    ///
+    /// Reuses the principal `require_authenticated` already verified and
+    /// inserted into the request extensions; otherwise runs the shared
+    /// Wyrd-audience verify pipeline against the request headers, so off-nest
+    /// routes authenticate identically to `/v1`.
+    ///
+    /// # Errors
+    /// Returns `401` when the access-token header is missing or verification
+    /// fails, `400` when the token is malformed, and `503` when no token
+    /// verifier is configured.
     async fn from_request_parts(
         parts: &mut Parts,
         state: &AppState,
@@ -238,6 +249,11 @@ mod pg_tests {
         })
     }
 
+    /// Mint a direct (non-delegated) Wyrd-audience access token for a fresh
+    /// User principal in `tenant`, expiring after `ttl`.
+    ///
+    /// # Panics
+    /// Panics when `state` has no issuing key or the token fails to mint.
     fn mint_test_user_jwt(
         state: &crate::state::AppState,
         tenant: DataTenantId,
@@ -271,6 +287,9 @@ mod pg_tests {
 
     /// Mint an access token whose outer `act` names `initiator` as the sole
     /// actor working for `subject`, the token's principal.
+    ///
+    /// # Panics
+    /// Panics when `state` has no issuing key or the token fails to mint.
     fn mint_delegated_user_jwt(
         state: &crate::state::AppState,
         tenant: DataTenantId,

@@ -136,6 +136,12 @@ mod test_helpers {
         }
     }
 
+    /// Build a delegated authz-check context with a Card-bound Service actor
+    /// acting for a Service subject, the shape every hook test evaluates.
+    ///
+    /// # Panics
+    /// Panics when the generated request id fails to parse or the verified
+    /// token is not accepted as a delegated context.
     fn context() -> AuthzCheckContext {
         let actor = principal("actor");
         let subject = principal("subject");

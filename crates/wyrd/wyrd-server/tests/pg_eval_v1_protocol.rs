@@ -64,6 +64,10 @@ fn mint_jwt(state: &AppState, tenant: DataTenantId, roles: &[&str]) -> String {
 
 /// Mint an access token for `roles` carrying exactly `permissions`, for a
 /// custom role whose grants the case seeds itself.
+///
+/// # Panics
+/// Panics when a role name is not a valid [`RoleRef`], the server state has
+/// no issuing key, or issuance fails.
 fn mint_jwt_with_permissions(
     state: &AppState,
     tenant: DataTenantId,

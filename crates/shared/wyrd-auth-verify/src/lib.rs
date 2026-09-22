@@ -1085,6 +1085,12 @@ mod tests {
     /// The outermost `act` is the current actor and earlier actors nest inside
     /// it; verification keeps the subject as the principal and flattens the
     /// actors earliest first, current actor last.
+    ///
+    /// # Panics
+    ///
+    /// Panics when claim conversion fails, the verified principal is not the
+    /// subject or lacks its permission, or the delegation chain is not the two
+    /// actors in earliest-first order.
     #[test]
     fn into_verified_keeps_subject_and_orders_actors_earliest_first() {
         let earlier_actor = service_ref("earlier-actor");
@@ -1417,6 +1423,11 @@ mod tests {
     /// A Bifrost-audience token verifies only on the Bifrost surface, while a
     /// `wyrd` token verifies on both, so a delegated Bifrost token cannot be
     /// replayed against a general Wyrd surface.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the Bifrost token verifies on the `wyrd` surface, or either
+    /// token fails to verify on the Bifrost surface.
     #[test]
     fn bifrost_audience_is_accepted_only_on_the_bifrost_surface() {
         let bifrost = SecretString::from(encode_eddsa_with_kid(&AccessTokenClaims {
@@ -1511,6 +1522,11 @@ mod tests {
         validation
     }
 
+    /// Build valid `wyrd`-audience user access-token claims for this tenant with
+    /// the given `exp` and `iat` (Unix seconds).
+    ///
+    /// Tests override single fields with struct-update syntax to present exactly
+    /// the defect under test; everything else stays verifiable.
     fn claims_with_times(exp: usize, iat: usize) -> AccessTokenClaims {
         AccessTokenClaims {
             sub: principal_id().to_string(),

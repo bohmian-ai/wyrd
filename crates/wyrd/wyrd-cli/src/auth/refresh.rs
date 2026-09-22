@@ -67,6 +67,9 @@ mod tests {
     }
 
     /// The server is the only argument refresh needs.
+    ///
+    /// # Panics
+    /// Panics when `--server` alone fails to parse.
     #[test]
     fn refresh_requires_only_the_server() {
         let parsed = Cli::try_parse_from(["wyrd", "--server", "https://acme.wyrd.cloud"]);
@@ -74,6 +77,10 @@ mod tests {
     }
 
     /// The refresh token is never an argument, and a refused one is not echoed.
+    ///
+    /// # Panics
+    /// Panics when `--refresh-token` parses, or the parse error echoes the
+    /// secret value.
     #[test]
     fn refresh_refuses_a_refresh_token_argument() {
         let secret = "refresh-token-sentinel";

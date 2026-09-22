@@ -37,6 +37,12 @@ fn issued_key(stdout: &str) -> String {
 /// exchanging the plaintext the first command printed. That is what makes this a
 /// credential handoff rather than two independent calls — if the key were not
 /// reused, or were not accepted, `wyrd list` would exit non-zero.
+///
+/// # Panics
+/// Panics when bootstrap fails, `auth issue-key` exits non-zero or prints no
+/// non-empty key or UUID `key_id`, the `wyrd list` call times out or exits
+/// non-zero with the issued key, or the subject's own token no longer reaches
+/// `200` on `/v1`.
 #[tokio::test]
 async fn auth_issue_key_cli_journey() {
     if std::env::var("WYRD_CLI_E2E").as_deref() != Ok("1") {

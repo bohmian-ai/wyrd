@@ -909,6 +909,10 @@ mod pg_tests {
 
     /// A suspended principal is refused by every tenant grant, and the one
     /// refusal is the same owner's decision on every path.
+    ///
+    /// # Panics
+    /// Panics when the fixture, connection, seeding, or suspension fails, or any
+    /// grant does not fail with [`IssuanceError::PrincipalInactive`].
     #[tokio::test]
     async fn a_suspended_principal_is_refused_by_every_grant() {
         let fixture = PgFixture::start().await.expect("fixture starts");

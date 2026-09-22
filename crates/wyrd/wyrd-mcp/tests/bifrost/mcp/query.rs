@@ -51,6 +51,12 @@ mod pg_tests {
     /// # Errors
     ///
     /// Returns fixture, delegation, transport, or shutdown failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the two-hop delegate or the nondelegated caller gets a tool
+    /// error, or the under-privileged delegate is not refused with
+    /// `WYRD_PERMISSION_403_DENIED_RBAC` and no rows.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires the Postgres-backed Bifrost journey lane"]
     async fn delegated_agent_query_is_authorized_as_the_subject() -> Result<(), McpJourneyError> {

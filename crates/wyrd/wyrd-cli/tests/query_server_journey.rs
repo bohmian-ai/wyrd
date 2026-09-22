@@ -66,6 +66,11 @@ fn assert_cli_problem(problem: &Value, expected: &WyrdError) {
 ///
 /// This journey requires the serialized Postgres-backed CLI lane; the default
 /// Wyrd test lane intentionally remains database-free.
+///
+/// # Panics
+/// Panics when the server, fixture, or shutdown fails, the CLI exits
+/// non-zero, stdout rows are not UTF-8 JSON equal to the seeded rows, or the
+/// final stderr line is not a complete two-row success terminal.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the serialized Postgres-backed CLI journey lane"]
 async fn query_command_reads_seeded_table() {
@@ -117,6 +122,12 @@ async fn query_command_reads_seeded_table() {
 }
 
 /// The compiled CLI preserves a denied query's originating problem and does no Oracle work.
+///
+/// # Panics
+/// Panics when setup fails, the typed client does not see the expected `403`
+/// RBAC denial or `400` invalid-SQL error, the CLI succeeds or emits no
+/// structured problem matching the typed error, or either refusal changes the
+/// Bifrost read-decision count.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the serialized Postgres-backed CLI journey lane"]
 async fn query_command_denial_preserves_problem_without_read_decision() {

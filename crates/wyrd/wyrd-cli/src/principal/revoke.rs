@@ -24,6 +24,11 @@ impl From<PrincipalKindCli> for PrincipalKindTag {
     }
 }
 
+/// Operator arguments for `wyrd principal revoke`, which suspends one principal
+/// through the server so every issuance path refuses its next token.
+///
+/// The target is named by id and kind together because principal ids are
+/// unique only within a kind; the reason is recorded in the audit decision.
 #[derive(Debug, Args)]
 pub struct RevokeArgs {
     /// Principal ID (UUID) to revoke.

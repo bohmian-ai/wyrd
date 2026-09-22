@@ -386,6 +386,12 @@ async fn workload_token_wrong_aud_absent_keycloak() {
 ///   3. `POST /auth/token {jwt-bearer}` exchanges the assertion for a Wyrd
 ///      Service token.
 ///   4. The Service token delegates and reaches a real `/v1/authz/check` `200`.
+///
+/// # Panics
+/// Panics when the Keycloak token has no `sub`, the server fails to boot or
+/// seed the bound principal, the jwt-bearer exchange is not `200`, the grant
+/// omits `access_token` or issues a refresh token, or the delegated authz
+/// check does not return `200`.
 #[tokio::test]
 async fn workload_jwt_bearer_journey_keycloak() {
     if !e2e_enabled() {
@@ -500,6 +506,11 @@ async fn workload_jwt_bearer_unbound_subject_returns_404_keycloak() {
 
 /// Mint a short-lived access token, reach a real `/v1/authz/check` `200`, sleep
 /// past `exp`, then assert the same token is rejected `401` on `/v1`.
+///
+/// # Panics
+/// Panics when the server, service bootstrap, or key exchange fails, when the
+/// fresh token does not reach `200`, or when the expired token is not rejected
+/// with `401`.
 #[tokio::test]
 async fn ttl_expiry_journey() {
     if !e2e_enabled() {
@@ -557,6 +568,11 @@ async fn ttl_expiry_journey() {
 /// admin, and show revocation governs issuance: the principal's durable key can
 /// no longer exchange, while the token it already holds keeps its immutable
 /// authority until its short expiry.
+///
+/// # Panics
+/// Panics when bootstrap or key exchange fails, the revoke `POST` does not
+/// succeed, the revoked key can still exchange, or the pre-revocation token
+/// stops reaching `200` before its expiry.
 #[tokio::test]
 async fn revocation_journey() {
     if !e2e_enabled() {
@@ -691,6 +707,11 @@ async fn revocation_requires_admin_permission() {
 ///      (commit 01) accepts a non-user issuer (pre-migration this would 500).
 ///   5. Issued key → `POST /auth/token` → access token.
 ///   6. `assert_v1_authz_check_ok` → `/v1/authz/check 200`.
+///
+/// # Panics
+/// Panics when bootstrap or either key exchange fails, `/auth/issue-key` does
+/// not return `200` with a non-nil `key_id`, or the issued key's token does not
+/// reach `/v1/authz/check` `200`.
 #[tokio::test]
 async fn service_account_issuer_full_chain() {
     if !e2e_enabled() {
@@ -940,6 +961,15 @@ fn principal_id_of(access_token: &str) -> String {
 ///   3. `OidcIssuerFixture::human_login` authenticates alice → code + state,
 ///   4. `GET /auth/callback` → Wyrd access token,
 ///   5. the human token reaches a real `/v1/authz/check` `200` via delegation.
+///
+/// It then rotates the refresh token, proves the successor still authorizes,
+/// and proves a replay of the consumed token is refused and kills the successor.
+///
+/// # Panics
+/// Panics when the login flow fails, the session lacks an access or refresh
+/// token, rotation does not return `200` with both tokens, either access token
+/// fails to reach `200`, the replay is not `401 WYRD_AUTH_401_REFRESH_REUSED`,
+/// or the successor can still rotate after the replay.
 #[tokio::test]
 async fn human_oidc_login_journey() {
     if !e2e_enabled() {
@@ -1056,6 +1086,12 @@ async fn post_refresh(srv: &WyrdTestServer, refresh_token: &str) -> (StatusCode,
 /// and then show the session cannot continue — the refresh token cannot rotate,
 /// so no successor exists — while the access token already issued keeps its
 /// snapshot authority only until its five-minute expiry.
+///
+/// # Panics
+/// Panics when login yields no access or refresh token, admin bootstrap or
+/// exchange fails, the revoke `POST` does not succeed, the issued access token
+/// stops reaching `200` inside its window, or the refresh rotation is not `401`
+/// or returns any successor token.
 #[tokio::test]
 async fn revoking_a_human_kills_the_session_refresh_authority() {
     if !e2e_enabled() {
@@ -1151,6 +1187,13 @@ async fn revoking_a_human_kills_the_session_refresh_authority() {
 ///
 /// The membership is restored before the journey returns, because the realm is
 /// shared with every other Keycloak journey in this target.
+///
+/// # Panics
+/// Panics when the server or actor bootstrap fails, a login yields no access
+/// token, the granted session stops reaching `200` after an unchanged
+/// re-login, delegation from the reduced session fails, or the reduced
+/// session's delegated `card_write` check is not `Deny`. A panic skips the
+/// membership restore and leaves the shared realm altered.
 #[tokio::test]
 async fn a_withdrawn_oidc_group_invalidates_the_roles_it_granted() {
     if !e2e_enabled() {
@@ -1246,6 +1289,13 @@ async fn a_withdrawn_oidc_group_invalidates_the_roles_it_granted() {
 /// record here is authored post-boot through the CLI the operator runs, proving
 /// the `PgIssuerResolver`/`PgWorkloadBindingResolver` serve runtime-authored
 /// rows immediately.
+///
+/// # Panics
+/// Panics when the bound server, admin bootstrap, principal seeding, or either
+/// CLI verb fails, the stored client secret is missing, empty, or equal to the
+/// plaintext, the jwt-bearer exchange is not `200`, the exchanged token does not
+/// reach `200`, the client middleware lifecycle assertions fail, or shutdown
+/// fails.
 #[tokio::test]
 async fn federated_cloud_journey_cli_authored_keycloak() {
     if !e2e_enabled() {
@@ -1445,6 +1495,12 @@ async fn assert_client_workload_lifecycle(srv: &WyrdTestServer, assertion: &str)
 ///   5. the same Keycloak assertion resolves at tenant A's slug → 200, and at
 ///      tenant B's slug fails closed with `WYRD_AUTH_404_PRINCIPAL_NOT_FOUND`
 ///      (issuer trusted, binding absent).
+///
+/// # Panics
+/// Panics when tenant B, either admin, or the tenant-A principal fails to
+/// provision, a CLI verb fails, the binding is not visible under A or is
+/// visible under B, tenant A's exchange is not `200`, or tenant B's exchange
+/// does not fail closed with `WYRD_AUTH_404_PRINCIPAL_NOT_FOUND`.
 #[tokio::test]
 async fn same_issuer_two_tenant_isolation_keycloak() {
     if !e2e_enabled() {

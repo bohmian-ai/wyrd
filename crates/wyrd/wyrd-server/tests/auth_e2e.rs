@@ -11,6 +11,12 @@ fn e2e_enabled() -> bool {
     env::var("WYRD_AUTH_E2E").is_ok()
 }
 
+/// Build a `POST /v1/authz/check` request asking whether `action` is allowed
+/// on `target`'s own Card, the terminal probe every journey here sends.
+///
+/// # Panics
+/// Panics when `target` carries no Card reference or the body fails to
+/// serialize or build into a request.
 fn authz_check_request(target: &Bootstrap, action: &str) -> Request<Body> {
     let body = json!({
         "target": target.card_ref().expect("machine target carries a card_ref"),
@@ -101,6 +107,9 @@ fn assert_deny(decision: &Value) {
 
 /// Bootstrap a subject that holds the `writer` authority an actor may use on
 /// its behalf, so the actor's own grants decide each delegated verdict.
+///
+/// # Panics
+/// Panics when the service bootstrap fails.
 async fn neutral_initiator(srv: &WyrdTestServer, label: &str) -> Bootstrap {
     srv.bootstrap_service(label, &["writer"])
         .await
@@ -192,6 +201,14 @@ async fn journey_role_grant_flips_verdict() {
     srv.shutdown().await.expect("shutdown");
 }
 
+/// Service B acts for Service A through token exchange, and the delegated
+/// token both authorizes on `/v1/authz/check` and carries the RFC 8693 shape:
+/// `sub` names A and a single-hop `act` names B.
+///
+/// # Panics
+/// Panics when the server, bootstraps, or exchange fail, the check is not an
+/// `allow` `200`, or the token's `sub`/`act` claims do not name A and a
+/// single-hop B.
 #[tokio::test(flavor = "current_thread")]
 async fn journey_delegated_call_via_token_exchange() {
     if !e2e_enabled() {
@@ -235,6 +252,13 @@ async fn journey_delegated_call_via_token_exchange() {
     srv.shutdown().await.expect("shutdown");
 }
 
+/// Revoking the actor's `writer` role flips a later delegation's verdict: the
+/// first delegated check allows, and a re-delegation after the revoke denies,
+/// proving the actor's grants are read at exchange time.
+///
+/// # Panics
+/// Panics when the server, bootstraps, exchanges, or revoke fail, either check
+/// is not `200`, or the verdicts are not allow then `missing_permission` deny.
 #[tokio::test(flavor = "current_thread")]
 async fn journey_delegation_then_revoke_underlying_role() {
     if !e2e_enabled() {
@@ -339,6 +363,10 @@ async fn journey_cross_principal_kind_isolation_via_independent_bootstrap() {
 
 /// Delegation never amplifies: an actor holding `writer` that acts for a
 /// subject holding nothing receives a delegated token that cannot write cards.
+///
+/// # Panics
+/// Panics when the server, bootstraps, or delegation fail, or the delegated
+/// `card_write` check is not a `missing_permission` deny.
 #[tokio::test(flavor = "current_thread")]
 async fn journey_delegation_cannot_amplify_the_subject() {
     if !e2e_enabled() {

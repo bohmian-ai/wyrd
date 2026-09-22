@@ -28,6 +28,10 @@ pub enum EvalCommand {
 }
 
 /// Flags for `wyrd eval run`.
+///
+/// Exactly one evaluation source is required: `--server` drives a remote
+/// protocol router, while `--records` scores pre-collected observations
+/// offline (optionally attributed via `--subject`). The two sources conflict.
 #[derive(Debug, Args)]
 #[command(group(
     clap::ArgGroup::new("source")

@@ -153,6 +153,9 @@ mod tests {
     /// No shipped command accepts a secret through argv or a clap `env`
     /// fallback, so none can reach shell history, the process table, or the
     /// derived `Debug` of parsed arguments.
+    ///
+    /// # Panics
+    /// Panics when any command in the tree declares a secret-valued argument.
     #[test]
     fn no_shipped_command_takes_a_secret_argument() {
         let mut found = Vec::new();
@@ -162,6 +165,10 @@ mod tests {
 
     /// Every former secret spelling is refused by the real root parser, and
     /// the refusal never echoes the value supplied.
+    ///
+    /// # Panics
+    /// Panics when a former secret option parses, is refused as anything other
+    /// than an unknown argument, or its refusal message contains the secret.
     #[test]
     fn the_root_parser_refuses_every_former_secret_option_without_echo() {
         let secret = "wyrd-cli-sentinel-secret";

@@ -26,6 +26,20 @@ use crate::state::AppState;
 /// The delegated token's subject carries the attenuated authority the required
 /// permission is checked against; its current actor must be a Card-bound
 /// Service or Agent, and the policy sees the full actor chain.
+///
+/// The policy hook runs first; only its `Allow` falls through to the RBAC
+/// check on the subject. Outside the stub writer, the resulting decision is
+/// audited and committed in a tenant transaction before the response is sent,
+/// so a failed audit returns an error and no decision.
+///
+/// # Errors
+/// Returns `401`/`400` when the access token is missing, malformed, invalid,
+/// or expired; `503` when no verifier is configured or the audit database is
+/// unavailable; `403 WYRD_AUTHZ_403_REQUIRES_DELEGATED_TOKEN` when the token has
+/// no eligible Card-bound actor; `400` when the body is invalid, a check header
+/// is not UTF-8, or the action is unknown; `500` when the check context cannot
+/// be assembled or the audit write fails; and `403 WYRD_AUTHZ_403_POLICY_DENIED`
+/// when policy denies for any reason other than a missing permission.
 #[tracing::instrument(skip(state, headers, body), fields(request_id = %request_id))]
 #[utoipa::path(
     post,

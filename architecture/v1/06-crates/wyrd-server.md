@@ -11,4 +11,3 @@ Auth modules added for the security foundation:
   inserts principal-generic refresh-token rows, and supports delegated token
   issuance through the verifier and RBAC permission check.
 - `auth::seed` and `auth::roles`: seed and protect builtin RBAC roles.
-

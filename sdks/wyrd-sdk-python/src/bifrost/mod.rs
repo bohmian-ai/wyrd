@@ -262,21 +262,38 @@ pub struct Bifrost {
 impl Bifrost {
     /// Connects one client, optionally already bound to a write target.
     ///
+    /// Without `client`, the transport resolves from the explicit options and
+    /// then the environment chain exactly as before. With `client`, the
+    /// supplied Rust `WyrdClient` — plain or delegated — is used as is, so no
+    /// second credential is resolved; it cannot be combined with
+    /// `server_url`, `credential`, or `grpc_url`.
+    ///
     /// # Errors
     ///
-    /// Raises `WyrdError` carrying `WYRD_CLIENT_401_NO_CREDENTIALS` when
+    /// Raises `WyrdError` carrying `WYRD_SPEC_400_VALIDATION` when `client` is
+    /// combined with a transport option, `WYRD_CLIENT_401_NO_CREDENTIALS` when
     /// nothing in the chain resolves a credential, and the catalog code for a
     /// failure to dial the ingest channel.
     #[new]
-    #[pyo3(signature = (table=None, server_url=None, credential=None, grpc_url=None))]
+    #[pyo3(signature = (table=None, server_url=None, credential=None, grpc_url=None, client=None))]
     fn __new__(
         py: Python<'_>,
         table: Option<PyTableConfig>,
         server_url: Option<&str>,
         credential: Option<&str>,
         grpc_url: Option<&str>,
+        client: Option<PyRef<'_, crate::client::PyWyrdClient>>,
     ) -> WyrdPyResult<Self> {
-        let client = client_from_options(server_url, credential, grpc_url).map_err(client_error)?;
+        let client = match client {
+            Some(_) if server_url.is_some() || credential.is_some() || grpc_url.is_some() => {
+                return Err(invalid_argument(
+                    "client",
+                    "cannot be combined with server_url, credential, or grpc_url",
+                ));
+            }
+            Some(client) => client.inner().clone(),
+            None => client_from_options(server_url, credential, grpc_url).map_err(client_error)?,
+        };
         let table = table.map(|table| table.inner);
         let handle = py
             .detach(|| {

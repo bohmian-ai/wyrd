@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import urllib.request
 import uuid
 from typing import TYPE_CHECKING
 
+import pyarrow
 import pytest
 from pydantic import BaseModel, ValidationError
 from wyrd import WyrdError
@@ -16,6 +18,7 @@ from wyrd.bifrost import (
     Bifrost,
     TableConfig,
 )
+from wyrd.client import WyrdClient
 from wyrd.observe import record
 
 if TYPE_CHECKING:
@@ -953,3 +956,87 @@ def test_standard_otel_metrics_export_to_bifrost(wyrd_server: WyrdTestServer) ->
     counts = rows.column("bucket_counts").to_pylist()[duration]
     assert len(counts) == len(bounds) + 1
     assert sum(counts) == 1
+
+
+# ---------------------------------------------------------------------------
+# Delegated client
+# ---------------------------------------------------------------------------
+
+
+def _access_token(server: WyrdTestServer, api_key: str) -> str:
+    """Exchange `api_key` for an access token through the public token route.
+
+    Service A's inbound bearer token is what a real Service B receives; the
+    public `/auth/token` route is how Service A obtained it.
+    """
+
+    request = urllib.request.Request(
+        f"{server.base_url}/auth/token",
+        data=json.dumps({"grant_type": "wyrd_api_key", "api_key": api_key}).encode(),
+        headers={"content-type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request) as response:
+        return json.load(response)["access_token"]
+
+
+def _fixture_batch(id_: int, value: str) -> pyarrow.RecordBatch:
+    """One row shaped like the Oracle fixture table's user columns."""
+
+    return pyarrow.record_batch(
+        [pyarrow.array([id_], pyarrow.int64()), pyarrow.array([value], pyarrow.string())],
+        schema=pyarrow.schema(
+            [
+                pyarrow.field("id", pyarrow.int64(), nullable=False),
+                pyarrow.field("value", pyarrow.string(), nullable=False),
+            ]
+        ),
+    )
+
+
+@pytest.mark.integration
+def test_delegated_client_reads_as_a_and_cannot_write_with_b_authority(
+    wyrd_server: WyrdTestServer,
+) -> None:
+    """Service B acts for Service A through one explicit delegated client.
+
+    A may only read; B may read and write. The delegated Bifrost carries the
+    intersection, so its read succeeds and its write is refused before effect,
+    while B's own client still writes the same table.
+    """
+
+    table_fqn, token = wyrd_server.prepare_oracle_query_fixture()
+    suffix = uuid.uuid4().hex[:8]
+    a_key = wyrd_server.scoped_api_key(f"py_deleg_a_{suffix}", ["bifrost_query:read"])
+    b_key = wyrd_server.scoped_api_key(
+        f"py_deleg_b_{suffix}",
+        ["bifrost_query:read", "bifrost_record:write", "bifrost_table:read"],
+    )
+
+    service_b = WyrdClient(server_url=wyrd_server.base_url, credential=b_key)
+    delegated = service_b.on_behalf_of(_access_token(wyrd_server, a_key), audience="bifrost")
+    bifrost_as_a = Bifrost(client=delegated)
+
+    ids = bifrost_as_a.sql(f"SELECT id FROM {table_fqn} WHERE id < 3 ORDER BY id")
+    assert ids.to_arrow().column("id").to_pylist() == [1, 2]
+    with pytest.raises(WyrdError) as denied:
+        bifrost_as_a.write_batch(table_fqn, _fixture_batch(41, "as-a"))
+    assert denied.value.status == 403
+
+    bifrost_as_b = Bifrost(client=service_b)
+    bifrost_as_b.write_batch(table_fqn, _fixture_batch(42, "as-b"))
+    wyrd_server.flush_bifrost()
+
+    assert _read(wyrd_server, token, f"SELECT id, value FROM {table_fqn} WHERE id > 40") == [
+        (42, "as-b")
+    ]
+
+
+@pytest.mark.integration
+def test_client_cannot_be_combined_with_transport_options(wyrd_server: WyrdTestServer) -> None:
+    """An explicit client and a second credential source is a validation error."""
+
+    service = WyrdClient(server_url=wyrd_server.base_url, credential=wyrd_server.api_key)
+    with pytest.raises(WyrdError) as captured:
+        Bifrost(client=service, credential=wyrd_server.api_key)
+    assert captured.value.code == "WYRD_SPEC_400_VALIDATION"

@@ -23,6 +23,14 @@ pub struct PyWyrdClient {
     inner: WyrdClient,
 }
 
+impl PyWyrdClient {
+    /// Borrow the wrapped Rust client so another boundary type, such as the
+    /// Bifrost facade, can compose it without re-resolving a credential.
+    pub(crate) const fn inner(&self) -> &WyrdClient {
+        &self.inner
+    }
+}
+
 #[pymethods]
 impl PyWyrdClient {
     /// Build a client from optionally overridden transport values.

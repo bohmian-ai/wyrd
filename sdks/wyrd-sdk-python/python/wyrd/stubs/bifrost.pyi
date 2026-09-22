@@ -3,6 +3,8 @@ from typing import Any, Protocol, TypedDict, TypeVar, overload
 
 import pyarrow
 
+from ..client import WyrdClient
+
 class DataTypeSpecVariants(TypedDict, total=False):
     """The parameterized `DataTypeSpec` forms, tagged by their variant name.
 
@@ -224,8 +226,13 @@ class _BifrostBase:
         server_url: str | None = None,
         credential: str | None = None,
         grpc_url: str | None = None,
+        client: WyrdClient | None = None,
     ) -> None:
-        """Connect one client; every argument resolves from the chain if omitted."""
+        """Connect one client; every argument resolves from the chain if omitted.
+
+        ``client`` reuses an existing, possibly delegated, ``WyrdClient`` and
+        cannot be combined with ``server_url``, ``credential``, or ``grpc_url``.
+        """
         ...
     def use_table(self, table: TableConfig) -> TableConfig | None:
         """Bind ``table`` as the write target, returning the previous binding."""

@@ -10,6 +10,7 @@ from typing import Any, Protocol, TypedDict, TypeVar, cast, overload
 import pyarrow
 
 from .. import _wyrd as _native
+from ..client import WyrdClient
 
 _Row = TypeVar("_Row", bound="RowModel")
 
@@ -398,6 +399,7 @@ class _BifrostBase:
         server_url: str | None = None,
         credential: str | None = None,
         grpc_url: str | None = None,
+        client: WyrdClient | None = None,
     ) -> None:
         """Connect one client, optionally already bound to a write target.
 
@@ -412,10 +414,15 @@ class _BifrostBase:
                 ``[default].api_key`` if omitted.
             grpc_url: the ingest endpoint. Resolved from ``WYRD_GRPC_URL`` if
                 omitted.
+            client: an existing ``WyrdClient``, such as one returned by
+                ``on_behalf_of``. Bifrost then uses its authentication and
+                transport; it cannot be combined with ``server_url``,
+                ``credential``, or ``grpc_url``.
 
         Raises:
-            WyrdError: ``WYRD_CLIENT_401_NO_CREDENTIALS`` when the credential
-                chain yielded nothing.
+            WyrdError: ``WYRD_SPEC_400_VALIDATION`` when ``client`` is combined
+                with a transport argument; ``WYRD_CLIENT_401_NO_CREDENTIALS``
+                when the credential chain yielded nothing.
 
         """
 
@@ -424,6 +431,7 @@ class _BifrostBase:
             server_url,
             credential,
             grpc_url,
+            client,
         )
 
     def use_table(self, table: TableConfig) -> TableConfig | None:

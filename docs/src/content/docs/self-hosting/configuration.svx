@@ -28,7 +28,7 @@ Field names and variable names refer to the same settings. Other pages name the 
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `APP_ENV` | `development` | `development`, `staging`, or `production`. The hardened profile requires a signing key, a real policy hook and audit writer, gRPC reflection off, and preview auth off. |
+| `APP_ENV` | `development` | `development`, `staging`, or `production`. The hardened profile requires a signing key, a real policy hook and audit writer, and gRPC reflection off. |
 
 <Aside title="The hardened profile needs more than env vars">
 
@@ -66,7 +66,6 @@ Signing and sealing keys are read from the environment only, never from the TOML
 | `WYRD_SEALING_KEY_FILE` | none | Path to a file holding a base64 32-byte AES-256-GCM key. Required only if a seeded issuer carries a client secret. |
 | `WYRD_SEALING_KEY_BASE64` | none | Inline base64 alternative, used only if `WYRD_SEALING_KEY_FILE` is unset. |
 | `WYRD_SERVER_TENANT_SLUG` | none | Implicit tenant slug for this deployment. Required if any trusted issuer or workload binding is configured. |
-| `WYRD_AUTH_ALLOW_PREVIEW` | `false` | Allow preview-gated routes. Must be `false` in production. |
 
 ### The implicit tenant
 
@@ -176,7 +175,7 @@ Boot rejects a configuration that breaks any of these:
 
 - HTTP and gRPC must bind different addresses, and the metrics bind must not collide with either.
 - Pool, limit, readiness, and shutdown values must fall in the ranges above.
-- A production profile requires a signing key, a real policy hook and audit writer, gRPC reflection off, and preview auth off.
+- A production profile requires a signing key, a real policy hook and audit writer, and gRPC reflection off.
 - Any trusted issuer or workload binding requires `WYRD_SERVER_TENANT_SLUG`.
 - `WYRD_OTLP_ENDPOINT`, if set, must be a valid URL with an `http`, `https`, or `grpc` scheme.
 

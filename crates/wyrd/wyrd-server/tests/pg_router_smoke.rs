@@ -536,6 +536,99 @@ async fn production_profile_refuses_a_serving_target_with_stub_defaults() {
         ),
         "the stub policy hook is the first production guard to refuse; got {refusal:?}"
     );
+
+    let without_audit = state.with_authz(wyrd_server::components::auth::ServerAuthz {
+        policy_hook: Arc::new(wyrd_auth_check::RecordingPolicyHook::default()),
+        ..wyrd_server::components::auth::ServerAuthz::default()
+    });
+    assert!(
+        matches!(
+            without_audit.production_validate(),
+            Err(wyrd_server::state::ProductionValidationError::NoopAuditWriter)
+        ),
+        "a real policy hook alone must still be refused for its no-op audit writer"
+    );
+
+    let mut without_verifier = without_audit.clone();
+    without_verifier.authz.audit_writer =
+        Arc::new(wyrd_server::components::auth::audit_writer::RealAuthzAuditWriter);
+    without_verifier.auth.token_verifier = None;
+    assert!(
+        matches!(
+            without_verifier.production_validate(),
+            Err(wyrd_server::state::ProductionValidationError::MissingTokenVerifier)
+        ),
+        "a production target without a token verifier must still be refused"
+    );
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// A production-valid serving target performs standard RFC 8693 delegation
+/// with no preview setting anywhere in its configuration.
+///
+/// The harness composes the same signing key, concrete verifier, and
+/// `TenantTokenIssuer` a production boot does; the test installs a non-stub
+/// policy hook and the canonical audit writer, proves that exact state passes
+/// `production_validate` under the production profile, and then exchanges a
+/// subject and actor token through the real `/auth/token` route. Nothing gates
+/// the grant beyond its verifier, invoke policy, and audit.
+///
+/// # Panics
+///
+/// Panics when the production-profile state is refused, a fixture cannot be
+/// bootstrapped, or the exchange does not issue a token after asking the
+/// invoke policy.
+#[tokio::test]
+async fn production_valid_target_serves_token_exchange_without_preview() {
+    let policy = Arc::new(wyrd_auth_check::RecordingPolicyHook::default());
+    let server = WyrdTestServer::builder()
+        .with_policy_hook(policy.clone())
+        .with_audit_writer(Arc::new(
+            wyrd_server::components::auth::audit_writer::RealAuthzAuditWriter,
+        ))
+        .start_in_process()
+        .await
+        .expect("test server starts");
+    server
+        .state()
+        .clone()
+        .with_deployment_profile(wyrd_server::config::DeploymentProfile::Production)
+        .production_validate()
+        .expect("real verifier, policy, audit, and signing key are production-valid");
+
+    let subject = server
+        .bootstrap_service("production-subject", &["writer"])
+        .await
+        .expect("subject bootstraps");
+    let actor = server
+        .bootstrap_service("production-actor", &["writer"])
+        .await
+        .expect("actor bootstraps");
+    let subject_jwt = server
+        .exchange_api_key(subject.api_key().expect("subject carries a key"))
+        .await
+        .expect("subject key exchanges");
+    let actor_jwt = server
+        .exchange_api_key(actor.api_key().expect("actor carries a key"))
+        .await
+        .expect("actor key exchanges");
+
+    server
+        .delegate(
+            &subject_jwt,
+            &actor_jwt,
+            wyrd_spec::auth::TokenAudience::Wyrd,
+        )
+        .await
+        .expect("a production-valid target serves standard token exchange");
+    assert_eq!(
+        policy.calls().len(),
+        1,
+        "the exchange asked the invoke policy exactly once"
+    );
+
+    server.shutdown().await.expect("server shuts down");
 }
 
 /// Polls the Oracle readiness input until it reports `expected`.

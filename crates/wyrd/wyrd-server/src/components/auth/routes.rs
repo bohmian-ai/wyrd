@@ -1,4 +1,5 @@
-//! HTTP routes for auth preview surfaces.
+//! HTTP routes for the tenant auth surfaces: token exchange, OIDC callback,
+//! and Card-bound API key issuance.
 
 use axum::Json;
 use axum::extract::{Extension, Query, State};
@@ -180,9 +181,6 @@ async fn token(
             actor_token_type: _,
             audience,
         } => {
-            if !state.auth.allow_preview {
-                return Err(WyrdErrorResponse::from(preview_disabled()));
-            }
             let issuer = state.auth.tenant_issuer().ok_or_else(auth_not_configured)?;
             let verifier = state
                 .auth
@@ -433,13 +431,6 @@ fn sql_error(error: wyrd_sql::SqlError) -> WyrdErrorResponse {
         message: "auth backend unavailable".to_owned(),
         details: serde_json::json!({}),
     })
-}
-
-fn preview_disabled() -> WyrdError {
-    WyrdError::AuthPreviewDisabled {
-        message: "preview auth routes are disabled".to_owned(),
-        details: serde_json::json!({}),
-    }
 }
 
 fn tenant_from_unverified_access_token(

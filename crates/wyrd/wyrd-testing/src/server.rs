@@ -459,7 +459,6 @@ enum Mode {
 pub struct WyrdTestServerBuilder {
     policy_hook: Option<Arc<dyn PolicyHook>>,
     audit_writer: Option<Arc<dyn AuthzAuditWriter>>,
-    allow_preview_auth: bool,
     storage_settings: Option<StorageSettings>,
     storage_handle: Option<Arc<wyrd_storage::StorageHandle>>,
     access_ttl: Option<ChronoDuration>,
@@ -568,7 +567,6 @@ impl Default for WyrdTestServerBuilder {
         Self {
             policy_hook: None,
             audit_writer: None,
-            allow_preview_auth: true,
             storage_settings: None,
             storage_handle: None,
             access_ttl: None,
@@ -3342,13 +3340,6 @@ impl WyrdTestServerBuilder {
         self
     }
 
-    /// Override the preview-auth gate.
-    #[must_use]
-    pub fn with_preview_auth(mut self, allow: bool) -> Self {
-        self.allow_preview_auth = allow;
-        self
-    }
-
     /// Override the storage backend used by the test server.
     ///
     /// By default the server uses a local filesystem backend backed by a
@@ -4124,7 +4115,6 @@ impl WyrdTestServerBuilder {
             .with_query_stream_fault(query_stream_fault.clone())
             .with_query_control_audit_fault(query_control_audit_fault.clone())
             .with_auth(wyrd_server::components::auth::ServerAuth {
-                allow_preview: self.allow_preview_auth,
                 issuing_key: Some(Arc::clone(&issuing_key)),
                 token_verifier: (!self.omit_token_verifier).then(|| Arc::clone(&verifier)),
                 external_verifier: Some(external_verifier),

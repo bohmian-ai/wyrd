@@ -109,7 +109,7 @@ pub enum DeploymentProfile {
     /// Local development defaults. Relaxed gates, reflection enabled.
     #[default]
     Development,
-    /// Production hardened defaults. Reflection disabled, preview gates off.
+    /// Production hardened defaults. Reflection disabled.
     Production,
 }
 
@@ -1926,9 +1926,6 @@ pub struct ReadinessConfig {
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct AuthConfig {
-    /// When true, auth routes that require preview-gated card registration are allowed.
-    #[serde(default)]
-    pub allow_preview: bool,
     /// Slug of the implicit tenant this self-hosted deployment serves.
     ///
     /// Boot has no request `Host` to derive the tenant from, so the operator
@@ -2534,11 +2531,6 @@ impl WyrdServerConfig {
                 })?;
         }
 
-        // auth.allow_preview
-        if let Some(val) = env_opt("WYRD_AUTH_ALLOW_PREVIEW")? {
-            self.auth.allow_preview = parse_flag(&val, "WYRD_AUTH_ALLOW_PREVIEW")?;
-        }
-
         // auth.tenant_slug
         if let Some(val) = env_opt("WYRD_SERVER_TENANT_SLUG")? {
             let slug = TenantSlug::new(val).map_err(|e| ConfigError::BadEnvVar {
@@ -2741,11 +2733,6 @@ impl WyrdServerConfig {
                 return Err(ConfigError::Invalid {
                     message: "grpc.reflection_enabled must be false in production profile"
                         .to_string(),
-                });
-            }
-            if self.auth.allow_preview {
-                return Err(ConfigError::Invalid {
-                    message: "auth.allow_preview must be false in production profile".to_string(),
                 });
             }
             if self.role.serves_peer() {
@@ -3178,7 +3165,6 @@ mod tests {
         config.grpc.certificate_chain_path = Some(PathBuf::from("certificate.pem"));
         config.http.bind = config.grpc.bind;
         config.grpc.reflection_enabled = true;
-        config.auth.allow_preview = true;
         config.limits.body_bytes = 0;
         config.limits.timeout_ms = 0;
         config.limits.concurrency = 0;
@@ -3203,7 +3189,6 @@ mod tests {
             config.bifrost.scribe.coordination_threads = 0;
             config.grpc.certificate_chain_path = Some(PathBuf::from("certificate.pem"));
             config.grpc.reflection_enabled = true;
-            config.auth.allow_preview = true;
             config.limits.body_bytes = 0;
             config.limits.timeout_ms = 0;
             config.limits.concurrency = 0;
@@ -3926,21 +3911,28 @@ minimum_slots = 2
         );
     }
 
-    // ── 6. Production profile + allow_preview → Invalid ──────────────────────
+    // ── 6. Delegation carries no preview setting ─────────────────────────────
 
+    /// Proves standard token exchange is not a preview surface.
+    ///
+    /// The `[auth]` section denies unknown fields, so the retired
+    /// `allow_preview` key is refused at parse time rather than silently
+    /// honoured. That a production-valid serving target then performs the
+    /// exchange is proven end to end by
+    /// `pg_router_smoke::production_valid_target_serves_token_exchange_without_preview`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the retired key parses.
     #[test]
-    fn production_allow_preview_invalid() {
-        let toml = r#"
+    fn production_auth_carries_no_preview_setting() {
+        let retired = r#"
             deployment_profile = "production"
             [auth]
             allow_preview = true
         "#;
-        let cfg = from_toml_str_with_dev_oracle_opt_in(toml).expect("parses ok");
-        let err = cfg.validate().expect_err("must fail");
-        assert!(
-            matches!(err, ConfigError::Invalid { .. }),
-            "expected Invalid, got {err:?}"
-        );
+        from_toml_str_with_dev_oracle_opt_in(retired)
+            .expect_err("the retired allow_preview key must not parse");
     }
 
     // ── 7. shutdown.drain_ms over 60k cap → Invalid ───────────────────────────

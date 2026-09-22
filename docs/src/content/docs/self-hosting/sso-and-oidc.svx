@@ -86,7 +86,6 @@ Beyond boot-time TOML, trusted issuers and workload bindings have admin CRUD rou
 ## Limitations
 
 - `private_key_jwt` client authentication to the IdP token endpoint is not yet implemented. Use `public` (PKCE) or a client secret.
-- The delegation grant (`token-exchange`) is preview-gated and not production-ready. It is rejected under a production profile unless preview auth is explicitly enabled, which production hardening forbids.
 
 ## Related
 

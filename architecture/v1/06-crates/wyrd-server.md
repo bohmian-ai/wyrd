@@ -12,6 +12,3 @@ Auth modules added for the security foundation:
   issuance through the verifier and RBAC permission check.
 - `auth::seed` and `auth::roles`: seed and protect builtin RBAC roles.
 
-The HTTP routes are preview-gated until the registry plane projects Service and
-Agent cards into `auth_service_accounts` and auth middleware exposes runtime
-principals to handlers.

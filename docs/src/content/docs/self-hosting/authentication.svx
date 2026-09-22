@@ -30,7 +30,7 @@ A **grant** is how a caller proves its identity at `POST /auth/token` to get a W
 | A person renewing an expiring session | `refresh_token` | Automatic once a login issues one |
 | A machine renewing an expiring token | The same grant it started with | Nothing — the client re-exchanges its durable credential |
 
-Delegation (`token-exchange`) also exists, but it is preview-gated and not production-ready; see the [SSO and OIDC limitations](/self-hosting/sso-and-oidc/#limitations). Every grant returns a Wyrd token minted with the signing key below; how each one is verified is in the [grant reference](/concepts/authentication/#grant-types). The rest of this page is the key material every deployment provides.
+Delegation (`token-exchange`) lets one Service or Agent act for another; see [delegation](/concepts/authorization/#delegation). Every grant returns a Wyrd token minted with the signing key below; how each one is verified is in the [grant reference](/concepts/authentication/#grant-types). The rest of this page is the key material every deployment provides.
 
 ## Signing key
 

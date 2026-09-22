@@ -806,20 +806,6 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// Auth preview routes are disabled on this deploy.
-    #[error("[WYRD_AUTH_503_PREVIEW_DISABLED] {message}")]
-    #[wyrd_error(
-        code = "WYRD_AUTH_503_PREVIEW_DISABLED",
-        status = 503,
-        title = "Auth preview disabled",
-        remediation = "This Wyrd deploy disables preview auth routes until the Card-Registry principal projection ships. Do not retry."
-    )]
-    AuthPreviewDisabled {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
     /// Credential issuance audit insert failed.
     #[error("[WYRD_AUDIT_503_UNAVAILABLE] {message}")]
     #[wyrd_error(
@@ -3340,7 +3326,6 @@ impl WyrdError {
             | Self::AdminNotFound { message, details }
             | Self::AuthVerifyUnavailable { message, details }
             | Self::DiscoveryUnavailable { message, details }
-            | Self::AuthPreviewDisabled { message, details }
             | Self::AuditUnavailable { message, details }
             | Self::AuthzRequiresDelegatedToken { message, details }
             | Self::MissingRequiredField { message, details }
@@ -4222,10 +4207,6 @@ mod tests {
             },
             WyrdError::DiscoveryUnavailable {
                 message: "oidc discovery unavailable".to_owned(),
-                details: serde_json::json!({}),
-            },
-            WyrdError::AuthPreviewDisabled {
-                message: "auth preview disabled".to_owned(),
                 details: serde_json::json!({}),
             },
             WyrdError::AuditUnavailable {

@@ -2405,9 +2405,6 @@ pub enum ProductionValidationError {
     /// Token verifier is absent in a production build.
     #[error("auth.token_verifier is None in a production build; auth-plan boot must install it")]
     MissingTokenVerifier,
-    /// Preview auth is still enabled in a production build.
-    #[error("auth.allow_preview is true in a production build; clear WYRD_AUTH_ALLOW_PREVIEW")]
-    PreviewAuthEnabled,
     /// The private Oracle peer was not constructed from verified production dependencies.
     #[error("oracle_peer is None in a production build; Oracle role boot must complete")]
     MissingOraclePeer,
@@ -2437,9 +2434,6 @@ impl AppState {
         }
         if self.auth.token_verifier.is_none() {
             return Err(ProductionValidationError::MissingTokenVerifier);
-        }
-        if self.auth.allow_preview {
-            return Err(ProductionValidationError::PreviewAuthEnabled);
         }
         Ok(())
     }

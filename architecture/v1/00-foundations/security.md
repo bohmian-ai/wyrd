@@ -39,7 +39,7 @@ wyrd-sql
   credential rows, audit rows
 
 wyrd-server
-  HTTP handlers, TenantConn acquisition, preview gate,
+  HTTP handlers, TenantConn acquisition,
   transactional credential/audit writes, error mapping
 ```
 

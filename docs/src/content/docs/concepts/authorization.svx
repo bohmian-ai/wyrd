@@ -133,9 +133,7 @@ The SDKs perform the exchange for you and re-exchange before expiry:
 `client.on_behalf_of(a_token, audience="bifrost")` in Python, and
 `client.onBehalfOf(aToken, { audience: "bifrost" })` in TypeScript.
 
-Delegation is a preview grant: it is enabled by `WYRD_AUTH_ALLOW_PREVIEW` and is
-rejected under a production profile until preview auth is cleared. Delegated
-tokens are the only tokens `/v1/authz/check` accepts.
+Delegated tokens are the only tokens `/v1/authz/check` accepts.
 
 ## Authz extension (authz/check)
 
@@ -361,7 +359,7 @@ let state = state
     .with_audit_writer(Arc::new(PgAuthzAuditWriter::new()));
 
 // Fails closed under APP_ENV=staging|production if either is still the shipped
-// stub, if the token verifier is missing, or if preview auth is still enabled.
+// stub, or if the token verifier is missing.
 state.production_validate()?;
 
 let router = build_router(state);

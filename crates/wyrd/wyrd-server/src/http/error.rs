@@ -447,10 +447,6 @@ mod error_mapper_tests {
         );
 
         for error in [
-            WyrdError::AuthPreviewDisabled {
-                message: "preview disabled".to_owned(),
-                details: serde_json::json!({}),
-            },
             WyrdError::AuditUnavailable {
                 message: "audit unavailable".to_owned(),
                 details: serde_json::json!({}),
@@ -633,7 +629,6 @@ mod error_mapper_tests {
             DelegationDepthExceededVerify,
             PrincipalNotFound,
             AuthVerifyUnavailable,
-            AuthPreviewDisabled,
             AuditUnavailable,
             AuthzRequiresDelegatedToken,
             MissingRequiredField,

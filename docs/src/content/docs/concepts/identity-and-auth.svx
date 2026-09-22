@@ -101,7 +101,7 @@ Human login is the exception: it starts at `GET /auth/login` and finishes with t
     { label: 'jwt-bearer', sub: 'workload assertion → access only' },
     { label: 'authorization_code', sub: 'OIDC callback → access + refresh' },
     { label: 'refresh_token', sub: 'rotate → access + refresh' },
-    { label: 'token-exchange', sub: 'delegation → access only · preview-gated' }
+    { label: 'token-exchange', sub: 'delegation → access only' }
   ]}
 />
 
@@ -114,8 +114,7 @@ Who uses which grant:
   machine renews by re-exchanging the durable credential it already holds, so
   revoking that credential ends its renewal.
 - **Delegation** (`token-exchange`) lets a caller mint a scoped token for
-  another Service/Agent. It is gated behind preview auth and never issues a
-  refresh token. See [Authorization](/concepts/authorization/#delegation).
+  another Service/Agent. It never issues a refresh token. See [Authorization](/concepts/authorization/#delegation).
 
 The per-grant flows, with diagrams, are on the
 [Authentication](/concepts/authentication/) page.
@@ -147,9 +146,8 @@ Ed25519 key at boot so auth works on a fresh local run. Those tokens do not surv
 a restart, and the key must never appear in staging or production.
 
 In **production** (staging or production), boot fails closed without
-`WYRD_SIGNING_KEY_FILE` or `WYRD_SIGNING_KEY_PEM`. It also rejects
-`auth.allow_preview=true` and refuses to boot with the default `StubAllowPolicyHook`
-or the no-op audit writer still mounted.
+`WYRD_SIGNING_KEY_FILE` or `WYRD_SIGNING_KEY_PEM`. It also refuses to boot with
+the default `StubAllowPolicyHook` or the no-op audit writer still mounted.
 
 <DataTable
   columns={[
@@ -160,7 +158,6 @@ or the no-op audit writer still mounted.
     ['APP_ENV', 'development | staging | production. Selects the deployment profile; staging and production both harden.'],
     ['WYRD_SIGNING_KEY_FILE', 'Path to the Ed25519 signing-key PEM (preferred; keeps the key out of the process environment). Required in production.'],
     ['WYRD_SIGNING_KEY_PEM', 'Inline Ed25519 signing-key PEM (fallback). Setting both file and inline is a configuration error.'],
-    ['WYRD_AUTH_ALLOW_PREVIEW', 'Enables preview grants (token-exchange delegation). Rejected in a production profile.'],
     ['WYRD_SERVER_TENANT_SLUG', 'Implicit tenant slug used to seed trusted issuers/bindings at boot and to resolve the login tenant.'],
     ['WYRD_SEALING_KEY_FILE', 'AES-256-GCM key file for OIDC client-secret encryption at rest. See Cloud identity.'],
     ['WYRD_SEALING_KEY_BASE64', 'Inline base64 sealing key (fallback for the file form).']

@@ -1225,9 +1225,6 @@ pub fn production_guards(config: &crate::config::WyrdServerConfig) {
     if config.grpc.reflection_enabled {
         tracing::warn!("grpc.reflection_enabled=true in development profile");
     }
-    if config.auth.allow_preview {
-        tracing::warn!("auth.allow_preview=true in development profile");
-    }
 }
 
 /// Assemble production `AppState` from config, applying `overrides` before
@@ -1490,7 +1487,6 @@ async fn install_auth(
     )?;
 
     Ok(ServerAuth {
-        allow_preview: config.auth.allow_preview,
         issuing_key: Some(handles.issuing_key),
         token_verifier: Some(handles.token_verifier),
         external_verifier: Some(handles.external_verifier),

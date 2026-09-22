@@ -14,9 +14,6 @@ use crate::components::auth::audit_writer::{AuthzAuditWriter, NoopAuthzAuditWrit
 /// Authentication handles: token issuance + verification + issuer/binding resolution.
 #[derive(Clone, Default)]
 pub struct ServerAuth {
-    /// When `true`, preview-auth paths are active. Must be `false` in production
-    /// (enforced by `AppState::production_validate`). Set via `WYRD_AUTH_ALLOW_PREVIEW`.
-    pub allow_preview: bool,
     /// Ed25519 key used to sign access and API-key tokens. Required for any token-issuance route.
     pub issuing_key: Option<Arc<IssuingKey>>,
     /// Verifies bearer tokens on every authenticated request. Required in production

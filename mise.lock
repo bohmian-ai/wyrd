@@ -64,10 +64,6 @@ url = "https://github.com/protocolbuffers/protobuf/releases/download/v33.2/proto
 checksum = "sha256:376770cd4073beb63db56fdd339260edb9957b3c4472e05a75f5f9ec8f98d8f5"
 url = "https://github.com/protocolbuffers/protobuf/releases/download/v33.2/protoc-33.2-win64.zip"
 
-[[tools.python]]
-version = "3.12.13"
-backend = "core:python"
-
 [[tools.rust]]
 version = "1.97.1"
 backend = "core:rust"

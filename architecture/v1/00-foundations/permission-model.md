@@ -58,7 +58,6 @@ other resource — including `AnyOf` and `Wildcard` — is rejected at decode.
 - `Triggers`
 - `ServiceAccounts`
 - `Users`
-- `Delegation`
 - `AnyOf(Vec<Resource>)`
 - `Wildcard`
 
@@ -71,7 +70,6 @@ other resource — including `AnyOf` and `Wildcard` — is rejected at decode.
 - `Install`
 - `Lock`
 - `Run`
-- `Issue`
 - `AnyOf(Vec<Action>)`
 - `Wildcard`
 
@@ -151,7 +149,6 @@ Roles persist permissions as a JSONB array of permission objects in
   {"resource": "cards", "action": "write", "scope": "all"},
   {"resource": "cards", "action": "read", "scope": "all"},
   {"resource": {"any_of": ["operators", "evals"]}, "action": "invoke", "scope": "all"},
-  {"resource": "delegation", "action": "issue", "scope": "all"},
   {"resource": "wildcard", "action": "wildcard", "scope": "all"}
 ]
 ```
@@ -185,16 +182,10 @@ change.
 
 ## Delegation
 
-`Resource::Delegation` and `Action::Issue` model RFC 8693 token exchange. A
-caller needs:
-
-```rust
-Permission { resource: Delegation, action: Issue, scope: All }
-```
-
-to call `POST /auth/token` with
-`grant_type=urn:ietf:params:oauth:grant-type:token-exchange`.
-
-This keeps delegated-token issuance inside the same typed RBAC model as every
-other Wyrd API call. The `runtime_admin` builtin role carries this permission;
-broader admin roles may cover it through `{ Wildcard, Wildcard, All }`.
+RFC 8693 token exchange has no permission of its own. Service B acts for
+Service A by presenting A's token as `subject_token` and its own as
+`actor_token`; the invoke policy decides whether A may be served by B. The
+issued token names A as its principal and B as its outer `act`, and its
+permissions are `PermissionSet::intersection` of B's current permissions and
+A's verified ones, so delegation narrows authority and never amplifies either
+party.

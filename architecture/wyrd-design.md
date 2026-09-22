@@ -180,17 +180,20 @@ not a passive integration or inventory product.
     JWT and re-exchanges the same durable key whenever that token expires or
     the server refuses it; a machine holds no refresh token. `/auth/token` derives `tenant_id` and
     `principal_id` from the verified API-key record — never from a
-    client-supplied header. The JWT carries top-level `principal` (current
-    actor / callee under delegation) and an RFC 8693 `act` chain
-    (initiator-first delegators); a single delegated token carries both sides
-    of an invoke. On cross-service calls the SDK puts that delegated Wyrd
-    JWT in the `X-Wyrd-Access-Token` header. The application's own
+    client-supplied header. The JWT carries top-level `principal` (the subject;
+    under delegation, the party being acted for) and an RFC 8693 `act` chain
+    whose outermost layer is the current actor; a single delegated token
+    carries both sides of an invoke. Service B obtains it with
+    `WyrdClient::on_behalf_of(A token, audience)`, presenting A's token as
+    `subject_token` and its own as `actor_token`; its permissions are the
+    intersection of both. On cross-service calls the SDK puts that delegated
+    Wyrd JWT in the `X-Wyrd-Access-Token` header. The application's own
     `Authorization` header is never touched. `Wyrd-Caller-Identity` is
     rejected legacy — do not reintroduce. The mesh's ext_authz filter (or
     the SDK middleware) forwards `X-Wyrd-Access-Token`, `Wyrd-Request-Id`,
-    and `X-Original-*` to `/v1/authz/check`; the body is empty. Both caller
-    and callee identities are server-verified from one signed delegated
-    JWT — no enforcement-point JWT, no SPIFFE/mTLS callee derivation.
+    and `X-Original-*` to `/v1/authz/check`; the body is empty. Both subject
+    and actor identities are server-verified from one signed delegated
+    JWT — no enforcement-point JWT, no SPIFFE/mTLS actor derivation.
 19. **Reference slots use exactly `Ref` or `InlineableRef<T>`.** `Ref` carries
     durable identity or an authored `Path`; `InlineableRef<T>` additionally
     permits an inline child body. `Path` is loader-only. During composite
@@ -514,7 +517,9 @@ derives `tenant_id` and `principal_id` from the verified API-key record;
 no client-supplied tenant header is accepted. The JWT carries the principal
 as the top-level `principal` claim, the `permissions` resolved from its current
 grants at issuance as its only authority, and for delegated tokens (token
-exchange) an RFC 8693 `act` chain of upstream delegators.
+exchange) an RFC 8693 `act` chain naming the actors, the outermost being the
+current one. A delegated token's audience is `wyrd` or `bifrost`; a `bifrost`
+token is accepted only on the Bifrost ingest and query surfaces.
 
 Env vars in deployed services:
 
@@ -529,16 +534,17 @@ Env vars in deployed services:
 The API key is exchanged at `/auth/token` — never on the wire. The JWT — not the API
 key — is what travels on cross-service calls in the dedicated
 `X-Wyrd-Access-Token: Bearer <jwt>` header. The JWT must be a **delegated**
-Wyrd token: its top-level `principal` identifies the protected callee
-(Service or Agent), and its `act` chain identifies the caller(s) that
-delegated to it. The application's own `Authorization` header belongs to
+Wyrd token: its top-level `principal` identifies the subject being acted
+for, and its `act` chain identifies the actor(s) acting for it, the
+outermost being the calling Service or Agent. Its `permissions` are the
+intersection of the actor's and the subject's; `act` is attribution only. The application's own `Authorization` header belongs to
 the application and is never read or written by the SDK or by Wyrd.
 `Wyrd-Caller-Identity` is rejected legacy — do not reintroduce.
 
 ```
 POST /charge HTTP/1.1
 Host: billing-svc.acme.svc.cluster.local
-X-Wyrd-Access-Token: Bearer <delegated Wyrd JWT — principal=callee, act=caller chain>
+X-Wyrd-Access-Token: Bearer <delegated Wyrd JWT — principal=subject, act=actor chain>
 Wyrd-Request-Id:     <UUIDv7>                     ← SDK adds; request correlator
 Authorization: Bearer <app's own token>           ← app's own auth; Wyrd never reads
 Content-Type: application/json
@@ -563,8 +569,8 @@ Contract:
 - Ancestry of any request (service1 → service2 → service3) is
   reconstructable by joining observations on this ID; per-hop caller
   identity comes from the verified `X-Wyrd-Access-Token` JWT at each
-  call (top-level `principal` is the hop's callee, `act` chain is the
-  caller path).
+  call (top-level `principal` is the subject acted for, `act` chain is the
+  actor path).
 
 Storage, query, and CEL surfaces must preserve this correlator and may not
 introduce a competing request identity.
@@ -706,7 +712,7 @@ translation logic on either end.
 ```
 POST /v1/authz/check HTTP/1.1
 Host: wyrd.acme.com
-X-Wyrd-Access-Token: Bearer <delegated Wyrd JWT — principal=callee, act=caller chain>
+X-Wyrd-Access-Token: Bearer <delegated Wyrd JWT — principal=subject, act=actor chain>
 Wyrd-Request-Id:     <UUIDv7 — forwarded from inbound, or absent on first hop>
 X-Original-Method:   POST
 X-Original-Path:     /charge
@@ -716,25 +722,24 @@ Content-Length: 0
 
 Wyrd:
 1. Verifies `X-Wyrd-Access-Token`. Rejects with `403 Forbidden` if the JWT
-   is not a **delegated** token — i.e. if `principal.kind ∉ {Service,
-   Agent}`, if `principal.card_ref` is `None`, or if the `act` chain is
-   empty. `/v1/authz/check` will not authorize on a direct (non-delegated)
-   token.
-2. Derives `callee = verified.principal` (the protected Service/Agent
-   card identity) and `caller = verified.delegation_chain.last()` (the
-   immediate delegator); the full chain is retained for policy bindings
-   and audit. There is no enforcement-point JWT and no SPIFFE/mTLS
-   callee derivation — one delegated token carries both sides.
+   is not a **delegated** token — i.e. if the `act` chain is empty, or if
+   the current actor's kind ∉ {Service, Agent} or it has no `card_ref`.
+   `/v1/authz/check` will not authorize on a direct (non-delegated) token.
+2. Derives `subject = verified.principal` (the party acted for, carrying
+   the attenuated permissions) and `actor = verified.delegation_chain.last()`
+   (the calling Service/Agent); the full chain is retained for policy
+   bindings and audit. There is no enforcement-point JWT and no SPIFFE/mTLS
+   actor derivation — one delegated token carries both sides.
 3. Reads `X-Original-Method` / `X-Original-Path` / `X-Original-Host`
    → builds `request`.
 4. Reads `Wyrd-Request-Id` if present; mints a fresh UUIDv7 if absent and
    echoes it back so the middleware/sidecar can inject it on the outbound
    call.
-5. Assembles `InvokeContext { caller, callee, chain, request, attrs }`
-   (attrs are merged Classify-derived attributes from caller + callee
-   cards).
-6. Evaluates CEL rules where `action == invoke` for the callee card
-   (org-global ∪ service-local, deny-overrides).
+5. Assembles `AuthzCheckContext { subject, actor, chain, request, metadata,
+   request_id }`.
+6. Evaluates the invoke policy for the actor acting for the subject
+   (org-global ∪ service-local, deny-overrides), then checks the required
+   permission against the subject's attenuated permissions.
 7. Returns `200 OK` (Allow) or `403 Forbidden` with `PolicyDecision::Deny { reason }`.
 8. Asynchronously emits one `PolicyInvokeDecision` observation per check,
    labeled with `Wyrd-Request-Id` (emitted under Wyrd's internal authority —

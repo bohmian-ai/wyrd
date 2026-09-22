@@ -127,9 +127,10 @@ this*. After a token verifies, its role claims resolve to an effective
 permission set, and RBAC checks the requested permission — operation *and*
 object scope — against it.
 
-Agent-to-agent calls add a second layer. A caller with `delegation:issue` can
-exchange its token for a **delegated** Service/Agent token that carries an `act`
-chain. Only delegated tokens reach `POST /v1/authz/check`, the policy-extension
+Service-to-service calls add a second layer. Service B can exchange Service
+A's token, together with its own, for a **delegated** token that acts for A: A
+is the principal, B is recorded in the `act` chain, and the permissions are
+the ones both hold. Only delegated tokens reach `POST /v1/authz/check`, the policy-extension
 endpoint backed by `PolicyHook`. Both layers must pass: the `PolicyHook` first,
 then RBAC. See [Authorization](/concepts/authorization/).
 

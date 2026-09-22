@@ -70,16 +70,11 @@ CEL and ABAC do not live behind this trait. Policy evaluation belongs to the
 Policy plane and its `/v1/authz/check` surface, which has its own decision
 shape. `PermissionDenyReason` intentionally has no ABAC variant.
 
-## Delegation Issuance Check
+## Delegated Requests
 
-Token exchange uses the same RBAC chokepoint before issuing a delegated token:
-
-```rust
-state
-    .permission_check
-    .check(&caller_principal, &Permission::delegation_issue())
-    .into_result()?;
-```
-
-The `runtime_admin` builtin role carries `Permission::delegation_issue()`, and
-broader administrators may cover it through `Permission::wildcard()`.
+Token exchange adds no RBAC check of its own; the invoke policy gates it. A
+delegated token's principal is the subject being acted for and its
+`permissions` claim is already the intersection of the actor's and the
+subject's, so every later request runs this same checker against that
+principal and set. The `act` chain is attribution for audit and policy only
+and never confers authority.

@@ -144,11 +144,17 @@ credential.
 
 ### Delegation and federation
 
-- Cross-service delegation uses the RFC 8693 `act` chain in the signed Wyrd
-  token. Both caller and callee are verified from that token; no caller-
-  supplied identity header is accepted.
+- Cross-service delegation uses RFC 8693 token exchange: the actor presents
+  the subject's token as `subject_token` and its own as `actor_token`, the
+  invoke policy must allow the pair, and the signed token names the subject as
+  its principal and the actor as its outer `act`. Both are verified from that
+  token; no caller-supplied identity header is accepted, and `act` confers no
+  authority.
+- A delegated token is bound to the `wyrd` or `bifrost` audience; a `bifrost`
+  token is refused outside the Bifrost ingest and query surfaces.
 - Delegation depth is bounded, every hop is authorized, and the effective
-  permission set can only narrow.
+  permission set is the intersection of the actor's current permissions and
+  the subject's, so it can only narrow.
 - External federation accepts tokens only from an explicitly configured
   issuer, audience, algorithm, and claim mapping. OIDC discovery does not make
   an issuer trusted.

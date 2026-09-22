@@ -11,8 +11,8 @@ Auth DTOs:
   contracts.
 - `TokenRequest`: `grant_type` tagged union for Wyrd API-key exchange and RFC
   8693 token exchange.
-- `RequestedSubject`: token-exchange target by principal id or structured
-  `CardRef`.
+- `TokenAudience`: the `wyrd` or `bifrost` audience a token-exchange token is
+  bound to.
 - `TokenResponse`: access token, refresh token, token type, and expiry. It does
   not duplicate `card_ref`; the binding lives inside the JWT claims.
 

@@ -77,7 +77,7 @@ The resolution path:
     ['writer', 'cards:read, cards:write, artifacts:read, artifacts:write, operators:invoke, evals:run, triggers:write'],
     ['reader', 'cards:read, artifacts:read, audit:read'],
     ['agent', 'cards:read, cards:write, artifacts:read, artifacts:write, operators:invoke, evals:run'],
-    ['runtime_admin', 'service_accounts:write, delegation:issue']
+    ['runtime_admin', 'service_accounts:write']
   ]}
 />
 
@@ -105,23 +105,33 @@ workload assertion is not used for human login and vice versa.
 
 ## Delegation
 
-Agent-to-agent calls run under a **delegated token**: an access token one
-principal mints on behalf of another Service or Agent. The caller exchanges its
-own token via the `token-exchange` grant on `POST /auth/token` and must hold the
-`delegation:issue` permission. The minted token carries an `act` chain, the
-ordered record of who delegated to whom, and no refresh token. Delegation depth is
-capped at 5.
+Service-to-service calls run under a **delegated token** (RFC 8693). When
+Service B handles a request for Service A, B exchanges A's token for one that
+acts for A: it calls `POST /auth/token` with the `token-exchange` grant, A's
+token as `subject_token`, its own token as `actor_token`, and a target
+`audience`. The issued token names A as its principal and B as its outer `act`,
+and carries only the permissions both A and B hold, so B can never do more
+than A could. The `act` chain is attribution for audit and policy; it confers
+no authority. The token has no refresh token and delegation depth is capped at 5.
+
+A token issued for the `bifrost` audience is accepted only on the Bifrost ingest
+and query surfaces, so it cannot be replayed against the rest of Wyrd.
 
 <WyrdSequenceDiagram
   title="Delegation (token-exchange)"
-  participants={['Caller', 'Wyrd server']}
+  participants={['Service B', 'Wyrd server']}
   messages={[
-    { from: 'Caller', to: 'Wyrd server', label: 'POST /auth/token · token-exchange · requested_subject' },
-    { from: 'Wyrd server', to: 'Wyrd server', label: 'verify caller · require delegation:issue' },
-    { from: 'Wyrd server', to: 'Wyrd server', label: 'resolve requested Service/Agent (server-owned)' },
-    { from: 'Wyrd server', to: 'Caller', label: 'delegated token · act chain · depth ≤ 5 · no refresh', dashed: true }
+    { from: 'Service B', to: 'Wyrd server', label: 'POST /auth/token · token-exchange · subject_token=A · actor_token=B · audience' },
+    { from: 'Wyrd server', to: 'Wyrd server', label: 'verify both tokens · same tenant · invoke policy (A served by B)' },
+    { from: 'Wyrd server', to: 'Wyrd server', label: 'permissions = B ∩ A · audit subject A, actor B' },
+    { from: 'Wyrd server', to: 'Service B', label: 'token · sub=A · act.sub=B · aud · no refresh', dashed: true }
   ]}
 />
+
+The SDKs perform the exchange for you and re-exchange before expiry:
+`client.on_behalf_of(a_token, TokenAudience::Bifrost)` in Rust,
+`client.on_behalf_of(a_token, audience="bifrost")` in Python, and
+`client.onBehalfOf(aToken, { audience: "bifrost" })` in TypeScript.
 
 Delegation is a preview grant: it is enabled by `WYRD_AUTH_ALLOW_PREVIEW` and is
 rejected under a production profile until preview auth is cleared. Delegated
@@ -144,9 +154,9 @@ fixed JSON contract, so a service mesh can call it as an external authorization
 provider for every inter-service hop.
 
 Only **delegated** tokens reach it: tokens issued via `token-exchange` that
-carry a non-empty `act` chain. `guard_reason` rejects User tokens, direct
-(non-delegated) Service/Agent tokens, and card-less tokens with a `403` before
-any policy runs.
+carry a non-empty `act` chain. `guard_reason` rejects a direct (non-delegated)
+token, and a token whose current actor is not a Card-bound Service or Agent,
+with a `403` before any policy runs.
 
 ### The two layers
 
@@ -155,12 +165,13 @@ pass.**
 
 1. **`PolicyHook` (your code) runs first.** It returns `Allow` or
    `Deny { reason }`. A `Deny` short-circuits, and RBAC is not consulted.
-2. **RBAC runs second, only if the hook allowed.** Wyrd checks the callee's
-   `effective_permissions` against the requested `action`.
+2. **RBAC runs second, only if the hook allowed.** Wyrd checks the subject's
+   `effective_permissions`, already narrowed to what both subject and actor
+   hold, against the requested `action`.
 
 A hook `Allow` does not bypass RBAC. It means "my policy permits this; now apply
 the principal's role permissions." Use the hook for attribute- and context-based
-rules (this caller, this target, this time, this delegation chain); leave coarse
+rules (this actor, this subject, this target, this time, this chain); leave coarse
 role-based grants — including object scope — to RBAC.
 
 <WyrdSequenceDiagram
@@ -189,7 +200,7 @@ Headers:
     { header: 'Meaning' }
   ]}
   rows={[
-    ['X-Wyrd-Access-Token', 'Yes', 'Bearer <access-token>. Must be a delegated Service or Agent token (minted through token-exchange with a non-empty act chain). User tokens, direct Service/Agent tokens, and card-less tokens are rejected with 403 before any policy runs.'],
+    ['X-Wyrd-Access-Token', 'Yes', 'Bearer <access-token>. Must be a delegated token (minted through token-exchange with a non-empty act chain) whose current actor is a Card-bound Service or Agent. Direct tokens and tokens with any other actor are rejected with 403 before any policy runs.'],
     ['Content-Type', 'Yes', 'application/json.'],
     ['X-Original-Method / -Path / -Host', 'No', 'The original request line, projected by a service mesh. Surfaced to your hook as ctx.metadata. All-or-nothing: if any of the three is missing, ctx.metadata is None, which is not an error.']
   ]}
@@ -249,7 +260,7 @@ curl -sS -X POST https://wyrd.internal/v1/authz/check \
 />
 
 The distinction between the two `200` cases matters: **an RBAC miss is a `200`,
-not a `403`.** The token is valid and the request was well-formed; the callee
+not a `403`.** The token is valid and the request was well-formed; the subject
 simply lacks the permission, so the answer is a normal "deny" decision. Only a
 `PolicyHook` denial, an explicit policy verdict, is a `403`:
 
@@ -275,9 +286,9 @@ there is no callback to fetch more identity.
     { header: 'What it carries' }
   ]}
   rows={[
-    ['callee', 'Principal', 'The principal the call runs as: id, kind (Service/Agent with its card_ref), tenant_id, roles, and effective_permissions.'],
-    ['caller', 'PrincipalRef', 'The immediate delegator for this hop.'],
-    ['chain', 'Vec<PrincipalRef>', 'The initiator-first delegation chain. The callee is not included.'],
+    ['subject', 'Principal', 'The party being acted for: id, kind, tenant_id, roles, and effective_permissions (the intersection of the subject\'s and the actor\'s).'],
+    ['actor', 'PrincipalRef', 'The current actor: the Card-bound Service or Agent making this call.'],
+    ['chain', 'Vec<PrincipalRef>', 'The actor chain, earliest first; its last entry is the actor.'],
     ['request', 'AuthzCheckRequest', 'The target, action, and context from the request body.'],
     ['metadata', 'Option<...>', 'The mesh-projected method / path / host, when the X-Original-* headers were present.'],
     ['request_id', 'RequestId', 'Correlator for audit records and response headers.']
@@ -308,27 +319,21 @@ production boot check.
 ```rust
 use async_trait::async_trait;
 use wyrd_auth_check::{AuthzCheckContext, PolicyHook};
-use wyrd_runtime::PrincipalKind;
 use wyrd_spec::card::policy::PolicyDecision;
 
 /// Deny any delegated write whose target lives in a different space than the
-/// callee's own card. Everything else falls through to RBAC.
+/// actor's own card. Everything else falls through to RBAC.
 #[derive(Debug)]
 struct SameSpacePolicy;
 
 #[async_trait]
 impl PolicyHook for SameSpacePolicy {
     async fn evaluate(&self, ctx: &AuthzCheckContext) -> PolicyDecision {
-        let callee_space = match &ctx.callee.kind {
-            PrincipalKind::Service {
-                card_ref: Some(card_ref),
-                ..
-            }
-            | PrincipalKind::Agent { card_ref, .. } => &card_ref.space,
-            _ => return PolicyDecision::deny("callee is not a card-bound service or agent"),
+        let Some(actor_card) = ctx.actor.card_ref() else {
+            return PolicyDecision::deny("actor is not a card-bound service or agent");
         };
 
-        if &ctx.request.target.space != callee_space {
+        if ctx.request.target.space != actor_card.space {
             return PolicyDecision::deny("cross-space delegated write is not allowed");
         }
         PolicyDecision::Allow
@@ -395,7 +400,7 @@ agent asks authz/check itself before making a delegated call: no mesh headers, a
 authz/check per hop with the `X-Original-*` headers projected, so `ctx.metadata`
 carries the original method, path, and host.
 
-Either way the token must be a delegated Service/Agent token, the same token that
+Either way the token must be a delegated token with a Service/Agent actor, the same token that
 would carry the call itself.
 
 ## Related

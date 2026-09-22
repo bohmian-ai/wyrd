@@ -315,7 +315,7 @@ Owning lanes: all passed at the final candidate.
 - Whitespace: `git diff --check c5c20754a167e8f4d74a555a720bd51df6179a6f HEAD` is clean.
 
 Limits:
-- **Local `python` shim.** This machine has only `python3`, so the four lanes that call `python` (`check:unwrap-audit`, `check:clippy-allow-audit`, `check:tenant-isolation` and `docs:check`) ran with a scratchpad `python`→`python3` shim on `PATH`.
+- **Python for the script lanes.** The repository `[tools]` pins no Python, and four lanes call a bare `python`: `check:unwrap-audit`, `check:clippy-allow-audit`, `check:tenant-isolation` and `docs:check`. They were run as `MISE_PYTHON_VERSION=3.12 mise run <task>`, and all four passed.
 - **Flaky first `test:shared` run.** It failed once because the test server's port was already taken (`Address already in use`) and passed 658/658 on the re-run.
 - **Strict rustdoc for `vala-bifrost-redux`.** It fails on missing docs this change did not introduce; only one line of `gate/auth.rs` changed there. That crate is not in `check:docs`.
 - **Trailing blank lines.** Two review records from `33feb673b` had trailing blank lines. Only the whitespace was removed, so `diff --check` passes.

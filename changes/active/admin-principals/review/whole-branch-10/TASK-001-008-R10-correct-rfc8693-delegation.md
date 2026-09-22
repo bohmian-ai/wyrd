@@ -273,7 +273,7 @@ Status: `IMPLEMENTED`. Commits `596a50bdd`, `47548e32f`, `29a3cad30`,
 | Attenuation | `PermissionSet::intersection` reused in `into_access_grant` | `mise exec -- cargo nextest run --locked -p wyrd-runtime --lib -E 'test(=permission::tests::intersection_keeps_only_the_narrower_shared_authority)'`: 1 passed; `an_exchange_names_subject_and_actor_and_carries_only_the_intersection` (above); `auth_e2e` `journey_delegation_cannot_amplify_the_subject` | PASS |
 | Automatic request verification | `29a3cad30`: `require_bifrost_authenticated` layers only the Bifrost and query routers; the gRPC gate uses `verify_on(.., TokenAudience::Bifrost)`; verification is JWT-only (no DB read) | Primary journey `scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test server -P journey --run-ignored=all -E 'test(=query::service_b_acts_for_service_a_with_only_a_table_authority)'"`: 1 passed (read succeeds; table write gets RBAC 403; a Wyrd route gets 401; audit names A as subject and B as actor); `mise run test:bifrost:journey:server` PASS; `mise run test:bifrost:integration:server` PASS | PASS |
 | Client helper | Rust `WyrdClient::on_behalf_of` (`57229ffbe`); Python `wyrd.WyrdClient.on_behalf_of` (`3912612fe`, `sdks/wyrd-sdk-python/src/client.rs`); TS `WyrdClient.onBehalfOf` (`5794e6cf9`, `sdks/wyrd-sdk-ts/native/src/client.rs`); both SDKs call the Rust method, with no exchange, caching or HTTP logic of their own | `mise exec -- cargo nextest run --locked -p wyrd-client --lib -E 'test(=auth::tests::on_behalf_of_caches_the_exchange_and_redacts_the_subject)'`: 1 passed; `mise exec -- uv run pytest tests/unit/client/test_client.py` (in `sdks/wyrd-sdk-python`): 3 passed; `mise run ts:test:unit`: 15 passed, including `wyrd-client.test.ts` (2) and the `WyrdClient.connect` no-credentials case | PASS |
-| Removal | `delegation:issue`, `Resource::Delegation`, `Action::Issue`, `requested_subject` and the callee/caller model are removed from code; schemas regenerated (`61ab3c689`); docs rewritten (`3a3bcc60d`) | `git grep -e requested_subject -e RequestedSubject -e delegation:issue -- ':!changes'` returns nothing; `mise run codegen:check` PASS; `mise run docs:check` PASS | PASS |
+| Removal | `delegation:issue`, `Resource::Delegation`, `Action::Issue`, `requested_subject` and the callee/caller model are removed from code; schemas regenerated (`61ab3c689`); docs rewritten (`3a3bcc60d`) | `git grep -e requested_subject -e RequestedSubject -e delegation:issue -- ':!changes'` returns nothing; `mise run codegen:check` PASS; `mise run docs:check` blocked locally (no `python` from mise) | PASS |
 | Audit | Exchange audit: operation `auth.token.exchange`, principal is the subject, detail carries actor and subject, resource is the audience, and the actor credential is attributed; `a_refused_exchange_audit_issues_no_token` shows an audit failure issues no token | Focused `wyrd-auth` pg tests (above); `scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && WYRD_AUTH_E2E=1 mise exec -- cargo nextest run --locked -p wyrd-server --test auth_e2e"` PASS; the primary journey asserts both the exchange audit row and the read-decision audit row | PASS |
 
 Owning lanes: all passed at the final candidate.
@@ -290,9 +290,6 @@ Owning lanes: all passed at the final candidate.
 - Boundary checks:
   - `mise run check:client-tier`
   - `mise run check:pyo3-scope`
-  - `mise run check:unwrap-audit`
-  - `mise run check:clippy-allow-audit`
-  - `mise run check:tenant-isolation`
   - `mise run check:from-pools-allowlist`
 - Test lanes:
   - `mise run test:principals:unit`
@@ -301,7 +298,6 @@ Owning lanes: all passed at the final candidate.
   - `mise run test:sql`
 - Generated artifacts:
   - `mise run codegen:check`
-  - `mise run docs:check`
 - Strict rustdoc: `RUSTDOCFLAGS="-D missing_docs -D rustdoc::broken_intra_doc_links" cargo doc --locked --no-deps` passes for:
   - `wyrd-spec`
   - `wyrd-auth-issue`
@@ -315,7 +311,7 @@ Owning lanes: all passed at the final candidate.
 - Whitespace: `git diff --check c5c20754a167e8f4d74a555a720bd51df6179a6f HEAD` is clean.
 
 Limits:
-- **Python for the script lanes.** The repository `[tools]` pins no Python, and four lanes call a bare `python`: `check:unwrap-audit`, `check:clippy-allow-audit`, `check:tenant-isolation` and `docs:check`. They were run as `MISE_PYTHON_VERSION=3.12 mise run <task>`, and all four passed.
+- **Script lanes blocked on this machine.** Four lanes call a bare `python`: `check:unwrap-audit`, `check:clippy-allow-audit`, `check:tenant-isolation` and `docs:check`. The repository `mise.toml` `[tools]` declares no Python, so after `mise install`, `mise run <task>` fails here with `python: not found`. These four lanes are unproven through the canonical command on this machine.
 - **Flaky first `test:shared` run.** It failed once because the test server's port was already taken (`Address already in use`) and passed 658/658 on the re-run.
 - **Strict rustdoc for `vala-bifrost-redux`.** It fails on missing docs this change did not introduce; only one line of `gate/auth.rs` changed there. That crate is not in `check:docs`.
 - **Trailing blank lines.** Two review records from `33feb673b` had trailing blank lines. Only the whitespace was removed, so `diff --check` passes.

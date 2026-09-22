@@ -22,23 +22,13 @@ async fn platform_cli(arguments: Vec<String>, credential: String) -> Output {
     run_cli_async_with_credential(arguments, "WYRD_PLATFORM_CREDENTIAL", credential).await
 }
 
-/// Run a `wyrd` invocation carrying a tenant credential.
+/// Run a tenant invocation with the tenant administrator's API key in the
+/// ambient chain.
 ///
-/// The value is whatever the operator was handed — the tenant administrator's
-/// API key, printed once at tenant creation — passed through the CLI's one
-/// explicit credential input. The shared client classifies it and exchanges a
-/// key for a token itself, so the journey never has to know which kind it
-/// holds, and never has to mint one out of band.
+/// No tenant command takes a credential argument; each reads the same ambient
+/// chain the SDKs read, where an API key belongs in `WYRD_API_KEY` and the
+/// shared client exchanges it for a token itself.
 async fn tenant_cli(arguments: Vec<String>, credential: String) -> Output {
-    run_cli_async_with_credential(arguments, "WYRD_ACCESS_TOKEN", credential).await
-}
-
-/// Run a principal-administration invocation with the tenant administrator's
-/// API key in the ambient chain.
-///
-/// Principal administration takes no credential argument; it reads the same
-/// ambient chain the SDKs read, where an API key belongs in `WYRD_API_KEY`.
-async fn principal_cli(arguments: Vec<String>, credential: String) -> Output {
     run_cli_async_with_credential(arguments, "WYRD_API_KEY", credential).await
 }
 
@@ -210,7 +200,7 @@ async fn operator_administers_a_deployment_through_the_cli() {
     arguments.extend(endpoint());
     let principal = succeeded(
         "principal create",
-        &principal_cli(arguments, tenant_credential.clone()).await,
+        &tenant_cli(arguments, tenant_credential.clone()).await,
     );
     let principal_id = field(&principal, "principal_id");
     let first_credential = field(&principal, "credential");
@@ -263,7 +253,7 @@ async fn operator_administers_a_deployment_through_the_cli() {
     arguments.extend(endpoint());
     let issued = succeeded(
         "credential issue",
-        &principal_cli(arguments, tenant_credential.clone()).await,
+        &tenant_cli(arguments, tenant_credential.clone()).await,
     );
     let replacement = server
         .exchange_api_key(&secrecy::SecretString::from(field(&issued, "credential")))
@@ -285,7 +275,7 @@ async fn operator_administers_a_deployment_through_the_cli() {
     arguments.extend(endpoint());
     let listed = succeeded(
         "credential list",
-        &principal_cli(arguments, tenant_credential.clone()).await,
+        &tenant_cli(arguments, tenant_credential.clone()).await,
     );
     let superseded = listed
         .lines()
@@ -306,7 +296,7 @@ async fn operator_administers_a_deployment_through_the_cli() {
     arguments.extend(endpoint());
     succeeded(
         "credential revoke",
-        &principal_cli(arguments, tenant_credential.clone()).await,
+        &tenant_cli(arguments, tenant_credential.clone()).await,
     );
 
     // 6. Lifecycle administration, from the platform plane.

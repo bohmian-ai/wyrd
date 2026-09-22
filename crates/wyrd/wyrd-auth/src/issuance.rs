@@ -114,8 +114,9 @@ pub enum TenantGrant {
     /// The issuer resolves the actor's current row and grants; the token names
     /// the subject as its principal and the actor as its outermost `act`.
     Delegation {
-        /// The subject being acted for, from its verified access token.
-        subject: TokenPrincipalRef,
+        /// The subject being acted for, from its verified access token; boxed
+        /// to keep the grant enum small.
+        subject: Box<TokenPrincipalRef>,
         /// The subject's roles; informational metadata only.
         subject_roles: Vec<RoleRef>,
         /// The subject's verified permissions. The token carries only the
@@ -158,6 +159,55 @@ impl TenantGrant {
             // The subject's Card scope was minted with its own token; the
             // exchange confers no new emit authority.
             Self::OidcLogin | Self::Refresh { .. } | Self::Delegation { .. } => None,
+        }
+    }
+
+    /// Build the signed-token contents for `issued`, whose current `roles`
+    /// and `permissions` were just resolved.
+    ///
+    /// Every grant but a delegation names `issued` with its own authority and
+    /// the `wyrd` audience. A delegation names the subject instead, carries
+    /// only the intersection of `issued`'s permissions with the subject's, and
+    /// records `issued` as the outermost actor over any earlier actors. The
+    /// actor is attribution only, so its Card scope stays out of the token.
+    fn into_access_grant(
+        self,
+        issued: TokenPrincipalRef,
+        roles: Vec<RoleRef>,
+        permissions: PermissionSet,
+    ) -> AccessGrant {
+        let credential_id = self.credential_id();
+        match self {
+            Self::Delegation {
+                subject,
+                subject_roles,
+                subject_permissions,
+                prior_act,
+                audience,
+                ..
+            } => AccessGrant {
+                principal: *subject,
+                roles: subject_roles,
+                permissions: permissions.intersection(&subject_permissions),
+                credential_id,
+                act: Some(Box::new(ActClaim {
+                    sub: issued.id.to_string(),
+                    principal: TokenPrincipalRef {
+                        card_ref_scope: CardRefScope::default(),
+                        ..issued
+                    },
+                    act: prior_act,
+                })),
+                audience,
+            },
+            _ => AccessGrant {
+                principal: issued,
+                roles,
+                permissions,
+                credential_id,
+                act: None,
+                audience: TokenAudience::Wyrd,
+            },
         }
     }
 }
@@ -344,52 +394,15 @@ impl TenantTokenIssuer {
         let permissions = resolve_permissions(conn, &roles).await?;
 
         let expires_at = Utc::now() + self.settings.access_ttl;
-        let credential_id = grant.credential_id();
         let scope_mint = grant
             .scope_mint_kind()
             .zip(principal.card_ref.clone())
             .map(|(kind, root)| (kind, root, principal.card_ref_scope.clone()));
         let event = exchange_audit_event(&principal, &grant, expires_at, request_id);
-        let (principal, roles, permissions, act, audience) = match grant {
-            TenantGrant::Delegation {
-                subject,
-                subject_roles,
-                subject_permissions,
-                prior_act,
-                audience,
-                ..
-            } => {
-                // The actor is attribution only: its Card binding names it,
-                // and its scope stays out of the token.
-                let actor = ActClaim {
-                    sub: principal.id.to_string(),
-                    principal: TokenPrincipalRef {
-                        card_ref_scope: CardRefScope::default(),
-                        ..principal
-                    },
-                    act: prior_act,
-                };
-                (
-                    subject,
-                    subject_roles,
-                    permissions.intersection(&subject_permissions),
-                    Some(Box::new(actor)),
-                    audience,
-                )
-            }
-            _ => (principal, roles, permissions, None, TokenAudience::Wyrd),
-        };
         let access_token = self
             .issuing_key
             .issue_access_token(
-                AccessGrant {
-                    principal,
-                    roles,
-                    permissions,
-                    credential_id,
-                    act,
-                    audience,
-                },
+                grant.into_access_grant(principal, roles, permissions),
                 self.settings.access_ttl,
             )
             .map_err(|error| match &scope_mint {
@@ -592,7 +605,7 @@ fn exchange_audit_event(
             expires_at,
         },
     );
-    event.resource = audience.as_str().to_owned();
+    audience.as_str().clone_into(&mut event.resource);
     event.with_credential_id(*actor_credential_id)
 }
 
@@ -931,7 +944,7 @@ mod pg_tests {
             (
                 machine,
                 TenantGrant::Delegation {
-                    subject,
+                    subject: Box::new(subject),
                     subject_roles: Vec::new(),
                     subject_permissions: wyrd_runtime::PermissionSet::new(),
                     prior_act: None,

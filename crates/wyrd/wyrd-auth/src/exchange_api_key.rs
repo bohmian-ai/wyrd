@@ -296,7 +296,7 @@ impl DelegateToken {
             }));
         }
         let grant = TenantGrant::Delegation {
-            subject: TokenPrincipalRef::from(&subject.principal),
+            subject: Box::new(TokenPrincipalRef::from(&subject.principal)),
             subject_roles: subject.principal.roles.clone(),
             subject_permissions: subject.principal.effective_permissions.clone(),
             prior_act: act_from_chain(&subject.delegation_chain, tenant),
@@ -416,7 +416,7 @@ async fn record_decision(
         },
     )
     .with_credential_id(actor.principal.credential_id);
-    event.resource = audience.as_str().to_owned();
+    audience.as_str().clone_into(&mut event.resource);
     append_auth_audit(conn, &event)
         .await
         .map_err(|error| DelegateError::Issuance(IssuanceError::Wyrd(error)))

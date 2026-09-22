@@ -55,14 +55,15 @@ pub fn connect_wyrd_client(
     credential: Option<String>,
     grpc_url: Option<String>,
 ) -> NativeWyrdClientResult {
-    NativeWyrdClientResult::from_outcome(
-        wyrd_client::bifrost::client_from_options(
-            server_url.as_deref(),
-            credential.as_deref(),
-            grpc_url.as_deref(),
-        )
-        .map_err(|error| WyrdError::from(&error)),
-    )
+    let client = wyrd_client::bifrost::client_from_options(
+        server_url.as_deref(),
+        credential.as_deref(),
+        grpc_url.as_deref(),
+    );
+    drop(server_url);
+    drop(credential);
+    drop(grpc_url);
+    NativeWyrdClientResult::from_outcome(client.map_err(|error| WyrdError::from(&error)))
 }
 
 #[napi]

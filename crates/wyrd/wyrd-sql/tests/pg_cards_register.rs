@@ -382,7 +382,7 @@ async fn make_retry_due(fixture: &PgFixture, card_uid: &CardUid) {
     conn.commit().await.expect("retry aging commits");
 }
 
-/// PostgreSQL, not the Rust host clock, decides whether a manifest's upload
+/// `PostgreSQL`, not the Rust host clock, decides whether a manifest's upload
 /// session is still live and resumable.
 #[tokio::test]
 async fn manifest_upload_liveness_is_decided_by_postgres() {

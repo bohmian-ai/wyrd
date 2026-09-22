@@ -131,7 +131,7 @@ async fn process_claim(
 
 /// Fixed retry backoff, in seconds, for the given completed attempt number.
 ///
-/// PostgreSQL turns this delay into the next-attempt deadline, so the schedule
+/// `PostgreSQL` turns this delay into the next-attempt deadline, so the schedule
 /// is independent of the reconciler host's wall clock.
 fn retry_delay_seconds(attempt: i32) -> i64 {
     match attempt {

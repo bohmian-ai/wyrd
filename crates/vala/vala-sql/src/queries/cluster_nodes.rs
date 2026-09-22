@@ -35,7 +35,7 @@ impl ClusterNodes {
 
     /// Validates one ready, fresh fenced Oracle role identity.
     ///
-    /// `liveness` is a window, not a cutoff instant: PostgreSQL subtracts it
+    /// `liveness` is a window, not a cutoff instant: `PostgreSQL` subtracts it
     /// from its own `statement_timestamp()` so every replica observes the same
     /// liveness boundary regardless of host clock skew.
     ///

@@ -128,7 +128,7 @@ pub enum PlatformCredentialError {
 /// deliberately expensive, persists only the verifier, and hands the
 /// plaintext back for its single exposure. `lifetime` is optional: an
 /// administrative credential established at initialization has no natural
-/// lifetime. PostgreSQL derives the stored expiry from that lifetime.
+/// lifetime. `PostgreSQL` derives the stored expiry from that lifetime.
 ///
 /// The insert runs on the caller's transaction — the one already carrying
 /// the authorization allowance — and the caller commits. A credential that

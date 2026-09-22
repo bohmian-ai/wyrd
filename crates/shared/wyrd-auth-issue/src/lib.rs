@@ -276,7 +276,7 @@ impl IssuingKey {
     ///
     /// `issued_at` is supplied by the caller rather than sampled here so that
     /// the signed `exp` and the durable refresh row that records it are derived
-    /// from one clock. Callers that persist the token pass the PostgreSQL
+    /// from one clock. Callers that persist the token pass the `PostgreSQL`
     /// issuance instant of their own transaction.
     ///
     /// # Errors

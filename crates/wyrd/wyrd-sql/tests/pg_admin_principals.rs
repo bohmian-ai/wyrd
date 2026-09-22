@@ -380,7 +380,7 @@ mod pg_tests {
     }
 
     /// Tenant API-key status and the relative expiry it reports both come from
-    /// PostgreSQL, so status, active lookup, and the issued expiry agree.
+    /// `PostgreSQL`, so status, active lookup, and the issued expiry agree.
     ///
     /// # Panics
     ///

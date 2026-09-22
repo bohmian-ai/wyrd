@@ -51,7 +51,7 @@ pub struct PromotableHotFileRow {
 /// `committed_snapshot_id` and `forge_publication_operation_id` are the two
 /// halves of the catalog-to-SQL settlement window: both present means the
 /// group provably landed in that snapshot under that operation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct PlannedHotFileRow {
     /// Durable file-list identity this state describes.
     pub id: uuid::Uuid,
@@ -218,9 +218,8 @@ impl HotFileCatalog {
         file_ids: &[uuid::Uuid],
     ) -> Result<Vec<PlannedHotFileRow>, SqlError> {
         // raw-query grep allowlist: this tenant-scoped file-list read post-dates the sqlx offline cache; run `mise run sqlx:prepare` to promote it to a macro. It remains bound to `TenantConn` and `wyrd.current_tenant()` and introduces no tenant-boundary exception.
-        let rows: Vec<(uuid::Uuid, String, Option<i64>, Option<uuid::Uuid>, bool)> =
-            sqlx::query_as(
-                r#"
+        sqlx::query_as::<_, PlannedHotFileRow>(
+            r#"
             SELECT id, file_path, committed_snapshot_id, forge_publication_operation_id, compacted
               FROM vala.file_list
              WHERE data_tenant_id = wyrd.current_tenant()
@@ -229,33 +228,13 @@ impl HotFileCatalog {
                AND id = ANY($3)
              ORDER BY created_at, file_ordinal, id
             "#,
-            )
-            .bind(&self.namespace)
-            .bind(&self.table_name)
-            .bind(file_ids)
-            .fetch_all(&mut **conn.transaction())
-            .await
-            .map_err(SqlError::from)?;
-        Ok(rows
-            .into_iter()
-            .map(
-                |(
-                    id,
-                    file_path,
-                    committed_snapshot_id,
-                    forge_publication_operation_id,
-                    compacted,
-                )| {
-                    PlannedHotFileRow {
-                        id,
-                        file_path,
-                        committed_snapshot_id,
-                        forge_publication_operation_id,
-                        compacted,
-                    }
-                },
-            )
-            .collect())
+        )
+        .bind(&self.namespace)
+        .bind(&self.table_name)
+        .bind(file_ids)
+        .fetch_all(&mut **conn.transaction())
+        .await
+        .map_err(SqlError::from)
     }
 
     /// Records that one committed promotion snapshot now represents these rows.
@@ -319,7 +298,7 @@ impl HotFileCatalog {
 ///
 /// # Errors
 ///
-/// Returns [`SqlError::Query`] when PostgreSQL cannot execute the tenant-scoped
+/// Returns [`SqlError::Query`] when `PostgreSQL` cannot execute the tenant-scoped
 /// read.
 pub async fn list_nonterminal_file_paths(
     conn: &mut TenantConn<'_>,
@@ -460,7 +439,7 @@ mod pg_tests {
     ///
     /// # Panics
     ///
-    /// Panics when the PostgreSQL fixture, insert, or tenant-scoped read fails.
+    /// Panics when the `PostgreSQL` fixture, insert, or tenant-scoped read fails.
     #[tokio::test]
     async fn unresolved_hot_cut_projects_bounds_without_migration() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -521,7 +500,7 @@ mod pg_tests {
     ///
     /// # Panics
     ///
-    /// Panics when the PostgreSQL fixture, inserts, reads, or settlement fail.
+    /// Panics when the `PostgreSQL` fixture, inserts, reads, or settlement fail.
     #[tokio::test]
     async fn promotable_hot_files_are_exact_and_settlement_is_idempotent() {
         let fixture = PgFixture::start().await.expect("fixture starts");

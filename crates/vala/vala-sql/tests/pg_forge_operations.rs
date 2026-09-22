@@ -8,7 +8,7 @@ mod pg_tests {
     //! Run via `mise run test:sql`.
 
     mod forge_operations {
-        //! Exercises the concrete Forge SQL owner against real PostgreSQL.
+        //! Exercises the concrete Forge SQL owner against real `PostgreSQL`.
         //!
         //! The tests use tenant transactions for public workflows and the
         //! migrator fixture only to inspect catalogs or arrange deliberately
@@ -50,7 +50,7 @@ mod pg_tests {
         ///
         /// # Panics
         ///
-        /// Panics when PostgreSQL setup or role-backed pool creation fails.
+        /// Panics when `PostgreSQL` setup or role-backed pool creation fails.
         async fn setup() -> TestFixtures {
             let fixture = PgFixture::start().await.expect("fixture");
             let superuser = fixture.superuser_pool().await.expect("superuser pool");
@@ -86,7 +86,7 @@ mod pg_tests {
         /// # Errors
         ///
         /// Returns the Forge transition error without committing when the
-        /// public owner rejects the event or PostgreSQL IO fails.
+        /// public owner rejects the event or `PostgreSQL` IO fails.
         ///
         /// # Panics
         ///
@@ -123,7 +123,7 @@ mod pg_tests {
         /// # Errors
         ///
         /// Returns the Forge transition error without committing when the
-        /// public owner rejects the event or PostgreSQL IO fails.
+        /// public owner rejects the event or `PostgreSQL` IO fails.
         ///
         /// # Panics
         ///
@@ -204,7 +204,7 @@ mod pg_tests {
         }
 
         /// Reads one operation's persisted ordering timestamps alongside the
-        /// database clock, so callers can prove the stamps are PostgreSQL's.
+        /// database clock, so callers can prove the stamps are `PostgreSQL`'s.
         ///
         /// # Panics
         ///
@@ -295,7 +295,7 @@ mod pg_tests {
         // Schema
         // -----------------------------------------------------------------------
 
-        /// Verifies the complete ordered PostgreSQL catalog contract.
+        /// Verifies the complete ordered `PostgreSQL` catalog contract.
         ///
         /// # Panics
         ///

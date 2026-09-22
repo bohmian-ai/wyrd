@@ -52,7 +52,7 @@ pub struct CardReconcileClaim {
 ///
 /// Eligibility and the new lease deadline are both derived from the claim
 /// statement's `statement_timestamp()`, so a host clock that leads or lags
-/// PostgreSQL cannot defer or shorten reconciliation. `lease_seconds` is the
+/// `PostgreSQL` cannot defer or shorten reconciliation. `lease_seconds` is the
 /// requested lease length; the statement returns the remainder it actually
 /// granted.
 ///
@@ -155,7 +155,7 @@ pub async fn lock_card_reconciliation_lease(
 
 /// Schedule tenant-owned lifecycle work after a client-visible side effect failed.
 ///
-/// `retry_delay_seconds` is a delay, not a deadline: PostgreSQL derives the
+/// `retry_delay_seconds` is a delay, not a deadline: `PostgreSQL` derives the
 /// next attempt from its own `statement_timestamp()` so host clock skew cannot
 /// make freshly scheduled work ineligible.
 ///
@@ -203,7 +203,7 @@ pub async fn schedule_card_reconciliation(
 
 /// Return a claimed row to the retry queue without consuming an attempt.
 ///
-/// `retry_delay_seconds` is a delay evaluated against PostgreSQL's own
+/// `retry_delay_seconds` is a delay evaluated against `PostgreSQL`'s own
 /// `statement_timestamp()`.
 ///
 /// # Errors
@@ -306,7 +306,7 @@ pub async fn mark_card_reconciliation_succeeded(
 
 /// Record a failed claimed attempt, dead-lettering exactly the third failure.
 ///
-/// `retry_delay_seconds` is a delay evaluated against PostgreSQL's own
+/// `retry_delay_seconds` is a delay evaluated against `PostgreSQL`'s own
 /// `statement_timestamp()`.
 ///
 /// # Errors
@@ -387,7 +387,7 @@ pub struct CardManifestCompletionRow {
     pub storage_expected_size_bytes: Option<i64>,
     /// Storage backend bound to the upload.
     pub storage_backend: Option<String>,
-    /// Whether PostgreSQL considers the linked upload session live and resumable.
+    /// Whether `PostgreSQL` considers the linked upload session live and resumable.
     ///
     /// The verdict combines the upload status with `expires_at >
     /// statement_timestamp()` inside the owning query, so no caller compares a

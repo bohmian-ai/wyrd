@@ -23,7 +23,7 @@ mod pg_tests {
     /// Starts one isolated migrated database and returns its administrative pool.
     ///
     /// # Panics
-    /// Panics when the repository PostgreSQL fixture cannot start.
+    /// Panics when the repository `PostgreSQL` fixture cannot start.
     async fn setup() -> (PgFixture, PgPool) {
         let fixture = PgFixture::start().await.expect("fixture");
         let admin = fixture.superuser_pool().await.expect("admin pool");
@@ -304,7 +304,7 @@ mod pg_tests {
     /// advances its durable cursor after a successful fitting claim.
     ///
     /// # Panics
-    /// Panics when PostgreSQL setup or cursor assertions fail.
+    /// Panics when `PostgreSQL` setup or cursor assertions fail.
     #[tokio::test]
     async fn worker_claim_cursor_is_independent_and_success_only() {
         let (fixture, admin) = setup().await;
@@ -374,7 +374,7 @@ mod pg_tests {
     ///
     /// # Panics
     /// Panics when rollback, exact cancellation, demand repair, or reclaim
-    /// invariants fail against PostgreSQL.
+    /// invariants fail against `PostgreSQL`.
     #[tokio::test]
     async fn superseded_cancellation_is_atomic_terminal_progress() {
         let (fixture, admin) = setup().await;
@@ -461,7 +461,7 @@ mod pg_tests {
     /// Proves duplicate enqueue, concurrent at-most-once claim, and stale attempt fencing.
     ///
     /// # Panics
-    /// Panics when PostgreSQL setup or a lifecycle assertion fails.
+    /// Panics when `PostgreSQL` setup or a lifecycle assertion fails.
     #[tokio::test]
     async fn competing_claim_is_at_most_once_and_stale_attempts_fail() {
         let (fixture, _admin) = setup().await;
@@ -528,7 +528,7 @@ mod pg_tests {
     /// of the first claim do not rewind the ring.
     ///
     /// # Panics
-    /// Panics when PostgreSQL setup or a cursor assertion fails.
+    /// Panics when `PostgreSQL` setup or a cursor assertion fails.
     #[tokio::test]
     async fn scheduler_takeover_preserves_cursor() {
         let (fixture, admin) = setup().await;
@@ -892,7 +892,7 @@ mod pg_tests {
     /// Prepared takeover preserves the committing generation and exact evidence.
     ///
     /// # Panics
-    /// Panics when PostgreSQL setup or takeover invariants fail.
+    /// Panics when `PostgreSQL` setup or takeover invariants fail.
     #[tokio::test]
     async fn prepared_reconciliation_takeover_is_at_most_once() {
         let (fixture, admin) = setup().await;
@@ -2173,7 +2173,7 @@ mod pg_tests {
     /// so snapshot expiry cannot be starved by compaction load.
     ///
     /// # Panics
-    /// Panics when PostgreSQL setup or claim assertions fail.
+    /// Panics when `PostgreSQL` setup or claim assertions fail.
     #[tokio::test]
     async fn maintenance_strategy_filter_claims_past_compaction_backlog() {
         let (fixture, _admin) = setup().await;
@@ -2265,7 +2265,7 @@ mod pg_tests {
     /// work, so it is deliberately excluded from the maintenance-reserved slot.
     ///
     /// # Panics
-    /// Panics when PostgreSQL setup, enqueue, claim, or the exact strategy,
+    /// Panics when `PostgreSQL` setup, enqueue, claim, or the exact strategy,
     /// and parameter assertions fail.
     #[tokio::test]
     async fn scribe_promotion_task_round_trips_and_unknown_strategy_quarantines() {
@@ -3120,7 +3120,7 @@ mod pg_tests {
     /// terminal task stops blocking its successor.
     ///
     /// # Panics
-    /// Panics when PostgreSQL setup or any invariant assertion fails.
+    /// Panics when `PostgreSQL` setup or any invariant assertion fails.
     #[tokio::test]
     async fn orphan_cleanup_demand_coalesces_onto_one_nonterminal_task() {
         let (fixture, admin) = setup().await;
@@ -3258,7 +3258,7 @@ mod pg_tests {
     ///
     /// One periodic orphan-cleanup task is fully described by its tenant, its
     /// table, one immutable scan prefix, and one immutable age cutoff. This
-    /// pins that whole contract against real PostgreSQL: the exact plan and
+    /// pins that whole contract against real `PostgreSQL`: the exact plan and
     /// cursor shapes round-trip, no Reset row and no source-operation identity
     /// is required or accepted anywhere in it, and every widened, malformed, or
     /// out-of-prefix value is refused before it can become durable state.
@@ -3273,7 +3273,7 @@ mod pg_tests {
     /// observing the transition roll back with it.
     ///
     /// # Panics
-    /// Panics when PostgreSQL setup or any closure assertion fails.
+    /// Panics when `PostgreSQL` setup or any closure assertion fails.
     #[tokio::test]
     async fn orphan_cleanup_plan_cursor_retry_and_completion_are_closed() {
         let (fixture, admin) = setup().await;
@@ -3751,7 +3751,7 @@ mod pg_tests {
     /// must not keep its own owner unready forever.
     ///
     /// # Panics
-    /// Panics when PostgreSQL setup or any state assertion fails.
+    /// Panics when `PostgreSQL` setup or any state assertion fails.
     #[tokio::test]
     async fn unattended_work_excludes_the_attempts_its_caller_still_holds() {
         let (fixture, admin) = setup().await;
@@ -3833,7 +3833,7 @@ mod pg_tests {
     /// cursor stays unready without becoming claimable early.
     ///
     /// # Panics
-    /// Panics when PostgreSQL setup or any state assertion fails.
+    /// Panics when `PostgreSQL` setup or any state assertion fails.
     #[tokio::test]
     async fn recoverable_cleanup_claim_and_predicate_cover_exact_states() {
         let (fixture, admin) = setup().await;

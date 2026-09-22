@@ -46,7 +46,7 @@ impl PgLoginStateStore {
         Self { pool }
     }
 
-    /// Store one login-state row whose expiry PostgreSQL derives from `ttl`.
+    /// Store one login-state row whose expiry `PostgreSQL` derives from `ttl`.
     pub async fn put(
         &self,
         tenant: DataTenantId,

@@ -34,7 +34,7 @@ pub struct PlatformCredentialLookupRow {
     /// Owning principal's stored kind, so a session records what it acts as
     /// rather than assuming every platform principal is a machine root.
     pub principal_kind: String,
-    /// Whether PostgreSQL judged this credential presently usable.
+    /// Whether `PostgreSQL` judged this credential presently usable.
     ///
     /// Usable means the credential is neither revoked nor expired and its
     /// principal is active, all decided by the statement that owns the row.
@@ -67,7 +67,7 @@ pub struct PlatformCredentialMetadataRow {
 /// collides or `principal_id` does not name an existing platform principal.
 /// Insert a platform credential inside a caller-owned transaction.
 ///
-/// `lifetime` is a relative lifetime or `None` for no expiry; PostgreSQL
+/// `lifetime` is a relative lifetime or `None` for no expiry; `PostgreSQL`
 /// derives the stored `expires_at` from its own `statement_timestamp()`.
 ///
 /// Used where the credential is only meaningful together with what else the

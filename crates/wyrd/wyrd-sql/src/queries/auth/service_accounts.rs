@@ -253,7 +253,7 @@ pub async fn tenant_admin_principal_id(
 /// plaintext is returned once by the issuing caller and never persisted.
 /// `lifetime` is optional: an administrative credential issued during tenant
 /// provisioning or recovery has no natural lifetime, while a workload key
-/// supplies the bounded lifetime its issuance path requested. PostgreSQL turns
+/// supplies the bounded lifetime its issuance path requested. `PostgreSQL` turns
 /// that lifetime into the stored expiry, and the insert returns the exact
 /// `created_at` and `expires_at` it wrote so no caller reconstructs them from
 /// the host clock.

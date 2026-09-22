@@ -35,7 +35,7 @@ pub struct LoginStateRow {
     pub redirect_uri: String,
 }
 
-/// Insert a login-state row whose expiry PostgreSQL derives from `ttl`.
+/// Insert a login-state row whose expiry `PostgreSQL` derives from `ttl`.
 ///
 /// The caller binds a lifetime, never an absolute instant, so the row's expiry
 /// and the consume predicate that evaluates it share one clock.
@@ -83,7 +83,7 @@ pub async fn take_login_state(
 mod tests {
     use super::{INSERT_LOGIN_STATE_SQL, TAKE_LOGIN_STATE_SQL};
 
-    /// Both statements stay tenant-bound and let PostgreSQL own expiry.
+    /// Both statements stay tenant-bound and let `PostgreSQL` own expiry.
     #[test]
     fn login_state_insert_and_take_queries_are_tenant_scoped() {
         assert!(INSERT_LOGIN_STATE_SQL.contains("data_tenant_id"));

@@ -1,4 +1,4 @@
-//! PostgreSQL integration coverage for Oracle membership and role fencing.
+//! `PostgreSQL` integration coverage for Oracle membership and role fencing.
 
 use chrono::{Duration, Utc};
 use vala_sql::{
@@ -149,7 +149,7 @@ impl ClusterNodes {
 }
 
 /// Reads one node's durable `started_at` and `heartbeat_at`, plus whether the
-/// heartbeat was stamped by PostgreSQL rather than copied from `started_at`.
+/// heartbeat was stamped by `PostgreSQL` rather than copied from `started_at`.
 ///
 /// # Panics
 ///
@@ -351,7 +351,7 @@ async fn live_discovery_excludes_expired_heartbeat() {
 }
 
 mod pg_tests {
-    //! PostgreSQL integration coverage for the durable Oracle reader authority.
+    //! `PostgreSQL` integration coverage for the durable Oracle reader authority.
     //!
     //! These tests drive the real SQL owners against a live database: the
     //! per-table serialization row, the epoch lease, and the per-epoch table

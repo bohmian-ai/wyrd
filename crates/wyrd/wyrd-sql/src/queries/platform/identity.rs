@@ -144,7 +144,7 @@ pub async fn delete_platform_oidc_connection(conn: &mut TenantConn<'_>) -> Resul
         .map_err(SqlError::from)
 }
 
-/// Persist one single-use login state row whose expiry PostgreSQL derives from
+/// Persist one single-use login state row whose expiry `PostgreSQL` derives from
 /// `ttl`.
 ///
 /// The caller binds a lifetime, never an absolute instant, so the row's expiry
@@ -191,7 +191,7 @@ pub struct PlatformLoginStateRow {
     pub issuer: String,
     /// Redirect URI the authorization code was bound to.
     pub redirect_uri: String,
-    /// Whether PostgreSQL judged the row still live when it deleted it.
+    /// Whether `PostgreSQL` judged the row still live when it deleted it.
     pub live: bool,
 }
 

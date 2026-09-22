@@ -77,6 +77,10 @@ impl IssueApiKey {
     /// # Errors
     /// Returns a typed error when the card cannot be bound, hashing fails, or
     /// the database rejects the insert.
+    ///
+    /// # Panics
+    /// Panics if `PostgreSQL` returns no expiry for a bound key lifetime, which
+    /// the insert's `CASE` makes impossible for a non-null lifetime.
     #[tracing::instrument(
         level = "debug",
         skip(self, conn, request),

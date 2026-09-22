@@ -1,4 +1,4 @@
-//! Durable PostgreSQL coordination for Forge maintenance work.
+//! Durable `PostgreSQL` coordination for Forge maintenance work.
 //!
 //! [`ForgeTasks`] owns bounded enqueue, fair claim, attempt, watermark,
 //! lifecycle, status, and retention workflows. Claims assign compute only;
@@ -31,10 +31,10 @@ use crate::{OperatorPool, SqlError, TenantConn};
 const TASK_PROJECTION: &str = "task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan,estimated_files,estimated_bytes,state,attempt_id,claimed_by,claim_expires_at,watermark_snapshot_id,watermark_timestamp_ms,evidence,attempt_count,failure_class,next_eligible_at,ready_at,created_at,updated_at";
 const CLAIM_TASK_PROJECTION: &str = "t.task_id,t.data_tenant_id,t.catalog_name,t.namespace_name,t.table_name,t.strategy,t.base_snapshot_id,t.plan,t.estimated_files,t.estimated_bytes,t.state,t.attempt_id,t.claimed_by,t.claim_expires_at,t.watermark_snapshot_id,t.watermark_timestamp_ms,t.evidence,t.attempt_count,t.failure_class,t.next_eligible_at,t.ready_at,t.created_at,t.updated_at";
 
-/// Exact PostgreSQL-16 fair-claim statement used by production and scale-plan proof.
+/// Exact `PostgreSQL`-16 fair-claim statement used by production and scale-plan proof.
 pub const FAIR_CLAIM_SQL: &str = include_str!("forge_fair_claim.sql");
 
-/// Claim limits enforced atomically by PostgreSQL.
+/// Claim limits enforced atomically by `PostgreSQL`.
 #[derive(Debug, Clone, Copy)]
 pub struct ForgeClaimLimits {
     /// Maximum active tasks for the selected tenant.
@@ -525,7 +525,7 @@ impl ForgeTasks {
 
     /// Claims one FIFO task for the next eligible tenant in the durable ring.
     ///
-    /// The worker-cursor row is locked first. PostgreSQL 16-compatible
+    /// The worker-cursor row is locked first. `PostgreSQL` 16-compatible
     /// `FOR UPDATE SKIP LOCKED` then selects one row and advances the cursor in
     /// the same transaction. Two durable bounds govern concurrency (D78): the
     /// retained per-table
@@ -1945,7 +1945,7 @@ pub struct ForgePreparedCleanupCandidate {
 ///
 /// # Errors
 ///
-/// Returns [`SqlError::Query`] when PostgreSQL cannot execute the tenant-scoped
+/// Returns [`SqlError::Query`] when `PostgreSQL` cannot execute the tenant-scoped
 /// read, and [`SqlError::InvariantViolation`] when a persisted row's evidence
 /// cannot be decoded or its prepared index names no candidate.
 pub async fn list_prepared_cleanup_candidates(

@@ -43,7 +43,7 @@ const INSERT_REFRESH_TOKEN_ROTATED_SQL: &str = r#"
     ) VALUES ($1, $2, $3, $4, $5, $6, $7)
 "#;
 
-/// Sample the PostgreSQL issuance instant for a refresh token, truncated to a
+/// Sample the `PostgreSQL` issuance instant for a refresh token, truncated to a
 /// whole second.
 ///
 /// The signed `exp` claim carries only whole seconds, so truncating here makes

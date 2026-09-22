@@ -29,31 +29,49 @@
       "additionalProperties": false
     },
     {
-      "description": "RFC 8693 token exchange for agent/service delegation.",
+      "description": "RFC 8693 token exchange: the actor acts on behalf of the subject.\n\nThe issued token names the subject as its top-level principal, the actor as the outermost `act` layer, and `audience` as its `aud`. Its authority is the intersection of both parties' permissions.",
       "type": "object",
       "required": [
+        "actor_token",
+        "actor_token_type",
+        "audience",
         "grant_type",
-        "requested_subject",
         "subject_token",
         "subject_token_type"
       ],
       "properties": {
+        "actor_token": {
+          "description": "Wyrd access token of the party doing the work (the actor).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/SecretBearer"
+            }
+          ]
+        },
+        "actor_token_type": {
+          "description": "Type of `actor_token`.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ExchangeTokenType"
+            }
+          ]
+        },
+        "audience": {
+          "description": "Wyrd resource the delegated token is issued for.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/TokenAudience"
+            }
+          ]
+        },
         "grant_type": {
           "type": "string",
           "enum": [
             "urn:ietf:params:oauth:grant-type:token-exchange"
           ]
         },
-        "requested_subject": {
-          "description": "Requested non-human target principal.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/RequestedSubject"
-            }
-          ]
-        },
         "subject_token": {
-          "description": "Existing access token to delegate from.",
+          "description": "Wyrd access token of the party being acted for (the subject).",
           "allOf": [
             {
               "$ref": "#/definitions/SecretBearer"
@@ -64,7 +82,7 @@
           "description": "Type of `subject_token`.",
           "allOf": [
             {
-              "$ref": "#/definitions/SubjectTokenType"
+              "$ref": "#/definitions/ExchangeTokenType"
             }
           ]
         }
@@ -166,158 +184,8 @@
     }
   ],
   "definitions": {
-    "CardKind": {
-      "title": "CardKind",
-      "description": "Wyrd Card kind.",
-      "type": "string",
-      "enum": [
-        "Data",
-        "Model",
-        "Experiment",
-        "Prompt",
-        "Agent",
-        "Workflow",
-        "Eval",
-        "Drift",
-        "Service",
-        "Policy",
-        "Mcp",
-        "Audit",
-        "Artifact",
-        "Trigger",
-        "Operator",
-        "Source"
-      ]
-    },
-    "CardName": {
-      "description": "Human-visible Card name.",
-      "type": "string"
-    },
-    "CardRef": {
-      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
-      "type": "object",
-      "required": [
-        "kind",
-        "name",
-        "version"
-      ],
-      "properties": {
-        "kind": {
-          "description": "Referenced Card kind.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/CardKind"
-            }
-          ]
-        },
-        "name": {
-          "description": "Referenced Card name.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/CardName"
-            }
-          ]
-        },
-        "space": {
-          "description": "Space pinning identity together with `name` and `version`.\n\nAuthors may omit it; the loader inherits the enclosing card's resolved metadata space before the reference crosses a wire boundary.",
-          "anyOf": [
-            {
-              "$ref": "#/definitions/SpaceName"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "uid": {
-          "description": "Optional server-resolved durable UID.\n\nAuthors identify a dependency with `(kind, space, name, version)` and may omit this field. The server resolves that reference to a [`CardUid`] before registration; the UID is then used for durable authorization and lineage without changing the authored reference identity.",
-          "anyOf": [
-            {
-              "$ref": "#/definitions/CardUid"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "version": {
-          "description": "Exact referenced Card version.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/VersionBlock"
-            }
-          ]
-        }
-      }
-    },
-    "CardUid": {
-      "description": "Resolved immutable Card UID.",
-      "type": "string"
-    },
-    "RequestedSubject": {
-      "description": "Token-exchange target.",
-      "oneOf": [
-        {
-          "description": "Target by principal id.",
-          "type": "object",
-          "required": [
-            "id",
-            "kind"
-          ],
-          "properties": {
-            "id": {
-              "description": "Stable principal id.",
-              "type": "string",
-              "format": "uuid"
-            },
-            "kind": {
-              "type": "string",
-              "enum": [
-                "principal_id"
-              ]
-            }
-          },
-          "additionalProperties": false
-        },
-        {
-          "description": "Target by card reference.",
-          "type": "object",
-          "required": [
-            "card_ref",
-            "kind"
-          ],
-          "properties": {
-            "card_ref": {
-              "description": "Service or Agent card reference.",
-              "allOf": [
-                {
-                  "$ref": "#/definitions/CardRef"
-                }
-              ]
-            },
-            "kind": {
-              "type": "string",
-              "enum": [
-                "card_ref"
-              ]
-            }
-          },
-          "additionalProperties": false
-        }
-      ]
-    },
-    "SecretBearer": {
-      "description": "Opaque secret. Redacted in logs and audit payloads.",
-      "writeOnly": true,
-      "type": "string",
-      "format": "password"
-    },
-    "SpaceName": {
-      "description": "Human-visible namespace for Cards and Runs.",
-      "type": "string"
-    },
-    "SubjectTokenType": {
-      "description": "Supported token type for RFC 8693 subject token.",
+    "ExchangeTokenType": {
+      "description": "Supported RFC 8693 token type for a subject or actor token.",
       "oneOf": [
         {
           "description": "OAuth access token.",
@@ -328,13 +196,34 @@
         }
       ]
     },
+    "SecretBearer": {
+      "description": "Opaque secret. Redacted in logs and audit payloads.",
+      "writeOnly": true,
+      "type": "string",
+      "format": "password"
+    },
     "TenantSlug": {
       "description": "Human-visible tenant slug resolved to a DataTenantId at the auth boundary.",
       "type": "string"
     },
-    "VersionBlock": {
-      "description": "Semver-compatible version string.",
-      "type": "string"
+    "TokenAudience": {
+      "description": "Audience (`aud`) of a Wyrd tenant access token.\n\nEvery directly issued token is [`Self::Wyrd`] and is accepted on every tenant surface. A [`Self::Bifrost`] token is accepted only on the Bifrost surfaces, so a token delegated for Bifrost cannot be replayed elsewhere.",
+      "oneOf": [
+        {
+          "description": "Every Wyrd tenant surface.",
+          "type": "string",
+          "enum": [
+            "wyrd"
+          ]
+        },
+        {
+          "description": "Only the Bifrost ingest and query surfaces.",
+          "type": "string",
+          "enum": [
+            "bifrost"
+          ]
+        }
+      ]
     }
   }
 }

@@ -1138,13 +1138,20 @@ async fn prove_scoped_bearer_over_grpc(
 /// Service B acts for Service A against Bifrost and holds only A's authority.
 ///
 /// A holds read on one concrete table; B holds read on that table plus table
-/// write. B, configured as an ordinary shared client, calls `on_behalf_of` with
-/// A's token: the delegated token names A as subject, B as the outer actor, and
-/// the Bifrost audience, and carries only the exact-table read. On the real
-/// Bifrost surface the read succeeds and a table registration is refused before
-/// effect, while B's own token then creates that same table. The invoke policy saw
-/// A-to-B, and both the exchange and the read decision are audited under A
-/// with B as the actor. The same token is refused on a non-Bifrost route.
+/// definition read and write, record write, and dataset-schema read. The invoke policy allows
+/// exactly A-subject/B-actor, so the same two valid tokens submitted in reverse
+/// are refused with the stable policy denial, commit one denied `invoke`
+/// decision under B, and issue nothing. B, configured as an ordinary shared
+/// client, calls `on_behalf_of` with A's token: the delegated token names A as
+/// subject, B as the outer actor, and the Bifrost audience, and carries only
+/// the exact-table read. On the real Bifrost surface the read succeeds, while a
+/// table registration over HTTP and a native-ingest write are each refused
+/// before effect; B's own token then creates that table and writes the one row
+/// the table ends up holding. The exchange is audited under A with B as actor,
+/// `invoke` as its permission, the Bifrost audience, and B's credential; the
+/// delegated read and refused native write are audited under A naming B, and
+/// B's direct write is audited under B with no attribution. The same token is
+/// refused on a non-Bifrost route.
 ///
 /// # Panics
 ///
@@ -1163,7 +1170,7 @@ async fn service_b_acts_for_service_a_with_only_a_table_authority() {
 ///
 /// Returns the first claim that broke.
 async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> {
-    let policy = std::sync::Arc::new(wyrd_auth_check::RecordingPolicyHook::default());
+    let policy = std::sync::Arc::new(DirectedInvokePolicy::default());
     let server = WyrdTestServer::builder()
         .with_policy_hook(policy.clone())
         .start_bound()
@@ -1194,11 +1201,30 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
         )),
     };
     let write = Permission::bifrost_table_write();
+    let datasets_read = Permission {
+        resource: wyrd_runtime::Resource::BifrostQuery,
+        action: wyrd_runtime::Action::Read,
+        scope: wyrd_runtime::PermissionScope::Bifrost(
+            wyrd_runtime::BifrostPermissionScope::Schema(wyrd_runtime::BifrostSchemaScope {
+                catalog: "vala".to_owned(),
+                schema: "datasets".to_owned(),
+            }),
+        ),
+    };
     server
         .seed_role("delegation_subject", std::slice::from_ref(&spans_read))
         .await?;
     server
-        .seed_role("delegation_actor", &[spans_read.clone(), write.clone()])
+        .seed_role(
+            "delegation_actor",
+            &[
+                spans_read.clone(),
+                write.clone(),
+                Permission::bifrost_table_read(),
+                Permission::bifrost_record_write(),
+                datasets_read,
+            ],
+        )
         .await?;
     let a = server
         .bootstrap_service_in_tenant(tenant, "delegation-a", &["delegation_subject"])
@@ -1209,6 +1235,35 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
     let a_token = server
         .exchange_api_key(a.api_key().ok_or("A carries no API key")?)
         .await?;
+    policy.allow_only(&a.id().to_string(), &b.id().to_string())?;
+
+    // The same two valid tokens in reverse ask a different, denied question.
+    let b_token = server
+        .exchange_api_key(b.api_key().ok_or("B carries no API key")?)
+        .await?;
+    match server
+        .delegate(&b_token, &a_token, wyrd_spec::auth::TokenAudience::Bifrost)
+        .await
+    {
+        Err(wyrd_testing::WyrdTestServerError::Http { status, code, .. })
+            if status.as_u16() == 403
+                && code == "WYRD_AUTHZ_403_POLICY_DENIED" => {}
+        other => {
+            return Err(format!(
+                "B-subject/A-actor must be refused by the invoke policy, got {other:?}"
+            )
+            .into());
+        }
+    }
+    let reverse = exchange_decisions(&server, tenant, &b.id().to_string()).await?;
+    if reverse != [("denied".to_owned(), "invoke".to_owned())] {
+        return Err(format!(
+            "the reverse exchange must commit exactly one denied invoke decision under B, \
+             got {reverse:?}"
+        )
+        .into());
+    }
+
     let b_client = client_for(&server, b.api_key().ok_or("B carries no API key")?)?;
 
     let delegated = b_client
@@ -1235,9 +1290,15 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
     );
     assert!(!permissions.contains(&write), "no write: {claims}");
 
-    let invoke = policy.last().ok_or("the invoke policy was not asked")?;
-    assert_eq!(invoke.subject.id.to_string(), a.id().to_string());
-    assert_eq!(invoke.actor.id.to_string(), b.id().to_string());
+    let asked = policy.asked()?;
+    assert_eq!(
+        asked,
+        [
+            (b.id().to_string(), a.id().to_string()),
+            (a.id().to_string(), b.id().to_string()),
+        ],
+        "the policy saw the denied reverse question, then the allowed A-to-B one"
+    );
 
     accepts(&delegated, TRACES_SQL).await?;
     let register = wyrd_spec::vala::api::RegisterTableRequest {
@@ -1286,6 +1347,49 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
         "the refused registration had no effect"
     );
 
+    // Native ingest: Gate refuses the delegated write before Scribe sees it,
+    // and B's own client writes the same table.
+    let events = "vala.datasets.delegation_events";
+    let described = wyrd_client::bifrost::TableConfig::describe(&b_client, events).await?;
+    let delegated_writer =
+        wyrd_client::Bifrost::connect_with_table(&delegated, described.clone()).await?;
+    delegated_writer.insert(br#"{"value": 1}"#.to_vec(), Default::default())?;
+    let denied_write = delegated_writer
+        .flush()
+        .await
+        .err()
+        .ok_or("the delegated token must not write records")?;
+    assert!(
+        denied_write
+            .to_string()
+            .contains("[WYRD_PERMISSION_403_DENIED_RBAC]")
+            && denied_write.to_string().contains("bifrost_record:write"),
+        "the delegated native write is refused for A's missing record write: {denied_write}"
+    );
+    let own_writer = wyrd_client::Bifrost::connect_with_table(&b_client, described).await?;
+    own_writer.insert(br#"{"value": 2}"#.to_vec(), Default::default())?;
+    own_writer.flush().await?;
+    server.flush_bifrost().await?;
+    let written = own_writer
+        .sql(&format!("SELECT value FROM {events}"))
+        .await?;
+    let values: Vec<i64> = written
+        .batches()
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column_by_name("value")
+                .and_then(|column| {
+                    column
+                        .as_any()
+                        .downcast_ref::<arrow::array::Int64Array>()
+                        .map(|values| values.iter().flatten().collect::<Vec<_>>())
+                })
+                .unwrap_or_default()
+        })
+        .collect();
+    assert_eq!(values, [2], "only B's own write landed");
+
     audit_rows(&server, tenant, READ_DECISION_OPERATION).await?;
     let mut conn = server.tenant_conn_for(tenant).await?;
     let attributed: Vec<(String, String, String)> = sqlx::query_as(
@@ -1318,8 +1422,147 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
         "the read names B as actor: {read_detail}"
     );
 
+    let mut conn = server.tenant_conn_for(tenant).await?;
+    let b_credential: uuid::Uuid =
+        sqlx::query_scalar("SELECT id FROM wyrd.auth_api_keys WHERE principal_id = $1")
+            .bind(uuid::Uuid::parse_str(&b_id)?)
+            .fetch_one(&mut **conn.transaction())
+            .await?;
+    let exchange_row: (String, Option<uuid::Uuid>) = sqlx::query_as(
+        "SELECT permission, credential_id FROM vala.audit_staging \
+         WHERE principal_id = $1 AND operation = 'auth.token.exchange' AND resource = 'bifrost' \
+           AND outcome = 'allowed'",
+    )
+    .bind(uuid::Uuid::parse_str(&a.id().to_string())?)
+    .fetch_one(&mut **conn.transaction())
+    .await?;
+    assert_eq!(
+        exchange_row,
+        ("invoke".to_owned(), Some(b_credential)),
+        "the exchange records the invoke decision and B's credential"
+    );
+    let writes: Vec<(String, uuid::Uuid, Option<String>)> = sqlx::query_as(
+        "SELECT outcome, principal_id, detail FROM vala.audit_staging \
+         WHERE operation = 'bifrost.record.write' ORDER BY seq",
+    )
+    .fetch_all(&mut **conn.transaction())
+    .await?;
+    conn.commit().await?;
+    let [(denied, denied_principal, denied_detail), (allowed, allowed_principal, allowed_detail)] =
+        writes.as_slice()
+    else {
+        return Err(format!("one refused and one admitted native write, got {writes:?}").into());
+    };
+    assert_eq!(denied, "denied");
+    assert_eq!(denied_principal.to_string(), a.id().to_string());
+    let denied_detail: serde_json::Value =
+        serde_json::from_str(denied_detail.as_deref().ok_or("the refusal names its actor")?)?;
+    assert_eq!(
+        denied_detail["delegation_chain"][0]["principal_id"], b_id,
+        "the refused native write names B as actor: {denied_detail}"
+    );
+    assert_eq!(allowed, "allowed");
+    assert_eq!(allowed_principal.to_string(), b_id);
+    assert!(
+        allowed_detail.is_none(),
+        "B's direct write carries no delegation attribution: {allowed_detail:?}"
+    );
+
     server.shutdown().await?;
     Ok(())
+}
+
+/// Committed `(outcome, permission)` token-exchange decisions recorded under
+/// `principal`, oldest first.
+///
+/// # Errors
+///
+/// Returns a connection, query, or commit failure.
+async fn exchange_decisions(
+    server: &WyrdTestServer,
+    tenant: DataTenantId,
+    principal: &str,
+) -> Result<Vec<(String, String)>, ServerJourneyError> {
+    let mut conn = server.tenant_conn_for(tenant).await?;
+    let rows = sqlx::query_as(
+        "SELECT outcome, permission FROM vala.audit_staging \
+         WHERE principal_id = $1 AND operation = 'auth.token.exchange' AND resource = 'bifrost' \
+         ORDER BY seq",
+    )
+    .bind(uuid::Uuid::parse_str(principal)?)
+    .fetch_all(&mut **conn.transaction())
+    .await?;
+    conn.commit().await?;
+    Ok(rows)
+}
+
+/// Invoke policy that allows exactly one directed subject/actor relation.
+///
+/// Production builds the invoke question with the subject token's principal
+/// as subject and the actor token's as actor; this hook answers it the way a
+/// real deployment's relation would, so a journey can prove A-to-B and B-to-A
+/// are different questions. It records every question it is asked as
+/// `(subject, actor)` principal ids. The relation is set once after the two
+/// principals exist; until then every question is denied.
+#[derive(Debug, Default)]
+struct DirectedInvokePolicy {
+    /// The one allowed `(subject, actor)` pair.
+    allowed: std::sync::OnceLock<(String, String)>,
+    /// Every `(subject, actor)` question asked, in order.
+    asked: std::sync::Mutex<Vec<(String, String)>>,
+}
+
+impl DirectedInvokePolicy {
+    /// Allow only `subject` acting through `actor`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a failure when the relation was already set.
+    fn allow_only(&self, subject: &str, actor: &str) -> Result<(), ServerJourneyError> {
+        self.allowed
+            .set((subject.to_owned(), actor.to_owned()))
+            .map_err(|_| "the directed relation is set once".into())
+    }
+
+    /// Every `(subject, actor)` question asked so far, in order.
+    ///
+    /// # Errors
+    ///
+    /// Returns a failure when the record lock is poisoned.
+    fn asked(&self) -> Result<Vec<(String, String)>, ServerJourneyError> {
+        Ok(self
+            .asked
+            .lock()
+            .map_err(|_| "the policy record lock is poisoned")?
+            .clone())
+    }
+}
+
+#[async_trait::async_trait]
+impl wyrd_auth_check::PolicyHook for DirectedInvokePolicy {
+    /// Records the question and allows it only for the configured relation.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the record lock is poisoned.
+    async fn evaluate(
+        &self,
+        ctx: &wyrd_auth_check::AuthzCheckContext,
+    ) -> wyrd_spec::card::policy::PolicyDecision {
+        let question = (ctx.subject.id.to_string(), ctx.actor.id.to_string());
+        let allowed = self.allowed.get() == Some(&question);
+        self.asked
+            .lock()
+            .expect("invariant: the policy record lock is never poisoned")
+            .push(question);
+        if allowed {
+            wyrd_spec::card::policy::PolicyDecision::Allow
+        } else {
+            wyrd_spec::card::policy::PolicyDecision::Deny {
+                reason: "no_directed_invoke_relation".to_owned(),
+            }
+        }
+    }
 }
 
 /// Decodes a JWT payload for contract assertions only; never verifies it.

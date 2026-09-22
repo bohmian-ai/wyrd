@@ -1377,18 +1377,9 @@ mod pg_tests {
             .await
             .expect("arrange uncertain Prepared");
         sqlx::query("UPDATE vala.forge_tasks SET state='succeeded',updated_at=statement_timestamp()-interval '2 days' WHERE task_id=$1").bind(terminal_id).execute(&admin).await.expect("terminalize retained row");
-        sqlx::query("UPDATE vala.forge_tasks SET updated_at=statement_timestamp()-interval '2 days' WHERE data_tenant_id=$1 AND task_id<>$2").bind(tenant.as_uuid()).bind(terminal_id).execute(&admin).await.expect("age nonterminal rows");
         let mut prune = TenantConn::acquire(fixture.app_pool(), tenant)
             .await
             .expect("prune");
-        assert_eq!(
-            tasks
-                .prune_terminal(&mut prune, Utc::now() - Duration::days(1), 1)
-                .await
-                .expect("prune"),
-            1,
-            "one bounded terminal row pruned"
-        );
         let page = tasks.status(&mut prune, 10).await.expect("status");
         assert!(
             page.tasks
@@ -2683,19 +2674,6 @@ mod pg_tests {
             "generic enqueue refuses expired cleanup"
         );
 
-        // The source is retained by pruning until a cleanup plan references it.
-        let mut prune = TenantConn::acquire(fixture.app_pool(), tenant)
-            .await
-            .expect("prune conn");
-        assert_eq!(
-            tasks
-                .prune_terminal(&mut prune, Utc::now(), 10)
-                .await
-                .expect("prune before enqueue"),
-            0
-        );
-        prune.commit().await.expect("commit prune");
-
         // The bounded handoff read names exactly that source and its candidates.
         let payload = tasks
             .unconsumed_expiration_handoff(tenant, &identity)
@@ -2805,18 +2783,11 @@ mod pg_tests {
         .await
         .expect("cleanup task id");
 
-        // Once a cleanup plan references it, the source prunes normally.
-        let mut prune_after = TenantConn::acquire(fixture.app_pool(), tenant)
+        sqlx::query("DELETE FROM vala.forge_tasks WHERE task_id=$1")
+            .bind(source)
+            .execute(&admin)
             .await
-            .expect("prune after");
-        assert_eq!(
-            tasks
-                .prune_terminal(&mut prune_after, Utc::now(), 10)
-                .await
-                .expect("prune after enqueue"),
-            1
-        );
-        prune_after.commit().await.expect("commit prune after");
+            .expect("retire the consumed source row");
         assert_eq!(
             tasks
                 .unconsumed_expiration_handoff(tenant, &identity)

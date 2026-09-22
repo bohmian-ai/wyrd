@@ -19,7 +19,6 @@
 
 use std::str::FromStr;
 
-use chrono::Utc;
 use sqlx::types::Uuid;
 use sqlx::{PgConnection, Postgres, Transaction};
 use wyrd_spec::DataTenantId;
@@ -566,7 +565,6 @@ impl<'resource> ForgeOperations<'resource> {
         operation_id: Uuid,
         detail: &AuditDetail,
     ) -> Result<(), SqlError> {
-        let now = Utc::now();
         let detail_json =
             serde_json::to_value(detail).map_err(|e| SqlError::InvariantViolation {
                 detail: format!("failed to serialize prepared detail: {e}"),
@@ -580,7 +578,7 @@ impl<'resource> ForgeOperations<'resource> {
              prepared_at, updated_at)
         VALUES (wyrd.current_tenant(), $1, $2, $3, 'prepared',
                 $4::jsonb, $4::jsonb,
-                $5, $5)
+                statement_timestamp(), statement_timestamp())
         ON CONFLICT (data_tenant_id, resource, family, operation_id) DO UPDATE
             SET phase = 'prepared',
                 current_detail = EXCLUDED.prepared_detail,
@@ -593,7 +591,6 @@ impl<'resource> ForgeOperations<'resource> {
         .bind(self.family.as_str())
         .bind(operation_id)
         .bind(detail_json.to_string())
-        .bind(now)
         .execute(&mut *conn)
         .await
         .map_err(SqlError::from)?;
@@ -621,7 +618,6 @@ impl<'resource> ForgeOperations<'resource> {
         detail: &AuditDetail,
         terminal_phase: ForgeOperationPhase,
     ) -> Result<(), SqlError> {
-        let now = Utc::now();
         let detail_json =
             serde_json::to_value(detail).map_err(|e| SqlError::InvariantViolation {
                 detail: format!("failed to serialize terminal detail: {e}"),
@@ -632,7 +628,7 @@ impl<'resource> ForgeOperations<'resource> {
         UPDATE vala.forge_operation_state
            SET phase = $4,
                current_detail = $5::jsonb,
-               updated_at = $6
+               updated_at = statement_timestamp()
          WHERE data_tenant_id = wyrd.current_tenant()
            AND resource = $1
            AND family = $2
@@ -644,7 +640,6 @@ impl<'resource> ForgeOperations<'resource> {
         .bind(operation_id)
         .bind(terminal_phase.as_str())
         .bind(detail_json.to_string())
-        .bind(now)
         .execute(&mut *conn)
         .await
         .map_err(SqlError::from)?;

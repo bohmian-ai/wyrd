@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::Utc;
 use num_traits::ToPrimitive;
 use thiserror::Error;
 use tokio::task::JoinHandle;
@@ -333,17 +333,7 @@ impl ClusterRegistry {
             .tenant_conn(DataTenantId::SYSTEM_OWNER)
             .await?;
         self.nodes
-            .validate_live_oracle(
-                &mut conn,
-                node_id,
-                fencing_token,
-                Utc::now()
-                    - ChronoDuration::from_std(self.liveness_cutoff()).map_err(|_| {
-                        SqlError::InvariantViolation {
-                            detail: "invalid liveness cutoff".to_owned(),
-                        }
-                    })?,
-            )
+            .validate_live_oracle(&mut conn, node_id, fencing_token, self.liveness_cutoff())
             .await?;
         conn.commit().await.map_err(ClusterError::Sql)
     }
@@ -435,12 +425,7 @@ impl ClusterRegistry {
     /// Returns [`ClusterError`] if either closed role projection cannot be decoded
     /// or read from membership.
     pub async fn refresh_snapshot(&self) -> Result<(), ClusterError> {
-        let cutoff = Utc::now()
-            - chrono::Duration::from_std(self.liveness_cutoff()).map_err(|error| {
-                ClusterError::Sql(SqlError::InvariantViolation {
-                    detail: error.to_string(),
-                })
-            })?;
+        let liveness = self.liveness_cutoff();
         let mut conn = self
             .nodes
             .postgres()
@@ -448,11 +433,11 @@ impl ClusterRegistry {
             .await?;
         let scribes = self
             .nodes
-            .list_live(&mut conn, ClusterRole::Scribe, cutoff)
+            .list_live(&mut conn, ClusterRole::Scribe, liveness)
             .await?;
         let oracles = self
             .nodes
-            .list_live(&mut conn, ClusterRole::Oracle, cutoff)
+            .list_live(&mut conn, ClusterRole::Oracle, liveness)
             .await?;
         conn.commit().await?;
         self.snapshot.store(Arc::new(ClusterSnapshot::new(

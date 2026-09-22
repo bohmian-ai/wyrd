@@ -104,22 +104,20 @@ impl ClusterNodes {
     async fn list_live(
         &self,
         role: ClusterRole,
-        heartbeat_after: chrono::DateTime<Utc>,
+        liveness: std::time::Duration,
     ) -> Result<Vec<wyrd_spec::vala::api::ClusterRoleLease>, vala_sql::SqlError> {
         let mut conn = self
             .inner
             .postgres()
             .tenant_conn(DataTenantId::SYSTEM_OWNER)
             .await?;
-        let rows = self
-            .inner
-            .list_live(&mut conn, role, heartbeat_after)
-            .await?;
+        let rows = self.inner.list_live(&mut conn, role, liveness).await?;
         conn.commit().await?;
         Ok(rows)
     }
 
-    /// Ages a registered node heartbeat to exercise the discovery cutoff.
+    /// Ages a registered node heartbeat in database time to exercise the
+    /// discovery window without trusting the test host clock.
     ///
     /// # Errors
     ///
@@ -127,7 +125,7 @@ impl ClusterNodes {
     async fn age_heartbeat(
         &self,
         node_id: NodeId,
-        heartbeat_at: chrono::DateTime<Utc>,
+        age_seconds: i64,
     ) -> Result<(), vala_sql::SqlError> {
         let mut conn = self
             .inner
@@ -135,11 +133,12 @@ impl ClusterNodes {
             .tenant_conn(DataTenantId::SYSTEM_OWNER)
             .await?;
         sqlx::query(
-            "UPDATE vala.cluster_nodes SET heartbeat_at=$2 \
+            "UPDATE vala.cluster_nodes \
+                SET heartbeat_at=statement_timestamp() - ($2 * interval '1 second') \
              WHERE data_tenant_id=$1 AND node_id=$3",
         )
         .bind(uuid::Uuid::from(conn.data_tenant_id()))
-        .bind(heartbeat_at)
+        .bind(age_seconds as f64)
         .bind(node_id.as_uuid())
         .execute(&mut **conn.transaction())
         .await
@@ -147,6 +146,32 @@ impl ClusterNodes {
         conn.commit().await?;
         Ok(())
     }
+}
+
+/// Reads one node's durable `started_at` and `heartbeat_at`, plus whether the
+/// heartbeat was stamped by PostgreSQL rather than copied from `started_at`.
+///
+/// # Panics
+///
+/// Panics when the projection cannot be read.
+async fn registration_times(
+    fixture: &PgFixture,
+    node_id: NodeId,
+) -> (chrono::DateTime<Utc>, chrono::DateTime<Utc>) {
+    let mut conn = fixture
+        .vala_postgres()
+        .tenant_conn(DataTenantId::SYSTEM_OWNER)
+        .await
+        .expect("system tenant connection opens");
+    let row = sqlx::query_as::<_, (chrono::DateTime<Utc>, chrono::DateTime<Utc>)>(
+        "SELECT started_at, heartbeat_at FROM vala.cluster_nodes WHERE node_id=$1",
+    )
+    .bind(node_id.as_uuid())
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("registration row is readable");
+    conn.commit().await.expect("read commits");
+    row
 }
 
 /// Starts an isolated database and seeds one tenant.
@@ -250,7 +275,7 @@ async fn stale_role_mutation_is_rejected() {
     );
     assert!(
         owner
-            .list_live(ClusterRole::Scribe, Utc::now() - Duration::seconds(30))
+            .list_live(ClusterRole::Scribe, std::time::Duration::from_secs(30))
             .await
             .expect("unready role discovery")
             .is_empty(),
@@ -267,34 +292,62 @@ async fn stale_role_mutation_is_rejected() {
 async fn live_discovery_excludes_expired_heartbeat() {
     let (fixture, _) = setup().await;
     let owner = ClusterNodes::new(fixture.vala_postgres().clone());
-    let registration = RoleRegistration {
-        key: ClusterNodeKey {
-            node_id: NodeId::new(uuid::Uuid::now_v7()),
-            role: ClusterRole::Scribe,
-        },
-        address: "http://scribe:5001".into(),
-        capabilities: ClusterCapabilities::ScribeV1(ScribeCapabilitiesV1 {
-            tail_protocol_version: 1,
-        }),
-        started_at: Utc::now(),
-    };
-    owner.register(&registration).await.expect("role registers");
-    owner
-        .heartbeat(&registration.key, 1, true, &registration.capabilities)
-        .await
-        .expect("heartbeat applies");
-    owner
-        .age_heartbeat(
-            registration.key.node_id,
-            Utc::now() - Duration::seconds(120),
-        )
-        .await
-        .expect("heartbeat ages");
-    let live = owner
-        .list_live(ClusterRole::Scribe, Utc::now() - Duration::seconds(30))
-        .await
-        .expect("live roles list");
-    assert!(live.is_empty(), "expired heartbeat must not be live");
+    // A process clock that is far behind or far ahead of PostgreSQL must not
+    // decide liveness: registration stamps heartbeat_at in the database.
+    for skewed_start in [
+        Utc::now() - Duration::seconds(3600),
+        Utc::now() + Duration::seconds(3600),
+    ] {
+        let registration = RoleRegistration {
+            key: ClusterNodeKey {
+                node_id: NodeId::new(uuid::Uuid::now_v7()),
+                role: ClusterRole::Scribe,
+            },
+            address: "http://scribe:5001".into(),
+            capabilities: ClusterCapabilities::ScribeV1(ScribeCapabilitiesV1 {
+                tail_protocol_version: 1,
+            }),
+            started_at: skewed_start,
+        };
+        owner.register(&registration).await.expect("role registers");
+        let (started_at, heartbeat_at) =
+            registration_times(&fixture, registration.key.node_id).await;
+        assert!(
+            (started_at - skewed_start).num_milliseconds().abs() < 1,
+            "started_at remains caller-supplied process metadata"
+        );
+        assert!(
+            (heartbeat_at - skewed_start).num_seconds().abs() > 60,
+            "heartbeat_at must be database-stamped, not copied from started_at"
+        );
+        owner
+            .heartbeat(&registration.key, 1, true, &registration.capabilities)
+            .await
+            .expect("heartbeat applies");
+        assert!(
+            owner
+                .list_live(ClusterRole::Scribe, std::time::Duration::from_secs(30))
+                .await
+                .expect("live roles list")
+                .iter()
+                .any(|lease| lease.key.node_id == registration.key.node_id),
+            "a freshly registered role is live regardless of process clock skew"
+        );
+
+        owner
+            .age_heartbeat(registration.key.node_id, 120)
+            .await
+            .expect("heartbeat ages");
+        assert!(
+            owner
+                .list_live(ClusterRole::Scribe, std::time::Duration::from_secs(30))
+                .await
+                .expect("live roles list")
+                .iter()
+                .all(|lease| lease.key.node_id != registration.key.node_id),
+            "expired heartbeat must not be live"
+        );
+    }
 }
 
 mod pg_tests {

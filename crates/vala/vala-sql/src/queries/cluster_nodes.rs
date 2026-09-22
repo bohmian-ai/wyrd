@@ -4,6 +4,8 @@
 //! through typed row conversions while every statement remains tenant-bound by
 //! both [`TenantConn`] RLS and an explicit `data_tenant_id` predicate.
 
+use std::time::Duration;
+
 use chrono::{DateTime, Utc};
 use wyrd_spec::vala::api::{
     ClusterCapabilities, ClusterNodeKey, ClusterRole, ClusterRoleLease, FencingToken,
@@ -33,6 +35,10 @@ impl ClusterNodes {
 
     /// Validates one ready, fresh fenced Oracle role identity.
     ///
+    /// `liveness` is a window, not a cutoff instant: PostgreSQL subtracts it
+    /// from its own `statement_timestamp()` so every replica observes the same
+    /// liveness boundary regardless of host clock skew.
+    ///
     /// # Errors
     /// Returns [`SqlError`] when the query fails or the exact row is absent.
     pub async fn validate_live_oracle(
@@ -40,17 +46,18 @@ impl ClusterNodes {
         conn: &mut TenantConn<'_>,
         node_id: wyrd_spec::vala::api::NodeId,
         fencing_token: FencingToken,
-        heartbeat_after: DateTime<Utc>,
+        liveness: Duration,
     ) -> Result<(), SqlError> {
         let found: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM vala.cluster_nodes \
              WHERE data_tenant_id=$1 AND node_id=$2 AND role='oracle' \
-             AND fencing_token=$3 AND ready=true AND heartbeat_at >= $4)",
+             AND fencing_token=$3 AND ready=true \
+             AND heartbeat_at >= statement_timestamp() - ($4 * interval '1 second'))",
         )
         .bind(uuid::Uuid::from(conn.data_tenant_id()))
         .bind(node_id.as_uuid())
         .bind(i64::try_from(fencing_token).map_err(|_| invariant("fence exceeds i64"))?)
-        .bind(heartbeat_after)
+        .bind(liveness.as_secs_f64())
         .fetch_one(&mut **conn.transaction())
         .await
         .map_err(SqlError::from)?;
@@ -104,11 +111,11 @@ impl ClusterNodes {
             r#"INSERT INTO vala.cluster_nodes
                (data_tenant_id, node_id, role, advertise_addr, fencing_token, started_at, heartbeat_at,
                 capability_version, capabilities, ready)
-               VALUES ($1,$2,$3,$4,1,$5,$5,1,$6,false)
+               VALUES ($1,$2,$3,$4,1,$5,statement_timestamp(),1,$6,false)
                ON CONFLICT (data_tenant_id, node_id, role) DO UPDATE SET
                  advertise_addr=EXCLUDED.advertise_addr,
                  fencing_token=vala.cluster_nodes.fencing_token + 1,
-                 started_at=EXCLUDED.started_at, heartbeat_at=EXCLUDED.heartbeat_at,
+                 started_at=EXCLUDED.started_at, heartbeat_at=statement_timestamp(),
                  capability_version=1, capabilities=EXCLUDED.capabilities, ready=false
                RETURNING node_id, role, advertise_addr, fencing_token, capability_version,
                          capabilities, ready, started_at, heartbeat_at"#,
@@ -195,17 +202,18 @@ impl ClusterNodes {
         &self,
         conn: &mut TenantConn<'_>,
         role: ClusterRole,
-        heartbeat_after: DateTime<Utc>,
+        liveness: Duration,
     ) -> Result<Vec<ClusterRoleLease>, SqlError> {
         let rows = sqlx::query_as::<_, ClusterNodeDbRow>(
             "SELECT node_id, role, advertise_addr, fencing_token, capability_version, \
              capabilities, ready, started_at, heartbeat_at FROM vala.cluster_nodes \
-             WHERE data_tenant_id=$1 AND role=$2 AND ready=true AND heartbeat_at >= $3 \
+             WHERE data_tenant_id=$1 AND role=$2 AND ready=true \
+             AND heartbeat_at >= statement_timestamp() - ($3 * interval '1 second') \
              ORDER BY node_id",
         )
         .bind(uuid::Uuid::from(conn.data_tenant_id()))
         .bind(role_name(role))
-        .bind(heartbeat_after)
+        .bind(liveness.as_secs_f64())
         .fetch_all(&mut **conn.transaction())
         .await
         .map_err(SqlError::from)?;

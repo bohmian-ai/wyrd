@@ -1199,31 +1199,6 @@ impl ForgeTasks {
         Ok(ForgeTaskPage { tasks, overflowed })
     }
 
-    /// Deletes a bounded tenant-scoped batch of old terminal rows.
-    ///
-    /// A succeeded snapshot expiration whose evidence still carries candidates
-    /// is retained past its retention window until an `expired_cleanup` plan
-    /// references its `task_id`. That is the only thing keeping the handoff
-    /// reachable between expiration settlement and cleanup enqueue; once the
-    /// cleanup row exists the copied plan is authoritative and the source
-    /// prunes normally.
-    ///
-    /// # Errors
-    /// Returns SQL errors; nonterminal and Prepared rows are never selected.
-    ///
-    /// # Cancellation
-    /// Deletion is one statement inside the caller transaction; caller rollback
-    /// removes the whole bounded batch.
-    pub async fn prune_terminal(
-        &self,
-        conn: &mut TenantConn<'_>,
-        before: DateTime<Utc>,
-        cap: u32,
-    ) -> Result<u64, SqlError> {
-        let changed=sqlx::query("WITH victims AS (SELECT task_id FROM vala.forge_tasks source WHERE state IN ('succeeded','failed','cancelled') AND updated_at<$1 AND NOT (source.state = 'succeeded' AND source.strategy = 'snapshot_expiry' AND jsonb_array_length(COALESCE(source.evidence->'cleanup_candidates', '[]'::jsonb)) > 0 AND NOT EXISTS (SELECT 1 FROM vala.forge_tasks cleanup WHERE cleanup.strategy = 'expired_cleanup' AND cleanup.plan #>> '{parameters,source_task_id}' = source.task_id::text)) ORDER BY updated_at,task_id FOR UPDATE SKIP LOCKED LIMIT $2) DELETE FROM vala.forge_tasks t USING victims v WHERE t.task_id=v.task_id").bind(before).bind(i64::from(cap)).execute(&mut **conn.transaction()).await.map_err(SqlError::from)?.rows_affected();
-        Ok(changed)
-    }
-
     /// Reports whether the demanded table still has an unconsumed handoff.
     ///
     /// This runs inside the acknowledgement transaction, so a cleanup task

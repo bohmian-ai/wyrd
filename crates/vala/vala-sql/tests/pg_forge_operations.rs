@@ -203,6 +203,45 @@ mod pg_tests {
             phase: String,
         }
 
+        /// Reads one operation's persisted ordering timestamps alongside the
+        /// database clock, so callers can prove the stamps are PostgreSQL's.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the tenant transaction or exact-row query fails.
+        async fn operation_times(
+            pool: &PgPool,
+            tenant: DataTenantId,
+            family: ForgeOperationFamily,
+            operation_id: Uuid,
+        ) -> (
+            chrono::DateTime<chrono::Utc>,
+            chrono::DateTime<chrono::Utc>,
+            chrono::DateTime<chrono::Utc>,
+        ) {
+            let mut conn = TenantConn::acquire(pool, tenant)
+                .await
+                .expect("tenant connection for operation times");
+            let row = sqlx::query_as(
+                r#"
+                SELECT prepared_at, updated_at, statement_timestamp()
+                  FROM vala.forge_operation_state
+                 WHERE data_tenant_id = wyrd.current_tenant()
+                   AND resource = $1
+                   AND family = $2
+                   AND operation_id = $3
+                "#,
+            )
+            .bind(resource())
+            .bind(family.as_str())
+            .bind(operation_id)
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect("operation times query");
+            conn.commit().await.expect("operation times commit");
+            row
+        }
+
         /// Reads one operation's persisted phase.
         ///
         /// # Panics
@@ -613,6 +652,11 @@ mod pg_tests {
             let pool = fixture.app_pool();
             let tenant = fixture.data_tenant_id();
             let family = ForgeOperationFamily::SnapshotExpire;
+            let before: chrono::DateTime<chrono::Utc> =
+                sqlx::query_scalar("SELECT statement_timestamp()")
+                    .fetch_one(pool)
+                    .await
+                    .expect("database clock sample");
 
             let detail = AuditDetail::ForgeSnapshotExpire {
                 operation_id: Uuid::now_v7(),
@@ -661,6 +705,20 @@ mod pg_tests {
                 resource(),
                 Some(committed_detail),
             );
+            // Operation ordering timestamps come from PostgreSQL, so preparation
+            // falls inside a window bracketed by the database's own clock.
+            let (prepared_at, prepared_updated_at, after_prepare) =
+                operation_times(pool, tenant, family, operation_id).await;
+            assert!(
+                prepared_at >= before && prepared_at <= after_prepare,
+                "prepared_at must be stamped by PostgreSQL: {prepared_at} not in \
+                 [{before}, {after_prepare}]"
+            );
+            assert_eq!(
+                prepared_at, prepared_updated_at,
+                "preparation stamps both ordering keys from one statement"
+            );
+
             let () = match append_terminal(pool, tenant, resource(), family, &committed_event)
                 .await
                 .expect("snapshot_expire committed")
@@ -668,6 +726,18 @@ mod pg_tests {
                 ForgeOperationTransition::Applied => (),
                 other => panic!("expected terminal application, got {other:?}"),
             };
+
+            let (terminal_prepared_at, terminal_updated_at, after_terminal) =
+                operation_times(pool, tenant, family, operation_id).await;
+            assert_eq!(
+                terminal_prepared_at, prepared_at,
+                "a terminal transition leaves prepared_at unchanged"
+            );
+            assert!(
+                terminal_updated_at >= prepared_at && terminal_updated_at <= after_terminal,
+                "updated_at must be stamped by PostgreSQL: {terminal_updated_at} not in \
+                 [{prepared_at}, {after_terminal}]"
+            );
 
             assert_eq!(
                 state_snapshot(pool, tenant, family, operation_id).await,

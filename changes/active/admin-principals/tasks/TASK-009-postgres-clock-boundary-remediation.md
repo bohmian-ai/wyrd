@@ -500,3 +500,120 @@ and deterministic fixture updates are authorized implementation decisions.
 - `architecture/references/languages/spec-driven-development.md`.
 - `architecture/references/languages/implementation-execution.md`.
 - `architecture/references/languages/testing-workflows.md`.
+
+## Implementation Evidence
+
+Commits (branch `claude/admin-principals-spec-qfsmjc`, baseline `119f625bf`):
+
+| Commit | Scenario |
+|---|---|
+| `41612c5d5` | Scenario 1 — Card reconciliation eligibility, leases, retries, upload liveness |
+| `81de3a0be` | Scenario 2 — cluster liveness windows, Forge operation stamps, `prune_terminal` deletion |
+| `5a53de839` | Scenario 3 — login-state and credential relative expiry, one usability verdict |
+| `8213234cf` | Scenario 4 — one `PostgreSQL` issuance instant for the refresh JWT and its durable row |
+| `7d04f2dc2` | Rustdoc markdown/panic-doc lint closure on the touched surface |
+
+### Acceptance matrix
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| CLOCK-V1 pending eligibility is DB-seeded | `wyrd-sql/src/queries/cards/register.rs` (`CASE WHEN $11='pending' THEN statement_timestamp()`) | `pg_cards_register -E 'test(=reconciliation_claims_are_bounded_and_lease_safe)'` — 1 passed | PASS |
+| CLOCK-V2 claim eligibility/lease from `statement_timestamp()` | `cards/lifecycle.rs::claim_card_reconciliation(operator, lease_seconds, limit)` | same focused test — 1 passed | PASS |
+| CLOCK-V3 retry deadlines derived in SQL | `cards/lifecycle.rs` `retry_delay_seconds` binds; `reconciler.rs::retry_delay_seconds` | same focused test + `wyrd-server --lib -E 'test(=components::cards::reconciler::tests::retry_schedule_is_fixed_and_bounded)'` (in `test:wyrd`, 2031 passed) | PASS |
+| CLOCK-V4 lease projected onto a monotonic deadline | `reconciler.rs` `claim_started` + `lease_remaining_seconds` | `test:wyrd` — 2031 passed | PASS |
+| CLOCK-V5/V6 liveness duration bound; `heartbeat_at` DB-stamped | `vala-sql/src/queries/cluster_nodes.rs`; `vala-bifrost-redux/src/cluster/mod.rs` | `pg_oracle_membership -E 'test(=live_discovery_excludes_expired_heartbeat)'` — 1 passed | PASS |
+| CLOCK-V7 upload liveness projected by SQL | `cards/lifecycle.rs` `storage_upload_live`; `cards/service.rs` | `pg_cards_register -E 'test(=manifest_upload_liveness_is_decided_by_postgres)'` — 1 passed | PASS |
+| CLOCK-V8 platform login-state expiry + verdict in SQL | `platform/identity.rs` (`ttl`, `expires_at > statement_timestamp() AS live`) | `pg_platform_identity -E 'test(=pg_tests::an_expired_login_state_is_refused_like_an_unknown_one)'` — 1 passed | PASS |
+| CLOCK-V9 tenant login-state relative expiry in SQL | `auth/login_state.rs`; `wyrd-auth/src/login.rs` | `wyrd-auth --lib -E 'test(=login::pg_tests::expired_login_state_returns_none)'` — 1 passed | PASS |
+| CLOCK-V10/V11 one issuance instant for JWT and row | `auth/refresh_tokens.rs::refresh_issuance_instant`; `wyrd-auth/src/issuance.rs`; `wyrd-auth-issue` `issue_refresh_token(..., issued_at, ttl)` | `wyrd-auth --lib -E 'test(=refresh::pg_tests::happy_rotation_mints_new_pair_and_revokes_old_row)'` — 1 passed; `-E 'test(=refresh::pg_tests::expired_token_is_rejected)'` — 1 passed | PASS |
+| CLOCK-V12 API-key status verdict from `PostgreSQL` | `auth/service_accounts.rs::api_key_status_by_prefix` | `pg_admin_principals -E 'test(=tenant_api_key_status_and_relative_expiry_use_database_time)'` — 1 passed | PASS |
+| CLOCK-V13 one credential usability verdict, Argon2 work preserved | `platform/credentials.rs` `usable` projection; `wyrd-auth/src/platform_credentials.rs` | `pg_admin_principals -E 'test(=every_invalid_condition_yields_an_unusable_credential)'` — 1 passed; `wyrd-auth --lib -E 'test(=platform_credentials::pg_tests::every_rejection_is_the_same_error)'` — 1 passed | PASS |
+| CLOCK-V14 Forge operation transitions DB-stamped | `vala-sql/src/queries/forge_operations.rs` | `pg_forge_operations -E 'test(=snapshot_expire_prepare_and_commit)'` (in `test:sql`, 118 passed) | PASS |
+| CLOCK-V15 production-dead `prune_terminal` deleted | `vala-sql/src/queries/forge_tasks.rs` | `grep -rn prune_terminal crates sdks` → 0 hits; `test:sql` 118 passed | PASS |
+| CLOCK-V16 relative lifetimes bound as durations | `auth/service_accounts.rs::insert_api_key`, `platform/credentials.rs::insert_platform_credential_tx` and their five server callers | `pg_admin_principals` focused tests above; `test:wyrd` 2031 passed | PASS |
+| Governing rule recorded once | `AGENTS.md` §15 | n/a (documentation) | PASS |
+
+### Caller inventory for changed private signatures
+
+- `claim_card_reconciliation` → `wyrd-server/src/components/cards/reconciler.rs::run_once` (sole caller).
+- `schedule_card_reconciliation` / `reschedule_card_reconciliation` / `record_card_reconciliation_failure` → `wyrd-server/src/components/cards/service.rs` (sole owner), reached from `reconciler.rs`.
+- `validate_live_oracle` / `list_live` → `vala-bifrost-redux/src/cluster/mod.rs` (sole callers).
+- `insert_login_state` → `wyrd-auth/src/login.rs`.
+- `insert_platform_login_state` → `wyrd-auth/src/platform_login.rs`.
+- `insert_platform_credential_tx` → `wyrd-auth/src/platform_credentials.rs::issue_platform_credential`, itself called from `wyrd-server` `platform/credentials.rs`, `platform/provisioning.rs`, `platform/recovery.rs`, `principals/routes.rs`, and `wyrd-testing/src/server.rs` (3 sites).
+- `insert_api_key` → `wyrd-auth/src/issue_api_key.rs` and `wyrd-server/src/auth/jwt_bearer.rs` test setup.
+- `issue_refresh_token` → `wyrd-auth/src/issuance.rs::issue_human_session` plus three test call sites (`wyrd-auth/src/refresh.rs`, `wyrd-auth-issue/src/lib.rs`).
+
+### Remaining `Utc::now()` in touched owners
+
+| Location | Classification |
+|---|---|
+| `wyrd-auth/src/issuance.rs:398` (`access_ttl`) | JWT-only — access-token `exp`, never evaluated by `PostgreSQL` |
+| `wyrd-auth/src/platform_sessions.rs:291` | Domain — reported token expiry inside an audit detail |
+| `vala-bifrost-redux/src/cluster/mod.rs:137` | In-process — snapshot observation time |
+| `vala-bifrost-redux/src/cluster/mod.rs:653,692,693,717,718`; `forge/worker.rs:8604-8607`; `vala-sql/src/queries/file_list.rs:382`; `wyrd-testing/src/*` | Test fixture |
+| `wyrd-server/src/auth/jwt_bearer.rs:366,367,946` | Test fixture (JWT claim construction) |
+| `wyrd-auth-issue/src/lib.rs` (3, all in `#[cfg(test)]`) | Test fixture |
+
+No `DateTime<Utc>` is bound into a `PostgreSQL` coordination or validity predicate in the touched owners. The remaining bound `DateTime<Utc>` parameters are `insert_refresh_token` / `insert_refresh_token_rotated` `expires_at`, both now fed the `PostgreSQL`-derived issuance instant; `cards/lifecycle.rs::CardReconcileClaim::reconcile_lease_expires_at` is returned reporting data with no Rust comparison (`grep` shows no non-SQL, non-test consumer).
+
+### Verification battery
+
+| Command | Result |
+|---|---|
+| `mise run fmt` | clean |
+| `mise run lints` | clean |
+| `mise run test:sql` | 118 + 2 passed, 0 failed |
+| `mise run test:wyrd` | 2031 passed, 0 failed |
+| `mise run test:bifrost` | 1 failure: `vala-bifrost-redux::integration forge::production_routes::a_promotion_planned_in_the_settlement_window_is_superseded` — **pre-existing**, see below |
+| `mise run gate` | same single failure; every other lane passed |
+| `git diff --check` | clean |
+
+`test:bifrost:gate` still schedules every selected binary in one Nextest
+invocation: `Starting 111 tests across 8 binaries (64 tests skipped)` under a
+single run ID.
+
+### Pre-existing failure, not caused by this task
+
+`forge::production_routes::a_promotion_planned_in_the_settlement_window_is_superseded`
+fails deterministically at `production_routes.rs:1859` ("the replanned
+promotion is claimed"). The same test, run in a clean worktree checked out at
+the task baseline `119f625bf`, fails identically:
+
+```
+git worktree add <tmp> 119f625bf
+scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && \
+  cargo nextest run --locked -p vala-bifrost-redux -P journey --run-ignored=all \
+  -E 'test(=forge::production_routes::a_promotion_planned_in_the_settlement_window_is_superseded)'"
+→ FAIL, same panic site
+```
+
+Nothing in this task touches Forge claim eligibility, the fair-claim statement,
+`ready_at`, or `next_eligible_at`. The failure is reported rather than repaired
+or suppressed: no test was weakened, ignored, serialized, or deleted.
+
+One further observation, not reproducible: the first `test:bifrost` run also
+failed `wyrd-testing::oracle published::published_cache_pruning_and_shutdown_are_production_governed`
+with `A Tokio 1.x context was found, but it is being shutdown` from the Forge
+worker during teardown. It passed standalone with tracing enabled, passed the
+whole `test:bifrost:journey:oracle` binary, and passed on the next full lane
+run. It is a Forge-worker shutdown-ordering race under aggregate contention,
+unrelated to clock ownership.
+
+### Diff audit
+
+`git diff 119f625bf --name-only` lists 38 files, all inside the authorized
+write set plus `AGENTS.md` and this task file. Two incidental edits are
+disclosed:
+
+- `crates/vala/vala-bifrost-redux/src/forge/scribe_promotion.rs` — `cargo fmt`
+  reflow only; the baseline tree was not formatted.
+- `crates/vala/vala-sql/src/queries/file_list.rs::planned_settlement` — the
+  baseline failed `mise run lints` with `clippy::type_complexity` on an
+  explicit five-tuple. Closed by deriving `sqlx::FromRow` on the existing
+  `PlannedHotFileRow` and deleting the tuple plus its mapping closure
+  (deletion, not addition; column names already matched the field names).
+
+No migration, public HTTP/gRPC/SDK/CLI/MCP contract, generated artifact,
+dependency, Cargo feature, environment variable, clock trait, or permanent
+repository check was added. No non-goal was implemented.

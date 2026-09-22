@@ -134,10 +134,12 @@ if (terminal.outcome !== "success" || terminal.freshness !== "complete" || termi
 
 ### CLI
 
+The CLI takes no secret-valued argument. Configure `WYRD_ACCESS_TOKEN`, or any
+other source in the normal ambient credential chain, before running the query.
+
 ```bash
 wyrd query \
   --server "$WYRD_SERVER_URL" \
-  --token "$WYRD_ACCESS_TOKEN" \
   --sql 'SELECT metric_name, time, value, service_name FROM "vala.metrics.points" WHERE wyrd_event_time >= now() - interval '\''7 days'\''' \
   --format jsonl
 ```

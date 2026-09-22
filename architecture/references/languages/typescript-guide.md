@@ -179,8 +179,14 @@ For `@wyrd/sdk` N-API-backed features:
   the edge.
 - Do not hold V8 handles across `.await` inside async napi tasks (same
   spirit as the PyO3 `Bound<'py, T>` rule).
-- The binding wraps `wyrd_client::Bifrost`. It must not assemble a
-  separate `QueryClient`, raw `WyrdClient`, or per-call gRPC transport.
+- The binding may project the single shared `wyrd_client::WyrdClient` as a
+  thin handle for authentication and delegation (`onBehalfOf`), and existing
+  facades such as `Bifrost.connect({ client })` may compose that handle. The
+  Rust client keeps exchange, bearer access, caching, renewal, retry,
+  headers, and transport private; the binding never duplicates them.
+- The binding wraps `wyrd_client::Bifrost`. It must not assemble a separate
+  `QueryClient`, a second authentication or transport path, or a per-call
+  gRPC transport.
 
 ## Tests
 

@@ -52,7 +52,7 @@ impl ClientScope {
         })
     }
 
-    /// Derive the scope from an already-assembled [`WyrdClient`].
+    /// Derive the scope from an already-assembled [`WyrdClient`](crate::WyrdClient).
     ///
     /// Reads the base URL and credential the client's [`AuthMiddleware`] is
     /// actually bound to, rather than re-running the credential chain, so a

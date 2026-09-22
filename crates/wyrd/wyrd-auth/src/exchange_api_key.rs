@@ -383,7 +383,8 @@ fn policy_context(
 /// only for a policy denial or an allowance whose issuance then refused. Like
 /// every delegated request, the row is recorded under the subject with the
 /// full actor chain, targets the requested audience, and attaches the
-/// credential that authenticated the actor.
+/// credential that authenticated the actor. Its permission is the invoke
+/// action the policy evaluated, so the row names the decision it records.
 ///
 /// # Errors
 /// Returns [`DelegateError::Issuance`] carrying the audit-unavailable error
@@ -417,6 +418,7 @@ async fn record_decision(
     )
     .with_credential_id(actor.principal.credential_id);
     audience.as_str().clone_into(&mut event.resource);
+    context.request.action.clone_into(&mut event.permission);
     append_auth_audit(conn, &event)
         .await
         .map_err(|error| DelegateError::Issuance(IssuanceError::Wyrd(error)))
@@ -926,8 +928,12 @@ mod pg_tests {
         (api_key_id, key.secret)
     }
 
-    /// Count the grant records staged for a principal, and read the credential
-    /// the single record names.
+    /// Count the direct grant records staged for a principal, and read the
+    /// credential the single record names.
+    ///
+    /// A direct grant evaluates no dynamic permission, so only rows whose
+    /// permission is the operation itself are counted; a direct row carrying
+    /// any other permission leaves the count at zero.
     async fn staged_exchange(
         conn: &mut TenantConn<'_>,
         tenant: DataTenantId,
@@ -935,7 +941,8 @@ mod pg_tests {
     ) -> (i64, Option<Uuid>) {
         let rows: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
             "SELECT principal_id, credential_id FROM vala.audit_staging
-              WHERE data_tenant_id = $1 AND operation = $2 AND principal_id = $3",
+              WHERE data_tenant_id = $1 AND operation = $2 AND permission = $2
+                AND principal_id = $3",
         )
         .bind(tenant.as_uuid())
         .bind(TOKEN_EXCHANGE_OPERATION)
@@ -1520,14 +1527,18 @@ mod pg_tests {
             .await
     }
 
-    /// Committed Bifrost exchange decisions `(outcome, principal, credential,
-    /// detail)`, oldest first.
+    /// Committed Bifrost exchange decisions `(outcome, permission, principal,
+    /// credential, detail)`, oldest first.
+    ///
+    /// # Panics
+    /// Panics when the query fails or a staged detail does not decode.
     async fn exchange_decisions(
         fixture: &PgFixture,
-    ) -> Vec<(String, Uuid, Option<Uuid>, AuditDetail)> {
+    ) -> Vec<(String, String, Uuid, Option<Uuid>, AuditDetail)> {
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        let rows: Vec<(String, Uuid, Option<Uuid>, String)> = sqlx::query_as(
-            "SELECT outcome, principal_id, credential_id, detail FROM vala.audit_staging
+        let rows: Vec<(String, String, Uuid, Option<Uuid>, String)> = sqlx::query_as(
+            "SELECT outcome, permission, principal_id, credential_id, detail
+               FROM vala.audit_staging
               WHERE operation = $1 AND resource = 'bifrost' ORDER BY seq",
         )
         .bind(TOKEN_EXCHANGE_OPERATION)
@@ -1535,19 +1546,23 @@ mod pg_tests {
         .await
         .expect("decision query runs");
         rows.into_iter()
-            .map(|(outcome, principal, credential, detail)| {
+            .map(|(outcome, permission, principal, credential, detail)| {
                 let detail = serde_json::from_str(&detail).expect("detail decodes");
-                (outcome, principal, credential, detail)
+                (outcome, permission, principal, credential, detail)
             })
             .collect()
     }
 
-    /// Outcomes of the committed Bifrost exchange decisions, oldest first.
-    async fn exchange_outcomes(fixture: &PgFixture) -> Vec<String> {
+    /// `(outcome, permission)` of the committed Bifrost exchange decisions,
+    /// oldest first.
+    ///
+    /// # Panics
+    /// Panics when `exchange_decisions` does.
+    async fn exchange_outcomes(fixture: &PgFixture) -> Vec<(String, String)> {
         exchange_decisions(fixture)
             .await
             .into_iter()
-            .map(|(outcome, ..)| outcome)
+            .map(|(outcome, permission, ..)| (outcome, permission))
             .collect()
     }
 
@@ -1586,10 +1601,11 @@ mod pg_tests {
             "{result:?}"
         );
         let decisions = exchange_decisions(&fixture).await;
-        let [(outcome, principal, credential, detail)] = decisions.as_slice() else {
+        let [(outcome, permission, principal, credential, detail)] = decisions.as_slice() else {
             panic!("exactly one decision commits, got {decisions:?}");
         };
         assert_eq!(outcome, "denied");
+        assert_eq!(permission, super::DELEGATION_POLICY_ACTION);
         assert_eq!(*principal, subject);
         assert_eq!(*credential, Some(ACTOR_CREDENTIAL));
         let AuditDetail::DelegationAttribution { delegation_chain } = detail else {
@@ -1623,7 +1639,11 @@ mod pg_tests {
             matches!(result, Err(DelegateError::ActorNotFound)),
             "{result:?}"
         );
-        assert_eq!(exchange_outcomes(&fixture).await, ["allowed"]);
+        assert_eq!(
+            exchange_outcomes(&fixture).await,
+            [("allowed".to_owned(), super::DELEGATION_POLICY_ACTION.to_owned())],
+            "one allowance names the evaluated invoke action"
+        );
     }
 
     /// Unverifiable, cross-tenant, or malformed identity input is refused
@@ -1783,10 +1803,11 @@ mod pg_tests {
         assert_eq!(asked.request.context["audience"], "bifrost");
 
         let decisions = exchange_decisions(&fixture).await;
-        let [(outcome, principal, credential, detail)] = decisions.as_slice() else {
+        let [(outcome, permission, principal, credential, detail)] = decisions.as_slice() else {
             panic!("exactly one decision commits, got {decisions:?}");
         };
         assert_eq!(outcome, "allowed");
+        assert_eq!(permission, super::DELEGATION_POLICY_ACTION);
         assert_eq!(*principal, subject_id);
         assert_eq!(*credential, Some(ACTOR_CREDENTIAL));
         let AuditDetail::TokenExchange {

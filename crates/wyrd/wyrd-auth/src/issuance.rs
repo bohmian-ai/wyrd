@@ -34,7 +34,9 @@ use crate::card_scope::{
     IssueErrorOrWyrd, MINT_KIND_API_KEY_EXCHANGE, MINT_KIND_JWT_BEARER, issue_scope_error,
     resolve_card_ref_scope, write_scope_mint_success_audit,
 };
-use crate::exchange_api_key::{principal_kind_wire, role_refs, token_hash};
+use crate::exchange_api_key::{
+    DELEGATION_POLICY_ACTION, principal_kind_wire, role_refs, token_hash,
+};
 
 /// Tenant token lifetimes.
 #[derive(Debug, Clone)]
@@ -552,7 +554,8 @@ fn permission_set_from_rows(rows: Vec<RoleRow>) -> Result<PermissionSet, Issuanc
 /// spent credential attached. A delegated grant is recorded under the subject
 /// being acted for, like every request its token later makes, names `issued`
 /// — the actor — as the exchange's actor, records the Card references of the
-/// earlier actors earliest first, targets the requested audience, and
+/// earlier actors earliest first, targets the requested audience, records
+/// the invoke action the exchange's policy evaluated as its permission, and
 /// attaches the credential that authenticated the actor, when one did.
 fn exchange_audit_event(
     issued: &TokenPrincipalRef,
@@ -606,6 +609,7 @@ fn exchange_audit_event(
         },
     );
     audience.as_str().clone_into(&mut event.resource);
+    DELEGATION_POLICY_ACTION.clone_into(&mut event.permission);
     event.with_credential_id(*actor_credential_id)
 }
 

@@ -35,8 +35,6 @@ env_shell_expand = false
 jobs = 1
 
 [env]
-# uv uses the `[tools]` python (https://mise.jdx.dev/lang/python.html#mise-uv).
-UV_PYTHON = { value = "{{ tools.python.path }}", tools = true }
 UI_DIR = "crates/wyrd/wyrd-server/wyrd-ui"
 PY_DIR = "sdks/wyrd-sdk-python"
 WYRD_DEV_PG_CACHE = "${HOME}/.cache/wyrd/pg"
@@ -394,7 +392,7 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:a
 hide = true
 description = "Run Python Bifrost journeys against an already-provisioned Postgres lifecycle."
 dir = "sdks/wyrd-sdk-python"
-depends = ["py:setup:testing"]
+depends = ["py:setup"]
 run = "uv run python -m pytest -q -m integration tests/integration/bifrost/test_bifrost_e2e.py tests/integration/test_bifrost_query.py"
 
 [tasks."test:bifrost:journey:typescript"]
@@ -883,10 +881,10 @@ description = "Refresh committed sqlx offline query metadata"
 run = "cargo sqlx prepare --workspace"
 
 [tasks."py:setup"]
-description = "Sync Python dev dependencies and build the Wyrd native extension"
+description = "Sync Python dev dependencies and build the Wyrd native extension with the wyrd.testing harness"
 dir = "sdks/wyrd-sdk-python"
 depends = ["codegen:stubs"]
-run = ["uv sync --all-extras --group dev", "uv run maturin develop"]
+run = ["uv sync --all-extras --group dev", "uv run maturin develop --features testing"]
 
 [tasks."py:test:unit"]
 description = "Run Python unit tests except TensorFlow-marked tests"
@@ -942,27 +940,17 @@ description = "Run ty over the generated Python stub surface"
 dir = "sdks/wyrd-sdk-python"
 run = "uv run ty check python/wyrd/*.pyi python/wyrd/*/__init__.pyi tests/unit/cards/data/test_public_surface.py tests/bifrost/test_public_typing.py"
 
-[tasks."py:setup:testing"]
-hide = true
-description = "Build wyrd-sdk-python with the wyrd.testing test harness enabled"
-dir = "sdks/wyrd-sdk-python"
-depends = ["codegen:stubs"]
-run = [
-  "uv sync --all-extras --group dev",
-  "uv run maturin develop --features testing",
-]
-
 [tasks."py:test:testing"]
 hide = true
 description = "Run the wyrd.testing harness pytest suite"
 dir = "sdks/wyrd-sdk-python"
-depends = ["py:setup:testing"]
+depends = ["py:setup"]
 run = "uv run python -m pytest -q tests/harness/test_test_server.py"
 
 [tasks."py:test:integration"]
 hide = true
 description = "Run wyrd.testing integration journeys against a live Postgres-backed server"
-depends = ["py:setup:testing"]
+depends = ["py:setup"]
 
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run py:test:integration:inner'"
 [tasks."py:test:integration:inner"]
@@ -974,7 +962,7 @@ run = "uv run python -m pytest -q -m integration"
 [tasks."py:test:cards:integration"]
 hide = true
 description = "Run the focused real-server Python Card registry journey"
-depends = ["py:setup:testing"]
+depends = ["py:setup"]
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run py:test:cards:integration:inner'"
 
 [tasks."py:test:cards:integration:inner"]
@@ -986,7 +974,7 @@ run = "uv run python -m pytest -q -m integration tests/integration/cards/test_ca
 [tasks."py:test:wyrdstate:integration"]
 hide = true
 description = "Run the real-server Python-to-offline typed WyrdState journey"
-depends = ["py:setup:testing"]
+depends = ["py:setup"]
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run py:test:wyrdstate:integration:inner'"
 
 [tasks."py:test:wyrdstate:integration:inner"]

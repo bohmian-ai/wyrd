@@ -7,6 +7,8 @@
 #[cfg(feature = "python")]
 mod bifrost;
 #[cfg(feature = "python")]
+mod client;
+#[cfg(feature = "python")]
 mod state;
 
 #[cfg(feature = "python")]
@@ -89,6 +91,11 @@ fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     register_submodule(py, "wyrd._wyrd.providers", &providers)?;
 
     skald_observer::python::python_register(m)?;
+
+    let client = PyModule::new(py, "client")?;
+    client::register_client(&client)?;
+    m.add_submodule(&client)?;
+    register_submodule(py, "wyrd._wyrd.client", &client)?;
 
     let bifrost = PyModule::new(py, "bifrost")?;
     bifrost::register_bifrost(&bifrost)?;

@@ -1,5 +1,5 @@
 #### begin imports ####
-from . import cards, config, data, model, prompt, state
+from . import cards, client, config, data, model, prompt, state
 from ._wyrd import AgentError, SessionError, ToolError, WyrdError
 from .agent import (
     Agent,
@@ -20,6 +20,7 @@ from .agent import (
 )
 from .cards import AgentCard, Card, CardKind, CardRef, Cards, RegistrationReceipt
 from .cli import run_wyrd_cli
+from .client import WyrdClient
 from .config import WyrdConfig
 from .data import DataCard, Split
 from .model import ModelCard, ModelSignature, SampleInput
@@ -89,6 +90,7 @@ __all__ = [
     "CardEnvelope",
     "HydratedArtifact",
     "WyrdState",
+    "WyrdClient",
     "cards",
     "config",
     "data",
@@ -96,6 +98,7 @@ __all__ = [
     "model",
     "prompt",
     "state",
+    "client",
     "run_wyrd_cli",
     "tool",
     "WyrdConfig",

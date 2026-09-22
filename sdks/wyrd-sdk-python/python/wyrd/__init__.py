@@ -2,7 +2,7 @@
 
 from typing import Protocol
 
-from . import cards, config, data, model, prompt, state
+from . import cards, client, config, data, model, prompt, state
 from ._wyrd import AgentError, SessionError, ToolError, WyrdError, _init
 from .agent import (
     Agent,
@@ -23,6 +23,7 @@ from .agent import (
 )
 from .cards import AgentCard, CardKind, CardRef, Cards, RegistrationReceipt
 from .cli import run_wyrd_cli
+from .client import WyrdClient
 from .config import WyrdConfig
 from .data import DataCard, Split
 from .model import ModelCard, ModelSignature, SampleInput
@@ -108,7 +109,9 @@ __all__ = [
     "CardEnvelope",
     "HydratedArtifact",
     "WyrdState",
+    "WyrdClient",
     "cards",
+    "client",
     "config",
     "data",
     "local_registry",

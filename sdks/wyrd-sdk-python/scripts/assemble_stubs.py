@@ -13,6 +13,7 @@ PUBLIC_MODULE_STUBS = {
     "agent.pyi": PACKAGE_DIR / "agent" / "__init__.pyi",
     "bifrost.pyi": PACKAGE_DIR / "bifrost" / "__init__.pyi",
     "cards.pyi": PACKAGE_DIR / "cards" / "__init__.pyi",
+    "client.pyi": PACKAGE_DIR / "client" / "__init__.pyi",
     "config.pyi": PACKAGE_DIR / "config" / "__init__.pyi",
     "data.pyi": PACKAGE_DIR / "data" / "__init__.pyi",
     "model.pyi": PACKAGE_DIR / "model" / "__init__.pyi",

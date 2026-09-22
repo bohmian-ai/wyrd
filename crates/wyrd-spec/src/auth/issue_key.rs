@@ -2,6 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::auth::SecretBearer;
 use crate::reference::CardRef;
@@ -26,8 +27,9 @@ pub struct IssueKeyRequest {
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct IssueKeyResponse {
-    /// API key row id.
-    pub key_id: String,
+    /// Credential id of the issued API key; the same UUID the credential
+    /// list, revoke path, and audit rows name.
+    pub key_id: Uuid,
     /// Plaintext API key, returned exactly once.
     pub key: SecretBearer,
     /// Log-safe prefix used for lookup.

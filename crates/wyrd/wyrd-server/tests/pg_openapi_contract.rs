@@ -522,6 +522,14 @@ async fn card_contract_publishes_typed_lifecycle_and_problem_shapes() {
 
 /// Issued and listed credential ids publish the same UUID contract the revoke
 /// path parameter and the MCP tools use, so no surface advertises free text.
+///
+/// Covers the principal credential routes and the Card-bound
+/// `POST /auth/issue-key` response, whose `key_id` is the same credential id.
+///
+/// # Panics
+///
+/// Panics when the server cannot start or a credential id is not published
+/// with the `uuid` format.
 #[tokio::test]
 async fn credential_ids_publish_their_uuid_contract() {
     let server = WyrdTestServer::start_in_process()
@@ -533,6 +541,11 @@ async fn credential_ids_publish_their_uuid_contract() {
         let id = &document["components"]["schemas"][component]["properties"]["id"];
         assert_eq!(id["format"], "uuid", "{component}.id is a UUID: {id}");
     }
+    let key_id = &document["components"]["schemas"]["IssueKeyResponse"]["properties"]["key_id"];
+    assert_eq!(
+        key_id["format"], "uuid",
+        "IssueKeyResponse.key_id is a UUID: {key_id}"
+    );
 
     server.shutdown().await.expect("server shuts down");
 }

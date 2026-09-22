@@ -759,7 +759,7 @@ async fn service_account_issuer_full_chain() {
         .expect("issue-key body reads");
     let issue_body: IssueKeyResponse =
         serde_json::from_slice(&issue_bytes).expect("issue-key response is valid JSON");
-    assert!(!issue_body.key_id.is_empty(), "issued key has a key_id");
+    assert!(!issue_body.key_id.is_nil(), "issued key has a key_id");
 
     // Exchange the issued key → access token.
     let issued_secret = SecretString::from(issue_body.key.expose().to_owned());

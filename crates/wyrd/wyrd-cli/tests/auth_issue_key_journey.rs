@@ -88,8 +88,15 @@ async fn auth_issue_key_cli_journey() {
         String::from_utf8_lossy(&issue.stdout),
         String::from_utf8_lossy(&issue.stderr)
     );
-    let key = issued_key(&String::from_utf8_lossy(&issue.stdout));
+    let stdout = String::from_utf8_lossy(&issue.stdout);
+    let key = issued_key(&stdout);
     assert!(!key.is_empty(), "the printed key is not empty");
+    let key_id = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("key_id:"))
+        .unwrap_or_else(|| panic!("issue-key printed no key_id: line: {stdout}"));
+    uuid::Uuid::parse_str(key_id.trim())
+        .unwrap_or_else(|error| panic!("the printed key_id is a UUID: {error}: {stdout}"));
 
     // The key's own principal, reached through the CLI's ambient credential
     // chain: the client exchanges it at /auth/token and carries the resulting

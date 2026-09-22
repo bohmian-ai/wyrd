@@ -706,9 +706,18 @@ mod pg_tests {
 
         assert_eq!(response.0.card_ref, card_ref);
         assert!(!response.0.prefix.is_empty());
-        assert!(!response.0.key_id.is_empty());
 
         let mut verify_conn = fixture.tenant_conn().await.expect("verify conn opens");
+        let stored_key_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM wyrd.auth_api_keys WHERE prefix = $1")
+                .bind(&response.0.prefix)
+                .fetch_one(&mut **verify_conn.transaction())
+                .await
+                .expect("issued key row reads");
+        assert_eq!(
+            response.0.key_id, stored_key_id,
+            "the response names the issued credential's UUID"
+        );
         let row = sqlx::query(
             "SELECT principal_id, detail, request_id, data_tenant_id
              FROM vala.audit_staging

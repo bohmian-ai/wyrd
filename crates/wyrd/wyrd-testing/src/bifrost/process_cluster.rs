@@ -826,17 +826,14 @@ impl AddressPlan {
     }
 }
 
-/// Reserves one currently free loopback socket.
+/// Reserves one currently free loopback socket through the harness's single
+/// reservation, which draws outside the OS ephemeral range.
 ///
 /// # Errors
 ///
-/// Returns [`ProcessClusterError::Resource`] when binding or address lookup
-/// fails.
+/// Returns [`ProcessClusterError::Resource`] when no harness port is free.
 fn reserve_ephemeral() -> Result<SocketAddr, ProcessClusterError> {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .map_err(|error| ProcessClusterError::Resource(error.to_string()))?;
-    listener
-        .local_addr()
+    crate::server::reserve_loopback_addr()
         .map_err(|error| ProcessClusterError::Resource(error.to_string()))
 }
 

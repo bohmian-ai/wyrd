@@ -795,26 +795,38 @@ impl ParquetMetadataCache {
 
     /// Stops admitting loads, triggers every loader token, and takes the tasks.
     ///
+    /// Each task is paired with whether it had already settled when close
+    /// began, sampled before `Closing` is published, so a loader that finishes
+    /// only after close started can never be mistaken for one that settled in
+    /// time.
+    ///
     /// The tokens are triggered with [`CancelCause::Closing`] so each loader
     /// publishes `Closed` itself. Close deliberately publishes nothing: two
     /// writers of one terminal could disagree about how a load ended, and the
     /// loader is the one that actually knows.
-    fn begin_close(&self) -> Vec<JoinHandle<()>> {
+    fn begin_close(&self) -> Vec<(JoinHandle<()>, bool)> {
         let Ok(mut state) = self.state.lock() else {
             return Vec::new();
         };
         state.lifecycle = StorageLifecycle::Closing;
         let inflight = std::mem::take(&mut state.inflight);
         drop(state);
-        self.telemetry.record_lifecycle(StorageLifecycle::Closing);
-        inflight
+        let tasks: Vec<_> = inflight
             .into_values()
             .map(|entry| {
+                let settled = entry.task.is_finished();
+                (entry, settled)
+            })
+            .collect();
+        self.telemetry.record_lifecycle(StorageLifecycle::Closing);
+        tasks
+            .into_iter()
+            .map(|(entry, settled)| {
                 entry
                     .cause
                     .store(CancelCause::Closing.code(), Ordering::Release);
                 entry.cancel.cancel();
-                entry.task
+                (entry.task, settled)
             })
             .collect()
     }
@@ -847,10 +859,18 @@ impl ParquetMetadataCache {
         if let Some(clean) = *closing {
             return clean;
         }
+        // With no budget left there is nothing to wait for: a loader still
+        // running when close began is forced, however soon it finishes after.
+        let no_budget = deadline <= Instant::now();
         let mut clean = true;
-        for mut task in self.begin_close() {
+        for (mut task, settled) in self.begin_close() {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            if tokio::time::timeout(remaining, &mut task).await.is_err() {
+            let forced = if no_budget {
+                !settled
+            } else {
+                tokio::time::timeout(remaining, &mut task).await.is_err()
+            };
+            if forced {
                 // The loader did not settle within the shutdown budget. Abort
                 // it and await the abort, so the owner never reports `Closed`
                 // while a task is still touching its state.

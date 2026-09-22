@@ -36,7 +36,7 @@ use crate::oracle::reader_authority::cut;
 use super::snapshot_expiration::{
     ExpirableTable, expirable_table, object_exists, seed_ready_expiry_task,
 };
-use super::support::PromotionIntegrationFixture;
+use super::support::{ForgeTelemetryCheckpoint, PromotionIntegrationFixture};
 
 /// One drained expiration and the cleanup task its handoff projects to.
 struct DrainedExpiration {
@@ -588,11 +588,17 @@ async fn assert_cross_table_plan_is_refused(
     persist_cleanup_plan(&table.fixture, cleanup_id, &sibling).await;
     let leases_before = live_leases(&table.fixture).await;
     let stats_before = table.store.stats();
-    let stray = worker
+    let Some(stray) = worker
         .claim_for_test()
         .await
         .expect("claim transaction runs")
-        .expect("the replanted cleanup task is claimable");
+    else {
+        panic!(
+            "the replanted cleanup task is claimable; tasks at {}: {:?}",
+            chrono::Utc::now(),
+            table.fixture.forge_tasks().await
+        );
+    };
     let refused = worker
         .execute_expired_cleanup_claim_for_test(stray, &CancellationToken::new())
         .await
@@ -627,6 +633,7 @@ async fn assert_cross_table_plan_is_refused(
 
 #[tokio::test]
 async fn candidate_preparation_releases_sql_and_blocks_oracle_and_competing_forge_claims() {
+    let _telemetry = ForgeTelemetryCheckpoint::install();
     let DrainedExpiration {
         table,
         worker,
@@ -636,11 +643,17 @@ async fn candidate_preparation_releases_sql_and_blocks_oracle_and_competing_forg
     let deletes_before = table.store.deletes();
     assert_cross_table_plan_is_refused(&table, &worker, cleanup_id, &payload).await;
 
-    let claim = worker
+    let Some(claim) = worker
         .claim_for_test()
         .await
         .expect("claim transaction runs")
-        .expect("the cleanup task is claimable");
+    else {
+        panic!(
+            "the cleanup task is claimable; tasks at {}: {:?}",
+            chrono::Utc::now(),
+            table.fixture.forge_tasks().await
+        );
+    };
     assert_eq!(claim.task_id, cleanup_id);
     assert_eq!(
         claim.strategy.as_str(),
@@ -1167,6 +1180,7 @@ async fn assert_cleanup_finished_exactly(
 
 #[tokio::test]
 async fn cursor_replays_exact_prepared_candidate_after_refusal_uncertainty_and_takeover() {
+    let _telemetry = ForgeTelemetryCheckpoint::install();
     let DrainedExpiration {
         table,
         worker,
@@ -1190,11 +1204,17 @@ async fn cursor_replays_exact_prepared_candidate_after_refusal_uncertainty_and_t
     let first = payload.cleanup_candidates[0].path.as_str().to_owned();
     let second = payload.cleanup_candidates[1].path.as_str().to_owned();
 
-    let claim = worker
+    let Some(claim) = worker
         .claim_for_test()
         .await
         .expect("claim transaction runs")
-        .expect("the cleanup task is claimable");
+    else {
+        panic!(
+            "the cleanup task is claimable; tasks at {}: {:?}",
+            chrono::Utc::now(),
+            table.fixture.forge_tasks().await
+        );
+    };
     let attempt = claim.attempt_id.expect("a claimed task has an attempt");
 
     assert_cancellation_before_preparation_is_inert(&table, &worker, &claim, cleanup_id, &payload)

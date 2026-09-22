@@ -1027,7 +1027,10 @@ async fn scheduler_debt_includes_rewrite_and_promotion() {
         worker
             .execute_one_for_test(&stop)
             .await
-            .expect("real promotion")
+            .expect("real promotion"),
+        "the promotion task is claimed; tasks at {}: {:?}",
+        chrono::Utc::now(),
+        fixture.forge_tasks().await
     );
     let executed = telemetry.snapshot();
     assert_eq!(
@@ -1225,7 +1228,10 @@ async fn worker_malformed_known_payload_observes_one_refusal() {
         worker
             .execute_one_for_test(&stop)
             .await
-            .expect("terminalized payload")
+            .expect("terminalized payload"),
+        "the malformed task is claimed; tasks at {}: {:?}",
+        chrono::Utc::now(),
+        fixture.forge_tasks().await
     );
     let state: (String, Option<String>, i32) =
         sqlx::query_as("SELECT state,failure_class,attempt_count FROM vala.forge_tasks")

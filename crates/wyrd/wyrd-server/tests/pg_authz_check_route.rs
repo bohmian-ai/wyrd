@@ -23,14 +23,20 @@ use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::CardRef;
 use wyrd_testing::WyrdTestServer;
 
-/// A user access token is not a delegated token, so the route must refuse it on
-/// principal kind alone — before any permission lookup.
+/// Only a Service or Agent actor may ask on a subject's behalf, so a delegated
+/// token whose actor is a User is refused on the actor's kind alone — before any
+/// permission lookup. (A plain user token has no actor and reports
+/// `chain_empty`.)
 #[tokio::test]
-async fn authz_user_jwt_returns_403_kind_not_eligible() {
+async fn authz_user_actor_returns_403_kind_not_eligible() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
-    let token = mint_user_jwt(server.state(), server.data_tenant_id());
+    let token = mint_delegated_jwt(
+        server.state(),
+        server.data_tenant_id(),
+        PrincipalKindTag::User,
+    );
 
     let (status, problem) = post_authz(&server, &token, true).await;
 
@@ -123,7 +129,11 @@ async fn authz_deny_hook_returns_403_with_reason() {
         .start_in_process()
         .await
         .expect("test server starts");
-    let token = mint_delegated_service_jwt(server.state(), server.data_tenant_id());
+    let token = mint_delegated_jwt(
+        server.state(),
+        server.data_tenant_id(),
+        PrincipalKindTag::Service,
+    );
 
     let (status, problem) = post_authz(&server, &token, true).await;
 
@@ -142,7 +152,11 @@ async fn authz_missing_x_original_method_still_uses_body_check() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
-    let token = mint_delegated_service_jwt(server.state(), server.data_tenant_id());
+    let token = mint_delegated_jwt(
+        server.state(),
+        server.data_tenant_id(),
+        PrincipalKindTag::Service,
+    );
 
     let (status, body) = post_authz(&server, &token, false).await;
 
@@ -161,7 +175,11 @@ async fn authz_unknown_action_returns_validation_error() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
-    let token = mint_delegated_service_jwt(server.state(), server.data_tenant_id());
+    let token = mint_delegated_jwt(
+        server.state(),
+        server.data_tenant_id(),
+        PrincipalKindTag::Service,
+    );
 
     let response = server
         .oneshot(authz_request_with_action(&token, "not_a_real_action"))
@@ -274,36 +292,6 @@ fn authz_body(target: &CardRef) -> serde_json::Value {
     })
 }
 
-/// Mint a user access token from the composed server's issuing key.
-///
-/// # Panics
-/// Panics when the composed state has no issuing key or minting fails.
-fn mint_user_jwt(state: &AppState, tenant: DataTenantId) -> String {
-    state
-        .auth
-        .issuing_key
-        .as_ref()
-        .expect("composed server carries an issuing key")
-        .issue_access_token(
-            wyrd_auth_issue::AccessGrant {
-                principal: TokenPrincipalRef {
-                    id: PrincipalId::new(uuid::Uuid::now_v7()),
-                    kind: PrincipalKindTag::User,
-                    tenant_id: tenant,
-                    card_ref: None,
-                    card_ref_scope: wyrd_spec::reference::CardRefScope::default(),
-                },
-                roles: Vec::new(),
-                permissions: wyrd_runtime::PermissionSet::new(),
-                credential_id: None,
-                act: None,
-                audience: TokenAudience::Wyrd,
-            },
-            Duration::minutes(5),
-        )
-        .expect("user jwt mints")
-}
-
 /// Mint a direct (undelegated) service access token from the composed server's
 /// issuing key, used to prove the route refuses an empty delegation chain.
 ///
@@ -335,20 +323,30 @@ fn mint_service_jwt(state: &AppState, tenant: DataTenantId, name: &str) -> Strin
         .expect("service jwt mints")
 }
 
-/// Mint a delegated service token whose subject is `subject` and whose outer
-/// actor is a distinct `actor` service, so the route's delegation gate admits
-/// it and evaluation proceeds to the policy hook.
+/// Mint a delegated token whose subject is the `callee` service and whose outer
+/// actor is a distinct `actor` of `actor_kind`. A Service actor passes the
+/// route's delegation gate so evaluation proceeds to the policy hook; any other
+/// kind is refused by that gate.
 ///
 /// # Panics
 /// Panics when the composed server carries no issuing key or minting fails.
-fn mint_delegated_service_jwt(state: &AppState, tenant: DataTenantId) -> String {
-    let actor_ref = card_ref(CardKind::Service, "actor");
+fn mint_delegated_jwt(
+    state: &AppState,
+    tenant: DataTenantId,
+    actor_kind: PrincipalKindTag,
+) -> String {
+    // Only a Service actor is Card-bound; the verifier refuses a Card on a User.
+    let actor_ref = matches!(actor_kind, PrincipalKindTag::Service)
+        .then(|| card_ref(CardKind::Service, "actor"));
     let actor = TokenPrincipalRef {
         id: PrincipalId::new(uuid::Uuid::now_v7()),
-        kind: PrincipalKindTag::Service,
+        kind: actor_kind,
         tenant_id: tenant,
-        card_ref: Some(actor_ref.clone()),
-        card_ref_scope: wyrd_spec::reference::CardRefScope::own(&actor_ref),
+        card_ref_scope: actor_ref
+            .as_ref()
+            .map(wyrd_spec::reference::CardRefScope::own)
+            .unwrap_or_default(),
+        card_ref: actor_ref,
     };
     let subject_ref = card_ref(CardKind::Service, "callee");
     let subject = TokenPrincipalRef {

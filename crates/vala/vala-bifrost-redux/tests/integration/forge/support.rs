@@ -871,7 +871,9 @@ impl PromotionIntegrationFixture {
         .expect("worker");
         assert!(
             first.execute_one_for_test(stop).await.is_err(),
-            "terminal SQL refusal must surface"
+            "terminal SQL refusal must surface; tasks at {}: {:?}",
+            chrono::Utc::now(),
+            self.forge_tasks().await
         );
         let state: String = sqlx::query_scalar("SELECT state FROM vala.forge_tasks")
             .fetch_one(self.operator_pool.pool())

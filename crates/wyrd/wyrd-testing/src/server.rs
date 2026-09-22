@@ -4262,20 +4262,41 @@ fn peer_keyring_config(
     }
 }
 
-/// Ask the OS for one currently free loopback address used by a bound harness.
+/// Ports the harness reserves from: below every common OS ephemeral range
+/// (Linux 32768+, macOS and Windows 49152+).
+///
+/// A reservation is released before the production binder claims it, so it
+/// must come from a range the kernel never hands out on its own. An `:0` port
+/// sits in the ephemeral range, where any outgoing connection — every Postgres
+/// pool connection of every concurrent test — can take it in that gap.
+const HARNESS_PORTS: std::ops::Range<u16> = 20_000..32_768;
+
+/// Reserve one currently free loopback address used by a bound harness.
 ///
 /// Reserving before server composition gives membership a concrete nonzero
 /// private endpoint. The production binder later claims this exact address.
+/// The port is drawn at random from [`HARNESS_PORTS`] and probed, so only two
+/// harnesses drawing the same free port in the same instant can still collide.
 ///
 /// # Errors
 ///
-/// Returns a bind error when loopback binding or address lookup fails.
+/// Returns a bind error when no probed port is free or address lookup fails.
 pub(crate) fn reserve_loopback_addr() -> Result<std::net::SocketAddr, WyrdTestServerError> {
-    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-        .map_err(|error| WyrdTestServerError::Bind(error.to_string()))?;
-    listener
-        .local_addr()
-        .map_err(|error| WyrdTestServerError::Bind(error.to_string()))
+    let mut last = None;
+    for _ in 0..64 {
+        let port = rand::random_range(HARNESS_PORTS);
+        match std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)) {
+            Ok(listener) => {
+                return listener
+                    .local_addr()
+                    .map_err(|error| WyrdTestServerError::Bind(error.to_string()));
+            }
+            Err(error) => last = Some(error),
+        }
+    }
+    Err(WyrdTestServerError::Bind(format!(
+        "no free harness port in {HARNESS_PORTS:?}: {last:?}"
+    )))
 }
 
 /// Poll a bound test server until its HTTP health endpoint reports readiness.

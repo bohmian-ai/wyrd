@@ -10,7 +10,8 @@
 # `wyrd-client/tests/storage_dispatch.rs` (presigned transfer headers) and the
 # `#[cfg(test)]` module of `wyrd-client/src/cards/handle.rs` are test-only
 # seams; their wiremock dev-dependency is not part of the published client
-# dependency graph.
+# dependency graph. The `#[cfg(test)]` `screening_tests` module of
+# `wyrd-auth/src/callback.rs` is the same shape: a dev-dependency only.
 #
 # WHAT IT CHECKS: mockall, wiremock, and mockito references do not appear
 # outside wyrd-testing and the explicitly allowlisted provider/auth files.
@@ -37,10 +38,10 @@ if rg -n 'mockall|wiremock|mockito' crates \
   --glob '!crates/wyrd/wyrd-server/Cargo.toml' \
   --glob '!crates/wyrd/wyrd-server/src/auth/jwt_bearer.rs' \
   --glob '!crates/wyrd/wyrd-server/src/auth/callback.rs' \
-  --glob '!crates/wyrd/wyrd-server/src/auth/admin.rs' \
   --glob '!crates/wyrd/wyrd-server/src/components/admin/routes.rs' \
-  --glob '!crates/wyrd/wyrd-server/src/issuer_boot.rs' \
   --glob '!crates/wyrd/wyrd-server/src/boot/issuer.rs' \
+  --glob '!crates/wyrd/wyrd-auth/Cargo.toml' \
+  --glob '!crates/wyrd/wyrd-auth/src/callback.rs' \
   --glob '!crates/wyrd/wyrd-cli/src/auth/trusted_issuer.rs'; then
   echo 'mock dependency leaked outside wyrd-testing'
   exit 1

@@ -4,7 +4,7 @@ set -euo pipefail
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
-python3 - <<'PY'
+uv run python - <<'PY'
 import json
 import subprocess
 import sys

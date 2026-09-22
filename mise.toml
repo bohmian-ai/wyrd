@@ -35,6 +35,8 @@ env_shell_expand = false
 jobs = 1
 
 [env]
+# uv uses the `[tools]` python (https://mise.jdx.dev/lang/python.html#mise-uv).
+UV_PYTHON = { value = "{{ tools.python.path }}", tools = true }
 UI_DIR = "crates/wyrd/wyrd-server/wyrd-ui"
 PY_DIR = "sdks/wyrd-sdk-python"
 WYRD_DEV_PG_CACHE = "${HOME}/.cache/wyrd/pg"
@@ -469,7 +471,7 @@ set -e
 docker compose up -d keycloak dex --wait
 
 # Seed Keycloak users via admin REST API (realm import only defines clients/groups)
-python3 - <<'PYEOF'
+uv run python - <<'PYEOF'
 import json, urllib.request, urllib.parse, time, sys
 
 BASE = "http://localhost:8080"
@@ -819,27 +821,27 @@ run = "bash scripts/checks/test-coverage.sh"
 [tasks."check:unwrap-audit"]
 hide = true
 description = "Audit unwrap/expect calls outside tests and examples"
-run = "python scripts/check_unwrap_audit.py"
+run = "uv run python scripts/check_unwrap_audit.py"
 
 [tasks."check:audit-script"]
 hide = true
 description = "Self-tests for the unwrap/expect audit script"
-run = "python scripts/tests/test_check_unwrap_audit.py"
+run = "uv run python scripts/tests/test_check_unwrap_audit.py"
 
 [tasks."check:clippy-allow-audit"]
 hide = true
 description = "Audit `#[allow(clippy::...)]` attributes outside tests and examples (requires a `// justification:` comment on the previous line)"
-run = "python scripts/check_clippy_allow.py"
+run = "uv run python scripts/check_clippy_allow.py"
 
 [tasks."check:tenant-isolation:self"]
 hide = true
 description = "Self-tests for the tenant isolation check script"
-run = "python scripts/tests/test_check_tenant_isolation.py"
+run = "uv run python scripts/tests/test_check_tenant_isolation.py"
 
 [tasks."check:clippy-allow-audit:self"]
 hide = true
 description = "Self-tests for the clippy-allow audit script"
-run = "python scripts/tests/test_check_clippy_allow.py"
+run = "uv run python scripts/tests/test_check_clippy_allow.py"
 
 [tasks."check:test-coverage:self"]
 hide = true
@@ -862,12 +864,12 @@ run = "bash scripts/checks/error-coverage.sh"
 [tasks."check:tenant-isolation"]
 hide = true
 description = "Assert SQL foundation tenant isolation and server-tier boundaries"
-run = "python scripts/check_tenant_isolation.py"
+run = "uv run python scripts/check_tenant_isolation.py"
 
 [tasks."check:test-contracts"]
 hide = true
 description = "Verify Wyrd critical Rust contracts have explicit Python test markers"
-run = "python scripts/check_test_contracts.py"
+run = "uv run python scripts/check_test_contracts.py"
 
 [tasks."check:tokens"]
 hide = true
@@ -1115,28 +1117,28 @@ hide = true
 description = "Generate docs pages from Wyrd schemas and API metadata"
 dir = "docs"
 run = """
-python scripts/generate_card_docs.py
-python scripts/generate_api_docs.py
-python scripts/generate_llms_txt.py
+uv run python scripts/generate_card_docs.py
+uv run python scripts/generate_api_docs.py
+uv run python scripts/generate_llms_txt.py
 """
 
 [tasks."docs:check:commands"]
 hide = true
 description = "Fail public docs snippets that bypass mise"
 dir = "docs"
-run = "python scripts/check_commands.py"
+run = "uv run python scripts/check_commands.py"
 
 [tasks."docs:linkcheck"]
 hide = true
 description = "Validate local Markdown links in the docs site"
 dir = "docs"
-run = "python scripts/check_links.py"
+run = "uv run python scripts/check_links.py"
 
 [tasks."docs:a11y"]
 hide = true
 description = "A11y gate: landmarks, heading order, WCAG AA contrast, keyboard controls over prerendered build"
 dir = "docs"
-run = "python scripts/check_a11y.py"
+run = "uv run python scripts/check_a11y.py"
 
 [tasks."docs:svelte:check"]
 hide = true
@@ -1549,4 +1551,4 @@ run = "bash scripts/postgres/test-roles.sh"
 [tasks."test:postgres:inventory"]
 hide = true
 description = "Validate the TOML-aware database task lifecycle inventory and regression fixture"
-run = "python3 scripts/postgres/check-inventory.py && python3 scripts/postgres/check-inventory.py --negative-test"
+run = "uv run python scripts/postgres/check-inventory.py && uv run python scripts/postgres/check-inventory.py --negative-test"

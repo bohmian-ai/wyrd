@@ -315,7 +315,18 @@ Owning lanes: all passed at the final candidate.
 - Whitespace: `git diff --check c5c20754a167e8f4d74a555a720bd51df6179a6f HEAD` is clean.
 
 Limits:
-- **Python declared in `mise.toml`.** Four lanes call a bare `python`: `check:unwrap-audit`, `check:clippy-allow-audit`, `check:tenant-isolation` and `docs:check`. The repository `mise.toml` `[tools]` did not declare Python, so these lanes failed with `python: not found` on a machine without one on `PATH`. `python = "3.12"`, matching CI's `setup-uv` version, is now declared. After `mise install`, all four pass through `mise run <task>`, and `py:lints` and `py:test:unit` (468 passed) still pass.
+- **Python toolchain through mise and uv.** Several script lanes called a bare `python` or `python3`, which mise never supplied. Following https://mise.jdx.dev/lang/python.html#mise-uv:
+  - `mise.toml` now declares `python = "3.12"` in `[tools]` (matching CI);
+  - `[env]` sets `UV_PYTHON = { value = "{{ tools.python.path }}", tools = true }`;
+  - every Python task and task-invoked script now runs through `uv run python`.
+
+  All of these pass through plain `mise run`:
+  - `check:unwrap-audit`, `check:clippy-allow-audit`, `check:tenant-isolation`
+  - their `:self` / `audit-script` tests
+  - `check:test-contracts`, `check:no-testing-in-prod-deps`, `test:postgres:inventory`
+  - `docs:check`, `docs:a11y`, `docs:check:commands`, `docs:linkcheck`
+
+  `py:test:unit` (468 passed) and `py:typecheck` pass on the SDK `.venv`, which was rebuilt on the mise interpreter.
 - **Flaky first `test:shared` run.** It failed once because the test server's port was already taken (`Address already in use`) and passed 658/658 on the re-run.
 - **Strict rustdoc for `vala-bifrost-redux`.** It fails on missing docs this change did not introduce; only one line of `gate/auth.rs` changed there. That crate is not in `check:docs`.
 - **Trailing blank lines.** Two review records from `33feb673b` had trailing blank lines. Only the whitespace was removed, so `diff --check` passes.

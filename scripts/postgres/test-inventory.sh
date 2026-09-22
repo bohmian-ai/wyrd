@@ -6,7 +6,7 @@ readonly temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/wyrd-pg-inventory.XXXXXX")"
 trap 'rm -rf "$temp_dir"' EXIT
 
 cp "$root/mise.toml" "$temp_dir/mise.toml"
-python3 - "$temp_dir/mise.toml" <<'PY'
+uv run python - "$temp_dir/mise.toml" <<'PY'
 from pathlib import Path
 import sys
 

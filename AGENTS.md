@@ -419,6 +419,13 @@ behavior has no cross-boundary state (record the reason).
   lifetime-dependent behavior must be loaded and exercised through the owning
   language runtime.
 
+### Host Load
+
+- Never generate synthetic host load to reproduce a failure: no `stress-ng`,
+  busy loops, duplicated or parallel lane runs, or raised test-thread counts.
+  The workstation is shared. Diagnose a load-only failure from its logs, code,
+  and timing assumptions, and prove the fix with the normal lane.
+
 ### Verification Scope
 
 Run verification for the code you changed. Capability-scoped `verify:<scope>`

@@ -1,4 +1,4 @@
-# <img src="docs/src/assets/wyrd-mark.svg" alt="" width="44" height="44"> Wyrd
+# <img src="docs/src/assets/wyrd-mark.svg" alt="" width="30" height="30"> Wyrd
 
 **Open-source verification and assurance infrastructure for AI systems.**
 
@@ -12,11 +12,9 @@ component versions behind it.
 [Release tracker](https://github.com/orgs/bohmian-ai/projects/1) ·
 [Contributing](CONTRIBUTING.md)
 
-**Coming this week:** Wyrd `v0.1.0` is targeted for September 25, 2026. Today,
-a source checkout supports local Card authoring and a development server.
-[Try the current source](#try-the-current-source). The verification example
-below shows the approved `v0.1.0` interface; its end-to-end path is still being
-completed.
+**Coming this week:** Wyrd `v0.1.0` is targeted for September 25, 2026. The
+verification example below shows the approved interface; its end-to-end path
+is still being completed.
 
 ## Planned verification workflow: Pydantic AI service
 
@@ -192,48 +190,6 @@ Enforce policy or trigger action
 - **Vala** owns observations, Drift and Agent Eval execution, and the Bifrost
   warehouse.
 - **Skald** owns LLM providers, prompts, tools, agents, and workflows.
-
-## Try the current source
-
-Public packages and container images will be published with `v0.1.0`. Until
-then, work from a repository checkout. You need Git, Python 3.10 or newer, and
-[`mise`](https://mise.jdx.dev/).
-
-```bash
-git clone https://github.com/bohmian-ai/wyrd.git
-cd wyrd
-mise install
-mise run examples:python:datacard
-```
-
-Expected output:
-
-```text
-saved_card_json: true
-saved_data_file: data/data.parquet
-loaded_rows: 3
-loaded_columns: customer_id,churned,segment
-labels: domain=customer,stage=example
-annotation_source: examples/python/datacard_local_workflow.py
-```
-
-This credential-free example creates a `DataCard` from a pandas DataFrame,
-saves it locally, and loads it again. It demonstrates Card authoring; it does
-not start the server or run continuous verification.
-
-To run the current server locally:
-
-```bash
-mkdir -p .wyrd-dev/storage
-export WYRD_STORAGE_URL="file://$PWD/.wyrd-dev/storage"
-export WYRD_PUBLIC_BASE_URL="http://localhost:8080"
-mise run dev:backend
-```
-
-The development server uses embedded Postgres, local object storage, and an
-ephemeral signing key. See
-[Self-hosting](docs/src/content/docs/self-hosting/index.svx) for health checks,
-initialization, and production configuration.
 
 ## Release status
 

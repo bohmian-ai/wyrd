@@ -206,6 +206,7 @@ run = """
 scripts/postgres/with-test-postgres.sh -- bash -lc '
 set -e
 mise run db:migrate:all:inner
+if [[ ${CI:-} == true ]]; then export NEXTEST_TEST_THREADS=2; fi
 cargo nextest run --locked \
   -p wyrd-client --test pg_bifrost_e2e \
   -p wyrd-testing --test forge --test scribe --test oracle --test otlp --test server \

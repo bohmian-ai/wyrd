@@ -108,7 +108,6 @@ jobs:
 
       - name: Run selected CI lane
         env:
-          NEXTEST_TEST_THREADS: "2"
           RUST_LOG: info,vala_bifrost_redux::oracle=debug
         run: |
           if [[ "${{ needs.changes.outputs.full_gate }}" == "true" ]]; then

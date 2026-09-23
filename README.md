@@ -1,6 +1,4 @@
-![Wyrd logo](docs/src/assets/wyrd-mark.svg)
-
-# Wyrd
+# <img src="docs/src/assets/wyrd-mark.svg" alt="" width="44" height="44"> Wyrd
 
 **Open-source verification and assurance infrastructure for AI systems.**
 
@@ -14,10 +12,11 @@ component versions behind it.
 [Release tracker](https://github.com/orgs/bohmian-ai/projects/1) ·
 [Contributing](CONTRIBUTING.md)
 
-**Current status:** A source checkout supports local Card authoring and a
-development server. [Try the current source](#try-the-current-source). The
-verification example below shows the approved `v0.1.0` interface; its
-end-to-end path is still being completed.
+**Coming this week:** Wyrd `v0.1.0` is targeted for September 25, 2026. Today,
+a source checkout supports local Card authoring and a development server.
+[Try the current source](#try-the-current-source). The verification example
+below shows the approved `v0.1.0` interface; its end-to-end path is still being
+completed.
 
 ## Planned verification workflow: Pydantic AI service
 

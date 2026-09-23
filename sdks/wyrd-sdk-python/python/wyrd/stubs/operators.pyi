@@ -1,4 +1,5 @@
 #### begin imports ####
+import builtins
 from collections.abc import Mapping
 from typing import Any
 
@@ -37,7 +38,7 @@ class OperatorConnections:
         """
         ...
 
-    def list(self) -> list[dict[str, Any]]:
+    def list(self) -> builtins.list[dict[str, Any]]:
         """List the caller tenant's connections.
 
         Raises:

@@ -49,18 +49,17 @@ jobs:
       - id: plan
         shell: bash
         run: |
+          echo 'os=["ubuntu-24.04","macos-15"]' >> "$GITHUB_OUTPUT"
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            echo 'os=["ubuntu-24.04"]'                                >> "$GITHUB_OUTPUT"
-            echo 'python=["3.12"]'                                    >> "$GITHUB_OUTPUT"
+            echo 'python=["3.12"]' >> "$GITHUB_OUTPUT"
           else
-            echo 'os=["ubuntu-24.04","macos-15","windows-latest"]'    >> "$GITHUB_OUTPUT"
-            echo 'python=["3.10","3.11","3.12"]'                      >> "$GITHUB_OUTPUT"
+            echo 'python=["3.10","3.11","3.12"]' >> "$GITHUB_OUTPUT"
           fi
           cat "$GITHUB_OUTPUT"
 
   # Mixed, global, and unclassified changes take the complete repository gate.
   # Any other non-Bifrost Rust change runs format, lint, and Linux Rust tests
-  # here; rust-compat adds macOS and Windows on main.
+  # here; rust-client covers client/SDK code on Linux and macOS.
   ci:
     name: ci
     needs: changes
@@ -158,32 +157,50 @@ jobs:
       - name: Run Bifrost gate
         run: mise run verify:bifrost
 
-  # Cross-platform Rust compatibility: tests on macOS and Windows.
-  # Format/lint/boundary checks run only in the ci job above (Linux only).
-  rust-compat:
-    name: rust compat (${{ matrix.os }})
+  rust-client:
+    name: rust client (${{ matrix.os }})
     needs: [changes, matrix-plan]
-    if: (needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflow == 'true') && needs.changes.outputs.bifrost_only != 'true'
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflow == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         os: ${{ fromJSON(needs.matrix-plan.outputs.os) }}
-        exclude:
-          - os: ubuntu-24.04   # covered by the ci job
     steps:
       - uses: actions/checkout@v4
 
       - uses: ./.github/actions/setup-rust-ci
 
-      - name: Run Rust test gate
-        run: mise run test:rust
+      - name: Run Rust client and SDK tests
+        run: |
+          mise run test:wyrd-sdk
+          mise exec -- cargo nextest run --locked -p wyrd-client --lib
+
+  typescript:
+    name: typescript (${{ matrix.os }})
+    needs: [changes, matrix-plan]
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflow == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(needs.matrix-plan.outputs.os) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-rust-ci
+
+      - name: Run TypeScript SDK tests
+        run: |
+          mise run ts:typecheck
+          mise run ts:test:unit
 
   python:
     name: python (${{ matrix.os }} / py${{ matrix.python-version }})
     needs: [changes, matrix-plan]
-    if: (needs.changes.outputs.python == 'true' || needs.changes.outputs.workflow == 'true') && needs.changes.outputs.bifrost_only != 'true'
+    if: needs.changes.outputs.python == 'true' || needs.changes.outputs.workflow == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     strategy:
@@ -314,7 +331,7 @@ jobs:
 
   ci-complete:
     name: ci complete
-    needs: [changes, matrix-plan, ci, bifrost, rust-compat, python, docs, ui]
+    needs: [changes, matrix-plan, ci, bifrost, rust-client, typescript, python, docs, ui]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -329,7 +346,8 @@ jobs:
           "${{ needs.matrix-plan.result }}"
           "${{ needs.ci.result }}"
           "${{ needs.bifrost.result }}"
-          "${{ needs.rust-compat.result }}"
+          "${{ needs.rust-client.result }}"
+          "${{ needs.typescript.result }}"
           "${{ needs.python.result }}"
           "${{ needs.docs.result }}"
           "${{ needs.ui.result }}"

@@ -113,7 +113,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: pypi_linux_${{ matrix.target }}
+          name: pypi_ubuntu_${{ matrix.target }}
           path: sdks/wyrd-sdk-python/dist
           retention-days: 1
 
@@ -162,44 +162,9 @@ jobs:
           path: sdks/wyrd-sdk-python/dist
           retention-days: 1
 
-  build-windows:
-    name: python - windows x86_64
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: astral-sh/setup-uv@v6
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          ignore-nothing-to-cache: true
-
-      - run: pip install "twine>=6.1.0" "packaging>=24.2"
-
-      - uses: arduino/setup-protoc@v3
-        with:
-          version: "33.2"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build wheel
-        uses: PyO3/maturin-action@v1
-        with:
-          command: build
-          target: x86_64-pc-windows-msvc
-          args: --release --out dist
-          rust-toolchain: stable
-          working-directory: sdks/wyrd-sdk-python
-
-      - run: twine check --strict sdks/wyrd-sdk-python/dist/*
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: pypi_windows_x86_64
-          path: sdks/wyrd-sdk-python/dist
-          retention-days: 1
-
   inspect-wheels:
     name: inspect wheels
-    needs: [build-sdist, build-linux, build-macos, build-windows]
+    needs: [build-sdist, build-linux, build-macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -211,11 +176,11 @@ jobs:
 
   test-wheels:
     name: smoke - ${{ matrix.os }}
-    needs: [build-sdist, build-linux, build-macos, build-windows]
+    needs: [build-sdist, build-linux, build-macos]
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu, macos, windows]
+        os: [ubuntu, macos]
     runs-on: ${{ matrix.os }}-latest
     steps:
       - uses: actions/checkout@v4
@@ -293,9 +258,6 @@ jobs:
           - os: macos-15
             target: aarch64-apple-darwin
             package: darwin-arm64
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            package: win32-x64-msvc
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -340,8 +302,8 @@ jobs:
           addon=$(find sdks/wyrd-sdk-ts/wyrd -maxdepth 1 -name 'wyrd.*.node' -print -quit)
           test -n "$addon"
           cp "$addon" "dist/addon/wyrd.${{ matrix.package }}.node"
-          npm pack --pack-destination "$PWD/dist" --json --prefix dist/addon
-          npm pack --pack-destination "$PWD/dist" --json --prefix sdks/wyrd-sdk-ts/wyrd
+          npm pack ./dist/addon --pack-destination "$PWD/dist" --json
+          npm pack ./sdks/wyrd-sdk-ts/wyrd --pack-destination "$PWD/dist" --json
           test -f "dist/wyrd-sdk-0.0.1.tgz"
           test -f "dist/wyrd-sdk-${{ matrix.package }}-0.0.1.tgz"
 

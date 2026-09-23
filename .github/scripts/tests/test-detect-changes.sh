@@ -159,20 +159,23 @@ rm -f "$zero_outputs"
 
 # The Linux ci job owns a selected change: a full-gate change runs only gate,
 # which already reaches the Rust tests, and any other change runs check and
-# then test:rust. rust-compat keeps Linux excluded so no Rust lane repeats.
+# then test:rust. Client/SDK tests run on Linux and macOS separately.
 LINTS_TEST="$SCRIPT_DIR/../../workflows/lints-test.yml"
 ci_job="$(awk '/^  ci:$/{p=1;next} p&&/^  [a-z-]+:$/{p=0} p' "$LINTS_TEST")"
 full_branch="$(awk '/full_gate }}" == "true" ]]; then$/{p=1;next} /^ *else$/{p=0} p' <<< "$ci_job")"
 generic_branch="$(awk '/^ *else$/{p=1;next} /^ *fi$/{p=0} p' <<< "$ci_job")"
-rust_compat="$(awk '/^  rust-compat:$/{p=1;next} p&&/^  [a-z-]+:$/{p=0} p' "$LINTS_TEST")"
+rust_client="$(awk '/^  rust-client:$/{p=1;next} p&&/^  [a-z-]+:$/{p=0} p' "$LINTS_TEST")"
+typescript="$(awk '/^  typescript:$/{p=1;next} p&&/^  [a-z-]+:$/{p=0} p' "$LINTS_TEST")"
 if grep -q 'mise run gate' <<< "$full_branch" \
   && ! grep -q 'test:rust' <<< "$full_branch" \
   && grep -A1 'mise run check' <<< "$generic_branch" | grep -q 'mise run test:rust' \
-  && grep -q -- '- os: ubuntu-24.04' <<< "$rust_compat"; then
-  echo "OK  ci runs gate for full changes and check plus test:rust otherwise"
+  && grep -q 'mise run test:wyrd-sdk' <<< "$rust_client" \
+  && grep -q -- '-p wyrd-client --lib' <<< "$rust_client" \
+  && grep -q 'mise run ts:test:unit' <<< "$typescript"; then
+  echo "OK  ci runs server tests on Linux and client SDK tests on both platforms"
   PASS=$((PASS+1))
 else
-  echo "FAIL ci must run gate for full changes and check then test:rust otherwise, with Linux excluded from rust-compat"
+  echo "FAIL ci must keep the Linux gate and cross-platform client SDK tests"
   FAIL=$((FAIL+1))
 fi
 

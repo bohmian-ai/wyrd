@@ -3,9 +3,10 @@
 //! A thin projection of `wyrd-client`, the sole shared client implementation:
 //! authentication and transport, [`cards::Cards`], [`principals::Principals`],
 //! [`platform::Platform`], [`state::WyrdState`], [`storage::WyrdStorageClient`],
-//! [`verification::Verification`], and [`Bifrost`]. This package adds no
-//! transport, validation, registry, storage, or lifecycle behavior of its own,
-//! and never enables an owner crate's `python` feature.
+//! [`verification::Verification`],
+//! [`operator_connections::OperatorConnections`], and [`Bifrost`]. This
+//! package adds no transport, validation, registry, storage, or lifecycle
+//! behavior of its own, and never enables an owner crate's `python` feature.
 
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
@@ -22,6 +23,7 @@ mod tests {
         let _ = super::cards::Cards::with_client;
         let _ = super::principals::Principals::with_client;
         let _ = super::verification::Verification::with_client;
+        let _ = super::operator_connections::OperatorConnections::with_client;
         let _ = super::platform::Platform::connect;
         let _ = super::state::WyrdState::from_path;
         let _ = super::storage::WyrdStorageClient::new;

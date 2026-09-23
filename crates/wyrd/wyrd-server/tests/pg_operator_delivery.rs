@@ -30,6 +30,7 @@ use wyrd_server::verification::health::RuntimeCapability;
 use wyrd_server::verification::operators::ProviderEndpoints;
 use wyrd_server::verification::runner::EngineScript;
 use wyrd_server::verification::{CapabilityCrash, RuntimeLimits, VerificationRuntime};
+use wyrd_spec::DataTenantId;
 use wyrd_spec::card::drift::DriftMethod;
 use wyrd_spec::ids::{CardUid, FeatureName, VerificationRunId};
 use wyrd_spec::verification::FrozenTarget;
@@ -404,11 +405,11 @@ impl Running {
     }
 }
 
-/// A script whose one execution returns a failing Drift verdict.
+/// A script whose next `runs` executions each return a failing Drift verdict.
 ///
 /// # Panics
 /// Panics when a static feature name is invalid.
-fn failing_script() -> EngineScript {
+fn failing_script(runs: usize) -> EngineScript {
     let feature = FeatureName::new("latency").expect("feature name");
     let report = DriftReport {
         method: DriftMethod::Custom,
@@ -426,9 +427,11 @@ fn failing_script() -> EngineScript {
         verdict: DriftVerdict::Drift,
     };
     let script = EngineScript::default();
-    script.push(EngineOutcome::Completed(VerifierReport::Drift(Some(
-        report,
-    ))));
+    for _ in 0..runs {
+        script.push(EngineOutcome::Completed(VerifierReport::Drift(Some(
+            report.clone(),
+        ))));
+    }
     script
 }
 
@@ -537,7 +540,7 @@ async fn failed_verdict_fans_out_to_every_provider_independently() {
     let running = delivery.spawn(
         delivery.server.state(),
         Delivery::limits(),
-        &failing_script(),
+        &failing_script(1),
         &CapabilityCrash::default(),
     );
     let run = delivery.new_run(&[]).await;
@@ -651,7 +654,7 @@ async fn next_attempt_on_another_replica_uses_the_rotated_credential() {
     let first = delivery.spawn(
         delivery.server.state(),
         Delivery::limits(),
-        &failing_script(),
+        &failing_script(1),
         &CapabilityCrash::default(),
     );
     let run = delivery.new_run(&[]).await;
@@ -777,7 +780,7 @@ async fn slow_endpoint_exhausts_the_budget_and_shutdown_releases() {
     };
     let crash = CapabilityCrash::default();
     let health = Arc::clone(&delivery.server.state().verification);
-    let running = delivery.spawn(delivery.server.state(), limits, &failing_script(), &crash);
+    let running = delivery.spawn(delivery.server.state(), limits, &failing_script(1), &crash);
     wait_until("runtime health", || {
         health.is_composed() && !health.is_degraded()
     })
@@ -826,7 +829,7 @@ async fn slow_endpoint_exhausts_the_budget_and_shutdown_releases() {
     let running = delivery.spawn(
         delivery.server.state(),
         draining,
-        &failing_script(),
+        &failing_script(1),
         &CapabilityCrash::default(),
     );
     let first = run;
@@ -894,7 +897,7 @@ async fn revoked_connection_fails_closed_and_key_outage_retries() {
     let running = delivery.spawn(
         &outage,
         Delivery::limits(),
-        &failing_script(),
+        &failing_script(1),
         &CapabilityCrash::default(),
     );
     let run = delivery.new_run(&[]).await;
@@ -966,7 +969,7 @@ async fn live_smoke_delivers_to_slack_and_pagerduty() {
     let running = delivery.spawn_to(
         delivery.server.state(),
         Delivery::limits(),
-        &failing_script(),
+        &failing_script(1),
         &CapabilityCrash::default(),
         ProviderEndpoints::default(),
     );
@@ -980,4 +983,128 @@ async fn live_smoke_delivers_to_slack_and_pagerduty() {
     for row in rows.values() {
         assert_eq!(row.status, "delivered", "{row:?}");
     }
+}
+
+/// One busy tenant is capped at four concurrent Operator deliveries while
+/// another tenant's dispatch still delivers; every dispatch eventually
+/// delivers and the process never exceeds its global ceiling.
+///
+/// # Panics
+/// Panics when a ceiling is exceeded, the other tenant is starved, or a
+/// dispatch does not deliver.
+#[tokio::test]
+async fn operator_permits_cap_each_tenant_without_starving_another() {
+    let delivery = Delivery::boot().await;
+    let origin = delivery.mock.uri();
+    Mock::given(method("POST"))
+        .and(path("/slow"))
+        .respond_with(ResponseTemplate::new(204).set_delay(Duration::from_secs(2)))
+        .mount(&delivery.mock)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&delivery.mock)
+        .await;
+    let unauthenticated = |route: &str| json!({ "kind": "http", "method": "post", "url": format!("{origin}{route}") });
+    let mut busy = Vec::new();
+    for index in 0..6 {
+        busy.push(
+            delivery
+                .seed
+                .operator(&format!("slow-{index}"), &unauthenticated("/slow"))
+                .await
+                .expect("operator seeds"),
+        );
+    }
+    delivery
+        .fail_binding("busy", &busy.iter().collect::<Vec<_>>())
+        .await;
+
+    let other_tenant = DataTenantId::new_v7();
+    delivery
+        .server
+        .pg_fixture()
+        .seed_additional_tenant_with_uuid(other_tenant, "operator-other")
+        .await
+        .expect("second tenant seeds");
+    let other =
+        VerificationFixture::provision(delivery.server.state().postgres.wyrd(), other_tenant)
+            .await
+            .expect("second tenant provisions");
+    let other_verifier = other.drift_verifier("drift").await.expect("verifier seeds");
+    let quick = other
+        .operator("quick", &unauthenticated("/quick"))
+        .await
+        .expect("operator seeds");
+    let (owner, principal) = other.service("quiet").await.expect("owner seeds");
+    let binding = other
+        .bind_schedule(
+            &owner,
+            &owner,
+            &other_verifier,
+            "0 2 * * *",
+            vec![FrozenTarget::Uid(quick.clone())],
+        )
+        .await
+        .expect("binding projects");
+    other.activate(principal).await.expect("owner activates");
+    other
+        .make_binding_due(binding)
+        .await
+        .expect("binding is due");
+
+    let script = failing_script(2);
+    let running = delivery.spawn(
+        delivery.server.state(),
+        Delivery::limits(),
+        &script,
+        &CapabilityCrash::default(),
+    );
+    let tenant = delivery.seed.tenant();
+    let count = |tenant: DataTenantId, status: &'static str| {
+        let pool = delivery.assertion.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM wyrd.operator_dispatches \
+                  WHERE data_tenant_id = $1 AND status = $2",
+            )
+            .bind(tenant.as_uuid())
+            .bind(status)
+            .fetch_one(&pool)
+            .await
+            .expect("dispatch counts read")
+        }
+    };
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let (mut peak, mut other_delivered_while_busy) = (0, false);
+    loop {
+        let busy_running = count(tenant, "running").await;
+        let all_running = busy_running + count(other_tenant, "running").await;
+        assert!(
+            busy_running <= 4,
+            "the busy tenant exceeded its ceiling: {busy_running}"
+        );
+        assert!(
+            all_running <= 16,
+            "the process exceeded its ceiling: {all_running}"
+        );
+        peak = peak.max(busy_running);
+        if count(other_tenant, "delivered").await == 1 && count(tenant, "delivered").await < 6 {
+            other_delivered_while_busy = true;
+        }
+        if count(tenant, "delivered").await == 6 && count(other_tenant, "delivered").await == 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "dispatches never delivered"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    running.stop().await;
+    assert_eq!(peak, 4, "the busy tenant reached its ceiling");
+    assert!(
+        other_delivered_while_busy,
+        "the other tenant delivered while the busy tenant was saturated"
+    );
 }

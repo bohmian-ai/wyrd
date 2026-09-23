@@ -20,7 +20,7 @@ requires no authentication to read.
 | --- | --- |
 | [llms.txt](/llms.txt) | Compact page index — every route with a one-line description. Start here. |
 | [llms-full.txt](/llms-full.txt) | Full reference — page index plus every card JSON Schema embedded verbatim. |
-| [JSON Schemas](https://github.com/mitari-ai/wyrd/tree/main/crates/wyrd-spec/schemas) | Source schemas in `crates/wyrd-spec/schemas/` — one file per card kind. |
+| [JSON Schemas](https://github.com/bohmian-ai/wyrd/tree/main/crates/wyrd-spec/schemas) | Source schemas in `crates/wyrd-spec/schemas/` — one file per card kind. |
 
 **Kind gate.** Only `data`, `model`, and `prompt` have standalone card pages
 under `/cards/`. Every other kind resolves to the `/cards/` catalog. The

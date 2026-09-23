@@ -129,7 +129,7 @@ column. Live rotation without downtime is not yet supported.
    old (already-rotated) secrets and are harmless.
 
 Key-id versioning, keyring support, KMS-backed key-encryption keys, and AAD
-binding are tracked in [issue #72](https://github.com/mitari-ai/wyrd/issues/72).
+binding remain future work.
 
 </Aside>
 

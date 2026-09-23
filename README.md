@@ -248,9 +248,7 @@ server. `v0.1.0` adds the complete self-hosted verification path, public Rust,
 Python, and TypeScript SDKs, and Linux Docker images. Windows is not part of
 this release.
 
-Track progress in the
-[`v0.1.0` milestone](https://github.com/bohmian-ai/wyrd/milestone/1) and
-[release project](https://github.com/orgs/bohmian-ai/projects/1).
+Follow release progress in the repository's releases and documentation.
 
 ## Documentation
 

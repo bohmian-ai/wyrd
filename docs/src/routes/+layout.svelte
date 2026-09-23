@@ -16,7 +16,7 @@
   import Toc from '$lib/components/Toc.svelte';
   import Pagination from '$lib/components/Pagination.svelte';
 
-  const GITHUB_URL = 'https://github.com/mitari-ai/wyrd';
+  const GITHUB_URL = 'https://github.com/bohmian-ai/wyrd';
 
   let { children } = $props();
 

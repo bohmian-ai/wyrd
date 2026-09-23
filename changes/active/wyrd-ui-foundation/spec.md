@@ -719,9 +719,9 @@ which is owned by `changes/active/verified-change-contract/spec.md`.
   transformations MUST preserve route and selection state rather than create
   mobile-only domain behavior.
 - **REQ-076**: Observe mocks MUST adapt the established search-to-inspection
-redacted
+  interaction flow demonstrated by observability tools while
   using only Wyrd's approved visual system, terminology, and product
-redacted
+  boundaries. External source code and visual identity MUST NOT be
   copied into Wyrd.
 
 ## Invariants and prohibited outcomes
@@ -939,7 +939,7 @@ None.
   familiar Logs, Metrics, Traces, Dashboards, Eval, and Drift workspaces and
   added a distinct operational-health landing page. Search, common facets, trend
   context, record drilldown, trace waterfall/graph, and span inspection adapt
-redacted
+  established observability flows under Wyrd's visual authority.
 - **Revision 1 query-boundary addition (2026-09-03):** Separated guided Logs
   investigation from unrestricted Bifrost SQL. Logs owns common filters,
   trends, records, and structured detail; advanced SQL escalates to the single
@@ -1006,7 +1006,7 @@ redacted
   for every core product area the mandatory first implementation task. Added a
   distinct Query workbench and expanded Observe to the familiar Logs, Metrics,
   Traces, Dashboards, Eval, and Drift search-to-inspection workflow informed by
-redacted
+  observability products while retaining Wyrd visual authority.
 - **Revision 1 visual-familiarity addition (2026-09-03):** Locked GitHub-
   familiar workflow and interaction conventions under Wyrd's uncompromised
   brand, geometry, palette, and light/dark theming.

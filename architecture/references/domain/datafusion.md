@@ -154,6 +154,3 @@ DataFusion's owned abstractions already satisfy the required boundary.
 - [DataFusion operator metrics](https://datafusion.apache.org/user-guide/metrics.html)
 - [DataFusion 55 `TableProvider`](https://docs.rs/datafusion/55.0.0/datafusion/catalog/trait.TableProvider.html)
 - [datafusion-distributed](https://github.com/datafusion-contrib/datafusion-distributed)
-redacted
-redacted
-redacted

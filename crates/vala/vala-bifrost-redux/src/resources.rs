@@ -2854,7 +2854,7 @@ fn scratch_budget(
 /// Resolves the immutable Forge compaction budget and the elastic remainder.
 ///
 /// The default is four fifths of the resolved process memory, which is the
-redacted
+/// proportion Forge reserves for compaction on a dedicated
 /// worker. `safe_bytes` is what remains after the protected Scribe and Oracle
 /// floors, so a dedicated Forge pod and a co-located `All` pod use one formula
 /// while `All` still cannot spend either protected floor.

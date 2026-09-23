@@ -21,7 +21,7 @@ light/dark mock inventory.
 
 The result must recover the visual energy, hierarchy, and operational clarity
 of the canonical Wyrd Workbench while preserving Wyrd routes, vocabulary,
-redacted
+theme, and product behavior. It must not copy external product
 styling.
 
 # Human value
@@ -59,8 +59,6 @@ Focused interaction references:
   `/Users/stevenforrester/Documents/GitHub/opsml/crates/opsml_server/opsml_ui/src/lib/components/scouter/agent/workflow/AgentEvalWorkflowContent.svelte`
 - OpsML Eval record drawer:
   `/Users/stevenforrester/Documents/GitHub/opsml/crates/opsml_server/opsml_ui/src/lib/components/scouter/agent/record/EvalRecordSideBar.svelte`
-redacted
-  TASK-001.
 
 The references demonstrate hierarchy and interaction. Wyrd's brand directory
 remains the sole visual authority.

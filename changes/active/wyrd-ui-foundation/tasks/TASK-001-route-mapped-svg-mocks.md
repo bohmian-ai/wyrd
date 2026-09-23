@@ -46,7 +46,7 @@ Resolve conflicts in this order:
    charts, and workbench composition.
 4. The page register below fixes each artboard's required composition/content.
    The agent may adjust spacing and chart geometry, not product structure.
-redacted
+5. External products and the partner mock below are interaction/information
    research only. They are not Wyrd visual, route, vocabulary, or contract
    authority and must not be copied.
 
@@ -81,11 +81,6 @@ Research-only references:
 - OpsML Drift: `/Users/stevenforrester/Documents/GitHub/opsml/crates/opsml_server/opsml_ui/src/routes/opsml/[registry]/card/[space]/[name]/[version]/monitoring/`
 - OpsML observability entry: `/Users/stevenforrester/Documents/GitHub/opsml/crates/opsml_server/opsml_ui/src/routes/opsml/observability/`
 - OpsML agent observability/dashboard: `/Users/stevenforrester/Documents/GitHub/opsml/crates/opsml_server/opsml_ui/src/routes/opsml/agent/[registry]/card/[space]/[name]/[version]/observability/` and `/Users/stevenforrester/Documents/GitHub/opsml/crates/opsml_server/opsml_ui/src/routes/opsml/agent/[registry]/card/[space]/[name]/[version]/dashboard/`
-redacted
-redacted
-redacted
-redacted
-redacted
 - Earlier Change Request concept: `/Users/stevenforrester/Documents/GitHub/agent-workflows/wyrd/active/verified-changes-trust-layer-v3-20260825/partner-mockup.html`
 
 Additional visual-authority detail lives in
@@ -579,7 +574,7 @@ overflow/stacking behavior.
 
 - No Svelte, BFF, auth, Nginx, server, or durable protocol implementation.
 - No new design system, font, tokens, library, or rendering pipeline.
-redacted
+- No copied external product name, route, contract, or styling.
 - No top-level Claims, Evidence, Inbox, Connections, Evaluations, Drift, Logs,
   Metrics, Traces, or Dashboards.
 - No Service observation hierarchy or browser-created correlation.

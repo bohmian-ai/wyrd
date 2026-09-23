@@ -23,7 +23,7 @@ example — `DataCard.save()` writes local files and does not register anything.
 ## 1. Clone and set up
 
 ```bash
-git clone https://github.com/mitari-ai/wyrd.git
+git clone https://github.com/bohmian-ai/wyrd.git
 cd wyrd
 mise run py:setup
 ```

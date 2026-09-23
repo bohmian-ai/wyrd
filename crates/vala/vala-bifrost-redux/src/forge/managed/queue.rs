@@ -1,23 +1,31 @@
 //! Worker-local FIFO admission queue for planned compaction runners.
 //!
-redacted
-//! `origin/main` `6f8fbbfd06d25d195bdff9a4f1cb246cf4363903`, file
-//! `src/storage/src/hummock/compactor/iceberg_compaction/mod.rs`
-//! (lines 40-385). Licensed Apache-2.0, Copyright `RisingWave` Labs.
+//! Includes adapted Apache-2.0-licensed queue code identified by the
+//! copyright notice below.
 //!
-//! The accounting rules are upstream's exactly, because they are the reason a
-//! worker cannot over-commit itself: waiting plans charge parallelism only,
-//! running plans charge parallelism *and* estimated memory, the head of the
-//! queue is the only candidate ever considered, and a plan that cannot fit the
+//! The accounting rules prevent worker over-commitment: waiting plans charge
+//! parallelism only, running plans charge parallelism *and* estimated memory.
+//! Only the queue head is considered, and a plan that cannot fit the
 //! worker at all is refused rather than parked forever.
 //!
-//! Two adaptations are Wyrd-local and deliberate. The key is
-//! `(TaskId, plan_index)` where upstream uses its own task id newtype, and the
-//! runner payload is a type parameter because the runner belongs to
+//! The key is `(TaskId, plan_index)`, and the runner payload belongs to
 //! [`ForgeWorker`](crate::forge::worker::ForgeWorker), not to the accounting.
-//! Upstream's `Notify` is not ported: Wyrd has exactly one event loop, which
-//! pops after every push and every completion, so a second wake-up channel
-//! would have no reader.
+//! Wyrd's single event loop pops after every push and completion.
+
+// Copyright 2025 RisingWave Labs
+// Adapted from https://github.com/risingwavelabs/risingwave/blob/6f8fbbfd06d25d195bdff9a4f1cb246cf4363903/src/storage/src/hummock/compactor/iceberg_compaction/mod.rs
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -393,20 +401,18 @@ mod tests {
         }
     }
 
-redacted
+    /// The queue's admission state machine is pinned through each transition.
     ///
-    /// Every transition upstream's own tests pin is asserted here against the
-    /// same expected values, because the queue's only justification is that a
-redacted
+    /// Every transition is asserted here against the expected values. The test
     /// is synchronous and has no sleeps: admission is pure accounting, so any
     /// need to wait would itself be a defect.
     ///
     /// # Panics
     ///
     /// Panics when any admission, refusal, pop, finish, or cancellation
-    /// deviates from the ported state machine.
+    /// deviates from the expected state machine.
     #[test]
-redacted
+    fn queue_admission_state_machine() {
         // Basic push, pop, finish.
         let mut queue = ForgeCompactionQueue::new(8, 32, usize::MAX);
         assert_eq!(queue.push(admission(1, 0, 4), None), ForgePushResult::Added);

@@ -2470,7 +2470,7 @@ impl ForgeWorker {
         reserved_maintenance: bool,
         shutdown: &CancellationToken,
     ) -> Result<Option<u32>, ForgeError> {
-redacted
+        // One pull turn asks for at most
         // the parallelism this worker still has free, and never more than four
         // tasks.
         let mut pending_pull_task_count =
@@ -5580,7 +5580,7 @@ redacted
 
     /// Reduces one attempt's per-plan refusals and outcomes to one task result.
     ///
-redacted
+    /// The priority is Forge's partial-progress rule and has no
     /// fall-through: any single published plan makes the task successful no
     /// matter how its siblings ended, because the commit is durable and the
     /// unfinished siblings remain ordinary planning debt for the next attempt.

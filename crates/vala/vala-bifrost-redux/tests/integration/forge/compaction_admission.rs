@@ -1,4 +1,4 @@
-redacted
+//! Tier-2 proofs for Forge compaction admission.
 //!
 //! One attempt plans every eligible group, admits them through the worker-local
 //! queue, and publishes each admitted plan under its own operation against the
@@ -129,10 +129,10 @@ async fn independent_plan_publications_compose_on_current_head() {
     );
 }
 
-redacted
+/// One attempt's plans settle under Forge's partial-progress rule.
 ///
 /// An attempt is many independent publications, so its task result is a
-redacted
+/// reduction over them and not the outcome of any one plan. Forge's
 /// rule
 /// is that partial progress is progress: a single durable commit makes the
 /// whole attempt successful and leaves its unfinished siblings as ordinary
@@ -1236,7 +1236,7 @@ async fn plan_two_ready_rewrites(
 /// and lets them publish out of order around the parked one.
 ///
 /// A definite catalog refusal is injected across the same window so at least
-redacted
+/// one plan spends a revalidated retry while its siblings publish. Forge's
 /// any-success rule then has to hold across two concurrently owned attempts:
 /// every task settles successfully, every plan keeps its own operation, and the
 /// conflict costs the plan a retry rather than costing the task its outcome.
@@ -1282,7 +1282,7 @@ async fn worker_wide_fifo_bounds_concurrent_attempts() {
             // them. Every other bound stays at the production default so the
             // budgets under test are the real ones.
             per_tenant_active_cap: 8,
-redacted
+            // Four is Forge's per-turn task allowance, and setting
             // the running bound to it is what makes one turn's claims saturate
             // execution exactly: a later turn then has no allowance of its own
             // to spend, which is the state the pull-turn phase below measures.
@@ -2120,7 +2120,7 @@ async fn promote_tables(
     );
 }
 
-redacted
+/// One pull turn claims Forge's four tasks and no more.
 ///
 /// The allowance is `(max_task_parallelism - running) .min(4)`, and a turn that
 /// failed to spend a unit per claim would keep claiming past it. Proving that
@@ -2208,7 +2208,7 @@ async fn pull_turn_stops_at_the_tenant_allowance(
         let ended = attempts_ended(supervisor);
         assert!(
             claims - window_claims <= 4,
-redacted
+            "one pull turn claims no more than four tasks: {} since the last of {ended} attempts ended",
             claims - window_claims
         );
         if claims - claims_before >= 4 && !saturated {

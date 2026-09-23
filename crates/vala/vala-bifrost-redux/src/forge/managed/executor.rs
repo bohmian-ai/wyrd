@@ -10,8 +10,7 @@
 //!
 //! Execution is deliberately unbounded: the context is built with no memory
 //! pool and no spill lease, which selects `DataFusion`'s unbounded pool and no
-redacted
-//! makes the queue's estimated-memory admission the only thing standing between
+//! disk manager. This makes the queue's estimated-memory admission the boundary between
 //! a worker and over-commitment. A hard pool here would turn an admitted plan
 //! into a mid-write failure instead of a plan that was never admitted.
 
@@ -55,7 +54,7 @@ pub struct ForgePlannedRewrite {
     pub plan: CompactionPlan,
     /// Execution parallelism the plan recommends.
     pub required_parallelism: u32,
-redacted
+    /// Estimated peak heap bytes for this plan.
     pub memory_reservation_bytes: usize,
 }
 
@@ -413,9 +412,7 @@ impl ForgeManagedRewrite {
 ///
 /// No memory pool and no spill lease are supplied, which is the whole point:
 /// the core's builder then selects `DataFusion`'s unbounded pool and leaves the
-/// runtime without a disk manager, so an admitted plan executes exactly as
-redacted
-/// inside its budget.
+/// runtime without a disk manager. Admission keeps a worker inside its budget.
 ///
 /// # Errors
 ///

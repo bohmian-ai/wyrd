@@ -1,19 +1,13 @@
 //! Peak-memory estimation for one planned compaction group.
 //!
-redacted
-//! `origin/main` `6f8fbbfd06d25d195bdff9a4f1cb246cf4363903`, file
-//! `src/storage/src/hummock/compactor/iceberg_compaction/memory.rs`
-//! (lines 21-468). Licensed Apache-2.0, Copyright `RisingWave` Labs.
-//!
-//! Only imports and visibility are adapted; every constant, branch, and
-//! arithmetic operation is byte-for-byte upstream. Forge admits plans against
-redacted
-//! fits here, and drift between the two is a code change rather than a silent
-//! behavioral difference. The estimator is pure and synchronous: it reads the
-//! plan, the table schema, and three configuration facts, and touches no IO,
+//! Includes adapted code from the Apache-2.0-licensed compaction estimator
+//! identified by the copyright notice below. Forge owns its own estimate and
+//! tests its branch behavior. The estimator is pure and synchronous: it reads
+//! the plan, the table schema, and three configuration facts, and touches no IO,
 //! no lease, and no catalog.
 
 // Copyright 2026 RisingWave Labs
+// Adapted from https://github.com/risingwavelabs/risingwave/blob/6f8fbbfd06d25d195bdff9a4f1cb246cf4363903/src/storage/src/hummock/compactor/iceberg_compaction/memory.rs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -37,10 +31,9 @@ use num_traits::ToPrimitive;
 /// Widens an unsigned 64-bit count to the pointer-sized arithmetic the
 /// estimator sums in.
 ///
-/// Every caller is a file size or record count that upstream widens with a
-/// plain cast. On the 64-bit targets Bifrost supports the conversion is exact;
-/// the saturation only exists so a hypothetical 32-bit target degrades to the
-/// largest representable estimate — which the queue then refuses as too large —
+/// Every caller is a file size or record count. The conversion is exact on
+/// supported 64-bit targets. Saturation makes a hypothetical 32-bit target
+/// degrade to the largest representable estimate, which the queue refuses,
 /// instead of wrapping to a small one that would be admitted.
 fn widen(value: u64) -> usize {
     usize::try_from(value).unwrap_or(usize::MAX)
@@ -50,7 +43,7 @@ fn widen(value: u64) -> usize {
 ///
 /// The conversion is total for every `usize`, so the fallback is unreachable;
 /// it is written rather than asserted because an estimate is not worth a panic.
-/// Precision loss above 2^53 is upstream's and is irrelevant at that magnitude:
+/// Precision loss above 2^53 is irrelevant at that magnitude:
 /// the resulting estimate is refused as too large either way.
 fn as_f64(value: usize) -> f64 {
     value.to_f64().unwrap_or(f64::MAX)
@@ -58,9 +51,9 @@ fn as_f64(value: usize) -> f64 {
 
 /// Converts a scaled float estimate back to bytes with saturating semantics.
 ///
-/// Matches the primitive cast upstream uses: a negative or NaN scale becomes
-/// zero and an overflowing one becomes the largest representable estimate, so
-/// no scale can produce a small figure the queue would wrongly admit.
+/// A negative or NaN scale becomes zero and an overflowing one becomes the
+/// largest representable estimate, so no scale can produce a small figure the
+/// queue would wrongly admit.
 fn as_usize(value: f64) -> usize {
     if value.is_nan() || value <= 0.0 {
         return 0;
@@ -137,7 +130,7 @@ struct PoolInputs {
 
 /// Returns the retained-operator bytes and the `DataFusion` pool peak.
 ///
-/// The two branches are upstream's and are not interchangeable: a sorted plan
+/// The two branches are not interchangeable: a sorted plan
 /// peaks when the sorter holds its full workspace beside the reservations it
 /// pinned before reading, while a streaming plan never exceeds what it retains,
 /// so its peak and its retention are the same figure.
@@ -815,25 +808,22 @@ mod tests {
         );
     }
 
-    /// The port reproduces `origin/main`'s estimate on every branch it owns.
+    /// The estimator's branch behavior is pinned to exact local fixtures.
     ///
     /// Two fully hand-evaluated anchors pin the streaming and sorted arithmetic
     /// to exact bytes, so any edit to a constant or an operator moves a number
     /// this test names. The remaining cases pin the direction of each branch the
     /// anchors cannot reach — schema fallback, prefetch overlap, both delete
     /// shapes, the V3 deletion-vector exemption, parallelism, and saturation —
-    /// because each of those is a distinct upstream code path rather than a
+    /// because each of those is a distinct code path rather than a
     /// scaling of the same one.
-    ///
-redacted
-    /// `src/storage/src/hummock/compactor/iceberg_compaction/memory.rs`.
     ///
     /// # Panics
     ///
     /// Panics when any anchor moves or when a branch stops changing the estimate
-    /// in the direction upstream's arithmetic requires.
+    /// in the expected direction.
     #[test]
-redacted
+    fn estimator_branch_fixtures() {
         let fixed = schema_of(PrimitiveType::Long);
         let variable = schema_of(PrimitiveType::String);
         let one_file = || vec![task("data-0.parquet", 10_000, Some(1_000), &fixed)];
@@ -903,10 +893,10 @@ redacted
     ///
     /// # Panics
     ///
-    /// Panics when any branch stops changing the estimate in the direction
-    /// upstream's arithmetic requires.
+    /// Panics when any branch stops changing the estimate in the expected
+    /// direction.
     #[test]
-redacted
+    fn estimator_delete_and_parallelism_branches() {
         let fixed = schema_of(PrimitiveType::Long);
         let one_file = || vec![task("data-0.parquet", 10_000, Some(1_000), &fixed)];
         let streaming = plan_of(one_file(), Vec::new(), Vec::new(), 1, 1);
@@ -980,7 +970,7 @@ redacted
     /// Panics when parallelism stops raising the estimate or when saturation
     /// does not hold.
     #[test]
-redacted
+    fn estimator_scales_with_parallelism_and_saturates() {
         let fixed = schema_of(PrimitiveType::Long);
 
         // Parallelism multiplies the concurrently allocated batches.

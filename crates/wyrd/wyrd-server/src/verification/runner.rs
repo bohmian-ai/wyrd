@@ -69,6 +69,8 @@ pub enum Transition {
         result_id: VerificationResultId,
         /// Its verdict.
         verdict: VerificationVerdict,
+        /// Bounded human-readable summary frozen into failure dispatches.
+        summary: String,
     },
     /// Try the same run and input again within its attempt budget.
     Retry(VerificationError),
@@ -515,6 +517,7 @@ impl VerifierRunner {
             Ok(Ok(())) => Transition::Complete {
                 result_id,
                 verdict: payload.verdict(),
+                summary: report.summary(),
             },
             Ok(Err(error)) => {
                 tracing::warn!(run_id = %run.lease.run_id, %error, "verification result publication failed");
@@ -545,9 +548,13 @@ impl VerifierRunner {
         let lease = run.lease;
         let mut conn = self.postgres.tenant_conn(tenant).await?;
         let outcome = match transition {
-            Transition::Complete { result_id, verdict } => settled(
+            Transition::Complete {
+                result_id,
+                verdict,
+                summary,
+            } => settled(
                 self.queue
-                    .complete(&mut conn, lease, result_id, verdict)
+                    .complete(&mut conn, lease, result_id, verdict, &summary)
                     .await?,
                 "completed",
             ),

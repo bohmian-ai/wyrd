@@ -64,6 +64,39 @@ impl VerifierReport {
             Self::Eval { verdict, .. } => *verdict,
         }
     }
+
+    /// The bounded human-readable summary frozen into each Operator failure
+    /// context.
+    ///
+    /// Only aggregate counts and verdicts: never feature rows, Eval context,
+    /// or task detail. Settlement clips it to the Operator summary bound.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        match self {
+            Self::Drift(None) => "Drift could not be scored for this window.".to_owned(),
+            Self::Drift(Some(report)) => {
+                let drifted = report
+                    .features
+                    .values()
+                    .filter(|feature| feature.verdict == DriftVerdict::Drift)
+                    .count();
+                format!(
+                    "Drift verdict {:?}: {drifted} of {} features drifted.",
+                    report.verdict,
+                    report.features.len()
+                )
+            }
+            Self::Eval { report, verdict } => {
+                let rollup = report.workflow_summary();
+                format!(
+                    "Eval verdict {}: {} of {} tasks passed.",
+                    <&str>::from(verdict),
+                    rollup.passed_tasks,
+                    rollup.total_tasks
+                )
+            }
+        }
+    }
 }
 
 /// The typed result of one engine execution.

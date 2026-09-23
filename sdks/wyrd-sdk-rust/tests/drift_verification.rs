@@ -39,7 +39,7 @@ use wyrd_testing::verification::VerificationFixture;
 const WAIT: Duration = Duration::from_secs(90);
 
 /// Rows in the baseline Parquet artifact.
-const BASELINE_ROWS: usize = 100;
+const BASELINE_ROWS: u32 = 100;
 
 /// The Drift feature map every observation projects into one row per series.
 #[derive(Serialize)]
@@ -102,7 +102,7 @@ fn write_baseline_parquet(path: &Path) -> Vec<u8> {
         Field::new("latency", DataType::Float64, false),
         Field::new("tier", DataType::Utf8, false),
     ]));
-    let latency: Vec<f64> = (0..BASELINE_ROWS).map(|row| row as f64).collect();
+    let latency: Vec<f64> = (0..BASELINE_ROWS).map(f64::from).collect();
     let batch = RecordBatch::try_new(
         Arc::clone(&schema),
         vec![
@@ -130,10 +130,7 @@ fn write_baseline_parquet(path: &Path) -> Vec<u8> {
 /// Panics when a fixture file cannot be written.
 fn write_baseline(root: &Path) {
     let bytes = write_baseline_parquet(&root.join("data/data.parquet"));
-    let hex: String = sha2::Sha256::digest(&bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    let hex = format!("{:x}", sha2::Sha256::digest(&bytes));
     let digest = base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(&bytes));
     std::fs::write(
         root.join("baseline.yaml"),
@@ -494,13 +491,57 @@ async fn drift_methods_fit_score_persist_and_dispatch() {
         .expect("service has a UID")
         .to_string();
 
-    let (result, features) = complete(
+    let empty = (
+        now - chrono::Duration::days(3),
+        now - chrono::Duration::days(2),
+    );
+    assert_direct_scores(
         &server,
         &verification,
         &query,
+        [
+            direct(&psi, &service, window.0, window.1),
+            direct(&spc, &service, window.0, window.1),
+            direct(&custom, &service, window.0, window.1),
+            direct(&custom, &service, empty.0, empty.1),
+        ],
+        &subject,
+    )
+    .await;
+
+    let unready = verification
+        .start_run(&direct(&unfit, &service, window.0, window.1), None)
+        .await
+        .expect_err("an unready Verifier is refused");
+    assert_eq!(unready.code(), "WYRD_VERIFICATION_409_VERIFIER_NOT_READY");
+
+    assert_scheduled_failure_dispatches(&server, &cards, &verification, &service, &query).await;
+    assert_refusals(
+        &server,
+        root.path(),
+        &cards,
         &direct(&psi, &service, window.0, window.1),
     )
     .await;
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// Prove each direct run scores server-side and persists its result rows.
+///
+/// PSI, SPC, and Custom each fail the drifted window with their feature rows;
+/// Custom over an empty window is inconclusive with null details and no
+/// feature rows.
+///
+/// # Panics
+/// Panics when a run or its persisted rows differ from the expected outcome.
+async fn assert_direct_scores(
+    server: &WyrdTestServer,
+    verification: &Verification,
+    query: &Bifrost,
+    [psi, spc, custom, empty]: [StartVerificationRunRequest; 4],
+    subject: &str,
+) {
+    let (result, features) = complete(server, verification, query, &psi).await;
     assert_eq!(
         (result.execution_status.as_str(), result.verdict.as_str()),
         ("completed", "failed"),
@@ -525,38 +566,16 @@ async fn drift_methods_fit_score_persist_and_dispatch() {
         "{features:?}"
     );
 
-    let (result, features) = complete(
-        &server,
-        &verification,
-        &query,
-        &direct(&spc, &service, window.0, window.1),
-    )
-    .await;
+    let (result, features) = complete(server, verification, query, &spc).await;
     assert_eq!(result.verdict, "failed", "{result:?}");
     assert_eq!(features.len(), 1, "{features:?}");
     assert_eq!(features[0].feature, "latency");
 
-    let (result, features) = complete(
-        &server,
-        &verification,
-        &query,
-        &direct(&custom, &service, window.0, window.1),
-    )
-    .await;
+    let (result, features) = complete(server, verification, query, &custom).await;
     assert_eq!(result.verdict, "failed", "{result:?}");
     assert_eq!(features.len(), 1, "{features:?}");
 
-    let empty = (
-        now - chrono::Duration::days(3),
-        now - chrono::Duration::days(2),
-    );
-    let (result, features) = complete(
-        &server,
-        &verification,
-        &query,
-        &direct(&custom, &service, empty.0, empty.1),
-    )
-    .await;
+    let (result, features) = complete(server, verification, query, &empty).await;
     assert_eq!(
         (result.execution_status.as_str(), result.verdict.as_str()),
         ("completed", "inconclusive"),
@@ -567,28 +586,12 @@ async fn drift_methods_fit_score_persist_and_dispatch() {
         "an unscored window has null details"
     );
     assert!(features.is_empty(), "an unscored window writes no features");
-
-    let unready = verification
-        .start_run(&direct(&unfit, &service, window.0, window.1), None)
-        .await
-        .expect_err("an unready Verifier is refused");
-    assert_eq!(unready.code(), "WYRD_VERIFICATION_409_VERIFIER_NOT_READY");
-
-    assert_scheduled_failure_dispatches(&server, &cards, &verification, &service, &query).await;
-    assert_refusals(
-        &server,
-        root.path(),
-        &cards,
-        &direct(&psi, &service, window.0, window.1),
-    )
-    .await;
-    server.shutdown().await.expect("test server shuts down");
 }
 
 /// Make the Service's cron binding due and prove its failed result dispatches
 /// once per configured Operator.
 ///
-/// The due instant is PostgreSQL's statement time, so the daily occurrence's
+/// The due instant is `PostgreSQL`'s statement time, so the daily occurrence's
 /// window is `[midnight UTC, now)` and holds every observation just emitted.
 ///
 /// # Panics

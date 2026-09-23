@@ -2081,6 +2081,76 @@
         }
       ]
     },
+    "DriftBaselineState": {
+      "description": "Lifecycle of one PSI or SPC Verifier's server-fitted baseline.\n\nRegistration creates it `pending`; the fitter claims it `building` and settles it `ready` with the persisted fitted profile or `failed` with a structured error. A failed fit is retried through the same record while attempts remain, so `failed` is visible without being necessarily final.",
+      "oneOf": [
+        {
+          "description": "Registered and waiting for the fitter.",
+          "type": "string",
+          "enum": [
+            "pending"
+          ]
+        },
+        {
+          "description": "Claimed by a fitter that is reading and fitting the baseline Data.",
+          "type": "string",
+          "enum": [
+            "building"
+          ]
+        },
+        {
+          "description": "Fitted and persisted; runs may start.",
+          "type": "string",
+          "enum": [
+            "ready"
+          ]
+        },
+        {
+          "description": "The last fit attempt failed; see the structured error.",
+          "type": "string",
+          "enum": [
+            "failed"
+          ]
+        }
+      ]
+    },
+    "DriftBaselineStatus": {
+      "description": "Server-derived fitted-baseline status of a PSI or SPC Drift Verifier.\n\nServed on `card.status.verification.baseline`; it never mutates the authored spec.",
+      "type": "object",
+      "required": [
+        "data",
+        "state"
+      ],
+      "properties": {
+        "data": {
+          "description": "Exact baseline Data Card the profile is fitted from, UID-pinned.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            }
+          ]
+        },
+        "error": {
+          "description": "Structured error of the last failed fit attempt, when one failed.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/VerificationError"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "state": {
+          "description": "Current fit lifecycle state.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/DriftBaselineState"
+            }
+          ]
+        }
+      }
+    },
     "DriftCondition": {
       "description": "Fire condition for a drift observation.",
       "oneOf": [
@@ -10883,10 +10953,39 @@
       },
       "additionalProperties": false
     },
+    "VerificationError": {
+      "description": "Structured, secret-free execution or delivery error.",
+      "type": "object",
+      "required": [
+        "code",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "description": "Stable machine-readable error code.",
+          "type": "string"
+        },
+        "message": {
+          "description": "Bounded human-readable description.",
+          "type": "string"
+        }
+      }
+    },
     "VerificationStatus": {
       "description": "Server-derived verification state projected onto `card.status`.\n\nA Service or standalone Agent owning `verified_by` bindings exposes the stable identity of each projected binding here, so a caller can address a binding without a separate listing resource. The field is read-only: it is derived from the tenant's binding projection on every Card read and is never persisted as Card status.",
       "type": "object",
       "properties": {
+        "baseline": {
+          "description": "Fitted-baseline readiness of a PSI or SPC Drift Verifier Card version.\n\nAbsent on every other Card, including a Custom Drift Verifier, which scores its authored scalar baseline and is ready without fitting.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/DriftBaselineStatus"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "binding_ids": {
           "description": "Stable identities of this owner Card version's projected bindings, ordered by identity so reordering authored bindings changes nothing.",
           "type": "array",

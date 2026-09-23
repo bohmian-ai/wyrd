@@ -21,9 +21,9 @@ mod pg_tests {
     use wyrd_testing::bifrost::seed_query_fixture;
 
     /// The exact catalog an ordinary Wyrd server advertises over `/mcp` to a
-    /// caller that also holds tenant principal administration and `evals:run`:
-    /// every read tool, then that caller's write tools.
-    const ADVERTISED_TOOLS: [&str; 9] = [
+    /// caller that also holds tenant principal administration, `evals:run`, and
+    /// `operators:write`: every read tool, then that caller's write tools.
+    const ADVERTISED_TOOLS: [&str; 14] = [
         "bifrost.list_tables",
         "bifrost.describe_table",
         "bifrost.query",
@@ -31,8 +31,13 @@ mod pg_tests {
         "cards.get",
         "verification.get_binding",
         "verification.get_run",
+        "operator_connections.list",
+        "operator_connections.get",
         "principals.revoke_credential",
         "verification.start_run",
+        "operator_connections.create",
+        "operator_connections.update",
+        "operator_connections.disable",
     ];
 
     /// An agent sees exactly the shipped catalog, only its own tenant's tables,

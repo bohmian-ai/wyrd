@@ -237,8 +237,13 @@ mod pg_tests {
                 "cards.get",
                 "verification.get_binding",
                 "verification.get_run",
+                "operator_connections.list",
+                "operator_connections.get",
                 "principals.revoke_credential",
                 "verification.start_run",
+                "operator_connections.create",
+                "operator_connections.update",
+                "operator_connections.disable",
                 probe::TOOL_NAME,
             ],
             "an opted-in fixture advertises the context probe after the ordinary catalog"

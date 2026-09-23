@@ -10,8 +10,9 @@
 //!
 //! The production catalog exposes three read-only Bifrost tools for table
 //! discovery, schema/layout description, and bounded terminal-safe queries,
-//! the Card read and Verification status tools, and per-caller write tools for
-//! credential revocation and manual Verifier runs.
+//! the Card read, Verification status, and Operator connection read tools, and
+//! per-caller write tools for credential revocation, manual Verifier runs, and
+//! Operator connection management.
 //! A test-support context probe is available only through explicit fixture opt-in.
 
 use std::borrow::Cow;
@@ -32,6 +33,7 @@ use crate::components::auth::{AuthenticatedPrincipal, Caller};
 use crate::state::AppState;
 
 mod bifrost;
+mod operators;
 mod principals;
 #[cfg(feature = "test-support")]
 pub mod probe;
@@ -138,6 +140,7 @@ impl WyrdMcpHandler {
         let mut catalog = bifrost::descriptors();
         catalog.extend(principals::descriptors_unscoped());
         catalog.extend(verification::descriptors_unscoped());
+        catalog.extend(operators::descriptors_unscoped());
         catalog
     }
 
@@ -175,6 +178,7 @@ impl ServerHandler for WyrdMcpHandler {
             .into_iter()
             .chain(principals::write_descriptors())
             .chain(verification::write_descriptors())
+            .chain(operators::write_descriptors())
             .chain(self.probe_descriptors())
             .find(|tool| tool.name == name)
     }
@@ -199,6 +203,9 @@ impl ServerHandler for WyrdMcpHandler {
             }
             if verification::may_start_runs(&caller) {
                 catalog.extend(verification::write_descriptors());
+            }
+            if operators::may_manage(&caller) {
+                catalog.extend(operators::write_descriptors());
             }
         }
         catalog.extend(self.probe_descriptors());
@@ -282,6 +289,17 @@ impl ServerHandler for WyrdMcpHandler {
                 let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
                 // Authorized and audited by the operation, like revocation.
                 self.mcp_start_run(caller, request.arguments)
+                    .await
+                    .map_err(wyrd_error_to_mcp)
+            }
+            name @ (operators::LIST
+            | operators::GET
+            | operators::CREATE
+            | operators::UPDATE
+            | operators::DISABLE) => {
+                let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
+                // Authorized and audited by the operation, like revocation.
+                self.mcp_operator_connections(name, caller, request.arguments)
                     .await
                     .map_err(wyrd_error_to_mcp)
             }

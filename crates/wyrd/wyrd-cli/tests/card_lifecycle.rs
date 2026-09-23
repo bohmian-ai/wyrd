@@ -1425,6 +1425,46 @@ mod pg_tests {
             panic!("journey bootstrap returned a non-user principal");
         };
 
+        let Bootstrap::User { jwt: admin_jwt, .. } = server
+            .bootstrap_user("canonical-directory-admin", &["admin"])
+            .await
+            .expect("journey admin bootstraps")
+        else {
+            panic!("journey bootstrap returned a non-user principal");
+        };
+        let connections = tempfile::tempdir().expect("connection bodies directory creates");
+        for (file, body) in [
+            (
+                "slack.yaml",
+                "provider: slack\nname: ops-slack\nworkspace_id: T0001\nbot_token: xoxb-cli-journey\n",
+            ),
+            (
+                "pagerduty.yaml",
+                "provider: pager_duty\nname: ops-pagerduty\nintegration_key: pd-cli-journey\n",
+            ),
+        ] {
+            let body_path = connections.path().join(file);
+            std::fs::write(&body_path, body).expect("connection body writes");
+            let view = run_cli_json(
+                vec![
+                    "operator-connection".to_owned(),
+                    "create".to_owned(),
+                    "--body-file".to_owned(),
+                    body_path
+                        .to_str()
+                        .expect("connection body path is UTF-8")
+                        .to_owned(),
+                    "--server".to_owned(),
+                    base_url.clone(),
+                ],
+                &admin_jwt,
+            )
+            .await
+            .expect("operator connection creates through the CLI");
+            assert_eq!(view["status"], "active");
+            assert!(!view.to_string().contains("cli-journey"), "{view}");
+        }
+
         for path in [
             &data_path,
             &verifier_path,

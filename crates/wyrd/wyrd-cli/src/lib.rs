@@ -14,6 +14,7 @@ mod client;
 pub mod error;
 mod eval;
 pub mod load;
+mod operator_connection;
 mod platform;
 mod principal;
 #[cfg(feature = "python")]

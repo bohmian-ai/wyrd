@@ -20,7 +20,7 @@ use wyrd_client::auth::AuthMiddleware;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::error::WyrdClientError;
 use wyrd_client::transport::HttpTransport;
-use wyrd_client::{Principals, WyrdClient};
+use wyrd_client::{OperatorConnections, Principals, WyrdClient};
 
 use crate::error::WyrdCliError;
 
@@ -71,6 +71,17 @@ fn assemble(config: ClientConfig) -> Result<WyrdClient, WyrdCliError> {
 /// Returns the same construction errors as [`from_global`].
 pub fn principals(server: &str) -> Result<Principals, WyrdCliError> {
     Ok(Principals::with_client(from_global(Some(server))?))
+}
+
+/// Build the tenant Operator connection handle for one deployment.
+///
+/// The administrator's credential comes from the ambient chain; `server`
+/// re-points only the endpoint.
+///
+/// # Errors
+/// Returns the same construction errors as [`from_global`].
+pub fn operator_connections(server: &str) -> Result<OperatorConnections, WyrdCliError> {
+    Ok(OperatorConnections::with_client(from_global(Some(server))?))
 }
 
 /// Project a client-assembly failure onto the CLI's local error catalog.

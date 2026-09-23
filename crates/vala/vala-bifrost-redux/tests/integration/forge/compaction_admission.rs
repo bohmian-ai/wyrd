@@ -731,6 +731,7 @@ async fn multi_plan_success_counts_all_committed_volume_once() {
     // repeated reconciliation, would show up as a counter that outruns the
     // files the table lost.
     let idle = promoted.fixture.live_data_paths().await;
+    promoted.fixture.clear_task_backoff().await;
     supervisor.restart_worker();
     supervisor.schedule_only().await;
     supervisor.start_worker();
@@ -1154,14 +1155,15 @@ async fn await_small_files_in_state(
     )
 }
 
-/// Polls until no small-files task is owed or owned and no rewrite operation
-/// is still `prepared`.
+/// Polls until no small-files task is owed, retryable, or owned and no rewrite
+/// operation is still `prepared`.
 ///
 /// Stopping a worker cancels its in-flight attempt, and a cancelled attempt
 /// whose commit already landed leaves its operation `prepared` and its volume
 /// uncounted until a later owner proves it. A pass is only comparable with the
 /// files the table lost once every attempt it started has settled, so callers
-/// wait here instead of stopping the worker after a fixed delay.
+/// wait here instead of stopping the worker after a fixed delay. A `retryable`
+/// task still owes its work, so a failed pass never reads as settled.
 ///
 /// # Panics
 ///
@@ -1170,8 +1172,11 @@ async fn await_small_files_in_state(
 async fn await_small_files_settled(fixture: &super::support::PromotionIntegrationFixture) {
     let settled = tokio::time::timeout(ADMISSION_BOUND, async {
         loop {
-            let owed =
-                small_files_in_state(fixture, &["ready", "claimed", "running", "prepared"]).await;
+            let owed = small_files_in_state(
+                fixture,
+                &["ready", "retryable", "claimed", "running", "prepared"],
+            )
+            .await;
             let open = operation_phases(fixture)
                 .await
                 .into_values()

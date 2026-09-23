@@ -13,6 +13,8 @@ mod observe;
 #[cfg(feature = "python")]
 mod state;
 #[cfg(feature = "python")]
+mod operators;
+#[cfg(feature = "python")]
 mod verification;
 
 #[cfg(feature = "python")]
@@ -111,6 +113,11 @@ fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     observe::register_run(&observe)?;
     m.add_submodule(&observe)?;
     register_submodule(py, "wyrd._wyrd.observe", &observe)?;
+
+    let operators = PyModule::new(py, "operators")?;
+    operators::register(&operators)?;
+    m.add_submodule(&operators)?;
+    register_submodule(py, "wyrd._wyrd.operators", &operators)?;
 
     let verification = PyModule::new(py, "verification")?;
     verification::register(&verification)?;

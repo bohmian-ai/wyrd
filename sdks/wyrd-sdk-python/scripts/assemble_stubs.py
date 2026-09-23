@@ -20,6 +20,7 @@ PUBLIC_MODULE_STUBS = {
     "model.pyi": PACKAGE_DIR / "model" / "__init__.pyi",
     "observe.pyi": PACKAGE_DIR / "observe" / "__init__.pyi",
     "observer.pyi": PACKAGE_DIR / "observer.pyi",
+    "operators.pyi": PACKAGE_DIR / "operators" / "__init__.pyi",
     "prompt.pyi": PACKAGE_DIR / "prompt" / "__init__.pyi",
     "state.pyi": PACKAGE_DIR / "state" / "__init__.pyi",
     "testing.pyi": PACKAGE_DIR / "testing" / "__init__.pyi",

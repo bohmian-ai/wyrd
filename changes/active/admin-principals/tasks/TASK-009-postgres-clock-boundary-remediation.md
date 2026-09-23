@@ -515,6 +515,8 @@ Commits (branch `claude/admin-principals-spec-qfsmjc`, baseline `119f625bf`):
 | `6d69545ab` | Gate closure — one scheduler identity in the superseded-promotion scenario |
 | `682da31b9` | Gate closure — test Postgres endpoint reachability (supersedes `66888d391`, `96b6d1b99`) |
 | `490079c30` | Gate closure — identity providers recreated instead of reused |
+| `716732b82` | Review hardening — Compose startup failure reported from the endpoint probe |
+| `1734aecc8` | Review hardening — identity providers removed on every lane exit |
 
 ### Acceptance matrix
 
@@ -613,7 +615,10 @@ forward the VM manager creates asynchronously after the guest starts listening �
 `ss -lntp` on a working endpoint names `ssh`, not `docker-proxy`. The wrapper now
 waits for the exact endpoint it exports, rebuilds the project once when that
 endpoint never opens, and otherwise reports the compose state, the mapping
-Docker claims, the host listeners and the server log.
+Docker claims, the host listeners and the server log. Review hardening
+(`716732b82`): the probe runs from an `if !` condition, which disables errexit,
+so `compose up` and `compose port` return their own failure rather than letting
+a container that never started consume the full wait.
 
 **3. Identity providers reused across runs** (`490079c30`).
 `test:identity:journey` failed first on `Bind for 0.0.0.0:8080: port is already
@@ -623,7 +628,12 @@ in an embedded H2 database inside the container filesystem, and H2 writes the
 opening container's hostname into its lock file; the lane stopped its containers
 and reused them, so a Keycloak killed mid-flight left a lock naming a hostname
 that no longer resolved. The lane now removes both containers before starting
-them and again when done. Verified alone: 20 passed.
+them and again when done. Review hardening (`1734aecc8`): the lane runs under
+`set -e`, so a trailing removal never ran when seeding or the suite failed —
+precisely the interrupted runs that leave the stale lock behind. An EXIT trap
+installed before the providers start removes them on success, failure and
+interrupt instead. Verified alone: 20 passed, no container left behind; trap
+semantics confirmed for a failing command (exit 1) and an interrupt (exit 130).
 
 The `wyrd-testing::oracle published::published_cache_pruning_and_shutdown_are_production_governed`
 shutdown-ordering flake observed on one earlier `test:bifrost` run did not recur

@@ -84,5 +84,6 @@ All structured errors carry a stable code in the form
 ## Git
 
 - Identity: `Thorrester <sjforrester32@gmail.com>`.
-- No `Co-Authored-By` trailers.
+- `Co-Authored-By:` trailers are allowed when an agentic harness requires
+  them; the author and committer stay the identity above.
 - Branch names: `<short-slug>` for feature branches.

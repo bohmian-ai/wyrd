@@ -469,7 +469,13 @@ env = { WYRD_KEYCLOAK_ISSUER = "http://localhost:8080/realms/wyrd-test", WYRD_DE
 run = """
 set -e
 
-# Bring up Keycloak and Dex (postgres was brought up by depends)
+# Bring up Keycloak and Dex (postgres was brought up by depends). Recreate them:
+# Keycloak start-dev keeps its realm in an embedded H2 database inside the
+# container filesystem, and H2's lock file names the container hostname that
+# opened it. A run killed mid-flight leaves that lock behind, so reusing the
+# stopped container made Keycloak resolve a hostname that no longer exists and
+# exit before serving. A fresh container each run has no stale lock to inherit.
+docker compose rm --force --stop --volumes keycloak dex
 docker compose up -d keycloak dex --wait
 
 # Seed Keycloak users via admin REST API (realm import only defines clients/groups)
@@ -548,7 +554,7 @@ PYEOF
 
 cargo nextest run --locked -p wyrd-server --all-features --test identity_e2e --run-ignored=all --test-threads=1
 
-docker compose stop keycloak dex
+docker compose rm --force --stop --volumes keycloak dex
 """
 
 [tasks."build:server"]

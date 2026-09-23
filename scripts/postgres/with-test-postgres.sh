@@ -65,7 +65,20 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 if ! (exec 3<>"/dev/tcp/${host}/${port}") 2>/dev/null; then
-  echo "Postgres endpoint ${host}:${port} never accepted a connection" >&2
+  # A refusal here is an environment fault, not a test result, and it aborts the
+  # whole lane. Print what the container and the host socket table say at the
+  # moment of refusal so the next occurrence is diagnosable from the lane log.
+  {
+    echo "Postgres endpoint ${host}:${port} never accepted a connection"
+    echo "--- compose ps"
+    "${compose[@]}" ps --all
+    echo "--- published ports"
+    "${compose[@]}" port --protocol tcp postgres 5432 || true
+    echo "--- host listeners on ${port}"
+    (ss -lntp "sport = :${port}" || true) 2>/dev/null
+    echo "--- postgres log (last 40)"
+    "${compose[@]}" logs --tail 40 postgres || true
+  } >&2
   exit 1
 fi
 

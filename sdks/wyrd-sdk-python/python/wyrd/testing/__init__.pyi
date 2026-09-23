@@ -18,10 +18,17 @@ class WyrdTestServer:
 
     ``audit_publication=False`` keeps the server's audit publisher from retiring
     staged audit rows, for a journey that counts staged decisions.
+
+    ``verification_runtime=True`` composes the verification runtime, so Drift
+    baselines fit and verification runs execute in the background.
     """
 
     def __init__(
-        self, cleanup: bool = True, mutate_env: bool = True, audit_publication: bool = True
+        self,
+        cleanup: bool = True,
+        mutate_env: bool = True,
+        audit_publication: bool = True,
+        verification_runtime: bool = False,
     ) -> None: ...
     def __enter__(self) -> WyrdTestServer: ...
     def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> bool: ...

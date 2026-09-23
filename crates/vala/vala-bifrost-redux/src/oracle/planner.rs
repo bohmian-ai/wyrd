@@ -335,7 +335,7 @@ impl OraclePlanner {
         plan: datafusion::logical_expr::LogicalPlan,
         providers: &std::collections::HashMap<String, Arc<dyn TableProvider>>,
     ) -> Result<datafusion::logical_expr::LogicalPlan, BifrostError> {
-        use datafusion::logical_expr::{LogicalPlan, TableScan};
+        use datafusion::logical_expr::{LogicalPlan, TableScanBuilder};
 
         plan.transform_up(|node| {
             let LogicalPlan::TableScan(scan) = node else {
@@ -346,13 +346,15 @@ impl OraclePlanner {
                     "typed plan scan has no authenticated Oracle provider".to_owned(),
                 ));
             };
-            TableScan::try_new(
+            TableScanBuilder::new(
                 scan.table_name,
                 Arc::new(DefaultTableSource::new(Arc::clone(provider))),
-                scan.projection,
-                scan.filters,
-                scan.fetch,
             )
+            .with_projection(scan.projection)
+            .with_filters(scan.filters)
+            .with_fetch(scan.fetch)
+            .with_statistics_requests(scan.statistics_requests)
+            .build()
             .map(|scan| Transformed::yes(LogicalPlan::TableScan(scan)))
         })
         .map(|transformed| transformed.data)

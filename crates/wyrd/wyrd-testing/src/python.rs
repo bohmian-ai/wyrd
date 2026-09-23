@@ -88,6 +88,11 @@ pub struct WyrdTestServer {
     /// Off for a journey that counts staged decisions, such as
     /// [`WyrdTestServer::table_describe_count`], so the count cannot shrink.
     audit_publication: bool,
+    /// Whether the server composes the verification runtime.
+    ///
+    /// On for a journey whose Verifier baselines must fit and whose runs must
+    /// execute, off by default so queue-driving journeys are not raced.
+    verification_runtime: bool,
     base_url: Option<String>,
     api_key: Option<String>,
     tenant_id: Option<String>,
@@ -98,12 +103,23 @@ pub struct WyrdTestServer {
 #[pymethods]
 impl WyrdTestServer {
     #[new]
-    #[pyo3(signature = (cleanup = true, mutate_env = true, audit_publication = true))]
-    fn __new__(cleanup: bool, mutate_env: bool, audit_publication: bool) -> Self {
+    #[pyo3(signature = (
+        cleanup = true,
+        mutate_env = true,
+        audit_publication = true,
+        verification_runtime = false
+    ))]
+    fn __new__(
+        cleanup: bool,
+        mutate_env: bool,
+        audit_publication: bool,
+        verification_runtime: bool,
+    ) -> Self {
         Self {
             cleanup,
             mutate_env,
             audit_publication,
+            verification_runtime,
             base_url: None,
             api_key: None,
             tenant_id: None,
@@ -121,6 +137,7 @@ impl WyrdTestServer {
     fn __enter__(mut slf: PyRefMut<'_, Self>) -> WyrdPyResult<PyRefMut<'_, Self>> {
         let mutate_env = slf.mutate_env;
         let audit_publication = slf.audit_publication;
+        let verification_runtime = slf.verification_runtime;
 
         let result: Result<
             (
@@ -137,6 +154,11 @@ impl WyrdTestServer {
                 builder
             } else {
                 builder.without_audit_publication_for_test()
+            };
+            let builder = if verification_runtime {
+                builder.with_verification_runtime_for_test()
+            } else {
+                builder
             };
             let srv = builder
                 .start_bound()

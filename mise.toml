@@ -417,7 +417,7 @@ hide = true
 description = "Run Python Bifrost journeys against an already-provisioned Postgres lifecycle."
 dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup"]
-run = "uv run python -m pytest -q -m integration tests/integration/bifrost/test_bifrost_e2e.py tests/integration/test_bifrost_query.py tests/integration/state/test_observe_journey.py"
+run = "uv run python -m pytest -q -m integration tests/integration/bifrost/test_bifrost_e2e.py tests/integration/test_bifrost_query.py tests/integration/state/test_observe_journey.py tests/integration/test_drift_journey.py"
 
 [tasks."test:bifrost:journey:typescript"]
 description = "Tier-1 journeys: TypeScript Bifrost client, query and write surfaces"

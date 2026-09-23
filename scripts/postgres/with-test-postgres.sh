@@ -52,8 +52,11 @@ trap 'handle_signal TERM' TERM
 # cannot fix the second case, so a project whose endpoint never opens is rebuilt
 # once, which makes the forwarder observe a fresh guest port.
 start_postgres() {
-  "${compose[@]}" up --detach --wait postgres
-  endpoint="$(${compose[@]} port --protocol tcp postgres 5432)"
+  # This function is called from an `if !` condition, which disables errexit for
+  # everything it runs. Both commands must therefore report their own failure,
+  # or a Compose that never came up would fall through to the endpoint probe.
+  "${compose[@]}" up --detach --wait postgres || return 1
+  endpoint="$("${compose[@]}" port --protocol tcp postgres 5432)" || return 1
   if [[ ! $endpoint =~ ^(127\.0\.0\.1|localhost|0\.0\.0\.0):([1-9][0-9]*)$ ]]; then
     echo "Docker returned an invalid loopback Postgres endpoint: '$endpoint'" >&2
     return 1

@@ -1,7 +1,7 @@
 ---
 id: TASK-009
 kind: implementation
-status: proposed
+status: ready
 spec: SPEC-verified-change-contract
 spec_revision: 35
 requirements: [REQ-123, REQ-151, INV-007, INV-012, AC-032]

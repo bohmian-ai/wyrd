@@ -128,7 +128,9 @@ mise run test:vala
 mise run test:wyrd
 mise run test:wyrd-sdk
 mise run verify:bifrost
-mise run test:e2e
+mise run test:wyrdstate:journey
+mise run test:platform:journey
+mise run test:cli:journey
 mise run test:bifrost:journey:sdk
 mise run test:bifrost:journey:server
 mise run test:bifrost:journey:mcp

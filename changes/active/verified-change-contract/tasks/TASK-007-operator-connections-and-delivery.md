@@ -1,7 +1,7 @@
 ---
 id: TASK-007
 kind: implementation
-status: proposed
+status: ready
 spec: SPEC-verified-change-contract
 spec_revision: 35
 requirements: [REQ-097, REQ-098, REQ-099, REQ-138, REQ-139, REQ-140, REQ-141, REQ-142, REQ-143, REQ-145, REQ-146, REQ-147, REQ-148, REQ-149, REQ-150, REQ-152, INV-006, INV-007, INV-011, INV-013, INV-015, AC-029, AC-030, AC-031, AC-033]
@@ -205,7 +205,9 @@ three SDKs, CLI, MCP, OpenAPI/schemas, and local/live provider journeys.
 mise run test:sql
 mise run test:shared
 mise run test:wyrd
-mise run test:e2e
+mise run test:wyrdstate:journey
+mise run test:platform:journey
+mise run test:cli:journey
 mise run test:principals:integration
 mise run test:bifrost:journey:server
 mise run test:bifrost:journey:mcp

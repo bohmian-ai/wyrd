@@ -1,7 +1,7 @@
 ---
 id: TASK-006
 kind: implementation
-status: proposed
+status: ready
 spec: SPEC-verified-change-contract
 spec_revision: 35
 requirements: [REQ-077, REQ-083, REQ-084, REQ-085, REQ-111, REQ-130, REQ-131, REQ-152, INV-004, INV-010, INV-012, INV-015, AC-014, AC-016, AC-020, AC-027, AC-033]
@@ -176,7 +176,7 @@ mise run test:vala
 mise run test:sql
 mise run test:wyrd
 mise run test:bifrost
-mise run test:e2e
+mise run test:wyrdstate:journey
 mise run fmt
 mise run lints
 git diff --check

@@ -1,7 +1,7 @@
 ---
 id: TASK-001
 kind: implementation
-status: proposed
+status: approved
 spec: SPEC-verified-change-contract
 spec_revision: 32
 requirements: [REQ-045, REQ-046, REQ-047, REQ-056, REQ-090, REQ-091, REQ-092, REQ-093, REQ-094, REQ-102, REQ-103, REQ-109, REQ-110, REQ-111, REQ-113, REQ-114, REQ-116, REQ-120, REQ-143, REQ-144, INV-001, INV-006, INV-012, INV-013, INV-014, AC-004, AC-018, AC-021, AC-022]

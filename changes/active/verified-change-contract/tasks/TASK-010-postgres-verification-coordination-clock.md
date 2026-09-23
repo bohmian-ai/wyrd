@@ -1,7 +1,7 @@
 ---
 id: TASK-010
 kind: remediation
-status: proposed
+status: approved
 spec: SPEC-verified-change-contract
 spec_revision: 35
 requirements: [REQ-078, REQ-079, REQ-081, REQ-098, REQ-112, REQ-115, REQ-146, REQ-152, INV-010, INV-015, AC-019, AC-020, AC-030, AC-033]

@@ -1,7 +1,7 @@
 ---
 id: TASK-005
 kind: implementation
-status: proposed
+status: ready
 spec: SPEC-verified-change-contract
 spec_revision: 35
 requirements: [REQ-072, REQ-073, REQ-074, REQ-080, REQ-082, REQ-085, REQ-110, REQ-113, REQ-134, REQ-152, INV-004, INV-010, INV-012, INV-015, AC-012, AC-013, AC-020, AC-024, AC-028, AC-033]
@@ -166,7 +166,7 @@ mise run test:sql
 mise run test:wyrd
 mise run test:bifrost
 mise run test:bifrost:journey:sdk
-mise run test:e2e
+mise run test:wyrdstate:journey
 mise run test:storage:matrix
 mise run codegen:check
 mise run check:tenant-isolation

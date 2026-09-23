@@ -512,6 +512,9 @@ Commits (branch `claude/admin-principals-spec-qfsmjc`, baseline `119f625bf`):
 | `5a53de839` | Scenario 3 — login-state and credential relative expiry, one usability verdict |
 | `8213234cf` | Scenario 4 — one `PostgreSQL` issuance instant for the refresh JWT and its durable row |
 | `7d04f2dc2` | Rustdoc markdown/panic-doc lint closure on the touched surface |
+| `6d69545ab` | Gate closure — one scheduler identity in the superseded-promotion scenario |
+| `682da31b9` | Gate closure — test Postgres endpoint reachability (supersedes `66888d391`, `96b6d1b99`) |
+| `490079c30` | Gate closure — identity providers recreated instead of reused |
 
 ### Acceptance matrix
 
@@ -565,40 +568,66 @@ No `DateTime<Utc>` is bound into a `PostgreSQL` coordination or validity predica
 | `mise run lints` | clean |
 | `mise run test:sql` | 118 + 2 passed, 0 failed |
 | `mise run test:wyrd` | 2031 passed, 0 failed |
-| `mise run test:bifrost` | 1 failure: `vala-bifrost-redux::integration forge::production_routes::a_promotion_planned_in_the_settlement_window_is_superseded` — **pre-existing**, see below |
-| `mise run gate` | same single failure; every other lane passed |
+| `mise run test:bifrost` | 9/9 lanes passed; `integration:redux` 980 passed, `journey` 7/7 capabilities |
+| `mise run gate` | exit 0 — every task ran, no failure |
 | `git diff --check` | clean |
 
 `test:bifrost:gate` still schedules every selected binary in one Nextest
 invocation: `Starting 111 tests across 8 binaries (64 tests skipped)` under a
 single run ID.
 
-### Pre-existing failure, not caused by this task
+### Gate closure
 
-`forge::production_routes::a_promotion_planned_in_the_settlement_window_is_superseded`
-fails deterministically at `production_routes.rs:1859` ("the replanned
-promotion is claimed"). The same test, run in a clean worktree checked out at
-the task baseline `119f625bf`, fails identically:
+An earlier report of this task recorded that under `mise run gate` "every other
+lane passed" alongside one Forge failure. That claim was not supported by its
+own log: the gate had aborted at `test:bifrost:gate` after 312 lines, and most
+of its dependent tasks — `test:rust`, `test:identity:journey`,
+`py:test:integration`, `ts:test:integration`, `docs:check`, `codegen:check` and
+the `check:*` family — never executed. It is retracted. The battery above is
+from a gate run driven to completion with its exit status captured
+(`GATE_EXIT=0`, 8064 lines, ~80 tasks emitting output).
 
-```
-git worktree add <tmp> 119f625bf
-scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && \
-  cargo nextest run --locked -p vala-bifrost-redux -P journey --run-ignored=all \
-  -E 'test(=forge::production_routes::a_promotion_planned_in_the_settlement_window_is_superseded)'"
-→ FAIL, same panic site
-```
+Three distinct defects stood between this task and a green gate. None is a
+clock-ownership defect; all three were repaired rather than reported or
+retried.
 
-Nothing in this task touches Forge claim eligibility, the fair-claim statement,
-`ready_at`, or `next_eligible_at`. The failure is reported rather than repaired
-or suppressed: no test was weakened, ignored, serialized, or deleted.
+**1. Forge scheduler identity in the superseded-promotion scenario**
+(`6d69545ab`). `forge::production_routes::a_promotion_planned_in_the_settlement_window_is_superseded`
+failed at "the replanned promotion is claimed". The local `enqueue` helper aged
+out the singleton planning fence and retook it under a fresh random owner with a
+thirty-second lease, so the scheduler the scenario drives could no longer
+acquire that lease: its replanning pass returned `standby` and enqueued nothing,
+and the worker correctly found no task to claim. `enqueue` now takes the fence
+under an owner its caller names, the scenario names one scheduler identity for
+arbitration, both planning passes and that enqueue, and each driven pass asserts
+it was not on standby. `forge_fair_claim.sql`, the claim projection, `ready_at`
+and `next_eligible_at` are untouched; no sleep, retry or weakened assertion was
+added.
 
-One further observation, not reproducible: the first `test:bifrost` run also
-failed `wyrd-testing::oracle published::published_cache_pruning_and_shutdown_are_production_governed`
-with `A Tokio 1.x context was found, but it is being shutdown` from the Forge
-worker during teardown. It passed standalone with tracing enabled, passed the
-whole `test:bifrost:journey:oracle` binary, and passed on the next full lane
-run. It is a Forge-worker shutdown-ordering race under aggregate contention,
-unrelated to clock ownership.
+**2. Test Postgres endpoint reachability** (`682da31b9`). Three gate runs died
+on `connection refused` against a container Compose had just reported healthy,
+before any test executed. `docker compose up --wait` proves the server accepts
+TCP inside the container; it does not prove the published port is reachable from
+this host. Under a VM-backed Docker the host side of a published port is an SSH
+forward the VM manager creates asynchronously after the guest starts listening —
+`ss -lntp` on a working endpoint names `ssh`, not `docker-proxy`. The wrapper now
+waits for the exact endpoint it exports, rebuilds the project once when that
+endpoint never opens, and otherwise reports the compose state, the mapping
+Docker claims, the host listeners and the server log.
+
+**3. Identity providers reused across runs** (`490079c30`).
+`test:identity:journey` failed first on `Bind for 0.0.0.0:8080: port is already
+allocated` and then on Keycloak exiting with
+`UnknownHostException: <old container id>`. Keycloak `start-dev` keeps its realm
+in an embedded H2 database inside the container filesystem, and H2 writes the
+opening container's hostname into its lock file; the lane stopped its containers
+and reused them, so a Keycloak killed mid-flight left a lock naming a hostname
+that no longer resolved. The lane now removes both containers before starting
+them and again when done. Verified alone: 20 passed.
+
+The `wyrd-testing::oracle published::published_cache_pruning_and_shutdown_are_production_governed`
+shutdown-ordering flake observed on one earlier `test:bifrost` run did not recur
+in the two subsequent full lanes or in the passing gate.
 
 ### Diff audit
 

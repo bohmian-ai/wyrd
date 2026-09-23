@@ -250,6 +250,55 @@ export declare class NativeCards {
   delete(cardRef: string): Promise<NativeLifecycleResult>
 }
 
+/** Tenant-scoped Operator connection handle over the shared `wyrd_client` handle. */
+export declare class NativeOperatorConnections {
+  /**
+   * Creates one connection from a serialized `CreateOperatorConnectionRequest`.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the view cannot be serialized; a
+   * malformed request or server refusal is returned in the result.
+   */
+  create(requestJson: string): Promise<NativeLifecycleResult>
+  /**
+   * Lists the caller tenant's redacted connections.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the views cannot be serialized.
+   */
+  list(): Promise<NativeLifecycleResult>
+  /**
+   * Reads one connection's redacted view.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the view cannot be serialized; a
+   * malformed ID or server refusal is returned in the result.
+   */
+  get(id: string): Promise<NativeLifecycleResult>
+  /**
+   * Updates or rotates one connection from a serialized
+   * `UpdateOperatorConnectionRequest`.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the view cannot be serialized; a
+   * malformed argument or server refusal is returned in the result.
+   */
+  update(id: string, requestJson: string): Promise<NativeLifecycleResult>
+  /**
+   * Disables one connection; Operators naming it fail closed.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the view cannot be serialized; a
+   * malformed ID or server refusal is returned in the result.
+   */
+  disable(id: string): Promise<NativeLifecycleResult>
+}
+
 /** Structured result of starting a native terminal-safe query. */
 export declare class NativeQueryStart {
   /** Moves the Rust-owned stream out after a successful startup. */
@@ -502,6 +551,14 @@ export declare function connectBifrost(table?: NativeTableConfig | undefined | n
 export declare function connectCards(serverUrl?: string | undefined | null, credential?: string | undefined | null): NativeCardsConnection
 
 /**
+ * Builds one Operator connection handle without performing IO.
+ *
+ * Omitted arguments resolve through the same shared client configuration
+ * chain as `connectCards`.
+ */
+export declare function connectOperatorConnections(serverUrl?: string | undefined | null, credential?: string | undefined | null): NativeOperatorConnectionsConnection
+
+/**
  * Builds one Verification handle without performing IO.
  *
  * Omitted arguments resolve through the same shared client configuration
@@ -563,6 +620,14 @@ export interface NativeLifecycleResult {
   errorRemediation?: string
   /** Serialized JSON-safe structured details when the control failed. */
   errorDetailsJson?: string
+}
+
+/** Closed result of building one Operator connection handle: a handle or a catalog error. */
+export interface NativeOperatorConnectionsConnection {
+  /** Operator connection handle when construction succeeded. */
+  connections?: NativeOperatorConnections
+  /** Catalog failure when no credential resolves or the client cannot be built. */
+  error?: NativeWyrdError
 }
 
 /** JavaScript query request projected onto the pure Wyrd contract. */

@@ -25,11 +25,16 @@ pub mod report;
 pub mod spc;
 
 pub use baseline::{FittedBaseline, fit_baseline, score_drift};
-pub use custom::score_custom;
+pub use custom::{score_custom, score_custom_mean};
 pub use error::{DriftFitError, DriftScoreError};
-pub use psi::{FittedPsiFeature, PsiBaseline, fit_psi_baseline, score_psi};
+pub use psi::{
+    FittedPsiFeature, PSI_MIN_TARGET_SAMPLE, PsiBaseline, PsiTargetCounts, fit_psi_baseline,
+    score_psi, score_psi_counts,
+};
 pub use report::{DriftReport, DriftVerdict, FeatureDriftReport};
-pub use spc::{FittedSpcFeature, SpcBaseline, fit_spc_baseline, score_spc};
+pub use spc::{
+    FittedSpcFeature, SpcBaseline, SpcTargetChunks, fit_spc_baseline, score_spc, score_spc_chunks,
+};
 
 #[cfg(test)]
 mod smoke {

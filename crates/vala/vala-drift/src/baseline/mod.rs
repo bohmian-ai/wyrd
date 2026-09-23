@@ -1,5 +1,6 @@
 //! Top-level baseline fit and score dispatch.
 
+use serde::{Deserialize, Serialize};
 use wyrd_spec::card::drift::{DriftMethod, DriftProfile, DriftSignal, DriftSpec};
 
 use crate::custom::score_custom;
@@ -12,9 +13,9 @@ use crate::spc::{fit_spc_baseline, score_spc};
 
 /// Fitted baseline state produced by `fit_baseline`.
 ///
-/// Serialization and persistence are out of phase; store baselines via the
-/// server-side baseline store.
-#[derive(Debug, Clone)]
+/// Serializable so the server's baseline store persists it as the fitted
+/// profile of one Verifier version and the Drift engine reads it back.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum FittedBaseline {
     /// PSI fitted baseline state.
     Psi(PsiBaseline),
@@ -423,5 +424,241 @@ mod end_to_end {
 
         assert_report_shape(&report, DriftMethod::Custom, &feature, DriftVerdict::Drift);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod aggregate_inputs {
+    //! Aggregate-input scoring matches raw-batch scoring, keeps insufficient
+    //! input inconclusive, and fitted baselines round-trip through JSON.
+
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, Float64Array, StringArray};
+    use arrow::record_batch::RecordBatch;
+    use arrow_schema::{DataType, Field, Schema};
+    use wyrd_spec::card::drift::{
+        CustomProfile, PsiBinningStrategy, PsiProfile, PsiThreshold, SpcAlertThreshold, SpcProfile,
+        SpcWecoRule,
+    };
+    use wyrd_spec::ids::FeatureName;
+
+    use crate::{
+        DriftVerdict, FittedBaseline, PsiTargetCounts, SpcTargetChunks, fit_psi_baseline,
+        fit_spc_baseline, score_custom_mean, score_psi, score_psi_counts, score_spc,
+        score_spc_chunks,
+    };
+
+    /// Parse a fixture feature name.
+    ///
+    /// # Panics
+    /// Panics when `name` is not a valid feature name.
+    fn feature(name: &str) -> FeatureName {
+        FeatureName::new(name).expect("valid feature name")
+    }
+
+    /// One-column batch named `name` holding `array`.
+    ///
+    /// # Panics
+    /// Panics when the batch cannot be built.
+    fn batch(name: &str, data_type: DataType, array: ArrayRef) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(name, data_type, true)])),
+            vec![array],
+        )
+        .expect("record batch")
+    }
+
+    /// A numeric PSI profile with four equal-width bins and a fixed threshold.
+    fn psi_profile(categorical: Vec<FeatureName>) -> PsiProfile {
+        PsiProfile {
+            binning_strategy: PsiBinningStrategy::EqualWidth { n_bins: 4 },
+            categorical_features: categorical,
+            threshold: PsiThreshold::Fixed { value: 0.1 },
+        }
+    }
+
+    /// Server-side numeric bin counts equal raw-batch scoring, and a window
+    /// under the minimum sample is inconclusive rather than a pass.
+    ///
+    /// # Panics
+    /// Panics when the two paths disagree or small input is not inconclusive.
+    #[test]
+    fn psi_counts_match_raw_scoring_and_small_windows_are_inconclusive() {
+        let x = feature("x");
+        let profile = psi_profile(Vec::new());
+        let base: Vec<f64> = (0..400).map(|value| f64::from(value % 100)).collect();
+        let baseline = fit_psi_baseline(
+            &batch("x", DataType::Float64, Arc::new(Float64Array::from(base))),
+            &profile,
+            std::slice::from_ref(&x),
+        )
+        .expect("baseline fits");
+        let target: Vec<f64> = (0..200).map(|value| f64::from(value % 30)).collect();
+        let edges = baseline.features[&x].numeric_edges().expect("edges");
+        let mut bins = vec![0_u64; edges.len() - 1];
+        for value in &target {
+            bins[crate::psi::binning::assign_bin(*value, &edges)] += 1;
+        }
+        let counts = BTreeMap::from([(x.clone(), PsiTargetCounts { bins, total: 200 })]);
+        let raw = score_psi(
+            &baseline,
+            &batch("x", DataType::Float64, Arc::new(Float64Array::from(target))),
+            &profile,
+        )
+        .expect("raw scores");
+        let aggregate = score_psi_counts(&baseline, &counts, &profile).expect("counts score");
+        assert_eq!(raw, aggregate);
+        assert_eq!(aggregate.verdict, DriftVerdict::Drift);
+
+        let small = BTreeMap::from([(
+            x.clone(),
+            PsiTargetCounts {
+                bins: vec![99, 0, 0, 0],
+                total: 99,
+            },
+        )]);
+        let report = score_psi_counts(&baseline, &small, &profile).expect("small scores");
+        assert_eq!(report.verdict, DriftVerdict::Inconclusive);
+        assert!(report.features[&x].score.is_nan());
+    }
+
+    /// Unknown categories count toward the categorical total without a bin.
+    ///
+    /// # Panics
+    /// Panics when unknown categories do not dilute the fitted proportions
+    /// exactly as raw scoring does.
+    #[test]
+    fn psi_categorical_unknowns_join_the_total_only() {
+        let c = feature("c");
+        let profile = psi_profile(vec![c.clone()]);
+        let base: Vec<&str> = (0..200)
+            .map(|i| if i % 2 == 0 { "a" } else { "b" })
+            .collect();
+        let baseline = fit_psi_baseline(
+            &batch("c", DataType::Utf8, Arc::new(StringArray::from(base))),
+            &profile,
+            std::slice::from_ref(&c),
+        )
+        .expect("baseline fits");
+        let target: Vec<&str> = (0..200)
+            .map(|i| match i % 4 {
+                0 | 1 => "a",
+                2 => "b",
+                _ => "unseen",
+            })
+            .collect();
+        let raw = score_psi(
+            &baseline,
+            &batch("c", DataType::Utf8, Arc::new(StringArray::from(target))),
+            &profile,
+        )
+        .expect("raw scores");
+        let counts = BTreeMap::from([(
+            c.clone(),
+            PsiTargetCounts {
+                bins: vec![100, 50],
+                total: 200,
+            },
+        )]);
+        assert_eq!(
+            raw,
+            score_psi_counts(&baseline, &counts, &profile).expect("counts score")
+        );
+    }
+
+    /// Server chunk means equal raw-batch SPC scoring, and a window smaller
+    /// than the frozen chunk size is inconclusive.
+    ///
+    /// # Panics
+    /// Panics when the two paths disagree or a short window is not inconclusive.
+    #[test]
+    fn spc_chunks_match_raw_scoring_and_short_windows_are_inconclusive() {
+        let x = feature("x");
+        let profile = SpcProfile {
+            sample_size: 5,
+            weco_rule: SpcWecoRule::default(),
+            alert_threshold: SpcAlertThreshold::Zone4,
+        };
+        let base: Vec<f64> = (0..100).map(|value| f64::from(value % 10)).collect();
+        let baseline = fit_spc_baseline(
+            &batch("x", DataType::Float64, Arc::new(Float64Array::from(base))),
+            &profile,
+            std::slice::from_ref(&x),
+        )
+        .expect("baseline fits");
+        let target: Vec<f64> = (0..23).map(|value| 40.0 + f64::from(value)).collect();
+        let means = target
+            .chunks(5)
+            .map(|chunk| chunk.iter().sum::<f64>() / chunk.len() as f64)
+            .collect();
+        let raw = score_spc(
+            &baseline,
+            &batch("x", DataType::Float64, Arc::new(Float64Array::from(target))),
+            &profile,
+        )
+        .expect("raw scores");
+        let chunks = BTreeMap::from([(x.clone(), SpcTargetChunks { rows: 23, means })]);
+        let aggregate = score_spc_chunks(&baseline, &chunks, &profile).expect("chunks score");
+        // The rule-driven threshold is NaN, so compare the rendered reports.
+        assert_eq!(format!("{raw:?}"), format!("{aggregate:?}"));
+        assert_eq!(aggregate.verdict, DriftVerdict::Drift);
+
+        let short = BTreeMap::from([(
+            x.clone(),
+            SpcTargetChunks {
+                rows: 4,
+                means: vec![4.5],
+            },
+        )]);
+        let report = score_spc_chunks(&baseline, &short, &profile).expect("short scores");
+        assert_eq!(report.verdict, DriftVerdict::Inconclusive);
+        assert!(report.features[&x].score.is_nan());
+    }
+
+    /// The Custom window mean drifts only strictly above the threshold.
+    ///
+    /// # Panics
+    /// Panics when equality drifts, excess does not, or a non-finite mean scores.
+    #[test]
+    fn custom_mean_equality_is_no_drift() {
+        let profile = CustomProfile {
+            metric_name: "latency".to_owned(),
+            baseline_value: 10.0,
+            alert_threshold: 2.0,
+        };
+        let equal = score_custom_mean(12.0, &profile).expect("equal scores");
+        assert_eq!(equal.verdict, DriftVerdict::NoDrift);
+        assert_eq!(equal.features[&feature("latency")].score, 2.0);
+        assert_eq!(
+            score_custom_mean(12.5, &profile)
+                .expect("above scores")
+                .verdict,
+            DriftVerdict::Drift
+        );
+        assert!(score_custom_mean(f64::NAN, &profile).is_err());
+    }
+
+    /// Fitted baselines, including infinite numeric edges, round-trip through JSON.
+    ///
+    /// # Panics
+    /// Panics when a baseline does not survive serialization unchanged.
+    #[test]
+    fn fitted_baselines_round_trip_through_json() {
+        let x = feature("x");
+        let values: Vec<f64> = (0..100).map(f64::from).collect();
+        let fitted = FittedBaseline::Psi(
+            fit_psi_baseline(
+                &batch("x", DataType::Float64, Arc::new(Float64Array::from(values))),
+                &psi_profile(Vec::new()),
+                std::slice::from_ref(&x),
+            )
+            .expect("baseline fits"),
+        );
+        let json = serde_json::to_value(&fitted).expect("baseline serializes");
+        assert_eq!(json["Psi"]["features"]["x"]["bins"][0]["lower"], "-inf");
+        let restored: FittedBaseline = serde_json::from_value(json).expect("baseline restores");
+        assert_eq!(restored, fitted);
     }
 }

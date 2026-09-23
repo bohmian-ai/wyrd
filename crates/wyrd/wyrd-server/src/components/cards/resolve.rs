@@ -2,6 +2,9 @@
 
 use std::collections::{BTreeSet, HashMap};
 
+use serde_json::json;
+use wyrd_spec::card::data::{ArrowFormat, DataInterface};
+use wyrd_spec::card::drift::DriftSignal;
 use wyrd_spec::card::operator::{OperatorAction, OperatorSpec};
 use wyrd_spec::card::trigger::{TriggerActivation, TriggerSpec};
 use wyrd_spec::card::verifier::{VerificationBinding, VerifierImplementation, VerifierSpec};
@@ -64,6 +67,7 @@ pub async fn resolve_card_references(
 
     let mut effective = EffectiveSpecs::new(submissions, resolved_refs)?;
     effective.validate_bindings(conn, submissions).await?;
+    effective.validate_baselines(conn, submissions).await?;
     Ok(effective.resolved)
 }
 
@@ -242,6 +246,79 @@ impl EffectiveSpecs {
         Ok(())
     }
 
+    /// Check every submitted PSI or SPC Verifier against its effective baseline Data.
+    ///
+    /// The fitter reads the Data Card's registered Parquet artifact, so the
+    /// baseline must use an interface whose artifact is Parquet — Pandas,
+    /// Polars, Parquet, or Arrow saved as Parquet — and must declare every
+    /// monitored feature as a schema column. Checking here, before the write
+    /// transaction, refuses a baseline that could never fit without persisting
+    /// a Verifier whose status would only ever fail.
+    ///
+    /// # Errors
+    /// Returns `WYRD_DRIFT_400_VALIDATION` when the baseline is not a Data
+    /// Card, is not stored as Parquet, or lacks a monitored feature column,
+    /// `WYRD_REGISTRY_400_INVALID_CARD_SPEC` for an undecodable submission,
+    /// and the registry error from loading an external baseline.
+    async fn validate_baselines(
+        &mut self,
+        conn: &mut TenantConn<'_>,
+        submissions: &[CardSubmission],
+    ) -> Result<(), WyrdError> {
+        for submission in submissions {
+            let Spec::Verifier(VerifierSpec {
+                implementation: VerifierImplementation::Drift(drift),
+                ..
+            }) = Spec::from_kind_and_value(&submission.kind, submission.spec.clone())
+                .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?
+            else {
+                continue;
+            };
+            let DriftSignal::Distribution {
+                baseline_ref,
+                features,
+            } = &drift.signal
+            else {
+                continue;
+            };
+            let Some(Spec::Data(data)) = self.load(conn, baseline_ref.as_card_ref()).await? else {
+                return Err(baseline_error(
+                    "signal.baseline_ref must name a registered Data Card",
+                    json!({ "field": "signal.baseline_ref" }),
+                ));
+            };
+            let parquet = match &data.interface {
+                DataInterface::Pandas(_) | DataInterface::Polars(_) | DataInterface::Parquet(_) => {
+                    true
+                }
+                DataInterface::Arrow(meta) => meta.format == ArrowFormat::Parquet,
+                _ => false,
+            };
+            if !parquet {
+                return Err(baseline_error(
+                    format!(
+                        "baseline Data Card interface {} is not stored as Parquet",
+                        data.interface.kind()
+                    ),
+                    json!({ "field": "signal.baseline_ref", "interface": data.interface.kind(), "expected": "Parquet artifact" }),
+                ));
+            }
+            if let Some(missing) = features.iter().find(|feature| {
+                !data
+                    .schema
+                    .columns
+                    .iter()
+                    .any(|column| column.name.as_str() == feature.as_str())
+            }) {
+                return Err(baseline_error(
+                    format!("baseline Data Card has no column for feature {missing}"),
+                    json!({ "field": "signal.features", "feature": missing.as_str() }),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Return the effective spec a resolved ref names, loading it once if external.
     ///
     /// Returns `None` for an absent ref; unresolved refs were already rejected.
@@ -266,6 +343,14 @@ impl EffectiveSpecs {
         let row = get_card_by_uid(conn, &uid).await?;
         self.specs.insert(identity, row.spec.clone());
         Ok(Some(row.spec))
+    }
+}
+
+/// Build the Drift validation refusal for an unusable baseline.
+fn baseline_error(message: impl Into<String>, details: serde_json::Value) -> WyrdError {
+    WyrdError::DriftValidation {
+        message: message.into(),
+        details,
     }
 }
 

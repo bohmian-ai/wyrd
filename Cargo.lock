@@ -10477,6 +10477,7 @@ dependencies = [
  "arrow",
  "arrow-schema",
  "serde",
+ "serde_json",
  "statrs",
  "thiserror 2.0.18",
  "workspace-hack",

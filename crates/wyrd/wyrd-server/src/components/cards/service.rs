@@ -14,15 +14,19 @@ use wyrd_semver::{VersionBlock, VersionRange, VersionSpec};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
+use wyrd_spec::card::drift::DriftSignal;
 use wyrd_spec::card::trigger::TriggerActivation;
-use wyrd_spec::card::verifier::{OWNER_OCCURRENCE_KEY, VerificationBinding, VerificationStatus};
+use wyrd_spec::card::verifier::{
+    OWNER_OCCURRENCE_KEY, VerificationBinding, VerificationStatus, VerifierImplementation,
+    VerifierSpec,
+};
 use wyrd_spec::envelope::{Card, CardKind, Metadata, Spec, Status};
 use wyrd_spec::error::{WyrdError, storage::WyrdStorageError};
 use wyrd_spec::graph::{
     GraphError, RootPick, TopoOrder, build, canonical_order, graph_ready_submissions, pick_root,
     relationships_from_spec, spec_binding_errors, topo_sort, validate_composition,
 };
-use wyrd_spec::ids::{BindingId, IdempotencyKey};
+use wyrd_spec::ids::IdempotencyKey;
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
 use wyrd_spec::reference::{CardRef, CardRefIdentity, InlineableRef, scope_child_card_refs};
 use wyrd_spec::registry::{
@@ -56,6 +60,7 @@ use wyrd_sql::queries::cards::{
     schedule_card_reconciliation, soft_delete_card_by_ref, soft_delete_card_with_kind,
     upsert_service_account_from_card,
 };
+use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
 use wyrd_sql::queries::storage::{artifact_metadata, multipart_uploads};
 use wyrd_sql::queries::verification::{
     BindingActivation, FrozenTarget, NewBinding, owner_binding_ids, project_bindings,
@@ -101,11 +106,9 @@ pub async fn get_card_by_uid(
     let inventory = artifact_metadata::list_for_card(&mut conn, card_uid.as_str())
         .await
         .map_err(|error| WyrdError::registry_unavailable(error.to_string()))?;
-    let binding_ids = owner_binding_ids(&mut conn, card_uid)
-        .await
-        .map_err(registry_db_error)?;
+    let verification = verification_status(&mut conn, card_uid).await?;
     conn.commit().await.map_err(registry_db_error)?;
-    hydrate_card(state, caller, row, inbound, inventory, binding_ids).await
+    hydrate_card(state, caller, row, inbound, inventory, verification).await
 }
 
 /// Load a fully hydrated Card by its exact tenant-scoped reference.
@@ -137,11 +140,9 @@ pub async fn get_card_by_ref(
     let inventory = artifact_metadata::list_for_card(&mut conn, row.card_uid.as_str())
         .await
         .map_err(|error| WyrdError::registry_unavailable(error.to_string()))?;
-    let binding_ids = owner_binding_ids(&mut conn, &row.card_uid)
-        .await
-        .map_err(registry_db_error)?;
+    let verification = verification_status(&mut conn, &row.card_uid).await?;
     conn.commit().await.map_err(registry_db_error)?;
-    hydrate_card(state, caller, row, inbound, inventory, binding_ids).await
+    hydrate_card(state, caller, row, inbound, inventory, verification).await
 }
 
 /// Resolve and load the newest stable Active Card in one identity line.
@@ -166,11 +167,9 @@ pub async fn get_latest_card(
     let inventory = artifact_metadata::list_for_card(&mut conn, row.card_uid.as_str())
         .await
         .map_err(|error| WyrdError::registry_unavailable(error.to_string()))?;
-    let binding_ids = owner_binding_ids(&mut conn, &row.card_uid)
-        .await
-        .map_err(registry_db_error)?;
+    let verification = verification_status(&mut conn, &row.card_uid).await?;
     conn.commit().await.map_err(registry_db_error)?;
-    hydrate_card(state, caller, row, inbound, inventory, binding_ids).await
+    hydrate_card(state, caller, row, inbound, inventory, verification).await
 }
 
 /// List versions in one card identity line, excluding deleted rows.
@@ -282,7 +281,7 @@ async fn hydrate_card(
     row: wyrd_sql::row_types::cards::ParsedCardRow,
     inbound: Vec<CardRef>,
     inventory: Vec<artifact_metadata::ArtifactMetadataRow>,
-    binding_ids: Vec<BindingId>,
+    verification: Option<VerificationStatus>,
 ) -> Result<GetCardResponse, WyrdError> {
     let uri = row.card_blob_uri.as_deref().ok_or_else(|| {
         WyrdError::registry_card_not_found(
@@ -329,13 +328,35 @@ async fn hydrate_card(
         phase: row.status.as_db_str().to_owned(),
         message: None,
         updated_at: Some(row.updated_at),
-        verification: (!binding_ids.is_empty()).then_some(VerificationStatus { binding_ids }),
+        verification,
     });
     Ok(GetCardResponse {
         card,
         created_at: row.created_at,
         updated_at: row.updated_at,
     })
+}
+
+/// Read the server-derived verification status a Card read serves.
+///
+/// Combines the Card's owned binding IDs with the fitted-baseline status of a
+/// PSI or SPC Drift Verifier, inside the read's tenant transaction, and
+/// returns `None` when the Card has neither.
+///
+/// # Errors
+/// Returns the mapped registry database error when either read fails.
+async fn verification_status(
+    conn: &mut TenantConn<'_>,
+    card_uid: &CardUid,
+) -> Result<Option<VerificationStatus>, WyrdError> {
+    let binding_ids = owner_binding_ids(conn, card_uid)
+        .await
+        .map_err(registry_db_error)?;
+    let baseline = DriftBaselineQueue::default()
+        .status(conn, card_uid)
+        .await
+        .map_err(registry_db_error)?;
+    Ok(VerificationStatus::derived(binding_ids, baseline))
 }
 
 /// Compare the immutable blob and stored artifact inventory with one registry row.
@@ -1169,6 +1190,18 @@ async fn persist_node(
         BindingProjector::new(conn)
             .project(&row.card_uid, &card.kind, &card.spec)
             .await?;
+    }
+    if let Spec::Verifier(VerifierSpec {
+        implementation: VerifierImplementation::Drift(drift),
+        ..
+    }) = &card.spec
+        && let DriftSignal::Distribution { baseline_ref, .. } = &drift.signal
+    {
+        let data_card_uid = pinned_uid(baseline_ref.as_card_ref())?;
+        DriftBaselineQueue::default()
+            .insert_pending(conn, &row.card_uid, &data_card_uid)
+            .await
+            .map_err(registry_db_error)?;
     }
     Ok(outcome_row_to_response(
         &row,

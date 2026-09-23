@@ -64,6 +64,34 @@ pub fn score_custom(
     }
 
     let mean = values.iter().sum::<f64>() / values.len() as f64;
+    score_custom_mean(mean, profile)
+}
+
+/// Score a target window mean against a Custom profile.
+///
+/// This is the aggregate-input entry point: the server computes the mean of
+/// the metric's raw values over the window and passes only it. The score is
+/// `|mean - baseline_value|`; a score above `alert_threshold` is `Drift` and
+/// equality is `NoDrift`.
+///
+/// # Errors
+/// - [`DriftScoreError::CustomMetricNameInvalid`] when `profile.metric_name`
+///   is not a valid `FeatureName`.
+/// - [`DriftScoreError::CustomInternal`] when `mean` is not finite.
+pub fn score_custom_mean(
+    mean: f64,
+    profile: &CustomProfile,
+) -> Result<DriftReport, DriftScoreError> {
+    let feature_name = FeatureName::new(profile.metric_name.as_str()).map_err(|_| {
+        DriftScoreError::CustomMetricNameInvalid {
+            name: profile.metric_name.clone(),
+        }
+    })?;
+    if !mean.is_finite() {
+        return Err(DriftScoreError::CustomInternal {
+            message: "non-finite target mean".into(),
+        });
+    }
     let score = (mean - profile.baseline_value).abs();
     let verdict = if score > profile.alert_threshold {
         DriftVerdict::Drift

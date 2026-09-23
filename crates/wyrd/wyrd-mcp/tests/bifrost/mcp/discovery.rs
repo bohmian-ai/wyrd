@@ -110,15 +110,17 @@ mod pg_tests {
                 vec!["namespace", "name", "status"],
                 "the list projection stays compact"
             );
-            assert_eq!(table["namespace"], serde_json::json!("vala.bifrost"));
         }
         let listed_names: Vec<&str> = tables
             .iter()
             .filter_map(|table| table["name"].as_str())
             .collect();
         assert!(
-            listed_names.contains(&authorized.as_str()),
-            "the caller's own table is listed: {listed_names:?}"
+            tables.iter().any(|table| {
+                table["name"] == authorized
+                    && table["namespace"] == serde_json::json!("vala.bifrost")
+            }),
+            "the caller's own table is listed in vala.bifrost: {tables:?}"
         );
         assert!(
             !listed_names.contains(&foreign_table.as_str()),

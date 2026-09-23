@@ -13,10 +13,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::WyrdError;
 use crate::ids::{
-    BindingId, CardUid, ConnectionName, OperatorDispatchId, VerificationResultId,
-    VerificationRunId,
+    BindingId, CardUid, ConnectionName, OperatorDispatchId, VerificationResultId, VerificationRunId,
 };
-use crate::operator_connection::HttpsOrigin;
+use crate::operator_connection::{
+    HttpAuthScheme, HttpsOrigin, OperatorConnectionConfig, OperatorProvider,
+};
 use crate::reference::Ref;
 use crate::verification::VerificationVerdict;
 
@@ -83,10 +84,16 @@ impl OperatorSpec {
         match &self.action {
             OperatorAction::Workflow { .. } => Ok(()),
             OperatorAction::Notify {
-                channel: NotifyChannel::Slack { channel_id, text, .. },
+                channel:
+                    NotifyChannel::Slack {
+                        channel_id, text, ..
+                    },
             } => {
                 if channel_id.trim().is_empty() {
-                    return Err(invalid(".channel.channel_id", "must not be empty".to_owned()));
+                    return Err(invalid(
+                        ".channel.channel_id",
+                        "must not be empty".to_owned(),
+                    ));
                 }
                 template(".channel.text", text).map(drop)
             }
@@ -142,6 +149,74 @@ impl OperatorSpec {
                     _ => Ok(()),
                 }
             }
+        }
+    }
+}
+
+impl OperatorSpec {
+    /// The provider and name of the connection this Operator's credential
+    /// authority names, or `None` for Workflow and unauthenticated HTTP.
+    #[must_use]
+    pub fn connection(&self) -> Option<(OperatorProvider, &ConnectionName)> {
+        match &self.action {
+            OperatorAction::Notify {
+                channel: NotifyChannel::Slack { connection, .. },
+            } => Some((OperatorProvider::Slack, connection)),
+            OperatorAction::Notify {
+                channel: NotifyChannel::PagerDuty { connection, .. },
+            } => Some((OperatorProvider::PagerDuty, connection)),
+            OperatorAction::Http {
+                auth: Some(auth), ..
+            } => Some((OperatorProvider::Http, auth.connection())),
+            OperatorAction::Http { auth: None, .. } | OperatorAction::Workflow { .. } => None,
+        }
+    }
+
+    /// Whether the stored connection authority `config` authorizes this
+    /// Operator.
+    ///
+    /// The one compatibility predicate registration and every delivery
+    /// attempt share. Slack and PagerDuty need only the matching provider; an
+    /// authenticated HTTP Operator additionally needs its literal URL origin
+    /// to equal the connection origin and its auth scheme (and custom header
+    /// name, case-insensitively) to equal the stored scheme.
+    #[must_use]
+    pub fn matches_authority(&self, config: &OperatorConnectionConfig) -> bool {
+        match (&self.action, config) {
+            (
+                OperatorAction::Notify {
+                    channel: NotifyChannel::Slack { .. },
+                },
+                OperatorConnectionConfig::Slack { .. },
+            )
+            | (
+                OperatorAction::Notify {
+                    channel: NotifyChannel::PagerDuty { .. },
+                },
+                OperatorConnectionConfig::PagerDuty {},
+            ) => true,
+            (
+                OperatorAction::Http {
+                    url,
+                    auth: Some(auth),
+                    ..
+                },
+                OperatorConnectionConfig::Http {
+                    origin,
+                    auth: scheme,
+                },
+            ) => {
+                let same_scheme = match (auth, scheme) {
+                    (HttpAuth::Bearer { .. }, HttpAuthScheme::Bearer)
+                    | (HttpAuth::Basic { .. }, HttpAuthScheme::Basic) => true,
+                    (HttpAuth::Header { name, .. }, HttpAuthScheme::Header { name: stored }) => {
+                        name.eq_ignore_ascii_case(stored)
+                    }
+                    _ => false,
+                };
+                same_scheme && operator_url_origin(url).is_ok_and(|url| url == *origin)
+            }
+            _ => false,
         }
     }
 }
@@ -513,7 +588,10 @@ mod tests {
             "channel": { "kind": "slack", "connection": "ops-slack", "channel_id": "C1", "text": "{{env.TOKEN}}" }
         }));
         assert_eq!(
-            bad_slack.validate("spec").expect_err("unknown field").code(),
+            bad_slack
+                .validate("spec")
+                .expect_err("unknown field")
+                .code(),
             "WYRD_SPEC_400_INVALID_OPERATOR"
         );
         let pager = spec(serde_json::json!({
@@ -522,19 +600,48 @@ mod tests {
         }));
         assert!(pager.validate("spec").is_ok());
 
-        let auth = serde_json::json!({ "scheme": "header", "name": "X-Api-Key", "connection": "hooks" });
+        let auth =
+            serde_json::json!({ "scheme": "header", "name": "X-Api-Key", "connection": "hooks" });
         assert!(
-            http("https://hooks.example.com/v1/{{run_id}}", serde_json::json!({}), auth.clone())
-                .validate("spec")
-                .is_ok()
+            http(
+                "https://hooks.example.com/v1/{{run_id}}",
+                serde_json::json!({}),
+                auth.clone()
+            )
+            .validate("spec")
+            .is_ok()
         );
         for (url, headers, auth) in [
-            ("https://{{run_id}}.example.com/", serde_json::json!({}), serde_json::Value::Null),
-            ("ftp://hooks.example.com/", serde_json::json!({}), serde_json::Value::Null),
-            ("http://hooks.example.com/", serde_json::json!({}), serde_json::Value::Null),
-            ("https://hooks.example.com/", serde_json::json!({ "AUTHORIZATION": "x" }), serde_json::Value::Null),
-            ("https://hooks.example.com/", serde_json::json!({ "Idempotency-Key": "x" }), serde_json::Value::Null),
-            ("https://hooks.example.com/", serde_json::json!({ "x-api-key": "x" }), auth.clone()),
+            (
+                "https://{{run_id}}.example.com/",
+                serde_json::json!({}),
+                serde_json::Value::Null,
+            ),
+            (
+                "ftp://hooks.example.com/",
+                serde_json::json!({}),
+                serde_json::Value::Null,
+            ),
+            (
+                "http://hooks.example.com/",
+                serde_json::json!({}),
+                serde_json::Value::Null,
+            ),
+            (
+                "https://hooks.example.com/",
+                serde_json::json!({ "AUTHORIZATION": "x" }),
+                serde_json::Value::Null,
+            ),
+            (
+                "https://hooks.example.com/",
+                serde_json::json!({ "Idempotency-Key": "x" }),
+                serde_json::Value::Null,
+            ),
+            (
+                "https://hooks.example.com/",
+                serde_json::json!({ "x-api-key": "x" }),
+                auth.clone(),
+            ),
             (
                 "https://hooks.example.com/",
                 serde_json::json!({}),
@@ -548,9 +655,48 @@ mod tests {
     /// The URL origin is extracted literally before any placeholder.
     #[test]
     fn url_origin_is_literal_and_normalized() {
-        let origin = operator_url_origin("https://Hooks.Example.com:443/a/{{run_id}}?q={{summary}}")
-            .expect("literal origin");
+        let origin =
+            operator_url_origin("https://Hooks.Example.com:443/a/{{run_id}}?q={{summary}}")
+                .expect("literal origin");
         assert_eq!(origin.as_str(), "https://hooks.example.com");
         assert!(operator_url_origin("https://user@hooks.example.com/").is_err());
+    }
+
+    /// Authority matches only the same provider, and for HTTP only the same
+    /// normalized origin and auth scheme, with header names compared
+    /// case-insensitively.
+    #[test]
+    fn authority_matches_provider_origin_and_scheme() {
+        let header =
+            serde_json::json!({ "scheme": "header", "name": "x-api-key", "connection": "hooks" });
+        let op = http(
+            "https://Hooks.Example.com:443/v1/{{run_id}}",
+            serde_json::json!({}),
+            header,
+        );
+        assert_eq!(
+            op.connection().map(|(p, n)| (p, n.as_str())),
+            Some((OperatorProvider::Http, "hooks"))
+        );
+        let stored = |origin: &str, auth: HttpAuthScheme| OperatorConnectionConfig::Http {
+            origin: HttpsOrigin::parse(origin).expect("origin"),
+            auth,
+        };
+        let header_scheme = || HttpAuthScheme::Header {
+            name: "X-Api-Key".to_owned(),
+        };
+        assert!(op.matches_authority(&stored("https://hooks.example.com", header_scheme())));
+        assert!(!op.matches_authority(&stored("https://hooks.example.com:8443", header_scheme())));
+        assert!(!op.matches_authority(&stored("https://other.example.com", header_scheme())));
+        assert!(
+            !op.matches_authority(&stored("https://hooks.example.com", HttpAuthScheme::Bearer))
+        );
+        assert!(!op.matches_authority(&OperatorConnectionConfig::PagerDuty {}));
+        let open = http(
+            "https://hooks.example.com/x",
+            serde_json::json!({}),
+            serde_json::Value::Null,
+        );
+        assert!(open.connection().is_none());
     }
 }

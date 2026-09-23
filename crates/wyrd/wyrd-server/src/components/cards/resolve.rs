@@ -8,11 +8,15 @@ use wyrd_spec::card::verifier::{VerificationBinding, VerifierImplementation, Ver
 use wyrd_spec::envelope::Spec;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::CardUid;
+use wyrd_spec::operator_connection::OperatorConnectionStatus;
 use wyrd_spec::reference::{CardRef, CardRefIdentity, InlineableRef, Ref};
 use wyrd_spec::refs::{ReferenceSlotVisitor, SlotValue};
 use wyrd_spec::registry::CardSubmission;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::cards::{get_card_by_uid, select_card_uids_by_ref_batch};
+use wyrd_sql::queries::operator_connections::find_connection;
+
+use crate::state::registry_db_error;
 use wyrd_sql::queries::verification::BindingSchedule;
 
 /// Identity key used to look up a resolved external reference.
@@ -44,6 +48,9 @@ pub async fn resolve_card_references(
         let spec = Spec::from_kind_and_value(&submission.kind, submission.spec.clone())
             .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?;
         validate_and_collect_refs(&spec, &siblings, &mut refs)?;
+        if let Spec::Operator(operator) = &spec {
+            check_operator(conn, operator, "spec").await?;
+        }
     }
 
     refs.sort_by_key(display_ref);
@@ -99,6 +106,44 @@ fn check_activation(
             "field": format!("{field}.runs_on"),
             "implementation": verifier.implementation.kind_name(),
         }),
+    })
+}
+
+/// Validate an Operator's shape and the exact connection authority it names.
+///
+/// Reads only the tenant's redacted connection row (never the secret) under
+/// the caller's RLS. Missing, disabled, wrong-provider, and mismatched
+/// authority all answer the same refusal, so a tenant cannot probe which one
+/// applies, and another tenant's connection is indistinguishable from none.
+///
+/// # Errors
+/// Returns `WYRD_SPEC_400_INVALID_OPERATOR` for a shape or template violation,
+/// `WYRD_SPEC_400_OPERATOR_CONNECTION_UNAVAILABLE` when no active matching
+/// connection exists, and a registry error when the read fails.
+async fn check_operator(
+    conn: &mut TenantConn<'_>,
+    operator: &OperatorSpec,
+    field: &str,
+) -> Result<(), WyrdError> {
+    operator.validate(field)?;
+    let Some((provider, name)) = operator.connection() else {
+        return Ok(());
+    };
+    let usable = find_connection(conn, provider, name)
+        .await
+        .map_err(registry_db_error)?
+        .is_some_and(|stored| {
+            stored.view.status == OperatorConnectionStatus::Active
+                && operator.matches_authority(&stored.view.config)
+        });
+    if usable {
+        return Ok(());
+    }
+    Err(WyrdError::SpecOperatorConnectionUnavailable {
+        message: format!(
+            "{field}: no active {provider} connection named {name} with matching authority"
+        ),
+        details: serde_json::json!({ "field": field, "provider": provider, "connection": name }),
     })
 }
 
@@ -227,16 +272,21 @@ impl EffectiveSpecs {
                 InlineableRef::Inline(operator) => Some(Spec::Operator((**operator).clone())),
                 reference => self.load(conn, reference.as_card_ref()).await?,
             };
-            if let Some(Spec::Operator(OperatorSpec {
-                action: OperatorAction::Workflow { .. },
-                ..
-            })) = operator
-            {
-                let field = format!("{field}.on_failure[{index}]");
-                return Err(WyrdError::SpecUnsupportedOperatorAction {
-                    message: format!("{field} uses the workflow action, which is not invocable"),
-                    details: serde_json::json!({ "field": field, "action": "workflow" }),
-                });
+            let field = format!("{field}.on_failure[{index}]");
+            match operator {
+                Some(Spec::Operator(OperatorSpec {
+                    action: OperatorAction::Workflow { .. },
+                    ..
+                })) => {
+                    return Err(WyrdError::SpecUnsupportedOperatorAction {
+                        message: format!(
+                            "{field} uses the workflow action, which is not invocable"
+                        ),
+                        details: serde_json::json!({ "field": field, "action": "workflow" }),
+                    });
+                }
+                Some(Spec::Operator(operator)) => check_operator(conn, &operator, &field).await?,
+                _ => {}
             }
         }
         Ok(())

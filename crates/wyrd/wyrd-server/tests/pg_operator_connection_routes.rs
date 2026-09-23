@@ -541,3 +541,135 @@ async fn missing_key_refuses_only_credential_writes() {
         StatusCode::OK
     );
 }
+
+/// Register one Operator Card named `name` with `spec` as `jwt`.
+///
+/// # Panics
+/// Panics when the request cannot be built or the route fails to respond.
+async fn register_operator(
+    server: &WyrdTestServer,
+    jwt: &str,
+    name: &str,
+    spec: Value,
+) -> (StatusCode, Value) {
+    let body = json!({ "submissions": [{
+        "apiVersion": "wyrd/v1", "kind": "Operator",
+        "metadata": { "name": name, "version": "1.0.0", "space": "default" },
+        "spec": spec, "artifacts": []
+    }] });
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/cards")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("Idempotency-Key", format!("oc-register-{name}"))
+        .body(Body::from(body.to_string()))
+        .expect("registration request builds");
+    decoded(
+        server
+            .oneshot_authenticated(jwt, request)
+            .await
+            .expect("registration responds"),
+    )
+    .await
+}
+
+/// Registration binds an Operator to an active connection of its provider
+/// whose HTTP origin and auth scheme match, and refuses a missing name, a
+/// mismatched origin or scheme, and a disabled connection with one code.
+///
+/// # Panics
+/// Panics when an accepted registration is refused or a mismatch is accepted.
+#[tokio::test(flavor = "current_thread")]
+async fn registration_binds_exact_connection_authority() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let (_, jwt) = user(&server, "oc-registrar", &["admin"]).await;
+    let mut slack_id = String::new();
+    for body in creates() {
+        let (status, view) = call(
+            &server,
+            &jwt,
+            Method::POST,
+            "/v1/operator-connections",
+            Some(&body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{view}");
+        if view["provider"] == "slack" {
+            slack_id = view["connection_id"].as_str().expect("id").to_owned();
+        }
+    }
+    let slack = |connection: &str| {
+        json!({ "kind": "notify", "channel": { "kind": "slack", "connection": connection,
+                "channel_id": "C0123456789", "text": "verification failed" } })
+    };
+    let http = |url: &str, auth: Value| json!({ "kind": "http", "method": "post", "url": url, "auth": auth });
+    let header_scheme =
+        json!({ "scheme": "header", "name": "x-api-key", "connection": "ops-hooks" });
+    let accepted = [
+        ("oc-slack", slack("ops-slack")),
+        (
+            "oc-pager",
+            json!({ "kind": "notify", "channel": { "kind": "pager_duty",
+                    "connection": "ops-pagerduty", "route": "retention",
+                    "severity": "warning", "summary": "verification failed" } }),
+        ),
+        (
+            "oc-http",
+            http(
+                "https://hooks.example.com/v1/{{subject_uid}}",
+                header_scheme.clone(),
+            ),
+        ),
+    ];
+    for (name, spec) in accepted {
+        let (status, body) = register_operator(&server, &jwt, name, spec).await;
+        assert_eq!(status, StatusCode::CREATED, "{name}: {body}");
+    }
+    let refused = [
+        ("oc-missing", slack("no-such-connection")),
+        ("oc-wrong-provider", slack("ops-pagerduty")),
+        (
+            "oc-wrong-origin",
+            http("https://hooks.example.com:8443/v1", header_scheme),
+        ),
+        (
+            "oc-wrong-scheme",
+            http(
+                "https://hooks.example.com/v1",
+                json!({ "scheme": "bearer", "connection": "ops-hooks" }),
+            ),
+        ),
+    ];
+    for (name, spec) in refused {
+        let (status, problem) = register_operator(&server, &jwt, name, spec).await;
+        assert_eq!(
+            (status, problem["code"].as_str()),
+            (
+                StatusCode::BAD_REQUEST,
+                Some("WYRD_SPEC_400_OPERATOR_CONNECTION_UNAVAILABLE")
+            ),
+            "{name}: {problem}"
+        );
+    }
+    let (status, _) = call(
+        &server,
+        &jwt,
+        Method::DELETE,
+        &format!("/v1/operator-connections/{slack_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, problem) =
+        register_operator(&server, &jwt, "oc-disabled", slack("ops-slack")).await;
+    assert_eq!(
+        (status, problem["code"].as_str()),
+        (
+            StatusCode::BAD_REQUEST,
+            Some("WYRD_SPEC_400_OPERATOR_CONNECTION_UNAVAILABLE")
+        ),
+        "{problem}"
+    );
+}

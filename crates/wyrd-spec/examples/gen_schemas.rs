@@ -29,9 +29,6 @@ use wyrd_spec::card::operator::{
     HttpAuth, HttpMethod, NotifyChannel, OperatorAction, OperatorBudget, OperatorFailureContext,
     OperatorSpec, PagerDutySeverity,
 };
-use wyrd_spec::operator_connection::{
-    CreateOperatorConnectionRequest, OperatorConnectionView, UpdateOperatorConnectionRequest,
-};
 use wyrd_spec::card::policy::{InvokeContext, InvokeOutcome, PolicyDecision, PolicySpec};
 use wyrd_spec::card::prompt::{ParameterName, PromptRef, PromptSpec};
 use wyrd_spec::card::service::{LockedComponent, ServiceLock};
@@ -47,6 +44,9 @@ use wyrd_spec::card::verifier::{VerificationBinding, VerifierImplementation, Ver
 use wyrd_spec::card::workflow::WorkflowSpec;
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::operator_connection::{
+    CreateOperatorConnectionRequest, OperatorConnectionView, UpdateOperatorConnectionRequest,
+};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::registry::{
     ArtifactInventoryResponse, ArtifactManifestEntry, CardLifecycleStatus, CardLocator,

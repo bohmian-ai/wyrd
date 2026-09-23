@@ -196,13 +196,19 @@ impl HttpConnectionAuth {
                 let forbidden = FORBIDDEN_HTTP_HEADERS
                     .iter()
                     .any(|header| name.eq_ignore_ascii_case(header));
-                let token = name.bytes().all(|b| {
-                    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
-                });
+                let token = name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b));
                 if name.is_empty() || !token || forbidden {
-                    return Err(invalid("auth.name", "must be a non-server-owned header name"));
+                    return Err(invalid(
+                        "auth.name",
+                        "must be a non-server-owned header name",
+                    ));
                 }
-                (HttpAuthScheme::Header { name }, ConnectionSecret::token(value)?)
+                (
+                    HttpAuthScheme::Header { name },
+                    ConnectionSecret::token(value)?,
+                )
             }
         })
     }
@@ -285,7 +291,11 @@ impl CreateOperatorConnectionRequest {
             ),
             Self::Http { name, origin, auth } => {
                 let (auth, secret) = auth.split()?;
-                (name, OperatorConnectionConfig::Http { origin, auth }, secret)
+                (
+                    name,
+                    OperatorConnectionConfig::Http { origin, auth },
+                    secret,
+                )
             }
         })
     }
@@ -617,12 +627,16 @@ mod tests {
         let update = rotate.apply(stored.clone()).expect("auth update");
         assert!(matches!(
             update.config,
-            OperatorConnectionConfig::Http { auth: HttpAuthScheme::Basic, .. }
+            OperatorConnectionConfig::Http {
+                auth: HttpAuthScheme::Basic,
+                ..
+            }
         ));
         assert!(update.secret.is_some());
 
         let wrong: UpdateOperatorConnectionRequest =
-            serde_json::from_value(json!({ "provider": "slack", "bot_token": "x" })).expect("parses");
+            serde_json::from_value(json!({ "provider": "slack", "bot_token": "x" }))
+                .expect("parses");
         assert!(wrong.apply(stored).is_err());
         assert!(
             serde_json::from_value::<UpdateOperatorConnectionRequest>(

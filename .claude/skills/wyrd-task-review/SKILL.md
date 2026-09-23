@@ -77,6 +77,12 @@ standard-library, native-platform, or installed-dependency behavior before
 accepting new code. Require the smallest safe root-cause correction without
 weakening validation, error handling, security, accessibility, or durability.
 
+Treat each failure diagnosis in the task evidence as a claim to falsify: the
+recorded cause must explain the trace, and the fix must sit at that cause. A
+change to a test, assertion, timeout, sleep, retry, `#[ignore]`, `#[allow]`, or
+skip made to clear a failure, without a recorded diagnosis and diagnostician
+report, is a `VIOLATION`.
+
 Build an explicit matrix:
 
 | Requirement, acceptance criterion, constraint, or non-goal | Implementation evidence | Verification evidence | Result |

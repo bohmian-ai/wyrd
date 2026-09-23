@@ -53,6 +53,28 @@ cross-service or concurrency semantics, security or tenancy rule,
 compatibility requirement, or another expensive-to-reverse decision. Otherwise
 resolve repository-local details and continue.
 
+## Diagnose unexpected failures
+
+An unexpected test, lane, or check failure is a defect to diagnose, not a gate
+to satisfy. Before editing to fix it, re-run it with tracing on (`WYRD_LOG`,
+else `RUST_LOG`), read the trace, and append a diagnosis to the task evidence:
+
+- **Symptom:** what failed and where;
+- **Evidence:** the trace lines or source locations that show the failure;
+- **Cause:** the code-level reason it fails; "flaky" or "timing" is not a
+  cause; and
+- **Fix site:** the shared owner where the fix belongs and the other callers
+  checked there.
+
+Without a stated cause there is no fix. Spawn a fresh read-only diagnostician
+before fixing when the fix would touch a test or assertion, a timeout, sleep,
+retry, `#[ignore]`, `#[allow]`, or skip; when a previous fix for the same
+failure did not hold; when the fix site is outside the task's write set; or
+when the cause involves timing, ordering, or concurrency. Give it only the
+failing command, the trace, and the diff, never your hypothesis. It returns the
+cause, fix site, and affected callers. Record its report beside the diagnosis,
+then apply the Ponytail ladder to the smallest fix at that root cause.
+
 ## Verify and record evidence
 
 Run the smallest complete verification set required by `AGENTS.md`: focused

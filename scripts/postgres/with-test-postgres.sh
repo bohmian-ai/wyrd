@@ -53,6 +53,22 @@ if [[ $host == "0.0.0.0" ]]; then
   host=127.0.0.1
 fi
 
+# `--wait` proves the server accepts TCP inside the container. It does not
+# prove Docker has finished publishing the loopback port this command will
+# actually dial: a healthy container has been observed behind a host port that
+# still refuses, which failed the lane before any test ran. Wait for the exact
+# endpoint, then fail with the endpoint named rather than as a psql refusal.
+for _ in $(seq 1 60); do
+  if (exec 3<>"/dev/tcp/${host}/${port}") 2>/dev/null; then
+    break
+  fi
+  sleep 1
+done
+if ! (exec 3<>"/dev/tcp/${host}/${port}") 2>/dev/null; then
+  echo "Postgres endpoint ${host}:${port} never accepted a connection" >&2
+  exit 1
+fi
+
 admin_dsn="postgres://wyrd_test_admin:${admin_password}@${host}:${port}/wyrd"
 export DATABASE_URL="postgres://wyrd_migrator:${migrator_password}@${host}:${port}/wyrd"
 export WYRD_DATABASE_URL="postgres://wyrd_app:${app_password}@${host}:${port}/wyrd"

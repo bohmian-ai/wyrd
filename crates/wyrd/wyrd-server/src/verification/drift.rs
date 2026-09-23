@@ -30,9 +30,7 @@ use datafusion::logical_expr::{
     Expr, ExprFunctionExt, LogicalPlan, LogicalPlanBuilder, cast, col, lit, when,
 };
 use futures_util::StreamExt as _;
-use vala_bifrost_redux::oracle::{
-    AuthorizedQueryContext, Oracle, QueryIpcDecoder, QueryOptions,
-};
+use vala_bifrost_redux::oracle::{AuthorizedQueryContext, Oracle, QueryIpcDecoder, QueryOptions};
 use vala_bifrost_redux::tables::builtin_table;
 use vala_drift::psi::BinType;
 use vala_drift::{
@@ -131,7 +129,12 @@ impl ObservationWindow {
             DataFusionError::Plan("vala.drift.observations is not a built-in table".to_owned())
         })?;
         let source = Arc::new(LogicalTableSource::new((table.schema)()));
-        let micros = |value| lit(ScalarValue::TimestampMicrosecond(Some(value), Some("UTC".into())));
+        let micros = |value| {
+            lit(ScalarValue::TimestampMicrosecond(
+                Some(value),
+                Some("UTC".into()),
+            ))
+        };
         LogicalPlanBuilder::scan(OBSERVATIONS, source, None)?.filter(
             col("card_uid")
                 .eq(lit(self.subject.as_str()))
@@ -151,9 +154,13 @@ impl ObservationWindow {
     /// Returns a planning error when `edges` has fewer than two entries or
     /// DataFusion rejects the plan.
     pub fn psi_numeric(&self, series: &str, edges: &[f64]) -> Result<LogicalPlan, DataFusionError> {
-        let bins = edges.len().checked_sub(1).filter(|bins| *bins > 0).ok_or_else(|| {
-            DataFusionError::Plan("a numeric PSI feature needs at least one bin".to_owned())
-        })?;
+        let bins = edges
+            .len()
+            .checked_sub(1)
+            .filter(|bins| *bins > 0)
+            .ok_or_else(|| {
+                DataFusionError::Plan("a numeric PSI feature needs at least one bin".to_owned())
+            })?;
         let value = || col("num_value");
         let mut case = when(value().is_null(), lit(NULL_BIN));
         for (index, upper) in edges[1..bins].iter().enumerate() {
@@ -212,7 +219,9 @@ impl ObservationWindow {
     /// rejects the plan.
     pub fn spc(&self, series: &str, chunk_size: u32) -> Result<LogicalPlan, DataFusionError> {
         if chunk_size == 0 {
-            return Err(DataFusionError::Plan("an SPC chunk size is positive".to_owned()));
+            return Err(DataFusionError::Plan(
+                "an SPC chunk size is positive".to_owned(),
+            ));
         }
         let rn = row_number()
             .order_by(vec![
@@ -377,8 +386,10 @@ pub fn custom_mean(batches: &[RecordBatch]) -> Result<Option<f64>, String> {
         int64s(batch, "numeric")?.value(0),
         float64s(batch, "mean")?,
     );
-    Ok((n > 0 && n == numeric && mean.is_valid(0) && mean.value(0).is_finite())
-        .then(|| mean.value(0)))
+    Ok(
+        (n > 0 && n == numeric && mean.is_valid(0) && mean.value(0).is_finite())
+            .then(|| mean.value(0)),
+    )
 }
 
 /// Owner of Drift execution: baseline loading, Oracle aggregates, scoring.
@@ -396,7 +407,11 @@ pub struct DriftEngine {
 impl DriftEngine {
     /// Build an engine over `postgres` and this process's `oracle`.
     #[must_use]
-    pub fn new(postgres: WyrdPostgres, oracle: Option<Arc<Oracle>>, query_timeout: Duration) -> Self {
+    pub fn new(
+        postgres: WyrdPostgres,
+        oracle: Option<Arc<Oracle>>,
+        query_timeout: Duration,
+    ) -> Self {
         Self {
             postgres,
             oracle,
@@ -436,7 +451,10 @@ impl DriftEngine {
         spec: &DriftSpec,
     ) -> Result<Option<vala_drift::DriftReport>, EngineOutcome> {
         let RunInput::DriftWindow(window) = &run.input else {
-            return Err(terminal(DRIFT_INVALID, "a Drift run needs a drift window input"));
+            return Err(terminal(
+                DRIFT_INVALID,
+                "a Drift run needs a drift window input",
+            ));
         };
         let window = ObservationWindow::new(&run.subject_card_uid, window);
         let invalid = |message: String| terminal(DRIFT_INVALID, message);
@@ -445,7 +463,9 @@ impl DriftEngine {
         };
         match spec.profile.as_ref() {
             Some(DriftProfile::Custom(profile)) => {
-                let plan = window.custom(&profile.metric_name).map_err(|e| invalid(e.to_string()))?;
+                let plan = window
+                    .custom(&profile.metric_name)
+                    .map_err(|e| invalid(e.to_string()))?;
                 let batches = self.aggregate(tenant, verifier, plan).await?;
                 match custom_mean(&batches).map_err(invalid)? {
                     Some(mean) => scored(score_custom_mean(mean, profile)),
@@ -455,7 +475,9 @@ impl DriftEngine {
             Some(DriftProfile::Psi(profile)) => {
                 let FittedBaseline::Psi(baseline) = self.fitted(tenant, &run.verifier_uid).await?
                 else {
-                    return Err(invalid("the fitted baseline is not a PSI baseline".to_owned()));
+                    return Err(invalid(
+                        "the fitted baseline is not a PSI baseline".to_owned(),
+                    ));
                 };
                 let mut counts = BTreeMap::new();
                 for (name, feature) in &baseline.features {
@@ -492,7 +514,9 @@ impl DriftEngine {
             Some(DriftProfile::Spc(profile)) => {
                 let FittedBaseline::Spc(baseline) = self.fitted(tenant, &run.verifier_uid).await?
                 else {
-                    return Err(invalid("the fitted baseline is not an SPC baseline".to_owned()));
+                    return Err(invalid(
+                        "the fitted baseline is not an SPC baseline".to_owned(),
+                    ));
                 };
                 let mut chunks = BTreeMap::new();
                 for name in baseline.features.keys() {
@@ -521,7 +545,8 @@ impl DriftEngine {
         tenant: DataTenantId,
         verifier_uid: &CardUid,
     ) -> Result<FittedBaseline, EngineOutcome> {
-        let unavailable = |error: &dyn std::fmt::Display| retry(DRIFT_QUERY_FAILED, error.to_string());
+        let unavailable =
+            |error: &dyn std::fmt::Display| retry(DRIFT_QUERY_FAILED, error.to_string());
         let mut conn = self
             .postgres
             .tenant_conn(tenant)
@@ -548,7 +573,8 @@ impl DriftEngine {
         tenant: DataTenantId,
         verifier: &CardRef,
     ) -> Result<AuthorizedQueryContext, EngineOutcome> {
-        let unavailable = |error: &dyn std::fmt::Display| retry(DRIFT_QUERY_FAILED, error.to_string());
+        let unavailable =
+            |error: &dyn std::fmt::Display| retry(DRIFT_QUERY_FAILED, error.to_string());
         let mut conn = self
             .postgres
             .tenant_conn(tenant)
@@ -624,10 +650,13 @@ impl DriftEngine {
                 ),
                 QueryStreamFrame::Terminal(terminal) => {
                     if terminal.outcome == QueryTerminalOutcome::Failed {
-                        return Err(failed(terminal.error.map_or(
-                            BifrostError::QueryExecutionFailed,
-                            |error| crate::query::service::terminal_error_to_bifrost(error.code),
-                        )));
+                        return Err(failed(
+                            terminal
+                                .error
+                                .map_or(BifrostError::QueryExecutionFailed, |error| {
+                                    crate::query::service::terminal_error_to_bifrost(error.code)
+                                }),
+                        ));
                     }
                     decoder
                         .accept_eos(&terminal.arrow_ipc_eos)
@@ -673,8 +702,14 @@ mod tests {
         ObservationWindow::new(
             &CardUid::from_uuid(uuid::Uuid::now_v7()).expect("a v7 UUID is a Card UID"),
             &DriftWindow {
-                start: Utc.with_ymd_and_hms(2026, 9, 17, 0, 0, 0).single().expect("start"),
-                end: Utc.with_ymd_and_hms(2026, 9, 17, 1, 0, 0).single().expect("end"),
+                start: Utc
+                    .with_ymd_and_hms(2026, 9, 17, 0, 0, 0)
+                    .single()
+                    .expect("start"),
+                end: Utc
+                    .with_ymd_and_hms(2026, 9, 17, 1, 0, 0)
+                    .single()
+                    .expect("end"),
             },
         )
     }
@@ -692,11 +727,19 @@ mod tests {
                 vec!["bin_id", "n"],
             ),
             (
-                window.psi_categorical("color", &["red", "blue"]).expect("categorical plan"),
+                window
+                    .psi_categorical("color", &["red", "blue"])
+                    .expect("categorical plan"),
                 vec!["bin_id", "n"],
             ),
-            (window.spc("age", 5).expect("spc plan"), vec!["chunk", "n", "numeric", "mean"]),
-            (window.custom("latency").expect("custom plan"), vec!["n", "numeric", "mean"]),
+            (
+                window.spc("age", 5).expect("spc plan"),
+                vec!["chunk", "n", "numeric", "mean"],
+            ),
+            (
+                window.custom("latency").expect("custom plan"),
+                vec!["n", "numeric", "mean"],
+            ),
         ];
         for (plan, columns) in plans {
             let names = plan
@@ -707,7 +750,10 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(names, columns);
             let rendered = plan.display_indent().to_string();
-            assert!(rendered.contains("TableScan: vala.drift.observations"), "{rendered}");
+            assert!(
+                rendered.contains("TableScan: vala.drift.observations"),
+                "{rendered}"
+            );
             assert!(rendered.contains(&window.subject), "{rendered}");
             assert!(rendered.contains("wyrd_event_time >="), "{rendered}");
             assert!(rendered.contains("wyrd_event_time <"), "{rendered}");
@@ -730,7 +776,10 @@ mod tests {
         assert!(psi_counts(&[stray], 2).is_err());
         assert_eq!(
             psi_counts(&[], 2).expect("empty"),
-            Some(PsiTargetCounts { bins: vec![0, 0], total: 0 })
+            Some(PsiTargetCounts {
+                bins: vec![0, 0],
+                total: 0
+            })
         );
     }
 
@@ -738,7 +787,11 @@ mod tests {
     #[test]
     fn spc_chunks_keep_order_and_refuse_nulls() {
         let rows = batch(
-            &[("chunk", vec![0, 1]), ("n", vec![5, 2]), ("numeric", vec![5, 2])],
+            &[
+                ("chunk", vec![0, 1]),
+                ("n", vec![5, 2]),
+                ("numeric", vec![5, 2]),
+            ],
             &[("mean", vec![Some(1.5), Some(3.0)])],
         );
         let chunks = spc_chunks(&[rows]).expect("chunks").expect("scorable");
@@ -755,12 +808,21 @@ mod tests {
     #[test]
     fn custom_mean_requires_a_complete_finite_window() {
         let row = |n, numeric, mean| {
-            batch(&[("n", vec![n]), ("numeric", vec![numeric])], &[("mean", vec![mean])])
+            batch(
+                &[("n", vec![n]), ("numeric", vec![numeric])],
+                &[("mean", vec![mean])],
+            )
         };
-        assert_eq!(custom_mean(&[row(3, 3, Some(2.5))]).expect("row"), Some(2.5));
+        assert_eq!(
+            custom_mean(&[row(3, 3, Some(2.5))]).expect("row"),
+            Some(2.5)
+        );
         assert_eq!(custom_mean(&[row(0, 0, None)]).expect("row"), None);
         assert_eq!(custom_mean(&[row(3, 2, Some(2.5))]).expect("row"), None);
-        assert_eq!(custom_mean(&[row(3, 3, Some(f64::INFINITY))]).expect("row"), None);
+        assert_eq!(
+            custom_mean(&[row(3, 3, Some(f64::INFINITY))]).expect("row"),
+            None
+        );
         assert!(custom_mean(&[]).is_err());
     }
 }

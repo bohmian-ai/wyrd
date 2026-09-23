@@ -19,9 +19,9 @@ use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::envelope::Spec;
 use wyrd_spec::card::drift::DriftSpec;
 use wyrd_spec::card::verifier::VerifierImplementation;
+use wyrd_spec::envelope::Spec;
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::verification::VerificationError;
 use wyrd_sql::queries::cards::get_card_by_uid;
@@ -160,7 +160,9 @@ impl BaselineFitter {
             match self.fit_next(tenant, stop).await {
                 Ok(true) => settled += 1,
                 Ok(false) => {}
-                Err(error) => tracing::warn!(%tenant, %error, "drift baseline fit failed to settle"),
+                Err(error) => {
+                    tracing::warn!(%tenant, %error, "drift baseline fit failed to settle")
+                }
             }
         }
         Ok(settled)
@@ -176,7 +178,11 @@ impl BaselineFitter {
     /// # Errors
     /// Returns [`SqlError`] when the claim or settlement transaction fails;
     /// the lease then expires and the row is reclaimed.
-    async fn fit_next(&self, tenant: DataTenantId, stop: &CancellationToken) -> Result<bool, SqlError> {
+    async fn fit_next(
+        &self,
+        tenant: DataTenantId,
+        stop: &CancellationToken,
+    ) -> Result<bool, SqlError> {
         let mut conn = self.postgres.tenant_conn(tenant).await?;
         let Some(claimed) = self.queue.claim(&mut conn, self.lease).await? else {
             return Ok(false);
@@ -193,7 +199,9 @@ impl BaselineFitter {
                 self.queue.release(&mut conn, &claimed.lease).await?;
             }
             Some(Ok(fitted)) => {
-                self.queue.complete(&mut conn, &claimed.lease, &fitted).await?;
+                self.queue
+                    .complete(&mut conn, &claimed.lease, &fitted)
+                    .await?;
                 tracing::info!(%tenant, %verifier_uid, "drift baseline fitted");
             }
             Some(Err(error)) => {
@@ -211,7 +219,11 @@ impl BaselineFitter {
     /// Returns the structured failure the row records: an unusable Verifier
     /// or Data Card, a missing, oversized, or unreadable Parquet artifact, or
     /// a fitter rejection.
-    async fn fit(&self, tenant: DataTenantId, claimed: &ClaimedBaseline) -> Result<Value, VerificationError> {
+    async fn fit(
+        &self,
+        tenant: DataTenantId,
+        claimed: &ClaimedBaseline,
+    ) -> Result<Value, VerificationError> {
         let (spec, path) = self.resolve(tenant, claimed).await?;
         let bytes = self
             .storage
@@ -264,10 +276,14 @@ impl BaselineFitter {
             .await
             .map_err(|error| unavailable(error.to_string()))?;
         let Spec::Verifier(verifier) = verifier.spec else {
-            return Err(unavailable("the baseline owner is not a Verifier".to_owned()));
+            return Err(unavailable(
+                "the baseline owner is not a Verifier".to_owned(),
+            ));
         };
         let VerifierImplementation::Drift(spec) = verifier.implementation else {
-            return Err(unavailable("the baseline owner is not a Drift Verifier".to_owned()));
+            return Err(unavailable(
+                "the baseline owner is not a Drift Verifier".to_owned(),
+            ));
         };
         let data = get_card_by_uid(&mut conn, &claimed.data_card_uid)
             .await

@@ -11,9 +11,9 @@ mod client;
 #[cfg(feature = "python")]
 mod observe;
 #[cfg(feature = "python")]
-mod state;
-#[cfg(feature = "python")]
 mod operators;
+#[cfg(feature = "python")]
+mod state;
 #[cfg(feature = "python")]
 mod verification;
 

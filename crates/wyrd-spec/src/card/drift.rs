@@ -307,6 +307,32 @@ pub enum DriftValidationError {
         "Custom profile baseline_value or alert_threshold not finite, or alert_threshold negative"
     )]
     CustomInvalidNumber,
+    /// Custom profile `metric_name` did not name the `Metric` signal.
+    ///
+    /// The run reads exactly one observed `series`; two differing names would
+    /// leave it ambiguous which one the Verifier judges.
+    #[error("Custom profile metric_name {profile} does not match signal name {signal}")]
+    CustomMetricNameMismatch {
+        /// Authored `signal.name`.
+        signal: String,
+        /// Authored `profile.metric_name`.
+        profile: String,
+    },
+    /// Custom metric name is not a valid feature name.
+    ///
+    /// Observations store each metric as a `FeatureName` series, so a name
+    /// outside that grammar could never match a stored row.
+    #[error("Custom metric name {name} is not a valid feature name")]
+    CustomMetricNameInvalid {
+        /// Rejected metric name.
+        name: String,
+    },
+    /// A PSI categorical feature is not one of the signal's features.
+    #[error("PSI categorical feature {feature} is not a signal feature")]
+    PsiCategoricalFeatureUnknown {
+        /// Categorical feature absent from `signal.features`.
+        feature: String,
+    },
 }
 
 impl DriftMethod {
@@ -381,6 +407,15 @@ impl DriftValidationError {
             Self::CustomInvalidNumber => {
                 json!({ "fields": ["profile.baseline_value", "profile.alert_threshold"], "expected": "finite values and alert_threshold >= 0" })
             }
+            Self::CustomMetricNameMismatch { signal, profile } => {
+                json!({ "fields": ["signal.name", "profile.metric_name"], "signal": signal, "profile": profile })
+            }
+            Self::CustomMetricNameInvalid { name } => {
+                json!({ "field": "profile.metric_name", "got": name, "expected": "feature name" })
+            }
+            Self::PsiCategoricalFeatureUnknown { feature } => {
+                json!({ "field": "profile.categorical_features", "unknown": feature })
+            }
         }
     }
 }
@@ -435,8 +470,54 @@ impl DriftSpec {
         validate_profile_presence(self.method, self.profile.as_ref())?;
         if let Some(profile) = &self.profile {
             validate_profile(profile)?;
+            validate_signal_profile(&self.signal, profile)?;
         }
         Ok(())
+    }
+}
+
+/// Enforce the invariants that span the signal and its profile.
+///
+/// A Custom run reads the single series its `Metric` signal names, so the
+/// profile must name the same metric and that name must be a storable
+/// `FeatureName`. A PSI categorical feature must be one of the fitted
+/// Distribution features; otherwise the profile would declare a column the
+/// fitter never reads.
+///
+/// # Errors
+/// Returns [`DriftValidationError::CustomMetricNameMismatch`],
+/// [`DriftValidationError::CustomMetricNameInvalid`], or
+/// [`DriftValidationError::PsiCategoricalFeatureUnknown`].
+fn validate_signal_profile(
+    signal: &DriftSignal,
+    profile: &DriftProfile,
+) -> Result<(), DriftValidationError> {
+    match (signal, profile) {
+        (DriftSignal::Metric { name }, DriftProfile::Custom(custom)) => {
+            if *name != custom.metric_name {
+                return Err(DriftValidationError::CustomMetricNameMismatch {
+                    signal: name.clone(),
+                    profile: custom.metric_name.clone(),
+                });
+            }
+            FeatureName::new(name.as_str()).map_err(|_| {
+                DriftValidationError::CustomMetricNameInvalid { name: name.clone() }
+            })?;
+            Ok(())
+        }
+        (DriftSignal::Distribution { features, .. }, DriftProfile::Psi(psi)) => {
+            match psi
+                .categorical_features
+                .iter()
+                .find(|feature| !features.contains(feature))
+            {
+                Some(feature) => Err(DriftValidationError::PsiCategoricalFeatureUnknown {
+                    feature: feature.to_string(),
+                }),
+                None => Ok(()),
+            }
+        }
+        _ => Ok(()),
     }
 }
 

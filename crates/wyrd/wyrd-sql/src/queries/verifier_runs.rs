@@ -553,7 +553,7 @@ pub struct ScheduleTick {
 /// Only [`VerifierRunQueue::claim`] mints one, so a settlement can only be
 /// attempted by a worker that actually claimed the run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LeaseToken(Uuid);
+pub struct LeaseToken(pub(crate) Uuid);
 
 /// The identity a runner settles a claimed run with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -641,7 +641,7 @@ impl TerminalStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunRetryPolicy {
     /// Total attempts, including the first.
-    max_attempts: i32,
+    pub(crate) max_attempts: i32,
     /// Delay after the first failed attempt; doubles after each later one.
     base_delay: Duration,
     /// Ceiling on any single delay.
@@ -1591,7 +1591,7 @@ impl DispatchRow {
 }
 
 /// Map a fenced update's row count to its settlement outcome.
-fn settlement(rows_affected: u64) -> Settlement {
+pub(crate) fn settlement(rows_affected: u64) -> Settlement {
     if rows_affected == 0 {
         Settlement::StaleLease
     } else {
@@ -1603,7 +1603,7 @@ fn settlement(rows_affected: u64) -> Settlement {
 ///
 /// # Errors
 /// Returns [`SqlxError::Decode`] wrapping `value`'s error.
-fn stored<T, E>(value: Result<T, E>) -> Result<T, SqlxError>
+pub(crate) fn stored<T, E>(value: Result<T, E>) -> Result<T, SqlxError>
 where
     E: StdError + Send + Sync + 'static,
 {

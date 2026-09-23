@@ -2380,6 +2380,71 @@ mod drift_validation_tests {
         assert!(matches!(err, DriftValidationError::CustomInvalidNumber));
     }
 
+    /// Reject a Custom profile whose metric differs from the Metric signal.
+    #[test]
+    fn rejects_custom_profile_naming_another_metric() {
+        let mut profile = custom_profile();
+        profile.metric_name = "tokens".to_string();
+
+        let err = DriftSpec::new(
+            DriftMethod::Custom,
+            metric_signal(),
+            DriftCondition::Statistical,
+            Some(DriftProfile::Custom(profile)),
+            None,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            DriftValidationError::CustomMetricNameMismatch { .. }
+        ));
+    }
+
+    /// Reject a Custom metric name that no observed series could carry.
+    #[test]
+    fn rejects_custom_metric_name_outside_the_feature_grammar() {
+        let mut profile = custom_profile();
+        profile.metric_name = "bad name!".to_string();
+
+        let err = DriftSpec::new(
+            DriftMethod::Custom,
+            DriftSignal::Metric {
+                name: "bad name!".to_string(),
+            },
+            DriftCondition::Statistical,
+            Some(DriftProfile::Custom(profile)),
+            None,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            DriftValidationError::CustomMetricNameInvalid { .. }
+        ));
+    }
+
+    /// Reject a PSI categorical feature the Distribution signal does not fit.
+    #[test]
+    fn rejects_psi_categorical_feature_outside_the_signal() {
+        let mut profile = psi_profile();
+        profile.categorical_features = vec![FeatureName::new("feature_b").expect("valid feature")];
+
+        let err = DriftSpec::new(
+            DriftMethod::Psi,
+            distribution_signal(),
+            DriftCondition::Statistical,
+            Some(DriftProfile::Psi(profile)),
+            None,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            DriftValidationError::PsiCategoricalFeatureUnknown { .. }
+        ));
+    }
+
     /// Route a signal/method mismatch to its dedicated catalog code.
     #[test]
     fn signal_method_mismatch_routes_to_dedicated_catalog_code() {

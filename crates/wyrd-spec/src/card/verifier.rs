@@ -22,7 +22,8 @@ use crate::card::eval::EvalSpec;
 use crate::card::operator::OperatorSpec;
 use crate::card::trigger::TriggerSpec;
 use crate::ids::BindingId;
-use crate::reference::{InlineableRef, Ref};
+use crate::reference::{CardRef, InlineableRef, Ref};
+use crate::verification::VerificationError;
 
 /// Verifier Card spec body.
 ///
@@ -207,6 +208,87 @@ pub struct VerificationStatus {
     /// ordered by identity so reordering authored bindings changes nothing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub binding_ids: Vec<BindingId>,
+    /// Fitted-baseline readiness of a PSI or SPC Drift Verifier Card version.
+    ///
+    /// Absent on every other Card, including a Custom Drift Verifier, which
+    /// scores its authored scalar baseline and is ready without fitting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<DriftBaselineStatus>,
+}
+
+impl VerificationStatus {
+    /// Build the status a Card read serves, or `None` when it has nothing to report.
+    #[must_use]
+    pub fn derived(
+        binding_ids: Vec<BindingId>,
+        baseline: Option<DriftBaselineStatus>,
+    ) -> Option<Self> {
+        (!binding_ids.is_empty() || baseline.is_some()).then_some(Self {
+            binding_ids,
+            baseline,
+        })
+    }
+}
+
+/// Lifecycle of one PSI or SPC Verifier's server-fitted baseline.
+///
+/// Registration creates it `pending`; the fitter claims it `building` and
+/// settles it `ready` with the persisted fitted profile or `failed` with a
+/// structured error. A failed fit is retried through the same record while
+/// attempts remain, so `failed` is visible without being necessarily final.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum DriftBaselineState {
+    /// Registered and waiting for the fitter.
+    Pending,
+    /// Claimed by a fitter that is reading and fitting the baseline Data.
+    Building,
+    /// Fitted and persisted; runs may start.
+    Ready,
+    /// The last fit attempt failed; see the structured error.
+    Failed,
+}
+
+impl DriftBaselineState {
+    /// Stored and wire value of this state.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Building => "building",
+            Self::Ready => "ready",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// Decode a stored state value, or `None` outside the closed set.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "building" => Some(Self::Building),
+            "ready" => Some(Self::Ready),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// Server-derived fitted-baseline status of a PSI or SPC Drift Verifier.
+///
+/// Served on `card.status.verification.baseline`; it never mutates the
+/// authored spec.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct DriftBaselineStatus {
+    /// Current fit lifecycle state.
+    pub state: DriftBaselineState,
+    /// Exact baseline Data Card the profile is fitted from, UID-pinned.
+    pub data: CardRef,
+    /// Structured error of the last failed fit attempt, when one failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<VerificationError>,
 }
 
 /// One inline declaration attaching a Verifier to its containing subject.

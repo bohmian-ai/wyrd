@@ -97,6 +97,8 @@ jobs:
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
 
       - name: Install system tools
         run: sudo apt-get update && sudo apt-get install -y ripgrep libcurl4-openssl-dev pkg-config
@@ -106,7 +108,8 @@ jobs:
 
       - name: Run selected CI lane
         env:
-          RUST_LOG: warn,vala_bifrost_redux::oracle=debug
+          NEXTEST_TEST_THREADS: "2"
+          RUST_LOG: info,vala_bifrost_redux::oracle=debug
         run: |
           if [[ "${{ needs.changes.outputs.full_gate }}" == "true" ]]; then
             mise run gate

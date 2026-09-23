@@ -5,13 +5,13 @@
 //! implementation spec and returns an [`EngineOutcome`]. Arms never read or
 //! write run rows, claim work, publish results, or create dispatches; the
 //! runner turns every outcome into exactly one fenced lifecycle transition.
-//! Drift and Eval land by replacing the body of [`drift`] or [`eval`] only.
+//! Drift runs through [`DriftEngine`](super::drift::DriftEngine); Eval lands
+//! by replacing the body of [`eval`] only.
 
 use std::future::Future;
 
 use vala_drift::{DriftReport, DriftVerdict};
 use vala_eval::executor::EvalReport;
-use wyrd_spec::card::drift::DriftSpec;
 use wyrd_spec::card::eval::EvalSpec;
 use wyrd_spec::verification::{VerificationError, VerificationVerdict};
 use wyrd_sql::queries::verifier_runs::{ClaimedRun, TerminalStatus};
@@ -97,19 +97,6 @@ impl EngineOutcome {
             },
         )
     }
-}
-
-/// Drift arm of the closed Verifier dispatch.
-///
-/// Receives the claimed run (its frozen window, subject, and identities) and
-/// the exact Verifier's typed Drift spec. Until the production Drift engine
-/// ships this returns the terminal `implementation_unavailable` outcome; it
-/// never fabricates a verdict.
-pub fn drift(
-    _run: &ClaimedRun,
-    _spec: &DriftSpec,
-) -> impl Future<Output = EngineOutcome> + Send + 'static {
-    std::future::ready(EngineOutcome::implementation_unavailable("drift"))
 }
 
 /// Eval arm of the closed Verifier dispatch.

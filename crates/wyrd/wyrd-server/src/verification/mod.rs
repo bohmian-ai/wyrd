@@ -9,6 +9,7 @@
 //! runtime holds no process-local registry, so any process may crash and
 //! another reclaims its leases.
 
+pub mod drift;
 pub mod engines;
 pub mod health;
 pub mod permits;
@@ -29,6 +30,7 @@ use wyrd_sql::queries::verifier_runs::VerifierRunQueue;
 
 use crate::state::AppState;
 
+use self::drift::DriftEngine;
 use self::health::{RuntimeCapability, VerificationHealth};
 use self::permits::VerifierPermits;
 #[cfg(feature = "test-support")]
@@ -362,6 +364,14 @@ impl VerificationRuntimeBuilder<'_> {
                     queue,
                     VerifierPermits::new(self.limits.global_permits, self.limits.tenant_permits),
                     publisher,
+                    DriftEngine::new(
+                        postgres.clone(),
+                        self.state
+                            .bifrost
+                            .oracle()
+                            .map(|oracle| Arc::clone(oracle.engine())),
+                        self.limits.execution_timeout,
+                    ),
                     self.limits,
                 );
                 #[cfg(feature = "test-support")]

@@ -40,6 +40,7 @@ use wyrd_sql::{OperatorPool, SqlError, WyrdPostgres};
 #[cfg(feature = "test-support")]
 use super::CapabilityCrash;
 use super::RuntimeLimits;
+use super::drift::DriftEngine;
 use super::engines::{self, EngineOutcome, VerifierReport};
 #[cfg(feature = "test-support")]
 use super::health::RuntimeCapability;
@@ -91,6 +92,8 @@ pub struct VerifierRunner {
     permits: VerifierPermits,
     /// Remote result publication.
     publisher: ResultPublisher,
+    /// The Drift arm's engine.
+    drift: DriftEngine,
     /// Runtime bounds.
     limits: RuntimeLimits,
     /// Test-only scripted engine outcomes.
@@ -115,6 +118,7 @@ impl VerifierRunner {
         queue: VerifierRunQueue,
         permits: VerifierPermits,
         publisher: ResultPublisher,
+        drift: DriftEngine,
         limits: RuntimeLimits,
     ) -> Self {
         Self {
@@ -123,6 +127,7 @@ impl VerifierRunner {
             queue,
             permits,
             publisher,
+            drift,
             limits,
             #[cfg(feature = "test-support")]
             script: None,
@@ -378,7 +383,7 @@ impl VerifierRunner {
         let started_at = Utc::now();
         let outcome = match tokio::time::timeout(
             self.limits.execution_timeout,
-            self.dispatch(run, &implementation),
+            self.dispatch(tenant, run, &verifier, &implementation),
         )
         .await
         {
@@ -448,10 +453,14 @@ impl VerifierRunner {
 
     /// The one closed dispatch over Verifier implementations.
     ///
-    /// Under `test-support` a scripted outcome, when queued, replaces the arm.
+    /// Drift executes through the runner's [`DriftEngine`] for `tenant`,
+    /// reading as the SYSTEM principal scoped to the exact `verifier`. Under
+    /// `test-support` a scripted outcome, when queued, replaces the arm.
     async fn dispatch(
         &self,
+        tenant: DataTenantId,
         run: &ClaimedRun,
+        verifier: &CardRef,
         implementation: &VerifierImplementation,
     ) -> EngineOutcome {
         #[cfg(feature = "test-support")]
@@ -461,7 +470,9 @@ impl VerifierRunner {
             return outcome;
         }
         match implementation {
-            VerifierImplementation::Drift(spec) => engines::drift(run, spec).await,
+            VerifierImplementation::Drift(spec) => {
+                self.drift.verify(tenant, verifier, run, spec).await
+            }
             VerifierImplementation::Eval(spec) => engines::eval(run, spec).await,
         }
     }

@@ -17,7 +17,10 @@ wyrd-client = { workspace = true }
 
 [dev-dependencies]
 workspace-hack.workspace = true
+arrow = { workspace = true }
 base64 = { workspace = true }
+chrono = { workspace = true }
+parquet = { workspace = true, features = ["arrow"] }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

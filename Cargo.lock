@@ -11725,7 +11725,10 @@ dependencies = [
 name = "wyrd-sdk-rust"
 version = "0.0.1"
 dependencies = [
+ "arrow",
  "base64 0.22.1",
+ "chrono",
+ "parquet",
  "secrecy",
  "serde",
  "serde_json",

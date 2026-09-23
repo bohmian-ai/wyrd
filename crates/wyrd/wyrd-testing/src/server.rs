@@ -155,8 +155,9 @@ use wyrd_spec::request_id::RequestId;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
     grant_role_to_service_account, grant_role_to_user, insert_api_key, insert_role,
-    insert_service_account, insert_user, revoke_role_from_service_account, revoke_role_from_user,
-    role_by_name, trusted_issuer_by_url, workload_binding_by_subject,
+    insert_service_account, insert_user, provision_system_principal,
+    revoke_role_from_service_account, revoke_role_from_user, role_by_name, trusted_issuer_by_url,
+    workload_binding_by_subject,
 };
 use wyrd_storage::{BackendConfig, StorageSettings};
 
@@ -2894,6 +2895,7 @@ impl WyrdTestServer {
         seed_builtin_roles_for_tenant(&mut conn, tenant_id)
             .await
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        provision_system_principal(&mut conn).await.map_err(sql)?;
         conn.commit().await.map_err(sql)?;
         Ok(tenant_id)
     }
@@ -4181,6 +4183,7 @@ impl WyrdTestServerBuilder {
         seed_builtin_roles_for_tenant(&mut conn, tenant_id)
             .await
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        provision_system_principal(&mut conn).await.map_err(sql)?;
         conn.commit().await.map_err(sql)?;
 
         let (storage_root, storage) = if let Some(handle) = self.storage_handle.take() {

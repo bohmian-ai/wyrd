@@ -343,6 +343,14 @@ hide = true
 description = "wyrd-sdk-rust observe_run binary, whole"
 run = "cargo nextest run --locked -p wyrd-sdk-rust --test observe_run -P journey --run-ignored=all"
 
+[tasks."test:bifrost:journey:drift"]
+description = "Tier-1 journeys: PSI, SPC, and Custom Drift Verifiers fitted, scored through Oracle, and dispatched"
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:bifrost:journey:drift:inner'"
+[tasks."test:bifrost:journey:drift:inner"]
+hide = true
+description = "wyrd-sdk-rust drift_verification binary, whole"
+run = "cargo nextest run --locked -p wyrd-sdk-rust --test drift_verification -P journey --run-ignored=all"
+
 [tasks."test:bifrost:journey:forge"]
 description = "Tier-1 journeys: compaction, maintenance, publication recovery, lease reclaim"
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:bifrost:journey:forge:inner'"

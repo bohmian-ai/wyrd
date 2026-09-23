@@ -19,9 +19,8 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vala_drift::{DriftReport, DriftVerdict, FeatureDriftReport};
-use wyrd_server::verification::engines::{
-    EngineOutcome, IMPLEMENTATION_UNAVAILABLE, VerifierReport,
-};
+use wyrd_server::verification::drift::DRIFT_INVALID;
+use wyrd_server::verification::engines::{EngineOutcome, VerifierReport};
 use wyrd_server::verification::health::RuntimeCapability;
 use wyrd_server::verification::publisher::{PublicationFault, SentBatch};
 use wyrd_server::verification::runner::{EngineScript, RESULT_PUBLICATION_FAILED};
@@ -654,19 +653,20 @@ async fn unscored_drift_publishes_only_the_summary() {
     runtime.stop().await;
 }
 
-/// Without a shipped engine the real Drift arm settles the run `errored`
-/// with `implementation_unavailable` and publishes nothing.
+/// Without a scripted outcome the real Drift engine refuses the fixture
+/// Verifier, which declares no profile, settling the run `errored` with
+/// `drift_invalid` and publishing nothing.
 ///
 /// # Panics
 /// Panics when the run is not errored with that code or anything is written.
 #[tokio::test]
-async fn unavailable_engine_errors_without_publishing() {
+async fn unscorable_verifier_errors_without_publishing() {
     let harness = Harness::start().await;
     let runtime = harness.spawn(Harness::limits(), &EngineScript::default());
     let run = harness.enqueue().await;
 
     let row = harness.wait_run(run, status("errored")).await;
-    assert_eq!(row.error_code.as_deref(), Some(IMPLEMENTATION_UNAVAILABLE));
+    assert_eq!(row.error_code.as_deref(), Some(DRIFT_INVALID));
     assert_eq!(row.result_id, None, "no verdict is fabricated");
     assert!(harness.writes().await.is_empty());
     runtime.stop().await;

@@ -6,13 +6,13 @@ metadata:
   space: default
 spec:
   interface:
-    kind: Custom
+    kind: Parquet
     meta:
-      loader_module: fixture
-      loader_class: Data
-      extra: {}
+      compression: Snappy
   schema:
-    columns: []
+    columns:
+      - name: feature
+        dtype: float64
   stats:
     byte_count: 14
     sha256: db622818c69fb90f249d5d1b35b8a76a75555fc9114b4cb36d41a05fd0526aa8

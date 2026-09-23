@@ -17,7 +17,11 @@ else
     echo "or set WYRD_CHANGE_BASE and WYRD_CHANGE_HEAD" >&2
     exit 2
   fi
-  git diff --name-only "$base" "$head" > "$changed_files"
+  if [[ "$base" =~ ^0+$ ]]; then
+    git ls-tree -r --name-only "$head" > "$changed_files"
+  else
+    git diff --name-only "$base" "$head" > "$changed_files"
+  fi
 fi
 
 set_output() {

@@ -146,6 +146,17 @@ check_selection "planning-only change selects nothing" "any=true unclassified=fa
 check_selection "client storage selects storage" "storage=true" \
   "crates/shared/wyrd-client/src/storage/mod.rs"
 
+zero_outputs="$(mktemp)"
+GITHUB_OUTPUT="$zero_outputs" bash "$DETECT" "$(printf '%040d' 0)" "$(git rev-parse HEAD)" > /dev/null
+if grep -qx 'full_gate=true' "$zero_outputs" && grep -qx 'any=true' "$zero_outputs"; then
+  echo "OK  first push selects the full gate"
+  PASS=$((PASS+1))
+else
+  echo "FAIL first push must select the full gate"
+  FAIL=$((FAIL+1))
+fi
+rm -f "$zero_outputs"
+
 # The Linux ci job owns a selected change: a full-gate change runs only gate,
 # which already reaches the Rust tests, and any other change runs check and
 # then test:rust. rust-compat keeps Linux excluded so no Rust lane repeats.

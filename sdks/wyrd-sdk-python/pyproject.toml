@@ -6,6 +6,7 @@ build-backend = "maturin"
 name = "wyrd"
 version = "0.0.1"
 description = "Python bindings for Wyrd"
+readme = { text = "Python SDK for Wyrd verification and assurance.", content-type = "text/markdown" }
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Wyrd contributors" }]

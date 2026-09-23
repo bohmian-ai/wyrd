@@ -503,7 +503,7 @@ mod tests {
 
         // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
         unsafe {
-            std::env::set_var("HOME", &tmp);
+            std::env::set_var("WYRD_CONFIG_HOME", tmp.join(".config/wyrd"));
             std::env::remove_var("WYRD_API_KEY");
             std::env::remove_var("WYRD_ACCESS_TOKEN");
             std::env::remove_var("WYRD_WORKLOAD_TOKEN");
@@ -515,7 +515,7 @@ mod tests {
 
         // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
         unsafe {
-            std::env::remove_var("HOME");
+            std::env::remove_var("WYRD_CONFIG_HOME");
         }
         fs::remove_dir_all(&tmp).ok();
 

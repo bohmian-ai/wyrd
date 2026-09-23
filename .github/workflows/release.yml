@@ -199,7 +199,7 @@ jobs:
         shell: bash
         run: |
           pip install wyrd --no-deps --no-index --force-reinstall --find-links dist
-          python -c "import wyrd; print(wyrd.__version__)"
+          python -c "import wyrd; from importlib.metadata import version; print(version('wyrd'))"
 
   publish-pypi:
     name: publish python

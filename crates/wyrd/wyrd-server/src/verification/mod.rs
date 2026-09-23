@@ -1,8 +1,8 @@
-//! The supervised verification runtime: scheduler, Verifier runner, and the
-//! Operator-worker slot.
+//! The supervised verification runtime: scheduler, Verifier runner, Drift
+//! baseline fitter, and the Operator-worker slot.
 //!
 //! [`VerificationRuntime`] is the one owner `BoundServer::run` spawns. It
-//! composes up to three capability tasks, restarts any that exits or panics
+//! composes up to four capability tasks, restarts any that exits or panics
 //! while the server is running, publishes their liveness through
 //! [`VerificationHealth`], and on shutdown lets each drain before returning.
 //! The durable queue in `wyrd.verifier_runs` is the only record of work; the
@@ -11,6 +11,7 @@
 
 pub mod drift;
 pub mod engines;
+pub mod fitter;
 pub mod health;
 pub mod permits;
 pub mod publisher;
@@ -31,6 +32,7 @@ use wyrd_sql::queries::verifier_runs::VerifierRunQueue;
 use crate::state::AppState;
 
 use self::drift::DriftEngine;
+use self::fitter::BaselineFitter;
 use self::health::{RuntimeCapability, VerificationHealth};
 use self::permits::VerifierPermits;
 #[cfg(feature = "test-support")]
@@ -101,7 +103,7 @@ impl RuntimeLimits {
 #[derive(Debug, Clone, Default)]
 pub struct CapabilityCrash {
     /// One armed flag per capability slot.
-    armed: Arc<[AtomicBool; 3]>,
+    armed: Arc<[AtomicBool; 4]>,
 }
 
 #[cfg(feature = "test-support")]
@@ -128,6 +130,8 @@ enum Capability {
     Scheduler(Arc<VerificationScheduler>),
     /// The Verifier runner.
     Runner(Arc<VerifierRunner>),
+    /// The Drift baseline fitter.
+    Fitter(Arc<BaselineFitter>),
 }
 
 impl Capability {
@@ -136,6 +140,7 @@ impl Capability {
         match self {
             Self::Scheduler(_) => RuntimeCapability::Scheduler,
             Self::Runner(_) => RuntimeCapability::Runner,
+            Self::Fitter(_) => RuntimeCapability::Fitter,
         }
     }
 
@@ -145,6 +150,7 @@ impl Capability {
         let handle = match self {
             Self::Scheduler(scheduler) => tasks.spawn(Arc::clone(scheduler).run(stop)),
             Self::Runner(runner) => tasks.spawn(Arc::clone(runner).run(stop)),
+            Self::Fitter(fitter) => tasks.spawn(Arc::clone(fitter).run(stop)),
         };
         handle.id()
     }
@@ -326,8 +332,11 @@ impl VerificationRuntimeBuilder<'_> {
     /// Compose the runtime, or `None` when this process cannot run any
     /// capability.
     ///
-    /// The scheduler needs the operator pool. The runner additionally needs
-    /// the tenant token issuer and an ingest endpoint; without them it is not
+    /// The scheduler and the Drift baseline fitter need the operator pool;
+    /// the fitter also reads Data Card artifacts from server storage. The
+    /// runner additionally needs the tenant token issuer and an ingest
+    /// endpoint, and runs Drift through this process's Oracle when it has
+    /// one; without the issuer or endpoint it is not
     /// composed and therefore not required, so health is not degraded by an
     /// intentionally absent capability. Every composed capability is marked
     /// required on the shared health.
@@ -349,7 +358,21 @@ impl VerificationRuntimeBuilder<'_> {
         if let Some(crash) = &self.crash {
             scheduler = scheduler.with_crash(crash.clone());
         }
-        let mut capabilities = vec![Capability::Scheduler(Arc::new(scheduler))];
+        let mut fitter = BaselineFitter::new(
+            postgres.clone(),
+            operator.clone(),
+            Arc::clone(&self.state.storage),
+            self.limits.lease,
+            self.limits.poll_interval,
+        );
+        #[cfg(feature = "test-support")]
+        if let Some(crash) = &self.crash {
+            fitter = fitter.with_crash(crash.clone());
+        }
+        let mut capabilities = vec![
+            Capability::Scheduler(Arc::new(scheduler)),
+            Capability::Fitter(Arc::new(fitter)),
+        ];
         match (self.state.auth.tenant_issuer(), self.ingest_endpoint) {
             (Some(issuer), Some(endpoint)) => {
                 let publisher = ResultPublisher::new(postgres.clone(), issuer, endpoint);

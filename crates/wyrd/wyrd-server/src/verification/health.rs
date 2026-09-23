@@ -16,11 +16,18 @@ pub enum RuntimeCapability {
     Runner,
     /// Delivers Operator dispatches; composed by a later change.
     OperatorWorker,
+    /// Fits pending Drift baselines from their Data Card artifacts.
+    Fitter,
 }
 
 impl RuntimeCapability {
     /// Every capability, in slot order.
-    pub const ALL: [Self; 3] = [Self::Scheduler, Self::Runner, Self::OperatorWorker];
+    pub const ALL: [Self; 4] = [
+        Self::Scheduler,
+        Self::Runner,
+        Self::OperatorWorker,
+        Self::Fitter,
+    ];
 
     /// Stable telemetry label.
     #[must_use]
@@ -29,6 +36,7 @@ impl RuntimeCapability {
             Self::Scheduler => "scheduler",
             Self::Runner => "runner",
             Self::OperatorWorker => "operator_worker",
+            Self::Fitter => "fitter",
         }
     }
 
@@ -38,6 +46,7 @@ impl RuntimeCapability {
             Self::Scheduler => 0,
             Self::Runner => 1,
             Self::OperatorWorker => 2,
+            Self::Fitter => 3,
         }
     }
 }
@@ -50,9 +59,9 @@ impl RuntimeCapability {
 #[derive(Debug, Default)]
 pub struct VerificationHealth {
     /// Whether this process composed each capability.
-    required: [AtomicBool; 3],
+    required: [AtomicBool; 4],
     /// Whether each capability's task is currently running.
-    up: [AtomicBool; 3],
+    up: [AtomicBool; 4],
 }
 
 impl VerificationHealth {

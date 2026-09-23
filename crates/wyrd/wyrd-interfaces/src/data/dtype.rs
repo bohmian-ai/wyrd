@@ -341,6 +341,22 @@ pub fn is_framework_class(
     module_name: &str,
     class_name: &str,
 ) -> WyrdPyResult<bool> {
+    let root = module_name.split('.').next().unwrap_or(module_name);
+    let mut belongs_to_framework = false;
+    for base in data.get_type().getattr("__mro__")?.try_iter()? {
+        let module: String = base?.getattr("__module__")?.extract()?;
+        if module == root
+            || module
+                .strip_prefix(root)
+                .is_some_and(|tail| tail.starts_with('.'))
+        {
+            belongs_to_framework = true;
+            break;
+        }
+    }
+    if !belongs_to_framework {
+        return Ok(false);
+    }
     let module = match py.import(module_name) {
         Ok(module) => module,
         Err(error) if error.is_instance_of::<PyModuleNotFoundError>(py) => return Ok(false),

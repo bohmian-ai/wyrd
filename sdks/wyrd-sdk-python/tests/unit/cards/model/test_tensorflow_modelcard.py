@@ -63,7 +63,9 @@ def test_tensorflow_artifact_path_modelcard_save_and_load(tmp_path: Path) -> Non
         metadata=model_metadata("regression"),
     ).save(source)
 
-    card = ModelCard(source / "model.keras", metadata=model_metadata("regression"))
+    interface = TensorflowInterface(save_format="keras")
+    interface.load(source)
+    card = ModelCard(interface, metadata=model_metadata("regression"))
     path = tmp_path / "tensorflow-from-path"
     card.save(path)
     restored = ModelCard.model_validate_json((path / "card.json").read_text())

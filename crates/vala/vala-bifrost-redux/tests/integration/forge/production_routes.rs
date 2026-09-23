@@ -165,7 +165,7 @@ async fn orphan_cleanup_is_last_and_uses_one_demand_cutoff() {
 
     // Consume the handoff exactly the way production does, so the third pass
     // has neither a handoff nor a planner candidate left.
-    enqueue(&table.fixture, &cleanup_choice, observed).await;
+    enqueue(&table.fixture, &cleanup_choice, observed, Uuid::now_v7()).await;
 
     // Pass three: the clock moves after the demand is observed, and the plan
     // must not move with it.
@@ -209,7 +209,32 @@ async fn orphan_cleanup_is_last_and_uses_one_demand_cutoff() {
     assert_eq!(replanned.plan.inputs, orphan.plan.inputs);
 }
 
+/// Reads the settled states of every promotion bound to one base snapshot.
+///
+/// # Panics
+///
+/// Panics when the diagnostic task read fails.
+async fn promotions_on_snapshot(
+    fixture: &PromotionIntegrationFixture,
+    base_snapshot_id: i64,
+) -> Vec<String> {
+    fixture
+        .forge_tasks()
+        .await
+        .into_iter()
+        .filter(|task| task.base_snapshot_id == base_snapshot_id)
+        .filter(|task| task.strategy == ForgeTaskStrategy::ScribePromotion.as_str())
+        .map(|task| task.state)
+        .collect()
+}
+
 /// Enqueues one arbitrated task through the production transaction.
+///
+/// `owner` is the scheduler identity the enqueue takes the singleton fence
+/// under. A caller that drives its own [`ForgeScheduler`] passes that
+/// scheduler's owner, because the singleton lease admits only one identity at a
+/// time: taking it under a fresh owner leaves the caller's scheduler on standby
+/// for the remaining lease, planning nothing it asks for afterwards.
 ///
 /// # Panics
 ///
@@ -218,13 +243,13 @@ async fn enqueue(
     fixture: &PromotionIntegrationFixture,
     task: &NewForgeTask,
     observed: chrono::DateTime<Utc>,
+    owner: Uuid,
 ) {
     let tasks = ForgeTasks::new(fixture.operator_pool.clone());
     sqlx::query("UPDATE vala.forge_scheduler_state SET expires_at = now() - interval '1 hour'")
         .execute(fixture.operator_pool.pool())
         .await
         .expect("the live scheduler fence ages out");
-    let owner = Uuid::now_v7();
     let fence = tasks
         .acquire_scheduler(owner, 30)
         .await
@@ -1772,6 +1797,7 @@ async fn current_snapshot_id(fixture: &PromotionIntegrationFixture) -> i64 {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Postgres, Iceberg, and object storage"]
 async fn a_promotion_planned_in_the_settlement_window_is_superseded() {
+    let _telemetry = ForgeTelemetryCheckpoint::install();
     let fixture = PromotionIntegrationFixture::start("settle_window").await;
     let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
     let forge = fixture.build_forge_for_test(
@@ -1783,9 +1809,14 @@ async fn a_promotion_planned_in_the_settlement_window_is_superseded() {
     );
     let stop = CancellationToken::new();
     let observed = Utc::now();
+    // One scheduler identity owns the singleton planning lease for the whole
+    // scenario. Every pass this test drives, and the mid-scenario enqueue that
+    // takes the fence, run under it, so no phase can find the lease held by a
+    // stranger and return standby instead of planning.
+    let scheduler_owner = Uuid::now_v7();
     // Captured before the promotion runs: once it settles SQL these rows are no
     // longer promotable, so arbitration would produce nothing to rebind.
-    let planned = ForgeScheduler::with_owner_for_test(&forge, Uuid::now_v7())
+    let planned = ForgeScheduler::with_owner_for_test(&forge, scheduler_owner)
         .expect("fixture scheduler")
         .arbitrate_demand_for_test(&demand(&fixture, observed))
         .await
@@ -1794,11 +1825,16 @@ async fn a_promotion_planned_in_the_settlement_window_is_superseded() {
         .find(|task| task.strategy == ForgeTaskStrategy::ScribePromotion)
         .expect("the sealed rows are owed a promotion");
 
-    let mut scheduler = ForgeScheduler::new(&forge).expect("scheduler");
-    scheduler
+    let mut scheduler =
+        ForgeScheduler::with_owner_for_test(&forge, scheduler_owner).expect("scheduler");
+    let discovery = scheduler
         .schedule_once(&stop)
         .await
         .expect("promotion discovery");
+    assert!(
+        !discovery.standby,
+        "this scheduler owns the planning lease for the discovery pass: {discovery:?}"
+    );
     let worker = ForgeWorker::new(
         Arc::clone(&forge),
         ForgeWorkerConfig::default(),
@@ -1822,7 +1858,7 @@ async fn a_promotion_planned_in_the_settlement_window_is_superseded() {
         base_snapshot_id: current_snapshot_id(&fixture).await,
         ..planned
     };
-    enqueue(&fixture, &in_window, observed).await;
+    enqueue(&fixture, &in_window, observed, scheduler_owner).await;
     assert!(
         worker
             .execute_one_for_test(&stop)
@@ -1835,27 +1871,22 @@ async fn a_promotion_planned_in_the_settlement_window_is_superseded() {
         promoted,
         "a superseded promotion appends no object a second time"
     );
-    let retired = fixture
-        .forge_tasks()
-        .await
-        .into_iter()
-        .filter(|task| task.base_snapshot_id == in_window.base_snapshot_id)
-        .filter(|task| task.strategy == ForgeTaskStrategy::ScribePromotion.as_str())
-        .collect::<Vec<_>>();
+    let retired = promotions_on_snapshot(&fixture, in_window.base_snapshot_id).await;
     assert_eq!(
-        retired
-            .iter()
-            .map(|task| task.state.as_str())
-            .collect::<Vec<_>>(),
-        vec!["cancelled"],
-        "the stale task is retired as cancelled, not failed: {retired:?}"
+        retired,
+        vec!["cancelled".to_owned()],
+        "the stale task is retired as cancelled, not failed"
     );
 
     fixture.seal_more(2).await;
-    scheduler
+    let replan = scheduler
         .schedule_once(&stop)
         .await
         .expect("the remaining demand is replanned");
+    assert!(
+        !replan.standby,
+        "this scheduler still owns the planning lease for the replanning pass: {replan:?}"
+    );
     assert!(
         worker
             .execute_one_for_test(&stop)

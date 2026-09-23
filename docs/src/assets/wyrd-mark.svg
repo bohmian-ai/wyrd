@@ -1,6 +1,6 @@
-<!-- Source: crates/wyrd/wyrd-server/wyrd-ui/brand/logo.svg -->
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" role="img" aria-label="Wyrd">
-  <path d="M42 92 L30 92 L6 8 L22 8 Z" fill="#7c3aed"/>
-  <path d="M58 92 L70 92 L94 8 L78 8 Z" fill="#7c3aed"/>
-  <path d="M44 8 h12 v84 h-12 z" fill="#c5f23c"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 100 100" role="img" aria-label="Wyrd">
+  <title>Wyrd</title>
+  <path d="M42 92 L30 92 L6 8 L22 8 Z" fill="#7a8cff" stroke="#0b0c12" stroke-width="2"/>
+  <path d="M58 92 L70 92 L94 8 L78 8 Z" fill="#7a8cff" stroke="#0b0c12" stroke-width="2"/>
+  <path d="M44 8 h12 v84 h-12 z" fill="#c5f23c" stroke="#0b0c12" stroke-width="2"/>
 </svg>

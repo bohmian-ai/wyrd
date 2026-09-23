@@ -1,21 +1,25 @@
+![Wyrd logo](docs/src/assets/wyrd-mark.svg)
+
 # Wyrd
 
 **Open-source verification and assurance infrastructure for AI systems.**
 
-Wyrd verifies that AI services behave as intended from development through
-production.
-
-Teams define expected behavior with typed, versioned contracts. Wyrd observes
-real execution, evaluates it with reusable Verifiers, and preserves the
-resulting evidence through lineage, policy, and audit. It works alongside your
-applications and infrastructure; it does not replace them.
+Wyrd checks whether an AI service behaves as declared. Define the service and
+what you expect, record what happens during real runs, and verify the results
+against that declaration. Wyrd keeps each result tied to the evidence and
+component versions behind it.
 
 [Getting started](docs/src/content/docs/get-started/index.svx) ·
 [Architecture](architecture/wyrd-design.md) ·
 [Release tracker](https://github.com/orgs/bohmian-ai/projects/1) ·
 [Contributing](CONTRIBUTING.md)
 
-## Verify a Pydantic AI service
+**Current status:** A source checkout supports local Card authoring and a
+development server. [Try the current source](#try-the-current-source). The
+verification example below shows the approved `v0.1.0` interface; its
+end-to-end path is still being completed.
+
+## Planned verification workflow: Pydantic AI service
 
 Define the service once. This bundle contains one Agent and its Prompt, an Eval
 Verifier, and the Slack Operator to run when verification fails.
@@ -130,11 +134,11 @@ agent = Agent(
 question = "What is the refund policy?"
 result = agent.run_sync(question)
 
-run = state.run().for_card("support_agent")
-run.observe.eval(
-    SupportExchange(question=question, answer=result.output),
-    session_id="support-session-123",
-)
+with state.run(card="support_agent") as run:
+    run.observe.eval(
+        SupportExchange(question=question, answer=result.output),
+        session_id="support-session-123",
+    )
 state.shutdown()
 ```
 
@@ -142,10 +146,6 @@ Wyrd ties the observation to the exact Service, Agent, Prompt, and Verifier
 versions. The Eval runs asynchronously after the observation is committed. A
 failed verdict is retained as evidence and dispatches the configured Slack
 Operator.
-
-> This is the approved `v0.1.0` verification interface. The end-to-end path is
-> being completed for the first public release; the current runnable source
-> workflow is documented below.
 
 ## Why Wyrd exists
 

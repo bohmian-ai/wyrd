@@ -105,6 +105,8 @@ jobs:
         run: rustup target add wasm32-unknown-unknown
 
       - name: Run selected CI lane
+        env:
+          RUST_LOG: warn,vala_bifrost_redux::oracle=debug
         run: |
           if [[ "${{ needs.changes.outputs.full_gate }}" == "true" ]]; then
             mise run gate

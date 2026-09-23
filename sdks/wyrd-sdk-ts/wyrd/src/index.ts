@@ -942,6 +942,12 @@ export interface CardStatus {
 export interface VerificationStatus {
   /** Stable UUIDv7 binding identities, ordered by identity; omitted when empty. */
   readonly binding_ids?: readonly string[];
+  /** Fitted Drift baseline lifecycle of a Drift Verifier; omitted otherwise. */
+  readonly baseline?: {
+    readonly state: "pending" | "building" | "ready" | "failed";
+    readonly data: CardRef;
+    readonly error?: VerificationError;
+  };
 }
 
 /** Server outcome for one Card in a composite registration. */

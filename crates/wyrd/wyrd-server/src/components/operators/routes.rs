@@ -28,7 +28,11 @@ use crate::state::AppState;
 pub fn operator_connections_router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(create_connection, list_connections))
-        .routes(routes!(get_connection, update_connection, disable_connection))
+        .routes(routes!(
+            get_connection,
+            update_connection,
+            disable_connection
+        ))
 }
 
 /// Decode a JSON body without echoing any of its values.
@@ -76,7 +80,10 @@ pub(crate) fn decode_body<T: DeserializeOwned>(body: &[u8]) -> Result<T, WyrdErr
     ),
     tag = "Operator connections"
 )]
-#[tracing::instrument(skip(state, caller, body), fields(operation = "operator_connection.create"))]
+#[tracing::instrument(
+    skip(state, caller, body),
+    fields(operation = "operator_connection.create")
+)]
 async fn create_connection(
     State(state): State<AppState>,
     caller: Caller,
@@ -194,7 +201,10 @@ async fn get_connection(
     ),
     tag = "Operator connections"
 )]
-#[tracing::instrument(skip(state, caller, body), fields(operation = "operator_connection.update"))]
+#[tracing::instrument(
+    skip(state, caller, body),
+    fields(operation = "operator_connection.update")
+)]
 async fn update_connection(
     State(state): State<AppState>,
     caller: Caller,

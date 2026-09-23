@@ -164,7 +164,8 @@ impl OperatorKeys {
                 let dir = self.config.dir.as_deref().unwrap_or(Path::new("."));
                 let path = dir.join(format!("v{version}"));
                 let location = path.display().to_string();
-                let value = read_owner_only(&path).map_err(|reason| unavailable(location.clone(), reason))?;
+                let value = read_owner_only(&path)
+                    .map_err(|reason| unavailable(location.clone(), reason))?;
                 (location, value)
             }
             OperatorKeySource::Vault => self.vault_key(tenant, version).await?,
@@ -189,7 +190,10 @@ impl OperatorKeys {
             reason,
         };
         let Some(vault) = &self.config.vault else {
-            return Err(unavailable("verification.operator_keys.vault", "not configured".to_owned()));
+            return Err(unavailable(
+                "verification.operator_keys.vault",
+                "not configured".to_owned(),
+            ));
         };
         let location = format!(
             "vault {}/data/{}/{tenant}/{version}",
@@ -217,15 +221,22 @@ impl OperatorKeys {
             .header("X-Vault-Token", token.as_str())
             .send()
             .await
-            .map_err(|error| unavailable(&location, format!("request failed: {}", error.without_url())))?;
+            .map_err(|error| {
+                unavailable(
+                    &location,
+                    format!("request failed: {}", error.without_url()),
+                )
+            })?;
         let status = response.status();
         if !status.is_success() {
             return Err(unavailable(&location, format!("Vault answered {status}")));
         }
-        let body: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|error| unavailable(&location, format!("unreadable response: {}", error.without_url())))?;
+        let body: serde_json::Value = response.json().await.map_err(|error| {
+            unavailable(
+                &location,
+                format!("unreadable response: {}", error.without_url()),
+            )
+        })?;
         let key = body
             .pointer("/data/data/key")
             .and_then(serde_json::Value::as_str)
@@ -475,8 +486,11 @@ mod tests {
     fn write_key(dir: &Path, version: u32, byte: u8) {
         use std::os::unix::fs::PermissionsExt as _;
         let path = dir.join(format!("v{version}"));
-        std::fs::write(&path, base64::engine::general_purpose::STANDARD.encode([byte; 32]))
-            .expect("key writes");
+        std::fs::write(
+            &path,
+            base64::engine::general_purpose::STANDARD.encode([byte; 32]),
+        )
+        .expect("key writes");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
     }
 
@@ -485,7 +499,11 @@ mod tests {
     fn decode_key_requires_32_base64_bytes() {
         let engine = base64::engine::general_purpose::STANDARD;
         assert!(decode_key(&format!("{}\n", engine.encode([1_u8; 32]))).is_ok());
-        assert!(decode_key(&engine.encode([1_u8; 31])).unwrap_err().contains("31 bytes"));
+        assert!(
+            decode_key(&engine.encode([1_u8; 31]))
+                .unwrap_err()
+                .contains("31 bytes")
+        );
         assert!(decode_key("not base64!").is_err());
     }
 
@@ -522,7 +540,10 @@ mod tests {
             sealed,
             secret_version: 1,
         };
-        assert_eq!(keys.open(tenant, &stored).await.expect("opens").as_slice(), b"secret");
+        assert_eq!(
+            keys.open(tenant, &stored).await.expect("opens").as_slice(),
+            b"secret"
+        );
         let other = DataTenantId::new(Uuid::now_v7()).expect("tenant");
         assert!(matches!(
             keys.open(other, &stored).await,
@@ -532,14 +553,23 @@ mod tests {
             secret_version: 2,
             ..stored.clone()
         };
-        assert!(keys.open(tenant, &moved).await.is_err(), "secret version is authenticated");
+        assert!(
+            keys.open(tenant, &moved).await.is_err(),
+            "secret version is authenticated"
+        );
 
-        std::fs::set_permissions(dir.path().join("v1"), std::fs::Permissions::from_mode(0o640))
-            .expect("chmod");
+        std::fs::set_permissions(
+            dir.path().join("v1"),
+            std::fs::Permissions::from_mode(0o640),
+        )
+        .expect("chmod");
         let loose = keys.key(tenant, 1).await.unwrap_err().to_string();
         assert!(loose.contains("chmod 600"), "{loose}");
-        std::fs::set_permissions(dir.path().join("v1"), std::fs::Permissions::from_mode(0o600))
-            .expect("chmod");
+        std::fs::set_permissions(
+            dir.path().join("v1"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .expect("chmod");
 
         write_key(dir.path(), 2, 9);
         let rotated = file_keys(dir.path(), 2);
@@ -556,6 +586,13 @@ mod tests {
         sealed.dek_nonce = wrapped.nonce;
         sealed.key_version = 2;
         let rewrapped = StoredConnection { sealed, ..stored };
-        assert_eq!(rotated.open(tenant, &rewrapped).await.expect("opens").as_slice(), b"secret");
+        assert_eq!(
+            rotated
+                .open(tenant, &rewrapped)
+                .await
+                .expect("opens")
+                .as_slice(),
+            b"secret"
+        );
     }
 }

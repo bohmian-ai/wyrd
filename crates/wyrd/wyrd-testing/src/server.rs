@@ -266,6 +266,8 @@ pub struct WyrdTestServer {
 
 struct WyrdTestServerInner {
     fixture: Arc<PgFixture>,
+    /// Lifetime guard of the generated Operator key directory, when used.
+    operator_keys_dir: Option<tempfile::TempDir>,
     /// Lifetime guard retained only for local storage-backed servers.
     _storage_root: Option<Arc<tempfile::TempDir>>,
     /// Lifetime guard for a harness-created Bifrost data directory.
@@ -567,6 +569,8 @@ pub struct WyrdTestServerBuilder {
     mcp_context_probe: bool,
     /// Keep the server's audit publisher from retiring staged audit rows.
     audit_publication_disabled: bool,
+    /// Operator connection key source; `None` generates a file key.
+    operator_keys: Option<wyrd_server::config::OperatorKeysConfig>,
 }
 
 /// Test-only file paths for one replica's Bifrost peer identity and trust root.
@@ -640,12 +644,43 @@ impl Default for WyrdTestServerBuilder {
             serve_task_panic_for_test: false,
             mcp_context_probe: false,
             audit_publication_disabled: false,
+            operator_keys: None,
         }
     }
 }
 
 /// Result of a fixture-path principal bootstrap.
 pub use crate::principal::Bootstrap;
+
+/// Write key version 1 as an owner-only file in a fresh directory and return
+/// the file-sourced Operator key config over it.
+///
+/// # Errors
+/// Returns [`WyrdTestServerError::Start`] when the directory or file cannot
+/// be created.
+fn generated_operator_keys() -> Result<
+    (
+        wyrd_server::config::OperatorKeysConfig,
+        Option<tempfile::TempDir>,
+    ),
+    WyrdTestServerError,
+> {
+    use base64::Engine as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    let start = |error: std::io::Error| WyrdTestServerError::Start(error.to_string());
+    let dir = tempfile::tempdir().map_err(start)?;
+    let mut key = [0_u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rng(), &mut key);
+    let path = dir.path().join("v1");
+    std::fs::write(&path, base64::engine::general_purpose::STANDARD.encode(key)).map_err(start)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(start)?;
+    let config = wyrd_server::config::OperatorKeysConfig {
+        source: wyrd_server::config::OperatorKeySource::File,
+        dir: Some(dir.path().to_path_buf()),
+        ..wyrd_server::config::OperatorKeysConfig::default()
+    };
+    Ok((config, Some(dir)))
+}
 
 /// Result of an authz-check request.
 pub use crate::principal::CheckResult;
@@ -3437,6 +3472,16 @@ impl WyrdTestServer {
         Some(self.inner.bifrost_data_root.wal())
     }
 
+    /// Directory of the generated owner-only Operator key files (`v1`, ...),
+    /// or `None` when the builder supplied its own key source.
+    #[must_use]
+    pub fn operator_keys_dir_for_test(&self) -> Option<&std::path::Path> {
+        self.inner
+            .operator_keys_dir
+            .as_ref()
+            .map(tempfile::TempDir::path)
+    }
+
     async fn raw_call(
         &self,
         mut req: Request<Body>,
@@ -3747,6 +3792,21 @@ impl WyrdTestServerBuilder {
     #[must_use]
     pub fn with_mcp_context_probe_for_test(mut self) -> Self {
         self.mcp_context_probe = true;
+        self
+    }
+
+    /// Read Operator connection keys from `config` instead of the default
+    /// generated owner-only file key version 1.
+    ///
+    /// A multi-replica rotation journey points a second server at the first
+    /// server's [`WyrdTestServer::operator_keys_dir_for_test`] with a newer
+    /// active version.
+    #[must_use]
+    pub fn with_operator_keys_for_test(
+        mut self,
+        config: wyrd_server::config::OperatorKeysConfig,
+    ) -> Self {
+        self.operator_keys = Some(config);
         self
     }
 
@@ -4663,11 +4723,19 @@ impl WyrdTestServerBuilder {
         }
         let (forge_publisher, _forge_inbox) = staging_file_channel(16)
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        let (operator_keys, operator_keys_dir) = match self.operator_keys.take() {
+            Some(config) => (config, None),
+            None => generated_operator_keys()?,
+        };
+        state = state.with_operator_keys(
+            wyrd_server::components::operators::keys::OperatorKeys::new(operator_keys),
+        );
         let router = build_router(state.clone());
 
         Ok(WyrdTestServer {
             inner: WyrdTestServerInner {
                 fixture,
+                operator_keys_dir,
                 _storage_root: storage_root,
                 _bifrost_data_dir: data_dir,
                 bifrost_data_root,

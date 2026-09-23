@@ -49,12 +49,12 @@ fn not_found(connection_id: OperatorConnectionId) -> WyrdError {
 /// # Errors
 /// Returns [`WyrdError::OperatorConnectionInvalid`] when it cannot serialize.
 fn plaintext(secret: &ConnectionSecret) -> Result<Zeroizing<Vec<u8>>, WyrdError> {
-    serde_json::to_vec(secret)
-        .map(Zeroizing::new)
-        .map_err(|_| WyrdError::OperatorConnectionInvalid {
+    serde_json::to_vec(secret).map(Zeroizing::new).map_err(|_| {
+        WyrdError::OperatorConnectionInvalid {
             message: "secret could not be encoded".to_owned(),
             details: serde_json::json!({ "field": "secret" }),
-        })
+        }
+    })
 }
 
 /// A change to an existing connection: a typed update or a disable.
@@ -130,7 +130,10 @@ impl<'a> OperatorConnectionControl<'a> {
             Ok::<_, WyrdError>(stored)
         }
         .await;
-        match self.record_if_uncommitted(caller, &allowed, committed).await? {
+        match self
+            .record_if_uncommitted(caller, &allowed, committed)
+            .await?
+        {
             Some(stored) => Ok(stored.view),
             None => Err(WyrdError::OperatorConnectionConflict {
                 message: format!(
@@ -197,7 +200,8 @@ impl<'a> OperatorConnectionControl<'a> {
             .await
             .map_err(registry_db_error)?;
         conn.commit().await.map_err(registry_db_error)?;
-        row.map(|row| row.view).ok_or_else(|| not_found(connection_id))
+        row.map(|row| row.view)
+            .ok_or_else(|| not_found(connection_id))
     }
 
     /// Apply a typed update: omitted fields keep, a supplied secret replaces

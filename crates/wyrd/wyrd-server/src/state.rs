@@ -34,12 +34,12 @@ use crate::bifrost::gate_audit::PostgresGateAudit;
 use crate::boot::data_root::BifrostDataRoot;
 use crate::components::auth::{ServerAuth, ServerAuthz};
 use crate::components::health::ReadinessSnapshot;
+use crate::components::operators::keys::OperatorKeys;
+use crate::config::OperatorKeysConfig;
 use crate::config::{BifrostRuntimeConfig, BifrostTarget, DeploymentProfile, ForgeRuntimeConfig};
 #[cfg(feature = "test-support")]
 use crate::oracle::SilentForwardPeer;
 use crate::postgres::ServerPostgres;
-use crate::components::operators::keys::OperatorKeys;
-use crate::config::OperatorKeysConfig;
 use crate::verification::health::VerificationHealth;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;

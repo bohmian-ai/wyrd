@@ -1896,7 +1896,9 @@ impl OperatorKeysConfig {
             OperatorKeySource::File => Ok(()),
             OperatorKeySource::Vault => {
                 let Some(vault) = &self.vault else {
-                    return invalid("source = \"vault\" requires vault.addr (WYRD_OPERATOR_KEK_VAULT_ADDR)");
+                    return invalid(
+                        "source = \"vault\" requires vault.addr (WYRD_OPERATOR_KEK_VAULT_ADDR)",
+                    );
                 };
                 match url::Url::parse(&vault.addr) {
                     Ok(url) if matches!(url.scheme(), "http" | "https") => {}
@@ -1937,12 +1939,12 @@ impl OperatorKeysConfig {
             };
         }
         if let Some(val) = env_opt("WYRD_OPERATOR_KEK_ACTIVE_VERSION")? {
-            self.active_version = val.parse().map_err(|e: std::num::ParseIntError| {
-                ConfigError::BadEnvVar {
-                    key: "WYRD_OPERATOR_KEK_ACTIVE_VERSION".to_owned(),
-                    message: e.to_string(),
-                }
-            })?;
+            self.active_version =
+                val.parse()
+                    .map_err(|e: std::num::ParseIntError| ConfigError::BadEnvVar {
+                        key: "WYRD_OPERATOR_KEK_ACTIVE_VERSION".to_owned(),
+                        message: e.to_string(),
+                    })?;
         }
         if let Some(val) = env_opt("WYRD_OPERATOR_KEK_DIR")? {
             self.dir = Some(PathBuf::from(val));

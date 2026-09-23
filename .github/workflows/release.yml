@@ -310,6 +310,11 @@ jobs:
           cache: pnpm
           cache-dependency-path: sdks/wyrd-sdk-ts/pnpm-lock.yaml
 
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "33.2"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}

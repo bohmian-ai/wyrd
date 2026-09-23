@@ -245,3 +245,43 @@ CLI argv/debug, or weaker SSRF/audit/tenancy behavior.
 - `architecture/wyrd-security-posture.md`
 - `architecture/agent-rules.md`
 - `AGENTS.md`
+
+## Implementation Evidence
+
+Decision recorded with the user: Wyrd stores Operator credentials itself in
+Postgres, envelope-encrypted under a versioned key-encryption key read from an
+environment variable, owner-only files, or HashiCorp Vault KV v2 (via the
+existing `reqwest`). Multi-tenant production requires Vault; without a readable
+key only connection create/update refuses. AWS/GCP key providers are deferred.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| AC-029 fan-out, Slack channel + bot token + JSON `ok`, PagerDuty route/key/dedup, HTTP bounded context, Idempotency-Key, effective-URL SSRF | `crates/wyrd/wyrd-server/src/verification/operators.rs` (`OperatorWorker`, `OperatorDelivery`) | `pg_operator_delivery::failed_verdict_fans_out_to_every_provider_independently` | PASS |
+| AC-029 terminal provider error, rate limit + Retry-After, origin-changing redirect, independent statuses, Verifier result unchanged | same | same test | PASS |
+| AC-029 revoked/missing connection fails closed; key outage retries; no provider call without credential | `OperatorWorker::credential` | `pg_operator_delivery::revoked_connection_fails_closed_and_key_outage_retries` | PASS |
+| AC-029 unsupported Workflow / wrong-provider / wrong-origin / wrong-scheme / disabled refused at registration | `components/cards/resolve.rs::check_operator` | `pg_operator_connection_routes::registration_binds_exact_connection_authority` | PASS |
+| AC-029 gated live Slack/PagerDuty smoke through the same runner | `pg_operator_delivery::live_smoke_delivers_to_slack_and_pagerduty` (`#[ignore]`, `WYRD_LIVE_*`) | Release evidence; not run (no credentials in fast lanes) | GATED |
+| AC-030 30s attempt timeout, 3 attempts, 30s/2m backoff, terminal after budget, no Verifier rerun | `RuntimeLimits::operator_*`, `OperatorWorker::settle` | `pg_operator_delivery::slow_endpoint_exhausts_the_budget_and_shutdown_releases` | PASS |
+| AC-030 worker crash restarts via health; shutdown drain releases in-flight with attempt refunded | `Capability::OperatorWorker`, `OperatorWorker::run` | same test | PASS |
+| AC-030 4 per-tenant / 16 global Operator permits; other tenant progresses | `OperatorWorker` permits | `pg_operator_delivery::operator_permits_cap_each_tenant_without_starving_another` | PASS |
+| AC-030 `operators:read` vs `operators:write` separation with audit | routes, MCP `may_manage` | `pg_operator_connection_routes::read_write_separation_and_tenant_isolation`, MCP `operators` journey, TS journey | PASS |
+| AC-031 admin CRUD, redaction, rotate, disable/re-enable, UUIDv7, RLS, ciphertext-only rows, key version | connection service/routes/SQL | `pg_operator_connection_routes::admin_manages_redacted_encrypted_connections` | PASS |
+| AC-031 every SDK + CLI + MCP projects the same contract | `wyrd-client::OperatorConnections`; Python `wyrd.operators`; TS `OperatorConnections`; CLI `operator-connection`; MCP `operator_connections.*` | Rust SDK `operator_connections`, `test_operator_connections_journey.py`, `operator-connections.test.ts`, `test:cli:journey`, `test:bifrost:journey:mcp` | PASS |
+| AC-031 multi-replica rotation observed on next attempt without Card revision; rewrap to new key version | `OperatorKeys::rewrap_pass` from the worker | `pg_operator_delivery::next_attempt_on_another_replica_uses_the_rotated_credential` | PASS |
+| CLI secrets never in argv/Debug | `wyrd-cli/src/operator_connection.rs` body files only | `cli.rs` refusal cases, `body_refusal_never_echoes_values` | PASS |
+| AC-033 retry/lease timestamps from `statement_timestamp()`; tests move DB rows, not clocks | `OperatorDispatchQueue` SQL | delivery journeys use `make_retries_due` | PASS |
+
+Verification (all run in this session, exit 0): `test:sql`, `test:shared`,
+`test:wyrd`, `test:wyrdstate:journey`, `test:platform:journey`,
+`test:cli:journey`, `test:principals:integration`,
+`test:bifrost:journey:server`, `test:bifrost:journey:mcp`,
+`py:test:integration`, `py:typecheck`, `ts:test:integration`, `ts:typecheck`,
+`codegen:check`, `check:tenant-isolation`, `check:client-tier`,
+`check:pyo3-scope`, `check:unwrap-audit`, `fmt`, `py:format`, `lints`,
+`py:lints`, `git diff --check`. Focused:
+`scripts/postgres/with-test-postgres.sh -- mise exec -- cargo nextest run --locked -p wyrd-server --features test-support --test pg_operator_delivery --test-threads=1` (5 passed, 1 ignored).
+
+Non-goals held: no Alert resource, no executable Workflow action, no new
+provider, no cloud KMS SDK, no checked-in OpenAPI snapshot, no exactly-once
+claim. `architecture/wyrd-design.md` Operator section updated to the approved
+connection and delivery contract.

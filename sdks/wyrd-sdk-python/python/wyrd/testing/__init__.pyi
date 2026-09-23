@@ -15,9 +15,14 @@ class WyrdTestServer:
 
     ``cleanup`` is reserved for a future teardown-skip feature; currently ignored
     (the server and embedded Postgres are always cleaned up on exit).
+
+    ``audit_publication=False`` keeps the server's audit publisher from retiring
+    staged audit rows, for a journey that counts staged decisions.
     """
 
-    def __init__(self, cleanup: bool = True, mutate_env: bool = True) -> None: ...
+    def __init__(
+        self, cleanup: bool = True, mutate_env: bool = True, audit_publication: bool = True
+    ) -> None: ...
     def __enter__(self) -> WyrdTestServer: ...
     def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> bool: ...
     @property
@@ -41,6 +46,15 @@ class WyrdTestServer:
         ``roles``: Wyrd built-in role names (e.g. ``"bifrost_write"``).
         An empty list creates a principal with no grants (useful for negative RBAC
         journeys). Must be called inside the context manager.
+        """
+        ...
+
+    def credential_registered_service(self, card_ref: str, roles: list[str]) -> str:
+        """Issue an API key for the principal a registered Service Card projects.
+
+        ``card_ref`` is the canonical ``space/Kind/name@version`` identity of an
+        already-registered Service. The key carries that Service's real card-ref
+        scope, so a run may observe the component Cards its spec references.
         """
         ...
 

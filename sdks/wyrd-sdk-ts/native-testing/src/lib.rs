@@ -259,6 +259,70 @@ impl NativeWyrdTestServer {
         }
     }
 
+    /// Issue an API key for the principal a registered Service Card projects.
+    ///
+    /// `card_ref` is the canonical `space/Kind/name@version` identity a
+    /// registration receipt returns. The Card must already be registered: this
+    /// credentials the service account registration projected for it rather
+    /// than minting a new one, so the key carries the registered Service's real
+    /// card-ref scope and a run may observe the component Cards its spec
+    /// references.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error for a malformed identity string, or when the
+    /// harness is closed or the Card has no projected principal.
+    #[napi]
+    pub fn credential_registered_service(
+        &self,
+        card_ref: String,
+        roles: Vec<String>,
+    ) -> Result<String> {
+        let result = self.credential_registered_service_borrowed(&card_ref, &roles);
+        drop(card_ref);
+        drop(roles);
+        result
+    }
+
+    /// Delegates the N-API-owned identity and roles without extending their
+    /// ownership into the Rust harness call.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error for a malformed identity string, or when the
+    /// harness lock is poisoned, the server is closed, or the Card has no
+    /// projected principal.
+    fn credential_registered_service_borrowed(
+        &self,
+        card_ref: &str,
+        roles: &[String],
+    ) -> Result<String> {
+        let guard = self
+            .server
+            .lock()
+            .map_err(|_| napi::Error::from_reason("test server lock poisoned".to_owned()))?;
+        let server = guard
+            .as_ref()
+            .ok_or_else(|| napi::Error::from_reason("test server is shut down".to_owned()))?;
+        let parsed: wyrd_spec::reference::CardRef = card_ref.parse().map_err(|error| {
+            napi::Error::from_reason(format!(
+                "`{card_ref}` is not a card identity string: {error}"
+            ))
+        })?;
+        let roles: Vec<&str> = roles.iter().map(String::as_str).collect();
+        let bootstrap = wyrd_runtime::runtime()
+            .block_on(server.credential_registered_service(&parsed, &roles))
+            .map_err(|error| napi::Error::from_reason(error.to_string()))?;
+        match bootstrap {
+            Bootstrap::Machine { api_key, .. } => {
+                Ok(secrecy::ExposeSecret::expose_secret(&api_key).to_owned())
+            }
+            Bootstrap::User { .. } => Err(napi::Error::from_reason(
+                "expected a machine bootstrap".to_owned(),
+            )),
+        }
+    }
+
     /// Mint an authenticated token without `bifrost_query:read`.
     ///
     /// # Errors
@@ -294,6 +358,76 @@ impl NativeWyrdTestServer {
             .ok_or_else(|| napi::Error::from_reason("test server is shut down".to_owned()))?;
         wyrd_runtime::runtime()
             .block_on(server.bifrost_read_decision_count())
+            .map_err(|error| napi::Error::from_reason(error.to_string()))
+    }
+
+    /// Return the staged allowed describe decisions for one table FQN.
+    ///
+    /// Every server describe stages exactly one decision, so a journey started
+    /// with audit publication disabled reads how many schema describes a table
+    /// has received.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the harness is closed or the audit query fails.
+    #[napi]
+    pub fn table_describe_count(&self, fqn: String) -> Result<i64> {
+        let guard = self
+            .server
+            .lock()
+            .map_err(|_| napi::Error::from_reason("test server lock poisoned".to_owned()))?;
+        let server = guard
+            .as_ref()
+            .ok_or_else(|| napi::Error::from_reason("test server is shut down".to_owned()))?;
+        let result = wyrd_runtime::runtime()
+            .block_on(server.table_describe_count(&fqn))
+            .map_err(|error| napi::Error::from_reason(error.to_string()));
+        drop(fqn);
+        result
+    }
+
+    /// Make every describe of one table FQN fail until restored.
+    ///
+    /// The server answers the failed describe with
+    /// `WYRD_VALA_500_AUDIT_UNAVAILABLE`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the harness is closed, the FQN is not a
+    /// dotted identifier, or installing the fault fails.
+    #[napi]
+    pub fn fail_table_describe(&self, fqn: String) -> Result<()> {
+        let guard = self
+            .server
+            .lock()
+            .map_err(|_| napi::Error::from_reason("test server lock poisoned".to_owned()))?;
+        let server = guard
+            .as_ref()
+            .ok_or_else(|| napi::Error::from_reason("test server is shut down".to_owned()))?;
+        let result = wyrd_runtime::runtime()
+            .block_on(server.fail_table_describe(&fqn))
+            .map_err(|error| napi::Error::from_reason(error.to_string()));
+        drop(fqn);
+        result
+    }
+
+    /// Remove the describe fault installed by `fail_table_describe`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the harness is closed or removing the fault
+    /// fails.
+    #[napi]
+    pub fn restore_table_describe(&self) -> Result<()> {
+        let guard = self
+            .server
+            .lock()
+            .map_err(|_| napi::Error::from_reason("test server lock poisoned".to_owned()))?;
+        let server = guard
+            .as_ref()
+            .ok_or_else(|| napi::Error::from_reason("test server is shut down".to_owned()))?;
+        wyrd_runtime::runtime()
+            .block_on(server.restore_table_describe())
             .map_err(|error| napi::Error::from_reason(error.to_string()))
     }
 
@@ -358,22 +492,32 @@ impl NativeWyrdTestServer {
 
 /// Starts a real bound Wyrd test server and mints an admin access token.
 ///
+/// `auditPublication: false` keeps staged audit rows in place so a journey can
+/// count describe decisions; omitted, publication runs as in production.
+///
 /// # Errors
 ///
 /// Returns a napi error when server startup, service bootstrap, API-key
 /// exchange, or URL discovery fails.
 #[napi]
-pub fn start_test_server() -> Result<NativeWyrdTestServer> {
-    wyrd_runtime::runtime().block_on(Box::pin(start_test_server_async()))
+pub fn start_test_server(audit_publication: Option<bool>) -> Result<NativeWyrdTestServer> {
+    wyrd_runtime::runtime().block_on(Box::pin(start_test_server_async(
+        audit_publication.unwrap_or(true),
+    )))
 }
 
-/// Starts the bound harness inside Wyrd's shared runtime.
+/// Starts the bound harness inside Wyrd's shared runtime, disabling audit
+/// publication when `audit_publication` is false.
 ///
 /// # Errors
 ///
 /// Returns a napi error when any server setup step fails.
-async fn start_test_server_async() -> Result<NativeWyrdTestServer> {
-    let server = Box::pin(WyrdTestServer::start_bound())
+async fn start_test_server_async(audit_publication: bool) -> Result<NativeWyrdTestServer> {
+    let mut builder = WyrdTestServer::builder();
+    if !audit_publication {
+        builder = builder.without_audit_publication_for_test();
+    }
+    let server = Box::pin(builder.start_bound())
         .await
         .map_err(|error| napi::Error::from_reason(error.to_string()))?;
     let table_name = "typescript_oracle_query";

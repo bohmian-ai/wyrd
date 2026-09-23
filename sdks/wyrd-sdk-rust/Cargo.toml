@@ -19,9 +19,12 @@ wyrd-client = { workspace = true }
 workspace-hack.workspace = true
 base64 = { workspace = true }
 secrecy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+uuid = { workspace = true, features = ["v7"] }
 wyrd-testing = { workspace = true }
 
 [lints]

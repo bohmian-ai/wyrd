@@ -44,12 +44,12 @@ pub enum GraphError {
         /// Exact component field containing the invalid reference.
         field: String,
     },
-    /// A Service-root bundle contains an Eval or Drift with no local publisher.
-    #[error("Service-root bundle {root} contains unpublished observability peer {peer}")]
-    UnpublishedObservabilityPeer {
+    /// A Service-root bundle contains a Verifier no local subject binds.
+    #[error("Service-root bundle {root} contains unbound Verifier peer {peer}")]
+    UnboundVerifierPeer {
         /// Selected Service root for the composite submission.
         root: Box<CardRef>,
-        /// Eval or Drift submission with no incoming publication.
+        /// Verifier submission with no incoming `verified_by` binding.
         peer: Box<CardRef>,
     },
     /// A submission spec could not be decoded for typed reference traversal.

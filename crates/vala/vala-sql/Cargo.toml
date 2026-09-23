@@ -37,9 +37,6 @@ wyrd-dev-fixtures = { workspace = true, features = ["pg"] }
 name = "pg_audit_staging"
 
 [[test]]
-name = "pg_drift_alerts"
-
-[[test]]
 name = "pg_forge_operations"
 
 [[test]]

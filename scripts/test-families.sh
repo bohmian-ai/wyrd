@@ -34,7 +34,6 @@ FAMILY_SKALD=(
 
 FAMILY_VALA=(
   vala-bifrost-redux
-  vala-core
   vala-drift
   vala-eval
   vala-ingest

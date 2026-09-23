@@ -18,6 +18,9 @@ its existing pooled queue; startup describes the fixed system tables and
 dynamic `observe.record(table, value)` describes a user table on first use;
 each scoped `observe.drift(...)` / `observe.eval(...)` call converts its input
 to the existing typed record and fixed table rows before queue insertion.
+Python Runs also provide an optional, fail-open OpenTelemetry context manager
+that applies the selected CardRef and invocation ID to spans emitted inside
+the scope without changing explicit observation or Bifrost lifecycle semantics.
 Shared `wyrd-client` and `wyrd-queue` do not own Verifier-specific projection.
 The locked runtime flow is [`verification-control-flow.html`](verification-control-flow.html);
 `verification-runtime.html` is an earlier, superseded proposal.

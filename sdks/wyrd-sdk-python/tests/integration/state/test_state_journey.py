@@ -8,7 +8,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import blake3
 import numpy as np
@@ -35,9 +35,9 @@ EXPECTED_ALIASES = (
     "agent_inline",
     "agent_triage",
     "default-Data-training-1.0.0",
-    "default-Drift-model-drift-1.0.0",
-    "default-Eval-quality-1.0.0",
     "default-Prompt-triage-prompt-1.0.0",
+    "default-Verifier-model-drift-1.0.0",
+    "default-Verifier-quality-1.0.0",
     "model_primary",
     "model_shadow",
     "root",
@@ -247,10 +247,12 @@ def test_service_bundle_hydrates_complete_python_runtime_offline(
     assert state.prompt("triage_prompt") is state.prompt("default-Prompt-triage-prompt-1.0.0")
     assert state.prompt("triage_prompt") is state.prompt("shared_prompt")
     assert state.model("model_primary") is not state.model("model_shadow")
-    assert state.eval("default-Eval-quality-1.0.0").kind is wyrd.CardKind.Eval
-    assert state.eval("default-Eval-quality-1.0.0").spec
-    assert state.drift("default-Drift-model-drift-1.0.0").kind is wyrd.CardKind.Drift
-    assert state.drift("default-Drift-model-drift-1.0.0").spec
+    quality = state.verifier("default-Verifier-quality-1.0.0")
+    assert quality.kind is wyrd.CardKind.Verifier
+    assert quality.spec["implementation"]["kind"] == "eval"
+    drift = state.verifier("default-Verifier-model-drift-1.0.0")
+    assert drift.kind is wyrd.CardKind.Verifier
+    assert drift.spec["implementation"]["kind"] == "drift"
     assert state.workflow("runtime_workflow").kind is wyrd.CardKind.Workflow
     assert state.workflow("runtime_workflow").spec == {}
     assert_all_refs_are_exact_and_uid_bearing(state)
@@ -345,3 +347,30 @@ def test_missing_relationship_projection_is_rejected_offline(tmp_path: Path) -> 
         )
     assert caught.value.code == "WYRD_SDK_400_INVALID_STATE_BUNDLE"
     assert caught.value.details["path"]
+
+
+def served_binding_ids(bundle: Path) -> list[str]:
+    """Read the root Service's served binding identities from a hydrated bundle."""
+    state = WyrdState.from_path(bundle, trusted_artifact_hashes=trusted_artifact_hashes(bundle))
+    status = state.card("root").status
+    assert status is not None, "a binding owner serves status"
+    return status["verification"]["binding_ids"]
+
+
+@pytest.mark.integration
+def test_bound_service_serves_stable_uuid7_binding_ids(tmp_path: Path) -> None:
+    """Reapplying the bound Service keeps the UUIDv7 binding IDs its envelope serves."""
+    service_path = copy_typed_state_service(tmp_path)
+    with WyrdTestServer(mutate_env=False) as server:
+        cards = Cards(server_url=server.base_url, credential=writer_api_key(server))
+        service_ref = register_service(cards, service_path)
+        first = tmp_path / "first"
+        run_cli(server, *exact_get_arguments(service_ref, first))
+        reapplied = cards.register_from_path(str(service_path / "typed-service.yaml")).root
+        assert reapplied.uid == service_ref.uid
+        second = tmp_path / "second"
+        run_cli(server, *exact_get_arguments(service_ref, second))
+    binding_ids = served_binding_ids(first)
+    assert len(binding_ids) == 2, "one binding per bound component occurrence"
+    assert all(UUID(binding_id).version == 7 for binding_id in binding_ids)
+    assert served_binding_ids(second) == binding_ids

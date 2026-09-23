@@ -25,10 +25,8 @@ pub enum Kind {
     Agent,
     /// Workflow Card.
     Workflow,
-    /// Evaluation Card.
-    Eval,
-    /// Drift Card.
-    Drift,
+    /// Verifier Card.
+    Verifier,
     /// Service Card.
     Service,
     /// Policy Card.
@@ -58,8 +56,7 @@ impl Kind {
             Self::Prompt => "Prompt",
             Self::Agent => "Agent",
             Self::Workflow => "Workflow",
-            Self::Eval => "Eval",
-            Self::Drift => "Drift",
+            Self::Verifier => "Verifier",
             Self::Service => "Service",
             Self::Policy => "Policy",
             Self::Mcp => "Mcp",
@@ -80,8 +77,7 @@ impl Kind {
             Self::Prompt => CardKind::Prompt,
             Self::Agent => CardKind::Agent,
             Self::Workflow => CardKind::Workflow,
-            Self::Eval => CardKind::Eval,
-            Self::Drift => CardKind::Drift,
+            Self::Verifier => CardKind::Verifier,
             Self::Service => CardKind::Service,
             Self::Policy => CardKind::Policy,
             Self::Mcp => CardKind::Mcp,
@@ -102,8 +98,7 @@ impl Kind {
             CardKind::Prompt => Self::Prompt,
             CardKind::Agent => Self::Agent,
             CardKind::Workflow => Self::Workflow,
-            CardKind::Eval => Self::Eval,
-            CardKind::Drift => Self::Drift,
+            CardKind::Verifier => Self::Verifier,
             CardKind::Service => Self::Service,
             CardKind::Policy => Self::Policy,
             CardKind::Mcp => Self::Mcp,
@@ -149,7 +144,7 @@ impl CardRefPy {
     ///
     /// `kind` accepts the native wire name of a registered card kind
     /// (one of `Data`, `Model`, `Experiment`, `Prompt`, `Agent`, `Workflow`,
-    /// `Eval`, `Drift`, `Service`, `Policy`, `Mcp`, `Audit`, `Artifact`,
+    /// `Verifier`, `Service`, `Policy`, `Mcp`, `Audit`, `Artifact`,
     /// `Trigger`, `Operator`, `Source`). External
     /// kinds are not constructable from Python in v1.
     /// `space` is required; identity is `(kind, name, version, space)`.

@@ -127,6 +127,9 @@ async fn the_served_document_describes_the_composed_surface() {
         "/v1/cards/{card_uid}/complete",
         "/v1/cards/download/init",
         "/v1/principals/{principal_id}/credentials/{credential_id}",
+        "/v1/verification/bindings/{binding_id}",
+        "/v1/verification/runs",
+        "/v1/verification/runs/{run_id}",
         "/v1/bifrost/tables",
         "/v1/bifrost/tables/{namespace}/{name}",
         "/auth/token",
@@ -454,8 +457,41 @@ async fn bifrost_operations_publish_typed_problem_refusals() {
     server.shutdown().await.expect("server shuts down");
 }
 
+/// Follow `schema` to the component it names in the served `document`.
+///
+/// Resolves a `$ref`, and unwraps the single non-null alternative utoipa emits
+/// for an optional reference (`oneOf`/`anyOf`/`allOf` with a `null` arm), so a
+/// caller can walk a property chain without caring how optionality is encoded.
+///
+/// # Panics
+/// Panics when a `$ref` is not a local component reference.
+fn resolve_schema<'a>(document: &'a Value, schema: &'a Value) -> &'a Value {
+    if let Some(reference) = schema["$ref"].as_str() {
+        let name = reference
+            .strip_prefix("#/components/schemas/")
+            .expect("schema references are local components");
+        return resolve_schema(document, &document["components"]["schemas"][name]);
+    }
+    for combinator in ["oneOf", "anyOf", "allOf"] {
+        if let Some(arms) = schema[combinator].as_array() {
+            let mut concrete = arms.iter().filter(|arm| arm["type"] != "null");
+            if let (Some(arm), None) = (concrete.next(), concrete.next()) {
+                return resolve_schema(document, arm);
+            }
+        }
+    }
+    schema
+}
+
 /// The card surface publishes its typed lifecycle, parameter, and problem
 /// shapes.
+///
+/// Also walks the served `Card -> Status -> verification -> binding_ids`
+/// chain, proving the read-side binding identities are a UUID array.
+///
+/// # Panics
+/// Panics when the server fails to start or stop or any published shape
+/// differs.
 #[tokio::test]
 async fn card_contract_publishes_typed_lifecycle_and_problem_shapes() {
     let server = WyrdTestServer::start_in_process()
@@ -494,8 +530,21 @@ async fn card_contract_publishes_typed_lifecycle_and_problem_shapes() {
             .as_array()
             .expect("typed spec alternatives")
             .len(),
-        16
+        15,
+        "one typed spec per registrable native Card kind"
     );
+
+    let status = resolve_schema(&document, &card["properties"]["status"]);
+    let verification = resolve_schema(&document, &status["properties"]["verification"]);
+    assert_eq!(
+        verification, &document["components"]["schemas"]["VerificationStatus"],
+        "Card status carries the named verification status"
+    );
+    let binding_ids = resolve_schema(&document, &verification["properties"]["binding_ids"]);
+    assert_eq!(binding_ids["type"], "array", "binding IDs are an array");
+    let binding_id = resolve_schema(&document, &binding_ids["items"]);
+    assert_eq!(binding_id["type"], "string");
+    assert_eq!(binding_id["format"], "uuid", "each binding ID is a UUID");
 
     let problem = &document["components"]["schemas"]["WyrdProblem"];
     let problem_required: BTreeSet<&str> = problem["required"]
@@ -515,6 +564,74 @@ async fn card_contract_publishes_typed_lifecycle_and_problem_shapes() {
             "details",
             "remediation",
         ])
+    );
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// The Verification surface is exactly three typed operations.
+///
+/// Binding status, manual run request, and run status publish their typed
+/// request and response schemas, the manual request answers `202 Accepted`,
+/// and no result or other Verification operation is routed: verdicts are
+/// read from Bifrost by `result_id`.
+///
+/// # Panics
+/// Panics when the server fails to start or stop, or when a Verification path,
+/// method, status, or schema reference differs.
+#[tokio::test]
+async fn verification_contract_publishes_exactly_three_typed_operations() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let paths = document["paths"].as_object().expect("paths object");
+
+    let verification: BTreeSet<(&str, &str)> = paths
+        .iter()
+        .filter(|(path, _)| path.starts_with("/v1/verification"))
+        .flat_map(|(path, item)| {
+            item.as_object()
+                .expect("path item object")
+                .keys()
+                .filter(|key| ["get", "post", "put", "patch", "delete"].contains(&key.as_str()))
+                .map(move |method| (path.as_str(), method.as_str()))
+        })
+        .collect();
+    assert_eq!(
+        verification,
+        BTreeSet::from([
+            ("/v1/verification/bindings/{binding_id}", "get"),
+            ("/v1/verification/runs", "post"),
+            ("/v1/verification/runs/{run_id}", "get"),
+        ])
+    );
+
+    let schema_ref = |operation: &Value, status: &str| {
+        operation["responses"][status]["content"]["application/json"]["schema"]["$ref"]
+            .as_str()
+            .map(str::to_owned)
+    };
+    let start = &paths["/v1/verification/runs"]["post"];
+    assert_eq!(
+        start["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/StartVerificationRunRequest"
+    );
+    assert_eq!(
+        schema_ref(start, "202").as_deref(),
+        Some("#/components/schemas/StartVerificationRunResponse")
+    );
+    assert_eq!(
+        schema_ref(
+            &paths["/v1/verification/bindings/{binding_id}"]["get"],
+            "200"
+        )
+        .as_deref(),
+        Some("#/components/schemas/VerificationBindingStatus")
+    );
+    assert_eq!(
+        schema_ref(&paths["/v1/verification/runs/{run_id}"]["get"], "200").as_deref(),
+        Some("#/components/schemas/VerificationRunStatus")
     );
 
     server.shutdown().await.expect("server shuts down");

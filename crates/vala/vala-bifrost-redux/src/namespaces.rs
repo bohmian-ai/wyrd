@@ -2,23 +2,39 @@
 
 use iceberg::NamespaceIdent;
 
+/// The closed set of `vala.*` namespaces the Bifrost catalog owns.
+///
+/// Every built-in table and every caller-owned dataset lives in exactly one of
+/// these; the catalog, query admission, and FQN parsing all resolve names
+/// through this enum rather than matching namespace strings ad hoc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BifrostNamespace {
+    /// `vala.system` — retained audit history.
     Audit,
+    /// `vala.bifrost` — Bifrost's own operational tables.
     Bifrost,
+    /// `vala.traces` — OpenTelemetry spans.
     Traces,
+    /// `vala.metrics` — OpenTelemetry metric points.
     Metrics,
+    /// `vala.logs` — OpenTelemetry log records.
     Logs,
+    /// `vala.eval` — Eval observations and per-task result items.
     Eval,
+    /// `vala.drift` — Drift observations and per-feature result details.
     Drift,
+    /// `vala.verification` — the shared per-run Verifier verdict table.
+    Verification,
+    /// `vala.dev` — development-time agent traces.
     Dev,
+    /// `vala.datasets` — caller-owned dynamic tables.
     Datasets, // Redux-only variant for dynamic table namespace
 }
 
 impl BifrostNamespace {
     /// All known namespaces. Adding a variant here causes a compile error at every
     /// `match` that is missing a branch — the exhaustiveness guard.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Audit,
         Self::Bifrost,
         Self::Traces,
@@ -26,10 +42,12 @@ impl BifrostNamespace {
         Self::Logs,
         Self::Eval,
         Self::Drift,
+        Self::Verification,
         Self::Dev,
         Self::Datasets,
     ];
 
+    /// The wire namespace string (e.g. `"vala.eval"`) every FQN is built from.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Audit => "vala.system",
@@ -39,6 +57,7 @@ impl BifrostNamespace {
             Self::Logs => "vala.logs",
             Self::Eval => "vala.eval",
             Self::Drift => "vala.drift",
+            Self::Verification => "vala.verification",
             Self::Dev => "vala.dev",
             Self::Datasets => "vala.datasets",
         }
@@ -61,6 +80,7 @@ impl BifrostNamespace {
             "logs" => Some(Self::Logs),
             "eval" => Some(Self::Eval),
             "drift" => Some(Self::Drift),
+            "verification" => Some(Self::Verification),
             "dev" => Some(Self::Dev),
             "datasets" => Some(Self::Datasets),
             _ => None,

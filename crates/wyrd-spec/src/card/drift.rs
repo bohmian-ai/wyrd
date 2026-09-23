@@ -1,21 +1,21 @@
-//! DriftCard spec.
+//! The typed spec body of a `drift` Verifier implementation.
 //!
 //! Envelope locked per `architecture/wyrd-design.md` §Drift. `DriftProfile`
 //! carries method-specific math config only; fitted baseline state lives in
 //! `vala-drift`, never in `wyrd-spec`.
 
-use std::collections::BTreeMap;
-
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::card::common::NonSecretValue;
 use crate::envelope::CardKind;
 use crate::error::WyrdError;
 use crate::ids::FeatureName;
 use crate::reference::Ref;
 
-/// DriftCard spec body.
+/// Drift Verifier implementation spec body.
+///
+/// Reached only as `implementation.spec` on a `Verifier` Card; `drift` is an
+/// implementation discriminator, never an envelope `kind`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
@@ -33,14 +33,10 @@ pub struct DriftSpec {
     /// When a sample becomes an emittable observation.
     pub condition: DriftCondition,
 
-    /// Method-specific math configuration. Required for `Psi | Spc | Custom`,
-    /// forbidden for `External`.
+    /// Method-specific math configuration. Required for every executable
+    /// method/signal pair and must match `method`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<DriftProfile>,
-
-    /// Free-form non-secret authoring metadata.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub details: BTreeMap<String, NonSecretValue>,
 }
 
 /// Drift detection method.
@@ -57,8 +53,6 @@ pub enum DriftMethod {
     Spc,
     /// User-defined metric with an author-supplied baseline value.
     Custom,
-    /// Drift method defined externally, with no Vala-side fit or score.
-    External,
 }
 
 /// How measurements enter the drift monitor.
@@ -77,16 +71,6 @@ pub enum DriftSignal {
     Metric {
         /// Metric name, such as `p99_latency_ms`, `mae`, or `tokens_per_call`.
         name: String,
-    },
-    /// Score stream produced by an Eval card.
-    EvalScore {
-        /// Eval card whose score stream this drift consumes.
-        eval_ref: Ref,
-    },
-    /// Measurement from an external system, such as Prometheus or OTel.
-    External {
-        /// Source card describing where to read the external measurement.
-        source_ref: Ref,
     },
 }
 
@@ -273,15 +257,6 @@ pub enum DriftValidationError {
         /// Duplicated feature.
         dup: String,
     },
-    /// EvalScore signal did not reference an Eval card.
-    #[error("eval_ref.kind must be Eval, got {got}")]
-    EvalRefMustBeEval {
-        /// Actual Card kind.
-        got: String,
-    },
-    /// External source referenced a Drift card.
-    #[error("source_ref.kind must not be Drift")]
-    SourceRefInvalidKind,
     /// A profile-bearing method had no profile.
     #[error("profile is required for method {method}")]
     ProfileRequired {
@@ -296,21 +271,16 @@ pub enum DriftValidationError {
         /// Method variant name.
         method: String,
     },
-    /// External method supplied a forbidden profile.
-    #[error("profile must be absent for External method")]
-    ProfileForbiddenForExternal,
-    /// Statistical condition was used without a profile.
-    #[error("Statistical condition requires a profile; External method has none")]
-    StatisticalRequiresProfile,
-    /// Condition limit was not finite.
-    #[error("condition limit must be finite: {field}")]
-    NonFiniteLimit {
-        /// Offending condition field.
-        field: String,
+    /// A non-`Statistical` condition was authored.
+    ///
+    /// `Above`, `Below`, and `Outside` remain typed vocabulary, but the three
+    /// executable method/signal pairs already own their thresholds through
+    /// their profile, so registration rejects them.
+    #[error("condition {condition} is not supported; use Statistical")]
+    ConditionNotStatistical {
+        /// Rejected condition variant name.
+        condition: String,
     },
-    /// Outside condition bounds were inverted.
-    #[error("Outside condition requires lower < upper")]
-    OutsideBoundsInverted,
     /// PSI alpha threshold was non-finite or outside `(0, 1)`.
     #[error("PSI threshold {field} must be finite and in (0, 1)")]
     PsiAlphaOutOfRange {
@@ -345,7 +315,6 @@ impl DriftMethod {
             Self::Psi => "Psi",
             Self::Spc => "Spc",
             Self::Custom => "Custom",
-            Self::External => "External",
         }
     }
 }
@@ -355,8 +324,6 @@ impl DriftSignal {
         match self {
             Self::Distribution { .. } => "Distribution",
             Self::Metric { .. } => "Metric",
-            Self::EvalScore { .. } => "EvalScore",
-            Self::External { .. } => "External",
         }
     }
 }
@@ -386,25 +353,12 @@ impl DriftValidationError {
             Self::DistributionDuplicateFeatures { dup } => {
                 json!({ "field": "signal.features", "duplicate": dup })
             }
-            Self::EvalRefMustBeEval { got } => {
-                json!({ "field": "signal.eval_ref.kind", "got": got, "expected": "Eval" })
-            }
-            Self::SourceRefInvalidKind => {
-                json!({ "field": "signal.source_ref.kind", "got": "Drift" })
-            }
             Self::ProfileRequired { method } => json!({ "method": method }),
             Self::ProfileMethodMismatch { profile, method } => {
                 json!({ "field": "profile.kind", "profile": profile, "method": method })
             }
-            Self::ProfileForbiddenForExternal => {
-                json!({ "field": "profile", "method": "External", "reason": "forbidden" })
-            }
-            Self::StatisticalRequiresProfile => {
-                json!({ "field": "condition", "condition": "Statistical", "reason": "profile_required" })
-            }
-            Self::NonFiniteLimit { field } => json!({ "field": field }),
-            Self::OutsideBoundsInverted => {
-                json!({ "field": "condition", "reason": "lower_gte_upper" })
+            Self::ConditionNotStatistical { condition } => {
+                json!({ "field": "condition", "got": condition, "expected": "Statistical" })
             }
             Self::PsiAlphaOutOfRange { field } => {
                 json!({ "field": field, "expected": "finite value in (0, 1)" })
@@ -458,7 +412,6 @@ impl DriftSpec {
         condition: DriftCondition,
         profile: Option<DriftProfile>,
         description: Option<String>,
-        details: BTreeMap<String, NonSecretValue>,
     ) -> Result<Self, DriftValidationError> {
         let spec = Self {
             description,
@@ -466,7 +419,6 @@ impl DriftSpec {
             signal,
             condition,
             profile,
-            details,
         };
         spec.validate()?;
         Ok(spec)
@@ -481,7 +433,6 @@ impl DriftSpec {
         validate_signal(&self.signal)?;
         validate_condition(&self.condition)?;
         validate_profile_presence(self.method, self.profile.as_ref())?;
-        validate_statistical_requires_profile(&self.condition, self.profile.as_ref())?;
         if let Some(profile) = &self.profile {
             validate_profile(profile)?;
         }
@@ -489,23 +440,22 @@ impl DriftSpec {
     }
 }
 
+/// Reject a signal shape the chosen method cannot consume.
+///
+/// PSI and SPC both fit a baseline distribution and therefore require a
+/// `Distribution` signal; `Custom` scores an already-reduced number and
+/// therefore requires a `Metric` signal. This is the first check `validate`
+/// runs, so later profile checks can assume a coherent method/signal pair.
+///
+/// # Errors
+/// Returns [`DriftValidationError::SignalMethodMismatch`] naming both sides.
 fn validate_signal_method(
     signal: &DriftSignal,
     method: DriftMethod,
 ) -> Result<(), DriftValidationError> {
     let allowed = match method {
-        DriftMethod::Psi => matches!(signal, DriftSignal::Distribution { .. }),
-        DriftMethod::Spc => matches!(
-            signal,
-            DriftSignal::Distribution { .. }
-                | DriftSignal::Metric { .. }
-                | DriftSignal::EvalScore { .. }
-        ),
-        DriftMethod::Custom => matches!(
-            signal,
-            DriftSignal::Metric { .. } | DriftSignal::EvalScore { .. }
-        ),
-        DriftMethod::External => matches!(signal, DriftSignal::External { .. }),
+        DriftMethod::Psi | DriftMethod::Spc => matches!(signal, DriftSignal::Distribution { .. }),
+        DriftMethod::Custom => matches!(signal, DriftSignal::Metric { .. }),
     };
 
     if allowed {
@@ -518,6 +468,17 @@ fn validate_signal_method(
     }
 }
 
+/// Enforce the invariants a `Distribution` signal owns.
+///
+/// A resolved baseline must name a `Data` Card, and the feature list must be
+/// non-empty and free of duplicates so each fitted feature maps to exactly one
+/// baseline column. An unresolved baseline path is left to the loader, and a
+/// `Metric` signal carries no reference or feature list to check.
+///
+/// # Errors
+/// Returns [`DriftValidationError::BaselineRefMustBeData`],
+/// [`DriftValidationError::DistributionMissingFeatures`], or
+/// [`DriftValidationError::DistributionDuplicateFeatures`].
 fn validate_signal(signal: &DriftSignal) -> Result<(), DriftValidationError> {
     match signal {
         DriftSignal::Distribution {
@@ -546,97 +507,65 @@ fn validate_signal(signal: &DriftSignal) -> Result<(), DriftValidationError> {
             Ok(())
         }
         DriftSignal::Metric { .. } => Ok(()),
-        DriftSignal::EvalScore { eval_ref } => {
-            let Some(eval_ref) = eval_ref.as_card_ref() else {
-                return Ok(());
-            };
-            if eval_ref.kind != CardKind::Eval {
-                return Err(DriftValidationError::EvalRefMustBeEval {
-                    got: format!("{:?}", eval_ref.kind),
-                });
-            }
-            Ok(())
-        }
-        DriftSignal::External { source_ref } => {
-            let Some(source_ref) = source_ref.as_card_ref() else {
-                return Ok(());
-            };
-            if source_ref.kind == CardKind::Drift {
-                return Err(DriftValidationError::SourceRefInvalidKind);
-            }
-            Ok(())
-        }
     }
 }
 
+/// Require the statistical condition; a drift verdict is never a bare threshold.
+///
+/// A bound threshold belongs to the method's own profile, so accepting
+/// `Above`, `Below`, or `Outside` here would create a second, competing place
+/// to express the same decision.
+///
+/// # Errors
+/// Returns [`DriftValidationError::ConditionNotStatistical`] naming the
+/// authored variant.
 fn validate_condition(condition: &DriftCondition) -> Result<(), DriftValidationError> {
     match condition {
         DriftCondition::Statistical => Ok(()),
-        DriftCondition::Above { limit } | DriftCondition::Below { limit } => {
-            if limit.is_finite() {
-                Ok(())
-            } else {
-                Err(DriftValidationError::NonFiniteLimit {
-                    field: "limit".to_string(),
-                })
-            }
-        }
-        DriftCondition::Outside { lower, upper } => {
-            if !lower.is_finite() {
-                return Err(DriftValidationError::NonFiniteLimit {
-                    field: "lower".to_string(),
-                });
-            }
-            if !upper.is_finite() {
-                return Err(DriftValidationError::NonFiniteLimit {
-                    field: "upper".to_string(),
-                });
-            }
-            if lower >= upper {
-                return Err(DriftValidationError::OutsideBoundsInverted);
-            }
-            Ok(())
-        }
+        DriftCondition::Above { .. } => Err(DriftValidationError::ConditionNotStatistical {
+            condition: "Above".to_string(),
+        }),
+        DriftCondition::Below { .. } => Err(DriftValidationError::ConditionNotStatistical {
+            condition: "Below".to_string(),
+        }),
+        DriftCondition::Outside { .. } => Err(DriftValidationError::ConditionNotStatistical {
+            condition: "Outside".to_string(),
+        }),
     }
 }
 
+/// Require a profile and require it to match the method.
+///
+/// Each method reads its own math configuration, so a missing or mismatched
+/// profile would leave the fit unparameterized at run time rather than at
+/// registration.
+///
+/// # Errors
+/// Returns [`DriftValidationError::ProfileRequired`] when no profile is
+/// authored and [`DriftValidationError::ProfileMethodMismatch`] when the
+/// authored profile belongs to a different method.
 fn validate_profile_presence(
     method: DriftMethod,
     profile: Option<&DriftProfile>,
 ) -> Result<(), DriftValidationError> {
-    match (method, profile) {
-        (DriftMethod::External, Some(_)) => Err(DriftValidationError::ProfileForbiddenForExternal),
-        (DriftMethod::External, None) => Ok(()),
-        (method, None) => Err(DriftValidationError::ProfileRequired {
+    let Some(profile) = profile else {
+        return Err(DriftValidationError::ProfileRequired {
             method: method.name().to_string(),
-        }),
-        (method, Some(profile)) => {
-            let matches = matches!(
-                (method, profile),
-                (DriftMethod::Psi, DriftProfile::Psi(_))
-                    | (DriftMethod::Spc, DriftProfile::Spc(_))
-                    | (DriftMethod::Custom, DriftProfile::Custom(_))
-            );
-            if matches {
-                Ok(())
-            } else {
-                Err(DriftValidationError::ProfileMethodMismatch {
-                    profile: profile.variant_name().to_string(),
-                    method: method.name().to_string(),
-                })
-            }
-        }
-    }
-}
-
-fn validate_statistical_requires_profile(
-    condition: &DriftCondition,
-    profile: Option<&DriftProfile>,
-) -> Result<(), DriftValidationError> {
-    if matches!(condition, DriftCondition::Statistical) && profile.is_none() {
-        Err(DriftValidationError::StatisticalRequiresProfile)
-    } else {
+        });
+    };
+    let matches = matches!(
+        (method, profile),
+        (DriftMethod::Psi, DriftProfile::Psi(_))
+            | (DriftMethod::Spc, DriftProfile::Spc(_))
+            | (DriftMethod::Custom, DriftProfile::Custom(_))
+    );
+    if matches {
         Ok(())
+    } else {
+        Err(DriftValidationError::ProfileMethodMismatch {
+            profile: profile.variant_name().to_string(),
+            method: method.name().to_string(),
+        })
     }
 }
 

@@ -8,11 +8,10 @@ metadata:
   version: 1.0.0
 
 spec:
-  action:
-    kind: notify
-    channel:
-      kind: slack
-      text: "Churn drift exceeded its configured threshold."
+  kind: notify
+  channel:
+    kind: slack
+    text: "Churn drift exceeded its configured threshold."
 
   budget:
     max_wall_seconds: 600

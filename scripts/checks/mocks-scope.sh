@@ -7,6 +7,11 @@
 # The allowlisted files are production code that instantiates a mock server
 # for live provider integration or uses wiremock for test helpers exposed
 # only through wyrd-testing.
+# `wyrd-auth/src/callback.rs` carries the provider-screening tests in a
+# `#[cfg(test)]` module over a `[dev-dependencies]` wiremock, exactly as the
+# `wyrd-server/src/auth/callback.rs` entry above it does; the callback
+# screening path gained a second home in `wyrd-auth` without the allowlist
+# following it.
 # `wyrd-client/tests/storage_dispatch.rs` (presigned transfer headers) and the
 # `#[cfg(test)]` module of `wyrd-client/src/cards/handle.rs` are test-only
 # seams; their wiremock dev-dependency is not part of the published client

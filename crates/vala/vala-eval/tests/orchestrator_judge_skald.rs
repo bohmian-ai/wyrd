@@ -39,7 +39,7 @@ impl AgentCardResolver for StaticAgentResolver {
                 max_iterations: Some(1),
                 ..AgentRunConfigSpec::default()
             },
-            publishes_to: Vec::new(),
+            verified_by: Vec::new(),
         })
     }
 }
@@ -81,7 +81,7 @@ fn inline_agent_ref(prompt: skald_prompt::Prompt) -> InlineableRef<AgentSpec> {
             max_iterations: Some(1),
             ..AgentRunConfigSpec::default()
         },
-        publishes_to: Vec::new(),
+        verified_by: Vec::new(),
     }))
 }
 

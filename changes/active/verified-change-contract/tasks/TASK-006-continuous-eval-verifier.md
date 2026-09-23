@@ -3,9 +3,9 @@ id: TASK-006
 kind: implementation
 status: proposed
 spec: SPEC-verified-change-contract
-spec_revision: 32
-requirements: [REQ-077, REQ-083, REQ-084, REQ-085, REQ-111, REQ-130, REQ-131, INV-004, INV-010, INV-012, AC-014, AC-016, AC-020, AC-027]
-depends_on: [TASK-004]
+spec_revision: 35
+requirements: [REQ-077, REQ-083, REQ-084, REQ-085, REQ-111, REQ-130, REQ-131, REQ-152, INV-004, INV-010, INV-012, INV-015, AC-014, AC-016, AC-020, AC-027, AC-033]
+depends_on: [TASK-004, TASK-010]
 ---
 
 ## Outcome and Value
@@ -24,6 +24,10 @@ reports, summary, pass gate, and context capture. Skald owns provider-native
 multimodal input. Scribe's post-ACK server seam triggers best-effort `wyrd-sql`
 run insertion; the generic runtime owns claims/status/results/dispatch. Oracle
 reads the exact record/day and authorized trace/media sources.
+
+The post-ACK insert reuses TASK-010's PostgreSQL-owned immediate queue time;
+the committed observation's `wyrd_event_time` remains a producer-owned event
+fact rather than a coordination clock.
 
 Do not join enqueue to Scribe's batch-fence transaction, add an outbox, poll
 Bifrost as a queue, synthesize `passed:false` from executor errors, add an

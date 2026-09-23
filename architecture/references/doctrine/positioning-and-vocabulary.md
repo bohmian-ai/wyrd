@@ -55,10 +55,10 @@ Rules:
 
 ## v1 Card Kinds
 
-Sixteen registrable native kinds:
+Fifteen registrable native kinds:
 
 `Data`, `Model`, `Artifact`, `Experiment`, `Prompt`, `Agent`, `Workflow`,
-`Mcp`, `Service`, `Policy`, `Audit`, `Drift`, `Eval`, `Source`, `Trigger`,
+`Mcp`, `Service`, `Policy`, `Audit`, `Verifier`, `Source`, `Trigger`,
 `Operator`.
 
 `CardKind::External` is a non-registrable discriminator for foreign schema

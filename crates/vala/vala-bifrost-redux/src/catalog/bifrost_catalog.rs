@@ -1282,10 +1282,6 @@ impl BifrostCatalog {
         tenant: DataTenantId,
     ) -> Result<BifrostTableDescription, BifrostCatalogError> {
         let fqn = table.fqn();
-        let row = self
-            .lookup_table_row(&fqn, tenant)
-            .await?
-            .ok_or_else(|| BifrostCatalogError::TableNotFound(fqn))?;
         let builtin = builtin_table(
             table
                 .namespace
@@ -1294,6 +1290,18 @@ impl BifrostCatalog {
                 .unwrap_or_default(),
             &table.name,
         );
+        // Built-ins are lazy, and ingest already materializes one on first use.
+        // Describing one must do the same: a client that must describe a fixed
+        // system table before it may write it — the SDK's observation startup —
+        // would otherwise fail against a table the server owns and would have
+        // created on the very next call.
+        if let Some(definition) = builtin {
+            self.ensure_builtin(tenant, definition).await?;
+        }
+        let row = self
+            .lookup_table_row(&fqn, tenant)
+            .await?
+            .ok_or_else(|| BifrostCatalogError::TableNotFound(fqn))?;
         // A canonical built-in is described from its own declaration, not from
         // the Iceberg round trip. The catalog assigns its own sequential field
         // ids at table creation, so the stored schema's ids diverge from the

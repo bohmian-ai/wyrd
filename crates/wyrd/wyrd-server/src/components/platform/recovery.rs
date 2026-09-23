@@ -107,7 +107,7 @@ impl TenantRecovery {
         let directory = tenant_by_id(&self.operator, tenant_id)
             .await
             .map_err(|e| ProvisionError::Store(e.to_string()))?;
-        if !directory.is_some_and(|row| row.status == "active") {
+        if directory.is_none_or(|row| row.status != "active") {
             return Err(ProvisionError::TenantUnavailable);
         }
 

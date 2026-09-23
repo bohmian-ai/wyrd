@@ -216,6 +216,9 @@ mod pg_tests {
     }
 
     /// Starts one real server with a published queryable table and authenticated SDK client.
+    ///
+    /// Audit publication stays off so the staged lifecycle decisions the
+    /// journey asserts on are not retired mid-test by the server's own sweep.
     async fn lifecycle_fixture() -> (
         WyrdTestServer,
         WyrdClient,
@@ -224,7 +227,8 @@ mod pg_tests {
         DataTenantId,
         String,
     ) {
-        let srv = WyrdTestServer::start_bound()
+        let srv = WyrdTestServer::builder()
+            .start_bound()
             .await
             .expect("lifecycle test server start");
         let table_name = format!("sdk_lifecycle_{}", uuid::Uuid::now_v7().simple());
@@ -1765,7 +1769,10 @@ mod pg_tests {
     /// Register, insert, swap the active table before flushing, insert again,
     /// drain, then read both tables back — one through `sql` and one through
     /// `stream`, so the collected and streamed doors are both exercised on the
-    /// rows this journey actually wrote.
+    /// rows this journey actually wrote. A second writer holding a stale
+    /// declaration of the first table is refused by the server's schema
+    /// fingerprint fence, both for its rows and for registering its schema as a
+    /// replacement, so none of its rows land.
     #[tokio::test]
     async fn unified_client_registers_writes_swaps_and_reads_both_tables() {
         let srv = WyrdTestServer::start_bound()
@@ -1830,6 +1837,7 @@ mod pg_tests {
 
         bifrost.flush().await.expect("flush every pooled producer");
         bifrost.shutdown().await.expect("shutdown drains and stops");
+        assert_stale_writer_is_fenced(&client, &first_fqn).await;
         srv.flush_bifrost()
             .await
             .expect("publish the server-owned Scribe");
@@ -1859,6 +1867,57 @@ mod pg_tests {
         );
 
         srv.shutdown().await.expect("server shutdown");
+    }
+
+    /// Prove a writer whose declaration of `fqn` is stale cannot land a row.
+    ///
+    /// The stale declaration adds a `note` column the registered table never
+    /// had. Its sealed batch reaches the server, which refuses it at the schema
+    /// fingerprint fence with the stable public code, and the same code refuses
+    /// registering the stale declaration as a replacement schema.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the stale writer cannot connect or insert, or when either
+    /// refusal is missing or carries a different stable code.
+    async fn assert_stale_writer_is_fenced(client: &WyrdClient, fqn: &str) {
+        let stale_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+            Field::new("note", DataType::Utf8, true),
+        ]));
+        let stale = Bifrost::connect_with_table(
+            client,
+            TableConfig::from_arrow(fqn, stale_schema).expect("stale declaration"),
+        )
+        .await
+        .expect("stale writer connects");
+        stale
+            .insert(
+                br#"{"id": 6, "value": "stale", "note": "outdated"}"#.to_vec(),
+                Correlation::default(),
+            )
+            .expect("the stale row is admitted locally");
+        let refused = stale
+            .flush()
+            .await
+            .expect_err("the server fences a batch built from a stale schema");
+        assert_eq!(
+            sdk_code(&refused),
+            "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH"
+        );
+        let replacement = stale
+            .register()
+            .await
+            .expect_err("a stale declaration never replaces the registered schema");
+        assert_eq!(
+            sdk_code(&replacement),
+            "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH"
+        );
+        stale
+            .shutdown()
+            .await
+            .expect("the refused batch was settled, leaving nothing to drain");
     }
 
     /// One row of the blocking journey's table, as a caller would declare it.
@@ -2638,6 +2697,53 @@ mod pg_tests {
         srv.shutdown().await.expect("server shutdown");
     }
 
+    /// A denied table describe is refused, audited, and admits nothing.
+    ///
+    /// `WyrdState::start_bifrost` and `observe.record` both reach a table only
+    /// through `Bifrost::writer_table`, so this is the describe every scoped
+    /// observation depends on. A principal holding query but not
+    /// `bifrost_table:read` must receive the stable RBAC refusal, the server
+    /// must stage one canonical denied decision naming the requested table,
+    /// and the writer must hold no cached destination and no producer.
+    pub(super) async fn denied_describe_is_audited_before_admission_impl() {
+        let srv = WyrdTestServer::builder()
+            .without_audit_publication_for_test()
+            .start_bound()
+            .await
+            .expect("denied-describe test server start");
+        let writer =
+            reader_with_permissions(&srv, "sdk_describe_denied", &["bifrost_query:read"]).await;
+
+        let denied = writer
+            .writer_table("vala.drift.observations")
+            .await
+            .expect_err("a caller without bifrost_table:read cannot describe");
+        assert_eq!(sdk_code(&denied), "WYRD_PERMISSION_403_DENIED_RBAC");
+        assert_eq!(
+            staged_audit_count(
+                &srv,
+                srv.data_tenant_id(),
+                "vala.bifrost.describe",
+                "vala.drift.observations",
+            )
+            .await,
+            1,
+            "the denial is one canonical staged decision naming the requested table"
+        );
+        assert!(
+            writer
+                .cached_writer_table("vala.drift.observations")
+                .is_none()
+        );
+        assert_eq!(
+            writer.producer_count(),
+            0,
+            "a denied describe admits nothing"
+        );
+
+        srv.shutdown().await.expect("server shutdown");
+    }
+
     /// A public reader holding exactly `permissions`, as its own principal.
     ///
     /// # Panics
@@ -2682,4 +2788,11 @@ async fn oracle_query_status_cancel_is_tenant_scoped() {
 #[ignore = "requires the controlled Postgres journey harness"]
 async fn oracle_query_grpc_status_cancel_is_tenant_scoped() {
     pg_tests::oracle_query_grpc_status_cancel_impl().await;
+}
+
+/// A denied describe is refused with canonical audit evidence before admission.
+#[tokio::test]
+#[ignore = "requires the controlled Postgres journey harness"]
+async fn denied_describe_is_audited_before_admission() {
+    pg_tests::denied_describe_is_audited_before_admission_impl().await;
 }

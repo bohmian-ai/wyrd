@@ -256,7 +256,7 @@ def build_complete_bundle(tmp_path: Path, *, duplicate_model_alias: bool = False
         "triage_agent": (
             _card(
                 agent,
-                {"prompt": prompt, "tool_names": [], "run_config": {}, "publishes_to": []},
+                {"prompt": prompt, "tool_names": [], "run_config": {}, "verified_by": []},
                 _relationships((prompt, None)),
             ),
             ["agent_triage"],
@@ -277,7 +277,7 @@ def build_complete_bundle(tmp_path: Path, *, duplicate_model_alias: bool = False
                     },
                     "tool_names": [],
                     "run_config": {},
-                    "publishes_to": [],
+                    "verified_by": [],
                 },
             ),
             ["agent_inline"],
@@ -293,7 +293,7 @@ def build_complete_bundle(tmp_path: Path, *, duplicate_model_alias: bool = False
                         {"alias": "agent_triage", "ref": agent},
                         {"alias": "agent_inline", "ref": inline_agent},
                     ],
-                    "publishes_to": [],
+                    "verified_by": [],
                 },
                 _relationships(
                     (model, "model"),

@@ -17,6 +17,7 @@ pub mod prompt;
 pub mod service;
 pub mod source;
 pub mod trigger;
+pub mod verifier;
 pub mod workflow;
 
 pub use crate::ids::{ColumnName, FeatureName, QueryName, SplitName};
@@ -1936,7 +1937,9 @@ mod model_validation_tests {
 
 #[cfg(test)]
 mod drift_validation_tests {
-    use std::collections::BTreeMap;
+    //! Registration-time invariants of the Drift Verifier implementation:
+    //! the three executable method/signal pairs, the Statistical-only
+    //! condition, profile presence and shape, and catalog error routing.
 
     use crate::card::drift::{
         CustomProfile, DriftCondition, DriftMethod, DriftProfile, DriftSignal, DriftSpec,
@@ -1949,6 +1952,7 @@ mod drift_validation_tests {
     use crate::reference::{CardRef, Ref};
     use wyrd_semver::VersionBlock;
 
+    /// Build a durable reference in the `default` space.
     fn card_ref(kind: CardKind, name: &str, version: &str) -> Ref {
         Ref::Ref(CardRef {
             kind,
@@ -1959,14 +1963,17 @@ mod drift_validation_tests {
         })
     }
 
+    /// Build a Data reference usable as a Distribution baseline.
     fn data_ref(name: &str) -> Ref {
         card_ref(CardKind::Data, name, "1.0.0")
     }
 
+    /// Build a Model reference that is never a valid baseline.
     fn model_ref(name: &str) -> Ref {
         card_ref(CardKind::Model, name, "1.0.0")
     }
 
+    /// Build a valid PSI profile.
     fn psi_profile() -> PsiProfile {
         PsiProfile {
             binning_strategy: PsiBinningStrategy::EqualWidth { n_bins: 10 },
@@ -1975,6 +1982,7 @@ mod drift_validation_tests {
         }
     }
 
+    /// Build a valid SPC profile.
     fn spc_profile() -> SpcProfile {
         SpcProfile {
             sample_size: 0,
@@ -1983,6 +1991,7 @@ mod drift_validation_tests {
         }
     }
 
+    /// Build a valid Custom profile.
     fn custom_profile() -> CustomProfile {
         CustomProfile {
             metric_name: "latency".to_string(),
@@ -1991,6 +2000,7 @@ mod drift_validation_tests {
         }
     }
 
+    /// Build a one-feature Distribution signal over a Data baseline.
     fn distribution_signal() -> DriftSignal {
         DriftSignal::Distribution {
             baseline_ref: data_ref("baseline-data"),
@@ -1998,18 +2008,14 @@ mod drift_validation_tests {
         }
     }
 
+    /// Build a named scalar Metric signal.
     fn metric_signal() -> DriftSignal {
         DriftSignal::Metric {
             name: "latency".to_string(),
         }
     }
 
-    fn external_signal() -> DriftSignal {
-        DriftSignal::External {
-            source_ref: data_ref("source-data"),
-        }
-    }
-
+    /// Accept PSI over a Distribution with a Statistical condition.
     #[test]
     fn happy_path_psi_distribution_statistical() {
         let spec = DriftSpec::new(
@@ -2018,26 +2024,40 @@ mod drift_validation_tests {
             DriftCondition::Statistical,
             Some(DriftProfile::Psi(psi_profile())),
             None,
-            BTreeMap::new(),
         );
 
         assert!(spec.is_ok(), "{spec:?}");
     }
 
+    /// Accept SPC over a Distribution with a Statistical condition.
     #[test]
-    fn happy_path_external_method_with_comparator_condition() {
+    fn happy_path_spc_distribution_statistical() {
         let spec = DriftSpec::new(
-            DriftMethod::External,
-            external_signal(),
-            DriftCondition::Above { limit: 1.0 },
+            DriftMethod::Spc,
+            distribution_signal(),
+            DriftCondition::Statistical,
+            Some(DriftProfile::Spc(spc_profile())),
             None,
-            None,
-            BTreeMap::new(),
         );
 
         assert!(spec.is_ok(), "{spec:?}");
     }
 
+    /// Accept Custom over a Metric with a Statistical condition.
+    #[test]
+    fn happy_path_custom_metric_statistical() {
+        let spec = DriftSpec::new(
+            DriftMethod::Custom,
+            metric_signal(),
+            DriftCondition::Statistical,
+            Some(DriftProfile::Custom(custom_profile())),
+            None,
+        );
+
+        assert!(spec.is_ok(), "{spec:?}");
+    }
+
+    /// Reject PSI paired with a Metric signal.
     #[test]
     fn rejects_psi_with_metric_signal() {
         let err = DriftSpec::new(
@@ -2046,7 +2066,6 @@ mod drift_validation_tests {
             DriftCondition::Statistical,
             Some(DriftProfile::Psi(psi_profile())),
             None,
-            BTreeMap::new(),
         )
         .unwrap_err();
 
@@ -2056,15 +2075,36 @@ mod drift_validation_tests {
         ));
     }
 
+    /// Reject SPC paired with a Metric signal; SPC is Distribution-only.
     #[test]
-    fn rejects_custom_with_external_signal() {
+    fn rejects_spc_with_metric_signal() {
+        let err = DriftSpec::new(
+            DriftMethod::Spc,
+            metric_signal(),
+            DriftCondition::Statistical,
+            Some(DriftProfile::Spc(spc_profile())),
+            None,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            DriftValidationError::SignalMethodMismatch {
+                signal: "Metric".to_string(),
+                method: "Spc".to_string(),
+            }
+        );
+    }
+
+    /// Reject Custom paired with a Distribution signal.
+    #[test]
+    fn rejects_custom_with_distribution_signal() {
         let err = DriftSpec::new(
             DriftMethod::Custom,
-            external_signal(),
+            distribution_signal(),
             DriftCondition::Statistical,
             Some(DriftProfile::Custom(custom_profile())),
             None,
-            BTreeMap::new(),
         )
         .unwrap_err();
 
@@ -2074,6 +2114,7 @@ mod drift_validation_tests {
         ));
     }
 
+    /// Reject a Distribution baseline that is not a Data Card.
     #[test]
     fn rejects_distribution_with_non_data_baseline_ref() {
         let signal = DriftSignal::Distribution {
@@ -2087,7 +2128,6 @@ mod drift_validation_tests {
             DriftCondition::Statistical,
             Some(DriftProfile::Psi(psi_profile())),
             None,
-            BTreeMap::new(),
         )
         .unwrap_err();
 
@@ -2097,6 +2137,7 @@ mod drift_validation_tests {
         ));
     }
 
+    /// Reject a Distribution signal with no features.
     #[test]
     fn rejects_distribution_with_no_features() {
         let signal = DriftSignal::Distribution {
@@ -2110,7 +2151,6 @@ mod drift_validation_tests {
             DriftCondition::Statistical,
             Some(DriftProfile::Psi(psi_profile())),
             None,
-            BTreeMap::new(),
         )
         .unwrap_err();
 
@@ -2120,6 +2160,7 @@ mod drift_validation_tests {
         ));
     }
 
+    /// Reject a Distribution signal that repeats a feature.
     #[test]
     fn rejects_distribution_with_duplicate_features() {
         let signal = DriftSignal::Distribution {
@@ -2136,7 +2177,6 @@ mod drift_validation_tests {
             DriftCondition::Statistical,
             Some(DriftProfile::Psi(psi_profile())),
             None,
-            BTreeMap::new(),
         )
         .unwrap_err();
 
@@ -2146,62 +2186,54 @@ mod drift_validation_tests {
         ));
     }
 
+    /// Reject every non-Statistical condition, even with a valid profile.
     #[test]
-    fn rejects_eval_score_with_non_eval_ref() {
-        let signal = DriftSignal::EvalScore {
-            eval_ref: data_ref("not-eval"),
-        };
+    fn rejects_non_statistical_conditions() {
+        for (condition, name) in [
+            (DriftCondition::Above { limit: 1.0 }, "Above"),
+            (DriftCondition::Below { limit: 1.0 }, "Below"),
+            (
+                DriftCondition::Outside {
+                    lower: 1.0,
+                    upper: 10.0,
+                },
+                "Outside",
+            ),
+        ] {
+            let err = DriftSpec::new(
+                DriftMethod::Custom,
+                metric_signal(),
+                condition,
+                Some(DriftProfile::Custom(custom_profile())),
+                None,
+            )
+            .unwrap_err();
 
-        let err = DriftSpec::new(
-            DriftMethod::Spc,
-            signal,
-            DriftCondition::Statistical,
-            Some(DriftProfile::Spc(spc_profile())),
-            None,
-            BTreeMap::new(),
-        )
-        .unwrap_err();
-
-        assert!(matches!(
-            err,
-            DriftValidationError::EvalRefMustBeEval { .. }
-        ));
+            assert_eq!(
+                err,
+                DriftValidationError::ConditionNotStatistical {
+                    condition: name.to_string(),
+                }
+            );
+        }
     }
 
-    #[test]
-    fn rejects_external_source_ref_with_drift_kind() {
-        let signal = DriftSignal::External {
-            source_ref: card_ref(CardKind::Drift, "bad-source", "1.0.0"),
-        };
-
-        let err = DriftSpec::new(
-            DriftMethod::External,
-            signal,
-            DriftCondition::Above { limit: 1.0 },
-            None,
-            None,
-            BTreeMap::new(),
-        )
-        .unwrap_err();
-
-        assert!(matches!(err, DriftValidationError::SourceRefInvalidKind));
-    }
-
+    /// Reject a PSI spec with no profile.
     #[test]
     fn rejects_profile_required_for_psi() {
         let err = DriftSpec::new(
             DriftMethod::Psi,
             distribution_signal(),
-            DriftCondition::Above { limit: 1.0 },
+            DriftCondition::Statistical,
             None,
             None,
-            BTreeMap::new(),
         )
         .unwrap_err();
 
         assert!(matches!(err, DriftValidationError::ProfileRequired { .. }));
     }
 
+    /// Reject a profile variant that does not match the method.
     #[test]
     fn rejects_profile_variant_that_does_not_match_method() {
         let err = DriftSpec::new(
@@ -2210,7 +2242,6 @@ mod drift_validation_tests {
             DriftCondition::Statistical,
             Some(DriftProfile::Spc(spc_profile())),
             None,
-            BTreeMap::new(),
         )
         .unwrap_err();
 
@@ -2220,75 +2251,7 @@ mod drift_validation_tests {
         ));
     }
 
-    #[test]
-    fn rejects_profile_for_external_method() {
-        let err = DriftSpec::new(
-            DriftMethod::External,
-            external_signal(),
-            DriftCondition::Above { limit: 1.0 },
-            Some(DriftProfile::Psi(psi_profile())),
-            None,
-            BTreeMap::new(),
-        )
-        .unwrap_err();
-
-        assert!(matches!(
-            err,
-            DriftValidationError::ProfileForbiddenForExternal
-        ));
-    }
-
-    #[test]
-    fn rejects_external_method_with_statistical_condition() {
-        let err = DriftSpec::new(
-            DriftMethod::External,
-            external_signal(),
-            DriftCondition::Statistical,
-            None,
-            None,
-            BTreeMap::new(),
-        )
-        .unwrap_err();
-
-        assert!(matches!(
-            err,
-            DriftValidationError::StatisticalRequiresProfile
-        ));
-    }
-
-    #[test]
-    fn rejects_above_with_non_finite_limit() {
-        let err = DriftSpec::new(
-            DriftMethod::Custom,
-            metric_signal(),
-            DriftCondition::Above { limit: f64::NAN },
-            Some(DriftProfile::Custom(custom_profile())),
-            None,
-            BTreeMap::new(),
-        )
-        .unwrap_err();
-
-        assert!(matches!(err, DriftValidationError::NonFiniteLimit { .. }));
-    }
-
-    #[test]
-    fn rejects_outside_with_inverted_bounds() {
-        let err = DriftSpec::new(
-            DriftMethod::Custom,
-            metric_signal(),
-            DriftCondition::Outside {
-                lower: 10.0,
-                upper: 1.0,
-            },
-            Some(DriftProfile::Custom(custom_profile())),
-            None,
-            BTreeMap::new(),
-        )
-        .unwrap_err();
-
-        assert!(matches!(err, DriftValidationError::OutsideBoundsInverted));
-    }
-
+    /// Reject a PSI alpha outside `(0, 1)`.
     #[test]
     fn rejects_psi_alpha_out_of_range() {
         let mut profile = psi_profile();
@@ -2300,7 +2263,6 @@ mod drift_validation_tests {
             DriftCondition::Statistical,
             Some(DriftProfile::Psi(profile)),
             None,
-            BTreeMap::new(),
         )
         .unwrap_err();
 
@@ -2310,6 +2272,7 @@ mod drift_validation_tests {
         ));
     }
 
+    /// Reject a non-positive fixed PSI threshold.
     #[test]
     fn rejects_psi_fixed_threshold_when_not_positive() {
         let mut profile = psi_profile();
@@ -2321,13 +2284,13 @@ mod drift_validation_tests {
             DriftCondition::Statistical,
             Some(DriftProfile::Psi(profile)),
             None,
-            BTreeMap::new(),
         )
         .unwrap_err();
 
         assert!(matches!(err, DriftValidationError::PsiFixedInvalid));
     }
 
+    /// Reject a PSI bin count below two.
     #[test]
     fn rejects_psi_bin_count_out_of_range() {
         let mut profile = psi_profile();
@@ -2339,13 +2302,13 @@ mod drift_validation_tests {
             DriftCondition::Statistical,
             Some(DriftProfile::Psi(profile)),
             None,
-            BTreeMap::new(),
         )
         .unwrap_err();
 
         assert!(matches!(err, DriftValidationError::PsiBinCountOutOfRange));
     }
 
+    /// Reject an SPC sample size of exactly one.
     #[test]
     fn rejects_spc_sample_size_one() {
         let mut profile = spc_profile();
@@ -2353,17 +2316,17 @@ mod drift_validation_tests {
 
         let err = DriftSpec::new(
             DriftMethod::Spc,
-            metric_signal(),
+            distribution_signal(),
             DriftCondition::Statistical,
             Some(DriftProfile::Spc(profile)),
             None,
-            BTreeMap::new(),
         )
         .unwrap_err();
 
         assert!(matches!(err, DriftValidationError::SpcSampleSizeOutOfRange));
     }
 
+    /// Reject a WECO rule string containing a zero.
     #[test]
     fn rejects_malformed_spc_weco_rule() {
         let mut profile = spc_profile();
@@ -2371,17 +2334,17 @@ mod drift_validation_tests {
 
         let err = DriftSpec::new(
             DriftMethod::Spc,
-            metric_signal(),
+            distribution_signal(),
             DriftCondition::Statistical,
             Some(DriftProfile::Spc(profile)),
             None,
-            BTreeMap::new(),
         )
         .unwrap_err();
 
         assert!(matches!(err, DriftValidationError::SpcWecoMalformed));
     }
 
+    /// Reject a blank Custom metric name.
     #[test]
     fn rejects_custom_profile_with_empty_metric_name() {
         let mut profile = custom_profile();
@@ -2393,13 +2356,13 @@ mod drift_validation_tests {
             DriftCondition::Statistical,
             Some(DriftProfile::Custom(profile)),
             None,
-            BTreeMap::new(),
         )
         .unwrap_err();
 
         assert!(matches!(err, DriftValidationError::CustomMetricNameEmpty));
     }
 
+    /// Reject a negative Custom alert threshold.
     #[test]
     fn rejects_custom_profile_with_invalid_numbers() {
         let mut profile = custom_profile();
@@ -2411,13 +2374,13 @@ mod drift_validation_tests {
             DriftCondition::Statistical,
             Some(DriftProfile::Custom(profile)),
             None,
-            BTreeMap::new(),
         )
         .unwrap_err();
 
         assert!(matches!(err, DriftValidationError::CustomInvalidNumber));
     }
 
+    /// Route a signal/method mismatch to its dedicated catalog code.
     #[test]
     fn signal_method_mismatch_routes_to_dedicated_catalog_code() {
         let err: WyrdError = DriftValidationError::SignalMethodMismatch {
@@ -2442,6 +2405,7 @@ mod drift_validation_tests {
         );
     }
 
+    /// Route a missing profile to its dedicated catalog code.
     #[test]
     fn profile_required_routes_to_dedicated_catalog_code() {
         let err: WyrdError = DriftValidationError::ProfileRequired {
@@ -2461,9 +2425,13 @@ mod drift_validation_tests {
         );
     }
 
+    /// Route every other validation failure to the shared Drift catalog code.
     #[test]
     fn catch_all_routes_to_drift_validation_catalog_code() {
-        let err: WyrdError = DriftValidationError::OutsideBoundsInverted.into();
+        let err: WyrdError = DriftValidationError::ConditionNotStatistical {
+            condition: "Above".to_string(),
+        }
+        .into();
 
         assert_eq!(err.code(), "WYRD_DRIFT_400_VALIDATION");
         assert_eq!(err.status(), 400);
@@ -2476,8 +2444,8 @@ mod drift_validation_tests {
             Some("condition")
         );
         assert_eq!(
-            details.get("reason").and_then(|value| value.as_str()),
-            Some("lower_gte_upper")
+            details.get("got").and_then(|value| value.as_str()),
+            Some("Above")
         );
     }
 }
@@ -2559,9 +2527,18 @@ mod envelope_roundtrip_tests {
         .expect("static prompt spec is valid")
     }
 
+    /// Round-trip every checked-in peer Card fixture through the YAML codec.
     #[test]
     fn phase_1_addendum_fixtures_round_trip() {
         for fixture in [
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/verifier-drift.yaml"
+            )),
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/verifier-eval.yaml"
+            )),
             include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/tests/fixtures/trigger-on-drift.yaml"
@@ -2582,6 +2559,7 @@ mod envelope_roundtrip_tests {
         }
     }
 
+    /// Decode the Trigger fixture as a native Trigger Card.
     #[test]
     fn trigger_fixture_uses_native_trigger_kind() {
         let decoded: Card = format::yaml::from_str(include_str!(concat!(
@@ -2593,6 +2571,7 @@ mod envelope_roundtrip_tests {
         assert!(matches!(decoded.spec, Spec::Trigger(_)));
     }
 
+    /// Decode the Operator fixture as a native Operator Card.
     #[test]
     fn operator_fixture_uses_native_operator_kind() {
         let decoded: Card = format::yaml::from_str(include_str!(concat!(
@@ -2606,17 +2585,36 @@ mod envelope_roundtrip_tests {
 }
 
 #[cfg(test)]
-mod eval_card_tests {
+mod verifier_card_tests {
+    //! Verifier Card envelope contract: the two registrable implementations
+    //! decode from real YAML, and removed kinds, unknown implementation kinds,
+    //! and unknown fields fail before validation or persistence.
+
     use std::collections::BTreeMap;
 
     use crate::api_version::ApiVersion;
+    use crate::card::drift::{DriftMethod, DriftSignal};
     use crate::card::eval::EvalSpec;
+    use crate::card::verifier::{VerifierImplementation, VerifierSpec};
     use crate::envelope::{Card, CardKind, Metadata, Relationships, Spec};
     use crate::format;
     use crate::ids::CardName;
     use crate::vala::eval::{AssertionTask, ComparisonOperator, EvalTask, JsonPath, TaskId};
     use wyrd_semver::VersionBlock;
 
+    /// Checked-in Drift Verifier fixture.
+    const DRIFT_VERIFIER_YAML: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/verifier-drift.yaml"
+    ));
+
+    /// Checked-in Eval Verifier fixture.
+    const EVAL_VERIFIER_YAML: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/verifier-eval.yaml"
+    ));
+
+    /// Round-trip the Eval payload through JSON unchanged.
     #[test]
     fn card_body_eval_uses_vala_eval_shape() {
         let spec = eval_spec();
@@ -2626,11 +2624,12 @@ mod eval_card_tests {
         assert_eq!(spec, back);
     }
 
+    /// Wrap the Eval payload in a Verifier envelope and round-trip it as YAML.
     #[test]
-    fn eval_card_envelope_round_trips_with_vala_eval_shape() {
+    fn eval_verifier_envelope_round_trips_with_vala_eval_shape() {
         let card = Card {
             api_version: ApiVersion::v1(),
-            kind: CardKind::Eval,
+            kind: CardKind::Verifier,
             metadata: Metadata {
                 name: CardName::new("quality_eval").unwrap(),
                 version: Some(VersionBlock::parse("1.0.0").unwrap().into()),
@@ -2643,22 +2642,48 @@ mod eval_card_tests {
                 artifact_hash: None,
                 origin: None,
             },
-            spec: Spec::Eval(eval_spec()),
+            spec: Spec::Verifier(VerifierSpec {
+                description: None,
+                implementation: VerifierImplementation::Eval(eval_spec()),
+            }),
             relationships: Relationships::default(),
             status: None,
         };
 
         let yaml = format::yaml::to_string(&card).unwrap();
-        assert!(yaml.contains("kind: Eval"));
+        assert!(yaml.contains("kind: Verifier"));
+        assert!(yaml.contains("kind: eval"));
         assert!(yaml.contains("tasks:"));
         assert!(yaml.contains("kind: assertion"));
-        assert!(!yaml.contains("eval_type:"));
-        assert!(!yaml.contains("type: Eval"));
+        assert!(!yaml.contains("kind: Eval"));
 
         let decoded: Card = format::yaml::from_str(&yaml).unwrap();
         assert_eq!(decoded, card);
     }
 
+    /// Refuse a sibling key beside `implementation.kind` and `implementation.spec`.
+    ///
+    /// The adjacently tagged union is the only place an implementation body is
+    /// named, so an extra key there is either a misplaced field or pasted
+    /// credential; accepting it would drop the content silently on re-serialization.
+    ///
+    /// # Panics
+    /// Panics when the sibling key is accepted, or when the refusal does not
+    /// name it.
+    #[test]
+    fn verifier_implementation_rejects_sibling_keys() {
+        let error = serde_json::from_value::<VerifierSpec>(serde_json::json!({
+            "implementation": {
+                "kind": "eval",
+                "spec": { "tasks": {} },
+                "api_token": "sk-live-not-a-real-token",
+            }
+        }))
+        .expect_err("a sibling key beside kind/spec is refused");
+        assert!(error.to_string().contains("api_token"), "{error}");
+    }
+
+    /// Reject the retired Eval profile shape.
     #[test]
     fn legacy_eval_profile_json_no_longer_deserializes() {
         let legacy = r#"{
@@ -2672,6 +2697,89 @@ mod eval_card_tests {
         assert!(result.is_err());
     }
 
+    /// Decode the real Drift Verifier YAML into a validated PSI Distribution Verifier.
+    #[test]
+    fn drift_verifier_yaml_deserializes_as_verifier_card() {
+        let card: Card = format::yaml::from_str(DRIFT_VERIFIER_YAML).unwrap();
+
+        assert_eq!(card.kind, CardKind::Verifier);
+        let Spec::Verifier(verifier) = &card.spec else {
+            panic!("expected Verifier spec, got {:?}", card.spec);
+        };
+        let VerifierImplementation::Drift(drift) = &verifier.implementation else {
+            panic!("expected drift implementation");
+        };
+        assert_eq!(drift.method, DriftMethod::Psi);
+        assert!(matches!(drift.signal, DriftSignal::Distribution { .. }));
+        verifier
+            .validate()
+            .expect("fixture Drift Verifier is valid");
+    }
+
+    /// Decode the real Eval Verifier YAML into an Eval Verifier with its task map.
+    #[test]
+    fn eval_verifier_yaml_deserializes_as_verifier_card() {
+        let card: Card = format::yaml::from_str(EVAL_VERIFIER_YAML).unwrap();
+
+        assert_eq!(card.kind, CardKind::Verifier);
+        let Spec::Verifier(verifier) = &card.spec else {
+            panic!("expected Verifier spec, got {:?}", card.spec);
+        };
+        let VerifierImplementation::Eval(eval) = &verifier.implementation else {
+            panic!("expected eval implementation");
+        };
+        assert!(
+            eval.tasks
+                .contains_key(&TaskId::new("lookup_called").unwrap())
+        );
+        verifier.validate().expect("fixture Eval Verifier is valid");
+    }
+
+    /// Reject `kind: Drift` and `kind: Eval` envelopes; neither is a Card kind.
+    #[test]
+    fn removed_drift_and_eval_card_kinds_fail_to_deserialize() {
+        let drift_body = DRIFT_VERIFIER_YAML.replace("kind: Verifier", "kind: Drift");
+        let eval_body = EVAL_VERIFIER_YAML.replace("kind: Verifier", "kind: Eval");
+
+        for yaml in [drift_body, eval_body] {
+            let result: Result<Card, _> = format::yaml::from_str(&yaml);
+            assert!(result.is_err(), "removed kind must not decode: {yaml}");
+        }
+        assert!(serde_json::from_value::<CardKind>(serde_json::json!("Drift")).is_err());
+        assert!(serde_json::from_value::<CardKind>(serde_json::json!("Eval")).is_err());
+    }
+
+    /// Reject an `implementation.kind` outside the closed `drift | eval` set.
+    #[test]
+    fn unknown_implementation_kind_fails_to_deserialize() {
+        let yaml = EVAL_VERIFIER_YAML.replace("kind: eval", "kind: future");
+
+        let result: Result<Card, _> = format::yaml::from_str(&yaml);
+
+        assert!(
+            result.is_err(),
+            "future implementation kind must not decode"
+        );
+    }
+
+    /// Reject an unknown field directly inside `VerifierSpec`.
+    #[test]
+    fn unknown_verifier_spec_field_fails_to_deserialize() {
+        let yaml = EVAL_VERIFIER_YAML.replace(
+            "spec:\n  implementation:",
+            "spec:\n  thresholds: {}\n  implementation:",
+        );
+        assert_ne!(yaml, EVAL_VERIFIER_YAML, "fixture edit must apply");
+
+        let result: Result<Card, _> = format::yaml::from_str(&yaml);
+
+        assert!(
+            result.is_err(),
+            "unknown VerifierSpec field must not decode"
+        );
+    }
+
+    /// Build a one-assertion Eval payload.
     fn eval_spec() -> EvalSpec {
         let mut tasks = BTreeMap::new();
         let id = TaskId::new("a").unwrap();
@@ -2697,10 +2805,16 @@ mod kind_tests {
     use proptest::prelude::*;
     use serde_json::json;
 
+    /// Lock 16 native kinds (15 registrable plus `External`), with `Verifier`
+    /// replacing both `Drift` and `Eval`.
     #[test]
     fn native_card_kind_count_is_locked() {
         assert_eq!(CardKind::native().len(), CardKind::NATIVE_COUNT);
-        assert_eq!(CardKind::NATIVE_COUNT, 17);
+        assert_eq!(CardKind::NATIVE_COUNT, 16);
+        assert_eq!(CardKind::registrable().len(), CardKind::REGISTRABLE_COUNT);
+        assert_eq!(CardKind::REGISTRABLE_COUNT, 15);
+        assert!(CardKind::registrable().contains(&CardKind::Verifier));
+        assert!(!CardKind::registrable().contains(&CardKind::External));
         assert!(
             CardKind::native()
                 .iter()
@@ -2737,6 +2851,7 @@ mod kind_tests {
         assert_eq!(decoded, CardKind::External);
     }
 
+    /// Publish exactly the 15 registrable kinds in the CardKind schema.
     #[test]
     fn card_kind_schema_is_string_enum_with_registrable_kinds() {
         let schema = schemars::schema_for!(CardKind);
@@ -2753,7 +2868,10 @@ mod kind_tests {
         assert!(!enum_values.contains(&json!("Tool")));
         assert!(!enum_values.contains(&json!("Skill")));
         assert!(!enum_values.contains(&json!("SubAgent")));
-        assert_eq!(enum_values.len(), 16);
+        assert!(enum_values.contains(&json!("Verifier")));
+        assert!(!enum_values.contains(&json!("Drift")));
+        assert!(!enum_values.contains(&json!("Eval")));
+        assert_eq!(enum_values.len(), 15);
     }
 
     proptest! {

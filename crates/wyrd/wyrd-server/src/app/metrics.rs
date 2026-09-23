@@ -63,6 +63,24 @@ pub const VALA_POSTGRES_POOL_ACQUIRE_SECONDS: &str = "vala_postgres_pool_acquire
 /// Shared storage operation latency.
 pub const WYRD_STORAGE_OPERATION_DURATION_SECONDS: &str = "wyrd_storage_operation_duration_seconds";
 
+/// Non-terminal Verifier runs and Operator dispatches, by `queue` and `status`.
+pub const VERIFICATION_QUEUE_DEPTH: &str = "wyrd_verification_queue_depth";
+/// Verifier executions currently holding a runtime permit in this process.
+pub const VERIFICATION_ACTIVE_RUNS: &str = "wyrd_verification_active_runs";
+/// Verifier run attempts this process claimed, by `implementation`.
+pub const VERIFICATION_RUN_ATTEMPTS_TOTAL: &str = "wyrd_verification_run_attempts_total";
+/// Verifier attempts that did not complete, by `implementation` and `status`.
+pub const VERIFICATION_RUN_FAILURES_TOTAL: &str = "wyrd_verification_run_failures_total";
+/// Claim-to-settlement latency of one Verifier attempt, by `implementation` and `outcome`.
+pub const VERIFICATION_RUN_DURATION_SECONDS: &str = "wyrd_verification_run_duration_seconds";
+/// Scheduler occurrences processed, by `outcome`.
+pub const VERIFICATION_SCHEDULE_TICKS_TOTAL: &str = "wyrd_verification_schedule_ticks_total";
+/// Whether each verification runtime capability task is running, by `capability`.
+pub const VERIFICATION_CAPABILITY_UP: &str = "wyrd_verification_capability_up";
+/// Unexpected verification capability exits that were restarted, by `capability`.
+pub const VERIFICATION_CAPABILITY_RESTARTS_TOTAL: &str =
+    "wyrd_verification_capability_restarts_total";
+
 /// Every production Bifrost duration family whose p99 is consumed by qualification.
 const BIFROST_P99_DURATION_FAMILIES: &[&str] = &[
     BIFROST_QUERY_DURATION_SECONDS,
@@ -180,6 +198,11 @@ pub fn install_recorder() -> Result<PrometheusHandle, MetricsError> {
         .set_buckets_for_metric(
             Matcher::Full(HTTP_REQUEST_DURATION_SECONDS.to_owned()),
             REQUEST_DURATION_BUCKETS,
+        )
+        .map_err(MetricsError::Buckets)?
+        .set_buckets_for_metric(
+            Matcher::Full(VERIFICATION_RUN_DURATION_SECONDS.to_owned()),
+            BIFROST_DURATION_BUCKETS,
         )
         .map_err(MetricsError::Buckets)?;
     for family in BIFROST_P99_DURATION_FAMILIES {

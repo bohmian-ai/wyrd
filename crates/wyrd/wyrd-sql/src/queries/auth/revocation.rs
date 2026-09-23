@@ -38,7 +38,9 @@ pub async fn suspend_user_principal(
 
 /// Suspend a service or agent principal in the caller's tenant.
 ///
-/// Same contract as [`suspend_user_principal`], on the machine table.
+/// Same contract as [`suspend_user_principal`], on the machine table. The
+/// internal SYSTEM writer has no lifecycle, so it never matches and reads as
+/// not found.
 ///
 /// # Errors
 /// Returns a SQLx error on database failure.
@@ -53,6 +55,7 @@ pub async fn suspend_service_account_principal(
                updated_at = now()
          WHERE data_tenant_id = wyrd.current_tenant()
            AND id = $1
+           AND principal_kind <> 'system'
         "#,
     )
     .bind(id)

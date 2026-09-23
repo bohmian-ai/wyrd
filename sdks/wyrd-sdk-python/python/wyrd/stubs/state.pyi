@@ -3,9 +3,11 @@
 from collections.abc import Mapping
 from pathlib import Path
 
+from ..bifrost import TableConfig
 from ..cards import AgentCard, CardKind, CardRef, DataLoadArgs, ModelLoadArgs
 from ..data import DataCard
 from ..model import ModelCard
+from ..observe import Run
 from ..prompt import PromptCard
 
 #### end of imports ####
@@ -146,6 +148,66 @@ class WyrdState:
         """
         ...
 
+    def start_bifrost(
+        self,
+        table: TableConfig | None = None,
+        server_url: str | None = None,
+        credential: str | None = None,
+        grpc_url: str | None = None,
+    ) -> None:
+        """Connect this state's one Bifrost writer and describe the fixed tables.
+
+        The four arguments are ``Bifrost(...)``'s and pass straight through,
+        including its environment and default resolution. Startup describes
+        ``vala.drift.observations`` and ``vala.eval.observations`` before
+        succeeding, so a run can never enqueue against a missing, unauthorized,
+        or incompatible system table. ``table`` keeps its existing Bifrost
+        meaning and does not choose a run's destination.
+
+        Raises:
+            WyrdError: ``WYRD_SDK_409_BIFROST_ALREADY_STARTED`` when this state
+                already started Bifrost, ``WYRD_SDK_409_BIFROST_CLOSED`` after a
+                successful shutdown, or the catalog code for a missing
+                credential, an undialable ingest channel, or a fixed table that
+                is absent, unauthorized, or incompatible.
+        """
+        ...
+
+    def run(self) -> Run:
+        """Open one invocation, targeting the root Service Card.
+
+        Local only: no network IO, no server-side Run resource, and no Verifier
+        execution.
+        """
+        ...
+
+    def flush(self) -> None:
+        """Drain every producer of this state's writer without closing it.
+
+        The explicit durability barrier for a test or a finite job.
+
+        Raises:
+            WyrdError: ``WYRD_SDK_400_BIFROST_NOT_STARTED`` before startup,
+                ``WYRD_SDK_409_BIFROST_CLOSED`` after shutdown, or the first
+                producer or sink failure.
+        """
+        ...
+
+    def shutdown(self) -> None:
+        """Drain every producer of this state's writer and close it to writes.
+
+        Call this once at graceful application shutdown, not after each
+        observation: queue admission is not a durable acknowledgement, so an
+        abrupt exit before this returns can lose pending rows. After an
+        ambiguous failure, retry ``shutdown()`` on the same state rather than
+        replacing the writer. A successfully shut-down state stays closed;
+        create a new ``WyrdState`` to start again.
+
+        Raises:
+            WyrdError: The first producer or sink failure from the drain.
+        """
+        ...
+
     @property
     def service(self) -> CardEnvelope:
         """Return the exact root Service envelope, independent of aliases."""
@@ -204,19 +266,13 @@ class WyrdState:
         """
         ...
 
-    def eval(self, alias: str) -> CardEnvelope:
-        """Return the kind-checked Eval envelope selected by ``alias``.
+    def verifier(self, alias: str) -> CardEnvelope:
+        """Return the kind-checked Verifier envelope selected by ``alias``.
+
+        The typed Drift or Eval body lives under ``spec["implementation"]``.
 
         Raises:
-            WyrdError: For an unknown alias or non-Eval Card.
-        """
-        ...
-
-    def drift(self, alias: str) -> CardEnvelope:
-        """Return the kind-checked Drift envelope selected by ``alias``.
-
-        Raises:
-            WyrdError: For an unknown alias or non-Drift Card.
+            WyrdError: For an unknown alias or non-Verifier Card.
         """
         ...
 

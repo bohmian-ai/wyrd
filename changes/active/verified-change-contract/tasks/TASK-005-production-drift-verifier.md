@@ -3,9 +3,9 @@ id: TASK-005
 kind: implementation
 status: proposed
 spec: SPEC-verified-change-contract
-spec_revision: 32
-requirements: [REQ-072, REQ-073, REQ-074, REQ-080, REQ-082, REQ-085, REQ-110, REQ-113, REQ-134, INV-004, INV-010, INV-012, AC-012, AC-013, AC-020, AC-024, AC-028]
-depends_on: [TASK-004]
+spec_revision: 35
+requirements: [REQ-072, REQ-073, REQ-074, REQ-080, REQ-082, REQ-085, REQ-110, REQ-113, REQ-134, REQ-152, INV-004, INV-010, INV-012, INV-015, AC-012, AC-013, AC-020, AC-024, AC-028, AC-033]
+depends_on: [TASK-004, TASK-010]
 ---
 
 ## Outcome and Value
@@ -67,7 +67,8 @@ checks already expressed by typed contracts.
 exact Data version and registered Parquet artifact, reads Arrow, calls existing
 fitters, and exposes pending/building/ready/failed plus structured errors.
 Interrupted/failed work retries through the same row; all Pandas/Polars/Arrow
-Data authoring paths produce usable Parquet.
+Data authoring paths produce usable Parquet. PostgreSQL assigns and evaluates
+every fitter claim, lease, due time, and retry deadline using its own clock.
 
 **RED.** Add real storage/Postgres/server cases for readiness, each authoring
 path, wrong artifact, fit failure, lease expiry, restart, tenant isolation, and

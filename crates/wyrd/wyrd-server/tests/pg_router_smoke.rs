@@ -9,6 +9,8 @@
 //! caller cannot distinguish a real `/v1` route from a missing one.
 
 use std::sync::Arc;
+#[cfg(feature = "test-support")]
+use std::time::Duration;
 
 use axum::body::to_bytes;
 use axum::http::{Request, StatusCode};
@@ -345,6 +347,7 @@ async fn readyz_returns_ok_when_all_probes_pass() {
         peer: ok_probe,
         forge_coordinator: None,
         forge_worker: None,
+        verification: None,
     }));
 
     let response = server
@@ -975,10 +978,13 @@ async fn blocked_renewal_cannot_suppress_cutoff_or_bounded_settlement() {
 
     // Hold the epoch row itself. Renewal is the only statement the live epoch
     // issues against it, so this stalls the renewal inside Postgres without
-    // touching the deadlines the supervisor already derived.
+    // touching the deadlines the supervisor already derived. No renewal can
+    // confirm past this hold, so the lease Postgres reports now fixes the
+    // cutoff the supervisor must enforce: `EXPECTED_CUTOFF_LEAD` before expiry.
     let mut gate = pool.begin().await.expect("epoch gate transaction begins");
-    sqlx::query(
-        "SELECT state_revision FROM vala.oracle_reader_epochs \
+    let lease_remaining: f64 = sqlx::query_scalar(
+        "SELECT EXTRACT(EPOCH FROM lease_expires_at - clock_timestamp())::float8 \
+           FROM vala.oracle_reader_epochs \
           WHERE node_id = $1 AND fencing_token = $2 FOR UPDATE",
     )
     .bind(node_id)
@@ -986,6 +992,10 @@ async fn blocked_renewal_cannot_suppress_cutoff_or_bounded_settlement() {
     .fetch_one(&mut *gate)
     .await
     .expect("the epoch row is held");
+    let cutoff_bound = tokio::time::Instant::now()
+        + std::time::Duration::from_secs_f64(lease_remaining.max(0.0))
+            .saturating_sub(EXPECTED_CUTOFF_LEAD)
+        + CUTOFF_SCHEDULING_SLACK;
 
     // The renewal cadence is short relative to the lease, so the stall is
     // observable long before the cutoff the test is waiting for.
@@ -1008,10 +1018,10 @@ async fn blocked_renewal_cannot_suppress_cutoff_or_bounded_settlement() {
             authority.admits()
         );
     }
-    // Collapse only after SQL proves renewal is blocked: the supervisor must
-    // enforce its updated confirmed cutoff while that renewal cannot finish.
-    authority.collapse_lease_for_test();
-    if tokio::time::timeout(FORGE_READINESS_CEILING, async {
+    // The supervisor captured its confirmed cutoff before this renewal began,
+    // and the stalled renewal holds the lifecycle, so nothing can move that
+    // cutoff now: it must close admission on its own before the lease expires.
+    if tokio::time::timeout_at(cutoff_bound, async {
         while authority.admits() {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
@@ -1187,6 +1197,25 @@ const MALFORMED_PLAN: &str = r#"{"version":1,"inputs":["a.parquet"],"parameters"
 #[cfg(feature = "test-support")]
 const LIVE_REWRITE_PLAN: &str =
     r#"{"version":1,"inputs":["a.parquet"],"parameters":{"kind":"live_rewrite"}}"#;
+
+/// How far before database lease expiry the Oracle must close admission.
+///
+/// Mirrors `EPOCH_DATABASE_TIME_ALLOWANCE` (2s) plus `EPOCH_READINESS_MARGIN`
+/// (8s) in `vala-bifrost-redux/src/oracle/reader_pins.rs`, which are
+/// crate-private. The stalled-renewal wait is bounded by expiry minus this
+/// lead, so a cutoff that slips toward the expiry fails the test; update it
+/// together with those constants.
+#[cfg(feature = "test-support")]
+const EXPECTED_CUTOFF_LEAD: Duration = Duration::from_secs(10);
+
+/// Scheduling allowance past the expected admission cutoff for a stalled
+/// renewal.
+///
+/// It only absorbs a loaded test runner waking the waiter late; it stays well
+/// inside `EXPECTED_CUTOFF_LEAD`, so a cutoff that slips toward the lease
+/// expiry still fails.
+#[cfg(feature = "test-support")]
+const CUTOFF_SCHEDULING_SLACK: Duration = Duration::from_secs(2);
 
 /// Diagnostic ceiling for one Forge role transition.
 ///
@@ -1664,6 +1693,9 @@ async fn coordinator_standby_pass_is_not_ready() {
         .expect("the scheduler composes")
         .expect("the default target selects a coordinator");
     let handle = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(scheduler));
+    // Observe the immediate boot pass first, so each driven pass below is the
+    // one it requested rather than a pass already in flight.
+    await_boot_scheduler_pass(&server, "standby boot pass").await;
 
     drive_scheduler_pass(&server, "standby pass").await;
     assert!(

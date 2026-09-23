@@ -7,6 +7,7 @@
 //! asymmetry is the server's, and it is why [`Bifrost::sql`] takes a query and
 //! [`Bifrost::insert`] takes only a row.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::WyrdClient;
@@ -14,6 +15,7 @@ use crate::config::ClientConfig;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use serde::de::DeserializeOwned;
+use tokio::sync::Mutex as AsyncMutex;
 use wyrd_queue::QueueConfig;
 use wyrd_queue::{BatchSink, ClientByteGuard, DurableBatchAck, SealedBatch, SinkError};
 use wyrd_spec::request_id::RequestId;
@@ -31,7 +33,7 @@ use crate::bifrost::query::{
 };
 use crate::bifrost::scope::ClientScope;
 use crate::bifrost::sink::BifrostIngestSink;
-use crate::bifrost::table::{Correlation, TableConfig};
+use crate::bifrost::table::{Correlation, TableConfig, WriterTable};
 
 /// The one Bifrost client: query any authorized table, write to the active one.
 ///
@@ -49,6 +51,19 @@ pub struct Bifrost {
     writer: Arc<WriterPool>,
     /// The table [`Bifrost::insert`] enqueues into, if one is bound.
     active: Mutex<Option<TableConfig>>,
+    /// Described user schemas, keyed by fully-qualified table name.
+    ///
+    /// Populated by [`Bifrost::writer_table`] and never evicted: one schema is
+    /// authoritative per table name for this connected writer's lifetime, so a
+    /// describe is paid once per table rather than once per observation.
+    described: Mutex<HashMap<Arc<str>, WriterTable>>,
+    /// Serializes cache-miss describes so racing first uses of one table pay
+    /// one describe (and one authorization decision), not one each.
+    ///
+    /// ponytail: one gate for every table, so first misses of different
+    /// tables also queue behind each other; per-table gating only if distinct
+    /// first uses ever contend on a hot path.
+    describe_gate: AsyncMutex<()>,
 }
 
 impl Bifrost {
@@ -132,6 +147,8 @@ impl Bifrost {
                 config,
             )),
             active: Mutex::new(table),
+            described: Mutex::new(HashMap::new()),
+            describe_gate: AsyncMutex::new(()),
         }
     }
 
@@ -172,6 +189,8 @@ impl Bifrost {
                 config,
             )),
             active: Mutex::new(table),
+            described: Mutex::new(HashMap::new()),
+            describe_gate: AsyncMutex::new(()),
         })
     }
 
@@ -255,6 +274,108 @@ impl Bifrost {
         let table = TableConfig::describe(self.query.client(), fqn).await?;
         self.use_table(table);
         Ok(())
+    }
+
+    /// Describe `fqn` once and return its cached destination for writes.
+    ///
+    /// This is the routing door for a caller that writes more than one table
+    /// from one client — an instrumented application emitting observations
+    /// alongside its own records. It deliberately does **not** touch the active
+    /// binding: [`Self::use_table_by_name`] performs a remote describe *and*
+    /// replaces the handle's shared active table, so two concurrent scoped
+    /// callers would race each other's destination. Returning a
+    /// [`WriterTable`] instead gives each caller its own immutable route.
+    ///
+    /// The first call for a table describes it; later calls return the cached
+    /// schema without network IO. A miss takes this writer's describe gate and
+    /// rechecks the cache under it, so concurrent first calls for one table
+    /// perform one describe and every caller receives that one schema and its
+    /// one pooled producer for this writer's lifetime.
+    ///
+    /// Describing proves only that the table exists and is accessible. Row
+    /// values are checked against the schema when the queue seals a batch, and
+    /// the server checks the registered fingerprint, so this returning is not a
+    /// durability or whole-row-validation acknowledgement.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stable not-found, authentication, authorization,
+    /// availability, or protocol error the server reported for an unknown,
+    /// unauthorized, or unavailable table, or a schema-parse error when the
+    /// description cannot be mapped back to Arrow.
+    ///
+    /// # Cancellation
+    ///
+    /// Abandoning the future leaves no server state behind and caches nothing;
+    /// describe is a read, and dropping the future releases the gate to the
+    /// next waiter, which describes in its place.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the described-table lock is poisoned.
+    pub async fn writer_table(&self, fqn: &str) -> Result<WriterTable, BifrostClientError> {
+        if let Some(table) = self.cached_writer_table(fqn) {
+            return Ok(table);
+        }
+        let _gate = self.describe_gate.lock().await;
+        if let Some(table) = self.cached_writer_table(fqn) {
+            return Ok(table);
+        }
+        let config = TableConfig::describe(self.query.client(), fqn).await?;
+        let described = WriterTable::new(fqn, config.user_schema().clone());
+        self.described
+            .lock()
+            .expect("described table lock poisoned")
+            .insert(Arc::from(fqn), described.clone());
+        Ok(described)
+    }
+
+    /// The cached destination for `fqn`, if this writer has described it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the described-table lock is poisoned.
+    #[must_use]
+    pub fn cached_writer_table(&self, fqn: &str) -> Option<WriterTable> {
+        self.described
+            .lock()
+            .expect("described table lock poisoned")
+            .get(fqn)
+            .cloned()
+    }
+
+    /// Enqueue one JSON row into an explicitly named described table.
+    ///
+    /// The routing counterpart to [`Self::insert`]: the destination travels
+    /// with the row rather than coming from the handle's shared active binding,
+    /// so concurrent callers writing different tables never disturb each other.
+    /// Correlation columns are added by the queue; they are not fields in
+    /// `row`.
+    ///
+    /// Synchronous for the same reason [`Self::insert`] is — enqueueing is a
+    /// bounded, non-blocking channel send — and durable only after
+    /// [`Self::flush`] or [`Self::shutdown`] resolves.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostClientError::Queue`] with `WYRD_CLIENT_429_QUEUE_FULL`
+    /// when the producer channel, its staging ring, and the byte budget are all
+    /// occupied.
+    pub fn insert_into(
+        &self,
+        table: &WriterTable,
+        row: Vec<u8>,
+        correlation: Correlation,
+    ) -> Result<(), BifrostClientError> {
+        self.writer
+            .insert(
+                table.fqn(),
+                table.user_schema(),
+                row,
+                correlation.card_ref,
+                correlation.run_id,
+            )
+            .map_err(Into::into)
     }
 
     /// The active write binding, if any.

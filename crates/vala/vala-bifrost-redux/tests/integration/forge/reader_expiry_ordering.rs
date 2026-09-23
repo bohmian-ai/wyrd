@@ -193,7 +193,16 @@ async fn reader_and_expiration_claim_have_one_table_local_winner() {
 
     // A header remains a root regardless of its epoch's liveness: only its
     // durable removal makes it absent.
+    // The collapse only changes the supervisor's next deadline read, so wait
+    // for it to actually fence the epoch; within one renewal interval it does.
     authority.collapse_lease_for_test();
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        while authority.admits() {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the collapsed epoch loses its lease and closes admission");
     let still_lost = prepare_expiration(&fixture, &orders, &contested, &[70]).await;
     assert!(
         still_lost.is_err(),

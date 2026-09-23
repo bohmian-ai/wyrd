@@ -8,11 +8,11 @@ order: 30
 
 # Evaluate
 
-<Aside title="Reserved — coming when EvalCard ships" data-variant="not">
+<Aside title="Reserved — coming when continuous Eval ships" data-variant="not">
 
-Evaluate recipes will be added as the EvalCard runtime contract ships. The
-`EvalCard` spec is authored and the JSON Schema is checked in; the runtime
-implementation is not yet available.
+Evaluate recipes will be added as the continuous Eval runtime ships. Eval is a
+`Verifier` implementation (`implementation.kind: eval`), not a separate card
+kind; the Verifier spec is authored and its JSON Schema is checked in.
 
 </Aside>
 
@@ -22,5 +22,5 @@ Evaluate capability covers:
 - Comparing model outputs against collected production records
 - Running `wyrd eval` from the CLI
 
-These how-to pages will be added alongside the EvalCard runtime. See what runs
+These how-to pages will be added alongside the continuous Eval runtime. See what runs
 today in the [Overview](/overview/).

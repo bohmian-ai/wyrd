@@ -43,12 +43,6 @@ pub fn print_local_summary(
     }
 }
 
-/// Print server protocol completion.
-pub fn print_server_run_complete(server_url: &url::Url, run_id: &wyrd_spec::vala::ids::RunId) {
-    println!("Eval run {run_id} complete on {server_url}");
-    println!("Results are server-side; the v1 protocol has no results-fetch route.");
-}
-
 /// Return true when no pass gate failed.
 #[must_use]
 pub fn pass_gate_satisfied(run: &EvalResults) -> bool {

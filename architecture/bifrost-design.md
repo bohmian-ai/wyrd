@@ -87,7 +87,14 @@ plan-root `TenantTripwireExec` enforce the same tenant. A mismatched row fails
 closed with `WYRD_VALA_500_TENANT_TRIPWIRE`.
 
 Built-in and user-defined tables share this physical model. "Built-in" names
-definition ownership, not a weaker tenant scope or a separate storage mode.
+definition ownership, not a weaker tenant scope or a separate storage mode. A
+built-in's per-tenant row is materialized on first use from its owning
+definition rather than seeded at tenant provisioning, and describing one
+materializes it exactly as ingesting into it does. A client that must confirm a
+fixed table before it writes — an SDK describing `vala.drift.observations` and
+`vala.eval.observations` at startup — therefore sees the same table a first
+ingest would create, instead of a missing-table error in a tenant that has not
+written yet.
 
 ## Durability and visibility
 
@@ -490,13 +497,21 @@ they emit no audit event. The publication path therefore evaluates no new
 permission and appends nothing, so retained audit history cannot feed itself.
 
 `vala.system.audit_log` partitions daily, deviating from the hourly granularity
-every other built-in table uses. Forge cannot bin-pack across partition
+of the high-rate telemetry tables. Forge cannot bin-pack across partition
 boundaries, so hourly partitions would permanently cap every audit object at one
 hour of a tenant's audit traffic regardless of compaction settings. Audit also
 differs from the telemetry tables on every axis partition granularity responds
 to: one row per authorized request rather than continuous high-rate ingest,
 date-range rather than recent-window queries, and retention measured in years
 rather than days.
+
+The five verification tables — `vala.drift.observations`,
+`vala.eval.observations`, `vala.verification.results`,
+`vala.drift.result_features`, and `vala.eval.result_items` — also partition by
+UTC day on `wyrd_event_time`, never by Verifier, subject, binding, or tenant
+ID. Every row of one Verification Result carries the same server-chosen event
+time, so a result and its detail rows never split across day partitions. A
+Drift schedule window does not determine partition size.
 
 ## Maintenance: Forge
 
@@ -761,8 +776,8 @@ The surface includes:
 - agent-facing read and write operations governed by explicit permissions.
 
 Observation namespaces such as `vala.traces`, `vala.metrics`, `vala.logs`,
-`vala.eval`, `vala.drift`, `vala.dev`, and `vala.system` remain
-tenant-qualified Bifrost tables. Canonical SQL is their only read contract;
+`vala.eval`, `vala.drift`, `vala.verification`, `vala.dev`, and `vala.system`
+remain tenant-qualified Bifrost tables. Canonical SQL is their only read contract;
 the namespace does not create another storage or authorization model.
 
 Permissions are scoped through `BifrostTable`, `BifrostRecord`, and

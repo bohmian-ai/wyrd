@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "DriftSpec",
-  "description": "DriftCard spec body.",
+  "description": "Drift Verifier implementation spec body.\n\nReached only as `implementation.spec` on a `Verifier` Card; `drift` is an implementation discriminator, never an envelope `kind`.",
   "type": "object",
   "required": [
     "condition",
@@ -24,13 +24,6 @@
         "null"
       ]
     },
-    "details": {
-      "description": "Free-form non-secret authoring metadata.",
-      "type": "object",
-      "additionalProperties": {
-        "$ref": "#/definitions/NonSecretValue"
-      }
-    },
     "method": {
       "description": "Drift detection method. Drives which `DriftProfile` variant is allowed.",
       "allOf": [
@@ -40,7 +33,7 @@
       ]
     },
     "profile": {
-      "description": "Method-specific math configuration. Required for `Psi | Spc | Custom`, forbidden for `External`.",
+      "description": "Method-specific math configuration. Required for every executable method/signal pair and must match `method`.",
       "anyOf": [
         {
           "$ref": "#/definitions/DriftProfile"
@@ -72,8 +65,7 @@
         "Prompt",
         "Agent",
         "Workflow",
-        "Eval",
-        "Drift",
+        "Verifier",
         "Service",
         "Policy",
         "Mcp",
@@ -261,13 +253,6 @@
           "enum": [
             "Custom"
           ]
-        },
-        {
-          "description": "Drift method defined externally, with no Vala-side fit or score.",
-          "type": "string",
-          "enum": [
-            "External"
-          ]
         }
       ]
     },
@@ -442,167 +427,12 @@
               "type": "string"
             }
           }
-        },
-        {
-          "description": "Score stream produced by an Eval card.",
-          "type": "object",
-          "required": [
-            "eval_ref",
-            "kind"
-          ],
-          "properties": {
-            "eval_ref": {
-              "description": "Eval card whose score stream this drift consumes.",
-              "allOf": [
-                {
-                  "$ref": "#/definitions/Ref"
-                }
-              ]
-            },
-            "kind": {
-              "type": "string",
-              "enum": [
-                "EvalScore"
-              ]
-            }
-          }
-        },
-        {
-          "description": "Measurement from an external system, such as Prometheus or OTel.",
-          "type": "object",
-          "required": [
-            "kind",
-            "source_ref"
-          ],
-          "properties": {
-            "kind": {
-              "type": "string",
-              "enum": [
-                "External"
-              ]
-            },
-            "source_ref": {
-              "description": "Source card describing where to read the external measurement.",
-              "allOf": [
-                {
-                  "$ref": "#/definitions/Ref"
-                }
-              ]
-            }
-          }
         }
       ]
     },
     "FeatureName": {
-      "description": "Feature column name referenced by a DriftCard signal.",
+      "description": "Feature column name referenced by a drift Verifier signal.",
       "type": "string"
-    },
-    "NonSecretValue": {
-      "description": "Non-secret JSON-like configuration value.",
-      "oneOf": [
-        {
-          "description": "String value.",
-          "type": "object",
-          "required": [
-            "type",
-            "value"
-          ],
-          "properties": {
-            "type": {
-              "type": "string",
-              "enum": [
-                "str"
-              ]
-            },
-            "value": {
-              "type": "string"
-            }
-          }
-        },
-        {
-          "description": "Numeric value.",
-          "type": "object",
-          "required": [
-            "type",
-            "value"
-          ],
-          "properties": {
-            "type": {
-              "type": "string",
-              "enum": [
-                "number"
-              ]
-            },
-            "value": {
-              "type": "number",
-              "format": "double"
-            }
-          }
-        },
-        {
-          "description": "Boolean value.",
-          "type": "object",
-          "required": [
-            "type",
-            "value"
-          ],
-          "properties": {
-            "type": {
-              "type": "string",
-              "enum": [
-                "bool"
-              ]
-            },
-            "value": {
-              "type": "boolean"
-            }
-          }
-        },
-        {
-          "description": "List of non-secret values.",
-          "type": "object",
-          "required": [
-            "type",
-            "value"
-          ],
-          "properties": {
-            "type": {
-              "type": "string",
-              "enum": [
-                "list"
-              ]
-            },
-            "value": {
-              "type": "array",
-              "items": {
-                "$ref": "#/definitions/NonSecretValue"
-              }
-            }
-          }
-        },
-        {
-          "description": "Object of non-secret values.",
-          "type": "object",
-          "required": [
-            "type",
-            "value"
-          ],
-          "properties": {
-            "type": {
-              "type": "string",
-              "enum": [
-                "object"
-              ]
-            },
-            "value": {
-              "type": "object",
-              "additionalProperties": {
-                "$ref": "#/definitions/NonSecretValue"
-              }
-            }
-          }
-        }
-      ]
     },
     "PsiBinningStrategy": {
       "description": "PSI numeric binning strategy.",

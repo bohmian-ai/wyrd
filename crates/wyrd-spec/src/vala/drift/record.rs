@@ -8,8 +8,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::ids::FeatureName;
-use crate::reference::CardRef;
-use crate::vala::ids::{RecordId, RunId, SessionId};
+use crate::vala::ids::{RecordId, SessionId};
 
 /// One measured feature value. Untagged so the wire scalar's type is the tag —
 /// `82000.0 → Float`, `5 → Int`, `"premium" → Cat`, `true → Bool`.
@@ -28,21 +27,20 @@ pub enum FeatureValue {
 }
 
 /// The raw drift measurement a subject emits for one event.
+///
+/// The record names neither the invocation nor a Verifier. The emitting run
+/// and the observed subject Card travel beside it as Bifrost row correlation,
+/// which is what the server authorizes and stamps; the server then selects
+/// every matching active `verified_by` binding from that authorized subject
+/// identity rather than from anything the client wrote into the record.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct DriftRecordObservation {
     /// Client-generated UUIDv7 record identity; server deduplicates on it.
     pub record_id: RecordId,
-    /// Run identifier of the invocation that emitted the record.
-    pub run_id: RunId,
     /// Optional session identifier supplied explicitly at emit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<SessionId>,
-    /// Pin one Drift card. `None` → fan to every Drift card whose `subject_ref`
-    /// is the run's Target.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub drift_ref: Option<CardRef>,
     /// Native per-feature values for one inference event.
     pub features: BTreeMap<FeatureName, FeatureValue>,
     /// Wall-clock emission time.

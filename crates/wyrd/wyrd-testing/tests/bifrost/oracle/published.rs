@@ -361,6 +361,7 @@ async fn prove_published_governance() -> Result<(), JourneyError> {
 /// the stalled read is not reached, does not terminate, or returns rows.
 async fn prove_cancelled_read_terminates() -> Result<(), JourneyError> {
     let mut server = WyrdTestServer::builder()
+        .with_shutdown_drain_for_test(CANCELLED_READ_DRAIN)
         .start_bound()
         .await
         .map_err(|error| format!("the bound production server starts: {error}"))?;
@@ -433,6 +434,19 @@ async fn prove_cancelled_read_terminates() -> Result<(), JourneyError> {
         .map_err(|error| format!("the harness releases its fixtures: {error}"))?;
     Ok(())
 }
+
+/// Shutdown budget the cancellation phase binds its server with.
+///
+/// The stalled read is released only once `cancel_and_join_for_test` returns,
+/// and that join necessarily consumes the whole drain budget: the barrier holds
+/// the one governed request the drain is waiting on. The production default is
+/// sized for the verification runtime's own in-flight drain and exceeds an
+/// Oracle query's first-batch timeout, so a server bound with it would let this
+/// query reach its own deadline mid-drain — ending the read on a timeout rather
+/// than on the cancellation this phase exists to observe, and leaving the
+/// barrier-held storage child outliving its released owner. A budget inside the
+/// query timeout keeps cancellation the cause of the terminal.
+const CANCELLED_READ_DRAIN: Duration = Duration::from_secs(15);
 
 /// Terminals the owner's cancellation contract permits for a stalled read.
 ///

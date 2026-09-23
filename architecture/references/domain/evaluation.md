@@ -1,18 +1,20 @@
 # Evaluation
 
-Load for Eval Cards, scenario execution, deterministic and LLM-based checks,
-judge quality, scoring, or evidence used by policy and release decisions.
+Load for Eval-backed Verifiers, scenario execution, deterministic and
+LLM-based checks, judge quality, scoring, or evidence used by policy and
+release decisions.
 
 ## Evaluation is a declared workflow
 
-An `Eval` Card is reusable and subject-less. It declares a typed DAG of checks;
-a Service component, Service, or standalone Agent binds it through versioned
-`publishes_to`. Runtime observation `card_ref` supplies subject identity.
-Offline execution receives the selected subject from the deployment/publication
-binding plus a versioned Data Card of scenarios. Archived or online evaluation
-filters observations from Bifrost or a read-only `Source` by that runtime
-identity. Presence of those inputs selects the mode; do not create a parallel
-evaluation ontology.
+Eval is a `Verifier` implementation (`implementation.kind: eval`), not a Card
+kind. The Verifier is reusable and subject-less and declares a typed DAG of
+checks; a Service component, Service, or standalone Agent binds it through
+versioned `verified_by` with an `observations_ready` Trigger. Runtime
+observation `card_ref` supplies subject identity. Each committed
+`vala.eval.observations` record activates one run per matching active binding
+of that subject, and the run records the common Verification Result plus Eval
+item details. There is no Eval pull protocol; a future offline dataset route
+must be Verifier-backed. Do not create a parallel evaluation ontology.
 
 Each task has a stable ID, typed comparator, input selector, expected value,
 dependencies, retry budget, and failure disposition. Validate the DAG for
@@ -84,7 +86,7 @@ cancelled, indeterminate, and failed checks remain distinct terminal states.
 
 ## Stable Wyrd anchors
 
-- Eval contract: `architecture/wyrd-design.md` §Eval.
+- Eval contract: `architecture/wyrd-design.md` §Verifier (Eval implementation).
 - Eval types: `crates/wyrd-spec/src/vala/eval/`.
 - Engine: `crates/vala/vala-eval/`.
 

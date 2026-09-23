@@ -1,9 +1,11 @@
 //! Real-socket Wyrd server test harness.
 
 use std::collections::{BTreeSet, HashMap};
+use std::fs::OpenOptions;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::ops::Range;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use wyrd_sql::OperatorPool;
 
@@ -11,7 +13,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use async_trait::async_trait;
 use axum::body::{Body, to_bytes};
 use axum::http::{HeaderValue, Request, Response, StatusCode, header};
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use ed25519_dalek::VerifyingKey;
 use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
@@ -75,6 +77,7 @@ use wyrd_server::state::{
 use wyrd_server::{AppState, WyrdServer, WyrdServerConfig, build_router};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{FencingToken, NodeId};
+use wyrd_sql::queries::auth::service_account_by_card_ref;
 use wyrd_telemetry::TelemetryGuard;
 
 use crate::bifrost::ForgeObjectStoreControl;
@@ -253,6 +256,12 @@ pub struct WyrdTestServer {
     shutdown_drain_for_test: Option<Duration>,
     /// Test-only request to panic the bound serve task after its drain returns.
     serve_task_panic_for_test: bool,
+    /// Whether the bound production server composes its verification runtime.
+    ///
+    /// Copied into `WyrdServerConfig.verification.enabled` when this server
+    /// binds. Off by default so ordinary journeys never race a background
+    /// scheduler or runner over the queue they assert on.
+    verification_runtime: bool,
 }
 
 struct WyrdTestServerInner {
@@ -456,15 +465,6 @@ pub struct ForgeRewriteComparison {
     pub output_bytes: u64,
 }
 
-/// Stable pointer identities for one server-owned runtime pool graph.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PostgresPoolIdentity {
-    /// Wyrd application pool identity.
-    pub wyrd_app: usize,
-    /// Vala/Bifrost application pool identity.
-    pub vala_app: usize,
-}
-
 enum Mode {
     InProcess,
     Bound {
@@ -553,6 +553,8 @@ pub struct WyrdTestServerBuilder {
     stalled_drain_for_test: Option<Arc<AtomicBool>>,
     /// Optional bounded drain budget copied into the bound server's config.
     shutdown_drain_for_test: Option<Duration>,
+    /// Whether the bound server composes its verification runtime.
+    verification_runtime: bool,
     /// Storage I/O bounds this server's one Bifrost storage owner resolves.
     ///
     /// The same operator-facing type production reads from configuration, so a
@@ -563,6 +565,8 @@ pub struct WyrdTestServerBuilder {
     serve_task_panic_for_test: bool,
     /// Register the test-support MCP context probe in the `/mcp` tool catalog.
     mcp_context_probe: bool,
+    /// Keep the server's audit publisher from retiring staged audit rows.
+    audit_publication_disabled: bool,
 }
 
 /// Test-only file paths for one replica's Bifrost peer identity and trust root.
@@ -582,6 +586,7 @@ pub struct TestBifrostPeerTls {
 }
 
 impl Default for WyrdTestServerBuilder {
+    /// A builder with every test hook off and audit publication enabled.
     fn default() -> Self {
         Self {
             policy_hook: None,
@@ -630,9 +635,11 @@ impl Default for WyrdTestServerBuilder {
             limits: None,
             stalled_drain_for_test: None,
             shutdown_drain_for_test: None,
+            verification_runtime: false,
             bifrost_storage_io: wyrd_server::config::BifrostStorageIoConfig::default(),
             serve_task_panic_for_test: false,
             mcp_context_probe: false,
+            audit_publication_disabled: false,
         }
     }
 }
@@ -1897,6 +1904,117 @@ impl WyrdTestServer {
             .await
     }
 
+    /// Count the fixture tenant's staged, allowed describes of `fqn`.
+    ///
+    /// The server stages exactly one `vala.bifrost.describe` decision per
+    /// describe it serves, so this is the server-observed describe count a
+    /// journey uses to prove a writer reused its cached schema. Start the
+    /// server without audit publication: the publisher retires staged rows,
+    /// which would shrink the count mid-test.
+    ///
+    /// # Errors
+    /// Returns an error when the fixture's superuser pool cannot be acquired
+    /// or the audit query fails.
+    pub async fn table_describe_count(&self, fqn: &str) -> Result<i64, WyrdTestServerError> {
+        let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM vala.audit_staging WHERE data_tenant_id = $1 \
+             AND operation = 'vala.bifrost.describe' AND resource = $2 AND outcome = 'allowed'",
+        )
+        .bind(self.data_tenant_id().as_uuid())
+        .bind(fqn)
+        .fetch_one(&pool)
+        .await
+        .map_err(sql)
+    }
+
+    /// Read the last qualifying machine exchange of the principal `owner` projects.
+    ///
+    /// Only an API-key or workload `jwt-bearer` exchange for a Card-bound
+    /// Service or Agent writes this timestamp, so a journey proves an excluded
+    /// path — an observation, a cached-token request — by reading it unchanged
+    /// across that path. `None` means the owner has never authenticated.
+    ///
+    /// # Errors
+    /// Returns an error when the fixture's superuser pool cannot be acquired,
+    /// the read fails, or the fixture tenant has no principal bound to `owner`.
+    pub async fn last_authenticated_at(
+        &self,
+        owner: &CardUid,
+    ) -> Result<Option<DateTime<Utc>>, WyrdTestServerError> {
+        let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
+        sqlx::query_scalar(
+            "SELECT last_authenticated_at FROM wyrd.auth_service_accounts \
+             WHERE data_tenant_id = $1 AND card_uid = $2",
+        )
+        .bind(self.data_tenant_id().as_uuid())
+        .bind(owner.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .map_err(sql)
+    }
+
+    /// Make every fixture-tenant describe of `fqn` fail until restored.
+    ///
+    /// Installs a Postgres trigger that refuses the describe's audit append, so
+    /// the real server fails closed with `WYRD_VALA_500_AUDIT_UNAVAILABLE` for that
+    /// one table while every other describe proceeds. This lets a journey drive
+    /// the startup refusal of either fixed observation table independently.
+    /// Installing again replaces the previous fault; undo it with
+    /// [`Self::restore_table_describe`].
+    ///
+    /// # Errors
+    /// Returns [`WyrdTestServerError::Unsupported`] when `fqn` is not a plain
+    /// dotted identifier, and an SQL error when the trigger cannot be installed.
+    pub async fn fail_table_describe(&self, fqn: &str) -> Result<(), WyrdTestServerError> {
+        // Trigger arguments are literals, so the FQN is interpolated only after
+        // proving it cannot close the quote.
+        if fqn.is_empty()
+            || !fqn
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'.')
+        {
+            return Err(WyrdTestServerError::Unsupported(format!(
+                "describe fault needs a plain table FQN, got {fqn:?}"
+            )));
+        }
+        let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
+        for statement in [
+            "CREATE OR REPLACE FUNCTION vala.wyrd_test_fail_describe() RETURNS trigger \
+             LANGUAGE plpgsql AS $$ BEGIN \
+             IF NEW.operation = 'vala.bifrost.describe' AND NEW.resource = TG_ARGV[0] \
+             AND NEW.data_tenant_id = TG_ARGV[1]::uuid THEN \
+             RAISE EXCEPTION 'test fault: describe of % refused', NEW.resource; \
+             END IF; RETURN NEW; END $$"
+                .to_owned(),
+            "DROP TRIGGER IF EXISTS wyrd_test_fail_describe ON vala.audit_staging".to_owned(),
+            format!(
+                "CREATE TRIGGER wyrd_test_fail_describe BEFORE INSERT ON vala.audit_staging \
+                 FOR EACH ROW EXECUTE FUNCTION vala.wyrd_test_fail_describe('{fqn}', '{}')",
+                self.data_tenant_id().as_uuid()
+            ),
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(statement))
+                .execute(&pool)
+                .await
+                .map_err(sql)?;
+        }
+        Ok(())
+    }
+
+    /// Remove the fault [`Self::fail_table_describe`] installed, if any.
+    ///
+    /// # Errors
+    /// Returns an SQL error when the trigger cannot be dropped.
+    pub async fn restore_table_describe(&self) -> Result<(), WyrdTestServerError> {
+        let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
+        sqlx::query("DROP TRIGGER IF EXISTS wyrd_test_fail_describe ON vala.audit_staging")
+            .execute(&pool)
+            .await
+            .map_err(sql)?;
+        Ok(())
+    }
+
     /// Count the exact tenant-bound read-decision audit row for one request ID.
     ///
     /// # Errors
@@ -2683,6 +2801,80 @@ impl WyrdTestServer {
             .await
     }
 
+    /// Issue an API key for the principal a registered Service Card already has.
+    ///
+    /// [`Self::bootstrap_service`] invents a minimal fixture Card and a fresh
+    /// principal for it, so its minted card-ref scope is that bare root and
+    /// nothing else. An observation journey needs the opposite: the writer must
+    /// be the identity registration itself projected for the Service, because
+    /// the scope walk expands that registered spec into the component Cards the
+    /// run scopes its sibling views against. Registering a Service or Agent Card
+    /// already upserts that service account, so nothing is minted here — the row
+    /// is looked up by its card binding, granted the requested roles, and handed
+    /// one API key. The supplied `card_ref` must already be registered in the
+    /// fixture tenant.
+    ///
+    /// # Errors
+    /// Returns an error when the Card has no projected principal, or when SQL
+    /// writes or API-key hashing fail.
+    pub async fn credential_registered_service(
+        &self,
+        card_ref: &CardRef,
+        roles: &[&str],
+    ) -> Result<Bootstrap, WyrdTestServerError> {
+        // The projection stores the binding with its uid; the lookup is JSONB
+        // containment, so a uid-less probe selects it either way.
+        let binding = CardRef {
+            uid: None,
+            ..card_ref.clone()
+        };
+        let tenant_id = self.data_tenant_id();
+        let creator_id = self.ensure_fixture_admin_for(tenant_id).await?;
+        let api_key = WyrdApiKey::generate(tenant_id);
+        let raw = api_key.secret.clone();
+        let key_hash = tokio::task::spawn_blocking(move || wyrd_auth_issue::hash_api_key(&raw))
+            .await
+            .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?
+            .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?;
+
+        let mut conn = self.tenant_conn_for(tenant_id).await?;
+        let principal = service_account_by_card_ref(&mut conn, "service", &binding)
+            .await
+            .map_err(sql)?
+            .ok_or_else(|| {
+                WyrdTestServerError::Auth(format!(
+                    "no service principal is projected for {binding}; register the Card first"
+                ))
+            })?;
+        insert_api_key(
+            &mut conn,
+            Uuid::now_v7(),
+            principal.id,
+            &api_key.prefix,
+            &key_hash,
+            creator_id,
+            Some(Duration::from_secs(365 * 24 * 60 * 60)),
+        )
+        .await
+        .map_err(sql)?;
+        for role in roles {
+            grant_role(
+                &mut conn,
+                principal.id,
+                PrincipalTable::ServiceAccount,
+                role,
+            )
+            .await?;
+        }
+        conn.commit().await.map_err(sql)?;
+
+        Ok(Bootstrap::Machine {
+            id: PrincipalId::new(principal.id),
+            api_key: api_key.secret,
+            card_ref: card_ref.clone(),
+        })
+    }
+
     /// Provision a second active tenant: seed its row and built-in roles.
     ///
     /// The fixture seeds one tenant at boot; the same-issuer-two-tenant
@@ -3079,9 +3271,30 @@ impl WyrdTestServer {
         card_kind: CardKind,
         principal_kind: &'static str,
     ) -> Result<Bootstrap, WyrdTestServerError> {
+        let card_ref = card_ref(card_kind, name)?;
+        self.mint_machine_principal(tenant_id, name, roles, card_ref, principal_kind)
+            .await
+    }
+
+    /// Mint a machine principal, its backing fixture Card row, and an API key.
+    ///
+    /// Both machine bootstrap routes share this body: each invents a minimal
+    /// registry row for the principal it mints, so the minted card-ref scope is
+    /// that bare root. A writer that must carry a real registered spec's scope
+    /// uses [`Self::credential_registered_service`] instead.
+    ///
+    /// # Errors
+    /// Returns an error when SQL writes or API-key hashing fail.
+    async fn mint_machine_principal(
+        &self,
+        tenant_id: DataTenantId,
+        name: &str,
+        roles: &[&str],
+        card_ref: CardRef,
+        principal_kind: &'static str,
+    ) -> Result<Bootstrap, WyrdTestServerError> {
         let principal_id = Uuid::now_v7();
         let creator_id = self.ensure_fixture_admin_for(tenant_id).await?;
-        let card_ref = card_ref(card_kind, name)?;
         let api_key = WyrdApiKey::generate(tenant_id);
         let raw = api_key.secret.clone();
         let key_hash = tokio::task::spawn_blocking(move || wyrd_auth_issue::hash_api_key(&raw))
@@ -3247,15 +3460,6 @@ impl WyrdTestServer {
         &self.inner.fixture
     }
 
-    /// Return pointer identities proving this process owns fresh runtime pools.
-    #[must_use]
-    pub fn postgres_pool_identity(&self) -> PostgresPoolIdentity {
-        PostgresPoolIdentity {
-            wyrd_app: std::ptr::from_ref(self.inner.state.postgres.app_pool()) as usize,
-            vala_app: std::ptr::from_ref(self.inner.state.postgres.vala().pool()) as usize,
-        }
-    }
-
     /// Cancel and drain a partially started bound server while preserving the
     /// startup error that caused rollback.
     async fn rollback_bound_startup(
@@ -3369,6 +3573,7 @@ impl WyrdTestServer {
         );
         config.metrics.enabled = false;
         config.serve.mode = ServeMode::Both;
+        config.verification.enabled = self.verification_runtime;
         if let Some(drain) = self.shutdown_drain_for_test {
             config.shutdown.drain_ms = u64::try_from(drain.as_millis()).unwrap_or(u64::MAX);
         }
@@ -3545,6 +3750,17 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Keep the server's audit publisher from starting.
+    ///
+    /// A journey that asserts on `vala.audit_staging` rows opts in: the
+    /// publisher retires staged rows on its own interval, so a staging read
+    /// taken after one sweep would miss rows the server did write.
+    #[must_use]
+    pub fn without_audit_publication_for_test(mut self) -> Self {
+        self.audit_publication_disabled = true;
+        self
+    }
+
     /// Force the bound readiness phase to fail and exercise startup rollback.
     #[must_use]
     pub fn with_readiness_failure_for_test(mut self) -> Self {
@@ -3572,6 +3788,17 @@ impl WyrdTestServerBuilder {
     #[must_use]
     pub fn with_stalled_drain_for_test(mut self, aborted: Arc<AtomicBool>) -> Self {
         self.stalled_drain_for_test = Some(aborted);
+        self
+    }
+
+    /// Compose the production verification runtime when this server binds.
+    ///
+    /// Default off: the scheduler and runner otherwise claim queue work in the
+    /// background and race journeys that drive the queue directly. Only a
+    /// journey proving the production composition opts in.
+    #[must_use]
+    pub const fn with_verification_runtime_for_test(mut self) -> Self {
+        self.verification_runtime = true;
         self
     }
 
@@ -4424,7 +4651,9 @@ impl WyrdTestServerBuilder {
         if let Some(limits) = self.limits {
             state = state.with_limits(limits);
         }
-        state = state.with_mcp_context_probe(self.mcp_context_probe);
+        state = state
+            .with_mcp_context_probe(self.mcp_context_probe)
+            .with_audit_publication_disabled(self.audit_publication_disabled);
         state.authz.permission_check = Arc::new(RbacCheck);
         state.authz.audit_writer = self
             .audit_writer
@@ -4471,6 +4700,7 @@ impl WyrdTestServerBuilder {
             readiness_failure: self.readiness_failure,
             stalled_drain_for_test: self.stalled_drain_for_test,
             shutdown_drain_for_test: self.shutdown_drain_for_test,
+            verification_runtime: self.verification_runtime,
             serve_task_panic_for_test: self.serve_task_panic_for_test,
         })
     }
@@ -4560,41 +4790,131 @@ fn peer_keyring_config(
     }
 }
 
-/// Ports the harness reserves from: below every common OS ephemeral range
-/// (Linux 32768+, macOS and Windows 49152+).
+/// Candidate ports tried before a reservation gives up on its band.
 ///
-/// A reservation is released before the production binder claims it, so it
-/// must come from a range the kernel never hands out on its own. An `:0` port
-/// sits in the ephemeral range, where any outgoing connection — every Postgres
-/// pool connection of every concurrent test — can take it in that gap.
-const HARNESS_PORTS: std::ops::Range<u16> = 20_000..32_768;
+/// Bounded so a host whose band is genuinely saturated fails with a bind error
+/// rather than walking tens of thousands of ports.
+const RESERVATION_ATTEMPTS: u32 = 512;
 
-/// Reserve one currently free loopback address used by a bound harness.
+/// The loopback port band reservations are drawn from, below the kernel's own.
+///
+/// A `:0` bind reports a port from `ip_local_port_range` and releases it the
+/// moment the probe listener drops, so the kernel may hand that exact port to
+/// anyone before the server that asked for it binds. With several journey
+/// processes reserving several ports each, that race is routine: a test fails
+/// with `Address already in use` on a port nothing in the test ever used.
+/// Drawing from below the kernel's range takes the kernel out of the contest —
+/// it never auto-assigns there — leaving only sibling test processes, which
+/// start at different offsets in the band and are fenced by [`claim_port`].
+///
+/// Returns `None` where the range cannot be read, which is every non-Linux
+/// host; the caller then falls back to `:0` and keeps the old behavior rather
+/// than guessing at a band it cannot verify is safe.
+fn reservation_band() -> Option<Range<u16>> {
+    /// The band read once per process; the kernel range does not change under a test run.
+    static BAND: OnceLock<Option<Range<u16>>> = OnceLock::new();
+    BAND.get_or_init(|| {
+        let range = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").ok()?;
+        let low: u16 = range.split_whitespace().next()?.parse().ok()?;
+        let start = low / 2;
+        (start >= 1024).then_some(start..low)
+    })
+    .clone()
+}
+
+/// Ask the OS for one currently free loopback address used by a bound harness.
 ///
 /// Reserving before server composition gives membership a concrete nonzero
-/// private endpoint. The production binder later claims this exact address.
-/// The port is drawn at random from [`HARNESS_PORTS`] and probed, so only two
-/// harnesses drawing the same free port in the same instant can still collide.
+/// private endpoint. The production binder later claims this exact address, so
+/// the port has to stay free across the gap — see [`reservation_band`] for why
+/// a `:0` bind does not keep it free and what is drawn from instead. The first
+/// candidate is seeded from the process id so two test processes walking the
+/// band concurrently do not walk it in step, and each candidate is first
+/// claimed through [`claim_port`] so a sibling cannot take it in the gap; the
+/// probe listener is dropped before the address is returned, exactly as the
+/// production binder expects.
 ///
 /// # Errors
 ///
-/// Returns a bind error when no probed port is free or address lookup fails.
-pub(crate) fn reserve_loopback_addr() -> Result<std::net::SocketAddr, WyrdTestServerError> {
+/// Returns a bind error when no candidate in the band is free within
+/// [`RESERVATION_ATTEMPTS`], when the port claim directory is unusable, or
+/// when loopback binding or address lookup fails.
+pub(crate) fn reserve_loopback_addr() -> Result<SocketAddr, WyrdTestServerError> {
+    let Some(band) = reservation_band() else {
+        return bound_loopback_addr(0);
+    };
+    /// Process-wide offset into the band so successive reservations probe fresh ports.
+    static CURSOR: AtomicU32 = AtomicU32::new(0);
+    let span = u32::from(band.end - band.start);
+    let seed = std::process::id().wrapping_mul(2_654_435_761);
     let mut last = None;
-    for _ in 0..64 {
-        let port = rand::random_range(HARNESS_PORTS);
-        match std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)) {
-            Ok(listener) => {
-                return listener
-                    .local_addr()
-                    .map_err(|error| WyrdTestServerError::Bind(error.to_string()));
-            }
+    for _ in 0..RESERVATION_ATTEMPTS.min(span) {
+        let step = CURSOR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let offset = u16::try_from(seed.wrapping_add(step) % span)
+            .map_err(|error| WyrdTestServerError::Bind(error.to_string()))?;
+        let port = band.start + offset;
+        if !claim_port(port)? {
+            continue;
+        }
+        match bound_loopback_addr(port) {
+            Ok(addr) => return Ok(addr),
             Err(error) => last = Some(error),
         }
     }
-    Err(WyrdTestServerError::Bind(format!(
-        "no free harness port in {HARNESS_PORTS:?}: {last:?}"
-    )))
+    Err(last.unwrap_or_else(|| {
+        WyrdTestServerError::Bind("no loopback reservation band is available".to_owned())
+    }))
+}
+
+/// Claims one band port for this process's lifetime across every test process.
+///
+/// A reserved port is released between the probe and the production bind, so
+/// a sibling test process walking the band could reserve the same free port
+/// in that gap and one server would fail with `Address already in use`. Each
+/// candidate is therefore fenced by an exclusive advisory lock on a per-port
+/// file under the shared temporary directory. The locked handle is leaked on
+/// success, so the lock lasts until the process exits and the kernel drops it;
+/// a crashed process therefore never strands a port.
+///
+/// Returns `false` when another process, or an earlier claim in this one,
+/// already holds the port.
+///
+/// # Errors
+///
+/// Returns a bind error when the claim directory or lock file cannot be
+/// created, or when locking fails for a reason other than contention.
+fn claim_port(port: u16) -> Result<bool, WyrdTestServerError> {
+    let dir = std::env::temp_dir().join("wyrd-test-ports");
+    std::fs::create_dir_all(&dir).map_err(|error| WyrdTestServerError::Bind(error.to_string()))?;
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(port.to_string()))
+        .map_err(|error| WyrdTestServerError::Bind(error.to_string()))?;
+    match file.try_lock() {
+        Ok(()) => {
+            std::mem::forget(file);
+            Ok(true)
+        }
+        Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+        Err(std::fs::TryLockError::Error(error)) => {
+            Err(WyrdTestServerError::Bind(error.to_string()))
+        }
+    }
+}
+
+/// Binds one loopback port, reports the concrete address, and releases it.
+///
+/// # Errors
+///
+/// Returns a bind error when the port is taken or address lookup fails.
+fn bound_loopback_addr(port: u16) -> Result<SocketAddr, WyrdTestServerError> {
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+        .map_err(|error| WyrdTestServerError::Bind(error.to_string()))?;
+    listener
+        .local_addr()
+        .map_err(|error| WyrdTestServerError::Bind(error.to_string()))
 }
 
 /// Poll a bound test server until its HTTP health endpoint reports readiness.

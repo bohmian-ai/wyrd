@@ -16,6 +16,7 @@ use opendal::Buffer;
 use parquet::arrow::ArrowWriter;
 use sha2::{Digest as _, Sha256};
 use std::sync::Arc;
+use std::time::Duration;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef, TenantTableBinding};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::oracle::analytical::{
@@ -505,11 +506,26 @@ pub(crate) fn unused_payload(id: i64) -> String {
     out
 }
 
-/// Bound on how many Forge planning passes the fixture will drive before it
-/// gives up on compacting its first batch. Generous, because a pass may claim
-/// nothing, retry, or lose a lease race; finite, because a stalled Forge must
-/// fail the journey rather than hang it.
-const COMPACTION_PASS_BUDGET: usize = 32;
+/// Bound on how long the fixture drives Forge planning passes before it gives
+/// up on compacting its first batch.
+///
+/// A wall clock rather than a count of passes. The loop waits on the worker
+/// completion observer, and that observer reports every completion the node
+/// makes — including one for a second tenant's table in the same fixture. A
+/// counted budget let those unrelated completions spend all of it in a few
+/// seconds, before this table's own demand was schedulable, so the journey
+/// failed with nothing compacted and no time elapsed. Generous, because a pass
+/// may claim nothing, retry, or lose a lease race; finite, because a stalled
+/// Forge must fail the journey rather than hang it.
+const COMPACTION_BUDGET: Duration = Duration::from_secs(120);
+
+/// Longest one requested pass is waited on before the loop re-reads the truth.
+const COMPACTION_PASS_WAIT: Duration = Duration::from_secs(30);
+
+/// Floor on one loop iteration, so a fixture whose completions return instantly
+/// polls Postgres and nudges the scheduler at a bounded rate instead of
+/// spinning on them for the whole budget.
+const COMPACTION_POLL_FLOOR: Duration = Duration::from_millis(100);
 
 /// Compacts every sealed file already written for `table`, so that a later
 /// query reads them through the Iceberg snapshot rather than the hot manifest.
@@ -528,16 +544,17 @@ const COMPACTION_PASS_BUDGET: usize = 32;
 ///   `next_eligible_at` back instead of sleeping, leaving the failure
 ///   classification untouched.
 ///
-/// The loop is bounded and its exit condition is the durable `compacted` flag,
-/// not a pass or completion count: a pass that claimed nothing, and a
-/// completion that rewrote some other table, must not be mistaken for this
-/// batch having moved tiers.
+/// The loop is bounded by [`COMPACTION_BUDGET`] and its exit condition is the
+/// durable `compacted` flag, not a pass or completion count: a pass that
+/// claimed nothing, and a completion that rewrote some other table, must not be
+/// mistaken for this batch having moved tiers — nor, since the budget is a wall
+/// clock, allowed to consume the time this batch is waiting for.
 ///
 /// # Errors
 ///
 /// Returns an error when the observer is absent, when the clock cannot be
 /// advanced, when a Postgres probe fails, or when fewer than `expected` inputs
-/// are compacted before the loop's budget runs out.
+/// are compacted before [`COMPACTION_BUDGET`] elapses.
 pub(crate) async fn compact_sealed_batch(
     cluster: &WyrdTestCluster,
     tenant: wyrd_spec::DataTenantId,
@@ -553,10 +570,18 @@ pub(crate) async fn compact_sealed_batch(
             .advance(chrono::Duration::days(1))
             .map_err(|error| format!("close the written partition: {error}"))?;
     }
-    for _ in 0..COMPACTION_PASS_BUDGET {
-        let (compacted, _) = file_tier_counts(cluster, tenant, table).await?;
+    let deadline = std::time::Instant::now() + COMPACTION_BUDGET;
+    loop {
+        let (compacted, hot) = file_tier_counts(cluster, tenant, table).await?;
         if compacted >= expected {
             return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "Forge compacted {compacted} of {expected} sealed inputs within \
+                 {COMPACTION_BUDGET:?} ({hot} still hot)"
+            )
+            .into());
         }
         release_forge_retries(cluster, tenant, table).await?;
         let target = observer.completed().saturating_add(1);
@@ -564,18 +589,10 @@ pub(crate) async fn compact_sealed_batch(
         // A lapsed wait is not a failure on its own: the pass may legitimately
         // have found nothing to claim on this iteration. The durable flag
         // checked at the top of the next iteration is the real verdict.
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            observer.wait_for_at_least(target),
-        )
-        .await;
+        let _ =
+            tokio::time::timeout(COMPACTION_PASS_WAIT, observer.wait_for_at_least(target)).await;
+        tokio::time::sleep(COMPACTION_POLL_FLOOR).await;
     }
-    let (compacted, hot) = file_tier_counts(cluster, tenant, table).await?;
-    Err(format!(
-        "Forge compacted {compacted} of {expected} sealed inputs within \
-         {COMPACTION_PASS_BUDGET} passes ({hot} still hot)"
-    )
-    .into())
 }
 /// Makes every `retryable` Forge task for one table immediately eligible.
 ///

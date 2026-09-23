@@ -1,6 +1,6 @@
 ---
 id: SPEC-verified-change-contract
-revision: 32
+revision: 35
 status: approved
 ---
 
@@ -85,9 +85,10 @@ make the standalone LLM-judge Verifier implementation part of this delivery.
   Agent declaration that names the Verifier, when it runs, and zero or more
   Operators performed independently after a failed verdict.
 - **Runtime-active binding owner**: the exact Service or standalone Agent Card
-  version whose existing card-bound service principal successfully authenticated
-  or refreshed within the configured verification inactivity timeout. Service
-  component bindings inherit the activity of their containing Service version.
+  version whose existing Card-bound machine principal successfully completed
+  an API-key exchange or workload `jwt-bearer` authentication within the
+  configured verification inactivity timeout. Service component bindings
+  inherit the activity of their containing Service version.
 - **Verification Result**: one Verifier run's immutable Bifrost summary and
   verdict, identified by exact tenant, run, binding, subject, Verifier Card
   version, and input identity.
@@ -107,9 +108,11 @@ make the standalone LLM-judge Verifier implementation part of this delivery.
   `AssertionResult`. A false assertion is attesting evidence; a skipped task or
   an executor/input failure is not.
 - **Internal SYSTEM result writer**: one server-only tenant principal, persisted
-  with a server-minted UUIDv7 and used only to publish Verification Result
-  batches. It has no public credential, Card, role grant, refresh path, or
-  delegation path.
+  in the existing tenant machine-principal store with `kind: system`, a
+  server-minted UUIDv7, and the fixed name `verification-results-writer`. It is
+  used only to publish Verification Result batches and has no public
+  credential, Card, role grant, refresh, workload, delegation, or
+  principal-management path.
 - **Operator connection**: one tenant-owned, provider-specific Postgres record
   containing nonsecret delivery coordinates and an encrypted credential. Cards
   carry only its provider-scoped name; connection reads never return secret
@@ -211,12 +214,14 @@ The three exact `observe.eval`, `observe.drift`, and `observe.record` insertion
 flows are listed in its "Input and queue boundary" section.
 
 - **REQ-123**: All three SDKs MUST expose the run API shown in `run_api.md`:
-  Python `state.start_bifrost(...)`, `state.run()`, `run.for_card(alias)`, and
+  Python `state.start_bifrost(...)`, `state.run(card=None)`,
+  `run.for_card(alias)`, and
   `scope.observe.drift(...)` / `scope.observe.eval(...)` /
   `scope.observe.record(table, value)`; TypeScript `await
-  state.startBifrost(options)`, `state.run()`, `run.forCard(alias)`, and the
-  corresponding `scope.observe` methods (with async `record`); Rust
-  `state.start_bifrost().await?`, `state.run()`, `run.for_card(alias)?`, and
+  state.startBifrost(options)`, `state.run(card?)`, `run.forCard(alias)`, and
+  the corresponding `scope.observe` methods (with async `record`); Rust
+  `state.start_bifrost().await?`, `state.run()`,
+  `state.run_for_card(alias)?`, `run.for_card(alias)?`, and
   `scope.observe().drift(...)` / `scope.observe().eval(...)` /
   `scope.observe().record(table, value).await?`. Python and TypeScript expose
   `observe` as a member; Rust uses an `observe()` accessor. Python startup and
@@ -229,12 +234,39 @@ flows are listed in its "Input and queue boundary" section.
   `wyrd_client::Bifrost` facade, which owns the existing bounded queue and
   transport. Callers MUST NOT pass a separate Bifrost client or table to
   `run()`.
-  A run generates one client-side invocation `run_id` and initially scopes the root Service
-  Card. Selecting a hydrated Card alias returns an immutable view of that
-  invocation that automatically supplies its exact subject `card_ref` on
-  every observation; sibling views cannot retarget each other. Unknown or
-  out-of-graph aliases fail. Run creation and scope selection MUST NOT
-  register a server Run, authenticate by themselves, or execute a Verifier.
+  A run generates one client-side invocation `run_id` and defaults to the root
+  Service Card. The language-idiomatic initial-Card argument and later
+  `for_card` / `forCard` selection both resolve a hydrated Card alias and
+  return an immutable view of that invocation that automatically supplies its
+  exact subject `card_ref` on every observation; sibling views cannot retarget
+  each other. Unknown or out-of-graph aliases fail. Run creation and scope
+  selection MUST NOT register a server Run, authenticate by themselves, or
+  execute a Verifier.
+- **REQ-151**: Python `Run` MUST be a synchronous context manager. Entering it
+  MUST best-effort attach the selected CardRef and invocation ID to Python's
+  execution-local OpenTelemetry context under the exact Bifrost attributes
+  `wyrd.card_ref` and `wyrd.run_id`, set both attributes on an already-active
+  recording span, and ensure one idempotently registered span processor copies
+  both values from the parent context to every span started inside the scope.
+  Exiting MUST restore the prior context, including nested Card scopes, and
+  MUST NOT suppress a user exception. Normal context propagation MUST work
+  across `await` and asyncio task creation without storing one shared attach
+  token on the immutable Run. A framework using the global provider MUST need
+  no setup beyond `with state.run(...)`; the Python SDK MUST expose an
+  idempotent `wyrd.otel.install_run_correlation(provider)` escape hatch for a
+  framework-owned private provider. Missing OpenTelemetry packages, an
+  unsupported or absent provider, no active recording span, invalid runtime
+  context, processor failure, and attach/detach failure MUST all fail open as
+  no enrichment: they MUST NOT fail Run construction or entry/exit, application
+  execution, or explicit Wyrd observation emission. Unknown Card aliases,
+  authorization, validation, and Wyrd writes remain fail-closed. The client
+  MUST inject only CardRef and run ID; tenant, principal, Card UID, and request
+  identity remain server-derived. The context manager MUST NOT start or end a
+  span, flush or close Bifrost, perform network IO, or create a server Run.
+  This requirement covers spans only; it does not promise ambient log or
+  metric enrichment. Shared Rust owns Run identity and Card selection, while
+  the Python SDK owns its foreign-runtime OpenTelemetry context and provider
+  integration. OpenTelemetry remains an optional dependency.
 - **REQ-124**: `observe.drift` MUST accept a Python mapping, dataclass, or
   Pydantic model; a TypeScript plain serializable object; or a Rust `Serialize`
   map/struct. The value represents one event's feature-name-to-scalar
@@ -440,13 +472,15 @@ flows are listed in its "Input and queue boundary" section.
   separate binding name or identifier.
 - **REQ-105**: Registering a Service, standalone Agent, or verification binding
   MUST NOT make its bindings runtime-active. A successful existing card-bound
-  service-principal authentication MUST activate the exact owning Card version.
-  A successful refresh of that same principal MUST renew its activity. User
-  authentication, another Card version, and authorization scope over a
-  component MUST NOT activate the owner.
-- **REQ-106**: Runtime activity MUST extend the existing service-principal
+  Service or Agent API-key exchange or workload `jwt-bearer` authentication
+  MUST activate the exact owning Card version. A later successful exchange of
+  either durable machine credential MUST renew its activity. Delegation, OIDC
+  login, human refresh, Card-free automation, SYSTEM issuance, cached bearer
+  use, user authentication, another Card version, and authorization scope over
+  a component MUST NOT activate the owner.
+- **REQ-106**: Runtime activity MUST extend the existing machine-principal
   authentication lifecycle. The server MUST persist the principal's last
-  successful token exchange time on its existing service-principal state,
+  successful qualifying exchange time on its existing machine-principal state,
   using the server clock and the same transaction that issues the token.
   `wyrd-client` MUST continue to re-exchange a stale access token automatically
   when an authenticated request needs one; token expiry or an otherwise idle
@@ -455,7 +489,7 @@ flows are listed in its "Input and queue boundary" section.
   add an activation endpoint, heartbeat protocol, activity table, background
   refresh timer, per-request touch, or per-observation activity write.
 - **REQ-107**: A binding owner is runtime-active only while its service
-  principal is enabled and its last successful authentication or refresh is
+  principal is enabled and its last successful qualifying machine exchange is
   within `WYRD_VERIFICATION_INACTIVITY_TIMEOUT_SECONDS`, which MUST default to
   `86400`. A process remaining open without another successful token exchange
   does not extend activity; once the timeout passes, the owner becomes
@@ -465,10 +499,10 @@ flows are listed in its "Input and queue boundary" section.
   or Eval post-commit enqueue MUST restrict new work to runtime-active exact
   owners. An inactive occurrence MUST create no activation or run and MUST NOT
   be backfilled after later authentication. Reauthentication starts eligibility
-  with the next schedule occurrence after that authentication. A refresh while
-  the owner remains active MUST NOT reset or postpone its existing schedule
-  cursor. Multiple exact
-  Card versions used for A/B operation remain independently active through
+  with the next schedule occurrence after that authentication. A later
+  qualifying exchange while the owner remains active MUST NOT reset or postpone
+  its existing schedule cursor. Multiple exact Card versions used for A/B
+  operation remain independently active through
   their distinct service principals; replicas sharing one exact principal
   share its activity. Service-level and component-occurrence bindings inherit
   their exact containing Service principal's activity, while a standalone
@@ -679,7 +713,7 @@ The locked storage split is:
 
 | Store | Existing/reused | Added by this change |
 |---|---|---|
-| Postgres control state | `wyrd.cards`, `wyrd.auth_service_accounts`, Scribe's `vala.scribe_batch_commits` fence | `verification_bindings`, `drift_baselines`, `verifier_runs`, `operator_dispatches`, encrypted tenant Operator connections, and one credentialless UUIDv7 SYSTEM principal per tenant; `last_authenticated_at` on the existing service-principal row |
+| Postgres control state | `wyrd.cards`, tenant machine principals in `wyrd.auth_service_accounts`, Scribe's `vala.scribe_batch_commits` fence | `verification_bindings`, `drift_baselines`, `verifier_runs`, `operator_dispatches`, encrypted tenant Operator connections, and one credentialless UUIDv7 SYSTEM principal per tenant; `last_authenticated_at` on the existing machine-principal row |
 | Bifrost analytical state | `vala.drift.observations`; existing Scribe/Oracle table lifecycle | `vala.eval.observations`, `vala.verification.results`, `vala.drift.result_features`, `vala.eval.result_items` |
 | Object storage | Registered Data Card Parquet artifact | No new baseline artifact format; the fitted profile is Postgres control state |
 
@@ -718,7 +752,7 @@ table on `(data_tenant_id, result_id)`.
   due binding row, create a unique verifier_runs row, and advance its cron
   cursor in the same transaction; the transaction releases the row lock
   before verification executes. It MUST filter on the existing service
-  principal's last successful token exchange and generic Verifier readiness
+  principal's last successful qualifying machine exchange and generic Verifier readiness
   before creating work. Inactive or unready due occurrences create no run and
   are not backfilled. After an outage, missed schedule occurrences are skipped
   rather than materialized in a catch-up batch; the next future cron boundary
@@ -726,8 +760,9 @@ table on `(data_tenant_id, result_id)`.
 - **REQ-112**: Composite owner registration MUST persist its resolved
   `verification_bindings` projection in the same registration transaction as
   the containing Card and its existing card-bound principal. A new binding's
-  scheduled cursor is null until the first successful exact-principal token
-  exchange; that exchange sets the next future cron boundary. Eval bindings
+  scheduled cursor is null until the first successful qualifying exchange by
+  that exact Card-bound machine principal; that exchange sets the next future
+  cron boundary. Eval bindings
   have no schedule cursor. Runtime activity is the existing
   `wyrd.auth_service_accounts.last_authenticated_at` value, not a new
   heartbeat or activity table. Existing principal uniqueness MUST permit two
@@ -874,14 +909,22 @@ table on `(data_tenant_id, result_id)`.
   MUST idempotently create exactly one internal `system` principal row named
   `verification-results-writer` for each tenant in the existing tenant machine
   principal store. Its server-minted `PrincipalId` MUST be UUIDv7 and remain
-  stable after provisioning. It is not a Card, API key, refresh token, role
-  grant, workload binding, or user-manageable principal.
+  stable after provisioning. `system` is the sixth `PrincipalKindTag` wire
+  value and a tenant-plane `PrincipalKind`, not a second identity hierarchy.
+  The row has no bound Card or user-managed lifecycle. It is not a Card, API
+  key, refresh token, role grant, workload binding, or user-manageable
+  principal. Public create, list, get, update, suspend/delete, credential,
+  refresh, workload, delegation, and token-exchange operations MUST reject or
+  omit it as appropriate; it remains representable in token and audit wire
+  contracts so internal writes are attributable.
 
   Immediately before each result-publication attempt, the runner MUST mint a
-  normal short-lived Wyrd access token using that tenant's persisted SYSTEM
+  normal five-minute-or-shorter Wyrd access token through the existing tenant
+  token issuer using that tenant's persisted SYSTEM
   principal. The token MUST contain the run tenant, `kind=system`, no roles or
-  bound root Card, and signed Card scope containing exactly one UID-bearing
-  `Verifier` CardRef: the run's exact Verifier version. Verification MUST reject
+  credential attribution, delegation chain, or bound root Card, and signed Card
+  scope containing exactly one UID-bearing `Verifier` CardRef: the run's exact
+  Verifier version. Verification MUST reject
   a missing or non-UUIDv7 persisted principal, a mismatched tenant, a bound root
   Card, any role, an empty or multi-Card scope, a non-Verifier scope member, or
   a scope member without managed Card UID. Public API-key, refresh, JWT-bearer,
@@ -889,6 +932,12 @@ table on `(data_tenant_id, result_id)`.
   MUST reject creation, credentialing, impersonation, delegation, or refresh
   of `system`. Expiry or retry mints a new short-lived token; no credential is
   persisted.
+
+  SYSTEM minting evaluates no end-user permission and emits no authorization
+  audit row. Gate's result-table admission is the one
+  `bifrost_record:write` authorization decision and uses the canonical audit
+  path. No second issuer, token format, credential table, or identity store is
+  introduced.
 
   A valid SYSTEM result token receives only the existing
   `bifrost_record:write` permission. Gate MUST reserve exactly
@@ -1188,7 +1237,7 @@ table on `(data_tenant_id, result_id)`.
   this initial journey.
 - **REQ-113**: Implementation MUST reuse the existing Card envelope,
   composite registration, UID-pinned `Ref`/`InlineableRef` resolution,
-  card-bound principal/token exchange, `WyrdState` request-driven refresh,
+  card-bound principal/token exchange, `WyrdState` request-driven re-exchange,
   `DriftRecordObservation` and `EvalRecordObservation` with their obsolete
   implementation-ref fields removed and the existing Eval `MediaRef` extended
   only for named native media binding, bounded
@@ -1244,6 +1293,23 @@ table on `(data_tenant_id, result_id)`.
   absent. Existing tracing and metrics MUST expose queue depth, active work,
   attempts, failures, and latency; this change adds no new telemetry service or
   process-local work registry.
+- **REQ-152**: Verification coordination MUST use PostgreSQL as its clock.
+  PostgreSQL MUST write and evaluate runtime activity, schedule eligibility,
+  run and dispatch availability, claim and lease expiry, retry/backoff
+  availability, worker deadlines, and coordination-relevant creation/update
+  times with `statement_timestamp()`. Immediate timestamps are assigned in the
+  owning SQL statement; relative deadlines are computed there from a bound
+  duration; and expiry or eligibility is compared there. When Rust needs a
+  database deadline decision, the same statement MUST return the verdict or
+  remaining interval rather than exposing a timestamp for comparison with a
+  process wall clock. An explicitly authored or cron-derived future schedule
+  remains an allowed bound instant, but its "next future" anchor MUST be a
+  PostgreSQL timestamp returned by the owning statement. Rust `Instant` remains
+  the clock for process-local timeouts, sleeps, and latency, while producer
+  clocks remain authoritative for event facts such as observation time,
+  verification execution start/end, and JWT `iat`/`exp`. Verification MUST NOT
+  add a clock abstraction, skew tolerance, synchronization setting, safety
+  margin, or permanent source checker.
 - **REQ-114**: Before this change is complete, the owning Card and runtime
   architecture authorities, generated schemas, and public documentation MUST
   describe the new Verifier-only verification model. In particular, the
@@ -1313,6 +1379,10 @@ table on `(data_tenant_id, result_id)`.
 - **INV-014**: `Verifier` is the only registrable Card kind for verification.
   `Drift` and `Eval` are typed implementations, not parallel Cards, hidden
   resources, or alternate registration paths.
+- **INV-015**: The system evaluating a verification time predicate owns the
+  timestamp used by that predicate. A PostgreSQL coordination column is never
+  written from a Rust wall-clock instant and later compared by PostgreSQL, and
+  Rust never evaluates a PostgreSQL-owned deadline against its wall clock.
 - **INV-013**: Inline and referenced Trigger or Operator definitions have the
   same semantics. Inline definitions remain part of the containing Card version
   and MUST NOT create hidden Cards. Referenced definitions retain their own Card
@@ -1457,6 +1527,43 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
   MUST omit `run_id` and `card_ref` user fields; both are supplied only as
   per-row correlation. Two concurrent scoped runs writing different tables
   MUST retain their own table and correlation without active-table switching.
+- **AC-032**: A Python real-SDK-to-real-server journey MUST enter
+  `state.run(card="...")` for a registered Service component, invoke
+  framework-style code that creates spans without setting Wyrd attributes,
+  and export those spans through the stock Python OpenTelemetry SDK and
+  OTLP/HTTP exporter to Wyrd's authenticated `POST /v1/traces` endpoint. The
+  same Run scope MUST write one caller-owned `vala.datasets.*` row and one Eval
+  observation whose trace/span IDs come from the active span rather than
+  explicit arguments. After context exit, explicit tracer flush, state
+  shutdown, and server publication, persisted Bifrost queries MUST prove every
+  span carries the exact shared `wyrd.run_id`, asserted `wyrd.card_ref`,
+  authenticated publisher, and server-resolved Card UID; the custom row joins
+  to those spans by `run_id`; and the Eval row joins to its exact span by
+  `trace_id` and `span_id` while retaining the same run and Card identity. The
+  proof MUST extend the existing Python scoped-observation journey rather than
+  introduce a second Service fixture. An already-active recording span MUST
+  receive the same attributes. Nested root and component scopes MUST share one
+  run ID, select their own exact CardRefs, and restore the outer Card after
+  exit. Async evidence MUST cover an `await`, concurrent tasks using the same
+  immutable Run, and a task created inside the scope. Focused Python tests MUST
+  prove that missing `opentelemetry-api`, an API-only/no-SDK provider,
+  processor registration failure, span enrichment failure, and detach failure
+  do not escape or block explicit observations; a user exception from the
+  block MUST propagate unchanged. Unknown aliases MUST still fail before
+  entry. Provider registration MUST be idempotent, and an explicitly installed
+  private provider MUST receive the same attributes. Context exit MUST NOT be
+  treated as a telemetry or Bifrost durability barrier. No test may infer
+  automatic log or metric enrichment from this span contract.
+- **AC-033**: Postgres integration evidence MUST prove the shared machine-
+  activity/schedule path and the shared verifier-run/dispatch path assign
+  immediate timestamps, relative deadlines, and due/expiry verdicts from
+  `statement_timestamp()`. Lease reclaim, retry availability, inactivity, and
+  no-backfill scheduling tests MUST control database coordination state rather
+  than advance a process wall clock or backdate a fixture merely to make an
+  unrelated predicate pass. Existing runtime journeys MUST continue to prove
+  restart reclaim, stale-token fencing, scheduling, activity renewal, and
+  dispatch creation. No skew workaround, clock abstraction, or permanent grep
+  check is acceptable evidence.
 - **AC-025**: Rust, Python, and TypeScript SDK journeys MUST start Bifrost
   through their specified pass-through options, fail startup when either
   fixed system table cannot be described, and emit Drift and Eval without
@@ -1492,10 +1599,13 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
   unauthorized, or cross-tenant refs. Registration alone does not activate
   a binding or start a run; PSI/SPC bindings remain unrunnable until ready.
 - **AC-019**: A real client/server journey proves that initial
-  service-principal authentication activates only the exact Service or
-  Agent Card version, request-driven stale-token re-exchange renews activity
-  without resetting an active schedule cursor, and an idle client does not
-  refresh solely on token expiry. Inactivity, suspension, and deletion
+  API-key exchange or workload `jwt-bearer` authentication activates only the
+  exact Card-bound Service or Agent Card version, request-driven stale-token
+  re-exchange renews activity without resetting an active schedule cursor, and
+  an idle client does not
+  re-exchange solely on token expiry. Delegation, human refresh, Card-free
+  automation, SYSTEM minting, cached-token requests, and ordinary observations
+  do not activate or renew an owner. Inactivity, suspension, and deletion
   prevent scheduled work; later reauthentication starts at the next future
   occurrence without backfill. Two A/B versions remain independently
   active, replicas of one exact principal do not duplicate runs, component
@@ -1564,10 +1674,14 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
   `card_ref` MUST be rejected; no global `SYSTEM_OWNER` token may write a
   customer-tenant result. Provisioning MUST create one stable UUIDv7 SYSTEM
   principal per tenant without a public credential. Tests MUST reject public
-  issuance, refresh, and delegation for SYSTEM, non-SYSTEM writes to any result
-  table, and SYSTEM writes to every other table. Two bindings for one subject MUST remain
-  independently filterable through runs/results while sharing the one raw
-  subject observation without Verifier/binding columns or per-binding copies.
+  create, list, get, update, suspend/delete, credential, refresh, workload,
+  delegation, impersonation, and token-exchange operations for SYSTEM,
+  non-SYSTEM writes to any result table, and SYSTEM writes to every other
+  table. They MUST also prove the existing tenant issuer/JWT format and the
+  single canonical Gate authorization audit. Two bindings for one subject MUST
+  remain independently filterable through runs/results while sharing the one
+  raw subject observation without Verifier/binding columns or per-binding
+  copies.
 - **AC-024**: Bifrost catalog/schema tests MUST assert the exact column names,
   order, Arrow types, and nullability in `architecture/logic/table_schema.md`,
   daily `wyrd_event_time` partitioning for all five verification tables, and the
@@ -1602,8 +1716,7 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
 
 ## Open material decisions
 
-None. Revision 32 was explicitly approved by the user's delegated
-Ponytail blocker resolver on 2026-09-19.
+None. Revision 35 was explicitly approved by the user on 2026-09-22.
 
 ## Material authority links
 
@@ -1797,3 +1910,32 @@ Ponytail blocker resolver on 2026-09-19.
   post-ack Eval enqueue, and no-Alert flow. This revision was explicitly
   approved through the user's delegated blocker-resolution authority on
   2026-09-19.
+- **Revision 33 identity integration (2026-09-21):** Integrated Verification
+  with the current tenant-principal and five-minute permission-snapshot model.
+  Added one internal-only tenant `system` principal kind for canonical result
+  publication while reusing the existing identity store, token issuer, JWT
+  format, Gate, and audit path. Fixed binding activity to successful API-key or
+  workload-`jwt-bearer` exchange by the exact Card-bound Service or Agent and
+  explicitly excluded delegation, human refresh, Card-free automation, SYSTEM
+  minting, cached bearer use, and idle expiry. This revision was explicitly
+  approved by the user on 2026-09-21.
+- **Revision 34 Run context and Python span correlation (2026-09-22):** Added
+  language-idiomatic initial Card selection when opening a Run and retained
+  immutable `for_card` views for multi-component invocations. Made Python Run
+  a synchronous context manager that injects `wyrd.card_ref` and
+  `wyrd.run_id` into the active span and framework-created child spans through
+  optional execution-local OpenTelemetry context plus an idempotent span
+  processor. Fixed nested and asyncio propagation, private-provider escape
+  hatch, server-owned identity boundaries, and fail-open behavior when Python
+  OpenTelemetry is absent or fails. Required the existing Python Service journey
+  to export through authenticated `/v1/traces` and prove persisted joins from
+  traces to custom rows by Run ID and Eval rows by trace/span identity. This
+  revision was explicitly approved by the user on 2026-09-22.
+- **Revision 35 PostgreSQL coordination clock (2026-09-22):** Made the
+  evaluator own every verification timestamp: PostgreSQL now owns activity,
+  scheduling, claims, leases, retries, worker deadlines, and their predicates;
+  Rust retains monotonic in-process timing and producer-owned event facts.
+  Prohibited process-clock/database-clock mixing, clock abstractions, skew
+  tolerances, and checker-based enforcement, and required behavioral Postgres
+  regression evidence for each corrected shared write path. This revision was
+  explicitly approved by the user on 2026-09-22.

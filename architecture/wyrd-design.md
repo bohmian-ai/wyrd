@@ -27,7 +27,7 @@ drift, not permission for code and documentation to diverge.
   - [Data](#data) · [Model](#model) · [Artifact](#artifact) · [Experiment](#experiment)
   - [Prompt](#prompt) · [Agent](#agent) · [Workflow](#workflow) · [Mcp](#mcp)
   - [Service](#service) · [Policy](#policy) · [Audit](#audit)
-  - [Drift](#drift) · [Eval](#eval) · [Source](#source) · [Bifrost](#bifrost)
+  - [Verifier](#verifier) · [Source](#source) · [Bifrost](#bifrost)
   - [Trigger](#trigger) · [Operator](#operator)
 - [Registry lifecycle](#registry-lifecycle) — composite registration, card blob, idempotency
 - [Bifrost design](./bifrost-design.md) — OLAP warehouse: tables, Scribe ingest, Oracle admission, Forge, public surface
@@ -58,7 +58,7 @@ not a passive integration or inventory product.
    reusable Verifier Card to that exact owner version and subject occurrence.
    Runtime observations supply subject identity; the binding supplies the
    Verifier, Trigger activation, and optional failure Operators.
-4. **Reactions are Operators; wiring is Triggers.** Verifier/Policy never
+4. **Reactions are Operators; activation is Triggers.** Verifier/Policy never
    inline reaction logic.
 5. **Service composes deployment and subscription wiring, not monitor
    definitions.** Verifier/Trigger/Operator/Audit/Source are peer cards, not
@@ -84,7 +84,7 @@ not a passive integration or inventory product.
     resolves through the runtime tool registry. MCP servers auto-register
     their tools by name; host tools register themselves. No `Tool` kind.
 13. **No event vocabulary on the wire.** "Observation" comes from Verifier implementations;
-    "trigger firing" comes from the `TriggerSource` enum. Free-form
+    "activation" comes from the closed `TriggerSpec` activation. Free-form
     event-name strings are doctrine drift.
 14. **Host config stays off Cards.** Permission modes,
     sandboxes, isolation, effort, and per-CLI compatibility are properties of
@@ -117,16 +117,16 @@ not a passive integration or inventory product.
     through the transitive card-ref graph declared in that card's spec. A card
     enters the scope only if its kind is an observation target — a kind a client
     (`wyrd.observer`, Bifrost, drift, eval) attributes records to: `Data`,
-    `Model`, `Experiment`, `Prompt`, `Agent`, `Workflow`, `Eval`, `Drift`,
-    `Service`, `Mcp`, `Artifact`, `Source`. Control-plane kinds (`Policy`,
-    `Audit`, `Operator`, `Trigger`) may be referenced for governance but never
-    enter the emit scope. Service principals start from their Service card and
+    `Model`, `Experiment`, `Prompt`, `Agent`, `Workflow`, `Service`, `Mcp`,
+    `Artifact`, `Source`. `Verifier` and control-plane kinds (`Policy`,
+    `Audit`, `Operator`, `Trigger`) may be referenced for governance or
+    verification but never enter the emit scope. Service principals start from their Service card and
     therefore include declared `Service.components`; Agent principals start from
     their Agent card and include its declared card refs. Every token mint —
     including the re-exchange a machine performs when its access token expires
     — resolves those bounded scope identities to Card UIDs and signs that
     mapping.
-    An observation may carry the run's Target `card_ref`; when present, the
+    An observation may carry its subject `card_ref`; when present, the
     server authorizes it against that scope and stamps the mapped `card_uid`.
     Generic telemetry may omit it and retains the authenticated publisher through
     `principal_id`. A separate emit credential was redundant — see "Observation
@@ -153,22 +153,29 @@ not a passive integration or inventory product.
     is a `Uuid` newtype; no string-prefix encoding (no `user:`, `sa:`,
     `agent:`) — discrimination lives on the kind. The closed wire set is
     `PrincipalKindTag`: `GlobalAdmin`, `TenantAdmin`, `User`, `Service`,
-    `Agent`, serialized as `global_admin`, `tenant_admin`, `user`, `service`,
-    `agent`. A `GlobalAdmin` is a platform-plane principal and has no tenant,
+    `Agent`, `System`, serialized as `global_admin`, `tenant_admin`, `user`,
+    `service`, `agent`, `system`. A `GlobalAdmin` is a platform-plane principal
+    and has no tenant,
     carried at runtime as `PlatformPrincipal { id, kind,
     effective_permissions, credential_id }`; a platform-plane human is a
     `User` with no tenant. Every tenant-plane principal has exactly one
     tenant and carries the card-bearing `PrincipalKind`: `TenantAdmin`,
-    `User`, `Service { card_ref: Option<CardRef>, card_ref_scope }`, or
-    `Agent { card_ref, card_ref_scope }`. Card binding is a property of a
+    `User`, `Service { card_ref: Option<CardRef>, card_ref_scope }`,
+    `Agent { card_ref, card_ref_scope }`, or the internal-only
+    `System { card_ref_scope }`. Card binding is a property of a
     machine principal, not a precondition for being one: an Agent is always
     card-bound and a deployed Service carries its Card, each projecting a
     `card_ref_scope` authorization set derived at mint time, while a tenant
     administrative or tenant-created automation principal is representable
     with no Card and therefore no emit scope. `User` is the marker for human
-    identity. Platform authority is a grant held at platform scope, not a
-    property of a kind, and neither plane's credential or token is accepted by
-    the other. `wyrd apply -f service.yaml` (or an Agent card) creates
+    identity. `System` is a tenant-local server identity used only for
+    canonical verification-result publication. It has no public credential,
+    role, refresh, workload, delegation, or principal-management path; the
+    server mints its short-lived token with exactly one UID-bearing Verifier
+    scope and the fixed result-write capability. Platform authority is a grant
+    held at platform scope, not a property of a kind, and neither plane's
+    credential or token is accepted by the other. `wyrd apply -f service.yaml`
+    (or an Agent card) creates
     or updates the principal row idempotently, keyed on
     `(tenant_id, card_kind, card_uid)`; re-apply preserves the same
     `principal_id`. No secret is returned. Credentials are issued out-of-band
@@ -234,8 +241,9 @@ not a passive integration or inventory product.
     `VerificationBinding` values. Each binding resolves one exact Verifier,
     one Trigger activation, and zero or more failure Operators. The binding is
     static declaration and never a per-request routing table; changing it
-    changes the containing Card spec. `publishes_to` has no verification
-    meaning.
+    changes the containing Card spec. There is no separate publication or
+    monitor-routing field, and clients never select a Verifier per
+    observation.
 
 ## Client model
 
@@ -578,26 +586,42 @@ introduce a competing request identity.
 #### Observation identity — `Card → Run → Observation`
 
 How Card-correlated telemetry ties to a Run and a Card, and how the server
-resolves it. Every Run is bound to a Card version, its **Target**. A telemetry
-row may omit Card correlation; when supplied, the `(card_ref, run_id)` pair
-anchors it to that Target and Run. The server owns resolution of that identity.
+resolves it. A Run is one client application invocation with one `run_id`;
+each correlated row names its own exact subject Card. A telemetry row may omit
+Card correlation; when supplied, the `(card_ref, run_id)` pair anchors it to
+that subject and invocation. The server owns resolution of that identity.
 
 **A principal is not a card.** A Service or Agent principal is bound to one card
 (its `card_ref`), but a Service card *nests components* — each a card in its own
-right (e.g. Model A, Model B, a Prompt; `Service.components`). `wyrd_state["a"]
-.run()` and `wyrd_state["b"].run()` execute under the **same** JWT yet target
-**different** component cards, and a Run is specific to the card that opened it.
-So the principal's root Card cannot say which card a correlated record belongs
-to — the run's Target Card must be carried on that row. Generic telemetry may
-omit a Target Card.
+right (e.g. Model A, Model B, a Prompt; `Service.components`). One
+`state.run()` opens one invocation and one `run_id`, initially scoped to the
+root Service Card. The first-class SDKs may select an initial hydrated Card
+alias when opening the run, and `for_card(alias)` returns an immutable
+Card-scoped view of that same invocation for multi-component work. Views for
+different components share the `run_id` and the JWT, but each row carries its
+view's exact subject `card_ref`. Switching Cards never requires a distinct Run
+ID, and the principal's root Card cannot say which card a correlated record
+belongs to — the subject Card must be carried on that row. Generic telemetry
+may omit a subject Card.
+
+Python `Run` values are synchronous context managers for optional ambient span
+correlation. Entering a scope best-effort attaches the selected CardRef and
+run ID to Python OpenTelemetry context, annotates an active recording span,
+and lets an idempotently installed span processor copy `wyrd.card_ref` and
+`wyrd.run_id` onto spans created inside the scope. Exiting restores the prior
+context. Missing or incompatible Python OpenTelemetry support and enrichment
+failures are no-ops; they never fail application execution or explicit Wyrd
+observation emission. Card lookup and authorization remain strict. The scope
+does not create, end, flush, or persist a Run or span. Signal-specific log and
+metric enrichment is not implied.
 
 Every accepted row carries authenticated publisher and request identity; Card
 and Run correlation are optional per-row values:
 
 | Value | Source | Grain | Means |
 |---|---|---|---|
-| `card_ref` | optional client assertion of the run's Target Card; server authorizes it when present | per row | the optional Card-version anchor — *which* Card |
-| `run_id` | optional client-generated value per `.run()`; passed through opaquely | per row | the optional Run anchor — *which* execution |
+| `card_ref` | optional client assertion of the row's exact subject Card (the run view's selected Card); server authorizes it when present | per row | the optional Card-version anchor — *which* Card |
+| `run_id` | optional client-generated value per `.run()`, shared by every Card-scoped view of that invocation; passed through opaquely | per row | the optional Run anchor — *which* execution |
 | `principal_id` | server-stamped from the verified JWT | per request | the authenticated publisher — *who* emitted it |
 | `tenant_id` | server-stamped from the verified JWT | per request | the tenancy boundary |
 | `wyrd_request_id` | the propagated `Wyrd-Request-Id` (minted at first sighting) | per request | the request spine — one request spans **many** runs and hops |
@@ -638,7 +662,7 @@ Consequences, stated so they stop drifting:
   **observation-target** cards reachable through the transitive card-ref graph
   declared in that card's spec. A card is in scope only if its kind is an
   observation target (`Data`, `Model`, `Experiment`, `Prompt`, `Agent`,
-  `Workflow`, `Eval`, `Drift`, `Service`, `Mcp`, `Artifact`, `Source`);
+  `Workflow`, `Service`, `Mcp`, `Artifact`, `Source`); `Verifier` and
   control-plane kinds (`Policy`, `Audit`, `Operator`, `Trigger`) never enter the
   emit scope. Service cards contribute `Service.components`; other reachable
   specs contribute their declared card refs according to the shared card-ref
@@ -756,9 +780,7 @@ provenance graph; never user-declared scope.
 
 **Creation.** Audit cards are created on-demand only. An investigator —
 human or agent — runs a provenance query, decides what is worth pinning,
-and snapshots the result. Wyrd does not auto-create Audit cards in v1;
-teams that want auto-snapshots wire a `Trigger` + `Operator` using
-existing nouns.
+and snapshots the result. Wyrd does not auto-create Audit cards in v1.
 
 **Storage.** Light-card pattern (doctrine #16). The case file lives inline
 on the Audit card itself — no separate `Artifact`, no separate chain
@@ -900,17 +922,16 @@ typed refs is a versioned breaking change that adds variants.
 
 | Variant           | Source-card fields                                                          |
 |-------------------|-----------------------------------------------------------------------------|
-| `Verification`    | `Service.components[].verified_by`, `Service.verified_by`, `Agent.verified_by` |
-| `SubjectFilter`   | `Trigger.source.*.subject_filter`                                           |
+| `Verification`    | `Service.components[].verified_by[].verifier`, `Service.verified_by[].verifier`, `Agent.verified_by[].verifier` |
 | `Component`       | `Service.components[].ref`, `Workflow.steps[].target`                       |
 | `Artifact`        | `Data.card_refs[]`, `Model.card_refs[]`                                     |
 | `Prompt`          | `Agent.prompt`                                                              |
-| `Dataset`         | `Eval.dataset`                                                              |
-| `Source`          | `Eval.source_ref`, `Drift.signal.External.source_ref`                       |
-| `Baseline`        | `Drift.signal.Distribution.baseline_ref`                                    |
-| `Trigger`         | `Trigger.source.drift_ref \| eval_ref`                                      |
-| `Operator`        | `Trigger.operator_ref`                                                      |
-| `Workflow`  | `Operator.action.workflow_ref`                                    |
+| `Dataset`         | `Verifier.implementation.spec.dataset` (eval)                               |
+| `Source`          | `Verifier.implementation.spec.source_ref` (eval)                            |
+| `Baseline`        | `Verifier.implementation.spec.signal.baseline_ref` (drift)                  |
+| `Trigger`         | `*.verified_by[].runs_on`                                                   |
+| `Operator`        | `*.verified_by[].on_failure[]`                                              |
+| `Workflow`  | `Operator.workflow_ref`                                           |
 | `Hook`      | `Operator.pre_invoke`, `Operator.post_invoke`                     |
 
 For `Service.components[].verified_by`, derived edges retain the exact
@@ -994,8 +1015,44 @@ Multi-party attestations are not part of the v1 Audit wire contract. Values in
 ### Verifier
 
 A subject-less verification declaration with exactly one typed implementation.
-The initial closed variants are Drift and Eval. Scheduling and failure reaction
+`Verifier` is the only registrable verification kind: the initial closed
+`implementation.kind` variants are `drift` and `eval`, and `kind: Drift` /
+`kind: Eval` registrations are rejected. Scheduling and failure reaction
 remain on the binding's Trigger and Operators.
+```yaml
+spec:
+  description?: string
+  implementation:
+    kind: drift | eval           # closed; variant fields below
+    spec: DriftSpec | EvalSpec    # implementation body below
+```
+
+A Verifier runs only through a `verified_by` binding on a Service component,
+Service, or standalone Agent, or through an analysis-only direct invocation:
+```yaml
+verified_by:
+  - verifier: Ref                            # → Verifier (exact version)
+    runs_on: InlineableRef<TriggerSpec>      # activation
+    on_failure: [InlineableRef<OperatorSpec>] # zero or more reactions
+```
+
+One binding is one subscription. Its subject is the containing Service,
+standalone Agent, or Service component occurrence; the same Verifier, Trigger,
+and Operator Cards may be reused by any number of bindings. Registration
+UID-pins every referenced Verifier, Trigger, and Operator, and rejects
+unresolved, wrong-kind, unauthorized, and cross-tenant references, duplicate
+bindings to the same Verifier version for one subject, and `workflow` in
+`on_failure`. The runtime direction is fixed:
+
+```text
+binding activation -> Verifier run -> Verification Result
+  -> zero or more on_failure dispatches (failed verdict only)
+```
+
+Trigger decides when; the Verifier decides the verdict; the generic runner,
+not the Drift or Eval implementation, creates dispatches; each Operator owns
+its own delivery. A Verifier run never creates another Trigger. Direct
+Verifier invocation is analysis-only and dispatches nothing.
 
 #### Drift implementation
 Subject-less observation definition. The implementation is orthogonal: signal +
@@ -1038,9 +1095,10 @@ Subject-less behavioral assessment definition. The implementation is orthogonal:
 **how** to judge (`tasks` DAG), **where to read observations from**
 (`source_ref`, deferred), and an optional **offline driver** (`dataset`).
 Subject identity is supplied by the publisher at observation time
-(Doctrine #3, #21). No scheduling, no dispatch, no fire condition — fire
-lives on `Drift` with `DriftSignal::EvalScore`. Eval is a single typed
-task workflow, not a parallel mode/profile split.
+(Doctrine #3, #21). No scheduling, no dispatch, no fire condition — its
+activation is an `observations_ready` Trigger and its failure reactions are
+the binding's Operators. Eval is a single typed task workflow, not a parallel
+mode/profile split.
 ```yaml
 spec:
   description?: string
@@ -1066,10 +1124,10 @@ of refs is the mode):
 
 | `dataset` | `source_ref` | Runtime behavior |
 |---------------|--------------|------------------|
-| set           | unset        | Offline batch. Engine invokes the subject selected by its Service-component or standalone-Agent publication binding against the Data card's scenario rows, captures traces inline. |
+| set           | unset        | Offline scenario driver. No shipped route runs it; a future Verifier-backed offline route owns it. There is no Eval pull protocol. |
 | unset         | set          | Online / archived (deferred — DESIGN §13). Engine reads the user's sink, filters records by publisher `card_ref`, samples records into the task workflow. |
 | set           | set          | Same tasks, both modes (online deferred — DESIGN §13). Offline gate and online monitor share one task definition. |
-| unset         | unset        | Online over `vala`'s default observation archive. |
+| unset         | unset        | Continuous: each committed `vala.eval.observations` record activates its subject's matching `observations_ready` bindings. |
 
 **Directional flow.** A Service component binding or standalone Agent declares
 `verified_by` with an Eval-backed Verifier and the runtime emits observations
@@ -1123,7 +1181,7 @@ Both run in one pass.
 Read-side reference to an external data system. **Wyrd reads, never writes.**
 
 `source` is a **read-shape bucket**, not a vendor. The top-level discriminator is
-the shape of data a consuming `Drift`/`Eval` Card sees — a row set, a time
+the shape of data a consuming Verifier implementation sees — a row set, a time
 series, blobs — so a consumer binds to the shape and never to a vendor. The
 vendor (BigQuery vs Snowflake, Prometheus vs Datadog, GCS vs S3) is a
 **connection detail nested below the bucket**. This is the same axis `object_store`
@@ -1154,9 +1212,10 @@ Each bucket carries one uniform read contract; the vendor is a nested
 | `logs`           | query → log records                   | `loki` \| `elasticsearch` \| `splunk`    |
 | `traces`         | query → spans                         | `tempo` \| `datadog_apm` \| `jaeger`     |
 
-The bucket set lines up with what `Drift`/`Eval` already read: `object_store`/
-`sql_warehouse` feed `DriftSignal::Distribution` (rows), `metrics` feeds
-`DriftSignal::Metric`, `traces` feeds `EvalTask::TraceAssertion`.
+The bucket set lines up with what Drift and Eval implementations already read:
+`object_store`/`sql_warehouse` feed `DriftSignal::Distribution` (rows),
+`metrics` feeds `DriftSignal::Metric`, `traces` feeds
+`EvalTask::TraceAssertion`.
 
 **Secrets never live on the Card** (Doctrine #7). Every vendor connection carries
 a `SourceAuth` whose secret material is a **named server-side env var**, resolved
@@ -1227,52 +1286,66 @@ authentication, HTTP, and gRPC. `QueryClient` and
 clients. Gate is the server dispatcher; it is neither a client type nor a
 deployment target.
 
+### Coordination clock
+
+The system evaluating a time predicate owns the timestamp used by that
+predicate. PostgreSQL owns database coordination time: work availability,
+schedule eligibility, claims, leases, heartbeats, retry/backoff eligibility,
+worker deadlines, retention cutoffs, and ordering timestamps that affect those
+decisions use `statement_timestamp()` in the owning SQL statement. Relative
+deadlines are computed in SQL from a bound duration, and PostgreSQL returns a
+verdict or remaining interval when Rust must react to a database deadline.
+Rust does not bind its wall clock into coordination columns or compare a
+PostgreSQL timestamp with `Utc::now()`.
+
+Rust `Instant` owns in-process timeouts, sleeps, poll deadlines, and latency.
+The producer owns domain and event facts such as observation time, execution
+start/end, caller-declared expiry, and JWT `iat`/`exp`. Explicit future
+scheduling remains representable, but a computed "next future" schedule uses a
+PostgreSQL timestamp returned by the owning statement as its anchor. Wyrd adds
+no clock abstraction, skew tolerance, synchronization setting, safety margin,
+or permanent source checker for this rule; each shared coordination write path
+is protected by a behavioral regression test.
+
 ### Trigger
-Fires an Operator. A Trigger declares when (`schedule`), what to evaluate
-(`source`, optional), and what to fire (`operator_ref`). On each schedule
-tick, the server evaluates the source if present; if its condition matches
-(or no source is declared), the operator fires.
+Decides when a bound Verifier runs. A Trigger is one flattened, closed
+activation; it names no Verifier, Operator, subject, threshold, pass-rate
+criterion, or other verdict matcher. A verification binding's `runs_on`
+supplies it inline or by reference; the same Trigger Card may serve any number
+of bindings.
 ```yaml
 spec:
   description?: string
-  schedule: { cron: string, tz?: string }   # required — IANA tz name, default UTC
-  source?: TriggerSource                     # closed tagged union — see below
-  operator_ref: CardRef                      # → Operator (the only valid target kind)
+  kind: schedule | observations_ready     # closed activation discriminator
+  cron: string                            # schedule only
+  tz?: string                             # schedule only — IANA tz name, default UTC
 ```
 
-`TriggerSource` is a closed tagged union (snake_case `kind` discriminator).
-Each variant carries an optional `subject_filter: CardRef` that narrows
-the subscription to observations emitted by that publisher. `None` matches
-any publisher — the Trigger fires on any observation from that monitor.
+| Activation           | Valid Verifier implementation | Creates |
+|----------------------|-------------------------------|---------|
+| `schedule`           | `drift`                       | One run per active binding per due occurrence, over that binding's subject window. |
+| `observations_ready` | `eval`                        | One run per matching active binding for each committed Eval observation of that binding's subject. |
 
-| Variant | Variant-specific carries                                                       | Server does on each schedule tick                                              |
-|---------|--------------------------------------------------------------------------------|--------------------------------------------------------------------------------|
-| `DriftObservation` | `drift_ref: CardRef` (→ Drift), `subject_filter?: CardRef`          | Evaluates the Drift over observations passing `subject_filter`. Condition match → fire `operator_ref`. Else record metric. |
-| `EvalObservation`  | `eval_ref: CardRef` (→ Eval), `subject_filter?: CardRef`            | Runs the Eval over observations passing `subject_filter`. Any task failure → fire `operator_ref`. Else record scores.      |
+Registration rejects an activation paired with the wrong Verifier
+implementation. A Trigger never fires on its own: nothing runs merely because
+a Trigger Card is registered, and one schedule occurrence shared by two
+subjects creates two subject-scoped runs, never one mixed-subject run.
 
-If `source` is omitted, the operator fires unconditionally on every schedule
-tick (cron-driven webhook or workflow dispatch with no monitor gate).
-
-vala chooses the evaluation strategy (windowed PSI/SPC compute, per-record
-aggregation, threshold-on-latest) based on the (signal, condition) pair of
-the referenced card. The card schema does not declare strategy — it's
-implementation.
-
-External pushes are deliberately not a Trigger source — Rule 7 ("Wyrd reads,
-it does not push") means external signals enter through a `Source`, are read
-by a `Drift` with `DriftSignal::External { source_ref }`, and fire through
-`source.DriftObservation` like any other drift.
+External pushes are deliberately not an activation — Rule 7 ("Wyrd reads, it
+does not push") means external data enters through a `Source`.
 
 ### Operator
-Fires when a Trigger references it. Performs exactly one action — a Workflow
-dispatch, a typed notification, or a generic HTTP call. Operator is a pure
-side-effect template with no `pre_invoke` / `post_invoke` hooks; policy
-gating on operator dispatch lives on the Trigger that references it
-(Doctrine #3, #4).
+A failure reaction. Performs exactly one action — a typed notification, a
+generic HTTP call, or a Workflow dispatch. Operator is a pure side-effect
+template with no `pre_invoke` / `post_invoke` hooks and no subscription of its
+own: it runs only as an `on_failure` entry of a verification binding. A
+referenced Operator Card and an inline `on_failure` mapping use the same
+flattened `OperatorSpec` shape.
 ```yaml
 spec:
   description?: string
-  action: OperatorAction          # closed tagged union — see below
+  kind: notify | http | workflow  # flattened OperatorAction discriminator
+  # ...variant fields below
   budget?: { max_wall_seconds?: u32, max_tool_calls?: u32 }
 ```
 
@@ -1280,9 +1353,17 @@ spec:
 
 | Variant    | Variant-specific carries                                                              | Server does                                                                   |
 |------------|---------------------------------------------------------------------------------------|-------------------------------------------------------------------------------|
-| `Workflow` | `workflow_ref: CardRef` (→ Workflow)                                                  | Dispatches the Workflow with the firing context as entrypoint payload.        |
 | `Notify`   | `channel: NotifyChannel` (closed tagged union — typed vendor shape)                  | Sends the notification through the vendor-specific adapter the server owns.   |
-| `Http`     | `method`, `url`, `headers?`, `body?`, `auth?`, `timeout_seconds?`, `expect_status?` | Builds and sends the HTTP request; records response code and latency in vala. |
+| `Http`     | `method`, `url`, `headers?`, `body?`, `auth?`, `timeout_seconds?`, `expect_status?` | Builds and sends the HTTP request.                                            |
+| `Workflow` | `workflow_ref: Ref` (→ Workflow)                                                      | Not yet executable. Registerable as an Operator Card, but registration rejects it in `on_failure`. |
+
+**Dispatch.** Only a completed, binding-created Verifier run with a `failed`
+verdict creates Operator work: one durable dispatch per configured
+`on_failure` Operator. Passed, inconclusive, cancelled, timed-out, errored,
+and direct analysis-only runs create none. Each dispatch has its own status,
+bounded retry, and terminal error; one failure never blocks siblings or
+rewrites the result. There is no `Alert` resource, table, or alert router — a
+Notify Operator *is* the alert.
 
 `NotifyChannel` (v1 set; closed tagged union; additional channels are
 protocol-versioned additions):
@@ -1312,16 +1393,12 @@ not in the card.
 `{{...}}` placeholders the server interpolates at fire time. Same templating
 applies to `Http.url` and to text fields in `NotifyChannel` variants.
 
-Templating context comes from the Trigger that fired the Operator:
-- `Trigger.source = DriftObservation { drift_ref, subject_filter? }`:
-  `drift.{name}`, `subject.{kind, name, version}` (the publisher whose
-  observation matched), `observation.{value, threshold, fired_at}`.
-- `Trigger.source = EvalObservation { eval_ref, subject_filter? }`:
-  `eval.{name}`, `subject.{kind, name, version}`,
-  `failures[]` (per-task failure entries).
-- `Trigger.source` absent: `schedule.fired_at` only.
-
-Exact field schema for each context lives in OpenAPI.
+Templating context is one bounded, immutable failure context derived from
+the failed Verification Result: dispatch, run, result, and binding IDs; the
+exact Verifier and subject Card identities; the `failed` verdict; completion
+time; and a bounded result summary. It never carries raw observation context,
+media, feature rows, or secret material, and registration rejects unknown
+template fields. Exact field schema lives in OpenAPI.
 
 ---
 
@@ -1446,8 +1523,11 @@ Codes and semantics live in `crates/wyrd-spec/src/error.rs` behind the
 `WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT`,
 `WYRD_REGISTRY_410_OPERATION_EXPIRED`,
 `WYRD_REGISTRY_507_ARTIFACT_VERIFY_FAILED`,
-`WYRD_SPEC_400_DUPLICATE_PUBLISH_TARGET`,
-`WYRD_SPEC_400_INVALID_PUBLISH_TARGET_KIND`,
+`WYRD_SPEC_400_DUPLICATE_VERIFICATION_BINDING`,
+`WYRD_SPEC_400_INVALID_VERIFIER_REF_KIND`,
+`WYRD_SPEC_400_INVALID_BINDING_REF_KIND`,
+`WYRD_SPEC_400_UNSUPPORTED_OPERATOR_ACTION`,
+`WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH`,
 `WYRD_INTERNAL_500`. The catalog is the source of truth for problem-json
 serialization across HTTP, Python, TypeScript, MCP, and CLI surfaces.
 
@@ -1470,11 +1550,11 @@ is available only at `InlineableRef<T>` slots.
 | `Artifact`     | **Yes** (typically derived from heavy cards) | Pointer to durable bytes. |
 | `Prompt`       | Optional | Light. Inlineable as `InlineableRef<Prompt>` inside `Agent.prompt`. |
 | `Agent`        | Optional | Light. Spec-only; `apply` registers it. `LlmJudgeTask.judge_ref` is `InlineableRef<AgentSpec>`. |
-| `Eval`, `Policy`, `Trigger`, `Operator`, `Source`, `Mcp`, `Workflow`, `Audit`, `Service` | Optional | Light. Spec-only; `apply` registers each card as it's read. |
+| `Verifier`, `Policy`, `Trigger`, `Operator`, `Source`, `Mcp`, `Workflow`, `Audit`, `Service` | Optional | Light. Spec-only; `apply` registers each card as it's read. |
 
 A single YAML file may contain many `---`-separated card documents — `wyrd
 apply -f eval-suite.yaml` registers all of them in dependency order. The Agent
-under test, the Source it reads from, and the Eval that judges it can all
+under test, the Source it reads from, and the Verifier that judges it can all
 ship in one file.
 
 ### Reference forms
@@ -1526,14 +1606,14 @@ heavy. There is one canonical slot inventory, and the loader, diagnostics, and
 relationship tests all project from it:
 
 - `Service.components[].ref` (light and heavy targets)
-- `Service.components[].verified_by`
+- `Service.components[].verified_by`, `Agent.verified_by`,
+  `Service.verified_by` — each binding's `verifier`, `runs_on`, and
+  `on_failure[]`
 - `Agent.prompt`
-- `Trigger.target`
 - `Workflow.steps[].target`
-- `Eval` task refs, including `EvalTask::LlmJudge.judge_ref`
-- `Drift.signal.eval_ref`, `Drift.signal.source_ref`
-- `TriggerSource.*.subject_filter`
-- `Agent.verified_by`, `Service.verified_by`
+- `Operator.workflow_ref`
+- Verifier implementation refs: Eval `dataset` and
+  `EvalTask::LlmJudge.judge_ref`; Drift `signal.baseline_ref`
 - Heavy anchors: `Model`/`Data`/`Experiment` `*_refs`, `Artifact` refs
 
  A new reference-bearing field is added to this inventory in one place; it then
@@ -1695,18 +1775,18 @@ foreign-card content pinning are not supported workflows.
 
 | Card    | Refs that authored on it             | Refs that point at it          |
 |---------|--------------------------------------|--------------------------------|
-| Data    | `card_refs`, `splits`                 | `Drift.signal.baseline_ref`, `Eval.dataset`, `Experiment.target_refs`, `TriggerSource.*.subject_filter` |
-| Model   | `card_refs`                           | `Service.components.ref`, `Experiment.target_refs`, `TriggerSource.*.subject_filter` |
-| Agent   | `prompt`, `tool_names`, `verified_by` | `Service.components.ref`, Agent prompts (sub-agent calls), `TriggerSource.*.subject_filter` |
-| Workflow| `steps.*.target`                     | `Service.components.ref`, `Operator.action.workflow_ref`, `TriggerSource.*.subject_filter` |
+| Data    | `card_refs`, `splits`                 | Verifier Drift `signal.baseline_ref`, Verifier Eval `dataset`, `Experiment.target_refs` |
+| Model   | `card_refs`                           | `Service.components.ref`, `Experiment.target_refs` |
+| Agent   | `prompt`, `tool_names`, `verified_by` | `Service.components.ref`, Agent prompts (sub-agent calls), Verifier Eval `LlmJudge.judge_ref` |
+| Workflow| `steps.*.target`                     | `Service.components.ref`, `Operator.workflow_ref` |
 | Mcp     | `server_name`, `transport`, `scopes` | `Service.components.ref` |
 | Verifier| Drift `signal.baseline_ref`; Eval `dataset`, `tasks[].LlmJudge.judge_ref` | `*.verified_by[].verifier` |
 | Audit   | `subject_refs`, `query` (roots), `lineage` (nodes), `investigator` (Agent variant) | — |
-| Service | `components[].ref`, `components[].verified_by`, `verified_by` | `TriggerSource.*.subject_filter` (service-level) |
+| Service | `components[].ref`, `components[].verified_by`, `verified_by` | — |
 | Policy  | `rules`                              | `Service.components.ref` |
 | Trigger | `schedule` or `observations_ready` activation | `*.verified_by[].runs_on` |
 | Operator| `action` (`workflow_ref` \| typed `channel` shape \| tenant connection) | `*.verified_by[].on_failure` |
-| Source  | `kind` (bucket), `connection` (vendor + `*_env`) | `Drift.signal.source_ref` (External variant), `Eval.source_ref` |
+| Source  | `kind` (bucket), `connection` (vendor + `*_env`) | Verifier Eval `source_ref` |
 
 `Service.components` accepts: Agent, Prompt, Model, Workflow, Mcp, Policy. No
 other kinds are runtime-aliased into a Service.
@@ -1762,9 +1842,8 @@ The following choices constrain every implementation:
   Runtime uses the `vala` read trait keyed on `(kind, vendor)` and exposes the
   connectivity preflight as `wyrd source check <ref>`.
 
-- **Eval signal decomposition.** `Eval` does not carry its own `signal`
-  decomposition. Eval IS the signal — its per-task pass/fail aggregates into a
-  score stream consumed downstream by `Drift` with `DriftSignal::EvalScore`. The
-  input edges (`dataset` vs `source_ref`) are optional refs, not a tagged enum:
-  presence is the mode (offline driver, online sink, both, or neither → vala
-  default archive).
+- **Eval signal decomposition.** The Eval implementation does not carry its
+  own `signal` decomposition; its per-task pass/fail and pass gate produce the
+  Verifier's verdict directly. The input edges (`dataset` vs `source_ref`) are
+  optional refs, not a tagged enum: presence is the mode (offline driver,
+  online sink, both, or neither → continuous `vala.eval.observations`).

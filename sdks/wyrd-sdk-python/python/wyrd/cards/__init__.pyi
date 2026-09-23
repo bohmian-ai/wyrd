@@ -107,8 +107,7 @@ class CardKind:
     Prompt: CardKind
     Agent: CardKind
     Workflow: CardKind
-    Eval: CardKind
-    Drift: CardKind
+    Verifier: CardKind
     Service: CardKind
     Policy: CardKind
     Mcp: CardKind

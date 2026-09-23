@@ -268,6 +268,92 @@ export declare class NativeQueryStart {
   get errorDetailsJson(): string | null
 }
 
+/**
+ * One invocation, or one Card-scoped view of it, over the shared `Run`.
+ *
+ * Every emit delegates to `wyrd_client::observe`; this wrapper only carries
+ * Node strings across the boundary so the three SDKs share one projection.
+ */
+export declare class NativeRun {
+  /** The `UUIDv7` invocation identity this run and every view of it shares. */
+  get runId(): string
+  /** The exact Card reference this view observes. */
+  get cardRef(): string
+  /** An immutable sibling view scoped to a registered alias. */
+  forCard(alias: string): NativeRunOpen
+  /**
+   * Emits one Drift observation from its JSON feature object.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the outcome cannot be projected; a
+   * malformed feature map, the lifecycle refusals, and queue saturation are
+   * returned in [`NativeLifecycleResult`].
+   */
+  drift(featuresJson: string, sessionId?: string | undefined | null): NativeLifecycleResult
+  /**
+   * Emits one Eval observation from its JSON context and options.
+   *
+   * `media_json` is one JSON array of media descriptors; `trace_id` and
+   * `span_id` are lower-case hex and fall back to the active span when both
+   * are omitted.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the outcome cannot be projected; malformed
+   * identifiers, a span without its trace, the lifecycle refusals, and queue
+   * saturation are returned in [`NativeLifecycleResult`].
+   */
+  eval(contextJson: string, sessionId?: string | undefined | null, mediaJson?: string | undefined | null, traceId?: string | undefined | null, spanId?: string | undefined | null): NativeLifecycleResult
+  /**
+   * Emits one row into a registered `vala.datasets` table.
+   *
+   * Asynchronous because the first call for a table describes it; later calls
+   * reuse the cached schema and producer.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the outcome cannot be projected; a
+   * reserved, unknown, or unauthorized table and the lifecycle refusals are
+   * returned in [`NativeLifecycleResult`].
+   */
+  record(table: string, rowJson: string): Promise<NativeLifecycleResult>
+}
+
+/** Tenant-scoped Verification handle over the shared `wyrd_client` handle. */
+export declare class NativeVerification {
+  /**
+   * Reads one binding's identities, activity, readiness, and cursor.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the status cannot be serialized; a
+   * malformed ID or server refusal is returned in the result.
+   */
+  getBinding(bindingId: string): Promise<NativeLifecycleResult>
+  /**
+   * Durably enqueues one manual Drift run and returns `{ run_id }`.
+   *
+   * `request_json` is one serialized `StartVerificationRunRequest`; a retry
+   * with the same `idempotency_key` and request returns the same run.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the response cannot be serialized; a
+   * malformed request or server refusal is returned in the result.
+   */
+  startRun(requestJson: string, idempotencyKey?: string | undefined | null): Promise<NativeLifecycleResult>
+  /**
+   * Reads one run's status, requester, result pointer, and dispatches.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the status cannot be serialized; a
+   * malformed ID or server refusal is returned in the result.
+   */
+  getRun(runId: string): Promise<NativeLifecycleResult>
+}
+
 /** Node-facing handle to one authenticated [`WyrdClient`]. */
 export declare class NativeWyrdClient {
   /**
@@ -344,6 +430,51 @@ export declare class NativeWyrdState {
    * Returns a napi error only when the artifact list cannot be serialized.
    */
   artifacts(alias: string): NativeLifecycleResult
+  /**
+   * Connects this state's one Bifrost writer and describes the fixed tables.
+   *
+   * The transport arguments are `connectBifrost`'s and resolve through the
+   * same chain when omitted. Startup describes both fixed observation tables
+   * before succeeding, so a run can never enqueue against a missing,
+   * unauthorized, or incompatible system table.
+   *
+   * # Errors
+   *
+   * Returns a napi error when `table` is not one serialized `TableConfig`;
+   * a second start, a closed state, and credential, dial, and fixed-table
+   * failures are returned in [`NativeLifecycleResult`].
+   */
+  startBifrost(table?: NativeTableConfig | undefined | null, serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null): Promise<NativeLifecycleResult>
+  /**
+   * Opens one invocation over this state, targeting the root Service Card.
+   *
+   * Local only: no network IO, no server-side Run resource, and no Verifier
+   * execution.
+   */
+  run(): NativeRunOpen
+  /**
+   * Drains every producer of this state's writer without closing it.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the outcome cannot be projected; the
+   * lifecycle refusals and the first producer or sink failure are returned in
+   * [`NativeLifecycleResult`].
+   */
+  flush(): Promise<NativeLifecycleResult>
+  /**
+   * Drains every producer of this state's writer and closes it to writes.
+   *
+   * Graceful shutdown is the durability barrier: queue admission is not a
+   * Scribe acknowledgement. After an ambiguous failure, retry `shutdown` on
+   * the same state rather than replacing the writer.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the outcome cannot be projected; the first
+   * producer or sink failure is returned in [`NativeLifecycleResult`].
+   */
+  shutdown(): Promise<NativeLifecycleResult>
 }
 
 /**
@@ -369,6 +500,14 @@ export declare function connectBifrost(table?: NativeTableConfig | undefined | n
  * Credential and configuration failures are returned as catalog metadata.
  */
 export declare function connectCards(serverUrl?: string | undefined | null, credential?: string | undefined | null): NativeCardsConnection
+
+/**
+ * Builds one Verification handle without performing IO.
+ *
+ * Omitted arguments resolve through the same shared client configuration
+ * chain as `connectCards`, so every capability authenticates identically.
+ */
+export declare function connectVerification(serverUrl?: string | undefined | null, credential?: string | undefined | null): NativeVerificationConnection
 
 /**
  * Builds one client without performing IO.
@@ -465,6 +604,20 @@ export interface NativeQueryStep {
 }
 
 /**
+ * Closed result of opening one scoped run: a run handle or a catalog error.
+ *
+ * Opening cannot be projected through [`NativeLifecycleResult`] because the run
+ * is a native class rather than a serializable value, so it follows the same
+ * handle-or-error shape as [`NativeCardsConnection`].
+ */
+export interface NativeRunOpen {
+  /** The scoped run when the bundle and alias resolved. */
+  run?: NativeRun
+  /** The stable failure that rejected the bundle or the alias. */
+  error?: NativeWyrdError
+}
+
+/**
  * One Bifrost table as it crosses the Node boundary.
  *
  * `configJson` is the authoritative value — the whole `TableConfig`, including
@@ -490,6 +643,14 @@ export interface NativeTableConfigResult {
   /** Described table config when the server answered. */
   config?: NativeTableConfig
   /** Catalog failure when description failed. */
+  error?: NativeWyrdError
+}
+
+/** Closed result of building one Verification handle: a handle or a catalog error. */
+export interface NativeVerificationConnection {
+  /** Verification handle when construction succeeded. */
+  verification?: NativeVerification
+  /** Catalog failure when no credential resolves or the client cannot be built. */
   error?: NativeWyrdError
 }
 

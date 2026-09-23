@@ -86,6 +86,22 @@ export declare class NativeWyrdTestServer {
    */
   scopedApiKey(role: string, permissions: Array<string>): string
   /**
+   * Issue an API key for the principal a registered Service Card projects.
+   *
+   * `card_ref` is the canonical `space/Kind/name@version` identity a
+   * registration receipt returns. The Card must already be registered: this
+   * credentials the service account registration projected for it rather
+   * than minting a new one, so the key carries the registered Service's real
+   * card-ref scope and a run may observe the component Cards its spec
+   * references.
+   *
+   * # Errors
+   *
+   * Returns a napi error for a malformed identity string, or when the
+   * harness is closed or the Card has no projected principal.
+   */
+  credentialRegisteredService(cardRef: string, roles: Array<string>): string
+  /**
    * Mint an authenticated token without `bifrost_query:read`.
    *
    * # Errors
@@ -101,6 +117,39 @@ export declare class NativeWyrdTestServer {
    * Returns a napi error when the harness is closed or the audit query fails.
    */
   bifrostReadDecisionCount(): number
+  /**
+   * Return the staged allowed describe decisions for one table FQN.
+   *
+   * Every server describe stages exactly one decision, so a journey started
+   * with audit publication disabled reads how many schema describes a table
+   * has received.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the harness is closed or the audit query fails.
+   */
+  tableDescribeCount(fqn: string): number
+  /**
+   * Make every describe of one table FQN fail until restored.
+   *
+   * The server answers the failed describe with
+   * `WYRD_VALA_500_AUDIT_UNAVAILABLE`.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the harness is closed, the FQN is not a
+   * dotted identifier, or installing the fault fails.
+   */
+  failTableDescribe(fqn: string): void
+  /**
+   * Remove the describe fault installed by `fail_table_describe`.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the harness is closed or removing the fault
+   * fails.
+   */
+  restoreTableDescribe(): void
   /**
    * Truncate the next query after its schema frame.
    *
@@ -132,9 +181,12 @@ export declare class NativeWyrdTestServer {
 /**
  * Starts a real bound Wyrd test server and mints an admin access token.
  *
+ * `auditPublication: false` keeps staged audit rows in place so a journey can
+ * count describe decisions; omitted, publication runs as in production.
+ *
  * # Errors
  *
  * Returns a napi error when server startup, service bootstrap, API-key
  * exchange, or URL discovery fails.
  */
-export declare function startTestServer(): NativeWyrdTestServer
+export declare function startTestServer(auditPublication?: boolean | undefined | null): NativeWyrdTestServer

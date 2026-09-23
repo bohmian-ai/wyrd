@@ -14,15 +14,17 @@ use wyrd_semver::{VersionBlock, VersionRange, VersionSpec};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
+use wyrd_spec::card::trigger::TriggerActivation;
+use wyrd_spec::card::verifier::{OWNER_OCCURRENCE_KEY, VerificationBinding, VerificationStatus};
 use wyrd_spec::envelope::{Card, CardKind, Metadata, Spec, Status};
 use wyrd_spec::error::{WyrdError, storage::WyrdStorageError};
 use wyrd_spec::graph::{
     GraphError, RootPick, TopoOrder, build, canonical_order, graph_ready_submissions, pick_root,
-    publication_validation_errors, relationships_from_spec, topo_sort, validate_composition,
+    relationships_from_spec, spec_binding_errors, topo_sort, validate_composition,
 };
-use wyrd_spec::ids::IdempotencyKey;
+use wyrd_spec::ids::{BindingId, IdempotencyKey};
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
-use wyrd_spec::reference::{CardRef, CardRefIdentity, scope_child_card_refs};
+use wyrd_spec::reference::{CardRef, CardRefIdentity, InlineableRef, scope_child_card_refs};
 use wyrd_spec::registry::{
     ArtifactInventoryResponse, ArtifactManifestEntry, CardLifecycleStatus, CardRegistrationOutcome,
     CardSubmission, CardSummary, CardUploadEntry, CardUploadPlan, CreateCardRequest,
@@ -55,6 +57,9 @@ use wyrd_sql::queries::cards::{
     upsert_service_account_from_card,
 };
 use wyrd_sql::queries::storage::{artifact_metadata, multipart_uploads};
+use wyrd_sql::queries::verification::{
+    BindingActivation, FrozenTarget, NewBinding, owner_binding_ids, project_bindings,
+};
 use wyrd_sql::row_types::cards::{CardRow, ParsedCardRow};
 use wyrd_storage::StorageError;
 use wyrd_storage::service::{upload_abort, upload_init};
@@ -78,6 +83,13 @@ struct CardListCursor {
 }
 
 /// Load a fully hydrated Card by its tenant-scoped UID.
+///
+/// Reads the row, inbound edges, artifact inventory, and owned verification
+/// binding IDs in one tenant transaction, then hydrates the immutable blob.
+///
+/// # Errors
+/// Returns the registry not-found, unavailable, or integrity errors raised by
+/// the tenant reads and [`hydrate_card`].
 pub async fn get_card_by_uid(
     state: &AppState,
     caller: &Caller,
@@ -89,11 +101,21 @@ pub async fn get_card_by_uid(
     let inventory = artifact_metadata::list_for_card(&mut conn, card_uid.as_str())
         .await
         .map_err(|error| WyrdError::registry_unavailable(error.to_string()))?;
+    let binding_ids = owner_binding_ids(&mut conn, card_uid)
+        .await
+        .map_err(registry_db_error)?;
     conn.commit().await.map_err(registry_db_error)?;
-    hydrate_card(state, caller, row, inbound, inventory).await
+    hydrate_card(state, caller, row, inbound, inventory, binding_ids).await
 }
 
 /// Load a fully hydrated Card by its exact tenant-scoped reference.
+///
+/// Reads the row, inbound edges, artifact inventory, and owned verification
+/// binding IDs in one tenant transaction, then hydrates the immutable blob.
+///
+/// # Errors
+/// Returns the registry not-found, unavailable, or integrity errors raised by
+/// the tenant reads and [`hydrate_card`].
 pub async fn get_card_by_ref(
     state: &AppState,
     caller: &Caller,
@@ -115,11 +137,21 @@ pub async fn get_card_by_ref(
     let inventory = artifact_metadata::list_for_card(&mut conn, row.card_uid.as_str())
         .await
         .map_err(|error| WyrdError::registry_unavailable(error.to_string()))?;
+    let binding_ids = owner_binding_ids(&mut conn, &row.card_uid)
+        .await
+        .map_err(registry_db_error)?;
     conn.commit().await.map_err(registry_db_error)?;
-    hydrate_card(state, caller, row, inbound, inventory).await
+    hydrate_card(state, caller, row, inbound, inventory, binding_ids).await
 }
 
 /// Resolve and load the newest stable Active Card in one identity line.
+///
+/// Reads the row, inbound edges, artifact inventory, and owned verification
+/// binding IDs in one tenant transaction, then hydrates the immutable blob.
+///
+/// # Errors
+/// Returns the registry not-found, unavailable, or integrity errors raised by
+/// the tenant reads and [`hydrate_card`].
 pub async fn get_latest_card(
     state: &AppState,
     caller: &Caller,
@@ -134,8 +166,11 @@ pub async fn get_latest_card(
     let inventory = artifact_metadata::list_for_card(&mut conn, row.card_uid.as_str())
         .await
         .map_err(|error| WyrdError::registry_unavailable(error.to_string()))?;
+    let binding_ids = owner_binding_ids(&mut conn, &row.card_uid)
+        .await
+        .map_err(registry_db_error)?;
     conn.commit().await.map_err(registry_db_error)?;
-    hydrate_card(state, caller, row, inbound, inventory).await
+    hydrate_card(state, caller, row, inbound, inventory, binding_ids).await
 }
 
 /// List versions in one card identity line, excluding deleted rows.
@@ -230,12 +265,24 @@ pub async fn list_card_artifacts(
     Ok(ArtifactInventoryResponse { artifacts })
 }
 
+/// Rebuild the served Card from its immutable blob and live registry state.
+///
+/// Verifies the blob against the registry row and artifact inventory, then
+/// overlays server-derived state: inbound relationships and `status`, whose
+/// `verification.binding_ids` lists the owner's projected bindings and is
+/// omitted when the Card owns none.
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_404_CARD_NOT_FOUND` before the blob is active,
+/// `WYRD_REGISTRY_400_INVALID_CARD_SPEC` when the blob URI, identity, or
+/// integrity check fails, and the mapped storage error when the read fails.
 async fn hydrate_card(
     state: &AppState,
     caller: &Caller,
     row: wyrd_sql::row_types::cards::ParsedCardRow,
     inbound: Vec<CardRef>,
     inventory: Vec<artifact_metadata::ArtifactMetadataRow>,
+    binding_ids: Vec<BindingId>,
 ) -> Result<GetCardResponse, WyrdError> {
     let uri = row.card_blob_uri.as_deref().ok_or_else(|| {
         WyrdError::registry_card_not_found(
@@ -282,6 +329,7 @@ async fn hydrate_card(
         phase: row.status.as_db_str().to_owned(),
         message: None,
         updated_at: Some(row.updated_at),
+        verification: (!binding_ids.is_empty()).then_some(VerificationStatus { binding_ids }),
     });
     Ok(GetCardResponse {
         card,
@@ -482,11 +530,12 @@ struct ExistingNode {
 /// This operation resolves references, applies idempotency replay, writes the
 /// registration transaction, and initializes any artifact uploads.
 ///
-/// `allowed` is the route's `card:write` verdict. A fresh write appends it on
-/// the registration transaction before any mutation, so both commit or roll
-/// back together. Every outcome that commits no registration — replay,
-/// validation or dependency failure, a lost idempotency race, or a rolled-back
-/// write — records it standalone once instead. Upload initialization runs
+/// `allowed` holds the route's allowed verdicts: `card:write`, plus
+/// `operators:invoke` for an Operator-bearing request. A fresh write appends
+/// them on the registration transaction before any mutation, so they commit
+/// or roll back together with it. Every outcome that commits no registration —
+/// replay, validation or dependency failure, a lost idempotency race, or a
+/// rolled-back write — records each standalone once instead. Upload initialization runs
 /// after that point and never records it again.
 ///
 /// # Errors
@@ -499,7 +548,7 @@ pub async fn register_card(
     caller: &Caller,
     idempotency_key: &str,
     request: CreateCardRequest,
-    allowed: &AuditEvent,
+    allowed: &[AuditEvent],
 ) -> Result<CreateCardResponse, WyrdError> {
     let written = async {
         let request_hash = hash_request(&request)?;
@@ -516,15 +565,49 @@ pub async fn register_card(
     let (operation_id, seed) = match written {
         Ok((written, true)) => written,
         Ok((written, false)) => {
-            audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, allowed).await?;
+            record_allowed(state, caller, allowed).await?;
             written
         }
         Err(error) => {
-            audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, allowed).await?;
+            record_allowed(state, caller, allowed).await?;
             return Err(error);
         }
     };
     initialize_uploads(state, caller, operation_id, seed, idempotency_key).await
+}
+
+/// Whether any submitted verification binding names an `on_failure` Operator.
+///
+/// Registration needs `operators:invoke` in addition to `card:write` exactly
+/// when this holds, inline or referenced alike, because the frozen Operator is
+/// later dispatched without another end-user decision. Only top-level binding
+/// sites count; nested sites and undecodable specs are refused by validation
+/// before anything is persisted, so they can never freeze an Operator.
+pub(crate) fn dispatches_operators(request: &CreateCardRequest) -> bool {
+    request.submissions.iter().any(|submission| {
+        Spec::from_kind_and_value(&submission.kind, submission.spec.clone()).is_ok_and(|spec| {
+            spec.binding_sites()
+                .iter()
+                .filter(|site| !site.nested)
+                .flat_map(|site| site.bindings)
+                .any(|binding| !binding.on_failure.is_empty())
+        })
+    })
+}
+
+/// Record each allowed verdict standalone when no registration commits it.
+///
+/// # Errors
+/// Returns [`WyrdError::AuditUnavailable`] when a row cannot be recorded.
+pub(crate) async fn record_allowed(
+    state: &AppState,
+    caller: &Caller,
+    allowed: &[AuditEvent],
+) -> Result<(), WyrdError> {
+    for event in allowed {
+        audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, event).await?;
+    }
+    Ok(())
 }
 
 /// Return a committed response for an identical idempotency key.
@@ -935,10 +1018,10 @@ fn plan_registration(
 
 /// Reserve idempotency and atomically persist every topo-ordered node and audit.
 ///
-/// The `allowed` verdict is appended before any mutation and commits with the
+/// Every `allowed` verdict is appended before any mutation and commits with the
 /// registration. The returned flag is `true` only when that transaction
 /// committed; a lost idempotency race rolls it back and returns the winner's
-/// replay with `false`, leaving the caller to record the verdict standalone.
+/// replay with `false`, leaving the caller to record the verdicts standalone.
 ///
 /// # Errors
 /// Returns [`WyrdError::AuditUnavailable`] when the append fails, and the
@@ -953,11 +1036,13 @@ async fn write_registration(
     caller: &Caller,
     idempotency_key: &str,
     mut plan: RegistrationPlan,
-    allowed: &AuditEvent,
+    allowed: &[AuditEvent],
 ) -> Result<((RegistrationOperationId, RegistrationReplaySeed), bool), WyrdError> {
     let operation_id = RegistrationOperationId::new(Uuid::now_v7());
     let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
-    audit::append_on(&mut conn, allowed).await?;
+    for event in allowed {
+        audit::append_on(&mut conn, event).await?;
+    }
     // Recheck before reserving idempotency so a dependency rejection rolls back
     // the entire attempt, including its bookkeeping row. The row locks remain
     // held while cards and relationships are written below.
@@ -1023,6 +1108,16 @@ async fn write_registration(
 }
 
 /// Resolve one node's version, deduplicate when possible, and persist when fresh.
+///
+/// A fresh node writes its Card row, edges, artifact inventory, projected
+/// Card-bound principal, and — through [`BindingProjector`] — its frozen
+/// verification bindings on the caller's registration transaction; nothing is
+/// committed here, so any failure rolls the whole registration back.
+///
+/// # Errors
+/// Returns a registry error when the submission cannot be canonicalized or
+/// version-resolved, a referenced binding target cannot be frozen, or any
+/// Card, edge, principal, or binding write fails.
 async fn persist_node(
     conn: &mut TenantConn<'_>,
     caller: &Caller,
@@ -1071,11 +1166,156 @@ async fn persist_node(
     insert_artifact_manifest_rows(conn, &row.card_uid, &submission.artifacts).await?;
     if matches!(card.kind, CardKind::Service | CardKind::Agent) {
         upsert_service_account_from_card(conn, &row.card_uid, &card, &caller.principal).await?;
+        BindingProjector::new(conn)
+            .project(&row.card_uid, &card.kind, &card.spec)
+            .await?;
     }
     Ok(outcome_row_to_response(
         &row,
         RegistrationOutcomeKind::Registered,
     ))
+}
+
+/// Transaction-scoped projector of one owner Card's verification bindings.
+///
+/// Registration builds one per bound Service or Agent inside its own
+/// caller-owned [`TenantConn`], after the owner Card and its Card-bound
+/// principal are written, so the Card, principal, and binding rows commit or
+/// roll back together. It never commits.
+struct BindingProjector<'a, 'c> {
+    /// The registration transaction; sibling Cards persisted earlier in it,
+    /// such as a referenced Trigger, are visible here.
+    conn: &'a mut TenantConn<'c>,
+}
+
+impl<'a, 'c> BindingProjector<'a, 'c> {
+    /// Borrow the registration transaction for one owner's projection.
+    fn new(conn: &'a mut TenantConn<'c>) -> Self {
+        Self { conn }
+    }
+
+    /// Freeze and project an owner Card version's effective bindings.
+    ///
+    /// Freezes every binding through [`BindingProjector::freeze`] and persists
+    /// the rows with [`project_bindings`] under their natural keys, so a
+    /// re-projection of the same immutable Card keeps its binding IDs.
+    ///
+    /// # Errors
+    /// Returns the freeze errors documented on [`BindingProjector::freeze`]
+    /// and the mapped registry database error when a row cannot be written;
+    /// the caller then rolls back the whole registration.
+    async fn project(
+        &mut self,
+        owner: &CardUid,
+        kind: &CardKind,
+        spec: &Spec,
+    ) -> Result<(), WyrdError> {
+        let bindings = self.freeze(owner, spec).await?;
+        project_bindings(self.conn, owner, kind, &bindings)
+            .await
+            .map_err(registry_db_error)?;
+        Ok(())
+    }
+
+    /// Freeze a bound Service or Agent spec's effective verification bindings.
+    ///
+    /// Walks the three legal owner locations — Service level and standalone
+    /// Agent (keyed by [`OWNER_OCCURRENCE_KEY`]) and each Service component
+    /// occurrence (keyed by its alias) — of a spec whose refs resolution
+    /// already pinned to exact UIDs. A referenced Trigger is read back by UID
+    /// inside this transaction (a sibling Trigger was persisted earlier in it)
+    /// so its schedule is frozen with the binding; an inline Trigger or
+    /// Operator is frozen as its canonical spec digest.
+    ///
+    /// # Errors
+    /// Returns `WYRD_INTERNAL` when a bound ref lacks its pinned UID or a
+    /// referenced Trigger UID names another kind, the canonicalization error
+    /// for an inline body that cannot be hashed, and the registry error from
+    /// reading a referenced Trigger.
+    async fn freeze(&mut self, owner: &CardUid, spec: &Spec) -> Result<Vec<NewBinding>, WyrdError> {
+        let mut sites: Vec<(&str, CardUid, &[VerificationBinding])> = Vec::new();
+        match spec {
+            Spec::Agent(agent) => {
+                sites.push((OWNER_OCCURRENCE_KEY, owner.clone(), &agent.verified_by));
+            }
+            Spec::Service(service) => {
+                sites.push((OWNER_OCCURRENCE_KEY, owner.clone(), &service.verified_by));
+                for component in &service.components {
+                    let subject = pinned_uid(component.card_ref.as_card_ref())?;
+                    sites.push((&component.alias, subject, &component.verified_by));
+                }
+            }
+            _ => {}
+        }
+        let mut bindings = Vec::new();
+        for (occurrence, subject, site) in sites {
+            for binding in site {
+                let (trigger, activation) = match &binding.runs_on {
+                    InlineableRef::Inline(trigger) => {
+                        let body = Spec::Trigger((**trigger).clone());
+                        (inline_digest(&body)?, trigger.activation.clone())
+                    }
+                    reference => {
+                        let uid = pinned_uid(reference.as_card_ref())?;
+                        let Spec::Trigger(trigger) =
+                            sql_get_card_by_uid(self.conn, &uid).await?.spec
+                        else {
+                            return Err(WyrdError::internal("runs_on UID is not a Trigger Card"));
+                        };
+                        (FrozenTarget::Uid(uid), trigger.activation)
+                    }
+                };
+                let operators = binding
+                    .on_failure
+                    .iter()
+                    .map(|operator| match operator {
+                        InlineableRef::Inline(body) => {
+                            inline_digest(&Spec::Operator((**body).clone()))
+                        }
+                        reference => pinned_uid(reference.as_card_ref()).map(FrozenTarget::Uid),
+                    })
+                    .collect::<Result<_, _>>()?;
+                bindings.push(NewBinding {
+                    subject_occurrence_key: occurrence.to_owned(),
+                    subject_card_uid: subject.clone(),
+                    verifier_uid: pinned_uid(binding.verifier.as_card_ref())?,
+                    trigger,
+                    operators,
+                    activation: match activation {
+                        TriggerActivation::Schedule { cron, tz } => {
+                            BindingActivation::Schedule { cron, tz }
+                        }
+                        TriggerActivation::ObservationsReady {} => {
+                            BindingActivation::ObservationsReady
+                        }
+                    },
+                });
+            }
+        }
+        Ok(bindings)
+    }
+}
+
+/// Return the UID resolution pinned on a bound ref.
+///
+/// # Errors
+/// Returns `WYRD_INTERNAL` when the ref is absent or unpinned, which
+/// resolution already refuses before persistence.
+fn pinned_uid(card_ref: Option<&CardRef>) -> Result<CardUid, WyrdError> {
+    card_ref
+        .and_then(|card_ref| card_ref.uid.clone())
+        .ok_or_else(|| WyrdError::internal("verification binding ref is not pinned to a UID"))
+}
+
+/// Freeze an inline Trigger or Operator body as its canonical spec digest.
+///
+/// # Errors
+/// Returns the canonicalization error when the body cannot be hashed.
+fn inline_digest(body: &Spec) -> Result<FrozenTarget, WyrdError> {
+    let digest = body
+        .canonical_hash()
+        .map_err(WyrdError::from_spec_canonicalization)?;
+    Ok(FrozenTarget::Digest(digest.to_string()))
 }
 
 /// Return an identical existing row or pin the fresh resolved version on the card.
@@ -1173,36 +1413,8 @@ fn validate_request(request: &CreateCardRequest) -> Result<(), WyrdError> {
         }
         let spec = Spec::from_kind_and_value(&submission.kind, submission.spec.clone())
             .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?;
-        match &spec {
-            Spec::Agent(agent) => {
-                if let Some(error) =
-                    publication_validation_errors(&agent.publishes_to, "spec.publishes_to")
-                        .into_iter()
-                        .next()
-                {
-                    return Err(error);
-                }
-            }
-            Spec::Service(service) => {
-                if let Some(error) =
-                    publication_validation_errors(&service.publishes_to, "spec.publishes_to")
-                        .into_iter()
-                        .next()
-                {
-                    return Err(error);
-                }
-                for (index, component) in service.components.iter().enumerate() {
-                    let field = format!("spec.components[{index}].publishes_to");
-                    if let Some(error) =
-                        publication_validation_errors(&component.publishes_to, &field)
-                            .into_iter()
-                            .next()
-                    {
-                        return Err(error);
-                    }
-                }
-            }
-            _ => {}
+        if let Some(error) = spec_binding_errors(&spec).into_iter().next() {
+            return Err(error);
         }
         let computed = canonical_artifact_manifest_hash(&submission.artifacts)?;
         if submission.metadata.artifact_hash.as_deref() != computed.as_deref()
@@ -1343,21 +1555,19 @@ fn graph_error(error: GraphError) -> WyrdError {
                 "field": field,
             }),
         },
-        GraphError::UnpublishedObservabilityPeer { root, peer } => {
-            WyrdError::SpecUnpublishedObservabilityPeer {
-                message: format!(
-                    "{} {} has no submitted publisher in Service-root bundle {}",
-                    peer.kind.wire_name(),
-                    peer.name,
-                    root.name
-                ),
-                details: serde_json::json!({
-                    "root": root,
-                    "peer": peer,
-                    "publisher_kinds": ["Data", "Model", "Agent", "Service"],
-                }),
-            }
-        }
+        GraphError::UnboundVerifierPeer { root, peer } => WyrdError::SpecUnboundVerifierPeer {
+            message: format!(
+                "{} {} is bound by no submitted subject in Service-root bundle {}",
+                peer.kind.wire_name(),
+                peer.name,
+                root.name
+            ),
+            details: serde_json::json!({
+                "root": root,
+                "peer": peer,
+                "binding_owner_kinds": ["Service", "Agent"],
+            }),
+        },
         GraphError::InvalidSpec { message } => WyrdError::registry_invalid_card_spec(message),
     }
 }
@@ -2365,13 +2575,13 @@ mod tests {
         })
     }
 
-    /// Build one empty Eval submission fixture.
-    fn eval(name: &str) -> serde_json::Value {
+    /// Build one Verifier submission fixture with an empty Eval implementation.
+    fn verifier(name: &str) -> serde_json::Value {
         serde_json::json!({
             "apiVersion": "wyrd/v1",
-            "kind": "Eval",
+            "kind": "Verifier",
             "metadata": { "name": name, "version": "1.0.0", "space": "default" },
-            "spec": { "tasks": {} },
+            "spec": { "implementation": { "kind": "eval", "spec": { "tasks": {} } } },
             "artifacts": []
         })
     }
@@ -2409,15 +2619,15 @@ mod tests {
         (card, manifest, spec_hash.to_string(), artifact_hash)
     }
 
-    /// Reject peer-only Service components before registry access.
+    /// Reject a peer-only Verifier Service component before registry access.
     #[test]
-    fn registration_graph_rejects_eval_service_component() {
+    fn registration_graph_rejects_verifier_service_component() {
         let request = request(serde_json::json!({
             "submissions": [service("app", serde_json::json!({
                 "components": [{
                     "alias": "quality",
                     "ref": {
-                        "kind": "Eval",
+                        "kind": "Verifier",
                         "name": "quality",
                         "version": "1.0.0",
                         "space": "default"
@@ -2427,33 +2637,33 @@ mod tests {
         }));
 
         let error = plan_registration_graph(&request.submissions)
-            .expect_err("Eval Service component must fail before registry I/O");
+            .expect_err("Verifier Service component must fail before registry I/O");
 
         assert_eq!(error.code(), "WYRD_SPEC_400_INVALID_SERVICE_COMPONENT_KIND");
     }
 
-    /// Reject an orphan Eval submitted beside a Service root before registry access.
+    /// Reject an unbound Verifier submitted beside a Service root before registry access.
     #[test]
-    fn registration_graph_rejects_unpublished_eval_peer() {
+    fn registration_graph_rejects_unbound_verifier_peer() {
         let request = request(serde_json::json!({
-            "submissions": [service("app", serde_json::json!({})), eval("quality")]
+            "submissions": [service("app", serde_json::json!({})), verifier("quality")]
         }));
 
         let error = plan_registration_graph(&request.submissions)
-            .expect_err("Service-root Eval requires a submitted publisher");
+            .expect_err("Service-root Verifier requires a submitted binding");
 
-        assert_eq!(error.code(), "WYRD_SPEC_400_UNPUBLISHED_OBSERVABILITY_PEER");
+        assert_eq!(error.code(), "WYRD_SPEC_400_UNBOUND_VERIFIER_PEER");
     }
 
-    /// Preserve standalone Eval registration at the server boundary.
+    /// Preserve standalone Verifier registration at the server boundary.
     #[test]
-    fn registration_graph_accepts_standalone_eval() {
+    fn registration_graph_accepts_standalone_verifier() {
         let request = request(serde_json::json!({
-            "submissions": [eval("quality")]
+            "submissions": [verifier("quality")]
         }));
 
         plan_registration_graph(&request.submissions)
-            .expect("standalone Eval registration remains valid");
+            .expect("standalone Verifier registration remains valid");
     }
 
     /// Prove canonical request hashing is independent of submission wire order.
@@ -2544,6 +2754,10 @@ mod tests {
     }
 
     /// Keep blob bytes stable while mutable status and inbound edges change.
+    ///
+    /// # Panics
+    /// Panics when the fixture Card does not decode, a blob fails to
+    /// serialize, or the two blobs differ.
     #[test]
     fn immutable_blob_projection_is_deterministic_and_excludes_live_edges() {
         let mut card: wyrd_spec::envelope::Card = serde_json::from_value(serde_json::json!({
@@ -2561,6 +2775,7 @@ mod tests {
             phase: "active".to_owned(),
             message: None,
             updated_at: None,
+            verification: None,
         });
         card.relationships.inbound = vec!["different-live-edge".to_owned()];
         let second = immutable_card_blob_bytes(card).expect("blob serializes");

@@ -76,9 +76,9 @@ pub enum Resource {
     Services,
     /// Operator cards and invocations.
     Operators,
-    /// Eval cards and eval runs.
+    /// Eval-backed Verifier Cards and eval runs.
     Evals,
-    /// Drift cards and drift observations.
+    /// Drift-backed Verifier Cards and drift observations.
     Drift,
     /// Artifact bytes and metadata.
     Artifacts,

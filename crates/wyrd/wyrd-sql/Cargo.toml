@@ -13,6 +13,8 @@ embedded-postgres = ["dep:pg-embed", "dep:rand", "dep:urlencoding"]
 [dependencies]
 blake3 = { workspace = true }
 chrono = { workspace = true }
+chrono-tz = { workspace = true }
+croner = { workspace = true }
 regex = { workspace = true }
 metrics = { workspace = true }
 secrecy = { workspace = true }

@@ -87,7 +87,18 @@ You only need it when you federate identity. Trusted issuers and workload bindin
 | `WYRD_HTTP_BODY_LIMIT_BYTES` | `1048576` | `>= 1048576` | Max request body. Buffers up to this per request. |
 | `WYRD_HTTP_REQUEST_TIMEOUT_MS` | `30000` | `1000`–`600000` | Per-request processing timeout. |
 | `WYRD_HTTP_CONCURRENCY_LIMIT` | `1024` | `1`–`1048576` | Max in-flight concurrent requests. |
-| `WYRD_SHUTDOWN_DRAIN_MS` | `15000` | `1000`–`60000` | Drain budget for in-flight requests on shutdown. |
+| `WYRD_SHUTDOWN_DRAIN_MS` | `35000` | `1000`–`60000` | Drain budget for in-flight requests and verification runs on shutdown. The verification runtime drains for up to 30 seconds inside it; a budget below `31000` shortens that drain. |
+
+## Verification runtime
+
+Every API-serving process runs the verification runtime: one scheduler, the Verifier runner, and their durable queue in Postgres. Replicas coordinate through that queue, so no leader election is needed.
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `WYRD_VERIFICATION_ENABLED` | `true` | Run the verification runtime in this process. Set `0` to disable it or `1` to enable it. |
+| `WYRD_VERIFICATION_INGEST_ENDPOINT` | none | Scribe-bearing gRPC endpoint (`http://` or `https://`) that Verifier results are published through. When unset, a process that hosts a Scribe and serves plaintext gRPC publishes through its own listener; any other process runs no Verifier runner until this is set. |
+
+On shutdown the runtime stops claiming work immediately, gives in-flight runs up to 30 seconds to finish, then releases their leases so another process retries them under the same run identity. That drain happens inside `WYRD_SHUTDOWN_DRAIN_MS`, so keep your supervisor's stop timeout (Kubernetes `terminationGracePeriodSeconds`) above it.
 
 ## Readiness
 

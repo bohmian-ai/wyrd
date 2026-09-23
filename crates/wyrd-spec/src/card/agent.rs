@@ -4,11 +4,12 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::api_version::ApiVersion;
+use crate::card::verifier::VerificationBinding;
 use crate::envelope::{Card, CardKind, Metadata as EnvelopeMetadata, Relationships, Spec};
 use crate::error::WyrdError;
 use crate::ids::{CardName, CardUid, SpaceName};
 use crate::metadata::{Annotations, Labels};
-use crate::reference::{CardRef, InlineableRef, Ref};
+use crate::reference::{CardRef, InlineableRef};
 use wyrd_semver::VersionBlock;
 
 /// Pure-serde mirror of the Skald agent run configuration.
@@ -43,9 +44,9 @@ pub struct AgentSpec {
     /// Agent run configuration.
     #[serde(default, skip_serializing_if = "is_default_run_config")]
     pub run_config: AgentRunConfigSpec,
-    /// Eval and Drift cards that receive observations from this agent.
+    /// Continuous verification bindings owned by this standalone Agent.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub publishes_to: Vec<Ref>,
+    pub verified_by: Vec<VerificationBinding>,
 }
 
 fn is_default_run_config(config: &AgentRunConfigSpec) -> bool {
@@ -277,7 +278,7 @@ mod agent_spec_tests {
                 session_recent_limit: Some(5),
                 timeout_ms: Some(1_500),
             },
-            publishes_to: Vec::new(),
+            verified_by: Vec::new(),
         };
 
         let json = serde_json::to_string(&spec).expect("serialize");
@@ -301,7 +302,7 @@ mod agent_spec_tests {
             }),
             tool_names: Vec::new(),
             run_config: AgentRunConfigSpec::default(),
-            publishes_to: Vec::new(),
+            verified_by: Vec::new(),
         };
 
         let yaml = serde_yaml::to_string(&spec).expect("serialize");
@@ -329,7 +330,7 @@ mod agent_spec_tests {
                 prompt: InlineableRef::from(prompt()),
                 tool_names: Vec::new(),
                 run_config: AgentRunConfigSpec::default(),
-                publishes_to: Vec::new(),
+                verified_by: Vec::new(),
             },
             cascade_children: Vec::new(),
             created_at: Utc::now(),

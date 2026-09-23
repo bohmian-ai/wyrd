@@ -9,7 +9,11 @@ mod bifrost;
 #[cfg(feature = "python")]
 mod client;
 #[cfg(feature = "python")]
+mod observe;
+#[cfg(feature = "python")]
 mod state;
+#[cfg(feature = "python")]
+mod verification;
 
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
@@ -104,8 +108,14 @@ fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     let observe = PyModule::new(py, "observe")?;
     bifrost::register_observe(&observe)?;
+    observe::register_run(&observe)?;
     m.add_submodule(&observe)?;
     register_submodule(py, "wyrd._wyrd.observe", &observe)?;
+
+    let verification = PyModule::new(py, "verification")?;
+    verification::register(&verification)?;
+    m.add_submodule(&verification)?;
+    register_submodule(py, "wyrd._wyrd.verification", &verification)?;
 
     #[cfg(feature = "testing")]
     {

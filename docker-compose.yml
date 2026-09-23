@@ -23,9 +23,10 @@ services:
         target: /var/lib/postgresql/data
     ports:
       - "127.0.0.1::5432"
+    # Probe over TCP, not the Unix socket: the image's first-boot init runs a
+    # temporary socket-only server, so a socket probe reports healthy before
+    # the real server listens and host clients race a refused connection.
     healthcheck:
-      # TCP, not the socket: the image's init-time server listens only on the
-      # socket, so a socket probe reports healthy before the real server is up.
       test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "wyrd_test_admin", "-d", "wyrd"]
       interval: 2s
       timeout: 3s
@@ -42,8 +43,13 @@ services:
       KC_LOG_LEVEL: WARN
     volumes:
       - ./tests/fixtures/identity/keycloak-realm.json:/opt/keycloak/data/import/keycloak-realm.json:ro
+    # Published on the loopback address only. A wildcard publication binds
+    # 0.0.0.0:8080, which occupies port 8080 on every 127.x.y.z address and so
+    # steals the canonical public HTTP port out from under the Bifrost process
+    # cluster's pod-like loopback addresses whenever the identity lane and a
+    # Bifrost lane run concurrently.
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     # The Keycloak 24 image (UBI-micro) ships no curl or wget, so the old
     # `curl -sf .../health/ready` probe could never run and `docker compose up
     # --wait` always reported the container unhealthy — the identity e2e gate
@@ -65,8 +71,9 @@ services:
     command: ["dex", "serve", "/etc/dex/config.yaml"]
     volumes:
       - ./tests/fixtures/identity/dex-config.yaml:/etc/dex/config.yaml:ro
+    # Loopback-only for the same reason as Keycloak above.
     ports:
-      - "5556:5556"
+      - "127.0.0.1:5556:5556"
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:5556/healthz 2>/dev/null || exit 1"]
       interval: 5s

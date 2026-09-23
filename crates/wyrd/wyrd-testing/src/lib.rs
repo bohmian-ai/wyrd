@@ -8,6 +8,7 @@ pub mod oidc_fixture;
 pub mod principal;
 pub mod server;
 pub mod time;
+pub mod verification;
 
 pub use oidc_fixture::{DiscoveryFixture, KeycloakAdmin, LoginResult, OidcIssuerFixture};
 pub use principal::{Bootstrap, CheckResult};

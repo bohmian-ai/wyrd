@@ -4,15 +4,17 @@ pub mod auth;
 pub mod error;
 pub mod limits;
 
+use std::io::Cursor;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use arrow::ipc::reader::StreamReader;
 use arrow::record_batch::RecordBatch;
 use sha2::{Digest as _, Sha256};
 use tracing::Instrument;
 use uuid::Uuid;
-use wyrd_runtime::PermissionCheck;
+use wyrd_runtime::{PermissionCheck, Principal, PrincipalKind};
 use wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest;
 use wyrd_tonic::otlp::metrics_service::ExportMetricsServiceRequest;
 use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
@@ -26,7 +28,7 @@ use wyrd_tonic::wyrd::v1::{InsertBatchRequest, InsertBatchResponse};
 use crate::catalog::TableRef;
 use crate::contracts::{
     CanonicalIngress, DecodedOtlp, IngressPayload, OracleQueryDispatch, OtlpDecodeOwner, Scribe,
-    ScribeIngressFrame,
+    ScribeError, ScribeIngressFrame,
 };
 pub use crate::gate::auth::{AuthContext, IngestAuthInterceptor, WYRD_REQUEST_ID_METADATA};
 pub use crate::gate::error::IngestError;
@@ -34,7 +36,9 @@ pub use crate::gate::limits::{IngestLimits, OtlpWireLimits};
 use crate::namespaces::BifrostNamespace;
 use crate::oracle::{AuthorizedQueryContext, OracleQueryStream, QueryStreamLifecycle};
 pub use crate::otlp_contract::{IngestOutcome, LogsOutcome, MetricsOutcome};
+use crate::scribe::execution_lanes::require_card_scope;
 use crate::scribe::preprocess::{correlation_data_identity, logical_data_identity};
+use crate::tables::{DomainTable, ResultFeaturesTable, ResultItemsTable, ResultsTable};
 use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::vala::api::{AuditOutcome, BifrostQueryRequest};
@@ -426,36 +430,72 @@ impl<A: GateAudit + 'static> Gate<A> {
 
     /// Evaluates the write permission and durably records the decision.
     ///
-    /// Both outcomes are recorded, and the row commits before the write is
-    /// admitted or refused, so no admitted write and no refusal is unlogged.
+    /// One decision per admission: the `bifrost_record:write` permission check
+    /// and the closed verification-result writer matrix are evaluated together
+    /// and recorded as a single canonical decision against `table`. The matrix
+    /// reserves the verification result tables to the internal SYSTEM writer —
+    /// every other kind, a wildcard administrator included, is refused them —
+    /// and confines the SYSTEM writer to those tables. A SYSTEM result write is
+    /// further allowed only when `native_frame` decodes and every row carries a
+    /// `card_ref` inside the writer's signed Verifier scope, so an unattributed
+    /// or foreign result batch is a recorded denial rather than an allowed
+    /// decision that Scribe later refuses. Both outcomes are recorded, and the
+    /// row commits before the write is admitted or refused, so no admitted
+    /// write and no refusal is unlogged.
+    ///
+    /// `native_frame` is the Arrow IPC payload of a native write; OTLP callers
+    /// pass `None` because their tables are never result tables.
     ///
     /// # Errors
     ///
     /// Returns [`IngestError::RbacDenied`] when the principal lacks the
-    /// permission, and [`IngestError::AuditUnavailable`] when either decision
-    /// cannot be recorded.
+    /// permission or is the SYSTEM writer outside the result tables,
+    /// [`IngestError::ReservedBuiltinWriteDenied`] when any other principal
+    /// targets a result table, [`IngestError::CardScopeDenied`] when a SYSTEM
+    /// result frame is absent, undecodable, or not fully in scope, and
+    /// [`IngestError::AuditUnavailable`] when the decision cannot be recorded.
     async fn authorize_record_write(
         &self,
         auth: &AuthContext,
-        resource: &str,
+        table: &TableRef,
+        native_frame: Option<&[u8]>,
     ) -> Result<(), IngestError> {
         let audit = self
             .audit
             .as_ref()
             .ok_or_else(|| IngestError::AuditUnavailable("gate has no audit sink".to_owned()))?;
+        let resource = table.fqn();
         let decision = wyrd_runtime::RbacCheck
             .check(
                 &auth.principal,
                 &wyrd_runtime::Permission::bifrost_record_write(),
             )
             .into_result()
-            .map_err(IngestError::from_rbac);
+            .map_err(IngestError::from_rbac)
+            .and_then(|()| {
+                let system = matches!(auth.principal.kind, PrincipalKind::System { .. });
+                match (is_verification_result_table(table), system) {
+                    (true, false) => Err(IngestError::ReservedBuiltinWriteDenied {
+                        table: resource.clone(),
+                    }),
+                    (false, true) => Err(IngestError::RbacDenied {
+                        detail: format!("the system writer may not write {resource}"),
+                    }),
+                    (true, true) => native_frame
+                        .ok_or(ScribeError::CardScopeDenied)
+                        .and_then(|frame| require_frame_card_scope(frame, &auth.principal))
+                        .map_err(IngestError::from_scribe),
+                    (false, false) => Ok(()),
+                }
+            });
         let outcome = if decision.is_ok() {
             AuditOutcome::Allowed
         } else {
             AuditOutcome::Denied
         };
-        audit.append_write_decision(auth, resource, outcome).await?;
+        audit
+            .append_write_decision(auth, &resource, outcome)
+            .await?;
         decision
     }
 
@@ -649,7 +689,8 @@ impl<A: GateAudit + 'static> Gate<A> {
         if let Err(error) = self
             .authorize_record_write(
                 auth,
-                &TableRef::new(BifrostNamespace::Traces, "spans").fqn(),
+                &TableRef::new(BifrostNamespace::Traces, "spans"),
+                None,
             )
             .await
         {
@@ -691,7 +732,8 @@ impl<A: GateAudit + 'static> Gate<A> {
         if let Err(error) = self
             .authorize_record_write(
                 auth,
-                &TableRef::new(BifrostNamespace::Metrics, "points").fqn(),
+                &TableRef::new(BifrostNamespace::Metrics, "points"),
+                None,
             )
             .await
         {
@@ -737,7 +779,8 @@ impl<A: GateAudit + 'static> Gate<A> {
         if let Err(error) = self
             .authorize_record_write(
                 auth,
-                &TableRef::new(BifrostNamespace::Logs, "records").fqn(),
+                &TableRef::new(BifrostNamespace::Logs, "records"),
+                None,
             )
             .await
         {
@@ -878,7 +921,8 @@ impl<A: GateAudit + 'static> Gate<A> {
             return Err(IngestError::ReservedBuiltinWriteDenied { table: frame.table });
         }
         let table = TableRef::new(namespace, name);
-        self.authorize_record_write(auth, &table.fqn()).await?;
+        self.authorize_record_write(auth, &table, Some(&frame.arrow_ipc))
+            .await?;
         let scribe = self.scribe.as_ref().ok_or(IngestError::IngressClosed)?;
         let ingress = ScribeIngressFrame {
             principal: auth.principal.clone(),
@@ -909,6 +953,51 @@ impl<A: GateAudit + 'static> Gate<A> {
             .record(resolution_started.elapsed().as_secs_f64());
         Ok(admission.rows_accepted)
     }
+}
+
+/// Whether `table` is one of the verification result tables only the internal
+/// SYSTEM writer may write.
+///
+/// The set is closed and owned by the table definitions themselves, so a
+/// renamed result table cannot silently fall out of the reservation.
+fn is_verification_result_table(table: &TableRef) -> bool {
+    [
+        (ResultsTable::NAMESPACE, ResultsTable::NAME),
+        (ResultFeaturesTable::NAMESPACE, ResultFeaturesTable::NAME),
+        (ResultItemsTable::NAMESPACE, ResultItemsTable::NAME),
+    ]
+    .into_iter()
+    .any(|(namespace, name)| {
+        BifrostNamespace::from_domain_namespace(namespace) == Some(table.namespace)
+            && table.name == name
+    })
+}
+
+/// Requires every row of a native Arrow IPC frame to carry an in-scope `card_ref`.
+///
+/// Gate decodes the SYSTEM writer's result frame before recording its write
+/// decision and applies Scribe's mandatory scope check to each record batch.
+/// A stream that fails to decode or carries no record batch has no attributable
+/// row and is refused like an absent correlation. Scribe decodes the frame
+/// again on admission and repeats its own scope and UID-stamping checks.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::CardScopeDenied`] when the frame does not decode,
+/// carries no record batch, or any batch fails [`require_card_scope`].
+fn require_frame_card_scope(frame: &[u8], principal: &Principal) -> Result<(), ScribeError> {
+    let reader = StreamReader::try_new(Cursor::new(frame), None)
+        .map_err(|_| ScribeError::CardScopeDenied)?;
+    let mut batches = 0_usize;
+    for rows in reader {
+        let rows = rows.map_err(|_| ScribeError::CardScopeDenied)?;
+        require_card_scope(&rows, principal)?;
+        batches += 1;
+    }
+    if batches == 0 {
+        return Err(ScribeError::CardScopeDenied);
+    }
+    Ok(())
 }
 
 /// Resolves one validated public table name into its closed namespace and local name.
@@ -1031,14 +1120,18 @@ mod tests {
 
     use super::limits::IngestLimits;
     use super::{AuditOutcome, AuthContext, Gate, GateAudit, IngestError};
-    use crate::contracts::DecodedOtlp;
+    use crate::contracts::{DecodedOtlp, FrameAdmission, Scribe, ScribeError, ScribeIngressFrame};
     use arrow::array::Array as _;
+    use arrow::array::{ArrayRef, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::ipc::writer::StreamWriter;
     use arrow::record_batch::RecordBatch;
     use async_trait::async_trait;
     use futures_util::StreamExt as _;
     use wyrd_runtime::{Permission, PermissionSet, Principal, PrincipalKind};
     use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::ids::DataTenantId;
+    use wyrd_spec::reference::CardRef;
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::QueryStreamFrame;
     use wyrd_spec::vala::error::BifrostError;
@@ -2065,6 +2158,357 @@ mod tests {
                     "missing seeded rejection series for {operation}/{reason}"
                 );
             }
+        }
+    }
+
+    /// Build an authenticated context for `kind` holding `permissions`.
+    ///
+    /// The verification-result matrix tests vary kind and authority
+    /// independently, so the principal shape is a parameter rather than one of
+    /// the fixed contexts above.
+    fn kind_context(kind: PrincipalKind, permissions: PermissionSet) -> AuthContext {
+        let tenant = DataTenantId::new_v7();
+        AuthContext {
+            principal: Principal::new(
+                PrincipalId::new(uuid::Uuid::now_v7()),
+                kind,
+                tenant,
+                Vec::new(),
+                permissions,
+            ),
+            tenant,
+            request_id: RequestId::now_v7(),
+            delegation_chain: Vec::new(),
+        }
+    }
+
+    /// A fresh UID-bearing Verifier reference, the only shape a SYSTEM scope
+    /// member takes.
+    ///
+    /// # Panics
+    /// Panics when the static Verifier reference does not parse with its UID.
+    fn system_verifier() -> CardRef {
+        let verifier = CardRef::from_str(&format!(
+            "prod/Verifier/drift@1.0.0#{}",
+            uuid::Uuid::now_v7()
+        ))
+        .expect("static verifier reference parses");
+        assert!(
+            verifier.uid.is_some(),
+            "the SYSTEM scope member carries a UID"
+        );
+        verifier
+    }
+
+    /// The internal SYSTEM writer scoped to exactly `verifier`, holding
+    /// exactly the record-write permission its minted token carries.
+    fn system_context_for(verifier: &CardRef) -> AuthContext {
+        kind_context(
+            PrincipalKind::System {
+                card_ref_scope: wyrd_spec::reference::CardRefScope::own(verifier),
+            },
+            PermissionSet::from_iter([Permission::bifrost_record_write()]),
+        )
+    }
+
+    /// The internal SYSTEM writer scoped to one fresh UID-bearing Verifier.
+    fn system_context() -> AuthContext {
+        system_context_for(&system_verifier())
+    }
+
+    /// The UID-free `card_ref` text a result row carries for `verifier`.
+    fn verifier_identity(verifier: &CardRef) -> String {
+        CardRef {
+            uid: None,
+            ..verifier.clone()
+        }
+        .to_string()
+    }
+
+    /// Encodes one Arrow IPC stream whose single batch carries `columns`.
+    ///
+    /// Each column is a nullable UTF-8 field, so a case can declare the
+    /// correlation column absent, duplicated, null, or populated.
+    ///
+    /// # Panics
+    /// Panics when the fixture batch cannot be built or encoded.
+    fn utf8_frame(columns: &[(&str, Vec<Option<&str>>)]) -> Vec<u8> {
+        let fields: Vec<Field> = columns
+            .iter()
+            .map(|(name, _)| Field::new(*name, DataType::Utf8, true))
+            .collect();
+        let arrays: Vec<ArrayRef> = columns
+            .iter()
+            .map(|(_, values)| Arc::new(StringArray::from(values.clone())) as ArrayRef)
+            .collect();
+        let rows = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+            .expect("fixture batch builds");
+        let mut payload = Vec::new();
+        let mut writer =
+            StreamWriter::try_new(&mut payload, rows.schema().as_ref()).expect("IPC writer");
+        writer.write(&rows).expect("IPC write");
+        writer.finish().expect("IPC finish");
+        payload
+    }
+
+    /// Encodes a one-row frame whose `card_ref` names the first member of
+    /// `auth`'s signed scope, the shape an admitted SYSTEM result write takes.
+    ///
+    /// # Panics
+    /// Panics when `auth` carries no Card scope member.
+    fn in_scope_frame(auth: &AuthContext) -> Vec<u8> {
+        let verifier = auth
+            .principal
+            .card_ref_scope()
+            .and_then(|scope| scope.as_slice().first())
+            .expect("the SYSTEM writer carries one scope member");
+        let identity = verifier_identity(verifier);
+        utf8_frame(&[("card_ref", vec![Some(identity.as_str())])])
+    }
+
+    /// Every SYSTEM result write whose frame lacks an attributable in-scope
+    /// `card_ref` on every row is refused before Scribe with exactly one
+    /// recorded denial, never an allow that Scribe later contradicts.
+    ///
+    /// # Panics
+    /// Panics when a case is admitted, refused with another error, reaches
+    /// Scribe, or records anything other than one denied decision.
+    #[tokio::test]
+    async fn gate_denies_system_result_writes_outside_the_exact_card_scope() {
+        let verifier = system_verifier();
+        let identity = verifier_identity(&verifier);
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("absent column", utf8_frame(&[("note", vec![Some("x")])])),
+            ("null row", utf8_frame(&[("card_ref", vec![None])])),
+            (
+                "partially null",
+                utf8_frame(&[("card_ref", vec![Some(identity.as_str()), None])]),
+            ),
+            (
+                "duplicated column",
+                utf8_frame(&[
+                    ("card_ref", vec![Some(identity.as_str())]),
+                    ("card_ref", vec![Some(identity.as_str())]),
+                ]),
+            ),
+            (
+                "malformed",
+                utf8_frame(&[("card_ref", vec![Some("not a card")])]),
+            ),
+            (
+                "foreign verifier",
+                utf8_frame(&[("card_ref", vec![Some("prod/Verifier/other@1.0.0")])]),
+            ),
+            ("undecodable frame", vec![0xde, 0xad, 0xbe, 0xef]),
+            ("empty frame", Vec::new()),
+        ];
+        for (label, arrow_ipc) in cases {
+            let scribe_calls = Arc::new(AtomicUsize::new(0));
+            let audit = RecordingAudit::new();
+            let gate = Gate::<RecordingAudit>::with_test_scribe(
+                Arc::new(AnyTableScribe(Arc::clone(&scribe_calls))),
+                test_interceptor(),
+                IngestLimits::default(),
+            )
+            .with_audit(Arc::clone(&audit));
+            let frame = wyrd_tonic::wyrd::v1::InsertBatchRequest {
+                table: "vala.verification.results".to_owned(),
+                wyrd_batch_id: uuid::Uuid::now_v7().as_bytes().to_vec().into(),
+                arrow_ipc: arrow_ipc.into(),
+            };
+
+            let result = gate
+                .dispatch_native_frame(
+                    &IngestLimits::default(),
+                    &system_context_for(&verifier),
+                    frame,
+                )
+                .await;
+
+            assert!(
+                matches!(result, Err(IngestError::CardScopeDenied { .. })),
+                "{label}: {result:?}"
+            );
+            assert_eq!(scribe_calls.load(Ordering::Relaxed), 0, "{label}");
+            assert_eq!(
+                audit.decisions(),
+                vec![("vala.verification.results".to_owned(), AuditOutcome::Denied)],
+                "{label} records exactly one denied decision"
+            );
+        }
+    }
+
+    /// Only the SYSTEM writer may write the three verification result tables,
+    /// every other kind — wildcard administrators included — is refused them,
+    /// and the SYSTEM writer is refused every other table. Each admission,
+    /// allowed or refused, records exactly one canonical write decision.
+    ///
+    /// # Panics
+    /// Panics when a cell of the matrix admits or refuses the wrong writer,
+    /// refuses with the wrong error, reaches Scribe after a refusal, or records
+    /// anything other than one decision for the admission.
+    #[tokio::test]
+    async fn gate_confines_verification_result_tables_to_the_system_writer() {
+        let results = [
+            "vala.verification.results",
+            "vala.drift.result_features",
+            "vala.eval.result_items",
+        ];
+        let others = [
+            "vala.traces.spans",
+            "vala.eval.observations",
+            "vala.datasets.rows",
+        ];
+        let record_write = || PermissionSet::from_iter([Permission::bifrost_record_write()]);
+        let scoped = scoped_auth_context();
+        let non_system = [
+            ("user", auth_context(true)),
+            (
+                "wildcard admin",
+                kind_context(
+                    PrincipalKind::TenantAdmin,
+                    PermissionSet::from_iter([Permission::wildcard()]),
+                ),
+            ),
+            (
+                "card-free service",
+                kind_context(
+                    PrincipalKind::Service {
+                        card_ref: None,
+                        card_ref_scope: wyrd_spec::reference::CardRefScope::default(),
+                    },
+                    record_write(),
+                ),
+            ),
+            ("card-bound service", scoped),
+        ];
+
+        let mut cells: Vec<(String, AuthContext, &str, Option<&str>)> = Vec::new();
+        for table in results {
+            cells.push(("system".to_owned(), system_context(), table, None));
+            for (label, auth) in &non_system {
+                cells.push(((*label).to_owned(), auth.clone(), table, Some("reserved")));
+            }
+        }
+        for table in others {
+            cells.push(("system".to_owned(), system_context(), table, Some("rbac")));
+        }
+
+        for (label, auth, table, refusal) in cells {
+            let arrow_ipc = if refusal.is_none() {
+                in_scope_frame(&auth)
+            } else {
+                Vec::new()
+            };
+            let scribe_calls = Arc::new(AtomicUsize::new(0));
+            let audit = RecordingAudit::new();
+            let gate = Gate::<RecordingAudit>::with_test_scribe(
+                Arc::new(AnyTableScribe(Arc::clone(&scribe_calls))),
+                test_interceptor(),
+                IngestLimits::default(),
+            )
+            .with_audit(Arc::clone(&audit));
+            let frame = wyrd_tonic::wyrd::v1::InsertBatchRequest {
+                table: table.to_owned(),
+                wyrd_batch_id: uuid::Uuid::now_v7().as_bytes().to_vec().into(),
+                arrow_ipc: arrow_ipc.into(),
+            };
+
+            let result = gate
+                .dispatch_native_frame(&IngestLimits::default(), &auth, frame)
+                .await;
+
+            let expected_outcome = match refusal {
+                None => {
+                    assert!(result.is_ok(), "{label} must write {table}: {result:?}");
+                    assert_eq!(scribe_calls.load(Ordering::Relaxed), 1);
+                    AuditOutcome::Allowed
+                }
+                Some(kind) => {
+                    let matches_kind = match kind {
+                        "reserved" => matches!(
+                            &result,
+                            Err(IngestError::ReservedBuiltinWriteDenied { table: denied })
+                                if denied == table
+                        ),
+                        _ => matches!(&result, Err(IngestError::RbacDenied { .. })),
+                    };
+                    assert!(matches_kind, "{label} on {table}: {result:?}");
+                    assert_eq!(
+                        scribe_calls.load(Ordering::Relaxed),
+                        0,
+                        "{label} on {table} must not reach Scribe"
+                    );
+                    AuditOutcome::Denied
+                }
+            };
+            assert_eq!(
+                audit.decisions(),
+                vec![(table.to_owned(), expected_outcome)],
+                "{label} on {table} records exactly one canonical decision"
+            );
+        }
+    }
+
+    /// The SYSTEM writer is refused the OTLP trace surface, with one recorded
+    /// denial, because its authority is confined to verification results.
+    ///
+    /// # Panics
+    /// Panics when the writer is admitted to OTLP ingest or the refusal is not
+    /// recorded exactly once.
+    #[tokio::test]
+    async fn gate_refuses_the_system_writer_on_otlp_ingest() {
+        let scribe_calls = Arc::new(AtomicUsize::new(0));
+        let audit = RecordingAudit::new();
+        let gate = Gate::<RecordingAudit>::with_test_scribe(
+            Arc::new(CountingScribe::new(Arc::clone(&scribe_calls))),
+            test_interceptor(),
+            IngestLimits::default(),
+        )
+        .with_audit(Arc::clone(&audit));
+
+        let error = gate
+            .ingest_decoded_resource_spans(
+                &system_context(),
+                decoded_trace(ExportTraceServiceRequest::default()),
+            )
+            .await
+            .expect_err("the SYSTEM writer cannot export traces");
+
+        assert!(matches!(error, IngestError::RbacDenied { .. }), "{error:?}");
+        assert_eq!(scribe_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            audit.decisions(),
+            vec![("vala.traces.spans".to_owned(), AuditOutcome::Denied)]
+        );
+    }
+
+    /// Scribe double that admits a frame for any table and counts admissions.
+    ///
+    /// The result-table matrix drives native frames at several tables, which
+    /// the traces-only [`CountingScribe`] would reject by assertion.
+    struct AnyTableScribe(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl Scribe for AnyTableScribe {
+        fn is_ready(&self) -> bool {
+            true
+        }
+
+        /// Counts one admitted frame without inspecting its payload.
+        ///
+        /// # Errors
+        ///
+        /// This test implementation never returns an error.
+        async fn ingest_frame(
+            &self,
+            _frame: ScribeIngressFrame,
+        ) -> Result<FrameAdmission, ScribeError> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(FrameAdmission {
+                batch_id: uuid::Uuid::now_v7(),
+                rows_accepted: 0,
+            })
         }
     }
 

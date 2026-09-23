@@ -9,15 +9,23 @@ mod pg_tests {
     //! Skipped automatically when the database environment is unset so the
     //! default suite stays credential-free.
 
-    use chrono::{DateTime, Utc};
+    use chrono::{DateTime, Duration, Utc};
     use sqlx::Row;
     use uuid::Uuid;
     use wyrd_dev_fixtures::pg::PgFixture;
+    use wyrd_semver::VersionBlock;
+    use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::PrincipalKindTag;
+    use wyrd_spec::envelope::CardKind;
+    use wyrd_spec::ids::{CardName, SpaceName};
+    use wyrd_spec::reference::CardRef;
     use wyrd_sql::queries::auth::{
         ApiKeyStatus, api_key_by_prefix, api_key_status_by_prefix, credential_belongs_to,
-        insert_api_key, insert_role, insert_service_account, insert_user, list_api_key_metadata,
-        list_user_roles, replace_user_roles, tenant_admin_principal_id,
+        delete_service_account, insert_api_key, insert_refresh_token, insert_role,
+        insert_service_account, insert_user, list_api_key_metadata, list_service_account_roles,
+        list_user_roles, provision_system_principal, replace_user_roles,
+        service_account_by_card_ref, service_account_by_id, suspend_service_account_principal,
+        system_principal_id, tenant_admin_principal_id,
     };
     use wyrd_sql::queries::platform::credentials::{
         insert_platform_credential_tx, list_platform_credentials, platform_credential_by_prefix,
@@ -756,6 +764,257 @@ mod pg_tests {
             !credential_belongs_to(&mut conn, credential, principal)
                 .await
                 .expect("B checks ownership")
+        );
+    }
+
+    /// Version of the upgrade migration that admits and backfills the SYSTEM
+    /// writer; the backfill proof replays it against an existing tenant.
+    const SYSTEM_PRINCIPAL_MIGRATION_VERSION: i64 = 20260601000028;
+
+    /// Provisioning the internal SYSTEM writer is idempotent: every call in a
+    /// tenant returns one stable UUIDv7 row that is active, Card-free,
+    /// role-free, and credential-free, and each tenant gets its own.
+    ///
+    /// # Panics
+    /// Panics when provisioning diverges between calls, yields a non-v7 id or a
+    /// second row, attaches a Card, role, or credential, or crosses tenants.
+    #[tokio::test]
+    async fn system_principal_provisioning_is_idempotent_and_stable() {
+        let Some(_) = database_url() else {
+            return;
+        };
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant_b = fixture
+            .seed_additional_tenant(&format!("system-b-{}", Uuid::now_v7()))
+            .await
+            .expect("second tenant seeds");
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant opens");
+        let first = provision_system_principal(&mut conn)
+            .await
+            .expect("first provisioning succeeds");
+        conn.commit().await.expect("first provisioning commits");
+        let mut conn = fixture.tenant_conn().await.expect("tenant reopens");
+        let second = provision_system_principal(&mut conn)
+            .await
+            .expect("repeat provisioning succeeds");
+        assert_eq!(first, second, "provisioning returns the one stable id");
+        assert_eq!(first.get_version_num(), 7, "the SYSTEM id is a UUIDv7");
+        assert_eq!(
+            system_principal_id(&mut conn)
+                .await
+                .expect("lookup succeeds"),
+            Some(first)
+        );
+        let rows = sqlx::query(
+            "SELECT name, status, card_kind, card_uid, card_ref, space, version \
+               FROM wyrd.auth_service_accounts WHERE principal_kind = 'system'",
+        )
+        .fetch_all(&mut **conn.transaction())
+        .await
+        .expect("system rows read");
+        assert_eq!(rows.len(), 1, "exactly one SYSTEM row per tenant");
+        let row = &rows[0];
+        assert_eq!(row.get::<String, _>("name"), "verification-results-writer");
+        assert_eq!(row.get::<String, _>("status"), "active");
+        for column in ["card_kind", "space", "version"] {
+            assert_eq!(row.get::<Option<String>, _>(column), None, "{column}");
+        }
+        assert_eq!(row.get::<Option<Uuid>, _>("card_uid"), None);
+        assert_eq!(row.get::<Option<serde_json::Value>, _>("card_ref"), None);
+        assert!(
+            list_service_account_roles(&mut conn, first)
+                .await
+                .expect("roles read")
+                .is_empty()
+        );
+        assert!(
+            list_api_key_metadata(&mut conn, first)
+                .await
+                .expect("credentials read")
+                .is_empty()
+        );
+        conn.commit().await.expect("tenant A commits");
+
+        let mut conn = fixture.tenant_conn_for(tenant_b).await.expect("B opens");
+        assert_eq!(
+            system_principal_id(&mut conn)
+                .await
+                .expect("B lookup succeeds"),
+            None,
+            "tenant A's writer is invisible to tenant B"
+        );
+        let tenant_b_writer = provision_system_principal(&mut conn)
+            .await
+            .expect("B provisions its own writer");
+        assert_ne!(tenant_b_writer, first, "each tenant owns a distinct writer");
+    }
+
+    /// Every public path that names a machine principal refuses the SYSTEM
+    /// writer as though it did not exist, and the store itself refuses giving
+    /// it a lifecycle, a Card, a second row, or a refresh session.
+    ///
+    /// # Panics
+    /// Panics when any public lookup resolves the writer, a lifecycle write
+    /// changes it, or the store accepts a forbidden shape.
+    #[tokio::test]
+    async fn system_principal_is_absent_from_public_principal_paths() {
+        let Some(_) = database_url() else {
+            return;
+        };
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let mut conn = fixture.tenant_conn().await.expect("tenant opens");
+        let writer = provision_system_principal(&mut conn)
+            .await
+            .expect("provisioning succeeds");
+
+        assert!(
+            service_account_by_id(&mut conn, writer)
+                .await
+                .expect("lookup succeeds")
+                .is_none(),
+            "public get, credential, revoke, and exchange lookups omit the writer"
+        );
+        assert!(
+            !suspend_service_account_principal(&mut conn, writer)
+                .await
+                .expect("suspend runs"),
+            "public revocation cannot suspend the writer"
+        );
+        assert!(
+            !delete_service_account(&mut conn, writer)
+                .await
+                .expect("delete runs"),
+            "public deletion cannot delete the writer"
+        );
+        let verifier = CardRef {
+            kind: CardKind::Verifier,
+            name: CardName::new("verification-results-writer").expect("static name is valid"),
+            version: VersionBlock::parse("1.0.0").expect("static version is valid"),
+            space: Some(SpaceName::new("prod").expect("static space is valid")),
+            uid: None,
+        };
+        assert!(
+            service_account_by_card_ref(&mut conn, "system", &verifier)
+                .await
+                .expect("card lookup succeeds")
+                .is_none(),
+            "workload binding and jwt-bearer resolve no Card-free writer"
+        );
+        assert_eq!(
+            system_principal_id(&mut conn)
+                .await
+                .expect("lookup succeeds"),
+            Some(writer),
+            "the writer is still active after every refused lifecycle write"
+        );
+        conn.commit().await.expect("refusals commit");
+
+        let refusals: [(&str, &str); 3] = [
+            (
+                "suspension",
+                "UPDATE wyrd.auth_service_accounts SET status = 'suspended' \
+                  WHERE principal_kind = 'system'",
+            ),
+            (
+                "a Card binding",
+                "UPDATE wyrd.auth_service_accounts \
+                    SET card_kind = 'Verifier', card_uid = gen_random_uuid(), \
+                        card_ref = '{}'::jsonb, space = 'prod', version = '1.0.0' \
+                  WHERE principal_kind = 'system'",
+            ),
+            (
+                "a second writer",
+                "INSERT INTO wyrd.auth_service_accounts \
+                    (id, data_tenant_id, principal_kind, name, status, created_by) \
+                 VALUES (gen_random_uuid(), wyrd.current_tenant(), 'system', 'second', \
+                         'active', gen_random_uuid())",
+            ),
+        ];
+        for (label, statement) in refusals {
+            let mut conn = fixture.tenant_conn().await.expect("tenant reopens");
+            let result = sqlx::query(statement)
+                .execute(&mut **conn.transaction())
+                .await;
+            assert!(result.is_err(), "the store must refuse {label}");
+        }
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant reopens");
+        let refresh = insert_refresh_token(
+            &mut conn,
+            Uuid::now_v7(),
+            "system",
+            writer,
+            "system-refresh-probe",
+            Utc::now() + Duration::days(1),
+        )
+        .await;
+        assert!(refresh.is_err(), "the writer can hold no refresh session");
+    }
+
+    /// The upgrade migration backfills a tenant that predates it with exactly
+    /// one SYSTEM writer, and replaying it keeps that same row. The platform
+    /// sentinel tenant is not a data tenant and never receives one.
+    ///
+    /// # Panics
+    /// Panics when the replayed migration fails, leaves the tenant without a
+    /// writer, replaces or duplicates it, or provisions the sentinel tenant.
+    #[tokio::test]
+    async fn system_principal_upgrade_backfills_existing_tenants_idempotently() {
+        let Some(_) = database_url() else {
+            return;
+        };
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture
+            .seed_additional_tenant(&format!("system-upgrade-{}", Uuid::now_v7()))
+            .await
+            .expect("pre-existing tenant seeds");
+        let pool = fixture.superuser_pool().await.expect("migrator pool");
+        let read_writers = || async {
+            sqlx::query_scalar::<_, Uuid>(
+                "SELECT id FROM wyrd.auth_service_accounts \
+                  WHERE data_tenant_id = $1 AND principal_kind = 'system'",
+            )
+            .bind(tenant.as_uuid())
+            .fetch_all(&pool)
+            .await
+            .expect("writer rows read")
+        };
+        assert!(
+            read_writers().await.is_empty(),
+            "a tenant seeded after migration starts without a writer"
+        );
+
+        let mut backfilled = Vec::new();
+        for _ in 0..2 {
+            sqlx::query("DELETE FROM wyrd._sqlx_migrations WHERE version = $1")
+                .bind(SYSTEM_PRINCIPAL_MIGRATION_VERSION)
+                .execute(&pool)
+                .await
+                .expect("migration ledger row removes");
+            wyrd_sql::migrate(&pool)
+                .await
+                .expect("upgrade migration replays");
+            backfilled.push(read_writers().await);
+        }
+
+        assert_eq!(
+            backfilled[0].len(),
+            1,
+            "backfill creates exactly one writer"
+        );
+        assert_eq!(backfilled[0][0].get_version_num(), 7);
+        assert_eq!(backfilled[0], backfilled[1], "replay keeps the same writer");
+        let sentinel_writers: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM wyrd.auth_service_accounts WHERE data_tenant_id = $1",
+        )
+        .bind(DataTenantId::SYSTEM_OWNER.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .expect("sentinel principals read");
+        assert_eq!(
+            sentinel_writers, 0,
+            "the platform sentinel tenant owns no verification-result writer"
         );
     }
 }

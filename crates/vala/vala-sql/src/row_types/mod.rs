@@ -2,7 +2,6 @@
 //!
 //! Future row modules mirror `queries/` concerns and stay at the SQL boundary.
 
-pub mod alerts;
 pub mod anchors;
 pub mod audit_staging;
 pub mod cluster_nodes;

@@ -12,6 +12,26 @@ spec:
     and execute the matched retention runbook.
   service_type: api
 
+  # Service-level binding: the whole deployment is verified by an org-wide
+  # Verifier that was registered on its own, so every leg is an exact `ref:`.
+  # `on_failure` carries one inline Operator body, owned by this binding.
+  verified_by:
+    - verifier:
+        kind: Verifier
+        space: wyrd-team
+        name: retention-guardrail
+        version: "1.0.0"
+      runs_on:
+        kind: Trigger
+        space: wyrd-team
+        name: retention-observations-ready
+        version: "1.0.0"
+      on_failure:
+        - kind: notify
+          channel:
+            kind: slack
+            text: retention guardrail failed for the churn response service
+
   # Every component uses the unified ref variant: `path` (sibling submission)
   # or `ref` (external, identity by kind+space+name+exact version). Inline is
   # not legal at component positions.
@@ -24,22 +44,27 @@ spec:
         name: churn-classifier
         version: "1.4.2"
       # Monitoring is deployment-specific, so the Service binds this reusable
-      # model to the sibling Drift card.
-      publishes_to:
-        - ./model/drift.yaml
+      # model to the sibling Drift Verifier on a referenced schedule Trigger.
+      verified_by:
+        - verifier: ./model/drift.yaml
+          runs_on: ./ops/trigger-drift-schedule.yaml
+          on_failure:
+            - ./ops/operator-slack.yaml
 
     - alias: agent1
       # `path:` — sibling submission in this composite; loader binds to its
       # resolved identity at wire assembly.
       ref: agent1/agent.yaml
-      publishes_to:
-        - agent1/eval.yaml
+      verified_by:
+        - verifier: agent1/eval.yaml
+          # Inline activation: the binding owns its Trigger body.
+          runs_on:
+            kind: observations_ready
+          on_failure:
+            - ./ops/operator-slack.yaml
 
     - alias: agent2
       ref: agent2/agent.yaml
-      publishes_to:
-        - agent1/eval.yaml
-
-  # Optional service-level publications (deploy/scale/health events). Empty
-  # here — this service has no first-class lifecycle observations.
-  publishes_to: []
+      verified_by:
+        - verifier: agent1/eval.yaml
+          runs_on: ./ops/trigger-eval-ready.yaml

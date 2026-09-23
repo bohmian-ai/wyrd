@@ -49,10 +49,11 @@ principals live under `wyrd.*` behind RLS and can never reach the platform
 plane. Neither plane's credential or token is accepted by the other.
 
 `PrincipalKindTag` is the closed wire set shared by both planes:
-`global_admin`, `tenant_admin`, `user`, `service`, and `agent`. A platform
-principal is `global_admin` or `user`; a tenant principal is `tenant_admin`,
-`user`, `service`, or `agent`. The runtime `Principal { id, kind, tenant_id,
-roles, effective_permissions, credential_id }` carries the tenant-plane
+`global_admin`, `tenant_admin`, `user`, `service`, `agent`, and `system`. A
+platform principal is `global_admin` or `user`; a tenant principal is
+`tenant_admin`, `user`, `service`, `agent`, or the internal-only `system`. The
+runtime `Principal { id, kind, tenant_id, roles, effective_permissions,
+credential_id }` carries the tenant-plane
 `PrincipalKind`, and `PlatformPrincipal { id, kind, effective_permissions,
 credential_id }` the tenantless platform identity.
 
@@ -67,6 +68,11 @@ identity is not a registered AI-system component.
 Card-bound identities are provisioned idempotently by tenant, principal kind,
 Card kind, and Card UID. Re-applying a Card preserves the principal identity.
 Credential issuance is a separate privileged operation and is policy-gated.
+The verification runtime also provisions one UUIDv7 `system` principal per
+tenant for canonical result publication. It is not Card-bound or publicly
+manageable, has no credential, role grant, refresh, workload, or delegation
+path, and can receive only a server-minted access token scoped to one exact
+Verifier Card for the reserved verification result tables.
 
 A tenant administrator is created once, during tenant provisioning, and is the
 tenant's headless root of trust: it holds credentials and roles, federates no
@@ -133,6 +139,11 @@ credential.
   exchange, OIDC login, human refresh, workload `jwt-bearer`, and delegation.
   Verification is local and synchronous — signature, issuer, audience, expiry —
   and reads no store, holds no cache, and resolves no roles.
+- Internal verification-result tokens use that same issuer and token format,
+  but load the tenant's persisted `system` principal and carry no roles,
+  credential, delegation chain, or bound root Card. Their permissions are
+  exactly `bifrost_record:write` and their Card scope contains exactly one
+  UID-bearing Verifier. This fixed server capability is not a public grant.
 - Revoking a credential, suspending or deleting a principal, suspending a
   tenant, or changing grants refuses the next issuance immediately. A tenant
   token already issued keeps its snapshot authority until its five-minute

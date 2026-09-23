@@ -28,9 +28,6 @@ pub enum DriftFitError {
     #[error("Distribution signal expected for PSI/SPC fit, got {got}")]
     SignalShapeMismatch { got: &'static str },
 
-    #[error("External method has no Vala-fit baseline")]
-    ExternalMethodHasNoBaseline,
-
     #[error("PSI fit internal error: {message}")]
     PsiInternal { message: String },
 
@@ -65,9 +62,6 @@ pub enum DriftScoreError {
 
     #[error("feature {feature} has zero non-null rows in target")]
     FeatureEmpty { feature: String },
-
-    #[error("External method scoring is not in phase")]
-    ExternalMethodNotInPhase,
 
     #[error("PSI score internal error: {message}")]
     PsiInternal { message: String },

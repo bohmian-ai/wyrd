@@ -13,8 +13,11 @@ spec:
         name: primary
         version: 1.0.0
         space: default
-      publishes_to:
-        - ./model-drift.yaml
+      verified_by:
+        - verifier: ./model-drift.yaml
+          runs_on:
+            kind: schedule
+            cron: "0 * * * *"
     - alias: model_shadow
       ref:
         kind: Model
@@ -23,8 +26,10 @@ spec:
         space: default
     - alias: agent_triage
       ref: ./agent-triage.yaml
-      publishes_to:
-        - ./quality.yaml
+      verified_by:
+        - verifier: ./quality.yaml
+          runs_on:
+            kind: observations_ready
     - alias: agent_inline
       ref: ./agent-inline.yaml
     - alias: triage_prompt

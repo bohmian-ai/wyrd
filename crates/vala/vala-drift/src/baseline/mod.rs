@@ -1,7 +1,6 @@
 //! Top-level baseline fit and score dispatch.
 
 use wyrd_spec::card::drift::{DriftMethod, DriftProfile, DriftSignal, DriftSpec};
-use wyrd_spec::ids::FeatureName;
 
 use crate::custom::score_custom;
 use crate::error::{DriftFitError, DriftScoreError};
@@ -64,18 +63,9 @@ pub fn fit_baseline(
                     });
                 }
             };
-            let metric_feature;
             let features = match &spec.signal {
                 DriftSignal::Distribution { features, .. } => features.as_slice(),
-                DriftSignal::Metric { name } => {
-                    metric_feature = FeatureName::new(name.as_str()).map_err(|_| {
-                        DriftFitError::SpcInternal {
-                            message: format!("metric name {name} is not a valid FeatureName"),
-                        }
-                    })?;
-                    std::slice::from_ref(&metric_feature)
-                }
-                other => {
+                other @ DriftSignal::Metric { .. } => {
                     return Err(DriftFitError::SignalShapeMismatch {
                         got: signal_variant(other),
                     });
@@ -84,7 +74,6 @@ pub fn fit_baseline(
             fit_spc_baseline(batch, profile, features).map(FittedBaseline::Spc)
         }
         DriftMethod::Custom => Ok(FittedBaseline::Custom),
-        DriftMethod::External => Err(DriftFitError::ExternalMethodHasNoBaseline),
     }
 }
 
@@ -92,8 +81,8 @@ pub fn fit_baseline(
 ///
 /// # Errors
 /// Returns a [`DriftScoreError`] when the fitted baseline does not match the
-/// selected method, the method profile is missing or mismatched, scoring fails,
-/// or the spec selects the out-of-phase External method.
+/// selected method, the method profile is missing or mismatched, or scoring
+/// fails.
 pub fn score_drift(
     baseline: &FittedBaseline,
     target: &arrow::record_batch::RecordBatch,
@@ -148,7 +137,6 @@ pub fn score_drift(
             };
             score_custom(target, profile)
         }
-        DriftMethod::External => Err(DriftScoreError::ExternalMethodNotInPhase),
     }
 }
 
@@ -156,8 +144,6 @@ fn signal_variant(signal: &DriftSignal) -> &'static str {
     match signal {
         DriftSignal::Distribution { .. } => "Distribution",
         DriftSignal::Metric { .. } => "Metric",
-        DriftSignal::EvalScore { .. } => "EvalScore",
-        DriftSignal::External { .. } => "External",
     }
 }
 
@@ -200,46 +186,24 @@ mod dispatch_errors {
         .expect("record batch")
     }
 
-    fn external_spec() -> DriftSpec {
-        DriftSpec::new(
-            DriftMethod::External,
-            DriftSignal::External {
-                source_ref: data_ref("source").into(),
+    /// Build an SPC + Metric spec without validation.
+    ///
+    /// Registration rejects this pair; the literal bypasses `DriftSpec::new`
+    /// to prove the fitter also refuses it rather than reinterpreting it.
+    fn spc_metric_unvalidated_spec() -> DriftSpec {
+        DriftSpec {
+            description: None,
+            method: DriftMethod::Spc,
+            signal: DriftSignal::Metric {
+                name: "latency".to_owned(),
             },
-            DriftCondition::Above { limit: 1.0 },
-            None,
-            None,
-            BTreeMap::new(),
-        )
-        .expect("valid external spec")
-    }
-
-    fn spc_eval_score_spec() -> DriftSpec {
-        // SPC + EvalScore passes spec-level validation (EvalScore is in the allowed
-        // set for SPC) but hits the SignalShapeMismatch arm in fit_baseline because
-        // fit_spc_baseline only handles Distribution and Metric signals.
-        DriftSpec::new(
-            DriftMethod::Spc,
-            DriftSignal::EvalScore {
-                eval_ref: CardRef {
-                    kind: CardKind::Eval,
-                    name: CardName::new("eval-card").expect("valid name"),
-                    version: VersionBlock::parse("1.0.0").expect("valid version"),
-                    space: Some(SpaceName::new("default").expect("valid space")),
-                    uid: None,
-                }
-                .into(),
-            },
-            DriftCondition::Statistical,
-            Some(DriftProfile::Spc(SpcProfile {
+            condition: DriftCondition::Statistical,
+            profile: Some(DriftProfile::Spc(SpcProfile {
                 sample_size: 0,
                 weco_rule: SpcWecoRule::default(),
                 alert_threshold: SpcAlertThreshold::Zone4,
             })),
-            None,
-            BTreeMap::new(),
-        )
-        .expect("valid spc+evalscore spec")
+        }
     }
 
     fn psi_spec() -> DriftSpec {
@@ -257,7 +221,6 @@ mod dispatch_errors {
                 threshold: PsiThreshold::Fixed { value: 0.25 },
             })),
             None,
-            BTreeMap::new(),
         )
         .expect("valid psi spec")
     }
@@ -272,31 +235,9 @@ mod dispatch_errors {
     }
 
     #[test]
-    fn fit_baseline_external_errors() {
-        let spec = external_spec();
-        let batch = empty_batch();
-        let err = fit_baseline(&batch, &spec).expect_err("should error");
-        assert!(
-            matches!(err, DriftFitError::ExternalMethodHasNoBaseline),
-            "unexpected error: {err:?}"
-        );
-    }
-
-    #[test]
-    fn score_drift_external_errors() {
-        let spec = external_spec();
-        let baseline = FittedBaseline::Custom;
-        let batch = empty_batch();
-        let err = score_drift(&baseline, &batch, &spec).expect_err("should error");
-        assert!(
-            matches!(err, DriftScoreError::ExternalMethodNotInPhase),
-            "unexpected error: {err:?}"
-        );
-    }
-
-    #[test]
+    /// SPC fitting refuses a Metric signal instead of fitting it as Custom.
     fn fit_baseline_signal_shape_mismatch() {
-        let spec = spc_eval_score_spec();
+        let spec = spc_metric_unvalidated_spec();
         let batch = empty_batch();
         let err = fit_baseline(&batch, &spec).expect_err("should error");
         assert!(
@@ -322,7 +263,6 @@ mod dispatch_errors {
 mod end_to_end {
     //! In-memory end-to-end tests for top-level drift dispatch.
 
-    use std::collections::BTreeMap;
     use std::error::Error;
     use std::sync::Arc;
 
@@ -376,7 +316,6 @@ mod end_to_end {
                 threshold: PsiThreshold::Fixed { value: 0.25 },
             })),
             None,
-            BTreeMap::new(),
         )?)
     }
 
@@ -390,20 +329,6 @@ mod end_to_end {
             DriftCondition::Statistical,
             Some(DriftProfile::Spc(spc_profile())),
             None,
-            BTreeMap::new(),
-        )?)
-    }
-
-    fn spc_metric_spec(name: &str) -> Result<DriftSpec, Box<dyn Error>> {
-        Ok(DriftSpec::new(
-            DriftMethod::Spc,
-            DriftSignal::Metric {
-                name: name.to_string(),
-            },
-            DriftCondition::Statistical,
-            Some(DriftProfile::Spc(spc_profile())),
-            None,
-            BTreeMap::new(),
         )?)
     }
 
@@ -420,7 +345,6 @@ mod end_to_end {
                 alert_threshold: 5.0,
             })),
             None,
-            BTreeMap::new(),
         )?)
     }
 
@@ -480,22 +404,6 @@ mod end_to_end {
         assert!(matches!(baseline, FittedBaseline::Spc(_)));
 
         let target = numeric_batch("latency", vec![100.0; 200])?;
-        let report = score_drift(&baseline, &target, &spec)?;
-
-        assert_report_shape(&report, DriftMethod::Spc, &feature, DriftVerdict::Drift);
-        Ok(())
-    }
-
-    #[test]
-    fn spc_metric_dispatch_scores_single_feature_report() -> Result<(), Box<dyn Error>> {
-        let feature = FeatureName::new("latency_ms")?;
-        let spec = spc_metric_spec(feature.as_str())?;
-        let baseline_values = (0..500).map(|idx| (f64::from(idx) * 0.01).sin()).collect();
-        let baseline_batch = numeric_batch(feature.as_str(), baseline_values)?;
-        let baseline = fit_baseline(&baseline_batch, &spec)?;
-        assert!(matches!(baseline, FittedBaseline::Spc(_)));
-
-        let target = numeric_batch(feature.as_str(), vec![100.0; 200])?;
         let report = score_drift(&baseline, &target, &spec)?;
 
         assert_report_shape(&report, DriftMethod::Spc, &feature, DriftVerdict::Drift);

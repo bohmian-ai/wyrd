@@ -1,10 +1,11 @@
 //! Thin napi projection of the Rust-owned `wyrd_client` capabilities:
-//! the shared client, Bifrost, Cards, and offline `WyrdState`.
+//! the shared client, Bifrost, Cards, Verification, and offline `WyrdState`.
 
 #![deny(missing_docs)]
 
 pub mod cards;
 pub mod client;
+pub mod verification;
 
 use std::result::Result as StdResult;
 use std::sync::{Arc, Mutex};

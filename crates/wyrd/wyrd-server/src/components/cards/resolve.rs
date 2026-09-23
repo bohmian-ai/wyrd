@@ -2,19 +2,37 @@
 
 use std::collections::{BTreeSet, HashMap};
 
+use wyrd_spec::card::operator::{OperatorAction, OperatorSpec};
+use wyrd_spec::card::trigger::{TriggerActivation, TriggerSpec};
+use wyrd_spec::card::verifier::{VerificationBinding, VerifierImplementation, VerifierSpec};
 use wyrd_spec::envelope::Spec;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::CardUid;
-use wyrd_spec::reference::{CardRef, CardRefIdentity};
+use wyrd_spec::reference::{CardRef, CardRefIdentity, InlineableRef, Ref};
 use wyrd_spec::refs::{ReferenceSlotVisitor, SlotValue};
 use wyrd_spec::registry::CardSubmission;
 use wyrd_sql::TenantConn;
-use wyrd_sql::queries::cards::select_card_uids_by_ref_batch;
+use wyrd_sql::queries::cards::{get_card_by_uid, select_card_uids_by_ref_batch};
+use wyrd_sql::queries::verification::BindingSchedule;
 
 /// Identity key used to look up a resolved external reference.
 pub type ResolvedRefs = Vec<(CardRef, CardUid)>;
 
 /// Resolve every external (non-sibling) `CardRef` to its `CardUid` under RLS.
+///
+/// Walks each submitted spec with the canonical [`ReferenceSlotVisitor`],
+/// rejects loader-only paths and siblings the request did not submit, batches
+/// the remaining identities into one RLS-scoped registry read, and then checks
+/// every verification binding against the effective specs those refs name. All
+/// of it runs before the caller opens its write transaction, so any refusal
+/// here persists nothing.
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_*_UNRESOLVED_PATH_REF` or
+/// `WYRD_REGISTRY_*_UNRESOLVED_DEPENDENCY` when a reference is a loader-only
+/// path, names an unsubmitted sibling, or has no Card in this tenant; the
+/// binding refusals listed on [`EffectiveSpecs::validate_bindings`]; and the
+/// underlying registry error when the batch read or a by-UID read fails.
 pub async fn resolve_card_references(
     conn: &mut TenantConn<'_>,
     submissions: &[CardSubmission],
@@ -44,7 +62,211 @@ pub async fn resolve_card_references(
         });
     }
 
-    Ok(resolved_refs)
+    let mut effective = EffectiveSpecs::new(submissions, resolved_refs)?;
+    effective.validate_bindings(conn, submissions).await?;
+    Ok(effective.resolved)
+}
+
+/// Reject a Trigger activation that cannot run the Verifier's implementation.
+///
+/// # Errors
+/// Returns `WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH` unless a drift
+/// Verifier runs on `schedule` or an eval Verifier runs on `observations_ready`.
+fn check_activation(
+    verifier: &VerifierSpec,
+    trigger: &TriggerSpec,
+    field: &str,
+) -> Result<(), WyrdError> {
+    let compatible = matches!(
+        (&verifier.implementation, &trigger.activation),
+        (
+            VerifierImplementation::Drift(_),
+            TriggerActivation::Schedule { .. }
+        ) | (
+            VerifierImplementation::Eval(_),
+            TriggerActivation::ObservationsReady {}
+        )
+    );
+    if compatible {
+        return Ok(());
+    }
+    Err(WyrdError::SpecTriggerActivationMismatch {
+        message: format!(
+            "{field}.runs_on cannot activate a {} Verifier",
+            verifier.implementation.kind_name()
+        ),
+        details: serde_json::json!({
+            "field": format!("{field}.runs_on"),
+            "implementation": verifier.implementation.kind_name(),
+        }),
+    })
+}
+
+/// Effective spec bodies for referenced binding targets, keyed by identity.
+///
+/// Owns the request's resolved external UIDs alongside the decoded bodies, so
+/// binding validation is one method on this handle rather than a call graph
+/// that re-threads the connection and the resolution table per lookup. Seeded
+/// with the request's own submissions, so a sibling ref never reads the
+/// registry; an external ref is loaded once by its resolved UID and cached.
+struct EffectiveSpecs {
+    /// Decoded spec per exact Card identity.
+    specs: HashMap<CardRefIdentity, Spec>,
+    /// External references this request already resolved to a `CardUid`.
+    resolved: ResolvedRefs,
+}
+
+impl EffectiveSpecs {
+    /// Decode every pinned submission into the identity cache.
+    ///
+    /// Submissions without a resolved space and version cannot be a sibling
+    /// target, so they are skipped rather than cached under a partial identity.
+    ///
+    /// # Errors
+    /// Returns `WYRD_REGISTRY_400_INVALID_CARD_SPEC` for an undecodable spec.
+    fn new(submissions: &[CardSubmission], resolved: ResolvedRefs) -> Result<Self, WyrdError> {
+        let mut specs = HashMap::new();
+        for submission in submissions {
+            let (Some(space), Some(version)) = (
+                &submission.metadata.space,
+                submission.metadata.resolved_pin(),
+            ) else {
+                continue;
+            };
+            let identity = CardRef {
+                kind: submission.kind.clone(),
+                name: submission.metadata.name.clone(),
+                version: version.clone(),
+                space: Some(space.clone()),
+                uid: None,
+            }
+            .identity_key();
+            let spec = Spec::from_kind_and_value(&submission.kind, submission.spec.clone())
+                .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?;
+            specs.insert(identity, spec);
+        }
+        Ok(Self { specs, resolved })
+    }
+
+    /// Check every submitted binding against the effective specs its refs name.
+    ///
+    /// Binding locations come from the single `Spec::binding_sites` owner, so
+    /// an inline-Agent binding was already refused by request validation and
+    /// only the three legal top-level locations reach here. Inline `runs_on`
+    /// and `on_failure` bodies are checked in place; referenced bodies come
+    /// from a sibling submission or this tenant's registry. This runs before
+    /// the write transaction, so a rejection persists nothing.
+    ///
+    /// # Errors
+    /// Returns `WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH` when the effective
+    /// Trigger cannot run the effective Verifier implementation,
+    /// `WYRD_REGISTRY_400_INVALID_CARD_SPEC` when a `schedule` Trigger cannot
+    /// be armed,
+    /// `WYRD_SPEC_400_UNSUPPORTED_OPERATOR_ACTION` when an effective
+    /// `on_failure` Operator uses the non-invocable `workflow` action, and
+    /// `WYRD_REGISTRY_400_INVALID_CARD_SPEC` for an undecodable submission.
+    /// Registry read failures propagate unchanged.
+    async fn validate_bindings(
+        &mut self,
+        conn: &mut TenantConn<'_>,
+        submissions: &[CardSubmission],
+    ) -> Result<(), WyrdError> {
+        for submission in submissions {
+            let spec = Spec::from_kind_and_value(&submission.kind, submission.spec.clone())
+                .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?;
+            for site in spec.binding_sites().iter().filter(|site| !site.nested) {
+                for (index, binding) in site.bindings.iter().enumerate() {
+                    let field = format!("{}[{index}]", site.field);
+                    self.validate_binding(conn, binding, &field).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Check one binding's effective Trigger pairing, schedule, and `on_failure` actions.
+    ///
+    /// A `schedule` Trigger must parse as a five-field cron in a known IANA
+    /// zone with a future occurrence, because the projected binding arms its
+    /// cursor from that schedule on the owner's first machine exchange.
+    ///
+    /// # Errors
+    /// Returns the activation-mismatch and unsupported-action refusals
+    /// documented on [`EffectiveSpecs::validate_bindings`],
+    /// `WYRD_REGISTRY_400_INVALID_CARD_SPEC` for an unarmable schedule, plus
+    /// any registry read failure raised while loading a referenced body.
+    async fn validate_binding(
+        &mut self,
+        conn: &mut TenantConn<'_>,
+        binding: &VerificationBinding,
+        field: &str,
+    ) -> Result<(), WyrdError> {
+        let verifier = self.load(conn, binding.verifier.as_card_ref()).await?;
+        let trigger = match &binding.runs_on {
+            InlineableRef::Inline(trigger) => Some(Spec::Trigger((**trigger).clone())),
+            reference => self.load(conn, reference.as_card_ref()).await?,
+        };
+        if let (Some(Spec::Verifier(verifier)), Some(Spec::Trigger(trigger))) =
+            (&verifier, &trigger)
+        {
+            check_activation(verifier, trigger, field)?;
+        }
+        if let Some(Spec::Trigger(TriggerSpec {
+            activation: TriggerActivation::Schedule { cron, tz },
+            ..
+        })) = &trigger
+        {
+            BindingSchedule::parse(cron, tz.as_deref())
+                .and_then(|schedule| schedule.next_after(chrono::Utc::now()))
+                .map_err(|error| {
+                    WyrdError::registry_invalid_card_spec(format!("{field}.runs_on: {error}"))
+                })?;
+        }
+        for (index, operator) in binding.on_failure.iter().enumerate() {
+            let operator = match operator {
+                InlineableRef::Inline(operator) => Some(Spec::Operator((**operator).clone())),
+                reference => self.load(conn, reference.as_card_ref()).await?,
+            };
+            if let Some(Spec::Operator(OperatorSpec {
+                action: OperatorAction::Workflow { .. },
+                ..
+            })) = operator
+            {
+                let field = format!("{field}.on_failure[{index}]");
+                return Err(WyrdError::SpecUnsupportedOperatorAction {
+                    message: format!("{field} uses the workflow action, which is not invocable"),
+                    details: serde_json::json!({ "field": field, "action": "workflow" }),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Return the effective spec a resolved ref names, loading it once if external.
+    ///
+    /// Returns `None` for an absent ref; unresolved refs were already rejected.
+    ///
+    /// # Errors
+    /// Returns the registry error from loading an external Card by UID.
+    async fn load(
+        &mut self,
+        conn: &mut TenantConn<'_>,
+        card_ref: Option<&CardRef>,
+    ) -> Result<Option<Spec>, WyrdError> {
+        let Some(card_ref) = card_ref else {
+            return Ok(None);
+        };
+        let identity = sibling_key(card_ref);
+        if let Some(spec) = self.specs.get(&identity) {
+            return Ok(Some(spec.clone()));
+        }
+        let Some(uid) = external_uid(card_ref, &self.resolved) else {
+            return Ok(None);
+        };
+        let row = get_card_by_uid(conn, &uid).await?;
+        self.specs.insert(identity, row.spec.clone());
+        Ok(Some(row.spec))
+    }
 }
 
 /// Collect the typed `CardRef` fields from one decoded spec.
@@ -53,17 +275,27 @@ fn collect_card_refs(spec: &Spec, output: &mut Vec<CardRef>) {
     let mut spec = spec.clone();
     ReferenceSlotVisitor::visit(&mut spec, |slot| match slot.value {
         SlotValue::Durable(reference) => {
-            if let wyrd_spec::reference::Ref::Ref(card_ref) = reference {
+            if let Ref::Ref(card_ref) = reference {
                 output.push(card_ref.clone());
             }
         }
         SlotValue::InlineablePrompt(reference) => {
-            if let wyrd_spec::reference::InlineableRef::Ref(card_ref) = reference {
+            if let InlineableRef::Ref(card_ref) = reference {
                 output.push(card_ref.clone());
             }
         }
         SlotValue::InlineableAgent(reference) => {
-            if let wyrd_spec::reference::InlineableRef::Ref(card_ref) = reference {
+            if let InlineableRef::Ref(card_ref) = reference {
+                output.push(card_ref.clone());
+            }
+        }
+        SlotValue::InlineableTrigger(reference) => {
+            if let InlineableRef::Ref(card_ref) = reference {
+                output.push(card_ref.clone());
+            }
+        }
+        SlotValue::InlineableOperator(reference) => {
+            if let InlineableRef::Ref(card_ref) = reference {
                 output.push(card_ref.clone());
             }
         }
@@ -84,39 +316,53 @@ fn validate_and_collect_refs(
         }
         match slot.value {
             SlotValue::Durable(reference) => match reference {
-                wyrd_spec::reference::Ref::Ref(card_ref) => output.push(card_ref.clone()),
-                wyrd_spec::reference::Ref::Sibling { sibling } => {
+                Ref::Ref(card_ref) => output.push(card_ref.clone()),
+                Ref::Sibling { sibling } => {
                     result = validate_sibling(sibling, siblings);
                 }
-                wyrd_spec::reference::Ref::Path(path) => {
+                Ref::Path(path) => {
                     result = Err(unresolved_path_error(path));
                 }
             },
-            SlotValue::InlineablePrompt(reference) => match reference {
-                wyrd_spec::reference::InlineableRef::Ref(card_ref) => output.push(card_ref.clone()),
-                wyrd_spec::reference::InlineableRef::Sibling { sibling } => {
-                    result = validate_sibling(sibling, siblings);
-                }
-                wyrd_spec::reference::InlineableRef::Path(path) => {
-                    result = Err(unresolved_path_error(path));
-                }
-                wyrd_spec::reference::InlineableRef::Inline(_) => {}
-            },
-            SlotValue::InlineableAgent(reference) => match reference {
-                wyrd_spec::reference::InlineableRef::Ref(card_ref) => {
-                    output.push(card_ref.clone());
-                }
-                wyrd_spec::reference::InlineableRef::Sibling { sibling } => {
-                    result = validate_sibling(sibling, siblings);
-                }
-                wyrd_spec::reference::InlineableRef::Path(path) => {
-                    result = Err(unresolved_path_error(path));
-                }
-                wyrd_spec::reference::InlineableRef::Inline(_) => {}
-            },
+            SlotValue::InlineablePrompt(reference) => {
+                result = collect_inline_ref(reference, siblings, output);
+            }
+            SlotValue::InlineableAgent(reference) => {
+                result = collect_inline_ref(reference, siblings, output);
+            }
+            SlotValue::InlineableTrigger(reference) => {
+                result = collect_inline_ref(reference, siblings, output);
+            }
+            SlotValue::InlineableOperator(reference) => {
+                result = collect_inline_ref(reference, siblings, output);
+            }
         }
     });
     result
+}
+
+/// Collect one inlineable slot's external ref, or validate its sibling target.
+///
+/// Inline bodies carry no separate identity; their nested refs are visited as
+/// their own slots by [`ReferenceSlotVisitor`].
+///
+/// # Errors
+/// Returns `WYRD_REGISTRY_*_UNRESOLVED_DEPENDENCY` for an unsubmitted sibling
+/// and `WYRD_REGISTRY_*_UNRESOLVED_PATH_REF` for a loader-only path.
+fn collect_inline_ref<T>(
+    reference: &InlineableRef<T>,
+    siblings: &BTreeSet<CardRefIdentity>,
+    output: &mut Vec<CardRef>,
+) -> Result<(), WyrdError> {
+    match reference {
+        InlineableRef::Ref(card_ref) => {
+            output.push(card_ref.clone());
+            Ok(())
+        }
+        InlineableRef::Sibling { sibling } => validate_sibling(sibling, siblings),
+        InlineableRef::Path(path) => Err(unresolved_path_error(path)),
+        InlineableRef::Inline(_) => Ok(()),
+    }
 }
 
 fn validate_sibling(
@@ -163,53 +409,59 @@ pub fn bind_card_references(
                 bind_inline_ref(reference, external, siblings)
             }
             SlotValue::InlineableAgent(reference) => bind_inline_ref(reference, external, siblings),
+            SlotValue::InlineableTrigger(reference) => {
+                bind_inline_ref(reference, external, siblings)
+            }
+            SlotValue::InlineableOperator(reference) => {
+                bind_inline_ref(reference, external, siblings)
+            }
         };
     });
     result
 }
 
 fn bind_ref(
-    reference: &mut wyrd_spec::reference::Ref,
+    reference: &mut Ref,
     external: &ResolvedRefs,
     siblings: &HashMap<CardRefIdentity, CardUid>,
 ) -> Result<(), WyrdError> {
     match reference {
-        wyrd_spec::reference::Ref::Ref(card_ref) => {
+        Ref::Ref(card_ref) => {
             card_ref.uid = external_uid(card_ref, external);
             require_uid(card_ref)
         }
-        wyrd_spec::reference::Ref::Sibling { sibling } => {
+        Ref::Sibling { sibling } => {
             let uid = siblings.get(&sibling_key(sibling)).cloned();
             let mut card_ref = sibling.clone();
             card_ref.uid = uid;
             require_uid(&card_ref)?;
-            *reference = wyrd_spec::reference::Ref::Ref(card_ref);
+            *reference = Ref::Ref(card_ref);
             Ok(())
         }
-        wyrd_spec::reference::Ref::Path(path) => Err(unresolved_path_error(path)),
+        Ref::Path(path) => Err(unresolved_path_error(path)),
     }
 }
 
 fn bind_inline_ref<T>(
-    reference: &mut wyrd_spec::reference::InlineableRef<T>,
+    reference: &mut InlineableRef<T>,
     external: &ResolvedRefs,
     siblings: &HashMap<CardRefIdentity, CardUid>,
 ) -> Result<(), WyrdError> {
     match reference {
-        wyrd_spec::reference::InlineableRef::Ref(card_ref) => {
+        InlineableRef::Ref(card_ref) => {
             card_ref.uid = external_uid(card_ref, external);
             require_uid(card_ref)
         }
-        wyrd_spec::reference::InlineableRef::Sibling { sibling } => {
+        InlineableRef::Sibling { sibling } => {
             let uid = siblings.get(&sibling_key(sibling)).cloned();
             let mut card_ref = sibling.clone();
             card_ref.uid = uid;
             require_uid(&card_ref)?;
-            *reference = wyrd_spec::reference::InlineableRef::Ref(card_ref);
+            *reference = InlineableRef::Ref(card_ref);
             Ok(())
         }
-        wyrd_spec::reference::InlineableRef::Inline(_) => Ok(()),
-        wyrd_spec::reference::InlineableRef::Path(path) => Err(unresolved_path_error(path)),
+        InlineableRef::Inline(_) => Ok(()),
+        InlineableRef::Path(path) => Err(unresolved_path_error(path)),
     }
 }
 

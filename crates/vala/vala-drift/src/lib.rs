@@ -1,4 +1,4 @@
-//! In-memory drift baseline fit and scoring for Wyrd's DriftCard primitive.
+//! In-memory drift baseline fit and scoring for Wyrd's drift Verifier implementation.
 //!
 //! This crate consumes Arrow `RecordBatch`es directly. Parquet I/O, DataCard
 //! resolution, persistence, scheduling, and HTTP wiring live in other crates.

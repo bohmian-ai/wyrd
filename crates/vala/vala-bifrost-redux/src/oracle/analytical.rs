@@ -6430,7 +6430,10 @@ mod tests {
 
         // The exceptional end: the task stops mid-lifecycle without running its
         // cleanup sequence, exactly as a panic would.
-        fixture.supervisor.abort_lifecycle_task_for_test(graph);
+        fixture
+            .supervisor
+            .abort_lifecycle_task_for_test(graph)
+            .await;
         drop(ownership);
         settle_lifecycle().await;
         assert_eq!(

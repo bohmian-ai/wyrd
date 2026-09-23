@@ -1793,6 +1793,14 @@ mod tests {
     /// Panics when the forced close, its terminal, or reconciliation fails.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_close_with_no_budget_left_aborts_and_awaits_its_loaders() {
+        /// How long close must stay outstanding to prove it gave up on the
+        /// blocked loader rather than observing a finished one. Any value
+        /// exceeds the handful of instructions between recording `Closing` and
+        /// polling the loader; it is a lower bound on close's progress, never a
+        /// wait for it, because a blocked worker makes early completion
+        /// impossible rather than merely unlikely.
+        const FORCED_CLOSE_EVIDENCE: Duration = Duration::from_millis(500);
+
         let tenant = DataTenantId::new_v7();
         let far = Instant::now() + Duration::from_hours(1);
         let forced_telemetry = Arc::new(BifrostStorageTelemetry::default());
@@ -1823,14 +1831,24 @@ mod tests {
             }
         });
         settled_to(&forced_telemetry, |snapshot| snapshot.load_starts() == 1).await;
-        let closing = tokio::spawn({
+        let mut closing = tokio::spawn({
             let cache = Arc::clone(&forced);
             async move { cache.close(Instant::now()).await }
         });
-        settled_to(&forced_telemetry, |snapshot| {
-            snapshot.lifecycle() != StorageLifecycle::Open
-        })
-        .await;
+        // The release must land after close has polled this loader and given
+        // up on it, or close observes an already-finished load and correctly
+        // reports clean. `Closing` is recorded by `begin_close`, before that
+        // poll, so waiting on the lifecycle races the very thing under test.
+        // A close that cannot complete is the evidence instead: the loader
+        // holds its worker in a synchronous `recv`, so close is necessarily
+        // parked in the abort-await it performs after giving up, and only the
+        // release below can let it finish.
+        assert!(
+            tokio::time::timeout(FORCED_CLOSE_EVIDENCE, &mut closing)
+                .await
+                .is_err(),
+            "a close cannot settle while a loader still holds its worker"
+        );
         let _ = release.send(());
         assert!(
             !closing.await.expect("the forced closer completes"),

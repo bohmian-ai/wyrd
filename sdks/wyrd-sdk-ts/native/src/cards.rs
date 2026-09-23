@@ -10,11 +10,13 @@ use std::result::Result as StdResult;
 use napi::Result;
 use napi_derive::napi;
 use wyrd_client::cards::{CardGraphHydrator, CardSelector, Cards, HydrationMode, ListCardsRequest};
+use wyrd_client::observe::eval::parse_session_id;
+use wyrd_client::observe::{EvalObservationOptions, Run};
 use wyrd_client::state::WyrdState;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::{CardRef, CardRefParseError};
 
-use crate::{NativeLifecycleResult, NativeWyrdError};
+use crate::{NativeLifecycleResult, NativeTableConfig, NativeWyrdError};
 
 /// Tenant-scoped Card registry handle over the shared `wyrd_client` Cards.
 #[napi]
@@ -253,6 +255,91 @@ impl NativeWyrdState {
         drop(alias);
         result
     }
+
+    /// Connects this state's one Bifrost writer and describes the fixed tables.
+    ///
+    /// The transport arguments are `connectBifrost`'s and resolve through the
+    /// same chain when omitted. Startup describes both fixed observation tables
+    /// before succeeding, so a run can never enqueue against a missing,
+    /// unauthorized, or incompatible system table.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when `table` is not one serialized `TableConfig`;
+    /// a second start, a closed state, and credential, dial, and fixed-table
+    /// failures are returned in [`NativeLifecycleResult`].
+    // justification: napi boundary; generated object and string arguments arrive owned
+    #[allow(clippy::needless_pass_by_value)]
+    #[napi]
+    pub async fn start_bifrost(
+        &self,
+        table: Option<NativeTableConfig>,
+        server_url: Option<String>,
+        credential: Option<String>,
+        grpc_url: Option<String>,
+    ) -> Result<NativeLifecycleResult> {
+        let state = match &self.state {
+            Ok(state) => state,
+            Err(error) => return Ok(NativeLifecycleResult::from_wyrd(error)),
+        };
+        let table = table.map(|table| table.parse()).transpose()?;
+        let client = match wyrd_client::bifrost::client_from_options(
+            server_url.as_deref(),
+            credential.as_deref(),
+            grpc_url.as_deref(),
+        ) {
+            Ok(client) => client,
+            Err(error) => {
+                return Ok(NativeLifecycleResult::from_wyrd(&WyrdError::from(&error)));
+            }
+        };
+        NativeLifecycleResult::outcome(Box::pin(state.start_bifrost_with(&client, table)).await)
+    }
+
+    /// Opens one invocation over this state, targeting the root Service Card.
+    ///
+    /// Local only: no network IO, no server-side Run resource, and no Verifier
+    /// execution.
+    #[napi]
+    pub fn run(&self) -> NativeRunOpen {
+        NativeRunOpen::outcome(match &self.state {
+            Ok(state) => Ok(state.run()),
+            Err(error) => Err(error.clone()),
+        })
+    }
+
+    /// Drains every producer of this state's writer without closing it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the outcome cannot be projected; the
+    /// lifecycle refusals and the first producer or sink failure are returned in
+    /// [`NativeLifecycleResult`].
+    #[napi]
+    pub async fn flush(&self) -> Result<NativeLifecycleResult> {
+        match &self.state {
+            Ok(state) => NativeLifecycleResult::outcome(Box::pin(state.flush()).await),
+            Err(error) => Ok(NativeLifecycleResult::from_wyrd(error)),
+        }
+    }
+
+    /// Drains every producer of this state's writer and closes it to writes.
+    ///
+    /// Graceful shutdown is the durability barrier: queue admission is not a
+    /// Scribe acknowledgement. After an ambiguous failure, retry `shutdown` on
+    /// the same state rather than replacing the writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the outcome cannot be projected; the first
+    /// producer or sink failure is returned in [`NativeLifecycleResult`].
+    #[napi]
+    pub async fn shutdown(&self) -> Result<NativeLifecycleResult> {
+        match &self.state {
+            Ok(state) => NativeLifecycleResult::outcome(Box::pin(state.shutdown()).await),
+            Err(error) => Ok(NativeLifecycleResult::from_wyrd(error)),
+        }
+    }
 }
 
 impl NativeWyrdState {
@@ -290,4 +377,143 @@ fn parse_card_ref(value: &str) -> StdResult<CardRef, WyrdError> {
         message,
         details: serde_json::json!({ "field": "card_ref" }),
     })
+}
+
+/// Closed result of opening one scoped run: a run handle or a catalog error.
+///
+/// Opening cannot be projected through [`NativeLifecycleResult`] because the run
+/// is a native class rather than a serializable value, so it follows the same
+/// handle-or-error shape as [`NativeCardsConnection`].
+#[napi(object, object_from_js = false)]
+pub struct NativeRunOpen {
+    /// The scoped run when the bundle and alias resolved.
+    pub run: Option<NativeRun>,
+    /// The stable failure that rejected the bundle or the alias.
+    pub error: Option<NativeWyrdError>,
+}
+
+impl NativeRunOpen {
+    /// Project one native open outcome into the closed napi result.
+    fn outcome(result: StdResult<Run, WyrdError>) -> Self {
+        match result {
+            Ok(run) => Self {
+                run: Some(NativeRun { run }),
+                error: None,
+            },
+            Err(error) => Self {
+                run: None,
+                error: Some(NativeWyrdError::from_wyrd(&error)),
+            },
+        }
+    }
+}
+
+/// One invocation, or one Card-scoped view of it, over the shared `Run`.
+///
+/// Every emit delegates to `wyrd_client::observe`; this wrapper only carries
+/// Node strings across the boundary so the three SDKs share one projection.
+#[napi]
+pub struct NativeRun {
+    /// The native view whose subject and invocation every emit correlates to.
+    run: Run,
+}
+
+#[napi]
+impl NativeRun {
+    /// The `UUIDv7` invocation identity this run and every view of it shares.
+    #[napi(getter)]
+    pub fn run_id(&self) -> String {
+        self.run.run_id().as_str().to_owned()
+    }
+
+    /// The exact Card reference this view observes.
+    #[napi(getter)]
+    pub fn card_ref(&self) -> String {
+        self.run.card_ref().to_string()
+    }
+
+    /// An immutable sibling view scoped to a registered alias.
+    // justification: napi boundary; a JavaScript string is primitive and cannot
+    // be passed by reference, so the generated binding requires an owned String
+    #[allow(clippy::needless_pass_by_value)]
+    #[napi]
+    pub fn for_card(&self, alias: String) -> NativeRunOpen {
+        NativeRunOpen::outcome(self.run.for_card(&alias))
+    }
+
+    /// Emits one Drift observation from its JSON feature object.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the outcome cannot be projected; a
+    /// malformed feature map, the lifecycle refusals, and queue saturation are
+    /// returned in [`NativeLifecycleResult`].
+    // justification: napi boundary; JavaScript strings arrive owned
+    #[allow(clippy::needless_pass_by_value)]
+    #[napi]
+    pub fn drift(
+        &self,
+        features_json: String,
+        session_id: Option<String>,
+    ) -> Result<NativeLifecycleResult> {
+        let session = match parse_session_id(session_id.as_deref()) {
+            Ok(session) => session,
+            Err(error) => return Ok(NativeLifecycleResult::from_wyrd(&error)),
+        };
+        NativeLifecycleResult::outcome(self.run.observe().drift_json(&features_json, session))
+    }
+
+    /// Emits one Eval observation from its JSON context and options.
+    ///
+    /// `media_json` is one JSON array of media descriptors; `trace_id` and
+    /// `span_id` are lower-case hex and fall back to the active span when both
+    /// are omitted.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the outcome cannot be projected; malformed
+    /// identifiers, a span without its trace, the lifecycle refusals, and queue
+    /// saturation are returned in [`NativeLifecycleResult`].
+    // justification: napi boundary; JavaScript strings arrive owned
+    #[allow(clippy::needless_pass_by_value)]
+    #[napi]
+    pub fn eval(
+        &self,
+        context_json: String,
+        session_id: Option<String>,
+        media_json: Option<String>,
+        trace_id: Option<String>,
+        span_id: Option<String>,
+    ) -> Result<NativeLifecycleResult> {
+        let options = EvalObservationOptions::from_parts(
+            session_id.as_deref(),
+            media_json.as_deref(),
+            trace_id.as_deref(),
+            span_id.as_deref(),
+        );
+        let options = match options {
+            Ok(options) => options,
+            Err(error) => return Ok(NativeLifecycleResult::from_wyrd(&error)),
+        };
+        NativeLifecycleResult::outcome(self.run.observe().eval_json(&context_json, options))
+    }
+
+    /// Emits one row into a registered `vala.datasets` table.
+    ///
+    /// Asynchronous because the first call for a table describes it; later calls
+    /// reuse the cached schema and producer.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the outcome cannot be projected; a
+    /// reserved, unknown, or unauthorized table and the lifecycle refusals are
+    /// returned in [`NativeLifecycleResult`].
+    // justification: napi boundary; JavaScript strings arrive owned
+    #[allow(clippy::needless_pass_by_value)]
+    #[napi]
+    pub async fn record(&self, table: String, row_json: String) -> Result<NativeLifecycleResult> {
+        NativeLifecycleResult::outcome(
+            Box::pin(self.run.observe().record_json(&table, &row_json)).await,
+        )
+    }
 }

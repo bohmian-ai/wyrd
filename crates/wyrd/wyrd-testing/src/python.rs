@@ -83,6 +83,11 @@ pub struct WyrdTestServer {
     // Retained from the Python constructor signature; teardown wiring is not yet read here.
     cleanup: bool,
     mutate_env: bool,
+    /// Whether the server's audit publisher retires staged audit rows.
+    ///
+    /// Off for a journey that counts staged decisions, such as
+    /// [`WyrdTestServer::table_describe_count`], so the count cannot shrink.
+    audit_publication: bool,
     base_url: Option<String>,
     api_key: Option<String>,
     tenant_id: Option<String>,
@@ -93,11 +98,12 @@ pub struct WyrdTestServer {
 #[pymethods]
 impl WyrdTestServer {
     #[new]
-    #[pyo3(signature = (cleanup = true, mutate_env = true))]
-    fn __new__(cleanup: bool, mutate_env: bool) -> Self {
+    #[pyo3(signature = (cleanup = true, mutate_env = true, audit_publication = true))]
+    fn __new__(cleanup: bool, mutate_env: bool, audit_publication: bool) -> Self {
         Self {
             cleanup,
             mutate_env,
+            audit_publication,
             base_url: None,
             api_key: None,
             tenant_id: None,
@@ -114,6 +120,7 @@ impl WyrdTestServer {
     /// environment setup cannot complete.
     fn __enter__(mut slf: PyRefMut<'_, Self>) -> WyrdPyResult<PyRefMut<'_, Self>> {
         let mutate_env = slf.mutate_env;
+        let audit_publication = slf.audit_publication;
 
         let result: Result<
             (
@@ -125,7 +132,14 @@ impl WyrdTestServer {
             ),
             wyrd_spec::error::WyrdError,
         > = wyrd_runtime::runtime().block_on(async {
-            let srv = crate::server::WyrdTestServer::start_bound()
+            let builder = crate::server::WyrdTestServer::builder();
+            let builder = if audit_publication {
+                builder
+            } else {
+                builder.without_audit_publication_for_test()
+            };
+            let srv = builder
+                .start_bound()
                 .await
                 .map_err(wyrd_spec::error::WyrdError::from)?;
             let base_url = srv.base_url().unwrap_or("").to_owned();
@@ -254,6 +268,46 @@ impl WyrdTestServer {
             }
             crate::server::Bootstrap::User { .. } => Err(WyrdPyError::from(harness_error(
                 "expected Machine bootstrap from bootstrap_service",
+            ))),
+        }
+    }
+
+    /// Issue an API key for the principal a registered Service Card projects.
+    ///
+    /// Wraps [`crate::server::WyrdTestServer::credential_registered_service`].
+    /// `card_ref` is the canonical `space/Kind/name@version` identity string a
+    /// registration receipt returns; the Card must already be registered, since
+    /// this credentials the service account registration projected for it
+    /// rather than minting a new one. A scoped-observation journey needs this
+    /// key: only a writer carrying the registered Service's card-ref scope may
+    /// stamp a component Card as an observation subject.
+    ///
+    /// # Errors
+    ///
+    /// Raises a Wyrd Python error when the context manager is inactive, the
+    /// identity string is malformed, or the Card has no projected principal.
+    fn credential_registered_service(
+        &self,
+        card_ref: &str,
+        roles: Vec<String>,
+    ) -> WyrdPyResult<String> {
+        let srv = self.server.as_ref().ok_or_else(not_started)?;
+        let parsed: wyrd_spec::reference::CardRef = card_ref.parse().map_err(|error| {
+            WyrdPyError::from(harness_error(format!(
+                "`{card_ref}` is not a card identity string: {error}"
+            )))
+        })?;
+        let roles: Vec<&str> = roles.iter().map(String::as_str).collect();
+        let bootstrap = wyrd_runtime::runtime()
+            .block_on(srv.credential_registered_service(&parsed, &roles))
+            .map_err(wyrd_spec::error::WyrdError::from)
+            .map_err(WyrdPyError::from)?;
+        match bootstrap {
+            crate::server::Bootstrap::Machine { api_key, .. } => {
+                Ok(api_key.expose_secret().to_owned())
+            }
+            crate::server::Bootstrap::User { .. } => Err(WyrdPyError::from(harness_error(
+                "expected Machine bootstrap from credential_registered_service",
             ))),
         }
     }
@@ -505,6 +559,48 @@ impl WyrdTestServer {
         let server = self.server.as_ref().ok_or_else(not_started)?;
         wyrd_runtime::runtime()
             .block_on(server.query_denied_token())
+            .map_err(WyrdPyError::from)
+    }
+
+    /// Return the server-observed describe count for `fqn` in the fixture tenant.
+    ///
+    /// Construct the server with `audit_publication=False`, or the publisher
+    /// retires the staged decisions this counts.
+    ///
+    /// # Errors
+    ///
+    /// Raises a Wyrd error when the context manager is inactive or the audit
+    /// query fails.
+    fn table_describe_count(&self, fqn: &str) -> WyrdPyResult<i64> {
+        let server = self.server.as_ref().ok_or_else(not_started)?;
+        wyrd_runtime::runtime()
+            .block_on(server.table_describe_count(fqn))
+            .map_err(WyrdPyError::from)
+    }
+
+    /// Make every fixture-tenant describe of `fqn` fail until restored.
+    ///
+    /// # Errors
+    ///
+    /// Raises a Wyrd error when the context manager is inactive, `fqn` is not a
+    /// plain table name, or the fault cannot be installed.
+    fn fail_table_describe(&self, fqn: &str) -> WyrdPyResult<()> {
+        let server = self.server.as_ref().ok_or_else(not_started)?;
+        wyrd_runtime::runtime()
+            .block_on(server.fail_table_describe(fqn))
+            .map_err(WyrdPyError::from)
+    }
+
+    /// Remove the fault `fail_table_describe` installed, if any.
+    ///
+    /// # Errors
+    ///
+    /// Raises a Wyrd error when the context manager is inactive or the fault
+    /// cannot be removed.
+    fn restore_table_describe(&self) -> WyrdPyResult<()> {
+        let server = self.server.as_ref().ok_or_else(not_started)?;
+        wyrd_runtime::runtime()
+            .block_on(server.restore_table_describe())
             .map_err(WyrdPyError::from)
     }
 

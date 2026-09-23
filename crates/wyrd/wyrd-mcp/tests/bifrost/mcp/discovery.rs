@@ -21,13 +21,18 @@ mod pg_tests {
     use wyrd_testing::bifrost::seed_query_fixture;
 
     /// The exact catalog an ordinary Wyrd server advertises over `/mcp` to a
-    /// caller that also holds tenant principal administration.
-    const ADVERTISED_TOOLS: [&str; 5] = [
+    /// caller that also holds tenant principal administration and `evals:run`:
+    /// every read tool, then that caller's write tools.
+    const ADVERTISED_TOOLS: [&str; 9] = [
         "bifrost.list_tables",
         "bifrost.describe_table",
         "bifrost.query",
         "principals.list_credentials",
+        "cards.get",
+        "verification.get_binding",
+        "verification.get_run",
         "principals.revoke_credential",
+        "verification.start_run",
     ];
 
     /// An agent sees exactly the shipped catalog, only its own tenant's tables,
@@ -87,8 +92,8 @@ mod pg_tests {
             .collect();
         assert_eq!(
             names, ADVERTISED_TOOLS,
-            "an ordinary server advertises exactly the three Bifrost read tools, the \
-             principal credential listing, this admin caller's revocation, and no test probe"
+            "an ordinary server advertises exactly the Bifrost, principal, Card, and \
+             verification read tools, this admin caller's write tools, and no test probe"
         );
 
         let listed = structured(

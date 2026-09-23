@@ -15,16 +15,17 @@ use crate::card::mcp::McpSpec;
 use crate::card::model::ModelSpec;
 use crate::card::operator::{OperatorAction, OperatorSpec};
 use crate::card::service::ServiceSpec;
-use crate::card::trigger::{TriggerSource, TriggerSpec};
+use crate::card::trigger::TriggerSpec;
+use crate::card::verifier::{VerificationBinding, VerifierImplementation, VerifierSpec};
 use crate::card::workflow::{WorkflowAction, WorkflowSpec};
 use crate::envelope::Spec;
-use crate::reference::{InlineableRef, Ref};
+use crate::reference::{CardRef, InlineableRef, Ref};
 use crate::vala::eval::EvalTask;
 use skald_spec::Prompt;
 
 /// A yielded reference slot with metadata about its kind and a mutable handle.
 pub struct SlotEntry<'a> {
-    /// The path to this slot in dot notation (e.g. `spec.publishes_to[0]`).
+    /// The path to this slot in dot notation (e.g. `spec.verified_by[0].verifier`).
     pub path: String,
     /// The slot value yielded for inspection or mutation.
     pub value: SlotValue<'a>,
@@ -38,6 +39,90 @@ pub enum SlotValue<'a> {
     InlineablePrompt(&'a mut InlineableRef<Prompt>),
     /// An inlineable Agent spec slot.
     InlineableAgent(&'a mut InlineableRef<AgentSpec>),
+    /// An inlineable Trigger spec slot (`verified_by[..].runs_on`).
+    InlineableTrigger(&'a mut InlineableRef<TriggerSpec>),
+    /// An inlineable Operator spec slot (`verified_by[..].on_failure[..]`).
+    InlineableOperator(&'a mut InlineableRef<OperatorSpec>),
+}
+
+impl SlotValue<'_> {
+    /// Return the resolved [`CardRef`] this slot carries.
+    ///
+    /// Returns `None` for an unresolved `Path` and for an inline body, which
+    /// has no separate Card identity.
+    #[must_use]
+    pub fn as_card_ref(&self) -> Option<&CardRef> {
+        match self {
+            Self::Durable(reference) => reference.as_card_ref(),
+            Self::InlineablePrompt(reference) => reference.as_card_ref(),
+            Self::InlineableAgent(reference) => reference.as_card_ref(),
+            Self::InlineableTrigger(reference) => reference.as_card_ref(),
+            Self::InlineableOperator(reference) => reference.as_card_ref(),
+        }
+    }
+
+    /// Return the exact identity when this slot holds a loader-projected sibling.
+    #[must_use]
+    pub fn as_sibling(&self) -> Option<&CardRef> {
+        match self {
+            Self::Durable(reference) => reference.as_sibling(),
+            Self::InlineablePrompt(reference) => reference.as_sibling(),
+            Self::InlineableAgent(reference) => reference.as_sibling(),
+            Self::InlineableTrigger(reference) => reference.as_sibling(),
+            Self::InlineableOperator(reference) => reference.as_sibling(),
+        }
+    }
+
+    /// Mutable variant of [`SlotValue::as_card_ref`].
+    #[must_use]
+    pub fn as_card_ref_mut(&mut self) -> Option<&mut CardRef> {
+        match self {
+            Self::Durable(reference) => reference.as_card_ref_mut(),
+            Self::InlineablePrompt(reference) => reference.as_card_ref_mut(),
+            Self::InlineableAgent(reference) => reference.as_card_ref_mut(),
+            Self::InlineableTrigger(reference) => reference.as_card_ref_mut(),
+            Self::InlineableOperator(reference) => reference.as_card_ref_mut(),
+        }
+    }
+
+    /// Rewrite this slot from an authored path to a loader-projected sibling.
+    ///
+    /// Each slot shape keeps its own sibling form, so the loader does not need
+    /// to know which concrete reference type it is holding. Slots that are not
+    /// currently a `Path` are left untouched.
+    pub fn resolve_path_to_sibling(&mut self, sibling: CardRef) {
+        match self {
+            Self::Durable(reference) => {
+                if matches!(reference, Ref::Path(_)) {
+                    **reference = Ref::Sibling { sibling };
+                }
+            }
+            Self::InlineablePrompt(reference) => set_inlineable_sibling(reference, sibling),
+            Self::InlineableAgent(reference) => set_inlineable_sibling(reference, sibling),
+            Self::InlineableTrigger(reference) => set_inlineable_sibling(reference, sibling),
+            Self::InlineableOperator(reference) => set_inlineable_sibling(reference, sibling),
+        }
+    }
+
+    /// Return the authored local path when this slot is still unresolved.
+    #[must_use]
+    pub fn as_path(&self) -> Option<&std::path::Path> {
+        match self {
+            Self::Durable(Ref::Path(path)) => Some(path),
+            Self::InlineablePrompt(InlineableRef::Path(path))
+            | Self::InlineableAgent(InlineableRef::Path(path))
+            | Self::InlineableTrigger(InlineableRef::Path(path))
+            | Self::InlineableOperator(InlineableRef::Path(path)) => Some(path),
+            _ => None,
+        }
+    }
+}
+
+/// Replace one inlineable slot's authored path with its sibling projection.
+fn set_inlineable_sibling<T>(reference: &mut InlineableRef<T>, sibling: CardRef) {
+    if matches!(reference, InlineableRef::Path(_)) {
+        *reference = InlineableRef::Sibling { sibling };
+    }
 }
 
 /// Canonical visitor that yields every reference slot on a `Spec`.
@@ -59,14 +144,13 @@ impl ReferenceSlotVisitor {
             Spec::Prompt(_) => {}
             Spec::Agent(agent) => agent.visit(&mut f),
             Spec::Workflow(workflow) => workflow.visit(&mut f),
-            Spec::Eval(eval) => eval.visit(&mut f),
-            Spec::Drift(drift) => drift.visit(&mut f),
+            Spec::Verifier(verifier) => verifier.visit(&mut f),
             Spec::Service(service) => service.visit(&mut f),
             Spec::Policy(_) => {}
             Spec::Mcp(mcp) => mcp.visit(&mut f),
             Spec::Audit(audit) => audit.visit(&mut f),
             Spec::Artifact(artifact) => artifact.visit(&mut f),
-            Spec::Trigger(trigger) => trigger.visit(&mut f),
+            Spec::Trigger(_) => {}
             Spec::Operator(operator) => operator.visit(&mut f),
             Spec::Source(_) => {}
         }
@@ -225,20 +309,34 @@ impl Visit for WorkflowSpec {
 }
 
 impl Visit for EvalSpec {
+    /// Visit the dataset reference and every LLM-judge Agent slot.
     fn visit<F>(&mut self, f: &mut F)
+    where
+        F: FnMut(SlotEntry<'_>),
+    {
+        self.visit_at("spec.implementation.spec", f);
+    }
+}
+
+impl EvalSpec {
+    /// Visit this Eval payload's reference slots under an explicit path prefix.
+    ///
+    /// The payload is only reachable inside a Verifier implementation, so the
+    /// prefix names that enclosing slot rather than a bare `spec`.
+    fn visit_at<F>(&mut self, prefix: &str, f: &mut F)
     where
         F: FnMut(SlotEntry<'_>),
     {
         if let Some(dataset_ref) = &mut self.dataset {
             f(SlotEntry {
-                path: "spec.dataset".to_owned(),
+                path: format!("{prefix}.dataset"),
                 value: SlotValue::Durable(&mut dataset_ref.0),
             });
         }
 
         for (task_id, task) in self.tasks.iter_mut() {
             if let EvalTask::LlmJudge(llm_judge_task) = task {
-                let path = format!("spec.tasks[{}].LlmJudge.judge_ref", task_id.as_str());
+                let path = format!("{prefix}.tasks[{}].LlmJudge.judge_ref", task_id.as_str());
                 f(SlotEntry {
                     path: path.clone(),
                     value: SlotValue::InlineableAgent(&mut llm_judge_task.judge_ref),
@@ -252,27 +350,29 @@ impl Visit for EvalSpec {
 }
 
 impl Visit for DriftSpec {
+    /// Visit the baseline Data reference carried by a `Distribution` signal.
     fn visit<F>(&mut self, f: &mut F)
+    where
+        F: FnMut(SlotEntry<'_>),
+    {
+        self.visit_at("spec.implementation.spec", f);
+    }
+}
+
+impl DriftSpec {
+    /// Visit this Drift payload's reference slots under an explicit path prefix.
+    ///
+    /// The payload is only reachable inside a Verifier implementation, so the
+    /// prefix names that enclosing slot rather than a bare `spec`.
+    fn visit_at<F>(&mut self, prefix: &str, f: &mut F)
     where
         F: FnMut(SlotEntry<'_>),
     {
         match &mut self.signal {
             DriftSignal::Distribution { baseline_ref, .. } => {
                 f(SlotEntry {
-                    path: "spec.signal.Distribution.baseline_ref".to_owned(),
+                    path: format!("{prefix}.signal.Distribution.baseline_ref"),
                     value: SlotValue::Durable(baseline_ref),
-                });
-            }
-            DriftSignal::EvalScore { eval_ref } => {
-                f(SlotEntry {
-                    path: "spec.signal.EvalScore.eval_ref".to_owned(),
-                    value: SlotValue::Durable(eval_ref),
-                });
-            }
-            DriftSignal::External { source_ref } => {
-                f(SlotEntry {
-                    path: "spec.signal.External.source_ref".to_owned(),
-                    value: SlotValue::Durable(source_ref),
                 });
             }
             DriftSignal::Metric { .. } => {}
@@ -280,8 +380,25 @@ impl Visit for DriftSpec {
     }
 }
 
+impl Visit for VerifierSpec {
+    /// Visit the reference slots owned by this Verifier's one implementation.
+    fn visit<F>(&mut self, f: &mut F)
+    where
+        F: FnMut(SlotEntry<'_>),
+    {
+        match &mut self.implementation {
+            VerifierImplementation::Drift(drift) => {
+                drift.visit_at("spec.implementation.spec", f);
+            }
+            VerifierImplementation::Eval(eval) => {
+                eval.visit_at("spec.implementation.spec", f);
+            }
+        }
+    }
+}
+
 impl Visit for ServiceSpec {
-    /// Visit component identities, component publication bindings, and Service publications.
+    /// Visit component identities, component verification bindings, and Service bindings.
     fn visit<F>(&mut self, f: &mut F)
     where
         F: FnMut(SlotEntry<'_>),
@@ -291,13 +408,13 @@ impl Visit for ServiceSpec {
                 path: format!("spec.components[{i}].ref"),
                 value: SlotValue::Durable(&mut component.card_ref),
             });
-            visit_publishes_to(
-                &mut component.publishes_to,
-                &format!("spec.components[{i}].publishes_to"),
+            visit_verified_by(
+                &mut component.verified_by,
+                &format!("spec.components[{i}].verified_by"),
                 f,
             );
         }
-        visit_publishes_to(&mut self.publishes_to, "spec.publishes_to", f);
+        visit_verified_by(&mut self.verified_by, "spec.verified_by", f);
     }
 }
 
@@ -355,66 +472,62 @@ impl Visit for ArtifactSpec {
     }
 }
 
-impl Visit for TriggerSpec {
+impl Visit for OperatorSpec {
+    /// Visit the Workflow reference carried by a `workflow` action.
     fn visit<F>(&mut self, f: &mut F)
     where
         F: FnMut(SlotEntry<'_>),
     {
-        f(SlotEntry {
-            path: "spec.operator_ref".to_owned(),
-            value: SlotValue::Durable(&mut self.operator_ref),
-        });
-
-        match &mut self.source {
-            Some(TriggerSource::DriftObservation {
-                drift_ref,
-                subject_filter,
-            }) => {
-                f(SlotEntry {
-                    path: "spec.source.drift_observation.drift_ref".to_owned(),
-                    value: SlotValue::Durable(drift_ref),
-                });
-                visit_subject_filter(subject_filter, f);
-            }
-            Some(TriggerSource::EvalObservation {
-                eval_ref,
-                subject_filter,
-            }) => {
-                f(SlotEntry {
-                    path: "spec.source.eval_observation.eval_ref".to_owned(),
-                    value: SlotValue::Durable(eval_ref),
-                });
-                visit_subject_filter(subject_filter, f);
-            }
-            None => {}
-        }
+        self.visit_at("spec", f);
     }
 }
 
-impl Visit for OperatorSpec {
-    fn visit<F>(&mut self, f: &mut F)
+impl OperatorSpec {
+    /// Visit this Operator's reference slots under an explicit path prefix.
+    ///
+    /// The same body is reachable as a Card `spec` and as an inline
+    /// `on_failure` mapping, so the prefix names whichever slot holds it.
+    fn visit_at<F>(&mut self, prefix: &str, f: &mut F)
     where
         F: FnMut(SlotEntry<'_>),
     {
         if let OperatorAction::Workflow { workflow_ref } = &mut self.action {
             f(SlotEntry {
-                path: "spec.action.workflow_ref".to_owned(),
+                path: format!("{prefix}.workflow_ref"),
                 value: SlotValue::Durable(workflow_ref),
             });
         }
     }
 }
 
-/// Visit one publication list using the exact owning field path.
-fn visit_publishes_to<F>(publishes_to: &mut [Ref], path: &str, f: &mut F)
+/// Visit one verification-binding list using the exact owning field path.
+///
+/// Each binding yields its Verifier reference, its `runs_on` Trigger slot, and
+/// every `on_failure` Operator slot, plus the references nested inside any
+/// inline Operator body. Inline Triggers carry no references of their own.
+fn visit_verified_by<F>(bindings: &mut [VerificationBinding], path: &str, f: &mut F)
 where
     F: FnMut(SlotEntry<'_>),
 {
-    for (index, card_ref) in publishes_to.iter_mut().enumerate() {
+    for (index, binding) in bindings.iter_mut().enumerate() {
         f(SlotEntry {
-            path: format!("{path}[{index}]"),
-            value: SlotValue::Durable(card_ref),
+            path: format!("{path}[{index}].verifier"),
+            value: SlotValue::Durable(&mut binding.verifier),
         });
+        f(SlotEntry {
+            path: format!("{path}[{index}].runs_on"),
+            value: SlotValue::InlineableTrigger(&mut binding.runs_on),
+        });
+        for (operator_index, operator) in binding.on_failure.iter_mut().enumerate() {
+            let operator_path = format!("{path}[{index}].on_failure[{operator_index}]");
+            if let InlineableRef::Inline(inline) = operator {
+                inline.visit_at(&operator_path, f);
+            }
+            f(SlotEntry {
+                path: operator_path,
+                value: SlotValue::InlineableOperator(operator),
+            });
+        }
     }
 }
 
@@ -426,24 +539,7 @@ where
         path: format!("{prefix}.prompt"),
         value: SlotValue::InlineablePrompt(&mut agent.prompt),
     });
-    for (index, card_ref) in agent.publishes_to.iter_mut().enumerate() {
-        f(SlotEntry {
-            path: format!("{prefix}.publishes_to[{index}]"),
-            value: SlotValue::Durable(card_ref),
-        });
-    }
-}
-
-fn visit_subject_filter<F>(subject_filter: &mut Option<Ref>, f: &mut F)
-where
-    F: FnMut(SlotEntry<'_>),
-{
-    if let Some(subject_filter) = subject_filter {
-        f(SlotEntry {
-            path: "spec.source.subject_filter".to_owned(),
-            value: SlotValue::Durable(subject_filter),
-        });
-    }
+    visit_verified_by(&mut agent.verified_by, &format!("{prefix}.verified_by"), f);
 }
 
 #[cfg(test)]
@@ -462,14 +558,18 @@ mod completeness_tests {
         ColorMode, DataInterface, DataSchema, DataSpec, DataSplit, DataStats, ImageFormat,
         ImageMeta, PandasMeta, ParquetCompression, SplitStrategy, TextMeta,
     };
-    use crate::card::drift::{DriftCondition, DriftMethod, DriftSignal, DriftSpec};
+    use crate::card::drift::{
+        DriftCondition, DriftMethod, DriftProfile, DriftSignal, DriftSpec, PsiBinningStrategy,
+        PsiProfile, PsiThreshold,
+    };
     use crate::card::experiment::ExperimentSpec;
     use crate::card::field::FieldSpec;
     use crate::card::mcp::McpSpec;
     use crate::card::model::{ModelInterface, ModelSignature, ModelSpec, SklearnMeta, TaskType};
     use crate::card::operator::{OperatorAction, OperatorSpec};
     use crate::card::service::{ServiceComponent, ServiceSpec};
-    use crate::card::trigger::{TriggerSchedule, TriggerSource, TriggerSpec};
+    use crate::card::trigger::{TriggerActivation, TriggerSpec};
+    use crate::card::verifier::{VerificationBinding, VerifierImplementation, VerifierSpec};
     use crate::card::workflow::{WorkflowAction, WorkflowSpec, WorkflowStep};
     use crate::envelope::{CardKind, Spec};
     use crate::ids::{CardName, ColumnName, SpaceName};
@@ -525,7 +625,7 @@ mod completeness_tests {
                 max_iterations: Some(1),
                 ..AgentRunConfigSpec::default()
             },
-            publishes_to: Vec::new(),
+            verified_by: Vec::new(),
         }
     }
 
@@ -642,6 +742,44 @@ mod completeness_tests {
         eval
     }
 
+    /// Build a PSI Drift payload whose baseline is the only reference slot.
+    fn drift() -> DriftSpec {
+        DriftSpec {
+            description: None,
+            method: DriftMethod::Psi,
+            signal: DriftSignal::Distribution {
+                baseline_ref: Ref::Ref(card_ref(CardKind::Data, "baseline")),
+                features: vec!["value".parse().expect("fixture feature is valid")],
+            },
+            condition: DriftCondition::Statistical,
+            profile: Some(DriftProfile::Psi(PsiProfile {
+                binning_strategy: PsiBinningStrategy::Quantile { n_bins: 10 },
+                categorical_features: Vec::new(),
+                threshold: PsiThreshold::Fixed { value: 0.25 },
+            })),
+        }
+    }
+
+    /// Build one binding with a referenced Trigger, a referenced Operator, and
+    /// an inline workflow Operator so every `verified_by` slot shape is visited.
+    fn binding(verifier: &str) -> VerificationBinding {
+        VerificationBinding {
+            verifier: Ref::Ref(card_ref(CardKind::Verifier, verifier)),
+            runs_on: InlineableRef::Ref(card_ref(CardKind::Trigger, "hourly")),
+            on_failure: vec![
+                InlineableRef::Ref(card_ref(CardKind::Operator, "page")),
+                InlineableRef::Inline(Box::new(OperatorSpec {
+                    description: None,
+                    action: OperatorAction::Workflow {
+                        workflow_ref: Ref::Ref(card_ref(CardKind::Workflow, "remediate")),
+                    },
+                    budget: None,
+                })),
+            ],
+        }
+    }
+
+    /// Project a visited spec into `(path, slot shape)` pairs in visit order.
     fn visit_paths(mut spec: Spec) -> Vec<(String, &'static str)> {
         let mut paths = Vec::new();
         ReferenceSlotVisitor::visit(&mut spec, |entry| {
@@ -649,6 +787,8 @@ mod completeness_tests {
                 SlotValue::Durable(_) => "durable",
                 SlotValue::InlineablePrompt(_) => "inlineable_prompt",
                 SlotValue::InlineableAgent(_) => "inlineable_agent",
+                SlotValue::InlineableTrigger(_) => "inlineable_trigger",
+                SlotValue::InlineableOperator(_) => "inlineable_operator",
             };
             paths.push((entry.path, kind));
         });
@@ -692,7 +832,7 @@ mod completeness_tests {
             components: vec![ServiceComponent {
                 alias: "model".to_owned(),
                 card_ref: Ref::Ref(card_ref(CardKind::Model, "component")),
-                publishes_to: vec![Ref::Ref(card_ref(CardKind::Eval, "component-quality"))],
+                verified_by: vec![binding("component-quality")],
                 source: None,
                 config: BTreeMap::new(),
                 credential_refs: Vec::new(),
@@ -701,15 +841,10 @@ mod completeness_tests {
         };
         let mut trigger = TriggerSpec {
             description: None,
-            schedule: TriggerSchedule {
+            activation: TriggerActivation::Schedule {
                 cron: "0 * * * *".to_owned(),
                 tz: None,
             },
-            source: Some(TriggerSource::DriftObservation {
-                drift_ref: Ref::Ref(card_ref(CardKind::Drift, "drift")),
-                subject_filter: Some(Ref::Ref(card_ref(CardKind::Model, "subject"))),
-            }),
-            operator_ref: Ref::Ref(card_ref(CardKind::Operator, "operator")),
         };
         let mut operator = OperatorSpec {
             description: None,
@@ -718,16 +853,7 @@ mod completeness_tests {
             },
             budget: None,
         };
-        let mut drift = DriftSpec {
-            description: None,
-            method: DriftMethod::External,
-            signal: DriftSignal::External {
-                source_ref: Ref::Ref(card_ref(CardKind::Source, "source")),
-            },
-            condition: DriftCondition::Statistical,
-            profile: None,
-            details: BTreeMap::new(),
-        };
+        let mut drift = drift();
         let mut workflow = workflow();
         let mut eval = eval();
         let mut image = image;
@@ -743,8 +869,14 @@ mod completeness_tests {
             Spec::Experiment(experiment.clone()),
             Spec::Agent(agent.clone()),
             Spec::Workflow(workflow.clone()),
-            Spec::Eval(eval.clone()),
-            Spec::Drift(drift.clone()),
+            Spec::Verifier(VerifierSpec {
+                description: None,
+                implementation: VerifierImplementation::Eval(eval.clone()),
+            }),
+            Spec::Verifier(VerifierSpec {
+                description: None,
+                implementation: VerifierImplementation::Drift(drift.clone()),
+            }),
             Spec::Service(service.clone()),
             Spec::Mcp(mcp.clone()),
             Spec::Audit(audit.clone()),
@@ -754,11 +886,11 @@ mod completeness_tests {
         ] {
             count += visit_paths(spec).len();
         }
-        assert_eq!(count, 32);
-        assert!(
-            visit_paths(Spec::Service(service.clone()))
-                .contains(&("spec.components[0].publishes_to[0]".to_owned(), "durable"))
-        );
+        assert_eq!(count, 33);
+        assert!(visit_paths(Spec::Service(service.clone())).contains(&(
+            "spec.components[0].verified_by[0].verifier".to_owned(),
+            "durable"
+        )));
         assert!(
             visit_paths(Spec::Service(service.clone()))
                 .contains(&("spec.components[0].ref".to_owned(), "durable"))
@@ -775,6 +907,9 @@ mod completeness_tests {
         let _ = (&mut audit, &mut artifact, &mut trigger, &mut operator);
     }
 
+    /// Pin the exact path and slot shape of every reference the visitor yields,
+    /// including Verifier implementation payloads and each `verified_by`
+    /// binding's `verifier`, `runs_on`, and `on_failure` slots.
     #[test]
     fn visitor_covers_every_slot_in_the_migration_table() {
         let expected = vec![
@@ -806,18 +941,65 @@ mod completeness_tests {
             ]
         );
         assert_eq!(
-            visit_paths(Spec::Eval(eval())),
+            visit_paths(Spec::Verifier(VerifierSpec {
+                description: None,
+                implementation: VerifierImplementation::Eval(eval()),
+            })),
             vec![
-                ("spec.dataset".to_owned(), "durable"),
+                ("spec.implementation.spec.dataset".to_owned(), "durable"),
                 (
-                    "spec.tasks[judge].LlmJudge.judge_ref".to_owned(),
+                    "spec.implementation.spec.tasks[judge].LlmJudge.judge_ref".to_owned(),
                     "inlineable_agent"
                 ),
                 (
-                    "spec.tasks[judge].LlmJudge.judge_ref.prompt".to_owned(),
+                    "spec.implementation.spec.tasks[judge].LlmJudge.judge_ref.prompt".to_owned(),
                     "inlineable_prompt"
                 ),
             ]
         );
+        assert_eq!(
+            visit_paths(Spec::Verifier(VerifierSpec {
+                description: None,
+                implementation: VerifierImplementation::Drift(drift()),
+            })),
+            vec![(
+                "spec.implementation.spec.signal.Distribution.baseline_ref".to_owned(),
+                "durable"
+            )]
+        );
+
+        let binding_slots = |prefix: &str| {
+            vec![
+                (format!("{prefix}[0].verifier"), "durable"),
+                (format!("{prefix}[0].runs_on"), "inlineable_trigger"),
+                (format!("{prefix}[0].on_failure[0]"), "inlineable_operator"),
+                (format!("{prefix}[0].on_failure[1].workflow_ref"), "durable"),
+                (format!("{prefix}[0].on_failure[1]"), "inlineable_operator"),
+            ]
+        };
+        let service = ServiceSpec {
+            components: vec![ServiceComponent {
+                alias: "model".to_owned(),
+                card_ref: Ref::Ref(card_ref(CardKind::Model, "component")),
+                verified_by: vec![binding("component-quality")],
+                source: None,
+                config: BTreeMap::new(),
+                credential_refs: Vec::new(),
+            }],
+            verified_by: vec![binding("service-quality")],
+            ..ServiceSpec::default()
+        };
+        let mut expected = vec![("spec.components[0].ref".to_owned(), "durable")];
+        expected.extend(binding_slots("spec.components[0].verified_by"));
+        expected.extend(binding_slots("spec.verified_by"));
+        assert_eq!(visit_paths(Spec::Service(service)), expected);
+
+        let agent = AgentSpec {
+            verified_by: vec![binding("agent-quality")],
+            ..agent()
+        };
+        let mut expected = vec![("spec.prompt".to_owned(), "inlineable_prompt")];
+        expected.extend(binding_slots("spec.verified_by"));
+        assert_eq!(visit_paths(Spec::Agent(agent)), expected);
     }
 }

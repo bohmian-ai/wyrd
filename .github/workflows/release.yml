@@ -327,7 +327,7 @@ jobs:
         shell: bash
         run: |
           rm -f index.js wyrd.*.node
-          pnpm exec napi build --release --target ${{ matrix.target }} --manifest-path ../native/Cargo.toml --output-dir . --package-json-path package.json
+          pnpm exec napi build --release --platform --target ${{ matrix.target }} --manifest-path ../native/Cargo.toml --output-dir . --package-json-path package.json
           test -f index.js && mv index.js index.generated.cjs
           cp index.d.ts index.d.cts
           pnpm exec tsc -p tsconfig.build.json

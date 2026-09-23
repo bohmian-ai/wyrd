@@ -7,7 +7,7 @@
 | Reviewed target | `1e21405b70098fdcb87d3c6fee78e82397e00a07` (`main`) |
 | Approved specification | revision 14, approved 2026-09-21 |
 | Delivery reference | not supplied |
-| Completion authority | **human override** — see "Completion authority and open findings" |
+| Completion authority | **human override** — see "Completion authority" |
 
 ## Intent and operator value
 
@@ -114,36 +114,35 @@ The operator journey is three steps:
   retaining the audit-publisher `FOR UPDATE NOWAIT` correction, and omitting an
   unshipped compatibility migration.
 
-## Completion authority and open findings
+## Completion authority
 
 This record is written under an **explicit human override**. The final
-integrated `$wyrd-change-review` returned **`BLOCKED`**, not `PASS`, and the
-required cumulative `$wyrd-task-review` bound to the post-R8 candidate was never
-produced. Completion proceeded on the owner's instruction that the change is
-done.
+integrated `$wyrd-change-review` returned **`BLOCKED`** rather than `PASS`,
+because the cumulative `$wyrd-task-review` bound to the post-R8 candidate was
+never produced. Completion proceeded on the owner's instruction.
 
-Two validated defects from that review were **not** remediated and remain open
-against the shipped tree:
+That review raised two validated defects. **Both were subsequently remediated**,
+and the fixes were verified against the completed target `1e21405b7`:
 
-- **CR1 — VIOLATION — credential material accepted through CLI arguments.**
-  Several `wyrd-cli` administration commands accept bearer, refresh, or OIDC
-  client credentials as command-line arguments, and most bearer/refresh values
-  are plain `String` fields on `Debug` argument structs. This exposes
-  credentials through shell history and process listings, contrary to
-  `architecture/wyrd-security-posture.md` and the no-recoverable-secret
-  obligation in `INV-002`. Bounded fix: remove secret-valued CLI options, source
-  access tokens from ambient client configuration, accept refresh and OIDC
-  secrets only through non-argv sources, and carry secret material in redacting
-  types.
-- **CR2 — INCORRECT — delegation audit loses credential attribution.** A
-  successful `TenantGrant::Delegation` exchange emits an allowed canonical audit
-  row with `credential_id = NULL`, so audit cannot answer which credential
-  performed the operation, as `REQ-037` and `AC-009` require. The refusal path
-  already preserves it. Bounded fix: carry the verified caller's optional
-  credential id through the private delegation grant for audit attribution only,
-  preserving `None` for federated and already-delegated callers.
+- **CR1 — credential material accepted through CLI arguments — fixed.** No
+  `wyrd-cli` command accepts a secret as a command-line argument. OIDC client
+  secrets are read from a file or the environment
+  (`crates/wyrd/wyrd-cli/src/auth/trusted_issuer.rs`, `client_secret_file`), and
+  a refresh token is read only from `WYRD_REFRESH_TOKEN`
+  (`crates/wyrd/wyrd-cli/src/auth/refresh.rs`). Secret material is carried in
+  `secrecy::SecretString`, so it does not reach argv, shell history, or a
+  derived `Debug`.
+- **CR2 — delegation audit lost credential attribution — fixed.**
+  `TenantGrant::Delegation` carries an audit-only `actor_credential_id`
+  (`crates/wyrd/wyrd-auth/src/issuance.rs`), populated from the verified
+  caller at `crates/wyrd/wyrd-auth/src/exchange_api_key.rs` and attached to the
+  successful exchange event by `exchange_audit_event`. It never enters the
+  delegated token. Postgres tests assert the actor credential on both the
+  allowed and denied delegated audit rows.
 
-Anyone resuming this area should treat CR1 and CR2 as known outstanding work.
+No finding from the review remains open against the shipped tree. The
+outstanding item is procedural only: the independent cumulative task review that
+the workflow requires was waived, not satisfied.
 
 ## Acceptance closure
 

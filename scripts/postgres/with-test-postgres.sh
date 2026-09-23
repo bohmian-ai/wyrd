@@ -41,45 +41,57 @@ trap cleanup EXIT
 trap 'handle_signal INT' INT
 trap 'handle_signal TERM' TERM
 
-"${compose[@]}" up --detach --wait postgres
-endpoint="$(${compose[@]} port --protocol tcp postgres 5432)"
-if [[ ! $endpoint =~ ^(127\.0\.0\.1|localhost|0\.0\.0\.0):([1-9][0-9]*)$ ]]; then
-  echo "Docker returned an invalid loopback Postgres endpoint: '$endpoint'" >&2
-  exit 1
-fi
-host="${BASH_REMATCH[1]}"
-port="${BASH_REMATCH[2]}"
-if [[ $host == "0.0.0.0" ]]; then
-  host=127.0.0.1
-fi
-
-# `--wait` proves the server accepts TCP inside the container. It does not
-# prove Docker has finished publishing the loopback port this command will
-# actually dial: a healthy container has been observed behind a host port that
-# still refuses, which failed the lane before any test ran. Wait for the exact
-# endpoint, then fail with the endpoint named rather than as a psql refusal.
-for _ in $(seq 1 60); do
-  if (exec 3<>"/dev/tcp/${host}/${port}") 2>/dev/null; then
-    break
+# Bring the project up and return the host endpoint that actually accepts.
+#
+# `--wait` proves the server accepts TCP inside the container. It does not prove
+# the published port is reachable from this host: under a VM-backed Docker
+# (Colima/Lima, and Docker Desktop) the host side is an SSH forward that the VM
+# manager creates asynchronously after the guest starts listening, so a healthy
+# container is routinely reachable only seconds later -- and occasionally not at
+# all, when that forwarder misses the guest port under churn. Waiting alone
+# cannot fix the second case, so a project whose endpoint never opens is rebuilt
+# once, which makes the forwarder observe a fresh guest port.
+start_postgres() {
+  "${compose[@]}" up --detach --wait postgres
+  endpoint="$(${compose[@]} port --protocol tcp postgres 5432)"
+  if [[ ! $endpoint =~ ^(127\.0\.0\.1|localhost|0\.0\.0\.0):([1-9][0-9]*)$ ]]; then
+    echo "Docker returned an invalid loopback Postgres endpoint: '$endpoint'" >&2
+    return 1
   fi
-  sleep 1
-done
-if ! (exec 3<>"/dev/tcp/${host}/${port}") 2>/dev/null; then
-  # A refusal here is an environment fault, not a test result, and it aborts the
-  # whole lane. Print what the container and the host socket table say at the
-  # moment of refusal so the next occurrence is diagnosable from the lane log.
-  {
-    echo "Postgres endpoint ${host}:${port} never accepted a connection"
-    echo "--- compose ps"
-    "${compose[@]}" ps --all
-    echo "--- published ports"
-    "${compose[@]}" port --protocol tcp postgres 5432 || true
-    echo "--- host listeners on ${port}"
-    (ss -lntp "sport = :${port}" || true) 2>/dev/null
-    echo "--- postgres log (last 40)"
-    "${compose[@]}" logs --tail 40 postgres || true
-  } >&2
-  exit 1
+  host="${BASH_REMATCH[1]}"
+  port="${BASH_REMATCH[2]}"
+  if [[ $host == "0.0.0.0" ]]; then
+    host=127.0.0.1
+  fi
+  for _ in $(seq 1 60); do
+    if (exec 3<>"/dev/tcp/${host}/${port}") 2>/dev/null; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+if ! start_postgres; then
+  echo "Postgres endpoint ${host-unknown}:${port-unknown} never accepted a connection; rebuilding the project once" >&2
+  "${compose[@]}" down --volumes --remove-orphans >/dev/null 2>&1 || true
+  if ! start_postgres; then
+    # An environment fault, not a test result, and it aborts the whole lane.
+    # Print what the container and the host socket table say at the moment of
+    # refusal so the next occurrence is diagnosable from the lane log.
+    {
+      echo "Postgres endpoint ${host-unknown}:${port-unknown} never accepted a connection"
+      echo "--- compose ps"
+      "${compose[@]}" ps --all
+      echo "--- published ports"
+      "${compose[@]}" port --protocol tcp postgres 5432 || true
+      echo "--- host listeners on ${port-0}"
+      (ss -lntp "sport = :${port-0}" || true) 2>/dev/null
+      echo "--- postgres log (last 40)"
+      "${compose[@]}" logs --tail 40 postgres || true
+    } >&2
+    exit 1
+  fi
 fi
 
 admin_dsn="postgres://wyrd_test_admin:${admin_password}@${host}:${port}/wyrd"

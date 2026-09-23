@@ -11,6 +11,7 @@
 
 pub mod engines;
 pub mod health;
+pub mod operators;
 pub mod permits;
 pub mod publisher;
 pub mod results;
@@ -30,6 +31,7 @@ use wyrd_sql::queries::verifier_runs::VerifierRunQueue;
 use crate::state::AppState;
 
 use self::health::{RuntimeCapability, VerificationHealth};
+use self::operators::{OperatorDelivery, OperatorWorker, ProviderEndpoints};
 use self::permits::VerifierPermits;
 #[cfg(feature = "test-support")]
 use self::publisher::PublicationFault;
@@ -61,6 +63,18 @@ pub struct RuntimeLimits {
     pub poll_interval: Duration,
     /// Wait before a crashed capability task is restarted.
     pub restart_backoff: Duration,
+    /// Delivery attempts one Operator dispatch may make.
+    pub operator_attempts: i32,
+    /// Wall-clock budget of one Operator dispatch from its creation.
+    pub operator_deadline: Duration,
+    /// How long one Operator claim holds a dispatch; exceeds the attempt
+    /// timeout so a live attempt settles before reclaim.
+    pub operator_lease: Duration,
+    /// Ceiling of one Operator delivery attempt.
+    pub operator_attempt_timeout: Duration,
+    /// Server backoff after the first and every later failed Operator
+    /// attempt.
+    pub operator_backoff: [Duration; 2],
 }
 
 impl Default for RuntimeLimits {
@@ -77,6 +91,11 @@ impl Default for RuntimeLimits {
             drain_grace: Duration::from_secs(30),
             poll_interval: Duration::from_secs(1),
             restart_backoff: Duration::from_secs(1),
+            operator_attempts: 3,
+            operator_deadline: Duration::from_secs(300),
+            operator_lease: Duration::from_secs(45),
+            operator_attempt_timeout: Duration::from_secs(30),
+            operator_backoff: [Duration::from_secs(30), Duration::from_secs(120)],
         }
     }
 }
@@ -91,6 +110,13 @@ impl RuntimeLimits {
             .drain_grace
             .min(server_drain.saturating_sub(Duration::from_secs(1)));
         self
+    }
+
+    /// Server backoff after failed Operator attempt number `attempt`
+    /// (1-based): the first entry after attempt one, the second afterwards.
+    #[must_use]
+    pub fn operator_backoff(&self, attempt: i32) -> Duration {
+        self.operator_backoff[usize::from(attempt > 1)]
     }
 }
 
@@ -126,6 +152,8 @@ enum Capability {
     Scheduler(Arc<VerificationScheduler>),
     /// The Verifier runner.
     Runner(Arc<VerifierRunner>),
+    /// The Operator delivery worker.
+    OperatorWorker(Arc<OperatorWorker>),
 }
 
 impl Capability {
@@ -134,6 +162,7 @@ impl Capability {
         match self {
             Self::Scheduler(_) => RuntimeCapability::Scheduler,
             Self::Runner(_) => RuntimeCapability::Runner,
+            Self::OperatorWorker(_) => RuntimeCapability::OperatorWorker,
         }
     }
 
@@ -143,6 +172,7 @@ impl Capability {
         let handle = match self {
             Self::Scheduler(scheduler) => tasks.spawn(Arc::clone(scheduler).run(stop)),
             Self::Runner(runner) => tasks.spawn(Arc::clone(runner).run(stop)),
+            Self::OperatorWorker(worker) => tasks.spawn(Arc::clone(worker).run(stop)),
         };
         handle.id()
     }
@@ -166,6 +196,7 @@ impl VerificationRuntime {
             state,
             limits: RuntimeLimits::default(),
             ingest_endpoint: None,
+            endpoints: ProviderEndpoints::default(),
             #[cfg(feature = "test-support")]
             publication_fault: None,
             #[cfg(feature = "test-support")]
@@ -247,6 +278,8 @@ pub struct VerificationRuntimeBuilder<'a> {
     limits: RuntimeLimits,
     /// Scribe-bearing gRPC endpoint results are published through.
     ingest_endpoint: Option<String>,
+    /// Slack and PagerDuty endpoints Operators deliver to.
+    endpoints: ProviderEndpoints,
     /// Test-only publication faults.
     #[cfg(feature = "test-support")]
     publication_fault: Option<PublicationFault>,
@@ -294,6 +327,14 @@ impl VerificationRuntimeBuilder<'_> {
             }
             self.ingest_endpoint = Some(format!("http://{addr}"));
         }
+        self
+    }
+
+    /// Deliver fixed-provider Operators to `endpoints` (mock providers).
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn provider_endpoints(mut self, endpoints: ProviderEndpoints) -> Self {
+        self.endpoints = endpoints;
         self
     }
 
@@ -347,7 +388,24 @@ impl VerificationRuntimeBuilder<'_> {
         if let Some(crash) = &self.crash {
             scheduler = scheduler.with_crash(crash.clone());
         }
-        let mut capabilities = vec![Capability::Scheduler(Arc::new(scheduler))];
+        let mut worker = OperatorWorker::new(
+            postgres.clone(),
+            operator.clone(),
+            Arc::clone(&self.state.operator_keys),
+            OperatorDelivery::new(
+                self.state.deployment_profile.screened_http(),
+                self.endpoints,
+            ),
+            self.limits,
+        );
+        #[cfg(feature = "test-support")]
+        if let Some(crash) = &self.crash {
+            worker = worker.with_crash(crash.clone());
+        }
+        let mut capabilities = vec![
+            Capability::Scheduler(Arc::new(scheduler)),
+            Capability::OperatorWorker(Arc::new(worker)),
+        ];
         match (self.state.auth.tenant_issuer(), self.ingest_endpoint) {
             (Some(issuer), Some(endpoint)) => {
                 let publisher = ResultPublisher::new(postgres.clone(), issuer, endpoint);

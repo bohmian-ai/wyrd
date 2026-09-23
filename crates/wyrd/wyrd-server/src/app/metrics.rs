@@ -80,6 +80,12 @@ pub const VERIFICATION_CAPABILITY_UP: &str = "wyrd_verification_capability_up";
 /// Unexpected verification capability exits that were restarted, by `capability`.
 pub const VERIFICATION_CAPABILITY_RESTARTS_TOTAL: &str =
     "wyrd_verification_capability_restarts_total";
+/// Operator deliveries currently holding an Operator permit in this process.
+pub const OPERATOR_ACTIVE_DISPATCHES: &str = "wyrd_operator_active_dispatches";
+/// Settled Operator delivery attempts, by `outcome`.
+pub const OPERATOR_DISPATCH_ATTEMPTS_TOTAL: &str = "wyrd_operator_dispatch_attempts_total";
+/// Claim-to-settlement latency of one Operator attempt, by `outcome`.
+pub const OPERATOR_DISPATCH_DURATION_SECONDS: &str = "wyrd_operator_dispatch_duration_seconds";
 
 /// Every production Bifrost duration family whose p99 is consumed by qualification.
 const BIFROST_P99_DURATION_FAMILIES: &[&str] = &[
@@ -202,6 +208,11 @@ pub fn install_recorder() -> Result<PrometheusHandle, MetricsError> {
         .map_err(MetricsError::Buckets)?
         .set_buckets_for_metric(
             Matcher::Full(VERIFICATION_RUN_DURATION_SECONDS.to_owned()),
+            BIFROST_DURATION_BUCKETS,
+        )
+        .map_err(MetricsError::Buckets)?
+        .set_buckets_for_metric(
+            Matcher::Full(OPERATOR_DISPATCH_DURATION_SECONDS.to_owned()),
             BIFROST_DURATION_BUCKETS,
         )
         .map_err(MetricsError::Buckets)?;

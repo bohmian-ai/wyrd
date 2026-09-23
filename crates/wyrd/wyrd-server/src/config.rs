@@ -3748,6 +3748,22 @@ minimum_slots = 2
         profile
     }
 
+    /// The Vault-sourced Operator keys multi-tenant production requires,
+    /// reading its token from a file under `directory`.
+    fn production_operator_keys(directory: &std::path::Path) -> OperatorKeysConfig {
+        OperatorKeysConfig {
+            source: OperatorKeySource::Vault,
+            vault: Some(VaultKeysConfig {
+                addr: "https://vault.internal:8200".to_owned(),
+                mount: default_vault_mount(),
+                prefix: default_vault_prefix(),
+                token_file: Some(directory.join("vault-token")),
+                token: None,
+            }),
+            ..OperatorKeysConfig::default()
+        }
+    }
+
     /// Proves production accepts only a complete maintainer-approved profile.
     #[test]
     fn oracle_production_calibration_requires_approved_profile() {
@@ -3759,6 +3775,7 @@ minimum_slots = 2
             deployment_profile: DeploymentProfile::Production,
             ..WyrdServerConfig::default()
         };
+        config.verification.operator_keys = production_operator_keys(directory.path());
         config.bifrost.oracle.calibration_profile = path.clone();
         config.grpc.certificate_chain_path = Some(directory.path().join("server.pem"));
         config.grpc.private_key_path = Some(directory.path().join("server-key.pem"));
@@ -3797,6 +3814,7 @@ minimum_slots = 2
             deployment_profile: DeploymentProfile::Production,
             ..WyrdServerConfig::default()
         };
+        config.verification.operator_keys = production_operator_keys(directory.path());
         config.bifrost.oracle.calibration_profile = calibration;
         assert!(config.validate().is_err());
 

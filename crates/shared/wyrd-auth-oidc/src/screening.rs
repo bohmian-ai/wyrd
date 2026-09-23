@@ -59,13 +59,28 @@ pub enum ScreenError {
 pub struct ScreenedHttp {
     /// The internal-range policy this deployment runs under.
     policy: AddressPolicy,
+    /// Whole-request timeout of every client this builds.
+    timeout: Duration,
 }
 
 impl ScreenedHttp {
     /// Bind screening to a deployment's address policy.
     #[must_use]
     pub const fn new(policy: AddressPolicy) -> Self {
-        Self { policy }
+        Self {
+            policy,
+            timeout: FETCH_TIMEOUT,
+        }
+    }
+
+    /// The same policy with a different whole-request timeout.
+    ///
+    /// Provider fetches keep the ten-second default; an Operator delivery
+    /// attempt carries its own server-owned ceiling.
+    #[must_use]
+    pub const fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     /// The policy a development or single-tenant deployment runs under.
@@ -97,7 +112,7 @@ impl ScreenedHttp {
     pub async fn client_for(&self, url: &Url) -> Result<Client, ScreenError> {
         wyrd_tls::install_crypto_provider().map_err(|_| ScreenError::Client)?;
         let builder = reqwest::Client::builder()
-            .timeout(FETCH_TIMEOUT)
+            .timeout(self.timeout)
             .redirect(reqwest::redirect::Policy::none());
 
         let builder = match url.host() {

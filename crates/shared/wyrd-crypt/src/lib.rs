@@ -106,7 +106,13 @@ pub fn encrypt_aad(
     let mut nonce = [0_u8; 12];
     OsRng.fill_bytes(&mut nonce);
     let ciphertext = cipher
-        .encrypt(Nonce::from_slice(&nonce), Payload { msg: plaintext, aad })
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|_| CryptError::Encrypt)?;
     Ok(EncryptedPayload { nonce, ciphertext })
 }
@@ -171,7 +177,12 @@ pub fn open(
     context: &[&str],
 ) -> Result<Zeroizing<Vec<u8>>, CryptError> {
     let dek = unwrap_dek(kek, &envelope.wrapped_dek, context)?;
-    decrypt_aad(&dek, &envelope.secret, &canonical_aad(SECRET_DOMAIN, context)).map(Zeroizing::new)
+    decrypt_aad(
+        &dek,
+        &envelope.secret,
+        &canonical_aad(SECRET_DOMAIN, context),
+    )
+    .map(Zeroizing::new)
 }
 
 /// Re-wrap a DEK from `old_kek` to `new_kek` without decrypting the secret.
@@ -205,7 +216,10 @@ fn unwrap_dek(
         wrapped_dek,
         &canonical_aad(DEK_DOMAIN, context),
     )?);
-    let dek: [u8; 32] = bytes.as_slice().try_into().map_err(|_| CryptError::InvalidKey)?;
+    let dek: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| CryptError::InvalidKey)?;
     Ok(SecretKey(dek))
 }
 
@@ -268,7 +282,10 @@ mod tests {
         }
         let mut flipped = envelope.clone();
         flipped.secret.ciphertext[0] ^= 1;
-        assert!(open(&kek, &flipped, &context).is_err(), "tampered ciphertext");
+        assert!(
+            open(&kek, &flipped, &context).is_err(),
+            "tampered ciphertext"
+        );
 
         let rewrapped = super::Envelope {
             secret: envelope.secret.clone(),

@@ -550,6 +550,13 @@ A change is not done until:
   glob to hide a real violation. Fix the underlying cause. Only use a check's
   own sanctioned mechanism (e.g. the documented per-file allowlist) when the
   usage is legitimately test-only and matches an existing in-pattern precedent.
+- A red gate blocks the change regardless of who turned it red. "Pre-existing"
+  is not an exit: a failure you did not cause is still a failure you must fix
+  before the change is done, or report as a blocker with the diagnosis you
+  already have. Never spend effort establishing authorship of a failure —
+  do not check out a baseline commit, add a worktree, bisect, or re-run a lane
+  on older code to prove a failure is not yours. Blame is not a deliverable and
+  does not turn a lane green. Diagnose the failure itself and fix it.
 
 ### Adding And Retiring Checks
 

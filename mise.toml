@@ -476,6 +476,9 @@ set -e
 # stopped container made Keycloak resolve a hostname that no longer exists and
 # exit before serving. A fresh container each run has no stale lock to inherit.
 docker compose rm --force --stop --volumes keycloak dex
+# Removed on every exit, including a failed seed, a failed suite, and an
+# interrupt, so the next run never inherits a container this one left behind.
+trap 'docker compose rm --force --stop --volumes keycloak dex' EXIT
 docker compose up -d keycloak dex --wait
 
 # Seed Keycloak users via admin REST API (realm import only defines clients/groups)
@@ -553,8 +556,6 @@ print("Keycloak users seeded")
 PYEOF
 
 cargo nextest run --locked -p wyrd-server --all-features --test identity_e2e --run-ignored=all --test-threads=1
-
-docker compose rm --force --stop --volumes keycloak dex
 """
 
 [tasks."build:server"]

@@ -192,3 +192,60 @@ SQL, new result fields, backfill, or different insufficient-input semantics.
 - `architecture/bifrost-design.md`
 - `architecture/references/domain/evaluation.md`
 - `AGENTS.md`
+
+## Implementation Evidence
+
+Commits `ef2e163f`..`a96bfe25` on `vcc/task-005`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| All `AC-012` method journeys pass | PSI/SPC/Custom engine `wyrd-server/src/verification/drift.rs`; fitter `verification/fitter.rs`; Rust journey `sdks/wyrd-sdk-rust/tests/drift_verification.rs` (Parquet baseline, PSI+SPC ready, SPC-over-string `baseline_fit_failed`, direct runs, result+feature rows joined by `result_id`, unready 409, non-Parquet `WYRD_DRIFT_400_VALIDATION`, reader 403, cross-tenant `INVALID_TARGET`/`TABLE_NOT_FOUND`); Python journey `sdks/wyrd-sdk-python/tests/integration/test_drift_journey.py` (Pandas, Polars, Arrow-Parquet baselines; Arrow IPC refused) | `mise run test:bifrost:journey:drift`; focused `pytest -m integration tests/integration/test_drift_journey.py`; `mise run test:bifrost` | PASS |
+| `AC-013` Drift activation cases pass | Drift adapter in the generic runtime; scheduled failed result dispatches once per Operator (`assert_scheduled_failure_dispatches`); direct runs never dispatch | `mise run test:bifrost:journey:drift`; `mise run test:wyrd` (`pg_verification_runtime`) | PASS |
+| Baseline Card status exact and non-blocking; Custom needs no fit job | Registration creates pending status (`ef2e163f`, `1e5f97e7`); `DriftBaselineStatus` on Card status, TS projection `VerificationStatus.baseline`; journey asserts Custom has no baseline status | Rust and Python journeys; `mise run codegen:check`; `mise run ts:typecheck` | PASS |
+| Plans use managed `wyrd_event_time`, exact subject, aggregates only | Typed Oracle plans in `drift.rs`; Oracle seam `replace_typed_sources` rebuilds scans against the physical provider schema | `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=oracle::planner::tests::typed_source_replacement_reconciles_the_physical_timezone_spelling)'`; `mise run test:vala` | PASS |
+| `DriftReport` semantics unchanged; no-report inconclusive has null details and zero features | Aggregate-input entry points share existing formulas (`1e5f97e7`); empty-window Custom run asserted inconclusive/`details: None`/no features | Rust Drift journey; `unscored_drift_publishes_only_the_summary` | PASS |
+
+Verification commands, each run in this session and exited 0: `mise run test:vala`,
+`mise run test:sql`, `mise run test:wyrd`, `mise run test:bifrost`,
+`mise run test:bifrost:journey:sdk`, `mise run test:wyrdstate:journey`,
+`mise run test:storage:matrix`, `mise run codegen:check`,
+`mise run check:tenant-isolation`, `mise run fmt`, `mise run lints`,
+`git diff --check`, `mise run ts:typecheck`, and the focused commands above.
+
+Non-goals remain excluded: no client aggregation, raw-value download, user SQL,
+profile MemTable, Drift scheduler, Alert table, fabricated pre-scoring report,
+or SPC algorithm change.
+
+Material limits: the CLI card-lifecycle fixtures now declare Parquet baselines
+(with feature columns) for registration, but carry no genuine Parquet bytes;
+those journeys run without the verification runtime, so their baselines are never
+fitted. The fitter's missing- or invalid-artifact path (`BASELINE_ARTIFACT_INVALID`)
+is covered by code but not by a journey.
+
+## Failure Diagnoses
+
+**`test:wyrd` (3 failures).** Symptom: two CLI applies returned
+`WYRD_DRIFT_400_VALIDATION` ("baseline Data Card interface Custom is not stored
+as Parquet"); `unavailable_engine_errors_without_publishing` expected
+`implementation_unavailable`, got `drift_invalid`. Evidence: `card_lifecycle.rs:1263`,
+`:1467`; `pg_verification_runtime.rs:669`. Cause: the new registration check
+(`cards/resolve.rs` `validate_baselines`) correctly refuses Custom-interface
+baselines; the real Drift engine now ships, so an empty script reaches it and the
+fixture Verifier has no profile (`drift.rs` "no profile"). Fix site: fixtures only
+(`585fdbbd`): Parquet interface plus feature columns; the runtime test is re-pinned
+as `unscorable_verifier_errors_without_publishing`. Independent read-only
+diagnostician: cause and fix site confirmed; runtime fix CORRECT. It rated the
+fixtures INCOMPLETE (no genuine Parquet bytes); accepted as the material limit above.
+
+**`test:bifrost` integration:redux, `multi_plan_success_counts_all_committed_volume_once`.**
+Symptom: final assertion 25 != 30; passes in isolation. Evidence: the extra-pass
+worker settled at `elapsed_ms=503` (the 500 ms sleep, then `shutdown()`);
+`support.rs` `shutdown` cancels the worker; `worker.rs` records input volume
+only after settlement or recovery. Cause: the test cancelled an attempt whose
+catalog commit had removed inputs before its volume was recorded, then compared
+consumed files with the counter. Fix site: the test's wait (`8a3070a7`,
+`a96bfe25`): wait until no small-files task is ready, retryable, claimed,
+running, or prepared and no operation is `prepared`, after clearing backoff;
+the equality assertion is unchanged. The shared `shutdown` is not changed, because
+other callers rely on cancelling in-flight work. Independent read-only
+diagnostician: CORRECT.

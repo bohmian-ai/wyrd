@@ -1749,6 +1749,10 @@ pub struct VerificationConfig {
     /// runner until this is set.
     #[serde(default)]
     pub ingest_endpoint: Option<String>,
+    /// Where the key-encryption keys that protect Operator connection
+    /// credentials come from.
+    #[serde(default)]
+    pub operator_keys: OperatorKeysConfig,
 }
 
 /// Serde default for [`VerificationConfig::enabled`].
@@ -1762,7 +1766,217 @@ impl Default for VerificationConfig {
         Self {
             enabled: default_verification_enabled(),
             ingest_endpoint: None,
+            operator_keys: OperatorKeysConfig::default(),
         }
+    }
+}
+
+/// Source of the 32-byte key-encryption keys (KEKs) that wrap each Operator
+/// connection's data key.
+///
+/// Wyrd stores every Slack, PagerDuty, and HTTP credential itself, encrypted;
+/// this names only where the key that unlocks them lives. Keys are read at
+/// use, never cached, so a rotated file or Vault secret applies on the next
+/// read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorKeySource {
+    /// One deployment key per version from `WYRD_OPERATOR_KEK_V<version>`
+    /// (base64). The zero-dependency first-run and self-hosted source.
+    #[default]
+    Env,
+    /// One deployment key per version from the owner-only file
+    /// `<dir>/v<version>` (base64).
+    File,
+    /// One key per tenant and version from HashiCorp Vault KV v2 at
+    /// `<mount>/data/<prefix>/<data_tenant_id>/<version>`, field `key`
+    /// (base64). Required for multi-tenant production.
+    Vault,
+}
+
+/// HashiCorp Vault KV v2 location of per-tenant Operator KEKs.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VaultKeysConfig {
+    /// Vault base URL, such as `https://vault.internal:8200`.
+    pub addr: String,
+    /// KV v2 mount name.
+    #[serde(default = "default_vault_mount")]
+    pub mount: String,
+    /// Path prefix under the mount; the tenant and version are appended.
+    #[serde(default = "default_vault_prefix")]
+    pub prefix: String,
+    /// File holding the Vault token, re-read on every key read so an agent
+    /// may renew it in place. Mutually exclusive with
+    /// `WYRD_OPERATOR_KEK_VAULT_TOKEN`.
+    #[serde(default)]
+    pub token_file: Option<PathBuf>,
+    /// Inline Vault token from `WYRD_OPERATOR_KEK_VAULT_TOKEN`; never read
+    /// from TOML.
+    #[serde(skip)]
+    pub token: Option<SecretString>,
+}
+
+/// Serde default for [`VaultKeysConfig::mount`].
+fn default_vault_mount() -> String {
+    "secret".to_owned()
+}
+
+/// Serde default for [`VaultKeysConfig::prefix`].
+fn default_vault_prefix() -> String {
+    "wyrd/operator-keys".to_owned()
+}
+
+/// Operator connection key configuration (`[verification.operator_keys]`).
+///
+/// Without a readable active key the rest of Wyrd runs; only creating or
+/// changing a connection credential refuses with
+/// `WYRD_OPERATOR_503_KEY_UNAVAILABLE`. Multi-tenant production (no
+/// `auth.tenant_slug`) must use [`OperatorKeySource::Vault`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorKeysConfig {
+    /// Where keys are read from.
+    #[serde(default)]
+    pub source: OperatorKeySource,
+    /// Key version new and rotated credentials are wrapped under. Publish a
+    /// version's key before activating it; keep older versions readable
+    /// until rewrap leaves no row on them.
+    #[serde(default = "default_active_key_version")]
+    pub active_version: std::num::NonZeroU32,
+    /// Directory of `v<version>` key files for [`OperatorKeySource::File`].
+    #[serde(default)]
+    pub dir: Option<PathBuf>,
+    /// Vault location for [`OperatorKeySource::Vault`].
+    #[serde(default)]
+    pub vault: Option<VaultKeysConfig>,
+}
+
+/// Serde default for [`OperatorKeysConfig::active_version`].
+const fn default_active_key_version() -> std::num::NonZeroU32 {
+    std::num::NonZeroU32::MIN
+}
+
+impl Default for OperatorKeysConfig {
+    /// Environment-sourced key version 1.
+    fn default() -> Self {
+        Self {
+            source: OperatorKeySource::default(),
+            active_version: default_active_key_version(),
+            dir: None,
+            vault: None,
+        }
+    }
+}
+
+impl OperatorKeysConfig {
+    /// Check that the chosen source is fully configured and allowed here.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::Invalid`] when `file` has no `dir`, `vault` has
+    /// no usable address or token, both token forms are set, or a
+    /// multi-tenant production deployment uses anything but Vault.
+    fn validate(&self, multi_tenant_production: bool) -> Result<(), ConfigError> {
+        let invalid = |message: &str| {
+            Err(ConfigError::Invalid {
+                message: format!("verification.operator_keys: {message}"),
+            })
+        };
+        if multi_tenant_production && self.source != OperatorKeySource::Vault {
+            return invalid(
+                "multi-tenant production requires source = \"vault\" \
+                 (WYRD_OPERATOR_KEK_SOURCE=vault) so each tenant has its own key",
+            );
+        }
+        match self.source {
+            OperatorKeySource::Env => Ok(()),
+            OperatorKeySource::File if self.dir.is_none() => {
+                invalid("source = \"file\" requires dir (WYRD_OPERATOR_KEK_DIR)")
+            }
+            OperatorKeySource::File => Ok(()),
+            OperatorKeySource::Vault => {
+                let Some(vault) = &self.vault else {
+                    return invalid("source = \"vault\" requires vault.addr (WYRD_OPERATOR_KEK_VAULT_ADDR)");
+                };
+                match url::Url::parse(&vault.addr) {
+                    Ok(url) if matches!(url.scheme(), "http" | "https") => {}
+                    _ => return invalid("vault.addr must be an http(s) URL"),
+                }
+                match (&vault.token_file, &vault.token) {
+                    (Some(_), Some(_)) => invalid(
+                        "set only one of vault.token_file (WYRD_OPERATOR_KEK_VAULT_TOKEN_FILE) \
+                         and WYRD_OPERATOR_KEK_VAULT_TOKEN",
+                    ),
+                    (None, None) => invalid(
+                        "source = \"vault\" requires a token (WYRD_OPERATOR_KEK_VAULT_TOKEN_FILE \
+                         or WYRD_OPERATOR_KEK_VAULT_TOKEN)",
+                    ),
+                    _ => Ok(()),
+                }
+            }
+        }
+    }
+
+    /// Apply `WYRD_OPERATOR_KEK_*` environment overrides.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::BadEnvVar`] or [`ConfigError::EmptyEnvVar`] for
+    /// a malformed override.
+    fn apply_env(&mut self) -> Result<(), ConfigError> {
+        if let Some(val) = env_opt("WYRD_OPERATOR_KEK_SOURCE")? {
+            self.source = match val.as_str() {
+                "env" => OperatorKeySource::Env,
+                "file" => OperatorKeySource::File,
+                "vault" => OperatorKeySource::Vault,
+                _ => {
+                    return Err(ConfigError::BadEnvVar {
+                        key: "WYRD_OPERATOR_KEK_SOURCE".to_owned(),
+                        message: format!("expected 'env', 'file', or 'vault', got {val:?}"),
+                    });
+                }
+            };
+        }
+        if let Some(val) = env_opt("WYRD_OPERATOR_KEK_ACTIVE_VERSION")? {
+            self.active_version = val.parse().map_err(|e: std::num::ParseIntError| {
+                ConfigError::BadEnvVar {
+                    key: "WYRD_OPERATOR_KEK_ACTIVE_VERSION".to_owned(),
+                    message: e.to_string(),
+                }
+            })?;
+        }
+        if let Some(val) = env_opt("WYRD_OPERATOR_KEK_DIR")? {
+            self.dir = Some(PathBuf::from(val));
+        }
+        if let Some(addr) = env_opt("WYRD_OPERATOR_KEK_VAULT_ADDR")? {
+            match &mut self.vault {
+                Some(vault) => vault.addr = addr,
+                None => {
+                    self.vault = Some(VaultKeysConfig {
+                        addr,
+                        mount: default_vault_mount(),
+                        prefix: default_vault_prefix(),
+                        token_file: None,
+                        token: None,
+                    });
+                }
+            }
+        }
+        let Some(vault) = &mut self.vault else {
+            return Ok(());
+        };
+        if let Some(val) = env_opt("WYRD_OPERATOR_KEK_VAULT_MOUNT")? {
+            vault.mount = val;
+        }
+        if let Some(val) = env_opt("WYRD_OPERATOR_KEK_VAULT_PREFIX")? {
+            vault.prefix = val;
+        }
+        if let Some(val) = env_opt("WYRD_OPERATOR_KEK_VAULT_TOKEN_FILE")? {
+            vault.token_file = Some(PathBuf::from(val));
+        }
+        if let Some(val) = env_opt("WYRD_OPERATOR_KEK_VAULT_TOKEN")? {
+            vault.token = Some(SecretString::from(val));
+        }
+        Ok(())
     }
 }
 
@@ -2570,6 +2784,9 @@ impl WyrdServerConfig {
             self.verification.ingest_endpoint = Some(val);
         }
 
+        // verification.operator_keys (WYRD_OPERATOR_KEK_*)
+        self.verification.operator_keys.apply_env()?;
+
         // readiness.tick_ms
         if let Some(val) = env_opt("WYRD_READINESS_TICK_MS")? {
             self.readiness.tick_ms = val.parse::<u64>().map_err(|e| ConfigError::BadEnvVar {
@@ -2615,6 +2832,11 @@ impl WyrdServerConfig {
     /// Returns [`ConfigError`] for any violated constraint.
     fn validate(&self) -> Result<(), ConfigError> {
         let serves_api = self.role.serves_api();
+        if serves_api {
+            self.verification.operator_keys.validate(
+                self.deployment_profile.is_production() && self.auth.tenant_slug.is_none(),
+            )?;
+        }
         if self.forge.per_tenant_active_cap == Some(0) {
             return Err(ConfigError::Invalid {
                 message: "forge.per_tenant_active_cap must be positive".to_owned(),

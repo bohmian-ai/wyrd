@@ -6,6 +6,7 @@ pub mod init;
 pub mod issuer;
 pub mod node_identity;
 
+use crate::components::operators::keys::OperatorKeys;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -1450,6 +1451,9 @@ fn attach_config_fields(
 ) -> Result<AppState, ServerBootError> {
     Ok(state
         .with_deployment_profile(config.deployment_profile)
+        .with_operator_keys(OperatorKeys::new(
+            config.verification.operator_keys.clone(),
+        ))
         .with_telemetry(telemetry)
         .with_limits(config.limits.into_state()))
 }

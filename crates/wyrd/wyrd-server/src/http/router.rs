@@ -26,6 +26,7 @@ use crate::components::platform::{
     platform_auth_router, platform_credentials_router, platform_identity_router,
     platform_login_router, platform_router,
 };
+use crate::components::operators::operator_connections_router;
 use crate::components::principals::principals_router;
 use crate::components::storage::storage_router;
 use crate::components::verification::verification_router;
@@ -68,6 +69,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(cards_router())
         .merge(principals_router())
         .merge(verification_router())
+        .merge(operator_connections_router())
         .merge(admin_router())
         .merge(otlp_router())
         .layer(middleware::from_fn_with_state(

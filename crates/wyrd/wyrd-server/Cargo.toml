@@ -69,6 +69,7 @@ sha2 = { workspace = true }
 sqlx = { workspace = true }
 subtle = { workspace = true }
 thiserror = { workspace = true }
+zeroize = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true }
 vala-sql = { path = "../../vala/vala-sql", version = "0.0.1" }

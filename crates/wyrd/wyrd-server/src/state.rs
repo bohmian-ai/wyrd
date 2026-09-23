@@ -38,6 +38,8 @@ use crate::config::{BifrostRuntimeConfig, BifrostTarget, DeploymentProfile, Forg
 #[cfg(feature = "test-support")]
 use crate::oracle::SilentForwardPeer;
 use crate::postgres::ServerPostgres;
+use crate::components::operators::keys::OperatorKeys;
+use crate::config::OperatorKeysConfig;
 use crate::verification::health::VerificationHealth;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
@@ -2087,6 +2089,8 @@ pub struct AppState {
     /// The runtime marks each capability it composes required and up or down;
     /// the readiness loop reports the server unready while one is absent.
     pub verification: Arc<VerificationHealth>,
+    /// Key-encryption keys that seal and open Operator connection credentials.
+    pub operator_keys: Arc<OperatorKeys>,
     /// Optional deterministic stream truncation controller for test servers.
     #[cfg(feature = "test-support")]
     pub query_stream_fault: Option<QueryStreamFaultController>,
@@ -2126,6 +2130,7 @@ impl AppState {
             readiness: Arc::new(ArcSwap::from_pointee(ReadinessSnapshot::initial())),
             peer_plane: Arc::new(crate::app::peer_plane::PeerPlaneStatus::default()),
             verification: Arc::default(),
+            operator_keys: Arc::new(OperatorKeys::new(OperatorKeysConfig::default())),
             #[cfg(feature = "test-support")]
             query_stream_fault: None,
             #[cfg(feature = "test-support")]
@@ -2187,6 +2192,13 @@ impl AppState {
     #[must_use]
     pub fn with_authz(mut self, authz: ServerAuthz) -> Self {
         self.authz = authz;
+        self
+    }
+
+    /// Use `keys` for Operator connection credentials.
+    #[must_use]
+    pub fn with_operator_keys(mut self, keys: OperatorKeys) -> Self {
+        self.operator_keys = Arc::new(keys);
         self
     }
 

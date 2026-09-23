@@ -87,6 +87,26 @@ impl Delivery {
     /// # Panics
     /// Panics when startup, seeding, or a connection create fails.
     async fn start() -> Self {
+        let delivery = Self::boot().await;
+        delivery
+            .connect(&[
+                json!({ "provider": "slack", "name": "ops-slack", "workspace_id": "T0001",
+                        "bot_token": SLACK_TOKEN }),
+                json!({ "provider": "pager_duty", "name": "ops-pagerduty",
+                        "integration_key": PAGER_KEY }),
+                json!({ "provider": "http", "name": "ops-hooks", "origin": delivery.mock.uri(),
+                        "auth": { "scheme": "header", "name": "X-Api-Key", "value": HOOK_KEY } }),
+            ])
+            .await;
+        delivery
+    }
+
+    /// Boot a bound server, seed a Verifier and an administrator, and start
+    /// the mock provider; creates no connection.
+    ///
+    /// # Panics
+    /// Panics when startup or seeding fails.
+    async fn boot() -> Self {
         let server = WyrdTestServer::builder()
             .without_audit_publication_for_test()
             .start_bound()
@@ -113,28 +133,27 @@ impl Delivery {
             .superuser_pool()
             .await
             .expect("fixture exposes a superuser pool");
-        let delivery = Self {
+        Self {
             server,
             seed,
             verifier,
             jwt,
             assertion,
             mock: MockServer::start().await,
-        };
-        for body in [
-            json!({ "provider": "slack", "name": "ops-slack", "workspace_id": "T0001",
-                    "bot_token": SLACK_TOKEN }),
-            json!({ "provider": "pager_duty", "name": "ops-pagerduty",
-                    "integration_key": PAGER_KEY }),
-            json!({ "provider": "http", "name": "ops-hooks", "origin": delivery.mock.uri(),
-                    "auth": { "scheme": "header", "name": "X-Api-Key", "value": HOOK_KEY } }),
-        ] {
-            let (status, view) = delivery
-                .call(Method::POST, "/v1/operator-connections", Some(&body))
+        }
+    }
+
+    /// Create every connection in `bodies` as the administrator.
+    ///
+    /// # Panics
+    /// Panics when a create is refused.
+    async fn connect(&self, bodies: &[Value]) {
+        for body in bodies {
+            let (status, view) = self
+                .call(Method::POST, "/v1/operator-connections", Some(body))
                 .await;
             assert_eq!(status, StatusCode::CREATED, "{view}");
         }
-        delivery
     }
 
     /// Send `method uri` with an optional JSON body as the administrator.
@@ -252,15 +271,36 @@ impl Delivery {
         crash: &CapabilityCrash,
     ) -> Running {
         let base = Url::parse(&self.mock.uri()).expect("mock URI");
+        self.spawn_to(
+            state,
+            limits,
+            script,
+            crash,
+            ProviderEndpoints {
+                slack: base.join("/slack").expect("slack URL"),
+                pager_duty: base.join("/pagerduty").expect("pagerduty URL"),
+            },
+        )
+    }
+
+    /// Spawn a runtime over `state` delivering fixed providers to `endpoints`.
+    ///
+    /// # Panics
+    /// Panics when the runtime cannot compose.
+    fn spawn_to(
+        &self,
+        state: &AppState,
+        limits: RuntimeLimits,
+        script: &EngineScript,
+        crash: &CapabilityCrash,
+        endpoints: ProviderEndpoints,
+    ) -> Running {
         let runtime = VerificationRuntime::builder(state)
             .limits(limits)
             .ingest_endpoint(self.server.grpc_url().expect("bound server serves gRPC"))
             .engine_script(script.clone())
             .crash_switch(crash.clone())
-            .provider_endpoints(ProviderEndpoints {
-                slack: base.join("/slack").expect("slack URL"),
-                pager_duty: base.join("/pagerduty").expect("pagerduty URL"),
-            })
+            .provider_endpoints(endpoints)
             .build()
             .expect("the runtime composes");
         let stop = CancellationToken::new();
@@ -885,4 +925,59 @@ async fn revoked_connection_fails_closed_and_key_outage_retries() {
             .is_empty(),
         "no provider is called without an authorized, decrypted credential"
     );
+}
+
+/// Gated live release smoke: a failed verdict posts to a dedicated Slack test
+/// channel and triggers a PagerDuty test service through the same Operator
+/// runner and the public provider endpoints.
+///
+/// Reads `WYRD_LIVE_SLACK_BOT_TOKEN`, `WYRD_LIVE_SLACK_WORKSPACE_ID`,
+/// `WYRD_LIVE_SLACK_CHANNEL_ID`, and `WYRD_LIVE_PAGERDUTY_KEY`; never runs in
+/// a credential-free lane.
+///
+/// # Panics
+/// Panics when a credential is unset or either dispatch is not delivered.
+#[tokio::test]
+#[ignore = "live release smoke: needs Slack and PagerDuty test credentials"]
+async fn live_smoke_delivers_to_slack_and_pagerduty() {
+    let env = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is set"));
+    let delivery = Delivery::boot().await;
+    delivery
+        .connect(&[
+            json!({ "provider": "slack", "name": "ops-slack",
+                    "workspace_id": env("WYRD_LIVE_SLACK_WORKSPACE_ID"),
+                    "bot_token": env("WYRD_LIVE_SLACK_BOT_TOKEN") }),
+            json!({ "provider": "pager_duty", "name": "ops-pagerduty",
+                    "integration_key": env("WYRD_LIVE_PAGERDUTY_KEY") }),
+        ])
+        .await;
+    let posted = delivery
+        .operator("live-slack", slack(&env("WYRD_LIVE_SLACK_CHANNEL_ID")))
+        .await;
+    let paged = delivery
+        .operator(
+            "live-pager",
+            json!({ "kind": "notify", "channel": { "kind": "pager_duty",
+                    "connection": "ops-pagerduty", "route": "wyrd-live-smoke",
+                    "severity": "info", "summary": "Wyrd live smoke {{run_id}}" } }),
+        )
+        .await;
+    delivery.fail_binding("owner", &[&posted, &paged]).await;
+    let running = delivery.spawn_to(
+        delivery.server.state(),
+        Delivery::limits(),
+        &failing_script(),
+        &CapabilityCrash::default(),
+        ProviderEndpoints::default(),
+    );
+    let run = delivery.new_run(&[]).await;
+    let rows = delivery
+        .wait_dispatches(run, 2, |row| {
+            row.status != "pending" && row.status != "running"
+        })
+        .await;
+    running.stop().await;
+    for row in rows.values() {
+        assert_eq!(row.status, "delivered", "{row:?}");
+    }
 }

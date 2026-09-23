@@ -1368,26 +1368,43 @@ Notify Operator *is* the alert.
 `NotifyChannel` (v1 set; closed tagged union; additional channels are
 protocol-versioned additions):
 
-| Channel     | Carries                                                                       |
-|-------------|-------------------------------------------------------------------------------|
-| `PagerDuty` | `severity`, `summary`, `dedup_key?: string`                                   |
-| `Slack`     | `text: string`                                                                |
+| Channel     | Carries                                                                            |
+|-------------|------------------------------------------------------------------------------------|
+| `Slack`     | `connection`, `channel_id`, `text` — `chat.postMessage` with the bot token; success is JSON `ok` |
+| `PagerDuty` | `connection`, `route`, `severity`, `summary`, `dedup_key?` — Events API v2 trigger; the default dedup key is the dispatch ID |
 
 `HttpMethod`: closed enum — `Get | Post | Put | Patch | Delete`.
 
-`HttpAuth` (closed tagged union):
-- `None`
-- `Bearer { env: string }` — `env` names a server-side env var holding the token
-- `Basic { env: string }` — env var holds `user:password`
-- `Header { name: string, env: string }` (covers `X-API-Key`,
-  `Authorization: token <foo>`)
+`HttpAuth` (closed tagged union; absent means no credential):
+- `Bearer { connection }`
+- `Basic { connection }`
+- `Header { name, connection }` (covers `X-API-Key`)
 
-Wyrd-the-server resolves `env` by reading the process environment at fire time;
-missing env vars fail the action closed. Cards never carry secret material.
-Notify channels (Slack/PagerDuty) and Source (S3/GCS/Azure) resolve their
-credentials from the server's own configuration — webhook URLs, routing keys,
-and object-store credentials live in the server's env or its operator config,
-not in the card.
+**Operator connections.** Cards never carry secret material; they name a
+tenant connection by provider and name. Tenant administrators manage
+connections through `/v1/operator-connections` (`operators:read` /
+`operators:write`) and every SDK, CLI, and MCP projection. Wyrd stores each
+secret itself in Postgres, envelope-encrypted: a per-row data key sealed with
+AAD binding tenant, connection, provider, name, and secret version, wrapped by
+a versioned key-encryption key from an environment variable, owner-only
+files, or HashiCorp Vault KV v2. Multi-tenant production requires Vault so
+each tenant has its own key; without a readable key only credential writes
+refuse. Responses, logs, and audit carry only redacted metadata. Registration
+and every delivery attempt require an active connection whose provider — and,
+for HTTP, auth scheme, header name, and origin of every effective URL —
+match; a mismatch fails closed with one indistinguishable error. Rotation
+takes effect on the next attempt with no Card revision.
+
+**Delivery.** A generic Operator worker takes a global (16) and per-tenant (4)
+permit, claims a due dispatch, re-checks authority, decrypts the latest
+credential for that attempt only, and screens and pins every destination
+address before a credential is attached; HTTP follows only same-origin
+redirects and sends `Idempotency-Key: <dispatch_id>`. Each attempt is bounded
+to 30 seconds; a dispatch gets three attempts with 30-second then two-minute
+backoff (or a longer provider `Retry-After`) inside a five-minute deadline.
+Connection failures, timeouts, credential-store outages, 408, 429, and 5xx
+retry; missing or unauthorized credentials, invalid destinations or
+templates, and other 4xx fail terminally. Delivery is at least once.
 
 `HttpBody`: structured JSON (`JsonValue`). Any string leaf may contain
 `{{...}}` placeholders the server interpolates at fire time. Same templating

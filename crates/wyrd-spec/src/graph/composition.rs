@@ -849,6 +849,8 @@ mod tests {
             "kind": "notify",
             "channel": {
                 "kind": "pager_duty",
+                "connection": "pagerduty",
+                "route": "team-a",
                 "severity": "critical",
                 "summary": "verification failed",
             },

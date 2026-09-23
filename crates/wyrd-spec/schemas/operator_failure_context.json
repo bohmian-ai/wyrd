@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OperatorFailureContext",
+  "description": "The bounded, immutable context every Operator invocation renders from.\n\nFrozen on the dispatch row when a failed binding-created run settles, so every retry renders the same payload. It carries identities, the verdict, completion time, and a bounded summary only: no Eval context, media, Drift feature rows, result detail, or secret material. Template placeholder names are exactly [`OperatorFailureContext::FIELDS`].",
+  "type": "object",
+  "required": [
+    "binding_id",
+    "completed_at",
+    "dispatch_id",
+    "result_id",
+    "run_id",
+    "subject_ref",
+    "subject_uid",
+    "summary",
+    "verdict",
+    "verifier_ref",
+    "verifier_uid"
+  ],
+  "properties": {
+    "binding_id": {
+      "description": "The binding that configured this Operator.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "completed_at": {
+      "description": "When the run settled.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "dispatch_id": {
+      "description": "The dispatch being delivered.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "result_id": {
+      "description": "The run's canonical result.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "run_id": {
+      "description": "The failed run.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "subject_ref": {
+      "description": "Exact subject identity as `space/name@version`.",
+      "type": "string"
+    },
+    "subject_uid": {
+      "description": "Exact subject Card UID.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/CardUid"
+        }
+      ]
+    },
+    "summary": {
+      "description": "Bounded human-readable result summary.",
+      "type": "string"
+    },
+    "verdict": {
+      "description": "Always `failed`.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/VerificationVerdict"
+        }
+      ]
+    },
+    "verifier_ref": {
+      "description": "Exact Verifier identity as `space/name@version`.",
+      "type": "string"
+    },
+    "verifier_uid": {
+      "description": "Exact Verifier Card UID.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/CardUid"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "CardUid": {
+      "description": "Resolved immutable Card UID.",
+      "type": "string"
+    },
+    "VerificationVerdict": {
+      "description": "Common Verifier verdict of a completed run.\n\nCarried by the Bifrost result and used by settlement to decide Operator dispatch; Run GET never returns it.",
+      "oneOf": [
+        {
+          "description": "Expectations held.",
+          "type": "string",
+          "enum": [
+            "passed"
+          ]
+        },
+        {
+          "description": "Expectations were violated; a binding-created run dispatches Operators.",
+          "type": "string",
+          "enum": [
+            "failed"
+          ]
+        },
+        {
+          "description": "No judgment could be made; never a pass.",
+          "type": "string",
+          "enum": [
+            "inconclusive"
+          ]
+        }
+      ]
+    }
+  }
+}

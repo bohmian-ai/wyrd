@@ -112,6 +112,11 @@ id_type!(
 );
 id_type!(ArtifactKey, "Artifact storage key.", validate_token);
 id_type!(RoleName, "RBAC role identifier.", validate_token);
+id_type!(
+    ConnectionName,
+    "Immutable tenant-scoped Operator connection name, unique per provider.",
+    validate_token
+);
 id_type!(ColumnName, "DataCard column name.", validate_card_token);
 id_type!(
     FeatureName,
@@ -340,6 +345,15 @@ uuid7_id_type!(
     /// configured Operator. Every delivery retry keeps it, so it is also the
     /// idempotency key an external destination may honor.
     OperatorDispatchId
+);
+
+uuid7_id_type!(
+    /// Durable identity of one tenant Operator connection.
+    ///
+    /// The server mints it on create; secret rotation, metadata updates,
+    /// disable, and re-enable keep it, so Cards name the connection by its
+    /// immutable name while management surfaces address it by this ID.
+    OperatorConnectionId
 );
 
 /// Generate a UUIDv7 string for Wyrd-owned identifiers.

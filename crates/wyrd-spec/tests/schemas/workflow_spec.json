@@ -1185,6 +1185,10 @@
       "description": "Resolved immutable Card UID.",
       "type": "string"
     },
+    "ConnectionName": {
+      "description": "Immutable tenant-scoped Operator connection name, unique per provider.",
+      "type": "string"
+    },
     "GoogleBatchEmbedRequest": {
       "type": "object",
       "required": [
@@ -1815,35 +1819,23 @@
       }
     },
     "HttpAuth": {
-      "description": "Server-side authentication sources for an HTTP action.",
+      "description": "Credential authority of an HTTP action, bound to a tenant `http` connection.\n\nThe scheme and custom header name must equal the named connection's stored authority at registration and before every attempt.",
       "oneOf": [
         {
-          "description": "No authentication.",
+          "description": "`Authorization: Bearer` from the connection's token.",
           "type": "object",
           "required": [
+            "connection",
             "scheme"
           ],
           "properties": {
-            "scheme": {
-              "type": "string",
-              "enum": [
-                "none"
+            "connection": {
+              "description": "Name of the tenant's `http` connection.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ConnectionName"
+                }
               ]
-            }
-          },
-          "additionalProperties": false
-        },
-        {
-          "description": "Bearer token loaded from an environment variable.",
-          "type": "object",
-          "required": [
-            "env",
-            "scheme"
-          ],
-          "properties": {
-            "env": {
-              "description": "Environment variable name.",
-              "type": "string"
             },
             "scheme": {
               "type": "string",
@@ -1855,16 +1847,20 @@
           "additionalProperties": false
         },
         {
-          "description": "`user:password` loaded from an environment variable.",
+          "description": "`Authorization: Basic` from the connection's username and password.",
           "type": "object",
           "required": [
-            "env",
+            "connection",
             "scheme"
           ],
           "properties": {
-            "env": {
-              "description": "Environment variable name.",
-              "type": "string"
+            "connection": {
+              "description": "Name of the tenant's `http` connection.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ConnectionName"
+                }
+              ]
             },
             "scheme": {
               "type": "string",
@@ -1876,20 +1872,24 @@
           "additionalProperties": false
         },
         {
-          "description": "Custom header value loaded from an environment variable.",
+          "description": "A custom header carrying the connection's value.",
           "type": "object",
           "required": [
-            "env",
+            "connection",
             "name",
             "scheme"
           ],
           "properties": {
-            "env": {
-              "description": "Environment variable name.",
-              "type": "string"
+            "connection": {
+              "description": "Name of the tenant's `http` connection.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ConnectionName"
+                }
+              ]
             },
             "name": {
-              "description": "Header name.",
+              "description": "Header name, compared case-insensitively with the connection's.",
               "type": "string"
             },
             "scheme": {
@@ -2222,16 +2222,26 @@
       "description": "Typed notification destinations.",
       "oneOf": [
         {
-          "description": "PagerDuty event payload.",
+          "description": "PagerDuty Events API v2 trigger through a tenant Global Integration key.",
           "type": "object",
           "required": [
+            "connection",
             "kind",
+            "route",
             "severity",
             "summary"
           ],
           "properties": {
+            "connection": {
+              "description": "Name of the tenant's `pager_duty` connection.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ConnectionName"
+                }
+              ]
+            },
             "dedup_key": {
-              "description": "Optional de-duplication key.",
+              "description": "Optional de-duplication key template; the dispatch ID when omitted.",
               "type": [
                 "string",
                 "null"
@@ -2243,25 +2253,47 @@
                 "pager_duty"
               ]
             },
-            "severity": {
-              "description": "PagerDuty severity.",
+            "route": {
+              "description": "Route sent as `payload.custom_details.wyrd_route` for PagerDuty Service Routes.",
               "type": "string"
             },
+            "severity": {
+              "description": "PagerDuty event severity.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/PagerDutySeverity"
+                }
+              ]
+            },
             "summary": {
-              "description": "Human-readable event summary.",
+              "description": "Event summary template.",
               "type": "string"
             }
           },
           "additionalProperties": false
         },
         {
-          "description": "Slack message payload.",
+          "description": "Slack `chat.postMessage` through a tenant workspace bot token.",
           "type": "object",
           "required": [
+            "channel_id",
+            "connection",
             "kind",
             "text"
           ],
           "properties": {
+            "channel_id": {
+              "description": "Slack conversation ID the app may post in.",
+              "type": "string"
+            },
+            "connection": {
+              "description": "Name of the tenant's `slack` connection.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ConnectionName"
+                }
+              ]
+            },
             "kind": {
               "type": "string",
               "enum": [
@@ -2269,7 +2301,7 @@
               ]
             },
             "text": {
-              "description": "Message text.",
+              "description": "Message text template.",
               "type": "string"
             }
           },
@@ -4540,7 +4572,7 @@
           ],
           "properties": {
             "auth": {
-              "description": "Optional server-side authentication binding.",
+              "description": "Credential authority; omitted for an unauthenticated request.",
               "anyOf": [
                 {
                   "$ref": "#/definitions/HttpAuth"
@@ -4551,10 +4583,10 @@
               ]
             },
             "body": {
-              "description": "Optional structured JSON body."
+              "description": "Optional structured JSON body; string values are templates."
             },
             "expect_status": {
-              "description": "Optional expected response status.",
+              "description": "Optional expected response status; any 2xx is accepted when omitted.",
               "type": [
                 "integer",
                 "null"
@@ -4563,7 +4595,7 @@
               "minimum": 0.0
             },
             "headers": {
-              "description": "Optional request headers.",
+              "description": "Optional request headers; values are templates.",
               "type": "object",
               "additionalProperties": {
                 "type": "string"
@@ -4584,7 +4616,7 @@
               ]
             },
             "timeout_seconds": {
-              "description": "Optional request timeout.",
+              "description": "Optional request timeout, clipped to [`MAX_ATTEMPT_SECONDS`].",
               "type": [
                 "integer",
                 "null"
@@ -4593,7 +4625,7 @@
               "minimum": 0.0
             },
             "url": {
-              "description": "URL template.",
+              "description": "URL template; its origin is literal and `{{field}}` placeholders may appear only in the path and query.",
               "type": "string"
             }
           },
@@ -4620,6 +4652,39 @@
           ]
         }
       }
+    },
+    "PagerDutySeverity": {
+      "description": "PagerDuty Events API v2 severities.",
+      "oneOf": [
+        {
+          "description": "critical.",
+          "type": "string",
+          "enum": [
+            "critical"
+          ]
+        },
+        {
+          "description": "error.",
+          "type": "string",
+          "enum": [
+            "error"
+          ]
+        },
+        {
+          "description": "warning.",
+          "type": "string",
+          "enum": [
+            "warning"
+          ]
+        },
+        {
+          "description": "info.",
+          "type": "string",
+          "enum": [
+            "info"
+          ]
+        }
+      ]
     },
     "ParameterValue": {
       "description": "Typed parameter value for experiments, runs, workflows, and tools.",

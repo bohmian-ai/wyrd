@@ -1,0 +1,198 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OperatorConnectionView",
+  "description": "Redacted connection read returned by every management surface.",
+  "type": "object",
+  "oneOf": [
+    {
+      "description": "Slack authority.",
+      "type": "object",
+      "required": [
+        "provider",
+        "workspace_id"
+      ],
+      "properties": {
+        "provider": {
+          "type": "string",
+          "enum": [
+            "slack"
+          ]
+        },
+        "workspace_id": {
+          "description": "Slack workspace ID.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "PagerDuty has no nonsecret configuration.",
+      "type": "object",
+      "required": [
+        "provider"
+      ],
+      "properties": {
+        "provider": {
+          "type": "string",
+          "enum": [
+            "pager_duty"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "HTTP authority.",
+      "type": "object",
+      "required": [
+        "auth",
+        "origin",
+        "provider"
+      ],
+      "properties": {
+        "auth": {
+          "description": "Scheme and custom header name.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/HttpAuthScheme"
+            }
+          ]
+        },
+        "origin": {
+          "description": "The only origin the credential may be sent to.",
+          "type": "string"
+        },
+        "provider": {
+          "type": "string",
+          "enum": [
+            "http"
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  ],
+  "required": [
+    "connection_id",
+    "created_at",
+    "name",
+    "status",
+    "updated_at"
+  ],
+  "properties": {
+    "connection_id": {
+      "description": "Connection identity.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "created_at": {
+      "description": "Creation time.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "name": {
+      "description": "Immutable name.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/ConnectionName"
+        }
+      ]
+    },
+    "status": {
+      "description": "Whether Operators may use it.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/OperatorConnectionStatus"
+        }
+      ]
+    },
+    "updated_at": {
+      "description": "Last update time.",
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "definitions": {
+    "ConnectionName": {
+      "description": "Immutable tenant-scoped Operator connection name, unique per provider.",
+      "type": "string"
+    },
+    "HttpAuthScheme": {
+      "description": "Redacted HTTP authority: the scheme and custom header name only.",
+      "oneOf": [
+        {
+          "description": "Bearer token.",
+          "type": "object",
+          "required": [
+            "scheme"
+          ],
+          "properties": {
+            "scheme": {
+              "type": "string",
+              "enum": [
+                "bearer"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Username and password.",
+          "type": "object",
+          "required": [
+            "scheme"
+          ],
+          "properties": {
+            "scheme": {
+              "type": "string",
+              "enum": [
+                "basic"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Custom header.",
+          "type": "object",
+          "required": [
+            "name",
+            "scheme"
+          ],
+          "properties": {
+            "name": {
+              "description": "Header name as created.",
+              "type": "string"
+            },
+            "scheme": {
+              "type": "string",
+              "enum": [
+                "header"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "OperatorConnectionStatus": {
+      "description": "Whether a connection may be used by Operators.",
+      "oneOf": [
+        {
+          "description": "Registration and delivery may use it.",
+          "type": "string",
+          "enum": [
+            "active"
+          ]
+        },
+        {
+          "description": "Retained for lineage; registration and delivery refuse it.",
+          "type": "string",
+          "enum": [
+            "disabled"
+          ]
+        }
+      ]
+    }
+  }
+}

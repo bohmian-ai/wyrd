@@ -23,7 +23,7 @@ use vala_drift::{DriftReport, DriftVerdict, FeatureDriftReport};
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_server::components::operators::keys::OperatorKeys;
-use wyrd_server::config::{OperatorKeySource, OperatorKeysConfig};
+use wyrd_server::config::{OperatorKeySource, OperatorKeysConfig, VaultKeysConfig};
 use wyrd_server::state::AppState;
 use wyrd_server::verification::engines::{EngineOutcome, VerifierReport};
 use wyrd_server::verification::health::RuntimeCapability;
@@ -1108,5 +1108,203 @@ async fn operator_permits_cap_each_tenant_without_starving_another() {
     assert!(
         other_delivered_while_busy,
         "the other tenant delivered while the busy tenant was saturated"
+    );
+}
+
+/// Key versions of every Operator connection of `tenant`.
+///
+/// # Panics
+/// Panics when the connection table cannot be read.
+async fn key_versions(pool: &PgPool, tenant: DataTenantId) -> Vec<i32> {
+    sqlx::query_scalar(
+        "SELECT key_version FROM wyrd.operator_connections \
+          WHERE data_tenant_id = $1 ORDER BY connection_id",
+    )
+    .bind(tenant.as_uuid())
+    .fetch_all(pool)
+    .await
+    .expect("key versions read")
+}
+
+/// Rewrap runs beside delivery, never ahead of it: while a stalled key
+/// provider times out every rewrap of one tenant's stale rows, another
+/// tenant's due dispatch is still claimed and delivered; each timed-out pass
+/// rolls back and is retried, and shutdown cancels the stalled pass at once.
+/// Once the provider answers, one pass rewraps every row reading each key
+/// version exactly once.
+///
+/// # Panics
+/// Panics when delivery waits on rewrap, a stalled pass commits or blocks
+/// shutdown, or a key version is read more than once in a pass.
+#[tokio::test]
+async fn slow_rewrap_never_holds_back_another_tenants_delivery() {
+    use base64::Engine as _;
+    let delivery = Delivery::start().await;
+    let origin = delivery.mock.uri();
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&delivery.mock)
+        .await;
+    let stale_tenant = delivery.seed.tenant();
+    assert_eq!(
+        key_versions(&delivery.assertion, stale_tenant).await,
+        vec![1, 1, 1]
+    );
+
+    let other_tenant = DataTenantId::new_v7();
+    delivery
+        .server
+        .pg_fixture()
+        .seed_additional_tenant_with_uuid(other_tenant, "operator-rewrap-other")
+        .await
+        .expect("second tenant seeds");
+    let other =
+        VerificationFixture::provision(delivery.server.state().postgres.wyrd(), other_tenant)
+            .await
+            .expect("second tenant provisions");
+    let other_verifier = other.drift_verifier("drift").await.expect("verifier seeds");
+    let quick = other
+        .operator(
+            "quick",
+            &json!({ "kind": "http", "method": "post", "url": format!("{origin}/quick") }),
+        )
+        .await
+        .expect("operator seeds");
+    let (owner, principal) = other.service("quiet").await.expect("owner seeds");
+    let binding = other
+        .bind_schedule(
+            &owner,
+            &owner,
+            &other_verifier,
+            "0 2 * * *",
+            vec![FrozenTarget::Uid(quick.clone())],
+        )
+        .await
+        .expect("binding projects");
+    other.activate(principal).await.expect("owner activates");
+    other
+        .make_binding_due(binding)
+        .await
+        .expect("binding is due");
+
+    let vault = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
+        .mount(&vault)
+        .await;
+    let mut replica = delivery.server.state().clone();
+    replica.operator_keys = Arc::new(
+        OperatorKeys::new(OperatorKeysConfig {
+            source: OperatorKeySource::Vault,
+            active_version: std::num::NonZeroU32::new(2).expect("nonzero"),
+            vault: Some(VaultKeysConfig {
+                addr: vault.uri(),
+                mount: "secret".to_owned(),
+                prefix: "wyrd/operator-keys".to_owned(),
+                token_file: None,
+                token: Some(secrecy::SecretString::from("rewrap-vault-token")),
+            }),
+            ..OperatorKeysConfig::default()
+        })
+        .expect("vault keys build"),
+    );
+    let limits = RuntimeLimits {
+        rewrap_interval: Duration::from_millis(50),
+        rewrap_tenant_budget: Duration::from_millis(300),
+        ..Delivery::limits()
+    };
+    let running = delivery.spawn(
+        &replica,
+        limits,
+        &failing_script(1),
+        &CapabilityCrash::default(),
+    );
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let delivered = loop {
+        let status: Option<String> = sqlx::query_scalar(
+            "SELECT status FROM wyrd.operator_dispatches WHERE data_tenant_id = $1",
+        )
+        .bind(other_tenant.as_uuid())
+        .fetch_optional(&delivery.assertion)
+        .await
+        .expect("dispatch reads");
+        if status.as_deref() == Some("delivered") {
+            break status;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the other tenant's dispatch was held back: {status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(delivered.as_deref(), Some("delivered"));
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while vault.received_requests().await.expect("recorded").len() < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a timed-out rewrap pass is retried"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let stopping = tokio::time::Instant::now();
+    running.stop().await;
+    assert!(
+        stopping.elapsed() < Duration::from_secs(5),
+        "shutdown cancels a stalled rewrap pass: {:?}",
+        stopping.elapsed()
+    );
+    assert_eq!(
+        key_versions(&delivery.assertion, stale_tenant).await,
+        vec![1, 1, 1],
+        "timed-out and cancelled passes roll back"
+    );
+
+    let engine = base64::engine::general_purpose::STANDARD;
+    let v1 = std::fs::read_to_string(
+        delivery
+            .server
+            .operator_keys_dir_for_test()
+            .expect("generated key directory")
+            .join("v1"),
+    )
+    .expect("key v1 reads");
+    vault.reset().await;
+    let key_path = |version: u32| format!("/v1/secret/data/wyrd/operator-keys/{stale_tenant}/{version}");
+    for (version, key) in [(1, v1.trim().to_owned()), (2, engine.encode([8_u8; 32]))] {
+        Mock::given(method("GET"))
+            .and(path(key_path(version)))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "data": { "data": { "key": key } } })),
+            )
+            .mount(&vault)
+            .await;
+    }
+    let running = delivery.spawn(
+        &replica,
+        limits,
+        &EngineScript::default(),
+        &CapabilityCrash::default(),
+    );
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while key_versions(&delivery.assertion, stale_tenant).await != vec![2, 2, 2] {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "rewrap never completed"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    running.stop().await;
+    let reads: Vec<String> = vault
+        .received_requests()
+        .await
+        .expect("recorded")
+        .iter()
+        .map(|request| request.url.path().to_owned())
+        .collect();
+    assert_eq!(
+        reads,
+        vec![key_path(2), key_path(1)],
+        "one pass reads the active and the repeated old version once each"
     );
 }

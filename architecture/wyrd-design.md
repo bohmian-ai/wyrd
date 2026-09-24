@@ -169,10 +169,12 @@ not a passive integration or inventory product.
     administrative or tenant-created automation principal is representable
     with no Card and therefore no emit scope. `User` is the marker for human
     identity. `System` is a tenant-local server identity used only for
-    canonical verification-result publication. It has no public credential,
-    role, refresh, workload, delegation, or principal-management path; the
-    server mints its short-lived token with exactly one UID-bearing Verifier
-    scope and the fixed result-write capability. Platform authority is a grant
+    canonical verification-result publication and the fixed Drift observation
+    read. It has no public credential, role, refresh, workload, delegation, or
+    principal-management path; the server mints each short-lived token with
+    exactly one UID-bearing Verifier scope and exactly one fixed capability:
+    result write, or `bifrost_query:read` scoped to the tenant's registered
+    `vala.drift.observations` table. No token carries both. Platform authority is a grant
     held at platform scope, not a property of a kind, and neither plane's
     credential or token is accepted by the other. `wyrd apply -f service.yaml`
     (or an Agent card) creates

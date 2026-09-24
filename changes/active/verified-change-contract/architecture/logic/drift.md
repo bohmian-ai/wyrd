@@ -131,7 +131,7 @@ Verifier.
 
 ## Standardized analysis plans
 
-The Drift implementation has three fixed, server-owned DataFusion plan
+The Drift implementation has three fixed, server-owned aggregate query
 families: PSI, subgroup SPC, and Custom. There is no user-authored SQL and no
 per-feature physical schema discovery. `DriftSignal` names the features;
 registration fits and persists a `FittedBaseline`. At run time the runner
@@ -139,8 +139,8 @@ loads that exact fitted baseline. For each PSI feature, its fitted `bin_type`
 chooses `num_value` or `str_value`, and its fitted bins supply numeric bounds
 or category labels. SPC's fitted `chunk_size` chooses subgroup size. Custom's
 authored `Metric.name` chooses `series` and its authored baseline supplies the
-comparison value. The plan operators are fixed; these values are typed
-runtime literals, not executable query text.
+comparison value. The query operators are fixed; these values are escaped
+typed literals in server-built SQL, never Verifier-authored query text.
 
 ```text
 for (feature_name, fitted_feature) in fitted_baseline.features:
@@ -150,17 +150,22 @@ for (feature_name, fitted_feature) in fitted_baseline.features:
 Custom             -> aggregate num_value where series = profile.metric_name
 ```
 
-Use Oracle's existing internal `query_plan(LogicalPlan, ...)` authorization,
-admission, snapshot, and Arrow-stream seam, and wire it as a real
-VerificationRuntime dependency. Build the plan from typed DataFusion
-expressions: canonical Bifrost table scan -> tenant-authorized subject,
-`series`, and `[start, end)` filter -> method-specific projection/aggregate.
-Numeric edges and category labels become typed `CASE` literals, not a
-temporary profile TableScan or interpolated SQL. The current `query_plan`
-seam has no production Verifier caller and must be integration-tested,
-including its execution path and admission behavior. Only aggregate rows
-return to Rust; SPC rows stream through a bounded eight-point rule window
-instead of accumulating an unbounded raw-sample vector. The existing
+The runner reads through the ordinary server query service as the tenant's
+SYSTEM Drift reader (spec REQ-086, revision 36): it mints and verifies a
+short-lived token holding only `bifrost_query:read` on the tenant's
+registered `vala.drift.observations` table, then submits one fixed SQL
+statement per feature through capability admission, Gate, and a local or
+peer-forwarded Oracle. No Oracle need run in the verification process. The
+statement is canonical table -> exact subject, `series`, and `[start, end)`
+filter -> method-specific projection/aggregate. The subject UID, feature
+name, numeric edges, category labels, and window bounds are rendered as
+escaped typed SQL literals; the Verifier contributes no SQL text. The stream
+is settled by the server's shared query consumer: terminal and row-total
+validation, clean end-of-stream, the query deadline, and cancel-and-settle on
+any failure. Only aggregate rows return to Rust, and each decoded batch is
+folded as it arrives; SPC chunk means stream through rule state bounded by
+the largest parsed WECO or trend lookback instead of accumulating every
+chunk. The existing
 `feature.rs` helpers read wide baseline Arrow batches; they are not a mapper
 for this tall observation table and may
 be retained for fitting or replaced there.
@@ -306,9 +311,8 @@ WHERE card_uid = <subject_uid>
   AND wyrd_event_time < <window_end>;
 ```
 
-This SQL is the logical plan shape, **not** runtime-assembled SQL or a new
-public query surface. `<...>` are typed plan inputs from the frozen run and
-Verifier. Oracle supplies the normal tenant boundary and live-tail fence.
+This is the server-built statement shape, not a new public query surface.
+`<...>` are escaped typed literals from the frozen run and Verifier. Oracle supplies the normal tenant boundary and live-tail fence.
 The worker never loads raw values or averages client-batch averages.
 
 ```text
@@ -453,7 +457,7 @@ Rust/Python/TypeScript client-to-server journey that proves:
    partition, and prove canonical category string parity with Data Card
    baseline fitting. Reuse the existing client queue, Gate, and Scribe path.
 2. Wire the generic runner's Drift dispatch to fitted-baseline readiness and
-   Oracle's typed `query_plan` path. Test tenant authorization, subject/series
+   the ordinary server query service under the SYSTEM Drift read token. Test tenant authorization, subject/series
    predicates, fixed ingest-time window, live-tail visibility, bounded
    aggregate output, and Oracle admission. Do not add a public SQL API or
    profile `MemTable` scan.

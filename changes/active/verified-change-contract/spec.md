@@ -1,6 +1,6 @@
 ---
 id: SPEC-verified-change-contract
-revision: 35
+revision: 36
 status: approved
 ---
 
@@ -110,8 +110,9 @@ make the standalone LLM-judge Verifier implementation part of this delivery.
 - **Internal SYSTEM result writer**: one server-only tenant principal, persisted
   in the existing tenant machine-principal store with `kind: system`, a
   server-minted UUIDv7, and the fixed name `verification-results-writer`. It is
-  used only to publish Verification Result batches and has no public
-  credential, Card, role grant, refresh, workload, delegation, or
+  used only for two server-minted purposes, each in its own token: publishing
+  Verification Result batches and the fixed Drift observation read. It has no
+  public credential, Card, role grant, refresh, workload, delegation, or
   principal-management path.
 - **Operator connection**: one tenant-owned, provider-specific Postgres record
   containing nonsecret delivery coordinates and an encrypted credential. Cards
@@ -954,6 +955,42 @@ table on `(data_tenant_id, result_id)`.
   internal path. The global `SYSTEM_OWNER` tenant, platform audit principal,
   and audit-publisher identity MUST NOT be reused.
 
+  Drift observation reads use a second, mutually exclusive SYSTEM token
+  purpose. Immediately before each Drift aggregate query the runner mints,
+  through the same tenant issuer and persisted SYSTEM principal, a
+  five-minute-or-shorter token with no roles, credential attribution,
+  delegation chain, or bound root Card, whose only permission is
+  `bifrost_query:read` scoped to the table object
+  `{ catalog: vala, schema: drift, table_uid }` of the tenant's registered
+  `vala.drift.observations` table. The issuer resolves that existing table UID
+  in the caller's tenant transaction and MUST NOT create or register a table;
+  when the tenant has no such table no token is minted and the run scores an
+  empty window (Custom completes `inconclusive` with no report). The token's
+  Card scope is the run's exact UID-bearing Verifier CardRef and serves
+  attribution only; it does not limit what Oracle reads. No SYSTEM token
+  carries both the result-write and read permission. Verification MUST accept
+  a `kind=system` claim set only when its permissions are exactly
+  `bifrost_record:write` or exactly one table-scoped `bifrost_query:read` on
+  catalog `vala`, schema `drift`, and MUST refuse every other set, scope, or
+  combination as forged.
+
+  The runner verifies the minted read token with the server's ordinary token
+  verifier, derives the query caller from the verified principal, and
+  dispatches through the ordinary server query service: coarse capability
+  admission, Gate, and a local or peer-forwarded Oracle. It MUST NOT assume an
+  Oracle is active in its own process, construct a principal or query context
+  by hand, or add an Oracle endpoint, client query route, or plan
+  serialization. Oracle's table authorization is the enforcement point; each
+  read records the canonical Oracle read decision and each denial the
+  canonical audited denial. Minting records no audit. The token does not
+  enforce subject, series, or window limits: the server-built fixed SQL
+  supplies those filters from the frozen run and fitted baseline, rendering
+  the subject UID, feature name, fitted edges and labels, and window bounds as
+  escaped typed literals. A Verifier contributes no SQL text. Registration
+  authorization is not standing query authorization. A read token is refused
+  by every record-write admission, and a result-write token is refused by
+  query admission.
+
   Every non-empty required detail batch is written before the canonical
   summary batch, and each is separately acknowledged. A result with zero
   details—such as sampled-out Eval or pre-scoring inconclusive Drift—writes no
@@ -1677,7 +1714,10 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
   create, list, get, update, suspend/delete, credential, refresh, workload,
   delegation, impersonation, and token-exchange operations for SYSTEM,
   non-SYSTEM writes to any result table, and SYSTEM writes to every other
-  table. They MUST also prove the existing tenant issuer/JWT format and the
+  table. They MUST prove that a SYSTEM read token is refused against another
+  table and another tenant and cannot write results, and that a verification
+  process without a local Oracle completes a Drift run through peer-forwarded
+  Oracle with an audited read decision. They MUST also prove the existing tenant issuer/JWT format and the
   single canonical Gate authorization audit. Two bindings for one subject MUST
   remain independently filterable through runs/results while sharing the one
   raw subject observation without Verifier/binding columns or per-binding
@@ -1716,7 +1756,8 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
 
 ## Open material decisions
 
-None. Revision 35 was explicitly approved by the user on 2026-09-22.
+None. Revision 36 was directed by the user on 2026-09-24 in the TASK-005 r1
+remediation plan.
 
 ## Material authority links
 
@@ -1939,3 +1980,13 @@ None. Revision 35 was explicitly approved by the user on 2026-09-22.
   tolerances, and checker-based enforcement, and required behavioral Postgres
   regression evidence for each corrected shared write path. This revision was
   explicitly approved by the user on 2026-09-22.
+- **Revision 36 SYSTEM Drift read (2026-09-24):** Resolved TASK-005 r1
+  `FIND-TASK-005-6`. Added a second, mutually exclusive SYSTEM token purpose:
+  a short-lived `bifrost_query:read` token scoped to the tenant's registered
+  `vala.drift.observations` table UID, resolved without creating the table.
+  Drift verifies it through the ordinary verifier and dispatches server-built
+  fixed SQL through the ordinary query service, Gate, and local or
+  peer-forwarded Oracle, replacing the local typed `query_plan` seam and the
+  hand-built SYSTEM principal. Stated that the token does not enforce
+  subject, series, or window limits. This revision was directed by the user
+  on 2026-09-24.

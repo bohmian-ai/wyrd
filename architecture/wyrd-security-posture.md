@@ -69,10 +69,12 @@ Card-bound identities are provisioned idempotently by tenant, principal kind,
 Card kind, and Card UID. Re-applying a Card preserves the principal identity.
 Credential issuance is a separate privileged operation and is policy-gated.
 The verification runtime also provisions one UUIDv7 `system` principal per
-tenant for canonical result publication. It is not Card-bound or publicly
-manageable, has no credential, role grant, refresh, workload, or delegation
-path, and can receive only a server-minted access token scoped to one exact
-Verifier Card for the reserved verification result tables.
+tenant for canonical result publication and the fixed Drift observation read.
+It is not Card-bound or publicly manageable, has no credential, role grant,
+refresh, workload, or delegation path, and can receive only server-minted
+access tokens scoped to one exact Verifier Card: one for the reserved
+verification result tables, or one for reading the tenant's
+`vala.drift.observations` table.
 
 A tenant administrator is created once, during tenant provisioning, and is the
 tenant's headless root of trust: it holds credentials and roles, federates no
@@ -141,9 +143,15 @@ credential.
   and reads no store, holds no cache, and resolves no roles.
 - Internal verification-result tokens use that same issuer and token format,
   but load the tenant's persisted `system` principal and carry no roles,
-  credential, delegation chain, or bound root Card. Their permissions are
-  exactly `bifrost_record:write` and their Card scope contains exactly one
-  UID-bearing Verifier. This fixed server capability is not a public grant.
+  credential, delegation chain, or bound root Card. Their Card scope contains
+  exactly one UID-bearing Verifier, and their permissions are exactly one
+  fixed purpose: `bifrost_record:write` for result publication, or
+  `bifrost_query:read` scoped to the tenant's registered
+  `vala.drift.observations` table UID for Drift reads. No token carries both.
+  The read token's Verifier scope is attribution only; Oracle's table
+  authorization enforces the read, and the server-built SQL, not the token,
+  limits subject, series, and window. These fixed server capabilities are not
+  public grants.
 - Revoking a credential, suspending or deleting a principal, suspending a
   tenant, or changing grants refuses the next issuance immediately. A tenant
   token already issued keeps its snapshot authority until its five-minute

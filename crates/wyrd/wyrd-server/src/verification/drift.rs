@@ -813,8 +813,7 @@ mod tests {
         let scorable = run(&sql, &null)
             .await
             .iter()
-            .map(|batch| fold_psi(batch, &mut counts).expect("well-formed"))
-            .all(|scorable| scorable);
+            .all(|batch| fold_psi(batch, &mut counts).expect("well-formed"));
         assert!(!scorable, "a null value leaves the window unscorable");
         assert!(window().psi_numeric("age", &[0.0]).is_err());
         assert!(

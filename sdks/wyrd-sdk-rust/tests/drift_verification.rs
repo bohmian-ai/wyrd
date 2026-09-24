@@ -659,30 +659,29 @@ async fn drift_method_edges_score_through_oracle() {
         ),
     );
     let cards = Cards::with_client(WyrdClient::clone(&admin));
-    let query = Bifrost::query_only(&admin);
+    let custom = register(&cards, &root.path().join("drift-custom.yaml")).await;
     let now = Utc::now();
-    let (start, end) = (
-        now - chrono::Duration::hours(1),
-        now + chrono::Duration::hours(1),
+    let journey = EdgeJourney {
+        server: &server,
+        query: Bifrost::query_only(&admin),
+        admin,
+        cards,
+        root: root.path(),
+        start: now - chrono::Duration::hours(1),
+        end: now + chrono::Duration::hours(1),
+    };
+    let steady = journey.subject("steady").await;
+    assert_unscored(
+        &journey
+            .run(&custom, &steady, journey.start, journey.end)
+            .await,
     );
 
-    let custom = register(&cards, &root.path().join("drift-custom.yaml")).await;
-    let steady = subject(&cards, root.path(), "steady").await;
-    let run = |verifier: &RegistrationReceipt, subject: &RegistrationReceipt, from, to| {
-        let request = direct(verifier, subject, from, to);
-        let (server, query, subject) = (&server, &query, subject.clone());
-        async move {
-            let verification = verifier_of(server, &subject).await;
-            complete(server, &verification, query, &request).await
-        }
-    };
-    assert_unscored(&run(&custom, &steady, start, end).await);
-
-    register(&cards, &root.path().join("baseline.yaml")).await;
-    let psi = register(&cards, &root.path().join("drift-psi.yaml")).await;
-    let spc = register(&cards, &root.path().join("drift-spc.yaml")).await;
-    assert_eq!(wait_baseline(&cards, &psi, "ready").await, None);
-    assert_eq!(wait_baseline(&cards, &spc, "ready").await, None);
+    register(&journey.cards, &root.path().join("baseline.yaml")).await;
+    let psi = register(&journey.cards, &root.path().join("drift-psi.yaml")).await;
+    let spc = register(&journey.cards, &root.path().join("drift-spc.yaml")).await;
+    assert_eq!(wait_baseline(&journey.cards, &psi, "ready").await, None);
+    assert_eq!(wait_baseline(&journey.cards, &spc, "ready").await, None);
 
     let baseline_like: Vec<Features> = (0..BASELINE_ROWS)
         .map(|row| Features {
@@ -691,128 +690,215 @@ async fn drift_method_edges_score_through_oracle() {
             score: if row % 2 == 0 { 1.0 } else { 2.0 },
         })
         .collect();
-    let bundle = root.path().join("bundles");
-    emit_rows(
-        &server,
-        &admin,
-        &steady,
-        &bundle.join("steady"),
-        &baseline_like,
-    )
-    .await;
-    let (result, features) = run(&psi, &steady, start, end).await;
-    assert_eq!(result.verdict, "passed", "{result:?}");
-    assert_eq!(
-        verdicts(&features),
-        [("latency", "Psi", "no_drift"), ("tier", "Psi", "no_drift")]
-    );
-    let (result, features) = run(&custom, &steady, start, end).await;
-    assert_eq!(
-        result.verdict, "passed",
-        "a mean at the threshold is no drift"
-    );
-    assert_eq!(verdicts(&features), [("score", "Custom", "no_drift")]);
-
-    let calm = subject(&cards, root.path(), "calm").await;
-    let near_center: Vec<Features> = [45.0; 5]
-        .into_iter()
-        .chain([54.0; 5])
-        .chain([49.0; 3])
-        .map(|latency| Features {
-            latency,
-            tier: "gold".to_owned(),
-            score: 1.0,
-        })
-        .collect();
-    emit_rows(&server, &admin, &calm, &bundle.join("calm"), &near_center).await;
-    let (result, features) = run(&spc, &calm, start, end).await;
-    assert_eq!(
-        result.verdict, "passed",
-        "two full chunks and a trailing chunk inside Zone C pass: {result:?}"
-    );
-    assert_eq!(verdicts(&features), [("latency", "Spc", "no_drift")]);
-
-    let sparse = subject(&cards, root.path(), "sparse").await;
-    emit_rows(
-        &server,
-        &admin,
-        &sparse,
-        &bundle.join("sparse"),
-        &baseline_like[..3],
-    )
-    .await;
-    let (result, features) = run(&psi, &sparse, start, end).await;
-    assert_eq!(result.verdict, "inconclusive", "{result:?}");
-    assert_eq!(
-        verdicts(&features),
-        [
-            ("latency", "Psi", "inconclusive"),
-            ("tier", "Psi", "inconclusive")
-        ],
-        "three rows are below PSI's minimum sample"
-    );
-    let (result, features) = run(&spc, &sparse, start, end).await;
-    assert_eq!(result.verdict, "inconclusive", "{result:?}");
-    assert_eq!(
-        verdicts(&features),
-        [("latency", "Spc", "inconclusive")],
-        "three rows are below the chunk size"
-    );
-
-    let weighted = subject(&cards, root.path(), "weighted").await;
-    let scores = |values: &[f64]| -> Vec<Features> {
-        values
-            .iter()
-            .map(|score| Features {
-                latency: 50.0,
-                tier: "gold".to_owned(),
-                score: *score,
-            })
-            .collect()
-    };
-    emit_rows(
-        &server,
-        &admin,
-        &weighted,
-        &bundle.join("weighted-a"),
-        &scores(&[1.0]),
-    )
-    .await;
-    let split = Utc::now();
-    emit_rows(
-        &server,
-        &admin,
-        &weighted,
-        &bundle.join("weighted-b"),
-        &scores(&[2.0, 2.0, 2.0]),
-    )
-    .await;
-    let (result, _) = run(&custom, &weighted, start, end).await;
-    assert_eq!(
-        result.verdict, "failed",
-        "rows average to 1.75; averaging the two batches would give 1.5"
-    );
-    let (result, _) = run(&custom, &weighted, start, split).await;
-    assert_eq!(
-        result.verdict, "passed",
-        "the window end excludes the second batch"
-    );
-    let (result, _) = run(&custom, &weighted, split, end).await;
-    assert_eq!(
-        result.verdict, "failed",
-        "the window start excludes the first batch"
-    );
-
-    let text = subject(&cards, root.path(), "text").await;
-    let rows: Vec<TextScore> = (0..3)
-        .map(|_| TextScore {
-            score: "high".to_owned(),
-        })
-        .collect();
-    emit_rows(&server, &admin, &text, &bundle.join("text"), &rows).await;
-    assert_unscored(&run(&custom, &text, start, end).await);
+    journey
+        .assert_baseline_like_passes(&steady, &psi, &custom, &baseline_like)
+        .await;
+    journey.assert_calm_spc_passes(&spc).await;
+    journey
+        .assert_sparse_is_inconclusive(&psi, &spc, &baseline_like[..3])
+        .await;
+    journey.assert_mean_is_per_row_within_window(&custom).await;
+    journey.assert_text_is_unscored(&custom).await;
 
     server.shutdown().await.expect("test server shuts down");
+}
+
+/// Shared state of the method-edge journey: one bound server, the admin
+/// client that registers subjects and emits their observations, and the
+/// default window every run scores unless a case narrows it.
+struct EdgeJourney<'a> {
+    /// Bound test server running the production verification runtime.
+    server: &'a WyrdTestServer,
+    /// Admin client used to credential subjects and emit their rows.
+    admin: WyrdClient,
+    /// Card handle registering subjects on the admin client.
+    cards: Cards,
+    /// Query-only Bifrost facade reading result and feature rows.
+    query: Bifrost,
+    /// Fixture root holding Card files and `WyrdState` bundles.
+    root: &'a Path,
+    /// Inclusive start of the default scoring window.
+    start: DateTime<Utc>,
+    /// Exclusive end of the default scoring window.
+    end: DateTime<Utc>,
+}
+
+impl EdgeJourney<'_> {
+    /// Run `verifier` directly against `subject` over `[from, to)` as the
+    /// subject's own Service, and wait for its persisted result and features.
+    ///
+    /// # Panics
+    /// Panics when the run cannot start, settle, or be read back.
+    async fn run(
+        &self,
+        verifier: &RegistrationReceipt,
+        subject: &RegistrationReceipt,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> (ResultRow, Vec<FeatureRow>) {
+        let verification = verifier_of(self.server, subject).await;
+        complete(
+            self.server,
+            &verification,
+            &self.query,
+            &direct(verifier, subject, from, to),
+        )
+        .await
+    }
+
+    /// Register the unbound Service subject `name`.
+    ///
+    /// # Panics
+    /// Panics when registration fails.
+    async fn subject(&self, name: &str) -> RegistrationReceipt {
+        subject(&self.cards, self.root, name).await
+    }
+
+    /// Emit `rows` as `subject` from a bundle named `bundle`.
+    ///
+    /// # Panics
+    /// Panics when emission or its flush fails.
+    async fn emit<T: Serialize>(&self, subject: &RegistrationReceipt, bundle: &str, rows: &[T]) {
+        let path = self.root.join("bundles").join(bundle);
+        emit_rows(self.server, &self.admin, subject, &path, rows).await;
+    }
+
+    /// A window matching the baseline distribution passes PSI on both
+    /// features, and a Custom mean exactly at its threshold is no drift.
+    ///
+    /// # Panics
+    /// Panics when either run is not a pass with the expected features.
+    async fn assert_baseline_like_passes(
+        &self,
+        steady: &RegistrationReceipt,
+        psi: &RegistrationReceipt,
+        custom: &RegistrationReceipt,
+        rows: &[Features],
+    ) {
+        self.emit(steady, "steady", rows).await;
+        let (result, features) = self.run(psi, steady, self.start, self.end).await;
+        assert_eq!(result.verdict, "passed", "{result:?}");
+        assert_eq!(
+            verdicts(&features),
+            [("latency", "Psi", "no_drift"), ("tier", "Psi", "no_drift")]
+        );
+        let (result, features) = self.run(custom, steady, self.start, self.end).await;
+        assert_eq!(
+            result.verdict, "passed",
+            "a mean at the threshold is no drift"
+        );
+        assert_eq!(verdicts(&features), [("score", "Custom", "no_drift")]);
+    }
+
+    /// Two full chunks and a trailing short chunk inside Zone C pass SPC.
+    ///
+    /// # Panics
+    /// Panics when the run is not a pass with one SPC feature.
+    async fn assert_calm_spc_passes(&self, spc: &RegistrationReceipt) {
+        let calm = self.subject("calm").await;
+        let rows: Vec<Features> = [45.0; 5]
+            .into_iter()
+            .chain([54.0; 5])
+            .chain([49.0; 3])
+            .map(|latency| Features {
+                latency,
+                tier: "gold".to_owned(),
+                score: 1.0,
+            })
+            .collect();
+        self.emit(&calm, "calm", &rows).await;
+        let (result, features) = self.run(spc, &calm, self.start, self.end).await;
+        assert_eq!(
+            result.verdict, "passed",
+            "two full chunks and a trailing chunk inside Zone C pass: {result:?}"
+        );
+        assert_eq!(verdicts(&features), [("latency", "Spc", "no_drift")]);
+    }
+
+    /// Three rows are below PSI's minimum sample and SPC's chunk size, so
+    /// both methods are inconclusive per feature.
+    ///
+    /// # Panics
+    /// Panics when either run is not inconclusive per feature.
+    async fn assert_sparse_is_inconclusive(
+        &self,
+        psi: &RegistrationReceipt,
+        spc: &RegistrationReceipt,
+        rows: &[Features],
+    ) {
+        let sparse = self.subject("sparse").await;
+        self.emit(&sparse, "sparse", rows).await;
+        let (result, features) = self.run(psi, &sparse, self.start, self.end).await;
+        assert_eq!(result.verdict, "inconclusive", "{result:?}");
+        assert_eq!(
+            verdicts(&features),
+            [
+                ("latency", "Psi", "inconclusive"),
+                ("tier", "Psi", "inconclusive")
+            ],
+            "three rows are below PSI's minimum sample"
+        );
+        let (result, features) = self.run(spc, &sparse, self.start, self.end).await;
+        assert_eq!(result.verdict, "inconclusive", "{result:?}");
+        assert_eq!(
+            verdicts(&features),
+            [("latency", "Spc", "inconclusive")],
+            "three rows are below the chunk size"
+        );
+    }
+
+    /// Two client batches of one and three rows average per row, not per
+    /// batch, and a window bounded between them excludes the other batch.
+    ///
+    /// # Panics
+    /// Panics when any Custom verdict differs from the expected one.
+    async fn assert_mean_is_per_row_within_window(&self, custom: &RegistrationReceipt) {
+        let weighted = self.subject("weighted").await;
+        let scores = |values: &[f64]| -> Vec<Features> {
+            values
+                .iter()
+                .map(|score| Features {
+                    latency: 50.0,
+                    tier: "gold".to_owned(),
+                    score: *score,
+                })
+                .collect()
+        };
+        self.emit(&weighted, "weighted-a", &scores(&[1.0])).await;
+        let split = Utc::now();
+        self.emit(&weighted, "weighted-b", &scores(&[2.0, 2.0, 2.0]))
+            .await;
+        let (result, _) = self.run(custom, &weighted, self.start, self.end).await;
+        assert_eq!(
+            result.verdict, "failed",
+            "rows average to 1.75; averaging the two batches would give 1.5"
+        );
+        let (result, _) = self.run(custom, &weighted, self.start, split).await;
+        assert_eq!(
+            result.verdict, "passed",
+            "the window end excludes the second batch"
+        );
+        let (result, _) = self.run(custom, &weighted, split, self.end).await;
+        assert_eq!(
+            result.verdict, "failed",
+            "the window start excludes the first batch"
+        );
+    }
+
+    /// A text-valued Custom metric completes inconclusive before scoring.
+    ///
+    /// # Panics
+    /// Panics when the run is scored.
+    async fn assert_text_is_unscored(&self, custom: &RegistrationReceipt) {
+        let text = self.subject("text").await;
+        let rows: Vec<TextScore> = (0..3)
+            .map(|_| TextScore {
+                score: "high".to_owned(),
+            })
+            .collect();
+        self.emit(&text, "text", &rows).await;
+        assert_unscored(&self.run(custom, &text, self.start, self.end).await);
+    }
 }
 
 /// Prove each direct run scores server-side and persists its result rows.

@@ -106,10 +106,10 @@ pub fn resolve_column<'a>(
 
 /// One configured feature's target column, row-aligned with its batch.
 ///
-/// Target scoring first decides which rows are observations of the monitored
-/// features and whether each carries every configured feature; only then are
-/// the values counted or grouped. A column absent from the batch is carried by
-/// no row.
+/// A direct target batch is already selected: every row is one relevant
+/// observation. Target scoring first checks that each row carries every
+/// configured feature; only then are the values counted or grouped. A column
+/// absent from the batch is carried by no row.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TargetColumn {
     /// The batch has no column of this feature.
@@ -121,15 +121,6 @@ pub enum TargetColumn {
 }
 
 impl TargetColumn {
-    /// Whether `row` carries this feature at all (a null carries nothing).
-    fn carried(&self, row: usize) -> bool {
-        match self {
-            Self::Absent => false,
-            Self::Numeric(values) => values[row].is_some(),
-            Self::Categorical(values) => values[row].is_some(),
-        }
-    }
-
     /// Whether `row` carries a scorable value: present and, if numeric, finite.
     fn valid(&self, row: usize) -> bool {
         match self {
@@ -148,18 +139,15 @@ impl TargetColumn {
     }
 }
 
-/// Whether every selected row of `rows` carries a valid value in every column.
+/// Whether every row of `rows` carries a valid value in every column.
 ///
-/// A row is selected when it carries at least one of `columns`; unrelated
-/// rows carry none and never enter the comparison. A selected row missing a
-/// configured feature, or holding a null or non-finite value where another
-/// feature is present, makes the target incomplete: the caller reports it
-/// unscored rather than dropping or imputing the row.
+/// The caller has already excluded unrelated observations, so every row
+/// participates; membership is never inferred from null values. A row missing
+/// a configured feature, or holding a null or non-finite value, makes the
+/// target incomplete: the caller reports it unscored rather than dropping or
+/// imputing the row.
 pub fn target_complete(rows: usize, columns: &[&TargetColumn]) -> bool {
-    (0..rows).all(|row| {
-        !columns.iter().any(|column| column.carried(row))
-            || columns.iter().all(|column| column.valid(row))
-    })
+    (0..rows).all(|row| columns.iter().all(|column| column.valid(row)))
 }
 
 /// Require a non-empty baseline column with no null row.

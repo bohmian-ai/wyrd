@@ -468,12 +468,12 @@ mod aggregate_inputs {
     use arrow::record_batch::RecordBatch;
     use arrow_schema::{DataType, Field, Schema};
     use wyrd_spec::card::drift::{
-        CustomProfile, PsiBinningStrategy, PsiProfile, PsiThreshold, SpcProfile,
+        CustomProfile, DriftMethod, PsiBinningStrategy, PsiProfile, PsiThreshold, SpcProfile,
     };
     use wyrd_spec::ids::FeatureName;
 
     use crate::{
-        DriftVerdict, FittedBaseline, SpcScorer, fit_psi_baseline, fit_spc_baseline,
+        DriftReport, DriftVerdict, FittedBaseline, SpcScorer, fit_psi_baseline, fit_spc_baseline,
         score_custom_mean, score_psi, score_psi_counts, score_spc,
     };
 
@@ -583,7 +583,7 @@ mod aggregate_inputs {
     }
 
     /// Server subgroup aggregates equal raw-batch SPC scoring, and a target
-    /// ending in a partial subgroup is inconclusive.
+    /// ending in a partial subgroup is wholly unscored.
     ///
     /// # Panics
     /// Panics when the two paths disagree or a partial target scores.
@@ -618,9 +618,7 @@ mod aggregate_inputs {
         partial
             .push(&x, 4, f64::NAN, f64::NAN)
             .expect("partial pushes");
-        let report = partial.finish();
-        assert_eq!(report.verdict, DriftVerdict::Inconclusive);
-        assert!(report.features[&x].score.is_nan());
+        assert_eq!(partial.finish(), DriftReport::unscored(DriftMethod::Spc));
     }
 
     /// The Custom window mean drifts only strictly above the threshold.

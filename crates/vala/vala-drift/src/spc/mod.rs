@@ -170,9 +170,10 @@ pub(crate) fn fit_spc_baseline_until(
 
 /// Score a target `RecordBatch` against a fitted SPC baseline.
 ///
-/// Each row is one observation. A row carrying none of the baseline features
-/// is unrelated and ignored; when any other row misses a feature or holds a
-/// null or non-finite value, the target is [`DriftReport::unscored`]. Otherwise
+/// `target` is an already selected batch: each row is one relevant
+/// observation and the caller has excluded unrelated ones. When any row
+/// misses a feature or holds a null or non-finite value, the target is
+/// [`DriftReport::unscored`]. Otherwise
 /// each feature's values form consecutive subgroups in row order and stream
 /// through one [`SpcScorer`], so raw-batch and server-aggregated inputs share
 /// one chart evaluation.
@@ -221,8 +222,8 @@ pub fn score_spc(
 /// count, mean, and sample standard deviation, then calls
 /// [`SpcScorer::finish`]. State per feature is two signal counters, so it
 /// stays constant however many subgroups arrive. A subgroup shorter than the
-/// frozen size can only be the trailing one and makes its feature
-/// inconclusive; its statistics are ignored.
+/// frozen size can only be the trailing one and makes the whole report
+/// unscored; its statistics are ignored.
 #[derive(Debug, Clone)]
 pub struct SpcScorer {
     /// Frozen rows per subgroup.
@@ -322,49 +323,48 @@ impl SpcScorer {
 
     /// Build the drift report from every pushed subgroup.
     ///
-    /// A feature with no complete subgroup or a partial one is `Inconclusive`
-    /// with NaN score and threshold and no evidence. Otherwise its score is
-    /// the X-bar plus S signal count, its threshold is zero, any signal is
+    /// When any feature has no complete subgroup or ends in a partial one,
+    /// the whole target is incomplete and the report is
+    /// [`DriftReport::unscored`]: no feature is scored, so a signal on another
+    /// feature cannot fail an incomplete run. Otherwise each feature's score
+    /// is the X-bar plus S signal count, its threshold is zero, any signal is
     /// `Drift`, and it carries [`SpcEvidence`].
     #[must_use]
     pub fn finish(self) -> DriftReport {
+        if self
+            .features
+            .values()
+            .any(|chart| chart.partial || chart.subgroups == 0)
+        {
+            return DriftReport::unscored(DriftMethod::Spc);
+        }
         let subgroup_size = self.subgroup_size;
         let features: BTreeMap<FeatureName, FeatureDriftReport> = self
             .features
             .into_iter()
             .map(|(feature, chart)| {
-                let report = if chart.partial || chart.subgroups == 0 {
-                    FeatureDriftReport {
-                        feature: feature.clone(),
-                        score: f64::NAN,
-                        threshold: f64::NAN,
-                        verdict: DriftVerdict::Inconclusive,
-                        evidence: None,
-                    }
-                } else {
-                    let signals = chart.x_bar_signals + chart.s_signals;
-                    FeatureDriftReport {
-                        feature: feature.clone(),
-                        score: signals as f64,
-                        threshold: 0.0,
-                        verdict: if signals > 0 {
-                            DriftVerdict::Drift
-                        } else {
-                            DriftVerdict::NoDrift
+                let signals = chart.x_bar_signals + chart.s_signals;
+                let report = FeatureDriftReport {
+                    feature: feature.clone(),
+                    score: signals as f64,
+                    threshold: 0.0,
+                    verdict: if signals > 0 {
+                        DriftVerdict::Drift
+                    } else {
+                        DriftVerdict::NoDrift
+                    },
+                    evidence: Some(FeatureEvidence::Spc(SpcEvidence {
+                        subgroup_size,
+                        subgroups: chart.subgroups,
+                        x_bar: SpcChartEvidence {
+                            limits: chart.limits.x_bar,
+                            signals: chart.x_bar_signals,
                         },
-                        evidence: Some(FeatureEvidence::Spc(SpcEvidence {
-                            subgroup_size,
-                            subgroups: chart.subgroups,
-                            x_bar: SpcChartEvidence {
-                                limits: chart.limits.x_bar,
-                                signals: chart.x_bar_signals,
-                            },
-                            s: SpcChartEvidence {
-                                limits: chart.limits.s,
-                                signals: chart.s_signals,
-                            },
-                        })),
-                    }
+                        s: SpcChartEvidence {
+                            limits: chart.limits.s,
+                            signals: chart.s_signals,
+                        },
+                    })),
                 };
                 (feature, report)
             })
@@ -546,6 +546,7 @@ mod spc_score {
     use arrow::array::{ArrayRef, Float64Array, StringArray};
     use arrow::record_batch::RecordBatch;
     use arrow_schema::{DataType, Field, Schema};
+    use wyrd_spec::card::drift::DriftMethod;
     use wyrd_spec::ids::FeatureName;
     use wyrd_version::WyrdVersion;
 
@@ -665,48 +666,77 @@ mod spc_score {
         assert_eq!(report.verdict, DriftVerdict::NoDrift);
     }
 
-    /// An empty target and a trailing partial subgroup are inconclusive
-    /// without evidence, never scored on shifted or dropped rows.
+    /// An empty target and a trailing partial subgroup are unscored, never
+    /// scored on shifted or dropped rows.
     ///
     /// # Panics
     /// Panics when either target scores.
     #[test]
     fn empty_and_partial_targets_are_inconclusive() {
         for values in [&[][..], &[12.0, 12.0, 10.0][..]] {
-            let report = score(values);
-            let x = &report.features[&feature("x")];
-            assert_eq!(report.verdict, DriftVerdict::Inconclusive, "{values:?}");
-            assert!(x.score.is_nan() && x.threshold.is_nan() && x.evidence.is_none());
+            assert_eq!(
+                score(values),
+                DriftReport::unscored(DriftMethod::Spc),
+                "{values:?}"
+            );
         }
     }
 
     /// A selected row missing a feature or holding null, NaN, or infinity is
-    /// unscored with no feature rows; a row carrying no feature is ignored.
+    /// unscored with no feature rows. A direct batch is already selected, so
+    /// a row null in every feature is a selected observation that makes an
+    /// otherwise sufficient target unscored rather than shifting subgroups.
     ///
     /// # Panics
-    /// Panics when an incomplete target scores or an unrelated row counts.
+    /// Panics when an incomplete target scores.
     #[test]
-    fn incomplete_targets_are_unscored_and_unrelated_rows_ignored() {
+    fn incomplete_targets_are_unscored() {
         let base = baseline(&["x", "y"]);
         let full = |x: Vec<Option<f64>>, y: Vec<Option<f64>>| {
             score_spc(&base, &batch(&[("x", x), ("y", y)])).expect("scores")
         };
+        let unscored = DriftReport::unscored(DriftMethod::Spc);
         let calm = vec![Some(10.0), Some(10.0)];
         for bad in [None, Some(f64::NAN), Some(f64::NEG_INFINITY)] {
-            let report = full(calm.clone(), vec![Some(10.0), bad]);
-            assert_eq!(
-                report,
-                DriftReport::unscored(wyrd_spec::card::drift::DriftMethod::Spc)
-            );
+            assert_eq!(full(calm.clone(), vec![Some(10.0), bad]), unscored);
         }
         let only_x = score_spc(&base, &batch(&[("x", calm.clone())])).expect("scores");
-        assert!(only_x.features.is_empty(), "an omitted feature is unscored");
+        assert_eq!(only_x, unscored, "an omitted feature is unscored");
 
-        let with_unrelated = full(
-            vec![Some(10.0), None, Some(10.0)],
-            vec![Some(10.0), None, Some(10.0)],
+        let four = vec![Some(10.0); 4];
+        assert_eq!(full(four.clone(), four).verdict, DriftVerdict::NoDrift);
+        let with_null_row = full(
+            vec![Some(10.0), None, Some(10.0), Some(10.0), Some(10.0)],
+            vec![Some(10.0), None, Some(10.0), Some(10.0), Some(10.0)],
         );
-        assert_eq!(with_unrelated.verdict, DriftVerdict::NoDrift);
+        assert_eq!(with_null_row, unscored, "a null-only selected row");
+    }
+
+    /// One signaled complete feature beside an empty or trailing-partial
+    /// feature leaves the whole report unscored, so the signal cannot fail
+    /// an incomplete run.
+    ///
+    /// # Panics
+    /// Panics when the signal escapes an incomplete report.
+    #[test]
+    fn a_signal_beside_an_incomplete_feature_is_unscored() {
+        let base = baseline(&["x", "y"]);
+        let (x, y) = (feature("x"), feature("y"));
+        let signaled = || {
+            let mut scorer = SpcScorer::new(&base);
+            scorer.push(&x, 2, 12.0, 0.0).expect("signaled subgroup");
+            scorer
+        };
+        let mut complete = signaled();
+        complete.push(&y, 2, 10.0, 1.0).expect("calm subgroup");
+        assert_eq!(complete.finish().verdict, DriftVerdict::Drift);
+
+        let empty = signaled();
+        let mut partial = signaled();
+        partial.push(&y, 1, f64::NAN, f64::NAN).expect("partial");
+        for scorer in [empty, partial] {
+            assert_eq!(scorer.finish(), DriftReport::unscored(DriftMethod::Spc));
+        }
     }
 
     /// The streaming scorer refuses unknown features, oversized or

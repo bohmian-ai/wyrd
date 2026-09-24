@@ -172,10 +172,10 @@ pub(crate) fn fit_psi_baseline_until(
 
 /// Score a target `RecordBatch` against a fitted PSI baseline.
 ///
-/// Each row is one observation. A row carrying none of the baseline features
-/// is unrelated and ignored. When any other row misses a feature or holds a
-/// null or non-finite value, the target is [`DriftReport::unscored`]; nothing
-/// is dropped or imputed. Otherwise every value is counted into its fitted
+/// `target` is an already selected batch: each row is one relevant
+/// observation and the caller has excluded unrelated ones. When any row
+/// misses a feature or holds a null or non-finite value, the target is
+/// [`DriftReport::unscored`]; nothing is dropped or imputed. Otherwise every value is counted into its fitted
 /// bin (an unseen category into `other`) and scored through
 /// [`score_psi_counts`], so raw-batch and server-aggregated inputs share one
 /// formula and report construction.
@@ -886,24 +886,36 @@ mod psi_score {
         assert!(feature_report.threshold.is_nan());
     }
 
-    /// Rows carrying no configured feature are unrelated: they leave the
-    /// target empty, which is inconclusive rather than an error.
+    /// A direct target batch is already selected, so a row whose configured
+    /// features are all null is a selected observation, not an unrelated one:
+    /// it makes an otherwise sufficient target wholly unscored instead of
+    /// vanishing from the counts.
     ///
     /// # Panics
-    /// Panics when unrelated rows are counted or the report is not inconclusive.
+    /// Panics when the null-only row is dropped and the target scores.
     #[test]
-    fn psi_target_without_configured_features_is_inconclusive() {
-        let baseline_batch = numeric_batch("x", (0..1000).map(|value| value as f64).collect());
-        let target_batch = numeric_batch("not_x", vec![1.0; 200]);
-        let profile = psi_profile_default();
-        let fname = feature("x");
-        let baseline = fit_psi_baseline(&baseline_batch, &profile, std::slice::from_ref(&fname))
+    fn psi_selected_null_only_row_makes_the_target_unscored() {
+        let profile = PsiProfile {
+            categorical_features: vec![feature("c")],
+            ..psi_profile_default()
+        };
+        let baseline_batch = two_column_batch(
+            (0..1000).map(|value| Some(value as f64)).collect(),
+            (0..1000).map(|value| Some(["a", "b"][value % 2])).collect(),
+        );
+        let baseline = fit_psi_baseline(&baseline_batch, &profile, &[feature("x"), feature("c")])
             .expect("baseline");
+        let mut x = (0..200).map(|value| Some(value as f64)).collect::<Vec<_>>();
+        let mut c = (0..200).map(|_| Some("a")).collect::<Vec<_>>();
+        let selected = score_psi(&baseline, &two_column_batch(x.clone(), c.clone()), &profile)
+            .expect("report");
+        assert_ne!(selected.verdict, DriftVerdict::Inconclusive);
 
-        let report = score_psi(&baseline, &target_batch, &profile).expect("report");
+        x.push(None);
+        c.push(None);
+        let report = score_psi(&baseline, &two_column_batch(x, c), &profile).expect("report");
 
-        assert_eq!(report.verdict, DriftVerdict::Inconclusive);
-        assert!(report.features[&fname].evidence.is_none());
+        assert_eq!(report, DriftReport::unscored(DriftMethod::Psi));
     }
 
     /// A selected observation omitting a configured feature, or holding a

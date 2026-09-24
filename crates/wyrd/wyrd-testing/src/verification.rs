@@ -312,6 +312,40 @@ impl VerificationFixture {
         Ok(())
     }
 
+    /// Rewrite `verifier`'s ready fitted profile without its `format`, as a
+    /// profile fitted before the current PSI/SPC semantics is stored.
+    ///
+    /// Stands in for a Verifier version fitted under earlier semantics, which
+    /// the engine must refuse rather than rescore; nothing else changes.
+    ///
+    /// # Errors
+    /// Returns [`VerificationFixtureError::Card`] when `verifier` has no ready
+    /// fitted profile, or a connection or statement error.
+    pub async fn retire_fitted_format(
+        &self,
+        verifier: &CardUid,
+    ) -> Result<(), VerificationFixtureError> {
+        let mut conn = self.postgres.tenant_conn(self.tenant).await?;
+        let updated = sqlx::query(
+            "UPDATE wyrd.drift_baselines \
+                SET fitted = (SELECT jsonb_object_agg(key, value - 'format') \
+                                FROM jsonb_each(fitted)) \
+              WHERE verifier_uid = $1 AND state = 'ready'",
+        )
+        .bind(verifier.as_uuid())
+        .execute(&mut **conn.transaction())
+        .await?
+        .rows_affected();
+        conn.commit().await?;
+        if updated == 1 {
+            Ok(())
+        } else {
+            Err(VerificationFixtureError::Card(format!(
+                "verifier {verifier} has no ready fitted profile"
+            )))
+        }
+    }
+
     /// Enqueue one manual direct run of `verifier` over `subject` for `window`,
     /// due at database statement time.
     ///

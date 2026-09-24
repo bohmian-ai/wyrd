@@ -3,16 +3,17 @@
 //! Registers a Parquet baseline Data Card, PSI and SPC Verifiers fitted from
 //! it, a Custom Verifier that needs no fit, and an SPC Verifier whose baseline
 //! cannot fit. Card status shows each baseline settle without blocking
-//! registration. Two Services bind the Custom Verifier through one shared
+//! registration. Two Services bind the SPC Verifier through one shared
 //! schedule Trigger Card, with two and one inline Operators, and emit Drift
 //! observations through `WyrdState`; direct runs of every method then score
-//! the window server-side through Oracle and persist their results and
-//! feature rows, an empty window completes inconclusive with null details and
-//! no features, one due occurrence of the shared Trigger runs each binding
-//! once and dispatches only that binding's Operators, and a manual run of one
-//! binding dispatches through the same Operator path. Negative flows cover an
-//! unready Verifier, a non-Parquet baseline, a caller without `evals:run`,
-//! and a second tenant.
+//! the window server-side through Oracle and persist their results, PSI bin
+//! and SPC X-bar/S evidence, and feature rows, an empty window completes
+//! inconclusive with null details and no features, one due occurrence of the
+//! shared Trigger runs each binding once, fails on SPC signals, and
+//! dispatches only that binding's Operators, and a manual run of one binding
+//! dispatches through the same Operator path. Negative flows cover an unready
+//! Verifier, a non-Parquet baseline, a retired SPC profile field, a caller
+//! without `evals:run`, and a second tenant.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -159,7 +160,7 @@ fn distribution(features: &str) -> String {
     )
 }
 
-/// Service Card YAML named `name` binding `drift-custom` on the shared
+/// Service Card YAML named `name` binding `drift-spc` on the shared
 /// `drift-daily` Trigger with one inline HTTP Operator per hook in `hooks`.
 fn service_yaml(name: &str, hooks: &[&str]) -> String {
     let operators = hooks
@@ -172,7 +173,7 @@ fn service_yaml(name: &str, hooks: &[&str]) -> String {
         .collect::<Vec<_>>()
         .concat();
     format!(
-        "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: {name}\n  version: 1.0.0\n  space: default\nspec:\n  verified_by:\n    - verifier:\n        kind: Verifier\n        name: drift-custom\n        version: 1.0.0\n        space: default\n      runs_on:\n        kind: Trigger\n        name: drift-daily\n        version: 1.0.0\n        space: default\n      on_failure:\n{operators}"
+        "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: {name}\n  version: 1.0.0\n  space: default\nspec:\n  verified_by:\n    - verifier:\n        kind: Verifier\n        name: drift-spc\n        version: 1.0.0\n        space: default\n      runs_on:\n        kind: Trigger\n        name: drift-daily\n        version: 1.0.0\n        space: default\n      on_failure:\n{operators}"
     )
 }
 
@@ -192,14 +193,14 @@ fn write_verifiers(root: &Path) {
         (
             "drift-spc",
             format!(
-                "      method: Spc\n{}      profile:\n        kind: Spc\n        sample_size: 5\n        weco_rule:\n          rule_string: \"8 16 4 8 2 4 1 1\"\n        alert_threshold: Zone1\n",
+                "      method: Spc\n{}      profile:\n        kind: Spc\n        sample_size: 5\n",
                 distribution("latency")
             ),
         ),
         (
             "drift-spc-unfit",
             format!(
-                "      method: Spc\n{}      profile:\n        kind: Spc\n        sample_size: 5\n        weco_rule:\n          rule_string: \"8 16 4 8 2 4 1 1\"\n        alert_threshold: Zone1\n",
+                "      method: Spc\n{}      profile:\n        kind: Spc\n        sample_size: 5\n",
                 distribution("tier")
             ),
         ),
@@ -598,6 +599,20 @@ async fn drift_methods_fit_score_persist_and_dispatch() {
     server.shutdown().await.expect("test server shuts down");
 }
 
+/// An observation carrying only the Custom metric, no PSI or SPC feature.
+#[derive(Serialize)]
+struct ScoreOnly {
+    /// Custom metric value.
+    score: f64,
+}
+
+/// An observation carrying `latency` but omitting the PSI `tier` feature.
+#[derive(Serialize)]
+struct LatencyOnly {
+    /// Numeric PSI and SPC feature.
+    latency: f64,
+}
+
 /// A Custom observation whose metric value is text, not a number.
 #[derive(Serialize)]
 struct TextScore {
@@ -650,6 +665,22 @@ fn verdicts(features: &[FeatureRow]) -> Vec<(&str, &str, &str)> {
         .collect()
 }
 
+/// The persisted typed evidence of `feature` in `result`'s details.
+///
+/// # Panics
+/// Panics when the details are absent, not JSON, or carry no evidence for
+/// `feature`.
+fn evidence(result: &ResultRow, feature: &str) -> serde_json::Value {
+    let details: serde_json::Value = serde_json::from_str(
+        result
+            .details
+            .as_deref()
+            .expect("a scored report has details"),
+    )
+    .expect("details are JSON");
+    details["features"][feature]["evidence"].clone()
+}
+
 /// Assert `result` completed inconclusive before scoring: null details and
 /// no feature rows.
 ///
@@ -672,11 +703,15 @@ fn assert_unscored((result, features): &(ResultRow, Vec<FeatureRow>)) {
 /// with no details, features, or dispatch. Separate subjects then isolate
 /// each case in the one shared observation table: a window matching the
 /// baseline distribution passes PSI and Custom, with the Custom mean exactly
-/// at its threshold; two chunks and a trailing short chunk near the baseline
-/// center pass SPC; three rows are too few for PSI's minimum sample
-/// and SPC's chunk size; two client batches of one and three rows average
-/// per row, not per batch, and a window ending between them excludes the
-/// second; and a text-valued metric is inconclusive.
+/// at its threshold; two in-control subgroups pass SPC with zero-signal
+/// evidence until a trailing partial subgroup makes it inconclusive; three
+/// rows are too few for PSI's minimum sample and one SPC subgroup; records
+/// without a PSI feature are ignored while one omitting a feature leaves PSI
+/// unscored; two client batches of one and three rows average per row, not
+/// per batch, and a window ending between them excludes the second; a
+/// text-valued metric is inconclusive; and after its fitted profile is
+/// retired, a PSI version's historical result stays readable while a new run
+/// is refused as legacy.
 ///
 /// # Panics
 /// Panics when any run, result, or feature row differs from the expected one.
@@ -737,12 +772,18 @@ async fn drift_method_edges_score_through_oracle() {
     journey
         .assert_baseline_like_passes(&steady, &psi, &custom, &baseline_like)
         .await;
-    journey.assert_calm_spc_passes(&spc).await;
+    journey.assert_calm_spc_passes_until_partial(&spc).await;
     journey
         .assert_sparse_is_inconclusive(&psi, &spc, &baseline_like[..3])
         .await;
+    journey
+        .assert_incomplete_is_unscored(&psi, &baseline_like)
+        .await;
     journey.assert_mean_is_per_row_within_window(&custom).await;
     journey.assert_text_is_unscored(&custom).await;
+    journey
+        .assert_legacy_profile_is_refused(&psi, &steady)
+        .await;
 
     server.shutdown().await.expect("test server shuts down");
 }
@@ -834,32 +875,128 @@ impl EdgeJourney<'_> {
         assert_eq!(verdicts(&features), [("score", "Custom", "no_drift")]);
     }
 
-    /// Two full chunks and a trailing short chunk inside Zone C pass SPC.
+    /// Two complete in-control subgroups pass SPC with zero signals, and
+    /// the same subject with two more rows ends in a partial subgroup, which
+    /// is inconclusive rather than shifted or dropped.
     ///
     /// # Panics
-    /// Panics when the run is not a pass with one SPC feature.
-    async fn assert_calm_spc_passes(&self, spc: &RegistrationReceipt) {
+    /// Panics when the calm run does not pass with SPC evidence or the
+    /// partial run is not inconclusive.
+    async fn assert_calm_spc_passes_until_partial(&self, spc: &RegistrationReceipt) {
         let calm = self.subject("calm").await;
-        let rows: Vec<Features> = [45.0; 5]
-            .into_iter()
-            .chain([54.0; 5])
-            .chain([49.0; 3])
-            .map(|latency| Features {
-                latency,
-                tier: "gold".to_owned(),
-                score: 1.0,
-            })
-            .collect();
-        self.emit(&calm, "calm", &rows).await;
+        let rows = |latencies: &[f64]| -> Vec<Features> {
+            latencies
+                .iter()
+                .map(|latency| Features {
+                    latency: *latency,
+                    tier: "gold".to_owned(),
+                    score: 1.0,
+                })
+                .collect()
+        };
+        let subgroup = [48.0, 49.0, 50.0, 51.0, 52.0];
+        self.emit(&calm, "calm", &rows(&[subgroup, subgroup].concat()))
+            .await;
         let (result, features) = self.run(spc, &calm, self.start, self.end).await;
-        assert_eq!(
-            result.verdict, "passed",
-            "two full chunks and a trailing chunk inside Zone C pass: {result:?}"
-        );
+        assert_eq!(result.verdict, "passed", "{result:?}");
         assert_eq!(verdicts(&features), [("latency", "Spc", "no_drift")]);
+        assert_spc_evidence(&result, 2, 0);
+
+        self.emit(&calm, "calm-partial", &rows(&[50.0, 50.0])).await;
+        let (result, features) = self.run(spc, &calm, self.start, self.end).await;
+        assert_eq!(result.verdict, "inconclusive", "{result:?}");
+        assert_eq!(
+            verdicts(&features),
+            [("latency", "Spc", "inconclusive")],
+            "a trailing partial subgroup is inconclusive"
+        );
     }
 
-    /// Three rows are below PSI's minimum sample and SPC's chunk size, so
+    /// Records carrying no PSI feature are unrelated and leave a passing
+    /// window passing; one selected record omitting a configured feature
+    /// makes the run inconclusive with no details or feature rows.
+    ///
+    /// # Panics
+    /// Panics when unrelated records change the verdict or an incomplete
+    /// record is scored.
+    async fn assert_incomplete_is_unscored(&self, psi: &RegistrationReceipt, rows: &[Features]) {
+        let gappy = self.subject("gappy").await;
+        self.emit(&gappy, "gappy", rows).await;
+        let unrelated: Vec<ScoreOnly> = (0..5).map(|_| ScoreOnly { score: 9.0 }).collect();
+        self.emit(&gappy, "gappy-unrelated", &unrelated).await;
+        let (result, _) = self.run(psi, &gappy, self.start, self.end).await;
+        assert_eq!(
+            result.verdict, "passed",
+            "records without a configured feature do not enter PSI: {result:?}"
+        );
+
+        self.emit(&gappy, "gappy-omitted", &[LatencyOnly { latency: 50.0 }])
+            .await;
+        assert_unscored(&self.run(psi, &gappy, self.start, self.end).await);
+    }
+
+    /// A PSI result scored before its Verifier version's fitted profile is
+    /// retired stays readable afterwards, while a new run of that version is
+    /// refused with `baseline_legacy` and produces no result.
+    ///
+    /// # Panics
+    /// Panics when the historical run or result changes, or the legacy run
+    /// is scored.
+    async fn assert_legacy_profile_is_refused(
+        &self,
+        psi: &RegistrationReceipt,
+        subject: &RegistrationReceipt,
+    ) {
+        let verification = verifier_of(self.server, subject).await;
+        let request = direct(psi, subject, self.start, self.end);
+        let historical = verification
+            .start_run(&request, None)
+            .await
+            .expect("run starts");
+        let before = wait_settled(&verification, &historical).await;
+        let result_id = before.result_id.expect("a completed run names its result");
+        let (scored, _) = read_result(self.server, &self.query, &result_id.to_string()).await;
+        assert_eq!(scored.verdict, "passed", "{scored:?}");
+
+        VerificationFixture::provision(
+            self.server.state().postgres.wyrd(),
+            self.server.pg_fixture().data_tenant_id(),
+        )
+        .await
+        .expect("fixture tenant opens")
+        .retire_fitted_format(psi.root.uid.as_ref().expect("verifier has a UID"))
+        .await
+        .expect("fitted profile retires");
+
+        let legacy = verification
+            .start_run(&request, None)
+            .await
+            .expect("run starts");
+        let refused = wait_settled(&verification, &legacy).await;
+        assert_eq!(
+            refused.status,
+            VerificationExecutionStatus::Errored,
+            "{refused:?}"
+        );
+        assert_eq!(
+            refused.error.as_ref().map(|error| error.code.as_str()),
+            Some("baseline_legacy"),
+            "{refused:?}"
+        );
+        assert!(refused.result_id.is_none(), "a refused run is never scored");
+
+        let after = verification.get_run(&historical).await.expect("run reads");
+        assert_eq!(after.result_id, before.result_id);
+        let (reread, _) = read_result(self.server, &self.query, &result_id.to_string()).await;
+        assert_eq!(
+            (reread.verdict.as_str(), reread.details.as_deref()),
+            (scored.verdict.as_str(), scored.details.as_deref()),
+            "the historical report reads unchanged"
+        );
+        assert!(evidence(&reread, "tier")["Psi"]["bins"].is_array());
+    }
+
+    /// Three rows are below PSI's minimum sample and one SPC subgroup, so
     /// both methods are inconclusive per feature.
     ///
     /// # Panics
@@ -887,7 +1024,7 @@ impl EdgeJourney<'_> {
         assert_eq!(
             verdicts(&features),
             [("latency", "Spc", "inconclusive")],
-            "three rows are below the chunk size"
+            "three rows are a partial subgroup"
         );
     }
 
@@ -984,11 +1121,28 @@ async fn assert_direct_scores(
         [("latency", "Psi", "drift"), ("tier", "Psi", "drift")],
         "{features:?}"
     );
+    let tier = evidence(&result, "tier");
+    assert_eq!(tier["Psi"]["sample"], 120, "{tier}");
+    let bins = tier["Psi"]["bins"].as_array().expect("PSI bins");
+    assert_eq!(
+        bins.iter()
+            .map(|bin| (
+                bin["bin"]["categorical_value"].clone(),
+                bin["target_count"].clone()
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (serde_json::json!("gold"), serde_json::json!(0)),
+            (serde_json::json!("silver"), serde_json::json!(0)),
+            (serde_json::Value::Null, serde_json::json!(120)),
+        ],
+        "every unseen tier lands in the reserved other bin: {tier}"
+    );
 
     let (result, features) = complete(server, verification, query, &spc).await;
     assert_eq!(result.verdict, "failed", "{result:?}");
-    assert_eq!(features.len(), 1, "{features:?}");
-    assert_eq!(features[0].feature, "latency");
+    assert_eq!(verdicts(&features), [("latency", "Spc", "drift")]);
+    assert_spc_evidence(&result, 24, 24);
 
     let (result, features) = complete(server, verification, query, &custom).await;
     assert_eq!(result.verdict, "failed", "{result:?}");
@@ -1005,6 +1159,40 @@ async fn assert_direct_scores(
         "an unscored window has null details"
     );
     assert!(features.is_empty(), "an unscored window writes no features");
+}
+
+/// Assert `result`'s SPC evidence for `latency`: subgroups of five, the
+/// number of complete `subgroups`, and `x_bar_signals` on the X-bar chart.
+///
+/// The baseline's twenty subgroups of consecutive integers fix the X-bar
+/// center at 49.5 and the S center at `sqrt(2.5)`; the persisted limits must
+/// be the NIST X-bar/S limits around them.
+///
+/// # Panics
+/// Panics when the evidence is missing or differs.
+fn assert_spc_evidence(result: &ResultRow, subgroups: u64, x_bar_signals: u64) {
+    let spc = &evidence(result, "latency")["Spc"];
+    assert_eq!(spc["subgroup_size"], 5, "{spc}");
+    assert_eq!(spc["subgroups"], subgroups, "{spc}");
+    assert_eq!(spc["x_bar"]["signals"], x_bar_signals, "{spc}");
+    let number = |value: &serde_json::Value| value.as_f64().expect("a number");
+    let s_bar = 2.5_f64.sqrt();
+    let c4 = 0.939_985_6;
+    let width = 3.0 * s_bar / (c4 * 5.0_f64.sqrt());
+    assert!(
+        (number(&spc["x_bar"]["center"]) - 49.5).abs() < 1e-9,
+        "{spc}"
+    );
+    assert!(
+        (number(&spc["x_bar"]["upper"]) - (49.5 + width)).abs() < 1e-5,
+        "{spc}"
+    );
+    assert!((number(&spc["s"]["center"]) - s_bar).abs() < 1e-9, "{spc}");
+    assert_eq!(
+        number(&spc["s"]["lower"]),
+        0.0,
+        "B3 is zero for subgroups of five"
+    );
 }
 
 /// Scheduled and manual activation of the Services sharing the `drift-daily`
@@ -1057,8 +1245,8 @@ impl SharedTrigger<'_> {
     ///
     /// # Panics
     /// Panics when a binding cannot be made due, an occurrence schedules the
-    /// wrong number of runs, or a run's identities, verdict, or dispatches are
-    /// wrong.
+    /// wrong number of runs, or a run's identities, verdict, SPC evidence, or
+    /// dispatches are wrong.
     async fn assert_one_occurrence_runs_each_binding(
         &self,
         services: [(&RegistrationReceipt, usize); 2],
@@ -1110,6 +1298,7 @@ impl SharedTrigger<'_> {
                 "only this binding's Operators"
             );
             let (result, _) = read_result(self.server, self.query, &run.result.to_string()).await;
+            assert_spc_evidence(&result, 24, 24);
             assert_eq!(
                 result.subject_card_uid,
                 service
@@ -1213,7 +1402,8 @@ impl SharedTrigger<'_> {
 
 /// Drive the refusals a real caller hits around Drift verification.
 ///
-/// A non-Parquet baseline is refused at registration, a caller without
+/// A non-Parquet baseline and an SPC profile carrying the retired
+/// `weco_rule` field are refused at registration, a caller without
 /// `evals:run` cannot start `request`, and a second tenant can neither run the
 /// first tenant's Verifier nor read its results.
 ///
@@ -1246,6 +1436,25 @@ async fn assert_refusals(
         .await
         .expect_err("a non-Parquet baseline is refused");
     assert_eq!(refused.code(), "WYRD_DRIFT_400_VALIDATION", "{refused:?}");
+
+    std::fs::write(
+        root.join("drift-spc-weco.yaml"),
+        verifier_yaml(
+            "drift-spc-weco",
+            &format!(
+                "      method: Spc\n{}      profile:\n        kind: Spc\n        sample_size: 5\n        weco_rule:\n          rule_string: \"8 16 4 8 2 4 1 1\"\n",
+                distribution("latency")
+            ),
+        ),
+    )
+    .expect("verifier card writes");
+    let retired = Box::pin(cards.register_from_path(&root.join("drift-spc-weco.yaml")))
+        .await
+        .expect_err("a retired SPC profile field is refused");
+    assert!(
+        format!("{retired:?}").contains("weco_rule"),
+        "the refusal names the retired field: {retired:?}"
+    );
 
     let reader = Verification::with_client(connect(
         server,

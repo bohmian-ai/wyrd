@@ -154,7 +154,7 @@ The runner reads through the ordinary server query service as the tenant's
 SYSTEM Drift reader (spec REQ-086, revision 36): it mints and verifies a
 short-lived token holding only `bifrost_query:read` on the tenant's
 registered `vala.drift.observations` table, then submits one fixed SQL
-statement per feature through capability admission, Gate, and a local or
+statement per run through capability admission, Gate, and a local or
 peer-forwarded Oracle. No Oracle need run in the verification process. The
 statement is canonical table -> exact subject, `series`, and `[start, end)`
 filter -> method-specific projection/aggregate. The subject UID, feature
@@ -165,11 +165,17 @@ validation, clean end-of-stream, the query deadline, and cancel-and-settle on
 any failure. Only aggregate rows return to Rust, and each decoded batch is
 folded as it arrives; SPC subgroup statistics stream through the X-bar/S
 signal counters in constant state instead of accumulating every subgroup.
-Before any method query, one completeness statement groups the window's
+A PSI or SPC statement is a `UNION ALL` of a completeness count and every
+feature's aggregate, ordered by part and then bin or subgroup, so Oracle
+answers all of them from one pinned cut: an observation ingested during a
+run is in every part or in none. The completeness part groups the window's
 records carrying any configured feature by `record_id` and counts records
 that omit a configured feature or carry a null or non-finite value; any such
 record makes the run inconclusive with no details and no feature rows.
-Records carrying no configured feature do not enter the comparison. The
+Records carrying no configured feature do not enter the comparison. Direct
+scoring receives an already selected batch: every row is one relevant
+observation, so a row null in every configured feature is incomplete rather
+than unrelated. The
 existing
 `feature.rs` helpers read wide baseline Arrow batches; they are not a mapper
 for this tall observation table and may
@@ -238,8 +244,10 @@ subgroups are formed. A subgroup signals on either chart when its mean or
 standard deviation is strictly outside that chart's limits. The feature score
 is the total signal count, compared with a threshold of zero. The report
 persists the subgroup size and count and, for each chart, its center, limits,
-and signal count as typed `Spc` evidence. An empty target or one ending in a
-partial subgroup is `inconclusive`, not a no-drift pass.
+and signal count as typed `Spc` evidence. When any feature has no complete
+subgroup or ends in a partial one, the whole run is inconclusive with no
+details and no feature rows, so a signal on another feature cannot fail an
+incomplete window.
 
 A Verifier whose stored baseline predates this format completes terminally
 with the visible `baseline_legacy` error instead of being reinterpreted.

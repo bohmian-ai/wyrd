@@ -847,6 +847,7 @@ mod tests {
                     score,
                     threshold: 0.2,
                     verdict,
+                    evidence: None,
                 },
             );
         }

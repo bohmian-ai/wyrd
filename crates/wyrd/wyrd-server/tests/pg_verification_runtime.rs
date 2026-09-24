@@ -569,6 +569,7 @@ fn drifting_report() -> VerifierReport {
                 score,
                 threshold: 1.0,
                 verdict,
+                evidence: None,
             },
         )
     })

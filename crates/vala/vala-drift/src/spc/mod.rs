@@ -270,6 +270,12 @@ impl SpcScorer {
         }
     }
 
+    /// The frozen rows per complete subgroup.
+    #[must_use]
+    pub fn subgroup_size(&self) -> u32 {
+        self.subgroup_size
+    }
+
     /// Feed the next subgroup of `feature`: `rows` values with `mean` and
     /// sample standard deviation `sd`.
     ///

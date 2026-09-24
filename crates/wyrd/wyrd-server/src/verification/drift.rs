@@ -18,10 +18,13 @@
 //! records the read decision. The shared scheduled-query consumer settles
 //! every stream, and each decoded aggregate batch is folded as it arrives.
 //!
-//! Input that cannot be scored (an empty Custom window, a tenant that never
-//! wrote an observation, a null value in a numeric projection, a non-finite
-//! mean) completes as `Drift(None)`, the inconclusive result without a report.
-//! A transient mint, query, or registry failure retries; a missing or
+//! PSI and SPC first check completeness: a selected observation is a
+//! `record_id` carrying at least one configured feature in the window, and
+//! when any selected observation omits a configured feature or holds a null
+//! or non-finite value the run completes as `Drift(None)`, the inconclusive
+//! result without a report; nothing is dropped or imputed. An empty Custom
+//! window and a non-finite Custom mean are unscorable the same way. A
+//! transient mint, query, or registry failure retries; a missing, legacy, or
 //! mismatched fitted baseline or a malformed aggregate terminates.
 
 use std::collections::BTreeMap;
@@ -32,7 +35,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use datafusion::sql::sqlparser::ast::Value;
 use tokio_util::sync::CancellationToken;
 use vala_drift::psi::BinType;
-use vala_drift::{FittedBaseline, PsiTargetCounts, SpcScorer, score_custom_mean, score_psi_counts};
+use vala_drift::{FITTED_FORMAT, FittedBaseline, SpcScorer, score_custom_mean, score_psi_counts};
 use wyrd_auth::issuance::TenantTokenIssuer;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::card::drift::{DriftProfile, DriftSpec};
@@ -57,13 +60,18 @@ pub const BASELINE_NOT_READY: &str = "baseline_not_ready";
 pub const DRIFT_QUERY_FAILED: &str = "drift_query_failed";
 /// Stable error code when the Verifier, baseline, and run cannot be scored together.
 pub const DRIFT_INVALID: &str = "drift_invalid";
+/// Stable error code when a PSI or SPC baseline was fitted before the current
+/// fitted-profile format; the Verifier needs a new version and a new fit.
+pub const BASELINE_LEGACY: &str = "baseline_legacy";
 
 /// Canonical Bifrost table every Drift statement reads.
 const OBSERVATIONS: &str = "vala.drift.observations";
-/// Aggregate bin of a null numeric value: the window is not scorable.
-const NULL_BIN: i64 = -2;
-/// Aggregate bin of a category absent from the fitted baseline.
-const UNKNOWN_BIN: i64 = -1;
+/// Aggregate bin of a null or non-finite value: the window is not scorable.
+const INVALID_BIN: i64 = -1;
+/// SQL predicate true only for a finite `num_value`: null and NaN compare
+/// false (IEEE) or outside the range (total order), and so do infinities.
+const FINITE_NUM: &str =
+    "COALESCE(num_value BETWEEN -1.7976931348623157e308 AND 1.7976931348623157e308, false)";
 
 /// Build a terminal `errored` outcome with `code` and `message`.
 fn terminal(code: &str, message: impl Into<String>) -> EngineOutcome {
@@ -123,14 +131,59 @@ impl ObservationWindow {
 
     /// The shared `FROM ... WHERE` clause selecting this window's `series` rows.
     fn rows(&self, series: &str) -> String {
+        self.rows_in(&format!("series = {}", Self::text(series)))
+    }
+
+    /// The `FROM ... WHERE` clause selecting this window's subject rows that
+    /// also satisfy `filter`.
+    fn rows_in(&self, filter: &str) -> String {
         format!(
-            "FROM {OBSERVATIONS} WHERE card_uid = {} AND series = {} \
+            "FROM {OBSERVATIONS} WHERE card_uid = {} AND {filter} \
              AND wyrd_event_time >= {} AND wyrd_event_time < {}",
             Self::text(&self.subject),
-            Self::text(series),
             Self::instant(self.start),
             Self::instant(self.end),
         )
+    }
+
+    /// Count the selected observations that are incomplete.
+    ///
+    /// Selected observations are the `record_id`s carrying at least one of
+    /// the configured `numeric` or `categorical` series in the window;
+    /// unrelated records never match. One is incomplete when it omits a
+    /// configured series or any of its configured values is invalid: a
+    /// numeric value that is null or non-finite, or a null category. Returns
+    /// one `incomplete` row.
+    ///
+    /// # Errors
+    /// Returns a description when no series is configured.
+    pub fn incomplete(&self, numeric: &[&str], categorical: &[&str]) -> Result<String, String> {
+        let list = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| Self::text(name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let configured = numeric.len() + categorical.len();
+        if configured == 0 {
+            return Err("a Drift distribution needs at least one feature".to_owned());
+        }
+        let valid = if numeric.is_empty() {
+            "str_value IS NOT NULL".to_owned()
+        } else {
+            format!(
+                "CASE WHEN series IN ({}) THEN {FINITE_NUM} ELSE str_value IS NOT NULL END",
+                list(numeric)
+            )
+        };
+        let all = list(&[numeric, categorical].concat());
+        Ok(format!(
+            "SELECT COUNT(*) AS incomplete FROM (SELECT record_id {} GROUP BY record_id \
+             HAVING COUNT(DISTINCT series) < {configured} \
+             OR SUM(CASE WHEN {valid} THEN 0 ELSE 1 END) > 0)",
+            self.rows_in(&format!("series IN ({all})"))
+        ))
     }
 
     /// Group `bin` over `rows` and count each group as `(bin_id, n)`.
@@ -141,8 +194,8 @@ impl ObservationWindow {
     /// Count `series` values into fitted `(lower, upper]` numeric bins.
     ///
     /// `edges` are the fitted bin edges (`bins + 1` values, open outer
-    /// edges). Returns `(bin_id, n)` rows; a null value lands in
-    /// [`NULL_BIN`] so the caller can refuse to score the window.
+    /// edges). Returns `(bin_id, n)` rows; a null or non-finite value lands
+    /// in [`INVALID_BIN`] so the caller can refuse to score the window.
     ///
     /// # Errors
     /// Returns a description when `edges` has fewer than two entries or an
@@ -153,7 +206,7 @@ impl ObservationWindow {
             .checked_sub(1)
             .filter(|bins| *bins > 0)
             .ok_or("a numeric PSI feature needs at least one bin")?;
-        let mut case = format!("CASE WHEN num_value IS NULL THEN {NULL_BIN}");
+        let mut case = format!("CASE WHEN NOT {FINITE_NUM} THEN {INVALID_BIN}");
         for (index, upper) in edges[1..bins].iter().enumerate() {
             if !upper.is_finite() {
                 return Err("a fitted inner PSI edge is not finite".to_owned());
@@ -164,48 +217,44 @@ impl ObservationWindow {
         Ok(Self::count_bins(&case, &self.rows(series)))
     }
 
-    /// Count non-null `series` categories into fitted labels.
+    /// Count `series` categories into fitted labels and the `other` bin.
     ///
-    /// Returns `(bin_id, n)` rows; a category absent from `labels` lands in
-    /// [`UNKNOWN_BIN`], which counts toward the target total only.
+    /// `labels` are the fitted labels in bin order and `other` the index of
+    /// the reserved bin every unseen category lands in. Returns `(bin_id, n)`
+    /// rows; a null category lands in [`INVALID_BIN`].
     #[must_use]
-    pub fn psi_categorical(&self, series: &str, labels: &[&str]) -> String {
-        let bin = if labels.is_empty() {
-            UNKNOWN_BIN.to_string()
-        } else {
-            let mut case = "CASE".to_owned();
-            for (index, label) in labels.iter().enumerate() {
-                case.push_str(&format!(
-                    " WHEN str_value = {} THEN {index}",
-                    Self::text(label)
-                ));
-            }
-            case.push_str(&format!(" ELSE {UNKNOWN_BIN} END"));
-            case
-        };
-        let rows = format!("{} AND str_value IS NOT NULL", self.rows(series));
-        Self::count_bins(&bin, &rows)
+    pub fn psi_categorical(&self, series: &str, labels: &[&str], other: usize) -> String {
+        let mut case = format!("CASE WHEN str_value IS NULL THEN {INVALID_BIN}");
+        for (index, label) in labels.iter().enumerate() {
+            case.push_str(&format!(
+                " WHEN str_value = {} THEN {index}",
+                Self::text(label)
+            ));
+        }
+        case.push_str(&format!(" ELSE {other} END"));
+        Self::count_bins(&case, &self.rows(series))
     }
 
-    /// Form consecutive `chunk_size` subgroups of `series` in observation order.
+    /// Form consecutive `subgroup_size` subgroups of `series` in observation
+    /// order.
     ///
     /// Rows are numbered by `created_at`, then `record_id`; subgroup `k`
-    /// holds rows `k·chunk_size ..` and the last may be a shorter trailing
-    /// chunk, as the existing scorer forms them. Returns
-    /// `(chunk, n, numeric_n, mean)` ordered by chunk; `n != numeric_n`
-    /// exposes a null value.
+    /// holds rows `k·subgroup_size ..`, and only the last may be partial.
+    /// Returns `(subgroup, n, numeric_n, mean, sd)` ordered by subgroup, with
+    /// `sd` the sample standard deviation; `n != numeric_n` exposes a null.
     ///
     /// # Errors
-    /// Returns a description when `chunk_size` is zero.
-    pub fn spc(&self, series: &str, chunk_size: u32) -> Result<String, String> {
-        if chunk_size == 0 {
-            return Err("an SPC chunk size is positive".to_owned());
+    /// Returns a description when `subgroup_size` is below two.
+    pub fn spc(&self, series: &str, subgroup_size: u32) -> Result<String, String> {
+        if subgroup_size < 2 {
+            return Err("an SPC subgroup holds at least two rows".to_owned());
         }
         Ok(format!(
-            "SELECT chunk, COUNT(*) AS n, COUNT(num_value) AS numeric_n, AVG(num_value) AS mean \
+            "SELECT subgroup, COUNT(*) AS n, COUNT(num_value) AS numeric_n, \
+             AVG(num_value) AS mean, STDDEV_SAMP(num_value) AS sd \
              FROM (SELECT num_value, CAST((ROW_NUMBER() OVER (ORDER BY created_at ASC NULLS LAST, \
-             record_id ASC NULLS LAST) - 1) / {chunk_size} AS BIGINT) AS chunk {}) \
-             GROUP BY chunk ORDER BY chunk",
+             record_id ASC NULLS LAST) - 1) / {subgroup_size} AS BIGINT) AS subgroup {}) \
+             GROUP BY subgroup ORDER BY subgroup",
             self.rows(series)
         ))
     }
@@ -251,63 +300,83 @@ fn count_of(value: i64) -> Result<u64, String> {
     u64::try_from(value).map_err(|_| "aggregate count is negative".to_owned())
 }
 
-/// Fold one batch of `(bin_id, n)` rows into `counts`.
+/// Fold one batch of `(bin_id, n)` rows into the fitted-bin `counts`.
 ///
-/// Absent bins stay zero; [`UNKNOWN_BIN`] adds to the total only. Returns
-/// `Ok(false)` when a null value was counted, which leaves the window
-/// unscorable.
+/// Absent bins stay zero. Returns `Ok(false)` when an invalid value was
+/// counted, which leaves the window unscorable.
 ///
 /// # Errors
 /// Returns a description for a malformed aggregate or an out-of-range bin.
-pub fn fold_psi(batch: &RecordBatch, counts: &mut PsiTargetCounts) -> Result<bool, String> {
+pub fn fold_psi(batch: &RecordBatch, counts: &mut [u64]) -> Result<bool, String> {
     let (ids, ns) = (int64s(batch, "bin_id")?, int64s(batch, "n")?);
     let mut scorable = true;
     for (id, n) in ids.values().iter().zip(ns.values()) {
         let n = count_of(*n)?;
-        match *id {
-            NULL_BIN => scorable = false,
-            UNKNOWN_BIN => {}
-            id => {
-                let slot = usize::try_from(id)
-                    .ok()
-                    .and_then(|index| counts.bins.get_mut(index))
-                    .ok_or_else(|| format!("aggregate bin {id} is not a fitted bin"))?;
-                *slot += n;
-            }
+        if *id == INVALID_BIN {
+            scorable = false;
+            continue;
         }
-        counts.total += n;
+        let slot = usize::try_from(*id)
+            .ok()
+            .and_then(|index| counts.get_mut(index))
+            .ok_or_else(|| format!("aggregate bin {id} is not a fitted bin"))?;
+        *slot += n;
     }
     Ok(scorable)
 }
 
-/// Feed one batch of ordered `(chunk, n, numeric_n, mean)` rows of `feature`
-/// to `scorer`.
+/// Feed one batch of ordered `(subgroup, n, numeric_n, mean, sd)` rows of
+/// `feature` to `scorer`.
 ///
-/// Returns `Ok(false)` without feeding further rows when a chunk counted a
-/// null value, which leaves the window unscorable.
+/// A partial subgroup is fed by size alone. Returns `Ok(false)` without
+/// feeding further rows when a complete subgroup counted a null or has
+/// non-finite statistics, which leaves the window unscorable.
 ///
 /// # Errors
-/// Returns a description for a malformed aggregate or a chunk the scorer
+/// Returns a description for a malformed aggregate or a subgroup the scorer
 /// refuses.
 pub fn fold_spc(
     batch: &RecordBatch,
     feature: &wyrd_spec::ids::FeatureName,
     scorer: &mut SpcScorer,
 ) -> Result<bool, String> {
-    let (ns, numeric, means) = (
+    let (ns, numeric, means, sds) = (
         int64s(batch, "n")?,
         int64s(batch, "numeric_n")?,
         float64s(batch, "mean")?,
+        float64s(batch, "sd")?,
     );
+    let value = |column: &Float64Array, row| {
+        if column.is_valid(row) {
+            column.value(row)
+        } else {
+            f64::NAN
+        }
+    };
     for row in 0..batch.num_rows() {
-        if ns.value(row) != numeric.value(row) || means.is_null(row) {
+        let n = count_of(ns.value(row))?;
+        let (mean, sd) = (value(means, row), value(sds, row));
+        if n == u64::from(scorer.subgroup_size())
+            && (ns.value(row) != numeric.value(row) || !mean.is_finite() || !sd.is_finite())
+        {
             return Ok(false);
         }
         scorer
-            .push(feature, count_of(ns.value(row))?, means.value(row))
+            .push(feature, n, mean, sd)
             .map_err(|error| error.to_string())?;
     }
     Ok(true)
+}
+
+/// Read one batch of the one-row `incomplete` count into `incomplete`.
+///
+/// # Errors
+/// Returns a description for a malformed aggregate.
+pub fn fold_incomplete(batch: &RecordBatch, incomplete: &mut u64) -> Result<(), String> {
+    for value in int64s(batch, "incomplete")?.values() {
+        *incomplete += count_of(*value)?;
+    }
+    Ok(())
 }
 
 /// Read one batch of the Custom `(n, numeric_n, mean)` aggregate into `row`.
@@ -423,6 +492,20 @@ impl DriftEngine {
                         "the fitted baseline is not a PSI baseline".to_owned(),
                     ));
                 };
+                let names = |bin_type: BinType| {
+                    baseline
+                        .features
+                        .iter()
+                        .filter(|(_, feature)| feature.bin_type == bin_type)
+                        .map(|(name, _)| name.as_str())
+                        .collect::<Vec<_>>()
+                };
+                let incomplete = window
+                    .incomplete(&names(BinType::Numeric), &names(BinType::Categorical))
+                    .map_err(&invalid)?;
+                if !reader.complete(incomplete).await? {
+                    return Ok(None);
+                }
                 let mut counts = BTreeMap::new();
                 for (name, feature) in &baseline.features {
                     let sql = match feature.bin_type {
@@ -432,18 +515,13 @@ impl DriftEngine {
                             .and_then(|edges| window.psi_numeric(name.as_str(), &edges))
                             .map_err(&invalid)?,
                         BinType::Categorical => {
-                            let labels = feature
-                                .bins
-                                .iter()
-                                .map(|bin| bin.categorical_value.as_deref().unwrap_or_default())
-                                .collect::<Vec<_>>();
-                            window.psi_categorical(name.as_str(), &labels)
+                            let (labels, other) = feature
+                                .categorical_labels()
+                                .map_err(|error| invalid(error.to_string()))?;
+                            window.psi_categorical(name.as_str(), &labels, other)
                         }
                     };
-                    let mut feature_counts = PsiTargetCounts {
-                        bins: vec![0; feature.bins.len()],
-                        total: 0,
-                    };
+                    let mut feature_counts = vec![0; feature.bins.len()];
                     let mut scorable = true;
                     reader
                         .fold(sql, |batch| {
@@ -458,18 +536,26 @@ impl DriftEngine {
                 }
                 scored(score_psi_counts(&baseline, &counts, profile))
             }
-            Some(DriftProfile::Spc(profile)) => {
+            Some(DriftProfile::Spc(_)) => {
                 let FittedBaseline::Spc(baseline) = self.fitted(tenant, &run.verifier_uid).await?
                 else {
                     return Err(invalid(
                         "the fitted baseline is not an SPC baseline".to_owned(),
                     ));
                 };
-                let mut scorer =
-                    SpcScorer::new(&baseline, profile).map_err(|e| invalid(e.to_string()))?;
+                let names = baseline
+                    .features
+                    .keys()
+                    .map(|name| name.as_str())
+                    .collect::<Vec<_>>();
+                let incomplete = window.incomplete(&names, &[]).map_err(&invalid)?;
+                if !reader.complete(incomplete).await? {
+                    return Ok(None);
+                }
+                let mut scorer = SpcScorer::new(&baseline);
                 for name in baseline.features.keys() {
                     let sql = window
-                        .spc(name.as_str(), baseline.chunk_size)
+                        .spc(name.as_str(), baseline.subgroup_size)
                         .map_err(&invalid)?;
                     let mut scorable = true;
                     reader
@@ -492,9 +578,14 @@ impl DriftEngine {
 
     /// Load the ready fitted baseline of `verifier_uid`.
     ///
+    /// A PSI or SPC profile whose `format` is not [`FITTED_FORMAT`] was fitted
+    /// under earlier semantics and is refused before decoding; it is never
+    /// rescored or migrated.
+    ///
     /// # Errors
-    /// Retries a registry failure; terminates when no baseline is ready or the
-    /// stored profile does not decode.
+    /// Retries a registry failure; terminates with [`BASELINE_NOT_READY`] when
+    /// no baseline is ready, [`BASELINE_LEGACY`] for an earlier format, and
+    /// [`DRIFT_INVALID`] when the stored profile does not decode.
     async fn fitted(
         &self,
         tenant: DataTenantId,
@@ -515,6 +606,18 @@ impl DriftEngine {
             .await
             .map_err(|error| unavailable(&error))?
             .ok_or_else(|| terminal(BASELINE_NOT_READY, "the Drift baseline is not fitted"))?;
+        let format = fitted
+            .as_object()
+            .and_then(|method| method.values().next())
+            .and_then(|profile| profile.get("format"))
+            .and_then(serde_json::Value::as_u64);
+        if format != Some(u64::from(FITTED_FORMAT)) {
+            return Err(terminal(
+                BASELINE_LEGACY,
+                "the Drift baseline was fitted before the conventional PSI/SPC semantics; \
+                 register a new Verifier version to refit it",
+            ));
+        }
         serde_json::from_value(fitted).map_err(|error| terminal(DRIFT_INVALID, error.to_string()))
     }
 }
@@ -576,6 +679,18 @@ impl Reader<'_> {
         }))
     }
 
+    /// Run the `incomplete` count `sql` and report whether every selected
+    /// observation is complete.
+    ///
+    /// # Errors
+    /// Returns the outcomes of [`Reader::fold`].
+    async fn complete(&self, sql: String) -> Result<bool, EngineOutcome> {
+        let mut incomplete = 0;
+        self.fold(sql, |batch| fold_incomplete(batch, &mut incomplete))
+            .await?;
+        Ok(incomplete == 0)
+    }
+
     /// Run `sql` as a fresh reader and hand each decoded batch to `fold`.
     ///
     /// A tenant with no observation table reads nothing and `fold` is never
@@ -632,7 +747,8 @@ mod tests {
     //! escaping, `[start, end)` exclusion, subject/series isolation, and SPC
     //! observation order are proved on the rendered SQL rather than on its
     //! text. The fold tests pin malformed-aggregate refusal and the
-    //! unscorable-window outcome.
+    //! unscorable-window outcome, and the completeness count pins which
+    //! observations are selected and which make the run inconclusive.
 
     use std::sync::Arc;
 
@@ -776,6 +892,18 @@ mod tests {
             .expect("fixed SQL executes")
     }
 
+    /// Execute the completeness `sql` over `rows` and fold its count.
+    ///
+    /// # Panics
+    /// Panics when the SQL fails or its aggregate is malformed.
+    async fn incomplete(sql: &str, rows: &[Row<'_>]) -> u64 {
+        let mut incomplete = 0;
+        for batch in run(sql, rows).await {
+            fold_incomplete(&batch, &mut incomplete).expect("well-formed");
+        }
+        incomplete
+    }
+
     /// Numeric PSI counts land on the fitted `(lower, upper]` edges exactly,
     /// and only this subject's series inside `[start, end)` is counted.
     #[tokio::test]
@@ -795,26 +923,26 @@ mod tests {
         let sql = window()
             .psi_numeric("age", &[f64::NEG_INFINITY, 10.0, 20.0, f64::INFINITY])
             .expect("numeric SQL");
-        let mut counts = PsiTargetCounts {
-            bins: vec![0; 3],
-            total: 0,
-        };
+        let mut counts = vec![0; 3];
         for batch in run(&sql, &rows).await {
             assert!(fold_psi(&batch, &mut counts).expect("well-formed"));
         }
-        assert_eq!(counts.bins, vec![1, 2, 1]);
-        assert_eq!(counts.total, 4);
+        assert_eq!(counts, vec![1, 2, 1]);
 
-        let null: Vec<Row<'_>> = vec![(&uid, "age", None, None, 0, 0, "a")];
-        let mut counts = PsiTargetCounts {
-            bins: vec![0; 3],
-            total: 0,
-        };
-        let scorable = run(&sql, &null)
-            .await
-            .iter()
-            .all(|batch| fold_psi(batch, &mut counts).expect("well-formed"));
-        assert!(!scorable, "a null value leaves the window unscorable");
+        for bad in [
+            None,
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+            Some(f64::NEG_INFINITY),
+        ] {
+            let invalid: Vec<Row<'_>> = vec![(&uid, "age", bad, None, 0, 0, "a")];
+            let mut counts = vec![0; 3];
+            let scorable = run(&sql, &invalid)
+                .await
+                .iter()
+                .all(|batch| fold_psi(batch, &mut counts).expect("well-formed"));
+            assert!(!scorable, "{bad:?} leaves the window unscorable");
+        }
         assert!(window().psi_numeric("age", &[0.0]).is_err());
         assert!(
             window()
@@ -823,36 +951,42 @@ mod tests {
         );
     }
 
-    /// Categorical PSI counts fitted labels, sends unknown categories to the
-    /// total only, ignores nulls, and escapes quoted labels and series.
+    /// Categorical PSI counts fitted labels, sends unseen categories to the
+    /// `other` bin, marks a null category invalid, and escapes quoted labels
+    /// and series.
     #[tokio::test]
-    async fn psi_categorical_sql_escapes_labels_and_counts_unknowns() {
+    async fn psi_categorical_sql_escapes_labels_and_counts_unknowns_as_other() {
         let uid = subject().to_string();
         let rows: Vec<Row<'_>> = vec![
             (&uid, "it's", None, Some("o'neil"), 0, 0, "a"),
             (&uid, "it's", None, Some("red"), 1, 1, "b"),
             (&uid, "it's", None, Some("red"), 2, 2, "c"),
             (&uid, "it's", None, Some("mauve"), 3, 3, "d"),
-            (&uid, "it's", None, None, 4, 4, "e"),
+            (&uid, "it's", None, Some("teal"), 4, 4, "e"),
         ];
-        let sql = window().psi_categorical("it's", &["red", "o'neil", "blue"]);
-        let mut counts = PsiTargetCounts {
-            bins: vec![0; 3],
-            total: 0,
-        };
+        let sql = window().psi_categorical("it's", &["red", "o'neil", "blue"], 3);
+        let mut counts = vec![0; 4];
         for batch in run(&sql, &rows).await {
             assert!(fold_psi(&batch, &mut counts).expect("well-formed"));
         }
-        assert_eq!(counts.bins, vec![2, 1, 0]);
-        assert_eq!(counts.total, 4);
+        assert_eq!(counts, vec![2, 1, 0, 2]);
+
+        let null: Vec<Row<'_>> = vec![(&uid, "it's", None, None, 0, 0, "a")];
+        let mut counts = vec![0; 4];
+        let scorable = run(&sql, &null)
+            .await
+            .iter()
+            .all(|batch| fold_psi(batch, &mut counts).expect("well-formed"));
+        assert!(!scorable, "a null category leaves the window unscorable");
         let stray = batch(&[("bin_id", vec![9]), ("n", vec![1])], &[]);
         assert!(fold_psi(&stray, &mut counts).is_err());
     }
 
-    /// SPC subgroups follow `created_at`, then `record_id`, keep a shorter
-    /// trailing chunk, and report nulls through `n != numeric_n`.
+    /// SPC subgroups follow `created_at`, then `record_id`, return the mean
+    /// and sample standard deviation, keep a partial trailing subgroup
+    /// visible, and report nulls through `n != numeric_n`.
     #[tokio::test]
-    async fn spc_sql_orders_chunks_by_creation_then_record() {
+    async fn spc_sql_orders_subgroups_by_creation_then_record() {
         let uid = subject().to_string();
         let rows: Vec<Row<'_>> = vec![
             (&uid, "age", Some(4.0), None, 0, 2, "a"),
@@ -863,13 +997,14 @@ mod tests {
         ];
         let sql = window().spc("age", 2).expect("spc SQL");
         let batches = run(&sql, &rows).await;
-        let chunks = batches
+        let subgroups = batches
             .iter()
             .flat_map(|batch| {
-                let (ns, numeric, means) = (
+                let (ns, numeric, means, sds) = (
                     int64s(batch, "n").expect("n"),
                     int64s(batch, "numeric_n").expect("numeric_n"),
                     float64s(batch, "mean").expect("mean"),
+                    float64s(batch, "sd").expect("sd"),
                 );
                 (0..batch.num_rows())
                     .map(|row| {
@@ -877,16 +1012,108 @@ mod tests {
                             ns.value(row),
                             numeric.value(row),
                             means.is_valid(row).then(|| means.value(row)),
+                            sds.is_valid(row).then(|| sds.value(row)),
                         )
                     })
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
+        let half = std::f64::consts::FRAC_1_SQRT_2;
         assert_eq!(
-            chunks,
-            vec![(2, 2, Some(1.5)), (2, 2, Some(3.5)), (1, 0, None)]
+            subgroups,
+            vec![
+                (2, 2, Some(1.5), Some(half)),
+                (2, 2, Some(3.5), Some(half)),
+                (1, 0, None, None)
+            ]
         );
-        assert!(window().spc("age", 0).is_err());
+        assert!(window().spc("age", 1).is_err());
+    }
+
+    /// The SPC fold feeds complete subgroups and a partial trailing one to
+    /// the scorer, and stops on a null or non-finite complete subgroup.
+    ///
+    /// # Panics
+    /// Panics when a fold outcome differs.
+    #[test]
+    fn spc_fold_feeds_subgroups_and_refuses_invalid_ones() {
+        let feature = wyrd_spec::ids::FeatureName::new("age").expect("feature");
+        let values = (0..40).map(|row| Some(f64::from(row % 3))).collect();
+        let baseline = vala_drift::fit_spc_baseline(
+            &batch(&[], &[("age", values)]),
+            &wyrd_spec::card::drift::SpcProfile { sample_size: 2 },
+            std::slice::from_ref(&feature),
+        )
+        .expect("baseline fits");
+        let aggregate = |n: Vec<i64>, numeric: Vec<i64>, mean: Vec<Option<f64>>, sd| {
+            batch(
+                &[("n", n), ("numeric_n", numeric)],
+                &[("mean", mean), ("sd", sd)],
+            )
+        };
+        let mut scorer = SpcScorer::new(&baseline);
+        let fed = aggregate(
+            vec![2, 2, 1],
+            vec![2, 2, 1],
+            vec![Some(0.0), Some(5.0), Some(0.0)],
+            vec![Some(0.5), Some(0.5), None],
+        );
+        assert!(fold_spc(&fed, &feature, &mut scorer).expect("well-formed"));
+        assert_eq!(
+            scorer.finish().verdict,
+            vala_drift::DriftVerdict::Inconclusive,
+            "a partial trailing subgroup is inconclusive"
+        );
+        for (numeric, mean) in [(1, Some(0.0)), (2, Some(f64::NAN)), (2, None)] {
+            let mut scorer = SpcScorer::new(&baseline);
+            let invalid = aggregate(vec![2], vec![numeric], vec![mean], vec![Some(0.5)]);
+            assert!(!fold_spc(&invalid, &feature, &mut scorer).expect("well-formed"));
+        }
+    }
+
+    /// Completeness selects records carrying a configured series in the
+    /// window, ignores unrelated records, and counts one incomplete for an
+    /// omitted feature, a null, NaN, or infinite numeric value, or a null
+    /// category.
+    #[tokio::test]
+    async fn completeness_flags_omitted_and_invalid_features_only() {
+        let uid = subject().to_string();
+        let uid = uid.as_str();
+        let sql = window()
+            .incomplete(&["x"], &["c"])
+            .expect("completeness SQL");
+        let complete = vec![
+            (uid, "x", Some(1.0), Some("1"), 0, 0, "r1"),
+            (uid, "c", None, Some("a"), 0, 0, "r1"),
+            (uid, "unrelated", None, None, 0, 0, "r2"),
+            (uid, "x", None, None, 7200, 0, "outside the window"),
+        ];
+        assert_eq!(incomplete(&sql, &complete).await, 0);
+        assert_eq!(
+            incomplete(&sql, &[]).await,
+            0,
+            "an empty window selects nothing"
+        );
+        let omitted = vec![(uid, "x", Some(1.0), Some("1"), 0, 0, "r1")];
+        assert_eq!(incomplete(&sql, &omitted).await, 1);
+        for bad in [
+            None,
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+            Some(f64::NEG_INFINITY),
+        ] {
+            let rows = vec![
+                (uid, "x", bad, None, 0, 0, "r1"),
+                (uid, "c", None, Some("a"), 0, 0, "r1"),
+            ];
+            assert_eq!(incomplete(&sql, &rows).await, 1, "{bad:?}");
+        }
+        let null_category = vec![
+            (uid, "x", Some(1.0), Some("1"), 0, 0, "r1"),
+            (uid, "c", None, None, 0, 0, "r1"),
+        ];
+        assert_eq!(incomplete(&sql, &null_category).await, 1);
+        assert!(window().incomplete(&[], &[]).is_err());
     }
 
     /// The Custom aggregate is one row over the window; only a non-empty,

@@ -1,7 +1,7 @@
 # Statistical Drift domain review — TASK-005 round 2
 
-**Subject:** `f8811ac5035c3aa165d34c38992f9889b3c9081f` → `81d2221b4d3b1a9fb6bd36c591d421385cc8c67d` (HEAD confirmed at candidate).  
-**Boundary:** baseline fitting; fixed-window PSI, SPC, and Custom aggregation and scoring; inconclusive outcomes; bounded SPC history; and method journey proof.  
+**Subject:** `f8811ac5035c3aa165d34c38992f9889b3c9081f` → `81d2221b4d3b1a9fb6bd36c591d421385cc8c67d` (HEAD confirmed at candidate).
+**Boundary:** baseline fitting; fixed-window PSI, SPC, and Custom aggregation and scoring; inconclusive outcomes; bounded SPC history; and method journey proof.
 **Result: PASS.** No material statistical finding.
 
 ## Authority and source coverage

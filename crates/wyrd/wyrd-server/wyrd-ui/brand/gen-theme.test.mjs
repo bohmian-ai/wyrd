@@ -11,7 +11,7 @@ const ROLES = {
   '--surface': ['#FFFFFF', '#101B19'],
   '--surface-2': ['#E7EEEC', '#182725'],
   '--surface-hover': ['#EDF2F0', '#1D2F2B'],
-  '--text': ['#10201D', '#EAF2F0'],
+  '--text': ['#10201D', '#C8D3CF'],
   '--muted': ['#53645F', '#9AB0AB'],
   '--border': ['#9AACAA', '#39504B'],
   '--border-soft': ['#D7E1DE', '#263B37'],

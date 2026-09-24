@@ -15,7 +15,7 @@
     "--surface-2":     { "group": "surface", "light": "#E7EEEC", "dark": "#182725", "role": "Surface secondary — subordinate regions and neutral controls." },
     "--surface-hover": { "group": "surface", "light": "#EDF2F0", "dark": "#1D2F2B", "role": "Surface hover — neutral interaction feedback." },
 
-    "--text":          { "group": "ink", "light": "#10201D", "dark": "#EAF2F0", "role": "Ink — primary text and the strongest rule." },
+    "--text":          { "group": "ink", "light": "#10201D", "dark": "#C8D3CF", "role": "Ink — primary text and the strongest rule." },
     "--muted":         { "group": "ink", "light": "#53645F", "dark": "#9AB0AB", "role": "Muted ink — supporting text and metadata." },
     "--border":        { "group": "ink", "light": "#9AACAA", "dark": "#39504B", "role": "Rule — one-pixel structural dividers and control borders." },
     "--border-soft":   { "group": "ink", "light": "#D7E1DE", "dark": "#263B37", "role": "Rule soft — row and subordinate dividers." },

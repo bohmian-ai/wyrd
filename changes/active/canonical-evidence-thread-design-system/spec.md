@@ -126,7 +126,7 @@ provenance, not crime-scene, policing, or compliance theater.
 | Surface | `#FFFFFF` | `#101B19` | primary panel and chrome |
 | Surface secondary | `#E7EEEC` | `#182725` | subordinate regions and controls |
 | Surface hover | `#EDF2F0` | `#1D2F2B` | neutral interaction feedback |
-| Ink | `#10201D` | `#EAF2F0` | primary text and strongest rule |
+| Ink | `#10201D` | `#C8D3CF` | primary text and strongest rule |
 | Muted ink | `#53645F` | `#9AB0AB` | supporting text and metadata |
 | Rule | `#9AACAA` | `#39504B` | structural dividers and control borders |
 | Rule soft | `#D7E1DE` | `#263B37` | row and subordinate dividers |

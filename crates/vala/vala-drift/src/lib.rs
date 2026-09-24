@@ -32,9 +32,7 @@ pub use psi::{
     score_psi, score_psi_counts,
 };
 pub use report::{DriftReport, DriftVerdict, FeatureDriftReport};
-pub use spc::{
-    FittedSpcFeature, SpcBaseline, SpcTargetChunks, fit_spc_baseline, score_spc, score_spc_chunks,
-};
+pub use spc::{FittedSpcFeature, SpcBaseline, SpcScorer, fit_spc_baseline, score_spc};
 
 #[cfg(test)]
 mod smoke {

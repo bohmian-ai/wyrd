@@ -445,9 +445,8 @@ mod aggregate_inputs {
     use wyrd_spec::ids::FeatureName;
 
     use crate::{
-        DriftVerdict, FittedBaseline, PsiTargetCounts, SpcTargetChunks, fit_psi_baseline,
+        DriftVerdict, FittedBaseline, PsiTargetCounts, SpcScorer, fit_psi_baseline,
         fit_spc_baseline, score_custom_mean, score_psi, score_psi_counts, score_spc,
-        score_spc_chunks,
     };
 
     /// Parse a fixture feature name.
@@ -589,30 +588,27 @@ mod aggregate_inputs {
         )
         .expect("baseline fits");
         let target: Vec<f64> = (0..23).map(|value| 40.0 + f64::from(value)).collect();
-        let means = target
-            .chunks(5)
-            .map(|chunk| chunk.iter().sum::<f64>() / chunk.len() as f64)
-            .collect();
+        let mut scorer = SpcScorer::new(&baseline, &profile).expect("rule parses");
+        for chunk in target.chunks(5) {
+            let mean = chunk.iter().sum::<f64>() / chunk.len() as f64;
+            scorer
+                .push(&x, chunk.len() as u64, mean)
+                .expect("chunk pushes");
+        }
+        let aggregate = scorer.finish();
         let raw = score_spc(
             &baseline,
             &batch("x", DataType::Float64, Arc::new(Float64Array::from(target))),
             &profile,
         )
         .expect("raw scores");
-        let chunks = BTreeMap::from([(x.clone(), SpcTargetChunks { rows: 23, means })]);
-        let aggregate = score_spc_chunks(&baseline, &chunks, &profile).expect("chunks score");
         // The rule-driven threshold is NaN, so compare the rendered reports.
         assert_eq!(format!("{raw:?}"), format!("{aggregate:?}"));
         assert_eq!(aggregate.verdict, DriftVerdict::Drift);
 
-        let short = BTreeMap::from([(
-            x.clone(),
-            SpcTargetChunks {
-                rows: 4,
-                means: vec![4.5],
-            },
-        )]);
-        let report = score_spc_chunks(&baseline, &short, &profile).expect("short scores");
+        let mut short = SpcScorer::new(&baseline, &profile).expect("rule parses");
+        short.push(&x, 4, 4.5).expect("short chunk pushes");
+        let report = short.finish();
         assert_eq!(report.verdict, DriftVerdict::Inconclusive);
         assert!(report.features[&x].score.is_nan());
     }

@@ -6,12 +6,14 @@ pub(crate) mod weco;
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use wyrd_spec::card::drift::SpcProfile;
+use wyrd_spec::card::drift::{DriftMethod, SpcProfile};
 use wyrd_spec::ids::FeatureName;
 use wyrd_version::WyrdVersion;
 
 use crate::error::{DriftFitError, DriftScoreError};
-use crate::report::DriftReport;
+use crate::report::{DriftReport, DriftVerdict, FeatureDriftReport};
+use crate::spc::control_limits::ControlLimits;
+use crate::spc::weco::{WecoChecks, WecoScan, assign_zone, parse_rule};
 
 /// SPC fitted baseline, one entry per feature plus the chunk size used.
 ///
@@ -116,14 +118,14 @@ pub fn fit_spc_baseline(
 /// Score a target `RecordBatch` against a fitted SPC baseline.
 ///
 /// Forms consecutive chunk means of each feature's non-null values in row
-/// order (the trailing partial chunk included) and scores them through
-/// [`score_spc_chunks`], so raw-batch and server-aggregated inputs share one
-/// zone and rule evaluation.
+/// order (the trailing partial chunk included) and feeds them through one
+/// [`SpcScorer`], so raw-batch and server-streamed inputs share one zone and
+/// rule evaluation.
 ///
 /// # Errors
-/// Returns [`DriftScoreError`] when a feature is missing, mistyped, empty,
-/// non-finite, or shorter than the chunk size, or when the WECO rule is
-/// malformed.
+/// Returns [`DriftScoreError`] when the WECO rule is malformed, or when a
+/// feature is missing, mistyped, empty, non-finite, or shorter than the
+/// chunk size, or the baseline chunk size is zero.
 pub fn score_spc(
     baseline: &SpcBaseline,
     target: &arrow::record_batch::RecordBatch,
@@ -132,7 +134,7 @@ pub fn score_spc(
     use crate::feature::resolve_column;
 
     let chunk_size = baseline.chunk_size as usize;
-    let mut chunks = BTreeMap::new();
+    let mut scorer = SpcScorer::new(baseline, profile)?;
     for feature_name in baseline.features.keys() {
         let column = resolve_column(target, feature_name).map_err(|_| {
             DriftScoreError::FeatureMissingInTarget {
@@ -167,123 +169,170 @@ pub fn score_spc(
                 chunk_size,
             });
         }
-        chunks.insert(
-            feature_name.clone(),
-            SpcTargetChunks {
-                rows: values.len() as u64,
-                means: sample_chunk_means(&values, chunk_size)?,
-            },
-        );
+        if chunk_size == 0 {
+            return Err(DriftScoreError::SpcInternal {
+                message: "chunk_size must be greater than zero".into(),
+            });
+        }
+        for chunk in values.chunks(chunk_size) {
+            let mean = chunk.iter().sum::<f64>() / chunk.len() as f64;
+            scorer.push(feature_name, chunk.len() as u64, mean)?;
+        }
     }
-    score_spc_chunks(baseline, &chunks, profile)
+    Ok(scorer.finish())
 }
 
-/// Ordered chunk means of one SPC feature's target window.
+/// Streaming SPC scorer over ordered chunk aggregates for one fitted baseline.
 ///
-/// `means[i]` is the mean of the `i`-th consecutive run of `chunk_size`
-/// values in target order; the last mean may cover a shorter trailing chunk.
-#[derive(Debug, Clone, PartialEq)]
-pub struct SpcTargetChunks {
-    /// Non-null target values across every chunk.
-    pub rows: u64,
-    /// Chunk means in chunk order.
-    pub means: Vec<f64>,
+/// The caller feeds each feature's chunk means in chunk order (the trailing
+/// shorter chunk included) and then calls [`SpcScorer::finish`]. Each mean is
+/// assigned its control-limit zone and run through an incremental WECO scan,
+/// so per-feature state is bounded by the largest rule or trend lookback, not
+/// by the number of chunks. Features are scored independently; their chunks
+/// may arrive in any interleaving as long as each feature's own order holds.
+#[derive(Debug, Clone)]
+pub struct SpcScorer {
+    /// Frozen baseline chunk size; a feature with fewer total rows is
+    /// inconclusive.
+    chunk_size: u32,
+    /// WECO checks resolved once from the profile's rule and alert threshold.
+    checks: WecoChecks,
+    /// Per-feature scan state, one entry per baseline feature.
+    features: BTreeMap<FeatureName, SpcFeatureScan>,
 }
 
-/// Score per-feature ordered chunk means against a fitted SPC baseline.
-///
-/// This is the aggregate-input entry point: the server forms the chunk means
-/// and passes only them. A feature with fewer values than the frozen chunk
-/// size (including zero) is `Inconclusive` with NaN score. Otherwise each
-/// mean is assigned its control-limit zone, the profile's WECO rule and alert
-/// threshold are evaluated, and the violation count is the score: any
-/// violation is `Drift`. The threshold is NaN because the verdict is
-/// rule-driven.
-///
-/// # Errors
-/// Returns [`DriftScoreError::WecoMalformed`] for an unparseable rule, and
-/// [`DriftScoreError::SpcInternal`] when a baseline feature has no chunks or
-/// a chunk mean is not finite.
-pub fn score_spc_chunks(
-    baseline: &SpcBaseline,
-    chunks: &BTreeMap<FeatureName, SpcTargetChunks>,
-    profile: &SpcProfile,
-) -> Result<DriftReport, DriftScoreError> {
-    use crate::report::{DriftVerdict, FeatureDriftReport};
-    use crate::spc::control_limits::ControlLimits;
-    use crate::spc::weco::{assign_zone, evaluate, parse_rule};
-    use wyrd_spec::card::drift::DriftMethod;
+/// Running SPC state of one baseline feature inside an [`SpcScorer`].
+#[derive(Debug, Clone)]
+struct SpcFeatureScan {
+    /// The feature's fitted control limits used for zone assignment.
+    limits: ControlLimits,
+    /// Total target rows across every chunk pushed so far.
+    rows: u64,
+    /// Rule violations fired so far; the feature's score.
+    violations: u64,
+    /// Bounded trailing-zone WECO scan.
+    scan: WecoScan,
+}
 
-    let rule = parse_rule(&profile.weco_rule.rule_string)?;
-    let mut feature_reports = BTreeMap::new();
-    for (feature_name, fitted) in &baseline.features {
-        let target = chunks
-            .get(feature_name)
+impl SpcScorer {
+    /// Parse the profile's WECO rule once and seed empty state for every
+    /// baseline feature.
+    ///
+    /// # Errors
+    /// Returns [`DriftScoreError::WecoMalformed`] when the profile's rule is
+    /// not eight positive integers.
+    pub fn new(baseline: &SpcBaseline, profile: &SpcProfile) -> Result<Self, DriftScoreError> {
+        let rule = parse_rule(&profile.weco_rule.rule_string)?;
+        let features = baseline
+            .features
+            .iter()
+            .map(|(name, fitted)| {
+                let state = SpcFeatureScan {
+                    limits: ControlLimits {
+                        center: fitted.center,
+                        one_lcl: fitted.one_lcl,
+                        one_ucl: fitted.one_ucl,
+                        two_lcl: fitted.two_lcl,
+                        two_ucl: fitted.two_ucl,
+                        three_lcl: fitted.three_lcl,
+                        three_ucl: fitted.three_ucl,
+                    },
+                    rows: 0,
+                    violations: 0,
+                    scan: WecoScan::default(),
+                };
+                (name.clone(), state)
+            })
+            .collect();
+        Ok(Self {
+            chunk_size: baseline.chunk_size,
+            checks: WecoChecks::new(&rule, profile.alert_threshold),
+            features,
+        })
+    }
+
+    /// Feed the next chunk of `feature`, in chunk order: `rows` values whose
+    /// mean is `mean`.
+    ///
+    /// Adds `rows` to the feature's total, assigns the mean its zone, and
+    /// counts every WECO rule firing at that chunk. Nothing changes on error.
+    ///
+    /// # Errors
+    /// Returns [`DriftScoreError::SpcInternal`] when `feature` is not in the
+    /// baseline or `mean` is not finite.
+    pub fn push(
+        &mut self,
+        feature: &FeatureName,
+        rows: u64,
+        mean: f64,
+    ) -> Result<(), DriftScoreError> {
+        let state = self
+            .features
+            .get_mut(feature)
             .ok_or_else(|| DriftScoreError::SpcInternal {
-                message: format!("feature {} has no target chunks", feature_name.as_str()),
+                message: format!("feature {} is not in the SPC baseline", feature.as_str()),
             })?;
-        if target.means.iter().any(|mean| !mean.is_finite()) {
+        if !mean.is_finite() {
             return Err(DriftScoreError::SpcInternal {
                 message: "non-finite chunk mean in target".into(),
             });
         }
-        let report = if target.rows < u64::from(baseline.chunk_size) {
-            FeatureDriftReport {
-                feature: feature_name.clone(),
-                score: f64::NAN,
-                threshold: f64::NAN,
-                verdict: DriftVerdict::Inconclusive,
-            }
-        } else {
-            let limits = ControlLimits {
-                center: fitted.center,
-                one_lcl: fitted.one_lcl,
-                one_ucl: fitted.one_ucl,
-                two_lcl: fitted.two_lcl,
-                two_ucl: fitted.two_ucl,
-                three_lcl: fitted.three_lcl,
-                three_ucl: fitted.three_ucl,
-            };
-            let drift_array: Vec<i8> = target
-                .means
-                .iter()
-                .map(|value| assign_zone(*value, &limits))
-                .collect();
-            let violations = evaluate(&drift_array, &rule, profile.alert_threshold);
-            let score = violations.len() as f64;
-            FeatureDriftReport {
-                feature: feature_name.clone(),
-                score,
-                threshold: f64::NAN,
-                verdict: if score > 0.0 {
-                    DriftVerdict::Drift
+        state.rows = state.rows.saturating_add(rows);
+        let violations = &mut state.violations;
+        state
+            .scan
+            .push(&self.checks, assign_zone(mean, &state.limits), |_| {
+                *violations += 1;
+            });
+        Ok(())
+    }
+
+    /// Build the drift report from every pushed chunk.
+    ///
+    /// A feature whose total rows are below the baseline chunk size (including
+    /// one that received no chunk) is `Inconclusive` with NaN score and
+    /// threshold. Otherwise the violation count is the score and any
+    /// violation is `Drift`; the threshold is NaN because the verdict is
+    /// rule-driven.
+    #[must_use]
+    pub fn finish(self) -> DriftReport {
+        let chunk_size = u64::from(self.chunk_size);
+        let features: BTreeMap<FeatureName, FeatureDriftReport> = self
+            .features
+            .into_iter()
+            .map(|(feature, state)| {
+                let (score, verdict) = if state.rows < chunk_size {
+                    (f64::NAN, DriftVerdict::Inconclusive)
+                } else if state.violations > 0 {
+                    (state.violations as f64, DriftVerdict::Drift)
                 } else {
-                    DriftVerdict::NoDrift
-                },
-            }
-        };
-        feature_reports.insert(feature_name.clone(), report);
+                    (0.0, DriftVerdict::NoDrift)
+                };
+                let report = FeatureDriftReport {
+                    feature: feature.clone(),
+                    score,
+                    threshold: f64::NAN,
+                    verdict,
+                };
+                (feature, report)
+            })
+            .collect();
+        let verdict = DriftReport::aggregate_verdict(&features);
+        DriftReport {
+            method: DriftMethod::Spc,
+            features,
+            verdict,
+        }
     }
 
-    let verdict = DriftReport::aggregate_verdict(&feature_reports);
-    Ok(DriftReport {
-        method: DriftMethod::Spc,
-        features: feature_reports,
-        verdict,
-    })
-}
-
-fn sample_chunk_means(values: &[f64], chunk_size: usize) -> Result<Vec<f64>, DriftScoreError> {
-    if chunk_size == 0 {
-        return Err(DriftScoreError::SpcInternal {
-            message: "chunk_size must be greater than zero".into(),
-        });
+    /// Zones currently retained for `feature`, or `None` for an unknown
+    /// feature; lets tests prove history stays within the lookback cap.
+    #[cfg(test)]
+    fn retained(&self, feature: &FeatureName) -> Option<usize> {
+        self.features
+            .get(feature)
+            .map(|state| state.scan.retained())
     }
-
-    Ok(values
-        .chunks(chunk_size)
-        .map(|chunk| chunk.iter().sum::<f64>() / chunk.len() as f64)
-        .collect())
 }
 
 #[cfg(test)]
@@ -562,5 +611,263 @@ mod spc_score {
         let err =
             score_spc(&baseline, &target, &profile).expect_err("target feature is not numeric");
         assert!(matches!(err, DriftScoreError::FeatureTypeMismatch { .. }));
+    }
+}
+
+#[cfg(test)]
+mod spc_scorer {
+    //! Parity tests for the streaming [`SpcScorer`]. Expected counts are the
+    //! violation counts the pre-streaming slice-rescanning evaluation produced
+    //! for the same ordered zones.
+
+    use wyrd_spec::card::drift::{SpcAlertThreshold, SpcProfile, SpcWecoRule};
+    use wyrd_spec::ids::FeatureName;
+    use wyrd_version::WyrdVersion;
+
+    use super::{FittedSpcFeature, SpcBaseline, SpcScorer};
+    use crate::{DriftReport, DriftScoreError, DriftVerdict};
+
+    /// Parse a fixture feature name.
+    ///
+    /// # Panics
+    /// Panics when `name` is not a valid feature name.
+    fn feature(name: &str) -> FeatureName {
+        FeatureName::new(name).expect("valid feature name")
+    }
+
+    /// Baseline over `names` with unit sigma limits around zero and chunk size 5.
+    fn baseline(names: &[&str]) -> SpcBaseline {
+        let fitted = FittedSpcFeature {
+            center: 0.0,
+            one_lcl: -1.0,
+            one_ucl: 1.0,
+            two_lcl: -2.0,
+            two_ucl: 2.0,
+            three_lcl: -3.0,
+            three_ucl: 3.0,
+        };
+        SpcBaseline {
+            features: names.iter().map(|name| (feature(name), fitted)).collect(),
+            chunk_size: 5,
+            wyrd_version: WyrdVersion::current(),
+        }
+    }
+
+    /// Profile with `rule` and `alert_threshold`.
+    fn profile(rule: &str, alert_threshold: SpcAlertThreshold) -> SpcProfile {
+        SpcProfile {
+            sample_size: 5,
+            weco_rule: SpcWecoRule {
+                rule_string: rule.to_owned(),
+            },
+            alert_threshold,
+        }
+    }
+
+    /// A chunk mean that lands in signed zone `zone` under [`baseline`]'s limits.
+    fn mean_in(zone: i8) -> f64 {
+        match zone {
+            0 => 0.0,
+            z if z > 0 => f64::from(z) - 0.5,
+            z => f64::from(z) + 0.5,
+        }
+    }
+
+    /// Stream full chunks landing in `zones` for feature `x` and report.
+    ///
+    /// # Panics
+    /// Panics when the rule is malformed or a push fails.
+    fn score(zones: &[i8], rule: &str, threshold: SpcAlertThreshold) -> DriftReport {
+        let mut scorer =
+            SpcScorer::new(&baseline(&["x"]), &profile(rule, threshold)).expect("rule parses");
+        for &zone in zones {
+            scorer.push(&feature("x"), 5, mean_in(zone)).expect("push");
+        }
+        scorer.finish()
+    }
+
+    /// Assert feature `x` scored `expected` violations with the matching verdict.
+    ///
+    /// # Panics
+    /// Panics when the score or verdict differ, or the threshold is not NaN.
+    fn assert_score(report: &DriftReport, expected: f64) {
+        let x = &report.features[&feature("x")];
+        assert_eq!(x.score, expected);
+        assert!(x.threshold.is_nan());
+        let verdict = if expected > 0.0 {
+            DriftVerdict::Drift
+        } else {
+            DriftVerdict::NoDrift
+        };
+        assert_eq!(x.verdict, verdict);
+    }
+
+    /// Nine same-side zone-1 chunks fire zone-1 consecutive (run 8) at the
+    /// eighth and ninth chunk: score 2.
+    ///
+    /// # Panics
+    /// Panics when the count differs from the old algorithm's.
+    #[test]
+    fn consecutive_run_counts_every_full_window() {
+        assert_score(
+            &score(&[1; 9], "8 16 4 8 2 4 1 1", SpcAlertThreshold::Zone1),
+            2.0,
+        );
+    }
+
+    /// The same zone-1 run is filtered out at alert threshold Zone2: score 0.
+    ///
+    /// # Panics
+    /// Panics when a filtered zone still counts.
+    #[test]
+    fn alert_threshold_filters_lower_zones() {
+        assert_score(
+            &score(&[1; 9], "8 16 4 8 2 4 1 1", SpcAlertThreshold::Zone2),
+            0.0,
+        );
+    }
+
+    /// An authored alternating threshold of 16 fires once after 16
+    /// alternating zone-1 chunks and never again; 15 chunks do not fire.
+    ///
+    /// # Panics
+    /// Panics when the 16-long window is not honored or fires more than once.
+    #[test]
+    fn alternating_threshold_sixteen_fires_once() {
+        let alternating: Vec<i8> = (0..20)
+            .map(|idx| if idx % 2 == 0 { 1 } else { -1 })
+            .collect();
+        assert_score(
+            &score(&alternating, "8 16 4 8 2 4 1 1", SpcAlertThreshold::Zone1),
+            1.0,
+        );
+        assert_score(
+            &score(
+                &alternating[..15],
+                "8 16 4 8 2 4 1 1",
+                SpcAlertThreshold::Zone1,
+            ),
+            0.0,
+        );
+    }
+
+    /// A strictly rising seven-chunk run fires the trend rule regardless of
+    /// the alert threshold: score 1.
+    ///
+    /// # Panics
+    /// Panics when the trend window does not fire exactly once.
+    #[test]
+    fn trend_window_fires_once() {
+        assert_score(
+            &score(
+                &[-3, -2, -1, 0, 1, 2, 3],
+                "8 16 4 8 2 4 1 1",
+                SpcAlertThreshold::Zone4,
+            ),
+            1.0,
+        );
+    }
+
+    /// A shorter trailing chunk is scored as a chunk: three zone-4 chunks
+    /// (5, 5, and 3 rows) fire zone-4 consecutive three times plus zone-4
+    /// alternating once: score 4.
+    ///
+    /// # Panics
+    /// Panics when the trailing chunk is dropped or miscounted.
+    #[test]
+    fn trailing_short_chunk_is_scored() {
+        let x = feature("x");
+        let mut scorer = SpcScorer::new(
+            &baseline(&["x"]),
+            &profile("8 16 4 8 2 4 1 1", SpcAlertThreshold::Zone4),
+        )
+        .expect("rule parses");
+        for rows in [5, 5, 3] {
+            scorer.push(&x, rows, mean_in(4)).expect("push");
+        }
+        assert_score(&scorer.finish(), 4.0);
+    }
+
+    /// Fewer total rows than the chunk size is inconclusive with NaN score
+    /// even when a rule fired, and a baseline feature that received no chunk
+    /// is inconclusive while its sibling is scored.
+    ///
+    /// # Panics
+    /// Panics when either feature is not inconclusive or the sibling is not scored.
+    #[test]
+    fn short_and_missing_features_are_inconclusive() {
+        let mut scorer = SpcScorer::new(
+            &baseline(&["x"]),
+            &profile("8 16 4 8 2 4 1 1", SpcAlertThreshold::Zone4),
+        )
+        .expect("rule parses");
+        scorer.push(&feature("x"), 4, mean_in(4)).expect("push");
+        let short = &scorer.finish().features[&feature("x")];
+        assert_eq!(short.verdict, DriftVerdict::Inconclusive);
+        assert!(short.score.is_nan() && short.threshold.is_nan());
+
+        let mut scorer = SpcScorer::new(
+            &baseline(&["x", "y"]),
+            &profile("8 16 4 8 2 4 1 1", SpcAlertThreshold::Zone4),
+        )
+        .expect("rule parses");
+        scorer.push(&feature("x"), 5, mean_in(0)).expect("push");
+        let report = scorer.finish();
+        assert_score(&report, 0.0);
+        let missing = &report.features[&feature("y")];
+        assert_eq!(missing.verdict, DriftVerdict::Inconclusive);
+        assert!(missing.score.is_nan() && missing.threshold.is_nan());
+    }
+
+    /// A malformed rule, an unknown feature, and a non-finite mean are
+    /// rejected with their documented errors.
+    ///
+    /// # Panics
+    /// Panics when any input is accepted or maps to the wrong error.
+    #[test]
+    fn invalid_inputs_are_rejected() {
+        assert!(matches!(
+            SpcScorer::new(
+                &baseline(&["x"]),
+                &profile("8 16 4", SpcAlertThreshold::Zone4)
+            ),
+            Err(DriftScoreError::WecoMalformed { .. })
+        ));
+        let mut scorer = SpcScorer::new(
+            &baseline(&["x"]),
+            &profile("8 16 4 8 2 4 1 1", SpcAlertThreshold::Zone4),
+        )
+        .expect("rule parses");
+        assert!(matches!(
+            scorer.push(&feature("nope"), 5, 0.0),
+            Err(DriftScoreError::SpcInternal { .. })
+        ));
+        assert!(matches!(
+            scorer.push(&feature("x"), 5, f64::NAN),
+            Err(DriftScoreError::SpcInternal { .. })
+        ));
+    }
+
+    /// Streaming 100_000 chunks keeps the retained per-feature history at or
+    /// below the lookback cap of 16 (the default rule's largest threshold).
+    ///
+    /// # Panics
+    /// Panics when the history outgrows the cap.
+    #[test]
+    fn retained_history_is_bounded_over_many_chunks() {
+        let x = feature("x");
+        let mut scorer = SpcScorer::new(
+            &baseline(&["x"]),
+            &profile("8 16 4 8 2 4 1 1", SpcAlertThreshold::Zone1),
+        )
+        .expect("rule parses");
+        let mut max_retained = 0;
+        for idx in 0..100_000i32 {
+            scorer
+                .push(&x, 5, mean_in((idx % 9 - 4) as i8))
+                .expect("push");
+            max_retained = max_retained.max(scorer.retained(&x).expect("known feature"));
+        }
+        assert_eq!(max_retained, 16);
     }
 }

@@ -345,7 +345,7 @@
     margin-left: 6px;
     border: 1px solid var(--border);
     border-radius: 3px;
-    background: var(--brand-soft);
+    background: var(--declare-soft);
     vertical-align: 1px;
   }
   .span-tabs {
@@ -357,8 +357,7 @@
     font-size: 11px;
   }
   .span-tabs .control[aria-selected='true'] {
-    background: var(--brand-soft);
-    box-shadow: 2px 2px 0 0 var(--shadow);
+    background: var(--declare-soft);
   }
   .events {
     gap: 10px;
@@ -406,7 +405,7 @@
     margin: 0;
   }
   .msg.out {
-    background: var(--brand-soft);
+    background: var(--declare-soft);
   }
   .genai-timeline {
     gap: 14px;
@@ -435,8 +434,7 @@
     gap: 8px;
   }
   .view-tabs .control[aria-selected='true'] {
-    background: var(--brand-soft);
-    box-shadow: 2px 2px 0 0 var(--shadow);
+    background: var(--declare-soft);
   }
   .legend {
     margin-left: auto;

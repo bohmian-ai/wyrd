@@ -6,15 +6,15 @@
   --sep: color-mix(in srgb, var(--border) 30%, var(--surface));
 }
 .changes h1 {
-  font: 700 26px var(--font-display);
+  font: 700 26px var(--font-sans);
   margin: 0 0 10px;
 }
 .changes h2 {
-  font: 700 16px var(--font-display);
+  font: 700 16px var(--font-sans);
   margin: 0 0 12px;
 }
 .changes h3 {
-  font: 700 14px var(--font-display);
+  font: 700 14px var(--font-sans);
   margin: 0 0 8px;
 }
 .changes p {
@@ -33,7 +33,7 @@
   vertical-align: top;
 }
 .changes a {
-  color: var(--brand-strong);
+  color: var(--declare);
 }
 .changes .muted,
 .changes small {
@@ -76,17 +76,15 @@
   display: inline-block;
 }
 .changes .primary {
-  background: var(--brand-btn);
-  color: var(--brand-btn-ink);
-  box-shadow: 3px 3px 0 var(--shadow);
+  background: var(--declare);
+  color: var(--declare-ink);
 }
-/* Lime is the second voice: a genuine secondary action beside a blue primary. */
+/* Secondary actions are neutral; lime is reserved for retained Evidence. */
 .changes .secondary {
-  background: var(--lime);
-  color: var(--lime-ink);
-  box-shadow: 3px 3px 0 var(--shadow);
+  background: var(--surface-2);
+  color: var(--text);
 }
-/* Interaction life: rows wash, controls react, presses collapse the hard shadow. */
+/* Interaction life: rows wash, controls react. */
 .changes tbody tr,
 .changes .control,
 .changes .nav a {
@@ -97,25 +95,22 @@
     color 120ms ease;
 }
 .changes tbody tr:hover {
-  background: var(--brand-soft);
+  background: var(--declare-soft);
 }
 .changes .control:hover {
-  background: var(--brand-soft);
+  background: var(--declare-soft);
 }
 .changes .primary:hover {
-  background: var(--brand-btn);
-  box-shadow: 4px 4px 0 var(--shadow);
+  background: var(--declare);
 }
 .changes .secondary:hover {
-  background: var(--lime);
-  box-shadow: 4px 4px 0 var(--shadow);
+  background: var(--surface-hover);
 }
 .changes button.control:active {
   transform: translate(2px, 2px);
 }
 .changes button.primary:active,
 .changes button.secondary:active {
-  box-shadow: 1px 1px 0 var(--shadow);
 }
 .changes .nav a:hover {
   background: var(--surface-2);
@@ -133,7 +128,7 @@
   opacity: 0.6;
 }
 .changes :is(button, a, input, select, textarea, summary):focus-visible {
-  outline: 2px solid var(--brand-strong);
+  outline: 2px solid var(--declare);
   outline-offset: 3px;
 }
 .changes
@@ -178,7 +173,7 @@
   border-radius: var(--r);
 }
 .changes .nav a[aria-current] {
-  background: var(--brand-soft);
+  background: var(--declare-soft);
   border-color: var(--border);
   color: var(--text);
 }
@@ -212,7 +207,7 @@
   border-radius: var(--r);
 }
 .changes .error {
-  color: var(--danger-text);
+  color: var(--danger);
 }
 .changes .fields {
   display: grid;

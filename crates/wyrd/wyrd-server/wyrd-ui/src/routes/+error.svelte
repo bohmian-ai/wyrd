@@ -19,7 +19,7 @@
     padding: 10vh 20px;
   }
   h1 {
-    font: 700 26px var(--font-display);
+    font: 700 26px var(--font-sans);
     margin-bottom: 24px;
   }
 </style>

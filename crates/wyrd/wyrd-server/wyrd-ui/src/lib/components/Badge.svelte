@@ -44,16 +44,16 @@
     background: var(--surface);
   }
   .wy-badge[data-tone='ok'] {
-    --bc: var(--ok-text);
+    --bc: var(--ok);
   }
   .wy-badge[data-tone='warn'] {
-    --bc: var(--warn-text);
+    --bc: var(--warn);
   }
   .wy-badge[data-tone='danger'] {
-    --bc: var(--danger-text);
+    --bc: var(--danger);
   }
   .wy-badge[data-tone='running'] {
-    --bc: var(--brand-strong);
+    --bc: var(--declare);
   }
   .gl {
     font-size: 9px;

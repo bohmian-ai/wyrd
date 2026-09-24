@@ -63,7 +63,6 @@
   border: 2px solid var(--border);
   border-radius: var(--r);
   background: var(--surface);
-  box-shadow: 3px 3px 0 0 var(--shadow);
   padding: 12px 14px;
   display: grid;
   gap: 10px;
@@ -75,16 +74,16 @@
   flex-wrap: wrap;
 }
 .svc .assess .title {
-  font: 700 15px var(--font-display);
+  font: 700 15px var(--font-sans);
 }
 .svc .assess[data-tone='warn'] .title {
-  color: var(--warn-text);
+  color: var(--warn);
 }
 .svc .assess[data-tone='danger'] .title {
-  color: var(--danger-text);
+  color: var(--danger);
 }
 .svc .assess[data-tone='ok'] .title {
-  color: var(--ok-text, var(--text));
+  color: var(--ok);
 }
 .svc .assess .meta {
   margin-left: auto;
@@ -135,7 +134,7 @@
   margin: 6px 0 0;
 }
 .svc .siglatest .lv {
-  font: 700 18px var(--font-display);
+  font: 700 18px var(--font-sans);
 }
 .svc .sigaxis {
   display: flex;
@@ -158,10 +157,9 @@
   text-decoration: none;
 }
 .svc .investigate a:hover {
-  box-shadow: 3px 3px 0 0 var(--shadow);
 }
 .svc .attention-item {
-  border: 2px solid var(--warn-text);
+  border: 2px solid var(--warn);
   border-radius: var(--r);
   padding: 9px 11px;
   display: grid;
@@ -224,10 +222,10 @@
   justify-self: start;
   font-weight: 700;
   font-size: 10.5px;
-  color: var(--brand-strong);
-  border: 2px solid var(--brand-strong);
+  color: var(--declare);
+  border: 2px solid var(--declare);
   border-radius: var(--r);
-  background: color-mix(in srgb, var(--brand-strong) 8%, var(--surface));
+  background: color-mix(in srgb, var(--declare) 8%, var(--surface));
   padding: 5px 10px;
 }
 .svc .node {
@@ -241,14 +239,12 @@
   color: var(--text);
 }
 .svc .node:hover {
-  box-shadow: 3px 3px 0 0 var(--shadow);
 }
 .svc .node[aria-current='true'] {
-  border-color: var(--brand-strong);
-  outline: 2px solid var(--brand-strong);
+  border-color: var(--declare);
+  outline: 2px solid var(--declare);
   outline-offset: -1px;
-  background: color-mix(in srgb, var(--brand-strong) 7%, var(--surface));
-  box-shadow: 4px 4px 0 0 var(--shadow);
+  background: color-mix(in srgb, var(--declare) 7%, var(--surface));
 }
 .svc .node .nrow {
   display: flex;
@@ -261,8 +257,8 @@
 .svc .pill {
   font: 700 8px var(--font-mono);
   letter-spacing: 0.5px;
-  color: var(--brand-strong);
-  background: color-mix(in srgb, var(--brand-strong) 11%, var(--surface));
+  color: var(--declare);
+  background: color-mix(in srgb, var(--declare) 11%, var(--surface));
   border-radius: 4px;
   padding: 2px 6px;
   white-space: nowrap;
@@ -277,10 +273,10 @@
   font-size: 10px;
 }
 .svc .node .st[data-tone='ok'] {
-  color: var(--ok-text);
+  color: var(--ok);
 }
 .svc .node .st[data-tone='danger'] {
-  color: var(--danger-text);
+  color: var(--danger);
 }
 .svc .node .st[data-tone='neutral'] {
   color: var(--muted);
@@ -290,23 +286,22 @@
   border-top-width: 4px;
   border-radius: var(--r);
   background: var(--surface);
-  box-shadow: 6px 6px 0 0 var(--shadow);
   padding: 12px 14px;
   display: grid;
   gap: 8px;
 }
 .svc .drawer[data-tone='danger'] {
-  border-top-color: var(--danger-text);
+  border-top-color: var(--danger);
 }
 .svc .drawer[data-tone='ok'] {
-  border-top-color: var(--ok-text);
+  border-top-color: var(--ok);
 }
 .svc .drawer[data-tone='danger'] .headline {
-  color: var(--danger-text);
+  color: var(--danger);
   font-weight: 700;
 }
 .svc .drawer[data-tone='ok'] .headline {
-  color: var(--ok-text);
+  color: var(--ok);
   font-weight: 700;
 }
 .svc .drawer-cols {
@@ -329,28 +324,27 @@
 /* Component refs are Card references, not row destinations — they read as
    links (S-03 render), unlike the inventory table's text-colored rows. */
 .svc .def-columns .wy-table td a {
-  color: var(--brand-strong);
+  color: var(--declare);
 }
-/* Lime is the second voice — the client/runtime plane. Aliases are runtime
-   names (not registry identity), so they carry lime text; the runtime
-   principal carries the full lime chip. */
+/* Aliases are runtime names (not registry identity), so they carry the
+   Observation voice; the runtime principal carries the observe chip. */
 .svc .def-columns .alias {
-  color: var(--lime-text);
+  color: var(--observe);
   font-weight: 700;
 }
 .svc .def-columns .principal-chip {
   font: 700 10px var(--font-mono);
   letter-spacing: 0.4px;
-  background: var(--lime);
-  color: var(--lime-ink);
+  background: var(--observe-soft);
+  color: var(--observe);
   border-radius: var(--r);
   padding: 2px 7px;
 }
 /* The selected/current version reads as a brand chip in the governance rail. */
 .svc .def-columns .kv a[aria-current='true'] {
-  color: var(--brand-strong);
-  background: color-mix(in srgb, var(--brand-strong) 11%, var(--surface));
-  outline: 2px solid var(--brand-strong);
+  color: var(--declare);
+  background: color-mix(in srgb, var(--declare) 11%, var(--surface));
+  outline: 2px solid var(--declare);
   border-radius: var(--r);
   padding: 1px 5px;
 }

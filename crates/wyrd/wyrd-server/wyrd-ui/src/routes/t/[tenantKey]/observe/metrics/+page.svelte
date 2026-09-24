@@ -150,8 +150,8 @@
     background: var(--surface-2);
   }
   .metric-list a[aria-current='true'] {
-    background: var(--brand-soft);
-    border-left-color: var(--brand-strong);
+    background: var(--declare-soft);
+    border-left-color: var(--declare);
     font-weight: 700;
   }
   .labels-title {

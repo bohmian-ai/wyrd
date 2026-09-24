@@ -47,8 +47,8 @@
   }
   button:hover,
   button:focus-visible {
-    background: var(--brand-soft);
-    box-shadow: inset 4px 0 0 var(--brand-strong);
+    background: var(--declare-soft);
+    box-shadow: inset 4px 0 0 var(--declare);
   }
   input {
     background: var(--surface-2);

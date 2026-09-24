@@ -1,6 +1,6 @@
 <script lang="ts">
-  // Multi-series time chart. Series identity never rests on hue: --control-bar and
-  // --brand-strong collapse to 1.22:1 under deuteranopia, so each series also carries a
+  // Multi-series time chart. Series identity never rests on hue: hue pairs can
+  // collapse under colour-vision deficiency, so each series also carries a
   // distinct stroke-dasharray and marker shape, and the legend mirrors both as a line
   // sample rather than a block swatch. Series take no colour prop — the style is chosen
   // by position from a fixed table, so a serialized view can never name a token.
@@ -25,10 +25,10 @@
 
   /** Stroke, dash and marker per series position. Four distinct non-colour identities. */
   const styles = [
-    { color: 'var(--brand-strong)', dash: '', marker: 'square' },
-    { color: 'var(--control-bar)', dash: '6 3', marker: 'circle' },
-    { color: 'var(--server-bar)', dash: '2 3', marker: 'triangle' },
-    { color: 'var(--lime-text)', dash: '8 2 2 2', marker: 'diamond' }
+    { color: 'var(--declare)', dash: '', marker: 'square' },
+    { color: 'var(--observe)', dash: '6 3', marker: 'circle' },
+    { color: 'var(--text)', dash: '2 3', marker: 'triangle' },
+    { color: 'var(--muted)', dash: '8 2 2 2', marker: 'diamond' }
   ] as const;
 
   const grid = [0, 1, 2, 3].map((g) => yTop + ((yBot - yTop) * g) / 3);
@@ -280,7 +280,7 @@
     font-family: var(--fm);
     font-size: 10px;
     font-weight: 700;
-    fill: var(--danger-text);
+    fill: var(--danger);
   }
   .node {
     fill: var(--surface);
@@ -313,7 +313,6 @@
     padding: 6px 8px;
     border: 2px solid var(--border);
     border-radius: var(--r);
-    box-shadow: 3px 3px 0 0 var(--shadow);
     background: var(--surface);
     font-family: var(--fm);
     font-size: 9.5px;

@@ -18,7 +18,7 @@
     max-width: 420px;
   }
   .kind {
-    color: var(--brand-strong);
+    color: var(--declare);
     font-weight: 700;
   }
   .kind-filter {

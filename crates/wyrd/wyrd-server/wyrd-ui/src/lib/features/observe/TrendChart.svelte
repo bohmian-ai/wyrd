@@ -102,7 +102,7 @@
     background: color-mix(in srgb, var(--danger) 72%, var(--surface));
   }
   .bar.ok {
-    background: color-mix(in srgb, var(--brand-strong) 72%, var(--surface));
+    background: color-mix(in srgb, var(--declare) 72%, var(--surface));
   }
   .bar:hover {
     outline: 1px solid var(--text);
@@ -121,7 +121,6 @@
     border-radius: var(--r);
     background: var(--surface);
     color: var(--text);
-    box-shadow: 3px 3px 0 0 var(--shadow);
     font: 700 10px var(--font-mono);
     pointer-events: none;
   }

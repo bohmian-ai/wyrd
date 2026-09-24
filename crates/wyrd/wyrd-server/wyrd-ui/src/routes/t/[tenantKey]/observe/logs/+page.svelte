@@ -243,7 +243,6 @@
     padding: 16px;
     background: var(--surface);
     border-left: 3px solid var(--border);
-    box-shadow: -6px 0 0 0 var(--shadow);
   }
   .drawer-head {
     display: flex;

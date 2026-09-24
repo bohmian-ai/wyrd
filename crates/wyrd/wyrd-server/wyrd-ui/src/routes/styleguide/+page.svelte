@@ -216,7 +216,7 @@
 
     <div class="sgh narrow-h" id="chrome">Trusted application chrome — implemented, deliberately not in the catalog</div>
     <Shell>
-      {#snippet sidebar()}<Sidebar brand="bohmian" groups={navGroups} />{/snippet}
+      {#snippet sidebar()}<Sidebar brand="Wyrd" groups={navGroups} />{/snippet}
       {#snippet topbar()}<Topbar crumbs={['acme', 'cards']} search="Search Cards" env={{ label: 'prod', status: 'ok' }} />{/snippet}
       <div class="row"><Badge tone="ok">chrome resolves tenant identity, not an authored view</Badge></div>
     </Shell>
@@ -266,7 +266,7 @@
     margin-top: 22px;
   }
   .sgh .wm {
-    font-family: var(--font-display);
+    font-family: var(--font-sans);
     font-size: 14px;
     color: var(--text);
     margin-right: 6px;

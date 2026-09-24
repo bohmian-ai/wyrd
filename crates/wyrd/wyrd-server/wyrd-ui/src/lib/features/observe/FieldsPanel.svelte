@@ -54,7 +54,6 @@
     border: 2px solid var(--border);
     border-radius: var(--r);
     background: var(--surface);
-    box-shadow: 3px 3px 0 0 var(--shadow);
     padding: 4px;
     align-self: flex-start;
     font-family: var(--fm);
@@ -107,7 +106,7 @@
     background: var(--surface-2);
   }
   li a.active {
-    background: var(--brand-soft);
+    background: var(--declare-soft);
     border-color: var(--border);
   }
   .val {

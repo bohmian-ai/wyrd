@@ -7,11 +7,11 @@
   --sep: color-mix(in srgb, var(--border) 30%, var(--surface));
 }
 .cards h1 {
-  font: 700 26px var(--font-display);
+  font: 700 26px var(--font-sans);
   margin: 0 0 10px;
 }
 .cards h2 {
-  font: 700 16px var(--font-display);
+  font: 700 16px var(--font-sans);
   margin: 0 0 12px;
 }
 .cards p {
@@ -19,7 +19,7 @@
   line-height: 1.55;
 }
 .cards a {
-  color: var(--brand-strong);
+  color: var(--declare);
 }
 .cards .muted,
 .cards small {
@@ -62,9 +62,8 @@
   display: inline-block;
 }
 .cards .primary {
-  background: var(--brand-btn);
-  color: var(--brand-btn-ink);
-  box-shadow: 3px 3px 0 var(--shadow);
+  background: var(--declare);
+  color: var(--declare-ink);
 }
 .cards tbody tr,
 .cards .control {
@@ -75,14 +74,13 @@
     color 120ms ease;
 }
 .cards tbody tr:hover {
-  background: var(--brand-soft);
+  background: var(--declare-soft);
 }
 .cards .control:hover {
-  background: var(--brand-soft);
+  background: var(--declare-soft);
 }
 .cards .primary:hover {
-  background: var(--brand-btn);
-  box-shadow: 4px 4px 0 var(--shadow);
+  background: var(--declare);
 }
 @media (prefers-reduced-motion: reduce) {
   .cards tbody tr,
@@ -91,7 +89,7 @@
   }
 }
 .cards :is(button, a, input, select, textarea, summary):focus-visible {
-  outline: 2px solid var(--brand-strong);
+  outline: 2px solid var(--declare);
   outline-offset: 3px;
 }
 .cards input:not([type='hidden']) {
@@ -183,7 +181,7 @@
   background: var(--surface-2);
 }
 .cards .kind-list a[aria-current] {
-  background: var(--brand-soft);
+  background: var(--declare-soft);
   border-color: var(--border);
 }
 .cards .kind-list .n {
@@ -217,10 +215,10 @@
   letter-spacing: 0.5px;
   text-transform: uppercase;
   padding: 3px 7px;
-  border: 2px solid var(--brand-strong);
+  border: 2px solid var(--declare);
   border-radius: 4px;
-  color: var(--brand-strong);
-  background: color-mix(in srgb, var(--brand-strong) 12%, var(--surface));
+  color: var(--declare);
+  background: color-mix(in srgb, var(--declare) 12%, var(--surface));
 }
 /* C-08 — the workflow stage flow strip. */
 .cards .stages {

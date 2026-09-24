@@ -1,148 +1,110 @@
 /* GENERATED FILE — do not edit by hand.
- * Source of truth: brand/palette.json.
- * Regenerate with `node brand/gen-theme.mjs`.
- * The rendered visual reference is ./renders/styleguide.html, which links
- * THIS file — no render may restate a hex. */
+ * Source of truth: crates/wyrd/wyrd-server/wyrd-ui/brand/palette.json.
+ * Regenerate with `node brand/gen-theme.mjs` from crates/wyrd/wyrd-server/wyrd-ui. */
 
 @theme {
-  --font-sans: "Archivo", system-ui, sans-serif;
-  --font-display: "Space Grotesk", "Archivo", system-ui, sans-serif;
-  --font-mono: "JetBrains Mono", monospace;
-  --font-serif: "Fraunces", Georgia, serif;
-  --radius-wy: 5px;
-  --shadow-wy-sm: 3px 3px 0 0 var(--shadow);
-  --shadow-wy-md: 6px 6px 0 0 var(--shadow);
-  --shadow-wy-lg: 10px 10px 0 0 var(--shadow);
+  --font-sans: "Familjen Grotesk", system-ui, sans-serif;
+  --font-mono: "Fragment Mono", ui-monospace, monospace;
+  --radius-wy: 2px;
   /* mode-aware color utilities: bg-*, text-*, border-* resolve per [data-mode] */
   --color-bg: var(--bg);
   --color-surface: var(--surface);
   --color-surface-2: var(--surface-2);
-  --color-border: var(--border);
-  --color-shadow: var(--shadow);
+  --color-surface-hover: var(--surface-hover);
   --color-text: var(--text);
   --color-muted: var(--muted);
-  --color-brand: var(--brand);
-  --color-brand-strong: var(--brand-strong);
-  --color-brand-soft: var(--brand-soft);
-  --color-brand-btn: var(--brand-btn);
-  --color-brand-btn-ink: var(--brand-btn-ink);
-  --color-lime: var(--lime);
-  --color-lime-ink: var(--lime-ink);
-  --color-lime-text: var(--lime-text);
-  --color-client: var(--client);
-  --color-client-bar: var(--client-bar);
-  --color-server: var(--server);
-  --color-server-bar: var(--server-bar);
-  --color-control: var(--control);
-  --color-control-bar: var(--control-bar);
+  --color-border: var(--border);
+  --color-border-soft: var(--border-soft);
+  --color-declare: var(--declare);
+  --color-declare-soft: var(--declare-soft);
+  --color-declare-ink: var(--declare-ink);
+  --color-observe: var(--observe);
+  --color-observe-soft: var(--observe-soft);
+  --color-evidence: var(--evidence);
+  --color-evidence-ink: var(--evidence-ink);
   --color-ok: var(--ok);
   --color-warn: var(--warn);
   --color-danger: var(--danger);
-  --color-ok-text: var(--ok-text);
-  --color-warn-text: var(--warn-text);
-  --color-danger-text: var(--danger-text);
-  --color-hero-bg: var(--hero-bg);
-  --color-hero-ink: var(--hero-ink);
-  --color-ink-on-fill: var(--ink-on-fill);
+  --color-danger-soft: var(--danger-soft);
+  --color-code-bg: var(--code-bg);
+  --color-code-text: var(--code-text);
 }
 
 [data-mode="light"] {
   /* surface */
-  --bg: #f2f0ea;
-  --surface: #ffffff;
-  --surface-2: #eceadf;
+  --bg: #F3F6F5;
+  --surface: #FFFFFF;
+  --surface-2: #E7EEEC;
+  --surface-hover: #EDF2F0;
 
   /* ink */
-  --border: #101014;
-  --shadow: #101014;
+  --text: #10201D;
+  --muted: #53645F;
+  --border: #9AACAA;
+  --border-soft: #D7E1DE;
 
-  /* text */
-  --text: #101014;
-  --muted: #62626d;
+  /* declare */
+  --declare: #5036D5;
+  --declare-soft: #EAE6FF;
+  --declare-ink: #FFFFFF;
 
-  /* brand */
-  --brand: #2745e8;
-  --brand-strong: #2745e8;
-  --brand-soft: #e9edfd;
-  --brand-btn: #2745e8;
-  --brand-btn-ink: #ffffff;
+  /* observe */
+  --observe: #007563;
+  --observe-soft: #BDF5E7;
 
-  /* acid */
-  --lime: #c5f23c;
-  --lime-ink: #101014;
-  --lime-text: #4a7a06;
-
-  /* line */
-  --client: #4a7a06;
-  --client-bar: #4a7a06;
-  --server: #f2a23c;
-  --server-bar: #ec8b14;
-  --control: #7cc4e8;
-  --control-bar: #2f6f9e;
+  /* evidence */
+  --evidence: #D7F33F;
+  --evidence-ink: #10201D;
 
   /* status */
-  --ok: #2f9e44;
-  --warn: #ec8b14;
-  --danger: #d2402a;
-  --ok-text: #247b35;
-  --warn-text: #9c5c0d;
-  --danger-text: #c03a26;
+  --ok: #187B45;
+  --warn: #A65F00;
+  --danger: #B52828;
+  --danger-soft: #F9E8E7;
 
-  /* hero */
-  --hero-bg: #2745e8;
-  --hero-ink: #ffffff;
-  --ink-on-fill: #101014;
+  /* code */
+  --code-bg: #0E1716;
+  --code-text: #DCF5EE;
 
   /* geometry */
-  --r: 5px;
+  --r: 2px;
 }
 [data-mode="dark"] {
   /* surface */
-  --bg: #0b0c12;
-  --surface: #12141c;
-  --surface-2: #1a1d28;
+  --bg: #08100F;
+  --surface: #101B19;
+  --surface-2: #182725;
+  --surface-hover: #1D2F2B;
 
   /* ink */
-  --border: #424866;
-  --shadow: #050609;
+  --text: #EAF2F0;
+  --muted: #9AB0AB;
+  --border: #39504B;
+  --border-soft: #263B37;
 
-  /* text */
-  --text: #e6e4da;
-  --muted: #84879a;
+  /* declare */
+  --declare: #A894FF;
+  --declare-soft: #241F46;
+  --declare-ink: #08100F;
 
-  /* brand */
-  --brand: #1a2040;
-  --brand-strong: #7a8cff;
-  --brand-soft: #1a2040;
-  --brand-btn: #7a8cff;
-  --brand-btn-ink: #0b0c12;
+  /* observe */
+  --observe: #67B891;
+  --observe-soft: #15352F;
 
-  /* acid */
-  --lime: #c5f23c;
-  --lime-ink: #101014;
-  --lime-text: #c5f23c;
-
-  /* line */
-  --client: #c5f23c;
-  --client-bar: #c5f23c;
-  --server: #f2a23c;
-  --server-bar: #f2a23c;
-  --control: #6fb3d6;
-  --control-bar: #6fb3d6;
+  /* evidence */
+  --evidence: #D7F33F;
+  --evidence-ink: #10201D;
 
   /* status */
-  --ok: #7ee081;
-  --warn: #f2a23c;
-  --danger: #e8615a;
-  --ok-text: #7ee081;
-  --warn-text: #f2a23c;
-  --danger-text: #e8615a;
+  --ok: #50DA83;
+  --warn: #FFB455;
+  --danger: #FF715E;
+  --danger-soft: #3B1D1B;
 
-  /* hero */
-  --hero-bg: #1a2040;
-  --hero-ink: #e9edfd;
-  --ink-on-fill: #101014;
+  /* code */
+  --code-bg: #050908;
+  --code-text: #DCF5EE;
 
   /* geometry */
-  --r: 5px;
+  --r: 2px;
 }

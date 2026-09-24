@@ -37,7 +37,7 @@
     width: 8px;
     height: 8px;
     border-radius: 50%;
-    background: var(--lime);
+    background: var(--declare);
     flex: 0 0 auto;
   }
   .grp {
@@ -66,8 +66,7 @@
   }
   .item.active {
     color: var(--text);
-    background: var(--brand-soft);
+    background: var(--declare-soft);
     border-color: var(--border);
-    box-shadow: 2px 2px 0 0 var(--shadow);
   }
 </style>

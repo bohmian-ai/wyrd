@@ -32,7 +32,6 @@
     padding: 8px 13px;
     border: 2px solid var(--border);
     border-radius: var(--r);
-    box-shadow: 3px 3px 0 0 var(--shadow);
     background: var(--surface);
     color: var(--text);
     cursor: pointer;
@@ -42,25 +41,22 @@
   }
   .wy-btn:hover {
     transform: translate(-1px, -1px);
-    box-shadow: 5px 5px 0 0 var(--shadow);
   }
   .wy-btn:active {
     transform: translate(2px, 2px);
-    box-shadow: 1px 1px 0 0 var(--shadow);
   }
-  /* the default ring is low contrast on the brand and lime fills */
+  /* an explicit ring stays visible on the declare fill */
   .wy-btn:focus-visible {
     outline: 2px solid var(--text);
     outline-offset: 2px;
   }
-  /* fill is --brand-btn, never --brand: --brand is a dim navy panel colour in dark mode */
   .wy-btn[data-variant='primary'] {
-    background: var(--brand-btn);
-    color: var(--brand-btn-ink);
+    background: var(--declare);
+    color: var(--declare-ink);
   }
   .wy-btn[data-variant='secondary'] {
-    background: var(--lime);
-    color: var(--lime-ink);
+    background: var(--surface-2);
+    color: var(--text);
   }
   .wy-btn[data-variant='ghost'] {
     background: var(--surface);

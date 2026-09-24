@@ -8,15 +8,15 @@
   --sep: color-mix(in srgb, var(--border) 30%, var(--surface));
 }
 .observe h1 {
-  font: 700 26px var(--font-display);
+  font: 700 26px var(--font-sans);
   margin: 0 0 10px;
 }
 .observe h2 {
-  font: 700 16px var(--font-display);
+  font: 700 16px var(--font-sans);
   margin: 0 0 12px;
 }
 .observe h3 {
-  font: 700 14px var(--font-display);
+  font: 700 14px var(--font-sans);
   margin: 0 0 8px;
 }
 .observe p {
@@ -33,7 +33,7 @@
   vertical-align: top;
 }
 .observe a {
-  color: var(--brand-strong);
+  color: var(--declare);
 }
 .observe .muted,
 .observe small {
@@ -76,15 +76,13 @@
   display: inline-block;
 }
 .observe .primary {
-  background: var(--brand-btn);
-  color: var(--brand-btn-ink);
-  box-shadow: 3px 3px 0 var(--shadow);
+  background: var(--declare);
+  color: var(--declare-ink);
 }
-/* Lime is the second voice: a genuine secondary action beside a blue primary. */
+/* Secondary actions are neutral; lime is reserved for retained Evidence. */
 .observe .secondary {
-  background: var(--lime);
-  color: var(--lime-ink);
-  box-shadow: 3px 3px 0 var(--shadow);
+  background: var(--surface-2);
+  color: var(--text);
 }
 .observe tbody tr,
 .observe .control,
@@ -96,25 +94,22 @@
     color 120ms ease;
 }
 .observe tbody tr:hover {
-  background: var(--brand-soft);
+  background: var(--declare-soft);
 }
 .observe .control:hover {
-  background: var(--brand-soft);
+  background: var(--declare-soft);
 }
 .observe .primary:hover {
-  background: var(--brand-btn);
-  box-shadow: 4px 4px 0 var(--shadow);
+  background: var(--declare);
 }
 .observe .secondary:hover {
-  background: var(--lime);
-  box-shadow: 4px 4px 0 var(--shadow);
+  background: var(--surface-hover);
 }
 .observe button.control:active {
   transform: translate(2px, 2px);
 }
 .observe button.primary:active,
 .observe button.secondary:active {
-  box-shadow: 1px 1px 0 var(--shadow);
 }
 .observe .nav a:hover {
   background: var(--surface-2);
@@ -132,7 +127,7 @@
   opacity: 0.6;
 }
 .observe :is(button, a, input, select, textarea, summary):focus-visible {
-  outline: 2px solid var(--brand-strong);
+  outline: 2px solid var(--declare);
   outline-offset: 3px;
 }
 .observe
@@ -172,7 +167,7 @@
   border-radius: var(--r);
 }
 .observe .nav a[aria-current] {
-  background: var(--brand-soft);
+  background: var(--declare-soft);
   border-color: var(--border);
   color: var(--text);
 }
@@ -204,7 +199,7 @@
   border-radius: var(--r);
 }
 .observe .error {
-  color: var(--danger-text);
+  color: var(--danger);
 }
 .observe .filters {
   margin-bottom: 18px;
@@ -270,7 +265,7 @@
   box-shadow: inset 3px 0 0 0 var(--danger);
 }
 .observe tr.lvl-warn td:first-child {
-  box-shadow: inset 3px 0 0 0 var(--server-bar);
+  box-shadow: inset 3px 0 0 0 var(--warn);
 }
 
 /* Inline duration bar inside a table cell, proportional to the visible max. */
@@ -287,7 +282,7 @@
   display: block;
   height: 100%;
   border-radius: 1px;
-  background: var(--brand-strong);
+  background: var(--declare);
 }
 .observe tr .durbar.err > i {
   background: var(--danger);
@@ -319,8 +314,8 @@
   background: var(--surface-2);
 }
 .observe .waterfall .span-row[aria-current='true'] {
-  background: var(--brand-soft);
-  border-left-color: var(--brand-strong);
+  background: var(--declare-soft);
+  border-left-color: var(--declare);
 }
 .observe .waterfall .lane {
   position: relative;
@@ -331,12 +326,12 @@
   position: absolute;
   top: 0;
   height: 100%;
-  border: 2px solid var(--brand-strong);
+  border: 2px solid var(--declare);
   border-radius: 3px;
-  background: color-mix(in srgb, var(--brand-strong) 18%, var(--surface));
+  background: color-mix(in srgb, var(--declare) 18%, var(--surface));
 }
 .observe .waterfall .bar.err {
-  border-color: var(--danger-text);
+  border-color: var(--danger);
   background: color-mix(in srgb, var(--danger) 30%, var(--surface));
 }
 .observe .waterfall .dur {
@@ -345,7 +340,7 @@
   color: var(--muted);
 }
 .observe .waterfall .span-row .dur.err {
-  color: var(--danger-text);
+  color: var(--danger);
   font-weight: 700;
 }
 
@@ -365,7 +360,6 @@
   font: 700 11px var(--font-mono);
   color: var(--text);
   text-decoration: none;
-  box-shadow: 3px 3px 0 var(--shadow);
 }
 .observe .svc-graph .edge {
   width: 44px;
@@ -374,7 +368,7 @@
   margin: 0 4px;
 }
 .observe .svc-graph .edge.err {
-  border-top-color: var(--danger-text);
+  border-top-color: var(--danger);
   border-top-width: 3px;
 }
 
@@ -384,7 +378,7 @@
   position: fixed;
   inset: 0;
   z-index: 5;
-  background: color-mix(in srgb, var(--shadow) 28%, transparent);
+  background: color-mix(in srgb, var(--bg) 72%, transparent);
 }
 .observe .drawer {
   position: fixed;
@@ -396,7 +390,6 @@
   overflow-y: auto;
   background: var(--bg);
   border-left: 3px solid var(--border);
-  box-shadow: -10px 0 0 0 var(--shadow);
   padding: 20px 24px;
 }
 .observe .stages {
@@ -414,7 +407,7 @@
 }
 .observe .stages .stage[data-tone='danger'] {
   background: color-mix(in srgb, var(--danger) 14%, var(--surface));
-  border-color: var(--danger-text);
+  border-color: var(--danger);
 }
 .observe .stages .arrow {
   color: var(--muted);
@@ -443,8 +436,8 @@
   background: var(--surface-2);
 }
 .observe .task-list .task[aria-current='true'] {
-  background: var(--brand-soft);
-  border-left-color: var(--brand-strong);
+  background: var(--declare-soft);
+  border-left-color: var(--declare);
 }
 
 /* Score block: big numeral, threshold bar with a positional tick. */
@@ -459,13 +452,13 @@
   background: var(--surface-2);
 }
 .observe .score .n {
-  font: 700 30px var(--font-display);
+  font: 700 30px var(--font-sans);
 }
 .observe .score .n.fail {
-  color: var(--danger-text);
+  color: var(--danger);
 }
 .observe .score .n.pass {
-  color: var(--ok-text);
+  color: var(--ok);
 }
 .observe .score-bar {
   position: relative;
@@ -521,7 +514,7 @@
   font: 11px var(--font-mono);
 }
 .observe .values .val.fail {
-  border-color: var(--danger-text);
+  border-color: var(--danger);
   background: color-mix(in srgb, var(--danger) 10%, var(--surface));
 }
 

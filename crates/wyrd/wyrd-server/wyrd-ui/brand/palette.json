@@ -1,80 +1,83 @@
 {
-  "name": "bohmian · Wyrd",
-  "description": "Canonical token source for the Wyrd design system under the bohmian brand. Edit here, then run `node brand/gen-theme.mjs` to regenerate theme.css. Consumed directly by agents/A2UI; the human/visual reference is DESIGN.md + ./renders/styleguide.html. Derived from .dev/assets/bohmian/bohmian-brand-mockups-v4.html (approved).",
+  "name": "Wyrd · Evidence Thread",
+  "description": "Canonical token source for Wyrd's Evidence Thread design system, shared by the documentation site and the workbench. Edit here, then run `node brand/gen-theme.mjs` to regenerate every projection (workbench theme.css, docs wyrd-tokens.css, the wyrd-ui skill theme, and the Wyrd mark renderings). Consumers never restate a value from this file. The human reference is DESIGN.md + ./renders/styleguide.html.",
   "modes": ["light", "dark"],
   "scale": {
     "fonts": {
-      "sans": "\"Archivo\", system-ui, sans-serif",
-      "display": "\"Space Grotesk\", \"Archivo\", system-ui, sans-serif",
-      "mono": "\"JetBrains Mono\", monospace",
-      "serif": "\"Fraunces\", Georgia, serif"
+      "sans": "\"Familjen Grotesk\", system-ui, sans-serif",
+      "mono": "\"Fragment Mono\", ui-monospace, monospace"
     },
-    "radius": "5px",
-    "shadow": { "sm": "3px", "md": "6px", "lg": "10px" }
+    "radius": "2px"
   },
   "tokens": {
-    "--bg":            { "group": "surface", "light": "#f2f0ea", "dark": "#0b0c12", "role": "page / main background — warm paper on light, blue-cast near-black on dark" },
-    "--surface":       { "group": "surface", "light": "#ffffff", "dark": "#12141c", "role": "card / table / header surface" },
-    "--surface-2":     { "group": "surface", "light": "#eceadf", "dark": "#1a1d28", "role": "insets, hover, pills, code blocks" },
+    "--bg":            { "group": "surface", "light": "#F3F6F5", "dark": "#08100F", "role": "Canvas — the neutral mineral application/page field. Never replaced by an accent, gradient, or neon field." },
+    "--surface":       { "group": "surface", "light": "#FFFFFF", "dark": "#101B19", "role": "Surface — primary panel and chrome." },
+    "--surface-2":     { "group": "surface", "light": "#E7EEEC", "dark": "#182725", "role": "Surface secondary — subordinate regions and neutral controls." },
+    "--surface-hover": { "group": "surface", "light": "#EDF2F0", "dark": "#1D2F2B", "role": "Surface hover — neutral interaction feedback." },
 
-    "--border":        { "group": "ink", "light": "#101014", "dark": "#424866", "role": "2px ink borders (always present, never hairline). Dark stays quiet (~2:1 on surface) — visible structure without light-mode ink loudness" },
-    "--shadow":        { "group": "ink", "light": "#101014", "dark": "#050609", "role": "hard-offset zero-blur shadow color" },
+    "--text":          { "group": "ink", "light": "#10201D", "dark": "#EAF2F0", "role": "Ink — primary text and the strongest rule." },
+    "--muted":         { "group": "ink", "light": "#53645F", "dark": "#9AB0AB", "role": "Muted ink — supporting text and metadata." },
+    "--border":        { "group": "ink", "light": "#9AACAA", "dark": "#39504B", "role": "Rule — one-pixel structural dividers and control borders." },
+    "--border-soft":   { "group": "ink", "light": "#D7E1DE", "dark": "#263B37", "role": "Rule soft — row and subordinate dividers." },
 
-    "--text":          { "group": "text", "light": "#101014", "dark": "#e6e4da", "role": "body text — LOCKED for readability (~17:1 light, ~14:1 dark). Do not re-tune." },
-    "--muted":         { "group": "text", "light": "#62626d", "dark": "#84879a", "role": "labels, metadata, secondary text" },
+    "--declare":       { "group": "declare", "light": "#5036D5", "dark": "#A894FF", "role": "Declare / primary — Declaration identity, links, selection, focus, and the primary action." },
+    "--declare-soft":  { "group": "declare", "light": "#EAE6FF", "dark": "#241F46", "role": "Declare soft — selected or contextual declaration field." },
+    "--declare-ink":   { "group": "declare", "light": "#FFFFFF", "dark": "#08100F", "role": "Label on a --declare fill (the primary action). Light reuses Surface, dark reuses Canvas." },
 
-    "--brand":         { "group": "brand", "light": "#2745e8", "dark": "#1a2040", "role": "brand blue fill (button/chip), panel top-bar. Collapses onto --brand-strong in light and onto --brand-soft in dark; the tokens stay distinct because their roles differ per mode." },
-    "--brand-strong":  { "group": "brand", "light": "#2745e8", "dark": "#7a8cff", "role": "links, selected refs, big stats, llm span kind, heat ramp" },
-    "--brand-soft":    { "group": "brand", "light": "#e9edfd", "dark": "#1a2040", "role": "selection / hover row wash, panel backgrounds" },
-    "--brand-btn":     { "group": "brand", "light": "#2745e8", "dark": "#7a8cff", "role": "primary button fill" },
-    "--brand-btn-ink": { "group": "brand", "light": "#ffffff", "dark": "#0b0c12", "role": "text on the primary button" },
+    "--observe":       { "group": "observe", "light": "#007563", "dark": "#67B891", "role": "Observe — observed facts and Observation identity." },
+    "--observe-soft":  { "group": "observe", "light": "#BDF5E7", "dark": "#15352F", "role": "Observe soft — selected or contextual observation field." },
 
-    "--lime":          { "group": "acid", "light": "#c5f23c", "dark": "#c5f23c", "role": "secondary accent — the second voice after brand blue. Secondary action fills, the client/runtime plane, and secondary emphasis. Bright lime is a FILL only; it is 1.30:1 on white and can never be text or a thin bar there." },
-    "--lime-ink":      { "group": "acid", "light": "#101014", "dark": "#101014", "role": "text on lime fills (both modes — safe because --lime is mode-invariant)" },
-    "--lime-text":     { "group": "acid", "light": "#4a7a06", "dark": "#c5f23c", "role": "lime as text or as a thin bar: raw lime on dark, darkened lime on light. 5.15:1 on white." },
+    "--evidence":      { "group": "evidence", "light": "#D7F33F", "dark": "#D7F33F", "role": "Retained Evidence — the retained-evidence signal, the Wyrd mark's center spine, and evidence-capture feedback only. Never a general accent, hover, or wash." },
+    "--evidence-ink":  { "group": "evidence", "light": "#10201D", "dark": "#10201D", "role": "Label and outline on a --evidence fill. Mode-invariant because --evidence is; light Ink." },
 
-    "--client":        { "group": "line", "light": "#4a7a06", "dark": "#c5f23c", "role": "the Line — client/runtime plane. This IS lime, mode-split so it survives a light surface (5.15:1 on white vs 1.30:1 for raw lime)." },
-    "--client-bar":    { "group": "line", "light": "#4a7a06", "dark": "#c5f23c", "role": "client/agent kind left-bar + indicators. 2.03:1 luminance separation from --server-bar amber." },
-    "--server":        { "group": "line", "light": "#f2a23c", "dark": "#f2a23c", "role": "the Line — server/enterprise plane fill" },
-    "--server-bar":    { "group": "line", "light": "#ec8b14", "dark": "#f2a23c", "role": "server/tool kind left-bar + indicators (darkened on light)" },
-    "--control":       { "group": "line", "light": "#7cc4e8", "dark": "#6fb3d6", "role": "the Line — control/deploy plane fill" },
-    "--control-bar":   { "group": "line", "light": "#2f6f9e", "dark": "#6fb3d6", "role": "control/retrieval kind left-bar + indicators (darkened on light). Steel blue: near brand blue but never a stand-in for brand identity." },
+    "--ok":            { "group": "status", "light": "#187B45", "dark": "#50DA83", "role": "Success — successful state; always paired with a glyph or word." },
+    "--warn":          { "group": "status", "light": "#A65F00", "dark": "#FFB455", "role": "Warning — caution state; always paired with a glyph or word." },
+    "--danger":        { "group": "status", "light": "#B52828", "dark": "#FF715E", "role": "Failure — failed judgment or error; always paired with a glyph or word." },
+    "--danger-soft":   { "group": "status", "light": "#F9E8E7", "dark": "#3B1D1B", "role": "Failure soft — failure context field." },
 
-    "--ok":            { "group": "status", "light": "#2f9e44", "dark": "#7ee081", "role": "healthy / pass / success — FILL and bar use only" },
-    "--warn":          { "group": "status", "light": "#ec8b14", "dark": "#f2a23c", "role": "drift / caution / warning — FILL and bar use only" },
-    "--danger":        { "group": "status", "light": "#d2402a", "dark": "#e8615a", "role": "fail / error / removed (overrides kind) — FILL and bar use only" },
-    "--ok-text":       { "group": "status", "light": "#247b35", "dark": "#7ee081", "role": "healthy AS TEXT. Raw --ok is 3.01:1 as a badge label on light; this is the darkest hue-preserving value clearing 4.5:1. Dark mode already passes, so it is unchanged there." },
-    "--warn-text":     { "group": "status", "light": "#9c5c0d", "dark": "#f2a23c", "role": "caution AS TEXT. Raw --warn is 2.28:1 as a badge label on light. Also decouples warning text from --server-bar, which shares --warn's hex." },
-    "--danger-text":   { "group": "status", "light": "#c03a26", "dark": "#e8615a", "role": "failure AS TEXT. Raw --danger is 3.94:1 as a badge label on light." },
+    "--code-bg":       { "group": "code", "light": "#0E1716", "dark": "#050908", "role": "Code surface — code and terminal blocks (dark in both modes)." },
+    "--code-text":     { "group": "code", "light": "#DCF5EE", "dark": "#DCF5EE", "role": "Code ink — default code text." },
 
-    "--hero-bg":       { "group": "hero", "light": "#2745e8", "dark": "#1a2040", "role": "loud hero block background" },
-    "--hero-ink":      { "group": "hero", "light": "#ffffff", "dark": "#e9edfd", "role": "text on hero block" },
-    "--ink-on-fill":   { "group": "hero", "light": "#101014", "dark": "#101014", "role": "always-dark text on bright fills" },
-
-    "--r":             { "group": "geometry", "light": "5px", "dark": "5px", "role": "radius — locked at 5px (true circles only for dots/avatars)" }
+    "--r":             { "group": "geometry", "light": "2px", "dark": "2px", "role": "Radius — restrained two-pixel corners (true circles only for dots/avatars)." }
   },
 
-  "$pairs": "Contrast contract, asserted by gen-theme.mjs in BOTH modes. Every foreground/background pairing the system actually renders is declared here so a palette edit that breaks one fails the build instead of shipping. `fill` may be a token name or {mix:[a,b],pct} for a color-mix() background. `min` is the WCAG floor for the role: 4.5 for text, 3.0 for non-text UI (WCAG 1.4.11), 7.0 where we hold ourselves to AAA. The reason this exists: --ink-on-fill and --lime-ink are mode-INVARIANT, so they are only safe on a mode-invariant fill; and --brand collapses onto --brand-btn-ink in dark (1.23:1) while looking fine in light (6.77:1).",
+  "$pairs": "Contrast contract, asserted by gen-theme.mjs in BOTH modes. Every foreground/background pairing the applications render is declared here so a palette edit that breaks one fails the token gate instead of shipping. `min` is the WCAG floor for the role: 4.5 for text, 3.0 for non-text UI (WCAG 1.4.11), 7.0 where we hold ourselves to AAA. Rule pairs are structural separation and never the sole identifier of a control; see DESIGN.md 'Rules are structure'.",
   "pairs": [
-    { "ink": "--text", "fill": "--bg", "min": 7.0, "role": "body text on page" },
-    { "ink": "--text", "fill": "--surface", "min": 7.0, "role": "body text on card" },
-    { "ink": "--muted", "fill": "--surface", "min": 4.5, "role": "labels, metadata" },
-    { "ink": "--brand-strong", "fill": "--surface", "min": 4.5, "role": "links, big stats" },
-    { "ink": "--lime-text", "fill": "--surface", "min": 4.5, "role": "lime as text" },
+    { "ink": "--text", "fill": "--bg", "min": 7.0, "role": "body text on canvas" },
+    { "ink": "--text", "fill": "--surface", "min": 7.0, "role": "body text on a panel" },
+    { "ink": "--text", "fill": "--surface-2", "min": 7.0, "role": "text in subordinate regions and neutral controls" },
+    { "ink": "--text", "fill": "--surface-hover", "min": 7.0, "role": "text on a hovered row or control" },
+    { "ink": "--muted", "fill": "--bg", "min": 4.5, "role": "metadata on canvas" },
+    { "ink": "--muted", "fill": "--surface", "min": 4.5, "role": "metadata on a panel; neutral badge label" },
+    { "ink": "--muted", "fill": "--surface-2", "min": 4.5, "role": "metadata in subordinate regions" },
+    { "ink": "--muted", "fill": "--surface-hover", "min": 4.5, "role": "metadata on a hovered row" },
 
-    { "ink": "--brand-btn-ink", "fill": "--brand-btn", "min": 4.5, "role": "primary button label" },
-    { "ink": "--lime-ink", "fill": "--lime", "min": 4.5, "role": "label on a lime fill" },
-    { "ink": "--hero-ink", "fill": "--hero-bg", "min": 4.5, "role": "hero copy" },
+    { "ink": "--declare", "fill": "--bg", "min": 4.5, "role": "links on canvas" },
+    { "ink": "--declare", "fill": "--surface", "min": 4.5, "role": "links, selected refs, focus ring on a panel" },
+    { "ink": "--declare", "fill": "--surface-hover", "min": 4.5, "role": "link on a hovered row" },
+    { "ink": "--declare", "fill": "--declare-soft", "min": 4.5, "role": "selected declaration label" },
+    { "ink": "--text", "fill": "--declare-soft", "min": 7.0, "role": "text in a selected declaration field" },
+    { "ink": "--declare-ink", "fill": "--declare", "min": 4.5, "role": "primary action label" },
 
-    { "ink": "--ok-text", "fill": { "mix": ["--ok-text", "--surface"], "pct": 0.12 }, "min": 4.5, "role": "ok badge label" },
-    { "ink": "--warn-text", "fill": { "mix": ["--warn-text", "--surface"], "pct": 0.12 }, "min": 4.5, "role": "warn badge label" },
-    { "ink": "--danger-text", "fill": { "mix": ["--danger-text", "--surface"], "pct": 0.12 }, "min": 4.5, "role": "danger badge label" },
-    { "ink": "--muted", "fill": "--surface", "min": 4.5, "role": "neutral badge label — untinted; a 12% --muted tint lands at 4.46:1 in dark, and 'neutral' means no status, so it gets no fill" },
+    { "ink": "--observe", "fill": "--surface", "min": 4.5, "role": "observation label on a panel" },
+    { "ink": "--observe", "fill": "--observe-soft", "min": 4.5, "role": "selected observation label" },
+    { "ink": "--text", "fill": "--observe-soft", "min": 7.0, "role": "text in a selected observation field" },
 
-    { "ink": "--client-bar", "fill": "--surface", "min": 3.0, "role": "client kind bar (non-text)" },
-    { "ink": "--server-bar", "fill": "--surface", "min": 2.5, "role": "server kind bar (non-text) — 2.54:1, inherited; see DESIGN.md" },
-    { "ink": "--control-bar", "fill": "--surface", "min": 3.0, "role": "control kind bar (non-text)" },
-    { "ink": "--ok", "fill": "--surface", "min": 3.0, "role": "ok bar / dot (non-text)" },
-    { "ink": "--danger", "fill": "--surface", "min": 3.0, "role": "danger bar / dot (non-text)" }
+    { "ink": "--evidence-ink", "fill": "--evidence", "min": 4.5, "role": "label and outline on a retained-evidence fill" },
+    { "ink": "--evidence", "fill": "--code-bg", "min": 3.0, "role": "retained-evidence signal on a code/terminal block (non-text)" },
+
+    { "ink": "--ok", "fill": "--surface", "min": 4.5, "role": "success label on a panel" },
+    { "ink": "--ok", "fill": "--bg", "min": 4.5, "role": "success label on canvas" },
+    { "ink": "--warn", "fill": "--surface", "min": 4.5, "role": "warning label on a panel" },
+    { "ink": "--warn", "fill": "--bg", "min": 4.5, "role": "warning label on canvas" },
+    { "ink": "--danger", "fill": "--surface", "min": 4.5, "role": "failure label on a panel" },
+    { "ink": "--danger", "fill": "--bg", "min": 4.5, "role": "failure label on canvas" },
+    { "ink": "--danger", "fill": "--danger-soft", "min": 4.5, "role": "failure label in a failure context field" },
+    { "ink": "--text", "fill": "--danger-soft", "min": 7.0, "role": "text in a failure context field" },
+
+    { "ink": "--code-text", "fill": "--code-bg", "min": 7.0, "role": "code and terminal text" },
+
+    { "ink": "--border", "fill": "--surface", "min": 2.0, "role": "structural rule on a panel — separation only; controls are also identified by label, fill, or --declare focus" },
+    { "ink": "--border", "fill": "--bg", "min": 2.0, "role": "structural rule on canvas — separation only" }
   ]
 }

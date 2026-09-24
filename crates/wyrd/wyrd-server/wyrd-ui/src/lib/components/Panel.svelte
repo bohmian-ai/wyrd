@@ -33,18 +33,17 @@
 
 <style>
   .wy-panel {
-    border: 2px solid var(--border);
+    border: 1px solid var(--border);
     border-radius: var(--r);
     background: var(--surface);
-    box-shadow: 3px 3px 0 0 var(--shadow);
     overflow: hidden;
     container-type: inline-size;
   }
   .wy-panel[data-variant='raised'] {
-    box-shadow: 6px 6px 0 0 var(--shadow);
+    border-color: var(--text);
   }
   .wy-panel[data-variant='flat'] {
-    box-shadow: none;
+    border-color: var(--border-soft);
   }
   .wy-panel[data-variant='wide'] {
     grid-column: 1 / -1;
@@ -58,17 +57,14 @@
     gap: 8px;
     flex-wrap: wrap;
     padding: 10px 14px;
-    border-bottom: 2px solid var(--border);
+    border-bottom: 1px solid var(--border);
     background: var(--surface-2);
     font: 700 13px var(--font-sans);
     color: var(--text);
   }
-  /* accent = the page's dominant panel: raised altitude plus a brand-tinted head. */
-  .wy-panel[data-variant='accent'] {
-    box-shadow: 6px 6px 0 0 var(--shadow);
-  }
+  /* accent = the page's dominant panel: a declare-soft head over a plain body. */
   .wy-panel[data-variant='accent'] .wy-panel-head {
-    background: color-mix(in srgb, var(--brand-strong) 14%, var(--surface));
+    background: var(--declare-soft);
   }
   .wy-panel-body {
     padding: 16px;

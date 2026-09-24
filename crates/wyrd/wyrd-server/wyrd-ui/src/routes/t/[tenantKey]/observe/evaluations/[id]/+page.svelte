@@ -228,11 +228,11 @@
     align-items: flex-start;
   }
   .kpi-n {
-    font: 700 20px var(--font-display);
+    font: 700 20px var(--font-sans);
     margin: 0;
   }
   .fail-text {
-    color: var(--danger-text);
+    color: var(--danger);
   }
   .kpi-k {
     font: 700 9px var(--font-mono);

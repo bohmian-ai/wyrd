@@ -860,7 +860,7 @@ run = "uv run python scripts/check_test_contracts.py"
 hide = true
 description = "Assert generated theme CSS targets are in sync with palette.json (token drift lock)"
 dir = "crates/wyrd/wyrd-server/wyrd-ui"
-run = "node brand/gen-theme.mjs --check"
+run = "node --test brand/gen-theme.test.mjs && node brand/gen-theme.mjs --check"
 
 [tasks."sqlx:prepare"]
 hide = true

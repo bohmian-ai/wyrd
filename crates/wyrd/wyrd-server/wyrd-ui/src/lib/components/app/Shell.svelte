@@ -64,7 +64,7 @@
 <a class="skip" href="#main">Skip to content</a>
 <div class="app-shell" class:rail={collapsed}>
   <aside>
-    <a class="wordmark" href={base}><img src={logo} alt="" width="28" height="28" />{#if !collapsed}bohmian{/if}</a>
+    <a class="wordmark" href={base}><img src={logo} alt="" width="28" height="28" />{#if !collapsed}Wyrd{/if}</a>
     <button class="app-control mobile-menu" type="button" bind:this={menuButton} aria-controls="menu-disclosure" aria-expanded={navOpen} onclick={() => navOpen = !navOpen}>Menu</button>
     <div id="menu-disclosure" class="menu-panel" class:collapsed={!navOpen} role="region" aria-label="Menu">
       <div class="menu-context mobile-menu"><span>Current area: {current}</span><span>{tenant.name}</span><button class="app-control" type="button" onclick={closeMenu}>Close menu</button></div>
@@ -158,7 +158,7 @@
     gap: 10px;
     color: var(--text);
     text-decoration: none;
-    font: 600 18px var(--font-serif);
+    font: 600 18px var(--font-sans);
     margin-bottom: 34px;
   }
   nav {
@@ -180,8 +180,7 @@
   nav a[aria-current] {
     color: var(--text);
     border-color: var(--border);
-    background: var(--brand-soft);
-    box-shadow: 3px 3px 0 var(--shadow);
+    background: var(--declare-soft);
   }
   header {
     display: flex;
@@ -195,8 +194,8 @@
     font: 700 11px var(--font-mono);
   }
   .product {
-    background: var(--brand-btn);
-    color: var(--brand-btn-ink);
+    background: var(--declare);
+    color: var(--declare-ink);
     padding: 5px 9px;
     border: 2px solid var(--border);
     border-radius: var(--r);
@@ -290,7 +289,6 @@
       padding: 14px;
       border: 2px solid var(--border);
       border-radius: var(--r);
-      box-shadow: 3px 3px 0 var(--shadow);
     }
     .menu-context {
       display: flex;

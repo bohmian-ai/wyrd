@@ -32,11 +32,10 @@
     border: 2px solid var(--border);
     border-radius: var(--r);
     background: var(--surface);
-    box-shadow: 3px 3px 0 0 var(--shadow);
     overflow-x: auto;
   }
   .wy-table:focus-visible {
-    outline: 2px solid var(--brand-strong);
+    outline: 2px solid var(--declare);
     outline-offset: 2px;
   }
   .wy-table :global(th),
@@ -90,12 +89,12 @@
     background: var(--surface-2);
   }
   .wy-table :global(tbody tr:has(a:focus-visible) td:first-child) {
-    box-shadow: inset 3px 0 0 0 var(--brand-strong);
+    box-shadow: inset 3px 0 0 0 var(--declare);
   }
   .wy-table :global(tr.sel td) {
-    background: var(--brand-soft);
+    background: var(--declare-soft);
   }
   .wy-table :global(tr.sel td:first-child) {
-    box-shadow: inset 3px 0 0 0 var(--brand-strong);
+    box-shadow: inset 3px 0 0 0 var(--declare);
   }
 </style>

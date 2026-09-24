@@ -53,7 +53,7 @@
     stroke: var(--border);
   }
   .bar {
-    fill: var(--brand-strong);
+    fill: var(--declare);
     stroke: var(--border);
   }
   .val {

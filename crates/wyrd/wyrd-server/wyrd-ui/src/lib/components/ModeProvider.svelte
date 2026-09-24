@@ -16,11 +16,11 @@
 <style>
   .wy-root {
     /* font shorthands used by every Wyrd component, matching the source-of-truth HTML */
-    --fm: var(--font-mono, 'JetBrains Mono', monospace);
-    --fh: var(--font-display, 'Archivo Black', sans-serif);
+    --fm: var(--font-mono);
+    --fh: var(--font-sans);
     min-height: 100%;
     background: var(--bg);
     color: var(--text);
-    font-family: var(--font-sans, 'Archivo', system-ui, sans-serif);
+    font-family: var(--font-sans);
   }
 </style>

@@ -124,7 +124,7 @@
   .text-action {
     border: 0;
     background: transparent;
-    color: var(--brand-strong);
+    color: var(--declare);
     font: 10px var(--font-mono);
     cursor: pointer;
     padding: 2px;

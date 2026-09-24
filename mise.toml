@@ -35,7 +35,7 @@ env_shell_expand = false
 jobs = 1
 
 [env]
-WYRD_DEV_PG_CACHE = "${HOME}/.cache/wyrd/pg"
+WYRD_DEV_PG_CACHE = "{{env.HOME}}/.cache/wyrd/pg"
 # A panicking test should say where it panicked. Every lane below runs under
 # this, so a failure report never costs a second run to reproduce with
 # backtraces enabled.

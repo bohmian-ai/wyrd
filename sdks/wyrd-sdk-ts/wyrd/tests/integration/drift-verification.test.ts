@@ -66,9 +66,6 @@ ${distribution("latency, tier")}      profile:
 ${distribution("latency")}      profile:
         kind: Spc
         sample_size: 5
-        weco_rule:
-          rule_string: "8 16 4 8 2 4 1 1"
-        alert_threshold: Zone1
 `,
   "ts-edge-custom": `      method: Custom
       signal:
@@ -162,6 +159,57 @@ spec: {}
 `,
   );
   return (await cards.registerFromPath(path)).root;
+}
+
+/** Register a Service bound to the SPC Verifier that dispatches one Operator on failure. */
+async function boundSubject(cards: Cards, root: string): Promise<CardRef> {
+  const path = join(root, "ts-edge-bound.yaml");
+  writeFileSync(
+    path,
+    `apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: ts-edge-bound
+  version: 1.0.0
+  space: default
+spec:
+  verified_by:
+    - verifier:
+        kind: Verifier
+        name: ts-edge-spc
+        version: 1.0.0
+        space: default
+      runs_on:
+        kind: schedule
+        cron: "0 0 * * *"
+      on_failure:
+        - kind: http
+          method: post
+          url: https://hooks.example.test/ts-drift
+`,
+  );
+  return (await cards.registerFromPath(path)).root;
+}
+
+/** Poll `runId` as the subject until it leaves the active states, and require completion. */
+async function settle(
+  server: NativeWyrdTestServer,
+  service: CardRef,
+  runId: string,
+): Promise<Awaited<ReturnType<Verification["getRun"]>>> {
+  const verification = Verification.connect({
+    serverUrl: server.baseUrl,
+    credential: subjectCredential(server, service),
+  });
+  const deadline = Date.now() + WAIT_MS;
+  let status = await verification.getRun(runId);
+  while (["pending", "running", "retrying"].includes(status.status)) {
+    expect(Date.now() < deadline, `run never settled: ${JSON.stringify(status)}`).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    status = await verification.getRun(runId);
+  }
+  expect(status.status, JSON.stringify(status)).toBe("completed");
+  return status;
 }
 
 /** Issue the subject Service's own key, whose Card scope covers its manual runs. */
@@ -258,6 +306,26 @@ async function readResult(
   };
 }
 
+/**
+ * Assert the persisted SPC evidence of `latency` in a result's `details`.
+ *
+ * The baseline's twenty subgroups of five consecutive integers fix the X-bar
+ * center at 49.5 and the S center at `sqrt(2.5)`; the limits must be the NIST
+ * X-bar/S limits around them, and SPC compares signals with zero.
+ */
+function assertSpcEvidence(details: string | null, subgroups: number, xBarSignals: number): void {
+  const feature = JSON.parse(details ?? "null").features.latency;
+  const spc = feature.evidence.Spc;
+  expect([spc.subgroup_size, spc.subgroups], JSON.stringify(spc)).toEqual([5, subgroups]);
+  expect(spc.x_bar.signals).toBe(xBarSignals);
+  const sBar = Math.sqrt(2.5);
+  expect(spc.x_bar.center).toBeCloseTo(49.5, 9);
+  expect(spc.x_bar.upper).toBeCloseTo(49.5 + (3 * sBar) / (0.9399856 * Math.sqrt(5)), 5);
+  expect(spc.s.center).toBeCloseTo(sBar, 9);
+  expect(spc.s.lower, "B3 is zero for subgroups of five").toBe(0);
+  expect(feature.threshold).toBe(0);
+}
+
 /** Assert a result completed inconclusive before scoring: null details, no features. */
 function assertUnscored({ result, features }: Outcome): void {
   expect([result.execution_status, result.verdict]).toEqual(["completed", "inconclusive"]);
@@ -299,15 +367,7 @@ describe("drift method edge journey", () => {
           },
           input: { kind: "drift_window", start: from.toISOString(), end: to.toISOString() },
         };
-        const runId = await verification.startRun(request);
-        const deadline = Date.now() + WAIT_MS;
-        let status = await verification.getRun(runId);
-        while (["pending", "running", "retrying"].includes(status.status)) {
-          expect(Date.now() < deadline, `run never settled: ${JSON.stringify(status)}`).toBe(true);
-          await new Promise((resolve) => setTimeout(resolve, 100));
-          status = await verification.getRun(runId);
-        }
-        expect(status.status, JSON.stringify(status)).toBe("completed");
+        const status = await settle(server, service, await verification.startRun(request));
         expect(status.dispatches, "a direct run never dispatches").toEqual([]);
         return readResult(server, query, status.result_id ?? "");
       };
@@ -336,18 +396,18 @@ describe("drift method edge journey", () => {
       expect(outcome.result.verdict, "a mean at the threshold is no drift").toBe("passed");
       expect(outcome.features).toEqual(["score/Custom/no_drift"]);
 
+      const latencies = (values: number[]) =>
+        values.map((latency) => ({ latency, tier: "gold", score: 1.0 }));
       const calm = await subject(cards, root, "ts-edge-calm");
-      const nearCenter = [...Array(5).fill(45.0), ...Array(5).fill(54.0), ...Array(3).fill(49.0)];
-      await emitRows(
-        server,
-        cards,
-        calm,
-        join(bundles, "calm"),
-        nearCenter.map((latency: number) => ({ latency, tier: "gold", score: 1.0 })),
-      );
+      await emitRows(server, cards, calm, join(bundles, "calm"), latencies([48, 49, 50, 51, 52, 48, 49, 50, 51, 52]));
       outcome = await run(spc, calm);
-      expect(outcome.result.verdict, "two chunks and a trailing chunk pass").toBe("passed");
+      expect(outcome.result.verdict, "two in-control subgroups pass").toBe("passed");
       expect(outcome.features).toEqual(["latency/Spc/no_drift"]);
+      assertSpcEvidence(outcome.result.details, 2, 0);
+      await emitRows(server, cards, calm, join(bundles, "calm-partial"), latencies([50, 50]));
+      outcome = await run(spc, calm);
+      expect(outcome.result.verdict, "a trailing partial subgroup").toBe("inconclusive");
+      expect(outcome.features).toEqual(["latency/Spc/inconclusive"]);
 
       const sparse = await subject(cards, root, "ts-edge-sparse");
       await emitRows(server, cards, sparse, join(bundles, "sparse"), baselineLike.slice(0, 3));
@@ -357,6 +417,48 @@ describe("drift method edge journey", () => {
       outcome = await run(spc, sparse);
       expect(outcome.result.verdict).toBe("inconclusive");
       expect(outcome.features).toEqual(["latency/Spc/inconclusive"]);
+
+      const gappy = await subject(cards, root, "ts-edge-gappy");
+      await emitRows(server, cards, gappy, join(bundles, "gappy"), baselineLike);
+      await emitRows(server, cards, gappy, join(bundles, "gappy-unrelated"), Array(5).fill({ score: 9.0 }));
+      expect(
+        (await run(psi, gappy)).result.verdict,
+        "records without a PSI feature do not enter PSI",
+      ).toBe("passed");
+      await emitRows(server, cards, gappy, join(bundles, "gappy-omitted"), [{ latency: 50.0 }]);
+      assertUnscored(await run(psi, gappy));
+
+      const bound = await boundSubject(cards, root);
+      const bindingIds = (await cards.get(bound)).status?.verification?.binding_ids;
+      expect(bindingIds).toHaveLength(1);
+      await emitRows(server, cards, bound, join(bundles, "bound"), latencies(Array(20).fill(200)));
+      const bindingRun = await Verification.connect({
+        serverUrl: server.baseUrl,
+        credential: subjectCredential(server, bound),
+      }).startRun({
+        target: { kind: "binding", binding_id: bindingIds?.[0] ?? "" },
+        input: { kind: "drift_window", start: start.toISOString(), end: end.toISOString() },
+      });
+      const failed = await settle(server, bound, bindingRun);
+      expect(failed.dispatches, "a failed binding result dispatches its Operator").toHaveLength(1);
+      outcome = await readResult(server, query, failed.result_id ?? "");
+      expect(outcome.result.verdict).toBe("failed");
+      expect(outcome.features).toEqual(["latency/Spc/drift"]);
+      assertSpcEvidence(outcome.result.details, 4, 4);
+
+      const retired = join(root, "ts-edge-weco.yaml");
+      writeFileSync(
+        retired,
+        readFileSync(join(root, "ts-edge-spc.yaml"), "utf8")
+          .replace("ts-edge-spc", "ts-edge-weco")
+          .replace("sample_size: 5\n", 'sample_size: 5\n        weco_rule:\n          rule_string: "8 16 4 8 2 4 1 1"\n'),
+      );
+      const legacy = await cards.registerFromPath(retired).then(
+        () => undefined,
+        (reason: unknown) => reason,
+      );
+      expect(legacy).toBeInstanceOf(WyrdError);
+      expect(JSON.stringify((legacy as WyrdError).details)).toContain("weco_rule");
 
       const weighted = await subject(cards, root, "ts-edge-weighted");
       const scores = (values: number[]) =>

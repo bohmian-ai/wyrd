@@ -482,6 +482,10 @@ impl<'a> DistributionFold<'a> {
 
     /// Score the folded window, or `None` when it is not scorable.
     ///
+    /// An SPC target the scorer leaves wholly unscored, such as one ending in
+    /// a partial subgroup, is `None` as well, so it publishes the same
+    /// inconclusive result without details as an incomplete window.
+    ///
     /// # Errors
     /// Returns the PSI scorer's error for counts that do not fit the baseline.
     pub fn finish(self) -> Result<Option<DriftReport>, DriftScoreError> {
@@ -497,7 +501,10 @@ impl<'a> DistributionFold<'a> {
                 let counts = baseline.features.keys().cloned().zip(counts).collect();
                 score_psi_counts(baseline, &counts, profile).map(Some)
             }
-            MethodFold::Spc { scorer, .. } => Ok(Some(scorer.finish())),
+            MethodFold::Spc { scorer, .. } => {
+                let report = scorer.finish();
+                Ok((!report.features.is_empty()).then_some(report))
+            }
         }
     }
 }
@@ -1419,9 +1426,8 @@ mod tests {
     }
 
     /// A duplicated historical `x` row gives `x` complete signaled subgroups
-    /// while `y` ends in a partial one. Every record is complete, so the
-    /// statement scores, but the SPC report is wholly unscored rather than
-    /// failing on `x`'s signal.
+    /// while `y` ends in a partial one. Every record is complete, yet the run
+    /// is unscored rather than failing on `x`'s signal.
     #[tokio::test]
     async fn spc_signal_beside_a_partial_feature_is_unscored() {
         let uid = subject().to_string();
@@ -1439,13 +1445,13 @@ mod tests {
         rows.push((&uid, "x", Some(50.0), None, 3, 3, "r2"));
         let sql = window().spc_statement(&spc).expect("SPC SQL");
 
-        let report = decide(&sql, &rows, DistributionFold::spc(&spc))
-            .await
-            .expect("every record is complete");
-
+        assert_eq!(decide(&sql, &rows, DistributionFold::spc(&spc)).await, None);
+        rows.truncate(4);
+        let scored = decide(&sql, &rows, DistributionFold::spc(&spc)).await;
         assert_eq!(
-            report,
-            vala_drift::DriftReport::unscored(wyrd_spec::card::drift::DriftMethod::Spc)
+            scored.map(|report| report.verdict),
+            Some(vala_drift::DriftVerdict::Drift),
+            "complete features still signal"
         );
     }
 }

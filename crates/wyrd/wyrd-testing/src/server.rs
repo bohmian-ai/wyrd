@@ -2,6 +2,8 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs::OpenOptions;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -10,6 +12,7 @@ use std::time::Duration;
 use wyrd_sql::OperatorPool;
 
 use arrow::datatypes::{DataType, Field, Schema};
+use base64::Engine as _;
 use async_trait::async_trait;
 use axum::body::{Body, to_bytes};
 use axum::http::{HeaderValue, Request, Response, StatusCode, header};
@@ -665,8 +668,6 @@ fn generated_operator_keys() -> Result<
     ),
     WyrdTestServerError,
 > {
-    use base64::Engine as _;
-    use std::os::unix::fs::PermissionsExt as _;
     let start = |error: std::io::Error| WyrdTestServerError::Start(error.to_string());
     let dir = tempfile::tempdir().map_err(start)?;
     let mut key = [0_u8; 32];
@@ -4728,7 +4729,8 @@ impl WyrdTestServerBuilder {
             None => generated_operator_keys()?,
         };
         state = state.with_operator_keys(
-            wyrd_server::components::operators::keys::OperatorKeys::new(operator_keys),
+            wyrd_server::components::operators::keys::OperatorKeys::new(operator_keys)
+                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
         );
         let router = build_router(state.clone());
 

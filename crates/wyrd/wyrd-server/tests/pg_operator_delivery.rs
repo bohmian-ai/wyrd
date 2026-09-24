@@ -705,7 +705,8 @@ async fn next_attempt_on_another_replica_uses_the_rotated_credential() {
         dir: Some(dir.to_path_buf()),
         active_version: std::num::NonZeroU32::new(2).expect("nonzero"),
         ..OperatorKeysConfig::default()
-    }));
+    })
+    .expect("file keys build"));
     delivery.make_retries_due(run).await;
     let second = delivery.spawn(
         &replica,
@@ -893,7 +894,8 @@ async fn revoked_connection_fails_closed_and_key_outage_retries() {
         source: OperatorKeySource::File,
         dir: Some(empty.path().to_path_buf()),
         ..OperatorKeysConfig::default()
-    }));
+    })
+    .expect("file keys build"));
     let running = delivery.spawn(
         &outage,
         Delivery::limits(),

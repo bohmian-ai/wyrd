@@ -35,7 +35,6 @@ use crate::boot::data_root::BifrostDataRoot;
 use crate::components::auth::{ServerAuth, ServerAuthz};
 use crate::components::health::ReadinessSnapshot;
 use crate::components::operators::keys::OperatorKeys;
-use crate::config::OperatorKeysConfig;
 use crate::config::{BifrostRuntimeConfig, BifrostTarget, DeploymentProfile, ForgeRuntimeConfig};
 #[cfg(feature = "test-support")]
 use crate::oracle::SilentForwardPeer;
@@ -2130,7 +2129,7 @@ impl AppState {
             readiness: Arc::new(ArcSwap::from_pointee(ReadinessSnapshot::initial())),
             peer_plane: Arc::new(crate::app::peer_plane::PeerPlaneStatus::default()),
             verification: Arc::default(),
-            operator_keys: Arc::new(OperatorKeys::new(OperatorKeysConfig::default())),
+            operator_keys: Arc::new(OperatorKeys::default()),
             #[cfg(feature = "test-support")]
             query_stream_fault: None,
             #[cfg(feature = "test-support")]

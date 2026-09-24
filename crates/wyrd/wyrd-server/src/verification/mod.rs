@@ -9,6 +9,7 @@
 //! runtime holds no process-local registry, so any process may crash and
 //! another reclaims its leases.
 
+mod claims;
 pub mod engines;
 pub mod health;
 pub mod operators;
@@ -75,12 +76,20 @@ pub struct RuntimeLimits {
     /// Server backoff after the first and every later failed Operator
     /// attempt.
     pub operator_backoff: [Duration; 2],
+    /// Wait between Operator key-rewrap passes; rewrap runs beside, never
+    /// inside, the delivery claim loop.
+    pub rewrap_interval: Duration,
+    /// Elapsed-time ceiling of one cross-tenant rewrap pass.
+    pub rewrap_pass_budget: Duration,
+    /// Elapsed-time ceiling of one tenant's rewrap transaction.
+    pub rewrap_tenant_budget: Duration,
 }
 
 impl Default for RuntimeLimits {
     /// Production bounds: 16 global and 4 per-tenant executions, a ten-minute
-    /// lease over a five-minute execution and one-minute publication, and a
-    /// thirty-second drain.
+    /// lease over a five-minute execution and one-minute publication, a
+    /// thirty-second drain, and a five-minute rewrap interval whose passes
+    /// stop after two minutes and thirty seconds per tenant.
     fn default() -> Self {
         Self {
             global_permits: 16,
@@ -96,6 +105,9 @@ impl Default for RuntimeLimits {
             operator_lease: Duration::from_secs(45),
             operator_attempt_timeout: Duration::from_secs(30),
             operator_backoff: [Duration::from_secs(30), Duration::from_secs(120)],
+            rewrap_interval: Duration::from_secs(300),
+            rewrap_pass_budget: Duration::from_secs(120),
+            rewrap_tenant_budget: Duration::from_secs(30),
         }
     }
 }

@@ -6,7 +6,7 @@ pub mod init;
 pub mod issuer;
 pub mod node_identity;
 
-use crate::components::operators::keys::OperatorKeys;
+use crate::components::operators::keys::{KeyError, KeyFailure, OperatorKeys};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -251,6 +251,12 @@ pub enum ServerBootError {
     /// Postgres boot or pool construction failed.
     #[error(transparent)]
     Postgres(#[from] BootError),
+    /// Operator connection keys could not be built, or a multi-tenant
+    /// production deployment could not read and decode an active tenant key.
+    /// Boot fails closed; the error names only the source kind, key version,
+    /// and failure class.
+    #[error("Operator connection keys are unavailable: {0}")]
+    OperatorKeys(#[from] KeyError),
     /// Server database readiness failed.
     #[error(transparent)]
     Database(#[from] crate::postgres::ServerPostgresError),
@@ -1331,6 +1337,10 @@ pub async fn build_state(
         rollback_state_roles(&state).await;
         return Err(ServerBootError::ProductionValidation(error));
     }
+    if let Err(error) = verify_operator_keys(&state, config).await {
+        rollback_state_roles(&state).await;
+        return Err(error);
+    }
     Ok(BootedServer {
         state,
         coordination_runtime,
@@ -1432,6 +1442,40 @@ fn resolve_peer_ticket_keyring(
         .map_err(|error| ServerBootError::SigningKey(error.to_string()))
 }
 
+/// Refuse startup of a multi-tenant production API server unless every
+/// active provisioned tenant's active Operator key reads and decodes.
+///
+/// Development and explicitly single-tenant (`auth.tenant_slug`) deployments
+/// keep their deferred failure: a missing key refuses only credential writes
+/// and deliveries.
+///
+/// # Errors
+/// Returns [`ServerBootError::OperatorKeys`] when the tenant directory is
+/// unavailable or any tenant's active key is unavailable, missing, malformed,
+/// or not 32 bytes.
+async fn verify_operator_keys(
+    state: &AppState,
+    config: &crate::config::WyrdServerConfig,
+) -> Result<(), ServerBootError> {
+    if !(config.role.serves_api()
+        && config.deployment_profile.is_production()
+        && config.auth.tenant_slug.is_none())
+    {
+        return Ok(());
+    }
+    let keys = &state.operator_keys;
+    let directory = state.postgres.operator_pool().ok_or_else(|| {
+        keys.unavailable(keys.active_version(), KeyFailure::Database)
+    })?;
+    let tenants = keys.verify_active(&directory).await?;
+    tracing::info!(
+        tenants,
+        key_version = keys.active_version(),
+        "active Operator tenant keys verified"
+    );
+    Ok(())
+}
+
 /// Apply caller overrides to a built state. Factored out for unit testing
 /// without a live DB boot.
 fn apply_overrides(state: AppState, overrides: StateOverrides) -> AppState {
@@ -1451,7 +1495,9 @@ fn attach_config_fields(
 ) -> Result<AppState, ServerBootError> {
     Ok(state
         .with_deployment_profile(config.deployment_profile)
-        .with_operator_keys(OperatorKeys::new(config.verification.operator_keys.clone()))
+        .with_operator_keys(OperatorKeys::new(
+            config.verification.operator_keys.clone(),
+        )?)
         .with_telemetry(telemetry)
         .with_limits(config.limits.into_state()))
 }

@@ -9,13 +9,19 @@
 //! shutdown — so one Operator's failure never blocks a sibling or touches the
 //! Verifier result. Claims and settlements are engine mechanics, not
 //! authorization decisions, so none of them writes audit.
+//!
+//! Key rewrap runs beside the claim loop, never inside it, under its own
+//! cancellation and elapsed-time budgets, so a slow key provider cannot hold
+//! back another tenant's due dispatch. HTTP credentials are attached only to
+//! the request built from a client already screened and pinned to that
+//! effective URL.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, RETRY_AFTER};
-use reqwest::{Method, Response, StatusCode};
-use tokio::task::{JoinError, JoinSet};
+use reqwest::{Method, RequestBuilder, Response, StatusCode};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 use wyrd_auth_oidc::{ScreenError, ScreenedHttp};
@@ -26,6 +32,7 @@ use wyrd_spec::card::operator::{
 };
 use wyrd_spec::card::verifier::VerificationBinding;
 use wyrd_spec::envelope::Spec;
+use wyrd_spec::auth::SecretBearer;
 use wyrd_spec::operator_connection::{ConnectionSecret, HttpsOrigin, OperatorConnectionStatus};
 use wyrd_spec::reference::InlineableRef;
 use wyrd_spec::verification::{FrozenTarget, VerificationError};
@@ -34,15 +41,15 @@ use wyrd_sql::queries::operator_connections::find_connection;
 use wyrd_sql::queries::operator_dispatches::{
     ClaimedDispatch, DispatchRetry, OperatorDispatchQueue,
 };
-use wyrd_sql::{OperatorPool, SqlError, WyrdPostgres};
+use wyrd_sql::{OperatorPool, SqlError, TenantConn, WyrdPostgres};
 
 #[cfg(feature = "test-support")]
 use super::CapabilityCrash;
 use super::RuntimeLimits;
-#[cfg(feature = "test-support")]
+use super::claims::{ClaimLoop, LeasedWork};
 use super::health::RuntimeCapability;
-use super::permits::{VerifierPermit, VerifierPermits};
-use crate::components::operators::keys::{KeyError, OperatorKeys};
+use super::permits::VerifierPermits;
+use crate::components::operators::keys::{KeyError, OperatorKeys, RewrapBudget};
 
 /// The frozen Operator no longer resolves to a supported Operator body.
 pub const OPERATOR_UNAVAILABLE: &str = "operator_unavailable";
@@ -69,14 +76,10 @@ pub const PROVIDER_TRANSIENT: &str = "provider_transient";
 /// payload error.
 pub const PROVIDER_REJECTED: &str = "provider_rejected";
 
-/// Tenants examined per claim round, most overdue first.
-const TENANTS_PER_ROUND: i64 = 64;
 /// Largest provider response body read, in bytes.
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 /// Same-origin redirects an HTTP Operator may follow in one attempt.
 const MAX_REDIRECTS: usize = 3;
-/// Interval between key-rewrap passes of this worker.
-const REWRAP_INTERVAL: Duration = Duration::from_secs(300);
 /// Slack errors that are transient rather than configuration failures.
 const SLACK_TRANSIENT: [&str; 5] = [
     "ratelimited",
@@ -155,18 +158,15 @@ pub struct OperatorWorker {
     operator: OperatorPool,
     /// Delivery ceilings and fenced transitions.
     queue: OperatorDispatchQueue,
-    /// Global and per-tenant Operator execution capacity, separate from the
-    /// Verifier pool.
-    permits: VerifierPermits,
+    /// Shared claim loop owning Operator execution capacity (separate from
+    /// the Verifier pool), admission, and drain.
+    claims: ClaimLoop,
     /// Tenant key-encryption keys for opening credentials.
     keys: Arc<OperatorKeys>,
     /// Provider wire adapters.
     delivery: OperatorDelivery,
     /// Runtime bounds.
     limits: RuntimeLimits,
-    /// Test-only crash switch.
-    #[cfg(feature = "test-support")]
-    crash: Option<CapabilityCrash>,
 }
 
 impl OperatorWorker {
@@ -180,6 +180,11 @@ impl OperatorWorker {
         limits: RuntimeLimits,
     ) -> Self {
         Self {
+            claims: ClaimLoop::new(
+                postgres.clone(),
+                VerifierPermits::new(limits.global_permits, limits.tenant_permits),
+                &limits,
+            ),
             postgres,
             operator,
             queue: OperatorDispatchQueue::new(
@@ -187,12 +192,9 @@ impl OperatorWorker {
                 limits.operator_deadline,
                 limits.operator_lease,
             ),
-            permits: VerifierPermits::new(limits.global_permits, limits.tenant_permits),
             keys,
             delivery,
             limits,
-            #[cfg(feature = "test-support")]
-            crash: None,
         }
     }
 
@@ -200,196 +202,51 @@ impl OperatorWorker {
     #[cfg(feature = "test-support")]
     #[must_use]
     pub fn with_crash(mut self, crash: CapabilityCrash) -> Self {
-        self.crash = Some(crash);
+        self.claims.arm_crash(crash);
         self
     }
 
-    /// Claim and deliver dispatches until `stop` is cancelled, then drain.
+    /// Claim and deliver dispatches until `stop` is cancelled, then drain,
+    /// while rewrapping stale keys beside the claim loop.
     ///
-    /// Mirrors the Verifier runner: each round claims one dispatch per due
-    /// tenant with capacity; on `stop` no claim is admitted, in-flight
-    /// attempts get the drain grace, and the rest are cancelled and released
-    /// with their attempt refunded. Between rounds the worker rewraps rows
-    /// still on an older key version, bounded per tenant.
+    /// Delivery runs on the shared [`ClaimLoop`] exactly like the Verifier
+    /// runner: each round claims one dispatch per due tenant with capacity;
+    /// on `stop` no claim is admitted, in-flight attempts get the drain grace,
+    /// and the rest are cancelled and released with their attempt refunded.
+    /// Rewrap is polled concurrently in the same task, so a slow key provider
+    /// delays only rewrap, and `stop` cancels it with the loop.
     ///
     /// # Panics
     /// Panics under `test-support` when a test armed an Operator-worker crash.
     pub async fn run(self: Arc<Self>, stop: CancellationToken) {
-        let abandon = CancellationToken::new();
-        let mut work = JoinSet::new();
-        let mut last_rewrap: Option<Instant> = None;
-        while !stop.is_cancelled() {
-            #[cfg(feature = "test-support")]
-            if let Some(crash) = &self.crash {
-                crash.check(RuntimeCapability::OperatorWorker);
-            }
-            if last_rewrap.is_none_or(|at| at.elapsed() >= REWRAP_INTERVAL) {
-                last_rewrap = Some(Instant::now());
-                if let Err(error) = self.keys.rewrap_pass(&self.postgres, &self.operator).await {
-                    tracing::warn!(%error, "operator key rewrap pass failed");
+        tokio::join!(self.claims.run(&self, stop.clone()), self.rewrap(&stop));
+    }
+
+    /// Rewrap rows still on an older key version every rewrap interval until
+    /// `stop`, each pass bounded by the runtime's pass and tenant budgets.
+    ///
+    /// Cancellation drops the pass in progress, rolling back its open tenant
+    /// transaction; the next pass (here or on another replica) retries it.
+    async fn rewrap(&self, stop: &CancellationToken) {
+        let budget = RewrapBudget {
+            pass: self.limits.rewrap_pass_budget,
+            tenant: self.limits.rewrap_tenant_budget,
+        };
+        loop {
+            tokio::select! {
+                biased;
+                () = stop.cancelled() => return,
+                pass = self.keys.rewrap_pass(&self.postgres, &self.operator, budget) => {
+                    if let Err(error) = pass {
+                        tracing::warn!(%error, "operator key rewrap pass failed");
+                    }
                 }
-            }
-            let claimed = match self.claim_round(&stop, &abandon, &mut work).await {
-                Ok(claimed) => claimed,
-                Err(error) => {
-                    tracing::warn!(%error, "operator dispatch claim round failed");
-                    0
-                }
-            };
-            while let Some(finished) = work.try_join_next() {
-                reap(finished);
-            }
-            self.record_active();
-            if claimed > 0 {
-                continue;
             }
             tokio::select! {
-                () = stop.cancelled() => {}
-                () = tokio::time::sleep(self.limits.poll_interval) => {}
-                Some(finished) = work.join_next(), if !work.is_empty() => reap(finished),
+                () = stop.cancelled() => return,
+                () = tokio::time::sleep(self.limits.rewrap_interval) => {}
             }
         }
-        let drained = tokio::time::timeout(self.limits.drain_grace, async {
-            while let Some(finished) = work.join_next().await {
-                reap(finished);
-            }
-        })
-        .await;
-        if drained.is_err() {
-            tracing::warn!(
-                in_flight = work.len(),
-                "operator drain grace elapsed; releasing in-flight dispatches"
-            );
-            abandon.cancel();
-            while let Some(finished) = work.join_next().await {
-                reap(finished);
-            }
-        }
-        self.record_active();
-    }
-
-    /// Claim at most one dispatch for each due tenant that has capacity.
-    ///
-    /// A permit is taken before the claim and dropped unused when the tenant
-    /// had nothing claimable. A claim committed after `stop` fired is released
-    /// at once instead of being spawned.
-    ///
-    /// # Errors
-    /// Returns [`SqlError`] when the due-tenant list or a claim fails;
-    /// dispatches claimed earlier in the round are already spawned.
-    async fn claim_round(
-        self: &Arc<Self>,
-        stop: &CancellationToken,
-        abandon: &CancellationToken,
-        work: &mut JoinSet<()>,
-    ) -> Result<usize, SqlError> {
-        if self.permits.saturated() {
-            return Ok(0);
-        }
-        let tenants = tokio::select! {
-            biased;
-            () = stop.cancelled() => return Ok(0),
-            tenants = self.queue.due_tenants(&self.operator, TENANTS_PER_ROUND) => tenants?,
-        };
-        let mut claimed = 0;
-        for tenant in tenants {
-            if stop.is_cancelled() || self.permits.saturated() {
-                break;
-            }
-            let Some(permit) = self.permits.try_acquire(tenant) else {
-                continue;
-            };
-            let Some(dispatch) = self.claim(tenant, stop).await? else {
-                continue;
-            };
-            if stop.is_cancelled() {
-                if let Err(error) = self.settle(tenant, &dispatch, Attempt::Release).await {
-                    tracing::error!(dispatch_id = %dispatch.lease.dispatch_id, %error, "releasing a late operator claim failed; the lease will expire");
-                }
-                break;
-            }
-            claimed += 1;
-            work.spawn(Arc::clone(self).process(
-                tenant,
-                dispatch,
-                permit,
-                stop.clone(),
-                abandon.clone(),
-            ));
-        }
-        Ok(claimed)
-    }
-
-    /// Claim `tenant`'s next due dispatch in its own committed transaction.
-    ///
-    /// The uncommitted claim races `stop` and rolls back when `stop` wins; the
-    /// commit is not raced, so a committed claim is always returned.
-    ///
-    /// # Errors
-    /// Returns [`SqlError`] when the transaction or claim fails.
-    async fn claim(
-        &self,
-        tenant: DataTenantId,
-        stop: &CancellationToken,
-    ) -> Result<Option<ClaimedDispatch>, SqlError> {
-        let uncommitted = async {
-            let mut conn = self.postgres.tenant_conn(tenant).await?;
-            let dispatch = self.queue.claim(&mut conn).await?;
-            Ok::<_, SqlError>((conn, dispatch))
-        };
-        let (conn, dispatch) = tokio::select! {
-            biased;
-            () = stop.cancelled() => return Ok(None),
-            claimed = uncommitted => claimed?,
-        };
-        conn.commit().await?;
-        Ok(dispatch)
-    }
-
-    /// Attempt one claimed dispatch and apply its single settlement.
-    ///
-    /// Holds `permit` until settlement. `abandon` cancels the attempt and
-    /// releases the lease; a retryable failure observed after `stop` is also
-    /// released, since the process, not the dispatch, failed.
-    async fn process(
-        self: Arc<Self>,
-        tenant: DataTenantId,
-        dispatch: ClaimedDispatch,
-        permit: VerifierPermit,
-        stop: CancellationToken,
-        abandon: CancellationToken,
-    ) {
-        let _permit = permit;
-        let started = Instant::now();
-        let timeout = self.limits.operator_attempt_timeout.min(dispatch.remaining);
-        let attempt = tokio::select! {
-            () = abandon.cancelled() => Attempt::Release,
-            attempt = tokio::time::timeout(timeout, self.attempt(tenant, &dispatch, timeout)) => {
-                attempt.unwrap_or_else(|_| Attempt::retry(ATTEMPT_TIMED_OUT, "the delivery attempt exceeded its timeout"))
-            }
-        };
-        let attempt = match attempt {
-            Attempt::Retry { .. } if stop.is_cancelled() => Attempt::Release,
-            attempt => attempt,
-        };
-        let outcome = match self.settle(tenant, &dispatch, attempt).await {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                tracing::error!(dispatch_id = %dispatch.lease.dispatch_id, %error, "operator settlement failed; the lease will expire");
-                "settlement_failed"
-            }
-        };
-        tracing::info!(dispatch_id = %dispatch.lease.dispatch_id, attempt = dispatch.attempt, outcome, "operator dispatch attempt settled");
-        metrics::counter!(
-            crate::app::metrics::OPERATOR_DISPATCH_ATTEMPTS_TOTAL,
-            "outcome" => outcome
-        )
-        .increment(1);
-        metrics::histogram!(
-            crate::app::metrics::OPERATOR_DISPATCH_DURATION_SECONDS,
-            "outcome" => outcome
-        )
-        .record(started.elapsed().as_secs_f64());
     }
 
     /// Resolve, authorize, decrypt, and deliver one attempt.
@@ -515,7 +372,7 @@ impl OperatorWorker {
             .open(tenant, &stored)
             .await
             .map_err(|error| match error {
-                KeyError::Unavailable { .. } => store_down(),
+                KeyError::Unavailable { .. } | KeyError::Client => store_down(),
                 KeyError::Authentication { .. } => Attempt::terminal(
                     CREDENTIAL_INVALID,
                     "the stored credential failed authentication",
@@ -563,11 +420,79 @@ impl OperatorWorker {
         Ok(outcome)
     }
 
-    /// Publish the active-dispatch gauge.
-    fn record_active(&self) {
-        metrics::gauge!(crate::app::metrics::OPERATOR_ACTIVE_DISPATCHES).set(f64::from(
-            u32::try_from(self.permits.active()).unwrap_or(u32::MAX),
-        ));
+}
+
+impl LeasedWork for OperatorWorker {
+    type Claim = ClaimedDispatch;
+
+    const CAPABILITY: RuntimeCapability = RuntimeCapability::OperatorWorker;
+    const ACTIVE_GAUGE: &'static str = crate::app::metrics::OPERATOR_ACTIVE_DISPATCHES;
+
+    /// Tenants with due dispatches, most overdue first.
+    ///
+    /// # Errors
+    /// Returns [`SqlError`] when the cross-tenant read fails.
+    async fn due_tenants(&self, limit: i64) -> Result<Vec<DataTenantId>, SqlError> {
+        Ok(self.queue.due_tenants(&self.operator, limit).await?)
+    }
+
+    /// Claim the tenant's next due dispatch under a fresh lease.
+    ///
+    /// # Errors
+    /// Returns [`SqlError`] when the claim fails.
+    async fn claim(&self, conn: &mut TenantConn<'_>) -> Result<Option<ClaimedDispatch>, SqlError> {
+        Ok(self.queue.claim(conn).await?)
+    }
+
+    /// Attempt one claimed dispatch and apply its single settlement.
+    ///
+    /// The claim loop holds its permit until settlement. `abandon` cancels the attempt and
+    /// releases the lease; a retryable failure observed after `stop` is also
+    /// released, since the process, not the dispatch, failed.
+    async fn process(
+        self: Arc<Self>,
+        tenant: DataTenantId,
+        dispatch: ClaimedDispatch,
+        stop: CancellationToken,
+        abandon: CancellationToken,
+    ) {
+        let started = Instant::now();
+        let timeout = self.limits.operator_attempt_timeout.min(dispatch.remaining);
+        let attempt = tokio::select! {
+            () = abandon.cancelled() => Attempt::Release,
+            attempt = tokio::time::timeout(timeout, self.attempt(tenant, &dispatch, timeout)) => {
+                attempt.unwrap_or_else(|_| Attempt::retry(ATTEMPT_TIMED_OUT, "the delivery attempt exceeded its timeout"))
+            }
+        };
+        let attempt = match attempt {
+            Attempt::Retry { .. } if stop.is_cancelled() => Attempt::Release,
+            attempt => attempt,
+        };
+        let outcome = match self.settle(tenant, &dispatch, attempt).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                tracing::error!(dispatch_id = %dispatch.lease.dispatch_id, %error, "operator settlement failed; the lease will expire");
+                "settlement_failed"
+            }
+        };
+        tracing::info!(dispatch_id = %dispatch.lease.dispatch_id, attempt = dispatch.attempt, outcome, "operator dispatch attempt settled");
+        metrics::counter!(
+            crate::app::metrics::OPERATOR_DISPATCH_ATTEMPTS_TOTAL,
+            "outcome" => outcome
+        )
+        .increment(1);
+        metrics::histogram!(
+            crate::app::metrics::OPERATOR_DISPATCH_DURATION_SECONDS,
+            "outcome" => outcome
+        )
+        .record(started.elapsed().as_secs_f64());
+    }
+
+    /// Release a dispatch claimed after shutdown began, attempt refunded.
+    async fn release_late(&self, tenant: DataTenantId, dispatch: &ClaimedDispatch) {
+        if let Err(error) = self.settle(tenant, dispatch, Attempt::Release).await {
+            tracing::error!(dispatch_id = %dispatch.lease.dispatch_id, %error, "releasing a late operator claim failed; the lease will expire");
+        }
     }
 }
 
@@ -619,7 +544,7 @@ impl OperatorDelivery {
                     );
                 };
                 let body = serde_json::json!({ "channel": channel_id, "text": text });
-                self.slack(value.expose(), &body, timeout).await
+                self.slack(value, &body, timeout).await
             }
             (
                 OperatorAction::Notify {
@@ -677,18 +602,17 @@ impl OperatorDelivery {
                         seconds.min(MAX_ATTEMPT_SECONDS),
                     )))
                 });
-                let request = match HttpRequest::render(
-                    *method,
-                    url,
-                    headers,
-                    body.as_ref(),
-                    auth.as_ref().zip(secret),
-                    context,
-                ) {
-                    Ok(request) => request,
-                    Err(reason) => return Attempt::terminal(INVALID_REQUEST, &reason),
-                };
-                self.http(request, *expect_status, timeout).await
+                let request =
+                    match HttpRequest::render(*method, url, headers, body.as_ref(), context) {
+                        Ok(request) => request,
+                        Err(reason) => return Attempt::terminal(INVALID_REQUEST, &reason),
+                    };
+                let credential = auth.as_ref().zip(secret).map(|(auth, secret)| Credential {
+                    auth,
+                    secret,
+                });
+                self.http(request, credential, *expect_status, timeout)
+                    .await
             }
             (OperatorAction::Workflow { .. }, _) => {
                 Attempt::terminal(OPERATOR_UNAVAILABLE, "the workflow action is not invocable")
@@ -700,15 +624,16 @@ impl OperatorDelivery {
         }
     }
 
-    /// `chat.postMessage` with the bot token; success is Slack's JSON `ok`.
-    async fn slack(&self, token: &str, body: &serde_json::Value, timeout: Duration) -> Attempt {
-        let mut headers = HeaderMap::new();
-        match bearer(token) {
-            Ok(value) => headers.insert(reqwest::header::AUTHORIZATION, value),
-            Err(attempt) => return attempt,
-        };
+    /// `chat.postMessage` with the bot token, attached after the endpoint is
+    /// screened; success is Slack's JSON `ok`.
+    async fn slack(
+        &self,
+        token: &SecretBearer,
+        body: &serde_json::Value,
+        timeout: Duration,
+    ) -> Attempt {
         let response = match self
-            .post_json(&self.endpoints.slack, headers, body, timeout)
+            .post_json(&self.endpoints.slack, Some(token), body, timeout)
             .await
         {
             Ok(response) => response,
@@ -736,7 +661,7 @@ impl OperatorDelivery {
     /// Events API v2 enqueue; the routing key rides in the body.
     async fn pager_duty(&self, body: &serde_json::Value, timeout: Duration) -> Attempt {
         match self
-            .post_json(&self.endpoints.pager_duty, HeaderMap::new(), body, timeout)
+            .post_json(&self.endpoints.pager_duty, None, body, timeout)
             .await
         {
             Ok(response) => status_failure(&response).unwrap_or(Attempt::Delivered),
@@ -745,10 +670,17 @@ impl OperatorDelivery {
     }
 
     /// Send an authored HTTP request, following at most [`MAX_REDIRECTS`]
-    /// same-origin redirects, each re-screened before the credential rides.
+    /// same-origin redirects.
+    ///
+    /// Each effective URL, initial or redirected, is resolved, screened, and
+    /// pinned first; only then is the already-authorized `credential`
+    /// rendered onto the request built from that screened client. A blocked,
+    /// unresolved, or cross-origin destination therefore never sees a
+    /// credential header built.
     async fn http(
         &self,
         mut request: HttpRequest,
+        credential: Option<Credential<'_>>,
         expect_status: Option<u16>,
         timeout: Duration,
     ) -> Attempt {
@@ -760,6 +692,12 @@ impl OperatorDelivery {
             let mut builder = client
                 .request(request.method.clone(), request.url.clone())
                 .headers(request.headers.clone());
+            if let Some(credential) = &credential {
+                builder = match credential.attach(builder) {
+                    Ok(builder) => builder,
+                    Err(attempt) => return attempt,
+                };
+            }
             if let Some(body) = &request.body {
                 builder = builder.json(body);
             }
@@ -795,21 +733,25 @@ impl OperatorDelivery {
         Attempt::terminal(DESTINATION_REJECTED, "the destination redirected too often")
     }
 
-    /// POST `body` as JSON to `url` through a screened client.
+    /// POST `body` as JSON to `url` through a screened client, attaching
+    /// `bearer` as a sensitive `Authorization` header only after screening.
     ///
     /// # Errors
-    /// Returns the classified attempt when screening or the send fails.
+    /// Returns the classified attempt when screening, the bearer header, or
+    /// the send fails.
     async fn post_json(
         &self,
         url: &Url,
-        headers: HeaderMap,
+        bearer_token: Option<&SecretBearer>,
         body: &serde_json::Value,
         timeout: Duration,
     ) -> Result<Response, Attempt> {
-        self.client(url, timeout)
-            .await?
-            .post(url.clone())
-            .headers(headers)
+        let mut builder = self.client(url, timeout).await?.post(url.clone());
+        if let Some(token) = bearer_token {
+            builder = builder.header(reqwest::header::AUTHORIZATION, bearer(token.expose())?);
+            credential_attached();
+        }
+        builder
             .json(body)
             .send()
             .await
@@ -839,32 +781,35 @@ impl OperatorDelivery {
     }
 }
 
-/// One rendered HTTP Operator request with its credential attached.
+/// One rendered HTTP Operator request without its credential.
+///
+/// Holds only nonsecret state; the credential is added per screened send by
+/// [`Credential::attach`].
 struct HttpRequest {
     /// Method.
     method: Method,
     /// Effective URL; its origin equals the template's literal origin.
     url: Url,
-    /// Rendered authored headers, the credential, and `Idempotency-Key`.
+    /// Rendered authored headers and `Idempotency-Key`.
     headers: HeaderMap,
     /// Rendered JSON body.
     body: Option<serde_json::Value>,
 }
 
 impl HttpRequest {
-    /// Render the authored request against `context` and attach `credential`.
+    /// Render the authored request against `context`.
     ///
     /// The effective URL must keep the template's literal origin, so a
-    /// rendered value can never re-point a credential.
+    /// rendered value can never re-point a credential. No credential is
+    /// touched here.
     ///
     /// # Errors
-    /// Returns a reason for an invalid template, URL, header, or credential.
+    /// Returns a reason for an invalid template, URL, or header.
     fn render(
         method: HttpMethod,
         url: &str,
         headers: &std::collections::BTreeMap<String, String>,
         body: Option<&serde_json::Value>,
-        credential: Option<(&HttpAuth, &ConnectionSecret)>,
         context: &OperatorFailureContext,
     ) -> Result<Self, String> {
         let origin = operator_url_origin(url)?;
@@ -878,35 +823,6 @@ impl HttpRequest {
                 HeaderName::try_from(name.as_str()).map_err(|error| error.to_string())?,
                 HeaderValue::try_from(context.render(value)?).map_err(|error| error.to_string())?,
             );
-        }
-        match credential {
-            None => {}
-            Some((HttpAuth::Bearer { .. }, ConnectionSecret::Token { value })) => {
-                rendered.insert(
-                    reqwest::header::AUTHORIZATION,
-                    bearer(value.expose()).map_err(|_| "the bearer token is not a header value")?,
-                );
-            }
-            Some((HttpAuth::Basic { .. }, ConnectionSecret::Basic { username, password })) => {
-                use base64::Engine as _;
-                let pair = base64::engine::general_purpose::STANDARD.encode(format!(
-                    "{}:{}",
-                    username.expose(),
-                    password.expose()
-                ));
-                rendered.insert(
-                    reqwest::header::AUTHORIZATION,
-                    sensitive(&format!("Basic {pair}"))
-                        .map_err(|()| "the basic credential is not a header value")?,
-                );
-            }
-            Some((HttpAuth::Header { name, .. }, ConnectionSecret::Token { value })) => {
-                rendered.insert(
-                    HeaderName::try_from(name.as_str()).map_err(|error| error.to_string())?,
-                    sensitive(value.expose()).map_err(|()| "the header credential is invalid")?,
-                );
-            }
-            Some(_) => return Err("the stored credential does not fit the auth scheme".to_owned()),
         }
         rendered.insert(
             HeaderName::from_static("idempotency-key"),
@@ -927,6 +843,62 @@ impl HttpRequest {
         })
     }
 }
+
+/// An already-authorized HTTP credential not yet rendered into a header.
+struct Credential<'a> {
+    /// Authored auth scheme.
+    auth: &'a HttpAuth,
+    /// Decrypted secret of this attempt.
+    secret: &'a ConnectionSecret,
+}
+
+impl Credential<'_> {
+    /// Render the credential as a sensitive header onto `builder`, which
+    /// must come from a client screened and pinned to its URL.
+    ///
+    /// # Errors
+    /// Returns a terminal [`CREDENTIAL_INVALID`] when the secret does not fit
+    /// the scheme or is not a valid header value.
+    fn attach(&self, builder: RequestBuilder) -> Result<RequestBuilder, Attempt> {
+        let invalid = |message: &str| Attempt::terminal(CREDENTIAL_INVALID, message);
+        let (name, value) = match (self.auth, self.secret) {
+            (HttpAuth::Bearer { .. }, ConnectionSecret::Token { value }) => {
+                (reqwest::header::AUTHORIZATION, bearer(value.expose())?)
+            }
+            (HttpAuth::Basic { .. }, ConnectionSecret::Basic { username, password }) => {
+                let pair = base64::engine::general_purpose::STANDARD.encode(format!(
+                    "{}:{}",
+                    username.expose(),
+                    password.expose()
+                ));
+                (
+                    reqwest::header::AUTHORIZATION,
+                    sensitive(&format!("Basic {pair}"))
+                        .map_err(|()| invalid("the basic credential is not a header value"))?,
+                )
+            }
+            (HttpAuth::Header { name, .. }, ConnectionSecret::Token { value }) => (
+                HeaderName::try_from(name.as_str())
+                    .map_err(|_| invalid("the credential header name is invalid"))?,
+                sensitive(value.expose())
+                    .map_err(|()| invalid("the header credential is invalid"))?,
+            ),
+            _ => return Err(invalid("the stored credential does not fit the auth scheme")),
+        };
+        credential_attached();
+        Ok(builder.header(name, value))
+    }
+}
+
+/// Count one credential attachment in unit tests; nothing in production.
+#[cfg(test)]
+fn credential_attached() {
+    tests::ATTACHED.with(|attached| attached.set(attached.get() + 1));
+}
+
+/// Count one credential attachment in unit tests; nothing in production.
+#[cfg(not(test))]
+const fn credential_attached() {}
 
 /// Every inline Operator body in `owner`'s verification bindings.
 fn inline_operators(owner: &Spec) -> impl Iterator<Item = &OperatorSpec> {
@@ -1064,19 +1036,162 @@ const fn fenced(applied: bool, label: &'static str) -> &'static str {
     if applied { label } else { "stale_lease" }
 }
 
-/// Log a delivery task that panicked; its lease expires into a reclaim.
-fn reap(finished: Result<(), JoinError>) {
-    if let Err(error) = finished
-        && error.is_panic()
-    {
-        tracing::error!(%error, "operator delivery panicked; its lease will expire");
-    }
-}
-
 /// A dispatch failure with a stable `code` and diagnostic `message`.
 fn failure(code: &str, message: &str) -> VerificationError {
     VerificationError {
         code: code.to_owned(),
         message: message.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! HTTP credentials are rendered only onto requests built from a client
+    //! already screened and pinned to that effective URL.
+
+    use std::cell::Cell;
+
+    use chrono::Utc;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wyrd_auth_oidc::AddressPolicy;
+    use wyrd_spec::ids::{
+        BindingId, CardUid, OperatorDispatchId, VerificationResultId, VerificationRunId,
+    };
+    use wyrd_spec::verification::VerificationVerdict;
+
+    use super::*;
+
+    thread_local! {
+        /// Credential headers built on this test thread.
+        pub(super) static ATTACHED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Credential headers built on this thread so far.
+    fn attached() -> usize {
+        ATTACHED.with(Cell::get)
+    }
+
+    /// A frozen failure context fixture.
+    fn context() -> OperatorFailureContext {
+        OperatorFailureContext {
+            dispatch_id: OperatorDispatchId::new_v7(),
+            run_id: VerificationRunId::new_v7(),
+            result_id: VerificationResultId::new_v7(),
+            binding_id: BindingId::new_v7(),
+            verifier_uid: CardUid::from_uuid(uuid::Uuid::now_v7()).expect("v7 card uid"),
+            verifier_ref: "verifier/drift@1.0.0".to_owned(),
+            subject_uid: CardUid::from_uuid(uuid::Uuid::now_v7()).expect("v7 card uid"),
+            subject_ref: "service/owner@1.0.0".to_owned(),
+            verdict: VerificationVerdict::Failed,
+            completed_at: Utc::now(),
+            summary: "failed".to_owned(),
+        }
+    }
+
+    /// An HTTP Operator posting to `url` with a header credential.
+    ///
+    /// # Panics
+    /// Panics when the fixture spec does not parse.
+    fn hook(url: &str) -> OperatorSpec {
+        serde_json::from_value(serde_json::json!({
+            "kind": "http", "method": "post", "url": url,
+            "auth": { "scheme": "header", "name": "x-api-key", "connection": "hooks" },
+        }))
+        .expect("hook spec parses")
+    }
+
+    /// The header credential fixture.
+    fn secret() -> ConnectionSecret {
+        ConnectionSecret::Token {
+            value: SecretBearer::new("hook-key".to_owned()),
+        }
+    }
+
+    /// Deliver `url` under `policy` and return the attempt with the number
+    /// of credential headers built for it.
+    async fn deliver(policy: AddressPolicy, url: &str) -> (Attempt, usize) {
+        let delivery = OperatorDelivery::new(ScreenedHttp::new(policy), ProviderEndpoints::default());
+        let before = attached();
+        let attempt = delivery
+            .send(&hook(url), Some(&secret()), &context(), Duration::from_secs(5))
+            .await;
+        (attempt, attached() - before)
+    }
+
+    /// A blocked or unresolved initial URL fails before any credential header
+    /// is built or any request sent.
+    ///
+    /// # Panics
+    /// Panics when a credential is attached or a request reaches the mock.
+    #[tokio::test]
+    async fn blocked_and_unresolved_destinations_never_get_a_credential() {
+        let mock = MockServer::start().await;
+        let (blocked, built) =
+            deliver(AddressPolicy::BlockInternal, &format!("{}/hook", mock.uri())).await;
+        assert!(
+            matches!(&blocked, Attempt::Terminal(error) if error.code == DESTINATION_REJECTED),
+            "{blocked:?}"
+        );
+        assert_eq!(built, 0, "a blocked destination gets no credential");
+        let (unresolved, built) =
+            deliver(AddressPolicy::AllowInternal, "https://wyrd-unresolvable.invalid/hook").await;
+        assert!(
+            matches!(&unresolved, Attempt::Retry { error, .. } if error.code == DESTINATION_UNREACHABLE),
+            "{unresolved:?}"
+        );
+        assert_eq!(built, 0, "an unresolved destination gets no credential");
+        assert!(mock.received_requests().await.expect("recorded").is_empty());
+    }
+
+    /// An allowed destination and each same-origin redirect are screened
+    /// before their own credential attachment and receive the header; a
+    /// cross-origin redirect is refused without attaching or sending.
+    ///
+    /// # Panics
+    /// Panics when a credential count, header, or outcome differs.
+    #[tokio::test]
+    async fn each_screened_hop_attaches_its_own_credential() {
+        let mock = MockServer::start().await;
+        let other = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/start"))
+            .respond_with(ResponseTemplate::new(307).insert_header("location", "/next"))
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/next"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/away"))
+            .respond_with(
+                ResponseTemplate::new(307).insert_header("location", format!("{}/stolen", other.uri())),
+            )
+            .mount(&mock)
+            .await;
+        let (followed, built) =
+            deliver(AddressPolicy::AllowInternal, &format!("{}/start", mock.uri())).await;
+        assert_eq!(followed, Attempt::Delivered);
+        assert_eq!(built, 2, "each hop attaches after its own screen");
+        let keys: Vec<_> = mock
+            .received_requests()
+            .await
+            .expect("recorded")
+            .iter()
+            .map(|request| request.headers.get("x-api-key").cloned())
+            .collect();
+        assert_eq!(keys.len(), 2);
+        assert!(keys.iter().all(|key| key.as_ref().is_some_and(|key| key == "hook-key")));
+
+        let (refused, built) =
+            deliver(AddressPolicy::AllowInternal, &format!("{}/away", mock.uri())).await;
+        assert!(
+            matches!(&refused, Attempt::Terminal(error) if error.code == DESTINATION_REJECTED),
+            "{refused:?}"
+        );
+        assert_eq!(built, 1, "the refused redirect target gets no credential");
+        assert!(other.received_requests().await.expect("recorded").is_empty());
     }
 }

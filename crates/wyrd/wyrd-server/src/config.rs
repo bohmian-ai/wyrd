@@ -1874,9 +1874,11 @@ impl OperatorKeysConfig {
     ///
     /// # Errors
     /// Returns [`ConfigError::Invalid`] when `file` has no `dir`, `vault` has
-    /// no usable address or token, both token forms are set, or a
-    /// multi-tenant production deployment uses anything but Vault.
-    fn validate(&self, multi_tenant_production: bool) -> Result<(), ConfigError> {
+    /// no usable address or token, both token forms are set, a production
+    /// deployment names a plaintext `http` Vault address, or a multi-tenant
+    /// production deployment uses anything but Vault.
+    fn validate(&self, production: bool, multi_tenant: bool) -> Result<(), ConfigError> {
+        let multi_tenant_production = production && multi_tenant;
         let invalid = |message: &str| {
             Err(ConfigError::Invalid {
                 message: format!("verification.operator_keys: {message}"),
@@ -1901,7 +1903,14 @@ impl OperatorKeysConfig {
                     );
                 };
                 match url::Url::parse(&vault.addr) {
-                    Ok(url) if matches!(url.scheme(), "http" | "https") => {}
+                    Ok(url) if url.scheme() == "https" => {}
+                    Ok(url) if url.scheme() == "http" && !production => {}
+                    Ok(url) if url.scheme() == "http" => {
+                        return invalid(
+                            "production requires an https vault.addr; plaintext http is \
+                             limited to non-production local fixtures",
+                        );
+                    }
                     _ => return invalid("vault.addr must be an http(s) URL"),
                 }
                 match (&vault.token_file, &vault.token) {
@@ -2836,7 +2845,8 @@ impl WyrdServerConfig {
         let serves_api = self.role.serves_api();
         if serves_api {
             self.verification.operator_keys.validate(
-                self.deployment_profile.is_production() && self.auth.tenant_slug.is_none(),
+                self.deployment_profile.is_production(),
+                self.auth.tenant_slug.is_none(),
             )?;
         }
         if self.forge.per_tenant_active_cap == Some(0) {
@@ -3762,6 +3772,28 @@ minimum_slots = 2
             }),
             ..OperatorKeysConfig::default()
         }
+    }
+
+    /// Production refuses a plaintext Vault address before any token or key
+    /// crosses it and accepts HTTPS; plaintext stays available only to a
+    /// non-production local fixture.
+    #[test]
+    fn production_vault_requires_https() {
+        let directory = tempfile::tempdir().expect("key temp directory");
+        let mut keys = production_operator_keys(directory.path());
+        keys.validate(true, true).expect("https Vault validates");
+        if let Some(vault) = &mut keys.vault {
+            vault.addr = "http://vault.internal:8200".to_owned();
+        }
+        for multi_tenant in [true, false] {
+            let refused = keys
+                .validate(true, multi_tenant)
+                .expect_err("production refuses plaintext Vault")
+                .to_string();
+            assert!(refused.contains("https"), "{refused}");
+        }
+        keys.validate(false, true)
+            .expect("a development fixture may use plaintext Vault");
     }
 
     /// Proves production accepts only a complete maintainer-approved profile.

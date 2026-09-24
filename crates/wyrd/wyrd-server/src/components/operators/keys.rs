@@ -21,7 +21,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use base64::Engine as _;
+use reqwest::Client;
 use secrecy::ExposeSecret as _;
+use serde_json::Value;
+use sqlx::Error as SqlxError;
 use tokio::time::Instant;
 use wyrd_crypt::{EncryptedPayload, Envelope, SecretKey};
 use wyrd_spec::DataTenantId;
@@ -232,7 +235,7 @@ pub struct OperatorKeys {
     active_version: i32,
     /// Bounded, non-redirecting HTTP client for Vault reads; built only for
     /// the Vault source.
-    http: Option<reqwest::Client>,
+    http: Option<Client>,
 }
 
 impl Default for OperatorKeys {
@@ -285,7 +288,7 @@ impl OperatorKeys {
             OperatorKeySource::Vault => {
                 wyrd_tls::install_crypto_provider().map_err(|_| KeyError::Client)?;
                 Some(
-                    reqwest::Client::builder()
+                    Client::builder()
                         .timeout(VAULT_TIMEOUT)
                         .redirect(reqwest::redirect::Policy::none())
                         .build()
@@ -392,10 +395,10 @@ impl OperatorKeys {
         if !status.is_success() {
             return Err(KeyFailure::Refused);
         }
-        let body: serde_json::Value = response.json().await.map_err(|_| KeyFailure::Malformed)?;
+        let body: Value = response.json().await.map_err(|_| KeyFailure::Malformed)?;
         let key = body
             .pointer("/data/data/key")
-            .and_then(serde_json::Value::as_str)
+            .and_then(Value::as_str)
             .ok_or(KeyFailure::Malformed)?;
         Ok(Zeroizing::new(key.to_owned()))
     }
@@ -483,7 +486,7 @@ impl OperatorKeys {
         tenant: DataTenantId,
     ) -> Result<usize, KeyError> {
         let active = self.active_version();
-        let database = |_: sqlx::Error| self.unavailable(active, KeyFailure::Database);
+        let database = |_: SqlxError| self.unavailable(active, KeyFailure::Database);
         let stale = stale_key_connections(conn, active, REWRAP_BATCH)
             .await
             .map_err(database)?;
@@ -547,7 +550,7 @@ impl OperatorKeys {
         operator: &OperatorPool,
         pass_budget: Duration,
         tenant_budget: Duration,
-    ) -> Result<usize, sqlx::Error> {
+    ) -> Result<usize, SqlxError> {
         let deadline = Instant::now() + pass_budget;
         let active = self.active_version();
         let Ok(discovered) =
@@ -668,12 +671,13 @@ mod tests {
     //! Key decoding, file permissions, selector-free failures, Vault reads,
     //! nonblocking file reads, sealing, and context binding.
 
-    use std::io::Write as _;
+    use std::io::{self, Write};
     use std::num::NonZeroU32;
     use std::sync::{Arc, Mutex};
 
     use chrono::Utc;
     use secrecy::SecretString;
+    use tracing_subscriber::fmt::MakeWriter;
     use uuid::Uuid;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -759,20 +763,20 @@ mod tests {
         }
     }
 
-    impl std::io::Write for Captured {
+    impl Write for Captured {
         /// Append `buf` to the sink.
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             self.0.lock().expect("log sink").extend_from_slice(buf);
             Ok(buf.len())
         }
 
         /// Nothing is buffered.
-        fn flush(&mut self) -> std::io::Result<()> {
+        fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
     }
 
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+    impl<'a> MakeWriter<'a> for Captured {
         type Writer = Self;
 
         /// A handle onto the shared sink.

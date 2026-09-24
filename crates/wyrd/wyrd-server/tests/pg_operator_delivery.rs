@@ -21,7 +21,7 @@ use url::Url;
 use uuid::Uuid;
 use vala_drift::{DriftReport, DriftVerdict, FeatureDriftReport};
 use wiremock::matchers::{body_partial_json, method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request as MockRequest, ResponseTemplate};
 use wyrd_server::components::operators::keys::OperatorKeys;
 use wyrd_server::config::{OperatorKeySource, OperatorKeysConfig, VaultKeysConfig};
 use wyrd_server::state::AppState;
@@ -372,7 +372,7 @@ impl Delivery {
     ///
     /// # Panics
     /// Panics when request recording is disabled.
-    async fn requests(&self, route: &str) -> Vec<wiremock::Request> {
+    async fn requests(&self, route: &str) -> Vec<MockRequest> {
         self.mock
             .received_requests()
             .await

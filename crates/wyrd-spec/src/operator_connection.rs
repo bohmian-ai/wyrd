@@ -7,11 +7,12 @@
 //! the clear. [`ConnectionSecret`] is the plaintext the server encrypts and is
 //! never a wire response.
 
-use std::fmt;
+use std::fmt::{self, Display, Formatter};
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
+use url::Url;
 
 use crate::auth::SecretBearer;
 use crate::card::operator::FORBIDDEN_HTTP_HEADERS;
@@ -89,7 +90,7 @@ impl HttpsOrigin {
     /// Returns [`OriginError`] for an unparsable URL, a scheme other than
     /// `https` (or loopback `http`), userinfo, or any path, query, or fragment.
     pub fn parse(value: &str) -> Result<Self, OriginError> {
-        let url = url::Url::parse(value).map_err(|error| OriginError(error.to_string()))?;
+        let url = Url::parse(value).map_err(|error| OriginError(error.to_string()))?;
         Self::of(&url, true)
     }
 
@@ -97,12 +98,12 @@ impl HttpsOrigin {
     ///
     /// # Errors
     /// Returns [`OriginError`] for a disallowed scheme, no host, or userinfo.
-    pub fn of_url(url: &url::Url) -> Result<Self, OriginError> {
+    pub fn of_url(url: &Url) -> Result<Self, OriginError> {
         Self::of(url, false)
     }
 
     /// Build the origin of `url`, refusing any trailing component when `bare`.
-    fn of(url: &url::Url, bare: bool) -> Result<Self, OriginError> {
+    fn of(url: &Url, bare: bool) -> Result<Self, OriginError> {
         let loopback = match url.host() {
             Some(url::Host::Domain(host)) => host == "localhost",
             Some(url::Host::Ipv4(addr)) => addr.is_loopback(),
@@ -132,9 +133,9 @@ impl HttpsOrigin {
     }
 }
 
-impl fmt::Display for HttpsOrigin {
+impl Display for HttpsOrigin {
     /// Write the normalized `https://host[:port]` origin exactly as parsed.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
 }
@@ -147,7 +148,7 @@ impl<'de> Deserialize<'de> for HttpsOrigin {
     /// Returns the deserializer's error when the value is not a string, or a
     /// custom serde error carrying the [`OriginError`] when it is not an
     /// allowed `https` origin.
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let value = String::deserialize(deserializer)?;
         Self::parse(&value).map_err(serde::de::Error::custom)
     }

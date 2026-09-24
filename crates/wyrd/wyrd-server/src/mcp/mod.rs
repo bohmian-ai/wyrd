@@ -19,13 +19,15 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, ErrorCode, ErrorData, InitializeResult,
-    ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ErrorCode, ErrorData,
+    InitializeResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities,
+    ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{RoleServer, ServerHandler};
+use serde::Serialize;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 
@@ -357,8 +359,8 @@ fn missing_context(extension: &'static str) -> WyrdError {
 ///
 /// # Errors
 /// Returns an internal error when the answer cannot be serialized.
-fn structured<T: serde::Serialize>(value: &T) -> Result<rmcp::model::CallToolResult, WyrdError> {
-    Ok(rmcp::model::CallToolResult::structured(
+fn structured<T: Serialize>(value: &T) -> Result<CallToolResult, WyrdError> {
+    Ok(CallToolResult::structured(
         serde_json::to_value(value).map_err(|error| {
             crate::http::error::internal_failure("tool answer could not be projected", &error)
         })?,

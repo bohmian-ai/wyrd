@@ -6,6 +6,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ops::Range;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -19,6 +20,7 @@ use base64::Engine as _;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use ed25519_dalek::VerifyingKey;
 use secrecy::{ExposeSecret, SecretString};
+use tempfile::TempDir;
 use thiserror::Error;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -69,7 +71,7 @@ use wyrd_server::boot::issuer::{seed_trusted_issuers, seed_workload_bindings};
 use wyrd_server::components::auth::audit_writer::{AuthzAuditWriter, NoopAuthzAuditWriter};
 use wyrd_server::config::{
     BifrostRuntimeConfig, BifrostRuntimeRole, BifrostTarget, DeploymentProfile, ForgeRuntimeConfig,
-    IssuerEntry, ServeMode, WorkloadBindingEntry,
+    IssuerEntry, OperatorKeySource, OperatorKeysConfig, ServeMode, WorkloadBindingEntry,
 };
 use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::query::scheduled::ScheduledQueryCaller;
@@ -270,7 +272,7 @@ pub struct WyrdTestServer {
 struct WyrdTestServerInner {
     fixture: Arc<PgFixture>,
     /// Lifetime guard of the generated Operator key directory, when used.
-    operator_keys_dir: Option<tempfile::TempDir>,
+    operator_keys_dir: Option<TempDir>,
     /// Lifetime guard retained only for local storage-backed servers.
     _storage_root: Option<Arc<tempfile::TempDir>>,
     /// Lifetime guard for a harness-created Bifrost data directory.
@@ -573,7 +575,7 @@ pub struct WyrdTestServerBuilder {
     /// Keep the server's audit publisher from retiring staged audit rows.
     audit_publication_disabled: bool,
     /// Operator connection key source; `None` generates a file key.
-    operator_keys: Option<wyrd_server::config::OperatorKeysConfig>,
+    operator_keys: Option<OperatorKeysConfig>,
 }
 
 /// Test-only file paths for one replica's Bifrost peer identity and trust root.
@@ -661,13 +663,7 @@ pub use crate::principal::Bootstrap;
 /// # Errors
 /// Returns [`WyrdTestServerError::Start`] when the directory or file cannot
 /// be created.
-fn generated_operator_keys() -> Result<
-    (
-        wyrd_server::config::OperatorKeysConfig,
-        Option<tempfile::TempDir>,
-    ),
-    WyrdTestServerError,
-> {
+fn generated_operator_keys() -> Result<(OperatorKeysConfig, Option<TempDir>), WyrdTestServerError> {
     let start = |error: std::io::Error| WyrdTestServerError::Start(error.to_string());
     let dir = tempfile::tempdir().map_err(start)?;
     let mut key = [0_u8; 32];
@@ -675,10 +671,10 @@ fn generated_operator_keys() -> Result<
     let path = dir.path().join("v1");
     std::fs::write(&path, base64::engine::general_purpose::STANDARD.encode(key)).map_err(start)?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(start)?;
-    let config = wyrd_server::config::OperatorKeysConfig {
-        source: wyrd_server::config::OperatorKeySource::File,
+    let config = OperatorKeysConfig {
+        source: OperatorKeySource::File,
         dir: Some(dir.path().to_path_buf()),
-        ..wyrd_server::config::OperatorKeysConfig::default()
+        ..OperatorKeysConfig::default()
     };
     Ok((config, Some(dir)))
 }
@@ -3476,11 +3472,8 @@ impl WyrdTestServer {
     /// Directory of the generated owner-only Operator key files (`v1`, ...),
     /// or `None` when the builder supplied its own key source.
     #[must_use]
-    pub fn operator_keys_dir_for_test(&self) -> Option<&std::path::Path> {
-        self.inner
-            .operator_keys_dir
-            .as_ref()
-            .map(tempfile::TempDir::path)
+    pub fn operator_keys_dir_for_test(&self) -> Option<&Path> {
+        self.inner.operator_keys_dir.as_ref().map(TempDir::path)
     }
 
     async fn raw_call(
@@ -3803,10 +3796,7 @@ impl WyrdTestServerBuilder {
     /// server's [`WyrdTestServer::operator_keys_dir_for_test`] with a newer
     /// active version.
     #[must_use]
-    pub fn with_operator_keys_for_test(
-        mut self,
-        config: wyrd_server::config::OperatorKeysConfig,
-    ) -> Self {
+    pub fn with_operator_keys_for_test(mut self, config: OperatorKeysConfig) -> Self {
         self.operator_keys = Some(config);
         self
     }

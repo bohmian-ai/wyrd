@@ -4,6 +4,7 @@
 //! reply. Screening, credential attachment, response bounds, and HTTP status
 //! classification stay with [`OperatorDelivery`](super::OperatorDelivery).
 
+use serde_json::Value;
 use wyrd_spec::card::operator::OperatorFailureContext;
 
 use super::{Attempt, INVALID_REQUEST, PROVIDER_REJECTED, PROVIDER_TRANSIENT};
@@ -26,7 +27,7 @@ pub(super) fn message(
     channel_id: &str,
     text: &str,
     context: &OperatorFailureContext,
-) -> Result<serde_json::Value, Attempt> {
+) -> Result<Value, Attempt> {
     let text = context
         .render(text)
         .map_err(|_| Attempt::terminal(INVALID_REQUEST, "the Slack text template is invalid"))?;
@@ -37,8 +38,8 @@ pub(super) fn message(
 /// otherwise a retry for a Slack-declared transient error and a terminal
 /// rejection for any other (or missing) error code.
 pub(super) fn outcome(reply: &[u8]) -> Attempt {
-    let reply: serde_json::Value = serde_json::from_slice(reply).unwrap_or_default();
-    if reply["ok"] == serde_json::Value::Bool(true) {
+    let reply: Value = serde_json::from_slice(reply).unwrap_or_default();
+    if reply["ok"] == Value::Bool(true) {
         return Attempt::Delivered;
     }
     let code = reply["error"].as_str().unwrap_or("unknown_error");

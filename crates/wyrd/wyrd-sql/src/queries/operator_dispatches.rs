@@ -20,7 +20,7 @@ use serde_json::Value;
 use sqlx::Error as SqlxError;
 use sqlx::types::{Json, Uuid};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::ids::{CardUid, OperatorDispatchId, VerificationRunId};
+use wyrd_spec::ids::{CardUid, IdError, OperatorDispatchId, VerificationRunId};
 use wyrd_spec::verification::{FrozenTarget, VerificationError};
 
 use crate::queries::verifier_runs::{LeaseToken, RetryOutcome, Settlement, settlement};
@@ -371,7 +371,7 @@ impl ClaimRow {
     /// # Errors
     /// Returns [`SqlxError::Decode`] for malformed identities.
     fn into_claimed(self, token: LeaseToken) -> Result<ClaimedDispatch, SqlxError> {
-        let decode = |error: wyrd_spec::ids::IdError| SqlxError::Decode(Box::new(error));
+        let decode = |error: IdError| SqlxError::Decode(Box::new(error));
         let operator = match (self.operator_uid, self.operator_digest) {
             (Some(uid), None) => FrozenTarget::Uid(CardUid::from_uuid(uid).map_err(decode)?),
             (None, Some(digest)) => FrozenTarget::Digest(digest),

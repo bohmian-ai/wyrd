@@ -12,6 +12,8 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, Response, StatusCode, header};
 use serde_json::{Value, json};
 use uuid::Uuid;
+use wiremock::{Mock, MockServer, ResponseTemplate};
+use wyrd_server::components::operators::keys::OperatorKeys;
 use wyrd_spec::ids::DataTenantId;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
@@ -681,33 +683,32 @@ async fn registration_binds_exact_connection_authority() {
 ///
 /// # Panics
 /// Panics when the owner cannot be built.
-fn vault_keys(addr: &str) -> wyrd_server::components::operators::keys::OperatorKeys {
-    wyrd_server::components::operators::keys::OperatorKeys::new(
-        wyrd_server::config::OperatorKeysConfig {
-            source: wyrd_server::config::OperatorKeySource::Vault,
-            vault: Some(wyrd_server::config::VaultKeysConfig {
-                addr: addr.to_owned(),
-                mount: "secret".to_owned(),
-                prefix: "wyrd/operator-keys".to_owned(),
-                token_file: None,
-                token: Some(secrecy::SecretString::from("boot-vault-token")),
-            }),
-            ..wyrd_server::config::OperatorKeysConfig::default()
-        },
-    )
+fn vault_keys(addr: &str) -> OperatorKeys {
+    OperatorKeys::new(wyrd_server::config::OperatorKeysConfig {
+        source: wyrd_server::config::OperatorKeySource::Vault,
+        vault: Some(wyrd_server::config::VaultKeysConfig {
+            addr: addr.to_owned(),
+            mount: "secret".to_owned(),
+            prefix: "wyrd/operator-keys".to_owned(),
+            token_file: None,
+            token: Some(secrecy::SecretString::from("boot-vault-token")),
+        }),
+        ..wyrd_server::config::OperatorKeysConfig::default()
+    })
     .expect("vault keys build")
 }
 
 /// A local Vault answering every tenant's version-1 key with `key`.
-async fn vault_serving(key: Option<String>) -> wiremock::MockServer {
+async fn vault_serving(key: Option<String>) -> MockServer {
     use wiremock::matchers::{method, path_regex};
-    let vault = wiremock::MockServer::start().await;
+    let vault = MockServer::start().await;
     let response = match key {
-        Some(key) => wiremock::ResponseTemplate::new(200)
-            .set_body_json(json!({ "data": { "data": { "key": key } } })),
-        None => wiremock::ResponseTemplate::new(404),
+        Some(key) => {
+            ResponseTemplate::new(200).set_body_json(json!({ "data": { "data": { "key": key } } }))
+        }
+        None => ResponseTemplate::new(404),
     };
-    wiremock::Mock::given(method("GET"))
+    Mock::given(method("GET"))
         .and(path_regex(
             r"^/v1/secret/data/wyrd/operator-keys/[0-9a-f-]+/1$",
         ))

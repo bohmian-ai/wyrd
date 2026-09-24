@@ -89,16 +89,25 @@ mod pg_tests {
             )
             .await?;
 
-        let names: Vec<String> = client
-            .list_all_tools()
-            .await?
-            .iter()
-            .map(|tool| tool.name.to_string())
-            .collect();
+        let tools = client.list_all_tools().await?;
+        let names: Vec<String> = tools.iter().map(|tool| tool.name.to_string()).collect();
         assert_eq!(
             names, ADVERTISED_TOOLS,
             "an ordinary server advertises exactly the Bifrost, principal, Card, and \
              verification read tools, this admin caller's write tools, and no test probe"
+        );
+        let list_connections = tools
+            .iter()
+            .find(|tool| tool.name == "operator_connections.list")
+            .ok_or("the catalog advertises the Operator connection list tool")?;
+        assert_eq!(
+            list_connections.description.as_deref(),
+            Some(
+                "List this tenant's Operator provider connections as redacted metadata: ID, \
+                 provider, name, status, and nonsecret config. Secrets are never returned. \
+                 Requires operators:read."
+            ),
+            "the list descriptor promises only fields the redacted view returns"
         );
 
         let listed = structured(

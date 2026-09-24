@@ -16,12 +16,15 @@
 //! the request built from a client already screened and pinned to that
 //! effective URL.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, RETRY_AFTER};
+use reqwest::{Client, Error as ReqwestError};
 use reqwest::{Method, RequestBuilder, Response, StatusCode};
+use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 use wyrd_auth_oidc::{ScreenError, ScreenedHttp};
@@ -602,12 +605,7 @@ impl OperatorDelivery {
 
     /// `chat.postMessage` with the bot token, attached after the endpoint is
     /// screened; a 2xx reply is classified by [`slack::outcome`].
-    async fn slack(
-        &self,
-        token: &SecretBearer,
-        body: &serde_json::Value,
-        timeout: Duration,
-    ) -> Attempt {
+    async fn slack(&self, token: &SecretBearer, body: &Value, timeout: Duration) -> Attempt {
         let response = match self
             .post_json(&self.endpoints.slack, Some(token), body, timeout)
             .await
@@ -625,7 +623,7 @@ impl OperatorDelivery {
     }
 
     /// Events API v2 enqueue; the routing key rides in the body.
-    async fn pager_duty(&self, body: &serde_json::Value, timeout: Duration) -> Attempt {
+    async fn pager_duty(&self, body: &Value, timeout: Duration) -> Attempt {
         match self
             .post_json(&self.endpoints.pager_duty, None, body, timeout)
             .await
@@ -709,7 +707,7 @@ impl OperatorDelivery {
         &self,
         url: &Url,
         bearer_token: Option<&SecretBearer>,
-        body: &serde_json::Value,
+        body: &Value,
         timeout: Duration,
     ) -> Result<Response, Attempt> {
         let mut builder = self.client(url, timeout).await?.post(url.clone());
@@ -729,7 +727,7 @@ impl OperatorDelivery {
     /// # Errors
     /// Returns a terminal [`DESTINATION_REJECTED`] for a blocked address and a
     /// retry [`DESTINATION_UNREACHABLE`] when the name does not resolve.
-    async fn client(&self, url: &Url, timeout: Duration) -> Result<reqwest::Client, Attempt> {
+    async fn client(&self, url: &Url, timeout: Duration) -> Result<Client, Attempt> {
         self.http
             .with_timeout(timeout)
             .client_for(url)
@@ -759,7 +757,7 @@ struct HttpRequest {
     /// Rendered authored headers and `Idempotency-Key`.
     headers: HeaderMap,
     /// Rendered JSON body.
-    body: Option<serde_json::Value>,
+    body: Option<Value>,
 }
 
 impl HttpRequest {
@@ -774,8 +772,8 @@ impl HttpRequest {
     fn render(
         method: HttpMethod,
         url: &str,
-        headers: &std::collections::BTreeMap<String, String>,
-        body: Option<&serde_json::Value>,
+        headers: &BTreeMap<String, String>,
+        body: Option<&Value>,
         context: &OperatorFailureContext,
     ) -> Result<Self, String> {
         let origin = operator_url_origin(url)?;
@@ -899,19 +897,16 @@ fn inline_operators(owner: &Spec) -> impl Iterator<Item = &OperatorSpec> {
 ///
 /// # Errors
 /// Returns the first template error.
-fn render_json(
-    value: &serde_json::Value,
-    context: &OperatorFailureContext,
-) -> Result<serde_json::Value, String> {
+fn render_json(value: &Value, context: &OperatorFailureContext) -> Result<Value, String> {
     Ok(match value {
-        serde_json::Value::String(text) => serde_json::Value::String(context.render(text)?),
-        serde_json::Value::Array(items) => serde_json::Value::Array(
+        Value::String(text) => Value::String(context.render(text)?),
+        Value::Array(items) => Value::Array(
             items
                 .iter()
                 .map(|item| render_json(item, context))
                 .collect::<Result<_, _>>()?,
         ),
-        serde_json::Value::Object(map) => serde_json::Value::Object(
+        Value::Object(map) => Value::Object(
             map.iter()
                 .map(|(key, item)| Ok((key.clone(), render_json(item, context)?)))
                 .collect::<Result<_, String>>()?,
@@ -972,7 +967,7 @@ fn status_failure(response: &Response) -> Option<Attempt> {
 
 /// Classify a send that produced no response; the request may have been
 /// delivered, so every such failure retries (at-least-once).
-fn transport_failure(error: &reqwest::Error) -> Attempt {
+fn transport_failure(error: &ReqwestError) -> Attempt {
     if error.is_builder() {
         Attempt::terminal(INVALID_REQUEST, "the request could not be built")
     } else if error.is_timeout() {
@@ -989,7 +984,7 @@ fn transport_failure(error: &reqwest::Error) -> Attempt {
 ///
 /// # Errors
 /// Returns the transport error when the body stream fails.
-async fn bounded_body(mut response: Response) -> Result<Vec<u8>, reqwest::Error> {
+async fn bounded_body(mut response: Response) -> Result<Vec<u8>, ReqwestError> {
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await? {
         let take = (MAX_RESPONSE_BYTES - body.len()).min(chunk.len());

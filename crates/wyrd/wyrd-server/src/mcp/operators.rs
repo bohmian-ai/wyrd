@@ -10,6 +10,7 @@
 use rmcp::model::{CallToolResult, Tool};
 use schemars::JsonSchema;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use wyrd_runtime::Permission;
 use wyrd_spec::error::WyrdError;
@@ -78,8 +79,8 @@ pub(super) fn descriptors_unscoped() -> Vec<Tool> {
             LIST,
             "List Operator connections",
             "List this tenant's Operator provider connections as redacted metadata: ID, \
-             provider, name, status, nonsecret config, and secret version. Secrets are never \
-             returned. Requires operators:read.",
+             provider, name, status, and nonsecret config. Secrets are never returned. Requires \
+             operators:read.",
             true,
         ),
         tool::<IdArgs, OperatorConnectionView>(
@@ -132,7 +133,7 @@ pub(super) fn may_manage(caller: &Caller) -> bool {
 ///
 /// # Errors
 /// Returns [`WyrdError::OperatorConnectionInvalid`] naming only a position.
-fn decode_secret_args<T: serde::de::DeserializeOwned>(
+fn decode_secret_args<T: DeserializeOwned>(
     arguments: Option<JsonMap<String, JsonValue>>,
 ) -> Result<T, WyrdError> {
     let arguments = JsonValue::Object(arguments.unwrap_or_default());

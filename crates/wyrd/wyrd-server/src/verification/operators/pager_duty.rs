@@ -4,6 +4,7 @@
 //! status classification stay with [`OperatorDelivery`](super::OperatorDelivery);
 //! PagerDuty success is the HTTP status alone.
 
+use serde_json::Value;
 use wyrd_spec::auth::SecretBearer;
 use wyrd_spec::card::operator::{OperatorFailureContext, PagerDutySeverity};
 
@@ -25,7 +26,7 @@ pub(super) fn event(
     summary: &str,
     dedup_key: Option<&str>,
     context: &OperatorFailureContext,
-) -> Result<serde_json::Value, Attempt> {
+) -> Result<Value, Attempt> {
     let dedup = dedup_key.map_or_else(
         || Ok(context.dispatch_id.to_string()),
         |key| context.render(key),

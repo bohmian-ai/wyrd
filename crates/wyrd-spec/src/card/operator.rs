@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::error::WyrdError;
 use crate::ids::{
@@ -248,7 +249,7 @@ pub enum OperatorAction {
         headers: BTreeMap<String, String>,
         /// Optional structured JSON body; string values are templates.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        body: Option<serde_json::Value>,
+        body: Option<Value>,
         /// Credential authority; omitted for an unauthenticated request.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         auth: Option<HttpAuth>,
@@ -528,11 +529,11 @@ fn check_header_name(name: &str) -> Result<(), String> {
 }
 
 /// Validate every string template inside a JSON body.
-fn check_body_templates(value: &serde_json::Value) -> Result<(), String> {
+fn check_body_templates(value: &Value) -> Result<(), String> {
     match value {
-        serde_json::Value::String(text) => render_template(text, |_| Some(String::new())).map(drop),
-        serde_json::Value::Array(items) => items.iter().try_for_each(check_body_templates),
-        serde_json::Value::Object(map) => map.values().try_for_each(check_body_templates),
+        Value::String(text) => render_template(text, |_| Some(String::new())).map(drop),
+        Value::Array(items) => items.iter().try_for_each(check_body_templates),
+        Value::Object(map) => map.values().try_for_each(check_body_templates),
         _ => Ok(()),
     }
 }
@@ -547,12 +548,12 @@ mod tests {
     ///
     /// # Panics
     /// Panics when the fixture is not a valid Operator spec.
-    fn spec(value: serde_json::Value) -> OperatorSpec {
+    fn spec(value: Value) -> OperatorSpec {
         serde_json::from_value(value).expect("test_setup: operator spec parses")
     }
 
     /// Build an HTTP Operator with `url`, `headers`, and `auth`.
-    fn http(url: &str, headers: serde_json::Value, auth: serde_json::Value) -> OperatorSpec {
+    fn http(url: &str, headers: Value, auth: Value) -> OperatorSpec {
         let mut value = serde_json::json!({
             "kind": "http", "method": "post", "url": url, "headers": headers,
             "body": { "text": "{{ summary }}", "ids": ["{{run_id}}"] }
@@ -615,27 +616,27 @@ mod tests {
             (
                 "https://{{run_id}}.example.com/",
                 serde_json::json!({}),
-                serde_json::Value::Null,
+                Value::Null,
             ),
             (
                 "ftp://hooks.example.com/",
                 serde_json::json!({}),
-                serde_json::Value::Null,
+                Value::Null,
             ),
             (
                 "http://hooks.example.com/",
                 serde_json::json!({}),
-                serde_json::Value::Null,
+                Value::Null,
             ),
             (
                 "https://hooks.example.com/",
                 serde_json::json!({ "AUTHORIZATION": "x" }),
-                serde_json::Value::Null,
+                Value::Null,
             ),
             (
                 "https://hooks.example.com/",
                 serde_json::json!({ "Idempotency-Key": "x" }),
-                serde_json::Value::Null,
+                Value::Null,
             ),
             (
                 "https://hooks.example.com/",
@@ -695,7 +696,7 @@ mod tests {
         let open = http(
             "https://hooks.example.com/x",
             serde_json::json!({}),
-            serde_json::Value::Null,
+            Value::Null,
         );
         assert!(open.connection().is_none());
     }

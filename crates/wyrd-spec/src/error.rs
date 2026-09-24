@@ -1635,7 +1635,7 @@ pub enum WyrdError {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
-        details: serde_json::Value,
+        details: Value,
     },
     /// An Operator names a connection that is missing, disabled, of another provider, or of incompatible authority.
     #[error("[WYRD_SPEC_400_OPERATOR_CONNECTION_UNAVAILABLE] {message}")]
@@ -1649,7 +1649,7 @@ pub enum WyrdError {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
-        details: serde_json::Value,
+        details: Value,
     },
     /// No Operator connection with this identity is visible to the caller's tenant.
     #[error("[WYRD_OPERATOR_404_CONNECTION_NOT_FOUND] {message}")]

@@ -59,7 +59,7 @@ use crate::auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
 use crate::boot::data_root::{BifrostDataRoot, BifrostDataRootError};
 use crate::components::auth::audit_writer::RealAuthzAuditWriter;
 use crate::components::auth::{ServerAuth, ServerAuthz};
-use crate::config::{BifrostRuntimeRole, WorkloadBindingEntry};
+use crate::config::{BifrostRuntimeRole, WorkloadBindingEntry, WyrdServerConfig};
 use crate::oracle::{
     OraclePeerAuthority, OracleQueryAudit, PostgresPeerSecurityAudit, ServerBifrostPeerCredentials,
 };
@@ -1224,7 +1224,7 @@ pub struct BootedServer {
 /// production config has already returned `ConfigError::Invalid`. This function
 /// only surfaces development-profile warnings for the same signals so an operator
 /// running a relaxed dev profile sees them on stderr.
-pub fn production_guards(config: &crate::config::WyrdServerConfig) {
+pub fn production_guards(config: &WyrdServerConfig) {
     if config.deployment_profile.is_production() {
         return;
     }
@@ -1250,7 +1250,7 @@ pub fn production_guards(config: &crate::config::WyrdServerConfig) {
 /// Returns [`ServerBootError`] on database/storage/bifrost boot, auth handle
 /// construction, federation seeding, or production validation failure.
 pub async fn build_state(
-    config: &crate::config::WyrdServerConfig,
+    config: &WyrdServerConfig,
     telemetry: Arc<wyrd_telemetry::TelemetryGuard>,
     overrides: StateOverrides,
 ) -> Result<BootedServer, ServerBootError> {
@@ -1373,9 +1373,7 @@ async fn rollback_state_roles(state: &AppState) {
 ///
 /// Returns [`ServerBootError::SigningKey`] when production has no configured
 /// key or development cannot generate an ephemeral Ed25519 key.
-fn resolve_signing_key(
-    config: &crate::config::WyrdServerConfig,
-) -> Result<SecretString, ServerBootError> {
+fn resolve_signing_key(config: &WyrdServerConfig) -> Result<SecretString, ServerBootError> {
     if let Some(signing_key) = &config.auth.signing_key {
         return Ok(signing_key.clone());
     }
@@ -1412,7 +1410,7 @@ fn resolve_signing_key(
 /// peer ticket configuration, when the configured keyring cannot be loaded,
 /// or when development cannot generate an ephemeral Ed25519 key.
 fn resolve_peer_ticket_keyring(
-    config: &crate::config::WyrdServerConfig,
+    config: &WyrdServerConfig,
 ) -> Result<Arc<crate::oracle::PeerTicketKeyring>, ServerBootError> {
     let ticket = &config.bifrost.peer.ticket;
     if ticket.is_complete() {
@@ -1454,7 +1452,7 @@ fn resolve_peer_ticket_keyring(
 /// or not 32 bytes.
 pub async fn verify_operator_keys(
     state: &AppState,
-    config: &crate::config::WyrdServerConfig,
+    config: &WyrdServerConfig,
 ) -> Result<(), ServerBootError> {
     if !(config.role.serves_api()
         && config.deployment_profile.is_production()
@@ -1490,7 +1488,7 @@ fn apply_overrides(state: AppState, overrides: StateOverrides) -> AppState {
 /// limits. Pure/sync (no I/O).
 fn attach_config_fields(
     state: AppState,
-    config: &crate::config::WyrdServerConfig,
+    config: &WyrdServerConfig,
     telemetry: Arc<wyrd_telemetry::TelemetryGuard>,
 ) -> Result<AppState, ServerBootError> {
     Ok(state
@@ -1512,7 +1510,7 @@ fn attach_config_fields(
 /// signing key, or when key material is invalid.
 async fn install_auth(
     postgres: &ServerPostgres,
-    config: &crate::config::WyrdServerConfig,
+    config: &WyrdServerConfig,
     signing_key: &SecretString,
     sealing_key: Option<Arc<SecretKey>>,
 ) -> Result<ServerAuth, ServerBootError> {
@@ -2092,7 +2090,7 @@ async fn release_failed_oracle_role(
 /// reference them by FK.
 async fn seed_federation(
     state: &AppState,
-    config: &crate::config::WyrdServerConfig,
+    config: &WyrdServerConfig,
     sealing_key: Option<&SecretKey>,
 ) -> Result<(), ServerBootError> {
     // Seed `[[trusted_issuers]]` and `[[workload_bindings]]` into Postgres under
@@ -2140,9 +2138,7 @@ async fn seed_federation(
 /// is no key-id column, no keyring, and no live rotation path. See `config.rs`
 /// `AuthConfig::sealing_key` for the manual rotation runbook. Key-id versioning,
 /// keyring support, KMS-backed KEK, and AAD binding are tracked in issue #72.
-fn build_sealing_key(
-    config: &crate::config::WyrdServerConfig,
-) -> Result<Option<Arc<SecretKey>>, ServerBootError> {
+fn build_sealing_key(config: &WyrdServerConfig) -> Result<Option<Arc<SecretKey>>, ServerBootError> {
     let Some(encoded) = config.auth.sealing_key.as_ref() else {
         return Ok(None);
     };

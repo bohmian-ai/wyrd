@@ -5,6 +5,8 @@
 //! refused, and another tenant's administrator sees nothing. No response or
 //! error ever carries the secret.
 
+use std::fmt::Debug;
+
 use secrecy::ExposeSecret;
 use serde_json::json;
 use wyrd_sdk::bifrost::client_from_options;
@@ -33,7 +35,7 @@ fn api_key(bootstrap: Bootstrap) -> String {
 ///
 /// # Panics
 /// Panics when a secret appears.
-fn assert_redacted(value: &impl std::fmt::Debug) {
+fn assert_redacted(value: &impl Debug) {
     let text = format!("{value:?}");
     for secret in SECRETS {
         assert!(!text.contains(secret), "secret leaked: {text}");

@@ -1589,3 +1589,158 @@ async fn system_result_writes_require_the_exact_signed_verifier_scope() {
 
     harness.shutdown().await;
 }
+
+/// The SYSTEM Drift reader reads only its tenant's observation table.
+///
+/// Before the tenant's first observation no table exists and the issuer
+/// mints nothing. Once the table is registered, the minted token verifies as
+/// SYSTEM holding exactly `bifrost_query:read` on that table's UID; it is
+/// refused for any other tenant, refused as a result writer over public
+/// gRPC, admitted by Oracle for the observation table with an audited read
+/// decision, and refused, with an audited denial, for another table.
+///
+/// # Panics
+///
+/// Panics when a token is minted without the table, carries other authority,
+/// verifies for another tenant, writes a result, or when either query or its
+/// staged audit decision differs from the expected one.
+#[tokio::test]
+async fn system_drift_reader_reads_only_the_observation_table() {
+    let harness = SystemWriterHarness::start("system-drift-reader").await;
+    let state = harness.server.state();
+    let issuer = state.auth.tenant_issuer().expect("tenant issuer");
+    let mint = || async {
+        let mut conn = wyrd_sql::TenantConn::acquire(state.postgres.app_pool(), harness.tenant)
+            .await
+            .expect("tenant connection opens");
+        let token = issuer
+            .issue_system_drift_read_token(&mut conn, &harness.verifier)
+            .await
+            .expect("drift read mint succeeds");
+        conn.commit().await.expect("mint commits");
+        token
+    };
+    assert!(
+        mint().await.is_none(),
+        "no observation table means nothing to read"
+    );
+
+    harness
+        .server
+        .ensure_builtin_table_for_test(harness.tenant, "drift", "observations")
+        .await
+        .expect("observation table provisions");
+    let token = mint().await.expect("a registered table mints a reader");
+    let table_uid: Vec<u8> = sqlx::query_scalar(
+        "SELECT table_uid FROM vala.bifrost_tables \
+         WHERE data_tenant_id = $1 AND fqn = 'vala.drift.observations'",
+    )
+    .bind(harness.tenant.as_uuid())
+    .fetch_one(&harness.assertion_pool)
+    .await
+    .expect("observation table UID reads");
+    let verifier = state
+        .auth
+        .token_verifier
+        .as_deref()
+        .expect("token verifier");
+    let verified = verifier
+        .verify(&token.access_token, &harness.tenant)
+        .expect("the reader verifies for its tenant");
+    assert!(matches!(
+        verified.principal.kind,
+        PrincipalKind::System { .. }
+    ));
+    assert_eq!(verified.principal.id.as_uuid(), harness.writer);
+    assert_eq!(
+        verified.principal.effective_permissions,
+        PermissionSet::from_iter([wyrd_runtime::Permission::drift_table_read(
+            Uuid::from_slice(&table_uid).expect("16-byte table UID")
+        )]),
+    );
+    assert!(
+        verifier
+            .verify(&token.access_token, &DataTenantId::new_v7())
+            .is_err(),
+        "the reader is refused for another tenant"
+    );
+
+    let read_jwt = secrecy::ExposeSecret::expose_secret(&token.access_token).to_owned();
+    let write = insert_as(
+        harness.bind,
+        &read_jwt,
+        "vala.verification.results",
+        verification_result_ipc(Some(Some(&harness.identity()))),
+    )
+    .await
+    .expect_err("the reader cannot write results");
+    assert_eq!(write.code(), Code::PermissionDenied, "{write:?}");
+
+    let query = |sql: &str| {
+        let caller = wyrd_server::components::auth::Caller {
+            data_tenant_id: harness.tenant,
+            principal: verified.principal.clone(),
+            request_id: RequestId::now_v7(),
+            delegation_chain: verified.delegation_chain.clone(),
+        };
+        let request = wyrd_spec::vala::api::BifrostQueryRequest {
+            sql: sql.to_owned(),
+            visibility: wyrd_spec::vala::api::VisibilityMode::PublishedOnly,
+            freshness: wyrd_spec::vala::api::FreshnessPolicy::Strict,
+            deadline_ms: Some(30_000),
+        };
+        async move {
+            wyrd_server::query::scheduled::ScheduledQueryCaller::authenticated(
+                state.clone(),
+                caller,
+                CancellationToken::new(),
+            )?
+            .run(request)
+            .await
+        }
+    };
+    query("SELECT COUNT(*) AS n FROM vala.drift.observations")
+        .await
+        .expect("the reader reads its observation table");
+    let denied = query("SELECT COUNT(*) AS n FROM vala.verification.results")
+        .await
+        .expect_err("the reader is refused another table");
+    assert_eq!(
+        denied.code(),
+        wyrd_spec::error::WyrdError::from(wyrd_spec::vala::error::BifrostError::QueryForbidden)
+            .code(),
+        "{denied:?}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let decisions = loop {
+        let decisions: Vec<(String, String)> = sqlx::query_as(
+            "SELECT operation, outcome FROM vala.audit_staging \
+             WHERE data_tenant_id = $1 AND principal_id = $2 AND seq > $3 \
+               AND operation IN ('bifrost.query.read_decision', 'vala.query.sync') \
+             ORDER BY operation",
+        )
+        .bind(harness.tenant.as_uuid())
+        .bind(harness.writer)
+        .bind(harness.seq_before)
+        .fetch_all(&harness.assertion_pool)
+        .await
+        .expect("staged read decisions");
+        if decisions.len() >= 2 || Instant::now() > deadline {
+            break decisions;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(
+        decisions,
+        vec![
+            (
+                "bifrost.query.read_decision".to_owned(),
+                "allowed".to_owned()
+            ),
+            ("vala.query.sync".to_owned(), "denied".to_owned()),
+        ]
+    );
+
+    harness.shutdown().await;
+}

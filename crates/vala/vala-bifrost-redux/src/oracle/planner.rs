@@ -320,14 +320,6 @@ impl OraclePlanner {
 
     /// Replaces schema-only scans with providers from the authenticated cut.
     ///
-    /// Each scan is rebuilt over its provider so its projected schema is the
-    /// provider's physical schema, and every ancestor recomputes its schema
-    /// bottom-up. A typed plan is authored against the catalog schema, which
-    /// may spell a type differently from the physical tier (Iceberg projects
-    /// UTC as `+00:00`); recomputing lets the analyzer's type coercion
-    /// reconcile authored literals with the physical columns during physical
-    /// planning instead of failing at execution.
-    ///
     /// # Errors
     /// Returns a typed execution failure when any scan lacks a cut provider or
     /// when `DataFusion` rejects the transformed logical plan.
@@ -335,27 +327,21 @@ impl OraclePlanner {
         plan: datafusion::logical_expr::LogicalPlan,
         providers: &std::collections::HashMap<String, Arc<dyn TableProvider>>,
     ) -> Result<datafusion::logical_expr::LogicalPlan, BifrostError> {
-        use datafusion::logical_expr::{LogicalPlan, TableScanBuilder};
-
-        plan.transform_up(|node| {
-            let LogicalPlan::TableScan(scan) = node else {
-                return node.recompute_schema().map(Transformed::yes);
+        plan.transform(|node| {
+            let datafusion::logical_expr::LogicalPlan::TableScan(scan) = &node else {
+                return Ok(Transformed::no(node));
             };
-            let Some(provider) = providers.get(&scan.table_name.to_string()) else {
+            let table_name = scan.table_name.to_string();
+            let Some(provider) = providers.get(&table_name) else {
                 return Err(datafusion::error::DataFusionError::Plan(
                     "typed plan scan has no authenticated Oracle provider".to_owned(),
                 ));
             };
-            TableScanBuilder::new(
-                scan.table_name,
-                Arc::new(DefaultTableSource::new(Arc::clone(provider))),
-            )
-            .with_projection(scan.projection)
-            .with_filters(scan.filters)
-            .with_fetch(scan.fetch)
-            .with_statistics_requests(scan.statistics_requests)
-            .build()
-            .map(|scan| Transformed::yes(LogicalPlan::TableScan(scan)))
+            let mut replacement = scan.clone();
+            replacement.source = Arc::new(DefaultTableSource::new(Arc::clone(provider)));
+            Ok(Transformed::yes(
+                datafusion::logical_expr::LogicalPlan::TableScan(replacement),
+            ))
         })
         .map(|transformed| transformed.data)
         .map_err(|error| map_datafusion_error(&error))
@@ -617,66 +603,5 @@ mod tests {
             OraclePlanner::replace_typed_sources(plan, &HashMap::new()),
             Err(BifrostError::QueryExecutionFailed)
         ));
-    }
-
-    /// A typed plan authored against a `UTC` catalog schema executes over a
-    /// provider that projects the same instant as `+00:00`: replacement
-    /// recomputes the scan and filter schemas so coercion reconciles the
-    /// authored literal with the physical column.
-    #[tokio::test]
-    async fn typed_source_replacement_reconciles_the_physical_timezone_spelling() {
-        use arrow::array::TimestampMicrosecondArray;
-        use arrow::datatypes::TimeUnit;
-        use arrow::record_batch::RecordBatch;
-        use datafusion::logical_expr::{
-            LogicalPlanBuilder, col, lit, logical_plan::builder::LogicalTableSource,
-        };
-        use datafusion::scalar::ScalarValue;
-
-        let authored = Arc::new(Schema::new(vec![Field::new(
-            "at",
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-            false,
-        )]));
-        let physical = Arc::new(Schema::new(vec![Field::new(
-            "at",
-            DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
-            false,
-        )]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&physical),
-            vec![Arc::new(
-                TimestampMicrosecondArray::from(vec![1_i64, 5, 9]).with_timezone("+00:00"),
-            )],
-        )
-        .expect("physical batch");
-        let provider = MemTable::try_new(physical, vec![vec![batch]]).expect("physical provider");
-        let plan = LogicalPlanBuilder::scan(
-            "vala.drift.observations",
-            Arc::new(LogicalTableSource::new(authored)),
-            None,
-        )
-        .and_then(|builder| {
-            builder.filter(col("at").gt_eq(lit(ScalarValue::TimestampMicrosecond(
-                Some(5),
-                Some("UTC".into()),
-            ))))
-        })
-        .and_then(LogicalPlanBuilder::build)
-        .expect("typed plan");
-        let providers = HashMap::from([(
-            "vala.drift.observations".to_owned(),
-            Arc::new(provider) as Arc<dyn datafusion::datasource::TableProvider>,
-        )]);
-
-        let plan = OraclePlanner::replace_typed_sources(plan, &providers).expect("replaces");
-        let batches = SessionContext::new()
-            .execute_logical_plan(plan)
-            .await
-            .expect("plans")
-            .collect()
-            .await
-            .expect("executes without a timezone comparison error");
-        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
     }
 }

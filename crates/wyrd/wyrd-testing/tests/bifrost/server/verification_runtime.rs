@@ -5,7 +5,10 @@
 //! the Scribe node's public ingest endpoint. The journey schedules one
 //! binding-created run, lets the runtime execute and publish a non-empty Drift
 //! result, and reads the summary and its feature rows back through the
-//! server's own query entry, asserting every identity they carry.
+//! server's own query entry, asserting every identity they carry. A second
+//! journey runs the production Drift engine on the Scribe-only node, which
+//! hosts no Oracle, so its observation read must be forwarded to a peer
+//! Oracle under the tenant's SYSTEM Drift reader and audited there.
 
 use std::time::Duration;
 
@@ -23,7 +26,7 @@ use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
 use wyrd_testing::verification::VerificationFixture;
 
-use super::query::{ServerJourneyError, scheduled_context};
+use super::query::{ServerJourneyError, audit_rows, scheduled_context};
 
 /// Upper bound on the wait for the remote runner to settle the run.
 const WAIT: Duration = Duration::from_secs(60);
@@ -163,6 +166,82 @@ async fn runner_without_local_scribe_publishes_through_the_ingest_endpoint()
             return Err(format!("{what}: expected {expected} rows, read {rows}").into());
         }
     }
+    Ok(())
+}
+
+/// A runner on a pod without a local Oracle completes a real Drift run.
+///
+/// The Scribe-only node composes the runtime with its own ingest endpoint.
+/// Its Custom Verifier's observation read is minted as the tenant SYSTEM
+/// Drift reader and forwarded by Gate to a peer Oracle, which records one
+/// audited read decision; the run completes with a published result. The
+/// registered table is empty for the subject, so the run is inconclusive.
+///
+/// # Errors
+/// Returns cluster, seeding, runtime, or audit errors, or a description of
+/// the first expectation that does not hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn drift_runner_without_local_oracle_reads_through_a_peer() -> Result<(), ServerJourneyError>
+{
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::role_separated()).await?;
+    let tenant = cluster.data_tenant_id();
+    let scribe = cluster
+        .servers()
+        .find(|server| server.bifrost_scribe().is_some())
+        .ok_or("the cluster composed no Scribe")?;
+    if scribe.state().bifrost.oracle().is_some() {
+        return Err("the runner node must host no Oracle".into());
+    }
+
+    let seed = VerificationFixture::provision(scribe.state().postgres.wyrd(), tenant).await?;
+    let (subject, _) = seed.service("forwarded-subject").await?;
+    let verifier = seed
+        .custom_drift_verifier("forwarded-drift", "score", 1.0, 0.5)
+        .await?;
+    scribe
+        .ensure_builtin_table_for_test(tenant, "drift", "observations")
+        .await?;
+    let now = chrono::Utc::now();
+    let run = seed
+        .enqueue_direct(
+            &verifier,
+            &subject,
+            wyrd_spec::verification::DriftWindow {
+                start: now - chrono::Duration::hours(1),
+                end: now,
+            },
+        )
+        .await?;
+    let reads = audit_rows(scribe, tenant, "bifrost.query.read_decision").await?;
+
+    let runtime = VerificationRuntime::builder(scribe.state())
+        .ingest_endpoint(scribe.grpc_url().ok_or("missing Scribe gRPC URL")?)
+        .build()
+        .ok_or("the runtime did not compose")?;
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(runtime.run(stop.clone()));
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let row = loop {
+        let row = seed.run(run).await?;
+        if row.status != "pending" && row.status != "running" && row.status != "retrying" {
+            break row;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("the Drift run never settled: {row:?}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    stop.cancel();
+    tokio::time::timeout(WAIT, task).await??;
+    if row.status != "completed" || row.result_id.is_none() || row.attempts != 1 {
+        return Err(format!("the forwarded Drift run settled {row:?}").into());
+    }
+    let after = audit_rows(scribe, tenant, "bifrost.query.read_decision").await?;
+    if after != reads + 1 {
+        return Err(format!("expected one audited peer read, counted {}", after - reads).into());
+    }
+    cluster.shutdown().await?;
     Ok(())
 }
 

@@ -160,6 +160,44 @@ impl VerificationFixture {
         Ok(uid)
     }
 
+    /// Register one active Custom Drift Verifier named `name` whose profile
+    /// scores the `metric` series mean against `baseline` with `threshold`.
+    ///
+    /// Unlike [`Self::drift_verifier`], the production Drift engine can
+    /// execute it.
+    ///
+    /// # Errors
+    /// Returns [`VerificationFixtureError`] when a write fails.
+    pub async fn custom_drift_verifier(
+        &self,
+        name: &str,
+        metric: &str,
+        baseline: f64,
+        threshold: f64,
+    ) -> Result<CardUid, VerificationFixtureError> {
+        let spec = serde_json::json!({
+            "implementation": {
+                "kind": "drift",
+                "spec": {
+                    "method": "Custom",
+                    "signal": { "kind": "Metric", "name": metric },
+                    "condition": { "kind": "Statistical" },
+                    "profile": {
+                        "kind": "Custom",
+                        "metric_name": metric,
+                        "baseline_value": baseline,
+                        "alert_threshold": threshold
+                    }
+                }
+            }
+        });
+        let card = card("Verifier", name, &spec)?;
+        let mut conn = self.postgres.tenant_conn(self.tenant).await?;
+        let uid = self.insert(&mut conn, &card).await?;
+        conn.commit().await?;
+        Ok(uid)
+    }
+
     /// Project one scheduled binding of `verifier` owned by the Service
     /// `owner` and verifying `subject`, dispatching `operators` on failure.
     ///

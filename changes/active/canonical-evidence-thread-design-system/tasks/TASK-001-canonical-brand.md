@@ -70,3 +70,27 @@ Stop for a spec revision if retaining the exact mark geometry, listed palette va
 - [Wyrd doctrine](../../../../architecture/wyrd-doctrine.mdx)
 - [Implementation execution](../../../../architecture/references/languages/implementation-execution.md)
 - [Testing workflows](../../../../architecture/references/languages/testing-workflows.md)
+
+## Implementation Evidence
+
+Status: `IMPLEMENTED` — awaiting `$wyrd-task-review`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Exact spec roles and light/dark values generate both app projections; no consumer-authored palette | `brand/palette.json` (19 REQ-005 roles + `--declare-ink`, `--evidence-ink`, `--r`); `brand/gen-theme.mjs` `renderTargets` → `brand/theme.css`, `docs/src/styles/wyrd-tokens.css`, `.agents/skills/wyrd-ui/references/wyrd-theme.css` | `brand/gen-theme.test.mjs` "both application projections carry every approved role value in both modes"; `mise run check:tokens` (now runs the generator tests, then drift check) | PASS |
+| Used pairs pass contrast in both modes, incl. code and state treatments | `palette.json` `pairs` (30 pairs: text, links, declare/observe soft fields, primary label, evidence label, status on surface/canvas/failure-soft, code) | `check:tokens` contrast assertion; test "a used pair below its contrast floor fails in the mode that breaks it" | PASS |
+| Brand references, logo variants, favicon preserve README mark geometry and name | Generator owns the README paths and renders `brand/logo.svg`, `logo-light.svg`, `app-icon.svg`, `docs/src/assets/wyrd-mark.svg`, `docs/public/favicon.svg`; workbench wordmark `bohmian` → `Wyrd` | Test "every Wyrd mark rendering keeps the exact README geometry"; `renders/styleguide.html` headless render (both modes) | PASS |
+| Both fonts bundled; no remote font request | `@fontsource/familjen-grotesk@5.3.0`, `@fontsource/fragment-mono@5.3.0` in workbench and docs; Google Fonts import removed from `src/app.css`; old faces removed from docs | Workbench `pnpm build` and docs build emit local `familjen-grotesk-*`/`fragment-mono-*` woff2; `grep googleapis\|gstatic` over build output: none | PASS |
+| Brand source, contracts, built components, registry, rendered reference agree; no retired shadow/arcade/warm-paper contract | `components.json` rewritten for Evidence Thread; workbench components migrated off retired tokens and hard-offset shadows; `DESIGN.md`, `brand-skill.md`, wyrd-ui skill rewritten; `renders/` reduced to one token-driven `styleguide.html` | `vitest run src/lib/components/component-contracts.test.ts` (19), `vitest run src/lib/registry.test.ts` (4), `pnpm test` (171), `pnpm check` 0 errors/0 warnings, `pnpm build`, `mise run docs:check` | PASS (see limits) |
+
+Commands (all passing): `mise exec -- node --test brand/gen-theme.test.mjs` (RED first: missing exports), `mise run check:tokens`, `mise exec -- pnpm exec vitest run src/lib/components/component-contracts.test.ts`, `mise exec -- pnpm exec vitest run src/lib/registry.test.ts`, `mise exec -- pnpm test`, `mise exec -- pnpm check`, `mise exec -- pnpm build` (workbench), `mise run docs:check`, `mise run check:skills-sync`, `git diff --check`.
+
+Limits and handoffs:
+
+- `--border` (Rule) is 2.0–2.4:1 on surface/canvas, below the 3:1 non-text floor. The values are spec-fixed; the pair is declared at `min: 2.0` and DESIGN.md "Rules are structure" requires every control to carry a label, fill, or text plus a `--declare` focus ring. TASK-006/TASK-002 must honor that for inputs.
+- Docs consumer CSS (`docs/src/styles/arcade.css` and docs components) still references retired tokens and faces; TASK-002 owns that adoption. `docs/src/lib/shiki-theme.js` still hand-restates code colours; TASK-002 must derive it from the projection (INV-001).
+- Workbench migration here is token-level only (renames, shadow removal, lime-as-accent removal, Panel geometry). Border widths, lift/sink motion, density, and state coverage remain TASK-006.
+- `brand/renders/product/*.svg` (wyrd-ui-foundation route mocks) keep their old visuals; their README now marks visual treatment superseded. The old `renders/index.html`, `workbench.html`, `landing.html`, `renders.css` were removed; the `wyrd-ui-foundation` packet still names them.
+- Workbench lockfile write re-resolved its `latest` specifiers (vite 8.3.0, vitest 5.0.1, svelte 5.57.1 patch bumps).
+
+Non-goals held: no domain/API/route/auth changes, no public marketing site changes, no compatibility aliases (generator rejects `var()` alias values and undocumented tokens).

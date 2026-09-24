@@ -15,36 +15,33 @@ Add Wyrd tokens through `@theme` or the dedicated Wyrd theme CSS. Do not introdu
 
 ## Token usage
 
-- Use `--color-wyrd-*` and Wyrd theme tokens for brand surfaces.
-- Use semantic tokens for status: success, warning, error, info.
-- Reserve status colors for actual state, risk, or feedback.
-- Use card-type colors only for card identity, not arbitrary accents.
-- Avoid hardcoded hex in components unless editing the theme itself.
+- `brand/DESIGN.md` and `brand/palette.json` are the authority; `brand/theme.css` is their
+  generated projection. Use its tokens (`--declare`, `--observe`, `--evidence`, `--ok`, …)
+  or the Tailwind utilities they map to.
+- Reserve status colors for actual state, and lime (`--evidence`) for retained Evidence.
+- Avoid hardcoded hex in components; never hand-edit a generated theme file.
 
-## Brutalist geometry
+## Evidence Thread geometry
 
-- Radius: `0`.
-- Border: `2px` default.
-- Shadow: hard-offset, zero blur.
-- Button interaction: press-in movement that aligns with the shadow offset.
-- Dividers inside cards: `2px dashed`.
+- Radius: `2px` (`--r`).
+- Rules: `1px` — `--border` for structure, `--border-soft` for rows and inner dividers.
+- No decorative elevation and no lift/sink press motion; state is carried by fill and rule.
 
 ## Dark mode
 
-Dark mode preserves the same brutalist geometry. Swap palette and atmosphere, not component structure. Borders and shadows must remain visible against near-black surfaces.
+Dark mode is a complete rendering of the same structure. Swap token values, not component
+structure.
 
 ## Icons and charts
 
 - Use the existing icon library when available.
 - Prefer recognizable icons for common actions.
-- Keep icon strokes visually strong enough for the brutalist UI.
-- Charts should use theme-aware colors and remain legible in both modes.
+- Charts use theme tokens, and every series carries a dash and marker as well as a color.
 
 ## Anti-patterns
 
-- Blurred shadows.
-- Rounded cards, pills, or buttons.
-- Gray hairline borders.
+- Hard-offset, blurred, or glowing shadows; gradients; scanlines.
+- Lime as an accent, hover, or secondary action.
 - Inline styles that bypass tokens.
 - Component-library defaults that override Wyrd geometry.
 - One-off color palettes per feature.

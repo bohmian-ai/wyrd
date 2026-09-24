@@ -30,6 +30,11 @@
   --color-code-text: var(--code-text);
 }
 
+:root {
+  --font-sans: "Familjen Grotesk", system-ui, sans-serif;
+  --font-mono: "Fragment Mono", ui-monospace, monospace;
+}
+
 [data-mode="light"] {
   /* surface */
   --bg: #F3F6F5;

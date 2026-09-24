@@ -24,7 +24,7 @@ Run both when changing route data, TypeScript contracts, Svelte components, or s
 - Focus is visible.
 - Loading, empty, and error states are reachable.
 - Theme tokens resolve correctly in both light and dark modes when theme support exists.
-- Brutalist rules hold: zero radius, 2px borders, hard-offset zero-blur shadows.
+- Evidence Thread rules hold: 2px radius, 1px rules, no decorative elevation, no color-only meaning.
 - Controls do not shift layout when labels, counts, or icons change.
 
 ## Performance checks

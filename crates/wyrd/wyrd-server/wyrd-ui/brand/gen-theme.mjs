@@ -150,7 +150,9 @@ function workbenchCss({ modes, scale, tokens }) {
   const modeBlocks = modes.map(
     (mode) => `[data-mode="${mode}"] {\n${tokenLines(tokens, mode).join('\n')}\n}`
   );
-  return [BANNER, '', theme.join('\n'), '', ...modeBlocks, ''].join('\n');
+  // Plain :root copy so static pages (renders/) that load theme.css without Tailwind get the faces.
+  const fonts = `:root {\n${fontLines(scale).join('\n')}\n}`;
+  return [BANNER, '', theme.join('\n'), '', fonts, '', ...modeBlocks, ''].join('\n');
 }
 
 /**

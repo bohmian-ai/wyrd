@@ -20,6 +20,7 @@ use chrono::{DateTime, Duration, Utc};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::json;
 use uuid::Uuid;
+use vala_sql::queries::olap_catalog::get_by_fqn;
 use wyrd_auth_issue::{AccessGrant, IssueError, IssuingKey};
 use wyrd_auth_verify::{ActClaim, TokenAudience, TokenPrincipalRef};
 use wyrd_runtime::{Permission, PermissionSet, PrincipalId, RoleRef};
@@ -29,15 +30,14 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::{CardRef, CardRefScope};
 use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
 use wyrd_spec::vala::audit_detail::CardScopeMintKind;
-use wyrd_sql::{SqlError, TenantConn};
 use wyrd_sql::queries::auth::{
     RoleRow, insert_refresh_token, insert_refresh_token_rotated, list_service_account_roles,
     list_user_roles, refresh_issuance_instant, roles_by_name, service_account_by_id,
     system_principal_id, user_by_id,
 };
-use vala_sql::queries::olap_catalog::get_by_fqn;
 use wyrd_sql::queries::platform::tenant_resolver::tenant_admits_credentials;
 use wyrd_sql::queries::verification::record_machine_authentication;
+use wyrd_sql::{SqlError, TenantConn};
 
 use crate::audit::{TOKEN_EXCHANGE_OPERATION, append_auth_audit, auth_event};
 use crate::card_scope::{

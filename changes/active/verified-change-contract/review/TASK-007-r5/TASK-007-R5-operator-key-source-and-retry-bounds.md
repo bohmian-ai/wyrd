@@ -147,3 +147,23 @@ Run `mise run codegen:check` only if implementation unexpectedly touches a
 generated/public contract; no such change is required.
 
 Route this task directly to `$wyrd-implement`.
+
+## Implementation evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| `FIND-TASK-007-18` | `OperatorKeysConfig::validate` in `crates/wyrd/wyrd-server/src/config.rs` refuses `source = "env"` whenever `production`; file/Vault and the multi-tenant Vault/HTTPS rule are unchanged; readiness untouched | `config::tests::operator_key_source_follows_deployment` (dev env accepted; single-tenant prod env refused; single-tenant prod file and Vault accepted; multi-tenant prod Vault accepted, file refused); retained `production_vault_requires_https`, `pg_operator_connection_routes::production_boot_requires_every_active_tenant_key` | PASS |
+| `FIND-TASK-007-19` | `RETRY_SQL` in `crates/wyrd/wyrd-sql/src/queries/operator_dispatches.rs` bounds `$5` by `$6` (`LEAST($5, $6)`) before building the interval; outer deadline clip, predicates, fence, and payload unchanged | `pg_verifier_runs::maximum_retry_after_settles_at_the_deadline` (`u64::MAX` seconds → `retrying`, `next_attempt_at = created_at + 5 min`, lease cleared); fails with `interval out of range` without the bound; retained `dispatch_delivery_obeys_budget_deadline_and_fencing`, `expired_dispatch_deadline_fails_without_a_claim`, and the `pg_operator_delivery` 90-second provider-delay coverage | PASS |
+
+Commands (all exit 0 in this session):
+
+- `mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=config::tests::operator_key_source_follows_deployment) | test(=config::tests::production_vault_requires_https) | test(=config::tests::operator_key_version_must_fit_i32)'`
+- `scripts/postgres/with-test-postgres.sh -- mise exec -- cargo nextest run --locked -p wyrd-sql --test pg_verifier_runs -E 'test(=maximum_retry_after_settles_at_the_deadline) | test(=dispatch_delivery_obeys_budget_deadline_and_fencing) | test(=expired_dispatch_deadline_fails_without_a_claim)'`
+- `mise run test:sql`, `mise run test:wyrd` (2160 passed), `mise run fmt`, `mise run lints`,
+  `mise run check:tenant-isolation`, `mise run check:unwrap-audit`, `git diff --check`
+
+Non-goals held: no new source, resolver, parser branch, retry type, clock,
+migration, dependency, public error, or public contract change; `codegen:check`
+not required. Also imported the `wyrd_server::config` types at module scope in
+`crates/wyrd/wyrd-server/tests/pg_operator_connection_routes.rs` (test-only
+consistency cleanup).

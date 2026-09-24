@@ -1453,7 +1453,7 @@ fn resolve_peer_ticket_keyring(
 /// Returns [`ServerBootError::OperatorKeys`] when the tenant directory is
 /// unavailable or any tenant's active key is unavailable, missing, malformed,
 /// or not 32 bytes.
-async fn verify_operator_keys(
+pub async fn verify_operator_keys(
     state: &AppState,
     config: &crate::config::WyrdServerConfig,
 ) -> Result<(), ServerBootError> {

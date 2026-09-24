@@ -495,7 +495,8 @@ async fn read_write_separation_and_tenant_isolation() {
 }
 
 /// Without a readable active key, credential writes refuse with the stable
-/// key error naming where the key belongs, while reads keep working.
+/// retryable key error and a constant detail that names no key location,
+/// while reads keep working.
 ///
 /// # Panics
 /// Panics when the refusal or the unaffected read differs.
@@ -527,12 +528,14 @@ async fn missing_key_refuses_only_credential_writes() {
             Some("WYRD_OPERATOR_503_KEY_UNAVAILABLE")
         )
     );
+    let empty_dir = empty.path().display().to_string();
     assert!(
-        problem["detail"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("v1"),
-        "{problem}"
+        !problem.to_string().contains(&empty_dir),
+        "the key directory stays internal: {problem}"
+    );
+    assert_eq!(
+        problem["detail"].as_str(),
+        Some("the Operator key provider could not supply a usable key; retry once it is restored")
     );
     assert_eq!(
         call(&server, &jwt, Method::GET, "/v1/operator-connections", None)
@@ -672,4 +675,104 @@ async fn registration_binds_exact_connection_authority() {
         ),
         "{problem}"
     );
+}
+
+/// A Vault-sourced key owner at `addr` using an inline token.
+///
+/// # Panics
+/// Panics when the owner cannot be built.
+fn vault_keys(addr: &str) -> wyrd_server::components::operators::keys::OperatorKeys {
+    wyrd_server::components::operators::keys::OperatorKeys::new(
+        wyrd_server::config::OperatorKeysConfig {
+            source: wyrd_server::config::OperatorKeySource::Vault,
+            vault: Some(wyrd_server::config::VaultKeysConfig {
+                addr: addr.to_owned(),
+                mount: "secret".to_owned(),
+                prefix: "wyrd/operator-keys".to_owned(),
+                token_file: None,
+                token: Some(secrecy::SecretString::from("boot-vault-token")),
+            }),
+            ..wyrd_server::config::OperatorKeysConfig::default()
+        },
+    )
+    .expect("vault keys build")
+}
+
+/// A local Vault answering every tenant's version-1 key with `key`.
+async fn vault_serving(key: Option<String>) -> wiremock::MockServer {
+    use wiremock::matchers::{method, path_regex};
+    let vault = wiremock::MockServer::start().await;
+    let response = match key {
+        Some(key) => wiremock::ResponseTemplate::new(200)
+            .set_body_json(json!({ "data": { "data": { "key": key } } })),
+        None => wiremock::ResponseTemplate::new(404),
+    };
+    wiremock::Mock::given(method("GET"))
+        .and(path_regex(r"^/v1/secret/data/wyrd/operator-keys/[0-9a-f-]+/1$"))
+        .respond_with(response)
+        .mount(&vault)
+        .await;
+    vault
+}
+
+/// Multi-tenant production boot refuses readiness unless every active
+/// provisioned tenant's active key reads and decodes to 32 bytes, naming no
+/// key location; development and explicitly single-tenant deployments keep
+/// the deferred failure.
+///
+/// # Panics
+/// Panics when a broken key source is accepted, a readable one refused, or a
+/// refusal discloses a selector.
+#[tokio::test(flavor = "current_thread")]
+async fn production_boot_requires_every_active_tenant_key() {
+    use base64::Engine as _;
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let production = wyrd_server::config::WyrdServerConfig {
+        deployment_profile: wyrd_server::config::DeploymentProfile::Production,
+        ..wyrd_server::config::WyrdServerConfig::default()
+    };
+    let engine = base64::engine::general_purpose::STANDARD;
+    let mut state = server.state().clone();
+
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("port reserves");
+    let unreachable = format!("http://{}", closed.local_addr().expect("addr"));
+    drop(closed);
+    let missing = vault_serving(None).await;
+    let malformed = vault_serving(Some("not base64!".to_owned())).await;
+    let short = vault_serving(Some(engine.encode([4_u8; 16]))).await;
+    for (case, addr) in [
+        ("unavailable provider", unreachable.clone()),
+        ("missing tenant key", missing.uri()),
+        ("malformed key", malformed.uri()),
+        ("wrong-length key", short.uri()),
+    ] {
+        state.operator_keys = std::sync::Arc::new(vault_keys(&addr));
+        let refused = wyrd_server::boot::verify_operator_keys(&state, &production)
+            .await
+            .expect_err(case)
+            .to_string();
+        for selector in [addr.as_str(), "wyrd/operator-keys", "boot-vault-token"] {
+            assert!(!refused.contains(selector), "{case} leaked {selector}: {refused}");
+        }
+    }
+
+    let readable = vault_serving(Some(engine.encode([4_u8; 32]))).await;
+    state.operator_keys = std::sync::Arc::new(vault_keys(&readable.uri()));
+    wyrd_server::boot::verify_operator_keys(&state, &production)
+        .await
+        .expect("readable 32-byte keys boot");
+    let reads = readable.received_requests().await.expect("recorded").len();
+    assert!(reads >= 2, "every active tenant, including the fixture, is checked: {reads}");
+
+    state.operator_keys = std::sync::Arc::new(vault_keys(&unreachable));
+    wyrd_server::boot::verify_operator_keys(&state, &wyrd_server::config::WyrdServerConfig::default())
+        .await
+        .expect("development defers key failures");
+    let mut single_tenant = production.clone();
+    single_tenant.auth.tenant_slug = Some(wyrd_spec::TenantSlug::new("acme").expect("slug"));
+    wyrd_server::boot::verify_operator_keys(&state, &single_tenant)
+        .await
+        .expect("an explicitly single-tenant deployment defers key failures");
 }

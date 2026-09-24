@@ -130,10 +130,7 @@ impl<'a> OperatorConnectionControl<'a> {
             Ok::<_, WyrdError>(stored)
         }
         .await;
-        match self
-            .record_if_uncommitted(caller, &allowed, committed)
-            .await?
-        {
+        match audit::record_unless_committed(self.state, caller, &allowed, committed).await? {
             Some(stored) => Ok(stored.view),
             None => Err(WyrdError::OperatorConnectionConflict {
                 message: format!(
@@ -323,7 +320,7 @@ impl<'a> OperatorConnectionControl<'a> {
             Ok::<_, WyrdError>(Ok(stored.view))
         }
         .await;
-        self.record_if_uncommitted(caller, &allowed, committed)
+        audit::record_unless_committed(self.state, caller, &allowed, committed)
             .await?
     }
 
@@ -347,32 +344,5 @@ impl<'a> OperatorConnectionControl<'a> {
             resource,
         )
         .await
-    }
-
-    /// Pass a committed result through; for a transaction that did not
-    /// commit, record the allowed decision standalone so an evaluated
-    /// permission is never lost, then return its error.
-    ///
-    /// # Errors
-    /// Returns the uncommitted error, or [`WyrdError::AuditUnavailable`] when
-    /// the standalone decision cannot be recorded.
-    async fn record_if_uncommitted<T>(
-        &self,
-        caller: &Caller,
-        allowed: &AuditEvent,
-        committed: Result<T, WyrdError>,
-    ) -> Result<T, WyrdError> {
-        match committed {
-            Ok(value) => Ok(value),
-            Err(error) => {
-                audit::record_audit(
-                    self.state.postgres.vala_pool(),
-                    caller.data_tenant_id,
-                    allowed,
-                )
-                .await?;
-                Err(error)
-            }
-        }
     }
 }

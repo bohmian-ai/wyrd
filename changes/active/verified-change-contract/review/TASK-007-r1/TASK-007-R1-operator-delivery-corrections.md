@@ -191,3 +191,47 @@ The gated Slack/PagerDuty live smoke remains release evidence and is not a
 credential-free remediation gate.
 
 Route this task directly to `$wyrd-implement`.
+
+## Implementation evidence
+
+Candidate: `vcc/task-007` from `5f6d6f1f` through the commit recording this
+evidence. Status: `IMPLEMENTED`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| `FIND-TASK-007-1` | `components/operators/keys.rs`: `KeyError::Unavailable{version, kind, failure: KeyFailure}`, constant `UNAVAILABLE_DETAIL`, `KeyError::log` with bounded fields only | `keys::tests::key_failures_disclose_no_selector` (captured logs + problem JSON with env/file/Vault sentinels); `pg_operator_connection_routes::missing_key_refuses_only_credential_writes` | PASS |
+| `FIND-TASK-007-2` | `boot::verify_operator_keys` → `OperatorKeys::verify_active` over `list_active_tenant_ids`, called from `build_state` (multi-tenant production only); `architecture/wyrd-design.md` fail-start text restored | `pg_operator_connection_routes::production_boot_requires_every_active_tenant_key` (unavailable, missing, malformed, wrong-length refused; readable boots; dev and single-tenant defer) | PASS |
+| `FIND-TASK-007-3` | `verification/operators.rs`: `HttpRequest` carries no credential; `Credential::attach` runs per hop after `ScreenedHttp::client_for`; Slack/PagerDuty bearer attached in `post_json` after screening | `operators::tests::blocked_and_unresolved_destinations_never_get_a_credential`, `operators::tests::each_screened_hop_attaches_its_own_credential` | PASS |
+| `FIND-TASK-007-4` | Skill files reverted to base (`5f6d6f1f`) | `git diff --stat f8811ac5..HEAD -- .agents/skills .claude/skills` empty | PASS |
+| `FIND-TASK-007-5` | `config.rs` `OperatorKeysConfig::validate(production, multi_tenant)` rejects `http` Vault in production; Vault token read through `read_owner_only` | `config::tests::production_vault_requires_https`; `keys::tests::vault_reads_require_an_owner_only_token_file` (0o644 token refused before any request reaches the mock) | PASS |
+| `FIND-TASK-007-6` | `sdks/wyrd-sdk-ts/wyrd/src/index.ts` closed update union + flattened view; `stubs/operators.pyi` TypedDict unions, `__init__.pyi` regenerated; `py:typecheck` runs with `--error unused-ignore-comment` | `tests/unit/operator-connection-types.test.ts` (`ts:typecheck`), `tests/unit/test_operator_connections_typing.py` (`py:typecheck`); Python and TS journeys assert flattened Slack/PagerDuty/HTTP fields and no `config` | PASS |
+| `FIND-TASK-007-7` | `keys.rs` `read_owner_only` via `tokio::task::spawn_blocking`, shared by KEK files and Vault token files | `keys::tests::stalled_key_file_does_not_block_the_executor` (FIFO), `keys::tests::file_keys_seal_open_and_bind_context` | PASS |
+| `FIND-TASK-007-8` | `base64::Engine` / `PermissionsExt` imports at module level in `keys.rs` and `wyrd-testing/src/server.rs` | `mise run fmt`, `mise run lints` | PASS |
+| `FIND-TASK-007-9` | `OperatorWorker::run` joins the claim loop with an independent `rewrap` loop; `rewrap_pass` has pass and per-tenant `RewrapBudget` timeouts, cancellable on stop; old keys cached per `rewrap_tenant` call only | `pg_operator_delivery::slow_rewrap_never_holds_back_another_tenants_delivery` (stalled Vault tenant; other tenant delivered; one read per old version), `next_attempt_on_another_replica_uses_the_rotated_credential`, `revoked_connection_fails_closed_and_key_outage_retries` | PASS |
+| Reuse A (Vault client) | `OperatorKeys::new` returns `Result<_, KeyError>`, calls `wyrd_tls::install_crypto_provider()`, builds the timeout/no-redirect client, and maps build failure to `KeyError::Client`; boot surfaces `ServerBootError::OperatorKeys` | `mise run test:wyrd`, `test:principals:integration`, focused keys tests | PASS |
+| Reuse B (shared claim loop) | `verification/claims.rs`: `ClaimLoop` (permits, limits, drain, cancellation, claim round, stop-racing claim, reap) + `LeasedWork`; `VerifierRunner` and `OperatorWorker` implement only due-tenants/claim/process/release-late; rewrap runs beside the loop | `mise run test:bifrost:integration:server` (`pg_verification_runtime`, 80 passed), `mise run test:wyrd`, focused operator delivery tests | PASS |
+
+Commands run in this session, each exit 0: `mise run fmt`, `py:format`,
+`lints`, `py:lints`, `py:typecheck`, `ts:typecheck`, `codegen:check`,
+`check:tenant-isolation`, `check:client-tier`, `check:pyo3-scope`,
+`check:unwrap-audit`, `py:test:unit` (491), `test:shared` (694), `test:sql`,
+`test:wyrd` (2152), `test:principals:integration`, `test:wyrdstate:journey`,
+`test:platform:journey`, `test:cli:journey`, `test:bifrost:journey:server`,
+`test:bifrost:journey:mcp`, `test:bifrost:integration:server`,
+`py:test:integration` (61), `ts:test:integration` (21), `git diff --check`;
+plus the exact selectors:
+
+```bash
+mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=components::operators::keys::tests::decode_key_requires_32_base64_bytes) | test(=components::operators::keys::tests::file_keys_seal_open_and_bind_context) | test(=components::operators::keys::tests::key_failures_disclose_no_selector) | test(=components::operators::keys::tests::vault_reads_require_an_owner_only_token_file) | test(=components::operators::keys::tests::stalled_key_file_does_not_block_the_executor) | test(=config::tests::production_vault_requires_https) | test(=verification::operators::tests::blocked_and_unresolved_destinations_never_get_a_credential) | test(=verification::operators::tests::each_screened_hop_attaches_its_own_credential)'
+scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-server --features test-support --test pg_operator_connection_routes --test pg_operator_delivery -E 'test(=missing_key_refuses_only_credential_writes) | test(=production_boot_requires_every_active_tenant_key) | test(=slow_rewrap_never_holds_back_another_tenants_delivery) | test(=next_attempt_on_another_replica_uses_the_rotated_credential) | test(=revoked_connection_fails_closed_and_key_outage_retries)'"
+```
+
+Non-goals held: no provider, route, permission, schema, cipher, dependency,
+cross-pass key cache, or checked-in OpenAPI change; live Slack/PagerDuty smoke
+remains release evidence.
+
+Limits: the boot gate is proven through `wyrd_server::boot::verify_operator_keys`
+(the exact function `build_state` calls) rather than a full production
+`build_state`, which needs complete production TLS and peer material. The Python
+connection `TypedDict`s are stub-only (runtime import needs `TYPE_CHECKING`),
+matching the finding's instruction not to add a parallel runtime shape.

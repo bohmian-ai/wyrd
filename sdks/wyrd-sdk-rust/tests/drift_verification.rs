@@ -3,13 +3,16 @@
 //! Registers a Parquet baseline Data Card, PSI and SPC Verifiers fitted from
 //! it, a Custom Verifier that needs no fit, and an SPC Verifier whose baseline
 //! cannot fit. Card status shows each baseline settle without blocking
-//! registration. A Service bound to the Custom Verifier with two inline
-//! Operators emits Drift observations through `WyrdState`; direct runs of every
-//! method then score the window server-side through Oracle and persist their
-//! results and feature rows, an empty window completes inconclusive with null
-//! details and no features, and a due cron occurrence of the binding fails and
-//! dispatches once per Operator. Negative flows cover an unready Verifier, a
-//! non-Parquet baseline, a caller without `evals:run`, and a second tenant.
+//! registration. Two Services bind the Custom Verifier through one shared
+//! schedule Trigger Card, with two and one inline Operators, and emit Drift
+//! observations through `WyrdState`; direct runs of every method then score
+//! the window server-side through Oracle and persist their results and
+//! feature rows, an empty window completes inconclusive with null details and
+//! no features, one due occurrence of the shared Trigger runs each binding
+//! once and dispatches only that binding's Operators, and a manual run of one
+//! binding dispatches through the same Operator path. Negative flows cover an
+//! unready Verifier, a non-Parquet baseline, a caller without `evals:run`,
+//! and a second tenant.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -27,8 +30,8 @@ use wyrd_sdk::bifrost::client_from_options;
 use wyrd_sdk::cards::{CardGraphHydrator, CardSelector, Cards, HydrationMode, RegistrationReceipt};
 use wyrd_sdk::state::WyrdState;
 use wyrd_sdk::verification::{
-    StartVerificationRunRequest, Verification, VerificationExecutionStatus, VerificationRunId,
-    VerificationRunStatus,
+    BindingId, OperatorDispatchState, StartVerificationRunRequest, Verification,
+    VerificationExecutionStatus, VerificationResultId, VerificationRunId, VerificationRunStatus,
 };
 use wyrd_sdk::{Bifrost, QueueConfig, WyrdClient};
 use wyrd_testing::Bootstrap;
@@ -156,7 +159,23 @@ fn distribution(features: &str) -> String {
     )
 }
 
-/// Write every Verifier and the bound Service, returning their paths.
+/// Service Card YAML named `name` binding `drift-custom` on the shared
+/// `drift-daily` Trigger with one inline HTTP Operator per hook in `hooks`.
+fn service_yaml(name: &str, hooks: &[&str]) -> String {
+    let operators: String = hooks
+        .iter()
+        .map(|hook| {
+            format!(
+                "        - kind: http\n          method: post\n          url: https://hooks.example.test/{hook}\n"
+            )
+        })
+        .collect();
+    format!(
+        "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: {name}\n  version: 1.0.0\n  space: default\nspec:\n  verified_by:\n    - verifier:\n        kind: Verifier\n        name: drift-custom\n        version: 1.0.0\n        space: default\n      runs_on:\n        kind: Trigger\n        name: drift-daily\n        version: 1.0.0\n        space: default\n      on_failure:\n{operators}"
+    )
+}
+
+/// Write every Verifier, the shared Trigger, and both bound Services.
 ///
 /// # Panics
 /// Panics when a fixture file cannot be written.
@@ -196,10 +215,20 @@ fn write_verifiers(root: &Path) {
         .expect("verifier card writes");
     }
     std::fs::write(
+        root.join("trigger.yaml"),
+        "apiVersion: wyrd/v1\nkind: Trigger\nmetadata:\n  name: drift-daily\n  version: 1.0.0\n  space: default\nspec:\n  kind: schedule\n  cron: \"0 0 * * *\"\n",
+    )
+    .expect("trigger card writes");
+    std::fs::write(
         root.join("service.yaml"),
-        "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: drift-service\n  version: 1.0.0\n  space: default\nspec:\n  verified_by:\n    - verifier:\n        kind: Verifier\n        name: drift-custom\n        version: 1.0.0\n        space: default\n      runs_on:\n        kind: schedule\n        cron: \"0 0 * * *\"\n      on_failure:\n        - kind: http\n          method: post\n          url: https://hooks.example.test/drift-a\n        - kind: http\n          method: post\n          url: https://hooks.example.test/drift-b\n",
+        service_yaml("drift-service", &["drift-a", "drift-b"]),
     )
     .expect("service card writes");
+    std::fs::write(
+        root.join("service-b.yaml"),
+        service_yaml("drift-service-b", &["drift-c"]),
+    )
+    .expect("second service card writes");
 }
 
 /// Register one Card file and return its receipt.
@@ -502,9 +531,12 @@ async fn drift_methods_fit_score_persist_and_dispatch() {
         Some("baseline_fit_failed"),
         "a baseline that cannot fit fails visibly"
     );
+    register(&cards, &root.path().join("trigger.yaml")).await;
     let service = register(&cards, &root.path().join("service.yaml")).await;
+    let service_b = register(&cards, &root.path().join("service-b.yaml")).await;
 
     let credential = emit_window(&server, &admin, &service, &root.path().join("bundle")).await;
+    emit_window(&server, &admin, &service_b, &root.path().join("bundle-b")).await;
     let verification = Verification::with_client(connect(&server, &credential));
     let query = Bifrost::query_only(&admin);
     let now = Utc::now();
@@ -543,7 +575,18 @@ async fn drift_methods_fit_score_persist_and_dispatch() {
         .expect_err("an unready Verifier is refused");
     assert_eq!(unready.code(), "WYRD_VERIFICATION_409_VERIFIER_NOT_READY");
 
-    assert_scheduled_failure_dispatches(&server, &cards, &verification, &service, &query).await;
+    let bindings = SharedTrigger {
+        server: &server,
+        cards: &cards,
+        verification: &verification,
+        query: &query,
+    };
+    let scheduled = bindings
+        .assert_one_occurrence_runs_each_binding([(&service, 2), (&service_b, 1)])
+        .await;
+    bindings
+        .assert_manual_binding_run_dispatches(&service, &scheduled[0], window)
+        .await;
     assert_refusals(
         &server,
         root.path(),
@@ -963,69 +1006,208 @@ async fn assert_direct_scores(
     assert!(features.is_empty(), "an unscored window writes no features");
 }
 
-/// Make the Service's cron binding due and prove its failed result dispatches
-/// once per configured Operator.
-///
-/// The due instant is `PostgreSQL`'s statement time, so the daily occurrence's
-/// window is `[midnight UTC, now)` and holds every observation just emitted.
-///
-/// # Panics
-/// Panics when the binding cannot be made due or the run never dispatches.
-async fn assert_scheduled_failure_dispatches(
-    server: &WyrdTestServer,
-    cards: &Cards,
-    verification: &Verification,
-    service: &RegistrationReceipt,
-    query: &Bifrost,
-) {
-    let binding = cards
-        .get(CardSelector::exact(service.root.clone()))
+/// Scheduled and manual activation of the Services sharing the `drift-daily`
+/// Trigger, observed through the public run status and Bifrost results.
+struct SharedTrigger<'a> {
+    /// The bound server, whose fixture tenant owns both bindings.
+    server: &'a WyrdTestServer,
+    /// Admin Card handle used to read each Service's binding status.
+    cards: &'a Cards,
+    /// Verification handle of the first Service's credential.
+    verification: &'a Verification,
+    /// Admin query handle over the tenant's result tables.
+    query: &'a Bifrost,
+}
+
+/// One settled binding-created run and the identities it reported.
+struct BindingRun {
+    /// The binding that created the run.
+    binding: BindingId,
+    /// Canonical result of the run.
+    result: VerificationResultId,
+    /// Every dispatch the run created, in identity order.
+    dispatches: Vec<OperatorDispatchState>,
+}
+
+impl SharedTrigger<'_> {
+    /// Read the single binding of `service`.
+    ///
+    /// # Panics
+    /// Panics when the Service cannot be read or serves no binding.
+    async fn binding(&self, service: &RegistrationReceipt) -> BindingId {
+        self.cards
+            .get(CardSelector::exact(service.root.clone()))
+            .await
+            .expect("service reads")
+            .status
+            .and_then(|status| status.verification)
+            .expect("the binding owner serves verification status")
+            .binding_ids[0]
+    }
+
+    /// Make every binding of `services` due at one occurrence of the shared
+    /// Trigger and prove each runs once, isolated, and dispatches only its own
+    /// configured Operators.
+    ///
+    /// The due instant is `PostgreSQL`'s statement time, so the daily
+    /// occurrence's window is `[midnight UTC, now)` and holds every
+    /// observation just emitted. Each pair is a Service and its Operator
+    /// count. Returns the settled runs in `services` order.
+    ///
+    /// # Panics
+    /// Panics when a binding cannot be made due, an occurrence schedules the
+    /// wrong number of runs, or a run's identities, verdict, or dispatches are
+    /// wrong.
+    async fn assert_one_occurrence_runs_each_binding(
+        &self,
+        services: [(&RegistrationReceipt, usize); 2],
+    ) -> Vec<BindingRun> {
+        let seed = VerificationFixture::provision(
+            self.server.state().postgres.wyrd(),
+            self.server.pg_fixture().data_tenant_id(),
+        )
         .await
-        .expect("service reads")
-        .status
-        .and_then(|status| status.verification)
-        .expect("the binding owner serves verification status")
-        .binding_ids[0];
-    let seed = VerificationFixture::provision(
-        server.state().postgres.wyrd(),
-        server.pg_fixture().data_tenant_id(),
-    )
-    .await
-    .expect("fixture tenant opens");
-    let direct_runs = seed.runs().await.expect("runs read");
-    seed.make_binding_due(binding)
-        .await
-        .expect("binding is due");
-    let deadline = tokio::time::Instant::now() + WAIT;
-    let run = loop {
-        let scheduled = seed.runs().await.expect("runs read");
-        if let Some(run) = scheduled.into_iter().find(|run| !direct_runs.contains(run)) {
-            break run;
+        .expect("fixture tenant opens");
+        let earlier = seed.runs().await.expect("runs read");
+        let mut bindings = Vec::new();
+        for (service, _) in services {
+            let binding = self.binding(service).await;
+            seed.make_binding_due(binding)
+                .await
+                .expect("binding is due");
+            bindings.push(binding);
         }
+        let deadline = tokio::time::Instant::now() + WAIT;
+        let runs = loop {
+            let scheduled: Vec<_> = seed
+                .runs()
+                .await
+                .expect("runs read")
+                .into_iter()
+                .filter(|run| !earlier.contains(run))
+                .collect();
+            if scheduled.len() >= services.len() {
+                break scheduled;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the due occurrence scheduled {scheduled:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert_eq!(runs.len(), services.len(), "one run per binding: {runs:?}");
+
+        let mut settled = Vec::new();
+        for run in &runs {
+            settled.push(self.settle_failed(run).await);
+        }
+        settled.sort_by_key(|run| bindings.iter().position(|binding| *binding == run.binding));
+        for ((service, operators), run) in services.iter().zip(&settled) {
+            assert_eq!(
+                run.dispatches.len(),
+                *operators,
+                "only this binding's Operators"
+            );
+            let (result, _) = read_result(self.server, self.query, &run.result.to_string()).await;
+            assert_eq!(
+                result.subject_card_uid,
+                service
+                    .root
+                    .uid
+                    .as_ref()
+                    .expect("service has a UID")
+                    .to_string(),
+                "each binding verifies its own Service"
+            );
+        }
+        assert_ne!(settled[0].binding, settled[1].binding);
+        assert_ne!(settled[0].result, settled[1].result);
         assert!(
-            tokio::time::Instant::now() < deadline,
-            "the due occurrence never scheduled a run"
+            settled[0].dispatches.iter().all(|a| settled[1]
+                .dispatches
+                .iter()
+                .all(|b| a.operator != b.operator)),
+            "no Operator crosses bindings"
         );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    };
-    let status = wait_settled(verification, &run).await;
-    assert_eq!(
-        status.status,
-        VerificationExecutionStatus::Completed,
-        "{status:?}"
-    );
-    assert_eq!(
-        status.dispatches.len(),
-        2,
-        "one dispatch per configured Operator: {status:?}"
-    );
-    let result_id = status.result_id.expect("a completed run names its result");
-    let (result, _) = read_result(server, query, &result_id.to_string()).await;
-    assert_eq!(result.verdict, "failed", "{result:?}");
-    assert_eq!(
-        result.binding_id.as_deref(),
-        Some(binding.to_string().as_str())
-    );
+        settled
+    }
+
+    /// Run `service`'s binding manually over `window` and prove its failed
+    /// result dispatches to the same Operators as `scheduled`, as new
+    /// dispatches of a new result.
+    ///
+    /// # Panics
+    /// Panics when the run cannot start, does not fail, or its dispatches do
+    /// not match the binding's Operators.
+    async fn assert_manual_binding_run_dispatches(
+        &self,
+        service: &RegistrationReceipt,
+        scheduled: &BindingRun,
+        window: (DateTime<Utc>, DateTime<Utc>),
+    ) {
+        let request: StartVerificationRunRequest = serde_json::from_value(serde_json::json!({
+            "target": { "kind": "binding", "binding_id": self.binding(service).await },
+            "input": { "kind": "drift_window", "start": window.0, "end": window.1 },
+        }))
+        .expect("run request matches the wire contract");
+        let run = self
+            .verification
+            .start_run(&request, None)
+            .await
+            .expect("manual binding run starts");
+        let manual = self.settle_failed(&run).await;
+        assert_eq!(manual.binding, scheduled.binding);
+        assert_ne!(
+            manual.result, scheduled.result,
+            "a manual run has its own result"
+        );
+        assert!(
+            manual
+                .dispatches
+                .iter()
+                .map(|dispatch| &dispatch.operator)
+                .eq(scheduled
+                    .dispatches
+                    .iter()
+                    .map(|dispatch| &dispatch.operator)),
+            "the binding's Operator path"
+        );
+        assert!(
+            manual.dispatches.iter().all(|a| scheduled
+                .dispatches
+                .iter()
+                .all(|b| a.dispatch_id != b.dispatch_id)),
+            "a manual run creates its own dispatches"
+        );
+    }
+
+    /// Wait for `run` to complete with a failed binding result.
+    ///
+    /// # Panics
+    /// Panics when the run does not complete, names no result or binding, or
+    /// its verdict is not failed.
+    async fn settle_failed(&self, run: &VerificationRunId) -> BindingRun {
+        let status = wait_settled(self.verification, run).await;
+        assert_eq!(
+            status.status,
+            VerificationExecutionStatus::Completed,
+            "{status:?}"
+        );
+        let result_id = status.result_id.expect("a completed run names its result");
+        let (result, _) = read_result(self.server, self.query, &result_id.to_string()).await;
+        assert_eq!(result.verdict, "failed", "{result:?}");
+        let binding = result
+            .binding_id
+            .as_deref()
+            .expect("a binding run records its binding")
+            .parse()
+            .expect("binding id parses");
+        BindingRun {
+            binding,
+            result: result_id,
+            dispatches: status.dispatches,
+        }
+    }
 }
 
 /// Drive the refusals a real caller hits around Drift verification.

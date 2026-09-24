@@ -166,9 +166,9 @@ impl NativeWyrdTestServer {
     /// binding ID, or the update fails.
     #[napi]
     pub fn make_binding_due(&self, binding_id: String) -> Result<()> {
-        let binding = binding_id
-            .parse::<wyrd_spec::ids::BindingId>()
-            .map_err(reason)?;
+        let binding = binding_id.parse::<wyrd_spec::ids::BindingId>();
+        drop(binding_id);
+        let binding = binding.map_err(reason)?;
         let fixture = self.verification_fixture()?;
         wyrd_runtime::runtime()
             .block_on(fixture.make_binding_due(binding))
@@ -199,9 +199,9 @@ impl NativeWyrdTestServer {
     /// a Card UID, or no ready baseline exists.
     #[napi]
     pub fn retire_fitted_format(&self, verifier_uid: String) -> Result<()> {
-        let verifier = verifier_uid
-            .parse::<wyrd_spec::ids::CardUid>()
-            .map_err(reason)?;
+        let verifier = verifier_uid.parse::<wyrd_spec::ids::CardUid>();
+        drop(verifier_uid);
+        let verifier = verifier.map_err(reason)?;
         let fixture = self.verification_fixture()?;
         wyrd_runtime::runtime()
             .block_on(fixture.retire_fitted_format(&verifier))

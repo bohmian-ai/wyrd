@@ -3473,8 +3473,10 @@ impl WyrdTestServer {
     /// tenant cannot be provisioned.
     pub async fn verification_fixture(
         &self,
-    ) -> Result<crate::verification::VerificationFixture, crate::verification::VerificationFixtureError>
-    {
+    ) -> Result<
+        crate::verification::VerificationFixture,
+        crate::verification::VerificationFixtureError,
+    > {
         crate::verification::VerificationFixture::provision(
             self.inner.state.postgres.wyrd(),
             self.inner.fixture.data_tenant_id(),

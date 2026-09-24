@@ -14,6 +14,7 @@
 //! error, response, or log line can disclose the deployment's secret layout.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -458,12 +459,9 @@ impl OperatorKeys {
         let mut moved = 0;
         for row in &stale {
             let old_version = row.sealed.key_version;
-            if !old_keks.contains_key(&old_version) {
-                let old_kek = self.key(tenant, old_version).await?;
-                old_keks.insert(old_version, old_kek);
-            }
-            let Some(old_kek) = old_keks.get(&old_version) else {
-                continue;
+            let old_kek = match old_keks.entry(old_version) {
+                Entry::Occupied(cached) => cached.into_mut(),
+                Entry::Vacant(slot) => slot.insert(self.key(tenant, old_version).await?),
             };
             let context = SecretIdentity::of(tenant, &row.view, row.secret_version).context();
             let wrapped = wyrd_crypt::rewrap(

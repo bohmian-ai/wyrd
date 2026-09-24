@@ -1829,10 +1829,11 @@ fn default_vault_prefix() -> String {
 
 /// Operator connection key configuration (`[verification.operator_keys]`).
 ///
-/// Without a readable active key the rest of Wyrd runs; only creating or
-/// changing a connection credential refuses with
-/// `WYRD_OPERATOR_503_KEY_UNAVAILABLE`. Multi-tenant production (no
-/// `auth.tenant_slug`) must use [`OperatorKeySource::Vault`].
+/// Multi-tenant production (no `auth.tenant_slug`) must use
+/// [`OperatorKeySource::Vault`] over `https` and fails startup unless every
+/// active tenant's active key is readable. Elsewhere Wyrd runs without a
+/// readable active key; only creating or changing a connection credential
+/// refuses with `WYRD_OPERATOR_503_KEY_UNAVAILABLE`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperatorKeysConfig {

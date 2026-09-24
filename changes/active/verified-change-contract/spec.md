@@ -1,6 +1,6 @@
 ---
 id: SPEC-verified-change-contract
-revision: 37
+revision: 38
 status: approved
 ---
 
@@ -204,18 +204,23 @@ make the standalone LLM-judge Verifier implementation part of this delivery.
   The shared `vala-drift` scorer owns both direct and server scoring; the
   server only supplies ordered complete subgroup aggregates.
 - **REQ-156**: Baseline fitting MUST reject any null or non-finite value in a
-  required PSI or SPC feature. A selected target observation is one that
-  carries at least one configured PSI/SPC feature for the subject and window;
-  unrelated observations do not enter the comparison. A missing configured
-  feature in such an observation, or a null or non-finite value, MUST make
-  the affected Drift run inconclusive, with no scored details or feature rows;
+  required PSI or SPC feature. The server selects target observations for the
+  subject and window by configured series presence, even when a selected
+  series has a null value; unrelated observations do not enter the comparison.
+  Direct PSI/SPC scoring receives an already selected target batch: every row
+  is one relevant observation, and its caller excludes unrelated observations
+  before scoring. The direct scorer MUST NOT infer row membership from whether
+  configured values are non-null. In either path, a missing configured feature
+  in a selected observation, or a null or non-finite value, MUST make the
+  affected Drift run inconclusive, with no scored details or feature rows;
   values are not dropped or imputed. A target with no observations or
-  insufficient complete samples is likewise inconclusive. These checks apply
-  identically to direct scoring and server runs. Client `observe:drift`
-  continues to reject explicit
-  null and non-finite values; server checks also cover omitted features and
-  historical or externally ingested rows. Custom retains its existing null,
-  non-finite, and empty-window inconclusive behavior.
+  insufficient complete samples is likewise inconclusive. Direct and server
+  scoring MUST agree after the same observation selection. This is Wyrd's
+  explicit data-completeness policy, not a PSI or SPC formula. Client
+  `observe:drift` continues to reject explicit null and non-finite values;
+  server checks also cover omitted features and historical or externally
+  ingested rows. Custom retains its existing null, non-finite, and
+  empty-window inconclusive behavior.
 - **REQ-157**: Corrected PSI/SPC semantics begin with newly registered,
   immutable Verifier Card versions and newly fitted baselines. The service
   MUST NOT silently rescore existing Verifier versions or stored results
@@ -1507,7 +1512,11 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
   fixtures MUST prove exhaustive numeric/category bins, including unseen
   target categories and zero-count smoothing. Baseline and target fixtures
   MUST prove null, non-finite, omitted feature, insufficient sample, and
-  incomplete subgroup outcomes without silent row removal. Real Rust,
+  incomplete subgroup outcomes without silent row removal. Direct PSI/SPC
+  fixtures MUST pass only preselected relevant rows, prove that a selected
+  null-only row makes an otherwise sufficient target wholly unscored, and
+  prove that unrelated observations are excluded before direct scoring and by
+  the server. Real Rust,
   Python, and TypeScript SDK-to-server Drift journeys MUST prove the new
   report evidence, a failed scheduled run's Operator dispatch, and the
   visible refusal of legacy versions; direct scoring and server scoring must
@@ -1850,6 +1859,16 @@ remediation plan.
 - [PagerDuty Global Integrations and Service Routes](https://support.pagerduty.com/main/docs/event-orchestration)
 
 ## Revision history
+
+- **Revision 38 direct Drift input boundary (2026-09-24):** Approved by the
+  user after the TASK-011 review. Direct PSI/SPC batches contain only selected
+  observations; every row participates in completeness checks. Server
+  selection continues to use series identity, including present-null values.
+  The revision removes the impossible requirement to infer selected-row
+  membership from a wide batch's null values. It retains revision 37's
+  statistical formulas, fixed subgrouping, and explicit null-to-inconclusive
+  policy; no missing PSI bin, new observation format, or statistical method is
+  introduced. The remaining TASK-011 review findings still require remediation.
 
 - **Revision 37 conventional PSI/SPC (2026-09-24):** Approved complete
   categorical PSI bins, strict missing-data handling, fixed rational

@@ -1387,9 +1387,13 @@ connections through `/v1/operator-connections` (`operators:read` /
 secret itself in Postgres, envelope-encrypted: a per-row data key sealed with
 AAD binding tenant, connection, provider, name, and secret version, wrapped by
 a versioned key-encryption key from an environment variable, owner-only
-files, or HashiCorp Vault KV v2. Multi-tenant production requires Vault so
-each tenant has its own key; without a readable key only credential writes
-refuse. Responses, logs, and audit carry only redacted metadata. Registration
+files, or HashiCorp Vault KV v2. Multi-tenant production requires Vault over
+HTTPS so each tenant has its own key, and fails startup if the provider or any
+active tenant's active 32-byte key is unavailable; environment keys are
+development-only, and owner-only key files may serve an explicitly
+single-tenant deployment. Rewrap onto a new active version runs beside
+delivery in bounded, cancellable tenant-scoped passes. Responses, errors,
+logs, and audit carry only redacted metadata, never key locations. Registration
 and every delivery attempt require an active connection whose provider — and,
 for HTTP, auth scheme, header name, and origin of every effective URL —
 match; a mismatch fails closed with one indistinguishable error. Rotation

@@ -335,8 +335,8 @@ impl VerificationRuntimeBuilder<'_> {
     /// The scheduler and the Drift baseline fitter need the operator pool;
     /// the fitter also reads Data Card artifacts from server storage. The
     /// runner additionally needs the tenant token issuer and an ingest
-    /// endpoint, and runs Drift through this process's Oracle when it has
-    /// one; without the issuer or endpoint it is not
+    /// endpoint, and reads Drift observations through the ordinary query
+    /// service, local or peer-forwarded; without the issuer or endpoint it is not
     /// composed and therefore not required, so health is not degraded by an
     /// intentionally absent capability. Every composed capability is marked
     /// required on the shared health.
@@ -375,6 +375,11 @@ impl VerificationRuntimeBuilder<'_> {
         ];
         match (self.state.auth.tenant_issuer(), self.ingest_endpoint) {
             (Some(issuer), Some(endpoint)) => {
+                let drift = DriftEngine::new(
+                    self.state.clone(),
+                    issuer.clone(),
+                    self.limits.execution_timeout,
+                );
                 let publisher = ResultPublisher::new(postgres.clone(), issuer, endpoint);
                 #[cfg(feature = "test-support")]
                 let publisher = match self.publication_fault {
@@ -387,14 +392,7 @@ impl VerificationRuntimeBuilder<'_> {
                     queue,
                     VerifierPermits::new(self.limits.global_permits, self.limits.tenant_permits),
                     publisher,
-                    DriftEngine::new(
-                        postgres.clone(),
-                        self.state
-                            .bifrost
-                            .oracle()
-                            .map(|oracle| Arc::clone(oracle.engine())),
-                        self.limits.execution_timeout,
-                    ),
+                    drift,
                     self.limits,
                 );
                 #[cfg(feature = "test-support")]

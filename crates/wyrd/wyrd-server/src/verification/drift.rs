@@ -3,68 +3,62 @@
 //! [`DriftEngine`] loads the run's exact fitted baseline, asks Oracle for
 //! fixed server-owned aggregates over the run's subject and frozen
 //! `wyrd_event_time` window, and feeds only those aggregates to the existing
-//! `vala-drift` scorers. [`ObservationWindow`] owns the typed DataFusion plans:
-//! a schema-only scan of `vala.drift.observations` that Oracle replaces with
-//! its tenant-authorized provider, the exact subject/series/window filter, and
-//! one method-specific aggregate. No raw observation reaches Rust, and no plan
-//! carries user SQL: fitted edges, labels, and chunk sizes are typed literals.
+//! `vala-drift` scorers. [`ObservationWindow`] renders the fixed SQL: the
+//! canonical `vala.drift.observations` table, the exact subject/series/window
+//! filter, and one method-specific aggregate. The subject UID, feature name,
+//! fitted edges and labels, and window bounds are escaped typed literals; a
+//! Verifier contributes no SQL text.
 //!
-//! Input that cannot be scored (an empty Custom window, a null value in a
-//! numeric projection, a non-finite mean) completes as `Drift(None)`, the
-//! inconclusive result without a report. A transient Oracle or registry
-//! failure retries; a missing or mismatched fitted baseline terminates.
+//! Each statement runs as the tenant's SYSTEM Drift reader: the engine mints a
+//! token holding only `bifrost_query:read` on the tenant's registered
+//! observation table, verifies it through the server's ordinary token
+//! verifier, and dispatches through the ordinary query service — capability
+//! admission, Gate, and a local or peer-forwarded Oracle — so no Oracle need
+//! run in this process. Oracle's table authorization enforces the read and
+//! records the read decision. The shared scheduled-query consumer settles
+//! every stream, and each decoded aggregate batch is folded as it arrives.
+//!
+//! Input that cannot be scored (an empty Custom window, a tenant that never
+//! wrote an observation, a null value in a numeric projection, a non-finite
+//! mean) completes as `Drift(None)`, the inconclusive result without a report.
+//! A transient mint, query, or registry failure retries; a missing or
+//! mismatched fitted baseline or a malformed aggregate terminates.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use arrow::array::{Array, Float64Array, Int64Array, RecordBatch};
-use datafusion::arrow::datatypes::DataType;
-use datafusion::common::ScalarValue;
-use datafusion::error::DataFusionError;
-use datafusion::functions_aggregate::count::count_all;
-use datafusion::functions_aggregate::expr_fn::{avg, count};
-use datafusion::functions_window::expr_fn::row_number;
-use datafusion::logical_expr::logical_plan::builder::LogicalTableSource;
-use datafusion::logical_expr::{
-    Expr, ExprFunctionExt, LogicalPlan, LogicalPlanBuilder, cast, col, lit, when,
-};
-use futures_util::StreamExt as _;
-use vala_bifrost_redux::oracle::{AuthorizedQueryContext, Oracle, QueryIpcDecoder, QueryOptions};
-use vala_bifrost_redux::tables::builtin_table;
+use chrono::{DateTime, SecondsFormat, Utc};
+use datafusion::sql::sqlparser::ast::Value;
+use tokio_util::sync::CancellationToken;
 use vala_drift::psi::BinType;
-use vala_drift::{
-    FittedBaseline, PsiTargetCounts, SpcTargetChunks, score_custom_mean, score_psi_counts,
-    score_spc_chunks,
-};
-use wyrd_runtime::permission::{Permission, PermissionSet};
-use wyrd_runtime::{Principal, PrincipalKind};
+use vala_drift::{FittedBaseline, PsiTargetCounts, SpcScorer, score_custom_mean, score_psi_counts};
+use wyrd_auth::issuance::TenantTokenIssuer;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::card::drift::{DriftProfile, DriftSpec};
+use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::CardUid;
-use wyrd_spec::reference::{CardRef, CardRefScope};
+use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{AuthMethod, QueryStreamFrame, QueryTerminalOutcome, VisibilityMode};
+use wyrd_spec::vala::api::{BifrostQueryRequest, FreshnessPolicy, VisibilityMode};
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::verification::{DriftWindow, VerificationError};
-use wyrd_sql::WyrdPostgres;
-use wyrd_sql::queries::auth::service_accounts::system_principal_id;
 use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
 use wyrd_sql::queries::verifier_runs::{ClaimedRun, RunInput, TerminalStatus};
 
 use super::engines::{EngineOutcome, VerifierReport};
+use crate::components::auth::Caller;
+use crate::query::scheduled::ScheduledQueryCaller;
+use crate::state::AppState;
 
 /// Stable error code when a PSI or SPC Verifier has no ready fitted baseline.
 pub const BASELINE_NOT_READY: &str = "baseline_not_ready";
-/// Stable error code when this process hosts no ready Oracle to plan against.
-pub const ORACLE_UNAVAILABLE: &str = "oracle_unavailable";
-/// Stable error code when the aggregate query failed transiently.
+/// Stable error code when the reader could not be minted or the query failed.
 pub const DRIFT_QUERY_FAILED: &str = "drift_query_failed";
 /// Stable error code when the Verifier, baseline, and run cannot be scored together.
 pub const DRIFT_INVALID: &str = "drift_invalid";
 
-/// Canonical Bifrost table every Drift plan scans.
+/// Canonical Bifrost table every Drift statement reads.
 const OBSERVATIONS: &str = "vala.drift.observations";
 /// Aggregate bin of a null numeric value: the window is not scorable.
 const NULL_BIN: i64 = -2;
@@ -92,17 +86,17 @@ fn retry(code: &str, message: impl Into<String>) -> EngineOutcome {
 
 /// One run's subject and frozen ingest-time window over the observation table.
 ///
-/// A pure value: it builds the fixed logical plans and never executes them.
-/// Every plan filters the exact subject `card_uid`, one feature `series`, and
+/// A pure value: it renders the fixed SQL and never executes it. Every
+/// statement filters the exact subject `card_uid`, one feature `series`, and
 /// `wyrd_event_time` in `[start, end)` before its method-specific aggregate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservationWindow {
     /// Observed subject Card UID as the managed `card_uid` column stores it.
     subject: String,
-    /// Inclusive window start, microseconds since the Unix epoch, UTC.
-    start_micros: i64,
-    /// Exclusive window end, microseconds since the Unix epoch, UTC.
-    end_micros: i64,
+    /// Inclusive window start.
+    start: DateTime<Utc>,
+    /// Exclusive window end.
+    end: DateTime<Utc>,
 }
 
 impl ObservationWindow {
@@ -111,37 +105,37 @@ impl ObservationWindow {
     pub fn new(subject: &CardUid, window: &DriftWindow) -> Self {
         Self {
             subject: subject.to_string(),
-            start_micros: window.start.timestamp_micros(),
-            end_micros: window.end.timestamp_micros(),
+            start: window.start,
+            end: window.end,
         }
     }
 
-    /// Scan the observation table and keep only this window's `series` rows.
-    ///
-    /// The scan source is schema-only; Oracle swaps in the tenant-authorized
-    /// provider for the canonical table name before execution.
-    ///
-    /// # Errors
-    /// Returns a planning error when the built-in table is unknown or
-    /// DataFusion rejects the filter.
-    fn series(&self, series: &str) -> Result<LogicalPlanBuilder, DataFusionError> {
-        let table = builtin_table("drift", "observations").ok_or_else(|| {
-            DataFusionError::Plan("vala.drift.observations is not a built-in table".to_owned())
-        })?;
-        let source = Arc::new(LogicalTableSource::new((table.schema)()));
-        let micros = |value| {
-            lit(ScalarValue::TimestampMicrosecond(
-                Some(value),
-                Some("UTC".into()),
-            ))
-        };
-        LogicalPlanBuilder::scan(OBSERVATIONS, source, None)?.filter(
-            col("card_uid")
-                .eq(lit(self.subject.as_str()))
-                .and(col("series").eq(lit(series)))
-                .and(col("wyrd_event_time").gt_eq(micros(self.start_micros)))
-                .and(col("wyrd_event_time").lt(micros(self.end_micros))),
+    /// Render `value` as an escaped SQL string literal.
+    fn text(value: &str) -> String {
+        Value::SingleQuotedString(value.to_owned()).to_string()
+    }
+
+    /// Render `value` as a microsecond UTC timestamp string literal, which
+    /// Oracle coerces to the `wyrd_event_time` column type.
+    fn instant(value: DateTime<Utc>) -> String {
+        Self::text(&value.to_rfc3339_opts(SecondsFormat::Micros, true))
+    }
+
+    /// The shared `FROM ... WHERE` clause selecting this window's `series` rows.
+    fn rows(&self, series: &str) -> String {
+        format!(
+            "FROM {OBSERVATIONS} WHERE card_uid = {} AND series = {} \
+             AND wyrd_event_time >= {} AND wyrd_event_time < {}",
+            Self::text(&self.subject),
+            Self::text(series),
+            Self::instant(self.start),
+            Self::instant(self.end),
         )
+    }
+
+    /// Group `bin` over `rows` and count each group as `(bin_id, n)`.
+    fn count_bins(bin: &str, rows: &str) -> String {
+        format!("SELECT bin_id, COUNT(*) AS n FROM (SELECT {bin} AS bin_id {rows}) GROUP BY bin_id")
     }
 
     /// Count `series` values into fitted `(lower, upper]` numeric bins.
@@ -151,59 +145,46 @@ impl ObservationWindow {
     /// [`NULL_BIN`] so the caller can refuse to score the window.
     ///
     /// # Errors
-    /// Returns a planning error when `edges` has fewer than two entries or
-    /// DataFusion rejects the plan.
-    pub fn psi_numeric(&self, series: &str, edges: &[f64]) -> Result<LogicalPlan, DataFusionError> {
+    /// Returns a description when `edges` has fewer than two entries or an
+    /// inner edge is not finite.
+    pub fn psi_numeric(&self, series: &str, edges: &[f64]) -> Result<String, String> {
         let bins = edges
             .len()
             .checked_sub(1)
             .filter(|bins| *bins > 0)
-            .ok_or_else(|| {
-                DataFusionError::Plan("a numeric PSI feature needs at least one bin".to_owned())
-            })?;
-        let value = || col("num_value");
-        let mut case = when(value().is_null(), lit(NULL_BIN));
+            .ok_or("a numeric PSI feature needs at least one bin")?;
+        let mut case = format!("CASE WHEN num_value IS NULL THEN {NULL_BIN}");
         for (index, upper) in edges[1..bins].iter().enumerate() {
-            case.when(value().lt_eq(lit(*upper)), lit(bin_id(index)?));
+            if !upper.is_finite() {
+                return Err("a fitted inner PSI edge is not finite".to_owned());
+            }
+            case.push_str(&format!(" WHEN num_value <= {upper:e} THEN {index}"));
         }
-        let bin = case.otherwise(lit(bin_id(bins - 1)?))?;
-        Self::count_bins(self.series(series)?, bin)
+        case.push_str(&format!(" ELSE {} END", bins - 1));
+        Ok(Self::count_bins(&case, &self.rows(series)))
     }
 
     /// Count non-null `series` categories into fitted labels.
     ///
     /// Returns `(bin_id, n)` rows; a category absent from `labels` lands in
     /// [`UNKNOWN_BIN`], which counts toward the target total only.
-    ///
-    /// # Errors
-    /// Returns a planning error when DataFusion rejects the plan.
-    pub fn psi_categorical(
-        &self,
-        series: &str,
-        labels: &[&str],
-    ) -> Result<LogicalPlan, DataFusionError> {
-        let value = || col("str_value");
-        let bin = match labels.split_first() {
-            None => lit(UNKNOWN_BIN),
-            Some((first, rest)) => {
-                let mut case = when(value().eq(lit(*first)), lit(0_i64));
-                for (index, label) in rest.iter().enumerate() {
-                    case.when(value().eq(lit(*label)), lit(bin_id(index + 1)?));
-                }
-                case.otherwise(lit(UNKNOWN_BIN))?
+    #[must_use]
+    pub fn psi_categorical(&self, series: &str, labels: &[&str]) -> String {
+        let bin = if labels.is_empty() {
+            UNKNOWN_BIN.to_string()
+        } else {
+            let mut case = "CASE".to_owned();
+            for (index, label) in labels.iter().enumerate() {
+                case.push_str(&format!(
+                    " WHEN str_value = {} THEN {index}",
+                    Self::text(label)
+                ));
             }
+            case.push_str(&format!(" ELSE {UNKNOWN_BIN} END"));
+            case
         };
-        Self::count_bins(self.series(series)?.filter(value().is_not_null())?, bin)
-    }
-
-    /// Group `input` by `bin` and count each group as `(bin_id, n)`.
-    ///
-    /// # Errors
-    /// Returns a planning error when DataFusion rejects the aggregate.
-    fn count_bins(input: LogicalPlanBuilder, bin: Expr) -> Result<LogicalPlan, DataFusionError> {
-        input
-            .aggregate(vec![bin.alias("bin_id")], vec![count_all().alias("n")])?
-            .build()
+        let rows = format!("{} AND str_value IS NOT NULL", self.rows(series));
+        Self::count_bins(&bin, &rows)
     }
 
     /// Form consecutive `chunk_size` subgroups of `series` in observation order.
@@ -211,67 +192,32 @@ impl ObservationWindow {
     /// Rows are numbered by `created_at`, then `record_id`; subgroup `k`
     /// holds rows `k·chunk_size ..` and the last may be a shorter trailing
     /// chunk, as the existing scorer forms them. Returns
-    /// `(chunk, n, numeric, mean)` ordered by chunk; `n != numeric` exposes a
-    /// null value.
+    /// `(chunk, n, numeric_n, mean)` ordered by chunk; `n != numeric_n`
+    /// exposes a null value.
     ///
     /// # Errors
-    /// Returns a planning error when `chunk_size` is zero or DataFusion
-    /// rejects the plan.
-    pub fn spc(&self, series: &str, chunk_size: u32) -> Result<LogicalPlan, DataFusionError> {
+    /// Returns a description when `chunk_size` is zero.
+    pub fn spc(&self, series: &str, chunk_size: u32) -> Result<String, String> {
         if chunk_size == 0 {
-            return Err(DataFusionError::Plan(
-                "an SPC chunk size is positive".to_owned(),
-            ));
+            return Err("an SPC chunk size is positive".to_owned());
         }
-        let rn = row_number()
-            .order_by(vec![
-                col("created_at").sort(true, false),
-                col("record_id").sort(true, false),
-            ])
-            .build()?
-            .alias("rn");
-        let chunk = cast(
-            (cast(col("rn"), DataType::Int64) - lit(1_i64)) / lit(i64::from(chunk_size)),
-            DataType::Int64,
-        );
-        self.series(series)?
-            .window(vec![rn])?
-            .aggregate(
-                vec![chunk.alias("chunk")],
-                vec![
-                    count_all().alias("n"),
-                    count(col("num_value")).alias("numeric"),
-                    avg(col("num_value")).alias("mean"),
-                ],
-            )?
-            .sort(vec![col("chunk").sort(true, false)])?
-            .build()
+        Ok(format!(
+            "SELECT chunk, COUNT(*) AS n, COUNT(num_value) AS numeric_n, AVG(num_value) AS mean \
+             FROM (SELECT num_value, CAST((ROW_NUMBER() OVER (ORDER BY created_at ASC NULLS LAST, \
+             record_id ASC NULLS LAST) - 1) / {chunk_size} AS BIGINT) AS chunk {}) \
+             GROUP BY chunk ORDER BY chunk",
+            self.rows(series)
+        ))
     }
 
-    /// Summarize `series` as one `(n, numeric, mean)` row.
-    ///
-    /// # Errors
-    /// Returns a planning error when DataFusion rejects the plan.
-    pub fn custom(&self, series: &str) -> Result<LogicalPlan, DataFusionError> {
-        self.series(series)?
-            .aggregate(
-                Vec::<Expr>::new(),
-                vec![
-                    count_all().alias("n"),
-                    count(col("num_value")).alias("numeric"),
-                    avg(col("num_value")).alias("mean"),
-                ],
-            )?
-            .build()
+    /// Summarize `series` as one `(n, numeric_n, mean)` row.
+    #[must_use]
+    pub fn custom(&self, series: &str) -> String {
+        format!(
+            "SELECT COUNT(*) AS n, COUNT(num_value) AS numeric_n, AVG(num_value) AS mean {}",
+            self.rows(series)
+        )
     }
-}
-
-/// Convert a fitted bin index into its `bin_id` literal.
-///
-/// # Errors
-/// Returns a planning error when the index does not fit in `i64`.
-fn bin_id(index: usize) -> Result<i64, DataFusionError> {
-    i64::try_from(index).map_err(|_| DataFusionError::Plan("too many fitted bins".to_owned()))
 }
 
 /// Read a non-null `Int64` column `name` of `batch`.
@@ -305,99 +251,94 @@ fn count_of(value: i64) -> Result<u64, String> {
     u64::try_from(value).map_err(|_| "aggregate count is negative".to_owned())
 }
 
-/// Fold `(bin_id, n)` rows into target counts over `bins` fitted bins.
+/// Fold one batch of `(bin_id, n)` rows into `counts`.
 ///
 /// Absent bins stay zero; [`UNKNOWN_BIN`] adds to the total only. Returns
-/// `Ok(None)` when a null value was counted, which leaves the window
+/// `Ok(false)` when a null value was counted, which leaves the window
 /// unscorable.
 ///
 /// # Errors
 /// Returns a description for a malformed aggregate or an out-of-range bin.
-pub fn psi_counts(batches: &[RecordBatch], bins: usize) -> Result<Option<PsiTargetCounts>, String> {
-    let mut counts = PsiTargetCounts {
-        bins: vec![0; bins],
-        total: 0,
-    };
-    for batch in batches {
-        let (ids, ns) = (int64s(batch, "bin_id")?, int64s(batch, "n")?);
-        for (id, n) in ids.values().iter().zip(ns.values()) {
-            let n = count_of(*n)?;
-            match *id {
-                NULL_BIN => return Ok(None),
-                UNKNOWN_BIN => {}
-                id => {
-                    let slot = usize::try_from(id)
-                        .ok()
-                        .and_then(|index| counts.bins.get_mut(index))
-                        .ok_or_else(|| format!("aggregate bin {id} is not a fitted bin"))?;
-                    *slot += n;
-                }
+pub fn fold_psi(batch: &RecordBatch, counts: &mut PsiTargetCounts) -> Result<bool, String> {
+    let (ids, ns) = (int64s(batch, "bin_id")?, int64s(batch, "n")?);
+    let mut scorable = true;
+    for (id, n) in ids.values().iter().zip(ns.values()) {
+        let n = count_of(*n)?;
+        match *id {
+            NULL_BIN => scorable = false,
+            UNKNOWN_BIN => {}
+            id => {
+                let slot = usize::try_from(id)
+                    .ok()
+                    .and_then(|index| counts.bins.get_mut(index))
+                    .ok_or_else(|| format!("aggregate bin {id} is not a fitted bin"))?;
+                *slot += n;
             }
-            counts.total += n;
         }
+        counts.total += n;
     }
-    Ok(Some(counts))
+    Ok(scorable)
 }
 
-/// Fold ordered `(chunk, n, numeric, mean)` rows into SPC target chunks.
+/// Feed one batch of ordered `(chunk, n, numeric_n, mean)` rows of `feature`
+/// to `scorer`.
 ///
-/// Returns `Ok(None)` when any chunk counted a null value.
+/// Returns `Ok(false)` without feeding further rows when a chunk counted a
+/// null value, which leaves the window unscorable.
 ///
 /// # Errors
-/// Returns a description for a malformed aggregate.
-pub fn spc_chunks(batches: &[RecordBatch]) -> Result<Option<SpcTargetChunks>, String> {
-    let mut chunks = SpcTargetChunks {
-        rows: 0,
-        means: Vec::new(),
-    };
-    for batch in batches {
-        let (ns, numeric, means) = (
-            int64s(batch, "n")?,
-            int64s(batch, "numeric")?,
-            float64s(batch, "mean")?,
-        );
-        for row in 0..batch.num_rows() {
-            if ns.value(row) != numeric.value(row) || means.is_null(row) {
-                return Ok(None);
-            }
-            chunks.rows += count_of(ns.value(row))?;
-            chunks.means.push(means.value(row));
+/// Returns a description for a malformed aggregate or a chunk the scorer
+/// refuses.
+pub fn fold_spc(
+    batch: &RecordBatch,
+    feature: &wyrd_spec::ids::FeatureName,
+    scorer: &mut SpcScorer,
+) -> Result<bool, String> {
+    let (ns, numeric, means) = (
+        int64s(batch, "n")?,
+        int64s(batch, "numeric_n")?,
+        float64s(batch, "mean")?,
+    );
+    for row in 0..batch.num_rows() {
+        if ns.value(row) != numeric.value(row) || means.is_null(row) {
+            return Ok(false);
         }
+        scorer
+            .push(feature, count_of(ns.value(row))?, means.value(row))
+            .map_err(|error| error.to_string())?;
     }
-    Ok(Some(chunks))
+    Ok(true)
 }
 
-/// Read the single Custom `(n, numeric, mean)` row as a scorable mean.
-///
-/// Returns `Ok(None)` for an empty window, a null value, or a non-finite mean.
+/// Read one batch of the Custom `(n, numeric_n, mean)` aggregate into `row`.
 ///
 /// # Errors
-/// Returns a description when the aggregate is not exactly one row.
-pub fn custom_mean(batches: &[RecordBatch]) -> Result<Option<f64>, String> {
-    let mut rows = batches.iter().filter(|batch| batch.num_rows() > 0);
-    let (Some(batch), None) = (rows.next(), rows.next()) else {
-        return Err("the Custom aggregate is not exactly one row".to_owned());
-    };
-    if batch.num_rows() != 1 {
+/// Returns a description for a malformed aggregate or a second row.
+pub fn fold_custom(batch: &RecordBatch, row: &mut Option<Option<f64>>) -> Result<(), String> {
+    if batch.num_rows() == 0 {
+        return Ok(());
+    }
+    if batch.num_rows() > 1 || row.is_some() {
         return Err("the Custom aggregate is not exactly one row".to_owned());
     }
     let (n, numeric, mean) = (
         int64s(batch, "n")?.value(0),
-        int64s(batch, "numeric")?.value(0),
+        int64s(batch, "numeric_n")?.value(0),
         float64s(batch, "mean")?,
     );
-    Ok(
+    *row = Some(
         (n > 0 && n == numeric && mean.is_valid(0) && mean.value(0).is_finite())
             .then(|| mean.value(0)),
-    )
+    );
+    Ok(())
 }
 
-/// Owner of Drift execution: baseline loading, Oracle aggregates, scoring.
+/// Owner of Drift execution: baseline loading, SYSTEM reads, scoring.
 pub struct DriftEngine {
-    /// Wyrd Postgres owner for the fitted baseline and SYSTEM principal reads.
-    postgres: WyrdPostgres,
-    /// This process's Oracle; `None` when the process hosts no Oracle role.
-    oracle: Option<Arc<Oracle>>,
+    /// Server state owning Postgres, the token verifier, and the query service.
+    state: AppState,
+    /// The one tenant token issuer the SYSTEM Drift reader is minted through.
+    issuer: TenantTokenIssuer,
     /// Fitted baseline reads.
     baselines: DriftBaselineQueue,
     /// Deadline of one aggregate query.
@@ -405,16 +346,12 @@ pub struct DriftEngine {
 }
 
 impl DriftEngine {
-    /// Build an engine over `postgres` and this process's `oracle`.
+    /// Build an engine reading through `state` as readers minted by `issuer`.
     #[must_use]
-    pub fn new(
-        postgres: WyrdPostgres,
-        oracle: Option<Arc<Oracle>>,
-        query_timeout: Duration,
-    ) -> Self {
+    pub fn new(state: AppState, issuer: TenantTokenIssuer, query_timeout: Duration) -> Self {
         Self {
-            postgres,
-            oracle,
+            state,
+            issuer,
             baselines: DriftBaselineQueue::default(),
             query_timeout,
         }
@@ -422,10 +359,10 @@ impl DriftEngine {
 
     /// Execute one claimed Drift run of `verifier` for `tenant`.
     ///
-    /// Loads the fitted baseline (PSI/SPC), plans one aggregate per feature,
-    /// runs each through Oracle as the tenant's SYSTEM reader scoped to
-    /// `verifier`, and scores the aggregates. Never fails: every failure is
-    /// the [`EngineOutcome`] it maps to.
+    /// Loads the fitted baseline (PSI/SPC), runs one fixed aggregate per
+    /// feature as the tenant's SYSTEM Drift reader, and scores the folded
+    /// aggregates. Never fails: every failure is the [`EngineOutcome`] it
+    /// maps to.
     pub async fn verify(
         &self,
         tenant: DataTenantId,
@@ -461,13 +398,20 @@ impl DriftEngine {
         let scored = |result: Result<vala_drift::DriftReport, vala_drift::DriftScoreError>| {
             result.map(Some).map_err(|error| invalid(error.to_string()))
         };
+        let reader = Reader {
+            engine: self,
+            tenant,
+            verifier,
+        };
         match spec.profile.as_ref() {
             Some(DriftProfile::Custom(profile)) => {
-                let plan = window
-                    .custom(&profile.metric_name)
-                    .map_err(|e| invalid(e.to_string()))?;
-                let batches = self.aggregate(tenant, verifier, plan).await?;
-                match custom_mean(&batches).map_err(invalid)? {
+                let mut row = None;
+                reader
+                    .fold(window.custom(&profile.metric_name), |batch| {
+                        fold_custom(batch, &mut row)
+                    })
+                    .await?;
+                match row.flatten() {
                     Some(mean) => scored(score_custom_mean(mean, profile)),
                     None => Ok(None),
                 }
@@ -481,32 +425,35 @@ impl DriftEngine {
                 };
                 let mut counts = BTreeMap::new();
                 for (name, feature) in &baseline.features {
-                    let plan = match feature.bin_type {
+                    let sql = match feature.bin_type {
                         BinType::Numeric => feature
                             .numeric_edges()
-                            .map_err(|e| invalid(e.to_string()))
-                            .and_then(|edges| {
-                                window
-                                    .psi_numeric(name.as_str(), &edges)
-                                    .map_err(|e| invalid(e.to_string()))
-                            })?,
+                            .map_err(|error| error.to_string())
+                            .and_then(|edges| window.psi_numeric(name.as_str(), &edges))
+                            .map_err(&invalid)?,
                         BinType::Categorical => {
                             let labels = feature
                                 .bins
                                 .iter()
                                 .map(|bin| bin.categorical_value.as_deref().unwrap_or_default())
                                 .collect::<Vec<_>>();
-                            window
-                                .psi_categorical(name.as_str(), &labels)
-                                .map_err(|e| invalid(e.to_string()))?
+                            window.psi_categorical(name.as_str(), &labels)
                         }
                     };
-                    let batches = self.aggregate(tenant, verifier, plan).await?;
-                    let Some(feature_counts) =
-                        psi_counts(&batches, feature.bins.len()).map_err(invalid)?
-                    else {
-                        return Ok(None);
+                    let mut feature_counts = PsiTargetCounts {
+                        bins: vec![0; feature.bins.len()],
+                        total: 0,
                     };
+                    let mut scorable = true;
+                    reader
+                        .fold(sql, |batch| {
+                            scorable &= fold_psi(batch, &mut feature_counts)?;
+                            Ok(())
+                        })
+                        .await?;
+                    if !scorable {
+                        return Ok(None);
+                    }
                     counts.insert(name.clone(), feature_counts);
                 }
                 scored(score_psi_counts(&baseline, &counts, profile))
@@ -518,18 +465,26 @@ impl DriftEngine {
                         "the fitted baseline is not an SPC baseline".to_owned(),
                     ));
                 };
-                let mut chunks = BTreeMap::new();
+                let mut scorer =
+                    SpcScorer::new(&baseline, profile).map_err(|e| invalid(e.to_string()))?;
                 for name in baseline.features.keys() {
-                    let plan = window
+                    let sql = window
                         .spc(name.as_str(), baseline.chunk_size)
-                        .map_err(|e| invalid(e.to_string()))?;
-                    let batches = self.aggregate(tenant, verifier, plan).await?;
-                    let Some(feature_chunks) = spc_chunks(&batches).map_err(invalid)? else {
+                        .map_err(&invalid)?;
+                    let mut scorable = true;
+                    reader
+                        .fold(sql, |batch| {
+                            if scorable {
+                                scorable = fold_spc(batch, name, &mut scorer)?;
+                            }
+                            Ok(())
+                        })
+                        .await?;
+                    if !scorable {
                         return Ok(None);
-                    };
-                    chunks.insert(name.clone(), feature_chunks);
+                    }
                 }
-                scored(score_spc_chunks(&baseline, &chunks, profile))
+                Ok(Some(scorer.finish()))
             }
             None => Err(invalid("the Drift Verifier has no profile".to_owned())),
         }
@@ -548,7 +503,9 @@ impl DriftEngine {
         let unavailable =
             |error: &dyn std::fmt::Display| retry(DRIFT_QUERY_FAILED, error.to_string());
         let mut conn = self
+            .state
             .postgres
+            .wyrd()
             .tenant_conn(tenant)
             .await
             .map_err(|error| unavailable(&error))?;
@@ -560,124 +517,150 @@ impl DriftEngine {
             .ok_or_else(|| terminal(BASELINE_NOT_READY, "the Drift baseline is not fitted"))?;
         serde_json::from_value(fitted).map_err(|error| terminal(DRIFT_INVALID, error.to_string()))
     }
+}
 
-    /// Build the tenant SYSTEM reader context scoped to `verifier`.
+/// The SYSTEM Drift reader of one run: its tenant and attributed Verifier.
+struct Reader<'a> {
+    /// Engine owning the server state and issuer.
+    engine: &'a DriftEngine,
+    /// Run tenant every read is minted for.
+    tenant: DataTenantId,
+    /// Exact Verifier the read token is attributed to.
+    verifier: &'a CardRef,
+}
+
+impl Reader<'_> {
+    /// Mint and verify a fresh SYSTEM Drift read token and derive its caller.
     ///
-    /// The SYSTEM principal is the tenant's persisted internal identity; it
-    /// holds only Bifrost query read, and Oracle audits the read decision.
+    /// Returns `Ok(None)` when the tenant has never registered the observation
+    /// table, so there is nothing to read.
     ///
     /// # Errors
-    /// Retries when the principal cannot be read or the tenant has none.
-    async fn context(
-        &self,
-        tenant: DataTenantId,
-        verifier: &CardRef,
-    ) -> Result<AuthorizedQueryContext, EngineOutcome> {
+    /// Retries when the tenant connection, mint, or verification fails.
+    async fn caller(&self) -> Result<Option<Caller>, EngineOutcome> {
         let unavailable =
             |error: &dyn std::fmt::Display| retry(DRIFT_QUERY_FAILED, error.to_string());
         let mut conn = self
+            .engine
+            .state
             .postgres
-            .tenant_conn(tenant)
+            .wyrd()
+            .tenant_conn(self.tenant)
             .await
             .map_err(|error| unavailable(&error))?;
-        let principal = system_principal_id(&mut conn)
+        let Some(token) = self
+            .engine
+            .issuer
+            .issue_system_drift_read_token(&mut conn, self.verifier)
             .await
             .map_err(|error| unavailable(&error))?
-            .ok_or_else(|| retry(DRIFT_QUERY_FAILED, "the tenant has no SYSTEM principal"))?;
+        else {
+            return Ok(None);
+        };
         drop(conn);
-        let permission = Permission::bifrost_query_read();
-        AuthorizedQueryContext::try_new(
-            Principal::new(
-                PrincipalId::new(principal),
-                PrincipalKind::System {
-                    card_ref_scope: CardRefScope::own(verifier),
-                },
-                tenant,
-                Vec::new(),
-                PermissionSet::from_iter([permission.clone()]),
-            ),
-            tenant,
-            RequestId::now_v7(),
-            None,
-            AuthMethod::Internal,
-            permission,
-        )
-        .map_err(|error| unavailable(&error))
+        let verifier = self
+            .engine
+            .state
+            .auth
+            .token_verifier
+            .as_deref()
+            .ok_or_else(|| retry(DRIFT_QUERY_FAILED, "no token verifier is configured"))?;
+        let verified = verifier
+            .verify(&token.access_token, &self.tenant)
+            .map_err(|error| unavailable(&error))?;
+        Ok(Some(Caller {
+            data_tenant_id: self.tenant,
+            principal: verified.principal,
+            request_id: RequestId::now_v7(),
+            delegation_chain: verified.delegation_chain,
+        }))
     }
 
-    /// Run `plan` through Oracle and collect its aggregate batches.
+    /// Run `sql` as a fresh reader and hand each decoded batch to `fold`.
     ///
-    /// A tenant that has never written an observation owns no table yet,
-    /// which is an empty window rather than a failure.
+    /// A tenant with no observation table reads nothing and `fold` is never
+    /// called. The stream is consumed and settled by the shared scheduled
+    /// consumer; a batch `fold` refuses terminates the run as invalid.
     ///
     /// # Errors
-    /// Retries when no Oracle is hosted here, or the query is refused, fails,
-    /// or its stream is malformed or incomplete.
-    async fn aggregate(
-        &self,
-        tenant: DataTenantId,
-        verifier: &CardRef,
-        plan: LogicalPlan,
-    ) -> Result<Vec<RecordBatch>, EngineOutcome> {
-        let Some(oracle) = &self.oracle else {
-            return Err(retry(ORACLE_UNAVAILABLE, "this process hosts no Oracle"));
+    /// Retries a mint, admission, query, or stream failure; terminates on a
+    /// malformed aggregate.
+    async fn fold<F>(&self, sql: String, mut fold: F) -> Result<(), EngineOutcome>
+    where
+        F: FnMut(&RecordBatch) -> Result<(), String>,
+    {
+        let Some(caller) = self.caller().await? else {
+            return Ok(());
         };
-        let context = self.context(tenant, verifier).await?;
-        let failed = |error: BifrostError| retry(DRIFT_QUERY_FAILED, error.to_string());
-        let options = QueryOptions {
+        let failed = |error: WyrdError| retry(DRIFT_QUERY_FAILED, error.to_string());
+        let query = ScheduledQueryCaller::authenticated(
+            self.engine.state.clone(),
+            caller,
+            CancellationToken::new(),
+        )
+        .map_err(failed)?;
+        let request = BifrostQueryRequest {
+            sql,
             visibility: VisibilityMode::Fused,
-            deadline: Instant::now() + self.query_timeout,
+            freshness: FreshnessPolicy::Strict,
+            deadline_ms: Some(
+                i64::try_from(self.engine.query_timeout.as_millis()).unwrap_or(i64::MAX),
+            ),
         };
-        let mut stream = match oracle.query_plan(context, plan, options).await {
-            Ok(stream) => stream,
-            Err(BifrostError::TableNotFound { .. }) => return Ok(Vec::new()),
-            Err(error) => return Err(failed(error)),
-        };
-        let mut decoder = QueryIpcDecoder::new();
-        let mut batches = Vec::new();
-        let decode = |error: &dyn std::fmt::Display| retry(DRIFT_QUERY_FAILED, error.to_string());
-        while let Some(frame) = stream.frames.next().await {
-            match frame.map_err(failed)? {
-                QueryStreamFrame::Schema(schema) => {
-                    decoder
-                        .accept_schema(&schema.arrow_ipc_schema)
-                        .map_err(|error| decode(&error))?;
-                }
-                QueryStreamFrame::Batch(batch) => batches.push(
-                    decoder
-                        .accept_batch(&batch.arrow_ipc_batch)
-                        .map_err(|error| decode(&error))?,
-                ),
-                QueryStreamFrame::Terminal(terminal) => {
-                    if terminal.outcome == QueryTerminalOutcome::Failed {
-                        return Err(failed(
-                            terminal
-                                .error
-                                .map_or(BifrostError::QueryExecutionFailed, |error| {
-                                    crate::query::service::terminal_error_to_bifrost(error.code)
-                                }),
-                        ));
-                    }
-                    decoder
-                        .accept_eos(&terminal.arrow_ipc_eos)
-                        .map_err(|error| decode(&error))?;
-                    return Ok(batches);
-                }
-            }
+        let mut malformed = None;
+        let settled = query
+            .run_with(request, |batch| {
+                fold(&batch).map_err(|message| {
+                    malformed = Some(message);
+                    WyrdError::from(BifrostError::QueryStreamProtocol)
+                })
+            })
+            .await;
+        if let Some(message) = malformed {
+            return Err(terminal(DRIFT_INVALID, message));
         }
-        Err(failed(BifrostError::QueryStreamIncomplete))
+        settled.map(drop).map_err(failed)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    //! Proof of the fixed Drift SQL and aggregate folds.
+    //!
+    //! Every statement is executed by DataFusion over the real
+    //! `vala.drift.observations` schema, so fitted-edge equality, category
+    //! escaping, `[start, end)` exclusion, subject/series isolation, and SPC
+    //! observation order are proved on the rendered SQL rather than on its
+    //! text. The fold tests pin malformed-aggregate refusal and the
+    //! unscorable-window outcome.
+
     use std::sync::Arc;
 
-    use arrow::array::{Float64Array, Int64Array, RecordBatch};
+    use arrow::array::{
+        Float64Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+    };
     use arrow::datatypes::{DataType, Field, Schema};
     use chrono::{TimeZone as _, Utc};
+    use datafusion::catalog::{
+        CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider, SchemaProvider,
+    };
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::SessionContext;
+    use vala_bifrost_redux::tables::builtin_table;
 
     use super::*;
+
+    /// One observation row: subject, series, numeric and string values,
+    /// event and creation seconds past the window start, and record id.
+    type Row<'a> = (
+        &'a str,
+        &'a str,
+        Option<f64>,
+        Option<&'a str>,
+        i64,
+        i64,
+        &'a str,
+    );
 
     /// Build a batch of named `Int64` and `Float64` columns.
     ///
@@ -697,132 +680,252 @@ mod tests {
         RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("valid batch")
     }
 
-    /// A window over one subject and a one-hour span.
+    /// The window start every fixture row is offset from.
+    fn start() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 9, 17, 0, 0, 0)
+            .single()
+            .expect("start")
+    }
+
+    /// The subject UID every in-scope fixture row carries.
+    fn subject() -> CardUid {
+        CardUid::from_uuid(uuid::Uuid::from_u128(
+            0x0190_0000_0000_7000_8000_0000_0000_0001,
+        ))
+        .expect("a v7 UUID is a Card UID")
+    }
+
+    /// A window over [`subject`] from [`start`] for one hour.
     fn window() -> ObservationWindow {
         ObservationWindow::new(
-            &CardUid::from_uuid(uuid::Uuid::now_v7()).expect("a v7 UUID is a Card UID"),
+            &subject(),
             &DriftWindow {
-                start: Utc
-                    .with_ymd_and_hms(2026, 9, 17, 0, 0, 0)
-                    .single()
-                    .expect("start"),
-                end: Utc
-                    .with_ymd_and_hms(2026, 9, 17, 1, 0, 0)
-                    .single()
-                    .expect("end"),
+                start: start(),
+                end: start() + chrono::Duration::hours(1),
             },
         )
     }
 
-    /// Every fixed plan builds, filters the exact subject/series/window, and
-    /// returns only its aggregate columns.
-    #[test]
-    fn plans_filter_the_window_and_return_aggregates_only() {
-        let window = window();
-        let plans = [
-            (
-                window
-                    .psi_numeric("age", &[f64::NEG_INFINITY, 10.0, 20.0, f64::INFINITY])
-                    .expect("numeric plan"),
-                vec!["bin_id", "n"],
-            ),
-            (
-                window
-                    .psi_categorical("color", &["red", "blue"])
-                    .expect("categorical plan"),
-                vec!["bin_id", "n"],
-            ),
-            (
-                window.spc("age", 5).expect("spc plan"),
-                vec!["chunk", "n", "numeric", "mean"],
-            ),
-            (
-                window.custom("latency").expect("custom plan"),
-                vec!["n", "numeric", "mean"],
-            ),
-        ];
-        for (plan, columns) in plans {
-            let names = plan
-                .schema()
+    /// Execute `sql` over `rows` stored in the real observation columns.
+    ///
+    /// Columns the statements never read are null, so every field is relaxed
+    /// to nullable; names and types are the table's own.
+    ///
+    /// # Panics
+    /// Panics when the fixture cannot be registered or the SQL fails.
+    async fn run(sql: &str, rows: &[Row<'_>]) -> Vec<RecordBatch> {
+        let table = (builtin_table("drift", "observations")
+            .expect("observations is built in")
+            .schema)();
+        let schema = Arc::new(Schema::new(
+            table
                 .fields()
                 .iter()
-                .map(|field| field.name().as_str())
-                .collect::<Vec<_>>();
-            assert_eq!(names, columns);
-            let rendered = plan.display_indent().to_string();
-            assert!(
-                rendered.contains("TableScan: vala.drift.observations"),
-                "{rendered}"
-            );
-            assert!(rendered.contains(&window.subject), "{rendered}");
-            assert!(rendered.contains("wyrd_event_time >="), "{rendered}");
-            assert!(rendered.contains("wyrd_event_time <"), "{rendered}");
-        }
-        assert!(window.spc("age", 0).is_err());
-        assert!(window.psi_numeric("age", &[0.0]).is_err());
-    }
-
-    /// PSI counts zero-fill absent bins, add unknown categories to the total
-    /// only, and refuse a window with a null value.
-    #[test]
-    fn psi_counts_zero_fill_and_count_unknowns() {
-        let rows = batch(&[("bin_id", vec![2, -1, 0]), ("n", vec![5, 3, 7])], &[]);
-        let counts = psi_counts(&[rows], 4).expect("counts").expect("scorable");
-        assert_eq!(counts.bins, vec![7, 0, 5, 0]);
-        assert_eq!(counts.total, 15);
-        let null = batch(&[("bin_id", vec![0, -2]), ("n", vec![5, 1])], &[]);
-        assert_eq!(psi_counts(&[null], 2).expect("counts"), None);
-        let stray = batch(&[("bin_id", vec![9]), ("n", vec![1])], &[]);
-        assert!(psi_counts(&[stray], 2).is_err());
-        assert_eq!(
-            psi_counts(&[], 2).expect("empty"),
-            Some(PsiTargetCounts {
-                bins: vec![0, 0],
-                total: 0
+                .map(|field| field.as_ref().clone().with_nullable(true))
+                .collect::<Vec<_>>(),
+        ));
+        let micros = |seconds: i64| start().timestamp_micros() + seconds * 1_000_000;
+        let columns: Vec<Arc<dyn Array>> = schema
+            .fields()
+            .iter()
+            .map(|field| -> Arc<dyn Array> {
+                match field.name().as_str() {
+                    "card_uid" => Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.0))),
+                    "series" => Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.1))),
+                    "num_value" => Arc::new(Float64Array::from_iter(rows.iter().map(|r| r.2))),
+                    "str_value" => Arc::new(StringArray::from_iter(rows.iter().map(|r| r.3))),
+                    "wyrd_event_time" => Arc::new(
+                        TimestampMicrosecondArray::from_iter_values(
+                            rows.iter().map(|r| micros(r.4)),
+                        )
+                        .with_timezone("UTC"),
+                    ),
+                    "created_at" => Arc::new(
+                        TimestampMicrosecondArray::from_iter_values(
+                            rows.iter().map(|r| micros(r.5)),
+                        )
+                        .with_timezone("UTC"),
+                    ),
+                    "record_id" => {
+                        Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.6)))
+                    }
+                    _ => arrow::array::new_null_array(field.data_type(), rows.len()),
+                }
             })
+            .collect();
+        let data = RecordBatch::try_new(Arc::clone(&schema), columns).expect("fixture batch");
+        let context = SessionContext::new();
+        let drift = Arc::new(MemorySchemaProvider::new());
+        drift
+            .register_table(
+                "observations".to_owned(),
+                Arc::new(MemTable::try_new(schema, vec![vec![data]]).expect("mem table")),
+            )
+            .expect("table registers");
+        let catalog = Arc::new(MemoryCatalogProvider::new());
+        catalog
+            .register_schema("drift", drift)
+            .expect("schema registers");
+        context.register_catalog("vala", catalog);
+        context
+            .sql(sql)
+            .await
+            .expect("fixed SQL plans")
+            .collect()
+            .await
+            .expect("fixed SQL executes")
+    }
+
+    /// Numeric PSI counts land on the fitted `(lower, upper]` edges exactly,
+    /// and only this subject's series inside `[start, end)` is counted.
+    #[tokio::test]
+    async fn psi_numeric_sql_bins_on_fitted_edges_inside_the_window() {
+        let uid = subject().to_string();
+        let other = "0190aaaa-0000-7000-8000-000000000009";
+        let rows: Vec<Row<'_>> = vec![
+            (&uid, "age", Some(10.0), None, 0, 0, "a"),
+            (&uid, "age", Some(10.5), None, 1, 1, "b"),
+            (&uid, "age", Some(20.0), None, 2, 2, "c"),
+            (&uid, "age", Some(99.0), None, 3, 3, "d"),
+            (&uid, "age", Some(1.0), None, 3600, 4, "end is exclusive"),
+            (&uid, "age", Some(1.0), None, -1, 5, "before start"),
+            (&uid, "height", Some(1.0), None, 4, 6, "other series"),
+            (other, "age", Some(1.0), None, 4, 7, "other subject"),
+        ];
+        let sql = window()
+            .psi_numeric("age", &[f64::NEG_INFINITY, 10.0, 20.0, f64::INFINITY])
+            .expect("numeric SQL");
+        let mut counts = PsiTargetCounts {
+            bins: vec![0; 3],
+            total: 0,
+        };
+        for batch in run(&sql, &rows).await {
+            assert!(fold_psi(&batch, &mut counts).expect("well-formed"));
+        }
+        assert_eq!(counts.bins, vec![1, 2, 1]);
+        assert_eq!(counts.total, 4);
+
+        let null: Vec<Row<'_>> = vec![(&uid, "age", None, None, 0, 0, "a")];
+        let mut counts = PsiTargetCounts {
+            bins: vec![0; 3],
+            total: 0,
+        };
+        let scorable = run(&sql, &null)
+            .await
+            .iter()
+            .map(|batch| fold_psi(batch, &mut counts).expect("well-formed"))
+            .all(|scorable| scorable);
+        assert!(!scorable, "a null value leaves the window unscorable");
+        assert!(window().psi_numeric("age", &[0.0]).is_err());
+        assert!(
+            window()
+                .psi_numeric("age", &[f64::NEG_INFINITY, f64::NAN, f64::INFINITY])
+                .is_err()
         );
     }
 
-    /// SPC chunks keep order, sum rows, and refuse a chunk with a null value.
-    #[test]
-    fn spc_chunks_keep_order_and_refuse_nulls() {
-        let rows = batch(
-            &[
-                ("chunk", vec![0, 1]),
-                ("n", vec![5, 2]),
-                ("numeric", vec![5, 2]),
-            ],
-            &[("mean", vec![Some(1.5), Some(3.0)])],
-        );
-        let chunks = spc_chunks(&[rows]).expect("chunks").expect("scorable");
-        assert_eq!(chunks.rows, 7);
-        assert_eq!(chunks.means, vec![1.5, 3.0]);
-        let null = batch(
-            &[("chunk", vec![0]), ("n", vec![5]), ("numeric", vec![4])],
-            &[("mean", vec![Some(1.0)])],
-        );
-        assert_eq!(spc_chunks(&[null]).expect("chunks"), None);
+    /// Categorical PSI counts fitted labels, sends unknown categories to the
+    /// total only, ignores nulls, and escapes quoted labels and series.
+    #[tokio::test]
+    async fn psi_categorical_sql_escapes_labels_and_counts_unknowns() {
+        let uid = subject().to_string();
+        let rows: Vec<Row<'_>> = vec![
+            (&uid, "it's", None, Some("o'neil"), 0, 0, "a"),
+            (&uid, "it's", None, Some("red"), 1, 1, "b"),
+            (&uid, "it's", None, Some("red"), 2, 2, "c"),
+            (&uid, "it's", None, Some("mauve"), 3, 3, "d"),
+            (&uid, "it's", None, None, 4, 4, "e"),
+        ];
+        let sql = window().psi_categorical("it's", &["red", "o'neil", "blue"]);
+        let mut counts = PsiTargetCounts {
+            bins: vec![0; 3],
+            total: 0,
+        };
+        for batch in run(&sql, &rows).await {
+            assert!(fold_psi(&batch, &mut counts).expect("well-formed"));
+        }
+        assert_eq!(counts.bins, vec![2, 1, 0]);
+        assert_eq!(counts.total, 4);
+        let stray = batch(&[("bin_id", vec![9]), ("n", vec![1])], &[]);
+        assert!(fold_psi(&stray, &mut counts).is_err());
     }
 
-    /// The Custom mean is scorable only for a non-empty, all-numeric, finite window.
-    #[test]
-    fn custom_mean_requires_a_complete_finite_window() {
-        let row = |n, numeric, mean| {
+    /// SPC subgroups follow `created_at`, then `record_id`, keep a shorter
+    /// trailing chunk, and report nulls through `n != numeric_n`.
+    #[tokio::test]
+    async fn spc_sql_orders_chunks_by_creation_then_record() {
+        let uid = subject().to_string();
+        let rows: Vec<Row<'_>> = vec![
+            (&uid, "age", Some(4.0), None, 0, 2, "a"),
+            (&uid, "age", Some(1.0), None, 1, 0, "b"),
+            (&uid, "age", Some(3.0), None, 2, 1, "b"),
+            (&uid, "age", Some(2.0), None, 3, 1, "a"),
+            (&uid, "age", None, None, 4, 3, "a"),
+        ];
+        let sql = window().spc("age", 2).expect("spc SQL");
+        let batches = run(&sql, &rows).await;
+        let chunks = batches
+            .iter()
+            .flat_map(|batch| {
+                let (ns, numeric, means) = (
+                    int64s(batch, "n").expect("n"),
+                    int64s(batch, "numeric_n").expect("numeric_n"),
+                    float64s(batch, "mean").expect("mean"),
+                );
+                (0..batch.num_rows())
+                    .map(|row| {
+                        (
+                            ns.value(row),
+                            numeric.value(row),
+                            means.is_valid(row).then(|| means.value(row)),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            chunks,
+            vec![(2, 2, Some(1.5)), (2, 2, Some(3.5)), (1, 0, None)]
+        );
+        assert!(window().spc("age", 0).is_err());
+    }
+
+    /// The Custom aggregate is one row over the window; only a non-empty,
+    /// all-numeric, finite window is scorable, and a second row is refused.
+    #[tokio::test]
+    async fn custom_sql_is_one_row_and_requires_a_complete_window() {
+        let uid = subject().to_string();
+        let rows: Vec<Row<'_>> = vec![
+            (&uid, "latency", Some(2.0), None, 0, 0, "a"),
+            (&uid, "latency", Some(3.0), None, 1, 1, "b"),
+        ];
+        let sql = window().custom("latency");
+        let mut row = None;
+        for batch in run(&sql, &rows).await {
+            fold_custom(&batch, &mut row).expect("well-formed");
+        }
+        assert_eq!(row, Some(Some(2.5)));
+
+        let mut empty = None;
+        for batch in run(&sql, &[]).await {
+            fold_custom(&batch, &mut empty).expect("well-formed");
+        }
+        assert_eq!(empty, Some(None), "an empty window is one unscorable row");
+
+        let aggregate = |n, numeric, mean| {
             batch(
-                &[("n", vec![n]), ("numeric", vec![numeric])],
+                &[("n", vec![n]), ("numeric_n", vec![numeric])],
                 &[("mean", vec![mean])],
             )
         };
-        assert_eq!(
-            custom_mean(&[row(3, 3, Some(2.5))]).expect("row"),
-            Some(2.5)
-        );
-        assert_eq!(custom_mean(&[row(0, 0, None)]).expect("row"), None);
-        assert_eq!(custom_mean(&[row(3, 2, Some(2.5))]).expect("row"), None);
-        assert_eq!(
-            custom_mean(&[row(3, 3, Some(f64::INFINITY))]).expect("row"),
-            None
-        );
-        assert!(custom_mean(&[]).is_err());
+        let mut partial = None;
+        fold_custom(&aggregate(3, 2, Some(2.5)), &mut partial).expect("well-formed");
+        assert_eq!(partial, Some(None));
+        let mut infinite = None;
+        fold_custom(&aggregate(3, 3, Some(f64::INFINITY)), &mut infinite).expect("well-formed");
+        assert_eq!(infinite, Some(None));
+        assert!(fold_custom(&aggregate(3, 3, Some(1.0)), &mut row).is_err());
+        let malformed = batch(&[("n", vec![1])], &[]);
+        assert!(fold_custom(&malformed, &mut None).is_err());
     }
 }

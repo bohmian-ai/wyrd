@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use arrow_schema::DataType;
 use serde::{Deserialize, Serialize};
-use wyrd_spec::card::drift::{PsiBinningStrategy, PsiProfile};
+use wyrd_spec::card::drift::{DriftMethod, PsiBinningStrategy, PsiProfile};
 use wyrd_spec::ids::FeatureName;
 use wyrd_version::WyrdVersion;
 
@@ -64,6 +64,22 @@ pub struct Bin {
     pub proportion: f64,
 }
 
+/// Fit a PSI baseline for `features` of `batch` under `profile`, uncancelled.
+///
+/// The ordinary entry point for callers with no cancellation: it runs the same
+/// per-feature fit as the cancellable fitter with a check that never fires,
+/// so its output is identical. Categorical features in `profile` get one bin
+/// per observed value; every other feature is binned numerically by the
+/// profile's binning strategy.
+///
+/// # Errors
+/// Returns [`DriftFitError::FeatureMissing`] when a feature is not a column
+/// of `batch`; [`DriftFitError::FeatureNotNumeric`] or
+/// [`DriftFitError::FeatureNotCategorical`] when a column has the wrong Arrow
+/// type; [`DriftFitError::FeatureEmpty`] when a column has no non-null rows;
+/// [`DriftFitError::NonFiniteValuesInColumn`] when a numeric column holds NaN
+/// or infinity; and [`DriftFitError::PsiInternal`] when bin edges or bin
+/// indices cannot be computed.
 pub fn fit_psi_baseline(
     batch: &arrow::record_batch::RecordBatch,
     profile: &PsiProfile,
@@ -168,8 +184,6 @@ pub fn score_psi_counts(
     counts: &BTreeMap<FeatureName, PsiTargetCounts>,
     profile: &PsiProfile,
 ) -> Result<DriftReport, DriftScoreError> {
-    use wyrd_spec::card::drift::DriftMethod;
-
     let mut feature_reports = BTreeMap::new();
     for (feature_name, fitted) in &baseline.features {
         let target = counts

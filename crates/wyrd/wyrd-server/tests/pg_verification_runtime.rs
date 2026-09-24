@@ -14,7 +14,14 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use arrow::array::Float64Array;
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use chrono::{DateTime, Utc};
+use datafusion::parquet::arrow::ArrowWriter;
+use sha2::{Digest as _, Sha256};
 use sqlx::{AssertSqlSafe, PgPool, Postgres, Transaction};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -34,6 +41,7 @@ use wyrd_spec::card::verifier::DriftBaselineState;
 use wyrd_spec::ids::{BindingId, CardUid, FeatureName, VerificationRunId};
 use wyrd_spec::verification::{DriftWindow, FrozenTarget, VerificationError};
 use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
+use wyrd_sql::queries::storage::artifact_metadata::{self, NewArtifactMetadata};
 use wyrd_sql::queries::verifier_runs::TerminalStatus;
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::verification::{RunRow, VerificationFixture};
@@ -269,41 +277,44 @@ impl Harness {
         rows.into_iter().collect()
     }
 
-    /// Open a superuser transaction holding `SHARE` on `wyrd.verifier_runs`.
+    /// Open a superuser transaction holding `SHARE` on `table`.
     ///
-    /// Reads still proceed, but every run insert or update blocks until the
-    /// returned transaction ends, which parks a scheduler occurrence
-    /// transaction at its enqueue and a runner claim transaction at its first
-    /// update, each inside its still-uncommitted tenant transaction.
+    /// Reads still proceed, but every insert or update of `table` blocks until
+    /// the returned transaction ends. On `wyrd.verifier_runs` this parks a
+    /// scheduler occurrence transaction at its enqueue and a runner claim
+    /// transaction at its first update; on `wyrd.drift_baselines` it parks a
+    /// fitter claim transaction. Each stays inside its uncommitted tenant
+    /// transaction.
     ///
     /// # Panics
     /// Panics when the transaction or lock cannot be taken.
-    async fn block_run_writes(&self) -> Transaction<'static, Postgres> {
+    async fn block_writes(&self, table: &'static str) -> Transaction<'static, Postgres> {
         let mut blocker = self.assertion.begin().await.expect("blocker begins");
-        sqlx::query("LOCK TABLE wyrd.verifier_runs IN SHARE MODE")
+        // `table` is a test-constant identifier, not caller input.
+        sqlx::query(AssertSqlSafe(format!("LOCK TABLE {table} IN SHARE MODE")))
             .execute(&mut *blocker)
             .await
-            .expect("run table locks");
+            .expect("table locks");
         blocker
     }
 
-    /// Wait until a backend is blocked writing `wyrd.verifier_runs` and
-    /// return its PID.
+    /// Wait until a backend is blocked writing `table` and return its PID.
     ///
     /// Polls `pg_locks` for an ungranted `RowExclusiveLock`, so the caller
     /// knows the runtime is parked inside its tenant transaction.
     ///
     /// # Panics
     /// Panics when no writer blocks within [`WAIT`].
-    async fn wait_blocked_writer(&self) -> i32 {
+    async fn wait_blocked_writer(&self, table: &'static str) -> i32 {
         let deadline = tokio::time::Instant::now() + WAIT;
         loop {
             let pid: Option<i32> = sqlx::query_scalar(
                 "SELECT pid FROM pg_locks \
-                 WHERE relation = 'wyrd.verifier_runs'::regclass \
+                 WHERE relation = $1::text::regclass \
                    AND mode = 'RowExclusiveLock' AND NOT granted \
                  LIMIT 1",
             )
+            .bind(table)
             .fetch_optional(&self.assertion)
             .await
             .expect("lock waiters read");
@@ -312,7 +323,7 @@ impl Harness {
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "no runtime write blocked on the run table"
+                "no runtime write blocked on {table}"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1342,14 +1353,14 @@ async fn cancelled_scheduler_rolls_back_its_blocked_occurrence() {
     let armed = harness.cursor(binding).await;
     assert!(armed.is_some(), "activation armed the schedule cursor");
 
-    let blocker = harness.block_run_writes().await;
+    let blocker = harness.block_writes("wyrd.verifier_runs").await;
     let runtime = RunningRuntime::spawn(
         VerificationRuntime::builder(harness.server.state())
             .limits(Harness::limits())
             .build()
             .expect("the scheduler composes"),
     );
-    let pid = harness.wait_blocked_writer().await;
+    let pid = harness.wait_blocked_writer("wyrd.verifier_runs").await;
     let holds_binding: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1 AND granted \
          AND relation = 'wyrd.verification_bindings'::regclass)",
@@ -1539,9 +1550,9 @@ async fn cancelled_runner_rolls_back_its_blocked_claim() {
     let script = EngineScript::default();
     script.push(EngineOutcome::Completed(VerifierReport::Drift(None)));
 
-    let blocker = harness.block_run_writes().await;
+    let blocker = harness.block_writes("wyrd.verifier_runs").await;
     let runtime = harness.spawn(Harness::limits(), &script);
-    let pid = harness.wait_blocked_writer().await;
+    let pid = harness.wait_blocked_writer("wyrd.verifier_runs").await;
 
     runtime.stop().await;
     blocker.rollback().await.expect("blocker releases");
@@ -1759,12 +1770,6 @@ async fn crash_after_detail_ack_reclaims_the_same_run_before_dispatch() {
 /// Panics when the Parquet encode, the storage write, or the metadata insert
 /// fails.
 async fn baseline_artifact(server: &WyrdTestServer, seed: &VerificationFixture, data: &CardUid) {
-    use arrow::array::Float64Array;
-    use arrow::datatypes::{DataType, Field, Schema};
-    use arrow::record_batch::RecordBatch;
-    use datafusion::parquet::arrow::ArrowWriter;
-    use wyrd_sql::queries::storage::artifact_metadata::{self, NewArtifactMetadata};
-
     let schema = Arc::new(Schema::new(vec![Field::new(
         "latency_ms",
         DataType::Float64,
@@ -1780,11 +1785,7 @@ async fn baseline_artifact(server: &WyrdTestServer, seed: &VerificationFixture, 
     writer.write(&batch).expect("batch writes");
     writer.close().expect("writer closes");
 
-    let sha256 = {
-        use base64::Engine as _;
-        use sha2::Digest as _;
-        base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(&bytes))
-    };
+    let sha256 = STANDARD.encode(Sha256::digest(&bytes));
     let path = wyrd_storage::tenant_path::build(seed.tenant(), data.as_str(), "data/data.parquet");
     let storage = &server.state().storage;
     storage
@@ -1935,4 +1936,144 @@ async fn baseline_fit_drains_within_grace_then_releases() {
         baseline_row(&harness, &cut_off).await,
         ("pending".to_owned(), 0)
     );
+}
+
+/// A fitter stopped while its claim transaction is parked admits nothing:
+/// the uncommitted claim rolls back once the lock is released, so the
+/// baseline stays pending with no attempt charged and no fit starts.
+///
+/// # Panics
+/// Panics when the fitter never blocks, does not stop while blocked, or the
+/// baseline is leased, charged, or fitted after shutdown.
+#[tokio::test]
+async fn stopped_fitter_rolls_back_its_blocked_claim() {
+    let harness = Harness::start().await;
+    pending_baseline(
+        &harness.server,
+        &harness.seed,
+        &harness.verifier,
+        &harness.subject,
+    )
+    .await;
+    let gate = FitGate::default();
+    let blocker = harness.block_writes("wyrd.drift_baselines").await;
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(fitter(&harness, Duration::from_secs(10), &gate).run(stop.clone()));
+    let pid = harness.wait_blocked_writer("wyrd.drift_baselines").await;
+
+    stop.cancel();
+    tokio::time::timeout(WAIT, task)
+        .await
+        .expect("the fitter stops while its claim is blocked")
+        .expect("the fitter does not panic");
+    blocker.rollback().await.expect("blocker releases");
+    harness.wait_backend_settled(pid).await;
+
+    assert_eq!(
+        baseline_row(&harness, &harness.verifier).await,
+        ("pending".to_owned(), 0),
+        "the claim rolled back: no lease and no charged attempt"
+    );
+    assert_eq!(gate.entered(), 0, "no fit started");
+}
+
+/// Advisory lock key the fitter commit-race test's deferred trigger waits on.
+const FIT_CLAIM_COMMIT_LOCK: i64 = 0x5752_4446;
+
+/// A fit claim whose commit completes after shutdown began is released
+/// through the fenced release transition with its attempt refunded, and is
+/// never fitted.
+///
+/// A test-scoped deferred constraint trigger on the baseline makes the
+/// claim's `COMMIT` wait on an advisory lock the test holds, so the claim is
+/// already applied and its commit in flight when `stop` fires; releasing the
+/// lock lets the commit win the race.
+///
+/// # Panics
+/// Panics when the commit never blocks, the committed claim is not released
+/// with its attempt refunded, or the claim is fitted.
+#[tokio::test]
+async fn fit_claim_committed_after_shutdown_is_released_unfitted() {
+    let harness = Harness::start().await;
+    pending_baseline(
+        &harness.server,
+        &harness.seed,
+        &harness.verifier,
+        &harness.subject,
+    )
+    .await;
+    sqlx::query(
+        "CREATE FUNCTION wyrd.test_hold_fit_claim_commit() RETURNS trigger \
+         LANGUAGE plpgsql AS $$ BEGIN \
+         PERFORM pg_advisory_xact_lock(TG_ARGV[0]::bigint); RETURN NULL; END $$",
+    )
+    .execute(&harness.assertion)
+    .await
+    .expect("hold function creates");
+    sqlx::query("GRANT EXECUTE ON FUNCTION wyrd.test_hold_fit_claim_commit() TO PUBLIC")
+        .execute(&harness.assertion)
+        .await
+        .expect("hold function grants");
+    // The Verifier UID is a typed UUID the fixture minted, not caller input.
+    sqlx::query(AssertSqlSafe(format!(
+        "CREATE CONSTRAINT TRIGGER test_hold_fit_claim_commit \
+         AFTER UPDATE ON wyrd.drift_baselines \
+         DEFERRABLE INITIALLY DEFERRED FOR EACH ROW \
+         WHEN (NEW.verifier_uid = '{}'::uuid AND NEW.state = 'building') \
+         EXECUTE FUNCTION wyrd.test_hold_fit_claim_commit('{FIT_CLAIM_COMMIT_LOCK}')",
+        harness.verifier.as_uuid()
+    )))
+    .execute(&harness.assertion)
+    .await
+    .expect("hold trigger creates");
+    let mut holder = harness.assertion.acquire().await.expect("holder connects");
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(FIT_CLAIM_COMMIT_LOCK)
+        .execute(&mut *holder)
+        .await
+        .expect("commit lock holds");
+
+    let gate = FitGate::default();
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(fitter(&harness, Duration::from_secs(10), &gate).run(stop.clone()));
+    harness.wait_advisory_waiter(FIT_CLAIM_COMMIT_LOCK).await;
+    stop.cancel();
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(FIT_CLAIM_COMMIT_LOCK)
+        .execute(&mut *holder)
+        .await
+        .expect("commit lock releases");
+    tokio::time::timeout(WAIT, task)
+        .await
+        .expect("the fitter stops after its late commit")
+        .expect("the fitter does not panic");
+
+    assert_eq!(
+        baseline_row(&harness, &harness.verifier).await,
+        ("pending".to_owned(), 0),
+        "the committed claim was released with its attempt refunded"
+    );
+    let token: Option<Uuid> = sqlx::query_scalar(
+        "SELECT lease_token FROM wyrd.drift_baselines \
+          WHERE data_tenant_id = $1 AND verifier_uid = $2",
+    )
+    .bind(harness.seed.tenant().as_uuid())
+    .bind(harness.verifier.as_uuid())
+    .fetch_one(&harness.assertion)
+    .await
+    .expect("lease token reads");
+    assert!(
+        token.is_some(),
+        "the claim committed: its now-fenced lease token remains"
+    );
+    assert_eq!(gate.entered(), 0, "the released claim was never fitted");
+
+    sqlx::query("DROP TRIGGER test_hold_fit_claim_commit ON wyrd.drift_baselines")
+        .execute(&harness.assertion)
+        .await
+        .expect("hold trigger drops");
+    sqlx::query("DROP FUNCTION wyrd.test_hold_fit_claim_commit()")
+        .execute(&harness.assertion)
+        .await
+        .expect("hold function drops");
 }

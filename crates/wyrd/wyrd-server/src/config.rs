@@ -1899,8 +1899,9 @@ impl OperatorKeysConfig {
     /// Returns [`ConfigError::Invalid`] when `active_version` exceeds the
     /// persisted `i32` key-version range, `file` has no `dir`, `vault` has no
     /// usable address or token, both token forms are set, a production
-    /// deployment names a plaintext `http` Vault address, or a multi-tenant
-    /// production deployment uses anything but Vault.
+    /// deployment names a plaintext `http` Vault address, a multi-tenant
+    /// production deployment uses anything but Vault, or any production
+    /// deployment uses the development-only environment source.
     fn validate(&self, production: bool, multi_tenant: bool) -> Result<(), ConfigError> {
         let multi_tenant_production = production && multi_tenant;
         let invalid = |message: &str| {
@@ -1915,6 +1916,12 @@ impl OperatorKeysConfig {
             return invalid(
                 "multi-tenant production requires source = \"vault\" \
                  (WYRD_OPERATOR_KEK_SOURCE=vault) so each tenant has its own key",
+            );
+        }
+        if production && self.source == OperatorKeySource::Env {
+            return invalid(
+                "source = \"env\" is development-only; single-tenant production requires \
+                 source = \"file\" or \"vault\" (WYRD_OPERATOR_KEK_SOURCE)",
             );
         }
         match self.source {
@@ -3799,6 +3806,41 @@ minimum_slots = 2
             }),
             ..OperatorKeysConfig::default()
         }
+    }
+
+    /// The environment KEK is development-only: production refuses it even
+    /// when single-tenant, where the owner-only file and Vault stay accepted,
+    /// and multi-tenant production remains Vault-only. Validation reads no key.
+    #[test]
+    fn operator_key_source_follows_deployment() {
+        let directory = tempfile::tempdir().expect("key temp directory");
+        OperatorKeysConfig::default()
+            .validate(false, true)
+            .expect("development accepts the environment source");
+        let refused = OperatorKeysConfig::default()
+            .validate(true, false)
+            .expect_err("single-tenant production refuses the environment source")
+            .to_string();
+        assert!(refused.contains("development-only"), "{refused}");
+        let file = OperatorKeysConfig {
+            source: OperatorKeySource::File,
+            dir: Some(directory.path().join("absent-keys")),
+            ..OperatorKeysConfig::default()
+        };
+        file.validate(true, false)
+            .expect("single-tenant production accepts the file source");
+        let vault = production_operator_keys(directory.path());
+        vault
+            .validate(true, false)
+            .expect("single-tenant production accepts Vault");
+        vault
+            .validate(true, true)
+            .expect("multi-tenant production accepts https Vault");
+        let refused = file
+            .validate(true, true)
+            .expect_err("multi-tenant production refuses the file source")
+            .to_string();
+        assert!(refused.contains("vault"), "{refused}");
     }
 
     /// Production refuses a plaintext Vault address before any token or key

@@ -99,8 +99,9 @@ const FAIL_SQL: &str = r#"
 /// Schedule a retry within the budget and deadline, or fail.
 ///
 /// `$4` is the attempt budget, `$5` the delay and `$6` the deadline, both in
-/// milliseconds. The next attempt is clipped to the deadline; a row already
-/// at or past it fails.
+/// milliseconds. The delay is first bounded by the deadline so an oversized
+/// provider `Retry-After` cannot overflow the interval, then the next attempt
+/// is clipped to the absolute deadline; a row already at or past it fails.
 const RETRY_SQL: &str = r#"
     UPDATE wyrd.operator_dispatches
        SET status = CASE WHEN attempts < $4
@@ -108,7 +109,7 @@ const RETRY_SQL: &str = r#"
                          THEN 'retrying' ELSE 'failed' END,
            next_attempt_at = CASE WHEN attempts < $4
                           AND created_at + ($6::bigint * INTERVAL '1 millisecond') > statement_timestamp()
-                         THEN LEAST(statement_timestamp() + ($5::bigint * INTERVAL '1 millisecond'),
+                         THEN LEAST(statement_timestamp() + (LEAST($5::bigint, $6::bigint) * INTERVAL '1 millisecond'),
                                     created_at + ($6::bigint * INTERVAL '1 millisecond'))
                          END,
            last_error = $3, lease_expires_at = NULL, updated_at = statement_timestamp()

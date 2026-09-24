@@ -14,6 +14,9 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_server::components::operators::keys::OperatorKeys;
+use wyrd_server::config::{
+    DeploymentProfile, OperatorKeySource, OperatorKeysConfig, VaultKeysConfig, WyrdServerConfig,
+};
 use wyrd_spec::ids::DataTenantId;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
@@ -506,10 +509,10 @@ async fn read_write_separation_and_tenant_isolation() {
 async fn missing_key_refuses_only_credential_writes() {
     let empty = tempfile::tempdir().expect("tempdir");
     let server = WyrdTestServer::builder()
-        .with_operator_keys_for_test(wyrd_server::config::OperatorKeysConfig {
-            source: wyrd_server::config::OperatorKeySource::File,
+        .with_operator_keys_for_test(OperatorKeysConfig {
+            source: OperatorKeySource::File,
             dir: Some(empty.path().to_path_buf()),
-            ..wyrd_server::config::OperatorKeysConfig::default()
+            ..OperatorKeysConfig::default()
         })
         .start_in_process()
         .await
@@ -684,16 +687,16 @@ async fn registration_binds_exact_connection_authority() {
 /// # Panics
 /// Panics when the owner cannot be built.
 fn vault_keys(addr: &str) -> OperatorKeys {
-    OperatorKeys::new(wyrd_server::config::OperatorKeysConfig {
-        source: wyrd_server::config::OperatorKeySource::Vault,
-        vault: Some(wyrd_server::config::VaultKeysConfig {
+    OperatorKeys::new(OperatorKeysConfig {
+        source: OperatorKeySource::Vault,
+        vault: Some(VaultKeysConfig {
             addr: addr.to_owned(),
             mount: "secret".to_owned(),
             prefix: "wyrd/operator-keys".to_owned(),
             token_file: None,
             token: Some(secrecy::SecretString::from("boot-vault-token")),
         }),
-        ..wyrd_server::config::OperatorKeysConfig::default()
+        ..OperatorKeysConfig::default()
     })
     .expect("vault keys build")
 }
@@ -732,9 +735,9 @@ async fn production_boot_requires_every_active_tenant_key() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
-    let production = wyrd_server::config::WyrdServerConfig {
-        deployment_profile: wyrd_server::config::DeploymentProfile::Production,
-        ..wyrd_server::config::WyrdServerConfig::default()
+    let production = WyrdServerConfig {
+        deployment_profile: DeploymentProfile::Production,
+        ..WyrdServerConfig::default()
     };
     let engine = base64::engine::general_purpose::STANDARD;
     let mut state = server.state().clone();
@@ -778,7 +781,7 @@ async fn production_boot_requires_every_active_tenant_key() {
     state.operator_keys = std::sync::Arc::new(vault_keys(&unreachable));
     wyrd_server::boot::verify_operator_keys(
         &state,
-        &wyrd_server::config::WyrdServerConfig::default(),
+        &WyrdServerConfig::default(),
     )
     .await
     .expect("development defers key failures");

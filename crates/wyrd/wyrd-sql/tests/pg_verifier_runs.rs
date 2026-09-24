@@ -1993,6 +1993,55 @@ async fn dispatch_delivery_obeys_budget_deadline_and_fencing() {
     assert_eq!(status.status, VerificationExecutionStatus::Completed);
 }
 
+/// The largest decimal `Retry-After` a provider can send (`u64::MAX`
+/// seconds) settles the retry durably: the delay is bounded by the deadline
+/// before PostgreSQL builds the interval, so the dispatch is scheduled exactly
+/// at its database-owned deadline with its lease cleared instead of erroring
+/// and waiting for lease expiry.
+///
+/// # Panics
+/// Panics when the retry errors, schedules past the deadline, or leaves the
+/// dispatch leased.
+#[tokio::test]
+async fn maximum_retry_after_settles_at_the_deadline() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let actor = actor(fixture.data_tenant_id());
+    let runs = VerifierRunQueue::default();
+    let dispatches = OperatorDispatchQueue::default();
+    let mut conn = fixture.tenant_conn().await.expect("tenant connection");
+    failed_run_with_two_dispatches(&runs, &mut conn, &actor).await;
+    let claimed = dispatches
+        .claim(&mut conn)
+        .await
+        .expect("claim runs")
+        .expect("a dispatch is due");
+
+    let RetryOutcome::Scheduled(at) = dispatches
+        .retry(
+            &mut conn,
+            claimed.lease,
+            &engine_error(),
+            std::time::Duration::from_secs(u64::MAX),
+        )
+        .await
+        .expect("the maximum Retry-After settles without an interval error")
+    else {
+        panic!("a first failure within budget schedules a retry");
+    };
+    let (status, created, lease): (String, DateTime<Utc>, Option<DateTime<Utc>>) =
+        sqlx::query_as(
+            "SELECT status, created_at, lease_expires_at
+               FROM wyrd.operator_dispatches WHERE dispatch_id = $1",
+        )
+        .bind(claimed.lease.dispatch_id.as_uuid())
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("dispatch reads");
+    assert_eq!(status, "retrying");
+    assert_eq!(at - created, Duration::minutes(5), "clipped to the deadline");
+    assert!(lease.is_none(), "settlement clears the lease");
+}
+
 /// A dispatch whose deadline has passed is failed by the next claim and never
 /// handed to a worker; the deadline is PostgreSQL's creation time plus the
 /// bound duration.

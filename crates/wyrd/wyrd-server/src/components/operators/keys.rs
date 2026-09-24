@@ -42,7 +42,7 @@ use crate::config::{OperatorKeySource, OperatorKeysConfig};
 const VAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Rows one tenant rewrap transaction moves at most.
-pub const REWRAP_BATCH: i64 = 100;
+const REWRAP_BATCH: i64 = 100;
 
 /// The constant public detail of every key failure; the cause stays internal.
 const UNAVAILABLE_DETAIL: &str =
@@ -207,24 +207,31 @@ fn parts(context: &[String; 5]) -> [&str; 5] {
     context.each_ref().map(String::as_str)
 }
 
-/// Elapsed-time bounds of one rewrap pass.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RewrapBudget {
-    /// Ceiling of the whole cross-tenant pass; remaining tenants wait for the
-    /// next pass.
-    pub pass: Duration,
-    /// Ceiling of one tenant's transaction; an overrun rolls it back.
-    pub tenant: Duration,
-}
-
 /// Owner of Operator KEK reads, sealing, opening, and rewrap.
-#[derive(Debug)]
 pub struct OperatorKeys {
     /// Configured source and active version.
     config: OperatorKeysConfig,
+    /// The validated active version, exactly as configured.
+    ///
+    /// Invariant: [`OperatorKeysConfig::validate`] refuses any version above
+    /// `i32::MAX`, so the persisted `i32` key version names the same external
+    /// key the operator configured.
+    active_version: i32,
     /// Bounded, non-redirecting HTTP client for Vault reads; built only for
     /// the Vault source.
     http: Option<reqwest::Client>,
+}
+
+impl std::fmt::Debug for OperatorKeys {
+    /// Redacting debug: prints the source kind, active version, and whether a
+    /// Vault client is present, never a selector or token.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OperatorKeys")
+            .field("source", &self.config.source)
+            .field("active_version", &self.active_version)
+            .field("vault_client", &self.http.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for OperatorKeys {
@@ -232,6 +239,7 @@ impl Default for OperatorKeys {
     fn default() -> Self {
         Self {
             config: OperatorKeysConfig::default(),
+            active_version: 1,
             http: None,
         }
     }
@@ -248,7 +256,13 @@ impl OperatorKeys {
     /// Returns [`KeyError::Client`] when the TLS provider cannot be installed
     /// or the client cannot be built, so a Vault read never runs without its
     /// timeout and redirect policy.
+    ///
+    /// # Panics
+    /// Panics when `config.active_version` exceeds `i32::MAX`, which
+    /// [`OperatorKeysConfig`] validation refuses before any owner is built.
     pub fn new(config: OperatorKeysConfig) -> Result<Self, KeyError> {
+        let active_version = i32::try_from(config.active_version.get())
+            .expect("invariant: validated Operator key versions fit the persisted i32");
         let http = match config.source {
             OperatorKeySource::Vault => {
                 wyrd_tls::install_crypto_provider().map_err(|_| KeyError::Client)?;
@@ -262,13 +276,17 @@ impl OperatorKeys {
             }
             OperatorKeySource::Env | OperatorKeySource::File => None,
         };
-        Ok(Self { config, http })
+        Ok(Self {
+            config,
+            active_version,
+            http,
+        })
     }
 
     /// Version new and rotated secrets are wrapped under.
     #[must_use]
-    pub fn active_version(&self) -> i32 {
-        i32::try_from(self.config.active_version.get()).unwrap_or(i32::MAX)
+    pub const fn active_version(&self) -> i32 {
+        self.active_version
     }
 
     /// A selector-free failure of `version` in this source.
@@ -493,13 +511,15 @@ impl OperatorKeys {
     /// One bounded rotation pass over every tenant with rows on an older key
     /// version: one tenant transaction and at most [`REWRAP_BATCH`] rows each.
     ///
-    /// Each tenant runs under `budget.tenant` and the whole pass under
-    /// `budget.pass`; an overrun drops the tenant transaction, which rolls it
-    /// back. A tenant whose keys are unavailable or whose budget elapsed is
-    /// logged with selector-free fields and skipped so it cannot stall the
-    /// others; the next pass retries it. Dropping the returned future (on
-    /// shutdown) likewise rolls back the tenant in progress. Returns the rows
-    /// moved.
+    /// The whole pass, including the cross-tenant discovery read, runs under
+    /// `pass_budget`, and each tenant under `tenant_budget` capped by what
+    /// remains; an overrun drops the in-flight future, which cancels a stalled
+    /// discovery before any row is touched or rolls back the tenant
+    /// transaction. A tenant whose keys are unavailable or whose budget
+    /// elapsed is logged with selector-free fields and skipped so it cannot
+    /// stall the others; the next pass retries it. Dropping the returned
+    /// future (on shutdown) likewise rolls back the tenant in progress.
+    /// Returns the rows moved.
     ///
     /// # Errors
     /// Returns the database error when the cross-tenant discovery read fails.
@@ -507,12 +527,18 @@ impl OperatorKeys {
         &self,
         postgres: &WyrdPostgres,
         operator: &OperatorPool,
-        budget: RewrapBudget,
+        pass_budget: Duration,
+        tenant_budget: Duration,
     ) -> Result<usize, sqlx::Error> {
-        let deadline = Instant::now() + budget.pass;
+        let deadline = Instant::now() + pass_budget;
         let active = self.active_version();
-        let mut tenants: Vec<DataTenantId> = referenced_key_versions(operator)
-            .await?
+        let Ok(discovered) =
+            tokio::time::timeout_at(deadline, referenced_key_versions(operator)).await
+        else {
+            pass_elapsed();
+            return Ok(0);
+        };
+        let mut tenants: Vec<DataTenantId> = discovered?
             .into_iter()
             .filter(|(_, version)| *version != active)
             .map(|(tenant, _)| tenant)
@@ -522,13 +548,10 @@ impl OperatorKeys {
         for tenant in tenants {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                tracing::warn!(
-                    failure = KeyFailure::TimedOut.as_str(),
-                    "operator key rewrap pass budget elapsed; the next pass continues"
-                );
+                pass_elapsed();
                 break;
             }
-            let rewrapped = tokio::time::timeout(budget.tenant.min(remaining), async {
+            let rewrapped = tokio::time::timeout(tenant_budget.min(remaining), async {
                 let database = |_| self.unavailable(active, KeyFailure::Database);
                 let mut conn = postgres.tenant_conn(tenant).await.map_err(database)?;
                 let count = self.rewrap_tenant(&mut conn, tenant).await?;
@@ -545,6 +568,15 @@ impl OperatorKeys {
         }
         Ok(moved)
     }
+}
+
+/// Log, with the selector-free timeout class only, that a rewrap pass ran out
+/// of budget and left the remaining work to the next pass.
+fn pass_elapsed() {
+    tracing::warn!(
+        failure = KeyFailure::TimedOut.as_str(),
+        "operator key rewrap pass budget elapsed; the next pass continues"
+    );
 }
 
 /// Rebuild the `wyrd-crypt` envelope of a stored sealed secret.
@@ -592,12 +624,15 @@ fn read_owner_only_blocking(path: &Path) -> Result<Zeroizing<String>, KeyFailure
         .map_err(io)
 }
 
-/// Decode a base64 32-byte key, trimming surrounding whitespace.
+/// Decode a base64 32-byte key, trimming surrounding whitespace, with the
+/// decoded bytes zeroized on drop.
+///
+/// Operator KEK reads and the server's auth sealing key share this decoder.
 ///
 /// # Errors
 /// Returns [`KeyFailure::Malformed`] for a value that is not base64 and
 /// [`KeyFailure::WrongLength`] for one that is not 32 bytes.
-fn decode_key(encoded: &str) -> Result<SecretKey, KeyFailure> {
+pub(crate) fn decode_key(encoded: &str) -> Result<SecretKey, KeyFailure> {
     let bytes = Zeroizing::new(
         base64::engine::general_purpose::STANDARD
             .decode(encoded.trim())
@@ -832,7 +867,8 @@ mod tests {
     }
 
     /// Env, file, and Vault failures behind sentinel selectors surface only
-    /// the stable code and constant detail, and the captured logs carry no
+    /// the stable code and constant detail, the complete public problem names
+    /// no generic key-location template, and the captured logs carry no
     /// selector, token, or provider text.
     ///
     /// # Panics
@@ -894,6 +930,21 @@ mod tests {
             public.push_str(&error.as_problem_json().to_string());
         }
         assert_eq!(vault.received_requests().await.expect("recorded").len(), 2);
+        for template in [
+            "WYRD_OPERATOR_KEK",
+            "operator_keys",
+            "<dir>",
+            "<mount>",
+            "<prefix>",
+            "<version>",
+            "Vault",
+            "KV v2",
+        ] {
+            assert!(
+                !public.contains(template),
+                "{template} leaked into the public problem: {public}"
+            );
+        }
         let logs = captured.text();
         assert!(logs.contains("failure="), "{logs}");
         for text in [&public, &logs] {
@@ -912,6 +963,41 @@ mod tests {
                 assert!(!text.contains(sentinel), "{sentinel} leaked: {text}");
             }
         }
+    }
+
+    /// Debug formatting of the owner prints only the source kind, exact
+    /// active version, and Vault client presence, never a selector or token.
+    #[test]
+    fn operator_keys_debug_redacts_selectors() {
+        let keys = OperatorKeys::new(OperatorKeysConfig {
+            source: OperatorKeySource::Vault,
+            active_version: std::num::NonZeroU32::new(2_147_483_647).expect("positive"),
+            dir: Some(PathBuf::from("/sentinel-kek-dir")),
+            vault: Some(VaultKeysConfig {
+                addr: "https://sentinel-vault-addr:8200".to_owned(),
+                mount: "sentinel-mount".to_owned(),
+                prefix: "sentinel-prefix".to_owned(),
+                token_file: Some(PathBuf::from("/sentinel-token-file")),
+                token: Some(SecretString::from("sentinel-inline-token")),
+            }),
+        })
+        .expect("vault keys build");
+        assert_eq!(keys.active_version(), i32::MAX, "the version is exact");
+        let debug = format!("{keys:?}");
+        for sentinel in [
+            "sentinel-kek-dir",
+            "sentinel-vault-addr",
+            "sentinel-mount",
+            "sentinel-prefix",
+            "sentinel-token-file",
+            "sentinel-inline-token",
+        ] {
+            assert!(!debug.contains(sentinel), "{sentinel} leaked: {debug}");
+        }
+        assert_eq!(
+            debug,
+            "OperatorKeys { source: Vault, active_version: 2147483647, vault_client: true, .. }"
+        );
     }
 
     /// Vault reads send the owner-only token file's value and decode the key;

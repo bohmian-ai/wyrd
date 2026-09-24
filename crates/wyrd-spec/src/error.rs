@@ -1699,7 +1699,7 @@ pub enum WyrdError {
         code = "WYRD_OPERATOR_503_KEY_UNAVAILABLE",
         status = 503,
         title = "Operator connection key unavailable",
-        remediation = "Provide the active 32-byte base64 key for verification.operator_keys: WYRD_OPERATOR_KEK_V<version> (source env), <dir>/v<version> (source file), or Vault KV v2 <mount>/data/<prefix>/<data_tenant_id>/<version> field key (source vault); then retry."
+        remediation = "Restore the configured Operator key provider so it can supply the active key, then retry."
     )]
     OperatorKeyUnavailable {
         /// Human-readable error message.

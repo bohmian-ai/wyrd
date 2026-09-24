@@ -2133,7 +2133,8 @@ async fn seed_federation(
 ///
 /// Returns `Ok(None)` when no sealing key is configured. Boot fails closed with
 /// [`ServerBootError::SealingKey`] when the key is set but is not valid base64
-/// or does not decode to exactly 32 bytes.
+/// or does not decode to exactly 32 bytes; decoding reuses the Operator key
+/// decoder, which trims whitespace and zeroizes the decoded bytes.
 ///
 /// **Single-key model:** this function produces one static process-wide key. There
 /// is no key-id column, no keyring, and no live rotation path. See `config.rs`
@@ -2145,18 +2146,15 @@ fn build_sealing_key(
     let Some(encoded) = config.auth.sealing_key.as_ref() else {
         return Ok(None);
     };
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(encoded.expose_secret())
-        .map_err(|error| {
-            ServerBootError::SealingKey(format!("sealing key is not valid base64: {error}"))
-        })?;
-    let key: [u8; 32] = bytes.try_into().map_err(|bytes: Vec<u8>| {
-        ServerBootError::SealingKey(format!(
-            "sealing key must decode to 32 bytes, got {}",
-            bytes.len()
-        ))
-    })?;
-    Ok(Some(Arc::new(SecretKey::from_bytes(key))))
+    let key = crate::components::operators::keys::decode_key(encoded.expose_secret()).map_err(
+        |failure| {
+            ServerBootError::SealingKey(format!(
+                "sealing key must be base64 of exactly 32 bytes: {}",
+                failure.as_str()
+            ))
+        },
+    )?;
+    Ok(Some(Arc::new(key)))
 }
 
 /// Map `[[workload_bindings]]` config entries to domain [`WorkloadBinding`]s, all

@@ -49,7 +49,7 @@ use super::RuntimeLimits;
 use super::claims::{ClaimLoop, LeasedWork};
 use super::health::RuntimeCapability;
 use super::permits::VerifierPermits;
-use crate::components::operators::keys::{KeyError, OperatorKeys, RewrapBudget};
+use crate::components::operators::keys::{KeyError, OperatorKeys};
 
 /// The frozen Operator no longer resolves to a supported Operator body.
 pub const OPERATOR_UNAVAILABLE: &str = "operator_unavailable";
@@ -228,15 +228,16 @@ impl OperatorWorker {
     /// Cancellation drops the pass in progress, rolling back its open tenant
     /// transaction; the next pass (here or on another replica) retries it.
     async fn rewrap(&self, stop: &CancellationToken) {
-        let budget = RewrapBudget {
-            pass: self.limits.rewrap_pass_budget,
-            tenant: self.limits.rewrap_tenant_budget,
-        };
         loop {
             tokio::select! {
                 biased;
                 () = stop.cancelled() => return,
-                pass = self.keys.rewrap_pass(&self.postgres, &self.operator, budget) => {
+                pass = self.keys.rewrap_pass(
+                    &self.postgres,
+                    &self.operator,
+                    self.limits.rewrap_pass_budget,
+                    self.limits.rewrap_tenant_budget,
+                ) => {
                     if let Err(error) = pass {
                         tracing::warn!(%error, "operator key rewrap pass failed");
                     }

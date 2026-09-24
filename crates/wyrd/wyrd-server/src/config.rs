@@ -1795,7 +1795,7 @@ pub enum OperatorKeySource {
 }
 
 /// HashiCorp Vault KV v2 location of per-tenant Operator KEKs.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VaultKeysConfig {
     /// Vault base URL, such as `https://vault.internal:8200`.
@@ -1817,6 +1817,14 @@ pub struct VaultKeysConfig {
     pub token: Option<SecretString>,
 }
 
+impl std::fmt::Debug for VaultKeysConfig {
+    /// Redacting debug: the address, mount, prefix, and token file locate
+    /// secret material, so only the type name is printed.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VaultKeysConfig").finish_non_exhaustive()
+    }
+}
+
 /// Serde default for [`VaultKeysConfig::mount`].
 fn default_vault_mount() -> String {
     "secret".to_owned()
@@ -1834,7 +1842,7 @@ fn default_vault_prefix() -> String {
 /// active tenant's active key is readable. Elsewhere Wyrd runs without a
 /// readable active key; only creating or changing a connection credential
 /// refuses with `WYRD_OPERATOR_503_KEY_UNAVAILABLE`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperatorKeysConfig {
     /// Where keys are read from.
@@ -1851,6 +1859,18 @@ pub struct OperatorKeysConfig {
     /// Vault location for [`OperatorKeySource::Vault`].
     #[serde(default)]
     pub vault: Option<VaultKeysConfig>,
+}
+
+impl std::fmt::Debug for OperatorKeysConfig {
+    /// Redacting debug: prints the source kind, active version, and whether a
+    /// Vault section is present, never a directory or Vault selector.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OperatorKeysConfig")
+            .field("source", &self.source)
+            .field("active_version", &self.active_version)
+            .field("vault", &self.vault.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Serde default for [`OperatorKeysConfig::active_version`].
@@ -1874,8 +1894,9 @@ impl OperatorKeysConfig {
     /// Check that the chosen source is fully configured and allowed here.
     ///
     /// # Errors
-    /// Returns [`ConfigError::Invalid`] when `file` has no `dir`, `vault` has
-    /// no usable address or token, both token forms are set, a production
+    /// Returns [`ConfigError::Invalid`] when `active_version` exceeds the
+    /// persisted `i32` key-version range, `file` has no `dir`, `vault` has no
+    /// usable address or token, both token forms are set, a production
     /// deployment names a plaintext `http` Vault address, or a multi-tenant
     /// production deployment uses anything but Vault.
     fn validate(&self, production: bool, multi_tenant: bool) -> Result<(), ConfigError> {
@@ -1885,6 +1906,9 @@ impl OperatorKeysConfig {
                 message: format!("verification.operator_keys: {message}"),
             })
         };
+        if i32::try_from(self.active_version.get()).is_err() {
+            return invalid("active_version must not exceed 2147483647 (i32::MAX)");
+        }
         if multi_tenant_production && self.source != OperatorKeySource::Vault {
             return invalid(
                 "multi-tenant production requires source = \"vault\" \
@@ -3795,6 +3819,74 @@ minimum_slots = 2
         }
         keys.validate(false, true)
             .expect("a development fixture may use plaintext Vault");
+    }
+
+    /// The largest persisted key version is accepted exactly, and one past it
+    /// is refused at validation from both TOML and the environment, before
+    /// boot or any key provider is reached.
+    #[test]
+    fn operator_key_version_must_fit_i32() {
+        let at_max: OperatorKeysConfig =
+            toml::from_str("active_version = 2147483647").expect("i32::MAX parses");
+        at_max.validate(false, false).expect("i32::MAX validates");
+        assert_eq!(at_max.active_version.get(), 2_147_483_647);
+        let past_max: OperatorKeysConfig =
+            toml::from_str("active_version = 2147483648").expect("u32 parses");
+        let refused = past_max
+            .validate(false, false)
+            .expect_err("i32::MAX + 1 is refused")
+            .to_string();
+        assert!(refused.contains("active_version"), "{refused}");
+
+        let _guard = ENV_LOCK.lock().expect("environment test lock");
+        temp_env::with_vars(
+            [("WYRD_OPERATOR_KEK_ACTIVE_VERSION", Some("2147483648"))],
+            || {
+                let mut config = WyrdServerConfig::default();
+                config.bifrost.oracle.allow_unapproved_profile = true;
+                config.apply_env_overrides().expect("the override parses");
+                assert!(matches!(
+                    config.validate(),
+                    Err(ConfigError::Invalid { ref message }) if message.contains("active_version")
+                ));
+            },
+        );
+    }
+
+    /// Debug formatting of the key configuration, directly and through the
+    /// server configuration, prints only the source kind, active version, and
+    /// Vault presence, never a selector or token.
+    #[test]
+    fn operator_keys_debug_redacts_selectors() {
+        let keys = OperatorKeysConfig {
+            source: OperatorKeySource::Vault,
+            active_version: std::num::NonZeroU32::new(907_311).expect("positive"),
+            dir: Some(PathBuf::from("/sentinel-kek-dir")),
+            vault: Some(VaultKeysConfig {
+                addr: "https://sentinel-vault-addr:8200".to_owned(),
+                mount: "sentinel-mount".to_owned(),
+                prefix: "sentinel-prefix".to_owned(),
+                token_file: Some(PathBuf::from("/sentinel-token-file")),
+                token: Some(SecretString::from("sentinel-inline-token")),
+            }),
+        };
+        let mut config = WyrdServerConfig::default();
+        config.verification.operator_keys = keys.clone();
+        for debug in [format!("{keys:?}"), format!("{config:?}")] {
+            for sentinel in [
+                "sentinel-kek-dir",
+                "sentinel-vault-addr",
+                "sentinel-mount",
+                "sentinel-prefix",
+                "sentinel-token-file",
+                "sentinel-inline-token",
+            ] {
+                assert!(!debug.contains(sentinel), "{sentinel} leaked: {debug}");
+            }
+            assert!(debug.contains("source: Vault"), "{debug}");
+            assert!(debug.contains("active_version: 907311"), "{debug}");
+            assert!(debug.contains("vault: true"), "{debug}");
+        }
     }
 
     /// Proves production accepts only a complete maintainer-approved profile.

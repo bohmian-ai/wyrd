@@ -6,7 +6,10 @@ reads every baseline's Card status until it is ready. A Service emits Drift
 observations through ``WyrdState``; direct runs of every Verifier then score
 the window server-side and persist their results and feature rows without an
 Operator dispatch. Negative flows cover an Arrow IPC baseline refused as
-non-Parquet and a caller without ``evals:run``.
+non-Parquet and a caller without ``evals:run``. A second journey proves each
+method's edge semantics on isolated subjects: an empty tenant, a baseline-like
+window, SPC chunking, a sparse window, per-row Custom averaging with window
+bounds, and a text-valued metric.
 """
 
 from __future__ import annotations
@@ -131,9 +134,18 @@ def wait_ready(server: WyrdTestServer, credential: str, verifier: CardRef, root:
         time.sleep(0.2)
 
 
-def complete(verification: Verification, verifier: CardRef, subject: CardRef) -> str:
-    """Run ``verifier`` directly over ``subject`` for the last hour and return its result."""
+def complete(
+    verification: Verification,
+    verifier: CardRef,
+    subject: CardRef,
+    window: tuple[datetime, datetime] | None = None,
+) -> str:
+    """Run ``verifier`` directly over ``subject`` and return its result.
+
+    ``window`` is the ``[start, end)`` range; omitted, it spans an hour either side of now.
+    """
     now = datetime.now(UTC)
+    start, end = window or (now - timedelta(hours=1), now + timedelta(hours=1))
     run_id = verification.start_run(
         {
             "target": {
@@ -143,8 +155,8 @@ def complete(verification: Verification, verifier: CardRef, subject: CardRef) ->
             },
             "input": {
                 "kind": "drift_window",
-                "start": (now - timedelta(hours=1)).isoformat(),
-                "end": (now + timedelta(hours=1)).isoformat(),
+                "start": start.isoformat(),
+                "end": end.isoformat(),
             },
         }
     )
@@ -267,3 +279,219 @@ def test_parquet_baselines_fit_and_score_drift_server_side(tmp_path: Path) -> No
                 }
             )
         assert denied.value.status == 403
+
+
+EDGE_VERIFIERS = {
+    "py-edge-psi": (
+        "      method: Psi\n      signal:\n        kind: Distribution\n"
+        "        baseline_ref:\n          kind: Data\n          name: py-edge-data\n"
+        "          version: 1.0.0\n          space: default\n"
+        "        features: [latency, tier]\n      condition:\n        kind: Statistical\n"
+        "      profile:\n        kind: Psi\n"
+        "        binning_strategy:\n          kind: EqualWidth\n          n_bins: 10\n"
+        "        categorical_features: [tier]\n"
+        "        threshold:\n          kind: Fixed\n          value: 0.25\n"
+    ),
+    "py-edge-spc": (
+        "      method: Spc\n      signal:\n        kind: Distribution\n"
+        "        baseline_ref:\n          kind: Data\n          name: py-edge-data\n"
+        "          version: 1.0.0\n          space: default\n"
+        "        features: [latency]\n      condition:\n        kind: Statistical\n"
+        "      profile:\n        kind: Spc\n        sample_size: 5\n"
+        '        weco_rule:\n          rule_string: "8 16 4 8 2 4 1 1"\n'
+        "        alert_threshold: Zone1\n"
+    ),
+    "py-edge-custom": (
+        "      method: Custom\n      signal:\n        kind: Metric\n        name: score\n"
+        "      condition:\n        kind: Statistical\n      profile:\n        kind: Custom\n"
+        "        metric_name: score\n        baseline_value: 1.0\n        alert_threshold: 0.5\n"
+    ),
+}
+
+
+def register_edge_verifier(cards: Cards, root: Path, name: str) -> CardRef:
+    """Register one method-edge Drift Verifier from ``EDGE_VERIFIERS``."""
+    path = root / f"{name}.yaml"
+    path.write_text(
+        f"apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: {name}\n"
+        "  version: 1.0.0\n  space: default\nspec:\n  implementation:\n    kind: drift\n"
+        f"    spec:\n{EDGE_VERIFIERS[name]}",
+        encoding="utf-8",
+    )
+    return cards.register_from_path(str(path)).root
+
+
+def subject(cards: Cards, root: Path, name: str) -> CardRef:
+    """Register an unbound Service named ``name`` as a Drift subject."""
+    path = root / f"{name}.yaml"
+    path.write_text(
+        f"apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: {name}\n"
+        "  version: 1.0.0\n  space: default\nspec: {}\n",
+        encoding="utf-8",
+    )
+    return cards.register_from_path(str(path)).root
+
+
+def subject_credential(server: WyrdTestServer, service: CardRef) -> str:
+    """Issue the subject Service's own key, whose Card scope covers its manual runs."""
+    return server.credential_registered_service(
+        f"{service.space}/Service/{service.name}@{service.version}", ["admin"]
+    )
+
+
+def emit_rows(
+    server: WyrdTestServer, admin: str, service: CardRef, bundle: Path, rows: list[dict]
+) -> None:
+    """Emit ``rows`` as Drift observations of ``service`` through one ``WyrdState`` lifetime.
+
+    Each lifetime is one client batch; the batch is drained and flushed before returning.
+    """
+    download(server, admin, "Service", str(service.uid), bundle)
+    state = WyrdState.from_path(bundle)
+    state.start_bifrost(server_url=server.base_url, credential=subject_credential(server, service))
+    run = state.run()
+    for row in rows:
+        run.observe.drift(row)
+    state.shutdown()
+    server.flush_bifrost()
+
+
+def read_result(server: WyrdTestServer, query: Bifrost, result_id: str) -> tuple[dict, list]:
+    """Flush Scribe, then read one result and its ``(feature, method, verdict)`` rows.
+
+    A tenant that has never scored a report has no feature table yet, which reads
+    as no feature rows.
+    """
+    server.flush_bifrost()
+    (result,) = (
+        query.sql(
+            "SELECT execution_status, verdict, details "
+            f"FROM vala.verification.results WHERE result_id = '{result_id}'"
+        )
+        .to_arrow()
+        .to_pylist()
+    )
+    try:
+        rows = (
+            query.sql(
+                "SELECT f.feature, f.method, f.verdict FROM vala.drift.result_features f "
+                "JOIN vala.verification.results r ON f.result_id = r.result_id "
+                f"WHERE r.result_id = '{result_id}' ORDER BY f.feature"
+            )
+            .to_arrow()
+            .to_pylist()
+        )
+    except WyrdError as error:
+        assert error.code == "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND", error
+        rows = []
+    return result, [(row["feature"], row["method"], row["verdict"]) for row in rows]
+
+
+def assert_unscored(outcome: tuple[dict, list]) -> None:
+    """Assert a result completed inconclusive before scoring: null details, no features."""
+    result, features = outcome
+    assert (result["execution_status"], result["verdict"]) == ("completed", "inconclusive"), result
+    assert result["details"] is None, result
+    assert features == [], features
+
+
+@pytest.mark.integration
+def test_drift_method_edges_score_through_oracle(tmp_path: Path) -> None:
+    """Each Drift method's edge semantics hold through the production runtime.
+
+    Before the tenant's first Drift write a Custom run completes inconclusive with
+    no details, features, or dispatch. Separate subjects then isolate each case: a
+    baseline-like window passes PSI and Custom (a mean at the threshold is no
+    drift); two chunks and a trailing chunk near the center pass SPC; three rows
+    are too few for PSI and SPC; Custom averages per row, not per batch, and the
+    window bounds exclude a batch; a text-valued metric is inconclusive.
+    """
+    with WyrdTestServer(verification_runtime=True) as server:
+        admin = server.bootstrap_service(["admin"], name="py-drift-edges-admin")
+        cards = Cards(server_url=server.base_url, credential=admin)
+        query = Bifrost(server_url=server.base_url, credential=admin)
+        now = datetime.now(UTC)
+        start, end = now - timedelta(hours=1), now + timedelta(hours=1)
+
+        def run(
+            verifier: CardRef, service: CardRef, window: tuple[datetime, datetime] = (start, end)
+        ) -> tuple[dict, list]:
+            verification = Verification(
+                server_url=server.base_url, credential=subject_credential(server, service)
+            )
+            return read_result(server, query, complete(verification, verifier, service, window))
+
+        custom = register_edge_verifier(cards, tmp_path, "py-edge-custom")
+        steady = subject(cards, tmp_path, "py-edge-steady")
+        assert_unscored(run(custom, steady))
+
+        tier = ["gold" if row % 2 == 0 else "silver" for row in range(ROWS)]
+        baseline = DataCard(
+            PolarsInterface(data=pl.DataFrame({"latency": LATENCY, "tier": tier})),
+            space="default",
+            name="py-edge-data",
+            version="1.0.0",
+        )
+        cards.data.register(baseline)
+        psi = register_edge_verifier(cards, tmp_path, "py-edge-psi")
+        spc = register_edge_verifier(cards, tmp_path, "py-edge-spc")
+        for verifier in (psi, spc):
+            wait_ready(server, admin, verifier, tmp_path / "status")
+
+        bundles = tmp_path / "bundles"
+        baseline_like = [
+            {
+                "latency": float((row * 37) % ROWS),
+                "tier": tier[row],
+                "score": 1.0 if row % 2 == 0 else 2.0,
+            }
+            for row in range(ROWS)
+        ]
+        emit_rows(server, admin, steady, bundles / "steady", baseline_like)
+        result, features = run(psi, steady)
+        assert result["verdict"] == "passed", result
+        assert features == [("latency", "Psi", "no_drift"), ("tier", "Psi", "no_drift")]
+        result, features = run(custom, steady)
+        assert result["verdict"] == "passed", "a mean at the threshold is no drift"
+        assert features == [("score", "Custom", "no_drift")]
+
+        calm = subject(cards, tmp_path, "py-edge-calm")
+        near_center = [45.0] * 5 + [54.0] * 5 + [49.0] * 3
+        emit_rows(
+            server,
+            admin,
+            calm,
+            bundles / "calm",
+            [{"latency": latency, "tier": "gold", "score": 1.0} for latency in near_center],
+        )
+        result, features = run(spc, calm)
+        assert result["verdict"] == "passed", result
+        assert features == [("latency", "Spc", "no_drift")]
+
+        sparse = subject(cards, tmp_path, "py-edge-sparse")
+        emit_rows(server, admin, sparse, bundles / "sparse", baseline_like[:3])
+        result, features = run(psi, sparse)
+        assert result["verdict"] == "inconclusive", result
+        assert features == [("latency", "Psi", "inconclusive"), ("tier", "Psi", "inconclusive")]
+        result, features = run(spc, sparse)
+        assert result["verdict"] == "inconclusive", result
+        assert features == [("latency", "Spc", "inconclusive")]
+
+        weighted = subject(cards, tmp_path, "py-edge-weighted")
+
+        def scores(values: list[float]) -> list[dict]:
+            return [{"latency": 50.0, "tier": "gold", "score": value} for value in values]
+
+        emit_rows(server, admin, weighted, bundles / "weighted-a", scores([1.0]))
+        split = datetime.now(UTC)
+        emit_rows(server, admin, weighted, bundles / "weighted-b", scores([2.0, 2.0, 2.0]))
+        result, _ = run(custom, weighted)
+        assert result["verdict"] == "failed", "rows average 1.75; batches would average 1.5"
+        result, _ = run(custom, weighted, (start, split))
+        assert result["verdict"] == "passed", "the window end excludes the second batch"
+        result, _ = run(custom, weighted, (split, end))
+        assert result["verdict"] == "failed", "the window start excludes the first batch"
+
+        text = subject(cards, tmp_path, "py-edge-text")
+        emit_rows(server, admin, text, bundles / "text", [{"score": "high"}] * 3)
+        assert_unscored(run(custom, text))

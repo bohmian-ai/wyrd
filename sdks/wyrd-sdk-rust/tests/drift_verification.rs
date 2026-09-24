@@ -162,14 +162,15 @@ fn distribution(features: &str) -> String {
 /// Service Card YAML named `name` binding `drift-custom` on the shared
 /// `drift-daily` Trigger with one inline HTTP Operator per hook in `hooks`.
 fn service_yaml(name: &str, hooks: &[&str]) -> String {
-    let operators: String = hooks
+    let operators = hooks
         .iter()
         .map(|hook| {
             format!(
                 "        - kind: http\n          method: post\n          url: https://hooks.example.test/{hook}\n"
             )
         })
-        .collect();
+        .collect::<Vec<_>>()
+        .concat();
     format!(
         "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: {name}\n  version: 1.0.0\n  space: default\nspec:\n  verified_by:\n    - verifier:\n        kind: Verifier\n        name: drift-custom\n        version: 1.0.0\n        space: default\n      runs_on:\n        kind: Trigger\n        name: drift-daily\n        version: 1.0.0\n        space: default\n      on_failure:\n{operators}"
     )

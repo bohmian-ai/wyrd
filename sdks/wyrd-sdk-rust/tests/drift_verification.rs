@@ -704,8 +704,9 @@ fn assert_unscored((result, features): &(ResultRow, Vec<FeatureRow>)) {
 /// each case in the one shared observation table: a window matching the
 /// baseline distribution passes PSI and Custom, with the Custom mean exactly
 /// at its threshold; two in-control subgroups pass SPC with zero-signal
-/// evidence until a trailing partial subgroup makes it inconclusive; three
-/// rows are too few for PSI's minimum sample and one SPC subgroup; records
+/// evidence until a trailing partial subgroup leaves it unscored; three
+/// rows are too few for PSI's minimum sample and leave SPC a partial,
+/// unscored subgroup; records
 /// without a PSI feature are ignored while one omitting a feature leaves PSI
 /// unscored; two client batches of one and three rows average per row, not
 /// per batch, and a window ending between them excludes the second; a
@@ -877,11 +878,11 @@ impl EdgeJourney<'_> {
 
     /// Two complete in-control subgroups pass SPC with zero signals, and
     /// the same subject with two more rows ends in a partial subgroup, which
-    /// is inconclusive rather than shifted or dropped.
+    /// leaves the run unscored rather than shifted or dropped.
     ///
     /// # Panics
     /// Panics when the calm run does not pass with SPC evidence or the
-    /// partial run is not inconclusive.
+    /// partial run is scored.
     async fn assert_calm_spc_passes_until_partial(&self, spc: &RegistrationReceipt) {
         let calm = self.subject("calm").await;
         let rows = |latencies: &[f64]| -> Vec<Features> {
@@ -903,13 +904,7 @@ impl EdgeJourney<'_> {
         assert_spc_evidence(&result, 2, 0);
 
         self.emit(&calm, "calm-partial", &rows(&[50.0, 50.0])).await;
-        let (result, features) = self.run(spc, &calm, self.start, self.end).await;
-        assert_eq!(result.verdict, "inconclusive", "{result:?}");
-        assert_eq!(
-            verdicts(&features),
-            [("latency", "Spc", "inconclusive")],
-            "a trailing partial subgroup is inconclusive"
-        );
+        assert_unscored(&self.run(spc, &calm, self.start, self.end).await);
     }
 
     /// Records carrying no PSI feature are unrelated and leave a passing
@@ -996,11 +991,11 @@ impl EdgeJourney<'_> {
         assert!(evidence(&reread, "tier")["Psi"]["bins"].is_array());
     }
 
-    /// Three rows are below PSI's minimum sample and one SPC subgroup, so
-    /// both methods are inconclusive per feature.
+    /// Three rows are below PSI's minimum sample, so PSI is inconclusive per
+    /// feature, and form only a partial SPC subgroup, so SPC is unscored.
     ///
     /// # Panics
-    /// Panics when either run is not inconclusive per feature.
+    /// Panics when PSI is not inconclusive per feature or SPC is scored.
     async fn assert_sparse_is_inconclusive(
         &self,
         psi: &RegistrationReceipt,
@@ -1019,13 +1014,7 @@ impl EdgeJourney<'_> {
             ],
             "three rows are below PSI's minimum sample"
         );
-        let (result, features) = self.run(spc, &sparse, self.start, self.end).await;
-        assert_eq!(result.verdict, "inconclusive", "{result:?}");
-        assert_eq!(
-            verdicts(&features),
-            [("latency", "Spc", "inconclusive")],
-            "three rows are a partial subgroup"
-        );
+        assert_unscored(&self.run(spc, &sparse, self.start, self.end).await);
     }
 
     /// Two client batches of one and three rows average per row, not per

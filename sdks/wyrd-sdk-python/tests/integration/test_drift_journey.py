@@ -528,8 +528,8 @@ def test_drift_method_edges_score_through_oracle(tmp_path: Path) -> None:
     no details, features, or dispatch. Separate subjects then isolate each case: a
     baseline-like window passes PSI and Custom (a mean at the threshold is no
     drift); two in-control subgroups pass SPC with zero-signal evidence until a
-    trailing partial subgroup makes it inconclusive; three rows are too few for
-    PSI and one SPC subgroup; records without a PSI feature are ignored while
+    trailing partial subgroup leaves it unscored; three rows are too few for
+    PSI and leave SPC a partial, unscored subgroup; records without a PSI feature are ignored while
     one omitting a feature leaves PSI unscored; Custom averages per row, not per
     batch, and the window bounds exclude a batch; a text-valued metric is
     inconclusive.
@@ -595,18 +595,14 @@ def test_drift_method_edges_score_through_oracle(tmp_path: Path) -> None:
         assert features == [("latency", "Spc", "no_drift")]
         assert_spc_evidence(result["details"], 2, 0)
         emit_rows(server, admin, calm, bundles / "calm-partial", latencies([50.0, 50.0]))
-        result, features = run(spc, calm)
-        assert result["verdict"] == "inconclusive", "a trailing partial subgroup"
-        assert features == [("latency", "Spc", "inconclusive")]
+        assert_unscored(run(spc, calm))
 
         sparse = subject(cards, tmp_path, "py-edge-sparse")
         emit_rows(server, admin, sparse, bundles / "sparse", baseline_like[:3])
         result, features = run(psi, sparse)
         assert result["verdict"] == "inconclusive", result
         assert features == [("latency", "Psi", "inconclusive"), ("tier", "Psi", "inconclusive")]
-        result, features = run(spc, sparse)
-        assert result["verdict"] == "inconclusive", result
-        assert features == [("latency", "Spc", "inconclusive")]
+        assert_unscored(run(spc, sparse))
 
         gappy = subject(cards, tmp_path, "py-edge-gappy")
         emit_rows(server, admin, gappy, bundles / "gappy", baseline_like)

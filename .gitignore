@@ -57,3 +57,4 @@ crates/vala/vala-bifrost-redux/benches/reports/*.json
 .omp
 *.node
 openapi.yaml.tmp
+.impeccable

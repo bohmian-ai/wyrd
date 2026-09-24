@@ -8,9 +8,11 @@
 //! issuance audit — so a grant change or suspension governs the very next
 //! token on every path, and no path can drift from the others.
 //!
-//! The one internal mint, [`TenantTokenIssuer::issue_system_token`], signs the
-//! tenant's credentialless SYSTEM writer a token scoped to one Verifier. It has
-//! no grant evidence to verify and no public entry path.
+//! The internal mints, [`TenantTokenIssuer::issue_system_token`] and
+//! [`TenantTokenIssuer::issue_system_drift_read_token`], sign the tenant's
+//! credentialless SYSTEM principal a token scoped to one Verifier for exactly
+//! one fixed purpose. They have no grant evidence to verify and no public entry
+//! path.
 
 use std::sync::Arc;
 
@@ -27,12 +29,13 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::{CardRef, CardRefScope};
 use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
 use wyrd_spec::vala::audit_detail::CardScopeMintKind;
-use wyrd_sql::TenantConn;
+use wyrd_sql::{SqlError, TenantConn};
 use wyrd_sql::queries::auth::{
     RoleRow, insert_refresh_token, insert_refresh_token_rotated, list_service_account_roles,
     list_user_roles, refresh_issuance_instant, roles_by_name, service_account_by_id,
     system_principal_id, user_by_id,
 };
+use vala_sql::queries::olap_catalog::get_by_fqn;
 use wyrd_sql::queries::platform::tenant_resolver::tenant_admits_credentials;
 use wyrd_sql::queries::verification::record_machine_authentication;
 
@@ -44,6 +47,9 @@ use crate::card_scope::{
 use crate::exchange_api_key::{
     DELEGATION_POLICY_ACTION, principal_kind_wire, role_refs, token_hash,
 };
+
+/// Canonical Bifrost table the SYSTEM Drift reader may read.
+const DRIFT_OBSERVATIONS: &str = "vala.drift.observations";
 
 /// Tenant token lifetimes.
 #[derive(Debug, Clone)]
@@ -256,6 +262,10 @@ pub enum IssuanceError {
     /// A store read or write failed.
     #[error("database operation failed")]
     Database(#[from] sqlx::Error),
+    /// A catalog read through a `SqlError`-returning store query failed, or
+    /// returned a row that breaks a stored invariant.
+    #[error("store operation failed")]
+    Store(#[from] SqlError),
     /// A Card-scope or audit step failed with its own stable error.
     #[error("wyrd error")]
     Wyrd(#[from] WyrdError),
@@ -300,7 +310,7 @@ impl From<IssuanceError> for WyrdError {
                     details: json!({}),
                 }
             }
-            IssuanceError::Database(error) => {
+            IssuanceError::Database(_) | IssuanceError::Store(_) => {
                 tracing::warn!(error = %error, "tenant token issuance store unavailable");
                 WyrdError::AuthVerifyUnavailable {
                     message: "auth backend unavailable".to_owned(),
@@ -503,6 +513,59 @@ impl TenantTokenIssuer {
         conn: &mut TenantConn<'_>,
         verifier: &CardRef,
     ) -> Result<ExchangedToken, IssuanceError> {
+        self.issue_system(conn, verifier, Permission::bifrost_record_write())
+            .await
+    }
+
+    /// Mint the tenant's SYSTEM Drift reader a token scoped to one Verifier.
+    ///
+    /// The Drift runner reads its run's observations through the ordinary query
+    /// service under this token. It resolves, in the caller's transaction, the
+    /// UID of the tenant's registered `vala.drift.observations` table without
+    /// creating it, then signs the same closed SYSTEM claim set as
+    /// [`Self::issue_system_token`] whose only authority is
+    /// [`Permission::drift_table_read`] of that table. The Verifier scope is
+    /// attribution only: Oracle's table authorization enforces the read, and
+    /// the runner's fixed SQL, not this token, limits subject, series, and
+    /// window. Like the result-write mint it appends no audit; Oracle audits
+    /// each read the token is spent on.
+    ///
+    /// Returns `Ok(None)` when the tenant has never registered the observation
+    /// table, which the runner scores as an empty window.
+    ///
+    /// # Errors
+    /// Returns the errors of [`Self::issue_system_token`], and
+    /// [`IssuanceError::Store`] when the table row cannot be read or its
+    /// stored UID is not 16 bytes.
+    #[tracing::instrument(level = "debug", skip(self, conn), fields(verifier = %verifier), err)]
+    pub async fn issue_system_drift_read_token(
+        &self,
+        conn: &mut TenantConn<'_>,
+        verifier: &CardRef,
+    ) -> Result<Option<ExchangedToken>, IssuanceError> {
+        let Some(table) = get_by_fqn(conn, DRIFT_OBSERVATIONS).await? else {
+            return Ok(None);
+        };
+        let table_uid = Uuid::from_slice(&table.table_uid).map_err(|_| {
+            IssuanceError::Store(SqlError::InvariantViolation {
+                detail: "stored Bifrost table UID is not 16 bytes".to_owned(),
+            })
+        })?;
+        self.issue_system(conn, verifier, Permission::drift_table_read(table_uid))
+            .await
+            .map(Some)
+    }
+
+    /// Sign the closed SYSTEM claim set for `verifier` carrying only `permission`.
+    ///
+    /// # Errors
+    /// Returns the errors documented on [`Self::issue_system_token`].
+    async fn issue_system(
+        &self,
+        conn: &mut TenantConn<'_>,
+        verifier: &CardRef,
+        permission: Permission,
+    ) -> Result<ExchangedToken, IssuanceError> {
         if verifier.kind != CardKind::Verifier || verifier.uid.is_none() {
             return Err(IssuanceError::SystemScopeInvalid);
         }
@@ -526,7 +589,7 @@ impl TenantTokenIssuer {
                     card_ref_scope: CardRefScope::own(verifier),
                 },
                 roles: Vec::new(),
-                permissions: PermissionSet::from_iter([Permission::bifrost_record_write()]),
+                permissions: PermissionSet::from_iter([permission]),
                 credential_id: None,
                 act: None,
                 audience: TokenAudience::Wyrd,

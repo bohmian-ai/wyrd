@@ -794,11 +794,13 @@ impl AccessTokenClaims {
 
     /// Resolve a `system` claim set into the SYSTEM principal kind.
     ///
-    /// The internal verification-result writer is minted with a closed shape,
-    /// and anything else signed under its tag is treated as forged: the id is
-    /// a `UUIDv7` equal to `sub`; there is no root Card, role, credential, or
-    /// delegation chain; the permissions are exactly `bifrost_record:write`;
-    /// and the scope is exactly one UID-bearing Verifier Card.
+    /// The internal SYSTEM principal is minted with a closed shape, and
+    /// anything else signed under its tag is treated as forged: the id is a
+    /// `UUIDv7` equal to `sub`; there is no root Card, role, credential, or
+    /// delegation chain; the permissions are exactly one fixed purpose —
+    /// `bifrost_record:write` for result publication, or one
+    /// [`Permission::drift_table_read`] for the Drift observation read, never
+    /// both; and the scope is exactly one UID-bearing Verifier Card.
     ///
     /// # Errors
     /// Returns [`AuthError::InvalidToken`] when any of those conditions fails.
@@ -811,7 +813,11 @@ impl AccessTokenClaims {
             && self.roles.is_empty()
             && self.cid.is_none()
             && self.act.is_none()
-            && self.permissions == PermissionSet::from_iter([Permission::bifrost_record_write()])
+            && (self.permissions == PermissionSet::from_iter([Permission::bifrost_record_write()])
+                || matches!(
+                    self.permissions.iter().collect::<Vec<_>>().as_slice(),
+                    [permission] if permission.is_drift_table_read()
+                ))
             && matches!(
                 scope,
                 [member] if member.kind == CardKind::Verifier && member.uid.is_some()
@@ -1007,7 +1013,9 @@ mod tests {
         ClaimMapping, ClaimPath, ClientAuth, IssuerConfigResolver, JwksCache, OidcError,
         TrustedIssuer,
     };
-    use wyrd_runtime::{Permission, PermissionSet};
+    use wyrd_runtime::{
+        BifrostPermissionScope, BifrostTableScope, Permission, PermissionScope, PermissionSet,
+    };
     use wyrd_runtime::{Principal, PrincipalId, PrincipalKind, RoleRef};
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
@@ -1593,6 +1601,38 @@ mod tests {
         );
     }
 
+    /// The SYSTEM Drift read shape — the same closed claim set carrying only
+    /// one `vala.drift` table-scoped `bifrost_query:read` — resolves to the
+    /// same single-Verifier `System` principal holding exactly that read.
+    ///
+    /// # Panics
+    /// Panics when the conforming read token is refused or gains authority.
+    #[test]
+    fn token_verifier_accepts_system_drift_read_token() {
+        let verifier_ref = uid_card_ref(CardKind::Verifier, "drift");
+        let read = Permission::drift_table_read(uuid::Uuid::now_v7());
+        let claims = AccessTokenClaims {
+            permissions: PermissionSet::from_iter([read.clone()]),
+            ..system_claims(&verifier_ref)
+        };
+        let token = SecretString::from(encode_eddsa_with_kid(&claims));
+
+        let verified = verifier(WyrdAuthVerifySettings::default())
+            .verify(&token, &tenant_id())
+            .expect("conforming system read token verifies");
+
+        assert_eq!(
+            verified.principal.kind,
+            PrincipalKind::System {
+                card_ref_scope: CardRefScope::own(&verifier_ref)
+            }
+        );
+        assert_eq!(
+            verified.principal.effective_permissions,
+            PermissionSet::from_iter([read])
+        );
+    }
+
     /// Every deviation from the SYSTEM token contract is refused as an invalid
     /// token, so no forged or widened claim set can act as the result writer.
     ///
@@ -1677,6 +1717,49 @@ mod tests {
                     permissions: PermissionSet::from_iter([
                         Permission::bifrost_record_write(),
                         Permission::card_read(),
+                    ]),
+                    ..base.clone()
+                },
+            ),
+            (
+                "both SYSTEM purposes",
+                AccessTokenClaims {
+                    permissions: PermissionSet::from_iter([
+                        Permission::bifrost_record_write(),
+                        Permission::drift_table_read(uuid::Uuid::now_v7()),
+                    ]),
+                    ..base.clone()
+                },
+            ),
+            (
+                "unscoped query read",
+                AccessTokenClaims {
+                    permissions: PermissionSet::from_iter([Permission::bifrost_query_read()]),
+                    ..base.clone()
+                },
+            ),
+            (
+                "query read of another schema",
+                AccessTokenClaims {
+                    permissions: PermissionSet::from_iter([Permission {
+                        scope: PermissionScope::Bifrost(BifrostPermissionScope::Table(
+                            BifrostTableScope {
+                                catalog: "vala".to_owned(),
+                                schema: "traces".to_owned(),
+                                table_uid: uuid::Uuid::now_v7(),
+                            },
+                        )),
+                        ..Permission::bifrost_query_read()
+                    }]),
+                    ..base.clone()
+                },
+            ),
+            (
+                "two drift table reads",
+                AccessTokenClaims {
+                    permissions: PermissionSet::from_iter([
+                        Permission::drift_table_read(uuid::Uuid::now_v7()),
+                        Permission::drift_table_read(uuid::Uuid::now_v7()),
                     ]),
                     ..base.clone()
                 },

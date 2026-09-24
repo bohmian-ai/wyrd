@@ -604,6 +604,37 @@ impl Permission {
         }
     }
 
+    /// Read exactly one table of the `vala.drift` schema, identified by UID.
+    ///
+    /// The tenant SYSTEM Drift reader's only permission: the issuer passes the
+    /// UID of the tenant's registered `vala.drift.observations` table, and
+    /// Oracle's table authorization refuses every other table.
+    #[must_use]
+    pub fn drift_table_read(table_uid: uuid::Uuid) -> Self {
+        Self {
+            resource: Resource::BifrostQuery,
+            action: Action::Read,
+            scope: PermissionScope::Bifrost(BifrostPermissionScope::Table(BifrostTableScope {
+                catalog: "vala".to_owned(),
+                schema: "drift".to_owned(),
+                table_uid,
+            })),
+        }
+    }
+
+    /// Whether this is a [`Self::drift_table_read`] permission for some table.
+    ///
+    /// Token verification uses it to accept the SYSTEM Drift reader's closed
+    /// claim shape without knowing the tenant's table UID.
+    #[must_use]
+    pub fn is_drift_table_read(&self) -> bool {
+        matches!(
+            &self.scope,
+            PermissionScope::Bifrost(BifrostPermissionScope::Table(table))
+                if *self == Self::drift_table_read(table.table_uid)
+        )
+    }
+
     /// All permissions.
     #[must_use]
     pub const fn wildcard() -> Self {

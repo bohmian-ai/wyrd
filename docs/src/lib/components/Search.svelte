@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { base } from '$app/paths';
 
-  // Bespoke Pagefind search: a brutalist arcade modal over the Pagefind JS API
+  // Pagefind search: a header control opening a modal over the Pagefind JS API
   // (loaded from /pagefind/pagefind.js at the base path). Pagefind only indexes
   // the built site, so search is inert in `vite dev` — the modal degrades to a
   // notice. Cmd/Ctrl+K opens; Esc closes.
@@ -84,38 +84,35 @@
   });
 </script>
 
-<button class="search" type="button" onclick={show} aria-label="Search docs">
-  Search docs…
-  <span class="k">⌘K</span>
+<button class="search-open" type="button" onclick={show} aria-label="Search docs">
+  <svg viewBox="0 0 20 20" aria-hidden="true">
+    <circle cx="8.5" cy="8.5" r="5.5" fill="none" stroke="currentColor" stroke-width="1.6" />
+    <path d="m13 13 4 4" fill="none" stroke="currentColor" stroke-width="1.6" />
+  </svg>
+  <span>Search docs</span>
+  <kbd>⌘K</kbd>
 </button>
 
 {#if open}
-  <div
-    class="search-overlay"
-    role="button"
-    tabindex="-1"
-    aria-label="Close search"
-    onclick={hide}
-    onkeydown={(e) => e.key === 'Enter' && hide()}
-  ></div>
+  <button class="search-scrim" type="button" tabindex="-1" aria-label="Close search" onclick={hide}
+  ></button>
   <div class="search-modal" role="dialog" aria-modal="true" aria-label="Search docs">
     <div class="sm-bar">
-      <span class="sm-icon" aria-hidden="true">⌕</span>
-      <!-- svelte-ignore a11y_autofocus -->
       <input
         bind:this={inputEl}
         bind:value={query}
         oninput={onInput}
         type="search"
-        placeholder="Search the docs…"
+        aria-label="Search the docs"
+        placeholder="Search the docs"
         autocomplete="off"
         spellcheck="false"
       />
-      <button class="sm-close" type="button" onclick={hide} aria-label="Close">ESC</button>
+      <button class="sm-close" type="button" onclick={hide}>Close <kbd>Esc</kbd></button>
     </div>
-    <div class="sm-results">
+    <div class="sm-results" aria-live="polite">
       {#if unavailable}
-        <p class="sm-note">Search index is built with the site — run a production build to use it.</p>
+        <p class="sm-note">The search index is built with the site. Run a production build to use it.</p>
       {:else if query.trim() && results.length === 0}
         <p class="sm-note">No results for “{query}”.</p>
       {:else}
@@ -131,106 +128,99 @@
 {/if}
 
 <style>
-  .search-overlay {
+  .search-scrim {
     position: fixed;
     inset: 0;
-    background: color-mix(in srgb, var(--border) 45%, transparent);
     z-index: 50;
+    border: 0;
+    background: color-mix(in srgb, var(--bg) 72%, transparent);
+    cursor: default;
   }
   .search-modal {
     position: fixed;
     top: 12vh;
     left: 50%;
     transform: translateX(-50%);
-    width: min(620px, 92vw);
+    width: min(620px, calc(100vw - 24px));
     z-index: 51;
     background: var(--surface);
-    border: 3px solid var(--border);
+    border: 1px solid var(--text);
     border-radius: var(--r);
-    box-shadow: 10px 10px 0 0 var(--shadow);
     overflow: hidden;
   }
   .sm-bar {
     display: flex;
     align-items: center;
-    gap: 10px;
-    padding: 12px 14px;
-    border-bottom: 2px solid var(--border);
-  }
-  .sm-icon {
-    font-size: 1.1rem;
-    color: var(--muted);
+    gap: 8px;
+    padding: 8px;
+    border-bottom: 1px solid var(--border);
   }
   .sm-bar input {
     flex: 1;
     min-width: 0;
-    font-family: var(--font-mono);
-    font-size: 0.9rem;
+    height: 40px;
+    padding: 0 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--r);
+    background: var(--bg);
     color: var(--text);
-    background: transparent;
-    border: 0;
-    outline: none;
+    font-size: 16px;
   }
   .sm-close {
-    font-family: var(--font-mono);
-    font-size: 0.6rem;
-    font-weight: 700;
+    min-height: 40px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--r);
+    background: var(--surface);
+    color: var(--text);
+    font-size: 13px;
+  }
+  .sm-close kbd {
     color: var(--muted);
-    background: var(--surface-2);
-    border: 2px solid var(--border);
-    border-radius: 4px;
-    padding: 3px 7px;
-    cursor: pointer;
+    font: 11px var(--font-mono);
   }
   .sm-results {
     max-height: 60vh;
     overflow-y: auto;
-    padding: 8px;
+    padding: 6px;
   }
   .sm-note {
-    font-family: var(--font-mono);
-    font-size: 0.78rem;
-    color: var(--muted);
-    padding: 14px;
     margin: 0;
+    padding: 14px;
+    color: var(--muted);
+    font-size: 14px;
   }
   .sm-hit {
     display: flex;
     flex-direction: column;
-    gap: 4px;
+    gap: 3px;
     padding: 10px 12px;
-    text-decoration: none;
-    color: var(--text);
-    border: 2px solid transparent;
+    border: 1px solid transparent;
     border-radius: var(--r);
+    color: var(--text);
+    text-decoration: none;
   }
-  .sm-hit:hover {
-    background: var(--rune-soft);
-    border-color: var(--border);
+  .sm-hit:hover,
+  .sm-hit:focus-visible {
+    border-color: var(--declare);
+    background: var(--declare-soft);
   }
   .sm-hit-title {
-    font-family: var(--font-display);
-    font-size: 0.92rem;
+    font-weight: 700;
   }
   .sm-hit-ex {
-    font-family: var(--font-sans);
-    font-size: 0.78rem;
-    line-height: 1.45;
     color: var(--muted);
+    font-size: 13px;
+    line-height: 1.45;
   }
   .sm-hit-ex :global(mark) {
-    background: var(--lime);
-    color: var(--lime-ink);
-    border-radius: 3px;
-    padding: 0 2px;
-  }
-
-  /* Phone: the global arcade theme hides the `.search` pill (the menu drawer
-     takes over) below 640px; the modal is viewport-relative (min(620px, 92vw))
-     so it stays full-width when opened via ⌘K. */
-  @media (max-width: 640px) {
-    .sm-hit {
-      padding: 12px 12px;
-    }
+    background: none;
+    color: var(--text);
+    font-weight: 700;
+    text-decoration: underline 1px var(--declare);
+    text-underline-offset: 2px;
   }
 </style>

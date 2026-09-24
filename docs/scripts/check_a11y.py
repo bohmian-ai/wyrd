@@ -24,11 +24,11 @@ TOKENS_CSS = DOCS_ROOT / "src" / "styles" / "wyrd-tokens.css"
 WCAG_AA = 4.5
 
 # Fail-closed floor on a truncated prerender. The site emits 33 real doc content
-# pages (the home and Fathom splashes are full-bleed archetypes, exempt from the
-# doc-shell contract below). A masked prerender failure (a content page throwing
-# at render) silently drops pages and omits index.html while the build still exits
-# 0. Asserting index.html plus a page floor turns that regression class into a hard
-# a11y-gate failure instead of a vacuously-green run over whatever HTML survived.
+# pages (the full-width home is exempt from the doc-shell contract below). A
+# masked prerender failure (a content page throwing at render) silently drops
+# pages and omits index.html while the build still exits 0. Asserting
+# index.html plus a page floor turns that regression class into a hard a11y-gate
+# failure instead of a vacuously-green run over whatever HTML survived.
 MIN_REAL_PAGES = 33
 
 
@@ -187,12 +187,12 @@ def check_page(path: Path) -> list[str]:
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
-# The home splash (root index.html) and the Fathom teaser are full-bleed holding
-# pages with no doc shell — no <main>, splash heading structure. They are exempt
-# from the doc-shell a11y contract, like 404.html. index.html existence is still
-# asserted separately in main() as a prerender-truncation guard.
+# The home page (root index.html) renders without the doc shell (no sidebar or
+# drawer control), so it is exempt from the doc-shell a11y contract, like
+# 404.html. index.html existence is still asserted separately in main() as a
+# prerender-truncation guard.
 _SKIP_FILES = frozenset({"404.html", "index.html"})
-_SKIP_DIRS = frozenset({"mocks", "pagefind", "_app", "fathom"})
+_SKIP_DIRS = frozenset({"mocks", "pagefind", "_app"})
 
 
 def _real_pages() -> list[Path]:

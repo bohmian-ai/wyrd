@@ -37,6 +37,10 @@
 
     "--code-bg":       { "group": "code", "light": "#0E1716", "dark": "#050908", "role": "Code surface — code and terminal blocks (dark in both modes)." },
     "--code-text":     { "group": "code", "light": "#DCF5EE", "dark": "#DCF5EE", "role": "Code ink — default code text." },
+    "--code-muted":    { "group": "code", "light": "#9AB0AB", "dark": "#9AB0AB", "role": "Code comment and punctuation ink. The code field is dark in both modes, so syntax roles hold one value." },
+    "--code-keyword":  { "group": "code", "light": "#A894FF", "dark": "#A894FF", "role": "Code keyword and storage ink (declaration syntax)." },
+    "--code-string":   { "group": "code", "light": "#67B891", "dark": "#67B891", "role": "Code string and literal-value ink." },
+    "--code-number":   { "group": "code", "light": "#FFB455", "dark": "#FFB455", "role": "Code number, constant, and function-name ink." },
 
     "--r":             { "group": "geometry", "light": "2px", "dark": "2px", "role": "Radius — restrained two-pixel corners (true circles only for dots/avatars)." }
   },
@@ -76,6 +80,10 @@
     { "ink": "--text", "fill": "--danger-soft", "min": 7.0, "role": "text in a failure context field" },
 
     { "ink": "--code-text", "fill": "--code-bg", "min": 7.0, "role": "code and terminal text" },
+    { "ink": "--code-muted", "fill": "--code-bg", "min": 4.5, "role": "code comments and punctuation" },
+    { "ink": "--code-keyword", "fill": "--code-bg", "min": 4.5, "role": "code keywords" },
+    { "ink": "--code-string", "fill": "--code-bg", "min": 4.5, "role": "code strings" },
+    { "ink": "--code-number", "fill": "--code-bg", "min": 4.5, "role": "code numbers, constants, and function names" },
 
     { "ink": "--border", "fill": "--surface", "min": 2.0, "role": "structural rule on a panel — separation only; controls are also identified by label, fill, or --declare focus" },
     { "ink": "--border", "fill": "--bg", "min": 2.0, "role": "structural rule on canvas — separation only" }

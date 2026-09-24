@@ -1,9 +1,7 @@
 <script lang="ts">
-  // Direction A "On this page" rail (`.toc`): a `.th` label over `<a>` links, h3s
-  // marked `.sub` and the in-view heading `.on`. Markup + classes only — styled by
-  // the global arcade theme (arcade.css `.mk .toc …`). Headings are still parsed
-  // live from the rendered article (`.prose`) and tracked with an
-  // IntersectionObserver scrollspy.
+  // "On this page" rail (`.toc` in docs.css): h2/h3 links parsed from the
+  // rendered article (`.prose`); h3s are `.sub` and the in-view heading carries
+  // aria-current, tracked with an IntersectionObserver scrollspy.
   import { tick } from 'svelte';
   import { page } from '$app/state';
 
@@ -48,11 +46,11 @@
 
 {#if heads.length > 1}
   <nav class="toc" aria-label="On this page">
-    <div class="th">On this page</div>
+    <h2>On this page</h2>
     {#each heads as h (h.id)}
       <a
         href={`#${h.id}`}
-        class={`${h.level === 3 ? 'sub' : ''} ${activeId === h.id ? 'on' : ''}`}
+        class={h.level === 3 ? 'sub' : undefined}
         aria-current={activeId === h.id ? 'true' : undefined}>{h.text}</a
       >
     {/each}

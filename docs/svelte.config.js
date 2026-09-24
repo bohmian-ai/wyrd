@@ -1,7 +1,7 @@
 import adapter from '@sveltejs/adapter-static';
 import { mdsvex, escapeSvelte } from 'mdsvex';
 import { createHighlighter } from 'shiki';
-import { wyrdLight, wyrdDark, WYRD_THEMES } from './src/lib/shiki-theme.js';
+import { wyrdCode, WYRD_THEME } from './src/lib/shiki-theme.js';
 import rehypeSlug from 'rehype-slug';
 import rehypeAutolinkHeadings from 'rehype-autolink-headings';
 import { fileURLToPath } from 'url';
@@ -54,9 +54,8 @@ function rehypeBaseLinks() {
 
 // Wrap every markdown table in a horizontal-scroll container so wide tables
 // (error catalog, schema reference, card fields) scroll within the content
-// column on narrow viewports instead of forcing page-level overflow. The 2px
-// ink frame + 5px radius + hard shadow live on `.mk .main table` (arcade.css);
-// the `.table-scroll` wrapper is the horizontal-scroll container.
+// column on narrow viewports instead of forcing page-level overflow. The
+// `.table-scroll` wrapper is the horizontal-scroll container (docs.css).
 function rehypeWrapTables() {
   const wrap = (node) => {
     if (!Array.isArray(node.children)) return;
@@ -76,11 +75,9 @@ function rehypeWrapTables() {
   return (tree) => wrap(tree);
 }
 
-// One shared Shiki highlighter on the custom Wyrd themes (brand-token syntax
-// colors). Dual-theme output emits inline `--shiki-dark` custom props; arcade.css
-// activates them under `:root[data-theme="dark"]`.
+// One shared Shiki highlighter on the token-driven Wyrd code theme.
 const highlighter = await createHighlighter({
-  themes: [wyrdLight, wyrdDark],
+  themes: [wyrdCode],
   langs: [
     'bash',
     'shell',
@@ -107,8 +104,6 @@ const AUTHORING_COMPONENTS = [
   'LangTabs',
   'LangTab',
   'CodeFromFile',
-  'CardTileGrid',
-  'CardTile',
   'DataTable',
   'CardSummary',
   'Pagination',
@@ -158,18 +153,17 @@ const mdsvexOptions = {
   layout: path.join(__dirname, 'src/lib/mdsvex/Layout.svelte'),
   highlight: {
     highlighter: async (code, lang = 'text') => {
-      const themes = WYRD_THEMES;
+      const theme = WYRD_THEME;
       let html;
       try {
-        html = highlighter.codeToHtml(code, { lang: lang || 'text', themes });
+        html = highlighter.codeToHtml(code, { lang: lang || 'text', theme });
       } catch {
-        html = highlighter.codeToHtml(code, { lang: 'text', themes });
+        html = highlighter.codeToHtml(code, { lang: 'text', theme });
       }
       // Wrap with CodeBlock (bare name supplied by injectMdsvexComponents) to
-      // add copy-to-clipboard and the Direction A `.ch` header. escapeSvelte'd
-      // html means backticks/braces inside Shiki output don't break the template
-      // literal; CodeBlock renders {@html html} verbatim so dual-theme inline
-      // --shiki-dark props survive. `lang` drives the header's language label.
+      // add the label/copy header. escapeSvelte'd html means backticks/braces
+      // inside Shiki output don't break the template literal; CodeBlock renders
+      // {@html html} verbatim. `lang` drives the header's language label.
       return `<CodeBlock lang="${lang || 'text'}" html={\`${escapeSvelte(html)}\`} />`;
     }
   },

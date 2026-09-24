@@ -70,6 +70,10 @@ designed but not yet built.
 | Failure soft | `--danger-soft` | `#F9E8E7` | `#3B1D1B` | failure context field |
 | Code surface | `--code-bg` | `#0E1716` | `#050908` | code and terminal blocks |
 | Code ink | `--code-text` | `#DCF5EE` | `#DCF5EE` | default code text |
+| Code comment | `--code-muted` | `#9AB0AB` | `#9AB0AB` | code comments and punctuation |
+| Code keyword | `--code-keyword` | `#A894FF` | `#A894FF` | keywords and storage |
+| Code string | `--code-string` | `#67B891` | `#67B891` | strings and literal values |
+| Code number | `--code-number` | `#FFB455` | `#FFB455` | numbers, constants, function names |
 
 ### Color semantics
 

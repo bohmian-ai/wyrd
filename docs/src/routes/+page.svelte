@@ -1,125 +1,83 @@
 <script lang="ts">
-  // Full-width Direction A landing: arcade hero with the Plane backdrop and the
-  // two-pillar Fathom/Wyrd stack, the "four ways into the docs" tile grid, and
-  // the lifecycle stages. The layout renders `/` full-width (no doc shell), so
-  // these sections sit directly inside the `.mk a` cabinet chrome and are styled
-  // entirely by the global arcade theme (arcade.css).
+  // Docs home: what Wyrd is, the Declare → Observe → Verify spine, one local
+  // start, and a few contextual next tasks. Everything deeper is one click away
+  // through the task-first sidebar and search, not a gateway.
   import { base } from '$app/paths';
-  import Plane from '$lib/components/Plane.svelte';
+
+  const next = [
+    {
+      href: '/self-hosting/',
+      title: 'Run Wyrd for a team',
+      body: 'Postgres, object storage, secrets, and readiness for a self-hosted server.'
+    },
+    {
+      href: '/how-to/',
+      title: 'Declare and verify components',
+      body: 'Author Data, Model, and Prompt Cards and connect what they produce.'
+    },
+    {
+      href: '/api/',
+      title: 'Automate with the API',
+      body: 'Live OpenAPI, schemas, stable errors, the CLI, and agent workflows.'
+    }
+  ];
 </script>
 
 <svelte:head>
-  <title>Mitari docs — Build AI systems that explain themselves</title>
-  <meta name="description" content="Developer and agent documentation for Wyrd and Fathom." />
+  <title>Wyrd docs</title>
+  <meta
+    name="description"
+    content="Wyrd verifies AI systems against what they declared. Run the server locally, then declare, observe, and verify."
+  />
 </svelte:head>
 
-<section class="hero">
-  <Plane />
-  <div class="hero-in">
-    <div>
-      <span class="eyebrow">OPEN CORE · TYPED AI SYSTEMS</span>
-      <h1>Build AI systems<br />that <span class="hl">explain themselves</span>.</h1>
-      <p class="hero-sub">
-        <span class="w">Wyrd</span> gives every model, prompt, agent, and dataset one typed,
-        versioned record — a Card — and wires them into a single graph.
-        <span class="f">Fathom</span> reads that graph to verify how they behave.
+<div class="home">
+  <h1>Verify AI systems against what they declared.</h1>
+  <p class="lead">
+    Wyrd gives every model, prompt, dataset, and agent an exact, versioned declaration, connects
+    what it does at runtime to that version, and keeps the evidence that makes each result
+    attributable.
+  </p>
+  <div class="start">
+    <a class="button primary" href={`${base}/get-started/`}>Run Wyrd locally</a>
+    <small>Ends with a running server and a verified client connection</small>
+  </div>
+
+  <h2>How it works</h2>
+  <ol class="spine">
+    <li>
+      <span class="shape declare" aria-hidden="true"></span>
+      <b>Declare</b>
+      <p>
+        Describe each component as a Card with an immutable name and version. The server validates
+        it and derives lineage from the references between Cards.
       </p>
-      <div class="hero-cta">
-        <a class="btn btn-lime" href={`${base}/get-started/`}>▶ Get started</a>
-        <a class="btn btn-ghost" href={`${base}/tutorials/`}>Learn Wyrd</a>
-      </div>
-    </div>
+    </li>
+    <li>
+      <span class="shape observe" aria-hidden="true"></span>
+      <b>Observe</b>
+      <p>Runs and Observations record measured behavior against the exact versions that produced it.</p>
+    </li>
+    <li>
+      <span class="shape verify" aria-hidden="true"></span>
+      <b>Verify</b>
+      <p>
+        Verifiers judge observed behavior against declared expectations, and the judgment stays
+        tied to <span class="evidence-mark">retained evidence</span>.
+      </p>
+    </li>
+  </ol>
+  <p class="status">
+    Wyrd is pre-release. Data, Model, and Prompt Cards run end to end today;
+    <a href={`${base}/overview/`}>the overview</a> says what is available at each stage.
+  </p>
 
-    <div class="stack">
-      <div class="layer fathom">
-        <div class="lhd">
-          <span class="nm">Fathom</span><span class="tg">ENTERPRISE</span><span class="dot"
-            >verification layer</span
-          >
-        </div>
-        <p>
-          The intelligence layer that <b>verifies how your systems behave</b> — leakage, eval,
-          drift, runtime — turned into evidence.
-        </p>
-        <div class="chips"><span>judgment</span><span>evidence</span><span>drift vs spec</span><span>audit</span></div>
-      </div>
-      <div class="seam"><span class="ar">▾</span><span>reads the typed model</span><span class="ar">▾</span></div>
-      <div class="layer wyrd">
-        <div class="lhd">
-          <span class="nm">Wyrd</span><span class="tg">OPEN CORE</span><span class="dot"
-            >the substrate</span
-          >
-        </div>
-        <p>
-          An open framework to build <b>interconnected AI systems</b> — every entity typed,
-          declared, and connected.
-        </p>
-        <div class="chips"><span>model</span><span>prompt</span><span>agent</span><span>service</span><span>dataset</span></div>
-      </div>
-      <div class="base"><span>THE DATA &amp; AI LIFECYCLE</span><span>develop · deploy · observe · diagnose</span></div>
-    </div>
-  </div>
-</section>
-
-<section class="sec center">
-  <div class="wrap">
-    <div class="sec-head">
-      <div class="sec-eye">FIND THE RIGHT PATH</div>
-      <h2 class="title">Start with the question <em>you have</em>.</h2>
-    </div>
-    <div class="grid3" style="text-align:left;margin-top:8px">
-      <a class="card" href={`${base}/get-started/`}>
-        <div class="ct"><span class="d client"></span>Start here</div>
-        <p>Install Wyrd and run the first local DataCard workflow.</p>
-        <div class="meta">Start here →</div>
-      </a>
-      <a class="card" href={`${base}/tutorials/`}>
-        <div class="ct"><span class="d rune"></span>Learn Wyrd</div>
-        <p>Follow tutorials, then learn the Card, Spec, Run, and Observation model.</p>
-        <div class="meta">Learn the model →</div>
-      </a>
-      <a class="card" href={`${base}/how-to/`}>
-        <div class="ct"><span class="d control"></span>Build with Wyrd</div>
-        <p>Declare Cards, build agents and workflows, and work through capability recipes.</p>
-        <div class="meta">Build something →</div>
-      </a>
-      <a class="card" href={`${base}/products/`}>
-        <div class="ct"><span class="d server"></span>Products and components</div>
-        <p>Find the right component: Wyrd core, Cards, Bifrost, Skald, or Fathom.</p>
-        <div class="meta">Choose a component →</div>
-      </a>
-      <a class="card" href={`${base}/reference/`}>
-        <div class="ct"><span class="d control"></span>Reference</div>
-        <p>Look up schemas, stable error codes, CLI verbs, and API contracts.</p>
-        <div class="meta">Look it up →</div>
-      </a>
-      <a class="card" href={`${base}/for-agents/`}>
-        <div class="ct"><span class="d server"></span>For agents</div>
-        <p>Use stable paths, machine-readable indexes, and error-remediation recipes.</p>
-        <div class="meta">Wire an agent →</div>
-      </a>
-    </div>
-  </div>
-</section>
-
-<section class="sec center alt">
-  <div class="wrap">
-    <div class="sec-head">
-      <div class="sec-eye">ENTIRE LIFECYCLE</div>
-      <h2 class="title">One typed model. <em>Every stage.</em></h2>
-    </div>
-    <div class="life" style="margin-top:8px">
-      <div class="stages">
-        <div class="stage"><span class="n">1</span><h4>DEVELOP</h4><p>Build and connect typed AI systems on Wyrd. Traces and experiments stream in.</p></div>
-        <div class="stage"><span class="n">2</span><h4>DEPLOY</h4><p>Models, services, and agents ship as declared Cards with a versioned spec.</p></div>
-        <div class="stage"><span class="n">3</span><h4>OBSERVE</h4><p>Runtime behavior is measured against what each entity declared.</p></div>
-        <div class="stage"><span class="n">4</span><h4>DIAGNOSE</h4><p>Fathom isolates the failure, proves the cause, returns a fix as code.</p></div>
-      </div>
-      <div class="rail">
-        <span class="lab"><span class="w">Wyrd</span> captures</span>
-        <span class="seg"></span>
-        <span class="lab"><span class="f">Fathom</span> verifies</span>
-      </div>
-    </div>
-  </div>
-</section>
+  <h2>Then</h2>
+  <ul class="next-tasks">
+    {#each next as t (t.href)}
+      <li>
+        <a href={`${base}${t.href}`}><b>{t.title}</b><span>{t.body}</span></a>
+      </li>
+    {/each}
+  </ul>
+</div>

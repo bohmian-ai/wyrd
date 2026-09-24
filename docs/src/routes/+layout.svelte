@@ -1,16 +1,17 @@
 <script lang="ts">
-  // The single chrome host (Direction A "Arcade Cabinet"): the always-dark
-  // marquee (Mitari wordmark, Wyrd/Fathom switch, search, theme, GitHub), the
-  // mobile drawer, the doc shell (sidebar / content + pagination / TOC), and the
-  // cabinet footer. The whole app is wrapped in `.mk a` so the global arcade
-  // theme (arcade.css → wyrd-tokens.css + fonts) styles everything by class.
-  import '../styles/arcade.css';
+  // Docs chrome: Wyrd header (mark, search, reference, theme, GitHub), the
+  // task-first sidebar (a drawer on narrow screens), the article column with
+  // its current-location cue and pager, and the on-page contents rail. Styled
+  // by styles/docs.css over the generated Evidence Thread tokens.
+  import '../styles/docs.css';
   import { onMount } from 'svelte';
   import { afterNavigate } from '$app/navigation';
   import { base } from '$app/paths';
   import { page } from '$app/state';
   import { initLang } from '$lib/lang.svelte';
-  import Fuji from '$lib/components/Fuji.svelte';
+  import { locate } from '$lib/derived-nav';
+  import { setTheme, type Theme } from '$lib/theme';
+  import WyrdMark from '$lib/components/WyrdMark.svelte';
   import Search from '$lib/components/Search.svelte';
   import Sidebar from '$lib/components/Sidebar.svelte';
   import Toc from '$lib/components/Toc.svelte';
@@ -20,145 +21,108 @@
 
   let { children } = $props();
 
-  let theme = $state<'light' | 'dark'>('dark');
+  let theme = $state<Theme>('light');
   let drawer = $state(false);
 
-  // The home route and error pages render full-width "splash" — no doc shell.
-  // The Fathom teaser archetype is also a full-bleed holding page.
-  const isHome = $derived(page.route.id === '/');
-  const isError = $derived(page.error !== null);
-  const isFathom = $derived(page.data?.archetype === 'fathom');
-  const isFullWidth = $derived(isHome || isError || isFathom);
-
-  // Active product for the marquee switch.
-  const product = $derived(isFathom ? 'fathom' : 'wyrd');
+  // Home and error pages render without the doc shell.
+  const isFullWidth = $derived(page.route.id === '/' || page.error !== null);
+  const here = $derived(locate(page.url.pathname, base || '/wyrd'));
 
   onMount(() => {
     initLang();
-    const t = document.documentElement.dataset.theme;
-    theme = t === 'light' ? 'light' : 'dark';
+    theme = document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light';
   });
 
-  // close the mobile drawer on navigation
   afterNavigate(() => (drawer = false));
 
-  function toggle(): void {
+  function toggleTheme(): void {
     theme = theme === 'dark' ? 'light' : 'dark';
-    document.documentElement.dataset.theme = theme;
-    try {
-      localStorage.setItem('wyrd:theme', theme);
-    } catch {
-      /* ignore */
-    }
+    setTheme(theme);
   }
 </script>
 
-<div class="mk a">
-  <header class="marquee" data-pagefind-ignore>
-    <a class="brand" href={`${base}/`} aria-label="Mitari docs home">
-      <Fuji size={22} />
-      <span class="wm">MITARI</span>
-      <span class="co">docs</span>
-    </a>
-    <nav class="switch" aria-label="Product">
-      <a href={`${base}/`} data-k="wyrd" class={product === 'wyrd' ? 'on' : ''}>Wyrd</a>
-      <a href={`${base}/fathom/`} data-k="fathom" class={product === 'fathom' ? 'on' : ''}>
-        Fathom <span class="soon">soon</span>
-      </a>
-    </nav>
-    <div class="right">
-      <Search />
-      <button class="iconbtn theme-toggle" aria-label="Toggle theme" onclick={toggle}>
-        {#if theme === 'dark'}
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
-            <circle cx="12" cy="12" r="4.5" />
-            <path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5 19 19M19 5l-1.5 1.5M6.5 17.5 5 19" />
-          </svg>
+<a class="skip" href="#content">Skip to content</a>
+
+<header class="site-head" data-pagefind-ignore>
+  <a class="lockup" href={`${base}/`} aria-label="Wyrd docs home">
+    <WyrdMark size={28} label="Wyrd" />
+    <span class="word">Wyrd</span>
+    <span class="tag">docs</span>
+  </a>
+  <Search />
+  <a class="head-link" href={`${base}/reference/`}>Reference</a>
+  <a class="head-link" href={GITHUB_URL} rel="noreferrer" target="_blank">GitHub</a>
+  <button
+    class="icon-control theme-toggle"
+    type="button"
+    aria-label={theme === 'dark' ? 'Use light theme' : 'Use dark theme'}
+    onclick={toggleTheme}
+  >
+    <svg class="sun" viewBox="0 0 20 20" aria-hidden="true">
+      <circle cx="10" cy="10" r="3.5" fill="none" stroke="currentColor" stroke-width="1.5" />
+      <path
+        d="M10 2v2M10 16v2M2 10h2M16 10h2M4.3 4.3l1.4 1.4M14.3 14.3l1.4 1.4M15.7 4.3l-1.4 1.4M5.7 14.3l-1.4 1.4"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.5"
+      />
+    </svg>
+    <svg class="moon" viewBox="0 0 20 20" aria-hidden="true">
+      <path d="M15.8 12.8A6.4 6.4 0 0 1 7.2 4.2a6.4 6.4 0 1 0 8.6 8.6Z" fill="none" stroke="currentColor" stroke-width="1.5" />
+    </svg>
+    <span class="label">{theme === 'dark' ? 'Dark' : 'Light'}</span>
+  </button>
+  {#if !isFullWidth}
+    <button
+      class="icon-control nav-drawer"
+      type="button"
+      aria-label={drawer ? 'Close navigation' : 'Open navigation'}
+      aria-expanded={drawer}
+      aria-controls="docs-nav"
+      onclick={() => (drawer = !drawer)}
+    >
+      <svg viewBox="0 0 20 20" aria-hidden="true">
+        {#if drawer}
+          <path d="M5 5l10 10M15 5 5 15" fill="none" stroke="currentColor" stroke-width="1.5" />
         {:else}
-          <svg viewBox="0 0 24 24" fill="currentColor">
-            <path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z" />
-          </svg>
+          <path d="M3 5h14M3 10h14M3 15h14" fill="none" stroke="currentColor" stroke-width="1.5" />
         {/if}
-      </button>
-      <a class="iconbtn" href={GITHUB_URL} aria-label="GitHub" rel="noreferrer" target="_blank">
-        <svg viewBox="0 0 24 24" fill="currentColor"
-          ><path
-            d="M12 2a10 10 0 0 0-3.16 19.49c.5.09.68-.22.68-.48v-1.7c-2.78.6-3.37-1.34-3.37-1.34-.45-1.16-1.1-1.47-1.1-1.47-.9-.62.07-.6.07-.6 1 .07 1.53 1.03 1.53 1.03.9 1.53 2.36 1.09 2.94.83.09-.65.35-1.09.63-1.34-2.22-.25-4.55-1.11-4.55-4.94 0-1.09.39-1.98 1.03-2.68-.1-.25-.45-1.27.1-2.65 0 0 .84-.27 2.75 1.02a9.5 9.5 0 0 1 5 0c1.91-1.29 2.75-1.02 2.75-1.02.55 1.38.2 2.4.1 2.65.64.7 1.03 1.59 1.03 2.68 0 3.84-2.34 4.69-4.57 4.94.36.31.68.92.68 1.85v2.74c0 .27.18.58.69.48A10 10 0 0 0 12 2z"
-          /></svg
-        >
-      </a>
-      <button
-        class="iconbtn menu nav-drawer"
-        aria-label="Menu"
-        aria-expanded={drawer}
-        aria-controls="nav-drawer"
-        onclick={() => (drawer = !drawer)}
-      >
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
-          {#if drawer}<path d="M5 5l14 14M19 5 5 19" />{:else}<path d="M3 6h18M3 12h18M3 18h18" />{/if}
-        </svg>
-      </button>
-    </div>
-  </header>
+      </svg>
+    </button>
+  {/if}
+</header>
 
-  <nav id="nav-drawer" class={`drawer ${drawer ? 'open' : ''}`} aria-label="Sections">
-    <a href={`${base}/overview/`}>Start here</a>
-    <a href={`${base}/tutorials/`}>Learn Wyrd</a>
-    <a href={`${base}/get-started/`}>Get started</a>
-    <a href={`${base}/how-to/`}>Build with Wyrd</a>
-    <a href={`${base}/products/`}>Products and components</a>
-    <a href={`${base}/reference/`}>Reference</a>
-    <a href={`${base}/self-hosting/`}>Operate Wyrd</a>
-    <a href={`${base}/for-agents/`}>For agents</a>
-    <a href={`${base}/fathom/`}>Fathom · coming soon</a>
-  </nav>
-
-  <div id="top">
-    {#if isFullWidth}
+{#if isFullWidth}
+  <main id="content">
+    {@render children()}
+  </main>
+{:else}
+  {#if drawer}
+    <button class="scrim" type="button" tabindex="-1" aria-label="Close navigation" onclick={() => (drawer = false)}
+    ></button>
+  {/if}
+  <div class="shell">
+    <aside id="docs-nav" class="side" class:open={drawer} data-pagefind-ignore>
+      <Sidebar />
+    </aside>
+    <main id="content" class="main">
+      {#if here}
+        <p class="crumbs" data-pagefind-ignore>{here.section} / {here.item.label}</p>
+      {/if}
       {@render children()}
-    {:else}
-      <div class="shell">
-        <aside class="side" data-pagefind-ignore>
-          <Sidebar />
-        </aside>
-        <main class="main">
-          {@render children()}
-          <Pagination />
-        </main>
-        <aside data-pagefind-ignore>
-          <Toc />
-        </aside>
-      </div>
-    {/if}
+      <Pagination />
+    </main>
+    <aside class="toc-rail" data-pagefind-ignore>
+      <Toc />
+    </aside>
   </div>
+{/if}
 
-  <footer class="foot" data-pagefind-ignore>
-    <div class="foot-in">
-      <div>
-        <div class="fb"><Fuji size={22} /><span class="wm">MITARI</span></div>
-        <div class="ci">© 2026 Mitari. All rights reserved.<br />Seattle, WA</div>
-      </div>
-      <div class="fcols">
-        <div class="fcol">
-          <span class="ch">WYRD</span>
-          <a href={`${base}/get-started/`}>Get started</a>
-          <a href={`${base}/concepts/`}>Concepts</a>
-          <a href={`${base}/products/`}>Products</a>
-          <a href={`${base}/reference/`}>Reference</a>
-          <a href={`${base}/for-agents/`}>For agents</a>
-        </div>
-        <div class="fcol">
-          <span class="ch">FATHOM</span>
-          <a href={`${base}/fathom/`}>Overview</a>
-          <a href={`${base}/fathom/`}>Coming soon</a>
-        </div>
-        <div class="fcol">
-          <span class="ch">PROJECT</span>
-          <a href={GITHUB_URL} rel="noreferrer" target="_blank">GitHub</a>
-          <a href={`${base}/overview/`}>Overview</a>
-          <a href={`${base}/llms.txt`}>llms.txt</a>
-        </div>
-      </div>
-    </div>
-  </footer>
-</div>
+<footer class="site-foot" data-pagefind-ignore>
+  <nav aria-label="Footer">
+    <a href={`${base}/get-started/`}>Run Wyrd locally</a>
+    <a href={`${base}/reference/`}>Reference</a>
+    <a href={`${base}/llms.txt`}>llms.txt</a>
+    <a href={GITHUB_URL} rel="noreferrer" target="_blank">GitHub</a>
+  </nav>
+</footer>

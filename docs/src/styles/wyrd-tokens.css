@@ -44,6 +44,10 @@
   /* code */
   --code-bg: #0E1716;
   --code-text: #DCF5EE;
+  --code-muted: #9AB0AB;
+  --code-keyword: #A894FF;
+  --code-string: #67B891;
+  --code-number: #FFB455;
 
   /* geometry */
   --r: 2px;
@@ -83,6 +87,10 @@
   /* code */
   --code-bg: #050908;
   --code-text: #DCF5EE;
+  --code-muted: #9AB0AB;
+  --code-keyword: #A894FF;
+  --code-string: #67B891;
+  --code-number: #FFB455;
 
   /* geometry */
   --r: 2px;

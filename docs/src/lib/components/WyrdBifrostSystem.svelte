@@ -108,7 +108,7 @@
   >
     <!-- Left panel: sources -->
     <g>
-      <rect class="bpa-panel" x={PAD} y={SIDE_TOP} width={LEFT_W} height={SIDE_H} rx="5" />
+      <rect class="bpa-panel" x={PAD} y={SIDE_TOP} width={LEFT_W} height={SIDE_H} rx="2" />
       <text class="bpa-cap" x={PAD + LEFT_W / 2} y={SIDE_TOP + CAP_H - 4}>SOURCES</text>
       {#each sources as lines, i (lines[0])}
         {@const y = SIDE_TOP + CAP_H + 6 + i * (BOX_H + BOX_GAP)}
@@ -120,7 +120,7 @@
           y={y}
           width={LEFT_W - 20}
           height={BOX_H}
-          rx="5"
+          rx="2"
         />
         <text class="bpa-box-t bpa-lime-t" x={cx} y={cy}>
           {#each lines as line, li (line)}
@@ -132,33 +132,25 @@
 
     <!-- Center: Bifrost pod -->
     <g>
-      <rect class="bpa-pod" x={POD_X} y={POD_TOP} width={POD_W} height={POD_H} rx="5" />
+      <rect class="bpa-pod" x={POD_X} y={POD_TOP} width={POD_W} height={POD_H} rx="2" />
       <rect
         class="bpa-pod-lab-bg"
         x={POD_X + 12}
         y={POD_TOP - 8}
         width="90"
         height="16"
-        rx="3"
+        rx="2"
       />
       <text class="bpa-pod-lab" x={POD_X + 18} y={POD_TOP + 3}>BIFROST POD</text>
 
       <!-- Gate -->
-      <rect
-        class="bpa-role-shadow"
-        x={GATE_X + 3}
-        y={GATE_TOP + 3}
-        width={GATE_W}
-        height={GATE_H}
-        rx="5"
-      />
       <rect
         class="bpa-role bpa-role-server"
         x={GATE_X}
         y={GATE_TOP}
         width={GATE_W}
         height={GATE_H}
-        rx="5"
+        rx="2"
       />
       <text class="bpa-role-name bpa-name-server" x={GATE_X + 14} y={GATE_TOP + 24}>Gate</text>
       <text class="bpa-role-detail" x={GATE_X + 14} y={GATE_TOP + 44}
@@ -172,20 +164,12 @@
 
       <!-- Scribe -->
       <rect
-        class="bpa-role-shadow"
-        x={SCRIBE_X + 3}
-        y={ROLES_TOP + 3}
-        width={ROLE_W}
-        height={ROLES_H}
-        rx="5"
-      />
-      <rect
         class="bpa-role bpa-role-control"
         x={SCRIBE_X}
         y={ROLES_TOP}
         width={ROLE_W}
         height={ROLES_H}
-        rx="5"
+        rx="2"
       />
       <text class="bpa-role-name bpa-name-control" x={SCRIBE_X + 12} y={ROLES_TOP + 22}>Scribe</text>
       <text class="bpa-role-sub" x={SCRIBE_X + ROLE_W - 12} y={ROLES_TOP + 22} text-anchor="end"
@@ -199,7 +183,7 @@
           y={rolePartY(i)}
           width={ROLE_W - ROLE_INNER_PAD * 2}
           height={ROLE_PART_H}
-          rx="5"
+          rx="2"
         />
         <text class="bpa-part-t bpa-part-t-control" x={SCRIBE_X + ROLE_W / 2} y={rolePartY(i) + 16}
           >{p.t}</text
@@ -209,20 +193,12 @@
 
       <!-- Oracle -->
       <rect
-        class="bpa-role-shadow"
-        x={ORACLE_X + 3}
-        y={ROLES_TOP + 3}
-        width={ROLE_W}
-        height={ROLES_H}
-        rx="5"
-      />
-      <rect
         class="bpa-role bpa-role-server"
         x={ORACLE_X}
         y={ROLES_TOP}
         width={ROLE_W}
         height={ROLES_H}
-        rx="5"
+        rx="2"
       />
       <text class="bpa-role-name bpa-name-server" x={ORACLE_X + 12} y={ROLES_TOP + 22}>Oracle</text>
       <text class="bpa-role-sub" x={ORACLE_X + ROLE_W - 12} y={ROLES_TOP + 22} text-anchor="end"
@@ -236,7 +212,7 @@
           y={rolePartY(i)}
           width={ROLE_W - ROLE_INNER_PAD * 2}
           height={ROLE_PART_H}
-          rx="5"
+          rx="2"
         />
         <text class="bpa-part-t bpa-part-t-server" x={ORACLE_X + ROLE_W / 2} y={rolePartY(i) + 16}
           >{p.t}</text
@@ -246,20 +222,12 @@
 
       <!-- Forge -->
       <rect
-        class="bpa-role-shadow"
-        x={FORGE_X + 3}
-        y={ROLES_TOP + 3}
-        width={ROLE_W}
-        height={ROLES_H}
-        rx="5"
-      />
-      <rect
         class="bpa-role bpa-role-rune"
         x={FORGE_X}
         y={ROLES_TOP}
         width={ROLE_W}
         height={ROLES_H}
-        rx="5"
+        rx="2"
       />
       <text class="bpa-role-name bpa-name-rune" x={FORGE_X + 12} y={ROLES_TOP + 22}>Forge</text>
       <text class="bpa-role-sub" x={FORGE_X + ROLE_W - 12} y={ROLES_TOP + 22} text-anchor="end"
@@ -273,7 +241,7 @@
           y={rolePartY(i)}
           width={ROLE_W - ROLE_INNER_PAD * 2}
           height={ROLE_PART_H}
-          rx="5"
+          rx="2"
         />
         <text class="bpa-part-t bpa-part-t-rune" x={FORGE_X + ROLE_W / 2} y={rolePartY(i) + 16}
           >{p.t}</text
@@ -284,7 +252,7 @@
 
     <!-- Right panel: auth -->
     <g>
-      <rect class="bpa-panel" x={RIGHT_X} y={SIDE_TOP} width={RIGHT_W} height={SIDE_H} rx="5" />
+      <rect class="bpa-panel" x={RIGHT_X} y={SIDE_TOP} width={RIGHT_W} height={SIDE_H} rx="2" />
       <text class="bpa-cap" x={RIGHT_X + RIGHT_W / 2} y={SIDE_TOP + CAP_H - 4}>AUTH</text>
       {#each authItems as lines, i (lines[0])}
         {@const y = SIDE_TOP + CAP_H + 6 + i * (BOX_H + BOX_GAP)}
@@ -296,7 +264,7 @@
           y={y}
           width={RIGHT_W - 20}
           height={BOX_H}
-          rx="5"
+          rx="2"
         />
         <text class="bpa-box-t bpa-rune-t" x={cx} y={cy}>
           {#each lines as line, li (line)}
@@ -316,7 +284,7 @@
           y={STATE_TOP}
           width={STATE_W}
           height={STATE_H}
-          rx="5"
+          rx="2"
         />
         <text
           class={s.accent ? 'bpa-db-icon bpa-db-icon-rune' : 'bpa-db-icon'}
@@ -336,9 +304,8 @@
   .bpa {
     margin: 1.5rem 0;
     background: var(--surface);
-    border: 2px solid var(--border);
+    border: 1px solid var(--border);
     border-radius: var(--r);
-    box-shadow: 3px 3px 0 0 var(--shadow);
     padding: 0;
   }
   .bpa svg {
@@ -351,7 +318,7 @@
   .bpa-panel {
     fill: var(--surface);
     stroke: var(--border);
-    stroke-width: 2;
+    stroke-width: 1;
   }
   .bpa-cap {
     fill: var(--muted);
@@ -364,13 +331,13 @@
   .bpa-box {
     fill: var(--surface-2);
     stroke: var(--border);
-    stroke-width: 2;
+    stroke-width: 1;
   }
   .bpa-box-lime {
-    stroke: var(--lime);
+    stroke: var(--border);
   }
   .bpa-box-rune {
-    stroke: var(--rune-strong);
+    stroke: var(--declare);
   }
   .bpa-box-t {
     font-family: var(--font-mono);
@@ -379,17 +346,17 @@
     text-anchor: middle;
   }
   .bpa-lime-t {
-    fill: var(--lime-text);
+    fill: var(--text);
   }
   .bpa-rune-t {
-    fill: var(--rune-strong);
+    fill: var(--declare);
   }
 
   /* Pod */
   .bpa-pod {
     fill: var(--surface);
     stroke: var(--border);
-    stroke-width: 2;
+    stroke-width: 1;
   }
   .bpa-pod-lab-bg {
     fill: var(--surface);
@@ -405,33 +372,30 @@
   /* Roles */
   .bpa-role {
     fill: var(--surface-2);
-    stroke-width: 2;
-  }
-  .bpa-role-shadow {
-    fill: var(--shadow);
+    stroke-width: 1;
   }
   .bpa-role-server {
-    stroke: var(--server);
+    stroke: var(--text);
   }
   .bpa-role-control {
-    stroke: var(--control);
+    stroke: var(--text);
   }
   .bpa-role-rune {
-    stroke: var(--rune-strong);
+    stroke: var(--declare);
   }
   .bpa-role-name {
-    font-family: var(--font-display);
+    font-family: var(--font-sans);
     font-size: 16px;
     font-weight: 700;
   }
   .bpa-name-server {
-    fill: var(--server);
+    fill: var(--text);
   }
   .bpa-name-control {
-    fill: var(--control);
+    fill: var(--text);
   }
   .bpa-name-rune {
-    fill: var(--rune-strong);
+    fill: var(--declare);
   }
   .bpa-role-sub {
     fill: var(--muted);
@@ -456,13 +420,13 @@
     stroke-width: 1.5;
   }
   .bpa-part-server {
-    stroke: var(--server);
+    stroke: var(--text);
   }
   .bpa-part-control {
-    stroke: var(--control);
+    stroke: var(--text);
   }
   .bpa-part-rune {
-    stroke: var(--rune-strong);
+    stroke: var(--declare);
   }
   .bpa-part-t {
     font-family: var(--font-mono);
@@ -471,13 +435,13 @@
     text-anchor: middle;
   }
   .bpa-part-t-server {
-    fill: var(--server);
+    fill: var(--text);
   }
   .bpa-part-t-control {
-    fill: var(--control);
+    fill: var(--text);
   }
   .bpa-part-t-rune {
-    fill: var(--rune-strong);
+    fill: var(--declare);
   }
   .bpa-part-s {
     fill: var(--muted);
@@ -490,25 +454,25 @@
   .bpa-db {
     fill: var(--surface);
     stroke: var(--border);
-    stroke-width: 2;
+    stroke-width: 1;
   }
   .bpa-db-rune {
-    stroke: var(--rune-strong);
+    stroke: var(--declare);
   }
   .bpa-db-icon {
-    fill: var(--rune-strong);
-    font-family: var(--font-display);
+    fill: var(--declare);
+    font-family: var(--font-sans);
     font-size: 18px;
     font-weight: 700;
     text-anchor: middle;
     letter-spacing: 1px;
   }
   .bpa-db-icon-rune {
-    fill: var(--rune-strong);
+    fill: var(--declare);
   }
   .bpa-db-name {
     fill: var(--text);
-    font-family: var(--font-display);
+    font-family: var(--font-sans);
     font-size: 14px;
     font-weight: 700;
     text-anchor: middle;

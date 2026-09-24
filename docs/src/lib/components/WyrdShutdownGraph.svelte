@@ -99,8 +99,7 @@
     {/each}
 
     {#each nodes as n (n.id)}
-      <rect class="sd-node-shadow" x={n.x + 4} y={n.y + 4} width={NODE_W} height={NODE_H} rx="5" />
-      <rect class={n.accent ? 'sd-node-accent' : 'sd-node'} x={n.x} y={n.y} width={NODE_W} height={NODE_H} rx="5" />
+      <rect class={n.accent ? 'sd-node-accent' : 'sd-node'} x={n.x} y={n.y} width={NODE_W} height={NODE_H} rx="2" />
       <text
         class={n.accent ? 'sd-node-text sd-node-text-accent' : 'sd-node-text'}
         x={n.x + NODE_W / 2}
@@ -118,9 +117,8 @@
   .sd {
     margin: 1.5rem 0;
     background: var(--surface);
-    border: 2px solid var(--border);
+    border: 1px solid var(--border);
     border-radius: var(--r);
-    box-shadow: 3px 3px 0 0 var(--shadow);
     overflow: hidden;
   }
   .sd svg {
@@ -135,7 +133,7 @@
   .sd-edge {
     fill: none;
     stroke: var(--border);
-    stroke-width: 2.5;
+    stroke-width: 1;
   }
   .sd-edge-label {
     fill: var(--muted);
@@ -144,28 +142,25 @@
     letter-spacing: 0.02em;
     text-anchor: middle;
   }
-  .sd-node-shadow {
-    fill: var(--shadow);
-  }
   .sd-node {
     fill: var(--surface);
     stroke: var(--border);
-    stroke-width: 2;
+    stroke-width: 1;
   }
   .sd-node-accent {
-    fill: var(--rune);
+    fill: var(--declare-soft);
     stroke: var(--border);
-    stroke-width: 2;
+    stroke-width: 1;
   }
   .sd-node-text {
     fill: var(--text);
-    font-family: var(--font-display);
+    font-family: var(--font-sans);
     font-size: 13px;
     font-weight: 700;
     text-anchor: middle;
   }
   .sd-node-text-accent {
-    fill: var(--hero-ink);
+    fill: var(--text);
   }
   .sd-node-sub {
     fill: var(--muted);
@@ -174,6 +169,6 @@
     text-anchor: middle;
   }
   .sd-node-sub-accent {
-    fill: color-mix(in srgb, var(--hero-ink) 78%, transparent);
+    fill: var(--muted);
   }
 </style>

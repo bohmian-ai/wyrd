@@ -8,11 +8,11 @@ import { setTheme } from './theme.js';
 const appHtml = readFileSync(new URL('../app.html', import.meta.url), 'utf8');
 const bootstrap = appHtml.match(/<script>([\s\S]*?)<\/script>/)?.[1] ?? '';
 
-type Root = { dataset: Record<string, string>; style: Record<string, string> };
+type Root = { dataset: Record<string, string>; style: { colorScheme: string } };
 
 function fakeBrowser(stored: string | null, prefersDark: boolean) {
   const store = new Map<string, string>(stored === null ? [] : [['wyrd:theme', stored]]);
-  const root: Root = { dataset: {}, style: {} };
+  const root: Root = { dataset: {}, style: { colorScheme: '' } };
   const localStorage = {
     getItem: (k: string) => store.get(k) ?? null,
     setItem: (k: string, v: string) => void store.set(k, v)
@@ -48,7 +48,7 @@ describe('pre-paint theme bootstrap', () => {
   });
 
   it('ignores an unrecognized stored value', () => {
-    expect(boot('arcade', true).dataset.theme).toBe('dark');
+    expect(boot('sepia', true).dataset.theme).toBe('dark');
   });
 });
 

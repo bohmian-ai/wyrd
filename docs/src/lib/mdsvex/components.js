@@ -9,8 +9,6 @@ export { default as Aside } from '$lib/components/Aside.svelte';
 export { default as LangTabs } from '$lib/components/LangTabs.svelte';
 export { default as LangTab } from '$lib/components/LangTab.svelte';
 export { default as CodeFromFile } from '$lib/components/CodeFromFile.svelte';
-export { default as CardTileGrid } from '$lib/components/CardTileGrid.svelte';
-export { default as CardTile } from '$lib/components/CardTile.svelte';
 export { default as DataTable } from '$lib/components/DataTable.svelte';
 export { default as CardSummary } from '$lib/components/CardSummary.svelte';
 export { default as Pagination } from '$lib/components/Pagination.svelte';

@@ -155,8 +155,7 @@
     {/each}
 
     {#each model.boxes as b (b.x + '-' + b.y)}
-      <rect class="srv-node-shadow" x={b.x + 4} y={b.y + 4} width={b.w} height={NODE_H} rx="5" />
-      <rect class={b.accent ? 'srv-node-accent' : 'srv-node'} x={b.x} y={b.y} width={b.w} height={NODE_H} rx="5" />
+      <rect class={b.accent ? 'srv-node-accent' : 'srv-node'} x={b.x} y={b.y} width={b.w} height={NODE_H} rx="2" />
       <text
         class={b.accent ? 'srv-node-text srv-node-text-accent' : 'srv-node-text'}
         x={b.cx}
@@ -168,20 +167,12 @@
     {/each}
 
     <rect
-      class="srv-node-shadow"
-      x={model.supervisor.x + 4}
-      y={model.supervisor.y + 4}
-      width={model.supervisor.w}
-      height={model.supervisor.h}
-      rx="5"
-    />
-    <rect
       class="srv-node"
       x={model.supervisor.x}
       y={model.supervisor.y}
       width={model.supervisor.w}
       height={model.supervisor.h}
-      rx="5"
+      rx="2"
     />
     <text class="srv-node-text" x={model.supervisor.cx} y={model.supervisor.y + 23}>supervisor</text>
     <text class="srv-node-sub" x={model.supervisor.cx} y={model.supervisor.y + 39}>drain → abort</text>
@@ -193,9 +184,8 @@
   .srv {
     margin: 1.5rem 0;
     background: var(--surface);
-    border: 2px solid var(--border);
+    border: 1px solid var(--border);
     border-radius: var(--r);
-    box-shadow: 3px 3px 0 0 var(--shadow);
     overflow: hidden;
   }
   .srv svg {
@@ -211,7 +201,7 @@
     fill: var(--surface-2);
     fill-opacity: 0.4;
     stroke: var(--border);
-    stroke-width: 2;
+    stroke-width: 1;
     stroke-dasharray: 5 4;
   }
   .srv-cluster-label {
@@ -224,7 +214,7 @@
   .srv-edge {
     fill: none;
     stroke: var(--border);
-    stroke-width: 2.5;
+    stroke-width: 1;
   }
   .srv-edge-label {
     fill: var(--muted);
@@ -232,28 +222,25 @@
     font-size: 10px;
     letter-spacing: 0.02em;
   }
-  .srv-node-shadow {
-    fill: var(--shadow);
-  }
   .srv-node {
     fill: var(--surface);
     stroke: var(--border);
-    stroke-width: 2;
+    stroke-width: 1;
   }
   .srv-node-accent {
-    fill: var(--rune);
+    fill: var(--declare-soft);
     stroke: var(--border);
-    stroke-width: 2;
+    stroke-width: 1;
   }
   .srv-node-text {
     fill: var(--text);
-    font-family: var(--font-display);
+    font-family: var(--font-sans);
     font-size: 13px;
     font-weight: 700;
     text-anchor: middle;
   }
   .srv-node-text-accent {
-    fill: var(--hero-ink);
+    fill: var(--text);
   }
   .srv-node-sub {
     fill: var(--muted);
@@ -262,6 +249,6 @@
     text-anchor: middle;
   }
   .srv-node-sub-accent {
-    fill: color-mix(in srgb, var(--hero-ink) 78%, transparent);
+    fill: var(--muted);
   }
 </style>

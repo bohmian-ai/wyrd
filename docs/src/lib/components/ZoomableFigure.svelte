@@ -115,27 +115,19 @@
   }
   .zf-btn {
     font-family: var(--font-mono);
-    font-size: 0.6rem;
+    font-size: 12px;
     font-weight: 700;
     letter-spacing: 0.08em;
     color: var(--text);
     background: var(--surface);
-    border: 2px solid var(--border);
+    border: 1px solid var(--border);
     border-radius: var(--r);
-    box-shadow: 2px 2px 0 0 var(--shadow);
     padding: 5px 8px;
     cursor: pointer;
-    transition:
-      transform 0.04s,
-      box-shadow 0.04s;
+    transition: background-color 160ms ease-out;
   }
   .zf-btn:hover {
-    transform: translate(-1px, -1px);
-    box-shadow: 3px 3px 0 0 var(--shadow);
-  }
-  .zf-btn:active {
-    transform: translate(1px, 1px);
-    box-shadow: 1px 1px 0 0 var(--shadow);
+    background: var(--surface-hover);
   }
   .zf-btn-open {
     position: absolute;
@@ -148,7 +140,7 @@
     position: fixed;
     inset: 0;
     z-index: 999;
-    background: color-mix(in srgb, var(--shadow) 55%, transparent);
+    background: color-mix(in srgb, var(--bg) 72%, transparent);
     border: none;
     cursor: zoom-out;
   }
@@ -160,9 +152,8 @@
     display: flex;
     flex-direction: column;
     background: var(--surface);
-    border: 2px solid var(--border);
+    border: 1px solid var(--border);
     border-radius: var(--r);
-    box-shadow: 6px 6px 0 0 var(--shadow);
     overflow: hidden;
   }
   .zf-bar {
@@ -171,7 +162,7 @@
     justify-content: space-between;
     gap: 1rem;
     padding: 0.75rem 1rem;
-    border-bottom: 2px solid var(--border);
+    border-bottom: 1px solid var(--border);
   }
   .zf-hint {
     font-family: var(--font-mono);
@@ -201,7 +192,6 @@
   .zf-pan :global(figure) {
     margin: 0;
     border: none;
-    box-shadow: none;
     overflow: visible;
     pointer-events: none;
   }

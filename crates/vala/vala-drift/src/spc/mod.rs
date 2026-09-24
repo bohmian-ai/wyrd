@@ -10,6 +10,7 @@ use wyrd_spec::card::drift::{DriftMethod, SpcProfile};
 use wyrd_spec::ids::FeatureName;
 use wyrd_version::WyrdVersion;
 
+use crate::baseline::ensure_live;
 use crate::error::{DriftFitError, DriftScoreError};
 use crate::report::{DriftReport, DriftVerdict, FeatureDriftReport};
 use crate::spc::control_limits::ControlLimits;
@@ -44,6 +45,24 @@ pub fn fit_spc_baseline(
     profile: &SpcProfile,
     features: &[FeatureName],
 ) -> Result<SpcBaseline, DriftFitError> {
+    fit_spc_baseline_until(batch, profile, features, &|| false)
+}
+
+/// Fit an SPC baseline, stopping once `cancelled` reports true.
+///
+/// Fits each feature in order exactly as [`fit_spc_baseline`] does, polling
+/// `cancelled` before each feature and between collecting its values and
+/// fitting its control limits; each of those phases is one linear pass.
+///
+/// # Errors
+/// Returns [`DriftFitError::Cancelled`] once `cancelled` reports true, and
+/// otherwise the errors of [`fit_spc_baseline`].
+pub(crate) fn fit_spc_baseline_until(
+    batch: &arrow::record_batch::RecordBatch,
+    profile: &SpcProfile,
+    features: &[FeatureName],
+    cancelled: &dyn Fn() -> bool,
+) -> Result<SpcBaseline, DriftFitError> {
     use crate::feature::resolve_column;
     use crate::spc::control_limits::{adaptive_sample_size, fit_control_limits};
 
@@ -56,6 +75,7 @@ pub fn fit_spc_baseline(
 
     let mut fitted = BTreeMap::new();
     for feature in features {
+        ensure_live(cancelled)?;
         let column = resolve_column(batch, feature).map_err(|_| DriftFitError::FeatureMissing {
             feature: feature.as_str().to_string(),
         })?;
@@ -84,6 +104,7 @@ pub fn fit_spc_baseline(
             });
         }
 
+        ensure_live(cancelled)?;
         let limits = fit_control_limits(&values, chunk_size).map_err(|error| match error {
             DriftFitError::InsufficientSamplesForChunk {
                 rows, chunk_size, ..

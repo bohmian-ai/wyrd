@@ -33,6 +33,10 @@ pub enum DriftFitError {
 
     #[error("SPC fit internal error: {message}")]
     SpcInternal { message: String },
+
+    /// The caller cancelled the fit before it finished; no baseline exists.
+    #[error("the baseline fit was cancelled")]
+    Cancelled,
 }
 
 /// Errors raised while scoring a target RecordBatch against a fitted baseline.

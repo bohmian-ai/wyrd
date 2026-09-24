@@ -254,8 +254,9 @@ impl BaselineFitter {
 
     /// Fit one claimed baseline and return its serialized fitted profile.
     ///
-    /// The blocking decode checks `cancel` between record batches and before
-    /// fitting, so cancelling makes the returned future finish promptly.
+    /// The blocking decode checks `cancel` between record batches and the
+    /// fit polls it before each feature and inside its loops, so cancelling
+    /// makes the returned future finish promptly.
     ///
     /// # Errors
     /// Returns the structured failure the row records: an unusable Verifier
@@ -278,13 +279,7 @@ impl BaselineFitter {
         let cancel = cancel.clone();
         tokio::task::spawn_blocking(move || {
             let batch = decode_bounded(bytes, MAX_DECODED_BYTES, &cancel)?;
-            if cancel.is_cancelled() {
-                return Err(fit_error(
-                    BASELINE_FIT_FAILED,
-                    "the baseline fit was cancelled",
-                ));
-            }
-            let fitted = vala_drift::fit_baseline(&batch, &spec)
+            let fitted = vala_drift::fit_baseline_until(&batch, &spec, &|| cancel.is_cancelled())
                 .map_err(|error| fit_error(BASELINE_FIT_FAILED, error.to_string()))?;
             serde_json::to_value(&fitted)
                 .map_err(|error| fit_error(BASELINE_FIT_FAILED, error.to_string()))

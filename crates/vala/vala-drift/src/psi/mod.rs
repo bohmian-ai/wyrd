@@ -14,6 +14,7 @@ use wyrd_spec::card::drift::{PsiBinningStrategy, PsiProfile};
 use wyrd_spec::ids::FeatureName;
 use wyrd_version::WyrdVersion;
 
+use crate::baseline::{CANCEL_CHECK_ROWS, ensure_live};
 use crate::error::{DriftFitError, DriftScoreError};
 use crate::feature::{ColumnRef, resolve_column};
 use crate::psi::binning::{assign_bin, compute_edges_equal_width, compute_edges_quantile};
@@ -68,16 +69,34 @@ pub fn fit_psi_baseline(
     profile: &PsiProfile,
     features: &[FeatureName],
 ) -> Result<PsiBaseline, DriftFitError> {
+    fit_psi_baseline_until(batch, profile, features, &|| false)
+}
+
+/// Fit a PSI baseline, stopping once `cancelled` reports true.
+///
+/// Fits each feature in order exactly as [`fit_psi_baseline`] does, polling
+/// `cancelled` before each feature and inside its fit loops.
+///
+/// # Errors
+/// Returns [`DriftFitError::Cancelled`] once `cancelled` reports true, and
+/// otherwise the errors of [`fit_psi_baseline`].
+pub(crate) fn fit_psi_baseline_until(
+    batch: &arrow::record_batch::RecordBatch,
+    profile: &PsiProfile,
+    features: &[FeatureName],
+    cancelled: &dyn Fn() -> bool,
+) -> Result<PsiBaseline, DriftFitError> {
     let mut fitted_features = BTreeMap::new();
 
     for feature in features {
+        ensure_live(cancelled)?;
         let column = resolve_column(batch, feature).map_err(|_| DriftFitError::FeatureMissing {
             feature: feature.as_str().to_string(),
         })?;
         let fitted = if profile.categorical_features.contains(feature) {
-            fit_categorical(feature, &column)?
+            fit_categorical(feature, &column, cancelled)?
         } else {
-            fit_numeric(feature, &column, &profile.binning_strategy)?
+            fit_numeric(feature, &column, &profile.binning_strategy, cancelled)?
         };
         fitted_features.insert(feature.clone(), fitted);
     }
@@ -325,10 +344,19 @@ fn is_categorical_dtype(data_type: &DataType) -> bool {
     }
 }
 
+/// Fit one numeric feature's bin edges and baseline proportions.
+///
+/// Polls `cancelled` after collecting values, after computing edges, and
+/// every [`CANCEL_CHECK_ROWS`] values while binning.
+///
+/// # Errors
+/// Returns [`DriftFitError`] for a non-numeric, empty, or non-finite column,
+/// an edge computation failure, or cancellation.
 fn fit_numeric(
     feature: &FeatureName,
     column: &ColumnRef<'_>,
     strategy: &PsiBinningStrategy,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<FittedPsiFeature, DriftFitError> {
     if !column.is_numeric() {
         return Err(DriftFitError::FeatureNotNumeric {
@@ -354,15 +382,18 @@ fn fit_numeric(
         });
     }
 
+    ensure_live(cancelled)?;
     let edges = match strategy {
         PsiBinningStrategy::EqualWidth { n_bins } => compute_edges_equal_width(&values, *n_bins)?,
         PsiBinningStrategy::Quantile { n_bins } => compute_edges_quantile(&values, *n_bins)?,
     };
 
     let mut counts = vec![0_u64; edges.edges.len() - 1];
-    for value in &values {
-        let bin = assign_bin(*value, &edges.edges);
-        counts[bin] += 1;
+    for chunk in values.chunks(CANCEL_CHECK_ROWS) {
+        ensure_live(cancelled)?;
+        for value in chunk {
+            counts[assign_bin(*value, &edges.edges)] += 1;
+        }
     }
 
     let total_count = values.len() as u64;
@@ -385,9 +416,17 @@ fn fit_numeric(
     })
 }
 
+/// Fit one categorical feature's observed categories and proportions.
+///
+/// Polls `cancelled` every [`CANCEL_CHECK_ROWS`] values while counting.
+///
+/// # Errors
+/// Returns [`DriftFitError`] for a non-categorical or empty column, a bin id
+/// overflow, or cancellation.
 fn fit_categorical(
     feature: &FeatureName,
     column: &ColumnRef<'_>,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<FittedPsiFeature, DriftFitError> {
     let values =
         column
@@ -402,9 +441,12 @@ fn fit_categorical(
         });
     }
 
-    let mut counts: BTreeMap<String, u64> = BTreeMap::new();
-    for value in values {
-        *counts.entry(value).or_default() += 1;
+    let mut counts: BTreeMap<&str, u64> = BTreeMap::new();
+    for chunk in values.chunks(CANCEL_CHECK_ROWS) {
+        ensure_live(cancelled)?;
+        for value in chunk {
+            *counts.entry(value.as_str()).or_default() += 1;
+        }
     }
 
     let total_count = counts.values().sum::<u64>();
@@ -414,7 +456,7 @@ fn fit_categorical(
             id: bin_id(index)?,
             lower: None,
             upper: None,
-            categorical_value: Some(value),
+            categorical_value: Some(value.to_owned()),
             proportion: count as f64 / total_count as f64,
         });
     }

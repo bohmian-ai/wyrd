@@ -24,7 +24,7 @@ pub mod psi;
 pub mod report;
 pub mod spc;
 
-pub use baseline::{FittedBaseline, fit_baseline, score_drift};
+pub use baseline::{FittedBaseline, fit_baseline, fit_baseline_until, score_drift};
 pub use custom::{score_custom, score_custom_mean};
 pub use error::{DriftFitError, DriftScoreError};
 pub use psi::{

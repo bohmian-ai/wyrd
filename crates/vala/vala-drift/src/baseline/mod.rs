@@ -6,10 +6,10 @@ use wyrd_spec::card::drift::{DriftMethod, DriftProfile, DriftSignal, DriftSpec};
 use crate::custom::score_custom;
 use crate::error::{DriftFitError, DriftScoreError};
 use crate::psi::PsiBaseline;
-use crate::psi::{fit_psi_baseline, score_psi};
+use crate::psi::{fit_psi_baseline_until, score_psi};
 use crate::report::DriftReport;
 use crate::spc::SpcBaseline;
-use crate::spc::{fit_spc_baseline, score_spc};
+use crate::spc::{fit_spc_baseline_until, score_spc};
 
 /// Fitted baseline state produced by `fit_baseline`.
 ///
@@ -25,7 +25,29 @@ pub enum FittedBaseline {
     Custom,
 }
 
+/// Rows a fit loop processes between two cancellation checks.
+///
+/// Bounds how long a cancelled fit keeps computing inside one large feature.
+pub(crate) const CANCEL_CHECK_ROWS: usize = 65_536;
+
+/// Fail with [`DriftFitError::Cancelled`] once `cancelled` reports true.
+///
+/// Fit loops call this before each feature, between a feature's phases, and
+/// every [`CANCEL_CHECK_ROWS`] rows, so a caller's stop signal ends the fit
+/// without waiting for the whole batch.
+///
+/// # Errors
+/// Returns [`DriftFitError::Cancelled`] when `cancelled()` is true.
+pub(crate) fn ensure_live(cancelled: &dyn Fn() -> bool) -> Result<(), DriftFitError> {
+    if cancelled() {
+        return Err(DriftFitError::Cancelled);
+    }
+    Ok(())
+}
+
 /// Fit a method-specific baseline from an Arrow `RecordBatch`.
+///
+/// Runs to completion; see [`fit_baseline_until`] for a cancellable fit.
 ///
 /// # Errors
 /// Returns a [`DriftFitError`] when the `DriftSpec` does not carry the signal
@@ -34,6 +56,25 @@ pub enum FittedBaseline {
 pub fn fit_baseline(
     batch: &arrow::record_batch::RecordBatch,
     spec: &DriftSpec,
+) -> Result<FittedBaseline, crate::DriftFitError> {
+    fit_baseline_until(batch, spec, &|| false)
+}
+
+/// Fit a method-specific baseline, stopping once `cancelled` reports true.
+///
+/// Produces exactly what [`fit_baseline`] produces while `cancelled` stays
+/// false. PSI and SPC poll `cancelled` before each feature, between a
+/// feature's collect, edge, and binning phases, and every
+/// [`CANCEL_CHECK_ROWS`] rows, so a blocking caller can stop a long fit
+/// promptly. A single quantile sort is not interrupted.
+///
+/// # Errors
+/// Returns [`DriftFitError::Cancelled`] once `cancelled` reports true, and
+/// otherwise the errors of [`fit_baseline`].
+pub fn fit_baseline_until(
+    batch: &arrow::record_batch::RecordBatch,
+    spec: &DriftSpec,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<FittedBaseline, crate::DriftFitError> {
     match spec.method {
         DriftMethod::Psi => {
@@ -53,7 +94,7 @@ pub fn fit_baseline(
                     });
                 }
             };
-            fit_psi_baseline(batch, profile, features).map(FittedBaseline::Psi)
+            fit_psi_baseline_until(batch, profile, features, cancelled).map(FittedBaseline::Psi)
         }
         DriftMethod::Spc => {
             let profile = match spec.profile.as_ref() {
@@ -72,7 +113,7 @@ pub fn fit_baseline(
                     });
                 }
             };
-            fit_spc_baseline(batch, profile, features).map(FittedBaseline::Spc)
+            fit_spc_baseline_until(batch, profile, features, cancelled).map(FittedBaseline::Spc)
         }
         DriftMethod::Custom => Ok(FittedBaseline::Custom),
     }
@@ -656,5 +697,138 @@ mod aggregate_inputs {
         assert_eq!(json["Psi"]["features"]["x"]["bins"][0]["lower"], "-inf");
         let restored: FittedBaseline = serde_json::from_value(json).expect("baseline restores");
         assert_eq!(restored, fitted);
+    }
+}
+
+#[cfg(test)]
+mod cancellation {
+    //! Cancellation reaching a fit after it starts stops inside a feature.
+
+    use std::cell::Cell;
+    use std::sync::Arc;
+
+    use crate::baseline::CANCEL_CHECK_ROWS;
+    use crate::{DriftFitError, fit_baseline, fit_baseline_until};
+    use arrow::array::{ArrayRef, Float64Array, StringArray};
+    use arrow::record_batch::RecordBatch;
+    use arrow_schema::{DataType, Field, Schema};
+    use wyrd_semver::VersionBlock;
+    use wyrd_spec::card::drift::{
+        DriftCondition, DriftMethod, DriftProfile, DriftSignal, DriftSpec, PsiBinningStrategy,
+        PsiProfile, PsiThreshold, SpcAlertThreshold, SpcProfile, SpcWecoRule,
+    };
+    use wyrd_spec::envelope::CardKind;
+    use wyrd_spec::ids::{CardName, FeatureName, SpaceName};
+    use wyrd_spec::reference::CardRef;
+
+    /// Rows per fixture: three cancellation chunks, so a mid-loop stop leaves work undone.
+    const ROWS: usize = CANCEL_CHECK_ROWS * 3;
+
+    /// One-column batch holding `ROWS` numeric values under `num` and labels under `cat`.
+    ///
+    /// # Panics
+    /// Panics when Arrow rejects the fixed two-column schema.
+    fn batch() -> RecordBatch {
+        let numbers: ArrayRef = Arc::new(Float64Array::from_iter_values(
+            (0..ROWS).map(|row| (row % 997) as f64),
+        ));
+        let labels: ArrayRef = Arc::new(StringArray::from_iter_values(
+            (0..ROWS).map(|row| ["a", "b", "c"][row % 3]),
+        ));
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("num", DataType::Float64, false),
+                Field::new("cat", DataType::Utf8, false),
+            ])),
+            vec![numbers, labels],
+        )
+        .expect("fixture batch")
+    }
+
+    /// A Distribution Drift spec over one feature with `profile`.
+    ///
+    /// # Panics
+    /// Panics when the fixed spec fails validation.
+    fn spec(method: DriftMethod, feature: &str, profile: DriftProfile) -> DriftSpec {
+        let baseline = CardRef {
+            kind: CardKind::Data,
+            name: CardName::new("baseline").expect("valid name"),
+            version: VersionBlock::parse("1.0.0").expect("valid version"),
+            space: Some(SpaceName::new("default").expect("valid space")),
+            uid: None,
+        };
+        DriftSpec::new(
+            method,
+            DriftSignal::Distribution {
+                baseline_ref: baseline.into(),
+                features: vec![FeatureName::new(feature).expect("valid feature")],
+            },
+            DriftCondition::Statistical,
+            Some(profile),
+            None,
+        )
+        .expect("valid drift spec")
+    }
+
+    /// PSI profile using quantile bins, with `categorical` as its categorical features.
+    ///
+    /// # Panics
+    /// Panics when a name is not a valid feature name.
+    fn psi(categorical: &[&str]) -> DriftProfile {
+        DriftProfile::Psi(PsiProfile {
+            binning_strategy: PsiBinningStrategy::Quantile { n_bins: 10 },
+            categorical_features: categorical
+                .iter()
+                .map(|name| FeatureName::new(*name).expect("valid feature"))
+                .collect(),
+            threshold: PsiThreshold::Fixed { value: 0.25 },
+        })
+    }
+
+    /// SPC profile with an explicit chunk size.
+    fn spc() -> DriftProfile {
+        DriftProfile::Spc(SpcProfile {
+            sample_size: 25,
+            weco_rule: SpcWecoRule::default(),
+            alert_threshold: SpcAlertThreshold::Zone4,
+        })
+    }
+
+    /// Each method stops at the first check after cancellation flips mid-feature,
+    /// and a never-cancelled fit equals the ordinary fit.
+    ///
+    /// The probe reports cancelled from its `stop_at`-th call. Earlier calls
+    /// include the per-feature check, so the stop lands inside the feature:
+    /// PSI numeric mid-binning, PSI categorical mid-count, SPC before limits.
+    ///
+    /// # Panics
+    /// Panics when a fit ignores cancellation, polls past the stop, or an
+    /// uncancelled fit differs from [`fit_baseline`].
+    #[test]
+    fn cancellation_after_fit_starts_stops_inside_the_feature() {
+        let batch = batch();
+        let cases = [
+            (spec(DriftMethod::Psi, "num", psi(&[])), 3),
+            (spec(DriftMethod::Psi, "cat", psi(&["cat"])), 2),
+            (spec(DriftMethod::Spc, "num", spc()), 2),
+        ];
+        for (spec, stop_at) in cases {
+            let calls = Cell::new(0_u32);
+            let probe = || {
+                calls.set(calls.get() + 1);
+                calls.get() >= stop_at
+            };
+            let error = fit_baseline_until(&batch, &spec, &probe).expect_err("cancelled fit");
+            assert!(matches!(error, DriftFitError::Cancelled), "{error:?}");
+            assert_eq!(
+                calls.get(),
+                stop_at,
+                "{:?} polled past the stop",
+                spec.method
+            );
+
+            let uncancelled = fit_baseline_until(&batch, &spec, &|| false).expect("fit");
+            assert_eq!(uncancelled, fit_baseline(&batch, &spec).expect("fit"));
+        }
     }
 }

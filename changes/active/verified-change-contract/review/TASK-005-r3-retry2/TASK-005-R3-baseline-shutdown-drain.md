@@ -43,3 +43,34 @@ Keep the correction in the existing `BaselineFitter` lifecycle. Use the already 
 | `FIND-TASK-005-11` | New claims stop at shutdown, including a claim already racing the stop signal. A baseline admitted before shutdown may finish and settle `ready` inside the configured grace. One still active after grace is cancelled, awaited, and released or expired under the same fence. | Add the smallest controlled Postgres-backed server fitter lifecycle test covering all three cases; record and run its exact named `mise exec -- cargo nextest run --locked ... -E 'test(=...)'` command under the repository Postgres wrapper. |
 
 Run `mise run fmt`, `mise run lints`, and the narrowest owning Wyrd/Drift runtime lane after the final code change. Record the focused and lane results in this task. Keep the cumulative candidate committed and submit it for a fresh `$wyrd-task-review` against `f8811ac5`.
+
+## Remediation r3 Evidence
+
+Candidate commit `2d92672f` on `vcc/task-005` (remediation range
+`93a2e3c9..2d92672f`), same base `f8811ac5`.
+
+| Finding | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| `FIND-TASK-005-11` new claims stop at shutdown, including a racing claim | `BaselineFitter::fit_next` (`verification/fitter.rs`) runs the tenant transaction and claim in a `biased` race with `stop`, as `VerifierRunner::claim` does, so an uncommitted claim rolls back. A claim whose commit completes after `stop` is released unfitted, with its attempt refunded. `pass` no longer pre-checks `stop`; it ends when `fit_next` refuses a claim after shutdown | Third case of `baseline_fit_drains_within_grace_then_releases`: `pass` with the stopped token settles 0, the gate sees no new fit, and the released row stays `pending` with 0 attempts | PASS |
+| `FIND-TASK-005-11` a fit admitted before shutdown finishes within the grace | `fit_within_drain` races the fit against the execution timeout and against `stop` followed by `RuntimeLimits::drain_grace`, so shutdown alone no longer cancels an admitted fit. `BaselineFitter::new` takes the runtime's `&RuntimeLimits`, the same lease, timeout, grace, and poll values the runner uses | First case: a fit held in flight across `stop` keeps the fitter running (`building`, 1 attempt); once released it settles `ready` and the fitter returns | PASS |
+| `FIND-TASK-005-11` a fit still running after the grace is cancelled, awaited, and released | When the grace elapses, the fit's cancellation token is cancelled, the blocking work is awaited, and the claimed lease is released through the existing fenced `DriftBaselineQueue::release` (attempt refunded). The timeout path, permits, decoded budget, and cooperative Vala polling are unchanged | Second case: with a 100 ms grace the held fit is cancelled, the fitter returns, and the row is `pending` with 0 attempts | PASS |
+
+`FitGate` (behind `test-support`, following the `EngineScript` pattern) holds a
+fit after its claim commits, so the test can keep a fit in flight across
+shutdown without timing guesses. It adds no production worker, setting, or
+registry.
+
+Focused command, run alone in this session (1 passed):
+
+```bash
+scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-server --features test-support --test pg_verification_runtime -E 'test(=baseline_fit_drains_within_grace_then_releases)'"
+```
+
+Lanes run after the final code change, each exit 0: `mise run fmt`,
+`mise run lints`, `mise run test:bifrost:integration:server` (83, including
+`pg_verification_runtime`), `mise run test:wyrd` (2135),
+`mise run test:bifrost:journey:drift`, and `git diff --check f8811ac5..HEAD`.
+
+Non-goals held: no new worker, scheduler, public setting, or process-local
+registry. Drift scoring, observation reads, result publication, Operator
+delivery, and the FIND-2/9/10 corrections are untouched.

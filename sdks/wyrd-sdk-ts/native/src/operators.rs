@@ -19,12 +19,14 @@ use wyrd_spec::error::WyrdError;
 
 use crate::{NativeLifecycleResult, NativeWyrdError};
 
-/// Decode one serialized JavaScript argument, naming only the argument.
+/// Decode one serialized JavaScript argument, naming only the argument and
+/// the decode category so a secret value is never echoed; shared by the
+/// Operator connection and Verification handles.
 ///
 /// # Errors
 /// Returns `WYRD_SPEC_400_VALIDATION` with `details.field` set to `field` when
 /// `json` does not match the wire contract.
-fn decode<T: DeserializeOwned>(field: &str, json: &str) -> StdResult<T, WyrdError> {
+pub(crate) fn decode<T: DeserializeOwned>(field: &str, json: &str) -> StdResult<T, WyrdError> {
     serde_json::from_str(json).map_err(|error| WyrdError::Validation {
         message: format!("{field} does not match the wire contract"),
         details: serde_json::json!({ "field": field, "category": format!("{:?}", error.classify()) }),

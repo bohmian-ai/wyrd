@@ -4,30 +4,17 @@
 //! this module only parses Node strings into wire types and projects results
 //! through [`NativeLifecycleResult`], so failures keep their catalog metadata.
 
-use std::result::Result as StdResult;
 
 use napi::Result;
 use napi_derive::napi;
-use serde::de::DeserializeOwned;
 use wyrd_client::verification::{
     BindingId, StartVerificationRunRequest, StartVerificationRunResponse, Verification,
     VerificationRunId,
 };
 use wyrd_spec::error::WyrdError;
 
+use crate::operators::decode;
 use crate::{NativeLifecycleResult, NativeWyrdError};
-
-/// Decode one serialized JavaScript argument, naming it on failure.
-///
-/// # Errors
-/// Returns `WYRD_SPEC_400_VALIDATION` with `details.field` set to `field` when
-/// `json` does not match the wire contract.
-fn decode<T: DeserializeOwned>(field: &str, json: &str) -> StdResult<T, WyrdError> {
-    serde_json::from_str(json).map_err(|error| WyrdError::Validation {
-        message: format!("{field} is invalid: {error}"),
-        details: serde_json::json!({ "field": field, "reason": error.to_string() }),
-    })
-}
 
 /// Tenant-scoped Verification handle over the shared `wyrd_client` handle.
 #[napi]

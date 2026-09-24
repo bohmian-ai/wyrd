@@ -21,12 +21,13 @@ use wyrd_spec::error::WyrdError;
 use wyrd_utils::py::{WyrdPyError, WyrdPyResult, json_to_pyobject, pyobject_to_json};
 
 /// Decode one Python argument into a wire type, naming only the argument and
-/// the decode position on failure so a secret value is never echoed.
+/// the decode category on failure so a secret value is never echoed; shared by
+/// the Operator connection and Verification handles.
 ///
 /// # Errors
 /// Returns `WYRD_SPEC_400_VALIDATION` with `details.field` set to `field` when
 /// `value` does not match the wire contract.
-fn decode<T: DeserializeOwned>(field: &str, value: Value) -> WyrdPyResult<T> {
+pub(crate) fn decode<T: DeserializeOwned>(field: &str, value: Value) -> WyrdPyResult<T> {
     serde_json::from_value(value).map_err(|error| {
         WyrdPyError::from(WyrdError::Validation {
             message: format!("{field} does not match the wire contract"),
@@ -35,11 +36,12 @@ fn decode<T: DeserializeOwned>(field: &str, value: Value) -> WyrdPyResult<T> {
     })
 }
 
-/// Project one redacted wire response into plain Python values.
+/// Project one wire response into plain Python values; shared by the Operator
+/// connection and Verification handles.
 ///
 /// # Errors
 /// Returns a Python error when the response cannot be serialized or converted.
-fn to_python<T: Serialize>(py: Python<'_>, value: &T) -> WyrdPyResult<Py<PyAny>> {
+pub(crate) fn to_python<T: Serialize>(py: Python<'_>, value: &T) -> WyrdPyResult<Py<PyAny>> {
     Ok(json_to_pyobject(py, &serde_json::to_value(value)?)?)
 }
 

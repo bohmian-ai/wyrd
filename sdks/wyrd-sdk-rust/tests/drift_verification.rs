@@ -328,6 +328,9 @@ async fn complete(
 /// Flush Scribe, then read one result and its feature rows joined on result
 /// identity within the caller's tenant-scoped view.
 ///
+/// A tenant that has never scored a report has no feature table yet, which
+/// reads as no feature rows.
+///
 /// # Panics
 /// Panics when the flush or either query fails, or the result is not exactly
 /// one row.
@@ -345,7 +348,7 @@ async fn read_result(
         .await
         .expect("result reads");
     assert_eq!(results.len(), 1, "one summary per result: {results:?}");
-    let features: Vec<FeatureRow> = query
+    let features: Vec<FeatureRow> = match query
         .sql_as(&format!(
             "SELECT f.feature, f.method, f.verdict \
              FROM vala.drift.result_features f JOIN vala.verification.results r \
@@ -353,7 +356,16 @@ async fn read_result(
              WHERE r.result_id = '{result_id}' ORDER BY f.feature"
         ))
         .await
-        .expect("feature rows read");
+    {
+        Ok(features) => features,
+        Err(error)
+            if wyrd_sdk::verification::WyrdError::from(&error).code()
+                == "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND" =>
+        {
+            Vec::new()
+        }
+        Err(error) => panic!("feature rows read: {error:?}"),
+    };
     (results.remove(0), features)
 }
 
@@ -373,6 +385,31 @@ async fn emit_window(
     admin: &WyrdClient,
     service: &RegistrationReceipt,
     bundle: &Path,
+) -> String {
+    let rows: Vec<Features> = (0..120_u32)
+        .map(|row| Features {
+            latency: 150.0 + f64::from(row),
+            tier: "bronze".to_owned(),
+            score: if row % 2 == 0 { 1.5 } else { 2.5 },
+        })
+        .collect();
+    emit_rows(server, admin, service, bundle, &rows).await
+}
+
+/// Emit `rows` as Drift observations of `service` through one `WyrdState`
+/// lifetime, drained and flushed before returning.
+///
+/// Each lifetime is one client batch, so calling this twice for one subject
+/// writes two batches of different sizes. Returns the Service's credential.
+///
+/// # Panics
+/// Panics when hydration, startup, an emit, or the drain fails.
+async fn emit_rows<T: Serialize>(
+    server: &WyrdTestServer,
+    admin: &WyrdClient,
+    service: &RegistrationReceipt,
+    bundle: &Path,
+    rows: &[T],
 ) -> String {
     let hydrator =
         CardGraphHydrator::new(Cards::with_client(WyrdClient::clone(admin)).registry_context());
@@ -395,17 +432,8 @@ async fn emit_window(
         .await
         .expect("bifrost starts");
     let run = state.run();
-    for row in 0..120_u32 {
-        run.observe()
-            .drift(
-                &Features {
-                    latency: 150.0 + f64::from(row),
-                    tier: "bronze".to_owned(),
-                    score: if row % 2 == 0 { 1.5 } else { 2.5 },
-                },
-                None,
-            )
-            .expect("drift emits");
+    for row in rows {
+        run.observe().drift(row, None).expect("drift emits");
     }
     state.shutdown().await.expect("state drains");
     server.flush_bifrost().await.expect("flush server Scribe");
@@ -523,6 +551,267 @@ async fn drift_methods_fit_score_persist_and_dispatch() {
         &direct(&psi, &service, window.0, window.1),
     )
     .await;
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// A Custom observation whose metric value is text, not a number.
+#[derive(Serialize)]
+struct TextScore {
+    /// Non-numeric value of the Custom metric series.
+    score: String,
+}
+
+/// Register an unbound Service named `name` as a Drift subject.
+///
+/// # Panics
+/// Panics when the Card file cannot be written or registration fails.
+async fn subject(cards: &Cards, root: &Path, name: &str) -> RegistrationReceipt {
+    let path = root.join(format!("{name}.yaml"));
+    std::fs::write(
+        &path,
+        format!(
+            "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: {name}\n  version: 1.0.0\n  space: default\nspec: {{}}\n"
+        ),
+    )
+    .expect("subject card writes");
+    register(cards, &path).await
+}
+
+/// A Verification client authenticated as `subject`'s own Service, whose
+/// Card scope covers manual runs of it.
+///
+/// # Panics
+/// Panics when the credential cannot be issued.
+async fn verifier_of(server: &WyrdTestServer, subject: &RegistrationReceipt) -> Verification {
+    let credential = api_key(
+        server
+            .credential_registered_service(&subject.root, &["admin"])
+            .await
+            .expect("subject credential issues"),
+    );
+    Verification::with_client(connect(server, &credential))
+}
+
+/// `(feature, method, verdict)` of every feature row, in feature order.
+fn verdicts(features: &[FeatureRow]) -> Vec<(&str, &str, &str)> {
+    features
+        .iter()
+        .map(|row| {
+            (
+                row.feature.as_str(),
+                row.method.as_str(),
+                row.verdict.as_str(),
+            )
+        })
+        .collect()
+}
+
+/// Assert `result` completed inconclusive before scoring: null details and
+/// no feature rows.
+///
+/// # Panics
+/// Panics when the result is scored or not inconclusive.
+fn assert_unscored((result, features): &(ResultRow, Vec<FeatureRow>)) {
+    assert_eq!(
+        (result.execution_status.as_str(), result.verdict.as_str()),
+        ("completed", "inconclusive"),
+        "{result:?}"
+    );
+    assert!(result.details.is_none(), "{result:?}");
+    assert!(features.is_empty(), "{features:?}");
+}
+
+/// Prove each method's edge semantics through the production verification
+/// runtime, Oracle, and Bifrost persistence.
+///
+/// Before the tenant's first Drift write a Custom run completes inconclusive
+/// with no details, features, or dispatch. Separate subjects then isolate
+/// each case in the one shared observation table: a window matching the
+/// baseline distribution passes PSI and Custom, with the Custom mean exactly
+/// at its threshold; two chunks and a trailing short chunk near the baseline
+/// center pass SPC; three rows are too few for PSI's minimum sample
+/// and SPC's chunk size; two client batches of one and three rows average
+/// per row, not per batch, and a window ending between them excludes the
+/// second; and a text-valued metric is inconclusive.
+///
+/// # Panics
+/// Panics when any run, result, or feature row differs from the expected one.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn drift_method_edges_score_through_oracle() {
+    let root = tempfile::tempdir().expect("fixture root creates");
+    write_baseline(root.path());
+    write_verifiers(root.path());
+    let server = Box::pin(
+        WyrdTestServer::builder()
+            .with_verification_runtime_for_test()
+            .start_bound(),
+    )
+    .await
+    .expect("test server starts");
+    let admin = connect(
+        &server,
+        &api_key(
+            server
+                .bootstrap_service("rust_drift_edges", &["admin"])
+                .await
+                .expect("admin bootstraps"),
+        ),
+    );
+    let cards = Cards::with_client(WyrdClient::clone(&admin));
+    let query = Bifrost::query_only(&admin);
+    let now = Utc::now();
+    let (start, end) = (
+        now - chrono::Duration::hours(1),
+        now + chrono::Duration::hours(1),
+    );
+
+    let custom = register(&cards, &root.path().join("drift-custom.yaml")).await;
+    let steady = subject(&cards, root.path(), "steady").await;
+    let run = |verifier: &RegistrationReceipt, subject: &RegistrationReceipt, from, to| {
+        let request = direct(verifier, subject, from, to);
+        let (server, query, subject) = (&server, &query, subject.clone());
+        async move {
+            let verification = verifier_of(server, &subject).await;
+            complete(server, &verification, query, &request).await
+        }
+    };
+    assert_unscored(&run(&custom, &steady, start, end).await);
+
+    register(&cards, &root.path().join("baseline.yaml")).await;
+    let psi = register(&cards, &root.path().join("drift-psi.yaml")).await;
+    let spc = register(&cards, &root.path().join("drift-spc.yaml")).await;
+    assert_eq!(wait_baseline(&cards, &psi, "ready").await, None);
+    assert_eq!(wait_baseline(&cards, &spc, "ready").await, None);
+
+    let baseline_like: Vec<Features> = (0..BASELINE_ROWS)
+        .map(|row| Features {
+            latency: f64::from((row * 37) % BASELINE_ROWS),
+            tier: if row % 2 == 0 { "gold" } else { "silver" }.to_owned(),
+            score: if row % 2 == 0 { 1.0 } else { 2.0 },
+        })
+        .collect();
+    let bundle = root.path().join("bundles");
+    emit_rows(
+        &server,
+        &admin,
+        &steady,
+        &bundle.join("steady"),
+        &baseline_like,
+    )
+    .await;
+    let (result, features) = run(&psi, &steady, start, end).await;
+    assert_eq!(result.verdict, "passed", "{result:?}");
+    assert_eq!(
+        verdicts(&features),
+        [("latency", "Psi", "no_drift"), ("tier", "Psi", "no_drift")]
+    );
+    let (result, features) = run(&custom, &steady, start, end).await;
+    assert_eq!(
+        result.verdict, "passed",
+        "a mean at the threshold is no drift"
+    );
+    assert_eq!(verdicts(&features), [("score", "Custom", "no_drift")]);
+
+    let calm = subject(&cards, root.path(), "calm").await;
+    let near_center: Vec<Features> = [45.0; 5]
+        .into_iter()
+        .chain([54.0; 5])
+        .chain([49.0; 3])
+        .map(|latency| Features {
+            latency,
+            tier: "gold".to_owned(),
+            score: 1.0,
+        })
+        .collect();
+    emit_rows(&server, &admin, &calm, &bundle.join("calm"), &near_center).await;
+    let (result, features) = run(&spc, &calm, start, end).await;
+    assert_eq!(
+        result.verdict, "passed",
+        "two full chunks and a trailing chunk inside Zone C pass: {result:?}"
+    );
+    assert_eq!(verdicts(&features), [("latency", "Spc", "no_drift")]);
+
+    let sparse = subject(&cards, root.path(), "sparse").await;
+    emit_rows(
+        &server,
+        &admin,
+        &sparse,
+        &bundle.join("sparse"),
+        &baseline_like[..3],
+    )
+    .await;
+    let (result, features) = run(&psi, &sparse, start, end).await;
+    assert_eq!(result.verdict, "inconclusive", "{result:?}");
+    assert_eq!(
+        verdicts(&features),
+        [
+            ("latency", "Psi", "inconclusive"),
+            ("tier", "Psi", "inconclusive")
+        ],
+        "three rows are below PSI's minimum sample"
+    );
+    let (result, features) = run(&spc, &sparse, start, end).await;
+    assert_eq!(result.verdict, "inconclusive", "{result:?}");
+    assert_eq!(
+        verdicts(&features),
+        [("latency", "Spc", "inconclusive")],
+        "three rows are below the chunk size"
+    );
+
+    let weighted = subject(&cards, root.path(), "weighted").await;
+    let scores = |values: &[f64]| -> Vec<Features> {
+        values
+            .iter()
+            .map(|score| Features {
+                latency: 50.0,
+                tier: "gold".to_owned(),
+                score: *score,
+            })
+            .collect()
+    };
+    emit_rows(
+        &server,
+        &admin,
+        &weighted,
+        &bundle.join("weighted-a"),
+        &scores(&[1.0]),
+    )
+    .await;
+    let split = Utc::now();
+    emit_rows(
+        &server,
+        &admin,
+        &weighted,
+        &bundle.join("weighted-b"),
+        &scores(&[2.0, 2.0, 2.0]),
+    )
+    .await;
+    let (result, _) = run(&custom, &weighted, start, end).await;
+    assert_eq!(
+        result.verdict, "failed",
+        "rows average to 1.75; averaging the two batches would give 1.5"
+    );
+    let (result, _) = run(&custom, &weighted, start, split).await;
+    assert_eq!(
+        result.verdict, "passed",
+        "the window end excludes the second batch"
+    );
+    let (result, _) = run(&custom, &weighted, split, end).await;
+    assert_eq!(
+        result.verdict, "failed",
+        "the window start excludes the first batch"
+    );
+
+    let text = subject(&cards, root.path(), "text").await;
+    let rows: Vec<TextScore> = (0..3)
+        .map(|_| TextScore {
+            score: "high".to_owned(),
+        })
+        .collect();
+    emit_rows(&server, &admin, &text, &bundle.join("text"), &rows).await;
+    assert_unscored(&run(&custom, &text, start, end).await);
+
     server.shutdown().await.expect("test server shuts down");
 }
 

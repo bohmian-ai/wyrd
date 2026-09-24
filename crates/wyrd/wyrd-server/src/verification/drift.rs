@@ -9,7 +9,7 @@
 //! fitted edges and labels, and window bounds are escaped typed literals; a
 //! Verifier contributes no SQL text.
 //!
-//! Each statement runs as the tenant's SYSTEM Drift reader: the engine mints a
+//! Each run issues exactly one statement as the tenant's SYSTEM Drift reader: the engine mints a
 //! token holding only `bifrost_query:read` on the tenant's registered
 //! observation table, verifies it through the server's ordinary token
 //! verifier, and dispatches through the ordinary query service — capability
@@ -18,16 +18,18 @@
 //! records the read decision. The shared scheduled-query consumer settles
 //! every stream, and each decoded aggregate batch is folded as it arrives.
 //!
-//! PSI and SPC first check completeness: a selected observation is a
-//! `record_id` carrying at least one configured feature in the window, and
-//! when any selected observation omits a configured feature or holds a null
-//! or non-finite value the run completes as `Drift(None)`, the inconclusive
-//! result without a report; nothing is dropped or imputed. An empty Custom
+//! A PSI or SPC statement combines the completeness count and every feature's
+//! aggregate, so Oracle answers all of them from one pinned cut: an
+//! observation ingested during the run is either in every part or in none.
+//! A selected observation is a `record_id` carrying at least one configured
+//! feature in the window, and when any selected observation omits a
+//! configured feature or holds a null or non-finite value the run completes
+//! as `Drift(None)`, the inconclusive result without a report; nothing is
+//! dropped or imputed. An empty Custom
 //! window and a non-finite Custom mean are unscorable the same way. A
 //! transient mint, query, or registry failure retries; a missing, legacy, or
 //! mismatched fitted baseline or a malformed aggregate terminates.
 
-use std::collections::BTreeMap;
 use std::time::Duration;
 
 use arrow::array::{Array, Float64Array, Int64Array, RecordBatch};
@@ -35,12 +37,15 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use datafusion::sql::sqlparser::ast::Value;
 use tokio_util::sync::CancellationToken;
 use vala_drift::psi::BinType;
-use vala_drift::{FITTED_FORMAT, FittedBaseline, SpcScorer, score_custom_mean, score_psi_counts};
+use vala_drift::{
+    DriftReport, DriftScoreError, FITTED_FORMAT, FittedBaseline, PsiBaseline, SpcBaseline,
+    SpcScorer, score_custom_mean, score_psi_counts,
+};
 use wyrd_auth::issuance::TenantTokenIssuer;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::card::drift::{DriftProfile, DriftSpec};
+use wyrd_spec::card::drift::{DriftProfile, DriftSpec, PsiProfile};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::CardUid;
+use wyrd_spec::ids::{CardUid, FeatureName};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{BifrostQueryRequest, FreshnessPolicy, VisibilityMode};
@@ -68,6 +73,13 @@ pub const BASELINE_LEGACY: &str = "baseline_legacy";
 const OBSERVATIONS: &str = "vala.drift.observations";
 /// Aggregate bin of a null or non-finite value: the window is not scorable.
 const INVALID_BIN: i64 = -1;
+/// Part of a combined statement carrying the completeness count; feature
+/// parts are the feature's index in fitted-baseline order.
+const COMPLETENESS_PART: i64 = -1;
+/// Typed null padding for the `numeric_n`, `mean`, and `sd` aggregate
+/// columns of a part that has no such values.
+const NO_MOMENTS: &str =
+    "CAST(NULL AS BIGINT) AS numeric_n, CAST(NULL AS DOUBLE) AS mean, CAST(NULL AS DOUBLE) AS sd";
 /// SQL predicate true only for a finite `num_value`: null and NaN compare
 /// false (IEEE) or outside the range (total order), and so do infinities.
 const FINITE_NUM: &str =
@@ -153,7 +165,7 @@ impl ObservationWindow {
     /// unrelated records never match. One is incomplete when it omits a
     /// configured series or any of its configured values is invalid: a
     /// numeric value that is null or non-finite, or a null category. Returns
-    /// one `incomplete` row.
+    /// one `(k, n, numeric_n, mean, sd)` row whose `n` is the incomplete count.
     ///
     /// # Errors
     /// Returns a description when no series is configured.
@@ -179,22 +191,24 @@ impl ObservationWindow {
         };
         let all = list(&[numeric, categorical].concat());
         Ok(format!(
-            "SELECT COUNT(*) AS incomplete FROM (SELECT record_id {} GROUP BY record_id \
+            "SELECT CAST(0 AS BIGINT) AS k, COUNT(*) AS n, {NO_MOMENTS} \
+             FROM (SELECT record_id {} GROUP BY record_id \
              HAVING COUNT(DISTINCT series) < {configured} \
              OR SUM(CASE WHEN {valid} THEN 0 ELSE 1 END) > 0)",
             self.rows_in(&format!("series IN ({all})"))
         ))
     }
 
-    /// Group `bin` over `rows` and count each group as `(bin_id, n)`.
+    /// Group `bin` over `rows` and count each group as `(k, n)` padded with
+    /// null moments.
     fn count_bins(bin: &str, rows: &str) -> String {
-        format!("SELECT bin_id, COUNT(*) AS n FROM (SELECT {bin} AS bin_id {rows}) GROUP BY bin_id")
+        format!("SELECT k, COUNT(*) AS n, {NO_MOMENTS} FROM (SELECT {bin} AS k {rows}) GROUP BY k")
     }
 
     /// Count `series` values into fitted `(lower, upper]` numeric bins.
     ///
     /// `edges` are the fitted bin edges (`bins + 1` values, open outer
-    /// edges). Returns `(bin_id, n)` rows; a null or non-finite value lands
+    /// edges). Returns `(k, n)` bin rows; a null or non-finite value lands
     /// in [`INVALID_BIN`] so the caller can refuse to score the window.
     ///
     /// # Errors
@@ -220,7 +234,7 @@ impl ObservationWindow {
     /// Count `series` categories into fitted labels and the `other` bin.
     ///
     /// `labels` are the fitted labels in bin order and `other` the index of
-    /// the reserved bin every unseen category lands in. Returns `(bin_id, n)`
+    /// the reserved bin every unseen category lands in. Returns `(k, n)` bin
     /// rows; a null category lands in [`INVALID_BIN`].
     #[must_use]
     pub fn psi_categorical(&self, series: &str, labels: &[&str], other: usize) -> String {
@@ -240,8 +254,9 @@ impl ObservationWindow {
     ///
     /// Rows are numbered by `created_at`, then `record_id`; subgroup `k`
     /// holds rows `k·subgroup_size ..`, and only the last may be partial.
-    /// Returns `(subgroup, n, numeric_n, mean, sd)` ordered by subgroup, with
-    /// `sd` the sample standard deviation; `n != numeric_n` exposes a null.
+    /// Returns `(k, n, numeric_n, mean, sd)` with subgroup `k`, ordered by
+    /// subgroup, with `sd` the sample standard deviation; `n != numeric_n`
+    /// exposes a null.
     ///
     /// # Errors
     /// Returns a description when `subgroup_size` is below two.
@@ -250,11 +265,11 @@ impl ObservationWindow {
             return Err("an SPC subgroup holds at least two rows".to_owned());
         }
         Ok(format!(
-            "SELECT subgroup, COUNT(*) AS n, COUNT(num_value) AS numeric_n, \
+            "SELECT k, COUNT(*) AS n, COUNT(num_value) AS numeric_n, \
              AVG(num_value) AS mean, STDDEV_SAMP(num_value) AS sd \
              FROM (SELECT num_value, CAST((ROW_NUMBER() OVER (ORDER BY created_at ASC NULLS LAST, \
-             record_id ASC NULLS LAST) - 1) / {subgroup_size} AS BIGINT) AS subgroup {}) \
-             GROUP BY subgroup ORDER BY subgroup",
+             record_id ASC NULLS LAST) - 1) / {subgroup_size} AS BIGINT) AS k {}) \
+             GROUP BY k ORDER BY k",
             self.rows(series)
         ))
     }
@@ -266,6 +281,224 @@ impl ObservationWindow {
             "SELECT COUNT(*) AS n, COUNT(num_value) AS numeric_n, AVG(num_value) AS mean {}",
             self.rows(series)
         )
+    }
+
+    /// Combine the `incomplete` count and one aggregate per feature into one
+    /// statement, so Oracle answers every part from one pinned cut.
+    ///
+    /// Every part projects `(part, k, n, numeric_n, mean, sd)`: the count is
+    /// part [`COMPLETENESS_PART`] and `features[i]` is part `i`. Rows are
+    /// ordered by part, then `k`, so each SPC feature's subgroups stay in
+    /// observation order.
+    fn combined(incomplete: &str, features: &[String]) -> String {
+        let part = |part: i64, sql: &str| {
+            format!("SELECT CAST({part} AS BIGINT) AS part, k, n, numeric_n, mean, sd FROM ({sql})")
+        };
+        let mut parts = vec![part(COMPLETENESS_PART, incomplete)];
+        parts.extend(
+            features
+                .iter()
+                .zip(0_i64..)
+                .map(|(sql, index)| part(index, sql)),
+        );
+        format!("{} ORDER BY part, k", parts.join(" UNION ALL "))
+    }
+
+    /// The one PSI statement of `baseline`: completeness over every fitted
+    /// feature and each feature's fitted-bin counts, in baseline order.
+    ///
+    /// # Errors
+    /// Returns a description when the baseline has no feature or malformed
+    /// fitted bins.
+    pub fn psi_statement(&self, baseline: &PsiBaseline) -> Result<String, String> {
+        let names = |bin_type: BinType| {
+            baseline
+                .features
+                .iter()
+                .filter(|(_, feature)| feature.bin_type == bin_type)
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>()
+        };
+        let incomplete = self.incomplete(&names(BinType::Numeric), &names(BinType::Categorical))?;
+        let mut features = Vec::with_capacity(baseline.features.len());
+        for (name, feature) in &baseline.features {
+            features.push(match feature.bin_type {
+                BinType::Numeric => {
+                    let edges = feature.numeric_edges().map_err(|error| error.to_string())?;
+                    self.psi_numeric(name.as_str(), &edges)?
+                }
+                BinType::Categorical => {
+                    let (labels, other) = feature
+                        .categorical_labels()
+                        .map_err(|error| error.to_string())?;
+                    self.psi_categorical(name.as_str(), &labels, other)
+                }
+            });
+        }
+        Ok(Self::combined(&incomplete, &features))
+    }
+
+    /// The one SPC statement of `baseline`: completeness over every fitted
+    /// feature and each feature's ordered subgroups, in baseline order.
+    ///
+    /// # Errors
+    /// Returns a description when the baseline has no feature or its
+    /// subgroup size is below two.
+    pub fn spc_statement(&self, baseline: &SpcBaseline) -> Result<String, String> {
+        let names = baseline
+            .features
+            .keys()
+            .map(|name| name.as_str())
+            .collect::<Vec<_>>();
+        let incomplete = self.incomplete(&names, &[])?;
+        let features = names
+            .iter()
+            .map(|name| self.spc(name, baseline.subgroup_size))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self::combined(&incomplete, &features))
+    }
+}
+
+/// Split one batch of a combined statement into its contiguous runs of one
+/// part, each paired with that part's number.
+///
+/// # Errors
+/// Returns a description when the `part` column is malformed.
+fn parts(batch: &RecordBatch) -> Result<Vec<(i64, RecordBatch)>, String> {
+    let parts = int64s(batch, "part")?;
+    let mut runs = Vec::new();
+    let mut start = 0;
+    for row in 1..=batch.num_rows() {
+        if row == batch.num_rows() || parts.value(row) != parts.value(start) {
+            runs.push((parts.value(start), batch.slice(start, row - start)));
+            start = row;
+        }
+    }
+    Ok(runs)
+}
+
+/// The folded result of one PSI or SPC combined statement.
+///
+/// Folds every decoded batch as it arrives, then decides the run: an
+/// incomplete observation or an invalid aggregated value leaves the window
+/// unscorable; otherwise the shared `vala-drift` scorer scores it. Every part
+/// came from one statement and so one Oracle cut, so completeness and every
+/// feature's aggregate describe the same population.
+pub struct DistributionFold<'a> {
+    /// Selected observations that are incomplete.
+    incomplete: u64,
+    /// False once an aggregated value was null or non-finite.
+    scorable: bool,
+    /// Method-specific fitted state and accumulated aggregates.
+    method: MethodFold<'a>,
+}
+
+/// Method-specific state of a [`DistributionFold`].
+enum MethodFold<'a> {
+    /// PSI bin counts per fitted feature, in baseline order.
+    Psi {
+        /// The fitted baseline the counts are scored against.
+        baseline: &'a PsiBaseline,
+        /// The authored profile carrying the threshold policy.
+        profile: &'a PsiProfile,
+        /// Fitted-bin counts of each feature part.
+        counts: Vec<Vec<u64>>,
+    },
+    /// The streaming SPC scorer and its features in baseline order.
+    Spc {
+        /// Feature of each part.
+        features: Vec<&'a FeatureName>,
+        /// Chart state fed each subgroup in observation order.
+        scorer: SpcScorer,
+    },
+}
+
+impl<'a> DistributionFold<'a> {
+    /// Start folding a PSI statement of `baseline` scored under `profile`.
+    #[must_use]
+    pub fn psi(baseline: &'a PsiBaseline, profile: &'a PsiProfile) -> Self {
+        let counts = baseline
+            .features
+            .values()
+            .map(|feature| vec![0; feature.bins.len()])
+            .collect();
+        Self::new(MethodFold::Psi {
+            baseline,
+            profile,
+            counts,
+        })
+    }
+
+    /// Start folding an SPC statement of `baseline`.
+    #[must_use]
+    pub fn spc(baseline: &'a SpcBaseline) -> Self {
+        Self::new(MethodFold::Spc {
+            features: baseline.features.keys().collect(),
+            scorer: SpcScorer::new(baseline),
+        })
+    }
+
+    /// Seed an empty fold over `method`.
+    fn new(method: MethodFold<'a>) -> Self {
+        Self {
+            incomplete: 0,
+            scorable: true,
+            method,
+        }
+    }
+
+    /// Fold one decoded batch of the combined statement.
+    ///
+    /// Completeness rows add to the incomplete count; a feature part's rows
+    /// go to that feature's PSI counts or, while still scorable, its SPC
+    /// chart in subgroup order.
+    ///
+    /// # Errors
+    /// Returns a description for a malformed aggregate, an unknown part, or
+    /// a subgroup the SPC scorer refuses.
+    pub fn fold(&mut self, batch: &RecordBatch) -> Result<(), String> {
+        for (part, rows) in parts(batch)? {
+            if part == COMPLETENESS_PART {
+                fold_incomplete(&rows, &mut self.incomplete)?;
+                continue;
+            }
+            let unknown = || format!("aggregate part {part} is not a fitted feature");
+            let index = usize::try_from(part).map_err(|_| unknown())?;
+            match &mut self.method {
+                MethodFold::Psi { counts, .. } => {
+                    let counts = counts.get_mut(index).ok_or_else(unknown)?;
+                    self.scorable &= fold_psi(&rows, counts)?;
+                }
+                MethodFold::Spc { features, scorer } => {
+                    let feature = features.get(index).ok_or_else(unknown)?;
+                    if self.scorable {
+                        self.scorable = fold_spc(&rows, feature, scorer)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Score the folded window, or `None` when it is not scorable.
+    ///
+    /// # Errors
+    /// Returns the PSI scorer's error for counts that do not fit the baseline.
+    pub fn finish(self) -> Result<Option<DriftReport>, DriftScoreError> {
+        if self.incomplete > 0 || !self.scorable {
+            return Ok(None);
+        }
+        match self.method {
+            MethodFold::Psi {
+                baseline,
+                profile,
+                counts,
+            } => {
+                let counts = baseline.features.keys().cloned().zip(counts).collect();
+                score_psi_counts(baseline, &counts, profile).map(Some)
+            }
+            MethodFold::Spc { scorer, .. } => Ok(Some(scorer.finish())),
+        }
     }
 }
 
@@ -300,7 +533,7 @@ fn count_of(value: i64) -> Result<u64, String> {
     u64::try_from(value).map_err(|_| "aggregate count is negative".to_owned())
 }
 
-/// Fold one batch of `(bin_id, n)` rows into the fitted-bin `counts`.
+/// Fold one batch of `(k, n)` bin rows into the fitted-bin `counts`.
 ///
 /// Absent bins stay zero. Returns `Ok(false)` when an invalid value was
 /// counted, which leaves the window unscorable.
@@ -308,7 +541,7 @@ fn count_of(value: i64) -> Result<u64, String> {
 /// # Errors
 /// Returns a description for a malformed aggregate or an out-of-range bin.
 pub fn fold_psi(batch: &RecordBatch, counts: &mut [u64]) -> Result<bool, String> {
-    let (ids, ns) = (int64s(batch, "bin_id")?, int64s(batch, "n")?);
+    let (ids, ns) = (int64s(batch, "k")?, int64s(batch, "n")?);
     let mut scorable = true;
     for (id, n) in ids.values().iter().zip(ns.values()) {
         let n = count_of(*n)?;
@@ -325,7 +558,7 @@ pub fn fold_psi(batch: &RecordBatch, counts: &mut [u64]) -> Result<bool, String>
     Ok(scorable)
 }
 
-/// Feed one batch of ordered `(subgroup, n, numeric_n, mean, sd)` rows of
+/// Feed one batch of ordered `(k, n, numeric_n, mean, sd)` subgroup rows of
 /// `feature` to `scorer`.
 ///
 /// A partial subgroup is fed by size alone. Returns `Ok(false)` without
@@ -368,12 +601,12 @@ pub fn fold_spc(
     Ok(true)
 }
 
-/// Read one batch of the one-row `incomplete` count into `incomplete`.
+/// Add one batch of the completeness count's `n` to `incomplete`.
 ///
 /// # Errors
 /// Returns a description for a malformed aggregate.
 pub fn fold_incomplete(batch: &RecordBatch, incomplete: &mut u64) -> Result<(), String> {
-    for value in int64s(batch, "incomplete")?.values() {
+    for value in int64s(batch, "n")?.values() {
         *incomplete += count_of(*value)?;
     }
     Ok(())
@@ -428,8 +661,8 @@ impl DriftEngine {
 
     /// Execute one claimed Drift run of `verifier` for `tenant`.
     ///
-    /// Loads the fitted baseline (PSI/SPC), runs one fixed aggregate per
-    /// feature as the tenant's SYSTEM Drift reader, and scores the folded
+    /// Loads the fitted baseline (PSI/SPC), runs one fixed aggregate
+    /// statement as the tenant's SYSTEM Drift reader, and scores the folded
     /// aggregates. Never fails: every failure is the [`EngineOutcome`] it
     /// maps to.
     pub async fn verify(
@@ -492,49 +725,10 @@ impl DriftEngine {
                         "the fitted baseline is not a PSI baseline".to_owned(),
                     ));
                 };
-                let names = |bin_type: BinType| {
-                    baseline
-                        .features
-                        .iter()
-                        .filter(|(_, feature)| feature.bin_type == bin_type)
-                        .map(|(name, _)| name.as_str())
-                        .collect::<Vec<_>>()
-                };
-                let incomplete = window
-                    .incomplete(&names(BinType::Numeric), &names(BinType::Categorical))
-                    .map_err(&invalid)?;
-                if !reader.complete(incomplete).await? {
-                    return Ok(None);
-                }
-                let mut counts = BTreeMap::new();
-                for (name, feature) in &baseline.features {
-                    let sql = match feature.bin_type {
-                        BinType::Numeric => feature
-                            .numeric_edges()
-                            .map_err(|error| error.to_string())
-                            .and_then(|edges| window.psi_numeric(name.as_str(), &edges))
-                            .map_err(&invalid)?,
-                        BinType::Categorical => {
-                            let (labels, other) = feature
-                                .categorical_labels()
-                                .map_err(|error| invalid(error.to_string()))?;
-                            window.psi_categorical(name.as_str(), &labels, other)
-                        }
-                    };
-                    let mut feature_counts = vec![0; feature.bins.len()];
-                    let mut scorable = true;
-                    reader
-                        .fold(sql, |batch| {
-                            scorable &= fold_psi(batch, &mut feature_counts)?;
-                            Ok(())
-                        })
-                        .await?;
-                    if !scorable {
-                        return Ok(None);
-                    }
-                    counts.insert(name.clone(), feature_counts);
-                }
-                scored(score_psi_counts(&baseline, &counts, profile))
+                let sql = window.psi_statement(&baseline).map_err(&invalid)?;
+                let mut fold = DistributionFold::psi(&baseline, profile);
+                reader.fold(sql, |batch| fold.fold(batch)).await?;
+                fold.finish().map_err(|error| invalid(error.to_string()))
             }
             Some(DriftProfile::Spc(_)) => {
                 let FittedBaseline::Spc(baseline) = self.fitted(tenant, &run.verifier_uid).await?
@@ -543,34 +737,10 @@ impl DriftEngine {
                         "the fitted baseline is not an SPC baseline".to_owned(),
                     ));
                 };
-                let names = baseline
-                    .features
-                    .keys()
-                    .map(|name| name.as_str())
-                    .collect::<Vec<_>>();
-                let incomplete = window.incomplete(&names, &[]).map_err(&invalid)?;
-                if !reader.complete(incomplete).await? {
-                    return Ok(None);
-                }
-                let mut scorer = SpcScorer::new(&baseline);
-                for name in baseline.features.keys() {
-                    let sql = window
-                        .spc(name.as_str(), baseline.subgroup_size)
-                        .map_err(&invalid)?;
-                    let mut scorable = true;
-                    reader
-                        .fold(sql, |batch| {
-                            if scorable {
-                                scorable = fold_spc(batch, name, &mut scorer)?;
-                            }
-                            Ok(())
-                        })
-                        .await?;
-                    if !scorable {
-                        return Ok(None);
-                    }
-                }
-                Ok(Some(scorer.finish()))
+                let sql = window.spc_statement(&baseline).map_err(&invalid)?;
+                let mut fold = DistributionFold::spc(&baseline);
+                reader.fold(sql, |batch| fold.fold(batch)).await?;
+                fold.finish().map_err(|error| invalid(error.to_string()))
             }
             None => Err(invalid("the Drift Verifier has no profile".to_owned())),
         }
@@ -677,18 +847,6 @@ impl Reader<'_> {
             request_id: RequestId::now_v7(),
             delegation_chain: verified.delegation_chain,
         }))
-    }
-
-    /// Run the `incomplete` count `sql` and report whether every selected
-    /// observation is complete.
-    ///
-    /// # Errors
-    /// Returns the outcomes of [`Reader::fold`].
-    async fn complete(&self, sql: String) -> Result<bool, EngineOutcome> {
-        let mut incomplete = 0;
-        self.fold(sql, |batch| fold_incomplete(batch, &mut incomplete))
-            .await?;
-        Ok(incomplete == 0)
     }
 
     /// Run `sql` as a fresh reader and hand each decoded batch to `fold`.
@@ -978,7 +1136,7 @@ mod tests {
             .iter()
             .all(|batch| fold_psi(batch, &mut counts).expect("well-formed"));
         assert!(!scorable, "a null category leaves the window unscorable");
-        let stray = batch(&[("bin_id", vec![9]), ("n", vec![1])], &[]);
+        let stray = batch(&[("k", vec![9]), ("n", vec![1])], &[]);
         assert!(fold_psi(&stray, &mut counts).is_err());
     }
 
@@ -1153,5 +1311,141 @@ mod tests {
         assert!(fold_custom(&aggregate(3, 3, Some(1.0)), &mut row).is_err());
         let malformed = batch(&[("n", vec![1])], &[]);
         assert!(fold_custom(&malformed, &mut None).is_err());
+    }
+
+    /// Execute one combined statement over `rows` and fold it.
+    ///
+    /// # Panics
+    /// Panics when the SQL fails or its aggregate is malformed.
+    async fn decide(
+        sql: &str,
+        rows: &[Row<'_>],
+        mut fold: DistributionFold<'_>,
+    ) -> Option<vala_drift::DriftReport> {
+        for batch in run(sql, rows).await {
+            fold.fold(&batch).expect("well-formed");
+        }
+        fold.finish().expect("scores")
+    }
+
+    /// Two numeric features `x` and `y` whose values cycle through `0..10`.
+    ///
+    /// # Panics
+    /// Panics when the fixture does not form a batch.
+    fn fitting_batch(rows: usize) -> RecordBatch {
+        let values = (0..rows)
+            .map(|row| Some((row % 10) as f64))
+            .collect::<Vec<_>>();
+        batch(&[], &[("x", values.clone()), ("y", values)])
+    }
+
+    /// Rows of `records` observations carrying `x = value` and `y = value`,
+    /// created one second apart.
+    fn observations<'a>(uid: &'a str, records: &'a [&'a str], value: f64) -> Vec<Row<'a>> {
+        records
+            .iter()
+            .zip(0_i64..)
+            .flat_map(|(record, second)| {
+                [
+                    (uid, "x", Some(value), None, second, second, *record),
+                    (uid, "y", Some(value), None, second, second, *record),
+                ]
+            })
+            .collect()
+    }
+
+    /// A PSI or SPC run reads completeness and every feature aggregate from
+    /// one statement, so one Oracle cut decides it. An incomplete observation
+    /// ingested where the former completeness and score reads were split is
+    /// either absent from every part or present in every part: with it the
+    /// run is unscorable, without it the complete population scores. A
+    /// selected record whose configured values are all null is incomplete,
+    /// agreeing with direct scoring of a preselected batch.
+    #[tokio::test]
+    async fn one_statement_decides_completeness_and_scores_from_one_cut() {
+        let uid = subject().to_string();
+        let features = [
+            wyrd_spec::ids::FeatureName::new("x").expect("x"),
+            wyrd_spec::ids::FeatureName::new("y").expect("y"),
+        ];
+        let records = ["r0", "r1", "r2", "r3"];
+        let complete = observations(&uid, &records, 5.0);
+        let seam = [(uid.as_str(), "x", Some(5.0), None, 9, 9, "late")];
+        let null_only = [
+            (uid.as_str(), "x", None, None, 9, 9, "late"),
+            (uid.as_str(), "y", None, None, 9, 9, "late"),
+        ];
+
+        let psi_profile = PsiProfile {
+            binning_strategy: wyrd_spec::card::drift::PsiBinningStrategy::EqualWidth { n_bins: 5 },
+            categorical_features: Vec::new(),
+            threshold: wyrd_spec::card::drift::PsiThreshold::Fixed { value: 0.2 },
+        };
+        let psi = vala_drift::fit_psi_baseline(&fitting_batch(1000), &psi_profile, &features)
+            .expect("PSI fits");
+        let sql = window().psi_statement(&psi).expect("PSI SQL");
+        assert_eq!(sql.matches("vala.drift.observations").count(), 3);
+        let fold = || DistributionFold::psi(&psi, &psi_profile);
+        assert!(decide(&sql, &complete, fold()).await.is_some());
+        assert_eq!(
+            decide(&sql, &[complete.as_slice(), &seam].concat(), fold()).await,
+            None
+        );
+        assert_eq!(
+            decide(&sql, &[complete.as_slice(), &null_only].concat(), fold()).await,
+            None
+        );
+
+        let spc = vala_drift::fit_spc_baseline(
+            &fitting_batch(40),
+            &wyrd_spec::card::drift::SpcProfile { sample_size: 2 },
+            &features,
+        )
+        .expect("SPC fits");
+        let sql = window().spc_statement(&spc).expect("SPC SQL");
+        let fold = || DistributionFold::spc(&spc);
+        let scored = decide(&sql, &complete, fold())
+            .await
+            .expect("complete scores");
+        assert_eq!(scored.verdict, vala_drift::DriftVerdict::NoDrift);
+        assert_eq!(
+            decide(&sql, &[complete.as_slice(), &seam].concat(), fold()).await,
+            None
+        );
+        assert_eq!(
+            decide(&sql, &[complete.as_slice(), &null_only].concat(), fold()).await,
+            None
+        );
+    }
+
+    /// A duplicated historical `x` row gives `x` complete signaled subgroups
+    /// while `y` ends in a partial one. Every record is complete, so the
+    /// statement scores, but the SPC report is wholly unscored rather than
+    /// failing on `x`'s signal.
+    #[tokio::test]
+    async fn spc_signal_beside_a_partial_feature_is_unscored() {
+        let uid = subject().to_string();
+        let features = [
+            wyrd_spec::ids::FeatureName::new("x").expect("x"),
+            wyrd_spec::ids::FeatureName::new("y").expect("y"),
+        ];
+        let spc = vala_drift::fit_spc_baseline(
+            &fitting_batch(40),
+            &wyrd_spec::card::drift::SpcProfile { sample_size: 2 },
+            &features,
+        )
+        .expect("SPC fits");
+        let mut rows = observations(&uid, &["r0", "r1", "r2"], 50.0);
+        rows.push((&uid, "x", Some(50.0), None, 3, 3, "r2"));
+        let sql = window().spc_statement(&spc).expect("SPC SQL");
+
+        let report = decide(&sql, &rows, DistributionFold::spc(&spc))
+            .await
+            .expect("every record is complete");
+
+        assert_eq!(
+            report,
+            vala_drift::DriftReport::unscored(wyrd_spec::card::drift::DriftMethod::Spc)
+        );
     }
 }

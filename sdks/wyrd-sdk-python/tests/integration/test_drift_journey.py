@@ -2,14 +2,17 @@
 
 Registers Pandas, Polars, and Arrow baseline Data Cards, each saved as Parquet,
 fits a PSI Verifier from each and an SPC Verifier from the Polars baseline, and
-reads every baseline's Card status until it is ready. A Service emits Drift
-observations through ``WyrdState``; direct runs of every Verifier then score
-the window server-side and persist their results and feature rows without an
-Operator dispatch. Negative flows cover an Arrow IPC baseline refused as
-non-Parquet and a caller without ``evals:run``. A second journey proves each
-method's edge semantics on isolated subjects: an empty tenant, a baseline-like
-window, SPC chunking, a sparse window, per-row Custom averaging with window
-bounds, and a text-valued metric.
+reads every baseline's Card status until it is ready. A Service bound to the
+SPC Verifier with one Operator emits Drift observations through ``WyrdState``;
+direct runs of every Verifier then score the window server-side and persist
+their results, SPC X-bar/S evidence, and feature rows without an Operator
+dispatch, and a run of the Service's binding fails on SPC signals and
+dispatches its Operator. Negative flows cover an Arrow IPC baseline refused as
+non-Parquet, an SPC profile carrying the retired ``weco_rule`` field, and a
+caller without ``evals:run``. A second journey proves each method's edge
+semantics on isolated subjects: an empty tenant, a baseline-like window, SPC
+subgroups until a partial one, a sparse window, unrelated and incomplete
+records, per-row Custom averaging with window bounds, and a text-valued metric.
 """
 
 from __future__ import annotations
@@ -48,11 +51,7 @@ def verifier_yaml(name: str, baseline: CardRef, method: str) -> str:
             "        binning_strategy:\n          kind: EqualWidth\n          n_bins: 10\n"
             "        threshold:\n          kind: Fixed\n          value: 0.25\n"
         ),
-        "Spc": (
-            "        kind: Spc\n        sample_size: 5\n"
-            '        weco_rule:\n          rule_string: "8 16 4 8 2 4 1 1"\n'
-            "        alert_threshold: Zone1\n"
-        ),
+        "Spc": "        kind: Spc\n        sample_size: 5\n",
     }[method]
     return (
         f"apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: {name}\n"
@@ -75,12 +74,16 @@ spec:
   verified_by:
     - verifier:
         kind: Verifier
-        name: py-drift-pandas
+        name: py-drift-spc
         version: 1.0.0
         space: default
       runs_on:
         kind: schedule
         cron: "0 0 * * *"
+      on_failure:
+        - kind: http
+          method: post
+          url: https://hooks.example.test/py-drift
 """
 
 
@@ -169,6 +172,26 @@ def complete(
     return run["result_id"]
 
 
+def assert_spc_evidence(details: str, subgroups: int, x_bar_signals: int) -> None:
+    """Assert the persisted SPC evidence of ``latency`` in a result's ``details``.
+
+    The baseline's twenty subgroups of five consecutive integers fix the X-bar
+    center at 49.5 and the S center at ``sqrt(2.5)``; the limits must be the
+    NIST X-bar/S limits around them, and SPC compares signals with zero.
+    """
+    feature = json.loads(details)["features"]["latency"]
+    spc = feature["evidence"]["Spc"]
+    assert (spc["subgroup_size"], spc["subgroups"]) == (5, subgroups), spc
+    assert spc["x_bar"]["signals"] == x_bar_signals, spc
+    s_bar = 2.5**0.5
+    width = 3 * s_bar / (0.9399856 * 5**0.5)
+    assert abs(spc["x_bar"]["center"] - 49.5) < 1e-9, spc
+    assert abs(spc["x_bar"]["upper"] - (49.5 + width)) < 1e-5, spc
+    assert abs(spc["s"]["center"] - s_bar) < 1e-9, spc
+    assert spc["s"]["lower"] == 0.0, "B3 is zero for subgroups of five"
+    assert feature["threshold"] == 0.0, feature
+
+
 def register_baselines(cards: Cards) -> dict[str, CardRef]:
     """Register the same baseline through each Parquet-backed authoring path."""
     tables = {
@@ -209,7 +232,9 @@ def test_parquet_baselines_fit_and_score_drift_server_side(tmp_path: Path) -> No
             f"{service.space}/Service/{service.name}@{service.version}", ["admin"]
         )
         bundle = tmp_path / "service"
-        download(server, admin, "Service", str(service.uid), bundle)
+        (binding_id,) = download(server, admin, "Service", str(service.uid), bundle)[
+            "verification"
+        ]["binding_ids"]
         state = WyrdState.from_path(bundle)
         state.start_bifrost(server_url=server.base_url, credential=credential)
         run = state.run()
@@ -225,7 +250,7 @@ def test_parquet_baselines_fit_and_score_drift_server_side(tmp_path: Path) -> No
             server.flush_bifrost()
             (result,) = (
                 query.sql(
-                    "SELECT execution_status, verdict, subject_card_uid, binding_id "
+                    "SELECT execution_status, verdict, subject_card_uid, binding_id, details "
                     f"FROM vala.verification.results WHERE result_id = '{result_id}'"
                 )
                 .to_arrow()
@@ -244,6 +269,41 @@ def test_parquet_baselines_fit_and_score_drift_server_side(tmp_path: Path) -> No
                 .to_pylist()
             )
             assert features == [{"feature": "latency", "verdict": "drift"}], name
+            if name == "py-drift-spc":
+                assert_spc_evidence(result["details"], 24, 24)
+
+        now = datetime.now(UTC)
+        binding_run = verification.start_run(
+            {
+                "target": {"kind": "binding", "binding_id": binding_id},
+                "input": {
+                    "kind": "drift_window",
+                    "start": (now - timedelta(hours=1)).isoformat(),
+                    "end": (now + timedelta(hours=1)).isoformat(),
+                },
+            }
+        )
+        deadline = time.monotonic() + WAIT_SECONDS
+        while (run := verification.get_run(binding_run))["status"] in {
+            "pending",
+            "running",
+            "retrying",
+        }:
+            assert time.monotonic() < deadline, f"binding run never settled: {run}"
+            time.sleep(0.1)
+        assert run["status"] == "completed", run
+        assert len(run["dispatches"]) == 1, "a failed binding result dispatches its Operator"
+        server.flush_bifrost()
+        (bound,) = (
+            query.sql(
+                "SELECT verdict, binding_id, details FROM vala.verification.results "
+                f"WHERE result_id = '{run['result_id']}'"
+            )
+            .to_arrow()
+            .to_pylist()
+        )
+        assert (bound["verdict"], bound["binding_id"]) == ("failed", binding_id), bound
+        assert_spc_evidence(bound["details"], 24, 24)
 
         ipc = DataCard(
             ArrowInterface(data=pa.table({"latency": LATENCY}), format="ipc"),
@@ -258,6 +318,18 @@ def test_parquet_baselines_fit_and_score_drift_server_side(tmp_path: Path) -> No
         with pytest.raises(WyrdError) as refused:
             cards.register_from_path(str(tmp_path / "ipc.yaml"))
         assert refused.value.code == "WYRD_DRIFT_400_VALIDATION"
+
+        retired = tmp_path / "py-drift-weco.yaml"
+        retired.write_text(
+            verifier_yaml("py-drift-weco", baselines["polars"], "Spc").replace(
+                "sample_size: 5\n",
+                'sample_size: 5\n        weco_rule:\n          rule_string: "8 16 4 8 2 4 1 1"\n',
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(WyrdError) as legacy:
+            cards.register_from_path(str(retired))
+        assert "weco_rule" in str(legacy.value.details), legacy.value.details
 
         reader = Verification(
             server_url=server.base_url,
@@ -298,8 +370,6 @@ EDGE_VERIFIERS = {
         "          version: 1.0.0\n          space: default\n"
         "        features: [latency]\n      condition:\n        kind: Statistical\n"
         "      profile:\n        kind: Spc\n        sample_size: 5\n"
-        '        weco_rule:\n          rule_string: "8 16 4 8 2 4 1 1"\n'
-        "        alert_threshold: Zone1\n"
     ),
     "py-edge-custom": (
         "      method: Custom\n      signal:\n        kind: Metric\n        name: score\n"
@@ -402,9 +472,12 @@ def test_drift_method_edges_score_through_oracle(tmp_path: Path) -> None:
     Before the tenant's first Drift write a Custom run completes inconclusive with
     no details, features, or dispatch. Separate subjects then isolate each case: a
     baseline-like window passes PSI and Custom (a mean at the threshold is no
-    drift); two chunks and a trailing chunk near the center pass SPC; three rows
-    are too few for PSI and SPC; Custom averages per row, not per batch, and the
-    window bounds exclude a batch; a text-valued metric is inconclusive.
+    drift); two in-control subgroups pass SPC with zero-signal evidence until a
+    trailing partial subgroup makes it inconclusive; three rows are too few for
+    PSI and one SPC subgroup; records without a PSI feature are ignored while
+    one omitting a feature leaves PSI unscored; Custom averages per row, not per
+    batch, and the window bounds exclude a batch; a text-valued metric is
+    inconclusive.
     """
     with WyrdTestServer(verification_runtime=True) as server:
         admin = server.bootstrap_service(["admin"], name="py-drift-edges-admin")
@@ -455,18 +528,21 @@ def test_drift_method_edges_score_through_oracle(tmp_path: Path) -> None:
         assert result["verdict"] == "passed", "a mean at the threshold is no drift"
         assert features == [("score", "Custom", "no_drift")]
 
+        def latencies(values: list[float]) -> list[dict]:
+            return [{"latency": value, "tier": "gold", "score": 1.0} for value in values]
+
         calm = subject(cards, tmp_path, "py-edge-calm")
-        near_center = [45.0] * 5 + [54.0] * 5 + [49.0] * 3
         emit_rows(
-            server,
-            admin,
-            calm,
-            bundles / "calm",
-            [{"latency": latency, "tier": "gold", "score": 1.0} for latency in near_center],
+            server, admin, calm, bundles / "calm", latencies([48.0, 49.0, 50.0, 51.0, 52.0] * 2)
         )
         result, features = run(spc, calm)
         assert result["verdict"] == "passed", result
         assert features == [("latency", "Spc", "no_drift")]
+        assert_spc_evidence(result["details"], 2, 0)
+        emit_rows(server, admin, calm, bundles / "calm-partial", latencies([50.0, 50.0]))
+        result, features = run(spc, calm)
+        assert result["verdict"] == "inconclusive", "a trailing partial subgroup"
+        assert features == [("latency", "Spc", "inconclusive")]
 
         sparse = subject(cards, tmp_path, "py-edge-sparse")
         emit_rows(server, admin, sparse, bundles / "sparse", baseline_like[:3])
@@ -476,6 +552,14 @@ def test_drift_method_edges_score_through_oracle(tmp_path: Path) -> None:
         result, features = run(spc, sparse)
         assert result["verdict"] == "inconclusive", result
         assert features == [("latency", "Spc", "inconclusive")]
+
+        gappy = subject(cards, tmp_path, "py-edge-gappy")
+        emit_rows(server, admin, gappy, bundles / "gappy", baseline_like)
+        emit_rows(server, admin, gappy, bundles / "gappy-unrelated", [{"score": 9.0}] * 5)
+        result, _ = run(psi, gappy)
+        assert result["verdict"] == "passed", "records without a PSI feature do not enter PSI"
+        emit_rows(server, admin, gappy, bundles / "gappy-omitted", [{"latency": 50.0}])
+        assert_unscored(run(psi, gappy))
 
         weighted = subject(cards, tmp_path, "py-edge-weighted")
 

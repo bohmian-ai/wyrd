@@ -1,7 +1,7 @@
 ---
 id: SPEC-verified-change-contract
 revision: 37
-status: draft
+status: approved
 ---
 
 # Verification contract
@@ -1851,11 +1851,12 @@ remediation plan.
 
 ## Revision history
 
-- **Revision 37 conventional PSI/SPC draft (2026-09-24):** Proposed complete
+- **Revision 37 conventional PSI/SPC (2026-09-24):** Approved complete
   categorical PSI bins, strict missing-data handling, fixed rational
   subgroups, NIST three-sigma X-bar/S limits, chart-specific result evidence,
   and an explicit new-version/refit boundary. This reverses revision 32's
-  SPC preservation decision and awaits explicit human approval. Statistical
+  SPC preservation decision and was explicitly approved by the user on
+  2026-09-24. Statistical
   grounding: [NIST X-bar/S chart](https://itl.nist.gov/div898/handbook/pmc/section3/pmc321.htm),
   [NIST rational subgroups](https://www.itl.nist.gov/div898/handbook/glossary.htm),
   and [ASQ control-chart setup](https://asq.org/quality-resources/control-chart).

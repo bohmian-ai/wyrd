@@ -1,7 +1,7 @@
 ---
 id: TASK-011
 kind: remediation
-status: draft
+status: ready
 spec: SPEC-verified-change-contract
 spec_revision: 37
 requirements: [REQ-110, REQ-153, REQ-154, REQ-155, REQ-156, REQ-157, INV-012, AC-034]
@@ -13,8 +13,8 @@ parent_task: TASK-005
 
 ## Authority and outcome
 
-The proposed [revision 37](../spec.md) is draft and requires explicit human
-approval before this task is ready for implementation. TASK-005 produced a
+The [revision 37 specification](../spec.md) was explicitly approved by the
+user on 2026-09-24, so this task is ready for implementation. TASK-005 produced a
 working Drift path under approved revision 36. Its categorical PSI omits
 unknown-category mass from the scored bins, and its SPC uses adaptive chunks,
 partial groups, a custom rule string, and X-bar limits without `sqrt(n)`.

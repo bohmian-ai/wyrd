@@ -1391,7 +1391,10 @@ files, or HashiCorp Vault KV v2. Multi-tenant production requires Vault over
 HTTPS so each tenant has its own key, and fails startup if the provider or any
 active tenant's active 32-byte key is unavailable; environment keys are
 development-only, and owner-only key files may serve an explicitly
-single-tenant deployment. Rewrap onto a new active version runs beside
+single-tenant deployment. Without a readable key only connection
+create/update refuses; other surfaces keep working and delivery retries with
+`credential_store_unavailable`. A shared `SecretRef` resolver and AWS Secrets
+Manager or Google Secret Manager key sources are deferred. Rewrap onto a new active version runs beside
 delivery in bounded, cancellable tenant-scoped passes. Responses, errors,
 logs, and audit carry only redacted metadata, never key locations. Registration
 and every delivery attempt require an active connection whose provider — and,

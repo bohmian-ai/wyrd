@@ -1,6 +1,6 @@
 ---
 id: SPEC-verified-change-contract
-revision: 35
+revision: 36
 status: approved
 ---
 
@@ -1030,7 +1030,7 @@ table on `(data_tenant_id, result_id)`.
   canonical tenant/connection/provider/name/version context, and a wrapped key
   bound to an externally held tenant-scoped key-encryption key and key version.
   Root or key-encryption material MUST remain outside Postgres in the deployment
-  secret/KMS boundary. Rotation replaces the encrypted secret on the same
+  key source defined below. Rotation replaces the encrypted secret on the same
   connection identity; key rotation MUST support rewrapping or re-encryption
   without exposing plaintext through a public surface. Decrypted bytes exist
   only for the bounded delivery attempt in a redacted secret type and are not
@@ -1043,20 +1043,26 @@ table on `(data_tenant_id, result_id)`.
   under the exact tenant KEK version using the same authenticated primitive
   with a distinct domain tag.
 
-  The deployment key provider is the existing external-secret resolver and
-  its `SecretRef::Vault` boundary (the configured backend may be Vault, AWS
-  Secrets Manager, or Google Secret Manager). Server configuration MUST supply
-  one external key prefix and one active positive key version; the resolver
-  reads a 32-byte KEK from
-  `<prefix>/<data_tenant_id>/<key_version>`. Multi-tenant production MUST use
-  this external provider and MUST fail startup if it or the active key is
-  unavailable; environment-sourced KEKs are development-only, while a
+  The server-owned `OperatorKeys` owner reads tenant KEKs from exactly one
+  configured deployment key source: an environment variable, owner-only
+  mounted files, or HashiCorp Vault KV v2 read over the already-installed
+  `reqwest`. Server configuration MUST name that source and one active
+  positive key version; the Vault source reads a 32-byte per-tenant KEK at
+  `<prefix>/<data_tenant_id>/<key_version>` under its KV v2 mount.
+  Multi-tenant production MUST use the HashiCorp Vault source over HTTPS and
+  MUST fail startup unless every active tenant's active key is readable
+  before readiness; environment-sourced KEKs are development-only, while a
   restrictive file-mounted KEK MAY be used by an explicitly single-tenant
-  deployment. Postgres stores only the key version and wrapped DEK. KEK
-  rotation publishes a new external version before making it active; new
-  writes use it, existing rows are rewrapped in bounded tenant-scoped work,
-  and an old external version is retained until no row references it. Rewrap
-  exposes only the DEK inside the process and does not decrypt the credential.
+  deployment. Without a readable key, only connection create/update
+  (sealing) refuses; every other surface keeps working and delivery retries
+  with `credential_store_unavailable`. Postgres stores only the key version
+  and wrapped DEK. KEK rotation publishes a new external version before
+  making it active; new writes use it, existing rows are rewrapped in bounded
+  tenant-scoped work, and an old external version is retained until no row
+  references it. Rewrap exposes only the DEK inside the process and does not
+  decrypt the credential. `SecretRef` is not the KEK configuration contract
+  for this change; a shared `SecretRef` resolver and AWS Secrets Manager and
+  Google Secret Manager KEK sources are deferred.
 - **REQ-148**: Tenant administrators MUST manage Operator connections through
   typed server-owned operations: create; list/get redacted metadata; update
   nonsecret configuration, status, or the write-only secret; and disable. The
@@ -1716,7 +1722,7 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
 
 ## Open material decisions
 
-None. Revision 35 was explicitly approved by the user on 2026-09-22.
+None. Revision 36 was explicitly approved by the user on 2026-09-24.
 
 ## Material authority links
 
@@ -1939,3 +1945,14 @@ None. Revision 35 was explicitly approved by the user on 2026-09-22.
   tolerances, and checker-based enforcement, and required behavioral Postgres
   regression evidence for each corrected shared write path. This revision was
   explicitly approved by the user on 2026-09-22.
+- **Revision 36 Operator key source (2026-09-24):** Replaced the assumed
+  backend-agnostic `SecretRef::Vault` resolver as the Operator KEK source,
+  which does not exist, with the server-owned `OperatorKeys` owner reading
+  exactly one configured source: an environment variable, owner-only mounted
+  files, or HashiCorp Vault KV v2 over the already-installed `reqwest`.
+  Required the HashiCorp Vault source over HTTPS for multi-tenant production
+  with fail-start unless every active tenant key is readable before
+  readiness, limited a missing key to refusing connection create/update while
+  delivery retries `credential_store_unavailable`, and deferred a shared
+  `SecretRef` resolver and AWS Secrets Manager / Google Secret Manager KEK
+  sources. This revision was explicitly approved by the user on 2026-09-24.

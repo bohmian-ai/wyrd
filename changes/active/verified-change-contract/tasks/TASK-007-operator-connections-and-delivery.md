@@ -3,7 +3,7 @@ id: TASK-007
 kind: implementation
 status: ready
 spec: SPEC-verified-change-contract
-spec_revision: 35
+spec_revision: 36
 requirements: [REQ-097, REQ-098, REQ-099, REQ-138, REQ-139, REQ-140, REQ-141, REQ-142, REQ-143, REQ-145, REQ-146, REQ-147, REQ-148, REQ-149, REQ-150, REQ-152, INV-006, INV-007, INV-011, INV-013, INV-015, AC-029, AC-030, AC-031, AC-033]
 depends_on: [TASK-004, TASK-010]
 ---
@@ -20,8 +20,9 @@ Alert resource or secret leakage.
 
 `wyrd-spec` owns closed connection/Operator/API/error contracts. `wyrd-sql`
 owns forced-RLS connection/dispatch persistence. `wyrd-crypt` owns AES-256-GCM
-and redacted secret handling; the existing external secret resolver supplies
-tenant/version KEKs. `wyrd-server` owns CRUD handlers, transactional audit,
+and redacted secret handling; the server-owned `OperatorKeys` owner reads
+tenant/version KEKs from one configured environment, owner-only file, or
+HashiCorp Vault KV v2 source. `wyrd-server` owns CRUD handlers, transactional audit,
 registration compatibility checks, the supervised Operator worker, SSRF
 screen/pin, provider adapters, limits, and status. `wyrd-client`, SDKs, CLI, and
 MCP project the same contract.
@@ -42,7 +43,8 @@ SSRF pinning, RLS, and auditing may not be simplified away.
 1. Add provider-tagged request/update/redacted view contracts and typed IDs,
    then forced-RLS SQL storage with UUIDv7 identities and audit composition.
 2. Extend `wyrd-crypt` authenticated associated data and envelope operations;
-   wire the approved external tenant/version KEK resolver and rotation model.
+   wire the approved `OperatorKeys` tenant/version KEK source and rotation
+   model.
 3. Expose HTTP/shared-client/SDK/CLI/MCP management operations with typed IDs,
    write-only secret handling outside CLI argv/debug, normal permissions, and
    route-owned runtime OpenAPI.
@@ -65,8 +67,8 @@ under-privileged access fails closed and audits allow/deny transactionally.
 responses, UUID version, RLS, auth failures, and injected audit/encryption
 failure rollback.
 
-**GREEN.** Extend existing cryptography and secret-resolver owners and compose
-the insert/audit on `TenantConn`.
+**GREEN.** Extend the existing cryptography owner, read KEKs through
+`OperatorKeys`, and compose the insert/audit on `TenantConn`.
 
 **REFACTOR.** Keep secret-bearing request values in redacted types and remove
 duplicate provider maps or debug output.
@@ -88,8 +90,9 @@ connection records or caches.
 
 ### Scenario 3 — KEK startup and rotation obey the external boundary
 
-**Behavior.** Multi-tenant production fails startup without its configured
-external provider/active 32-byte tenant key. Development may use env and
+**Behavior.** Multi-tenant production fails startup unless it uses the
+HashiCorp Vault KV v2 source over HTTPS and every active tenant's active
+32-byte key is readable before readiness. Development may use env and
 explicit single-tenant may use restrictive file mounting only as approved.
 Publish-before-active rotation makes new writes use the new version, bounded
 tenant work rewraps DEKs without decrypting credentials, and old versions stay
@@ -97,10 +100,12 @@ until unreferenced.
 
 **RED.** Add configuration, missing/wrong-size/unavailable key, AAD tamper,
 wrong-tenant/key-version, publish/activate/rewrap/retire, and cancellation cases
-using a local resolver.
+using a local Vault KV v2 fixture.
 
-**GREEN.** Reuse `SecretRef::Vault` resolver and `wyrd-crypt`; add only AAD,
-wrap/unwrap, and bounded rewrap orchestration.
+**GREEN.** Reuse `wyrd-crypt` and the already-installed `reqwest` for the
+server-owned `OperatorKeys` env/file/Vault KV v2 source; add only AAD,
+wrap/unwrap, and bounded rewrap orchestration. A shared `SecretRef` resolver
+and AWS Secrets Manager / Google Secret Manager KEK sources are deferred.
 
 **REFACTOR.** No cloud SDK or generic KMS framework is added to foundational
 crates.
@@ -195,7 +200,7 @@ capability.
 ## Expected Write Set and Consumer Closure
 
 Likely owners: `wyrd-spec` Operator/connection/API/ID/error contracts,
-`wyrd-crypt`, external secret resolver/config, `wyrd-sql` migrations/queries,
+`wyrd-crypt`, server `OperatorKeys` source/config, `wyrd-sql` migrations/queries,
 server handlers/registration/runtime/providers/SSRF/status, shared client,
 three SDKs, CLI, MCP, OpenAPI/schemas, and local/live provider journeys.
 

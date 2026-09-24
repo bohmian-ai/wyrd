@@ -11,8 +11,9 @@ use super::{Attempt, INVALID_REQUEST};
 
 /// The `trigger` event for one dispatch, carrying the routing key in the body.
 ///
-/// The dedup key defaults to the dispatch id, so every retry of a dispatch
-/// collapses into one PagerDuty incident.
+/// The dedup key defaults to the dispatch id, so PagerDuty may group retry
+/// events of one dispatch. This is not an exactly-once delivery or
+/// incident-grouping guarantee.
 ///
 /// # Errors
 /// Returns a terminal [`INVALID_REQUEST`] attempt when the summary or dedup

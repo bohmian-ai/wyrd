@@ -7,7 +7,7 @@
 //! server's redacted views, printed as JSON.
 
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, Subcommand};
@@ -115,7 +115,7 @@ pub async fn dispatch(command: OperatorConnectionCommand) -> Result<ExitCode, Wy
 /// # Errors
 /// Returns [`WyrdCliError::Io`] when the body cannot be read and
 /// [`WyrdCliError::InvalidArgument`] when it does not match `T`.
-fn read_body<T: DeserializeOwned>(path: &std::path::Path) -> Result<T, WyrdCliError> {
+fn read_body<T: DeserializeOwned>(path: &Path) -> Result<T, WyrdCliError> {
     let mut text = String::new();
     if path.as_os_str() == "-" {
         std::io::stdin()

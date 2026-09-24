@@ -152,6 +152,9 @@ pub struct OperatorDispatchQueue {
 }
 
 impl Default for OperatorDispatchQueue {
+    /// Three attempts within a five-minute deadline and a 45-second lease;
+    /// the lease exceeds the 30-second attempt timeout so a live attempt is
+    /// never reclaimed by another worker.
     fn default() -> Self {
         Self::new(3, Duration::from_secs(300), Duration::from_secs(45))
     }

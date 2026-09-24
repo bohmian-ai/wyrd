@@ -1495,8 +1495,9 @@ fn attach_config_fields(
 ) -> Result<AppState, ServerBootError> {
     Ok(state
         .with_deployment_profile(config.deployment_profile)
-        .with_operator_keys(OperatorKeys::new(
-            config.verification.operator_keys.clone(),
+        .with_operator_keys(OperatorKeys::for_role(
+            config.role,
+            &config.verification.operator_keys,
         )?)
         .with_telemetry(telemetry)
         .with_limits(config.limits.into_state()))

@@ -36,7 +36,7 @@ use wyrd_sql::queries::platform::tenants::list_active_tenant_ids;
 use wyrd_sql::{OperatorPool, TenantConn, WyrdPostgres};
 use zeroize::Zeroizing;
 
-use crate::config::{OperatorKeySource, OperatorKeysConfig};
+use crate::config::{BifrostTarget, OperatorKeySource, OperatorKeysConfig};
 
 /// Deadline of one Vault key read.
 const VAULT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -123,6 +123,11 @@ pub enum KeyError {
     /// redirects; construction refuses instead.
     #[error("the Operator key provider HTTP client could not be built")]
     Client,
+    /// The configured active version exceeds the persisted `i32` key-version
+    /// range, so no stored row could name it; construction refuses instead of
+    /// narrowing it onto a different key.
+    #[error("the Operator key active version exceeds the persisted key-version range")]
+    VersionOutOfRange,
 }
 
 impl KeyError {
@@ -145,6 +150,9 @@ impl KeyError {
                 "{message}"
             ),
             Self::Client => tracing::warn!(failure = "client", "{message}"),
+            Self::VersionOutOfRange => {
+                tracing::warn!(failure = "version_out_of_range", "{message}");
+            }
         }
     }
 }
@@ -208,30 +216,23 @@ fn parts(context: &[String; 5]) -> [&str; 5] {
 }
 
 /// Owner of Operator KEK reads, sealing, opening, and rewrap.
+///
+/// The derived `Debug` stays selector-free: the configuration prints through
+/// its own redacting `Debug`, and the Vault client holds no default headers
+/// because the token is attached per request.
+#[derive(Debug)]
 pub struct OperatorKeys {
     /// Configured source and active version.
     config: OperatorKeysConfig,
     /// The validated active version, exactly as configured.
     ///
-    /// Invariant: [`OperatorKeysConfig::validate`] refuses any version above
+    /// Invariant: [`OperatorKeys::new`] refuses any version above
     /// `i32::MAX`, so the persisted `i32` key version names the same external
     /// key the operator configured.
     active_version: i32,
     /// Bounded, non-redirecting HTTP client for Vault reads; built only for
     /// the Vault source.
     http: Option<reqwest::Client>,
-}
-
-impl std::fmt::Debug for OperatorKeys {
-    /// Redacting debug: prints the source kind, active version, and whether a
-    /// Vault client is present, never a selector or token.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OperatorKeys")
-            .field("source", &self.config.source)
-            .field("active_version", &self.active_version)
-            .field("vault_client", &self.http.is_some())
-            .finish_non_exhaustive()
-    }
 }
 
 impl Default for OperatorKeys {
@@ -246,6 +247,25 @@ impl Default for OperatorKeys {
 }
 
 impl OperatorKeys {
+    /// Build the owner a server `role` uses.
+    ///
+    /// Only API-bearing roles serve Operator connections, so only they build
+    /// the configured owner; a dedicated Forge worker keeps the unused default
+    /// and never reads Operator key settings it does not own or validate.
+    ///
+    /// # Errors
+    /// Returns any [`OperatorKeys::new`] error for an API-bearing role.
+    pub(crate) fn for_role(
+        role: BifrostTarget,
+        config: &OperatorKeysConfig,
+    ) -> Result<Self, KeyError> {
+        if role.serves_api() {
+            Self::new(config.clone())
+        } else {
+            Ok(Self::default())
+        }
+    }
+
     /// Build the owner over `config`.
     ///
     /// The Vault source gets a client with the read deadline and no redirect
@@ -255,14 +275,12 @@ impl OperatorKeys {
     /// # Errors
     /// Returns [`KeyError::Client`] when the TLS provider cannot be installed
     /// or the client cannot be built, so a Vault read never runs without its
-    /// timeout and redirect policy.
-    ///
-    /// # Panics
-    /// Panics when `config.active_version` exceeds `i32::MAX`, which
-    /// [`OperatorKeysConfig`] validation refuses before any owner is built.
+    /// timeout and redirect policy, and [`KeyError::VersionOutOfRange`] when
+    /// `config.active_version` exceeds `i32::MAX` because the caller skipped
+    /// [`OperatorKeysConfig`] validation.
     pub fn new(config: OperatorKeysConfig) -> Result<Self, KeyError> {
-        let active_version = i32::try_from(config.active_version.get())
-            .expect("invariant: validated Operator key versions fit the persisted i32");
+        let active_version =
+            i32::try_from(config.active_version.get()).map_err(|_| KeyError::VersionOutOfRange)?;
         let http = match config.source {
             OperatorKeySource::Vault => {
                 wyrd_tls::install_crypto_provider().map_err(|_| KeyError::Client)?;
@@ -651,6 +669,7 @@ mod tests {
     //! nonblocking file reads, sealing, and context binding.
 
     use std::io::Write as _;
+    use std::num::NonZeroU32;
     use std::sync::{Arc, Mutex};
 
     use chrono::Utc;
@@ -679,7 +698,7 @@ mod tests {
     fn file_keys(dir: &Path, active: u32) -> OperatorKeys {
         OperatorKeys::new(OperatorKeysConfig {
             source: OperatorKeySource::File,
-            active_version: std::num::NonZeroU32::new(active).expect("positive"),
+            active_version: NonZeroU32::new(active).expect("positive"),
             dir: Some(dir.to_path_buf()),
             vault: None,
         })
@@ -894,7 +913,7 @@ mod tests {
         write_mode(&token, "sentinel-token-value", 0o600);
         let owners = [
             OperatorKeys::new(OperatorKeysConfig {
-                active_version: std::num::NonZeroU32::new(907_311).expect("positive"),
+                active_version: NonZeroU32::new(907_311).expect("positive"),
                 ..OperatorKeysConfig::default()
             })
             .expect("env keys build"),
@@ -965,39 +984,31 @@ mod tests {
         }
     }
 
-    /// Debug formatting of the owner prints only the source kind, exact
-    /// active version, and Vault client presence, never a selector or token.
+    /// Direct construction keeps `i32::MAX` exact and refuses one past it
+    /// with the selector-free typed error instead of unwinding, while a
+    /// dedicated Forge worker ignores the oversized setting it does not own
+    /// and keeps the default owner without reading any key source.
     #[test]
-    fn operator_keys_debug_redacts_selectors() {
-        let keys = OperatorKeys::new(OperatorKeysConfig {
-            source: OperatorKeySource::Vault,
-            active_version: std::num::NonZeroU32::new(2_147_483_647).expect("positive"),
-            dir: Some(PathBuf::from("/sentinel-kek-dir")),
-            vault: Some(VaultKeysConfig {
-                addr: "https://sentinel-vault-addr:8200".to_owned(),
-                mount: "sentinel-mount".to_owned(),
-                prefix: "sentinel-prefix".to_owned(),
-                token_file: Some(PathBuf::from("/sentinel-token-file")),
-                token: Some(SecretString::from("sentinel-inline-token")),
-            }),
-        })
-        .expect("vault keys build");
-        assert_eq!(keys.active_version(), i32::MAX, "the version is exact");
-        let debug = format!("{keys:?}");
-        for sentinel in [
-            "sentinel-kek-dir",
-            "sentinel-vault-addr",
-            "sentinel-mount",
-            "sentinel-prefix",
-            "sentinel-token-file",
-            "sentinel-inline-token",
-        ] {
-            assert!(!debug.contains(sentinel), "{sentinel} leaked: {debug}");
-        }
-        assert_eq!(
-            debug,
-            "OperatorKeys { source: Vault, active_version: 2147483647, vault_client: true, .. }"
-        );
+    fn oversized_active_version_is_typed_or_ignored_by_role() {
+        let config = |version: u32| OperatorKeysConfig {
+            active_version: NonZeroU32::new(version).expect("positive"),
+            ..OperatorKeysConfig::default()
+        };
+        let at_max = OperatorKeys::new(config(2_147_483_647)).expect("i32::MAX builds");
+        assert_eq!(at_max.active_version(), i32::MAX, "the version is exact");
+
+        let oversized = config(2_147_483_648);
+        assert!(matches!(
+            OperatorKeys::new(oversized.clone()),
+            Err(KeyError::VersionOutOfRange)
+        ));
+        assert!(matches!(
+            OperatorKeys::for_role(BifrostTarget::Server, &oversized),
+            Err(KeyError::VersionOutOfRange)
+        ));
+        let forge = OperatorKeys::for_role(BifrostTarget::ForgeWorker, &oversized)
+            .expect("a Forge worker keeps the default owner");
+        assert_eq!(forge.active_version(), 1);
     }
 
     /// Vault reads send the owner-only token file's value and decode the key;

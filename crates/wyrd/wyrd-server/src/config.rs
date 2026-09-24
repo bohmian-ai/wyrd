@@ -4,7 +4,9 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::env;
+use std::fmt::{self, Debug, Formatter};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -1817,10 +1819,10 @@ pub struct VaultKeysConfig {
     pub token: Option<SecretString>,
 }
 
-impl std::fmt::Debug for VaultKeysConfig {
+impl Debug for VaultKeysConfig {
     /// Redacting debug: the address, mount, prefix, and token file locate
     /// secret material, so only the type name is printed.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("VaultKeysConfig").finish_non_exhaustive()
     }
 }
@@ -1852,7 +1854,7 @@ pub struct OperatorKeysConfig {
     /// version's key before activating it; keep older versions readable
     /// until rewrap leaves no row on them.
     #[serde(default = "default_active_key_version")]
-    pub active_version: std::num::NonZeroU32,
+    pub active_version: NonZeroU32,
     /// Directory of `v<version>` key files for [`OperatorKeySource::File`].
     #[serde(default)]
     pub dir: Option<PathBuf>,
@@ -1861,10 +1863,10 @@ pub struct OperatorKeysConfig {
     pub vault: Option<VaultKeysConfig>,
 }
 
-impl std::fmt::Debug for OperatorKeysConfig {
+impl Debug for OperatorKeysConfig {
     /// Redacting debug: prints the source kind, active version, and whether a
     /// Vault section is present, never a directory or Vault selector.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("OperatorKeysConfig")
             .field("source", &self.source)
             .field("active_version", &self.active_version)
@@ -1874,8 +1876,8 @@ impl std::fmt::Debug for OperatorKeysConfig {
 }
 
 /// Serde default for [`OperatorKeysConfig::active_version`].
-const fn default_active_key_version() -> std::num::NonZeroU32 {
-    std::num::NonZeroU32::MIN
+const fn default_active_key_version() -> NonZeroU32 {
+    NonZeroU32::MIN
 }
 
 impl Default for OperatorKeysConfig {
@@ -3785,7 +3787,7 @@ minimum_slots = 2
 
     /// The Vault-sourced Operator keys multi-tenant production requires,
     /// reading its token from a file under `directory`.
-    fn production_operator_keys(directory: &std::path::Path) -> OperatorKeysConfig {
+    fn production_operator_keys(directory: &Path) -> OperatorKeysConfig {
         OperatorKeysConfig {
             source: OperatorKeySource::Vault,
             vault: Some(VaultKeysConfig {
@@ -3853,6 +3855,33 @@ minimum_slots = 2
         );
     }
 
+    /// An oversized Operator key version is ignored by a dedicated Forge
+    /// worker, which owns no Operator keys, and refused before boot for an
+    /// API-bearing role.
+    #[test]
+    fn oversized_operator_key_version_follows_role_ownership() {
+        for (role, accepted) in [
+            (BifrostTarget::ForgeWorker, true),
+            (BifrostTarget::Server, false),
+        ] {
+            let mut config = WyrdServerConfig {
+                role,
+                ..WyrdServerConfig::default()
+            };
+            config.bifrost.oracle.allow_unapproved_profile = true;
+            config.verification.operator_keys.active_version =
+                NonZeroU32::new(2_147_483_648).expect("positive");
+            match config.validate() {
+                Ok(()) => assert!(accepted, "{role:?} accepted an oversized version"),
+                Err(ConfigError::Invalid { message }) => {
+                    assert!(!accepted, "{role:?} refused: {message}");
+                    assert!(message.contains("active_version"), "{message}");
+                }
+                Err(other) => panic!("{role:?} failed unexpectedly: {other}"),
+            }
+        }
+    }
+
     /// Debug formatting of the key configuration, directly and through the
     /// server configuration, prints only the source kind, active version, and
     /// Vault presence, never a selector or token.
@@ -3860,7 +3889,7 @@ minimum_slots = 2
     fn operator_keys_debug_redacts_selectors() {
         let keys = OperatorKeysConfig {
             source: OperatorKeySource::Vault,
-            active_version: std::num::NonZeroU32::new(907_311).expect("positive"),
+            active_version: NonZeroU32::new(907_311).expect("positive"),
             dir: Some(PathBuf::from("/sentinel-kek-dir")),
             vault: Some(VaultKeysConfig {
                 addr: "https://sentinel-vault-addr:8200".to_owned(),

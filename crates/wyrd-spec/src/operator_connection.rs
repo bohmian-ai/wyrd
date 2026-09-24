@@ -133,12 +133,20 @@ impl HttpsOrigin {
 }
 
 impl fmt::Display for HttpsOrigin {
+    /// Write the normalized `https://host[:port]` origin exactly as parsed.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
 }
 
 impl<'de> Deserialize<'de> for HttpsOrigin {
+    /// Read a string and parse it through [`HttpsOrigin::parse`], normalizing
+    /// it to its serialized origin.
+    ///
+    /// # Errors
+    /// Returns the deserializer's error when the value is not a string, or a
+    /// custom serde error carrying the [`OriginError`] when it is not an
+    /// allowed `https` origin.
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let value = String::deserialize(deserializer)?;
         Self::parse(&value).map_err(serde::de::Error::custom)

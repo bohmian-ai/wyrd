@@ -269,9 +269,10 @@ impl ClaimLoop {
     }
 }
 
-/// Log a spawned item that panicked; its lease expires into a reclaim.
-/// `label` when a fenced run or dispatch settlement applied, otherwise
-/// `stale_lease`; the outcome label both capabilities log and count.
+/// The outcome label both claim capabilities log and count for a settlement.
+///
+/// Returns `label` when a fenced run or dispatch settlement applied, otherwise
+/// `stale_lease`, because a lost lease means another claimant owns the row.
 pub(super) const fn settled(settlement: Settlement, label: &'static str) -> &'static str {
     match settlement {
         Settlement::Applied => label,
@@ -279,6 +280,7 @@ pub(super) const fn settled(settlement: Settlement, label: &'static str) -> &'st
     }
 }
 
+/// Log a spawned item that panicked; its lease expires into a reclaim.
 fn reap<W: LeasedWork>(finished: Result<(), JoinError>) {
     if let Err(error) = finished
         && error.is_panic()

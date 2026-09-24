@@ -10,6 +10,7 @@
 // raw-query grep allowlist: operator connection tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use std::error::Error as StdError;
+use std::fmt::{self, Debug, Formatter};
 
 use chrono::{DateTime, Utc};
 use sqlx::Error as SqlxError;
@@ -114,8 +115,10 @@ pub struct SealedSecret {
     pub key_version: i32,
 }
 
-impl std::fmt::Debug for SealedSecret {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for SealedSecret {
+    /// Redacting debug: prints only the key version, never the ciphertext,
+    /// nonces, or wrapped data key.
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("SealedSecret")
             .field("key_version", &self.key_version)
             .finish_non_exhaustive()

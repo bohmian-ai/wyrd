@@ -367,7 +367,9 @@ impl OperatorWorker {
             .open(tenant, &stored)
             .await
             .map_err(|error| match error {
-                KeyError::Unavailable { .. } | KeyError::Client => store_down(),
+                KeyError::Unavailable { .. } | KeyError::Client | KeyError::VersionOutOfRange => {
+                    store_down()
+                }
                 KeyError::Authentication { .. } => Attempt::terminal(
                     CREDENTIAL_INVALID,
                     "the stored credential failed authentication",

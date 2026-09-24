@@ -49,7 +49,7 @@ pub async fn resolve_card_references(
             .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?;
         validate_and_collect_refs(&spec, &siblings, &mut refs)?;
         if let Spec::Operator(operator) = &spec {
-            check_operator(conn, operator, "spec").await?;
+            check_operator(conn, operator, "spec", None).await?;
         }
     }
 
@@ -111,21 +111,27 @@ fn check_activation(
 
 /// Validate an Operator's shape and the exact connection authority it names.
 ///
+/// `implementation` is the bound Verifier's implementation when the Operator
+/// is attached to a binding, so a kind-specific template field of another
+/// implementation is refused; a standalone Operator Card passes `None`.
+///
 /// Reads only the tenant's redacted connection row (never the secret) under
 /// the caller's RLS. Missing, disabled, wrong-provider, and mismatched
 /// authority all answer the same refusal, so a tenant cannot probe which one
 /// applies, and another tenant's connection is indistinguishable from none.
 ///
 /// # Errors
-/// Returns `WYRD_SPEC_400_INVALID_OPERATOR` for a shape or template violation,
+/// Returns `WYRD_SPEC_400_INVALID_OPERATOR` for a shape or template violation
+/// (including a template field of another Verifier implementation),
 /// `WYRD_SPEC_400_OPERATOR_CONNECTION_UNAVAILABLE` when no active matching
 /// connection exists, and a registry error when the read fails.
 async fn check_operator(
     conn: &mut TenantConn<'_>,
     operator: &OperatorSpec,
     field: &str,
+    implementation: Option<&VerifierImplementation>,
 ) -> Result<(), WyrdError> {
-    operator.validate(field)?;
+    operator.validate(field, implementation)?;
     let Some((provider, name)) = operator.connection() else {
         return Ok(());
     };
@@ -285,7 +291,13 @@ impl EffectiveSpecs {
                         details: serde_json::json!({ "field": field, "action": "workflow" }),
                     });
                 }
-                Some(Spec::Operator(operator)) => check_operator(conn, &operator, &field).await?,
+                Some(Spec::Operator(operator)) => {
+                    let implementation = match &verifier {
+                        Some(Spec::Verifier(verifier)) => Some(&verifier.implementation),
+                        _ => None,
+                    };
+                    check_operator(conn, &operator, &field, implementation).await?;
+                }
                 _ => {}
             }
         }

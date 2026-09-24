@@ -1,0 +1,12 @@
+# SPEC-operator-verifier-fields revision 1 — implementation evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| AC-001 Drift counts render into Slack and agree with `summary` | `VerifierCounts` in `wyrd-spec/src/card/operator.rs`; `VerifierReport::counts` in `verification/engines.rs`; frozen by `VerifierRunQueue::complete` | `pg_operator_delivery::drift_counts_render_into_the_slack_message` | PASS |
+| AC-002 Eval counts render into an HTTP JSON body, pass rate rounds down | `VerifierCounts::eval`; `render_json` | Unit only: `verification::operators::tests::eval_counts_render_into_a_json_body` (7/10 → `"70%"`), `card::operator::tests::eval_counts_round_the_pass_rate_down` | PASS (limit: no end-to-end Eval delivery harness exists; Drift covers the delivery path) |
+| AC-003 Binding refuses another kind's fields, inline and referenced; standalone accepts both | `check_operator(.., implementation)` in `components/cards/resolve.rs`; `OperatorSpec::validate` | `pg_card_registration_route::referenced_binding_refusals_leave_no_writes` (Eval binding, inline + referenced `drift.*` → `WYRD_SPEC_400_INVALID_OPERATOR`, field path named, no writes); reverse direction and standalone acceptance in `card::operator::tests::kind_fields_follow_the_verifier_implementation` | PASS (limit: Drift-binding reverse and SDK/CLI projection not driven end to end) |
+| AC-004 Retries render identical frozen values | frozen `verifier` JSONB on `wyrd.operator_dispatches.failure_context` | `pg_operator_delivery::next_attempt_on_another_replica_uses_the_rotated_credential` asserts both attempts send `1/1 drifted`; `pg_verifier_runs::failed_settlement_freezes_the_bounded_failure_context` | PASS |
+| AC-005 Schemas regenerate with the `verifier` union | `crates/wyrd-spec/schemas/operator_failure_context.json`, `tests/schemas/…` | `mise run codegen:check` exit 0 (no Python/TS type projects the failure context today) | PASS |
+| REQ-005 docs | `architecture/wyrd-design.md` Operator templating: per-kind field table, Drift and Eval Slack examples | review | PASS (no public Operator authoring page exists; examples live in the design authority) |
+
+Verification run: `mise run fmt`, `mise run lints`, `mise run test:sql` (284 passed), focused nextest runs above, `mise run codegen:check`, `git diff --check` — all exit 0. `mise run test:wyrd` was not run (stopped by the user for host memory).

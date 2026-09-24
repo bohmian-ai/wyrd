@@ -1420,9 +1420,33 @@ applies to `Http.url` and to text fields in `NotifyChannel` variants.
 Templating context is one bounded, immutable failure context derived from
 the failed Verification Result: dispatch, run, result, and binding IDs; the
 exact Verifier and subject Card identities; the `failed` verdict; completion
-time; and a bounded result summary. It never carries raw observation context,
-media, feature rows, or secret material, and registration rejects unknown
-template fields. Exact field schema lives in OpenAPI.
+time; a bounded result summary; and one count block for the failed run's
+Verifier implementation (`verifier`, tagged by `implementation`). It never
+carries raw observation context, media, feature rows, feature names, Eval task
+detail, or secret material, and registration rejects unknown template fields.
+Exact field schema lives in OpenAPI.
+
+| Implementation | Template fields |
+|---|---|
+| any | `dispatch_id`, `run_id`, `result_id`, `binding_id`, `verifier_ref`, `verifier_uid`, `subject_ref`, `subject_uid`, `verdict`, `completed_at`, `summary` |
+| `drift` | `drift.drifted_features`, `drift.total_features` |
+| `eval` | `eval.passed_tasks`, `eval.failed_tasks`, `eval.total_tasks`, `eval.pass_rate_percent` (rounded down; `0` with no tasks) |
+
+Counts render as base-10 digits and come from the same result as `summary`.
+A standalone Operator Card may use fields of either implementation; a
+binding refuses an attached Operator (inline or referenced) that uses the
+other implementation's fields, naming the binding field path.
+
+```yaml
+# Drift Verifier's on_failure
+kind: notify
+channel: { kind: slack, connection: ops-slack, channel_id: C0123456789,
+           text: "{{drift.drifted_features}}/{{drift.total_features}} features drifted on {{subject_ref}} ({{verifier_ref}})" }
+# Eval Verifier's on_failure
+kind: notify
+channel: { kind: slack, connection: ops-slack, channel_id: C0123456789,
+           text: "{{subject_ref}} passed {{eval.passed_tasks}}/{{eval.total_tasks}} tasks ({{eval.pass_rate_percent}}%)" }
+```
 
 ---
 

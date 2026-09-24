@@ -13,7 +13,7 @@ use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_runtime::PermissionSet;
 use wyrd_runtime::principal::{Principal, PrincipalId, PrincipalKind};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::card::operator::{MAX_SUMMARY_CHARS, OperatorFailureContext};
+use wyrd_spec::card::operator::{MAX_SUMMARY_CHARS, OperatorFailureContext, VerifierCounts};
 use wyrd_spec::card::verifier::OWNER_OCCURRENCE_KEY;
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::ids::{BindingId, CardUid, VerificationResultId, VerificationRunId};
@@ -37,6 +37,12 @@ use wyrd_sql::queries::verifier_runs::{
     TerminalStatus, VerifierRunQueue,
 };
 use wyrd_sql::row_types::cards::CardStatus;
+
+/// Counts every test completion freezes, matching a one-of-three drift report.
+const DRIFT_COUNTS: VerifierCounts = VerifierCounts::Drift {
+    drifted_features: 1,
+    total_features: 3,
+};
 
 /// Mint a fresh Card UID.
 ///
@@ -974,7 +980,8 @@ async fn reclaimed_lease_fences_the_stale_token() {
                 stale.lease,
                 result,
                 VerificationVerdict::Passed,
-                "drift detected"
+                "drift detected",
+                DRIFT_COUNTS
             )
             .await
             .expect("stale completion answers"),
@@ -995,7 +1002,8 @@ async fn reclaimed_lease_fences_the_stale_token() {
                     current.lease,
                     result,
                     VerificationVerdict::Passed,
-                    "drift detected"
+                    "drift detected",
+                    DRIFT_COUNTS
                 )
                 .await
                 .expect("completion answers"),
@@ -1010,6 +1018,7 @@ async fn reclaimed_lease_fences_the_stale_token() {
                 VerificationResultId::new_v7(),
                 VerificationVerdict::Passed,
                 "drift detected",
+                DRIFT_COUNTS,
             )
             .await
             .expect("conflicting completion answers"),
@@ -1277,7 +1286,14 @@ async fn failed_binding_runs_dispatch_each_distinct_operator_once() {
         for _ in 0..2 {
             assert_eq!(
                 queue
-                    .complete(&mut conn, claimed.lease, result, verdict, "drift detected")
+                    .complete(
+                        &mut conn,
+                        claimed.lease,
+                        result,
+                        verdict,
+                        "drift detected",
+                        DRIFT_COUNTS
+                    )
                     .await
                     .expect("completion answers"),
                 Settlement::Applied
@@ -1417,6 +1433,7 @@ async fn queue_state_is_tenant_isolated() {
             VerificationResultId::new_v7(),
             VerificationVerdict::Failed,
             "drift detected",
+            DRIFT_COUNTS,
         )
         .await
         .expect("run completes");
@@ -1716,6 +1733,7 @@ async fn database_clock_owns_verifier_queue_deadlines() {
                 VerificationResultId::new_v7(),
                 VerificationVerdict::Failed,
                 "drift detected",
+                DRIFT_COUNTS,
             )
             .await
             .expect("completion answers"),
@@ -1808,6 +1826,7 @@ async fn failed_run_with_two_dispatches(
             VerificationResultId::new_v7(),
             VerificationVerdict::Failed,
             &summary,
+            DRIFT_COUNTS,
         )
         .await
         .expect("failed completion settles");
@@ -1845,6 +1864,7 @@ async fn failed_settlement_freezes_the_bounded_failure_context() {
         assert_eq!(context.verifier_ref, "default/drift@1.0.0");
         assert_eq!(context.subject_ref, "default/svc@1.0.0");
         assert_eq!(context.summary.chars().count(), MAX_SUMMARY_CHARS);
+        assert_eq!(context.verifier, DRIFT_COUNTS);
     }
 }
 

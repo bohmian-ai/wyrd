@@ -1015,6 +1015,7 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     use wyrd_auth_oidc::AddressPolicy;
+    use wyrd_spec::card::operator::VerifierCounts;
     use wyrd_spec::ids::{
         BindingId, CardUid, OperatorDispatchId, VerificationResultId, VerificationRunId,
     };
@@ -1046,7 +1047,25 @@ mod tests {
             verdict: VerificationVerdict::Failed,
             completed_at: Utc::now(),
             summary: "failed".to_owned(),
+            verifier: VerifierCounts::eval(7, 10),
         }
+    }
+
+    /// An HTTP JSON body renders every `eval.*` count as a string value from
+    /// the frozen context, with the partial pass rate rounded down.
+    #[test]
+    fn eval_counts_render_into_a_json_body() {
+        let body = serde_json::json!({
+            "passed": "{{eval.passed_tasks}}",
+            "counts": ["{{eval.failed_tasks}}", "{{eval.total_tasks}}"],
+            "rate": "{{ eval.pass_rate_percent }}%",
+        });
+        assert_eq!(
+            render_json(&body, &context()).expect("eval fields render"),
+            serde_json::json!({ "passed": "7", "counts": ["3", "10"], "rate": "70%" })
+        );
+        let drift = serde_json::json!({ "n": "{{drift.total_features}}" });
+        assert!(render_json(&drift, &context()).is_err());
     }
 
     /// An HTTP Operator posting to `url` with a header credential.

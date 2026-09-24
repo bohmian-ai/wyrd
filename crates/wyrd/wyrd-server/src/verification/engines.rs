@@ -13,6 +13,7 @@ use vala_drift::{DriftReport, DriftVerdict};
 use vala_eval::executor::EvalReport;
 use wyrd_spec::card::drift::DriftSpec;
 use wyrd_spec::card::eval::EvalSpec;
+use wyrd_spec::card::operator::VerifierCounts;
 use wyrd_spec::verification::{VerificationError, VerificationVerdict};
 use wyrd_sql::queries::verifier_runs::{ClaimedRun, TerminalStatus};
 
@@ -93,6 +94,40 @@ impl VerifierReport {
                     <&str>::from(verdict),
                     rollup.passed_tasks,
                     rollup.total_tasks
+                )
+            }
+        }
+    }
+
+    /// The count-only numbers frozen beside [`VerifierReport::summary`] into
+    /// each Operator failure context.
+    ///
+    /// Drift counts drifted and scored features; Eval counts passed and ran
+    /// tasks. An unscored Drift execution (never `failed`) reads zero of zero,
+    /// and a negative rollup count reads zero.
+    #[must_use]
+    pub fn counts(&self) -> VerifierCounts {
+        let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        match self {
+            Self::Drift(None) => VerifierCounts::Drift {
+                drifted_features: 0,
+                total_features: 0,
+            },
+            Self::Drift(Some(report)) => VerifierCounts::Drift {
+                drifted_features: count(
+                    report
+                        .features
+                        .values()
+                        .filter(|feature| feature.verdict == DriftVerdict::Drift)
+                        .count(),
+                ),
+                total_features: count(report.features.len()),
+            },
+            Self::Eval { report, .. } => {
+                let rollup = report.workflow_summary();
+                VerifierCounts::eval(
+                    u32::try_from(rollup.passed_tasks).unwrap_or(0),
+                    u32::try_from(rollup.total_tasks).unwrap_or(0),
                 )
             }
         }

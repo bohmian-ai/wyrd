@@ -25,6 +25,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::watch::Sender;
 use tokio_util::sync::CancellationToken;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::card::operator::VerifierCounts;
 use wyrd_spec::card::verifier::VerifierImplementation;
 use wyrd_spec::envelope::{CardKind, Spec};
 use wyrd_spec::ids::VerificationResultId;
@@ -67,6 +68,8 @@ pub enum Transition {
         verdict: VerificationVerdict,
         /// Bounded human-readable summary frozen into failure dispatches.
         summary: String,
+        /// The same result's counts frozen into failure dispatches.
+        counts: VerifierCounts,
     },
     /// Try the same run and input again within its attempt budget.
     Retry(VerificationError),
@@ -307,6 +310,7 @@ impl VerifierRunner {
                 result_id,
                 verdict: payload.verdict(),
                 summary: report.summary(),
+                counts: report.counts(),
             },
             Ok(Err(error)) => {
                 tracing::warn!(run_id = %run.lease.run_id, %error, "verification result publication failed");
@@ -341,9 +345,10 @@ impl VerifierRunner {
                 result_id,
                 verdict,
                 summary,
+                counts,
             } => settled(
                 self.queue
-                    .complete(&mut conn, lease, result_id, verdict, &summary)
+                    .complete(&mut conn, lease, result_id, verdict, &summary, counts)
                     .await?,
                 "completed",
             ),

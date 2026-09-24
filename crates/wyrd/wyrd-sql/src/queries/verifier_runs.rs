@@ -23,7 +23,7 @@ use sqlx::Error as SqlxError;
 use sqlx::types::{Json, Uuid};
 use wyrd_runtime::principal::PrincipalId;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::card::operator::MAX_SUMMARY_CHARS;
+use wyrd_spec::card::operator::{MAX_SUMMARY_CHARS, VerifierCounts};
 use wyrd_spec::ids::{
     BindingId, CardUid, OperatorDispatchId, VerificationResultId, VerificationRunId,
 };
@@ -203,8 +203,9 @@ const COMPLETE_RUN_SQL: &str = r#"
 /// Insert one Operator dispatch; the (tenant, run, Operator) key absorbs retries.
 ///
 /// The failure context is frozen here from the settled run and its exact
-/// Verifier and subject Cards plus the runner's bounded summary (`$5`), so
-/// every delivery attempt renders the same payload.
+/// Verifier and subject Cards plus the runner's bounded summary (`$5`) and
+/// the Verifier implementation's counts (`$6`), so every delivery attempt
+/// renders the same payload.
 const INSERT_DISPATCH_SQL: &str = r#"
     INSERT INTO wyrd.operator_dispatches (
         dispatch_id, data_tenant_id, run_id, operator_uid, operator_digest,
@@ -222,7 +223,8 @@ const INSERT_DISPATCH_SQL: &str = r#"
                'subject_ref', s.space || '/' || s.name || '@' || s.version,
                'verdict', 'failed',
                'completed_at', r.settled_at,
-               'summary', $5::text
+               'summary', $5::text,
+               'verifier', $6::jsonb
            ),
            statement_timestamp(), statement_timestamp(), statement_timestamp()
       FROM wyrd.verifier_runs r
@@ -1112,8 +1114,8 @@ impl VerifierRunQueue {
     /// PostgreSQL's statement time; the (tenant, run, Operator) key makes a
     /// settlement retry insert
     /// nothing new. Each dispatch freezes the bounded failure context built
-    /// from the settled run, its exact Cards, and `summary`, which is clipped
-    /// to [`MAX_SUMMARY_CHARS`]. Passed and inconclusive verdicts and direct
+    /// from the settled run, its exact Cards, `summary`, which is clipped
+    /// to [`MAX_SUMMARY_CHARS`], and the same result's `counts`. Passed and inconclusive verdicts and direct
     /// runs create no dispatch. The verdict itself is not stored: Bifrost owns
     /// it.
     ///
@@ -1128,6 +1130,7 @@ impl VerifierRunQueue {
         result_id: VerificationResultId,
         verdict: VerificationVerdict,
         summary: &str,
+        counts: VerifierCounts,
     ) -> Result<Settlement, SqlxError> {
         let settled: Option<(Option<Uuid>, Json<Vec<FrozenTarget>>)> =
             sqlx::query_as(COMPLETE_RUN_SQL)
@@ -1152,6 +1155,7 @@ impl VerifierRunQueue {
                     .bind(uid)
                     .bind(digest)
                     .bind(&summary)
+                    .bind(Json(counts))
                     .execute(&mut **conn.transaction())
                     .await?;
             }

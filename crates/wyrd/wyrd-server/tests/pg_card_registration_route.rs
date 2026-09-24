@@ -877,6 +877,9 @@ fn bound_agent_request(
 
 /// Reject every binding refusal at the authenticated route before any write.
 ///
+/// A `drift.*` template field on an Eval binding's inline or referenced
+/// Operator is refused with the offending binding field path.
+///
 /// Four branches are only reachable with a real registry behind them: the
 /// effective Operator and Trigger bodies come from previously registered
 /// Cards, the cross-tenant case depends on RLS, and the under-privileged case
@@ -995,6 +998,63 @@ async fn referenced_binding_refusals_leave_no_writes() {
         "binding-workflow-operator-agent",
     )
     .await;
+
+    seed_card(
+        &server,
+        tenant,
+        "Operator",
+        "binding-drift-counts-operator",
+        json!({ "kind": "http", "method": "post",
+                "url": "https://hooks.example.com/{{drift.total_features}}" }),
+        "active",
+    )
+    .await;
+    let kind_refusals = [
+        (
+            "referenced",
+            json!([{
+                "kind": "Operator", "name": "binding-drift-counts-operator",
+                "version": "1.0.0", "space": "default"
+            }]),
+        ),
+        (
+            "inline",
+            json!([{ "kind": "http", "method": "post",
+                     "url": "https://hooks.example.com/{{drift.drifted_features}}" }]),
+        ),
+    ];
+    for (shape, on_failure) in kind_refusals {
+        let agent = format!("binding-kind-{shape}-agent");
+        let operation = format!("binding-kind-{shape}-operation");
+        let refused = server
+            .oneshot_authenticated(
+                &jwt,
+                bound_agent_request(
+                    &agent,
+                    "binding-prompt",
+                    "binding-eval-verifier",
+                    "binding-observations-trigger",
+                    on_failure,
+                    &operation,
+                ),
+            )
+            .await
+            .expect("kind-mismatch registration responds");
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "{shape}");
+        let problem = response_json(refused).await;
+        assert_eq!(problem["code"], "WYRD_SPEC_400_INVALID_OPERATOR", "{shape}");
+        assert_eq!(
+            problem["details"]["field"], "spec.verified_by[0].on_failure[0].url",
+            "{shape}: {problem}"
+        );
+        assert!(
+            problem["details"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("drift.")),
+            "{shape}: {problem}"
+        );
+        assert_no_registration_writes(&server, &operation, &agent).await;
+    }
 
     let mismatch = server
         .oneshot_authenticated(

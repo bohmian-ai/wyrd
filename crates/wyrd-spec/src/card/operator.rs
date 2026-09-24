@@ -12,6 +12,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::card::verifier::VerifierImplementation;
 use crate::error::WyrdError;
 use crate::ids::{
     BindingId, CardUid, ConnectionName, OperatorDispatchId, VerificationResultId, VerificationRunId,
@@ -65,7 +66,11 @@ impl OperatorSpec {
     /// Validate the connection-independent shape of this Operator.
     ///
     /// Checks every `{{field}}` template against the closed failure-context
-    /// field set, requires a literal `https` (or loopback `http`) URL origin
+    /// field set. With `implementation`, the Operator is attached to a binding
+    /// of that exact Verifier, so a kind-specific field of another
+    /// implementation (for example `drift.*` under an Eval Verifier) is
+    /// refused; without it (a standalone Operator Card) every known field is
+    /// allowed. It also requires a literal `https` (or loopback `http`) URL origin
     /// with templates confined to its path and query, refuses server-owned
     /// headers, and refuses a custom auth header that is itself forbidden.
     /// Connection existence and authority are checked by the server, which
@@ -74,13 +79,18 @@ impl OperatorSpec {
     /// # Errors
     /// Returns [`WyrdError::SpecInvalidOperator`] naming `field` and the first
     /// violation found.
-    pub fn validate(&self, field: &str) -> Result<(), WyrdError> {
+    pub fn validate(
+        &self,
+        field: &str,
+        implementation: Option<&VerifierImplementation>,
+    ) -> Result<(), WyrdError> {
         let invalid = |at: &str, reason: String| WyrdError::SpecInvalidOperator {
             message: format!("{field}{at}: {reason}"),
             details: serde_json::json!({ "field": format!("{field}{at}"), "reason": reason }),
         };
+        let lookup = |name: &str| field_applies(name, implementation).then(String::new);
         let template = |at: &str, value: &str| {
-            render_template(value, |_| Some(String::new())).map_err(|reason| invalid(at, reason))
+            render_template(value, lookup).map_err(|reason| invalid(at, reason))
         };
         match &self.action {
             OperatorAction::Workflow { .. } => Ok(()),
@@ -140,7 +150,8 @@ impl OperatorSpec {
                     }
                 }
                 if let Some(body) = body {
-                    check_body_templates(body).map_err(|reason| invalid(".body", reason))?;
+                    check_body_templates(body, &lookup)
+                        .map_err(|reason| invalid(".body", reason))?;
                 }
                 match expect_status {
                     Some(status) if !(100..=599).contains(status) => Err(invalid(
@@ -410,11 +421,101 @@ pub struct OperatorFailureContext {
     pub completed_at: DateTime<Utc>,
     /// Bounded human-readable result summary.
     pub summary: String,
+    /// Aggregate counts of the failed run's Verifier implementation.
+    pub verifier: VerifierCounts,
+}
+
+/// Aggregate, count-only numbers of one failed run, per Verifier implementation.
+///
+/// Frozen into the failure context beside `summary` and derived from the same
+/// acknowledged result, so the two never disagree. Carries counts only: no
+/// feature names, feature rows, task inputs or outputs, or assertion detail.
+/// Templates reach these values as `drift.*` or `eval.*` fields, and a binding
+/// may only reference the block of its own Verifier implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(tag = "implementation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum VerifierCounts {
+    /// Counts of a failed Drift run.
+    Drift {
+        /// Features whose own verdict is `drift`.
+        drifted_features: u32,
+        /// Features scored in the report.
+        total_features: u32,
+    },
+    /// Counts of a failed Eval run.
+    Eval {
+        /// Tasks that passed.
+        passed_tasks: u32,
+        /// Tasks that ran and did not pass.
+        failed_tasks: u32,
+        /// Tasks that ran.
+        total_tasks: u32,
+        /// `floor(100 * passed / total)`, or `0` when no task ran.
+        pass_rate_percent: u32,
+    },
+}
+
+impl VerifierCounts {
+    /// Eval counts from `passed` of `total` tasks that ran.
+    ///
+    /// Derives `failed_tasks` and a pass rate rounded down, so a partial pass
+    /// never reads `100`. `passed` above `total` is clamped to `total`.
+    #[must_use]
+    pub fn eval(passed: u32, total: u32) -> Self {
+        let passed = passed.min(total);
+        let pass_rate_percent = if total == 0 {
+            0
+        } else {
+            u32::try_from(u64::from(passed) * 100 / u64::from(total))
+                .expect("invariant: a rate of at most 100 fits u32")
+        };
+        Self::Eval {
+            passed_tasks: passed,
+            failed_tasks: total - passed,
+            total_tasks: total,
+            pass_rate_percent,
+        }
+    }
+
+    /// The rendered value of one `drift.*` or `eval.*` field, or `None` when
+    /// the field is unknown or belongs to another implementation.
+    fn field(self, name: &str) -> Option<u32> {
+        match (self, name) {
+            (
+                Self::Drift {
+                    drifted_features, ..
+                },
+                "drift.drifted_features",
+            ) => Some(drifted_features),
+            (Self::Drift { total_features, .. }, "drift.total_features") => Some(total_features),
+            (Self::Eval { passed_tasks, .. }, "eval.passed_tasks") => Some(passed_tasks),
+            (Self::Eval { failed_tasks, .. }, "eval.failed_tasks") => Some(failed_tasks),
+            (Self::Eval { total_tasks, .. }, "eval.total_tasks") => Some(total_tasks),
+            (
+                Self::Eval {
+                    pass_rate_percent, ..
+                },
+                "eval.pass_rate_percent",
+            ) => Some(pass_rate_percent),
+            _ => None,
+        }
+    }
+}
+
+/// Whether template field `name` may be used by an Operator bound to
+/// `implementation`; every field applies to a standalone Operator (`None`).
+fn field_applies(name: &str, implementation: Option<&VerifierImplementation>) -> bool {
+    !matches!(
+        (name.split_once('.').map(|(kind, _)| kind), implementation),
+        (Some("drift"), Some(VerifierImplementation::Eval(_)))
+            | (Some("eval"), Some(VerifierImplementation::Drift(_)))
+    )
 }
 
 impl OperatorFailureContext {
     /// Every placeholder name a template may reference.
-    pub const FIELDS: [&'static str; 11] = [
+    pub const FIELDS: [&'static str; 17] = [
         "dispatch_id",
         "run_id",
         "result_id",
@@ -426,9 +527,16 @@ impl OperatorFailureContext {
         "verdict",
         "completed_at",
         "summary",
+        "drift.drifted_features",
+        "drift.total_features",
+        "eval.passed_tasks",
+        "eval.failed_tasks",
+        "eval.total_tasks",
+        "eval.pass_rate_percent",
     ];
 
-    /// The rendered value of one placeholder, or `None` for an unknown name.
+    /// The rendered value of one placeholder, or `None` for an unknown name
+    /// or a kind-specific field of another Verifier implementation.
     #[must_use]
     pub fn field(&self, name: &str) -> Option<String> {
         Some(match name {
@@ -443,7 +551,7 @@ impl OperatorFailureContext {
             "verdict" => <&'static str>::from(self.verdict).to_owned(),
             "completed_at" => self.completed_at.to_rfc3339(),
             "summary" => self.summary.clone(),
-            _ => return None,
+            _ => return self.verifier.field(name).map(|count| count.to_string()),
         })
     }
 
@@ -483,7 +591,9 @@ pub fn render_template(
                 OperatorFailureContext::FIELDS.join(", ")
             ));
         }
-        out.push_str(&lookup(name).ok_or_else(|| format!("unknown template field {name:?}"))?);
+        out.push_str(&lookup(name).ok_or_else(|| {
+            format!("template field {name:?} does not apply to this Verifier implementation")
+        })?);
         rest = &after[end + 2..];
     }
     out.push_str(rest);
@@ -528,12 +638,19 @@ fn check_header_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Validate every string template inside a JSON body.
-fn check_body_templates(value: &Value) -> Result<(), String> {
+/// Validate every string template inside a JSON body through `lookup`.
+fn check_body_templates(
+    value: &Value,
+    lookup: &impl Fn(&str) -> Option<String>,
+) -> Result<(), String> {
     match value {
-        Value::String(text) => render_template(text, |_| Some(String::new())).map(drop),
-        Value::Array(items) => items.iter().try_for_each(check_body_templates),
-        Value::Object(map) => map.values().try_for_each(check_body_templates),
+        Value::String(text) => render_template(text, lookup).map(drop),
+        Value::Array(items) => items
+            .iter()
+            .try_for_each(|item| check_body_templates(item, lookup)),
+        Value::Object(map) => map
+            .values()
+            .try_for_each(|item| check_body_templates(item, lookup)),
         _ => Ok(()),
     }
 }
@@ -576,6 +693,75 @@ mod tests {
         assert!(render_template("{{run_id", |_| Some(String::new())).is_err());
     }
 
+    /// Eval counts derive failures and a pass rate that rounds down, never
+    /// reading 100 for a partial pass, and read 0 when no task ran.
+    #[test]
+    fn eval_counts_round_the_pass_rate_down() {
+        assert_eq!(
+            VerifierCounts::eval(999, 1000),
+            VerifierCounts::Eval {
+                passed_tasks: 999,
+                failed_tasks: 1,
+                total_tasks: 1000,
+                pass_rate_percent: 99,
+            }
+        );
+        assert_eq!(
+            VerifierCounts::eval(0, 0),
+            VerifierCounts::Eval {
+                passed_tasks: 0,
+                failed_tasks: 0,
+                total_tasks: 0,
+                pass_rate_percent: 0,
+            }
+        );
+    }
+
+    /// Kind fields render from the frozen counts; a field of the other
+    /// implementation does not render, and a binding of that implementation
+    /// refuses it while a standalone Operator accepts every known field.
+    #[test]
+    fn kind_fields_follow_the_verifier_implementation() {
+        let counts = VerifierCounts::Drift {
+            drifted_features: 3,
+            total_features: 20,
+        };
+        let rendered = render_template(
+            "{{drift.drifted_features}}/{{ drift.total_features }}",
+            |name| counts.field(name).map(|count| count.to_string()),
+        )
+        .expect("drift fields render");
+        assert_eq!(rendered, "3/20");
+        let refusal = render_template("{{eval.total_tasks}}", |name| {
+            counts.field(name).map(|count| count.to_string())
+        })
+        .expect_err("an eval field does not render from drift counts");
+        assert!(refusal.contains("does not apply"), "{refusal}");
+
+        let eval: VerifierImplementation =
+            serde_json::from_value(serde_json::json!({ "kind": "eval", "spec": { "tasks": {} } }))
+                .expect("test_setup: eval implementation parses");
+        let drift_hook = http(
+            "https://hooks.example.com/{{drift.total_features}}",
+            serde_json::json!({}),
+            Value::Null,
+        );
+        assert!(drift_hook.validate("spec", None).is_ok());
+        let error = drift_hook
+            .validate("spec", Some(&eval))
+            .expect_err("an eval binding refuses a drift field");
+        assert!(
+            error.to_string().contains("drift.total_features"),
+            "{error}"
+        );
+        let eval_hook = http(
+            "https://hooks.example.com/{{eval.pass_rate_percent}}",
+            serde_json::json!({}),
+            Value::Null,
+        );
+        assert!(eval_hook.validate("spec", Some(&eval)).is_ok());
+    }
+
     /// Slack, PagerDuty, and HTTP Operators validate; each violation is refused.
     #[test]
     fn validate_refuses_each_shape_violation() {
@@ -583,14 +769,14 @@ mod tests {
             "kind": "notify",
             "channel": { "kind": "slack", "connection": "ops-slack", "channel_id": "C1", "text": "{{verifier_ref}} failed" }
         }));
-        assert!(slack.validate("spec").is_ok());
+        assert!(slack.validate("spec", None).is_ok());
         let bad_slack = spec(serde_json::json!({
             "kind": "notify",
             "channel": { "kind": "slack", "connection": "ops-slack", "channel_id": "C1", "text": "{{env.TOKEN}}" }
         }));
         assert_eq!(
             bad_slack
-                .validate("spec")
+                .validate("spec", None)
                 .expect_err("unknown field")
                 .code(),
             "WYRD_SPEC_400_INVALID_OPERATOR"
@@ -599,7 +785,7 @@ mod tests {
             "kind": "notify",
             "channel": { "kind": "pager_duty", "connection": "pagerduty", "route": "team-a", "severity": "error", "summary": "{{summary}}" }
         }));
-        assert!(pager.validate("spec").is_ok());
+        assert!(pager.validate("spec", None).is_ok());
 
         let auth =
             serde_json::json!({ "scheme": "header", "name": "X-Api-Key", "connection": "hooks" });
@@ -609,7 +795,7 @@ mod tests {
                 serde_json::json!({}),
                 auth.clone()
             )
-            .validate("spec")
+            .validate("spec", None)
             .is_ok()
         );
         for (url, headers, auth) in [
@@ -649,7 +835,10 @@ mod tests {
                 serde_json::json!({ "scheme": "header", "name": "Host", "connection": "hooks" }),
             ),
         ] {
-            assert!(http(url, headers, auth).validate("spec").is_err(), "{url}");
+            assert!(
+                http(url, headers, auth).validate("spec", None).is_err(),
+                "{url}"
+            );
         }
     }
 

@@ -633,7 +633,8 @@ async fn failed_verdict_fans_out_to_every_provider_independently() {
 /// with no Card revision.
 ///
 /// # Panics
-/// Panics when the retry schedule, rotation, or rewrap differs.
+/// Panics when the retry schedule, rotation, rewrap, or frozen kind counts
+/// differ between attempts.
 #[tokio::test]
 async fn next_attempt_on_another_replica_uses_the_rotated_credential() {
     let delivery = Delivery::start().await;
@@ -649,7 +650,14 @@ async fn next_attempt_on_another_replica_uses_the_rotated_credential() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
         .mount(&delivery.mock)
         .await;
-    let posted = delivery.operator("posted", slack("C0123456789")).await;
+    let posted = delivery
+        .operator(
+            "posted",
+            json!({ "kind": "notify", "channel": { "kind": "slack", "connection": "ops-slack",
+                    "channel_id": "C0123456789",
+                    "text": "{{drift.drifted_features}}/{{drift.total_features}} drifted" } }),
+        )
+        .await;
     delivery.fail_binding("owner", &[&posted]).await;
     let first = delivery.spawn(
         delivery.server.state(),
@@ -739,9 +747,13 @@ async fn next_attempt_on_another_replica_uses_the_rotated_credential() {
     }
     second.stop().await;
     assert_eq!(rows[&posted.as_uuid()].attempts, 2);
-    let tokens: Vec<String> = delivery
-        .requests("/slack")
-        .await
+    let posts = delivery.requests("/slack").await;
+    let texts: Vec<Value> = posts
+        .iter()
+        .map(|post| post.body_json::<Value>().expect("slack body")["text"].clone())
+        .collect();
+    assert_eq!(texts, vec![json!("1/1 drifted"), json!("1/1 drifted")]);
+    let tokens: Vec<String> = posts
         .iter()
         .filter_map(|post| {
             post.headers
@@ -933,6 +945,58 @@ async fn revoked_connection_fails_closed_and_key_outage_retries() {
             .expect("recorded")
             .is_empty(),
         "no provider is called without an authorized, decrypted credential"
+    );
+}
+
+/// A Slack template referencing `drift.*` fields renders the frozen counts of
+/// the failed Drift run, agreeing with its server-written `summary`.
+///
+/// # Panics
+/// Panics when the dispatch is not delivered or the posted text differs.
+#[tokio::test]
+async fn drift_counts_render_into_the_slack_message() {
+    let delivery = Delivery::start().await;
+    Mock::given(method("POST"))
+        .and(path("/slack"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
+        .mount(&delivery.mock)
+        .await;
+    let posted = delivery
+        .operator(
+            "counted",
+            json!({ "kind": "notify", "channel": { "kind": "slack", "connection": "ops-slack",
+                    "channel_id": "C0123456789",
+                    "text": "{{drift.drifted_features}}/{{drift.total_features}} drifted | {{summary}}" } }),
+        )
+        .await;
+    delivery.fail_binding("owner", &[&posted]).await;
+    let running = delivery.spawn(
+        delivery.server.state(),
+        Delivery::limits(),
+        &failing_script(1),
+        &CapabilityCrash::default(),
+    );
+    let run = delivery.new_run(&[]).await;
+    let rows = delivery
+        .wait_dispatches(run, 1, |row| {
+            row.status != "pending" && row.status != "running"
+        })
+        .await;
+    running.stop().await;
+    assert!(
+        rows.values().all(|row| row.status == "delivered"),
+        "{rows:?}"
+    );
+    let sent: Vec<Value> = delivery
+        .requests("/slack")
+        .await
+        .iter()
+        .map(|request| serde_json::from_slice(&request.body).expect("slack body is JSON"))
+        .collect();
+    assert_eq!(
+        sent,
+        [json!({ "channel": "C0123456789",
+                 "text": "1/1 drifted | Drift verdict Drift: 1 of 1 features drifted." })]
     );
 }
 

@@ -13,6 +13,7 @@
     "subject_uid",
     "summary",
     "verdict",
+    "verifier",
     "verifier_ref",
     "verifier_uid"
   ],
@@ -66,6 +67,14 @@
         }
       ]
     },
+    "verifier": {
+      "description": "Aggregate counts of the failed run's Verifier implementation.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/VerifierCounts"
+        }
+      ]
+    },
     "verifier_ref": {
       "description": "Exact Verifier identity as `space/name@version`.",
       "type": "string"
@@ -108,6 +117,85 @@
           "enum": [
             "inconclusive"
           ]
+        }
+      ]
+    },
+    "VerifierCounts": {
+      "description": "Aggregate, count-only numbers of one failed run, per Verifier implementation.\n\nFrozen into the failure context beside `summary` and derived from the same acknowledged result, so the two never disagree. Carries counts only: no feature names, feature rows, task inputs or outputs, or assertion detail. Templates reach these values as `drift.*` or `eval.*` fields, and a binding may only reference the block of its own Verifier implementation.",
+      "oneOf": [
+        {
+          "description": "Counts of a failed Drift run.",
+          "type": "object",
+          "required": [
+            "drifted_features",
+            "implementation",
+            "total_features"
+          ],
+          "properties": {
+            "drifted_features": {
+              "description": "Features whose own verdict is `drift`.",
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "implementation": {
+              "type": "string",
+              "enum": [
+                "drift"
+              ]
+            },
+            "total_features": {
+              "description": "Features scored in the report.",
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Counts of a failed Eval run.",
+          "type": "object",
+          "required": [
+            "failed_tasks",
+            "implementation",
+            "pass_rate_percent",
+            "passed_tasks",
+            "total_tasks"
+          ],
+          "properties": {
+            "failed_tasks": {
+              "description": "Tasks that ran and did not pass.",
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "implementation": {
+              "type": "string",
+              "enum": [
+                "eval"
+              ]
+            },
+            "pass_rate_percent": {
+              "description": "`floor(100 * passed / total)`, or `0` when no task ran.",
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "passed_tasks": {
+              "description": "Tasks that passed.",
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "total_tasks": {
+              "description": "Tasks that ran.",
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            }
+          },
+          "additionalProperties": false
         }
       ]
     }

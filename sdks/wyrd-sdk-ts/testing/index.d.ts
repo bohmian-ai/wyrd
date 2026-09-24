@@ -60,6 +60,35 @@ export declare class NativeWyrdTestServer {
    */
   flushBifrost(): void
   /**
+   * Bring binding `binding_id`'s schedule cursor to database time, so the
+   * verification runtime schedules its next occurrence now.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the harness is closed, `binding_id` is not a
+   * binding ID, or the update fails.
+   */
+  makeBindingDue(bindingId: string): void
+  /**
+   * Every verification run ID of the fixture tenant, oldest first.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the harness is closed or the runs cannot be
+   * read.
+   */
+  verificationRuns(): Array<string>
+  /**
+   * Strip the fitted-profile format from Verifier `verifier_uid`'s ready
+   * baseline, as a baseline fitted under earlier semantics is stored.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the harness is closed, `verifier_uid` is not
+   * a Card UID, or no ready baseline exists.
+   */
+  retireFittedFormat(verifierUid: string): void
+  /**
    * Provision one canonical built-in table for the fixture tenant.
    *
    * A canonical signal ledger is server-owned, so a journey cannot register

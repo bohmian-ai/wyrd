@@ -191,11 +191,12 @@ spec:
   return (await cards.registerFromPath(path)).root;
 }
 
-/** Poll `runId` as the subject until it leaves the active states, and require completion. */
+/** Poll `runId` as the subject until it leaves the active states, and require `expected`. */
 async function settle(
   server: NativeWyrdTestServer,
   service: CardRef,
   runId: string,
+  expected = "completed",
 ): Promise<Awaited<ReturnType<Verification["getRun"]>>> {
   const verification = Verification.connect({
     serverUrl: server.baseUrl,
@@ -208,8 +209,29 @@ async function settle(
     await new Promise((resolve) => setTimeout(resolve, 100));
     status = await verification.getRun(runId);
   }
-  expect(status.status, JSON.stringify(status)).toBe("completed");
+  expect(status.status, JSON.stringify(status)).toBe(expected);
   return status;
+}
+
+/**
+ * Make `bindingId` due and return the one run its occurrence schedules.
+ *
+ * Dueness is PostgreSQL's decision, so the test harness places the schedule
+ * cursor at statement time and the verification runtime schedules the
+ * occurrence; the daily window `[midnight UTC, now)` holds this journey's rows.
+ */
+async function scheduledRun(server: NativeWyrdTestServer, bindingId: string): Promise<string> {
+  const earlier = new Set(server.verificationRuns());
+  server.makeBindingDue(bindingId);
+  const deadline = Date.now() + WAIT_MS;
+  let runs = server.verificationRuns().filter((run) => !earlier.has(run));
+  while (runs.length === 0) {
+    expect(Date.now() < deadline, "the due binding never scheduled a run").toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    runs = server.verificationRuns().filter((run) => !earlier.has(run));
+  }
+  expect(runs).toHaveLength(1);
+  return runs[0] ?? "";
 }
 
 /** Issue the subject Service's own key, whose Card scope covers its manual runs. */
@@ -405,18 +427,14 @@ describe("drift method edge journey", () => {
       expect(outcome.features).toEqual(["latency/Spc/no_drift"]);
       assertSpcEvidence(outcome.result.details, 2, 0);
       await emitRows(server, cards, calm, join(bundles, "calm-partial"), latencies([50, 50]));
-      outcome = await run(spc, calm);
-      expect(outcome.result.verdict, "a trailing partial subgroup").toBe("inconclusive");
-      expect(outcome.features).toEqual(["latency/Spc/inconclusive"]);
+      assertUnscored(await run(spc, calm));
 
       const sparse = await subject(cards, root, "ts-edge-sparse");
       await emitRows(server, cards, sparse, join(bundles, "sparse"), baselineLike.slice(0, 3));
       outcome = await run(psi, sparse);
       expect(outcome.result.verdict).toBe("inconclusive");
       expect(outcome.features).toEqual(["latency/Psi/inconclusive", "tier/Psi/inconclusive"]);
-      outcome = await run(spc, sparse);
-      expect(outcome.result.verdict).toBe("inconclusive");
-      expect(outcome.features).toEqual(["latency/Spc/inconclusive"]);
+      assertUnscored(await run(spc, sparse));
 
       const gappy = await subject(cards, root, "ts-edge-gappy");
       await emitRows(server, cards, gappy, join(bundles, "gappy"), baselineLike);
@@ -440,10 +458,32 @@ describe("drift method edge journey", () => {
         input: { kind: "drift_window", start: start.toISOString(), end: end.toISOString() },
       });
       const failed = await settle(server, bound, bindingRun);
-      expect(failed.dispatches, "a failed binding result dispatches its Operator").toHaveLength(1);
+      const scheduled = await settle(server, bound, await scheduledRun(server, bindingIds?.[0] ?? ""));
+      for (const status of [failed, scheduled]) {
+        expect(status.dispatches, "a failed binding result dispatches its Operator").toHaveLength(1);
+        outcome = await readResult(server, query, status.result_id ?? "");
+        expect(outcome.result.verdict).toBe("failed");
+        expect(outcome.features).toEqual(["latency/Spc/drift"]);
+        assertSpcEvidence(outcome.result.details, 4, 4);
+      }
+
+      server.retireFittedFormat(spc.uid ?? "");
+      const refused = await settle(
+        server,
+        calm,
+        await Verification.connect({
+          serverUrl: server.baseUrl,
+          credential: subjectCredential(server, calm),
+        }).startRun({
+          target: { kind: "verifier", verifier_uid: spc.uid ?? "", subject_card_uid: calm.uid ?? "" },
+          input: { kind: "drift_window", start: start.toISOString(), end: end.toISOString() },
+        }),
+        "errored",
+      );
+      expect(refused.error?.code, JSON.stringify(refused)).toBe("baseline_legacy");
+      expect(refused.result_id ?? null, "a refused legacy run is never scored").toBeNull();
       outcome = await readResult(server, query, failed.result_id ?? "");
-      expect(outcome.result.verdict).toBe("failed");
-      expect(outcome.features).toEqual(["latency/Spc/drift"]);
+      expect(outcome.result.verdict, "the historical result stays readable").toBe("failed");
       assertSpcEvidence(outcome.result.details, 4, 4);
 
       const retired = join(root, "ts-edge-weco.yaml");

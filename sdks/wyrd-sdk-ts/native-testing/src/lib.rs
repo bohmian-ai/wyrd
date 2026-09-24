@@ -157,6 +157,77 @@ impl NativeWyrdTestServer {
             .map_err(|error| napi::Error::from_reason(error.to_string()))
     }
 
+    /// Bring binding `binding_id`'s schedule cursor to database time, so the
+    /// verification runtime schedules its next occurrence now.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the harness is closed, `binding_id` is not a
+    /// binding ID, or the update fails.
+    #[napi]
+    pub fn make_binding_due(&self, binding_id: String) -> Result<()> {
+        let binding = binding_id
+            .parse::<wyrd_spec::ids::BindingId>()
+            .map_err(reason)?;
+        let fixture = self.verification_fixture()?;
+        wyrd_runtime::runtime()
+            .block_on(fixture.make_binding_due(binding))
+            .map_err(reason)
+    }
+
+    /// Every verification run ID of the fixture tenant, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the harness is closed or the runs cannot be
+    /// read.
+    #[napi]
+    pub fn verification_runs(&self) -> Result<Vec<String>> {
+        let fixture = self.verification_fixture()?;
+        let runs = wyrd_runtime::runtime()
+            .block_on(fixture.runs())
+            .map_err(reason)?;
+        Ok(runs.iter().map(ToString::to_string).collect())
+    }
+
+    /// Strip the fitted-profile format from Verifier `verifier_uid`'s ready
+    /// baseline, as a baseline fitted under earlier semantics is stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the harness is closed, `verifier_uid` is not
+    /// a Card UID, or no ready baseline exists.
+    #[napi]
+    pub fn retire_fitted_format(&self, verifier_uid: String) -> Result<()> {
+        let verifier = verifier_uid
+            .parse::<wyrd_spec::ids::CardUid>()
+            .map_err(reason)?;
+        let fixture = self.verification_fixture()?;
+        wyrd_runtime::runtime()
+            .block_on(fixture.retire_fitted_format(&verifier))
+            .map_err(reason)
+    }
+
+    /// Open the open server's verification fixture, which owns its own
+    /// Postgres handle and so outlives the harness lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the harness lock is poisoned, the server is
+    /// shut down, or the fixture tenant cannot be provisioned.
+    fn verification_fixture(&self) -> Result<wyrd_testing::verification::VerificationFixture> {
+        let guard = self
+            .server
+            .lock()
+            .map_err(|_| napi::Error::from_reason("test server lock poisoned".to_owned()))?;
+        let server = guard
+            .as_ref()
+            .ok_or_else(|| napi::Error::from_reason("test server is shut down".to_owned()))?;
+        wyrd_runtime::runtime()
+            .block_on(server.verification_fixture())
+            .map_err(reason)
+    }
+
     /// Provision one canonical built-in table for the fixture tenant.
     ///
     /// A canonical signal ledger is server-owned, so a journey cannot register
@@ -587,4 +658,9 @@ async fn start_test_server_async(
         api_key: secrecy::ExposeSecret::expose_secret(&api_key).to_owned(),
         card_ref,
     })
+}
+
+/// Convert a harness failure into a napi error carrying its message.
+fn reason(error: impl std::fmt::Display) -> napi::Error {
+    napi::Error::from_reason(error.to_string())
 }

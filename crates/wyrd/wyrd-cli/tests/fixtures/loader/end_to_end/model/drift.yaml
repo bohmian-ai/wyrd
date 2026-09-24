@@ -29,6 +29,7 @@ spec:
         binning_strategy:
           kind: Quantile
           n_bins: 10
+        categorical_features: [contract_type]
         threshold:
           kind: Fixed
           value: 0.2

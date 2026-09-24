@@ -216,11 +216,15 @@ Non-goals remain excluded: no client aggregation, raw-value download, user SQL,
 profile MemTable, Drift scheduler, Alert table, fabricated pre-scoring report,
 or SPC algorithm change.
 
-Material limits: the CLI card-lifecycle fixtures now declare Parquet baselines
-(with feature columns) for registration, but carry no genuine Parquet bytes;
-those journeys run without the verification runtime, so their baselines are never
-fitted. The fitter's missing- or invalid-artifact path (`BASELINE_ARTIFACT_INVALID`)
-is covered by code but not by a journey.
+CLI fixture baselines: `typed_state/training.yaml` and
+`end_to_end_prerequisites/churn-classifier-data.yaml` carry genuine Parquet
+artifacts at `data/data.parquet` (100 rows; digests, sizes, and schemas match), and
+`churn-classifier-drift` declares `contract_type` categorical. Both CLI journeys
+run with the verification runtime and wait for their Drift baselines to fit
+`ready` (`wait_baseline_ready` in `card_lifecycle.rs`); the canonical journey now
+uses a bound server, because an in-process server that is never bound runs no
+background capability. Material limit: the fitter's missing- or invalid-artifact
+path (`BASELINE_ARTIFACT_INVALID`) is covered by code but not by a journey.
 
 ## Failure Diagnoses
 
@@ -235,7 +239,8 @@ fixture Verifier has no profile (`drift.rs` "no profile"). Fix site: fixtures on
 (`585fdbbd`): Parquet interface plus feature columns; the runtime test is re-pinned
 as `unscorable_verifier_errors_without_publishing`. Independent read-only
 diagnostician: cause and fix site confirmed; runtime fix CORRECT. It rated the
-fixtures INCOMPLETE (no genuine Parquet bytes); accepted as the material limit above.
+fixtures INCOMPLETE (no genuine Parquet bytes); remediated with real Parquet
+artifacts and fit-to-`ready` assertions in both CLI journeys.
 
 **`test:bifrost` integration:redux, `multi_plan_success_counts_all_committed_volume_once`.**
 Symptom: final assertion 25 != 30; passes in isolation. Evidence: the extra-pass

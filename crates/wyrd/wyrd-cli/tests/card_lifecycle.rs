@@ -187,7 +187,7 @@ impl RuntimeServiceFixture {
     const FILES: &[&str] = &[
         "primary.bin",
         "shadow.bin",
-        "training.bin",
+        "data/data.parquet",
         "triage-prompt.yaml",
         "model-primary.yaml",
         "model-shadow.yaml",
@@ -562,6 +562,7 @@ mod pg_tests {
     use tokio::task::JoinHandle;
     use wyrd_client::WyrdClient;
     use wyrd_client::auth::AuthMiddleware;
+    use wyrd_client::cards::CardSelector;
     use wyrd_client::config::ClientConfig;
     use wyrd_client::transport::{HttpTransport, ResolvedCredential};
     use wyrd_testing::Bootstrap;
@@ -615,6 +616,41 @@ mod pg_tests {
         shutdown.cancel();
         serve_handle.await.expect("CLI test server joins");
         server.shutdown().await.expect("test server shuts down");
+    }
+
+    /// Poll a Drift Verifier's served Card status until its baseline is fitted.
+    ///
+    /// Proves the fixture baseline Data carries a genuine, fittable Parquet
+    /// artifact: the server's fitter reads it from storage and settles the
+    /// baseline `ready`.
+    ///
+    /// # Panics
+    /// Panics when the Verifier cannot be read, serves no baseline status,
+    /// the fit fails, or the baseline is not ready within 90 seconds.
+    async fn wait_baseline_ready(cards: &Cards, verifier: serde_json::Value) {
+        let verifier: CardRef = serde_json::from_value(verifier).expect("verifier CardRef parses");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(90);
+        loop {
+            let baseline = cards
+                .get(CardSelector::exact(verifier.clone()))
+                .await
+                .expect("drift verifier reads")
+                .status
+                .and_then(|status| status.verification)
+                .and_then(|verification| verification.baseline)
+                .expect("a PSI Verifier serves baseline status");
+            match baseline.state.as_str() {
+                "ready" => return,
+                "failed" => panic!("{} baseline failed to fit: {baseline:?}", verifier.name),
+                _ => {}
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{} baseline never fitted: {baseline:?}",
+                verifier.name
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
 
     /// Build the public registry handle used by the CLI journey's dependency
@@ -707,7 +743,10 @@ mod pg_tests {
         for (alias, expected) in [
             ("model_primary", b"primary-model\n".as_slice()),
             ("model_shadow", b"shadow-model\n".as_slice()),
-            ("default-Data-training-1.0.0", b"training-data\n".as_slice()),
+            (
+                "default-Data-training-1.0.0",
+                include_bytes!("fixtures/card_lifecycle/typed_state/data/data.parquet").as_slice(),
+            ),
         ] {
             let artifact = state.artifacts(alias).expect("artifact list resolves");
             assert_eq!(artifact.len(), 1, "{alias} has one fixture artifact");
@@ -1224,7 +1263,9 @@ mod pg_tests {
     #[tokio::test]
     async fn cli_bundle_loads_typed_wyrdstate_after_server_shutdown() {
         let fixture = RuntimeServiceFixture::new().expect("typed fixture copies");
-        let server = WyrdTestServer::start_bound()
+        let server = WyrdTestServer::builder()
+            .with_verification_runtime_for_test()
+            .start_bound()
             .await
             .expect("bound WyrdTestServer starts");
         let base_url = server
@@ -1261,6 +1302,11 @@ mod pg_tests {
         )
         .await;
         let receipt = apply.expect("CLI apply succeeds");
+        wait_baseline_ready(
+            &cards,
+            json!({"kind": "Verifier", "name": "model-drift", "version": "1.0.0", "space": "default"}),
+        )
+        .await;
         let service_ref = exact_root_ref(&receipt).expect("apply root is an exact CardRef");
         assert_eq!(service_ref.kind, wyrd_spec::envelope::CardKind::Service);
         assert_eq!(service_ref.name.as_str(), "typed-service");
@@ -1416,7 +1462,15 @@ mod pg_tests {
         let plan: Value = serde_json::from_slice(&plan.stdout).expect("plan output is JSON");
         assert_eq!(plan["cards"].as_array().map(Vec::len), Some(11));
 
-        let (server, base_url, _storage_root, shutdown, serve_handle) = start_cli_server().await;
+        let server = WyrdTestServer::builder()
+            .with_verification_runtime_for_test()
+            .start_bound()
+            .await
+            .expect("bound WyrdTestServer starts");
+        let base_url = server
+            .base_url()
+            .expect("bound server exposes base URL")
+            .to_owned();
         let Bootstrap::User { jwt, .. } = server
             .bootstrap_user("canonical-directory-writer", &["writer"])
             .await
@@ -1466,6 +1520,16 @@ mod pg_tests {
         .await
         .expect("canonical authored directory applies");
         assert_eq!(receipt["outcomes"].as_array().map(Vec::len), Some(11));
+        wait_baseline_ready(
+            &public_cards_client(&base_url, &jwt),
+            json!({
+                "kind": "Verifier",
+                "name": "churn-classifier-drift",
+                "version": "1.0.0",
+                "space": "wyrd-team",
+            }),
+        )
+        .await;
         let service_ref = exact_root_ref(&receipt).expect("receipt root is an exact CardRef");
         assert_eq!(service_ref.kind, wyrd_spec::envelope::CardKind::Service);
         assert_eq!(service_ref.name.as_str(), "churn-response-service");
@@ -1554,7 +1618,7 @@ mod pg_tests {
             }
         }
 
-        stop_cli_server(server, shutdown, serve_handle).await;
+        server.shutdown().await.expect("test server shuts down");
     }
 
     /// Prove real registry output hydrates into runtime state and rejects metadata-only output.

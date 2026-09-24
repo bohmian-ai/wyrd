@@ -3795,6 +3795,9 @@ impl WyrdTestServerBuilder {
 
     /// Compose the production verification runtime when this server binds.
     ///
+    /// Only a bound server runs it: a server from [`Self::start_in_process`]
+    /// that is never bound serves no background capability.
+    ///
     /// Default off: the scheduler and runner otherwise claim queue work in the
     /// background and race journeys that drive the queue directly. Only a
     /// journey proving the production composition opts in.

@@ -131,7 +131,7 @@
     font: 600 18px var(--font-sans);
   }
   .product {
-    font: 700 10px var(--font-mono);
+    font: var(--weight-strong) 10px var(--font-mono);
     border: 2px solid var(--border);
     border-radius: var(--r);
     padding: 4px 12px;
@@ -154,7 +154,7 @@
     padding-top: 8px;
   }
   h1 {
-    font: 700 26px var(--font-sans);
+    font: var(--weight-strong) 26px var(--font-sans);
     text-align: center;
   }
   .intro {

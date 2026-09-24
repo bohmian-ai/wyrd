@@ -30,7 +30,7 @@
     gap: 4px;
     font-family: var(--fm);
     font-size: 8.5px;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
     letter-spacing: 0.5px;
     text-transform: uppercase;
     padding: 3px 7px;

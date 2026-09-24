@@ -106,7 +106,7 @@
     border-bottom: 2px solid var(--border);
   }
   h1 {
-    font: 700 24px var(--font-sans);
+    font: var(--weight-strong) 24px var(--font-sans);
   }
   .heading p {
     font: 12px var(--font-sans);
@@ -222,7 +222,7 @@
   /* Every row leads with its human-readable title; identifiers live in the muted column. */
   .attention-table a,
   .changes-table a {
-    font-weight: 700;
+    font-weight: var(--weight-strong);
   }
   table {
     table-layout: fixed;
@@ -295,7 +295,7 @@
   .summary a {
     color: var(--declare);
     text-decoration: none;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
   }
   .summary {
     padding: 0 4px;
@@ -303,7 +303,7 @@
   }
   .summary strong {
     display: block;
-    font: 700 22px/26px var(--font-sans);
+    font: var(--weight-strong) 22px/26px var(--font-sans);
     margin-bottom: 4px;
   }
   .summary p,

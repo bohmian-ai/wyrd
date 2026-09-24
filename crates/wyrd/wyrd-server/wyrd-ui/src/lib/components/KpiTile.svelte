@@ -43,7 +43,7 @@
     overflow-wrap: anywhere;
     font-family: var(--fm);
     font-size: 22px;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
     color: var(--text);
     margin-top: 2px;
   }

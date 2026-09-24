@@ -8,15 +8,15 @@
   --sep: color-mix(in srgb, var(--border) 30%, var(--surface));
 }
 .observe h1 {
-  font: 700 26px var(--font-sans);
+  font: var(--weight-strong) 26px var(--font-sans);
   margin: 0 0 10px;
 }
 .observe h2 {
-  font: 700 16px var(--font-sans);
+  font: var(--weight-strong) 16px var(--font-sans);
   margin: 0 0 12px;
 }
 .observe h3 {
-  font: 700 14px var(--font-sans);
+  font: var(--weight-strong) 14px var(--font-sans);
   margin: 0 0 8px;
 }
 .observe p {
@@ -69,7 +69,7 @@
   border-radius: var(--r);
   background: var(--surface);
   color: var(--text);
-  font: 700 11px var(--font-mono);
+  font: var(--weight-strong) 11px var(--font-mono);
   padding: 7px 11px;
   cursor: pointer;
   text-decoration: none;
@@ -157,7 +157,7 @@
   border-bottom: 2px solid var(--border);
   padding: 8px 0;
   margin-bottom: 24px;
-  font: 700 11px var(--font-mono);
+  font: var(--weight-strong) 11px var(--font-mono);
 }
 .observe .nav a {
   padding: 8px 12px;
@@ -341,7 +341,7 @@
 }
 .observe .waterfall .span-row .dur.err {
   color: var(--danger);
-  font-weight: 700;
+  font-weight: var(--weight-strong);
 }
 
 /* Service graph: nodes joined by plain or error edges. */
@@ -357,7 +357,7 @@
   border-radius: var(--r);
   background: var(--surface-2);
   padding: 6px 12px;
-  font: 700 11px var(--font-mono);
+  font: var(--weight-strong) 11px var(--font-mono);
   color: var(--text);
   text-decoration: none;
 }
@@ -403,7 +403,7 @@
   border-radius: var(--r);
   padding: 7px 12px;
   background: var(--surface-2);
-  font: 700 11px var(--font-mono);
+  font: var(--weight-strong) 11px var(--font-mono);
 }
 .observe .stages .stage[data-tone='danger'] {
   background: color-mix(in srgb, var(--danger) 14%, var(--surface));
@@ -452,7 +452,7 @@
   background: var(--surface-2);
 }
 .observe .score .n {
-  font: 700 30px var(--font-sans);
+  font: var(--weight-strong) 30px var(--font-sans);
 }
 .observe .score .n.fail {
   color: var(--danger);

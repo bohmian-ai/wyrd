@@ -248,7 +248,7 @@
   .tag {
     font-family: var(--font-mono);
     font-size: 10px;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
     letter-spacing: 2px;
     color: #fff;
     padding: 8px 18px;

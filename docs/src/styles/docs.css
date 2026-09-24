@@ -78,7 +78,7 @@ svg {
   padding: 10px 14px;
   background: var(--declare);
   color: var(--declare-ink);
-  font-weight: 700;
+  font-weight: var(--weight-strong);
   border-radius: var(--r);
 }
 .skip:focus {
@@ -125,7 +125,7 @@ svg {
   border-radius: var(--r);
   background: transparent;
   color: var(--text);
-  font-weight: 700;
+  font-weight: var(--weight-strong);
   text-decoration: none;
   transition: background-color var(--ease);
 }
@@ -164,7 +164,7 @@ svg {
 }
 .lockup .word {
   font-size: 22px;
-  font-weight: 700;
+  font-weight: var(--weight-strong);
   letter-spacing: -0.03em;
 }
 .lockup .tag {
@@ -289,7 +289,7 @@ svg {
   border-color: var(--declare);
   background: var(--declare-soft);
   color: var(--text);
-  font-weight: 700;
+  font-weight: var(--weight-strong);
 }
 
 .main {
@@ -336,7 +336,7 @@ svg {
 .toc a[aria-current='true'] {
   border-left-color: var(--declare);
   color: var(--declare);
-  font-weight: 700;
+  font-weight: var(--weight-strong);
 }
 
 /* ─── Prose ─────────────────────────────────────────────────────────────── */
@@ -398,7 +398,7 @@ svg {
   color: var(--muted);
 }
 .prose strong {
-  font-weight: 700;
+  font-weight: var(--weight-strong);
 }
 .prose hr {
   margin: 32px 0;
@@ -521,7 +521,7 @@ svg {
 .aside .at {
   margin-bottom: 4px;
   font-size: 14px;
-  font-weight: 700;
+  font-weight: var(--weight-strong);
 }
 .aside[data-type='caution'] .at::before {
   content: '! ';
@@ -623,7 +623,7 @@ table.ref .ty {
   border-bottom: 1px solid var(--border-soft);
 }
 .wyrd-defs dt {
-  font-weight: 700;
+  font-weight: var(--weight-strong);
 }
 .wyrd-defs dt:last-of-type,
 .wyrd-defs dd:last-of-type {
@@ -662,7 +662,7 @@ table.ref .ty {
   font: 11px/1.4 var(--font-mono);
 }
 .pag .lbl {
-  font-weight: 700;
+  font-weight: var(--weight-strong);
 }
 
 .site-foot {
@@ -708,7 +708,7 @@ table.ref .ty {
   fill: var(--text);
   font-family: var(--font-sans);
   font-size: 14px;
-  font-weight: 700;
+  font-weight: var(--weight-strong);
   text-anchor: middle;
 }
 .wyrd-diagram .node-sub {
@@ -806,7 +806,7 @@ table.ref .ty {
   border: 2px solid var(--text);
 }
 .evidence-mark {
-  text-decoration: underline 3px var(--evidence);
+  text-decoration: underline 1px var(--evidence);
   text-underline-offset: 4px;
   text-decoration-skip-ink: none;
 }

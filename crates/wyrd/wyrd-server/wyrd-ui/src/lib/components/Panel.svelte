@@ -59,7 +59,7 @@
     padding: 10px 14px;
     border-bottom: 1px solid var(--border);
     background: var(--surface-2);
-    font: 700 13px var(--font-sans);
+    font: var(--weight-strong) 13px var(--font-sans);
     color: var(--text);
   }
   /* accent = the page's dominant panel: a declare-soft head over a plain body. */

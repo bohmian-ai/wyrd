@@ -37,7 +37,7 @@
     letter-spacing: 0.5px;
   }
   .v {
-    font-weight: 700;
+    font-weight: var(--weight-strong);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;

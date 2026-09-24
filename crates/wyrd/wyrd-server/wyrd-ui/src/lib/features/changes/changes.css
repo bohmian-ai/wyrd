@@ -6,15 +6,15 @@
   --sep: color-mix(in srgb, var(--border) 30%, var(--surface));
 }
 .changes h1 {
-  font: 700 26px var(--font-sans);
+  font: var(--weight-strong) 26px var(--font-sans);
   margin: 0 0 10px;
 }
 .changes h2 {
-  font: 700 16px var(--font-sans);
+  font: var(--weight-strong) 16px var(--font-sans);
   margin: 0 0 12px;
 }
 .changes h3 {
-  font: 700 14px var(--font-sans);
+  font: var(--weight-strong) 14px var(--font-sans);
   margin: 0 0 8px;
 }
 .changes p {
@@ -69,7 +69,7 @@
   border-radius: var(--r);
   background: var(--surface);
   color: var(--text);
-  font: 700 11px var(--font-mono);
+  font: var(--weight-strong) 11px var(--font-mono);
   padding: 7px 11px;
   cursor: pointer;
   text-decoration: none;
@@ -163,7 +163,7 @@
   border-bottom: 2px solid var(--border);
   padding: 8px 0;
   margin-bottom: 24px;
-  font: 700 11px var(--font-mono);
+  font: var(--weight-strong) 11px var(--font-mono);
 }
 .changes .nav a {
   padding: 8px 12px;
@@ -227,7 +227,7 @@
 }
 .changes .table-title {
   display: block;
-  font: 700 15px var(--font-sans);
+  font: var(--weight-strong) 15px var(--font-sans);
   margin: 6px 0;
 }
 /* Prose stays prose: "waiting on …" is a sentence, not an identifier. */

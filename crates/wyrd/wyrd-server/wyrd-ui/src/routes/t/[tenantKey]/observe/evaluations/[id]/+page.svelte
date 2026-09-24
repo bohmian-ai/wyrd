@@ -218,7 +218,7 @@
     margin: 2px 0 4px;
   }
   .head-k {
-    font: 700 9px var(--font-mono);
+    font: var(--weight-strong) 9px var(--font-mono);
     text-transform: uppercase;
     letter-spacing: 0.05em;
     margin: 0 0 4px;
@@ -228,14 +228,14 @@
     align-items: flex-start;
   }
   .kpi-n {
-    font: 700 20px var(--font-sans);
+    font: var(--weight-strong) 20px var(--font-sans);
     margin: 0;
   }
   .fail-text {
     color: var(--danger);
   }
   .kpi-k {
-    font: 700 9px var(--font-mono);
+    font: var(--weight-strong) 9px var(--font-mono);
     text-transform: uppercase;
     letter-spacing: 0.04em;
     color: var(--muted);

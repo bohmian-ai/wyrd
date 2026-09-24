@@ -24,7 +24,7 @@
 
 <style>
   .clear {
-    font: 700 10px var(--font-mono);
+    font: var(--weight-strong) 10px var(--font-mono);
     color: var(--muted);
     text-decoration: none;
   }

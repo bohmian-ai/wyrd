@@ -156,7 +156,7 @@
     fill: var(--text);
     font-family: var(--font-sans);
     font-size: 13px;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
     text-anchor: middle;
   }
   .sd-node-text-accent {

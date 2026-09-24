@@ -335,10 +335,10 @@
 
 <style>
   .back {
-    font-weight: 700;
+    font-weight: var(--weight-strong);
   }
   .genai-chip {
-    font: 700 8px var(--font-mono);
+    font: var(--weight-strong) 8px var(--font-mono);
     font-style: normal;
     letter-spacing: 0.06em;
     padding: 1px 4px;
@@ -388,7 +388,7 @@
   .role {
     margin: 10px 0 2px;
     font-size: 10px;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
     text-transform: uppercase;
     letter-spacing: 0.05em;
   }
@@ -424,7 +424,7 @@
   }
   .error {
     color: var(--danger);
-    font-weight: 700;
+    font-weight: var(--weight-strong);
   }
   .trace-facts {
     grid-template-columns: auto minmax(0, 1fr) auto minmax(0, 1fr);
@@ -465,7 +465,7 @@
   .tl-label {
     text-transform: uppercase;
     letter-spacing: 0.5px;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
   }
   .tl-lane {
     position: relative;

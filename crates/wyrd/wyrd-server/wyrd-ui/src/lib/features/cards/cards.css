@@ -7,11 +7,11 @@
   --sep: color-mix(in srgb, var(--border) 30%, var(--surface));
 }
 .cards h1 {
-  font: 700 26px var(--font-sans);
+  font: var(--weight-strong) 26px var(--font-sans);
   margin: 0 0 10px;
 }
 .cards h2 {
-  font: 700 16px var(--font-sans);
+  font: var(--weight-strong) 16px var(--font-sans);
   margin: 0 0 12px;
 }
 .cards p {
@@ -55,7 +55,7 @@
   border-radius: var(--r);
   background: var(--surface);
   color: var(--text);
-  font: 700 11px var(--font-mono);
+  font: var(--weight-strong) 11px var(--font-mono);
   padding: 7px 11px;
   cursor: pointer;
   text-decoration: none;
@@ -116,7 +116,7 @@
   flex-wrap: wrap;
 }
 .cards .chips .clear {
-  font: 700 10px var(--font-mono);
+  font: var(--weight-strong) 10px var(--font-mono);
   color: var(--muted);
   text-decoration: none;
 }
@@ -195,7 +195,7 @@
 .cards .recent-list a {
   text-decoration: none;
   color: var(--text);
-  font-weight: 700;
+  font-weight: var(--weight-strong);
 }
 .cards .recent-list a:hover {
   text-decoration: underline;
@@ -211,7 +211,7 @@
   margin: 0;
 }
 .cards .kind-pill {
-  font: 700 8.5px var(--font-mono);
+  font: var(--weight-strong) 8.5px var(--font-mono);
   letter-spacing: 0.5px;
   text-transform: uppercase;
   padding: 3px 7px;
@@ -232,7 +232,7 @@
   border-radius: var(--r);
   padding: 7px 12px;
   background: var(--surface-2);
-  font: 700 11px var(--font-mono);
+  font: var(--weight-strong) 11px var(--font-mono);
 }
 .cards .stages .arrow {
   color: var(--muted);
@@ -283,7 +283,7 @@
   }
   .cards .inv-main .wy-table td::before {
     content: attr(data-l);
-    font: 700 9px var(--font-mono);
+    font: var(--weight-strong) 9px var(--font-mono);
     letter-spacing: 0.5px;
     text-transform: uppercase;
     color: var(--muted);

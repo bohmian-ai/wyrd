@@ -99,7 +99,7 @@
   .st {
     font-family: var(--fm);
     font-size: 8.5px;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
     letter-spacing: 0.5px;
     text-transform: uppercase;
     color: var(--sc);
@@ -110,7 +110,7 @@
   .t {
     font-family: var(--font-sans);
     font-size: 13px;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
   }
   .d {
     margin: 6px 0 0;
@@ -128,7 +128,7 @@
     margin-top: 9px;
     font-family: var(--fm);
     font-size: 11px;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
     color: var(--declare);
   }
 </style>

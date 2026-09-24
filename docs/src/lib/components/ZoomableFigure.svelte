@@ -116,7 +116,7 @@
   .zf-btn {
     font-family: var(--font-mono);
     font-size: 12px;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
     letter-spacing: 0.08em;
     color: var(--text);
     background: var(--surface);

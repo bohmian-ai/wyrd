@@ -298,7 +298,7 @@
     gap: 8px;
   }
   .per .on {
-    font-weight: 700;
+    font-weight: var(--weight-strong);
     text-decoration: underline;
   }
 </style>

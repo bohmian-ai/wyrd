@@ -47,6 +47,9 @@
   --code-string: #67B891;
   --code-number: #FFB455;
 
+  /* type */
+  --weight-strong: 700;
+
   /* geometry */
   --r: 2px;
 }
@@ -56,28 +59,28 @@
   --font-mono: "Fragment Mono", ui-monospace, monospace;
 
   /* surface */
-  --bg: #08100F;
-  --surface: #101B19;
-  --surface-2: #182725;
-  --surface-hover: #1D2F2B;
+  --bg: #0E1413;
+  --surface: #131A19;
+  --surface-2: #19211F;
+  --surface-hover: #1F2826;
 
   /* ink */
   --text: #C8D3CF;
-  --muted: #9AB0AB;
-  --border: #39504B;
-  --border-soft: #263B37;
+  --muted: #A3AEAB;
+  --border: #434E4C;
+  --border-soft: #222A28;
 
   /* declare */
   --declare: #A894FF;
   --declare-soft: #241F46;
-  --declare-ink: #08100F;
+  --declare-ink: #0E1413;
 
   /* observe */
   --observe: #67B891;
   --observe-soft: #15352F;
 
   /* evidence */
-  --evidence: #D7F33F;
+  --evidence: #B8D14A;
   --evidence-ink: #10201D;
 
   /* status */
@@ -93,6 +96,9 @@
   --code-keyword: #A894FF;
   --code-string: #67B891;
   --code-number: #FFB455;
+
+  /* type */
+  --weight-strong: 600;
 
   /* geometry */
   --r: 2px;

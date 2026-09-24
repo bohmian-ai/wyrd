@@ -209,7 +209,7 @@
     background: var(--declare-soft);
   }
   .sm-hit-title {
-    font-weight: 700;
+    font-weight: var(--weight-strong);
   }
   .sm-hit-ex {
     color: var(--muted);
@@ -219,7 +219,7 @@
   .sm-hit-ex :global(mark) {
     background: none;
     color: var(--text);
-    font-weight: 700;
+    font-weight: var(--weight-strong);
     text-decoration: underline 1px var(--declare);
     text-underline-offset: 2px;
   }

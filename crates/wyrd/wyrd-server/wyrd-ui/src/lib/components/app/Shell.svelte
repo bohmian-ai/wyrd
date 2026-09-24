@@ -144,7 +144,7 @@
     border-radius: var(--r);
     background: none;
     color: var(--muted);
-    font: 700 10px var(--font-mono);
+    font: var(--weight-strong) 10px var(--font-mono);
     cursor: pointer;
     text-align: left;
   }
@@ -164,7 +164,7 @@
   nav {
     display: grid;
     gap: 6px;
-    font: 700 11px var(--font-mono);
+    font: var(--weight-strong) 11px var(--font-mono);
   }
   nav a {
     padding: 7px 12px;
@@ -191,7 +191,7 @@
     padding: 10px 22px;
     border-bottom: 2px solid var(--border);
     background: var(--surface);
-    font: 700 11px var(--font-mono);
+    font: var(--weight-strong) 11px var(--font-mono);
   }
   .product {
     background: var(--declare);
@@ -213,7 +213,7 @@
     border: 2px solid var(--border);
     border-radius: var(--r);
     background: var(--surface-2);
-    font: 700 10px var(--font-mono);
+    font: var(--weight-strong) 10px var(--font-mono);
     box-shadow: none;
   }
   .context strong {

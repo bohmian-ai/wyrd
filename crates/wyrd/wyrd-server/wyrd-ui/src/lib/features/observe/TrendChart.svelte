@@ -121,7 +121,7 @@
     border-radius: var(--r);
     background: var(--surface);
     color: var(--text);
-    font: 700 10px var(--font-mono);
+    font: var(--weight-strong) 10px var(--font-mono);
     pointer-events: none;
   }
   /* Keep the leftmost/rightmost tooltips inside the panel. */

@@ -19,7 +19,7 @@
   }
   .kind {
     color: var(--declare);
-    font-weight: 700;
+    font-weight: var(--weight-strong);
   }
   .kind-filter {
     margin-bottom: 12px;

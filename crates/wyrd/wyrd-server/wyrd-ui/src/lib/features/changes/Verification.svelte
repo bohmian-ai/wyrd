@@ -133,7 +133,7 @@
     font-size: 12px;
   }
   details.amend summary {
-    font: 700 11px var(--font-mono);
+    font: var(--weight-strong) 11px var(--font-mono);
     color: var(--declare);
     cursor: pointer;
   }
@@ -164,7 +164,7 @@
   }
   .closed-line.error {
     color: var(--danger);
-    font-weight: 700;
+    font-weight: var(--weight-strong);
   }
   .claim[open] > summary .closed-lines {
     display: none;

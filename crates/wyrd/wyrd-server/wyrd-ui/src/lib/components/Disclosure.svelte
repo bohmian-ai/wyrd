@@ -35,7 +35,7 @@
     padding: 8px 11px;
     font-family: var(--fm);
     font-size: 11px;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
     color: var(--text);
   }
   summary::-webkit-details-marker {

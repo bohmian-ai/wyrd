@@ -208,7 +208,7 @@
     fill: var(--muted);
     font-family: var(--font-mono);
     font-size: 11px;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
     letter-spacing: 0.12em;
   }
   .srv-edge {
@@ -236,7 +236,7 @@
     fill: var(--text);
     font-family: var(--font-sans);
     font-size: 13px;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
     text-anchor: middle;
   }
   .srv-node-text-accent {

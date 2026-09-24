@@ -122,19 +122,19 @@ provenance, not crime-scene, policing, or compliance theater.
 
 | Semantic role | Light | Dark | Meaning |
 |---|---:|---:|---|
-| Canvas | `#F3F6F5` | `#08100F` | application/page field |
-| Surface | `#FFFFFF` | `#101B19` | primary panel and chrome |
-| Surface secondary | `#E7EEEC` | `#182725` | subordinate regions and controls |
-| Surface hover | `#EDF2F0` | `#1D2F2B` | neutral interaction feedback |
+| Canvas | `#F3F6F5` | `#0E1413` | application/page field |
+| Surface | `#FFFFFF` | `#131A19` | primary panel and chrome |
+| Surface secondary | `#E7EEEC` | `#19211F` | subordinate regions and controls |
+| Surface hover | `#EDF2F0` | `#1F2826` | neutral interaction feedback |
 | Ink | `#10201D` | `#C8D3CF` | primary text and strongest rule |
-| Muted ink | `#53645F` | `#9AB0AB` | supporting text and metadata |
-| Rule | `#9AACAA` | `#39504B` | structural dividers and control borders |
-| Rule soft | `#D7E1DE` | `#263B37` | row and subordinate dividers |
+| Muted ink | `#53645F` | `#A3AEAB` | supporting text and metadata |
+| Rule | `#9AACAA` | `#434E4C` | structural dividers and control borders |
+| Rule soft | `#D7E1DE` | `#222A28` | row and subordinate dividers |
 | Declare / primary | `#5036D5` | `#A894FF` | Declaration identity, links, selection, primary action |
 | Declare soft | `#EAE6FF` | `#241F46` | selected or contextual declaration field |
 | Observe | `#007563` | `#67B891` | observed facts and Observation identity |
 | Observe soft | `#BDF5E7` | `#15352F` | selected or contextual observation field |
-| Retained Evidence | `#D7F33F` | `#D7F33F` | retained-evidence signal and logo spine |
+| Retained Evidence | `#D7F33F` | `#B8D14A` | retained-evidence signal and logo spine |
 | Success | `#187B45` | `#50DA83` | successful state, with non-color cue |
 | Warning | `#A65F00` | `#FFB455` | caution state, with non-color cue |
 | Failure | `#B52828` | `#FF715E` | failed judgment or error, with non-color cue |

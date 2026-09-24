@@ -17,7 +17,7 @@
   padding: 6px 10px;
 }
 .svc .subnav a.view {
-  font: 700 11px var(--font-mono);
+  font: var(--weight-strong) 11px var(--font-mono);
   text-transform: uppercase;
   letter-spacing: 0.4px;
   color: var(--muted);
@@ -40,7 +40,7 @@
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
-  font: 700 10px var(--font-mono);
+  font: var(--weight-strong) 10px var(--font-mono);
   color: var(--muted);
 }
 .svc .scopebar a {
@@ -74,7 +74,7 @@
   flex-wrap: wrap;
 }
 .svc .assess .title {
-  font: 700 15px var(--font-sans);
+  font: var(--weight-strong) 15px var(--font-sans);
 }
 .svc .assess[data-tone='warn'] .title {
   color: var(--warn);
@@ -101,12 +101,12 @@
   gap: 3px;
 }
 .svc .channel .k {
-  font: 700 8.5px var(--font-mono);
+  font: var(--weight-strong) 8.5px var(--font-mono);
   letter-spacing: 0.5px;
   color: var(--muted);
 }
 .svc .channel .v {
-  font: 700 11px var(--font-mono);
+  font: var(--weight-strong) 11px var(--font-mono);
 }
 .svc .dashboard {
   display: grid;
@@ -134,7 +134,7 @@
   margin: 6px 0 0;
 }
 .svc .siglatest .lv {
-  font: 700 18px var(--font-sans);
+  font: var(--weight-strong) 18px var(--font-sans);
 }
 .svc .sigaxis {
   display: flex;
@@ -148,7 +148,7 @@
   flex-wrap: wrap;
 }
 .svc .investigate a {
-  font: 700 11px var(--font-mono);
+  font: var(--weight-strong) 11px var(--font-mono);
   border: 2px solid var(--border);
   border-radius: var(--r);
   background: var(--surface);
@@ -212,7 +212,7 @@
   min-width: 0;
 }
 .svc .lane .lane-h {
-  font: 700 10px var(--font-mono);
+  font: var(--weight-strong) 10px var(--font-mono);
   letter-spacing: 0.5px;
   color: var(--muted);
   border-bottom: 2px dashed var(--border);
@@ -220,7 +220,7 @@
 }
 .svc .svcbox {
   justify-self: start;
-  font-weight: 700;
+  font-weight: var(--weight-strong);
   font-size: 10.5px;
   color: var(--declare);
   border: 2px solid var(--declare);
@@ -255,7 +255,7 @@
 /* Kind pill — shared by Composition nodes and the Definition components
    table: declarative brand color, never an operational tone. */
 .svc .pill {
-  font: 700 8px var(--font-mono);
+  font: var(--weight-strong) 8px var(--font-mono);
   letter-spacing: 0.5px;
   color: var(--declare);
   background: color-mix(in srgb, var(--declare) 11%, var(--surface));
@@ -264,7 +264,7 @@
   white-space: nowrap;
 }
 .svc .node .nn {
-  font: 700 12px var(--font-mono);
+  font: var(--weight-strong) 12px var(--font-mono);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -298,11 +298,11 @@
 }
 .svc .drawer[data-tone='danger'] .headline {
   color: var(--danger);
-  font-weight: 700;
+  font-weight: var(--weight-strong);
 }
 .svc .drawer[data-tone='ok'] .headline {
   color: var(--ok);
-  font-weight: 700;
+  font-weight: var(--weight-strong);
 }
 .svc .drawer-cols {
   display: grid;
@@ -330,10 +330,10 @@
    Observation voice; the runtime principal carries the observe chip. */
 .svc .def-columns .alias {
   color: var(--observe);
-  font-weight: 700;
+  font-weight: var(--weight-strong);
 }
 .svc .def-columns .principal-chip {
-  font: 700 10px var(--font-mono);
+  font: var(--weight-strong) 10px var(--font-mono);
   letter-spacing: 0.4px;
   background: var(--observe-soft);
   color: var(--observe);

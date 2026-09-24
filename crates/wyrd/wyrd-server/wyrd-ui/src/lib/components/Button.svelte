@@ -27,7 +27,7 @@
     display: inline-block;
     font-family: var(--fm);
     font-size: 13px;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
     text-decoration: none;
     padding: 8px 13px;
     border: 2px solid var(--border);

@@ -34,6 +34,9 @@ const HEX = /^#[0-9A-Fa-f]{6}$/;
 const MARK_WINGS = ['M42 92 L30 92 L6 8 L22 8 Z', 'M58 92 L70 92 L94 8 L78 8 Z'];
 const MARK_SPINE = 'M44 8 h12 v84 h-12 z';
 
+// Token groups whose values are not colors: literal CSS values with no Tailwind color alias.
+const NON_COLOR = new Set(['geometry', 'type']);
+
 /**
  * Every structural problem with a palette, as readable messages. An empty list
  * means the palette may be projected. Each token must carry a documented role and
@@ -55,7 +58,7 @@ export function paletteErrors({ modes, scale, tokens }) {
       const v = def[mode];
       if (v === undefined || v === null || v === '') {
         errors.push(`token ${name} has no value for mode "${mode}"`);
-      } else if (def.group !== 'geometry' && !HEX.test(v)) {
+      } else if (!NON_COLOR.has(def.group) && !HEX.test(v)) {
         errors.push(`token ${name} [${mode}] must be a literal #rrggbb color, not "${v}"`);
       }
     }
@@ -144,7 +147,7 @@ function workbenchCss({ modes, scale, tokens }) {
   const theme = ['@theme {', ...fontLines(scale), `  --radius-wy: ${scale.radius};`];
   theme.push('  /* mode-aware color utilities: bg-*, text-*, border-* resolve per [data-mode] */');
   for (const [name, def] of Object.entries(tokens)) {
-    if (def.group !== 'geometry') theme.push(`  --color-${name.slice(2)}: var(${name});`);
+    if (!NON_COLOR.has(def.group)) theme.push(`  --color-${name.slice(2)}: var(${name});`);
   }
   theme.push('}');
   const modeBlocks = modes.map(

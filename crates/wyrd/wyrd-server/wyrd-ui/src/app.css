@@ -21,7 +21,7 @@ body {
   padding: 8px 12px;
   background: var(--surface);
   color: var(--text);
-  font: 700 12px var(--font-mono);
+  font: var(--weight-strong) 12px var(--font-mono);
   min-width: 0;
   max-width: 100%;
 }

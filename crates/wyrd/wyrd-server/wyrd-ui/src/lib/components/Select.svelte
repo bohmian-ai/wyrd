@@ -47,7 +47,7 @@
   }
   label {
     font-size: 8.5px;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
     letter-spacing: 0.5px;
     text-transform: uppercase;
     color: var(--muted);
@@ -66,7 +66,7 @@
     appearance: none;
     font-family: var(--fm);
     font-size: 11px;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
     padding: 7px 26px 7px 10px;
     border: 2px solid var(--border);
     border-radius: var(--r);
@@ -152,7 +152,7 @@
     option::checkmark {
       content: '✓';
       color: var(--declare);
-      font-weight: 700;
+      font-weight: var(--weight-strong);
     }
   }
 </style>

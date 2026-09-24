@@ -65,7 +65,7 @@
     border-radius: var(--r);
     background: var(--surface);
     color: var(--muted);
-    font: 700 10px var(--font-mono);
+    font: var(--weight-strong) 10px var(--font-mono);
   }
   .dev-tools > form {
     display: flex;

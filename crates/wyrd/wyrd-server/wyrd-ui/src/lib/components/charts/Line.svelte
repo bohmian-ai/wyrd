@@ -279,7 +279,7 @@
   .thrl {
     font-family: var(--fm);
     font-size: 10px;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
     fill: var(--danger);
   }
   .node {
@@ -334,7 +334,7 @@
   .at {
     display: block;
     font-size: 8.5px;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
     letter-spacing: 0.5px;
     text-transform: uppercase;
     color: var(--muted);
@@ -344,7 +344,7 @@
     margin-right: auto;
   }
   .sv {
-    font-weight: 700;
+    font-weight: var(--weight-strong);
     color: var(--text);
   }
   .su {

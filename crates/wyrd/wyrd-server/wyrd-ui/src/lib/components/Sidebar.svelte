@@ -43,7 +43,7 @@
   .grp {
     font-family: var(--fm);
     font-size: 8.5px;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
     letter-spacing: 0.6px;
     text-transform: uppercase;
     color: var(--muted);

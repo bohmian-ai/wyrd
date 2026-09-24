@@ -54,7 +54,7 @@
     border-bottom: 2px solid var(--border);
     background: var(--surface-2);
     font-size: 9px;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
     letter-spacing: 0.5px;
     text-transform: uppercase;
     color: var(--muted);

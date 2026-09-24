@@ -324,7 +324,7 @@
     fill: var(--muted);
     font-family: var(--font-mono);
     font-size: 11px;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
     letter-spacing: 1.4px;
     text-anchor: middle;
   }
@@ -342,7 +342,7 @@
   .bpa-box-t {
     font-family: var(--font-mono);
     font-size: 12px;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
     text-anchor: middle;
   }
   .bpa-lime-t {
@@ -365,7 +365,7 @@
     fill: var(--muted);
     font-family: var(--font-mono);
     font-size: 11px;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
     letter-spacing: 1.4px;
   }
 
@@ -386,7 +386,7 @@
   .bpa-role-name {
     font-family: var(--font-sans);
     font-size: 16px;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
   }
   .bpa-name-server {
     fill: var(--text);
@@ -401,7 +401,7 @@
     fill: var(--muted);
     font-family: var(--font-mono);
     font-size: 10px;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
     letter-spacing: 0.5px;
   }
   .bpa-role-detail {
@@ -411,7 +411,7 @@
   }
   .bpa-em {
     fill: var(--text);
-    font-weight: 700;
+    font-weight: var(--weight-strong);
   }
 
   /* Parts */
@@ -431,7 +431,7 @@
   .bpa-part-t {
     font-family: var(--font-mono);
     font-size: 11px;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
     text-anchor: middle;
   }
   .bpa-part-t-server {
@@ -463,7 +463,7 @@
     fill: var(--declare);
     font-family: var(--font-sans);
     font-size: 18px;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
     text-anchor: middle;
     letter-spacing: 1px;
   }
@@ -474,7 +474,7 @@
     fill: var(--text);
     font-family: var(--font-sans);
     font-size: 14px;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
     text-anchor: middle;
   }
   .bpa-db-role {

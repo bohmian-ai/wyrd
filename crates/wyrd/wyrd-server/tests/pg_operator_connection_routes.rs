@@ -708,7 +708,9 @@ async fn vault_serving(key: Option<String>) -> wiremock::MockServer {
         None => wiremock::ResponseTemplate::new(404),
     };
     wiremock::Mock::given(method("GET"))
-        .and(path_regex(r"^/v1/secret/data/wyrd/operator-keys/[0-9a-f-]+/1$"))
+        .and(path_regex(
+            r"^/v1/secret/data/wyrd/operator-keys/[0-9a-f-]+/1$",
+        ))
         .respond_with(response)
         .mount(&vault)
         .await;
@@ -754,7 +756,10 @@ async fn production_boot_requires_every_active_tenant_key() {
             .expect_err(case)
             .to_string();
         for selector in [addr.as_str(), "wyrd/operator-keys", "boot-vault-token"] {
-            assert!(!refused.contains(selector), "{case} leaked {selector}: {refused}");
+            assert!(
+                !refused.contains(selector),
+                "{case} leaked {selector}: {refused}"
+            );
         }
     }
 
@@ -764,12 +769,18 @@ async fn production_boot_requires_every_active_tenant_key() {
         .await
         .expect("readable 32-byte keys boot");
     let reads = readable.received_requests().await.expect("recorded").len();
-    assert!(reads >= 2, "every active tenant, including the fixture, is checked: {reads}");
+    assert!(
+        reads >= 2,
+        "every active tenant, including the fixture, is checked: {reads}"
+    );
 
     state.operator_keys = std::sync::Arc::new(vault_keys(&unreachable));
-    wyrd_server::boot::verify_operator_keys(&state, &wyrd_server::config::WyrdServerConfig::default())
-        .await
-        .expect("development defers key failures");
+    wyrd_server::boot::verify_operator_keys(
+        &state,
+        &wyrd_server::config::WyrdServerConfig::default(),
+    )
+    .await
+    .expect("development defers key failures");
     let mut single_tenant = production.clone();
     single_tenant.auth.tenant_slug = Some(wyrd_spec::TenantSlug::new("acme").expect("slug"));
     wyrd_server::boot::verify_operator_keys(&state, &single_tenant)

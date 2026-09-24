@@ -379,7 +379,6 @@ impl VerifierRunner {
         conn.commit().await?;
         Ok(outcome)
     }
-
 }
 
 impl LeasedWork for VerifierRunner {
@@ -393,7 +392,8 @@ impl LeasedWork for VerifierRunner {
     /// # Errors
     /// Returns [`SqlError`] when the cross-tenant read fails.
     async fn due_tenants(&self, limit: i64) -> Result<Vec<DataTenantId>, SqlError> {
-        Ok(self.queue
+        Ok(self
+            .queue
             .tenants_with_runnable_runs(&self.operator, limit)
             .await?)
     }

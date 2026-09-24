@@ -700,13 +700,15 @@ async fn next_attempt_on_another_replica_uses_the_rotated_credential() {
         .expect("generated key directory");
     std::fs::copy(dir.join("v1"), dir.join("v2")).expect("key v2 publishes");
     let mut replica = delivery.server.state().clone();
-    replica.operator_keys = Arc::new(OperatorKeys::new(OperatorKeysConfig {
-        source: OperatorKeySource::File,
-        dir: Some(dir.to_path_buf()),
-        active_version: std::num::NonZeroU32::new(2).expect("nonzero"),
-        ..OperatorKeysConfig::default()
-    })
-    .expect("file keys build"));
+    replica.operator_keys = Arc::new(
+        OperatorKeys::new(OperatorKeysConfig {
+            source: OperatorKeySource::File,
+            dir: Some(dir.to_path_buf()),
+            active_version: std::num::NonZeroU32::new(2).expect("nonzero"),
+            ..OperatorKeysConfig::default()
+        })
+        .expect("file keys build"),
+    );
     delivery.make_retries_due(run).await;
     let second = delivery.spawn(
         &replica,
@@ -890,12 +892,14 @@ async fn revoked_connection_fails_closed_and_key_outage_retries() {
 
     let empty = tempfile::tempdir().expect("empty key directory");
     let mut outage = delivery.server.state().clone();
-    outage.operator_keys = Arc::new(OperatorKeys::new(OperatorKeysConfig {
-        source: OperatorKeySource::File,
-        dir: Some(empty.path().to_path_buf()),
-        ..OperatorKeysConfig::default()
-    })
-    .expect("file keys build"));
+    outage.operator_keys = Arc::new(
+        OperatorKeys::new(OperatorKeysConfig {
+            source: OperatorKeySource::File,
+            dir: Some(empty.path().to_path_buf()),
+            ..OperatorKeysConfig::default()
+        })
+        .expect("file keys build"),
+    );
     let running = delivery.spawn(
         &outage,
         Delivery::limits(),
@@ -1269,7 +1273,8 @@ async fn slow_rewrap_never_holds_back_another_tenants_delivery() {
     )
     .expect("key v1 reads");
     vault.reset().await;
-    let key_path = |version: u32| format!("/v1/secret/data/wyrd/operator-keys/{stale_tenant}/{version}");
+    let key_path =
+        |version: u32| format!("/v1/secret/data/wyrd/operator-keys/{stale_tenant}/{version}");
     for (version, key) in [(1, v1.trim().to_owned()), (2, engine.encode([8_u8; 32]))] {
         Mock::given(method("GET"))
             .and(path(key_path(version)))

@@ -1464,9 +1464,10 @@ pub async fn verify_operator_keys(
         return Ok(());
     }
     let keys = &state.operator_keys;
-    let directory = state.postgres.operator_pool().ok_or_else(|| {
-        keys.unavailable(keys.active_version(), KeyFailure::Database)
-    })?;
+    let directory = state
+        .postgres
+        .operator_pool()
+        .ok_or_else(|| keys.unavailable(keys.active_version(), KeyFailure::Database))?;
     let tenants = keys.verify_active(&directory).await?;
     tracing::info!(
         tenants,

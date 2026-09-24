@@ -2,20 +2,20 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs::OpenOptions;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt as _;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ops::Range;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use wyrd_sql::OperatorPool;
 
 use arrow::datatypes::{DataType, Field, Schema};
-use base64::Engine as _;
 use async_trait::async_trait;
 use axum::body::{Body, to_bytes};
 use axum::http::{HeaderValue, Request, Response, StatusCode, header};
+use base64::Engine as _;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use ed25519_dalek::VerifyingKey;
 use secrecy::{ExposeSecret, SecretString};

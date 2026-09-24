@@ -26,13 +26,13 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 use wyrd_auth_oidc::{ScreenError, ScreenedHttp};
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::SecretBearer;
 use wyrd_spec::card::operator::{
     HttpAuth, HttpMethod, MAX_ATTEMPT_SECONDS, NotifyChannel, OperatorAction,
     OperatorFailureContext, OperatorSpec, operator_url_origin,
 };
 use wyrd_spec::card::verifier::VerificationBinding;
 use wyrd_spec::envelope::Spec;
-use wyrd_spec::auth::SecretBearer;
 use wyrd_spec::operator_connection::{ConnectionSecret, HttpsOrigin, OperatorConnectionStatus};
 use wyrd_spec::reference::InlineableRef;
 use wyrd_spec::verification::{FrozenTarget, VerificationError};
@@ -419,7 +419,6 @@ impl OperatorWorker {
         conn.commit().await?;
         Ok(outcome)
     }
-
 }
 
 impl LeasedWork for OperatorWorker {
@@ -607,10 +606,10 @@ impl OperatorDelivery {
                         Ok(request) => request,
                         Err(reason) => return Attempt::terminal(INVALID_REQUEST, &reason),
                     };
-                let credential = auth.as_ref().zip(secret).map(|(auth, secret)| Credential {
-                    auth,
-                    secret,
-                });
+                let credential = auth
+                    .as_ref()
+                    .zip(secret)
+                    .map(|(auth, secret)| Credential { auth, secret });
                 self.http(request, credential, *expect_status, timeout)
                     .await
             }
@@ -883,7 +882,11 @@ impl Credential<'_> {
                 sensitive(value.expose())
                     .map_err(|()| invalid("the header credential is invalid"))?,
             ),
-            _ => return Err(invalid("the stored credential does not fit the auth scheme")),
+            _ => {
+                return Err(invalid(
+                    "the stored credential does not fit the auth scheme",
+                ));
+            }
         };
         credential_attached();
         Ok(builder.header(name, value))
@@ -1111,10 +1114,16 @@ mod tests {
     /// Deliver `url` under `policy` and return the attempt with the number
     /// of credential headers built for it.
     async fn deliver(policy: AddressPolicy, url: &str) -> (Attempt, usize) {
-        let delivery = OperatorDelivery::new(ScreenedHttp::new(policy), ProviderEndpoints::default());
+        let delivery =
+            OperatorDelivery::new(ScreenedHttp::new(policy), ProviderEndpoints::default());
         let before = attached();
         let attempt = delivery
-            .send(&hook(url), Some(&secret()), &context(), Duration::from_secs(5))
+            .send(
+                &hook(url),
+                Some(&secret()),
+                &context(),
+                Duration::from_secs(5),
+            )
             .await;
         (attempt, attached() - before)
     }
@@ -1127,15 +1136,21 @@ mod tests {
     #[tokio::test]
     async fn blocked_and_unresolved_destinations_never_get_a_credential() {
         let mock = MockServer::start().await;
-        let (blocked, built) =
-            deliver(AddressPolicy::BlockInternal, &format!("{}/hook", mock.uri())).await;
+        let (blocked, built) = deliver(
+            AddressPolicy::BlockInternal,
+            &format!("{}/hook", mock.uri()),
+        )
+        .await;
         assert!(
             matches!(&blocked, Attempt::Terminal(error) if error.code == DESTINATION_REJECTED),
             "{blocked:?}"
         );
         assert_eq!(built, 0, "a blocked destination gets no credential");
-        let (unresolved, built) =
-            deliver(AddressPolicy::AllowInternal, "https://wyrd-unresolvable.invalid/hook").await;
+        let (unresolved, built) = deliver(
+            AddressPolicy::AllowInternal,
+            "https://wyrd-unresolvable.invalid/hook",
+        )
+        .await;
         assert!(
             matches!(&unresolved, Attempt::Retry { error, .. } if error.code == DESTINATION_UNREACHABLE),
             "{unresolved:?}"
@@ -1167,12 +1182,16 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/away"))
             .respond_with(
-                ResponseTemplate::new(307).insert_header("location", format!("{}/stolen", other.uri())),
+                ResponseTemplate::new(307)
+                    .insert_header("location", format!("{}/stolen", other.uri())),
             )
             .mount(&mock)
             .await;
-        let (followed, built) =
-            deliver(AddressPolicy::AllowInternal, &format!("{}/start", mock.uri())).await;
+        let (followed, built) = deliver(
+            AddressPolicy::AllowInternal,
+            &format!("{}/start", mock.uri()),
+        )
+        .await;
         assert_eq!(followed, Attempt::Delivered);
         assert_eq!(built, 2, "each hop attaches after its own screen");
         let keys: Vec<_> = mock
@@ -1183,15 +1202,27 @@ mod tests {
             .map(|request| request.headers.get("x-api-key").cloned())
             .collect();
         assert_eq!(keys.len(), 2);
-        assert!(keys.iter().all(|key| key.as_ref().is_some_and(|key| key == "hook-key")));
+        assert!(
+            keys.iter()
+                .all(|key| key.as_ref().is_some_and(|key| key == "hook-key"))
+        );
 
-        let (refused, built) =
-            deliver(AddressPolicy::AllowInternal, &format!("{}/away", mock.uri())).await;
+        let (refused, built) = deliver(
+            AddressPolicy::AllowInternal,
+            &format!("{}/away", mock.uri()),
+        )
+        .await;
         assert!(
             matches!(&refused, Attempt::Terminal(error) if error.code == DESTINATION_REJECTED),
             "{refused:?}"
         );
         assert_eq!(built, 1, "the refused redirect target gets no credential");
-        assert!(other.received_requests().await.expect("recorded").is_empty());
+        assert!(
+            other
+                .received_requests()
+                .await
+                .expect("recorded")
+                .is_empty()
+        );
     }
 }

@@ -524,7 +524,10 @@ impl OperatorKeys {
         for tenant in tenants {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                tracing::warn!(failure = KeyFailure::TimedOut.as_str(), "operator key rewrap pass budget elapsed; the next pass continues");
+                tracing::warn!(
+                    failure = KeyFailure::TimedOut.as_str(),
+                    "operator key rewrap pass budget elapsed; the next pass continues"
+                );
                 break;
             }
             let rewrapped = tokio::time::timeout(budget.tenant.min(remaining), async {
@@ -586,7 +589,9 @@ fn read_owner_only_blocking(path: &Path) -> Result<Zeroizing<String>, KeyFailure
     if std::fs::metadata(path).map_err(io)?.permissions().mode() & 0o077 != 0 {
         return Err(KeyFailure::LoosePermissions);
     }
-    std::fs::read_to_string(path).map(Zeroizing::new).map_err(io)
+    std::fs::read_to_string(path)
+        .map(Zeroizing::new)
+        .map_err(io)
 }
 
 /// Decode a base64 32-byte key, trimming surrounding whitespace.
@@ -879,7 +884,10 @@ mod tests {
         let mut public = String::new();
         for keys in &owners {
             let error = keys
-                .seal(SecretIdentity::of(tenant, &view, 1), b"sentinel-secret-bytes")
+                .seal(
+                    SecretIdentity::of(tenant, &view, 1),
+                    b"sentinel-secret-bytes",
+                )
                 .await
                 .expect_err("no key is readable");
             assert_eq!(error.code(), "WYRD_OPERATOR_503_KEY_UNAVAILABLE");
@@ -922,7 +930,8 @@ mod tests {
         let tenant = DataTenantId::new(Uuid::now_v7()).expect("tenant");
         let engine = base64::engine::general_purpose::STANDARD;
         let respond = |key: String| {
-            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": { "data": { "key": key } } }))
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "data": { "data": { "key": key } } }))
         };
         for (version, key) in [
             (1, engine.encode([3_u8; 32])),
@@ -930,7 +939,9 @@ mod tests {
             (3, engine.encode([3_u8; 16])),
         ] {
             Mock::given(method("GET"))
-                .and(path(format!("/v1/secret/data/wyrd/operator-keys/{tenant}/{version}")))
+                .and(path(format!(
+                    "/v1/secret/data/wyrd/operator-keys/{tenant}/{version}"
+                )))
                 .and(header("X-Vault-Token", "vault-token"))
                 .respond_with(respond(key))
                 .mount(&vault)
@@ -950,7 +961,11 @@ mod tests {
             );
         }
         assert!(
-            vault.received_requests().await.expect("recorded").is_empty(),
+            vault
+                .received_requests()
+                .await
+                .expect("recorded")
+                .is_empty(),
             "a loose token file fails before network use"
         );
         write_mode(&token, "vault-token\n", 0o600);

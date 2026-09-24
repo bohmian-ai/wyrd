@@ -13,7 +13,7 @@
 
 ## Get started
 
-- [Get Started](https://mitari-ai.github.io/wyrd/get-started/): Install Wyrd from the repo and run the DataCard example end to end.
+- [Run Wyrd locally](https://mitari-ai.github.io/wyrd/get-started/): Install Wyrd from the repo and run the DataCard example end to end.
 - [Client configuration](https://mitari-ai.github.io/wyrd/get-started/client-configuration/): Configure Wyrd clients, credentials, and repository defaults for local development and automation.
 
 ## Tutorials
@@ -101,7 +101,7 @@
 
 ## For Agents
 
-- [For Agents](https://mitari-ai.github.io/wyrd/for-agents/): Machine-readable surface, stable API paths, and the rules agents must follow when reading and updating Wyrd.
+- [Agent workflows](https://mitari-ai.github.io/wyrd/for-agents/): Machine-readable surface, stable API paths, and the rules agents must follow when reading and updating Wyrd.
 - [Error remediation](https://mitari-ai.github.io/wyrd/for-agents/error-remediation/): How agents should handle Wyrd errors.
 - [Agent workflow](https://mitari-ai.github.io/wyrd/for-agents/workflow/): A copyable end-to-end workflow for agents that declare cards and register them over HTTP.
 

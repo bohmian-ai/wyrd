@@ -16252,14 +16252,6 @@ Schema source: crates/wyrd-spec/schemas/verifier_spec.json
         {
           "description": "SPC profile configuration.",
           "properties": {
-            "alert_threshold": {
-              "allOf": [
-                {
-                  "$ref": "#/definitions/SpcAlertThreshold"
-                }
-              ],
-              "description": "Lowest zone that should produce a Drift verdict."
-            },
             "kind": {
               "enum": [
                 "Spc"
@@ -16267,25 +16259,15 @@ Schema source: crates/wyrd-spec/schemas/verifier_spec.json
               "type": "string"
             },
             "sample_size": {
-              "description": "Sample chunk size for baseline computation. `0` means adaptive default.",
+              "description": "Fixed rational subgroup size; at least two.",
               "format": "uint32",
               "minimum": 0.0,
               "type": "integer"
-            },
-            "weco_rule": {
-              "allOf": [
-                {
-                  "$ref": "#/definitions/SpcWecoRule"
-                }
-              ],
-              "description": "WECO rule configuration."
             }
           },
           "required": [
-            "alert_threshold",
             "kind",
-            "sample_size",
-            "weco_rule"
+            "sample_size"
           ],
           "type": "object"
         },
@@ -21198,52 +21180,6 @@ Schema source: crates/wyrd-spec/schemas/verifier_spec.json
     "SpaceName": {
       "description": "Human-visible namespace for Cards and Runs.",
       "type": "string"
-    },
-    "SpcAlertThreshold": {
-      "description": "SPC alert threshold: the lowest zone that produces a Drift verdict.",
-      "oneOf": [
-        {
-          "description": "Zone 1.",
-          "enum": [
-            "Zone1"
-          ],
-          "type": "string"
-        },
-        {
-          "description": "Zone 2.",
-          "enum": [
-            "Zone2"
-          ],
-          "type": "string"
-        },
-        {
-          "description": "Zone 3.",
-          "enum": [
-            "Zone3"
-          ],
-          "type": "string"
-        },
-        {
-          "description": "Zone 4.",
-          "enum": [
-            "Zone4"
-          ],
-          "type": "string"
-        }
-      ]
-    },
-    "SpcWecoRule": {
-      "description": "WECO rule string config.",
-      "properties": {
-        "rule_string": {
-          "description": "Eight whitespace-separated positive `u32`s. Default: `\"8 16 4 8 2 4 1 1\"`.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "rule_string"
-      ],
-      "type": "object"
     },
     "TaskId": {
       "maxLength": 128,

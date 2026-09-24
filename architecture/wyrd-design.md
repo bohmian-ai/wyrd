@@ -1087,7 +1087,7 @@ authoring; the card stores resolved bounds):
 
 | Variant         | Carries                          | Fires when |
 |-----------------|----------------------------------|------------|
-| `Statistical`   | —                                | The method's profile decides (PSI threshold, SPC sigma) |
+| `Statistical`   | —                                | The method's profile decides (PSI threshold, SPC X-bar/S limits) |
 | `Above`         | `limit: f64`                     | Sample > `limit` |
 | `Below`         | `limit: f64`                     | Sample < `limit` |
 | `Outside`       | `lower: f64`, `upper: f64`       | Sample < `lower` or > `upper` |

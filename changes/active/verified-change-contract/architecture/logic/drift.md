@@ -137,7 +137,7 @@ per-feature physical schema discovery. `DriftSignal` names the features;
 registration fits and persists a `FittedBaseline`. At run time the runner
 loads that exact fitted baseline. For each PSI feature, its fitted `bin_type`
 chooses `num_value` or `str_value`, and its fitted bins supply numeric bounds
-or category labels. SPC's fitted `chunk_size` chooses subgroup size. Custom's
+or category labels. SPC's fitted `subgroup_size` chooses subgroup size. Custom's
 authored `Metric.name` chooses `series` and its authored baseline supplies the
 comparison value. The query operators are fixed; these values are escaped
 typed literals in server-built SQL, never Verifier-authored query text.
@@ -146,7 +146,7 @@ typed literals in server-built SQL, never Verifier-authored query text.
 for (feature_name, fitted_feature) in fitted_baseline.features:
   PSI Numeric      -> count num_value using fitted_feature.numeric bins
   PSI Categorical  -> count str_value using fitted_feature.category labels
-  SPC              -> aggregate num_value in fitted_baseline.chunk_size groups
+  SPC              -> aggregate num_value in fitted_baseline.subgroup_size groups
 Custom             -> aggregate num_value where series = profile.metric_name
 ```
 
@@ -163,9 +163,14 @@ escaped typed SQL literals; the Verifier contributes no SQL text. The stream
 is settled by the server's shared query consumer: terminal and row-total
 validation, clean end-of-stream, the query deadline, and cancel-and-settle on
 any failure. Only aggregate rows return to Rust, and each decoded batch is
-folded as it arrives; SPC chunk means stream through rule state bounded by
-the largest parsed WECO or trend lookback instead of accumulating every
-chunk. The existing
+folded as it arrives; SPC subgroup statistics stream through the X-bar/S
+signal counters in constant state instead of accumulating every subgroup.
+Before any method query, one completeness statement groups the window's
+records carrying any configured feature by `record_id` and counts records
+that omit a configured feature or carry a null or non-finite value; any such
+record makes the run inconclusive with no details and no feature rows.
+Records carrying no configured feature do not enter the comparison. The
+existing
 `feature.rs` helpers read wide baseline Arrow batches; they are not a mapper
 for this tall observation table and may
 be retained for fitting or replaced there.
@@ -174,9 +179,9 @@ The fixed plan shapes and Arrow outputs are:
 
 | Method | DataFusion operators after common filter | Aggregate output to Rust |
 |---|---|---|
-| PSI numeric | Preflight `COUNT(*) = COUNT(num_value)`; `CASE` over fitted `(lower, upper]` edges; `GROUP BY bin_id`; `COUNT(*)` | `(feature, bin_id, count)` and input-validity counts |
-| PSI categorical | `str_value IS NOT NULL`; `CASE` over fitted labels, with unmatched `bin_id = -1`; `GROUP BY bin_id`; `COUNT(*)` | `(feature, bin_id, count)` including unknown count |
-| SPC | Preflight `COUNT(*) = COUNT(num_value)`; deterministic `ROW_NUMBER` over numeric rows per feature; group consecutive frozen-size chunks; `COUNT(*)`, `AVG`; order by chunk | `(feature, chunk_index, n, mean)` and input-validity counts |
+| PSI numeric | `CASE` over fitted `(lower, upper]` edges, with null or non-finite values in `bin_id = -1`; `GROUP BY bin_id`; `COUNT(*)` | `(bin_id, count)`; any invalid count is inconclusive |
+| PSI categorical | `CASE` over fitted labels, with unmatched labels in the reserved `other` bin and null values in `bin_id = -1`; `GROUP BY bin_id`; `COUNT(*)` | `(bin_id, count)` including the `other` count |
+| SPC | `ROW_NUMBER` ordered by `created_at`, then `record_id`; consecutive frozen-size subgroups; `COUNT(*)`, `AVG`, `STDDEV_SAMP`; order by subgroup | `(subgroup, n, mean, sd)`; a short trailing subgroup is inconclusive |
 | Custom | `COUNT(*)`, `COUNT(num_value)`, `AVG(num_value)` | `(metric, observed_count, numeric_count, window_mean)` |
 
 The shared filter is the tenant-authorized table scan plus exact subject UID,
@@ -193,43 +198,54 @@ baseline proportions. The server computes target counts for each run window.
 1. Select each fitted feature's `series` and its fitted `bin_type`-appropriate
    value column within the run window.
 2. DataFusion assigns numeric values to fitted `(lower, upper]` bins or
-   categorical values to fitted labels, then counts each bin. Unmatched
-   categorical labels contribute to the target total through `bin_id = -1`
-   but not to a fitted category's numerator.
-3. Rust zero-fills absent fitted bins and sums all counts for the non-null
-   target total. It applies the existing minimum-sample, smoothing, PSI
-   formula, threshold, and verdict logic unchanged.
+   categorical values to fitted labels, then counts each bin. Categories
+   absent from the fitted labels count in the reserved `other` bin.
+3. Rust zero-fills absent fitted bins and sums all counts for the target
+   total. It applies the minimum-sample, smoothing, PSI formula, threshold,
+   and verdict logic, and records each bin's target count and proportion as
+   typed `Psi` evidence on the feature report.
 
 The existing PSI implementation must expose an aggregate-count input that
 shares its current formula and report construction. Passing count rows into
 the raw-value scorer would bin them twice. The fitted profile is frozen at
 registration; observed counts never refit the bins.
 
-The existing fitted numeric edges already cover values below and above the
-baseline range through infinite boundary bins. For categorical PSI, categories
-absent from the fitted baseline remain part of the target total but do not
-create a new fitted bin, matching the current scorer.
+The fitted bins are exhaustive. Numeric edges cover values below and above
+the baseline range through infinite boundary bins. Every categorical fit
+reserves an `other` bin, with a smoothed zero baseline proportion, for
+categories absent from the baseline, so every target value lands in exactly
+one scored bin. PSI is a distribution-distance index with an authored
+threshold, not a significance test.
 
-## SPC: preserve the existing scorer
+## SPC: NIST X-bar/S charts
 
-The initial Verifier adapts the existing `vala-drift` SPC contract instead of
-inventing another chart. `SpcProfile` retains `sample_size`, `weco_rule`, and
-`alert_threshold`. An authored `sample_size` is at least two; zero selects the
-existing row-count adaptive size, which is frozen in the fitted baseline. The
-existing eight-positive-integer WECO rule string, zone assignment, trend rule,
-and alert-threshold filtering remain authoritative.
+`SpcProfile` carries only `sample_size`, an authored fixed subgroup size of at
+least two; `weco_rule` and `alert_threshold` are not part of the profile, and
+the loader rejects them. The subgroup size is never inferred. The author is
+responsible for stable, process-ordered rational subgroups.
 
-The baseline fitter uses the registered Data Card's feature-row order exactly
-as the existing scorer does. Runtime rows are ordered by `created_at`, then
-`record_id`, before consecutive chunk means are formed. The server-side
-DataFusion plan returns those ordered chunk means; Rust applies the existing
-zone/rule evaluator and constructs the existing `DriftReport`. The current
-trailing-chunk behavior is preserved. A window too small for the frozen chunk
-size is `inconclusive`, not a no-drift pass.
+The fitter splits the registered Data Card's feature rows, in their row order,
+into consecutive subgroups of that size. It rejects leftover rows, fewer than
+20 complete subgroups, and any null or non-finite value. From the subgroup
+means and sample standard deviations it fits NIST's two-sided three-sigma
+limits: the X-bar chart centers on the grand mean with half-width
+`3 * s_bar / (c4 * sqrt(n))`, and the S chart centers on `s_bar` with limits
+`B3 * s_bar` and `B4 * s_bar`. The fitted baseline records its format so a run
+can refuse a baseline fitted under an earlier revision.
 
-This delivery does not add a second S chart, fixed four-rule policy,
-25-subgroup readiness gate, or new finding schema. Those would be a separate
-public algorithm change with separate evidence.
+Runtime rows are ordered by `created_at`, then `record_id`, before consecutive
+subgroups are formed. A subgroup signals on either chart when its mean or
+standard deviation is strictly outside that chart's limits. The feature score
+is the total signal count, compared with a threshold of zero. The report
+persists the subgroup size and count and, for each chart, its center, limits,
+and signal count as typed `Spc` evidence. An empty target or one ending in a
+partial subgroup is `inconclusive`, not a no-drift pass.
+
+A Verifier whose stored baseline predates this format completes terminally
+with the visible `baseline_legacy` error instead of being reinterpreted.
+Authors register the corrected behavior under a new immutable Verifier
+version, whose baseline is fitted anew. Stored results remain readable, and
+no migration rewrites them.
 
 ## Customer metrics
 
@@ -437,9 +453,9 @@ Rust/Python/TypeScript client-to-server journey that proves:
    batch transfer to the Rust scorer.
 4. PSI numeric fitted-edge and categorical fitted-label counts, zero bins,
    unknown category totals, minimum sample, pass, drift, and inconclusive.
-5. SPC baseline limits against existing known fixtures, the existing adaptive
-   sample-size table, authored sample size, eight-number rule parsing, zone,
-   trend, alert-threshold, trailing-chunk, and no-data behavior.
+5. SPC X-bar/S limits against independent NIST calculations for several
+   subgroup sizes, strict signals, the 20-subgroup fit floor, partial and
+   empty targets, typed evidence, and refusal of legacy fitted baselines.
 6. Custom raw-value averaging, strict threshold equality, missing/invalid
    input, and pass/drift/inconclusive behavior.
 7. Direct manual and binding-driven cron runs use the same analysis path;
@@ -464,9 +480,8 @@ Rust/Python/TypeScript client-to-server journey that proves:
 3. Add the fixed PSI numeric/categorical and Custom aggregate plans and
    narrow count/mean scoring inputs in `vala-drift`, sharing the existing PSI
    and Custom formulas and `DriftReport` construction.
-4. Adapt SPC without changing its public or statistical contract: preserve
-   its fitted-baseline shape and rule parser, and feed the existing scorer the
-   ordered chunk means produced by the fixed DataFusion plan.
+4. Fit SPC as NIST X-bar/S charts and feed the scorer the ordered subgroup
+   means and standard deviations produced by the fixed plan.
 5. Map scored reports to the canonical detail and summary Bifrost tables,
    require every non-empty batch ACK, settle the existing run, and rely on the generic
    Operator dispatch worker. Prove the method-specific journeys above through

@@ -23,6 +23,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::ids::{CardUid, OperatorDispatchId, VerificationRunId};
 use wyrd_spec::verification::{FrozenTarget, VerificationError};
 
+use crate::queries::verifier_runs::{LeaseToken, RetryOutcome, Settlement, settlement};
 use crate::{OperatorPool, TenantConn};
 
 /// Fail every dispatch that can no longer be attempted.
@@ -156,13 +157,13 @@ impl Default for OperatorDispatchQueue {
     }
 }
 
-/// Opaque fencing token of one dispatch claim.
+/// The identity a worker settles a claimed dispatch with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DispatchLease {
     /// The claimed dispatch.
     pub dispatch_id: OperatorDispatchId,
-    /// This claim's token.
-    token: Uuid,
+    /// This claim's fencing token.
+    pub token: LeaseToken,
 }
 
 /// A dispatch claimed for one delivery attempt.
@@ -182,17 +183,6 @@ pub struct ClaimedDispatch {
     pub attempt: i32,
     /// Time left before the dispatch deadline, as PostgreSQL computed it.
     pub remaining: Duration,
-}
-
-/// The stored result of a retry request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DispatchRetry {
-    /// Another attempt is due at this database time.
-    Scheduled(DateTime<Utc>),
-    /// The budget or deadline is spent; the dispatch is `failed`.
-    Exhausted,
-    /// The lease no longer holds the dispatch; nothing changed.
-    StaleLease,
 }
 
 impl OperatorDispatchQueue {
@@ -238,7 +228,8 @@ impl OperatorDispatchQueue {
             .bind(millis(self.deadline))
             .fetch_optional(&mut **conn.transaction())
             .await?;
-        row.map(|row| row.into_claimed(token)).transpose()
+        row.map(|row| row.into_claimed(LeaseToken(token)))
+            .transpose()
     }
 
     /// Settle a claimed dispatch `delivered`.
@@ -249,13 +240,13 @@ impl OperatorDispatchQueue {
         &self,
         conn: &mut TenantConn<'_>,
         lease: DispatchLease,
-    ) -> Result<bool, SqlxError> {
+    ) -> Result<Settlement, SqlxError> {
         let done = sqlx::query(DELIVER_SQL)
             .bind(lease.dispatch_id.as_uuid())
-            .bind(lease.token)
+            .bind(lease.token.0)
             .execute(&mut **conn.transaction())
             .await?;
-        Ok(done.rows_affected() == 1)
+        Ok(settlement(done.rows_affected()))
     }
 
     /// Settle a claimed dispatch `failed` with a terminal error.
@@ -267,14 +258,14 @@ impl OperatorDispatchQueue {
         conn: &mut TenantConn<'_>,
         lease: DispatchLease,
         error: &VerificationError,
-    ) -> Result<bool, SqlxError> {
+    ) -> Result<Settlement, SqlxError> {
         let done = sqlx::query(FAIL_SQL)
             .bind(lease.dispatch_id.as_uuid())
-            .bind(lease.token)
+            .bind(lease.token.0)
             .bind(Json(error))
             .execute(&mut **conn.transaction())
             .await?;
-        Ok(done.rows_affected() == 1)
+        Ok(settlement(done.rows_affected()))
     }
 
     /// Schedule another attempt after `delay`, clipped to the deadline, or fail.
@@ -287,10 +278,10 @@ impl OperatorDispatchQueue {
         lease: DispatchLease,
         error: &VerificationError,
         delay: Duration,
-    ) -> Result<DispatchRetry, SqlxError> {
+    ) -> Result<RetryOutcome, SqlxError> {
         let row: Option<(String, Option<DateTime<Utc>>)> = sqlx::query_as(RETRY_SQL)
             .bind(lease.dispatch_id.as_uuid())
-            .bind(lease.token)
+            .bind(lease.token.0)
             .bind(Json(error))
             .bind(self.max_attempts)
             .bind(millis(delay))
@@ -298,9 +289,9 @@ impl OperatorDispatchQueue {
             .fetch_optional(&mut **conn.transaction())
             .await?;
         Ok(match row {
-            None => DispatchRetry::StaleLease,
-            Some((_, Some(at))) => DispatchRetry::Scheduled(at),
-            Some((_, None)) => DispatchRetry::Exhausted,
+            None => RetryOutcome::StaleLease,
+            Some((_, Some(at))) => RetryOutcome::Scheduled(at),
+            Some((_, None)) => RetryOutcome::Exhausted,
         })
     }
 
@@ -314,13 +305,13 @@ impl OperatorDispatchQueue {
         &self,
         conn: &mut TenantConn<'_>,
         lease: DispatchLease,
-    ) -> Result<bool, SqlxError> {
+    ) -> Result<Settlement, SqlxError> {
         let done = sqlx::query(RELEASE_SQL)
             .bind(lease.dispatch_id.as_uuid())
-            .bind(lease.token)
+            .bind(lease.token.0)
             .execute(&mut **conn.transaction())
             .await?;
-        Ok(done.rows_affected() == 1)
+        Ok(settlement(done.rows_affected()))
     }
 
     /// Tenants with due, lease-expired, or exhaustible dispatches.
@@ -376,7 +367,7 @@ impl ClaimRow {
     ///
     /// # Errors
     /// Returns [`SqlxError::Decode`] for malformed identities.
-    fn into_claimed(self, token: Uuid) -> Result<ClaimedDispatch, SqlxError> {
+    fn into_claimed(self, token: LeaseToken) -> Result<ClaimedDispatch, SqlxError> {
         let decode = |error: wyrd_spec::ids::IdError| SqlxError::Decode(Box::new(error));
         let operator = match (self.operator_uid, self.operator_digest) {
             (Some(uid), None) => FrozenTarget::Uid(CardUid::from_uuid(uid).map_err(decode)?),

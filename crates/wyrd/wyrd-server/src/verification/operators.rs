@@ -39,14 +39,15 @@ use wyrd_spec::verification::{FrozenTarget, VerificationError};
 use wyrd_sql::queries::cards::get_card_by_uid;
 use wyrd_sql::queries::operator_connections::find_connection;
 use wyrd_sql::queries::operator_dispatches::{
-    ClaimedDispatch, DispatchRetry, OperatorDispatchQueue,
+    ClaimedDispatch, OperatorDispatchQueue,
 };
+use wyrd_sql::queries::verifier_runs::RetryOutcome;
 use wyrd_sql::{OperatorPool, SqlError, TenantConn, WyrdPostgres};
 
 #[cfg(feature = "test-support")]
 use super::CapabilityCrash;
 use super::RuntimeLimits;
-use super::claims::{ClaimLoop, LeasedWork};
+use super::claims::{ClaimLoop, LeasedWork, settled};
 use super::health::RuntimeCapability;
 use super::permits::VerifierPermits;
 use crate::components::operators::keys::{KeyError, OperatorKeys};
@@ -397,18 +398,18 @@ impl OperatorWorker {
         let lease = dispatch.lease;
         let mut conn = self.postgres.tenant_conn(tenant).await?;
         let outcome = match attempt {
-            Attempt::Delivered => fenced(self.queue.deliver(&mut conn, lease).await?, "delivered"),
+            Attempt::Delivered => settled(self.queue.deliver(&mut conn, lease).await?, "delivered"),
             Attempt::Terminal(error) => {
-                fenced(self.queue.fail(&mut conn, lease, &error).await?, "failed")
+                settled(self.queue.fail(&mut conn, lease, &error).await?, "failed")
             }
-            Attempt::Release => fenced(self.queue.release(&mut conn, lease).await?, "released"),
+            Attempt::Release => settled(self.queue.release(&mut conn, lease).await?, "released"),
             Attempt::Retry { error, retry_after } => {
                 let backoff = self.limits.operator_backoff(dispatch.attempt);
                 let delay = retry_after.map_or(backoff, |after| after.max(backoff));
                 match self.queue.retry(&mut conn, lease, &error, delay).await? {
-                    DispatchRetry::Scheduled(_) => "retrying",
-                    DispatchRetry::Exhausted => "failed",
-                    DispatchRetry::StaleLease => "stale_lease",
+                    RetryOutcome::Scheduled(_) => "retrying",
+                    RetryOutcome::Exhausted => "failed",
+                    RetryOutcome::StaleLease => "stale_lease",
                 }
             }
         };
@@ -998,11 +999,6 @@ async fn bounded_body(mut response: Response) -> Result<Vec<u8>, reqwest::Error>
         }
     }
     Ok(body)
-}
-
-/// `label` when the fenced settlement applied, otherwise `stale_lease`.
-const fn fenced(applied: bool, label: &'static str) -> &'static str {
-    if applied { label } else { "stale_lease" }
 }
 
 /// A dispatch failure with a stable `code` and diagnostic `message`.

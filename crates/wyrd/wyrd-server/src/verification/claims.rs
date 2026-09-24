@@ -16,6 +16,7 @@ use std::time::Duration;
 use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 use wyrd_spec::DataTenantId;
+use wyrd_sql::queries::verifier_runs::Settlement;
 use wyrd_sql::{SqlError, TenantConn, WyrdPostgres};
 
 #[cfg(feature = "test-support")]
@@ -269,6 +270,15 @@ impl ClaimLoop {
 }
 
 /// Log a spawned item that panicked; its lease expires into a reclaim.
+/// `label` when a fenced run or dispatch settlement applied, otherwise
+/// `stale_lease`; the outcome label both capabilities log and count.
+pub(super) const fn settled(settlement: Settlement, label: &'static str) -> &'static str {
+    match settlement {
+        Settlement::Applied => label,
+        Settlement::StaleLease => "stale_lease",
+    }
+}
+
 fn reap<W: LeasedWork>(finished: Result<(), JoinError>) {
     if let Err(error) = finished
         && error.is_panic()

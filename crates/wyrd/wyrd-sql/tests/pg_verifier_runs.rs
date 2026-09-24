@@ -27,7 +27,7 @@ use wyrd_sql::queries::cards::{
     NewCardRow, NewRegistrationOperation, insert_card_row, insert_registration_operation,
     upsert_service_account_from_card,
 };
-use wyrd_sql::queries::operator_dispatches::{DispatchRetry, OperatorDispatchQueue};
+use wyrd_sql::queries::operator_dispatches::OperatorDispatchQueue;
 use wyrd_sql::queries::verification::{
     BindingActivation, FrozenTarget, NewBinding, project_bindings, record_machine_authentication,
 };
@@ -1894,15 +1894,16 @@ async fn dispatch_delivery_obeys_budget_deadline_and_fencing() {
     assert_eq!(first.attempt, 1);
     assert!(first.remaining <= std::time::Duration::from_secs(300));
     assert!(first.remaining > std::time::Duration::from_secs(290));
-    assert!(
+    assert_eq!(
         dispatches
             .deliver(&mut conn, sibling.lease)
             .await
-            .expect("sibling delivers")
+            .expect("sibling delivers"),
+        Settlement::Applied
     );
 
     let error = engine_error();
-    let DispatchRetry::Scheduled(at) = dispatches
+    let RetryOutcome::Scheduled(at) = dispatches
         .retry(
             &mut conn,
             first.lease,
@@ -1922,11 +1923,12 @@ async fn dispatch_delivery_obeys_budget_deadline_and_fencing() {
     .await
     .expect("dispatch reads");
     assert_eq!(at - written, Duration::seconds(30));
-    assert!(
-        !dispatches
+    assert_eq!(
+        dispatches
             .deliver(&mut conn, first.lease)
             .await
             .expect("stale deliver answers"),
+        Settlement::StaleLease,
         "a settled lease cannot deliver"
     );
 
@@ -1947,11 +1949,12 @@ async fn dispatch_delivery_obeys_budget_deadline_and_fencing() {
         assert_eq!(again.lease.dispatch_id, first.lease.dispatch_id);
         assert_eq!(again.attempt, attempt);
         if attempt == 2 {
-            assert!(
+            assert_eq!(
                 dispatches
                     .release(&mut conn, again.lease)
                     .await
-                    .expect("release applies")
+                    .expect("release applies"),
+                Settlement::Applied
             );
             let refunded = dispatches
                 .claim(&mut conn)
@@ -1969,7 +1972,7 @@ async fn dispatch_delivery_obeys_budget_deadline_and_fencing() {
                     .retry(&mut conn, again.lease, &error, std::time::Duration::ZERO)
                     .await
                     .expect("retry answers"),
-                DispatchRetry::Exhausted
+                RetryOutcome::Exhausted
             );
         }
     }

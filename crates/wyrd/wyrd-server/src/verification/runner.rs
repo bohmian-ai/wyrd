@@ -32,14 +32,14 @@ use wyrd_spec::reference::CardRef;
 use wyrd_spec::verification::{VerificationError, VerificationVerdict};
 use wyrd_sql::queries::cards::get_card_by_uid;
 use wyrd_sql::queries::verifier_runs::{
-    ClaimedRun, RetryOutcome, RunInput, Settlement, TerminalStatus, VerifierRunQueue,
+    ClaimedRun, RetryOutcome, RunInput, TerminalStatus, VerifierRunQueue,
 };
 use wyrd_sql::{OperatorPool, SqlError, TenantConn, WyrdPostgres};
 
 #[cfg(feature = "test-support")]
 use super::CapabilityCrash;
 use super::RuntimeLimits;
-use super::claims::{ClaimLoop, LeasedWork};
+use super::claims::{ClaimLoop, LeasedWork, settled};
 use super::engines::{self, EngineOutcome, VerifierReport};
 use super::health::RuntimeCapability;
 use super::permits::VerifierPermits;
@@ -156,22 +156,6 @@ impl VerifierRunner {
     /// until expiry.
     pub async fn run(self: Arc<Self>, stop: CancellationToken) {
         self.claims.run(&self, stop).await;
-    }
-
-    /// Release `run`, claimed by a commit that completed after shutdown
-    /// began, with its attempt refunded and without executing it.
-    ///
-    /// Uses the same fenced release transition as the drain. A failed release
-    /// is logged; the lease then expires into a reclaim.
-    async fn refund_late_claim(&self, tenant: DataTenantId, run: &ClaimedRun) {
-        match self.settle(tenant, run, Transition::Release).await {
-            Ok(outcome) => {
-                tracing::info!(run_id = %run.lease.run_id, outcome, "claim committed after shutdown began; released");
-            }
-            Err(error) => {
-                tracing::error!(run_id = %run.lease.run_id, %error, "releasing a claim committed after shutdown failed; the lease will expire");
-            }
-        }
     }
 
     /// Load the Verifier, dispatch it, and publish a completed report.
@@ -459,17 +443,20 @@ impl LeasedWork for VerifierRunner {
         .record(started.elapsed().as_secs_f64());
     }
 
-    /// Release a run claimed after shutdown began, with its attempt refunded.
+    /// Release a run claimed after shutdown began, with its attempt refunded
+    /// and without executing it.
+    ///
+    /// Uses the same fenced release transition as the drain. A failed release
+    /// is logged; the lease then expires into a reclaim.
     async fn release_late(&self, tenant: DataTenantId, run: &ClaimedRun) {
-        self.refund_late_claim(tenant, run).await;
-    }
-}
-
-/// `label` when the settlement applied, otherwise `stale_lease`.
-const fn settled(settlement: Settlement, label: &'static str) -> &'static str {
-    match settlement {
-        Settlement::Applied => label,
-        Settlement::StaleLease => "stale_lease",
+        match self.settle(tenant, run, Transition::Release).await {
+            Ok(outcome) => {
+                tracing::info!(run_id = %run.lease.run_id, outcome, "claim committed after shutdown began; released");
+            }
+            Err(error) => {
+                tracing::error!(run_id = %run.lease.run_id, %error, "releasing a claim committed after shutdown failed; the lease will expire");
+            }
+        }
     }
 }
 

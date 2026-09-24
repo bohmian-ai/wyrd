@@ -573,10 +573,12 @@ pub struct ScheduleTick {
 
 /// Opaque fencing token of one claim.
 ///
-/// Only [`VerifierRunQueue::claim`] mints one, so a settlement can only be
-/// attempted by a worker that actually claimed the run.
+/// Only [`VerifierRunQueue::claim`] and
+/// [`OperatorDispatchQueue::claim`](crate::queries::operator_dispatches::OperatorDispatchQueue::claim)
+/// mint one, so a settlement can only be attempted by a worker that actually
+/// claimed the run or dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LeaseToken(Uuid);
+pub struct LeaseToken(pub(crate) Uuid);
 
 /// The identity a runner settles a claimed run with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -623,18 +625,19 @@ pub struct ClaimedRun {
 pub enum Settlement {
     /// The transition was applied (or idempotently re-applied).
     Applied,
-    /// The lease token no longer holds the run; nothing changed.
+    /// The lease token no longer holds the run or dispatch; nothing changed.
     StaleLease,
 }
 
-/// Outcome of reporting a retryable engine failure.
+/// Outcome of reporting a retryable run or dispatch failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetryOutcome {
-    /// The same run and input will be attempted again at this time.
+    /// The same work will be attempted again at this database time.
     Scheduled(DateTime<Utc>),
-    /// The attempt budget is exhausted; the run is now `errored`.
+    /// The attempt budget (or a dispatch's deadline) is spent; a run is now
+    /// `errored`, a dispatch `failed`.
     Exhausted,
-    /// The lease token no longer holds the run; nothing changed.
+    /// The lease token no longer holds the work; nothing changed.
     StaleLease,
 }
 
@@ -1619,8 +1622,9 @@ impl DispatchRow {
     }
 }
 
-/// Map a fenced update's row count to its settlement outcome.
-fn settlement(rows_affected: u64) -> Settlement {
+/// Map a fenced update's row count to its settlement outcome; shared by the
+/// run and Operator dispatch queues.
+pub(crate) fn settlement(rows_affected: u64) -> Settlement {
     if rows_affected == 0 {
         Settlement::StaleLease
     } else {

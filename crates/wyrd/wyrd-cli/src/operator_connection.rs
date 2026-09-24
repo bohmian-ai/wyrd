@@ -11,10 +11,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Subcommand};
-use serde::Serialize;
 use serde::de::DeserializeOwned;
 use wyrd_client::operator_connections::OperatorConnectionId;
 
+use crate::card::print_json;
 use crate::error::WyrdCliError;
 use crate::principal::credential::TenantEndpoint;
 
@@ -77,7 +77,7 @@ pub struct UpdateArgs {
 pub async fn dispatch(command: OperatorConnectionCommand) -> Result<ExitCode, WyrdCliError> {
     let connections =
         |endpoint: &TenantEndpoint| crate::client::operator_connections(endpoint.server.as_str());
-    match command {
+    let printed = match command {
         OperatorConnectionCommand::Create(args) => {
             let request = read_body(&args.body_file)?;
             print_json(&connections(&args.endpoint)?.create(&request).await?)
@@ -103,7 +103,8 @@ pub async fn dispatch(command: OperatorConnectionCommand) -> Result<ExitCode, Wy
                 .disable(&args.connection_id)
                 .await?,
         ),
-    }
+    };
+    printed.map(|()| ExitCode::SUCCESS)
 }
 
 /// Read and decode a JSON or YAML request body from `path`, or stdin for `-`.
@@ -137,18 +138,6 @@ fn read_body<T: DeserializeOwned>(path: &std::path::Path) -> Result<T, WyrdCliEr
             },
         ),
     })
-}
-
-/// Print one redacted response as pretty JSON.
-///
-/// # Errors
-/// Returns [`WyrdCliError::Output`] when the value cannot be serialized.
-fn print_json(value: &impl Serialize) -> Result<ExitCode, WyrdCliError> {
-    let text = serde_json::to_string_pretty(value).map_err(|error| WyrdCliError::Output {
-        detail: error.to_string(),
-    })?;
-    println!("{text}");
-    Ok(ExitCode::SUCCESS)
 }
 
 /// Body decoding never echoes a secret value.

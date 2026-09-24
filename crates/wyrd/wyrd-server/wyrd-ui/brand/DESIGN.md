@@ -55,7 +55,7 @@ designed but not yet built.
 | Surface | `--surface` | `#FFFFFF` | `#131A19` | primary panel and chrome |
 | Surface secondary | `--surface-2` | `#E7EEEC` | `#19211F` | subordinate regions, neutral controls |
 | Surface hover | `--surface-hover` | `#EDF2F0` | `#1F2826` | neutral interaction feedback |
-| Ink | `--text` | `#10201D` | `#C8D3CF` | primary text, strongest rule |
+| Ink | `--text` | `#10201D` | `#E3E9E7` | primary text, strongest rule |
 | Muted ink | `--muted` | `#53645F` | `#A3AEAB` | supporting text, metadata |
 | Rule | `--border` | `#9AACAA` | `#434E4C` | structural dividers, control borders |
 | Rule soft | `--border-soft` | `#D7E1DE` | `#222A28` | row and subordinate dividers |

@@ -494,28 +494,42 @@ impl NativeWyrdTestServer {
 ///
 /// `auditPublication: false` keeps staged audit rows in place so a journey can
 /// count describe decisions; omitted, publication runs as in production.
+/// `verificationRuntime: true` composes the verification runtime, so Drift
+/// Verifier baselines fit and manual runs execute and persist results; omitted,
+/// it stays off so queue-driving journeys are not raced.
 ///
 /// # Errors
 ///
 /// Returns a napi error when server startup, service bootstrap, API-key
 /// exchange, or URL discovery fails.
 #[napi]
-pub fn start_test_server(audit_publication: Option<bool>) -> Result<NativeWyrdTestServer> {
+pub fn start_test_server(
+    audit_publication: Option<bool>,
+    verification_runtime: Option<bool>,
+) -> Result<NativeWyrdTestServer> {
     wyrd_runtime::runtime().block_on(Box::pin(start_test_server_async(
         audit_publication.unwrap_or(true),
+        verification_runtime.unwrap_or(false),
     )))
 }
 
 /// Starts the bound harness inside Wyrd's shared runtime, disabling audit
-/// publication when `audit_publication` is false.
+/// publication when `audit_publication` is false and composing the
+/// verification runtime when `verification_runtime` is true.
 ///
 /// # Errors
 ///
 /// Returns a napi error when any server setup step fails.
-async fn start_test_server_async(audit_publication: bool) -> Result<NativeWyrdTestServer> {
+async fn start_test_server_async(
+    audit_publication: bool,
+    verification_runtime: bool,
+) -> Result<NativeWyrdTestServer> {
     let mut builder = WyrdTestServer::builder();
     if !audit_publication {
         builder = builder.without_audit_publication_for_test();
+    }
+    if verification_runtime {
+        builder = builder.with_verification_runtime_for_test();
     }
     let server = Box::pin(builder.start_bound())
         .await

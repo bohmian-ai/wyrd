@@ -1313,3 +1313,76 @@ async fn slow_rewrap_never_holds_back_another_tenants_delivery() {
         "one pass reads the active and the repeated old version once each"
     );
 }
+
+/// A cross-tenant rewrap discovery stalled behind a lock on the connection
+/// table returns within the pass budget without touching a row, and the next
+/// pass after the stall clears rewraps every stale row.
+///
+/// # Panics
+/// Panics when the stalled pass outlives its budget, mutates a row, or the
+/// later pass does not rewrap.
+#[tokio::test]
+async fn stalled_rewrap_discovery_returns_within_the_pass_budget() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use base64::Engine as _;
+    let delivery = Delivery::start().await;
+    let tenant = delivery.seed.tenant();
+    let dir = delivery
+        .server
+        .operator_keys_dir_for_test()
+        .expect("generated key directory");
+    let v2 = dir.join("v2");
+    std::fs::write(
+        &v2,
+        base64::engine::general_purpose::STANDARD.encode([8_u8; 32]),
+    )
+    .expect("key v2 writes");
+    std::fs::set_permissions(&v2, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    let keys = OperatorKeys::new(OperatorKeysConfig {
+        source: OperatorKeySource::File,
+        active_version: std::num::NonZeroU32::new(2).expect("nonzero"),
+        dir: Some(dir.to_path_buf()),
+        vault: None,
+    })
+    .expect("file keys build");
+    let state = delivery.server.state();
+    let operator = state.postgres.operator_pool().expect("operator pool");
+
+    let mut lock = delivery.assertion.begin().await.expect("lock transaction");
+    sqlx::query("LOCK TABLE wyrd.operator_connections IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock)
+        .await
+        .expect("connection table locks");
+    let budget = Duration::from_millis(300);
+    let started = tokio::time::Instant::now();
+    let moved = tokio::time::timeout(
+        WAIT,
+        keys.rewrap_pass(state.postgres.wyrd(), &operator, budget, budget),
+    )
+    .await
+    .expect("the stalled pass returns")
+    .expect("a stalled discovery is not a pass failure");
+    let elapsed = started.elapsed();
+    assert_eq!(moved, 0);
+    assert!(
+        elapsed < budget + Duration::from_secs(2),
+        "the stalled discovery outlived the pass budget: {elapsed:?}"
+    );
+    lock.rollback().await.expect("lock releases");
+    assert_eq!(
+        key_versions(&delivery.assertion, tenant).await,
+        vec![1, 1, 1],
+        "a timed-out discovery mutates nothing"
+    );
+
+    let moved = keys
+        .rewrap_pass(state.postgres.wyrd(), &operator, WAIT, WAIT)
+        .await
+        .expect("the next pass runs");
+    assert_eq!(moved, 3);
+    assert_eq!(
+        key_versions(&delivery.assertion, tenant).await,
+        vec![2, 2, 2]
+    );
+}

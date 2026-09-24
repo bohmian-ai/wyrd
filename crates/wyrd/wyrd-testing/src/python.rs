@@ -480,6 +480,59 @@ impl WyrdTestServer {
             .map_err(WyrdPyError::from)
     }
 
+    /// Bring binding `binding_id`'s schedule cursor to database time, so the
+    /// verification runtime schedules its next occurrence now.
+    ///
+    /// # Errors
+    /// Raises a Wyrd Python error when the context manager is inactive,
+    /// `binding_id` is not a binding ID, or the update fails.
+    fn make_binding_due(&self, binding_id: &str) -> WyrdPyResult<()> {
+        let server = self.server.as_ref().ok_or_else(not_started)?;
+        let binding = binding_id.parse().map_err(harness_error)?;
+        wyrd_runtime::runtime()
+            .block_on(async {
+                server
+                    .verification_fixture()
+                    .await?
+                    .make_binding_due(binding)
+                    .await
+            })
+            .map_err(|error| WyrdPyError::from(harness_error(error)))
+    }
+
+    /// Every verification run ID of the fixture tenant, oldest first.
+    ///
+    /// # Errors
+    /// Raises a Wyrd Python error when the context manager is inactive or the
+    /// runs cannot be read.
+    fn verification_runs(&self) -> WyrdPyResult<Vec<String>> {
+        let server = self.server.as_ref().ok_or_else(not_started)?;
+        let runs = wyrd_runtime::runtime()
+            .block_on(async { server.verification_fixture().await?.runs().await })
+            .map_err(|error| WyrdPyError::from(harness_error(error)))?;
+        Ok(runs.iter().map(ToString::to_string).collect())
+    }
+
+    /// Strip the fitted-profile format from Verifier `verifier_uid`'s ready
+    /// baseline, as a baseline fitted under earlier semantics is stored.
+    ///
+    /// # Errors
+    /// Raises a Wyrd Python error when the context manager is inactive,
+    /// `verifier_uid` is not a Card UID, or no ready baseline exists.
+    fn retire_fitted_format(&self, verifier_uid: &str) -> WyrdPyResult<()> {
+        let server = self.server.as_ref().ok_or_else(not_started)?;
+        let verifier = verifier_uid.parse().map_err(harness_error)?;
+        wyrd_runtime::runtime()
+            .block_on(async {
+                server
+                    .verification_fixture()
+                    .await?
+                    .retire_fitted_format(&verifier)
+                    .await
+            })
+            .map_err(|error| WyrdPyError::from(harness_error(error)))
+    }
+
     /// Truncate the next query after its schema frame in the real server.
     ///
     /// # Errors

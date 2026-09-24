@@ -3462,6 +3462,26 @@ impl WyrdTestServer {
         &self.inner.fixture
     }
 
+    /// Open the verification fixture of this server's fixture tenant.
+    ///
+    /// Language test servers reach the test-only verification controls, such
+    /// as making a binding due or retiring a fitted profile, through this
+    /// one owner instead of restating its SQL.
+    ///
+    /// # Errors
+    /// Returns [`crate::verification::VerificationFixtureError`] when the
+    /// tenant cannot be provisioned.
+    pub async fn verification_fixture(
+        &self,
+    ) -> Result<crate::verification::VerificationFixture, crate::verification::VerificationFixtureError>
+    {
+        crate::verification::VerificationFixture::provision(
+            self.inner.state.postgres.wyrd(),
+            self.inner.fixture.data_tenant_id(),
+        )
+        .await
+    }
+
     /// Cancel and drain a partially started bound server while preserving the
     /// startup error that caused rollback.
     async fn rollback_bound_startup(

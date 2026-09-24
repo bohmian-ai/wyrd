@@ -6,10 +6,12 @@ reads every baseline's Card status until it is ready. A Service bound to the
 SPC Verifier with one Operator emits Drift observations through ``WyrdState``;
 direct runs of every Verifier then score the window server-side and persist
 their results, SPC X-bar/S evidence, and feature rows without an Operator
-dispatch, and a run of the Service's binding fails on SPC signals and
-dispatches its Operator. Negative flows cover an Arrow IPC baseline refused as
-non-Parquet, an SPC profile carrying the retired ``weco_rule`` field, and a
-caller without ``evals:run``. A second journey proves each method's edge
+dispatch. A manual run of the Service's binding and its due scheduled
+occurrence each fail on SPC signals and dispatch its Operator. Once the SPC
+Verifier's stored fit is retired to a pre-revision format, a new run is refused
+with ``baseline_legacy`` while its earlier result stays readable. Negative flows
+cover an Arrow IPC baseline refused as non-Parquet, an SPC profile carrying the
+retired ``weco_rule`` field, and a caller without ``evals:run``. A second journey proves each method's edge
 semantics on isolated subjects: an empty tenant, a baseline-like window, SPC
 subgroups until a partial one, a sparse window, unrelated and incomplete
 records, per-row Custom averaging with window bounds, and a text-valued metric.
@@ -137,6 +139,33 @@ def wait_ready(server: WyrdTestServer, credential: str, verifier: CardRef, root:
         time.sleep(0.2)
 
 
+def settle(verification: Verification, run_id: str) -> dict:
+    """Poll run ``run_id`` until it leaves the queue and return its status."""
+    deadline = time.monotonic() + WAIT_SECONDS
+    while (run := verification.get_run(run_id))["status"] in {"pending", "running", "retrying"}:
+        assert time.monotonic() < deadline, f"run never settled: {run}"
+        time.sleep(0.1)
+    return run
+
+
+def scheduled_run(server: WyrdTestServer, binding_id: str) -> str:
+    """Make ``binding_id`` due and return the one run its occurrence schedules.
+
+    Dueness is PostgreSQL's decision, so the test harness places the schedule
+    cursor at statement time and the verification runtime schedules the
+    occurrence; the daily window ``[midnight UTC, now)`` holds this journey's
+    observations.
+    """
+    earlier = set(server.verification_runs())
+    server.make_binding_due(binding_id)
+    deadline = time.monotonic() + WAIT_SECONDS
+    while not (runs := [run for run in server.verification_runs() if run not in earlier]):
+        assert time.monotonic() < deadline, "the due binding never scheduled a run"
+        time.sleep(0.1)
+    (run,) = runs
+    return run
+
+
 def complete(
     verification: Verification,
     verifier: CardRef,
@@ -163,10 +192,7 @@ def complete(
             },
         }
     )
-    deadline = time.monotonic() + WAIT_SECONDS
-    while (run := verification.get_run(run_id))["status"] in {"pending", "running", "retrying"}:
-        assert time.monotonic() < deadline, f"run never settled: {run}"
-        time.sleep(0.1)
+    run = settle(verification, run_id)
     assert run["status"] == "completed", run
     assert run["dispatches"] == [], "a direct run never dispatches"
     return run["result_id"]
@@ -245,8 +271,9 @@ def test_parquet_baselines_fit_and_score_drift_server_side(tmp_path: Path) -> No
 
         verification = Verification(server_url=server.base_url, credential=credential)
         query = Bifrost(server_url=server.base_url, credential=admin)
+        results = {}
         for name, verifier in verifiers.items():
-            result_id = complete(verification, verifier, service)
+            result_id = results[name] = complete(verification, verifier, service)
             server.flush_bifrost()
             (result,) = (
                 query.sql(
@@ -283,27 +310,55 @@ def test_parquet_baselines_fit_and_score_drift_server_side(tmp_path: Path) -> No
                 },
             }
         )
-        deadline = time.monotonic() + WAIT_SECONDS
-        while (run := verification.get_run(binding_run))["status"] in {
-            "pending",
-            "running",
-            "retrying",
-        }:
-            assert time.monotonic() < deadline, f"binding run never settled: {run}"
-            time.sleep(0.1)
-        assert run["status"] == "completed", run
-        assert len(run["dispatches"]) == 1, "a failed binding result dispatches its Operator"
-        server.flush_bifrost()
-        (bound,) = (
+        for run_id in (binding_run, scheduled_run(server, binding_id)):
+            run = settle(verification, run_id)
+            assert run["status"] == "completed", run
+            assert len(run["dispatches"]) == 1, "a failed binding result dispatches its Operator"
+            server.flush_bifrost()
+            (bound,) = (
+                query.sql(
+                    "SELECT verdict, binding_id, details FROM vala.verification.results "
+                    f"WHERE result_id = '{run['result_id']}'"
+                )
+                .to_arrow()
+                .to_pylist()
+            )
+            assert (bound["verdict"], bound["binding_id"]) == ("failed", binding_id), bound
+            assert_spc_evidence(bound["details"], 24, 24)
+
+        spc = verifiers["py-drift-spc"]
+        server.retire_fitted_format(str(spc.uid))
+        now = datetime.now(UTC)
+        refused = settle(
+            verification,
+            verification.start_run(
+                {
+                    "target": {
+                        "kind": "verifier",
+                        "verifier_uid": str(spc.uid),
+                        "subject_card_uid": str(service.uid),
+                    },
+                    "input": {
+                        "kind": "drift_window",
+                        "start": (now - timedelta(hours=1)).isoformat(),
+                        "end": (now + timedelta(hours=1)).isoformat(),
+                    },
+                }
+            ),
+        )
+        assert refused["status"] == "errored", refused
+        assert refused["error"]["code"] == "baseline_legacy", refused
+        assert refused["result_id"] is None, "a refused legacy run is never scored"
+        (historical,) = (
             query.sql(
-                "SELECT verdict, binding_id, details FROM vala.verification.results "
-                f"WHERE result_id = '{run['result_id']}'"
+                "SELECT verdict, details FROM vala.verification.results "
+                f"WHERE result_id = '{results['py-drift-spc']}'"
             )
             .to_arrow()
             .to_pylist()
         )
-        assert (bound["verdict"], bound["binding_id"]) == ("failed", binding_id), bound
-        assert_spc_evidence(bound["details"], 24, 24)
+        assert historical["verdict"] == "failed", historical
+        assert_spc_evidence(historical["details"], 24, 24)
 
         ipc = DataCard(
             ArrowInterface(data=pa.table({"latency": LATENCY}), format="ipc"),

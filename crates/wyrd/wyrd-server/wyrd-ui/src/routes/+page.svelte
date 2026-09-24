@@ -69,6 +69,8 @@
     isolation: isolate;
     overflow: hidden;
     display: grid;
+    /* A bounded track, so the card's width: 100% resolves against the viewport, not its content. */
+    grid-template-columns: minmax(0, 1fr);
     place-items: center;
     padding: 64px 24px 96px;
     background: var(--bg);

@@ -1943,13 +1943,13 @@ mod drift_validation_tests {
 
     use crate::card::drift::{
         CustomProfile, DriftCondition, DriftMethod, DriftProfile, DriftSignal, DriftSpec,
-        DriftValidationError, PsiBinningStrategy, PsiProfile, PsiThreshold, SpcAlertThreshold,
-        SpcProfile, SpcWecoRule,
+        DriftValidationError, PsiBinningStrategy, PsiProfile, PsiThreshold, SpcProfile,
     };
     use crate::envelope::CardKind;
     use crate::error::WyrdError;
     use crate::ids::{CardName, FeatureName, SpaceName};
     use crate::reference::{CardRef, Ref};
+    use serde_json::json;
     use wyrd_semver::VersionBlock;
 
     /// Build a durable reference in the `default` space.
@@ -1984,11 +1984,7 @@ mod drift_validation_tests {
 
     /// Build a valid SPC profile.
     fn spc_profile() -> SpcProfile {
-        SpcProfile {
-            sample_size: 0,
-            weco_rule: SpcWecoRule::default(),
-            alert_threshold: SpcAlertThreshold::Zone4,
-        }
+        SpcProfile { sample_size: 5 }
     }
 
     /// Build a valid Custom profile.
@@ -2308,40 +2304,48 @@ mod drift_validation_tests {
         assert!(matches!(err, DriftValidationError::PsiBinCountOutOfRange));
     }
 
-    /// Reject an SPC sample size of exactly one.
+    /// Reject SPC subgroup sizes of zero and one.
     #[test]
-    fn rejects_spc_sample_size_one() {
-        let mut profile = spc_profile();
-        profile.sample_size = 1;
+    fn rejects_spc_sample_size_below_two() {
+        for sample_size in [0, 1] {
+            let err = DriftSpec::new(
+                DriftMethod::Spc,
+                distribution_signal(),
+                DriftCondition::Statistical,
+                Some(DriftProfile::Spc(SpcProfile { sample_size })),
+                None,
+            )
+            .unwrap_err();
 
-        let err = DriftSpec::new(
-            DriftMethod::Spc,
-            distribution_signal(),
-            DriftCondition::Statistical,
-            Some(DriftProfile::Spc(profile)),
-            None,
-        )
-        .unwrap_err();
-
-        assert!(matches!(err, DriftValidationError::SpcSampleSizeOutOfRange));
+            assert!(
+                matches!(err, DriftValidationError::SpcSampleSizeOutOfRange),
+                "{sample_size}"
+            );
+        }
     }
 
-    /// Reject a WECO rule string containing a zero.
+    /// Reject the retired `weco_rule` and `alert_threshold` fields and any
+    /// other unknown SPC profile field.
     #[test]
-    fn rejects_malformed_spc_weco_rule() {
-        let mut profile = spc_profile();
-        profile.weco_rule.rule_string = "8 16 0 8 2 4 1 1".to_string();
-
-        let err = DriftSpec::new(
-            DriftMethod::Spc,
-            distribution_signal(),
-            DriftCondition::Statistical,
-            Some(DriftProfile::Spc(profile)),
-            None,
-        )
-        .unwrap_err();
-
-        assert!(matches!(err, DriftValidationError::SpcWecoMalformed));
+    fn rejects_retired_and_unknown_spc_profile_fields() {
+        for extra in [
+            json!({ "weco_rule": { "rule_string": "8 16 4 8 2 4 1 1" } }),
+            json!({ "alert_threshold": "Zone1" }),
+            json!({ "subgroups": 25 }),
+        ] {
+            let mut profile = json!({ "kind": "Spc", "sample_size": 5 });
+            profile
+                .as_object_mut()
+                .expect("object")
+                .extend(extra.as_object().expect("object").clone());
+            let error = serde_json::from_value::<DriftProfile>(profile).unwrap_err();
+            assert!(error.to_string().contains("unknown field"), "{error}");
+        }
+        assert_eq!(
+            serde_json::from_value::<DriftProfile>(json!({ "kind": "Spc", "sample_size": 5 }))
+                .expect("sample_size alone parses"),
+            DriftProfile::Spc(SpcProfile { sample_size: 5 })
+        );
     }
 
     /// Reject a blank Custom metric name.

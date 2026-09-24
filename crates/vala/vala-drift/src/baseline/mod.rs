@@ -25,6 +25,13 @@ pub enum FittedBaseline {
     Custom,
 }
 
+/// Format of every PSI and SPC fitted profile this crate writes.
+///
+/// Format 2 is the exhaustive-bin PSI and NIST X-bar/S SPC fit. Profiles
+/// fitted earlier carry no format and are refused rather than rescored under
+/// different math; their Verifier needs a new version and a new fit.
+pub const FITTED_FORMAT: u32 = 2;
+
 /// Rows a fit loop processes between two cancellation checks.
 ///
 /// Bounds how long a cancelled fit keeps computing inside one large feature.
@@ -153,15 +160,7 @@ pub fn score_drift(
                     message: "SPC method requires FittedBaseline::Spc".to_string(),
                 });
             };
-            let profile = match spec.profile.as_ref() {
-                Some(DriftProfile::Spc(profile)) => profile,
-                _ => {
-                    return Err(DriftScoreError::SpcInternal {
-                        message: "SPC method requires DriftProfile::Spc".to_string(),
-                    });
-                }
-            };
-            score_spc(baseline, target, profile)
+            score_spc(baseline, target)
         }
         DriftMethod::Custom => {
             if !matches!(baseline, FittedBaseline::Custom) {
@@ -204,7 +203,7 @@ mod dispatch_errors {
     use wyrd_semver::VersionBlock;
     use wyrd_spec::card::drift::{
         DriftCondition, DriftMethod, DriftProfile, DriftSignal, DriftSpec, PsiBinningStrategy,
-        PsiProfile, PsiThreshold, SpcAlertThreshold, SpcProfile, SpcWecoRule,
+        PsiProfile, PsiThreshold, SpcProfile,
     };
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, FeatureName, SpaceName};
@@ -240,11 +239,7 @@ mod dispatch_errors {
                 name: "latency".to_owned(),
             },
             condition: DriftCondition::Statistical,
-            profile: Some(DriftProfile::Spc(SpcProfile {
-                sample_size: 0,
-                weco_rule: SpcWecoRule::default(),
-                alert_threshold: SpcAlertThreshold::Zone4,
-            })),
+            profile: Some(DriftProfile::Spc(SpcProfile { sample_size: 5 })),
         }
     }
 
@@ -271,7 +266,8 @@ mod dispatch_errors {
         use wyrd_version::WyrdVersion;
         FittedBaseline::Spc(SpcBaseline {
             features: BTreeMap::new(),
-            chunk_size: 25,
+            subgroup_size: 25,
+            format: super::FITTED_FORMAT,
             wyrd_version: WyrdVersion::current(),
         })
     }
@@ -315,7 +311,7 @@ mod end_to_end {
     use wyrd_semver::VersionBlock;
     use wyrd_spec::card::drift::{
         CustomProfile, DriftCondition, DriftMethod, DriftProfile, DriftSignal, DriftSpec,
-        PsiBinningStrategy, PsiProfile, PsiThreshold, SpcAlertThreshold, SpcProfile, SpcWecoRule,
+        PsiBinningStrategy, PsiProfile, PsiThreshold, SpcProfile,
     };
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, FeatureName, SpaceName};
@@ -391,11 +387,7 @@ mod end_to_end {
     }
 
     fn spc_profile() -> SpcProfile {
-        SpcProfile {
-            sample_size: 0,
-            weco_rule: SpcWecoRule::default(),
-            alert_threshold: SpcAlertThreshold::Zone4,
-        }
+        SpcProfile { sample_size: 5 }
     }
 
     fn assert_report_shape(
@@ -414,11 +406,7 @@ mod end_to_end {
         assert_eq!(feature_report.feature, *feature);
         assert_eq!(feature_report.verdict, verdict);
         assert!(feature_report.score.is_finite());
-        if method == DriftMethod::Spc {
-            assert!(feature_report.threshold.is_nan());
-        } else {
-            assert!(feature_report.threshold.is_finite());
-        }
+        assert!(feature_report.threshold.is_finite());
     }
 
     #[test]
@@ -480,14 +468,13 @@ mod aggregate_inputs {
     use arrow::record_batch::RecordBatch;
     use arrow_schema::{DataType, Field, Schema};
     use wyrd_spec::card::drift::{
-        CustomProfile, PsiBinningStrategy, PsiProfile, PsiThreshold, SpcAlertThreshold, SpcProfile,
-        SpcWecoRule,
+        CustomProfile, PsiBinningStrategy, PsiProfile, PsiThreshold, SpcProfile,
     };
     use wyrd_spec::ids::FeatureName;
 
     use crate::{
-        DriftVerdict, FittedBaseline, PsiTargetCounts, SpcScorer, fit_psi_baseline,
-        fit_spc_baseline, score_custom_mean, score_psi, score_psi_counts, score_spc,
+        DriftVerdict, FittedBaseline, SpcScorer, fit_psi_baseline, fit_spc_baseline,
+        score_custom_mean, score_psi, score_psi_counts, score_spc,
     };
 
     /// Parse a fixture feature name.
@@ -541,7 +528,7 @@ mod aggregate_inputs {
         for value in &target {
             bins[crate::psi::binning::assign_bin(*value, &edges)] += 1;
         }
-        let counts = BTreeMap::from([(x.clone(), PsiTargetCounts { bins, total: 200 })]);
+        let counts = BTreeMap::from([(x.clone(), bins)]);
         let raw = score_psi(
             &baseline,
             &batch("x", DataType::Float64, Arc::new(Float64Array::from(target))),
@@ -552,25 +539,18 @@ mod aggregate_inputs {
         assert_eq!(raw, aggregate);
         assert_eq!(aggregate.verdict, DriftVerdict::Drift);
 
-        let small = BTreeMap::from([(
-            x.clone(),
-            PsiTargetCounts {
-                bins: vec![99, 0, 0, 0],
-                total: 99,
-            },
-        )]);
+        let small = BTreeMap::from([(x.clone(), vec![99, 0, 0, 0])]);
         let report = score_psi_counts(&baseline, &small, &profile).expect("small scores");
         assert_eq!(report.verdict, DriftVerdict::Inconclusive);
         assert!(report.features[&x].score.is_nan());
     }
 
-    /// Unknown categories count toward the categorical total without a bin.
+    /// Unseen categories land in the reserved `other` bin on both paths.
     ///
     /// # Panics
-    /// Panics when unknown categories do not dilute the fitted proportions
-    /// exactly as raw scoring does.
+    /// Panics when raw scoring and `other`-bin counts disagree.
     #[test]
-    fn psi_categorical_unknowns_join_the_total_only() {
+    fn psi_categorical_unknowns_land_in_the_other_bin() {
         let c = feature("c");
         let profile = psi_profile(vec![c.clone()]);
         let base: Vec<&str> = (0..200)
@@ -595,32 +575,22 @@ mod aggregate_inputs {
             &profile,
         )
         .expect("raw scores");
-        let counts = BTreeMap::from([(
-            c.clone(),
-            PsiTargetCounts {
-                bins: vec![100, 50],
-                total: 200,
-            },
-        )]);
+        let counts = BTreeMap::from([(c.clone(), vec![100, 50, 50])]);
         assert_eq!(
             raw,
             score_psi_counts(&baseline, &counts, &profile).expect("counts score")
         );
     }
 
-    /// Server chunk means equal raw-batch SPC scoring, and a window smaller
-    /// than the frozen chunk size is inconclusive.
+    /// Server subgroup aggregates equal raw-batch SPC scoring, and a target
+    /// ending in a partial subgroup is inconclusive.
     ///
     /// # Panics
-    /// Panics when the two paths disagree or a short window is not inconclusive.
+    /// Panics when the two paths disagree or a partial target scores.
     #[test]
-    fn spc_chunks_match_raw_scoring_and_short_windows_are_inconclusive() {
+    fn spc_subgroups_match_raw_scoring_and_partial_targets_are_inconclusive() {
         let x = feature("x");
-        let profile = SpcProfile {
-            sample_size: 5,
-            weco_rule: SpcWecoRule::default(),
-            alert_threshold: SpcAlertThreshold::Zone4,
-        };
+        let profile = SpcProfile { sample_size: 5 };
         let base: Vec<f64> = (0..100).map(|value| f64::from(value % 10)).collect();
         let baseline = fit_spc_baseline(
             &batch("x", DataType::Float64, Arc::new(Float64Array::from(base))),
@@ -628,28 +598,27 @@ mod aggregate_inputs {
             std::slice::from_ref(&x),
         )
         .expect("baseline fits");
-        let target: Vec<f64> = (0..23).map(|value| 40.0 + f64::from(value)).collect();
-        let mut scorer = SpcScorer::new(&baseline, &profile).expect("rule parses");
-        for chunk in target.chunks(5) {
-            let mean = chunk.iter().sum::<f64>() / chunk.len() as f64;
-            scorer
-                .push(&x, chunk.len() as u64, mean)
-                .expect("chunk pushes");
+        let target: Vec<f64> = (0..20).map(|value| 40.0 + f64::from(value)).collect();
+        let mut scorer = SpcScorer::new(&baseline);
+        for subgroup in target.chunks(5) {
+            let (mean, sd) = crate::spc::control_limits::subgroup_stats(subgroup);
+            scorer.push(&x, 5, mean, sd).expect("subgroup pushes");
         }
         let aggregate = scorer.finish();
         let raw = score_spc(
             &baseline,
             &batch("x", DataType::Float64, Arc::new(Float64Array::from(target))),
-            &profile,
         )
         .expect("raw scores");
-        // The rule-driven threshold is NaN, so compare the rendered reports.
-        assert_eq!(format!("{raw:?}"), format!("{aggregate:?}"));
+        assert_eq!(raw, aggregate);
         assert_eq!(aggregate.verdict, DriftVerdict::Drift);
 
-        let mut short = SpcScorer::new(&baseline, &profile).expect("rule parses");
-        short.push(&x, 4, 4.5).expect("short chunk pushes");
-        let report = short.finish();
+        let mut partial = SpcScorer::new(&baseline);
+        partial.push(&x, 5, 4.5, 2.0).expect("subgroup pushes");
+        partial
+            .push(&x, 4, f64::NAN, f64::NAN)
+            .expect("partial pushes");
+        let report = partial.finish();
         assert_eq!(report.verdict, DriftVerdict::Inconclusive);
         assert!(report.features[&x].score.is_nan());
     }
@@ -715,7 +684,7 @@ mod cancellation {
     use wyrd_semver::VersionBlock;
     use wyrd_spec::card::drift::{
         DriftCondition, DriftMethod, DriftProfile, DriftSignal, DriftSpec, PsiBinningStrategy,
-        PsiProfile, PsiThreshold, SpcAlertThreshold, SpcProfile, SpcWecoRule,
+        PsiProfile, PsiThreshold, SpcProfile,
     };
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, FeatureName, SpaceName};
@@ -785,13 +754,9 @@ mod cancellation {
         })
     }
 
-    /// SPC profile with an explicit chunk size.
+    /// SPC profile whose subgroup size divides `ROWS`.
     fn spc() -> DriftProfile {
-        DriftProfile::Spc(SpcProfile {
-            sample_size: 25,
-            weco_rule: SpcWecoRule::default(),
-            alert_threshold: SpcAlertThreshold::Zone4,
-        })
+        DriftProfile::Spc(SpcProfile { sample_size: 3 })
     }
 
     /// Each method stops at the first check after cancellation flips mid-feature,

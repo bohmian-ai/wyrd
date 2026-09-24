@@ -6,7 +6,7 @@
 //! ## Public surface
 //!
 //! - `fit_psi_baseline` / `score_psi` - Population Stability Index over a feature distribution.
-//! - `fit_spc_baseline` / `score_spc` - Statistical Process Control with WECO rule evaluation.
+//! - `fit_spc_baseline` / `score_spc` - Shewhart X-bar/S control charts over fixed rational subgroups.
 //! - `score_custom` - User-defined scalar drift against an author-supplied baseline value.
 //! - `fit_baseline` / `score` - Method-dispatching helpers that read a `DriftSpec`.
 //!
@@ -24,15 +24,18 @@ pub mod psi;
 pub mod report;
 pub mod spc;
 
-pub use baseline::{FittedBaseline, fit_baseline, fit_baseline_until, score_drift};
+pub use baseline::{FITTED_FORMAT, FittedBaseline, fit_baseline, fit_baseline_until, score_drift};
 pub use custom::{score_custom, score_custom_mean};
 pub use error::{DriftFitError, DriftScoreError};
 pub use psi::{
-    FittedPsiFeature, PSI_MIN_TARGET_SAMPLE, PsiBaseline, PsiTargetCounts, fit_psi_baseline,
-    score_psi, score_psi_counts,
+    FittedPsiFeature, PSI_MIN_TARGET_SAMPLE, PsiBaseline, PsiBinEvidence, PsiEvidence,
+    fit_psi_baseline, score_psi, score_psi_counts,
 };
-pub use report::{DriftReport, DriftVerdict, FeatureDriftReport};
-pub use spc::{FittedSpcFeature, SpcBaseline, SpcScorer, fit_spc_baseline, score_spc};
+pub use report::{DriftReport, DriftVerdict, FeatureDriftReport, FeatureEvidence};
+pub use spc::{
+    ChartLimits, FittedSpcFeature, MIN_BASELINE_SUBGROUPS, SpcBaseline, SpcChartEvidence,
+    SpcEvidence, SpcScorer, fit_spc_baseline, score_spc,
+};
 
 #[cfg(test)]
 mod smoke {
@@ -76,11 +79,8 @@ mod smoke {
             &SpcProfile,
             &[FeatureName],
         ) -> Result<SpcBaseline, DriftFitError> = fit_spc_baseline;
-        let _score_spc: fn(
-            &SpcBaseline,
-            &RecordBatch,
-            &SpcProfile,
-        ) -> Result<DriftReport, DriftScoreError> = score_spc;
+        let _score_spc: fn(&SpcBaseline, &RecordBatch) -> Result<DriftReport, DriftScoreError> =
+            score_spc;
         let _score_custom_fn: fn(
             &RecordBatch,
             &CustomProfile,

@@ -168,50 +168,20 @@ pub enum PsiThreshold {
     },
 }
 
-/// SPC profile configuration.
+/// SPC profile configuration: a two-sided, three-sigma Shewhart X-bar/S chart.
+///
+/// Consecutive rows, ordered by `created_at` then `record_id`, form rational
+/// subgroups of exactly `sample_size` rows. The author is responsible for
+/// supplying baseline rows in process order from a stable process and for a
+/// size whose consecutive rows form meaningful subgroups; Wyrd infers neither
+/// process context nor subgroup boundaries. The chart owns its control limits,
+/// so no rule or threshold is authored.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
 pub struct SpcProfile {
-    /// Sample chunk size for baseline computation. `0` means adaptive default.
+    /// Fixed rational subgroup size; at least two.
     pub sample_size: u32,
-
-    /// WECO rule configuration.
-    pub weco_rule: SpcWecoRule,
-
-    /// Lowest zone that should produce a Drift verdict.
-    pub alert_threshold: SpcAlertThreshold,
-}
-
-/// WECO rule string config.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct SpcWecoRule {
-    /// Eight whitespace-separated positive `u32`s. Default:
-    /// `"8 16 4 8 2 4 1 1"`.
-    pub rule_string: String,
-}
-
-impl Default for SpcWecoRule {
-    fn default() -> Self {
-        Self {
-            rule_string: "8 16 4 8 2 4 1 1".to_string(),
-        }
-    }
-}
-
-/// SPC alert threshold: the lowest zone that produces a Drift verdict.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(rename_all = "PascalCase")]
-pub enum SpcAlertThreshold {
-    /// Zone 1.
-    Zone1,
-    /// Zone 2.
-    Zone2,
-    /// Zone 3.
-    Zone3,
-    /// Zone 4.
-    Zone4,
 }
 
 /// Custom profile configuration.
@@ -293,12 +263,9 @@ pub enum DriftValidationError {
     /// PSI bin count was outside the allowed range.
     #[error("PSI bin count must be in [2, 1000]")]
     PsiBinCountOutOfRange,
-    /// SPC sample size was not zero or at least two.
-    #[error("SPC sample_size must be 0 (adaptive) or >= 2")]
+    /// SPC subgroup size was below two.
+    #[error("SPC sample_size must be >= 2")]
     SpcSampleSizeOutOfRange,
-    /// SPC WECO rule string was malformed.
-    #[error("SPC weco rule string must be exactly eight whitespace-separated positive u32s")]
-    SpcWecoMalformed,
     /// Custom profile metric name was empty.
     #[error("Custom profile metric_name must be non-empty")]
     CustomMetricNameEmpty,
@@ -396,10 +363,7 @@ impl DriftValidationError {
                 json!({ "field": "profile.binning_strategy.n_bins", "min": 2, "max": 1000 })
             }
             Self::SpcSampleSizeOutOfRange => {
-                json!({ "field": "profile.sample_size", "expected": "0 or >= 2" })
-            }
-            Self::SpcWecoMalformed => {
-                json!({ "field": "profile.weco_rule.rule_string", "expected": "eight positive u32 values" })
+                json!({ "field": "profile.sample_size", "expected": ">= 2" })
             }
             Self::CustomMetricNameEmpty => {
                 json!({ "field": "profile.metric_name", "reason": "empty" })
@@ -684,24 +648,16 @@ fn validate_psi_profile(profile: &PsiProfile) -> Result<(), DriftValidationError
     Ok(())
 }
 
+/// Require a fixed subgroup of at least two rows.
+///
+/// A subgroup's sample standard deviation divides by `n - 1`, so a size of
+/// zero or one could never fit the S chart.
+///
+/// # Errors
+/// Returns [`DriftValidationError::SpcSampleSizeOutOfRange`] below two.
 fn validate_spc_profile(profile: &SpcProfile) -> Result<(), DriftValidationError> {
-    if profile.sample_size == 1 {
+    if profile.sample_size < 2 {
         return Err(DriftValidationError::SpcSampleSizeOutOfRange);
-    }
-
-    if profile.weco_rule.rule_string.len() > 256 {
-        return Err(DriftValidationError::SpcWecoMalformed);
-    }
-
-    let parts: Vec<&str> = profile.weco_rule.rule_string.split_whitespace().collect();
-    if parts.len() != 8 {
-        return Err(DriftValidationError::SpcWecoMalformed);
-    }
-    for part in parts {
-        match part.parse::<u32>() {
-            Ok(value) if value >= 1 => {}
-            _ => return Err(DriftValidationError::SpcWecoMalformed),
-        }
     }
     Ok(())
 }

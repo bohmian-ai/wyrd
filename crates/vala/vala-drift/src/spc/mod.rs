@@ -1,7 +1,17 @@
-//! SPC baseline fit and target scoring.
+//! SPC baseline fit and target scoring: a two-sided, three-sigma Shewhart
+//! X-bar/S chart over fixed rational subgroups.
+//!
+//! Consecutive rows in observation order form subgroups of exactly the
+//! authored `sample_size`. The author is responsible for supplying baseline
+//! rows in process order from a stable process and a size whose consecutive
+//! rows form meaningful subgroups; this module infers neither. A fit needs at
+//! least [`MIN_BASELINE_SUBGROUPS`] complete subgroups and refuses leftover
+//! rows. A target scores only complete subgroups: an empty target, or one
+//! ending in a partial subgroup, is inconclusive. A subgroup mean or standard
+//! deviation strictly outside its frozen limits is a signal, and the feature's
+//! score is the total signal count of both charts with threshold zero.
 
 pub(crate) mod control_limits;
-pub(crate) mod weco;
 
 use std::collections::BTreeMap;
 
@@ -10,36 +20,70 @@ use wyrd_spec::card::drift::{DriftMethod, SpcProfile};
 use wyrd_spec::ids::FeatureName;
 use wyrd_version::WyrdVersion;
 
-use crate::baseline::ensure_live;
+use crate::baseline::{FITTED_FORMAT, ensure_live};
 use crate::error::{DriftFitError, DriftScoreError};
-use crate::report::{DriftReport, DriftVerdict, FeatureDriftReport};
-use crate::spc::control_limits::ControlLimits;
-use crate::spc::weco::{WecoChecks, WecoScan, assign_zone, parse_rule};
+use crate::feature::{TargetColumn, required_values, resolve_column, target_complete};
+use crate::report::{DriftReport, DriftVerdict, FeatureDriftReport, FeatureEvidence};
+pub use crate::spc::control_limits::ChartLimits;
+use crate::spc::control_limits::{fit_x_bar_s, subgroup_stats};
 
-/// SPC fitted baseline, one entry per feature plus the chunk size used.
+/// Complete baseline subgroups an SPC fit requires.
+pub const MIN_BASELINE_SUBGROUPS: usize = 20;
+
+/// SPC fitted baseline: frozen chart limits per feature and the subgroup size.
 ///
 /// Serializable so the server's baseline store can persist it as the fitted
 /// profile of one Verifier version.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SpcBaseline {
+    /// Frozen limits per feature.
     pub features: BTreeMap<FeatureName, FittedSpcFeature>,
-    pub chunk_size: u32,
+    /// Rows per rational subgroup.
+    pub subgroup_size: u32,
+    /// Fitted-profile format; [`FITTED_FORMAT`] marks X-bar/S limits.
+    pub format: u32,
     /// Vala version at fit time; used by the persistence layer for forward-compatibility checks.
     pub wyrd_version: WyrdVersion,
 }
 
-/// Per-feature fitted SPC state.
+/// Per-feature frozen X-bar and S chart limits.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct FittedSpcFeature {
-    pub center: f64,
-    pub one_lcl: f64,
-    pub one_ucl: f64,
-    pub two_lcl: f64,
-    pub two_ucl: f64,
-    pub three_lcl: f64,
-    pub three_ucl: f64,
+    /// Limits on subgroup means.
+    pub x_bar: ChartLimits,
+    /// Limits on subgroup sample standard deviations.
+    pub s: ChartLimits,
 }
 
+/// The chart evidence behind one scored SPC feature.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpcEvidence {
+    /// Rows per subgroup.
+    pub subgroup_size: u32,
+    /// Complete target subgroups scored.
+    pub subgroups: u64,
+    /// The X-bar chart and its signals.
+    pub x_bar: SpcChartEvidence,
+    /// The S chart and its signals.
+    pub s: SpcChartEvidence,
+}
+
+/// One chart's frozen limits and the target subgroups outside them.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SpcChartEvidence {
+    /// Center line and limits.
+    #[serde(flatten)]
+    pub limits: ChartLimits,
+    /// Subgroups strictly outside the limits.
+    pub signals: u64,
+}
+
+/// Fit an SPC baseline for `features` of `batch` under `profile`, uncancelled.
+///
+/// Runs [`fit_spc_baseline_until`] with a check that never fires.
+///
+/// # Errors
+/// Returns the errors of [`fit_spc_baseline_until`] other than cancellation.
 pub fn fit_spc_baseline(
     batch: &arrow::record_batch::RecordBatch,
     profile: &SpcProfile,
@@ -50,290 +94,271 @@ pub fn fit_spc_baseline(
 
 /// Fit an SPC baseline, stopping once `cancelled` reports true.
 ///
-/// Fits each feature in order exactly as [`fit_spc_baseline`] does, polling
-/// `cancelled` before each feature and between collecting its values and
-/// fitting its control limits; each of those phases is one linear pass.
+/// For each feature in order: reads every row, splits the rows into
+/// consecutive subgroups of `profile.sample_size`, and fits X-bar/S limits from
+/// the subgroup means and sample standard deviations. Polls `cancelled`
+/// before each feature and between collecting its values and fitting; each
+/// phase is one linear pass.
 ///
 /// # Errors
-/// Returns [`DriftFitError::Cancelled`] once `cancelled` reports true, and
-/// otherwise the errors of [`fit_spc_baseline`].
+/// Returns [`DriftFitError::Cancelled`] once `cancelled` reports true;
+/// [`DriftFitError::FeatureMissing`], [`DriftFitError::FeatureNotNumeric`],
+/// [`DriftFitError::FeatureEmpty`], [`DriftFitError::NullValuesInColumn`], or
+/// [`DriftFitError::NonFiniteValuesInColumn`] for an unusable column;
+/// [`DriftFitError::IncompleteSubgroup`] when rows remain after the last
+/// complete subgroup; [`DriftFitError::InsufficientSubgroups`] below
+/// [`MIN_BASELINE_SUBGROUPS`]; and [`DriftFitError::SpcInternal`] for a
+/// subgroup size below two or a non-finite limit.
 pub(crate) fn fit_spc_baseline_until(
     batch: &arrow::record_batch::RecordBatch,
     profile: &SpcProfile,
     features: &[FeatureName],
     cancelled: &dyn Fn() -> bool,
 ) -> Result<SpcBaseline, DriftFitError> {
-    use crate::feature::resolve_column;
-    use crate::spc::control_limits::{adaptive_sample_size, fit_control_limits};
-
-    let row_count = batch.num_rows();
-    let chunk_size = if profile.sample_size == 0 {
-        adaptive_sample_size(row_count)
-    } else {
-        profile.sample_size
-    };
-
+    let n = profile.sample_size;
+    let size = n as usize;
     let mut fitted = BTreeMap::new();
     for feature in features {
         ensure_live(cancelled)?;
-        let column = resolve_column(batch, feature).map_err(|_| DriftFitError::FeatureMissing {
-            feature: feature.as_str().to_string(),
-        })?;
+        let name = || feature.as_str().to_string();
+        let column = resolve_column(batch, feature)
+            .map_err(|_| DriftFitError::FeatureMissing { feature: name() })?;
+        let not_numeric = || DriftFitError::FeatureNotNumeric {
+            feature: name(),
+            arrow_type: column.data_type_string(),
+        };
         if !column.is_numeric() {
-            return Err(DriftFitError::FeatureNotNumeric {
-                feature: feature.as_str().to_string(),
-                arrow_type: column.data_type_string(),
-            });
+            return Err(not_numeric());
         }
-
-        let values =
-            column
-                .collect_f64_non_null()
-                .map_err(|_| DriftFitError::FeatureNotNumeric {
-                    feature: feature.as_str().to_string(),
-                    arrow_type: column.data_type_string(),
-                })?;
-        if values.is_empty() {
-            return Err(DriftFitError::FeatureEmpty {
-                feature: feature.as_str().to_string(),
-            });
-        }
+        let values = column.collect_f64().map_err(|_| not_numeric())?;
+        let values = required_values(&column, values)?;
         if values.iter().any(|value| !value.is_finite()) {
-            return Err(DriftFitError::NonFiniteValuesInColumn {
-                feature: feature.as_str().to_string(),
+            return Err(DriftFitError::NonFiniteValuesInColumn { feature: name() });
+        }
+        if size < 2 || values.len() % size != 0 {
+            return Err(DriftFitError::IncompleteSubgroup {
+                feature: name(),
+                rows: values.len(),
+                subgroup_size: n,
+            });
+        }
+        let subgroups = values.len() / size;
+        if subgroups < MIN_BASELINE_SUBGROUPS {
+            return Err(DriftFitError::InsufficientSubgroups {
+                feature: name(),
+                subgroups,
+                required: MIN_BASELINE_SUBGROUPS,
             });
         }
 
         ensure_live(cancelled)?;
-        let limits = fit_control_limits(&values, chunk_size).map_err(|error| match error {
-            DriftFitError::InsufficientSamplesForChunk {
-                rows, chunk_size, ..
-            } => DriftFitError::InsufficientSamplesForChunk {
-                feature: feature.as_str().to_string(),
-                rows,
-                chunk_size,
-            },
-            other => other,
-        })?;
-        fitted.insert(
-            feature.clone(),
-            FittedSpcFeature {
-                center: limits.center,
-                one_lcl: limits.one_lcl,
-                one_ucl: limits.one_ucl,
-                two_lcl: limits.two_lcl,
-                two_ucl: limits.two_ucl,
-                three_lcl: limits.three_lcl,
-                three_ucl: limits.three_ucl,
-            },
-        );
+        let stats = values
+            .chunks_exact(size)
+            .map(subgroup_stats)
+            .collect::<Vec<_>>();
+        let (x_bar, s) = fit_x_bar_s(&stats, n)?;
+        fitted.insert(feature.clone(), FittedSpcFeature { x_bar, s });
     }
 
     Ok(SpcBaseline {
         features: fitted,
-        chunk_size,
+        subgroup_size: n,
+        format: FITTED_FORMAT,
         wyrd_version: WyrdVersion::current(),
     })
 }
 
 /// Score a target `RecordBatch` against a fitted SPC baseline.
 ///
-/// Forms consecutive chunk means of each feature's non-null values in row
-/// order (the trailing partial chunk included) and feeds them through one
-/// [`SpcScorer`], so raw-batch and server-streamed inputs share one zone and
-/// rule evaluation.
+/// Each row is one observation. A row carrying none of the baseline features
+/// is unrelated and ignored; when any other row misses a feature or holds a
+/// null or non-finite value, the target is [`DriftReport::unscored`]. Otherwise
+/// each feature's values form consecutive subgroups in row order and stream
+/// through one [`SpcScorer`], so raw-batch and server-aggregated inputs share
+/// one chart evaluation.
 ///
 /// # Errors
-/// Returns [`DriftScoreError`] when the WECO rule is malformed, or when a
-/// feature is missing, mistyped, empty, non-finite, or shorter than the
-/// chunk size, or the baseline chunk size is zero.
+/// Returns [`DriftScoreError::FeatureTypeMismatch`] for a non-numeric target
+/// column and the errors of [`SpcScorer::push`].
 pub fn score_spc(
     baseline: &SpcBaseline,
     target: &arrow::record_batch::RecordBatch,
-    profile: &SpcProfile,
 ) -> Result<DriftReport, DriftScoreError> {
-    use crate::feature::resolve_column;
-
-    let chunk_size = baseline.chunk_size as usize;
-    let mut scorer = SpcScorer::new(baseline, profile)?;
-    for feature_name in baseline.features.keys() {
-        let column = resolve_column(target, feature_name).map_err(|_| {
-            DriftScoreError::FeatureMissingInTarget {
-                feature: feature_name.as_str().to_string(),
+    let mut columns = Vec::with_capacity(baseline.features.len());
+    for feature in baseline.features.keys() {
+        let mismatch = || DriftScoreError::FeatureTypeMismatch {
+            feature: feature.as_str().to_string(),
+        };
+        columns.push(match resolve_column(target, feature) {
+            Err(_) => TargetColumn::Absent,
+            Ok(column) if column.is_numeric() => {
+                TargetColumn::Numeric(column.collect_f64().map_err(|_| mismatch())?)
             }
-        })?;
-        if !column.is_numeric() {
-            return Err(DriftScoreError::FeatureTypeMismatch {
-                feature: feature_name.as_str().to_string(),
-            });
-        }
-        let values =
-            column
-                .collect_f64_non_null()
-                .map_err(|_| DriftScoreError::FeatureTypeMismatch {
-                    feature: feature_name.as_str().to_string(),
-                })?;
-        if values.is_empty() {
-            return Err(DriftScoreError::FeatureEmpty {
-                feature: feature_name.as_str().to_string(),
-            });
-        }
-        if values.iter().any(|value| !value.is_finite()) {
-            return Err(DriftScoreError::SpcInternal {
-                message: "non-finite value in target column".into(),
-            });
-        }
-        if values.len() < chunk_size {
-            return Err(DriftScoreError::TargetTooSmall {
-                feature: feature_name.as_str().to_string(),
-                rows: values.len(),
-                chunk_size,
-            });
-        }
-        if chunk_size == 0 {
-            return Err(DriftScoreError::SpcInternal {
-                message: "chunk_size must be greater than zero".into(),
-            });
-        }
-        for chunk in values.chunks(chunk_size) {
-            let mean = chunk.iter().sum::<f64>() / chunk.len() as f64;
-            scorer.push(feature_name, chunk.len() as u64, mean)?;
+            Ok(_) => return Err(mismatch()),
+        });
+    }
+    if !target_complete(target.num_rows(), &columns.iter().collect::<Vec<_>>()) {
+        return Ok(DriftReport::unscored(DriftMethod::Spc));
+    }
+    let size = baseline.subgroup_size as usize;
+    let mut scorer = SpcScorer::new(baseline);
+    for (feature, column) in baseline.features.keys().zip(&columns) {
+        for subgroup in column.numeric_values().chunks(size.max(1)) {
+            let (mean, sd) = if subgroup.len() == size {
+                subgroup_stats(subgroup)
+            } else {
+                (f64::NAN, f64::NAN)
+            };
+            scorer.push(feature, subgroup.len() as u64, mean, sd)?;
         }
     }
     Ok(scorer.finish())
 }
 
-/// Streaming SPC scorer over ordered chunk aggregates for one fitted baseline.
+/// Streaming X-bar/S scorer over ordered subgroup aggregates of one baseline.
 ///
-/// The caller feeds each feature's chunk means in chunk order (the trailing
-/// shorter chunk included) and then calls [`SpcScorer::finish`]. Each mean is
-/// assigned its control-limit zone and run through an incremental WECO scan,
-/// so per-feature state is bounded by the largest rule or trend lookback, not
-/// by the number of chunks. Features are scored independently; their chunks
-/// may arrive in any interleaving as long as each feature's own order holds.
+/// The caller feeds each feature's subgroups in observation order, as row
+/// count, mean, and sample standard deviation, then calls
+/// [`SpcScorer::finish`]. State per feature is two signal counters, so it
+/// stays constant however many subgroups arrive. A subgroup shorter than the
+/// frozen size can only be the trailing one and makes its feature
+/// inconclusive; its statistics are ignored.
 #[derive(Debug, Clone)]
 pub struct SpcScorer {
-    /// Frozen baseline chunk size; a feature with fewer total rows is
-    /// inconclusive.
-    chunk_size: u32,
-    /// WECO checks resolved once from the profile's rule and alert threshold.
-    checks: WecoChecks,
-    /// Per-feature scan state, one entry per baseline feature.
-    features: BTreeMap<FeatureName, SpcFeatureScan>,
+    /// Frozen rows per subgroup.
+    subgroup_size: u32,
+    /// Chart state per baseline feature.
+    features: BTreeMap<FeatureName, SpcFeatureChart>,
 }
 
-/// Running SPC state of one baseline feature inside an [`SpcScorer`].
+/// Running chart state of one baseline feature inside an [`SpcScorer`].
 #[derive(Debug, Clone)]
-struct SpcFeatureScan {
-    /// The feature's fitted control limits used for zone assignment.
-    limits: ControlLimits,
-    /// Total target rows across every chunk pushed so far.
-    rows: u64,
-    /// Rule violations fired so far; the feature's score.
-    violations: u64,
-    /// Bounded trailing-zone WECO scan.
-    scan: WecoScan,
+struct SpcFeatureChart {
+    /// The feature's frozen limits.
+    limits: FittedSpcFeature,
+    /// Complete subgroups pushed so far.
+    subgroups: u64,
+    /// Whether a partial subgroup arrived.
+    partial: bool,
+    /// Subgroup means strictly outside the X-bar limits.
+    x_bar_signals: u64,
+    /// Subgroup standard deviations strictly outside the S limits.
+    s_signals: u64,
 }
 
 impl SpcScorer {
-    /// Parse the profile's WECO rule once and seed empty state for every
-    /// baseline feature.
-    ///
-    /// # Errors
-    /// Returns [`DriftScoreError::WecoMalformed`] when the profile's rule is
-    /// not eight positive integers.
-    pub fn new(baseline: &SpcBaseline, profile: &SpcProfile) -> Result<Self, DriftScoreError> {
-        let rule = parse_rule(&profile.weco_rule.rule_string)?;
+    /// Seed empty chart state for every baseline feature.
+    #[must_use]
+    pub fn new(baseline: &SpcBaseline) -> Self {
         let features = baseline
             .features
             .iter()
-            .map(|(name, fitted)| {
-                let state = SpcFeatureScan {
-                    limits: ControlLimits {
-                        center: fitted.center,
-                        one_lcl: fitted.one_lcl,
-                        one_ucl: fitted.one_ucl,
-                        two_lcl: fitted.two_lcl,
-                        two_ucl: fitted.two_ucl,
-                        three_lcl: fitted.three_lcl,
-                        three_ucl: fitted.three_ucl,
-                    },
-                    rows: 0,
-                    violations: 0,
-                    scan: WecoScan::default(),
+            .map(|(name, limits)| {
+                let chart = SpcFeatureChart {
+                    limits: *limits,
+                    subgroups: 0,
+                    partial: false,
+                    x_bar_signals: 0,
+                    s_signals: 0,
                 };
-                (name.clone(), state)
+                (name.clone(), chart)
             })
             .collect();
-        Ok(Self {
-            chunk_size: baseline.chunk_size,
-            checks: WecoChecks::new(&rule, profile.alert_threshold),
+        Self {
+            subgroup_size: baseline.subgroup_size,
             features,
-        })
+        }
     }
 
-    /// Feed the next chunk of `feature`, in chunk order: `rows` values whose
-    /// mean is `mean`.
+    /// Feed the next subgroup of `feature`: `rows` values with `mean` and
+    /// sample standard deviation `sd`.
     ///
-    /// Adds `rows` to the feature's total, assigns the mean its zone, and
-    /// counts every WECO rule firing at that chunk. Nothing changes on error.
+    /// A complete subgroup is checked against both charts; a shorter one
+    /// marks the feature partial and ignores `mean` and `sd`. Nothing changes
+    /// on error.
     ///
     /// # Errors
     /// Returns [`DriftScoreError::SpcInternal`] when `feature` is not in the
-    /// baseline or `mean` is not finite.
+    /// baseline, `rows` exceeds the subgroup size, a subgroup follows a
+    /// partial one, or a complete subgroup's statistics are not finite.
     pub fn push(
         &mut self,
         feature: &FeatureName,
         rows: u64,
         mean: f64,
+        sd: f64,
     ) -> Result<(), DriftScoreError> {
-        let state = self
+        let internal = |message: &str| DriftScoreError::SpcInternal {
+            message: format!("feature {}: {message}", feature.as_str()),
+        };
+        let size = u64::from(self.subgroup_size);
+        let chart = self
             .features
             .get_mut(feature)
-            .ok_or_else(|| DriftScoreError::SpcInternal {
-                message: format!("feature {} is not in the SPC baseline", feature.as_str()),
-            })?;
-        if !mean.is_finite() {
-            return Err(DriftScoreError::SpcInternal {
-                message: "non-finite chunk mean in target".into(),
-            });
+            .ok_or_else(|| internal("not in the SPC baseline"))?;
+        if rows > size || chart.partial {
+            return Err(internal(
+                "a subgroup follows a partial subgroup or is oversized",
+            ));
         }
-        state.rows = state.rows.saturating_add(rows);
-        let violations = &mut state.violations;
-        state
-            .scan
-            .push(&self.checks, assign_zone(mean, &state.limits), |_| {
-                *violations += 1;
-            });
+        if rows < size {
+            chart.partial = true;
+            return Ok(());
+        }
+        if !mean.is_finite() || !sd.is_finite() {
+            return Err(internal("non-finite subgroup statistics"));
+        }
+        chart.subgroups += 1;
+        chart.x_bar_signals += u64::from(chart.limits.x_bar.signals(mean));
+        chart.s_signals += u64::from(chart.limits.s.signals(sd));
         Ok(())
     }
 
-    /// Build the drift report from every pushed chunk.
+    /// Build the drift report from every pushed subgroup.
     ///
-    /// A feature whose total rows are below the baseline chunk size (including
-    /// one that received no chunk) is `Inconclusive` with NaN score and
-    /// threshold. Otherwise the violation count is the score and any
-    /// violation is `Drift`; the threshold is NaN because the verdict is
-    /// rule-driven.
+    /// A feature with no complete subgroup or a partial one is `Inconclusive`
+    /// with NaN score and threshold and no evidence. Otherwise its score is
+    /// the X-bar plus S signal count, its threshold is zero, any signal is
+    /// `Drift`, and it carries [`SpcEvidence`].
     #[must_use]
     pub fn finish(self) -> DriftReport {
-        let chunk_size = u64::from(self.chunk_size);
+        let subgroup_size = self.subgroup_size;
         let features: BTreeMap<FeatureName, FeatureDriftReport> = self
             .features
             .into_iter()
-            .map(|(feature, state)| {
-                let (score, verdict) = if state.rows < chunk_size {
-                    (f64::NAN, DriftVerdict::Inconclusive)
-                } else if state.violations > 0 {
-                    (state.violations as f64, DriftVerdict::Drift)
+            .map(|(feature, chart)| {
+                let report = if chart.partial || chart.subgroups == 0 {
+                    FeatureDriftReport {
+                        feature: feature.clone(),
+                        score: f64::NAN,
+                        threshold: f64::NAN,
+                        verdict: DriftVerdict::Inconclusive,
+                        evidence: None,
+                    }
                 } else {
-                    (0.0, DriftVerdict::NoDrift)
-                };
-                let report = FeatureDriftReport {
-                    feature: feature.clone(),
-                    score,
-                    threshold: f64::NAN,
-                    verdict,
+                    let signals = chart.x_bar_signals + chart.s_signals;
+                    FeatureDriftReport {
+                        feature: feature.clone(),
+                        score: signals as f64,
+                        threshold: 0.0,
+                        verdict: if signals > 0 {
+                            DriftVerdict::Drift
+                        } else {
+                            DriftVerdict::NoDrift
+                        },
+                        evidence: Some(FeatureEvidence::Spc(SpcEvidence {
+                            subgroup_size,
+                            subgroups: chart.subgroups,
+                            x_bar: SpcChartEvidence {
+                                limits: chart.limits.x_bar,
+                                signals: chart.x_bar_signals,
+                            },
+                            s: SpcChartEvidence {
+                                limits: chart.limits.s,
+                                signals: chart.s_signals,
+                            },
+                        })),
+                    }
                 };
                 (feature, report)
             })
@@ -345,20 +370,12 @@ impl SpcScorer {
             verdict,
         }
     }
-
-    /// Zones currently retained for `feature`, or `None` for an unknown
-    /// feature; lets tests prove history stays within the lookback cap.
-    #[cfg(test)]
-    fn retained(&self, feature: &FeatureName) -> Option<usize> {
-        self.features
-            .get(feature)
-            .map(|state| state.scan.retained())
-    }
 }
 
 #[cfg(test)]
 mod spc_fit {
-    //! Unit tests for `fit_spc_baseline`.
+    //! Baseline fitting: complete subgroups only, at least twenty of them,
+    //! and no null or non-finite value.
 
     use std::sync::Arc;
 
@@ -366,287 +383,8 @@ mod spc_fit {
     use arrow::array::{Float64Array, Int64Array, StringArray};
     use arrow::record_batch::RecordBatch;
     use arrow_schema::{DataType, Field, Schema};
-    use wyrd_spec::card::drift::{SpcAlertThreshold, SpcProfile, SpcWecoRule};
+    use wyrd_spec::card::drift::SpcProfile;
     use wyrd_spec::ids::FeatureName;
-
-    fn feature(name: &str) -> FeatureName {
-        FeatureName::new(name).expect("valid feature name")
-    }
-
-    fn numeric_batch(name: &str, values: Vec<f64>) -> RecordBatch {
-        RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new(name, DataType::Float64, true)])),
-            vec![Arc::new(Float64Array::from(values))],
-        )
-        .expect("record batch")
-    }
-
-    fn int_batch(name: &str, values: Vec<i64>) -> RecordBatch {
-        RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new(name, DataType::Int64, true)])),
-            vec![Arc::new(Int64Array::from(values))],
-        )
-        .expect("record batch")
-    }
-
-    fn spc_profile(sample_size: u32) -> SpcProfile {
-        SpcProfile {
-            sample_size,
-            weco_rule: SpcWecoRule::default(),
-            alert_threshold: SpcAlertThreshold::Zone4,
-        }
-    }
-
-    #[test]
-    fn fit_adaptive_chunk_size_small_data() {
-        let values: Vec<f64> = (0..500).map(|value| (value as f64).sin()).collect();
-        let batch = numeric_batch("x", values);
-        let profile = spc_profile(0);
-        let fname = feature("x");
-
-        let baseline =
-            fit_spc_baseline(&batch, &profile, std::slice::from_ref(&fname)).expect("baseline");
-
-        assert_eq!(baseline.chunk_size, 25);
-        let fitted = baseline.features.get(&fname).expect("feature");
-        assert!(fitted.three_lcl < fitted.center && fitted.center < fitted.three_ucl);
-    }
-
-    #[test]
-    fn fit_explicit_chunk_size() {
-        let values: Vec<f64> = (0..1_000).map(|value| (value as f64) * 0.1).collect();
-        let batch = numeric_batch("x", values);
-        let profile = spc_profile(50);
-        let fname = feature("x");
-
-        let baseline = fit_spc_baseline(&batch, &profile, &[fname]).expect("baseline");
-
-        assert_eq!(baseline.chunk_size, 50);
-    }
-
-    #[test]
-    fn fit_from_int_column() {
-        let values: Vec<i64> = (0..500).collect();
-        let batch = int_batch("x", values);
-        let profile = spc_profile(0);
-        let fname = feature("x");
-
-        let baseline =
-            fit_spc_baseline(&batch, &profile, std::slice::from_ref(&fname)).expect("baseline");
-
-        let fitted = baseline.features.get(&fname).expect("feature");
-        assert!(fitted.center > 0.0);
-    }
-
-    #[test]
-    fn fit_includes_trailing_partial_chunk_for_center() {
-        let batch = numeric_batch("x", vec![0.0, 2.0, 2.0, 4.0, 100.0, 104.0]);
-        let profile = spc_profile(4);
-        let fname = feature("x");
-
-        let baseline =
-            fit_spc_baseline(&batch, &profile, std::slice::from_ref(&fname)).expect("baseline");
-
-        let fitted = baseline.features.get(&fname).expect("feature");
-        assert!((fitted.center - 52.0).abs() < 1e-12);
-    }
-
-    #[test]
-    fn rejects_non_numeric_column() {
-        let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)])),
-            vec![Arc::new(StringArray::from(vec!["a", "b", "c"]))],
-        )
-        .expect("record batch");
-        let profile = spc_profile(0);
-        let fname = feature("name");
-
-        let err = fit_spc_baseline(&batch, &profile, &[fname]).expect_err("fit error");
-
-        assert!(matches!(err, DriftFitError::FeatureNotNumeric { .. }));
-    }
-
-    #[test]
-    fn rejects_empty_column() {
-        let batch = numeric_batch("x", Vec::new());
-        let profile = spc_profile(0);
-        let fname = feature("x");
-
-        let err = fit_spc_baseline(&batch, &profile, &[fname]).expect_err("fit error");
-
-        assert!(matches!(err, DriftFitError::FeatureEmpty { .. }));
-    }
-
-    #[test]
-    fn rejects_insufficient_chunks() {
-        let values: Vec<f64> = (0..25).map(|value| value as f64).collect();
-        let batch = numeric_batch("x", values);
-        let profile = spc_profile(25);
-        let fname = feature("x");
-
-        let err = fit_spc_baseline(&batch, &profile, &[fname]).expect_err("fit error");
-
-        assert!(matches!(
-            err,
-            DriftFitError::InsufficientSamplesForChunk { .. }
-        ));
-    }
-
-    #[test]
-    fn rejects_missing_feature() {
-        let batch = numeric_batch("x", (0..500).map(|value| value as f64).collect());
-        let profile = spc_profile(0);
-        let fname = feature("not_x");
-
-        let err = fit_spc_baseline(&batch, &profile, &[fname]).expect_err("fit error");
-
-        assert!(matches!(err, DriftFitError::FeatureMissing { .. }));
-    }
-
-    #[test]
-    fn rejects_non_finite_values() {
-        let batch = numeric_batch("x", vec![1.0, f64::NAN, 3.0]);
-        let profile = spc_profile(2);
-        let fname = feature("x");
-
-        let err = fit_spc_baseline(&batch, &profile, &[fname]).expect_err("fit error");
-
-        assert!(matches!(err, DriftFitError::NonFiniteValuesInColumn { .. }));
-    }
-}
-
-#[cfg(test)]
-mod spc_score {
-    //! End-to-end tests for SPC scoring.
-
-    use std::sync::Arc;
-
-    use arrow::array::{Float64Array, StringArray};
-    use arrow::record_batch::RecordBatch;
-    use arrow_schema::{DataType, Field, Schema};
-
-    use crate::{DriftScoreError, DriftVerdict, fit_spc_baseline, score_spc};
-    use wyrd_spec::card::drift::{SpcAlertThreshold, SpcProfile, SpcWecoRule};
-    use wyrd_spec::ids::FeatureName;
-
-    fn numeric_batch(name: &str, values: Vec<f64>) -> RecordBatch {
-        let schema = Schema::new(vec![Field::new(name, DataType::Float64, true)]);
-        let array = Float64Array::from(values);
-        RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)])
-            .expect("test batch should be valid")
-    }
-
-    fn string_batch(name: &str, values: Vec<&str>) -> RecordBatch {
-        let schema = Schema::new(vec![Field::new(name, DataType::Utf8, true)]);
-        let array = StringArray::from(values);
-        RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)])
-            .expect("test batch should be valid")
-    }
-
-    fn profile_default() -> SpcProfile {
-        SpcProfile {
-            sample_size: 0,
-            weco_rule: SpcWecoRule::default(),
-            alert_threshold: SpcAlertThreshold::Zone4,
-        }
-    }
-
-    #[test]
-    fn spc_in_control_target_no_drift() {
-        let baseline_batch = numeric_batch("x", vec![0.0; 500]);
-        let target = numeric_batch("x", vec![0.0; 500]);
-        let profile = profile_default();
-        let feature = FeatureName::new("x").expect("valid feature name");
-        let baseline =
-            fit_spc_baseline(&baseline_batch, &profile, &[feature]).expect("SPC fit should pass");
-        let report = score_spc(&baseline, &target, &profile).expect("SPC score should pass");
-        assert_eq!(report.verdict, DriftVerdict::NoDrift);
-    }
-
-    #[test]
-    fn spc_out_of_bounds_target_drift_zone4() {
-        let baseline_values: Vec<f64> = (0..500).map(|idx| ((idx as f64) * 0.01).sin()).collect();
-        let baseline_batch = numeric_batch("x", baseline_values);
-        let target = numeric_batch("x", vec![100.0; 200]);
-        let profile = profile_default();
-        let feature = FeatureName::new("x").expect("valid feature name");
-        let baseline =
-            fit_spc_baseline(&baseline_batch, &profile, &[feature]).expect("SPC fit should pass");
-        let report = score_spc(&baseline, &target, &profile).expect("SPC score should pass");
-        assert_eq!(report.verdict, DriftVerdict::Drift);
-    }
-
-    #[test]
-    fn spc_drift_with_zone1_threshold_detects_run() {
-        let baseline_values: Vec<f64> = (0..500).map(|idx| ((idx as f64) * 0.1).sin()).collect();
-        let baseline_batch = numeric_batch("x", baseline_values);
-        let target = numeric_batch("x", vec![0.05; 200]);
-        let profile = SpcProfile {
-            sample_size: 0,
-            weco_rule: SpcWecoRule::default(),
-            alert_threshold: SpcAlertThreshold::Zone1,
-        };
-        let feature = FeatureName::new("x").expect("valid feature name");
-        let baseline =
-            fit_spc_baseline(&baseline_batch, &profile, &[feature]).expect("SPC fit should pass");
-        let report = score_spc(&baseline, &target, &profile).expect("SPC score should pass");
-        assert_eq!(report.verdict, DriftVerdict::Drift);
-    }
-
-    #[test]
-    fn spc_target_smaller_than_chunk_size_errors() {
-        let baseline_batch = numeric_batch("x", (0..500).map(|idx| idx as f64).collect());
-        let target = numeric_batch("x", vec![1.0, 2.0, 3.0]);
-        let profile = profile_default();
-        let feature = FeatureName::new("x").expect("valid feature name");
-        let baseline =
-            fit_spc_baseline(&baseline_batch, &profile, &[feature]).expect("SPC fit should pass");
-        let err = score_spc(&baseline, &target, &profile).expect_err("target should be too small");
-        assert!(matches!(err, DriftScoreError::TargetTooSmall { .. }));
-    }
-
-    #[test]
-    fn spc_missing_feature_in_target() {
-        let baseline_batch = numeric_batch("x", (0..500).map(|idx| idx as f64).collect());
-        let target = numeric_batch("y", vec![1.0; 100]);
-        let profile = profile_default();
-        let feature = FeatureName::new("x").expect("valid feature name");
-        let baseline =
-            fit_spc_baseline(&baseline_batch, &profile, &[feature]).expect("SPC fit should pass");
-        let err =
-            score_spc(&baseline, &target, &profile).expect_err("target feature should be absent");
-        assert!(matches!(
-            err,
-            DriftScoreError::FeatureMissingInTarget { .. }
-        ));
-    }
-
-    #[test]
-    fn spc_non_numeric_target_errors() {
-        let baseline_batch = numeric_batch("x", (0..500).map(|idx| idx as f64).collect());
-        let target = string_batch("x", vec!["1", "2", "3"]);
-        let profile = profile_default();
-        let feature = FeatureName::new("x").expect("valid feature name");
-        let baseline =
-            fit_spc_baseline(&baseline_batch, &profile, &[feature]).expect("SPC fit should pass");
-        let err =
-            score_spc(&baseline, &target, &profile).expect_err("target feature is not numeric");
-        assert!(matches!(err, DriftScoreError::FeatureTypeMismatch { .. }));
-    }
-}
-
-#[cfg(test)]
-mod spc_scorer {
-    //! Parity tests for the streaming [`SpcScorer`]. Expected counts are the
-    //! violation counts the pre-streaming slice-rescanning evaluation produced
-    //! for the same ordered zones.
-
-    use wyrd_spec::card::drift::{SpcAlertThreshold, SpcProfile, SpcWecoRule};
-    use wyrd_spec::ids::FeatureName;
-    use wyrd_version::WyrdVersion;
-
-    use super::{FittedSpcFeature, SpcBaseline, SpcScorer};
-    use crate::{DriftReport, DriftScoreError, DriftVerdict};
 
     /// Parse a fixture feature name.
     ///
@@ -656,239 +394,355 @@ mod spc_scorer {
         FeatureName::new(name).expect("valid feature name")
     }
 
-    /// Baseline over `names` with unit sigma limits around zero and chunk size 5.
+    /// One nullable `Float64` column named `name`.
+    ///
+    /// # Panics
+    /// Panics when Arrow rejects the batch.
+    fn numeric_batch(name: &str, values: Vec<Option<f64>>) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(name, DataType::Float64, true)])),
+            vec![Arc::new(Float64Array::from(values))],
+        )
+        .expect("record batch")
+    }
+
+    /// Fit `values` of feature `x` with subgroups of `n`.
+    fn fit(values: Vec<Option<f64>>, n: u32) -> Result<crate::SpcBaseline, DriftFitError> {
+        fit_spc_baseline(
+            &numeric_batch("x", values),
+            &SpcProfile { sample_size: n },
+            &[feature("x")],
+        )
+    }
+
+    /// `subgroups` subgroups of five rows alternating around 10.
+    fn stable(subgroups: usize) -> Vec<Option<f64>> {
+        (0..subgroups * 5)
+            .map(|row| Some(10.0 + [-2.0, -1.0, 0.0, 1.0, 2.0][row % 5]))
+            .collect()
+    }
+
+    /// Twenty complete subgroups fit limits around the grand mean, integer
+    /// columns fit too, and the fitted profile records its format.
+    ///
+    /// # Panics
+    /// Panics when a valid baseline does not fit.
+    #[test]
+    fn twenty_complete_subgroups_fit() {
+        let baseline = fit(stable(20), 5).expect("baseline");
+        assert_eq!(baseline.subgroup_size, 5);
+        assert_eq!(baseline.format, crate::baseline::FITTED_FORMAT);
+        let x = baseline.features[&feature("x")];
+        assert!((x.x_bar.center - 10.0).abs() < 1e-12);
+        assert!(x.x_bar.lower < 10.0 && 10.0 < x.x_bar.upper);
+        assert!(x.s.lower >= 0.0 && x.s.center < x.s.upper);
+
+        let ints = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from_iter_values(
+                (0..100).map(|v| v % 7),
+            ))],
+        )
+        .expect("record batch");
+        fit_spc_baseline(&ints, &SpcProfile { sample_size: 5 }, &[feature("x")])
+            .expect("integer baseline");
+    }
+
+    /// Nineteen subgroups, leftover rows, and a subgroup size below two fail.
+    ///
+    /// # Panics
+    /// Panics when an incomplete or short baseline fits.
+    #[test]
+    fn short_or_ragged_baselines_fail_visibly() {
+        assert!(matches!(
+            fit(stable(19), 5),
+            Err(DriftFitError::InsufficientSubgroups {
+                subgroups: 19,
+                required: 20,
+                ..
+            })
+        ));
+        let mut ragged = stable(20);
+        ragged.push(Some(10.0));
+        assert!(matches!(
+            fit(ragged, 5),
+            Err(DriftFitError::IncompleteSubgroup { rows: 101, .. })
+        ));
+        assert!(matches!(
+            fit(stable(20), 1),
+            Err(DriftFitError::IncompleteSubgroup { .. })
+        ));
+    }
+
+    /// Null, NaN, and infinite baseline values fail without dropping rows.
+    ///
+    /// # Panics
+    /// Panics when a malformed baseline fits.
+    #[test]
+    fn null_and_non_finite_baseline_values_fail() {
+        for (bad, is_null) in [
+            (None, true),
+            (Some(f64::NAN), false),
+            (Some(f64::INFINITY), false),
+        ] {
+            let mut values = stable(20);
+            values[7] = bad;
+            let error = fit(values, 5).expect_err("malformed baseline");
+            if is_null {
+                assert!(
+                    matches!(error, DriftFitError::NullValuesInColumn { .. }),
+                    "{error:?}"
+                );
+            } else {
+                assert!(
+                    matches!(error, DriftFitError::NonFiniteValuesInColumn { .. }),
+                    "{error:?}"
+                );
+            }
+        }
+    }
+
+    /// Missing, text, and empty columns keep their typed errors.
+    ///
+    /// # Panics
+    /// Panics when a column error maps to the wrong variant.
+    #[test]
+    fn column_errors_are_typed() {
+        let profile = SpcProfile { sample_size: 5 };
+        let text = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("x", DataType::Utf8, true)])),
+            vec![Arc::new(StringArray::from(vec!["a", "b"]))],
+        )
+        .expect("record batch");
+        assert!(matches!(
+            fit_spc_baseline(&text, &profile, &[feature("x")]),
+            Err(DriftFitError::FeatureNotNumeric { .. })
+        ));
+        assert!(matches!(
+            fit(Vec::new(), 5),
+            Err(DriftFitError::FeatureEmpty { .. })
+        ));
+        assert!(matches!(
+            fit_spc_baseline(&numeric_batch("y", stable(20)), &profile, &[feature("x")]),
+            Err(DriftFitError::FeatureMissing { .. })
+        ));
+    }
+}
+
+#[cfg(test)]
+mod spc_score {
+    //! Target scoring against independently computed limits: signals on
+    //! either chart, equality at the limit, complete-subgroup gating, and
+    //! the missing-value rules shared with the server path.
+
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, Float64Array, StringArray};
+    use arrow::record_batch::RecordBatch;
+    use arrow_schema::{DataType, Field, Schema};
+    use wyrd_spec::ids::FeatureName;
+    use wyrd_version::WyrdVersion;
+
+    use super::{ChartLimits, FittedSpcFeature, SpcBaseline, SpcScorer};
+    use crate::report::FeatureEvidence;
+    use crate::{DriftReport, DriftScoreError, DriftVerdict, score_spc};
+
+    /// Parse a fixture feature name.
+    ///
+    /// # Panics
+    /// Panics when `name` is not a valid feature name.
+    fn feature(name: &str) -> FeatureName {
+        FeatureName::new(name).expect("valid feature name")
+    }
+
+    /// Subgroups of two with X-bar limits `[9, 11]` and S limits `[0, sqrt(2)]`.
     fn baseline(names: &[&str]) -> SpcBaseline {
-        let fitted = FittedSpcFeature {
-            center: 0.0,
-            one_lcl: -1.0,
-            one_ucl: 1.0,
-            two_lcl: -2.0,
-            two_ucl: 2.0,
-            three_lcl: -3.0,
-            three_ucl: 3.0,
+        let limits = FittedSpcFeature {
+            x_bar: ChartLimits {
+                center: 10.0,
+                lower: 9.0,
+                upper: 11.0,
+            },
+            s: ChartLimits {
+                center: 1.0,
+                lower: 0.0,
+                upper: std::f64::consts::SQRT_2,
+            },
         };
         SpcBaseline {
-            features: names.iter().map(|name| (feature(name), fitted)).collect(),
-            chunk_size: 5,
+            features: names.iter().map(|name| (feature(name), limits)).collect(),
+            subgroup_size: 2,
+            format: crate::baseline::FITTED_FORMAT,
             wyrd_version: WyrdVersion::current(),
         }
     }
 
-    /// Profile with `rule` and `alert_threshold`.
-    fn profile(rule: &str, alert_threshold: SpcAlertThreshold) -> SpcProfile {
-        SpcProfile {
-            sample_size: 5,
-            weco_rule: SpcWecoRule {
-                rule_string: rule.to_owned(),
-            },
-            alert_threshold,
-        }
-    }
-
-    /// A chunk mean that lands in signed zone `zone` under [`baseline`]'s limits.
-    fn mean_in(zone: i8) -> f64 {
-        match zone {
-            0 => 0.0,
-            z if z > 0 => f64::from(z) - 0.5,
-            z => f64::from(z) + 0.5,
-        }
-    }
-
-    /// Stream full chunks landing in `zones` for feature `x` and report.
+    /// A batch of nullable numeric columns.
     ///
     /// # Panics
-    /// Panics when the rule is malformed or a push fails.
-    fn score(zones: &[i8], rule: &str, threshold: SpcAlertThreshold) -> DriftReport {
-        let mut scorer =
-            SpcScorer::new(&baseline(&["x"]), &profile(rule, threshold)).expect("rule parses");
-        for &zone in zones {
-            scorer.push(&feature("x"), 5, mean_in(zone)).expect("push");
-        }
-        scorer.finish()
-    }
-
-    /// Assert feature `x` scored `expected` violations with the matching verdict.
-    ///
-    /// # Panics
-    /// Panics when the score or verdict differ, or the threshold is not NaN.
-    fn assert_score(report: &DriftReport, expected: f64) {
-        let x = &report.features[&feature("x")];
-        assert_eq!(x.score, expected);
-        assert!(x.threshold.is_nan());
-        let verdict = if expected > 0.0 {
-            DriftVerdict::Drift
-        } else {
-            DriftVerdict::NoDrift
-        };
-        assert_eq!(x.verdict, verdict);
-    }
-
-    /// Nine same-side zone-1 chunks fire zone-1 consecutive (run 8) at the
-    /// eighth and ninth chunk: score 2.
-    ///
-    /// # Panics
-    /// Panics when the count differs from the old algorithm's.
-    #[test]
-    fn consecutive_run_counts_every_full_window() {
-        assert_score(
-            &score(&[1; 9], "8 16 4 8 2 4 1 1", SpcAlertThreshold::Zone1),
-            2.0,
-        );
-    }
-
-    /// The same zone-1 run is filtered out at alert threshold Zone2: score 0.
-    ///
-    /// # Panics
-    /// Panics when a filtered zone still counts.
-    #[test]
-    fn alert_threshold_filters_lower_zones() {
-        assert_score(
-            &score(&[1; 9], "8 16 4 8 2 4 1 1", SpcAlertThreshold::Zone2),
-            0.0,
-        );
-    }
-
-    /// An authored alternating threshold of 16 fires once after 16
-    /// alternating zone-1 chunks and never again; 15 chunks do not fire.
-    ///
-    /// # Panics
-    /// Panics when the 16-long window is not honored or fires more than once.
-    #[test]
-    fn alternating_threshold_sixteen_fires_once() {
-        let alternating: Vec<i8> = (0..20)
-            .map(|idx| if idx % 2 == 0 { 1 } else { -1 })
+    /// Panics when Arrow rejects the batch.
+    fn batch(columns: &[(&str, Vec<Option<f64>>)]) -> RecordBatch {
+        let fields = columns
+            .iter()
+            .map(|(name, _)| Field::new(*name, DataType::Float64, true))
+            .collect::<Vec<_>>();
+        let arrays = columns
+            .iter()
+            .map(|(_, values)| Arc::new(Float64Array::from(values.clone())) as ArrayRef)
             .collect();
-        assert_score(
-            &score(&alternating, "8 16 4 8 2 4 1 1", SpcAlertThreshold::Zone1),
-            1.0,
-        );
-        assert_score(
-            &score(
-                &alternating[..15],
-                "8 16 4 8 2 4 1 1",
-                SpcAlertThreshold::Zone1,
-            ),
-            0.0,
-        );
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).expect("record batch")
     }
 
-    /// A strictly rising seven-chunk run fires the trend rule regardless of
-    /// the alert threshold: score 1.
+    /// Score `values` of `x` directly.
     ///
     /// # Panics
-    /// Panics when the trend window does not fire exactly once.
-    #[test]
-    fn trend_window_fires_once() {
-        assert_score(
-            &score(
-                &[-3, -2, -1, 0, 1, 2, 3],
-                "8 16 4 8 2 4 1 1",
-                SpcAlertThreshold::Zone4,
-            ),
-            1.0,
-        );
+    /// Panics when scoring errors.
+    fn score(values: &[f64]) -> DriftReport {
+        let column = values.iter().copied().map(Some).collect();
+        score_spc(&baseline(&["x"]), &batch(&[("x", column)])).expect("scores")
     }
 
-    /// A shorter trailing chunk is scored as a chunk: three zone-4 chunks
-    /// (5, 5, and 3 rows) fire zone-4 consecutive three times plus zone-4
-    /// alternating once: score 4.
+    /// The X-bar and S signal counts of feature `x`.
     ///
     /// # Panics
-    /// Panics when the trailing chunk is dropped or miscounted.
-    #[test]
-    fn trailing_short_chunk_is_scored() {
-        let x = feature("x");
-        let mut scorer = SpcScorer::new(
-            &baseline(&["x"]),
-            &profile("8 16 4 8 2 4 1 1", SpcAlertThreshold::Zone4),
-        )
-        .expect("rule parses");
-        for rows in [5, 5, 3] {
-            scorer.push(&x, rows, mean_in(4)).expect("push");
+    /// Panics when `x` carries no SPC evidence.
+    fn signals(report: &DriftReport) -> (u64, u64) {
+        match &report.features[&feature("x")].evidence {
+            Some(FeatureEvidence::Spc(evidence)) => (evidence.x_bar.signals, evidence.s.signals),
+            other => panic!("no SPC evidence: {other:?}"),
         }
-        assert_score(&scorer.finish(), 4.0);
     }
 
-    /// Fewer total rows than the chunk size is inconclusive with NaN score
-    /// even when a rule fired, and a baseline feature that received no chunk
-    /// is inconclusive while its sibling is scored.
+    /// In-control subgroups pass with score and threshold zero and evidence.
     ///
     /// # Panics
-    /// Panics when either feature is not inconclusive or the sibling is not scored.
+    /// Panics when a calm target signals.
     #[test]
-    fn short_and_missing_features_are_inconclusive() {
-        let mut scorer = SpcScorer::new(
-            &baseline(&["x"]),
-            &profile("8 16 4 8 2 4 1 1", SpcAlertThreshold::Zone4),
-        )
-        .expect("rule parses");
-        scorer.push(&feature("x"), 4, mean_in(4)).expect("push");
-        let short = &scorer.finish().features[&feature("x")];
-        assert_eq!(short.verdict, DriftVerdict::Inconclusive);
-        assert!(short.score.is_nan() && short.threshold.is_nan());
-
-        let mut scorer = SpcScorer::new(
-            &baseline(&["x", "y"]),
-            &profile("8 16 4 8 2 4 1 1", SpcAlertThreshold::Zone4),
-        )
-        .expect("rule parses");
-        scorer.push(&feature("x"), 5, mean_in(0)).expect("push");
-        let report = scorer.finish();
-        assert_score(&report, 0.0);
-        let missing = &report.features[&feature("y")];
-        assert_eq!(missing.verdict, DriftVerdict::Inconclusive);
-        assert!(missing.score.is_nan() && missing.threshold.is_nan());
+    fn in_control_target_passes_with_evidence() {
+        let report = score(&[9.5, 10.5, 10.0, 10.0]);
+        let x = &report.features[&feature("x")];
+        assert_eq!(
+            (report.verdict, x.score, x.threshold),
+            (DriftVerdict::NoDrift, 0.0, 0.0)
+        );
+        let Some(FeatureEvidence::Spc(evidence)) = &x.evidence else {
+            panic!("SPC evidence");
+        };
+        assert_eq!((evidence.subgroup_size, evidence.subgroups), (2, 2));
+        assert_eq!(evidence.x_bar.limits.upper, 11.0);
     }
 
-    /// A malformed rule, an unknown feature, and a non-finite mean are
-    /// rejected with their documented errors.
+    /// A mean beyond the X-bar limit and a spread beyond the S limit each
+    /// signal; the score sums both charts.
     ///
     /// # Panics
-    /// Panics when any input is accepted or maps to the wrong error.
+    /// Panics when either chart misses its signal.
     #[test]
-    fn invalid_inputs_are_rejected() {
+    fn each_chart_signals_independently() {
+        // Mean 12 (X-bar signal, sd 0); then mean 10 with sd 2.83 (S signal).
+        let report = score(&[12.0, 12.0, 8.0, 12.0]);
+        assert_eq!(signals(&report), (1, 1));
+        assert_eq!(report.features[&feature("x")].score, 2.0);
+        assert_eq!(report.verdict, DriftVerdict::Drift);
+    }
+
+    /// A subgroup mean exactly at a limit and a standard deviation exactly at
+    /// the S limit do not signal.
+    ///
+    /// # Panics
+    /// Panics when equality signals.
+    #[test]
+    fn equality_at_the_limits_is_in_control() {
+        // Mean 11 (= upper), sd 0 (= lower); mean 9 (= lower); sd sqrt(2) (= upper).
+        let report = score(&[11.0, 11.0, 9.0, 9.0, 9.0, 11.0]);
+        assert_eq!(signals(&report), (0, 0));
+        assert_eq!(report.verdict, DriftVerdict::NoDrift);
+    }
+
+    /// An empty target and a trailing partial subgroup are inconclusive
+    /// without evidence, never scored on shifted or dropped rows.
+    ///
+    /// # Panics
+    /// Panics when either target scores.
+    #[test]
+    fn empty_and_partial_targets_are_inconclusive() {
+        for values in [&[][..], &[12.0, 12.0, 10.0][..]] {
+            let report = score(values);
+            let x = &report.features[&feature("x")];
+            assert_eq!(report.verdict, DriftVerdict::Inconclusive, "{values:?}");
+            assert!(x.score.is_nan() && x.threshold.is_nan() && x.evidence.is_none());
+        }
+    }
+
+    /// A selected row missing a feature or holding null, NaN, or infinity is
+    /// unscored with no feature rows; a row carrying no feature is ignored.
+    ///
+    /// # Panics
+    /// Panics when an incomplete target scores or an unrelated row counts.
+    #[test]
+    fn incomplete_targets_are_unscored_and_unrelated_rows_ignored() {
+        let base = baseline(&["x", "y"]);
+        let full = |x: Vec<Option<f64>>, y: Vec<Option<f64>>| {
+            score_spc(&base, &batch(&[("x", x), ("y", y)])).expect("scores")
+        };
+        let calm = vec![Some(10.0), Some(10.0)];
+        for bad in [None, Some(f64::NAN), Some(f64::NEG_INFINITY)] {
+            let report = full(calm.clone(), vec![Some(10.0), bad]);
+            assert_eq!(
+                report,
+                DriftReport::unscored(wyrd_spec::card::drift::DriftMethod::Spc)
+            );
+        }
+        let only_x = score_spc(&base, &batch(&[("x", calm.clone())])).expect("scores");
+        assert!(only_x.features.is_empty(), "an omitted feature is unscored");
+
+        let with_unrelated = full(
+            vec![Some(10.0), None, Some(10.0)],
+            vec![Some(10.0), None, Some(10.0)],
+        );
+        assert_eq!(with_unrelated.verdict, DriftVerdict::NoDrift);
+    }
+
+    /// The streaming scorer refuses unknown features, oversized or
+    /// post-partial subgroups, and non-finite statistics, and keeps no
+    /// per-subgroup history.
+    ///
+    /// # Panics
+    /// Panics when an invalid push is accepted.
+    #[test]
+    fn scorer_rejects_invalid_pushes() {
+        let x = feature("x");
+        let mut scorer = SpcScorer::new(&baseline(&["x"]));
         assert!(matches!(
-            SpcScorer::new(
-                &baseline(&["x"]),
-                &profile("8 16 4", SpcAlertThreshold::Zone4)
-            ),
-            Err(DriftScoreError::WecoMalformed { .. })
-        ));
-        let mut scorer = SpcScorer::new(
-            &baseline(&["x"]),
-            &profile("8 16 4 8 2 4 1 1", SpcAlertThreshold::Zone4),
-        )
-        .expect("rule parses");
-        assert!(matches!(
-            scorer.push(&feature("nope"), 5, 0.0),
+            scorer.push(&feature("nope"), 2, 10.0, 1.0),
             Err(DriftScoreError::SpcInternal { .. })
         ));
-        assert!(matches!(
-            scorer.push(&feature("x"), 5, f64::NAN),
-            Err(DriftScoreError::SpcInternal { .. })
-        ));
+        assert!(scorer.push(&x, 3, 10.0, 1.0).is_err());
+        assert!(scorer.push(&x, 2, f64::NAN, 1.0).is_err());
+        for _ in 0..100_000 {
+            scorer.push(&x, 2, 10.0, 1.0).expect("calm subgroup");
+        }
+        scorer
+            .push(&x, 1, f64::NAN, f64::NAN)
+            .expect("trailing partial");
+        assert!(scorer.push(&x, 2, 10.0, 1.0).is_err());
+        assert_eq!(scorer.finish().verdict, DriftVerdict::Inconclusive);
     }
 
-    /// Streaming 100_000 chunks keeps the retained per-feature history at or
-    /// below the lookback cap of 16 (the default rule's largest threshold).
+    /// A non-numeric target column is a type mismatch.
     ///
     /// # Panics
-    /// Panics when the history outgrows the cap.
+    /// Panics when a text column scores.
     #[test]
-    fn retained_history_is_bounded_over_many_chunks() {
-        let x = feature("x");
-        let mut scorer = SpcScorer::new(
-            &baseline(&["x"]),
-            &profile("8 16 4 8 2 4 1 1", SpcAlertThreshold::Zone1),
+    fn non_numeric_target_errors() {
+        let text = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("x", DataType::Utf8, true)])),
+            vec![Arc::new(StringArray::from(vec!["1", "2"]))],
         )
-        .expect("rule parses");
-        let mut max_retained = 0;
-        for idx in 0..100_000i32 {
-            scorer
-                .push(&x, 5, mean_in((idx % 9 - 4) as i8))
-                .expect("push");
-            max_retained = max_retained.max(scorer.retained(&x).expect("known feature"));
-        }
-        assert_eq!(max_retained, 16);
+        .expect("record batch");
+        assert!(matches!(
+            score_spc(&baseline(&["x"]), &text),
+            Err(DriftScoreError::FeatureTypeMismatch { .. })
+        ));
     }
 }

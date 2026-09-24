@@ -107,6 +107,7 @@ pub fn score_custom_mean(
             score,
             threshold: profile.alert_threshold,
             verdict,
+            evidence: None,
         },
     );
 

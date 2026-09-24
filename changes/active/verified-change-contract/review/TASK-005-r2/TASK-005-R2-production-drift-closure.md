@@ -56,3 +56,61 @@ Align that same task's revision and governing prose with revision 36. Keep its o
 | `FIND-TASK-005-10` | No active ready instruction names revision 35 or the displaced local typed-plan path. | Read the final task frontmatter, outcome, owner, approach, and scenarios against approved revision 36. No runtime test is needed. |
 
 Use `mise.toml` to select the narrowest owning journey/fit tasks. Record the exact focused command for every named test, then run required format/lints and the touched-surface broader lanes under `mise`. Preserve the cumulative candidate and submit it for a fresh `$wyrd-task-review` against the same base.
+
+## Remediation r2 Evidence
+
+Candidate commits `95a8a827`..`7a497bb8` on `vcc/task-005`, same base
+`f8811ac5`. Postgres-backed commands run inside
+`scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && <command>"`.
+
+| Finding | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| `FIND-TASK-005-2` two Services on one Trigger; manual binding dispatch | `drift_methods_fit_score_persist_and_dispatch` registers Trigger `drift-daily` and two Services binding `drift-custom` through it (two and one inline Operators). `SharedTrigger::assert_one_occurrence_runs_each_binding` makes both bindings due and asserts exactly one run per binding, distinct binding and result IDs, each result's own subject, failed verdicts, 2 and 1 dispatches, and no shared Operator. `assert_manual_binding_run_dispatches` starts a `binding` run through the SDK and asserts a new failed result, new dispatch IDs, and the same Operators as the scheduled run. The existing direct-run no-dispatch assertion in `complete` is unchanged | Focused journey command below | PASS |
+| `FIND-TASK-005-9` fit ignores cancellation after decode | `vala_drift::fit_baseline_until(batch, spec, cancelled)` polls before each feature, between a feature's collect, edge, and binning phases, and every `CANCEL_CHECK_ROWS` (65,536) rows in PSI binning and categorical counting. It returns `DriftFitError::Cancelled`. `fit_baseline` and the PSI/SPC fitters delegate with a never-cancelled probe, so their output is unchanged. The server fitter passes `|| cancel.is_cancelled()` inside `spawn_blocking`, and `fit_next` still awaits that blocking task before release or fail. Permits, the decoded budget, and the SQL lease fence are untouched | `baseline::cancellation::cancellation_after_fit_starts_stops_inside_the_feature` (PSI numeric stops mid-binning, PSI categorical mid-count, SPC before limits; no poll after the stop; an uncancelled fit equals `fit_baseline`); `verification::fitter::tests` | PASS |
+| `FIND-TASK-005-10` stale task authority | Frontmatter changed to `status: review` and `spec_revision: 36`. Outcome, owners, approach step 3, Scenario 3, acceptance criterion, and write set now name the SYSTEM read token and fixed SQL through the query service. The r1 evidence is kept | `grep -n "DataFusion\|typed Oracle\|logical-plan\|revision 35"` on the task finds only the r1 historical note | PASS |
+
+Focused commands, each run alone in this session (1 passed):
+
+```bash
+mise exec -- cargo nextest run --locked -p vala-drift --lib -E 'test(=baseline::cancellation::cancellation_after_fit_starts_stops_inside_the_feature)'
+# inside the Postgres wrapper above
+mise exec -- cargo nextest run --locked -p wyrd-sdk-rust --test drift_verification -P journey --run-ignored=all -E 'test(=drift_methods_fit_score_persist_and_dispatch)'
+```
+
+Lanes run after the final code change, each exit 0: `mise run fmt`,
+`mise run lints`, `mise run test:vala` (1308), `mise run test:wyrd` (2134),
+`mise run test:bifrost` (9/9 lanes, including the Drift, Oracle, SDK, Python, and TypeScript journeys), and `git diff --check f8811ac5..HEAD`.
+
+Non-goals held: no new scheduler, worker, timeout framework, public API, or
+harness. `Oracle::query_plan` is untouched.
+
+Material limit: one quantile sort within a feature cannot be interrupted. It
+runs at most O(n log n) over a column held within the 256 MiB decoded budget.
+
+### Failure diagnosis — Oracle capacity baseline (found while verifying)
+
+- **Symptom:** the first `mise run test:bifrost` run failed at
+  `wyrd-testing::oracle capacity::lowest_rung_analytical_contention_preserves_two_interactive_tenants`
+  (`capacity.rs:126`). `spill_directories` read 3 at the baseline and 4 after
+  settlement, while every admission, reservation, and spill-file counter was 0.
+  The test passes when run alone.
+- **Evidence:** each analytical query `RuntimeEnv` makes a DataFusion
+  `datafusion-*` TempDir when it is built (`oracle/spill.rs:89-95`). Upstream
+  worker task entries keep that `RuntimeEnv` through their `TaskContext` until
+  coordinator end-of-stream or cache invalidation. `release_graph` returns the
+  counters once reservations reach 0. The test read `ownership_baseline` once,
+  right after `await_clean_nodes`.
+- **Cause:** the empty directory lives until the upstream lease teardown,
+  which can finish after graph release. `architecture/bifrost-design.md`
+  permits this ("Query-owned leases remain alive until coordinator
+  end-of-stream, cancellation, or cache invalidation"). The single read
+  asserted an ordering the design does not promise.
+- **Fix site:** the test's settled-baseline comparison (`capacity.rs`, commit
+  `7a497bb8`). It now polls under the existing `CLEAN_NODE_POLLS` × 100 ms
+  bound, following the pattern in `distributed.rs`. A directory that never goes
+  away still fails with the last snapshot. `capacity.rs` is the only test that
+  compares `spill_directories`. Other `await_clean_nodes` users check only
+  graph and attempt state. No production change is needed.
+- **Diagnostician:** a fresh read-only diagnostician was given the failing
+  command, the trace, and the diff. It reported this cause and fix site. This
+  diff does not touch Oracle spill or ownership code.

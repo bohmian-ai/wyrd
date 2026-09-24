@@ -10,7 +10,6 @@ use crate::components::operators::keys::{KeyError, KeyFailure, OperatorKeys};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use base64::Engine;
 use futures_util::{StreamExt, TryStreamExt};
 use secrecy::{ExposeSecret, SecretString};
 use tokio_util::sync::CancellationToken;

@@ -51,6 +51,9 @@ use super::health::RuntimeCapability;
 use super::permits::VerifierPermits;
 use crate::components::operators::keys::{KeyError, OperatorKeys};
 
+mod pager_duty;
+mod slack;
+
 /// The frozen Operator no longer resolves to a supported Operator body.
 pub const OPERATOR_UNAVAILABLE: &str = "operator_unavailable";
 /// The named connection is missing, disabled, of another provider, or of
@@ -80,14 +83,6 @@ pub const PROVIDER_REJECTED: &str = "provider_rejected";
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 /// Same-origin redirects an HTTP Operator may follow in one attempt.
 const MAX_REDIRECTS: usize = 3;
-/// Slack errors that are transient rather than configuration failures.
-const SLACK_TRANSIENT: [&str; 5] = [
-    "ratelimited",
-    "internal_error",
-    "service_unavailable",
-    "request_timeout",
-    "fatal_error",
-];
 
 /// Where the fixed-provider Operators send.
 ///
@@ -536,16 +531,10 @@ impl OperatorDelivery {
                         },
                 },
                 Some(ConnectionSecret::Token { value }),
-            ) => {
-                let Ok(text) = context.render(text) else {
-                    return Attempt::terminal(
-                        INVALID_REQUEST,
-                        "the Slack text template is invalid",
-                    );
-                };
-                let body = serde_json::json!({ "channel": channel_id, "text": text });
-                self.slack(value, &body, timeout).await
-            }
+            ) => match slack::message(channel_id, text, context) {
+                Ok(body) => self.slack(value, &body, timeout).await,
+                Err(attempt) => attempt,
+            },
             (
                 OperatorAction::Notify {
                     channel:
@@ -559,31 +548,17 @@ impl OperatorDelivery {
                 },
                 Some(ConnectionSecret::Token { value }),
             ) => {
-                let dedup = dedup_key.as_deref().map_or_else(
-                    || Ok(context.dispatch_id.to_string()),
-                    |key| context.render(key),
-                );
-                let (Ok(summary), Ok(dedup)) = (context.render(summary), dedup) else {
-                    return Attempt::terminal(INVALID_REQUEST, "a PagerDuty template is invalid");
-                };
-                let body = serde_json::json!({
-                    "routing_key": value.expose(),
-                    "event_action": "trigger",
-                    "dedup_key": dedup,
-                    "payload": {
-                        "summary": summary,
-                        "source": context.subject_ref,
-                        "severity": severity,
-                        "custom_details": {
-                            "wyrd_route": route,
-                            "run_id": context.run_id,
-                            "result_id": context.result_id,
-                            "binding_id": context.binding_id,
-                            "verifier_ref": context.verifier_ref,
-                        },
-                    },
-                });
-                self.pager_duty(&body, timeout).await
+                match pager_duty::event(
+                    value,
+                    route,
+                    *severity,
+                    summary,
+                    dedup_key.as_deref(),
+                    context,
+                ) {
+                    Ok(body) => self.pager_duty(&body, timeout).await,
+                    Err(attempt) => attempt,
+                }
             }
             (
                 OperatorAction::Http {
@@ -625,7 +600,7 @@ impl OperatorDelivery {
     }
 
     /// `chat.postMessage` with the bot token, attached after the endpoint is
-    /// screened; success is Slack's JSON `ok`.
+    /// screened; a 2xx reply is classified by [`slack::outcome`].
     async fn slack(
         &self,
         token: &SecretBearer,
@@ -645,17 +620,7 @@ impl OperatorDelivery {
         let Ok(bytes) = bounded_body(response).await else {
             return Attempt::retry(DESTINATION_UNREACHABLE, "the Slack response was cut short");
         };
-        let reply: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
-        if reply["ok"] == serde_json::Value::Bool(true) {
-            return Attempt::Delivered;
-        }
-        let code = reply["error"].as_str().unwrap_or("unknown_error");
-        let message = format!("Slack refused the message: {code}");
-        if SLACK_TRANSIENT.contains(&code) {
-            Attempt::retry(PROVIDER_TRANSIENT, &message)
-        } else {
-            Attempt::terminal(PROVIDER_REJECTED, &message)
-        }
+        slack::outcome(&bytes)
     }
 
     /// Events API v2 enqueue; the routing key rides in the body.

@@ -1188,11 +1188,7 @@ fn assert_spc_evidence(result: &ResultRow, subgroups: u64, x_bar_signals: u64) {
         "{spc}"
     );
     assert!((number(&spc["s"]["center"]) - s_bar).abs() < 1e-9, "{spc}");
-    assert_eq!(
-        number(&spc["s"]["lower"]),
-        0.0,
-        "B3 is zero for subgroups of five"
-    );
+    assert_eq!(spc["s"]["lower"], 0.0, "B3 is zero for subgroups of five");
 }
 
 /// Scheduled and manual activation of the Services sharing the `drift-daily`

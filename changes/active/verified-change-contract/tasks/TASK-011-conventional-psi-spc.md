@@ -97,3 +97,49 @@ without adding another monitor or client-side scorer.
 - [NIST X-bar/S chart formulas](https://itl.nist.gov/div898/handbook/pmc/section3/pmc321.htm)
 - [NIST rational subgroup guidance](https://www.itl.nist.gov/div898/handbook/glossary.htm)
 - [ASQ control-chart baseline guidance](https://asq.org/quality-resources/control-chart)
+
+## Implementation evidence
+
+Candidate range `338f3323..eecd2832` (base is the approved spec commit).
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Exhaustive PSI bins, reserved `other` bin, bin evidence | `vala-drift` `psi/` fit and score, `report.rs` `Psi` evidence; server `psi_categorical` other bin | `psi_unseen_categories_land_in_the_other_bin`, `psi_zero_bins_and_other_count_toward_the_threshold`, `psi_threshold_boundary_is_strict`, `categorical_fit_sorts_bins_and_reserves_other`, `psi_categorical_unknowns_land_in_the_other_bin`; server `psi_categorical_sql_escapes_labels_and_counts_unknowns_as_other` | PASS |
+| Baseline null/non-finite fails the fit | `psi` and `spc` fit validation, `DriftFitError::{NullValuesInColumn, NonFiniteValuesInColumn}` | `null_baseline_values_fail_the_fit`, `numeric_fit_rejects_non_finite_values`, `null_and_non_finite_baseline_values_fail` | PASS |
+| Target completeness: omitted/null/non-finite → inconclusive, no rows; unrelated records ignored; Custom unchanged | `vala-drift` scorers; server `ObservationWindow::incomplete`, `Reader::complete` | `psi_incomplete_targets_are_unscored`, `psi_target_without_configured_features_is_inconclusive`, `incomplete_targets_are_unscored_and_unrelated_rows_ignored`, server `completeness_flags_omitted_and_invalid_features_only`; Rust/Python/TS "gappy" journey cases | PASS |
+| `SpcProfile { sample_size ≥ 2 }` only; `weco_rule`/`alert_threshold` rejected | `wyrd-spec` `drift.rs`, schemas, stubs | `wyrd-spec` suite (879 passed); `codegen:check`; Rust/Python/TS journeys refuse a `weco_rule` profile at registration | PASS |
+| ≥ 20 complete baseline subgroups; leftover rows rejected | `spc::fit_spc_baseline_until`, `MIN_BASELINE_SUBGROUPS` | `twenty_complete_subgroups_fit`, `short_or_ragged_baselines_fail_visibly` | PASS |
+| Target ordered by `created_at`, `record_id`; empty/partial target inconclusive | server `ObservationWindow::spc`, `fold_spc`; `SpcScorer` | `spc_sql_orders_subgroups_by_creation_then_record`, `spc_fold_feeds_subgroups_and_refuses_invalid_ones`, `empty_and_partial_targets_are_inconclusive`, `spc_subgroups_match_raw_scoring_and_partial_targets_are_inconclusive`; journey "calm-partial" cases | PASS |
+| NIST X-bar/S limits incl. `sqrt(n)`, strict signals, score = signals, threshold 0, typed evidence | `spc/control_limits.rs`, `SpcEvidence`, `SpcChartEvidence` | `x_bar_s_fixture_includes_sqrt_n`, `limits_reproduce_published_a3_b3_b4_constants`, `equality_at_the_limit_does_not_signal`, `equality_at_the_limits_is_in_control`, `each_chart_signals_independently`, `in_control_target_passes_with_evidence`, `rejects_degenerate_fits`, `scorer_rejects_invalid_pushes`, `non_numeric_target_errors`; journeys assert center/limits/signals/threshold | PASS |
+| Failed scheduled result dispatches its Operator | Unchanged runtime; SPC now fails on signals | Rust `drift_methods_fit_score_persist_and_dispatch` (due-trigger scheduled SPC run, one dispatch); Python/TS binding-run failure with one dispatch | PASS |
+| Version boundary: legacy fitted profile refused, history readable, no migration | server `fitted()` format check, `BASELINE_LEGACY`; `wyrd-testing` `retire_fitted_format` | Rust journey: retired baseline → terminal `baseline_legacy`, earlier result still readable | PASS |
+| Docs and schemas aligned | `architecture/logic/drift.md`, `architecture/verifier/drift.md` (change packet), `architecture/wyrd-design.md`, `docs/public/llms-full.txt` | `docs:check`, `codegen:check` | PASS |
+| TASK-005 journeys stay green | — | `test:bifrost:journey:drift`, `:python`, `:typescript`, `test:bifrost:integration:server` | PASS |
+
+Commands (all exit 0 in this session):
+
+- `mise run fmt`; `mise run lints`; `mise run py:format`; `mise run py:lints`; `mise run ts:typecheck`
+- `mise run test:vala` — 1278 passed
+- `mise exec -- cargo nextest run --locked -p wyrd-spec` — 879 passed
+- `mise run test:bifrost:journey:drift` — 2 passed
+- `mise run test:bifrost:journey:python` — 40 passed
+- `mise run test:bifrost:journey:typescript` — 20 passed
+- `mise run test:bifrost:integration:server` — 85 passed (includes `pg_verification_runtime`)
+- `mise run codegen:check`; `mise run docs:check`
+- `git diff --check 338f3323..HEAD`
+- Focused, one exact command per named test:
+  - `mise exec -- cargo nextest run --locked -p vala-drift --lib -E 'test(=<path>)'` for each vala-drift test named above (23 commands, each 1 passed)
+  - `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-server --features test-support --lib -E "test(/verification::drift::tests::/)"'` — 6 passed
+  - `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-sdk-rust --test drift_verification -P journey --run-ignored=all -E "test(=drift_methods_fit_score_persist_and_dispatch)"'` and the same for `drift_method_edges_score_through_oracle` — 1 passed each
+  - `uv run python -m pytest -q -m integration tests/integration/test_drift_journey.py::test_parquet_baselines_fit_and_score_drift_server_side tests/integration/test_drift_journey.py::test_drift_method_edges_score_through_oracle` (under the Postgres wrapper) — 2 passed
+  - `pnpm exec vitest run tests/integration/drift-verification.test.ts -t "scores each method"` (under the Postgres wrapper) — 1 passed
+
+Material limits:
+
+- Python and TypeScript have no database test hooks. Three things are therefore proven only in the Rust journey:
+  - refusal of a stored legacy baseline;
+  - historical readability after retirement;
+  - due-trigger scheduled dispatch.
+- Python and TypeScript prove failed-result dispatch through a manual binding run, and prove legacy refusal only at registration.
+- NaN and ±inf target values are proven in unit and server SQL tests only. The SDKs' JSON observation path cannot carry non-finite numbers.
+- Non-goals stayed excluded: no extra chart families, no configurable rules, no inferred subgroup size, no imputation, no migration.

@@ -59,7 +59,8 @@ pub struct RuntimeLimits {
     pub execution_timeout: Duration,
     /// Deadline of one result publication attempt; exceeding it retries.
     pub publication_timeout: Duration,
-    /// How long shutdown waits for in-flight runs before releasing them.
+    /// How long shutdown waits for in-flight runs and baseline fits before
+    /// releasing them.
     pub drain_grace: Duration,
     /// Idle wait between scheduler passes and between empty claim rounds.
     pub poll_interval: Duration,
@@ -367,9 +368,7 @@ impl VerificationRuntimeBuilder<'_> {
             operator.clone(),
             Arc::clone(&self.state.storage),
             Arc::clone(&permits),
-            self.limits.lease,
-            self.limits.execution_timeout,
-            self.limits.poll_interval,
+            &self.limits,
         );
         #[cfg(feature = "test-support")]
         if let Some(crash) = &self.crash {

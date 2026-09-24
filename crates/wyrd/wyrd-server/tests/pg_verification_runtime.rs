@@ -11,6 +11,7 @@
 //! so staged rows stay observable.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -21,7 +22,9 @@ use uuid::Uuid;
 use vala_drift::{DriftReport, DriftVerdict, FeatureDriftReport};
 use wyrd_server::verification::drift::DRIFT_INVALID;
 use wyrd_server::verification::engines::{EngineOutcome, VerifierReport};
+use wyrd_server::verification::fitter::{BaselineFitter, FitGate};
 use wyrd_server::verification::health::RuntimeCapability;
+use wyrd_server::verification::permits::VerifierPermits;
 use wyrd_server::verification::publisher::{PublicationFault, SentBatch};
 use wyrd_server::verification::runner::{EngineScript, RESULT_PUBLICATION_FAILED};
 use wyrd_server::verification::{CapabilityCrash, RuntimeLimits, VerificationRuntime};
@@ -1747,4 +1750,189 @@ async fn crash_after_detail_ack_reclaims_the_same_run_before_dispatch() {
     let rows = harness.durable_rows().await;
     assert_eq!(rows.get(FEATURES), Some(&4), "{rows:?}");
     assert_eq!(rows.get(RESULTS), Some(&1), "{rows:?}");
+}
+
+/// Write a small Parquet artifact for `data` and register its metadata, so a
+/// fit of a baseline pinned to `data` decodes and settles `ready`.
+///
+/// # Panics
+/// Panics when the Parquet encode, the storage write, or the metadata insert
+/// fails.
+async fn baseline_artifact(server: &WyrdTestServer, seed: &VerificationFixture, data: &CardUid) {
+    use arrow::array::Float64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use datafusion::parquet::arrow::ArrowWriter;
+    use wyrd_sql::queries::storage::artifact_metadata::{self, NewArtifactMetadata};
+
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "latency_ms",
+        DataType::Float64,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0]))],
+    )
+    .expect("baseline batch");
+    let mut bytes = Vec::new();
+    let mut writer = ArrowWriter::try_new(&mut bytes, schema, None).expect("parquet writer");
+    writer.write(&batch).expect("batch writes");
+    writer.close().expect("writer closes");
+
+    let sha256 = {
+        use base64::Engine as _;
+        use sha2::Digest as _;
+        base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(&bytes))
+    };
+    let path = wyrd_storage::tenant_path::build(seed.tenant(), data.as_str(), "data/data.parquet");
+    let storage = &server.state().storage;
+    storage
+        .operator()
+        .write(&path, bytes.clone())
+        .await
+        .expect("artifact writes");
+    let mut conn = server
+        .state()
+        .postgres
+        .wyrd()
+        .tenant_conn(seed.tenant())
+        .await
+        .expect("tenant connection opens");
+    artifact_metadata::insert(
+        &mut conn,
+        NewArtifactMetadata {
+            storage_path: &path,
+            card_uid: data.as_str(),
+            size_bytes: i64::try_from(bytes.len()).expect("artifact size fits"),
+            sha256: &sha256,
+            content_type: Some("application/vnd.apache.parquet"),
+            sse_marker: None,
+            backend: storage.backend(),
+        },
+    )
+    .await
+    .expect("artifact metadata inserts");
+    conn.commit().await.expect("artifact metadata commits");
+}
+
+/// Read `(state, attempts)` of `verifier`'s baseline row.
+///
+/// # Panics
+/// Panics when the read fails or the row does not exist.
+async fn baseline_row(harness: &Harness, verifier: &CardUid) -> (String, i32) {
+    sqlx::query_as(
+        "SELECT state, attempts FROM wyrd.drift_baselines \
+          WHERE data_tenant_id = $1 AND verifier_uid = $2",
+    )
+    .bind(harness.seed.tenant().as_uuid())
+    .bind(verifier.as_uuid())
+    .fetch_one(&harness.assertion)
+    .await
+    .expect("baseline row reads")
+}
+
+/// A fitter over `harness`'s server with `drain_grace`, holding fits at `gate`.
+///
+/// # Panics
+/// Panics when the server has no operator pool.
+fn fitter(harness: &Harness, drain_grace: Duration, gate: &FitGate) -> Arc<BaselineFitter> {
+    let state = harness.server.state();
+    let limits = RuntimeLimits {
+        drain_grace,
+        ..Harness::limits()
+    };
+    Arc::new(
+        BaselineFitter::new(
+            state.postgres.wyrd().clone(),
+            state
+                .postgres
+                .operator_pool()
+                .expect("server has an operator pool"),
+            Arc::clone(&state.storage),
+            Arc::new(VerifierPermits::new(
+                limits.global_permits,
+                limits.tenant_permits,
+            )),
+            &limits,
+        )
+        .with_fit_gate(gate.clone()),
+    )
+}
+
+/// Baseline fitting follows the runtime's shutdown drain.
+///
+/// A fit admitted before shutdown finishes inside the drain grace and settles
+/// `ready`. A fit still running when a short grace elapses is cancelled,
+/// awaited, and released to `pending` with its attempt refunded. After
+/// shutdown a pass admits no claim, so the released row stays unclaimed.
+///
+/// # Panics
+/// Panics when a fitter does not drain within [`WAIT`], an admitted fit does
+/// not settle `ready`, a cut-off fit is not released, or a claim is admitted
+/// after shutdown.
+#[tokio::test]
+async fn baseline_fit_drains_within_grace_then_releases() {
+    let harness = Harness::start().await;
+    baseline_artifact(&harness.server, &harness.seed, &harness.subject).await;
+    let gate = FitGate::default();
+    gate.hold();
+
+    let draining = fitter(&harness, Duration::from_secs(10), &gate);
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(Arc::clone(&draining).run(stop.clone()));
+    pending_baseline(
+        &harness.server,
+        &harness.seed,
+        &harness.verifier,
+        &harness.subject,
+    )
+    .await;
+    wait_until("the first fit is admitted", || gate.entered() == 1).await;
+    stop.cancel();
+    assert!(!task.is_finished(), "an admitted fit holds the drain open");
+    assert_eq!(
+        baseline_row(&harness, &harness.verifier).await,
+        ("building".to_owned(), 1)
+    );
+    gate.release();
+    tokio::time::timeout(WAIT, task)
+        .await
+        .expect("the fitter drains within the wait")
+        .expect("the fitter does not panic");
+    assert_eq!(
+        baseline_row(&harness, &harness.verifier).await,
+        ("ready".to_owned(), 1),
+        "a fit admitted before shutdown settles inside the grace"
+    );
+
+    let cut_off = harness
+        .seed
+        .drift_verifier("drift-cut-off")
+        .await
+        .expect("verifier registers");
+    gate.hold();
+    let releasing = fitter(&harness, Duration::from_millis(100), &gate);
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(Arc::clone(&releasing).run(stop.clone()));
+    pending_baseline(&harness.server, &harness.seed, &cut_off, &harness.subject).await;
+    wait_until("the second fit is admitted", || gate.entered() == 2).await;
+    stop.cancel();
+    tokio::time::timeout(WAIT, task)
+        .await
+        .expect("the fitter releases within the wait")
+        .expect("the fitter does not panic");
+    assert_eq!(
+        baseline_row(&harness, &cut_off).await,
+        ("pending".to_owned(), 0),
+        "a fit past the grace is released with its attempt refunded"
+    );
+
+    let settled = releasing.pass(&stop).await.expect("pass reads due tenants");
+    assert_eq!(settled, 0, "no claim is admitted after shutdown");
+    assert_eq!(gate.entered(), 2, "no fit starts after shutdown");
+    assert_eq!(
+        baseline_row(&harness, &cut_off).await,
+        ("pending".to_owned(), 0)
+    );
 }

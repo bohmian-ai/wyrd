@@ -11,8 +11,10 @@
 //! runner shares, taken before the claim and kept through settlement, so fits
 //! and runs together respect the global and per-tenant ceilings; many
 //! processes share the queue through `SKIP LOCKED` claims. Decoding stops at a
-//! decoded-byte budget, and the blocking decode and fit observe shutdown and
-//! the execution timeout, which the fitter awaits before it settles the lease.
+//! decoded-byte budget. Shutdown closes claim admission at once, gives a fit
+//! admitted before it the runtime's drain grace to finish and settle, and then
+//! cancels it; the blocking decode and fit observe that cancellation and the
+//! execution timeout, and the fitter awaits them before it settles the lease.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,6 +41,7 @@ use wyrd_storage::tenant_path;
 
 #[cfg(feature = "test-support")]
 use super::CapabilityCrash;
+use super::RuntimeLimits;
 #[cfg(feature = "test-support")]
 use super::health::RuntimeCapability;
 use super::permits::VerifierPermits;
@@ -86,17 +89,23 @@ pub struct BaselineFitter {
     permits: Arc<VerifierPermits>,
     /// Deadline of one fit; exceeding it stops the fit and fails the row.
     execution_timeout: Duration,
+    /// How long shutdown lets an admitted fit finish before cancelling it.
+    drain_grace: Duration,
     /// Test-only crash switch.
     #[cfg(feature = "test-support")]
     crash: Option<CapabilityCrash>,
+    /// Test-only hold on fits after their claim commits.
+    #[cfg(feature = "test-support")]
+    gate: Option<FitGate>,
 }
 
 impl BaselineFitter {
     /// Build a fitter over the Wyrd Postgres owner, the operator pool, and storage.
     ///
     /// The fitter carries no coordination clock: due times, leases, and retry
-    /// deadlines are PostgreSQL's; `lease` is only a length and
-    /// `poll_interval` only this process's idle wait. `permits` is the one
+    /// deadlines are PostgreSQL's. From `limits` it takes the lease length,
+    /// the execution timeout, the shutdown drain grace, and its idle poll
+    /// interval, the same values the runner uses. `permits` is the one
     /// capacity owner the Verifier runner also draws from.
     #[must_use]
     pub fn new(
@@ -104,22 +113,31 @@ impl BaselineFitter {
         operator: OperatorPool,
         storage: Arc<StorageHandle>,
         permits: Arc<VerifierPermits>,
-        lease: Duration,
-        execution_timeout: Duration,
-        poll_interval: Duration,
+        limits: &RuntimeLimits,
     ) -> Self {
         Self {
             postgres,
             operator,
             storage,
             queue: DriftBaselineQueue::default(),
-            lease: chrono::Duration::from_std(lease).unwrap_or(chrono::Duration::MAX),
-            poll_interval,
+            lease: chrono::Duration::from_std(limits.lease).unwrap_or(chrono::Duration::MAX),
+            poll_interval: limits.poll_interval,
             permits,
-            execution_timeout,
+            execution_timeout: limits.execution_timeout,
+            drain_grace: limits.drain_grace,
             #[cfg(feature = "test-support")]
             crash: None,
+            #[cfg(feature = "test-support")]
+            gate: None,
         }
+    }
+
+    /// Hold every fit at `gate` after its claim commits.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn with_fit_gate(mut self, gate: FitGate) -> Self {
+        self.gate = Some(gate);
+        self
     }
 
     /// Let `crash` panic this fitter's loop.
@@ -139,8 +157,10 @@ impl BaselineFitter {
     /// Panics under `test-support` when a test armed a fitter crash.
     ///
     /// # Cancellation
-    /// A fit in progress when `stop` fires is released back to `pending` with
-    /// its attempt refunded.
+    /// Once `stop` fires no new fit is claimed. A fit admitted before it may
+    /// finish and settle within the drain grace; one still running then is
+    /// cancelled, awaited, and released back to `pending` with its attempt
+    /// refunded.
     pub async fn run(self: Arc<Self>, stop: CancellationToken) {
         loop {
             #[cfg(feature = "test-support")]
@@ -163,7 +183,8 @@ impl BaselineFitter {
     /// shared permit, held through settlement; a tenant at its ceiling is
     /// skipped with its row unclaimed, and the pass ends when global capacity
     /// is exhausted. A tenant whose claim or settlement fails is logged and
-    /// skipped; no tenant starts once `stop` is cancelled.
+    /// skipped. Once `stop` is cancelled every claim is refused at the
+    /// durable boundary in [`fit_next`](Self::fit_next), which ends the pass.
     ///
     /// # Errors
     /// Returns [`SqlError`] when the cross-tenant due list cannot be read.
@@ -174,7 +195,7 @@ impl BaselineFitter {
             .await?;
         let mut settled = 0;
         for tenant in tenants {
-            if stop.is_cancelled() || self.permits.saturated() {
+            if self.permits.saturated() {
                 break;
             }
             let Some(_permit) = self.permits.try_acquire(tenant) else {
@@ -182,6 +203,7 @@ impl BaselineFitter {
             };
             match self.fit_next(tenant, stop).await {
                 Ok(true) => settled += 1,
+                Ok(false) if stop.is_cancelled() => break,
                 Ok(false) => {}
                 Err(error) => {
                     tracing::warn!(%tenant, %error, "drift baseline fit failed to settle")
@@ -194,11 +216,16 @@ impl BaselineFitter {
     /// Claim, fit, and settle the next due baseline of `tenant`.
     ///
     /// The claim commits before fitting so its lease is visible to other
-    /// processes. On `stop` or the execution timeout the fit is cancelled and
-    /// awaited until its blocking work has returned, so nothing keeps running
-    /// once the lease is settled: a stopped fit is released, a timed-out fit
-    /// fails, and a finished fit is completed or failed through the claimed
-    /// lease. Returns whether a fit was claimed.
+    /// processes. `stop` closes admission at the durable boundary, as the
+    /// runner does: a claim still in its transaction when `stop` fires rolls
+    /// back, and one whose commit completed after `stop` fired is released
+    /// unfitted. A fit admitted before `stop` runs until it finishes, the
+    /// execution timeout passes, or the drain grace after `stop` elapses; on
+    /// either deadline it is cancelled and awaited until its blocking work has
+    /// returned, so nothing keeps running once the lease is settled. A fit
+    /// cut off by the grace is released, a timed-out fit fails, and a finished
+    /// fit is completed or failed through the claimed lease. Returns whether
+    /// a fit was claimed.
     ///
     /// # Errors
     /// Returns [`SqlError`] when the claim or settlement transaction fails;
@@ -208,28 +235,25 @@ impl BaselineFitter {
         tenant: DataTenantId,
         stop: &CancellationToken,
     ) -> Result<bool, SqlError> {
-        let mut conn = self.postgres.tenant_conn(tenant).await?;
-        let Some(claimed) = self.queue.claim(&mut conn, self.lease).await? else {
+        let uncommitted = async {
+            let mut conn = self.postgres.tenant_conn(tenant).await?;
+            let claimed = self.queue.claim(&mut conn, self.lease).await?;
+            Ok::<_, SqlError>((conn, claimed))
+        };
+        let (conn, claimed) = tokio::select! {
+            biased;
+            () = stop.cancelled() => return Ok(false),
+            claimed = uncommitted => claimed?,
+        };
+        let Some(claimed) = claimed else {
             return Ok(false);
         };
         conn.commit().await?;
-        let cancel = CancellationToken::new();
-        let mut fit = std::pin::pin!(self.fit(tenant, &claimed, &cancel));
-        let interrupted = tokio::select! {
-            fitted = &mut fit => Ok(fitted),
-            () = stop.cancelled() => Err(None),
-            () = tokio::time::sleep(self.execution_timeout) => Err(Some(fit_error(
-                BASELINE_FIT_FAILED,
-                "the baseline fit exceeded the execution timeout",
-            ))),
-        };
-        let fitted = match interrupted {
-            Ok(fitted) => Some(fitted),
-            Err(reason) => {
-                cancel.cancel();
-                drop(fit.await);
-                reason.map(Err)
-            }
+        let fitted = if stop.is_cancelled() {
+            tracing::info!(%tenant, verifier_uid = %claimed.lease.verifier_uid, "fit claim committed after shutdown began; released");
+            None
+        } else {
+            self.fit_within_drain(tenant, &claimed, stop).await
         };
         let mut conn = self.postgres.tenant_conn(tenant).await?;
         let verifier_uid = &claimed.lease.verifier_uid;
@@ -252,6 +276,45 @@ impl BaselineFitter {
         Ok(true)
     }
 
+    /// Fit `claimed` until it finishes, times out, or outlives the drain grace.
+    ///
+    /// The grace starts when `stop` fires. On the timeout or the grace the
+    /// fit's cancellation token is cancelled and the fit is awaited until its
+    /// blocking work returns. Returns the fit's outcome, a timeout failure,
+    /// or `None` when the grace cut it off and the lease must be released.
+    async fn fit_within_drain(
+        &self,
+        tenant: DataTenantId,
+        claimed: &ClaimedBaseline,
+        stop: &CancellationToken,
+    ) -> Option<Result<Value, VerificationError>> {
+        let cancel = CancellationToken::new();
+        let mut fit = std::pin::pin!(self.fit(tenant, claimed, &cancel));
+        let grace = async {
+            stop.cancelled().await;
+            tokio::time::sleep(self.drain_grace).await;
+        };
+        let interrupted = tokio::select! {
+            fitted = &mut fit => Ok(fitted),
+            () = grace => Err(None),
+            () = tokio::time::sleep(self.execution_timeout) => Err(Some(fit_error(
+                BASELINE_FIT_FAILED,
+                "the baseline fit exceeded the execution timeout",
+            ))),
+        };
+        match interrupted {
+            Ok(fitted) => Some(fitted),
+            Err(reason) => {
+                if reason.is_none() {
+                    tracing::warn!(%tenant, verifier_uid = %claimed.lease.verifier_uid, "drift baseline drain grace elapsed; releasing the fit");
+                }
+                cancel.cancel();
+                drop(fit.await);
+                reason.map(Err)
+            }
+        }
+    }
+
     /// Fit one claimed baseline and return its serialized fitted profile.
     ///
     /// The blocking decode checks `cancel` between record batches and the
@@ -268,6 +331,10 @@ impl BaselineFitter {
         claimed: &ClaimedBaseline,
         cancel: &CancellationToken,
     ) -> Result<Value, VerificationError> {
+        #[cfg(feature = "test-support")]
+        if let Some(gate) = &self.gate {
+            gate.pass(cancel).await?;
+        }
         let (spec, path) = self.resolve(tenant, claimed).await?;
         let bytes = self
             .storage
@@ -350,6 +417,67 @@ impl BaselineFitter {
             ));
         }
         Ok((spec, path))
+    }
+}
+
+/// Test hold on baseline fits, taken after a fit's claim commits.
+///
+/// While held, a fit that reached the gate waits until
+/// [`release`](Self::release) or its cancellation, so a test can place a fit
+/// in flight across shutdown deterministically.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone)]
+pub struct FitGate {
+    /// Whether fits wait at the gate.
+    held: Arc<tokio::sync::watch::Sender<bool>>,
+    /// Fits that have reached the gate.
+    entered: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(feature = "test-support")]
+impl Default for FitGate {
+    /// An unheld gate.
+    fn default() -> Self {
+        Self {
+            held: Arc::new(tokio::sync::watch::Sender::new(false)),
+            entered: Arc::default(),
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl FitGate {
+    /// Hold fits at the gate until [`release`](Self::release).
+    pub fn hold(&self) {
+        self.held.send_replace(true);
+    }
+
+    /// Let held fits continue.
+    pub fn release(&self) {
+        self.held.send_replace(false);
+    }
+
+    /// Fits that have reached the gate so far.
+    #[must_use]
+    pub fn entered(&self) -> usize {
+        self.entered.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Count this fit, then wait while the gate is held.
+    ///
+    /// # Errors
+    /// Returns [`BASELINE_FIT_FAILED`] when `cancel` fires while held.
+    async fn pass(&self, cancel: &CancellationToken) -> Result<(), VerificationError> {
+        self.entered
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut held = self.held.subscribe();
+        tokio::select! {
+            _ = held.wait_for(|held| !held) => Ok(()),
+            () = cancel.cancelled() => Err(fit_error(
+                BASELINE_FIT_FAILED,
+                "the baseline fit was cancelled",
+            )),
+        }
     }
 }
 

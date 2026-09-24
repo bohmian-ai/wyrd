@@ -1281,6 +1281,26 @@ export type OperatorProvider = "slack" | "pager_duty" | "http";
 /** A connection's lifecycle state; Operators naming a disabled one fail closed. */
 export type OperatorConnectionStatus = "active" | "disabled";
 
+/** Write-only HTTP connection credential, tagged by `scheme`. */
+export type HttpConnectionAuth =
+  | { readonly scheme: "bearer"; readonly token: string }
+  | {
+      readonly scheme: "basic";
+      readonly username: string;
+      readonly password: string;
+    }
+  | {
+      readonly scheme: "header";
+      readonly name: string;
+      readonly value: string;
+    };
+
+/** Redacted HTTP auth metadata a view returns; the credential is never read back. */
+export type HttpAuthScheme =
+  | { readonly scheme: "bearer" }
+  | { readonly scheme: "basic" }
+  | { readonly scheme: "header"; readonly name: string };
+
 /** A connection create request: provider config plus its secret. */
 export type CreateOperatorConnectionRequest =
   | {
@@ -1298,39 +1318,55 @@ export type CreateOperatorConnectionRequest =
       readonly provider: "http";
       readonly name: string;
       readonly origin: string;
-      readonly auth:
-        | { readonly scheme: "bearer"; readonly token: string }
-        | {
-            readonly scheme: "basic";
-            readonly username: string;
-            readonly password: string;
-          }
-        | {
-            readonly scheme: "header";
-            readonly name: string;
-            readonly value: string;
-          };
+      readonly auth: HttpConnectionAuth;
     };
 
 /**
  * A connection update: the same provider, with any config, status, or secret
  * field to replace; omitted fields are preserved.
  */
-export type UpdateOperatorConnectionRequest = {
-  readonly provider: OperatorProvider;
-  readonly status?: OperatorConnectionStatus;
-} & Readonly<Record<string, unknown>>;
+export type UpdateOperatorConnectionRequest =
+  | {
+      readonly provider: "slack";
+      readonly workspace_id?: string;
+      readonly bot_token?: string;
+      readonly status?: OperatorConnectionStatus;
+    }
+  | {
+      readonly provider: "pager_duty";
+      readonly integration_key?: string;
+      readonly status?: OperatorConnectionStatus;
+    }
+  | {
+      readonly provider: "http";
+      readonly origin?: string;
+      readonly auth?: HttpConnectionAuth;
+      readonly status?: OperatorConnectionStatus;
+    };
 
-/** A connection's redacted metadata; no view ever carries a secret. */
-export interface OperatorConnectionView {
+/** Fields every connection view carries regardless of provider. */
+interface OperatorConnectionViewBase {
   readonly connection_id: string;
-  readonly provider: OperatorProvider;
   readonly name: string;
   readonly status: OperatorConnectionStatus;
-  readonly config: Readonly<Record<string, unknown>>;
   readonly created_at: string;
   readonly updated_at: string;
 }
+
+/**
+ * A connection's redacted metadata with provider config flattened alongside
+ * it; no view ever carries a secret.
+ */
+export type OperatorConnectionView = OperatorConnectionViewBase &
+  (
+    | { readonly provider: "slack"; readonly workspace_id: string }
+    | { readonly provider: "pager_duty" }
+    | {
+        readonly provider: "http";
+        readonly origin: string;
+        readonly auth: HttpAuthScheme;
+      }
+  );
 
 /**
  * Tenant-scoped Operator connection client over the shared Rust handle.

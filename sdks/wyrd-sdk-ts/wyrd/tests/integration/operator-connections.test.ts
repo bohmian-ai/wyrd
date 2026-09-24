@@ -58,6 +58,52 @@ describe("operator connection journey", () => {
       expect(
         (await admin.update(id, { provider: "slack", status: "active" })).status,
       ).toBe("active");
+      expect(created).toMatchObject({ provider: "slack", workspace_id: "T0001" });
+      expect(created).not.toHaveProperty("config");
+
+      const pager = await admin.create({
+        provider: "pager_duty",
+        name: "ts-pager",
+        integration_key: SECRETS[0] ?? "",
+      });
+      expectRedacted(pager);
+      expect(pager.provider).toBe("pager_duty");
+      expect(pager).not.toHaveProperty("config");
+      expect(pager).not.toHaveProperty("integration_key");
+
+      const http = await admin.create({
+        provider: "http",
+        name: "ts-http",
+        origin: "HTTPS://Hooks.Example.COM:443",
+        auth: { scheme: "header", name: "X-Api-Key", value: SECRETS[0] ?? "" },
+      });
+      expectRedacted(http);
+      expect(http).toMatchObject({
+        provider: "http",
+        origin: "https://hooks.example.com",
+        auth: { scheme: "header", name: "X-Api-Key" },
+      });
+      expect(http).not.toHaveProperty("config");
+      const basic = await admin.update(http.connection_id, {
+        provider: "http",
+        auth: { scheme: "basic", username: "u", password: SECRETS[1] ?? "" },
+      });
+      expectRedacted(basic);
+      expect(basic.provider === "http" && basic.auth).toEqual({ scheme: "basic" });
+      const bearer = await admin.update(http.connection_id, {
+        provider: "http",
+        origin: "https://other.example.com",
+        auth: { scheme: "bearer", token: SECRETS[1] ?? "" },
+      });
+      expect(bearer).toMatchObject({
+        origin: "https://other.example.com",
+        auth: { scheme: "bearer" },
+      });
+      const mismatch = await rejection(
+        admin.update(http.connection_id, { provider: "slack", bot_token: "x" }),
+      );
+      expect(mismatch.code).toBe("WYRD_OPERATOR_400_INVALID_CONNECTION");
+
       const malformed = await rejection(admin.get("not-a-uuid"));
       expect(malformed.code).toBe("WYRD_SPEC_400_VALIDATION");
 

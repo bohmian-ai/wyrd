@@ -2028,17 +2028,20 @@ async fn maximum_retry_after_settles_at_the_deadline() {
     else {
         panic!("a first failure within budget schedules a retry");
     };
-    let (status, created, lease): (String, DateTime<Utc>, Option<DateTime<Utc>>) =
-        sqlx::query_as(
-            "SELECT status, created_at, lease_expires_at
+    let (status, created, lease): (String, DateTime<Utc>, Option<DateTime<Utc>>) = sqlx::query_as(
+        "SELECT status, created_at, lease_expires_at
                FROM wyrd.operator_dispatches WHERE dispatch_id = $1",
-        )
-        .bind(claimed.lease.dispatch_id.as_uuid())
-        .fetch_one(&mut **conn.transaction())
-        .await
-        .expect("dispatch reads");
+    )
+    .bind(claimed.lease.dispatch_id.as_uuid())
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("dispatch reads");
     assert_eq!(status, "retrying");
-    assert_eq!(at - created, Duration::minutes(5), "clipped to the deadline");
+    assert_eq!(
+        at - created,
+        Duration::minutes(5),
+        "clipped to the deadline"
+    );
     assert!(lease.is_none(), "settlement clears the lease");
 }
 

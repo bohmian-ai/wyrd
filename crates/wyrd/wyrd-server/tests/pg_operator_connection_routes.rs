@@ -779,12 +779,9 @@ async fn production_boot_requires_every_active_tenant_key() {
     );
 
     state.operator_keys = std::sync::Arc::new(vault_keys(&unreachable));
-    wyrd_server::boot::verify_operator_keys(
-        &state,
-        &WyrdServerConfig::default(),
-    )
-    .await
-    .expect("development defers key failures");
+    wyrd_server::boot::verify_operator_keys(&state, &WyrdServerConfig::default())
+        .await
+        .expect("development defers key failures");
     let mut single_tenant = production.clone();
     single_tenant.auth.tenant_slug = Some(wyrd_spec::TenantSlug::new("acme").expect("slug"));
     wyrd_server::boot::verify_operator_keys(&state, &single_tenant)

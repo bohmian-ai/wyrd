@@ -1,7 +1,7 @@
 ---
 id: SPEC-verified-change-contract
-revision: 36
-status: approved
+revision: 37
+status: draft
 ---
 
 # Verification contract
@@ -147,9 +147,9 @@ make the standalone LLM-judge Verifier implementation part of this delivery.
 - **REQ-047**: The initial registrable `VerifierImplementation` variants MUST
   be `Drift(DriftSpec)` and `Eval(EvalSpec)`. They MUST incorporate the current
   Drift and Eval contracts rather than replace them.
-- **REQ-110**: The Drift payload MUST retain the existing `method`, `signal`,
-  `condition`, `profile`, and nested PSI/SPC/Custom configuration and
-  validation, with the agreed removals of `DriftMethod::External`,
+- **REQ-110**: The Drift payload MUST retain `method`, `signal`, `condition`,
+  `profile`, and the nested PSI/Custom configuration and validation, with the
+  agreed removals of `DriftMethod::External`,
   `DriftSignal::External`, `DriftSignal::EvalScore`, and `DriftSpec.details`.
   The only valid method/signal pairs are `Psi` + `Distribution`, `Spc` +
   `Distribution`, and `Custom` + `Metric`, each with its matching profile.
@@ -161,18 +161,68 @@ make the standalone LLM-judge Verifier implementation part of this delivery.
   fitted distributions. `condition` MUST be `Statistical` for all three
   executable pairs; `Above`, `Below`, and `Outside` remain typed vocabulary
   but registration rejects them in this delivery because the three profiles
-  already own their thresholds. The SPC public contract remains exactly
-  `SpcProfile { sample_size, weco_rule, alert_threshold }`: `sample_size = 0`
-  uses the existing row-count adaptive chunk size and any authored value MUST
-  be at least 2; the eight-positive-integer `weco_rule.rule_string`, existing
-  zone assignment, trend rule, and `alert_threshold` filtering retain their
-  current `vala-drift` semantics. Runtime observations are ordered by
-  `created_at`, then `record_id`, before the same consecutive chunk-mean
-  scorer is applied; incomplete trailing chunks retain the scorer's current
-  behavior. This change MUST NOT replace that contract with a fixed four-rule
-  WECO policy, an X-bar/S dual-chart result, a 25-subgroup readiness gate, or
-  a new SPC result shape. No client-side binning or subgroup aggregation is
-  added.
+  already own their thresholds or control limits. Revision 37 replaces the
+  previous SPC profile and scoring decisions with REQ-153–REQ-155. No
+  client-side binning or subgroup aggregation is added.
+- **REQ-153**: PSI MUST compare baseline and target over the same exhaustive,
+  frozen bins. Numeric bins retain their fitted edges and cover values outside
+  the baseline range. A categorical fit MUST include one reserved `other` bin
+  with zero baseline count; every target category absent from the fitted
+  labels contributes to that bin. Baseline and target proportions MUST each
+  sum to one before the existing zero-bin smoothing and PSI formula. The
+  `other` bin participates in the score, threshold bin count, and reported
+  sample/bin evidence. Existing numeric bin strategies, the minimum target
+  sample of 100, and authored PSI threshold choices remain; PSI and its
+  threshold strategies MUST NOT be presented as a significance test or proof
+  of model degradation.
+- **REQ-154**: SPC MUST be a two-sided, three-sigma Shewhart X-bar/S chart over
+  consecutive rational subgroups of an explicitly authored, fixed
+  `SpcProfile.sample_size >= 2`. The public SPC profile contains only
+  `sample_size`; registration rejects zero, the old `weco_rule` and
+  `alert_threshold` fields, and unknown fields. Authors are responsible for
+  supplying baseline rows in process order and a size whose consecutive rows
+  form meaningful subgroups; Wyrd does not infer process context or subgroup
+  boundaries. Runtime rows are ordered by `created_at`, then `record_id`.
+  Baseline fitting requires at least 20 complete subgroups from an
+  author-identified stable process; extra trailing rows make fitting fail
+  visibly rather than joining a smaller subgroup. A target window requires
+  at least one complete subgroup; a trailing partial subgroup makes that run
+  inconclusive. Neither path may shift or silently discard rows to make groups
+  fit.
+- **REQ-155**: For subgroup size `n`, fit the grand mean `x_bar_bar`, mean
+  sample standard deviation `s_bar` (each subgroup uses `n - 1`), and NIST's
+  `c4(n)`. Freeze X-bar limits at `x_bar_bar ± 3*s_bar/(c4(n)*sqrt(n))` and S
+  limits at `max(0, s_bar*(1 - 3*sqrt(1 - c4(n)^2)/c4(n)))` and
+  `s_bar*(1 + 3*sqrt(1 - c4(n)^2)/c4(n))`; the chart centers are `x_bar_bar`
+  and `s_bar`. A subgroup mean or sample standard deviation strictly outside
+  its respective limits signals drift; equality does not. Either chart's
+  signal fails the feature and thus the run. The existing scalar feature
+  `score` becomes the total count of signaled subgroups across both charts
+  and its threshold is zero. Persist typed SPC report evidence containing
+  subgroup size/count and, for each X-bar and S chart, center, lower/upper
+  limits, and signal count. PSI and Custom reports omit this SPC evidence.
+  The shared `vala-drift` scorer owns both direct and server scoring; the
+  server only supplies ordered complete subgroup aggregates.
+- **REQ-156**: Baseline fitting MUST reject any null or non-finite value in a
+  required PSI or SPC feature. A selected target observation is one that
+  carries at least one configured PSI/SPC feature for the subject and window;
+  unrelated observations do not enter the comparison. A missing configured
+  feature in such an observation, or a null or non-finite value, MUST make
+  the affected Drift run inconclusive, with no scored details or feature rows;
+  values are not dropped or imputed. A target with no observations or
+  insufficient complete samples is likewise inconclusive. These checks apply
+  identically to direct scoring and server runs. Client `observe:drift`
+  continues to reject explicit
+  null and non-finite values; server checks also cover omitted features and
+  historical or externally ingested rows. Custom retains its existing null,
+  non-finite, and empty-window inconclusive behavior.
+- **REQ-157**: Corrected PSI/SPC semantics begin with newly registered,
+  immutable Verifier Card versions and newly fitted baselines. The service
+  MUST NOT silently rescore existing Verifier versions or stored results
+  under revision 37 math. Previously persisted reports remain readable;
+  legacy versions without a revision-37 fitted profile cannot start new
+  scoring and fail visibly until replaced by a new version. No dual legacy
+  scorer or automatic migration is required.
 - **REQ-111**: The Eval payload MUST retain the existing `EvalSpec` fields
   `dataset`, `tasks`, `workflow`, `sampling`, `pass_gate`, and
   `context_capture`, and the existing nested task/DAG/result semantics.
@@ -185,7 +235,7 @@ The initial Verifier implementations and input/output boundaries are:
 
 | Implementation kind | Typed spec | Verification input | Typed engine output | Delivery |
 |---|---|---|---|---|
-| `drift` | existing `DriftSpec` with REQ-110 removals | Exact subject and fixed window of existing `DriftRecordObservation` rows; PSI/SPC also load exact `FittedBaseline` | Existing `DriftReport` mapped to one common verdict plus feature details | Production in this change |
+| `drift` | `DriftSpec` with REQ-110 and REQ-153–REQ-157 decisions | Exact subject and fixed window of existing `DriftRecordObservation` rows; PSI/SPC also load exact `FittedBaseline` | `DriftReport` with SPC chart evidence, mapped to one common verdict plus feature details | Production in this change |
 | `eval` | existing `EvalSpec` | Exact subject and committed existing `EvalRecordObservation`, with declared trace context when needed | Existing `EvalReport` task outcomes and `EvalWorkflowSummary` mapped to one common verdict plus task details | Production in this change |
 
 Future code-review, CI-test, Python, MCP, API, standalone LLM-judge, and
@@ -1409,8 +1459,9 @@ table on `(data_tenant_id, result_id)`.
 - **INV-012**: This change reuses existing Drift, Eval, observation, execution,
   and Bifrost contracts inside the new Verifier Card. It MUST NOT replace
   their working algorithms or record semantics merely to implement the missing
-  server machinery and plumbing; removing obsolete implementation refs is
-  the only intentional logical input-record subtraction. The existing Eval
+  server machinery and plumbing; REQ-153–REQ-157 are the explicit exception
+  correcting PSI/SPC behavior. Removing obsolete implementation refs is the
+  only other intentional logical input-record subtraction. The existing Eval
   media item gains binding identity/kind so its already-authored media can
   reach the existing multimodal judge path.
 - **INV-014**: `Verifier` is the only registrable Card kind for verification.
@@ -1450,6 +1501,18 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
   report and produced feature rows.
   Invalid/non-Parquet baselines, failed fitting, insufficient data,
   unauthorized access, and cross-tenant reads fail visibly.
+- **AC-034**: Published NIST X-bar/S examples or independently calculated
+  fixtures MUST prove both chart limits, subgroup mean/standard-deviation
+  signals, equality at the limit, and the missing `sqrt(n)` regression. PSI
+  fixtures MUST prove exhaustive numeric/category bins, including unseen
+  target categories and zero-count smoothing. Baseline and target fixtures
+  MUST prove null, non-finite, omitted feature, insufficient sample, and
+  incomplete subgroup outcomes without silent row removal. Real Rust,
+  Python, and TypeScript SDK-to-server Drift journeys MUST prove the new
+  report evidence, a failed scheduled run's Operator dispatch, and the
+  visible refusal of legacy versions; direct scoring and server scoring must
+  agree for the same valid data. Existing tenancy, fixed-window, audit,
+  capacity, timeout, and result-publication obligations remain.
 - **AC-013**: A real Service binding journey registers a Drift Verifier,
   Trigger, and one or more Operators; emits existing DriftRecordObservation
   through observe:drift and the same wyrd-client/wyrd-queue path used by
@@ -1787,6 +1850,15 @@ remediation plan.
 - [PagerDuty Global Integrations and Service Routes](https://support.pagerduty.com/main/docs/event-orchestration)
 
 ## Revision history
+
+- **Revision 37 conventional PSI/SPC draft (2026-09-24):** Proposed complete
+  categorical PSI bins, strict missing-data handling, fixed rational
+  subgroups, NIST three-sigma X-bar/S limits, chart-specific result evidence,
+  and an explicit new-version/refit boundary. This reverses revision 32's
+  SPC preservation decision and awaits explicit human approval. Statistical
+  grounding: [NIST X-bar/S chart](https://itl.nist.gov/div898/handbook/pmc/section3/pmc321.htm),
+  [NIST rational subgroups](https://www.itl.nist.gov/div898/handbook/glossary.htm),
+  and [ASQ control-chart setup](https://asq.org/quality-resources/control-chart).
 
 - **Revisions 1–10 (2026-09-03 through 2026-09-16):** Earlier draft
   iterations established the Verifier Card, Change Request model,

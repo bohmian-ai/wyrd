@@ -230,6 +230,7 @@ impl ForgeTaskTableIdentity {
             "vala.logs",
             "vala.eval",
             "vala.drift",
+            "vala.verification",
             "vala.dev",
             "vala.datasets",
         ];

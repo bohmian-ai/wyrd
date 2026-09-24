@@ -161,6 +161,27 @@ mod tests {
         assert!(BifrostNamespace::from_domain_namespace("unknown_namespace").is_none());
     }
 
+    /// Forge keeps its own namespace allowlist (in Rust and in the Postgres
+    /// CHECKs on its task tables); a Bifrost namespace missing from it has
+    /// every planning hint refused and is never maintained.
+    ///
+    /// # Panics
+    /// Panics when Forge refuses a known Bifrost namespace.
+    #[test]
+    fn forge_accepts_every_bifrost_namespace() {
+        for ns in BifrostNamespace::ALL {
+            assert!(
+                vala_sql::row_types::forge_tasks::ForgeTaskTableIdentity::new(
+                    crate::catalog::BIFROST_CATALOG_NAME,
+                    ns.as_str(),
+                    "events",
+                )
+                .is_ok(),
+                "Forge refuses {ns:?}"
+            );
+        }
+    }
+
     #[test]
     fn bifrost_namespace_datasets_variant_round_trips() {
         let datasets = BifrostNamespace::Datasets;

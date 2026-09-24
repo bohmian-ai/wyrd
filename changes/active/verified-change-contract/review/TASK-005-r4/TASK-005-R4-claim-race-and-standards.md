@@ -56,3 +56,33 @@ Add rustdoc stating this entry point performs the ordinary uncancelled fit and d
 | `FIND-TASK-005-13` | `fit_psi_baseline` has item-level rustdoc and a truthful `# Errors` section; fitting output is unchanged. | Read the item documentation and run the owning Vala lane. |
 
 Record exact focused commands for every named test, and record all post-change lane results in this task. Keep the cumulative candidate committed and submit it for a fresh `$wyrd-task-review` against `f8811ac5`.
+
+## Remediation r4 Evidence
+
+Commit `63ddbdf1` on `vcc/task-005` (range `72d205dd..63ddbdf1`). No production code changed.
+
+| Finding | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| `FIND-TASK-005-11` uncommitted claim across stop | `stopped_fitter_rolls_back_its_blocked_claim`: `SHARE` lock on `wyrd.drift_baselines` parks the fitter's claim transaction; `stop` fires; fitter returns; blocker rolls back → `("pending", 0)`, `FitGate::entered() == 0` | Focused command below | PASS |
+| `FIND-TASK-005-11` claim committed after stop | `fit_claim_committed_after_shutdown_is_released_unfitted`: deferred constraint trigger holds the claim's `COMMIT` on an advisory lock; `stop` fires, lock released, commit wins → `("pending", 0)`, fenced lease token remains, `FitGate::entered() == 0`. Mutation check: disabling the post-commit guard in `fit_next` fails it with `("failed", 1)` | Focused command below | PASS |
+| `FIND-TASK-005-11` in-grace and past-grace | `baseline_fit_drains_within_grace_then_releases` unchanged | Focused command below | PASS |
+| `FIND-TASK-005-12` hidden imports | `DriftMethod` joins the `psi/mod.rs` import block; `baseline_artifact` imports moved to the test module's top block. Shared helpers `block_writes`/`wait_blocked_writer` now take the table, reused by the runner and fitter races | `mise run fmt`, `mise run lints`, `mise run test:vala`, `mise run test:bifrost:integration:server` | PASS |
+| `FIND-TASK-005-13` `fit_psi_baseline` rustdoc | Item rustdoc plus `# Errors` naming `FeatureMissing`, `FeatureNotNumeric`, `FeatureNotCategorical`, `FeatureEmpty`, `NonFiniteValuesInColumn`, `PsiInternal`; body unchanged | `mise run lints`, `mise run test:vala` | PASS |
+
+Focused commands, each run alone inside
+`scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && <command>"` (1 passed each):
+
+```bash
+mise exec -- cargo nextest run --locked -p wyrd-server --features test-support --test pg_verification_runtime -E 'test(=stopped_fitter_rolls_back_its_blocked_claim)'
+mise exec -- cargo nextest run --locked -p wyrd-server --features test-support --test pg_verification_runtime -E 'test(=fit_claim_committed_after_shutdown_is_released_unfitted)'
+mise exec -- cargo nextest run --locked -p wyrd-server --features test-support --test pg_verification_runtime -E 'test(=baseline_fit_drains_within_grace_then_releases)'
+mise exec -- cargo nextest run --locked -p wyrd-server --features test-support --test pg_verification_runtime -E 'test(=cancelled_runner_rolls_back_its_blocked_claim)'
+```
+
+Lanes after the final change, each exit 0: `mise run fmt`, `mise run lints`,
+`mise run test:vala` (1308 passed), `mise run test:bifrost:integration:server`
+(85 passed), `git diff --check f8811ac5..HEAD`.
+
+Non-goals held: no fitter worker, scheduler, configuration, harness, or
+production branch added; r3 shutdown behavior, permits, claims, budgets,
+scoring, authorization, publication, and dispatch untouched.

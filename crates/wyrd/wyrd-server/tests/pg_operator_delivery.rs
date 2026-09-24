@@ -937,41 +937,65 @@ async fn revoked_connection_fails_closed_and_key_outage_retries() {
 }
 
 /// Gated live release smoke: a failed verdict posts to a dedicated Slack test
-/// channel and triggers a PagerDuty test service through the same Operator
-/// runner and the public provider endpoints.
+/// channel through the production Operator runner and the public Slack
+/// endpoint.
 ///
-/// Reads `WYRD_LIVE_SLACK_BOT_TOKEN`, `WYRD_LIVE_SLACK_WORKSPACE_ID`,
-/// `WYRD_LIVE_SLACK_CHANNEL_ID`, and `WYRD_LIVE_PAGERDUTY_KEY`; never runs in
-/// a credential-free lane.
+/// Reads `WYRD_LIVE_SLACK_BOT_TOKEN`, `WYRD_LIVE_SLACK_WORKSPACE_ID`, and
+/// `WYRD_LIVE_SLACK_CHANNEL_ID`; never runs in a credential-free lane.
 ///
 /// # Panics
-/// Panics when a credential is unset or either dispatch is not delivered.
+/// Panics when a credential is unset or the dispatch is not delivered.
 #[tokio::test]
-#[ignore = "live release smoke: needs Slack and PagerDuty test credentials"]
-async fn live_smoke_delivers_to_slack_and_pagerduty() {
-    let env = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is set"));
+#[ignore = "live release smoke: needs Slack test credentials"]
+async fn live_smoke_delivers_to_slack() {
+    live_smoke(
+        json!({ "provider": "slack", "name": "ops-slack",
+                "workspace_id": live_env("WYRD_LIVE_SLACK_WORKSPACE_ID"),
+                "bot_token": live_env("WYRD_LIVE_SLACK_BOT_TOKEN") }),
+        slack(&live_env("WYRD_LIVE_SLACK_CHANNEL_ID")),
+    )
+    .await;
+}
+
+/// Delivers one failed-verdict incident to a real PagerDuty Events API v2
+/// integration through the production runner and default endpoint.
+///
+/// Reads `WYRD_LIVE_PAGERDUTY_KEY`; never runs in a credential-free lane.
+///
+/// # Panics
+/// Panics when the credential is unset or the dispatch is not delivered.
+#[tokio::test]
+#[ignore = "live release smoke: needs PagerDuty test credentials"]
+async fn live_smoke_delivers_to_pagerduty() {
+    live_smoke(
+        json!({ "provider": "pager_duty", "name": "ops-pagerduty",
+                "integration_key": live_env("WYRD_LIVE_PAGERDUTY_KEY") }),
+        json!({ "kind": "notify", "channel": { "kind": "pager_duty",
+                "connection": "ops-pagerduty", "route": "wyrd-live-smoke",
+                "severity": "info", "summary": "Wyrd live smoke {{run_id}}" } }),
+    )
+    .await;
+}
+
+/// Reads one required live-smoke credential from the environment.
+///
+/// # Panics
+/// Panics naming the variable when it is unset.
+fn live_env(name: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| panic!("{name} is set"))
+}
+
+/// Registers `connection` and one Operator `spec` on a failing binding, runs
+/// the production worker against the real provider endpoints, and waits for
+/// the single dispatch to settle.
+///
+/// # Panics
+/// Panics when the dispatch settles in any status other than `delivered`.
+async fn live_smoke(connection: Value, spec: Value) {
     let delivery = Delivery::boot().await;
-    delivery
-        .connect(&[
-            json!({ "provider": "slack", "name": "ops-slack",
-                    "workspace_id": env("WYRD_LIVE_SLACK_WORKSPACE_ID"),
-                    "bot_token": env("WYRD_LIVE_SLACK_BOT_TOKEN") }),
-            json!({ "provider": "pager_duty", "name": "ops-pagerduty",
-                    "integration_key": env("WYRD_LIVE_PAGERDUTY_KEY") }),
-        ])
-        .await;
-    let posted = delivery
-        .operator("live-slack", slack(&env("WYRD_LIVE_SLACK_CHANNEL_ID")))
-        .await;
-    let paged = delivery
-        .operator(
-            "live-pager",
-            json!({ "kind": "notify", "channel": { "kind": "pager_duty",
-                    "connection": "ops-pagerduty", "route": "wyrd-live-smoke",
-                    "severity": "info", "summary": "Wyrd live smoke {{run_id}}" } }),
-        )
-        .await;
-    delivery.fail_binding("owner", &[&posted, &paged]).await;
+    delivery.connect(&[connection]).await;
+    let operator = delivery.operator("live", spec).await;
+    delivery.fail_binding("owner", &[&operator]).await;
     let running = delivery.spawn_to(
         delivery.server.state(),
         Delivery::limits(),
@@ -981,7 +1005,7 @@ async fn live_smoke_delivers_to_slack_and_pagerduty() {
     );
     let run = delivery.new_run(&[]).await;
     let rows = delivery
-        .wait_dispatches(run, 2, |row| {
+        .wait_dispatches(run, 1, |row| {
             row.status != "pending" && row.status != "running"
         })
         .await;

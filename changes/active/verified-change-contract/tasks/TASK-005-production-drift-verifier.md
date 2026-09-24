@@ -1,9 +1,9 @@
 ---
 id: TASK-005
 kind: implementation
-status: ready
+status: review
 spec: SPEC-verified-change-contract
-spec_revision: 35
+spec_revision: 36
 requirements: [REQ-072, REQ-073, REQ-074, REQ-080, REQ-082, REQ-085, REQ-110, REQ-113, REQ-134, REQ-152, INV-004, INV-010, INV-012, INV-015, AC-012, AC-013, AC-020, AC-024, AC-028, AC-033]
 depends_on: [TASK-004, TASK-010]
 ---
@@ -11,15 +11,18 @@ depends_on: [TASK-004, TASK-010]
 ## Outcome and Value
 
 PSI, SPC, and Custom Drift Verifiers fit or validate their approved baselines,
-analyze immutable subject/time windows with server-owned DataFusion plans,
+analyze immutable subject/time windows with server-built fixed SQL read
+through the ordinary query service,
 reuse the existing Vala scorers, and persist explainable canonical results.
 Users see readiness and can run the same analysis manually or by schedule;
 insufficient input is inconclusive, never a pass.
 
 ## Owners, Scope, Consumers, and Prohibited Changes
 
-`vala-drift` owns fitting/scoring algorithms and reports. Oracle/DataFusion owns
-tenant-authorized aggregate plans. `wyrd-sql` owns baseline work/status;
+`vala-drift` owns fitting/scoring algorithms and reports. Oracle owns
+table-authorized, audited SQL reads reached through the query service and Gate
+(local or peer-forwarded); the Drift runner authenticates with the revision 36
+SYSTEM read token scoped to `vala.drift.observations`. `wyrd-sql` owns baseline work/status;
 `wyrd-server` owns the fitter and Drift adapter inside the generic runtime.
 The registry/Data Card storage path supplies exact Parquet artifacts. The
 generic runtime owns claims, result transport, settlement, and dispatch.
@@ -36,8 +39,9 @@ or fabricated reports for pre-scoring inconclusive outcomes.
    status in the registration transaction.
 2. Add bounded fitter claims that resolve exact Data Cards and Parquet,
    perform method-appropriate server fitting, and persist existing fitted types.
-3. Build fixed typed Oracle plans for PSI/SPC/Custom over subject, series, and
-   managed event-time windows; return aggregates only.
+3. Mint and verify the SYSTEM Drift read token, then run fixed SQL for
+   PSI/SPC/Custom over subject, series, and managed event-time windows through
+   the query service; return aggregates only.
 4. Feed aggregates through narrow entry points sharing existing formulas and
    `DriftReport` construction.
 5. Map produced reports and pre-scoring inconclusive outcomes through the
@@ -82,7 +86,7 @@ helper and reuse the generic runtime's permits/supervision.
 
 ### Scenario 3 — PSI uses fitted bins and server counts
 
-**Behavior.** Fixed Oracle plans filter exact tenant/subject/series/window,
+**Behavior.** Fixed SQL filters exact tenant/subject/series/window,
 count numeric or categorical fitted bins including unknown categories and zero
 bins, and pass counts to existing PSI formula/report construction. Minimum
 samples and invalid input are inconclusive.
@@ -91,8 +95,8 @@ samples and invalid input are inconclusive.
 boundaries, unknowns, zero bins, subject/tenant/window exclusion, pass/fail,
 and insufficient input.
 
-**GREEN.** Build typed DataFusion expressions and a narrow aggregate-count
-scoring entry point sharing existing formula code.
+**GREEN.** Render fitted bins as escaped SQL literals and add a narrow
+aggregate-count scoring entry point sharing existing formula code.
 
 **REFACTOR.** Return aggregate rows only and delete any raw-batch or double-
 binning path.
@@ -147,7 +151,7 @@ cron, partial ACK, restart, authorization, and tenant isolation.
 
 - All `AC-012` method journeys and `AC-013` Drift activation cases pass.
 - Baseline Card status is exact and non-blocking; Custom needs no fit job.
-- Plans use managed `wyrd_event_time`, exact subject, and aggregates only.
+- Fixed SQL uses managed `wyrd_event_time`, exact subject, and aggregates only.
 - Produced `DriftReport` semantics remain current; no-report inconclusive rows
   have null details and zero features.
 
@@ -155,7 +159,8 @@ cron, partial ACK, restart, authorization, and tenant isolation.
 
 Likely owners: Drift contracts/tests in `wyrd-spec`, `vala-drift` fit/score
 entry points, `wyrd-sql` baseline queries, Data artifact resolution/storage,
-Oracle internal logical-plan seam, server fitter/runtime adapter/status, and
+SYSTEM read-token issuance and verification, the query service caller path,
+server fitter/runtime adapter/status, and
 real SDK/server/Bifrost journey fixtures.
 
 ## Verification and Evidence
@@ -202,7 +207,7 @@ Commits `ef2e163f`..`a96bfe25` on `vcc/task-005`.
 | All `AC-012` method journeys pass | PSI/SPC/Custom engine `wyrd-server/src/verification/drift.rs`; fitter `verification/fitter.rs`; Rust journey `sdks/wyrd-sdk-rust/tests/drift_verification.rs` (Parquet baseline, PSI+SPC ready, SPC-over-string `baseline_fit_failed`, direct runs, result+feature rows joined by `result_id`, unready 409, non-Parquet `WYRD_DRIFT_400_VALIDATION`, reader 403, cross-tenant `INVALID_TARGET`/`TABLE_NOT_FOUND`); Python journey `sdks/wyrd-sdk-python/tests/integration/test_drift_journey.py` (Pandas, Polars, Arrow-Parquet baselines; Arrow IPC refused) | `mise run test:bifrost:journey:drift`; focused `pytest -m integration tests/integration/test_drift_journey.py`; `mise run test:bifrost` | PASS |
 | `AC-013` Drift activation cases pass | Drift adapter in the generic runtime; scheduled failed result dispatches once per Operator (`assert_scheduled_failure_dispatches`); direct runs never dispatch | `mise run test:bifrost:journey:drift`; `mise run test:wyrd` (`pg_verification_runtime`) | PASS |
 | Baseline Card status exact and non-blocking; Custom needs no fit job | Registration creates pending status (`ef2e163f`, `1e5f97e7`); `DriftBaselineStatus` on Card status, TS projection `VerificationStatus.baseline`; journey asserts Custom has no baseline status | Rust and Python journeys; `mise run codegen:check`; `mise run ts:typecheck` | PASS |
-| Plans use managed `wyrd_event_time`, exact subject, aggregates only | Superseded by remediation r1 (below): fixed server-built SQL in `ObservationWindow` (`drift.rs`), read through the query service; the typed-plan Oracle seam change was reverted (`d6a67597`) | See remediation r1 F6 | PASS |
+| Fixed SQL uses managed `wyrd_event_time`, exact subject, aggregates only | Superseded by remediation r1 (below): fixed server-built SQL in `ObservationWindow` (`drift.rs`), read through the query service; the typed-plan Oracle seam change was reverted (`d6a67597`) | See remediation r1 F6 | PASS |
 | `DriftReport` semantics unchanged; no-report inconclusive has null details and zero features | Aggregate-input entry points share existing formulas (`1e5f97e7`); empty-window Custom run asserted inconclusive/`details: None`/no features | Rust Drift journey; `unscored_drift_publishes_only_the_summary` | PASS |
 
 Verification commands, each run in this session and exited 0: `mise run test:vala`,

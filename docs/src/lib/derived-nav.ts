@@ -9,65 +9,62 @@
 import type { DocMetadata } from './content.js';
 import { allSlugs, getEntry } from './content.js';
 
-export type NavItem = { label: string; path: string; soon?: boolean };
+export type NavItem = { label: string; path: string };
 export type NavSection = { label: string; items: NavItem[] };
 export type NavGroup = {
   label: string;
-  kind?: string;
   sections: NavSection[];
   items: NavItem[];
 };
 
-// Top-level navigation is organized by reader intent. Product/topic groups are
-// nested inside those sections, so a page can be found by either what the
-// reader wants to do or the Wyrd component they are working with.
+// The first level is a short task path: start, build and verify, run, automate,
+// then background and lookup. Product/topic groups nest inside those sections as
+// subheads, so a page is found by what the reader is trying to do.
 export const GROUP_ORDER: readonly string[] = [
-  'Start here',
-  'Learn Wyrd',
-  'Build with Wyrd',
-  'Products and components',
-  'Reference',
-  'Operate Wyrd',
-  'For agents'
+  'Get started',
+  'Build and verify',
+  'Run Wyrd',
+  'Automate',
+  'Understand',
+  'Reference'
 ];
 
 const GROUP_SECTION: Record<string, string> = {
-  Overview: 'Start here',
-  'Get Started': 'Start here',
-  Tutorials: 'Learn Wyrd',
-  Concepts: 'Learn Wyrd',
-  Architecture: 'Learn Wyrd',
-  'How-to': 'Build with Wyrd',
-  Bifrost: 'Products and components',
-  Cards: 'Products and components',
-  Skald: 'Products and components',
-  Fathom: 'Products and components',
-  Reference: 'Reference',
-  'Self-hosting': 'Operate Wyrd',
-  'For Agents': 'For agents'
+  Overview: 'Get started',
+  'Get Started': 'Get started',
+  Tutorials: 'Get started',
+  'How-to': 'Build and verify',
+  Cards: 'Build and verify',
+  Bifrost: 'Build and verify',
+  Skald: 'Build and verify',
+  'Self-hosting': 'Run Wyrd',
+  'API and CLI': 'Automate',
+  'Agents and MCP': 'Automate',
+  Concepts: 'Understand',
+  Architecture: 'Understand',
+  Reference: 'Reference'
 };
 
 const GROUP_ORDER_WITHIN_SECTION: readonly string[] = [
   'Overview',
   'Get Started',
   'Tutorials',
-  'Concepts',
-  'Architecture',
   'How-to',
   'Cards',
   'Bifrost',
   'Skald',
-  'Fathom',
-  'Reference',
   'Self-hosting',
-  'For Agents'
+  'API and CLI',
+  'Agents and MCP',
+  'Concepts',
+  'Architecture',
+  'Reference'
 ];
 
 function sectionFor(meta: DocMetadata): string {
   if (meta.section) return meta.section;
   if (meta.group && GROUP_SECTION[meta.group]) return GROUP_SECTION[meta.group];
-  if (meta.pillar === 'fathom') return 'Products and components';
-  return 'Learn Wyrd';
+  return 'Understand';
 }
 
 function groupOrderIndex(label: string): number {
@@ -92,9 +89,7 @@ function sortLabels(labels: string[], indexOf: (label: string) => number): void 
 }
 
 function navItem(slug: string, meta: DocMetadata): NavItem {
-  const item: NavItem = { label: meta.title, path: slugToPath(slug) };
-  if (meta.pillar === 'fathom') item.soon = true;
-  return item;
+  return { label: meta.title, path: slugToPath(slug) };
 }
 
 // Convert a content slug to a base-free nav path. Empty slug → root '/';
@@ -123,7 +118,9 @@ function buildNav(): { nav: NavGroup[]; flat: NavItem[] } {
 
   const entries: Entry[] = allSlugs()
     .map((slug) => ({ slug, meta: getEntry(slug)!.metadata }))
-    .filter(({ meta }) => !meta.draft);
+    // Planned products are reachable by URL and search with their status, but
+    // never sit in primary navigation beside shipped tasks.
+    .filter(({ meta }) => !meta.draft && meta.pillar !== 'fathom');
 
   const sectionBuckets = new Map<string, Map<string, Entry[]>>();
   for (const entry of entries) {
@@ -182,6 +179,20 @@ function derived(): { nav: NavGroup[]; flat: NavItem[] } {
 // Sidebar tree: ordered groups with their items.
 export function navGroups(): NavGroup[] {
   return derived().nav;
+}
+
+// Section and page for a base-prefixed browser pathname: the current-location
+// cue shown by the sidebar and the narrow-screen navigation control.
+export function locate(
+  pathname: string,
+  base = '/wyrd'
+): { section: string; item: NavItem } | undefined {
+  const target = normalize(stripBase(pathname, base));
+  for (const group of derived().nav) {
+    const item = group.items.find((it) => normalize(it.path) === target);
+    if (item) return { section: group.label, item };
+  }
+  return undefined;
 }
 
 // Return the prev and next pages relative to a given browser pathname.

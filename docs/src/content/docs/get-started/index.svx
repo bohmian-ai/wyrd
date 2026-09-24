@@ -1,5 +1,5 @@
 ---
-title: Get Started
+title: Run Wyrd locally
 description: Install Wyrd from the repo and run the DataCard example end to end.
 pillar: wyrd
 group: Get Started

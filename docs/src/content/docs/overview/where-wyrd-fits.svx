@@ -3,6 +3,7 @@ title: Where Wyrd fits
 description: Wyrd's position in the AI stack, the Mitari platform, the lifecycle loop, and what Wyrd is deliberately not.
 pillar: wyrd
 group: Overview
+section: Understand
 order: 2
 ---
 

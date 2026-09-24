@@ -2,7 +2,6 @@
 title: Cards overview
 description: The card envelope, how registration works, and a catalog of every card kind with its status.
 pillar: wyrd
-section: Products and components
 group: Cards
 order: 1
 ---

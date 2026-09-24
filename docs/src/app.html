@@ -4,16 +4,19 @@
     <meta charset="utf-8" />
     <link rel="icon" href="%sveltekit.assets%/favicon.svg" type="image/svg+xml" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
     <script>
-      // FOUC guard: set the [data-theme] contract before first paint.
+      // Pre-paint theme: an explicit stored choice, else the system preference.
       (function () {
+        var t = null;
         try {
-          var t = localStorage.getItem('wyrd:theme');
-          if (t !== 'light' && t !== 'dark') {
-            t = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
-          }
-          document.documentElement.dataset.theme = t;
+          t = localStorage.getItem('wyrd:theme');
         } catch (e) {}
+        if (t !== 'light' && t !== 'dark') {
+          t = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+        }
+        document.documentElement.dataset.theme = t;
+        document.documentElement.style.colorScheme = t;
       })();
     </script>
     %sveltekit.head%

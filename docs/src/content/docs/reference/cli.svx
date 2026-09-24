@@ -2,7 +2,7 @@
 title: CLI
 description: The wyrd binary — auth, eval, and principal commands, with every flag and environment variable.
 pillar: wyrd
-group: Reference
+group: API and CLI
 order: 2
 ---
 

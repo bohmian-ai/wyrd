@@ -1,12 +1,12 @@
 ---
-title: For Agents
+title: Agent workflows
 description: Machine-readable surface, stable API paths, and the rules agents must follow when reading and updating Wyrd.
 pillar: wyrd
-group: For Agents
+group: Agents and MCP
 order: 1
 ---
 
-# For Agents
+# Agent workflows
 
 This section is written for AI agents that use Wyrd as a tool — reading cards,
 registering new ones, querying relationships, and acting on errors.

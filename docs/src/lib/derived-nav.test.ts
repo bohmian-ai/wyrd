@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { GROUP_ORDER, navGroups, siblings, stripBase } from './derived-nav.js';
+import { GROUP_ORDER, locate, navGroups, siblings, stripBase } from './derived-nav.js';
 
 const nav = navGroups();
 // The flat spine mirrors derived-nav's internal navFlat (groups.flatMap(items)),
@@ -46,34 +46,46 @@ describe('nav ordering', () => {
     expect(flat.length).toBeGreaterThan(0);
   });
 
-  it('organizes the sidebar by reader intent', () => {
+  it('keeps a small, task-first first level', () => {
     expect(nav.map((group) => group.label)).toEqual([
-      'Start here',
-      'Learn Wyrd',
-      'Build with Wyrd',
-      'Products and components',
-      'Reference',
-      'Operate Wyrd',
-      'For agents'
+      'Get started',
+      'Build and verify',
+      'Run Wyrd',
+      'Automate',
+      'Understand',
+      'Reference'
     ]);
   });
 
-  it('keeps product topics nested inside the products section', () => {
-    const products = nav.find((group) => group.label === 'Products and components');
-    expect(products?.sections.map((section) => section.label)).toEqual([
-      'Overview',
-      'Cards',
-      'Bifrost',
-      'Skald',
-      'Fathom'
-    ]);
-    expect(products?.items.some((item) => item.path === '/bifrost/')).toBe(true);
-    expect(products?.items.some((item) => item.path === '/cards/')).toBe(true);
+  it('leads with what Wyrd is, then the one local start', () => {
+    const start = nav[0].items.map((item) => item.path);
+    expect(start.slice(0, 2)).toEqual(['/overview/', '/get-started/']);
   });
 
-  it('marks Fathom as coming soon without hiding it from navigation', () => {
-    const fathom = flat.find((item) => item.path === '/fathom/');
-    expect(fathom?.soon).toBe(true);
+  it('routes API, CLI, and agent workflows from task navigation', () => {
+    const automate = nav.find((group) => group.label === 'Automate')!.items.map((i) => i.path);
+    expect(automate).toEqual(expect.arrayContaining(['/api/', '/reference/cli/', '/for-agents/']));
+  });
+
+  it('keeps planned products out of primary navigation', () => {
+    expect(flat.some((item) => item.path === '/fathom/')).toBe(false);
+  });
+});
+
+describe('locate', () => {
+  it('names the section and page for the current location', () => {
+    expect(locate('/wyrd/get-started/')).toEqual({
+      section: 'Get started',
+      item: { label: 'Run Wyrd locally', path: '/get-started/' }
+    });
+  });
+
+  it('matches without a trailing slash', () => {
+    expect(locate('/wyrd/api')?.section).toBe('Automate');
+  });
+
+  it('returns undefined off the spine', () => {
+    expect(locate('/wyrd/')).toBeUndefined();
   });
 });
 

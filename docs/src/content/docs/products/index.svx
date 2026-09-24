@@ -2,7 +2,7 @@
 title: Products and components
 description: Choose the Wyrd product or subsystem you are learning, building with, or maintaining.
 pillar: wyrd
-section: Products and components
+section: Understand
 group: Overview
 order: 1
 ---

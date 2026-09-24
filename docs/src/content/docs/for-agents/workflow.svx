@@ -2,7 +2,7 @@
 title: Agent workflow
 description: A copyable end-to-end workflow for agents that declare cards and register them over HTTP.
 pillar: wyrd
-group: For Agents
+group: Agents and MCP
 order: 2
 ---
 
@@ -102,5 +102,5 @@ See the [Errors reference](/api/errors/) for the full catalog and
 
 ## Related
 
-- [For Agents](/for-agents/) — rules and stable paths.
+- [Agent workflows](/for-agents/) — rules and stable paths.
 - [Declare a Data card](/how-to/declare/data/) — the declare recipe.

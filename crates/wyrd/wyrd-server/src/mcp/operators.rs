@@ -18,12 +18,11 @@ use wyrd_spec::operator_connection::{
     CreateOperatorConnectionRequest, OperatorConnectionView, UpdateOperatorConnectionRequest,
 };
 
-use super::WyrdMcpHandler;
+use super::{WyrdMcpHandler, structured};
 use super::principals::{parse_args, tool};
 use crate::components::auth::Caller;
 use crate::components::operators::routes::decode_body;
 use crate::components::operators::service::OperatorConnectionControl;
-use crate::http::error::internal_failure;
 
 /// Wire name of the connection listing.
 pub(super) const LIST: &str = "operator_connections.list";
@@ -127,18 +126,6 @@ pub(super) fn may_manage(caller: &Caller) -> bool {
         .principal
         .effective_permissions
         .contains(&Permission::operators_write())
-}
-
-/// Project one typed answer as a structured tool result.
-///
-/// # Errors
-/// Returns an internal error when the answer cannot be serialized.
-fn structured<T: Serialize>(value: &T) -> Result<CallToolResult, WyrdError> {
-    Ok(CallToolResult::structured(
-        serde_json::to_value(value).map_err(|error| {
-            internal_failure("operator connection answer could not be projected", &error)
-        })?,
-    ))
 }
 
 /// Decode secret-bearing tool arguments without echoing any value.

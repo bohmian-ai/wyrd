@@ -353,6 +353,20 @@ fn missing_context(extension: &'static str) -> WyrdError {
     }
 }
 
+/// Project one typed tool answer as a structured tool result.
+///
+/// # Errors
+/// Returns an internal error when the answer cannot be serialized.
+fn structured<T: serde::Serialize>(
+    value: &T,
+) -> Result<rmcp::model::CallToolResult, WyrdError> {
+    Ok(rmcp::model::CallToolResult::structured(
+        serde_json::to_value(value).map_err(|error| {
+            crate::http::error::internal_failure("tool answer could not be projected", &error)
+        })?,
+    ))
+}
+
 /// Project a public Wyrd error onto the MCP protocol error shape.
 ///
 /// The complete RFC 9457 problem body — stable code, title, status, details,

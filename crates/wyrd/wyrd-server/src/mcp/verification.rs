@@ -22,12 +22,11 @@ use wyrd_spec::verification::{
     VerificationRunStatus, VerificationRunTarget,
 };
 
-use super::WyrdMcpHandler;
+use super::{WyrdMcpHandler, structured};
 use super::principals::{parse_args, tool};
 use crate::components::auth::Caller;
 use crate::components::cards::routes::get_card_for;
 use crate::components::verification::service::{VerificationControl, decode_start_request};
-use crate::http::error::internal_failure;
 
 /// Wire name of the Card read.
 pub(super) const CARDS_GET: &str = "cards.get";
@@ -137,18 +136,6 @@ pub(super) fn may_start_runs(caller: &Caller) -> bool {
         .principal
         .effective_permissions
         .contains(&Permission::eval_run())
-}
-
-/// Project one typed answer as a structured tool result.
-///
-/// # Errors
-/// Returns an internal error when the answer cannot be serialized.
-fn structured<T: Serialize>(value: &T) -> Result<CallToolResult, WyrdError> {
-    Ok(CallToolResult::structured(
-        serde_json::to_value(value).map_err(|error| {
-            internal_failure("verification answer could not be projected", &error)
-        })?,
-    ))
 }
 
 impl WyrdMcpHandler {

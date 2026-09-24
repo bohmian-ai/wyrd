@@ -18,8 +18,8 @@ use wyrd_spec::operator_connection::{
     CreateOperatorConnectionRequest, OperatorConnectionView, UpdateOperatorConnectionRequest,
 };
 
-use super::{WyrdMcpHandler, structured};
 use super::principals::{parse_args, tool};
+use super::{WyrdMcpHandler, structured};
 use crate::components::auth::Caller;
 use crate::components::operators::routes::decode_body;
 use crate::components::operators::service::OperatorConnectionControl;

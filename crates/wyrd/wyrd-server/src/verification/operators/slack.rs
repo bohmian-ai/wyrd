@@ -65,7 +65,10 @@ mod tests {
             outcome(br#"{"ok":false,"error":"ratelimited"}"#),
             Attempt::Retry { .. }
         ));
-        for reply in [&br#"{"ok":false,"error":"channel_not_found"}"#[..], b"not json"] {
+        for reply in [
+            &br#"{"ok":false,"error":"channel_not_found"}"#[..],
+            b"not json",
+        ] {
             assert!(matches!(outcome(reply), Attempt::Terminal(_)));
         }
     }

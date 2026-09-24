@@ -38,9 +38,7 @@ use wyrd_spec::reference::InlineableRef;
 use wyrd_spec::verification::{FrozenTarget, VerificationError};
 use wyrd_sql::queries::cards::get_card_by_uid;
 use wyrd_sql::queries::operator_connections::find_connection;
-use wyrd_sql::queries::operator_dispatches::{
-    ClaimedDispatch, OperatorDispatchQueue,
-};
+use wyrd_sql::queries::operator_dispatches::{ClaimedDispatch, OperatorDispatchQueue};
 use wyrd_sql::queries::verifier_runs::RetryOutcome;
 use wyrd_sql::{OperatorPool, SqlError, TenantConn, WyrdPostgres};
 

@@ -4,7 +4,6 @@
 //! this module only parses Node strings into wire types and projects results
 //! through [`NativeLifecycleResult`], so failures keep their catalog metadata.
 
-
 use napi::Result;
 use napi_derive::napi;
 use wyrd_client::verification::{

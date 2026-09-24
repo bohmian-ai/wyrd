@@ -320,8 +320,7 @@ impl<'a> OperatorConnectionControl<'a> {
             Ok::<_, WyrdError>(Ok(stored.view))
         }
         .await;
-        audit::record_unless_committed(self.state, caller, &allowed, committed)
-            .await?
+        audit::record_unless_committed(self.state, caller, &allowed, committed).await?
     }
 
     /// Evaluate `operators:write`, recording a denial standalone and

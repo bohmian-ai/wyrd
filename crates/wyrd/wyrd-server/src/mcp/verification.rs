@@ -22,8 +22,8 @@ use wyrd_spec::verification::{
     VerificationRunStatus, VerificationRunTarget,
 };
 
-use super::{WyrdMcpHandler, structured};
 use super::principals::{parse_args, tool};
+use super::{WyrdMcpHandler, structured};
 use crate::components::auth::Caller;
 use crate::components::cards::routes::get_card_for;
 use crate::components::verification::service::{VerificationControl, decode_start_request};

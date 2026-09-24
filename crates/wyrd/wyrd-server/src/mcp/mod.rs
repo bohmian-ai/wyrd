@@ -357,9 +357,7 @@ fn missing_context(extension: &'static str) -> WyrdError {
 ///
 /// # Errors
 /// Returns an internal error when the answer cannot be serialized.
-fn structured<T: serde::Serialize>(
-    value: &T,
-) -> Result<rmcp::model::CallToolResult, WyrdError> {
+fn structured<T: serde::Serialize>(value: &T) -> Result<rmcp::model::CallToolResult, WyrdError> {
     Ok(rmcp::model::CallToolResult::structured(
         serde_json::to_value(value).map_err(|error| {
             crate::http::error::internal_failure("tool answer could not be projected", &error)

@@ -358,11 +358,17 @@ impl VerificationRuntimeBuilder<'_> {
         if let Some(crash) = &self.crash {
             scheduler = scheduler.with_crash(crash.clone());
         }
+        let permits = Arc::new(VerifierPermits::new(
+            self.limits.global_permits,
+            self.limits.tenant_permits,
+        ));
         let mut fitter = BaselineFitter::new(
             postgres.clone(),
             operator.clone(),
             Arc::clone(&self.state.storage),
+            Arc::clone(&permits),
             self.limits.lease,
+            self.limits.execution_timeout,
             self.limits.poll_interval,
         );
         #[cfg(feature = "test-support")]
@@ -390,7 +396,7 @@ impl VerificationRuntimeBuilder<'_> {
                     postgres.clone(),
                     operator,
                     queue,
-                    VerifierPermits::new(self.limits.global_permits, self.limits.tenant_permits),
+                    permits,
                     publisher,
                     drift,
                     self.limits,

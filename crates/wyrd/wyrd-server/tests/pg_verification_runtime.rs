@@ -27,8 +27,10 @@ use wyrd_server::verification::runner::{EngineScript, RESULT_PUBLICATION_FAILED}
 use wyrd_server::verification::{CapabilityCrash, RuntimeLimits, VerificationRuntime};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::card::drift::DriftMethod;
+use wyrd_spec::card::verifier::DriftBaselineState;
 use wyrd_spec::ids::{BindingId, CardUid, FeatureName, VerificationRunId};
 use wyrd_spec::verification::{DriftWindow, FrozenTarget, VerificationError};
+use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
 use wyrd_sql::queries::verifier_runs::TerminalStatus;
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::verification::{RunRow, VerificationFixture};
@@ -937,6 +939,127 @@ async fn permits_cap_each_tenant_and_share_the_process() {
     }
     for run in quiet {
         wait_run_in(&other, run, status("completed")).await;
+    }
+    runtime.stop().await;
+}
+
+/// Insert a pending baseline fit of `verifier` from `data` in `seed`'s tenant.
+///
+/// # Panics
+/// Panics when the insert or its commit fails.
+async fn pending_baseline(
+    server: &WyrdTestServer,
+    seed: &VerificationFixture,
+    verifier: &CardUid,
+    data: &CardUid,
+) {
+    let mut conn = server
+        .state()
+        .postgres
+        .wyrd()
+        .tenant_conn(seed.tenant())
+        .await
+        .expect("tenant connection opens");
+    DriftBaselineQueue::default()
+        .insert_pending(&mut conn, verifier, data)
+        .await
+        .expect("baseline inserts");
+    conn.commit().await.expect("baseline commits");
+}
+
+/// Read the baseline state of `verifier` in `seed`'s tenant.
+///
+/// # Panics
+/// Panics when the read fails or the baseline does not exist.
+async fn baseline_state(
+    server: &WyrdTestServer,
+    seed: &VerificationFixture,
+    verifier: &CardUid,
+) -> DriftBaselineState {
+    let mut conn = server
+        .state()
+        .postgres
+        .wyrd()
+        .tenant_conn(seed.tenant())
+        .await
+        .expect("tenant connection opens");
+    DriftBaselineQueue::default()
+        .status(&mut conn, verifier)
+        .await
+        .expect("baseline reads")
+        .expect("baseline exists")
+        .state
+}
+
+/// Baseline fits draw from the runner's permits: while a tenant's four
+/// Verifier runs hold its whole share, its due fit stays unclaimed and
+/// another tenant's fit proceeds; releasing the runs lets the same row be
+/// claimed.
+///
+/// Each fit here settles `failed` because the fixture's baseline Card has no
+/// Parquet artifact; leaving `pending` is the claim this test observes.
+///
+/// # Panics
+/// Panics when the saturated tenant's fit is claimed, the other tenant's fit
+/// is starved, or the released row is never claimed.
+#[tokio::test]
+async fn baseline_fits_share_the_verifier_permits() {
+    let harness = Harness::start().await;
+    let other_tenant = DataTenantId::new_v7();
+    harness
+        .server
+        .pg_fixture()
+        .seed_additional_tenant_with_uuid(other_tenant, "verification-fit-other")
+        .await
+        .expect("second tenant seeds");
+    let (other, other_subject, other_verifier) = seed_tenant(&harness.server, other_tenant).await;
+    let script = EngineScript::default();
+    script.hold();
+    let mut busy = Vec::new();
+    for _ in 0..4 {
+        script.push(EngineOutcome::Completed(VerifierReport::Drift(None)));
+        busy.push(harness.enqueue().await);
+    }
+    let runtime = harness.spawn(Harness::limits(), &script);
+    wait_until("four executions", || script.entered() == 4).await;
+
+    pending_baseline(
+        &harness.server,
+        &harness.seed,
+        &harness.verifier,
+        &harness.subject,
+    )
+    .await;
+    pending_baseline(&harness.server, &other, &other_verifier, &other_subject).await;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while baseline_state(&harness.server, &other, &other_verifier).await
+        == DriftBaselineState::Pending
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the other tenant's fit was starved"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        baseline_state(&harness.server, &harness.seed, &harness.verifier).await,
+        DriftBaselineState::Pending,
+        "a tenant at its permit ceiling leaves its fit unclaimed"
+    );
+
+    script.release();
+    for run in busy {
+        harness.wait_run(run, status("completed")).await;
+    }
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while baseline_state(&harness.server, &harness.seed, &harness.verifier).await
+        == DriftBaselineState::Pending
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the released tenant's fit was never claimed"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
     runtime.stop().await;
 }

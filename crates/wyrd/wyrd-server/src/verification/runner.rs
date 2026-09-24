@@ -89,7 +89,7 @@ pub struct VerifierRunner {
     /// Queue policies and transitions.
     queue: VerifierRunQueue,
     /// Global and per-tenant execution capacity.
-    permits: VerifierPermits,
+    permits: Arc<VerifierPermits>,
     /// Remote result publication.
     publisher: ResultPublisher,
     /// The Drift arm's engine.
@@ -116,7 +116,7 @@ impl VerifierRunner {
         postgres: WyrdPostgres,
         operator: OperatorPool,
         queue: VerifierRunQueue,
-        permits: VerifierPermits,
+        permits: Arc<VerifierPermits>,
         publisher: ResultPublisher,
         drift: DriftEngine,
         limits: RuntimeLimits,

@@ -62,3 +62,33 @@ journey lanes, `mise run test:principals:integration`, `mise run codegen:check`,
 and `git diff --check` over the cumulative task range. Record exact commands
 and exit results in TASK-011 and this remediation task. Repository-managed
 Postgres wrappers are required for focused database tests.
+
+## Implementation evidence
+
+Remediation commits `99a8ff75..HEAD`; cumulative TASK-011 candidate
+`338f3323..HEAD`. The exact per-test commands and their results are recorded in
+[TASK-011](../../tasks/TASK-011-conventional-psi-spc.md#implementation-evidence).
+
+| Finding | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| FIND-TASK-011-1 | `vala-drift` `feature.rs::target_complete` counts every row of a preselected direct batch, so a null-only row is incomplete; the server still selects by series | `psi_selected_null_only_row_makes_the_target_unscored`, `incomplete_targets_are_unscored` (null-only row case), server `one_statement_decides_completeness_and_scores_from_one_cut` (null-only record); complete-data scores are unchanged (`test:vala`) | PASS |
+| FIND-TASK-011-2 | `SpcScorer::finish` returns `DriftReport::unscored(Spc)` when any chart is partial or empty; `DistributionFold::finish` publishes that as `Drift(None)`, so the result is inconclusive with null details, no feature rows and no dispatch | `a_signal_beside_an_incomplete_feature_is_unscored`, `empty_and_partial_targets_are_inconclusive`, `spc_subgroups_match_raw_scoring_and_partial_targets_are_inconclusive`, server `spc_signal_beside_a_partial_feature_is_unscored`; Rust/Python/TS calm-partial and sparse SPC cases `assert_unscored` | PASS |
+| FIND-TASK-011-3 | `ObservationWindow::{psi_statement, spc_statement}` build one `UNION ALL` statement (completeness part −1, feature part *i*, `ORDER BY part, k`); `DistributionFold` folds it from one `reader.fold` call; `Reader::complete` was deleted | `one_statement_decides_completeness_and_scores_from_one_cut` (an observation at the former seam leaves the run unscored); `test:bifrost:integration:server`, drift and SDK journeys | PASS |
+| FIND-TASK-011-4 | — | `mise run test:principals:integration` passed, including `pg_openapi_contract` | PASS |
+| FIND-TASK-011-5 | TASK-011 evidence lists one exact `mise exec -- cargo nextest run ... -E 'test(=<name>)'` command per named Vala and server test, plus the exact journey commands | Each command exited 0 with 1 passed (the Python command: 2 passed) | PASS |
+| FIND-TASK-011-6 | TASK-011 front matter `status: review` | — | PASS |
+| FIND-TASK-011-7 | `WyrdTestServer::verification_fixture` reuses `VerificationFixture`; test-only `make_binding_due`, `verification_runs`, `retire_fitted_format` in `wyrd-testing` (Python) and `sdks/wyrd-sdk-ts/native-testing`. No product route | Python `test_parquet_baselines_fit_and_score_drift_server_side` and TS "scores each method's edge cases": the due binding runs once, fails and dispatches once; a retired SPC fit gives `errored`/`baseline_legacy` with no result; the earlier result reads unchanged; manual direct runs dispatch nothing | PASS |
+
+Commands (each exited 0 on the final candidate): `mise run fmt`, `mise run lints`,
+`mise run py:lints`, `mise run ts:typecheck`, `mise run test:vala` (1279 passed),
+`mise run test:bifrost:journey:drift` (2), `mise run test:bifrost:journey:python` (40),
+`mise run test:bifrost:journey:typescript` (20), `mise run test:bifrost:integration:server` (85),
+`mise run test:principals:integration`, `mise run codegen:check`, `mise run docs:check`,
+`git diff --check 338f3323..HEAD`.
+
+Non-goals stayed excluded: no PSI missing bin, new observation format, extra
+chart, imputation, legacy scorer, baseline migration or new public API. Tenant
+isolation, the audited query service, fit limits, runtime leases/permits/shutdown,
+result publication and Operator dispatch semantics are unchanged. The single-cut
+proof is structural: Oracle pins one cut per statement, so no test injects an
+ingest in the middle of a query.

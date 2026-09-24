@@ -148,3 +148,35 @@ crate-family tasks for the touched server, SQL, spec, and CLI owners. Run
 implementation unexpectedly changes a public contract or behavior.
 
 Route this task directly to `$wyrd-implement`.
+
+## Implementation evidence
+
+Candidate: `4ba0f06f` on base `57ee8dd0`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| `FIND-TASK-007-10` | `OperatorKeys::new` returns the selector-free `KeyError::VersionOutOfRange` instead of `expect` (`components/operators/keys.rs`); `OperatorKeys::for_role` builds the configured owner only when `BifrostTarget::serves_api`, else the default; `boot::attach_config_fields` calls `for_role`; delivery maps the new variant with the other key-store failures (`verification/operators.rs`) | `keys::tests::oversized_active_version_is_typed_or_ignored_by_role` (exact `i32::MAX`, typed direct refusal, Server refusal, Forge default); `config::tests::oversized_operator_key_version_follows_role_ownership` (Forge validates, Server refused pre-boot); `config::tests::operator_key_version_must_fit_i32` retained | PASS |
+| `FIND-TASK-007-13` | `verification/operators/pager_duty.rs` `event` rustdoc: PagerDuty may group retry events; not exactly-once delivery or incident grouping. No code change | source inspection; `lints` | PASS |
+| `FIND-TASK-007-14` | Rustdoc on `HttpsOrigin::fmt`, `HttpsOrigin::deserialize` (`wyrd-spec/src/operator_connection.rs`), `SealedSecret::fmt` (`wyrd-sql/.../operator_connections.rs`), `OperatorDispatchQueue::default` (`wyrd-sql/.../operator_dispatches.rs`) | source inspection; `lints` | PASS |
+| `FIND-TASK-007-15` | Module-top `std::fmt::{self, Debug, Formatter}` / `std::num::NonZeroU32` / `std::path::Path` imports with bare names in `config.rs`, `keys.rs` (tests), `operator_connections.rs`, `wyrd-cli/src/operator_connection.rs`; `fmt::Result` avoids the `Result` collision | source inspection; `fmt`; `lints` | PASS |
+| Human-accepted (A) `claims.rs` rustdoc | `settled` has its own rustdoc (outcome label for a settlement); the panic-logging line is back on `reap` (`verification/claims.rs`) | source inspection; `lints` | PASS |
+| Human-accepted (B) `OperatorKeys` Debug | Fields checked: `config` prints through `OperatorKeysConfig`'s redacting `Debug` (source, version, Vault presence only); `active_version` is an `i32`; `http` is a `reqwest::Client` built with only a timeout and redirect policy — no default headers, and the Vault token is attached per request, so its `Debug` holds no selector or secret. Restored `#[derive(Debug)]`, deleted the manual impl and `keys::tests::operator_keys_debug_redacts_selectors`; its exact-`i32::MAX` assertion moved into the new constructor test; `config::tests::operator_keys_debug_redacts_selectors` still covers redaction | focused tests below | PASS |
+
+Non-goals held: no new provider, public API, error code, version type, SQL
+schema, key source, dependency, trait, or wire/schema change. `KeyError`
+gained one internal variant that maps to the existing
+`WYRD_OPERATOR_503_KEY_UNAVAILABLE`. No unrelated file changed.
+
+Focused command (exit 0):
+
+```bash
+mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=components::operators::keys::tests::oversized_active_version_is_typed_or_ignored_by_role) | test(=config::tests::oversized_operator_key_version_follows_role_ownership) | test(=config::tests::operator_key_version_must_fit_i32) | test(=config::tests::operator_keys_debug_redacts_selectors)'
+```
+
+Lanes run in this session, all exit 0: `fmt`, `lints`, `test:wyrd` (2158
+passed; includes wyrd-server, wyrd-sql, wyrd-spec, wyrd-cli, and the
+`pg_operator_delivery`/`pg_operator_connection_routes` suites), `test:sql`,
+`check:unwrap-audit`, `git diff --check`. No codegen, SDK, or journey lane:
+no public contract changed.
+
+Status: `IMPLEMENTED`.

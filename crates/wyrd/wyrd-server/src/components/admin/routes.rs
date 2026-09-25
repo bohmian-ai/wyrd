@@ -1288,7 +1288,7 @@ mod pg_tests {
 
         // The sealing key round-trips: the resolver decrypts back to the original.
         let resolver = PgIssuerResolver::new(
-            Arc::new(fixture.app_pool().clone()),
+            fixture.wyrd_postgres().clone(),
             Some(Arc::new(sealing_key())),
         );
         let resolved = resolver

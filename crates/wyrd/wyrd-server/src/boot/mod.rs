@@ -1569,7 +1569,7 @@ async fn install_auth(
     // issuer resolver also feeds the issuance-side external (foreign-OIDC)
     // verifier so federated tokens can be exchanged for Wyrd tokens.
     let issuer_resolver = Arc::new(PgIssuerResolver::new(
-        Arc::new(postgres.app_pool().clone()),
+        postgres.wyrd().clone(),
         sealing_key.clone(),
     ));
     let binding_resolver = Arc::new(PgWorkloadBindingResolver::new(Arc::new(

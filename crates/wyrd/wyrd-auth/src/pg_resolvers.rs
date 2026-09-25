@@ -34,13 +34,13 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::IssuerTokenPolicy;
 use wyrd_spec::auth::IssuerUrl;
 use wyrd_spec::reference::CardRef;
-use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
     TrustedIssuerWrite, WorkloadBindingWrite, trusted_issuer_by_url, trusted_issuers_for_tenant,
     workload_binding_by_subject,
 };
 use wyrd_sql::queries::platform::identity::PlatformOidcConnectionRow;
 use wyrd_sql::row_types::auth::{HumanConnectionRow, TrustedIssuerRow};
+use wyrd_sql::{TenantConn, WyrdPostgres};
 
 const CLIENT_AUTH_SECRET_BASIC: &str = "SecretBasic";
 const CLIENT_AUTH_SECRET_POST: &str = "SecretPost";
@@ -56,21 +56,40 @@ const PRINCIPAL_KIND_WORKLOAD: &str = "Workload";
 
 /// Production [`IssuerConfigResolver`] backed by `wyrd.auth_trusted_issuers`.
 ///
-/// Holds the app [`PgPool`] and an optional process-wide sealing key. The key is
-/// `Option` because a deployment with only secret-free issuers
-/// (`PrivateKeyJwt`/`Public`) needs no sealing key; decryption is only attempted
-/// for rows that actually carry an encrypted secret.
-#[derive(Debug, Clone)]
+/// Holds the role-separated runtime [`WyrdPostgres`] handle and an optional
+/// process-wide sealing keyring. The keyring is `Option` because a deployment
+/// with only secret-free issuers (`PrivateKeyJwt`/`Public`) needs none;
+/// decryption is only attempted for rows that actually carry a sealed secret.
+#[derive(Clone)]
 pub struct PgIssuerResolver {
-    pool: Arc<PgPool>,
+    /// Runtime Postgres handle; every read runs on an RLS [`TenantConn`]
+    /// acquired through [`WyrdPostgres::tenant_conn`], so a resolve for one
+    /// tenant can never observe another tenant's issuers.
+    postgres: WyrdPostgres,
+    /// Keyring that opens sealed client secrets, `None` on a keyless
+    /// deployment. A row carrying a secret with no keyring fails closed with
+    /// [`IssuerDecodeError::SealingKeyMissing`] instead of being dropped.
     sealing_key: Option<Arc<SealingKeyring>>,
 }
 
+/// Redacted debug view: names the keyring presence and hides the store handle.
+impl std::fmt::Debug for PgIssuerResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PgIssuerResolver")
+            .field("sealing_key", &self.sealing_key)
+            .finish_non_exhaustive()
+    }
+}
+
 impl PgIssuerResolver {
-    /// Construct a resolver over the Wyrd app pool with an optional sealing key.
+    /// Construct a resolver over the runtime Postgres handle with an optional
+    /// sealing keyring.
     #[must_use]
-    pub fn new(pool: Arc<PgPool>, sealing_key: Option<Arc<SealingKeyring>>) -> Self {
-        Self { pool, sealing_key }
+    pub fn new(postgres: WyrdPostgres, sealing_key: Option<Arc<SealingKeyring>>) -> Self {
+        Self {
+            postgres,
+            sealing_key,
+        }
     }
 }
 
@@ -92,7 +111,7 @@ impl IssuerConfigResolver for PgIssuerResolver {
         &self,
         tenant: &DataTenantId,
     ) -> Result<Vec<TrustedIssuer>, OidcError> {
-        let mut conn = TenantConn::acquire(&self.pool, *tenant).await.map_err(|error| {
+        let mut conn = self.postgres.tenant_conn(*tenant).await.map_err(|error| {
             tracing::warn!(error = %error, "issuer resolver failed to acquire tenant connection");
             OidcError::JwksUnavailable {
                 issuer: tenant.as_uuid().to_string(),
@@ -141,7 +160,7 @@ impl IssuerConfigResolver for PgIssuerResolver {
         tenant: &DataTenantId,
         issuer: &IssuerUrl,
     ) -> Result<Option<TrustedIssuer>, OidcError> {
-        let mut conn = TenantConn::acquire(&self.pool, *tenant).await.map_err(|error| {
+        let mut conn = self.postgres.tenant_conn(*tenant).await.map_err(|error| {
             tracing::warn!(error = %error, "issuer resolver failed to acquire tenant connection");
             OidcError::JwksUnavailable {
                 issuer: tenant.as_uuid().to_string(),
@@ -240,26 +259,44 @@ pub enum IssuerSealError {
     Serialize(#[from] serde_json::Error),
 }
 
-/// Failure decoding a [`TrustedIssuerRow`] or [`HumanConnectionRow`] back into
-/// a [`TrustedIssuer`].
+/// Failure decoding a [`TrustedIssuerRow`], [`HumanConnectionRow`], or
+/// platform connection row back into a verification-ready issuer.
+///
+/// Every variant is fail-closed: the issuer resolver maps it to
+/// [`OidcError::JwksUnavailable`] and the human and platform connection
+/// owners to a server-side (5xx) error, so an undecodable row never reads as
+/// an untrusted (401) issuer. No variant carries secret material.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum IssuerDecodeError {
+    /// The stored `issuer_url` is not a valid issuer URL; carries the parse
+    /// error text.
     #[error("stored issuer url is invalid: {0}")]
     IssuerUrl(String),
+    /// The stored `jwks_uri` is not an absolute URL; carries the parse error
+    /// text.
     #[error("stored jwks uri is invalid: {0}")]
     JwksUri(String),
+    /// The stored `client_auth` names no known client-authentication method.
     #[error("unknown client_auth discriminant {0:?}")]
     ClientAuth(String),
+    /// The stored `principal_kind` names no known token policy.
     #[error("unknown principal_kind discriminant {0:?}")]
     PrincipalKind(String),
+    /// A secret-bearing method (`SecretBasic`/`SecretPost`) has no stored
+    /// ciphertext.
     #[error("client_auth requires a secret but client_secret_enc is null")]
     MissingSecret,
+    /// The row carries a sealed secret but the process holds no keyring.
     #[error("client secret present but no sealing key is configured")]
     SealingKeyMissing,
+    /// No held sealing key opens the stored ciphertext, or it is malformed
+    /// or tampered.
     #[error("client secret could not be decrypted")]
     Decrypt,
+    /// The opened secret is not UTF-8; its bytes are discarded, not echoed.
     #[error("decrypted client secret is not valid utf-8")]
     SecretEncoding,
+    /// A JSONB column does not match its expected shape.
     #[error("json column decode failed: {0}")]
     Json(#[from] serde_json::Error),
 }
@@ -355,10 +392,28 @@ pub(crate) fn seal_secret(
 }
 
 /// Open a stored sealed value with whichever held key it names.
+///
+/// The versioned envelope names its sealing key, so a secret sealed under a
+/// retained (pre-rotation) key still opens while the rewrap catches up. The
+/// underlying crypto error is dropped so no key or ciphertext detail leaks.
+///
+/// # Errors
+/// Returns [`IssuerDecodeError::Decrypt`] when the envelope is malformed, names
+/// a key the keyring does not hold, or fails authentication.
 fn open_secret(keyring: &SealingKeyring, bytes: &[u8]) -> Result<Vec<u8>, IssuerDecodeError> {
     keyring.open(bytes).map_err(|_| IssuerDecodeError::Decrypt)
 }
 
+/// Open a row's sealed client secret into a [`SecretString`].
+///
+/// Called only for secret-bearing client-authentication methods; the
+/// plaintext never leaves the returned secret wrapper.
+///
+/// # Errors
+/// Returns [`IssuerDecodeError::MissingSecret`] when the row stores no
+/// ciphertext, [`IssuerDecodeError::SealingKeyMissing`] when the process holds
+/// no keyring, [`IssuerDecodeError::Decrypt`] when no held key opens it, and
+/// [`IssuerDecodeError::SecretEncoding`] when the plaintext is not UTF-8.
 fn decode_secret(
     secret_enc: Option<&[u8]>,
     sealing_key: Option<&SealingKeyring>,
@@ -808,7 +863,7 @@ mod pg_tests {
         conn.commit().await.expect("seed commits");
 
         let resolver = PgIssuerResolver::new(
-            Arc::new(fixture.app_pool().clone()),
+            fixture.wyrd_postgres().clone(),
             Some(Arc::new(sealing_key())),
         );
         let issuers = resolver

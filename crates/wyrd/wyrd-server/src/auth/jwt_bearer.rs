@@ -594,10 +594,8 @@ mod pg_tests {
             conn.commit().await.expect("binding seed commits");
         }
 
-        let issuer_resolver = Arc::new(PgIssuerResolver::new(
-            Arc::new(fixture.app_pool().clone()),
-            None,
-        ));
+        let issuer_resolver =
+            Arc::new(PgIssuerResolver::new(fixture.wyrd_postgres().clone(), None));
         let binding_resolver = Arc::new(PgWorkloadBindingResolver::new(Arc::new(
             fixture.app_pool().clone(),
         )));

@@ -4306,7 +4306,7 @@ impl WyrdTestServerBuilder {
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
 
         let issuer_resolver = Arc::new(PgIssuerResolver::new(
-            Arc::new(runtime_wyrd.app_pool().clone()),
+            runtime_wyrd.clone(),
             Some(Arc::clone(&sealing_key)),
         ));
         let binding_resolver = Arc::new(PgWorkloadBindingResolver::new(Arc::new(

@@ -1339,7 +1339,7 @@ mod tests {
         sql: &str,
         rows: &[Row<'_>],
         mut fold: DistributionFold<'_>,
-    ) -> Option<vala_drift::DriftReport> {
+    ) -> Option<DriftReport> {
         for batch in run(sql, rows).await {
             fold.fold(&batch).expect("well-formed");
         }

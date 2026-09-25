@@ -262,6 +262,8 @@ mod dispatch_errors {
         .expect("valid psi spec")
     }
 
+    /// An SPC baseline with no features, used where only its method matters
+    /// for dispatch.
     fn spc_baseline_stub() -> FittedBaseline {
         use wyrd_version::WyrdVersion;
         FittedBaseline::Spc(SpcBaseline {
@@ -386,10 +388,17 @@ mod end_to_end {
         )?)
     }
 
+    /// The SPC profile of the dispatch fixtures: subgroups of five rows.
     fn spc_profile() -> SpcProfile {
         SpcProfile { sample_size: 5 }
     }
 
+    /// Assert `report` is a finite, scored `method` report with exactly one
+    /// row, for `feature`, whose verdict and the report's are `verdict`.
+    ///
+    /// # Panics
+    /// Panics when the method, verdict, feature row, or finite score and
+    /// threshold differ.
     fn assert_report_shape(
         report: &DriftReport,
         method: DriftMethod,

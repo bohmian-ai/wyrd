@@ -162,6 +162,7 @@ use wyrd_sql::queries::auth::{
 use wyrd_storage::{BackendConfig, StorageSettings};
 
 use crate::time::ClockHandle;
+use crate::verification::{VerificationFixture, VerificationFixtureError};
 
 /// Dedicated least-privilege role assigned to the test Oracle Service.
 const BIFROST_PEER_ROLE: &str = "bifrost_peer";
@@ -3469,15 +3470,12 @@ impl WyrdTestServer {
     /// one owner instead of restating its SQL.
     ///
     /// # Errors
-    /// Returns [`crate::verification::VerificationFixtureError`] when the
-    /// tenant cannot be provisioned.
+    /// Returns [`VerificationFixtureError`] when the tenant cannot be
+    /// provisioned.
     pub async fn verification_fixture(
         &self,
-    ) -> Result<
-        crate::verification::VerificationFixture,
-        crate::verification::VerificationFixtureError,
-    > {
-        crate::verification::VerificationFixture::provision(
+    ) -> Result<VerificationFixture, VerificationFixtureError> {
+        VerificationFixture::provision(
             self.inner.state.postgres.wyrd(),
             self.inner.fixture.data_tenant_id(),
         )

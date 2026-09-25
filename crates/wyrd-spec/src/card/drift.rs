@@ -332,6 +332,9 @@ impl DriftProfile {
 }
 
 impl DriftValidationError {
+    /// The machine-readable problem details of this validation failure: the
+    /// offending field and why it was refused, so a caller can correct the
+    /// Verifier spec without parsing the message.
     fn details(&self) -> serde_json::Value {
         match self {
             Self::SignalMethodMismatch { signal, method } => {

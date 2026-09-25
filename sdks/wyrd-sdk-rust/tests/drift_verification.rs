@@ -26,6 +26,7 @@ use base64::Engine;
 use chrono::{DateTime, Utc};
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::Digest;
 use wyrd_sdk::bifrost::client_from_options;
 use wyrd_sdk::cards::{CardGraphHydrator, CardSelector, Cards, HydrationMode, RegistrationReceipt};
@@ -670,8 +671,8 @@ fn verdicts(features: &[FeatureRow]) -> Vec<(&str, &str, &str)> {
 /// # Panics
 /// Panics when the details are absent, not JSON, or carry no evidence for
 /// `feature`.
-fn evidence(result: &ResultRow, feature: &str) -> serde_json::Value {
-    let details: serde_json::Value = serde_json::from_str(
+fn evidence(result: &ResultRow, feature: &str) -> Value {
+    let details: Value = serde_json::from_str(
         result
             .details
             .as_deref()
@@ -1114,7 +1115,7 @@ async fn assert_direct_scores(
         [
             (serde_json::json!("gold"), serde_json::json!(0)),
             (serde_json::json!("silver"), serde_json::json!(0)),
-            (serde_json::Value::Null, serde_json::json!(120)),
+            (Value::Null, serde_json::json!(120)),
         ],
         "every unseen tier lands in the reserved other bin: {tier}"
     );
@@ -1155,7 +1156,7 @@ fn assert_spc_evidence(result: &ResultRow, subgroups: u64, x_bar_signals: u64) {
     assert_eq!(spc["subgroup_size"], 5, "{spc}");
     assert_eq!(spc["subgroups"], subgroups, "{spc}");
     assert_eq!(spc["x_bar"]["signals"], x_bar_signals, "{spc}");
-    let number = |value: &serde_json::Value| value.as_f64().expect("a number");
+    let number = |value: &Value| value.as_f64().expect("a number");
     let s_bar = 2.5_f64.sqrt();
     let c4 = 0.939_985_6;
     let width = 3.0 * s_bar / (c4 * 5.0_f64.sqrt());

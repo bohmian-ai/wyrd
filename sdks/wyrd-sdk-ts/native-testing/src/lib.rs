@@ -2,15 +2,17 @@
 
 #![deny(missing_docs)]
 
+use std::fmt::Display;
 use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::{DataType, Field};
-use napi::Result;
+use napi::{Error, Result};
 use napi_derive::napi;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use wyrd_testing::Bootstrap;
 use wyrd_testing::server::WyrdTestServer;
+use wyrd_testing::verification::VerificationFixture;
 
 /// In-process server handle used only by TypeScript integration tests.
 #[napi]
@@ -215,7 +217,7 @@ impl NativeWyrdTestServer {
     ///
     /// Returns a napi error when the harness lock is poisoned, the server is
     /// shut down, or the fixture tenant cannot be provisioned.
-    fn verification_fixture(&self) -> Result<wyrd_testing::verification::VerificationFixture> {
+    fn verification_fixture(&self) -> Result<VerificationFixture> {
         let guard = self
             .server
             .lock()
@@ -661,6 +663,6 @@ async fn start_test_server_async(
 }
 
 /// Convert a harness failure into a napi error carrying its message.
-fn reason(error: impl std::fmt::Display) -> napi::Error {
-    napi::Error::from_reason(error.to_string())
+fn reason(error: impl Display) -> Error {
+    Error::from_reason(error.to_string())
 }

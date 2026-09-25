@@ -16,6 +16,7 @@ pub(crate) mod threshold;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 
+use arrow::record_batch::RecordBatch;
 use arrow_schema::DataType;
 use serde::{Deserialize, Serialize};
 use wyrd_spec::card::drift::{DriftMethod, PsiBinningStrategy, PsiProfile};
@@ -209,7 +210,7 @@ pub fn score_psi(
 /// whose column is not numeric or a categorical one whose column is not text.
 fn target_column(
     fitted: &FittedPsiFeature,
-    target: &arrow::record_batch::RecordBatch,
+    target: &RecordBatch,
     feature: &FeatureName,
 ) -> Result<TargetColumn, DriftScoreError> {
     let mismatch = || DriftScoreError::FeatureTypeMismatch {
@@ -789,6 +790,11 @@ mod psi_score {
     use wyrd_spec::card::drift::{DriftMethod, PsiBinningStrategy, PsiProfile, PsiThreshold};
     use wyrd_spec::ids::FeatureName;
 
+    /// Parse a fixture feature name.
+    ///
+    /// # Panics
+    /// Panics when `name` is not a valid [`FeatureName`]; every caller passes
+    /// a fixed, valid literal, so this is a fixture invariant.
     fn feature(name: &str) -> FeatureName {
         FeatureName::new(name).expect("valid feature name")
     }
@@ -811,6 +817,10 @@ mod psi_score {
         .expect("record batch")
     }
 
+    /// A one-column `Float64` batch named `name` holding `values`.
+    ///
+    /// # Panics
+    /// Panics when Arrow rejects the batch.
     fn numeric_batch(name: &str, values: Vec<f64>) -> RecordBatch {
         RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new(name, DataType::Float64, true)])),
@@ -819,6 +829,10 @@ mod psi_score {
         .expect("record batch")
     }
 
+    /// A one-column non-null `Int64` batch named `name` holding `values`.
+    ///
+    /// # Panics
+    /// Panics when Arrow rejects the batch.
     fn int_batch(name: &str, values: Vec<i64>) -> RecordBatch {
         RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new(name, DataType::Int64, false)])),
@@ -827,6 +841,10 @@ mod psi_score {
         .expect("record batch")
     }
 
+    /// A one-column `Utf8` batch named `name` holding `values`.
+    ///
+    /// # Panics
+    /// Panics when Arrow rejects the batch.
     fn cat_batch(name: &str, values: Vec<&str>) -> RecordBatch {
         RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new(name, DataType::Utf8, true)])),
@@ -835,6 +853,7 @@ mod psi_score {
         .expect("record batch")
     }
 
+    /// Ten equal-width numeric bins scored at chi-square `alpha = 0.05`.
     fn psi_profile_default() -> PsiProfile {
         PsiProfile {
             binning_strategy: PsiBinningStrategy::EqualWidth { n_bins: 10 },

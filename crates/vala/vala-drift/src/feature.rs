@@ -43,7 +43,13 @@ impl<'a> ColumnRef<'a> {
 
     /// Cast and return every row as `f64`, `None` where the row is null.
     ///
-    /// Returns [`FeatureLookupError`] if the column cannot be cast to `Float64`.
+    /// Row positions are preserved so the caller can decide what a null or
+    /// non-finite value means for its selected observation; nothing is
+    /// dropped here.
+    ///
+    /// # Errors
+    /// Returns [`FeatureLookupError`] if the column cannot be cast to
+    /// `Float64`.
     pub fn collect_f64(&self) -> Result<Vec<Option<f64>>, FeatureLookupError> {
         let casted = cast(self.array, &DataType::Float64).map_err(|_| FeatureLookupError)?;
         let arr = casted
@@ -55,6 +61,10 @@ impl<'a> ColumnRef<'a> {
 
     /// Cast and return every row as a string, `None` where the row is null.
     ///
+    /// Row positions are preserved so a null category stays visible to the
+    /// caller's completeness check instead of being dropped.
+    ///
+    /// # Errors
     /// Returns [`FeatureLookupError`] if the column cannot be cast to `Utf8`.
     pub fn collect_string(&self) -> Result<Vec<Option<String>>, FeatureLookupError> {
         let casted = cast(self.array, &DataType::Utf8).map_err(|_| FeatureLookupError)?;

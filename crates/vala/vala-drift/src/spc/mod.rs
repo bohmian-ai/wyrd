@@ -385,7 +385,7 @@ mod spc_fit {
 
     use std::sync::Arc;
 
-    use crate::{DriftFitError, fit_spc_baseline};
+    use crate::{DriftFitError, SpcBaseline, fit_spc_baseline};
     use arrow::array::{Float64Array, Int64Array, StringArray};
     use arrow::record_batch::RecordBatch;
     use arrow_schema::{DataType, Field, Schema};
@@ -412,8 +412,17 @@ mod spc_fit {
         .expect("record batch")
     }
 
-    /// Fit `values` of feature `x` with subgroups of `n`.
-    fn fit(values: Vec<Option<f64>>, n: u32) -> Result<crate::SpcBaseline, DriftFitError> {
+    /// Fit `values` of feature `x` with subgroups of `n` through the public
+    /// SPC fitter, so each test sees exactly what a Verifier fit would.
+    ///
+    /// # Errors
+    /// Returns the fitter's [`DriftFitError`] for a size below two, an
+    /// incomplete or trailing subgroup, too few subgroups, or a null or
+    /// non-finite value.
+    ///
+    /// # Panics
+    /// Panics when Arrow rejects the fixture batch.
+    fn fit(values: Vec<Option<f64>>, n: u32) -> Result<SpcBaseline, DriftFitError> {
         fit_spc_baseline(
             &numeric_batch("x", values),
             &SpcProfile { sample_size: n },

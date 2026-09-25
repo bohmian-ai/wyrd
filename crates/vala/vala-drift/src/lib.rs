@@ -50,6 +50,7 @@ mod smoke {
     use wyrd_spec::card::drift::{CustomProfile, DriftSpec, PsiProfile, SpcProfile};
     use wyrd_spec::ids::FeatureName;
 
+    /// Every public re-export stays nameable from the crate root.
     #[test]
     fn public_surface_is_visible() {
         // No-op: this test exists to force a link of every public re-export. If

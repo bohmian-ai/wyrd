@@ -205,6 +205,9 @@ pub fn score_psi(
 
 /// Read `feature`'s target column with the type its fitted bins require.
 ///
+/// A missing column or a `Null`-typed one carries no value in any row, so it
+/// is [`TargetColumn::Absent`] and leaves a non-empty target incomplete.
+///
 /// # Errors
 /// Returns [`DriftScoreError::FeatureTypeMismatch`] for a numeric feature
 /// whose column is not numeric or a categorical one whose column is not text.
@@ -219,6 +222,9 @@ fn target_column(
     let Ok(column) = resolve_column(target, feature) else {
         return Ok(TargetColumn::Absent);
     };
+    if column.array.data_type().is_null() {
+        return Ok(TargetColumn::Absent);
+    }
     match fitted.bin_type {
         BinType::Numeric if column.is_numeric() => column
             .collect_f64()
@@ -784,7 +790,7 @@ mod psi_score {
     use crate::{
         DriftReport, DriftScoreError, DriftVerdict, fit_psi_baseline, score_psi, score_psi_counts,
     };
-    use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray};
+    use arrow::array::{ArrayRef, Float64Array, Int64Array, NullArray, StringArray};
     use arrow::record_batch::RecordBatch;
     use arrow_schema::{DataType, Field, Schema};
     use wyrd_spec::card::drift::{DriftMethod, PsiBinningStrategy, PsiProfile, PsiThreshold};
@@ -1199,6 +1205,45 @@ mod psi_score {
         let report_high = score_psi(&baseline, &target_batch, &profile_high).expect("report");
 
         assert_eq!(report_high.verdict, DriftVerdict::NoDrift);
+    }
+
+    /// A selected target whose feature column has Arrow's `Null` type is
+    /// null in every row, so numeric and categorical baselines both report
+    /// it unscored rather than as a type mismatch.
+    ///
+    /// # Panics
+    /// Panics when either target scores, errors, or carries feature rows.
+    #[test]
+    fn psi_null_typed_target_is_unscored() {
+        let numeric = numeric_batch("x", (0..1000).map(|value| value as f64).collect());
+        let categorical = cat_batch(
+            "x",
+            std::iter::repeat_n("sea", 500)
+                .chain(std::iter::repeat_n("pdx", 500))
+                .collect(),
+        );
+        let fname = feature("x");
+        let null_target = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("x", DataType::Null, true)])),
+            vec![Arc::new(NullArray::new(200))],
+        )
+        .expect("record batch");
+        let categorical_profile = PsiProfile {
+            categorical_features: vec![fname.clone()],
+            ..psi_profile_default()
+        };
+        for (baseline_batch, profile) in [
+            (numeric, psi_profile_default()),
+            (categorical, categorical_profile),
+        ] {
+            let baseline =
+                fit_psi_baseline(&baseline_batch, &profile, std::slice::from_ref(&fname))
+                    .expect("baseline");
+            assert_eq!(
+                score_psi(&baseline, &null_target, &profile).expect("report"),
+                DriftReport::unscored(DriftMethod::Psi)
+            );
+        }
     }
 
     #[test]

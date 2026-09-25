@@ -119,10 +119,12 @@ pub fn resolve_column<'a>(
 /// A direct target batch is already selected: every row is one relevant
 /// observation. Target scoring first checks that each row carries every
 /// configured feature; only then are the values counted or grouped. A column
-/// absent from the batch is carried by no row.
+/// absent from the batch, or present with Arrow's `Null` type, is carried by
+/// no row.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TargetColumn {
-    /// The batch has no column of this feature.
+    /// The batch has no column of this feature, or only a `Null`-typed one
+    /// whose every row is null.
     Absent,
     /// A numeric feature's values; a non-finite value is invalid.
     Numeric(Vec<Option<f64>>),

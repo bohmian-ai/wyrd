@@ -173,7 +173,8 @@ pub(crate) fn fit_spc_baseline_until(
 /// `target` is an already selected batch: each row is one relevant
 /// observation and the caller has excluded unrelated ones. When any row
 /// misses a feature or holds a null or non-finite value, the target is
-/// [`DriftReport::unscored`]. Otherwise
+/// [`DriftReport::unscored`]; a `Null`-typed column is null in every row.
+/// Otherwise
 /// each feature's values form consecutive subgroups in row order and stream
 /// through one [`SpcScorer`], so raw-batch and server-aggregated inputs share
 /// one chart evaluation.
@@ -192,6 +193,7 @@ pub fn score_spc(
         };
         columns.push(match resolve_column(target, feature) {
             Err(_) => TargetColumn::Absent,
+            Ok(column) if column.array.data_type().is_null() => TargetColumn::Absent,
             Ok(column) if column.is_numeric() => {
                 TargetColumn::Numeric(column.collect_f64().map_err(|_| mismatch())?)
             }
@@ -552,7 +554,7 @@ mod spc_score {
 
     use std::sync::Arc;
 
-    use arrow::array::{ArrayRef, Float64Array, StringArray};
+    use arrow::array::{ArrayRef, Float64Array, NullArray, StringArray};
     use arrow::record_batch::RecordBatch;
     use arrow_schema::{DataType, Field, Schema};
     use wyrd_spec::card::drift::DriftMethod;
@@ -772,6 +774,24 @@ mod spc_score {
             .expect("trailing partial");
         assert!(scorer.push(&x, 2, 10.0, 1.0).is_err());
         assert_eq!(scorer.finish().verdict, DriftVerdict::Inconclusive);
+    }
+
+    /// A selected target whose column has Arrow's `Null` type is null in
+    /// every row, so the report is unscored rather than a type mismatch.
+    ///
+    /// # Panics
+    /// Panics when the target scores, errors, or carries feature rows.
+    #[test]
+    fn null_typed_target_is_unscored() {
+        let nulls = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("x", DataType::Null, true)])),
+            vec![Arc::new(NullArray::new(4))],
+        )
+        .expect("record batch");
+        assert_eq!(
+            score_spc(&baseline(&["x"]), &nulls).expect("report"),
+            DriftReport::unscored(DriftMethod::Spc)
+        );
     }
 
     /// A non-numeric target column is a type mismatch.

@@ -180,7 +180,14 @@ async fn scribe_sustained_ingest_oracle_hot_read_journey() {
     // Every tenant drives both of its tables at once, so the pod's one vector
     // is contended for the whole phase and each refusal is real pressure a
     // public client recovers from.
-    let refusals = drive_sustained_ingest(&mut participants).await;
+    drive_sustained_ingest(&mut participants).await;
+    // Counted on the pod, not at the client: the gRPC transport retries a busy
+    // refusal inside its frame budget, so a fast host absorbs every refusal
+    // before `until_admitted` can see one.
+    let refusals = server
+        .scribe_contention_totals_for_test()
+        .expect("the pod's contention totals are inspectable")
+        .activation_refusals();
     assert!(
         refusals > 0,
         "a pod lending a single vector to four concurrent tenants must refuse at \
@@ -268,6 +275,23 @@ async fn scribe_sustained_ingest_oracle_hot_read_journey() {
         participant.assert_exact("published-hot").await;
     }
 
+    // Every read above committed a read decision that the server's audit
+    // publisher appends through this same Scribe. Settle that retained history
+    // and publish what it wrote, so the pod is drained rather than mid-append.
+    for tenant in participants
+        .iter()
+        .map(|participant| participant.tenant)
+        .chain([server.data_tenant_id()])
+    {
+        server
+            .await_audit_published(tenant)
+            .await
+            .expect("retained audit history settles");
+    }
+    server
+        .flush_bifrost()
+        .await
+        .expect("the published audit history publishes");
     assert_terminal_reconciliation(&server);
     server.shutdown().await.expect("the server drains cleanly");
 }
@@ -306,22 +330,21 @@ async fn build_participants(server: &WyrdTestServer) -> Vec<Participant> {
     participants
 }
 
-/// Drives every participant's whole demand concurrently and returns the refusals.
+/// Drives every participant's whole demand concurrently to acknowledgement.
 ///
 /// Each tenant runs one bounded task that alternates between its dynamic table
 /// and the built-in, placing consecutive batches in two adjacent hour
 /// partitions. The tasks rendezvous on a barrier before their first append, so
 /// contention for the pod's single vector is structural rather than dependent
 /// on scheduling order. Every attempt goes through the shared bounded retry, so
-/// the returned total is the number of times the pod applied typed capacity
-/// pressure before admitting the work — never a measure of how long anything
-/// took.
+/// a busy refusal that outlasts the transport's own retries is recovered the
+/// way a public client would recover it.
 ///
 /// # Panics
 ///
 /// Panics when a participant task does not complete, or when any append fails
 /// for a reason other than capacity pressure.
-async fn drive_sustained_ingest(participants: &mut [Participant]) -> usize {
+async fn drive_sustained_ingest(participants: &mut [Participant]) {
     let base = super::support::hour_start(chrono::Utc::now());
     // Every participant blocks here until all of them are ready, so the pod's
     // single vector is contended by the first append of every tenant at once
@@ -335,7 +358,6 @@ async fn drive_sustained_ingest(participants: &mut [Participant]) -> usize {
         let dynamic_table = participant.dynamic_table.clone();
         let start = Arc::clone(&start);
         tasks.push(tokio::spawn(async move {
-            let mut refusals = 0_usize;
             let mut dynamic = Vec::new();
             let mut system = Vec::new();
             start.wait().await;
@@ -344,7 +366,7 @@ async fn drive_sustained_ingest(participants: &mut [Participant]) -> usize {
                 // Consecutive batches alternate between two adjacent hours, so
                 // one table's rows span two physical partitions.
                 let event_time = base + chrono::Duration::hours((batch % 2) as i64);
-                refusals += until_admitted(&format!("tenant {ordinal} dynamic {batch}"), || {
+                until_admitted(&format!("tenant {ordinal} dynamic {batch}"), || {
                     append_values_at(
                         &client,
                         &dynamic_table,
@@ -358,7 +380,7 @@ async fn drive_sustained_ingest(participants: &mut [Participant]) -> usize {
 
                 let spans = batch_values(ordinal, batch + BATCHES_PER_TABLE);
                 let span_rows = span_batch(&spans);
-                refusals += until_admitted(&format!("tenant {ordinal} spans {batch}"), || {
+                until_admitted(&format!("tenant {ordinal} spans {batch}"), || {
                     append_batch(&client, SYSTEM_TABLE, uuid::Uuid::now_v7(), &span_rows)
                 })
                 .await;
@@ -366,18 +388,15 @@ async fn drive_sustained_ingest(participants: &mut [Participant]) -> usize {
             }
             dynamic.sort_unstable();
             system.sort_unstable();
-            (refusals, dynamic, system)
+            (dynamic, system)
         }));
     }
 
-    let mut refusals = 0_usize;
     for (participant, task) in participants.iter_mut().zip(tasks) {
-        let (refused, dynamic, system) = task.await.expect("the participant task completes");
-        refusals += refused;
+        let (dynamic, system) = task.await.expect("the participant task completes");
         participant.expected_dynamic = dynamic;
         participant.expected_system = system;
     }
-    refusals
 }
 
 /// Returns the exact values one tenant's batch carries.

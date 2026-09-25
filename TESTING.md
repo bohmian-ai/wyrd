@@ -88,6 +88,19 @@ mise run test:rust                       # full Rust aggregate
 `test:rust` is the broad Rust aggregate. Capability work uses its capability
 lane instead; Bifrost-only pull requests run `verify:bifrost`.
 
+### What CI selects
+
+`.github/scripts/select-ci.py` maps each changed file to its workspace package
+and expands it to that package's consumers via `cargo metadata`. A pull request
+runs `check`, the boundary checks, and the owning lanes of the affected
+packages. Those lanes cover the family lanes, filtered by `WYRD_TEST_PACKAGES`,
+along with codegen, the SDK platform jobs, and the Python, TypeScript,
+Bifrost, identity, and storage journeys that consume them. The selector writes
+every reason to the job summary. Any global, mixed, or unknown change, or a
+package it cannot place, takes `gate`. Main pushes build only the affected
+release packages; releases build every package.
+`mise run check:ci-selection` pins every route.
+
 ### Checks and codegen
 
 ```bash

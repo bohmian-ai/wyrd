@@ -1199,6 +1199,16 @@ impl ScribeTelemetrySnapshot {
         self.counts[effect.index()]
     }
 
+    /// Returns table activations refused at the pod's derived ceiling since startup.
+    ///
+    /// This is the pod's own count of real capacity pressure. A public client
+    /// may never observe it: the gRPC ingest transport retries a busy refusal
+    /// within its frame budget, so only refusals outlasting that budget reach
+    /// the caller.
+    pub const fn activation_refusals(&self) -> u64 {
+        self.count(ContentionEffect::ActivationRefused)
+    }
+
     /// Returns admission transitions opened since startup.
     pub const fn starts(&self) -> u64 {
         self.starts

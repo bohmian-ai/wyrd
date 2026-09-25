@@ -505,11 +505,15 @@ pub(crate) fn unused_payload(id: i64) -> String {
     out
 }
 
-/// Bound on how many Forge planning passes the fixture will drive before it
-/// gives up on compacting its first batch. Generous, because a pass may claim
-/// nothing, retry, or lose a lease race; finite, because a stalled Forge must
-/// fail the journey rather than hang it.
-const COMPACTION_PASS_BUDGET: usize = 32;
+/// How long the fixture drives Forge passes before it gives up on compacting
+/// its first batch.
+///
+/// The bound is time, not a pass count: Forge claims round-robin across
+/// tenants, so every tenant an earlier case in the same lane database left with
+/// ready work takes a pass before this tenant's turn comes around. Generous,
+/// because a pass may also claim nothing, retry, or lose a lease race; finite,
+/// because a stalled Forge must fail the journey rather than hang it.
+const COMPACTION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(180);
 
 /// Compacts every sealed file already written for `table`, so that a later
 /// query reads them through the Iceberg snapshot rather than the hot manifest.
@@ -528,7 +532,7 @@ const COMPACTION_PASS_BUDGET: usize = 32;
 ///   `next_eligible_at` back instead of sleeping, leaving the failure
 ///   classification untouched.
 ///
-/// The loop is bounded and its exit condition is the durable `compacted` flag,
+/// The loop is bounded by [`COMPACTION_DEADLINE`] and its exit condition is the durable `compacted` flag,
 /// not a pass or completion count: a pass that claimed nothing, and a
 /// completion that rewrote some other table, must not be mistaken for this
 /// batch having moved tiers.
@@ -537,7 +541,7 @@ const COMPACTION_PASS_BUDGET: usize = 32;
 ///
 /// Returns an error when the observer is absent, when the clock cannot be
 /// advanced, when a Postgres probe fails, or when fewer than `expected` inputs
-/// are compacted before the loop's budget runs out.
+/// are compacted before the deadline.
 pub(crate) async fn compact_sealed_batch(
     cluster: &WyrdTestCluster,
     tenant: wyrd_spec::DataTenantId,
@@ -553,7 +557,8 @@ pub(crate) async fn compact_sealed_batch(
             .advance(chrono::Duration::days(1))
             .map_err(|error| format!("close the written partition: {error}"))?;
     }
-    for _ in 0..COMPACTION_PASS_BUDGET {
+    let deadline = tokio::time::Instant::now() + COMPACTION_DEADLINE;
+    while tokio::time::Instant::now() < deadline {
         let (compacted, _) = file_tier_counts(cluster, tenant, table).await?;
         if compacted >= expected {
             return Ok(());
@@ -573,7 +578,7 @@ pub(crate) async fn compact_sealed_batch(
     let (compacted, hot) = file_tier_counts(cluster, tenant, table).await?;
     Err(format!(
         "Forge compacted {compacted} of {expected} sealed inputs within \
-         {COMPACTION_PASS_BUDGET} passes ({hot} still hot)"
+         {COMPACTION_DEADLINE:?} ({hot} still hot)"
     )
     .into())
 }

@@ -17,13 +17,15 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
-      rust: ${{ steps.filter.outputs.rust }}
       python: ${{ steps.filter.outputs.python }}
+      typescript: ${{ steps.filter.outputs.typescript }}
+      rust_client: ${{ steps.filter.outputs.rust_client }}
       docs: ${{ steps.filter.outputs.docs }}
       ui: ${{ steps.filter.outputs.ui }}
-      workflow: ${{ steps.filter.outputs.workflow }}
       bifrost_only: ${{ steps.filter.outputs.bifrost_only }}
       full_gate: ${{ steps.filter.outputs.full_gate }}
+      rust_packages: ${{ steps.filter.outputs.rust_packages }}
+      ci_lanes: ${{ steps.filter.outputs.ci_lanes }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -57,15 +59,19 @@ jobs:
           fi
           cat "$GITHUB_OUTPUT"
 
-  # Mixed, global, and unclassified changes take the complete repository gate.
-  # Any other non-Bifrost Rust change runs format, lint, and Linux Rust tests
-  # here; rust-client covers client/SDK code on Linux and macOS.
+  # Mixed, global, unclassified, and unresolvable changes take the complete
+  # repository gate. Any other change with selected lanes runs format, lint, the
+  # live boundary checks, and exactly the lanes select-ci.py chose for its
+  # affected packages and journeys, all on Linux; the SDK jobs below cover
+  # Linux and macOS.
   ci:
     name: ci
     needs: changes
-    if: needs.changes.outputs.full_gate == 'true' || ((needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflow == 'true') && needs.changes.outputs.bifrost_only != 'true')
+    if: needs.changes.outputs.full_gate == 'true' || needs.changes.outputs.ci_lanes != ''
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    # The full gate needs more than an hour on a cold hosted runner; selected
+    # lanes keep the tighter bound.
+    timeout-minutes: ${{ needs.changes.outputs.full_gate == 'true' && 120 || 60 }}
     steps:
       - uses: actions/checkout@v4
 
@@ -106,21 +112,35 @@ jobs:
       - name: Add wasm target
         run: rustup target add wasm32-unknown-unknown
 
-      - name: Run selected CI lane
+      - name: Run selected CI lanes
         env:
           RUST_LOG: info,vala_bifrost_redux::oracle=debug
+          WYRD_TEST_PACKAGES: ${{ needs.changes.outputs.rust_packages }}
+          CI_LANES: ${{ needs.changes.outputs.ci_lanes }}
         run: |
+          timed() {
+            local started=$SECONDS
+            echo "::group::mise run $1"
+            mise run "$1"
+            echo "::endgroup::"
+            echo "| \`$1\` | $((SECONDS - started))s |" >> "$GITHUB_STEP_SUMMARY"
+          }
+          printf '### Lane timings\n\n| lane | duration |\n| --- | --- |\n' >> "$GITHUB_STEP_SUMMARY"
           if [[ "${{ needs.changes.outputs.full_gate }}" == "true" ]]; then
-            mise run gate
+            timed gate
           else
-            mise run check
-            mise run test:rust
+            timed check
+            timed check:client-tier
+            timed check:pyo3-scope
+            for lane in $CI_LANES; do
+              timed "$lane"
+            done
           fi
 
   bifrost:
     name: bifrost
     needs: changes
-    if: needs.changes.outputs.bifrost_only == 'true' && needs.changes.outputs.workflow != 'true'
+    if: needs.changes.outputs.bifrost_only == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -154,6 +174,8 @@ jobs:
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
 
       - name: Install system tools
         run: sudo apt-get update && sudo apt-get install -y ripgrep libcurl4-openssl-dev pkg-config
@@ -164,7 +186,7 @@ jobs:
   rust-client:
     name: rust client (${{ matrix.os }})
     needs: [changes, matrix-plan]
-    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflow == 'true'
+    if: needs.changes.outputs.full_gate == 'true' || needs.changes.outputs.rust_client == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -184,7 +206,7 @@ jobs:
   typescript:
     name: typescript (${{ matrix.os }})
     needs: [changes, matrix-plan]
-    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflow == 'true'
+    if: needs.changes.outputs.full_gate == 'true' || needs.changes.outputs.typescript == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     strategy:
@@ -204,7 +226,7 @@ jobs:
   python:
     name: python (${{ matrix.os }} / py${{ matrix.python-version }})
     needs: [changes, matrix-plan]
-    if: needs.changes.outputs.python == 'true' || needs.changes.outputs.workflow == 'true'
+    if: needs.changes.outputs.full_gate == 'true' || needs.changes.outputs.python == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     strategy:
@@ -284,7 +306,7 @@ jobs:
   docs:
     name: docs
     needs: changes
-    if: needs.changes.outputs.docs == 'true' || needs.changes.outputs.workflow == 'true'
+    if: needs.changes.outputs.full_gate == 'true' || needs.changes.outputs.docs == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -311,7 +333,7 @@ jobs:
   ui:
     name: ui
     needs: changes
-    if: needs.changes.outputs.ui == 'true' || needs.changes.outputs.workflow == 'true'
+    if: needs.changes.outputs.full_gate == 'true' || needs.changes.outputs.ui == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:

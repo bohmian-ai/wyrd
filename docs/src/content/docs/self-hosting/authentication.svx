@@ -65,9 +65,11 @@ The sealing key encrypts IdP client secrets at rest with AES-256-GCM: tenant OID
 Generate a 32-byte key, base64-encoded, and put it in a file:
 
 ```bash
-openssl rand -base64 32 > sealing-key.b64
+(umask 077 && openssl rand -base64 32 > sealing-key.b64)
 export WYRD_SEALING_KEY_FILE=/run/secrets/sealing-key.b64
 ```
+
+The sealing key file and the retained keys file must be regular files readable by their owner only (mode `0600` or `0400`) and no larger than 64 KiB. Boot refuses a group- or world-readable file, a directory or other non-regular path, or an oversized file, and the refusal never includes key material. When you replace either file, write the new content to a temporary file in the same directory with owner-only mode, then `mv` it over the old one, so the server never reads a partial or permissive file.
 
 The file holds base64 that must decode to exactly 32 bytes. Boot fails closed if it decodes to any other length, or if a stored secret needs a sealing key and none is set. Every sealed value records which key sealed it, so the server can hold older keys during a rotation.
 

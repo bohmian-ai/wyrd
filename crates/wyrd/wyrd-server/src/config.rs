@@ -67,14 +67,16 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
-    /// The sealing-key file named by `WYRD_SEALING_KEY_FILE` could not be read.
-    #[error("sealing-key file at {path} could not be read")]
+    /// The sealing-key file named by `WYRD_SEALING_KEY_FILE` or
+    /// `WYRD_SEALING_RETAINED_KEYS_FILE` was refused by
+    /// [`read_secret_file`]: unreadable, not a regular owner-only file, or
+    /// larger than one secret.
+    #[error("sealing-key file at {path} {reason}")]
     ReadSealingKey {
-        /// Path that failed to read.
+        /// Path that was refused.
         path: PathBuf,
-        /// Underlying I/O error.
-        #[source]
-        source: std::io::Error,
+        /// The loader's static refusal; it names no key material.
+        reason: &'static str,
     },
     /// An environment variable is set but contains no value.
     #[error("environment variable {key} is set but empty")]
@@ -3410,8 +3412,14 @@ fn load_signing_key() -> Result<Option<SecretString>, ConfigError> {
 /// `WYRD_SEALING_KEY_FILE` (a path to a mounted secret) is the primary source;
 /// `WYRD_SEALING_KEY_BASE64` (inline base64) is the fallback. The file form is
 /// preferred for the same reason as the signing key. Setting both is a
-/// configuration error. Surrounding whitespace (e.g. a trailing newline in a
-/// mounted secret file) is trimmed; boot decodes the base64 to a 32-byte key.
+/// configuration error. The file is read through [`read_secret_file`], so it
+/// must be a regular, owner-only file no larger than one secret. Surrounding
+/// whitespace (e.g. a trailing newline in a mounted secret file) is trimmed;
+/// boot decodes the base64 to a 32-byte key.
+///
+/// # Errors
+/// Returns [`ConfigError::ConflictingEnvVars`] when both sources are set and
+/// [`ConfigError::ReadSealingKey`] when the file is refused.
 fn load_sealing_key() -> Result<Option<SecretString>, ConfigError> {
     let file = env_opt("WYRD_SEALING_KEY_FILE")?;
     let inline = env_opt("WYRD_SEALING_KEY_BASE64")?;
@@ -3424,8 +3432,8 @@ fn load_sealing_key() -> Result<Option<SecretString>, ConfigError> {
         }),
         (Some(path), None) => {
             let path = PathBuf::from(path);
-            let encoded = std::fs::read_to_string(&path)
-                .map_err(|source| ConfigError::ReadSealingKey { path, source })?;
+            let encoded = read_secret_file(&path)
+                .map_err(|reason| ConfigError::ReadSealingKey { path, reason })?;
             Ok(Some(SecretString::from(encoded.trim().to_owned())))
         }
         (None, Some(encoded)) => Ok(Some(SecretString::from(encoded.trim().to_owned()))),
@@ -3437,12 +3445,13 @@ fn load_sealing_key() -> Result<Option<SecretString>, ConfigError> {
 ///
 /// `WYRD_SEALING_RETAINED_KEYS_FILE` names a mounted file with one base64 key
 /// per line (blank lines ignored); `WYRD_SEALING_RETAINED_KEYS_BASE64` holds a
-/// comma-separated list. Setting both is a configuration error. Boot decodes
-/// and validates each key.
+/// comma-separated list. Setting both is a configuration error. The file is
+/// read through [`read_secret_file`] under the same rules as the active key.
+/// Boot decodes and validates each key.
 ///
 /// # Errors
 /// Returns [`ConfigError::ConflictingEnvVars`] when both sources are set and
-/// [`ConfigError::ReadSealingKey`] when the file cannot be read.
+/// [`ConfigError::ReadSealingKey`] when the file is refused.
 fn load_sealing_retained_keys() -> Result<Vec<SecretString>, ConfigError> {
     let file = env_opt("WYRD_SEALING_RETAINED_KEYS_FILE")?;
     let inline = env_opt("WYRD_SEALING_RETAINED_KEYS_BASE64")?;
@@ -3457,8 +3466,8 @@ fn load_sealing_retained_keys() -> Result<Vec<SecretString>, ConfigError> {
         }
         (Some(path), None) => {
             let path = PathBuf::from(path);
-            let text = std::fs::read_to_string(&path)
-                .map_err(|source| ConfigError::ReadSealingKey { path, source })?;
+            let text = read_secret_file(&path)
+                .map_err(|reason| ConfigError::ReadSealingKey { path, reason })?;
             (text, '\n')
         }
         (None, Some(text)) => (text, ','),
@@ -5386,6 +5395,78 @@ provider = "anthropic"
             assert!(
                 !message.contains(KEY) && !message.contains(&KEY[..8]),
                 "{case} refusal quotes key material: {message}"
+            );
+        }
+    }
+
+    /// Active and retained sealing-key files load only from bounded,
+    /// owner-only regular files, and no refusal quotes key material.
+    ///
+    /// Both files can decrypt every stored provider secret, so they share the
+    /// tenant wrapping key rule: permissive, non-regular, and oversized mounts
+    /// are refused as [`ConfigError::ReadSealingKey`].
+    ///
+    /// # Panics
+    /// Panics when a key file cannot be written, when an owner-only file is
+    /// refused, or when a refused file is accepted, refused with another
+    /// error, or refused with text containing the key.
+    #[test]
+    fn sealing_key_files_require_a_restrictive_regular_bounded_file() {
+        const KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let _guard = ENV_LOCK.lock().expect("environment test lock");
+        let directory = tempfile::tempdir().expect("key temp directory");
+        let owner_only = directory.path().join("owner-only.key");
+        write_key_file(&owner_only, KEY, 0o600);
+        let permissive = directory.path().join("permissive.key");
+        write_key_file(&permissive, KEY, 0o644);
+        let oversized = directory.path().join("oversized.key");
+        write_key_file(&oversized, &KEY.repeat(4096), 0o600);
+
+        temp_env::with_vars(
+            [
+                ("WYRD_SEALING_KEY_FILE", Some(owner_only.as_os_str())),
+                (
+                    "WYRD_SEALING_RETAINED_KEYS_FILE",
+                    Some(owner_only.as_os_str()),
+                ),
+            ],
+            || {
+                let active = load_sealing_key().expect("owner-only active file loads");
+                assert_eq!(
+                    active.map(|key| key.expose_secret().to_owned()).as_deref(),
+                    Some(KEY)
+                );
+                let retained =
+                    load_sealing_retained_keys().expect("owner-only retained file loads");
+                assert_eq!(retained.len(), 1);
+            },
+        );
+
+        for (case, path) in [
+            ("permissive", permissive.as_path()),
+            ("non-regular", directory.path()),
+            ("oversized", oversized.as_path()),
+        ] {
+            temp_env::with_vars(
+                [
+                    ("WYRD_SEALING_KEY_FILE", Some(path.as_os_str())),
+                    ("WYRD_SEALING_RETAINED_KEYS_FILE", Some(path.as_os_str())),
+                ],
+                || {
+                    let active = load_sealing_key().expect_err(case);
+                    let retained = load_sealing_retained_keys().expect_err(case);
+                    for error in [active, retained] {
+                        let message = error.to_string();
+                        assert!(
+                            matches!(error, ConfigError::ReadSealingKey { .. }),
+                            "{case} refusal is a sealing-key read error: {message}"
+                        );
+                        assert!(
+                            !message.contains(KEY) && !message.contains(&KEY[..8]),
+                            "{case} refusal quotes key material: {message}"
+                        );
+                    }
+                },
             );
         }
     }

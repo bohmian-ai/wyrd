@@ -132,9 +132,15 @@ export declare class NativeWyrdTestServer {
 /**
  * Starts a real bound Wyrd test server and mints an admin access token.
  *
+ * `providerBaseUrl` roots every built-in gateway adapter at one local mock
+ * upstream (`OpenAI` under `/v1`), so a TypeScript gateway journey dispatches
+ * over HTTP with the harness's operator credential bindings; without it the
+ * gateway admits and accounts calls but reaches no provider.
+ *
  * # Errors
  *
- * Returns a napi error when server startup, service bootstrap, API-key
- * exchange, or URL discovery fails.
+ * Returns a napi error when `providerBaseUrl` is not an absolute URL, or when
+ * server startup, service bootstrap, API-key exchange, or URL discovery
+ * fails.
  */
-export declare function startTestServer(): NativeWyrdTestServer
+export declare function startTestServer(providerBaseUrl?: string | undefined | null): NativeWyrdTestServer

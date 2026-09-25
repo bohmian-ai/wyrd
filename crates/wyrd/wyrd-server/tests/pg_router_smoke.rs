@@ -374,6 +374,7 @@ async fn oversized_body_returns_413_problem_json() {
     let server = WyrdTestServer::builder()
         .with_limits_for_test(wyrd_server::state::LimitsConfig {
             body_bytes: 10,
+            audio_upload_bytes: 26_214_400,
             timeout: std::time::Duration::from_secs(30),
             concurrency: 1024,
         })
@@ -453,6 +454,13 @@ async fn representative_v1_routes_without_token_all_return_401() {
         ),
         ("GET", "/v1/admin/trusted-issuers"),
         ("GET", "/v1/admin/workload-bindings"),
+        ("GET", "/v1/admin/gateway/provider-credentials"),
+        ("GET", "/v1/admin/gateway/provider-credentials/primary"),
+        ("GET", "/v1/admin/gateway/provider-deployments"),
+        ("GET", "/v1/admin/gateway/provider-deployments/primary"),
+        ("GET", "/v1/admin/gateway/fallback-policy"),
+        ("GET", "/v1/admin/gateway/governance-policy"),
+        ("GET", "/v1/admin/gateway/capture-policy"),
     ];
 
     for (method, path) in routes {

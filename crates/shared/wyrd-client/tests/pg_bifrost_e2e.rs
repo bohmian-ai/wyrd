@@ -1351,9 +1351,11 @@ mod pg_tests {
         srv.shutdown().await.expect("server shutdown");
     }
 
-    /// Proves that an owned SDK batch survives an ambiguous post-receipt deadline,
-    /// retries with its original UUIDv7, and settles after the server deduplicates
-    /// the already-durable append.
+    /// Proves that an ambiguous post-receipt deadline is resolved by the transport
+    /// retry owner alone: the same UUIDv7 is resent inside one sink attempt, the
+    /// server deduplicates the already-durable append, and the exhausted budget
+    /// settles the owner terminally — releasing its bytes and counting the loss
+    /// exactly once instead of leaving a retained owner for a later flush.
     #[tokio::test]
     async fn public_sdk_owned_batch_timeout_retry_deduplicates_and_settles() {
         let srv = WyrdTestServer::builder()
@@ -1405,7 +1407,7 @@ mod pg_tests {
         let client = WyrdClient::with_config(config).expect("public SDK client");
         let transport = BifrostGrpcTransport::connect_with_config(
             &client,
-            BifrostTransportConfig::with_max_frame_retries(0),
+            BifrostTransportConfig::with_max_frame_retries(1),
         )
         .await
         .expect("connect timeout-retry transport");
@@ -1444,63 +1446,38 @@ mod pg_tests {
             ),
             "the deadline must be projected as a retryable ambiguous result: {first_sink_error:?}"
         );
-        let retained = bifrost.metrics();
-        assert!(
-            retained.owned_bytes > 0,
-            "retained batch still owns its bytes: {retained:?}"
-        );
-        assert_eq!(
-            retained.live_batches, 1,
-            "one sealed owner is retained: {retained:?}"
-        );
-        assert_eq!(
-            retained.retry_entries, 1,
-            "one retry entry retains that owner: {retained:?}"
-        );
-        assert_eq!(
-            retained.pending_controls, 0,
-            "the failed flush released its control slot"
-        );
-
-        // The producer owns the retry schedule: early retries land inside the
-        // delayed WAL sync and back off, and a flush while one is scheduled
-        // reports FlushTimeout. Wait for the retained owner to settle instead
-        // of guessing how many backoff steps a fixed delay covers.
-        tokio::time::timeout(Duration::from_secs(15), async {
-            while bifrost.metrics().retry_entries > 0 {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("the retained retry settles once the original append is durable");
-        bifrost
-            .flush()
-            .await
-            .expect("retry resolves the post-receipt ambiguity through durable dedup");
         let attempts = recording.attempts();
-        assert!(attempts.len() >= 2, "one deadline then at least one retry");
-        assert!(
-            attempts.iter().all(|attempt| attempt.0 == attempts[0].0),
-            "every public sink retry used the exact same stable batch ID"
-        );
-        assert!(
-            attempts.iter().all(|attempt| attempt.1 == attempts[0].1),
-            "every retry reused the owned-byte allocation without copying"
+        assert_eq!(
+            attempts.len(),
+            1,
+            "the transport owns every resend, so the queue made one sink attempt: {attempts:?}"
         );
         let settled = bifrost.metrics();
-        assert_eq!(settled.owned_bytes, 0, "durable ACK releases client bytes");
+        assert_eq!(
+            settled.owned_bytes, 0,
+            "the exhausted retry budget releases the owner's bytes: {settled:?}"
+        );
         assert_eq!(
             settled.live_batches, 0,
-            "durable ACK releases the live batch slot"
+            "the exhausted retry budget releases the live batch slot: {settled:?}"
         );
         assert_eq!(
             settled.retry_entries, 0,
-            "durable ACK releases the retry slot"
+            "the queue never becomes a second retry owner: {settled:?}"
         );
         assert_eq!(
             settled.pending_controls, 0,
-            "durable ACK leaves no pending control"
+            "the failed flush released its control slot: {settled:?}"
         );
+        assert_eq!(
+            settled.dropped_rows, 1,
+            "the ambiguous batch is counted lost exactly once: {settled:?}"
+        );
+
+        bifrost
+            .flush()
+            .await
+            .expect("the settled queue has nothing left to flush");
 
         srv.flush_bifrost()
             .await

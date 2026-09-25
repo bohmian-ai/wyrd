@@ -270,6 +270,11 @@ pub enum ServerBootError {
     /// verify Wyrd JWTs.
     #[error("WYRD_SIGNING_KEY is invalid: {0}")]
     SigningKey(String),
+    /// The gateway's policy-enforcing provider transport could not be built,
+    /// so no provider could be reached; boot fails instead of serving a
+    /// gateway that fails every call.
+    #[error("gateway provider transport could not be built: {0}")]
+    GatewayTransport(String),
     /// OIDC discovery for a configured trusted issuer was unavailable after the
     /// bounded retry schedule. Boot fails closed rather than starting with a
     /// silently empty registry; the message surfaces the stable
@@ -1441,17 +1446,40 @@ fn apply_overrides(state: AppState, overrides: StateOverrides) -> AppState {
     state
 }
 
-/// Attach config-derived fields to core state: shutdown token, telemetry, and
-/// limits. Pure/sync (no I/O).
+/// Attach config-derived fields to core state: shutdown token, telemetry,
+/// limits, gateway configuration, and the gateway engine whose HTTP provider
+/// dispatch screens endpoints under the deployment profile. Pure/sync (no I/O).
 fn attach_config_fields(
     state: AppState,
     config: &crate::config::WyrdServerConfig,
     telemetry: Arc<wyrd_telemetry::TelemetryGuard>,
 ) -> Result<AppState, ServerBootError> {
+    let gateway_secret_keys = Arc::new(
+        config
+            .gateway
+            .managed_secret_keys()
+            .map_err(|error| ServerBootError::GatewayTransport(error.to_string()))?,
+    );
     Ok(state
         .with_deployment_profile(config.deployment_profile)
         .with_telemetry(telemetry)
-        .with_limits(config.limits.into_state()))
+        .with_limits(config.limits.into_state())
+        .with_gateway(config.gateway.clone())
+        .with_gateway_secret_keys(Arc::clone(&gateway_secret_keys))
+        .with_gateway_engine(wyrd_gateway::GatewayEngine::new(
+            config
+                .gateway
+                .credential_resolver(gateway_secret_keys)
+                .map_err(|error| ServerBootError::GatewayTransport(error.to_string()))?,
+            wyrd_gateway::DeploymentHealth::default(),
+            Arc::new(
+                wyrd_gateway::HttpProviderDispatch::new(
+                    wyrd_gateway::EndpointPolicy::new(config.deployment_profile.is_production()),
+                    wyrd_gateway::BuiltinEndpoints::default(),
+                )
+                .map_err(|error| ServerBootError::GatewayTransport(error.to_string()))?,
+            ),
+        )))
 }
 
 /// Install Wyrd's own auth handles: build resolvers, construct issuing key +

@@ -10,5 +10,6 @@
 
 pub mod auth;
 pub mod cards;
+pub mod gateway;
 pub mod platform;
 pub mod storage;

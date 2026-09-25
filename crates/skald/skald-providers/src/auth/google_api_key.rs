@@ -2,6 +2,7 @@
 
 use std::fmt;
 
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use secrecy::{ExposeSecret, SecretString};
 use url::Url;
 
@@ -57,13 +58,27 @@ impl GoogleApiKeyAuth {
         &self.base_url
     }
 
-    /// Adds the API key as a `key` query parameter.
-    pub fn url_with_key(&self, path: &str) -> ProviderResult<String> {
-        let mut url = Url::parse(&format!("{}{}", self.base_url, path))
+    /// Returns the URL of `path` under the base URL.
+    pub fn url(&self, path: &str) -> String {
+        format!("{}{}", self.base_url, path)
+    }
+
+    /// Builds the sensitive `x-goog-api-key` header.
+    ///
+    /// The key never enters the URL, where transport errors and access logs
+    /// would record it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::Decode`] when the key is not a valid header
+    /// value.
+    pub fn headers(&self) -> ProviderResult<HeaderMap> {
+        let mut value = HeaderValue::from_str(self.api_key.expose_secret())
             .map_err(|error| ProviderError::decode("google", error))?;
-        url.query_pairs_mut()
-            .append_pair("key", self.api_key.expose_secret());
-        Ok(url.to_string())
+        value.set_sensitive(true);
+        let mut headers = HeaderMap::new();
+        headers.insert(HeaderName::from_static("x-goog-api-key"), value);
+        Ok(headers)
     }
 }
 

@@ -320,7 +320,7 @@ async fn generated_grpc_and_scheduled_queries_share_audit_terminal_and_cleanup()
 ///
 /// Returns the last `/readyz` body when readiness does not arrive within the
 /// bounded window, so the failing probe and its reason code are visible.
-async fn await_server_ready(base: &str) -> Result<(), ServerJourneyError> {
+pub(super) async fn await_server_ready(base: &str) -> Result<(), ServerJourneyError> {
     let deadline = std::time::Instant::now() + READINESS_CEILING;
     let mut last = String::new();
     while std::time::Instant::now() < deadline {

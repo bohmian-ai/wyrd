@@ -100,6 +100,63 @@ mod pg_tests {
             );
         }
 
+        /// The staging constraint admits exactly the five principal kinds.
+        ///
+        /// Every approved kind appends through the canonical path, and a row
+        /// copied from a staged decision but relabelled `system` is refused by
+        /// `audit_staging_principal_kind_check`, so no reserved internal kind
+        /// can enter the chain.
+        #[tokio::test]
+        async fn principal_kind_check_admits_exactly_the_five_kinds() {
+            let (fixture, superuser, tenant) = setup().await;
+            for kind in [
+                PrincipalKindTag::GlobalAdmin,
+                PrincipalKindTag::TenantAdmin,
+                PrincipalKindTag::User,
+                PrincipalKindTag::Service,
+                PrincipalKindTag::Agent,
+            ] {
+                let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
+                    .await
+                    .unwrap();
+                vala_sql::queries::audit_staging::append_audit(
+                    &mut conn,
+                    &AuditEvent {
+                        principal_kind: kind,
+                        ..event(kind.as_str())
+                    },
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{} must be admitted: {error}", kind.as_str()));
+                conn.commit().await.unwrap();
+            }
+
+            let mut tx = superuser.begin().await.unwrap();
+            sqlx::query(
+                "CREATE TEMP TABLE relabelled ON COMMIT DROP AS
+                 SELECT * FROM vala.audit_staging WHERE data_tenant_id = $1 AND seq = 5",
+            )
+            .bind(tenant.as_uuid())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            sqlx::query("UPDATE relabelled SET principal_kind = 'system', seq = 6")
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            let refused = sqlx::query("INSERT INTO vala.audit_staging SELECT * FROM relabelled")
+                .execute(&mut *tx)
+                .await
+                .expect_err("the system kind must be refused");
+            assert_eq!(
+                refused
+                    .as_database_error()
+                    .and_then(|error| error.constraint()),
+                Some("audit_staging_principal_kind_check"),
+                "{refused}"
+            );
+        }
+
         /// A written audit row can be retired, but never rewritten.
         #[tokio::test]
         async fn immutability_trigger_rejects_content_update() {

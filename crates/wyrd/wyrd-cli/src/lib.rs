@@ -13,6 +13,7 @@ mod cli;
 mod client;
 pub mod error;
 mod eval;
+pub mod gateway;
 pub mod load;
 mod platform;
 mod principal;

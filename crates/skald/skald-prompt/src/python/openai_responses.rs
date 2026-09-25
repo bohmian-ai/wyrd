@@ -52,13 +52,15 @@ impl PyOpenAiResponsesRequest {
     fn model(&self) -> &str {
         &self.req().model
     }
+    /// Input items; text shorthand input is shown as its one user message.
     #[getter]
     fn input(&self) -> Vec<PyOpenAiResponseItem> {
-        let n = self.req().input.len();
-        (0..n)
-            .map(|i| PyOpenAiResponseItem {
-                inner: Arc::clone(&self.inner),
-                index: i,
+        self.req()
+            .input
+            .items()
+            .iter()
+            .map(|item| PyOpenAiResponseItem {
+                value: item.clone(),
             })
             .collect()
     }
@@ -524,17 +526,22 @@ impl PyOpenAiResponsesShellToolChoice {
     }
 }
 
+/// Python projection of one `OpenAI` Responses input item.
+///
+/// Owns a copy of the item rather than indexing the shared request, because
+/// text shorthand input has no stored item: `OpenAiResponsesRequest.input`
+/// materializes it as one user message, so every returned item stays valid
+/// independently of the request it came from.
 #[pyclass(module = "wyrd.prompt", name = "OpenAiResponseItem")]
 pub struct PyOpenAiResponseItem {
-    inner: Arc<ProviderRequest>,
-    index: usize,
+    /// The item, copied out of the request because text shorthand input has no
+    /// stored item to index.
+    value: OpenAiResponseItem,
 }
 impl PyOpenAiResponseItem {
+    /// The wrapped item.
     fn i(&self) -> &OpenAiResponseItem {
-        match self.inner.as_ref() {
-            ProviderRequest::OpenAiResponses(r) => &r.input[self.index],
-            _ => unreachable!(),
-        }
+        &self.value
     }
 }
 #[pymethods]

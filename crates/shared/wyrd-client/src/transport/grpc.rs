@@ -25,6 +25,8 @@ pub struct GrpcConnection {
     channel: Channel,
     auth: Arc<AuthMiddleware>,
     max_message_bytes: usize,
+    /// Deadline the endpoint applies to every call on this channel.
+    call_timeout: Duration,
 }
 
 impl std::fmt::Debug for GrpcConnection {
@@ -32,6 +34,7 @@ impl std::fmt::Debug for GrpcConnection {
         f.debug_struct("GrpcConnection")
             .field("auth", &self.auth)
             .field("max_message_bytes", &self.max_message_bytes)
+            .field("call_timeout", &self.call_timeout)
             .finish_non_exhaustive()
     }
 }
@@ -72,6 +75,7 @@ impl GrpcConnection {
                         channel,
                         auth,
                         max_message_bytes: config.max_message_bytes,
+                        call_timeout: Duration::from_millis(config.timeout_ms),
                     });
                 }
                 Err(err) => {
@@ -120,6 +124,16 @@ impl GrpcConnection {
     #[must_use]
     pub fn max_message_bytes(&self) -> usize {
         self.max_message_bytes
+    }
+
+    /// Return the per-call deadline the endpoint applies to every call.
+    ///
+    /// A caller that bounds several calls on this channel, such as a retrying
+    /// transport, sizes its own deadline from this value instead of restating
+    /// [`GrpcConfig::timeout_ms`].
+    #[must_use]
+    pub fn call_timeout(&self) -> Duration {
+        self.call_timeout
     }
 }
 

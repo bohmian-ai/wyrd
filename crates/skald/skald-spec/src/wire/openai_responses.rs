@@ -1,13 +1,20 @@
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::wire::common::TokenUsage;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// `OpenAI` Responses API request body carried by a prompt or gateway call.
+///
+/// `input` keeps the form the author or caller sent, either text shorthand or
+/// an item list, so the request serializes back without reshaping.
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct OpenAiResponsesRequest {
     pub model: String,
-    pub input: Vec<OpenAiResponseItem>,
+    /// Conversation input, in the text or item form the author or caller sent.
+    pub input: OpenAiResponsesInput,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -266,6 +273,66 @@ pub enum OpenAiResponsesShellToolKind {
     Shell,
 }
 
+/// OpenAI Responses `input`: the text shorthand for one user message, or an
+/// ordered list of input items.
+///
+/// Both forms decode and re-encode unchanged, so a relayed request keeps the
+/// form its caller sent. Editing the conversation first expands the text
+/// shorthand into the single user message it stands for.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(untagged)]
+pub enum OpenAiResponsesInput {
+    /// Text shorthand for one user message carrying one `input_text` part.
+    Text(String),
+    /// Ordered input items.
+    Items(Vec<OpenAiResponseItem>),
+}
+
+impl OpenAiResponsesInput {
+    /// The input as items: the items themselves, or the one user message the
+    /// text shorthand stands for.
+    #[must_use]
+    pub fn items(&self) -> Cow<'_, [OpenAiResponseItem]> {
+        match self {
+            Self::Text(text) => Cow::Owned(vec![Self::user_message(text.clone())]),
+            Self::Items(items) => Cow::Borrowed(items),
+        }
+    }
+
+    /// Mutable items, expanding the text shorthand into its one user message
+    /// first so edits apply to the equivalent item form.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: the text form is replaced by the item form before
+    /// the items are borrowed.
+    pub fn items_mut(&mut self) -> &mut Vec<OpenAiResponseItem> {
+        if let Self::Text(text) = self {
+            *self = Self::Items(vec![Self::user_message(std::mem::take(text))]);
+        }
+        match self {
+            Self::Items(items) => items,
+            Self::Text(_) => unreachable!("the text shorthand was expanded above"),
+        }
+    }
+
+    /// The user message equivalent to the text shorthand `text`.
+    fn user_message(text: String) -> OpenAiResponseItem {
+        OpenAiResponseItem::Message {
+            role: "user".to_owned(),
+            content: vec![OpenAiResponseContentPart::InputText { text }],
+        }
+    }
+}
+
+impl From<Vec<OpenAiResponseItem>> for OpenAiResponsesInput {
+    /// Wraps `items` as the item form.
+    fn from(items: Vec<OpenAiResponseItem>) -> Self {
+        Self::Items(items)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -466,4 +533,48 @@ pub enum OpenAiResponsesStreamEvent {
     ResponseCompleted { response: OpenAiResponsesResponse },
     #[serde(rename = "response.failed")]
     ResponseFailed { response: OpenAiResponsesResponse },
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{OpenAiResponseContentPart, OpenAiResponseItem, OpenAiResponsesRequest};
+
+    /// Both `input` forms re-encode exactly as sent, and editing text
+    /// shorthand expands it into the user message it stands for first.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a form does not round-trip or the expansion differs.
+    #[test]
+    fn responses_input_keeps_its_form_until_edited() {
+        let items = json!([{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}]);
+        for input in [json!("hi"), items.clone()] {
+            let body = json!({"model": "m", "input": input, "truncation": "auto"});
+            let request: OpenAiResponsesRequest =
+                serde_json::from_value(body.clone()).expect("both input forms decode");
+            assert_eq!(serde_json::to_value(&request).expect("encodes"), body);
+            assert_eq!(
+                serde_json::to_value(request.input.items()).expect("encodes"),
+                items
+            );
+        }
+
+        let mut request: OpenAiResponsesRequest =
+            serde_json::from_value(json!({"model": "m", "input": "hi"})).expect("decodes");
+        request.input.items_mut().push(OpenAiResponseItem::Message {
+            role: "assistant".to_owned(),
+            content: vec![OpenAiResponseContentPart::OutputText {
+                text: "hello".to_owned(),
+            }],
+        });
+        assert_eq!(
+            serde_json::to_value(&request.input).expect("encodes"),
+            json!([
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hello"}]}
+            ])
+        );
+    }
 }

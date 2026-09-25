@@ -6,7 +6,7 @@ use vala_sql::queries::audit_staging::{
 use wyrd_server::audit::publication::{AuditPublisher, PublishOutcome};
 use wyrd_server::oracle::PostgresPeerSecurityAudit;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
+use wyrd_spec::auth::{GATEWAY_CAPTURE_PRINCIPAL, PrincipalId, PrincipalKindTag};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
@@ -16,7 +16,7 @@ use wyrd_spec::vala::api::{
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_testing::WyrdTestServer;
 
-use super::query::{ServerJourneyError, scheduled_context};
+use super::query::{ServerJourneyError, await_server_ready, scheduled_context};
 
 /// Retained history this journey reads back.
 const AUDIT_LOG: &str = "vala.system.audit_log";
@@ -108,8 +108,20 @@ async fn append_decision(
     tenant: DataTenantId,
     operation: &str,
 ) -> Result<i64, ServerJourneyError> {
+    append_event(server, tenant, &decision(operation)).await
+}
+
+/// Appends one prepared authorization decision through the production writer.
+///
+/// # Errors
+/// Returns the Postgres or RLS failure the tenant-scoped append raised.
+async fn append_event(
+    server: &WyrdTestServer,
+    tenant: DataTenantId,
+    event: &AuditEvent,
+) -> Result<i64, ServerJourneyError> {
     let mut conn = server.tenant_conn_for(tenant).await?;
-    let seq = append_audit(&mut conn, &decision(operation)).await?;
+    let seq = append_audit(&mut conn, event).await?;
     conn.commit().await?;
     Ok(seq)
 }
@@ -324,6 +336,9 @@ async fn frozen_bound(
 #[ignore = "requires the serialized Postgres-backed journey lane"]
 async fn frozen_audit_range_replays_once_while_its_tail_waits() -> Result<(), ServerJourneyError> {
     let server = WyrdTestServer::start_bound().await?;
+    // The strict retained-history reads below need Oracle and Scribe serving,
+    // which `/healthz` does not promise; querying earlier fails visibility.
+    await_server_ready(server.base_url().ok_or("missing HTTP URL")?).await?;
     let tenant = server.data_tenant_id();
     let suffix = uuid::Uuid::now_v7().simple().to_string();
     let frozen_op = format!("wyrd.journey.audit_frozen.{suffix}");
@@ -606,6 +621,44 @@ async fn a_stalled_tenant_does_not_block_another_tenants_history() -> Result<(),
     fence.commit().await?;
     await_retained(&server, stalled, &stalled_op, 1).await?;
     await_drained(&server, stalled).await?;
+
+    server.shutdown().await?;
+    Ok(())
+}
+
+/// A tenant's gateway capture decision publishes and does not hold later
+/// history back.
+///
+/// Gateway capture authenticates to Bifrost as the reserved tenant-bound
+/// card-free Service principal, so its Gate decision stages under that
+/// reserved id with `principal_kind = 'service'`. The publisher projects a
+/// frozen range before settling it; a projection that refused the decision
+/// would fail every retry, pin the watermark, and keep every later decision of
+/// the tenant out of retained history. The journey stages a capture decision
+/// and then a user decision through the production writer, and both must
+/// retain once while the tenant's staging drains to zero.
+///
+/// # Errors
+/// Returns the server, Postgres, publication, or query failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn gateway_capture_decisions_publish_ahead_of_later_history() -> Result<(), ServerJourneyError>
+{
+    let server = WyrdTestServer::start_bound().await?;
+    let tenant = server.data_tenant_id();
+    let suffix = uuid::Uuid::now_v7().simple().to_string();
+    let capture_op = format!("wyrd.journey.audit_capture.{suffix}");
+    let user_op = format!("wyrd.journey.audit_user.{suffix}");
+
+    let mut capture = decision(&capture_op);
+    capture.principal_id = GATEWAY_CAPTURE_PRINCIPAL;
+    capture.principal_kind = PrincipalKindTag::Service;
+    append_event(&server, tenant, &capture).await?;
+    append_decision(&server, tenant, &user_op).await?;
+
+    await_retained(&server, tenant, &capture_op, 1).await?;
+    await_retained(&server, tenant, &user_op, 1).await?;
+    await_drained(&server, tenant).await?;
 
     server.shutdown().await?;
     Ok(())

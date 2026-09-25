@@ -16,6 +16,7 @@ PUBLIC_MODULE_STUBS = {
     "client.pyi": PACKAGE_DIR / "client" / "__init__.pyi",
     "config.pyi": PACKAGE_DIR / "config" / "__init__.pyi",
     "data.pyi": PACKAGE_DIR / "data" / "__init__.pyi",
+    "gateway.pyi": PACKAGE_DIR / "gateway" / "__init__.pyi",
     "model.pyi": PACKAGE_DIR / "model" / "__init__.pyi",
     "observe.pyi": PACKAGE_DIR / "observe" / "__init__.pyi",
     "observer.pyi": PACKAGE_DIR / "observer.pyi",

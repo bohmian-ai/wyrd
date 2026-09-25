@@ -56,4 +56,9 @@ crates/vala/vala-bifrost-redux/benches/reports/*.json
 **/.vitest/
 .omp
 *.node
-openapi.yaml.tmp
+
+# Local mise configuration: carries operator credentials for the opt-in live
+# provider smoke lane and must never be committed.
+mise.local.toml
+.mise.local.toml
+mise.*.local.toml

@@ -2,6 +2,7 @@
 
 use iceberg::NamespaceIdent;
 
+/// Closed set of Bifrost logical namespaces a table may belong to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BifrostNamespace {
     Audit,
@@ -13,12 +14,14 @@ pub enum BifrostNamespace {
     Drift,
     Dev,
     Datasets, // Redux-only variant for dynamic table namespace
+    /// Gateway capture tables such as `vala.gateway.calls`.
+    Gateway,
 }
 
 impl BifrostNamespace {
     /// All known namespaces. Adding a variant here causes a compile error at every
     /// `match` that is missing a branch — the exhaustiveness guard.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Audit,
         Self::Bifrost,
         Self::Traces,
@@ -28,6 +31,7 @@ impl BifrostNamespace {
         Self::Drift,
         Self::Dev,
         Self::Datasets,
+        Self::Gateway,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -41,6 +45,7 @@ impl BifrostNamespace {
             Self::Drift => "vala.drift",
             Self::Dev => "vala.dev",
             Self::Datasets => "vala.datasets",
+            Self::Gateway => "vala.gateway",
         }
     }
 
@@ -63,6 +68,7 @@ impl BifrostNamespace {
             "drift" => Some(Self::Drift),
             "dev" => Some(Self::Dev),
             "datasets" => Some(Self::Datasets),
+            "gateway" => Some(Self::Gateway),
             _ => None,
         }
     }

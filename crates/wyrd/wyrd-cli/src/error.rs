@@ -387,12 +387,13 @@ impl WyrdCliError {
 pub enum CliBoundaryError {
     /// A derive-catalogued failure owned by the local CLI.
     Local(WyrdCliError),
-    /// An Oracle query failure already projected onto the shared catalog.
+    /// A server or shared-client failure already projected onto the shared
+    /// catalog, such as an Oracle query or gateway administration error.
     ///
     /// The SDK owns that projection, so the binary boundary reads its stable
     /// metadata straight off the catalog error instead of keeping a second
     /// per-variant table here.
-    Query(wyrd_spec::error::WyrdError),
+    Remote(wyrd_spec::error::WyrdError),
 }
 
 impl From<WyrdCliError> for CliBoundaryError {
@@ -405,7 +406,14 @@ impl From<WyrdCliError> for CliBoundaryError {
 impl From<wyrd_client::bifrost::BifrostClientError> for CliBoundaryError {
     /// Projects an originating query SDK error onto the shared catalog.
     fn from(error: wyrd_client::bifrost::BifrostClientError) -> Self {
-        Self::Query(wyrd_spec::error::WyrdError::from(error))
+        Self::Remote(wyrd_spec::error::WyrdError::from(error))
+    }
+}
+
+impl From<wyrd_spec::error::WyrdError> for CliBoundaryError {
+    /// Preserves an originating shared-catalog error from a client handle.
+    fn from(error: wyrd_spec::error::WyrdError) -> Self {
+        Self::Remote(error)
     }
 }
 
@@ -415,7 +423,7 @@ impl CliBoundaryError {
     pub fn code(&self) -> &str {
         match self {
             Self::Local(error) => error.code(),
-            Self::Query(error) => error.code(),
+            Self::Remote(error) => error.code(),
         }
     }
 
@@ -424,7 +432,7 @@ impl CliBoundaryError {
     pub fn status(&self) -> u16 {
         match self {
             Self::Local(error) => error.status(),
-            Self::Query(error) => error.status(),
+            Self::Remote(error) => error.status(),
         }
     }
 
@@ -433,7 +441,7 @@ impl CliBoundaryError {
     pub fn title(&self) -> &str {
         match self {
             Self::Local(error) => error.title(),
-            Self::Query(error) => error.title(),
+            Self::Remote(error) => error.title(),
         }
     }
 
@@ -442,7 +450,7 @@ impl CliBoundaryError {
     pub fn detail(&self) -> String {
         match self {
             Self::Local(error) => error.to_string(),
-            Self::Query(error) => error
+            Self::Remote(error) => error
                 .as_problem_json()
                 .get("detail")
                 .and_then(serde_json::Value::as_str)
@@ -456,7 +464,7 @@ impl CliBoundaryError {
     pub fn remediation(&self) -> &str {
         match self {
             Self::Local(error) => error.remediation(),
-            Self::Query(error) => error.remediation(),
+            Self::Remote(error) => error.remediation(),
         }
     }
 
@@ -465,7 +473,7 @@ impl CliBoundaryError {
     pub fn details(&self) -> Option<serde_json::Value> {
         match self {
             Self::Local(_) => None,
-            Self::Query(error) => error.as_problem_json().get("details").cloned(),
+            Self::Remote(error) => error.as_problem_json().get("details").cloned(),
         }
     }
 
@@ -474,7 +482,7 @@ impl CliBoundaryError {
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::Local(error) => error.exit_code(),
-            Self::Query(error) => match error.status() {
+            Self::Remote(error) => match error.status() {
                 400 => 64,
                 422 => 65,
                 _ => 1,

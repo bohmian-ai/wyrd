@@ -22,7 +22,7 @@ pub use card_scope::CardScope;
 pub use issue_key::{IssueKeyRequest, IssueKeyResponse};
 pub use oidc::{AbsoluteUrl, CallbackQuery, IssuerUrl, LoginInitResponse, UrlParseError};
 pub use permission_scope::{
-    BifrostPermissionScope, BifrostSchemaScope, BifrostTableScope, PermissionScope,
+    BifrostPermissionScope, BifrostSchemaScope, BifrostTableScope, GatewayAccess, PermissionScope,
     PermissionScopeError,
 };
 pub use platform_identity::{
@@ -31,7 +31,7 @@ pub use platform_identity::{
     PlatformPrincipalListResponse, PlatformPrincipalSummary, RegisterPlatformAdminRequest,
     RegisterPlatformAdminResponse, SetPlatformPrincipalStatusRequest,
 };
-pub use principal_id::{PLATFORM_AUDIT_PRINCIPAL, PrincipalId};
+pub use principal_id::{GATEWAY_CAPTURE_PRINCIPAL, PLATFORM_AUDIT_PRINCIPAL, PrincipalId};
 pub use principal_kind::PrincipalKindTag;
 pub use revoke::{REASON_MAX_BYTES, RevokePrincipalRequest};
 pub use secret_bearer::SecretBearer;

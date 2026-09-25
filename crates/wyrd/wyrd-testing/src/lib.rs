@@ -16,6 +16,3 @@ pub use server::{
     materialize_test_peer_config, server_postgres_from_fixture,
 };
 pub use time::ClockHandle;
-
-#[cfg(feature = "python")]
-pub mod python;

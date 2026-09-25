@@ -3339,15 +3339,18 @@
       ],
       "properties": {
         "file_uri": {
+          "description": "File URI; decodes from `file_uri` or `fileUri`.",
           "type": "string"
         },
         "mime_type": {
+          "description": "Media type; decodes from `mime_type` or `mimeType`.",
           "type": "string"
         }
       },
       "additionalProperties": false
     },
     "GoogleFunctionCall": {
+      "description": "Function call the model requested.\n\nDecoding is deliberately permissive (no `deny_unknown_fields`): Gemini and Vertex add members such as call identifiers and thought signatures, which are ignored rather than failing the whole answer.",
       "type": "object",
       "required": [
         "args",
@@ -3358,8 +3361,7 @@
         "name": {
           "type": "string"
         }
-      },
-      "additionalProperties": false
+      }
     },
     "GoogleFunctionCallingConfig": {
       "type": "object",
@@ -3625,69 +3627,17 @@
           "type": "string"
         },
         "mime_type": {
+          "description": "Media type; decodes from `mime_type` or `mimeType`.",
           "type": "string"
         }
       },
       "additionalProperties": false
     },
     "GooglePart": {
+      "description": "One content part.\n\nDecoding is untagged and tries variants in declaration order, so `Thought` precedes `Text`: a part carrying both `thought` and `text` is reasoning, not visible text. Structured variants accept the snake_case names Skald emits and the camelCase names Gemini and Vertex return.",
       "anyOf": [
         {
-          "type": "object",
-          "required": [
-            "text"
-          ],
-          "properties": {
-            "text": {
-              "type": "string"
-            }
-          }
-        },
-        {
-          "type": "object",
-          "required": [
-            "inline_data"
-          ],
-          "properties": {
-            "inline_data": {
-              "$ref": "#/definitions/GoogleInlineData"
-            }
-          }
-        },
-        {
-          "type": "object",
-          "required": [
-            "file_data"
-          ],
-          "properties": {
-            "file_data": {
-              "$ref": "#/definitions/GoogleFileData"
-            }
-          }
-        },
-        {
-          "type": "object",
-          "required": [
-            "function_call"
-          ],
-          "properties": {
-            "function_call": {
-              "$ref": "#/definitions/GoogleFunctionCall"
-            }
-          }
-        },
-        {
-          "type": "object",
-          "required": [
-            "function_response"
-          ],
-          "properties": {
-            "function_response": {
-              "$ref": "#/definitions/GoogleFunctionResponse"
-            }
-          }
-        },
-        {
+          "description": "Model reasoning text.",
           "type": "object",
           "required": [
             "text",
@@ -3695,32 +3645,127 @@
           ],
           "properties": {
             "text": {
+              "description": "Reasoning text.",
               "type": "string"
             },
             "thought": {
+              "description": "Reasoning marker the provider sets on thought parts.",
               "type": "boolean"
             }
           }
         },
         {
+          "description": "Visible text.",
+          "type": "object",
+          "required": [
+            "text"
+          ],
+          "properties": {
+            "text": {
+              "description": "Text content.",
+              "type": "string"
+            }
+          }
+        },
+        {
+          "description": "Inline base64 media.",
+          "type": "object",
+          "required": [
+            "inline_data"
+          ],
+          "properties": {
+            "inline_data": {
+              "description": "Media payload; decodes from `inline_data` or `inlineData`.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GoogleInlineData"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "description": "Media referenced by URI.",
+          "type": "object",
+          "required": [
+            "file_data"
+          ],
+          "properties": {
+            "file_data": {
+              "description": "File reference; decodes from `file_data` or `fileData`.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GoogleFileData"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "description": "Function call the model requested.",
+          "type": "object",
+          "required": [
+            "function_call"
+          ],
+          "properties": {
+            "function_call": {
+              "description": "Call; decodes from `function_call` or `functionCall`.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GoogleFunctionCall"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "description": "Function result returned to the model.",
+          "type": "object",
+          "required": [
+            "function_response"
+          ],
+          "properties": {
+            "function_response": {
+              "description": "Result; decodes from `function_response` or `functionResponse`.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GoogleFunctionResponse"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "description": "Code the model generated for execution.",
           "type": "object",
           "required": [
             "executable_code"
           ],
           "properties": {
             "executable_code": {
-              "$ref": "#/definitions/GoogleExecutableCode"
+              "description": "Code; decodes from `executable_code` or `executableCode`.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GoogleExecutableCode"
+                }
+              ]
             }
           }
         },
         {
+          "description": "Result of executing generated code.",
           "type": "object",
           "required": [
             "code_execution_result"
           ],
           "properties": {
             "code_execution_result": {
-              "$ref": "#/definitions/GoogleCodeExecutionResult"
+              "description": "Result; decodes from `code_execution_result` or `codeExecutionResult`.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GoogleCodeExecutionResult"
+                }
+              ]
             }
           }
         }
@@ -7070,6 +7115,22 @@
         "code_interpreter"
       ]
     },
+    "OpenAiResponsesInput": {
+      "description": "OpenAI Responses `input`: the text shorthand for one user message, or an ordered list of input items.\n\nBoth forms decode and re-encode unchanged, so a relayed request keeps the form its caller sent. Editing the conversation first expands the text shorthand into the single user message it stands for.",
+      "anyOf": [
+        {
+          "description": "Text shorthand for one user message carrying one `input_text` part.",
+          "type": "string"
+        },
+        {
+          "description": "Ordered input items.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/OpenAiResponseItem"
+          }
+        }
+      ]
+    },
     "OpenAiResponsesMcpToolChoice": {
       "type": "object",
       "required": [
@@ -7099,7 +7160,7 @@
       ]
     },
     "OpenAiResponsesRequest": {
-      "description": "Native OpenAI Responses generation settings flattened into the request body.",
+      "description": "`OpenAI` Responses API request body carried by a prompt or gateway call.\n\n`input` keeps the form the author or caller sent, either text shorthand or an item list, so the request serializes back without reshaping.",
       "type": "object",
       "required": [
         "input",
@@ -7117,10 +7178,12 @@
           }
         },
         "input": {
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/OpenAiResponseItem"
-          }
+          "description": "Conversation input, in the text or item form the author or caller sent.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/OpenAiResponsesInput"
+            }
+          ]
         },
         "instructions": {
           "type": [

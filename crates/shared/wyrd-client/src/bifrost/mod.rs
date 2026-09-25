@@ -600,6 +600,7 @@ mod sdk {
                 budget.reserve_sealed(3).expect("batch budget"),
             ),
             rows: 1,
+            request_id: None,
         };
 
         let rt = wyrd_runtime::runtime();

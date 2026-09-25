@@ -7,7 +7,7 @@ use std::path::Path;
 use schemars::schema_for;
 use serde_json::{Map, Value, json, to_string_pretty};
 use wyrd_spec::auth::{
-    AbsoluteUrl, CallbackQuery, IssuerUrl, LoginInitResponse, PrincipalKindTag,
+    AbsoluteUrl, CallbackQuery, GatewayAccess, IssuerUrl, LoginInitResponse, PrincipalKindTag,
     RevokePrincipalRequest, TokenRequest, TokenResponse,
 };
 use wyrd_spec::card::agent::AgentSpec;
@@ -42,6 +42,12 @@ use wyrd_spec::card::trigger::{TriggerSchedule, TriggerSource, TriggerSpec};
 use wyrd_spec::card::workflow::WorkflowSpec;
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::gateway::{
+    GatewayAccountingEntryV1, GatewayAttemptSpanFieldsV1, GatewayCallPayloadV1,
+    GatewayCapturePolicy, GatewayCapturePolicyWrite, GatewayFallbackOverride,
+    GatewayFallbackPolicy, GatewayGovernancePolicy, ProviderCredentialView,
+    ProviderCredentialWrite, ProviderDeployment,
+};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::registry::{
     ArtifactInventoryResponse, ArtifactManifestEntry, CardLifecycleStatus, CardLocator,
@@ -195,6 +201,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Phase 4 section 16: shared security primitives.
     write::<SecretRef>(out, golden, "security_secret_ref")?;
     write::<TlsConfig>(out, golden, "security_tls_config")?;
+
+    // Gateway V1 administration, accounting, and capture contracts.
+    write::<GatewayAccess>(out, golden, "auth_gateway_access")?;
+    write::<ProviderCredentialWrite>(out, golden, "gateway_provider_credential_write")?;
+    write::<ProviderCredentialView>(out, golden, "gateway_provider_credential_view")?;
+    write::<ProviderDeployment>(out, golden, "gateway_provider_deployment")?;
+    write::<GatewayFallbackPolicy>(out, golden, "gateway_fallback_policy")?;
+    write::<GatewayFallbackOverride>(out, golden, "gateway_fallback_override")?;
+    write::<GatewayGovernancePolicy>(out, golden, "gateway_governance_policy")?;
+    write::<GatewayCapturePolicyWrite>(out, golden, "gateway_capture_policy_write")?;
+    write::<GatewayCapturePolicy>(out, golden, "gateway_capture_policy")?;
+    write::<GatewayAccountingEntryV1>(out, golden, "gateway_accounting_entry_v1")?;
+    write::<GatewayCallPayloadV1>(out, golden, "gateway_call_payload_v1")?;
+    write::<GatewayAttemptSpanFieldsV1>(out, golden, "gateway_attempt_span_fields_v1")?;
 
     // Stage 3 C2a: Bifrost wire contract (table management + query).
     write::<BifrostTableEntry>(out, golden, "bifrost_table_entry")?;

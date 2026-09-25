@@ -129,6 +129,36 @@ id_type!(
     "Bifrost pod identifier for multi-pod seal coordination.",
     validate_token
 );
+id_type!(
+    ProviderId,
+    "Tenant-visible gateway provider identifier using the canonical Wyrd name grammar.",
+    validate_token
+);
+id_type!(
+    ModelId,
+    "Provider-native gateway model identifier: 1..=255 UTF-8 bytes without control characters.",
+    validate_model_id
+);
+id_type!(
+    ProviderCredentialName,
+    "Tenant-unique gateway provider credential name.",
+    validate_token
+);
+id_type!(
+    ProviderDeploymentName,
+    "Tenant-unique gateway provider deployment name.",
+    validate_token
+);
+id_type!(
+    CredentialBindingName,
+    "Operator-configured gateway credential binding name.",
+    validate_token
+);
+id_type!(
+    SecretBackendName,
+    "Operator-configured external secret backend identity.",
+    validate_token
+);
 
 /// Immutable tenant isolation key used by tenant-scoped Wyrd and Vala rows.
 #[derive(
@@ -271,6 +301,22 @@ fn validate_uuid7(value: &str) -> Result<(), IdError> {
     }
 }
 
+/// Accepts a provider-native model identifier.
+///
+/// Provider catalogs are open-ended, so the grammar only bounds the value to
+/// 1..=255 UTF-8 bytes and rejects control characters; slashes are allowed.
+///
+/// # Errors
+///
+/// Returns [`IdError::InvalidModelId`] for an empty, over-long, or
+/// control-character-bearing value.
+fn validate_model_id(value: &str) -> Result<(), IdError> {
+    if value.is_empty() || value.len() > 255 || value.chars().any(char::is_control) {
+        return Err(IdError::InvalidModelId);
+    }
+    Ok(())
+}
+
 fn validate_opaque(value: &str) -> Result<(), IdError> {
     if value.len() < 8 || value.len() > 256 || value.chars().any(char::is_whitespace) {
         return Err(IdError::InvalidOpaque);
@@ -293,4 +339,7 @@ pub enum IdError {
     /// Opaque identifier was empty, too long, too short, or contained whitespace.
     #[error("opaque identifier is invalid")]
     InvalidOpaque,
+    /// Model identifier was empty, longer than 255 bytes, or held a control character.
+    #[error("model identifier must be 1..=255 UTF-8 bytes without control characters")]
+    InvalidModelId,
 }

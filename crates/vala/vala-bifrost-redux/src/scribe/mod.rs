@@ -1854,6 +1854,19 @@ impl Scribe for ScribeImpl {
         Self::is_ready(self)
     }
 
+    /// Resolves one write destination through Scribe's catalog owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failures of `ScribeImpl::resolve_write_table_uid`.
+    async fn resolve_write_table(
+        &self,
+        tenant: wyrd_spec::ids::DataTenantId,
+        table: &crate::catalog::TableRef,
+    ) -> Result<crate::catalog::TableUid, ScribeError> {
+        self.resolve_write_table_uid(tenant, table).await
+    }
+
     /// Prepares one logical Gate frame and waits for durable completion.
     ///
     /// # Errors

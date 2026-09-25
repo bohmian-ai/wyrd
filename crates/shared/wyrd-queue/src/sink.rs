@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::request_id::RequestId;
 
 /// The server acknowledgement that settles one durable batch identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +102,10 @@ pub struct SealedBatch<G> {
     pub frame: OwnedIpcBytes<G>,
     /// The number of logical rows represented by this frame.
     pub rows: u64,
+    /// Originating request every transport attempt of this frame carries, or
+    /// `None` for a frame coalesced from unrelated rows, which mints one per
+    /// attempt.
+    pub request_id: Option<RequestId>,
 }
 
 impl<G> SealedBatch<G> {
@@ -163,6 +168,8 @@ pub struct BatchReceipt {
     pub bytes: Vec<u8>,
     /// Logical row count.
     pub rows: u64,
+    /// Originating request the settled frame carried.
+    pub request_id: Option<RequestId>,
 }
 
 /// In-memory loopback sink for queue tests.
@@ -171,6 +178,7 @@ pub struct MockSink {
     received: Mutex<Vec<BatchReceipt>>,
     attempted: Mutex<Vec<[u8; 16]>>,
     fail_next: AtomicUsize,
+    terminal_next: AtomicUsize,
 }
 
 impl MockSink {
@@ -183,6 +191,12 @@ impl MockSink {
     /// Arranges for the next `n` sends to return retryable ambiguity.
     pub fn fail_next(&self, n: usize) {
         self.fail_next.store(n, Ordering::SeqCst);
+    }
+
+    /// Arranges for the next `n` sends not already failing retryably to be
+    /// terminally refused.
+    pub fn terminal_next(&self, n: usize) {
+        self.terminal_next.store(n, Ordering::SeqCst);
     }
 
     /// Returns assertion receipts rather than cloneable owned batches.
@@ -212,6 +226,7 @@ impl<G: Send + Sync + 'static> BatchSink<G> for MockSink {
     ///
     /// Returns a retryable service-unavailable error while `fail_next` still
     /// has budget; the queue retains the batch because this sink borrows it.
+    /// Then returns a terminal validation refusal while `terminal_next` does.
     async fn send(&self, batch: &SealedBatch<G>) -> Result<DurableBatchAck, SinkError> {
         self.attempted
             .lock()
@@ -233,11 +248,22 @@ impl<G: Send + Sync + 'static> BatchSink<G> for MockSink {
                 }));
             }
         }
+        if self
+            .terminal_next
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(SinkError::Terminal(WyrdError::Validation {
+                message: "mock sink forced terminal refusal".to_owned(),
+                details: serde_json::json!({ "mock": true }),
+            }));
+        }
         let receipt = BatchReceipt {
             table: batch.table.clone(),
             batch_id: batch.batch_id,
             bytes: batch.bytes().to_vec(),
             rows: batch.rows,
+            request_id: batch.request_id.clone(),
         };
         let ack = DurableBatchAck {
             batch_id: receipt.batch_id,

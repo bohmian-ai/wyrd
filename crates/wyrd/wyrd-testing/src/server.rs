@@ -1,7 +1,8 @@
 //! Real-socket Wyrd server test harness.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -11,13 +12,16 @@ use arrow::datatypes::{DataType, Field, Schema};
 use async_trait::async_trait;
 use axum::body::{Body, to_bytes};
 use axum::http::{HeaderValue, Request, Response, StatusCode, header};
+use base64::Engine as _;
 use chrono::{Duration as ChronoDuration, Utc};
 use ed25519_dalek::VerifyingKey;
 use secrecy::{ExposeSecret, SecretString};
+use tempfile::TempDir;
 use thiserror::Error;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
+use url::Url;
 use uuid::Uuid;
 use vala_bifrost_redux::catalog::{
     BIFROST_CATALOG_NAME, BifrostCatalog, TableRef, TenantTableBinding,
@@ -54,6 +58,7 @@ use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
 use wyrd_crypt::SecretKey;
 use wyrd_dev_fixtures::pg::PgFixture;
+use wyrd_gateway::BuiltinEndpoints;
 #[cfg(test)]
 use wyrd_runtime::PermissionSet;
 use wyrd_runtime::{Permission, PrincipalId, RbacCheck};
@@ -64,7 +69,7 @@ use wyrd_server::boot::issuer::{seed_trusted_issuers, seed_workload_bindings};
 use wyrd_server::components::auth::audit_writer::{AuthzAuditWriter, NoopAuthzAuditWriter};
 use wyrd_server::config::{
     BifrostRuntimeConfig, BifrostRuntimeRole, BifrostTarget, DeploymentProfile, ForgeRuntimeConfig,
-    IssuerEntry, ServeMode, WorkloadBindingEntry,
+    GatewayConfig, GatewayManagedSecretKeys, IssuerEntry, ServeMode, WorkloadBindingEntry,
 };
 use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::query::scheduled::ScheduledQueryCaller;
@@ -263,6 +268,9 @@ struct WyrdTestServerInner {
     _bifrost_data_dir: Arc<tempfile::TempDir>,
     /// Exclusive owner of this server's one Bifrost data root.
     bifrost_data_root: BifrostDataRoot,
+    /// Lifetime guard for the mounted managed-secret key files this server
+    /// loads its tenant keyring from.
+    _managed_secret_key_root: Arc<TempDir>,
     state: AppState,
     router: axum::Router,
     issuing_key: Arc<IssuingKey>,
@@ -549,6 +557,15 @@ pub struct WyrdTestServerBuilder {
     omit_token_verifier: bool,
     /// Optional non-default edge limits applied to the composed `AppState`.
     limits: Option<wyrd_server::state::LimitsConfig>,
+    /// Built-in provider base URLs of an attached HTTP gateway engine; `None`
+    /// keeps the default engine that dispatches nothing.
+    gateway_endpoints: Option<BuiltinEndpoints>,
+    /// Address and token variable the declared test Vault backend uses.
+    ///
+    /// `None` keeps the unreachable default address and the default token
+    /// variable, which is what every journey that never resolves a Vault
+    /// credential wants.
+    gateway_vault_backend: Option<(Url, String)>,
     /// Replace the serve task with a cancellation-resistant test task.
     stalled_drain_for_test: Option<Arc<AtomicBool>>,
     /// Optional bounded drain budget copied into the bound server's config.
@@ -628,6 +645,8 @@ impl Default for WyrdTestServerBuilder {
             readiness_failure: false,
             omit_token_verifier: false,
             limits: None,
+            gateway_endpoints: None,
+            gateway_vault_backend: None,
             stalled_drain_for_test: None,
             shutdown_drain_for_test: None,
             bifrost_storage_io: wyrd_server::config::BifrostStorageIoConfig::default(),
@@ -652,6 +671,9 @@ pub enum WyrdTestServerError {
     /// TCP listener bind failed.
     #[error("test server failed to bind: {0}")]
     Bind(String),
+    /// A Scribe flush failed or did not settle within its bound.
+    #[error("Scribe flush failed: {0}")]
+    Flush(String),
     /// Serve task join failed.
     #[error("test server join failed: {0}")]
     Join(String),
@@ -687,6 +709,7 @@ impl From<WyrdTestServerError> for wyrd_spec::error::WyrdError {
         let msg = err.to_string();
         match err {
             WyrdTestServerError::Start(_)
+            | WyrdTestServerError::Flush(_)
             | WyrdTestServerError::Sql(_)
             | WyrdTestServerError::Http { .. }
             | WyrdTestServerError::Io(_)
@@ -954,11 +977,17 @@ impl WyrdTestServer {
     /// Returns an error when the server has no Scribe or a residue claim
     /// cannot publish.
     pub async fn flush_bifrost(&self) -> Result<(), WyrdTestServerError> {
-        self.inner
-            .state
-            .flush_scribe_for_test()
-            .await
-            .map_err(|error| WyrdTestServerError::Start(error.to_string()))
+        tokio::time::timeout(
+            FLUSH_BIFROST_BOUND,
+            self.inner.state.flush_scribe_for_test(),
+        )
+        .await
+        .map_err(|_| {
+            WyrdTestServerError::Flush(format!(
+                "staged rows did not settle within {FLUSH_BIFROST_BOUND:?}"
+            ))
+        })?
+        .map_err(|error| WyrdTestServerError::Flush(error.to_string()))
     }
 
     /// Freeze every writable generation into an immutable staged member.
@@ -3532,6 +3561,72 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Dispatch gateway calls over HTTP with built-in adapters at `endpoints`.
+    ///
+    /// Default off: an ordinary test server's gateway admits and accounts calls
+    /// but reaches no provider. Journeys that prove public ingress against
+    /// local mock upstreams opt in here. The engine is the production
+    /// composition, with the non-production endpoint policy so loopback mocks
+    /// are reachable and the fixed operator credential bindings as its only
+    /// credential sources.
+    #[must_use]
+    pub fn with_gateway_endpoints_for_test(mut self, endpoints: BuiltinEndpoints) -> Self {
+        self.gateway_endpoints = Some(endpoints);
+        self
+    }
+
+    /// Dispatch gateway calls over HTTP with every built-in adapter rooted at
+    /// one local mock upstream `root`.
+    ///
+    /// `OpenAI` is served under `root`'s `/v1` segment; Anthropic, Gemini, and
+    /// Vertex at `root` itself, where each provider's native paths begin.
+    /// Delegates to [`Self::with_gateway_endpoints_for_test`].
+    #[must_use]
+    pub fn with_gateway_provider_root_for_test(self, root: Url) -> Self {
+        let mut openai = root.clone();
+        openai.set_path("/v1");
+        self.with_gateway_endpoints_for_test(BuiltinEndpoints {
+            openai: Some(openai),
+            anthropic: Some(root.clone()),
+            gemini: Some(root.clone()),
+            vertex: Some(root),
+        })
+    }
+
+    /// Dispatch gateway calls over HTTP with every built-in adapter targeting
+    /// its real provider endpoint.
+    ///
+    /// Only the opt-in live provider smoke lane asks for this: an ordinary
+    /// journey roots the adapters at a local mock with
+    /// [`Self::with_gateway_provider_root_for_test`] and never reaches a real
+    /// provider. Delegates to [`Self::with_gateway_endpoints_for_test`] with
+    /// no overrides, so each adapter keeps its production base URL.
+    #[must_use]
+    pub fn with_live_gateway_providers_for_test(self) -> Self {
+        self.with_gateway_endpoints_for_test(BuiltinEndpoints::default())
+    }
+
+    /// Resolve the declared test Vault backend against `address`, reading its
+    /// token from the environment variable `token_variable`.
+    ///
+    /// Default off: the backend is declared at an unreachable address so a
+    /// server that never resolves a Vault credential still boots with a
+    /// complete, validated configuration, and an unconfigured journey proves
+    /// the unreachable outcome without any override. The ExternalSecret
+    /// journey points it at a real `vault server -dev` listener instead, which
+    /// is the only way to prove the KV v2 read contract end to end. Selecting
+    /// the token variable lets one journey boot a second server against a
+    /// denied token without mutating the process environment.
+    #[must_use]
+    pub fn with_gateway_vault_backend_for_test(
+        mut self,
+        address: Url,
+        token_variable: &str,
+    ) -> Self {
+        self.gateway_vault_backend = Some((address, token_variable.to_owned()));
+        self
+    }
+
     /// Register the test-support MCP context probe in this server's `/mcp`
     /// tool catalog.
     ///
@@ -4406,6 +4501,11 @@ impl WyrdTestServerBuilder {
         })
         .await
         .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        // Mounted key files the tenant keyring loads from; retained by the
+        // server so the paths stay readable for its whole lifetime.
+        let managed_secret_key_root = Arc::new(
+            tempfile::tempdir().map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
+        );
         let query_stream_fault = QueryStreamFaultController::default();
         let query_control_audit_fault =
             wyrd_server::state::QueryControlAuditFaultController::default();
@@ -4420,7 +4520,37 @@ impl WyrdTestServerBuilder {
                 trusted_issuer_resolver: Some(issuer_resolver),
                 workload_binding_resolver: Some(binding_resolver),
                 sealing_key: Some(sealing_key),
-            });
+            })
+            .with_gateway(test_gateway_config(
+                fixture.data_tenant_id(),
+                self.gateway_vault_backend.clone(),
+                managed_secret_key_root.path(),
+            )?);
+        let start = |error: String| WyrdTestServerError::Start(error);
+        let gateway_secret_keys = Arc::new(
+            state
+                .gateway
+                .managed_secret_keys()
+                .map_err(|error| start(error.to_string()))?,
+        );
+        state = state.with_gateway_secret_keys(Arc::clone(&gateway_secret_keys));
+        if let Some(endpoints) = self.gateway_endpoints {
+            let resolver = state
+                .gateway
+                .credential_resolver(gateway_secret_keys)
+                .map_err(|error| start(error.to_string()))?;
+            state = state.with_gateway_engine(wyrd_gateway::GatewayEngine::new(
+                resolver,
+                wyrd_gateway::DeploymentHealth::default(),
+                Arc::new(
+                    wyrd_gateway::HttpProviderDispatch::new(
+                        wyrd_gateway::EndpointPolicy::new(false),
+                        endpoints,
+                    )
+                    .map_err(|error| start(error.to_string()))?,
+                ),
+            ));
+        }
         if let Some(limits) = self.limits {
             state = state.with_limits(limits);
         }
@@ -4442,6 +4572,7 @@ impl WyrdTestServerBuilder {
                 _storage_root: storage_root,
                 _bifrost_data_dir: data_dir,
                 bifrost_data_root,
+                _managed_secret_key_root: managed_secret_key_root,
                 state,
                 router,
                 issuing_key,
@@ -4500,6 +4631,184 @@ impl WyrdTestServerBuilder {
         let srv = self.start_in_process().await?;
         srv.bind().await
     }
+}
+
+/// Bound a journey's Scribe flush settles within.
+///
+/// A flush that cannot settle is a wedged Scribe, not a slow one: without this
+/// bound a journey polling for published rows blocks its caller forever and
+/// reports nothing, so the harness names the failure instead.
+const FLUSH_BIFROST_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Operator binding every test server declares for `Environment` gateway credentials.
+pub const TEST_GATEWAY_CREDENTIAL_BINDING: &str = "test-provider-key";
+
+/// Operator binding every test server declares for Anthropic `Environment`
+/// gateway credentials.
+pub const TEST_GATEWAY_ANTHROPIC_BINDING: &str = "test-anthropic-key";
+
+/// Operator binding every test server declares for Gemini `Environment`
+/// gateway credentials.
+pub const TEST_GATEWAY_GEMINI_BINDING: &str = "test-gemini-key";
+
+/// Operator binding every test server declares for Vertex `Environment`
+/// gateway credentials, used as a static bearer access token.
+pub const TEST_GATEWAY_VERTEX_BINDING: &str = "test-vertex-key";
+
+/// Environment variable every test server's operator bindings read, per
+/// resolution, as the provider key.
+pub const TEST_GATEWAY_PROVIDER_KEY_VARIABLE: &str = "WYRD_TEST_GATEWAY_PROVIDER_KEY";
+
+/// External secret backend every test server declares for gateway credentials.
+pub const TEST_GATEWAY_SECRET_BACKEND: &str = "test-vault";
+
+/// Active managed-secret key version every test server declares.
+pub const TEST_GATEWAY_MANAGED_KEY_VERSION: &str = "v1";
+
+/// Retained managed-secret key version every test server declares beside the
+/// active one, so a journey can prove that rotation keeps older envelopes
+/// readable without reconfiguring the server.
+pub const TEST_GATEWAY_RETIRED_MANAGED_KEY_VERSION: &str = "v0";
+
+/// Deterministic 32-byte managed-secret key of `tenant` at `version`.
+///
+/// Derived rather than random so a restarted server, a second replica, and a
+/// second `WyrdTestServer` over the same tenant all load identical key
+/// material — which is exactly what an operator must distribute — while two
+/// tenants never share a key.
+#[must_use]
+pub fn test_managed_secret_key(tenant: DataTenantId, version: &str) -> [u8; 32] {
+    let mut key = [0_u8; 32];
+    key[..16].copy_from_slice(tenant.as_uuid().as_bytes());
+    for (slot, byte) in key[16..].iter_mut().zip(version.bytes().cycle()) {
+        *slot = byte;
+    }
+    key
+}
+
+/// Writes `tenant`'s managed-secret keyring under `directory` and returns the
+/// operator configuration referencing those files.
+///
+/// The keys go through the ordinary mounted-file `SecretRef` path so journeys
+/// exercise the real operator configuration shape rather than a test-only
+/// injection point, and each file is written owner-only so it satisfies the
+/// same restrictive-mount rule boot enforces in production.
+///
+/// # Errors
+///
+/// Returns [`WyrdTestServerError::Start`] when a key file cannot be written.
+fn materialize_test_managed_secret_keys(
+    directory: &Path,
+    tenant: DataTenantId,
+) -> Result<GatewayManagedSecretKeys, WyrdTestServerError> {
+    let mut versions = BTreeMap::new();
+    for version in [
+        TEST_GATEWAY_MANAGED_KEY_VERSION,
+        TEST_GATEWAY_RETIRED_MANAGED_KEY_VERSION,
+    ] {
+        let path = directory.join(format!("managed-secret-{version}.key"));
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(test_managed_secret_key(tenant, version));
+        std::fs::write(&path, encoded)
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        // Boot holds a mounted wrapping key to the same owner-only rule as any
+        // other mounted secret, so the fixture writes the file an operator
+        // would mount rather than a world-readable one.
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        versions.insert(
+            version.to_owned(),
+            wyrd_spec::security::SecretRef::File {
+                path: path.to_string_lossy().into_owned(),
+            },
+        );
+    }
+    Ok(GatewayManagedSecretKeys {
+        active: TEST_GATEWAY_MANAGED_KEY_VERSION.to_owned(),
+        versions,
+    })
+}
+
+/// Environment variable the declared test Vault backend reads its token from.
+pub const TEST_GATEWAY_VAULT_TOKEN_VARIABLE: &str = "WYRD_TEST_GATEWAY_VAULT_TOKEN";
+
+/// Builds the fixed operator gateway configuration test servers expose.
+///
+/// Tenant journeys can then create `Environment` credentials over the
+/// bindings and `ExternalSecret` credentials under the backend's `openai`
+/// prefix by name without a per-test harness option. Each binding is assigned
+/// to `tenant` for one built-in provider — `openai`, `anthropic`, `gemini`, or
+/// `vertex` — and the backend prefix to `openai`. Every binding reads
+/// [`TEST_GATEWAY_PROVIDER_KEY_VARIABLE`] and the backend token another
+/// variable; neither must exist for administration, which does not resolve
+/// plaintext, and a dispatching journey sets the provider key before calling.
+///
+/// # Errors
+///
+/// Returns [`WyrdTestServerError::Start`] if a fixture name violates the
+/// canonical Wyrd name grammar.
+fn test_gateway_config(
+    tenant: DataTenantId,
+    vault_backend: Option<(Url, String)>,
+    managed_secret_key_root: &Path,
+) -> Result<GatewayConfig, WyrdTestServerError> {
+    let invalid = |error: wyrd_spec::ids::IdError| WyrdTestServerError::Start(error.to_string());
+    let assignment = |provider: &str| {
+        Ok(wyrd_gateway::CredentialAssignment {
+            tenant,
+            provider: wyrd_spec::ids::ProviderId::new(provider).map_err(invalid)?,
+            host: None,
+        })
+    };
+    let binding = |name: &str, provider: &str| {
+        Ok((
+            wyrd_spec::ids::CredentialBindingName::new(name).map_err(invalid)?,
+            wyrd_server::config::GatewayCredentialBinding {
+                secret: wyrd_spec::security::SecretRef::Env {
+                    name: TEST_GATEWAY_PROVIDER_KEY_VARIABLE.to_owned(),
+                },
+                assignment: assignment(provider)?,
+            },
+        ))
+    };
+    Ok(wyrd_server::config::GatewayConfig {
+        credential_bindings: [
+            binding(TEST_GATEWAY_CREDENTIAL_BINDING, "openai")?,
+            binding(TEST_GATEWAY_ANTHROPIC_BINDING, "anthropic")?,
+            binding(TEST_GATEWAY_GEMINI_BINDING, "gemini")?,
+            binding(TEST_GATEWAY_VERTEX_BINDING, "vertex")?,
+        ]
+        .into_iter()
+        .collect(),
+        secret_backends: std::collections::BTreeMap::from([(
+            wyrd_spec::ids::SecretBackendName::new(TEST_GATEWAY_SECRET_BACKEND).map_err(invalid)?,
+            wyrd_server::config::VaultBackendConfig {
+                address: match &vault_backend {
+                    Some((address, _)) => address.clone(),
+                    None => url::Url::parse("http://127.0.0.1:1")
+                        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
+                },
+                mount: "secret".to_owned(),
+                token: wyrd_spec::security::SecretRef::Env {
+                    name: match &vault_backend {
+                        Some((_, variable)) => variable.clone(),
+                        None => TEST_GATEWAY_VAULT_TOKEN_VARIABLE.to_owned(),
+                    },
+                },
+                namespace: None,
+                ca_cert: None,
+                paths: std::collections::BTreeMap::from([(
+                    "openai".to_owned(),
+                    assignment("openai")?,
+                )]),
+            },
+        )]),
+        managed_secret_keys: std::collections::BTreeMap::from([(
+            tenant,
+            materialize_test_managed_secret_keys(managed_secret_key_root, tenant)?,
+        )]),
+    })
 }
 
 /// Mints one complete `bifrost.peer` identity under `directory`.

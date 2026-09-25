@@ -16,7 +16,9 @@
 use std::sync::Arc;
 
 use wyrd_crypt::SealingKeyring;
-use wyrd_sql::queries::auth::{SealedSecretTable, sealed_tenant_secrets, swap_sealed_tenant_secret};
+use wyrd_sql::queries::auth::{
+    SealedSecretTable, sealed_tenant_secrets, swap_sealed_tenant_secret,
+};
 use wyrd_sql::queries::platform::identity::{platform_sealed_secret, swap_platform_sealed_secret};
 use wyrd_sql::{OperatorPool, SqlError};
 

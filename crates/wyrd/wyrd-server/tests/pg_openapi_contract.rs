@@ -173,11 +173,31 @@ async fn identity_connection_operations_publish_their_contract() {
     let document = served_document(&server).await;
     let operations: [(&str, &str, &[&str]); 6] = [
         ("/v1/identity/oidc/connections", "get", &["403", "503"]),
-        ("/v1/identity/oidc/candidate", "put", &["400", "403", "409", "503"]),
-        ("/v1/identity/oidc/candidate/test", "post", &["400", "403", "409", "503"]),
-        ("/v1/identity/oidc/candidate/activate", "post", &["403", "409", "503"]),
-        ("/v1/identity/oidc/active/deactivate", "post", &["403", "404", "503"]),
-        ("/v1/identity/oidc/connections/{id}", "delete", &["403", "404", "503"]),
+        (
+            "/v1/identity/oidc/candidate",
+            "put",
+            &["400", "403", "409", "503"],
+        ),
+        (
+            "/v1/identity/oidc/candidate/test",
+            "post",
+            &["400", "403", "409", "503"],
+        ),
+        (
+            "/v1/identity/oidc/candidate/activate",
+            "post",
+            &["403", "409", "503"],
+        ),
+        (
+            "/v1/identity/oidc/active/deactivate",
+            "post",
+            &["403", "404", "503"],
+        ),
+        (
+            "/v1/identity/oidc/connections/{id}",
+            "delete",
+            &["403", "404", "503"],
+        ),
     ];
     for (path, method, statuses) in operations {
         let operation = &document["paths"][path][method];

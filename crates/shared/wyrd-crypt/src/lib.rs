@@ -196,8 +196,9 @@ impl SealingKeyring {
     /// Returns [`CryptError::Encrypt`] when AES-GCM encryption fails.
     pub fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>, CryptError> {
         let payload = encrypt(&self.write.1, plaintext)?;
-        let mut out =
-            Vec::with_capacity(SEALED_MAGIC.len() + KEY_ID_LEN + NONCE_LEN + payload.ciphertext.len());
+        let mut out = Vec::with_capacity(
+            SEALED_MAGIC.len() + KEY_ID_LEN + NONCE_LEN + payload.ciphertext.len(),
+        );
         out.extend_from_slice(SEALED_MAGIC);
         out.extend_from_slice(&self.write.0.0);
         out.extend_from_slice(&payload.nonce);
@@ -346,20 +347,38 @@ mod tests {
 
         let rotated = SealingKeyring::new(SecretKey::from_bytes([2_u8; 32]))
             .with_retained(SecretKey::from_bytes([1_u8; 32]));
-        assert_eq!(rotated.open(&sealed_old).expect("retained opens"), b"client-secret");
-        assert_eq!(rotated.open(&legacy).expect("legacy opens"), b"legacy-secret");
+        assert_eq!(
+            rotated.open(&sealed_old).expect("retained opens"),
+            b"client-secret"
+        );
+        assert_eq!(
+            rotated.open(&legacy).expect("legacy opens"),
+            b"legacy-secret"
+        );
         assert!(rotated.needs_rewrap(&sealed_old));
         assert!(rotated.needs_rewrap(&legacy));
 
-        let rewrapped = rotated.rewrap(&sealed_old).expect("rewrap").expect("changed");
+        let rewrapped = rotated
+            .rewrap(&sealed_old)
+            .expect("rewrap")
+            .expect("changed");
         let rewrapped_legacy = rotated.rewrap(&legacy).expect("rewrap").expect("changed");
         assert!(!rotated.needs_rewrap(&rewrapped));
         assert_eq!(rotated.rewrap(&rewrapped).expect("rewrap"), None);
 
         let retired = SealingKeyring::new(SecretKey::from_bytes([2_u8; 32]));
-        assert_eq!(retired.open(&rewrapped).expect("new key opens"), b"client-secret");
-        assert_eq!(retired.open(&rewrapped_legacy).expect("new key opens"), b"legacy-secret");
-        assert!(retired.open(&sealed_old).is_err(), "retired key no longer opens");
+        assert_eq!(
+            retired.open(&rewrapped).expect("new key opens"),
+            b"client-secret"
+        );
+        assert_eq!(
+            retired.open(&rewrapped_legacy).expect("new key opens"),
+            b"legacy-secret"
+        );
+        assert!(
+            retired.open(&sealed_old).is_err(),
+            "retired key no longer opens"
+        );
     }
 
     /// Key identifiers are deterministic, key-specific, and the keyring Debug
@@ -372,7 +391,10 @@ mod tests {
         assert_eq!(a.to_string().len(), 16);
         let ring = SealingKeyring::new(SecretKey::from_bytes([5_u8; 32]))
             .with_retained(SecretKey::from_bytes([5_u8; 32]));
-        assert!(ring.retained_key_ids().is_empty(), "write key is not retained twice");
+        assert!(
+            ring.retained_key_ids().is_empty(),
+            "write key is not retained twice"
+        );
         assert!(format!("{ring:?}").contains(&a.to_string()));
     }
 

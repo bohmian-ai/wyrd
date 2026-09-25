@@ -344,8 +344,13 @@ fn principal_kind_from_str(value: &str) -> Result<IssuerTokenPolicy, IssuerDecod
 ///
 /// # Errors
 /// Returns [`IssuerSealError::Encrypt`] when encryption fails.
-pub(crate) fn seal_secret(keyring: &SealingKeyring, plaintext: &[u8]) -> Result<Vec<u8>, IssuerSealError> {
-    keyring.seal(plaintext).map_err(|_| IssuerSealError::Encrypt)
+pub(crate) fn seal_secret(
+    keyring: &SealingKeyring,
+    plaintext: &[u8],
+) -> Result<Vec<u8>, IssuerSealError> {
+    keyring
+        .seal(plaintext)
+        .map_err(|_| IssuerSealError::Encrypt)
 }
 
 /// Open a stored sealed value with whichever held key it names.
@@ -517,9 +522,7 @@ pub fn seal_platform_client_secret(
     match client_auth {
         ClientAuth::SecretBasic(secret) | ClientAuth::SecretPost(secret) => {
             let key = sealing_key.ok_or(IssuerSealError::SealingKeyMissing)?;
-            Ok(Some(
-                seal_secret(key, secret.expose_secret().as_bytes())?,
-            ))
+            Ok(Some(seal_secret(key, secret.expose_secret().as_bytes())?))
         }
         ClientAuth::PrivateKeyJwt | ClientAuth::Public => Ok(None),
     }
@@ -551,9 +554,7 @@ pub fn issuer_write_from_trusted(
     let client_secret_enc = match &issuer.client_auth {
         ClientAuth::SecretBasic(secret) | ClientAuth::SecretPost(secret) => {
             let key = sealing_key.ok_or(IssuerSealError::SealingKeyMissing)?;
-            Some(
-                seal_secret(key, secret.expose_secret().as_bytes())?,
-            )
+            Some(seal_secret(key, secret.expose_secret().as_bytes())?)
         }
         ClientAuth::PrivateKeyJwt | ClientAuth::Public => None,
     };

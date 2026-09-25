@@ -87,9 +87,10 @@ async fn try_initiate_login(
     query: &LoginQuery,
     tenant_id: DataTenantId,
 ) -> Result<Response, WyrdErrorResponse> {
-    let connections = state
-        .auth
-        .human_connections(state.postgres.app_pool(), state.deployment_profile.screened_http());
+    let connections = state.auth.human_connections(
+        state.postgres.app_pool(),
+        state.deployment_profile.screened_http(),
+    );
     let trusted =
         wyrd_auth::callback::active_connection_for(&connections, tenant_id, &query.issuer)
             .await

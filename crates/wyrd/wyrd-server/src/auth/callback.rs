@@ -60,9 +60,10 @@ pub async fn exchange_authorization_code(
             .external_verifier
             .clone()
             .ok_or_else(auth_not_configured)?,
-        connections: state
-            .auth
-            .human_connections(state.postgres.app_pool(), state.deployment_profile.screened_http()),
+        connections: state.auth.human_connections(
+            state.postgres.app_pool(),
+            state.deployment_profile.screened_http(),
+        ),
         http: state.deployment_profile.screened_http(),
     };
     service
@@ -598,9 +599,10 @@ mod pg_tests {
                 .external_verifier
                 .clone()
                 .expect("test state has external verifier"),
-            connections: state
-                .auth
-                .human_connections(state.postgres.app_pool(), state.deployment_profile.screened_http()),
+            connections: state.auth.human_connections(
+                state.postgres.app_pool(),
+                state.deployment_profile.screened_http(),
+            ),
             http: state.deployment_profile.screened_http(),
         }
     }

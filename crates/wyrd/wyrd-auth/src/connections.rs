@@ -22,7 +22,9 @@ use serde_json::Value;
 use sqlx::PgPool;
 use url::Url;
 use uuid::Uuid;
-use wyrd_auth_oidc::{ClientAuth, OidcError, OidcProvider, ScreenError, ScreenedHttp, TrustedIssuer};
+use wyrd_auth_oidc::{
+    ClientAuth, OidcError, OidcProvider, ScreenError, ScreenedHttp, TrustedIssuer,
+};
 use wyrd_crypt::SealingKeyring;
 use wyrd_runtime::Permission;
 use wyrd_spec::DataTenantId;
@@ -143,7 +145,9 @@ impl HumanConnections {
     ) -> Result<HumanConnectionsResponse, WyrdError> {
         let mut conn = self.begin(tenant).await?;
         append_auth_audit(&mut conn, decision).await?;
-        let rows = live_human_connections(&mut conn).await.map_err(store_error)?;
+        let rows = live_human_connections(&mut conn)
+            .await
+            .map_err(store_error)?;
         conn.commit().await.map_err(store_error)?;
 
         let mut response = HumanConnectionsResponse {
@@ -177,11 +181,14 @@ impl HumanConnections {
         input.validate()?;
         let client_secret_enc = match &input.client_secret {
             Some(secret) if input.client_auth.requires_secret() => {
-                let keyring = self.keyring.as_deref().ok_or_else(|| WyrdError::Validation {
-                    message: "a client secret was supplied but no sealing key is configured"
-                        .to_owned(),
-                    details: serde_json::json!({ "reason": "sealing_key_missing" }),
-                })?;
+                let keyring = self
+                    .keyring
+                    .as_deref()
+                    .ok_or_else(|| WyrdError::Validation {
+                        message: "a client secret was supplied but no sealing key is configured"
+                            .to_owned(),
+                        details: serde_json::json!({ "reason": "sealing_key_missing" }),
+                    })?;
                 Some(seal_secret(keyring, secret.expose().as_bytes()).map_err(internal)?)
             }
             _ => None,
@@ -220,9 +227,10 @@ impl HumanConnections {
             mut write,
         } = staged;
         let mut conn = self.begin_locked(tenant, decision).await?;
-        let candidate = human_connection_in_state(&mut conn, HumanConnectionState::Candidate.as_str())
-            .await
-            .map_err(store_error)?;
+        let candidate =
+            human_connection_in_state(&mut conn, HumanConnectionState::Candidate.as_str())
+                .await
+                .map_err(store_error)?;
         let revision_matches = match (&candidate, expected_revision) {
             (Some(row), Some(expected)) => u64::try_from(row.revision).ok() == Some(expected),
             (None, None) => true,
@@ -332,17 +340,15 @@ impl HumanConnections {
     ) -> Result<HumanConnectionView, WyrdError> {
         let recovery_key = request.recovery_api_key.into_secret_string();
         let mut conn = self.begin_locked(tenant, decision).await?;
-        let candidate = human_connection_in_state(&mut conn, HumanConnectionState::Candidate.as_str())
-            .await
-            .map_err(store_error)?;
-        let Some(candidate) = candidate.filter(|row| {
-            u64::try_from(row.revision).ok() == Some(request.expected_revision)
-        }) else {
-            return commit_refusal(
-                conn,
-                conflict("no candidate exists at expected_revision"),
-            )
-            .await;
+        let candidate =
+            human_connection_in_state(&mut conn, HumanConnectionState::Candidate.as_str())
+                .await
+                .map_err(store_error)?;
+        let Some(candidate) = candidate
+            .filter(|row| u64::try_from(row.revision).ok() == Some(request.expected_revision))
+        else {
+            return commit_refusal(conn, conflict("no candidate exists at expected_revision"))
+                .await;
         };
         if !human_candidate_test_is_current(&mut conn, candidate.revision)
             .await
@@ -491,12 +497,15 @@ impl HumanConnections {
     /// # Errors
     /// Returns [`WyrdError::Validation`] naming the missing public origin.
     pub fn require_callback(&self) -> Result<&Url, WyrdError> {
-        self.callback_url.as_ref().ok_or_else(|| WyrdError::Validation {
-            message: "the deployment has no public origin configured (WYRD_PUBLIC_ORIGIN), so no \
+        self.callback_url
+            .as_ref()
+            .ok_or_else(|| WyrdError::Validation {
+                message:
+                    "the deployment has no public origin configured (WYRD_PUBLIC_ORIGIN), so no \
                       callback URL can be registered"
-                .to_owned(),
-            details: serde_json::json!({ "reason": "public_origin_missing" }),
-        })
+                        .to_owned(),
+                details: serde_json::json!({ "reason": "public_origin_missing" }),
+            })
     }
 
     /// Read and open the candidate at `expected_revision` for a network test.
@@ -551,7 +560,10 @@ impl HumanConnections {
                     .is_some_and(|keys| !keys.is_empty())
             });
         if !keys_ok {
-            return Err(not_tested_reason("jwks_unusable", "the provider JWKS has no usable keys"));
+            return Err(not_tested_reason(
+                "jwks_unusable",
+                "the provider JWKS has no usable keys",
+            ));
         }
 
         self.probe_callback(&provider, target, callback).await?;
@@ -649,13 +661,16 @@ impl HumanConnections {
 
     /// Build a screened client for one provider URL.
     async fn client_for(&self, url: &Url) -> Result<reqwest::Client, WyrdError> {
-        self.http.client_for(url).await.map_err(|error| match error {
-            ScreenError::Blocked => WyrdError::Validation {
-                message: "the provider resolves to a blocked address range".to_owned(),
-                details: serde_json::json!({ "field": "issuer" }),
-            },
-            ScreenError::Unresolved | ScreenError::Client => unreachable(error),
-        })
+        self.http
+            .client_for(url)
+            .await
+            .map_err(|error| match error {
+                ScreenError::Blocked => WyrdError::Validation {
+                    message: "the provider resolves to a blocked address range".to_owned(),
+                    details: serde_json::json!({ "field": "issuer" }),
+                },
+                ScreenError::Unresolved | ScreenError::Client => unreachable(error),
+            })
     }
 
     /// Project a stored row to its redacted view.

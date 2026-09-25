@@ -4278,9 +4278,10 @@ impl WyrdTestServerBuilder {
         // client secret on write and decrypts it on read. The production Pg
         // resolvers then serve issuers/bindings per-request, including on the
         // verifier's external (foreign-OIDC) path.
-        let sealing_key = self.sealing_keyring.clone().unwrap_or_else(|| {
-            Arc::new(SealingKeyring::new(SecretKey::from_bytes([9_u8; 32])))
-        });
+        let sealing_key = self
+            .sealing_keyring
+            .clone()
+            .unwrap_or_else(|| Arc::new(SealingKeyring::new(SecretKey::from_bytes([9_u8; 32]))));
         if self.sealing_keyring.is_some() {
             wyrd_auth::sealing::SealedSecretRewrap::new(
                 fixture.operator_pool().clone(),

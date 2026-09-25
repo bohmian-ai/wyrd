@@ -258,13 +258,23 @@ mod pg_tests {
             message.contains(&tenant.as_uuid().to_string()),
             "refusal names the tenant: {message}"
         );
-        assert!(message.contains("Repair:"), "refusal names a repair: {message}");
-        assert!(message.contains(reason), "refusal names the cause: {message}");
+        assert!(
+            message.contains("Repair:"),
+            "refusal names a repair: {message}"
+        );
+        assert!(
+            message.contains(reason),
+            "refusal names the cause: {message}"
+        );
         assert!(
             !message.contains(&String::from_utf8_lossy(secret).into_owned()),
             "refusal never carries the stored secret: {message}"
         );
-        assert_eq!(trusted_issuer_snapshot(pool).await, before, "issuers unchanged");
+        assert_eq!(
+            trusted_issuer_snapshot(pool).await,
+            before,
+            "issuers unchanged"
+        );
         assert_regclass_exists(pool, "wyrd.auth_human_connections", false).await;
         let applied: i64 =
             sqlx::query_scalar("SELECT count(*) FROM wyrd._sqlx_migrations WHERE version = $1")
@@ -336,14 +346,20 @@ mod pg_tests {
             )
             .await;
 
-            wyrd_sql::migrate(pool).await.expect("valid upgrade applies");
+            wyrd_sql::migrate(pool)
+                .await
+                .expect("valid upgrade applies");
 
             let connections: Vec<wyrd_sql::row_types::auth::HumanConnectionRow> =
                 sqlx::query_as("SELECT * FROM wyrd.auth_human_connections ORDER BY issuer_url")
                     .fetch_all(pool)
                     .await
                     .expect("connections read");
-            assert_eq!(connections.len(), 2, "each Human issuer becomes one connection");
+            assert_eq!(
+                connections.len(),
+                2,
+                "each Human issuer becomes one connection"
+            );
             for row in &connections {
                 assert_eq!(row.state, "Active");
                 assert_eq!(row.revision, 1);
@@ -400,11 +416,10 @@ mod pg_tests {
             .await
             .expect("bindings read");
             assert_eq!(bindings, 1, "the workload binding survives");
-            let refused = sqlx::query(
-                "UPDATE wyrd.auth_trusted_issuers SET principal_kind = 'Human'",
-            )
-            .execute(pool)
-            .await;
+            let refused =
+                sqlx::query("UPDATE wyrd.auth_trusted_issuers SET principal_kind = 'Human'")
+                    .execute(pool)
+                    .await;
             assert!(refused.is_err(), "trusted issuers hold workload trust only");
         }
 

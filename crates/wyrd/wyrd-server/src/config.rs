@@ -2909,10 +2909,12 @@ impl WyrdServerConfig {
         }
         if let Some(origin) = env_opt("WYRD_PUBLIC_ORIGIN")? {
             self.auth.public_origin =
-                Some(url::Url::parse(&origin).map_err(|e| ConfigError::BadEnvVar {
-                    key: "WYRD_PUBLIC_ORIGIN".to_string(),
-                    message: e.to_string(),
-                })?);
+                Some(
+                    url::Url::parse(&origin).map_err(|e| ConfigError::BadEnvVar {
+                        key: "WYRD_PUBLIC_ORIGIN".to_string(),
+                        message: e.to_string(),
+                    })?,
+                );
         }
 
         Ok(())

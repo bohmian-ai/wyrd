@@ -94,7 +94,9 @@ pub async fn live_human_connections(
     conn: &mut TenantConn<'_>,
 ) -> Result<Vec<HumanConnectionRow>, SqlError> {
     sqlx::query_as::<_, HumanConnectionRow>(concat!(
-        "SELECT ", columns!(), " FROM wyrd.auth_human_connections \
+        "SELECT ",
+        columns!(),
+        " FROM wyrd.auth_human_connections \
           WHERE removed_at IS NULL ORDER BY revision DESC"
     ))
     .fetch_all(&mut **conn.transaction())
@@ -113,7 +115,9 @@ pub async fn human_connection_in_state(
     state: &str,
 ) -> Result<Option<HumanConnectionRow>, SqlError> {
     sqlx::query_as::<_, HumanConnectionRow>(concat!(
-        "SELECT ", columns!(), " FROM wyrd.auth_human_connections \
+        "SELECT ",
+        columns!(),
+        " FROM wyrd.auth_human_connections \
           WHERE state = $1 AND removed_at IS NULL"
     ))
     .bind(state)
@@ -138,7 +142,9 @@ pub async fn insert_human_candidate(
          VALUES ($1, $2,
                  (SELECT COALESCE(max(revision), 0) + 1 FROM wyrd.auth_human_connections),
                  'Candidate', $3, $4, $5, $6, $7, $8, $9)
-         RETURNING ", columns!(), ""
+         RETURNING ",
+        columns!(),
+        ""
     ))
     .bind(Uuid::now_v7())
     .bind(conn.data_tenant_id().as_uuid())
@@ -174,7 +180,9 @@ pub async fn replace_human_candidate(
              jwks_uri = NULL, tested_revision = NULL, tested_until = NULL,
              updated_at = statement_timestamp()
           WHERE connection_id = $1 AND state = 'Candidate'
-         RETURNING ", columns!(), ""
+         RETURNING ",
+        columns!(),
+        ""
     ))
     .bind(connection_id)
     .bind(&write.issuer_url)
@@ -257,7 +265,9 @@ pub async fn promote_tested_human_candidate(
           WHERE state = 'Candidate' AND revision = $1
             AND tested_revision = revision
             AND tested_until > statement_timestamp()
-         RETURNING ", columns!(), ""
+         RETURNING ",
+        columns!(),
+        ""
     ))
     .bind(revision)
     .fetch_optional(&mut **conn.transaction())

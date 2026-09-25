@@ -1154,8 +1154,10 @@ mod pg_tests {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
         let state = test_state(&fixture).await;
-        let mut request =
-            create_issuer_request(IssuerUrl::new(SEEDED_ISSUER).expect("issuer is valid"), None);
+        let mut request = create_issuer_request(
+            IssuerUrl::new(SEEDED_ISSUER).expect("issuer is valid"),
+            None,
+        );
         request.principal_kind = IssuerTokenPolicy::Human;
 
         let error = create_trusted_issuer(State(state), writer(tenant), Json(request))

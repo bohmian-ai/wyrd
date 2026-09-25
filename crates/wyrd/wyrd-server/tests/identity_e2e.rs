@@ -14,23 +14,23 @@ use wyrd_auth_check::response::AuthzCheckDecision;
 use wyrd_auth_oidc::IssuerConfigResolver;
 use wyrd_auth_verify::WyrdAuthVerifySettings;
 use wyrd_cli::auth::trusted_issuer::{self, AddArgs as TrustedIssuerAddArgs, TrustedIssuerCommand};
-use wyrd_cli::error::WyrdCliError;
-use wyrd_crypt::{SealingKeyring, SecretKey};
-use wyrd_spec::DataTenantId;
-use wyrd_spec::error::WyrdError;
 use wyrd_cli::auth::workload_binding::{
     self, AddArgs as WorkloadBindingAddArgs, WorkloadBindingCommand,
 };
+use wyrd_cli::error::WyrdCliError;
 use wyrd_client::auth::AuthMiddleware;
 use wyrd_client::config::{ClientConfig, TokenCacheMode};
 use wyrd_client::transport::config::HttpConfig;
 use wyrd_client::transport::credential::ResolvedCredential;
+use wyrd_crypt::{SealingKeyring, SecretKey};
 use wyrd_semver::VersionBlock;
 use wyrd_server::config::{ClaimMappingEntry, ClientAuthEntry, IssuerEntry, WorkloadBindingEntry};
+use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
     IssueKeyRequest, IssueKeyResponse, IssuerTokenPolicy, IssuerUrl, TokenAudience,
 };
 use wyrd_spec::envelope::CardKind;
+use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::CardRef;
 use wyrd_testing::{
@@ -844,7 +844,10 @@ async fn call_json(
     let bytes = to_bytes(response.into_body(), 262_144)
         .await
         .expect("body reads");
-    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
 /// A `ConnectionInput` body for the Keycloak realm.
@@ -886,7 +889,12 @@ async fn activate_keycloak_connection(
         &admin.token,
         Method::PUT,
         CANDIDATE,
-        Some(connection_input(client_id, client_auth, client_secret, current)),
+        Some(connection_input(
+            client_id,
+            client_auth,
+            client_secret,
+            current,
+        )),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "candidate stages: {candidate}");
@@ -1098,7 +1106,14 @@ async fn human_oidc_login_journey() {
 
     let srv = human_server().await;
 
-    let token_body = human_login(&srv, &keycloak, PUBLIC_HUMAN_CLIENT, "alice", "alice-password").await;
+    let token_body = human_login(
+        &srv,
+        &keycloak,
+        PUBLIC_HUMAN_CLIENT,
+        "alice",
+        "alice-password",
+    )
+    .await;
     let access_token = token_body["access_token"]
         .as_str()
         .expect("access_token present in response");
@@ -1209,7 +1224,14 @@ async fn revoking_a_human_kills_the_session_refresh_authority() {
     let keycloak = OidcIssuerFixture::connect(&keycloak_issuer()).await;
     let srv = human_server().await;
 
-    let token_body = human_login(&srv, &keycloak, PUBLIC_HUMAN_CLIENT, "alice", "alice-password").await;
+    let token_body = human_login(
+        &srv,
+        &keycloak,
+        PUBLIC_HUMAN_CLIENT,
+        "alice",
+        "alice-password",
+    )
+    .await;
     let access_token = token_body["access_token"]
         .as_str()
         .expect("access_token present")
@@ -1308,7 +1330,14 @@ async fn a_withdrawn_oidc_group_invalidates_the_roles_it_granted() {
     let srv = human_server().await;
 
     // The group grants writer, so the first session's delegated checks allow.
-    let granted = human_login(&srv, &keycloak, PUBLIC_HUMAN_CLIENT, "alice", "alice-password").await;
+    let granted = human_login(
+        &srv,
+        &keycloak,
+        PUBLIC_HUMAN_CLIENT,
+        "alice",
+        "alice-password",
+    )
+    .await;
     let granted_token = granted["access_token"]
         .as_str()
         .expect("access_token present")
@@ -1317,14 +1346,28 @@ async fn a_withdrawn_oidc_group_invalidates_the_roles_it_granted() {
 
     // A second login asserting the same groups changes nothing, so the first
     // session keeps working: re-authenticating must not log a user out.
-    let _unchanged = human_login(&srv, &keycloak, PUBLIC_HUMAN_CLIENT, "alice", "alice-password").await;
+    let _unchanged = human_login(
+        &srv,
+        &keycloak,
+        PUBLIC_HUMAN_CLIENT,
+        "alice",
+        "alice-password",
+    )
+    .await;
     assert_v1_authz_check_ok(&srv, &granted_token, "roles-unchanged").await;
 
     // The provider withdraws the group; the next login persists the reduced set.
     keycloak
         .set_group_membership("alice", "wyrd-admins", false)
         .await;
-    let reduced = human_login(&srv, &keycloak, PUBLIC_HUMAN_CLIENT, "alice", "alice-password").await;
+    let reduced = human_login(
+        &srv,
+        &keycloak,
+        PUBLIC_HUMAN_CLIENT,
+        "alice",
+        "alice-password",
+    )
+    .await;
     let reduced_token = reduced["access_token"]
         .as_str()
         .expect("access_token present")
@@ -1395,7 +1438,10 @@ async fn login_status(srv: &WyrdTestServer) -> (StatusCode, Value) {
     let bytes = to_bytes(response.into_body(), 65_536)
         .await
         .expect("login body reads");
-    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
 /// Tenant human connection administration across two tenants, one issuer.
@@ -1448,7 +1494,12 @@ async fn tenant_connection_admin_journey() {
 
     // 1. service_accounts:write alone does not administer human SSO.
     let (status, body) = call_json(&srv, &operator_token, Method::GET, CONNECTIONS, None).await;
-    assert_refused(status, &body, StatusCode::FORBIDDEN, "WYRD_PERMISSION_403_DENIED_RBAC");
+    assert_refused(
+        status,
+        &body,
+        StatusCode::FORBIDDEN,
+        "WYRD_PERMISSION_403_DENIED_RBAC",
+    );
     let (status, body) = call_json(
         &srv,
         &operator_token,
@@ -1457,7 +1508,12 @@ async fn tenant_connection_admin_journey() {
         Some(connection_input(PUBLIC_HUMAN_CLIENT, "Public", None, None)),
     )
     .await;
-    assert_refused(status, &body, StatusCode::FORBIDDEN, "WYRD_PERMISSION_403_DENIED_RBAC");
+    assert_refused(
+        status,
+        &body,
+        StatusCode::FORBIDDEN,
+        "WYRD_PERMISSION_403_DENIED_RBAC",
+    );
 
     // 2. Both tenants trust the same issuer through their own connection.
     let active_a =
@@ -1470,7 +1526,10 @@ async fn tenant_connection_admin_journey() {
         Some(CONFIDENTIAL_HUMAN_SECRET),
     )
     .await;
-    assert_eq!(active_a["issuer"], active_b["issuer"], "the same issuer in both tenants");
+    assert_eq!(
+        active_a["issuer"], active_b["issuer"],
+        "the same issuer in both tenants"
+    );
     let callback = format!("{PUBLIC_ORIGIN}/auth/callback");
     for (admin, tenant, client) in [
         (&admin_a, tenant_a, PUBLIC_HUMAN_CLIENT),
@@ -1480,8 +1539,14 @@ async fn tenant_connection_admin_journey() {
         assert_eq!(status, StatusCode::OK, "admin lists: {listed}");
         assert_eq!(listed["callback_url"], callback.as_str());
         assert_eq!(listed["active"]["tenant_id"], tenant.to_string());
-        assert_eq!(listed["active"]["client_id"], client, "each tenant sees its own client");
-        assert!(listed["candidate"].is_null(), "activation consumed the candidate");
+        assert_eq!(
+            listed["active"]["client_id"], client,
+            "each tenant sees its own client"
+        );
+        assert!(
+            listed["candidate"].is_null(),
+            "activation consumed the candidate"
+        );
         assert!(
             !listed.to_string().contains(CONFIDENTIAL_HUMAN_SECRET),
             "no read returns a provider secret: {listed}"
@@ -1509,9 +1574,21 @@ async fn tenant_connection_admin_journey() {
         None,
     )
     .await;
-    assert_refused(status, &body, StatusCode::NOT_FOUND, "WYRD_SPEC_404_NOT_FOUND");
+    assert_refused(
+        status,
+        &body,
+        StatusCode::NOT_FOUND,
+        "WYRD_SPEC_404_NOT_FOUND",
+    );
     let keycloak = OidcIssuerFixture::connect(&keycloak_issuer()).await;
-    let session = human_login(&srv, &keycloak, PUBLIC_HUMAN_CLIENT, "alice", "alice-password").await;
+    let session = human_login(
+        &srv,
+        &keycloak,
+        PUBLIC_HUMAN_CLIENT,
+        "alice",
+        "alice-password",
+    )
+    .await;
     let access = session["access_token"].as_str().expect("access token");
     assert_v1_authz_check_ok(&srv, access, "tenant-a-connection").await;
 
@@ -1606,7 +1683,12 @@ async fn tenant_connection_admin_journey() {
         call_json(&srv, &admin_a.token, Method::POST, ACTIVE_DEACTIVATE, None).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "deactivates: {body}");
     let (status, body) = login_status(&srv).await;
-    assert_refused(status, &body, StatusCode::UNAUTHORIZED, "WYRD_AUTH_401_INVALID_TOKEN");
+    assert_refused(
+        status,
+        &body,
+        StatusCode::UNAUTHORIZED,
+        "WYRD_AUTH_401_INVALID_TOKEN",
+    );
     let (status, body) = call_json(
         &srv,
         &admin_a.token,
@@ -1624,11 +1706,22 @@ async fn tenant_connection_admin_journey() {
         None,
     )
     .await;
-    assert_refused(status, &body, StatusCode::NOT_FOUND, "WYRD_SPEC_404_NOT_FOUND");
+    assert_refused(
+        status,
+        &body,
+        StatusCode::NOT_FOUND,
+        "WYRD_SPEC_404_NOT_FOUND",
+    );
     let (_, listed) = call_json(&srv, &admin_a.token, Method::GET, CONNECTIONS, None).await;
-    assert!(listed["active"].is_null() && listed["candidate"].is_null(), "{listed}");
+    assert!(
+        listed["active"].is_null() && listed["candidate"].is_null(),
+        "{listed}"
+    );
     let (_, listed_b) = call_json(&srv, &admin_b.token, Method::GET, CONNECTIONS, None).await;
-    assert_eq!(listed_b["active"]["id"], active_b["id"], "tenant B is untouched");
+    assert_eq!(
+        listed_b["active"]["id"], active_b["id"],
+        "tenant B is untouched"
+    );
 
     srv.await_audit_published(tenant_a)
         .await
@@ -1716,9 +1809,19 @@ async fn tenant_connection_rotation_journey() {
     // 1. Unsafe discovery fails closed; stale revisions conflict.
     let mut unsafe_input = connection_input(PUBLIC_HUMAN_CLIENT, "Public", None, None);
     unsafe_input["issuer"] = "https://169.254.169.254".into();
-    let (status, staged) =
-        call_json(&replica_a, token, Method::PUT, CANDIDATE, Some(unsafe_input)).await;
-    assert_eq!(status, StatusCode::OK, "staging does no provider IO: {staged}");
+    let (status, staged) = call_json(
+        &replica_a,
+        token,
+        Method::PUT,
+        CANDIDATE,
+        Some(unsafe_input),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "staging does no provider IO: {staged}"
+    );
     assert_eq!(staged["revision"], 1);
     let (status, body) = call_json(
         &replica_a,
@@ -1728,7 +1831,12 @@ async fn tenant_connection_rotation_journey() {
         Some(serde_json::json!({ "expected_revision": 1 })),
     )
     .await;
-    assert_refused(status, &body, StatusCode::BAD_REQUEST, "WYRD_SPEC_400_VALIDATION");
+    assert_refused(
+        status,
+        &body,
+        StatusCode::BAD_REQUEST,
+        "WYRD_SPEC_400_VALIDATION",
+    );
     let (status, body) = call_json(
         &replica_a,
         token,
@@ -1737,7 +1845,12 @@ async fn tenant_connection_rotation_journey() {
         Some(connection_input(PUBLIC_HUMAN_CLIENT, "Public", None, None)),
     )
     .await;
-    assert_refused(status, &body, StatusCode::CONFLICT, "WYRD_AUTH_409_CONNECTION_CONFLICT");
+    assert_refused(
+        status,
+        &body,
+        StatusCode::CONFLICT,
+        "WYRD_AUTH_409_CONNECTION_CONFLICT",
+    );
 
     // 2. A wrong secret fails the client-authentication probe.
     let (status, staged) = call_json(
@@ -1763,7 +1876,12 @@ async fn tenant_connection_rotation_journey() {
         Some(serde_json::json!({ "expected_revision": 2 })),
     )
     .await;
-    assert_refused(status, &body, StatusCode::CONFLICT, "WYRD_AUTH_409_CONNECTION_NOT_TESTED");
+    assert_refused(
+        status,
+        &body,
+        StatusCode::CONFLICT,
+        "WYRD_AUTH_409_CONNECTION_NOT_TESTED",
+    );
     assert_eq!(body["details"]["reason"], "client_auth_rejected", "{body}");
     let (status, body) = call_json(
         &replica_a,
@@ -1773,7 +1891,12 @@ async fn tenant_connection_rotation_journey() {
         Some(activation(2, &admin.api_key)),
     )
     .await;
-    assert_refused(status, &body, StatusCode::CONFLICT, "WYRD_AUTH_409_CONNECTION_NOT_TESTED");
+    assert_refused(
+        status,
+        &body,
+        StatusCode::CONFLICT,
+        "WYRD_AUTH_409_CONNECTION_NOT_TESTED",
+    );
 
     // 3. The fixed candidate tests for fifteen minutes; activation still
     //    needs a qualifying recovery key and a durable audit decision.
@@ -1791,7 +1914,10 @@ async fn tenant_connection_rotation_journey() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "candidate replaces: {staged}");
-    assert!(staged["tested_until"].is_null(), "a replaced candidate is untested");
+    assert!(
+        staged["tested_until"].is_null(),
+        "a replaced candidate is untested"
+    );
     let (status, tested) = call_json(
         &replica_a,
         token,
@@ -1825,7 +1951,12 @@ async fn tenant_connection_rotation_journey() {
         )),
     )
     .await;
-    assert_refused(status, &body, StatusCode::CONFLICT, "WYRD_AUTH_409_CONNECTION_CONFLICT");
+    assert_refused(
+        status,
+        &body,
+        StatusCode::CONFLICT,
+        "WYRD_AUTH_409_CONNECTION_CONFLICT",
+    );
     assert!(
         !body.to_string().contains(
             runtime_admin
@@ -1880,7 +2011,10 @@ async fn tenant_connection_rotation_journey() {
         .await
         .expect("failure trigger drops");
     let (_, listed) = call_json(&replica_a, token, Method::GET, CONNECTIONS, None).await;
-    assert!(listed["active"].is_null(), "the failed activation rolled back: {listed}");
+    assert!(
+        listed["active"].is_null(),
+        "the failed activation rolled back: {listed}"
+    );
     assert_eq!(listed["candidate"]["revision"], 3, "{listed}");
 
     // 4. Concurrent activations of one revision have exactly one winner.
@@ -1898,8 +2032,7 @@ async fn tenant_connection_rotation_journey() {
         CANDIDATE_ACTIVATE,
         Some(activation(3, &admin.api_key)),
     );
-    let ((first_status, first_body), (second_status, second_body)) =
-        tokio::join!(first, second);
+    let ((first_status, first_body), (second_status, second_body)) = tokio::join!(first, second);
     let mut statuses = [first_status, second_status];
     statuses.sort();
     assert_eq!(
@@ -1931,7 +2064,10 @@ async fn tenant_connection_rotation_journey() {
         .expect("ciphertext reads")
         .expect("active connection stores a secret");
     let k2_only = SealingKeyring::new(SecretKey::from_bytes(k2));
-    assert!(k2_only.open(&under_k1).is_err(), "K1 sealed the first secret");
+    assert!(
+        k2_only.open(&under_k1).is_err(),
+        "K1 sealed the first secret"
+    );
     let replica_b = replica_a
         .start_replica(human_server_builder().with_sealing_keyring(keyring(k2, k1)))
         .await
@@ -1943,7 +2079,9 @@ async fn tenant_connection_rotation_journey() {
         .expect("active connection stores a secret");
     assert_ne!(under_k1, under_k2, "boot rewrapped the stored secret");
     assert_eq!(
-        k2_only.rewrap(&under_k2).expect("K2 opens the rewrapped secret"),
+        k2_only
+            .rewrap(&under_k2)
+            .expect("K2 opens the rewrapped secret"),
         None,
         "the rewrapped secret references only the write key"
     );
@@ -1974,7 +2112,10 @@ async fn tenant_connection_rotation_journey() {
     )
     .await;
     let (_, listed) = call_json(&replica_a, token, Method::GET, CONNECTIONS, None).await;
-    assert_eq!(listed["active"]["id"], rotated["id"], "A serves B's activation");
+    assert_eq!(
+        listed["active"]["id"], rotated["id"],
+        "A serves B's activation"
+    );
     assert_eq!(listed["active"]["revision"], 4);
     let session = human_login(
         &replica_a,
@@ -1984,12 +2125,19 @@ async fn tenant_connection_rotation_journey() {
         "alice-password",
     )
     .await;
-    assert!(session["access_token"].is_string(), "A signs in through the rotated connection");
-    let (status, body) =
-        call_json(&replica_b, token, Method::POST, ACTIVE_DEACTIVATE, None).await;
+    assert!(
+        session["access_token"].is_string(),
+        "A signs in through the rotated connection"
+    );
+    let (status, body) = call_json(&replica_b, token, Method::POST, ACTIVE_DEACTIVATE, None).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "B deactivates: {body}");
     let (status, body) = login_status(&replica_a).await;
-    assert_refused(status, &body, StatusCode::UNAUTHORIZED, "WYRD_AUTH_401_INVALID_TOKEN");
+    assert_refused(
+        status,
+        &body,
+        StatusCode::UNAUTHORIZED,
+        "WYRD_AUTH_401_INVALID_TOKEN",
+    );
 
     replica_b.shutdown().await.expect("replica B shuts down");
     replica_a.shutdown().await.expect("replica A shuts down");

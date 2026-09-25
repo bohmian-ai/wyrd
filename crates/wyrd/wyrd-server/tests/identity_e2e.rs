@@ -1816,11 +1816,14 @@ async fn tenant_connection_admin_journey() {
 ///      winner;
 ///   5. replica B boots with K2 as the write key and K1 retained, rewraps the
 ///      stored secret under K2, and both replicas still sign alice in;
-///   6. A, still sealing with K1, stages a late secret after B's pass; a
-///      post-roll pass (replica C) reseals it under K2, and a replica holding
+///   6. A, still sealing with K1, stages a late secret after B's pass; A,
+///      the only K1 writer, is then shut down, so the final pass (replica C,
+///      started from K2-writing B) runs with no K1 writer left in service,
+///      leaves every stored secret current under K2, and a replica holding
 ///      only K2 then signs alice in;
-///   7. a same-issuer secret rotation staged and activated on B is served by
-///      A at once, and deactivation on B stops login on A.
+///   7. from then on only K2 writers serve: a same-issuer secret rotation
+///      staged and activated on B is served by the K2-only replica at once,
+///      and deactivation on B stops login there.
 ///
 /// # Panics
 /// Panics when any step deviates from the contract above.
@@ -2144,8 +2147,9 @@ async fn tenant_connection_rotation_journey() {
     }
 
     // 6. A still seals with K1 after B's pass reported nothing left: a late
-    //    K1 write. The post-roll pass (replica C, booted once every writer is
-    //    meant to use K2) reseals it, and a K2-only replica then serves login.
+    //    K1 write. A is then taken out of service, so no K1 writer remains;
+    //    the final pass (replica C, started from K2-writing B) reseals the
+    //    late write, and a K2-only replica then serves login.
     let (status, late) = call_json(
         &replica_a,
         token,
@@ -2169,23 +2173,30 @@ async fn tenant_connection_rotation_journey() {
         k2_only.open(&late_under_k1).is_err(),
         "A sealed the late write under K1"
     );
-    let replica_c = replica_a
+    replica_a
+        .shutdown()
+        .await
+        .expect("replica A, the last K1 writer, shuts down");
+    let replica_c = replica_b
         .start_replica(human_server_builder().with_sealing_keyring(keyring(k2, k1)))
         .await
-        .expect("post-roll replica C starts");
-    let late_under_k2 = replica_a
-        .human_connection_secret_ciphertext(tenant, "Candidate")
-        .await
-        .expect("ciphertext reads")
-        .expect("the late candidate stores a secret");
-    assert_eq!(
-        k2_only
-            .rewrap(&late_under_k2)
-            .expect("K2 opens the resealed late write"),
-        None,
-        "the post-roll pass resealed the late K1 write"
-    );
-    let replica_k2 = replica_a
+        .expect("final-pass replica C starts");
+    for state in ["Active", "Candidate"] {
+        let sealed = replica_b
+            .human_connection_secret_ciphertext(tenant, state)
+            .await
+            .expect("ciphertext reads")
+            .expect("the connection stores a secret");
+        assert_eq!(
+            k2_only
+                .rewrap(&sealed)
+                .expect("K2 opens every stored secret"),
+            None,
+            "the final pass left the {state} secret current under K2"
+        );
+    }
+    replica_c.shutdown().await.expect("replica C shuts down");
+    let replica_k2 = replica_b
         .start_replica(
             human_server_builder().with_sealing_keyring(std::sync::Arc::new(SealingKeyring::new(
                 SecretKey::from_bytes(k2),
@@ -2207,13 +2218,9 @@ async fn tenant_connection_rotation_journey() {
         "rotation-k2-only",
     )
     .await;
-    replica_k2
-        .shutdown()
-        .await
-        .expect("K2-only replica shuts down");
-    replica_c.shutdown().await.expect("replica C shuts down");
 
-    // 7. A same-issuer secret rotation on B is served by A without restart.
+    // 7. A same-issuer secret rotation on B is served by the K2-only replica
+    //    without restart.
     let rotated = activate_keycloak_connection(
         &replica_b,
         &admin,
@@ -2222,14 +2229,14 @@ async fn tenant_connection_rotation_journey() {
         Some(CONFIDENTIAL_HUMAN_SECRET),
     )
     .await;
-    let (_, listed) = call_json(&replica_a, token, Method::GET, CONNECTIONS, None).await;
+    let (_, listed) = call_json(&replica_k2, token, Method::GET, CONNECTIONS, None).await;
     assert_eq!(
         listed["active"]["id"], rotated["id"],
-        "A serves B's activation"
+        "the K2-only replica serves B's activation"
     );
     assert_eq!(listed["active"]["revision"], 5);
     let session = human_login(
-        &replica_a,
+        &replica_k2,
         &keycloak,
         CONFIDENTIAL_HUMAN_CLIENT,
         "alice",
@@ -2238,11 +2245,11 @@ async fn tenant_connection_rotation_journey() {
     .await;
     assert!(
         session["access_token"].is_string(),
-        "A signs in through the rotated connection"
+        "the K2-only replica signs in through the rotated connection"
     );
     let (status, body) = call_json(&replica_b, token, Method::POST, ACTIVE_DEACTIVATE, None).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "B deactivates: {body}");
-    let (status, body) = login_status(&replica_a).await;
+    let (status, body) = login_status(&replica_k2).await;
     assert_refused(
         status,
         &body,
@@ -2250,8 +2257,11 @@ async fn tenant_connection_rotation_journey() {
         "WYRD_AUTH_401_INVALID_TOKEN",
     );
 
+    replica_k2
+        .shutdown()
+        .await
+        .expect("K2-only replica shuts down");
     replica_b.shutdown().await.expect("replica B shuts down");
-    replica_a.shutdown().await.expect("replica A shuts down");
 }
 
 /// Count the refresh rows ever issued to `principal_id`, read as superuser so

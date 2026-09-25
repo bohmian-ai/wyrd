@@ -253,7 +253,7 @@ impl HumanConnections {
     /// Prepare a candidate write without IO: require a public origin and seal
     /// the secret under the keyring's write key.
     ///
-    /// `input` must come from [`ConnectionInput::from_json`], which is the one
+    /// `input` must come from [`ConnectionInput::from_slice`], which is the one
     /// place its cross-field rules are checked; the durable table re-asserts
     /// the Public-has-no-secret invariant. Callers run this before
     /// authorizing, so every refusal it can produce is a deployment or input

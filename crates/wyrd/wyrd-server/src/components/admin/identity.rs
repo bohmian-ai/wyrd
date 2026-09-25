@@ -10,9 +10,9 @@
 //! appears in a response, error, log, or audit row.
 
 use axum::Json;
+use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use serde_json::Value;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 use uuid::Uuid;
@@ -141,7 +141,10 @@ async fn list_connections(
 ///
 /// This is also the rotation path for a secret or group-role map, including
 /// when the issuer is unchanged. Replacing a candidate clears its test stamp.
-/// The body is authorized before it is interpreted.
+/// The body is read as raw bytes, bounded by the router's default request
+/// body limit, and is only decoded by [`ConnectionInput::from_slice`] after
+/// the caller is authorized, so a refused caller never learns whether its
+/// body was valid.
 ///
 /// # Errors
 /// Returns `400` for invalid input, a missing public origin, or an unsupported
@@ -177,11 +180,11 @@ async fn list_connections(
 async fn put_candidate(
     State(state): State<AppState>,
     caller: Caller,
-    Json(body): Json<Value>,
+    body: Bytes,
 ) -> Result<Json<HumanConnectionView>, WyrdErrorResponse> {
     let decision = decide(&state, &caller, "identity.oidc.candidate.put").await?;
     let owner = connections(&state)?;
-    let staged = match ConnectionInput::from_json(body).and_then(|input| owner.stage(input)) {
+    let staged = match ConnectionInput::from_slice(&body).and_then(|input| owner.stage(input)) {
         Ok(staged) => staged,
         Err(refusal) => return refuse_after_decision(&state, &caller, &decision, refusal).await,
     };
@@ -558,18 +561,26 @@ mod pg_tests {
         }
     }
 
+    /// Raw candidate PUT bytes for `issuer` using client-auth `method`.
+    fn candidate_body(issuer: &str, method: &str) -> Bytes {
+        Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "issuer": issuer,
+                "client_id": "wyrd-human",
+                "client_auth": method,
+                "claim_mapping": { "subject": "sub" },
+            }))
+            .expect("candidate body encodes"),
+        )
+    }
+
     /// Stage a public candidate for the mock provider at revision 1.
     ///
     /// # Panics
     /// Panics when the candidate cannot be staged.
     async fn stage_candidate(state: &AppState, tenant: DataTenantId, provider: &MockServer) {
-        let input = ConnectionInput::from_json(serde_json::json!({
-            "issuer": provider.uri(),
-            "client_id": "wyrd-human",
-            "client_auth": "Public",
-            "claim_mapping": { "subject": "sub" },
-        }))
-        .expect("candidate input is valid");
+        let input = ConnectionInput::from_slice(&candidate_body(&provider.uri(), "Public"))
+            .expect("candidate input is valid");
         let owner = connections(state).expect("owner configured");
         let staged = owner.stage(input).expect("candidate stages");
         let decision = audit::audit_event(
@@ -749,5 +760,81 @@ mod pg_tests {
 
         assert!(refused.0.status() >= 500, "fails closed: {:?}", refused.0);
         assert_eq!(stamp(&fixture).await, (None, false));
+    }
+
+    /// The candidate PUT decides authorization before it interprets the raw
+    /// body: an unauthorized caller sending garbage gets an audited `403`, not
+    /// a validation error; an authorized caller gets `VALIDATION` for bytes
+    /// that are not JSON, `UNSUPPORTED_CLIENT_AUTH` for `PrivateKeyJwt`, and a
+    /// staged candidate for a valid body.
+    ///
+    /// # Panics
+    /// Panics when any response or recorded decision differs from the above.
+    #[tokio::test]
+    async fn put_candidate_authorizes_before_decoding_its_body() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let denied = test_state(
+            &fixture,
+            Arc::new(AllowFirst {
+                allowed: AtomicUsize::new(0),
+                evaluations: AtomicUsize::new(0),
+            }),
+        )
+        .await;
+        let refused = put_candidate(
+            State(denied),
+            caller(tenant),
+            Bytes::from_static(b"{not json"),
+        )
+        .await
+        .expect_err("an unauthorized caller is refused");
+        assert_eq!(refused.0.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
+        assert_eq!(
+            decisions(&fixture, "identity.oidc.candidate.put").await,
+            vec![("denied".to_owned(), 1)]
+        );
+
+        let state = test_state(
+            &fixture,
+            Arc::new(AllowFirst {
+                allowed: AtomicUsize::new(usize::MAX),
+                evaluations: AtomicUsize::new(0),
+            }),
+        )
+        .await;
+        let malformed = put_candidate(
+            State(state.clone()),
+            caller(tenant),
+            Bytes::from_static(b"{not json"),
+        )
+        .await
+        .expect_err("malformed input is refused");
+        assert_eq!(malformed.0.code(), "WYRD_SPEC_400_VALIDATION");
+
+        let unsupported = put_candidate(
+            State(state.clone()),
+            caller(tenant),
+            candidate_body("https://idp.example.com", "PrivateKeyJwt"),
+        )
+        .await
+        .expect_err("PrivateKeyJwt is refused");
+        assert_eq!(
+            unsupported.0.code(),
+            "WYRD_AUTH_400_UNSUPPORTED_CLIENT_AUTH"
+        );
+
+        let Json(staged) = put_candidate(
+            State(state),
+            caller(tenant),
+            candidate_body("https://idp.example.com", "Public"),
+        )
+        .await
+        .expect("a valid body stages");
+        assert_eq!(staged.revision, 1);
+        assert_eq!(
+            decisions(&fixture, "identity.oidc.candidate.put").await,
+            vec![("allowed".to_owned(), 3), ("denied".to_owned(), 1)]
+        );
     }
 }

@@ -164,7 +164,8 @@ async fn the_served_document_describes_the_composed_surface() {
 /// Each of the six operations publishes its route-specific refusals as
 /// problem+json; the redacted view and list shapes expose no secret field; the
 /// input schema offers exactly the three supported client-authentication
-/// methods (never `PrivateKeyJwt`); and activation requires the recovery key.
+/// methods (never `PrivateKeyJwt`); the candidate PUT publishes that input as
+/// its request body; and activation requires the recovery key.
 #[tokio::test]
 async fn identity_connection_operations_publish_their_contract() {
     let server = WyrdTestServer::start_in_process()
@@ -214,6 +215,13 @@ async fn identity_connection_operations_publish_their_contract() {
             );
         }
     }
+
+    assert_eq!(
+        document["paths"]["/v1/identity/oidc/candidate"]["put"]["requestBody"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/ConnectionInput",
+        "the candidate PUT publishes its typed body although it reads raw bytes"
+    );
 
     let schemas = &document["components"]["schemas"];
     let view_fields = schemas["HumanConnectionView"]["properties"]

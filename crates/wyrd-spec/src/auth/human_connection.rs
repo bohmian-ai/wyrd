@@ -10,7 +10,7 @@
 //! Secrets travel inbound only. [`HumanConnectionView`] carries no secret or
 //! sealing metadata, and [`HumanClientAuth`] deliberately has no
 //! `PrivateKeyJwt` arm: an unimplemented method is refused with
-//! `WYRD_AUTH_400_UNSUPPORTED_CLIENT_AUTH` by [`ConnectionInput::from_json`]
+//! `WYRD_AUTH_400_UNSUPPORTED_CLIENT_AUTH` by [`ConnectionInput::from_slice`]
 //! and never appears in a generated schema.
 
 use std::collections::HashMap;
@@ -203,18 +203,22 @@ impl ConnectionInput {
     /// Decode a raw request body, refusing unsupported client authentication
     /// with its own stable code before generic validation.
     ///
+    /// The bytes are parsed as JSON once; a `client_auth` of `PrivateKeyJwt`
+    /// is refused before the contract shape is checked, so that method keeps
+    /// its stable code even though the schema does not offer it. The body is
+    /// then decoded into the contract and its cross-field rules are checked.
+    ///
     /// # Errors
-    /// Returns [`WyrdError::UnsupportedClientAuth`] when `client_auth` names
-    /// `PrivateKeyJwt`, [`WyrdError::Validation`] when the body does not match
-    /// the contract, and the result of [`Self::validate`] otherwise.
-    pub fn from_json(body: Value) -> Result<Self, WyrdError> {
+    /// Returns [`WyrdError::Validation`] when the bytes are not JSON or do not
+    /// match the contract, [`WyrdError::UnsupportedClientAuth`] when
+    /// `client_auth` names `PrivateKeyJwt`, and the result of
+    /// [`Self::validate`] otherwise.
+    pub fn from_slice(body: &[u8]) -> Result<Self, WyrdError> {
+        let body: Value = serde_json::from_slice(body).map_err(invalid_input)?;
         if body.get("client_auth").and_then(Value::as_str) == Some(PRIVATE_KEY_JWT) {
             return Err(unsupported_client_auth());
         }
-        let input: Self = serde_json::from_value(body).map_err(|error| WyrdError::Validation {
-            message: format!("connection input is invalid: {error}"),
-            details: serde_json::json!({}),
-        })?;
+        let input: Self = serde_json::from_value(body).map_err(invalid_input)?;
         input.validate()?;
         Ok(input)
     }
@@ -225,7 +229,7 @@ impl ConnectionInput {
     /// Returns [`WyrdError::Validation`] when `client_id` or the subject claim
     /// path is empty, a secret method omits its secret or supplies an empty
     /// one, or `Public` supplies any secret value, including an empty one.
-    pub fn validate(&self) -> Result<(), WyrdError> {
+    fn validate(&self) -> Result<(), WyrdError> {
         if self.client_id.trim().is_empty() {
             return Err(validation("client_id must not be empty", "client_id"));
         }
@@ -310,6 +314,14 @@ fn unsupported_client_auth() -> WyrdError {
     }
 }
 
+/// The refusal for a body that is not JSON or does not match the contract.
+fn invalid_input(error: serde_json::Error) -> WyrdError {
+    WyrdError::Validation {
+        message: format!("connection input is invalid: {error}"),
+        details: serde_json::json!({}),
+    }
+}
+
 /// A field-scoped validation refusal.
 fn validation(message: &str, field: &str) -> WyrdError {
     WyrdError::Validation {
@@ -334,13 +346,39 @@ mod tests {
         })
     }
 
+    /// Encode `body` as the raw request bytes the decoder receives.
+    fn bytes(body: &serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(body).expect("test body encodes")
+    }
+
+    /// `PrivateKeyJwt` is refused with its own code even when the rest of the
+    /// body would fail ordinary validation, and bytes that are not JSON are a
+    /// validation refusal.
+    #[test]
+    fn private_key_jwt_precedes_validation_and_malformed_bytes_are_invalid() {
+        let raw = serde_json::json!({ "client_auth": "PrivateKeyJwt", "unknown": true });
+        assert!(matches!(
+            ConnectionInput::from_slice(&bytes(&raw)),
+            Err(WyrdError::UnsupportedClientAuth { .. })
+        ));
+        for malformed in [&b"{not json"[..], b"", b"[]"] {
+            assert!(
+                matches!(
+                    ConnectionInput::from_slice(malformed),
+                    Err(WyrdError::Validation { .. })
+                ),
+                "{malformed:?} is a validation refusal"
+            );
+        }
+    }
+
     /// `PrivateKeyJwt` gets its own stable code, not a generic decode error.
     #[test]
     fn private_key_jwt_is_refused_with_its_own_code() {
         let mut raw = body();
         raw["client_auth"] = serde_json::json!("PrivateKeyJwt");
         assert!(matches!(
-            ConnectionInput::from_json(raw),
+            ConnectionInput::from_slice(&bytes(&raw)),
             Err(WyrdError::UnsupportedClientAuth { .. })
         ));
     }
@@ -348,13 +386,13 @@ mod tests {
     /// Secret presence must agree with the client-auth method.
     #[test]
     fn secret_presence_follows_the_method() {
-        let input = ConnectionInput::from_json(body()).expect("public client decodes");
+        let input = ConnectionInput::from_slice(&bytes(&body())).expect("public client decodes");
         assert_eq!(input.client_auth, HumanClientAuth::Public);
 
         let mut missing = body();
         missing["client_auth"] = serde_json::json!("SecretPost");
         assert!(matches!(
-            ConnectionInput::from_json(missing),
+            ConnectionInput::from_slice(&bytes(&missing)),
             Err(WyrdError::Validation { .. })
         ));
 
@@ -363,7 +401,7 @@ mod tests {
             extra["client_secret"] = serde_json::json!(secret);
             assert!(
                 matches!(
-                    ConnectionInput::from_json(extra),
+                    ConnectionInput::from_slice(&bytes(&extra)),
                     Err(WyrdError::Validation { .. })
                 ),
                 "Public refuses a supplied secret {secret:?}"
@@ -376,7 +414,7 @@ mod tests {
             empty["client_secret"] = serde_json::json!("");
             assert!(
                 matches!(
-                    ConnectionInput::from_json(empty),
+                    ConnectionInput::from_slice(&bytes(&empty)),
                     Err(WyrdError::Validation { .. })
                 ),
                 "{method} refuses an empty secret"
@@ -384,7 +422,8 @@ mod tests {
             let mut valid = body();
             valid["client_auth"] = serde_json::json!(method);
             valid["client_secret"] = serde_json::json!("s3cret");
-            let input = ConnectionInput::from_json(valid).expect("a nonempty secret decodes");
+            let input =
+                ConnectionInput::from_slice(&bytes(&valid)).expect("a nonempty secret decodes");
             assert!(input.client_auth.requires_secret());
         }
     }

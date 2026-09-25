@@ -277,6 +277,9 @@ mod tests {
     use super::{
         AddressPolicy, BodyError, MAX_RESPONSE_BYTES, ScreenError, ScreenedHttp, read_bounded_body,
     };
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
     use std::net::IpAddr;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use url::Url;
@@ -564,8 +567,11 @@ mod tests {
     /// decoded size.
     #[tokio::test]
     async fn an_oversized_decompressed_body_is_refused() {
-        let repeats = MAX_RESPONSE_BYTES / 258 + 1;
-        let compressed = gzip_repeating_a(repeats);
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+        encoder
+            .write_all(&vec![b'a'; MAX_RESPONSE_BYTES + 1])
+            .expect("gzip encodes in memory");
+        let compressed = encoder.finish().expect("gzip stream finishes");
         assert!(
             compressed.len() < MAX_RESPONSE_BYTES / 64,
             "the body is small on the wire"
@@ -575,40 +581,5 @@ mod tests {
             .await
             .expect_err("inflated body is refused");
         assert!(matches!(error, BodyError::TooLarge), "{error:?}");
-    }
-
-    /// Gzip stream inflating to `1 + 258 * repeats` bytes of `a`.
-    ///
-    /// One fixed-Huffman deflate block: a literal `a`, then `repeats`
-    /// length-258/distance-1 back-references (13 bits each). The trailer's
-    /// CRC and size are zero because a bounded reader stops before them; the
-    /// workspace ships no compression encoder to this crate.
-    ///
-    /// # Panics
-    /// Never in practice; the byte conversion masks to eight bits.
-    fn gzip_repeating_a(repeats: usize) -> Vec<u8> {
-        let mut out = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff];
-        let (mut bits, mut used) = (0_u32, 0_u32);
-        let mut put = |out: &mut Vec<u8>, value: u32, len: u32| {
-            bits |= value << used;
-            used += len;
-            while used >= 8 {
-                out.push(u8::try_from(bits & 0xff).expect("masked to a byte"));
-                bits >>= 8;
-                used -= 8;
-            }
-        };
-        // Huffman codes are packed most-significant bit first.
-        let huffman = |code: u32, len: u32| code.reverse_bits() >> (32 - len);
-        put(&mut out, 0b011, 3); // BFINAL = 1, BTYPE = 01 (fixed Huffman).
-        put(&mut out, huffman(0x30 + u32::from(b'a'), 8), 8);
-        for _ in 0..repeats {
-            put(&mut out, huffman(0b1100_0101, 8), 8); // length code 285 = 258.
-            put(&mut out, huffman(0, 5), 5); // distance code 0 = 1.
-        }
-        put(&mut out, huffman(0, 7), 7); // end of block.
-        put(&mut out, 0, 7); // flush the final partial byte.
-        out.extend([0; 8]);
-        out
     }
 }

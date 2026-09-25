@@ -11335,6 +11335,7 @@ dependencies = [
 name = "wyrd-auth-oidc"
 version = "0.0.1"
 dependencies = [
+ "flate2",
  "jsonwebtoken 9.3.1",
  "moka",
  "reqwest 0.13.4",

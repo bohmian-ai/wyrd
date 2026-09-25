@@ -233,3 +233,51 @@ workflow mechanics remain implementation choices.
   `architecture/references/languages/testing-workflows.md`.
 - `architecture/operations/deployment-and-release.md`,
   `architecture/wyrd-design.md`, and `architecture/bifrost-design.md`.
+
+## Implementation Evidence
+
+Commits: `7535b719` (selection), `92c78828` (release routing and identity),
+`2410542e` (docs, cache-on-failure), plus this evidence commit.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| AC-001 leaf, shared, wire, Bifrost-only, mixed, global, docs, unknown, renamed, deleted routes | `.github/scripts/select-ci.py`; `detect-changes.sh` (`--no-renames`) | `mise run check:ci-selection`: 52 passed (RED first: 34 of 52 failed against the path-only classifier) | PASS |
+| AC-002 transitive consumers in, unrelated families out | `Workspace.closure` (normal/build edges transitive, dev edges one hop); `run-family-tests.sh` `WYRD_TEST_PACKAGES` filter | leaf `vala-drift` → `test:vala` only; `skald-cache` → Skald, Vala, and Wyrd consumers; `WYRD_TEST_PACKAGES=vala-drift mise run test:vala` ran exactly 88 `vala-drift` tests | PASS |
+| AC-003 codegen, SDK platforms, server journeys, environment tasks | `ci_lanes` (codegen:check, py/ts integration, ts:napi:check, test:bifrost:gate, check:examples), `rust_client`/`python`/`typescript`/`identity`/`storage` flags; `lints-test.yml` jobs | wire-contract, shared-client, server, auth, storage, SDK-only cases in `check:ci-selection`; workflow-shape assertions (both OS, full gate) | PASS |
+| AC-004 logged reasons; classifier errors never green-skip | per-package/lane/fallback reasons to stdout and `$GITHUB_STEP_SUMMARY`; metadata failure, unowned path, and laneless package → full gate; empty family filter exits 1 | `check:ci-selection` failure cases | PASS |
+| AC-005 bounded heavy journeys with traces; full nightly inventory | Bifrost concurrency bound unchanged (`test:bifrost:gate` CI threads 2); nightly callable by release | local `mise run gate` exit 0 (1765s); hosted-runner run pending push | PARTIAL |
+| AC-006 before/after timings | baseline: `evidence/baseline-ci-timings.md`; per-lane timing table in the `ci` job summary; `cache-on-failure` (baseline: 4 of 5 cache restores missed because red runs skip the save) | after-measurements need hosted runs of this branch | PARTIAL |
+| AC-007 affected main packaging, full release matrix, tested artifact identity | `release.yml` `changes` + per-deliverable conditions; `qualify` (nightly gate) and `release-commit` gates; `SHA256SUMS.*` records; `verify-release-artifacts.sh`; `attest-build-provenance` on every publisher; docker image smoke-tested then attested by pushed digest | packaging and digest-verifier cases in `check:ci-selection`; `actionlint` clean; hosted release dry-run pending push | PARTIAL |
+
+Commands: `mise run check:ci-selection`; `bash scripts/checks/test-coverage.sh`;
+`uvx --from actionlint-py actionlint .github/workflows/*.yml`; `mise run gate`
+(exit 0); `mise run test:principals:integration` (exit 0); `mise run
+verify:bifrost` (exit 1, see blockers); `git diff --check`.
+
+Non-goals held: no new build system, no Wyrd protocol or Rust source change,
+no deployment workflow, no credential change (`storage-integration-cloud.yml`
+untouched; pull-request workflows reference no secrets, pinned by a check).
+
+### Blockers and material risks
+
+1. `mise run verify:bifrost` is red because of Bifrost production defects
+   unrelated to CI routing:
+   - `wyrd-testing::scribe sustained::scribe_sustained_ingest_oracle_hot_read_journey`
+     fails reproducibly in isolation. The lane run read duplicated rows 32–47,
+     breaking exactly-once acknowledgement (`sustained.rs:103`). The isolated
+     rerun leaked an admission transition: 1043 opened, 1042 closed
+     (`sustained.rs:409`).
+   - `wyrd-testing::oracle published::published_cache_pruning_and_shutdown_are_production_governed`
+     failed under the full lane: "Forge compacted 0 of 3 sealed inputs within
+     32 passes". It passed in isolation (21s), so a liveness bound is missed
+     under load.
+   Both need a Bifrost remediation task; neither is inside this change's write
+   set.
+2. `wyrd-spec` cannot be packaged: `cargo package -p wyrd-spec` fails on the
+   unpublished `skald-spec` dependency. The new `package-crates` check exposes
+   this. Crate publication was already broken before this change.
+3. A full `wyrd.release/v1` ReleaseManifest (migration, contract, and
+   compatibility digests) has no tooling in the repository. This change
+   records artifact digests and signed provenance, and it fails publication
+   closed on any mismatch. The manifest and deployment gate remain release
+   authority work that needs its own specification.

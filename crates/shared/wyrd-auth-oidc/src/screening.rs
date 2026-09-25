@@ -83,7 +83,7 @@ impl ScreenedHttp {
     /// addresses — so the answer that passed the screen is the answer the
     /// connection uses, and a rebinding reply between the two cannot redirect it
     /// inward. Redirects are refused outright, because following one would leave
-    /// the screen behind.
+    /// the screen behind, and system proxies are ignored for the same reason.
     ///
     /// Rejecting on *any* blocked record rather than filtering them out is
     /// deliberate: split-horizon DNS that mixes one public and one internal
@@ -96,9 +96,13 @@ impl ScreenedHttp {
     /// fails.
     pub async fn client_for(&self, url: &Url) -> Result<Client, ScreenError> {
         wyrd_tls::install_crypto_provider().map_err(|_| ScreenError::Client)?;
+        // No proxy, ambient or otherwise: a proxy would receive the original
+        // hostname and choose its own destination, bypassing the pinned,
+        // screened addresses below.
         let builder = reqwest::Client::builder()
             .timeout(FETCH_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none());
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy();
 
         let builder = match url.host() {
             Some(url::Host::Ipv4(addr)) => {
@@ -286,5 +290,83 @@ mod tests {
             .await
             .expect_err("refused");
         assert!(matches!(error, ScreenError::Blocked));
+    }
+
+    /// Environment variable naming the pinned target the proxy probe child
+    /// requests; absent in every ordinary run.
+    const PROXY_PROBE_TARGET: &str = "WYRD_SCREENED_PROXY_PROBE_TARGET";
+
+    /// An ambient HTTP proxy neither observes nor reroutes a screened request.
+    ///
+    /// The workspace denies `unsafe`, so the proxy environment cannot be set
+    /// in-process; the test re-runs this binary's
+    /// [`screened_request_child`] with `HTTP_PROXY` pointing at a recording
+    /// server and asserts the request reached the pinned target instead.
+    ///
+    /// # Panics
+    /// Panics when the child fails, the target misses the request, or the
+    /// proxy sees any request.
+    #[tokio::test]
+    async fn an_ambient_proxy_cannot_observe_a_screened_request() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let proxy = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&proxy)
+            .await;
+        let target = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pinned"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&target)
+            .await;
+        let target_url = format!("http://localhost:{}/pinned", target.address().port());
+        let proxy_url = proxy.uri();
+
+        let status = tokio::task::spawn_blocking(move || {
+            std::process::Command::new(std::env::current_exe().expect("test binary path"))
+                .args(["--exact", "screening::tests::screened_request_child"])
+                .env(PROXY_PROBE_TARGET, target_url)
+                .env("HTTP_PROXY", &proxy_url)
+                .env("http_proxy", &proxy_url)
+                .env("ALL_PROXY", &proxy_url)
+                .env_remove("NO_PROXY")
+                .env_remove("no_proxy")
+                .status()
+                .expect("child test runs")
+        })
+        .await
+        .expect("child join");
+
+        assert!(status.success(), "the screened request succeeds: {status}");
+        let proxied = proxy.received_requests().await.expect("proxy records");
+        assert!(proxied.is_empty(), "the proxy saw {} requests", proxied.len());
+        let reached = target.received_requests().await.expect("target records");
+        assert_eq!(reached.len(), 1, "the pinned target receives the request");
+    }
+
+    /// Child half of [`an_ambient_proxy_cannot_observe_a_screened_request`]:
+    /// one screened GET under the parent's proxy environment. Without that
+    /// environment it has nothing to probe and returns.
+    ///
+    /// # Panics
+    /// Panics when the screened client cannot be built or the request fails.
+    #[tokio::test]
+    async fn screened_request_child() {
+        let Ok(target) = std::env::var(PROXY_PROBE_TARGET) else {
+            return;
+        };
+        let url = Url::parse(&target).expect("target parses");
+        let response = ScreenedHttp::allowing_internal()
+            .client_for(&url)
+            .await
+            .expect("screened client builds")
+            .get(url)
+            .send()
+            .await
+            .expect("screened request completes");
+        assert!(response.status().is_success(), "{}", response.status());
     }
 }

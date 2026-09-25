@@ -24,7 +24,7 @@ pub mod screening;
 pub use claims::{MappedClaims, map_claims};
 pub use config::IssuerConfigResolver;
 pub use error::OidcError;
-pub use jwks::{JwksCache, OidcKid};
+pub use jwks::{JwksCache, OidcKid, usable_jwks_keys};
 pub use provider::{OidcProvider, ProviderMetadata};
 pub use registry::{
     ClaimMapping, ClaimPath, ClientAuth, IssuerVerification, TrustedIssuer, TrustedIssuerRegistry,

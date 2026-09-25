@@ -73,7 +73,7 @@ const CLIENT_AUTH_REFUSALS: [&str; 2] = ["invalid_client", "unauthorized_client"
 /// provider authenticated the client and then rejected the bogus code.
 const GRANT_REFUSAL: &str = "invalid_grant";
 
-/// Standard OAuth 2.0 (RFC 6749 §4.1.2.1) and OpenID Connect Core (§3.1.2.6)
+/// Standard OAuth 2.0 (RFC 6749 §4.1.2.1) and `OpenID` Connect Core (§3.1.2.6)
 /// authorization error codes. A provider redirecting one of these to the
 /// callback has accepted the callback as registered for the client, which is
 /// what the non-interactive `prompt=none` probe needs to prove.

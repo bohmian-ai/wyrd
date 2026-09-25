@@ -24,6 +24,14 @@
 [test-groups.postgres-fixtures]
 max-threads = 6
 
+# pg-embed downloads and unpacks its Postgres binaries into one per-user cache
+# on first use, guarded only by an in-process mutex. Nextest runs each test in
+# its own process, so on a cold cache (every hosted runner) two embedded-boot
+# tests unpack over each other and one runs `initdb` against a half-written
+# tree, failing with `PgInitFailure`. A warm local cache never shows it.
+[test-groups.embedded-postgres]
+max-threads = 1
+
 [profile.default]
 # nextest reports LEAK when a test's process has not fully quiesced within this
 # window after the test function returns. The test still passes. Fixtures here
@@ -46,6 +54,10 @@ test-group = 'postgres-fixtures'
 [[profile.default.overrides]]
 filter = 'package(wyrd-server) and binary(pg_router_smoke)'
 test-group = 'postgres-fixtures'
+
+[[profile.default.overrides]]
+filter = 'package(wyrd-sql) and test(/embedded/)'
+test-group = 'embedded-postgres'
 
 [profile.journey]
 # Tier-1 journey binaries boot a WyrdTestServer per test, each retaining its own

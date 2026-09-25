@@ -6,7 +6,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode, header};
 use base64::Engine as _;
 use chrono::Duration as ChronoDuration;
-use secrecy::SecretString;
+use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::Value;
 use url::Url;
 use wyrd_auth_check::AuthzCheckRequest;
@@ -14,6 +14,10 @@ use wyrd_auth_check::response::AuthzCheckDecision;
 use wyrd_auth_oidc::IssuerConfigResolver;
 use wyrd_auth_verify::WyrdAuthVerifySettings;
 use wyrd_cli::auth::trusted_issuer::{self, AddArgs as TrustedIssuerAddArgs, TrustedIssuerCommand};
+use wyrd_cli::error::WyrdCliError;
+use wyrd_crypt::{SealingKeyring, SecretKey};
+use wyrd_spec::DataTenantId;
+use wyrd_spec::error::WyrdError;
 use wyrd_cli::auth::workload_binding::{
     self, AddArgs as WorkloadBindingAddArgs, WorkloadBindingCommand,
 };
@@ -762,32 +766,181 @@ async fn service_account_issuer_full_chain() {
 
 // ─── Human OIDC login journey (Keycloak) ──────────────────────────────────────
 
-/// Build the `wyrd-human` public-PKCE issuer entry every human journey boots on.
+/// Deployment public origin every human journey configures; the tenant
+/// connection callback URL is `{origin}/auth/callback`, which the Keycloak
+/// fixture clients register.
+const PUBLIC_ORIGIN: &str = "http://test-tenant-1.wyrd.test";
+
+/// The public PKCE Keycloak client human journeys sign in through.
+const PUBLIC_HUMAN_CLIENT: &str = "wyrd-human";
+
+/// The confidential Keycloak client the rotation journey authenticates to
+/// with `SecretPost`, and its fixture secret.
+const CONFIDENTIAL_HUMAN_CLIENT: &str = "wyrd-human-confidential";
+const CONFIDENTIAL_HUMAN_SECRET: &str = "wyrd-human-confidential-secret";
+
+/// A server builder with the deployment public origin every human journey
+/// needs to stage a tenant connection.
+fn human_server_builder() -> WyrdTestServerBuilder {
+    WyrdTestServerBuilder::default()
+        .with_public_origin(PUBLIC_ORIGIN.parse().expect("public origin parses"))
+}
+
+/// The group map every human journey grants through: the realm's
+/// `wyrd-admins` group confers `writer`, so alice can be a delegation subject.
+fn admins_write() -> HashMap<String, Vec<String>> {
+    HashMap::from([("wyrd-admins".to_owned(), vec!["writer".to_owned()])])
+}
+
+/// A tenant administrator's access token and its recovery API key.
+struct TenantAdmin {
+    token: String,
+    api_key: SecretString,
+}
+
+/// Bootstrap a built-in `admin` service principal in `tenant` and exchange its
+/// key: the principal that holds `identity_connections:write` and whose key
+/// doubles as the activation recovery key.
 ///
-/// The three human journeys differ only in where the federated user's Wyrd
-/// authority comes from: a baseline `default_roles` grant, or a
-/// `group_role_map` over the realm's `groups` claim. Everything else — the
-/// public PKCE client, the claim paths, the human token policy — is the same
-/// deployment shape, so it is written once here. Config-driven boot binds the
-/// entry to the fixture's implicit tenant and runs OIDC discovery for
-/// `jwks_uri`.
-fn human_issuer_entry(
-    default_roles: Vec<String>,
-    group_role_map: HashMap<String, Vec<String>>,
-) -> IssuerEntry {
-    let mut entry = IssuerEntry {
-        client_auth: ClientAuthEntry::Public,
-        claim_mapping: ClaimMappingEntry {
-            subject: "sub".to_owned(),
-            email: Some("email".to_owned()),
-            groups: Some("groups".to_owned()),
-        },
-        default_roles,
-        group_role_map,
-        ..issuer_entry(&keycloak_issuer(), "wyrd-human", IssuerTokenPolicy::Human)
+/// # Panics
+/// Panics when the bootstrap or exchange fails.
+async fn tenant_admin(srv: &WyrdTestServer, tenant: DataTenantId, name: &str) -> TenantAdmin {
+    let admin = srv
+        .bootstrap_service_in_tenant(tenant, name, &["admin"])
+        .await
+        .expect("tenant admin bootstraps");
+    let api_key = admin.api_key().expect("admin has an api key").clone();
+    let token = srv
+        .exchange_api_key(&api_key)
+        .await
+        .expect("admin api key exchanges");
+    TenantAdmin { token, api_key }
+}
+
+/// Call one authenticated JSON route and read its status and body.
+///
+/// # Panics
+/// Panics when the request cannot be built or the router fails.
+async fn call_json(
+    srv: &WyrdTestServer,
+    token: &str,
+    method: Method,
+    uri: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let mut request = Request::builder().method(method).uri(uri);
+    let body = match body {
+        Some(body) => {
+            request = request.header(header::CONTENT_TYPE, "application/json");
+            Body::from(body.to_string())
+        }
+        None => Body::empty(),
     };
-    entry.client_id = "wyrd-human".to_owned();
-    entry
+    let response = srv
+        .oneshot_authenticated(token, request.body(body).expect("request builds"))
+        .await
+        .expect("route responds");
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 262_144)
+        .await
+        .expect("body reads");
+    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+/// A `ConnectionInput` body for the Keycloak realm.
+fn connection_input(
+    client_id: &str,
+    client_auth: &str,
+    client_secret: Option<&str>,
+    expected_revision: Option<u64>,
+) -> Value {
+    serde_json::json!({
+        "issuer": keycloak_issuer(),
+        "client_id": client_id,
+        "client_auth": client_auth,
+        "client_secret": client_secret,
+        "claim_mapping": { "subject": "sub", "email": "email", "groups": "groups" },
+        "group_role_map": admins_write(),
+        "expected_revision": expected_revision,
+    })
+}
+
+/// Stage, test, and activate one Keycloak connection for `admin`'s tenant
+/// through the served connection API, returning the Active view.
+///
+/// Any existing candidate is replaced at its current revision.
+///
+/// # Panics
+/// Panics when any step does not return `200`.
+async fn activate_keycloak_connection(
+    srv: &WyrdTestServer,
+    admin: &TenantAdmin,
+    client_id: &str,
+    client_auth: &str,
+    client_secret: Option<&str>,
+) -> Value {
+    let (_, listed) = call_json(srv, &admin.token, Method::GET, CONNECTIONS, None).await;
+    let current = listed["candidate"]["revision"].as_u64();
+    let (status, candidate) = call_json(
+        srv,
+        &admin.token,
+        Method::PUT,
+        CANDIDATE,
+        Some(connection_input(client_id, client_auth, client_secret, current)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "candidate stages: {candidate}");
+    let revision = candidate["revision"].as_u64().expect("candidate revision");
+    let (status, tested) = call_json(
+        srv,
+        &admin.token,
+        Method::POST,
+        CANDIDATE_TEST,
+        Some(serde_json::json!({ "expected_revision": revision })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "candidate tests: {tested}");
+    let (status, active) = call_json(
+        srv,
+        &admin.token,
+        Method::POST,
+        CANDIDATE_ACTIVATE,
+        Some(activation(revision, &admin.api_key)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "candidate activates: {active}");
+    assert_eq!(active["state"], "Active");
+    active
+}
+
+/// A `ConnectionActivate` body.
+fn activation(revision: u64, recovery_key: &SecretString) -> Value {
+    serde_json::json!({
+        "expected_revision": revision,
+        "recovery_api_key": recovery_key.expose_secret(),
+    })
+}
+
+/// Tenant connection administration routes.
+const CONNECTIONS: &str = "/v1/identity/oidc/connections";
+const CANDIDATE: &str = "/v1/identity/oidc/candidate";
+const CANDIDATE_TEST: &str = "/v1/identity/oidc/candidate/test";
+const CANDIDATE_ACTIVATE: &str = "/v1/identity/oidc/candidate/activate";
+const ACTIVE_DEACTIVATE: &str = "/v1/identity/oidc/active/deactivate";
+
+/// Start a human journey server whose fixture tenant has an Active public
+/// Keycloak connection granting `writer` through `wyrd-admins`.
+///
+/// # Panics
+/// Panics when the server or the connection setup fails.
+async fn human_server() -> WyrdTestServer {
+    let srv = human_server_builder()
+        .start_in_process()
+        .await
+        .expect("test server starts");
+    let admin = tenant_admin(&srv, srv.data_tenant_id(), "human-connection-admin").await;
+    activate_keycloak_connection(&srv, &admin, PUBLIC_HUMAN_CLIENT, "Public", None).await;
+    srv
 }
 
 /// Drive one complete browser login and return the token response body.
@@ -808,6 +961,7 @@ fn human_issuer_entry(
 async fn human_login(
     srv: &WyrdTestServer,
     keycloak: &OidcIssuerFixture,
+    client_id: &str,
     username: &str,
     password: &str,
 ) -> Value {
@@ -859,7 +1013,7 @@ async fn human_login(
         .expect("redirect URI parses");
     let login_result = keycloak
         .human_login(
-            "wyrd-human",
+            client_id,
             username,
             password,
             &redirect_uri,
@@ -921,8 +1075,9 @@ fn principal_id_of(access_token: &str) -> String {
 }
 
 /// Drive a complete config-driven human OIDC login:
-///   1. boot trusts Keycloak via `[[trusted_issuers]]` (config-driven), granting
-///      `writer` as a default role so the federated human can be a subject,
+///   1. a tenant admin stages, tests, and activates the Keycloak connection
+///      through `/v1/identity/oidc/*`, granting `writer` through the
+///      `wyrd-admins` group so the federated human can be a subject,
 ///   2. `GET /auth/login` → authorization URL + state,
 ///   3. `OidcIssuerFixture::human_login` authenticates alice → code + state,
 ///   4. `GET /auth/callback` → Wyrd access token,
@@ -941,16 +1096,9 @@ fn principal_id_of(access_token: &str) -> String {
 async fn human_oidc_login_journey() {
     let keycloak = OidcIssuerFixture::connect(&keycloak_issuer()).await;
 
-    let srv = WyrdTestServerBuilder::default()
-        .with_trusted_issuer_configs(vec![human_issuer_entry(
-            vec!["writer".to_owned()],
-            HashMap::new(),
-        )])
-        .start_in_process()
-        .await
-        .expect("test server starts");
+    let srv = human_server().await;
 
-    let token_body = human_login(&srv, &keycloak, "alice", "alice-password").await;
+    let token_body = human_login(&srv, &keycloak, PUBLIC_HUMAN_CLIENT, "alice", "alice-password").await;
     let access_token = token_body["access_token"]
         .as_str()
         .expect("access_token present in response");
@@ -1059,16 +1207,9 @@ async fn post_refresh(srv: &WyrdTestServer, refresh_token: &str) -> (StatusCode,
 #[ignore = "requires the Keycloak and Dex identity lane"]
 async fn revoking_a_human_kills_the_session_refresh_authority() {
     let keycloak = OidcIssuerFixture::connect(&keycloak_issuer()).await;
-    let srv = WyrdTestServerBuilder::default()
-        .with_trusted_issuer_configs(vec![human_issuer_entry(
-            vec!["writer".to_owned()],
-            HashMap::new(),
-        )])
-        .start_in_process()
-        .await
-        .expect("test server starts");
+    let srv = human_server().await;
 
-    let token_body = human_login(&srv, &keycloak, "alice", "alice-password").await;
+    let token_body = human_login(&srv, &keycloak, PUBLIC_HUMAN_CLIENT, "alice", "alice-password").await;
     let access_token = token_body["access_token"]
         .as_str()
         .expect("access_token present")
@@ -1164,17 +1305,10 @@ async fn a_withdrawn_oidc_group_invalidates_the_roles_it_granted() {
         .set_group_membership("alice", "wyrd-admins", true)
         .await;
 
-    let srv = WyrdTestServerBuilder::default()
-        .with_trusted_issuer_configs(vec![human_issuer_entry(
-            Vec::new(),
-            HashMap::from([("wyrd-admins".to_owned(), vec!["writer".to_owned()])]),
-        )])
-        .start_in_process()
-        .await
-        .expect("test server starts");
+    let srv = human_server().await;
 
     // The group grants writer, so the first session's delegated checks allow.
-    let granted = human_login(&srv, &keycloak, "alice", "alice-password").await;
+    let granted = human_login(&srv, &keycloak, PUBLIC_HUMAN_CLIENT, "alice", "alice-password").await;
     let granted_token = granted["access_token"]
         .as_str()
         .expect("access_token present")
@@ -1183,14 +1317,14 @@ async fn a_withdrawn_oidc_group_invalidates_the_roles_it_granted() {
 
     // A second login asserting the same groups changes nothing, so the first
     // session keeps working: re-authenticating must not log a user out.
-    let _unchanged = human_login(&srv, &keycloak, "alice", "alice-password").await;
+    let _unchanged = human_login(&srv, &keycloak, PUBLIC_HUMAN_CLIENT, "alice", "alice-password").await;
     assert_v1_authz_check_ok(&srv, &granted_token, "roles-unchanged").await;
 
     // The provider withdraws the group; the next login persists the reduced set.
     keycloak
         .set_group_membership("alice", "wyrd-admins", false)
         .await;
-    let reduced = human_login(&srv, &keycloak, "alice", "alice-password").await;
+    let reduced = human_login(&srv, &keycloak, PUBLIC_HUMAN_CLIENT, "alice", "alice-password").await;
     let reduced_token = reduced["access_token"]
         .as_str()
         .expect("access_token present")
@@ -1224,6 +1358,641 @@ async fn a_withdrawn_oidc_group_invalidates_the_roles_it_granted() {
     keycloak
         .set_group_membership("alice", "wyrd-admins", true)
         .await;
+}
+
+// ─── Tenant human connection administration ─────────────────────────────────
+
+/// Assert a refusal's status and stable code.
+///
+/// # Panics
+/// Panics when either differs.
+fn assert_refused(status: StatusCode, body: &Value, expected: StatusCode, code: &str) {
+    assert_eq!(status, expected, "expected {expected} {code}: {body}");
+    assert_eq!(response_code(body), code, "stable code: {body}");
+}
+
+/// Start a login at the fixture tenant's host for `issuer` and return the
+/// status: `200` while the tenant's Active connection trusts the issuer.
+///
+/// # Panics
+/// Panics when the request cannot be built or the router fails.
+async fn login_status(srv: &WyrdTestServer) -> (StatusCode, Value) {
+    let issuer: String =
+        url::form_urlencoded::byte_serialize(keycloak_issuer().as_bytes()).collect();
+    let response = srv
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/auth/login?issuer={issuer}"))
+                .header(header::HOST, "test-tenant-1.wyrd.test")
+                .header(header::ACCEPT, "application/json")
+                .body(Body::empty())
+                .expect("login request builds"),
+        )
+        .await
+        .expect("login responds");
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 65_536)
+        .await
+        .expect("login body reads");
+    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+/// Tenant human connection administration across two tenants, one issuer.
+///
+/// Tenant A and tenant B each configure the same Keycloak issuer through the
+/// served `/v1/identity/oidc/*` API — A with the public client, B with the
+/// confidential client and a `SecretPost` secret — and the journey proves:
+///   1. an unauthorized tenant principal (`runtime_admin`, which holds
+///      `service_accounts:write` but not `identity_connections:write`) is
+///      refused on read and write, and each refusal is audited;
+///   2. each tenant reads only its own redacted connection with the
+///      deployment callback URL, and no response carries B's secret;
+///   3. B's administrator cannot remove A's connection (RLS answers not
+///      found), and A's login keeps working afterwards;
+///   4. the old Human trusted-issuer HTTP and CLI writers are refused with
+///      `HUMAN_CONNECTION_REQUIRED` while a Workload CLI write still succeeds;
+///   5. the served OpenAPI document publishes all six operations;
+///   6. deactivation stops A's login immediately, removal tombstones the
+///      connection, and the retained audit history records every decision.
+///
+/// # Panics
+/// Panics when any step deviates from the contract above.
+#[tokio::test]
+#[ignore = "requires the Keycloak and Dex identity lane"]
+async fn tenant_connection_admin_journey() {
+    let srv = human_server_builder()
+        .start_bound()
+        .await
+        .expect("bound server starts");
+    let server_url: Url = srv
+        .base_url()
+        .expect("bound server exposes a base URL")
+        .parse()
+        .expect("base URL parses");
+    let tenant_a = srv.data_tenant_id();
+    let tenant_b = srv
+        .seed_tenant("test-tenant-2")
+        .await
+        .expect("tenant B provisions");
+    let admin_a = tenant_admin(&srv, tenant_a, "connection-admin-a").await;
+    let admin_b = tenant_admin(&srv, tenant_b, "connection-admin-b").await;
+    let operator = srv
+        .bootstrap_service_in_tenant(tenant_a, "connection-runtime-admin", &["runtime_admin"])
+        .await
+        .expect("runtime admin bootstraps");
+    let operator_token = srv
+        .exchange_api_key(operator.api_key().expect("runtime admin has a key"))
+        .await
+        .expect("runtime admin key exchanges");
+
+    // 1. service_accounts:write alone does not administer human SSO.
+    let (status, body) = call_json(&srv, &operator_token, Method::GET, CONNECTIONS, None).await;
+    assert_refused(status, &body, StatusCode::FORBIDDEN, "WYRD_PERMISSION_403_DENIED_RBAC");
+    let (status, body) = call_json(
+        &srv,
+        &operator_token,
+        Method::PUT,
+        CANDIDATE,
+        Some(connection_input(PUBLIC_HUMAN_CLIENT, "Public", None, None)),
+    )
+    .await;
+    assert_refused(status, &body, StatusCode::FORBIDDEN, "WYRD_PERMISSION_403_DENIED_RBAC");
+
+    // 2. Both tenants trust the same issuer through their own connection.
+    let active_a =
+        activate_keycloak_connection(&srv, &admin_a, PUBLIC_HUMAN_CLIENT, "Public", None).await;
+    let active_b = activate_keycloak_connection(
+        &srv,
+        &admin_b,
+        CONFIDENTIAL_HUMAN_CLIENT,
+        "SecretPost",
+        Some(CONFIDENTIAL_HUMAN_SECRET),
+    )
+    .await;
+    assert_eq!(active_a["issuer"], active_b["issuer"], "the same issuer in both tenants");
+    let callback = format!("{PUBLIC_ORIGIN}/auth/callback");
+    for (admin, tenant, client) in [
+        (&admin_a, tenant_a, PUBLIC_HUMAN_CLIENT),
+        (&admin_b, tenant_b, CONFIDENTIAL_HUMAN_CLIENT),
+    ] {
+        let (status, listed) = call_json(&srv, &admin.token, Method::GET, CONNECTIONS, None).await;
+        assert_eq!(status, StatusCode::OK, "admin lists: {listed}");
+        assert_eq!(listed["callback_url"], callback.as_str());
+        assert_eq!(listed["active"]["tenant_id"], tenant.to_string());
+        assert_eq!(listed["active"]["client_id"], client, "each tenant sees its own client");
+        assert!(listed["candidate"].is_null(), "activation consumed the candidate");
+        assert!(
+            !listed.to_string().contains(CONFIDENTIAL_HUMAN_SECRET),
+            "no read returns a provider secret: {listed}"
+        );
+    }
+    let sealed = srv
+        .human_connection_secret_ciphertext(tenant_b, "Active")
+        .await
+        .expect("ciphertext reads")
+        .expect("tenant B stores a sealed secret");
+    assert!(
+        !sealed
+            .windows(CONFIDENTIAL_HUMAN_SECRET.len())
+            .any(|window| window == CONFIDENTIAL_HUMAN_SECRET.as_bytes()),
+        "the secret is sealed at rest"
+    );
+
+    // 3. Tenant B cannot reach tenant A's connection.
+    let a_id = active_a["id"].as_str().expect("connection id").to_owned();
+    let (status, body) = call_json(
+        &srv,
+        &admin_b.token,
+        Method::DELETE,
+        &format!("{CONNECTIONS}/{a_id}"),
+        None,
+    )
+    .await;
+    assert_refused(status, &body, StatusCode::NOT_FOUND, "WYRD_SPEC_404_NOT_FOUND");
+    let keycloak = OidcIssuerFixture::connect(&keycloak_issuer()).await;
+    let session = human_login(&srv, &keycloak, PUBLIC_HUMAN_CLIENT, "alice", "alice-password").await;
+    let access = session["access_token"].as_str().expect("access token");
+    assert_v1_authz_check_ok(&srv, access, "tenant-a-connection").await;
+
+    // 4. The old Human writers are refused; Workload writes remain.
+    let (status, body) = call_json(
+        &srv,
+        &admin_a.token,
+        Method::POST,
+        "/v1/admin/trusted-issuers",
+        Some(serde_json::json!({
+            "issuer": keycloak_issuer(),
+            "expected_audience": PUBLIC_HUMAN_CLIENT,
+            "client_id": PUBLIC_HUMAN_CLIENT,
+            "client_auth": "Public",
+            "claim_mapping": { "subject": "sub" },
+            "principal_kind": "human",
+        })),
+    )
+    .await;
+    assert_refused(
+        status,
+        &body,
+        StatusCode::BAD_REQUEST,
+        "WYRD_AUTH_400_HUMAN_CONNECTION_REQUIRED",
+    );
+    set_cli_environment("WYRD_ACCESS_TOKEN", &admin_a.token);
+    let cli_issuer = |principal_kind: &str| {
+        TrustedIssuerCommand::Add(Box::new(TrustedIssuerAddArgs {
+            issuer: keycloak_issuer(),
+            expected_audience: "wyrd-workload".to_owned(),
+            client_id: "wyrd-workload".to_owned(),
+            client_auth: "Public".to_owned(),
+            client_secret_file: None,
+            claim_subject: "sub".to_owned(),
+            claim_email: None,
+            claim_groups: None,
+            default_roles: Vec::new(),
+            group_roles: Vec::new(),
+            principal_kind: principal_kind.to_owned(),
+            jwks_ttl_secs: Some(300),
+            server: server_url.clone(),
+        }))
+    };
+    let refused = trusted_issuer::dispatch(cli_issuer("Human"))
+        .await
+        .expect_err("the CLI refuses a Human issuer");
+    assert!(
+        matches!(
+            refused,
+            WyrdCliError::Server {
+                source: WyrdError::HumanConnectionRequired { .. }
+            }
+        ),
+        "CLI refusal is HUMAN_CONNECTION_REQUIRED: {refused:?}"
+    );
+    trusted_issuer::dispatch(cli_issuer("Workload"))
+        .await
+        .expect("a Workload issuer is still authored through the CLI");
+
+    // 5. The served contract publishes the connection surface.
+    let openapi = srv
+        .oneshot(
+            Request::builder()
+                .uri("/openapi.json")
+                .body(Body::empty())
+                .expect("openapi request builds"),
+        )
+        .await
+        .expect("openapi responds");
+    let document: Value = serde_json::from_slice(
+        &to_bytes(openapi.into_body(), 16 * 1024 * 1024)
+            .await
+            .expect("openapi body reads"),
+    )
+    .expect("openapi is JSON");
+    for (path, method) in [
+        (CONNECTIONS, "get"),
+        (CANDIDATE, "put"),
+        (CANDIDATE_TEST, "post"),
+        (CANDIDATE_ACTIVATE, "post"),
+        (ACTIVE_DEACTIVATE, "post"),
+        ("/v1/identity/oidc/connections/{id}", "delete"),
+    ] {
+        assert!(
+            document["paths"][path][method].is_object(),
+            "served OpenAPI publishes {method} {path}"
+        );
+    }
+
+    // 6. Deactivation stops login at once; removal tombstones the record.
+    let (status, body) =
+        call_json(&srv, &admin_a.token, Method::POST, ACTIVE_DEACTIVATE, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "deactivates: {body}");
+    let (status, body) = login_status(&srv).await;
+    assert_refused(status, &body, StatusCode::UNAUTHORIZED, "WYRD_AUTH_401_INVALID_TOKEN");
+    let (status, body) = call_json(
+        &srv,
+        &admin_a.token,
+        Method::DELETE,
+        &format!("{CONNECTIONS}/{a_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "removes: {body}");
+    let (status, body) = call_json(
+        &srv,
+        &admin_a.token,
+        Method::DELETE,
+        &format!("{CONNECTIONS}/{a_id}"),
+        None,
+    )
+    .await;
+    assert_refused(status, &body, StatusCode::NOT_FOUND, "WYRD_SPEC_404_NOT_FOUND");
+    let (_, listed) = call_json(&srv, &admin_a.token, Method::GET, CONNECTIONS, None).await;
+    assert!(listed["active"].is_null() && listed["candidate"].is_null(), "{listed}");
+    let (_, listed_b) = call_json(&srv, &admin_b.token, Method::GET, CONNECTIONS, None).await;
+    assert_eq!(listed_b["active"]["id"], active_b["id"], "tenant B is untouched");
+
+    srv.await_audit_published(tenant_a)
+        .await
+        .expect("tenant A audit publishes");
+    let decisions = srv
+        .retained_audit_records(
+            tenant_a,
+            "operation, outcome",
+            "operation LIKE 'identity.oidc.%'",
+        )
+        .await
+        .expect("retained audit reads");
+    let decisions: Vec<(String, String)> = decisions
+        .into_iter()
+        .map(|row| {
+            (
+                row[0].clone().unwrap_or_default(),
+                row[1].clone().unwrap_or_default().to_lowercase(),
+            )
+        })
+        .collect();
+    for (operation, outcome) in [
+        ("identity.oidc.connections.list", "denied"),
+        ("identity.oidc.candidate.put", "denied"),
+        ("identity.oidc.candidate.put", "allowed"),
+        ("identity.oidc.candidate.test", "allowed"),
+        ("identity.oidc.candidate.tested", "allowed"),
+        ("identity.oidc.candidate.activate", "allowed"),
+        ("identity.oidc.active.deactivate", "allowed"),
+        ("identity.oidc.connection.remove", "allowed"),
+    ] {
+        assert!(
+            decisions
+                .iter()
+                .any(|(op, out)| op == operation && out == outcome),
+            "retained audit records {operation} {outcome}: {decisions:?}"
+        );
+    }
+    let audit_text = format!("{decisions:?}");
+    assert!(!audit_text.contains(CONFIDENTIAL_HUMAN_SECRET));
+
+    srv.shutdown().await.expect("server shuts down cleanly");
+}
+
+/// Candidate lifecycle, secret rotation, and replica safety for one tenant.
+///
+/// Two replicas share one database. Replica A seals with key K1 and retains
+/// K2; the journey proves:
+///   1. an unsafe issuer (cloud metadata address) stages but fails its test
+///      before any connection, and a stale `expected_revision` conflicts;
+///   2. a candidate with a wrong secret fails its test as
+///      `client_auth_rejected` and cannot be activated;
+///   3. the fixed candidate's stamp lasts fifteen minutes, a recovery key
+///      without `identity_connections:write` is refused, and an injected
+///      audit failure rolls activation back;
+///   4. two concurrent activations of the same revision yield exactly one
+///      winner;
+///   5. replica B boots with K2 as the write key and K1 retained, rewraps the
+///      stored secret under K2, and both replicas still sign alice in;
+///   6. a same-issuer secret rotation staged and activated on B is served by
+///      A at once, and deactivation on B stops login on A.
+///
+/// # Panics
+/// Panics when any step deviates from the contract above.
+#[tokio::test]
+#[ignore = "requires the Keycloak and Dex identity lane"]
+async fn tenant_connection_rotation_journey() {
+    let k1 = [0x11_u8; 32];
+    let k2 = [0x22_u8; 32];
+    let keyring = |write: [u8; 32], retained: [u8; 32]| {
+        std::sync::Arc::new(
+            SealingKeyring::new(SecretKey::from_bytes(write))
+                .with_retained(SecretKey::from_bytes(retained)),
+        )
+    };
+    let replica_a = human_server_builder()
+        .with_sealing_keyring(keyring(k1, k2))
+        .start_in_process()
+        .await
+        .expect("replica A starts");
+    let tenant = replica_a.data_tenant_id();
+    let admin = tenant_admin(&replica_a, tenant, "rotation-admin").await;
+    let token = admin.token.as_str();
+
+    // 1. Unsafe discovery fails closed; stale revisions conflict.
+    let mut unsafe_input = connection_input(PUBLIC_HUMAN_CLIENT, "Public", None, None);
+    unsafe_input["issuer"] = "https://169.254.169.254".into();
+    let (status, staged) =
+        call_json(&replica_a, token, Method::PUT, CANDIDATE, Some(unsafe_input)).await;
+    assert_eq!(status, StatusCode::OK, "staging does no provider IO: {staged}");
+    assert_eq!(staged["revision"], 1);
+    let (status, body) = call_json(
+        &replica_a,
+        token,
+        Method::POST,
+        CANDIDATE_TEST,
+        Some(serde_json::json!({ "expected_revision": 1 })),
+    )
+    .await;
+    assert_refused(status, &body, StatusCode::BAD_REQUEST, "WYRD_SPEC_400_VALIDATION");
+    let (status, body) = call_json(
+        &replica_a,
+        token,
+        Method::PUT,
+        CANDIDATE,
+        Some(connection_input(PUBLIC_HUMAN_CLIENT, "Public", None, None)),
+    )
+    .await;
+    assert_refused(status, &body, StatusCode::CONFLICT, "WYRD_AUTH_409_CONNECTION_CONFLICT");
+
+    // 2. A wrong secret fails the client-authentication probe.
+    let (status, staged) = call_json(
+        &replica_a,
+        token,
+        Method::PUT,
+        CANDIDATE,
+        Some(connection_input(
+            CONFIDENTIAL_HUMAN_CLIENT,
+            "SecretPost",
+            Some("not-the-secret"),
+            Some(1),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "candidate replaces: {staged}");
+    assert_eq!(staged["revision"], 2);
+    let (status, body) = call_json(
+        &replica_a,
+        token,
+        Method::POST,
+        CANDIDATE_TEST,
+        Some(serde_json::json!({ "expected_revision": 2 })),
+    )
+    .await;
+    assert_refused(status, &body, StatusCode::CONFLICT, "WYRD_AUTH_409_CONNECTION_NOT_TESTED");
+    assert_eq!(body["details"]["reason"], "client_auth_rejected", "{body}");
+    let (status, body) = call_json(
+        &replica_a,
+        token,
+        Method::POST,
+        CANDIDATE_ACTIVATE,
+        Some(activation(2, &admin.api_key)),
+    )
+    .await;
+    assert_refused(status, &body, StatusCode::CONFLICT, "WYRD_AUTH_409_CONNECTION_NOT_TESTED");
+
+    // 3. The fixed candidate tests for fifteen minutes; activation still
+    //    needs a qualifying recovery key and a durable audit decision.
+    let (status, staged) = call_json(
+        &replica_a,
+        token,
+        Method::PUT,
+        CANDIDATE,
+        Some(connection_input(
+            CONFIDENTIAL_HUMAN_CLIENT,
+            "SecretPost",
+            Some(CONFIDENTIAL_HUMAN_SECRET),
+            Some(2),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "candidate replaces: {staged}");
+    assert!(staged["tested_until"].is_null(), "a replaced candidate is untested");
+    let (status, tested) = call_json(
+        &replica_a,
+        token,
+        Method::POST,
+        CANDIDATE_TEST,
+        Some(serde_json::json!({ "expected_revision": 3 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "candidate tests: {tested}");
+    assert_eq!(tested["candidate"]["tested_revision"], 3);
+    let tested_until: chrono::DateTime<chrono::Utc> =
+        serde_json::from_value(tested["candidate"]["tested_until"].clone())
+            .expect("tested_until is a timestamp");
+    let window = tested_until - chrono::Utc::now();
+    assert!(
+        window > ChronoDuration::minutes(14) && window <= ChronoDuration::minutes(15),
+        "the stamp lasts fifteen minutes: {window}"
+    );
+    let runtime_admin = replica_a
+        .bootstrap_service_in_tenant(tenant, "rotation-runtime-admin", &["runtime_admin"])
+        .await
+        .expect("runtime admin bootstraps");
+    let (status, body) = call_json(
+        &replica_a,
+        token,
+        Method::POST,
+        CANDIDATE_ACTIVATE,
+        Some(activation(
+            3,
+            runtime_admin.api_key().expect("runtime admin has a key"),
+        )),
+    )
+    .await;
+    assert_refused(status, &body, StatusCode::CONFLICT, "WYRD_AUTH_409_CONNECTION_CONFLICT");
+    assert!(
+        !body.to_string().contains(
+            runtime_admin
+                .api_key()
+                .expect("runtime admin has a key")
+                .expose_secret()
+        ),
+        "the refusal never echoes the recovery key"
+    );
+
+    let superuser = replica_a
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool opens");
+    sqlx::query(
+        r#"CREATE OR REPLACE FUNCTION vala.test_fail_connection_activation_audit()
+           RETURNS trigger LANGUAGE plpgsql AS $$
+           BEGIN
+             IF NEW.operation = 'identity.oidc.candidate.activate' THEN
+               RAISE EXCEPTION 'injected connection activation audit failure';
+             END IF;
+             RETURN NEW;
+           END;
+           $$;"#,
+    )
+    .execute(&superuser)
+    .await
+    .expect("failure function installs");
+    sqlx::query(
+        r#"CREATE TRIGGER test_fail_connection_activation_audit
+           BEFORE INSERT ON vala.audit_staging
+           FOR EACH ROW EXECUTE FUNCTION vala.test_fail_connection_activation_audit()"#,
+    )
+    .execute(&superuser)
+    .await
+    .expect("failure trigger installs");
+    let (status, body) = call_json(
+        &replica_a,
+        token,
+        Method::POST,
+        CANDIDATE_ACTIVATE,
+        Some(activation(3, &admin.api_key)),
+    )
+    .await;
+    assert!(
+        status.is_server_error(),
+        "activation without a durable decision fails closed: {status} {body}"
+    );
+    sqlx::query("DROP TRIGGER test_fail_connection_activation_audit ON vala.audit_staging")
+        .execute(&superuser)
+        .await
+        .expect("failure trigger drops");
+    let (_, listed) = call_json(&replica_a, token, Method::GET, CONNECTIONS, None).await;
+    assert!(listed["active"].is_null(), "the failed activation rolled back: {listed}");
+    assert_eq!(listed["candidate"]["revision"], 3, "{listed}");
+
+    // 4. Concurrent activations of one revision have exactly one winner.
+    let first = call_json(
+        &replica_a,
+        token,
+        Method::POST,
+        CANDIDATE_ACTIVATE,
+        Some(activation(3, &admin.api_key)),
+    );
+    let second = call_json(
+        &replica_a,
+        token,
+        Method::POST,
+        CANDIDATE_ACTIVATE,
+        Some(activation(3, &admin.api_key)),
+    );
+    let ((first_status, first_body), (second_status, second_body)) =
+        tokio::join!(first, second);
+    let mut statuses = [first_status, second_status];
+    statuses.sort();
+    assert_eq!(
+        statuses,
+        [StatusCode::OK, StatusCode::CONFLICT],
+        "exactly one activation wins: {first_body} / {second_body}"
+    );
+
+    let keycloak = OidcIssuerFixture::connect(&keycloak_issuer()).await;
+    let session = human_login(
+        &replica_a,
+        &keycloak,
+        CONFIDENTIAL_HUMAN_CLIENT,
+        "alice",
+        "alice-password",
+    )
+    .await;
+    assert_v1_authz_check_ok(
+        &replica_a,
+        session["access_token"].as_str().expect("access token"),
+        "rotation-k1",
+    )
+    .await;
+
+    // 5. Replica B switches the write key to K2; its boot rewraps the secret.
+    let under_k1 = replica_a
+        .human_connection_secret_ciphertext(tenant, "Active")
+        .await
+        .expect("ciphertext reads")
+        .expect("active connection stores a secret");
+    let k2_only = SealingKeyring::new(SecretKey::from_bytes(k2));
+    assert!(k2_only.open(&under_k1).is_err(), "K1 sealed the first secret");
+    let replica_b = replica_a
+        .start_replica(human_server_builder().with_sealing_keyring(keyring(k2, k1)))
+        .await
+        .expect("replica B starts");
+    let under_k2 = replica_a
+        .human_connection_secret_ciphertext(tenant, "Active")
+        .await
+        .expect("ciphertext reads")
+        .expect("active connection stores a secret");
+    assert_ne!(under_k1, under_k2, "boot rewrapped the stored secret");
+    assert_eq!(
+        k2_only.rewrap(&under_k2).expect("K2 opens the rewrapped secret"),
+        None,
+        "the rewrapped secret references only the write key"
+    );
+    for (replica, label) in [(&replica_a, "rotation-a"), (&replica_b, "rotation-b")] {
+        let session = human_login(
+            replica,
+            &keycloak,
+            CONFIDENTIAL_HUMAN_CLIENT,
+            "alice",
+            "alice-password",
+        )
+        .await;
+        assert_v1_authz_check_ok(
+            replica,
+            session["access_token"].as_str().expect("access token"),
+            label,
+        )
+        .await;
+    }
+
+    // 6. A same-issuer secret rotation on B is served by A without restart.
+    let rotated = activate_keycloak_connection(
+        &replica_b,
+        &admin,
+        CONFIDENTIAL_HUMAN_CLIENT,
+        "SecretPost",
+        Some(CONFIDENTIAL_HUMAN_SECRET),
+    )
+    .await;
+    let (_, listed) = call_json(&replica_a, token, Method::GET, CONNECTIONS, None).await;
+    assert_eq!(listed["active"]["id"], rotated["id"], "A serves B's activation");
+    assert_eq!(listed["active"]["revision"], 4);
+    let session = human_login(
+        &replica_a,
+        &keycloak,
+        CONFIDENTIAL_HUMAN_CLIENT,
+        "alice",
+        "alice-password",
+    )
+    .await;
+    assert!(session["access_token"].is_string(), "A signs in through the rotated connection");
+    let (status, body) =
+        call_json(&replica_b, token, Method::POST, ACTIVE_DEACTIVATE, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "B deactivates: {body}");
+    let (status, body) = login_status(&replica_a).await;
+    assert_refused(status, &body, StatusCode::UNAUTHORIZED, "WYRD_AUTH_401_INVALID_TOKEN");
+
+    replica_b.shutdown().await.expect("replica B shuts down");
+    replica_a.shutdown().await.expect("replica A shuts down");
 }
 
 // ─── Federated cloud journey: CLI-authored issuer + binding ───────────────────

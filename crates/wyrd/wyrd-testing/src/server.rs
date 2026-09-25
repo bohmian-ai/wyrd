@@ -828,6 +828,32 @@ impl WyrdTestServer {
             .await
     }
 
+    /// Start `builder` as a second in-process replica over this server's
+    /// Postgres fixture and artifact storage, leaving this server running.
+    ///
+    /// The replica builds its own application state, auth handles, and
+    /// sealing keyring from `builder`, so a journey can prove that durable
+    /// state written through one replica is served by another without a
+    /// restart, and that replicas holding different keyrings interoperate
+    /// during sealing-key rotation. The Bifrost peer principal is shared, as
+    /// every replica of one deployment shares it.
+    ///
+    /// # Errors
+    /// Returns an error when the replica fails to start.
+    pub async fn start_replica(
+        &self,
+        builder: WyrdTestServerBuilder,
+    ) -> Result<WyrdTestServer, WyrdTestServerError> {
+        builder
+            .with_oracle_peer_credentials(Arc::clone(&self.peer_credentials))
+            .start_with_resources(
+                Arc::clone(&self.inner.fixture),
+                Arc::clone(&self.inner.state.storage),
+                self.inner._storage_root.clone(),
+            )
+            .await
+    }
+
     /// Cancel the serve task, join it in place, and return its drain outcome.
     ///
     /// Unlike [`shutdown`](Self::shutdown) and
@@ -2777,6 +2803,29 @@ impl WyrdTestServer {
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         conn.commit().await.map_err(sql)?;
         Ok(tenant_id)
+    }
+
+    /// Return the raw sealed client secret of the tenant's human connection in
+    /// `state` (`Active` or `Candidate`).
+    ///
+    /// Reads the stored column byte-for-byte through a [`TenantConn`], so a
+    /// journey can assert ciphertext at rest and which sealing key a rotation
+    /// left it under. Returns `None` when no such connection exists or it
+    /// stores no secret.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub async fn human_connection_secret_ciphertext(
+        &self,
+        tenant_id: DataTenantId,
+        state: &str,
+    ) -> Result<Option<Vec<u8>>, WyrdTestServerError> {
+        let mut conn = self.tenant_conn_for(tenant_id).await?;
+        let row = wyrd_sql::queries::auth::human_connection_in_state(&mut conn, state)
+            .await
+            .map_err(sql)?;
+        conn.commit().await.map_err(sql)?;
+        Ok(row.and_then(|row| row.client_secret_enc))
     }
 
     /// Return the raw `client_secret_enc` ciphertext for a trusted issuer.

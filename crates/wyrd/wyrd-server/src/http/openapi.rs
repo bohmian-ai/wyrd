@@ -146,6 +146,10 @@ fn is_problem(content: Option<&Content>) -> bool {
             description = "Tenant administration of trusted OIDC issuers and workload bindings"
         ),
         (
+            name = "Identity",
+            description = "Tenant human OIDC login connection administration"
+        ),
+        (
             name = "Cards",
             description = "Card registration, resolution, listing, and deletion"
         ),

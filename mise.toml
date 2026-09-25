@@ -646,7 +646,37 @@ create_user("bob", "bob@wyrd.test", "wyrd-test", "wyrd-viewers")
 print("Keycloak users seeded")
 PYEOF
 
-cargo nextest run --locked -p wyrd-server --all-features --test identity_e2e --run-ignored=all --test-threads=1
+# WYRD_IDENTITY_TARGET selects the suite (only `server` exists);
+# WYRD_IDENTITY_FILTER selects one exact test and must select exactly one.
+# Unfiltered runs every identity journey, and first proves each named tenant
+# connection journey still selects exactly one test so a rename cannot
+# silently drop it.
+target="${WYRD_IDENTITY_TARGET:-server}"
+if [ "$target" != server ]; then
+  echo "unsupported WYRD_IDENTITY_TARGET=$target (supported: server)" >&2
+  exit 2
+fi
+selected_count() {
+  cargo nextest list --locked -p wyrd-server --all-features --test identity_e2e --run-ignored=all --message-format oneline -E "$1" | grep -c . || true
+}
+if [ -n "${WYRD_IDENTITY_FILTER:-}" ]; then
+  expr="test(=${WYRD_IDENTITY_FILTER})"
+  count="$(selected_count "$expr")"
+  if [ "$count" != 1 ]; then
+    echo "WYRD_IDENTITY_FILTER=$WYRD_IDENTITY_FILTER selects $count tests; expected exactly 1" >&2
+    exit 1
+  fi
+  cargo nextest run --locked -p wyrd-server --all-features --test identity_e2e --run-ignored=all --test-threads=1 -E "$expr"
+else
+  for required in tenant_connection_admin_journey tenant_connection_rotation_journey; do
+    count="$(selected_count "test(=$required)")"
+    if [ "$count" != 1 ]; then
+      echo "identity journey $required selects $count tests; expected exactly 1" >&2
+      exit 1
+    fi
+  done
+  cargo nextest run --locked -p wyrd-server --all-features --test identity_e2e --run-ignored=all --test-threads=1
+fi
 """
 
 [tasks."build:server"]

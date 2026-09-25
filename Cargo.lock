@@ -11593,6 +11593,7 @@ dependencies = [
  "url",
  "uuid",
  "wiremock",
+ "workspace-hack",
  "wyrd-crypt",
  "wyrd-spec",
  "wyrd-tls",

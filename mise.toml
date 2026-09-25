@@ -1297,10 +1297,11 @@ run = "bash scripts/sync-agent-skills.sh --check"
 
 [tasks."check:workspace-hack"]
 hide = true
-description = "Fail when the hakari workspace-hack no longer matches the workspace's third-party feature union (regenerate with `cargo hakari generate`)"
+description = "Fail when the hakari workspace-hack no longer matches the workspace's third-party feature union, or a member does not depend on it (fix with `cargo hakari generate` and `cargo hakari manage-deps`)"
 run = """
 set -eu
 cargo hakari generate --diff
+cargo hakari manage-deps --dry-run
 cargo hakari verify
 """
 

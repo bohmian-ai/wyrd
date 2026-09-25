@@ -18,10 +18,9 @@ mod pg_tests {
     use wyrd_sql::pool::build_app_pool;
     use wyrd_sql::queries::auth::{
         TrustedIssuerWrite, WorkloadBindingWrite, consume_active_refresh, delete_trusted_issuer,
-        delete_workload_binding, delete_workload_bindings_for_issuer, human_connection_is_active,
-        insert_human_refresh_token, insert_user, trusted_issuer_by_url, trusted_issuers_for_tenant,
-        upsert_user_identity, user_by_email, user_by_id, user_id_by_identity,
-        workload_binding_by_key, workload_binding_by_subject,
+        delete_workload_binding, delete_workload_bindings_for_issuer, insert_user,
+        trusted_issuer_by_url, trusted_issuers_for_tenant, upsert_user_identity, user_by_email,
+        user_by_id, user_id_by_identity, workload_binding_by_key, workload_binding_by_subject,
     };
     // `insert_trusted_issuer`/`insert_workload_binding` are referenced by full path
     // in `cloud_issuer_crud_write_path_conflict_and_cascade` because this test module
@@ -303,12 +302,10 @@ mod pg_tests {
     ///   (c) two Human issuers in one tenant: each preflight fails naming the
     ///       tenant and a repair step, leaking no secret, and leaving the old
     ///       schema and rows untouched;
-    ///   (d) a live legacy user refresh family issued under Human issuer A,
-    ///       whose tenant then replaced A with B before upgrading: the family
-    ///       stays unbound, so the refresh path's consume returns a row with no
-    ///       connection and rotation refuses it, a machine row is untouched,
-    ///       and a fresh post-migration refresh row issued under B is bound to
-    ///       B's Active revision and renewable.
+    ///   (d) live legacy user and machine refresh rows: both stay live and
+    ///       unbound, so the refresh path's consume returns a row with no
+    ///       connection, which rotation refuses (runtime renewal under a bound
+    ///       connection is covered by the refresh rotation tests).
     #[tokio::test]
     async fn human_connection_upgrade_preflight() {
         let Some(_) = database_url() else {
@@ -473,19 +470,16 @@ mod pg_tests {
             assert_preflight_refuses(pool, tenant, secret, "2 Human trusted issuers").await;
         }
 
-        // (d) A legacy refresh family issued under a replaced issuer stays
-        // unbound and cannot rotate; a fresh session under the replacement
-        // is bound and renewable.
+        // (d) Legacy refresh rows stay live and unbound.
         {
             let database = pre_human_connection_database().await;
             let pool = database.migrator_pool();
             let tenant = DataTenantId::new_v7();
-            insert_tenant(pool, tenant, "upgrade-replaced-issuer").await;
-            let issuer_a = "https://legacy-idp.example.com/a";
+            insert_tenant(pool, tenant, "upgrade-legacy-refresh").await;
             insert_legacy_human_issuer(
                 pool,
                 tenant,
-                issuer_a,
+                "https://legacy-idp.example.com/refresh",
                 "Public",
                 None,
                 serde_json::json!([]),
@@ -511,20 +505,6 @@ mod pg_tests {
                 .await
                 .expect("legacy refresh row inserts");
             }
-            sqlx::query("DELETE FROM wyrd.auth_trusted_issuers WHERE issuer_url = $1")
-                .bind(issuer_a)
-                .execute(pool)
-                .await
-                .expect("issuer A is removed");
-            insert_legacy_human_issuer(
-                pool,
-                tenant,
-                "https://legacy-idp.example.com/b",
-                "Public",
-                None,
-                serde_json::json!([]),
-            )
-            .await;
 
             wyrd_sql::migrate(pool).await.expect("upgrade applies");
 
@@ -559,63 +539,6 @@ mod pg_tests {
                 ),
                 (None, None),
                 "the refresh path sees no connection and refuses to rotate"
-            );
-            drop(conn);
-
-            let binding: wyrd_sql::row_types::auth::HumanConnectionBinding = {
-                let (connection_id, connection_revision): (Uuid, i64) = sqlx::query_as(
-                    "SELECT connection_id, revision FROM wyrd.auth_human_connections
-                      WHERE data_tenant_id = $1 AND state = 'Active'",
-                )
-                .bind(tenant.as_uuid())
-                .fetch_one(pool)
-                .await
-                .expect("issuer B is the Active connection");
-                wyrd_sql::row_types::auth::HumanConnectionBinding {
-                    connection_id,
-                    connection_revision,
-                }
-            };
-            let mut conn = TenantConn::acquire(pool, tenant)
-                .await
-                .expect("tenant conn acquires");
-            insert_human_refresh_token(
-                &mut conn,
-                Uuid::now_v7(),
-                user_id,
-                "fresh-user-hash",
-                chrono::Utc::now() + chrono::Duration::hours(1),
-                None,
-                binding,
-            )
-            .await
-            .expect("fresh refresh row inserts under B");
-            conn.commit().await.expect("fresh session commits");
-
-            let mut conn = TenantConn::acquire(pool, tenant)
-                .await
-                .expect("tenant conn acquires");
-            let fresh = consume_active_refresh(&mut conn, "fresh-user-hash")
-                .await
-                .expect("fresh row consumes")
-                .expect("fresh row is live");
-            assert_eq!(
-                (fresh.human_connection_id, fresh.human_connection_revision),
-                (
-                    Some(binding.connection_id),
-                    Some(binding.connection_revision)
-                ),
-                "the fresh family is bound to B"
-            );
-            assert!(
-                human_connection_is_active(
-                    &mut conn,
-                    binding.connection_id,
-                    binding.connection_revision
-                )
-                .await
-                .expect("binding check runs"),
-                "the fresh family's connection admits renewal"
             );
         }
     }

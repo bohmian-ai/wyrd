@@ -216,10 +216,13 @@ async fn identity_connection_operations_publish_their_contract() {
     }
 
     let schemas = &document["components"]["schemas"];
-    let view = schemas["HumanConnectionView"].to_string();
+    let view_fields = schemas["HumanConnectionView"]["properties"]
+        .as_object()
+        .expect("HumanConnectionView publishes its properties");
     assert!(
-        !view.contains("secret"),
-        "the redacted view must not carry a secret field: {view}"
+        view_fields.keys().all(|field| !field.contains("secret")),
+        "the redacted view must not carry a secret field: {:?}",
+        view_fields.keys().collect::<Vec<_>>()
     );
     assert_eq!(
         schemas["HumanClientAuth"]["enum"],

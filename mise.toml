@@ -165,7 +165,7 @@ run = [
 
 [tasks."test:gateway:native"]
 description = "Run the real-server native Anthropic and Gemini gateway ingress journeys (Rust HTTP and official Python clients)"
-depends = ["py:setup:testing"]
+depends = ["py:setup"]
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:gateway:native:inner && mise run py:test:gateway:native:inner'"
 
 [tasks."test:gateway:native:inner"]
@@ -188,7 +188,7 @@ MCP, and Rust SDK administration journeys, the Python
 official-client journeys over all four provider backends with their Bifrost capture evidence, and the
 TypeScript inference journey. Credential-free: every provider is a local mock upstream.
 """
-depends = ["py:setup:testing", "ts:build", "ts:build:testing"]
+depends = ["py:setup", "ts:build", "ts:build:testing"]
 run = """scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner \
   && mise run test:gateway:native:inner \
   && mise run test:gateway:vault:inner \
@@ -227,7 +227,7 @@ as managed secrets through the CLI. A provider whose credential is absent is ski
 Vertex is excluded: its credential is a short-lived OAuth token, which never enters managed-secret
 storage. Deliberately outside test:gateway:journey and the CI gate.
 """
-depends = ["py:setup:testing"]
+depends = ["py:setup"]
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:gateway:smoke:live:inner'"
 
 [tasks."test:gateway:smoke:live:inner"]

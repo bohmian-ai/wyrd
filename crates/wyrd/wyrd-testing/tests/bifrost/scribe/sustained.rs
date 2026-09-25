@@ -268,6 +268,23 @@ async fn scribe_sustained_ingest_oracle_hot_read_journey() {
         participant.assert_exact("published-hot").await;
     }
 
+    // Every read above committed a read decision that the server's audit
+    // publisher appends through this same Scribe. Settle that retained history
+    // and publish what it wrote, so the pod is drained rather than mid-append.
+    for tenant in participants
+        .iter()
+        .map(|participant| participant.tenant)
+        .chain([server.data_tenant_id()])
+    {
+        server
+            .await_audit_published(tenant)
+            .await
+            .expect("retained audit history settles");
+    }
+    server
+        .flush_bifrost()
+        .await
+        .expect("the published audit history publishes");
     assert_terminal_reconciliation(&server);
     server.shutdown().await.expect("the server drains cleanly");
 }

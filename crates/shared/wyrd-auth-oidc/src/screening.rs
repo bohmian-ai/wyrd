@@ -145,9 +145,7 @@ impl ScreenedHttp {
     /// fails, and [`ScreenError::Client`] when TLS setup or client construction
     /// fails.
     pub async fn client_for(&self, url: &Url) -> Result<Client, ScreenError> {
-        if !self.permits_scheme(url.scheme()) {
-            return Err(ScreenError::Blocked);
-        }
+        self.screen_scheme(url)?;
         wyrd_tls::install_crypto_provider().map_err(|_| ScreenError::Client)?;
         // No proxy, ambient or otherwise: a proxy would receive the original
         // hostname and choose its own destination, bypassing the pinned,
@@ -204,6 +202,23 @@ impl ScreenedHttp {
             return Err(ScreenError::Blocked);
         }
         Ok(addrs)
+    }
+
+    /// Refuse `url` unless this deployment may use its scheme.
+    ///
+    /// The scheme half of [`Self::client_for`], on its own for provider URLs
+    /// Wyrd hands to a browser rather than fetches itself — such as a
+    /// discovered authorization endpoint — so the same production rule keeps
+    /// login state and PKCE parameters off cleartext there too.
+    ///
+    /// # Errors
+    /// Returns [`ScreenError::Blocked`] when the policy refuses the scheme.
+    pub fn screen_scheme(&self, url: &Url) -> Result<(), ScreenError> {
+        if self.permits_scheme(url.scheme()) {
+            Ok(())
+        } else {
+            Err(ScreenError::Blocked)
+        }
     }
 
     /// Whether this deployment may send a provider request over `scheme`.

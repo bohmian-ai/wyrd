@@ -27,7 +27,7 @@ use crate::audit::{
     TOKEN_EXCHANGE_OPERATION, auth_event, auth_failure_code, record_auth_audit_best_effort,
 };
 use crate::connections::HumanConnections;
-use crate::error::{auth_error_to_wyrd, screen_error, store_error};
+use crate::error::{auth_error_to_wyrd, provider_unreachable, screen_error, store_error};
 use crate::exchange_api_key::role_refs;
 use crate::issuance::TenantTokenIssuer;
 use crate::login::{LoginStateEntry, PgLoginStateStore};
@@ -299,11 +299,10 @@ pub(crate) async fn discover_provider(
     issuer: &IssuerUrl,
     http: ScreenedHttp,
 ) -> Result<OidcProvider, DiscoveryFailure> {
-    let issuer_url = Url::parse(issuer.as_str()).map_err(|_| {
-        DiscoveryFailure::Unavailable(WyrdError::DiscoveryUnavailable {
-            message: "trusted issuer URL could not be parsed".to_owned(),
-            details: serde_json::json!({}),
-        })
+    let issuer_url = Url::parse(issuer.as_str()).map_err(|error| {
+        DiscoveryFailure::Unavailable(provider_unreachable(format_args!(
+            "trusted issuer URL could not be parsed: {error}"
+        )))
     })?;
     let client = http
         .client_for(&issuer_url)
@@ -311,15 +310,14 @@ pub(crate) async fn discover_provider(
         .map_err(|error| DiscoveryFailure::Unavailable(screen_error(&error)))?;
     OidcProvider::discover(issuer_url, client)
         .await
-        .map_err(|error| {
-            tracing::warn!(error = %error, "OIDC discovery failed");
-            match error {
-                OidcError::IssuerMismatch { .. } => DiscoveryFailure::IssuerMismatch,
-                _ => DiscoveryFailure::Unavailable(WyrdError::DiscoveryUnavailable {
-                    message: "OIDC discovery unavailable".to_owned(),
-                    details: serde_json::json!({}),
-                }),
+        .map_err(|error| match error {
+            OidcError::IssuerMismatch { .. } => {
+                tracing::warn!(error = %error, "OIDC discovery failed");
+                DiscoveryFailure::IssuerMismatch
             }
+            error => DiscoveryFailure::Unavailable(provider_unreachable(format_args!(
+                "OIDC discovery failed: {error}"
+            ))),
         })
 }
 

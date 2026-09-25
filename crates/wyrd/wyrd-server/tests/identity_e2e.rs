@@ -8,6 +8,7 @@ use base64::Engine as _;
 use chrono::Duration as ChronoDuration;
 use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::Value;
+use sqlx::PgPool;
 use url::Url;
 use wyrd_auth_check::AuthzCheckRequest;
 use wyrd_auth_check::response::AuthzCheckDecision;
@@ -2431,7 +2432,7 @@ async fn tenant_connection_rotation_journey() {
 ///
 /// # Panics
 /// Panics when the read fails or the principal has no single key.
-async fn api_key_id(superuser: &sqlx::PgPool, principal: &Bootstrap) -> String {
+async fn api_key_id(superuser: &PgPool, principal: &Bootstrap) -> String {
     sqlx::query_scalar::<_, String>(
         "SELECT id::text FROM wyrd.auth_api_keys WHERE principal_id = $1",
     )

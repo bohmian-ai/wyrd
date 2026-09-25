@@ -10,6 +10,7 @@
 //! resolver, one pinned client: discovery, token exchange, and JWKS refresh all
 //! go through it so none of them can be the path that forgot.
 
+use std::io::Result as IoResult;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
@@ -214,16 +215,12 @@ impl ScreenedHttp {
     /// # Errors
     /// Returns [`ScreenError::Blocked`] when the policy refuses the scheme.
     pub fn screen_scheme(&self, url: &Url) -> Result<(), ScreenError> {
-        if self.permits_scheme(url.scheme()) {
+        let scheme = url.scheme();
+        if scheme == "https" || (self.policy == AddressPolicy::AllowInternal && scheme == "http") {
             Ok(())
         } else {
             Err(ScreenError::Blocked)
         }
-    }
-
-    /// Whether this deployment may send a provider request over `scheme`.
-    fn permits_scheme(&self, scheme: &str) -> bool {
-        scheme == "https" || (self.policy == AddressPolicy::AllowInternal && scheme == "http")
     }
 
     /// Whether this deployment must refuse to connect to `ip`.
@@ -244,7 +241,7 @@ impl ScreenedHttp {
 /// finish within [`FETCH_TIMEOUT`]; the cause is logged, never returned.
 async fn bounded_lookup<I>(
     host: &str,
-    lookup: impl Future<Output = std::io::Result<I>>,
+    lookup: impl Future<Output = IoResult<I>>,
 ) -> Result<Vec<SocketAddr>, ScreenError>
 where
     I: Iterator<Item = SocketAddr>,
@@ -286,14 +283,24 @@ fn is_unique_local_v6(v6: Ipv6Addr) -> bool {
 
 /// Addresses that are never a legitimate provider, in every deployment.
 ///
-/// Link-local (`169.254.0.0/16`) covers the cloud instance metadata endpoint
-/// (`169.254.169.254`); even a self-hosted deployment must never let a provider
-/// URL reach it.
+/// Link-local (`169.254.0.0/16`) covers the common cloud instance metadata
+/// endpoint (`169.254.169.254`). Alibaba's `100.100.100.200` and AWS IMDS's
+/// IPv6 `fd00:ec2::254` sit inside CGNAT and ULA space, which a permissive
+/// deployment otherwise allows, so they are named exactly. Even a self-hosted
+/// deployment must never let a provider URL reach any of them.
 fn is_always_blocked(ip: IpAddr) -> bool {
     match normalize_ip(ip) {
-        IpAddr::V4(v4) => v4.is_link_local() || v4.is_broadcast() || v4.is_documentation(),
+        IpAddr::V4(v4) => {
+            v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4 == Ipv4Addr::new(100, 100, 100, 200)
+        }
         // fe80::/10 link-local.
-        IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
+        IpAddr::V6(v6) => {
+            (v6.segments()[0] & 0xffc0) == 0xfe80
+                || v6 == Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254)
+        }
     }
 }
 
@@ -344,6 +351,21 @@ mod tests {
                 !allowing.is_blocked(ip),
                 "{raw} is a legitimate local provider"
             );
+        }
+
+        for raw in ["100.100.100.201", "fd00:ec2::253"] {
+            let ip: IpAddr = raw.parse().expect("valid ip");
+            assert!(blocking.is_blocked(ip), "{raw} is internal");
+            assert!(
+                !allowing.is_blocked(ip),
+                "{raw} neighbours a metadata endpoint but is not one"
+            );
+        }
+
+        for raw in ["100.100.100.200", "::ffff:100.100.100.200", "fd00:ec2::254"] {
+            let ip: IpAddr = raw.parse().expect("valid ip");
+            assert!(blocking.is_blocked(ip), "{raw} is cloud metadata");
+            assert!(allowing.is_blocked(ip), "{raw} is cloud metadata");
         }
 
         for raw in ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111"] {

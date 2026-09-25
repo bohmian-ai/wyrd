@@ -289,3 +289,11 @@ untouched; pull-request workflows reference no secrets, pinned by a check).
    records artifact digests and signed provenance, and it fails publication
    closed on any mismatch. The manifest and deployment gate remain release
    authority work that needs its own specification.
+
+### Status
+
+`BLOCKED` on hosted evidence. The branch is pushed (`e96486cc` on
+`origin/feat/affected-monorepo-ci`). AC-005, AC-006, and AC-007 stay PARTIAL
+until the results from that hosted run are recorded above. Reading GitHub
+Actions runs from this session needs a `gh run` permission grant, or the
+results must be supplied by hand.

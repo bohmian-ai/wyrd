@@ -63,7 +63,7 @@ pub enum ScreenError {
 /// Why a provider response body could not be read.
 #[derive(Debug, thiserror::Error)]
 pub enum BodyError {
-    /// The declared or decoded body exceeds [`MAX_RESPONSE_BYTES`].
+    /// The decoded body exceeds [`MAX_RESPONSE_BYTES`].
     #[error("provider response exceeds the {MAX_RESPONSE_BYTES}-byte limit")]
     TooLarge,
     /// The transfer failed, timed out, or could not be decoded.
@@ -74,24 +74,17 @@ pub enum BodyError {
 /// Read a provider response body, refusing it once it exceeds
 /// [`MAX_RESPONSE_BYTES`].
 ///
-/// A declared `Content-Length` above the cap is refused before any body byte
-/// is read. Otherwise the decoded body is read chunk by chunk through reqwest,
-/// and reading stops at the first chunk that would cross the cap, so a
-/// chunked or decompression-amplified body is never buffered whole. The
+/// The decoded body is read chunk by chunk through reqwest, and reading stops
+/// at the first chunk that would cross the cap, so a declared-oversized,
+/// chunked, or decompression-amplified body is never buffered whole. The
 /// request's own timeout keeps bounding the read; dropping the future cancels
 /// it with nothing retained.
 ///
 /// # Errors
-/// Returns [`BodyError::TooLarge`] when the declared or decoded body exceeds
-/// the cap, and [`BodyError::Read`] when the transfer or content decoding
-/// fails or times out.
+/// Returns [`BodyError::TooLarge`] when the decoded body exceeds the cap, and
+/// [`BodyError::Read`] when the transfer or content decoding fails or times
+/// out.
 pub async fn read_bounded_body(mut response: Response) -> Result<Vec<u8>, BodyError> {
-    let declared_too_large = response
-        .content_length()
-        .is_some_and(|len| !usize::try_from(len).is_ok_and(|len| len <= MAX_RESPONSE_BYTES));
-    if declared_too_large {
-        return Err(BodyError::TooLarge);
-    }
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await? {
         if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
@@ -193,21 +186,19 @@ impl ScreenedHttp {
 
     /// Resolve `host:port` and reject unless every answer is permitted.
     ///
+    /// The single system lookup runs under [`FETCH_TIMEOUT`] through
+    /// [`bounded_lookup`], so a stalled resolver fails the request before any
+    /// connection instead of holding serving work.
+    ///
     /// # Errors
-    /// Returns [`ScreenError::Unresolved`] when the name does not resolve and
-    /// [`ScreenError::Blocked`] when any answer is blocked.
+    /// Returns [`ScreenError::Unresolved`] when the name does not resolve in
+    /// time and [`ScreenError::Blocked`] when any answer is blocked.
     async fn resolve_and_screen(
         &self,
         host: &str,
         port: u16,
     ) -> Result<Vec<SocketAddr>, ScreenError> {
-        let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
-            .await
-            .map_err(|error| {
-                tracing::warn!(%host, %error, "provider host resolution failed");
-                ScreenError::Unresolved
-            })?
-            .collect();
+        let addrs = bounded_lookup(host, tokio::net::lookup_host((host, port))).await?;
 
         if addrs.is_empty() || addrs.iter().any(|addr| self.is_blocked(addr.ip())) {
             return Err(ScreenError::Blocked);
@@ -223,6 +214,36 @@ impl ScreenedHttp {
     /// Whether this deployment must refuse to connect to `ip`.
     fn is_blocked(&self, ip: IpAddr) -> bool {
         is_always_blocked(ip) || (self.policy == AddressPolicy::BlockInternal && is_internal(ip))
+    }
+}
+
+/// Await one DNS `lookup` for `host`, giving up after [`FETCH_TIMEOUT`].
+///
+/// Takes the lookup future rather than performing it so the deadline can be
+/// proven against a lookup that never answers. The resolved addresses are
+/// returned exactly as the resolver produced them; dropping the future cancels
+/// the wait.
+///
+/// # Errors
+/// Returns [`ScreenError::Unresolved`] when the lookup fails or does not
+/// finish within [`FETCH_TIMEOUT`]; the cause is logged, never returned.
+async fn bounded_lookup<I>(
+    host: &str,
+    lookup: impl Future<Output = std::io::Result<I>>,
+) -> Result<Vec<SocketAddr>, ScreenError>
+where
+    I: Iterator<Item = SocketAddr>,
+{
+    match tokio::time::timeout(FETCH_TIMEOUT, lookup).await {
+        Ok(Ok(addrs)) => Ok(addrs.collect()),
+        Ok(Err(error)) => {
+            tracing::warn!(%host, %error, "provider host resolution failed");
+            Err(ScreenError::Unresolved)
+        }
+        Err(_) => {
+            tracing::warn!(%host, "provider host resolution timed out");
+            Err(ScreenError::Unresolved)
+        }
     }
 }
 
@@ -275,7 +296,8 @@ fn is_internal(ip: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AddressPolicy, BodyError, MAX_RESPONSE_BYTES, ScreenError, ScreenedHttp, read_bounded_body,
+        AddressPolicy, BodyError, FETCH_TIMEOUT, MAX_RESPONSE_BYTES, ScreenError, ScreenedHttp,
+        bounded_lookup, read_bounded_body,
     };
     use flate2::Compression;
     use flate2::write::GzEncoder;
@@ -480,6 +502,11 @@ mod tests {
 
     /// Fetch `url` through a permissive screened client and read it bounded.
     ///
+    /// # Errors
+    /// Returns [`BodyError::TooLarge`] when the body exceeds the shared
+    /// [`MAX_RESPONSE_BYTES`] cap, and [`BodyError::Read`] when the transfer
+    /// or content decoding fails.
+    ///
     /// # Panics
     /// Panics when the client cannot be built or the request is not sent.
     async fn bounded_get(url: &str) -> Result<Vec<u8>, BodyError> {
@@ -518,6 +545,28 @@ mod tests {
             .await
             .expect("an at-limit body is read");
         assert_eq!(body.len(), MAX_RESPONSE_BYTES);
+    }
+
+    /// A lookup that never answers gives up at the fixed fetch deadline as
+    /// `Unresolved`, and not a moment before.
+    ///
+    /// Runs on paused Tokio time against a lookup future that stays pending,
+    /// so the host resolver is never touched.
+    ///
+    /// # Panics
+    /// Panics when the lookup resolves early or fails with another error.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_lookup_is_unresolved_at_the_deadline() {
+        let stalled =
+            std::future::pending::<std::io::Result<std::vec::IntoIter<std::net::SocketAddr>>>();
+        let started = tokio::time::Instant::now();
+
+        let error = bounded_lookup("idp.example.com", stalled)
+            .await
+            .expect_err("a stalled lookup is refused");
+
+        assert!(matches!(error, ScreenError::Unresolved), "{error:?}");
+        assert_eq!(started.elapsed(), FETCH_TIMEOUT);
     }
 
     /// A declared length one byte over the cap is refused.

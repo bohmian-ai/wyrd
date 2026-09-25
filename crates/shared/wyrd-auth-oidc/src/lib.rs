@@ -31,5 +31,5 @@ pub use registry::{
     WorkloadBinding, WorkloadBindingResolver,
 };
 pub use screening::{
-    AddressPolicy, BodyError, MAX_RESPONSE_BYTES, ScreenError, ScreenedHttp, read_bounded_body,
+    AddressPolicy, MAX_RESPONSE_BYTES, ScreenError, ScreenedHttp, read_bounded_body,
 };

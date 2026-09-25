@@ -960,19 +960,14 @@ async fn human_server() -> WyrdTestServer {
 
 /// Drive one complete browser login and return the token response body.
 ///
-/// This is the served human path end to end: `GET /auth/login` mints the
-/// authorization URL, PKCE challenge, nonce, and state; the Keycloak fixture
-/// authenticates the user against the real HTML login form and returns the
-/// authorization code; `GET /auth/callback` exchanges it for a Wyrd session.
-/// Every human journey starts here, and the role-change journey runs it
-/// several times against the same user, so the flow is one helper rather than
-/// three copies.
+/// This is the served human path end to end: [`authorization_code`] mints the
+/// login and authenticates the user at Keycloak, and [`finish_callback`]
+/// exchanges the code for a Wyrd session. Every human journey starts here,
+/// and the role-change journey runs it several times against the same user,
+/// so the flow is one helper rather than three copies.
 ///
 /// # Panics
-/// Panics when any leg of the flow does not return `200`, when the
-/// authorization URL omits the PKCE challenge or nonce, or when the IdP echoes
-/// a different `state` than the one Wyrd issued — each is a broken login, not
-/// a condition a caller could handle.
+/// Panics when any leg of the flow does not return `200`.
 async fn human_login(
     srv: &WyrdTestServer,
     keycloak: &OidcIssuerFixture,
@@ -980,6 +975,35 @@ async fn human_login(
     username: &str,
     password: &str,
 ) -> Value {
+    let (code, state) = authorization_code(srv, keycloak, client_id, username, password).await;
+    let (status, session) = finish_callback(srv, &code, &state).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "authorization code exchange returns 200: {session}"
+    );
+    session
+}
+
+/// Start a login on `srv` and authenticate `username` at Keycloak, returning
+/// the authorization code and echoed state the callback will present.
+///
+/// `GET /auth/login` mints the authorization URL, PKCE challenge, nonce, and
+/// state; the Keycloak fixture submits the real HTML login form. Nothing is
+/// exchanged yet, so a journey can change the tenant's connection between
+/// provider authentication and the callback.
+///
+/// # Panics
+/// Panics when login initiation does not return `200`, when the
+/// authorization URL omits the PKCE challenge or nonce, or when the IdP echoes
+/// a different `state` than the one Wyrd issued.
+async fn authorization_code(
+    srv: &WyrdTestServer,
+    keycloak: &OidcIssuerFixture,
+    client_id: &str,
+    username: &str,
+    password: &str,
+) -> (String, String) {
     let issuer_encoded: String =
         url::form_urlencoded::byte_serialize(keycloak_issuer().as_bytes()).collect();
     let login_resp = srv
@@ -1042,11 +1066,17 @@ async fn human_login(
         "Keycloak returned authorization code"
     );
     assert_eq!(login_result.state, state_key, "state echoed back correctly");
+    (login_result.code, login_result.state)
+}
 
-    let code_encoded: String =
-        url::form_urlencoded::byte_serialize(login_result.code.as_bytes()).collect();
-    let state_encoded: String =
-        url::form_urlencoded::byte_serialize(login_result.state.as_bytes()).collect();
+/// Present `code` and `state` to `GET /auth/callback` and return the status
+/// and JSON body (`Null` when the body is not JSON).
+///
+/// # Panics
+/// Panics when the request cannot be built or the router fails.
+async fn finish_callback(srv: &WyrdTestServer, code: &str, state: &str) -> (StatusCode, Value) {
+    let code_encoded: String = url::form_urlencoded::byte_serialize(code.as_bytes()).collect();
+    let state_encoded: String = url::form_urlencoded::byte_serialize(state.as_bytes()).collect();
     let callback_resp = srv
         .oneshot(
             Request::builder()
@@ -1060,16 +1090,14 @@ async fn human_login(
         )
         .await
         .expect("callback call completes");
-    assert_eq!(
-        callback_resp.status(),
-        StatusCode::OK,
-        "authorization code exchange returns 200: {}",
-        callback_resp.status()
-    );
+    let status = callback_resp.status();
     let token_bytes = to_bytes(callback_resp.into_body(), 65_536)
         .await
         .expect("token body reads");
-    serde_json::from_slice(&token_bytes).expect("token response is JSON")
+    (
+        status,
+        serde_json::from_slice(&token_bytes).unwrap_or(Value::Null),
+    )
 }
 
 /// Read the Wyrd principal id a session's access token was minted for.
@@ -1788,7 +1816,10 @@ async fn tenant_connection_admin_journey() {
 ///      winner;
 ///   5. replica B boots with K2 as the write key and K1 retained, rewraps the
 ///      stored secret under K2, and both replicas still sign alice in;
-///   6. a same-issuer secret rotation staged and activated on B is served by
+///   6. A, still sealing with K1, stages a late secret after B's pass; a
+///      post-roll pass (replica C) reseals it under K2, and a replica holding
+///      only K2 then signs alice in;
+///   7. a same-issuer secret rotation staged and activated on B is served by
 ///      A at once, and deactivation on B stops login on A.
 ///
 /// # Panics
@@ -2112,7 +2143,77 @@ async fn tenant_connection_rotation_journey() {
         .await;
     }
 
-    // 6. A same-issuer secret rotation on B is served by A without restart.
+    // 6. A still seals with K1 after B's pass reported nothing left: a late
+    //    K1 write. The post-roll pass (replica C, booted once every writer is
+    //    meant to use K2) reseals it, and a K2-only replica then serves login.
+    let (status, late) = call_json(
+        &replica_a,
+        token,
+        Method::PUT,
+        CANDIDATE,
+        Some(connection_input(
+            CONFIDENTIAL_HUMAN_CLIENT,
+            "SecretPost",
+            Some(CONFIDENTIAL_HUMAN_SECRET),
+            None,
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "A stages a late candidate: {late}");
+    let late_under_k1 = replica_a
+        .human_connection_secret_ciphertext(tenant, "Candidate")
+        .await
+        .expect("ciphertext reads")
+        .expect("the late candidate stores a secret");
+    assert!(
+        k2_only.open(&late_under_k1).is_err(),
+        "A sealed the late write under K1"
+    );
+    let replica_c = replica_a
+        .start_replica(human_server_builder().with_sealing_keyring(keyring(k2, k1)))
+        .await
+        .expect("post-roll replica C starts");
+    let late_under_k2 = replica_a
+        .human_connection_secret_ciphertext(tenant, "Candidate")
+        .await
+        .expect("ciphertext reads")
+        .expect("the late candidate stores a secret");
+    assert_eq!(
+        k2_only
+            .rewrap(&late_under_k2)
+            .expect("K2 opens the resealed late write"),
+        None,
+        "the post-roll pass resealed the late K1 write"
+    );
+    let replica_k2 = replica_a
+        .start_replica(
+            human_server_builder().with_sealing_keyring(std::sync::Arc::new(SealingKeyring::new(
+                SecretKey::from_bytes(k2),
+            ))),
+        )
+        .await
+        .expect("a K2-only replica starts once nothing needs K1");
+    let session = human_login(
+        &replica_k2,
+        &keycloak,
+        CONFIDENTIAL_HUMAN_CLIENT,
+        "alice",
+        "alice-password",
+    )
+    .await;
+    assert_v1_authz_check_ok(
+        &replica_k2,
+        session["access_token"].as_str().expect("access token"),
+        "rotation-k2-only",
+    )
+    .await;
+    replica_k2
+        .shutdown()
+        .await
+        .expect("K2-only replica shuts down");
+    replica_c.shutdown().await.expect("replica C shuts down");
+
+    // 7. A same-issuer secret rotation on B is served by A without restart.
     let rotated = activate_keycloak_connection(
         &replica_b,
         &admin,
@@ -2126,7 +2227,7 @@ async fn tenant_connection_rotation_journey() {
         listed["active"]["id"], rotated["id"],
         "A serves B's activation"
     );
-    assert_eq!(listed["active"]["revision"], 4);
+    assert_eq!(listed["active"]["revision"], 5);
     let session = human_login(
         &replica_a,
         &keycloak,
@@ -2147,6 +2248,204 @@ async fn tenant_connection_rotation_journey() {
         &body,
         StatusCode::UNAUTHORIZED,
         "WYRD_AUTH_401_INVALID_TOKEN",
+    );
+
+    replica_b.shutdown().await.expect("replica B shuts down");
+    replica_a.shutdown().await.expect("replica A shuts down");
+}
+
+/// Count the refresh rows ever issued to `principal_id`, read as superuser so
+/// the count sees every tenant row regardless of session state.
+///
+/// # Panics
+/// Panics when the superuser pool or the read fails.
+async fn refresh_rows(srv: &WyrdTestServer, principal_id: &str) -> i64 {
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool opens");
+    sqlx::query_scalar(
+        "SELECT count(*) FROM wyrd.auth_refresh_tokens WHERE principal_id = $1::uuid",
+    )
+    .bind(principal_id)
+    .fetch_one(&superuser)
+    .await
+    .expect("refresh rows read")
+}
+
+/// Assert `refresh_token` no longer renews on `srv` and that the refusal
+/// inserted no successor for its principal.
+///
+/// # Panics
+/// Panics when the refresh is not `401 WYRD_AUTH_401_REFRESH_REVOKED`, it
+/// returns any token, or a refresh row was added.
+async fn assert_refresh_cut_off(srv: &WyrdTestServer, session: &Value, label: &str) {
+    let principal = principal_id_of(session["access_token"].as_str().expect("access token"));
+    let before = refresh_rows(srv, &principal).await;
+    let (status, body) = post_refresh(
+        srv,
+        session["refresh_token"].as_str().expect("refresh token"),
+    )
+    .await;
+    assert_refused(
+        status,
+        &body,
+        StatusCode::UNAUTHORIZED,
+        "WYRD_AUTH_401_REFRESH_REVOKED",
+    );
+    assert!(
+        body.get("refresh_token").is_none() && body.get("access_token").is_none(),
+        "{label}: a stale session gets no successor: {body}"
+    );
+    assert_eq!(
+        refresh_rows(srv, &principal).await,
+        before,
+        "{label}: the refusal inserted no refresh row"
+    );
+}
+
+/// Human sessions end with the connection revision they signed in through,
+/// across replicas.
+///
+/// Replica A signs alice in; replica B then changes the tenant's connection,
+/// and A must refuse to renew the old session without minting a successor:
+///   1. a session renews on B while its connection is unchanged;
+///   2. B replaces the Active connection, and A refuses the old session;
+///   3. B deactivates, and A refuses the session minted by the replacement;
+///   4. B removes a freshly activated connection, and A refuses its session;
+///   5. a callback paused after provider authentication — held before
+///      issuance by a lock on the user-role table — fails once B's
+///      deactivation commits, and inserts no refresh row.
+///
+/// # Panics
+/// Panics when any step deviates from the contract above.
+#[tokio::test]
+#[ignore = "requires the Keycloak and Dex identity lane"]
+async fn tenant_connection_session_cutoff_journey() {
+    let replica_a = human_server_builder()
+        .start_in_process()
+        .await
+        .expect("replica A starts");
+    let replica_b = replica_a
+        .start_replica(human_server_builder())
+        .await
+        .expect("replica B starts");
+    let tenant = replica_a.data_tenant_id();
+    let admin = tenant_admin(&replica_a, tenant, "cutoff-admin").await;
+    let token = admin.token.as_str();
+    let keycloak = OidcIssuerFixture::connect(&keycloak_issuer()).await;
+    let sign_in = || {
+        human_login(
+            &replica_a,
+            &keycloak,
+            PUBLIC_HUMAN_CLIENT,
+            "alice",
+            "alice-password",
+        )
+    };
+
+    // 1. An unchanged connection renews on the other replica.
+    activate_keycloak_connection(&replica_b, &admin, PUBLIC_HUMAN_CLIENT, "Public", None).await;
+    let first = sign_in().await;
+    let (status, renewed) = post_refresh(
+        &replica_b,
+        first["refresh_token"].as_str().expect("refresh token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "B renews an A session: {renewed}");
+
+    // 2. Replacement on B cuts off the renewed session on A.
+    activate_keycloak_connection(&replica_b, &admin, PUBLIC_HUMAN_CLIENT, "Public", None).await;
+    assert_refresh_cut_off(&replica_a, &renewed, "replacement").await;
+
+    // 3. Deactivation on B cuts off the replacement's session on A.
+    let second = sign_in().await;
+    let (status, body) = call_json(&replica_b, token, Method::POST, ACTIVE_DEACTIVATE, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "B deactivates: {body}");
+    assert_refresh_cut_off(&replica_a, &second, "deactivation").await;
+
+    // 4. Removal on B cuts off the removed connection's session on A.
+    let active =
+        activate_keycloak_connection(&replica_b, &admin, PUBLIC_HUMAN_CLIENT, "Public", None).await;
+    let third = sign_in().await;
+    let id = active["id"].as_str().expect("active connection id");
+    let (status, body) = call_json(
+        &replica_b,
+        token,
+        Method::DELETE,
+        &format!("{CONNECTIONS}/{id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "B removes: {body}");
+    assert_refresh_cut_off(&replica_a, &third, "removal").await;
+
+    // 5. A callback paused after provider IO fails once deactivation commits.
+    activate_keycloak_connection(&replica_b, &admin, PUBLIC_HUMAN_CLIENT, "Public", None).await;
+    let principal = principal_id_of(
+        sign_in().await["access_token"]
+            .as_str()
+            .expect("access token"),
+    );
+    let before = refresh_rows(&replica_a, &principal).await;
+    let (code, state) = authorization_code(
+        &replica_a,
+        &keycloak,
+        PUBLIC_HUMAN_CLIENT,
+        "alice",
+        "alice-password",
+    )
+    .await;
+    let superuser = replica_a
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool opens");
+    let mut hold = superuser.begin().await.expect("hold transaction begins");
+    sqlx::query("LOCK TABLE wyrd.auth_user_roles IN EXCLUSIVE MODE")
+        .execute(&mut *hold)
+        .await
+        .expect("user-role table locks");
+    let release = async {
+        let deadline = tokio::time::Instant::now() + StdDuration::from_secs(30);
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation \
+                  WHERE c.relname = 'auth_user_roles' AND NOT l.granted",
+            )
+            .fetch_one(&superuser)
+            .await
+            .expect("lock waiters read");
+            if waiting > 0 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the callback never reached issuance"
+            );
+            tokio::time::sleep(StdDuration::from_millis(20)).await;
+        }
+        let (status, body) =
+            call_json(&replica_b, token, Method::POST, ACTIVE_DEACTIVATE, None).await;
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "B deactivates mid-callback: {body}"
+        );
+        hold.commit().await.expect("hold releases");
+    };
+    let ((status, body), ()) = tokio::join!(finish_callback(&replica_a, &code, &state), release);
+    assert_refused(
+        status,
+        &body,
+        StatusCode::UNAUTHORIZED,
+        "WYRD_AUTH_401_INVALID_TOKEN",
+    );
+    assert_eq!(
+        refresh_rows(&replica_a, &principal).await,
+        before,
+        "the in-flight callback issued no session"
     );
 
     replica_b.shutdown().await.expect("replica B shuts down");

@@ -7,9 +7,11 @@ mod pg_tests {
     //!   WYRD_DATABASE_MIGRATOR_PASSWORD=<migrator_pw> \
     //!   cargo test -p wyrd-sql --all-features --test migration_pg
 
+    use serde_json::Value;
     use sqlx::PgPool;
     use sqlx::types::Uuid;
     use std::time::Duration;
+    use wyrd_dev_fixtures::pg::UnmigratedDatabase;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::reference::CardRef;
     use wyrd_spec::storage::{StorageBackendKind, UploadId, WireProtocol};
@@ -162,8 +164,8 @@ mod pg_tests {
     ///
     /// # Panics
     /// Panics when the database cannot be created or partially migrated.
-    async fn pre_human_connection_database() -> wyrd_dev_fixtures::pg::UnmigratedDatabase {
-        let database = wyrd_dev_fixtures::pg::UnmigratedDatabase::create()
+    async fn pre_human_connection_database() -> UnmigratedDatabase {
+        let database = UnmigratedDatabase::create()
             .await
             .expect("empty database creates");
         let mut conn = database
@@ -199,7 +201,7 @@ mod pg_tests {
         issuer_url: &str,
         client_auth: &str,
         client_secret_enc: Option<&[u8]>,
-        default_roles: serde_json::Value,
+        default_roles: Value,
     ) {
         sqlx::query(
             "INSERT INTO wyrd.auth_trusted_issuers
@@ -226,7 +228,7 @@ mod pg_tests {
     ///
     /// # Panics
     /// Panics when the query fails.
-    async fn trusted_issuer_snapshot(pool: &PgPool) -> Vec<serde_json::Value> {
+    async fn trusted_issuer_snapshot(pool: &PgPool) -> Vec<Value> {
         sqlx::query_scalar(
             "SELECT to_jsonb(t) FROM wyrd.auth_trusted_issuers t
               ORDER BY data_tenant_id, issuer_url",

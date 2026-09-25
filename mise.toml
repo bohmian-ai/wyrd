@@ -657,7 +657,7 @@ if [ "$target" != server ]; then
   exit 2
 fi
 selected_count() {
-  cargo nextest list --locked -p wyrd-server --all-features --test identity_e2e --run-ignored=all --message-format oneline -E "$1" | grep -c . || true
+  cargo nextest list --locked -p wyrd-server --test identity_e2e --run-ignored=all --message-format oneline -E "$1" | grep -c . || true
 }
 if [ -n "${WYRD_IDENTITY_FILTER:-}" ]; then
   expr="test(=${WYRD_IDENTITY_FILTER})"
@@ -666,7 +666,7 @@ if [ -n "${WYRD_IDENTITY_FILTER:-}" ]; then
     echo "WYRD_IDENTITY_FILTER=$WYRD_IDENTITY_FILTER selects $count tests; expected exactly 1" >&2
     exit 1
   fi
-  cargo nextest run --locked -p wyrd-server --all-features --test identity_e2e --run-ignored=all --test-threads=1 -E "$expr"
+  cargo nextest run --locked -p wyrd-server --test identity_e2e --run-ignored=all --test-threads=1 -E "$expr"
 else
   for required in tenant_connection_admin_journey tenant_connection_rotation_journey; do
     count="$(selected_count "test(=$required)")"
@@ -675,7 +675,7 @@ else
       exit 1
     fi
   done
-  cargo nextest run --locked -p wyrd-server --all-features --test identity_e2e --run-ignored=all --test-threads=1
+  cargo nextest run --locked -p wyrd-server --test identity_e2e --run-ignored=all --test-threads=1
 fi
 """
 

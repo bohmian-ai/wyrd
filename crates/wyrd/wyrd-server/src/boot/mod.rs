@@ -3020,3 +3020,52 @@ pub(crate) mod pg_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod sealing_boot_pg_tests {
+    use wyrd_dev_fixtures::pg::{PgFixture, seed_active_human_connection};
+
+    use super::*;
+
+    /// A keyless deployment boots while no provider secret is stored, and
+    /// refuses to boot with `SealingKey` once one is, since it could never
+    /// open that ciphertext.
+    ///
+    /// # Panics
+    /// Panics when the fixture cannot be seeded or either boot outcome differs.
+    #[tokio::test]
+    async fn keyless_boot_refuses_only_when_ciphertext_is_stored() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let operator = fixture.operator_pool().clone();
+        rewrap_sealed_secrets(Some(operator.clone()), None)
+            .await
+            .expect("a keyless deployment with no stored secret boots");
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let binding = seed_active_human_connection(&mut conn)
+            .await
+            .expect("connection seeds");
+        conn.commit().await.expect("seed commits");
+        let superuser = fixture
+            .superuser_pool()
+            .await
+            .expect("superuser pool opens");
+        sqlx::query(
+            "UPDATE wyrd.auth_human_connections \
+             SET client_auth = 'SecretPost', client_secret_enc = '\\x0102'::bytea \
+             WHERE connection_id = $1",
+        )
+        .bind(binding.connection_id)
+        .execute(&superuser)
+        .await
+        .expect("a sealed secret is stored");
+
+        let refused = rewrap_sealed_secrets(Some(operator), None)
+            .await
+            .expect_err("a keyless deployment with a stored secret refuses to boot");
+        assert!(
+            matches!(refused, ServerBootError::SealingKey(_)),
+            "{refused:?}"
+        );
+    }
+}

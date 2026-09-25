@@ -194,10 +194,120 @@ fn sql_error(error: impl std::fmt::Display) -> WyrdErrorResponse {
 
 #[cfg(test)]
 mod pg_tests {
-    use super::resolve_login_tenant;
+    use super::{LoginQuery, resolve_login_tenant, try_initiate_login};
+    use axum::body::to_bytes;
     use axum::http::{HeaderMap, HeaderValue, header};
     use std::sync::Arc;
+    use url::Url;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wyrd_auth::connections::HumanConnections;
+    use wyrd_auth_oidc::ScreenedHttp;
+    use wyrd_dev_fixtures::pg::{PgFixture, seed_active_human_connection};
+    use wyrd_spec::auth::IssuerUrl;
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
+
+    use crate::components::auth::ServerAuth;
+
+    /// Login sends the provider back to the deployment's configured callback,
+    /// never to one derived from the request's `Host` or `X-Forwarded-Proto`.
+    ///
+    /// # Panics
+    /// Panics when the fixture cannot be seeded, login initiation fails, or
+    /// the authorization URL carries any other `redirect_uri`.
+    #[tokio::test]
+    async fn login_uses_the_configured_callback_despite_request_headers() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let provider = MockServer::start().await;
+        let issuer = provider.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": issuer,
+                "authorization_endpoint": format!("{issuer}/authorize"),
+                "token_endpoint": format!("{issuer}/token"),
+                "jwks_uri": format!("{issuer}/jwks"),
+                "id_token_signing_alg_values_supported": ["EdDSA"],
+            })))
+            .mount(&provider)
+            .await;
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let binding = seed_active_human_connection(&mut conn)
+            .await
+            .expect("connection seeds");
+        conn.commit().await.expect("seed commits");
+        sqlx::query(
+            "UPDATE wyrd.auth_human_connections SET issuer_url = $1 WHERE connection_id = $2",
+        )
+        .bind(&issuer)
+        .bind(binding.connection_id)
+        .execute(
+            &fixture
+                .superuser_pool()
+                .await
+                .expect("superuser pool opens"),
+        )
+        .await
+        .expect("connection points at the mock provider");
+        let origin = Url::parse("https://wyrd.example.com").expect("origin parses");
+        let tempdir = tempfile::tempdir().expect("login storage tempdir");
+        let signer = LocalSigner::new(tempdir.path().to_owned()).expect("local signer creates");
+        let state = crate::test_support::test_app_state(
+            Arc::new(crate::postgres::ServerPostgres::from_parts(
+                fixture.wyrd_postgres().clone(),
+                fixture.vala_postgres().clone(),
+            )),
+            Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+            crate::test_support::test_catalog().await,
+        )
+        .with_auth(ServerAuth {
+            human_connections: Some(HumanConnections::new(
+                fixture.wyrd_postgres().clone(),
+                None,
+                ScreenedHttp::allowing_internal(),
+                Some(&origin),
+            )),
+            ..ServerAuth::default()
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::HOST,
+            HeaderValue::from_static("attacker.example.net"),
+        );
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("http"));
+        headers.insert(header::ACCEPT, HeaderValue::from_static("application/json"));
+
+        let response = try_initiate_login(
+            &state,
+            &headers,
+            &LoginQuery {
+                issuer: IssuerUrl::new(&issuer).expect("issuer is valid"),
+            },
+            fixture.data_tenant_id(),
+        )
+        .await
+        .expect("login initiates");
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body reads");
+        let init: serde_json::Value = serde_json::from_slice(&body).expect("body is JSON");
+        let authorization_url = Url::parse(
+            init["authorization_url"]
+                .as_str()
+                .expect("authorization URL present"),
+        )
+        .expect("authorization URL parses");
+        let redirect_uris: Vec<String> = authorization_url
+            .query_pairs()
+            .filter(|(key, _)| key == "redirect_uri")
+            .map(|(_, value)| value.into_owned())
+            .collect();
+        assert_eq!(
+            redirect_uris,
+            vec!["https://wyrd.example.com/auth/callback"]
+        );
+    }
 
     #[tokio::test]
     async fn login_tenant_resolution_rejects_non_tenant_host_even_with_query_fallback_context() {

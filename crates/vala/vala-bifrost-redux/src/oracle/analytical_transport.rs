@@ -2121,7 +2121,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use async_trait::async_trait;
-    use prost::Message as _;
+    use wyrd_tonic::prost::Message as _;
     use tower::{Layer as _, Service as _};
 
     use super::super::analytical::{

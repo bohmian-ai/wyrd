@@ -12,14 +12,27 @@
 #   2. ServerPostgres::from_parts appears only in wyrd-server and wyrd-testing
 #   3. wyrd-dev-fixtures Cargo.toml does not declare wyrd-server as a dep
 set -e
+
+# Fail the check when rg finds a forbidden match or cannot search (exit 2, e.g.
+# a missing path). `! rg` would pass on a search error, and under `set -e` a
+# negated command that fails does not stop the script, so only the last one
+# ever decided the exit status.
+forbid() {
+    local status=0
+    rg -n --no-heading "$@" || status=$?
+    if [ "$status" -ne 1 ]; then
+        echo "forbidden pattern found or search failed (rg exit $status)" >&2
+        exit 1
+    fi
+}
 # 1. wyrd-dev-fixtures must never import wyrd-server.
-! rg -n --no-heading -e '\buse\s+wyrd_server\b|\bwyrd_server::' \
+forbid -e '\buse\s+wyrd_server\b|\bwyrd_server::' \
     crates/shared/wyrd-dev-fixtures/
 # 2. ServerPostgres composition (from_parts) stays in server + test harness only.
-! rg -n --no-heading -e 'ServerPostgres::from_parts' \
+forbid -e 'ServerPostgres::from_parts' \
     --glob '!crates/wyrd/wyrd-server/**' \
     --glob '!crates/wyrd/wyrd-testing/**' \
-    crates/ python/
+    crates/
 # 3. wyrd-dev-fixtures Cargo.toml must not declare wyrd-server as a dependency.
-! rg -n --no-heading -e '^[[:space:]]*wyrd-server[[:space:]]*=' \
+forbid -e '^[[:space:]]*wyrd-server[[:space:]]*=' \
     crates/shared/wyrd-dev-fixtures/Cargo.toml

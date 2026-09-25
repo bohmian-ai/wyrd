@@ -10427,7 +10427,6 @@ dependencies = [
  "num-traits",
  "opendal 0.57.0",
  "parquet",
- "prost",
  "rand 0.8.7",
  "rayon",
  "rustix",

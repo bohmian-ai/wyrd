@@ -20,7 +20,7 @@ use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream, execut
 use datafusion_proto::bytes::physical_plan_from_bytes_with_extension_codec;
 use datafusion_proto::protobuf::{PhysicalPlanNode, physical_plan_node::PhysicalPlanType};
 use iceberg_datafusion::physical_plan::IcebergTableScan;
-use prost::Message;
+use wyrd_tonic::prost::Message;
 use thiserror::Error;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{

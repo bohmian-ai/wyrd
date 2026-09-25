@@ -19,8 +19,8 @@ use arrow::record_batch::RecordBatch;
 
 use crate::tables::TableError;
 use crate::tables::fields::{self, CanonicalField, CanonicalType};
-use prost::Message;
-use prost::encoding::{WireType, encode_key};
+use wyrd_tonic::prost::Message;
+use wyrd_tonic::prost::encoding::{WireType, encode_key};
 use std::str::FromStr;
 use std::sync::Arc;
 use wyrd_spec::reference::{CardRef, CardRefScope};
@@ -54,7 +54,7 @@ pub fn encode_attributes(values: &[KeyValue]) -> Vec<u8> {
             WireType::LengthDelimited,
             &mut buffer,
         );
-        prost::encoding::encode_varint(value.encoded_len() as u64, &mut buffer);
+        wyrd_tonic::prost::encoding::encode_varint(value.encoded_len() as u64, &mut buffer);
         value.encode_raw(&mut buffer);
     }
     buffer

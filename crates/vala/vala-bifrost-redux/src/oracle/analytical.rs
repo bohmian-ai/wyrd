@@ -4077,7 +4077,7 @@ mod tests {
         ) -> Result<wyrd_spec::vala::api::SignedPeerTicket, PeerSecurityError> {
             Ok(wyrd_spec::vala::api::SignedPeerTicket {
                 key_id: "fixture".to_owned(),
-                claims_bytes: prost::Message::encode_to_vec(claims),
+                claims_bytes: wyrd_tonic::prost::Message::encode_to_vec(claims),
                 signature: vec![0; 64],
             })
         }
@@ -4093,7 +4093,7 @@ mod tests {
             body: &[u8],
             _now: DateTime<Utc>,
         ) -> Result<AuthorizedStage, PeerSecurityError> {
-            let claims = <super::super::peer::StageTicketClaims as prost::Message>::decode(
+            let claims = <super::super::peer::StageTicketClaims as wyrd_tonic::prost::Message>::decode(
                 ticket.claims_bytes.as_slice(),
             )
             .map_err(|_| PeerSecurityError::Claims)?;

@@ -183,3 +183,46 @@ unfiltered identity journey, `test:principals:integration`, `test:sql`,
 `check:from-pools-allowlist`, applicable client/PyO3/unwrap boundaries,
 `docs:check`, `fmt`, `lints`, and `git diff --check`. Keep identity journeys on
 default features and prove exact test selection.
+
+## Implementation evidence
+
+Commits `e2e4de4e6..c265752d8` on `oidc-complete`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| `FIND-TASK-001-1` | `wyrd-auth/src/connections.rs::callback_redirect_qualifies` collects every `code`/`error`/`state` value; accepts only `([code],[])` or `([],[error])` with one `state` | `wyrd-auth connections::probe_tests::only_an_exact_state_matching_callback_redirect_qualifies` (mixed, duplicate-code, duplicate-error cases) | PASS |
+| `FIND-TASK-001-5` | Inference `UPDATE` deleted from `20260925000000_auth_human_connections.sql`; `RefreshTokens::execute` already refuses unbound user rows | `wyrd-sql pg_migration pg_tests::human_connection_upgrade_preflight` case (d): A→B legacy row stays unbound, consume yields no binding; fresh B row bound and active; `test:sql` | PASS |
+| `FIND-TASK-001-8` | rustdoc on `PgIssuerResolver` fields, `IssuerDecodeError` + variants, `open_secret`/`decode_secret` with `# Errors` | `mise run lints`, direct diff inspection | PASS |
+| `FIND-TASK-001-12` | `identity_e2e.rs::tenant_connection_rotation_journey` shuts down replica A after its late K1 write; final pass from K2 writer C; K2-only replica serves; A never reused | filtered `tenant_connection_rotation_journey` and unfiltered identity journey | PASS |
+| `FIND-TASK-001-14` | `PgIssuerResolver { postgres: WyrdPostgres, .. }` acquires via `tenant_conn`; all constructor sites updated | `pg_resolvers::pg_tests::resolver_reads_and_decrypts_seeded_issuer`, `boot::auth::tests::*`, `check:from-pools-allowlist` | PASS |
+| `FIND-TASK-001-15` | `put_candidate` takes `axum::body::Bytes` (axum default 2 MB limit), decides authorization, then `ConnectionInput::from_slice` (PrivateKeyJwt refused before shape decode; `validate` now private) | `wyrd-server components::admin::identity::pg_tests::put_candidate_authorizes_before_decoding_its_body`; `wyrd-spec auth::human_connection::tests::*`; served OpenAPI `$ref` asserted in `pg_openapi_contract identity_connection_operations_publish_their_contract` | PASS |
+| `FIND-TASK-001-16` | wiremock imports moved to the `screening::tests` import block | `screening::tests::an_ambient_proxy_cannot_observe_a_screened_request`, fmt, lints | PASS |
+| `FIND-TASK-001-17` | `config.rs` sealing loaders use `read_secret_file`; `ConfigError::ReadSealingKey` carries a static reason; runbook documents 0600/0400 and temp+rename | `wyrd-server config::tests::sealing_key_files_require_a_restrictive_regular_bounded_file`; `docs:check` | PASS |
+| `FIND-TASK-001-18` | `ScreenedHttp::client_for` refuses non-HTTPS under `BlockInternal`, non-HTTP(S) always, before resolution | `screening::tests::only_the_permissive_policy_accepts_cleartext_http`; identity journeys (AllowInternal local providers) | PASS |
+| `FIND-TASK-001-19` | `wyrd_auth_oidc::read_bounded_body` (`MAX_RESPONSE_BYTES` = 1 MiB, declared length + `Response::chunk()`) used by discovery, JWKS, candidate probe, token exchange | `screening::tests::{a_body_at_the_limit_is_read_whole, an_oversized_declared_body_is_refused, an_oversized_chunked_body_is_refused, an_oversized_decompressed_body_is_refused}`; `connections::probe_tests::an_oversized_token_response_leaves_the_candidate_untested` | PASS |
+
+Accepted reuse findings: `HumanConnections::begin_login` replaces `prepare_login`
+(and `AuthorizationCodeExchange::execute` drops its `postgres` parameter);
+`callback_url()` deleted; `error::provider_unreachable` shared by `screen_error`
+and the probe; typed `DiscoveryFailure` replaces the `issuer_mismatch` string
+round-trip; `Reseal` enum inlined into `settle`; `ConnectionInput::validate`
+private; `discover_authorization_endpoint` inlined. `http()` stays
+`pub(crate)` because `callback.rs` still uses it. `flate2` is a dev-dependency
+of `wyrd-auth-oidc` (existing workspace dependency) for the compressed-body test.
+`scripts/checks/from-pools-allowlist.sh` no longer scans the absent `python/`
+root, which made the negated `rg` unconditionally pass.
+
+Verification, all exit 0 in this session: the focused `mise exec -- cargo
+nextest run --locked` selectors above (Postgres-backed ones under
+`scripts/postgres/with-test-postgres.sh`); filtered identity journeys
+`tenant_connection_admin_journey`, `tenant_connection_rotation_journey`,
+`tenant_connection_session_cutoff_journey` and the unfiltered
+`test:identity:journey` (23/23, default features); `test:principals:integration`;
+`test:sql`; `test:platform:journey`; `codegen:check`; `check:tenant-isolation`;
+`check:from-pools-allowlist`; `check:client-tier`; `check:pyo3-scope`;
+`check:unwrap-audit`; `docs:check`; `fmt`; `lints`; `git diff --check`.
+
+Behavior note: a candidate PUT with a non-JSON content type now reaches
+authorization and body decoding instead of axum's pre-authorization 415.
+Non-goals remained excluded; no route, wire field, error code, knob, or
+runtime dependency was added.

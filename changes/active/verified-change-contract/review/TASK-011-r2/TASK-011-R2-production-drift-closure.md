@@ -47,3 +47,19 @@ The cumulative diff changes `wyrd-spec/src/card/mod.rs` tests `rejects_spc_sampl
 ## Preserved behavior and non-goals
 
 Retain revision 38's selected-row contract, conventional PSI bins and smoothing, NIST X-bar/S chart, whole-run SPC incompleteness, fitted-version refusal, historical reads, and the existing test-only SDK fixtures. Do not add a PSI missing bin, another chart, a new observation format, a product route, a migration, a second query cut, or an alternate scorer. Use the existing owners and the smallest proof that catches the observed defect.
+
+## Implementation evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| 1. Two-feature PSI, drifting feature at 100 and sibling at 99 → one empty inconclusive report; complete multi-feature PSI scores | `vala-drift/src/psi/mod.rs::score_psi_counts` checks every feature's sample before PSI math and returns `DriftReport::unscored(Psi)` | `psi::psi_score::psi_one_insufficient_feature_unscores_the_report` (both at 100 → two rows, Drift; 99 → unscored); `psi_target_too_small_is_unscored`; `baseline::aggregate_inputs::psi_counts_match_raw_scoring_and_small_windows_are_inconclusive` | PASS |
+| 2. 99 complete records plus one repeated series row → unscored, `completed/inconclusive`, null details, no feature rows, no dispatch; single-query path intact | `wyrd-server/src/verification/drift.rs`: `ObservationWindow::incomplete` adds `COUNT(*) > configured`; `DistributionFold::finish` maps any empty report (PSI or SPC) to `None`, which publishes `Drift(None)` | `verification::drift::tests::completeness_flags_omitted_and_invalid_features_only` (repeated row → 1 incomplete); `psi_repeated_series_row_cannot_manufacture_a_sample` (99 + repeat → `None`, 100 → Drift, through `psi_statement`); `one_statement_decides_completeness_and_scores_from_one_cut`; `test:bifrost:integration:server`; journeys assert sparse PSI and SPC `assert_unscored` | PASS |
+| 3. Rustdoc `# Errors`/`# Panics` and bare imported types in changed signatures | `feature.rs` `collect_f64`/`collect_string`; `psi_score` helpers incl. `feature`; `spc_fit::fit`; `baseline` fixtures; `lib.rs` surface test; `DriftValidationError::details`; `fold_spc`, `WyrdTestServer::verification_fixture`, TS `verification_fixture`/`reason`, `psi::target_column`, test `decide`, Rust journey `evidence` | `mise run fmt`; `mise run lints`; an audit of every function touching changed lines in `338f3323..HEAD` reports no gap | PASS |
+| 4. `wyrd-spec` tests execute | Tests unchanged; commands recorded in TASK-011 | `mise run test:wyrd` — 2142 passed, both tests in the log; each exact `-p wyrd-spec --lib` command — 1 passed | PASS |
+| 5. Gates after the final code change | TASK-011 evidence updated | `test:vala` 1280; `test:wyrd` 2142; `test:bifrost:integration:server` 85; journeys drift 2, python 40, typescript 20; `py:lints`; `ts:typecheck`; `test:principals:integration`; `codegen:check`; `docs:check`; `git diff --check` — all exit 0 | PASS |
+
+Exact focused commands for the named tests, and the journey commands, are listed in [TASK-011](../../tasks/TASK-011-conventional-psi-spc.md#implementation-evidence).
+
+Diagnosis of the one test change: `one_statement_decides_completeness_and_scores_from_one_cut` previously expected a scored PSI report from a 4-record window. The per-feature NaN rows made it look scored. Under REQ-156 that window is insufficient and now unscored, so the fixture uses 100 records. The seam and all-null assertions are unchanged.
+
+Non-goals stayed excluded: no PSI missing bin, no new chart, observation format, route, migration, second query cut, or alternate scorer. The common verdict aggregator and Custom are unchanged.

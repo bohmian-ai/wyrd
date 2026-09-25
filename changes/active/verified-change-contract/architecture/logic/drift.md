@@ -170,8 +170,10 @@ feature's aggregate, ordered by part and then bin or subgroup, so Oracle
 answers all of them from one pinned cut: an observation ingested during a
 run is in every part or in none. The completeness part groups the window's
 records carrying any configured feature by `record_id` and counts records
-that omit a configured feature or carry a null or non-finite value; any such
-record makes the run inconclusive with no details and no feature rows.
+that do not carry exactly one row of each configured feature, or carry a null
+or non-finite value; any such record makes the run inconclusive with no
+details and no feature rows. A repeated feature row is incomplete so it
+cannot give one feature more values than the window has observations.
 Records carrying no configured feature do not enter the comparison. Direct
 scoring receives an already selected batch: every row is one relevant
 observation, so a row null in every configured feature is incomplete rather
@@ -207,9 +209,12 @@ baseline proportions. The server computes target counts for each run window.
    categorical values to fitted labels, then counts each bin. Categories
    absent from the fitted labels count in the reserved `other` bin.
 3. Rust zero-fills absent fitted bins and sums all counts for the target
-   total. It applies the minimum-sample, smoothing, PSI formula, threshold,
-   and verdict logic, and records each bin's target count and proportion as
-   typed `Psi` evidence on the feature report.
+   total. When any feature's total is below the minimum sample of 100, the
+   whole target is insufficient: the run is inconclusive with no details and
+   no feature rows, so a sufficient sibling cannot fail it alone. Otherwise it
+   applies the smoothing, PSI formula, threshold, and verdict logic, and
+   records each bin's target count and proportion as typed `Psi` evidence on
+   the feature report.
 
 The existing PSI implementation must expose an aggregate-count input that
 shares its current formula and report construction. Passing count rows into

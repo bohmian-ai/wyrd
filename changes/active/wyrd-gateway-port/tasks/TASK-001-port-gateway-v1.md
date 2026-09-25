@@ -1,7 +1,7 @@
 ---
 id: TASK-001
 kind: implementation
-status: ready
+status: implemented
 spec: SPEC-wyrd-gateway-port
 spec_revision: 1
 requirements: [REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, REQ-006, REQ-007, INV-001, INV-002, INV-003, INV-004, INV-005, AC-001, AC-002, AC-003, AC-004, AC-005]
@@ -249,3 +249,64 @@ code structure, and fresh migration numbering are implementation choices.
   `architecture/references/languages/spec-driven-development.md`.
 - Historical behavior/evidence: both approved specifications at the pinned
   archive commit and their paths in the local spec.
+
+## Implementation Evidence
+
+Candidate: `452a028d0` (port), `f70b30e3c` (restart journey), `7c2b7a3aa`
+(Scribe merge-window fix found by the Python journey), plus this evidence
+commit. Base `f7c61336a` is current `main`; no rebase was required.
+
+### Source-to-target ledger
+
+| Source (`d8907084` via `0f1d385b` adaptation) | Target | Disposition |
+|---|---|---|
+| Gateway wire types, stable errors, schemas | `crates/wyrd-spec/src/gateway/*` | Ported |
+| In-process engine | `crates/wyrd/wyrd-gateway` | Ported |
+| Admin/invocation/ingress/ledger/capture/batch/multipart handlers | `crates/wyrd/wyrd-server/src/components/gateway/*`, `mcp/gateway.rs` | Ported onto current principal, `TenantConn`, RBAC, canonical audit, runtime OpenAPI registration |
+| Runtime migrations `20260601000020`–`22`, integration `26`–`28` | `wyrd-sql/migrations/20260924000000`–`02`, `vala-sql/migrations/20260924000000_forge_gateway_namespace.sql` | Renumbered fresh; no applied SQL edited |
+| `20260916000000_audit_staging_system_principal` and `system` principal kind | — | Superseded: capture principal is a card-free `service`; main's `20260910000026` already widened kinds |
+| Checked-in `openapi.yaml`, `docs/api/openapi.md` | served `GET /openapi.json` | Superseded by runtime OpenAPI |
+| `invocation_tests.rs`, `tests.rs` | `pg_invocation_tests.rs`, `pg_administration_tests.rs` | Renamed to current Postgres-test naming |
+| Skald provider/adapter changes | `skald-providers`, `skald-spec`; `skald-runtime` workflow tests get wire-type consumer fixes only | Ported; no workflow execution (INV-005) |
+| Capture identity (auth issue/verify) | `wyrd-auth-issue`, `wyrd-auth-verify`, `vala-bifrost-redux` gate reservation, `tables/gateway/calls.rs` | Adapted: tenant-bound service, ≤900 s token, exactly two record-write grants (`vala.gateway.calls`, `vala.traces.spans`); refresh tokens refused |
+| Client/SDK/CLI | `wyrd-client/gateway*.rs`, `sdks/wyrd-sdk-{rust,python,ts}` gateway, `wyrd-cli gateway.rs` | Ported; credential mutation stays in CLI/MCP |
+| Python test-server wrapper `wyrd-testing/src/python.rs` | `sdks/wyrd-sdk-python/src/testing.rs` | Relocated per PyO3 ownership rule |
+| Real-server journeys | `wyrd-testing/tests/gateway/{compatible,native,operations,resilience,vault}.rs`, Python/TS gateway integration tests | Ported; added `compatible::managed_secret_rotation_survives_server_restart` |
+| `changes/`, `.agents`, `.claude`, `CONTRIBUTING.md`, AI co-author trailer text in `AGENTS.md` | — | Omitted: not gateway |
+| `workflow_gateway` examples | — | Pre-existing, owned by `skald-workflow-runtime` |
+
+### Acceptance
+
+| Criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| AC-001 managed secret, deployment, narrow caller, unmodified SDK, redacted reads | admin handlers, `wyrd-crypt` keyring envelopes, ingress | `compatible::managed_secret_rotation_survives_server_restart`; Python `test_gateway_admin_journey`, `test_openai_client_reaches_every_backend_through_the_server`, `test_two_users_have_distinct_model_access_and_traceable_usage` | PASS |
+| AC-002 fail-closed negatives | RBAC, tenant scoping, token extraction, endpoint screening, admission | restart journey (reader 403, cross-tenant 404/4xx); `test_gateway_admin_requires_gateway_permissions`; `test_openai_client_receives_stable_refusals_without_dispatch_or_leakage`; native `*_is_native_governed_and_fail_closed`; `resilience::a_retryable_refusal_fails_over_and_a_limit_refuses_before_dispatch`; vault refusal tests | PASS |
+| AC-003 operations, native ingress, streams, batches, retry/fallback | engine + Skald adapters | `mise run test:gateway:native`; `operations::responses_audio_and_batches_dispatch_through_the_public_server`; `compatible::openai_compatible_streams_terminate_and_survive_a_capture_outage` | PASS |
+| AC-004 ledger, audit, capture; restart/rotation/replay/drain/outage | ledger, canonical audit append, capture writer | `resilience::a_pending_invocation_audit_append_drains_before_shutdown_completes`, `resilience::a_cancelled_call_is_still_settled_and_the_server_keeps_serving`, restart journey, `test_embedding_and_image_evidence_reaches_bifrost_and_storage`, vault rotation | PASS |
+| AC-005 Rust/Python/TS/HTTP/CLI/MCP, served contract | client + SDKs + CLI + MCP | `mise run test:gateway:journey` (Rust 8, Vault 2, CLI 1, MCP 1, Rust SDK 1, Python 8, TS 2); `mise run codegen:check`; `mise run test:principals:integration` | PASS |
+| INV-001 single in-process gateway | `wyrd-gateway` engine inside `wyrd-server` | journeys use only `WyrdTestServer`; no listener/route alias added | PASS |
+| INV-002 no caller-selected key / plaintext secret | redacted views, sealed envelopes | restart journey redaction and upstream-key assertions; refusal test asserts no leakage | PASS |
+| INV-003 capture scope | capture principal shape + gate reservation | `wyrd-auth-issue`: `issue_gateway_capture_access_token_is_a_card_free_service_with_only_the_capture_role`, `issue_refresh_token_refuses_the_reserved_capture_identity`; `wyrd-auth-verify`: `reserved_capture_identity_verifies_only_in_its_exact_shape`; `vala-bifrost-redux`: `gate_reserves_the_gateway_call_table_to_the_capture_principal` | PASS |
+| INV-004 no historical merge | patch built from `git diff 41e60be6 0f1d385b` minus archive admin/auth/migrations | ledger above; fresh migration numbers | PASS |
+| INV-005 no workflow execution | Skald wire-type consumer fixes only | diff audit | PASS |
+
+### Commands
+
+- `mise run test:gateway:journey`, `mise run test:gateway:native` — pass.
+- `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test gateway -P journey --run-ignored=all -E "test(=compatible::managed_secret_rotation_survives_server_restart)"'` — pass.
+- `scripts/postgres/with-test-postgres.sh -- mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=scribe::persistence::tests::merge_window_bytes_is_bounded_by_the_rows_a_claim_holds)'` — pass (fails under the previous full-window-per-member formula).
+- `mise run fmt`, `lints`, `py:format`, `py:lints`, `py:typecheck`, `codegen:check`, `check:client-tier`, `check:pyo3-scope`, `check:unwrap-audit`, `docs:check` — pass.
+- `mise run test:principals:integration` (15 + 17, includes served `/openapi.json` contract), `mise run test:sql` (119 + 2), `mise run test:skald` (421) — pass.
+- `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-server --lib --run-ignored=all -E "test(/mcp::/) | test(/components::gateway::/)"'` — 58 pass (MCP catalog/tools and gateway administration/invocation Postgres tests).
+- `git diff --check` — clean; tracked/untracked audit: only this task's write set plus the untouched `changes/active/skald-workflow-runtime` edits owned elsewhere.
+
+### Limits
+
+- RED was not observable for ported tests: code and tests were applied together
+  from the source patch. The new restart journey first failed on a harness
+  issue (peer principal re-provisioned on restart, fixed by
+  `WyrdTestServer::restart_bound` reusing peer credentials), not a missing
+  gateway feature.
+- `mise run test:gateway:smoke:live` is opt-in and was not run.
+- The Python journey exposed a Scribe merge-workspace over-reservation
+  (3.1 GB requested against a 2.6 GB ceiling); fixed in `7c2b7a3aa`.

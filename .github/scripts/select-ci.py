@@ -287,8 +287,9 @@ def main():
         "full_gate_reason": sel.full_gate_reason,
         "bifrost_only": "true" if outputs.get("bifrost_only") and not full_gate else "false",
         "changed_packages": outputs["changed_packages"],
-        "rust_packages": outputs["rust_packages"],
-        # The full gate runs every lane itself.
+        # The full gate runs every lane over every package itself; a package
+        # filter would make its family lanes test only the affected closure.
+        "rust_packages": "" if full_gate else outputs["rust_packages"],
         "ci_lanes": "" if full_gate else " ".join(sel.lanes),
     }
     for name in flags:

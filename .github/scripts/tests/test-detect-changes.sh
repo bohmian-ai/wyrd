@@ -135,7 +135,7 @@ check_selection "Bifrost-only runs the capability gate" \
 check_selection "Bifrost cross-crate change stays Bifrost-only" "bifrost_only=true full_gate=false" \
   "crates/vala/vala-bifrost-redux/src/forge/worker.rs" \
   "crates/wyrd/wyrd-server/src/oracle/peer_service.rs"
-check_selection "mixed Bifrost and Rust takes the full gate" "bifrost_only=false full_gate=true" \
+check_selection "mixed Bifrost and Rust takes the full gate" "bifrost_only=false full_gate=true rust_packages= ci_lanes=" \
   "crates/vala/vala-bifrost-redux/src/forge/worker.rs" \
   "crates/skald/skald-agent/src/lib.rs"
 check_selection "global configuration takes the full gate" "full_gate=true" "Cargo.lock"

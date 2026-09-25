@@ -7,6 +7,7 @@ use serde::Deserialize;
 use url::Url;
 
 use crate::error::OidcError;
+use crate::screening::read_bounded_body;
 
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -100,8 +101,12 @@ impl OidcProvider {
     /// The function accepts a [`url::Url`] rather than [`wyrd_spec::auth::oidc::IssuerUrl`]
     /// so that tests can use in-process mock servers that serve HTTP.
     ///
+    /// The document is read through [`read_bounded_body`], so a body above
+    /// [`crate::screening::MAX_RESPONSE_BYTES`] fails discovery.
+    ///
     /// # Errors
-    /// Returns [`OidcError::Discovery`] on network or HTTP failure,
+    /// Returns [`OidcError::Discovery`] on network or HTTP failure, an
+    /// oversized or undecodable body,
     /// [`OidcError::IssuerMismatch`] when the metadata `issuer` disagrees with
     /// the request URL, and [`OidcError::NoAsymmetricAlg`] when no supported
     /// asymmetric algorithm is advertised.
@@ -129,10 +134,17 @@ impl OidcProvider {
             });
         }
 
-        let raw: RawProviderMetadata = response.json().await.map_err(|e| OidcError::Discovery {
-            issuer: issuer_str.clone(),
-            message: e.to_string(),
-        })?;
+        let body = read_bounded_body(response)
+            .await
+            .map_err(|e| OidcError::Discovery {
+                issuer: issuer_str.clone(),
+                message: e.to_string(),
+            })?;
+        let raw: RawProviderMetadata =
+            serde_json::from_slice(&body).map_err(|e| OidcError::Discovery {
+                issuer: issuer_str.clone(),
+                message: e.to_string(),
+            })?;
 
         // Anti-spoofing: the metadata issuer must match the URL we requested from.
         // Both sides are normalized to strip trailing slashes so comparison is canonical.

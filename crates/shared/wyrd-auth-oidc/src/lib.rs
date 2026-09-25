@@ -30,4 +30,6 @@ pub use registry::{
     ClaimMapping, ClaimPath, ClientAuth, IssuerVerification, TrustedIssuer, TrustedIssuerRegistry,
     WorkloadBinding, WorkloadBindingResolver,
 };
-pub use screening::{AddressPolicy, ScreenError, ScreenedHttp};
+pub use screening::{
+    AddressPolicy, BodyError, MAX_RESPONSE_BYTES, ScreenError, ScreenedHttp, read_bounded_body,
+};

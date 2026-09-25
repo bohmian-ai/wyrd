@@ -8,7 +8,9 @@ use serde::Deserialize;
 use serde_json::Value;
 use url::Url;
 use uuid::Uuid;
-use wyrd_auth_oidc::{ClientAuth, OidcError, OidcProvider, ScreenedHttp, TrustedIssuer};
+use wyrd_auth_oidc::{
+    ClientAuth, OidcError, OidcProvider, ScreenedHttp, TrustedIssuer, read_bounded_body,
+};
 use wyrd_auth_verify::ExternalVerifier;
 use wyrd_runtime::{PrincipalId, RoleRef};
 use wyrd_spec::DataTenantId;
@@ -305,7 +307,8 @@ pub(crate) async fn discover_provider(
 /// Returns [`WyrdError::DiscoveryUnavailable`] when another Rustls provider
 /// already owns the process or discovery omitted the token endpoint. Returns
 /// the callback's structured authentication errors when request construction,
-/// transport, response parsing, or token validation fails. Cancellation can
+/// transport, response parsing (including a body over
+/// [`wyrd_auth_oidc::MAX_RESPONSE_BYTES`]), or token validation fails. Cancellation can
 /// leave the remote exchange outcome unknown, but this helper makes no local
 /// durable progress.
 pub(crate) async fn exchange_code_for_id_token(
@@ -355,17 +358,19 @@ pub(crate) async fn exchange_code_for_id_token(
         };
     }
 
-    response
-        .json::<TokenEndpointResponse>()
+    let decode_failed = |error: &dyn std::fmt::Display| {
+        tracing::warn!(error = %error, "OIDC token response decode failed");
+        WyrdError::AuthVerifyUnavailable {
+            message: "OIDC token response decode failed".to_owned(),
+            details: serde_json::json!({ "retry_after_seconds": 1 }),
+        }
+    };
+    let body = read_bounded_body(response)
         .await
+        .map_err(|error| decode_failed(&error))?;
+    serde_json::from_slice::<TokenEndpointResponse>(&body)
         .map(|body| body.id_token)
-        .map_err(|error| {
-            tracing::warn!(error = %error, "OIDC token response decode failed");
-            WyrdError::AuthVerifyUnavailable {
-                message: "OIDC token response decode failed".to_owned(),
-                details: serde_json::json!({ "retry_after_seconds": 1 }),
-            }
-        })
+        .map_err(|error| decode_failed(&error))
 }
 
 /// Build one authorization-code token request with the client's configured

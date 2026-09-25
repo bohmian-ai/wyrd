@@ -13,7 +13,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
-use reqwest::Client;
+use reqwest::{Client, Response};
 use url::Url;
 
 /// How long any provider fetch may take.
@@ -21,6 +21,14 @@ use url::Url;
 /// Bounded because these requests sit in a login path: a provider that hangs
 /// must fail the login, not hold the connection.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Largest decoded provider response body Wyrd buffers: 1 MiB.
+///
+/// Discovery documents, key sets, and token responses are a few KiB. The cap is
+/// counted after transfer and content decoding, so neither a chunked stream nor
+/// a small compressed body that inflates can grow a serving replica's memory
+/// past it.
+pub const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
 /// Which internal address ranges a deployment may legitimately reach.
 ///
@@ -40,8 +48,9 @@ pub enum AddressPolicy {
 /// Why a provider fetch could not be made.
 #[derive(Debug, thiserror::Error)]
 pub enum ScreenError {
-    /// The URL has no host, or resolves to an address Wyrd must never reach.
-    #[error("issuer resolves to a blocked address range")]
+    /// The URL uses a scheme the policy refuses, has no host, or resolves to
+    /// an address Wyrd must never reach.
+    #[error("provider URL uses a refused scheme or resolves to a blocked address range")]
     Blocked,
     /// The host could not be resolved at all.
     #[error("issuer host could not be resolved")]
@@ -49,6 +58,48 @@ pub enum ScreenError {
     /// The HTTP client could not be constructed.
     #[error("provider client could not be constructed")]
     Client,
+}
+
+/// Why a provider response body could not be read.
+#[derive(Debug, thiserror::Error)]
+pub enum BodyError {
+    /// The declared or decoded body exceeds [`MAX_RESPONSE_BYTES`].
+    #[error("provider response exceeds the {MAX_RESPONSE_BYTES}-byte limit")]
+    TooLarge,
+    /// The transfer failed, timed out, or could not be decoded.
+    #[error("provider response could not be read: {0}")]
+    Read(#[from] reqwest::Error),
+}
+
+/// Read a provider response body, refusing it once it exceeds
+/// [`MAX_RESPONSE_BYTES`].
+///
+/// A declared `Content-Length` above the cap is refused before any body byte
+/// is read. Otherwise the decoded body is read chunk by chunk through reqwest,
+/// and reading stops at the first chunk that would cross the cap, so a
+/// chunked or decompression-amplified body is never buffered whole. The
+/// request's own timeout keeps bounding the read; dropping the future cancels
+/// it with nothing retained.
+///
+/// # Errors
+/// Returns [`BodyError::TooLarge`] when the declared or decoded body exceeds
+/// the cap, and [`BodyError::Read`] when the transfer or content decoding
+/// fails or times out.
+pub async fn read_bounded_body(mut response: Response) -> Result<Vec<u8>, BodyError> {
+    let declared_too_large = response
+        .content_length()
+        .is_some_and(|len| !usize::try_from(len).is_ok_and(|len| len <= MAX_RESPONSE_BYTES));
+    if declared_too_large {
+        return Err(BodyError::TooLarge);
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
+            return Err(BodyError::TooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 /// Builds screened, pinned HTTP clients for identity-provider requests.
@@ -78,6 +129,12 @@ impl ScreenedHttp {
 
     /// Build a client that can only reach `url`'s screened addresses.
     ///
+    /// The scheme is screened first, before any resolution or request:
+    /// [`AddressPolicy::BlockInternal`] accepts only `https`, so no discovered
+    /// endpoint can carry a client secret or authorization code in cleartext;
+    /// [`AddressPolicy::AllowInternal`] also accepts `http` for local and test
+    /// providers. Every other scheme is refused under both policies.
+    ///
     /// A literal-IP host is screened directly. A name is resolved, every
     /// resolved address is screened, and the returned client is pinned to those
     /// addresses — so the answer that passed the screen is the answer the
@@ -90,11 +147,14 @@ impl ScreenedHttp {
     /// answer is the attack, not a mixed-quality result to be salvaged.
     ///
     /// # Errors
-    /// Returns [`ScreenError::Blocked`] when the URL has no host or any
-    /// resolved address is blocked, [`ScreenError::Unresolved`] when resolution
+    /// Returns [`ScreenError::Blocked`] when the scheme is refused, the URL has
+    /// no host, or any resolved address is blocked, [`ScreenError::Unresolved`] when resolution
     /// fails, and [`ScreenError::Client`] when TLS setup or client construction
     /// fails.
     pub async fn client_for(&self, url: &Url) -> Result<Client, ScreenError> {
+        if !self.permits_scheme(url.scheme()) {
+            return Err(ScreenError::Blocked);
+        }
         wyrd_tls::install_crypto_provider().map_err(|_| ScreenError::Client)?;
         // No proxy, ambient or otherwise: a proxy would receive the original
         // hostname and choose its own destination, bypassing the pinned,
@@ -155,6 +215,11 @@ impl ScreenedHttp {
         Ok(addrs)
     }
 
+    /// Whether this deployment may send a provider request over `scheme`.
+    fn permits_scheme(&self, scheme: &str) -> bool {
+        scheme == "https" || (self.policy == AddressPolicy::AllowInternal && scheme == "http")
+    }
+
     /// Whether this deployment must refuse to connect to `ip`.
     fn is_blocked(&self, ip: IpAddr) -> bool {
         is_always_blocked(ip) || (self.policy == AddressPolicy::BlockInternal && is_internal(ip))
@@ -209,9 +274,14 @@ fn is_internal(ip: IpAddr) -> bool {
 /// Address-policy screening for outbound OIDC calls.
 #[cfg(test)]
 mod tests {
-    use super::{AddressPolicy, ScreenError, ScreenedHttp};
+    use super::{
+        AddressPolicy, BodyError, MAX_RESPONSE_BYTES, ScreenError, ScreenedHttp, read_bounded_body,
+    };
     use std::net::IpAddr;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use url::Url;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// The internal ranges separate the two policies, and only those ranges do.
     #[test]
@@ -308,9 +378,6 @@ mod tests {
     /// proxy sees any request.
     #[tokio::test]
     async fn an_ambient_proxy_cannot_observe_a_screened_request() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
         let proxy = MockServer::start().await;
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(200))
@@ -372,5 +439,176 @@ mod tests {
             .await
             .expect("screened request completes");
         assert!(response.status().is_success(), "{}", response.status());
+    }
+
+    /// Production screening refuses cleartext before resolving or sending;
+    /// the permissive policy keeps its `http` local-provider path; no policy
+    /// accepts another scheme.
+    #[tokio::test]
+    async fn only_the_permissive_policy_accepts_cleartext_http() {
+        let target = MockServer::start().await;
+        let blocking = ScreenedHttp::new(AddressPolicy::BlockInternal);
+        let allowing = ScreenedHttp::allowing_internal();
+
+        let cleartext = Url::parse("http://idp.example.com/token").expect("url");
+        assert!(matches!(
+            blocking.client_for(&cleartext).await.expect_err("refused"),
+            ScreenError::Blocked
+        ));
+
+        let local = Url::parse(&target.uri()).expect("mock uri");
+        allowing
+            .client_for(&local)
+            .await
+            .expect("the local provider stays reachable")
+            .get(local)
+            .send()
+            .await
+            .expect("the local request is sent");
+
+        let other = Url::parse("ftp://127.0.0.1/token").expect("url");
+        for policy in [blocking, allowing] {
+            assert!(matches!(
+                policy.client_for(&other).await.expect_err("refused"),
+                ScreenError::Blocked
+            ));
+        }
+    }
+
+    /// Fetch `url` through a permissive screened client and read it bounded.
+    ///
+    /// # Panics
+    /// Panics when the client cannot be built or the request is not sent.
+    async fn bounded_get(url: &str) -> Result<Vec<u8>, BodyError> {
+        let url = Url::parse(url).expect("url");
+        let response = ScreenedHttp::allowing_internal()
+            .client_for(&url)
+            .await
+            .expect("screened client builds")
+            .get(url)
+            .send()
+            .await
+            .expect("request is sent");
+        read_bounded_body(response).await
+    }
+
+    /// Serve `body` from a mock provider at `/body` with extra `headers`.
+    async fn serve(body: Vec<u8>, headers: &[(&str, &str)]) -> MockServer {
+        let server = MockServer::start().await;
+        let mut response = ResponseTemplate::new(200).set_body_bytes(body);
+        for (name, value) in headers {
+            response = response.insert_header(*name, *value);
+        }
+        Mock::given(method("GET"))
+            .and(path("/body"))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// A body of exactly the cap is returned whole.
+    #[tokio::test]
+    async fn a_body_at_the_limit_is_read_whole() {
+        let server = serve(vec![b'a'; MAX_RESPONSE_BYTES], &[]).await;
+        let body = bounded_get(&format!("{}/body", server.uri()))
+            .await
+            .expect("an at-limit body is read");
+        assert_eq!(body.len(), MAX_RESPONSE_BYTES);
+    }
+
+    /// A declared length one byte over the cap is refused.
+    #[tokio::test]
+    async fn an_oversized_declared_body_is_refused() {
+        let server = serve(vec![b'a'; MAX_RESPONSE_BYTES + 1], &[]).await;
+        let error = bounded_get(&format!("{}/body", server.uri()))
+            .await
+            .expect_err("oversized body is refused");
+        assert!(matches!(error, BodyError::TooLarge), "{error:?}");
+    }
+
+    /// A chunked body with no declared length stops at the cap.
+    ///
+    /// # Panics
+    /// Panics when the raw server cannot bind or accept.
+    #[tokio::test]
+    async fn an_oversized_chunked_body_is_refused() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("local address");
+        let chunk = 64 * 1024;
+        let mut response = b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n".to_vec();
+        for _ in 0..=MAX_RESPONSE_BYTES / chunk {
+            response.extend_from_slice(format!("{chunk:x}\r\n").as_bytes());
+            response.extend(std::iter::repeat_n(b'a', chunk));
+            response.extend_from_slice(b"\r\n");
+        }
+        response.extend_from_slice(b"0\r\n\r\n");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await;
+            // The client may hang up mid-body once it refuses; that is the point.
+            let _ = socket.write_all(&response).await;
+        });
+
+        let error = bounded_get(&format!("http://{address}/body"))
+            .await
+            .expect_err("oversized chunked body is refused");
+        assert!(matches!(error, BodyError::TooLarge), "{error:?}");
+        server.abort();
+    }
+
+    /// A gzip body of a few KiB that inflates past the cap is refused on its
+    /// decoded size.
+    #[tokio::test]
+    async fn an_oversized_decompressed_body_is_refused() {
+        let repeats = MAX_RESPONSE_BYTES / 258 + 1;
+        let compressed = gzip_repeating_a(repeats);
+        assert!(
+            compressed.len() < MAX_RESPONSE_BYTES / 64,
+            "the body is small on the wire"
+        );
+        let server = serve(compressed, &[("content-encoding", "gzip")]).await;
+        let error = bounded_get(&format!("{}/body", server.uri()))
+            .await
+            .expect_err("inflated body is refused");
+        assert!(matches!(error, BodyError::TooLarge), "{error:?}");
+    }
+
+    /// Gzip stream inflating to `1 + 258 * repeats` bytes of `a`.
+    ///
+    /// One fixed-Huffman deflate block: a literal `a`, then `repeats`
+    /// length-258/distance-1 back-references (13 bits each). The trailer's
+    /// CRC and size are zero because a bounded reader stops before them; the
+    /// workspace ships no compression encoder to this crate.
+    ///
+    /// # Panics
+    /// Never in practice; the byte conversion masks to eight bits.
+    fn gzip_repeating_a(repeats: usize) -> Vec<u8> {
+        let mut out = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff];
+        let (mut bits, mut used) = (0_u32, 0_u32);
+        let mut put = |out: &mut Vec<u8>, value: u32, len: u32| {
+            bits |= value << used;
+            used += len;
+            while used >= 8 {
+                out.push(u8::try_from(bits & 0xff).expect("masked to a byte"));
+                bits >>= 8;
+                used -= 8;
+            }
+        };
+        // Huffman codes are packed most-significant bit first.
+        let huffman = |code: u32, len: u32| code.reverse_bits() >> (32 - len);
+        put(&mut out, 0b011, 3); // BFINAL = 1, BTYPE = 01 (fixed Huffman).
+        put(&mut out, huffman(0x30 + u32::from(b'a'), 8), 8);
+        for _ in 0..repeats {
+            put(&mut out, huffman(0b1100_0101, 8), 8); // length code 285 = 258.
+            put(&mut out, huffman(0, 5), 5); // distance code 0 = 1.
+        }
+        put(&mut out, huffman(0, 7), 7); // end of block.
+        put(&mut out, 0, 7); // flush the final partial byte.
+        out.extend([0; 8]);
+        out
     }
 }

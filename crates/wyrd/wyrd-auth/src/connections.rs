@@ -29,7 +29,9 @@ use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
 use url::Url;
 use uuid::Uuid;
-use wyrd_auth_oidc::{ClientAuth, OidcProvider, ScreenedHttp, TrustedIssuer, usable_jwks_keys};
+use wyrd_auth_oidc::{
+    ClientAuth, OidcProvider, ScreenedHttp, TrustedIssuer, read_bounded_body, usable_jwks_keys,
+};
 use wyrd_crypt::SealingKeyring;
 use wyrd_runtime::Permission;
 use wyrd_spec::DataTenantId;
@@ -750,7 +752,8 @@ impl HumanConnections {
     ///
     /// # Errors
     /// Returns [`WyrdError::DiscoveryUnavailable`] when the endpoint is
-    /// refused by screening, unreachable, or answers 5xx, and
+    /// refused by screening, unreachable, answers 5xx, or returns a body over
+    /// [`wyrd_auth_oidc::MAX_RESPONSE_BYTES`], and
     /// [`WyrdError::ConnectionNotTested`] naming `token_endpoint_missing`,
     /// `client_auth_rejected`, or `client_auth_unverified`.
     async fn probe_client_auth(
@@ -788,7 +791,7 @@ impl HumanConnections {
         if status.is_server_error() {
             return Err(unreachable("token endpoint failed"));
         }
-        let body = response.bytes().await.map_err(unreachable)?;
+        let body = read_bounded_body(response).await.map_err(unreachable)?;
         client_auth_outcome(status, &body)
     }
 
@@ -1014,10 +1017,17 @@ fn internal(cause: impl Display) -> WyrdError {
 mod probe_tests {
     use reqwest::StatusCode;
     use serde_json::json;
+    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use url::Url;
+    use uuid::Uuid;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wyrd_auth_oidc::{ClientAuth, MAX_RESPONSE_BYTES, OidcProvider, ScreenedHttp};
+    use wyrd_spec::auth::IssuerUrl;
     use wyrd_spec::error::WyrdError;
+    use wyrd_sql::WyrdPostgres;
 
-    use super::{callback_redirect_qualifies, client_auth_outcome};
+    use super::{HumanConnections, TestTarget, callback_redirect_qualifies, client_auth_outcome};
 
     /// The deployment callback the probes judge against.
     fn callback() -> Url {
@@ -1162,5 +1172,67 @@ mod probe_tests {
                 String::from_utf8_lossy(&payload)
             );
         }
+    }
+
+    /// A token endpoint whose `invalid_grant` answer is padded past the
+    /// response cap fails the client-auth probe as unreachable, so the
+    /// candidate is never handed to the stamp and stays untested.
+    ///
+    /// # Panics
+    /// Panics when the mock provider cannot be discovered or the probe
+    /// qualifies.
+    #[tokio::test]
+    async fn an_oversized_token_response_leaves_the_candidate_untested() {
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issuer": issuer,
+                "authorization_endpoint": format!("{issuer}/authorize"),
+                "token_endpoint": format!("{issuer}/token"),
+                "jwks_uri": format!("{issuer}/jwks"),
+                "id_token_signing_alg_values_supported": ["RS256"],
+            })))
+            .mount(&server)
+            .await;
+        let mut padded = br#"{"error":"invalid_grant"}"#.to_vec();
+        padded.resize(MAX_RESPONSE_BYTES + 1, b' ');
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(400).set_body_bytes(padded))
+            .mount(&server)
+            .await;
+
+        let http = ScreenedHttp::allowing_internal();
+        let issuer_url = Url::parse(&issuer).expect("mock issuer parses");
+        let provider = OidcProvider::discover(
+            issuer_url.clone(),
+            http.client_for(&issuer_url).await.expect("screened client"),
+        )
+        .await
+        .expect("mock provider is discovered");
+        let pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
+        let connections = HumanConnections::new(
+            WyrdPostgres::from_pools(pool, None),
+            None,
+            http,
+            Some(&Url::parse("https://wyrd.example.com").expect("origin parses")),
+        );
+        let target = TestTarget {
+            connection_id: Uuid::nil(),
+            revision: 1,
+            issuer: IssuerUrl::new(issuer).expect("mock issuer is valid"),
+            client_id: "wyrd".to_owned(),
+            client_auth: ClientAuth::Public,
+        };
+
+        let outcome = connections
+            .probe_client_auth(&provider, &target, &callback())
+            .await;
+        assert!(
+            matches!(outcome, Err(WyrdError::DiscoveryUnavailable { .. })),
+            "{outcome:?}"
+        );
     }
 }

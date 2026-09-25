@@ -10,7 +10,7 @@ use serde::Deserialize;
 use url::Url;
 
 use crate::error::OidcError;
-use crate::screening::ScreenedHttp;
+use crate::screening::{ScreenedHttp, read_bounded_body};
 
 /// Key identifier extracted from a JWT header, scoped to OIDC key management.
 ///
@@ -136,7 +136,8 @@ fn decoding_key_from_jwk(
 /// # Errors
 /// Returns [`OidcError::JwksUnavailable`] when the screened client cannot be
 /// built for the URI, the request fails, the issuer answers with a non-success
-/// status, or the body does not decode as a JWKS document. Keys the decoder
+/// status, the body exceeds [`crate::screening::MAX_RESPONSE_BYTES`], or the
+/// body does not decode as a JWKS document. Keys the decoder
 /// does not recognize are skipped rather than failing the fetch.
 async fn fetch_jwks(
     issuer: &str,
@@ -171,13 +172,16 @@ async fn fetch_jwks(
         });
     }
 
-    let jwks: Jwks = response
-        .json()
+    let body = read_bounded_body(response)
         .await
         .map_err(|e| OidcError::JwksUnavailable {
             issuer: issuer.to_owned(),
-            message: format!("JWKS JSON parse failed: {e}"),
+            message: e.to_string(),
         })?;
+    let jwks: Jwks = serde_json::from_slice(&body).map_err(|e| OidcError::JwksUnavailable {
+        issuer: issuer.to_owned(),
+        message: format!("JWKS JSON parse failed: {e}"),
+    })?;
 
     let mut map = HashMap::new();
     for jwk in &jwks.keys {

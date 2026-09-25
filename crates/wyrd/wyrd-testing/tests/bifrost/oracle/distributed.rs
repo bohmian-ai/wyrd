@@ -315,18 +315,25 @@ async fn prove_selective_predicate_pruning(
         .into());
     }
 
-    let inspection = cluster.oracle_inspection().await?;
-    if inspection.active_queries != 0
-        || inspection.queued_queries != 0
-        || inspection.reserved_memory_bytes != 0
-        || inspection.reserved_spill_bytes != 0
-        || inspection.peer_pending != 0
-        || inspection.peer_running != 0
-    {
-        return Err(format!("Oracle runtime did not settle: {inspection:?}").into());
+    // A follower settles its cancelled graph, and so its peer permit, on its
+    // own stage-operation path after the leader's terminal frame, so this is a
+    // bounded convergence rather than an instantaneous read.
+    let mut inspection = cluster.oracle_inspection().await?;
+    for _ in 0..CLEAN_NODE_POLLS {
+        if inspection.active_queries == 0
+            && inspection.queued_queries == 0
+            && inspection.reserved_memory_bytes == 0
+            && inspection.reserved_spill_bytes == 0
+            && inspection.peer_pending == 0
+            && inspection.peer_running == 0
+        {
+            cluster.shutdown().await?;
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        inspection = cluster.oracle_inspection().await?;
     }
-    cluster.shutdown().await?;
-    Ok(())
+    Err(format!("Oracle runtime did not settle: {inspection:?}").into())
 }
 
 /// Drives one query to a terminal outcome across both of Oracle's refusal

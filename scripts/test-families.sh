@@ -10,6 +10,7 @@ FAMILY_WYRD=(
   wyrd-cards
   wyrd-cli
   wyrd-config
+  wyrd-gateway
   wyrd-interfaces
   wyrd-mcp
   wyrd-server

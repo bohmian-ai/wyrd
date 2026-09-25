@@ -196,6 +196,16 @@ run = """scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate
   && mise run py:test:gateway:journey:inner \
   && mise run ts:test:gateway:journey:inner'"""
 
+[tasks."test:gateway:gate"]
+hide = true
+description = """The gate's share of the gateway: only the ignored Rust, Vault, CLI, MCP, and Rust SDK
+journeys. py:test:integration and ts:test:integration own the Python and TypeScript gateway
+journeys. Run `test:gateway:journey` for the complete, standalone lane."""
+run = """scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner \
+  && mise run test:gateway:native:inner \
+  && mise run test:gateway:vault:inner \
+  && mise run test:gateway:journey:surfaces:inner'"""
+
 [tasks."test:gateway:vault:inner"]
 hide = true
 tools = { vault = "2.1.1" }
@@ -1461,6 +1471,7 @@ depends = [
   "check:skills-sync",
   "test:rust",
   "test:bifrost:gate",
+  "test:gateway:gate",
   "test:identity:journey",
   "py:test:integration",
   "ts:test:integration",

@@ -17,10 +17,11 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use uuid::Uuid;
 
 use crate::DataTenantId;
-use crate::auth::{ClaimMappingPayload, IssuerUrl, SecretBearer};
+use crate::auth::{ClaimMappingPayload, IssuerTokenPolicy, IssuerUrl, SecretBearer};
 use crate::error::WyrdError;
 
 /// Wire spelling of the client-authentication method Wyrd does not implement.
@@ -206,8 +207,8 @@ impl ConnectionInput {
     /// Returns [`WyrdError::UnsupportedClientAuth`] when `client_auth` names
     /// `PrivateKeyJwt`, [`WyrdError::Validation`] when the body does not match
     /// the contract, and the result of [`Self::validate`] otherwise.
-    pub fn from_json(body: serde_json::Value) -> Result<Self, WyrdError> {
-        if body.get("client_auth").and_then(serde_json::Value::as_str) == Some(PRIVATE_KEY_JWT) {
+    pub fn from_json(body: Value) -> Result<Self, WyrdError> {
+        if body.get("client_auth").and_then(Value::as_str) == Some(PRIVATE_KEY_JWT) {
             return Err(unsupported_client_auth());
         }
         let input: Self = serde_json::from_value(body).map_err(|error| WyrdError::Validation {
@@ -222,8 +223,8 @@ impl ConnectionInput {
     ///
     /// # Errors
     /// Returns [`WyrdError::Validation`] when `client_id` or the subject claim
-    /// path is empty, a secret method omits its secret, or `Public` carries
-    /// one.
+    /// path is empty, a secret method omits its secret or supplies an empty
+    /// one, or `Public` supplies any secret value, including an empty one.
     pub fn validate(&self) -> Result<(), WyrdError> {
         if self.client_id.trim().is_empty() {
             return Err(validation("client_id must not be empty", "client_id"));
@@ -234,20 +235,20 @@ impl ConnectionInput {
                 "claim_mapping",
             ));
         }
-        let has_secret = self
-            .client_secret
-            .as_ref()
-            .is_some_and(|secret| !secret.expose().is_empty());
-        match (self.client_auth.requires_secret(), has_secret) {
-            (true, false) => Err(validation(
-                "client_secret is required for SecretBasic and SecretPost",
+        // Presence and content are separate facts: a Public client refuses
+        // any supplied value, even an empty one, and a secret method needs a
+        // supplied, nonempty one.
+        match (self.client_auth.requires_secret(), &self.client_secret) {
+            (true, Some(secret)) if !secret.expose().is_empty() => Ok(()),
+            (true, _) => Err(validation(
+                "client_secret is required and must not be empty for SecretBasic and SecretPost",
                 "client_secret",
             )),
-            (false, true) => Err(validation(
+            (false, Some(_)) => Err(validation(
                 "client_secret must be omitted for a Public client",
                 "client_secret",
             )),
-            _ => Ok(()),
+            (false, None) => Ok(()),
         }
     }
 }
@@ -288,10 +289,8 @@ pub struct ConnectionActivate {
 /// # Errors
 /// Returns [`WyrdError::HumanConnectionRequired`] when `principal_kind` is
 /// `Human`.
-pub fn refuse_human_trusted_issuer(
-    principal_kind: crate::auth::IssuerTokenPolicy,
-) -> Result<(), WyrdError> {
-    if principal_kind == crate::auth::IssuerTokenPolicy::Human {
+pub fn refuse_human_trusted_issuer(principal_kind: IssuerTokenPolicy) -> Result<(), WyrdError> {
+    if principal_kind == IssuerTokenPolicy::Human {
         return Err(WyrdError::HumanConnectionRequired {
             message: "trusted issuers are workload-only; configure human login through the \
                       tenant OIDC connection API (/v1/identity/oidc)"
@@ -359,12 +358,35 @@ mod tests {
             Err(WyrdError::Validation { .. })
         ));
 
-        let mut extra = body();
-        extra["client_secret"] = serde_json::json!("s3cret");
-        assert!(matches!(
-            ConnectionInput::from_json(extra),
-            Err(WyrdError::Validation { .. })
-        ));
+        for secret in ["s3cret", ""] {
+            let mut extra = body();
+            extra["client_secret"] = serde_json::json!(secret);
+            assert!(
+                matches!(
+                    ConnectionInput::from_json(extra),
+                    Err(WyrdError::Validation { .. })
+                ),
+                "Public refuses a supplied secret {secret:?}"
+            );
+        }
+
+        for method in ["SecretBasic", "SecretPost"] {
+            let mut empty = body();
+            empty["client_auth"] = serde_json::json!(method);
+            empty["client_secret"] = serde_json::json!("");
+            assert!(
+                matches!(
+                    ConnectionInput::from_json(empty),
+                    Err(WyrdError::Validation { .. })
+                ),
+                "{method} refuses an empty secret"
+            );
+            let mut valid = body();
+            valid["client_auth"] = serde_json::json!(method);
+            valid["client_secret"] = serde_json::json!("s3cret");
+            let input = ConnectionInput::from_json(valid).expect("a nonempty secret decodes");
+            assert!(input.client_auth.requires_secret());
+        }
     }
 
     /// The generated schema never offers `PrivateKeyJwt` and never leaks

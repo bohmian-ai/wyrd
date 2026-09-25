@@ -50,6 +50,8 @@ export WYRD_SIGNING_KEY_FILE=/run/secrets/signing-key.pem
 export WYRD_SIGNING_KEY_PEM="$(cat signing-key.pem)"
 ```
 
+The signing key file follows the same rule as the sealing key files below: a regular file readable by its owner only (mode `0600` or `0400`), no larger than 64 KiB. Boot refuses anything else without quoting the key.
+
 In a production profile, boot fails closed if neither is set. In development the server mints an ephemeral key on each start and logs a warning, so local runs work with no secret. That key does not survive a restart, so tokens minted against it stop verifying when the process restarts. Never use an ephemeral key outside development.
 
 <Aside title="Rotation">

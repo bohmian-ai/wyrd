@@ -58,14 +58,15 @@ pub enum ConfigError {
         /// The missing path.
         path: PathBuf,
     },
-    /// The signing-key file named by `WYRD_SIGNING_KEY_FILE` could not be read.
-    #[error("signing-key file at {path} could not be read")]
+    /// The signing-key file named by `WYRD_SIGNING_KEY_FILE` was refused by
+    /// [`read_secret_file`]: unreadable, not a regular owner-only file, or
+    /// larger than one secret.
+    #[error("signing-key file at {path} {reason}")]
     ReadSigningKey {
-        /// Path that failed to read.
+        /// Path that was refused.
         path: PathBuf,
-        /// Underlying I/O error.
-        #[source]
-        source: std::io::Error,
+        /// The loader's static refusal; it names no key material.
+        reason: &'static str,
     },
     /// The sealing-key file named by `WYRD_SEALING_KEY_FILE` or
     /// `WYRD_SEALING_RETAINED_KEYS_FILE` was refused by
@@ -3385,7 +3386,13 @@ where
 /// `WYRD_SIGNING_KEY_FILE` (a path to a mounted secret) is the primary source;
 /// `WYRD_SIGNING_KEY_PEM` (inline PEM) is the fallback. The file form is
 /// preferred because a k8s Secret volume keeps the PEM out of the process
-/// environment and `env` dumps. Setting both is a configuration error.
+/// environment and `env` dumps. Setting both is a configuration error. The
+/// file is read through [`read_secret_file`], the same loader the sealing keys
+/// use, so it must be a regular, owner-only file no larger than one secret.
+///
+/// # Errors
+/// Returns [`ConfigError::ConflictingEnvVars`] when both sources are set and
+/// [`ConfigError::ReadSigningKey`] when the file is refused.
 fn load_signing_key() -> Result<Option<SecretString>, ConfigError> {
     let file = env_opt("WYRD_SIGNING_KEY_FILE")?;
     let inline = env_opt("WYRD_SIGNING_KEY_PEM")?;
@@ -3398,8 +3405,8 @@ fn load_signing_key() -> Result<Option<SecretString>, ConfigError> {
         }),
         (Some(path), None) => {
             let path = PathBuf::from(path);
-            let pem = std::fs::read_to_string(&path)
-                .map_err(|source| ConfigError::ReadSigningKey { path, source })?;
+            let pem = read_secret_file(&path)
+                .map_err(|reason| ConfigError::ReadSigningKey { path, reason })?;
             Ok(Some(SecretString::from(pem)))
         }
         (None, Some(pem)) => Ok(Some(SecretString::from(pem))),
@@ -5395,6 +5402,70 @@ provider = "anthropic"
             assert!(
                 !message.contains(KEY) && !message.contains(&KEY[..8]),
                 "{case} refusal quotes key material: {message}"
+            );
+        }
+    }
+
+    /// The signing-key file loads only from a bounded, owner-only regular
+    /// file, and no refusal quotes key material.
+    ///
+    /// The PEM mints every access token, so it shares the sealing keys'
+    /// [`read_secret_file`] rule: permissive, non-regular, and oversized
+    /// mounts are refused as [`ConfigError::ReadSigningKey`].
+    ///
+    /// # Panics
+    /// Panics when a key file cannot be written, when an owner-only file is
+    /// refused, or when a refused file is accepted, refused with another
+    /// error, or refused with text containing the key.
+    #[test]
+    fn the_signing_key_file_requires_a_restrictive_regular_bounded_file() {
+        const PEM: &str =
+            "-----BEGIN PRIVATE KEY-----\nsigning-key-body\n-----END PRIVATE KEY-----\n";
+        let _guard = ENV_LOCK.lock().expect("environment test lock");
+        let directory = tempfile::tempdir().expect("key temp directory");
+        let owner_only = directory.path().join("owner-only.pem");
+        write_key_file(&owner_only, PEM, 0o600);
+        let permissive = directory.path().join("permissive.pem");
+        write_key_file(&permissive, PEM, 0o644);
+        let oversized = directory.path().join("oversized.pem");
+        write_key_file(&oversized, &PEM.repeat(2048), 0o600);
+
+        temp_env::with_vars(
+            [
+                ("WYRD_SIGNING_KEY_FILE", Some(owner_only.as_os_str())),
+                ("WYRD_SIGNING_KEY_PEM", None),
+            ],
+            || {
+                let loaded = load_signing_key().expect("owner-only signing key loads");
+                assert_eq!(
+                    loaded.map(|key| key.expose_secret().to_owned()).as_deref(),
+                    Some(PEM)
+                );
+            },
+        );
+
+        for (case, path) in [
+            ("permissive", permissive.as_path()),
+            ("non-regular", directory.path()),
+            ("oversized", oversized.as_path()),
+        ] {
+            temp_env::with_vars(
+                [
+                    ("WYRD_SIGNING_KEY_FILE", Some(path.as_os_str())),
+                    ("WYRD_SIGNING_KEY_PEM", None),
+                ],
+                || {
+                    let error = load_signing_key().expect_err(case);
+                    let message = error.to_string();
+                    assert!(
+                        matches!(error, ConfigError::ReadSigningKey { .. }),
+                        "{case} refusal is a signing-key read error: {message}"
+                    );
+                    assert!(
+                        !message.contains("signing-key-body"),
+                        "{case} refusal quotes key material: {message}"
+                    );
+                },
             );
         }
     }

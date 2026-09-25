@@ -7,12 +7,12 @@
 pub mod audit;
 pub mod callback;
 pub mod card_scope;
+pub mod connections;
 pub mod credential_verify;
 pub(crate) mod error;
 pub mod exchange_api_key;
 pub mod issuance;
 pub mod issue_api_key;
-pub mod issuer;
 pub mod jwt_bearer;
 pub mod login;
 pub mod pg_resolvers;
@@ -24,6 +24,7 @@ pub mod refresh;
 pub mod repo;
 pub mod revoke;
 pub mod roles;
+pub mod sealing;
 pub mod seed;
 pub mod service_accounts;
 

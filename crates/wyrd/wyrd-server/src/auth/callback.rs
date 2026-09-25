@@ -60,11 +60,9 @@ pub async fn exchange_authorization_code(
             .external_verifier
             .clone()
             .ok_or_else(auth_not_configured)?,
-        trusted_issuer_resolver: state
+        connections: state
             .auth
-            .trusted_issuer_resolver
-            .clone()
-            .ok_or_else(auth_not_configured)?,
+            .human_connections(state.postgres.app_pool(), state.deployment_profile.screened_http()),
         http: state.deployment_profile.screened_http(),
     };
     service
@@ -113,7 +111,7 @@ mod pg_tests {
     use std::sync::Arc;
     use std::time::Duration as StdDuration;
 
-    use crate::auth::pg_resolvers::{PgIssuerResolver, issuer_write_from_trusted};
+    use crate::auth::pg_resolvers::PgIssuerResolver;
     use crate::http::error::WyrdErrorResponse;
     use crate::state::AppState;
     use axum::http::{HeaderMap, HeaderValue, header};
@@ -133,12 +131,11 @@ mod pg_tests {
     use wyrd_auth_verify::{
         ExternalVerifier, Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem,
     };
-    use wyrd_crypt::SecretKey;
+    use wyrd_crypt::{SealingKeyring, SecretKey};
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::IssuerTokenPolicy;
     use wyrd_spec::auth::{IssuerUrl, TokenResponse, TokenType};
-    use wyrd_sql::queries::auth::upsert_trusted_issuer;
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
 
     use crate::auth::tenant_slug_from_host;
@@ -601,11 +598,9 @@ mod pg_tests {
                 .external_verifier
                 .clone()
                 .expect("test state has external verifier"),
-            trusted_issuer_resolver: state
+            connections: state
                 .auth
-                .trusted_issuer_resolver
-                .clone()
-                .expect("test state has issuer resolver"),
+                .human_connections(state.postgres.app_pool(), state.deployment_profile.screened_http()),
             http: state.deployment_profile.screened_http(),
         }
     }
@@ -681,23 +676,14 @@ mod pg_tests {
         )
     }
 
-    async fn test_state_with_external(fixture: &PgFixture, trusted: TrustedIssuer) -> AppState {
-        // Seed the issuer into Postgres so the production Pg resolver serves it on
-        // the verifier's external path. These issuers carry a SecretPost client
-        // secret, so a deterministic test sealing key encrypts it on write and
-        // decrypts it on read.
-        let sealing_key = Arc::new(SecretKey::from_bytes([7_u8; 32]));
-        let write =
-            issuer_write_from_trusted(&trusted, Some(&sealing_key)).expect("issuer encodes");
-        let mut conn = fixture
-            .tenant_conn_for(trusted.tenant_id)
-            .await
-            .expect("tenant conn opens");
-        upsert_trusted_issuer(&mut conn, &write)
-            .await
-            .expect("issuer upsert");
-        conn.commit().await.expect("issuer seed commits");
-
+    /// Build callback test state with a real issuing key and external
+    /// verifier.
+    ///
+    /// Human trust is passed to `finish_id_token_exchange` explicitly, so no
+    /// connection is seeded; `_trusted` only documents which issuer each test
+    /// exercises. The Pg issuer resolver backs the verifier's workload path.
+    async fn test_state_with_external(fixture: &PgFixture, _trusted: TrustedIssuer) -> AppState {
+        let sealing_key = Arc::new(SealingKeyring::new(SecretKey::from_bytes([7_u8; 32])));
         let issuer_resolver = Arc::new(PgIssuerResolver::new(
             Arc::new(fixture.app_pool().clone()),
             Some(Arc::clone(&sealing_key)),

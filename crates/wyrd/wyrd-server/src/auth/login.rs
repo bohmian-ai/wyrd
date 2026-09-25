@@ -77,7 +77,8 @@ pub async fn login(
 /// refusal is logged once at one place.
 ///
 /// # Errors
-/// Returns [`WyrdErrorResponse`] when the issuer is not trusted for the tenant,
+/// Returns [`WyrdErrorResponse`] when the issuer is not the tenant's Active
+/// human connection,
 /// when its authorization endpoint cannot be discovered, or when the login
 /// state cannot be persisted.
 async fn try_initiate_login(
@@ -86,13 +87,13 @@ async fn try_initiate_login(
     query: &LoginQuery,
     tenant_id: DataTenantId,
 ) -> Result<Response, WyrdErrorResponse> {
-    let trusted = wyrd_auth::issuer::trusted_issuer(
-        state.auth.trusted_issuer_resolver.as_deref(),
-        tenant_id,
-        &query.issuer,
-    )
-    .await
-    .map_err(WyrdErrorResponse::from)?;
+    let connections = state
+        .auth
+        .human_connections(state.postgres.app_pool(), state.deployment_profile.screened_http());
+    let trusted =
+        wyrd_auth::callback::active_connection_for(&connections, tenant_id, &query.issuer)
+            .await
+            .map_err(WyrdErrorResponse::from)?;
     let redirect_uri = callback_redirect_uri(headers)?;
     let init = wyrd_auth::login::prepare_login(
         state.postgres.app_pool(),

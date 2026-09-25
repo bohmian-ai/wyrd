@@ -22,7 +22,7 @@ use std::sync::Arc;
 use secrecy::{ExposeSecret, SecretString};
 use wyrd_auth_oidc::{ClientAuth, IssuerVerification, ScreenedHttp};
 use wyrd_auth_verify::{ExternalClaims, ExternalVerifier};
-use wyrd_crypt::SecretKey;
+use wyrd_crypt::SealingKeyring;
 use wyrd_spec::auth::LoginInitResponse;
 use wyrd_spec::error::WyrdError;
 use wyrd_sql::queries::platform::identity::{
@@ -82,7 +82,7 @@ pub struct PlatformLogin {
     /// Cross-tenant boundary the connection and identity stores live behind.
     pool: OperatorPool,
     /// Process sealing key the stored client secret is opened with.
-    sealing_key: Option<Arc<SecretKey>>,
+    sealing_key: Option<Arc<SealingKeyring>>,
     /// The deployment's single external-token verification implementation.
     verifier: Arc<ExternalVerifier<PgIssuerResolver>>,
     /// Mints the platform session an accepted identity receives.
@@ -105,7 +105,7 @@ impl PlatformLogin {
     #[must_use]
     pub fn new(
         pool: OperatorPool,
-        sealing_key: Option<Arc<SecretKey>>,
+        sealing_key: Option<Arc<SealingKeyring>>,
         verifier: Arc<ExternalVerifier<PgIssuerResolver>>,
         sessions: Arc<PlatformSessions>,
         http: ScreenedHttp,
@@ -306,7 +306,7 @@ pub struct PlatformConnection {
 /// rather than silently degrading to an unauthenticated client.
 fn decode_connection(
     row: PlatformOidcConnectionRow,
-    sealing_key: Option<&SecretKey>,
+    sealing_key: Option<&SealingKeyring>,
 ) -> Result<PlatformConnection, PlatformLoginError> {
     platform_connection_from_row(row, sealing_key).map_err(|error| {
         tracing::warn!(error = %error, "platform OIDC connection could not be decoded");

@@ -1968,22 +1968,43 @@ pub struct AuthConfig {
     /// separately. `None` when unset; production boot fails closed without it.
     #[serde(skip)]
     pub signing_key: Option<SecretString>,
-    /// Base64-encoded 32-byte AES-256-GCM sealing key for issuer client secrets.
+    /// Base64-encoded 32-byte AES-256-GCM write key for stored provider secrets.
     ///
     /// Env-injected only — never read from the TOML file. Loaded at config time
     /// from `WYRD_SEALING_KEY_FILE` (path to a mounted secret; primary) or
     /// `WYRD_SEALING_KEY_BASE64` (inline base64; fallback). Boot decodes this to
-    /// a 32-byte key. `None` when unset; boot fails closed if any seeded issuer
-    /// carries a client secret without a sealing key configured.
+    /// a 32-byte key and makes it the write key of the deployment
+    /// `SealingKeyring`: every new provider secret (tenant human connections,
+    /// workload issuers, the platform connection) is sealed under it with a
+    /// versioned `key_id` envelope. `None` when unset; storing a secret without
+    /// a configured key fails closed.
     ///
-    /// **Single-key limitation:** there is currently no key-id column or keyring.
-    /// All rows are encrypted under this one key; live rotation without downtime
-    /// is not yet supported. If the key leaks: (1) rotate the client secrets at
-    /// the IdP, (2) re-register the issuers with the new secrets, (3) rotate this
-    /// env var. The existing `client_secret_enc` rows then encrypt stale secrets
-    /// and are harmless. Tracked in issue #72.
+    /// **Rotation:** add the new key to every replica as a retained key, switch
+    /// this write key while listing the old one in
+    /// [`Self::sealing_retained_keys`], and restart. Boot rewraps every stored
+    /// secret under the write key and logs any value it could not open. Remove
+    /// the old retained key only after boot reports zero values needing rewrap.
     #[serde(skip)]
     pub sealing_key: Option<SecretString>,
+    /// Base64-encoded 32-byte keys retained only to open secrets sealed before
+    /// the latest rotation.
+    ///
+    /// Env-injected only. Loaded from `WYRD_SEALING_RETAINED_KEYS_FILE` (a file
+    /// holding one base64 key per line; primary) or
+    /// `WYRD_SEALING_RETAINED_KEYS_BASE64` (comma-separated base64; fallback).
+    /// Empty when unset.
+    #[serde(skip)]
+    pub sealing_retained_keys: Vec<SecretString>,
+    /// Deployment-controlled public origin (scheme, host, optional port) that
+    /// browsers and identity providers reach Wyrd on.
+    ///
+    /// Loaded from `WYRD_PUBLIC_ORIGIN` or `[auth] public_origin`. The tenant
+    /// human-connection callback URL shown to administrators is this origin
+    /// plus `/auth/callback`; it is never assembled from request headers.
+    /// `None` leaves OIDC administration unable to stage a connection while
+    /// every non-OIDC path keeps working.
+    #[serde(default)]
+    pub public_origin: Option<url::Url>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -2882,6 +2903,17 @@ impl WyrdServerConfig {
         if let Some(key) = load_sealing_key()? {
             self.auth.sealing_key = Some(key);
         }
+        let retained = load_sealing_retained_keys()?;
+        if !retained.is_empty() {
+            self.auth.sealing_retained_keys = retained;
+        }
+        if let Some(origin) = env_opt("WYRD_PUBLIC_ORIGIN")? {
+            self.auth.public_origin =
+                Some(url::Url::parse(&origin).map_err(|e| ConfigError::BadEnvVar {
+                    key: "WYRD_PUBLIC_ORIGIN".to_string(),
+                    message: e.to_string(),
+                })?);
+        }
 
         Ok(())
     }
@@ -3397,6 +3429,45 @@ fn load_sealing_key() -> Result<Option<SecretString>, ConfigError> {
         (None, Some(encoded)) => Ok(Some(SecretString::from(encoded.trim().to_owned()))),
         (None, None) => Ok(None),
     }
+}
+
+/// Load the base64-encoded retained sealing keys from the environment.
+///
+/// `WYRD_SEALING_RETAINED_KEYS_FILE` names a mounted file with one base64 key
+/// per line (blank lines ignored); `WYRD_SEALING_RETAINED_KEYS_BASE64` holds a
+/// comma-separated list. Setting both is a configuration error. Boot decodes
+/// and validates each key.
+///
+/// # Errors
+/// Returns [`ConfigError::ConflictingEnvVars`] when both sources are set and
+/// [`ConfigError::ReadSealingKey`] when the file cannot be read.
+fn load_sealing_retained_keys() -> Result<Vec<SecretString>, ConfigError> {
+    let file = env_opt("WYRD_SEALING_RETAINED_KEYS_FILE")?;
+    let inline = env_opt("WYRD_SEALING_RETAINED_KEYS_BASE64")?;
+    let (text, separator) = match (file, inline) {
+        (Some(_), Some(_)) => {
+            return Err(ConfigError::ConflictingEnvVars {
+                keys: vec![
+                    "WYRD_SEALING_RETAINED_KEYS_FILE".to_string(),
+                    "WYRD_SEALING_RETAINED_KEYS_BASE64".to_string(),
+                ],
+            });
+        }
+        (Some(path), None) => {
+            let path = PathBuf::from(path);
+            let text = std::fs::read_to_string(&path)
+                .map_err(|source| ConfigError::ReadSealingKey { path, source })?;
+            (text, '\n')
+        }
+        (None, Some(text)) => (text, ','),
+        (None, None) => return Ok(Vec::new()),
+    };
+    Ok(text
+        .split(separator)
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(|key| SecretString::from(key.to_owned()))
+        .collect())
 }
 
 /// Parse a boolean flag from a `0`/`1` string.

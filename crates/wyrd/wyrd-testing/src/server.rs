@@ -56,7 +56,7 @@ use wyrd_auth_verify::{
 };
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
-use wyrd_crypt::SecretKey;
+use wyrd_crypt::{SealingKeyring, SecretKey};
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_gateway::BuiltinEndpoints;
 #[cfg(test)]
@@ -492,6 +492,10 @@ pub struct WyrdTestServerBuilder {
     auth_verify_settings: Option<WyrdAuthVerifySettings>,
     trusted_issuer_configs: Vec<IssuerEntry>,
     workload_binding_configs: Vec<WorkloadBindingEntry>,
+    /// Provider-secret sealing keyring; `None` uses the deterministic test key.
+    sealing_keyring: Option<Arc<SealingKeyring>>,
+    /// Deployment public origin the human-connection callback URL derives from.
+    public_origin: Option<url::Url>,
     forge_interval: Duration,
     /// Executor slots composed into the production Forge worker.
     wal_sync_delay: Duration,
@@ -609,6 +613,8 @@ impl Default for WyrdTestServerBuilder {
             auth_verify_settings: None,
             trusted_issuer_configs: Vec::new(),
             workload_binding_configs: Vec::new(),
+            sealing_keyring: None,
+            public_origin: None,
             forge_interval: Duration::from_secs(60),
             wal_sync_delay: Duration::ZERO,
             scribe_admission: None,
@@ -3823,6 +3829,26 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Seal provider client secrets with `keyring` instead of the
+    /// deterministic test key.
+    ///
+    /// Start runs the production sealed-secret rewrap with this keyring, the
+    /// way a booting replica does, so a server started with a new write key
+    /// and the old key retained converges stored ciphertext onto the new key.
+    #[must_use]
+    pub fn with_sealing_keyring(mut self, keyring: Arc<SealingKeyring>) -> Self {
+        self.sealing_keyring = Some(keyring);
+        self
+    }
+
+    /// Configure the deployment public origin; the tenant human-connection
+    /// callback URL is `{origin}/auth/callback`.
+    #[must_use]
+    pub fn with_public_origin(mut self, origin: url::Url) -> Self {
+        self.public_origin = Some(origin);
+        self
+    }
+
     /// Boot workload bindings from `[[workload_bindings]]` config DTOs.
     ///
     /// At [`Self::start_in_process`] these run through the production
@@ -4203,7 +4229,18 @@ impl WyrdTestServerBuilder {
         // client secret on write and decrypts it on read. The production Pg
         // resolvers then serve issuers/bindings per-request, including on the
         // verifier's external (foreign-OIDC) path.
-        let sealing_key = Arc::new(SecretKey::from_bytes([9_u8; 32]));
+        let sealing_key = self.sealing_keyring.clone().unwrap_or_else(|| {
+            Arc::new(SealingKeyring::new(SecretKey::from_bytes([9_u8; 32])))
+        });
+        if self.sealing_keyring.is_some() {
+            wyrd_auth::sealing::SealedSecretRewrap::new(
+                fixture.operator_pool().clone(),
+                Arc::clone(&sealing_key),
+            )
+            .run()
+            .await
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        }
         seed_trusted_issuers(
             runtime_wyrd.app_pool(),
             tenant_id,
@@ -4558,6 +4595,7 @@ impl WyrdTestServerBuilder {
                 trusted_issuer_resolver: Some(issuer_resolver),
                 workload_binding_resolver: Some(binding_resolver),
                 sealing_key: Some(sealing_key),
+                public_origin: self.public_origin.clone(),
             })
             .with_gateway(test_gateway_config(
                 fixture.data_tenant_id(),

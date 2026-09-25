@@ -117,6 +117,21 @@ mod tests {
         }
     }
 
+    /// Human SSO administration is reachable only through the tenant `admin`
+    /// wildcard: `runtime_admin` (credential administration) and every other
+    /// built-in role must not confer `identity_connections:write`.
+    #[test]
+    fn only_admin_grants_identity_connection_administration() {
+        let required = Permission::identity_connections_write();
+        let granting = BUILTIN_ROLES
+            .iter()
+            .filter(|role| role.permissions.iter().any(|held| held.covers(&required)))
+            .map(|role| role.name)
+            .collect::<Vec<_>>();
+        assert_eq!(granting, vec!["admin"]);
+        assert!(!Permission::service_accounts_write().covers(&required));
+    }
+
     #[test]
     fn names_are_unique() {
         let names = BUILTIN_ROLES

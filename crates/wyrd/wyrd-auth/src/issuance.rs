@@ -519,7 +519,7 @@ impl TenantTokenIssuer {
 /// Returns [`IssuanceError::Database`] when the read fails and
 /// [`IssuanceError::RoleCorrupt`] when a stored permission document does not
 /// decode.
-async fn resolve_permissions(
+pub(crate) async fn resolve_permissions(
     conn: &mut TenantConn<'_>,
     roles: &[RoleRef],
 ) -> Result<PermissionSet, IssuanceError> {

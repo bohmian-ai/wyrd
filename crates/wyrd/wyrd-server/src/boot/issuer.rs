@@ -1,7 +1,8 @@
 //! Boot-time trusted-issuer seeding for self-hosted deployments.
 //!
-//! Self-hosted Wyrd declares its trusted OIDC issuers in `[[trusted_issuers]]`
-//! config. At boot, [`seed_trusted_issuers`] runs OIDC discovery per entry
+//! Self-hosted Wyrd declares its trusted workload OIDC issuers in
+//! `[[trusted_issuers]]` config; a `principal_kind = human` entry is refused,
+//! because human login trust lives only in the tenant OIDC connection store. At boot, [`seed_trusted_issuers`] runs OIDC discovery per entry
 //! (under a bounded retry schedule), maps each config DTO to the
 //! [`TrustedIssuer`] domain type, encrypts any client secret with the sealing
 //! key, and upserts the row into `wyrd.auth_trusted_issuers`. Postgres is then
@@ -29,7 +30,7 @@ use wyrd_auth_oidc::{
     ClaimMapping, ClaimPath, ClientAuth, OidcProvider, ProviderMetadata, TrustedIssuer,
     WorkloadBinding,
 };
-use wyrd_crypt::SecretKey;
+use wyrd_crypt::SealingKeyring;
 use wyrd_spec::auth::IssuerUrl;
 use wyrd_spec::{DataTenantId, TenantSlug};
 use wyrd_sql::TenantConn;
@@ -95,7 +96,9 @@ pub async fn resolve_implicit_tenant(
 /// boot closed.
 ///
 /// # Errors
-/// Returns [`ServerBootError::IssuerDiscoveryUnavailable`] when another Rustls
+/// Returns [`ServerBootError::HumanIssuerSeed`] before any IO when an entry is
+/// `principal_kind = human`: human login trust lives only in the tenant OIDC
+/// connection store. Returns [`ServerBootError::IssuerDiscoveryUnavailable`] when another Rustls
 /// provider already owns the process or for an unreachable, never-seeded
 /// issuer; [`ServerBootError::IssuerSeal`] when a secret-bearing issuer has no
 /// sealing key; and [`ServerBootError::Sql`] on a write failure. Cancellation
@@ -105,10 +108,18 @@ pub async fn seed_trusted_issuers(
     pool: &PgPool,
     tenant_id: DataTenantId,
     entries: &[IssuerEntry],
-    sealing_key: Option<&SecretKey>,
+    sealing_key: Option<&SealingKeyring>,
 ) -> Result<(), ServerBootError> {
     if entries.is_empty() {
         return Ok(());
+    }
+    if let Some(human) = entries
+        .iter()
+        .find(|entry| entry.principal_kind == IssuerTokenPolicy::Human)
+    {
+        return Err(ServerBootError::HumanIssuerSeed {
+            issuer: human.issuer.clone(),
+        });
     }
     wyrd_tls::install_crypto_provider().map_err(|error| {
         ServerBootError::IssuerDiscoveryUnavailable {
@@ -134,7 +145,7 @@ async fn seed_one_trusted_issuer(
     conn: &mut TenantConn<'_>,
     tenant_id: DataTenantId,
     entry: &IssuerEntry,
-    sealing_key: Option<&SecretKey>,
+    sealing_key: Option<&SealingKeyring>,
     http: &reqwest::Client,
 ) -> Result<(), ServerBootError> {
     match discover_with_retry(&entry.issuer, http).await {
@@ -307,7 +318,7 @@ mod pg_tests {
     use secrecy::{ExposeSecret, SecretString};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-    use wyrd_crypt::SecretKey;
+    use wyrd_crypt::{SealingKeyring, SecretKey};
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_sql::queries::auth::upsert_trusted_issuer;
 
@@ -487,7 +498,7 @@ mod pg_tests {
     async fn seed_keeps_existing_row_when_discovery_unreachable_on_restart() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant_id = fixture.data_tenant_id();
-        let key = SecretKey::from_bytes([3_u8; 32]);
+        let key = SealingKeyring::new(SecretKey::from_bytes([3_u8; 32]));
 
         // Pre-seed the row as a prior successful boot would have.
         let entry = issuer_entry(UNREACHABLE_ISSUER);
@@ -511,7 +522,7 @@ mod pg_tests {
     async fn seed_fails_closed_for_unreachable_unseeded_issuer() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant_id = fixture.data_tenant_id();
-        let key = SecretKey::from_bytes([4_u8; 32]);
+        let key = SealingKeyring::new(SecretKey::from_bytes([4_u8; 32]));
 
         let entry = issuer_entry("https://idp.invalid/realms/never-seeded");
         let error = seed_trusted_issuers(fixture.app_pool(), tenant_id, &[entry], Some(&key))
@@ -521,5 +532,23 @@ mod pg_tests {
             matches!(error, ServerBootError::IssuerDiscoveryUnavailable { .. }),
             "expected IssuerDiscoveryUnavailable, got {error:?}"
         );
+    }
+
+    /// A human `[[trusted_issuers]]` entry is refused before any IO and names
+    /// the connection API; nothing is seeded that login would ignore.
+    #[tokio::test]
+    async fn seed_refuses_a_human_issuer_before_discovery() {
+        let mut entry = issuer_entry("https://idp.invalid/realms/human");
+        entry.principal_kind = IssuerTokenPolicy::Human;
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused.invalid/none")
+            .expect("lazy pool builds without connecting");
+
+        let error = seed_trusted_issuers(&pool, tenant(), &[entry], None)
+            .await
+            .expect_err("a human issuer must not seed");
+
+        assert!(matches!(error, ServerBootError::HumanIssuerSeed { .. }));
+        assert!(error.to_string().contains("/v1/identity/oidc/candidate"));
     }
 }

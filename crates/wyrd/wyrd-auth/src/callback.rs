@@ -26,6 +26,7 @@ use crate::error::{auth_error_to_wyrd, screen_error};
 use crate::exchange_api_key::role_refs;
 use crate::issuance::TenantTokenIssuer;
 use crate::login::{LoginStateEntry, PgLoginStateStore};
+use crate::connections::HumanConnections;
 use crate::pg_resolvers::PgIssuerResolver;
 
 #[derive(Debug, Deserialize)]
@@ -50,8 +51,8 @@ pub struct AuthorizationCodeExchange {
     pub issuer: TenantTokenIssuer,
     /// External OIDC id-token verifier.
     pub verifier: Arc<ExternalVerifier<PgIssuerResolver>>,
-    /// Tenant-scoped trusted issuer resolver.
-    pub trusted_issuer_resolver: Arc<PgIssuerResolver>,
+    /// The tenant human-connection owner; the only source of human trust.
+    pub connections: HumanConnections,
     /// Screened HTTP capability every provider request is made through.
     pub http: ScreenedHttp,
 }
@@ -91,12 +92,7 @@ impl AuthorizationCodeExchange {
             };
             let issuer = IssuerUrl::new(login_state.issuer.clone())
                 .map_err(|_| invalid_token("stored issuer URL is invalid"))?;
-            let trusted = crate::issuer::trusted_issuer(
-                Some(self.trusted_issuer_resolver.as_ref()),
-                tenant_id,
-                &issuer,
-            )
-            .await?;
+            let trusted = active_connection_for(&self.connections, tenant_id, &issuer).await?;
             let provider = discover_provider(&trusted.issuer, self.http).await?;
             let id_token = exchange_code_for_id_token(
                 &provider,
@@ -188,7 +184,7 @@ impl AuthorizationCodeExchange {
         } = input;
         let verified = self
             .verifier
-            .verify_external(&tenant_id, id_token)
+            .verify_external_against(&trusted.verification(), id_token)
             .await
             .map_err(auth_error_to_wyrd)?;
         verify_nonce(login_state, &verified.raw_claims)?;
@@ -220,6 +216,28 @@ impl AuthorizationCodeExchange {
 
         Ok(exchanged.into_response())
     }
+}
+
+/// Resolve the tenant's Active human connection, requiring it to be `issuer`.
+///
+/// Login state records the issuer the flow began against; if the tenant has
+/// since activated a different provider or deactivated login, the callback
+/// fails closed rather than trusting whichever provider is active now.
+///
+/// # Errors
+/// Returns [`WyrdError::InvalidToken`] when no Active connection exists or it
+/// names a different issuer, and the owner's unavailability error when the
+/// store cannot be read.
+pub async fn active_connection_for(
+    connections: &HumanConnections,
+    tenant_id: DataTenantId,
+    issuer: &IssuerUrl,
+) -> Result<TrustedIssuer, WyrdError> {
+    connections
+        .active_trusted_issuer(tenant_id)
+        .await?
+        .filter(|trusted| trusted.issuer == *issuer)
+        .ok_or_else(|| invalid_token("issuer is not the active login connection for the tenant"))
 }
 
 /// Discover an issuer using Wyrd's process-owned TLS implementation.

@@ -8,6 +8,7 @@
 //! query-file macros.
 
 pub mod api_keys;
+pub mod human_connections;
 pub mod login_state;
 pub mod refresh_tokens;
 pub mod revocation;
@@ -21,6 +22,13 @@ pub mod workload_bindings;
 
 pub use api_keys::{
     ApiKeyMetadataRow, credential_belongs_to, list_api_key_metadata, revoke_api_key,
+};
+pub use human_connections::{
+    HumanConnectionWrite, SealedSecretRow, SealedSecretTable, deactivate_active_human_connection,
+    human_candidate_test_is_current, human_connection_in_state, insert_human_candidate,
+    live_human_connections, lock_human_connection_slot, promote_tested_human_candidate,
+    remove_human_connection, replace_human_candidate, sealed_tenant_secrets,
+    stamp_human_candidate_tested, swap_sealed_tenant_secret,
 };
 pub use login_state::{LoginStateRow, insert_login_state, take_login_state};
 pub use refresh_tokens::{

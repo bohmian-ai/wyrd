@@ -778,6 +778,62 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// A human-login trust write reached the workload trusted-issuer surface.
+    #[error("[WYRD_AUTH_400_HUMAN_CONNECTION_REQUIRED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_400_HUMAN_CONNECTION_REQUIRED",
+        status = 400,
+        title = "Human login uses the tenant OIDC connection",
+        remediation = "Trusted issuers and `[[trusted_issuers]]` accept only `principal_kind = workload`. Configure human sign-in through the tenant OIDC connection API: PUT /v1/identity/oidc/candidate, POST /v1/identity/oidc/candidate/test, then POST /v1/identity/oidc/candidate/activate."
+    )]
+    HumanConnectionRequired {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A tenant OIDC connection mutation lost a revision, state, or recovery check.
+    #[error("[WYRD_AUTH_409_CONNECTION_CONFLICT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_409_CONNECTION_CONFLICT",
+        status = 409,
+        title = "Tenant OIDC connection conflict",
+        remediation = "Re-read GET /v1/identity/oidc/connections and retry with the current `expected_revision`. Activation also requires a valid recovery API key for a headless principal of this tenant that holds `identity_connections:write`."
+    )]
+    ConnectionConflict {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Activation named a candidate without a current successful test.
+    #[error("[WYRD_AUTH_409_CONNECTION_NOT_TESTED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_409_CONNECTION_NOT_TESTED",
+        status = 409,
+        title = "Tenant OIDC candidate is not freshly tested",
+        remediation = "Run POST /v1/identity/oidc/candidate/test against this exact candidate revision and activate within 15 minutes of a successful test."
+    )]
+    ConnectionNotTested {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A tenant OIDC connection named a client-authentication method Wyrd does not implement.
+    #[error("[WYRD_AUTH_400_UNSUPPORTED_CLIENT_AUTH] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_400_UNSUPPORTED_CLIENT_AUTH",
+        status = 400,
+        title = "Unsupported OIDC client authentication",
+        remediation = "Use `SecretBasic` or `SecretPost` with a client secret, or `Public` without one. `private_key_jwt` is not supported for tenant connections."
+    )]
+    UnsupportedClientAuth {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// A gateway administration document violates the gateway contract.
     #[error("[WYRD_GATEWAY_400_INVALID_CONFIGURATION] {message}")]
     #[wyrd_error(
@@ -3464,6 +3520,10 @@ impl WyrdError {
             | Self::PrincipalNotFound { message, details }
             | Self::AdminConflict { message, details }
             | Self::AdminNotFound { message, details }
+            | Self::HumanConnectionRequired { message, details }
+            | Self::ConnectionConflict { message, details }
+            | Self::ConnectionNotTested { message, details }
+            | Self::UnsupportedClientAuth { message, details }
             | Self::GatewayInvalidConfiguration { message, details }
             | Self::GatewayResourceNotFound { message, details }
             | Self::GatewayResourceConflict { message, details }

@@ -2,10 +2,13 @@ use std::sync::Arc;
 
 use wyrd_auth_check::{PolicyHook, StubAllowPolicyHook};
 use wyrd_auth_issue::IssuingKey;
-use wyrd_crypt::SecretKey;
+use wyrd_crypt::SealingKeyring;
 use wyrd_runtime::{PermissionCheck, RbacCheck};
 
+use sqlx::PgPool;
+use wyrd_auth::connections::HumanConnections;
 use wyrd_auth::issuance::{TenantTokenIssuer, TokenExchangeSettings};
+use wyrd_auth_oidc::ScreenedHttp;
 use wyrd_auth_verify::{ExternalVerifier, TokenVerifier};
 
 use crate::auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
@@ -26,8 +29,13 @@ pub struct ServerAuth {
     pub trusted_issuer_resolver: Option<Arc<PgIssuerResolver>>,
     /// Resolves workload-to-principal bindings from Postgres for the JWT-bearer exchange path.
     pub workload_binding_resolver: Option<Arc<PgWorkloadBindingResolver>>,
-    /// Symmetric key used to seal client secrets at rest. Required when trusted issuers carry secrets.
-    pub sealing_key: Option<Arc<SecretKey>>,
+    /// Sealing keyring for provider client secrets at rest: one write key plus
+    /// retained keys that still open older ciphertext during rotation.
+    /// Required only while provider secrets are stored.
+    pub sealing_key: Option<Arc<SealingKeyring>>,
+    /// Deployment-controlled public origin; the provider callback URL tenants
+    /// register is derived from it, never from request headers.
+    pub public_origin: Option<url::Url>,
     /// TTL and delegation settings for token exchange responses.
     pub token_exchange_settings: TokenExchangeSettings,
 }
@@ -43,6 +51,21 @@ impl ServerAuth {
         self.issuing_key
             .clone()
             .map(|key| TenantTokenIssuer::new(key, self.token_exchange_settings.clone()))
+    }
+
+    /// Build the tenant human-connection owner over this deployment's keyring
+    /// and public origin.
+    ///
+    /// Human login, the callback, and the connection administration routes all
+    /// resolve human trust through the owner this returns.
+    #[must_use]
+    pub fn human_connections(&self, app: &PgPool, http: ScreenedHttp) -> HumanConnections {
+        HumanConnections::new(
+            app.clone(),
+            self.sealing_key.clone(),
+            http,
+            self.public_origin.as_ref(),
+        )
     }
 }
 

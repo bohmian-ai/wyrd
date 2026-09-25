@@ -29,7 +29,7 @@ use wyrd_auth_oidc::{
     ClaimMapping, ClaimPath, ClientAuth, IssuerConfigResolver, IssuerVerification, OidcError,
     TrustedIssuer, WorkloadBinding, WorkloadBindingResolver,
 };
-use wyrd_crypt::{CryptError, EncryptedPayload, SecretKey};
+use wyrd_crypt::SealingKeyring;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::IssuerTokenPolicy;
 use wyrd_spec::auth::IssuerUrl;
@@ -41,9 +41,6 @@ use wyrd_sql::queries::auth::{
 };
 use wyrd_sql::queries::platform::identity::PlatformOidcConnectionRow;
 use wyrd_sql::row_types::auth::TrustedIssuerRow;
-
-/// AES-GCM nonce length; the leading prefix of every `client_secret_enc` value.
-const NONCE_LEN: usize = 12;
 
 const CLIENT_AUTH_SECRET_BASIC: &str = "SecretBasic";
 const CLIENT_AUTH_SECRET_POST: &str = "SecretPost";
@@ -66,13 +63,13 @@ const PRINCIPAL_KIND_WORKLOAD: &str = "Workload";
 #[derive(Debug, Clone)]
 pub struct PgIssuerResolver {
     pool: Arc<PgPool>,
-    sealing_key: Option<Arc<SecretKey>>,
+    sealing_key: Option<Arc<SealingKeyring>>,
 }
 
 impl PgIssuerResolver {
     /// Construct a resolver over the Wyrd app pool with an optional sealing key.
     #[must_use]
-    pub fn new(pool: Arc<PgPool>, sealing_key: Option<Arc<SecretKey>>) -> Self {
+    pub fn new(pool: Arc<PgPool>, sealing_key: Option<Arc<SealingKeyring>>) -> Self {
         Self { pool, sealing_key }
     }
 }
@@ -245,7 +242,7 @@ pub enum IssuerSealError {
 
 /// Failure decoding a [`TrustedIssuerRow`] back into a [`TrustedIssuer`].
 #[derive(Debug, thiserror::Error)]
-enum IssuerDecodeError {
+pub(crate) enum IssuerDecodeError {
     #[error("stored issuer url is invalid: {0}")]
     IssuerUrl(String),
     #[error("stored jwks uri is invalid: {0}")]
@@ -258,8 +255,6 @@ enum IssuerDecodeError {
     MissingSecret,
     #[error("client secret present but no sealing key is configured")]
     SealingKeyMissing,
-    #[error("client_secret_enc payload is shorter than the nonce")]
-    MalformedSecret,
     #[error("client secret could not be decrypted")]
     Decrypt,
     #[error("decrypted client secret is not valid utf-8")]
@@ -304,7 +299,11 @@ fn claim_mapping_to_value(mapping: &ClaimMapping) -> Result<Value, serde_json::E
     serde_json::to_value(ClaimMappingDto::from_domain(mapping))
 }
 
-fn claim_mapping_from_value(value: Value) -> Result<ClaimMapping, serde_json::Error> {
+/// Decode a stored claim-mapping JSONB column into the domain mapping.
+///
+/// # Errors
+/// Returns the serde error when the column does not match the mapping shape.
+pub(crate) fn claim_mapping_from_value(value: Value) -> Result<ClaimMapping, serde_json::Error> {
     let dto: ClaimMappingDto = serde_json::from_value(value)?;
     Ok(dto.into_domain())
 }
@@ -338,36 +337,25 @@ fn principal_kind_from_str(value: &str) -> Result<IssuerTokenPolicy, IssuerDecod
 }
 
 // --------------------------------------------------------------------------
-// Secret sealing (nonce ‖ ciphertext)
+// Secret sealing (versioned keyring envelope)
 // --------------------------------------------------------------------------
 
-/// Encrypt `plaintext` and return `nonce ‖ ciphertext` for the BYTEA column.
-fn seal_secret(key: &SecretKey, plaintext: &[u8]) -> Result<Vec<u8>, CryptError> {
-    let payload = wyrd_crypt::encrypt(key, plaintext)?;
-    let mut out = Vec::with_capacity(NONCE_LEN + payload.ciphertext.len());
-    out.extend_from_slice(&payload.nonce);
-    out.extend_from_slice(&payload.ciphertext);
-    Ok(out)
+/// Seal `plaintext` under the keyring's write key for a BYTEA column.
+///
+/// # Errors
+/// Returns [`IssuerSealError::Encrypt`] when encryption fails.
+pub(crate) fn seal_secret(keyring: &SealingKeyring, plaintext: &[u8]) -> Result<Vec<u8>, IssuerSealError> {
+    keyring.seal(plaintext).map_err(|_| IssuerSealError::Encrypt)
 }
 
-/// Split a stored `nonce ‖ ciphertext` value and decrypt it.
-fn open_secret(key: &SecretKey, bytes: &[u8]) -> Result<Vec<u8>, IssuerDecodeError> {
-    if bytes.len() < NONCE_LEN {
-        return Err(IssuerDecodeError::MalformedSecret);
-    }
-    let (nonce_bytes, ciphertext) = bytes.split_at(NONCE_LEN);
-    let mut nonce = [0_u8; NONCE_LEN];
-    nonce.copy_from_slice(nonce_bytes);
-    let payload = EncryptedPayload {
-        nonce,
-        ciphertext: ciphertext.to_vec(),
-    };
-    wyrd_crypt::decrypt(key, &payload).map_err(|_| IssuerDecodeError::Decrypt)
+/// Open a stored sealed value with whichever held key it names.
+fn open_secret(keyring: &SealingKeyring, bytes: &[u8]) -> Result<Vec<u8>, IssuerDecodeError> {
+    keyring.open(bytes).map_err(|_| IssuerDecodeError::Decrypt)
 }
 
 fn decode_secret(
     secret_enc: Option<&[u8]>,
-    sealing_key: Option<&SecretKey>,
+    sealing_key: Option<&SealingKeyring>,
 ) -> Result<SecretString, IssuerDecodeError> {
     let bytes = secret_enc.ok_or(IssuerDecodeError::MissingSecret)?;
     let key = sealing_key.ok_or(IssuerDecodeError::SealingKeyMissing)?;
@@ -376,10 +364,18 @@ fn decode_secret(
     Ok(SecretString::from(text))
 }
 
-fn client_auth_from_row(
+/// Rebuild a stored client-authentication method, opening its sealed secret.
+///
+/// Shared by the workload issuer, platform connection, and tenant human
+/// connection decoders so every store opens secrets through one keyring path.
+///
+/// # Errors
+/// Returns [`IssuerDecodeError`] for an unknown discriminant, a secret method
+/// with no stored secret, a missing keyring, or a secret no held key opens.
+pub(crate) fn client_auth_from_row(
     discriminant: &str,
     secret_enc: Option<&[u8]>,
-    sealing_key: Option<&SecretKey>,
+    sealing_key: Option<&SealingKeyring>,
 ) -> Result<ClientAuth, IssuerDecodeError> {
     match discriminant {
         CLIENT_AUTH_SECRET_BASIC => Ok(ClientAuth::SecretBasic(decode_secret(
@@ -409,7 +405,7 @@ fn client_auth_from_row(
 fn trusted_issuer_from_row(
     tenant: DataTenantId,
     row: TrustedIssuerRow,
-    sealing_key: Option<&SecretKey>,
+    sealing_key: Option<&SealingKeyring>,
 ) -> Result<TrustedIssuer, IssuerDecodeError> {
     let issuer = IssuerUrl::new(row.issuer_url.clone())
         .map_err(|error| IssuerDecodeError::IssuerUrl(error.to_string()))?;
@@ -460,7 +456,7 @@ fn trusted_issuer_from_row(
 /// which fails closed rather than degrading to an unauthenticated client.
 pub fn platform_connection_from_row(
     row: PlatformOidcConnectionRow,
-    sealing_key: Option<&SecretKey>,
+    sealing_key: Option<&SealingKeyring>,
 ) -> Result<PlatformConnection, PlatformConnectionError> {
     let issuer = IssuerUrl::new(row.issuer_url.clone())
         .map_err(|error| PlatformConnectionError::IssuerUrl(error.to_string()))?;
@@ -516,14 +512,13 @@ pub enum PlatformConnectionError {
 /// encryption fails. A secret-bearing connection is never stored in the clear.
 pub fn seal_platform_client_secret(
     client_auth: &ClientAuth,
-    sealing_key: Option<&SecretKey>,
+    sealing_key: Option<&SealingKeyring>,
 ) -> Result<Option<Vec<u8>>, IssuerSealError> {
     match client_auth {
         ClientAuth::SecretBasic(secret) | ClientAuth::SecretPost(secret) => {
             let key = sealing_key.ok_or(IssuerSealError::SealingKeyMissing)?;
             Ok(Some(
-                seal_secret(key, secret.expose_secret().as_bytes())
-                    .map_err(|_| IssuerSealError::Encrypt)?,
+                seal_secret(key, secret.expose_secret().as_bytes())?,
             ))
         }
         ClientAuth::PrivateKeyJwt | ClientAuth::Public => Ok(None),
@@ -551,14 +546,13 @@ pub fn client_auth_label(auth: &ClientAuth) -> &'static str {
 /// encryption fails, or a JSONB column cannot be serialized.
 pub fn issuer_write_from_trusted(
     issuer: &TrustedIssuer,
-    sealing_key: Option<&SecretKey>,
+    sealing_key: Option<&SealingKeyring>,
 ) -> Result<TrustedIssuerWrite, IssuerSealError> {
     let client_secret_enc = match &issuer.client_auth {
         ClientAuth::SecretBasic(secret) | ClientAuth::SecretPost(secret) => {
             let key = sealing_key.ok_or(IssuerSealError::SealingKeyMissing)?;
             Some(
-                seal_secret(key, secret.expose_secret().as_bytes())
-                    .map_err(|_| IssuerSealError::Encrypt)?,
+                seal_secret(key, secret.expose_secret().as_bytes())?,
             )
         }
         ClientAuth::PrivateKeyJwt | ClientAuth::Public => None,
@@ -606,7 +600,7 @@ mod pg_tests {
         ClaimMapping, ClaimPath, ClientAuth, IssuerConfigResolver, TrustedIssuer, WorkloadBinding,
         WorkloadBindingResolver,
     };
-    use wyrd_crypt::SecretKey;
+    use wyrd_crypt::{SealingKeyring, SecretKey};
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
@@ -624,8 +618,8 @@ mod pg_tests {
 
     const ISSUER_URL: &str = "https://idp.example.com/realms/wyrd";
 
-    fn sealing_key() -> SecretKey {
-        SecretKey::from_bytes([7_u8; 32])
+    fn sealing_key() -> SealingKeyring {
+        SealingKeyring::new(SecretKey::from_bytes([7_u8; 32]))
     }
 
     fn sample_issuer(tenant: DataTenantId) -> TrustedIssuer {
@@ -647,7 +641,7 @@ mod pg_tests {
             },
             group_role_map,
             default_roles: vec!["viewer".to_owned()],
-            principal_kind: IssuerTokenPolicy::Human,
+            principal_kind: IssuerTokenPolicy::Workload,
             jwks_ttl: Duration::from_mins(30),
         }
     }

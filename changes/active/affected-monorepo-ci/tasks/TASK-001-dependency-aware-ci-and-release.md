@@ -237,7 +237,9 @@ workflow mechanics remain implementation choices.
 ## Implementation Evidence
 
 Commits: `7535b719` (selection), `92c78828` (release routing and identity),
-`2410542e` (docs, cache-on-failure), plus this evidence commit.
+`2410542e` (docs, cache-on-failure), `dc8e353f`/`c946931a` (staged live-tail
+read exactly once), `9dd96465` (sustained journey settles audit publication),
+`eea0d117` (Oracle compaction wait bounded by time), plus evidence commits.
 
 | Acceptance criterion | Implementation evidence | Verification evidence | Result |
 |---|---|---|---|
@@ -252,7 +254,12 @@ Commits: `7535b719` (selection), `92c78828` (release routing and identity),
 Commands: `mise run check:ci-selection`; `bash scripts/checks/test-coverage.sh`;
 `uvx --from actionlint-py actionlint .github/workflows/*.yml`; `mise run gate`
 (exit 0); `mise run test:principals:integration` (exit 0); `mise run
-verify:bifrost` (exit 1, see blockers); `git diff --check`.
+verify:bifrost` (exit 0, 1478s, 9/9 lanes, 7/7 journey capabilities); `mise
+run lints` (exit 0); `mise exec -- cargo nextest run --locked -p
+vala-bifrost-redux --lib -E
+'test(=scribe::tail_rpc::tests::a_generation_staged_before_the_shard_settles_is_read_once)'`
+(pass; fails with `[1, 1, 2, 2, 3, 3]` when the exclusion is removed); `git
+diff --check`.
 
 Non-goals held: no new build system, no Wyrd protocol or Rust source change,
 no deployment workflow, no credential change (`storage-integration-cloud.yml`
@@ -260,19 +267,20 @@ untouched; pull-request workflows reference no secrets, pinned by a check).
 
 ### Blockers and material risks
 
-1. `mise run verify:bifrost` is red because of Bifrost production defects
-   unrelated to CI routing:
-   - `wyrd-testing::scribe sustained::scribe_sustained_ingest_oracle_hot_read_journey`
-     fails reproducibly in isolation. The lane run read duplicated rows 32–47,
-     breaking exactly-once acknowledgement (`sustained.rs:103`). The isolated
-     rerun leaked an admission transition: 1043 opened, 1042 closed
-     (`sustained.rs:409`).
-   - `wyrd-testing::oracle published::published_cache_pruning_and_shutdown_are_production_governed`
-     failed under the full lane: "Forge compacted 0 of 3 sealed inputs within
-     32 passes". It passed in isolation (21s), so a liveness bound is missed
-     under load.
-   Both need a Bifrost remediation task; neither is inside this change's write
-   set.
+1. Resolved: `verify:bifrost` was red on three defects, fixed as follows.
+   - Staged live-tail duplicates (`sustained.rs:103`, rows 32–47 twice).
+     Staging advanced a generation's registry authority to its staged runs
+     before the shard marked the memtable copy durable, and `fetch_hot_batches`
+     read both. The memtable cut now runs first and tags generations. Staged
+     runs for those generations are skipped. This is a production fix in
+     `vala-bifrost-redux`, outside the original write set, with a regression
+     test.
+   - Admission reconciliation off by one (`sustained.rs:409`). The audit
+     publisher's in-flight append was counted; the journey now settles
+     retained audit history before asserting a drained pod.
+   - Oracle "compacted 0 of 3 within 32 passes". Forge claims round-robin
+     across tenants, so the backlog earlier cases leave in the shared lane
+     database consumed the pass budget. The bound is now a 180s deadline.
 2. `wyrd-spec` cannot be packaged: `cargo package -p wyrd-spec` fails on the
    unpublished `skald-spec` dependency. The new `package-crates` check exposes
    this. Crate publication was already broken before this change.

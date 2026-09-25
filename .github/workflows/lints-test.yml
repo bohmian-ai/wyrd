@@ -69,7 +69,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.full_gate == 'true' || needs.changes.outputs.ci_lanes != ''
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    # The full gate needs more than an hour on a cold hosted runner; selected
+    # lanes keep the tighter bound.
+    timeout-minutes: ${{ needs.changes.outputs.full_gate == 'true' && 120 || 60 }}
     steps:
       - uses: actions/checkout@v4
 

@@ -186,9 +186,9 @@ ALTER TABLE wyrd.auth_trusted_issuers
 -- as long as a session names it.
 --
 -- In-flight login state is transient (five minutes) and names no connection,
--- so it is discarded. Live human refresh families move with their tenant's
--- Human issuer onto the Active connection migrated above; a family whose
--- tenant had no Human issuer stays unbound and can no longer renew.
+-- so it is discarded. Legacy refresh rows record no issuer provenance, so
+-- every pre-existing human refresh family stays unbound and can no longer
+-- renew; its user signs in again under the tenant's current connection.
 DELETE FROM wyrd.auth_login_state;
 
 ALTER TABLE wyrd.auth_login_state
@@ -203,12 +203,3 @@ ALTER TABLE wyrd.auth_refresh_tokens
         CHECK ((human_connection_id IS NULL) = (human_connection_revision IS NULL)),
     ADD CONSTRAINT auth_refresh_tokens_human_connection_user
         CHECK (human_connection_id IS NULL OR principal_kind = 'user');
-
-UPDATE wyrd.auth_refresh_tokens AS token
-   SET human_connection_id = connection.connection_id,
-       human_connection_revision = connection.revision
-  FROM wyrd.auth_human_connections AS connection
- WHERE connection.data_tenant_id = token.data_tenant_id
-   AND connection.state = 'Active'
-   AND token.principal_kind = 'user'
-   AND token.revoked_at IS NULL;

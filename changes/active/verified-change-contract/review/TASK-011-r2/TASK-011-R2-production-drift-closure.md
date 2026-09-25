@@ -1,7 +1,7 @@
 ---
 id: TASK-011-R2
 kind: remediation
-status: ready
+status: review
 spec: SPEC-verified-change-contract
 spec_revision: 38
 requirements: [REQ-153, REQ-156, INV-012, AC-034]

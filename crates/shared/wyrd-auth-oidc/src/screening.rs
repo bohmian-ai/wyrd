@@ -342,7 +342,11 @@ mod tests {
 
         assert!(status.success(), "the screened request succeeds: {status}");
         let proxied = proxy.received_requests().await.expect("proxy records");
-        assert!(proxied.is_empty(), "the proxy saw {} requests", proxied.len());
+        assert!(
+            proxied.is_empty(),
+            "the proxy saw {} requests",
+            proxied.len()
+        );
         let reached = target.received_requests().await.expect("target records");
         assert_eq!(reached.len(), 1, "the pinned target receives the request");
     }

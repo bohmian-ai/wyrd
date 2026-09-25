@@ -7,14 +7,17 @@ use rand::RngCore;
 use secrecy::{ExposeSecret, SecretString};
 use sha2::{Digest, Sha256};
 use url::Url;
-use wyrd_auth_oidc::{OidcProvider, ScreenedHttp, TrustedIssuer};
-
-use crate::error::screen_error;
+use wyrd_auth_oidc::ScreenedHttp;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{AbsoluteUrl, IssuerUrl, LoginInitResponse};
 use wyrd_spec::error::WyrdError;
-use wyrd_sql::queries::auth::{insert_login_state, take_login_state};
-use wyrd_sql::{SqlError, TenantConn};
+use wyrd_sql::queries::auth::{LoginStateRow, insert_login_state, take_login_state};
+use wyrd_sql::row_types::auth::HumanConnectionBinding;
+use wyrd_sql::{SqlError, WyrdPostgres};
+
+use crate::callback::discover_provider;
+use crate::connections::ActiveHumanConnection;
+use crate::error::store_error;
 
 /// Lifetime of a persisted login-state row: the browser must complete the `IdP`
 /// round-trip and hit `/auth/callback` within this window or the state is gone.
@@ -31,22 +34,34 @@ pub struct LoginStateEntry {
     pub issuer: String,
     /// Callback redirect URI.
     pub redirect_uri: String,
+    /// The exact human-connection id and revision the login began through;
+    /// the callback issues a session only while that revision is still Active.
+    pub connection: HumanConnectionBinding,
 }
 
 /// Postgres-backed login-state store.
-#[derive(Debug, Clone)]
+///
+/// Every row is written and consumed on an RLS tenant transaction acquired
+/// through [`WyrdPostgres`], so a state key only ever resolves inside the
+/// tenant that created it.
+#[derive(Clone)]
 pub struct PgLoginStateStore {
-    pool: sqlx::PgPool,
+    /// The role-separated runtime store the tenant transactions come from.
+    postgres: WyrdPostgres,
 }
 
 impl PgLoginStateStore {
-    /// Build a store from the runtime app pool.
+    /// Build a store over the runtime Postgres handle.
     #[must_use]
-    pub fn new(pool: sqlx::PgPool) -> Self {
-        Self { pool }
+    pub fn new(postgres: WyrdPostgres) -> Self {
+        Self { postgres }
     }
 
     /// Store one login-state row whose expiry `PostgreSQL` derives from `ttl`.
+    ///
+    /// # Errors
+    /// Returns [`SqlError`] when the tenant transaction cannot be opened, the
+    /// insert fails, or the commit fails; nothing is durable unless it commits.
     pub async fn put(
         &self,
         tenant: DataTenantId,
@@ -54,27 +69,30 @@ impl PgLoginStateStore {
         entry: LoginStateEntry,
         ttl: Duration,
     ) -> Result<(), SqlError> {
-        let mut conn = TenantConn::acquire(&self.pool, tenant).await?;
-        insert_login_state(
-            &mut conn,
-            state,
-            entry.code_verifier.expose_secret(),
-            &entry.nonce,
-            &entry.issuer,
-            &entry.redirect_uri,
-            ttl,
-        )
-        .await?;
+        let mut conn = self.postgres.tenant_conn(tenant).await?;
+        let row = LoginStateRow {
+            code_verifier: entry.code_verifier.expose_secret().to_owned(),
+            nonce: entry.nonce,
+            issuer: entry.issuer,
+            redirect_uri: entry.redirect_uri,
+            connection: entry.connection,
+        };
+        insert_login_state(&mut conn, state, &row, ttl).await?;
         conn.commit().await
     }
 
     /// Consume a login-state row exactly once.
+    ///
+    /// # Errors
+    /// Returns [`SqlError`] when the tenant transaction cannot be opened, the
+    /// consume fails, or the commit fails. A row consumed by an uncommitted
+    /// transaction stays available.
     pub async fn take(
         &self,
         tenant: DataTenantId,
         state: &str,
     ) -> Result<Option<LoginStateEntry>, SqlError> {
-        let mut conn = TenantConn::acquire(&self.pool, tenant).await?;
+        let mut conn = self.postgres.tenant_conn(tenant).await?;
         let row = take_login_state(&mut conn, state).await?;
         conn.commit().await?;
         Ok(row.map(|row| LoginStateEntry {
@@ -82,11 +100,18 @@ impl PgLoginStateStore {
             nonce: row.nonce,
             issuer: row.issuer,
             redirect_uri: row.redirect_uri,
+            connection: row.connection,
         }))
     }
 }
 
 /// Resolve the `IdP` authorization URL and persist login state for the callback.
+///
+/// `redirect_uri` is the deployment's configured callback — the one URL
+/// tenants register at their provider and candidate testing proved — never a
+/// value derived from request headers. The state row binds the exact
+/// connection revision in `active`, so the callback can refuse a login whose
+/// connection was replaced, deactivated, or removed in the meantime.
 ///
 /// # Errors
 /// Returns [`WyrdError`] when the issuer's authorization endpoint cannot be
@@ -94,13 +119,12 @@ impl PgLoginStateStore {
 /// issuer's configuration, or when the login state cannot be persisted. No
 /// redirect is returned unless its state row is durable.
 pub async fn prepare_login(
-    pool: &sqlx::PgPool,
-    tenant_id: DataTenantId,
-    trusted: &TrustedIssuer,
-    issuer: &IssuerUrl,
-    redirect_uri: String,
+    postgres: &WyrdPostgres,
+    active: &ActiveHumanConnection,
+    redirect_uri: &Url,
     http: ScreenedHttp,
 ) -> Result<LoginInitResponse, WyrdError> {
+    let trusted = &active.trusted;
     let authorization_endpoint = discover_authorization_endpoint(&trusted.issuer, http).await?;
     let state_key = auth_state_key();
     let code_verifier = pkce_verifier();
@@ -108,7 +132,7 @@ pub async fn prepare_login(
     let authz_url = build_authorization_url(
         &authorization_endpoint,
         &trusted.client_id,
-        &redirect_uri,
+        redirect_uri.as_str(),
         &state_key,
         code_verifier.expose_secret(),
         &nonce,
@@ -118,20 +142,21 @@ pub async fn prepare_login(
             .map_err(|_| invalid_token("authorization URL is invalid"))?,
         state: state_key.clone(),
     };
-    PgLoginStateStore::new(pool.clone())
+    PgLoginStateStore::new(postgres.clone())
         .put(
-            tenant_id,
+            trusted.tenant_id,
             &state_key,
             LoginStateEntry {
                 code_verifier,
                 nonce,
-                issuer: issuer.to_string(),
-                redirect_uri,
+                issuer: trusted.issuer.to_string(),
+                redirect_uri: redirect_uri.to_string(),
+                connection: active.binding,
             },
             LOGIN_STATE_TTL,
         )
         .await
-        .map_err(sql_error)?;
+        .map_err(store_error)?;
     Ok(init)
 }
 
@@ -151,24 +176,10 @@ pub async fn discover_authorization_endpoint(
     issuer: &IssuerUrl,
     http: ScreenedHttp,
 ) -> Result<Url, WyrdError> {
-    let issuer_url = Url::parse(issuer.as_str()).map_err(|_| WyrdError::DiscoveryUnavailable {
-        message: "trusted issuer URL could not be parsed".to_owned(),
-        details: serde_json::json!({}),
-    })?;
-    let client = http
-        .client_for(&issuer_url)
-        .await
-        .map_err(|error| screen_error(&error))?;
-    let provider = OidcProvider::discover(issuer_url, client)
-        .await
-        .map_err(|error| {
-            tracing::warn!(error = %error, "OIDC discovery failed");
-            WyrdError::DiscoveryUnavailable {
-                message: "OIDC discovery unavailable".to_owned(),
-                details: serde_json::json!({}),
-            }
-        })?;
-    Ok(provider.metadata.authorization_endpoint)
+    Ok(discover_provider(issuer, http)
+        .await?
+        .metadata
+        .authorization_endpoint)
 }
 
 /// Generate an unguessable login-state key.
@@ -232,29 +243,34 @@ fn invalid_token(message: &str) -> WyrdError {
     }
 }
 
-fn sql_error(error: impl Into<SqlError>) -> WyrdError {
-    let error = error.into();
-    tracing::warn!(error = %error, "OIDC login SQL unavailable");
-    WyrdError::AuthVerifyUnavailable {
-        message: "auth backend unavailable".to_owned(),
-        details: serde_json::json!({ "retry_after_seconds": 1 }),
-    }
-}
-
 #[cfg(test)]
 mod pg_tests {
     use super::{LoginStateEntry, PgLoginStateStore};
     use secrecy::{ExposeSecret, SecretString};
     use std::time::Duration;
+    use uuid::Uuid;
+    use wyrd_sql::row_types::auth::HumanConnectionBinding;
 
+    /// A login-state binding; the store records it verbatim and nothing here
+    /// requires the named connection to exist.
+    fn binding() -> HumanConnectionBinding {
+        HumanConnectionBinding {
+            connection_id: Uuid::now_v7(),
+            connection_revision: 3,
+        }
+    }
+
+    /// A login-state row is consumed once from any replica's store and carries
+    /// its connection binding back to the callback.
     #[tokio::test]
     async fn login_state_store_consumes_single_use_rows_once() {
         let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
             .await
             .expect("fixture starts");
         let tenant = fixture.data_tenant_id();
-        let store_a = PgLoginStateStore::new(fixture.app_pool().clone());
-        let store_b = PgLoginStateStore::new(fixture.app_pool().clone());
+        let store_a = PgLoginStateStore::new(fixture.wyrd_postgres().clone());
+        let bound = binding();
+        let store_b = PgLoginStateStore::new(fixture.wyrd_postgres().clone());
 
         store_a
             .put(
@@ -265,6 +281,7 @@ mod pg_tests {
                     nonce: "nonce-1".to_owned(),
                     issuer: "https://idp.example.com/realms/acme".to_owned(),
                     redirect_uri: "https://app.example.com/auth/callback".to_owned(),
+                    connection: bound,
                 },
                 Duration::from_mins(5),
             )
@@ -280,6 +297,10 @@ mod pg_tests {
             "https://app.example.com/auth/callback"
         );
         assert_eq!(consumed.code_verifier.expose_secret(), "verifier-1");
+        assert_eq!(
+            consumed.connection, bound,
+            "the connection binding round-trips"
+        );
 
         let replay = store_a
             .take(tenant, "state-1")
@@ -288,13 +309,14 @@ mod pg_tests {
         assert!(replay.is_none());
     }
 
+    /// A row past its database-derived expiry is never returned.
     #[tokio::test]
     async fn expired_login_state_returns_none() {
         let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
             .await
             .expect("fixture starts");
         let tenant = fixture.data_tenant_id();
-        let store = PgLoginStateStore::new(fixture.app_pool().clone());
+        let store = PgLoginStateStore::new(fixture.wyrd_postgres().clone());
 
         store
             .put(
@@ -305,6 +327,7 @@ mod pg_tests {
                     nonce: "nonce-expired".to_owned(),
                     issuer: "https://idp.example.com/realms/acme".to_owned(),
                     redirect_uri: "https://app.example.com/auth/callback".to_owned(),
+                    connection: binding(),
                 },
                 Duration::from_secs(0),
             )

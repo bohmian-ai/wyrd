@@ -11,6 +11,7 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{consume_active_refresh, refresh_by_hash, revoke_refresh_family};
+use wyrd_sql::row_types::auth::HumanConnectionBinding;
 
 use crate::audit::{
     REFRESH_FAMILY_REVOKE_OPERATION, append_auth_audit, auth_event, principal_kind_tag,
@@ -56,11 +57,14 @@ impl From<RefreshError> for WyrdError {
                 message: "Refresh token family revoked due to reuse of a rotated token".to_owned(),
                 details: json!({}),
             },
-            // A suspended user or a tenant that stopped admitting credentials
-            // ends the session the same way a revoked refresh row does.
+            // A suspended user, a tenant that stopped admitting credentials,
+            // or a login connection that is no longer Active ends the session
+            // the same way a revoked refresh row does.
             RefreshError::NotFound
             | RefreshError::Issuance(
-                IssuanceError::PrincipalInactive | IssuanceError::TenantNotAdmitting,
+                IssuanceError::PrincipalInactive
+                | IssuanceError::TenantNotAdmitting
+                | IssuanceError::ConnectionInactive,
             ) => WyrdError::RefreshRevoked {
                 message: "Refresh token not found, expired, or revoked".to_owned(),
                 details: json!({}),
@@ -97,7 +101,11 @@ impl RefreshTokens {
     /// token, [`RefreshError::Reused`] when a stale row is presented — the
     /// family is revoked and the containment audited before returning — and a
     /// store or issuance error when the successor cannot be minted. A machine
-    /// refresh row cannot rotate and is refused.
+    /// refresh row cannot rotate and is refused, and a human row whose bound
+    /// connection revision is missing or no longer Active is refused with
+    /// [`IssuanceError::ConnectionInactive`]. The consumed row is only
+    /// retired if the caller commits, so a refused rotation leaves nothing
+    /// written.
     pub async fn execute(
         &self,
         conn: &mut TenantConn<'_>,
@@ -125,12 +133,37 @@ impl RefreshTokens {
                     )));
                 }
 
+                // A human family belongs to the exact connection revision it
+                // logged in through; a row carrying no binding predates that
+                // provenance and has no connection that could still admit it.
+                let (Some(connection_id), Some(connection_revision)) =
+                    (active.human_connection_id, active.human_connection_revision)
+                else {
+                    tracing::warn!(
+                        principal_id = %principal_id,
+                        "refresh rotation refused for a family with no login connection"
+                    );
+                    return Err(RefreshError::Issuance(IssuanceError::ConnectionInactive));
+                };
+                let connection = HumanConnectionBinding {
+                    connection_id,
+                    connection_revision,
+                };
+
                 // The successor is minted from the user's current status and
                 // grants, not the consumed token's, so a suspension or revoked
-                // role does not survive a renewal.
+                // role does not survive a renewal, and it inherits the family's
+                // connection binding, so a replaced, deactivated, or removed
+                // connection ends the family at its next rotation.
                 let exchanged = self
                     .issuer
-                    .issue_human_session(conn, principal_id, Some(active.id), request_id)
+                    .issue_human_session(
+                        conn,
+                        principal_id,
+                        Some(active.id),
+                        connection,
+                        request_id,
+                    )
                     .await?;
 
                 tracing::debug!(
@@ -238,7 +271,7 @@ mod pg_tests {
     use uuid::Uuid;
     use wyrd_auth_issue::{IssueError, IssuingKey};
     use wyrd_auth_verify::{AccessTokenClaims, Kid, public_key_from_pem, verify_eddsa};
-    use wyrd_dev_fixtures::pg::PgFixture;
+    use wyrd_dev_fixtures::pg::{PgFixture, seed_active_human_connection};
     use wyrd_runtime::PrincipalId;
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
@@ -249,8 +282,8 @@ mod pg_tests {
 
     use wyrd_sql::TenantConn;
     use wyrd_sql::queries::auth::{
-        insert_refresh_token, insert_role, insert_service_account, list_user_roles,
-        refresh_by_hash, replace_user_roles,
+        insert_human_refresh_token, insert_refresh_token, insert_role, insert_service_account,
+        list_user_roles, refresh_by_hash, replace_user_roles,
     };
 
     use wyrd_dev_fixtures::cards::seed_backing_card;
@@ -349,7 +382,10 @@ mod pg_tests {
     /// Seed one active refresh row and return its durable id.
     ///
     /// The id is the value audit attributes a consumed or replayed row to, so
-    /// the tests that assert attribution need it rather than a fresh UUID.
+    /// the tests that assert attribution need it rather than a fresh UUID. A
+    /// `user` row is bound to the tenant's Active human connection, seeding
+    /// one when absent, exactly as a real login binds it; any other kind is
+    /// written unbound.
     async fn seed_active_refresh(
         conn: &mut TenantConn<'_>,
         principal_kind: &str,
@@ -357,17 +393,127 @@ mod pg_tests {
         token_hash: &str,
     ) -> Uuid {
         let id = Uuid::new_v4();
+        let expires_at = Utc::now() + Duration::days(30);
+        if principal_kind == "user" {
+            let binding = seed_active_human_connection(conn)
+                .await
+                .expect("connection seeds");
+            insert_human_refresh_token(
+                conn,
+                id,
+                principal_id,
+                token_hash,
+                expires_at,
+                None,
+                binding,
+            )
+            .await
+            .expect("human refresh token inserts");
+        } else {
+            insert_refresh_token(
+                conn,
+                id,
+                principal_kind,
+                principal_id,
+                token_hash,
+                expires_at,
+            )
+            .await
+            .expect("refresh token inserts");
+        }
+        id
+    }
+
+    /// A rotated successor inherits its family's exact connection binding.
+    #[tokio::test]
+    async fn rotation_copies_the_connection_binding() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let key = test_issuing_key();
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let user_id = insert_test_user(&mut conn, tenant).await;
+        let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::User, user_id, tenant);
+        let original_hash = hash_of(&refresh_jwt);
+        seed_active_refresh(&mut conn, "user", user_id, &original_hash).await;
+        let binding = seed_active_human_connection(&mut conn)
+            .await
+            .expect("connection reads");
+
+        let exchanged = refresh_service()
+            .execute(&mut conn, refresh_jwt, "req-binding")
+            .await
+            .expect("rotation succeeds");
+
+        let new_hash = hash_of(exchanged.refresh_token.as_ref().expect("refresh token"));
+        let new_row = refresh_by_hash(&mut conn, &new_hash)
+            .await
+            .expect("lookup")
+            .expect("new row exists");
+        assert_eq!(new_row.human_connection_id, Some(binding.connection_id));
+        assert_eq!(
+            new_row.human_connection_revision,
+            Some(binding.connection_revision)
+        );
+    }
+
+    /// A family whose connection is no longer Active, or which carries no
+    /// binding at all, is refused without writing a successor.
+    #[tokio::test]
+    async fn rotation_refuses_an_inactive_or_unbound_connection() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let key = test_issuing_key();
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let user_id = insert_test_user(&mut conn, tenant).await;
+
+        let unbound_jwt = issue_refresh_jwt(&key, PrincipalKindTag::User, user_id, tenant);
         insert_refresh_token(
-            conn,
-            id,
-            principal_kind,
-            principal_id,
-            token_hash,
+            &mut conn,
+            Uuid::new_v4(),
+            "user",
+            user_id,
+            &hash_of(&unbound_jwt),
             Utc::now() + Duration::days(30),
         )
         .await
-        .expect("refresh token inserts");
-        id
+        .expect("unbound row inserts");
+        let unbound = refresh_service()
+            .execute(&mut conn, unbound_jwt, "req-unbound")
+            .await;
+        assert!(
+            matches!(
+                unbound,
+                Err(RefreshError::Issuance(IssuanceError::ConnectionInactive))
+            ),
+            "an unbound family must refuse, got {unbound:?}"
+        );
+
+        let bound_jwt = issue_refresh_jwt(&key, PrincipalKindTag::User, user_id, tenant);
+        seed_active_refresh(&mut conn, "user", user_id, &hash_of(&bound_jwt)).await;
+        sqlx::query("UPDATE wyrd.auth_human_connections SET state = 'Inactive'")
+            .execute(&mut **conn.transaction())
+            .await
+            .expect("connection deactivates");
+        let result = refresh_service()
+            .execute(&mut conn, bound_jwt, "req-inactive")
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(RefreshError::Issuance(IssuanceError::ConnectionInactive))
+            ),
+            "a deactivated connection must refuse, got {result:?}"
+        );
+        let user_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM wyrd.auth_refresh_tokens WHERE rotated_from IS NOT NULL",
+        )
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("successor count reads");
+        assert_eq!(
+            user_rows, 0,
+            "no successor is written for a refused rotation"
+        );
     }
 
     /// A human session rotates: the consumed row is retired and the successor

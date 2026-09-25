@@ -25,15 +25,15 @@ pub use api_keys::{
 };
 pub use human_connections::{
     HumanConnectionWrite, SealedSecretRow, SealedSecretTable, deactivate_active_human_connection,
-    human_candidate_test_is_current, human_connection_in_state, insert_human_candidate,
-    live_human_connections, lock_human_connection_slot, promote_tested_human_candidate,
-    remove_human_connection, replace_human_candidate, sealed_tenant_secrets,
-    stamp_human_candidate_tested, swap_sealed_tenant_secret,
+    human_candidate_test_is_current, human_connection_in_state, human_connection_is_active,
+    insert_human_candidate, live_human_connections, lock_human_connection_slot,
+    promote_tested_human_candidate, remove_human_connection, replace_human_candidate,
+    sealed_tenant_secrets, stamp_human_candidate_tested, swap_sealed_tenant_secret,
 };
 pub use login_state::{LoginStateRow, insert_login_state, take_login_state};
 pub use refresh_tokens::{
-    consume_active_refresh, insert_refresh_token_rotated, refresh_by_hash,
-    refresh_issuance_instant, revoke_refresh, revoke_refresh_family,
+    consume_active_refresh, insert_human_refresh_token, refresh_by_hash, refresh_issuance_instant,
+    revoke_refresh, revoke_refresh_family,
 };
 pub use revocation::{suspend_service_account_principal, suspend_user_principal};
 pub use role_assignments::{

@@ -173,3 +173,42 @@ DELETE FROM wyrd.auth_trusted_issuers
 ALTER TABLE wyrd.auth_trusted_issuers
     ADD CONSTRAINT auth_trusted_issuers_workload_only
     CHECK (principal_kind = 'Workload');
+
+-- ---------------------------------------------------------------------------
+-- Session provenance
+-- ---------------------------------------------------------------------------
+-- A human session belongs to the exact connection revision its login began
+-- through. Login state records it; the first refresh row copies it and every
+-- rotation copies it forward. Issuing a session or a refresh successor takes
+-- the tenant connection slot lock and requires that exact revision to still
+-- be Active, so replacement, deactivation, and removal end old sessions on
+-- every replica. The foreign key keeps a removed connection's tombstone for
+-- as long as a session names it.
+--
+-- In-flight login state is transient (five minutes) and names no connection,
+-- so it is discarded. Live human refresh families move with their tenant's
+-- Human issuer onto the Active connection migrated above; a family whose
+-- tenant had no Human issuer stays unbound and can no longer renew.
+DELETE FROM wyrd.auth_login_state;
+
+ALTER TABLE wyrd.auth_login_state
+    ADD COLUMN connection_id UUID NOT NULL,
+    ADD COLUMN connection_revision BIGINT NOT NULL;
+
+ALTER TABLE wyrd.auth_refresh_tokens
+    ADD COLUMN human_connection_id UUID
+        REFERENCES wyrd.auth_human_connections(connection_id),
+    ADD COLUMN human_connection_revision BIGINT,
+    ADD CONSTRAINT auth_refresh_tokens_human_connection_pair
+        CHECK ((human_connection_id IS NULL) = (human_connection_revision IS NULL)),
+    ADD CONSTRAINT auth_refresh_tokens_human_connection_user
+        CHECK (human_connection_id IS NULL OR principal_kind = 'user');
+
+UPDATE wyrd.auth_refresh_tokens AS token
+   SET human_connection_id = connection.connection_id,
+       human_connection_revision = connection.revision
+  FROM wyrd.auth_human_connections AS connection
+ WHERE connection.data_tenant_id = token.data_tenant_id
+   AND connection.state = 'Active'
+   AND token.principal_kind = 'user'
+   AND token.revoked_at IS NULL;

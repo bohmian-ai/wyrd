@@ -60,11 +60,11 @@ pub async fn exchange_authorization_code(
             .external_verifier
             .clone()
             .ok_or_else(auth_not_configured)?,
-        connections: state.auth.human_connections(
-            state.postgres.app_pool(),
-            state.deployment_profile.screened_http(),
-        ),
-        http: state.deployment_profile.screened_http(),
+        connections: state
+            .auth
+            .human_connections
+            .clone()
+            .ok_or_else(auth_not_configured)?,
     };
     service
         .execute(
@@ -126,17 +126,21 @@ mod pg_tests {
         AuthorizationCodeExchange, audit_authorization_code_failure, ensure_user_identity,
         role_names_to_refs, verify_nonce,
     };
+    use wyrd_auth::connections::HumanConnections;
     use wyrd_auth::login::{LoginStateEntry, PgLoginStateStore};
     use wyrd_auth_issue::IssuingKey;
-    use wyrd_auth_oidc::{ClaimMapping, ClaimPath, ClientAuth, JwksCache, TrustedIssuer};
+    use wyrd_auth_oidc::{
+        ClaimMapping, ClaimPath, ClientAuth, JwksCache, ScreenedHttp, TrustedIssuer,
+    };
     use wyrd_auth_verify::{
         ExternalVerifier, Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem,
     };
     use wyrd_crypt::{SealingKeyring, SecretKey};
-    use wyrd_dev_fixtures::pg::PgFixture;
+    use wyrd_dev_fixtures::pg::{PgFixture, seed_active_human_connection};
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::IssuerTokenPolicy;
     use wyrd_spec::auth::{IssuerUrl, TokenResponse, TokenType};
+    use wyrd_sql::row_types::auth::HumanConnectionBinding;
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
 
     use crate::auth::tenant_slug_from_host;
@@ -216,6 +220,7 @@ mod pg_tests {
             nonce: "nonce-a".to_owned(),
             issuer: "https://idp.example.com/realms/acme".to_owned(),
             redirect_uri: "https://test-tenant-1.example.com/auth/callback".to_owned(),
+            connection: unseeded_binding(),
         };
 
         let error = verify_nonce(&state, &serde_json::json!({ "nonce": "nonce-b" }))
@@ -248,10 +253,7 @@ mod pg_tests {
     #[tokio::test]
     async fn missing_state_writes_failure_audit_with_nil_principal() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let tenant = fixture.data_tenant_id();
-        let state =
-            test_state_with_external(&fixture, trusted_issuer(tenant, HashMap::new(), Vec::new()))
-                .await;
+        let state = test_state_with_external(&fixture).await;
         let headers = tenant_headers(fixture.tenant_slug());
 
         let error = exchange_authorization_code(
@@ -276,11 +278,9 @@ mod pg_tests {
     async fn stored_invalid_issuer_writes_failure_audit_with_nil_principal() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
-        let state =
-            test_state_with_external(&fixture, trusted_issuer(tenant, HashMap::new(), Vec::new()))
-                .await;
+        let state = test_state_with_external(&fixture).await;
         let headers = tenant_headers(fixture.tenant_slug());
-        PgLoginStateStore::new(fixture.app_pool().clone())
+        PgLoginStateStore::new(fixture.wyrd_postgres().clone())
             .put(
                 tenant,
                 "bad-issuer-state",
@@ -289,6 +289,7 @@ mod pg_tests {
                     nonce: "nonce".to_owned(),
                     issuer: "not a url".to_owned(),
                     redirect_uri: "https://test-tenant-1.example.com/auth/callback".to_owned(),
+                    connection: unseeded_binding(),
                 },
                 StdDuration::from_secs(300),
             )
@@ -324,13 +325,10 @@ mod pg_tests {
             .mount(&server)
             .await;
         let jwks_uri = jwks_uri(&server);
-        let state = test_state_with_external(
-            &fixture,
-            trusted_issuer_with_jwks(tenant, jwks_uri.clone(), HashMap::new(), Vec::new()),
-        )
-        .await;
+        let state = test_state_with_external(&fixture).await;
         let trusted = trusted_issuer_with_jwks(tenant, jwks_uri, HashMap::new(), Vec::new());
-        let login_state = login_state_with_nonce("nonce-ok");
+        let login_state =
+            login_state_with_nonce("nonce-ok", committed_active_binding(&fixture).await);
         let id_token = encode_external_token(&external_claims(
             EXTERNAL_AUDIENCE,
             "nonce-ok",
@@ -381,13 +379,9 @@ mod pg_tests {
             .mount(&server)
             .await;
         let jwks_uri = jwks_uri(&server);
-        let state = test_state_with_external(
-            &fixture,
-            trusted_issuer_with_jwks(tenant, jwks_uri.clone(), HashMap::new(), Vec::new()),
-        )
-        .await;
+        let state = test_state_with_external(&fixture).await;
         let trusted = trusted_issuer_with_jwks(tenant, jwks_uri, HashMap::new(), Vec::new());
-        let login_state = login_state_with_nonce("nonce-ok");
+        let login_state = login_state_with_nonce("nonce-ok", unseeded_binding());
         let id_token = encode_external_token(&external_claims(
             "wrong-audience",
             "nonce-ok",
@@ -521,13 +515,35 @@ mod pg_tests {
         }
     }
 
-    fn login_state_with_nonce(nonce: &str) -> LoginStateEntry {
+    /// Login state for `nonce`, bound to `connection`.
+    fn login_state_with_nonce(nonce: &str, connection: HumanConnectionBinding) -> LoginStateEntry {
         LoginStateEntry {
             code_verifier: SecretString::from("verifier".to_owned()),
             nonce: nonce.to_owned(),
             issuer: EXTERNAL_ISSUER.to_owned(),
             redirect_uri: "https://test-tenant-1.example.com/auth/callback".to_owned(),
+            connection,
         }
+    }
+
+    /// A binding naming no stored connection, for paths refused before
+    /// issuance ever checks it.
+    fn unseeded_binding() -> HumanConnectionBinding {
+        HumanConnectionBinding {
+            connection_id: Uuid::now_v7(),
+            connection_revision: 1,
+        }
+    }
+
+    /// Seed and commit the tenant's Active human connection, returning the
+    /// binding a login through it records.
+    async fn committed_active_binding(fixture: &PgFixture) -> HumanConnectionBinding {
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let binding = seed_active_human_connection(&mut conn)
+            .await
+            .expect("connection seeds");
+        conn.commit().await.expect("connection commits");
+        binding
     }
 
     async fn finish_with_failure_audit(
@@ -599,11 +615,11 @@ mod pg_tests {
                 .external_verifier
                 .clone()
                 .expect("test state has external verifier"),
-            connections: state.auth.human_connections(
-                state.postgres.app_pool(),
-                state.deployment_profile.screened_http(),
-            ),
-            http: state.deployment_profile.screened_http(),
+            connections: state
+                .auth
+                .human_connections
+                .clone()
+                .expect("test state has a connection owner"),
         }
     }
 
@@ -678,13 +694,13 @@ mod pg_tests {
         )
     }
 
-    /// Build callback test state with a real issuing key and external
-    /// verifier.
+    /// Build callback test state with a real issuing key, external verifier,
+    /// and human-connection owner.
     ///
-    /// Human trust is passed to `finish_id_token_exchange` explicitly, so no
-    /// connection is seeded; `_trusted` only documents which issuer each test
-    /// exercises. The Pg issuer resolver backs the verifier's workload path.
-    async fn test_state_with_external(fixture: &PgFixture, _trusted: TrustedIssuer) -> AppState {
+    /// Human trust is passed to `finish_id_token_exchange` explicitly; a test
+    /// that reaches issuance seeds the Active connection its login state is
+    /// bound to. The Pg issuer resolver backs the verifier's workload path.
+    async fn test_state_with_external(fixture: &PgFixture) -> AppState {
         let sealing_key = Arc::new(SealingKeyring::new(SecretKey::from_bytes([7_u8; 32])));
         let issuer_resolver = Arc::new(PgIssuerResolver::new(
             Arc::new(fixture.app_pool().clone()),
@@ -707,7 +723,7 @@ mod pg_tests {
         let verifier = TokenVerifier::new(local_keys, "wyrd", WyrdAuthVerifySettings::default());
         let external_verifier = ExternalVerifier::new(
             Arc::new(JwksCache::new(
-                wyrd_auth_oidc::ScreenedHttp::allowing_internal(),
+                ScreenedHttp::allowing_internal(),
                 StdDuration::from_secs(300),
                 StdDuration::from_secs(5),
             )),
@@ -721,6 +737,12 @@ mod pg_tests {
                 token_verifier: Some(Arc::new(verifier)),
                 external_verifier: Some(Arc::new(external_verifier)),
                 trusted_issuer_resolver: Some(issuer_resolver),
+                human_connections: Some(HumanConnections::new(
+                    fixture.wyrd_postgres().clone(),
+                    Some(Arc::clone(&sealing_key)),
+                    ScreenedHttp::allowing_internal(),
+                    None,
+                )),
                 sealing_key: Some(sealing_key),
                 ..crate::components::auth::ServerAuth::default()
             })

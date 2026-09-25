@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use sqlx::types::Uuid;
 
 use crate::TenantConn;
-use crate::row_types::auth::RefreshTokenRow;
+use crate::row_types::auth::{HumanConnectionBinding, RefreshTokenRow};
 
 const CONSUME_ACTIVE_REFRESH_SQL: &str = r#"
     UPDATE wyrd.auth_refresh_tokens
@@ -20,7 +20,8 @@ const CONSUME_ACTIVE_REFRESH_SQL: &str = r#"
        AND revoked_at IS NULL
        AND expires_at > statement_timestamp()
     RETURNING id, data_tenant_id, principal_kind, principal_id, token_hash,
-              issued_at, expires_at, rotated_from, revoked_at, revoked_reason
+              issued_at, expires_at, rotated_from, revoked_at, revoked_reason,
+              human_connection_id, human_connection_revision
 "#;
 
 const REFRESH_ISSUANCE_INSTANT_SQL: &str = r#"
@@ -29,18 +30,21 @@ const REFRESH_ISSUANCE_INSTANT_SQL: &str = r#"
 
 const REFRESH_BY_HASH_SQL: &str = r#"
     SELECT id, data_tenant_id, principal_kind, principal_id, token_hash,
-           issued_at, expires_at, rotated_from, revoked_at, revoked_reason
+           issued_at, expires_at, rotated_from, revoked_at, revoked_reason,
+           human_connection_id, human_connection_revision
       FROM wyrd.auth_refresh_tokens
      WHERE token_hash = $1
        AND data_tenant_id = $2
      LIMIT 1
 "#;
 
-const INSERT_REFRESH_TOKEN_ROTATED_SQL: &str = r#"
+/// Inserts one human refresh row bound to the login connection revision.
+const INSERT_HUMAN_REFRESH_TOKEN_SQL: &str = r#"
     INSERT INTO wyrd.auth_refresh_tokens (
         id, data_tenant_id, principal_kind, principal_id,
-        token_hash, expires_at, rotated_from
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+        token_hash, expires_at, rotated_from,
+        human_connection_id, human_connection_revision
+    ) VALUES ($1, $2, 'user', $3, $4, $5, $6, $7, $8)
 "#;
 
 /// Sample the `PostgreSQL` issuance instant for a refresh token, truncated to a
@@ -158,28 +162,36 @@ pub async fn revoke_refresh_family(
     Ok(result.rows_affected())
 }
 
-/// Insert a new refresh token row with a `rotated_from` back-link.
+/// Insert one human session refresh row bound to its login connection.
 ///
-/// Called during rotation to record the successor token alongside the id of
-/// the token it replaced. The predecessor row must already be revoked (via
-/// `consume_active_refresh`) before this insert runs in the same transaction.
-pub async fn insert_refresh_token_rotated(
+/// `rotated_from` is `None` at first login and names the consumed predecessor
+/// on rotation, which must already be revoked (via `consume_active_refresh`)
+/// in the same transaction. `connection` names the
+/// exact tenant human connection the session was established through: the
+/// login's connection at first issuance, copied from the predecessor on
+/// rotation, so every successor in a family carries the same provenance.
+///
+/// # Errors
+/// Returns a SQLx error when Postgres rejects the insert, including when the
+/// connection id names no stored connection.
+pub async fn insert_human_refresh_token(
     conn: &mut TenantConn<'_>,
     id: Uuid,
-    principal_kind: &str,
     principal_id: Uuid,
     token_hash: &str,
     expires_at: DateTime<Utc>,
-    rotated_from: Uuid,
+    rotated_from: Option<Uuid>,
+    connection: HumanConnectionBinding,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(INSERT_REFRESH_TOKEN_ROTATED_SQL)
+    sqlx::query(INSERT_HUMAN_REFRESH_TOKEN_SQL)
         .bind(id)
         .bind(conn.data_tenant_id().as_uuid())
-        .bind(principal_kind)
         .bind(principal_id)
         .bind(token_hash)
         .bind(expires_at)
         .bind(rotated_from)
+        .bind(connection.connection_id)
+        .bind(connection.connection_revision)
         .execute(&mut **conn.transaction())
         .await?;
     Ok(())
@@ -187,9 +199,7 @@ pub async fn insert_refresh_token_rotated(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CONSUME_ACTIVE_REFRESH_SQL, INSERT_REFRESH_TOKEN_ROTATED_SQL, REFRESH_BY_HASH_SQL,
-    };
+    use super::{CONSUME_ACTIVE_REFRESH_SQL, INSERT_HUMAN_REFRESH_TOKEN_SQL, REFRESH_BY_HASH_SQL};
 
     #[test]
     fn consume_active_refresh_is_atomic_update_returning() {
@@ -211,11 +221,13 @@ mod tests {
         assert!(!REFRESH_BY_HASH_SQL.contains("expires_at >"));
     }
 
+    /// The human insert records the family back-link and the exact login
+    /// connection revision, and is only ever a `user` row.
     #[test]
-    fn insert_refresh_token_rotated_includes_rotated_from() {
-        assert!(INSERT_REFRESH_TOKEN_ROTATED_SQL.contains("rotated_from"));
-        assert!(INSERT_REFRESH_TOKEN_ROTATED_SQL.contains("principal_kind"));
-        assert!(INSERT_REFRESH_TOKEN_ROTATED_SQL.contains("principal_id"));
-        assert!(INSERT_REFRESH_TOKEN_ROTATED_SQL.contains("token_hash"));
+    fn insert_human_refresh_token_binds_rotation_and_connection() {
+        assert!(INSERT_HUMAN_REFRESH_TOKEN_SQL.contains("rotated_from"));
+        assert!(INSERT_HUMAN_REFRESH_TOKEN_SQL.contains("'user'"));
+        assert!(INSERT_HUMAN_REFRESH_TOKEN_SQL.contains("human_connection_id"));
+        assert!(INSERT_HUMAN_REFRESH_TOKEN_SQL.contains("human_connection_revision"));
     }
 }

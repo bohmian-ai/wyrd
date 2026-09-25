@@ -2,11 +2,13 @@
 
 use std::sync::Arc;
 
+use reqwest::RequestBuilder;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use serde_json::Value;
+use url::Url;
 use uuid::Uuid;
-use wyrd_auth_oidc::{ClientAuth, OidcProvider, ScreenedHttp, TrustedIssuer};
+use wyrd_auth_oidc::{ClientAuth, OidcError, OidcProvider, ScreenedHttp, TrustedIssuer};
 use wyrd_auth_verify::ExternalVerifier;
 use wyrd_runtime::{PrincipalId, RoleRef};
 use wyrd_spec::DataTenantId;
@@ -23,7 +25,7 @@ use crate::audit::{
     TOKEN_EXCHANGE_OPERATION, auth_event, auth_failure_code, record_auth_audit_best_effort,
 };
 use crate::connections::HumanConnections;
-use crate::error::{auth_error_to_wyrd, screen_error};
+use crate::error::{auth_error_to_wyrd, screen_error, store_error};
 use crate::exchange_api_key::role_refs;
 use crate::issuance::TenantTokenIssuer;
 use crate::login::{LoginStateEntry, PgLoginStateStore};
@@ -51,10 +53,9 @@ pub struct AuthorizationCodeExchange {
     pub issuer: TenantTokenIssuer,
     /// External OIDC id-token verifier.
     pub verifier: Arc<ExternalVerifier<PgIssuerResolver>>,
-    /// The tenant human-connection owner; the only source of human trust.
+    /// The tenant human-connection owner; the only source of human trust and
+    /// of the screened HTTP capability every provider request is made through.
     pub connections: HumanConnections,
-    /// Screened HTTP capability every provider request is made through.
-    pub http: ScreenedHttp,
 }
 
 impl std::fmt::Debug for AuthorizationCodeExchange {
@@ -67,9 +68,15 @@ impl std::fmt::Debug for AuthorizationCodeExchange {
 impl AuthorizationCodeExchange {
     /// Execute the authorization-code grant.
     ///
+    /// The login must still be on the exact connection revision its state was
+    /// bound to when it began, and issuance re-checks that revision under the
+    /// connection slot lock, so a replacement, deactivation, or removal that
+    /// commits while the provider round-trip is in flight refuses the session.
+    ///
     /// # Errors
     /// Returns [`WyrdError`] when the login state is unknown, already consumed,
-    /// or expired, when the issuer refuses the code or its id token fails
+    /// or expired, when the login's connection is no longer the tenant's Active
+    /// revision, when the issuer refuses the code or its id token fails
     /// verification, when role persistence or successor issuance fails, or when
     /// the decision cannot be audited. Every refusal is audited before it is
     /// returned, and the grant transaction commits or rolls back whole.
@@ -81,10 +88,13 @@ impl AuthorizationCodeExchange {
         state_key: &str,
         request_id: &str,
     ) -> Result<TokenResponse, WyrdError> {
-        let store = PgLoginStateStore::new(postgres.app_pool().clone());
+        let store = PgLoginStateStore::new(postgres.clone());
         let mut audit_principal_id = Uuid::nil();
         let result = async {
-            let Some(login_state) = store.take(tenant_id, state_key).await.map_err(sql_error)?
+            let Some(login_state) = store
+                .take(tenant_id, state_key)
+                .await
+                .map_err(store_error)?
             else {
                 return Err(invalid_state(
                     "login state is missing, expired, or already consumed",
@@ -92,8 +102,18 @@ impl AuthorizationCodeExchange {
             };
             let issuer = IssuerUrl::new(login_state.issuer.clone())
                 .map_err(|_| invalid_token("stored issuer URL is invalid"))?;
-            let trusted = active_connection_for(&self.connections, tenant_id, &issuer).await?;
-            let provider = discover_provider(&trusted.issuer, self.http).await?;
+            let active = self
+                .connections
+                .active_connection_for(tenant_id, &issuer)
+                .await?;
+            if active.binding != login_state.connection {
+                return Err(invalid_token(
+                    "the login connection changed while the login was in progress",
+                ));
+            }
+            let trusted = active.trusted;
+            let http = self.connections.http();
+            let provider = discover_provider(&trusted.issuer, http).await?;
             let id_token = exchange_code_for_id_token(
                 &provider,
                 &trusted.client_id,
@@ -101,7 +121,7 @@ impl AuthorizationCodeExchange {
                 &login_state.redirect_uri,
                 &login_state.code_verifier,
                 code,
-                self.http,
+                http,
             )
             .await?;
             let token = self
@@ -136,6 +156,14 @@ impl AuthorizationCodeExchange {
     }
 
     /// Complete a human OIDC login after the provider has returned an ID token.
+    ///
+    /// The session is bound to `login_state.connection` and issued only while
+    /// that exact revision is still Active. Returns the token and the resolved
+    /// user id.
+    ///
+    /// # Errors
+    /// Returns the errors of the verification, persistence, and issuance steps
+    /// of [`Self::execute`]; nothing commits unless every step succeeds.
     pub async fn finish_id_token_exchange(
         &self,
         postgres: &WyrdPostgres,
@@ -163,12 +191,14 @@ impl AuthorizationCodeExchange {
     /// Complete the grant once the id token has been verified: persist the
     /// asserted roles, then issue the session through the shared issuance
     /// workflow inside the same transaction, so the access token carries the
-    /// permissions of the roles just recorded.
+    /// permissions of the roles just recorded. Issuance takes the connection
+    /// slot lock and requires the login's bound revision to still be Active.
     ///
     /// # Errors
-    /// Returns [`WyrdError`] when identity or role persistence, issuance, the
-    /// canonical audit append, or the commit fails; no session is returned
-    /// unless all of them committed together.
+    /// Returns [`WyrdError::InvalidToken`] when the bound connection revision
+    /// is no longer Active, and [`WyrdError`] when identity or role
+    /// persistence, issuance, the canonical audit append, or the commit fails;
+    /// no session is returned unless all of them committed together.
     async fn finish_authorization_code_exchange(
         &self,
         input: FinishAuthorizationCodeInput<'_>,
@@ -189,7 +219,7 @@ impl AuthorizationCodeExchange {
             .map_err(auth_error_to_wyrd)?;
         verify_nonce(login_state, &verified.raw_claims)?;
 
-        let mut conn = postgres.tenant_conn(tenant_id).await.map_err(sql_error)?;
+        let mut conn = postgres.tenant_conn(tenant_id).await.map_err(store_error)?;
         let principal_id = ensure_user_identity(
             &mut conn,
             trusted,
@@ -197,7 +227,7 @@ impl AuthorizationCodeExchange {
             verified.email.as_deref(),
         )
         .await
-        .map_err(sql_error)?;
+        .map_err(store_error)?;
         *audit_principal_id = principal_id;
         let roles = role_names_to_refs(trusted, &verified.groups)?;
         // The provider just asserted this human's authority, and nothing else
@@ -207,55 +237,43 @@ impl AuthorizationCodeExchange {
         let role_names = roles.iter().map(RoleRef::as_str).collect::<Vec<_>>();
         replace_user_roles(&mut conn, principal_id, &role_names)
             .await
-            .map_err(sql_error)?;
+            .map_err(store_error)?;
         let exchanged = self
             .issuer
-            .issue_human_session(&mut conn, principal_id, None, request_id)
+            .issue_human_session(
+                &mut conn,
+                principal_id,
+                None,
+                login_state.connection,
+                request_id,
+            )
             .await?;
-        conn.commit().await.map_err(sql_error)?;
+        conn.commit().await.map_err(store_error)?;
 
         Ok(exchanged.into_response())
     }
 }
 
-/// Resolve the tenant's Active human connection, requiring it to be `issuer`.
-///
-/// Login state records the issuer the flow began against; if the tenant has
-/// since activated a different provider or deactivated login, the callback
-/// fails closed rather than trusting whichever provider is active now.
-///
-/// # Errors
-/// Returns [`WyrdError::InvalidToken`] when no Active connection exists or it
-/// names a different issuer, and the owner's unavailability error when the
-/// store cannot be read.
-pub async fn active_connection_for(
-    connections: &HumanConnections,
-    tenant_id: DataTenantId,
-    issuer: &IssuerUrl,
-) -> Result<TrustedIssuer, WyrdError> {
-    connections
-        .active_trusted_issuer(tenant_id)
-        .await?
-        .filter(|trusted| trusted.issuer == *issuer)
-        .ok_or_else(|| invalid_token("issuer is not the active login connection for the tenant"))
-}
-
 /// Discover an issuer using Wyrd's process-owned TLS implementation.
+///
+/// Shared by login, the callback, and candidate testing, so every provider
+/// discovery is screened and pinned to its issuer the same way.
 ///
 /// # Errors
 ///
 /// Returns [`WyrdError::DiscoveryUnavailable`] when the issuer URL is invalid,
-/// `http` refuses the address behind it, or discovery fails. Cancellation
-/// interrupts the request without persisting callback state.
+/// `http` refuses the address behind it, or discovery fails; a discovery
+/// document naming a different issuer carries `details.reason =
+/// "issuer_mismatch"`. Cancellation interrupts the request without persisting
+/// callback state.
 pub(crate) async fn discover_provider(
     issuer: &IssuerUrl,
     http: ScreenedHttp,
 ) -> Result<OidcProvider, WyrdError> {
-    let issuer_url =
-        url::Url::parse(issuer.as_str()).map_err(|_| WyrdError::DiscoveryUnavailable {
-            message: "trusted issuer URL could not be parsed".to_owned(),
-            details: serde_json::json!({}),
-        })?;
+    let issuer_url = Url::parse(issuer.as_str()).map_err(|_| WyrdError::DiscoveryUnavailable {
+        message: "trusted issuer URL could not be parsed".to_owned(),
+        details: serde_json::json!({}),
+    })?;
     let client = http
         .client_for(&issuer_url)
         .await
@@ -264,9 +282,15 @@ pub(crate) async fn discover_provider(
         .await
         .map_err(|error| {
             tracing::warn!(error = %error, "OIDC discovery failed");
-            WyrdError::DiscoveryUnavailable {
-                message: "OIDC discovery unavailable".to_owned(),
-                details: serde_json::json!({}),
+            match error {
+                OidcError::IssuerMismatch { .. } => WyrdError::DiscoveryUnavailable {
+                    message: "the provider discovery document names a different issuer".to_owned(),
+                    details: serde_json::json!({ "reason": "issuer_mismatch" }),
+                },
+                _ => WyrdError::DiscoveryUnavailable {
+                    message: "OIDC discovery unavailable".to_owned(),
+                    details: serde_json::json!({}),
+                },
             }
         })
 }
@@ -304,35 +328,16 @@ pub(crate) async fn exchange_code_for_id_token(
         .client_for(&token_endpoint)
         .await
         .map_err(|error| screen_error(&error))?;
-    let mut request = client.post(token_endpoint);
-    let mut form = vec![
-        ("grant_type", "authorization_code".to_owned()),
-        ("code", code.expose_secret().to_owned()),
-        ("client_id", client_id.to_owned()),
-        ("redirect_uri", redirect_uri.to_owned()),
-        ("code_verifier", code_verifier.expose_secret().to_owned()),
-    ];
-
-    match client_auth {
-        ClientAuth::SecretBasic(secret) => {
-            request = request.basic_auth(
-                client_id.to_owned(),
-                Some(secret.expose_secret().to_owned()),
-            );
-        }
-        ClientAuth::SecretPost(secret) => {
-            form.push(("client_secret", secret.expose_secret().to_owned()));
-        }
-        ClientAuth::PrivateKeyJwt => {
-            return Err(WyrdError::Internal {
-                message: "private_key_jwt client authentication is not implemented".to_owned(),
-                details: serde_json::json!({ "client_auth": "private_key_jwt" }),
-            });
-        }
-        ClientAuth::Public => {}
-    }
-
-    let response = request.form(&form).send().await.map_err(|error| {
+    let request = authorization_code_request(
+        &client,
+        token_endpoint,
+        client_id,
+        client_auth,
+        redirect_uri,
+        code.expose_secret(),
+        code_verifier.expose_secret(),
+    )?;
+    let response = request.send().await.map_err(|error| {
         tracing::warn!(error = %error, "OIDC token endpoint unavailable");
         WyrdError::AuthVerifyUnavailable {
             message: "OIDC token endpoint unavailable".to_owned(),
@@ -361,6 +366,50 @@ pub(crate) async fn exchange_code_for_id_token(
                 details: serde_json::json!({ "retry_after_seconds": 1 }),
             }
         })
+}
+
+/// Build one authorization-code token request with the client's configured
+/// authentication.
+///
+/// Shared by the login callback's real exchange and candidate testing's
+/// invalid-code probe, so the probe proves exactly the request a login sends:
+/// the same grant form, PKCE verifier, redirect URI, and `client_secret_basic`
+/// or `client_secret_post` placement. Nothing is sent here.
+///
+/// # Errors
+/// Returns [`WyrdError::Internal`] for `private_key_jwt`, which human
+/// connections cannot store and this request cannot sign.
+pub(crate) fn authorization_code_request(
+    client: &reqwest::Client,
+    token_endpoint: Url,
+    client_id: &str,
+    client_auth: &ClientAuth,
+    redirect_uri: &str,
+    code: &str,
+    code_verifier: &str,
+) -> Result<RequestBuilder, WyrdError> {
+    let mut request = client.post(token_endpoint);
+    let mut form = vec![
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("client_id", client_id),
+        ("redirect_uri", redirect_uri),
+        ("code_verifier", code_verifier),
+    ];
+    match client_auth {
+        ClientAuth::SecretBasic(secret) => {
+            request = request.basic_auth(client_id, Some(secret.expose_secret()));
+        }
+        ClientAuth::SecretPost(secret) => form.push(("client_secret", secret.expose_secret())),
+        ClientAuth::PrivateKeyJwt => {
+            return Err(WyrdError::Internal {
+                message: "private_key_jwt client authentication is not implemented".to_owned(),
+                details: serde_json::json!({ "client_auth": "private_key_jwt" }),
+            });
+        }
+        ClientAuth::Public => {}
+    }
+    Ok(request.form(&form))
 }
 
 /// Resolve the local user for a trusted external identity or create it once.
@@ -459,15 +508,6 @@ fn invalid_token(message: &str) -> WyrdError {
     WyrdError::InvalidToken {
         message: message.to_owned(),
         details: serde_json::json!({}),
-    }
-}
-
-fn sql_error(error: impl Into<SqlError>) -> WyrdError {
-    let error = error.into();
-    tracing::warn!(error = %error, "OIDC callback SQL unavailable");
-    WyrdError::AuthVerifyUnavailable {
-        message: "auth backend unavailable".to_owned(),
-        details: serde_json::json!({ "retry_after_seconds": 1 }),
     }
 }
 

@@ -4,12 +4,14 @@ use axum::extract::{Extension, Query, State};
 use axum::http::{HeaderMap, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use serde::Deserialize;
+use wyrd_auth::login::prepare_login;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::IssuerUrl;
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::ids::TenantSlug;
 use wyrd_spec::request_id::RequestId;
 
+use crate::auth::auth_not_configured;
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
@@ -33,6 +35,8 @@ pub struct LoginQuery {
     params(("issuer" = String, Query, description = "Trusted issuer URL to begin login against")),
     responses(
         (status = 303, description = "Redirect to the trusted issuer's authorization endpoint"),
+        (status = 400, description = "The deployment has no public origin, so no callback URL \
+          exists (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The host names no tenant, or the issuer is not trusted by it \
           (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
         (status = 503, description = "The auth backend is unavailable \
@@ -76,33 +80,38 @@ pub async fn login(
 /// Build the redirect for a login attempt, separated from the caller so every
 /// refusal is logged once at one place.
 ///
+/// The provider is sent back to the deployment's configured callback — the
+/// URL tenants register and candidate testing proved — whatever `Host` or
+/// `X-Forwarded-Proto` the request carried; the host only selects the tenant.
+///
 /// # Errors
-/// Returns [`WyrdErrorResponse`] when the issuer is not the tenant's Active
-/// human connection,
-/// when its authorization endpoint cannot be discovered, or when the login
-/// state cannot be persisted.
+/// Returns [`WyrdErrorResponse`] when auth is not configured, when the
+/// deployment has no public origin, when the issuer is not the tenant's Active
+/// human connection, when its authorization endpoint cannot be discovered, or
+/// when the login state cannot be persisted.
 async fn try_initiate_login(
     state: &AppState,
     headers: &HeaderMap,
     query: &LoginQuery,
     tenant_id: DataTenantId,
 ) -> Result<Response, WyrdErrorResponse> {
-    let connections = state.auth.human_connections(
-        state.postgres.app_pool(),
-        state.deployment_profile.screened_http(),
-    );
-    let trusted =
-        wyrd_auth::callback::active_connection_for(&connections, tenant_id, &query.issuer)
-            .await
-            .map_err(WyrdErrorResponse::from)?;
-    let redirect_uri = callback_redirect_uri(headers)?;
-    let init = wyrd_auth::login::prepare_login(
-        state.postgres.app_pool(),
-        tenant_id,
-        &trusted,
-        &query.issuer,
+    let connections = state
+        .auth
+        .human_connections
+        .as_ref()
+        .ok_or_else(auth_not_configured)?;
+    let redirect_uri = connections
+        .require_callback()
+        .map_err(WyrdErrorResponse::from)?;
+    let active = connections
+        .active_connection_for(tenant_id, &query.issuer)
+        .await
+        .map_err(WyrdErrorResponse::from)?;
+    let init = prepare_login(
+        state.postgres.wyrd(),
+        &active,
         redirect_uri,
-        state.deployment_profile.screened_http(),
+        connections.http(),
     )
     .await
     .map_err(WyrdErrorResponse::from)?;
@@ -121,23 +130,6 @@ fn wants_json(headers: &HeaderMap) -> bool {
         .get(header::ACCEPT)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.contains("application/json"))
-}
-
-/// Build the `redirect_uri` the IdP sends the browser back to, derived from the
-/// request `Host` (and `X-Forwarded-Proto` when present). Must match the value
-/// replayed at the token exchange, so it is stored with the login state.
-fn callback_redirect_uri(headers: &HeaderMap) -> Result<String, WyrdErrorResponse> {
-    let host = headers
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| invalid_token("request host header is missing"))?;
-    let host = host.split(':').next().unwrap_or(host);
-    let scheme = headers
-        .get("x-forwarded-proto")
-        .and_then(|value| value.to_str().ok())
-        .filter(|scheme| matches!(*scheme, "http" | "https"))
-        .unwrap_or("http");
-    Ok(format!("{scheme}://{host}/auth/callback"))
 }
 
 /// Resolve the tenant for this login request from the request host subdomain,

@@ -24,16 +24,19 @@ use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
 use wyrd_spec::vala::audit_detail::CardScopeMintKind;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
-    RoleRow, insert_refresh_token, insert_refresh_token_rotated, list_service_account_roles,
-    list_user_roles, refresh_issuance_instant, roles_by_name, service_account_by_id, user_by_id,
+    RoleRow, human_connection_is_active, insert_human_refresh_token, list_service_account_roles,
+    list_user_roles, lock_human_connection_slot, refresh_issuance_instant, roles_by_name,
+    service_account_by_id, user_by_id,
 };
 use wyrd_sql::queries::platform::tenant_resolver::tenant_admits_credentials;
+use wyrd_sql::row_types::auth::HumanConnectionBinding;
 
 use crate::audit::{TOKEN_EXCHANGE_OPERATION, append_auth_audit, auth_event};
 use crate::card_scope::{
     IssueErrorOrWyrd, MINT_KIND_API_KEY_EXCHANGE, MINT_KIND_JWT_BEARER, issue_scope_error,
     resolve_card_ref_scope, write_scope_mint_success_audit,
 };
+use crate::error::store_error;
 use crate::exchange_api_key::{
     DELEGATION_POLICY_ACTION, principal_kind_wire, role_refs, token_hash,
 };
@@ -240,6 +243,10 @@ pub enum IssuanceError {
     /// A store read or write failed.
     #[error("database operation failed")]
     Database(#[from] sqlx::Error),
+    /// The human connection revision a session is bound to is no longer
+    /// Active, so no session may be issued or renewed through it.
+    #[error("human connection is no longer active")]
+    ConnectionInactive,
     /// A Card-scope or audit step failed with its own stable error.
     #[error("wyrd error")]
     Wyrd(#[from] WyrdError),
@@ -254,6 +261,10 @@ impl From<IssuanceError> for WyrdError {
                     details: json!({}),
                 }
             }
+            IssuanceError::ConnectionInactive => WyrdError::InvalidToken {
+                message: "the login connection is no longer active".to_owned(),
+                details: json!({}),
+            },
             IssuanceError::RoleCorrupt { role } => WyrdError::RoleCorrupt {
                 message: format!("role {role} has corrupt permissions"),
                 details: json!({ "role": role }),
@@ -440,25 +451,48 @@ impl TenantTokenIssuer {
     }
 
     /// Establish or renew a human session: an access token from [`Self::issue`]
-    /// plus a rotated refresh token.
+    /// plus a rotated refresh token bound to the connection it logged in through.
     ///
     /// `rotated_from` is absent at first login and carries the consumed refresh
     /// row on renewal; it is both the family back-link that makes reuse
     /// detectable and the credential attribution of the renewed access token.
-    /// Only human sessions get a refresh token — a machine re-exchanges its
-    /// durable credential instead.
+    /// `connection` is the exact human-connection id and revision the session
+    /// belongs to. Before anything is minted this takes the tenant's connection
+    /// slot lock — the lock every lifecycle mutation takes — and requires that
+    /// exact revision to still be Active, so replacement, deactivation, or
+    /// removal committed on any replica cuts the session off: once the mutation
+    /// commits no successor can be written, and a mutation waiting on the lock
+    /// commits only after this transaction does. The new refresh row carries
+    /// the same binding, so a rotation inherits it. Only human sessions get a
+    /// refresh token — a machine re-exchanges its durable credential instead.
     ///
     /// # Errors
-    /// Returns every [`Self::issue`] error, [`IssuanceError::Issue`] when the
-    /// refresh token cannot be signed, and [`IssuanceError::Database`] when
-    /// the refresh row cannot be written. Nothing is committed here.
+    /// Returns [`IssuanceError::ConnectionInactive`] when the bound connection
+    /// revision is no longer Active, every [`Self::issue`] error,
+    /// [`IssuanceError::Issue`] when the refresh token cannot be signed, and
+    /// [`IssuanceError::Database`] or [`IssuanceError::Wyrd`] when a store step
+    /// fails. Nothing is committed here.
     pub async fn issue_human_session(
         &self,
         conn: &mut TenantConn<'_>,
         principal_id: Uuid,
         rotated_from: Option<Uuid>,
+        connection: HumanConnectionBinding,
         request_id: &str,
     ) -> Result<ExchangedToken, IssuanceError> {
+        lock_human_connection_slot(conn)
+            .await
+            .map_err(store_error)?;
+        let active = human_connection_is_active(
+            conn,
+            connection.connection_id,
+            connection.connection_revision,
+        )
+        .await
+        .map_err(store_error)?;
+        if !active {
+            return Err(IssuanceError::ConnectionInactive);
+        }
         let grant = match rotated_from {
             Some(consumed) => TenantGrant::Refresh { consumed },
             None => TenantGrant::OidcLogin,
@@ -477,32 +511,16 @@ impl TenantTokenIssuer {
         )?;
         let refresh_expires_at = issued_at + self.settings.refresh_ttl;
         let hash = token_hash(&refresh_token);
-        let successor = Uuid::new_v4();
-        match rotated_from {
-            Some(predecessor) => {
-                insert_refresh_token_rotated(
-                    conn,
-                    successor,
-                    "user",
-                    principal_id,
-                    &hash,
-                    refresh_expires_at,
-                    predecessor,
-                )
-                .await?;
-            }
-            None => {
-                insert_refresh_token(
-                    conn,
-                    successor,
-                    "user",
-                    principal_id,
-                    &hash,
-                    refresh_expires_at,
-                )
-                .await?;
-            }
-        }
+        insert_human_refresh_token(
+            conn,
+            Uuid::new_v4(),
+            principal_id,
+            &hash,
+            refresh_expires_at,
+            rotated_from,
+            connection,
+        )
+        .await?;
         Ok(ExchangedToken {
             refresh_token: Some(SecretString::from(refresh_token)),
             ..access
@@ -780,7 +798,7 @@ mod pg_tests {
         Kid, TokenAudience, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings,
         public_key_from_pem,
     };
-    use wyrd_dev_fixtures::pg::PgFixture;
+    use wyrd_dev_fixtures::pg::{PgFixture, seed_active_human_connection};
     use wyrd_runtime::{Permission, PrincipalId};
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::PrincipalKindTag;
@@ -791,6 +809,7 @@ mod pg_tests {
         insert_user, revoke_role_from_service_account, suspend_service_account_principal,
         suspend_user_principal,
     };
+    use wyrd_sql::row_types::auth::HumanConnectionBinding;
 
     use super::{IssuanceError, TenantGrant, TenantTokenIssuer, TokenExchangeSettings};
 
@@ -990,12 +1009,41 @@ mod pg_tests {
             .await
             .expect("role grants");
 
+        let binding = seed_active_human_connection(&mut conn)
+            .await
+            .expect("connection seeds");
+
         let session = issuer()
-            .issue_human_session(&mut conn, user, None, "req-session")
+            .issue_human_session(&mut conn, user, None, binding, "req-session")
             .await
             .expect("session issues");
 
         assert!(grants_card_read(&session.access_token, tenant));
         assert!(session.refresh_token.is_some(), "a human session renews");
+    }
+
+    /// A session bound to a connection revision that is no longer Active is
+    /// refused before any token or refresh row is minted.
+    #[tokio::test]
+    async fn a_human_session_bound_to_an_inactive_connection_is_refused() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let user = seed_user(&mut conn).await;
+        let active = seed_active_human_connection(&mut conn)
+            .await
+            .expect("connection seeds");
+        let stale = HumanConnectionBinding {
+            connection_revision: active.connection_revision + 1,
+            ..active
+        };
+
+        let result = issuer()
+            .issue_human_session(&mut conn, user, None, stale, "req-stale")
+            .await;
+
+        assert!(
+            matches!(result, Err(IssuanceError::ConnectionInactive)),
+            "a stale binding must refuse, got {result:?}"
+        );
     }
 }

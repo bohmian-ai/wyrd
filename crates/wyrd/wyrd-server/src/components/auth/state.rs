@@ -5,10 +5,8 @@ use wyrd_auth_issue::IssuingKey;
 use wyrd_crypt::SealingKeyring;
 use wyrd_runtime::{PermissionCheck, RbacCheck};
 
-use sqlx::PgPool;
 use wyrd_auth::connections::HumanConnections;
 use wyrd_auth::issuance::{TenantTokenIssuer, TokenExchangeSettings};
-use wyrd_auth_oidc::ScreenedHttp;
 use wyrd_auth_verify::{ExternalVerifier, TokenVerifier};
 
 use crate::auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
@@ -33,9 +31,11 @@ pub struct ServerAuth {
     /// retained keys that still open older ciphertext during rotation.
     /// Required only while provider secrets are stored.
     pub sealing_key: Option<Arc<SealingKeyring>>,
-    /// Deployment-controlled public origin; the provider callback URL tenants
-    /// register is derived from it, never from request headers.
-    pub public_origin: Option<url::Url>,
+    /// The tenant human-connection owner, built once at boot over the runtime
+    /// store, keyring, screened HTTP, and deployment public origin. Human
+    /// login, the callback, and connection administration all resolve human
+    /// trust — and the callback URL, never request headers — through it.
+    pub human_connections: Option<HumanConnections>,
     /// TTL and delegation settings for token exchange responses.
     pub token_exchange_settings: TokenExchangeSettings,
 }
@@ -51,21 +51,6 @@ impl ServerAuth {
         self.issuing_key
             .clone()
             .map(|key| TenantTokenIssuer::new(key, self.token_exchange_settings.clone()))
-    }
-
-    /// Build the tenant human-connection owner over this deployment's keyring
-    /// and public origin.
-    ///
-    /// Human login, the callback, and the connection administration routes all
-    /// resolve human trust through the owner this returns.
-    #[must_use]
-    pub fn human_connections(&self, app: &PgPool, http: ScreenedHttp) -> HumanConnections {
-        HumanConnections::new(
-            app.clone(),
-            self.sealing_key.clone(),
-            http,
-            self.public_origin.as_ref(),
-        )
     }
 }
 

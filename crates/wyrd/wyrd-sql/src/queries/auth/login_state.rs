@@ -6,12 +6,14 @@
 use std::time::Duration;
 
 use crate::TenantConn;
+use crate::row_types::auth::HumanConnectionBinding;
 
 const INSERT_LOGIN_STATE_SQL: &str = r#"
     INSERT INTO wyrd.auth_login_state (
-        data_tenant_id, state, code_verifier, nonce, issuer, redirect_uri, expires_at
+        data_tenant_id, state, code_verifier, nonce, issuer, redirect_uri, expires_at,
+        connection_id, connection_revision
     ) VALUES ($1, $2, $3, $4, $5, $6,
-              statement_timestamp() + ($7 * interval '1 second'))
+              statement_timestamp() + ($7 * interval '1 second'), $8, $9)
 "#;
 
 const TAKE_LOGIN_STATE_SQL: &str = r#"
@@ -19,10 +21,11 @@ const TAKE_LOGIN_STATE_SQL: &str = r#"
      WHERE data_tenant_id = $1
        AND state = $2
        AND expires_at > statement_timestamp()
-    RETURNING code_verifier, nonce, issuer, redirect_uri
+    RETURNING code_verifier, nonce, issuer, redirect_uri, connection_id, connection_revision
 "#;
 
-/// Row returned by a single-use login-state consume.
+/// One login-state row: written when a login begins and returned by its
+/// single-use consume.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct LoginStateRow {
     /// Server-generated PKCE verifier.
@@ -33,32 +36,36 @@ pub struct LoginStateRow {
     pub issuer: String,
     /// Callback redirect URI.
     pub redirect_uri: String,
+    /// The exact connection revision the login began through.
+    #[sqlx(flatten)]
+    pub connection: HumanConnectionBinding,
 }
 
 /// Insert a login-state row whose expiry `PostgreSQL` derives from `ttl`.
 ///
 /// The caller binds a lifetime, never an absolute instant, so the row's expiry
-/// and the consume predicate that evaluates it share one clock.
+/// and the consume predicate that evaluates it share one clock. The row also
+/// binds the exact connection id and revision the login began through, which
+/// the callback requires to still be Active when it issues the session.
 ///
 /// # Errors
 /// Returns a SQLx error when Postgres rejects the insert.
 pub async fn insert_login_state(
     conn: &mut TenantConn<'_>,
     state: &str,
-    code_verifier: &str,
-    nonce: &str,
-    issuer: &str,
-    redirect_uri: &str,
+    row: &LoginStateRow,
     ttl: Duration,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(INSERT_LOGIN_STATE_SQL)
         .bind(conn.data_tenant_id().as_uuid())
         .bind(state)
-        .bind(code_verifier)
-        .bind(nonce)
-        .bind(issuer)
-        .bind(redirect_uri)
+        .bind(&row.code_verifier)
+        .bind(&row.nonce)
+        .bind(&row.issuer)
+        .bind(&row.redirect_uri)
         .bind(ttl.as_secs_f64())
+        .bind(row.connection.connection_id)
+        .bind(row.connection.connection_revision)
         .execute(&mut **conn.transaction())
         .await?;
     Ok(())

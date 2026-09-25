@@ -40,7 +40,7 @@ use wyrd_sql::queries::auth::{
     workload_binding_by_subject,
 };
 use wyrd_sql::queries::platform::identity::PlatformOidcConnectionRow;
-use wyrd_sql::row_types::auth::TrustedIssuerRow;
+use wyrd_sql::row_types::auth::{HumanConnectionRow, TrustedIssuerRow};
 
 const CLIENT_AUTH_SECRET_BASIC: &str = "SecretBasic";
 const CLIENT_AUTH_SECRET_POST: &str = "SecretPost";
@@ -240,7 +240,8 @@ pub enum IssuerSealError {
     Serialize(#[from] serde_json::Error),
 }
 
-/// Failure decoding a [`TrustedIssuerRow`] back into a [`TrustedIssuer`].
+/// Failure decoding a [`TrustedIssuerRow`] or [`HumanConnectionRow`] back into
+/// a [`TrustedIssuer`].
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum IssuerDecodeError {
     #[error("stored issuer url is invalid: {0}")]
@@ -438,6 +439,51 @@ fn trusted_issuer_from_row(
         default_roles,
         principal_kind,
         jwks_ttl: Duration::from_secs(row.jwks_ttl_secs.max(0).unsigned_abs()),
+    })
+}
+
+/// Rebuild the trusted issuer human login verifies against from a tenant's
+/// Active human-connection row.
+///
+/// The sibling of [`trusted_issuer_from_row`] for the human connection table:
+/// the same secret, claim-mapping, and URL decode steps, except that the ID
+/// token audience is always the client id and no default roles exist, since a
+/// human's roles come only from the connection's group map.
+///
+/// # Errors
+/// Returns [`IssuerDecodeError`] when the issuer or JWKS URI is malformed or
+/// absent, a JSON column does not decode, or the client authentication cannot
+/// be reconstructed — including a sealed secret this process holds no key for.
+pub(crate) fn human_connection_trusted_issuer(
+    tenant: DataTenantId,
+    row: HumanConnectionRow,
+    sealing_key: Option<&SealingKeyring>,
+) -> Result<TrustedIssuer, IssuerDecodeError> {
+    let issuer = IssuerUrl::new(row.issuer_url)
+        .map_err(|error| IssuerDecodeError::IssuerUrl(error.to_string()))?;
+    let jwks_uri = row
+        .jwks_uri
+        .as_deref()
+        .ok_or_else(|| IssuerDecodeError::JwksUri("the connection has no jwks uri".to_owned()))?;
+    let jwks_uri =
+        Url::parse(jwks_uri).map_err(|error| IssuerDecodeError::JwksUri(error.to_string()))?;
+    let client_auth = client_auth_from_row(
+        &row.client_auth,
+        row.client_secret_enc.as_deref(),
+        sealing_key,
+    )?;
+    Ok(TrustedIssuer {
+        tenant_id: tenant,
+        issuer,
+        jwks_uri,
+        expected_audience: row.client_id.clone(),
+        client_id: row.client_id,
+        client_auth,
+        claim_mapping: claim_mapping_from_value(row.claim_mapping)?,
+        group_role_map: serde_json::from_value(row.group_role_map)?,
+        default_roles: Vec::new(),
+        principal_kind: IssuerTokenPolicy::Human,
+        jwks_ttl: Duration::from_secs(row.jwks_ttl_secs.max(1).unsigned_abs()),
     })
 }
 

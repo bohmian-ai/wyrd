@@ -22,18 +22,113 @@ use sqlx::types::Uuid;
 use crate::row_types::auth::HumanConnectionRow;
 use crate::{OperatorPool, SqlError, TenantConn};
 
-/// The full `HumanConnectionRow` projection, as a literal so every statement
-/// stays a `&'static str`.
-macro_rules! columns {
-    () => {
-        "connection_id, data_tenant_id, revision, state, issuer_url, client_id, \
-         client_auth, client_secret_enc, claim_mapping, group_role_map, jwks_ttl_secs, jwks_uri, \
-         tested_revision, tested_until, removed_at, created_at, updated_at"
-    };
-}
-
+/// Serializes every lifecycle mutation for the bound tenant; see
+/// [`lock_human_connection_slot`].
 const LOCK_SLOT_SQL: &str = "SELECT pg_advisory_xact_lock(hashtextextended(\
      'wyrd.auth_human_connections:' || wyrd.current_tenant()::text, 0))";
+
+/// Reads the tenant's live connections, newest revision first.
+const LIVE_SQL: &str = r#"
+    SELECT connection_id, data_tenant_id, revision, state, issuer_url, client_id,
+           client_auth, client_secret_enc, claim_mapping, group_role_map, jwks_ttl_secs,
+           jwks_uri, tested_revision, tested_until, removed_at, created_at, updated_at
+      FROM wyrd.auth_human_connections
+     WHERE removed_at IS NULL
+     ORDER BY revision DESC
+"#;
+
+/// Reads the tenant's one live connection in a state.
+const IN_STATE_SQL: &str = r#"
+    SELECT connection_id, data_tenant_id, revision, state, issuer_url, client_id,
+           client_auth, client_secret_enc, claim_mapping, group_role_map, jwks_ttl_secs,
+           jwks_uri, tested_revision, tested_until, removed_at, created_at, updated_at
+      FROM wyrd.auth_human_connections
+     WHERE state = $1 AND removed_at IS NULL
+"#;
+
+/// Inserts a candidate at one more than the tenant's highest revision ever.
+const INSERT_CANDIDATE_SQL: &str = r#"
+    INSERT INTO wyrd.auth_human_connections (
+        connection_id, data_tenant_id, revision, state, issuer_url, client_id,
+        client_auth, client_secret_enc, claim_mapping, group_role_map, jwks_ttl_secs)
+    VALUES ($1, $2,
+            (SELECT COALESCE(max(revision), 0) + 1 FROM wyrd.auth_human_connections),
+            'Candidate', $3, $4, $5, $6, $7, $8, $9)
+    RETURNING connection_id, data_tenant_id, revision, state, issuer_url, client_id,
+           client_auth, client_secret_enc, claim_mapping, group_role_map, jwks_ttl_secs,
+           jwks_uri, tested_revision, tested_until, removed_at, created_at, updated_at
+"#;
+
+/// Replaces the candidate in place at the next revision, clearing its test.
+const REPLACE_CANDIDATE_SQL: &str = r#"
+    UPDATE wyrd.auth_human_connections
+       SET revision = (SELECT max(revision) + 1 FROM wyrd.auth_human_connections),
+           issuer_url = $2, client_id = $3, client_auth = $4, client_secret_enc = $5,
+           claim_mapping = $6, group_role_map = $7, jwks_ttl_secs = $8,
+           jwks_uri = NULL, tested_revision = NULL, tested_until = NULL,
+           updated_at = statement_timestamp()
+     WHERE connection_id = $1 AND state = 'Candidate'
+    RETURNING connection_id, data_tenant_id, revision, state, issuer_url, client_id,
+           client_auth, client_secret_enc, claim_mapping, group_role_map, jwks_ttl_secs,
+           jwks_uri, tested_revision, tested_until, removed_at, created_at, updated_at
+"#;
+
+/// Stamps the exact candidate revision tested until a database-clock deadline.
+const STAMP_TESTED_SQL: &str = r#"
+    UPDATE wyrd.auth_human_connections
+       SET jwks_uri = $3, tested_revision = revision,
+           tested_until = statement_timestamp() + make_interval(secs => $4),
+           updated_at = statement_timestamp()
+     WHERE connection_id = $1 AND state = 'Candidate' AND revision = $2
+    RETURNING connection_id, data_tenant_id, revision, state, issuer_url, client_id,
+           client_auth, client_secret_enc, claim_mapping, group_role_map, jwks_ttl_secs,
+           jwks_uri, tested_revision, tested_until, removed_at, created_at, updated_at
+"#;
+
+/// Retires the Active connection to Inactive.
+const DEACTIVATE_ACTIVE_SQL: &str = r#"
+    UPDATE wyrd.auth_human_connections
+       SET state = 'Inactive', updated_at = statement_timestamp()
+     WHERE state = 'Active'
+    RETURNING connection_id
+"#;
+
+/// Promotes the candidate at a revision whose test stamp is still current.
+const PROMOTE_TESTED_SQL: &str = r#"
+    UPDATE wyrd.auth_human_connections
+       SET state = 'Active', updated_at = statement_timestamp()
+     WHERE state = 'Candidate' AND revision = $1
+       AND tested_revision = revision
+       AND tested_until > statement_timestamp()
+    RETURNING connection_id, data_tenant_id, revision, state, issuer_url, client_id,
+           client_auth, client_secret_enc, claim_mapping, group_role_map, jwks_ttl_secs,
+           jwks_uri, tested_revision, tested_until, removed_at, created_at, updated_at
+"#;
+
+/// Reports whether the candidate at a revision carries an unexpired stamp.
+const TEST_IS_CURRENT_SQL: &str = r#"
+    SELECT EXISTS (
+        SELECT 1 FROM wyrd.auth_human_connections
+         WHERE state = 'Candidate' AND revision = $1
+           AND tested_revision = revision
+           AND tested_until > statement_timestamp())
+"#;
+
+/// Reports whether one exact connection revision is the tenant's Active one.
+const IS_ACTIVE_SQL: &str = r#"
+    SELECT EXISTS (
+        SELECT 1 FROM wyrd.auth_human_connections
+         WHERE connection_id = $1 AND revision = $2
+           AND state = 'Active' AND removed_at IS NULL)
+"#;
+
+/// Tombstones one live connection and wipes its secret.
+const REMOVE_SQL: &str = r#"
+    UPDATE wyrd.auth_human_connections
+       SET state = 'Inactive', client_secret_enc = NULL,
+           removed_at = statement_timestamp(), updated_at = statement_timestamp()
+     WHERE connection_id = $1 AND removed_at IS NULL
+"#;
 
 /// Column values for a new or replaced candidate connection.
 ///
@@ -93,15 +188,10 @@ pub async fn lock_human_connection_slot(conn: &mut TenantConn<'_>) -> Result<(),
 pub async fn live_human_connections(
     conn: &mut TenantConn<'_>,
 ) -> Result<Vec<HumanConnectionRow>, SqlError> {
-    sqlx::query_as::<_, HumanConnectionRow>(concat!(
-        "SELECT ",
-        columns!(),
-        " FROM wyrd.auth_human_connections \
-          WHERE removed_at IS NULL ORDER BY revision DESC"
-    ))
-    .fetch_all(&mut **conn.transaction())
-    .await
-    .map_err(SqlError::from)
+    sqlx::query_as::<_, HumanConnectionRow>(LIVE_SQL)
+        .fetch_all(&mut **conn.transaction())
+        .await
+        .map_err(SqlError::from)
 }
 
 /// Read the tenant's connection in `state` (`Active` or `Candidate`).
@@ -114,16 +204,11 @@ pub async fn human_connection_in_state(
     conn: &mut TenantConn<'_>,
     state: &str,
 ) -> Result<Option<HumanConnectionRow>, SqlError> {
-    sqlx::query_as::<_, HumanConnectionRow>(concat!(
-        "SELECT ",
-        columns!(),
-        " FROM wyrd.auth_human_connections \
-          WHERE state = $1 AND removed_at IS NULL"
-    ))
-    .bind(state)
-    .fetch_optional(&mut **conn.transaction())
-    .await
-    .map_err(SqlError::from)
+    sqlx::query_as::<_, HumanConnectionRow>(IN_STATE_SQL)
+        .bind(state)
+        .fetch_optional(&mut **conn.transaction())
+        .await
+        .map_err(SqlError::from)
 }
 
 /// Insert a new candidate at the next tenant revision.
@@ -135,29 +220,19 @@ pub async fn insert_human_candidate(
     conn: &mut TenantConn<'_>,
     write: &HumanConnectionWrite,
 ) -> Result<HumanConnectionRow, SqlError> {
-    sqlx::query_as::<_, HumanConnectionRow>(concat!(
-        "INSERT INTO wyrd.auth_human_connections (
-             connection_id, data_tenant_id, revision, state, issuer_url, client_id,
-             client_auth, client_secret_enc, claim_mapping, group_role_map, jwks_ttl_secs)
-         VALUES ($1, $2,
-                 (SELECT COALESCE(max(revision), 0) + 1 FROM wyrd.auth_human_connections),
-                 'Candidate', $3, $4, $5, $6, $7, $8, $9)
-         RETURNING ",
-        columns!(),
-        ""
-    ))
-    .bind(Uuid::now_v7())
-    .bind(conn.data_tenant_id().as_uuid())
-    .bind(&write.issuer_url)
-    .bind(&write.client_id)
-    .bind(&write.client_auth)
-    .bind(write.client_secret_enc.as_deref())
-    .bind(&write.claim_mapping)
-    .bind(&write.group_role_map)
-    .bind(write.jwks_ttl_secs)
-    .fetch_one(&mut **conn.transaction())
-    .await
-    .map_err(SqlError::from)
+    sqlx::query_as::<_, HumanConnectionRow>(INSERT_CANDIDATE_SQL)
+        .bind(Uuid::now_v7())
+        .bind(conn.data_tenant_id().as_uuid())
+        .bind(&write.issuer_url)
+        .bind(&write.client_id)
+        .bind(&write.client_auth)
+        .bind(write.client_secret_enc.as_deref())
+        .bind(&write.claim_mapping)
+        .bind(&write.group_role_map)
+        .bind(write.jwks_ttl_secs)
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .map_err(SqlError::from)
 }
 
 /// Replace the existing candidate in place at the next tenant revision.
@@ -172,35 +247,25 @@ pub async fn replace_human_candidate(
     connection_id: Uuid,
     write: &HumanConnectionWrite,
 ) -> Result<Option<HumanConnectionRow>, SqlError> {
-    sqlx::query_as::<_, HumanConnectionRow>(concat!(
-        "UPDATE wyrd.auth_human_connections SET
-             revision = (SELECT max(revision) + 1 FROM wyrd.auth_human_connections),
-             issuer_url = $2, client_id = $3, client_auth = $4, client_secret_enc = $5,
-             claim_mapping = $6, group_role_map = $7, jwks_ttl_secs = $8,
-             jwks_uri = NULL, tested_revision = NULL, tested_until = NULL,
-             updated_at = statement_timestamp()
-          WHERE connection_id = $1 AND state = 'Candidate'
-         RETURNING ",
-        columns!(),
-        ""
-    ))
-    .bind(connection_id)
-    .bind(&write.issuer_url)
-    .bind(&write.client_id)
-    .bind(&write.client_auth)
-    .bind(write.client_secret_enc.as_deref())
-    .bind(&write.claim_mapping)
-    .bind(&write.group_role_map)
-    .bind(write.jwks_ttl_secs)
-    .fetch_optional(&mut **conn.transaction())
-    .await
-    .map_err(SqlError::from)
+    sqlx::query_as::<_, HumanConnectionRow>(REPLACE_CANDIDATE_SQL)
+        .bind(connection_id)
+        .bind(&write.issuer_url)
+        .bind(&write.client_id)
+        .bind(&write.client_auth)
+        .bind(write.client_secret_enc.as_deref())
+        .bind(&write.claim_mapping)
+        .bind(&write.group_role_map)
+        .bind(write.jwks_ttl_secs)
+        .fetch_optional(&mut **conn.transaction())
+        .await
+        .map_err(SqlError::from)
 }
 
-/// Stamp the exact candidate revision as tested for `validity`.
+/// Stamp the exact candidate revision as tested for `validity`, returning the
+/// stamped row.
 ///
 /// PostgreSQL derives `tested_until` from `statement_timestamp()`. Returns
-/// `false` when the candidate no longer exists at `revision` (it was replaced
+/// `None` when the candidate no longer exists at `revision` (it was replaced
 /// or activated while the network test ran), in which case nothing changes.
 ///
 /// # Errors
@@ -211,22 +276,15 @@ pub async fn stamp_human_candidate_tested(
     revision: i64,
     jwks_uri: &str,
     validity: Duration,
-) -> Result<bool, SqlError> {
-    sqlx::query(
-        "UPDATE wyrd.auth_human_connections SET
-             jwks_uri = $3, tested_revision = revision,
-             tested_until = statement_timestamp() + make_interval(secs => $4),
-             updated_at = statement_timestamp()
-          WHERE connection_id = $1 AND state = 'Candidate' AND revision = $2",
-    )
-    .bind(connection_id)
-    .bind(revision)
-    .bind(jwks_uri)
-    .bind(validity.as_secs_f64())
-    .execute(&mut **conn.transaction())
-    .await
-    .map(|result| result.rows_affected() == 1)
-    .map_err(SqlError::from)
+) -> Result<Option<HumanConnectionRow>, SqlError> {
+    sqlx::query_as::<_, HumanConnectionRow>(STAMP_TESTED_SQL)
+        .bind(connection_id)
+        .bind(revision)
+        .bind(jwks_uri)
+        .bind(validity.as_secs_f64())
+        .fetch_optional(&mut **conn.transaction())
+        .await
+        .map_err(SqlError::from)
 }
 
 /// Retire the current Active connection to Inactive, returning its id.
@@ -236,15 +294,10 @@ pub async fn stamp_human_candidate_tested(
 pub async fn deactivate_active_human_connection(
     conn: &mut TenantConn<'_>,
 ) -> Result<Option<Uuid>, SqlError> {
-    sqlx::query_scalar(
-        "UPDATE wyrd.auth_human_connections
-            SET state = 'Inactive', updated_at = statement_timestamp()
-          WHERE state = 'Active'
-         RETURNING connection_id",
-    )
-    .fetch_optional(&mut **conn.transaction())
-    .await
-    .map_err(SqlError::from)
+    sqlx::query_scalar(DEACTIVATE_ACTIVE_SQL)
+        .fetch_optional(&mut **conn.transaction())
+        .await
+        .map_err(SqlError::from)
 }
 
 /// Promote the candidate at `revision` to Active if its test stamp is current.
@@ -259,20 +312,11 @@ pub async fn promote_tested_human_candidate(
     conn: &mut TenantConn<'_>,
     revision: i64,
 ) -> Result<Option<HumanConnectionRow>, SqlError> {
-    sqlx::query_as::<_, HumanConnectionRow>(concat!(
-        "UPDATE wyrd.auth_human_connections
-            SET state = 'Active', updated_at = statement_timestamp()
-          WHERE state = 'Candidate' AND revision = $1
-            AND tested_revision = revision
-            AND tested_until > statement_timestamp()
-         RETURNING ",
-        columns!(),
-        ""
-    ))
-    .bind(revision)
-    .fetch_optional(&mut **conn.transaction())
-    .await
-    .map_err(SqlError::from)
+    sqlx::query_as::<_, HumanConnectionRow>(PROMOTE_TESTED_SQL)
+        .bind(revision)
+        .fetch_optional(&mut **conn.transaction())
+        .await
+        .map_err(SqlError::from)
 }
 
 /// Report whether the candidate at `revision` carries an unexpired test stamp.
@@ -283,45 +327,52 @@ pub async fn human_candidate_test_is_current(
     conn: &mut TenantConn<'_>,
     revision: i64,
 ) -> Result<bool, SqlError> {
-    sqlx::query_scalar(
-        "SELECT EXISTS (
-             SELECT 1 FROM wyrd.auth_human_connections
-              WHERE state = 'Candidate' AND revision = $1
-                AND tested_revision = revision
-                AND tested_until > statement_timestamp())",
-    )
-    .bind(revision)
-    .fetch_one(&mut **conn.transaction())
-    .await
-    .map_err(SqlError::from)
+    sqlx::query_scalar(TEST_IS_CURRENT_SQL)
+        .bind(revision)
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .map_err(SqlError::from)
+}
+
+/// Report whether the connection `connection_id` at exactly `revision` is the
+/// bound tenant's live Active connection.
+///
+/// Session issuance and refresh rotation call this under
+/// [`lock_human_connection_slot`], so a lifecycle change on any replica either
+/// commits before the check (and the session is refused) or waits for the
+/// issuing transaction to commit.
+///
+/// # Errors
+/// Returns [`SqlError`] when the query fails.
+pub async fn human_connection_is_active(
+    conn: &mut TenantConn<'_>,
+    connection_id: Uuid,
+    revision: i64,
+) -> Result<bool, SqlError> {
+    sqlx::query_scalar(IS_ACTIVE_SQL)
+        .bind(connection_id)
+        .bind(revision)
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .map_err(SqlError::from)
 }
 
 /// Tombstone one live connection: Inactive, secret wiped, `removed_at` set.
 ///
-/// Returns the state the connection had before removal, or `None` when no live
-/// connection has that id in the bound tenant.
+/// Returns `false` when no live connection has that id in the bound tenant.
 ///
 /// # Errors
 /// Returns [`SqlError`] when the update fails.
 pub async fn remove_human_connection(
     conn: &mut TenantConn<'_>,
     connection_id: Uuid,
-) -> Result<Option<String>, SqlError> {
-    sqlx::query_scalar(
-        "WITH previous AS (
-             SELECT connection_id, state FROM wyrd.auth_human_connections
-              WHERE connection_id = $1 AND removed_at IS NULL)
-         UPDATE wyrd.auth_human_connections AS current
-            SET state = 'Inactive', client_secret_enc = NULL,
-                removed_at = statement_timestamp(), updated_at = statement_timestamp()
-           FROM previous
-          WHERE current.connection_id = previous.connection_id
-         RETURNING previous.state",
-    )
-    .bind(connection_id)
-    .fetch_optional(&mut **conn.transaction())
-    .await
-    .map_err(SqlError::from)
+) -> Result<bool, SqlError> {
+    sqlx::query(REMOVE_SQL)
+        .bind(connection_id)
+        .execute(&mut **conn.transaction())
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(SqlError::from)
 }
 
 /// List every sealed secret in the tenant human-connection and workload-issuer
@@ -387,6 +438,7 @@ impl SealedSecretTable {
         }
     }
 
+    /// The operator statement listing every sealed secret in this table.
     fn select_sql(self) -> &'static str {
         match self {
             Self::HumanConnections => {
@@ -400,6 +452,7 @@ impl SealedSecretTable {
         }
     }
 
+    /// The operator compare-and-swap statement replacing one sealed secret.
     fn swap_sql(self) -> &'static str {
         match self {
             Self::HumanConnections => {

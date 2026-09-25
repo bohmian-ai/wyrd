@@ -49,3 +49,18 @@ pub struct HumanConnectionRow {
     /// Last mutation timestamp.
     pub updated_at: DateTime<Utc>,
 }
+
+/// The exact tenant human connection revision a human session belongs to.
+///
+/// Login state records it when a login begins; the first refresh row of the
+/// session copies it from login state and every rotation copies it forward.
+/// Issuing a session or a refresh successor requires this exact id and
+/// revision to still be the tenant's Active connection, so replacement,
+/// deactivation, or removal cuts the session off on every replica.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow)]
+pub struct HumanConnectionBinding {
+    /// Connection id; survives removal as a tombstone.
+    pub connection_id: Uuid,
+    /// The connection's revision when the login began.
+    pub connection_revision: i64,
+}

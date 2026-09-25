@@ -15,9 +15,50 @@ use vala_sql::ValaPostgres;
 use wyrd_spec::DataTenantId;
 use wyrd_sql::dsn::ResolvedDsns;
 use wyrd_sql::pool::build_pool;
+use wyrd_sql::row_types::auth::HumanConnectionBinding;
 use wyrd_sql::{OperatorPool, PoolConfig, SqlError, TenantConn, WyrdPostgres};
 
 static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Return the bound tenant's Active human connection binding, seeding a public
+/// Active connection when the tenant has none.
+///
+/// Every human session is bound to the exact connection revision it logged in
+/// through, and issuance refuses one whose connection is not Active. Tests
+/// that mint or rotate human sessions without driving a provider use this to
+/// give the session a real, Active connection to belong to.
+///
+/// # Errors
+/// Returns [`SqlError`] when the read or insert fails.
+pub async fn seed_active_human_connection(
+    conn: &mut TenantConn<'_>,
+) -> Result<HumanConnectionBinding, SqlError> {
+    sqlx::query_as::<_, HumanConnectionBinding>(
+        "WITH existing AS (
+             SELECT connection_id, revision AS connection_revision
+               FROM wyrd.auth_human_connections
+              WHERE state = 'Active' AND removed_at IS NULL),
+         inserted AS (
+             INSERT INTO wyrd.auth_human_connections (
+                 connection_id, data_tenant_id, revision, state, issuer_url, client_id,
+                 client_auth, claim_mapping, group_role_map, jwks_ttl_secs, jwks_uri)
+             SELECT $1, $2,
+                    (SELECT COALESCE(max(revision), 0) + 1 FROM wyrd.auth_human_connections),
+                    'Active', 'https://idp.fixture.test', 'wyrd-fixture', 'Public',
+                    '{\"subject\": \"sub\"}'::jsonb, '{}'::jsonb, 300,
+                    'https://idp.fixture.test/jwks'
+              WHERE NOT EXISTS (SELECT 1 FROM existing)
+             RETURNING connection_id, revision AS connection_revision)
+         SELECT connection_id, connection_revision FROM existing
+         UNION ALL
+         SELECT connection_id, connection_revision FROM inserted",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .bind(conn.data_tenant_id().as_uuid())
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)
+}
 
 /// Per-test Postgres fixture backed by a fixture-owned database.
 pub struct PgFixture {

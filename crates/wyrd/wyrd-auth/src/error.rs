@@ -4,6 +4,7 @@ use serde_json::json;
 use wyrd_auth_oidc::ScreenError;
 use wyrd_auth_verify::{AuthError, MAX_DELEGATION_DEPTH};
 use wyrd_spec::error::WyrdError;
+use wyrd_sql::SqlError;
 
 /// Convert an outbound address-screening refusal to the public catalog.
 ///
@@ -15,6 +16,21 @@ pub(crate) fn screen_error(error: &ScreenError) -> WyrdError {
     WyrdError::DiscoveryUnavailable {
         message: "identity provider could not be reached".to_owned(),
         details: json!({}),
+    }
+}
+
+/// Map an auth store failure to the fail-closed backend error, logging the
+/// cause server-side only.
+///
+/// Every auth workflow that reads or writes the tenant auth tables answers a
+/// store outage the same way: a retryable `503` that names no table, query, or
+/// driver detail.
+pub(crate) fn store_error(error: impl Into<SqlError>) -> WyrdError {
+    let error = error.into();
+    tracing::warn!(error = %error, "auth store unavailable");
+    WyrdError::AuthVerifyUnavailable {
+        message: "auth backend unavailable".to_owned(),
+        details: json!({ "retry_after_seconds": 1 }),
     }
 }
 

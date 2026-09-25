@@ -40,6 +40,8 @@ use vala_bifrost_redux::scribe::{
     ScribeBuildConfig, ScribeExecutionPools, ScribeImpl, ScribeIngressCpuPool,
     ScribePersistenceConfig, ScribePersistenceCpuPool, ScribeWalIoPool,
 };
+use wyrd_auth::connections::HumanConnections;
+use wyrd_auth::sealing::SealedSecretRewrap;
 use wyrd_auth_oidc::WorkloadBinding;
 use wyrd_crypt::{SealingKeyring, SecretKey};
 use wyrd_runtime::{Permission, PrincipalKind};
@@ -52,6 +54,7 @@ use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::api::{
     NodeId as ClusterNodeId, OracleCapabilitiesV1, QueryClass, ScribeCapabilitiesV1,
 };
+use wyrd_sql::OperatorPool;
 use wyrd_sql::postgres_boot::{BootError, PostgresBoot};
 use wyrd_storage::{StorageHandle, settings::from_env as load_storage_settings};
 
@@ -330,8 +333,9 @@ pub enum ServerBootError {
         message: String,
     },
     /// `WYRD_SEALING_KEY_FILE`/`WYRD_SEALING_KEY_BASE64` was set but did not
-    /// decode to a 32-byte AES-256-GCM key. Boot fails closed rather than
-    /// proceeding with an unusable sealing key.
+    /// decode to a 32-byte AES-256-GCM key, or no key is set while provider
+    /// ciphertext is stored. Boot fails closed rather than proceeding with an
+    /// unusable sealing key or secrets it could never open.
     #[error("WYRD_SEALING_KEY is invalid: {0}")]
     SealingKey(String),
     /// gRPC router assembly failed (e.g. missing token verifier).
@@ -1335,7 +1339,12 @@ pub async fn build_state(
         rollback_state_roles(&state).await;
         return Err(error);
     }
-    rewrap_sealed_secrets(&state, sealing_key.as_ref()).await;
+    if let Err(error) =
+        rewrap_sealed_secrets(state.postgres.operator_pool(), sealing_key.clone()).await
+    {
+        rollback_state_roles(&state).await;
+        return Err(error);
+    }
 
     // Install the real authz audit writer as the OSS default. Callers can
     // still replace the entire ServerAuthz (policy hook + writer) via overrides.
@@ -1496,20 +1505,48 @@ fn attach_config_fields(
         )))
 }
 
-/// Reseal every stored provider secret under the current sealing write key.
+/// Reseal every stored provider secret under the current sealing write key, or
+/// prove a keyless deployment stores none.
 ///
 /// This is the rewrap step of sealing-key rotation: with the new key configured
 /// as the write key and the old one retained, every boot converges stored
-/// ciphertext onto the write key, and the logged `remaining` count tells the
-/// operator when the old key may be retired. A failure is logged and left for
-/// the next boot: retained keys still open everything, so serving is unaffected.
-async fn rewrap_sealed_secrets(state: &AppState, keyring: Option<&Arc<SealingKeyring>>) {
-    let (Some(keyring), Some(operator)) = (keyring, state.postgres.operator_pool()) else {
-        return;
+/// ciphertext onto the write key, and the logged `remaining` count — from a
+/// pass that started after every writer moved to the new key — tells the
+/// operator when the old key may be retired. With a key, a failure is logged
+/// and left for the next boot: retained keys still open everything, so serving
+/// is unaffected. Without a key, the same pass counts every stored ciphertext
+/// as unopenable, and any count fails boot before readiness, because the
+/// server could never open those secrets. Production boot and the test
+/// harness both call this, so they behave identically. Skipped when no
+/// cross-tenant operator pool is configured, since nothing can be read.
+///
+/// # Errors
+/// Returns [`ServerBootError::SealingKey`] when no sealing key is configured
+/// and any provider ciphertext is stored, or the store cannot be read to
+/// prove there is none.
+pub async fn rewrap_sealed_secrets(
+    operator: Option<OperatorPool>,
+    keyring: Option<Arc<SealingKeyring>>,
+) -> Result<(), ServerBootError> {
+    let Some(operator) = operator else {
+        return Ok(());
     };
-    let rewrap = wyrd_auth::sealing::SealedSecretRewrap::new(operator, Arc::clone(keyring));
-    if let Err(error) = rewrap.run().await {
-        tracing::error!(error = %error, "sealed provider secret rewrap failed; retrying next boot");
+    let keyless = keyring.is_none();
+    match SealedSecretRewrap::new(operator, keyring).run().await {
+        Ok(report) if keyless && report.remaining > 0 => Err(ServerBootError::SealingKey(format!(
+            "{} stored provider client secret(s) exist but no sealing key is configured; \
+                 configure the key they were sealed under",
+            report.remaining
+        ))),
+        Ok(_) => Ok(()),
+        Err(error) if keyless => Err(ServerBootError::SealingKey(format!(
+            "stored provider client secrets could not be checked with no sealing key \
+             configured: {error}"
+        ))),
+        Err(error) => {
+            tracing::error!(error = %error, "sealed provider secret rewrap failed; retrying next boot");
+            Ok(())
+        }
     }
 }
 
@@ -1551,8 +1588,13 @@ async fn install_auth(
         external_verifier: Some(handles.external_verifier),
         trusted_issuer_resolver: Some(Arc::clone(&issuer_resolver)),
         workload_binding_resolver: Some(binding_resolver),
+        human_connections: Some(HumanConnections::new(
+            postgres.wyrd().clone(),
+            sealing_key.clone(),
+            config.deployment_profile.screened_http(),
+            config.auth.public_origin.as_ref(),
+        )),
         sealing_key: sealing_key.clone(),
-        public_origin: config.auth.public_origin.clone(),
         token_exchange_settings: wyrd_auth::issuance::TokenExchangeSettings::default(),
     })
 }

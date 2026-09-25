@@ -23,9 +23,10 @@ use wyrd_spec::auth::{
     HumanConnectionView, HumanConnectionsResponse,
 };
 use wyrd_spec::error::{WyrdError, WyrdProblem};
-use wyrd_spec::vala::api::{AuditEvent, AuditOutcome};
+use wyrd_spec::vala::api::AuditEvent;
 
 use crate::audit;
+use crate::auth::auth_not_configured;
 use crate::components::auth::Caller;
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
@@ -44,12 +45,16 @@ pub fn identity_router() -> OpenApiRouter<AppState> {
         .routes(routes!(remove_connection))
 }
 
-/// The deployment's connection owner for this request.
-fn connections(state: &AppState) -> HumanConnections {
-    state.auth.human_connections(
-        state.postgres.app_pool(),
-        state.deployment_profile.screened_http(),
-    )
+/// The deployment's connection owner, built once at boot.
+///
+/// # Errors
+/// Returns `AUTH_NOT_CONFIGURED` when the server was assembled without auth.
+fn connections(state: &AppState) -> Result<&HumanConnections, WyrdErrorResponse> {
+    state
+        .auth
+        .human_connections
+        .as_ref()
+        .ok_or_else(auth_not_configured)
 }
 
 /// Evaluate `identity_connections:write` for `operation`, recording a denial.
@@ -124,7 +129,7 @@ async fn list_connections(
     caller: Caller,
 ) -> Result<Json<HumanConnectionsResponse>, WyrdErrorResponse> {
     let decision = decide(&state, &caller, "identity.oidc.connections.list").await?;
-    connections(&state)
+    connections(&state)?
         .list(caller.data_tenant_id, &decision)
         .await
         .map(Json)
@@ -175,7 +180,7 @@ async fn put_candidate(
     Json(body): Json<Value>,
 ) -> Result<Json<HumanConnectionView>, WyrdErrorResponse> {
     let decision = decide(&state, &caller, "identity.oidc.candidate.put").await?;
-    let owner = connections(&state);
+    let owner = connections(&state)?;
     let staged = match ConnectionInput::from_json(body).and_then(|input| owner.stage(input)) {
         Ok(staged) => staged,
         Err(refusal) => return refuse_after_decision(&state, &caller, &decision, refusal).await,
@@ -191,16 +196,17 @@ async fn put_candidate(
 /// `expected_revision` against its provider and stamp it activatable for
 /// fifteen minutes.
 ///
-/// The allowed decision is committed before the screened provider IO starts;
-/// the stamp and a `identity.oidc.candidate.tested` decision then commit
-/// together.
+/// The allowed decision is committed before the screened provider IO starts.
+/// After every check passes, `identity_connections:write` is evaluated again
+/// as `identity.oidc.candidate.tested`; that decision and the stamp commit
+/// together, and a denial there stamps nothing.
 ///
 /// # Errors
-/// Returns `400` for a blocked provider address or no public origin, `403`
-/// without `identity_connections:write`, `409` for a stale revision
+/// Returns `400` when no public origin is configured, `403` without
+/// `identity_connections:write` at either evaluation, `409` for a stale revision
 /// (`CONNECTION_CONFLICT`) or a failed check (`CONNECTION_NOT_TESTED`), and
-/// `503` when the provider or store is unavailable or the decision cannot be
-/// audited.
+/// `503` when the provider is refused by address screening or unavailable, the
+/// store is unavailable, or a decision cannot be audited.
 #[utoipa::path(
     post,
     path = "/identity/oidc/candidate/test",
@@ -208,8 +214,8 @@ async fn put_candidate(
     responses(
         (status = 200, description = "The candidate passed every check and is activatable \
           until tested_until", body = ConnectionTestResponse),
-        (status = 400, description = "The provider resolves to a blocked address or no public \
-          origin is configured (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 400, description = "No public origin is configured \
+          (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
           WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
@@ -220,8 +226,9 @@ async fn put_candidate(
           (WYRD_AUTH_409_CONNECTION_NOT_TESTED)", body = WyrdProblem),
         (status = 500, description = "An unexpected server failure (WYRD_SPEC_500_INTERNAL)",
          body = WyrdProblem),
-        (status = 503, description = "The provider or store is unavailable, or the decision \
-          could not be audited (WYRD_AUTH_503_DISCOVERY_UNAVAILABLE, \
+        (status = 503, description = "The provider is refused by address screening or \
+          unavailable, the store is unavailable, or a decision could not be audited \
+          (WYRD_AUTH_503_DISCOVERY_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE, WYRD_AUDIT_503_UNAVAILABLE)",
          body = WyrdProblem)
     ),
@@ -237,15 +244,17 @@ async fn test_candidate(
     audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, &decision)
         .await
         .map_err(WyrdErrorResponse::from)?;
-    let stamp = audit::audit_event(
-        &caller,
-        "identity.oidc.candidate.tested",
-        RESOURCE,
-        &Permission::identity_connections_write().to_string(),
-        AuditOutcome::Allowed,
-    );
-    connections(&state)
-        .test_candidate(caller.data_tenant_id, request.expected_revision, &stamp)
+    let owner = connections(&state)?;
+    let tested = owner
+        .probe_candidate(caller.data_tenant_id, request.expected_revision)
+        .await
+        .map_err(WyrdErrorResponse::from)?;
+    // The probe ran for seconds without a lock; the caller's authority is
+    // evaluated again at the stamp so a grant withdrawn meanwhile stamps
+    // nothing.
+    let stamp = decide(&state, &caller, "identity.oidc.candidate.tested").await?;
+    owner
+        .stamp_candidate(caller.data_tenant_id, tested, &stamp)
         .await
         .map(|candidate| Json(ConnectionTestResponse { candidate }))
         .map_err(WyrdErrorResponse::from)
@@ -294,7 +303,7 @@ async fn activate_candidate(
     Json(request): Json<ConnectionActivate>,
 ) -> Result<Json<HumanConnectionView>, WyrdErrorResponse> {
     let decision = decide(&state, &caller, "identity.oidc.candidate.activate").await?;
-    connections(&state)
+    connections(&state)?
         .activate(caller.data_tenant_id, request, &decision)
         .await
         .map(Json)
@@ -334,7 +343,7 @@ async fn deactivate_active(
     caller: Caller,
 ) -> Result<StatusCode, WyrdErrorResponse> {
     let decision = decide(&state, &caller, "identity.oidc.active.deactivate").await?;
-    connections(&state)
+    connections(&state)?
         .deactivate(caller.data_tenant_id, &decision)
         .await
         .map(|_| StatusCode::NO_CONTENT)
@@ -376,7 +385,7 @@ async fn remove_connection(
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, WyrdErrorResponse> {
     let decision = decide(&state, &caller, "identity.oidc.connection.remove").await?;
-    connections(&state)
+    connections(&state)?
         .remove(caller.data_tenant_id, id, &decision)
         .await
         .map(|()| StatusCode::NO_CONTENT)

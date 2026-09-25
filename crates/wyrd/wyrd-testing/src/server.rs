@@ -43,6 +43,7 @@ use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
 use vala_sql::queries::oracle_reader_authority::OracleTableProtections;
 use vala_sql::row_types::oracle_reader_authority::{ProtectionRecord, TableAuthorityIdentity};
+use wyrd_auth::connections::HumanConnections;
 use wyrd_auth::exchange_api_key::ExchangeApiKey;
 use wyrd_auth::issuance::{TenantGrant, TenantTokenIssuer, TokenExchangeSettings};
 use wyrd_auth::issue_api_key::WyrdApiKey;
@@ -63,9 +64,9 @@ use wyrd_gateway::BuiltinEndpoints;
 use wyrd_runtime::PermissionSet;
 use wyrd_runtime::{Permission, PrincipalId, RbacCheck};
 use wyrd_semver::VersionBlock;
-use wyrd_server::boot::build_workload_bindings;
 use wyrd_server::boot::data_root::BifrostDataRoot;
 use wyrd_server::boot::issuer::{seed_trusted_issuers, seed_workload_bindings};
+use wyrd_server::boot::{build_workload_bindings, rewrap_sealed_secrets};
 use wyrd_server::components::auth::audit_writer::{AuthzAuditWriter, NoopAuthzAuditWriter};
 use wyrd_server::config::{
     BifrostRuntimeConfig, BifrostRuntimeRole, BifrostTarget, DeploymentProfile, ForgeRuntimeConfig,
@@ -495,7 +496,7 @@ pub struct WyrdTestServerBuilder {
     /// Provider-secret sealing keyring; `None` uses the deterministic test key.
     sealing_keyring: Option<Arc<SealingKeyring>>,
     /// Deployment public origin the human-connection callback URL derives from.
-    public_origin: Option<url::Url>,
+    public_origin: Option<Url>,
     forge_interval: Duration,
     /// Executor slots composed into the production Forge worker.
     wal_sync_delay: Duration,
@@ -3893,7 +3894,7 @@ impl WyrdTestServerBuilder {
     /// Configure the deployment public origin; the tenant human-connection
     /// callback URL is `{origin}/auth/callback`.
     #[must_use]
-    pub fn with_public_origin(mut self, origin: url::Url) -> Self {
+    pub fn with_public_origin(mut self, origin: Url) -> Self {
         self.public_origin = Some(origin);
         self
     }
@@ -4282,15 +4283,14 @@ impl WyrdTestServerBuilder {
             .sealing_keyring
             .clone()
             .unwrap_or_else(|| Arc::new(SealingKeyring::new(SecretKey::from_bytes([9_u8; 32]))));
-        if self.sealing_keyring.is_some() {
-            wyrd_auth::sealing::SealedSecretRewrap::new(
-                fixture.operator_pool().clone(),
-                Arc::clone(&sealing_key),
-            )
-            .run()
-            .await
-            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        }
+        // The same boot step production runs: always rewrap, logging (not
+        // failing on) a rewrap error while a key is configured.
+        rewrap_sealed_secrets(
+            Some(fixture.operator_pool().clone()),
+            Some(Arc::clone(&sealing_key)),
+        )
+        .await
+        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         seed_trusted_issuers(
             runtime_wyrd.app_pool(),
             tenant_id,
@@ -4337,6 +4337,12 @@ impl WyrdTestServerBuilder {
             TokenExchangeSettings::default()
         };
 
+        let human_connections = HumanConnections::new(
+            runtime_wyrd.clone(),
+            Some(Arc::clone(&sealing_key)),
+            DeploymentProfile::Development.screened_http(),
+            self.public_origin.as_ref(),
+        );
         let postgres = Arc::new(ServerPostgres::from_parts(runtime_wyrd, runtime_vala));
         let resource_roles = self
             .bifrost_roles
@@ -4645,7 +4651,7 @@ impl WyrdTestServerBuilder {
                 trusted_issuer_resolver: Some(issuer_resolver),
                 workload_binding_resolver: Some(binding_resolver),
                 sealing_key: Some(sealing_key),
-                public_origin: self.public_origin.clone(),
+                human_connections: Some(human_connections),
             })
             .with_gateway(test_gateway_config(
                 fixture.data_tenant_id(),

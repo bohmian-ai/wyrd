@@ -162,9 +162,11 @@ impl ObservationWindow {
     ///
     /// Selected observations are the `record_id`s carrying at least one of
     /// the configured `numeric` or `categorical` series in the window;
-    /// unrelated records never match. One is incomplete when it omits a
-    /// configured series or any of its configured values is invalid: a
-    /// numeric value that is null or non-finite, or a null category. Returns
+    /// unrelated records never match. One is incomplete unless it carries
+    /// exactly one row of each configured series: it omits or repeats a
+    /// series, or any of its configured values is invalid, a numeric value
+    /// that is null or non-finite or a null category. A repeated row would
+    /// otherwise give its feature more values than the observations. Returns
     /// one `(k, n, numeric_n, mean, sd)` row whose `n` is the incomplete count.
     ///
     /// # Errors
@@ -193,7 +195,7 @@ impl ObservationWindow {
         Ok(format!(
             "SELECT CAST(0 AS BIGINT) AS k, COUNT(*) AS n, {NO_MOMENTS} \
              FROM (SELECT record_id {} GROUP BY record_id \
-             HAVING COUNT(DISTINCT series) < {configured} \
+             HAVING COUNT(DISTINCT series) < {configured} OR COUNT(*) > {configured} \
              OR SUM(CASE WHEN {valid} THEN 0 ELSE 1 END) > 0)",
             self.rows_in(&format!("series IN ({all})"))
         ))
@@ -482,9 +484,10 @@ impl<'a> DistributionFold<'a> {
 
     /// Score the folded window, or `None` when it is not scorable.
     ///
-    /// An SPC target the scorer leaves wholly unscored, such as one ending in
-    /// a partial subgroup, is `None` as well, so it publishes the same
-    /// inconclusive result without details as an incomplete window.
+    /// A target the scorer leaves wholly unscored, such as a PSI feature
+    /// below the minimum sample or an SPC feature ending in a partial
+    /// subgroup, is `None` as well, so it publishes the same inconclusive
+    /// result without details as an incomplete window.
     ///
     /// # Errors
     /// Returns the PSI scorer's error for counts that do not fit the baseline.
@@ -492,20 +495,18 @@ impl<'a> DistributionFold<'a> {
         if self.incomplete > 0 || !self.scorable {
             return Ok(None);
         }
-        match self.method {
+        let report = match self.method {
             MethodFold::Psi {
                 baseline,
                 profile,
                 counts,
             } => {
                 let counts = baseline.features.keys().cloned().zip(counts).collect();
-                score_psi_counts(baseline, &counts, profile).map(Some)
+                score_psi_counts(baseline, &counts, profile)?
             }
-            MethodFold::Spc { scorer, .. } => {
-                let report = scorer.finish();
-                Ok((!report.features.is_empty()).then_some(report))
-            }
-        }
+            MethodFold::Spc { scorer, .. } => scorer.finish(),
+        };
+        Ok((!report.features.is_empty()).then_some(report))
     }
 }
 
@@ -577,7 +578,7 @@ pub fn fold_psi(batch: &RecordBatch, counts: &mut [u64]) -> Result<bool, String>
 /// refuses.
 pub fn fold_spc(
     batch: &RecordBatch,
-    feature: &wyrd_spec::ids::FeatureName,
+    feature: &FeatureName,
     scorer: &mut SpcScorer,
 ) -> Result<bool, String> {
     let (ns, numeric, means, sds) = (
@@ -1202,7 +1203,7 @@ mod tests {
     /// Panics when a fold outcome differs.
     #[test]
     fn spc_fold_feeds_subgroups_and_refuses_invalid_ones() {
-        let feature = wyrd_spec::ids::FeatureName::new("age").expect("feature");
+        let feature = FeatureName::new("age").expect("feature");
         let values = (0..40).map(|row| Some(f64::from(row % 3))).collect();
         let baseline = vala_drift::fit_spc_baseline(
             &batch(&[], &[("age", values)]),
@@ -1238,8 +1239,8 @@ mod tests {
 
     /// Completeness selects records carrying a configured series in the
     /// window, ignores unrelated records, and counts one incomplete for an
-    /// omitted feature, a null, NaN, or infinite numeric value, or a null
-    /// category.
+    /// omitted or repeated feature, a null, NaN, or infinite numeric value, or
+    /// a null category.
     #[tokio::test]
     async fn completeness_flags_omitted_and_invalid_features_only() {
         let uid = subject().to_string();
@@ -1278,6 +1279,16 @@ mod tests {
             (uid, "c", None, None, 0, 0, "r1"),
         ];
         assert_eq!(incomplete(&sql, &null_category).await, 1);
+        let repeated = vec![
+            (uid, "x", Some(1.0), Some("1"), 0, 0, "r1"),
+            (uid, "x", Some(2.0), Some("2"), 0, 0, "r1"),
+            (uid, "c", None, Some("a"), 0, 0, "r1"),
+        ];
+        assert_eq!(
+            incomplete(&sql, &repeated).await,
+            1,
+            "a repeated series row makes its record incomplete"
+        );
         assert!(window().incomplete(&[], &[]).is_err());
     }
 
@@ -1372,10 +1383,13 @@ mod tests {
     async fn one_statement_decides_completeness_and_scores_from_one_cut() {
         let uid = subject().to_string();
         let features = [
-            wyrd_spec::ids::FeatureName::new("x").expect("x"),
-            wyrd_spec::ids::FeatureName::new("y").expect("y"),
+            FeatureName::new("x").expect("x"),
+            FeatureName::new("y").expect("y"),
         ];
-        let records = ["r0", "r1", "r2", "r3"];
+        let names = (0..100)
+            .map(|record| format!("r{record}"))
+            .collect::<Vec<_>>();
+        let records = names.iter().map(String::as_str).collect::<Vec<_>>();
         let complete = observations(&uid, &records, 5.0);
         let seam = [(uid.as_str(), "x", Some(5.0), None, 9, 9, "late")];
         let null_only = [
@@ -1425,15 +1439,55 @@ mod tests {
         );
     }
 
+    /// 99 complete records plus one repeated `x` row would give drifting `x`
+    /// 100 values beside `y`'s 99. The repeat makes its record incomplete, so
+    /// the run is unscored rather than failing on `x` alone; without the
+    /// repeat the 99-record window is below PSI's minimum sample and unscored.
+    /// Adding a hundredth complete record scores and drifts.
+    ///
+    /// # Panics
+    /// Panics when a repeated row or short window scores, or a sufficient one
+    /// does not.
+    #[tokio::test]
+    async fn psi_repeated_series_row_cannot_manufacture_a_sample() {
+        let uid = subject().to_string();
+        let features = [
+            FeatureName::new("x").expect("x"),
+            FeatureName::new("y").expect("y"),
+        ];
+        let profile = PsiProfile {
+            binning_strategy: wyrd_spec::card::drift::PsiBinningStrategy::EqualWidth { n_bins: 5 },
+            categorical_features: Vec::new(),
+            threshold: wyrd_spec::card::drift::PsiThreshold::Fixed { value: 0.2 },
+        };
+        let psi = vala_drift::fit_psi_baseline(&fitting_batch(1000), &profile, &features)
+            .expect("PSI fits");
+        let sql = window().psi_statement(&psi).expect("PSI SQL");
+        let names = (0..100)
+            .map(|record| format!("r{record}"))
+            .collect::<Vec<_>>();
+        let records = names.iter().map(String::as_str).collect::<Vec<_>>();
+        let fold = || DistributionFold::psi(&psi, &profile);
+
+        let mut rows = observations(&uid, &records[..99], 5.0);
+        assert_eq!(decide(&sql, &rows, fold()).await, None, "99 records");
+        rows.push((&uid, "x", Some(5.0), None, 0, 0, "r0"));
+        assert_eq!(decide(&sql, &rows, fold()).await, None, "a repeated row");
+
+        let sufficient = observations(&uid, &records, 5.0);
+        let scored = decide(&sql, &sufficient, fold()).await.expect("scores");
+        assert_eq!(scored.verdict, vala_drift::DriftVerdict::Drift);
+    }
+
     /// A duplicated historical `x` row gives `x` complete signaled subgroups
-    /// while `y` ends in a partial one. Every record is complete, yet the run
-    /// is unscored rather than failing on `x`'s signal.
+    /// while `y` ends in a partial one. The run is unscored rather than
+    /// failing on `x`'s signal.
     #[tokio::test]
     async fn spc_signal_beside_a_partial_feature_is_unscored() {
         let uid = subject().to_string();
         let features = [
-            wyrd_spec::ids::FeatureName::new("x").expect("x"),
-            wyrd_spec::ids::FeatureName::new("y").expect("y"),
+            FeatureName::new("x").expect("x"),
+            FeatureName::new("y").expect("y"),
         ];
         let spc = vala_drift::fit_spc_baseline(
             &fitting_batch(40),

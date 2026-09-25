@@ -1,7 +1,7 @@
 ---
 id: TASK-007
 kind: implementation
-status: ready
+status: approved
 spec: SPEC-verified-change-contract
 spec_revision: 36
 requirements: [REQ-097, REQ-098, REQ-099, REQ-138, REQ-139, REQ-140, REQ-141, REQ-142, REQ-143, REQ-145, REQ-146, REQ-147, REQ-148, REQ-149, REQ-150, REQ-152, INV-006, INV-007, INV-011, INV-013, INV-015, AC-029, AC-030, AC-031, AC-033]

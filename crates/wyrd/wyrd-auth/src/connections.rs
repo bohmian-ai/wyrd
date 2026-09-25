@@ -37,10 +37,10 @@ use wyrd_runtime::Permission;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
     ClaimMappingPayload, ConnectionActivate, ConnectionInput, HumanClientAuth,
-    HumanConnectionState, HumanConnectionView, HumanConnectionsResponse, IssuerUrl,
+    HumanConnectionState, HumanConnectionView, HumanConnectionsResponse, IssuerUrl, PrincipalId,
 };
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::vala::api::AuditEvent;
+use wyrd_spec::vala::api::{AuditEvent, AuditOutcome};
 use wyrd_sql::queries::auth::{
     HumanConnectionWrite, deactivate_active_human_connection, human_candidate_test_is_current,
     human_connection_in_state, insert_human_candidate, list_service_account_roles,
@@ -50,7 +50,7 @@ use wyrd_sql::queries::auth::{
 use wyrd_sql::row_types::auth::{HumanConnectionBinding, HumanConnectionRow};
 use wyrd_sql::{TenantConn, WyrdPostgres};
 
-use crate::audit::append_auth_audit;
+use crate::audit::{append_auth_audit, principal_kind_tag};
 use crate::callback::{DiscoveryFailure, authorization_code_request, discover_provider};
 use crate::error::{provider_unreachable, screen_error, store_error};
 use crate::exchange_api_key::{ExchangeError, role_refs, verify_api_key};
@@ -443,11 +443,18 @@ impl HumanConnections {
     /// retired and the candidate promoted, in the same transaction; sessions
     /// bound to the retired revision stop renewing once it commits.
     ///
+    /// Two decisions are audited on that transaction: the bearer caller's
+    /// `decision`, appended when the lock is taken, and — whenever the
+    /// recovery key resolves to an active principal — that principal's own
+    /// Allowed or Denied decision on `identity_connections:write`, appended
+    /// before promotion or the committed refusal.
+    ///
     /// # Errors
     /// Returns [`WyrdError::ConnectionConflict`] for a missing or stale
     /// candidate or an invalid recovery key, [`WyrdError::ConnectionNotTested`]
-    /// when the stamp is missing or expired, and the audit/store errors of
-    /// [`Self::list`].
+    /// when the stamp is missing or expired, [`WyrdError::AuditUnavailable`]
+    /// when either decision cannot be appended — leaving the Active and
+    /// Candidate unchanged — and the store errors of [`Self::list`].
     pub async fn activate(
         &self,
         tenant: DataTenantId,
@@ -472,7 +479,7 @@ impl HumanConnections {
         {
             return commit_refusal(conn, not_tested("the candidate has no current test")).await;
         }
-        if !recovery_key_authorizes(&mut conn, &recovery_key).await? {
+        if !recovery_key_authorizes(&mut conn, &recovery_key, decision).await? {
             return commit_refusal(
                 conn,
                 conflict(
@@ -915,20 +922,30 @@ fn client_auth_rejected() -> WyrdError {
     )
 }
 
-/// Verify a recovery API key against this tenant, constant-cost on refusal.
+/// Verify a recovery API key against this tenant, constant-cost on refusal,
+/// and audit the recovery principal's permission decision.
 ///
 /// Reuses the API-key exchange's verification, so the key must parse, name
 /// this tenant, and match a live key row by Argon2 with every refusal still
 /// running one verification; the owning principal must then be active and
 /// hold permissions covering `identity_connections:write`.
 ///
+/// A key that resolves to an active principal reaches a real permission
+/// decision, so one Allowed or Denied event attributed to that principal and
+/// its verified credential id is appended on `conn`, sharing `bearer`'s
+/// request, operation, and resource. Malformed, unknown, cross-tenant,
+/// mismatched, and inactive keys resolve no decision and append nothing, so
+/// their refusals stay indistinguishable.
+///
 /// # Errors
 /// Returns [`WyrdError::AuthVerifyUnavailable`] when a store read fails,
-/// [`WyrdError::RoleCorrupt`] when a stored role document does not decode, and
+/// [`WyrdError::RoleCorrupt`] when a stored role document does not decode,
+/// [`WyrdError::AuditUnavailable`] when the decision cannot be appended, and
 /// [`WyrdError::Internal`] when verification cannot run.
 async fn recovery_key_authorizes(
     conn: &mut TenantConn<'_>,
     presented: &SecretString,
+    bearer: &AuditEvent,
 ) -> Result<bool, WyrdError> {
     let row = match verify_api_key(conn, presented).await {
         Ok(row) => row,
@@ -948,7 +965,27 @@ async fn recovery_key_authorizes(
     let permissions = resolve_permissions(conn, &roles)
         .await
         .map_err(WyrdError::from)?;
-    Ok(permissions.contains(&Permission::identity_connections_write()))
+    let required = Permission::identity_connections_write();
+    let allowed = permissions.contains(&required);
+    let recovery = AuditEvent {
+        request_id: bearer.request_id.clone(),
+        trace_id: bearer.trace_id.clone(),
+        operation: bearer.operation.clone(),
+        resource: bearer.resource.clone(),
+        card_ref: row.card_ref.map(|card_ref| card_ref.0),
+        principal_id: PrincipalId::new(row.principal_id),
+        principal_kind: principal_kind_tag(&row.principal_kind),
+        credential_id: Some(row.api_key_id),
+        permission: required.to_string(),
+        outcome: if allowed {
+            AuditOutcome::Allowed
+        } else {
+            AuditOutcome::Denied
+        },
+        detail: None,
+    };
+    append_auth_audit(conn, &recovery).await?;
+    Ok(allowed)
 }
 
 /// Commit the already-appended decision alone, then return `refusal`.

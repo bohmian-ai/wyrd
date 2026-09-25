@@ -1809,11 +1809,11 @@ async fn tenant_connection_admin_journey() {
 ///      before any connection, and a stale `expected_revision` conflicts;
 ///   2. a candidate with a wrong secret fails its test as
 ///      `client_auth_rejected` and cannot be activated;
-///   3. the fixed candidate's stamp lasts fifteen minutes, a recovery key
-///      without `identity_connections:write` is refused, and an injected
-///      audit failure rolls activation back;
-///   4. two concurrent activations of the same revision yield exactly one
-///      winner;
+///   3. the fixed candidate's stamp lasts fifteen minutes, a malformed
+///      recovery key and one without `identity_connections:write` are
+///      refused, and an injected audit failure rolls activation back;
+///   4. two concurrent activations of the same revision, recovered by a
+///      principal distinct from the bearer caller, yield exactly one winner;
 ///   5. replica B boots with K2 as the write key and K1 retained, rewraps the
 ///      stored secret under K2, and both replicas still sign alice in;
 ///   6. A, still sealing with K1, stages a late secret after B's pass; A,
@@ -1822,8 +1822,13 @@ async fn tenant_connection_admin_journey() {
 ///      leaves every stored secret current under K2, and a replica holding
 ///      only K2 then signs alice in;
 ///   7. from then on only K2 writers serve: a same-issuer secret rotation
-///      staged and activated on B is served by the K2-only replica at once,
-///      and deactivation on B stops login there.
+///      staged on B survives a failed append of the recovery principal's
+///      decision with the Active and Candidate unchanged, is then activated
+///      and served by the K2-only replica at once, and deactivation on B
+///      stops login there;
+///   8. the canonical audit staging attributes each recovery decision to its
+///      principal and verified credential: Denied for the underprivileged key, Allowed for
+///      each successful activation, and nothing for the malformed key.
 ///
 /// # Panics
 /// Panics when any step deviates from the contract above.
@@ -1984,6 +1989,28 @@ async fn tenant_connection_rotation_journey() {
         .bootstrap_service_in_tenant(tenant, "rotation-runtime-admin", &["runtime_admin"])
         .await
         .expect("runtime admin bootstraps");
+    let recovery_admin = replica_a
+        .bootstrap_service_in_tenant(tenant, "rotation-recovery-admin", &["admin"])
+        .await
+        .expect("recovery admin bootstraps");
+    let recovery_key = recovery_admin
+        .api_key()
+        .expect("recovery admin has a key")
+        .clone();
+    let (status, body) = call_json(
+        &replica_a,
+        token,
+        Method::POST,
+        CANDIDATE_ACTIVATE,
+        Some(activation(3, &SecretString::from("not-a-wyrd-api-key"))),
+    )
+    .await;
+    assert_refused(
+        status,
+        &body,
+        StatusCode::CONFLICT,
+        "WYRD_AUTH_409_CONNECTION_CONFLICT",
+    );
     let (status, body) = call_json(
         &replica_a,
         token,
@@ -2067,14 +2094,14 @@ async fn tenant_connection_rotation_journey() {
         token,
         Method::POST,
         CANDIDATE_ACTIVATE,
-        Some(activation(3, &admin.api_key)),
+        Some(activation(3, &recovery_key)),
     );
     let second = call_json(
         &replica_a,
         token,
         Method::POST,
         CANDIDATE_ACTIVATE,
-        Some(activation(3, &admin.api_key)),
+        Some(activation(3, &recovery_key)),
     );
     let ((first_status, first_body), (second_status, second_body)) = tokio::join!(first, second);
     let mut statuses = [first_status, second_status];
@@ -2219,16 +2246,97 @@ async fn tenant_connection_rotation_journey() {
     )
     .await;
 
-    // 7. A same-issuer secret rotation on B is served by the K2-only replica
+    // 7. A same-issuer secret rotation on B survives a failed recovery
+    //    decision append unchanged, then is served by the K2-only replica
     //    without restart.
-    let rotated = activate_keycloak_connection(
+    let (_, before) = call_json(&replica_b, token, Method::GET, CONNECTIONS, None).await;
+    let (status, staged) = call_json(
         &replica_b,
-        &admin,
-        CONFIDENTIAL_HUMAN_CLIENT,
-        "SecretPost",
-        Some(CONFIDENTIAL_HUMAN_SECRET),
+        token,
+        Method::PUT,
+        CANDIDATE,
+        Some(connection_input(
+            CONFIDENTIAL_HUMAN_CLIENT,
+            "SecretPost",
+            Some(CONFIDENTIAL_HUMAN_SECRET),
+            before["candidate"]["revision"].as_u64(),
+        )),
     )
     .await;
+    assert_eq!(status, StatusCode::OK, "B stages the rotation: {staged}");
+    let revision = staged["revision"].as_u64().expect("candidate revision");
+    let (status, tested) = call_json(
+        &replica_b,
+        token,
+        Method::POST,
+        CANDIDATE_TEST,
+        Some(serde_json::json!({ "expected_revision": revision })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the rotation tests: {tested}");
+    let recovery_id = recovery_admin.id().as_uuid();
+    // `recovery_id` is a UUID, so interpolating it cannot inject SQL.
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        r#"CREATE OR REPLACE FUNCTION vala.test_fail_recovery_decision_audit()
+           RETURNS trigger LANGUAGE plpgsql AS $$
+           BEGIN
+             IF NEW.operation = 'identity.oidc.candidate.activate'
+                AND NEW.principal_id = '{recovery_id}'::uuid THEN
+               RAISE EXCEPTION 'injected recovery decision audit failure';
+             END IF;
+             RETURN NEW;
+           END;
+           $$;"#
+    )))
+    .execute(&superuser)
+    .await
+    .expect("recovery failure function installs");
+    sqlx::query(
+        r#"CREATE TRIGGER test_fail_recovery_decision_audit
+           BEFORE INSERT ON vala.audit_staging
+           FOR EACH ROW EXECUTE FUNCTION vala.test_fail_recovery_decision_audit()"#,
+    )
+    .execute(&superuser)
+    .await
+    .expect("recovery failure trigger installs");
+    let (status, body) = call_json(
+        &replica_b,
+        token,
+        Method::POST,
+        CANDIDATE_ACTIVATE,
+        Some(activation(revision, &recovery_key)),
+    )
+    .await;
+    assert!(
+        status.is_server_error(),
+        "activation without a durable recovery decision fails closed: {status} {body}"
+    );
+    sqlx::query("DROP TRIGGER test_fail_recovery_decision_audit ON vala.audit_staging")
+        .execute(&superuser)
+        .await
+        .expect("recovery failure trigger drops");
+    let (_, after) = call_json(&replica_b, token, Method::GET, CONNECTIONS, None).await;
+    assert_eq!(
+        after["active"]["id"], before["active"]["id"],
+        "the Active was not retired: {after}"
+    );
+    assert_eq!(
+        after["active"]["revision"], before["active"]["revision"],
+        "{after}"
+    );
+    assert_eq!(
+        after["candidate"]["revision"], revision,
+        "the Candidate was not promoted: {after}"
+    );
+    let (status, rotated) = call_json(
+        &replica_b,
+        token,
+        Method::POST,
+        CANDIDATE_ACTIVATE,
+        Some(activation(revision, &recovery_key)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the rotation activates: {rotated}");
     let (_, listed) = call_json(&replica_k2, token, Method::GET, CONNECTIONS, None).await;
     assert_eq!(
         listed["active"]["id"], rotated["id"],
@@ -2257,11 +2365,80 @@ async fn tenant_connection_rotation_journey() {
         "WYRD_AUTH_401_INVALID_TOKEN",
     );
 
+    // 8. Each recovery decision is staged on the canonical audit path,
+    //    attributed to the recovery principal and its verified credential;
+    //    the malformed key left none. In-process replicas run no publisher,
+    //    so every committed decision is still in staging.
+    let recovery_decisions = sqlx::query_as::<_, (String, Option<String>, String, String)>(
+        "SELECT principal_id::text, credential_id::text, permission, outcome \
+         FROM vala.audit_staging \
+         WHERE data_tenant_id = $1 AND operation = 'identity.oidc.candidate.activate' \
+         ORDER BY seq",
+    )
+    .bind(tenant.as_uuid())
+    .fetch_all(&superuser)
+    .await
+    .expect("staged activation decisions read");
+    let admin_id = principal_id_of(token);
+    let runtime_id = runtime_admin.id().as_uuid().to_string();
+    let recovery_id = recovery_id.to_string();
+    let decisions_of = |principal: &str| -> Vec<(Option<String>, String, String)> {
+        recovery_decisions
+            .iter()
+            .filter(|(id, ..)| id == principal)
+            .map(|(_, credential, permission, outcome)| {
+                (credential.clone(), permission.clone(), outcome.clone())
+            })
+            .collect()
+    };
+    let write = "identity_connections:write".to_owned();
+    assert_eq!(
+        decisions_of(&runtime_id),
+        vec![(
+            Some(api_key_id(&superuser, &runtime_admin).await),
+            write.clone(),
+            "denied".to_owned()
+        )],
+        "the underprivileged recovery key is audited as Denied: {recovery_decisions:?}"
+    );
+    let allowed = (
+        Some(api_key_id(&superuser, &recovery_admin).await),
+        write,
+        "allowed".to_owned(),
+    );
+    assert_eq!(
+        decisions_of(&recovery_id),
+        vec![allowed.clone(), allowed],
+        "each successful activation audits its recovery principal once: \
+         {recovery_decisions:?}"
+    );
+    assert!(
+        recovery_decisions
+            .iter()
+            .all(|(id, ..)| [&admin_id, &runtime_id, &recovery_id].contains(&id)),
+        "no decision is attributed to an unresolved key: {recovery_decisions:?}"
+    );
+
     replica_k2
         .shutdown()
         .await
         .expect("K2-only replica shuts down");
     replica_b.shutdown().await.expect("replica B shuts down");
+}
+
+/// Read the id of `principal`'s one API key — the credential id its
+/// verified recovery decisions are attributed to — as superuser.
+///
+/// # Panics
+/// Panics when the read fails or the principal has no single key.
+async fn api_key_id(superuser: &sqlx::PgPool, principal: &Bootstrap) -> String {
+    sqlx::query_scalar::<_, String>(
+        "SELECT id::text FROM wyrd.auth_api_keys WHERE principal_id = $1",
+    )
+    .bind(principal.id().as_uuid())
+    .fetch_one(superuser)
+    .await
+    .expect("the principal's key id reads")
 }
 
 /// Count the refresh rows ever issued to `principal_id`, read as superuser so

@@ -3051,6 +3051,56 @@ mod tests {
         .expect("fixture schema fingerprint")
     }
 
+    /// Writes `rows` as one staged Parquet run under `directory`.
+    ///
+    /// # Panics
+    /// Panics when the fixture cannot write its own run.
+    fn write_staged_run(
+        directory: &std::path::Path,
+        schema: Arc<Schema>,
+        rows: &RecordBatch,
+    ) -> std::path::PathBuf {
+        let run = directory.join("run-0.parquet");
+        let mut writer = parquet::arrow::ArrowWriter::try_new(
+            std::fs::File::create(&run).expect("staged run file"),
+            schema,
+            None,
+        )
+        .expect("staged run writer");
+        writer.write(rows).expect("staged run rows");
+        writer.close().expect("staged run footer");
+        run
+    }
+
+    /// Returns every `value` a live-tail fetch yields, sorted, so duplicates
+    /// across sources stay visible.
+    ///
+    /// # Panics
+    /// Panics when the fetch fails or the first column is not `Int64`.
+    async fn hot_values(
+        service: &FetchLiveTailService,
+        request: super::FetchLiveTailRequest,
+    ) -> Vec<i64> {
+        let mut values = service
+            .fetch_hot_batches(request)
+            .await
+            .expect("hot snapshot")
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .rows
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("Int64 value column")
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        values.sort_unstable();
+        values
+    }
+
     /// A generation whose staged runs are already registered is read once.
     ///
     /// Staging advances a generation's registry authority to its staged runs
@@ -3117,15 +3167,7 @@ mod tests {
         };
 
         let directory = tempfile::tempdir().expect("staged run directory");
-        let run = directory.path().join("run-0.parquet");
-        let mut writer = parquet::arrow::ArrowWriter::try_new(
-            std::fs::File::create(&run).expect("staged run file"),
-            schema,
-            None,
-        )
-        .expect("staged run writer");
-        writer.write(&rows).expect("staged run rows");
-        writer.close().expect("staged run footer");
+        let run = write_staged_run(directory.path(), schema, &rows);
         let member = StagedMemberId::new(0, generation.get());
         registry
             .advance(
@@ -3144,35 +3186,17 @@ mod tests {
             .with_hot_sources(registry);
         let binding =
             super::TenantTableBinding::resolve((tenant, table)).expect("fixture binding resolves");
-        let read = || async {
-            let mut values = service
-                .fetch_hot_batches(super::FetchLiveTailRequest {
-                    binding: binding.clone(),
-                    target_stream: stream,
-                    start_partition: day,
-                    end_partition: day,
-                    required_columns: vec!["value".to_owned()],
-                    predicates: Vec::new(),
-                    max_batches: 64,
-                    max_retained_bytes: 64 * 1024 * 1024,
-                })
-                .await
-                .expect("hot snapshot")
-                .iter()
-                .flat_map(|batch| {
-                    batch
-                        .rows
-                        .column(0)
-                        .as_any()
-                        .downcast_ref::<Int64Array>()
-                        .expect("Int64 value column")
-                        .values()
-                        .to_vec()
-                })
-                .collect::<Vec<_>>();
-            values.sort_unstable();
-            values
+        let request = super::FetchLiveTailRequest {
+            binding,
+            target_stream: stream,
+            start_partition: day,
+            end_partition: day,
+            required_columns: vec!["value".to_owned()],
+            predicates: Vec::new(),
+            max_batches: 64,
+            max_retained_bytes: 64 * 1024 * 1024,
         };
+        let read = || hot_values(&service, request.clone());
 
         assert_eq!(read().await, vec![1, 2, 3], "staged but not yet durable");
         memtable

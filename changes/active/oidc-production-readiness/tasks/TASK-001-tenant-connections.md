@@ -212,3 +212,29 @@ Stop for a second trust authority, different callback contract, weaker SSRF cont
 ## Authority Links
 
 [Approved spec](../spec.md); [AGENTS.md](../../../../AGENTS.md); [agent rules](../../../../architecture/agent-rules.md); [security posture](../../../../architecture/wyrd-security-posture.md).
+
+## Implementation Evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| REQ-001: OIDC optional per tenant; no IdP or OIDC env needed without a connection | `wyrd-server` boot/config treat public origin and sealing key as optional; `HumanConnections::active_trusted_issuer` returns none when no Active row | `mise run test:identity:journey` (22/22, all servers start connectionless), `mise run test:platform:journey` (38/38) | PASS |
+| REQ-002: at most one Active per tenant; same issuer isolated across tenants | migration `20260925000000_auth_human_connections.sql` (RLS, one-Active/one-Candidate partial unique indexes); `wyrd-auth/src/connections.rs` slot lock | `tenant_connection_admin_journey` steps 2-3 (two tenants, same Keycloak issuer, B cannot reach A); `tenant_connection_rotation_journey` step 4 (concurrent activation, one winner); `mise run check:tenant-isolation` | PASS |
+| REQ-003: authorized create, redacted inspect, test, replace/rotate, activate, deactivate, remove over headless API; no restart | `wyrd-server/src/components/admin/identity.rs` (six `/v1/identity/oidc/*` routes, `identity_connections:write`); login/callback read Active per request | admin journey steps 1, 4, 6 (service_accounts:write refused and audited, Human TOML/admin/CLI writers refused, Workload writes kept, deactivate stops login, delete tombstones); rotation journey step 6 (replica A serves B's rotation without restart) | PASS |
+| REQ-004: exact callback from public origin; discovery/issuer validated; audience = client_id; `private_key_jwt` refused | `ServerAuth.public_origin` → `callback_url`; `test_candidate` screened discovery + client-auth probe; `wyrd-spec/src/auth/human_connection.rs` `ConnectionInput::from_json` | admin journey asserts `callback_url`; rotation journey step 1-2 (unsafe discovery fails closed, wrong secret fails probe); `cargo nextest run -p wyrd-spec --lib -E 'test(/^auth::human_connection::/)'` (4/4, `PrivateKeyJwt` refused with `WYRD_AUTH_400_UNSUPPORTED_CLIENT_AUTH`; unit-only because it is a pure input check with no cross-boundary state); `identity_connection_operations_publish_their_contract` (enum excludes `PrivateKeyJwt`) | PASS |
+| REQ-005: secret sealed at rest, absent from reads/errors/audit/generated artifacts; sealing key rotatable | `wyrd-crypt` `SealingKeyring` (write + retained keys), `wyrd-auth/src/sealing.rs` `SealedSecretRewrap` on boot; docs `self-hosting/authentication.svx` rotation runbook | admin journey (no secret in GET, sealed ciphertext differs, audit text lacks secret); rotation journey step 5 (K1→K2 boot rewrap, K2-only keyring opens without rewrap); OpenAPI test asserts no `secret` property on `HumanConnectionView`; `mise run codegen:check` | PASS |
+| REQ-017: redacted canonical audit for mutations; audit failure cannot establish a connection | handlers record decisions through `crate::audit` before IO; owner commits in the decision transaction | admin journey reads retained `identity.oidc.*` audit (allowed and denied); rotation journey step 3 (injected `vala.audit_staging` failure on activate → 503, candidate still Candidate) | PASS |
+| Migration preflight (a)/(b)/(c) | migration preflight block with `Repair:` messages | `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise exec -- cargo nextest run --locked -p wyrd-sql --test pg_migration -E 'test(=pg_tests::human_connection_upgrade_preflight)'"`; `mise run test:sql` | PASS |
+| Focused journey selection fails on zero matches | `mise.toml` `test:identity:journey:inner` `WYRD_IDENTITY_TARGET`/`WYRD_IDENTITY_FILTER` count check | `mise exec -- env WYRD_IDENTITY_TARGET=server WYRD_IDENTITY_FILTER=tenant_connection_admin_journey mise run test:identity:journey` and `..._rotation_journey` (exit 0) | PASS |
+| Served OpenAPI contract | `openapi.rs` Identity tag, utoipa route registrations | `mise run test:principals:integration` (`pg_openapi_contract` 18/18) | PASS |
+
+Verification commands (all exit 0): both focused journeys; `mise run test:identity:journey`;
+`mise run test:principals:integration`; `mise run test:sql`; `mise run test:platform:journey`;
+the focused `human_connection_upgrade_preflight`; `wyrd-auth --lib`, `wyrd-server --lib`
+(auth/admin/config/boot), `wyrd-cli --lib` trusted_issuer, `wyrd-crypt`, `wyrd-spec`
+human_connection under the test Postgres wrapper; `mise run codegen:check`;
+`mise run check:tenant-isolation`; `mise run docs:check`; `mise run fmt`; `mise run lints`;
+`git diff --check`.
+
+Non-goals kept out: no UI (TASK-003), no login redirect-URI or renewal changes (TASK-002),
+no `private_key_jwt`, no second trust store. Journeys run replicas in-process over one
+shared Postgres rather than a deployed multi-pod topology.

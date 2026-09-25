@@ -4093,10 +4093,11 @@ mod tests {
             body: &[u8],
             _now: DateTime<Utc>,
         ) -> Result<AuthorizedStage, PeerSecurityError> {
-            let claims = <super::super::peer::StageTicketClaims as wyrd_tonic::prost::Message>::decode(
-                ticket.claims_bytes.as_slice(),
-            )
-            .map_err(|_| PeerSecurityError::Claims)?;
+            let claims =
+                <super::super::peer::StageTicketClaims as wyrd_tonic::prost::Message>::decode(
+                    ticket.claims_bytes.as_slice(),
+                )
+                .map_err(|_| PeerSecurityError::Claims)?;
             let digest = super::super::peer::stage_body_digest(body)?;
             claims.verify_binding(binding, &digest)?;
             Ok(AuthorizedStage {

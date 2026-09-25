@@ -19,8 +19,6 @@ use arrow::record_batch::RecordBatch;
 
 use crate::tables::TableError;
 use crate::tables::fields::{self, CanonicalField, CanonicalType};
-use wyrd_tonic::prost::Message;
-use wyrd_tonic::prost::encoding::{WireType, encode_key};
 use std::str::FromStr;
 use std::sync::Arc;
 use wyrd_spec::reference::{CardRef, CardRefScope};
@@ -31,6 +29,8 @@ use wyrd_tonic::otlp::common::v1::{
     AnyValue, EntityRef, InstrumentationScope, KeyValue, KeyValueList,
 };
 use wyrd_tonic::otlp::resource::v1::Resource;
+use wyrd_tonic::prost::Message;
+use wyrd_tonic::prost::encoding::{WireType, encode_key};
 
 /// Protobuf field number of `KeyValueList.values`.
 ///

@@ -14,8 +14,8 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
-use wyrd_tonic::prost::Message;
 use sha2::{Digest as _, Sha256};
+use wyrd_tonic::prost::Message;
 
 /// Version of the private Oracle physical extension envelope.
 pub const ORACLE_PHYSICAL_CODEC_VERSION: u32 = 1;

@@ -19,14 +19,14 @@
 use std::time::Duration;
 
 use reqwest::{Client, Response};
-use secrecy::ExposeSecret;
+use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
 use url::Url;
 use wiremock::{MockServer, Request};
 use wyrd_runtime::Permission;
 use wyrd_spec::auth::GatewayAccess;
 use wyrd_testing::Bootstrap;
-use wyrd_testing::server::WyrdTestServer;
+use wyrd_testing::server::{WyrdTestServer, WyrdTestServerBuilder};
 
 /// Anthropic Messages stream with usage in `message_start` and `message_delta`.
 pub(crate) const ANTHROPIC_EVENTS: &str = concat!(
@@ -82,6 +82,9 @@ pub(crate) struct Journey {
     pub(crate) caller: String,
     /// Access token of a principal without gateway permissions.
     pub(crate) reader: String,
+    /// Durable API keys of the admin, caller, and reader, in that order,
+    /// re-exchanged for fresh access tokens when the server restarts.
+    api_keys: [SecretString; 3],
 }
 
 impl Journey {
@@ -94,15 +97,9 @@ impl Journey {
     /// Panics when startup, role seeding, bootstrap, or token exchange fails.
     pub(crate) async fn start() -> Self {
         let upstream = MockServer::start().await;
-        let root = Url::parse(&upstream.uri()).expect("mock url");
-        let server = Box::pin(
-            WyrdTestServer::builder()
-                .with_gateway_provider_root_for_test(root)
-                .start_bound(),
-        )
-        .await
-        .expect("test server starts");
-        let base = server.base_url().expect("bound url").to_owned();
+        let server = Box::pin(Self::builder(&upstream).start_bound())
+            .await
+            .expect("test server starts");
         let invoke: Vec<Permission> = INVOKED_PROVIDERS
             .iter()
             .map(|provider| {
@@ -115,9 +112,50 @@ impl Journey {
             .seed_role(INVOKER_ROLE, &invoke)
             .await
             .expect("invoker role seeds");
-        let admin = token(&server, "native_admin", &["admin"]).await;
-        let caller = token(&server, "native_caller", &[INVOKER_ROLE]).await;
-        let reader = token(&server, "native_reader", &["reader"]).await;
+        let api_keys = [
+            api_key(&server, "native_admin", &["admin"]).await,
+            api_key(&server, "native_caller", &[INVOKER_ROLE]).await,
+            api_key(&server, "native_reader", &["reader"]).await,
+        ];
+        Self::connect(server, upstream, api_keys).await
+    }
+
+    /// Restarts the server over the same Postgres and storage, as a process
+    /// restart does, and re-exchanges the durable API keys for access tokens
+    /// signed by the restarted process.
+    ///
+    /// # Panics
+    /// Panics when shutdown, restart, or token exchange fails.
+    pub(crate) async fn restart(self) -> Self {
+        let server = Box::pin(self.server.restart_bound(Self::builder(&self.upstream)))
+            .await
+            .expect("test server restarts");
+        Self::connect(server, self.upstream, self.api_keys).await
+    }
+
+    /// Server builder whose built-in adapters target `upstream`.
+    ///
+    /// # Panics
+    /// Panics when the mock URL does not parse.
+    fn builder(upstream: &MockServer) -> WyrdTestServerBuilder {
+        let root = Url::parse(&upstream.uri()).expect("mock url");
+        WyrdTestServer::builder().with_gateway_provider_root_for_test(root)
+    }
+
+    /// Assembles a journey over a started `server`, exchanging each API key
+    /// for an access token.
+    ///
+    /// # Panics
+    /// Panics when the server is unbound or an exchange fails.
+    async fn connect(
+        server: WyrdTestServer,
+        upstream: MockServer,
+        api_keys: [SecretString; 3],
+    ) -> Self {
+        let base = server.base_url().expect("bound url").to_owned();
+        let admin = exchange(&server, &api_keys[0]).await;
+        let caller = exchange(&server, &api_keys[1]).await;
+        let reader = exchange(&server, &api_keys[2]).await;
         Self {
             server,
             upstream,
@@ -126,6 +164,7 @@ impl Journey {
             admin,
             caller,
             reader,
+            api_keys,
         }
     }
 
@@ -299,6 +338,15 @@ impl Journey {
 /// # Panics
 /// Panics when bootstrap returns a user or token exchange fails.
 pub(crate) async fn token(server: &WyrdTestServer, name: &str, roles: &[&str]) -> String {
+    exchange(server, &api_key(server, name, roles).await).await
+}
+
+/// Bootstraps a service principal holding `roles` and returns its durable API
+/// key.
+///
+/// # Panics
+/// Panics when bootstrap fails or returns a user.
+async fn api_key(server: &WyrdTestServer, name: &str, roles: &[&str]) -> SecretString {
     let Bootstrap::Machine { api_key, .. } = server
         .bootstrap_service(name, roles)
         .await
@@ -306,12 +354,18 @@ pub(crate) async fn token(server: &WyrdTestServer, name: &str, roles: &[&str]) -
     else {
         panic!("service bootstrap returned a user principal");
     };
+    SecretString::from(api_key.expose_secret().to_owned())
+}
+
+/// Exchanges `key` for an access token signed by `server`.
+///
+/// # Panics
+/// Panics when the exchange fails.
+async fn exchange(server: &WyrdTestServer, key: &SecretString) -> String {
     server
-        .exchange_api_key(&secrecy::SecretString::from(
-            api_key.expose_secret().to_owned(),
-        ))
+        .exchange_api_key(key)
         .await
-        .unwrap_or_else(|error| panic!("{name} api key exchanges: {error}"))
+        .unwrap_or_else(|error| panic!("api key exchanges: {error}"))
 }
 
 /// Token usage list the ledger records.

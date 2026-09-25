@@ -784,6 +784,44 @@ impl WyrdTestServer {
         Ok(())
     }
 
+    /// Shut this server down, then boot `builder` as a fresh bound server over
+    /// the same Postgres fixture and artifact storage.
+    ///
+    /// This is what a process restart looks like to durable state: every
+    /// committed row — principals, API keys, role grants, gateway
+    /// configuration, and sealed managed-secret envelopes — survives, while
+    /// in-memory state, the token-signing key, sockets, and the Bifrost data
+    /// root are rebuilt. The fixture, storage, and Bifrost peer credential are
+    /// retained across the shutdown so dropping the old server does not
+    /// release the database and the durable peer principal is reused.
+    /// Previously minted access tokens are signed by the old process's key, so
+    /// callers exchange their API keys again against the restarted server.
+    ///
+    /// # Errors
+    /// Returns an error when the old server fails to shut down or the
+    /// replacement fails to start or bind.
+    pub async fn restart_bound(
+        self,
+        mut builder: WyrdTestServerBuilder,
+    ) -> Result<WyrdTestServer, WyrdTestServerError> {
+        let fixture = Arc::clone(&self.inner.fixture);
+        let storage = Arc::clone(&self.inner.state.storage);
+        let storage_root = self.inner._storage_root.clone();
+        let peer_credentials = Arc::clone(&self.peer_credentials);
+        self.shutdown().await?;
+        // The peer principal is durable, so the replacement admits the one
+        // the database already holds instead of provisioning a duplicate.
+        builder = builder.with_oracle_peer_credentials(peer_credentials);
+        if builder.bind_addrs.is_none() {
+            builder.bind_addrs = Some((reserve_loopback_addr()?, reserve_loopback_addr()?));
+        }
+        builder
+            .start_with_resources(fixture, storage, storage_root)
+            .await?
+            .bind()
+            .await
+    }
+
     /// Cancel the serve task, join it in place, and return its drain outcome.
     ///
     /// Unlike [`shutdown`](Self::shutdown) and

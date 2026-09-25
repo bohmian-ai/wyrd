@@ -2,12 +2,17 @@
 //!
 //! The official-client matrix over every built-in provider lives in the Python
 //! journeys; these cover what an SDK cannot observe from the outside: how a
-//! truncated provider stream terminates on the wire, and that a Scribe outage
-//! which stops capture publication never changes a caller's answer.
+//! truncated provider stream terminates on the wire, that a Scribe outage
+//! which stops capture publication never changes a caller's answer, and that a
+//! managed provider secret keeps working across rotation and server restart.
 
 use serde_json::{Value, json};
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, ResponseTemplate};
+
+use secrecy::{ExposeSecret, SecretString};
+use wyrd_spec::ids::DataTenantId;
+use wyrd_testing::Bootstrap;
 
 use crate::harness::{Journey, PROVIDER_KEY, assert_provider_credentials, openai_code, tokens};
 
@@ -193,4 +198,197 @@ async fn openai_compatible_streams_terminate_and_survive_a_capture_outage() {
         4,
         "the refusal reaches no provider"
     );
+}
+
+/// Provider key the administrator rotates the managed credential to.
+const ROTATED_KEY: &str = "sk-rotated-upstream";
+
+/// Proves the tenant-setup path of a managed provider secret as one user
+/// journey through a real server that restarts twice.
+///
+/// A tenant administrator submits a managed key and configures a deployment;
+/// redacted reads never reveal it. An ordinary caller invokes and the upstream
+/// receives only the submitted key. A principal without gateway permission
+/// cannot read or write the credential, and an administrator of another
+/// tenant neither sees it nor reaches the upstream through it. The committed
+/// envelope survives a restart; the administrator then rotates the key, and
+/// the rotated value alone reaches the upstream before and after a second
+/// restart.
+///
+/// # Panics
+///
+/// Panics when a status, redacted view, upstream credential, or isolation
+/// expectation fails.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn managed_secret_rotation_survives_server_restart() {
+    let journey = Journey::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(completion()))
+        .mount(&journey.upstream)
+        .await;
+    journey
+        .deploy("openai", "authorization", "gpt-4o", &["chat_completions"])
+        .await;
+    let credential = "provider-credentials/openai-key";
+
+    let view = get(&journey, credential, &journey.admin).await;
+    assert_eq!(view.status().as_u16(), 200);
+    let view = view.text().await.expect("redacted view");
+    assert!(view.contains("managed_secret"), "{view}");
+    assert!(!view.contains(PROVIDER_KEY), "the view is redacted: {view}");
+
+    let denied_read = get(&journey, credential, &journey.reader).await;
+    assert_eq!(denied_read.status().as_u16(), 403);
+    let denied_write = journey
+        .http
+        .put(format!("{}/v1/admin/gateway/{credential}", journey.base))
+        .header("x-wyrd-access-token", format!("Bearer {}", journey.reader))
+        .json(&managed("openai-key", "sk-reader-key"))
+        .send()
+        .await
+        .expect("request sends");
+    assert_eq!(denied_write.status().as_u16(), 403);
+
+    let other_tenant = journey
+        .server
+        .seed_tenant("gateway-other")
+        .await
+        .expect("second tenant seeds");
+    let outsider = outsider_token(&journey, other_tenant).await;
+    let hidden = get(&journey, credential, &outsider).await;
+    assert_eq!(
+        hidden.status().as_u16(),
+        404,
+        "another tenant never sees the credential"
+    );
+    let foreign = journey
+        .post(
+            "/v1/chat/completions",
+            &[("authorization", format!("Bearer {outsider}"))],
+            &chat(false, "hi"),
+        )
+        .await;
+    assert!(
+        foreign.status().is_client_error(),
+        "another tenant cannot invoke through this tenant's deployment: {}",
+        foreign.status()
+    );
+
+    invoke(&journey).await;
+    let journey = journey.restart().await;
+    invoke(&journey).await;
+    assert_upstream_keys(&journey, &[PROVIDER_KEY; 2]).await;
+
+    journey
+        .put(credential, managed("openai-key", ROTATED_KEY))
+        .await;
+    let rotated = get(&journey, credential, &journey.admin)
+        .await
+        .text()
+        .await
+        .expect("redacted view");
+    assert!(
+        !rotated.contains(ROTATED_KEY) && !rotated.contains(PROVIDER_KEY),
+        "the rotated view stays redacted: {rotated}"
+    );
+    invoke(&journey).await;
+    let journey = journey.restart().await;
+    invoke(&journey).await;
+    assert_upstream_keys(
+        &journey,
+        &[PROVIDER_KEY, PROVIDER_KEY, ROTATED_KEY, ROTATED_KEY],
+    )
+    .await;
+}
+
+/// Managed-secret credential document for `name` holding `secret`.
+fn managed(name: &str, secret: &str) -> Value {
+    json!({
+        "name": name,
+        "provider": "openai",
+        "source": {"managed_secret": {"secret": secret}},
+    })
+}
+
+/// Reads one administration resource at `route` as `bearer`.
+///
+/// # Panics
+/// Panics when the request cannot be sent.
+async fn get(journey: &Journey, route: &str, bearer: &str) -> reqwest::Response {
+    journey
+        .http
+        .get(format!("{}/v1/admin/gateway/{route}", journey.base))
+        .header("x-wyrd-access-token", format!("Bearer {bearer}"))
+        .send()
+        .await
+        .expect("request sends")
+}
+
+/// Access token of a full administrator of `tenant`, a tenant other than the
+/// journey's.
+///
+/// # Panics
+/// Panics when bootstrap or exchange fails.
+async fn outsider_token(journey: &Journey, tenant: DataTenantId) -> String {
+    let Bootstrap::Machine { api_key, .. } = journey
+        .server
+        .bootstrap_service_in_tenant(tenant, "gateway_outsider", &["admin"])
+        .await
+        .expect("outsider bootstraps")
+    else {
+        panic!("service bootstrap returned a user principal");
+    };
+    journey
+        .server
+        .exchange_api_key(&SecretString::from(api_key.expose_secret().to_owned()))
+        .await
+        .expect("outsider exchanges")
+}
+
+/// Invokes one non-streaming chat completion as the caller and asserts the
+/// relayed answer.
+///
+/// # Panics
+/// Panics when the call is refused or the answer differs.
+async fn invoke(journey: &Journey) {
+    let answer = journey
+        .post(
+            "/v1/chat/completions",
+            &[("authorization", format!("Bearer {}", journey.caller))],
+            &chat(false, "hi"),
+        )
+        .await;
+    assert_eq!(answer.status().as_u16(), 200);
+    assert_eq!(answer.json::<Value>().await.expect("answer"), completion());
+}
+
+/// Asserts the upstream received exactly `keys` as bearer credentials, in
+/// order, and never the caller's token.
+///
+/// # Panics
+/// Panics when the dispatched credentials differ.
+async fn assert_upstream_keys(journey: &Journey, keys: &[&str]) {
+    let calls = journey.upstream_calls().await;
+    let seen: Vec<String> = calls
+        .iter()
+        .map(|call| {
+            call.headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect();
+    let expected: Vec<String> = keys.iter().map(|key| format!("Bearer {key}")).collect();
+    assert_eq!(seen, expected);
+    for (call, key) in calls.iter().zip(keys) {
+        assert_provider_credentials(
+            std::slice::from_ref(call),
+            "authorization",
+            &format!("Bearer {key}"),
+            &journey.caller,
+        );
+    }
 }

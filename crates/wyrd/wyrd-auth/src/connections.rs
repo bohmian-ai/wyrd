@@ -968,10 +968,6 @@ async fn recovery_key_authorizes(
     let required = Permission::identity_connections_write();
     let allowed = permissions.contains(&required);
     let recovery = AuditEvent {
-        request_id: bearer.request_id.clone(),
-        trace_id: bearer.trace_id.clone(),
-        operation: bearer.operation.clone(),
-        resource: bearer.resource.clone(),
         card_ref: row.card_ref.map(|card_ref| card_ref.0),
         principal_id: PrincipalId::new(row.principal_id),
         principal_kind: principal_kind_tag(&row.principal_kind),
@@ -983,6 +979,7 @@ async fn recovery_key_authorizes(
             AuditOutcome::Denied
         },
         detail: None,
+        ..bearer.clone()
     };
     append_auth_audit(conn, &recovery).await?;
     Ok(allowed)

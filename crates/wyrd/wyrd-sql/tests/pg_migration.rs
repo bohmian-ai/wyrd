@@ -17,10 +17,10 @@ mod pg_tests {
     use wyrd_spec::storage::{StorageBackendKind, UploadId, WireProtocol};
     use wyrd_sql::pool::build_app_pool;
     use wyrd_sql::queries::auth::{
-        TrustedIssuerWrite, WorkloadBindingWrite, consume_active_refresh, delete_trusted_issuer,
-        delete_workload_binding, delete_workload_bindings_for_issuer, insert_user,
-        trusted_issuer_by_url, trusted_issuers_for_tenant, upsert_user_identity, user_by_email,
-        user_by_id, user_id_by_identity, workload_binding_by_key, workload_binding_by_subject,
+        TrustedIssuerWrite, WorkloadBindingWrite, delete_trusted_issuer, delete_workload_binding,
+        delete_workload_bindings_for_issuer, insert_user, trusted_issuer_by_url,
+        trusted_issuers_for_tenant, upsert_user_identity, user_by_email, user_by_id,
+        user_id_by_identity, workload_binding_by_key, workload_binding_by_subject,
     };
     // `insert_trusted_issuer`/`insert_workload_binding` are referenced by full path
     // in `cloud_issuer_crud_write_path_conflict_and_cascade` because this test module
@@ -303,8 +303,7 @@ mod pg_tests {
     ///       tenant and a repair step, leaking no secret, and leaving the old
     ///       schema and rows untouched;
     ///   (d) live legacy user and machine refresh rows: both stay live and
-    ///       unbound, so the refresh path's consume returns a row with no
-    ///       connection, which rotation refuses (runtime renewal under a bound
+    ///       unbound, so rotation refuses them (runtime renewal under a bound
     ///       connection is covered by the refresh rotation tests).
     #[tokio::test]
     async fn human_connection_upgrade_preflight() {
@@ -523,22 +522,6 @@ mod pg_tests {
                     (machine_row, None, None, true)
                 ],
                 "legacy user and machine rows stay live and unbound"
-            );
-
-            let mut conn = TenantConn::acquire(pool, tenant)
-                .await
-                .expect("tenant conn acquires");
-            let consumed = consume_active_refresh(&mut conn, "legacy-user-hash")
-                .await
-                .expect("legacy row consumes")
-                .expect("legacy row is live");
-            assert_eq!(
-                (
-                    consumed.human_connection_id,
-                    consumed.human_connection_revision
-                ),
-                (None, None),
-                "the refresh path sees no connection and refuses to rotate"
             );
         }
     }

@@ -5406,16 +5406,17 @@ provider = "anthropic"
         }
     }
 
-    /// The signing-key file loads only from a bounded, owner-only regular
-    /// file, and no refusal quotes key material.
+    /// The signing-key file loads through [`read_secret_file`], and its
+    /// refusal quotes no key material.
     ///
     /// The PEM mints every access token, so it shares the sealing keys'
-    /// [`read_secret_file`] rule: permissive, non-regular, and oversized
-    /// mounts are refused as [`ConfigError::ReadSigningKey`].
+    /// owner-only rule; that reader's full refusal matrix is proven by the
+    /// sealing-key test, so this proves only the wiring: an owner-only file
+    /// loads and a permissive one is refused as [`ConfigError::ReadSigningKey`].
     ///
     /// # Panics
-    /// Panics when a key file cannot be written, when an owner-only file is
-    /// refused, or when a refused file is accepted, refused with another
+    /// Panics when a key file cannot be written, when the owner-only file is
+    /// refused, or when the permissive file is accepted, refused with another
     /// error, or refused with text containing the key.
     #[test]
     fn the_signing_key_file_requires_a_restrictive_regular_bounded_file() {
@@ -5427,8 +5428,6 @@ provider = "anthropic"
         write_key_file(&owner_only, PEM, 0o600);
         let permissive = directory.path().join("permissive.pem");
         write_key_file(&permissive, PEM, 0o644);
-        let oversized = directory.path().join("oversized.pem");
-        write_key_file(&oversized, &PEM.repeat(2048), 0o600);
 
         temp_env::with_vars(
             [
@@ -5444,30 +5443,24 @@ provider = "anthropic"
             },
         );
 
-        for (case, path) in [
-            ("permissive", permissive.as_path()),
-            ("non-regular", directory.path()),
-            ("oversized", oversized.as_path()),
-        ] {
-            temp_env::with_vars(
-                [
-                    ("WYRD_SIGNING_KEY_FILE", Some(path.as_os_str())),
-                    ("WYRD_SIGNING_KEY_PEM", None),
-                ],
-                || {
-                    let error = load_signing_key().expect_err(case);
-                    let message = error.to_string();
-                    assert!(
-                        matches!(error, ConfigError::ReadSigningKey { .. }),
-                        "{case} refusal is a signing-key read error: {message}"
-                    );
-                    assert!(
-                        !message.contains("signing-key-body"),
-                        "{case} refusal quotes key material: {message}"
-                    );
-                },
-            );
-        }
+        temp_env::with_vars(
+            [
+                ("WYRD_SIGNING_KEY_FILE", Some(permissive.as_os_str())),
+                ("WYRD_SIGNING_KEY_PEM", None),
+            ],
+            || {
+                let error = load_signing_key().expect_err("permissive file is refused");
+                let message = error.to_string();
+                assert!(
+                    matches!(error, ConfigError::ReadSigningKey { .. }),
+                    "refusal is a signing-key read error: {message}"
+                );
+                assert!(
+                    !message.contains("signing-key-body"),
+                    "refusal quotes key material: {message}"
+                );
+            },
+        );
     }
 
     /// Active and retained sealing-key files load only from bounded,

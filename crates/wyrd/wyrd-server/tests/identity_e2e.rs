@@ -777,6 +777,7 @@ const PUBLIC_HUMAN_CLIENT: &str = "wyrd-human";
 /// The confidential Keycloak client the rotation journey authenticates to
 /// with `SecretPost`, and its fixture secret.
 const CONFIDENTIAL_HUMAN_CLIENT: &str = "wyrd-human-confidential";
+/// The fixture secret Keycloak registers for [`CONFIDENTIAL_HUMAN_CLIENT`].
 const CONFIDENTIAL_HUMAN_SECRET: &str = "wyrd-human-confidential-secret";
 
 /// A server builder with the deployment public origin every human journey
@@ -794,7 +795,9 @@ fn admins_write() -> HashMap<String, Vec<String>> {
 
 /// A tenant administrator's access token and its recovery API key.
 struct TenantAdmin {
+    /// Bearer access token presented on every connection administration call.
     token: String,
+    /// The admin's own API key; activation presents it as the recovery key.
     api_key: SecretString,
 }
 
@@ -931,9 +934,13 @@ fn activation(revision: u64, recovery_key: &SecretString) -> Value {
 
 /// Tenant connection administration routes.
 const CONNECTIONS: &str = "/v1/identity/oidc/connections";
+/// Stage or replace the tenant's Candidate connection.
 const CANDIDATE: &str = "/v1/identity/oidc/candidate";
+/// Probe the Candidate and stamp it Tested on success.
 const CANDIDATE_TEST: &str = "/v1/identity/oidc/candidate/test";
+/// Promote the Tested Candidate to Active.
 const CANDIDATE_ACTIVATE: &str = "/v1/identity/oidc/candidate/activate";
+/// Deactivate the tenant's Active connection.
 const ACTIVE_DEACTIVATE: &str = "/v1/identity/oidc/active/deactivate";
 
 /// Start a human journey server whose fixture tenant has an Active public
@@ -1834,8 +1841,8 @@ async fn tenant_connection_rotation_journey() {
     assert_refused(
         status,
         &body,
-        StatusCode::BAD_REQUEST,
-        "WYRD_SPEC_400_VALIDATION",
+        StatusCode::SERVICE_UNAVAILABLE,
+        "WYRD_AUTH_503_DISCOVERY_UNAVAILABLE",
     );
     let (status, body) = call_json(
         &replica_a,

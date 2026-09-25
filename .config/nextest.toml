@@ -79,3 +79,15 @@ fail-fast = false
 [[profile.journey.overrides]]
 filter = 'test(=sustained::scribe_sustained_ingest_oracle_hot_read_journey)'
 threads-required = 'num-test-threads'
+
+# Every Bifrost process cluster gives its pods the canonical public, gRPC, and
+# peer ports on distinct loopback addresses starting at 127.0.0.2, as a real
+# deployment does. Two clusters alive together therefore bind the same sockets
+# and the second fails with `Address already in use`. One cluster at a time
+# keeps pod-like addressing without sharing sockets between tests.
+[test-groups.process-clusters]
+max-threads = 1
+
+[[profile.journey.overrides]]
+filter = 'package(wyrd-testing) and binary(oracle) and test(/^(analytical_activation|peer_network|mcp)::/)'
+test-group = 'process-clusters'

@@ -17,6 +17,7 @@ pub mod dev;
 pub mod drift;
 pub mod eval;
 pub mod fields;
+pub mod gateway;
 pub mod logs;
 pub mod managed_columns;
 pub mod metrics;
@@ -27,6 +28,7 @@ pub use audit::AuditLogTable;
 pub use dev::AgentTracesTable;
 pub use drift::ObservationsTable;
 pub use eval::{AssertionsTable, RunsTable};
+pub use gateway::CallsTable;
 pub use logs::RecordsTable;
 pub use metrics::PointsTable;
 pub use traces::SpansTable;
@@ -726,8 +728,8 @@ const fn definition<T: DomainTable>() -> BuiltinTableDefinition {
     }
 }
 
-/// The single canonical list of eight server-owned built-in tables.
-pub static BUILTIN_TABLES: [BuiltinTableDefinition; 8] = [
+/// The single canonical list of nine server-owned built-in tables.
+pub static BUILTIN_TABLES: [BuiltinTableDefinition; 9] = [
     definition::<SpansTable>(),
     definition::<PointsTable>(),
     definition::<RecordsTable>(),
@@ -736,11 +738,12 @@ pub static BUILTIN_TABLES: [BuiltinTableDefinition; 8] = [
     definition::<ObservationsTable>(),
     definition::<AgentTracesTable>(),
     definition::<AuditLogTable>(),
+    definition::<CallsTable>(),
 ];
 
 /// Return all immutable built-in definitions.
 #[must_use]
-pub const fn builtin_tables() -> &'static [BuiltinTableDefinition; 8] {
+pub const fn builtin_tables() -> &'static [BuiltinTableDefinition; 9] {
     &BUILTIN_TABLES
 }
 
@@ -752,7 +755,7 @@ pub fn builtin_table(namespace: &str, name: &str) -> Option<&'static BuiltinTabl
         .find(|definition| definition.namespace == namespace && definition.name == name)
 }
 
-/// Return the eight built-in logical FQNs in canonical order.
+/// Return the nine built-in logical FQNs in canonical order.
 #[must_use]
 pub fn builtin_fqns() -> Vec<String> {
     BUILTIN_TABLES

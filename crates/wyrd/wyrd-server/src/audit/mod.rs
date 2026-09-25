@@ -4,15 +4,20 @@
 //! appends one hash-chained `AuditEvent` row into the
 //! transactional `vala.audit_staging`. The attribution is derived from the
 //! resolved [`Caller`]: `principal_id`/`principal_kind`/`card_ref` come straight
-//! off the `Principal`, `request_id` off the caller, and `auth_method` is `Jwt`
-//! because this surface is reached only through the HTTP JWT-bearer flow
-//! (internal record writes audit as `Internal` down the ingest path).
+//! off the `Principal` and `request_id` off the caller.
 //!
 //! A same-tx append (register) is threaded directly on the operation's
 //! `TenantConn`; a standalone append (query, RBAC deny) uses
-//! [`record_audit`], which owns its own short transaction. Either way a failed
-//! append is fail-closed: the enclosing op is refused with
+//! [`record_audit`], which owns its own short transaction. On both of those
+//! paths a failed append is fail-closed: the enclosing op is refused with
 //! `WYRD_VALA_500_AUDIT_UNAVAILABLE`.
+//!
+//! The named non-blocking paths — Oracle read decisions, tenant tripwires, and
+//! gateway invocation decisions — call this same canonical append from a
+//! tracked task instead, so the decision does not wait on it and an authorized
+//! call is not refused when it fails; the failure is counted and the event can
+//! be lost on abrupt process loss. Gateway *administration* is not in that set
+//! and stays transactional and fail-closed.
 
 pub mod publication;
 

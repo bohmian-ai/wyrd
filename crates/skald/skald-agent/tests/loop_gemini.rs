@@ -4,12 +4,22 @@ use skald_agent::{Agent, FinishReason, RunConfig};
 use skald_prompt::Prompt;
 use skald_runtime::{MockProvider, ProviderRegistry};
 use skald_spec::wire::google_generate::{
-    GoogleCandidate, GoogleContent, GoogleFinishReason, GoogleGenerateContentRequest,
-    GoogleGenerateContentResponse, GoogleGenerateSettings, GooglePart,
+    GoogleAnswerContent, GoogleCandidate, GoogleContent, GoogleFinishReason,
+    GoogleGenerateContentRequest, GoogleGenerateContentResponse, GoogleGenerateSettings,
+    GooglePart,
 };
 use skald_spec::{
     Prompt as SpecPrompt, ProviderName, ProviderRequest, ProviderResponse, ResponseType,
 };
+
+fn google_answer(text: &str) -> GoogleAnswerContent {
+    GoogleAnswerContent {
+        role: Some("model".to_owned()),
+        parts: vec![GooglePart::Text {
+            text: text.to_owned(),
+        }],
+    }
+}
 
 fn google_content(role: &str, text: &str) -> GoogleContent {
     GoogleContent {
@@ -33,7 +43,7 @@ fn gemini_request(contents: Vec<GoogleContent>) -> ProviderRequest {
 fn gemini_text_response(text: &str) -> ProviderResponse {
     ProviderResponse::GeminiGenerateContent(GoogleGenerateContentResponse {
         candidates: vec![GoogleCandidate {
-            content: google_content("model", text),
+            content: google_answer(text),
             finish_reason: Some(GoogleFinishReason::Stop),
             index: Some(0),
             safety_ratings: Vec::new(),
@@ -44,6 +54,8 @@ fn gemini_text_response(text: &str) -> ProviderResponse {
         usage_metadata: None,
         model_version: Some("gemini-1.5-pro".to_owned()),
         prompt_feedback: None,
+        response_id: None,
+        create_time: None,
     })
 }
 

@@ -10,8 +10,8 @@ use skald_spec::wire::anthropic_messages::{AnthropicSystem, AnthropicUsage};
 use skald_spec::wire::openai_chat::OpenAiMessageContent;
 use skald_spec::{
     AnthropicContentBlock, AnthropicMessage, AnthropicMessagesRequest, AnthropicMessagesResponse,
-    AnthropicMessagesSettings, AnthropicStopReason, GoogleCandidate, GoogleContent,
-    GoogleFinishReason, GoogleGenerateContentRequest, GoogleGenerateContentResponse,
+    AnthropicMessagesSettings, AnthropicStopReason, GoogleAnswerContent, GoogleCandidate,
+    GoogleContent, GoogleFinishReason, GoogleGenerateContentRequest, GoogleGenerateContentResponse,
     GoogleGenerateSettings, GooglePart, GoogleUsageMetadata, OpenAiChatChoice, OpenAiChatMessage,
     OpenAiChatRequest, OpenAiChatResponse, OpenAiChatSettings, OpenAiUsage, ProviderRequest,
     ProviderResponse,
@@ -143,8 +143,8 @@ pub fn google_request(text: &str) -> ProviderRequest {
 pub fn google_response(text: &str) -> ProviderResponse {
     ProviderResponse::GeminiGenerateContent(GoogleGenerateContentResponse {
         candidates: vec![GoogleCandidate {
-            content: GoogleContent {
-                role: "model".to_owned(),
+            content: GoogleAnswerContent {
+                role: Some("model".to_owned()),
                 parts: vec![GooglePart::Text {
                     text: text.to_owned(),
                 }],
@@ -165,6 +165,8 @@ pub fn google_response(text: &str) -> ProviderResponse {
         }),
         model_version: None,
         prompt_feedback: None,
+        response_id: None,
+        create_time: None,
     })
 }
 

@@ -1,20 +1,23 @@
 //! The client byte owner and one bounded background producer.
 
+use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
 use crossbeam_queue::ArrayQueue;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Interval, MissedTickBehavior};
 use wyrd_spec::reference::CardRef;
+use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::ids::RunId;
 
 use crate::config::QueueConfig;
 use crate::error::WyrdQueueError;
-use crate::queue::{RecordQueue, Row};
+use crate::queue::{Entry, FlushOutcome, OwnedBatch, RecordQueue, Row};
 use crate::sink::BatchSink;
 
 /// Running producer state.
@@ -33,7 +36,7 @@ const RETRY_BACKOFF_MAX_MS: u64 = 1_000;
 /// Charged queue slots selected before one producer allocates its fixed buffers.
 #[derive(Debug, Clone, Copy)]
 struct ProducerCapacities {
-    /// Tokio data-channel slots retaining [`Row`] values.
+    /// Tokio data-channel slots retaining [`Entry`] values.
     data_slots: usize,
     /// Fixed crossbeam staging slots retaining [`Row`] values.
     staging_slots: usize,
@@ -47,7 +50,7 @@ impl ProducerCapacities {
     /// Derives a per-producer fixed queue allocation from configured cardinality.
     ///
     /// Half of each producer partition is charged to concrete
-    /// repository-owned [`Row`] and [`Ctrl`] slots, leaving the other half for
+    /// repository-owned [`Entry`] and [`Ctrl`] slots, leaving the other half for
     /// dynamic row, sealed-batch, and retry ownership. Tokio node headers,
     /// `Arc` control blocks, allocator slack, TLS, and authentication state
     /// remain cardinality-bounded T7R residual rather than guessed layout
@@ -73,7 +76,9 @@ impl ProducerCapacities {
         let control_bytes = CONTROL_SLOTS_PER_PRODUCER
             .checked_mul(std::mem::size_of::<Ctrl>())
             .ok_or(WyrdQueueError::Backpressure)?;
-        let row_slot_bytes = std::mem::size_of::<Row>();
+        // Every slot is charged at the channel entry size, which covers both a
+        // staged `Row` and an in-flight `OwnedBatch` handle.
+        let row_slot_bytes = std::mem::size_of::<Entry>().max(std::mem::size_of::<Row>());
         let available_row_bytes = fixed_storage_bytes
             .checked_sub(control_bytes)
             .ok_or(WyrdQueueError::Backpressure)?;
@@ -123,6 +128,18 @@ struct ClientBudgetState {
     fixed_storage: AtomicUsize,
     /// Shared producer admission state guarded as one cardinality transition.
     producer_permits: Mutex<ProducerPermitState>,
+    /// Observer told the row count of every loss a queue of this handle settles.
+    loss_observer: OnceLock<LossObserver>,
+}
+
+/// Callback receiving the row count of each settled post-admission loss.
+struct LossObserver(Box<dyn Fn(u64) + Send + Sync>);
+
+impl fmt::Debug for LossObserver {
+    /// Names the observer without exposing the callback.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("LossObserver")
+    }
 }
 
 /// The accepted producer count and the tightest configuration ceiling seen by a handle.
@@ -149,6 +166,7 @@ impl ClientByteBudget {
                     live: 0,
                     ceiling: QueueConfig::MAX_LIVE_ENTRIES,
                 }),
+                loss_observer: OnceLock::new(),
             }),
         }
     }
@@ -227,6 +245,27 @@ impl ClientByteBudget {
             {
                 return Ok(());
             }
+        }
+    }
+
+    /// Registers `observer` to receive the row count of every loss this
+    /// handle's queues settle, synchronously on the settling task, so a loss
+    /// is observable without a later enqueue or polling. The lost owner's
+    /// bytes and retry slot are already released when the observer runs, so
+    /// [`Self::metrics`] read there reports the settled ownership.
+    ///
+    /// The observer must not block. Only the first registration takes effect.
+    pub fn observe_losses(&self, observer: impl Fn(u64) + Send + Sync + 'static) {
+        let _ = self
+            .state
+            .loss_observer
+            .set(LossObserver(Box::new(observer)));
+    }
+
+    /// Tells the registered observer, if any, that `rows` were settled as lost.
+    pub(crate) fn report_loss(&self, rows: u64) {
+        if let Some(LossObserver(observer)) = self.state.loss_observer.get() {
+            observer(rows);
         }
     }
 
@@ -445,6 +484,25 @@ impl ClientByteGuard {
         self
     }
 
+    /// Sets this reservation to exactly `bytes`, reserving any growth before it is owned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WyrdQueueError::Backpressure`] when growth does not fit the
+    /// handle-wide budget; the original reservation is then released with
+    /// this guard.
+    pub(crate) fn fit(mut self, bytes: usize) -> Result<Self, WyrdQueueError> {
+        if bytes <= self.bytes {
+            return Ok(self.resize(bytes));
+        }
+        let mut growth = self.budget.reserve(bytes - self.bytes)?;
+        // The growth bytes transfer into `self`, so the temporary guard must
+        // not return them when it drops.
+        growth.bytes = 0;
+        self.bytes = bytes;
+        Ok(self)
+    }
+
     /// Marks this existing byte owner as one of the 64 live sealed batches.
     ///
     /// # Errors
@@ -526,7 +584,7 @@ enum Ctrl {
 
 /// The caller-facing bounded producer for one table.
 pub struct Producer {
-    tx: mpsc::Sender<Row>,
+    tx: mpsc::Sender<Entry>,
     ctrl_tx: mpsc::Sender<Ctrl>,
     control_pending: Arc<AtomicBool>,
     staging: Arc<ArrayQueue<Row>>,
@@ -664,31 +722,79 @@ impl Producer {
         card_ref: Option<CardRef>,
         run_id: Option<RunId>,
     ) -> Result<(), WyrdQueueError> {
+        self.admit(1, json.capacity(), |guard| {
+            Entry::Row(Row {
+                json,
+                card_ref,
+                run_id,
+                _guard: guard,
+            })
+        })
+    }
+
+    /// Admits one owned Arrow batch without waiting for encoding or publication.
+    ///
+    /// The batch's array memory is charged to the handle-wide budget and the
+    /// batch takes one bounded channel slot. The background owner later seals
+    /// it alone under a stable UUIDv7 and settles it through the same retry,
+    /// flush, and shutdown lifecycle as JSON rows. Its schema is sent
+    /// unchanged; the destination contract is enforced by the server. A
+    /// supplied `request_id` travels with the sealed frame, so every transport
+    /// attempt, including retries, publishes under that originating request.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed backpressure when the producer is draining, its channel
+    /// is full, or the handle budget cannot cover the batch. Refused rows are
+    /// counted as dropped.
+    pub fn enqueue_batch(
+        &self,
+        batch: RecordBatch,
+        request_id: Option<RequestId>,
+    ) -> Result<(), WyrdQueueError> {
+        let rows = batch.num_rows() as u64;
+        self.admit(rows, batch.get_array_memory_size(), |guard| {
+            Entry::Batch(OwnedBatch {
+                batch,
+                guard,
+                request_id,
+            })
+        })
+    }
+
+    /// Reserves `bytes` and hands the built entry to the bounded channel without waiting.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WyrdQueueError::QueueFull`] when the producer is draining or
+    /// the channel is full or closed, and [`WyrdQueueError::Backpressure`]
+    /// when the handle budget cannot cover `bytes`. Each refusal counts
+    /// `rows` as dropped.
+    fn admit(
+        &self,
+        rows: u64,
+        bytes: usize,
+        build: impl FnOnce(ClientByteGuard) -> Entry,
+    ) -> Result<(), WyrdQueueError> {
         if self.state.load(Ordering::Acquire) != RUNNING {
-            self.counters.dropped.fetch_add(1, Ordering::AcqRel);
+            self.counters.dropped.fetch_add(rows, Ordering::AcqRel);
             return Err(WyrdQueueError::QueueFull);
         }
-        let guard = match self.budget.reserve(json.capacity()) {
+        let guard = match self.budget.reserve(bytes) {
             Ok(guard) => guard,
             Err(error) => {
-                self.counters.dropped.fetch_add(1, Ordering::AcqRel);
+                self.counters.dropped.fetch_add(rows, Ordering::AcqRel);
                 return Err(error);
             }
         };
-        let row = Row {
-            json,
-            card_ref,
-            run_id,
-            _guard: guard,
-        };
-        match self.tx.try_send(row) {
+        match self.tx.try_send(build(guard)) {
             Ok(()) => {
-                self.counters.accepted.fetch_add(1, Ordering::AcqRel);
+                self.counters.accepted.fetch_add(rows, Ordering::AcqRel);
                 self.channel_depth.fetch_add(1, Ordering::AcqRel);
                 Ok(())
             }
             Err(TrySendError::Full(_)) | Err(TrySendError::Closed(_)) => {
-                self.counters.dropped.fetch_add(1, Ordering::AcqRel);
+                self.counters.dropped.fetch_add(rows, Ordering::AcqRel);
                 Err(WyrdQueueError::QueueFull)
             }
         }
@@ -788,7 +894,7 @@ struct Task {
     /// Staging and retry owner dropped before the task lifetime guards.
     queue: RecordQueue,
     /// Stage-one receiver dropped before the task lifetime guards.
-    rx: mpsc::Receiver<Row>,
+    rx: mpsc::Receiver<Entry>,
     /// Control receiver dropped before the task lifetime guards.
     ctrl_rx: mpsc::Receiver<Ctrl>,
     /// One command-slot occupancy flag shared with the producer handle.
@@ -839,10 +945,15 @@ impl Task {
                         let result = if self.retry_deadline.is_some() {
                             Err(WyrdQueueError::FlushTimeout)
                         } else {
-                            self.drain_channel().await;
-                            match self.queue.seal_and_send().await {
-                                Ok(outcome) => {
+                            let mut outcome = FlushOutcome::default();
+                            let sealed = match self.drain_channel(&mut outcome).await {
+                                Ok(()) => self.queue.seal_and_send().await,
+                                Err(error) => Err(error),
+                            };
+                            match sealed {
+                                Ok(sealed) => {
                                     self.reset_retry_schedule();
+                                    outcome.batch_ids.extend(sealed.batch_ids);
                                     Ok(outcome.batch_ids)
                                 }
                                 Err(error) => {
@@ -861,9 +972,12 @@ impl Task {
                         let result = if self.retry_deadline.is_some() {
                             Err(WyrdQueueError::FlushTimeout)
                         } else {
-                            self.drain_channel().await;
-                            match self.queue.seal_and_send().await {
-                                Ok(_) => {
+                            let sealed = match self.drain_channel(&mut FlushOutcome::default()).await {
+                                Ok(()) => self.queue.seal_and_send().await.map(drop),
+                                Err(error) => Err(error),
+                            };
+                            match sealed {
+                                Ok(()) => {
                                     self.reset_retry_schedule();
                                     Ok(())
                                 }
@@ -893,11 +1007,15 @@ impl Task {
                         return None;
                     }
                 },
-                row = self.rx.recv(), if self.retry_deadline.is_none() => match row {
-                    Some(row) => {
+                entry = self.rx.recv(), if self.retry_deadline.is_none() => match entry {
+                    Some(entry) => {
                         self.channel_depth.fetch_sub(1, Ordering::AcqRel);
-                        self.queue.ingest(row).await;
-                        if self.queue.staging_len() >= self.flush_max_rows {
+                        if self.queue.ingest(entry, &mut FlushOutcome::default()).await.is_err() {
+                            self.schedule_retry_if_retained();
+                        }
+                        if self.retry_deadline.is_none()
+                            && self.queue.staging_len() >= self.flush_max_rows
+                        {
                             let result = self.queue.seal_and_send().await;
                             self.settle_background(result);
                         }
@@ -924,12 +1042,21 @@ impl Task {
         }
     }
 
-    /// Moves every currently queued row into fixed staging before a control seal.
-    async fn drain_channel(&mut self) {
-        while let Ok(row) = self.rx.try_recv() {
+    /// Moves every queued entry into staging, sealing Arrow batches, before a control seal.
+    ///
+    /// Acknowledged Arrow batch identities are appended to `outcome`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first Arrow batch settlement error. Later entries stay in
+    /// the bounded channel for the next pass, and a retryable batch is already
+    /// retained with its stable identity.
+    async fn drain_channel(&mut self, outcome: &mut FlushOutcome) -> Result<(), WyrdQueueError> {
+        while let Ok(entry) = self.rx.try_recv() {
             self.channel_depth.fetch_sub(1, Ordering::AcqRel);
-            self.queue.ingest(row).await;
+            self.queue.ingest(entry, outcome).await?;
         }
+        Ok(())
     }
 
     /// Settles a seal that no flush or shutdown caller is waiting on.
@@ -999,15 +1126,18 @@ impl Task {
     /// batch identity. A terminal result that consumed the final owner leaves
     /// no pending work and permits task cleanup.
     async fn drain_dropped_handle(&mut self) {
-        self.drain_channel().await;
         if let Some(deadline) = self.retry_deadline.take() {
             tokio::time::sleep_until(deadline).await;
         }
         let mut attempt = self.retry_attempt;
-        while self.queue.has_pending() {
-            match self.queue.seal_and_send().await {
-                Ok(_) => attempt = 0,
-                Err(_) if !self.queue.has_pending() => break,
+        loop {
+            let settled = match self.drain_channel(&mut FlushOutcome::default()).await {
+                Ok(()) if !self.queue.has_pending() => break,
+                Ok(()) => self.queue.seal_and_send().await.map(drop),
+                Err(error) => Err(error),
+            };
+            match settled {
+                Ok(()) => attempt = 0,
                 Err(_) => {
                     let batch_id = self.queue.retry_batch_id().unwrap_or([0; 16]);
                     tokio::time::sleep(retry_backoff(batch_id, attempt)).await;
@@ -1076,13 +1206,19 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
+    use arrow::array::{ArrayRef, BinaryArray, Int64Array, ListArray, StructArray};
+    use arrow::datatypes::Int32Type;
+    use arrow::ipc::reader::StreamReader;
+    use arrow::record_batch::RecordBatch;
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use async_trait::async_trait;
     use crossbeam_queue::ArrayQueue;
     use tokio::sync::{Notify, mpsc, oneshot};
     use wyrd_spec::reference::CardRef;
+    use wyrd_spec::request_id::RequestId;
 
     use super::{ClientByteBudget, Counters, Ctrl, RUNNING, Task};
+    use crate::queue::Entry;
     use crate::{
         BatchSink, ClientByteGuard, DurableBatchAck, MockSink, Producer, QueueConfig, RecordQueue,
         Row, SealedBatch, SinkError, WyrdQueueError,
@@ -1104,7 +1240,7 @@ mod tests {
         config: QueueConfig,
     ) -> (
         Task,
-        mpsc::Sender<Row>,
+        mpsc::Sender<Entry>,
         mpsc::Sender<Ctrl>,
         Arc<AtomicBool>,
         Arc<AtomicUsize>,
@@ -1812,12 +1948,12 @@ mod tests {
         let task_handle = tokio::spawn(task.run());
         let json = br#"{"id":1}"#.to_vec();
         let guard = budget.reserve(json.capacity()).expect("row bytes fit");
-        tx.send(Row {
+        tx.send(Entry::Row(Row {
             json,
             card_ref: Some(card()),
             run_id: None,
             _guard: guard,
-        })
+        }))
         .await
         .expect("task row channel is open");
         channel_depth.fetch_add(1, Ordering::Release);
@@ -1937,5 +2073,222 @@ mod tests {
         assert!(second.is_ok(), "a refusal is reported once: {second:?}");
         let shutdown = producer.shutdown();
         assert!(shutdown.is_ok(), "nothing remains to report: {shutdown:?}");
+    }
+
+    /// Builds a two-row batch whose binary and nested columns the JSON row path cannot express.
+    fn nested_batch() -> RecordBatch {
+        let tags = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+            Some(vec![Some(1), Some(2)]),
+            None,
+        ]);
+        let usage = StructArray::from(vec![(
+            Arc::new(Field::new("tokens", DataType::Int64, false)),
+            Arc::new(Int64Array::from(vec![7, 9])) as ArrayRef,
+        )]);
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(BinaryArray::from(vec![
+                b"\x00\xff".as_slice(),
+                b"".as_slice(),
+            ])),
+            Arc::new(tags),
+            Arc::new(usage),
+        ];
+        RecordBatch::try_from_iter(vec![
+            ("body", columns[0].clone()),
+            ("tags", columns[1].clone()),
+            ("usage", columns[2].clone()),
+        ])
+        .expect("nested test batch is well formed")
+    }
+
+    /// Terminal refusal of a fresh or retained batch and a refused retry slot
+    /// each settle the batch's rows as lost exactly once, tell the loss
+    /// observer as they settle without a later enqueue, and release every
+    /// owner before the observer reads the handle's ownership. Shutdown still
+    /// drains and reports the first background refusal exactly once.
+    #[test]
+    fn accepted_batch_losses_settle_exactly_once() {
+        let sink = Arc::new(MockSink::new());
+        let budget = ClientByteBudget::new(QueueConfig::MAX_CLIENT_BYTE_LIMIT);
+        let lost = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        budget.observe_losses({
+            let (lost, observed, budget) =
+                (Arc::clone(&lost), Arc::clone(&observed), budget.clone());
+            move |rows| {
+                let metrics = budget.metrics();
+                observed
+                    .lock()
+                    .expect("observation lock")
+                    .push((metrics.owned_bytes, metrics.retry_entries));
+                lost.fetch_add(rows, Ordering::AcqRel);
+            }
+        });
+        let producer = Producer::with_budget(
+            "vala.gateway.calls",
+            schema(),
+            sink.clone(),
+            QueueConfig {
+                flush_interval_ms: 0,
+                ..QueueConfig::default()
+            },
+            budget.clone(),
+        )
+        .expect("producer fits the default budget");
+        let settle = |expected: u64| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while lost.load(Ordering::Acquire) < expected {
+                assert!(Instant::now() < deadline, "{expected} lost rows settle");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+
+        sink.terminal_next(1);
+        producer
+            .enqueue_batch(nested_batch(), None)
+            .expect("fresh batch admitted");
+        settle(2);
+        sink.fail_next(1);
+        sink.terminal_next(1);
+        producer
+            .enqueue_batch(nested_batch(), None)
+            .expect("retained batch admitted");
+        settle(4);
+        let slots = (0..QueueConfig::MAX_LIVE_ENTRIES)
+            .map(|_| budget.reserve_retry().expect("test occupies a retry slot"))
+            .collect::<Vec<_>>();
+        sink.fail_next(1);
+        producer
+            .enqueue_batch(nested_batch(), None)
+            .expect("unretainable batch admitted");
+        settle(6);
+        drop(slots);
+        assert_eq!(
+            *observed.lock().expect("observation lock"),
+            vec![(0, 0), (0, 0), (0, QueueConfig::MAX_LIVE_ENTRIES)],
+            "each observer sees the lost owner's bytes and retry slot released"
+        );
+
+        let deferred = producer
+            .shutdown()
+            .expect_err("the drained producer reports its unreported background refusal");
+        assert!(
+            matches!(deferred, WyrdQueueError::Sink(_)),
+            "the first terminal refusal is the one reported: {deferred:?}"
+        );
+        assert_eq!(lost.load(Ordering::Acquire), 6, "each loss settles once");
+        assert_eq!(producer.metrics().dropped, 6);
+        assert!(sink.received().is_empty(), "no refused batch publishes");
+        let settled = budget.metrics();
+        assert_eq!(
+            (settled.live_batches, settled.retry_entries),
+            (0, 0),
+            "every lost owner is released"
+        );
+        assert_eq!(budget.used_bytes(), 0);
+    }
+
+    /// Decodes every batch carried by one sink receipt.
+    fn decode(bytes: &[u8]) -> Vec<RecordBatch> {
+        StreamReader::try_new(std::io::Cursor::new(bytes), None)
+            .expect("receipt is an IPC stream")
+            .map(|batch| batch.expect("receipt batch decodes"))
+            .collect()
+    }
+
+    /// An owned Arrow batch is sealed by the background owner under one stable retried identity.
+    #[test]
+    fn arrow_batch_enqueue_seals_nested_columns_through_the_retry_owner() {
+        let sink = Arc::new(MockSink::new());
+        sink.fail_next(1);
+        let budget = ClientByteBudget::new(QueueConfig::MAX_CLIENT_BYTE_LIMIT);
+        let producer = Producer::with_budget(
+            "vala.gateway.calls",
+            schema(),
+            sink.clone(),
+            QueueConfig {
+                flush_interval_ms: 0,
+                ..QueueConfig::default()
+            },
+            budget.clone(),
+        )
+        .expect("producer fits the default budget");
+        let batch = nested_batch();
+        let request_id = RequestId::now_v7();
+        producer
+            .enqueue_batch(batch.clone(), Some(request_id.clone()))
+            .expect("nested batch admitted");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while sink.received().is_empty() {
+            assert!(Instant::now() < deadline, "retained batch settles on retry");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let attempts = sink.attempted();
+        assert_eq!(attempts.len(), 2, "one ambiguity then one resolving retry");
+        assert_eq!(attempts[0], attempts[1], "retry keeps the sealed UUIDv7");
+        let receipt = &sink.received()[0];
+        assert_eq!(receipt.table, "vala.gateway.calls");
+        assert_eq!(receipt.rows, 2);
+        assert_eq!(
+            receipt.request_id,
+            Some(request_id),
+            "the retry keeps the request"
+        );
+        assert_eq!(decode(&receipt.bytes), vec![batch], "columns sent verbatim");
+        producer.flush().expect("nothing remains after the ACK");
+        assert_eq!(producer.metrics().accepted, 2);
+        assert_eq!(producer.metrics().dropped, 0);
+        producer.shutdown().expect("settled producer drains");
+        assert_eq!(budget.used_bytes(), 0, "every batch reservation settles");
+    }
+
+    /// Admission returns at once while a sink stalls, and refuses at once when bytes are exhausted.
+    #[test]
+    fn arrow_batch_enqueue_never_waits_for_publication() {
+        let sink = Arc::new(TimeoutSink::default());
+        let budget = ClientByteBudget::new(QueueConfig::MAX_CLIENT_BYTE_LIMIT);
+        let producer = Producer::with_budget(
+            "vala.traces.spans",
+            schema(),
+            sink.clone(),
+            QueueConfig {
+                flush_interval_ms: 0,
+                flush_timeout_ms: 10_000,
+                ..QueueConfig::default()
+            },
+            budget.clone(),
+        )
+        .expect("producer fits the default budget");
+        producer
+            .enqueue_batch(nested_batch(), None)
+            .expect("first batch admitted");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while sink.attempts.lock().expect("attempt lock").is_empty() {
+            assert!(Instant::now() < deadline, "background owner starts sending");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let started = Instant::now();
+        producer
+            .enqueue_batch(nested_batch(), None)
+            .expect("second batch admitted while the sink stalls");
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "admission never awaits publication"
+        );
+        let blocker = budget
+            .reserve(QueueConfig::MAX_CLIENT_BYTE_LIMIT - budget.used_bytes())
+            .expect("test occupies the remaining byte owner");
+        assert!(matches!(
+            producer.enqueue_batch(nested_batch(), None),
+            Err(WyrdQueueError::Backpressure)
+        ));
+        assert_eq!(producer.metrics().dropped, 2, "refused rows are counted");
+        drop(blocker);
+        sink.release();
+        producer
+            .shutdown()
+            .expect("released sink drains both batches");
+        assert_eq!(sink.attempts.lock().expect("attempt lock").len(), 2);
+        assert_eq!(budget.used_bytes(), 0, "shutdown settles every reservation");
     }
 }

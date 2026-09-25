@@ -55,6 +55,30 @@ impl TableRef {
         format!("{}.{}", self.namespace.as_str(), self.name)
     }
 
+    /// The Bifrost table object scope naming this table's registered identity.
+    ///
+    /// The namespace splits into the scope's catalog and schema (`vala` and
+    /// `traces` for `vala.traces`), and the UID pins the exact registration, so
+    /// one scope is shared by Oracle query reads and Gate record writes.
+    #[must_use]
+    pub fn permission_scope(
+        &self,
+        table_uid: &crate::catalog::TableUid,
+    ) -> wyrd_runtime::PermissionScope {
+        let (catalog, schema) = self
+            .namespace
+            .as_str()
+            .split_once('.')
+            .unwrap_or(("vala", self.namespace.as_str()));
+        wyrd_runtime::PermissionScope::Bifrost(wyrd_runtime::BifrostPermissionScope::Table(
+            wyrd_runtime::BifrostTableScope {
+                catalog: catalog.to_owned(),
+                schema: schema.to_owned(),
+                table_uid: uuid::Uuid::from_bytes(*table_uid.as_bytes()),
+            },
+        ))
+    }
+
     /// Parse a fully-qualified name into a `TableRef`.
     ///
     /// Returns `None` if the namespace is not a known `BifrostNamespace` or if

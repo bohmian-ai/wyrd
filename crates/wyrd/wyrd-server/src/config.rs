@@ -2,19 +2,31 @@
 //!
 //! Load order: env overrides > TOML file > compiled defaults.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
+use url::Url;
 use vala_bifrost_redux::resources::ANALYTICAL_QUERY_SLOT_UNITS;
 use vala_bifrost_redux::scribe::geometry::{ScribeGeometry, ScribeGeometryError};
 use wyrd_auth_oidc::{AddressPolicy, ScreenedHttp};
-use wyrd_spec::TenantSlug;
+use wyrd_crypt::SecretKey;
+use wyrd_gateway::{
+    CredentialAssignment, CredentialResolver, ManagedSecretKeys, TenantKeyring, VaultBackend,
+    read_secret_file,
+};
 use wyrd_spec::auth::IssuerTokenPolicy;
+use wyrd_spec::gateway::{ExternalSecretReference, ProviderCredentialSourceView};
+use wyrd_spec::ids::{CredentialBindingName, SecretBackendName};
+use wyrd_spec::security::SecretRef;
+use wyrd_spec::{DataTenantId, TenantSlug};
 use wyrd_telemetry::TelemetryConfig;
 
 use crate::boot::data_root::DEFAULT_BIFROST_DATA_DIR;
@@ -1817,6 +1829,9 @@ pub struct WyrdServerConfig {
     /// Workload identity bindings for this deployment.
     #[serde(default)]
     pub workload_bindings: Vec<WorkloadBindingEntry>,
+    /// Operator-owned gateway credential sources.
+    #[serde(default)]
+    pub gateway: GatewayConfig,
 }
 
 impl WyrdServerConfig {
@@ -1881,6 +1896,14 @@ pub struct LimitsConfig {
     /// worst-case process memory is `body_bytes × concurrency`.
     #[serde(default = "default_body_bytes")]
     pub body_bytes: usize,
+    /// Maximum Audio transcription or translation upload in bytes.
+    ///
+    /// These uploads bypass `body_bytes` buffering: file parts spool to
+    /// anonymous temporary files as they arrive, so memory stays bounded by
+    /// one chunk plus small text members while disk holds at most this many
+    /// bytes per upload.
+    #[serde(default = "default_audio_upload_bytes")]
+    pub audio_upload_bytes: usize,
     /// Per-request processing timeout in milliseconds.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
@@ -1895,6 +1918,7 @@ impl LimitsConfig {
     pub fn into_state(self) -> crate::state::LimitsConfig {
         crate::state::LimitsConfig {
             body_bytes: self.body_bytes,
+            audio_upload_bytes: self.audio_upload_bytes,
             timeout: Duration::from_millis(self.timeout_ms),
             concurrency: self.concurrency,
         }
@@ -2072,6 +2096,300 @@ pub struct WorkloadBindingEntry {
     pub version: String,
 }
 
+/// `[gateway]` operator configuration for tenant provider credentials.
+///
+/// Tenants name only what the operator declares here: an `Environment`
+/// credential selects a binding key, never a raw variable or path, and an
+/// `ExternalSecret` credential selects a declared Vault backend and a path
+/// inside one of its assigned prefixes. Every binding and prefix is assigned
+/// to exactly one tenant and provider.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayConfig {
+    /// Named bindings, each an environment variable or mounted secret file.
+    #[serde(default)]
+    pub credential_bindings: BTreeMap<CredentialBindingName, GatewayCredentialBinding>,
+    /// Vault KV v2 backends tenants may reference.
+    #[serde(default)]
+    pub secret_backends: BTreeMap<SecretBackendName, VaultBackendConfig>,
+    /// Independently configured managed-secret keyring of each tenant.
+    ///
+    /// A tenant without an entry cannot submit or resolve a ManagedSecret; it
+    /// can still use the operator-owned Environment and ExternalSecret
+    /// sources.
+    #[serde(default)]
+    pub managed_secret_keys: BTreeMap<DataTenantId, GatewayManagedSecretKeys>,
+}
+
+/// One tenant's versioned managed-secret keyring as the operator declares it.
+///
+/// `active` seals new and replaced values. Every version listed here is
+/// distributed to every replica serving the tenant, so an envelope sealed by
+/// one replica opens on any other. Removing a version is safe only once no
+/// stored envelope still records it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayManagedSecretKeys {
+    /// Version name that seals new and replaced values.
+    pub active: String,
+    /// Every distributed version, each a standard-base64 32-byte key held in
+    /// the existing environment or mounted-file secret reference.
+    pub versions: BTreeMap<String, SecretRef>,
+}
+
+/// One operator Environment binding and its assignment.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayCredentialBinding {
+    /// Environment variable or mounted-file source of the credential.
+    pub secret: SecretRef,
+    /// Tenant, provider, and optional compatible host allowed to use it.
+    pub assignment: CredentialAssignment,
+}
+
+/// One operator-declared Vault KV v2 backend.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VaultBackendConfig {
+    /// Vault base address; `https` is required in production.
+    pub address: Url,
+    /// KV v2 mount path; never tenant input.
+    pub mount: String,
+    /// Environment or mounted-file token source, re-read on every resolution.
+    pub token: SecretRef,
+    /// Optional Vault namespace.
+    #[serde(default)]
+    pub namespace: Option<String>,
+    /// Optional environment or mounted-file PEM bundle replacing platform
+    /// trust roots.
+    #[serde(default)]
+    pub ca_cert: Option<SecretRef>,
+    /// Assigned path prefixes; a referenced path must fall within one.
+    #[serde(default)]
+    pub paths: BTreeMap<String, CredentialAssignment>,
+}
+
+impl GatewayConfig {
+    /// Rejects invalid bindings and backends so the server fails boot.
+    ///
+    /// Secrets must be non-empty env or file references; backend addresses
+    /// must be base URLs using `https` (or `http` outside production); mounts
+    /// and prefixes must satisfy the Vault path grammar; and no assigned
+    /// prefix may contain another, so each path has one owner.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::Invalid`] naming the first invalid member.
+    fn validate(&self, production: bool) -> Result<(), ConfigError> {
+        let invalid = |field: String, reason: &str| ConfigError::Invalid {
+            message: format!("{field} {reason}"),
+        };
+        for (name, binding) in &self.credential_bindings {
+            if !local_secret(&binding.secret) {
+                return Err(invalid(
+                    format!("gateway.credential_bindings.{name}.secret"),
+                    "must be a non-empty env or file secret reference",
+                ));
+            }
+        }
+        for (tenant, keyring) in &self.managed_secret_keys {
+            let field = |member: &str| format!("gateway.managed_secret_keys.{tenant}.{member}");
+            if !keyring.versions.contains_key(&keyring.active) {
+                return Err(invalid(
+                    field("active"),
+                    "must name a version present in this tenant's versions map",
+                ));
+            }
+            for (version, secret) in &keyring.versions {
+                if version.is_empty() || !local_secret(secret) {
+                    return Err(invalid(
+                        field(&format!("versions.{version}")),
+                        "must be a named, non-empty env or file secret reference",
+                    ));
+                }
+            }
+        }
+        for (name, backend) in &self.secret_backends {
+            let field = |member: &str| format!("gateway.secret_backends.{name}.{member}");
+            let scheme = backend.address.scheme();
+            if backend.address.cannot_be_a_base()
+                || !(scheme == "https" || (scheme == "http" && !production))
+            {
+                return Err(invalid(
+                    field("address"),
+                    "must be an https base URL (http only outside production)",
+                ));
+            }
+            if !ExternalSecretReference::is_valid_path(&backend.mount) {
+                return Err(invalid(field("mount"), "must be a valid Vault path"));
+            }
+            if !local_secret(&backend.token)
+                || backend.ca_cert.as_ref().is_some_and(|ca| !local_secret(ca))
+            {
+                return Err(invalid(
+                    field("token"),
+                    "and ca_cert must be non-empty env or file secret references",
+                ));
+            }
+            for prefix in backend.paths.keys() {
+                let overlaps = backend
+                    .paths
+                    .keys()
+                    .any(|other| other != prefix && within(other, prefix));
+                if !ExternalSecretReference::is_valid_path(prefix) || overlaps {
+                    return Err(invalid(
+                        field(&format!("paths.{prefix}")),
+                        "must be a valid Vault path that contains no other assigned prefix",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Loads every configured tenant keyring into process memory.
+    ///
+    /// Each version's base64 value is read once from its environment variable
+    /// or mounted file and must decode to exactly 32 key bytes. Key material
+    /// is never persisted and never leaves this process. The load also proves
+    /// tenant isolation: two tenants sharing one key would make one process
+    /// wrapping key out of per-tenant configuration, so that fails boot.
+    ///
+    /// A mounted file carries tenant wrapping authority, so it is read through
+    /// [`read_secret_file`] under the same open-handle, regular-file,
+    /// owner-only, bounded rule the request path applies to an operator
+    /// binding: a `0644` mount is refused here rather than accepted.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::Invalid`] naming the tenant and version whose
+    /// key is unreadable, not a regular owner-only file, larger than one
+    /// secret, not standard base64, not 32 bytes, incomplete, or shared with
+    /// another tenant. The message names no key material and no other tenant.
+    pub fn managed_secret_keys(&self) -> Result<ManagedSecretKeys, ConfigError> {
+        let mut seen: BTreeSet<[u8; 32]> = BTreeSet::new();
+        let mut keyrings = BTreeMap::new();
+        for (tenant, configured) in &self.managed_secret_keys {
+            let invalid = |version: &str, reason: &str| ConfigError::Invalid {
+                message: format!(
+                    "gateway.managed_secret_keys.{tenant}.versions.{version} {reason}"
+                ),
+            };
+            let mut versions = BTreeMap::new();
+            for (version, secret) in &configured.versions {
+                let encoded = match secret {
+                    SecretRef::Env { name } => env::var(name)
+                        .map_err(|_| invalid(version, "names an unset environment variable"))?,
+                    SecretRef::File { path } => read_secret_file(Path::new(path))
+                        .map_err(|reason| invalid(version, reason))?,
+                    _ => return Err(invalid(version, "must be an env or file secret reference")),
+                };
+                let bytes: [u8; 32] = BASE64_STANDARD
+                    .decode(encoded.trim())
+                    .ok()
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .ok_or_else(|| {
+                        invalid(version, "must be standard base64 of exactly 32 key bytes")
+                    })?;
+                if !seen.insert(bytes) {
+                    return Err(invalid(
+                        version,
+                        "repeats key material already assigned to another tenant or version; \
+                         each tenant needs independent key authority",
+                    ));
+                }
+                versions.insert(version.clone(), SecretKey::from_bytes(bytes));
+            }
+            let keyring = TenantKeyring::new(configured.active.clone(), versions)
+                .map_err(|_| invalid(&configured.active, "is not a distributed version"))?;
+            keyrings.insert(*tenant, keyring);
+        }
+        Ok(ManagedSecretKeys::new(keyrings))
+    }
+
+    /// Operator assignment covering a credential source, if any.
+    ///
+    /// A binding carries its own assignment; a Vault reference is covered by
+    /// the single assigned prefix of its backend that contains its path.
+    #[must_use]
+    pub fn assignment(
+        &self,
+        source: &ProviderCredentialSourceView,
+    ) -> Option<&CredentialAssignment> {
+        match source {
+            ProviderCredentialSourceView::Environment { binding } => self
+                .credential_bindings
+                .get(binding)
+                .map(|binding| &binding.assignment),
+            ProviderCredentialSourceView::ExternalSecret { backend, reference } => self
+                .secret_backends
+                .get(backend)?
+                .paths
+                .iter()
+                .find(|(prefix, _)| within(reference.path(), prefix))
+                .map(|(_, assignment)| assignment),
+            // A managed secret has no operator binding or path: its authority
+            // is the submitting tenant's own keyring.
+            ProviderCredentialSourceView::ManagedSecret => None,
+        }
+    }
+
+    /// Builds the runtime credential resolver over every declared backend and
+    /// the already-loaded tenant keyrings.
+    ///
+    /// Reads each backend's CA bundle once; tokens are read per resolution.
+    /// `keys` is shared with gateway administration so sealing and opening use
+    /// one loaded keyring set.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::Invalid`] when a CA bundle is unreadable or does
+    /// not parse, or a backend client cannot be built.
+    pub fn credential_resolver(
+        &self,
+        keys: Arc<ManagedSecretKeys>,
+    ) -> Result<CredentialResolver, ConfigError> {
+        self.secret_backends
+            .iter()
+            .map(|(name, backend)| {
+                let failed = || ConfigError::Invalid {
+                    message: format!(
+                        "gateway.secret_backends.{name}.ca_cert must be a readable PEM bundle"
+                    ),
+                };
+                let ca_cert = match &backend.ca_cert {
+                    Some(SecretRef::Env { name }) => {
+                        Some(env::var(name).map_err(|_| failed())?.into_bytes())
+                    }
+                    Some(SecretRef::File { path }) => {
+                        Some(std::fs::read(path).map_err(|_| failed())?)
+                    }
+                    Some(_) => return Err(failed()),
+                    None => None,
+                };
+                let vault = VaultBackend::new(
+                    backend.address.clone(),
+                    backend.mount.clone(),
+                    backend.token.clone(),
+                    backend.namespace.clone(),
+                    ca_cert.as_deref(),
+                )
+                .map_err(|_| failed())?;
+                Ok((name.clone(), vault))
+            })
+            .collect::<Result<_, _>>()
+            .map(|backends| CredentialResolver::new(backends, keys))
+    }
+}
+
+/// Whether `source` is a structurally valid env or file reference.
+fn local_secret(source: &SecretRef) -> bool {
+    matches!(source, SecretRef::Env { .. } | SecretRef::File { .. }) && source.validate().is_ok()
+}
+
+/// Whether Vault `path` equals `prefix` or lies beneath it segment-wise.
+fn within(path: &str, prefix: &str) -> bool {
+    path.strip_prefix(prefix)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Default helpers (private)
 // ──────────────────────────────────────────────────────────────────────────────
@@ -2098,6 +2416,11 @@ fn default_pool_acquire_ms() -> u64 {
 
 fn default_body_bytes() -> usize {
     1_048_576
+}
+
+/// Default Audio upload bound: the `OpenAI` Audio per-file maximum, 25 MiB.
+fn default_audio_upload_bytes() -> usize {
+    26_214_400
 }
 
 fn default_timeout_ms() -> u64 {
@@ -2156,6 +2479,7 @@ impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
             body_bytes: default_body_bytes(),
+            audio_upload_bytes: default_audio_upload_bytes(),
             timeout_ms: default_timeout_ms(),
             concurrency: default_concurrency(),
         }
@@ -2458,6 +2782,15 @@ impl WyrdServerConfig {
             })?;
         }
 
+        // limits.audio_upload_bytes
+        if let Some(val) = env_opt("WYRD_HTTP_AUDIO_UPLOAD_LIMIT_BYTES")? {
+            self.limits.audio_upload_bytes =
+                val.parse::<usize>().map_err(|e| ConfigError::BadEnvVar {
+                    key: "WYRD_HTTP_AUDIO_UPLOAD_LIMIT_BYTES".to_string(),
+                    message: e.to_string(),
+                })?;
+        }
+
         // limits.timeout_ms
         if let Some(val) = env_opt("WYRD_HTTP_REQUEST_TIMEOUT_MS")? {
             self.limits.timeout_ms = val.parse::<u64>().map_err(|e| ConfigError::BadEnvVar {
@@ -2558,6 +2891,8 @@ impl WyrdServerConfig {
     /// # Errors
     /// Returns [`ConfigError`] for any violated constraint.
     fn validate(&self) -> Result<(), ConfigError> {
+        self.gateway
+            .validate(self.deployment_profile.is_production())?;
         let serves_api = self.role.serves_api();
         if self.forge.per_tenant_active_cap == Some(0) {
             return Err(ConfigError::Invalid {
@@ -2670,6 +3005,16 @@ impl WyrdServerConfig {
                     message: format!(
                         "limits.body_bytes must be >= 1048576 (1 MiB), got {}",
                         self.limits.body_bytes
+                    ),
+                });
+            }
+
+            // 4a. limits.audio_upload_bytes >= 1 MiB
+            if self.limits.audio_upload_bytes < 1_048_576 {
+                return Err(ConfigError::Invalid {
+                    message: format!(
+                        "limits.audio_upload_bytes must be >= 1048576 (1 MiB), got {}",
+                        self.limits.audio_upload_bytes
                     ),
                 });
             }
@@ -3096,6 +3441,7 @@ fn validate_otlp_endpoint(url_str: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
     use std::sync::Mutex;
 
     use super::*;
@@ -4813,5 +5159,161 @@ minimum_slots = 2
                 .expect_err("class allocations exceeding usable slots must fail closed")
                 .contains("exceeds usable slots")
         );
+    }
+    /// Gateway operator config parses binding and Vault prefix assignments,
+    /// rejects production `http` addresses, overlapping prefixes, and
+    /// non-local tokens, and assigns Vault references by whole path segments.
+    #[test]
+    fn gateway_config_validates_backends_and_assigns_vault_prefixes() {
+        let tenant = wyrd_spec::DataTenantId::new_v7();
+        let parse = |address: &str, second: &str, token: &str| {
+            toml::from_str::<GatewayConfig>(&format!(
+                r#"
+[credential_bindings.openai-env]
+secret = {{ source = "env", name = "OPENAI_KEY" }}
+assignment = {{ tenant = "{tenant}", provider = "openai" }}
+
+[secret_backends.vault]
+address = "{address}"
+mount = "kv/team"
+token = {token}
+
+[secret_backends.vault.paths.openai]
+tenant = "{tenant}"
+provider = "openai"
+
+[secret_backends.vault.paths."{second}"]
+tenant = "{tenant}"
+provider = "anthropic"
+"#
+            ))
+            .expect("gateway config parses")
+        };
+        let file_token = r#"{ source = "file", path = "/run/secrets/vault-token" }"#;
+        let config = parse("https://vault.example", "anthropic", file_token);
+        config.validate(true).expect("https config validates");
+        assert!(
+            parse("http://vault.example", "anthropic", file_token)
+                .validate(true)
+                .is_err()
+        );
+        parse("http://vault.example", "anthropic", file_token)
+            .validate(false)
+            .expect("http allowed outside production");
+        assert!(
+            parse("https://vault.example", "openai/team", file_token)
+                .validate(true)
+                .is_err()
+        );
+        assert!(
+            parse(
+                "https://vault.example",
+                "anthropic",
+                r#"{ source = "env", name = "" }"#
+            )
+            .validate(true)
+            .is_err()
+        );
+
+        let lookup = |reference: &str| {
+            config
+                .assignment(&ProviderCredentialSourceView::ExternalSecret {
+                    backend: SecretBackendName::new("vault").expect("backend"),
+                    reference: ExternalSecretReference::new(reference).expect("reference"),
+                })
+                .map(|assignment| assignment.provider.as_str().to_owned())
+        };
+        assert_eq!(lookup("openai#k").as_deref(), Some("openai"));
+        assert_eq!(lookup("openai/team#k").as_deref(), Some("openai"));
+        assert_eq!(lookup("openai-team#k"), None);
+        assert_eq!(lookup("other#k"), None);
+    }
+
+    /// Build a one-tenant, one-version keyring config reading `path`.
+    ///
+    /// The caller owns the file so it can set the mode, size, or kind each
+    /// case needs; only the `SecretRef::File` wiring lives here.
+    fn file_backed_keyring(path: &Path) -> GatewayConfig {
+        GatewayConfig {
+            managed_secret_keys: BTreeMap::from([(
+                DataTenantId::new_v7(),
+                GatewayManagedSecretKeys {
+                    active: "v1".to_owned(),
+                    versions: BTreeMap::from([(
+                        "v1".to_owned(),
+                        SecretRef::File {
+                            path: path.display().to_string(),
+                        },
+                    )]),
+                },
+            )]),
+            ..GatewayConfig::default()
+        }
+    }
+
+    /// Write `contents` to `path` with Unix mode `mode`.
+    ///
+    /// # Panics
+    /// Panics when the file cannot be created, written, or chmodded.
+    fn write_key_file(path: &Path, contents: &str, mode: u32) {
+        std::fs::write(path, contents).expect("key file writes");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .expect("key file mode applies");
+    }
+
+    /// A mounted tenant wrapping key loads only from an owner-only regular file.
+    ///
+    /// The file carries authority over every stored provider secret for its
+    /// tenant, so boot applies the same open-handle, regular-file, owner-only,
+    /// bounded rule the request path applies to an operator binding. A `0644`
+    /// mount is the common misconfiguration and must be refused, and no
+    /// refusal may quote the key.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the temporary directory or a key file cannot be written,
+    /// when the owner-only mount is refused, when a permissive, non-regular,
+    /// or oversized mount is accepted or refused with anything other than a
+    /// member-naming `ConfigError::Invalid`, or when a refusal quotes the key.
+    #[test]
+    fn mounted_tenant_keys_require_a_restrictive_regular_bounded_file() {
+        const KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let directory = tempfile::tempdir().expect("key temp directory");
+
+        let owner_only = directory.path().join("owner-only.key");
+        write_key_file(&owner_only, KEY, 0o600);
+        assert!(
+            file_backed_keyring(&owner_only)
+                .managed_secret_keys()
+                .is_ok(),
+            "an owner-only regular file is the supported mount"
+        );
+
+        let permissive = directory.path().join("permissive.key");
+        write_key_file(&permissive, KEY, 0o644);
+
+        let oversized = directory.path().join("oversized.key");
+        write_key_file(&oversized, &KEY.repeat(4096), 0o600);
+
+        for (case, path) in [
+            ("permissive", permissive.as_path()),
+            ("non-regular", directory.path()),
+            ("oversized", oversized.as_path()),
+        ] {
+            let error = file_backed_keyring(path)
+                .managed_secret_keys()
+                .expect_err(case);
+            let ConfigError::Invalid { message } = error else {
+                panic!("{case} refusal is an invalid-configuration error");
+            };
+            assert!(
+                message.starts_with("gateway.managed_secret_keys."),
+                "{case} refusal names the configuration member: {message}"
+            );
+            assert!(
+                !message.contains(KEY) && !message.contains(&KEY[..8]),
+                "{case} refusal quotes key material: {message}"
+            );
+        }
     }
 }

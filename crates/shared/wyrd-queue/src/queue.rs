@@ -4,16 +4,19 @@ use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
+use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
 use crossbeam_queue::ArrayQueue;
 use uuid::Uuid;
 use wyrd_spec::reference::CardRef;
+use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::ids::RunId;
 
 use crate::batch_builder::BatchBuilder;
 use crate::config::QueueConfig;
 use crate::error::WyrdQueueError;
 use crate::producer::{ClientByteBudget, ClientByteGuard, Counters, RetryPermit};
+use crate::sealed_sender::encode_ipc;
 use crate::sink::{BatchSink, DurableBatchAck, OwnedIpcBytes, SealedBatch, SinkError};
 
 /// One buffered JSON row and the client reservation that pays for its bytes.
@@ -31,6 +34,29 @@ pub struct Row {
     pub run_id: Option<RunId>,
     /// The one handle-wide byte reservation held while the row is buffered.
     pub(crate) _guard: ClientByteGuard,
+}
+
+/// One caller-built Arrow batch and the reservation that pays for its arrays.
+///
+/// The batch is already the durable unit, so it never enters JSON staging: the
+/// background owner encodes it as its own sealed batch.
+#[derive(Debug)]
+pub(crate) struct OwnedBatch {
+    /// The caller's batch, sent with its schema unchanged.
+    pub(crate) batch: RecordBatch,
+    /// The handle-wide reservation charged for the batch's array memory.
+    pub(crate) guard: ClientByteGuard,
+    /// Originating request the batch's sealed frame is published under.
+    pub(crate) request_id: Option<RequestId>,
+}
+
+/// One admitted unit of producer work carried by the bounded data channel.
+#[derive(Debug)]
+pub(crate) enum Entry {
+    /// A JSON row staged and coalesced with its neighbours.
+    Row(Row),
+    /// An Arrow batch sealed alone under its own stable identity.
+    Batch(OwnedBatch),
 }
 
 /// The retry state couples a retained sealed batch with its bounded retry slot.
@@ -57,22 +83,6 @@ impl SendEntry {
         match self {
             Self::Fresh(batch) => batch,
             Self::Retained(entry) => &entry.batch,
-        }
-    }
-
-    /// Retains ambiguity, reserving cardinality only for a fresh batch.
-    ///
-    /// # Errors
-    ///
-    /// Returns backpressure only when a fresh ambiguity cannot reserve its
-    /// first retry slot. A retained attempt reuses its existing permit.
-    fn into_retry(self, budget: &ClientByteBudget) -> Result<RetryEntry, WyrdQueueError> {
-        match self {
-            Self::Fresh(batch) => Ok(RetryEntry {
-                batch,
-                _permit: budget.reserve_retry()?,
-            }),
-            Self::Retained(entry) => Ok(entry),
         }
     }
 }
@@ -164,13 +174,84 @@ impl RecordQueue {
             .map(|entry| entry.batch.batch_id)
     }
 
-    /// Transfers one row to staging or records visible backpressure after one seal.
-    pub(crate) async fn ingest(&self, row: Row) {
+    /// Moves one admitted entry into staging or, for an Arrow batch, seals and sends it.
+    ///
+    /// A JSON row that still cannot be staged after one seal is counted as
+    /// dropped. An Arrow batch reaches the sink immediately; its durable
+    /// identity is recorded in `outcome` on acknowledgement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an Arrow batch's encode, size, byte-envelope, or transport
+    /// settlement error. A retryable settlement has already retained the exact
+    /// sealed owner for the scheduled retry. JSON rows never fail here.
+    pub(crate) async fn ingest(
+        &self,
+        entry: Entry,
+        outcome: &mut FlushOutcome,
+    ) -> Result<(), WyrdQueueError> {
+        let row = match entry {
+            Entry::Row(row) => row,
+            Entry::Batch(batch) => return self.seal_batch(batch, outcome).await,
+        };
         if let Some(row) = self.push(row) {
             let _ = self.seal_and_send().await;
             if self.push(row).is_some() {
-                self.counters.dropped.fetch_add(1, Ordering::SeqCst);
-                tracing::warn!("row rejected: fixed staging remains full after seal");
+                self.settle_loss(1, None, WyrdQueueError::QueueFull.code());
+            }
+        }
+        Ok(())
+    }
+
+    /// Seals one Arrow batch as its own frame and sends it through the retry owner.
+    ///
+    /// Before encoding, the array reservation grows to cover the arrays plus a
+    /// frame of up to the message ceiling, since both are live while the
+    /// encoder runs and the encoder cannot grow past that ceiling. The arrays
+    /// are released as soon as the frame exists, and the reservation shrinks
+    /// to the frame before the batch slot is attached. The UUIDv7 minted here
+    /// survives every retained retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WyrdQueueError::Backpressure`] before encoding when the
+    /// overlap does not fit, or when the live-batch envelope is full,
+    /// [`WyrdQueueError::PayloadTooLarge`] once the frame would exceed the
+    /// message ceiling, and [`WyrdQueueError::SchemaParse`] when encoding
+    /// fails; those rows are settled as lost. Transport errors follow
+    /// [`Self::send_one`].
+    async fn seal_batch(
+        &self,
+        owned: OwnedBatch,
+        outcome: &mut FlushOutcome,
+    ) -> Result<(), WyrdQueueError> {
+        let OwnedBatch {
+            batch,
+            guard,
+            request_id,
+        } = owned;
+        let rows = batch.num_rows() as u64;
+        let limit = self.config.max_message_bytes;
+        let sealed = guard
+            .fit(batch.get_array_memory_size().saturating_add(limit))
+            .and_then(|guard| {
+                let frame = encode_ipc(&batch, limit);
+                drop(batch);
+                let frame = frame?;
+                let guard = guard.fit(frame.len())?.attach_batch()?;
+                Ok(SealedBatch {
+                    table: self.table.clone(),
+                    batch_id: Uuid::now_v7().into_bytes(),
+                    frame: OwnedIpcBytes::new(frame, guard),
+                    rows,
+                    request_id,
+                })
+            });
+        match sealed {
+            Ok(sealed) => self.send_one(SendEntry::Fresh(sealed), outcome).await,
+            Err(error) => {
+                self.settle_loss(rows, None, error.code());
+                Err(error)
             }
         }
     }
@@ -215,17 +296,62 @@ impl RecordQueue {
 
     /// Adds one ambiguous attempt to the bounded retry set without replacing its permit.
     ///
+    /// A fresh ambiguity reserves its first retry slot; a retained attempt
+    /// reuses its existing permit. A fresh batch refused a slot is settled as
+    /// lost before its owner is released.
+    ///
     /// # Errors
     ///
     /// Returns backpressure only when a fresh ambiguity cannot reserve its
     /// first retry slot.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the retry lock is poisoned.
     fn retain_retry(&self, entry: SendEntry) -> Result<(), WyrdQueueError> {
-        let entry = entry.into_retry(&self.budget)?;
+        let entry = match entry {
+            SendEntry::Retained(entry) => entry,
+            SendEntry::Fresh(batch) => match self.budget.reserve_retry() {
+                Ok(permit) => RetryEntry {
+                    batch,
+                    _permit: permit,
+                },
+                Err(error) => {
+                    self.settle_loss(batch.rows, Some(SendEntry::Fresh(batch)), error.code());
+                    return Err(error);
+                }
+            },
+        };
         self.retry
             .lock()
             .expect("retry lock is not poisoned")
             .push_back(entry);
         Ok(())
+    }
+
+    /// Settles `rows` this queue accepted but will never publish, exactly once.
+    ///
+    /// Every post-admission discard routes here: a row staging cannot hold, an
+    /// Arrow batch that cannot be sealed, a row too large to frame, a terminal
+    /// sink refusal, and a fresh ambiguity refused a retry slot. The rows are
+    /// counted as dropped, and one warning names only the table, row count,
+    /// stable `code`, and the batch and request identities when a sealed
+    /// `owner` exists. The owner's bytes and any retry slot are then released
+    /// before the handle's loss observer is told, so an observer reading the
+    /// handle's ownership sees the settled values without a later enqueue.
+    fn settle_loss(&self, rows: u64, owner: Option<SendEntry>, code: &str) {
+        self.counters.dropped.fetch_add(rows, Ordering::AcqRel);
+        let batch = owner.as_ref().map(SendEntry::batch);
+        tracing::warn!(
+            table = %self.table,
+            rows,
+            code,
+            batch_id = ?batch.map(|batch| Uuid::from_bytes(batch.batch_id)),
+            request_id = ?batch.and_then(|batch| batch.request_id.as_ref()).map(RequestId::as_str),
+            "bifrost rows lost before durable acknowledgement"
+        );
+        drop(owner);
+        self.budget.report_loss(rows);
     }
 
     /// Sends a borrowed batch within the configured deadline and records explicit ACKs.
@@ -238,7 +364,8 @@ impl RecordQueue {
     ///
     /// Returns [`WyrdQueueError::FlushTimeout`] after retaining the exact batch
     /// on deadline expiry, a sink error after retry or terminal settlement, or
-    /// backpressure if the bounded retry state cannot retain the batch.
+    /// backpressure if the bounded retry state cannot retain the batch. Both
+    /// terminal settlement and refused retention settle the rows as lost.
     async fn send_one(
         &self,
         entry: SendEntry,
@@ -255,7 +382,10 @@ impl RecordQueue {
                 self.retain_retry(entry)?;
                 Err(WyrdQueueError::Sink(error))
             }
-            Ok(Err(SinkError::Terminal(error))) => Err(WyrdQueueError::Sink(error)),
+            Ok(Err(SinkError::Terminal(error))) => {
+                self.settle_loss(entry.batch().rows, Some(entry), error.code());
+                Err(WyrdQueueError::Sink(error))
+            }
             Err(_) => {
                 self.retain_retry(entry)?;
                 Err(WyrdQueueError::FlushTimeout)
@@ -317,13 +447,12 @@ impl RecordQueue {
                     chunks.push_front(chunk);
                     continue;
                 }
-                self.counters.dropped.fetch_add(1, Ordering::AcqRel);
+                let error = frame.err().unwrap_or(WyrdQueueError::PayloadTooLarge);
+                drop(chunk);
+                self.settle_loss(1, None, error.code());
                 let later = chunks.into_iter().flatten().collect();
                 self.restore_unsealed(later);
-                return match frame {
-                    Err(error) => Err(error),
-                    Ok(_) => Err(WyrdQueueError::PayloadTooLarge),
-                };
+                return Err(error);
             }
             let frame = frame.expect("successful frame result checked above");
             let frame_guard = frame_guard.resize(frame.len());
@@ -340,6 +469,7 @@ impl RecordQueue {
                 batch_id: Uuid::now_v7().into_bytes(),
                 frame: OwnedIpcBytes::new(frame, frame_guard),
                 rows: chunk.len() as u64,
+                request_id: None,
             };
             drop(chunk);
             if let Err(error) = self.send_one(SendEntry::Fresh(batch), &mut outcome).await {
@@ -405,6 +535,90 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect()
+    }
+
+    /// Seals `batch`, admitted with its array reservation, through a fresh
+    /// queue over a `budget_bytes` handle and `max_message_bytes` ceiling,
+    /// returning the result, dropped rows, published batches, and the bytes
+    /// still reserved once the queue is gone.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the budget cannot admit the batch's arrays.
+    async fn seal(
+        batch: &RecordBatch,
+        budget_bytes: usize,
+        max_message_bytes: usize,
+    ) -> (Result<(), WyrdQueueError>, u64, usize, usize) {
+        let budget = ClientByteBudget::new(budget_bytes);
+        let sink = Arc::new(MockSink::new());
+        let counters = Arc::new(Counters::default());
+        let queue = RecordQueue::new(
+            "events".to_owned(),
+            batch.schema(),
+            Arc::new(ArrayQueue::new(1)),
+            sink.clone(),
+            QueueConfig {
+                max_message_bytes,
+                ..QueueConfig::default()
+            },
+            budget.clone(),
+            counters.clone(),
+        );
+        let owned = OwnedBatch {
+            guard: budget
+                .reserve(batch.get_array_memory_size())
+                .expect("the arrays are admitted"),
+            batch: batch.clone(),
+            request_id: None,
+        };
+        let result = queue
+            .ingest(Entry::Batch(owned), &mut FlushOutcome::default())
+            .await;
+        drop(queue);
+        (
+            result,
+            counters.dropped.load(Ordering::Acquire),
+            sink.received().len(),
+            budget.used_bytes(),
+        )
+    }
+
+    /// For a long and a schema-heavy wide batch, sealing reserves the arrays
+    /// plus the message ceiling before encoding: a near-ceiling budget seals,
+    /// one byte less refuses before the encoder allocates, and an encoding
+    /// past the ceiling stops at it. Each refusal settles the rows once and
+    /// every outcome releases all bytes.
+    #[tokio::test]
+    async fn arrow_sealing_reserves_the_encoding_overlap_first() {
+        let long = RecordBatch::try_from_iter([(
+            "id",
+            Arc::new(Int64Array::from_iter_values(0..1024)) as arrow::array::ArrayRef,
+        )])
+        .expect("long batch builds");
+        let wide = RecordBatch::try_from_iter((0..256).map(|column| {
+            (
+                format!("column_with_a_long_descriptive_name_{column}"),
+                Arc::new(Int64Array::from(vec![column])) as arrow::array::ArrayRef,
+            )
+        }))
+        .expect("wide batch builds");
+        for batch in [long, wide] {
+            let rows = batch.num_rows() as u64;
+            let arrays = batch.get_array_memory_size();
+            let frame = encode_ipc(&batch, usize::MAX)
+                .expect("unbounded encoding")
+                .len();
+            let near = seal(&batch, arrays + frame, frame).await;
+            assert!(near.0.is_ok(), "{:?}", near.0);
+            assert_eq!((near.1, near.2, near.3), (0, 1, 0));
+            let short = seal(&batch, arrays + frame - 1, frame).await;
+            assert!(matches!(short.0, Err(WyrdQueueError::Backpressure)));
+            assert_eq!((short.1, short.2, short.3), (rows, 0, 0));
+            let oversized = seal(&batch, QueueConfig::MAX_CLIENT_BYTE_LIMIT, frame - 1).await;
+            assert!(matches!(oversized.0, Err(WyrdQueueError::PayloadTooLarge)));
+            assert_eq!((oversized.1, oversized.2, oversized.3), (rows, 0, 0));
+        }
     }
 
     /// Aggregate oversize bisects left-first and preserves every row exactly once.

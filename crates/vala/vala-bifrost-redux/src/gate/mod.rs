@@ -35,7 +35,8 @@ use crate::namespaces::BifrostNamespace;
 use crate::oracle::{AuthorizedQueryContext, OracleQueryStream, QueryStreamLifecycle};
 pub use crate::otlp_contract::{IngestOutcome, LogsOutcome, MetricsOutcome};
 use crate::scribe::preprocess::{correlation_data_identity, logical_data_identity};
-use wyrd_spec::auth::PrincipalId;
+use crate::tables::{CallsTable, DomainTable, SpansTable};
+use wyrd_spec::auth::{GATEWAY_CAPTURE_PRINCIPAL, PrincipalId};
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::vala::api::{AuditOutcome, BifrostQueryRequest};
 use wyrd_spec::vala::error::BifrostError;
@@ -424,39 +425,108 @@ impl<A: GateAudit + 'static> Gate<A> {
         self
     }
 
-    /// Evaluates the write permission and durably records the decision.
+    /// Evaluates the table-scoped write permission and durably records the decision.
     ///
     /// Both outcomes are recorded, and the row commits before the write is
-    /// admitted or refused, so no admitted write and no refusal is unlogged.
+    /// admitted or refused, so no admitted write and no refusal is unlogged. A
+    /// destination that cannot be resolved reaches no decision and records none.
     ///
     /// # Errors
     ///
-    /// Returns [`IngestError::RbacDenied`] when the principal lacks the
-    /// permission, and [`IngestError::AuditUnavailable`] when either decision
-    /// cannot be recorded.
+    /// Returns [`IngestError::RbacDenied`] when the principal lacks the scoped
+    /// permission, [`IngestError::ReservedBuiltinWriteDenied`] when a principal
+    /// other than the gateway capture principal targets `vala.gateway.calls`
+    /// (the capture principal targeting any table besides `vala.gateway.calls`
+    /// and `vala.traces.spans` is an [`IngestError::RbacDenied`]),
+    /// [`IngestError::AuditUnavailable`] when the decision cannot be recorded,
+    /// and the mapped Scribe failure when the destination cannot be resolved.
     async fn authorize_record_write(
         &self,
         auth: &AuthContext,
-        resource: &str,
+        table: &TableRef,
     ) -> Result<(), IngestError> {
         let audit = self
             .audit
             .as_ref()
             .ok_or_else(|| IngestError::AuditUnavailable("gate has no audit sink".to_owned()))?;
-        let decision = wyrd_runtime::RbacCheck
-            .check(
-                &auth.principal,
-                &wyrd_runtime::Permission::bifrost_record_write(),
-            )
-            .into_result()
-            .map_err(IngestError::from_rbac);
+        let decision = self.record_write_verdict(auth, table).await?;
         let outcome = if decision.is_ok() {
             AuditOutcome::Allowed
         } else {
             AuditOutcome::Denied
         };
-        audit.append_write_decision(auth, resource, outcome).await?;
+        audit
+            .append_write_decision(auth, &table.fqn(), outcome)
+            .await?;
         decision
+    }
+
+    /// Reaches the write verdict for one destination without recording it.
+    ///
+    /// The checks run cheapest first. A principal holding `BifrostRecord`
+    /// `Write` under no scope at all is refused before any catalog work. The
+    /// exact `vala.gateway.calls` table is reserved to the gateway capture
+    /// principal, so every other principal, a wildcard holder included, is
+    /// refused next; the rest of `vala.gateway` is not reserved. The capture
+    /// principal is in turn confined to `vala.gateway.calls` and
+    /// `vala.traces.spans`: any other destination is refused before Scribe
+    /// resolves it, whatever its token carries. Otherwise
+    /// Scribe resolves the tenant's registered table UID and the principal must
+    /// hold `BifrostRecord` `Write` covering that exact table object scope.
+    ///
+    /// # Errors
+    ///
+    /// The outer error is an unresolvable destination, which is not a
+    /// decision: [`IngestError::IngressClosed`] without a Scribe, or the mapped
+    /// Scribe failure. The inner result is the decision itself.
+    async fn record_write_verdict(
+        &self,
+        auth: &AuthContext,
+        table: &TableRef,
+    ) -> Result<Result<(), IngestError>, IngestError> {
+        let principal = &auth.principal;
+        let check = |required: &wyrd_runtime::Permission| {
+            wyrd_runtime::RbacCheck
+                .check(principal, required)
+                .into_result()
+                .map_err(IngestError::from_rbac)
+        };
+        if !principal.effective_permissions.covers_operation(
+            &wyrd_runtime::Resource::BifrostRecord,
+            &wyrd_runtime::Action::Write,
+        ) {
+            return Ok(check(&wyrd_runtime::Permission::bifrost_record_write()));
+        }
+        if table.namespace == BifrostNamespace::Gateway
+            && table.name == CallsTable::NAME
+            && principal.id != GATEWAY_CAPTURE_PRINCIPAL
+        {
+            return Ok(Err(IngestError::ReservedBuiltinWriteDenied {
+                table: table.fqn(),
+            }));
+        }
+        let capture_destination = (table.namespace == BifrostNamespace::Gateway
+            && table.name == CallsTable::NAME)
+            || (table.namespace == BifrostNamespace::Traces && table.name == SpansTable::NAME);
+        if principal.id == GATEWAY_CAPTURE_PRINCIPAL && !capture_destination {
+            return Ok(Err(IngestError::RbacDenied {
+                detail: format!(
+                    "principal {} may write only vala.gateway.calls and vala.traces.spans, not {}",
+                    principal.id,
+                    table.fqn()
+                ),
+            }));
+        }
+        let scribe = self.scribe.as_ref().ok_or(IngestError::IngressClosed)?;
+        let table_uid = scribe
+            .resolve_write_table(auth.tenant, table)
+            .await
+            .map_err(IngestError::from_scribe)?;
+        Ok(check(&wyrd_runtime::Permission {
+            resource: wyrd_runtime::Resource::BifrostRecord,
+            action: wyrd_runtime::Action::Write,
+            scope: table.permission_scope(&table_uid),
+        }))
     }
 
     /// Stop accepting new ingest requests.
@@ -647,10 +717,7 @@ impl<A: GateAudit + 'static> Gate<A> {
         self.ensure_open()?;
         record_gate_event("otlp_export");
         if let Err(error) = self
-            .authorize_record_write(
-                auth,
-                &TableRef::new(BifrostNamespace::Traces, "spans").fqn(),
-            )
+            .authorize_record_write(auth, &TableRef::new(BifrostNamespace::Traces, "spans"))
             .await
         {
             record_gate_event("otlp_rejection");
@@ -689,10 +756,7 @@ impl<A: GateAudit + 'static> Gate<A> {
         self.ensure_open()?;
         record_gate_event("otlp_export");
         if let Err(error) = self
-            .authorize_record_write(
-                auth,
-                &TableRef::new(BifrostNamespace::Metrics, "points").fqn(),
-            )
+            .authorize_record_write(auth, &TableRef::new(BifrostNamespace::Metrics, "points"))
             .await
         {
             record_gate_event("otlp_rejection");
@@ -735,10 +799,7 @@ impl<A: GateAudit + 'static> Gate<A> {
         self.ensure_open()?;
         record_gate_event("otlp_export");
         if let Err(error) = self
-            .authorize_record_write(
-                auth,
-                &TableRef::new(BifrostNamespace::Logs, "records").fqn(),
-            )
+            .authorize_record_write(auth, &TableRef::new(BifrostNamespace::Logs, "records"))
             .await
         {
             record_gate_event("otlp_rejection");
@@ -878,7 +939,7 @@ impl<A: GateAudit + 'static> Gate<A> {
             return Err(IngestError::ReservedBuiltinWriteDenied { table: frame.table });
         }
         let table = TableRef::new(namespace, name);
-        self.authorize_record_write(auth, &table.fqn()).await?;
+        self.authorize_record_write(auth, &table).await?;
         let scribe = self.scribe.as_ref().ok_or(IngestError::IngressClosed)?;
         let ingress = ScribeIngressFrame {
             principal: auth.principal.clone(),
@@ -1031,13 +1092,18 @@ mod tests {
 
     use super::limits::IngestLimits;
     use super::{AuditOutcome, AuthContext, Gate, GateAudit, IngestError};
+    use crate::catalog::{TableRef, TableUid};
     use crate::contracts::DecodedOtlp;
+    use crate::namespaces::BifrostNamespace;
     use arrow::array::Array as _;
     use arrow::record_batch::RecordBatch;
     use async_trait::async_trait;
     use futures_util::StreamExt as _;
-    use wyrd_runtime::{Permission, PermissionSet, Principal, PrincipalKind};
-    use wyrd_spec::auth::PrincipalId;
+    use wyrd_runtime::builtin_roles::gateway_capture_permissions;
+    use wyrd_runtime::{
+        Action, Permission, PermissionScope, PermissionSet, Principal, PrincipalKind, Resource,
+    };
+    use wyrd_spec::auth::{GATEWAY_CAPTURE_PRINCIPAL, PrincipalId};
     use wyrd_spec::ids::DataTenantId;
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::QueryStreamFrame;
@@ -1264,6 +1330,19 @@ mod tests {
                 rows_accepted: 0,
             })
         }
+
+        /// Resolves every destination to one fixed registered identity.
+        ///
+        /// # Errors
+        ///
+        /// This test implementation never fails.
+        async fn resolve_write_table(
+            &self,
+            _tenant: DataTenantId,
+            _table: &TableRef,
+        ) -> Result<TableUid, crate::contracts::ScribeError> {
+            Ok(TableUid::from_bytes([7; 16]))
+        }
     }
 
     struct NotReadyScribe;
@@ -1278,6 +1357,19 @@ mod tests {
             &self,
             _frame: crate::contracts::ScribeIngressFrame,
         ) -> Result<crate::contracts::FrameAdmission, crate::contracts::ScribeError> {
+            panic!("a not-ready Scribe must be rejected by Gate first");
+        }
+
+        /// Refuses resolution because Gate must reject a not-ready Scribe first.
+        ///
+        /// # Errors
+        ///
+        /// Never returns; reaching it panics the owning test.
+        async fn resolve_write_table(
+            &self,
+            _tenant: DataTenantId,
+            _table: &TableRef,
+        ) -> Result<TableUid, crate::contracts::ScribeError> {
             panic!("a not-ready Scribe must be rejected by Gate first");
         }
     }
@@ -1404,6 +1496,109 @@ mod tests {
                 rows_accepted: 0,
             })
         }
+
+        /// Resolves every destination to one fixed registered identity.
+        ///
+        /// # Errors
+        ///
+        /// This test implementation never fails.
+        async fn resolve_write_table(
+            &self,
+            _tenant: DataTenantId,
+            _table: &TableRef,
+        ) -> Result<TableUid, crate::contracts::ScribeError> {
+            Ok(TableUid::from_bytes([7; 16]))
+        }
+    }
+
+    /// Scribe double that resolves every destination to one chosen UID and
+    /// counts how far Gate let each write travel.
+    struct ResolvingScribe {
+        /// Registered identity every destination resolves to.
+        table_uid: TableUid,
+        /// Destination resolutions Gate requested.
+        resolved: AtomicUsize,
+        /// Frames Gate handed on after authorization.
+        ingested: AtomicUsize,
+    }
+
+    impl ResolvingScribe {
+        /// Builds one double resolving to `table_uid`.
+        fn new(table_uid: TableUid) -> Arc<Self> {
+            Arc::new(Self {
+                table_uid,
+                resolved: AtomicUsize::new(0),
+                ingested: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl crate::contracts::Scribe for ResolvingScribe {
+        /// Counts one authorized frame.
+        ///
+        /// # Errors
+        ///
+        /// This test implementation never fails.
+        async fn ingest_frame(
+            &self,
+            _frame: crate::contracts::ScribeIngressFrame,
+        ) -> Result<crate::contracts::FrameAdmission, crate::contracts::ScribeError> {
+            self.ingested.fetch_add(1, Ordering::Relaxed);
+            Ok(crate::contracts::FrameAdmission {
+                batch_id: uuid::Uuid::now_v7(),
+                rows_accepted: 0,
+            })
+        }
+
+        /// Counts one resolution and answers the configured identity.
+        ///
+        /// # Errors
+        ///
+        /// This test implementation never fails.
+        async fn resolve_write_table(
+            &self,
+            _tenant: DataTenantId,
+            _table: &TableRef,
+        ) -> Result<TableUid, crate::contracts::ScribeError> {
+            self.resolved.fetch_add(1, Ordering::Relaxed);
+            Ok(self.table_uid)
+        }
+    }
+
+    /// One native frame for `table` carrying a fresh `UUIDv7` batch identity.
+    fn native_frame(table: &str) -> wyrd_tonic::wyrd::v1::InsertBatchRequest {
+        wyrd_tonic::wyrd::v1::InsertBatchRequest {
+            table: table.to_owned(),
+            wyrd_batch_id: uuid::Uuid::now_v7().as_bytes().to_vec().into(),
+            arrow_ipc: Vec::new().into(),
+        }
+    }
+
+    /// One authenticated context for `id` of `kind` holding exactly `permissions`.
+    fn context_with(
+        id: PrincipalId,
+        kind: PrincipalKind,
+        permissions: impl IntoIterator<Item = Permission>,
+    ) -> AuthContext {
+        let tenant = DataTenantId::new_v7();
+        AuthContext {
+            principal: Principal::new(
+                id,
+                kind,
+                tenant,
+                Vec::new(),
+                PermissionSet::from_iter(permissions),
+            ),
+            tenant,
+            request_id: RequestId::now_v7(),
+            delegation_chain: Vec::new(),
+        }
+    }
+
+    /// A random registered table identity.
+    fn random_uid() -> TableUid {
+        TableUid::from_bytes(*uuid::Uuid::now_v7().as_bytes())
     }
 
     fn auth_context(with_permission: bool) -> AuthContext {
@@ -1578,6 +1773,165 @@ mod tests {
             vec![AuditOutcome::Denied],
             "the refusal is recorded before it is returned"
         );
+    }
+
+    /// Only the gateway capture principal may write the exact call table, and
+    /// it may write nothing but the call and span tables.
+    ///
+    /// A wildcard holder is refused before Scribe resolves anything; the
+    /// capture principal reaches Scribe with its scoped grants for
+    /// `vala.gateway.calls` and `vala.traces.spans`, yet is refused any other
+    /// table before resolution, even when its principal carries a wildcard.
+    /// Every verdict is recorded against the table it targeted.
+    #[tokio::test]
+    async fn gate_reserves_the_gateway_call_table_to_the_capture_principal() {
+        let calls_uid = random_uid();
+        let spans_uid = random_uid();
+        let scribe = ResolvingScribe::new(calls_uid);
+        let audit = RecordingAudit::new();
+        let gate = Gate::<RecordingAudit>::with_test_scribe(
+            Arc::clone(&scribe) as Arc<dyn crate::contracts::Scribe>,
+            test_interceptor(),
+            IngestLimits::default(),
+        )
+        .with_audit(Arc::clone(&audit));
+        let limits = IngestLimits::default();
+
+        let wildcard = context_with(
+            PrincipalId::new(uuid::Uuid::now_v7()),
+            PrincipalKind::User,
+            [Permission {
+                resource: Resource::Wildcard,
+                action: Action::Wildcard,
+                scope: PermissionScope::All,
+            }],
+        );
+        let error = gate
+            .dispatch_native_frame(&limits, &wildcard, native_frame("vala.gateway.calls"))
+            .await
+            .expect_err("a wildcard holder cannot write the reserved call table");
+        assert!(matches!(
+            error,
+            IngestError::ReservedBuiltinWriteDenied { .. }
+        ));
+        assert_eq!(scribe.resolved.load(Ordering::Relaxed), 0);
+
+        let capture = context_with(
+            GATEWAY_CAPTURE_PRINCIPAL,
+            PrincipalKind::Service {
+                card_ref: None,
+                card_ref_scope: wyrd_runtime::CardRefScope::default(),
+            },
+            gateway_capture_permissions(
+                uuid::Uuid::from_bytes(*calls_uid.as_bytes()),
+                uuid::Uuid::from_bytes(*spans_uid.as_bytes()),
+            ),
+        );
+        gate.dispatch_native_frame(&limits, &capture, native_frame("vala.gateway.calls"))
+            .await
+            .expect("the capture principal writes its scoped call table");
+        let error = gate
+            .dispatch_native_frame(&limits, &capture, native_frame("vala.logs.records"))
+            .await
+            .expect_err("the capture principal is confined to its scoped tables");
+        assert!(matches!(error, IngestError::RbacDenied { .. }));
+        let widened = context_with(
+            GATEWAY_CAPTURE_PRINCIPAL,
+            PrincipalKind::Service {
+                card_ref: None,
+                card_ref_scope: wyrd_runtime::CardRefScope::default(),
+            },
+            [Permission {
+                resource: Resource::Wildcard,
+                action: Action::Wildcard,
+                scope: PermissionScope::All,
+            }],
+        );
+        let error = gate
+            .dispatch_native_frame(&limits, &widened, native_frame("vala.gateway.runs"))
+            .await
+            .expect_err("no grant widens the capture principal past its two tables");
+        assert!(matches!(error, IngestError::RbacDenied { .. }));
+        assert_eq!(
+            scribe.resolved.load(Ordering::Relaxed),
+            1,
+            "only the call-table write reached Scribe resolution"
+        );
+        assert_eq!(scribe.ingested.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            audit.decisions(),
+            vec![
+                ("vala.gateway.calls".to_owned(), AuditOutcome::Denied),
+                ("vala.gateway.calls".to_owned(), AuditOutcome::Allowed),
+                ("vala.logs.records".to_owned(), AuditOutcome::Denied),
+                ("vala.gateway.runs".to_owned(), AuditOutcome::Denied),
+            ]
+        );
+
+        let spans_scribe = ResolvingScribe::new(spans_uid);
+        let spans_gate = Gate::<RecordingAudit>::with_test_scribe(
+            Arc::clone(&spans_scribe) as Arc<dyn crate::contracts::Scribe>,
+            test_interceptor(),
+            IngestLimits::default(),
+        )
+        .with_audit(RecordingAudit::new());
+        spans_gate
+            .dispatch_native_frame(&limits, &capture, native_frame("vala.traces.spans"))
+            .await
+            .expect("the capture principal writes its scoped span table");
+        assert_eq!(spans_scribe.ingested.load(Ordering::Relaxed), 1);
+    }
+
+    /// A table-scoped record write is authorized against the resolved UID.
+    ///
+    /// The same grant is refused when the destination resolves to another
+    /// registration, while the rest of `vala.gateway` stays unreserved for an
+    /// ordinary wildcard writer.
+    #[tokio::test]
+    async fn gate_authorizes_record_writes_against_the_resolved_table_uid() {
+        let granted = random_uid();
+        let scoped = context_with(
+            PrincipalId::new(uuid::Uuid::now_v7()),
+            PrincipalKind::User,
+            [Permission {
+                resource: Resource::BifrostRecord,
+                action: Action::Write,
+                scope: TableRef::new(BifrostNamespace::Traces, "spans").permission_scope(&granted),
+            }],
+        );
+        let limits = IngestLimits::default();
+        let gate_resolving_to = |table_uid| {
+            let scribe = ResolvingScribe::new(table_uid);
+            let gate = Gate::<RecordingAudit>::with_test_scribe(
+                Arc::clone(&scribe) as Arc<dyn crate::contracts::Scribe>,
+                test_interceptor(),
+                IngestLimits::default(),
+            )
+            .with_audit(RecordingAudit::new());
+            (gate, scribe)
+        };
+
+        let (gate, scribe) = gate_resolving_to(random_uid());
+        let error = gate
+            .dispatch_native_frame(&limits, &scoped, native_frame("vala.traces.spans"))
+            .await
+            .expect_err("a grant for another registration does not cover this one");
+        assert!(matches!(error, IngestError::RbacDenied { .. }));
+        assert_eq!(scribe.ingested.load(Ordering::Relaxed), 0);
+
+        let (gate, scribe) = gate_resolving_to(granted);
+        gate.dispatch_native_frame(&limits, &scoped, native_frame("vala.traces.spans"))
+            .await
+            .expect("the grant covers its exact registration");
+        let wildcard = context_with(
+            PrincipalId::new(uuid::Uuid::now_v7()),
+            PrincipalKind::User,
+            [Permission::bifrost_record_write()],
+        );
+        gate.dispatch_native_frame(&limits, &wildcard, native_frame("vala.gateway.other"))
+            .await
+            .expect("only the exact call table is reserved");
+        assert_eq!(scribe.ingested.load(Ordering::Relaxed), 2);
     }
 
     /// Authentication runs before Gate reads anything from the request.

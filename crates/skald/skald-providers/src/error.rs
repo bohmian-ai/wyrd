@@ -1,9 +1,6 @@
 //! Provider error catalog with stable `SKALD_PROVIDERS_*` codes.
 
 use reqwest::StatusCode;
-use tracing::debug;
-
-const MAX_BODY_BYTES: usize = 512;
 
 /// Result alias for provider operations.
 pub type ProviderResult<T> = Result<T, ProviderError>;
@@ -11,16 +8,36 @@ pub type ProviderResult<T> = Result<T, ProviderError>;
 /// Provider HTTP, auth, and decode failures.
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum ProviderError {
-    /// Provider authentication failed or credentials were missing.
+    /// Local provider authentication material was missing or invalid.
     #[error("{provider} authentication failed: {detail}")]
     Auth { provider: String, detail: String },
-    /// Provider rate-limited the request.
-    #[error("{provider} rate limited request")]
-    RateLimit {
+    /// The provider answered with a non-success HTTP status.
+    ///
+    /// `body` keeps the complete bounded answer so callers can relay the
+    /// provider's own error; the display names only the provider and status,
+    /// because provider bodies can echo request content or credentials. The
+    /// stable code follows the status.
+    #[error("{provider} answered HTTP {status}")]
+    Status {
+        /// Provider label.
         provider: String,
+        /// Upstream HTTP status.
+        status: u16,
+        /// Complete answer body.
+        body: String,
+        /// `Retry-After` hint in milliseconds, when the provider sent one.
         retry_after_ms: Option<u64>,
     },
-    /// Provider returned a 5xx or transport-level upstream failure.
+    /// No connection to the provider was established, so it never received
+    /// the request.
+    #[error("{provider} connection failed: {detail}")]
+    Connect {
+        /// Provider label.
+        provider: String,
+        /// Transport failure detail.
+        detail: String,
+    },
+    /// The exchange failed after the provider may have received the request.
     #[error("{provider} upstream error: status={status} body={body}")]
     Upstream {
         provider: String,
@@ -30,7 +47,7 @@ pub enum ProviderError {
     /// Provider request timed out.
     #[error("{provider} request timed out")]
     Timeout { provider: String },
-    /// Provider rejected the request body.
+    /// The request was rejected before it reached the provider.
     #[error("{provider} rejected request: {detail}")]
     BadRequest { provider: String, detail: String },
     /// Provider response could not be decoded as the expected native shape.
@@ -90,25 +107,18 @@ impl ProviderError {
         }
     }
 
-    /// Maps a provider HTTP status and response body to the stable catalog.
+    /// Records a non-success provider answer, keeping its status and body.
     pub fn from_status(
         provider: impl Into<String>,
         status: StatusCode,
         body: impl Into<String>,
         retry_after_ms: Option<u64>,
     ) -> Self {
-        let provider = provider.into();
-        let body = body.into();
-        let truncated = truncate_body(&body);
-        match status.as_u16() {
-            401 | 403 => Self::auth(provider, "provider rejected credentials"),
-            408 => Self::timeout(provider),
-            429 => Self::RateLimit {
-                provider,
-                retry_after_ms,
-            },
-            500..=599 => Self::upstream(provider, status.as_u16(), truncated),
-            _ => Self::bad_request(provider, truncated),
+        Self::Status {
+            provider: provider.into(),
+            status: status.as_u16(),
+            body: body.into(),
+            retry_after_ms,
         }
     }
 
@@ -116,22 +126,20 @@ impl ProviderError {
     pub const fn code(&self) -> &'static str {
         match self {
             Self::Auth { .. } => "SKALD_PROVIDERS_401_AUTH",
-            Self::RateLimit { .. } => "SKALD_PROVIDERS_429_RATE_LIMIT",
+            Self::Status { status, .. } => match *status {
+                401 | 403 => "SKALD_PROVIDERS_401_AUTH",
+                408 => "SKALD_PROVIDERS_408_TIMEOUT",
+                429 => "SKALD_PROVIDERS_429_RATE_LIMIT",
+                500..=599 => "SKALD_PROVIDERS_5XX_UPSTREAM",
+                _ => "SKALD_PROVIDERS_400_BAD_REQUEST",
+            },
+            Self::Connect { .. } => "SKALD_PROVIDERS_503_CONNECT",
             Self::Upstream { .. } => "SKALD_PROVIDERS_5XX_UPSTREAM",
             Self::Timeout { .. } => "SKALD_PROVIDERS_408_TIMEOUT",
             Self::BadRequest { .. } => "SKALD_PROVIDERS_400_BAD_REQUEST",
             Self::Decode { .. } => "SKALD_PROVIDERS_502_DECODE",
             Self::VariantMismatch { .. } => "SKALD_PROVIDERS_400_VARIANT_MISMATCH",
         }
-    }
-}
-
-fn truncate_body(body: &str) -> String {
-    debug!(full_body = %body, "provider upstream response body");
-    if body.len() <= MAX_BODY_BYTES {
-        body.to_owned()
-    } else {
-        format!("{}…[truncated]", &body[..MAX_BODY_BYTES])
     }
 }
 
@@ -170,5 +178,19 @@ mod error_mapping {
             ProviderError::decode("openai", "bad json").code(),
             "SKALD_PROVIDERS_502_DECODE"
         );
+    }
+
+    /// A status answer keeps its complete body for relay, while its display
+    /// names only the provider and status, so formatting never exposes
+    /// provider content.
+    #[test]
+    fn status_errors_keep_the_body_out_of_display() {
+        let body = format!("{{\"error\":\"echoed sk-canary {}\"}}", "é".repeat(400));
+        let error = ProviderError::from_status("openai", StatusCode::BAD_REQUEST, &*body, None);
+
+        assert!(
+            matches!(&error, ProviderError::Status { status: 400, body: kept, .. } if *kept == body)
+        );
+        assert_eq!(error.to_string(), "openai answered HTTP 400");
     }
 }

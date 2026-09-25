@@ -66,7 +66,7 @@ The edge layers, outermost to innermost:
 1. Request-id: propagate a valid inbound `wyrd-request-id`, or mint a fresh UUID v7. The id is written to the response header and injected into problem+json error bodies.
 2. Catch-panic: a panicking handler becomes a `500` problem+json response instead of a dropped connection.
 3. Timeout, concurrency limit, and load shed: enforce `limits.timeout` and `limits.concurrency`, shedding with `503` when saturated.
-4. Body limit: reject bodies over `limits.body_bytes` with `413`, using the `Content-Length` fast path before buffering.
+4. Body limit: reject bodies over `limits.body_bytes` with `413`, using the `Content-Length` fast path before buffering. Gateway Audio transcription and translation uploads pass through unbuffered; their handlers stream them under `limits.audio_upload_bytes`.
 5. Authentication: `/v1` routes require a valid bearer token. Missing or invalid tokens get `401` before the handler runs.
 
 Health routes (`/healthz`, `/readyz`) sit outside the auth layer by design. They carry panic protection but no token requirement.

@@ -73,6 +73,43 @@ Wyrd is multi-tenant by design. In the hosted product, each request names its te
 
 You only need it when you federate identity. Trusted issuers and workload bindings are owned by a tenant, so the moment you declare either one (see [SSO and OIDC](/self-hosting/sso-and-oidc/)), the server has to know which tenant they attach to. Leave it unset if you configure no federation. If you do set it, the slug must resolve to an active tenant at boot; the server resolves it through the same lookup the request handlers use, so a bound issuer matches request-time identity. A slug that resolves to nothing fails boot rather than binding issuers to a tenant that does not exist.
 
+## Gateway
+
+The `[gateway]` table declares what tenant administrators may reference when
+they [configure provider credentials](/how-to/administer-the-gateway/). It is
+TOML-only.
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `credential_bindings.<name>` | none | An `env` (`{ source = "env", name }`) or `file` (`{ source = "file", path }`, absolute) secret reference. Tenants select `<name>` for an `environment` credential and never see the variable or path. |
+| `secret_backends` | `[]` | External secret backend identities tenants may name in an `external_secret` credential. |
+| `managed_secret_keys.<tenant-id>` | none | The tenant's wrapping keyring: `active` names one entry of `versions`, and each version is an `env` or `file` secret reference holding a base64 32-byte key. A tenant with no keyring cannot submit or resolve a `managed_secret` credential. |
+
+```toml
+[gateway]
+secret_backends = ["vault"]
+
+[gateway.credential_bindings]
+openai-prod = { source = "env", name = "OPENAI_API_KEY" }
+
+[gateway.managed_secret_keys.018f2c4e-7a1b-7c3d-9e5f-0a1b2c3d4e5f]
+active = "v2"
+versions.v1 = { source = "file", path = "/etc/wyrd/keys/tenant-a-v1.key" }
+versions.v2 = { source = "file", path = "/etc/wyrd/keys/tenant-a-v2.key" }
+```
+
+Each version's value is read once at boot and held only in process memory;
+Wyrd never persists key material. Boot fails, naming the tenant and version,
+when a key is unreadable, is not standard base64, is not 32 bytes, or is
+shared with another tenant — one wrapping key across tenants is not a valid
+per-tenant configuration. Rotate by adding a version, pointing `active` at it,
+and keeping the older version until nothing is sealed under it any more: new
+submissions seal under `active` while committed envelopes keep opening under
+the version that sealed them. Remove a version only after its envelopes have
+been resubmitted; envelopes whose version is gone fail closed with the same
+redacted upstream-unavailable error as a missing keyring, and never fall back
+to another key, to plaintext, or to another source.
+
 ## Pools
 
 | Variable | Default | Range | Notes |
@@ -85,6 +122,7 @@ You only need it when you federate identity. Trusted issuers and workload bindin
 | Variable | Default | Range | Notes |
 | --- | --- | --- | --- |
 | `WYRD_HTTP_BODY_LIMIT_BYTES` | `1048576` | `>= 1048576` | Max request body. Buffers up to this per request. |
+| `WYRD_HTTP_AUDIO_UPLOAD_LIMIT_BYTES` | `26214400` | `>= 1048576` | Max gateway Audio transcription or translation upload. Streams to a temporary file instead of buffering. |
 | `WYRD_HTTP_REQUEST_TIMEOUT_MS` | `30000` | `1000`–`600000` | Per-request processing timeout. |
 | `WYRD_HTTP_CONCURRENCY_LIMIT` | `1024` | `1`–`1048576` | Max in-flight concurrent requests. |
 | `WYRD_SHUTDOWN_DRAIN_MS` | `15000` | `1000`–`60000` | Drain budget for in-flight requests on shutdown. |
@@ -131,6 +169,7 @@ reflection_enabled = false
 
 [limits]
 body_bytes = 1048576
+audio_upload_bytes = 26214400
 timeout_ms = 30000
 concurrency = 1024
 

@@ -8818,8 +8818,10 @@ dependencies = [
  "serde_yaml",
  "skald-spec",
  "temp-env",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
  "url",
  "urlencoding",
@@ -11086,6 +11088,7 @@ dependencies = [
  "axum-core",
  "base64 0.22.1",
  "base64 0.23.1",
+ "bigdecimal",
  "bitflags 2.13.0",
  "blake2",
  "block-buffer 0.12.1",
@@ -11364,6 +11367,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "uuid",
  "wiremock",
  "workspace-hack",
  "wyrd-auth-oidc",
@@ -11564,6 +11568,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "wyrd-gateway"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "bigdecimal",
+ "chrono",
+ "metrics",
+ "rcgen",
+ "reqwest 0.13.4",
+ "rustls",
+ "secrecy",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "skald-providers",
+ "skald-spec",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "uuid",
+ "wiremock",
+ "wyrd-crypt",
+ "wyrd-spec",
+ "wyrd-tls",
+ "zeroize",
+]
+
+[[package]]
 name = "wyrd-interfaces"
 version = "0.0.1"
 dependencies = [
@@ -11703,6 +11739,8 @@ dependencies = [
  "skald-tool",
  "skald-workflow",
  "tempfile",
+ "tracing",
+ "url",
  "wyrd-cards",
  "wyrd-cli",
  "wyrd-client",
@@ -11758,6 +11796,7 @@ dependencies = [
  "napi-build",
  "napi-derive",
  "secrecy",
+ "url",
  "vala-bifrost-redux",
  "wyrd-runtime",
  "wyrd-testing",
@@ -11846,7 +11885,9 @@ dependencies = [
  "wyrd-client",
  "wyrd-crypt",
  "wyrd-dev-fixtures",
+ "wyrd-gateway",
  "wyrd-loader",
+ "wyrd-queue",
  "wyrd-runtime",
  "wyrd-semver",
  "wyrd-spec",
@@ -12015,7 +12056,6 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "parquet",
- "pyo3",
  "rand 0.9.5",
  "rcgen",
  "reqwest 0.13.4",
@@ -12049,6 +12089,7 @@ dependencies = [
  "wyrd-client",
  "wyrd-crypt",
  "wyrd-dev-fixtures",
+ "wyrd-gateway",
  "wyrd-queue",
  "wyrd-runtime",
  "wyrd-semver",
@@ -12059,7 +12100,6 @@ dependencies = [
  "wyrd-telemetry",
  "wyrd-tls",
  "wyrd-tonic",
- "wyrd-utils",
 ]
 
 [[package]]

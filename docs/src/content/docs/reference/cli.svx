@@ -1,6 +1,6 @@
 ---
 title: CLI
-description: The wyrd binary — auth, eval, and principal commands, with every flag and environment variable.
+description: The wyrd binary — auth, eval, principal, and gateway commands, with every flag and environment variable.
 pillar: wyrd
 group: Reference
 order: 2
@@ -8,8 +8,8 @@ order: 2
 
 # CLI
 
-Reference for the `wyrd` binary. It has three command groups: `auth`, `eval`, and
-`principal`. The binary is built from the repo — see [Get started](/get-started/).
+Reference for the `wyrd` binary. It has four command groups: `auth`, `eval`,
+`principal`, and `gateway`. The binary is built from the repo — see [Get started](/get-started/).
 
 Every server-facing command reads `--server` from `WYRD_SERVER_URL` when the flag
 is omitted. No command takes a secret as an argument: server-facing commands
@@ -157,6 +157,36 @@ wyrd principal revoke 3f9a...uuid --kind service --reason "key leaked" \
     ['--kind', 'yes', '—', 'Principal kind: user, service, or agent.'],
     ['--reason', 'yes', '—', 'Audit reason for the revocation.'],
     ['--server', 'yes', 'WYRD_SERVER_URL', 'Wyrd server base URL.']
+  ]}
+/>
+
+## wyrd gateway
+
+Administer tenant gateway resources. Every verb prints the server's JSON
+response on stdout (deletes print nothing) and failures print the originating
+problem on stderr. See [Administer the gateway](/how-to/administer-the-gateway/)
+for lifecycle rules.
+
+```bash
+wyrd gateway credential put --file credential.json
+WYRD_ACCESS_TOKEN=... wyrd gateway deployment list --server https://acme.wyrd.cloud
+```
+
+<DataTable
+  columns={[
+    { header: 'Command', role: 'name' },
+    { header: 'Meaning' }
+  ]}
+  rows={[
+    ['credential put --file <path>', 'Create or rotate the credential named in the document.'],
+    ['credential get <name> | list', 'Read redacted credentials.'],
+    ['credential revoke <name>', 'Terminally revoke a credential.'],
+    ['credential delete <name>', 'Delete an unreferenced credential; absent names succeed.'],
+    ['deployment put --file <path> | get <name> | list | delete <name>', 'Manage provider deployments.'],
+    ['fallback-policy put --file <path> | get | delete', 'Replace, read, or reset the fallback policy.'],
+    ['governance-policy put --file <path> | get | delete', 'Replace, read, or reset the governance policy.'],
+    ['capture-policy put --file <path> | get', 'Replace or read the capture policy.'],
+    ['--server', 'Wyrd server base URL (WYRD_SERVER_URL). Credentials resolve from WYRD_ACCESS_TOKEN, WYRD_API_KEY, or client configuration; the CLI never accepts them as arguments.']
   ]}
 />
 

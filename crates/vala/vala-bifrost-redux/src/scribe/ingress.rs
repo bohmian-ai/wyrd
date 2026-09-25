@@ -208,6 +208,45 @@ impl ScribeImpl {
         })
     }
 
+    /// Resolves the registered UID Gate authorizes one record write against.
+    ///
+    /// The registration lookup runs first so the common case costs one control
+    /// row. Only a missing built-in destination is provisioned, through the same
+    /// [`crate::catalog::BifrostCatalog::ensure_builtin`] owner ingest uses.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when Scribe has no catalog owner,
+    /// [`ScribeError::TableNotFound`] for an unregistered caller table, and the
+    /// mapped catalog failure otherwise.
+    pub(super) async fn resolve_write_table_uid(
+        &self,
+        tenant: wyrd_spec::ids::DataTenantId,
+        table: &crate::catalog::TableRef,
+    ) -> Result<crate::catalog::TableUid, ScribeError> {
+        let catalog = self.catalog.as_ref().ok_or_else(|| ScribeError::Internal {
+            detail: "Scribe write authorization requires its catalog owner".to_owned(),
+        })?;
+        match catalog.table_uid(table, tenant).await {
+            Err(crate::catalog::BifrostCatalogError::TableNotFound(fqn)) => {
+                let definition = crate::tables::builtin_table(
+                    table
+                        .namespace
+                        .as_str()
+                        .strip_prefix("vala.")
+                        .unwrap_or_default(),
+                    &table.name,
+                )
+                .ok_or(ScribeError::TableNotFound { table: fqn })?;
+                catalog
+                    .ensure_builtin(tenant, definition)
+                    .await
+                    .map_err(scribe_catalog_error)
+            }
+            resolved => resolved.map_err(scribe_catalog_error),
+        }
+    }
+
     /// Computes one immutable material plan before root admission or binding.
     ///
     /// # Errors

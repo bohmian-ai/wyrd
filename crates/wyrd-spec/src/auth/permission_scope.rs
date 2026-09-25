@@ -14,6 +14,8 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::ids::{ModelId, ProviderId};
+
 /// Longest accepted catalog or schema identifier segment.
 const MAX_IDENTIFIER_LEN: usize = 63;
 
@@ -44,6 +46,49 @@ pub enum PermissionScope {
     All,
     /// One Bifrost schema or table.
     Bifrost(BifrostPermissionScope),
+    /// One gateway provider or exact provider/model pair.
+    Gateway(GatewayAccess),
+}
+
+/// The gateway provider objects one invoke grant reaches.
+///
+/// A provider grant covers every tenant-enabled model of that provider; a
+/// model grant covers only the exact provider/model pair. Identities are the
+/// same typed values deployment resolution uses.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum GatewayAccess {
+    /// Every model served by one provider.
+    Provider {
+        /// Covered provider.
+        provider: ProviderId,
+    },
+    /// One exact provider-native model.
+    Model {
+        /// Provider serving the model.
+        provider: ProviderId,
+        /// Provider-native model identifier.
+        model: ModelId,
+    },
+}
+
+impl GatewayAccess {
+    /// True when this gateway grant's objects include every object `required` names.
+    #[must_use]
+    pub fn covers(&self, required: &Self) -> bool {
+        match (self, required) {
+            (Self::Provider { provider }, Self::Provider { provider: required })
+            | (
+                Self::Provider { provider },
+                Self::Model {
+                    provider: required, ..
+                },
+            ) => provider == required,
+            (Self::Model { .. }, Self::Model { .. }) => self == required,
+            (Self::Model { .. }, Self::Provider { .. }) => false,
+        }
+    }
 }
 
 /// The Bifrost objects one grant reaches.
@@ -100,7 +145,8 @@ impl PermissionScope {
         match (self, required) {
             (Self::All, _) => true,
             (Self::Bifrost(granted), Self::Bifrost(required)) => granted.covers(required),
-            (Self::Bifrost(_), Self::All) => false,
+            (Self::Gateway(granted), Self::Gateway(required)) => granted.covers(required),
+            (Self::Bifrost(_) | Self::Gateway(_), _) => false,
         }
     }
 
@@ -110,16 +156,23 @@ impl PermissionScope {
         matches!(self, Self::Bifrost(_))
     }
 
+    /// True when this scope names a gateway provider or model.
+    #[must_use]
+    pub const fn is_gateway(&self) -> bool {
+        matches!(self, Self::Gateway(_))
+    }
+
     /// Rejects a scope whose object identity is malformed.
     ///
     /// # Errors
     ///
     /// Returns [`PermissionScopeError::InvalidIdentifier`] when a catalog or
     /// schema segment is empty, longer than 63 characters, or contains anything
-    /// other than ASCII alphanumerics, `_`, or `-`.
+    /// other than ASCII alphanumerics, `_`, or `-`. Gateway identities are
+    /// validated when their typed ids decode, so a gateway scope is always valid.
     pub fn validate(&self) -> Result<(), PermissionScopeError> {
         match self {
-            Self::All => Ok(()),
+            Self::All | Self::Gateway(_) => Ok(()),
             Self::Bifrost(scope) => scope.validate(),
         }
     }
@@ -310,6 +363,46 @@ mod tests {
         assert!(
             schema(&"x".repeat(64)).validate().is_err(),
             "an over-long schema segment is rejected"
+        );
+    }
+
+    /// Proves a provider grant covers that provider's models and a model grant
+    /// covers only its exact pair, with the approved wire projection.
+    #[test]
+    fn gateway_scope_covers_provider_models_and_exact_pairs() {
+        use super::GatewayAccess;
+        use crate::ids::{ModelId, ProviderId};
+        let provider = |name: &str| {
+            PermissionScope::Gateway(GatewayAccess::Provider {
+                provider: ProviderId::new(name).expect("valid provider"),
+            })
+        };
+        let model = |name: &str, model: &str| {
+            PermissionScope::Gateway(GatewayAccess::Model {
+                provider: ProviderId::new(name).expect("valid provider"),
+                model: ModelId::new(model).expect("valid model"),
+            })
+        };
+
+        assert!(provider("openai").covers(&model("openai", "gpt-4o")));
+        assert!(provider("openai").covers(&provider("openai")));
+        assert!(!provider("openai").covers(&model("anthropic", "claude")));
+        assert!(model("openai", "gpt-4o").covers(&model("openai", "gpt-4o")));
+        assert!(!model("openai", "gpt-4o").covers(&model("openai", "gpt-4.1")));
+        assert!(!model("openai", "gpt-4o").covers(&provider("openai")));
+        assert!(!provider("openai").covers(&PermissionScope::All));
+        assert!(!provider("openai").covers(&schema("logs")));
+        assert!(!schema("logs").covers(&provider("openai")));
+        assert!(PermissionScope::All.covers(&model("openai", "gpt-4o")));
+        assert_eq!(
+            serde_json::to_value(model("openai", "gpt-4o")).expect("scope serializes"),
+            serde_json::json!({"gateway": {"model": {"provider": "openai", "model": "gpt-4o"}}})
+        );
+        assert!(
+            serde_json::from_value::<PermissionScope>(
+                serde_json::json!({"gateway": {"provider": {"provider": "OpenAI"}}})
+            )
+            .is_err()
         );
     }
 

@@ -31,7 +31,7 @@ python = [
     "wyrd-config/python",
     "wyrd-utils/python",
 ]
-testing = ["python", "dep:wyrd-testing"]
+testing = ["python", "dep:wyrd-testing", "dep:tracing", "dep:url"]
 
 [dependencies]
 pyo3 = { workspace = true, features = ["extension-module", "abi3-py310", "chrono"], optional = true }
@@ -59,7 +59,9 @@ tempfile = { workspace = true }
 wyrd-interfaces = { workspace = true }
 wyrd-loader = { workspace = true }
 wyrd-semver = { workspace = true }
-wyrd-testing = { workspace = true, features = ["python"], optional = true }
+wyrd-testing = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
 
 [lints]
 workspace = true

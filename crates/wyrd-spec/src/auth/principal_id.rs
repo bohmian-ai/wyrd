@@ -18,6 +18,20 @@ pub const PLATFORM_AUDIT_PRINCIPAL: PrincipalId = PrincipalId::new(uuid::Uuid::f
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x77, 0x79, 0x72, 0x64, 0x01,
 ]));
 
+/// Reserved card-free `Service` principal that publishes gateway capture into
+/// Bifrost.
+///
+/// It is an internal server-minted sentinel rather than a tenant record: only
+/// `wyrd-server`'s internal capture path issues it, always for exactly one
+/// tenant, with no Card reference, an empty Card-reference scope, the
+/// informational `gateway_capture` Role, and exactly that tenant's two capture
+/// table write grants. Verifiers reject any token that pairs this id with
+/// another kind, a Card binding, another Role set, another permission set, or
+/// a delegation chain, and no public issuance path may mint it.
+pub const GATEWAY_CAPTURE_PRINCIPAL: PrincipalId = PrincipalId::new(uuid::Uuid::from_bytes([
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x77, 0x79, 0x72, 0x64, 0x02,
+]));
+
 impl PrincipalId {
     /// Build from a UUID.
     #[must_use]

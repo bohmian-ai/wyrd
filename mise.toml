@@ -151,7 +151,7 @@ description = "Run the real-server CLI Card lifecycle journey with its lifecycle
 run = "cargo test --locked -p wyrd-cli --test cli -- --nocapture --test-threads=1"
 
 [tasks."test:wyrdstate:journey"]
-description = "Run the real-server CLI and Rust SDK typed WyrdState journeys"
+description = "Run the real-server CLI and Rust SDK typed WyrdState and gateway administration journeys"
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:wyrdstate:journey:inner'"
 
 [tasks."test:wyrdstate:journey:inner"]
@@ -160,7 +160,97 @@ description = "Run the real-server CLI and Rust SDK typed WyrdState journeys wit
 run = [
   "cargo nextest run --locked -p wyrd-cli --test cli -E 'test(=card_lifecycle::pg_tests::cli_bundle_loads_typed_wyrdstate_after_server_shutdown)'",
   "cargo nextest run --locked -p wyrd-sdk-rust --test cards_state -E 'test(=registers_reads_hydrates_and_loads_offline_state)'",
+  "cargo nextest run --locked -p wyrd-sdk-rust --test gateway_admin --run-ignored all -E 'test(=administers_redacted_gateway_configuration)'",
 ]
+
+[tasks."test:gateway:native"]
+description = "Run the real-server native Anthropic and Gemini gateway ingress journeys (Rust HTTP and official Python clients)"
+depends = ["py:setup"]
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:gateway:native:inner && mise run py:test:gateway:native:inner'"
+
+[tasks."test:gateway:native:inner"]
+hide = true
+description = "Run the Rust gateway journeys — ingress, operation families, and resilience — with their lifecycle already provisioned"
+env = { WYRD_TEST_GATEWAY_PROVIDER_KEY = "sk-native-upstream" }
+run = "cargo nextest run --locked -p wyrd-testing --test gateway -P journey --run-ignored=all -E 'not test(/^vault::/)'"
+
+[tasks."py:test:gateway:native:inner"]
+hide = true
+description = "Run the official Anthropic and Google GenAI client gateway journeys with their lifecycle already provisioned"
+dir = "sdks/wyrd-sdk-python"
+run = "uv run python -m pytest -q -m integration tests/integration/gateway/test_gateway_native_clients.py"
+
+[tasks."test:gateway:journey"]
+description = """The focused gateway lane: every gateway journey across the public surfaces, on one Postgres lifecycle.
+Composes the Rust ingress journeys (OpenAI-compatible, Anthropic Messages, Gemini GenerateContent,
+stream termination, capture outage), the ExternalSecret journeys against a real dev Vault, the CLI,
+MCP, and Rust SDK administration journeys, the Python
+official-client journeys over all four provider backends with their Bifrost capture evidence, and the
+TypeScript inference journey. Credential-free: every provider is a local mock upstream.
+"""
+depends = ["py:setup", "ts:build", "ts:build:testing"]
+run = """scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner \
+  && mise run test:gateway:native:inner \
+  && mise run test:gateway:vault:inner \
+  && mise run test:gateway:journey:surfaces:inner \
+  && mise run py:test:gateway:journey:inner \
+  && mise run ts:test:gateway:journey:inner'"""
+
+[tasks."test:gateway:gate"]
+hide = true
+description = """The gate's share of the gateway: only the ignored Rust, Vault, CLI, MCP, and Rust SDK
+journeys. py:test:integration and ts:test:integration own the Python and TypeScript gateway
+journeys. Run `test:gateway:journey` for the complete, standalone lane."""
+run = """scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner \
+  && mise run test:gateway:native:inner \
+  && mise run test:gateway:vault:inner \
+  && mise run test:gateway:journey:surfaces:inner'"""
+
+[tasks."test:gateway:vault:inner"]
+hide = true
+tools = { vault = "2.1.1" }
+description = "Run the ExternalSecret journeys against a real dev Vault with their lifecycle already provisioned"
+env = { WYRD_TEST_GATEWAY_PROVIDER_KEY = "sk-native-upstream", WYRD_TEST_GATEWAY_VAULT_TOKEN = "wyrd-test-vault-root", WYRD_TEST_GATEWAY_VAULT_TOKEN_DENIED = "wyrd-test-vault-denied" }
+run = "cargo nextest run --locked -p wyrd-testing --test gateway -P journey --run-ignored=all -E 'test(/^vault::/)'"
+
+[tasks."test:gateway:journey:surfaces:inner"]
+hide = true
+description = "Run the CLI, MCP, and Rust SDK gateway administration journeys with their lifecycle already provisioned"
+env = { WYRD_CLI_E2E = "1" }
+run = [
+  "cargo test --locked -p wyrd-cli --test cli -- --ignored gateway_server_journey:: --nocapture --test-threads=1",
+  "cargo nextest run --locked -p wyrd-mcp --test mcp -P journey --run-ignored=all -E 'test(=gateway::pg_tests::agent_administers_redacted_gateway_configuration)'",
+  "cargo nextest run --locked -p wyrd-sdk-rust --test gateway_admin --run-ignored all -E 'test(=administers_redacted_gateway_configuration)'",
+]
+
+[tasks."py:test:gateway:journey:inner"]
+hide = true
+description = "Run every Python gateway journey — administration, native clients, and the official OpenAI client over all four provider backends — with their lifecycle already provisioned"
+dir = "sdks/wyrd-sdk-python"
+run = "uv run python -m pytest -q -m integration tests/integration/gateway"
+
+[tasks."test:gateway:smoke:live"]
+description = """Opt-in live provider smoke lane: real OpenAI, Anthropic, and Gemini upstreams through the gateway.
+Operator credentials come from the environment, normally an untracked mise.local.toml: the
+conventional OPENAI_API_KEY, ANTHROPIC_API_KEY, and GOOGLE_API_KEY are read directly and submitted
+as managed secrets through the CLI. A provider whose credential is absent is skipped explicitly.
+Vertex is excluded: its credential is a short-lived OAuth token, which never enters managed-secret
+storage. Deliberately outside test:gateway:journey and the CI gate.
+"""
+depends = ["py:setup"]
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:gateway:smoke:live:inner'"
+
+[tasks."test:gateway:smoke:live:inner"]
+hide = true
+description = "Run the live provider gateway smoke tests with their lifecycle already provisioned"
+dir = "sdks/wyrd-sdk-python"
+run = "uv run python -m pytest -q -rs -m smoke tests/smoke"
+
+[tasks."ts:test:gateway:journey:inner"]
+hide = true
+description = "Run the TypeScript gateway administration and inference journeys with their lifecycle already provisioned"
+dir = "sdks/wyrd-sdk-ts/wyrd"
+run = "pnpm exec vitest run tests/integration/gateway-admin.test.ts tests/integration/gateway-inference.test.ts"
 
 [tasks."test:skald"]
 hide = true
@@ -604,11 +694,15 @@ done
 
 [tasks."check:sdk-client-tier"]
 hide = true
-description = "Verify the Rust SDK projects wyrd-client without Python-only dependencies"
+description = "Verify the Rust SDK projects wyrd-client without Python-only dependencies or credential mutation"
 run = """
 set -eu
 if cargo tree --locked -p wyrd-sdk-rust -e normal | rg 'pyo3|wyrd-sdk-python|wyrd-sdk-ts'; then
   echo "FAIL: wyrd-sdk-rust dependency cone contains a Python or TypeScript binding dependency"
+  exit 1
+fi
+if cat sdks/wyrd-sdk-rust/src/*.rs | grep -v '^[[:space:]]*//' | rg -q 'gateway_credential'; then
+  echo "FAIL: wyrd-sdk-rust projects gateway_credential; provider-credential mutation is reserved for the CLI and scoped MCP (SPEC-wyrd-gateway-v1 REQ-030B)"
   exit 1
 fi
 """
@@ -925,7 +1019,7 @@ run = "uv run ruff check python/wyrd tests scripts"
 hide = true
 description = "Run ty over the generated Python stub surface"
 dir = "sdks/wyrd-sdk-python"
-run = "uv run ty check python/wyrd/*.pyi python/wyrd/*/__init__.pyi tests/unit/cards/data/test_public_surface.py tests/bifrost/test_public_typing.py"
+run = "uv run ty check python/wyrd/*.pyi python/wyrd/*/__init__.pyi tests/unit/cards/data/test_public_surface.py tests/bifrost/test_public_typing.py tests/unit/gateway/test_gateway_typing.py"
 
 [tasks."py:test:testing"]
 hide = true
@@ -1377,6 +1471,7 @@ depends = [
   "check:skills-sync",
   "test:rust",
   "test:bifrost:gate",
+  "test:gateway:gate",
   "test:identity:journey",
   "py:test:integration",
   "ts:test:integration",

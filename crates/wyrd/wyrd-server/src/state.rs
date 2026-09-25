@@ -26,6 +26,7 @@ use vala_bifrost_redux::scribe::tail_rpc::{
     FetchLiveTailService, ScribeTailReader, TailFenceConfig,
 };
 use wyrd_auth_verify::TokenVerifier;
+use wyrd_gateway::{GatewayEngine, ManagedSecretKeys};
 use wyrd_storage::StorageHandle;
 use wyrd_telemetry::TelemetryGuard;
 use wyrd_tonic::tonic_health::server::HealthReporter;
@@ -35,7 +36,9 @@ use crate::boot::data_root::BifrostDataRoot;
 use crate::components::auth::{ServerAuth, ServerAuthz};
 use crate::components::eval::{EvalRuns, new_run_map};
 use crate::components::health::ReadinessSnapshot;
-use crate::config::{BifrostRuntimeConfig, BifrostTarget, DeploymentProfile, ForgeRuntimeConfig};
+use crate::config::{
+    BifrostRuntimeConfig, BifrostTarget, DeploymentProfile, ForgeRuntimeConfig, GatewayConfig,
+};
 #[cfg(feature = "test-support")]
 use crate::oracle::SilentForwardPeer;
 use crate::postgres::ServerPostgres;
@@ -1132,6 +1135,8 @@ async fn await_role_task(
 pub struct LimitsConfig {
     /// Maximum allowed request body size in bytes.
     pub body_bytes: usize,
+    /// Maximum streamed Audio transcription or translation upload in bytes.
+    pub audio_upload_bytes: usize,
     /// Per-request processing timeout.
     pub timeout: std::time::Duration,
     /// Maximum in-flight concurrent requests.
@@ -1384,6 +1389,7 @@ impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
             body_bytes: 1_048_576,
+            audio_upload_bytes: 26_214_400,
             timeout: std::time::Duration::from_secs(30),
             concurrency: 1024,
         }
@@ -2057,6 +2063,14 @@ pub struct AppState {
     /// for it inside the existing shutdown deadline, so a pod cannot report a
     /// clean drain while an MCP handler is still settling.
     pub mcp_tasks: tokio_util::task::TaskTracker,
+    /// In-flight governed gateway call work for this process.
+    ///
+    /// Every call's execution and accounting task runs on this tracker,
+    /// including accounting that settles after a stream reached its caller.
+    /// After transport admission stops, `BoundServer::run` closes it and waits
+    /// inside the shutdown deadline, so accepted calls keep their accounting
+    /// evidence.
+    pub gateway_tasks: tokio_util::task::TaskTracker,
     /// Register the test-support MCP context probe in the `/mcp` tool catalog.
     ///
     /// Default `false`: only a test server that explicitly opted in through
@@ -2068,6 +2082,19 @@ pub struct AppState {
     pub telemetry: Arc<TelemetryGuard>,
     /// Request-shaping limits for the router middleware stack.
     pub limits: LimitsConfig,
+    /// Operator-declared gateway credential bindings and secret backends.
+    pub gateway: Arc<GatewayConfig>,
+    /// Independently configured tenant keyrings protecting managed secrets.
+    ///
+    /// Administration seals through this handle and the credential resolver
+    /// opens through the same one, so key selection and envelope protection
+    /// have a single owner. Key material lives only here, never in Postgres.
+    pub gateway_secret_keys: Arc<ManagedSecretKeys>,
+    /// Shared gateway execution engine behind every governed invocation entry.
+    pub gateway_engine: Arc<GatewayEngine>,
+    /// Per-tenant embedded Bifrost producers of opted-in gateway call capture;
+    /// empty until a capturing tenant's first terminal call.
+    pub gateway_capture: Arc<crate::components::gateway::GatewayCapture>,
     /// gRPC health reporter shared between HTTP readiness and gRPC health service.
     pub grpc_health: HealthReporter,
     /// Cached readiness snapshot from the background readiness_loop task.
@@ -2103,12 +2130,17 @@ impl AppState {
             deployment_profile: DeploymentProfile::Development,
             shutdown_token,
             mcp_tasks: tokio_util::task::TaskTracker::new(),
+            gateway_tasks: tokio_util::task::TaskTracker::new(),
             #[cfg(feature = "test-support")]
             mcp_context_probe: false,
             telemetry: Arc::new(wyrd_telemetry::init_test_only_no_global(
                 wyrd_telemetry::TelemetryConfig::default(),
             )),
             limits: LimitsConfig::default(),
+            gateway: Arc::default(),
+            gateway_secret_keys: Arc::default(),
+            gateway_engine: Arc::new(crate::components::gateway::unconnected_engine()),
+            gateway_capture: Arc::default(),
             grpc_health: reporter,
             readiness: Arc::new(ArcSwap::from_pointee(ReadinessSnapshot::initial())),
             peer_plane: Arc::new(crate::app::peer_plane::PeerPlaneStatus::default()),
@@ -2189,6 +2221,27 @@ impl AppState {
     #[must_use]
     pub fn with_limits(mut self, limits: LimitsConfig) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// Attach the operator gateway configuration tenants' credentials may name.
+    #[must_use]
+    pub fn with_gateway(mut self, gateway: GatewayConfig) -> Self {
+        self.gateway = Arc::new(gateway);
+        self
+    }
+
+    /// Attach the loaded per-tenant managed-secret keyrings.
+    #[must_use]
+    pub fn with_gateway_secret_keys(mut self, keys: Arc<ManagedSecretKeys>) -> Self {
+        self.gateway_secret_keys = keys;
+        self
+    }
+
+    /// Attach the gateway execution engine every invocation entry shares.
+    #[must_use]
+    pub fn with_gateway_engine(mut self, engine: GatewayEngine) -> Self {
+        self.gateway_engine = Arc::new(engine);
         self
     }
 
@@ -2647,11 +2700,13 @@ mod tests {
         let state = test_state().await;
         let limits = LimitsConfig {
             body_bytes: 2048,
+            audio_upload_bytes: 4096,
             timeout: std::time::Duration::from_millis(1000),
             concurrency: 10,
         };
         let state = state.with_limits(limits);
         assert_eq!(state.limits.body_bytes, 2048);
+        assert_eq!(state.limits.audio_upload_bytes, 4096);
         assert_eq!(state.limits.concurrency, 10);
     }
 

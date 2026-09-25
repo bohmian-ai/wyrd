@@ -22,16 +22,34 @@ mod pg_tests {
 
     /// The exact catalog an ordinary Wyrd server advertises over `/mcp` to a
     /// caller that also holds tenant principal administration.
-    const ADVERTISED_TOOLS: [&str; 5] = [
+    const ADVERTISED_TOOLS: [&str; 22] = [
         "bifrost.list_tables",
         "bifrost.describe_table",
         "bifrost.query",
         "principals.list_credentials",
+        "gateway.list_provider_credentials",
+        "gateway.list_provider_deployments",
+        "gateway.get_fallback_policy",
+        "gateway.get_governance_policy",
+        "gateway.get_capture_policy",
+        "gateway.get_provider_credential",
+        "gateway.get_provider_deployment",
+        "gateway.put_provider_credential",
+        "gateway.put_provider_deployment",
+        "gateway.put_fallback_policy",
+        "gateway.put_governance_policy",
+        "gateway.put_capture_policy",
+        "gateway.revoke_provider_credential",
+        "gateway.delete_provider_credential",
+        "gateway.delete_provider_deployment",
+        "gateway.delete_fallback_policy",
+        "gateway.delete_governance_policy",
         "principals.revoke_credential",
     ];
 
-    /// An agent sees exactly the shipped catalog, only its own tenant's tables,
-    /// and the complete physical layout of the one it selects.
+    /// An agent sees exactly the advertised Bifrost, principal, and gateway
+    /// tools, only its own tenant's tables, and the complete physical layout
+    /// of the one it selects.
     ///
     /// The two tenants are what make the list assertion a tenancy claim rather
     /// than a formatting one: both tables exist in the same catalog, and only
@@ -88,7 +106,8 @@ mod pg_tests {
         assert_eq!(
             names, ADVERTISED_TOOLS,
             "an ordinary server advertises exactly the three Bifrost read tools, the \
-             principal credential listing, this admin caller's revocation, and no test probe"
+             principal credential listing, this admin caller's revocation, the gateway \
+             tools, and no test probe"
         );
 
         let listed = structured(

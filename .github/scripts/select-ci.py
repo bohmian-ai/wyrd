@@ -66,6 +66,8 @@ PACKAGE_TREES = re.compile(r"^(crates/|sdks/[^/]+/(src|native|native-testing)/|e
 LANGUAGE_PACKAGES = {"wyrd-sdk-python", "wyrd-sdk-ts", "wyrd-sdk-ts-testing", "wyrd-rust-examples"}
 # Packages whose ignored Bifrost journeys test:bifrost:gate runs.
 BIFROST_JOURNEY = {"vala-bifrost-redux", "wyrd-client", "wyrd-testing", "wyrd-mcp"}
+# Packages whose ignored gateway journeys test:gateway:gate runs.
+GATEWAY_JOURNEY = {"wyrd-testing", "wyrd-cli", "wyrd-mcp", "wyrd-sdk-rust"}
 STORAGE_PACKAGES = {"wyrd-storage", "wyrd-server", "wyrd-sql"}
 IDENTITY_PACKAGES = {
     "wyrd-auth", "wyrd-auth-check", "wyrd-auth-issue", "wyrd-auth-oidc",
@@ -251,6 +253,8 @@ def select(paths, root):
         sel.lane("codegen:check", f"generated contracts derive from {hits[0]}")
     if hits := sorted(affected.keys() & BIFROST_JOURNEY):
         sel.lane("test:bifrost:gate", f"Bifrost journeys exercise {hits[0]}")
+    if hits := sorted(affected.keys() & GATEWAY_JOURNEY):
+        sel.lane("test:gateway:gate", f"gateway journeys exercise {hits[0]}")
     if hits := sorted(affected.keys() & EXAMPLE_PACKAGES):
         sel.lane("check:examples", f"examples build {hits[0]}")
     if hits := sorted(affected.keys() & RUST_CLIENT_PACKAGES):

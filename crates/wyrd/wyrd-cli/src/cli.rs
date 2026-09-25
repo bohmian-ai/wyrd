@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 use crate::auth::AuthCommand;
 use crate::card::{ApplyArgs, DeleteArgs, GetArgs, LatestArgs, ListArgs, LoadArgs, PlanArgs};
 use crate::eval::run::EvalCommand;
+use crate::gateway::GatewayCommand;
 use crate::platform::PlatformCommand;
 use crate::principal::PrincipalCommand;
 use crate::query::QueryCommand;
@@ -52,6 +53,7 @@ impl Cli {
                 .await
                 .map_err(Into::into),
             Command::Query(command) => crate::query::dispatch(command).await,
+            Command::Gateway(command) => command.dispatch().await,
         }
     }
 }
@@ -89,6 +91,8 @@ pub enum Command {
     Principal(PrincipalCommand),
     /// Run a terminal-safe streaming Oracle query.
     Query(QueryCommand),
+    /// Administer tenant gateway credentials, deployments, and policies.
+    Gateway(GatewayCommand),
 }
 
 /// Structural checks over the assembled command tree.

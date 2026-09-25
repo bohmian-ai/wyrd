@@ -358,22 +358,57 @@ impl NativeWyrdTestServer {
 
 /// Starts a real bound Wyrd test server and mints an admin access token.
 ///
+/// `providerBaseUrl` roots every built-in gateway adapter at one local mock
+/// upstream (`OpenAI` under `/v1`), so a TypeScript gateway journey dispatches
+/// over HTTP with the harness's operator credential bindings; without it the
+/// gateway admits and accounts calls but reaches no provider.
+///
 /// # Errors
 ///
-/// Returns a napi error when server startup, service bootstrap, API-key
-/// exchange, or URL discovery fails.
+/// Returns a napi error when `providerBaseUrl` is not an absolute URL, or when
+/// server startup, service bootstrap, API-key exchange, or URL discovery
+/// fails.
 #[napi]
-pub fn start_test_server() -> Result<NativeWyrdTestServer> {
-    wyrd_runtime::runtime().block_on(Box::pin(start_test_server_async()))
+pub fn start_test_server(provider_base_url: Option<String>) -> napi::Result<NativeWyrdTestServer> {
+    let result = start_test_server_borrowed(provider_base_url.as_deref());
+    drop(provider_base_url);
+    result
 }
 
-/// Starts the bound harness inside Wyrd's shared runtime.
+/// Parses the N-API-owned provider root without extending its ownership into
+/// the Rust harness call, then starts the harness.
+///
+/// # Errors
+///
+/// Returns a napi error when `provider_base_url` is not an absolute URL or any
+/// server setup step fails.
+fn start_test_server_borrowed(
+    provider_base_url: Option<&str>,
+) -> napi::Result<NativeWyrdTestServer> {
+    let root = provider_base_url
+        .map(|base| {
+            url::Url::parse(base).map_err(|error| {
+                napi::Error::from_reason(format!("invalid providerBaseUrl: {error}"))
+            })
+        })
+        .transpose()?;
+    wyrd_runtime::runtime().block_on(Box::pin(start_test_server_async(root)))
+}
+
+/// Starts the bound harness inside Wyrd's shared runtime, rooting the gateway
+/// adapters at `provider_root` when a journey supplied one.
 ///
 /// # Errors
 ///
 /// Returns a napi error when any server setup step fails.
-async fn start_test_server_async() -> Result<NativeWyrdTestServer> {
-    let server = Box::pin(WyrdTestServer::start_bound())
+async fn start_test_server_async(
+    provider_root: Option<url::Url>,
+) -> napi::Result<NativeWyrdTestServer> {
+    let mut builder = WyrdTestServer::builder();
+    if let Some(root) = provider_root {
+        builder = builder.with_gateway_provider_root_for_test(root);
+    }
+    let server = Box::pin(builder.start_bound())
         .await
         .map_err(|error| napi::Error::from_reason(error.to_string()))?;
     let table_name = "typescript_oracle_query";

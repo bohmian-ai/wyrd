@@ -1,0 +1,533 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GatewayAccountingEntryV1",
+  "description": "One append-only, tenant-scoped accounting ledger entry.",
+  "oneOf": [
+    {
+      "description": "A bounded cost reservation admitted with a budget check.",
+      "type": "object",
+      "required": [
+        "budget_reservation_created"
+      ],
+      "properties": {
+        "budget_reservation_created": {
+          "type": "object",
+          "required": [
+            "call_id",
+            "created_at",
+            "currency",
+            "data_tenant_id",
+            "entry_id",
+            "expires_at",
+            "period_end",
+            "period_start",
+            "reservation_id",
+            "reserved_cost",
+            "subject"
+          ],
+          "properties": {
+            "call_id": {
+              "description": "Logical call.",
+              "type": "string",
+              "format": "uuid"
+            },
+            "created_at": {
+              "description": "Admission time.",
+              "type": "string",
+              "format": "date-time"
+            },
+            "currency": {
+              "description": "Reservation currency.",
+              "type": "string"
+            },
+            "data_tenant_id": {
+              "description": "Tenant.",
+              "type": "string",
+              "format": "uuid"
+            },
+            "entry_id": {
+              "description": "Entry identity.",
+              "type": "string",
+              "format": "uuid"
+            },
+            "expires_at": {
+              "description": "Time after which reconciliation may release it.",
+              "type": "string",
+              "format": "date-time"
+            },
+            "period_end": {
+              "description": "End of that period.",
+              "type": "string",
+              "format": "date-time"
+            },
+            "period_start": {
+              "description": "Start of the UTC calendar period fixed at admission.",
+              "type": "string",
+              "format": "date-time"
+            },
+            "reservation_id": {
+              "description": "Reservation identity.",
+              "type": "string",
+              "format": "uuid"
+            },
+            "reserved_cost": {
+              "description": "Positive reserved cost.",
+              "type": "string"
+            },
+            "subject": {
+              "description": "Budgeted subject.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GatewayPolicySubject"
+                }
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Settlement of a reservation with actual cost.",
+      "type": "object",
+      "required": [
+        "budget_reservation_settled"
+      ],
+      "properties": {
+        "budget_reservation_settled": {
+          "type": "object",
+          "required": [
+            "actual_cost",
+            "call_id",
+            "currency",
+            "data_tenant_id",
+            "entry_id",
+            "released_cost",
+            "reservation_id",
+            "settled_at"
+          ],
+          "properties": {
+            "actual_cost": {
+              "description": "Non-negative actual cost.",
+              "type": "string"
+            },
+            "call_id": {
+              "description": "Logical call.",
+              "type": "string",
+              "format": "uuid"
+            },
+            "currency": {
+              "description": "Settlement currency.",
+              "type": "string"
+            },
+            "data_tenant_id": {
+              "description": "Tenant.",
+              "type": "string",
+              "format": "uuid"
+            },
+            "entry_id": {
+              "description": "Entry identity.",
+              "type": "string",
+              "format": "uuid"
+            },
+            "released_cost": {
+              "description": "Non-negative released remainder.",
+              "type": "string"
+            },
+            "reservation_id": {
+              "description": "Settled reservation.",
+              "type": "string",
+              "format": "uuid"
+            },
+            "settled_at": {
+              "description": "Settlement time.",
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Accounting for one upstream attempt.",
+      "type": "object",
+      "required": [
+        "attempt_accounted"
+      ],
+      "properties": {
+        "attempt_accounted": {
+          "type": "object",
+          "required": [
+            "accounted_at",
+            "attempt_ordinal",
+            "call_id",
+            "data_tenant_id",
+            "deployment",
+            "entry_id",
+            "model",
+            "outcome"
+          ],
+          "properties": {
+            "accounted_at": {
+              "description": "Accounting time.",
+              "type": "string",
+              "format": "date-time"
+            },
+            "attempt_ordinal": {
+              "description": "One-based attempt ordinal.",
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 1.0
+            },
+            "call_id": {
+              "description": "Logical call.",
+              "type": "string",
+              "format": "uuid"
+            },
+            "cost": {
+              "description": "Cost, or null when unknown.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "currency": {
+              "description": "Currency, present exactly when cost is.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "data_tenant_id": {
+              "description": "Tenant.",
+              "type": "string",
+              "format": "uuid"
+            },
+            "deployment": {
+              "description": "Deployment attempted.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ProviderDeploymentName"
+                }
+              ]
+            },
+            "entry_id": {
+              "description": "Entry identity.",
+              "type": "string",
+              "format": "uuid"
+            },
+            "model": {
+              "description": "Model attempted.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ModelRef"
+                }
+              ]
+            },
+            "normalized_usage": {
+              "description": "Normalized usage, or null when unknown.",
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "$ref": "#/definitions/GatewayUsageAmount"
+              }
+            },
+            "outcome": {
+              "description": "Attempt outcome.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GatewayCallOutcome"
+                }
+              ]
+            },
+            "pricing_version": {
+              "description": "Pricing version, present exactly when cost is.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "maxLength": 128,
+              "minLength": 1
+            },
+            "provider_usage_json": {
+              "description": "Canonical bounded provider-usage JSON from the typed adapter usage. Bounded by the fixed ceiling of 1,048,576 serialized UTF-8 bytes. `maxLength` counts characters, so a multibyte value within it can still exceed the byte ceiling and is rejected.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "maxLength": 1048576
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Accounting for the logical call.",
+      "type": "object",
+      "required": [
+        "call_accounted"
+      ],
+      "properties": {
+        "call_accounted": {
+          "type": "object",
+          "required": [
+            "accounted_at",
+            "call_id",
+            "caller_principal_id",
+            "data_tenant_id",
+            "entry_id",
+            "outcome",
+            "pricing_versions"
+          ],
+          "properties": {
+            "accounted_at": {
+              "description": "Accounting time.",
+              "type": "string",
+              "format": "date-time"
+            },
+            "call_id": {
+              "description": "Logical call.",
+              "type": "string",
+              "format": "uuid"
+            },
+            "caller_principal_id": {
+              "description": "Verified caller.",
+              "type": "string",
+              "format": "uuid"
+            },
+            "cost": {
+              "description": "Cost, or null when unknown.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "currency": {
+              "description": "Currency, present exactly when cost is.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "data_tenant_id": {
+              "description": "Tenant.",
+              "type": "string",
+              "format": "uuid"
+            },
+            "entry_id": {
+              "description": "Entry identity.",
+              "type": "string",
+              "format": "uuid"
+            },
+            "normalized_usage": {
+              "description": "Normalized usage, or null when unknown.",
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "$ref": "#/definitions/GatewayUsageAmount"
+              }
+            },
+            "outcome": {
+              "description": "Call outcome.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GatewayCallOutcome"
+                }
+              ]
+            },
+            "pricing_versions": {
+              "description": "Pricing versions used by billed attempts; empty when unpriced.",
+              "type": "array",
+              "items": {
+                "type": "string",
+                "maxLength": 128,
+                "minLength": 1
+              },
+              "uniqueItems": true
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  ],
+  "definitions": {
+    "GatewayCallOutcome": {
+      "description": "Terminal outcome of a logical call or attempt.",
+      "oneOf": [
+        {
+          "description": "Completed successfully.",
+          "type": "string",
+          "enum": [
+            "succeeded"
+          ]
+        },
+        {
+          "description": "Failed.",
+          "type": "string",
+          "enum": [
+            "failed"
+          ]
+        },
+        {
+          "description": "Cancelled by the caller or shutdown.",
+          "type": "string",
+          "enum": [
+            "cancelled"
+          ]
+        },
+        {
+          "description": "Exceeded its deadline.",
+          "type": "string",
+          "enum": [
+            "timed_out"
+          ]
+        }
+      ]
+    },
+    "GatewayPolicySubject": {
+      "description": "Principal set a budget applies to.",
+      "oneOf": [
+        {
+          "description": "The whole tenant.",
+          "type": "string",
+          "enum": [
+            "tenant"
+          ]
+        },
+        {
+          "description": "One principal.",
+          "type": "object",
+          "required": [
+            "principal"
+          ],
+          "properties": {
+            "principal": {
+              "type": "object",
+              "required": [
+                "principal_id"
+              ],
+              "properties": {
+                "principal_id": {
+                  "description": "Principal identity.",
+                  "type": "string",
+                  "format": "uuid"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Every principal holding one role.",
+          "type": "object",
+          "required": [
+            "role"
+          ],
+          "properties": {
+            "role": {
+              "type": "object",
+              "required": [
+                "role_name"
+              ],
+              "properties": {
+                "role_name": {
+                  "description": "Role name.",
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/RoleName"
+                    }
+                  ]
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "GatewayUsageAmount": {
+      "description": "One normalized usage quantity.",
+      "type": "object",
+      "required": [
+        "dimension",
+        "quantity",
+        "unit"
+      ],
+      "properties": {
+        "dimension": {
+          "description": "Open usage dimension, such as `output_tokens`.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1
+        },
+        "quantity": {
+          "description": "Non-negative quantity.",
+          "type": "string"
+        },
+        "unit": {
+          "description": "Usage unit, such as `tokens`.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "ModelId": {
+      "description": "Provider-native gateway model identifier: 1..=255 UTF-8 bytes without control characters.",
+      "type": "string"
+    },
+    "ModelRef": {
+      "description": "One exact provider-native model selected by a caller.\n\nTyped surfaces carry the pair; the OpenAI-compatible `model` string is the canonical `<provider>/<model>` projection, split on the first `/` so a native model identifier may itself contain slashes.",
+      "type": "object",
+      "required": [
+        "model",
+        "provider"
+      ],
+      "properties": {
+        "model": {
+          "description": "Provider-native model identifier.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ModelId"
+            }
+          ]
+        },
+        "provider": {
+          "description": "Provider that serves the model.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ProviderId"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "ProviderDeploymentName": {
+      "description": "Tenant-unique gateway provider deployment name.",
+      "type": "string"
+    },
+    "ProviderId": {
+      "description": "Tenant-visible gateway provider identifier using the canonical Wyrd name grammar.",
+      "type": "string"
+    },
+    "RoleName": {
+      "description": "RBAC role identifier.",
+      "type": "string"
+    }
+  }
+}

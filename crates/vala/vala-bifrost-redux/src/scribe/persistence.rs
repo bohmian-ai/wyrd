@@ -1222,16 +1222,33 @@ pub(crate) struct StagedGenerationOutcome {
 ///
 /// The merge decodes one bounded batch per member rather than a whole member,
 /// so the footprint is derived from what the members measured: their encoded
-/// bytes per row, scaled by the bounded row window each member contributes.
+/// bytes per row, scaled by the rows the merge can hold at once.
 /// [`parquet_candidate_incremental_bytes`] then adds the writer's own footer
 /// and transfer children on top of it.
 fn claim_merge_bytes(claim: &crate::scribe::assembly::StagingClaim) -> usize {
-    let rows = claim.rows().max(1);
-    let bytes_per_row = claim.encoded_bytes().div_ceil(rows);
+    merge_window_bytes(
+        claim.encoded_bytes(),
+        claim.rows(),
+        claim.members().len() as u64,
+    )
+}
+
+/// Bytes a merge of `members` holds at once, given their total `encoded_bytes`
+/// over `rows`.
+///
+/// Each member contributes one batch of at most
+/// [`MERGE_BATCH_ROWS`](crate::scribe::claim_assembly::MERGE_BATCH_ROWS) rows,
+/// and no batch holds more rows than its member has, so the rows held at once
+/// are the lesser of the claim's rows and one full window per member. Bounding
+/// by the claim's own rows keeps a claim of many small, wide members from
+/// requesting a window it can never fill — a request that exceeds the pod's
+/// Scribe memory ceiling would otherwise wait for admission forever.
+fn merge_window_bytes(encoded_bytes: u64, rows: u64, members: u64) -> usize {
+    let rows = rows.max(1);
+    let bytes_per_row = encoded_bytes.div_ceil(rows);
     let window = crate::scribe::claim_assembly::MERGE_BATCH_ROWS as u64;
-    let members = claim.members().len() as u64;
-    usize::try_from(bytes_per_row.saturating_mul(window).saturating_mul(members))
-        .unwrap_or(usize::MAX)
+    let held_rows = rows.min(window.saturating_mul(members));
+    usize::try_from(bytes_per_row.saturating_mul(held_rows)).unwrap_or(usize::MAX)
 }
 
 /// Separate Scribe mover that uploads finalized stages but owns no catalog decision.
@@ -2934,6 +2951,26 @@ mod tests {
             cohort_id: Some(std::path::PathBuf::from("wal/shard-3/segment-9001")),
             member_generation: 77,
         }
+    }
+
+    /// A claim of many one-row, wide members sizes its merge to the rows it
+    /// holds, not to one full window per member, while a claim larger than
+    /// its members' windows stays bounded by those windows.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either estimate differs from the held rows times bytes per
+    /// row.
+    #[test]
+    fn merge_window_bytes_is_bounded_by_the_rows_a_claim_holds() {
+        let window = crate::scribe::claim_assembly::MERGE_BATCH_ROWS as u64;
+        let row = 27_000_u64;
+        assert_eq!(merge_window_bytes(7 * row, 7, 7), 7 * 27_000);
+        assert_eq!(
+            merge_window_bytes(10 * window * 100, 10 * window, 2),
+            usize::try_from(2 * window * 100).expect("fits usize")
+        );
+        assert_eq!(merge_window_bytes(0, 0, 0), 0);
     }
 
     /// A production producer refusal retains identity and cannot fall through as cancellation.

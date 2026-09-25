@@ -305,6 +305,47 @@ impl PgFixture {
     }
 }
 
+/// An isolated, fixture-owned database with no migration applied.
+///
+/// Upgrade tests use it to stop the schema at a chosen historical version,
+/// stage legacy rows, and then prove how a later migration treats them. The
+/// database is dropped when this value drops.
+pub struct UnmigratedDatabase {
+    /// Migrator-role pool on the empty database. Precedes `_test_db` so it
+    /// drops before the database is removed.
+    migrator: PgPool,
+    /// Database owner whose drop removes the isolated database.
+    _test_db: TestDatabase,
+}
+
+impl UnmigratedDatabase {
+    /// Create an empty isolated database and connect the migrator role to it.
+    ///
+    /// # Errors
+    /// Returns [`FixtureError`] when the test DSNs are unset or invalid, or the
+    /// database cannot be created, granted, or connected.
+    pub async fn create() -> Result<Self, FixtureError> {
+        let test_db = TestDatabase::create_empty().await?;
+        let migrator_dsn = test_db.resolved_dsns()?.migrator;
+        let migrator = build_pool(
+            migrator_dsn.expose_secret(),
+            PoolConfig::migrator_defaults(),
+        )
+        .await
+        .map_err(SqlError::Connect)?;
+        Ok(Self {
+            migrator,
+            _test_db: test_db,
+        })
+    }
+
+    /// The migrator-role pool, which owns DDL on this database.
+    #[must_use]
+    pub fn migrator_pool(&self) -> &PgPool {
+        &self.migrator
+    }
+}
+
 /// Owns one ephemeral database and the admin authority required to clean it up.
 struct TestDatabase {
     /// Unique database name allocated for this fixture instance.
@@ -337,6 +378,18 @@ impl TestDatabase {
     /// database cannot be created or granted, or migrations fail.
     async fn create() -> Result<Self, SqlError> {
         let base = resolved_external_test_dsns()?;
+        let test_db = Self::create_empty().await?;
+        test_db.migrate(&base).await?;
+        Ok(test_db)
+    }
+
+    /// Creates an isolated database and grants the migrator its narrow
+    /// database privileges, applying no migration.
+    ///
+    /// # Errors
+    /// Returns [`SqlError`] when the admin DSN is missing or invalid, or the
+    /// database cannot be created or granted.
+    async fn create_empty() -> Result<Self, SqlError> {
         let admin_dsn = test_database_admin_dsn("wyrd")?;
         let name = unique_database_name();
         let admin_pool = build_pool(admin_dsn.expose_secret(), PoolConfig::migrator_defaults())
@@ -355,13 +408,11 @@ impl TestDatabase {
         .map_err(SqlError::from)?;
         admin_pool.close().await;
 
-        let test_db = Self {
+        Ok(Self {
             name,
             admin_dsn,
             owned: true,
-        };
-        test_db.migrate(&base).await?;
-        Ok(test_db)
+        })
     }
 
     /// Binds to an already-created, already-migrated fixture database.

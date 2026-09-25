@@ -18,7 +18,7 @@
 -- leaving the database unchanged, and names the tenant id and a repair step
 -- (never an issuer secret) when a tenant has more than one Human issuer, a
 -- Human issuer carries default roles, its audience differs from its client id,
--- or it uses private_key_jwt. Each surviving Human issuer becomes that tenant's
+-- it uses private_key_jwt, or a secret method stores no secret. Each surviving Human issuer becomes that tenant's
 -- Active connection with its claim mapping, group role map, JWKS URI, and JWKS
 -- TTL preserved. A Human issuer still referenced by a workload binding is kept
 -- as a Workload issuer so the binding survives; every other Human issuer row is
@@ -74,6 +74,18 @@ BEGIN
      LIMIT 1;
     IF FOUND THEN
         RAISE EXCEPTION 'human connection preflight failed for tenant %: the Human trusted issuer uses an unsupported client authentication method. Repair: Re-create the Human trusted issuer with SecretBasic, SecretPost, or Public client authentication with the previous release, then rerun the upgrade.', offending.data_tenant_id;
+    END IF;
+
+    SELECT data_tenant_id
+      INTO offending
+      FROM wyrd.auth_trusted_issuers
+     WHERE principal_kind = 'Human'
+       AND client_auth IN ('SecretBasic', 'SecretPost')
+       AND client_secret_enc IS NULL
+     ORDER BY data_tenant_id
+     LIMIT 1;
+    IF FOUND THEN
+        RAISE EXCEPTION 'human connection preflight failed for tenant %: the Human trusted issuer uses a client secret method but stores no secret. Repair: Re-create the Human trusted issuer with its client secret (or Public client authentication) with the previous release, then rerun the upgrade.', offending.data_tenant_id;
     END IF;
 END
 $$;
@@ -137,7 +149,9 @@ INSERT INTO wyrd.auth_human_connections (
     jwks_ttl_secs, jwks_uri, created_at, updated_at
 )
 SELECT gen_random_uuid(), data_tenant_id, 1, 'Active', issuer_url, client_id,
-       client_auth, client_secret_enc, claim_mapping, group_role_map,
+       client_auth,
+       CASE WHEN client_auth = 'Public' THEN NULL ELSE client_secret_enc END,
+       claim_mapping, group_role_map,
        GREATEST(jwks_ttl_secs, 1), jwks_uri, created_at, now()
   FROM wyrd.auth_trusted_issuers
  WHERE principal_kind = 'Human';

@@ -4,7 +4,6 @@ use axum::extract::{Extension, Query, State};
 use axum::http::{HeaderMap, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use serde::Deserialize;
-use wyrd_auth::login::prepare_login;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::IssuerUrl;
 use wyrd_spec::error::{WyrdError, WyrdProblem};
@@ -100,21 +99,10 @@ async fn try_initiate_login(
         .human_connections
         .as_ref()
         .ok_or_else(auth_not_configured)?;
-    let redirect_uri = connections
-        .require_callback()
-        .map_err(WyrdErrorResponse::from)?;
-    let active = connections
-        .active_connection_for(tenant_id, &query.issuer)
+    let init = connections
+        .begin_login(tenant_id, &query.issuer)
         .await
         .map_err(WyrdErrorResponse::from)?;
-    let init = prepare_login(
-        state.postgres.wyrd(),
-        &active,
-        redirect_uri,
-        connections.http(),
-    )
-    .await
-    .map_err(WyrdErrorResponse::from)?;
 
     if wants_json(headers) {
         Ok(axum::Json(init).into_response())

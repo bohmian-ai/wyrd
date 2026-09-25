@@ -1,5 +1,7 @@
 //! Cross-cutting auth error converters shared by all three token-issuing flows.
 
+use std::fmt::Display;
+
 use serde_json::json;
 use wyrd_auth_oidc::ScreenError;
 use wyrd_auth_verify::{AuthError, MAX_DELEGATION_DEPTH};
@@ -12,7 +14,17 @@ use wyrd_sql::SqlError;
 /// be reached, never which address range it resolved to, because that answer is
 /// a probe of the deployment's internal network.
 pub(crate) fn screen_error(error: &ScreenError) -> WyrdError {
-    tracing::warn!(%error, "identity provider request refused by address screening");
+    provider_unreachable(format_args!(
+        "request refused by address screening: {error}"
+    ))
+}
+
+/// The identity provider could not be reached, failed, or answered unusably.
+///
+/// Logs `cause` server-side and returns the one public refusal every provider
+/// transport failure shares, naming no address, status, or body detail.
+pub(crate) fn provider_unreachable(cause: impl Display) -> WyrdError {
+    tracing::warn!(error = %cause, "identity provider unavailable");
     WyrdError::DiscoveryUnavailable {
         message: "identity provider could not be reached".to_owned(),
         details: json!({}),

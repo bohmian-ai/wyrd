@@ -150,12 +150,12 @@ impl PlatformLogin {
         redirect_uri: String,
     ) -> Result<LoginInitResponse, PlatformLoginError> {
         let connection = self.connection().await?;
-        let authorization_endpoint = crate::login::discover_authorization_endpoint(
-            &connection.verification.issuer,
-            self.http,
-        )
-        .await
-        .map_err(|error| PlatformLoginError::ProviderUnavailable(Box::new(error)))?;
+        let authorization_endpoint =
+            crate::callback::discover_provider(&connection.verification.issuer, self.http)
+                .await
+                .map_err(|error| PlatformLoginError::ProviderUnavailable(Box::new(error.into())))?
+                .metadata
+                .authorization_endpoint;
 
         let state = auth_state_key();
         let code_verifier = pkce_verifier();
@@ -230,7 +230,7 @@ impl PlatformLogin {
         let provider =
             crate::callback::discover_provider(&connection.verification.issuer, self.http)
                 .await
-                .map_err(|error| PlatformLoginError::ProviderUnavailable(Box::new(error)))?;
+                .map_err(|error| PlatformLoginError::ProviderUnavailable(Box::new(error.into())))?;
         let id_token = crate::callback::exchange_code_for_id_token(
             &provider,
             &connection.client_id,

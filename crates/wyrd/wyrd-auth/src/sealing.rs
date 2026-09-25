@@ -130,9 +130,18 @@ impl SealedSecretRewrap {
     where
         F: Future<Output = Result<bool, SqlError>>,
     {
-        match self.reseal(sealed) {
-            Reseal::Current => report.current += 1,
-            Reseal::Unopenable => {
+        // Without a keyring nothing opens; `rewrap` answers `None` for a
+        // ciphertext already under the write key.
+        match self.keyring.as_ref().map(|keyring| keyring.rewrap(sealed)) {
+            Some(Ok(None)) => report.current += 1,
+            Some(Ok(Some(bytes))) => {
+                if swap(bytes).await? {
+                    report.rewrapped += 1;
+                } else {
+                    report.remaining += 1;
+                }
+            }
+            None | Some(Err(_)) => {
                 tracing::error!(
                     table,
                     tenant_id = ?tenant_id,
@@ -140,37 +149,7 @@ impl SealedSecretRewrap {
                 );
                 report.remaining += 1;
             }
-            Reseal::Rewrapped(bytes) => {
-                if swap(bytes).await? {
-                    report.rewrapped += 1;
-                } else {
-                    report.remaining += 1;
-                }
-            }
         }
         Ok(())
     }
-
-    /// Classify one ciphertext and reseal it when needed; without a keyring
-    /// nothing opens.
-    fn reseal(&self, sealed: &[u8]) -> Reseal {
-        let Some(keyring) = &self.keyring else {
-            return Reseal::Unopenable;
-        };
-        match keyring.rewrap(sealed) {
-            Ok(None) => Reseal::Current,
-            Ok(Some(bytes)) => Reseal::Rewrapped(bytes),
-            Err(_) => Reseal::Unopenable,
-        }
-    }
-}
-
-/// What one ciphertext needs.
-enum Reseal {
-    /// Already sealed under the write key.
-    Current,
-    /// Resealed under the write key; must be swapped in.
-    Rewrapped(Vec<u8>),
-    /// No held key opens it.
-    Unopenable,
 }

@@ -67,13 +67,7 @@ pub async fn exchange_authorization_code(
             .ok_or_else(auth_not_configured)?,
     };
     service
-        .execute(
-            state.postgres.wyrd(),
-            tenant_id,
-            code,
-            state_key,
-            request_id,
-        )
+        .execute(tenant_id, code, state_key, request_id)
         .await
         .map_err(WyrdErrorResponse::from)
 }
@@ -703,7 +697,7 @@ mod pg_tests {
     async fn test_state_with_external(fixture: &PgFixture) -> AppState {
         let sealing_key = Arc::new(SealingKeyring::new(SecretKey::from_bytes([7_u8; 32])));
         let issuer_resolver = Arc::new(PgIssuerResolver::new(
-            Arc::new(fixture.app_pool().clone()),
+            fixture.wyrd_postgres().clone(),
             Some(Arc::clone(&sealing_key)),
         ));
 

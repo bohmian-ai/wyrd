@@ -51,8 +51,8 @@ use wyrd_sql::row_types::auth::{HumanConnectionBinding, HumanConnectionRow};
 use wyrd_sql::{TenantConn, WyrdPostgres};
 
 use crate::audit::append_auth_audit;
-use crate::callback::{authorization_code_request, discover_provider};
-use crate::error::{screen_error, store_error};
+use crate::callback::{DiscoveryFailure, authorization_code_request, discover_provider};
+use crate::error::{provider_unreachable, screen_error, store_error};
 use crate::exchange_api_key::{ExchangeError, role_refs, verify_api_key};
 use crate::issuance::resolve_permissions;
 use crate::login::{auth_nonce, auth_state_key, build_authorization_url, pkce_verifier};
@@ -200,17 +200,20 @@ impl HumanConnections {
         }
     }
 
-    /// The exact redirect URI tenants register at their provider, if a public
-    /// origin is configured.
+    /// The screened HTTP capability every provider request is made through;
+    /// login and the callback exchange reuse it so their provider requests
+    /// are screened exactly as candidate testing's are.
     #[must_use]
-    pub fn callback_url(&self) -> Option<&Url> {
-        self.callback_url.as_ref()
+    pub(crate) fn http(&self) -> ScreenedHttp {
+        self.http
     }
 
-    /// The screened HTTP capability every provider request is made through.
+    /// The runtime Postgres handle this owner acquires tenant transactions
+    /// from; login state and callback issuance share it so every human-login
+    /// statement runs under the same role-separated store.
     #[must_use]
-    pub fn http(&self) -> ScreenedHttp {
-        self.http
+    pub(crate) fn postgres(&self) -> &WyrdPostgres {
+        &self.postgres
     }
 
     /// Read the tenant's Active and Candidate connections as redacted views.
@@ -376,7 +379,13 @@ impl HumanConnections {
         let target = self.test_target(tenant, expected_revision).await?;
         let provider = discover_provider(&target.issuer, self.http)
             .await
-            .map_err(issuer_mismatch_untested)?;
+            .map_err(|failure| match failure {
+                DiscoveryFailure::IssuerMismatch => not_tested_reason(
+                    "issuer_mismatch",
+                    "the provider discovery document names a different issuer",
+                ),
+                DiscoveryFailure::Unavailable(error) => error,
+            })?;
         self.probe_jwks(&target, &provider).await?;
         self.probe_callback(&provider, &target, callback).await?;
         self.probe_client_auth(&provider, &target, callback).await?;
@@ -727,10 +736,10 @@ impl HumanConnections {
             .client_for(&url)
             .await
             .map_err(|error| screen_error(&error))?;
-        let response = client.get(url).send().await.map_err(unreachable)?;
+        let response = client.get(url).send().await.map_err(provider_unreachable)?;
         let status = response.status();
         if status.is_server_error() {
-            return Err(unreachable("authorization endpoint failed"));
+            return Err(provider_unreachable("authorization endpoint failed"));
         }
         let location = response
             .headers()
@@ -786,12 +795,14 @@ impl HumanConnections {
         )?
         .send()
         .await
-        .map_err(unreachable)?;
+        .map_err(provider_unreachable)?;
         let status = response.status();
         if status.is_server_error() {
-            return Err(unreachable("token endpoint failed"));
+            return Err(provider_unreachable("token endpoint failed"));
         }
-        let body = read_bounded_body(response).await.map_err(unreachable)?;
+        let body = read_bounded_body(response)
+            .await
+            .map_err(provider_unreachable)?;
         client_auth_outcome(status, &body)
     }
 
@@ -832,8 +843,9 @@ impl HumanConnections {
 ///
 /// Qualifies only a redirect whose `Location` is an absolute URL with the
 /// callback's exact origin and path, carrying exactly one `state` equal to
-/// the probe's and either a nonempty `code` or one standard authorization
-/// `error`. A provider only redirects to a URI registered for the client, so
+/// the probe's and exactly one response arm: one nonempty `code` and no
+/// `error`, or one standard authorization `error` and no `code`. Mixed or
+/// repeated arms are ambiguous and never qualify. A provider only redirects to a URI registered for the client, so
 /// that answer proves registration; a login page, a foreign or missing
 /// location, a mismatched state, or an unknown error proves nothing.
 fn callback_redirect_qualifies(
@@ -852,19 +864,19 @@ fn callback_redirect_qualifies(
         return false;
     }
     let pairs: Vec<(String, String)> = location.query_pairs().into_owned().collect();
-    let single = |name: &str| {
-        let mut values = pairs
+    let values = |name: &str| {
+        pairs
             .iter()
             .filter(|(key, _)| key == name)
-            .map(|(_, value)| value.as_str());
-        match (values.next(), values.next()) {
-            (Some(value), None) => Some(value),
-            _ => None,
-        }
+            .map(|(_, value)| value.as_str())
+            .collect::<Vec<_>>()
     };
-    let answered = single("code").is_some_and(|code| !code.is_empty())
-        || single("error").is_some_and(|error| AUTHORIZATION_ERRORS.contains(&error));
-    single("state") == Some(state) && answered
+    let answered = match (values("code").as_slice(), values("error").as_slice()) {
+        ([code], []) => !code.is_empty(),
+        ([], [error]) => AUTHORIZATION_ERRORS.contains(error),
+        _ => false,
+    };
+    values("state") == [state] && answered
 }
 
 /// Judge the token endpoint's answer to the invalid-code probe.
@@ -949,31 +961,6 @@ async fn commit_refusal<T>(conn: TenantConn<'_>, refusal: WyrdError) -> Result<T
     Err(refusal)
 }
 
-/// Report a discovery document naming a different issuer as a failed test
-/// check; every other discovery failure keeps its unavailability error.
-fn issuer_mismatch_untested(error: WyrdError) -> WyrdError {
-    match error {
-        WyrdError::DiscoveryUnavailable { details, .. }
-            if details.get("reason").and_then(Value::as_str) == Some("issuer_mismatch") =>
-        {
-            not_tested_reason(
-                "issuer_mismatch",
-                "the provider discovery document names a different issuer",
-            )
-        }
-        other => other,
-    }
-}
-
-/// The provider could not be reached or failed; testing fails closed.
-fn unreachable(error: impl Display) -> WyrdError {
-    tracing::warn!(error = %error, "tenant connection provider unavailable");
-    WyrdError::DiscoveryUnavailable {
-        message: "the identity provider could not be reached".to_owned(),
-        details: json!({}),
-    }
-}
-
 /// A failed test check with a stable machine-readable reason.
 fn not_tested_reason(reason: &str, message: &str) -> WyrdError {
     WyrdError::ConnectionNotTested {
@@ -1017,15 +1004,14 @@ fn internal(cause: impl Display) -> WyrdError {
 mod probe_tests {
     use reqwest::StatusCode;
     use serde_json::json;
-    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use url::Url;
     use uuid::Uuid;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     use wyrd_auth_oidc::{ClientAuth, MAX_RESPONSE_BYTES, OidcProvider, ScreenedHttp};
+    use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::auth::IssuerUrl;
     use wyrd_spec::error::WyrdError;
-    use wyrd_sql::WyrdPostgres;
 
     use super::{HumanConnections, TestTarget, callback_redirect_qualifies, client_auth_outcome};
 
@@ -1055,8 +1041,9 @@ mod probe_tests {
         }
     }
 
-    /// Only an exact callback redirect echoing the state with a code or a
-    /// standard error qualifies.
+    /// Only an exact callback redirect echoing the state with exactly one
+    /// response arm (a code or a standard error) qualifies; mixed and
+    /// duplicate arms are refused.
     #[test]
     fn only_an_exact_state_matching_callback_redirect_qualifies() {
         let base = "https://wyrd.example.com/auth/callback";
@@ -1080,6 +1067,29 @@ mod probe_tests {
             (302, Some(format!("{base}?state=s1"))),
             (302, Some(format!("{base}?code=&state=s1"))),
             (302, Some(format!("{base}?error=made_up&state=s1"))),
+            (
+                302,
+                Some(format!("{base}?code=abc&error=login_required&state=s1")),
+            ),
+            (302, Some(format!("{base}?code=a&code=b&state=s1"))),
+            (
+                302,
+                Some(format!(
+                    "{base}?error=login_required&error=consent_required&state=s1"
+                )),
+            ),
+            (
+                302,
+                Some(format!(
+                    "{base}?code=a&code=b&error=login_required&state=s1"
+                )),
+            ),
+            (
+                302,
+                Some(format!(
+                    "{base}?code=abc&error=login_required&error=consent_required&state=s1"
+                )),
+            ),
             (
                 302,
                 Some("https://evil.example.com/auth/callback?code=a&state=s1".to_owned()),
@@ -1212,9 +1222,9 @@ mod probe_tests {
         )
         .await
         .expect("mock provider is discovered");
-        let pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
+        let fixture = PgFixture::start().await.expect("fixture starts");
         let connections = HumanConnections::new(
-            WyrdPostgres::from_pools(pool, None),
+            fixture.wyrd_postgres().clone(),
             None,
             http,
             Some(&Url::parse("https://wyrd.example.com").expect("origin parses")),

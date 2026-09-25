@@ -84,12 +84,12 @@ impl AuthorizationCodeExchange {
     /// returned, and the grant transaction commits or rolls back whole.
     pub async fn execute(
         &self,
-        postgres: &WyrdPostgres,
         tenant_id: DataTenantId,
         code: SecretString,
         state_key: &str,
         request_id: &str,
     ) -> Result<TokenResponse, WyrdError> {
+        let postgres = self.connections.postgres();
         let store = PgLoginStateStore::new(postgres.clone());
         let mut audit_principal_id = Uuid::nil();
         let result = async {
@@ -256,43 +256,69 @@ impl AuthorizationCodeExchange {
     }
 }
 
+/// Why screened discovery produced no provider.
+///
+/// Keeps an issuer mismatch typed so candidate testing can report it as a
+/// failed check while login and the callback convert it into the public
+/// [`WyrdError::DiscoveryUnavailable`] through [`From`].
+#[derive(Debug)]
+pub(crate) enum DiscoveryFailure {
+    /// The discovery document names a different issuer than requested.
+    IssuerMismatch,
+    /// Any other failure, already mapped to its public error.
+    Unavailable(WyrdError),
+}
+
+impl From<DiscoveryFailure> for WyrdError {
+    /// Project a discovery failure onto the public catalog; a mismatch keeps
+    /// its stable `details.reason = "issuer_mismatch"`.
+    fn from(failure: DiscoveryFailure) -> Self {
+        match failure {
+            DiscoveryFailure::IssuerMismatch => WyrdError::DiscoveryUnavailable {
+                message: "the provider discovery document names a different issuer".to_owned(),
+                details: serde_json::json!({ "reason": "issuer_mismatch" }),
+            },
+            DiscoveryFailure::Unavailable(error) => error,
+        }
+    }
+}
+
 /// Discover an issuer using Wyrd's process-owned TLS implementation.
 ///
-/// Shared by login, the callback, and candidate testing, so every provider
-/// discovery is screened and pinned to its issuer the same way.
+/// Shared by login, the callback, platform login, and candidate testing, so
+/// every provider discovery is screened and pinned to its issuer the same way.
 ///
 /// # Errors
 ///
-/// Returns [`WyrdError::DiscoveryUnavailable`] when the issuer URL is invalid,
-/// `http` refuses the address behind it, or discovery fails; a discovery
-/// document naming a different issuer carries `details.reason =
-/// "issuer_mismatch"`. Cancellation interrupts the request without persisting
-/// callback state.
+/// Returns [`DiscoveryFailure::IssuerMismatch`] when the discovery document
+/// names a different issuer, and [`DiscoveryFailure::Unavailable`] carrying
+/// [`WyrdError::DiscoveryUnavailable`] when the issuer URL is invalid, `http`
+/// refuses the address behind it, or discovery otherwise fails. Cancellation
+/// interrupts the request without persisting callback state.
 pub(crate) async fn discover_provider(
     issuer: &IssuerUrl,
     http: ScreenedHttp,
-) -> Result<OidcProvider, WyrdError> {
-    let issuer_url = Url::parse(issuer.as_str()).map_err(|_| WyrdError::DiscoveryUnavailable {
-        message: "trusted issuer URL could not be parsed".to_owned(),
-        details: serde_json::json!({}),
+) -> Result<OidcProvider, DiscoveryFailure> {
+    let issuer_url = Url::parse(issuer.as_str()).map_err(|_| {
+        DiscoveryFailure::Unavailable(WyrdError::DiscoveryUnavailable {
+            message: "trusted issuer URL could not be parsed".to_owned(),
+            details: serde_json::json!({}),
+        })
     })?;
     let client = http
         .client_for(&issuer_url)
         .await
-        .map_err(|error| screen_error(&error))?;
+        .map_err(|error| DiscoveryFailure::Unavailable(screen_error(&error)))?;
     OidcProvider::discover(issuer_url, client)
         .await
         .map_err(|error| {
             tracing::warn!(error = %error, "OIDC discovery failed");
             match error {
-                OidcError::IssuerMismatch { .. } => WyrdError::DiscoveryUnavailable {
-                    message: "the provider discovery document names a different issuer".to_owned(),
-                    details: serde_json::json!({ "reason": "issuer_mismatch" }),
-                },
-                _ => WyrdError::DiscoveryUnavailable {
+                OidcError::IssuerMismatch { .. } => DiscoveryFailure::IssuerMismatch,
+                _ => DiscoveryFailure::Unavailable(WyrdError::DiscoveryUnavailable {
                     message: "OIDC discovery unavailable".to_owned(),
                     details: serde_json::json!({}),
-                },
+                }),
             }
         })
 }
@@ -566,14 +592,15 @@ mod screening_tests {
     async fn begin_login_refuses_an_internal_issuer_without_reaching_it() {
         let (server, issuer) = loopback_provider().await;
 
-        let error = crate::login::discover_authorization_endpoint(
-            &issuer,
-            ScreenedHttp::new(AddressPolicy::BlockInternal),
-        )
-        .await
-        .expect_err("an internal issuer is refused");
+        let error =
+            super::discover_provider(&issuer, ScreenedHttp::new(AddressPolicy::BlockInternal))
+                .await
+                .expect_err("an internal issuer is refused");
 
-        assert!(matches!(error, WyrdError::DiscoveryUnavailable { .. }));
+        assert!(matches!(
+            WyrdError::from(error),
+            WyrdError::DiscoveryUnavailable { .. }
+        ));
         assert!(
             server
                 .received_requests()

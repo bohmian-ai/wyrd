@@ -7,7 +7,6 @@ use rand::RngCore;
 use secrecy::{ExposeSecret, SecretString};
 use sha2::{Digest, Sha256};
 use url::Url;
-use wyrd_auth_oidc::ScreenedHttp;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{AbsoluteUrl, IssuerUrl, LoginInitResponse};
 use wyrd_spec::error::WyrdError;
@@ -16,7 +15,7 @@ use wyrd_sql::row_types::auth::HumanConnectionBinding;
 use wyrd_sql::{SqlError, WyrdPostgres};
 
 use crate::callback::discover_provider;
-use crate::connections::ActiveHumanConnection;
+use crate::connections::HumanConnections;
 use crate::error::store_error;
 
 /// Lifetime of a persisted login-state row: the browser must complete the `IdP`
@@ -105,81 +104,73 @@ impl PgLoginStateStore {
     }
 }
 
-/// Resolve the `IdP` authorization URL and persist login state for the callback.
-///
-/// `redirect_uri` is the deployment's configured callback — the one URL
-/// tenants register at their provider and candidate testing proved — never a
-/// value derived from request headers. The state row binds the exact
-/// connection revision in `active`, so the callback can refuse a login whose
-/// connection was replaced, deactivated, or removed in the meantime.
-///
-/// # Errors
-/// Returns [`WyrdError`] when the issuer's authorization endpoint cannot be
-/// discovered, when the authorization URL cannot be built from the trusted
-/// issuer's configuration, or when the login state cannot be persisted. No
-/// redirect is returned unless its state row is durable.
-pub async fn prepare_login(
-    postgres: &WyrdPostgres,
-    active: &ActiveHumanConnection,
-    redirect_uri: &Url,
-    http: ScreenedHttp,
-) -> Result<LoginInitResponse, WyrdError> {
-    let trusted = &active.trusted;
-    let authorization_endpoint = discover_authorization_endpoint(&trusted.issuer, http).await?;
-    let state_key = auth_state_key();
-    let code_verifier = pkce_verifier();
-    let nonce = auth_nonce();
-    let authz_url = build_authorization_url(
-        &authorization_endpoint,
-        &trusted.client_id,
-        redirect_uri.as_str(),
-        &state_key,
-        code_verifier.expose_secret(),
-        &nonce,
-    );
-    let init = LoginInitResponse {
-        authorization_url: AbsoluteUrl::new(authz_url.as_str().to_owned())
-            .map_err(|_| invalid_token("authorization URL is invalid"))?,
-        state: state_key.clone(),
-    };
-    PgLoginStateStore::new(postgres.clone())
-        .put(
-            trusted.tenant_id,
+impl HumanConnections {
+    /// Begin a human login for `tenant` against `issuer`: resolve the `IdP`
+    /// authorization URL and persist the login state the callback consumes.
+    ///
+    /// Requires a configured public origin, then requires `issuer` to be the
+    /// tenant's Active connection. The redirect URI is the deployment's
+    /// configured callback — the one URL tenants register at their provider
+    /// and candidate testing proved — never a value derived from request
+    /// headers. Discovery runs through this owner's screened HTTP capability,
+    /// and the state row binds the exact Active connection revision, so the
+    /// callback can refuse a login whose connection was replaced,
+    /// deactivated, or removed in the meantime.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::Validation`] when no public origin is configured,
+    /// [`WyrdError::InvalidToken`] when `issuer` is not the tenant's Active
+    /// connection or the authorization URL cannot be built,
+    /// [`WyrdError::DiscoveryUnavailable`] when the issuer is refused by
+    /// screening or its discovery fails, and [`WyrdError::AuthVerifyUnavailable`]
+    /// when the connection read or login-state write fails. No redirect is
+    /// returned unless its state row is durable; cancellation before the
+    /// write persists nothing.
+    pub async fn begin_login(
+        &self,
+        tenant: DataTenantId,
+        issuer: &IssuerUrl,
+    ) -> Result<LoginInitResponse, WyrdError> {
+        let redirect_uri = self.require_callback()?;
+        let active = self.active_connection_for(tenant, issuer).await?;
+        let trusted = &active.trusted;
+        let authorization_endpoint = discover_provider(&trusted.issuer, self.http())
+            .await?
+            .metadata
+            .authorization_endpoint;
+        let state_key = auth_state_key();
+        let code_verifier = pkce_verifier();
+        let nonce = auth_nonce();
+        let authz_url = build_authorization_url(
+            &authorization_endpoint,
+            &trusted.client_id,
+            redirect_uri.as_str(),
             &state_key,
-            LoginStateEntry {
-                code_verifier,
-                nonce,
-                issuer: trusted.issuer.to_string(),
-                redirect_uri: redirect_uri.to_string(),
-                connection: active.binding,
-            },
-            LOGIN_STATE_TTL,
-        )
-        .await
-        .map_err(store_error)?;
-    Ok(init)
-}
-
-/// Resolve the trusted issuer's OIDC `authorization_endpoint` via discovery.
-///
-/// # Errors
-///
-/// Returns [`WyrdError::DiscoveryUnavailable`] when the issuer URL is invalid,
-/// the address behind it is refused by `http`, or the metadata request or
-/// response is invalid. Cancellation can interrupt discovery without
-/// persisting state.
-///
-/// The address is screened by `http` at the moment of the request, so an
-/// issuer that resolved publicly when it was configured cannot resolve inward
-/// now.
-pub async fn discover_authorization_endpoint(
-    issuer: &IssuerUrl,
-    http: ScreenedHttp,
-) -> Result<Url, WyrdError> {
-    Ok(discover_provider(issuer, http)
-        .await?
-        .metadata
-        .authorization_endpoint)
+            code_verifier.expose_secret(),
+            &nonce,
+        );
+        let init = LoginInitResponse {
+            authorization_url: AbsoluteUrl::new(authz_url.as_str().to_owned())
+                .map_err(|_| invalid_token("authorization URL is invalid"))?,
+            state: state_key.clone(),
+        };
+        PgLoginStateStore::new(self.postgres().clone())
+            .put(
+                trusted.tenant_id,
+                &state_key,
+                LoginStateEntry {
+                    code_verifier,
+                    nonce,
+                    issuer: trusted.issuer.to_string(),
+                    redirect_uri: redirect_uri.to_string(),
+                    connection: active.binding,
+                },
+                LOGIN_STATE_TTL,
+            )
+            .await
+            .map_err(store_error)?;
+        Ok(init)
+    }
 }
 
 /// Generate an unguessable login-state key.

@@ -431,9 +431,7 @@ describe("drift method edge journey", () => {
 
       const sparse = await subject(cards, root, "ts-edge-sparse");
       await emitRows(server, cards, sparse, join(bundles, "sparse"), baselineLike.slice(0, 3));
-      outcome = await run(psi, sparse);
-      expect(outcome.result.verdict).toBe("inconclusive");
-      expect(outcome.features).toEqual(["latency/Psi/inconclusive", "tier/Psi/inconclusive"]);
+      assertUnscored(await run(psi, sparse));
       assertUnscored(await run(spc, sparse));
 
       const gappy = await subject(cards, root, "ts-edge-gappy");

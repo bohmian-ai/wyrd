@@ -236,11 +236,13 @@ fn target_column(
 /// This is the aggregate-input entry point: the server counts target values
 /// into the fitted bins and passes only the counts. `counts[f][i]` is the
 /// number of target values in fitted bin `i`, and the feature's sample is
-/// their sum. A feature below [`PSI_MIN_TARGET_SAMPLE`] values (including
-/// zero) is `Inconclusive` with NaN score and threshold; otherwise the PSI of
-/// baseline against target proportions is compared with the profile threshold
-/// over every bin, `other` included, equality is `NoDrift`, and the feature
-/// carries [`PsiEvidence`].
+/// their sum. When any feature has fewer than [`PSI_MIN_TARGET_SAMPLE`]
+/// values (including zero), the whole target is insufficient and the result
+/// is [`DriftReport::unscored`]: no feature is scored, so a sufficient sibling
+/// cannot fail the run on its own. Otherwise each feature's PSI of baseline
+/// against target proportions is compared with the profile threshold over
+/// every bin, `other` included, equality is `NoDrift`, and the feature carries
+/// [`PsiEvidence`].
 ///
 /// # Errors
 /// Returns [`DriftScoreError::PsiInternal`] when a baseline feature has no
@@ -251,7 +253,7 @@ pub fn score_psi_counts(
     counts: &BTreeMap<FeatureName, Vec<u64>>,
     profile: &PsiProfile,
 ) -> Result<DriftReport, DriftScoreError> {
-    let mut feature_reports = BTreeMap::new();
+    let mut targets = Vec::with_capacity(baseline.features.len());
     for (feature_name, fitted) in &baseline.features {
         let target = counts
             .get(feature_name)
@@ -262,49 +264,49 @@ pub fn score_psi_counts(
                     feature_name.as_str()
                 ),
             })?;
-        let sample = target.iter().sum::<u64>();
-        let report = if sample < PSI_MIN_TARGET_SAMPLE {
-            FeatureDriftReport {
-                feature: feature_name.clone(),
-                score: f64::NAN,
-                threshold: f64::NAN,
-                verdict: DriftVerdict::Inconclusive,
-                evidence: None,
-            }
+        targets.push((feature_name, fitted, target, target.iter().sum::<u64>()));
+    }
+    if targets
+        .iter()
+        .any(|(_, _, _, sample)| *sample < PSI_MIN_TARGET_SAMPLE)
+    {
+        return Ok(DriftReport::unscored(DriftMethod::Psi));
+    }
+
+    let mut feature_reports = BTreeMap::new();
+    for (feature_name, fitted, target, sample) in targets {
+        let baseline_proportions = fitted
+            .bins
+            .iter()
+            .map(|bin| bin.proportion)
+            .collect::<Vec<_>>();
+        let target_proportions = target
+            .iter()
+            .map(|count| *count as f64 / sample as f64)
+            .collect::<Vec<_>>();
+        let score = psi(&baseline_proportions, &target_proportions);
+        let threshold = compute_psi_threshold(&profile.threshold, fitted.bins.len(), sample)?;
+        let verdict = if score > threshold {
+            DriftVerdict::Drift
         } else {
-            let baseline_proportions = fitted
-                .bins
-                .iter()
-                .map(|bin| bin.proportion)
-                .collect::<Vec<_>>();
-            let target_proportions = target
-                .iter()
-                .map(|count| *count as f64 / sample as f64)
-                .collect::<Vec<_>>();
-            let score = psi(&baseline_proportions, &target_proportions);
-            let threshold = compute_psi_threshold(&profile.threshold, fitted.bins.len(), sample)?;
-            let verdict = if score > threshold {
-                DriftVerdict::Drift
-            } else {
-                DriftVerdict::NoDrift
-            };
-            let bins = fitted
-                .bins
-                .iter()
-                .zip(target.iter().zip(target_proportions))
-                .map(|(bin, (count, proportion))| PsiBinEvidence {
-                    bin: bin.clone(),
-                    target_count: *count,
-                    target_proportion: proportion,
-                })
-                .collect();
-            FeatureDriftReport {
-                feature: feature_name.clone(),
-                score,
-                threshold,
-                verdict,
-                evidence: Some(FeatureEvidence::Psi(PsiEvidence { sample, bins })),
-            }
+            DriftVerdict::NoDrift
+        };
+        let bins = fitted
+            .bins
+            .iter()
+            .zip(target.iter().zip(target_proportions))
+            .map(|(bin, (count, proportion))| PsiBinEvidence {
+                bin: bin.clone(),
+                target_count: *count,
+                target_proportion: proportion,
+            })
+            .collect();
+        let report = FeatureDriftReport {
+            feature: feature_name.clone(),
+            score,
+            threshold,
+            verdict,
+            evidence: Some(FeatureEvidence::Psi(PsiEvidence { sample, bins })),
         };
         feature_reports.insert(feature_name.clone(), report);
     }
@@ -774,10 +776,13 @@ mod psi_fit {
 mod psi_score {
     //! Target scoring: exhaustive bins, completeness, evidence, and thresholds.
 
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     use crate::report::FeatureEvidence;
-    use crate::{DriftReport, DriftScoreError, DriftVerdict, fit_psi_baseline, score_psi};
+    use crate::{
+        DriftReport, DriftScoreError, DriftVerdict, fit_psi_baseline, score_psi, score_psi_counts,
+    };
     use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray};
     use arrow::record_batch::RecordBatch;
     use arrow_schema::{DataType, Field, Schema};
@@ -868,22 +873,56 @@ mod psi_score {
         assert_eq!(report.verdict, DriftVerdict::Drift);
     }
 
+    /// A target below the minimum sample is insufficient, so the whole
+    /// report is unscored: no NaN-scored feature row stands in for it.
+    ///
+    /// # Panics
+    /// Panics when a short target produces a feature report.
     #[test]
-    fn psi_target_too_small_is_inconclusive_with_nan_score_and_threshold() {
+    fn psi_target_too_small_is_unscored() {
         let baseline_batch = numeric_batch("x", (0..1000).map(|value| value as f64).collect());
         let target_batch = numeric_batch("x", (0..50).map(|value| value as f64).collect());
         let profile = psi_profile_default();
-        let fname = feature("x");
-        let baseline = fit_psi_baseline(&baseline_batch, &profile, std::slice::from_ref(&fname))
-            .expect("baseline");
+        let baseline =
+            fit_psi_baseline(&baseline_batch, &profile, &[feature("x")]).expect("baseline");
 
         let report = score_psi(&baseline, &target_batch, &profile).expect("report");
 
-        assert_eq!(report.verdict, DriftVerdict::Inconclusive);
-        let feature_report = report.features.get(&fname).expect("feature report");
-        assert_eq!(feature_report.verdict, DriftVerdict::Inconclusive);
-        assert!(feature_report.score.is_nan());
-        assert!(feature_report.threshold.is_nan());
+        assert_eq!(report, DriftReport::unscored(DriftMethod::Psi));
+    }
+
+    /// One feature below the minimum sample leaves the whole report unscored,
+    /// even when a sufficient sibling drifts, so the sibling cannot fail the
+    /// run alone. The same counts at the minimum score both features.
+    ///
+    /// # Panics
+    /// Panics when a mixed-sample target scores or a complete one does not.
+    #[test]
+    fn psi_one_insufficient_feature_unscores_the_report() {
+        let profile = PsiProfile {
+            categorical_features: vec![feature("c")],
+            ..psi_profile_default()
+        };
+        let baseline_batch = two_column_batch(
+            (0..1000).map(|value| Some(value as f64)).collect(),
+            (0..1000).map(|value| Some(["a", "b"][value % 2])).collect(),
+        );
+        let baseline = fit_psi_baseline(&baseline_batch, &profile, &[feature("x"), feature("c")])
+            .expect("baseline");
+        let counts = |c_sample: u64| {
+            let mut x = vec![0; baseline.features[&feature("x")].bins.len()];
+            x[0] = 100;
+            let mut c = vec![0; baseline.features[&feature("c")].bins.len()];
+            c[0] = c_sample;
+            BTreeMap::from([(feature("x"), x), (feature("c"), c)])
+        };
+
+        let complete = score_psi_counts(&baseline, &counts(100), &profile).expect("report");
+        assert_eq!(complete.features.len(), 2);
+        assert_eq!(complete.verdict, DriftVerdict::Drift);
+
+        let mixed = score_psi_counts(&baseline, &counts(99), &profile).expect("report");
+        assert_eq!(mixed, DriftReport::unscored(DriftMethod::Psi));
     }
 
     /// A direct target batch is already selected, so a row whose configured

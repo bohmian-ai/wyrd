@@ -991,11 +991,11 @@ impl EdgeJourney<'_> {
         assert!(evidence(&reread, "tier")["Psi"]["bins"].is_array());
     }
 
-    /// Three rows are below PSI's minimum sample, so PSI is inconclusive per
-    /// feature, and form only a partial SPC subgroup, so SPC is unscored.
+    /// Three rows are below PSI's minimum sample and form only a partial SPC
+    /// subgroup, so both methods leave the window unscored.
     ///
     /// # Panics
-    /// Panics when PSI is not inconclusive per feature or SPC is scored.
+    /// Panics when either method scores the sparse window.
     async fn assert_sparse_is_inconclusive(
         &self,
         psi: &RegistrationReceipt,
@@ -1004,16 +1004,7 @@ impl EdgeJourney<'_> {
     ) {
         let sparse = self.subject("sparse").await;
         self.emit(&sparse, "sparse", rows).await;
-        let (result, features) = self.run(psi, &sparse, self.start, self.end).await;
-        assert_eq!(result.verdict, "inconclusive", "{result:?}");
-        assert_eq!(
-            verdicts(&features),
-            [
-                ("latency", "Psi", "inconclusive"),
-                ("tier", "Psi", "inconclusive")
-            ],
-            "three rows are below PSI's minimum sample"
-        );
+        assert_unscored(&self.run(psi, &sparse, self.start, self.end).await);
         assert_unscored(&self.run(spc, &sparse, self.start, self.end).await);
     }
 

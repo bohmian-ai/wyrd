@@ -599,9 +599,7 @@ def test_drift_method_edges_score_through_oracle(tmp_path: Path) -> None:
 
         sparse = subject(cards, tmp_path, "py-edge-sparse")
         emit_rows(server, admin, sparse, bundles / "sparse", baseline_like[:3])
-        result, features = run(psi, sparse)
-        assert result["verdict"] == "inconclusive", result
-        assert features == [("latency", "Psi", "inconclusive"), ("tier", "Psi", "inconclusive")]
+        assert_unscored(run(psi, sparse))
         assert_unscored(run(spc, sparse))
 
         gappy = subject(cards, tmp_path, "py-edge-gappy")

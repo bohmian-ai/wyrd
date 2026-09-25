@@ -507,7 +507,7 @@ mod aggregate_inputs {
     }
 
     /// Server-side numeric bin counts equal raw-batch scoring, and a window
-    /// under the minimum sample is inconclusive rather than a pass.
+    /// under the minimum sample is unscored rather than a pass.
     ///
     /// # Panics
     /// Panics when the two paths disagree or small input is not inconclusive.
@@ -541,8 +541,7 @@ mod aggregate_inputs {
 
         let small = BTreeMap::from([(x.clone(), vec![99, 0, 0, 0])]);
         let report = score_psi_counts(&baseline, &small, &profile).expect("small scores");
-        assert_eq!(report.verdict, DriftVerdict::Inconclusive);
-        assert!(report.features[&x].score.is_nan());
+        assert_eq!(report, DriftReport::unscored(DriftMethod::Psi));
     }
 
     /// Unseen categories land in the reserved `other` bin on both paths.

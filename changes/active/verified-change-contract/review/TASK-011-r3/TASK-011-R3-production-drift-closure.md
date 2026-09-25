@@ -37,3 +37,33 @@ The R1 and R2 remediation files both have `status: ready` despite their complete
 ## Preserved behavior and non-goals
 
 Keep revision 38's selected-row completeness policy, exhaustive PSI bins, NIST X-bar/S math, whole-run short-sample handling, one Oracle query cut, audited tenant-scoped read, fitted-version boundary, result/dispatch behavior, and prior historical evidence. Do not add a PSI missing bin, imputation, new chart, migration, public route, or alternate scorer.
+
+## Implementation evidence
+
+Remediation range `0b12c45a..HEAD` (`7f3d5dd6` fix, `8459169f` status, then this record).
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Direct PSI numeric, PSI categorical and SPC targets with a selected all-null Arrow `Null` column return one empty unscored report | `vala-drift` `psi::target_column` and `score_spc` map a present `DataType::Null` column to `TargetColumn::Absent`; the existing `target_complete` guard returns `DriftReport::unscored` | `psi_null_typed_target_is_unscored` (numeric and categorical baselines), `null_typed_target_is_unscored`; both failed with the fix removed and pass with it | PASS |
+| Typed-null and non-null wrong-type behavior kept | Unchanged arms after the `Null` check | `psi_selected_null_only_row_makes_the_target_unscored`, `psi_numeric_target_type_mismatch_errors`, `psi_categorical_target_type_mismatch_errors`, `non_numeric_target_errors` | PASS |
+| R1 and R2 headers read `status: review` | Front matter of both remediation files | Inspected; `git diff --check` | PASS |
+| Lanes green after the last code change | — | commands below | PASS |
+
+Commands (all exit 0 after `7f3d5dd6`):
+
+- `mise run fmt`; `mise run lints`
+- `mise run test:vala` — 1282 passed
+- `mise run test:bifrost:integration:server` — 85 passed
+- `mise run test:bifrost:journey:drift` — 2 passed
+- `mise run test:bifrost:journey:python` — 40 passed
+- `mise run test:bifrost:journey:typescript` — 20 passed
+- `mise exec -- cargo nextest run --locked -p vala-drift --lib -E 'test(=psi::psi_score::psi_null_typed_target_is_unscored)'` — 1 passed
+- `mise exec -- cargo nextest run --locked -p vala-drift --lib -E 'test(=spc::spc_score::null_typed_target_is_unscored)'` — 1 passed
+- `mise exec -- cargo nextest run --locked -p vala-drift --lib -E 'test(=psi::psi_score::psi_numeric_target_type_mismatch_errors)'` — 1 passed
+- `mise exec -- cargo nextest run --locked -p vala-drift --lib -E 'test(=psi::psi_score::psi_categorical_target_type_mismatch_errors)'` — 1 passed
+- `mise exec -- cargo nextest run --locked -p vala-drift --lib -E 'test(=spc::spc_score::non_numeric_target_errors)'` — 1 passed
+- `git diff --check 0b12c45a..HEAD`
+
+`test:wyrd`, `test:principals:integration`, `codegen:check` and `docs:check` evidence is reused from R2: R3 changes no contract, schema, stub, route or doc-site file.
+
+Non-goals stayed excluded: no server, SQL, observation-format, missing-bin, imputation, chart, migration or route change. Only `vala-drift` target resolution, its tests, and the three task/remediation files changed.

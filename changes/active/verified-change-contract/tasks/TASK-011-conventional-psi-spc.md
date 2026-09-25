@@ -102,14 +102,15 @@ without adding another monitor or client-side scorer.
 
 Candidate range `338f3323..HEAD`: the original implementation
 `338f3323..6e3bac03` plus the [TASK-011-R1 remediation](../review/TASK-011-r1/TASK-011-R1-production-drift-closure.md)
-and the [TASK-011-R2 remediation](../review/TASK-011-r2/TASK-011-R2-production-drift-closure.md)
+the [TASK-011-R2 remediation](../review/TASK-011-r2/TASK-011-R2-production-drift-closure.md)
+and the [TASK-011-R3 remediation](../review/TASK-011-r3/TASK-011-R3-production-drift-closure.md)
 under approved revision 38.
 
 | Acceptance criterion | Implementation evidence | Verification evidence | Result |
 |---|---|---|---|
 | Exhaustive PSI bins, reserved `other` bin, bin evidence | `vala-drift` `psi/` fit and score, `report.rs` `Psi` evidence; server `psi_categorical` other bin | `psi_unseen_categories_land_in_the_other_bin`, `psi_zero_bins_and_other_count_toward_the_threshold`, `psi_threshold_boundary_is_strict`, `categorical_fit_sorts_bins_and_reserves_other`, `psi_categorical_unknowns_land_in_the_other_bin`; server `psi_categorical_sql_escapes_labels_and_counts_unknowns_as_other` | PASS |
 | Baseline null/non-finite fails the fit | `psi` and `spc` fit validation, `DriftFitError::{NullValuesInColumn, NonFiniteValuesInColumn}` | `null_baseline_values_fail_the_fit`, `numeric_fit_rejects_non_finite_values`, `null_and_non_finite_baseline_values_fail` | PASS |
-| Target completeness (rev 38): every row of a preselected direct batch participates; omitted/null/non-finite → wholly unscored; server selects by series and requires exactly one row per configured series per record; Custom unchanged | `feature.rs::target_complete`; server `ObservationWindow::incomplete` (`COUNT(*) > configured` marks a repeated series) inside the one PSI/SPC statement | `psi_incomplete_targets_are_unscored`, `psi_selected_null_only_row_makes_the_target_unscored`, `incomplete_targets_are_unscored`, server `completeness_flags_omitted_and_invalid_features_only` (repeated row case), `one_statement_decides_completeness_and_scores_from_one_cut`; Rust/Python/TS "gappy" journey cases | PASS |
+| Target completeness (rev 38): every row of a preselected direct batch participates; omitted/null/non-finite → wholly unscored; server selects by series and requires exactly one row per configured series per record; Custom unchanged | `feature.rs::target_complete` (a present Arrow `Null`-typed column is `TargetColumn::Absent` in PSI `target_column` and `score_spc`); server `ObservationWindow::incomplete` (`COUNT(*) > configured` marks a repeated series) inside the one PSI/SPC statement | `psi_incomplete_targets_are_unscored`, `psi_selected_null_only_row_makes_the_target_unscored`, `psi_null_typed_target_is_unscored` (numeric and categorical), `incomplete_targets_are_unscored`, `null_typed_target_is_unscored`, `psi_numeric_target_type_mismatch_errors`, `psi_categorical_target_type_mismatch_errors`, server `completeness_flags_omitted_and_invalid_features_only` (repeated row case), `one_statement_decides_completeness_and_scores_from_one_cut`; Rust/Python/TS "gappy" journey cases | PASS |
 | Insufficient PSI target (any feature < 100 values) → one empty unscored report, published as `completed/inconclusive` with null details, no feature rows, no dispatch; a repeated row cannot manufacture a sample | `vala-drift` `score_psi_counts` returns `DriftReport::unscored` before PSI math; server `DistributionFold::finish` maps any empty report to `None` | `psi_one_insufficient_feature_unscores_the_report` (100 vs 99, drifting sibling), `psi_target_too_small_is_unscored`, `psi_counts_match_raw_scoring_and_small_windows_are_inconclusive`; server `psi_repeated_series_row_cannot_manufacture_a_sample` (99 records + repeat → `None`; 100 records → Drift); Rust/Python/TS sparse journey cases assert PSI unscored | PASS |
 | Completeness and all feature aggregates from one Oracle cut | server `ObservationWindow::{psi_statement, spc_statement}` (`UNION ALL` ordered by part, `k`), `DistributionFold` | `one_statement_decides_completeness_and_scores_from_one_cut`; drift journeys and server integration lane | PASS |
 | `SpcProfile { sample_size ≥ 2 }` only; `weco_rule`/`alert_threshold` rejected | `wyrd-spec` `drift.rs`, schemas, stubs | `mise run test:wyrd` (runs `rejects_spc_sample_size_below_two`, `rejects_retired_and_unknown_spc_profile_fields`) and their exact commands; `codegen:check`; served `/openapi.json` via `test:principals:integration`; journeys refuse a `weco_rule` profile at registration | PASS |
@@ -125,20 +126,24 @@ under approved revision 38.
 Commands (all exit 0 on the final candidate):
 
 - `mise run fmt`; `mise run lints`; `mise run py:format`; `mise run py:lints`; `mise run ts:typecheck`
-- `mise run test:vala` — 1280 passed
-- `mise run test:wyrd` — 2142 passed (includes `wyrd-spec`)
+- `mise run test:vala` — 1282 passed (R3)
+- `mise run test:wyrd` — 2142 passed (includes `wyrd-spec`; R2 candidate, unaffected by the R3 `vala-drift` target-column change)
 - `mise run test:bifrost:journey:drift` — 2 passed
 - `mise run test:bifrost:journey:python` — 40 passed
 - `mise run test:bifrost:journey:typescript` — 20 passed
 - `mise run test:bifrost:integration:server` — 85 passed (includes `pg_verification_runtime`)
-- `mise run test:principals:integration` — passed (includes `pg_openapi_contract`, 16 passed)
-- `mise run codegen:check`; `mise run docs:check`
+- `mise run test:principals:integration` — passed (R2 candidate; R3 changes no contract) (includes `pg_openapi_contract`, 16 passed)
+- `mise run codegen:check`; `mise run docs:check` (R2 candidate; R3 changes no schema, stub, or doc site)
 - `git diff --check 338f3323..HEAD`
 - Focused, one exact command per named test:
   - `mise exec -- cargo nextest run --locked -p wyrd-spec --lib -E 'test(=card::drift_validation_tests::rejects_spc_sample_size_below_two)'` — 1 passed
   - `mise exec -- cargo nextest run --locked -p wyrd-spec --lib -E 'test(=card::drift_validation_tests::rejects_retired_and_unknown_spc_profile_fields)'` — 1 passed
   - `mise exec -- cargo nextest run --locked -p vala-drift --lib -E 'test(=psi::psi_score::psi_target_too_small_is_unscored)'` — 1 passed
   - `mise exec -- cargo nextest run --locked -p vala-drift --lib -E 'test(=psi::psi_score::psi_one_insufficient_feature_unscores_the_report)'` — 1 passed
+  - `mise exec -- cargo nextest run --locked -p vala-drift --lib -E 'test(=psi::psi_score::psi_null_typed_target_is_unscored)'` — 1 passed
+  - `mise exec -- cargo nextest run --locked -p vala-drift --lib -E 'test(=spc::spc_score::null_typed_target_is_unscored)'` — 1 passed
+  - `mise exec -- cargo nextest run --locked -p vala-drift --lib -E 'test(=psi::psi_score::psi_numeric_target_type_mismatch_errors)'` — 1 passed
+  - `mise exec -- cargo nextest run --locked -p vala-drift --lib -E 'test(=psi::psi_score::psi_categorical_target_type_mismatch_errors)'` — 1 passed
   - `mise exec -- cargo nextest run --locked -p vala-drift --lib -E 'test(=baseline::aggregate_inputs::psi_counts_match_raw_scoring_and_small_windows_are_inconclusive)'` — 1 passed
   - `mise exec -- cargo nextest run --locked -p wyrd-server --features test-support --lib -E 'test(=verification::drift::tests::psi_repeated_series_row_cannot_manufacture_a_sample)'` — 1 passed
   - `mise exec -- cargo nextest run --locked -p vala-drift --lib -E 'test(=baseline::aggregate_inputs::psi_categorical_unknowns_land_in_the_other_bin)'` — 1 passed

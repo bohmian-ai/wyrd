@@ -76,7 +76,7 @@
       ]
     },
     {
-      "id": "wyrd-human-confidential-client",
+      "id": "wyrd-human-conf-client",
       "clientId": "wyrd-human-confidential",
       "name": "Wyrd Human Login (confidential)",
       "enabled": true,
@@ -97,7 +97,7 @@
       },
       "protocolMappers": [
         {
-          "id": "wyrd-human-confidential-groups-mapper",
+          "id": "wyrd-human-conf-groups-mapper",
           "name": "groups",
           "protocol": "openid-connect",
           "protocolMapper": "oidc-group-membership-mapper",

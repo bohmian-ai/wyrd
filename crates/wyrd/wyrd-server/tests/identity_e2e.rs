@@ -1931,9 +1931,12 @@ async fn tenant_connection_rotation_journey() {
     let tested_until: chrono::DateTime<chrono::Utc> =
         serde_json::from_value(tested["candidate"]["tested_until"].clone())
             .expect("tested_until is a timestamp");
+    // Postgres stamps the deadline on its own clock, so allow a few seconds
+    // of skew against the test host's clock on either side.
     let window = tested_until - chrono::Utc::now();
     assert!(
-        window > ChronoDuration::minutes(14) && window <= ChronoDuration::minutes(15),
+        window > ChronoDuration::minutes(14)
+            && window <= ChronoDuration::minutes(15) + ChronoDuration::seconds(5),
         "the stamp lasts fifteen minutes: {window}"
     );
     let runtime_admin = replica_a

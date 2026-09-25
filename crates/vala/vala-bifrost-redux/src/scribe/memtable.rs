@@ -1002,9 +1002,11 @@ impl Memtable {
                     if matches!(entry.state, ImmutableState::Durable { .. }) {
                         continue;
                     }
-                    entry
-                        .frozen
-                        .append_readable_batches(required_columns, &mut batches)?;
+                    entry.frozen.append_readable_batches(
+                        required_columns,
+                        self.ordinal(entry.seal_id),
+                        &mut batches,
+                    )?;
                 }
             }
         }
@@ -1017,10 +1019,11 @@ impl Memtable {
     /// one consistent moment rather than two.
     ///
     /// Publication is not decided here and is not inferred from WAL positions.
-    /// A generation whose rows a durable member already serves is marked
-    /// [`ImmutableState::Durable`] before that member becomes readable, and the
-    /// collector skips exactly those; every generation this cut still returns is
-    /// one nothing else serves. WAL records are numbered from one node-global
+    /// The collector skips a generation already marked
+    /// [`ImmutableState::Durable`], and tags every other immutable batch with
+    /// its generation. A member's runs become readable before the shard marks
+    /// its generation durable, so the live-tail reader resolves staged runs
+    /// after this cut and skips the generations it tagged. WAL records are numbered from one node-global
     /// counter while generations are sealed per tenant, table, partition, and
     /// shard, so a published member's bounds routinely enclose positions a live
     /// generation owns, and treating that containment as ownership would drop
@@ -1507,6 +1510,7 @@ impl MemtableBucket {
             &self.batches,
             &self.metas,
             self.seal_key.partition,
+            None,
             &projection,
             output,
         )
@@ -1637,6 +1641,13 @@ pub struct ReadableBatch {
     pub meta: ScribeAppendMeta,
     /// Arrow rows for the append.
     pub batch: RecordBatch,
+    /// Registry identity of the immutable generation serving the rows, or
+    /// `None` for rows still in a writable bucket.
+    ///
+    /// A generation's staged runs become readable before the shard learns its
+    /// member is durable, so for a moment both sources hold the same rows. The
+    /// reader uses this to take such a generation from exactly one of them.
+    pub generation: Option<crate::scribe::hot_source::GenerationOrdinal>,
 }
 
 /// Immutable count and byte ceilings for one shallow live-tail snapshot.
@@ -1726,12 +1737,17 @@ impl FrozenMemtable {
 
     /// Appends this immutable generation through the bounded shallow collector.
     ///
+    /// Every batch is tagged with `generation`, the registry identity of this
+    /// generation, so a caller can tell which generations the cut served and
+    /// must not also read from their staged runs.
+    ///
     /// # Errors
     ///
     /// Returns the collector capacity or Arrow projection error unchanged.
     fn append_readable_batches(
         &self,
         required_columns: &[String],
+        generation: crate::scribe::hot_source::GenerationOrdinal,
         output: &mut ReadableBatchCollector,
     ) -> Result<(), ScribeError> {
         let projection = projection_indices(&self.schema, required_columns)?;
@@ -1739,6 +1755,7 @@ impl FrozenMemtable {
             &self.batches,
             &self.metas,
             self.seal_key.partition,
+            Some(generation),
             &projection,
             output,
         )
@@ -1751,11 +1768,13 @@ impl FrozenMemtable {
 ///
 /// Returns [`ScribeError::IngestBusy`] before projection when the configured
 /// batch or retained-byte ceiling would be exceeded, or an internal error when
-/// byte arithmetic or Arrow projection fails.
+/// byte arithmetic or Arrow projection fails. Each batch carries `generation`,
+/// the serving immutable generation or `None` for a writable bucket.
 fn append_projected_batches(
     batches: &[RecordBatch],
     metas: &[ScribeAppendMeta],
     partition_day: crate::catalog::layout::TimePartition,
+    generation: Option<crate::scribe::hot_source::GenerationOrdinal>,
     projection: &[usize],
     output: &mut ReadableBatchCollector,
 ) -> Result<(), ScribeError> {
@@ -1770,6 +1789,7 @@ fn append_projected_batches(
             partition_day,
             meta: meta.clone(),
             batch,
+            generation,
         });
     }
     Ok(())

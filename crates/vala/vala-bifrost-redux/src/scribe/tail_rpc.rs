@@ -1235,7 +1235,7 @@ fn inclusive_cursor(
 /// not be resumable.
 fn cursor_batch_id(batch: &HotBatch) -> Result<uuid::Uuid, TailReadError> {
     match batch.origin {
-        HotBatchSource::Append { batch_id } => Ok(uuid::Uuid::from_bytes(batch_id)),
+        HotBatchSource::Append { batch_id, .. } => Ok(uuid::Uuid::from_bytes(batch_id)),
         HotBatchSource::StagedMember { member, .. } => {
             last_row_batch_id(&batch.rows).ok_or(TailReadError::State {
                 detail: format!(
@@ -2478,6 +2478,9 @@ pub enum HotBatchSource {
     Append {
         /// Idempotency identity of the append.
         batch_id: [u8; 16],
+        /// Immutable generation holding the rows, or `None` while they are
+        /// still in a writable bucket.
+        generation: Option<crate::scribe::hot_source::GenerationOrdinal>,
     },
     /// Rows served from a durable staged member.
     StagedMember {
@@ -2546,6 +2549,20 @@ impl FetchLiveTailService {
             memtable: None,
             shards: Some(shards),
         }
+    }
+
+    /// Binds a direct-memtable reader to a hot-source authority registry.
+    ///
+    /// Test fixtures use this to exercise the staged-run half of a live-tail
+    /// read without standing up the shard runtime.
+    #[cfg(test)]
+    #[must_use]
+    fn with_hot_sources(
+        mut self,
+        hot_sources: Arc<crate::scribe::hot_source::ScribeHotSourceRegistry>,
+    ) -> Self {
+        self.hot_sources = Some(hot_sources);
+        self
     }
 
     /// Stream identity this service serves.
@@ -2668,11 +2685,9 @@ impl FetchLiveTailService {
             });
         }
         let predicates = request.predicates.clone();
-        let staged = self.staged_batches(&request)?;
-        let assembled = if let Some(shards) = &self.shards {
-            let mut assembled = shards.snapshot(request).await?;
-            assembled.extend(staged);
-            assembled
+        let staged_request = request.clone();
+        let mut assembled = if let Some(shards) = &self.shards {
+            shards.snapshot(request).await?
         } else {
             self.memtable
                 .as_ref()
@@ -2696,15 +2711,34 @@ impl FetchLiveTailService {
                     wal_lsn: readable.meta.wal_lsn_max,
                     origin: HotBatchSource::Append {
                         batch_id: readable.meta.batch_id,
+                        generation: readable.generation,
                     },
                     rows: readable.batch,
                 })
                 .collect()
         };
+        // Staged runs are resolved only after the memtable cut, excluding every
+        // generation it already served: the registry lends a generation's runs
+        // before the shard learns the member is durable and stops serving its
+        // Arrow, so resolving them first would read that generation twice.
+        let served = assembled
+            .iter()
+            .filter_map(|batch| match batch.origin {
+                HotBatchSource::Append {
+                    generation: Some(generation),
+                    ..
+                } => Some((batch.partition_day, generation)),
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
+        assembled.extend(self.staged_batches(&staged_request, &served)?);
         Self::retain_signed_rows(assembled, &predicates)
     }
 
     /// Returns the rows this request's staged members still serve.
+    ///
+    /// `served` names the generations the memtable cut already returned; their
+    /// staged runs are skipped so each generation reaches the reader once.
     ///
     /// A generation whose Arrow was released after staging is invisible to the
     /// shard snapshot, so without this a live-tail reader would see a gap
@@ -2718,7 +2752,14 @@ impl FetchLiveTailService {
     ///
     /// Returns [`ScribeError::Internal`] when the registry is unavailable or a
     /// staged run cannot be opened, projected, or decoded.
-    fn staged_batches(&self, request: &FetchLiveTailRequest) -> Result<Vec<HotBatch>, ScribeError> {
+    fn staged_batches(
+        &self,
+        request: &FetchLiveTailRequest,
+        served: &std::collections::HashSet<(
+            TimePartition,
+            crate::scribe::hot_source::GenerationOrdinal,
+        )>,
+    ) -> Result<Vec<HotBatch>, ScribeError> {
         let Some(hot_sources) = &self.hot_sources else {
             return Ok(Vec::new());
         };
@@ -2732,11 +2773,17 @@ impl FetchLiveTailService {
             .map_err(|error| ScribeError::Internal {
                 detail: format!("resolve the staged members serving a live-tail read: {error}"),
             })?;
-        if sources.sources().is_empty() {
+        let unserved = sources
+            .sources()
+            .iter()
+            .filter(|source| !served.contains(&(source.key.partition, source.generation)))
+            .cloned()
+            .collect::<Vec<_>>();
+        if unserved.is_empty() {
             return Ok(Vec::new());
         }
         crate::scribe::staged_tail::StagedTailReader::default().read(
-            sources.sources(),
+            &unserved,
             &crate::scribe::staged_tail::StagedTailRead {
                 required_columns: &request.required_columns,
                 predicates: &request.predicates,
@@ -3002,6 +3049,140 @@ mod tests {
             crate::contracts::projected_source_schema_fingerprint(&schema).0,
         ))
         .expect("fixture schema fingerprint")
+    }
+
+    /// A generation whose staged runs are already registered is read once.
+    ///
+    /// Staging advances a generation's registry authority to its staged runs
+    /// before the owning shard learns the member is durable, so for a moment
+    /// both the frozen Arrow and the runs hold the same rows. A live-tail read
+    /// in that window, and one after the shard marks the generation durable,
+    /// must each return every row exactly once.
+    ///
+    /// # Panics
+    /// Panics when the fixture cannot be built or a read returns any row other
+    /// than exactly once.
+    #[tokio::test]
+    async fn a_generation_staged_before_the_shard_settles_is_read_once() {
+        use crate::catalog::TableRef;
+        use crate::scribe::assembly::StagedMemberId;
+        use crate::scribe::hot_source::{HotAuthority, ScribeHotSourceRegistry};
+        use crate::scribe::memtable::Memtable;
+        use crate::scribe::seal_key::SealKey;
+        use crate::scribe::wal::ScribeAppendMeta;
+
+        let tenant = DataTenantId::new_v7();
+        let day = crate::test_support::day_partition(2026, 7, 14);
+        let stream = StreamIdentity::new(NodeId::generate(), WriterEpoch::new(1));
+        let table = TableRef::new(crate::namespaces::BifrostNamespace::Bifrost, "events");
+        let key = SealKey::new(tenant, table.clone(), day);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let rows = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3]))],
+        )
+        .expect("fixture batch");
+        let registry = Arc::new(ScribeHotSourceRegistry::new());
+        let memtable = Arc::new(Memtable::new().with_hot_sources(0, Arc::clone(&registry)));
+        memtable
+            .insert(
+                &key,
+                ScribeAppendMeta {
+                    batch_id: *uuid::Uuid::now_v7().as_bytes(),
+                    schema_fingerprint: [0; 32],
+                    data_digest: [0; 32],
+                    data_len: 0,
+                    payload_digest: [0; 32],
+                    payload_len: 0,
+                    slice_index: 0,
+                    slice_count: 1,
+                    rows_accepted: 3,
+                    wal_lsn_min: WalLsn::new(1),
+                    wal_lsn_max: WalLsn::new(1),
+                    seal_key: key.to_string(),
+                },
+                rows.clone(),
+            )
+            .expect("fixture batch inserts");
+        memtable.freeze(&key).expect("fixture generation freezes");
+        let [(generation, HotAuthority::Memtable)] = registry
+            .live_generations(&key)
+            .expect("registry is readable")[..]
+        else {
+            panic!("freezing registers exactly one memtable-authoritative generation");
+        };
+
+        let directory = tempfile::tempdir().expect("staged run directory");
+        let run = directory.path().join("run-0.parquet");
+        let mut writer = parquet::arrow::ArrowWriter::try_new(
+            std::fs::File::create(&run).expect("staged run file"),
+            schema,
+            None,
+        )
+        .expect("staged run writer");
+        writer.write(&rows).expect("staged run rows");
+        writer.close().expect("staged run footer");
+        let member = StagedMemberId::new(0, generation.get());
+        registry
+            .advance(
+                &key,
+                generation,
+                HotAuthority::StagedRun {
+                    member,
+                    runs: vec![run],
+                    bytes: 4_096,
+                    wal: (WalLsn::new(1), WalLsn::new(1)),
+                },
+            )
+            .expect("the generation moves to its staged runs");
+
+        let service = FetchLiveTailService::new(stream, Arc::clone(&memtable), tail_resources())
+            .with_hot_sources(registry);
+        let binding =
+            super::TenantTableBinding::resolve((tenant, table)).expect("fixture binding resolves");
+        let read = || async {
+            let mut values = service
+                .fetch_hot_batches(super::FetchLiveTailRequest {
+                    binding: binding.clone(),
+                    target_stream: stream,
+                    start_partition: day,
+                    end_partition: day,
+                    required_columns: vec!["value".to_owned()],
+                    predicates: Vec::new(),
+                    max_batches: 64,
+                    max_retained_bytes: 64 * 1024 * 1024,
+                })
+                .await
+                .expect("hot snapshot")
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .rows
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("Int64 value column")
+                        .values()
+                        .to_vec()
+                })
+                .collect::<Vec<_>>();
+            values.sort_unstable();
+            values
+        };
+
+        assert_eq!(read().await, vec![1, 2, 3], "staged but not yet durable");
+        memtable
+            .complete_staged(generation.get(), member)
+            .expect("the shard marks the generation durable");
+        assert_eq!(
+            read().await,
+            vec![1, 2, 3],
+            "durable and served by its runs"
+        );
     }
 
     /// A signed predicate is applied inside Scribe, so a selective live-tail

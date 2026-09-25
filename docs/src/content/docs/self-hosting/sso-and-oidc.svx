@@ -8,38 +8,53 @@ order: 8
 
 # SSO and OIDC
 
-Wyrd federates two kinds of identity from external OIDC providers: humans who log in through single sign-on, and machine workloads that present a platform-issued JWT. Both are declared the same way, as a trusted issuer, and distinguished by one field: `principal_kind`. Human issuers back the login flow. Workload issuers back the `jwt-bearer` grant.
+Wyrd federates two kinds of identity from external OIDC providers: humans who log in through single sign-on, and machine workloads that present a platform-issued JWT. Each tenant configures its own human sign-in as one **tenant OIDC connection** through the API. Workload federation is declared as a trusted issuer with `principal_kind = "workload"` and backs the `jwt-bearer` grant. The two stores never overlap: a human login reads only the tenant's connection, and a `Human` trusted issuer is refused everywhere (TOML boot, `/v1/admin/trusted-issuers`, and `wyrd auth trusted-issuer add`) with `WYRD_AUTH_400_HUMAN_CONNECTION_REQUIRED`.
 
-Trusted issuers and workload bindings are configured as TOML arrays in the same `server.toml` the rest of [Configuration](/self-hosting/configuration/) uses (`$WYRD_CONFIG_PATH`, `/etc/wyrd/server.toml`, or `~/.config/wyrd/server.toml`). They have no environment-variable form. Any deployment that declares either one must also set `WYRD_SERVER_TENANT_SLUG` so the server knows which tenant they belong to (see [the implicit tenant](/self-hosting/configuration/#the-implicit-tenant)).
+Workload trusted issuers and bindings are configured as TOML arrays in the same `server.toml` the rest of [Configuration](/self-hosting/configuration/) uses (`$WYRD_CONFIG_PATH`, `/etc/wyrd/server.toml`, or `~/.config/wyrd/server.toml`). They have no environment-variable form. Any deployment that declares either one must also set `WYRD_SERVER_TENANT_SLUG` so the server knows which tenant they belong to (see [the implicit tenant](/self-hosting/configuration/#the-implicit-tenant)).
 
 ## Human single sign-on
 
-A person logs in through your IdP with the OIDC authorization-code flow, secured by PKCE. Wyrd stores the login state server-side for at most five minutes and verifies the returned ID token before issuing its own tokens. The [login flow](/concepts/authentication/#human-oidc-login-flow) in Concepts has the full sequence. To set it up:
+A person logs in through the tenant's IdP with the OIDC authorization-code flow, secured by PKCE. Wyrd stores the login state server-side for at most five minutes and verifies the returned ID token, whose audience must be the connection's client id, before issuing its own tokens. The [login flow](/concepts/authentication/#human-oidc-login-flow) in Concepts has the full sequence. OIDC is optional: a server starts, provisions tenants, and serves API keys and workload federation without any connection.
 
-1. Register Wyrd as an OIDC client at your IdP. Set the redirect URI to `https://<your-server>/auth/callback`.
-2. Add a trusted issuer with `principal_kind = "human"`, the client id, and how Wyrd authenticates back to the IdP token endpoint.
-3. Map the IdP's groups to Wyrd roles so users land with the right permissions.
+### Deployment setup
 
-```toml
-[[trusted_issuers]]
-issuer            = "https://idp.example.com/realms/acme"
-client_id         = "wyrd"
-expected_audience = "wyrd"
-client_auth       = "public"
-principal_kind    = "human"
-default_roles     = ["reader"]
+Set `WYRD_PUBLIC_ORIGIN` to the origin browsers and IdPs reach Wyrd on, for example `https://wyrd.example.com`. The one callback URL every tenant registers at its IdP is `{WYRD_PUBLIC_ORIGIN}/auth/callback`; it is derived from this setting, never from request headers, and is returned read-only as `callback_url`. Without it, connections cannot be staged or tested. If a connection uses a client secret, the server also needs a [sealing key](/self-hosting/authentication/#sealing-key).
 
-[trusted_issuers.claim_mapping]
-subject = "sub"
-email   = "email"
-groups  = "realm_access.roles"
+### Connection lifecycle
 
-[trusted_issuers.group_role_map]
-"wyrd-admins" = ["admin"]
-"wyrd-writers" = ["writer"]
+Every route below takes its tenant from the bearer token and requires `identity_connections:write`, which only the tenant `admin` role holds. `service_accounts:write` alone does not grant it. Each allow or refusal is audited before any provider network call.
+
+| Route | Purpose |
+| --- | --- |
+| `GET /v1/identity/oidc/connections` | The Active connection and optional Candidate, redacted, plus `callback_url`. |
+| `PUT /v1/identity/oidc/candidate` | Create the Candidate, or replace it at the next `revision` (pass `expected_revision`). This is also how you rotate a client secret or group map, even for the same issuer. |
+| `POST /v1/identity/oidc/candidate/test` | Probe discovery, issuer, JWKS, the callback URL, and client authentication for the exact `expected_revision`. Success stamps it activatable for 15 minutes. |
+| `POST /v1/identity/oidc/candidate/activate` | Promote the tested Candidate and retire the previous Active connection in one transaction. Requires `expected_revision` and a `recovery_api_key`. |
+| `POST /v1/identity/oidc/active/deactivate` | Stop human sign-in now. |
+| `DELETE /v1/identity/oidc/connections/{id}` | Tombstone a connection: its secret is wiped and its id is kept for history. |
+
+```json
+PUT /v1/identity/oidc/candidate
+{
+  "issuer": "https://idp.example.com/realms/acme",
+  "client_id": "wyrd",
+  "client_auth": "SecretPost",
+  "client_secret": "<secret>",
+  "claim_mapping": { "subject": "sub", "email": "email", "groups": "groups" },
+  "group_role_map": { "wyrd-admins": ["admin"], "wyrd-writers": ["writer"] },
+  "expected_revision": null
+}
 ```
 
-`client_auth` selects how Wyrd authenticates to the IdP token endpoint: `"public"` for a PKCE-only client with no secret, `{ secret_basic = "…" }` or `{ secret_post = "…" }` for a shared client secret. If you use a client secret, the server needs a [sealing key](/self-hosting/authentication/#sealing-key) to encrypt it at rest.
+`client_auth` is `SecretBasic`, `SecretPost`, or `Public`; secret methods require `client_secret` and `Public` takes none. `PrivateKeyJwt` is refused with `WYRD_AUTH_400_UNSUPPORTED_CLIENT_AUTH`. A user's roles come only from `group_role_map`; connections have no default roles.
+
+Activation is guarded twice. The Candidate must carry an unexpired test for exactly that revision, so a stale or failed test, or a provider outage, fails closed with `WYRD_AUTH_409_CONNECTION_NOT_TESTED`. And `recovery_api_key` must be a live API key of a headless principal in the same tenant that holds `identity_connections:write`. That proves a way back in exists that does not depend on the new IdP. The key is checked and discarded: it is never stored, logged, or audited. A stale revision, an invalid recovery key, or a competing change returns `WYRD_AUTH_409_CONNECTION_CONFLICT`.
+
+Every replica reads the Active connection from Postgres on each login, so activation, rotation, and deactivation take effect on all replicas without a restart.
+
+### Upgrading from Human trusted issuers
+
+The upgrade migration moves each tenant's existing Human trusted issuer into an Active connection, keeping its claim mapping, group map, JWKS URI, and JWKS TTL. A Human issuer that a workload binding references is kept as a Workload issuer so the binding survives. The migration refuses to run, and leaves the database unchanged, if a tenant has more than one Human issuer, a Human issuer with default roles, an audience different from its client id, `private_key_jwt`, or a secret method with no stored secret. The error names the tenant and the repair to make with the previous release.
 
 ## Workload federation
 
@@ -79,13 +94,13 @@ curl -X POST https://<your-server>/auth/token \
   }'
 ```
 
-## Managing issuers at runtime
+## Managing workload issuers at runtime
 
-Beyond boot-time TOML, trusted issuers and workload bindings have admin CRUD routes under `/v1/admin/trusted-issuers` and `/v1/admin/workload-bindings` (both require `service_accounts:write`). Use them to add or rotate federation without a server restart. See [Cloud identity](/concepts/cloud-identity/) for the full field reference and request shapes.
+Beyond boot-time TOML, workload trusted issuers and bindings have admin CRUD routes under `/v1/admin/trusted-issuers` and `/v1/admin/workload-bindings` (both require `service_accounts:write`). Use them to add or rotate federation without a server restart. See [Cloud identity](/concepts/cloud-identity/) for the full field reference and request shapes.
 
 ## Limitations
 
-- `private_key_jwt` client authentication to the IdP token endpoint is not yet implemented. Use `public` (PKCE) or a client secret.
+- `private_key_jwt` client authentication to the IdP token endpoint is not yet implemented. Use `Public` (PKCE) or a client secret.
 
 ## Related
 

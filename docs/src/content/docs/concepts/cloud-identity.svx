@@ -13,8 +13,10 @@ secret: Kubernetes service accounts, SPIFFE JWTs, GCP Workload Identity, GitHub
 Actions. The server holds two kinds of data:
 
 - **Trusted issuers** are OIDC issuers whose JWTs Wyrd will verify. Each issuer
-  is scoped to one tenant and carries a `principal_kind` of `Workload` (for
-  machines) or `Human` (for human OIDC login).
+  is scoped to one tenant and carries `principal_kind = Workload`. Human
+  sign-in is configured separately, as a tenant OIDC connection (see
+  [SSO and OIDC](/self-hosting/sso-and-oidc/#human-single-sign-on)); a `Human`
+  trusted issuer is refused with `WYRD_AUTH_400_HUMAN_CONNECTION_REQUIRED`.
 - **Workload bindings** are server-owned mappings from
   `(issuer, subject, audience) → CardRef`. The binding tells Wyrd which Service or
   Agent principal a given workload assertion represents.

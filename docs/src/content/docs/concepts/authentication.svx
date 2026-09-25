@@ -164,8 +164,8 @@ carries only the assertion.
    and the assertion.
 3. Server verifies the assertion against the trusted issuer's JWKS (with
    caching and automatic key-rotation recovery).
-4. Server checks `principal_kind = Workload` on the matched issuer. Human
-   issuers are rejected.
+4. Server matches the assertion to a Workload trusted issuer. Human trust
+   lives only in tenant OIDC connections and never authorizes this grant.
 5. Server resolves the workload binding: `(issuer, subject, audience) → CardRef`.
    This lookup is server-owned; the token never names its own card.
 6. Server loads the Service/Agent principal for that `CardRef` and its roles.

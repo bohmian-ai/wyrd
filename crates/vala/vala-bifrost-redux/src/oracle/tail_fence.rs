@@ -126,8 +126,6 @@ pub(super) struct TailFenceDrainer<'a> {
     pub(super) deadline: Instant,
     /// Admission lifecycle cancellation shared with streaming.
     pub(super) cancellation: CancellationToken,
-    /// Caller-selected strict or degraded live-source failure policy.
-    pub(super) freshness: wyrd_spec::vala::api::FreshnessPolicy,
     /// Query identity bound into private Scribe-tail tickets.
     pub(super) query_id: uuid::Uuid,
     /// Server-owned domain-separated ticket signer.
@@ -195,8 +193,6 @@ pub(super) struct TailFenceDrainerConfig {
     pub(super) deadline: Instant,
     /// Admission lifecycle cancellation shared with streaming.
     pub(super) cancellation: CancellationToken,
-    /// Caller-selected strict or degraded live-source failure policy.
-    pub(super) freshness: wyrd_spec::vala::api::FreshnessPolicy,
     /// Query identity bound into private Scribe-tail tickets.
     pub(super) query_id: uuid::Uuid,
     /// Server-owned domain-separated ticket signer.
@@ -286,7 +282,6 @@ impl TailFenceDrainer<'_> {
             query_pool: config.query_pool,
             deadline: config.deadline,
             cancellation: config.cancellation,
-            freshness: config.freshness,
             query_id: config.query_id,
             ticket_minter: config.ticket_minter,
             cluster: config.cluster,
@@ -417,7 +412,7 @@ impl TailFenceDrainer<'_> {
     #[tracing::instrument(
         name = "bifrost.oracle.tail",
         skip_all,
-        fields(fence_count = fences.len(), freshness = ?self.freshness)
+        fields(fence_count = fences.len())
     )]
     pub(super) async fn drain(
         &self,
@@ -450,9 +445,7 @@ impl TailFenceDrainer<'_> {
             }
         }
         if let Some(error) = strict_failure {
-            if error == BifrostError::QueryTimeout
-                || self.freshness == wyrd_spec::vala::api::FreshnessPolicy::Strict
-            {
+            if error == BifrostError::QueryTimeout {
                 return Err(error);
             }
             drained.degraded = true;
@@ -1194,7 +1187,6 @@ mod tests {
                 query_pool: crate::resources::bounded_memory_pool(1024 * 1024 * 1024),
                 deadline: Instant::now() + Duration::from_secs(1),
                 cancellation: CancellationToken::new(),
-                freshness: wyrd_spec::vala::api::FreshnessPolicy::Strict,
                 query_id: uuid::Uuid::nil(),
                 ticket_minter: None,
                 cluster: None,

@@ -26,7 +26,7 @@ use wyrd_client::bifrost::{BifrostClientError, CollectedQueryLimits, CollectedQu
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::vala::api::{BifrostQueryRequest, FreshnessPolicy, VisibilityMode};
+use wyrd_spec::vala::api::BifrostQueryRequest;
 
 use crate::Bootstrap;
 use crate::WyrdTestServer;
@@ -525,8 +525,6 @@ impl BifrostClusterLoad {
             .collect_bounded(
                 &BifrostQueryRequest {
                     sql: format!("SELECT id, tenant, batch FROM {table} LIMIT 0"),
-                    visibility: VisibilityMode::PublishedOnly,
-                    freshness: FreshnessPolicy::Strict,
                     deadline_ms: Some(5_000),
                 },
                 CollectedQueryLimits {
@@ -698,8 +696,6 @@ async fn exercise_query_cancellation(
             .collect_bounded(
                 &BifrostQueryRequest {
                     sql,
-                    visibility: VisibilityMode::PublishedOnly,
-                    freshness: FreshnessPolicy::Strict,
                     deadline_ms: Some(5_000),
                 },
                 CollectedQueryLimits {
@@ -993,8 +989,6 @@ async fn run_public_matrix(
         let final_stream = query
             .query(&BifrostQueryRequest {
                 sql: final_sql,
-                visibility: VisibilityMode::PublishedOnly,
-                freshness: FreshnessPolicy::Strict,
                 deadline_ms: Some(5_000),
             })
             .await
@@ -1050,7 +1044,7 @@ async fn run_public_matrix(
         }
         let terminal_valid = final_result
             .terminal
-            .validate(VisibilityMode::PublishedOnly)
+            .validate()
             .is_ok()
             && final_result.terminal.row_count == final_result.rows as u64;
         if !terminal_valid {
@@ -1952,8 +1946,6 @@ async fn run_tenant(context: TenantRunContext) -> Result<TenantLoadResult, Clust
                     .collect_bounded(
                         &BifrostQueryRequest {
                             sql,
-                            visibility: VisibilityMode::PublishedOnly,
-                            freshness: FreshnessPolicy::Strict,
                             deadline_ms: Some(deadline_ms),
                         },
                         CollectedQueryLimits {

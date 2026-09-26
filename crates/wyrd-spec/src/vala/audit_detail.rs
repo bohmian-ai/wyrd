@@ -9,7 +9,7 @@ use crate::ids::CardUid;
 use crate::origin::Origin;
 use crate::reference::CardRef;
 use crate::vala::api::AuditOutcome;
-use crate::vala::api::{QueryClass, TimePartitionWire, VisibilityMode};
+use crate::vala::api::{QueryClass, TimePartitionWire};
 
 /// Error returned when an audit-detail identifier is empty, malformed, or
 /// contains a value that must never enter an audit record.
@@ -536,14 +536,12 @@ pub enum AuditDetail {
         /// Total slot units retained across every active lease.
         total_slots: u64,
     },
-    /// Immutable, scrubbed Bifrost visibility-cut read decision.
+    /// Immutable, scrubbed Bifrost query read decision.
     BifrostQueryReadDecision {
         /// Digest of the normalized query.
         query_digest: QueryAuditDigest,
         /// Server-derived admission class.
         query_class: QueryClass,
-        /// Visibility mode committed by the cut.
-        visibility: VisibilityMode,
         /// Sorted tenant-table binding digests.
         binding_digests: Vec<QueryAuditDigest>,
         /// Pinned snapshot summary digest.
@@ -1008,8 +1006,8 @@ mod tests {
     use crate::auth::{PrincipalId, PrincipalKindTag};
     use crate::origin::{CommitSha, Origin};
     use crate::request_id::RequestId;
+    use crate::vala::api::QueryClass;
     use crate::vala::api::{AuditEvent, AuditOutcome, BifrostTableName};
-    use crate::vala::api::{QueryClass, VisibilityMode};
 
     #[test]
     fn canonical_json_is_compact_and_stable() {
@@ -1146,7 +1144,6 @@ mod tests {
             AuditDetail::BifrostQueryReadDecision {
                 query_digest: digest(),
                 query_class: QueryClass::Interactive,
-                visibility: VisibilityMode::PublishedOnly,
                 binding_digests: vec![digest()],
                 snapshot_digest: digest(),
                 manifest_digest: digest(),
@@ -1205,7 +1202,6 @@ mod tests {
         let detail = AuditDetail::BifrostQueryReadDecision {
             query_digest: digest(),
             query_class: QueryClass::Interactive,
-            visibility: VisibilityMode::PublishedOnly,
             binding_digests: vec![digest()],
             snapshot_digest: digest(),
             manifest_digest: digest(),
@@ -1227,7 +1223,6 @@ mod tests {
         let invalid = AuditDetail::BifrostQueryReadDecision {
             query_digest: digest(),
             query_class: QueryClass::Interactive,
-            visibility: VisibilityMode::PublishedOnly,
             binding_digests: (0..65).map(|_| digest()).collect(),
             snapshot_digest: digest(),
             manifest_digest: digest(),
@@ -1251,7 +1246,6 @@ mod tests {
         let duplicate = AuditDetail::BifrostQueryReadDecision {
             query_digest: digest(),
             query_class: QueryClass::Interactive,
-            visibility: VisibilityMode::PublishedOnly,
             binding_digests: vec![digest(), digest()],
             snapshot_digest: digest(),
             manifest_digest: digest(),
@@ -1275,7 +1269,6 @@ mod tests {
         let unsorted = AuditDetail::BifrostQueryReadDecision {
             query_digest: digest(),
             query_class: QueryClass::Interactive,
-            visibility: VisibilityMode::PublishedOnly,
             binding_digests: vec![
                 QueryAuditDigest::new("sha256:z").expect("valid digest"),
                 QueryAuditDigest::new("sha256:a").expect("valid digest"),

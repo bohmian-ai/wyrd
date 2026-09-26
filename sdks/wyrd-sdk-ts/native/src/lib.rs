@@ -29,8 +29,8 @@ use wyrd_client::bifrost::{BifrostClientError, QueryResultStream};
 use wyrd_queue::QueueConfig;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
+use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::api::PhysicalLayoutWire;
-use wyrd_spec::vala::api::{BifrostQueryRequest, FreshnessPolicy, VisibilityMode};
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::vala::ids::RunId;
 
@@ -39,10 +39,6 @@ use wyrd_spec::vala::ids::RunId;
 pub struct NativeQueryRequest {
     /// SELECT-only SQL text.
     pub sql: String,
-    /// `published_only` or `fused`.
-    pub visibility: String,
-    /// `strict` or `allow_degraded`.
-    pub freshness: String,
     /// Optional query deadline in milliseconds, valid in `1..=u32::MAX`.
     ///
     /// Accepted as a JavaScript number so every out-of-range, fractional, or
@@ -689,14 +685,6 @@ impl NativeBifrost {
     pub async fn query(&self, request: NativeQueryRequest) -> Result<NativeQueryStart> {
         let request = BifrostQueryRequest {
             sql: request.sql,
-            visibility: match parse_visibility(&request.visibility) {
-                Ok(visibility) => visibility,
-                Err(error) => return Ok(NativeQueryStart::failure(&error)),
-            },
-            freshness: match parse_freshness(&request.freshness) {
-                Ok(freshness) => freshness,
-                Err(error) => return Ok(NativeQueryStart::failure(&error)),
-            },
             deadline_ms: match request.deadline_ms.map(parse_deadline_ms).transpose() {
                 Ok(deadline_ms) => deadline_ms,
                 Err(error) => return Ok(NativeQueryStart::failure(&error)),
@@ -992,21 +980,6 @@ fn correlation(card_ref: Option<&str>, run_id: Option<String>) -> Result<Correla
     })
 }
 
-/// Parses the native visibility spelling.
-///
-/// # Errors
-///
-/// Returns a structured SDK protocol error for an unknown value.
-fn parse_visibility(value: &str) -> StdResult<VisibilityMode, BifrostClientError> {
-    match value {
-        "published_only" => Ok(VisibilityMode::PublishedOnly),
-        "fused" => Ok(VisibilityMode::Fused),
-        _ => Err(BifrostClientError::Protocol(
-            "visibility must be published_only or fused".to_owned(),
-        )),
-    }
-}
-
 /// Converts a JavaScript deadline number into the shared signed request field.
 ///
 /// Only exact integers pass through the lossless decimal round trip; the
@@ -1025,21 +998,6 @@ fn parse_deadline_ms(value: f64) -> StdResult<i64, BifrostClientError> {
             },
         })
     })
-}
-
-/// Parses the native freshness spelling.
-///
-/// # Errors
-///
-/// Returns a structured SDK protocol error for an unknown value.
-fn parse_freshness(value: &str) -> StdResult<FreshnessPolicy, BifrostClientError> {
-    match value {
-        "strict" => Ok(FreshnessPolicy::Strict),
-        "allow_degraded" => Ok(FreshnessPolicy::AllowDegraded),
-        _ => Err(BifrostClientError::Protocol(
-            "freshness must be strict or allow_degraded".to_owned(),
-        )),
-    }
 }
 
 /// Parses one canonical request ID at the Node boundary.

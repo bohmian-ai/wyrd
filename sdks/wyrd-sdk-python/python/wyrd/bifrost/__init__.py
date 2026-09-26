@@ -557,13 +557,11 @@ class Bifrost(_BifrostBase):
         self,
         query: str,
         *,
-        visibility: str = "published_only",
-        freshness: str = "strict",
         deadline_ms: int | None = None,
     ) -> BifrostBatchIterator:
         """Run one SQL SELECT and iterate its batches as they arrive."""
 
-        return BifrostBatchIterator(self._native.stream(query, visibility, freshness, deadline_ms))
+        return BifrostBatchIterator(self._native.stream(query, deadline_ms))
 
     def running(self) -> list[RunningQuery]:
         """List active queries visible to the authenticated tenant."""
@@ -653,8 +651,6 @@ class AsyncBifrost(_BifrostBase):
         self,
         query: str,
         *,
-        visibility: str = "published_only",
-        freshness: str = "strict",
         deadline_ms: int | None = None,
     ) -> BifrostQueryStream:
         """Start one query and iterate its batches with ``async for``."""
@@ -662,8 +658,6 @@ class AsyncBifrost(_BifrostBase):
         native_stream = await asyncio.to_thread(
             self._native.stream,
             query,
-            visibility,
-            freshness,
             deadline_ms,
         )
         return BifrostQueryStream(native_stream)

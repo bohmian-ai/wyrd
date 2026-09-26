@@ -6,9 +6,8 @@ use utoipa::{Modify, OpenApi};
 use wyrd_spec::card::trigger::{TriggerActivation, TriggerSpec};
 use wyrd_spec::card::verifier::{VerificationBinding, VerifierImplementation, VerifierSpec};
 use wyrd_spec::vala::api::{
-    BifrostQueryRequest, CancelRunningQueryResponse, FreshnessPolicy, ListRunningQueriesResponse,
-    QueryClass, RunningQueryLifecycleState, RunningQueryProgress, RunningQuerySummary,
-    VisibilityMode,
+    BifrostQueryRequest, CancelRunningQueryResponse, ListRunningQueriesResponse, QueryClass,
+    RunningQueryLifecycleState, RunningQueryProgress, RunningQuerySummary,
 };
 
 /// Name the contract gives the one Wyrd authentication scheme.
@@ -125,7 +124,6 @@ fn is_problem(content: Option<&Content>) -> bool {
     components(schemas(
         BifrostQueryRequest,
         CancelRunningQueryResponse,
-        FreshnessPolicy,
         ListRunningQueriesResponse,
         QueryClass,
         RunningQueryLifecycleState,
@@ -135,8 +133,7 @@ fn is_problem(content: Option<&Content>) -> bool {
         TriggerSpec,
         VerificationBinding,
         VerifierImplementation,
-        VerifierSpec,
-        VisibilityMode
+        VerifierSpec
     )),
     tags(
         (name = "Bifrost", description = "Bounded Bifrost query transport"),

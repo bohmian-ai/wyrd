@@ -5,7 +5,7 @@ use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::oracle::{AuthorizedQueryContext, OracleQueryStream, QueryIpcDecoder};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{
-    BifrostQueryRequest, QueryStreamFrame, QueryTerminalFrame, QueryTerminalOutcome, VisibilityMode,
+    BifrostQueryRequest, QueryStreamFrame, QueryTerminalFrame, QueryTerminalOutcome,
 };
 use wyrd_spec::vala::error::BifrostError;
 
@@ -131,7 +131,6 @@ impl ScheduledQueryCaller {
     where
         F: FnMut(RecordBatch) -> Result<(), WyrdError>,
     {
-        let visibility = request.visibility;
         let mut stream = self.dispatch(request).await?;
         // The stream's absolute deadline becomes one fixed instant before any
         // frame is taken, so no leg of consumption — least of all the wait for
@@ -142,7 +141,6 @@ impl ScheduledQueryCaller {
             &mut stream.frames,
             deadline,
             &self.cancellation,
-            visibility,
             &mut terminal,
             &mut on_batch,
         )
@@ -158,7 +156,6 @@ impl ScheduledQueryCaller {
                         self.context.data_tenant_id,
                         self.context.request_id.clone(),
                         stream,
-                        visibility,
                         terminal,
                     )
                     .await?;
@@ -214,7 +211,6 @@ impl ScheduledQueryCaller {
         frames: &mut S,
         deadline: tokio::time::Instant,
         cancellation: &CancellationToken,
-        visibility: VisibilityMode,
         observed: &mut Option<QueryTerminalFrame>,
         on_batch: &mut F,
     ) -> Result<ScheduledQueryOutcome, WyrdError>
@@ -271,7 +267,7 @@ impl ScheduledQueryCaller {
                 }
                 QueryStreamFrame::Terminal(terminal) => {
                     terminal
-                        .validate(visibility)
+                        .validate()
                         .and_then(|()| terminal.validate_emitted_rows(rows))
                         .map_err(|_| WyrdError::from(BifrostError::QueryStreamProtocol))?;
                     if terminal.outcome == QueryTerminalOutcome::Failed {
@@ -318,8 +314,8 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use wyrd_spec::vala::api::{
-        QueryBatchFrame, QueryFreshness, QuerySchemaFrame, QuerySource, QueryTerminalError,
-        QueryTerminalErrorCode, SourceCompletion, SourceCompletionOutcome,
+        QueryBatchFrame, QuerySchemaFrame, QuerySource, QueryTerminalError, QueryTerminalErrorCode,
+        SourceCompletion, SourceCompletionOutcome,
     };
 
     use super::*;
@@ -358,7 +354,6 @@ mod tests {
     fn success_terminal(row_count: u64, arrow_ipc_eos: Vec<u8>) -> QueryTerminalFrame {
         QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Success,
-            freshness: QueryFreshness::Complete,
             execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
             row_count,
             warnings: Vec::new(),
@@ -471,7 +466,6 @@ mod tests {
                 &mut stream,
                 deadline_instant(deadline_in(30_000)),
                 &CancellationToken::new(),
-                VisibilityMode::PublishedOnly,
                 &mut None,
                 &mut |_| Ok(()),
             )
@@ -499,7 +493,6 @@ mod tests {
             &mut stream,
             deadline_instant(deadline_in(30_000)),
             &CancellationToken::new(),
-            VisibilityMode::PublishedOnly,
             &mut None,
             &mut |_| Ok(()),
         )
@@ -521,7 +514,6 @@ mod tests {
             &mut stream,
             deadline_instant(deadline_in(30_000)),
             &CancellationToken::new(),
-            VisibilityMode::PublishedOnly,
             &mut None,
             &mut |_| Ok(()),
         )
@@ -536,7 +528,6 @@ mod tests {
             &mut stream,
             deadline_instant(deadline_in(-1)),
             &CancellationToken::new(),
-            VisibilityMode::PublishedOnly,
             &mut None,
             &mut |_| Ok(()),
         )
@@ -585,7 +576,6 @@ mod tests {
                 &mut stream,
                 deadline_instant(deadline_in(30_000)),
                 &cancellation,
-                VisibilityMode::PublishedOnly,
                 &mut None,
                 &mut sink,
             )

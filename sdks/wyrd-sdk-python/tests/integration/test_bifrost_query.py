@@ -16,8 +16,6 @@ def test_bifrost_query_yields_pyarrow_and_terminal(wyrd_server: WyrdTestServer) 
     async def query() -> tuple[list[pyarrow.RecordBatch], dict[str, object] | None]:
         stream = await AsyncBifrost(server_url=wyrd_server.base_url, credential=token).stream(
             f"SELECT id, value FROM {table_fqn} ORDER BY id",
-            visibility="published_only",
-            freshness="strict",
         )
         batches = [batch async for batch in stream]
         return batches, stream.terminal
@@ -45,8 +43,6 @@ def test_query_stream_schema_once_eos(wyrd_server: WyrdTestServer) -> None:
     async def query() -> tuple[list[pyarrow.RecordBatch], dict[str, object] | None]:
         stream = await AsyncBifrost(server_url=wyrd_server.base_url, credential=token).stream(
             f"SELECT id, value FROM {table_fqn} ORDER BY id",
-            visibility="published_only",
-            freshness="strict",
         )
         batches = [batch async for batch in stream]
         return batches, stream.terminal
@@ -150,8 +146,6 @@ def test_bifrost_query_cancellation_releases_all_resources(
     async def cancel_query() -> tuple[dict[str, int], dict[str, int]]:
         stream = await AsyncBifrost(server_url=wyrd_server.base_url, credential=token).stream(
             f"SELECT id, value FROM {table_fqn} ORDER BY id",
-            visibility="fused",
-            freshness="strict",
         )
         consumer = asyncio.create_task(stream.__anext__())
         query_id = await asyncio.to_thread(wyrd_server.wait_query_schema_stall)

@@ -486,10 +486,9 @@ mod tests {
     use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::{
-        FreshnessPolicy, QueryBatchFrame, QueryErrorDetail, QueryFreshness, QuerySchemaFrame,
-        QuerySource, QueryStreamFrame, QueryTerminalError, QueryTerminalErrorCode,
-        QueryTerminalFrame, QueryTerminalOutcome, SourceCompletion, SourceCompletionOutcome,
-        VisibilityMode,
+        QueryBatchFrame, QueryErrorDetail, QuerySchemaFrame, QuerySource, QueryStreamFrame,
+        QueryTerminalError, QueryTerminalErrorCode, QueryTerminalFrame, QueryTerminalOutcome,
+        SourceCompletion, SourceCompletionOutcome,
     };
     use wyrd_tonic::frame_codec::FrameDecoder;
 
@@ -632,7 +631,6 @@ mod tests {
             }),
             QueryStreamFrame::Terminal(QueryTerminalFrame {
                 outcome: QueryTerminalOutcome::Degraded,
-                freshness: QueryFreshness::Degraded,
                 execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
                 row_count: 1,
                 warnings: Vec::new(),
@@ -713,7 +711,6 @@ mod tests {
             }),
             QueryStreamFrame::Terminal(QueryTerminalFrame {
                 outcome: QueryTerminalOutcome::Success,
-                freshness: QueryFreshness::Complete,
                 execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
                 row_count: 0,
                 warnings: Vec::new(),
@@ -757,8 +754,6 @@ mod tests {
                 query_caller().await,
                 Json(BifrostQueryRequest {
                     sql: "SELECT 1".to_owned(),
-                    visibility: VisibilityMode::PublishedOnly,
-                    freshness: FreshnessPolicy::Strict,
                     deadline_ms: Some(1_000),
                 }),
             )
@@ -784,7 +779,6 @@ mod tests {
     async fn http_query_stream_preserves_late_failed_terminal() {
         let terminal = QueryStreamFrame::Terminal(QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Failed,
-            freshness: QueryFreshness::Complete,
             execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
             row_count: 1,
             warnings: Vec::new(),

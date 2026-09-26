@@ -31,9 +31,7 @@ use wyrd_client::bifrost::TableConfig;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{
-    BifrostQueryRequest, FreshnessPolicy, PhysicalLayoutWire, VisibilityMode,
-};
+use wyrd_spec::vala::api::{BifrostQueryRequest, PhysicalLayoutWire};
 use wyrd_spec::vala::ids::RunId;
 use wyrd_utils::py::{WyrdPyError, WyrdPyResult, json_to_pyobject};
 
@@ -444,21 +442,17 @@ impl Bifrost {
     ///
     /// # Errors
     ///
-    /// Raises `WyrdError` for an unknown visibility or freshness spelling, and
-    /// the catalog code for request-contract or transport failures.
-    #[pyo3(signature = (sql, visibility="published_only", freshness="strict", deadline_ms=None))]
+    /// Raises `WyrdError` with the catalog code for request-contract or
+    /// transport failures.
+    #[pyo3(signature = (sql, deadline_ms=None))]
     fn stream(
         &self,
         py: Python<'_>,
         sql: &str,
-        visibility: &str,
-        freshness: &str,
         deadline_ms: Option<i64>,
     ) -> WyrdPyResult<PyBifrostQueryStream> {
         let request = BifrostQueryRequest {
             sql: sql.to_owned(),
-            visibility: parse_visibility(visibility)?,
-            freshness: parse_freshness(freshness)?,
             deadline_ms,
         };
         let stream = py
@@ -968,40 +962,6 @@ pub fn register_bifrost(module: &Bound<'_, PyModule>) -> PyResult<()> {
 pub fn register_observe(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(record, module)?)?;
     Ok(())
-}
-
-/// Parses the Python visibility spelling into the closed Rust contract.
-///
-/// # Errors
-///
-/// Raises the stable Wyrd validation error for any value other than
-/// `published_only`, `published-only`, or `fused`.
-fn parse_visibility(value: &str) -> WyrdPyResult<VisibilityMode> {
-    match value {
-        "published_only" | "published-only" => Ok(VisibilityMode::PublishedOnly),
-        "fused" => Ok(VisibilityMode::Fused),
-        _ => Err(invalid_argument(
-            "visibility",
-            "must be 'published_only' or 'fused'",
-        )),
-    }
-}
-
-/// Parses the Python freshness spelling into the closed Rust contract.
-///
-/// # Errors
-///
-/// Raises the stable Wyrd validation error for any value other than `strict`,
-/// `allow_degraded`, or `allow-degraded`.
-fn parse_freshness(value: &str) -> WyrdPyResult<FreshnessPolicy> {
-    match value {
-        "strict" => Ok(FreshnessPolicy::Strict),
-        "allow_degraded" | "allow-degraded" => Ok(FreshnessPolicy::AllowDegraded),
-        _ => Err(invalid_argument(
-            "freshness",
-            "must be 'strict' or 'allow_degraded'",
-        )),
-    }
 }
 
 /// Encodes one Rust record batch for the public Python `PyArrow` conversion.

@@ -398,7 +398,6 @@ mod tests {
     use wyrd_runtime::{Principal, PrincipalKind};
     use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::request_id::RequestId;
-    use wyrd_spec::vala::api::{FreshnessPolicy, VisibilityMode};
 
     use super::*;
 
@@ -448,8 +447,6 @@ mod tests {
             let state = state_without_oracle().await;
             let request = BifrostQueryRequest {
                 sql: "SELECT 1".to_owned(),
-                visibility: VisibilityMode::PublishedOnly,
-                freshness: FreshnessPolicy::Strict,
                 deadline_ms: Some(1_000),
             };
             let allowed = stream_query(

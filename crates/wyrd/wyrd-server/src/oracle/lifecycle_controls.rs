@@ -12,7 +12,7 @@ use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::{
     CancelOracleLifecycleRequest, CancelOracleLifecycleResponse, ListOracleLifecyclesRequest,
     OracleLifecycleLookupRequest, QueryStreamFrame, QueryTerminalFrame, QueryTerminalOutcome,
-    RunningQuerySummary, VisibilityMode,
+    RunningQuerySummary,
 };
 
 use super::{OracleLifecycleOutcome, OracleLifecycleTransport};
@@ -49,7 +49,6 @@ impl RunningQueryControls {
         tenant_id: DataTenantId,
         request_id: RequestId,
         mut stream: OracleQueryStream,
-        visibility: VisibilityMode,
         mut terminal: Option<QueryTerminalFrame>,
     ) -> Result<(), WyrdError> {
         stream.request_cancel();
@@ -63,7 +62,7 @@ impl RunningQueryControls {
         tokio::time::timeout_at(deadline, async {
             if let Some(observed) = &terminal {
                 observed
-                    .validate(visibility)
+                    .validate()
                     .map_err(|_| BifrostError::QueryStreamProtocol)?;
                 if observed.outcome == QueryTerminalOutcome::Failed {
                     return Ok(());
@@ -100,7 +99,7 @@ impl RunningQueryControls {
                     }
                     Some(Ok(QueryStreamFrame::Terminal(observed))) => {
                         observed
-                            .validate(visibility)
+                            .validate()
                             .map_err(|_| BifrostError::QueryStreamProtocol)?;
                         if observed.outcome == QueryTerminalOutcome::Failed {
                             return Ok(());

@@ -309,8 +309,6 @@ fn decode_managed_rows(batch: &arrow::record_batch::RecordBatch) -> Vec<ManagedR
 fn strict_fused(sql: String) -> wyrd_spec::vala::api::BifrostQueryRequest {
     wyrd_spec::vala::api::BifrostQueryRequest {
         sql,
-        visibility: wyrd_spec::vala::api::VisibilityMode::Fused,
-        freshness: wyrd_spec::vala::api::FreshnessPolicy::Strict,
         deadline_ms: Some(120_000),
     }
 }

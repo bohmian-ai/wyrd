@@ -38,13 +38,8 @@ type NativeRun = import("../index.cjs").NativeRun;
 type NativeRunOpen = import("../index.cjs").NativeRunOpen;
 type NativeTableConfig = import("../index.cjs").NativeTableConfig;
 
-export type VisibilityMode = "published_only" | "fused";
-export type FreshnessPolicy = "strict" | "allow_degraded";
-
 export interface BifrostQueryRequest {
   sql: string;
-  visibility?: VisibilityMode;
-  freshness?: FreshnessPolicy;
   deadlineMs?: number;
 }
 
@@ -157,7 +152,6 @@ interface CancelRunningQueryWire {
 
 export interface QueryTerminal {
   outcome: "success" | "degraded" | "failed";
-  freshness: string;
   row_count: number;
   warnings: unknown[];
   source_completion: unknown[];
@@ -846,8 +840,6 @@ export class Bifrost {
     const query = typeof request === "string" ? { sql: request } : request;
     const nativeRequest: NativeQueryRequest = {
       sql: query.sql,
-      visibility: query.visibility ?? "published_only",
-      freshness: query.freshness ?? "strict",
       deadlineMs: query.deadlineMs,
     };
     const start = await this.#native.query(nativeRequest);

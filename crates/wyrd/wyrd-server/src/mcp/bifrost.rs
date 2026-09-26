@@ -20,9 +20,7 @@ use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::oracle::{OracleQueryStream, QueryIpcDecoder};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::BifrostError as ValaError;
-use wyrd_spec::vala::api::{
-    BifrostQueryRequest, BifrostTableEntry, FreshnessPolicy, VisibilityMode,
-};
+use wyrd_spec::vala::api::{BifrostQueryRequest, BifrostTableEntry};
 use wyrd_spec::vala::api::{QueryStreamFrame, QueryTerminalFrame, QueryTerminalOutcome};
 
 use super::WyrdMcpHandler;
@@ -156,18 +154,6 @@ fn query_tool() -> Tool {
                     "minLength": 1,
                     "maxLength": MAX_SQL_BYTES
                 },
-                "visibility": {
-                    "type": "string",
-                    "enum": ["published_only", "fused"],
-                    "default": "published_only",
-                    "description": "Which visibility tiers the immutable read cut includes."
-                },
-                "freshness": {
-                    "type": "string",
-                    "enum": ["strict", "allow_degraded"],
-                    "default": "strict",
-                    "description": "Whether an unavailable live source fails the query or degrades it."
-                },
                 "deadline_ms": {
                     "type": "integer",
                     "minimum": 1,
@@ -235,20 +221,13 @@ fn parse_arguments<T: serde::de::DeserializeOwned>(
 
 /// Arguments accepted by [`QUERY`].
 ///
-/// Every field is either the SQL itself or one of the four query-policy values
-/// the public request already carries, plus the two MCP-local response
-/// ceilings. There is no path, class, tenant, or principal field to omit.
+/// Every field is either the SQL itself or the optional deadline the public
+/// request already carries, plus the two MCP-local response ceilings. There is no path, class, tenant, or principal field to omit.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct QueryArguments {
     /// A single read-only SELECT statement.
     sql: String,
-    /// Visibility tiers the immutable read cut includes.
-    #[serde(default = "default_visibility")]
-    visibility: VisibilityMode,
-    /// Behavior when a requested live source cannot complete.
-    #[serde(default)]
-    freshness: FreshnessPolicy,
     /// Optional caller deadline in milliseconds.
     #[serde(default)]
     deadline_ms: Option<u32>,
@@ -258,11 +237,6 @@ struct QueryArguments {
     /// Serialized JSON byte ceiling for the complete result.
     #[serde(default = "default_max_bytes")]
     max_bytes: usize,
-}
-
-/// Default visibility for an omitted `visibility`.
-fn default_visibility() -> VisibilityMode {
-    VisibilityMode::PublishedOnly
 }
 
 /// Default row ceiling for an omitted `max_rows`.
@@ -325,12 +299,10 @@ impl QueryArguments {
         Ok(())
     }
 
-    /// Project the four query-policy values onto the public query request.
+    /// Project the SQL and optional deadline onto the public query request.
     fn to_request(&self) -> BifrostQueryRequest {
         BifrostQueryRequest {
             sql: self.sql.clone(),
-            visibility: self.visibility,
-            freshness: self.freshness,
             deadline_ms: self.deadline_ms.map(i64::from),
         }
     }
@@ -436,7 +408,6 @@ impl WyrdMcpHandler {
             .await?;
             let collector = ResultCollector {
                 settlement,
-                visibility: arguments.visibility,
                 max_rows: usize::try_from(arguments.max_rows).unwrap_or(usize::MAX),
                 max_bytes: arguments.max_bytes,
                 bytes: STRUCTURED_OVERHEAD_BYTES,
@@ -490,8 +461,6 @@ struct ResultCollector {
         wyrd_spec::DataTenantId,
         wyrd_spec::request_id::RequestId,
     )>,
-    /// Visibility requested by the caller, used to validate source completion.
-    visibility: VisibilityMode,
     /// Row ceiling this caller asked for. Exceeding it fails; nothing truncates.
     max_rows: usize,
     /// Exact compact-JSON byte ceiling for `{columns, rows, terminal}`.
@@ -524,7 +493,7 @@ impl ResultCollector {
                     .take()
                     .ok_or(ValaError::RunningQueryControlUnavailable)?;
                 controls
-                    .cancel_and_settle(tenant, request_id, stream, self.visibility, terminal)
+                    .cancel_and_settle(tenant, request_id, stream, terminal)
                     .await?;
                 Err(error)
             }
@@ -613,7 +582,7 @@ impl ResultCollector {
                 }
                 QueryStreamFrame::Terminal(frame) if schema.is_some() && terminal.is_none() => {
                     if frame
-                        .validate(self.visibility)
+                        .validate()
                         .and_then(|()| frame.validate_emitted_rows(decoded_rows))
                         .is_err()
                     {
@@ -777,7 +746,6 @@ fn project_columns(schema: &arrow::datatypes::Schema) -> Vec<JsonValue> {
 fn project_terminal(frame: &QueryTerminalFrame) -> JsonValue {
     serde_json::json!({
         "outcome": frame.outcome,
-        "freshness": frame.freshness,
         "execution_path": frame.execution_path,
         "row_count": frame.row_count,
         "warnings": frame.warnings,
@@ -803,10 +771,9 @@ mod tests {
     use wyrd_spec::error::WyrdError;
     use wyrd_spec::vala::BifrostError;
     use wyrd_spec::vala::api::{
-        FreshnessPolicy, QueryBatchFrame, QueryExecutionPath, QueryFreshness, QuerySchemaFrame,
-        QuerySource, QueryStreamFrame, QueryTerminalError, QueryTerminalErrorCode,
-        QueryTerminalFrame, QueryTerminalOutcome, SourceCompletion, SourceCompletionOutcome,
-        VisibilityMode,
+        QueryBatchFrame, QueryExecutionPath, QuerySchemaFrame, QuerySource, QueryStreamFrame,
+        QueryTerminalError, QueryTerminalErrorCode, QueryTerminalFrame, QueryTerminalOutcome,
+        SourceCompletion, SourceCompletionOutcome,
     };
 
     /// One synthetic batch carrying every shape the projection must survive.
@@ -872,7 +839,6 @@ mod tests {
             })),
             Ok(QueryStreamFrame::Terminal(QueryTerminalFrame {
                 outcome: QueryTerminalOutcome::Success,
-                freshness: QueryFreshness::Complete,
                 execution_path: QueryExecutionPath::Interactive,
                 row_count: 2,
                 warnings: Vec::new(),
@@ -971,7 +937,6 @@ mod tests {
                 ));
                 let mut collector = ResultCollector {
                     settlement: None,
-                    visibility: VisibilityMode::PublishedOnly,
                     max_rows: 10,
                     max_bytes: MAX_BYTES_CEILING,
                     bytes: STRUCTURED_OVERHEAD_BYTES,
@@ -1008,7 +973,6 @@ mod tests {
             let batch = projection_batch();
             let collector = |max_bytes: usize| ResultCollector {
                 settlement: None,
-                visibility: VisibilityMode::PublishedOnly,
                 max_rows: 10,
                 max_bytes,
                 bytes: STRUCTURED_OVERHEAD_BYTES,
@@ -1105,37 +1069,14 @@ mod tests {
         names.sort_unstable();
         assert_eq!(
             names,
-            vec![
-                "deadline_ms",
-                "freshness",
-                "max_bytes",
-                "max_rows",
-                "sql",
-                "visibility"
-            ],
-            "the query input is exactly the six closed fields"
+            vec!["deadline_ms", "max_bytes", "max_rows", "sql"],
+            "the query input is exactly the four closed fields"
         );
 
         assert_eq!(properties["sql"]["minLength"], serde_json::json!(1));
         assert_eq!(
             properties["sql"]["maxLength"],
             serde_json::json!(MAX_SQL_BYTES)
-        );
-        assert_eq!(
-            properties["visibility"]["enum"],
-            serde_json::json!(["published_only", "fused"])
-        );
-        assert_eq!(
-            properties["visibility"]["default"],
-            serde_json::json!("published_only")
-        );
-        assert_eq!(
-            properties["freshness"]["enum"],
-            serde_json::json!(["strict", "allow_degraded"])
-        );
-        assert_eq!(
-            properties["freshness"]["default"],
-            serde_json::json!("strict")
         );
         assert_eq!(properties["deadline_ms"]["minimum"], serde_json::json!(1));
         assert_eq!(
@@ -1177,6 +1118,8 @@ mod tests {
             "execution_path",
             "path",
             "query_class",
+            "visibility",
+            "freshness",
             "topology",
             "plan",
         ] {
@@ -1190,16 +1133,12 @@ mod tests {
         defaults.validate().expect("bare sql is in range");
         let request = defaults.to_request();
         assert_eq!(request.sql, "SELECT 1");
-        assert_eq!(request.visibility, VisibilityMode::PublishedOnly);
-        assert_eq!(request.freshness, FreshnessPolicy::Strict);
         assert_eq!(request.deadline_ms, None);
         assert_eq!(defaults.max_rows, DEFAULT_MAX_ROWS);
         assert_eq!(defaults.max_bytes, DEFAULT_MAX_BYTES);
 
         let named = parse(serde_json::json!({
             "sql": "SELECT 1",
-            "visibility": "fused",
-            "freshness": "allow_degraded",
             "deadline_ms": u32::MAX,
             "max_rows": MAX_ROWS_CEILING,
             "max_bytes": MAX_BYTES_CEILING,
@@ -1207,8 +1146,6 @@ mod tests {
         .expect("every field at its bound parses");
         named.validate().expect("every field at its bound is valid");
         let request = named.to_request();
-        assert_eq!(request.visibility, VisibilityMode::Fused);
-        assert_eq!(request.freshness, FreshnessPolicy::AllowDegraded);
         assert_eq!(request.deadline_ms, Some(i64::from(u32::MAX)));
 
         for (case, arguments) in [

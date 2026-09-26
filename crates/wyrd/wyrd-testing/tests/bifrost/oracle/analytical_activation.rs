@@ -24,9 +24,7 @@ use wyrd_client::WyrdClient;
 use wyrd_client::bifrost::{BifrostClientError, QueryResultStream};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{
-    BifrostQueryRequest, FreshnessPolicy, QueryExecutionPath, VisibilityMode,
-};
+use wyrd_spec::vala::api::{BifrostQueryRequest, QueryExecutionPath};
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::process_cluster::BifrostProcessCluster;
 use wyrd_testing::bifrost::process_cluster::{
@@ -71,8 +69,6 @@ const SELF_JOIN_RESULT: [(i64, i64, i32); 8] = [
 fn request(sql: &str) -> BifrostQueryRequest {
     BifrostQueryRequest {
         sql: sql.to_owned(),
-        visibility: VisibilityMode::PublishedOnly,
-        freshness: FreshnessPolicy::Strict,
         deadline_ms: Some(30_000),
     }
 }
@@ -938,7 +934,7 @@ async fn prove_preparation_deadline(
         .parse()?;
     let mut frames = response.into_inner();
     let mut ipc = QueryIpcDecoder::new();
-    let mut converter = QueryStreamConverter::new(VisibilityMode::PublishedOnly);
+    let mut converter = QueryStreamConverter::new();
     let mut terminal = None;
     while let Some(frame) = frames.next().await {
         let frame = frame?;

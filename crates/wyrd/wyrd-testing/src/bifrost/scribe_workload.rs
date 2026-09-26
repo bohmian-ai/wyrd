@@ -1323,8 +1323,6 @@ impl crate::WyrdTestServer {
         let mut stream = query
             .query(&wyrd_spec::vala::api::BifrostQueryRequest {
                 sql: format!("SELECT value FROM {table_fqn}"),
-                visibility: wyrd_spec::vala::api::VisibilityMode::Fused,
-                freshness: wyrd_spec::vala::api::FreshnessPolicy::Strict,
                 deadline_ms: Some(60_000),
             })
             .await

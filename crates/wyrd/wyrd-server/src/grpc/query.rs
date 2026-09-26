@@ -277,9 +277,9 @@ mod tests {
     use vala_bifrost_redux::oracle::OracleQueryStream;
     use wyrd_spec::vala::BifrostError;
     use wyrd_spec::vala::api::{
-        QueryBatchFrame, QueryErrorDetail, QueryFreshness, QuerySchemaFrame, QuerySource,
-        QueryStreamFrame, QueryTerminalError, QueryTerminalErrorCode, QueryTerminalFrame,
-        QueryTerminalOutcome, QueryWarning, SourceCompletion, SourceCompletionOutcome,
+        QueryBatchFrame, QueryErrorDetail, QuerySchemaFrame, QuerySource, QueryStreamFrame,
+        QueryTerminalError, QueryTerminalErrorCode, QueryTerminalFrame, QueryTerminalOutcome,
+        QueryWarning, SourceCompletion, SourceCompletionOutcome,
     };
     use wyrd_tonic::frame_codec::FrameDecoder;
     use wyrd_tonic::tonic::Code;
@@ -492,7 +492,6 @@ mod tests {
             schema_frame(),
             QueryStreamFrame::Terminal(QueryTerminalFrame {
                 outcome: QueryTerminalOutcome::Success,
-                freshness: QueryFreshness::Complete,
                 execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
                 row_count: 0,
                 warnings: Vec::new(),
@@ -535,7 +534,6 @@ mod tests {
             }),
             QueryStreamFrame::Terminal(QueryTerminalFrame {
                 outcome: QueryTerminalOutcome::Degraded,
-                freshness: QueryFreshness::Degraded,
                 execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
                 row_count: 1,
                 warnings: vec![QueryWarning::LiveTailUnavailable],
@@ -551,7 +549,6 @@ mod tests {
             }),
             QueryStreamFrame::Terminal(QueryTerminalFrame {
                 outcome: QueryTerminalOutcome::Failed,
-                freshness: QueryFreshness::Complete,
                 execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
                 row_count: 1,
                 warnings: Vec::new(),

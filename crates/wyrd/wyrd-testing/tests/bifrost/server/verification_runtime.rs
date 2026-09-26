@@ -20,7 +20,7 @@ use wyrd_server::verification::engines::{EngineOutcome, VerifierReport};
 use wyrd_server::verification::health::RuntimeCapability;
 use wyrd_server::verification::runner::EngineScript;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::vala::api::{BifrostQueryRequest, FreshnessPolicy, VisibilityMode};
+use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::managed_columns::{CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_EVENT_TIME};
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
@@ -262,8 +262,6 @@ async fn query_rows(
     )
     .run(BifrostQueryRequest {
         sql,
-        visibility: VisibilityMode::PublishedOnly,
-        freshness: FreshnessPolicy::Strict,
         deadline_ms: Some(30_000),
     })
     .await?;

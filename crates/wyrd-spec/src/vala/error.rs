@@ -89,13 +89,13 @@ pub enum BifrostError {
     )]
     QueryMemoryRequestTooLarge,
 
-    /// The requested sealed or live visibility cut could not be acquired.
+    /// A required published query source could not be pinned or read.
     #[error("query visibility unavailable")]
     #[wyrd_error(
         code = "WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE",
         status = 503,
         title = "Query visibility unavailable",
-        remediation = "Retry when the sealed/live source is available or select an allowed weaker freshness."
+        remediation = "Retry when the published query source is available."
     )]
     QueryVisibilityUnavailable,
 

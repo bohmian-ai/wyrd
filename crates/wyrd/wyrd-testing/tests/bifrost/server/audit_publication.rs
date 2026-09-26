@@ -10,8 +10,7 @@ use wyrd_spec::auth::{GATEWAY_CAPTURE_PRINCIPAL, PrincipalId, PrincipalKindTag};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
-    AuditEvent, AuditOutcome, BifrostQueryRequest, BifrostSecurityViolationKind, FreshnessPolicy,
-    VisibilityMode,
+    AuditEvent, AuditOutcome, BifrostQueryRequest, BifrostSecurityViolationKind,
 };
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_testing::WyrdTestServer;
@@ -51,8 +50,6 @@ async fn retained_rows(
     )
     .run(BifrostQueryRequest {
         sql: format!("SELECT seq FROM {AUDIT_LOG} WHERE operation = '{operation}'"),
-        visibility: VisibilityMode::Fused,
-        freshness: FreshnessPolicy::Strict,
         deadline_ms: Some(60_000),
     })
     .await;
@@ -784,8 +781,6 @@ async fn retained_matching(
     )
     .run(BifrostQueryRequest {
         sql: format!("SELECT seq FROM {AUDIT_LOG} WHERE operation = '{operation}' AND {predicate}"),
-        visibility: VisibilityMode::Fused,
-        freshness: FreshnessPolicy::Strict,
         deadline_ms: Some(60_000),
     })
     .await?;

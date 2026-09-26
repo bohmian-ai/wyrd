@@ -1685,8 +1685,6 @@ async fn system_drift_reader_reads_only_the_observation_table() {
         };
         let request = wyrd_spec::vala::api::BifrostQueryRequest {
             sql: sql.to_owned(),
-            visibility: wyrd_spec::vala::api::VisibilityMode::PublishedOnly,
-            freshness: wyrd_spec::vala::api::FreshnessPolicy::Strict,
             deadline_ms: Some(30_000),
         };
         async move {

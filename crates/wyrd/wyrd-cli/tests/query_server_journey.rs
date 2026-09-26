@@ -8,7 +8,7 @@ use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{HttpConfig, HttpTransport, ResolvedCredential};
 use wyrd_client::{Bifrost, WyrdClient};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::vala::api::{BifrostQueryRequest, FreshnessPolicy, VisibilityMode};
+use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::seed_query_fixture;
 
@@ -37,8 +37,6 @@ async fn typed_query_error(
     let client = WyrdClient::from_parts(auth, http, config.grpc);
     let request = BifrostQueryRequest {
         sql: sql.to_owned(),
-        visibility: VisibilityMode::PublishedOnly,
-        freshness: FreshnessPolicy::Strict,
         deadline_ms: None,
     };
     match Bifrost::query_only(&client).query(&request).await {
@@ -113,7 +111,11 @@ async fn query_command_reads_seeded_table() {
         .map(|line| serde_json::from_str(line).expect("CLI terminal is JSON"))
         .expect("CLI emits terminal JSON");
     assert_eq!(terminal["outcome"], "success");
-    assert_eq!(terminal["freshness"], "complete");
+    assert!(terminal.get("freshness").is_none());
+    assert_eq!(
+        terminal["source_completion"].as_array().map(Vec::len),
+        Some(3)
+    );
     assert_eq!(terminal["row_count"], 2);
     assert_eq!(terminal["error"], Value::Null);
     server.shutdown().await.expect("test server shuts down");

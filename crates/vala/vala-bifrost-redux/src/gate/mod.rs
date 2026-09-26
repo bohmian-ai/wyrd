@@ -2228,7 +2228,6 @@ mod tests {
             let frames = futures_util::stream::iter([Ok(QueryStreamFrame::Terminal(
                 wyrd_spec::vala::api::QueryTerminalFrame {
                     outcome: wyrd_spec::vala::api::QueryTerminalOutcome::Success,
-                    freshness: wyrd_spec::vala::api::QueryFreshness::Complete,
                     execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
                     row_count: 0,
                     warnings: Vec::new(),
@@ -2263,8 +2262,6 @@ mod tests {
     fn query_request() -> wyrd_spec::vala::api::BifrostQueryRequest {
         wyrd_spec::vala::api::BifrostQueryRequest {
             sql: "SELECT 1".to_owned(),
-            visibility: wyrd_spec::vala::api::VisibilityMode::PublishedOnly,
-            freshness: wyrd_spec::vala::api::FreshnessPolicy::Strict,
             deadline_ms: None,
         }
     }

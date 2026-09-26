@@ -36,9 +36,9 @@ use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::{
     AuditDetail, AuthMethod, BifrostQueryRequest, BifrostSecurityPhase,
     BifrostSecurityViolationKind, NodeId, PersistedFileDescriptor, QueryAuditDigest,
-    QueryBatchFrame, QueryClass, QueryExecutionMode, QueryExecutionPath, QueryFreshness, QueryId,
-    QuerySchemaFrame, QuerySource, QueryStreamFrame, QueryTerminalErrorCode, QueryTerminalFrame,
-    QueryTerminalOutcome, SourceCompletion, SourceCompletionOutcome, VisibilityMode,
+    QueryBatchFrame, QueryClass, QueryExecutionMode, QueryExecutionPath, QueryId, QuerySchemaFrame,
+    QuerySource, QueryStreamFrame, QueryTerminalErrorCode, QueryTerminalFrame,
+    QueryTerminalOutcome, SourceCompletion, SourceCompletionOutcome,
 };
 #[cfg(feature = "test-support")]
 use wyrd_spec::vala::api::{AuditEvent, AuditOutcome};
@@ -202,11 +202,9 @@ pub(crate) fn test_persisted_descriptor(path: &str) -> PersistedFileDescriptor {
 #[cfg(test)]
 fn follower_source_loss_degrades(
     error: &dispatcher::DispatchError,
-    freshness: wyrd_spec::vala::api::FreshnessPolicy,
     sources: &[QuerySource],
 ) -> bool {
-    freshness == wyrd_spec::vala::api::FreshnessPolicy::AllowDegraded
-        && matches!(error, dispatcher::DispatchError::EligibleSourceLoss { .. })
+    matches!(error, dispatcher::DispatchError::EligibleSourceLoss { .. })
         && sources == [QuerySource::LiveTail]
 }
 
@@ -327,8 +325,6 @@ impl AuthorizedQueryContext {
 /// Options for a lowered, already-parsed logical query.
 #[derive(Debug, Clone, Copy)]
 pub struct QueryOptions {
-    /// Visibility mode represented by the lowered plan.
-    pub visibility: VisibilityMode,
     /// Maximum execution duration.
     pub deadline: Instant,
 }
@@ -528,7 +524,7 @@ impl OracleTelemetry {
     /// returned guard, so this is an associated constructor rather than a
     /// method that pretends to consult shared state.
     #[must_use]
-    fn start_query(_visibility: VisibilityMode, query_class: QueryClass) -> QueryTelemetryGuard {
+    fn start_query(query_class: QueryClass) -> QueryTelemetryGuard {
         metrics::gauge!(
             "oracle_queries_active",
             "class" => query_class_label(query_class)
@@ -677,7 +673,7 @@ impl QueryTelemetryGuard {
     }
 
     /// Emits the final query and stream outcome exactly once.
-    fn finish(&mut self, outcome: &'static str, _freshness: &'static str) {
+    fn finish(&mut self, outcome: &'static str) {
         if self.finalization == QueryTelemetryFinalization::Closed {
             return;
         }
@@ -751,7 +747,7 @@ impl Drop for QueryTelemetryGuard {
             } else {
                 "failed"
             };
-            self.finish(outcome, "complete");
+            self.finish(outcome);
         }
         metrics::gauge!("oracle_queries_active", "class" => query_class_label(self.query_class))
             .decrement(1.0);
@@ -2524,7 +2520,6 @@ impl Oracle {
         name = "bifrost.oracle.query",
         skip_all,
         fields(
-            visibility = visibility_label(request.visibility),
             query_class = tracing::field::Empty,
             request_node_id = %self.admission.local_role.key.node_id.as_uuid(),
             leader_node_id = %self.admission.local_role.key.node_id.as_uuid(),
@@ -2765,8 +2760,7 @@ impl Oracle {
             .finalize(query_class)
             .map_err(|_| BifrostError::OracleRoleUnavailable)?;
         // Started once across a possible stale retry.
-        query_telemetry
-            .get_or_insert_with(|| OracleTelemetry::start_query(request.visibility, query_class));
+        query_telemetry.get_or_insert_with(|| OracleTelemetry::start_query(query_class));
         let attempt = match analytical {
             Some(attempt) => Some(attempt.clone()),
             None if query_class == QueryClass::Analytical && self.analytical.is_some() => Some(
@@ -2936,7 +2930,7 @@ impl Oracle {
                 .get()
                 .is_some_and(bindings::OracleExecutionBindings::degraded),
         );
-        let settlement = AttemptSettlement::new(deadline, &participant_cut, request);
+        let settlement = AttemptSettlement::new(deadline, &participant_cut);
         let output = AttemptOutput::new(execution, admitted, running_query, reader_protection);
         settle_attempt_output(output, settlement, query_telemetry).await
     }
@@ -3257,7 +3251,6 @@ impl Oracle {
                 query_pool,
                 deadline: input.deadline,
                 cancellation: input.admitted.cancellation.clone(),
-                freshness: input.request.freshness,
                 query_id: input.admitted.query_id.into(),
                 ticket_minter: self.tail_ticket_minter.clone(),
                 cluster: Some(Arc::clone(&self.cluster)),
@@ -3265,24 +3258,16 @@ impl Oracle {
             },
         );
         let mut degraded = false;
-        // Every Fused query drains its live tails on the leader. The single
-        // planner owns distribution now, so there is no second architecture
-        // that would instead ship a Scribe tail to a follower as an assignment.
-        let acquired = if input.request.visibility == VisibilityMode::Fused {
-            match drainer.acquire(input.cuts).await {
-                Ok(fences) => fences,
-                Err(error)
-                    if input.request.freshness
-                        == wyrd_spec::vala::api::FreshnessPolicy::AllowDegraded =>
-                {
-                    tracing::warn!(error = %error, "Oracle Fused cut omits unavailable live tail");
-                    degraded = true;
-                    Vec::new()
-                }
-                Err(error) => return Err(error),
+        // Every query drains its live tails on the leader; a known live source
+        // lost before rows degrades the result instead of failing it.
+        let acquired = match drainer.acquire(input.cuts).await {
+            Ok(fences) => fences,
+            Err(BifrostError::QueryTimeout) => return Err(BifrostError::QueryTimeout),
+            Err(error) => {
+                tracing::warn!(error = %error, "Oracle query omits unavailable live tail");
+                degraded = true;
+                Vec::new()
             }
-        } else {
-            Vec::new()
         };
         let audit_span = tracing::info_span!(
             "bifrost.oracle.audit",
@@ -3299,7 +3284,6 @@ impl Oracle {
                 input.context,
                 &input.request.sql,
                 input.cuts,
-                input.request.visibility,
                 input.query_class,
                 input.deadline,
             )?;
@@ -3345,7 +3329,6 @@ impl Oracle {
         name = "bifrost.oracle.query",
         skip_all,
         fields(
-            visibility = visibility_label(options.visibility),
             query_class = "analytical",
             request_node_id = %self.admission.local_role.key.node_id.as_uuid(),
             leader_node_id = %self.admission.local_role.key.node_id.as_uuid(),
@@ -3373,7 +3356,7 @@ impl Oracle {
             return Err(BifrostError::OracleRoleUnavailable);
         }
         let class = QueryClass::Analytical;
-        let query_telemetry = OracleTelemetry::start_query(options.visibility, class);
+        let query_telemetry = OracleTelemetry::start_query(class);
         let admitted = self
             .admission
             .admit(admission::PreparedAdmission {
@@ -3393,9 +3376,7 @@ impl Oracle {
     /// Ordering is load-bearing. Tails are fenced before the read decision is
     /// audited so the audited cut and the drained rows describe the same
     /// visibility, and a rejected audit releases every acquired fence before
-    /// returning so a refused query leaves no tail pinned. Only `Fused`
-    /// visibility acquires tails at all; every other mode reads the pinned
-    /// sealed cut alone and drains nothing.
+    /// returning so a refused query leaves no tail pinned.
     ///
     /// # Errors
     ///
@@ -3422,18 +3403,13 @@ impl Oracle {
                     .ok_or(BifrostError::QueryAdmissionRejected)?,
                 deadline: options.deadline,
                 cancellation: admitted.cancellation.clone(),
-                freshness: wyrd_spec::vala::api::FreshnessPolicy::Strict,
                 query_id: admitted.query_id.into(),
                 ticket_minter: self.tail_ticket_minter.clone(),
                 cluster: Some(Arc::clone(&self.cluster)),
                 discovery: self.tail_discovery_for_query(),
             },
         );
-        let acquired = if options.visibility == VisibilityMode::Fused {
-            fence_owner.acquire(cuts).await?
-        } else {
-            Vec::new()
-        };
+        let acquired = fence_owner.acquire(cuts).await?;
         if let Err(error) = self
             .audit_typed_decision(context, plan, options, class, cuts)
             .await
@@ -3547,8 +3523,6 @@ impl Oracle {
             admitted,
             deadline: options.deadline,
             deadline_ms: absolute_deadline_ms(options.deadline),
-            visibility: options.visibility,
-            freshness_policy: wyrd_spec::vala::api::FreshnessPolicy::Strict,
             degraded_sources: degraded_live_tail_sources(degraded),
             query_telemetry,
             scan_stats,
@@ -4417,44 +4391,32 @@ pub type OracleFrameStream = dyn Stream<Item = Result<QueryStreamFrame, BifrostE
 /// irreversible, and a caller must never read a path the server did not run.
 #[must_use]
 pub fn failed_terminal(code: QueryTerminalErrorCode, row_count: u64) -> QueryTerminalFrame {
-    failed_terminal_for_visibility(
-        code,
-        row_count,
-        VisibilityMode::PublishedOnly,
-        QueryExecutionPath::Interactive,
-    )
+    failed_terminal_on_path(code, row_count, QueryExecutionPath::Interactive)
 }
 
-/// Returns a contract-valid failed terminal for the query's visibility cut.
+/// Returns a contract-valid failed terminal naming every source tier.
 ///
 /// `execution_path` is the path the stream had already selected, so a failure
 /// after Analytical selection reports `Analytical` rather than silently
-/// presenting itself as an Interactive failure.
-fn failed_terminal_for_visibility(
+/// presenting itself as an Interactive failure. A failed terminal carries no
+/// live-loss warning: the failure, not a degraded source, is the result.
+fn failed_terminal_on_path(
     code: QueryTerminalErrorCode,
     row_count: u64,
-    visibility: VisibilityMode,
     execution_path: QueryExecutionPath,
 ) -> QueryTerminalFrame {
-    let mut source_completion = vec![
-        SourceCompletion {
-            source: QuerySource::Iceberg,
-            outcome: SourceCompletionOutcome::Complete,
-        },
-        SourceCompletion {
-            source: QuerySource::HotSealed,
-            outcome: SourceCompletionOutcome::Complete,
-        },
-    ];
-    if visibility == VisibilityMode::Fused {
-        source_completion.push(SourceCompletion {
-            source: QuerySource::LiveTail,
-            outcome: SourceCompletionOutcome::Complete,
-        });
-    }
+    let source_completion = [
+        QuerySource::Iceberg,
+        QuerySource::HotSealed,
+        QuerySource::LiveTail,
+    ]
+    .map(|source| SourceCompletion {
+        source,
+        outcome: SourceCompletionOutcome::Complete,
+    })
+    .to_vec();
     QueryTerminalFrame {
         outcome: QueryTerminalOutcome::Failed,
-        freshness: wyrd_spec::vala::api::QueryFreshness::Complete,
         execution_path,
         row_count,
         warnings: Vec::new(),
@@ -4582,7 +4544,6 @@ fn read_decision(
     context: &AuthorizedQueryContext,
     sql: &str,
     cuts: &[PinnedSealedTable],
-    visibility: VisibilityMode,
     query_class: QueryClass,
     deadline: Instant,
 ) -> Result<BifrostQueryReadDecision, BifrostError> {
@@ -4604,7 +4565,6 @@ fn read_decision(
     BifrostQueryReadDecision::try_new(AuditDetail::BifrostQueryReadDecision {
         query_digest: audit_digest(sql)?,
         query_class,
-        visibility,
         binding_digests,
         snapshot_digest: aggregate_audit_digest(
             cuts.iter().map(|cut| cut.snapshot_digest.as_str()),
@@ -4668,7 +4628,6 @@ fn plan_read_decision(
     BifrostQueryReadDecision::try_new(AuditDetail::BifrostQueryReadDecision {
         query_digest: audit_digest(&plan_text)?,
         query_class,
-        visibility: options.visibility,
         binding_digests,
         snapshot_digest,
         manifest_digest,
@@ -4864,14 +4823,6 @@ fn query_class_label(class: QueryClass) -> &'static str {
     OracleQueryClassLabel::from(class).as_str()
 }
 
-/// Returns the closed production metric label for one visibility mode.
-const fn visibility_label(visibility: VisibilityMode) -> &'static str {
-    match visibility {
-        VisibilityMode::PublishedOnly => "published_only",
-        VisibilityMode::Fused => "fused",
-    }
-}
-
 /// Returns the closed metric label for one stable late terminal code.
 const fn terminal_error_label(code: QueryTerminalErrorCode) -> &'static str {
     match code {
@@ -4950,30 +4901,18 @@ struct AttemptSettlement {
     deadline: Instant,
     /// The pinned cut's deadline as a nonnegative Unix epoch millisecond.
     deadline_ms: i64,
-    /// Caller-selected visibility retained on the returned stream.
-    visibility: VisibilityMode,
-    /// Caller-selected source-loss policy retained on the returned stream.
-    freshness: wyrd_spec::vala::api::FreshnessPolicy,
 }
 
 impl AttemptSettlement {
     /// Derives the terminal settlement values from the attempt's own inputs.
     ///
-    /// Every field is fixed once the participant cut is signed: the caller's
-    /// visibility and freshness selections travel unchanged onto the returned
-    /// stream, and the cut's deadline is clamped to a nonnegative epoch
-    /// millisecond because a cut signed at or before the epoch is not
-    /// representable on the wire.
-    fn new(
-        deadline: Instant,
-        participant_cut: &participant_cut::OracleQueryAttemptCut,
-        request: &BifrostQueryRequest,
-    ) -> Self {
+    /// Every field is fixed once the participant cut is signed: the cut's
+    /// deadline is clamped to a nonnegative epoch millisecond because a cut
+    /// signed at or before the epoch is not representable on the wire.
+    fn new(deadline: Instant, participant_cut: &participant_cut::OracleQueryAttemptCut) -> Self {
         Self {
             deadline,
             deadline_ms: participant_cut.deadline().timestamp_millis().max(0),
-            visibility: request.visibility,
-            freshness: request.freshness,
         }
     }
 }
@@ -5030,8 +4969,6 @@ async fn settle_attempt_output(
     let AttemptSettlement {
         deadline,
         deadline_ms,
-        visibility,
-        freshness,
     } = settle;
     let Ok(first) =
         tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), batches.next()).await
@@ -5096,8 +5033,6 @@ async fn settle_attempt_output(
         admitted,
         deadline,
         deadline_ms,
-        visibility,
-        freshness_policy: freshness,
         degraded_sources,
         query_telemetry,
         scan_stats,
@@ -5777,32 +5712,22 @@ mod tests {
         );
     }
 
-    /// Only eligible live-tail loss under explicit policy becomes degraded.
+    /// Only eligible live-tail loss becomes degraded.
     #[test]
     fn eligible_source_loss_obeys_parent_terminal_matrix() {
-        use wyrd_spec::vala::api::FreshnessPolicy;
-
         let eligible = dispatcher::DispatchError::EligibleSourceLoss {
             cause: dispatcher::EligibleSourceLossCause::ProviderResolution,
         };
         assert!(follower_source_loss_degrades(
             &eligible,
-            FreshnessPolicy::AllowDegraded,
             &[QuerySource::LiveTail],
         ));
         assert!(!follower_source_loss_degrades(
             &eligible,
-            FreshnessPolicy::Strict,
-            &[QuerySource::LiveTail],
-        ));
-        assert!(!follower_source_loss_degrades(
-            &eligible,
-            FreshnessPolicy::AllowDegraded,
             &[QuerySource::Iceberg],
         ));
         assert!(!follower_source_loss_degrades(
             &eligible,
-            FreshnessPolicy::AllowDegraded,
             &[QuerySource::HotSealed],
         ));
         for error in [
@@ -5814,7 +5739,6 @@ mod tests {
         ] {
             assert!(!follower_source_loss_degrades(
                 &error,
-                FreshnessPolicy::AllowDegraded,
                 &[QuerySource::LiveTail],
             ));
         }
@@ -5969,8 +5893,6 @@ mod tests {
         for sql in ["", "UPDATE x SET y = 1", "SELECT 1; SELECT 2"] {
             let request = BifrostQueryRequest {
                 sql: sql.to_owned(),
-                visibility: VisibilityMode::PublishedOnly,
-                freshness: wyrd_spec::vala::api::FreshnessPolicy::default(),
                 deadline_ms: None,
             };
             assert!(planner.validate_query(&request).is_err());
@@ -6060,7 +5982,7 @@ mod tests {
         let terminal = failed_terminal(QueryTerminalErrorCode::QueryExecutionFailed, 17);
         assert_eq!(terminal.outcome, QueryTerminalOutcome::Failed);
         assert_eq!(terminal.row_count, 17);
-        assert!(terminal.validate(VisibilityMode::PublishedOnly).is_ok());
+        assert!(terminal.validate().is_ok());
         assert_eq!(
             terminal
                 .error
@@ -6076,10 +5998,9 @@ mod tests {
     fn oracle_terminal_metric_records_closed_label_delta() {
         let recorder = wyrd_bench::BenchmarkRecorder::new();
         metrics::with_local_recorder(&recorder, || {
-            let mut query =
-                OracleTelemetry::start_query(VisibilityMode::PublishedOnly, QueryClass::Analytical);
+            let mut query = OracleTelemetry::start_query(QueryClass::Analytical);
             query.start_stream();
-            query.finish("failed", "complete");
+            query.finish("failed");
         });
         let snapshot = recorder.snapshot();
         let observed = snapshot.histograms.iter().any(|(series, _)| {
@@ -6329,11 +6250,7 @@ mod tests {
 
         {
             for query_class in [QueryClass::Interactive, QueryClass::Analytical] {
-                for visibility in [VisibilityMode::PublishedOnly, VisibilityMode::Fused] {
-                    let query = OracleTelemetry::start_query(visibility, query_class);
-                    drop(query);
-                }
-                let _ = query_class;
+                drop(OracleTelemetry::start_query(query_class));
             }
         }
 
@@ -6361,18 +6278,14 @@ mod tests {
         let recorder = wyrd_bench::BenchmarkRecorder::new();
         metrics::with_local_recorder(&recorder, || {
             for outcome in ["success", "failed"] {
-                let mut query = OracleTelemetry::start_query(
-                    VisibilityMode::PublishedOnly,
-                    QueryClass::Analytical,
-                );
+                let mut query = OracleTelemetry::start_query(QueryClass::Analytical);
                 query.start_stream();
                 query.record_payload(0, 7);
                 query.record_payload(3, 11);
-                query.finish(outcome, "complete");
+                query.finish(outcome);
             }
 
-            let mut cancelled =
-                OracleTelemetry::start_query(VisibilityMode::PublishedOnly, QueryClass::Analytical);
+            let mut cancelled = OracleTelemetry::start_query(QueryClass::Analytical);
             cancelled.start_stream();
             cancelled.record_payload(3, 18);
             cancelled
@@ -6380,8 +6293,7 @@ mod tests {
                 .store(true, Ordering::Release);
             drop(cancelled);
 
-            let mut dropped =
-                OracleTelemetry::start_query(VisibilityMode::PublishedOnly, QueryClass::Analytical);
+            let mut dropped = OracleTelemetry::start_query(QueryClass::Analytical);
             dropped.start_stream();
             dropped.record_payload(3, 18);
             drop(dropped);

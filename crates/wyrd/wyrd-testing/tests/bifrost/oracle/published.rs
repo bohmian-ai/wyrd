@@ -21,7 +21,7 @@ use vala_bifrost_redux::storage::{
     StorageOperation, StorageOperationBarrier, StorageRequestOutcome,
 };
 use wyrd_client::WyrdClient;
-use wyrd_spec::vala::api::{BifrostQueryRequest, FreshnessPolicy, VisibilityMode};
+use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::{BifrostClusterSpec, ScribeCacheMode, WyrdTestCluster};
 
@@ -640,8 +640,6 @@ async fn collect_ids(client: &WyrdClient, sql: String) -> Result<Vec<i64>, Journ
     let mut stream = wyrd_client::Bifrost::query_only(client)
         .query(&BifrostQueryRequest {
             sql,
-            visibility: VisibilityMode::PublishedOnly,
-            freshness: FreshnessPolicy::Strict,
             deadline_ms: None,
         })
         .await?;

@@ -10,7 +10,7 @@ use vala_bifrost_redux::namespaces::BifrostNamespace;
 use wyrd_client::bifrost::BifrostClientError;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
-use wyrd_spec::vala::api::{BifrostQueryRequest, QueryTerminalErrorCode, VisibilityMode};
+use wyrd_spec::vala::api::{BifrostQueryRequest, QueryTerminalErrorCode};
 use wyrd_testing::bifrost::{
     BifrostClusterSpec, ScribeCacheMode, ScribeCheckpointNameV1, ScribeProductionEvidenceV1,
     ScribeProductionWorkloadV1, ScribePublishedHotFileV1, ScribeStorageDrainObservationV1,
@@ -248,8 +248,6 @@ async fn query_rows(
     let mut stream = wyrd_client::Bifrost::query_only(writer.client())
         .query(&BifrostQueryRequest {
             sql: sql.to_owned(),
-            visibility: VisibilityMode::Fused,
-            freshness: wyrd_spec::vala::api::FreshnessPolicy::Strict,
             deadline_ms: Some(60_000),
         })
         .await
@@ -504,8 +502,6 @@ async fn assert_empty_table_reads_cleanly(server: &wyrd_testing::WyrdTestServer)
     let mut empty = wyrd_client::Bifrost::query_only(reader.client())
         .query(&BifrostQueryRequest {
             sql: format!("SELECT value FROM {table}"),
-            visibility: VisibilityMode::Fused,
-            freshness: wyrd_spec::vala::api::FreshnessPolicy::Strict,
             deadline_ms: Some(60_000),
         })
         .await
@@ -611,8 +607,6 @@ async fn scribe_undialable_private_peer_returns_typed_visibility_failure() {
     let started = wyrd_client::Bifrost::query_only(writer.client())
         .query(&BifrostQueryRequest {
             sql: format!("SELECT value FROM {table}"),
-            visibility: VisibilityMode::Fused,
-            freshness: wyrd_spec::vala::api::FreshnessPolicy::Strict,
             deadline_ms: Some(5_000),
         })
         .await;
@@ -1032,8 +1026,6 @@ async fn read_correlation(
     let mut stream = wyrd_client::Bifrost::query_only(client)
         .query(&BifrostQueryRequest {
             sql: sql.clone(),
-            visibility: VisibilityMode::Fused,
-            freshness: wyrd_spec::vala::api::FreshnessPolicy::Strict,
             deadline_ms: Some(120_000),
         })
         .await

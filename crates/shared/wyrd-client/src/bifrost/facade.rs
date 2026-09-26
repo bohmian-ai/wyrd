@@ -20,9 +20,8 @@ use wyrd_queue::QueueConfig;
 use wyrd_queue::{BatchSink, ClientByteGuard, DurableBatchAck, SealedBatch, SinkError};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
-    BifrostQueryRequest, BifrostTableDescription, CancelRunningQueryResponse, FreshnessPolicy,
-    QueryTerminalFrame, RegisterOutcome, RegisterTableResponse, RunningQuerySummary,
-    VisibilityMode,
+    BifrostQueryRequest, BifrostTableDescription, CancelRunningQueryResponse, QueryTerminalFrame,
+    RegisterOutcome, RegisterTableResponse, RunningQuerySummary,
 };
 
 use crate::bifrost::BifrostMetrics;
@@ -628,8 +627,6 @@ impl Bifrost {
     pub async fn stream(&self, query: &str) -> Result<QueryResultStream, BifrostClientError> {
         self.query(&BifrostQueryRequest {
             sql: query.to_owned(),
-            visibility: VisibilityMode::PublishedOnly,
-            freshness: FreshnessPolicy::Strict,
             deadline_ms: None,
         })
         .await
@@ -638,7 +635,7 @@ impl Bifrost {
     /// Start one query from a complete request and return its batches as they arrive.
     ///
     /// The raw form [`Self::stream`] and [`Self::sql`] wrap: the caller chooses
-    /// visibility, freshness, and deadline. The request is validated before any
+    /// the deadline. The request is validated before any
     /// IO, and the returned stream owns the HTTP response body.
     ///
     /// # Errors

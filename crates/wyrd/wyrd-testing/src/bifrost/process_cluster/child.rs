@@ -597,19 +597,18 @@ struct ChildConfig {
 ///
 /// # Errors
 ///
-/// Returns [`ProcessClusterError::Child`] when the terminal is malformed for
-/// the requested visibility, disagrees with the rows emitted before it, is not
+/// Returns [`ProcessClusterError::Child`] when the terminal is malformed,
+/// disagrees with the rows emitted before it, is not
 /// [`wyrd_spec::vala::api::QueryTerminalOutcome::Success`], or does not close
 /// the decoder with its own explicit Arrow IPC end-of-stream.
 fn accept_query_terminal(
     terminal: &wyrd_spec::vala::api::QueryTerminalFrame,
-    visibility: wyrd_spec::vala::api::VisibilityMode,
     emitted_rows: usize,
     decoder: &mut vala_bifrost_redux::oracle::QueryIpcDecoder,
 ) -> Result<usize, ProcessClusterError> {
     let child = |detail: String| ProcessClusterError::Child(detail);
     terminal
-        .validate(visibility)
+        .validate()
         .map_err(|error| child(error.to_string()))?;
     terminal
         .validate_emitted_rows(u64::try_from(emitted_rows).unwrap_or(u64::MAX))
@@ -1262,8 +1261,6 @@ async fn drive_inactive_sql(
                 context,
                 wyrd_spec::vala::api::BifrostQueryRequest {
                     sql: sql.to_owned(),
-                    visibility: wyrd_spec::vala::api::VisibilityMode::PublishedOnly,
-                    freshness: wyrd_spec::vala::api::FreshnessPolicy::Strict,
                     deadline_ms: Some(STATEMENT_DEADLINE_MS.cast_signed()),
                 },
                 attempt,
@@ -1292,12 +1289,7 @@ async fn drive_inactive_sql(
         }
         let terminal = terminal
             .ok_or_else(|| child("the inactive attempt emitted no terminal frame".to_owned()))?;
-        accept_query_terminal(
-            &terminal,
-            wyrd_spec::vala::api::VisibilityMode::PublishedOnly,
-            rows,
-            &mut decoder,
-        )
+        accept_query_terminal(&terminal, rows, &mut decoder)
     }
 }
 
@@ -1746,9 +1738,8 @@ mod tests {
     use std::sync::Arc;
 
     use wyrd_spec::vala::api::{
-        QueryFreshness, QuerySource, QueryTerminalError, QueryTerminalErrorCode,
-        QueryTerminalFrame, QueryTerminalOutcome, SourceCompletion, SourceCompletionOutcome,
-        VisibilityMode,
+        QuerySource, QueryTerminalError, QueryTerminalErrorCode, QueryTerminalFrame,
+        QueryTerminalOutcome, SourceCompletion, SourceCompletionOutcome,
     };
 
     use super::{ProcessClusterError, accept_query_terminal, settled_analytical_evidence};
@@ -1799,7 +1790,6 @@ mod tests {
 
         let failed = QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Failed,
-            freshness: QueryFreshness::Complete,
             execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
             row_count: u64::try_from(emitted).expect("a fixture row count fits a u64"),
             warnings: Vec::new(),
@@ -1820,15 +1810,10 @@ mod tests {
             arrow_ipc_eos: Vec::new(),
         };
         failed
-            .validate(VisibilityMode::PublishedOnly)
+            .validate()
             .expect("the fixture terminal is structurally valid on its own");
 
-        let refused = accept_query_terminal(
-            &failed,
-            VisibilityMode::PublishedOnly,
-            emitted,
-            &mut decoder,
-        );
+        let refused = accept_query_terminal(&failed, emitted, &mut decoder);
         assert!(
             matches!(refused, Err(ProcessClusterError::Child(_))),
             "rows preceding a failed terminal are not a result: {refused:?}"

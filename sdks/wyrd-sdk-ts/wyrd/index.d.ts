@@ -722,10 +722,6 @@ export interface NativeLifecycleResult {
 export interface NativeQueryRequest {
   /** SELECT-only SQL text. */
   sql: string
-  /** `published_only` or `fused`. */
-  visibility: string
-  /** `strict` or `allow_degraded`. */
-  freshness: string
   /**
    * Optional query deadline in milliseconds, valid in `1..=u32::MAX`.
    *

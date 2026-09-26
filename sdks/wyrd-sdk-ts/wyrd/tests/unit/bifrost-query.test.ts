@@ -15,7 +15,6 @@ describe("BifrostQueryStream", () => {
     const ipc = tableToIPC(tableFromArrays({ value: [1, 2] }), "stream");
     const terminal = {
       outcome: "success",
-      freshness: "fresh",
       row_count: 2,
       warnings: [],
       source_completion: [],

@@ -10,9 +10,7 @@ use wyrd_server::query::scheduled::ScheduledQueryCaller;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{
-    AuthMethod, BifrostQueryRequest, FreshnessPolicy, QueryExecutionPath, VisibilityMode,
-};
+use wyrd_spec::vala::api::{AuthMethod, BifrostQueryRequest, QueryExecutionPath};
 use wyrd_testing::WyrdTestServer;
 use wyrd_tonic::wyrd::v1 as proto;
 use wyrd_tonic::wyrd::v1::bifrost_query_service_client::BifrostQueryServiceClient;
@@ -27,8 +25,6 @@ const FIXTURE_VALUES: [i64; 4] = [1, 2, 3, 4];
 fn request(sql: &str) -> BifrostQueryRequest {
     BifrostQueryRequest {
         sql: sql.to_owned(),
-        visibility: VisibilityMode::PublishedOnly,
-        freshness: FreshnessPolicy::Strict,
         deadline_ms: Some(30_000),
     }
 }
@@ -189,13 +185,7 @@ async fn consumer_cancellation_requires_owner_terminal() -> Result<(), ServerJou
         let controls = controls.clone();
         let settlement = tokio::spawn(async move {
             controls
-                .cancel_and_settle(
-                    tenant,
-                    request_id,
-                    stream,
-                    VisibilityMode::PublishedOnly,
-                    observed,
-                )
+                .cancel_and_settle(tenant, request_id, stream, observed)
                 .await
         });
         tokio::time::timeout(std::time::Duration::from_secs(1), token.cancelled()).await?;

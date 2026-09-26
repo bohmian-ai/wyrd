@@ -32,9 +32,7 @@ use wyrd_runtime::{Permission, Principal, PrincipalKind};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{
-    AuditEvent, AuditOutcome, AuthMethod, BifrostQueryRequest, FreshnessPolicy, VisibilityMode,
-};
+use wyrd_spec::vala::api::{AuditEvent, AuditOutcome, AuthMethod, BifrostQueryRequest};
 use wyrd_testing::Bootstrap;
 use wyrd_testing::bifrost::WyrdTestCluster;
 use wyrd_testing::bifrost::write::BifrostWriter;
@@ -299,18 +297,12 @@ pub(crate) async fn seed_foreign_hot_row(
     Ok(())
 }
 /// Drain a public query stream and require its terminal row count to match frames.
-pub(crate) async fn query_rows(
-    client: &WyrdClient,
-    table: &str,
-    visibility: VisibilityMode,
-) -> Result<u64, JourneyError> {
+pub(crate) async fn query_rows(client: &WyrdClient, table: &str) -> Result<u64, JourneyError> {
     let mut stream = wyrd_client::Bifrost::query_only(client)
         .query(&BifrostQueryRequest {
             sql: format!(
                 "SELECT id, filter_key, unused_payload FROM vala.bifrost.{table} ORDER BY id"
             ),
-            visibility,
-            freshness: FreshnessPolicy::Strict,
             deadline_ms: None,
         })
         .await?;

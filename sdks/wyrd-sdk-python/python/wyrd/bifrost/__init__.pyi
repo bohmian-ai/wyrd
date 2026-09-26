@@ -271,8 +271,6 @@ class Bifrost(_BifrostBase):
         self,
         query: str,
         *,
-        visibility: str = "published_only",
-        freshness: str = "strict",
         deadline_ms: int | None = None,
     ) -> BifrostBatchIterator: ...
     def running(self) -> list[RunningQuery]: ...
@@ -296,8 +294,6 @@ class AsyncBifrost(_BifrostBase):
         self,
         query: str,
         *,
-        visibility: str = "published_only",
-        freshness: str = "strict",
         deadline_ms: int | None = None,
     ) -> BifrostQueryStream: ...
     async def running(self) -> list[RunningQuery]: ...

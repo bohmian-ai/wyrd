@@ -1753,7 +1753,6 @@ mod tests {
         use wyrd_runtime::{Permission, Principal, PrincipalKind};
         use wyrd_spec::auth::PrincipalId;
         use wyrd_spec::request_id::RequestId;
-        use wyrd_spec::vala::api::{FreshnessPolicy, VisibilityMode};
 
         // The route admits on the coarse capability while the principal holds
         // only a schema-scoped grant, which is exactly the shape a worker would
@@ -1784,8 +1783,6 @@ mod tests {
             context,
             request: BifrostQueryRequest {
                 sql: "SELECT value FROM vala.bifrost.events".to_owned(),
-                visibility: VisibilityMode::PublishedOnly,
-                freshness: FreshnessPolicy::Strict,
                 deadline_ms: Some(5_000),
             },
             absolute_deadline_ms: (now + chrono::Duration::seconds(30)).timestamp_millis(),

@@ -48,7 +48,7 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardUid, FeatureName};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{BifrostQueryRequest, FreshnessPolicy, VisibilityMode};
+use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::verification::{DriftWindow, VerificationError};
 use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
@@ -882,8 +882,6 @@ impl Reader<'_> {
         .map_err(failed)?;
         let request = BifrostQueryRequest {
             sql,
-            visibility: VisibilityMode::Fused,
-            freshness: FreshnessPolicy::Strict,
             deadline_ms: Some(
                 i64::try_from(self.engine.query_timeout.as_millis()).unwrap_or(i64::MAX),
             ),

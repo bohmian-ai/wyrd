@@ -28,9 +28,7 @@ use wyrd_client::Bifrost;
 use wyrd_client::WyrdClient;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::NodeId;
-use wyrd_spec::vala::api::{
-    BifrostQueryRequest, FreshnessPolicy, QueryStreamFrame, QueryTerminalOutcome, VisibilityMode,
-};
+use wyrd_spec::vala::api::{BifrostQueryRequest, QueryStreamFrame, QueryTerminalOutcome};
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::telemetry::BifrostMetricSample;
 use wyrd_testing::bifrost::telemetry::BifrostTelemetryDelta;
@@ -205,8 +203,6 @@ async fn prove_lowest_rung_contention() -> Result<(), JourneyError> {
             query_context(tenant_a)?,
             BifrostQueryRequest {
                 sql: analytical_baseline_sql(&left, &right),
-                visibility: VisibilityMode::PublishedOnly,
-                freshness: FreshnessPolicy::Strict,
                 deadline_ms: Some(ANALYTICAL_DEADLINE_MS),
             },
             attempt_context(),
@@ -375,8 +371,6 @@ async fn prove_interactive_window(
             // Analytical query would never reach the Interactive floor this
             // window exists to observe. Rows are counted, not ordered.
             sql: format!("SELECT id, filter_key FROM vala.bifrost.{table}"),
-            visibility: VisibilityMode::PublishedOnly,
-            freshness: FreshnessPolicy::Strict,
             deadline_ms: Some(INTERACTIVE_DEADLINE_MS),
         })
         .await?;
@@ -1137,7 +1131,7 @@ async fn query_each_node(
         // One machine principal per pod and per pass: a bootstrap name is a
         // Card identity, so reusing it would collide rather than authenticate.
         let reader = client(server, &format!("heterogeneous-reader-{label}-{index}")).await?;
-        let rows = query_rows(&reader, table, VisibilityMode::PublishedOnly).await?;
+        let rows = query_rows(&reader, table).await?;
         if rows != u64::try_from(HETEROGENEOUS_ROWS)? {
             return Err(format!(
                 "during {label} node {} returned {rows} rows",
@@ -1318,8 +1312,6 @@ async fn prove_memory_refusal_preserves_health() -> Result<(), JourneyError> {
     let stream = holder_query
         .query(&BifrostQueryRequest {
             sql: format!("SELECT id FROM vala.bifrost.{table}"),
-            visibility: VisibilityMode::PublishedOnly,
-            freshness: FreshnessPolicy::Strict,
             deadline_ms: Some(REFUSAL_HOLDER_DEADLINE_MS),
         })
         .await
@@ -1379,7 +1371,7 @@ async fn prove_memory_refusal_preserves_health() -> Result<(), JourneyError> {
         );
     }
     let next = client(server, "memory-refusal-next").await?;
-    let served = query_rows(&next, &table, VisibilityMode::PublishedOnly).await?;
+    let served = query_rows(&next, &table).await?;
     if served != u64::try_from(REFUSAL_ROWS)? {
         return Err(format!("the next query returned {served} rows after the refusal").into());
     }
@@ -1402,8 +1394,6 @@ async fn drain_query(query: &Bifrost, sql: &str) -> Result<u64, String> {
     let mut stream = query
         .query(&BifrostQueryRequest {
             sql: sql.to_owned(),
-            visibility: VisibilityMode::PublishedOnly,
-            freshness: FreshnessPolicy::Strict,
             deadline_ms: Some(REFUSAL_QUERY_DEADLINE_MS),
         })
         .await
@@ -1607,8 +1597,6 @@ async fn hold_envelope(
     let stream = wyrd_client::Bifrost::query_only(client)
         .query(&BifrostQueryRequest {
             sql: sql.to_owned(),
-            visibility: VisibilityMode::PublishedOnly,
-            freshness: FreshnessPolicy::Strict,
             deadline_ms: Some(REFUSAL_HOLDER_DEADLINE_MS),
         })
         .await

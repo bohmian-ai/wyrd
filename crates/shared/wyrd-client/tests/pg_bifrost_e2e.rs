@@ -40,9 +40,7 @@ mod pg_tests {
     use wyrd_spec::DataTenantId;
     use wyrd_spec::reference::CardRef;
     use wyrd_spec::request_id::RequestId;
-    use wyrd_spec::vala::api::{
-        BifrostQueryRequest, FreshnessPolicy, QueryTerminalOutcome, RegisterOutcome, VisibilityMode,
-    };
+    use wyrd_spec::vala::api::{BifrostQueryRequest, QueryTerminalOutcome, RegisterOutcome};
     use wyrd_testing::bifrost::write::{BifrostWriter, RawIngest};
     use wyrd_testing::server::WyrdTestServer;
     use wyrd_tonic::tonic::Request;
@@ -331,8 +329,6 @@ mod pg_tests {
         let stream = query
             .query(&BifrostQueryRequest {
                 sql: format!("SELECT value FROM {table_fqn}"),
-                visibility: VisibilityMode::PublishedOnly,
-                freshness: FreshnessPolicy::Strict,
                 deadline_ms: Some(30_000),
             })
             .await
@@ -845,8 +841,6 @@ mod pg_tests {
 
         let request = BifrostQueryRequest {
             sql: format!("SELECT id, value FROM {table_fqn} ORDER BY id"),
-            visibility: VisibilityMode::PublishedOnly,
-            freshness: FreshnessPolicy::Strict,
             deadline_ms: None,
         };
         let mut stream = wyrd_client::Bifrost::query_only(client)
@@ -945,8 +939,6 @@ mod pg_tests {
 
         let request = BifrostQueryRequest {
             sql: format!("SELECT id, value FROM {table_fqn} ORDER BY id"),
-            visibility: VisibilityMode::PublishedOnly,
-            freshness: FreshnessPolicy::Strict,
             deadline_ms: None,
         };
         let mut stream = wyrd_client::Bifrost::query_only(client)
@@ -1234,8 +1226,6 @@ mod pg_tests {
                     "SELECT id, card_uid, principal_id \
                      FROM vala.bifrost.{table_name} ORDER BY id"
                 ),
-                visibility: VisibilityMode::PublishedOnly,
-                freshness: FreshnessPolicy::Strict,
                 deadline_ms: None,
             })
             .await

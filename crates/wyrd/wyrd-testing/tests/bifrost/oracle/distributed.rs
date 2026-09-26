@@ -11,10 +11,7 @@ use vala_bifrost_redux::oracle::iceberg_projection_probe;
 use wyrd_client::WyrdClient;
 use wyrd_client::bifrost::BifrostClientError;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::vala::api::{
-    BifrostQueryRequest, FreshnessPolicy, QueryTerminalErrorCode, QueryTerminalOutcome,
-    VisibilityMode,
-};
+use wyrd_spec::vala::api::{BifrostQueryRequest, QueryTerminalErrorCode, QueryTerminalOutcome};
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
 
@@ -134,7 +131,7 @@ async fn prove_selective_predicate_pruning(
         .telemetry()
         .checkpoint()
         .map_err(|error| error.to_string())?;
-    let unfiltered_rows = query_rows(&reader, &table, VisibilityMode::PublishedOnly).await?;
+    let unfiltered_rows = query_rows(&reader, &table).await?;
     if unfiltered_rows != 3 {
         return Err(format!("unfiltered baseline expected 3 rows, saw {unfiltered_rows}").into());
     }
@@ -372,8 +369,6 @@ async fn query_terminal_either_surface(
     let opened = wyrd_client::Bifrost::query_only(client)
         .query(&BifrostQueryRequest {
             sql,
-            visibility: VisibilityMode::PublishedOnly,
-            freshness: FreshnessPolicy::Strict,
             deadline_ms: None,
         })
         .await;
@@ -853,8 +848,6 @@ async fn query_ids(client: &WyrdClient, sql: String) -> Result<Vec<i64>, Journey
     let mut stream = wyrd_client::Bifrost::query_only(client)
         .query(&BifrostQueryRequest {
             sql,
-            visibility: VisibilityMode::PublishedOnly,
-            freshness: FreshnessPolicy::Strict,
             deadline_ms: None,
         })
         .await?;

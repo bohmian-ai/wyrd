@@ -1728,8 +1728,6 @@ impl WyrdTestServer {
                          AND audit_principal_id <> '{AUDIT_INSPECTION_PRINCIPAL}' \
                          ORDER BY seq"
                     ),
-                    visibility: wyrd_spec::vala::api::VisibilityMode::Fused,
-                    freshness: wyrd_spec::vala::api::FreshnessPolicy::Strict,
                     deadline_ms: Some(60_000),
                 },
             )
@@ -1801,8 +1799,6 @@ impl WyrdTestServer {
                         "SELECT seq FROM {AUDIT_LOG} WHERE ({predicate}) \
                  AND audit_principal_id <> '{AUDIT_INSPECTION_PRINCIPAL}'"
                     ),
-                    visibility: wyrd_spec::vala::api::VisibilityMode::Fused,
-                    freshness: wyrd_spec::vala::api::FreshnessPolicy::Strict,
                     deadline_ms: Some(60_000),
                 })
                 .await;

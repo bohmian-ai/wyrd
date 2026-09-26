@@ -160,13 +160,23 @@ command, `mise run test:principals:unit`, `mise run test:sql`,
 `mise run check:tenant-isolation`, `mise run fmt`, `mise run lints`,
 `git diff --check`.
 
-Family-mutation audit: `revoke_refresh_family` has two callers. Refresh replay
-containment (`refresh.rs`) already holds the lock; User revocation (`revoke.rs`)
-now does too. `revoke_refresh` (single row) has no callers. Human-connection
-deactivation, replacement, and removal (`connections.rs`) never mutate refresh
-rows; rotation enforces connection cutoff under the family lock and then the
-connection slot lock. No path deletes principals or bulk-retires families
-otherwise. No further caller needed the lock.
+Family-mutation audit (every runtime write to `wyrd.auth_refresh_tokens`,
+found by grepping `UPDATE|DELETE FROM|TRUNCATE` over `crates`, `sdks`, `scripts`,
+plus FK cascades and triggers):
+
+| Path | Mutates refresh rows? | Races rotation? | Action |
+|---|---|---|---|
+| `consume_active_refresh` (`refresh_tokens.rs:15`) | single row, rotation itself | n/a | already under family lock (`refresh.rs:126`) |
+| `revoke_refresh_family` in replay containment (`refresh.rs:134`) | family | yes | already under family lock |
+| `revoke_refresh_family` in User revocation (`revoke.rs`) | family | yes | **now locked** (this task) |
+| `revoke_refresh` (`refresh_tokens.rs:152`) | single row | — | no callers |
+| Connection activate / deactivate / remove (`connections.rs`, `DEACTIVATE_ACTIVE_SQL`, `PROMOTE_TESTED_SQL`, `REMOVE_SQL`) | no — update `auth_human_connections` only | cutoff is enforced at rotation: `begin_locked` takes `lock_human_connection_slot` (`connections.rs:658`) and rotation takes the same lock and requires the bound revision to be Active (`issuance.rs:483`) | none; no family retirement to serialize |
+| User suspension | only via `revoke_principal_in_conn` (sole caller of `suspend_user_principal` outside tests) | yes | covered by this task |
+| Principal / connection deletion | no `DELETE` of users, service accounts, or connections exists; refresh FK to connections has no cascade; no FK from refresh rows to users; no triggers on the refresh table | — | none |
+| Migration `20260925000001` line 79 | one-off revoke of unbound families at migrate time | not at runtime | none |
+
+No path other than User revocation needed the family lock, so no additional
+overlap test was required.
 
 Non-goals held: no new persistence, lock abstraction, isolation change,
 public contract, migration, or generated artifact.

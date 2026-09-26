@@ -26,6 +26,9 @@ pub const API_KEY_ISSUE_OPERATION: &str = "auth.api_key.issue";
 pub const REFRESH_FAMILY_REVOKE_OPERATION: &str = "auth.refresh.revoke_family";
 /// Operation for a card-ref scope minted into (or refused from) a token.
 pub const CARD_SCOPE_MINT_OPERATION: &str = "auth.card_scope.mint";
+/// Operation for a human login whose provider-asserted groups changed the
+/// User's durable role assignments.
+pub const USER_ROLES_SYNC_OPERATION: &str = "auth.user.roles.sync";
 
 /// Parse the caller's request id into the audit correlation id.
 ///

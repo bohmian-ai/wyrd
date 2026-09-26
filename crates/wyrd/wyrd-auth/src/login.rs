@@ -7,10 +7,9 @@
 //! only in the returned authorization URL. The common callback
 //! ([`crate::callback::AuthorizationCodeExchange`]) consumes that row, issues
 //! the session, and stores it sealed against the login's initiation binding;
-//! [`LoginCompletions::redeem`] hands it once to the BFF or CLI holding that
-//! binding. No request header ever selects a tenant, connection, or redirect.
+//! [`HumanConnections::redeem_completion`] hands it once to the BFF or CLI
+//! holding that binding. No request header ever selects a tenant, connection, or redirect.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine;
@@ -23,13 +22,10 @@ use wyrd_auth_oidc::{OidcProvider, ScreenedHttp};
 use wyrd_crypt::SealingKeyring;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
-    AbsoluteUrl, BeginLogin, BeginLoginResponse, LoginInitiation, TokenResponse,
+    AbsoluteUrl, BeginLogin, BeginLoginResponse, LoginInitiation, Sha256Hex, TokenResponse,
 };
 use wyrd_spec::error::WyrdError;
-use wyrd_sql::WyrdPostgres;
-use wyrd_sql::queries::auth::{
-    LoginStateBinding, NewLoginState, insert_login_state, redeem_login_completion,
-};
+use wyrd_sql::queries::auth::{LoginState, insert_login_state, redeem_login_completion};
 use wyrd_sql::queries::platform::tenant_resolver::resolve_by_slug_for_app;
 
 use crate::callback::discover_provider;
@@ -40,7 +36,7 @@ use crate::error::{screen_error, store_error};
 /// redirected to: `{public_origin}/login/complete`, with no query string.
 ///
 /// The redirect carries no capability. The BFF redeems the completion with
-/// its `HttpOnly` flow cookie through [`LoginCompletions::redeem`].
+/// its `HttpOnly` flow cookie through [`HumanConnections::redeem_completion`].
 pub const LOGIN_COMPLETE_PATH: &str = "/login/complete";
 
 /// Lifetime of a persisted login-state row: the browser must complete the `IdP`
@@ -61,7 +57,7 @@ impl HumanConnections {
     /// ([`BeginLogin::initiation`]), a configured public origin, a deployment
     /// sealing keyring (completed logins are sealed at rest, so a keyless
     /// deployment cannot offer human SSO), and a known CLI handoff
-    /// ([`initiation_binding`]). The route key then resolves the tenant, and
+    /// ([`known_initiation`]). The route key then resolves the tenant, and
     /// the tenant must have an Active connection; an unknown tenant and a
     /// tenant without one fail with the same generic refusal, so the endpoint
     /// cannot enumerate tenants or their login configuration.
@@ -88,8 +84,8 @@ impl HumanConnections {
     pub async fn begin_login(&self, request: &BeginLogin) -> Result<BeginLoginResponse, WyrdError> {
         let initiation = request.initiation()?;
         let redirect_uri = self.require_callback()?.clone();
-        self.completion_keyring()?;
-        let binding = initiation_binding(initiation)?;
+        self.require_keyring()?;
+        let initiation = known_initiation(initiation)?;
         let tenant = resolve_by_slug_for_app(self.postgres().app_pool(), &request.tenant_route_key)
             .await
             .map_err(store_error)?
@@ -114,22 +110,22 @@ impl HumanConnections {
         );
         let authorization_url = AbsoluteUrl::new(authorization_url.as_str().to_owned())
             .map_err(|_| invalid_token("authorization URL is invalid"))?;
-        let row = NewLoginState {
-            state_hash: state_hash(&state_key),
+        let row = LoginState {
             connection: active.binding,
             issuer: trusted.issuer.to_string(),
             client_id: trusted.client_id.clone(),
             redirect_uri: redirect_uri.to_string(),
-            code_verifier: code_verifier.expose_secret().to_owned(),
+            code_verifier,
             nonce,
-            binding,
+            initiation,
         };
         let mut conn = self
             .postgres()
             .tenant_conn(tenant)
             .await
             .map_err(store_error)?;
-        if !insert_login_state(&mut conn, &row, LOGIN_STATE_TTL)
+        let state_hash = Sha256Hex::digest(state_key.as_bytes());
+        if !insert_login_state(&mut conn, &state_hash, &row, LOGIN_STATE_TTL)
             .await
             .map_err(store_error)?
         {
@@ -143,36 +139,14 @@ impl HumanConnections {
     }
 }
 
-/// Redemption owner for completed human logins.
-///
-/// The callback stores each issued session sealed under the deployment keyring
-/// against the login's initiation binding. This owner hands it out exactly
-/// once: the BFF redeems a browser login with the flow id hash from its
-/// `HttpOnly` cookie, and the CLI redeems its handoff. It is the primitive the
-/// BFF completion route and the CLI handoff claim wrap; it has no HTTP route
-/// of its own.
-#[derive(Clone)]
-pub struct LoginCompletions {
-    /// Runtime store the tenant transaction is acquired from.
-    postgres: WyrdPostgres,
-    /// Deployment keyring the completion was sealed under.
-    keyring: Arc<SealingKeyring>,
-}
-
-impl std::fmt::Debug for LoginCompletions {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LoginCompletions").finish_non_exhaustive()
-    }
-}
-
-impl LoginCompletions {
-    /// Build the owner over the runtime store and the deployment keyring.
-    #[must_use]
-    pub fn new(postgres: WyrdPostgres, keyring: Arc<SealingKeyring>) -> Self {
-        Self { postgres, keyring }
-    }
-
+impl HumanConnections {
     /// Redeem the completed login bound to `initiation` in `tenant`, once.
+    ///
+    /// The callback stores each issued session sealed under the deployment
+    /// keyring against the login's initiation binding. The BFF redeems a
+    /// browser login with the flow id hash from its `HttpOnly` cookie, and the
+    /// CLI redeems its handoff; this is the primitive the BFF completion route
+    /// and the CLI handoff claim wrap, and it has no HTTP route of its own.
     ///
     /// One tenant transaction deletes the completed, unexpired row recorded
     /// for exactly this binding and returns its sealed session, which is then
@@ -181,28 +155,25 @@ impl LoginCompletions {
     /// is then lost and the person signs in again.
     ///
     /// # Errors
-    /// Returns [`WyrdError::InvalidState`] when no completed, unexpired login
-    /// is recorded for the binding (never completed, already redeemed,
-    /// expired, or another tenant's), [`WyrdError::AuthVerifyUnavailable`]
-    /// when the store fails, and [`WyrdError::Internal`] when the sealed
-    /// session cannot be opened with this keyring or decoded.
-    pub async fn redeem(
+    /// Returns [`WyrdError::Validation`] with reason `sealing_key_missing`
+    /// when no sealing keyring is configured, [`WyrdError::InvalidState`] when
+    /// no completed, unexpired login is recorded for the binding (never
+    /// completed, already redeemed, expired, or another tenant's),
+    /// [`WyrdError::AuthVerifyUnavailable`] when the store fails, and
+    /// [`WyrdError::Internal`] when the sealed session cannot be opened with
+    /// this keyring or decoded.
+    pub async fn redeem_completion(
         &self,
         tenant: DataTenantId,
         initiation: LoginInitiation,
     ) -> Result<TokenResponse, WyrdError> {
-        let binding = match initiation {
-            LoginInitiation::Browser(hash) => LoginStateBinding::Browser {
-                flow_hash: *hash.as_bytes(),
-            },
-            LoginInitiation::Cli(handoff_id) => LoginStateBinding::Cli { handoff_id },
-        };
+        let keyring = self.require_keyring()?;
         let mut conn = self
-            .postgres
+            .postgres()
             .tenant_conn(tenant)
             .await
             .map_err(store_error)?;
-        let sealed = redeem_login_completion(&mut conn, &binding)
+        let sealed = redeem_login_completion(&mut conn, &initiation)
             .await
             .map_err(store_error)?;
         conn.commit().await.map_err(store_error)?;
@@ -210,7 +181,7 @@ impl LoginCompletions {
             message: "no completed login is waiting for this binding".to_owned(),
             details: json!({ "reason": "login_completion_missing" }),
         })?;
-        let opened = self.keyring.open(&sealed).map_err(|_| {
+        let opened = keyring.open(&sealed).map_err(|_| {
             tracing::error!(tenant_id = %tenant, "login completion could not be opened");
             completion_unusable()
         })?;
@@ -231,7 +202,7 @@ pub(crate) fn seal_completion(
     keyring.seal(&plaintext).map_err(|_| completion_unusable())
 }
 
-/// Resolve the stored initiation binding for a begin request.
+/// Admit a begin request's initiation binding for storage.
 ///
 /// This is the one place a CLI handoff is checked. CLI handoffs are issued by
 /// a server-owned handoff table that does not exist yet, so every handoff id
@@ -242,24 +213,14 @@ pub(crate) fn seal_completion(
 /// # Errors
 /// Returns [`WyrdError::InvalidState`] with reason `unknown_cli_handoff` for
 /// every CLI handoff id.
-pub(crate) fn initiation_binding(
-    initiation: LoginInitiation,
-) -> Result<LoginStateBinding, WyrdError> {
+pub(crate) fn known_initiation(initiation: LoginInitiation) -> Result<LoginInitiation, WyrdError> {
     match initiation {
-        LoginInitiation::Browser(hash) => Ok(LoginStateBinding::Browser {
-            flow_hash: *hash.as_bytes(),
-        }),
+        LoginInitiation::Browser(_) => Ok(initiation),
         LoginInitiation::Cli(_) => Err(WyrdError::InvalidState {
             message: "the CLI login handoff is unknown or expired; start a new login".to_owned(),
             details: json!({ "reason": "unknown_cli_handoff" }),
         }),
     }
-}
-
-/// SHA-256 of a raw login state: the only form the database stores and the
-/// key the callback's cross-tenant lookup uses.
-pub(crate) fn state_hash(state_key: &str) -> [u8; 32] {
-    Sha256::digest(state_key.as_bytes()).into()
 }
 
 /// The one refusal for a route key that names no active tenant or a tenant
@@ -369,6 +330,7 @@ mod pg_tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use secrecy::SecretString;
     use url::Url;
     use uuid::Uuid;
     use wyrd_auth_oidc::ScreenedHttp;
@@ -378,12 +340,11 @@ mod pg_tests {
     use wyrd_spec::auth::{BeginLogin, LoginInitiation, Sha256Hex, TokenResponse, TokenType};
     use wyrd_spec::error::WyrdError;
     use wyrd_sql::queries::auth::{
-        LoginStateBinding, NewLoginState, complete_login_state, consume_login_state,
-        insert_login_state,
+        LoginState, complete_login_state, consume_login_state, insert_login_state,
     };
     use wyrd_sql::row_types::auth::HumanConnectionBinding;
 
-    use super::{LOGIN_COMPLETION_TTL, LoginCompletions, seal_completion, state_hash};
+    use super::{LOGIN_COMPLETION_TTL, seal_completion};
     use crate::connections::HumanConnections;
 
     /// The deterministic keyring these tests seal completions under.
@@ -526,9 +487,8 @@ mod pg_tests {
         let tenant = fixture.data_tenant_id();
         let keyring = keyring();
         let flow = Sha256Hex::digest(b"flow-id");
-        let hash = state_hash("raw-state");
-        let row = NewLoginState {
-            state_hash: hash,
+        let hash = Sha256Hex::digest(b"raw-state");
+        let row = LoginState {
             connection: HumanConnectionBinding {
                 connection_id: Uuid::now_v7(),
                 connection_revision: 1,
@@ -536,26 +496,25 @@ mod pg_tests {
             issuer: "https://idp.example.com".to_owned(),
             client_id: "wyrd".to_owned(),
             redirect_uri: "https://wyrd.example.com/auth/callback".to_owned(),
-            code_verifier: "verifier".to_owned(),
+            code_verifier: SecretString::from("verifier"),
             nonce: "nonce".to_owned(),
-            binding: LoginStateBinding::Browser {
-                flow_hash: *flow.as_bytes(),
-            },
+            initiation: LoginInitiation::Browser(flow),
         };
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         assert!(
-            insert_login_state(&mut conn, &row, Duration::from_mins(5))
+            insert_login_state(&mut conn, &hash, &row, Duration::from_mins(5))
                 .await
                 .expect("state inserts")
         );
-        let reused = NewLoginState {
-            state_hash: state_hash("other-state"),
-            ..row.clone()
-        };
         assert!(
-            !insert_login_state(&mut conn, &reused, Duration::from_mins(5))
-                .await
-                .expect("duplicate binding is a no-op"),
+            !insert_login_state(
+                &mut conn,
+                &Sha256Hex::digest(b"other-state"),
+                &row,
+                Duration::from_mins(5)
+            )
+            .await
+            .expect("duplicate binding is a no-op"),
             "a flow binding is recorded against one login only"
         );
         let consumed = consume_login_state(&mut conn, &hash)
@@ -584,9 +543,9 @@ mod pg_tests {
         );
         conn.commit().await.expect("commit");
 
-        let completions = LoginCompletions::new(fixture.wyrd_postgres().clone(), keyring);
+        let completions = connections(&fixture, Some(keyring));
         let wrong = completions
-            .redeem(
+            .redeem_completion(
                 tenant,
                 LoginInitiation::Browser(Sha256Hex::digest(b"other")),
             )
@@ -594,13 +553,13 @@ mod pg_tests {
             .expect_err("another binding redeems nothing");
         assert!(matches!(wrong, WyrdError::InvalidState { .. }));
         let redeemed = completions
-            .redeem(tenant, LoginInitiation::Browser(flow))
+            .redeem_completion(tenant, LoginInitiation::Browser(flow))
             .await
             .expect("the binding redeems its completion");
         assert_eq!(redeemed.token_type, TokenType::Bearer);
         assert_eq!(redeemed.access_token.expose(), "access");
         let again = completions
-            .redeem(tenant, LoginInitiation::Browser(flow))
+            .redeem_completion(tenant, LoginInitiation::Browser(flow))
             .await
             .expect_err("a completion is redeemed once");
         assert!(matches!(again, WyrdError::InvalidState { .. }));

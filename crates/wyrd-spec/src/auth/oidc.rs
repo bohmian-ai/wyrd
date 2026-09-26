@@ -224,6 +224,13 @@ impl Sha256Hex {
     }
 }
 
+impl From<[u8; 32]> for Sha256Hex {
+    /// Wrap an already-computed raw digest, such as one read back from storage.
+    fn from(digest: [u8; 32]) -> Self {
+        Self(digest)
+    }
+}
+
 impl fmt::Display for Sha256Hex {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&hex::encode(self.0))

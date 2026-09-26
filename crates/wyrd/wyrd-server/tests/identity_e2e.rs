@@ -1211,7 +1211,7 @@ fn assert_browser_completion(reply: &CallbackReply, code: &str) {
 /// Returns the redemption refusal.
 ///
 /// # Panics
-/// Panics when the server has no connection owner or keyring.
+/// Panics when the server has no connection owner.
 async fn redeem(
     srv: &WyrdTestServer,
     tenant: DataTenantId,
@@ -1222,9 +1222,7 @@ async fn redeem(
         .human_connections
         .as_ref()
         .expect("the server owns human connections")
-        .completions()
-        .expect("the test server has a sealing keyring")
-        .redeem(tenant, LoginInitiation::Browser(*flow))
+        .redeem_completion(tenant, LoginInitiation::Browser(*flow))
         .await
 }
 

@@ -6,10 +6,10 @@
 -- now keyed globally by the SHA-256 of its random state value. The raw state
 -- lives only in the provider authorization URL; the database never stores it.
 --
--- A row records how the login was initiated. A browser login binds the hash of
--- the BFF's random flow id; a CLI login binds a server-issued handoff id. The
--- binding is unique, so a flow id or handoff can be recorded against exactly
--- one login. The callback consumes the row (consumed_at) before any provider
+-- A row records how the login was initiated by which one binding it carries: a
+-- browser login binds the hash of the BFF's random flow id; a CLI login binds a
+-- server-issued handoff id. The binding is unique, so a flow id or handoff
+-- can be recorded against exactly one login. The callback consumes the row (consumed_at) before any provider
 -- IO and, once it has issued a Wyrd session, stores that session sealed under
 -- the deployment keyring in completion_sealed with a fresh, short
 -- expires_at. The BFF or CLI redeems the completion once by its binding; the
@@ -30,14 +30,12 @@ CREATE TABLE wyrd.auth_login_state (
     redirect_uri        TEXT        NOT NULL,
     code_verifier       TEXT        NOT NULL,
     nonce               TEXT        NOT NULL,
-    initiation_kind     TEXT        NOT NULL CHECK (initiation_kind IN ('browser', 'cli')),
     browser_flow_hash   BYTEA       CHECK (octet_length(browser_flow_hash) = 32),
     cli_handoff_id      UUID,
     consumed_at         TIMESTAMPTZ,
     completion_sealed   BYTEA,
     expires_at          TIMESTAMPTZ NOT NULL,
-    CHECK ((initiation_kind = 'browser') = (browser_flow_hash IS NOT NULL)),
-    CHECK ((initiation_kind = 'cli') = (cli_handoff_id IS NOT NULL)),
+    CHECK (num_nonnulls(browser_flow_hash, cli_handoff_id) = 1),
     CHECK (completion_sealed IS NULL OR consumed_at IS NOT NULL)
 );
 

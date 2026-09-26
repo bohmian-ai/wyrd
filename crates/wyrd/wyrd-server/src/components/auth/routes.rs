@@ -12,9 +12,10 @@ use secrecy::SecretString;
 use tower_governor::GovernorLayer;
 use tower_governor::governor::GovernorConfigBuilder;
 use uuid::Uuid;
-use wyrd_auth::callback::CompletedLogin;
 use wyrd_auth_verify::AccessTokenClaims;
-use wyrd_spec::auth::{CallbackQuery, IssueKeyRequest, TokenRequest, TokenResponse};
+use wyrd_spec::auth::{
+    CallbackQuery, IssueKeyRequest, LoginInitiation, TokenRequest, TokenResponse,
+};
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::request_id::RequestId;
 
@@ -339,7 +340,7 @@ async fn callback(
     )
     .await?;
     match completed {
-        CompletedLogin::Browser => {
+        LoginInitiation::Browser(_) => {
             let connections = state
                 .auth
                 .human_connections
@@ -350,7 +351,7 @@ async fn callback(
                 .map_err(WyrdErrorResponse::from)?;
             Ok(Redirect::to(location.as_str()).into_response())
         }
-        CompletedLogin::Cli => Ok(Html(CLI_LOGIN_COMPLETE_PAGE).into_response()),
+        LoginInitiation::Cli(_) => Ok(Html(CLI_LOGIN_COMPLETE_PAGE).into_response()),
     }
 }
 

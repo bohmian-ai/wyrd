@@ -2,7 +2,9 @@
 
 use secrecy::ExposeSecret;
 use sqlx::PgPool;
+use sqlx::types::Uuid;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::Sha256Hex;
 
 use crate::dsn::ResolvedDsns;
 use crate::operator_pool::OperatorPool;
@@ -143,6 +145,40 @@ impl WyrdPostgres {
         let result = TenantConn::acquire(&self.app, data_tenant_id).await;
         lifecycle.finish(&result);
         result
+    }
+
+    /// Resolve the tenant owning an unconsumed, unexpired login state.
+    ///
+    /// The common OIDC callback carries only the provider's `state`; it has no
+    /// tenant selector and never trusts `Host` or forwarded headers. The
+    /// SECURITY DEFINER function `wyrd.auth_login_state_tenant`, granted only
+    /// to the runtime `wyrd_app` role this handle's app pool connects as,
+    /// answers this one question across tenant RLS: the tenant id of the row
+    /// whose SHA-256 state hash is `state_hash`, or `None` when the state is
+    /// unknown, consumed, or expired. It exposes no other column, so the
+    /// caller learns only which tenant transaction to open.
+    ///
+    /// # Errors
+    /// Returns [`SqlError::Query`] when Postgres rejects the lookup and
+    /// [`SqlError::InvalidDataTenantId`] when the stored tenant id violates the
+    /// Wyrd tenant-id contract.
+    pub async fn login_state_tenant(
+        &self,
+        state_hash: &Sha256Hex,
+    ) -> Result<Option<DataTenantId>, SqlError> {
+        // Dynamic query is intentional: the definer function post-dates the
+        // SQLx offline bundle.
+        let tenant_uuid =
+            sqlx::query_scalar::<_, Option<Uuid>>("SELECT wyrd.auth_login_state_tenant($1)")
+                .bind(state_hash.as_bytes().as_slice())
+                .fetch_one(&self.app)
+                .await
+                .map_err(SqlError::from)?;
+
+        tenant_uuid
+            .map(DataTenantId::new)
+            .transpose()
+            .map_err(SqlError::InvalidDataTenantId)
     }
 }
 

@@ -56,8 +56,7 @@ use crate::error::{provider_unreachable, screen_error, store_error};
 use crate::exchange_api_key::{ExchangeError, role_refs, verify_api_key};
 use crate::issuance::resolve_permissions;
 use crate::login::{
-    LOGIN_COMPLETE_PATH, LoginCompletions, auth_nonce, auth_state_key, build_authorization_url,
-    pkce_verifier,
+    LOGIN_COMPLETE_PATH, auth_nonce, auth_state_key, build_authorization_url, pkce_verifier,
 };
 use crate::pg_resolvers::{client_auth_from_row, human_connection_trusted_issuer, seal_secret};
 
@@ -274,14 +273,7 @@ impl HumanConnections {
         self.require_callback()?;
         let client_secret_enc = match &input.client_secret {
             Some(secret) => {
-                let keyring = self
-                    .keyring
-                    .as_deref()
-                    .ok_or_else(|| WyrdError::Validation {
-                        message: "a client secret was supplied but no sealing key is configured"
-                            .to_owned(),
-                        details: json!({ "reason": "sealing_key_missing" }),
-                    })?;
+                let keyring = self.require_keyring()?;
                 Some(seal_secret(keyring, secret.expose().as_bytes()).map_err(internal)?)
             }
             None => None,
@@ -615,36 +607,23 @@ impl HumanConnections {
             .ok_or_else(public_origin_missing)
     }
 
-    /// The deployment keyring login completions are sealed under.
+    /// The deployment sealing keyring, required wherever this owner seals.
     ///
-    /// A completed human login is stored until the BFF or CLI redeems it, so
-    /// it is sealed at rest; a keyless deployment cannot complete a human
-    /// login and refuses to begin one.
+    /// A provider client secret is sealed before it is stored, and a completed
+    /// human login is sealed until the BFF or CLI redeems it, so a keyless
+    /// deployment can neither store a secret nor complete a human login, and
+    /// refuses to begin one.
     ///
     /// # Errors
     /// Returns [`WyrdError::Validation`] with reason `sealing_key_missing`
     /// when no sealing keyring is configured.
-    pub(crate) fn completion_keyring(&self) -> Result<&Arc<SealingKeyring>, WyrdError> {
+    pub(crate) fn require_keyring(&self) -> Result<&Arc<SealingKeyring>, WyrdError> {
         self.keyring.as_ref().ok_or_else(|| WyrdError::Validation {
-            message:
-                "human SSO login requires a deployment sealing key (WYRD_SEALING_KEY_FILE) to \
-                      protect completed logins at rest"
-                    .to_owned(),
+            message: "a deployment sealing key (WYRD_SEALING_KEY_FILE) is required to seal \
+                      provider client secrets and completed human logins at rest"
+                .to_owned(),
             details: json!({ "reason": "sealing_key_missing" }),
         })
-    }
-
-    /// The login-completion redemption owner over this deployment's store and
-    /// sealing keyring.
-    ///
-    /// # Errors
-    /// Returns [`WyrdError::Validation`] with reason `sealing_key_missing`
-    /// when no sealing keyring is configured.
-    pub fn completions(&self) -> Result<LoginCompletions, WyrdError> {
-        Ok(LoginCompletions::new(
-            self.postgres.clone(),
-            Arc::clone(self.completion_keyring()?),
-        ))
     }
 
     /// Refuse when no public origin is configured.

@@ -7,7 +7,13 @@ description: Orchestrate a required two-wave, multi-agent audit of one immutable
 
 Answer one question: does the resulting repository satisfy the original task
 exactly? This is an acceptance audit, not an opportunity to improve, redesign,
-or refactor the implementation.
+or refactor the implementation beyond what a blocking finding requires.
+
+**Candidate-owned surface.** Public API, types, traits, and seams that the
+candidate introduced and the approved spec does not name are implementation
+choices, not approved decisions. When a blocking finding's root cause is the
+shape of such a surface, redesigning that surface is an in-scope correction.
+Only surface the spec names requires `SPEC_REVISION_REQUIRED` to change.
 
 Keep the reviewed source immutable. Review the complete base-to-candidate range,
 not the implementation summary or only the latest fix diff. After remediation,
@@ -76,6 +82,8 @@ extension: delete it if the task does not need it; otherwise reuse repository,
 standard-library, native-platform, or installed-dependency behavior before
 accepting new code. Require the smallest safe root-cause correction without
 weakening validation, error handling, security, accessibility, or durability.
+Removing a check that a stronger check at the same boundary covers is not
+weakening validation.
 
 Build an explicit matrix:
 
@@ -99,7 +107,10 @@ repository source and the diff, not agent summaries.
 Return `task-review.md` with the acceptance matrix, proposed findings, and one
 overall `PASS`, `FAIL`, or `BLOCKED` result. Each finding needs a source-local
 ID, classification, violated obligation, exact location, evidence, observable
-consequence, and required testable correction. For `DRIFT`, identify what can
+consequence, and required testable correction. Name the defect class in one
+line and state whether the owner's shape (a public field, an enum variant
+payload, a raw `String` where a validated type belongs) is what permits the
+defect. For `DRIFT`, identify what can
 be deleted or which existing or native mechanism already covers the outcome.
 
 ## Wave 1: repository standards review (`repo-rev`)
@@ -161,10 +172,12 @@ from approved authority. Apply this ladder to every finding and proposed
 remediation:
 
 1. Can it be deleted while preserving the complete task?
-2. Does existing repository behavior already solve it?
-3. Does the standard library or native platform solve it?
-4. Does an already-installed dependency solve it?
-5. Only then, what is the minimum necessary correction?
+2. Can a different shape of the candidate-owned owner make the defect
+   unrepresentable, so no guard is needed?
+3. Does existing repository behavior already solve it?
+4. Does the standard library or native platform solve it?
+5. Does an already-installed dependency solve it?
+6. Only then, what is the minimum necessary guard?
 
 Prefer one root-cause fix in the shared owner over repeated symptom guards. Do
 not mistake fewer lines for a valid simplification when it weakens validation,
@@ -172,7 +185,9 @@ error handling, security, accessibility, durability, or another explicit
 requirement. For each proposed finding the `ponytail-rev` must:
 
 1. trace every caller and read the full body of each function the correction
-   would change or move;
+   would change or move, and every producer of each value the correction
+   validates or transforms, confirming those producers' real outputs still
+   pass;
 2. prove the reported path is reachable and required by the approved task,
    rejecting dormant, test-only, speculative, or zero-caller surfaces unless
    the task explicitly requires them;
@@ -186,17 +201,26 @@ requirement. For each proposed finding the `ponytail-rev` must:
    smallest safe correction boundary.
 
 The final deduplicated ledger records each retained finding's stable
-`FIND-<task>-<n>` ID, Wave 1 source IDs, `CONFIRMED` or `REVISED` status,
+`FIND-<task>-<n>` ID, Wave 1 source IDs, `CONFIRMED`, `REVISED`, or
+`CLASS_INCOMPLETE` status,
 classification, violated obligation, exact location, evidence, observable
 consequence, decision-complete correction, and focused closure proof. Preserve
 prior `FIND-*` IDs during remediation and assign the next unused number only to
-new findings. Each correction selects the smallest safe approach, names the
+new findings. A finding whose root cause matches a prior `FIND-*` reopens that
+ID with status `CLASS_INCOMPLETE`: the earlier correction did not close the
+class. It reopens that correction's design, not only its coverage: state why
+its shape let the defect back in, and prefer replacing it over extending it.
+During remediation, also audit code added by prior remediation rounds: code a
+later fix or obligation made redundant (for example, validation subsumed by a
+stronger check at the same boundary) is `DRIFT`, and its deletion belongs in
+the correction. Each correction selects the smallest safe approach, names the
 existing owner or mechanism to reuse, and preserves adjacent behavior. When
 Wave 1 proposed no findings, return an explicitly validated empty ledger.
 
-The orchestrator may include only independently confirmed or revised findings.
+The orchestrator may include only independently `CONFIRMED`, `REVISED`, or
+`CLASS_INCOMPLETE` findings.
 A rejected finding is omitted, not softened into optional advice. If validation
-shows that the correction needs a new product, public API,
+shows that the correction needs a new product, spec-named public API,
 architecture, security, compatibility, cross-service, concurrency, resource-
 ownership, or persistent-data decision, do not prescribe it as remediation;
 return `SPEC_REVISION_REQUIRED` when the approved task truly requires that
@@ -245,9 +269,11 @@ Do not write an outcome checklist or merely restate the acceptance matrix. The
 diagnosis and recommendation are the substance of the remediation task;
 acceptance criteria only prove that correction. An implementer must not need to
 rediscover the defect or choose the correction boundary. If that recommendation
-requires a new product, public API, architecture, security, compatibility,
-cross-service, concurrency-semantics, or persistent-data decision, return
-`SPEC_REVISION_REQUIRED` instead.
+requires a new product, spec-named public API, architecture, security,
+compatibility, cross-service, concurrency-semantics, or persistent-data
+decision, return `SPEC_REVISION_REQUIRED` instead. Redesigning candidate-owned
+surface is not such a decision. The remediation's write set includes every file
+the root-cause correction touches; never narrow it below that.
 
 The remediation task packages validated findings for a fresh implementation
 agent; it is not another design plan. Do not specify helpers, private methods,

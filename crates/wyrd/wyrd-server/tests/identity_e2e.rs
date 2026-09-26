@@ -3160,11 +3160,13 @@ async fn begin_mock_login(srv: &WyrdTestServer, slug: &str) -> (Sha256Hex, Strin
 ///   4. a login begun for tenant B under the same issuer completes into B
 ///      only, whatever `Host` the callback carried: A cannot redeem it;
 ///   5. against a mock provider: a nonce, issuer, audience, signature, or
-///      algorithm mismatch, a multi-audience token without `azp`, an `azp`
+///      algorithm mismatch, a validly signed token without `iat`, a
+///      multi-audience token without `azp`, an `azp`
 ///      naming another client, a validly signed token whose algorithm
 ///      discovery did not advertise, an `HS256` token even when discovery
 ///      advertises `HS256` beside an asymmetric algorithm, and a provider
-///      outage are refused, leaving no completion, while a valid
+///      outage are refused, leaving no completion, User, identity, role
+///      grant, or refresh row, while a valid
 ///      multi-audience token whose `azp` names the client completes;
 ///   6. an injected audit-staging failure issues nothing: no completion and
 ///      no refresh row.
@@ -3440,6 +3442,16 @@ async fn tenant_callback_refusal_journey() {
             "WYRD_AUTH_401_INVALID_TOKEN",
         ),
         (
+            "missing iat",
+            Box::new(|nonce| {
+                let mut wrong = claims(nonce);
+                wrong.as_object_mut().expect("claims object").remove("iat");
+                id_token_reply(&sign_id_token(&eddsa, &wrong, MOCK_SIGNING_KEY))
+            }),
+            StatusCode::UNAUTHORIZED,
+            "WYRD_AUTH_401_INVALID_TOKEN",
+        ),
+        (
             "outage",
             Box::new(|_| wiremock::ResponseTemplate::new(503)),
             StatusCode::SERVICE_UNAVAILABLE,
@@ -3492,6 +3504,23 @@ async fn tenant_callback_refusal_journey() {
             "{label}: no completion is stored"
         );
     }
+    // Every refusal above happened before identity: tenant C holds no User,
+    // provider identity, role grant, or refresh row.
+    let persisted: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM wyrd.auth_users WHERE data_tenant_id = $1), \
+                (SELECT count(*) FROM wyrd.auth_user_identities WHERE data_tenant_id = $1), \
+                (SELECT count(*) FROM wyrd.auth_user_roles WHERE data_tenant_id = $1), \
+                (SELECT count(*) FROM wyrd.auth_refresh_tokens WHERE data_tenant_id = $1)",
+    )
+    .bind(tenant_c.as_uuid())
+    .fetch_one(&superuser)
+    .await
+    .expect("tenant C rows read");
+    assert_eq!(
+        persisted,
+        (0, 0, 0, 0),
+        "refused logins persisted no User, identity, role grant, or refresh row"
+    );
     mount_mock_provider(&mock, id_token_reply("unused")).await;
     let (flow, state, nonce) = begin_mock_login(&srv, "test-tenant-3").await;
     let mut with_azp = claims(&nonce);

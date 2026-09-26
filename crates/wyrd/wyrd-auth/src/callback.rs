@@ -212,7 +212,7 @@ impl AuthorizationCodeExchange {
         verify_id_token_algorithm(supported_algorithms, id_token)?;
         let verified = self
             .verifier
-            .verify_external_against(&trusted.verification(), id_token)
+            .verify_id_token_against(&trusted.verification(), id_token)
             .await
             .map_err(auth_error_to_wyrd)?;
         verify_nonce(&login_state.nonce, &verified.raw_claims)?;
@@ -572,7 +572,7 @@ fn roles_sync_event(request_id: &str, principal_id: Uuid) -> AuditEvent {
 /// This checks advertised-set membership only; it does not itself refuse
 /// symmetric algorithms. Its sole caller,
 /// [`AuthorizationCodeExchange::finish_id_token_exchange`], immediately hands
-/// the token to [`ExternalVerifier::verify_external_against`], which owns
+/// the token to [`ExternalVerifier::verify_id_token_against`], which owns
 /// symmetric-algorithm (`HS256`/`HS384`/`HS512`) rejection and the signature
 /// and JWKS verification. This check narrows a tenant login to the
 /// provider's own policy before that key lookup. Advertised names that do not

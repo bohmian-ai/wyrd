@@ -484,8 +484,8 @@ impl<I: IssuerConfigResolver> ExternalVerifier<I> {
     /// Verify a federated token against an issuer the caller already resolved.
     ///
     /// This is the single authoritative external-token verification: signature
-    /// over the issuer's JWKS, issuer and audience pinning, clock skew, and
-    /// claim mapping. [`Self::verify_external`] is the tenant-scoped entry
+    /// over the issuer's JWKS, required and pinned issuer and audience, expiry
+    /// and a present `nbf` under clock skew, and claim mapping. [`Self::verify_external`] is the tenant-scoped entry
     /// point that resolves the issuer from a tenant's configuration and then
     /// delegates here.
     ///
@@ -502,6 +502,8 @@ impl<I: IssuerConfigResolver> ExternalVerifier<I> {
     /// - [`AuthError::InvalidToken`] — a symmetric algorithm, a missing or
     ///   unknown `kid`, a wrong issuer or audience, or unmappable claims.
     /// - [`AuthError::TokenExpired`] — the token's `exp` has passed.
+    /// - [`AuthError::Jwt`] — a missing `exp`, `iss`, or `aud`, a future
+    ///   `nbf`, or another signature or decoding failure.
     /// - [`AuthError::VerifyUnavailable`] — the JWKS endpoint is unreachable.
     pub async fn verify_external_against(
         &self,
@@ -538,6 +540,10 @@ impl<I: IssuerConfigResolver> ExternalVerifier<I> {
         let mut validation = Validation::new(header.alg);
         validation.set_issuer(&[trusted.issuer.as_str()]);
         validation.set_audience(&[trusted.expected_audience.as_str()]);
+        // Pinning a claim the token omits proves nothing, so both pinned
+        // claims must be present, and a present `nbf` must have passed.
+        validation.set_required_spec_claims(&["exp", "iss", "aud"]);
+        validation.validate_nbf = true;
         validation.leeway = self.settings.allowed_clock_skew.as_secs();
 
         let raw_claims: serde_json::Value = jsonwebtoken::decode(token, &decoding_key, &validation)
@@ -561,6 +567,38 @@ impl<I: IssuerConfigResolver> ExternalVerifier<I> {
             expected_audience: trusted.expected_audience.clone(),
             raw_claims,
         })
+    }
+
+    /// Verify an OIDC ID token against an issuer the caller already resolved.
+    ///
+    /// ID-token semantics layered once over [`Self::verify_external_against`]:
+    /// after that generic verification succeeds, the token must also carry a
+    /// numeric `iat` no later than now plus the allowed clock skew. Tenant
+    /// callback and platform login route through here; workload assertions
+    /// stay on the generic entry because they are not ID tokens and carry no
+    /// `iat` contract.
+    ///
+    /// # Errors
+    /// Every error of [`Self::verify_external_against`], plus
+    /// [`AuthError::InvalidToken`] when `iat` is missing, not a non-negative
+    /// integer, or later than now plus the allowed clock skew.
+    pub async fn verify_id_token_against(
+        &self,
+        trusted: &IssuerVerification,
+        token: &str,
+    ) -> Result<ExternalClaims, AuthError> {
+        let claims = self.verify_external_against(trusted, token).await?;
+        let issued_at = claims
+            .raw_claims
+            .get("iat")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or(AuthError::InvalidToken)?;
+        let latest = jsonwebtoken::get_current_timestamp()
+            .saturating_add(self.settings.allowed_clock_skew.as_secs());
+        if issued_at > latest {
+            return Err(AuthError::InvalidToken);
+        }
+        Ok(claims)
     }
 }
 
@@ -2299,5 +2337,68 @@ mod tests {
         v2.verify_external(&tid, &new_token)
             .await
             .expect("new kid should resolve after one JWKS refetch");
+    }
+
+    /// ID-token verification refuses a signed token that omits or misstates a
+    /// binding or time claim, while a valid ID token passes and a workload
+    /// assertion without `iat` stays valid on the generic entry.
+    #[tokio::test]
+    async fn oidc_id_token_requires_binding_and_time_claims() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ed_jwks_json(EXTERNAL_KID)))
+            .mount(&server)
+            .await;
+        let jwks_uri: url::Url = format!("{}/jwks", server.uri())
+            .parse()
+            .expect("wiremock uri is valid");
+        let issuer = IssuerUrl::new(EXTERNAL_ISSUER).expect("test issuer is valid");
+        let tid = tenant_id();
+        let trusted = make_trusted_issuer(tid, issuer, EXTERNAL_AUDIENCE, jwks_uri);
+        let verification = trusted.verification();
+        let v = with_external_issuer(trusted, make_jwks_cache());
+        let valid = external_claims(EXTERNAL_ISSUER, EXTERNAL_AUDIENCE, now() + 3_600, now());
+        // Re-signs the valid claims with `key` set to `value`, or removed.
+        let variant = |key: &str, value: Option<serde_json::Value>| {
+            let mut claims = valid.clone();
+            let object = claims.as_object_mut().expect("claims are an object");
+            match value {
+                Some(value) => object.insert(key.to_owned(), value),
+                None => object.remove(key),
+            };
+            encode_external_token(&claims, EXTERNAL_KID)
+        };
+        let future = Some((now() + 3_000).into());
+
+        let refused = [
+            ("missing iss", variant("iss", None)),
+            ("missing aud", variant("aud", None)),
+            ("missing iat", variant("iat", None)),
+            ("string iat", variant("iat", Some("now".into()))),
+            ("future iat", variant("iat", future.clone())),
+            ("future nbf", variant("nbf", future.clone())),
+        ];
+        for (case, token) in &refused {
+            let result = v.verify_id_token_against(&verification, token).await;
+            assert!(result.is_err(), "{case} must be refused: {result:?}");
+        }
+
+        v.verify_id_token_against(&verification, &encode_external_token(&valid, EXTERNAL_KID))
+            .await
+            .expect("a correctly bound ID token passes");
+        v.verify_id_token_against(&verification, &variant("nbf", Some(now().into())))
+            .await
+            .expect("a past nbf passes");
+
+        v.verify_external(&tid, &variant("iat", None))
+            .await
+            .expect("a workload assertion without iat stays valid");
+        assert!(
+            v.verify_external(&tid, &variant("nbf", future))
+                .await
+                .is_err(),
+            "a workload assertion with a future nbf is refused"
+        );
     }
 }

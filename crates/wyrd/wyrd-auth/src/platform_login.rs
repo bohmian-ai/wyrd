@@ -275,7 +275,7 @@ impl PlatformLogin {
 
         let claims = self
             .verifier
-            .verify_external_against(&connection.verification, &id_token)
+            .verify_id_token_against(&connection.verification, &id_token)
             .await
             .map_err(|error| {
                 tracing::warn!(error = %auth_error_to_wyrd(error), "platform ID token rejected");

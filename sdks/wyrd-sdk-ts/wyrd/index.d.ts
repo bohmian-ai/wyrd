@@ -642,12 +642,6 @@ export declare function connectBifrost(table?: NativeTableConfig | undefined | n
 export declare function connectCards(serverUrl?: string | undefined | null, credential?: string | undefined | null): NativeCardsConnection
 
 /**
- * Builds one Verification handle without performing IO.
- *
- * Omitted arguments resolve through the same shared client configuration
- * chain as `connectCards`, so every capability authenticates identically.
- */
-export declare function connectVerification(serverUrl?: string | undefined | null, credential?: string | undefined | null): NativeVerificationConnection
  * Builds one gateway administration handle without performing IO.
  *
  * Omitted arguments resolve through the same shared client configuration
@@ -659,6 +653,14 @@ export declare function connectVerification(serverUrl?: string | undefined | nul
  * be built.
  */
 export declare function connectGateway(serverUrl?: string | undefined | null, credential?: string | undefined | null): NativeGateway
+
+/**
+ * Builds one Verification handle without performing IO.
+ *
+ * Omitted arguments resolve through the same shared client configuration
+ * chain as `connectCards`, so every capability authenticates identically.
+ */
+export declare function connectVerification(serverUrl?: string | undefined | null, credential?: string | undefined | null): NativeVerificationConnection
 
 /**
  * Builds one client without performing IO.

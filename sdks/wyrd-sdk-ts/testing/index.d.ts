@@ -210,14 +210,12 @@ export declare class NativeWyrdTestServer {
 /**
  * Starts a real bound Wyrd test server and mints an admin access token.
  *
- * `providerBaseUrl` roots gateway adapters at a local mock upstream.
- * `auditPublication: false` retains staged audit rows for assertions.
+ * `auditPublication: false` keeps staged audit rows for assertions.
  * `verificationRuntime: true` runs Drift baseline fitting and Verifier runs.
+ * `providerBaseUrl` roots built-in gateway adapters at a local mock upstream.
  *
  * # Errors
  *
- * Returns a napi error when `providerBaseUrl` is not an absolute URL, or when
- * server startup, service bootstrap, API-key exchange, or URL discovery
- * fails.
+ * Returns a napi error for an invalid provider URL or server setup failure.
  */
 export declare function startTestServer(providerBaseUrl?: string | undefined | null, auditPublication?: boolean | undefined | null, verificationRuntime?: boolean | undefined | null): NativeWyrdTestServer

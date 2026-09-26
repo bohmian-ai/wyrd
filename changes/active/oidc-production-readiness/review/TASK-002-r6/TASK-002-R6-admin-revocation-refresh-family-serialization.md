@@ -1,7 +1,7 @@
 ---
 id: TASK-002-R6
 kind: remediation
-status: implemented
+status: ready
 spec: SPEC-oidc-production-readiness
 spec_revision: 4
 requirements: [REQ-016, INV-004, AC-007]

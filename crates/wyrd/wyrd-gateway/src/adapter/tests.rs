@@ -1233,6 +1233,25 @@ fn later() -> Instant {
     Instant::now() + Duration::from_secs(10)
 }
 
+/// The JSON payload of the stream's final frame, which must end with `suffix`
+/// and follow the last `prefix`.
+///
+/// Comparing parsed JSON keeps the terminal-error assertions independent of
+/// object key order, which `serde_json`'s `preserve_order` feature changes
+/// under workspace feature unification.
+///
+/// # Panics
+///
+/// Panics when `text` does not end in `prefix`, one JSON value, and `suffix`.
+fn terminal_json(text: &str, prefix: &str, suffix: &str) -> Value {
+    let frame = text
+        .strip_suffix(suffix)
+        .and_then(|body| body.rsplit_once(prefix))
+        .map(|(_, frame)| frame)
+        .unwrap_or_else(|| panic!("no terminal frame in {text}"));
+    serde_json::from_str(frame).unwrap_or_else(|error| panic!("{error}: {text}"))
+}
+
 /// Truncation at an event boundary appends the ingress protocol's terminal
 /// error: the `OpenAI` error frame and `[DONE]` for Chat Completions, and an
 /// `error` event for Responses and Anthropic. Usage stays unknown.
@@ -1273,9 +1292,14 @@ async fn truncation_at_an_event_boundary_ends_in_the_terminal_error() {
     let text = String::from_utf8(bytes).expect("utf-8");
     assert!(!aborted && end.outcome == GatewayCallOutcome::Failed);
     assert!(text.starts_with(CHAT_FRAME), "{text}");
-    assert!(
-        text.ends_with("\"code\":\"WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE\",\"message\":\"the provider stream ended before completing\",\"param\":null,\"type\":\"api_error\"}}\n\ndata: [DONE]\n\n"),
-        "{text}"
+    assert_eq!(
+        terminal_json(&text, "\n\ndata: ", "\n\ndata: [DONE]\n\n"),
+        json!({"error": {
+            "code": "WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE",
+            "message": "the provider stream ended before completing",
+            "param": null,
+            "type": "api_error",
+        }}),
     );
     let (bytes, aborted, end) = open_stream(
         &dispatch,
@@ -1289,9 +1313,14 @@ async fn truncation_at_an_event_boundary_ends_in_the_terminal_error() {
     .await;
     let text = String::from_utf8(bytes).expect("utf-8");
     assert!(!aborted && end.outcome == GatewayCallOutcome::Failed);
-    assert!(
-        text.ends_with("event: error\ndata: {\"code\":\"WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE\",\"message\":\"the provider stream ended before completing\",\"param\":null,\"type\":\"error\"}\n\n"),
-        "{text}"
+    assert_eq!(
+        terminal_json(&text, "event: error\ndata: ", "\n\n"),
+        json!({
+            "code": "WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE",
+            "message": "the provider stream ended before completing",
+            "param": null,
+            "type": "error",
+        }),
     );
 
     let (bytes, aborted, _) = open_stream(
@@ -1310,9 +1339,15 @@ async fn truncation_at_an_event_boundary_ends_in_the_terminal_error() {
     .await;
     let text = String::from_utf8(bytes).expect("utf-8");
     assert!(!aborted);
-    assert!(
-        text.ends_with("event: error\ndata: {\"error\":{\"message\":\"the provider stream ended before completing\",\"type\":\"api_error\"},\"type\":\"error\"}\n\n"),
-        "{text}"
+    assert_eq!(
+        terminal_json(&text, "event: error\ndata: ", "\n\n"),
+        json!({
+            "error": {
+                "message": "the provider stream ended before completing",
+                "type": "api_error",
+            },
+            "type": "error",
+        }),
     );
 }
 

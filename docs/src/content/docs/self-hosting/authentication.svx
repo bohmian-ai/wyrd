@@ -83,7 +83,7 @@ Retained keys are read from `WYRD_SEALING_RETAINED_KEYS_FILE` (one base64 key pe
 2. Make the new key the sealing key on every replica and move the old key into the retained keys. Roll the deployment.
 3. On boot, each replica reseals every stored secret that the new key did not seal and logs `sealed provider secret rewrap finished` with `rewrapped`, `current`, and `remaining` counts. The log never includes a key or a secret. Rewrapping is idempotent and safe for replicas to run at the same time.
 4. Once the roll in step 2 has finished and every serving replica seals with the new key, run one more verification pass by restarting any replica. Counts reported during the roll prove nothing: a replica still sealing with the old key can store a new secret after another replica counted zero. The post-roll pass also reseals any such late write.
-5. When that post-roll pass reports `remaining = 0`, no stored value needs the old key. Remove it from the retained keys and roll once more.
+5. When that post-roll pass reports `remaining = 0`, no stored secret needs the old key. Completed human logins waiting to be redeemed are not resealed and are not counted: each stays redeemable for two minutes after it is sealed, so one sealed with the old key needs it for that long. Wait at least two minutes after the post-roll pass started, then remove the old key from the retained keys and roll once more. Removing it sooner can fail a login that was completing during the rotation.
 
 If `remaining` stays above zero, the log names the table and tenant of each value no held key can open. Keep the old key until you have restored the right key or re-entered that secret, for example by staging and activating a new connection candidate.
 

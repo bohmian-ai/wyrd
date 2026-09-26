@@ -206,3 +206,29 @@ git diff --check
 
 If the implementation changes a generated contract despite the non-goal, stop:
 that is scope drift rather than a reason to regenerate it.
+
+## Implementation evidence
+
+Commits: `aef4ef3e3` (ID-token claims), `117231745` (refresh-family
+serialization).
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| AC-R4-01 | `crates/shared/wyrd-auth-verify/src/lib.rs`: `verify_external_against` requires `exp`/`iss`/`aud` and validates a present `nbf`; new `ExternalVerifier::verify_id_token_against` requires numeric `iat` ≤ now + skew. `callback.rs` and `platform_login.rs` route through it; `jwt_bearer.rs` stays on `verify_external`. | `tests::oidc_id_token_requires_binding_and_time_claims` (missing `iss`/`aud`/`iat`, string/future `iat`, future `nbf`, valid ID token, past `nbf`, workload without `iat` passes, workload future `nbf` refused); `tenant_callback_refusal_journey` adds a validly signed missing-`iat` token and asserts tenant C has no `auth_users`, `auth_user_identities`, `auth_user_roles`, or `auth_refresh_tokens` row, plus no completion | PASS |
+| AC-R4-02 | `wyrd-sql` `lock_refresh_family` (transaction-scoped advisory lock on tenant + principal kind + id); `RefreshTokens::execute` resolves the row, locks the family, then consumes or contains under the lock; issuance then takes the connection slot lock (family → connection). | `refresh::pg_tests::ancestor_replay_overlapping_rotation_revokes_successor` holds rotation of B open until the replay of A is observed waiting in `pg_locks`, commits both, then from a fresh transaction asserts C is `reuse_detected`, C rotation is `Reused`, and exactly one containment audit names A. It failed before the fix (C unrevoked). | PASS |
+| AC-R4-03 | No public contract, route, schema, or generated artifact changed; existing refresh, connection, and journey tests unchanged. | `test:principals:unit`, `test:principals:integration`, `test:sql`, `check:tenant-isolation`, `test:identity:journey` (27/27) | PASS |
+
+Commands (all exit 0 in this session): the three focused commands above,
+`mise run test:principals:unit`, `mise run test:principals:integration`,
+`mise run test:sql`, `mise run check:tenant-isolation`,
+`mise run test:identity:journey`, `mise run fmt`, `mise run lints`,
+`git diff --check`.
+
+Non-goals held: no new JWT library, verifier, claim DTO, skew setting, public
+API, table, trait, lease, retry, isolation change, or process-local lock.
+
+Limit: the refusal journey carries only the missing-`iat` claim case
+end to end. Adding missing-`iss` and future-`iat` there pushed the journey past
+the auth route's per-peer governor burst (20), so all in-process requests got
+`429`. The verifier unit test covers those cases on the shared owner that both
+OIDC paths use.

@@ -26,7 +26,6 @@ use wyrd_spec::auth::{
 };
 use wyrd_spec::error::WyrdError;
 use wyrd_sql::queries::auth::{LoginState, insert_login_state, redeem_login_completion};
-use wyrd_sql::queries::platform::tenant_resolver::resolve_by_slug_for_app;
 
 use crate::callback::discover_provider;
 use crate::connections::HumanConnections;
@@ -86,7 +85,9 @@ impl HumanConnections {
         let redirect_uri = self.require_callback()?.clone();
         self.require_keyring()?;
         let initiation = known_initiation(initiation)?;
-        let tenant = resolve_by_slug_for_app(self.postgres().app_pool(), &request.tenant_route_key)
+        let tenant = self
+            .postgres()
+            .resolve_tenant_slug(&request.tenant_route_key)
             .await
             .map_err(store_error)?
             .ok_or_else(login_unavailable)?;

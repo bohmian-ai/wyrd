@@ -37,7 +37,19 @@ use crate::state::AppState;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-/// Build auth routes.
+/// Build the tenant-plane auth router.
+///
+/// Mounts the four auth surfaces — human login initiation
+/// (`POST /auth/login`), the common OIDC provider callback
+/// (`GET /auth/callback`), credential exchange (`POST /auth/token`), and API
+/// key issuance (`POST /auth/issue-key`) — behind one shared per-peer-IP governor,
+/// so credential guessing and login-state churn draw on a single admission
+/// budget rather than one per route.
+///
+/// # Panics
+/// Panics when the static governor configuration is invalid (a zero period
+/// or burst). The values are compile-time constants, so this is an invariant
+/// rather than a runtime condition.
 pub fn auth_router() -> OpenApiRouter<AppState> {
     let auth_governor = Arc::new(
         GovernorConfigBuilder::default()
@@ -108,6 +120,7 @@ pub fn auth_router() -> OpenApiRouter<AppState> {
     security(()),
     tag = "Auth"
 )]
+#[tracing::instrument(level = "debug", skip_all)]
 async fn token(
     State(state): State<AppState>,
     headers: HeaderMap,

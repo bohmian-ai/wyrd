@@ -76,7 +76,7 @@ mod pg_tests {
     use wyrd_spec::auth::{IssuerUrl, LoginInitiation, Sha256Hex, TokenType};
     use wyrd_sql::queries::auth::{
         LoginState, consume_login_state, insert_login_state, insert_role, list_user_roles,
-        user_id_by_identity,
+        lock_refresh_family, user_id_by_identity,
     };
     use wyrd_sql::row_types::auth::HumanConnectionBinding;
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
@@ -574,6 +574,134 @@ mod pg_tests {
             2,
             "one exchange per login"
         );
+    }
+
+    /// Two concurrent callbacks for one existing User with disjoint mapped
+    /// roles serialize before role replacement, so neither issues the union.
+    ///
+    /// A test transaction holds the User's refresh-family lock while callback
+    /// `A` (group `alpha`) and then callback `B` (group `beta`) park on it, the
+    /// order observed through `pg_locks` rather than timing. Once released,
+    /// each token carries exactly its callback's mapped role, the durable set
+    /// is `B`'s, and each login stages one role-sync event.
+    ///
+    /// # Panics
+    /// Panics when a callback fails, a waiter is never observed, or any token
+    /// or the durable set carries authority another callback mapped.
+    #[tokio::test]
+    async fn concurrent_callbacks_replace_roles_without_union() {
+        const ALPHA: &str = "login_alpha_probe";
+        const BETA: &str = "login_beta_probe";
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let server = jwks_server().await;
+        let state = test_state_with_external(&fixture).await;
+        seed_role(&fixture, ALPHA).await;
+        seed_role(&fixture, BETA).await;
+        let trusted = trusted_issuer_with_jwks(
+            tenant,
+            jwks_uri(&server),
+            HashMap::from([
+                ("alpha".to_owned(), vec![ALPHA.to_owned()]),
+                ("beta".to_owned(), vec![BETA.to_owned()]),
+            ]),
+            Vec::new(),
+        );
+        let binding = committed_active_binding(&fixture).await;
+        let service = authorization_exchange_service(&state);
+        let login = |hash: Sha256Hex, login: LoginState, group: &'static str| {
+            let service = &service;
+            let trusted = &trusted;
+            async move {
+                let token = encode_external_token(&external_claims(
+                    EXTERNAL_AUDIENCE,
+                    "nonce",
+                    None,
+                    &[group],
+                ));
+                service
+                    .finish_id_token_exchange(
+                        &hash,
+                        trusted,
+                        &login,
+                        &advertised(),
+                        &token,
+                        "req-race",
+                    )
+                    .await
+                    .expect("login completes");
+                hash
+            }
+        };
+        let (first, first_login) = pending_login(&fixture, state_hash(30), binding, "nonce").await;
+        login(first, first_login, "none").await;
+        let user = user_for(&fixture, EXTERNAL_SUBJECT).await.expect("user");
+        let (hash_a, login_a) = pending_login(&fixture, state_hash(31), binding, "nonce").await;
+        let (hash_b, login_b) = pending_login(&fixture, state_hash(32), binding, "nonce").await;
+
+        let mut gate = fixture.tenant_conn().await.expect("gate conn opens");
+        lock_refresh_family(&mut gate, "user", user)
+            .await
+            .expect("the gate holds the family lock");
+        let (hash_a, hash_b, ()) = tokio::join!(
+            login(hash_a, login_a, "alpha"),
+            async {
+                wait_for_lock_waiters(&fixture, 1).await;
+                login(hash_b, login_b, "beta").await
+            },
+            async {
+                wait_for_lock_waiters(&fixture, 2).await;
+                gate.commit().await.expect("the gate releases");
+            }
+        );
+
+        let verifier = state.auth.token_verifier.clone().expect("token verifier");
+        for (hash, expected) in [(hash_a, ALPHA), (hash_b, BETA)] {
+            let session = redeem(&state, tenant, &hash).await.expect("redeems");
+            let access = SecretString::from(session.access_token.expose().to_owned());
+            let roles = verifier
+                .verify(&access, &tenant)
+                .expect("the session verifies")
+                .principal
+                .roles;
+            assert_eq!(role_set(roles), BTreeSet::from([expected.to_owned()]));
+        }
+        assert_eq!(user_roles(&fixture, user).await, vec![BETA.to_owned()]);
+        assert_eq!(
+            operation_rows(&fixture, "auth.user.roles.sync").await.len(),
+            2,
+            "each login changed the durable set once"
+        );
+    }
+
+    /// Wait until `count` backends of this test database wait on a lock.
+    ///
+    /// The gate's family lock parks each callback: before role replacement
+    /// once the callback serializes, or — without that — the first at the
+    /// family lock and the second behind the first's audit chain head, so the
+    /// count observes either ordering without timing.
+    ///
+    /// # Panics
+    /// Panics when `pg_stat_activity` cannot be read or the waiters never
+    /// appear.
+    async fn wait_for_lock_waiters(fixture: &PgFixture, count: i64) {
+        tokio::time::timeout(StdDuration::from_secs(30), async {
+            loop {
+                let waiting: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM pg_stat_activity
+                      WHERE datname = current_database() AND wait_event_type = 'Lock'",
+                )
+                .fetch_one(fixture.app_pool())
+                .await
+                .expect("lock state reads");
+                if waiting >= count {
+                    break;
+                }
+                tokio::time::sleep(StdDuration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the callbacks park behind the gate");
     }
 
     /// When the role-sync event cannot be staged, the role change, session,

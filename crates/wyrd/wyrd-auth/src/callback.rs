@@ -27,7 +27,7 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{AuditDetail, AuditEvent, AuditOutcome};
 use wyrd_sql::queries::auth::{
     LoginState, complete_login_state, consume_login_state, delete_user, insert_user,
-    replace_user_roles, upsert_user_identity, user_id_by_identity,
+    lock_refresh_family, replace_user_roles, upsert_user_identity, user_id_by_identity,
 };
 use wyrd_sql::{SqlError, TenantConn, WyrdPostgres};
 
@@ -178,8 +178,12 @@ impl AuthorizationCodeExchange {
     /// rules for the bound client ([`verify_authorized_party`]). The tenant's
     /// Active connection is then re-read and must still be the exact revision,
     /// issuer, and client the login bound. One tenant transaction then
-    /// resolves the user by (issuer, `sub`) only, replaces the user's roles
-    /// with those the verified groups map to (unmapped groups and unknown role
+    /// resolves the user by (issuer, `sub`) only and takes the User's
+    /// tenant-qualified refresh-family lock, held through commit and taken
+    /// before the connection slot lock as every refresh path orders them, so
+    /// concurrent callbacks for one User serialize and each issued session and
+    /// the final durable roles equal one callback's mapping. It then replaces
+    /// the user's roles with those the verified groups map to (unmapped groups and unknown role
     /// names grant nothing; connection default roles are never applied to
     /// human login) and, when that changed the user's durable roles, stages
     /// one allowed `auth.user.roles.sync` audit event for the User, issues the
@@ -233,6 +237,12 @@ impl AuthorizationCodeExchange {
         )
         .await
         .map_err(store_error)?;
+        // Concurrent callbacks for this User would otherwise each replace
+        // roles unseen by the other and the later one mint their union; the
+        // family lock held to commit makes one callback's set the whole truth.
+        lock_refresh_family(&mut conn, "user", principal_id)
+            .await
+            .map_err(store_error)?;
         let roles = role_names_to_refs(trusted, &verified.groups)?;
         // The provider just asserted this human's authority, and nothing else
         // in Wyrd grants a user a role. Recording it here is what makes the

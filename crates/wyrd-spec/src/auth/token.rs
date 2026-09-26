@@ -91,12 +91,13 @@ impl TokenAudience {
 pub struct TokenResponse {
     /// Signed Wyrd access token.
     pub access_token: SecretBearer,
-    /// Refresh token. Present only for credentials that issue one: a human OIDC
-    /// login completed through the common callback, API-key exchange
-    /// (`wyrd_api_key`), and refresh rotation (`refresh_token`). Absent for
-    /// the workload `jwt-bearer` and `token-exchange` (delegation) grants,
-    /// whose clients re-present their durable credential to obtain a fresh
-    /// access token instead of holding a long-lived refresh secret.
+    /// Refresh token. Present only for human sessions: a human OIDC login
+    /// completed through the common callback and human refresh rotation
+    /// (`refresh_token`). Absent for every machine grant — API-key exchange
+    /// (`wyrd_api_key`), the workload `jwt-bearer` grant, and `token-exchange`
+    /// delegation — whose clients re-present their durable credential to
+    /// obtain a fresh access token instead of holding a long-lived refresh
+    /// secret.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_token: Option<SecretBearer>,
     /// Token type.

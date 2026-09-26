@@ -3,8 +3,8 @@
 use secrecy::ExposeSecret;
 use sqlx::PgPool;
 use sqlx::types::Uuid;
-use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Sha256Hex;
+use wyrd_spec::{DataTenantId, TenantSlug};
 
 use crate::dsn::ResolvedDsns;
 use crate::operator_pool::OperatorPool;
@@ -145,6 +145,25 @@ impl WyrdPostgres {
         let result = TenantConn::acquire(&self.app, data_tenant_id).await;
         lifecycle.finish(&result);
         result
+    }
+
+    /// Resolve a URL tenant slug to its tenant id on the app pool.
+    ///
+    /// Pre-authentication callers such as begin-login hold only the typed
+    /// slug; this delegates to [`crate::queries::platform::tenant_resolver::resolve_by_slug_for_app`]
+    /// with the private runtime app pool, whose `wyrd_app` role alone is
+    /// granted the SECURITY DEFINER slug bridge, so pool selection never
+    /// leaves this owner. Returns `None` when the slug is unknown, suspended,
+    /// or deleted.
+    ///
+    /// # Errors
+    /// Returns the errors of
+    /// [`crate::queries::platform::tenant_resolver::resolve_by_slug_for_app`].
+    pub async fn resolve_tenant_slug(
+        &self,
+        slug: &TenantSlug,
+    ) -> Result<Option<DataTenantId>, SqlError> {
+        crate::queries::platform::tenant_resolver::resolve_by_slug_for_app(&self.app, slug).await
     }
 
     /// Resolve the tenant owning an unconsumed, unexpired login state.

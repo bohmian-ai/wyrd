@@ -1,7 +1,7 @@
 ---
 id: TASK-002-R10
 kind: remediation
-status: ready
+status: implemented
 spec: SPEC-oidc-production-readiness
 spec_revision: 5
 requirements: [REQ-005, REQ-006, REQ-007, REQ-008, REQ-009, REQ-011, REQ-013, REQ-014, REQ-015, REQ-016, REQ-017, INV-001, INV-002, INV-003, INV-004, AC-002, AC-003, AC-004, AC-005, AC-006, AC-007]
@@ -125,3 +125,16 @@ Record the exact diff inspection and command results as implementation
 evidence. A later task review must reassess the complete
 `3fc085acf5b3a710d5dc80892bd2e664b3db6174`-to-new-candidate range, not only
 the R10 remediation diff.
+
+## Implementation evidence
+
+Commit `1c6b86c65` changes only the two cited rustdoc blocks. Its diff was
+inspected with `git show 1c6b86c65`, and no executable or test lines changed.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| `new_grant_variants_reject_unknown_fields` rustdoc names the surviving `jwt-bearer` and `refresh_token` variants; the body is unchanged | `1c6b86c65` | diff inspection | PASS |
+| The auth-routes module rustdoc names login initiation, token exchange, OIDC callback, and Card-bound API-key issuance | `1c6b86c65` (`wyrd-server/src/components/auth/routes.rs`) | diff inspection | PASS |
+| The subdiff contains only the two comment blocks | `git show --stat 1c6b86c65` | diff inspection | PASS |
+| FIND-TASK-002-1..22 remain closed | no reverting change in the R10 range | `mise run lints`, `mise run test:identity:journey` (27/27) | PASS |
+| Hygiene | — | `git diff --check`, `mise run fmt`, `mise run lints` | PASS |

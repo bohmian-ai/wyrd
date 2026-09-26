@@ -1,7 +1,7 @@
 ---
 id: TASK-002-R10-HUMAN
 kind: remediation
-status: ready
+status: implemented
 parent_task: TASK-002
 spec: SPEC-oidc-production-readiness
 spec_revision: 5
@@ -118,3 +118,70 @@ findings in the parent remediation packet.
   in-flight completions. Record TASK-003/004 initiator checks as pending
   until their real browser and CLI journeys pass; do not count earlier green
   gates or the R10 verdict as proof of this new work.
+
+## Implementation evidence
+
+Commits: `454bdb90e` (item 1), `b0899f651` (item 2), `fa24a79ac` (item 3),
+`0de851078` (item 4), `afe0605b2` (identity-journey gate fix). Postgres-backed tests were run through
+`scripts/postgres/with-test-postgres.sh -- mise exec -- cargo nextest run --locked ...`.
+
+### Source inventory
+
+| Site | Before | Surviving owner |
+|---|---|---|
+| Tenant login `HumanConnections::begin_login` (`wyrd-auth/src/login.rs`) | `WyrdPostgres::resolve_tenant_slug` | unchanged: `WyrdPostgres::resolve_tenant_slug` |
+| Workload exchange `resolve_tenant_slug` (`wyrd-server/src/auth/jwt_bearer.rs`) | `resolve_by_slug_for_app(&PgPool)` | `WyrdPostgres::resolve_tenant_slug` |
+| Boot `resolve_implicit_tenant` / `seed_trusted_issuers` / `seed_workload_bindings` (`wyrd-server/src/boot/issuer.rs`) | `&PgPool` | `&WyrdPostgres` (`resolve_tenant_slug`, `tenant_conn`) |
+| `WyrdPostgres::login_state_tenant` (`wyrd-sql/src/postgres.rs`) | `resolve_tenant_slug` | unchanged |
+| Resolver query `tenant_resolver::resolve_by_slug` | `pub resolve_by_slug_for_app(&PgPool)` on the app pool | `pub(crate) resolve_by_slug(&OperatorPool)`; `WyrdPostgres::resolve_tenant_slug` refuses with `InsufficientPrivilege` when no operator pool is configured |
+| `PgWorkloadBindingResolver` field (`wyrd-auth/src/pg_resolvers.rs`) | `PgPool` | `WyrdPostgres` |
+| `record_auth_audit_best_effort`, `audit_scope_mint_failure_best_effort` (`wyrd-auth`) | `&PgPool` | `&WyrdPostgres` |
+| Storage admin `reap_idempotency_keys`, `expired_uploads_batch` (`wyrd-sql/src/queries/storage/admin`) | `&PgPool` | `&OperatorPool` |
+| Raw `PgPool` still in `wyrd-server/src`: `postgres.rs` (pool owner), `test_support.rs` (cfg(test)), `components/eval/resolver.rs`, `audit/mod.rs` | — | Outside the auth/boot/SQL-query scope of this packet; the new `check_sql_capability_signatures` covers the wyrd-sql and vala-sql query dirs, `wyrd-auth/src`, and `wyrd-server` `auth/`, `components/auth/`, `boot/` |
+| User authority writer: callback role sync (`wyrd-auth/src/callback.rs`) | family lock before role replacement | unchanged. Identity resolution precedes the lock because the principal id is not known until then. |
+| User authority writer: `issue_human_session` (`wyrd-auth/src/issuance.rs`) | family then connection slot | unchanged |
+| User authority writer: refresh rotation (`wyrd-auth/src/refresh.rs`) | hash lookup finds the family, then lock, then consume | unchanged |
+| User authority writer: revocation (`wyrd-auth/src/revoke.rs`) | read User, then lock | family lock **before** `user_by_id` |
+| Lock-wait test helpers | inline pid loop in `refresh.rs` | reuses `revoke::pg_tests::wait_for_advisory_lock_wait`. `wait_for_connection_slot_waiter` (keyed, unknown pid) and the server's count-based `wait_for_lock_waiters` observe different conditions and remain. |
+
+### Acceptance
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| One slug resolver on the operator pool, fail closed without it | `wyrd-sql/src/postgres.rs`, `queries/platform/tenant_resolver.rs` | `-p wyrd-sql --lib -E 'test(=postgres::telemetry_tests::resolve_tenant_slug_without_operator_pool_fails_closed)'`; `-p wyrd-sql --test pg_tenant_slug -E 'test(=pg_tests::resolver_answers_only_active_slugs)'` | PASS |
+| No raw pool in auth/boot/SQL-query signatures; the check enforces it | `scripts/check_tenant_isolation.py` (`check_sql_capability_signatures`, stale allowlists deleted) | `mise run check:tenant-isolation` passes and fails on an injected `&PgPool`; `mise run check:from-pools-allowlist` passes (`boot/issuer.rs` cfg(test) entry added) | PASS |
+| Callers compile and behave on `WyrdPostgres` | `wyrd-auth`, `wyrd-server` boot/auth, `wyrd-storage` sweeper, `wyrd-testing` | wyrd-sql lib (76), wyrd-auth pg_resolvers/card_scope/audit (29), wyrd-server `boot::issuer` + `auth::jwt_bearer` (17), `-p wyrd-storage --test pg_sweeper` (2) | PASS |
+| Shared JWT correction; a valid workload assertion succeeds; missing iss/aud and future nbf are refused | `wyrd-auth-verify/src/lib.rs` | `-p wyrd-auth-verify --lib -E 'test(=tests::oidc_id_token_requires_binding_and_time_claims) \| test(=tests::verify_external_happy_path_returns_verified_identity_not_principal)'` | PASS |
+| Family lock before connection lock and before reading authority; both orders; no role union | `wyrd-auth/src/revoke.rs` | `-p wyrd-auth --lib` revoke `pg_tests` (10), the issuance both-orders test, `refresh` `ancestor_replay_overlapping_rotation_revokes_successor`; `-p wyrd-server --lib -E 'test(=auth::callback::pg_tests::concurrent_callbacks_replace_roles_without_union)'` | PASS |
+| REQ-005: callback issuance and sealed completion are atomic | `wyrd-auth/src/callback.rs` `finish_id_token_exchange` (single transaction) | `-p wyrd-server --lib -E 'test(=auth::callback::pg_tests::a_failed_role_sync_audit_rolls_back_the_whole_login)'` | PASS |
+| REQ-005: one-time redemption, bound to tenant and initiator | `wyrd-sql` `REDEEM_LOGIN_COMPLETION_SQL` | `-p wyrd-auth --lib -E 'test(=login::pg_tests::a_completed_login_is_redeemed_once_by_its_binding)'`; `-p wyrd-sql --test pg_login_state` tenant confinement | PASS |
+| REQ-005: expiry, retained-key rotation, unusable key fails closed | `wyrd-auth/src/login.rs` | `-p wyrd-auth --lib -E 'test(=login::pg_tests::completions_survive_rotation_and_fail_closed_on_unusable_or_expired)'` | PASS |
+| REQ-005: a missing key fails closed for a secretless provider at activation and login | `HumanConnections::activate` now calls `require_keyring` first | `-p wyrd-auth --lib -E 'test(=connections::probe_tests::activation_without_a_sealing_key_is_refused_for_a_secretless_provider) \| test(=login::pg_tests::begin_without_a_sealing_key_is_refused_before_any_state)'` | PASS |
+| Provider-secret rotation proof and machine independence are preserved | unchanged: `wyrd-crypt` `keyring_rotation_rewraps_and_retires_the_old_key`, boot `keyless_boot_refuses_only_when_ciphertext_is_stored`, `tenant_machine_independence_journey` | `mise run test:identity:journey` | PASS (27/27) |
+| Email non-unique; the provider switch creates a separate User | migration `20260925000001_auth_login_state_binding.sql` drops `auth_users_data_tenant_id_email_key` | `tenant_provider_switch_journey` in `mise run test:identity:journey` | PASS (27/27) |
+| R10 rustdoc findings 23/24 | commit `1c6b86c65` | `mise run fmt`, `mise run lints` | PASS |
+| Format and diff hygiene | — | `mise run fmt`, `git diff --check` | PASS |
+
+### Pending and non-goals
+
+- TASK-003 (BFF authenticated flow-cookie redemption) and TASK-004 (CLI
+  verifier-held claim) initiator checks are **pending**. The BFF and CLI
+  surfaces were not built here, and no earlier gate counts as their proof.
+- The gateway and Forge test fixes (`3b3c0a6b7`, `0fce08515`, `194888ef9`,
+  `1c6e0c054`) and the bifrost format commit (`dacd7d04b`) are isolated
+  commits from earlier rounds that were needed for green lanes. No further
+  incidental changes were made in this remediation.
+- `afe0605b2` is a required gate fix. `tenant_callback_refusal_journey` makes
+  more `/auth/*` calls from the single test peer than the shared auth
+  governor's burst of 20, so step 6 was refused with `429` by admission. The
+  journey helpers `begin_login` and `callback_reply` now honor
+  `retry-after`, as a real client does. The governor refuses before any
+  handler runs, so no login state is consumed. Production behavior is
+  unchanged. Proof: `WYRD_IDENTITY_FILTER=tenant_callback_refusal_journey mise run test:identity:journey`, then the full
+  `mise run test:identity:journey` (27/27).
+- Gates: `mise run fmt`, `mise run lints` (exit 0),
+  `mise run check:tenant-isolation`, `mise run check:from-pools-allowlist`,
+  `git diff --check`.
+- Operational risk: tenant login and workload exchange now require the
+  `wyrd_platform_admin` operator pool (its DSN is optional for external
+  Postgres), and that pool defaults to 2 connections.

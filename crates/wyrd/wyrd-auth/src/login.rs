@@ -591,7 +591,7 @@ mod pg_tests {
             redirect_uri: "https://wyrd.example.com/auth/callback".to_owned(),
             code_verifier: SecretString::from("verifier"),
             nonce: "nonce".to_owned(),
-            initiation: LoginInitiation::Browser(flow.clone()),
+            initiation: LoginInitiation::Browser(flow),
         };
         let token: TokenResponse = serde_json::from_value(serde_json::json!({
             "access_token": format!("access-{label}"),
@@ -655,7 +655,7 @@ mod pg_tests {
 
         let dropped = connections(&fixture, Some(Arc::new(SealingKeyring::new(new()))));
         let error = dropped
-            .redeem_completion(tenant, LoginInitiation::Browser(orphaned.clone()))
+            .redeem_completion(tenant, LoginInitiation::Browser(orphaned))
             .await
             .expect_err("a completion under a dropped key is unusable");
         assert!(matches!(error, WyrdError::Internal { .. }), "{error:?}");

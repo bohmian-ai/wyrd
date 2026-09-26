@@ -1244,10 +1244,12 @@ fn later() -> Instant {
 ///
 /// Panics when `text` does not end in `prefix`, one JSON value, and `suffix`.
 fn terminal_json(text: &str, prefix: &str, suffix: &str) -> Value {
-    let frame = text
+    let Some((_, frame)) = text
         .strip_suffix(suffix)
         .and_then(|body| body.rsplit_once(prefix))
-        .map_or_else(|| panic!("no terminal frame in {text}"), |(_, frame)| frame);
+    else {
+        panic!("no terminal frame in {text}");
+    };
     serde_json::from_str(frame).unwrap_or_else(|error| panic!("{error}: {text}"))
 }
 

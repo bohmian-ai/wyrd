@@ -2348,7 +2348,8 @@ mod tests {
 
     /// ID-token verification refuses a signed token that omits or misstates a
     /// binding, time, or Subject Identifier claim, while a valid ID token passes and a workload
-    /// assertion without `iat` stays valid on the generic entry.
+    /// assertion without `iat` stays valid on the generic entry. The shared
+    /// workload entry still refuses a missing `iss` or `aud` or a future `nbf`.
     #[tokio::test]
     async fn oidc_id_token_requires_binding_and_time_claims() {
         let server = MockServer::start().await;
@@ -2415,5 +2416,13 @@ mod tests {
                 .is_err(),
             "a workload assertion with a future nbf is refused"
         );
+        for claim in ["iss", "aud"] {
+            assert!(
+                v.verify_external(&tid, &variant(claim, None))
+                    .await
+                    .is_err(),
+                "a workload assertion missing {claim} is refused (RFC 7523 §3)"
+            );
+        }
     }
 }

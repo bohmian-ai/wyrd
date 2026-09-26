@@ -222,6 +222,10 @@ mod tests {
         assert!(!schema.contains("authorization_code"));
     }
 
+    /// Proves the surviving `jwt-bearer` and `refresh_token` request variants
+    /// reject unknown fields now that the public authorization-code grant is
+    /// retired, so an extra member cannot smuggle input past the typed
+    /// token-exchange contract.
     #[test]
     fn new_grant_variants_reject_unknown_fields() {
         let jwt_bearer = serde_json::json!({

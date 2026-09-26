@@ -1,5 +1,5 @@
-//! HTTP routes for the tenant auth surfaces: token exchange, OIDC callback,
-//! and Card-bound API key issuance.
+//! HTTP routes for the tenant auth surfaces: tenant human login initiation,
+//! token exchange, OIDC callback, and Card-bound API key issuance.
 
 use axum::Json;
 use axum::extract::{Extension, Query, State};

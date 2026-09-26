@@ -3162,9 +3162,10 @@ async fn begin_mock_login(srv: &WyrdTestServer, slug: &str) -> (Sha256Hex, Strin
 ///   5. against a mock provider: a nonce, issuer, audience, signature, or
 ///      algorithm mismatch, a multi-audience token without `azp`, an `azp`
 ///      naming another client, a validly signed token whose algorithm
-///      discovery did not advertise, and a provider outage are refused,
-///      leaving no completion, while a valid multi-audience token whose `azp`
-///      names the client completes;
+///      discovery did not advertise, an `HS256` token even when discovery
+///      advertises `HS256` beside an asymmetric algorithm, and a provider
+///      outage are refused, leaving no completion, while a valid
+///      multi-audience token whose `azp` names the client completes;
 ///   6. an injected audit-staging failure issues nothing: no completion and
 ///      no refresh row.
 ///
@@ -3457,21 +3458,40 @@ async fn tenant_callback_refusal_journey() {
             "{label}: no completion is stored"
         );
     }
-    mount_mock_provider(&mock, id_token_reply("unused")).await;
-    let (flow, state, nonce) = begin_mock_login(&srv, "test-tenant-3").await;
-    mount_mock_provider_advertising(
-        &mock,
-        id_token_reply(&sign_id_token(&eddsa, &claims(&nonce), MOCK_SIGNING_KEY)),
-        &["RS256"],
-    )
-    .await;
-    let (status, body) = finish_callback(&srv, "mock-code", &state).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "unadvertised alg: {body}");
-    assert_eq!(response_code(&body), "WYRD_AUTH_401_INVALID_TOKEN");
-    assert!(
-        redeem(&srv, tenant_c, &flow).await.is_err(),
-        "an unadvertised algorithm stores no completion"
-    );
+    // A validly signed token whose algorithm discovery did not advertise is
+    // refused by the advertised-set check; `HS256` advertised beside an
+    // asymmetric algorithm (discovery requires one) passes that check and is
+    // refused by the shared verifier's symmetric-algorithm guard.
+    let hmac_key = jsonwebtoken::EncodingKey::from_secret(MOCK_SIGNING_X.as_bytes());
+    let algorithm_cases = [
+        ("unadvertised EdDSA", &eddsa, None, &["RS256"][..]),
+        (
+            "advertised HS256",
+            &hs256,
+            Some(&hmac_key),
+            &["EdDSA", "HS256"][..],
+        ),
+    ];
+    for (label, header, hmac, advertised) in algorithm_cases {
+        mount_mock_provider(&mock, id_token_reply("unused")).await;
+        let (flow, state, nonce) = begin_mock_login(&srv, "test-tenant-3").await;
+        let id_token = match hmac {
+            Some(key) => jsonwebtoken::encode(header, &claims(&nonce), key).expect("signs"),
+            None => sign_id_token(header, &claims(&nonce), MOCK_SIGNING_KEY),
+        };
+        mount_mock_provider_advertising(&mock, id_token_reply(&id_token), advertised).await;
+        let (status, body) = finish_callback(&srv, "mock-code", &state).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{label}: {body}");
+        assert_eq!(
+            response_code(&body),
+            "WYRD_AUTH_401_INVALID_TOKEN",
+            "{label}: {body}"
+        );
+        assert!(
+            redeem(&srv, tenant_c, &flow).await.is_err(),
+            "{label}: no completion is stored"
+        );
+    }
     mount_mock_provider(&mock, id_token_reply("unused")).await;
     let (flow, state, nonce) = begin_mock_login(&srv, "test-tenant-3").await;
     let mut with_azp = claims(&nonce);

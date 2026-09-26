@@ -7,7 +7,9 @@ use schemars::JsonSchema;
 use schemars::r#gen::SchemaGenerator;
 use schemars::schema::{InstanceType, Metadata, Schema, SchemaObject, StringValidation};
 use serde::{Deserialize, Deserializer, Serialize};
-
+use sha2::Digest as _;
+#[cfg(feature = "server")]
+use utoipa::openapi::schema::{ObjectBuilder, Schema as OpenApiSchema, Type};
 use uuid::Uuid;
 
 use crate::auth::SecretBearer;
@@ -213,7 +215,6 @@ impl Sha256Hex {
     /// Digest `bytes` with SHA-256.
     #[must_use]
     pub fn digest(bytes: &[u8]) -> Self {
-        use sha2::Digest as _;
         Self(sha2::Sha256::digest(bytes).into())
     }
 
@@ -232,18 +233,37 @@ impl From<[u8; 32]> for Sha256Hex {
 }
 
 impl fmt::Display for Sha256Hex {
+    /// Write the canonical wire form: the 32 raw bytes as 64 lowercase
+    /// hexadecimal characters, the only form [`Sha256Hex::new`] accepts.
+    ///
+    /// # Errors
+    /// Returns [`fmt::Error`] only when the underlying formatter's writer
+    /// fails; encoding itself cannot fail.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&hex::encode(self.0))
     }
 }
 
 impl Serialize for Sha256Hex {
+    /// Serialize as the canonical lowercase-hex string produced by
+    /// [`fmt::Display`], so the wire form round-trips through
+    /// [`Deserialize`].
+    ///
+    /// # Errors
+    /// Returns the serializer's error when it cannot accept a string.
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.collect_str(self)
     }
 }
 
 impl<'de> Deserialize<'de> for Sha256Hex {
+    /// Deserialize from a string and validate it with [`Sha256Hex::new`], so
+    /// the wire accepts exactly the canonical lowercase-hex form.
+    ///
+    /// # Errors
+    /// Returns the deserializer's error when the input is not a string, and a
+    /// custom error carrying [`Sha256HexError`] when the string is not exactly
+    /// 64 lowercase hexadecimal characters.
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -254,10 +274,15 @@ impl<'de> Deserialize<'de> for Sha256Hex {
 }
 
 impl JsonSchema for Sha256Hex {
+    /// Name the schema `Sha256Hex` so generated contracts reference one shared
+    /// definition.
     fn schema_name() -> String {
         "Sha256Hex".to_owned()
     }
 
+    /// Describe the canonical wire form as a 64-character string constrained
+    /// by [`SHA256_HEX_PATTERN`], mirroring the validation in
+    /// [`Sha256Hex::new`] and the `OpenAPI` projection.
     fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
         Schema::Object(SchemaObject {
             metadata: Some(Box::new(Metadata {
@@ -277,10 +302,11 @@ impl JsonSchema for Sha256Hex {
 
 #[cfg(feature = "server")]
 impl utoipa::PartialSchema for Sha256Hex {
-    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
-        use utoipa::openapi::schema::{ObjectBuilder, Schema, Type};
-
-        utoipa::openapi::RefOr::T(Schema::Object(
+    /// Describe the canonical wire form for `OpenAPI` with the same length,
+    /// pattern, and description as the JSON Schema projection, so both
+    /// generated contracts agree with [`Sha256Hex::new`].
+    fn schema() -> utoipa::openapi::RefOr<OpenApiSchema> {
+        utoipa::openapi::RefOr::T(OpenApiSchema::Object(
             ObjectBuilder::new()
                 .schema_type(Type::String)
                 .min_length(Some(64))

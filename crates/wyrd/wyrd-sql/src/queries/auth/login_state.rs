@@ -26,6 +26,13 @@ const PURGE_EXPIRED_LOGIN_STATE_SQL: &str = r#"
      WHERE expires_at <= statement_timestamp()
 "#;
 
+/// Begin a login: record one unconsumed row owned by the RLS tenant.
+///
+/// Forced RLS's `WITH CHECK` refuses a `data_tenant_id` other than the
+/// connection's tenant. `ON CONFLICT DO NOTHING` never overwrites: a reused
+/// state hash, browser flow hash, or CLI handoff id inserts nothing, so one
+/// binding names at most one login. `PostgreSQL` derives `expires_at` from the
+/// bound lifetime in seconds.
 const INSERT_LOGIN_STATE_SQL: &str = r#"
     INSERT INTO wyrd.auth_login_state (
         state_hash, data_tenant_id, connection_id, connection_revision, issuer,
@@ -36,6 +43,12 @@ const INSERT_LOGIN_STATE_SQL: &str = r#"
     ON CONFLICT DO NOTHING
 "#;
 
+/// Consume a login's state exactly once at the callback, before provider IO.
+///
+/// Only an unconsumed, unexpired row visible under forced RLS matches, and
+/// setting `consumed_at` makes every replay of the same state match nothing.
+/// Returns the pinned connection, PKCE verifier, nonce, and initiation binding
+/// the callback needs to finish the exchange.
 const CONSUME_LOGIN_STATE_SQL: &str = r#"
     UPDATE wyrd.auth_login_state
        SET consumed_at = statement_timestamp()
@@ -46,6 +59,11 @@ const CONSUME_LOGIN_STATE_SQL: &str = r#"
               code_verifier, nonce, browser_flow_hash, cli_handoff_id
 "#;
 
+/// Attach the sealed session to a consumed login, once.
+///
+/// Matches only a consumed row of the RLS tenant with no completion yet, so a
+/// completion is written at most once and never before consumption. Resets
+/// `expires_at` to a fresh, short `PostgreSQL`-derived redemption window.
 const COMPLETE_LOGIN_STATE_SQL: &str = r#"
     UPDATE wyrd.auth_login_state
        SET completion_sealed = $2,
@@ -55,6 +73,11 @@ const COMPLETE_LOGIN_STATE_SQL: &str = r#"
        AND completion_sealed IS NULL
 "#;
 
+/// Redeem a completed login once by its initiation binding.
+///
+/// Deletes the RLS tenant's completed, unexpired row bound to either the
+/// browser flow hash or the CLI handoff id and returns its sealed session.
+/// Deletion is the one-use guarantee: a second redemption matches nothing.
 const REDEEM_LOGIN_COMPLETION_SQL: &str = r#"
     DELETE FROM wyrd.auth_login_state
      WHERE (browser_flow_hash = $1 OR cli_handoff_id = $2)

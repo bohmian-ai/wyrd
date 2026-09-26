@@ -10,6 +10,8 @@ use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::Value;
 use sqlx::PgPool;
 use url::Url;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, ResponseTemplate};
 use wyrd_auth_check::AuthzCheckRequest;
 use wyrd_auth_check::response::AuthzCheckDecision;
 use wyrd_auth_oidc::IssuerConfigResolver;
@@ -3049,8 +3051,6 @@ async fn mount_mock_provider_advertising(
     token_response: wiremock::ResponseTemplate,
     algorithms: &[&str],
 ) {
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, ResponseTemplate};
     server.reset().await;
     let issuer = server.uri();
     Mock::given(method("GET"))
@@ -3079,6 +3079,11 @@ async fn mount_mock_provider_advertising(
 }
 
 /// Sign `claims` as an ID token with `header` and the Ed25519 `pem`.
+///
+/// # Panics
+/// Panics when `pem` is not a valid Ed25519 private key in PEM form, or when
+/// `jsonwebtoken` cannot encode the token, such as when `header` names an
+/// algorithm the Ed25519 key cannot sign with.
 fn sign_id_token(header: &jsonwebtoken::Header, claims: &Value, pem: &str) -> String {
     let key = jsonwebtoken::EncodingKey::from_ed_pem(pem.as_bytes()).expect("key parses");
     jsonwebtoken::encode(header, claims, &key).expect("token signs")
@@ -3359,6 +3364,9 @@ async fn tenant_callback_refusal_journey() {
     eddsa.kid = Some("mock-1".to_owned());
     let mut hs256 = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
     hs256.kid = Some("mock-1".to_owned());
+    /// Builds the mock provider's token-endpoint response for one refusal
+    /// case from the nonce the login began with, so each case can reply with a
+    /// forged or failing token exchange.
     type Mutation<'a> = Box<dyn Fn(&str) -> wiremock::ResponseTemplate + 'a>;
     let cases: Vec<(&str, Mutation, StatusCode, &str)> = vec![
         (

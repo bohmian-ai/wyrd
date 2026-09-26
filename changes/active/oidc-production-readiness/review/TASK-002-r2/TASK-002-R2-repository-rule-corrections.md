@@ -74,3 +74,32 @@ Static inspection of the cited items is the direct closure proof. No new runtime
 - `git diff --check`
 
 Because the correction must remain documentation/import-only, rerun a broader identity or Postgres lane only if the implementation diff changes executable behavior or generated contracts. Any such change is outside this remediation and must be removed rather than justified by new proof.
+
+## Implementation evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| FIND-8: cited items carry substantive rustdoc; fallible projections have `# Errors`; `sign_id_token` has `# Panics` | `crates/wyrd-spec/src/auth/oidc.rs` (`Sha256Hex` `Display`, `Serialize`, `Deserialize`, `JsonSchema`, `PartialSchema`); `crates/wyrd/wyrd-sql/src/queries/auth/login_state.rs` (insert/consume/complete/redeem SQL constants); `crates/wyrd/wyrd-server/tests/identity_e2e.rs` (`sign_id_token`, `Mutation`) | static inspection; `mise run lints` | PASS |
+| FIND-9: no local `use` in the three cited bodies; imports at module top with feature gating/aliasing | `oidc.rs` top block (`sha2::Digest as _`; `#[cfg(feature = "server")]` Utoipa `ObjectBuilder`, `Schema as OpenApiSchema`, `Type`); `identity_e2e.rs` top block (Wiremock matchers, `Mock`, `ResponseTemplate`) | `mise run lints`; `mise run codegen:check` (no generated drift) | PASS |
+| No behavioral, contract, generated-artifact, dependency, or ownership change from the remediation | commit `2833fab2f` is docs/imports only | `mise run codegen:check`; `git diff --check` | PASS |
+
+Commands run on the final tree, all exit 0: `mise run fmt`, `mise run lints`,
+`mise run codegen:check`, `git diff --check`, `mise run docs:check`,
+`mise run test:wyrd` (2213 passed).
+
+Additional reuse cleanups requested by the caller in separate commits,
+outside FIND-8/9: `principal_event` split so `roles_sync_event` reuses the
+audit.rs core; removal of the unreachable HMAC filter in
+`verify_id_token_algorithm` (`ExternalVerifier::verify_external_against`
+rejects HS* before key lookup, and the error code is unchanged); callback tests
+reuse `jwks_server` and one `sync_trusted` helper; the operator runbook records
+the two-minute old-sealing-key retention for in-flight login completions.
+Skipped: a human-only claim-mapping payload with hard-coded `sub`. It would
+change the public `ClaimMappingPayload` admin contract, so the fail-closed
+decode check stays. Not done (follow-up only): moving
+`resolve_by_slug_for_app` onto `WyrdPostgres`.
+
+Lane repairs found in `test:wyrd`: the gateway terminal-error test now compares
+parsed JSON rather than key-ordered text (`preserve_order` feature unification),
+and `coordinator_standby_pass_is_not_ready` waits for the boot pass first so
+a pending standby pass cannot satisfy the post-release wait.

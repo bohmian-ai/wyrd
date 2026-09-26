@@ -10,6 +10,14 @@
 //! for example, one more replica restart — reports `remaining == 0`. That pass
 //! also reseals any late K1 write, so it is both the proof and the repair.
 //!
+//! Completed human logins (`wyrd.auth_login_state.completion_sealed`) are
+//! deliberately not rewrapped: each is redeemable for at most the login
+//! completion TTL (two minutes) after it is sealed and is unreadable after.
+//! A completion sealed under K1 therefore needs K1 only until that TTL has
+//! passed since the last K1 writer stopped. Retaining K1 for that long past
+//! the verification pass's start is enough; rewrapping it would only extend
+//! a secret that is about to expire.
+//!
 //! The pass is idempotent and safe across replicas: each row is replaced by a
 //! compare-and-swap on the exact bytes read, so a concurrent reconfiguration or
 //! a second replica's rewrap is never overwritten. It is an engine-internal

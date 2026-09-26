@@ -158,3 +158,46 @@ If closure requires a new public contract, persistence model, lock abstraction,
 transaction-isolation decision, or broader concurrency semantic, stop and route
 that decision through specification revision rather than expanding this
 remediation.
+
+## Implementation evidence
+
+Commit: `d5c04dd13` (fix + focused test).
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| The shared human-session owner takes the tenant-qualified refresh-family lock before the connection-slot lock and before reading User status, held through the caller's commit or rollback. | `crates/wyrd/wyrd-auth/src/issuance.rs` `TenantTokenIssuer::issue_human_session` calls `lock_refresh_family(conn, "user", principal_id)` first, then `lock_human_connection_slot`, then `Self::issue`. Transaction-scoped advisory lock on the caller's `TenantConn`; rotation reacquires it in its own transaction. | Focused test observes each side's backend blocked on an `advisory` lock while the other holds the family lock. | PASS |
+| Issuance owns the lock first: revocation waits, then retires the new row; no active family row. | Same. | `issuance::pg_tests::initial_session_issuance_and_user_revocation_serialize`, ordering 1: committed family is `(1 row, 0 active)`. | PASS |
+| Revocation owns the lock first: issuance waits, re-reads the User as suspended, returns `PrincipalInactive`, inserts no row. | Same. | Same test, ordering 2: `Err(IssuanceError::PrincipalInactive)`, committed family `(0 rows)`. With the lock call removed the test fails (revocation never waits; 30s timeout panic in `wait_for_advisory_lock_wait`). | PASS |
+| Rotation/replay serialization, family-before-connection order, audit, connection cutoff, Service/Agent behavior, prior remediations unchanged. | Only change in production code is the added lock call. `revoke::pg_tests` is now `pub(crate)` so the issuance test reuses its `wait_for_advisory_lock_wait` probe (doc generalized). | `test:principals:integration` (includes `issuance`, `refresh`, `revoke` pg_tests), `test:principals:unit`, `test:sql`, `test:identity:journey` (27/27), `check:tenant-isolation`, `fmt`, `lints`, `git diff --check` all exit 0. | PASS |
+
+Commands run, each exiting 0: the focused `with-test-postgres.sh … nextest`
+command, `mise run test:principals:unit`, `mise run test:principals:integration`,
+`mise run test:sql`, `mise run test:identity:journey`,
+`mise run check:tenant-isolation`, `mise run fmt`, `mise run lints`,
+`git diff --check`.
+
+Issuance audit (every production path that inserts refresh rows or mints
+access authority, found by grepping `insert_refresh_token`,
+`insert_human_refresh_token`, `issue_human_session`, `.issue(`,
+`issue_access_token`, `issue_refresh_token`, `issue_platform_access_token`
+over `crates` and `sdks`, excluding `#[cfg(test)]` modules and test harnesses):
+
+| Path | Authority issued | Persists renewable authority? | Serialization vs revocation | Action |
+|---|---|---|---|---|
+| OIDC callback first login → `issue_human_session` (`callback.rs:249`) | access + human refresh row | yes | family lock before status read (`issuance.rs:490`) | **now locked** (this task); proven by both orderings of the focused test |
+| Refresh rotation → `issue_human_session` (`refresh.rs:217`) | access + successor refresh row | yes | family lock at `refresh.rs:126`, reacquired at `issuance.rs:490` in the same transaction | already locked; proven by `revoke::pg_tests::refresh_rotation_overlapping_user_revocation_retires_successor` |
+| API-key exchange → `TenantTokenIssuer::issue` (`exchange_api_key.rs:191`) | 5-minute access token | no refresh row (`refresh_token: None`) | status read in the grant transaction; machine revocation takes no family lock | cannot race beyond the accepted bound: a mint whose status read precedes the suspension commit is equivalent to a token issued just before revocation, which the spec lets lapse at its five-minute expiry; a mint after the commit re-reads `suspended` and refuses |
+| Token-exchange delegation → `issue` (`exchange_api_key.rs:328`) | 5-minute access token | no | same | same as API-key exchange |
+| Workload `jwt-bearer` → `issue` (`jwt_bearer.rs:72`) | 5-minute access token | no | same | same as API-key exchange |
+| Platform credential exchange `PlatformSessions::exchange` (`platform_sessions.rs:164`) | platform session token | no refresh row | platform extractor re-confirms the session, credential, and principal against the store on every request before reading grants (`platform_extractor.rs:136`) | cannot race: a stale mint is refused on first use |
+| Platform federated login `PlatformSessions::issue_federated` (`platform_sessions.rs:246`) | platform session token | no | same per-request store confirmation | cannot race |
+| Machine `insert_refresh_token` (`service_accounts.rs:44`) | machine refresh row | — | — | no production caller (tests only) |
+| Direct `issue_access_token` in `wyrd-server` (`authenticate.rs`, `principal_extractor.rs`, `caller_extractor.rs`, `boot/auth.rs`, `oracle/lifecycle_service.rs`) and `wyrd-testing/src/server.rs` | — | — | — | test code only |
+
+Only initial human-session issuance could persist authority past a
+revocation, and it is now serialized. Machine and platform paths persist no
+renewable authority.
+
+Non-goals held: no new persistence, lock abstraction, isolation change,
+retry loop, public contract, migration, or generated artifact; no unrelated
+file changed.

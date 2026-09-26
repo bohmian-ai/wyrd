@@ -185,7 +185,7 @@ impl HumanConnections {
 /// # Errors
 /// Returns [`WyrdError::DiscoveryUnavailable`] — the redacted screening
 /// refusal — when the policy refuses the endpoint's scheme.
-fn browser_authorization_endpoint(
+pub(crate) fn browser_authorization_endpoint(
     provider: OidcProvider,
     http: ScreenedHttp,
 ) -> Result<Url, WyrdError> {

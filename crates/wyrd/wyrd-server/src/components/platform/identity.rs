@@ -799,6 +799,7 @@ fn login_error(error: PlatformLoginError) -> WyrdErrorResponse {
                 details: serde_json::json!({ "plane": "platform" }),
             })
         }
+        PlatformLoginError::EndpointRefused(error) => WyrdErrorResponse::from(*error),
         PlatformLoginError::ProviderUnavailable(_) | PlatformLoginError::ConnectionUnusable => {
             WyrdErrorResponse::from(WyrdError::AuthVerifyUnavailable {
                 message: "identity provider unavailable".to_owned(),

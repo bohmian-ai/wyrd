@@ -225,8 +225,8 @@ Material limits:
 - Human login requires a configured sealing key; without one `begin_login`
   refuses with `WYRD_SPEC_400_VALIDATION` before storing state.
 - A `cli_handoff_id` binding is refused with `INVALID_STATE` until TASK-004
-  supplies the handoff (`login.rs::initiation_binding` is the replacement point).
-- The browser `/login/complete` BFF route that calls `LoginCompletions::redeem`
+  supplies the handoff (`login.rs::known_initiation` is the replacement point).
+- The browser `/login/complete` BFF route that calls `HumanConnections::redeem_completion`
   is owned by TASK-003; journeys redeem through the owner directly.
 - Unsafe discovered provider URLs and the missing sealing key are proven at
   unit/Postgres level only: the journey server is permissive toward local

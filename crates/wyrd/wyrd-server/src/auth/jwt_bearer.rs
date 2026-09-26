@@ -56,7 +56,7 @@ async fn resolve_workload_tenant(
     tenant: Option<TenantSlug>,
 ) -> Result<DataTenantId, WyrdErrorResponse> {
     if let Some(host_tenant) = tenant_slug_from_host(headers) {
-        return resolve_tenant_slug(state.postgres.app_pool(), &host_tenant)
+        return resolve_tenant_slug(state, &host_tenant)
             .await?
             .ok_or_else(|| invalid_token("request host tenant could not be resolved"));
     }
@@ -66,16 +66,24 @@ async fn resolve_workload_tenant(
             "tenant could not be resolved for workload token",
         ));
     };
-    resolve_tenant_slug(state.postgres.app_pool(), &fallback)
+    resolve_tenant_slug(state, &fallback)
         .await?
         .ok_or_else(|| invalid_token("requested tenant could not be resolved"))
 }
 
+/// Resolve a workload tenant slug through the one `WyrdPostgres` resolver.
+///
+/// # Errors
+/// Returns an [`WyrdError::AuthVerifyUnavailable`] response when the
+/// resolver fails, including when no operator pool is configured.
 async fn resolve_tenant_slug(
-    pool: &sqlx::PgPool,
+    state: &AppState,
     slug: &TenantSlug,
 ) -> Result<Option<DataTenantId>, WyrdErrorResponse> {
-    wyrd_sql::queries::platform::tenant_resolver::resolve_by_slug_for_app(pool, slug)
+    state
+        .postgres
+        .wyrd()
+        .resolve_tenant_slug(slug)
         .await
         .map_err(sql_error)
 }
@@ -596,9 +604,9 @@ mod pg_tests {
 
         let issuer_resolver =
             Arc::new(PgIssuerResolver::new(fixture.wyrd_postgres().clone(), None));
-        let binding_resolver = Arc::new(PgWorkloadBindingResolver::new(Arc::new(
-            fixture.app_pool().clone(),
-        )));
+        let binding_resolver = Arc::new(PgWorkloadBindingResolver::new(
+            fixture.wyrd_postgres().clone(),
+        ));
 
         let issuing_key = Arc::new(
             IssuingKey::from_ed_pem(

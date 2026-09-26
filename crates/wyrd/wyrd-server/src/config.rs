@@ -1958,7 +1958,7 @@ pub struct AuthConfig {
     /// Boot has no request `Host` to derive the tenant from, so the operator
     /// declares it here (or via `WYRD_SERVER_TENANT_SLUG`). Required when any
     /// `[[trusted_issuers]]` or `[[workload_bindings]]` entry is configured; the
-    /// slug is resolved at boot through the same `resolve_by_slug_for_app` path
+    /// slug is resolved at boot through the same `WyrdPostgres::resolve_tenant_slug`
     /// the request handlers use, so the bound tenant matches request-time lookups.
     #[serde(default)]
     pub tenant_slug: Option<TenantSlug>,

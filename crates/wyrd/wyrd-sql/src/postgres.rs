@@ -147,23 +147,31 @@ impl WyrdPostgres {
         result
     }
 
-    /// Resolve a URL tenant slug to its tenant id on the app pool.
+    /// Resolve a URL tenant slug to its tenant id.
     ///
-    /// Pre-authentication callers such as begin-login hold only the typed
-    /// slug; this delegates to [`crate::queries::platform::tenant_resolver::resolve_by_slug_for_app`]
-    /// with the private runtime app pool, whose `wyrd_app` role alone is
-    /// granted the SECURITY DEFINER slug bridge, so pool selection never
-    /// leaves this owner. Returns `None` when the slug is unknown, suspended,
-    /// or deleted.
+    /// This is the one slug resolver for tenant login, workload exchange, and
+    /// boot. A slug names no tenant yet, so the lookup runs on the audited
+    /// operator pool through
+    /// [`crate::queries::platform::tenant_resolver::resolve_by_slug`]; the
+    /// RLS app pool is never a fallback. Returns `None` when the slug is
+    /// unknown, suspended, or deleted.
     ///
     /// # Errors
-    /// Returns the errors of
-    /// [`crate::queries::platform::tenant_resolver::resolve_by_slug_for_app`].
+    /// Returns [`SqlError::InsufficientPrivilege`] when no platform-admin
+    /// operator pool is configured, so pre-tenant resolution fails closed, and
+    /// otherwise the errors of
+    /// [`crate::queries::platform::tenant_resolver::resolve_by_slug`].
     pub async fn resolve_tenant_slug(
         &self,
         slug: &TenantSlug,
     ) -> Result<Option<DataTenantId>, SqlError> {
-        crate::queries::platform::tenant_resolver::resolve_by_slug_for_app(&self.app, slug).await
+        let operator = self
+            .operator_pool()
+            .ok_or_else(|| SqlError::InsufficientPrivilege {
+                detail: "tenant slug resolution requires the wyrd_platform_admin operator pool"
+                    .to_owned(),
+            })?;
+        crate::queries::platform::tenant_resolver::resolve_by_slug(&operator, slug).await
     }
 
     /// Resolve the tenant owning an unconsumed, unexpired login state.
@@ -382,5 +390,26 @@ mod telemetry_tests {
                 1
             );
         }
+    }
+
+    /// Without a platform-admin operator pool, slug resolution fails closed
+    /// before any IO rather than falling back to the RLS app pool.
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_tenant_slug_without_operator_pool_fails_closed() {
+        let app = PgPoolOptions::new()
+            .connect_lazy("postgres://unused.invalid/none")
+            .expect("lazy pool builds without connecting");
+        let app_only = WyrdPostgres::from_pools(app, None);
+        let slug = wyrd_spec::TenantSlug::new("acme").expect("slug is valid");
+
+        let error = app_only
+            .resolve_tenant_slug(&slug)
+            .await
+            .expect_err("resolution must not fall back to the app pool");
+
+        assert!(matches!(
+            error,
+            crate::SqlError::InsufficientPrivilege { .. }
+        ));
     }
 }

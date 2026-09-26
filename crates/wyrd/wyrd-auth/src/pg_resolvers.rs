@@ -6,7 +6,7 @@
 //! sealing key, and call commit 03's tenant-scoped read-path query functions.
 //!
 //! Issuer trust is tenant-scoped (F02): every read goes through a
-//! [`TenantConn`], so Postgres RLS is the load-bearing isolation boundary. A
+//! [`TenantConn`](wyrd_sql::TenantConn), so Postgres RLS is the load-bearing isolation boundary. A
 //! resolve for tenant A can never surface tenant B's issuers or bindings.
 //!
 //! The `client_secret_enc` BYTEA column stores `nonce ‖ ciphertext` (AES-256-GCM
@@ -23,7 +23,6 @@ use crate::platform_login::PlatformConnection;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::PgPool;
 use url::Url;
 use wyrd_auth_oidc::{
     ClaimMapping, ClaimPath, ClientAuth, IssuerConfigResolver, IssuerVerification, OidcError,
@@ -35,13 +34,13 @@ use wyrd_spec::auth::HUMAN_SUBJECT_CLAIM;
 use wyrd_spec::auth::IssuerTokenPolicy;
 use wyrd_spec::auth::IssuerUrl;
 use wyrd_spec::reference::CardRef;
+use wyrd_sql::WyrdPostgres;
 use wyrd_sql::queries::auth::{
     TrustedIssuerWrite, WorkloadBindingWrite, trusted_issuer_by_url, trusted_issuers_for_tenant,
     workload_binding_by_subject,
 };
 use wyrd_sql::queries::platform::identity::PlatformOidcConnectionRow;
 use wyrd_sql::row_types::auth::{HumanConnectionRow, TrustedIssuerRow};
-use wyrd_sql::{TenantConn, WyrdPostgres};
 
 const CLIENT_AUTH_SECRET_BASIC: &str = "SecretBasic";
 const CLIENT_AUTH_SECRET_POST: &str = "SecretPost";
@@ -63,7 +62,7 @@ const PRINCIPAL_KIND_WORKLOAD: &str = "Workload";
 /// decryption is only attempted for rows that actually carry a sealed secret.
 #[derive(Clone)]
 pub struct PgIssuerResolver {
-    /// Runtime Postgres handle; every read runs on an RLS [`TenantConn`]
+    /// Runtime Postgres handle; every read runs on an RLS [`TenantConn`](wyrd_sql::TenantConn)
     /// acquired through [`WyrdPostgres::tenant_conn`], so a resolve for one
     /// tenant can never observe another tenant's issuers.
     postgres: WyrdPostgres,
@@ -195,19 +194,32 @@ impl IssuerConfigResolver for PgIssuerResolver {
 
 /// Production [`WorkloadBindingResolver`] backed by `wyrd.auth_workload_bindings`.
 ///
-/// Holds only the app [`PgPool`] — bindings carry no secrets, so no sealing key
-/// is needed. Audience precedence (exact match preferred, `NULL`-audience
-/// fallback) is enforced in the SQL query (`workload_binding_by_subject`).
-#[derive(Debug, Clone)]
+/// Holds only the runtime [`WyrdPostgres`] handle — bindings carry no
+/// secrets, so no sealing key is needed. Each lookup opens its tenant
+/// transaction through [`WyrdPostgres::tenant_conn`], so RLS binds the read to
+/// the requested tenant. Audience precedence (exact match preferred,
+/// `NULL`-audience fallback) is enforced in the SQL query
+/// (`workload_binding_by_subject`).
+#[derive(Clone)]
 pub struct PgWorkloadBindingResolver {
-    pool: Arc<PgPool>,
+    /// Runtime Postgres owner; tenant transactions come only from
+    /// [`WyrdPostgres::tenant_conn`].
+    postgres: WyrdPostgres,
+}
+
+/// Redacted debug view: hides the store handle.
+impl std::fmt::Debug for PgWorkloadBindingResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PgWorkloadBindingResolver")
+            .finish_non_exhaustive()
+    }
 }
 
 impl PgWorkloadBindingResolver {
-    /// Construct a resolver over the Wyrd app pool.
+    /// Construct a resolver over the runtime Postgres handle.
     #[must_use]
-    pub fn new(pool: Arc<PgPool>) -> Self {
-        Self { pool }
+    pub fn new(postgres: WyrdPostgres) -> Self {
+        Self { postgres }
     }
 }
 
@@ -220,7 +232,7 @@ impl WorkloadBindingResolver for PgWorkloadBindingResolver {
         subject: &str,
         audience: Option<&str>,
     ) -> Result<Option<CardRef>, OidcError> {
-        let mut conn = TenantConn::acquire(&self.pool, *tenant).await.map_err(|error| {
+        let mut conn = self.postgres.tenant_conn(*tenant).await.map_err(|error| {
             tracing::warn!(error = %error, "binding resolver failed to acquire tenant connection");
             OidcError::JwksUnavailable {
                 issuer: issuer.as_str().to_owned(),
@@ -988,7 +1000,7 @@ mod pg_tests {
             .expect("binding upsert");
         conn.commit().await.expect("seed commits");
 
-        let resolver = PgWorkloadBindingResolver::new(Arc::new(fixture.app_pool().clone()));
+        let resolver = PgWorkloadBindingResolver::new(fixture.wyrd_postgres().clone());
 
         // A NULL-audience binding answers an audience-qualified lookup (fallback).
         let resolved_binding = resolver

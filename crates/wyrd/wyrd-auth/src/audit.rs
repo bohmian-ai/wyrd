@@ -6,7 +6,6 @@
 //! The server's `AuditPublisher` is the only thing that moves those rows into
 //! retained history; this module owns no table and no other sink.
 
-use sqlx::PgPool;
 use vala_sql::queries::audit_staging::append_audit;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
@@ -15,7 +14,7 @@ use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{AuditDetail, AuditEvent, AuditOutcome};
 use wyrd_spec::vala::audit_detail::AuditErrorCode;
-use wyrd_sql::TenantConn;
+use wyrd_sql::{TenantConn, WyrdPostgres};
 
 /// Operation for every issued access token: authorization code, API key, JWT
 /// bearer, delegation, and refresh rotation.
@@ -134,16 +133,18 @@ pub async fn append_auth_audit(
 /// Append one auth failure event in its own transaction, logging instead of
 /// failing.
 ///
+/// The transaction is opened through [`WyrdPostgres::tenant_conn`], separate
+/// from the refused grant's rolled-back one, and carries the canonical append.
 /// Refused grants already return an error to the caller; a missing refusal row
 /// must not replace that error, so acquire, append, and commit failures are
 /// logged at `error` and swallowed.
 pub async fn record_auth_audit_best_effort(
-    pool: &PgPool,
+    postgres: &WyrdPostgres,
     tenant: DataTenantId,
     event: &AuditEvent,
 ) {
     let result = async {
-        let mut conn = TenantConn::acquire(pool, tenant).await?;
+        let mut conn = postgres.tenant_conn(tenant).await?;
         append_audit(&mut conn, event).await?;
         conn.commit().await
     }

@@ -1572,9 +1572,7 @@ async fn install_auth(
         postgres.wyrd().clone(),
         sealing_key.clone(),
     ));
-    let binding_resolver = Arc::new(PgWorkloadBindingResolver::new(Arc::new(
-        postgres.app_pool().clone(),
-    )));
+    let binding_resolver = Arc::new(PgWorkloadBindingResolver::new(postgres.wyrd().clone()));
 
     let handles = crate::boot::auth::build_auth_handles(
         signing_key,
@@ -2150,7 +2148,7 @@ async fn seed_federation(
 ) -> Result<(), ServerBootError> {
     // Seed `[[trusted_issuers]]` and `[[workload_bindings]]` into Postgres under
     // the implicit tenant. Both resolve the slug through the same
-    // `resolve_by_slug_for_app` path the request handlers use, so the bound
+    // `WyrdPostgres::resolve_tenant_slug` the request handlers use, so the bound
     // tenant matches request-time lookups by construction. Each binding's card
     // target is built into a server-owned `CardRef` (F04, never from token
     // claims); building the ref is not a card-existence check.
@@ -2161,10 +2159,10 @@ async fn seed_federation(
             }
         })?;
         let tenant_id =
-            crate::boot::issuer::resolve_implicit_tenant(state.postgres.app_pool(), slug).await?;
+            crate::boot::issuer::resolve_implicit_tenant(state.postgres.wyrd(), slug).await?;
 
         crate::boot::issuer::seed_trusted_issuers(
-            state.postgres.app_pool(),
+            state.postgres.wyrd(),
             tenant_id,
             &config.trusted_issuers,
             sealing_key,
@@ -2172,12 +2170,8 @@ async fn seed_federation(
         .await?;
 
         let bindings = build_workload_bindings(&config.workload_bindings, tenant_id)?;
-        crate::boot::issuer::seed_workload_bindings(
-            state.postgres.app_pool(),
-            tenant_id,
-            &bindings,
-        )
-        .await?;
+        crate::boot::issuer::seed_workload_bindings(state.postgres.wyrd(), tenant_id, &bindings)
+            .await?;
     }
     Ok(())
 }

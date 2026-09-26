@@ -1203,7 +1203,7 @@ mod pg_tests {
         .expect("expired upload row inserts");
 
         let rows = storage::admin::multipart_uploads::expired_uploads_batch(
-            store.pool(),
+            &wyrd_sql::OperatorPool::from(store.pool().clone()),
             10,
             std::time::Duration::from_secs(30),
         )

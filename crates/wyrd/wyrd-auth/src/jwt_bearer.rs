@@ -181,7 +181,7 @@ async fn audit_workload_failure(
             error_code: auth_failure_code(error),
         },
     );
-    record_auth_audit_best_effort(postgres.app_pool(), tenant_id, &event).await;
+    record_auth_audit_best_effort(postgres, tenant_id, &event).await;
 }
 
 fn principal_not_found(subject: &str, issuer: &IssuerUrl) -> WyrdError {

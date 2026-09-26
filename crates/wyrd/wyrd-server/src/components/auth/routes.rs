@@ -177,7 +177,7 @@ async fn token(
                 Err(error) => {
                     let wyrd = map_exchange_error_to_wyrd(&mut conn, &prefix, error).await;
                     audit_scope_mint_failure_best_effort(
-                        state.postgres.app_pool(),
+                        state.postgres.wyrd(),
                         parsed.tenant_id,
                         req_id,
                         MINT_KIND_API_KEY_EXCHANGE,
@@ -257,7 +257,7 @@ async fn token(
                     }
                     let wyrd = WyrdError::from(error);
                     audit_scope_mint_failure_best_effort(
-                        state.postgres.app_pool(),
+                        state.postgres.wyrd(),
                         tenant_id,
                         req_id,
                         MINT_KIND_REFRESH,

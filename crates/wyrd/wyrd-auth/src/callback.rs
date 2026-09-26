@@ -541,7 +541,7 @@ pub async fn audit_authorization_code_failure(
             error_code: auth_failure_code(error),
         },
     );
-    record_auth_audit_best_effort(postgres.app_pool(), tenant_id, &event).await;
+    record_auth_audit_best_effort(postgres, tenant_id, &event).await;
 }
 
 /// Require the verified ID token's `nonce` claim to equal the nonce the login

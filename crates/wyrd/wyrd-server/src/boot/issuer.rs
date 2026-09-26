@@ -12,7 +12,7 @@
 //! Issuer trust is tenant-scoped (F02). Boot has no request `Host` to derive
 //! the tenant from, so the operator declares the deployment's implicit tenant
 //! via `[auth] tenant_slug`. [`resolve_implicit_tenant`] resolves that slug
-//! through the SAME `resolve_by_slug_for_app` path the request handlers use, so
+//! through the SAME `WyrdPostgres::resolve_tenant_slug` the request handlers use, so
 //! the bound `DataTenantId` equals what the resolver reads at request time, by
 //! construction.
 //!
@@ -24,7 +24,6 @@
 
 use std::time::Duration;
 
-use sqlx::PgPool;
 use url::Url;
 use wyrd_auth_oidc::{
     ClaimMapping, ClaimPath, ClientAuth, OidcProvider, ProviderMetadata, TrustedIssuer,
@@ -33,10 +32,10 @@ use wyrd_auth_oidc::{
 use wyrd_crypt::SealingKeyring;
 use wyrd_spec::auth::IssuerUrl;
 use wyrd_spec::{DataTenantId, TenantSlug};
-use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
     trusted_issuer_exists, upsert_trusted_issuer, upsert_workload_binding,
 };
+use wyrd_sql::{TenantConn, WyrdPostgres};
 
 use crate::auth::pg_resolvers::{binding_write_from_binding, issuer_write_from_trusted};
 use crate::boot::ServerBootError;
@@ -62,20 +61,20 @@ fn backoff_ms(attempt: u32) -> u64 {
 
 /// Resolve the deployment's implicit tenant slug to its `DataTenantId`.
 ///
-/// Reuses [`resolve_by_slug_for_app`](wyrd_sql::queries::platform::tenant_resolver::resolve_by_slug_for_app),
-/// the same resolver the request handlers (`callback.rs`/`login.rs`/
-/// `jwt_bearer.rs`) use, so the boot tenant matches request-time lookups.
-/// Commit 03 reuses this helper for workload bindings.
+/// Reuses [`WyrdPostgres::resolve_tenant_slug`], the one resolver tenant
+/// login and workload exchange use, so the boot tenant matches request-time
+/// lookups by construction.
 ///
 /// # Errors
-/// Returns [`ServerBootError::Sql`] when the resolver query fails, and
+/// Returns [`ServerBootError::Sql`] when the resolver query fails or no
+/// operator pool is configured, and
 /// [`ServerBootError::TenantSlugUnresolved`] when the slug does not resolve to
 /// an active tenant.
 pub async fn resolve_implicit_tenant(
-    pool: &PgPool,
+    postgres: &WyrdPostgres,
     slug: &TenantSlug,
 ) -> Result<DataTenantId, ServerBootError> {
-    match wyrd_sql::queries::platform::tenant_resolver::resolve_by_slug_for_app(pool, slug).await? {
+    match postgres.resolve_tenant_slug(slug).await? {
         Some(tenant_id) => Ok(tenant_id),
         None => Err(ServerBootError::TenantSlugUnresolved {
             slug: slug.to_string(),
@@ -88,7 +87,8 @@ pub async fn resolve_implicit_tenant(
 /// For each entry: run OIDC discovery (bounded retry), map the config DTO to a
 /// [`TrustedIssuer`], encrypt any client secret with `sealing_key`, and upsert
 /// the row (`ON CONFLICT DO UPDATE`, so re-seeding from config is idempotent).
-/// All writes share one tenant transaction, committed once at the end.
+/// All writes share one tenant transaction opened through
+/// [`WyrdPostgres::tenant_conn`], committed once at the end.
 ///
 /// Discovery that is unreachable for an issuer whose row already exists is
 /// non-fatal (a restart while the IdP is briefly down keeps the prior row).
@@ -105,7 +105,7 @@ pub async fn resolve_implicit_tenant(
 /// may leave earlier issuer entries committed while later entries remain
 /// unprocessed.
 pub async fn seed_trusted_issuers(
-    pool: &PgPool,
+    postgres: &WyrdPostgres,
     tenant_id: DataTenantId,
     entries: &[IssuerEntry],
     sealing_key: Option<&SealingKeyring>,
@@ -132,7 +132,7 @@ pub async fn seed_trusted_issuers(
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("discovery client config is valid");
-    let mut conn = TenantConn::acquire(pool, tenant_id).await?;
+    let mut conn = postgres.tenant_conn(tenant_id).await?;
     for entry in entries {
         seed_one_trusted_issuer(&mut conn, tenant_id, entry, sealing_key, &http).await?;
     }
@@ -190,21 +190,21 @@ async fn seed_one_trusted_issuer(
 /// Each binding's structured `card_ref` is encoded to JSONB and upserted
 /// (`ON CONFLICT DO UPDATE`). The referenced trusted issuer must already be
 /// seeded (FK), so callers seed issuers first. All writes share one tenant
-/// transaction.
+/// transaction opened through [`WyrdPostgres::tenant_conn`].
 ///
 /// # Errors
 /// Returns [`ServerBootError::InvalidWorkloadBinding`] when a binding's
 /// `card_ref` cannot be serialized, and [`ServerBootError::Sql`] on a write
 /// failure (including an FK violation when the issuer was not seeded).
 pub async fn seed_workload_bindings(
-    pool: &PgPool,
+    postgres: &WyrdPostgres,
     tenant_id: DataTenantId,
     bindings: &[WorkloadBinding],
 ) -> Result<(), ServerBootError> {
     if bindings.is_empty() {
         return Ok(());
     }
-    let mut conn = TenantConn::acquire(pool, tenant_id).await?;
+    let mut conn = postgres.tenant_conn(tenant_id).await?;
     for (index, binding) in bindings.iter().enumerate() {
         let write = binding_write_from_binding(binding).map_err(|error| {
             ServerBootError::InvalidWorkloadBinding {
@@ -513,7 +513,7 @@ mod pg_tests {
         conn.commit().await.expect("pre-seed commits");
 
         // Boot again with the IdP unreachable: the existing row makes this non-fatal.
-        seed_trusted_issuers(fixture.app_pool(), tenant_id, &[entry], Some(&key))
+        seed_trusted_issuers(fixture.wyrd_postgres(), tenant_id, &[entry], Some(&key))
             .await
             .expect("restart with unreachable but already-seeded issuer must not fail boot");
     }
@@ -525,7 +525,7 @@ mod pg_tests {
         let key = SealingKeyring::new(SecretKey::from_bytes([4_u8; 32]));
 
         let entry = issuer_entry("https://idp.invalid/realms/never-seeded");
-        let error = seed_trusted_issuers(fixture.app_pool(), tenant_id, &[entry], Some(&key))
+        let error = seed_trusted_issuers(fixture.wyrd_postgres(), tenant_id, &[entry], Some(&key))
             .await
             .expect_err("a never-seeded unreachable issuer must fail boot closed");
         assert!(
@@ -544,7 +544,9 @@ mod pg_tests {
             .connect_lazy("postgres://unused.invalid/none")
             .expect("lazy pool builds without connecting");
 
-        let error = seed_trusted_issuers(&pool, tenant(), &[entry], None)
+        let postgres = WyrdPostgres::from_pools(pool, None);
+
+        let error = seed_trusted_issuers(&postgres, tenant(), &[entry], None)
             .await
             .expect_err("a human issuer must not seed");
 

@@ -4292,7 +4292,7 @@ impl WyrdTestServerBuilder {
         .await
         .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         seed_trusted_issuers(
-            runtime_wyrd.app_pool(),
+            &runtime_wyrd,
             tenant_id,
             &self.trusted_issuer_configs,
             Some(sealing_key.as_ref()),
@@ -4301,7 +4301,7 @@ impl WyrdTestServerBuilder {
         .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         let bindings = build_workload_bindings(&self.workload_binding_configs, tenant_id)
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        seed_workload_bindings(runtime_wyrd.app_pool(), tenant_id, &bindings)
+        seed_workload_bindings(&runtime_wyrd, tenant_id, &bindings)
             .await
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
 
@@ -4309,9 +4309,7 @@ impl WyrdTestServerBuilder {
             runtime_wyrd.clone(),
             Some(Arc::clone(&sealing_key)),
         ));
-        let binding_resolver = Arc::new(PgWorkloadBindingResolver::new(Arc::new(
-            runtime_wyrd.app_pool().clone(),
-        )));
+        let binding_resolver = Arc::new(PgWorkloadBindingResolver::new(runtime_wyrd.clone()));
 
         let verifier = Arc::new(TokenVerifier::new(
             decoding_keys,

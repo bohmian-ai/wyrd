@@ -170,9 +170,10 @@ impl AuthorizationCodeExchange {
     /// Finish a consumed login in `trusted.tenant_id` once the provider has
     /// returned an ID token.
     ///
-    /// The token's header algorithm must be an asymmetric algorithm the
-    /// provider's fresh discovery advertised in `supported_algorithms`; only
-    /// then is it verified against `trusted`. The verified claims must carry
+    /// The token's header algorithm must be one the provider's fresh
+    /// discovery advertised in `supported_algorithms`; only then is it
+    /// verified against `trusted` by the shared external verifier, which
+    /// refuses symmetric algorithms even when the provider advertises them. The verified claims must carry
     /// the nonce recorded in `login_state` and satisfy OIDC authorized-party
     /// rules for the bound client ([`verify_authorized_party`]). The tenant's
     /// Active connection is then re-read and must still be the exact revision,
@@ -565,17 +566,24 @@ fn roles_sync_event(request_id: &str, principal_id: Uuid) -> AuditEvent {
     )
 }
 
-/// Require the ID token's header algorithm to be an asymmetric algorithm the
-/// provider advertised for ID tokens in its fresh discovery document.
+/// Require the ID token's header algorithm to be one the provider advertised
+/// for ID tokens in its fresh discovery document.
 ///
-/// The shared verifier accepts any asymmetric header algorithm its JWKS key
-/// supports; this narrows a tenant login to the provider's own policy before
-/// any key lookup or identity resolution. Unknown advertised names are
-/// ignored, so they can never admit a token.
+/// This checks advertised-set membership only; it does not itself refuse
+/// symmetric algorithms. Its sole caller,
+/// [`AuthorizationCodeExchange::finish_id_token_exchange`], immediately hands
+/// the token to [`ExternalVerifier::verify_external_against`], which owns
+/// symmetric-algorithm (`HS256`/`HS384`/`HS512`) rejection and the signature
+/// and JWKS verification. This check narrows a tenant login to the
+/// provider's own policy before that key lookup. Advertised names that do not
+/// parse as a known algorithm are ignored rather than rejected, so they can
+/// never admit a token.
 ///
 /// # Errors
-/// Returns [`WyrdError::InvalidToken`] when the token header does not decode
-/// or its algorithm is outside the advertised asymmetric set.
+/// Returns [`WyrdError::InvalidToken`] when the token header is malformed or
+/// does not decode, or when its algorithm is absent from the advertised set.
+/// An unparseable advertised value is not itself an error: it is skipped, so
+/// it can only contribute to the absent-from-advertised-set failure.
 pub fn verify_id_token_algorithm(supported: &[String], id_token: &str) -> Result<(), WyrdError> {
     let header = jsonwebtoken::decode_header(id_token)
         .map_err(|_| invalid_token("id token header is malformed"))?;

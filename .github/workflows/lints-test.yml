@@ -114,7 +114,7 @@ jobs:
 
       - name: Run selected CI lanes
         env:
-          RUST_LOG: info,vala_bifrost_redux::oracle=debug
+          RUST_LOG: info,vala_bifrost_redux::oracle=debug,wyrd_server::http::router=debug
           WYRD_TEST_PACKAGES: ${{ needs.changes.outputs.rust_packages }}
           CI_LANES: ${{ needs.changes.outputs.ci_lanes }}
         run: |

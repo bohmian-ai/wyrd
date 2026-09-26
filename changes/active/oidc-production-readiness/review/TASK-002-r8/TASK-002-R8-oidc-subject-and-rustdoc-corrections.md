@@ -151,3 +151,31 @@ public authentication contract, workload subject semantics, durable identity
 key, persistence schema, error catalog, or another security decision beyond
 the validated OIDC syntax rule. Ordinary local implementation and test details
 inside the existing verifier owner remain implementer-owned.
+
+## Implementation evidence
+
+Status: `IMPLEMENTED`
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Refresh token-output rustdoc describes only token printing; behavior unchanged | `crates/wyrd/wyrd-cli/src/auth/refresh.rs` `print_tokens`: stale "Argument parsing" line deleted; body untouched | Direct inspection; `mise run fmt`, `mise run lints` | PASS |
+| OIDC ID-token verification rejects missing, non-string, empty, non-ASCII, 256-byte `sub`; accepts normal subject | `crates/shared/wyrd-auth-verify/src/lib.rs` `ExternalVerifier::verify_id_token_against` subject check (`is_empty`, `is_ascii`, `len() > 255`) | `tests::oidc_id_token_requires_binding_and_time_claims` extended with the five refused cases plus a 255-byte accepted subject; RED before fix (`empty sub must be refused: Ok(..)`), GREEN after | PASS |
+| Validation owned by the OIDC-specific verifier; generic/workload semantics unchanged | Check lives only in `verify_id_token_against`; `verify_external_against` and `map_claims` untouched | Same test still proves workload assertion without `iat` passes generic entry | PASS |
+| Verifier rustdoc/error contract names the Subject Identifier refusal | Summary and `# Errors` of `verify_id_token_against` | Direct inspection | PASS |
+| Tenant login, identity journeys, prior fixes remain green | No other files changed | `mise run test:principals:unit` (exit 0); `mise run test:identity:journey` (27/27 journey tests, exit 0) | PASS |
+
+Commands (all exit 0, run sequentially):
+
+```bash
+mise exec -- cargo nextest run --locked -p wyrd-auth-verify --lib \
+  -E 'test(=tests::oidc_id_token_requires_binding_and_time_claims)'
+mise run test:principals:unit
+mise run test:identity:journey
+mise run fmt
+mise run lints
+git diff --check 3fc085acf5b3a710d5dc80892bd2e664b3db6174..HEAD
+```
+
+Non-goals held: no new type, helper, dependency, feature, migration, route,
+error code, callback guard, workload subject change, or CLI refactor. Only the
+two source files and this record changed.

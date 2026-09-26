@@ -51,7 +51,6 @@ pub async fn dispatch(args: RefreshArgs) -> Result<ExitCode, WyrdCliError> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Argument parsing for `wyrd auth refresh`.
 /// Print an issued token pair to the operator terminal.
 ///
 /// The one place either token exists outside the server; neither is written to a

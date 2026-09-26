@@ -572,15 +572,18 @@ impl<I: IssuerConfigResolver> ExternalVerifier<I> {
     /// Verify an OIDC ID token against an issuer the caller already resolved.
     ///
     /// ID-token semantics layered once over [`Self::verify_external_against`]:
-    /// after that generic verification succeeds, the token must also carry a
-    /// numeric `iat` no later than now plus the allowed clock skew. Tenant
+    /// after that generic verification succeeds, the subject must be an OpenID
+    /// Connect Subject Identifier (nonempty ASCII, at most 255 bytes) and the
+    /// token must also carry a numeric `iat` no later than now plus the allowed
+    /// clock skew. Tenant
     /// callback and platform login route through here; workload assertions
     /// stay on the generic entry because they are not ID tokens and carry no
     /// `iat` contract.
     ///
     /// # Errors
     /// Every error of [`Self::verify_external_against`], plus
-    /// [`AuthError::InvalidToken`] when `iat` is missing, not a non-negative
+    /// [`AuthError::InvalidToken`] when the subject is empty, non-ASCII, or
+    /// longer than 255 bytes, or when `iat` is missing, not a non-negative
     /// integer, or later than now plus the allowed clock skew.
     pub async fn verify_id_token_against(
         &self,
@@ -588,6 +591,10 @@ impl<I: IssuerConfigResolver> ExternalVerifier<I> {
         token: &str,
     ) -> Result<ExternalClaims, AuthError> {
         let claims = self.verify_external_against(trusted, token).await?;
+        let subject = claims.subject.as_str();
+        if subject.is_empty() || !subject.is_ascii() || subject.len() > 255 {
+            return Err(AuthError::InvalidToken);
+        }
         let issued_at = claims
             .raw_claims
             .get("iat")
@@ -2340,7 +2347,7 @@ mod tests {
     }
 
     /// ID-token verification refuses a signed token that omits or misstates a
-    /// binding or time claim, while a valid ID token passes and a workload
+    /// binding, time, or Subject Identifier claim, while a valid ID token passes and a workload
     /// assertion without `iat` stays valid on the generic entry.
     #[tokio::test]
     async fn oidc_id_token_requires_binding_and_time_claims() {
@@ -2378,6 +2385,11 @@ mod tests {
             ("string iat", variant("iat", Some("now".into()))),
             ("future iat", variant("iat", future.clone())),
             ("future nbf", variant("nbf", future.clone())),
+            ("missing sub", variant("sub", None)),
+            ("numeric sub", variant("sub", Some(7.into()))),
+            ("empty sub", variant("sub", Some("".into()))),
+            ("non-ASCII sub", variant("sub", Some("usér".into()))),
+            ("256-byte sub", variant("sub", Some("a".repeat(256).into()))),
         ];
         for (case, token) in &refused {
             let result = v.verify_id_token_against(&verification, token).await;
@@ -2390,6 +2402,9 @@ mod tests {
         v.verify_id_token_against(&verification, &variant("nbf", Some(now().into())))
             .await
             .expect("a past nbf passes");
+        v.verify_id_token_against(&verification, &variant("sub", Some("a".repeat(255).into())))
+            .await
+            .expect("a 255-byte ASCII subject passes");
 
         v.verify_external(&tid, &variant("iat", None))
             .await

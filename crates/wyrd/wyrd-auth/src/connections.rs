@@ -448,8 +448,14 @@ impl HumanConnections {
     /// Allowed or Denied decision on `identity_connections:write`, appended
     /// before promotion or the committed refusal.
     ///
+    /// A keyless deployment is refused first, before any lock or decision:
+    /// the activated connection could not complete a human login, secretless
+    /// providers included, because completions are sealed by the keyring.
+    ///
     /// # Errors
-    /// Returns [`WyrdError::ConnectionConflict`] for a missing or stale
+    /// Returns [`WyrdError::Validation`] with reason `sealing_key_missing`
+    /// when no sealing keyring is configured,
+    /// [`WyrdError::ConnectionConflict`] for a missing or stale
     /// candidate or an invalid recovery key, [`WyrdError::ConnectionNotTested`]
     /// when the stamp is missing or expired, [`WyrdError::AuditUnavailable`]
     /// when either decision cannot be appended — leaving the Active and
@@ -460,6 +466,7 @@ impl HumanConnections {
         request: ConnectionActivate,
         decision: &AuditEvent,
     ) -> Result<HumanConnectionView, WyrdError> {
+        self.require_keyring()?;
         let recovery_key = request.recovery_api_key.into_secret_string();
         let mut conn = self.begin_locked(tenant, decision).await?;
         let candidate =
@@ -1303,5 +1310,44 @@ mod probe_tests {
             matches!(outcome, Err(WyrdError::DiscoveryUnavailable { .. })),
             "{outcome:?}"
         );
+    }
+
+    /// A keyless deployment cannot activate even a secretless (public-client)
+    /// candidate: the refusal names the missing sealing key and happens
+    /// before any candidate or recovery key is consulted.
+    ///
+    /// # Panics
+    /// Panics when the fixture cannot start or activation is not refused.
+    #[tokio::test]
+    async fn activation_without_a_sealing_key_is_refused_for_a_secretless_provider() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let connections = HumanConnections::new(
+            fixture.wyrd_postgres().clone(),
+            None,
+            ScreenedHttp::allowing_internal(),
+            Some(&Url::parse("https://wyrd.example.com").expect("origin parses")),
+        );
+        let decision = crate::audit::principal_event(
+            "req-activate",
+            "identity.oidc.candidate.activate",
+            wyrd_runtime::PrincipalId::new(Uuid::new_v4()),
+            wyrd_spec::auth::PrincipalKindTag::User,
+            None,
+            super::AuditOutcome::Allowed,
+        );
+        let request = wyrd_spec::auth::ConnectionActivate {
+            expected_revision: 1,
+            recovery_api_key: wyrd_spec::auth::SecretBearer::new("not-checked".to_owned()),
+        };
+
+        let outcome = connections
+            .activate(fixture.data_tenant_id(), request, &decision)
+            .await;
+        match outcome {
+            Err(WyrdError::Validation { details, .. }) => {
+                assert_eq!(details["reason"], "sealing_key_missing");
+            }
+            other => panic!("expected sealing_key_missing, got {other:?}"),
+        }
     }
 }

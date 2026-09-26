@@ -566,6 +566,105 @@ mod pg_tests {
         assert!(matches!(again, WyrdError::InvalidState { .. }));
         assert_eq!(state_rows(&fixture).await, 0);
     }
+
+    /// Record a consumed login for the browser flow `label` and attach a
+    /// completion sealed under `keyring` that expires after `ttl`, returning
+    /// the flow binding that redeems it.
+    ///
+    /// # Panics
+    /// Panics when any store step fails.
+    async fn store_completion(
+        fixture: &PgFixture,
+        keyring: &SealingKeyring,
+        label: &str,
+        ttl: Duration,
+    ) -> Sha256Hex {
+        let flow = Sha256Hex::digest(format!("flow-{label}").as_bytes());
+        let hash = Sha256Hex::digest(format!("state-{label}").as_bytes());
+        let row = LoginState {
+            connection: HumanConnectionBinding {
+                connection_id: Uuid::now_v7(),
+                connection_revision: 1,
+            },
+            issuer: "https://idp.example.com".to_owned(),
+            client_id: "wyrd".to_owned(),
+            redirect_uri: "https://wyrd.example.com/auth/callback".to_owned(),
+            code_verifier: SecretString::from("verifier"),
+            nonce: "nonce".to_owned(),
+            initiation: LoginInitiation::Browser(flow.clone()),
+        };
+        let token: TokenResponse = serde_json::from_value(serde_json::json!({
+            "access_token": format!("access-{label}"),
+            "token_type": "Bearer",
+            "expires_at": "2030-01-01T00:00:00Z",
+        }))
+        .expect("token response decodes");
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        assert!(
+            insert_login_state(&mut conn, &hash, &row, Duration::from_mins(5))
+                .await
+                .expect("state inserts")
+        );
+        consume_login_state(&mut conn, &hash)
+            .await
+            .expect("consume runs")
+            .expect("state is pending");
+        let sealed = seal_completion(keyring, &token).expect("completion seals");
+        assert!(
+            complete_login_state(&mut conn, &hash, &sealed, ttl)
+                .await
+                .expect("completion stores")
+        );
+        conn.commit().await.expect("commit");
+        flow
+    }
+
+    /// A completion sealed before a key rotation is still redeemed by the
+    /// rotated keyring that retains the old key; one whose key was dropped
+    /// fails closed as unusable and is consumed anyway; an expired completion
+    /// is not redeemable.
+    ///
+    /// # Panics
+    /// Panics when any redemption succeeds or fails differently.
+    #[tokio::test]
+    async fn completions_survive_rotation_and_fail_closed_on_unusable_or_expired() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let old = || SecretKey::from_bytes([9_u8; 32]);
+        let new = || SecretKey::from_bytes([10_u8; 32]);
+        let before = SealingKeyring::new(old());
+        let in_flight =
+            store_completion(&fixture, &before, "in-flight", LOGIN_COMPLETION_TTL).await;
+        let orphaned = store_completion(&fixture, &before, "orphaned", LOGIN_COMPLETION_TTL).await;
+        let expired = store_completion(&fixture, &before, "expired", Duration::ZERO).await;
+
+        let rotated = connections(
+            &fixture,
+            Some(Arc::new(SealingKeyring::new(new()).with_retained(old()))),
+        );
+        let redeemed = rotated
+            .redeem_completion(tenant, LoginInitiation::Browser(in_flight))
+            .await
+            .expect("the retained key opens an in-flight completion");
+        assert_eq!(redeemed.access_token.expose(), "access-in-flight");
+        let error = rotated
+            .redeem_completion(tenant, LoginInitiation::Browser(expired))
+            .await
+            .expect_err("an expired completion is not redeemable");
+        assert!(matches!(error, WyrdError::InvalidState { .. }), "{error:?}");
+
+        let dropped = connections(&fixture, Some(Arc::new(SealingKeyring::new(new()))));
+        let error = dropped
+            .redeem_completion(tenant, LoginInitiation::Browser(orphaned.clone()))
+            .await
+            .expect_err("a completion under a dropped key is unusable");
+        assert!(matches!(error, WyrdError::Internal { .. }), "{error:?}");
+        let error = rotated
+            .redeem_completion(tenant, LoginInitiation::Browser(orphaned))
+            .await
+            .expect_err("an unusable completion was still consumed");
+        assert!(matches!(error, WyrdError::InvalidState { .. }), "{error:?}");
+    }
 }
 
 /// The browser destination a login returns is screened by scheme after fresh

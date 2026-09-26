@@ -424,7 +424,7 @@ mod pg_tests {
         let verifier = ExternalVerifier::new(
             Arc::new(JwksCache::new(
                 ScreenedHttp::new(policy),
-                Duration::from_secs(300),
+                Duration::from_mins(5),
                 Duration::from_secs(5),
             )),
             Arc::new(PgIssuerResolver::new(fixture.wyrd_postgres().clone(), None)),

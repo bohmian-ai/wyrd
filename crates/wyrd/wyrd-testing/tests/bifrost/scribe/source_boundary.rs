@@ -10,7 +10,7 @@ use super::support::{
 /// A row acknowledged by Scribe is owned in turn by an active memtable, a
 /// durable staged member, and finally a published hot object. Each handoff is
 /// a place a row can be lost, duplicated, or become briefly invisible, and a
-/// strict fused read must not be able to tell which owner answered it.
+/// public read must not be able to tell which owner answered it.
 ///
 /// The case walks the two production boundaries one at a time so a failure
 /// localizes to one seam: the freeze that turns writable buckets into durable

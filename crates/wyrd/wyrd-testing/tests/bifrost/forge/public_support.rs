@@ -2,7 +2,7 @@
 //!
 //! Contains no tests. Every item here reaches the server the way a real caller
 //! does — registration through the real catalog route, ingest over public gRPC,
-//! reads over the public strict fused query route — so a journey that uses them
+//! reads over the public query route — so a journey that uses them
 //! is exercising the shipped surface rather than an in-process engine.
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,7 +16,7 @@ use wyrd_testing::WyrdTestServer;
 
 use arrow::datatypes::{DataType, Field};
 
-/// Rows every strict fused public read in this process has really returned.
+/// Rows every public read in this process has really returned.
 ///
 /// Counted where the result batches are decoded, so a journey reconciling
 /// Oracle's own returned-row counter compares it against what the public route
@@ -25,7 +25,7 @@ use arrow::datatypes::{DataType, Field};
 /// count belongs to exactly one journey.
 static PUBLIC_ROWS_RETURNED: AtomicU64 = AtomicU64::new(0);
 
-/// Returns the rows strict fused public reads have returned in this process.
+/// Returns the rows public reads have returned in this process.
 pub(crate) fn public_rows_returned() -> u64 {
     PUBLIC_ROWS_RETURNED.load(Ordering::Acquire)
 }
@@ -229,8 +229,8 @@ pub(crate) fn canonical_order(mut rows: Vec<ManagedRow>) -> Vec<ManagedRow> {
 
 /// Reads one table's complete acknowledged-row set through the public route.
 ///
-/// Strict freshness and fused visibility are what make the read an authority
-/// check: the answer must come from whichever tier currently owns the rows, so
+/// Every query reads published and live sources, so a successful terminal is
+/// what makes the read an authority check: the answer must come from whichever tier currently owns the rows, so
 /// a promotion or a rewrite that lost, duplicated, or stranded a row shows up
 /// here rather than only in the catalog. The managed identity columns are
 /// selected alongside the user column so the result is comparable by identity,
@@ -246,7 +246,7 @@ pub(crate) async fn read_managed_rows(
 ) -> Vec<ManagedRow> {
     let sql = format!("SELECT wyrd_batch_id, wyrd_row_ordinal, value FROM {table}");
     let mut stream = wyrd_client::Bifrost::query_only(client)
-        .query(&strict_fused(sql.clone()))
+        .query(&public_query(sql.clone()))
         .await
         .unwrap_or_else(|error| panic!("public query `{sql}` starts: {error}"));
     let mut rows = Vec::new();
@@ -257,6 +257,11 @@ pub(crate) async fn read_managed_rows(
     {
         rows.extend(decode_managed_rows(&batch));
     }
+    assert_eq!(
+        stream.terminal().map(|terminal| terminal.outcome),
+        Some(wyrd_spec::vala::api::QueryTerminalOutcome::Success),
+        "an authority read of `{sql}` must see every source"
+    );
     canonical_order(rows)
 }
 
@@ -306,7 +311,7 @@ fn decode_managed_rows(batch: &arrow::record_batch::RecordBatch) -> Vec<ManagedR
 }
 
 /// Builds the one customer read shape this journey is allowed to use.
-fn strict_fused(sql: String) -> wyrd_spec::vala::api::BifrostQueryRequest {
+fn public_query(sql: String) -> wyrd_spec::vala::api::BifrostQueryRequest {
     wyrd_spec::vala::api::BifrostQueryRequest {
         sql,
         deadline_ms: Some(120_000),
@@ -324,7 +329,7 @@ pub(crate) async fn try_read(
 ) -> Result<Vec<ManagedRow>, wyrd_client::bifrost::BifrostClientError> {
     let sql = format!("SELECT wyrd_batch_id, wyrd_row_ordinal, value FROM {table}");
     let mut stream = wyrd_client::Bifrost::query_only(client)
-        .query(&strict_fused(sql))
+        .query(&public_query(sql))
         .await?;
     let mut rows = Vec::new();
     while let Some(batch) = stream.next_batch().await? {

@@ -132,7 +132,7 @@ async fn scribe_write_flush_read_user_journey() {
 /// The canonical span ledger is a server-owned built-in, so the pod provisions
 /// it and the fixture then uses the only door a caller has: the table's own
 /// published description, one public Arrow batch write, the pod's own Scribe
-/// publication, and a strict fused public read. A second active tenant
+/// publication, and a public read. A second active tenant
 /// provisions the same ledger and reads the same scope, which must return
 /// nothing — the ledger is shared by name, never by content.
 ///
@@ -236,7 +236,7 @@ async fn assert_canonical_genai_span_is_tenant_isolated(server: &wyrd_testing::W
     );
 }
 
-/// Drain one strict fused public read into its batches.
+/// Drain one public read into its batches.
 ///
 /// # Panics
 ///
@@ -516,7 +516,7 @@ async fn assert_empty_table_reads_cleanly(server: &wyrd_testing::WyrdTestServer)
     );
 }
 
-/// An undialable ready Scribe peer fails a strict fused read with its typed 503.
+/// An undialable ready Scribe peer fails a public read with its typed 503.
 ///
 /// This drives the public SDK against an active, unflushed generation so Oracle
 /// must use the private Scribe RPC. The test then replaces only the durable
@@ -682,7 +682,7 @@ async fn tenant_writer(
     .expect("tenant SDK write door")
 }
 
-/// Appends one row without flushing so strict fused visibility requires Scribe.
+/// Appends one row without flushing so the read needs the live Scribe tier.
 async fn append_active_row(writer: &wyrd_testing::bifrost::write::BifrostWriter, table: &str) {
     let schema = Arc::new(Schema::new(vec![Field::new(
         "value",
@@ -1016,7 +1016,7 @@ async fn append_correlated(
 ///
 /// # Panics
 ///
-/// Panics when the strict fused read fails or a managed column is missing or
+/// Panics when the public read fails or a managed column is missing or
 /// carries the wrong Arrow type.
 async fn read_correlation(
     client: &wyrd_client::WyrdClient,

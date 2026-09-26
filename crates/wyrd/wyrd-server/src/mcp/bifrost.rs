@@ -842,13 +842,17 @@ mod tests {
                 execution_path: QueryExecutionPath::Interactive,
                 row_count: 2,
                 warnings: Vec::new(),
-                source_completion: [QuerySource::Iceberg, QuerySource::HotSealed]
-                    .into_iter()
-                    .map(|source| SourceCompletion {
-                        source,
-                        outcome: SourceCompletionOutcome::Complete,
-                    })
-                    .collect(),
+                source_completion: [
+                    QuerySource::Iceberg,
+                    QuerySource::HotSealed,
+                    QuerySource::LiveTail,
+                ]
+                .into_iter()
+                .map(|source| SourceCompletion {
+                    source,
+                    outcome: SourceCompletionOutcome::Complete,
+                })
+                .collect(),
                 error: None,
                 arrow_ipc_eos: eos,
             })),

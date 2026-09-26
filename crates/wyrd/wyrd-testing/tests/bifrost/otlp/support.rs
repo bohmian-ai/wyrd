@@ -983,9 +983,10 @@ impl OtlpJourney {
             .expect("the acknowledged rows publish");
     }
 
-    /// Runs one strict fused public query and returns its batches.
+    /// Runs one public query and returns its batches.
     ///
-    /// Strict freshness and fused visibility make the read an authority check:
+    /// Every query reads published and live sources, so a successful terminal
+    /// makes the read an authority check:
     /// the answer must come from whichever source owns the rows now, not from
     /// whichever source is cheapest.
     ///
@@ -996,7 +997,7 @@ impl OtlpJourney {
         self.query_as(&self.client, sql).await
     }
 
-    /// Runs one strict fused public query through a caller-supplied client.
+    /// Runs one public query through a caller-supplied client.
     ///
     /// # Panics
     ///
@@ -1021,10 +1022,15 @@ impl OtlpJourney {
         {
             batches.push(batch);
         }
+        assert_eq!(
+            stream.terminal().map(|terminal| terminal.outcome),
+            Some(wyrd_spec::vala::api::QueryTerminalOutcome::Success),
+            "an authority read of `{sql}` must see every source"
+        );
         batches
     }
 
-    /// Runs one strict fused public query, returning its stable refusal code.
+    /// Runs one public query, returning its stable refusal code.
     ///
     /// A negative journey has to distinguish "the table holds no matching row"
     /// from "no accepted record ever materialized this table"; both are proof
@@ -1064,7 +1070,7 @@ impl OtlpJourney {
         Ok(batches)
     }
 
-    /// Runs one strict fused public query and returns its single row.
+    /// Runs one public query and returns its single row.
     ///
     /// # Panics
     ///

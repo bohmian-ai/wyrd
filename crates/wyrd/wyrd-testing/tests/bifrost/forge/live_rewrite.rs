@@ -818,7 +818,7 @@ struct RecoveryTelemetry {
     output_bytes: u64,
     /// Rows public appends acknowledged inside the journey window.
     acknowledged_rows: u64,
-    /// Rows strict fused public reads really returned inside the window.
+    /// Rows public reads really returned inside the window.
     returned_rows: u64,
 }
 
@@ -1107,7 +1107,7 @@ const APPROVED_FORGE_FAMILIES: &[&str] = &[
 ///
 /// The route is the shipped one end to end: two tenants register the same table
 /// name, append through authenticated public gRPC, and read back through the
-/// strict fused public query route. The pod's own Scribe publishes their
+/// public query route. The pod's own Scribe publishes their
 /// objects, the pod's own Forge scheduler and worker promote them, and the
 /// settled table then plans its own rewrite. That rewrite's commit is accepted
 /// by the real catalog which then loses the response, so the worker claims
@@ -1117,7 +1117,7 @@ const APPROVED_FORGE_FAMILIES: &[&str] = &[
 ///
 /// The customer oracle is the public read, and it is exact: at every one of the
 /// four cuts — before promotion, after promotion, across the uncertain commit,
-/// and after recovery — each tenant's strict fused read must return the exact
+/// and after recovery — each tenant's public read must return the exact
 /// `(batch_id, row_ordinal, value)` multiset it acknowledged, with the matching
 /// canonical digest, and the neighbouring tenant's identically named table must
 /// be neither read, rewritten, nor disturbed.

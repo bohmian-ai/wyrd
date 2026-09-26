@@ -348,7 +348,7 @@ mod tests {
         assert!(!absent.message().contains(request_id.as_str()));
     }
 
-    /// Builds the exact complete source set for a published-only terminal.
+    /// Builds the complete three-tier source set every successful terminal carries.
     fn complete_sources() -> Vec<SourceCompletion> {
         vec![
             SourceCompletion {
@@ -357,6 +357,10 @@ mod tests {
             },
             SourceCompletion {
                 source: QuerySource::HotSealed,
+                outcome: SourceCompletionOutcome::Complete,
+            },
+            SourceCompletion {
+                source: QuerySource::LiveTail,
                 outcome: SourceCompletionOutcome::Complete,
             },
         ]
@@ -523,10 +527,7 @@ mod tests {
     #[tokio::test]
     async fn http_and_grpc_query_frame_parity_covers_degraded_and_late_failed() {
         let mut degraded_sources = complete_sources();
-        degraded_sources.push(SourceCompletion {
-            source: QuerySource::LiveTail,
-            outcome: SourceCompletionOutcome::Unavailable,
-        });
+        degraded_sources[2].outcome = SourceCompletionOutcome::Unavailable;
         let degraded = vec![
             schema_frame(),
             QueryStreamFrame::Batch(QueryBatchFrame {

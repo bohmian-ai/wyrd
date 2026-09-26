@@ -135,7 +135,7 @@ impl Participant {
 ///
 /// Reads then follow the rows through all three authorities: active writable
 /// buckets, durable staged members after the freeze, and committed hot objects
-/// after publication. Each read is the public strict fused query, so it is the
+/// after publication. Each read is the public query, so it is the
 /// Oracle path answering from whichever source currently owns the rows, and it
 /// must not be able to tell which one that was. Tenant isolation is asserted at
 /// the same time by construction: an exact comparison against disjoint expected

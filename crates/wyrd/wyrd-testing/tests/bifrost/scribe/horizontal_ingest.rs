@@ -5,7 +5,7 @@
 //! store and one catalog — accept work on every pod at once, and does adding
 //! tenants and tables to that topology change the pod-local machine that serves
 //! them? Every write is a public authenticated gRPC append to one endpoint,
-//! every read is the public strict fused query route, and every claim about a
+//! every read is the public query route, and every claim about a
 //! pod is read from that pod's own production Scribe inspection rather than
 //! inferred from the client side.
 
@@ -178,7 +178,7 @@ async fn multi_pod_concurrent_batches_are_owned_and_visible() {
 ///
 /// So this submits one immutable batch — one batch id over one byte-identical
 /// Arrow payload — to all three pod endpoints simultaneously from one barrier,
-/// and requires the public strict fused read to return each
+/// and requires the public public read to return each
 /// `(batch id, row ordinal)` exactly once. Every attempt must still be
 /// acknowledged: a suppressed duplicate is an idempotent success, not a refusal
 /// the caller has to interpret.
@@ -458,7 +458,7 @@ fn expected_rows(batches: &[SubmittedBatch]) -> Vec<RowIdentity> {
 
 /// Reads one table's complete durable identities through the public query route.
 ///
-/// Strict fused visibility is what makes this an authority read: the rows must
+/// A successful terminal is what makes this an authority read: the rows must
 /// come from whichever source currently owns them. The batch id and row ordinal
 /// are the identity Scribe itself stamped, so the returned set is comparable to
 /// the submitted set without the test inventing an identity of its own.

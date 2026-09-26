@@ -569,7 +569,7 @@ mod tests {
         assert!(response.into_body().collect().await.is_err());
     }
 
-    /// Builds the required complete source set for a published-only terminal.
+    /// Builds the complete three-tier source set every successful terminal carries.
     fn complete_sources() -> Vec<SourceCompletion> {
         vec![
             SourceCompletion {
@@ -578,6 +578,10 @@ mod tests {
             },
             SourceCompletion {
                 source: QuerySource::HotSealed,
+                outcome: SourceCompletionOutcome::Complete,
+            },
+            SourceCompletion {
+                source: QuerySource::LiveTail,
                 outcome: SourceCompletionOutcome::Complete,
             },
         ]

@@ -1653,7 +1653,7 @@ impl WyrdTestServer {
     /// of read decisions never counts the inspection reads that produced it.
     ///
     /// A tenant that has never published owns no retained table yet, which is an
-    /// honest zero rather than a failure. A strict fused read may also refuse
+    /// honest zero rather than a failure. A public read may also refuse
     /// with the retryable `QueryVisibilityUnavailable` while publication moves
     /// the live cut; that yields `None` so a bounded poll retries instead of
     /// failing early.
@@ -1848,7 +1848,7 @@ impl WyrdTestServer {
     /// Counts retained rows for `predicate`, retrying only a transient refusal.
     ///
     /// # Errors
-    /// Returns the query failure, or a timeout when strict fused visibility
+    /// Returns the query failure, or a timeout when the published source
     /// stays unavailable for the whole budget.
     async fn retained_audit_count(
         &self,

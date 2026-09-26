@@ -32,7 +32,7 @@ const PUBLICATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(9
 /// Retained history is registered by its first publication, so a tenant that
 /// has never published owns no such table yet. That is an honest zero rather
 /// than a failure: the caller is polling for a move the server has not made.
-/// A strict fused read may also refuse with the retryable
+/// A public read may also refuse with the retryable
 /// `QueryVisibilityUnavailable` while publication moves the live cut; that
 /// yields `None` so the bounded poll retries instead of failing early.
 ///

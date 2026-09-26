@@ -233,12 +233,7 @@ mod pg_tests {
     async fn finish_issues_seals_and_audits_the_session() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/jwks"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(ed_jwks_json(EXTERNAL_KID)))
-            .mount(&server)
-            .await;
+        let server = jwks_server().await;
         let state = test_state_with_external(&fixture).await;
         let trusted =
             trusted_issuer_with_jwks(tenant, jwks_uri(&server), HashMap::new(), Vec::new());
@@ -296,12 +291,7 @@ mod pg_tests {
     async fn a_wrong_audience_is_refused_and_leaves_no_completion() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/jwks"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(ed_jwks_json(EXTERNAL_KID)))
-            .mount(&server)
-            .await;
+        let server = jwks_server().await;
         let state = test_state_with_external(&fixture).await;
         let trusted =
             trusted_issuer_with_jwks(tenant, jwks_uri(&server), HashMap::new(), Vec::new());
@@ -505,16 +495,9 @@ mod pg_tests {
     #[tokio::test]
     async fn same_email_different_subjects_are_distinct_users() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let tenant = fixture.data_tenant_id();
         let server = jwks_server().await;
         let state = test_state_with_external(&fixture).await;
-        seed_role(&fixture, SYNC_ROLE).await;
-        let trusted = trusted_issuer_with_jwks(
-            tenant,
-            jwks_uri(&server),
-            HashMap::from([("admins".to_owned(), vec![SYNC_ROLE.to_owned()])]),
-            Vec::new(),
-        );
+        let trusted = sync_trusted(&fixture, &server).await;
         let binding = committed_active_binding(&fixture).await;
         let service = authorization_exchange_service(&state);
         for (n, subject, groups) in [(6, "subject-a", &["admins"][..]), (7, "subject-b", &[])] {
@@ -558,16 +541,9 @@ mod pg_tests {
     #[tokio::test]
     async fn changed_roles_are_audited_once_and_unchanged_roles_never() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let tenant = fixture.data_tenant_id();
         let server = jwks_server().await;
         let state = test_state_with_external(&fixture).await;
-        seed_role(&fixture, SYNC_ROLE).await;
-        let trusted = trusted_issuer_with_jwks(
-            tenant,
-            jwks_uri(&server),
-            HashMap::from([("admins".to_owned(), vec![SYNC_ROLE.to_owned()])]),
-            Vec::new(),
-        );
+        let trusted = sync_trusted(&fixture, &server).await;
         let binding = committed_active_binding(&fixture).await;
         let service = authorization_exchange_service(&state);
         for n in [8, 9] {
@@ -608,16 +584,9 @@ mod pg_tests {
     #[tokio::test]
     async fn a_failed_role_sync_audit_rolls_back_the_whole_login() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let tenant = fixture.data_tenant_id();
         let server = jwks_server().await;
         let state = test_state_with_external(&fixture).await;
-        seed_role(&fixture, SYNC_ROLE).await;
-        let trusted = trusted_issuer_with_jwks(
-            tenant,
-            jwks_uri(&server),
-            HashMap::from([("admins".to_owned(), vec![SYNC_ROLE.to_owned()])]),
-            Vec::new(),
-        );
+        let trusted = sync_trusted(&fixture, &server).await;
         let binding = committed_active_binding(&fixture).await;
         let (hash, login) = pending_login(&fixture, state_hash(10), binding, "nonce").await;
         let superuser = fixture
@@ -695,6 +664,22 @@ mod pg_tests {
         .await
         .expect("role inserts");
         conn.commit().await.expect("role commits");
+    }
+
+    /// Seed [`SYNC_ROLE`] and trust the external issuer at `server` with
+    /// group `admins` mapped to it and no default roles, the setup every
+    /// role-sync test shares.
+    ///
+    /// # Panics
+    /// Panics when the role cannot be written.
+    async fn sync_trusted(fixture: &PgFixture, server: &MockServer) -> TrustedIssuer {
+        seed_role(fixture, SYNC_ROLE).await;
+        trusted_issuer_with_jwks(
+            fixture.data_tenant_id(),
+            jwks_uri(server),
+            HashMap::from([("admins".to_owned(), vec![SYNC_ROLE.to_owned()])]),
+            Vec::new(),
+        )
     }
 
     /// Role names durably granted to `user`.

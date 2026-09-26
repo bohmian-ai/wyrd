@@ -1,6 +1,6 @@
 ---
 id: SPEC-oidc-production-readiness
-revision: 4
+revision: 5
 status: approved
 ---
 
@@ -71,11 +71,20 @@ authentication.
   `private_key_jwt` is refused until it is implemented end to end.
 - **REQ-005**: A provider secret is accepted only at an authorized server
   boundary, encrypted at rest, and absent from read responses, browser data,
-  logs, traces, errors, audit, and generated artifacts. A deployment sealing
-  secret is required only while provider secrets are stored. Operators can
-  rotate it without making existing connections permanently unusable; the
-  rotation procedure is documented and tested. No per-tenant OIDC secret is
-  injected into every serving replica as an environment variable.
+  logs, traces, errors, audit, and generated artifacts. Recoverable Wyrd
+  login and browser-session credentials, including a pending access/refresh
+  token pair or an operator bootstrap API key, are likewise encrypted at rest
+  and never returned to an unauthorized client. One deployment sealing
+  keyring, held separately from the encrypted data and shared by serving
+  replicas, protects these values. It is required whenever provider secrets
+  are stored or human login or browser sessions persist recoverable
+  credentials, including when the provider uses no client secret; otherwise
+  it is optional. Missing key material refuses activation or use of the
+  affected human login or session flow without disabling independent machine
+  authentication. Operators can rotate the keyring without making existing
+  connections or sessions permanently unusable; the rotation procedure is
+  documented and tested. No per-tenant OIDC secret is injected into every
+  serving replica as an environment variable.
 
 ### Browser login and session
 
@@ -106,8 +115,12 @@ authentication.
   usable across serving replicas. The browser gets a Secure, HttpOnly,
   SameSite cookie and safe session metadata, never a Wyrd bearer or refresh
   token in page data, URL, JavaScript storage, or a JSON callback page. BFF
-  actions enforce CSRF, expiry, tenant binding, and Wyrd permissions. Logout
-  ends the Wyrd browser session; it does not claim to end every IdP session.
+  completion redeems a short-lived, one-time pending credential only when
+  bound to the initiating browser flow and authorized server-side BFF caller;
+  missing, expired, replayed, or mismatched claims return no credential or
+  session. BFF actions enforce CSRF, expiry, tenant binding, and Wyrd
+  permissions. Logout ends the Wyrd browser session; it does not claim to end
+  every IdP session.
 - **REQ-010**: With OIDC absent, a self-hosted operator can sign in to the UI
   through an existing authorized Wyrd credential. This uses Wyrd's existing
   exchange and session authority; no new local password store is introduced.
@@ -119,9 +132,11 @@ authentication.
 - **REQ-011**: `wyrd auth login` for a human opens the system browser and
   completes the tenant's SSO flow without pasting a callback URL or printing
   access or refresh tokens. The CLI obtains the Wyrd user credential through
-  a short-lived, one-time handoff bound to the initiated login; neither the
-  provider authorization code nor a Wyrd token is put in a redirect URL.
-  A second IdP application registration is not required solely for CLI use.
+  a short-lived, one-time handoff bound to the initiated login and a
+  CLI-held secret; an absent, wrong, expired, or replayed claim returns no
+  credential. Neither the provider authorization code nor a Wyrd token is
+  put in a redirect URL. A second IdP application registration is not
+  required solely for CLI use.
 - **REQ-012**: The CLI stores the renewable Wyrd user credential in a
   user-protected credential store with tenant and server identity. Rust,
   Python, and TypeScript clients resolve it through the shared client and
@@ -228,6 +243,11 @@ outside this change.
 6. A local interactive login gives all first-class SDKs renewable Wyrd user
    authority for one server and tenant. The browser session and provider
    tokens are not SDK credentials; deployed workloads use their own identity.
+7. A completed OIDC callback hands Wyrd credentials to its initiating browser
+   or CLI through one server-owned, encrypted, expiring, single-use handoff.
+   The deployment keyring protects recoverable provider and Wyrd session
+   credentials in both self-hosted and hosted deployments; the number of
+   tenants does not select a different secret-storage or login path.
 
 ## Acceptance criteria and evidence
 
@@ -259,10 +279,13 @@ outside this change.
 - **AC-007**: Fault and security evidence covers IdP outage, unsafe discovery
   and JWKS URL, invalid token and nonce, replayed or expired state, wrong
   callback origin, inactive connection, unsupported client auth, audit
-  failure, mapping changes, provider key and secret rotation, and BFF session
-  behavior across two serving replicas. It proves an unmapped but valid
-  provider subject receives a tenant `User` without privileged grants, and an
-  old-connection BFF session cannot renew after replacement or removal.
+  failure, mapping changes, provider key and secret rotation, absent or
+  rotated sealing keys, and BFF session behavior across two serving replicas.
+  A missing or wrong browser-flow binding, unauthorized BFF caller, missing or
+  wrong CLI handoff secret, expired handoff, or second redemption yields no
+  Wyrd credential or browser session. An unmapped but valid provider subject
+  receives a tenant `User` without privileged grants, and an old-connection
+  BFF session cannot renew after replacement or removal.
 - **AC-008**: Provider qualification uses controlled Okta, Keycloak, and
   Entra ID accounts over externally trusted TLS for each combination publicly
   claimed as supported. Redacted results identify the immutable Wyrd artifact,
@@ -280,6 +303,12 @@ revision and human approval.
 
 ## Revision history
 
+- **Revision 5 — 2026-09-26 — approved**: Approved the existing encrypted,
+  short-lived, one-time browser/CLI credential handoff. Clarified that the
+  deployment sealing keyring also protects recoverable login and browser
+  session credentials, including secretless-provider and OIDC-off browser
+  sessions; required initiator-bound, single-use redemption and key-failure
+  evidence. This supersedes revision 4's provider-secrets-only key condition.
 - **Revision 4 — 2026-09-25 — approved**: Clarified the CLI-to-SDK local user
   credential flow, explicit precedence, tenant selection, and safe concurrent
   renewal of a shared saved login.
@@ -316,3 +345,6 @@ revision and human approval.
   [RFC 9700](https://www.rfc-editor.org/rfc/rfc9700.html), and
   [RFC 10017](https://www.rfc-editor.org/rfc/rfc10017.html): protocol and
   browser/native-client security guidance.
+- [OWASP Cryptographic Storage](https://cheatsheetseries.owasp.org/cheatsheets/Cryptographic_Storage_Cheat_Sheet.html)
+  and [Secrets Management](https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html):
+  protection and management of stored credentials and deployment keys.

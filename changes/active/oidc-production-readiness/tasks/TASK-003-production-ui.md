@@ -3,8 +3,8 @@ id: TASK-003
 kind: implementation
 status: ready
 spec: SPEC-oidc-production-readiness
-spec_revision: 4
-requirements: [REQ-003, REQ-006, REQ-009, REQ-010, REQ-015, REQ-016, REQ-018, INV-001, INV-003, INV-005, AC-001, AC-002, AC-003, AC-006, AC-007, AC-009]
+spec_revision: 5
+requirements: [REQ-003, REQ-005, REQ-006, REQ-009, REQ-010, REQ-015, REQ-016, REQ-018, INV-001, INV-003, INV-005, AC-001, AC-002, AC-003, AC-006, AC-007, AC-009]
 depends_on: [TASK-002]
 ---
 
@@ -55,17 +55,23 @@ cookie and sends only its hash to TASK-002's `BeginLogin`; TASK-002 binds that
 hash into state. After callback verification
 and Wyrd issuance, the server stores the token pair against that flow and
 redirects to a fixed BFF completion route without query data. That route
-redeems the flow once using its cookie and BFF service credential. In the
-same transaction the server consumes the flow, creates the session, hashes
-its own random 256-bit session ID for storage, and returns the raw ID once
+redeems the existing sealed completion once using its cookie and BFF service
+credential. Missing or mismatched cookies, an unauthorized BFF caller,
+expired completion, and a second redemption return no credential or session.
+In the same transaction, the server consumes the flow, creates the session,
+hashes its own random 256-bit session ID for storage, and returns the raw ID once
 over the private channel to the BFF. The BFF sets exactly that ID as an
 opaque session cookie (`Secure`, `HttpOnly`, `SameSite=Lax`, host-only, path `/`, bounded
 expiry), clears the flow cookie, and redirects to the tenant page without
 carrying a grant or tokens.
-The session ID is stored only as a hash in Postgres; token pair is encrypted
-at rest. Invalid/expired/replayed flow sets no session cookie. Both BFF replicas
-resolve the same record through the server, with no process-local production
-session authority. On creation the BFF sends a random session CSRF token only
+The session ID is stored only as a hash in Postgres; the token pair is encrypted
+at rest with the deployment keyring from REQ-005. An OIDC-off UI session's
+recoverable bootstrap API key uses the same keyring. Missing key material
+refuses session creation or renewal without disabling independent machine
+authentication. Invalid, expired, or replayed flow sets no session cookie.
+Both BFF replicas resolve the same record through the server, with no
+process-local production session authority. On creation the BFF sends a
+random session CSRF token only
 over the private channel; the server stores its hash and encrypted value.
 Every replica retrieves the raw token through `SessionRead` to render existing
 form fields; the BFF checks submitted token against the stored hash in
@@ -101,7 +107,7 @@ flag is accepted in production.
 
 ### Scenario 1 — Production SSO session
 
-**Behavior.** The tenant login page offers SSO only when active; callback establishes a session on the correct tenant. A second replica can use it. Browser URL, page data, JavaScript storage, and callback response expose no Wyrd bearer or refresh token.
+**Behavior.** The tenant login page offers SSO only when active; callback establishes a session on the correct tenant. A second replica can use it. Browser URL, page data, JavaScript storage, and callback response expose no Wyrd bearer or refresh token. Missing or wrong flow cookie, unauthorized BFF service credential, expiry, and replay establish no session.
 
 **RED.** Add a BFF route/action test and real-server browser journey; observe the current production mock-auth refusal or token/session mismatch.
 
@@ -121,7 +127,7 @@ flag is accepted in production.
 
 ### Scenario 3 — OIDC-off and tenant settings
 
-**Behavior.** Without OIDC, an authorized Wyrd credential reaches a real self-hosted UI; no IdP or mock flag is needed. Tenant administrators can view redacted settings and perform permitted connection actions; other tenants cannot.
+**Behavior.** Without OIDC, an authorized Wyrd credential reaches a real self-hosted UI; no IdP or mock flag is needed. The stored bootstrap credential is sealed by the same deployment keyring, and a missing key refuses session creation. Tenant administrators can view redacted settings and perform permitted connection actions; other tenants cannot.
 
 **RED.** Add an OIDC-off UI journey and tenant settings permission tests; observe missing entry or settings projection.
 

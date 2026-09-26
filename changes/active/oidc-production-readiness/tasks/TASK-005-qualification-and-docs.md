@@ -3,8 +3,8 @@ id: TASK-005
 kind: implementation
 status: ready
 spec: SPEC-oidc-production-readiness
-spec_revision: 4
-requirements: [REQ-001, REQ-018, INV-001, INV-003, INV-004, INV-005, INV-006, AC-001, AC-002, AC-003, AC-004, AC-005, AC-006, AC-007, AC-008, AC-009]
+spec_revision: 5
+requirements: [REQ-001, REQ-005, REQ-018, INV-001, INV-003, INV-004, INV-005, INV-006, AC-001, AC-002, AC-003, AC-004, AC-005, AC-006, AC-007, AC-008, AC-009]
 depends_on: [TASK-003, TASK-004]
 ---
 
@@ -21,7 +21,7 @@ Own the public self-hosted and hosted documentation, CLI help, architecture auth
 ## Approach
 
 1. Reconcile public API, generated schemas, UI, CLI help, and documentation against the approved contract.
-2. Document IdP and Wyrd operator responsibilities, setup inputs and exact callback, one-active-connection rule, role mapping, local human login, independent machine identity, secret rotation, failure handling, and recovery.
+2. Document IdP and Wyrd operator responsibilities, setup inputs and exact callback, one-active-connection rule, role mapping, local human login, independent machine identity, the shared deployment keyring for provider secrets and recoverable login/session credentials, key rotation across replicas, missing-key failure, and recovery. State that secretless-provider human login and OIDC-off UI sessions still need the keyring; machine-only use without recoverable stored credentials does not.
 3. Run the integrated self-hosted OIDC-off and OIDC-on journeys and the hosted two-tenant journey, including negative and provider-switch flows.
 4. Qualify Okta, Keycloak, and Entra ID with controlled accounts over externally trusted TLS for every combination publicly claimed; record redacted immutable artifact, topology, origin, configuration fingerprint, time, and outcome.
 

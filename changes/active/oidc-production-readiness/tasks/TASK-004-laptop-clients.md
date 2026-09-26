@@ -3,8 +3,8 @@ id: TASK-004
 kind: implementation
 status: ready
 spec: SPEC-oidc-production-readiness
-spec_revision: 4
-requirements: [REQ-011, REQ-012, REQ-015, REQ-016, INV-001, INV-002, INV-003, INV-005, AC-004, AC-007, AC-009]
+spec_revision: 5
+requirements: [REQ-005, REQ-011, REQ-012, REQ-015, REQ-016, INV-001, INV-002, INV-003, INV-005, AC-004, AC-007, AC-009]
 depends_on: [TASK-002]
 ---
 
@@ -33,12 +33,15 @@ most five minutes), and completion state. `POST /auth/cli-handoffs` accepts
 tenant route key as pre-login routing context and returns
 `{handoff_id, login_url, poll_verifier: Secret, expires_at}` over TLS. The CLI
 opens `login_url`; TASK-002 binds `handoff_id` in one-use login state. After
-provider callback, the server stores Wyrd credentials under the handoff and
-shows only a generic browser success page. No provider code, Wyrd token, or
-poll verifier is in the browser URL/page. CLI polls
+provider callback, the server seals the Wyrd credentials once in TASK-002's
+existing pending-completion row, bound to the handoff ID, and shows only a
+generic browser success page. The handoff row stores the verifier binding,
+not a second token copy. No provider code, Wyrd token, or poll verifier is in
+the browser URL/page. CLI polls
 `POST /auth/cli-handoffs/{id}/claim` with the verifier. Pending returns a
-bounded retry interval; complete atomically consumes the handoff and returns
-`{server_origin, tenant_id, principal_id, access_token, refresh_token,
+bounded retry interval; complete atomically consumes the handoff and its
+sealed completion and returns `{server_origin, tenant_id, principal_id,
+access_token, refresh_token,
 access_expires_at}` only to the verifier holder. Wrong verifier, tenant,
 expiry, second claim, and cancellation return typed refusals and no tokens.
 Throttle polling and audit completion/refusal. No second IdP app is used.
@@ -91,7 +94,7 @@ tenant's record. Routine API requests contact Wyrd, not the IdP.
 
 ### Scenario 1 — Browser to CLI handoff
 
-**Behavior.** The system browser completes SSO; the CLI receives Wyrd user authority through a bound, expiring, one-use handoff without callback paste, redirect token, printed token, or second IdP app.
+**Behavior.** The system browser completes SSO; the CLI receives Wyrd user authority through the existing sealed, bound, expiring, one-use completion without callback paste, redirect token, printed token, duplicate token store, or second IdP app. A missing or wrong verifier, wrong tenant, expired completion, and replay return no credentials.
 
 **RED.** Add a real-server CLI journey with success, replay, expiry, and wrong-initiator cases; observe the current pasted-callback flow or an accepted replay.
 

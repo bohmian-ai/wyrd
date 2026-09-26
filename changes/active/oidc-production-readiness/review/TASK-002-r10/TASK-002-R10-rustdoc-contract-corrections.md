@@ -3,8 +3,8 @@ id: TASK-002-R10
 kind: remediation
 status: ready
 spec: SPEC-oidc-production-readiness
-spec_revision: 4
-requirements: [REQ-006, REQ-007, REQ-008, REQ-013, REQ-014, REQ-015, REQ-016, REQ-017, INV-001, INV-002, INV-003, INV-004, AC-002, AC-003, AC-005, AC-006, AC-007]
+spec_revision: 5
+requirements: [REQ-005, REQ-006, REQ-007, REQ-008, REQ-009, REQ-011, REQ-013, REQ-014, REQ-015, REQ-016, REQ-017, INV-001, INV-002, INV-003, INV-004, AC-002, AC-003, AC-004, AC-005, AC-006, AC-007]
 depends_on: [TASK-002-R9]
 parent_task: TASK-002
 remediates: [FIND-TASK-002-23, FIND-TASK-002-24]
@@ -15,7 +15,7 @@ remediates: [FIND-TASK-002-23, FIND-TASK-002-24]
 ## Authority and immutable review subject
 
 - Approved specification:
-  `changes/active/oidc-production-readiness/spec.md`, revision 4
+  `changes/active/oidc-production-readiness/spec.md`, revision 5
 - Original task:
   `changes/active/oidc-production-readiness/tasks/TASK-002-tenant-login.md`
 - Reviewed base: `3fc085acf5b3a710d5dc80892bd2e664b3db6174`
@@ -27,6 +27,17 @@ remediates: [FIND-TASK-002-23, FIND-TASK-002-24]
 Apply `AGENTS.md` section 16, `architecture/agent-rules.md`, and
 `architecture/references/languages/rust-core.md`. Route this bounded task
 directly to `$wyrd-implement`.
+
+## Human-directed drift work
+
+The R10 verdict independently validated only `FIND-TASK-002-23` and
+`FIND-TASK-002-24`. The human subsequently required the additional remediation
+in [TASK-002-R10-human-directed-drift.md](TASK-002-R10-human-directed-drift.md).
+Implement and verify that packet before requesting another TASK-002 PASS. Its
+items are human direction, not retroactive R10 reviewer findings. The
+documentation-only limits below apply to the two R10 findings, not to the
+separate human-directed packet. The human-approved sealing-key decision is
+recorded in specification revision 5; apply REQ-005 as revised.
 
 ## Outcome
 
@@ -94,17 +105,18 @@ add a documentation checker.
 |---|---|
 | `new_grant_variants_reject_unknown_fields` has substantive rustdoc stating that the surviving `jwt-bearer` and `refresh_token` variants reject unknown fields after authorization-code retirement, while its body is byte-for-byte unchanged. | `FIND-TASK-002-23` |
 | The auth-routes module rustdoc names tenant human login initiation, token exchange, OIDC callback, and Card-bound API-key issuance, while the module's executable contents are unchanged. | `FIND-TASK-002-24` |
-| The remediation diff changes only the two cited rustdoc blocks and introduces no generated, executable, contract, test-body, dependency, feature, fixture, or unrelated documentation change. | `FIND-TASK-002-23`, `FIND-TASK-002-24` |
+| The subdiff for these two documentation findings changes only the two cited rustdoc blocks; executable and test changes are assessed separately against the human-directed packet. | `FIND-TASK-002-23`, `FIND-TASK-002-24` |
 | `FIND-TASK-002-1` through `FIND-TASK-002-22` remain closed. | Both |
 
 ## Focused proof and broader verification
 
-No new runtime test is warranted: both gaps are static documentation
-contracts, and the existing test and router bodies must not change.
+No new runtime test is warranted for these two static documentation gaps;
+the human-directed packet has separate behavioral proof obligations.
 
 1. Inspect the final two rustdoc blocks against their unchanged full item
    bodies and callers.
-2. Confirm the remediation diff contains only those two comment blocks.
+2. Confirm the subdiff for these findings contains only those two comment
+   blocks.
 3. Run `git diff --check`.
 4. Run `mise run fmt`.
 5. Run `mise run lints`.

@@ -120,6 +120,30 @@ pub(crate) async fn client_from_bootstrap(
         ..ClientConfig::default()
     })?)
 }
+/// Builds one public client against one pod's public HTTP and gRPC listeners.
+///
+/// # Errors
+///
+/// Returns the client configuration error.
+pub(crate) fn public_client(
+    node: &wyrd_testing::bifrost::process_cluster::ProcessNode,
+    api_key: &secrecy::SecretString,
+) -> Result<WyrdClient, JourneyError> {
+    Ok(WyrdClient::with_config(ClientConfig {
+        grpc: GrpcConfig {
+            endpoint: format!("http://{}", node.grpc_addr()),
+            connect_retries: 0,
+            ..GrpcConfig::default()
+        },
+        http: HttpConfig {
+            base_url: format!("http://{}", node.http_addr()),
+            ..HttpConfig::default()
+        },
+        credential: Some(api_key.clone()),
+        ..ClientConfig::default()
+    })?)
+}
+
 /// The three-column user schema every Oracle journey table registers.
 ///
 /// `unused_payload` is the wide column no narrow query requests; it exists so

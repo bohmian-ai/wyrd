@@ -7846,9 +7846,8 @@ impl datafusion_distributed::DesiredTaskCountHandler for AnalyticalCutTaskCount 
                 });
         }
         // The live Scribe leaf is leader-owned and has no wire encoding, so its
-        // stage is capped at one task and stays on the leader.
-        // ponytail: an aggregate over live rows then runs on the leader; a
-        // coalesce boundary under the union lets published work distribute.
+        // stage is capped at one task and stays on the leader;
+        // `LiveUnionBoundary` gives its published siblings their own stages.
         if ev
             .plan
             .downcast_ref::<super::live::LiveScribeExec>()
@@ -8307,9 +8306,9 @@ impl AnalyticalExecutionHandle {
         config.set_distributed_scale_up_leaf_node_handler(AnalyticalLeafSplit);
         config.set_distributed_worker_resolver(AnalyticalWorkerResolver { urls });
         config.set_distributed_route_tasks_handler(OracleRouteTasks { destinations });
-        // Bifrost's scan is one union of this table's leader-owned source kinds
-        // — published Iceberg, leader hot files, and the drained local live
-        // tail. Upstream's isolator would give that union one task per child
+        // Bifrost's scan is one union of this table's source kinds —
+        // published Iceberg, leader hot files, and the leader-owned live
+        // Scribe leaf. Upstream's isolator would give that union one task per child
         // and therefore place a plan the leader alone can read below a network
         // boundary, where the codec is asked to serialize leaves that exist
         // only on this node.
@@ -8325,6 +8324,7 @@ impl AnalyticalExecutionHandle {
             local.state(),
         )
         .with_config(config)
+        .with_physical_optimizer_rule(Arc::new(super::live::LiveUnionBoundary))
         .with_distributed_planner()
         .build();
         Ok(SessionContext::new_with_state(state))

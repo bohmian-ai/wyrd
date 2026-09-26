@@ -373,6 +373,84 @@ impl ExecutionPlan for LiveScribeExec {
     }
 }
 
+/// Physical optimizer rule that keeps published work distributable beside a live leaf.
+///
+/// A [`LiveScribeExec`] is capped at one leader task, and the distributed
+/// planner reconciles a whole stage to its smallest cap, so a union holding
+/// the live leaf would pull every published sibling onto the leader. Placing
+/// a `CoalescePartitionsExec` above each sibling without a live leaf makes the
+/// planner open a separate coalesce stage for it: published scans keep their
+/// cut-derived worker tasks, while the union, the live leaf, and everything
+/// above stay in the leader stage. A sibling whose stage is one task is
+/// elided back into the leader by the planner itself.
+///
+/// Only the analytical planning session installs it; the rule is a no-op for
+/// plans without a live leaf.
+#[derive(Debug)]
+pub(super) struct LiveUnionBoundary;
+
+impl datafusion::physical_optimizer::PhysicalOptimizerRule for LiveUnionBoundary {
+    /// Wraps every non-live sibling of each union that holds a live leaf.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `DataFusion` error when a union cannot be rebuilt over its
+    /// wrapped children.
+    fn optimize(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        _config: &datafusion::config::ConfigOptions,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        use datafusion::common::tree_node::{Transformed, TreeNode as _};
+        let holds_live = |plan: &Arc<dyn ExecutionPlan>| {
+            plan.exists(|node| Ok(node.downcast_ref::<LiveScribeExec>().is_some()))
+        };
+        plan.transform_up(|node| {
+            if node
+                .downcast_ref::<datafusion::physical_plan::union::UnionExec>()
+                .is_none()
+            {
+                return Ok(Transformed::no(node));
+            }
+            let mut live = false;
+            let mut children = Vec::with_capacity(node.children().len());
+            for child in node.children() {
+                if holds_live(child)? {
+                    live = true;
+                    children.push(Arc::clone(child));
+                } else {
+                    children.push(Arc::new(
+                        datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec::new(
+                            Arc::clone(child),
+                        ),
+                    ) as Arc<dyn ExecutionPlan>);
+                }
+            }
+            if !live {
+                return Ok(Transformed::no(node));
+            }
+            node.replace_children(
+                children,
+                datafusion::physical_plan::ReplaceChildrenOptions::new(
+                    datafusion::physical_plan::ChildrenPropertiesMode::Recompute,
+                ),
+            )
+            .map(Transformed::yes)
+        })
+        .map(|transformed| transformed.data)
+    }
+
+    /// Names the rule in `DataFusion` optimizer traces.
+    fn name(&self) -> &'static str {
+        "bifrost_live_union_boundary"
+    }
+
+    /// Asks `DataFusion` to verify the rewrite preserved the plan schema.
+    fn schema_check(&self) -> bool {
+        true
+    }
+}
+
 /// One route's fragment read, from dispatch through footer validation.
 struct LiveFragmentRead {
     /// Leaf whose closure the fragment is signed for.

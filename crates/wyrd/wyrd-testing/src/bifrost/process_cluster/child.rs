@@ -182,8 +182,9 @@ async fn serve() -> Result<(), ProcessClusterError> {
                 start_id,
                 rows,
                 groups,
+                publish,
             } => match config
-                .ingest_rows(&server, &table, start_id, rows, groups)
+                .ingest_rows(&server, &table, start_id, rows, groups, publish)
                 .await
             {
                 Ok(()) => emit(&ControlResponse::Ingested)?,
@@ -283,6 +284,14 @@ async fn serve() -> Result<(), ProcessClusterError> {
                     count: wyrd_server::grpc::peer_body_polls(),
                 })?;
             }
+            ControlRequest::ScribeFragments => match server.state().bifrost_ingest() {
+                Some(scribe) => emit(&ControlResponse::ScribeFragments {
+                    executions: scribe.fragment_inspection().0,
+                })?,
+                None => emit(&ControlResponse::Failed {
+                    detail: "this target composes no Scribe".to_owned(),
+                })?,
+            },
             ControlRequest::ExecuteInactiveSql { sql } => {
                 match config.execute_inactive_sql(&server, &sql).await {
                     Ok(rows) => emit(&ControlResponse::Executed { rows })?,
@@ -848,11 +857,12 @@ impl ChildConfig {
             .map_err(|error| ProcessClusterError::Child(error.to_string()))
     }
 
-    /// Writes and publishes deterministic fixture rows through this Scribe.
+    /// Writes deterministic fixture rows through this Scribe, optionally publishing them.
     ///
     /// The batch is admitted through the same logical ingress seam the public
-    /// write surface uses and then frozen and published, so the rows a later
-    /// query reads are files this pod's own Scribe encoded.
+    /// write surface uses. With `publish` it is then frozen and published, so
+    /// the rows a later query reads are files this pod's own Scribe encoded;
+    /// without it the rows stay live on this Scribe.
     ///
     /// # Errors
     ///
@@ -866,6 +876,7 @@ impl ChildConfig {
         start_id: i64,
         rows: i64,
         groups: i64,
+        publish: bool,
     ) -> Result<(), ProcessClusterError> {
         let child = ProcessClusterError::Child;
         let scribe = server
@@ -902,10 +913,12 @@ impl ChildConfig {
             })
             .await
             .map_err(|error| child(error.to_string()))?;
-        server
-            .flush_bifrost()
-            .await
-            .map_err(|error| child(error.to_string()))?;
+        if publish {
+            server
+                .flush_bifrost()
+                .await
+                .map_err(|error| child(error.to_string()))?;
+        }
         Ok(())
     }
 

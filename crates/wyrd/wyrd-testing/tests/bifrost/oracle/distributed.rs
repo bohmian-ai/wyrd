@@ -11,7 +11,9 @@ use vala_bifrost_redux::oracle::iceberg_projection_probe;
 use wyrd_client::WyrdClient;
 use wyrd_client::bifrost::BifrostClientError;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::vala::api::{BifrostQueryRequest, QueryTerminalErrorCode, QueryTerminalOutcome};
+use wyrd_spec::vala::api::{
+    BifrostQueryRequest, QueryExecutionPath, QueryTerminalErrorCode, QueryTerminalOutcome,
+};
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
 
@@ -1025,5 +1027,147 @@ async fn live_query_routes_only_relevant_scribes() -> Result<(), JourneyError> {
         )
         .into());
     }
+    Ok(())
+}
+
+/// Test-node binary every process-cluster pod runs.
+const NODE_BINARY: &str = env!("CARGO_BIN_EXE_bifrost_peer_test_node");
+
+/// Drains one public grouped count into `(filter_key, matched)` rows and its path.
+///
+/// # Errors
+///
+/// Returns a client or Arrow error, and an error when the stream does not
+/// succeed or a batch does not carry a `Utf8` key and an `Int64` count.
+async fn grouped_counts(
+    client: &WyrdClient,
+    sql: String,
+) -> Result<(Vec<(String, i64)>, QueryExecutionPath), JourneyError> {
+    let mut stream = wyrd_client::Bifrost::query_only(client)
+        .query(&BifrostQueryRequest {
+            sql,
+            deadline_ms: Some(30_000),
+        })
+        .await?;
+    let mut rows = Vec::new();
+    while let Some(batch) = stream.next_batch().await? {
+        let keys = batch
+            .column_by_name("filter_key")
+            .and_then(|column| column.as_any().downcast_ref::<arrow::array::StringArray>())
+            .ok_or("grouped result has no Utf8 filter_key")?;
+        let counts = batch
+            .column_by_name("matched")
+            .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+            .ok_or("grouped result has no Int64 matched")?;
+        for index in 0..batch.num_rows() {
+            rows.push((keys.value(index).to_owned(), counts.value(index)));
+        }
+    }
+    let terminal = stream.terminal().ok_or("query terminal missing")?;
+    if terminal.outcome != QueryTerminalOutcome::Success || terminal.error.is_some() {
+        return Err(format!(
+            "query did not succeed: {:?} {:?}",
+            terminal.outcome, terminal.error
+        )
+        .into());
+    }
+    Ok((rows, terminal.execution_path))
+}
+
+/// A filtered aggregate over published files and live rows on two Scribes is
+/// one Analytical plan: published scans run on the Oracle workers while each
+/// Scribe executes exactly one live fragment, and the result counts both.
+///
+/// Published rows alone, or live rows drained anywhere but the two Scribe
+/// fragments, cannot produce these counts and deltas together.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn published_workers_and_live_scribes_share_one_plan() -> Result<(), JourneyError> {
+    use wyrd_testing::bifrost::process_cluster::{BifrostProcessCluster, ProcessNodeTarget};
+    /// Oracle pod the public query enters.
+    const COORDINATOR: usize = 0;
+    /// Oracle pods that may run published work.
+    const WORKERS: [usize; 2] = [1, 2];
+    /// Scribe pods that each hold live rows.
+    const SCRIBES: [usize; 2] = [3, 4];
+    let mut cluster = BifrostProcessCluster::start(
+        NODE_BINARY,
+        &[
+            ProcessNodeTarget::Oracle,
+            ProcessNodeTarget::Oracle,
+            ProcessNodeTarget::Oracle,
+            ProcessNodeTarget::Scribe,
+            ProcessNodeTarget::Scribe,
+        ],
+    )
+    .await?;
+    let api_key = cluster
+        .provision_public_api_key("live-share-reader")
+        .await?;
+    let table = format!("live_share_{}", uuid::Uuid::now_v7().simple());
+    let nodes = cluster.nodes_mut();
+    nodes[SCRIBES[0]].register_table(&table)?;
+    // Two published objects of ids 0..12 give every group 8 published rows
+    // and the cut real work to split across both workers.
+    nodes[SCRIBES[0]].ingest_rows(&table, 0, 12, 3)?;
+    nodes[SCRIBES[0]].ingest_rows(&table, 0, 12, 3)?;
+    // Six live rows per Scribe add 2 + 2 to every group, plus one negative id
+    // per Scribe that the filter must remove.
+    nodes[SCRIBES[0]].ingest_live_rows(&table, 100, 6, 3)?;
+    nodes[SCRIBES[1]].ingest_live_rows(&table, 200, 6, 3)?;
+    nodes[SCRIBES[0]].ingest_live_rows(&table, -1, 1, 3)?;
+    nodes[SCRIBES[1]].ingest_live_rows(&table, -2, 1, 3)?;
+    for node in nodes.iter_mut() {
+        node.refresh_snapshot()?;
+    }
+    let polls_before = WORKERS
+        .iter()
+        .map(|index| cluster.nodes_mut()[*index].peer_body_polls())
+        .collect::<Result<Vec<_>, _>>()?;
+    let fragments_before = SCRIBES
+        .iter()
+        .map(|index| cluster.nodes_mut()[*index].scribe_fragments())
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let client = public_client(&cluster.nodes()[COORDINATOR], &api_key)?;
+    let (rows, path) = grouped_counts(
+        &client,
+        format!(
+            "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} \
+             WHERE id >= 0 GROUP BY filter_key ORDER BY filter_key"
+        ),
+    )
+    .await?;
+
+    let expected = (0..3)
+        .map(|group| (format!("group_{group}"), 12_i64))
+        .collect::<Vec<_>>();
+    if rows != expected {
+        return Err(
+            format!("published plus live counts expected {expected:?}, saw {rows:?}").into(),
+        );
+    }
+    if path != QueryExecutionPath::Analytical {
+        return Err(
+            format!("the distributed published scan must stay Analytical, saw {path:?}").into(),
+        );
+    }
+    for (offset, index) in WORKERS.into_iter().enumerate() {
+        let polls = cluster.nodes_mut()[index].peer_body_polls()?;
+        if polls <= polls_before[offset] {
+            return Err(format!("published worker {index} admitted no peer work").into());
+        }
+    }
+    let fragments = SCRIBES
+        .iter()
+        .map(|index| cluster.nodes_mut()[*index].scribe_fragments())
+        .collect::<Result<Vec<_>, _>>()?;
+    let delta = execution_delta(&fragments_before, &fragments);
+    if delta != vec![1, 1] {
+        return Err(
+            format!("each Scribe must execute exactly one live fragment, saw {delta:?}").into(),
+        );
+    }
+    cluster.shutdown()?;
     Ok(())
 }

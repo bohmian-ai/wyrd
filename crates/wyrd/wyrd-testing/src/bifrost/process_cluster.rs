@@ -210,7 +210,7 @@ pub enum ControlRequest {
         /// Table name inside the `vala.bifrost` namespace.
         table: String,
     },
-    /// Write and publish deterministic fixture rows through this child's Scribe.
+    /// Write deterministic fixture rows through this child's Scribe.
     IngestRows {
         /// Table name inside the `vala.bifrost` namespace.
         table: String,
@@ -220,6 +220,8 @@ pub enum ControlRequest {
         rows: i64,
         /// Distinct `filter_key` groups the rows fall into.
         groups: i64,
+        /// Whether to freeze and publish the rows, rather than leave them live.
+        publish: bool,
     },
     /// Freeze and publish everything this child's Scribe currently holds.
     ///
@@ -243,6 +245,8 @@ pub enum ControlRequest {
     PeerProbe(PeerProbePlan),
     /// Report how many request bodies this child's peer plane has polled.
     PeerBodyPolls,
+    /// Report this child's cumulative Scribe fragment executions.
+    ScribeFragments,
     /// Report this child's physical-build total, latest cut, and active cuts.
     PhysicalBuildEvidence,
     /// Arm the one-shot refusal of this child's next distributed physical build.
@@ -525,6 +529,11 @@ pub enum ControlResponse {
     BodyPolls {
         /// Request bodies this child's peer plane has polled since start.
         count: u64,
+    },
+    /// Answer to [`ControlRequest::ScribeFragments`].
+    ScribeFragments {
+        /// Scribe fragments this child executed after authenticated resolution.
+        executions: u64,
     },
     /// Answer to [`ControlRequest::PhysicalBuildEvidence`].
     PhysicalBuilds(PhysicalBuildEvidence),
@@ -1150,11 +1159,47 @@ impl ProcessNode {
         rows: i64,
         groups: i64,
     ) -> Result<(), ProcessClusterError> {
+        self.ingest(table, start_id, rows, groups, true)
+    }
+
+    /// Writes deterministic fixture rows and leaves them live on this Scribe.
+    ///
+    /// Nothing is frozen or published, so a later query can only read these
+    /// rows through a live fragment on this pod.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::ingest_rows`].
+    pub fn ingest_live_rows(
+        &mut self,
+        table: &str,
+        start_id: i64,
+        rows: i64,
+        groups: i64,
+    ) -> Result<(), ProcessClusterError> {
+        self.ingest(table, start_id, rows, groups, false)
+    }
+
+    /// Sends one fixture ingest, optionally followed by publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::request`], and
+    /// [`ProcessClusterError::Child`] when the ingest or publication failed.
+    fn ingest(
+        &mut self,
+        table: &str,
+        start_id: i64,
+        rows: i64,
+        groups: i64,
+        publish: bool,
+    ) -> Result<(), ProcessClusterError> {
         match self.request(&ControlRequest::IngestRows {
             table: table.to_owned(),
             start_id,
             rows,
             groups,
+            publish,
         })? {
             ControlResponse::Ingested => Ok(()),
             ControlResponse::Failed { detail } => Err(ProcessClusterError::Child(detail)),
@@ -1401,6 +1446,25 @@ impl ProcessNode {
             ControlResponse::Failed { detail } => Err(ProcessClusterError::Child(detail)),
             other => Err(ProcessClusterError::Protocol(format!(
                 "expected a body-poll count, received {other:?}"
+            ))),
+        }
+    }
+
+    /// Reads how many Scribe fragments this child has executed.
+    ///
+    /// Differenced across one query, it names exactly which Scribe pods a
+    /// live read dispatched to.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::request`], and
+    /// [`ProcessClusterError::Child`] when this target composes no Scribe.
+    pub fn scribe_fragments(&mut self) -> Result<u64, ProcessClusterError> {
+        match self.request(&ControlRequest::ScribeFragments)? {
+            ControlResponse::ScribeFragments { executions } => Ok(executions),
+            ControlResponse::Failed { detail } => Err(ProcessClusterError::Child(detail)),
+            other => Err(ProcessClusterError::Protocol(format!(
+                "expected a Scribe fragment count, received {other:?}"
             ))),
         }
     }

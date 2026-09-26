@@ -27,9 +27,7 @@ use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{BifrostQueryRequest, QueryExecutionPath};
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::process_cluster::BifrostProcessCluster;
-use wyrd_testing::bifrost::process_cluster::{
-    OracleOwnershipSnapshot, ProcessNode, ProcessNodeTarget,
-};
+use wyrd_testing::bifrost::process_cluster::{OracleOwnershipSnapshot, ProcessNodeTarget};
 use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
 use wyrd_tonic::query_conversion::QueryStreamConverter;
 use wyrd_tonic::wyrd::v1 as proto;
@@ -463,32 +461,6 @@ const PEER_SCRIBE: usize = 3;
 /// single held graph owns everything Analytical work can be granted while the
 /// remaining unit stays available to the Interactive floor.
 const ANALYTICAL_GRAPH_UNITS: u32 = 2;
-
-/// Builds one public client against one pod's public HTTP and gRPC listeners.
-///
-/// # Errors
-///
-/// Returns the client configuration error.
-fn public_client(
-    node: &ProcessNode,
-    api_key: &secrecy::SecretString,
-) -> Result<WyrdClient, JourneyError> {
-    Ok(WyrdClient::with_config(
-        wyrd_client::config::ClientConfig {
-            grpc: wyrd_client::transport::GrpcConfig {
-                endpoint: format!("http://{}", node.grpc_addr()),
-                connect_retries: 0,
-                ..wyrd_client::transport::GrpcConfig::default()
-            },
-            http: wyrd_client::transport::HttpConfig {
-                base_url: format!("http://{}", node.http_addr()),
-                ..wyrd_client::transport::HttpConfig::default()
-            },
-            credential: Some(api_key.clone()),
-            ..wyrd_client::config::ClientConfig::default()
-        },
-    )?)
-}
 
 /// What one public query settled to over the real public HTTP surface.
 struct PublicSettlement {

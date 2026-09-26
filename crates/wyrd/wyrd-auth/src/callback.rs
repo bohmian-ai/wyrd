@@ -32,8 +32,8 @@ use wyrd_sql::queries::auth::{
 use wyrd_sql::{SqlError, TenantConn, WyrdPostgres};
 
 use crate::audit::{
-    TOKEN_EXCHANGE_OPERATION, USER_ROLES_SYNC_OPERATION, append_auth_audit, audit_request_id,
-    auth_event, auth_failure_code, record_auth_audit_best_effort,
+    TOKEN_EXCHANGE_OPERATION, USER_ROLES_SYNC_OPERATION, append_auth_audit, auth_event,
+    auth_failure_code, principal_event, record_auth_audit_best_effort,
 };
 use crate::connections::HumanConnections;
 use crate::error::{auth_error_to_wyrd, provider_unreachable, screen_error, store_error};
@@ -555,15 +555,12 @@ pub fn verify_nonce(expected: &str, claims: &Value) -> Result<(), WyrdError> {
 /// names are tenant configuration, and the fact of the mutation is what the
 /// audit needs to distinguish it from an unchanged login.
 fn roles_sync_event(request_id: &str, principal_id: Uuid) -> AuditEvent {
-    AuditEvent::new(
-        audit_request_id(request_id),
-        None,
-        USER_ROLES_SYNC_OPERATION.to_owned(),
-        format!("principal:{principal_id}"),
-        None,
+    principal_event(
+        request_id,
+        USER_ROLES_SYNC_OPERATION,
         PrincipalId::new(principal_id),
         PrincipalKindTag::User,
-        USER_ROLES_SYNC_OPERATION.to_owned(),
+        None,
         AuditOutcome::Allowed,
     )
 }
@@ -573,8 +570,8 @@ fn roles_sync_event(request_id: &str, principal_id: Uuid) -> AuditEvent {
 ///
 /// The shared verifier accepts any asymmetric header algorithm its JWKS key
 /// supports; this narrows a tenant login to the provider's own policy before
-/// any key lookup or identity resolution. Unknown advertised names and every
-/// HMAC algorithm are ignored, so they can never admit a token.
+/// any key lookup or identity resolution. Unknown advertised names are
+/// ignored, so they can never admit a token.
 ///
 /// # Errors
 /// Returns [`WyrdError::InvalidToken`] when the token header does not decode
@@ -585,7 +582,6 @@ pub fn verify_id_token_algorithm(supported: &[String], id_token: &str) -> Result
     let advertised = supported
         .iter()
         .filter_map(|name| Algorithm::from_str(name).ok())
-        .filter(|alg| !matches!(alg, Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512))
         .any(|alg| alg == header.alg);
     if advertised {
         Ok(())

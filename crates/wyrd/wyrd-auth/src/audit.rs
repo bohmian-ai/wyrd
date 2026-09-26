@@ -42,10 +42,8 @@ pub fn audit_request_id(request_id: &str) -> RequestId {
 
 /// Build one auth audit event attributed to the acting principal.
 ///
-/// The resource is the acting card when there is one, otherwise the principal
-/// id. The permission is the operation name, because these grants authenticate
-/// rather than evaluate a dynamic permission; callers that did evaluate one
-/// overwrite `permission` (and `resource`) on the returned event.
+/// [`principal_event`] with `detail` attached; see it for the resource and
+/// permission rules.
 #[must_use]
 pub fn auth_event(
     request_id: &str,
@@ -55,6 +53,32 @@ pub fn auth_event(
     card_ref: Option<CardRef>,
     outcome: AuditOutcome,
     detail: AuditDetail,
+) -> AuditEvent {
+    principal_event(
+        request_id,
+        operation,
+        principal_id,
+        principal_kind,
+        card_ref,
+        outcome,
+    )
+    .with_detail(detail)
+}
+
+/// Build one detail-less auth audit event attributed to the acting principal.
+///
+/// The resource is the acting card when there is one, otherwise the principal
+/// id. The permission is the operation name, because these grants authenticate
+/// rather than evaluate a dynamic permission; callers that did evaluate one
+/// overwrite `permission` (and `resource`) on the returned event.
+#[must_use]
+pub fn principal_event(
+    request_id: &str,
+    operation: &str,
+    principal_id: PrincipalId,
+    principal_kind: PrincipalKindTag,
+    card_ref: Option<CardRef>,
+    outcome: AuditOutcome,
 ) -> AuditEvent {
     let resource = card_ref
         .as_ref()
@@ -70,7 +94,6 @@ pub fn auth_event(
         operation.to_owned(),
         outcome,
     )
-    .with_detail(detail)
 }
 
 /// Map a stored `principal_kind` column value onto its audit tag.

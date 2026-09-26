@@ -1247,8 +1247,7 @@ fn terminal_json(text: &str, prefix: &str, suffix: &str) -> Value {
     let frame = text
         .strip_suffix(suffix)
         .and_then(|body| body.rsplit_once(prefix))
-        .map(|(_, frame)| frame)
-        .unwrap_or_else(|| panic!("no terminal frame in {text}"));
+        .map_or_else(|| panic!("no terminal frame in {text}"), |(_, frame)| frame);
     serde_json::from_str(frame).unwrap_or_else(|error| panic!("{error}: {text}"))
 }
 

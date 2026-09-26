@@ -175,3 +175,62 @@ Stop if correctness requires accepting unverified identity, weakening refresh re
 ## Authority Links
 
 [Approved spec](../spec.md); [AGENTS.md](../../../../AGENTS.md); [agent rules](../../../../architecture/agent-rules.md); [security posture](../../../../architecture/wyrd-security-posture.md).
+
+## Implementation Evidence
+
+Commits: `5267bef7f` (header-free login, sealed one-use completions,
+retirements), `652830688` (four journeys, email non-unique), `21d8a8d19`
+(schemas, OpenAPI contract test, docs, migration test).
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| REQ-006 (route key is untrusted routing context; generic refusal) | `wyrd-auth/src/login.rs::HumanConnections::begin_login`; `wyrd-server/src/auth/login.rs` (`POST /auth/login`) | `login::pg_tests::unknown_tenant_and_no_connection_are_indistinguishable`; `auth::login::pg_tests::*`; `conformance_login_rejects_bare_localhost_host` | PASS |
+| REQ-007 (PKCE/state/nonce, one-time state, verified token, screened calls) | `login.rs` state insert (hashed, 5 min TTL); `callback.rs::AuthorizationCodeExchange::complete` consume-then-commit before IO; `finish_id_token_exchange` | `tenant_callback_refusal_journey` steps 1, 5; `callback::screening_tests`; `login::destination_tests` | PASS |
+| REQ-008 (callback creates tenant User by (issuer, subject); tenant tokens) | `finish_id_token_exchange` → `ensure_user_identity`, `issue_human_session` | `tenant_human_login_journey` steps 1–2; `auth::callback::pg_tests::finish_issues_seals_and_audits_the_session` | PASS |
+| REQ-013 (machine credentials independent of SSO) | unchanged API-key / jwt-bearer paths | `tenant_machine_independence_journey` | PASS |
+| REQ-014 (tested replacement; no inherited authority) | connection lifecycle (TASK-001) + login bound to connection id/issuer/client | `tenant_provider_switch_journey` steps 2–5 | PASS |
+| REQ-015 (per-tenant authentication; no cross-tenant grant) | state resolves tenant via `wyrd.auth_login_state_tenant`; completion redeemable only in its tenant | `tenant_callback_refusal_journey` step 4; `same_issuer_two_tenant_isolation_keycloak` | PASS |
+| REQ-016 (old-connection renewal stops; mapping at next issuance; ≤5 min access) | refresh bound to connection; migration revokes provenance-free user refresh rows | `tenant_provider_switch_journey` steps 1, 2, 4; `tenant_connection_session_cutoff_journey`; `pg_migration::human_connection_upgrade_preflight` (d) | PASS |
+| REQ-017 (audit; failure issues nothing) | session issue, seal, and audit in one transaction; failure audit with nil principal | `tenant_callback_refusal_journey` step 6; `tenant_human_login_journey` step 5 | PASS |
+| INV-001 (no header/host/email selection) | begin reads only the body; callback reads only hashed state | `auth::login::pg_tests::login_ignores_request_headers`, `the_host_header_cannot_select_a_tenant`; refusal journey step 4 | PASS |
+| INV-002 ((issuer, subject) identity; no email linking) | migration drops `auth_users_data_tenant_id_email_key`; `user_by_email` removed (no production caller) | `tenant_provider_switch_journey` step 3 | PASS |
+| INV-003 (planes distinct; groups cannot bypass RBAC; no default roles) | groups-only mapping in `finish_id_token_exchange` | `auth::callback::pg_tests` role-mapping test; login journey step 4 (unmapped = zero grants) | PASS |
+| INV-004 (fail-closed verification, replay, isolation) | state consume-once; nonce/aud/iss/sig checks; RLS FORCE on `auth_login_state` | refusal journey steps 1, 5; `mise run check:tenant-isolation` | PASS |
+| AC-002 | — | `tenant_human_login_journey` | PASS |
+| AC-003 | — | `tenant_callback_refusal_journey`, `same_issuer_two_tenant_isolation_keycloak`, `tenant_login_operations_publish_their_contract` | PASS |
+| AC-005 | — | `tenant_machine_independence_journey`, `workload_jwt_bearer_journey_keycloak` | PASS |
+| AC-006 | — | `tenant_provider_switch_journey` | PASS |
+| AC-007 | — | refusal journey steps 1–6; switch journey step 4; `tenant_connection_rotation_journey`; `login::pg_tests::begin_without_a_sealing_key_is_refused_before_any_state` | PASS |
+
+Retirements: `TokenRequest::AuthorizationCode` (`token::tests::authorization_code_grant_is_retired`),
+`wyrd_client` `begin_login`, CLI `auth login` and `parse_callback_input`, the
+`GET /auth/login` route; docs updated (no instant-revocation promise).
+
+Commands (all exit 0):
+
+- `mise exec -- env WYRD_IDENTITY_TARGET=server WYRD_IDENTITY_FILTER=<name> mise run test:identity:journey` for each of `tenant_human_login_journey`, `tenant_callback_refusal_journey`, `tenant_provider_switch_journey`, `tenant_machine_independence_journey`
+- `mise run test:identity:journey` (27/27)
+- `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^login::/) | test(/^callback::/) | test(/^connections::/)' && cargo nextest run --locked -p wyrd-server --lib -E 'test(/^auth::login::/) | test(/^auth::callback::/) | test(/^components::auth::/)' && cargo nextest run --locked -p wyrd-spec --lib -E 'test(/auth::/)' && cargo nextest run --locked -p wyrd-sql --test pg_migration"`
+- `mise run test:principals:integration` (includes `pg_openapi_contract::tenant_login_operations_publish_their_contract`)
+- `mise run test:principals:unit`, `mise run test:sql`
+- `mise run codegen:regen`, `mise run codegen:check`, `mise run docs:generate`, `mise run docs:check`
+- `mise run check:tenant-isolation`, `mise run check:client-tier`
+- `mise run fmt`, `mise run lints`, `git diff --check`
+
+Python and TypeScript artifacts did not change (codegen produced no SDK diff),
+so no py/TS lanes were required.
+
+Material limits:
+
+- Human login requires a configured sealing key; without one `begin_login`
+  refuses with `WYRD_SPEC_400_VALIDATION` before storing state.
+- A `cli_handoff_id` binding is refused with `INVALID_STATE` until TASK-004
+  supplies the handoff (`login.rs::initiation_binding` is the replacement point).
+- The browser `/login/complete` BFF route that calls `LoginCompletions::redeem`
+  is owned by TASK-003; journeys redeem through the owner directly.
+- Unsafe discovered provider URLs and the missing sealing key are proven at
+  unit/Postgres level only: the journey server is permissive toward local
+  providers (Keycloak) and always configures a keyring.
+- Email is no longer unique per tenant (`auth_users_data_tenant_id_email_key`
+  dropped) because a replacement provider's same-email user must be a separate
+  User (INV-002, AC-006).

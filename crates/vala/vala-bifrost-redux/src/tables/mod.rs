@@ -878,7 +878,7 @@ mod tests {
             let schema = (definition.schema)();
             assert!(schema.field_with_name(WYRD_EVENT_TIME).is_ok());
             assert!(schema.field_with_name(DATA_TENANT_ID).is_ok());
-            // Continuous high-rate OTel signals partition hourly. Retained
+            // Continuous high-rate OTel signals and gateway calls partition hourly. Retained
             // audit history and the five verification tables partition daily:
             // both are low-rate, both are read over date ranges rather than a
             // recent window, and a Verification Result plus all of its detail
@@ -887,7 +887,8 @@ mod tests {
                 ("traces", "spans")
                 | ("metrics", "points")
                 | ("logs", "records")
-                | ("dev", "agent_traces") => TimeGranularityWire::Hour,
+                | ("dev", "agent_traces")
+                | ("gateway", "calls") => TimeGranularityWire::Hour,
                 ("system", "audit_log")
                 | ("drift", "observations" | "result_features")
                 | ("eval", "observations" | "result_items")

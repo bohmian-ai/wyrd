@@ -135,3 +135,33 @@ mise exec -- cargo nextest run --locked -p wyrd-auth-oidc --lib \
 WYRD_IDENTITY_FILTER=tenant_connection_rotation_journey \
   mise run test:identity:journey
 ```
+
+## Implementation evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| `FIND-TASK-001-24` Both policies reject `100.100.100.200`, `::ffff:100.100.100.200`, and `fd00:ec2::254`; `100.100.100.201` and `fd00:ec2::253` stay allowed only under `AllowInternal` | `crates/shared/wyrd-auth-oidc/src/screening.rs` `is_always_blocked`: two exact comparisons after the existing `normalize_ip` | `screening::tests::the_policy_decides_only_the_internal_ranges` extended (exact selector, 1 run); full `wyrd-auth-oidc` lib 38/38 | PASS |
+| `FIND-TASK-001-25` Both cited signatures use imported bare type names | `screening.rs`: `use std::io::Result as IoResult;` and `Future<Output = IoResult<I>>`; `identity_e2e.rs`: `use sqlx::PgPool;` and `&PgPool` | Source inspection; `mise run fmt`; `mise run lints`; `screening::tests::a_stalled_lookup_is_unresolved_at_the_deadline` (exact selector, 1 run); `WYRD_IDENTITY_FILTER=tenant_connection_rotation_journey mise run test:identity:journey` (1 selected) | PASS |
+
+Accepted reuse findings. Applied:
+- `permits_scheme` was inlined into `screen_scheme`.
+- The signing-key test was reduced to one owner-only success and one permissive refusal. The sealing-key test already covers the `read_secret_file` matrix.
+- The recovery `AuditEvent` now uses `..bearer.clone()`.
+- `forbid()` moved into the sourced `scripts/checks/forbid.sh`. A probe forbidden match still fails the check.
+- `pg_migration` case (d) no longer has the redundant `consume_active_refresh` assert.
+
+Skipped:
+- Finding 1 (inline `browser_authorization_endpoint` and replace `login::destination_tests`). It would remove the only login-path proof of the R3 `FIND-TASK-001-20` criterion.
+- Finding 3 (drop `bounded_lookup`, its paused-clock test, and `test-util`). This remediation requires that stalled-DNS test as focused proof.
+
+All of these exited 0 in this session:
+- `mise run fmt` and `mise run lints`
+- `git diff --check`
+- `mise run codegen:check` and `mise run docs:check`
+- `mise run test:principals:integration`, `mise run test:sql`, and `mise run test:platform:journey`
+- `WYRD_IDENTITY_FILTER=<name> mise run test:identity:journey` for `tenant_connection_admin_journey`, `tenant_connection_rotation_journey`, and `tenant_connection_session_cutoff_journey`. Each selected exactly one test.
+- Unfiltered `mise run test:identity:journey`: 23/23
+- The Postgres-wrapped `wyrd-auth` lib suite: 119/119
+- `check:tenant-isolation`, `check:from-pools-allowlist`, `check:fixtures-no-server`, `check:no-tonic-outside-wyrd-tonic`, `check:client-tier`, `check:pyo3-scope`, `check:unwrap-audit`, and `check:clippy-allow-audit`
+
+Non-goals stayed out of scope. There is no new public contract, route, dependency, configuration, policy knob, or classifier abstraction, and no test contacts a live metadata service.

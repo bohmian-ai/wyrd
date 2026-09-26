@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
+use datafusion::common::DataFusionError;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::memory::MemorySourceConfig;
@@ -16,6 +17,8 @@ use datafusion::execution::TaskContext;
 use datafusion::execution::memory_pool::MemoryPool;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::streaming::{PartitionStream, StreamingTableExec};
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream, execute_stream};
 use datafusion_proto::bytes::physical_plan_from_bytes_with_extension_codec;
 use datafusion_proto::protobuf::{PhysicalPlanNode, physical_plan_node::PhysicalPlanType};
@@ -38,7 +41,7 @@ use crate::oracle::reader_pins::{
     OracleReaderAuthority, ReaderIoPermit, ReaderQueryGuard, local_cut_from_follower,
 };
 use crate::scribe::stream_identity::StreamIdentity;
-use crate::scribe::tail_rpc::{FetchLiveTailRequest, FetchLiveTailService, HotBatch};
+use crate::scribe::tail_rpc::{FetchLiveTailRequest, FetchLiveTailService, LiveTailBatches};
 
 /// Hard private plan-size default enforced before protobuf decoding.
 pub const DEFAULT_MAX_PHYSICAL_PLAN_BYTES: usize = 8 * 1024 * 1024;
@@ -701,13 +704,14 @@ trait LiveTailSource: Send + Sync + std::fmt::Debug {
     /// Returns the exact stream incarnation served by this source.
     fn stream(&self) -> StreamIdentity;
 
-    /// Captures one bounded active-plus-unretired-immutable Arrow cohort.
-    /// Cancellation may abandon the local snapshot attempt before it is returned;
-    /// no partial cohort is exposed and a retry takes a new atomic snapshot.
+    /// Opens one lazily produced live read over the bounded memtable cut and
+    /// the staged members it did not serve.
+    /// Cancellation before the open returns exposes no producer; a retry opens
+    /// a new cut.
     ///
     /// # Errors
-    /// Returns a redacted error when the unchanged Scribe snapshot call fails.
-    async fn fetch(&self, request: FetchLiveTailRequest) -> Result<Vec<HotBatch>, String>;
+    /// Returns a redacted error when Scribe rejects or cannot open the read.
+    async fn open(&self, request: FetchLiveTailRequest) -> Result<LiveTailBatches, String>;
 }
 
 #[async_trait]
@@ -717,14 +721,12 @@ impl LiveTailSource for FetchLiveTailService {
         FetchLiveTailService::stream(self)
     }
 
-    /// Delegates exactly once to the unchanged Scribe production snapshot operation.
-    /// Cancellation drops the in-progress snapshot future and exposes no partial
-    /// batch vector; a retry invokes a new complete snapshot.
+    /// Delegates exactly once to the Scribe live-read open.
     ///
     /// # Errors
-    /// Returns a redacted error when Scribe rejects or cannot build the snapshot.
-    async fn fetch(&self, request: FetchLiveTailRequest) -> Result<Vec<HotBatch>, String> {
-        self.fetch_hot_batches(request)
+    /// Returns a redacted error when Scribe rejects or cannot open the read.
+    async fn open(&self, request: FetchLiveTailRequest) -> Result<LiveTailBatches, String> {
+        self.open_live_batches(request)
             .await
             .map_err(|_| "Scribe live-tail snapshot failed".to_owned())
     }
@@ -1035,10 +1037,9 @@ where
             .map_err(|_| "Scribe batch bound does not fit this process".to_owned())?;
         let max_retained_bytes = usize::try_from(cut.maximum_retained_bytes)
             .map_err(|_| "Scribe byte bound does not fit this process".to_owned())?;
-        let fetch_started = std::time::Instant::now();
-        let fetched = self
+        let batches = self
             .tail
-            .fetch(FetchLiveTailRequest {
+            .open(FetchLiveTailRequest {
                 binding,
                 target_stream: stream,
                 start_partition,
@@ -1053,33 +1054,79 @@ where
                 max_batches,
                 max_retained_bytes,
             })
-            .await;
-        // The leader skips its own fence drain whenever followers are dispatched,
-        // so this bounded snapshot is the only live-tail read a distributed query
-        // performs. It carries the `remote` locality of the same page families the
-        // single-node drain emits, keeping live-tail observation continuous across
-        // both execution shapes.
-        let page_outcome = if fetched.is_ok() { "success" } else { "failed" };
-        metrics::counter!(
-            "bifrost_oracle_tail_pages_total",
-            "locality" => "remote",
-            "outcome" => page_outcome
+            .await?;
+        let partition = Arc::new(LiveTailPartition {
+            schema: Arc::clone(&required_schema),
+            batches: std::sync::Mutex::new(Some(batches)),
+        });
+        StreamingTableExec::try_new(
+            Arc::clone(&required_schema),
+            vec![partition as Arc<dyn PartitionStream>],
+            None,
+            Vec::new(),
+            false,
+            None,
         )
-        .increment(1);
-        metrics::histogram!(
-            "bifrost_oracle_tail_page_seconds",
-            "locality" => "remote",
-            "outcome" => page_outcome
-        )
-        .record(fetch_started.elapsed().as_secs_f64());
-        let batches = fetched?;
-        let rows = batches
-            .into_iter()
-            .map(|batch| batch.rows)
-            .collect::<Vec<_>>();
-        super::exec::OracleTableProvider::projected_memory_source(&rows, &required_schema)
-            .map(|plan| ResolvedFollowerSource { plan, full_schema })
-            .map_err(|_| "Scribe Arrow provider construction failed".to_owned())
+        .map(|plan| ResolvedFollowerSource {
+            plan: Arc::new(plan) as Arc<dyn ExecutionPlan>,
+            full_schema,
+        })
+        .map_err(|_| "Scribe Arrow provider construction failed".to_owned())
+    }
+}
+
+/// One-shot partition over an opened Scribe live read.
+///
+/// The fragment executes its single leaf partition once, so the producer is
+/// taken on first execution and each batch is projected to the signed closure
+/// as it is pulled. Dropping the returned stream drops the producer and with
+/// it the memtable references and staged lease.
+#[derive(Debug)]
+struct LiveTailPartition {
+    /// Signed closure schema every produced batch is projected to.
+    schema: SchemaRef,
+    /// Opened producer, present until the partition is executed.
+    batches: std::sync::Mutex<Option<LiveTailBatches>>,
+}
+
+impl PartitionStream for LiveTailPartition {
+    /// Returns the signed closure schema.
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    /// Takes the producer and streams its batches projected to the closure.
+    ///
+    /// A second execution yields one internal error instead of rows, because
+    /// the live cut has already been handed out.
+    fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+        use futures_util::StreamExt as _;
+        let schema = Arc::clone(&self.schema);
+        let taken = self
+            .batches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let stream = match taken {
+            Some(batches) => batches
+                .into_stream()
+                .map(move |batch| {
+                    batch
+                        .map_err(|error| DataFusionError::External(Box::new(error)))
+                        .and_then(|batch| super::exec::project_batch(&batch, Arc::clone(&schema)))
+                })
+                .boxed(),
+            None => futures_util::stream::once(async {
+                Err(DataFusionError::Internal(
+                    "Scribe live read was already executed".to_owned(),
+                ))
+            })
+            .boxed(),
+        };
+        Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&self.schema),
+            stream,
+        ))
     }
 }
 
@@ -1826,6 +1873,7 @@ pub fn authenticated_preflight(
 pub(crate) mod tests {
     //! Authenticated preflight and role-local provider behavior proofs.
 
+    use crate::scribe::tail_rpc::HotBatch;
     use crate::scribe::wal::WalLsn;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2029,12 +2077,16 @@ pub(crate) mod tests {
         ///
         /// # Errors
         /// This focused source is infallible.
-        async fn fetch(&self, request: FetchLiveTailRequest) -> Result<Vec<HotBatch>, String> {
+        async fn open(&self, request: FetchLiveTailRequest) -> Result<LiveTailBatches, String> {
+            let predicates = request.predicates.clone();
             self.requests
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(request);
-            Ok(self.batches.clone())
+            Ok(LiveTailBatches::from_snapshot(
+                self.batches.clone(),
+                predicates,
+            ))
         }
     }
 

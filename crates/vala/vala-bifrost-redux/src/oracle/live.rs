@@ -546,13 +546,29 @@ impl LiveFragmentRead {
                                 "live Scribe fragment violated the attempt protocol: {error}"
                             ))
                         })? {
-                            yield super::exec::project_batch(&batch, SchemaRef::clone(&schema))?;
+                            let batch = super::exec::project_batch(&batch, SchemaRef::clone(&schema))?;
+                            #[cfg(feature = "test-support")]
+                            LIVE_SOURCE_BATCHES.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                            yield batch;
                         }
                     }
                 }
             }
         }
     }
+}
+
+/// Validated live batches this process's Oracle live sources have handed to
+/// `DataFusion`, across every query.
+#[cfg(feature = "test-support")]
+static LIVE_SOURCE_BATCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Returns how many validated live batches have reached an Oracle live source
+/// in this process.
+#[cfg(feature = "test-support")]
+#[must_use]
+pub fn live_source_batches_for_test() -> usize {
+    LIVE_SOURCE_BATCHES.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Returns the time left before `deadline`, zero once it has passed.

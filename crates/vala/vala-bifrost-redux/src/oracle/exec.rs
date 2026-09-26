@@ -24,7 +24,6 @@ use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::physical_plan::FileScanConfig;
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::datasource::{TableProvider, TableType};
@@ -1405,7 +1404,8 @@ impl OracleTableProvider {
 
     /// Narrows already-validated in-memory batches to the scan's closure schema.
     ///
-    /// Distributed and drained live rows arrive at the complete physical schema.
+    /// Test fixtures use it to stand in for a live leaf. Live rows arrive at
+    /// the complete physical schema.
     /// Shallow-projecting them by name before the memory source keeps every
     /// union leaf on one schema, which is what lets the serialized plan's
     /// `Column` indices be closure indices everywhere. An empty batch vector
@@ -1424,6 +1424,7 @@ impl OracleTableProvider {
     ///
     /// Returns a `DataFusion` error when a batch is missing a closure column,
     /// a cast fails, or Arrow rejects the projected batch.
+    #[cfg(test)]
     pub(super) fn projected_memory_source(
         batches: &[RecordBatch],
         schema: &SchemaRef,
@@ -1432,11 +1433,13 @@ impl OracleTableProvider {
             .iter()
             .map(|batch| project_batch(batch, Arc::clone(schema)))
             .collect::<DataFusionResult<Vec<_>>>()?;
-        Ok(MemorySourceConfig::try_new_exec(
-            std::slice::from_ref(&projected),
-            Arc::clone(schema),
-            None,
-        )?)
+        Ok(
+            datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
+                std::slice::from_ref(&projected),
+                Arc::clone(schema),
+                None,
+            )?,
+        )
     }
 
     /// Builds one provider from an already pinned sealed cut and its discovered live routes.
@@ -3701,6 +3704,7 @@ mod tests {
     use crate::oracle::codec::RemoteSourcePlaceholderExec;
     use arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray};
     use async_trait::async_trait;
+    use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::logical_expr::{col, lit};
     use datafusion::physical_plan::sorts::sort::SortExec;
     use datafusion::physical_plan::union::UnionExec;

@@ -1171,3 +1171,207 @@ async fn published_workers_and_live_scribes_share_one_plan() -> Result<(), Journ
     cluster.shutdown()?;
     Ok(())
 }
+
+/// How long the journey keeps one live Scribe producer paused mid-stream.
+///
+/// Past the 30-second window the removed tail-fence expiry enforced, so a
+/// second timeout on the live read would fail the query here.
+const LIVE_HOLD: Duration = Duration::from_secs(31);
+
+/// Deadline of every live query here, well past [`LIVE_HOLD`].
+///
+/// The query deadline is the read's one timeout; the 30-second default would
+/// end the held read on its own.
+const LIVE_DEADLINE_MS: i64 = 120_000;
+
+/// Bound on waiting for a paused, cancelled, or dropped live read to settle.
+const LIVE_SETTLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Reports whether the writer Scribe still holds a follower lease above `baseline`.
+///
+/// A follower lease charges a whole partition grant, orders of magnitude above
+/// the memtable drift a few journey rows cause, so half a grant separates a
+/// held lease from a released one without depending on exact memtable bytes.
+///
+/// # Errors
+///
+/// Returns an error when the node carries no Scribe or its root snapshot fails.
+fn follower_lease_held(cluster: &WyrdTestCluster, baseline: usize) -> Result<bool, JourneyError> {
+    let used = cluster
+        .server(0)
+        .ok_or("missing writer node")?
+        .state()
+        .bifrost_ingest()
+        .ok_or("writer node has no Scribe runtime")?
+        .resources()
+        .snapshot()?
+        .scribe_memory_used_bytes;
+    Ok(used >= baseline + vala_bifrost_redux::resources::ORACLE_PARTITION_MEMORY_BYTES / 2)
+}
+
+/// Waits until no live producer is open, the writer's follower lease is
+/// released, and no Oracle still admits a query or holds query memory.
+///
+/// # Errors
+///
+/// Returns an error naming `case` when any of them still holds after the bound.
+async fn await_live_released(
+    cluster: &WyrdTestCluster,
+    baseline: usize,
+    case: &str,
+) -> Result<(), JourneyError> {
+    let deadline = tokio::time::Instant::now() + LIVE_SETTLE_TIMEOUT;
+    loop {
+        let producers = vala_bifrost_redux::scribe::tail_rpc::open_live_producers_for_test();
+        let held = follower_lease_held(cluster, baseline)?;
+        let admitted = cluster.oracle_resource_snapshots()?.iter().any(|snapshot| {
+            snapshot.oracle_active_queries != 0 || snapshot.oracle_query_memory_used_bytes != 0
+        });
+        if producers == 0 && !held && !admitted {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "{case}: {producers} live producers open, follower lease held={held}, \
+                 Oracle admission held={admitted}"
+            )
+            .into());
+        }
+        tokio::time::sleep(SETTLEMENT_INTERVAL).await;
+    }
+}
+
+/// Opens one public live query while the Scribe producer pause is armed and
+/// waits until the producer has stopped after its first batch.
+///
+/// # Errors
+///
+/// Returns an error when the query cannot open, the producer never pauses, or
+/// the first batch never reaches the Oracle live source.
+async fn open_paused_live_query(
+    query: &wyrd_client::Bifrost,
+    sql: &str,
+    case: &str,
+) -> Result<wyrd_client::bifrost::QueryResultStream, JourneyError> {
+    let pause = vala_bifrost_redux::scribe::tail_rpc::scribe_live_production_pause_for_test();
+    let reached = vala_bifrost_redux::oracle::live_source_batches_for_test();
+    pause.arm();
+    let stream = query
+        .query(&BifrostQueryRequest {
+            sql: sql.to_owned(),
+            deadline_ms: Some(LIVE_DEADLINE_MS),
+        })
+        .await?;
+    tokio::time::timeout(LIVE_SETTLE_TIMEOUT, pause.wait_entered())
+        .await
+        .map_err(|_| format!("{case}: the Scribe producer never paused"))?;
+    let deadline = tokio::time::Instant::now() + LIVE_SETTLE_TIMEOUT;
+    while vala_bifrost_redux::oracle::live_source_batches_for_test() == reached {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "{case}: no batch reached the Oracle live source before the pause"
+            )
+            .into());
+        }
+        tokio::time::sleep(SETTLEMENT_INTERVAL).await;
+    }
+    Ok(stream)
+}
+
+/// A live Scribe read streams batch by batch under backpressure and lives
+/// exactly as long as its query.
+///
+/// Nothing is flushed, so every row is live. The Scribe producer is paused
+/// before its second batch exists: the first batch has already reached the
+/// Oracle live source while production waits, so the read is incremental
+/// rather than a whole-cohort fetch. The pause is held past 30 seconds with
+/// the snapshot and follower lease still held and no further batch produced,
+/// then released, and the query succeeds with every row. Cancelling an open
+/// read and separately dropping a public client stream each release the
+/// producer, its snapshot, and its follower lease.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn live_stream_backpressure_and_query_owned_lifetime() -> Result<(), JourneyError> {
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::three_mixed()).await?;
+    let tenant = cluster.data_tenant_id();
+    let table = unique_table("oracle_live_lifetime");
+    let table_fqn = format!("vala.bifrost.{table}");
+    let writer_node = cluster.server(0).ok_or("missing node 0")?;
+    register_table(writer_node, tenant, &table).await?;
+    let writer = client(writer_node, "live-lifetime-writer").await?;
+    let now = chrono::Utc::now().timestamp_micros();
+    for id in 1..=3 {
+        append_event_time_row(&writer, &table_fqn, id, now).await?;
+    }
+    cluster.refresh_oracle_snapshots().await?;
+    let baseline = writer_node
+        .state()
+        .bifrost_ingest()
+        .ok_or("writer node has no Scribe runtime")?
+        .resources()
+        .snapshot()?
+        .scribe_memory_used_bytes;
+    let leader = cluster.server(1).ok_or("missing node 1")?;
+    let reader = client(leader, "live-lifetime-reader").await?;
+    let query = wyrd_client::Bifrost::query_only(&reader);
+    let pause = vala_bifrost_redux::scribe::tail_rpc::scribe_live_production_pause_for_test();
+    let sql = format!("SELECT id FROM {table_fqn}");
+
+    let case = "held past 30 seconds";
+    let reached = vala_bifrost_redux::oracle::live_source_batches_for_test();
+    let stream = open_paused_live_query(&query, &sql, case).await?;
+    let drain = tokio::spawn(async move {
+        let mut stream = stream;
+        let mut ids = Vec::new();
+        while let Some(batch) = stream.next_batch().await? {
+            let column = batch
+                .column_by_name("id")
+                .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+                .ok_or("query result id column is not Int64")?;
+            ids.extend(column.iter().flatten());
+        }
+        let terminal = stream.terminal().ok_or("query terminal missing")?;
+        if terminal.outcome != QueryTerminalOutcome::Success {
+            return Err(format!("held live query ended {:?}", terminal.error).into());
+        }
+        Ok::<_, JourneyError>(ids)
+    });
+    tokio::time::sleep(LIVE_HOLD).await;
+    let delivered = vala_bifrost_redux::oracle::live_source_batches_for_test() - reached;
+    if delivered != 1 {
+        return Err(format!("{case}: paused production delivered {delivered} batches").into());
+    }
+    if drain.is_finished() {
+        return Err(format!("{case}: the paused query ended early: {:?}", drain.await?).into());
+    }
+    let producers = vala_bifrost_redux::scribe::tail_rpc::open_live_producers_for_test();
+    if producers != 1 || !follower_lease_held(&cluster, baseline)? {
+        return Err(format!(
+            "{case}: a paused read must stay open with its snapshot and lease \
+             (producers={producers})"
+        )
+        .into());
+    }
+    pause.release();
+    let mut ids = tokio::time::timeout(LIVE_SETTLE_TIMEOUT, drain).await???;
+    ids.sort_unstable();
+    if ids != vec![1, 2, 3] {
+        return Err(format!("{case}: expected live ids [1, 2, 3], saw {ids:?}").into());
+    }
+    await_live_released(&cluster, baseline, case).await?;
+
+    let case = "cancelled";
+    let stream = open_paused_live_query(&query, &sql, case).await?;
+    let request_id = stream.request_id().clone();
+    query.cancel(&request_id).await?;
+    await_live_released(&cluster, baseline, case).await?;
+    pause.release();
+    drop(stream);
+
+    let case = "client stream dropped";
+    let stream = open_paused_live_query(&query, &sql, case).await?;
+    drop(stream);
+    await_live_released(&cluster, baseline, case).await?;
+    pause.release();
+    Ok(())
+}

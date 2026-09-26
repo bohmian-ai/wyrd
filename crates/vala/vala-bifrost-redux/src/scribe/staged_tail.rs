@@ -100,18 +100,12 @@ impl StagedTailReader {
         Ok(accepted.finish())
     }
 
-    /// Decodes one run, retaining only the rows its signed predicate authorizes.
-    ///
-    /// The predicate is compiled once per run against the projected schema and
-    /// reused for every decode window, and a window retaining no row charges
-    /// neither ceiling.
+    /// Decodes one run into the caller's bounded accumulator.
     ///
     /// # Errors
     ///
     /// Returns [`ScribeError::IngestBusy`] when a retained window does not fit
-    /// the caller's ceilings, or [`ScribeError::Internal`] when the run cannot
-    /// be opened, its projection cannot be resolved, a batch cannot be decoded,
-    /// or the signed predicate cannot be compiled or evaluated.
+    /// the caller's ceilings, or any [`Self::run_batches`] failure.
     fn read_run(
         self,
         run: &std::path::Path,
@@ -119,46 +113,8 @@ impl StagedTailReader {
         read: &StagedTailRead<'_>,
         accepted: &mut AcceptedStagedBatches,
     ) -> Result<(), ScribeError> {
-        let file = std::fs::File::open(run).map_err(run_failure(run, "open"))?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-            .map_err(run_failure(run, "read the metadata of"))?
-            .with_batch_size(self.batch_rows);
-        let projection = projection_mask(&builder, read.required_columns, run)?;
-        let schema = builder.schema().clone();
-        let reader = builder
-            .with_projection(projection)
-            .build()
-            .map_err(run_failure(run, "start reading"))?;
-        let mut filter = None;
-        for batch in reader {
-            let batch = batch.map_err(run_failure(run, "decode a batch from"))?;
-            let batch = reorder(&batch, &schema, read.required_columns, run)?;
-            let batch = if read.predicates.is_empty() {
-                batch
-            } else {
-                let filter = match &filter {
-                    Some(filter) => filter,
-                    None => filter.insert(
-                        crate::oracle::exec::ScanPredicateFilter::compile(
-                            &batch.schema(),
-                            read.predicates,
-                        )
-                        .map_err(|error| ScribeError::Internal {
-                            detail: format!(
-                                "live-tail predicate is invalid for this snapshot: {error}"
-                            ),
-                        })?,
-                    ),
-                };
-                filter
-                    .retain(batch)
-                    .map_err(|error| ScribeError::Internal {
-                        detail: format!("live-tail predicate evaluation failed: {error}"),
-                    })?
-            };
-            if batch.num_rows() == 0 {
-                continue;
-            }
+        for batch in self.run_batches(run, read.required_columns, read.predicates)? {
+            let batch = batch?;
             accepted.preflight(batch.get_array_memory_size())?;
             accepted.push(HotBatch {
                 partition_day: source.key.partition,
@@ -171,6 +127,66 @@ impl StagedTailReader {
             });
         }
         Ok(())
+    }
+
+    /// Opens one run and yields its decode windows lazily, retaining only the
+    /// rows its signed predicate authorizes.
+    ///
+    /// Each window is decoded only when the iterator is advanced, so a live
+    /// producer that yields between windows never holds more than one decoded
+    /// window. The predicate is compiled once per run against the projected
+    /// schema and reused for every window; a window retaining no row is
+    /// skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the run cannot be opened or its
+    /// projection cannot be resolved; the iterator yields
+    /// [`ScribeError::Internal`] when a batch cannot be decoded or reordered,
+    /// or the signed predicate cannot be compiled or evaluated.
+    pub(crate) fn run_batches<'a>(
+        self,
+        run: &'a std::path::Path,
+        required_columns: &'a [String],
+        predicates: &'a [wyrd_spec::vala::assignment_authority::ScanPredicate],
+    ) -> Result<impl Iterator<Item = Result<RecordBatch, ScribeError>> + 'a, ScribeError> {
+        let file = std::fs::File::open(run).map_err(run_failure(run, "open"))?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(run_failure(run, "read the metadata of"))?
+            .with_batch_size(self.batch_rows);
+        let projection = projection_mask(&builder, required_columns, run)?;
+        let schema = builder.schema().clone();
+        let reader = builder
+            .with_projection(projection)
+            .build()
+            .map_err(run_failure(run, "start reading"))?;
+        let mut filter = None;
+        Ok(reader
+            .map(move |batch| {
+                let batch = batch.map_err(run_failure(run, "decode a batch from"))?;
+                let batch = reorder(&batch, &schema, required_columns, run)?;
+                if predicates.is_empty() {
+                    return Ok(batch);
+                }
+                let filter = match &filter {
+                    Some(filter) => filter,
+                    None => filter.insert(
+                        crate::oracle::exec::ScanPredicateFilter::compile(
+                            &batch.schema(),
+                            predicates,
+                        )
+                        .map_err(|error| ScribeError::Internal {
+                            detail: format!(
+                                "live-tail predicate is invalid for this snapshot: {error}"
+                            ),
+                        })?,
+                    ),
+                };
+                filter.retain(batch).map_err(|error| ScribeError::Internal {
+                    detail: format!("live-tail predicate evaluation failed: {error}"),
+                })
+            })
+            .filter(|batch| !matches!(batch, Ok(batch) if batch.num_rows() == 0)))
     }
 }
 

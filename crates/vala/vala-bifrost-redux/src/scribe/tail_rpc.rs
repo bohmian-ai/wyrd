@@ -2405,6 +2405,121 @@ impl Drop for ScribeTailReader {
     }
 }
 
+/// One-shot pause held inside Scribe live production before a later batch exists.
+///
+/// A journey needs to prove Oracle received an earlier live batch while the
+/// Scribe has not yet produced the next one, and that the open read survives a
+/// long wait. Arming this stops exactly one live producer at that point until
+/// the test releases it.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Default)]
+pub struct ScribeLiveProductionPause {
+    /// Whether one producer should still be stopped.
+    armed: std::sync::atomic::AtomicBool,
+    /// Whether a producer has reached the pause.
+    entered: std::sync::atomic::AtomicBool,
+    /// Wakes a waiter once a producer reaches the pause.
+    entered_notify: tokio::sync::Notify,
+    /// Wakes the paused producer once the test releases it.
+    release_notify: tokio::sync::Notify,
+}
+
+#[cfg(feature = "test-support")]
+impl ScribeLiveProductionPause {
+    /// Arms the pause for the next live producer that reaches it.
+    pub fn arm(&self) {
+        self.entered
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.armed.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Waits until a producer is stopped on the pause.
+    pub async fn wait_entered(&self) {
+        loop {
+            // Registered before the check so an entry between the check and
+            // the await is not missed.
+            let entered = self.entered_notify.notified();
+            if self.entered.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            entered.await;
+        }
+    }
+
+    /// Releases the paused producer and disarms the pause.
+    pub fn release(&self) {
+        self.armed
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.release_notify.notify_waiters();
+    }
+
+    /// Stops one armed producer here, consuming the arming exactly once.
+    ///
+    /// Unarmed producers pass straight through.
+    async fn hold(&self) {
+        if !self.armed.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
+        let released = self.release_notify.notified();
+        tokio::pin!(released);
+        self.entered
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.entered_notify.notify_waiters();
+        released.await;
+    }
+}
+
+/// Process-wide live-production pause shared by the harness and producers.
+#[cfg(feature = "test-support")]
+static SCRIBE_LIVE_PRODUCTION_PAUSE: std::sync::OnceLock<
+    std::sync::Arc<ScribeLiveProductionPause>,
+> = std::sync::OnceLock::new();
+
+/// Returns the process-wide Scribe live-production pause.
+#[cfg(feature = "test-support")]
+#[must_use]
+pub fn scribe_live_production_pause_for_test() -> std::sync::Arc<ScribeLiveProductionPause> {
+    std::sync::Arc::clone(
+        SCRIBE_LIVE_PRODUCTION_PAUSE
+            .get_or_init(|| std::sync::Arc::new(ScribeLiveProductionPause::default())),
+    )
+}
+
+/// Live producers currently open in this process, across every Scribe.
+#[cfg(feature = "test-support")]
+static OPEN_LIVE_PRODUCERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Returns how many Scribe live producers, with their snapshot references,
+/// are still open in this process.
+#[cfg(feature = "test-support")]
+#[must_use]
+pub fn open_live_producers_for_test() -> usize {
+    OPEN_LIVE_PRODUCERS.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Counts one open live producer for the test harness until it drops.
+///
+/// Zero-sized and inert unless `test-support` is enabled.
+#[derive(Debug)]
+struct OpenLiveProducer;
+
+impl OpenLiveProducer {
+    /// Records one newly opened producer.
+    fn open() -> Self {
+        #[cfg(feature = "test-support")]
+        OPEN_LIVE_PRODUCERS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl Drop for OpenLiveProducer {
+    /// Records that the producer and its snapshot references were released.
+    fn drop(&mut self) {
+        OPEN_LIVE_PRODUCERS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 /// Exact, bounded hot-read request handed from Oracle to Scribe.
 #[derive(Debug, Clone)]
 pub struct FetchLiveTailRequest {
@@ -2494,6 +2609,112 @@ pub enum HotBatchSource {
     },
 }
 
+/// One opened Scribe live read whose batches are produced only when pulled.
+///
+/// Opening takes the bounded shallow memtable snapshot and leases the staged
+/// members not already served by it; nothing is filtered, decoded, or copied
+/// until the consumer asks for the next batch. The snapshot references and the
+/// staged lease live exactly as long as this value or the stream built from
+/// it, so dropping the stream — at completion, cancellation, or disconnect —
+/// releases them together, and an already-leased staged run stays readable
+/// even if publication retires its authority meanwhile.
+#[derive(Debug)]
+pub struct LiveTailBatches {
+    /// Shallow memtable batches in acknowledgement order, not yet filtered.
+    memtable: Vec<HotBatch>,
+    /// Lease keeping every staged run below readable until release.
+    staged: Option<crate::scribe::hot_source::StagedSourceLease>,
+    /// Leased staged members the memtable cut did not already serve.
+    unserved: Vec<crate::scribe::hot_source::StagedSource>,
+    /// Signed projection closure, in caller order.
+    required_columns: Vec<String>,
+    /// Signed predicate conjunction every produced row must satisfy.
+    predicates: Vec<wyrd_spec::vala::assignment_authority::ScanPredicate>,
+    /// Test-harness accounting of this open producer.
+    open: OpenLiveProducer,
+}
+
+impl LiveTailBatches {
+    /// Wraps an already captured memtable snapshot with no staged members.
+    ///
+    /// Used by resolver fixtures that supply their own cohort.
+    #[must_use]
+    pub fn from_snapshot(
+        memtable: Vec<HotBatch>,
+        predicates: Vec<wyrd_spec::vala::assignment_authority::ScanPredicate>,
+    ) -> Self {
+        Self {
+            memtable,
+            staged: None,
+            unserved: Vec::new(),
+            required_columns: Vec::new(),
+            predicates,
+            open: OpenLiveProducer::open(),
+        }
+    }
+
+    /// Produces this read's rows one batch per pull.
+    ///
+    /// Memtable batches come first, then each unserved staged run decoded one
+    /// bounded window at a time; each batch is filtered by the signed
+    /// predicates just before it is yielded and batches retaining no row are
+    /// skipped. Because the next batch is produced only when the consumer polls
+    /// again, a slow consumer holds production back rather than accumulating
+    /// output here.
+    ///
+    /// # Errors
+    ///
+    /// The stream yields [`ScribeError::Internal`] when a signed predicate
+    /// cannot be compiled or evaluated, or a staged run cannot be opened,
+    /// projected, or decoded; it ends after the first error.
+    pub fn into_stream(
+        self,
+    ) -> futures_util::stream::BoxStream<
+        'static,
+        Result<arrow::record_batch::RecordBatch, ScribeError>,
+    > {
+        let Self {
+            memtable,
+            staged,
+            unserved,
+            required_columns,
+            predicates,
+            open,
+        } = self;
+        Box::pin(async_stream::try_stream! {
+            let _open = open;
+            let _staged = staged;
+            let mut produced = false;
+            for batch in memtable {
+                #[cfg(feature = "test-support")]
+                if produced {
+                    scribe_live_production_pause_for_test().hold().await;
+                }
+                let rows = FetchLiveTailService::retain_signed(batch.rows, &predicates)?;
+                if rows.num_rows() == 0 {
+                    continue;
+                }
+                produced = true;
+                yield rows;
+            }
+            let reader = crate::scribe::staged_tail::StagedTailReader::default();
+            for source in &unserved {
+                for run in &source.runs {
+                    for window in reader.run_batches(run, &required_columns, &predicates)? {
+                        #[cfg(feature = "test-support")]
+                        if produced {
+                            scribe_live_production_pause_for_test().hold().await;
+                        }
+                        let rows = window?;
+                        produced = true;
+                        yield rows;
+                    }
+                }
+            }
+        })
+    }
+}
+
 /// Pod-local live-tail service over the Scribe memtable.
 #[derive(Debug)]
 pub struct FetchLiveTailService {
@@ -2521,7 +2742,7 @@ impl FetchLiveTailService {
     #[must_use]
     pub fn new(
         stream: StreamIdentity,
-        memtable: Arc<Memtable>,
+        memtable: Arc<crate::scribe::memtable::Memtable>,
         resources: crate::resources::ScribeResources,
     ) -> Self {
         Self {
@@ -2673,6 +2894,70 @@ impl FetchLiveTailService {
         &self,
         request: FetchLiveTailRequest,
     ) -> Result<Vec<HotBatch>, ScribeError> {
+        let predicates = request.predicates.clone();
+        let staged_request = request.clone();
+        let mut assembled = self.memtable_batches(request).await?;
+        // Staged runs are resolved only after the memtable cut, excluding every
+        // generation it already served: the registry lends a generation's runs
+        // before the shard learns the member is durable and stops serving its
+        // Arrow, so resolving them first would read that generation twice.
+        let served = Self::served_generations(&assembled);
+        assembled.extend(self.staged_batches(&staged_request, &served)?);
+        Self::retain_signed_rows(assembled, &predicates)
+    }
+
+    /// Opens one lazily produced live read over this Scribe's stream.
+    ///
+    /// Validation, the bounded memtable snapshot, and the staged lease happen
+    /// here; filtering and staged decoding happen only as the returned
+    /// producer is pulled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when stream/range validation fails, the bounded
+    /// snapshot exceeds its count or retained-byte ceiling, the owning
+    /// memtable/shard cannot produce the projection, or the staged registry is
+    /// unavailable.
+    pub async fn open_live_batches(
+        &self,
+        request: FetchLiveTailRequest,
+    ) -> Result<LiveTailBatches, ScribeError> {
+        let staged_request = request.clone();
+        let memtable = self.memtable_batches(request).await?;
+        let served = Self::served_generations(&memtable);
+        let staged = self.staged_lease(&staged_request)?;
+        let unserved = staged
+            .as_ref()
+            .map(|lease| {
+                lease
+                    .sources()
+                    .iter()
+                    .filter(|source| !served.contains(&(source.key.partition, source.generation)))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(LiveTailBatches {
+            memtable,
+            staged,
+            unserved,
+            required_columns: staged_request.required_columns,
+            predicates: staged_request.predicates,
+            open: OpenLiveProducer::open(),
+        })
+    }
+
+    /// Validates one request and takes its bounded shallow memtable snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when the request names another stream or an
+    /// inverted range, the snapshot exceeds its count or retained-byte ceiling,
+    /// or the owning memtable/shard cannot produce the projection.
+    async fn memtable_batches(
+        &self,
+        request: FetchLiveTailRequest,
+    ) -> Result<Vec<HotBatch>, ScribeError> {
         if request.target_stream != self.stream {
             return Err(ScribeError::StreamMismatch {
                 requested: request.target_stream,
@@ -2684,44 +2969,48 @@ impl FetchLiveTailService {
                 detail: "live-tail start day is after end day".to_owned(),
             });
         }
-        let predicates = request.predicates.clone();
-        let staged_request = request.clone();
-        let mut assembled = if let Some(shards) = &self.shards {
-            shards.snapshot(request).await?
-        } else {
-            self.memtable
-                .as_ref()
-                .ok_or_else(|| ScribeError::Internal {
-                    detail: "direct tail memtable is not configured".to_owned(),
-                })?
-                .readable_batches_for_range(
-                    request.binding.tenant,
-                    &request.binding.table_ref,
-                    request.start_partition,
-                    request.end_partition,
-                    &request.required_columns,
-                    ReadableBatchLimits {
-                        max_batches: request.max_batches,
-                        max_retained_bytes: request.max_retained_bytes,
-                    },
-                )?
-                .into_iter()
-                .map(|readable| HotBatch {
-                    partition_day: readable.partition_day,
-                    wal_lsn: readable.meta.wal_lsn_max,
-                    origin: HotBatchSource::Append {
-                        batch_id: readable.meta.batch_id,
-                        generation: readable.generation,
-                    },
-                    rows: readable.batch,
-                })
-                .collect()
-        };
-        // Staged runs are resolved only after the memtable cut, excluding every
-        // generation it already served: the registry lends a generation's runs
-        // before the shard learns the member is durable and stops serving its
-        // Arrow, so resolving them first would read that generation twice.
-        let served = assembled
+        if let Some(shards) = &self.shards {
+            return shards.snapshot(request).await;
+        }
+        Ok(self
+            .memtable
+            .as_ref()
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "direct tail memtable is not configured".to_owned(),
+            })?
+            .readable_batches_for_range(
+                request.binding.tenant,
+                &request.binding.table_ref,
+                request.start_partition,
+                request.end_partition,
+                &request.required_columns,
+                ReadableBatchLimits {
+                    max_batches: request.max_batches,
+                    max_retained_bytes: request.max_retained_bytes,
+                },
+            )?
+            .into_iter()
+            .map(|readable| HotBatch {
+                partition_day: readable.partition_day,
+                wal_lsn: readable.meta.wal_lsn_max,
+                origin: HotBatchSource::Append {
+                    batch_id: readable.meta.batch_id,
+                    generation: readable.generation,
+                },
+                rows: readable.batch,
+            })
+            .collect())
+    }
+
+    /// Names the immutable generations a memtable snapshot already served.
+    ///
+    /// Their staged runs must be skipped so each generation reaches a reader
+    /// once.
+    fn served_generations(
+        batches: &[HotBatch],
+    ) -> std::collections::HashSet<(TimePartition, crate::scribe::hot_source::GenerationOrdinal)>
+    {
+        batches
             .iter()
             .filter_map(|batch| match batch.origin {
                 HotBatchSource::Append {
@@ -2730,23 +3019,45 @@ impl FetchLiveTailService {
                 } => Some((batch.partition_day, generation)),
                 _ => None,
             })
-            .collect::<std::collections::HashSet<_>>();
-        assembled.extend(self.staged_batches(&staged_request, &served)?);
-        Self::retain_signed_rows(assembled, &predicates)
+            .collect()
+    }
+
+    /// Leases the staged members that serve this request's range.
+    ///
+    /// A generation whose Arrow was released after staging is invisible to the
+    /// shard snapshot, so without this a live-tail reader would see a gap
+    /// between staging and publication. The registry hands back only the
+    /// generations it still holds staged authority for, so a generation a
+    /// published object already serves is absent rather than filtered out.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the registry is unavailable.
+    fn staged_lease(
+        &self,
+        request: &FetchLiveTailRequest,
+    ) -> Result<Option<crate::scribe::hot_source::StagedSourceLease>, ScribeError> {
+        let Some(hot_sources) = &self.hot_sources else {
+            return Ok(None);
+        };
+        hot_sources
+            .staged_sources(
+                request.binding.tenant,
+                &request.binding.table_ref,
+                request.start_partition,
+                request.end_partition,
+            )
+            .map(Some)
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("resolve the staged members serving a live-tail read: {error}"),
+            })
     }
 
     /// Returns the rows this request's staged members still serve.
     ///
-    /// `served` names the generations the memtable cut already returned; their
-    /// staged runs are skipped so each generation reaches the reader once.
-    ///
-    /// A generation whose Arrow was released after staging is invisible to the
-    /// shard snapshot, so without this a live-tail reader would see a gap
-    /// between staging and publication. The read is bounded by the same
-    /// projection, count, and retained-byte limits the memtable path obeys. No
-    /// member is skipped here: the registry hands back only the generations it
-    /// still holds staged authority for, so a generation a published object
-    /// already serves is absent rather than filtered out.
+    /// `served` names the generations the memtable cut already returned. The
+    /// read is bounded by the same projection, count, and retained-byte limits
+    /// the memtable path obeys.
     ///
     /// # Errors
     ///
@@ -2760,19 +3071,9 @@ impl FetchLiveTailService {
             crate::scribe::hot_source::GenerationOrdinal,
         )>,
     ) -> Result<Vec<HotBatch>, ScribeError> {
-        let Some(hot_sources) = &self.hot_sources else {
+        let Some(sources) = self.staged_lease(request)? else {
             return Ok(Vec::new());
         };
-        let sources = hot_sources
-            .staged_sources(
-                request.binding.tenant,
-                &request.binding.table_ref,
-                request.start_partition,
-                request.end_partition,
-            )
-            .map_err(|error| ScribeError::Internal {
-                detail: format!("resolve the staged members serving a live-tail read: {error}"),
-            })?;
         let unserved = sources
             .sources()
             .iter()
@@ -2815,32 +3116,35 @@ impl FetchLiveTailService {
         }
         let mut retained = Vec::with_capacity(batches.len());
         for batch in batches {
-            let HotBatch {
-                partition_day,
-                wal_lsn,
-                origin,
-                rows,
-            } = batch;
-            let filter =
-                crate::oracle::exec::ScanPredicateFilter::compile(&rows.schema(), predicates)
-                    .map_err(|error| ScribeError::Internal {
-                        detail: format!(
-                            "live-tail predicate is invalid for this snapshot: {error}"
-                        ),
-                    })?;
-            let rows = filter.retain(rows).map_err(|error| ScribeError::Internal {
-                detail: format!("live-tail predicate evaluation failed: {error}"),
-            })?;
+            let rows = Self::retain_signed(batch.rows, predicates)?;
             if rows.num_rows() > 0 {
-                retained.push(HotBatch {
-                    partition_day,
-                    wal_lsn,
-                    origin,
-                    rows,
-                });
+                retained.push(HotBatch { rows, ..batch });
             }
         }
         Ok(retained)
+    }
+
+    /// Keeps only the rows of one batch the signed predicate conjunction admits.
+    ///
+    /// An empty conjunction admits every row and returns the batch unchanged.
+    ///
+    /// # Errors
+    /// Returns [`ScribeError::Internal`] when a signed predicate cannot be
+    /// compiled against, or evaluated over, the batch's own schema.
+    fn retain_signed(
+        rows: arrow::record_batch::RecordBatch,
+        predicates: &[wyrd_spec::vala::assignment_authority::ScanPredicate],
+    ) -> Result<arrow::record_batch::RecordBatch, ScribeError> {
+        if predicates.is_empty() {
+            return Ok(rows);
+        }
+        let filter = crate::oracle::exec::ScanPredicateFilter::compile(&rows.schema(), predicates)
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("live-tail predicate is invalid for this snapshot: {error}"),
+            })?;
+        filter.retain(rows).map_err(|error| ScribeError::Internal {
+            detail: format!("live-tail predicate evaluation failed: {error}"),
+        })
     }
 }
 
@@ -3101,19 +3405,32 @@ mod tests {
         values
     }
 
-    /// A generation whose staged runs are already registered is read once.
-    ///
-    /// Staging advances a generation's registry authority to its staged runs
-    /// before the owning shard learns the member is durable, so for a moment
-    /// both the frozen Arrow and the runs hold the same rows. A live-tail read
-    /// in that window, and one after the shard marks the generation durable,
-    /// must each return every row exactly once.
+    /// One frozen generation whose rows are both in the memtable and in a
+    /// registered staged run, served by a direct-memtable tail service.
+    struct StagedGenerationFixture {
+        /// Service reading the memtable and the registry.
+        service: FetchLiveTailService,
+        /// Memtable holding the frozen generation.
+        memtable: Arc<crate::scribe::memtable::Memtable>,
+        /// Registry naming the generation's staged runs.
+        registry: Arc<crate::scribe::hot_source::ScribeHotSourceRegistry>,
+        /// Seal key of the generation.
+        key: crate::scribe::seal_key::SealKey,
+        /// The staged generation.
+        generation: crate::scribe::hot_source::GenerationOrdinal,
+        /// Staged member holding the runs.
+        member: crate::scribe::assembly::StagedMemberId,
+        /// Request reading the generation's day.
+        request: super::FetchLiveTailRequest,
+        /// Directory owning the staged run; the run is deleted when it drops.
+        directory: tempfile::TempDir,
+    }
+
+    /// Builds a [`StagedGenerationFixture`] holding rows `[1, 2, 3]`.
     ///
     /// # Panics
-    /// Panics when the fixture cannot be built or a read returns any row other
-    /// than exactly once.
-    #[tokio::test]
-    async fn a_generation_staged_before_the_shard_settles_is_read_once() {
+    /// Panics when any fixture step fails.
+    fn staged_generation_fixture() -> StagedGenerationFixture {
         use crate::catalog::TableRef;
         use crate::scribe::assembly::StagedMemberId;
         use crate::scribe::hot_source::{HotAuthority, ScribeHotSourceRegistry};
@@ -3183,7 +3500,7 @@ mod tests {
             .expect("the generation moves to its staged runs");
 
         let service = FetchLiveTailService::new(stream, Arc::clone(&memtable), tail_resources())
-            .with_hot_sources(registry);
+            .with_hot_sources(Arc::clone(&registry));
         let binding =
             super::TenantTableBinding::resolve((tenant, table)).expect("fixture binding resolves");
         let request = super::FetchLiveTailRequest {
@@ -3196,6 +3513,40 @@ mod tests {
             max_batches: 64,
             max_retained_bytes: 64 * 1024 * 1024,
         };
+        StagedGenerationFixture {
+            service,
+            memtable,
+            registry,
+            key,
+            generation,
+            member,
+            request,
+            directory,
+        }
+    }
+
+    /// A generation whose staged runs are already registered is read once.
+    ///
+    /// Staging advances a generation's registry authority to its staged runs
+    /// before the owning shard learns the member is durable, so for a moment
+    /// both the frozen Arrow and the runs hold the same rows. A live-tail read
+    /// in that window, and one after the shard marks the generation durable,
+    /// must each return every row exactly once.
+    ///
+    /// # Panics
+    /// Panics when the fixture cannot be built or a read returns any row other
+    /// than exactly once.
+    #[tokio::test]
+    async fn a_generation_staged_before_the_shard_settles_is_read_once() {
+        let StagedGenerationFixture {
+            service,
+            memtable,
+            generation,
+            member,
+            request,
+            directory: _directory,
+            ..
+        } = staged_generation_fixture();
         let read = || hot_values(&service, request.clone());
 
         assert_eq!(read().await, vec![1, 2, 3], "staged but not yet durable");
@@ -3206,6 +3557,71 @@ mod tests {
             read().await,
             vec![1, 2, 3],
             "durable and served by its runs"
+        );
+    }
+
+    /// A live read opened over durable staged runs keeps them readable after
+    /// publication retires their authority, and holds its lease until its
+    /// stream drops.
+    ///
+    /// # Panics
+    /// Panics when the fixture cannot be built, the leased run cannot be read
+    /// after publication, or the lease does not follow the stream.
+    #[tokio::test]
+    async fn an_open_live_read_keeps_staged_runs_across_publication() {
+        use crate::scribe::hot_source::HotAuthority;
+
+        let StagedGenerationFixture {
+            service,
+            memtable,
+            registry,
+            key,
+            generation,
+            member,
+            request,
+            directory: _directory,
+            ..
+        } = staged_generation_fixture();
+        memtable
+            .complete_staged(generation.get(), member)
+            .expect("the shard marks the generation durable");
+        let open = service
+            .open_live_batches(request.clone())
+            .await
+            .expect("the live read opens");
+        assert_eq!(registry.leases(&key, generation).expect("locked"), 1);
+        registry
+            .advance(
+                &key,
+                generation,
+                HotAuthority::Published {
+                    object_keys: vec!["hot/events/0001.parquet".to_owned()],
+                },
+            )
+            .expect("the generation publishes");
+        let mut stream = open.into_stream();
+        let batch = futures_util::StreamExt::next(&mut stream)
+            .await
+            .expect("the staged run yields a batch")
+            .expect("a leased staged run stays readable after publication");
+        let values = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64 value column")
+            .values()
+            .to_vec();
+        assert_eq!(values, vec![1, 2, 3], "published after open, still read");
+        assert_eq!(
+            registry.leases(&key, generation).expect("locked"),
+            1,
+            "an open stream keeps its lease"
+        );
+        drop(stream);
+        assert_eq!(
+            registry.leases(&key, generation).expect("locked"),
+            0,
+            "dropping the stream releases the lease"
         );
     }
 

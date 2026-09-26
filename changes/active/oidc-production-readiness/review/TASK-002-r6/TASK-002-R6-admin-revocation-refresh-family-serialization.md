@@ -1,7 +1,7 @@
 ---
 id: TASK-002-R6
 kind: remediation
-status: ready
+status: implemented
 spec: SPEC-oidc-production-readiness
 spec_revision: 4
 requirements: [REQ-016, INV-004, AC-007]
@@ -142,3 +142,31 @@ If closing the finding requires a new public contract, persistence model,
 lock abstraction, transaction-isolation decision, or broader concurrency
 semantic, stop and route that decision through specification revision rather
 than expanding this remediation.
+
+## Implementation evidence
+
+Commits: `3f6464087` (fix + focused test), `ab1a0e495` (test helper split for
+`clippy::too_many_lines`).
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| User revocation takes the tenant-qualified family lock after the User-existence check, before suspension and family revocation, held through the route commit. | `crates/wyrd/wyrd-auth/src/revoke.rs` `revoke_principal_in_conn` User branch calls `lock_refresh_family(conn, "user", id)` on the caller's `TenantConn` (transaction-scoped advisory lock). | Focused test waits until the revoking backend is blocked on an `advisory` lock while rotation is open. | PASS |
+| Overlapping rotation + revocation leaves no active successor; `C` is `principal_revoked`. | Same. | `revoke::pg_tests::refresh_rotation_overlapping_user_revocation_retires_successor` passes; with the lock call removed it fails (revocation never waits on the family lock, 30s timeout). | PASS |
+| Replay/rotation serialization, lock order, audit, Service/Agent revocation, connection cutoff, prior remediations unchanged. | No connection lock taken; Service/Agent branch untouched; no other file changed. | `test:principals:integration` (includes `refresh::pg_tests`, `revoke::pg_tests`), `test:principals:unit`, `test:sql`, `test:identity:journey` (27/27), `check:tenant-isolation`, `fmt`, `lints`, `git diff --check` all exit 0. | PASS |
+
+Commands run, each exiting 0: the focused `with-test-postgres.sh … nextest`
+command, `mise run test:principals:unit`, `mise run test:sql`,
+`mise run test:principals:integration`, `mise run test:identity:journey`,
+`mise run check:tenant-isolation`, `mise run fmt`, `mise run lints`,
+`git diff --check`.
+
+Family-mutation audit: `revoke_refresh_family` has two callers. Refresh replay
+containment (`refresh.rs`) already holds the lock; User revocation (`revoke.rs`)
+now does too. `revoke_refresh` (single row) has no callers. Human-connection
+deactivation, replacement, and removal (`connections.rs`) never mutate refresh
+rows; rotation enforces connection cutoff under the family lock and then the
+connection slot lock. No path deletes principals or bulk-retires families
+otherwise. No further caller needed the lock.
+
+Non-goals held: no new persistence, lock abstraction, isolation change,
+public contract, migration, or generated artifact.

@@ -1196,6 +1196,15 @@ mise run lints
 description = "Regenerate Claude workflow-skill mirrors from canonical .agents skills"
 run = "bash scripts/sync-agent-skills.sh --write"
 
+[tasks."review:verify-citations"]
+description = "Drop task-review findings whose citations do not match the candidate: <review-dir> <candidate-commit>"
+run = "uv run python scripts/verify_review_citations.py"
+
+[tasks."test:review-scripts"]
+hide = true
+description = "Self-check the task-review citation verifier"
+run = "uv run python scripts/test_verify_review_citations.py"
+
 [tasks."check:skills-sync"]
 hide = true
 description = "Fail when Claude workflow-skill mirrors drift or retired skills reappear"
@@ -1375,6 +1384,7 @@ description = "Full repository aggregate for nightly, release, mixed, global, an
 depends = [
   "check",
   "check:skills-sync",
+  "test:review-scripts",
   "test:rust",
   "test:bifrost:gate",
   "test:identity:journey",

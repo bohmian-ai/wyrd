@@ -1,6 +1,6 @@
 ---
 name: wyrd-task-review
-description: Orchestrate a required two-wave, multi-agent audit of one immutable cumulative Wyrd task implementation, then write its verdict and any remediation task from independently validated findings.
+description: Orchestrate a required two-wave, multi-agent audit of one immutable cumulative Wyrd task implementation, then write its verdict and any remediation task from citation-checked, reproduced, root-cause findings.
 ---
 
 # Wyrd Task Review
@@ -43,25 +43,71 @@ use the harness's agent-delegation capability to spawn separate fresh subagents;
 simulating multiple reviewer roles in one context does not satisfy this skill.
 No agent may fill more than one role.
 
-Run the review in two waves:
+Run the review in two waves with one script between them:
 
-1. **Wave 1, in parallel:** always spawn a task implementation reviewer
-   (`task-rev`) and repository-standards reviewer (`repo-rev`). Also spawn one
-   domain reviewer (`domain-rev`) for each materially changed sensitive domain,
-   including security/RBAC, tenancy, concurrency, durability, persistent data,
-   or another boundary whose correctness needs domain expertise.
-2. **Wave 2:** after every Wave 1 report is complete, always spawn one
-   structured Ponytail reviewer (`ponytail-rev`). It independently validates
-   the union of all findings and produces the final finding ledger and
-   decision-complete recommendations.
+1. **Wave 1, in parallel:** always spawn two independent task implementation
+   reviewer samples (`task-rev` A and B) and one repository-standards reviewer
+   (`repo-rev`). Also spawn one domain reviewer (`domain-rev`) for each
+   materially changed sensitive domain, including security/RBAC, tenancy,
+   concurrency, durability, persistent data, or another boundary whose
+   correctness needs domain expertise. The two `task-rev` samples receive
+   identical inputs and never see each other; running both raises recall
+   because each explores the code differently.
+2. **Citation check:** after every Wave 1 report is complete, run
+   `mise run review:verify-citations <review-dir> <candidate>`. Drop every
+   finding it prints as `REJECT`; it cites code that does not exist at the
+   candidate. A non-zero exit means a report broke the finding contract and
+   the review is `BLOCKED`.
+3. **Wave 2:** always spawn one structured Ponytail reviewer (`ponytail-rev`).
+   It reproduces the surviving claims, applies the blocking gate, merges
+   findings by root cause, and produces the final ledger and decision-complete
+   recommendations.
 
 Wave 1 reviewers receive the immutable subject and inputs needed for their own
 scope, but not another reviewer's conclusions or an intended verdict. The
-`ponytail-rev` receives the complete diff, applicable authorities, and every
-Wave 1 report. The orchestrator only establishes the subject, routes inputs,
-checks report completeness, and writes final artifacts from the validated
-ledger. If any required agent cannot be spawned, any required report is
-missing, or the candidate changes during either wave, return `BLOCKED`.
+`ponytail-rev` receives the complete diff, applicable authorities, and the
+claim ledger described in Wave 2, not the Wave 1 reasoning. The orchestrator
+only establishes the subject, routes inputs, runs the citation check, builds
+the claim ledger, and writes final artifacts from the validated ledger. If any
+required agent cannot be spawned, any required report is missing, or the candidate changes during either wave, return `BLOCKED`.
+
+## Finding contract (every Wave 1 reviewer)
+
+A finding is a root cause, not a symptom. Before reporting, each reviewer:
+
+1. traces the symptom back to the first place the wrong value, decision, or
+   rule violation is produced, and stops at that owner, not a caller;
+2. names the defect class in one line, such as "posting keys are not
+   normalized before lookup", and states whether the owner's shape (a public
+   field, an enum variant payload, a raw `String` where a validated type
+   belongs) is what permits the defect; and
+3. sweeps for siblings: every other site in the candidate with the same root
+   cause or pattern, found through callers, references, and the same rule.
+   Siblings are locations of one finding, never separate findings.
+
+Each finding records its ID, classification, root cause, defect class, every
+sibling location, violated obligation or written rule, evidence, observable
+consequence, and testable correction.
+
+Every report also ends with exactly one fenced `citations` block: a JSON array
+with one entry per cited location, empty when there are no findings. Each
+entry has the finding `id`, repository-relative `path`, 1-based `line`, a
+verbatim `snippet` of the code starting at that line, and the `symbols` the
+claim depends on:
+
+````markdown
+```citations
+[{"id": "TASK-A-1", "path": "crates/x/src/lib.rs", "line": 42,
+  "snippet": "let used = 0;", "symbols": ["pack"]}]
+```
+````
+
+Quote code exactly; the citation check rejects paraphrase.
+
+**Verify, don't bounce.** When a gap is missing evidence that a read-only
+command can produce, such as an exact focused test run, the reviewer runs the
+command and records the observed result instead of reporting a finding. Code,
+test-placement, and behavior gaps still go back to implementation.
 
 ## Wave 1: task implementation review (`task-rev`)
 
@@ -82,8 +128,6 @@ extension: delete it if the task does not need it; otherwise reuse repository,
 standard-library, native-platform, or installed-dependency behavior before
 accepting new code. Require the smallest safe root-cause correction without
 weakening validation, error handling, security, accessibility, or durability.
-Removing a check that a stronger check at the same boundary covers is not
-weakening validation.
 
 Build an explicit matrix:
 
@@ -104,13 +148,10 @@ unrelated pre-existing debt, or refactors not required by the task. Tests prove
 behavior; they do not prove that the requested behavior was built. Rely on
 repository source and the diff, not agent summaries.
 
-Return `task-review.md` with the acceptance matrix, proposed findings, and one
-overall `PASS`, `FAIL`, or `BLOCKED` result. Each finding needs a source-local
+Each sample returns `task-review-a.md` or `task-review-b.md` with the
+acceptance matrix, proposed findings, and one overall `PASS`, `FAIL`, or `BLOCKED` result. Each finding needs a source-local
 ID, classification, violated obligation, exact location, evidence, observable
-consequence, and required testable correction. Name the defect class in one
-line and state whether the owner's shape (a public field, an enum variant
-payload, a raw `String` where a validated type belongs) is what permits the
-defect. For `DRIFT`, identify what can
+consequence, and required testable correction. For `DRIFT`, identify what can
 be deleted or which existing or native mechanism already covers the outcome.
 
 ## Wave 1: repository standards review (`repo-rev`)
@@ -138,6 +179,10 @@ The `repo-rev` returns:
    location, consequence, and testable correction; and
 4. one overall `PASS`, `FAIL`, or `BLOCKED` result.
 
+Every finding cites a rule written in `AGENTS.md` or `architecture/` by file
+and line; an inferred convention or preference is not a finding. Only
+violations introduced or materially touched by the diff count. A rule that a
+mise lane already enforces mechanically is proved by that lane, not re-argued.
 The specialist does not review task acceptance, propose optional improvements,
 or perform the Ponytail audit. Missing authority or incomplete coverage blocks
 the review. Preserve its report as `standards-review.md`.
@@ -161,15 +206,54 @@ report speculative hardening.
 
 ## Wave 2: structured Ponytail validation (`ponytail-rev`)
 
-Always spawn a fresh `ponytail-rev` after all Wave 1 reports are complete, even
-when their proposed finding union is empty. Give it the immutable subject,
-applicable authorities, complete diff, `task-review.md`, `standards-review.md`,
-and every `domain-review-<domain>.md`, but no intended verdict.
+Always spawn a fresh `ponytail-rev` after the citation check, even when the
+surviving finding union is empty. Give it the immutable subject, applicable
+authorities, complete diff, prior `FIND-*` ledger during remediation, and a
+claim ledger the orchestrator builds from the citation-checked findings: for
+each finding, its source ID, reporting reviewer, citations, one-sentence claim,
+root cause, defect class, and sibling locations. Do not pass Wave 1 evidence
+prose, matrices, overall results, or an intended verdict; the `ponytail-rev`
+must reach its own conclusion from source. Keep the full reports in the review
+directory for audit.
 
-The `ponytail-rev` independently inspects the actual source, validates every
-Wave 1 finding and correction, removes duplicates, and resolves contradictions
-from approved authority. Apply this ladder to every finding and proposed
-remediation:
+The `ponytail-rev` first merges claims that share a root cause, including
+different symptoms reported by the two `task-rev` samples, and then applies
+the blocking gate. A finding blocks only when at least one holds:
+
+1. **Production path:** it is reachable from the public facade on realistic
+   input and makes the common case observably wrong: wrong result, rejected
+   valid request, lost or duplicated evidence, panic, or silent data loss.
+2. **Task contract:** it violates a named acceptance criterion, constraint, or
+   non-goal of the approved task.
+3. **Repository standard:** the diff violates a rule written in `AGENTS.md` or
+   `architecture/`, cited by file and line.
+4. **Absolute boundary:** it breaks security, tenant isolation, audit, or
+   durability, even on a rare path.
+
+Everything else is a **note**: a preference without a written rule, an edge
+case off the common production path, speculative hardening, or pre-existing
+debt outside the diff. Notes are recorded in the verdict, need no
+reproduction, and never block `PASS` or produce remediation.
+
+Reproduce every blocking claim independently: show a failing focused test, a
+command result, or a traced source path from the facade or the cited rule to
+the defect. Agreement between the `task-rev` samples raises confidence but
+never replaces reproduction. An unreproduced claim is `REJECTED`, not
+softened into a note.
+
+During remediation, a blocking claim whose root cause matches a prior
+`FIND-*` reopens that ID with status `CLASS_INCOMPLETE`: the earlier fix did
+not close the class. Never assign it a new ID. A `CLASS_INCOMPLETE` reopens the
+earlier correction's design, not only its coverage: state why its shape let
+the defect back in, and prefer replacing it over extending it.
+
+During remediation, also audit code added by prior remediation rounds. Code a
+later fix or obligation has made redundant (for example, validation subsumed by
+a stronger check at the same boundary) is `DRIFT`, and its deletion belongs in
+the correction. Removing a check that a stronger check covers is not weakening
+validation.
+
+Apply this ladder to every blocking finding and proposed remediation:
 
 1. Can it be deleted while preserving the complete task?
 2. Can a different shape of the candidate-owned owner make the defect
@@ -197,27 +281,22 @@ requirement. For each proposed finding the `ponytail-rev` must:
 4. ask whether the finding or remediation can be deleted, whether existing
    behavior already satisfies the task, and whether the proposed proof is the
    smallest credible check without a new dependency or test harness; and
-5. return `CONFIRMED`, `REVISED`, or `REJECTED` with source evidence and the
-   smallest safe correction boundary.
+5. return `CONFIRMED`, `REVISED`, `CLASS_INCOMPLETE`, `NOTE`, or `REJECTED`
+   with source evidence, the gate that applies, and the smallest safe
+   correction boundary.
 
-The final deduplicated ledger records each retained finding's stable
-`FIND-<task>-<n>` ID, Wave 1 source IDs, `CONFIRMED`, `REVISED`, or
-`CLASS_INCOMPLETE` status,
-classification, violated obligation, exact location, evidence, observable
-consequence, decision-complete correction, and focused closure proof. Preserve
+The final deduplicated ledger records each retained blocking finding's stable
+`FIND-<task>-<n>` ID, Wave 1 source IDs, status, gate, classification, root
+cause, defect class, every sibling location, violated obligation, evidence,
+reproduction, observable consequence, decision-complete correction at the
+root-cause owner, and focused closure proof covering every sibling. Notes are
+listed separately with their source IDs and one line each. Preserve
 prior `FIND-*` IDs during remediation and assign the next unused number only to
-new findings. A finding whose root cause matches a prior `FIND-*` reopens that
-ID with status `CLASS_INCOMPLETE`: the earlier correction did not close the
-class. It reopens that correction's design, not only its coverage: state why
-its shape let the defect back in, and prefer replacing it over extending it.
-During remediation, also audit code added by prior remediation rounds: code a
-later fix or obligation made redundant (for example, validation subsumed by a
-stronger check at the same boundary) is `DRIFT`, and its deletion belongs in
-the correction. Each correction selects the smallest safe approach, names the
+new findings. Each correction selects the smallest safe approach, names the
 existing owner or mechanism to reuse, and preserves adjacent behavior. When
 Wave 1 proposed no findings, return an explicitly validated empty ledger.
 
-The orchestrator may include only independently `CONFIRMED`, `REVISED`, or
+The orchestrator may block only on reproduced `CONFIRMED`, `REVISED`, or
 `CLASS_INCOMPLETE` findings.
 A rejected finding is omitted, not softened into optional advice. If validation
 shows that the correction needs a new product, spec-named public API,
@@ -226,23 +305,23 @@ ownership, or persistent-data decision, do not prescribe it as remediation;
 return `SPEC_REVISION_REQUIRED` when the approved task truly requires that
 decision, otherwise reject the finding as out of scope.
 
-Missing source, incomplete caller tracing, an unavailable independent
-`ponytail-rev`, or disagreement that cannot be resolved from approved authority
-blocks the review. Preserve its final ledger and recommendations as
+Missing source, incomplete caller tracing, a failed citation check, an
+unavailable independent `ponytail-rev`, or disagreement that cannot be resolved
+from approved authority blocks the review. Preserve its final ledger and recommendations as
 `findings-validation.md` in the review directory.
 
 ## Verdict and remediation task
 
-In the established review directory, preserve `task-review.md`,
-`standards-review.md`, every `domain-review-<domain>.md`, and
-`findings-validation.md`, then write `verdict.md` containing the immutable
-subject, acceptance matrix, Wave 1 results, validated finding ledger,
+In the established review directory, preserve `task-review-a.md`,
+`task-review-b.md`, `standards-review.md`, every `domain-review-<domain>.md`,
+the citation-check output as `citations.txt`, and `findings-validation.md`,
+then write `verdict.md` containing the immutable subject, acceptance matrix,
+Wave 1 results, rejected citations, validated blocking ledger, notes,
 verification limits, prior-finding closure, and one verdict:
 
-- `PASS` — `task-rev`, `repo-rev`, and every selected `domain-rev` pass,
-  `ponytail-rev` completes with an empty validated ledger, every obligation
+- `PASS` — `ponytail-rev` completes with no blocking finding, every obligation
   passes, non-goals remain excluded, verification is credible, and no unrelated
-  change entered the diff;
+  change entered the diff; notes may remain;
 - `FIX_REQUIRED` — one or more bounded implementation findings remain;
 - `SPEC_REVISION_REQUIRED` — correction requires changing approved behavior or
   an expensive-to-reverse decision; or
@@ -253,17 +332,21 @@ For `FIX_REQUIRED`, also write one self-contained remediation task named
 `<task-id>-R<n>-<name>.md` in the same review directory. It must contain:
 
 1. the approved spec path, original task path, and candidate identities;
-2. an issue diagnosis for each material finding: the violated obligation,
-   current behavior, exact evidence, observable consequence, and why the
-   candidate or its existing proof falls short;
+2. an issue diagnosis for each blocking finding: the root cause, defect class,
+   every sibling location, violated obligation, current behavior, exact
+   evidence, reproduction, observable consequence, and why the candidate or its
+   existing proof falls short;
 3. the intended correction outcome;
 4. a decision-complete recommendation within the approved behavior: select the
    minimal correction approach, name the existing owner or mechanism to reuse,
    resolve alternatives that would change scope or proof, and explain why that
    approach closes the diagnosed gap;
 5. constraints, preserved behavior, and explicit non-goals;
-6. acceptance criteria mapped to every finding; and
+6. acceptance criteria mapped to every finding and every sibling location; and
 7. focused proof that directly exercises the gap plus broader verification.
+
+The correction is made once at the root-cause owner and closes the whole
+defect class, not only the reported symptom.
 
 Do not write an outcome checklist or merely restate the acceptance matrix. The
 diagnosis and recommendation are the substance of the remediation task;

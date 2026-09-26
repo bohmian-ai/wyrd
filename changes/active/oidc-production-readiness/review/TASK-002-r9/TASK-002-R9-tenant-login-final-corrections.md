@@ -229,3 +229,30 @@ role model, lock ordering, transaction isolation, security policy, or another
 expensive-to-reverse decision beyond these validated corrections. Ordinary
 implementation and test details inside the existing owners remain
 implementer-owned.
+
+## Implementation evidence
+
+Candidate: code commit `5553df724` (evidence recorded in the following commit).
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Concurrent callbacks serialize before role replacement; exact per-token roles, final set = later callback's, 2 role-sync events, no union | `crates/wyrd/wyrd-auth/src/callback.rs` `finish_id_token_exchange` takes `lock_refresh_family(conn, "user", principal_id)` right after `ensure_user_identity` | `auth::callback::pg_tests::concurrent_callbacks_replace_roles_without_union` — RED before fix: callback B's token carried `{login_alpha_probe, login_beta_probe}` (union); GREEN after fix | PASS |
+| Reuses existing family lock before role replacement; family-before-connection order, transaction ownership, completion, audit preserved | Same site; no new lock, table, isolation, or retry; `issue_human_session` reacquisition unchanged | Focused test above; `test:principals:integration`, `test:identity:journey`, `test:sql` | PASS |
+| `TokenResponse::refresh_token` and schemas describe human login and human refresh only | `crates/wyrd-spec/src/auth/token.rs`; regenerated `crates/wyrd-spec/schemas/auth_token_response.json` and `crates/wyrd-spec/tests/schemas/auth_token_response.json` via `mise run codegen:regen` | `mise run codegen:check` | PASS |
+| Token handler has scrubbed debug instrumentation | `#[tracing::instrument(level = "debug", skip_all)]` on `token` in `crates/wyrd/wyrd-server/src/components/auth/routes.rs` | Direct inspection; `mise run lints` | PASS |
+| `auth_router` rustdoc covers four surfaces, shared governor, `# Panics`; body unchanged | `crates/wyrd/wyrd-server/src/components/auth/routes.rs` | Direct inspection; `mise run lints` | PASS |
+| Begin-login uses one narrow `WyrdPostgres` slug capability, no raw-pool resolver or `app_pool` | `WyrdPostgres::resolve_tenant_slug` in `crates/wyrd/wyrd-sql/src/postgres.rs`; `HumanConnections::begin_login` in `crates/wyrd/wyrd-auth/src/login.rs` | `login::pg_tests::unknown_tenant_and_no_connection_are_indistinguishable`; `check:from-pools-allowlist`; `check:tenant-isolation` | PASS |
+| Prior corrections, journeys, contracts, isolation, pool boundaries, fmt, lints, diff hygiene green | — | All commands below exited 0 | PASS |
+
+Commands (all exit 0, run sequentially in this session):
+
+- `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-server --lib -E 'test(=auth::callback::pg_tests::concurrent_callbacks_replace_roles_without_union)'"`
+- `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-auth --lib -E 'test(=login::pg_tests::unknown_tenant_and_no_connection_are_indistinguishable)'"`
+- `mise run test:principals:unit`, `mise run test:principals:integration`, `mise run test:sql`, `mise run test:identity:journey`
+- `mise run codegen:check`, `mise run check:from-pools-allowlist`, `mise run check:tenant-isolation`
+- `mise run fmt`, `mise run lints`
+- `git diff --check 3fc085acf5b3a710d5dc80892bd2e664b3db6174..HEAD`
+
+Test note: the ordering is observed through `pg_stat_activity` lock waits. Before the fix the second callback parks behind the first's audit chain-head row rather than the advisory lock, so an advisory-only `pg_locks` count cannot observe the RED ordering.
+
+Non-goals held: no dependency, feature, migration, table, route, error code, lock abstraction, isolation change, or wire-shape change; no machine refresh tokens; no unrelated resolver callers migrated; no TASK-003/TASK-004 work.

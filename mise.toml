@@ -307,7 +307,8 @@ cargo nextest run --locked \
   -p wyrd-mcp --test mcp \
   -p vala-bifrost-redux --test integration \
   --features wyrd-client/test-support \
-  -P journey --run-ignored=only
+  -P journey --run-ignored=only \
+  -E "not test(=qualification::scribe_512_mib_physical_object_qualifies)"
 mise run test:bifrost:unit:python:inner'
 """
 
@@ -465,7 +466,16 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:i
 [tasks."test:bifrost:journey:scribe:inner"]
 hide = true
 description = "wyrd-testing `scribe` binary, whole"
-run = "cargo nextest run --locked -p wyrd-testing --test scribe -P journey --run-ignored=all"
+run = "cargo nextest run --locked -p wyrd-testing --test scribe -P journey --run-ignored=all -E 'not test(=qualification::scribe_512_mib_physical_object_qualifies)'"
+
+[tasks."test:bifrost:journey:scribe:production-geometry"]
+description = "The Scribe physical-object qualification at the standard 512 MiB production size"
+run = """
+scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && \
+  cargo nextest run --locked -p wyrd-testing --test scribe \
+  -P journey --run-ignored=only \
+  -E "test(=qualification::scribe_512_mib_physical_object_qualifies)"'
+"""
 
 [tasks."test:bifrost:journey:oracle"]
 description = "Tier-1 journeys: query execution, distributed dispatch, peer security, tail fencing, spill, telemetry"

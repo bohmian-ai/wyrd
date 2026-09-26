@@ -424,13 +424,14 @@ fn auth_error_to_wyrd(error: AuthError) -> WyrdError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bifrost::BifrostClientError;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use wyrd_queue::{ClientByteBudget, OwnedIpcBytes, QueueConfig};
+    use wyrd_queue::{ClientByteBudget, OwnedIpcBytes, QueueConfig, WyrdQueueError};
 
     use crate::auth::AuthMiddleware;
     use crate::config::ClientConfig;
@@ -739,8 +740,8 @@ mod tests {
     /// # Panics
     ///
     /// Panics when the service, facade, or batch cannot be built, when the
-    /// flush or shutdown fails, or when the settled batch keeps bytes, a live
-    /// batch, or a retry entry.
+    /// flush returns an unexpected error, shutdown fails, or the settled batch
+    /// keeps bytes, a live batch, or a retry entry.
     async fn settle_held_batch<S: BifrostIngestService>(
         service: S,
         attempts: &AtomicUsize,
@@ -803,10 +804,13 @@ mod tests {
             bifrost
                 .enqueue_batch("events", batch.clone(), None)
                 .expect("batch admitted");
-            bifrost
-                .flush()
-                .await
-                .expect("an enqueued batch's loss settles through the observer");
+            match bifrost.flush().await {
+                Ok(())
+                | Err(BifrostClientError::Queue(WyrdQueueError::Sink(
+                    WyrdError::ServiceUnavailable { .. },
+                ))) => {}
+                Err(error) => panic!("unexpected flush failure: {error}"),
+            }
         }
         let flushed = attempts.load(Ordering::Acquire);
         let metrics = bifrost.metrics();

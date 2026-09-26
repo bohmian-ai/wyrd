@@ -28,3 +28,17 @@ jobs:
 
       - name: Run Forge production-geometry journey
         run: mise run test:bifrost:journey:forge:production-geometry
+
+  scribe-production-geometry:
+    name: scribe production geometry
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          docker-images: "false"
+
+      - name: Run Scribe production-geometry journey
+        run: mise run test:bifrost:journey:scribe:production-geometry

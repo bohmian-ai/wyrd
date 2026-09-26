@@ -17,9 +17,11 @@
 # seams; their wiremock dev-dependency is not part of the published client
 # dependency graph. The `#[cfg(test)]` `screening_tests` module of
 # `wyrd-auth/src/callback.rs` is the same shape: a dev-dependency only.
+# Gateway's mock provider and Postgres proofs, plus the provider client tests,
+# are also compiled only under `#[cfg(test)]` with dev-only wiremock.
 #
 # WHAT IT CHECKS: mockall, wiremock, and mockito references do not appear
-# outside wyrd-testing and the explicitly allowlisted provider/auth files.
+# outside wyrd-testing and the explicitly allowlisted test-only seams.
 if rg -n 'mockall|wiremock|mockito' crates \
   --glob '!crates/wyrd/wyrd-testing/**' \
   --glob '!crates/skald/skald-providers/Cargo.toml' \
@@ -30,6 +32,12 @@ if rg -n 'mockall|wiremock|mockito' crates \
   --glob '!crates/skald/skald-providers/src/clients/google.rs' \
   --glob '!crates/skald/skald-providers/src/clients/openai.rs' \
   --glob '!crates/skald/skald-providers/src/clients/vertex.rs' \
+  --glob '!crates/skald/skald-providers/src/clients/mod.rs' \
+  --glob '!crates/wyrd/wyrd-gateway/Cargo.toml' \
+  --glob '!crates/wyrd/wyrd-gateway/src/vault.rs' \
+  --glob '!crates/wyrd/wyrd-gateway/src/credential.rs' \
+  --glob '!crates/wyrd/wyrd-gateway/src/endpoint.rs' \
+  --glob '!crates/wyrd/wyrd-gateway/src/adapter/tests.rs' \
   --glob '!crates/wyrd/wyrd-cli/Cargo.toml' \
   --glob '!crates/wyrd/wyrd-cli/tests/**' \
   --glob '!crates/shared/wyrd-client/Cargo.toml' \
@@ -45,6 +53,7 @@ if rg -n 'mockall|wiremock|mockito' crates \
   --glob '!crates/wyrd/wyrd-server/src/auth/callback.rs' \
   --glob '!crates/wyrd/wyrd-server/src/components/admin/routes.rs' \
   --glob '!crates/wyrd/wyrd-server/src/boot/issuer.rs' \
+  --glob '!crates/wyrd/wyrd-server/src/components/gateway/pg_invocation_tests.rs' \
   --glob '!crates/wyrd/wyrd-auth/Cargo.toml' \
   --glob '!crates/wyrd/wyrd-auth/src/callback.rs' \
   --glob '!crates/wyrd/wyrd-cli/src/auth/trusted_issuer.rs'; then

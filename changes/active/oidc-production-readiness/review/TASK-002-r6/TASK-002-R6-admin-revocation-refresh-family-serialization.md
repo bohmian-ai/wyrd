@@ -170,13 +170,14 @@ plus FK cascades and triggers):
 | `revoke_refresh_family` in replay containment (`refresh.rs:134`) | family | yes | already under family lock |
 | `revoke_refresh_family` in User revocation (`revoke.rs`) | family | yes | **now locked** (this task) |
 | `revoke_refresh` (`refresh_tokens.rs:152`) | single row | — | no callers |
-| Connection activate / deactivate / remove (`connections.rs`, `DEACTIVATE_ACTIVE_SQL`, `PROMOTE_TESTED_SQL`, `REMOVE_SQL`) | no — update `auth_human_connections` only | cutoff is enforced at rotation: `begin_locked` takes `lock_human_connection_slot` (`connections.rs:658`) and rotation takes the same lock and requires the bound revision to be Active (`issuance.rs:483`) | none; no family retirement to serialize |
+| Connection candidate insert/replace, stamp, activate, deactivate, remove (`human_connections.rs`: `INSERT_CANDIDATE_SQL`, `REPLACE_CANDIDATE_SQL`, `STAMP_TESTED_SQL`, `PROMOTE_TESTED_SQL`, `DEACTIVATE_ACTIVE_SQL`, `REMOVE_SQL`) | no — every write statement in the module targets `wyrd.auth_human_connections` only | serialized on the connection slot lock: `begin_locked` (`connections.rs:658`) and rotation's `issue_human_session` (`issuance.rs:483`) both take `lock_human_connection_slot`, and rotation refuses a bound revision that is not Active | no family lock needed; proven by `refresh::pg_tests::connection_deactivation_overlapping_rotation_ends_successor` (production `HumanConnections::deactivate` observed waiting on the tenant's slot lock while rotation of `B` is open; after both commit, `C` rotates to `ConnectionInactive` and no successor of `C` exists) |
 | User suspension | only via `revoke_principal_in_conn` (sole caller of `suspend_user_principal` outside tests) | yes | covered by this task |
 | Principal / connection deletion | no `DELETE` of users, service accounts, or connections exists; refresh FK to connections has no cascade; no FK from refresh rows to users; no triggers on the refresh table | — | none |
 | Migration `20260925000001` line 79 | one-off revoke of unbound families at migrate time | not at runtime | none |
 
-No path other than User revocation needed the family lock, so no additional
-overlap test was required.
+Only User revocation needed the family lock. Connection lifecycle paths
+retire no refresh rows and are covered by the connection-slot overlap test
+above. Both overlap tests pass in `mise run test:principals:integration`.
 
 Non-goals held: no new persistence, lock abstraction, isolation change,
 public contract, migration, or generated artifact.

@@ -384,6 +384,385 @@ mod pg_tests {
         );
     }
 
+    /// OIDC authorized-party rules: several audiences need `azp` naming the
+    /// client, a present `azp` must name the client, and a lone audience may
+    /// omit it.
+    #[test]
+    fn verify_authorized_party_enforces_azp_for_the_client() {
+        let client = EXTERNAL_AUDIENCE;
+        let refused = [
+            serde_json::json!({ "aud": [client, "other"] }),
+            serde_json::json!({ "aud": [client, "other"], "azp": "other" }),
+            serde_json::json!({ "aud": [client, "other"], "azp": 7 }),
+            serde_json::json!({ "aud": client, "azp": "other" }),
+            serde_json::json!({ "aud": [client], "azp": "other" }),
+        ];
+        for claims in refused {
+            let error = verify_authorized_party(client, &claims).expect_err("azp is refused");
+            assert_eq!(error.code(), "WYRD_AUTH_401_INVALID_TOKEN", "{claims}");
+        }
+        for claims in [
+            serde_json::json!({ "aud": client }),
+            serde_json::json!({ "aud": [client] }),
+            serde_json::json!({ "aud": client, "azp": client }),
+            serde_json::json!({ "aud": [client, "other"], "azp": client }),
+        ] {
+            verify_authorized_party(client, &claims).expect("azp is accepted");
+        }
+    }
+
+    /// A signed multi-audience token without `azp` is refused before any
+    /// User, session, or completion exists; the same token naming the client
+    /// in `azp` completes.
+    ///
+    /// # Panics
+    /// Panics when the refusal persists anything or the matching token fails.
+    #[tokio::test]
+    async fn a_multi_audience_token_needs_azp_naming_the_client() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let server = jwks_server().await;
+        let state = test_state_with_external(&fixture).await;
+        let trusted =
+            trusted_issuer_with_jwks(tenant, jwks_uri(&server), HashMap::new(), Vec::new());
+        let binding = committed_active_binding(&fixture).await;
+        let (refused_hash, refused_login) =
+            pending_login(&fixture, state_hash(3), binding, "nonce-ok").await;
+        let mut claims = external_claims(EXTERNAL_AUDIENCE, "nonce-ok", None, &[]);
+        claims["aud"] = serde_json::json!([EXTERNAL_AUDIENCE, "another-client"]);
+
+        let error = finish_with_failure_audit(
+            &state,
+            &refused_hash,
+            &trusted,
+            &refused_login,
+            &encode_external_token(&claims),
+        )
+        .await
+        .expect_err("a multi-audience token without azp is refused");
+
+        assert_eq!(error.0.code(), "WYRD_AUTH_401_INVALID_TOKEN");
+        assert_nothing_persisted(&fixture, &state, &refused_hash).await;
+
+        let (hash, login) = pending_login(&fixture, state_hash(4), binding, "nonce-ok").await;
+        claims["azp"] = serde_json::json!(EXTERNAL_AUDIENCE);
+        authorization_exchange_service(&state)
+            .finish_id_token_exchange(
+                &hash,
+                &trusted,
+                &login,
+                &advertised(),
+                &encode_external_token(&claims),
+                "req-azp",
+            )
+            .await
+            .expect("azp naming the client completes");
+        redeem(&state, tenant, &hash)
+            .await
+            .expect("the completion redeems");
+    }
+
+    /// A validly signed token whose asymmetric algorithm the provider did not
+    /// advertise for ID tokens is refused before any User, session, or
+    /// completion exists.
+    ///
+    /// # Panics
+    /// Panics when the token is accepted or anything persists.
+    #[tokio::test]
+    async fn an_unadvertised_id_token_algorithm_is_refused() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let server = jwks_server().await;
+        let state = test_state_with_external(&fixture).await;
+        let trusted =
+            trusted_issuer_with_jwks(tenant, jwks_uri(&server), HashMap::new(), Vec::new());
+        let binding = committed_active_binding(&fixture).await;
+        let (hash, login) = pending_login(&fixture, state_hash(5), binding, "nonce-ok").await;
+        let id_token =
+            encode_external_token(&external_claims(EXTERNAL_AUDIENCE, "nonce-ok", None, &[]));
+
+        let error = authorization_exchange_service(&state)
+            .finish_id_token_exchange(
+                &hash,
+                &trusted,
+                &login,
+                &["RS256".to_owned(), "HS256".to_owned()],
+                &id_token,
+                "req-alg",
+            )
+            .await
+            .expect_err("an unadvertised algorithm is refused");
+
+        assert_eq!(error.code(), "WYRD_AUTH_401_INVALID_TOKEN");
+        assert_nothing_persisted(&fixture, &state, &hash).await;
+    }
+
+    /// Two signed subjects at one issuer sharing an email are two Users, and
+    /// the second gains none of the first's authority.
+    ///
+    /// # Panics
+    /// Panics when the subjects merge or authority transfers.
+    #[tokio::test]
+    async fn same_email_different_subjects_are_distinct_users() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let server = jwks_server().await;
+        let state = test_state_with_external(&fixture).await;
+        seed_role(&fixture, SYNC_ROLE).await;
+        let trusted = trusted_issuer_with_jwks(
+            tenant,
+            jwks_uri(&server),
+            HashMap::from([("admins".to_owned(), vec![SYNC_ROLE.to_owned()])]),
+            Vec::new(),
+        );
+        let binding = committed_active_binding(&fixture).await;
+        let service = authorization_exchange_service(&state);
+        for (n, subject, groups) in [(6, "subject-a", &["admins"][..]), (7, "subject-b", &[])] {
+            let (hash, login) = pending_login(&fixture, state_hash(n), binding, "nonce").await;
+            let mut claims = external_claims(
+                EXTERNAL_AUDIENCE,
+                "nonce",
+                Some("shared@example.com"),
+                groups,
+            );
+            claims["sub"] = serde_json::json!(subject);
+            service
+                .finish_id_token_exchange(
+                    &hash,
+                    &trusted,
+                    &login,
+                    &advertised(),
+                    &encode_external_token(&claims),
+                    "req-subject",
+                )
+                .await
+                .expect("login completes");
+        }
+
+        let first = user_for(&fixture, "subject-a").await.expect("first user");
+        let second = user_for(&fixture, "subject-b").await.expect("second user");
+        assert_ne!(first, second);
+        assert_eq!(
+            user_roles(&fixture, first).await,
+            vec![SYNC_ROLE.to_owned()]
+        );
+        assert!(user_roles(&fixture, second).await.is_empty());
+    }
+
+    /// A login that changes the User's durable roles stages exactly one
+    /// `auth.user.roles.sync` event beside its token exchange; a repeat login
+    /// with the same groups stages none.
+    ///
+    /// # Panics
+    /// Panics when the role-sync evidence differs.
+    #[tokio::test]
+    async fn changed_roles_are_audited_once_and_unchanged_roles_never() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let server = jwks_server().await;
+        let state = test_state_with_external(&fixture).await;
+        seed_role(&fixture, SYNC_ROLE).await;
+        let trusted = trusted_issuer_with_jwks(
+            tenant,
+            jwks_uri(&server),
+            HashMap::from([("admins".to_owned(), vec![SYNC_ROLE.to_owned()])]),
+            Vec::new(),
+        );
+        let binding = committed_active_binding(&fixture).await;
+        let service = authorization_exchange_service(&state);
+        for n in [8, 9] {
+            let (hash, login) = pending_login(&fixture, state_hash(n), binding, "nonce").await;
+            let claims = external_claims(EXTERNAL_AUDIENCE, "nonce", None, &["admins"]);
+            service
+                .finish_id_token_exchange(
+                    &hash,
+                    &trusted,
+                    &login,
+                    &advertised(),
+                    &encode_external_token(&claims),
+                    "req-sync",
+                )
+                .await
+                .expect("login completes");
+        }
+
+        let user = user_for(&fixture, EXTERNAL_SUBJECT).await.expect("user");
+        assert_eq!(user_roles(&fixture, user).await, vec![SYNC_ROLE.to_owned()]);
+        let sync = operation_rows(&fixture, "auth.user.roles.sync").await;
+        assert_eq!(
+            sync,
+            vec![(user, "allowed".to_owned(), format!("principal:{user}"))]
+        );
+        assert_eq!(
+            audit_rows(&fixture).await.len(),
+            2,
+            "one exchange per login"
+        );
+    }
+
+    /// When the role-sync event cannot be staged, the role change, session,
+    /// refresh row, and completion all roll back together.
+    ///
+    /// # Panics
+    /// Panics when the login succeeds or leaves anything behind.
+    #[tokio::test]
+    async fn a_failed_role_sync_audit_rolls_back_the_whole_login() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let server = jwks_server().await;
+        let state = test_state_with_external(&fixture).await;
+        seed_role(&fixture, SYNC_ROLE).await;
+        let trusted = trusted_issuer_with_jwks(
+            tenant,
+            jwks_uri(&server),
+            HashMap::from([("admins".to_owned(), vec![SYNC_ROLE.to_owned()])]),
+            Vec::new(),
+        );
+        let binding = committed_active_binding(&fixture).await;
+        let (hash, login) = pending_login(&fixture, state_hash(10), binding, "nonce").await;
+        let superuser = fixture
+            .superuser_pool()
+            .await
+            .expect("superuser pool opens");
+        sqlx::query(
+            r#"CREATE OR REPLACE FUNCTION vala.test_fail_roles_sync_audit()
+               RETURNS trigger LANGUAGE plpgsql AS $$
+               BEGIN
+                 IF NEW.operation = 'auth.user.roles.sync' THEN
+                   RAISE EXCEPTION 'injected roles sync audit failure';
+                 END IF;
+                 RETURN NEW;
+               END;
+               $$;"#,
+        )
+        .execute(&superuser)
+        .await
+        .expect("failure function installs");
+        sqlx::query(
+            r#"CREATE TRIGGER test_fail_roles_sync_audit
+               BEFORE INSERT ON vala.audit_staging
+               FOR EACH ROW EXECUTE FUNCTION vala.test_fail_roles_sync_audit()"#,
+        )
+        .execute(&superuser)
+        .await
+        .expect("failure trigger installs");
+
+        let error = authorization_exchange_service(&state)
+            .finish_id_token_exchange(
+                &hash,
+                &trusted,
+                &login,
+                &advertised(),
+                &encode_external_token(&external_claims(
+                    EXTERNAL_AUDIENCE,
+                    "nonce",
+                    None,
+                    &["admins"],
+                )),
+                "req-sync-fail",
+            )
+            .await
+            .expect_err("an unrecordable role change refuses the login");
+
+        assert_eq!(error.code(), "WYRD_AUDIT_503_UNAVAILABLE");
+        assert_nothing_persisted(&fixture, &state, &hash).await;
+        let role_rows: i64 = {
+            let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+            sqlx::query_scalar("SELECT COUNT(*) FROM wyrd.auth_user_roles")
+                .fetch_one(&mut **conn.transaction())
+                .await
+                .expect("role count runs")
+        };
+        assert_eq!(role_rows, 0, "the role assignment rolled back");
+    }
+
+    /// The tenant role the role-sync cases map a provider group to.
+    const SYNC_ROLE: &str = "login_sync_probe";
+
+    /// Create and commit tenant role `name`.
+    ///
+    /// # Panics
+    /// Panics when the role cannot be written.
+    async fn seed_role(fixture: &PgFixture, name: &str) {
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        insert_role(
+            &mut conn,
+            Uuid::now_v7(),
+            name,
+            &serde_json::json!([]),
+            false,
+        )
+        .await
+        .expect("role inserts");
+        conn.commit().await.expect("role commits");
+    }
+
+    /// Role names durably granted to `user`.
+    ///
+    /// # Panics
+    /// Panics when the query fails.
+    async fn user_roles(fixture: &PgFixture, user: Uuid) -> Vec<String> {
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        list_user_roles(&mut conn, user)
+            .await
+            .expect("role list runs")
+    }
+
+    /// A mock JWKS endpoint serving the test Ed25519 key.
+    async fn jwks_server() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ed_jwks_json(EXTERNAL_KID)))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// Assert a refused login left no User, refresh row, completion, or
+    /// role-sync event behind.
+    ///
+    /// # Panics
+    /// Panics when anything persisted.
+    async fn assert_nothing_persisted(fixture: &PgFixture, state: &AppState, hash: &Sha256Hex) {
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let (users, refresh): (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM wyrd.auth_users WHERE auth_type = 'oidc'),
+                    (SELECT COUNT(*) FROM wyrd.auth_refresh_tokens)",
+        )
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("persistence counts run");
+        assert_eq!((users, refresh), (0, 0));
+        assert!(
+            operation_rows(fixture, "auth.user.roles.sync")
+                .await
+                .is_empty()
+        );
+        redeem(state, fixture.data_tenant_id(), hash)
+            .await
+            .expect_err("no completion was stored");
+    }
+
+    /// Staged events of `operation` as `(principal_id, outcome, resource)`,
+    /// oldest first.
+    ///
+    /// # Panics
+    /// Panics when the query fails.
+    async fn operation_rows(fixture: &PgFixture, operation: &str) -> Vec<(Uuid, String, String)> {
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        sqlx::query_as(
+            "SELECT principal_id, outcome, resource
+               FROM vala.audit_staging
+              WHERE operation = $1
+              ORDER BY seq ASC",
+        )
+        .bind(operation)
+        .fetch_all(&mut **conn.transaction())
+        .await
+        .expect("audit query runs")
+    }
+
     fn trusted_issuer(
         tenant_id: DataTenantId,
         group_role_map: HashMap<String, Vec<String>>,

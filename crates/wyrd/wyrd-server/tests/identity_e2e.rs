@@ -974,26 +974,56 @@ fn new_flow() -> Sha256Hex {
     Sha256Hex::digest(uuid::Uuid::new_v4().as_bytes())
 }
 
+/// Send one auth-route request the way a well-behaved client does: a `429`
+/// from the shared per-peer auth governor is retried after the advertised
+/// `retry-after` (at least the governor's 100 ms replenish period).
+///
+/// Every journey request arrives from the same test peer, so a journey that
+/// makes more auth calls than the governor's burst would otherwise be refused
+/// by admission, not by the behavior under test. The governor refuses before
+/// any handler runs, so a retried request has consumed no login state.
+///
+/// # Panics
+/// Panics when the router fails or the request is still refused after 50
+/// attempts.
+async fn auth_call(
+    srv: &WyrdTestServer,
+    request: impl Fn() -> Request<Body>,
+) -> axum::http::Response<Body> {
+    for _ in 0..50 {
+        let response = srv.oneshot(request()).await.expect("auth call completes");
+        if response.status() != StatusCode::TOO_MANY_REQUESTS {
+            return response;
+        }
+        let after = response
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        tokio::time::sleep(StdDuration::from_secs(after).max(StdDuration::from_millis(100))).await;
+    }
+    panic!("the auth governor never admitted the request");
+}
+
 /// `POST /auth/login` with `body` and hostile `Host` and forwarded headers
 /// that must play no part; returns the status and JSON body.
 ///
 /// # Panics
 /// Panics when the request cannot be built or the router fails.
 async fn begin_login(srv: &WyrdTestServer, host: &str, body: Value) -> (StatusCode, Value) {
-    let response = srv
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/auth/login")
-                .header(header::HOST, host)
-                .header("x-forwarded-host", "attacker.example.net")
-                .header("x-forwarded-proto", "https")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(body.to_string()))
-                .expect("login request builds"),
-        )
-        .await
-        .expect("login call completes");
+    let response = auth_call(srv, || {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/auth/login")
+            .header(header::HOST, host)
+            .header("x-forwarded-host", "attacker.example.net")
+            .header("x-forwarded-proto", "https")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("login request builds")
+    })
+    .await;
     let status = response.status();
     let bytes = to_bytes(response.into_body(), 65_536)
         .await
@@ -1144,19 +1174,17 @@ async fn callback_reply(
 ) -> CallbackReply {
     let code_encoded: String = url::form_urlencoded::byte_serialize(code.as_bytes()).collect();
     let state_encoded: String = url::form_urlencoded::byte_serialize(state.as_bytes()).collect();
-    let response = srv
-        .oneshot(
-            Request::builder()
-                .method(Method::GET)
-                .uri(format!(
-                    "/auth/callback?code={code_encoded}&state={state_encoded}"
-                ))
-                .header(header::HOST, host)
-                .body(Body::empty())
-                .expect("callback request builds"),
-        )
-        .await
-        .expect("callback call completes");
+    let response = auth_call(srv, || {
+        Request::builder()
+            .method(Method::GET)
+            .uri(format!(
+                "/auth/callback?code={code_encoded}&state={state_encoded}"
+            ))
+            .header(header::HOST, host)
+            .body(Body::empty())
+            .expect("callback request builds")
+    })
+    .await;
     let status = response.status();
     let location = response
         .headers()
